@@ -129,12 +129,24 @@ impl InternalNodePage {
         self.children[i] = pid.to_le_bytes();
     }
 
-    /// Índice del hijo a seguir para la key dada (búsqueda binaria).
+    /// Índice del hijo a seguir para la key dada (binary search).
     /// Retorna el índice `j` tal que `children[j]` contiene el rango de `key`.
+    ///
+    /// Busca el primer separador estrictamente mayor que `key` usando binary search.
+    /// Las keys están ordenadas por invariante del B+ Tree → O(log n) comparaciones.
     pub fn find_child_idx(&self, key: &[u8]) -> usize {
         let n = self.num_keys();
-        // Primer separator > key → ese es el índice del child derecho
-        (0..n).find(|&i| self.key_at(i) > key).unwrap_or(n)
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.key_at(mid) <= key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
     }
 
     /// Inserta un par (sep_key, right_child_pid) en la posición `pos`.

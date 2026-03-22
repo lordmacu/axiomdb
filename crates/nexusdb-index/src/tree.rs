@@ -18,7 +18,6 @@ use crate::page_layout::{
     cast_internal, cast_internal_mut, cast_leaf, cast_leaf_mut, InternalNodePage, LeafNodePage,
     MAX_KEY_LEN, MIN_KEYS_INTERNAL, MIN_KEYS_LEAF, NULL_PAGE, ORDER_INTERNAL, ORDER_LEAF,
 };
-use crate::prefix::CompressedNode;
 
 // ── Tipos internos ───────────────────────────────────────────────────────────
 
@@ -102,25 +101,11 @@ impl BTree {
                     return Ok(node.search(key).ok().map(|i| node.rid_at(i)));
                 }
                 NodeCopy::Internal(node) => {
-                    pid = Self::find_child_compressed(&node, key);
+                    let idx = node.find_child_idx(key);
+                    pid = node.child_at(idx);
                 }
             }
         }
-    }
-
-    /// Traversa un nodo interno usando prefix compression en memoria.
-    ///
-    /// Extrae el prefijo común de las keys del nodo y compara solo los sufijos,
-    /// reduciendo el trabajo de comparación cuando las keys comparten prefijos largos
-    /// (e.g., UUIDs, keys con namespace como "user:000001").
-    fn find_child_compressed(node: &InternalNodePage, key: &[u8]) -> u64 {
-        let n = node.num_keys();
-        let keys: Vec<Box<[u8]>> = (0..n)
-            .map(|i| node.key_at(i).to_vec().into_boxed_slice())
-            .collect();
-        let children: Vec<u64> = (0..=n).map(|i| node.child_at(i)).collect();
-        let compressed = CompressedNode::from_keys(&keys, children);
-        compressed.children[compressed.find_child_idx(key)]
     }
 
     // ── Insert ───────────────────────────────────────────────────────────────
@@ -170,8 +155,18 @@ impl BTree {
 
                 match Self::insert_subtree(storage, child_pid, key, rid)? {
                     InsertResult::Ok(new_child_pid) => {
-                        let new_pid =
-                            Self::cow_update_child(storage, pid, node, child_idx, new_child_pid)?;
+                        // Si el hijo se actualizó in-place (mismo pid), el padre no cambió:
+                        // no hay que reescribirlo ni actualizar su puntero child.
+                        if new_child_pid == child_pid {
+                            return Ok(InsertResult::Ok(pid));
+                        }
+                        let new_pid = Self::in_place_update_child(
+                            storage,
+                            pid,
+                            node,
+                            child_idx,
+                            new_child_pid,
+                        )?;
                         Ok(InsertResult::Ok(new_pid))
                     }
                     InsertResult::Split {
@@ -213,15 +208,14 @@ impl BTree {
         };
 
         if node.num_keys() < ORDER_LEAF {
-            let new_pid = storage.alloc_page(PageType::Index)?;
-            let mut p = Page::new(PageType::Index, new_pid);
+            // In-place: con &mut self no hay lectores concurrentes, no necesitamos CoW.
+            let mut p = Page::new(PageType::Index, old_pid);
             let n = cast_leaf_mut(&mut p);
             *n = node;
             n.insert_at(ins_pos, key, rid);
             p.update_checksum();
-            storage.write_page(new_pid, &p)?;
-            storage.free_page(old_pid)?;
-            return Ok(InsertResult::Ok(new_pid));
+            storage.write_page(old_pid, &p)?;
+            return Ok(InsertResult::Ok(old_pid));
         }
 
         // Split
@@ -376,21 +370,20 @@ impl BTree {
         Ok(pid)
     }
 
-    fn cow_update_child(
+    fn in_place_update_child(
         storage: &mut dyn StorageEngine,
         old_pid: u64,
         mut node: InternalNodePage,
         child_idx: usize,
         new_child: u64,
     ) -> Result<u64, DbError> {
+        // In-place: con &mut self no hay lectores concurrentes, no necesitamos CoW.
         node.set_child_at(child_idx, new_child);
-        let new_pid = storage.alloc_page(PageType::Index)?;
-        let mut p = Page::new(PageType::Index, new_pid);
+        let mut p = Page::new(PageType::Index, old_pid);
         *cast_internal_mut(&mut p) = node;
         p.update_checksum();
-        storage.write_page(new_pid, &p)?;
-        storage.free_page(old_pid)?;
-        Ok(new_pid)
+        storage.write_page(old_pid, &p)?;
+        Ok(old_pid)
     }
 
     // ── Delete ───────────────────────────────────────────────────────────────
@@ -431,7 +424,7 @@ impl BTree {
                         underfull,
                     } => {
                         if !underfull {
-                            let new_pid = Self::cow_update_child(
+                            let new_pid = Self::in_place_update_child(
                                 storage,
                                 pid,
                                 node,
@@ -890,7 +883,7 @@ impl BTree {
         loop {
             match NodeCopy::read(self.storage.as_ref(), pid)? {
                 NodeCopy::Leaf(_) => return Ok(pid),
-                NodeCopy::Internal(n) => pid = Self::find_child_compressed(&n, key),
+                NodeCopy::Internal(n) => pid = n.child_at(n.find_child_idx(key)),
             }
         }
     }
