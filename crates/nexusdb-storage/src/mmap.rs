@@ -300,6 +300,13 @@ impl StorageEngine for MmapStorage {
     }
 }
 
+impl MmapStorage {
+    /// Número de páginas libres actualmente (para benchmarks y monitoreo).
+    pub fn free_count(&self) -> u64 {
+        self.freelist.free_count()
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

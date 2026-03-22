@@ -8,7 +8,7 @@ use tempfile::tempdir;
 
 fn make_data_page(page_id: u64) -> Page {
     let mut page = Page::new(PageType::Data, page_id);
-    // Llenar body con datos realistas (no todo ceros — evita optimizaciones del OS).
+    // Datos realistas — evita optimizaciones del OS/compilador para ceros.
     page.body_mut()
         .iter_mut()
         .enumerate()
@@ -61,7 +61,6 @@ fn bench_memory_write_read(c: &mut Criterion) {
             },
             |(s, id)| {
                 let page = s.read_page(id).unwrap();
-                // Consumir el primer byte para evitar que el compilador elimine la lectura.
                 black_box(page.body()[0])
             },
             BatchSize::SmallInput,
@@ -103,22 +102,27 @@ fn bench_memory_sequential_reads(c: &mut Criterion) {
 }
 
 // ── MmapStorage benchmarks ────────────────────────────────────────────────────
+//
+// El storage se crea UNA VEZ antes del loop de medición. Así medimos solo la
+// operación real (alloc, write, read) sin incluir create()/mmap()/set_len().
 
 fn bench_mmap_alloc(c: &mut Criterion) {
     let mut group = c.benchmark_group("mmap/alloc");
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("alloc_page", |b| {
-        b.iter_batched(
-            || {
-                let dir = tempdir().unwrap();
-                let path = dir.path().join("bench.db");
-                let s = MmapStorage::create(&path).unwrap();
-                (s, dir) // dir mantenido para que no se borre
-            },
-            |(mut s, _dir)| s.alloc_page(PageType::Data).unwrap(),
-            BatchSize::SmallInput,
-        )
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bench_alloc.db");
+        let mut storage = MmapStorage::create(&path).unwrap();
+        // Pre-grow a 10_000 páginas para que el benchmark no dispare grows.
+        storage.grow(10_000).unwrap();
+
+        b.iter(|| {
+            let id = storage.alloc_page(PageType::Data).unwrap();
+            // Liberar inmediatamente para reutilizar la misma página y evitar
+            // que el storage crezca durante la medición.
+            storage.free_page(id).unwrap();
+        });
     });
 
     group.finish();
@@ -128,37 +132,23 @@ fn bench_mmap_write_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("mmap/write_read");
     group.throughput(Throughput::Bytes(nexusdb_storage::PAGE_SIZE as u64));
 
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("bench_wr.db");
+    let mut storage = MmapStorage::create(&path).unwrap();
+    let page_id = storage.alloc_page(PageType::Data).unwrap();
+    let page = make_data_page(page_id);
+
+    // Medir solo el copy de 16KB al mmap.
     group.bench_function("write_page", |b| {
-        b.iter_batched(
-            || {
-                let dir = tempdir().unwrap();
-                let path = dir.path().join("bench.db");
-                let mut s = MmapStorage::create(&path).unwrap();
-                let id = s.alloc_page(PageType::Data).unwrap();
-                (s, id, make_data_page(id), dir)
-            },
-            |(mut s, id, page, _dir)| s.write_page(id, &page).unwrap(),
-            BatchSize::SmallInput,
-        )
+        b.iter(|| storage.write_page(page_id, &page).unwrap());
     });
 
+    // Medir solo acceso zero-copy al mmap + verify CRC32c.
     group.bench_function("read_page", |b| {
-        b.iter_batched(
-            || {
-                let dir = tempdir().unwrap();
-                let path = dir.path().join("bench.db");
-                let mut s = MmapStorage::create(&path).unwrap();
-                let id = s.alloc_page(PageType::Data).unwrap();
-                let page = make_data_page(id);
-                s.write_page(id, &page).unwrap();
-                (s, id, dir)
-            },
-            |(s, id, _dir)| {
-                let page = s.read_page(id).unwrap();
-                black_box(page.body()[0])
-            },
-            BatchSize::SmallInput,
-        )
+        b.iter(|| {
+            let p = storage.read_page(page_id).unwrap();
+            black_box(p.body()[0])
+        });
     });
 
     group.finish();
@@ -169,33 +159,33 @@ fn bench_mmap_sequential_reads(c: &mut Criterion) {
     let mut group = c.benchmark_group("mmap/sequential");
     group.throughput(Throughput::Elements(N_PAGES));
 
+    // Setup único: storage con 1000 páginas ya escritas.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("bench_seq.db");
+    let mut storage = MmapStorage::create(&path).unwrap();
+    storage.grow(N_PAGES + 64).unwrap();
+    let ids: Vec<u64> = (0..N_PAGES)
+        .map(|_| {
+            let id = storage.alloc_page(PageType::Data).unwrap();
+            let page = make_data_page(id);
+            storage.write_page(id, &page).unwrap();
+            id
+        })
+        .collect();
+
+    // Medir solo las 1000 lecturas.
     group.bench_function(BenchmarkId::new("read_sequential", N_PAGES), |b| {
-        b.iter_batched(
-            || {
-                let dir = tempdir().unwrap();
-                let path = dir.path().join("bench.db");
-                let mut s = MmapStorage::create(&path).unwrap();
-                let ids: Vec<u64> = (0..N_PAGES)
-                    .map(|_| {
-                        let id = s.alloc_page(PageType::Data).unwrap();
-                        let page = make_data_page(id);
-                        s.write_page(id, &page).unwrap();
-                        id
-                    })
-                    .collect();
-                (s, ids, dir)
-            },
-            |(s, ids, _dir)| {
-                ids.iter().for_each(|&id| {
-                    s.read_page(id).unwrap();
-                });
-            },
-            BatchSize::SmallInput,
-        )
+        b.iter(|| {
+            ids.iter().for_each(|&id| {
+                storage.read_page(id).unwrap();
+            });
+        });
     });
 
     group.finish();
 }
+
+// ── CRC32c throughput ─────────────────────────────────────────────────────────
 
 fn bench_checksum_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("page/checksum");
@@ -217,7 +207,7 @@ fn bench_checksum_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Registro ─────────────────────────────────────────────────────────────────
+// ── Registro ──────────────────────────────────────────────────────────────────
 
 criterion_group!(
     benches,
