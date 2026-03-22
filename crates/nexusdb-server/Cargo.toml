@@ -1,0 +1,15 @@
+[package]
+name        = "nexusdb-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nexusdb-server"
+path = "src/main.rs"
+
+[dependencies]
+nexusdb-core = { workspace = true }
+thiserror    = { workspace = true }
+tokio        = { workspace = true }
