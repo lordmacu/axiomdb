@@ -1,4 +1,4 @@
-# DBYO — Motor de Base de Datos en Rust
+# NexusDB — Motor de Base de Datos en Rust
 
 ## Fuente de verdad
 El archivo `db.md` contiene el diseño completo: arquitectura, tipos, fases, crates y decisiones.

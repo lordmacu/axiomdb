@@ -1,6 +1,7 @@
-# Motor de Base de Datos — Investigación y Diseño
+# NexusDB — Motor de Base de Datos en Rust
 
-> Proyecto universitario: motor de BD portable, rápido, con SQL, índices, llaves foráneas y concurrencia.
+> Proyecto universitario: NexusDB es un motor de BD portable, rápido, con SQL, índices, llaves foráneas y concurrencia.
+
 > Inspirado en ISAM pero moderno. Objetivo: superar a MySQL en benchmarks específicos.
 
 ---

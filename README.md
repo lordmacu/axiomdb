@@ -1,4 +1,4 @@
-# dbyo — Motor de Base de Datos en Rust
+# NexusDB — Motor de Base de Datos en Rust
 
 Motor de base de datos diseñado para superar a MySQL en benchmarks específicos.
 Proyecto universitario en Rust con arquitectura moderna.
@@ -17,7 +17,7 @@ Proyecto universitario en Rust con arquitectura moderna.
 
 ```bash
 # Servidor
-cargo run --bin dbyo-server -- --data-dir ./data
+cargo run --bin nexusdb-server -- --data-dir ./data
 
 # Conectar con psql
 psql -h localhost -p 5432 -U root myapp
@@ -26,8 +26,8 @@ psql -h localhost -p 5432 -U root myapp
 mysql -h localhost -P 3306 -u root myapp
 
 # Modo embebido (Python)
-pip install dbyo-python
-python -c "import dbyo; db = dbyo.open('myapp.db'); db.execute('SELECT 1')"
+pip install nexusdb-python
+python -c "import nexusdb; db = nexusdb.open('myapp.db'); db.execute('SELECT 1')"
 ```
 
 ## Arquitectura
@@ -53,6 +53,11 @@ Disco (.db + .wal + .idx)
 ## Documentación de diseño
 
 Ver [`db.md`](db.md) para el diseño completo: tipos, optimizaciones, fases y decisiones.
+
+## Nombre
+
+**NexusDB** — una base de datos es el punto central de conexión de toda aplicación.
+El nombre refleja exactamente eso: el nexo entre los datos y el mundo.
 
 ## Benchmarks objetivo
 
