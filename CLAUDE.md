@@ -21,6 +21,14 @@ El flujo completo se aplica **por subfase** (3.1, 3.2, 3.3…), no por fase ente
 Cada subfase tiene su propio spec, plan, implementación y review antes de pasar a la siguiente.
 Nunca implementar varias subfases juntas sin cerrar cada una individualmente.
 
+**Por qué subfases y no fases completas:**
+Trabajar por subfase garantiza que cada pieza recibe toda la atención de ingeniería que necesita.
+Si se trabaja por fases completas, es fácil pasar por alto detalles que solo se notan al planear
+en profundidad una sola cosa a la vez — y esos detalles ignorados se convierten en gaps, bugs
+o retrabajo costoso en fases futuras. Una subfase bien cerrada (spec → plan → código → review)
+es una subfase que no volverá a abrirse. El objetivo no es avanzar rápido en papel, sino que
+cada componente quede correcto, robusto y sin deuda técnica oculta desde el primer día.
+
 ---
 
 ## /brainstorm — Explorar antes de proponer
