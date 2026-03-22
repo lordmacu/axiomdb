@@ -10,3 +10,7 @@ nexusdb-core = { workspace = true }
 thiserror    = { workspace = true }
 crc32c       = "0.6"
 bytemuck     = { version = "1", features = ["derive"] }
+memmap2      = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
