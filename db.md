@@ -4523,6 +4523,7 @@ Fase 22 — Features de producto      (semana 40-42)
   ✓ OData v4 nativo — puerto :3309, PowerBI/Excel/Tableau/SAP sin drivers ni ODBC
   ✓ OData $metadata — EDMX autodescubierto desde catálogo (PowerBI lo usa al conectar)
   ✓ OData $filter/$select/$orderby/$top/$skip/$count/$expand/$batch
+  ✓ OData interno: parser URL → AST OData → translator → SqlStatement → executor existente
 
 ---
 
@@ -4649,6 +4650,143 @@ max_page = 1000       # máximo de filas por respuesta ($top implícito)
 | Excel | Complemento + driver | Datos → OData Feed → URL |
 | Tableau | Driver específico por BD | Conector Web Data Connector |
 | SAP | Adaptador custom | Endpoint estándar OData v4 |
+
+### Arquitectura interna — cómo se implementa
+
+#### Crates involucrados
+
+```
+nexusdb-odata          ← nuevo crate (Fase 22)
+    ├── parser.rs      ← URL OData → AST OData
+    ├── translator.rs  ← AST OData → SqlStatement (reutiliza nexusdb-sql)
+    ├── metadata.rs    ← catálogo → documento EDMX/XML autodescubierto
+    ├── serializer.rs  ← QueryResult → JSON OData
+    └── server.rs      ← servidor HTTP con axum en puerto :3309
+
+nexusdb-sql            ← Fase 4, reutilizado sin cambios
+nexusdb-catalog        ← Fase 4, fuente del $metadata y resolución de FKs
+```
+
+#### Flujo end-to-end de una request
+
+```
+PowerBI: GET /odata/orders?$filter=total gt 100&$expand=customer&$top=50
+         │
+         ▼
+axum router → handle_query()
+         │
+         ▼
+ODataParser::parse()
+→ ODataQuery {
+    entity_set: "orders",
+    filter: Comparison("total", Gt, Int(100)),
+    expand: ["customer"],
+    top: Some(50)
+  }
+         │
+         ▼
+ODataTranslator::translate()          ← SOLO pieza nueva
+→ SqlStatement::Select {              ← tipo ya existente en nexusdb-sql
+    table: "orders",
+    joins: [Join { table: "customers", on: "customer_id = id" }],
+    where: BinaryOp(Column("total"), Gt, Literal(100)),
+    limit: Some(50)
+  }
+         │
+         ▼
+engine.execute_plan()                 ← executor de Fase 4, sin cambios
+→ QueryResult { rows: [...] }
+         │
+         ▼
+ODataSerializer::to_json()
+→ {"@odata.count": 342, "value": [...]}
+         │
+         ▼
+HTTP 200 → PowerBI renderiza tabla
+```
+
+#### AST OData (tipos internos)
+
+```rust
+struct ODataQuery {
+    entity_set: String,
+    filter:     Option<ODataFilter>,
+    select:     Vec<String>,
+    orderby:    Vec<ODataOrder>,
+    top:        Option<u64>,
+    skip:       Option<u64>,
+    expand:     Vec<String>,
+    count:      bool,
+}
+
+enum ODataFilter {
+    Comparison { left: String, op: CmpOp, right: ODataValue },
+    And(Box<ODataFilter>, Box<ODataFilter>),
+    Or(Box<ODataFilter>,  Box<ODataFilter>),
+    Not(Box<ODataFilter>),
+}
+
+enum CmpOp { Eq, Ne, Gt, Ge, Lt, Le }
+
+enum ODataValue { String(String), Int(i64), Float(f64), Bool(bool), Null }
+```
+
+#### $expand resuelve FKs automáticamente desde el catálogo
+
+```rust
+// $expand=customer en tabla orders
+// → catálogo sabe que orders.customer_id → customers.id
+// → traduce a JOIN sin que el usuario especifique nada
+let fk = catalog.find_fk(&table, "customer")?;
+Join {
+    table:    fk.referenced_table,   // "customers"
+    on_left:  fk.column,             // "customer_id"
+    on_right: fk.referenced_column,  // "id"
+}
+```
+
+#### $metadata generado desde el catálogo
+
+```rust
+fn generate_metadata(catalog: &Catalog) -> String {
+    // Por cada tabla → EntityType con Properties + NavigationProperties
+    // Por cada FK → NavigationProperty al tipo relacionado
+    // Resultado: documento EDMX que PowerBI entiende directamente
+}
+```
+
+#### Servidor HTTP con axum
+
+```rust
+let router = Router::new()
+    .route("/odata/$metadata",        get(handle_metadata))
+    .route("/odata/:entity",          get(handle_query))
+    .route("/odata/:entity",          post(handle_insert))
+    .route("/odata/:entity/:id",      patch(handle_update))
+    .route("/odata/:entity/:id",      delete(handle_delete))
+    .route("/odata/:entity/$count",   get(handle_count))
+    .route("/odata/$batch",           post(handle_batch))
+    .with_state(engine);
+```
+
+#### Lo que se reutiliza vs lo que es nuevo
+
+```
+REUTILIZADO (cero cambios):          NUEVO (solo en nexusdb-odata):
+─────────────────────────────        ────────────────────────────────
+✅ Executor SQL (Fase 4)             🆕 OData URL parser → AST OData
+✅ SqlStatement / AST SQL (Fase 4)   🆕 AST OData → SqlStatement translator
+✅ B+ Tree lookups (Fase 2)          🆕 EDMX $metadata generator
+✅ WAL (Fase 3)                      🆕 OData JSON serializer
+✅ Catálogo + FKs (Fases 4 y 6)     🆕 axum HTTP server (pequeño)
+✅ Tokio async runtime               🆕 Auth middleware (bearer/basic)
+✅ DbError propagation               🆕 OData error format (JSON estándar)
+```
+
+El 80% del trabajo ya está hecho al llegar a Fase 22.
+`nexusdb-odata` es un adaptador de protocolo — traduce OData al lenguaje
+interno que el motor ya habla, igual que el MySQL wire protocol traduce el
+protocolo MySQL.
 
 ---
 
