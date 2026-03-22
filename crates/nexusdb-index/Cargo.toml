@@ -6,5 +6,15 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-nexusdb-core = { workspace = true }
-thiserror    = { workspace = true }
+nexusdb-core    = { workspace = true }
+nexusdb-storage = { workspace = true }
+bytemuck        = { workspace = true }
+thiserror       = { workspace = true }
+
+[dev-dependencies]
+tempfile  = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name    = "btree"
+harness = false

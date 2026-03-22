@@ -66,6 +66,16 @@ pub enum DbError {
     #[error("tipo incorrecto: se esperaba {expected}, se obtuvo {got}")]
     TypeMismatch { expected: String, got: String },
 
+    // ── B+ Tree ───────────────────────────────────────────────────
+    #[error("key demasiado larga: {len} bytes (máximo {max})")]
+    KeyTooLong { len: usize, max: usize },
+
+    #[error("clave duplicada en índice")]
+    DuplicateKey,
+
+    #[error("árbol B+ corrupto: {msg}")]
+    BTreeCorrupted { msg: String },
+
     // ── General ──────────────────────────────────────────────────
     #[error("no implementado: {feature}")]
     NotImplemented { feature: String },
