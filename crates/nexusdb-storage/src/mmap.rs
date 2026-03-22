@@ -55,8 +55,10 @@ pub struct MmapStorage {
     mmap: MmapMut,
     /// El descriptor se mantiene abierto para `set_len` en `grow`.
     file: File,
-    /// Free list en memoria, sincronizada con página 1 en cada mutación.
+    /// Free list en memoria. Se persiste a página 1 de forma lazy en `flush()`.
     freelist: FreeList,
+    /// Indica que el freelist fue modificado y debe persistirse en el próximo flush.
+    freelist_dirty: bool,
 }
 
 impl MmapStorage {
@@ -88,6 +90,7 @@ impl MmapStorage {
             mmap,
             file,
             freelist,
+            freelist_dirty: false,
         })
     }
 
@@ -128,6 +131,7 @@ impl MmapStorage {
             mmap,
             file,
             freelist,
+            freelist_dirty: false,
         })
     }
 
@@ -262,12 +266,12 @@ impl StorageEngine for MmapStorage {
             let new_page = Page::new(page_type, page_id);
             let offset = page_id as usize * PAGE_SIZE;
             self.mmap[offset..offset + PAGE_SIZE].copy_from_slice(new_page.as_bytes());
-            // Persistir estado actualizado de freelist.
-            Self::write_freelist_to_mmap(&mut self.mmap, &self.freelist)?;
+            self.freelist_dirty = true;
             return Ok(page_id);
         }
 
         // Freelist agotada: crecer el storage.
+        // grow() persiste freelist internamente porque cambia el page_count.
         let first_new = self.grow(GROW_PAGES)?;
         let page_id = self.freelist.alloc().ok_or(DbError::StorageFull)?;
         debug_assert_eq!(page_id, first_new);
@@ -275,7 +279,7 @@ impl StorageEngine for MmapStorage {
         let new_page = Page::new(page_type, page_id);
         let offset = page_id as usize * PAGE_SIZE;
         self.mmap[offset..offset + PAGE_SIZE].copy_from_slice(new_page.as_bytes());
-        Self::write_freelist_to_mmap(&mut self.mmap, &self.freelist)?;
+        self.freelist_dirty = true;
         Ok(page_id)
     }
 
@@ -286,11 +290,16 @@ impl StorageEngine for MmapStorage {
             )));
         }
         self.freelist.free(page_id)?;
-        Self::write_freelist_to_mmap(&mut self.mmap, &self.freelist)?;
+        self.freelist_dirty = true;
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), DbError> {
+        // Persistir freelist si fue modificada desde el último flush.
+        if self.freelist_dirty {
+            Self::write_freelist_to_mmap(&mut self.mmap, &self.freelist)?;
+            self.freelist_dirty = false;
+        }
         self.mmap.flush()?;
         Ok(())
     }
