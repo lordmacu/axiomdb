@@ -18,19 +18,19 @@ use crate::{
 
 const DB_FILE_MAGIC: u64 = 0x4E455855_53444201; // "NEXUSDB\1"
 const DB_VERSION: u32 = 1;
-/// Unidad de crecimiento: 64 páginas = 1 MB.
+/// Growth unit: 64 pages = 1 MB.
 const GROW_PAGES: u64 = 64;
 
-// Offsets fijos en el archivo para actualización directa sin re-parsear.
+// Fixed offsets for in-place updates without re-parsing the full meta page.
 // PageHeader(64) + db_magic(8) + version(4) + _pad(4) = 80
 const PAGE_COUNT_OFFSET: usize = HEADER_SIZE + 8 + 4 + 4;
-// Offset del campo `checksum` dentro del PageHeader.
+// Offset of the `checksum` field inside PageHeader.
 const CHECKSUM_OFFSET: usize = 12;
 
 // ── DbFileMeta ────────────────────────────────────────────────────────────────
 
-/// Metadatos del archivo almacenados en el body de la página 0.
-/// Ocupa exactamente `PAGE_SIZE - HEADER_SIZE` bytes.
+/// File metadata stored in the body of page 0.
+/// Occupies exactly `PAGE_SIZE - HEADER_SIZE` bytes.
 #[repr(C)]
 struct DbFileMeta {
     db_magic: u64,
@@ -42,48 +42,48 @@ struct DbFileMeta {
 
 const _: () = assert!(
     std::mem::size_of::<DbFileMeta>() == PAGE_SIZE - HEADER_SIZE,
-    "DbFileMeta debe llenar exactamente el body de una página"
+    "DbFileMeta must fill exactly the body of one page"
 );
 
 // ── MmapStorage ───────────────────────────────────────────────────────────────
 
-/// Motor de storage basado en mmap.
+/// mmap-based storage engine.
 ///
-/// Layout del archivo:
-/// - Página 0: Meta (`DbFileMeta` en body)
-/// - Página 1: Bitmap de la free list (`FreeList` serializada)
-/// - Páginas 2+: Data, Index, Overflow, etc.
+/// File layout:
+/// - Page 0: Meta (`DbFileMeta` in body)
+/// - Page 1: Free list bitmap (`FreeList` serialized)
+/// - Pages 2+: Data, Index, Overflow, etc.
 ///
-/// El archivo `.db` se bloquea con `flock(LOCK_EX)` al abrirse y se desbloquea
-/// al hacer drop. Esto previene corrupción por acceso simultáneo de dos procesos.
+/// The `.db` file is locked with `flock(LOCK_EX)` on open and released on
+/// drop, preventing corruption from two processes opening the same file.
 pub struct MmapStorage {
     mmap: MmapMut,
-    /// El descriptor se mantiene abierto para `set_len` en `grow` y para
-    /// sostener el file lock hasta que se haga drop de este struct.
+    /// File descriptor kept open for `set_len` in `grow` and to hold the
+    /// exclusive file lock for the lifetime of this struct.
     file: File,
-    /// Free list en memoria. Se persiste a página 1 de forma lazy en `flush()`.
+    /// In-memory free list. Persisted lazily to page 1 on `flush()`.
     freelist: FreeList,
-    /// Indica que el freelist fue modificado y debe persistirse en el próximo flush.
+    /// Set when the freelist was modified and needs to be written on the next flush.
     freelist_dirty: bool,
 }
 
 impl Drop for MmapStorage {
     fn drop(&mut self) {
-        // Drop::drop() se ejecuta con todos los campos aún vivos; los campos se
-        // dropean después en orden de declaración (mmap → file).
-        // Liberamos el lock explícitamente aquí para mayor claridad; aunque el SO
-        // también lo liberaría al cerrar el fd cuando `file` se dropee.
+        // Drop::drop() runs while all fields are still alive; fields are dropped
+        // afterwards in declaration order (mmap → file).
+        // We release the lock explicitly here for clarity, even though the OS
+        // would also release it when `file` is dropped and the fd is closed.
         if let Err(e) = self.file.unlock() {
-            // Drop no puede retornar Result; solo se loggea.
-            warn!(error = %e, "error al liberar el file lock al cerrar la BD");
+            // Cannot return a Result from Drop; log only.
+            warn!(error = %e, "failed to release file lock on close");
         } else {
-            debug!("file lock liberado");
+            debug!("file lock released");
         }
     }
 }
 
 impl MmapStorage {
-    /// Crea un archivo nuevo en `path`. Falla si ya existe.
+    /// Creates a new database file at `path`. Fails if the file already exists.
     pub fn create(path: &Path) -> Result<Self, DbError> {
         let file = OpenOptions::new()
             .read(true)
@@ -91,32 +91,32 @@ impl MmapStorage {
             .create_new(true)
             .open(path)?;
 
-        // Adquirir lock exclusivo antes de cualquier escritura. Si otro proceso
-        // abrió el mismo archivo (raro en create_new, pero posible en race),
-        // fallamos de inmediato en lugar de corromper.
+        // Acquire an exclusive lock before any write. If another process opened
+        // the same file (rare with create_new, but possible in a race), fail
+        // immediately instead of corrupting.
         file.try_lock_exclusive()
             .map_err(|_| DbError::FileLocked { path: path.to_owned() })?;
 
-        info!(path = %path.display(), pages = GROW_PAGES, "creando base de datos");
+        info!(path = %path.display(), pages = GROW_PAGES, "creating database");
 
         let initial_size = GROW_PAGES * PAGE_SIZE as u64;
         file.set_len(initial_size)?;
 
-        // SAFETY: archivo recién creado con tamaño correcto. Sin otros mapeos.
+        // SAFETY: freshly created file with the correct size. No other mappings.
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
 
-        // Escribir página 0 (Meta).
+        // Write page 0 (Meta).
         Self::write_meta_to_mmap(&mut mmap, GROW_PAGES)?;
 
-        // Inicializar FreeList: páginas 0 y 1 reservadas (meta + bitmap).
+        // Initialize FreeList: pages 0 and 1 reserved (meta + bitmap).
         let freelist = FreeList::new(GROW_PAGES, &[0, 1]);
 
-        // Escribir página 1 (bitmap).
+        // Write page 1 (bitmap).
         Self::write_freelist_to_mmap(&mut mmap, &freelist)?;
 
         mmap.flush()?;
 
-        debug!(path = %path.display(), "base de datos inicializada y lista");
+        debug!(path = %path.display(), "database initialized and ready");
         Ok(MmapStorage {
             mmap,
             file,
@@ -125,49 +125,49 @@ impl MmapStorage {
         })
     }
 
-    /// Abre un archivo existente en `path`.
+    /// Opens an existing database file at `path`.
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
 
-        // Adquirir lock exclusivo de forma no-bloqueante.
-        // Si otro proceso ya tiene el archivo abierto, retornamos error inmediato
-        // en lugar de bloquear o corromper.
+        // Acquire an exclusive lock (non-blocking). If another process already
+        // holds the file open, return an error immediately instead of blocking
+        // or causing corruption.
         file.try_lock_exclusive()
             .map_err(|_| DbError::FileLocked { path: path.to_owned() })?;
 
-        info!(path = %path.display(), "abriendo base de datos");
+        info!(path = %path.display(), "opening database");
 
-        // SAFETY: archivo existente, lock exclusivo adquirido — sin otros mapeos mutables activos.
+        // SAFETY: existing file, exclusive lock held — no other mutable mappings active.
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
-        // Validar página 0.
+        // Validate page 0.
         let page_count = {
             let meta_page = Self::read_page_from_mmap(&mmap, 0)?;
             let file_meta = Self::parse_file_meta(meta_page);
 
             if file_meta.db_magic != DB_FILE_MAGIC {
                 return Err(DbError::Other(format!(
-                    "archivo inválido: db_magic esperado {:#018x}, obtenido {:#018x}",
+                    "invalid file: expected db_magic {:#018x}, got {:#018x}",
                     DB_FILE_MAGIC, file_meta.db_magic
                 )));
             }
             if file_meta.version != DB_VERSION {
                 return Err(DbError::Other(format!(
-                    "versión de archivo no soportada: {}",
+                    "unsupported file version: {}",
                     file_meta.version
                 )));
             }
             file_meta.page_count
         };
 
-        // Cargar FreeList desde página 1.
+        // Load FreeList from page 1.
         let freelist = {
             let bitmap_page = Self::read_page_from_mmap(&mmap, 1)?;
             FreeList::from_bytes(bitmap_page.body(), page_count)
         };
 
-        info!(path = %path.display(), page_count, "base de datos abierta");
-        debug!(free_pages = freelist.free_count(), "freelist cargada desde disco");
+        info!(path = %path.display(), page_count, "database opened");
+        debug!(free_pages = freelist.free_count(), "freelist loaded from disk");
 
         Ok(MmapStorage {
             mmap,
@@ -177,32 +177,32 @@ impl MmapStorage {
         })
     }
 
-    /// Extiende el archivo en `extra_pages` páginas, remapea y actualiza metadata.
+    /// Extends the file by `extra_pages` pages, remaps, and updates metadata.
     ///
-    /// Retorna el `page_id` de la primera página nueva.
+    /// Returns the `page_id` of the first new page.
     pub fn grow(&mut self, extra_pages: u64) -> Result<u64, DbError> {
         let old_count = self.page_count();
         let new_count = old_count + extra_pages;
-        debug!(old_count, new_count, extra_pages, "storage creciendo");
+        debug!(old_count, new_count, extra_pages, "growing storage");
         let new_size = new_count * PAGE_SIZE as u64;
 
         self.file.set_len(new_size)?;
 
-        // SAFETY: archivo extendido a `new_size` bytes. Sin referencias externas
-        // al mmap anterior (tenemos `&mut self`).
+        // SAFETY: file extended to `new_size` bytes. No external references to
+        // the previous mapping (we hold `&mut self`).
         self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
 
-        // Actualizar page_count en meta y CRC32c.
+        // Update page_count in meta and its CRC32c.
         self.update_page_count_in_mmap(new_count);
 
-        // Extender la freelist para cubrir las nuevas páginas.
+        // Extend the freelist to cover the new pages.
         self.freelist.grow(new_count);
         Self::write_freelist_to_mmap(&mut self.mmap, &self.freelist)?;
 
         Ok(old_count)
     }
 
-    // ── Privados ──────────────────────────────────────────────────────────────
+    // ── Private helpers ───────────────────────────────────────────────────────
 
     fn read_page_from_mmap(mmap: &MmapMut, page_id: u64) -> Result<&Page, DbError> {
         let offset = page_id as usize * PAGE_SIZE;
@@ -210,9 +210,10 @@ impl MmapStorage {
             return Err(DbError::PageNotFound { page_id });
         }
         let ptr = mmap[offset..].as_ptr();
-        // SAFETY: offset dentro del mmap (verificado). mmap alineado ≥4KB (múltiplo de 64).
-        // PAGE_SIZE=16384 múltiplo de 64 → cada página cumple align_of::<Page>()==64.
-        // Page es repr(C, align(64)). Sin alias mutables (función toma &MmapMut).
+        // SAFETY: offset is within the mmap (verified above). The mmap is aligned
+        // to ≥4 KB (a multiple of 64). PAGE_SIZE=16384 is a multiple of 64, so
+        // every page satisfies align_of::<Page>()==64. Page is repr(C, align(64)).
+        // No mutable aliases — function takes &MmapMut.
         let page = unsafe { &*(ptr as *const Page) };
         page.verify_checksum()?;
         Ok(page)
@@ -227,8 +228,8 @@ impl MmapStorage {
             page_count,
             _reserved: [0u8; PAGE_SIZE - HEADER_SIZE - 24],
         };
-        // SAFETY: body y DbFileMeta tienen el mismo tamaño (const assert).
-        // Escritura a memoria exclusiva de meta_page.
+        // SAFETY: body and DbFileMeta have the same size (const assert).
+        // Writing to the exclusive memory of meta_page.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 &file_meta as *const DbFileMeta as *const u8,
@@ -245,35 +246,35 @@ impl MmapStorage {
         let mut bitmap_page = Page::new(PageType::Free, 1);
         freelist.to_bytes(bitmap_page.body_mut());
         bitmap_page.update_checksum();
-        let offset = PAGE_SIZE; // página 1
+        let offset = PAGE_SIZE; // page 1
         mmap[offset..offset + PAGE_SIZE].copy_from_slice(bitmap_page.as_bytes());
         Ok(())
     }
 
     fn parse_file_meta(page: &Page) -> &DbFileMeta {
-        // SAFETY: body tiene PAGE_SIZE-HEADER_SIZE bytes = size_of::<DbFileMeta>()
-        // (const assert). Page está align(64), body[0] en offset 64 → align 64.
-        // DbFileMeta es repr(C) sin padding (tamaño == suma de campos).
+        // SAFETY: body has PAGE_SIZE-HEADER_SIZE bytes = size_of::<DbFileMeta>()
+        // (const assert). Page is align(64), body[0] is at offset 64 → align 64.
+        // DbFileMeta is repr(C) with no padding (size == sum of fields).
         unsafe { &*(page.body().as_ptr() as *const DbFileMeta) }
     }
 
-    /// Lee un u64 little-endian en `offset` del mmap.
+    /// Reads a little-endian u64 at `offset` from the mmap slice.
     ///
-    /// El slice siempre tiene exactamente 8 bytes (offset verificado por el
-    /// caller o constante estática), por lo que la conversión no puede fallar.
+    /// The slice always has exactly 8 bytes (offset is verified by the caller
+    /// or is a compile-time constant), so the conversion cannot fail.
     #[inline]
     fn read_u64_at(mmap: &[u8], offset: usize) -> u64 {
-        // SAFETY del try_into: el slice tiene exactamente 8 bytes porque
-        // `offset + 8 <= mmap.len()` está garantizado por la invariante de que
-        // el mmap tiene al menos PAGE_SIZE bytes y PAGE_COUNT_OFFSET + 8 < PAGE_SIZE.
+        // SAFETY of try_into: the slice has exactly 8 bytes because
+        // `offset + 8 <= mmap.len()` is guaranteed by the invariant that the
+        // mmap has at least PAGE_SIZE bytes and PAGE_COUNT_OFFSET + 8 < PAGE_SIZE.
         u64::from_le_bytes(
             mmap[offset..offset + 8]
                 .try_into()
-                .expect("slice de 8 bytes para u64 — garantizado por invariante del mmap"),
+                .expect("8-byte slice for u64 — guaranteed by mmap invariant"),
         )
     }
 
-    /// Actualiza page_count y CRC32c de la meta page directamente en el mmap.
+    /// Updates page_count and the CRC32c of the meta page directly in the mmap.
     fn update_page_count_in_mmap(&mut self, count: u64) {
         self.mmap[PAGE_COUNT_OFFSET..PAGE_COUNT_OFFSET + 8].copy_from_slice(&count.to_le_bytes());
         let checksum = crc32c::crc32c(&self.mmap[HEADER_SIZE..PAGE_SIZE]);
@@ -285,7 +286,7 @@ impl MmapStorage {
 
 impl StorageEngine for MmapStorage {
     fn read_page(&self, page_id: u64) -> Result<&Page, DbError> {
-        // Leer page_count directo del mmap sin verificar checksum — hot path.
+        // Read page_count directly from the mmap without verifying the checksum — hot path.
         let count = Self::read_u64_at(&self.mmap, PAGE_COUNT_OFFSET);
         if page_id >= count {
             return Err(DbError::PageNotFound { page_id });
@@ -329,7 +330,7 @@ impl StorageEngine for MmapStorage {
     fn free_page(&mut self, page_id: u64) -> Result<(), DbError> {
         if page_id == 0 || page_id == 1 {
             return Err(DbError::Other(format!(
-                "no se puede liberar la página reservada {page_id}"
+                "cannot free reserved page {page_id}"
             )));
         }
         self.freelist.free(page_id)?;
@@ -338,7 +339,7 @@ impl StorageEngine for MmapStorage {
     }
 
     fn flush(&mut self) -> Result<(), DbError> {
-        // Persistir freelist si fue modificada desde el último flush.
+        // Persist the freelist if it was modified since the last flush.
         if self.freelist_dirty {
             Self::write_freelist_to_mmap(&mut self.mmap, &self.freelist)?;
             self.freelist_dirty = false;
@@ -353,7 +354,7 @@ impl StorageEngine for MmapStorage {
 }
 
 impl MmapStorage {
-    /// Número de páginas libres actualmente (para benchmarks y monitoreo).
+    /// Returns the number of currently free pages (for benchmarks and monitoring).
     pub fn free_count(&self) -> u64 {
         self.freelist.free_count()
     }
@@ -389,11 +390,11 @@ mod tests {
         let path = tmp_path();
         let _storage1 = MmapStorage::create(&path).unwrap();
 
-        // Segundo intento de abrir mientras el primero está vivo → FileLocked.
+        // Second open attempt while the first is still alive → FileLocked.
         let result = MmapStorage::open(&path);
         assert!(
             matches!(result, Err(DbError::FileLocked { .. })),
-            "esperaba FileLocked, obtuvo un resultado distinto"
+            "expected FileLocked, got a different result"
         );
     }
 
@@ -404,7 +405,7 @@ mod tests {
             let _storage = MmapStorage::create(&path).unwrap();
             // _storage tiene el lock
         }
-        // Drop liberó el lock; reabrir debe funcionar.
+        // Drop released the lock; reopening must succeed.
         let storage = MmapStorage::open(&path).unwrap();
         assert_eq!(storage.page_count(), GROW_PAGES);
     }
@@ -446,12 +447,12 @@ mod tests {
             allocated = storage.alloc_page(PageType::Data).unwrap();
             storage.flush().unwrap();
         }
-        // Reabrir — el freelist debe recordar que `allocated` está en uso.
+        // Reopen — the freelist must remember that `allocated` is in use.
         let mut storage = MmapStorage::open(&path).unwrap();
         let next = storage.alloc_page(PageType::Data).unwrap();
         assert_ne!(
             next, allocated,
-            "freelist no persistió: reutilizó página en uso"
+            "freelist did not persist: reused an in-use page"
         );
     }
 
@@ -460,11 +461,11 @@ mod tests {
         let path = tmp_path();
         let mut storage = MmapStorage::create(&path).unwrap();
         let initial_count = storage.page_count();
-        // Agotar todas las páginas libres (GROW_PAGES - 2 reservadas).
+        // Exhaust all free pages (GROW_PAGES - 2 reserved).
         for _ in 0..(GROW_PAGES - 2) {
             storage.alloc_page(PageType::Data).unwrap();
         }
-        // El siguiente alloc debe crecer automáticamente.
+        // The next alloc must trigger an automatic grow.
         storage.alloc_page(PageType::Data).unwrap();
         assert!(storage.page_count() > initial_count);
     }
