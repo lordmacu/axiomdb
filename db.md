@@ -4520,6 +4520,135 @@ Fase 22 — Features de producto      (semana 40-42)
   ✓ GraphQL subscriptions vía WAL stream — WebSocket, eventos en tiempo real sin polling
   ✓ GraphQL DataLoader integrado — batch loading automático, cero N+1
   ✓ GraphQL introspection — compatible con Apollo Studio, Postman, codegen
+  ✓ OData v4 nativo — puerto :3309, PowerBI/Excel/Tableau/SAP sin drivers ni ODBC
+  ✓ OData $metadata — EDMX autodescubierto desde catálogo (PowerBI lo usa al conectar)
+  ✓ OData $filter/$select/$orderby/$top/$skip/$count/$expand/$batch
+
+---
+
+## OData v4 API Nativa
+
+### Por qué OData
+
+OData (Open Data Protocol) es el estándar REST usado por PowerBI, Excel Power Query,
+Tableau, SAP, Microsoft Dynamics y prácticamente todo el ecosistema enterprise.
+Con un endpoint OData, NexusDB se conecta a PowerBI sin drivers, sin ODBC, sin gateway —
+el analista escribe la URL y tiene sus datos en segundos.
+
+### Arquitectura
+
+```
+PowerBI / Excel / Tableau / SAP
+        │
+        │ HTTP  :3309
+        │ GET /odata/$metadata        ← descubrir schema
+        │ GET /odata/users?$filter=.. ← query con filtros
+        │ GET /odata/orders?$expand=customer ← JOIN por FK
+        ▼
+┌─────────────────────────────┐
+│     OData v4 Server         │
+│  (axum + Tokio)             │
+│                             │
+│  $metadata ← Catálogo       │  ← documento EDMX autodescubierto
+│  $filter   → WHERE clause   │  ← parser OData → AST SQL
+│  $expand   → JOIN por FK    │  ← el catálogo conoce las FKs
+│  $orderby  → ORDER BY       │
+│  $top/$skip → LIMIT/OFFSET  │
+│  $count    → COUNT(*)       │
+│  $select   → column pruning │
+└─────────────────────────────┘
+        │
+        ▼
+   Motor NexusDB (compartido con MySQL, PostgreSQL, GraphQL)
+```
+
+### Endpoint $metadata — autodescubierto
+
+PowerBI llama a `GET /odata/$metadata` al conectar. NexusDB genera el documento
+EDMX desde el catálogo de tablas sin configuración manual:
+
+```xml
+<!-- GET /odata/$metadata -->
+<edmx:Edmx Version="4.0">
+  <edmx:DataServices>
+    <Schema Namespace="NexusDB">
+      <EntityType Name="User">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="Name" Type="Edm.String"/>
+        <Property Name="Email" Type="Edm.String"/>
+        <Property Name="CreatedAt" Type="Edm.DateTimeOffset"/>
+        <NavigationProperty Name="Orders" Type="Collection(NexusDB.Order)"/>
+      </EntityType>
+      <EntitySet Name="Users" EntityType="NexusDB.User"/>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+```
+
+### Queries OData → SQL
+
+```
+GET /odata/users?$filter=age gt 25 and country eq 'CO'
+→ SELECT * FROM users WHERE age > 25 AND country = 'CO'
+
+GET /odata/orders?$select=id,total&$orderby=total desc&$top=10&$skip=20
+→ SELECT id, total FROM orders ORDER BY total DESC LIMIT 10 OFFSET 20
+
+GET /odata/orders?$expand=customer&$filter=total gt 100
+→ SELECT orders.*, customers.* FROM orders
+  JOIN customers ON orders.customer_id = customers.id
+  WHERE orders.total > 100
+
+GET /odata/users/$count
+→ SELECT COUNT(*) FROM users
+```
+
+### Conexión desde PowerBI
+
+```
+1. PowerBI → Obtener datos → OData Feed
+2. URL: http://servidor:3309/odata
+3. PowerBI llama a /odata/$metadata → descubre tablas automáticamente
+4. El analista elige qué tablas importar
+5. PowerBI genera queries OData → NexusDB las traduce a SQL → retorna JSON
+6. Sin drivers, sin ODBC, sin gateway — funciona en cualquier OS
+```
+
+### Tipos OData ↔ NexusDB
+
+| Tipo NexusDB | Tipo OData (Edm) |
+|---|---|
+| INT, BIGINT | Edm.Int32, Edm.Int64 |
+| REAL, DOUBLE | Edm.Single, Edm.Double |
+| DECIMAL | Edm.Decimal |
+| TEXT, VARCHAR | Edm.String |
+| BOOL | Edm.Boolean |
+| DATE | Edm.Date |
+| TIMESTAMPTZ | Edm.DateTimeOffset |
+| UUID | Edm.Guid |
+| BYTEA | Edm.Binary |
+
+### Puerto y configuración
+
+```toml
+# nexusdb.toml
+[odata]
+enabled  = true
+port     = 3309
+path     = "/odata"
+auth     = "bearer"   # bearer, basic, none
+max_page = 1000       # máximo de filas por respuesta ($top implícito)
+```
+
+### Diferenciador
+
+| Herramienta | Forma de conectar a una BD | Con NexusDB OData |
+|---|---|---|
+| PowerBI | ODBC driver + gateway + configuración | URL directa, cero instalación |
+| Excel | Complemento + driver | Datos → OData Feed → URL |
+| Tableau | Driver específico por BD | Conector Web Data Connector |
+| SAP | Adaptador custom | Endpoint estándar OData v4 |
 
 ---
 

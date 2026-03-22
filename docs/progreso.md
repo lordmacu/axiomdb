@@ -255,6 +255,12 @@
 - [ ] 22.11 ⏳ GraphQL subscriptions — WAL como stream de eventos, WebSocket, sin polling
 - [ ] 22.12 ⏳ GraphQL DataLoader — batch loading automático, elimina el problema N+1
 - [ ] 22.13 ⏳ GraphQL introspection — schema completo para Apollo Studio, Postman, codegen
+- [ ] 22.14 ⏳ **OData v4 nativo** — endpoint HTTP `:3309`, compatible con PowerBI, Excel, Tableau, SAP sin drivers
+- [ ] 22.15 ⏳ OData `$metadata` — documento EDMX autodescubierto desde el catálogo (PowerBI lo consume al conectar)
+- [ ] 22.16 ⏳ OData queries — `$filter`, `$select`, `$orderby`, `$top`, `$skip`, `$count` mapeados a SQL
+- [ ] 22.17 ⏳ OData `$expand` — JOINs por FK: `/odata/orders?$expand=customer` sin SQL manual
+- [ ] 22.18 ⏳ OData batch requests — múltiples operaciones en un solo HTTP request (`$batch`)
+- [ ] 22.19 ⏳ OData autenticación — Bearer token + Basic Auth para conectores enterprise
 
 ### Fase 23 — Retrocompatibilidad `⏳` semana 43-45
 - [ ] 23.1 ⏳ Lector SQLite nativo — parsear formato binario `.db`/`.sqlite`
