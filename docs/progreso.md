@@ -7,14 +7,14 @@
 
 ## BLOQUE 1 — Fundamentos del Motor (Fases 1-7)
 
-### Fase 1 — Storage básico `🔄` semana 1-2
+### Fase 1 — Storage básico `✅` semana 1-2
 - [x] 1.1 ✅ Workspace setup — Cargo.toml, estructura de carpetas, CI básico
 - [x] 1.2 ✅ Formato de página — `struct Page`, `PageType`, CRC32c checksum, align(64)
 - [x] 1.3 ✅ MmapStorage — abrir/crear `.db`, `read_page`, `write_page` con mmap
 - [x] 1.4 ✅ MemoryStorage — implementación en RAM para tests (sin I/O)
 - [x] 1.5 ✅ Free list — `alloc_page`, `free_page`, bitmap de páginas libres
 - [x] 1.6 ✅ Trait StorageEngine — unificar Mmap y Memory con trait intercambiable
-- [ ] 1.7 ⏳ Tests + benchmarks — unit, integration, bench de read/write de páginas
+- [x] 1.7 ✅ Tests + benchmarks — unit, integration, bench de read/write de páginas
 
 ### Fase 2 — B+ Tree `⏳` semana 3-4
 - [ ] 2.1 ⏳ Estructuras de nodo — `BTreeNode`, hojas e internos, linked list de hojas

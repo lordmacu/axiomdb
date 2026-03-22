@@ -49,6 +49,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Concurrent data structures
 dashmap = "5"
 
+# Testing / benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+
 # Internal crates
 nexusdb-core  = { path = "crates/nexusdb-core" }
 nexusdb-types = { path = "crates/nexusdb-types" }
