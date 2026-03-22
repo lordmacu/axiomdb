@@ -1,0 +1,14 @@
+[package]
+name        = "nexusdb-embedded"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name       = "nexusdb_embedded"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+nexusdb-core = { workspace = true }
+thiserror    = { workspace = true }
