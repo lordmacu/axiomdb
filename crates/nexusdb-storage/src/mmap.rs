@@ -41,10 +41,7 @@ const _: () = assert!(
 /// La página 0 es siempre la página Meta con `DbFileMeta` en su body.
 pub struct MmapStorage {
     mmap: MmapMut,
-    /// El descriptor debe mantenerse abierto mientras `mmap` esté activo.
-    /// En Unix, cerrar el fd no invalida el mmap, pero lo conservamos para
-    /// poder hacer `set_len` al crecer el archivo en fases futuras.
-    #[allow(dead_code)]
+    /// El descriptor se mantiene abierto para `set_len` en `grow`.
     file: File,
 }
 
@@ -163,6 +160,55 @@ impl MmapStorage {
         self.file_meta(meta_page).page_count
     }
 
+    /// Extiende el archivo en `extra_pages` páginas y remapea.
+    ///
+    /// Retorna el `page_id` de la primera página nueva.
+    /// El mmap anterior se invalida — no deben existir referencias a él.
+    pub fn grow(&mut self, extra_pages: u64) -> Result<u64, DbError> {
+        let old_count = self.page_count();
+        let new_count = old_count + extra_pages;
+        let new_size = new_count * PAGE_SIZE as u64;
+
+        // Extender el archivo.
+        self.file.set_len(new_size)?;
+
+        // Re-mapear: el MmapMut anterior se reemplaza. No hay referencias
+        // externas pendientes porque `grow` toma `&mut self`.
+        //
+        // SAFETY: el archivo tiene exactamente `new_size` bytes tras set_len.
+        // No existen otros mapeos activos sobre este fd.
+        self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
+
+        // Actualizar page_count en la meta page.
+        self.set_page_count(new_count)?;
+
+        Ok(old_count) // primer page_id nuevo
+    }
+
+    /// Actualiza `page_count` en la meta page (página 0) a bajo nivel,
+    /// sin releer toda la página — usa el offset fijo del campo en DbFileMeta.
+    ///
+    /// Layout en el archivo:
+    ///   [0..64]  PageHeader
+    ///   [64..72] db_magic: u64
+    ///   [72..76] version: u32
+    ///   [76..80] _pad: u32
+    ///   [80..88] page_count: u64  ← aquí escribimos
+    ///   [88..12] checksum en header está en bytes [12..16]
+    pub fn set_page_count(&mut self, count: u64) -> Result<(), DbError> {
+        const PAGE_COUNT_OFFSET: usize = HEADER_SIZE + 8 + 4 + 4; // = 80
+        const CHECKSUM_OFFSET: usize = 12; // dentro del header
+
+        // Actualizar page_count.
+        self.mmap[PAGE_COUNT_OFFSET..PAGE_COUNT_OFFSET + 8].copy_from_slice(&count.to_le_bytes());
+
+        // Recalcular CRC32c del body (bytes HEADER_SIZE..PAGE_SIZE).
+        let checksum = crc32c::crc32c(&self.mmap[HEADER_SIZE..PAGE_SIZE]);
+        self.mmap[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
+
+        Ok(())
+    }
+
     // ── Privados ──────────────────────────────────────────────────────────────
 
     /// Referencia zero-copy a una página del mmap sin validar page_count.
@@ -274,5 +320,51 @@ mod tests {
         let page = Page::new(PageType::Data, 999);
         let result = storage.write_page(GROW_PAGES + 1, &page);
         assert!(matches!(result, Err(DbError::PageNotFound { .. })));
+    }
+
+    #[test]
+    fn test_grow_extends_page_count() {
+        let path = tmp_path();
+        let mut storage = MmapStorage::create(&path).unwrap();
+        let old_count = storage.page_count();
+        let first_new = storage.grow(64).unwrap();
+        assert_eq!(first_new, old_count);
+        assert_eq!(storage.page_count(), old_count + 64);
+    }
+
+    #[test]
+    fn test_grow_new_pages_are_writable() {
+        let path = tmp_path();
+        let mut storage = MmapStorage::create(&path).unwrap();
+        let first_new = storage.grow(64).unwrap();
+
+        let mut page = Page::new(PageType::Data, first_new);
+        page.body_mut()[0] = 0x99;
+        page.update_checksum();
+
+        storage.write_page(first_new, &page).unwrap();
+        assert_eq!(storage.read_page(first_new).unwrap().body()[0], 0x99);
+    }
+
+    #[test]
+    fn test_grow_persists_after_reopen() {
+        let path = tmp_path();
+        let expected_count;
+        {
+            let mut storage = MmapStorage::create(&path).unwrap();
+            storage.grow(64).unwrap();
+            expected_count = storage.page_count();
+            storage.flush().unwrap();
+        }
+        let storage = MmapStorage::open(&path).unwrap();
+        assert_eq!(storage.page_count(), expected_count);
+    }
+
+    #[test]
+    fn test_set_page_count_updates_meta() {
+        let path = tmp_path();
+        let mut storage = MmapStorage::create(&path).unwrap();
+        storage.set_page_count(256).unwrap();
+        assert_eq!(storage.page_count(), 256);
     }
 }
