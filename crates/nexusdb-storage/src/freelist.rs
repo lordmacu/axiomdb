@@ -60,7 +60,14 @@ impl FreeList {
         let mut words = vec![0u64; n_words];
         for (i, w) in words.iter_mut().enumerate() {
             let off = i * 8;
-            *w = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+            // El slice tiene exactamente 8 bytes: `off = i * 8` y
+            // `bytes.len() >= BITMAP_BODY_BYTES` (assert arriba), con
+            // `i < n_words` y `n_words * 8 <= BITMAP_BODY_BYTES`.
+            *w = u64::from_le_bytes(
+                bytes[off..off + 8]
+                    .try_into()
+                    .expect("slice de 8 bytes garantizado por invariante de BITMAP_BODY_BYTES"),
+            );
         }
         // Garantizar que bits sobrantes están a cero (USED).
         Self::mask_tail(&mut words, total_pages);

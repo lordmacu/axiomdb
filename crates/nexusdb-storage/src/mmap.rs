@@ -210,6 +210,22 @@ impl MmapStorage {
         unsafe { &*(page.body().as_ptr() as *const DbFileMeta) }
     }
 
+    /// Lee un u64 little-endian en `offset` del mmap.
+    ///
+    /// El slice siempre tiene exactamente 8 bytes (offset verificado por el
+    /// caller o constante estática), por lo que la conversión no puede fallar.
+    #[inline]
+    fn read_u64_at(mmap: &[u8], offset: usize) -> u64 {
+        // SAFETY del try_into: el slice tiene exactamente 8 bytes porque
+        // `offset + 8 <= mmap.len()` está garantizado por la invariante de que
+        // el mmap tiene al menos PAGE_SIZE bytes y PAGE_COUNT_OFFSET + 8 < PAGE_SIZE.
+        u64::from_le_bytes(
+            mmap[offset..offset + 8]
+                .try_into()
+                .expect("slice de 8 bytes para u64 — garantizado por invariante del mmap"),
+        )
+    }
+
     /// Actualiza page_count y CRC32c de la meta page directamente en el mmap.
     fn update_page_count_in_mmap(&mut self, count: u64) {
         self.mmap[PAGE_COUNT_OFFSET..PAGE_COUNT_OFFSET + 8].copy_from_slice(&count.to_le_bytes());
@@ -222,14 +238,8 @@ impl MmapStorage {
 
 impl StorageEngine for MmapStorage {
     fn read_page(&self, page_id: u64) -> Result<&Page, DbError> {
-        let count = {
-            // Leer page_count directo del mmap sin ir por read_page_raw para
-            // evitar la verificación de checksum extra en hot path.
-            let bytes: [u8; 8] = self.mmap[PAGE_COUNT_OFFSET..PAGE_COUNT_OFFSET + 8]
-                .try_into()
-                .unwrap();
-            u64::from_le_bytes(bytes)
-        };
+        // Leer page_count directo del mmap sin verificar checksum — hot path.
+        let count = Self::read_u64_at(&self.mmap, PAGE_COUNT_OFFSET);
         if page_id >= count {
             return Err(DbError::PageNotFound { page_id });
         }
@@ -286,10 +296,7 @@ impl StorageEngine for MmapStorage {
     }
 
     fn page_count(&self) -> u64 {
-        let bytes: [u8; 8] = self.mmap[PAGE_COUNT_OFFSET..PAGE_COUNT_OFFSET + 8]
-            .try_into()
-            .unwrap();
-        u64::from_le_bytes(bytes)
+        Self::read_u64_at(&self.mmap, PAGE_COUNT_OFFSET)
     }
 }
 
