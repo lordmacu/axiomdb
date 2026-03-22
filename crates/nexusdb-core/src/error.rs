@@ -51,6 +51,16 @@ pub enum DbError {
     #[error("violación de CHECK en {table}.{constraint}")]
     CheckViolation { table: String, constraint: String },
 
+    // ── WAL ──────────────────────────────────────────────────────
+    #[error("WAL entry en LSN {lsn} tiene checksum inválido: esperado {expected:#010x}, obtenido {got:#010x}")]
+    WalChecksumMismatch { lsn: u64, expected: u32, got: u32 },
+
+    #[error("WAL entry en LSN {lsn} está truncado — el archivo puede estar corrupto")]
+    WalEntryTruncated { lsn: u64 },
+
+    #[error("WAL entry tiene tipo desconocido: {byte:#04x}")]
+    WalUnknownEntryType { byte: u8 },
+
     // ── Transacciones ────────────────────────────────────────────
     #[error("deadlock detectado entre transacciones")]
     DeadlockDetected,
