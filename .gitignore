@@ -1,0 +1,55 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# Datos de la BD (no commitear datos de prueba)
+*.db
+*.wal
+*.idx
+*.fts
+*.bloom
+*.toast
+
+# Backups
+*.backup
+wal_archive/
+
+# Logs
+*.log
+/var/log/
+
+# Configuración local con secretos
+dbyo.local.toml
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Benchmarks output
+/target/criterion/
+flamegraph.svg
+perf.data*
+
+# Fuzz artifacts (solo guardar corpus, no crashes)
+fuzz/artifacts/
+fuzz/coverage/
+
+# Checkpoint files temporales (commitear solo los relevantes)
+docs/checkpoint-*.md
+
+# ONNX models (demasiado grandes para git)
+*.onnx
+/models/
+
+# Secrets nunca al repo
+*.pem
+*.crt
+*.key
+server.crt
+server.key
+ca.crt
