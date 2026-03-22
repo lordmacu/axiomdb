@@ -88,9 +88,7 @@ git commit -m "feat(fase-N): [descripción concisa]
 - [detalle 2]
 
 Fase N/34 completada. Ver docs/fase-N.md
-Spec: specs/fase-N/ | Tests: X pasando
-
-Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+Spec: specs/fase-N/ | Tests: X pasando"
 ```
 
 ## Paso 6 — Confirmar al usuario

@@ -84,9 +84,7 @@ git add docs/progreso.md .claude/projects/*/memory/project_state.md
 git commit -m "progress(N.M): completar [descripción breve de la subfase]
 
 Subfase N.M de Fase N completada.
-Progreso: X/185 subfases (Y%)
-
-Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+Progreso: X/225 subfases (Y%)"
 ```
 
 ### Paso 7 — Reportar al usuario
