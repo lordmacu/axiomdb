@@ -13,7 +13,7 @@
 - [x] 1.3 ✅ MmapStorage — abrir/crear `.db`, `read_page`, `write_page` con mmap
 - [x] 1.4 ✅ MemoryStorage — implementación en RAM para tests (sin I/O)
 - [x] 1.5 ✅ Free list — `alloc_page`, `free_page`, bitmap de páginas libres
-- [ ] 1.6 ⏳ Trait StorageEngine — unificar Mmap y Memory con trait intercambiable
+- [x] 1.6 ✅ Trait StorageEngine — unificar Mmap y Memory con trait intercambiable
 - [ ] 1.7 ⏳ Tests + benchmarks — unit, integration, bench de read/write de páginas
 
 ### Fase 2 — B+ Tree `⏳` semana 3-4

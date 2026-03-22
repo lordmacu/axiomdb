@@ -13,19 +13,8 @@ pub struct RecordId {
 /// Identificador de transacción.
 pub type TxnId = u64;
 
-/// Trait central del motor de almacenamiento.
-/// Implementaciones: MmapStorage, MemoryStorage, EncryptedStorage.
-pub trait StorageEngine: Send + Sync {
-    fn read_page(&self, page_id: PageId) -> Result<Box<[u8; 8192]>>;
-    fn write_page(&self, page_id: PageId, data: &[u8; 8192]) -> Result<()>;
-    fn alloc_page(&self) -> Result<PageId>;
-    fn free_page(&self, page_id: PageId) -> Result<()>;
-    fn flush(&self) -> Result<()>;
-    fn total_pages(&self) -> u64;
-}
-
-/// Trait central de índice.
-/// Implementaciones: BTreeIndex, HashIndex, HnswIndex, FtsIndex.
+/// Trait de índice — implementaciones: BTreeIndex, HashIndex, HnswIndex, FtsIndex.
+/// Nota: StorageEngine vive en nexusdb-storage (usa Page/PageType, evita ciclo de deps).
 pub trait Index: Send + Sync {
     fn insert(&self, key: &[u8], rid: RecordId) -> Result<()>;
     fn delete(&self, key: &[u8], rid: RecordId) -> Result<()>;
