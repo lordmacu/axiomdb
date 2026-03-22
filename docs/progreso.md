@@ -16,15 +16,16 @@
 - [x] 1.6 ✅ Trait StorageEngine — unificar Mmap y Memory con trait intercambiable
 - [x] 1.7 ✅ Tests + benchmarks — unit, integration, bench de read/write de páginas
 
-### Fase 2 — B+ Tree `⏳` semana 3-4
-- [ ] 2.1 ⏳ Estructuras de nodo — `BTreeNode`, hojas e internos, linked list de hojas
-- [ ] 2.2 ⏳ Lookup por key exacto — búsqueda O(log n) desde root hasta hoja
-- [ ] 2.3 ⏳ Insert con split — split de hoja y propagación al nodo interno
-- [ ] 2.4 ⏳ Range scan — recorrer linked list de hojas para rangos
-- [ ] 2.5 ⏳ Delete con merge — merge y redistribución de nodos
-- [ ] 2.6 ⏳ Copy-on-Write — raíz atómica con AtomicU64 + CAS, readers sin locks
-- [ ] 2.7 ⏳ Prefix compression — comprimir keys con prefijo común en nodos internos
-- [ ] 2.8 ⏳ Tests + benchmarks — correctness, concurrencia, benchmark vs BTreeMap
+### Fase 2 — B+ Tree `✅` semana 3-4
+- [x] 2.1 ✅ Estructuras de nodo — `InternalNodePage`, `LeafNodePage`, bytemuck::Pod
+- [x] 2.2 ✅ Lookup por key exacto — búsqueda O(log n) desde root hasta hoja
+- [x] 2.3 ✅ Insert con split — split de hoja y propagación al nodo interno
+- [x] 2.4 ✅ Range scan — iterador lazy con tree traversal (CoW-safe)
+- [x] 2.5 ✅ Delete con merge — merge y redistribución de nodos
+- [x] 2.6 ✅ Copy-on-Write — raíz atómica con AtomicU64, readers lock-free por diseño
+- [x] 2.7 ✅ Prefix compression — `CompressedNode` en memoria para nodos internos
+- [x] 2.8 ✅ Tests + benchmarks — 37 tests, benchmarks Criterion vs std::BTreeMap
+- [ ] ⚠️ next_leaf linked list stale en CoW — range scan usa tree traversal en su lugar → retomar en Fase 7 (MVCC + epoch reclamation)
 
 ### Fase 3 — WAL y transacciones `⏳` semana 5
 - [ ] 3.1 ⏳ Formato WAL entry — `[LSN|Type|Table|Key|Old|New|CRC]`

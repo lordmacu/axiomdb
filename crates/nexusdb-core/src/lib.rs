@@ -8,4 +8,5 @@ pub mod traits;
 pub mod types;
 
 pub use error::DbError;
+pub use traits::{Index, PageId, RecordId, TxnId};
 pub type Result<T> = std::result::Result<T, DbError>;
