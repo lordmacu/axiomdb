@@ -328,12 +328,16 @@ pub fn encode_rid(rid: RecordId) -> [u8; 10] {
 }
 
 /// Deserializa RecordId desde 10 bytes.
+///
+/// Usa indexación directa de arrays para evitar `try_into().unwrap()` en código
+/// de producción — el compilador verifica los tamaños en tiempo de compilación.
 #[inline]
 pub fn decode_rid(buf: [u8; 10]) -> RecordId {
     RecordId {
-        // SAFETY: slices tienen tamaño exacto, try_into nunca falla.
-        page_id: u64::from_le_bytes(buf[..8].try_into().unwrap()),
-        slot_id: u16::from_le_bytes(buf[8..10].try_into().unwrap()),
+        page_id: u64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]),
+        slot_id: u16::from_le_bytes([buf[8], buf[9]]),
     }
 }
 

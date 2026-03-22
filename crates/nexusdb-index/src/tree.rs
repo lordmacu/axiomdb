@@ -18,6 +18,7 @@ use crate::page_layout::{
     cast_internal, cast_internal_mut, cast_leaf, cast_leaf_mut, InternalNodePage, LeafNodePage,
     MAX_KEY_LEN, MIN_KEYS_INTERNAL, MIN_KEYS_LEAF, NULL_PAGE, ORDER_INTERNAL, ORDER_LEAF,
 };
+use crate::prefix::CompressedNode;
 
 // ── Tipos internos ───────────────────────────────────────────────────────────
 
@@ -101,10 +102,25 @@ impl BTree {
                     return Ok(node.search(key).ok().map(|i| node.rid_at(i)));
                 }
                 NodeCopy::Internal(node) => {
-                    pid = node.child_at(node.find_child_idx(key));
+                    pid = Self::find_child_compressed(&node, key);
                 }
             }
         }
+    }
+
+    /// Traversa un nodo interno usando prefix compression en memoria.
+    ///
+    /// Extrae el prefijo común de las keys del nodo y compara solo los sufijos,
+    /// reduciendo el trabajo de comparación cuando las keys comparten prefijos largos
+    /// (e.g., UUIDs, keys con namespace como "user:000001").
+    fn find_child_compressed(node: &InternalNodePage, key: &[u8]) -> u64 {
+        let n = node.num_keys();
+        let keys: Vec<Box<[u8]>> = (0..n)
+            .map(|i| node.key_at(i).to_vec().into_boxed_slice())
+            .collect();
+        let children: Vec<u64> = (0..=n).map(|i| node.child_at(i)).collect();
+        let compressed = CompressedNode::from_keys(&keys, children);
+        compressed.children[compressed.find_child_idx(key)]
     }
 
     // ── Insert ───────────────────────────────────────────────────────────────
@@ -114,7 +130,14 @@ impl BTree {
         let root = self.root_pid.load(Ordering::Acquire);
         match Self::insert_subtree(self.storage.as_mut(), root, key, rid)? {
             InsertResult::Ok(new_root) => {
-                self.root_pid.store(new_root, Ordering::Release);
+                // CAS garantiza que si en Fase 7 hubiera otro writer concurrente,
+                // el segundo fallaría en lugar de sobrescribir silenciosamente.
+                // Con &mut self (Fase 2) siempre tiene éxito — el patrón queda listo.
+                self.root_pid
+                    .compare_exchange(root, new_root, Ordering::AcqRel, Ordering::Acquire)
+                    .map_err(|_| DbError::BTreeCorrupted {
+                        msg: "root modificado concurrentemente durante insert".into(),
+                    })?;
             }
             InsertResult::Split {
                 left_pid,
@@ -122,7 +145,11 @@ impl BTree {
                 sep,
             } => {
                 let new_root = Self::alloc_root(self.storage.as_mut(), &sep, left_pid, right_pid)?;
-                self.root_pid.store(new_root, Ordering::Release);
+                self.root_pid
+                    .compare_exchange(root, new_root, Ordering::AcqRel, Ordering::Acquire)
+                    .map_err(|_| DbError::BTreeCorrupted {
+                        msg: "root modificado concurrentemente durante insert (split)".into(),
+                    })?;
             }
         }
         Ok(())
@@ -375,7 +402,11 @@ impl BTree {
             DeleteResult::NotFound => Ok(false),
             DeleteResult::Deleted { new_pid, .. } => {
                 let final_root = Self::collapse_root(self.storage.as_mut(), new_pid)?;
-                self.root_pid.store(final_root, Ordering::Release);
+                self.root_pid
+                    .compare_exchange(root, final_root, Ordering::AcqRel, Ordering::Acquire)
+                    .map_err(|_| DbError::BTreeCorrupted {
+                        msg: "root modificado concurrentemente durante delete".into(),
+                    })?;
                 Ok(true)
             }
         }
@@ -859,7 +890,7 @@ impl BTree {
         loop {
             match NodeCopy::read(self.storage.as_ref(), pid)? {
                 NodeCopy::Leaf(_) => return Ok(pid),
-                NodeCopy::Internal(n) => pid = n.child_at(n.find_child_idx(key)),
+                NodeCopy::Internal(n) => pid = Self::find_child_compressed(&n, key),
             }
         }
     }

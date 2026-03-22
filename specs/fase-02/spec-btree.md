@@ -37,16 +37,20 @@ Page body disponible: `16,384 - 64 = 16,320 bytes`
 Total usado: 16,296 bytes ≤ 16,320 ✓
 ```
 
-### Nodo hoja (`ORDER_LEAF = 211`)
+### Nodo hoja (`ORDER_LEAF = 217`)
 
 ```
 [header:    16 bytes] is_leaf=1, pad, num_keys (u16), pad + next_leaf (u64)
-[key_lens: 211 bytes] longitud real de cada key
-[_pad:       1 byte]  alinear rids a 4 bytes
-[rids:     2,532 bytes] 211 * 12 bytes = {page_id: u64, slot_id: u16, _pad: u16}
-[keys:    13,504 bytes] 211 * 64 bytes
+[key_lens: 217 bytes] longitud real de cada key (1 byte por key)
+[rids:    2,170 bytes] 217 × 10 bytes: page_id([u8;8] LE) + slot_id([u8;2] LE)
+                       — sin padding: bytemuck usa [u8;10], alignment=1
+[keys:   13,888 bytes] 217 × 64 bytes, zero-padded
 ────────────────────────────────────────────────
-Total usado: 16,264 bytes ≤ 16,320 ✓
+Total usado: 16,291 bytes ≤ 16,320 ✓
+
+Nota: el spec original usaba RIDs de 12 bytes con padding de alineación.
+La implementación usa 10 bytes sin padding (bytemuck+[u8;N] no necesita alignment),
+logrando 217 entradas por hoja vs 211 — 3% más capacidad, 17% menos espacio por RID.
 ```
 
 ---
