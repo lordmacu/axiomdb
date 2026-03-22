@@ -113,12 +113,40 @@ Una fase a la vez. Al terminar cada fase — **protocolo de cierre obligatorio:*
 2. cargo clippy --workspace -- -D warnings sin errores
 3. cargo fmt --check sin diferencias
 4. Escribir docs/fase-N.md
-5. Actualizar memory/project_state.md
-6. Actualizar memory/architecture.md
-7. Actualizar memory/lessons.md si hubo aprendizajes
-8. Commit con formato Conventional Commits
-9. Confirmar al usuario
+5. Actualizar docs/progreso.md — marcar subfase con [x] ✅ y fase padre con 🔄
+6. Actualizar memory/project_state.md
+7. Actualizar memory/architecture.md
+8. Actualizar memory/lessons.md si hubo aprendizajes
+9. Commit con formato Conventional Commits
+10. Confirmar al usuario
 ```
+
+### Items no implementados — regla anti-gaps
+
+Si algo no se puede implementar completamente (scope, limitación técnica, dependencia futura):
+
+**NO** dejarlo sin marcar. En su lugar:
+
+1. En el spec, agregar sección:
+   ```
+   ## ⚠️ DEFERRED
+   - [descripción del gap] → pendiente en subfase X.Y
+   ```
+
+2. En `docs/progreso.md`, agregar línea bajo la subfase:
+   ```
+   - [ ] ⚠️ [descripción corta] — gap identificado, retomar en [subfase]
+   ```
+
+**Por qué:** Los gaps silenciosos se convierten en bugs o trabajo duplicado en fases futuras.
+El objetivo es tener visibilidad total del estado real del proyecto en todo momento.
+
+### Principio de implementación máxima
+
+Siempre implementar la versión más completa y correcta posible, sin importar la complejidad.
+No simplificar por comodidad. Si algo es difícil, encontrar la forma correcta de hacerlo.
+Solo marcar como DEFERRED cuando existe una **dependencia real** de otra fase o una
+limitación externa documentada — nunca por complejidad o conveniencia.
 
 **El contexto se compacta.** Escribir como si el lector no estuvo en esta sesión.
 
@@ -158,29 +186,42 @@ Nunca pushear directamente a main. Merge solo después de /review-task completo.
 
 ## /review-task — Auditar antes de cerrar
 
-1. **Revisión mecánica:**
-   - ¿Cumple todos los criterios del spec?
-   - ¿`unwrap()` en código de producción? → bloqueante
-   - ¿Código sin tests? → bloqueante
-   - ¿Unsafe sin comentario SAFETY? → bloqueante
+**OBLIGATORIO antes de cerrar cualquier fase.** No se puede hacer commit de cierre sin pasar esta revisión completa.
 
-2. **Revisión por subagente** para cada issue encontrado:
-   - Lanzar agente Explore por problema
-   - Investigar si es real o falso positivo
-   - Proponer fix concreto
+### Paso 1 — Revisión por subagente Explore
 
-3. **Checklist de cierre:**
+Lanzar un agente Explore con instrucciones de revisar:
+
+1. **Cada criterio de aceptación** de todos los specs de la fase — marcar ✅/❌
+2. **`unwrap()` en código de producción** (`src/`, excluyendo `#[cfg(test)]`) → bloqueante si existe
+3. **`unsafe` sin comentario `SAFETY:`** → bloqueante si existe
+4. **Tests de integración** en `tests/` — ¿existen? → bloqueante si no
+5. **Benchmarks** en `benches/` — ¿compilan? → bloqueante si no
+6. **Lógica de los tests** — ¿los assertions son correctos? ¿hay tests que siempre pasan sin verificar nada real?
+7. **Gaps no identificados** — ¿hay funcionalidad prometida en el spec que no está implementada?
+
+El subagente debe retornar un reporte con:
+- Lista de criterios cumplidos/no cumplidos por subfase
+- Lista de blockers encontrados (con archivo:línea)
+- Lista de gaps o deferred items
+
+### Paso 2 — Fixes de blockers
+
+Corregir **todos** los blockers antes de continuar. No hay excepciones.
+
+### Paso 3 — Checklist de cierre
    ```
-   [ ] Spec cumplido completamente
+   [ ] Todos los criterios de aceptación de todos los specs ✅
    [ ] cargo test --workspace ✅
    [ ] cargo clippy -- -D warnings ✅
    [ ] cargo fmt --check ✅
-   [ ] Sin unwrap() en src/ (solo en tests y benches)
-   [ ] Todo unsafe tiene comentario SAFETY:
-   [ ] Benchmarks no regresaron vs baseline
-   [ ] docs/fase-N.md escrito
-   [ ] memory/ actualizado
-   [ ] Commit hecho
+   [ ] Sin unwrap() en src/ (solo en tests y benches) ✅
+   [ ] Todo unsafe tiene comentario SAFETY: ✅
+   [ ] Tests de integración en tests/ ✅
+   [ ] Benchmarks compilan ✅
+   [ ] Lógica de tests revisada (no assertions vacías) ✅
+   [ ] docs/progreso.md actualizado ✅
+   [ ] Commit hecho ✅
    ```
 
 ---
