@@ -61,6 +61,9 @@ pub enum DbError {
     #[error("WAL entry tiene tipo desconocido: {byte:#04x}")]
     WalUnknownEntryType { byte: u8 },
 
+    #[error("archivo WAL inválido en '{path}': magic o versión incorrectos")]
+    WalInvalidHeader { path: String },
+
     // ── Transacciones ────────────────────────────────────────────
     #[error("deadlock detectado entre transacciones")]
     DeadlockDetected,
