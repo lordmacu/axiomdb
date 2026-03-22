@@ -132,9 +132,17 @@ feat(fase-N): descripción concisa
 
 Fase N/34 completada. Ver docs/fase-N.md
 Spec: specs/fase-N/ | Tests: crates/dbyo-X/tests/
-
-Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
 ```
+
+### Cuenta de GitHub
+
+Siempre usar la cuenta **lordmacu** (personal, NO la cuenta del trabajo).
+El repo está configurado con:
+- `user.name = lordmacu`
+- `user.email = lordmacu@users.noreply.github.com`
+- GitHub CLI autenticado como lordmacu
+
+No incluir Co-Authored-By de Claude en ningún commit de este proyecto.
 
 ### Ramas git
 
