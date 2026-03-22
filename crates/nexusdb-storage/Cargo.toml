@@ -11,6 +11,8 @@ thiserror    = { workspace = true }
 crc32c       = "0.6"
 bytemuck     = { version = "1", features = ["derive"] }
 memmap2      = "0.9"
+fs2          = "0.4"
+tracing      = { workspace = true }
 
 [dev-dependencies]
 tempfile  = "3"
