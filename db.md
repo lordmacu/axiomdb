@@ -4516,6 +4516,134 @@ Fase 22 — Features de producto      (semana 40-42)
   ✓ Multi-database: CREATE DATABASE, USE, cross-database queries
   ✓ Schema namespacing: CREATE SCHEMA, schema.tabla
   ✓ Schema migrations CLI: dbyo migrate up/down/status
+  ✓ GraphQL API nativa — puerto :3308, schema autodescubierto, queries/mutations/subscriptions
+  ✓ GraphQL subscriptions vía WAL stream — WebSocket, eventos en tiempo real sin polling
+  ✓ GraphQL DataLoader integrado — batch loading automático, cero N+1
+  ✓ GraphQL introspection — compatible con Apollo Studio, Postman, codegen
+
+---
+
+## GraphQL API Nativa
+
+### Por qué tiene sentido en NexusDB
+
+NexusDB ya expone el mismo motor por dos vías (MySQL wire protocol + C FFI embebido).
+GraphQL es un tercer protocolo de acceso que se construye encima de todo lo ya hecho,
+sin duplicar lógica. El WAL ya es un event bus — las subscriptions son una consecuencia
+natural de leerlo como stream.
+
+### Arquitectura
+
+```
+Cliente (web/mobile/backend)
+        │
+        │ WebSocket / HTTP  :3308
+        ▼
+┌─────────────────────────────┐
+│     GraphQL Server          │
+│  (async-graphql + Tokio)    │
+│                             │
+│  Schema ← Catálogo tablas   │  ← autodescubierto en runtime
+│  Queries → B+ Tree lookups  │  ← reutiliza el executor SQL
+│  Mutations → WAL + B+ Tree  │  ← misma ruta que INSERT/UPDATE/DELETE
+│  Subscriptions → WAL stream │  ← lee el WAL como canal de eventos
+└─────────────────────────────┘
+        │
+        ▼
+   Motor NexusDB (compartido)
+```
+
+### Schema autodescubierto
+
+El schema GraphQL se genera automáticamente desde el catálogo de tablas:
+
+```graphql
+# Tabla SQL:
+# CREATE TABLE users (id UUID, name TEXT, email TEXT, created_at TIMESTAMPTZ);
+
+# Schema GraphQL generado automáticamente:
+type User {
+  id: ID!
+  name: String!
+  email: String!
+  createdAt: String!
+}
+
+type Query {
+  user(id: ID!): User
+  users(limit: Int, offset: Int, orderBy: String): [User!]!
+  usersWhere(filter: UserFilter): [User!]!
+}
+
+type Mutation {
+  insertUser(input: UserInput!): User!
+  updateUser(id: ID!, input: UserInput!): User
+  deleteUser(id: ID!): Boolean!
+}
+
+type Subscription {
+  onUserChange(filter: UserFilter): UserChangeEvent!
+}
+```
+
+### Subscriptions vía WAL
+
+```rust
+// El WAL reader expone un canal de eventos:
+async fn subscribe_table(table_id: u32) -> impl Stream<Item = WalEntry> {
+    // Tail del WAL desde la posición actual
+    // Cada COMMIT con entries de esta tabla emite un evento
+    WalReader::tail(table_id)
+}
+
+// GraphQL subscription:
+// subscription { onUserChange { id name email } }
+// → lee el WAL stream → filtra por table_id → emite al WebSocket
+```
+
+### DataLoader — eliminar N+1
+
+```rust
+// Sin DataLoader (N+1):
+// query { users { id orders { id total } } }
+// → 1 query para users + N queries para orders de cada user = N+1
+
+// Con DataLoader integrado:
+// → 1 query para users + 1 query batch para todos sus orders
+// El motor conoce el FK schema → batch automático sin configuración del cliente
+```
+
+### Crate elegido
+
+`async-graphql` — el crate más completo del ecosistema Rust:
+- Subscriptions con WebSocket nativo
+- DataLoader integrado
+- Introspection completo
+- Compatible con Apollo Studio
+
+### Puerto y configuración
+
+```toml
+# nexusdb.toml
+[graphql]
+enabled = true
+port    = 3308
+path    = "/graphql"
+ws_path = "/graphql/ws"
+introspection = true   # deshabilitar en producción si se desea
+max_complexity = 100   # límite de complejidad de queries (protección DoS)
+max_depth = 10         # profundidad máxima de queries anidadas
+```
+
+### Diferenciador vs competencia
+
+| Característica | Hasura | PostGraphile | NexusDB GraphQL |
+|---|---|---|---|
+| Arquitectura | Encima de Postgres | Encima de Postgres | Nativo dentro del motor |
+| Subscriptions | Polling o logical decoding | Polling | WAL stream directo |
+| N+1 | DataLoader manual | DataLoader manual | Automático (motor conoce FKs) |
+| Setup | Servicio separado | Plugin Postgres | Un binario, un puerto más |
+| Latencia | +1 hop de red | +1 hop de red | In-process, sin hop |
 
 Fase 23 — Retrocompatibilidad       (semana 43-45)
   ✓ Lector nativo de archivos SQLite (.db/.sqlite) sin libsqlite3

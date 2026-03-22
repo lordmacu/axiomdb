@@ -250,6 +250,11 @@
 - [ ] 22.6 ⏳ Multi-database — `CREATE DATABASE`, `USE`, cross-db queries
 - [ ] 22.7 ⏳ Schema namespacing — `CREATE SCHEMA`, `schema.tabla`
 - [ ] 22.8 ⏳ Schema migrations CLI — `dbyo migrate up/down/status`
+- [ ] 22.9 ⏳ **GraphQL API nativa** — servidor GraphQL en puerto `:3308`, schema autodescubierto del catálogo
+- [ ] 22.10 ⏳ GraphQL queries y mutations — mapeadas a point lookups y range scans del B+ Tree
+- [ ] 22.11 ⏳ GraphQL subscriptions — WAL como stream de eventos, WebSocket, sin polling
+- [ ] 22.12 ⏳ GraphQL DataLoader — batch loading automático, elimina el problema N+1
+- [ ] 22.13 ⏳ GraphQL introspection — schema completo para Apollo Studio, Postman, codegen
 
 ### Fase 23 — Retrocompatibilidad `⏳` semana 43-45
 - [ ] 23.1 ⏳ Lector SQLite nativo — parsear formato binario `.db`/`.sqlite`
