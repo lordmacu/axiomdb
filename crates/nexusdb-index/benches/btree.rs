@@ -184,11 +184,45 @@ fn bench_insert_random(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Insert 1M secuencial — throughput y splits a escala ─────────────────────
+
+fn bench_insert_1m_sequential(c: &mut Criterion) {
+    let mut group = c.benchmark_group("insert_1m_sequential");
+    // Tiempo de medición extendido para 1M inserts
+    group.measurement_time(std::time::Duration::from_secs(60));
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(1_000_000));
+
+    group.bench_function("nexusdb_btree_1m", |b| {
+        b.iter(|| {
+            let mut tree = BTree::new(Box::new(MemoryStorage::new()), None).unwrap();
+            for i in 0..1_000_000u64 {
+                let key = i.to_be_bytes(); // 8 bytes, secuencial ordenado
+                tree.insert(&key, rid(i)).unwrap();
+            }
+            black_box(tree.root_page_id())
+        });
+    });
+
+    group.bench_function("std_btreemap_1m", |b| {
+        b.iter(|| {
+            let mut map = BTreeMap::new();
+            for i in 0..1_000_000u64 {
+                map.insert(i.to_be_bytes(), i);
+            }
+            black_box(map.len())
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_point_lookup,
     bench_range_scan,
     bench_insert_sequential,
     bench_insert_random,
+    bench_insert_1m_sequential,
 );
 criterion_main!(benches);

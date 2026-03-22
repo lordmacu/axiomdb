@@ -15,6 +15,12 @@ El archivo `db.md` contiene el diseño completo: arquitectura, tipos, fases, cra
 Nunca saltar pasos. Specs antes que código. Planes antes que implementación.
 Reviews antes de cerrar. Sin excepciones.
 
+### Unidad de trabajo: subfase, no fase
+
+El flujo completo se aplica **por subfase** (3.1, 3.2, 3.3…), no por fase entera.
+Cada subfase tiene su propio spec, plan, implementación y review antes de pasar a la siguiente.
+Nunca implementar varias subfases juntas sin cerrar cada una individualmente.
+
 ---
 
 ## /brainstorm — Explorar antes de proponer
@@ -209,7 +215,30 @@ El subagente debe retornar un reporte con:
 
 Corregir **todos** los blockers antes de continuar. No hay excepciones.
 
-### Paso 3 — Checklist de cierre
+### Paso 3 — Benchmarks obligatorios
+
+**OBLIGATORIO antes de cerrar.** Correr los benchmarks de la fase y reportar resultados al usuario.
+
+```bash
+cargo bench --bench [nombre_bench] 2>&1 | tee /tmp/bench-fase-N.txt
+```
+
+Reportar al usuario una tabla con:
+
+| Benchmark | Resultado | vs objetivo (CLAUDE.md) | Veredicto |
+|---|---|---|---|
+| point_lookup/1M | X ns/iter | objetivo 800k ops/s | ✅/⚠️/❌ |
+| range_scan/10K | X ms | objetivo 45ms | ✅/⚠️/❌ |
+| insert/sequential | X ns/iter | objetivo 180k ops/s | ✅/⚠️/❌ |
+
+**Umbrales:**
+- ✅ Cumple el objetivo del presupuesto de rendimiento
+- ⚠️ Dentro del máximo aceptable pero no del objetivo — documentar en `docs/fase-N.md`
+- ❌ Supera el máximo aceptable — **bloqueante**, no se puede cerrar la fase sin investigar
+
+Si hay un ❌, abrir `/debug` para identificar el cuello de botella antes de continuar.
+
+### Paso 4 — Checklist de cierre
    ```
    [ ] Todos los criterios de aceptación de todos los specs ✅
    [ ] cargo test --workspace ✅
@@ -218,7 +247,8 @@ Corregir **todos** los blockers antes de continuar. No hay excepciones.
    [ ] Sin unwrap() en src/ (solo en tests y benches) ✅
    [ ] Todo unsafe tiene comentario SAFETY: ✅
    [ ] Tests de integración en tests/ ✅
-   [ ] Benchmarks compilan ✅
+   [ ] Benchmarks corridos y resultados reportados al usuario ✅
+   [ ] Ningún benchmark ❌ (bloqueante) ✅
    [ ] Lógica de tests revisada (no assertions vacías) ✅
    [ ] docs/progreso.md actualizado ✅
    [ ] Commit hecho ✅

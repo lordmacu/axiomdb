@@ -16,6 +16,7 @@ use nexusdb_core::{error::DbError, RecordId};
 use nexusdb_storage::StorageEngine;
 
 use crate::page_layout::{cast_internal, cast_leaf, NULL_PAGE};
+use crate::prefix::CompressedNode;
 
 /// Iterador lazy de range scan.
 ///
@@ -87,10 +88,20 @@ impl<'a> RangeIter<'a> {
                 break;
             }
             let node = cast_internal(page);
-            let idx = node.find_child_idx(after_key);
+            let n = node.num_keys();
+
+            // Usar prefix compression para comparar solo sufijos en nodos
+            // con keys que comparten prefijo común (e.g., UUIDs, namespaced keys).
+            let keys: Vec<Box<[u8]>> = (0..n)
+                .map(|i| node.key_at(i).to_vec().into_boxed_slice())
+                .collect();
+            let children: Vec<u64> = (0..=n).map(|i| node.child_at(i)).collect();
+            let compressed = CompressedNode::from_keys(&keys, children);
+            let idx = compressed.find_child_idx(after_key);
+
             // Guardar este nodo con el índice del SIGUIENTE hermano (idx+1)
             stack.push((pid, idx + 1));
-            pid = node.child_at(idx);
+            pid = compressed.children[idx];
         }
 
         // 2. Subir hasta encontrar un hermano a la derecha

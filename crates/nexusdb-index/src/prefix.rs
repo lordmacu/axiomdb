@@ -86,6 +86,33 @@ impl CompressedNode {
         self.children[child_idx]
     }
 
+    /// Encuentra el índice del child para una `search_key` dada.
+    ///
+    /// Opera sobre los sufijos comprimidos — compara solo la parte única de cada key
+    /// tras extraer el prefijo común. Equivalente a `InternalNodePage::find_child_idx`
+    /// pero más eficiente cuando el prefijo común es largo.
+    ///
+    /// Retorna el índice `j` tal que `self.children[j]` contiene el rango de `search_key`.
+    pub fn find_child_idx(&self, search_key: &[u8]) -> usize {
+        let n = self.suffixes.len();
+        let plen = self.common_prefix.len();
+
+        // Si search_key no empieza con el prefijo común, navegar por extremos
+        if search_key.len() < plen || &search_key[..plen] != self.common_prefix.as_slice() {
+            return if search_key < self.common_prefix.as_slice() {
+                0 // antes de todas las keys → primer child
+            } else {
+                n // después de todas las keys → último child
+            };
+        }
+
+        // Comparar solo el sufijo (la parte única)
+        let suffix = &search_key[plen..];
+        (0..n)
+            .find(|&i| self.suffixes[i].as_slice() > suffix)
+            .unwrap_or(n)
+    }
+
     /// Longitud del prefijo común de una lista de keys.
     pub fn common_prefix_len(keys: &[Box<[u8]>]) -> usize {
         Self::find_common_prefix(keys).len()

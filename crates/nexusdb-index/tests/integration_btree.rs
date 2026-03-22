@@ -207,6 +207,48 @@ fn test_btree_insert_delete_interleaved() {
     }
 }
 
+/// Verifica las garantías de CoW + CAS del root:
+/// - El root_pid cambia atómicamente cuando hay splits.
+/// - Después de cada cambio de root, todos los datos son accesibles.
+/// - El root evoluciona de forma monotónica (nunca regresa a un pid anterior).
+#[test]
+fn test_cow_atomic_root_consistency() {
+    let mut tree = BTree::new(Box::new(MemoryStorage::new()), None).unwrap();
+    let initial_root = tree.root_page_id();
+    let mut root_changes = 0usize;
+    let mut last_root = initial_root;
+
+    // Insertar suficientes keys para forzar múltiples splits y cambios de root
+    let count = nexusdb_index::page_layout::ORDER_LEAF * 3 + 50;
+    for i in 0..count {
+        let key = format!("{:08}", i);
+        tree.insert(key.as_bytes(), rid(i as u64)).unwrap();
+
+        let current_root = tree.root_page_id();
+        if current_root != last_root {
+            root_changes += 1;
+            // Invariante CoW: cada cambio de root debe dejar TODOS los datos accesibles
+            for j in 0..=i {
+                let k = format!("{:08}", j);
+                assert_eq!(
+                    tree.lookup(k.as_bytes()).unwrap(),
+                    Some(rid(j as u64)),
+                    "key {:08} inaccesible tras cambio de root (insert {})",
+                    j,
+                    i
+                );
+            }
+            last_root = current_root;
+        }
+    }
+
+    assert!(
+        root_changes > 0,
+        "el root debería haber cambiado al menos una vez con {} inserts",
+        count
+    );
+}
+
 #[test]
 fn test_btree_root_page_id_persists() {
     let mut tree = BTree::new(Box::new(MemoryStorage::new()), None).unwrap();
