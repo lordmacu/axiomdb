@@ -24,6 +24,9 @@ pub enum DbError {
     #[error("error de I/O: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("no se puede abrir '{path}': otro proceso ya tiene el archivo bloqueado")]
+    FileLocked { path: std::path::PathBuf },
+
     // ── SQL ──────────────────────────────────────────────────────
     #[error("error de sintaxis SQL: {message}")]
     ParseError { message: String },
@@ -112,6 +115,7 @@ impl DbError {
             DbError::PermissionDenied { .. } => "42501",
             DbError::TypeMismatch { .. } => "42804",
             DbError::Io(_) => "58030",
+            DbError::FileLocked { .. } => "55006", // object_in_use
             _ => "XX000",
         }
     }

@@ -3,8 +3,10 @@ use std::{
     path::Path,
 };
 
+use fs2::FileExt;
 use memmap2::MmapMut;
 use nexusdb_core::error::DbError;
+use tracing::{debug, info, warn};
 
 use crate::{
     engine::StorageEngine,
@@ -51,14 +53,33 @@ const _: () = assert!(
 /// - Página 0: Meta (`DbFileMeta` en body)
 /// - Página 1: Bitmap de la free list (`FreeList` serializada)
 /// - Páginas 2+: Data, Index, Overflow, etc.
+///
+/// El archivo `.db` se bloquea con `flock(LOCK_EX)` al abrirse y se desbloquea
+/// al hacer drop. Esto previene corrupción por acceso simultáneo de dos procesos.
 pub struct MmapStorage {
     mmap: MmapMut,
-    /// El descriptor se mantiene abierto para `set_len` en `grow`.
+    /// El descriptor se mantiene abierto para `set_len` en `grow` y para
+    /// sostener el file lock hasta que se haga drop de este struct.
     file: File,
     /// Free list en memoria. Se persiste a página 1 de forma lazy en `flush()`.
     freelist: FreeList,
     /// Indica que el freelist fue modificado y debe persistirse en el próximo flush.
     freelist_dirty: bool,
+}
+
+impl Drop for MmapStorage {
+    fn drop(&mut self) {
+        // Drop::drop() se ejecuta con todos los campos aún vivos; los campos se
+        // dropean después en orden de declaración (mmap → file).
+        // Liberamos el lock explícitamente aquí para mayor claridad; aunque el SO
+        // también lo liberaría al cerrar el fd cuando `file` se dropee.
+        if let Err(e) = self.file.unlock() {
+            // Drop no puede retornar Result; solo se loggea.
+            warn!(error = %e, "error al liberar el file lock al cerrar la BD");
+        } else {
+            debug!("file lock liberado");
+        }
+    }
 }
 
 impl MmapStorage {
@@ -69,6 +90,14 @@ impl MmapStorage {
             .write(true)
             .create_new(true)
             .open(path)?;
+
+        // Adquirir lock exclusivo antes de cualquier escritura. Si otro proceso
+        // abrió el mismo archivo (raro en create_new, pero posible en race),
+        // fallamos de inmediato en lugar de corromper.
+        file.try_lock_exclusive()
+            .map_err(|_| DbError::FileLocked { path: path.to_owned() })?;
+
+        info!(path = %path.display(), pages = GROW_PAGES, "creando base de datos");
 
         let initial_size = GROW_PAGES * PAGE_SIZE as u64;
         file.set_len(initial_size)?;
@@ -86,6 +115,8 @@ impl MmapStorage {
         Self::write_freelist_to_mmap(&mut mmap, &freelist)?;
 
         mmap.flush()?;
+
+        debug!(path = %path.display(), "base de datos inicializada y lista");
         Ok(MmapStorage {
             mmap,
             file,
@@ -98,7 +129,15 @@ impl MmapStorage {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
 
-        // SAFETY: archivo existente, sin otros mapeos mutables activos.
+        // Adquirir lock exclusivo de forma no-bloqueante.
+        // Si otro proceso ya tiene el archivo abierto, retornamos error inmediato
+        // en lugar de bloquear o corromper.
+        file.try_lock_exclusive()
+            .map_err(|_| DbError::FileLocked { path: path.to_owned() })?;
+
+        info!(path = %path.display(), "abriendo base de datos");
+
+        // SAFETY: archivo existente, lock exclusivo adquirido — sin otros mapeos mutables activos.
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
         // Validar página 0.
@@ -127,6 +166,9 @@ impl MmapStorage {
             FreeList::from_bytes(bitmap_page.body(), page_count)
         };
 
+        info!(path = %path.display(), page_count, "base de datos abierta");
+        debug!(free_pages = freelist.free_count(), "freelist cargada desde disco");
+
         Ok(MmapStorage {
             mmap,
             file,
@@ -141,6 +183,7 @@ impl MmapStorage {
     pub fn grow(&mut self, extra_pages: u64) -> Result<u64, DbError> {
         let old_count = self.page_count();
         let new_count = old_count + extra_pages;
+        debug!(old_count, new_count, extra_pages, "storage creciendo");
         let new_size = new_count * PAGE_SIZE as u64;
 
         self.file.set_len(new_size)?;
@@ -337,6 +380,31 @@ mod tests {
             let storage = MmapStorage::create(&path).unwrap();
             assert_eq!(storage.page_count(), GROW_PAGES);
         }
+        let storage = MmapStorage::open(&path).unwrap();
+        assert_eq!(storage.page_count(), GROW_PAGES);
+    }
+
+    #[test]
+    fn test_file_lock_prevents_double_open() {
+        let path = tmp_path();
+        let _storage1 = MmapStorage::create(&path).unwrap();
+
+        // Segundo intento de abrir mientras el primero está vivo → FileLocked.
+        let result = MmapStorage::open(&path);
+        assert!(
+            matches!(result, Err(DbError::FileLocked { .. })),
+            "esperaba FileLocked, obtuvo un resultado distinto"
+        );
+    }
+
+    #[test]
+    fn test_lock_released_after_drop() {
+        let path = tmp_path();
+        {
+            let _storage = MmapStorage::create(&path).unwrap();
+            // _storage tiene el lock
+        }
+        // Drop liberó el lock; reabrir debe funcionar.
         let storage = MmapStorage::open(&path).unwrap();
         assert_eq!(storage.page_count(), GROW_PAGES);
     }
