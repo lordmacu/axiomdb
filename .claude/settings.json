@@ -1,0 +1,53 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo bench:*)",
+      "Bash(cargo fuzz:*)",
+      "Bash(cargo new:*)",
+      "Bash(cargo add:*)",
+      "Bash(cargo tree:*)",
+      "Bash(cargo flamegraph:*)",
+      "Bash(cargo install:*)",
+      "Bash(cargo run:*)",
+      "Bash(cargo check:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git checkout:*)",
+      "Bash(git branch:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git status:*)",
+      "Bash(mkdir -p:*)",
+      "Bash(cat > docs/*)",
+      "Bash(cat > specs/*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd /Users/cristian/dbyo && [ -f Cargo.toml ] && cargo fmt 2>/dev/null; exit 0"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd /Users/cristian/dbyo && [ -f Cargo.toml ] && echo '\\n── Estado al parar ──' && cargo test --workspace --quiet 2>&1 | tail -5 || echo 'Cargo.toml no existe aún'; exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}
