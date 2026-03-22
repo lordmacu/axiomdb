@@ -27,10 +27,10 @@
 - [x] 2.8 ✅ Tests + benchmarks — 37 tests, benchmarks Criterion vs std::BTreeMap
 - [ ] ⚠️ next_leaf linked list stale en CoW — range scan usa tree traversal en su lugar → retomar en Fase 7 (MVCC + epoch reclamation)
 
-### Fase 3 — WAL y transacciones `⏳` semana 5
-- [ ] 3.1 ⏳ Formato WAL entry — `[LSN|Type|Table|Key|Old|New|CRC]`
-- [ ] 3.2 ⏳ WalWriter — append-only, fsync configurable
-- [ ] 3.3 ⏳ WalReader — leer desde LSN específico, validar CRC
+### Fase 3 — WAL y transacciones `🔄` semana 5
+- [x] 3.1 ✅ Formato WAL entry — `[LSN|Type|Table|Key|Old|New|CRC]` + backward scan
+- [x] 3.2 ✅ WalWriter — append-only, LSN global, fsync en commit, open() con scan_last_lsn
+- [x] 3.3 ✅ WalReader — scan_forward(from_lsn) streaming + scan_backward() con entry_len_2
 - [ ] 3.4 ⏳ BEGIN / COMMIT / ROLLBACK básico
 - [ ] 3.5 ⏳ Crash recovery — replay del WAL al abrir la BD
 - [ ] 3.6 ⏳ Tests de durabilidad — escribir → simular crash → releer → verificar
