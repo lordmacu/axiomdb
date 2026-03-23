@@ -6,6 +6,47 @@ trade-offs accepted.
 
 ---
 
+## Query Languages
+
+### SQL + AxiomQL dual-language strategy
+
+| Aspect | Decision |
+|--------|----------|
+| **Chosen** | Two query languages sharing one AST and executor |
+| **Alternatives** | SQL only; AxiomQL only; SQL-to-AxiomQL transpiler |
+| **Phase** | Phase 12+ (post wire protocol) |
+
+**SQL is the primary language.** Full MySQL/PostgreSQL wire protocol compatibility. All ORMs, clients, and tools work without changes. Nothing breaks for anyone.
+
+**AxiomQL is an optional alternative** — a method-chain query language for developers who prefer modern, readable syntax. It compiles to the same `Stmt` AST as SQL, so there is zero executor overhead and every SQL feature is automatically available in AxiomQL.
+
+```
+SQL  ──────┐
+           ├──► AST ──► Optimizer ──► Executor
+AxiomQL ───┘
+```
+
+**AxiomQL syntax** reads top-to-bottom in the logical order of execution:
+
+```js
+users
+  .filter(active, age > 18)
+  .join(orders)
+  .group(country, total: count())
+  .sort(total.desc)
+  .take(10)
+```
+
+This is already familiar to any developer who uses `.filter().map().sort()` in JavaScript, Python, Rust, or C#. The learning curve is ~10 minutes.
+
+**Why not SQL-only:** SQL's evaluation order (SELECT before FROM, HAVING separate from WHERE) is a 50-year-old quirk that confuses new users. AxiomQL removes the confusion without removing SQL.
+
+**Why not AxiomQL-only:** Breaking compatibility with every MySQL client, ORM, and tool in existence would be unacceptable. SQL stays.
+
+**No existing database has this combination:** ORMs like ActiveRecord and Eloquent are application-layer libraries, not native DB languages. PRQL compiles to SQL externally. EdgeQL is native but a different syntax family. AxiomQL would be the first native method-chain language that coexists with SQL in the same engine.
+
+---
+
 ## Storage
 
 ### mmap over a Custom Buffer Pool
