@@ -1,0 +1,22 @@
+[book]
+title       = "NexusDB Documentation"
+authors     = ["NexusDB Team"]
+language    = "en"
+src         = "src"
+
+[output.html]
+default-theme         = "navy"
+preferred-dark-theme  = "navy"
+git-repository-url    = "https://github.com/lordmacu/nexusdb"
+git-repository-icon   = "fa-github"
+no-section-label      = true
+
+[output.html.search]
+enable            = true
+limit-results     = 20
+use-boolean-and   = true
+boost-title       = 2
+boost-hierarchy   = 1
+boost-paragraph   = 1
+expand            = true
+heading-split-level = 3
