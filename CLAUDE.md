@@ -917,7 +917,7 @@ axiomdb/
 
 ## Memory protocol — update when completing each phase
 
-Files in `.claude/projects/-Users-cristian-dbyo/memory/`:
+Files in `.claude/projects/-Users-cristian-nexusdb/memory/`:
 
 | File | When to update |
 |---|---|
