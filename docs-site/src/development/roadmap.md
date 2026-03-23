@@ -52,6 +52,7 @@ functionality. The design is organized in three blocks:
 | 4.4 | DML parser | ✅ | SELECT (all clauses), INSERT, UPDATE, DELETE |
 | 4.17 | Expression evaluator | ✅ | Three-valued NULL logic, all operators |
 | 4.18 | Semantic analyzer | ✅ | BindContext, col_idx resolution |
+| 4.18b | Type coercion matrix | ✅ | coerce(), coerce_for_op(), CoercionMode strict/permissive |
 | 4.5 | Value/DataType types | ✅ | Row codec, encode/decode, encoded_len |
 | 5 | Executor | ⚠️ Planned | Heap scan, index lookup, join, aggregate |
 | 6 | Query planner | ⚠️ Planned | Cost-based plan selection |
