@@ -9,11 +9,13 @@
 mod checkpoint;
 mod entry;
 mod reader;
+mod rotation;
 mod txn;
 mod writer;
 
 pub use checkpoint::Checkpointer;
 pub use entry::{EntryType, WalEntry, MIN_ENTRY_LEN};
 pub use reader::{BackwardIter, ForwardIter, WalReader};
+pub use rotation::WalRotator;
 pub use txn::{TxnManager, UndoOp};
 pub use writer::{WalWriter, WAL_HEADER_SIZE, WAL_MAGIC, WAL_VERSION};
