@@ -78,7 +78,7 @@ memory/lessons.md (if there were learnings):
   - Problem, cause, solution, when to apply
 ```
 
-## Step 5 — Commit
+## Step 5 — Commit and push
 
 ```bash
 git add -A
@@ -89,6 +89,8 @@ git commit -m "feat(fase-N): [concise description]
 
 Phase N/34 completed. See docs/fase-N.md
 Spec: specs/fase-N/ | Tests: X passing"
+
+git push origin main
 ```
 
 ## Step 6 — Confirm to user

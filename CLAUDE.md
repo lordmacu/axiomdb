@@ -224,8 +224,9 @@ One phase at a time. When finishing each phase — **mandatory closing protocol:
 8. Update memory/architecture.md
 9. Update memory/lessons.md if there were learnings
 10. Commit with Conventional Commits format
-11. Report progress percentages to the user (see below)
-12. Confirm to the user
+11. Push: `git push origin main`
+12. Report progress percentages to the user (see below)
+13. Confirm to the user
 ```
 
 ### Progress report — mandatory after every subfase close
@@ -577,6 +578,7 @@ Si hay un ❌, abrir `/debug` para identificar el bottleneck antes de continuar.
    [ ] Stale documentation checked (blocker if found) ✅
    [ ] Callouts added for every mandatory trigger in this subphase ✅
    [ ] Commit done ✅
+   [ ] git push origin main ✅
    ```
 
 ---
