@@ -47,7 +47,7 @@ use crate::{
     ast::{
         ColumnConstraint, CreateIndexStmt, CreateTableStmt, DeleteStmt, DropIndexStmt,
         DropTableStmt, FromClause, InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType,
-        SelectItem, SelectStmt, Stmt, UpdateStmt,
+        NullsOrder, OrderByItem, SelectItem, SelectStmt, SortOrder, Stmt, UpdateStmt,
     },
     eval::{eval, is_truthy},
     expr::{BinaryOp, Expr},
@@ -165,17 +165,7 @@ fn execute_select(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
-    // Guard unsupported clauses (ORDER BY, LIMIT, DISTINCT remain unimplemented).
-    if !stmt.order_by.is_empty() {
-        return Err(DbError::NotImplemented {
-            feature: "ORDER BY — Phase 4.10".into(),
-        });
-    }
-    if stmt.limit.is_some() {
-        return Err(DbError::NotImplemented {
-            feature: "LIMIT — Phase 4.10".into(),
-        });
-    }
+    // Guard unsupported clauses (DISTINCT remains unimplemented).
     if stmt.distinct {
         return Err(DbError::NotImplemented {
             feature: "DISTINCT — Phase 4.12".into(),
@@ -251,11 +241,18 @@ fn execute_select(
             return execute_select_grouped(stmt, combined_rows);
         }
 
+        // Sort source rows before projection (ORDER BY evaluated on source col_idx).
+        combined_rows = apply_order_by(combined_rows, &stmt.order_by)?;
+
         let out_cols = build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
-        let rows = combined_rows
+        let mut rows = combined_rows
             .iter()
             .map(|v| project_row(&stmt.columns, v))
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // LIMIT/OFFSET applied to projected rows.
+        rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
+
         Ok(QueryResult::Rows {
             columns: out_cols,
             rows,
@@ -377,14 +374,20 @@ fn execute_select_with_joins(
         return execute_select_grouped(stmt, combined_rows);
     }
 
+    // Sort source rows before projection.
+    combined_rows = apply_order_by(combined_rows, &stmt.order_by)?;
+
     // Build output ColumnMeta.
     let out_cols = build_join_column_meta(&stmt.columns, &all_resolved, &stmt.joins)?;
 
     // Project SELECT list.
-    let rows = combined_rows
+    let mut rows = combined_rows
         .iter()
         .map(|r| project_row(&stmt.columns, r))
         .collect::<Result<Vec<_>, _>>()?;
+
+    // LIMIT/OFFSET applied to projected rows.
+    rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 
     Ok(QueryResult::Rows {
         columns: out_cols,
@@ -1282,6 +1285,13 @@ fn execute_select_grouped(
         rows.push(out_row);
     }
 
+    // ORDER BY applied to projected output rows.
+    // For GROUP BY queries, ORDER BY evaluates against the output row.
+    rows = apply_order_by(rows, &stmt.order_by)?;
+
+    // LIMIT/OFFSET.
+    rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
+
     Ok(QueryResult::Rows {
         columns: out_cols,
         rows,
@@ -1852,6 +1862,181 @@ fn project_row(items: &[SelectItem], values: &[Value]) -> Result<Row, DbError> {
         }
     }
     Ok(out)
+}
+
+// ── ORDER BY / LIMIT helpers ──────────────────────────────────────────────────
+
+/// Compares two values for ORDER BY sorting, correctly handling NULLs.
+///
+/// ## NULL ordering defaults (PostgreSQL-compatible)
+/// - `ASC` with no explicit NULLS → NULLs sort **last** (after non-NULLs)
+/// - `DESC` with no explicit NULLS → NULLs sort **first** (before non-NULLs)
+///
+/// Explicit `NULLS FIRST` or `NULLS LAST` overrides the default.
+fn compare_sort_values(
+    a: &Value,
+    b: &Value,
+    direction: SortOrder,
+    nulls: Option<NullsOrder>,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+
+    let nulls_first = match (direction, nulls) {
+        (_, Some(NullsOrder::First)) => true,
+        (_, Some(NullsOrder::Last)) => false,
+        (SortOrder::Asc, None) => false, // default: NULLS LAST for ASC
+        (SortOrder::Desc, None) => true, // default: NULLS FIRST for DESC
+    };
+
+    match (a, b) {
+        (Value::Null, Value::Null) => Equal,
+        (Value::Null, _) => {
+            if nulls_first {
+                Less
+            } else {
+                Greater
+            }
+        }
+        (_, Value::Null) => {
+            if nulls_first {
+                Greater
+            } else {
+                Less
+            }
+        }
+        (a, b) => {
+            let ord = compare_non_null_for_sort(a, b);
+            if direction == SortOrder::Desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        }
+    }
+}
+
+/// Compares two non-NULL values using the expression evaluator.
+///
+/// Delegates to `eval()` via synthetic `Expr::BinaryOp { Lt }` and `Eq`
+/// expressions to reuse all existing type coercion and comparison logic.
+/// Returns `Equal` if the comparison fails (type mismatch in ORDER BY).
+fn compare_non_null_for_sort(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+
+    let lt = eval(
+        &Expr::BinaryOp {
+            op: BinaryOp::Lt,
+            left: Box::new(Expr::Literal(a.clone())),
+            right: Box::new(Expr::Literal(b.clone())),
+        },
+        &[],
+    );
+    let eq = eval(
+        &Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Literal(a.clone())),
+            right: Box::new(Expr::Literal(b.clone())),
+        },
+        &[],
+    );
+    match (lt, eq) {
+        (Ok(lt_v), Ok(eq_v)) => {
+            if is_truthy(&lt_v) {
+                Less
+            } else if is_truthy(&eq_v) {
+                Equal
+            } else {
+                Greater
+            }
+        }
+        // Type mismatch or error: treat as equal (stable, no crash).
+        _ => Equal,
+    }
+}
+
+/// Compares two rows using all ORDER BY items (multi-column composite key).
+///
+/// Items are applied left-to-right; the first non-Equal result determines
+/// the order. Returns `Equal` only when all items produce equal keys.
+fn compare_rows_for_sort(
+    a: &[Value],
+    b: &[Value],
+    order_items: &[OrderByItem],
+) -> Result<std::cmp::Ordering, DbError> {
+    for item in order_items {
+        let key_a = eval(&item.expr, a)?;
+        let key_b = eval(&item.expr, b)?;
+        let ord = compare_sort_values(&key_a, &key_b, item.order, item.nulls);
+        if ord != std::cmp::Ordering::Equal {
+            return Ok(ord);
+        }
+    }
+    Ok(std::cmp::Ordering::Equal)
+}
+
+/// Sorts `rows` in place according to `order_items`.
+///
+/// Uses `sort_by` (stable) to preserve insertion order for equal keys.
+/// Errors from expression evaluation are captured via `sort_err` and
+/// returned after the sort completes — `sort_by` cannot return `Result`.
+fn apply_order_by(mut rows: Vec<Row>, order_items: &[OrderByItem]) -> Result<Vec<Row>, DbError> {
+    if order_items.is_empty() {
+        return Ok(rows);
+    }
+    let mut sort_err: Option<DbError> = None;
+    rows.sort_by(|a, b| {
+        if sort_err.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        match compare_rows_for_sort(a, b, order_items) {
+            Ok(ord) => ord,
+            Err(e) => {
+                sort_err = Some(e);
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+    if let Some(e) = sort_err {
+        return Err(e);
+    }
+    Ok(rows)
+}
+
+/// Evaluates a LIMIT or OFFSET expression as a non-negative integer.
+///
+/// # Errors
+/// - [`DbError::TypeMismatch`] if the value is negative or not an integer.
+fn eval_as_usize(expr: &Expr) -> Result<usize, DbError> {
+    match eval(expr, &[])? {
+        Value::Int(n) if n >= 0 => Ok(n as usize),
+        Value::BigInt(n) if n >= 0 => Ok(n as usize),
+        Value::Int(_) | Value::BigInt(_) => Err(DbError::TypeMismatch {
+            expected: "non-negative integer for LIMIT/OFFSET".into(),
+            got: "negative integer".into(),
+        }),
+        other => Err(DbError::TypeMismatch {
+            expected: "integer for LIMIT/OFFSET".into(),
+            got: other.variant_name().into(),
+        }),
+    }
+}
+
+/// Applies LIMIT and OFFSET to a row vector.
+///
+/// `skip(offset).take(limit)` — LIMIT is applied after ORDER BY and after
+/// OFFSET. Passing `limit = None` returns all remaining rows.
+fn apply_limit_offset(
+    rows: Vec<Row>,
+    limit: &Option<Expr>,
+    offset: &Option<Expr>,
+) -> Result<Vec<Row>, DbError> {
+    let offset_n = offset.as_ref().map(eval_as_usize).transpose()?.unwrap_or(0);
+    let limit_n = limit.as_ref().map(eval_as_usize).transpose()?;
+    Ok(rows
+        .into_iter()
+        .skip(offset_n)
+        .take(limit_n.unwrap_or(usize::MAX))
+        .collect())
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

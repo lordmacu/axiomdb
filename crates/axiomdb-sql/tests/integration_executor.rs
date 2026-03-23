@@ -470,19 +470,37 @@ fn test_select_nonexistent_table() {
 }
 
 #[test]
-fn test_order_by_returns_not_implemented() {
+fn test_order_by_works() {
+    // ORDER BY is now implemented — this test verifies it works, not that it errors.
     let (mut storage, mut txn) = setup();
     run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
-    let err = run_result("SELECT * FROM t ORDER BY id", &mut storage, &mut txn).unwrap_err();
-    assert!(matches!(err, DbError::NotImplemented { .. }), "got {err:?}");
+    run("INSERT INTO t VALUES (3), (1), (2)", &mut storage, &mut txn);
+    let r = rows(run(
+        "SELECT * FROM t ORDER BY id ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0][0], Value::Int(1));
+    assert_eq!(r[2][0], Value::Int(3));
 }
 
 #[test]
-fn test_limit_returns_not_implemented() {
+fn test_limit_works() {
+    // LIMIT is now implemented.
     let (mut storage, mut txn) = setup();
     run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
-    let err = run_result("SELECT * FROM t LIMIT 1", &mut storage, &mut txn).unwrap_err();
-    assert!(matches!(err, DbError::NotImplemented { .. }), "got {err:?}");
+    run(
+        "INSERT INTO t VALUES (1), (2), (3), (4), (5)",
+        &mut storage,
+        &mut txn,
+    );
+    let r = rows(run(
+        "SELECT * FROM t ORDER BY id ASC LIMIT 3",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 3);
 }
 
 // ── Full round-trip ───────────────────────────────────────────────────────────
@@ -996,4 +1014,267 @@ fn test_select_star_with_group_by_error() {
     run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
     let err = run_result("SELECT * FROM t GROUP BY id", &mut storage, &mut txn).unwrap_err();
     assert!(matches!(err, DbError::TypeMismatch { .. }), "got {err:?}");
+}
+
+// ── ORDER BY / LIMIT tests ────────────────────────────────────────────────────
+
+fn setup_order_table(storage: &mut MemoryStorage, txn: &mut TxnManager) {
+    run(
+        "CREATE TABLE scores (id INT, name TEXT, score INT)",
+        storage,
+        txn,
+    );
+    run("INSERT INTO scores VALUES (3, 'Carol', 85)", storage, txn);
+    run("INSERT INTO scores VALUES (1, 'Alice', 92)", storage, txn);
+    run("INSERT INTO scores VALUES (4, 'Dave', NULL)", storage, txn);
+    run("INSERT INTO scores VALUES (2, 'Bob', 78)", storage, txn);
+    run("INSERT INTO scores VALUES (5, 'Eve', NULL)", storage, txn);
+}
+
+#[test]
+fn test_order_by_asc() {
+    let (mut storage, mut txn) = setup();
+    setup_order_table(&mut storage, &mut txn);
+    let r = rows(run(
+        "SELECT id FROM scores ORDER BY id ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    let ids: Vec<&Value> = r.iter().map(|row| &row[0]).collect();
+    assert_eq!(
+        ids,
+        vec![
+            &Value::Int(1),
+            &Value::Int(2),
+            &Value::Int(3),
+            &Value::Int(4),
+            &Value::Int(5)
+        ]
+    );
+}
+
+#[test]
+fn test_order_by_desc() {
+    let (mut storage, mut txn) = setup();
+    setup_order_table(&mut storage, &mut txn);
+    let r = rows(run(
+        "SELECT id FROM scores ORDER BY id DESC",
+        &mut storage,
+        &mut txn,
+    ));
+    let ids: Vec<&Value> = r.iter().map(|row| &row[0]).collect();
+    assert_eq!(
+        ids,
+        vec![
+            &Value::Int(5),
+            &Value::Int(4),
+            &Value::Int(3),
+            &Value::Int(2),
+            &Value::Int(1)
+        ]
+    );
+}
+
+#[test]
+fn test_order_by_text() {
+    let (mut storage, mut txn) = setup();
+    setup_order_table(&mut storage, &mut txn);
+    let r = rows(run(
+        "SELECT name FROM scores ORDER BY name ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    let names: Vec<&Value> = r.iter().map(|row| &row[0]).collect();
+    // Alphabetical: Alice, Bob, Carol, Dave, Eve
+    assert_eq!(names[0], &Value::Text("Alice".into()));
+    assert_eq!(names[4], &Value::Text("Eve".into()));
+}
+
+#[test]
+fn test_order_by_nulls_asc_default() {
+    // ASC default: NULLs LAST
+    let (mut storage, mut txn) = setup();
+    setup_order_table(&mut storage, &mut txn);
+    let r = rows(run(
+        "SELECT score FROM scores ORDER BY score ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    // NULLs should be at the END
+    let last = r.last().unwrap();
+    assert_eq!(last[0], Value::Null, "ASC default: NULLs must be LAST");
+    let second_last = &r[r.len() - 2];
+    assert_eq!(second_last[0], Value::Null);
+    // First values should be non-NULL
+    assert_ne!(r[0][0], Value::Null);
+}
+
+#[test]
+fn test_order_by_nulls_desc_default() {
+    // DESC default: NULLs FIRST
+    let (mut storage, mut txn) = setup();
+    setup_order_table(&mut storage, &mut txn);
+    let r = rows(run(
+        "SELECT score FROM scores ORDER BY score DESC",
+        &mut storage,
+        &mut txn,
+    ));
+    // NULLs should be at the START
+    assert_eq!(r[0][0], Value::Null, "DESC default: NULLs must be FIRST");
+    assert_eq!(r[1][0], Value::Null);
+}
+
+#[test]
+fn test_order_by_nulls_first_explicit() {
+    // ASC NULLS FIRST: NULLs before non-NULLs
+    let (mut storage, mut txn) = setup();
+    setup_order_table(&mut storage, &mut txn);
+    let r = rows(run(
+        "SELECT score FROM scores ORDER BY score ASC NULLS FIRST",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r[0][0], Value::Null);
+    assert_eq!(r[1][0], Value::Null);
+    assert_ne!(r[2][0], Value::Null);
+}
+
+#[test]
+fn test_order_by_nulls_last_explicit() {
+    // DESC NULLS LAST: NULLs after non-NULLs
+    let (mut storage, mut txn) = setup();
+    setup_order_table(&mut storage, &mut txn);
+    let r = rows(run(
+        "SELECT score FROM scores ORDER BY score DESC NULLS LAST",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_ne!(r[0][0], Value::Null);
+    assert_eq!(r[r.len() - 1][0], Value::Null);
+    assert_eq!(r[r.len() - 2][0], Value::Null);
+}
+
+#[test]
+fn test_multi_column_order_by() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (dept TEXT, salary INT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES ('eng', 90000)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES ('eng', 70000)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES ('sales', 80000)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let r = rows(run(
+        "SELECT dept, salary FROM t ORDER BY dept ASC, salary DESC",
+        &mut storage,
+        &mut txn,
+    ));
+    // eng rows first (ASC), within eng: 90000 before 70000 (DESC)
+    assert_eq!(r[0][0], Value::Text("eng".into()));
+    assert_eq!(r[0][1], Value::Int(90000));
+    assert_eq!(r[1][0], Value::Text("eng".into()));
+    assert_eq!(r[1][1], Value::Int(70000));
+    assert_eq!(r[2][0], Value::Text("sales".into()));
+}
+
+#[test]
+fn test_limit_only() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    for i in 1..=10i32 {
+        run(
+            &format!("INSERT INTO t VALUES ({i})"),
+            &mut storage,
+            &mut txn,
+        );
+    }
+    let r = rows(run(
+        "SELECT * FROM t ORDER BY id ASC LIMIT 3",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0][0], Value::Int(1));
+    assert_eq!(r[2][0], Value::Int(3));
+}
+
+#[test]
+fn test_limit_offset() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    for i in 1..=10i32 {
+        run(
+            &format!("INSERT INTO t VALUES ({i})"),
+            &mut storage,
+            &mut txn,
+        );
+    }
+    let r = rows(run(
+        "SELECT * FROM t ORDER BY id ASC LIMIT 3 OFFSET 5",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0][0], Value::Int(6));
+    assert_eq!(r[2][0], Value::Int(8));
+}
+
+#[test]
+fn test_limit_zero() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1), (2), (3)", &mut storage, &mut txn);
+    let r = rows(run("SELECT * FROM t LIMIT 0", &mut storage, &mut txn));
+    assert_eq!(r.len(), 0);
+}
+
+#[test]
+fn test_offset_beyond_end() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1), (2)", &mut storage, &mut txn);
+    // Use LIMIT + OFFSET (parser requires LIMIT before OFFSET).
+    let r = rows(run(
+        "SELECT * FROM t ORDER BY id LIMIT 100 OFFSET 100",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 0);
+}
+
+#[test]
+fn test_order_by_with_group_by() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (dept TEXT, val INT)",
+        &mut storage,
+        &mut txn,
+    );
+    run("INSERT INTO t VALUES ('b', 1)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES ('a', 2)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES ('c', 3)", &mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT dept, COUNT(*) FROM t GROUP BY dept ORDER BY dept ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0][0], Value::Text("a".into()));
+    assert_eq!(r[1][0], Value::Text("b".into()));
+    assert_eq!(r[2][0], Value::Text("c".into()));
 }
