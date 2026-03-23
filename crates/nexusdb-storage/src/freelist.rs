@@ -2,23 +2,23 @@ use nexusdb_core::error::DbError;
 
 use crate::page::{HEADER_SIZE, PAGE_SIZE};
 
-// ── Constantes ────────────────────────────────────────────────────────────────
+// ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Bytes disponibles en el body de la página de bitmap.
+/// Available bytes in the body of the bitmap page.
 const BITMAP_BODY_BYTES: usize = PAGE_SIZE - HEADER_SIZE;
-/// Máximo de páginas que cubre un solo bitmap (130,560).
+/// Maximum pages covered by a single bitmap (130,560).
 pub const BITMAP_CAPACITY: u64 = (BITMAP_BODY_BYTES * 8) as u64;
 
 // ── FreeList ──────────────────────────────────────────────────────────────────
 
-/// Bitmap de páginas libres almacenado en memoria.
+/// In-memory free page bitmap.
 ///
-/// Convenio: bit = 1 → FREE, bit = 0 → USED.
-/// Los bits se organizan en words de 64 bits, LSB-first:
-///   word[0] cubre páginas 0-63, word[1] cubre 64-127, etc.
+/// Convention: bit = 1 → FREE, bit = 0 → USED.
+/// Bits are organized in 64-bit words, LSB-first:
+///   word[0] covers pages 0-63, word[1] covers 64-127, etc.
 ///
-/// `alloc` usa `u64::trailing_zeros()` sobre el word invertido para encontrar
-/// el primer bit libre en O(1) por word, O(n/64) en total.
+/// `alloc` uses `u64::trailing_zeros()` on the inverted word to find
+/// the first free bit in O(1) per word, O(n/64) total.
 #[derive(Debug)]
 pub struct FreeList {
     words: Vec<u64>,
@@ -26,24 +26,24 @@ pub struct FreeList {
 }
 
 impl FreeList {
-    /// Crea un nuevo bitmap para `total_pages` páginas.
+    /// Creates a new bitmap for `total_pages` pages.
     ///
-    /// Las páginas en `reserved` quedan marcadas como USED.
-    /// Todas las demás (dentro del rango) quedan marcadas como FREE.
+    /// Pages in `reserved` are marked as USED.
+    /// All others (within range) are marked as FREE.
     pub fn new(total_pages: u64, reserved: &[u64]) -> Self {
         assert!(
             total_pages <= BITMAP_CAPACITY,
-            "total_pages {total_pages} supera BITMAP_CAPACITY {BITMAP_CAPACITY}"
+            "total_pages {total_pages} exceeds BITMAP_CAPACITY {BITMAP_CAPACITY}"
         );
 
         let n_words = Self::words_needed(total_pages);
-        // Iniciar todo a FREE (0xFF...).
+        // Initialize all to FREE (0xFF...).
         let mut words = vec![u64::MAX; n_words];
 
-        // Marcar bits más allá de total_pages como USED (no existen).
+        // Mark bits beyond total_pages as USED (they don't exist).
         Self::mask_tail(&mut words, total_pages);
 
-        // Marcar reservadas como USED.
+        // Mark reserved pages as USED.
         let mut fl = FreeList { words, total_pages };
         for &page_id in reserved {
             fl.mark_used(page_id);
@@ -51,7 +51,7 @@ impl FreeList {
         fl
     }
 
-    /// Deserializa un FreeList desde el body de la página de bitmap.
+    /// Deserializes a FreeList from the body of the bitmap page.
     pub fn from_bytes(bytes: &[u8], total_pages: u64) -> Self {
         assert!(bytes.len() >= BITMAP_BODY_BYTES);
         assert!(total_pages <= BITMAP_CAPACITY);
@@ -60,24 +60,28 @@ impl FreeList {
         let mut words = vec![0u64; n_words];
         for (i, w) in words.iter_mut().enumerate() {
             let off = i * 8;
-            // El slice tiene exactamente 8 bytes: `off = i * 8` y
-            // `bytes.len() >= BITMAP_BODY_BYTES` (assert arriba), con
-            // `i < n_words` y `n_words * 8 <= BITMAP_BODY_BYTES`.
-            *w = u64::from_le_bytes(
-                bytes[off..off + 8]
-                    .try_into()
-                    .expect("slice de 8 bytes garantizado por invariante de BITMAP_BODY_BYTES"),
-            );
+            // Direct array construction: off + 8 <= BITMAP_BODY_BYTES (asserted above)
+            // and i < n_words, so the indexing is in bounds.
+            *w = u64::from_le_bytes([
+                bytes[off],
+                bytes[off + 1],
+                bytes[off + 2],
+                bytes[off + 3],
+                bytes[off + 4],
+                bytes[off + 5],
+                bytes[off + 6],
+                bytes[off + 7],
+            ]);
         }
-        // Garantizar que bits sobrantes están a cero (USED).
+        // Ensure leftover bits are zero (USED).
         Self::mask_tail(&mut words, total_pages);
         FreeList { words, total_pages }
     }
 
-    /// Serializa el bitmap al buffer `buf` (debe ser ≥ BITMAP_BODY_BYTES).
+    /// Serializes the bitmap to buffer `buf` (must be ≥ BITMAP_BODY_BYTES).
     pub fn to_bytes(&self, buf: &mut [u8]) {
         assert!(buf.len() >= BITMAP_BODY_BYTES);
-        // Limpiar primero (por si había datos viejos más allá del bitmap activo).
+        // Clear first (in case there were stale data beyond the active bitmap).
         buf[..BITMAP_BODY_BYTES].fill(0);
         for (i, &w) in self.words.iter().enumerate() {
             let off = i * 8;
@@ -85,20 +89,20 @@ impl FreeList {
         }
     }
 
-    /// Busca y reserva la primera página libre.
+    /// Finds and reserves the first free page.
     ///
-    /// Retorna `None` si el bitmap está lleno (tiempo de crecer).
-    /// Complejidad: O(n/64) donde n = total_pages.
+    /// Returns `None` if the bitmap is full (time to grow).
+    /// Complexity: O(n/64) where n = total_pages.
     pub fn alloc(&mut self) -> Option<u64> {
         for (i, word) in self.words.iter_mut().enumerate() {
             if *word == 0 {
                 continue;
             }
-            // trailing_zeros sobre word da el índice del bit libre más bajo.
+            // trailing_zeros on word gives the index of the lowest free bit.
             let bit = word.trailing_zeros() as u64;
             let page_id = i as u64 * 64 + bit;
             if page_id < self.total_pages {
-                // Marcar como USED.
+                // Mark as USED.
                 *word &= !(1u64 << bit);
                 return Some(page_id);
             }
@@ -106,9 +110,9 @@ impl FreeList {
         None
     }
 
-    /// Marca `page_id` como libre.
+    /// Marks `page_id` as free.
     ///
-    /// Retorna error si `page_id` está fuera de rango o ya era libre (double-free).
+    /// Returns an error if `page_id` is out of range or already free (double-free).
     pub fn free(&mut self, page_id: u64) -> Result<(), DbError> {
         if page_id >= self.total_pages {
             return Err(DbError::PageNotFound { page_id });
@@ -117,14 +121,14 @@ impl FreeList {
         let mask = 1u64 << bit;
         if self.words[word_idx] & mask != 0 {
             return Err(DbError::Other(format!(
-                "double-free detectado en página {page_id}"
+                "double-free detected on page {page_id}"
             )));
         }
         self.words[word_idx] |= mask;
         Ok(())
     }
 
-    /// Marca `page_id` como USED sin verificar si ya lo estaba.
+    /// Marks `page_id` as USED without checking if it already was.
     pub fn mark_used(&mut self, page_id: u64) {
         if page_id >= self.total_pages {
             return;
@@ -133,51 +137,51 @@ impl FreeList {
         self.words[word_idx] &= !(1u64 << bit);
     }
 
-    /// Extiende el bitmap para cubrir `new_total` páginas.
+    /// Extends the bitmap to cover `new_total` pages.
     ///
-    /// Las páginas nuevas (old_total..new_total) quedan marcadas como FREE.
+    /// New pages (old_total..new_total) are marked as FREE.
     pub fn grow(&mut self, new_total: u64) {
         assert!(new_total > self.total_pages);
         assert!(
             new_total <= BITMAP_CAPACITY,
-            "new_total {new_total} supera BITMAP_CAPACITY"
+            "new_total {new_total} exceeds BITMAP_CAPACITY"
         );
 
         let old_total = self.total_pages;
         let new_n_words = Self::words_needed(new_total);
 
-        // Extender el vector con words llenos de FREE.
+        // Extend the vector with words filled with FREE.
         self.words.resize(new_n_words, u64::MAX);
         self.total_pages = new_total;
 
-        // Asegurar que los bits en el último word viejo que antes estaban
-        // marcados como "fuera de rango" (USED) ahora se marcan FREE.
+        // Ensure bits in the last old word that were previously marked
+        // as "out of range" (USED) are now marked FREE.
         let old_n_words = Self::words_needed(old_total);
         if old_n_words > 0 {
             let last_old_idx = old_n_words - 1;
             let bits_in_last = old_total % 64;
             if bits_in_last != 0 {
-                // El word tenía bits superiores forzados a USED; ahora son FREE.
+                // The word had upper bits forced to USED; they are now FREE.
                 let free_mask = u64::MAX << bits_in_last;
                 self.words[last_old_idx] |= free_mask;
             }
         }
 
-        // Volver a enmascarar bits más allá de new_total.
+        // Re-mask bits beyond new_total.
         Self::mask_tail(&mut self.words, new_total);
     }
 
-    /// Número total de páginas que cubre este bitmap.
+    /// Total number of pages covered by this bitmap.
     pub fn total_pages(&self) -> u64 {
         self.total_pages
     }
 
-    /// Número de páginas libres actualmente.
+    /// Number of currently free pages.
     pub fn free_count(&self) -> u64 {
         self.words.iter().map(|w| w.count_ones() as u64).sum()
     }
 
-    // ── Helpers privados ──────────────────────────────────────────────────────
+    // ── Private helpers ───────────────────────────────────────────────────────
 
     #[inline]
     fn words_needed(n_pages: u64) -> usize {
@@ -189,12 +193,12 @@ impl FreeList {
         ((page_id / 64) as usize, (page_id % 64) as u32)
     }
 
-    /// Fuerza a USED todos los bits del último word que estén más allá de `total`.
+    /// Forces all bits in the last word beyond `total` to USED.
     fn mask_tail(words: &mut [u64], total: u64) {
         let remainder = total % 64;
         if remainder != 0 && !words.is_empty() {
             let last = words.len() - 1;
-            // Bits [remainder..63] deben ser 0 (USED / no existen).
+            // Bits [remainder..63] must be 0 (USED / do not exist).
             let valid_mask = (1u64 << remainder) - 1;
             words[last] &= valid_mask;
         }
@@ -208,7 +212,7 @@ mod tests {
     use super::*;
 
     fn make_fl(total: u64) -> FreeList {
-        // Reservar páginas 0 y 1 como en el storage real.
+        // Reserve pages 0 and 1 as in real storage.
         FreeList::new(total, &[0, 1])
     }
 
@@ -226,7 +230,7 @@ mod tests {
         let mut ids: Vec<u64> = (0..62).map(|_| fl.alloc().unwrap()).collect();
         ids.sort();
         assert_eq!(ids, (2u64..64).collect::<Vec<_>>());
-        // Ahora está lleno.
+        // Now it is full.
         assert_eq!(fl.alloc(), None);
     }
 
@@ -236,7 +240,7 @@ mod tests {
         let id1 = fl.alloc().unwrap(); // 2
         let id2 = fl.alloc().unwrap(); // 3
         fl.free(id1).unwrap();
-        // El siguiente alloc debe reutilizar id1 (es el menor libre).
+        // The next alloc must reuse id1 (it is the lowest free page).
         assert_eq!(fl.alloc(), Some(id1));
         assert_eq!(fl.alloc(), Some(id2 + 1));
     }
@@ -275,20 +279,20 @@ mod tests {
 
         let fl2 = FreeList::from_bytes(&buf, 128);
         assert_eq!(fl2.free_count(), fl.free_count());
-        // Página 2 libre, 3 usada.
+        // Page 2 is free, page 3 is used.
         let mut fl2 = fl2;
-        assert_eq!(fl2.alloc(), Some(2)); // fue liberada
+        assert_eq!(fl2.alloc(), Some(2)); // was freed
     }
 
     #[test]
     fn test_grow_marks_new_pages_free() {
         let mut fl = make_fl(64);
-        // Agotar todas las páginas.
+        // Exhaust all pages.
         while fl.alloc().is_some() {}
         assert_eq!(fl.alloc(), None);
 
         fl.grow(128);
-        // Después de grow, páginas 64..128 son libres.
+        // After grow, pages 64..128 are free.
         let id = fl.alloc().unwrap();
         assert!(id >= 64 && id < 128);
     }
@@ -299,30 +303,33 @@ mod tests {
         let ids: Vec<u64> = (0..5).map(|_| fl.alloc().unwrap()).collect();
         fl.grow(128);
 
-        // Las páginas ya allocadas siguen USED (no se retornan por alloc).
+        // Already-allocated pages remain USED (not returned by alloc).
         let new_allocs: Vec<u64> = (0..10).map(|_| fl.alloc().unwrap()).collect();
         for id in &ids {
-            assert!(!new_allocs.contains(id), "página {id} ya usada reaparecio");
+            assert!(
+                !new_allocs.contains(id),
+                "page {id} already in use reappeared"
+            );
         }
     }
 
     #[test]
     fn test_free_count() {
         let mut fl = make_fl(64);
-        assert_eq!(fl.free_count(), 62); // 64 - 2 reservadas
+        assert_eq!(fl.free_count(), 62); // 64 - 2 reserved
         fl.alloc().unwrap();
         assert_eq!(fl.free_count(), 61);
     }
 
     #[test]
     fn test_cross_word_boundary() {
-        // Verificar que alloc funciona correctamente cruzando el boundary de 64 páginas.
+        // Verify that alloc works correctly crossing the 64-page word boundary.
         let mut fl = make_fl(128);
-        // Agotar el primer word completo (páginas 2..64).
+        // Exhaust the first complete word (pages 2..64).
         for _ in 0..62 {
             fl.alloc().unwrap();
         }
-        // El siguiente alloc debe saltar al segundo word.
+        // The next alloc must jump to the second word.
         let id = fl.alloc().unwrap();
         assert_eq!(id, 64);
     }

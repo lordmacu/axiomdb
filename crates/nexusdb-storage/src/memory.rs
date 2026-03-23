@@ -77,10 +77,9 @@ impl StorageEngine for MemoryStorage {
         let new_total = old_total + 64;
         self.freelist.grow(new_total);
         self.pages.resize_with(new_total as usize, || None);
-        let page_id = self
-            .freelist
-            .alloc()
-            .expect("freelist empty after grow — impossible");
+        let page_id = self.freelist.alloc().ok_or(DbError::Other(
+            "freelist empty after grow — internal invariant violated".into(),
+        ))?;
         let idx = page_id as usize;
         self.pages[idx] = Some(Box::new(Page::new(page_type, page_id)));
         Ok(page_id)
