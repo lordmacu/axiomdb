@@ -1516,42 +1516,73 @@ fn execute_insert(
         }
     };
 
-    let source_rows = match stmt.source {
-        InsertSource::Values(rows) => rows,
-        InsertSource::Select(_) => {
-            return Err(DbError::NotImplemented {
-                feature: "INSERT SELECT — Phase 4.6".into(),
-            })
+    let mut count = 0u64;
+
+    match stmt.source {
+        // ── INSERT ... VALUES ─────────────────────────────────────────────────
+        InsertSource::Values(rows) => {
+            for value_exprs in rows {
+                // Evaluate each expression against an empty row (VALUES has no FROM).
+                let provided: Vec<Value> = value_exprs
+                    .iter()
+                    .map(|e| eval(e, &[]))
+                    .collect::<Result<_, _>>()?;
+
+                let full_values: Vec<Value> = col_positions
+                    .iter()
+                    .map(|&idx| {
+                        if idx == usize::MAX {
+                            Value::Null
+                        } else {
+                            provided.get(idx).cloned().unwrap_or(Value::Null)
+                        }
+                    })
+                    .collect();
+
+                TableEngine::insert_row(storage, txn, &resolved.def, schema_cols, full_values)?;
+                count += 1;
+            }
         }
+
+        // ── INSERT ... SELECT ─────────────────────────────────────────────────
+        InsertSource::Select(select_stmt) => {
+            // Execute the SELECT to get all rows.
+            // The SelectStmt arrives already analyzed (col_idx resolved).
+            // The active_snapshot is fixed at BEGIN — inserted rows are NOT
+            // visible to this SELECT (MVCC prevents the Halloween problem).
+            let select_rows = match execute_select(*select_stmt, storage, txn)? {
+                QueryResult::Rows { rows, .. } => rows,
+                other => {
+                    return Err(DbError::Other(format!(
+                        "INSERT SELECT: expected Rows from SELECT, got {other:?}"
+                    )))
+                }
+            };
+
+            // Insert each SELECT row using the same column mapping as VALUES.
+            for row_values in select_rows {
+                let full_values: Vec<Value> = col_positions
+                    .iter()
+                    .map(|&idx| {
+                        if idx == usize::MAX {
+                            Value::Null
+                        } else {
+                            row_values.get(idx).cloned().unwrap_or(Value::Null)
+                        }
+                    })
+                    .collect();
+
+                TableEngine::insert_row(storage, txn, &resolved.def, schema_cols, full_values)?;
+                count += 1;
+            }
+        }
+
+        // ── INSERT ... DEFAULT VALUES (deferred) ──────────────────────────────
         InsertSource::DefaultValues => {
             return Err(DbError::NotImplemented {
                 feature: "DEFAULT VALUES — Phase 4.3c".into(),
             })
         }
-    };
-
-    let mut count = 0u64;
-    for value_exprs in source_rows {
-        // Evaluate each expression against an empty row.
-        let provided: Vec<Value> = value_exprs
-            .iter()
-            .map(|e| eval(e, &[]))
-            .collect::<Result<_, _>>()?;
-
-        // Build full_values aligned to the schema column order.
-        let full_values: Vec<Value> = col_positions
-            .iter()
-            .map(|&idx| {
-                if idx == usize::MAX {
-                    Value::Null
-                } else {
-                    provided.get(idx).cloned().unwrap_or(Value::Null)
-                }
-            })
-            .collect();
-
-        TableEngine::insert_row(storage, txn, &resolved.def, schema_cols, full_values)?;
-        count += 1;
     }
 
     Ok(QueryResult::Affected {

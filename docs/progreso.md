@@ -134,7 +134,7 @@
 - [x] 4.12 ✅ DISTINCT — HashSet dedup on projected output rows; NULL=NULL for grouping; pre-LIMIT
 - [ ] 4.12b ⏳ CAST + basic type coercion — explicit and implicit conversion between compatible types
 - [x] 4.24 ✅ CASE WHEN — searched + simple form; NULL semantics; nested; SELECT/WHERE/ORDER BY/GROUP BY
-- [ ] 4.6 ⏳ INSERT ... SELECT — insert result of a SELECT directly into a table
+- [x] 4.6 ✅ INSERT ... SELECT — execute_select + col_map + insert_row; MVCC prevents self-reads
 
 <!-- ── Group F — Functions (needs executor) ── -->
 - [ ] 4.13 ⏳ version() / current_user / session_user / current_database() — ORMs call these on connect; required for Phase 5 compatibility

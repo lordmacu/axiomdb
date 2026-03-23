@@ -62,6 +62,7 @@ functionality. The design is organized in three blocks:
 | 4.10+4.10b+4.10c | ORDER BY + LIMIT/OFFSET | ✅ | Multi-column; NULLS FIRST/LAST; LIMIT/OFFSET pagination |
 | 4.12 | DISTINCT | ✅ | HashSet dedup on output rows; NULL=NULL; pre-LIMIT |
 | 4.24 | CASE WHEN | ✅ | Searched + simple form; NULL semantics; all contexts |
+| 4.6 | INSERT ... SELECT | ✅ | Reuses execute_select; MVCC prevents self-reads |
 | 5 | Executor (advanced) | ⚠️ Planned | JOIN, GROUP BY, ORDER BY, index lookup, aggregate |
 | 6 | Query planner | ⚠️ Planned | Cost-based plan selection |
 | 7 | Full MVCC | ⚠️ Planned | SSI, write-write conflicts, epoch reclamation |
