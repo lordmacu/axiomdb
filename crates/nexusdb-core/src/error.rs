@@ -1,99 +1,117 @@
 use thiserror::Error;
 
-/// Error central de NexusDB.
-/// Todos los crates retornan este tipo (o lo wrappean).
+/// Central error type for NexusDB.
+/// All crates return this type (or wrap it).
 #[derive(Debug, Error)]
 pub enum DbError {
     // ── Storage ──────────────────────────────────────────────────
-    #[error("página {page_id} no encontrada")]
+    #[error("page {page_id} not found")]
     PageNotFound { page_id: u64 },
 
-    #[error(
-        "checksum inválido en página {page_id}: esperado {expected:#010x}, obtenido {got:#010x}"
-    )]
+    #[error("invalid checksum on page {page_id}: expected {expected:#010x}, got {got:#010x}")]
     ChecksumMismatch {
         page_id: u64,
         expected: u32,
         got: u32,
     },
 
-    #[error("storage lleno: no hay páginas libres")]
+    #[error("storage full: no free pages available")]
     StorageFull,
 
     // ── I/O ──────────────────────────────────────────────────────
-    #[error("error de I/O: {0}")]
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("no se puede abrir '{path}': otro proceso ya tiene el archivo bloqueado")]
+    #[error("cannot open '{path}': another process already holds the file lock")]
     FileLocked { path: std::path::PathBuf },
 
     // ── SQL ──────────────────────────────────────────────────────
-    #[error("error de sintaxis SQL: {message}")]
+    #[error("SQL syntax error: {message}")]
     ParseError { message: String },
 
-    #[error("tabla '{name}' no encontrada")]
+    #[error("table '{name}' not found")]
     TableNotFound { name: String },
 
-    #[error("columna '{name}' no encontrada en tabla '{table}'")]
+    #[error("column '{name}' not found in table '{table}'")]
     ColumnNotFound { name: String, table: String },
 
-    // ── Integridad ───────────────────────────────────────────────
-    #[error("violación de clave única en {table}.{column}")]
+    // ── Integrity ────────────────────────────────────────────────
+    #[error("unique key violation on {table}.{column}")]
     UniqueViolation { table: String, column: String },
 
-    #[error("violación de clave foránea: {table}.{column} = {value}")]
+    #[error("foreign key violation: {table}.{column} = {value}")]
     ForeignKeyViolation {
         table: String,
         column: String,
         value: String,
     },
 
-    #[error("violación NOT NULL en {table}.{column}")]
+    #[error("NOT NULL violation on {table}.{column}")]
     NotNullViolation { table: String, column: String },
 
-    #[error("violación de CHECK en {table}.{constraint}")]
+    #[error("CHECK constraint violation on {table}.{constraint}")]
     CheckViolation { table: String, constraint: String },
 
     // ── WAL ──────────────────────────────────────────────────────
-    #[error("WAL entry en LSN {lsn} tiene checksum inválido: esperado {expected:#010x}, obtenido {got:#010x}")]
+    #[error(
+        "WAL entry at LSN {lsn} has invalid checksum: expected {expected:#010x}, got {got:#010x}"
+    )]
     WalChecksumMismatch { lsn: u64, expected: u32, got: u32 },
 
-    #[error("WAL entry en LSN {lsn} está truncado — el archivo puede estar corrupto")]
+    #[error("WAL entry at LSN {lsn} is truncated — the file may be corrupt")]
     WalEntryTruncated { lsn: u64 },
 
-    #[error("WAL entry tiene tipo desconocido: {byte:#04x}")]
+    #[error("WAL entry has unknown type: {byte:#04x}")]
     WalUnknownEntryType { byte: u8 },
 
-    #[error("archivo WAL inválido en '{path}': magic o versión incorrectos")]
+    #[error("invalid WAL file at '{path}': wrong magic or version")]
     WalInvalidHeader { path: String },
 
-    // ── Transacciones ────────────────────────────────────────────
-    #[error("deadlock detectado entre transacciones")]
+    // ── Transactions ─────────────────────────────────────────────
+    #[error("deadlock detected between transactions")]
     DeadlockDetected,
 
-    #[error("transacción {txn_id} ya no es válida")]
+    #[error("transaction {txn_id} is no longer valid")]
     TransactionExpired { txn_id: u64 },
 
-    // ── Permisos ─────────────────────────────────────────────────
-    #[error("permiso denegado: {action} en {object}")]
+    // ── Permissions ──────────────────────────────────────────────
+    #[error("permission denied: {action} on {object}")]
     PermissionDenied { action: String, object: String },
 
-    // ── Tipos ────────────────────────────────────────────────────
-    #[error("tipo incorrecto: se esperaba {expected}, se obtuvo {got}")]
+    // ── Types ────────────────────────────────────────────────────
+    #[error("type mismatch: expected {expected}, got {got}")]
     TypeMismatch { expected: String, got: String },
 
+    // ── Heap pages ───────────────────────────────────────────────
+    #[error("heap page {page_id} is full (need {needed} bytes, have {available})")]
+    HeapPageFull {
+        page_id: u64,
+        needed: usize,
+        available: usize,
+    },
+
+    #[error("invalid slot {slot_id} on page {page_id} (page has {num_slots} slots)")]
+    InvalidSlot {
+        page_id: u64,
+        slot_id: u16,
+        num_slots: u16,
+    },
+
+    #[error("slot {slot_id} on page {page_id} is already deleted")]
+    AlreadyDeleted { page_id: u64, slot_id: u16 },
+
     // ── B+ Tree ───────────────────────────────────────────────────
-    #[error("key demasiado larga: {len} bytes (máximo {max})")]
+    #[error("key too long: {len} bytes (maximum {max})")]
     KeyTooLong { len: usize, max: usize },
 
-    #[error("clave duplicada en índice")]
+    #[error("duplicate key in index")]
     DuplicateKey,
 
-    #[error("árbol B+ corrupto: {msg}")]
+    #[error("B+ tree corrupted: {msg}")]
     BTreeCorrupted { msg: String },
 
     // ── General ──────────────────────────────────────────────────
-    #[error("no implementado: {feature}")]
+    #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
 
     #[error("{0}")]
@@ -101,7 +119,7 @@ pub enum DbError {
 }
 
 impl DbError {
-    /// SQLSTATE code — para compatibilidad con ORMs y clientes SQL.
+    /// SQLSTATE code — for compatibility with ORMs and SQL clients.
     pub fn sqlstate(&self) -> &'static str {
         match self {
             DbError::UniqueViolation { .. } => "23505",

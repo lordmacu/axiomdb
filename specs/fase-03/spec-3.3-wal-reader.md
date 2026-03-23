@@ -1,74 +1,74 @@
 # Spec: 3.3 — WalReader
 
-## Qué construir
+## What to build
 
-Un lector del archivo WAL que expone dos modos de scan:
+A WAL file reader that exposes two scan modes:
 
-- **Forward**: desde el inicio del WAL (o desde un LSN específico) hacia el final,
-  parando en el primer entry truncado/corrupto — comportamiento correcto para crash recovery.
-- **Backward**: desde el último entry válido hacia el inicio, usando el trailer `entry_len_2`
-  para navegar sin leer el archivo entero — necesario para ROLLBACK.
+- **Forward**: from the start of the WAL (or from a specific LSN) towards the end,
+  stopping at the first truncated/corrupt entry — correct behavior for crash recovery.
+- **Backward**: from the last valid entry towards the start, using the `entry_len_2` trailer
+  to navigate without reading the entire file — required for ROLLBACK.
 
-El WalReader no mantiene el archivo abierto entre scans — cada iterador abre su propio
-`File` handle. Esto elimina shared mutable state y permite múltiples scans concurrentes.
+The WalReader does not keep the file open between scans — each iterator opens its own
+`File` handle. This eliminates shared mutable state and allows concurrent scans.
 
 ## Inputs / Outputs
 
-- Input: `path: &Path` — ruta al archivo WAL existente
+- Input: `path: &Path` — path to the existing WAL file
 - Output (forward): `impl Iterator<Item = Result<WalEntry, DbError>>`
 - Output (backward): `impl Iterator<Item = Result<WalEntry, DbError>>`
-- Errores construcción: `DbError::WalInvalidHeader` si el header es inválido o el archivo no existe
+- Construction errors: `DbError::WalInvalidHeader` if the header is invalid or the file does not exist
 
-### Comportamiento del iterator
+### Iterator behavior
 
 **Forward:**
-- Abre `File` en modo lectura, envuelto en `BufReader<File>` (64KB buffer)
-- Verifica header mágico antes de empezar a iterar
-- Salta entries con `LSN < from_lsn` (scan lineal desde WAL_HEADER_SIZE)
-- Para cada entry: parsea, verifica CRC — si falla retorna el error y el iterator termina
-- Llega a EOF → el iterator termina limpiamente (`None`)
-- Entry truncado o corrupto → el item es `Err(...)` y el iterator termina
+- Opens `File` in read mode, wrapped in `BufReader<File>` (64KB buffer)
+- Verifies the magic header before starting to iterate
+- Skips entries with `LSN < from_lsn` (linear scan from WAL_HEADER_SIZE)
+- For each entry: parses, verifies CRC — if it fails, returns the error and the iterator ends
+- Reaches EOF → iterator ends cleanly (`None`)
+- Truncated or corrupt entry → the item is `Err(...)` and the iterator ends
 
 **Backward:**
-- Abre `File` en modo lectura (seekable, sin BufReader — los seeks invalidan el buffer)
-- Verifica header mágico
-- Posición inicial: `file_end` — 4 bytes → leer `entry_len_2` → seek a `file_end - entry_len_2`
-- Parsea el entry completo (lee `entry_len_2` bytes)
-- Mueve cursor: `current_pos -= entry_len_2`
-- Repite hasta llegar a `WAL_HEADER_SIZE` (inicio del área de entries)
-- Cualquier error → el item es `Err(...)` y el iterator termina
+- Opens `File` in read mode (seekable, without BufReader — seeks invalidate the buffer)
+- Verifies the magic header
+- Initial position: `file_end` — 4 bytes → read `entry_len_2` → seek to `file_end - entry_len_2`
+- Parses the complete entry (reads `entry_len_2` bytes)
+- Moves cursor: `current_pos -= entry_len_2`
+- Repeats until reaching `WAL_HEADER_SIZE` (start of the entries area)
+- Any error → the item is `Err(...)` and the iterator ends
 
-## Casos de uso
+## Use cases
 
-1. **Crash recovery (happy path)**: WAL con 100 entries todos válidos → forward retorna 100 entries
-2. **Crash recovery con tail truncado**: WAL con 50 entries válidos + bytes parciales al final → forward retorna 50 entries y luego `Err(WalEntryTruncated)`
-3. **from_lsn skip**: forward con `from_lsn=51` salta los primeros 50 entries y retorna solo desde LSN 51
-4. **Backward completo**: retorna entries en orden LSN decreciente (último → primero)
-5. **WAL vacío** (solo header): forward y backward terminan en `None` de inmediato
-6. **WAL corrupto en el medio**: entry 30 de 100 tiene CRC malo → forward retorna `Ok` para 1-29, `Err(WalChecksumMismatch)` en 30, fin
+1. **Crash recovery (happy path)**: WAL with 100 all-valid entries → forward returns 100 entries
+2. **Crash recovery with truncated tail**: WAL with 50 valid entries + partial bytes at the end → forward returns 50 entries and then `Err(WalEntryTruncated)`
+3. **from_lsn skip**: forward with `from_lsn=51` skips the first 50 entries and returns only from LSN 51
+4. **Full backward**: returns entries in decreasing LSN order (last → first)
+5. **Empty WAL** (header only): forward and backward both end with `None` immediately
+6. **Corrupt WAL in the middle**: entry 30 of 100 has a bad CRC → forward returns `Ok` for 1-29, `Err(WalChecksumMismatch)` at 30, end
 
-## Criterios de aceptación
+## Acceptance criteria
 
-- [ ] `WalReader::open()` verifica header y retorna error en archivo inválido
-- [ ] `scan_forward(0)` retorna todos los entries del WAL en orden LSN creciente
-- [ ] `scan_forward(N)` salta entries con `LSN < N` y retorna desde LSN N en adelante
-- [ ] Forward se detiene en el primer entry corrupto/truncado retornando `Err`
-- [ ] `scan_backward()` retorna todos los entries en orden LSN decreciente
-- [ ] Backward se detiene en el primer entry corrupto retornando `Err`
-- [ ] WAL vacío (solo header): ambos iteradores terminan limpiamente con `None`
-- [ ] Ambos iteradores abren su propio file handle — no hay shared mutable state en `WalReader`
-- [ ] Tests de integración en `tests/integration_wal_reader.rs`
-- [ ] Sin `unwrap()` en `src/reader.rs`
+- [ ] `WalReader::open()` verifies header and returns error on invalid file
+- [ ] `scan_forward(0)` returns all WAL entries in increasing LSN order
+- [ ] `scan_forward(N)` skips entries with `LSN < N` and returns from LSN N onward
+- [ ] Forward stops at the first corrupt/truncated entry returning `Err`
+- [ ] `scan_backward()` returns all entries in decreasing LSN order
+- [ ] Backward stops at the first corrupt entry returning `Err`
+- [ ] Empty WAL (header only): both iterators end cleanly with `None`
+- [ ] Both iterators open their own file handle — no shared mutable state in `WalReader`
+- [ ] Integration tests in `tests/integration_wal_reader.rs`
+- [ ] No `unwrap()` in `src/reader.rs`
 
-## Fuera del alcance
+## Out of scope
 
-- Indexado de LSNs para O(1) seek — scan lineal es suficiente para esta fase
-- WAL de múltiples segmentos (rotation) — un archivo único
-- Zero-copy con mmap — los entries tienen payloads variables con `Vec<u8>` owned
-- Lectura concurrente thread-safe — el iterator se usa en un thread a la vez
+- LSN indexing for O(1) seek — linear scan is sufficient for this phase
+- Multi-segment WAL (rotation) — single file only
+- Zero-copy with mmap — entries have variable payloads with owned `Vec<u8>`
+- Thread-safe concurrent reading — the iterator is used in one thread at a time
 
-## Dependencias
+## Dependencies
 
 - `WalEntry::from_bytes()` — subfase 3.1 ✅
-- `WalWriter` + constantes `WAL_HEADER_SIZE`, `WAL_MAGIC`, `WAL_VERSION` — subfase 3.2 ✅
-- `DbError::WalEntryTruncated`, `WalChecksumMismatch`, `WalInvalidHeader` — ya en nexusdb-core ✅
+- `WalWriter` + constants `WAL_HEADER_SIZE`, `WAL_MAGIC`, `WAL_VERSION` — subfase 3.2 ✅
+- `DbError::WalEntryTruncated`, `WalChecksumMismatch`, `WalInvalidHeader` — already in nexusdb-core ✅
