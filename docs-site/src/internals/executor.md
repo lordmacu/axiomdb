@@ -406,3 +406,127 @@ query. Lateral joins (which allow correlation in `FROM`) are not yet supported.
 
 All operations are **in-memory** for Phase 4. External sort and hash spill for
 large datasets are planned for Phase 14 (vectorized execution).
+
+---
+
+## AUTO_INCREMENT Execution
+
+### Per-Table Sequence State
+
+Each table that has an `AUTO_INCREMENT` column maintains a sequence counter.
+The counter is stored as a thread-local `HashMap<String, i64>` keyed by table
+name, lazily initialized on the first INSERT:
+
+```
+auto_increment_next(table_name):
+  if table_name not in thread_local_map:
+    max_existing = MAX(id) from HeapChain scan, or 0 if table is empty
+    thread_local_map[table_name] = max_existing + 1
+  value = thread_local_map[table_name]
+  thread_local_map[table_name] += 1
+  return value
+```
+
+The `MAX+1` lazy-init strategy means the sequence is always consistent with
+existing data, even after rows are inserted by a previous session or after
+a crash recovery.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Thread-Local vs Per-Session State</span>
+The sequence counter is stored in thread-local storage rather than attached to a
+session object. Phase 4 uses a single-threaded executor, so thread-local and
+session-local are equivalent. This avoids the complexity of a session handle
+threading through every call site. When Phase 7 introduces concurrent sessions,
+the counter will migrate to per-session state. The lazy-init from <code>MAX+1</code>
+is compatible with either approach.
+</div>
+</div>
+
+### Explicit Value Bypass
+
+When the INSERT column list includes the AUTO_INCREMENT column with a non-NULL
+value, the explicit value is used directly and the sequence counter is not
+advanced:
+
+```
+for each row to insert:
+  if auto_increment_col in provided_columns:
+    value = provided value   // bypass — no counter update
+  else:
+    value = auto_increment_next(table_name)
+    session.last_insert_id = value   // update only for generated IDs
+```
+
+`LAST_INSERT_ID()` is updated only when a value is auto-generated. Inserting
+an explicit ID does not change the session's `last_insert_id`.
+
+### Multi-Row INSERT
+
+For `INSERT INTO t VALUES (...), (...), ...`, the executor calls
+`auto_increment_next` once per row. `last_insert_id` is set to the value
+generated for the **first** row before iterating through the rest:
+
+```
+ids = [auto_increment_next(t) for _ in rows]
+session.last_insert_id = ids[0]   // MySQL semantics
+insert all rows with their respective ids
+```
+
+### TRUNCATE — Sequence Reset
+
+`TRUNCATE TABLE t` deletes all rows by scanning the `HeapChain` and marking
+every visible row as deleted (same algorithm as `DELETE FROM t` without a
+WHERE clause). After clearing the rows, it resets the sequence:
+
+```
+execute_truncate(table_name):
+  for row in HeapChain::scan_visible(table_name, snapshot):
+    storage.delete_row(row.record_id, txn_id)
+  thread_local_map.remove(table_name)   // next insert re-initializes from MAX+1 = 1
+  return QueryResult::Affected { count: 0 }
+```
+
+Removing the entry from the map forces a `MAX+1` re-initialization on the next
+INSERT. Because the table is now empty, `MAX = 0`, so `next = 1`.
+
+---
+
+## SHOW TABLES / SHOW COLUMNS
+
+### SHOW TABLES
+
+`SHOW TABLES [FROM schema]` reads the catalog's table registry and returns one
+row per table. The output column is named `Tables_in_<schema>`:
+
+```
+execute_show_tables(schema):
+  tables = catalog.list_tables(schema)
+  column_name = "Tables_in_" + schema
+  return QueryResult::Rows { columns: [column_name], rows: [[t] for t in tables] }
+```
+
+### SHOW COLUMNS / DESCRIBE
+
+`SHOW COLUMNS FROM t`, `DESCRIBE t`, and `DESC t` are all dispatched to the
+same handler. The executor reads the column definitions from the catalog and
+constructs a fixed six-column result set:
+
+```
+execute_show_columns(table_name):
+  cols = catalog.get_table(table_name).columns
+  for col in cols:
+    Field   = col.name
+    Type    = col.data_type.to_sql_string()
+    Null    = if col.nullable { "YES" } else { "NO" }
+    Key     = if col.is_primary_key { "PRI" } else { "" }
+    Default = "NULL"   // stub
+    Extra   = if col.auto_increment { "auto_increment" } else { "" }
+  return six-column result set
+```
+
+The `Key` and `Default` fields are stubs: `Key` only reflects primary key
+membership; composite keys, unique constraints, and foreign keys are not yet
+surfaced. `Default` always shows `"NULL"` regardless of the declared default
+expression. Full metadata exposure is planned for a later catalog enhancement.
