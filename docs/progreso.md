@@ -210,6 +210,7 @@
 - [ ] 7.13 ⏳ Isolation tests — verify READ COMMITTED and REPEATABLE READ with concurrent transactions; test dirty reads, non-repeatable reads, phantom reads; use real concurrent transactions (not mocks)
 - [ ] 7.14 ⏳ Cascading rollback prevention — if txn A aborts and txn B read data from A (dirty read), B must also abort; verify that READ COMMITTED prevents this structurally
 - [ ] 7.15 ⏳ Basic transaction ID overflow prevention — `txn_id` is u64; log warning at 50% and 90% of capacity; plan for VACUUM FREEZE (complete in Phase 34) but detection must be early
+- [ ] 7.16 ⏳ Historical reads — `BEGIN READ ONLY AS OF TIMESTAMP '2023-12-31 23:59:59'` anchors the snapshot to a past point; MVCC already has the data, this adds the SQL syntax and executor support; critical for auditing financial data at a specific date without exporting first
 
 ---
 
@@ -300,6 +301,10 @@
 - [ ] 13.6 ⏳ Non-blocking ALTER TABLE — shadow table + WAL delta + atomic swap
 - [ ] 13.7 ⏳ Row-level locking — lock specific row during UPDATE/DELETE; reduces contention vs per-table lock from 7.5
 - [ ] 13.8 ⏳ Deadlock detection — DFS on wait graph when lock_timeout expires; kill the youngest transaction
+- [ ] 13.9 ⏳ Immutable / append-only tables — `CREATE TABLE journal IMMUTABLE`; the engine physically rejects UPDATE and DELETE on that table at the storage layer (not just a trigger); WAL still accepts new inserts; errors on any modification attempt with SQLSTATE 42000; critical for accounting, compliance, and audit logs where data must never be altered — only corrected via compensating inserts
+- [ ] 13.10 ⏳ Gapless sequences — `CREATE SEQUENCE inv_num GAPLESS START 1`; unlike AUTO_INCREMENT (which skips numbers on rollback), a gapless sequence uses a dedicated lock + WAL entry to guarantee no gaps even across failures; `NEXTVAL('inv_num')` blocks until the sequence number is committed; required by tax law in most countries for invoice numbering; `LAST_VALUE`, `RESET TO n` for administration
+- [ ] 13.11 ⏳ Fiscal period locking — `LOCK FISCAL PERIOD '2023'`; after locking, INSERT/UPDATE/DELETE of rows with any date column falling within that period returns an error; `UNLOCK FISCAL PERIOD '2023'` for corrections; stored in a system table `nexus_locked_periods`; the executor checks against it for tables that have a designated date column (`CREATE TABLE t (..., WITH FISCAL_DATE = created_at)`)
+- [ ] 13.12 ⏳ Statement-level triggers — `CREATE TRIGGER t AFTER INSERT ON journal FOR EACH STATEMENT`; fires once after the entire DML statement, not once per row; receives aggregated counts; enables double-entry validation: after a batch of journal inserts, verify that SUM(debits) = SUM(credits) within the same transaction, rejecting the commit if not balanced
 
 ### Phase 14 — TimescaleDB + Redis + Content-addressed BLOB `⏳` week 32-33
 - [ ] 14.1 ⏳ Table partitioning — `PARTITION BY RANGE/HASH/LIST`
@@ -341,7 +346,7 @@
 ### Phase 17 — Security `⏳` week 39-40
 - [ ] 17.1 ⏳ CREATE USER / CREATE ROLE — user and role model
 - [ ] 17.2 ⏳ GRANT / REVOKE — permissions per table and per column
-- [ ] 17.3 ⏳ Row-Level Security — policies with `USING` expr applied automatically
+- [ ] 17.3 ⏳ Row-Level Security — `CREATE POLICY empresa_isolation ON cuentas USING (empresa_id = current_setting('app.empresa_id')::INT)`; policies applied automatically on every SELECT/INSERT/UPDATE/DELETE without application code changes; multiple policies per table combined with OR; `FORCE ROW LEVEL SECURITY` for table owners; critical for multi-tenant accounting software where one DB instance serves multiple companies and data isolation is a legal requirement
 - [ ] 17.4 ⏳ Argon2id — password hashing + Scram-SHA-256 in handshake
 - [ ] 17.5 ⏳ TLS 1.3 — encrypted connections with `tokio-rustls`
 - [ ] 17.6 ⏳ Statement timeout — per user, session and global
