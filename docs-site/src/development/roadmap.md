@@ -56,6 +56,7 @@ functionality. The design is organized in three blocks:
 | 4.23 | QueryResult type | ✅ | Row, ColumnMeta, QueryResult (Rows/Affected/Empty) |
 | 4.5b | Table engine | ✅ | TableEngine scan/insert/delete/update; TableDef.data_root_page_id |
 | 4.5 + 4.5a | Basic executor | ✅ | SELECT/INSERT/UPDATE/DELETE, DDL, txn control, SELECT without FROM |
+| 4.25 + 4.7 | Error handling framework | ✅ | Complete SQLSTATE mapping; ErrorResponse{sqlstate,message,detail,hint} |
 | 5 | Executor (advanced) | ⚠️ Planned | JOIN, GROUP BY, ORDER BY, index lookup, aggregate |
 | 6 | Query planner | ⚠️ Planned | Cost-based plan selection |
 | 7 | Full MVCC | ⚠️ Planned | SSI, write-write conflicts, epoch reclamation |
