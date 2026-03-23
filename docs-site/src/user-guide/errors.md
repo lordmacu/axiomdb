@@ -310,4 +310,13 @@ The following conversions happen automatically without raising 22018:
 | `22003`  | numeric_value_out_of_range    | Number exceeds type bounds                |
 | `22012`  | division_by_zero              | Division by zero in expression            |
 | `22018`  | invalid_character_value_for_cast | Implicit type coercion failed          |
+| `22P02`  | invalid_text_representation   | Invalid literal value                     |
+| `42501`  | insufficient_privilege        | Permission denied on object               |
+| `42702`  | ambiguous_column              | Unqualified column matches in 2+ tables   |
+| `42804`  | datatype_mismatch             | Type mismatch in expression               |
+| `25001`  | active_sql_transaction        | BEGIN inside an active transaction        |
+| `25P01`  | no_active_sql_transaction     | COMMIT/ROLLBACK with no active transaction|
+| `25006`  | read_only_sql_transaction     | Transaction expired                       |
+| `0A000`  | feature_not_supported         | SQL feature not yet implemented           |
+| `53100`  | disk_full                     | Storage volume is full                    |
 | `58030`  | io_error                      | OS-level I/O failure (disk, permissions)  |

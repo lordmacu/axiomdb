@@ -115,10 +115,10 @@
 - [x] 4.5 ✅ Basic executor — connects AST→semantic→storage: executes CREATE/DROP TABLE, INSERT, SELECT (with WHERE), UPDATE, DELETE; autocommit per statement
 - [x] 4.5a ✅ SELECT without FROM — `SELECT 1`, `SELECT NOW()`; included in 4.5
 - [x] 4.5b ✅ Table engine — row storage interface: `scan_table(snap)→RowIter`, `insert_row(values)→RecordId`, `delete_row(rid)`, `update_row(rid, values)`; wraps HeapChain + Row codec + catalog; used by the executor for all DML on heap tables
-- [ ] 4.25 ⏳ Error handling framework — SQLSTATE codes (23505, 42P01, 40001), propagation without panic, recovery from constraint + type errors; base for all other modules
-- [ ] 4.25b ⏳ Structured error responses — every error includes: `code` (SQLSTATE), `message`, `detail` (table, column, constraint, offending value), `hint` (what to do), `position` (query line/col); inspired by Rust compiler errors — the most actionable error format in any language; `'duplicate key'` errors tell you which row already has that value; `'foreign key violation'` tells you which referenced row does not exist; available as JSON via `SET error_format = 'json'` and as human-readable text by default; no other SQL database provides this level of detail out of the box
-- [ ] 4.25c ⏳ Strict mode always on + warnings system — data truncation is always an error (not configurable); division by zero is always an error; `'42abc'` cast to INT is always an error; `SET warnings = 'all'` makes every implicit conversion visible as a warning; `SET warnings = 'error'` converts warnings to errors for strict applications; `SET warnings = 'silent'` suppresses all (MySQL-compatible mode); with `COMPAT='mysql'` the behavior matches MySQL's lenient defaults for migration
-- [ ] 4.7 ⏳ SQLSTATE codes — map all DbError variants to standard 5-char codes; consistent error format for Phase 5 wire protocol
+- [x] 4.25 ✅ Error handling framework — complete SQLSTATE mapping + ErrorResponse{sqlstate,severity,message,detail,hint} with hints for 15 variants
+- [ ] 4.25b ⏳ Structured error responses — position (byte offset), offending value in UniqueViolation, JSON format via SET error_format='json'
+- [ ] 4.25c ⏳ Strict mode always on + warnings system — requires session state (Phase 5)
+- [x] 4.7 ✅ SQLSTATE codes — all DbError variants mapped; SQL-reachable errors have precise 5-char codes
 
 <!-- ── Group E — Core SQL (needs executor) ── -->
 - [ ] 4.8 ⏳ JOIN — INNER, LEFT, RIGHT, CROSS with basic nested loop join

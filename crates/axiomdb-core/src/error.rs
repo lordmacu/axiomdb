@@ -178,22 +178,47 @@ pub enum DbError {
 }
 
 impl DbError {
-    /// SQLSTATE code — for compatibility with ORMs and SQL clients.
+    /// SQLSTATE code — 5-character string for wire protocol and ORM compatibility.
+    ///
+    /// Every variant that a SQL client can trigger has a precise SQLSTATE code.
+    /// Internal errors (storage corruption, WAL issues, heap internals) return
+    /// `"XX000"` because they are not caused by user SQL.
     pub fn sqlstate(&self) -> &'static str {
         match self {
+            // ── Integrity ─────────────────────────────────────────────────
             DbError::UniqueViolation { .. } => "23505",
             DbError::ForeignKeyViolation { .. } => "23503",
             DbError::NotNullViolation { .. } => "23502",
             DbError::CheckViolation { .. } => "23514",
+            DbError::DuplicateKey => "23505",
+            // ── Transaction ───────────────────────────────────────────────
             DbError::DeadlockDetected => "40P01",
+            DbError::TransactionAlreadyActive { .. } => "25001",
+            DbError::NoActiveTransaction => "25P01",
+            DbError::TransactionExpired { .. } => "25006",
+            // ── Schema ────────────────────────────────────────────────────
             DbError::ParseError { .. } => "42601",
             DbError::TableNotFound { .. } => "42P01",
+            DbError::TableAlreadyExists { .. } => "42P07",
             DbError::ColumnNotFound { .. } => "42703",
+            DbError::AmbiguousColumn { .. } => "42702",
             DbError::PermissionDenied { .. } => "42501",
+            // ── Data / Types ──────────────────────────────────────────────
             DbError::TypeMismatch { .. } => "42804",
             DbError::InvalidCoercion { .. } => "22018",
+            DbError::DivisionByZero => "22012",
+            DbError::Overflow => "22003",
+            DbError::KeyTooLong { .. } => "22001",
+            DbError::ValueTooLarge { .. } => "22001",
+            DbError::InvalidValue { .. } => "22P02",
+            // ── Features ─────────────────────────────────────────────────
+            DbError::NotImplemented { .. } => "0A000",
+            // ── System / I/O ──────────────────────────────────────────────
             DbError::Io(_) => "58030",
-            DbError::FileLocked { .. } => "55006", // object_in_use
+            DbError::FileLocked { .. } => "55006",
+            DbError::StorageFull => "53100",
+            DbError::SequenceOverflow => "2200H",
+            // ── Internal errors (not user-facing) ─────────────────────────
             _ => "XX000",
         }
     }
