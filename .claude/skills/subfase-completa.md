@@ -77,7 +77,7 @@ Only if N.M was the last subphase of Phase N:
 - `dbyo-NAME` — description (Phase N completed YYYY-MM-DD)
 ```
 
-### Step 6 — Commit
+### Step 6 — Commit and push
 
 ```bash
 git add docs/progreso.md .claude/projects/*/memory/project_state.md
@@ -85,6 +85,8 @@ git commit -m "progress(N.M): complete [brief subphase description]
 
 Subphase N.M of Phase N completed.
 Progress: X/225 subphases (Y%)"
+
+git push origin main
 ```
 
 ### Step 7 — Report to user
