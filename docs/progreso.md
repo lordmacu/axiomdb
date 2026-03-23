@@ -867,19 +867,41 @@
 - [ ] 37.22 ⏳ `users.history()` — all versions of rows → temporal scan
 - [ ] 37.23 ⏳ `users.changes(from: t1, to: t2)` — delta between two snapshots
 
-#### 37.F — Quality
-- [ ] 37.24 ⏳ Documentation — AxiomQL reference in docs-site: every method with SQL equivalent side-by-side
-- [ ] 37.25 ⏳ Fuzz testing — malformed AxiomQL input; every panic = regression test
-- [ ] 37.26 ⏳ AxiomQL → SQL pretty-printer — `users.filter(active).to_sql()` returns the SQL string (useful for debugging)
+#### 37.G — Bulk I/O (COPY)
+- [ ] 37.27 ⏳ `users.export('/path/file.csv', format: csv)` — COPY TO; also `format: json`, `format: parquet`
+- [ ] 37.28 ⏳ `users.import('/path/file.csv', format: csv)` — COPY FROM with schema validation and error reporting
+- [ ] 37.29 ⏳ `users.filter(...).export(query)` — export result of arbitrary query, not just full table
 
-#### Out of scope for AxiomQL (handled by SQL only)
-> The following are intentionally not in AxiomQL. SQL handles them:
-> - VACUUM, CHECKPOINT, REINDEX, ANALYZE (administrative)
-> - LISTEN / NOTIFY (pub/sub — use the Rust SDK event API instead)
-> - Row-level security policies (CREATE POLICY)
-> - Cursors (DECLARE / FETCH / CLOSE)
-> - COPY TO / COPY FROM (bulk I/O — use the CLI or Rust API)
-> - Advisory locks
+#### 37.H — Reactive queries (LISTEN/NOTIFY)
+- [ ] 37.30 ⏳ `channel('name').listen()` — LISTEN channel; returns async stream of notifications
+- [ ] 37.31 ⏳ `channel('name').notify(payload)` — NOTIFY channel, 'payload'
+- [ ] 37.32 ⏳ `users.subscribe(filter: active)` — reactive query stream; uses WAL CatalogChangeNotifier from Phase 3.13
+
+#### 37.I — Cursors (server-side iteration)
+- [ ] 37.33 ⏳ `users.filter(...).cursor()` — server-side cursor for large result sets; compiles to DECLARE + CURSOR
+- [ ] 37.34 ⏳ `.fetch(n)` / `.fetch_all()` / `.close()` — FETCH n / FETCH ALL / CLOSE on cursor object
+- [ ] 37.35 ⏳ `.each(batch: 1000, fn)` — convenience: cursor + fetch loop + auto-close
+
+#### 37.J — Row-Level Security
+- [ ] 37.36 ⏳ `policy on users { name: 'p', using: tenant_id = current_user() }` — CREATE POLICY; auto-filter per user
+- [ ] 37.37 ⏳ `users.enable_rls()` / `users.disable_rls()` — ALTER TABLE ENABLE/DISABLE ROW LEVEL SECURITY
+- [ ] 37.38 ⏳ `drop policy 'name' on users` — DROP POLICY
+
+#### 37.K — Advisory locks
+- [ ] 37.39 ⏳ `advisory_lock(key) { ... }` — block-based advisory lock; auto-release on exit
+- [ ] 37.40 ⏳ `advisory_lock_shared(key) { ... }` — shared advisory lock for read-only critical sections
+- [ ] 37.41 ⏳ `lock.try_acquire(key)` — non-blocking attempt; returns bool
+
+#### 37.L — Maintenance
+- [ ] 37.42 ⏳ `vacuum(users)`, `vacuum(users, full: true, analyze: true)` — VACUUM; reclaims dead MVCC rows
+- [ ] 37.43 ⏳ `analyze(users)` — UPDATE STATISTICS for query planner
+- [ ] 37.44 ⏳ `reindex(users)`, `reindex(users.email_idx)` — REINDEX table or index
+- [ ] 37.45 ⏳ `checkpoint()` — manual WAL checkpoint; flush all dirty pages
+
+#### 37.M — Quality
+- [ ] 37.46 ⏳ Documentation — AxiomQL reference in docs-site: every method with SQL equivalent side-by-side
+- [ ] 37.47 ⏳ Fuzz testing — malformed AxiomQL input; every panic = regression test
+- [ ] 37.48 ⏳ `.to_sql()` pretty-printer — `users.filter(active).to_sql()` returns the generated SQL (debug + learning tool)
 
 ---
 
