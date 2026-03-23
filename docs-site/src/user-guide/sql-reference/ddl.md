@@ -364,41 +364,115 @@ DROP INDEX IF EXISTS idx_old_lookup;
 
 ## ALTER TABLE
 
-Modifies the structure of an existing table.
+Modifies the structure of an existing table. All four forms are blocking
+operations — no concurrent DDL is allowed while an ALTER TABLE is in progress.
 
 ### Add Column
 
+Adds a new column at the end of the column list. If existing rows are present,
+they are rewritten to include the default value for the new column. If no
+`DEFAULT` clause is given, existing rows receive `NULL` for that column.
+
 ```sql
+ALTER TABLE table_name ADD COLUMN column_name data_type [NOT NULL] [DEFAULT expr];
+```
+
+```sql
+-- Add a nullable column (existing rows get NULL)
 ALTER TABLE users ADD COLUMN phone TEXT;
 
--- With a default value (applied to all existing rows immediately)
+-- Add a NOT NULL column with a default (existing rows get 0)
 ALTER TABLE orders ADD COLUMN priority INT NOT NULL DEFAULT 0;
+
+-- Add a column with a string default
+ALTER TABLE products ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
 ```
+
+> A column with `NOT NULL` and no `DEFAULT` cannot be added to a non-empty
+> table — existing rows would have no value to fill in and would violate the
+> constraint. Provide a `DEFAULT` value, or add the column as nullable first
+> and back-fill the data before adding the constraint.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Row Rewriting on Schema Change</span>
+AxiomDB rows are stored positionally: each row is a packed binary blob where
+values are addressed by column index, not by name. The null bitmap and value
+offsets are fixed at write time according to the schema that was active when
+the row was inserted. When a column is added or dropped, the column count
+changes and all existing rows must be rewritten to match the new layout.
+This is the same approach used by SQLite for its "full table rewrite" DDL path.
+Rename operations (RENAME COLUMN, RENAME TO) touch only the catalog — no rows
+are rewritten because column positions do not change.
+</div>
+</div>
 
 ### Drop Column
 
+Removes a column from the table. All existing rows are rewritten without the
+dropped column's value. The column name must exist unless `IF EXISTS` is used.
+
 ```sql
+ALTER TABLE table_name DROP COLUMN column_name [IF EXISTS];
+```
+
+```sql
+-- Remove a column (fails if the column does not exist)
 ALTER TABLE users DROP COLUMN phone;
+
+-- Remove a column only if it exists (idempotent, safe in migrations)
+ALTER TABLE users DROP COLUMN phone IF EXISTS;
+```
+
+> Dropping a column is permanent. The data stored in that column is discarded
+> when rows are rewritten and cannot be recovered without a backup.
+
+> **Not yet supported:** dropping a column that is part of a PRIMARY KEY,
+> UNIQUE constraint, or FOREIGN KEY. These require constraint-aware DDL
+> (Phase 4.22b).
+
+### Rename Column
+
+Renames an existing column. This is a catalog-only operation — no rows are
+rewritten because the positional encoding is not affected by column names.
+
+```sql
+ALTER TABLE table_name RENAME COLUMN old_name TO new_name;
+```
+
+```sql
+-- Rename a column
+ALTER TABLE users RENAME COLUMN full_name TO display_name;
+
+-- Rename to fix a typo
+ALTER TABLE orders RENAME COLUMN shiped_at TO shipped_at;
 ```
 
 ### Rename Table
+
+Renames the table itself. This is a catalog-only operation.
 
 ```sql
 ALTER TABLE old_name RENAME TO new_name;
 ```
 
-### Add Constraint
-
 ```sql
-ALTER TABLE orders ADD CONSTRAINT chk_positive_total CHECK (total >= 0);
-ALTER TABLE users  ADD CONSTRAINT uq_users_phone UNIQUE (phone);
+-- Rename during a refactoring
+ALTER TABLE user_profiles RENAME TO profiles;
+
+-- Rename a staging table after a migration
+ALTER TABLE orders_import RENAME TO orders;
 ```
 
-### Drop Constraint
+### Not Yet Supported
 
-```sql
-ALTER TABLE orders DROP CONSTRAINT chk_positive_total;
-```
+The following ALTER TABLE forms are planned for Phase 4.22b and later:
+
+- `MODIFY COLUMN` / `ALTER COLUMN` — changing a column's data type
+- `ADD CONSTRAINT` — adding a CHECK, UNIQUE, or FOREIGN KEY after table creation
+- `DROP CONSTRAINT` — removing a named constraint
+- Dropping columns that participate in a constraint
 
 ---
 

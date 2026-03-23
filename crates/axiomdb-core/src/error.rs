@@ -175,6 +175,12 @@ pub enum DbError {
     #[error("subquery must return exactly one row, but returned {count} rows")]
     CardinalityViolation { count: usize },
 
+    // ── DDL ───────────────────────────────────────────────────────
+    /// A column with this name already exists in the table.
+    /// SQLSTATE 42701 — duplicate_column
+    #[error("column '{name}' already exists in table '{table}'")]
+    ColumnAlreadyExists { name: String, table: String },
+
     // ── General ──────────────────────────────────────────────────
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
@@ -222,6 +228,8 @@ impl DbError {
             DbError::InvalidValue { .. } => "22P02",
             // ── Subqueries ────────────────────────────────────────────────
             DbError::CardinalityViolation { .. } => "21000",
+            // ── DDL ───────────────────────────────────────────────────────
+            DbError::ColumnAlreadyExists { .. } => "42701",
             // ── Features ─────────────────────────────────────────────────
             DbError::NotImplemented { .. } => "0A000",
             // ── System / I/O ──────────────────────────────────────────────

@@ -150,7 +150,7 @@
 <!-- ── Group H — Introspection + DDL modification (needs executor) ── -->
 - [x] 4.20 ✅ SHOW TABLES / SHOW COLUMNS / DESCRIBE — parser + executor using CatalogReader; MySQL-compatible 6-column output; Extra shows auto_increment
 - [x] 4.21 ✅ TRUNCATE TABLE — delete-all + AUTO_INCREMENT sequence reset; MySQL convention (returns count=0)
-- [ ] 4.22 ⏳ Basic ALTER TABLE — `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `RENAME TABLE` (blocking, no concurrent); prerequisite for migrations
+- [x] 4.22 ✅ Basic ALTER TABLE — `ADD COLUMN` (row rewrite + default), `DROP COLUMN` (row rewrite), `RENAME COLUMN`, `RENAME TO`; parser + CatalogWriter extensions; 15 integration tests; ColumnAlreadyExists (SQLSTATE 42701)
 - [ ] 4.22b ⏳ ALTER TABLE ADD/DROP CONSTRAINT — `ADD CONSTRAINT fk`, `DROP CONSTRAINT`, `ADD UNIQUE`, `ADD CHECK`; ORMs need this post-creation
 
 <!-- ── Group I — Validation (last, closes the phase) ── -->

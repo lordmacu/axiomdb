@@ -2092,3 +2092,270 @@ fn test_truncate_nonexistent_table() {
     let err = run_result("TRUNCATE TABLE nonexistent", &mut storage, &mut txn);
     assert!(matches!(err, Err(DbError::TableNotFound { .. })));
 }
+
+// ── 4.22: ALTER TABLE ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_alter_add_column_catalog() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT, name TEXT)", &mut storage, &mut txn);
+    run("ALTER TABLE t ADD COLUMN age INT", &mut storage, &mut txn);
+
+    let r = rows(run("DESCRIBE t", &mut storage, &mut txn));
+    assert_eq!(r.len(), 3);
+    let col_names: Vec<String> = r
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(s) => s.clone(),
+            v => panic!("{v:?}"),
+        })
+        .collect();
+    assert_eq!(col_names, vec!["id", "name", "age"]);
+}
+
+#[test]
+fn test_alter_add_column_existing_rows_get_null() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT, name TEXT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1, 'Alice')", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (2, 'Bob')", &mut storage, &mut txn);
+
+    run("ALTER TABLE t ADD COLUMN score INT", &mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT id, name, score FROM t ORDER BY id",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][2], Value::Null); // score = NULL for existing rows
+    assert_eq!(r[1][2], Value::Null);
+}
+
+#[test]
+fn test_alter_add_column_with_default() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (2)", &mut storage, &mut txn);
+
+    run(
+        "ALTER TABLE t ADD COLUMN status TEXT DEFAULT 'active'",
+        &mut storage,
+        &mut txn,
+    );
+
+    let r = rows(run(
+        "SELECT id, status FROM t ORDER BY id",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r[0][1], Value::Text("active".into()));
+    assert_eq!(r[1][1], Value::Text("active".into()));
+}
+
+#[test]
+fn test_alter_add_column_duplicate_name() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT, name TEXT)", &mut storage, &mut txn);
+
+    let err = run_result("ALTER TABLE t ADD COLUMN name TEXT", &mut storage, &mut txn);
+    assert!(matches!(err, Err(DbError::ColumnAlreadyExists { .. })));
+}
+
+#[test]
+fn test_alter_add_column_then_insert_and_select() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1)", &mut storage, &mut txn);
+    run("ALTER TABLE t ADD COLUMN val TEXT", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (2, 'hello')", &mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT id, val FROM t ORDER BY id",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][1], Value::Null); // old row: val = NULL
+    assert_eq!(r[1][1], Value::Text("hello".into())); // new row
+}
+
+#[test]
+fn test_alter_drop_column_removes_from_catalog() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT, name TEXT, age INT)",
+        &mut storage,
+        &mut txn,
+    );
+    run("ALTER TABLE t DROP COLUMN age", &mut storage, &mut txn);
+
+    let r = rows(run("DESCRIBE t", &mut storage, &mut txn));
+    assert_eq!(r.len(), 2);
+    let col_names: Vec<String> = r
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(s) => s.clone(),
+            v => panic!("{v:?}"),
+        })
+        .collect();
+    assert_eq!(col_names, vec!["id", "name"]);
+}
+
+#[test]
+fn test_alter_drop_column_data_remains_correct() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT, name TEXT, age INT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES (1, 'Alice', 30)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES (2, 'Bob', 25)",
+        &mut storage,
+        &mut txn,
+    );
+
+    run("ALTER TABLE t DROP COLUMN age", &mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT id, name FROM t ORDER BY id",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][0], Value::Int(1));
+    assert_eq!(r[0][1], Value::Text("Alice".into()));
+    assert_eq!(r[1][0], Value::Int(2));
+    assert_eq!(r[1][1], Value::Text("Bob".into()));
+}
+
+#[test]
+fn test_alter_drop_column_nonexistent() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+
+    let err = run_result(
+        "ALTER TABLE t DROP COLUMN nonexistent",
+        &mut storage,
+        &mut txn,
+    );
+    assert!(matches!(err, Err(DbError::ColumnNotFound { .. })));
+}
+
+#[test]
+fn test_alter_drop_column_if_exists_nonexistent() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+
+    // Should succeed silently
+    run(
+        "ALTER TABLE t DROP COLUMN IF EXISTS nonexistent",
+        &mut storage,
+        &mut txn,
+    );
+}
+
+#[test]
+fn test_alter_rename_column() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT, name TEXT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1, 'Alice')", &mut storage, &mut txn);
+
+    run(
+        "ALTER TABLE t RENAME COLUMN name TO full_name",
+        &mut storage,
+        &mut txn,
+    );
+
+    // DESCRIBE shows new name
+    let r = rows(run("DESCRIBE t", &mut storage, &mut txn));
+    let col_names: Vec<String> = r
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(s) => s.clone(),
+            v => panic!("{v:?}"),
+        })
+        .collect();
+    assert!(col_names.contains(&"full_name".to_string()));
+    assert!(!col_names.contains(&"name".to_string()));
+}
+
+#[test]
+fn test_alter_rename_column_nonexistent() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+
+    let err = run_result(
+        "ALTER TABLE t RENAME COLUMN nonexistent TO x",
+        &mut storage,
+        &mut txn,
+    );
+    assert!(matches!(err, Err(DbError::ColumnNotFound { .. })));
+}
+
+#[test]
+fn test_alter_rename_column_to_existing_name() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT, name TEXT)", &mut storage, &mut txn);
+
+    let err = run_result(
+        "ALTER TABLE t RENAME COLUMN id TO name",
+        &mut storage,
+        &mut txn,
+    );
+    assert!(matches!(err, Err(DbError::ColumnAlreadyExists { .. })));
+}
+
+#[test]
+fn test_alter_rename_table() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE users (id INT)", &mut storage, &mut txn);
+    run("INSERT INTO users VALUES (1)", &mut storage, &mut txn);
+
+    run(
+        "ALTER TABLE users RENAME TO customers",
+        &mut storage,
+        &mut txn,
+    );
+
+    // SHOW TABLES shows new name
+    let r = rows(run("SHOW TABLES", &mut storage, &mut txn));
+    let names: Vec<String> = r
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(s) => s.clone(),
+            v => panic!("{v:?}"),
+        })
+        .collect();
+    assert!(names.contains(&"customers".to_string()));
+    assert!(!names.contains(&"users".to_string()));
+}
+
+#[test]
+fn test_alter_rename_table_to_existing() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE a (id INT)", &mut storage, &mut txn);
+    run("CREATE TABLE b (id INT)", &mut storage, &mut txn);
+
+    let err = run_result("ALTER TABLE a RENAME TO b", &mut storage, &mut txn);
+    assert!(matches!(err, Err(DbError::TableAlreadyExists { .. })));
+}
+
+#[test]
+fn test_alter_nonexistent_table() {
+    let (mut storage, mut txn) = setup();
+
+    let err = run_result(
+        "ALTER TABLE nonexistent ADD COLUMN x INT",
+        &mut storage,
+        &mut txn,
+    );
+    assert!(matches!(err, Err(DbError::TableNotFound { .. })));
+}

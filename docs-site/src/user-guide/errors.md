@@ -181,6 +181,20 @@ CREATE TABLE users (...);
 -- ERROR 42P07: relation "users" already exists
 ```
 
+### 42701 — duplicate_column
+
+`ALTER TABLE ... ADD COLUMN` was called for a column that already exists in
+the table.
+
+```sql
+CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL);
+ALTER TABLE users ADD COLUMN email TEXT;
+-- ERROR 42701: column "email" already exists in table "users"
+```
+
+**Fix:** Use a different column name, or check the current schema with
+`DESCRIBE users` before adding the column.
+
 ### 42702 — ambiguous_column
 
 An unqualified column name appears in multiple tables in the FROM clause.
@@ -362,6 +376,7 @@ The following conversions happen automatically without raising 22018:
 | `42703`  | undefined_column              | Column does not exist                     |
 | `42702`  | ambiguous_column              | Unqualified column name is ambiguous      |
 | `42P07`  | duplicate_table               | Table already exists                      |
+| `42701`  | duplicate_column              | Column already exists in table            |
 | `42601`  | syntax_error                  | Malformed SQL                             |
 | `42883`  | undefined_function            | Unknown function name                     |
 | `22001`  | string_data_right_truncation  | Value too long for column type            |

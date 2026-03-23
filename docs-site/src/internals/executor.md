@@ -530,3 +530,127 @@ The `Key` and `Default` fields are stubs: `Key` only reflects primary key
 membership; composite keys, unique constraints, and foreign keys are not yet
 surfaced. `Default` always shows `"NULL"` regardless of the declared default
 expression. Full metadata exposure is planned for a later catalog enhancement.
+
+---
+
+## ALTER TABLE Execution
+
+ALTER TABLE dispatches to one of four handlers depending on the operation.
+Two of them (ADD COLUMN and DROP COLUMN) require rewriting every row in the
+table. The other two (RENAME COLUMN and RENAME TO) touch only the catalog.
+
+### Why Row Rewriting Is Needed
+
+AxiomDB rows are stored as positional binary blobs. The null bitmap at the
+start of each row has exactly `ceil(column_count / 8)` bytes — one bit per
+column, in column-index order. Packed values follow immediately, with offsets
+derived from the column types declared at write time.
+
+```
+Row layout (schema: id BIGINT, name TEXT, age INT):
+
+  null_bitmap (1 byte)   [b0=id_null, b1=name_null, b2=age_null, ...]
+  id   (8 bytes, LE i64) [only present if b0=0]
+  name (4-byte len + UTF-8 bytes) [only present if b1=0]
+  age  (4 bytes, LE i32) [only present if b2=0]
+```
+
+When the column count changes, the null bitmap size changes and all subsequent
+offsets shift. A row written under the old schema cannot be decoded against the
+new schema — the null bitmap has the wrong number of bits, and value positions
+no longer align. Every row must therefore be rewritten to match the new layout.
+
+`RENAME COLUMN` does not change column positions or types — only the name entry
+in the catalog changes. `RENAME TO` changes only the table name in the catalog.
+Neither operation touches row data.
+
+### `rewrite_rows` Helper
+
+Both ADD COLUMN and DROP COLUMN use a shared `rewrite_rows` path:
+
+```
+rewrite_rows(table_name, old_schema, new_schema, transform_fn):
+  snapshot = txn.active_snapshot()
+  old_rows = HeapChain::scan_visible(table_name, snapshot)
+
+  for (record_id, old_row) in old_rows:
+    new_row = transform_fn(old_row)   // apply per-operation transformation
+    storage.delete_row(record_id, txn_id)
+    storage.insert_row(table_name, encode_row(new_row, new_schema), txn_id)
+```
+
+The `transform_fn` is operation-specific:
+
+| Operation | transform_fn |
+|---|---|
+| ADD COLUMN | Append `DEFAULT` value (or `NULL` if no default) to the end of the row |
+| DROP COLUMN | Remove the value at `col_idx` from the row vector |
+
+### Ordering Constraint — Catalog Before vs. After Rewrite
+
+The ordering of the catalog update relative to the row rewrite is not arbitrary.
+It is chosen so that a failure mid-rewrite leaves the database in a recoverable
+state:
+
+**ADD COLUMN — catalog update FIRST, then rewrite rows:**
+
+```
+1. catalog.add_column(table_name, new_column_def)
+2. rewrite_rows(old_schema → new_schema, append DEFAULT)
+```
+
+If the process crashes after step 1 but before step 2 completes, the catalog
+already reflects the new schema. The partially-rewritten rows are discarded by
+crash recovery (their transactions are uncommitted). On restart, the table is
+consistent: the new column exists in the catalog, and all rows either have been
+fully rewritten (if the transaction committed) or none have been (if it was
+rolled back).
+
+**DROP COLUMN — rewrite rows FIRST, then update catalog:**
+
+```
+1. rewrite_rows(old_schema → new_schema, remove col at col_idx)
+2. catalog.remove_column(table_name, col_idx)
+```
+
+If the process crashes after step 1 but before step 2, the rows have already
+been written in the new (narrower) layout but the catalog still shows the old
+schema. Recovery rolls back the uncommitted row rewrites and the catalog is
+never touched — the table is fully consistent under the old schema.
+
+The invariant is: **the catalog always describes rows that can be decoded.**
+Swapping the order for either operation would create a window where the catalog
+describes a schema that does not match the on-disk rows.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Asymmetric Catalog Ordering</span>
+ADD COLUMN updates the catalog before rewriting rows; DROP COLUMN rewrites rows
+before updating the catalog. The direction is chosen so that a mid-operation
+crash always leaves the catalog consistent with whatever rows are on disk. For
+ADD, a rolled-back partial rewrite leaves rows under the old (narrower) schema —
+but the catalog already shows the new column, which is a problem. The solution
+is that partial rewrites are uncommitted transactions and are invisible to crash
+recovery, which only replays committed WAL entries. For DROP, partial rewrites
+under the new (narrower) layout are also rolled back, and the catalog still
+describes the old (wider) schema — fully decodable. This mirrors the ordering
+used in PostgreSQL's heap rewrite path for ALTER TABLE operations.
+</div>
+</div>
+
+### Session Cache Invalidation
+
+The session holds a `SchemaCache` that maps table names to their column
+definitions at the time the last query was prepared. After any ALTER TABLE
+operation completes, the cache entry for the affected table is invalidated:
+
+```
+execute_alter_table(stmt):
+  // ... perform operation (catalog update + optional row rewrite) ...
+  session.schema_cache.invalidate(table_name)
+```
+
+This ensures that the next query against the altered table re-reads the catalog
+and sees the updated column list, rather than operating on a stale schema that
+may reference columns that no longer exist or omit newly added ones.

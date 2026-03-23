@@ -5,8 +5,9 @@ use axiomdb_types::DataType;
 
 use crate::{
     ast::{
-        ColumnConstraint, ColumnDef, CreateIndexStmt, CreateTableStmt, DropIndexStmt,
-        DropTableStmt, ForeignKeyAction, IndexColumn, SortOrder, Stmt, TableConstraint,
+        AlterTableOp, AlterTableStmt, ColumnConstraint, ColumnDef, CreateIndexStmt,
+        CreateTableStmt, DropIndexStmt, DropTableStmt, ForeignKeyAction, IndexColumn, SortOrder,
+        Stmt, TableConstraint,
     },
     lexer::Token,
 };
@@ -494,4 +495,84 @@ pub(crate) fn parse_drop_index(p: &mut Parser) -> Result<Stmt, DbError> {
         name,
         table,
     }))
+}
+
+// ── ALTER TABLE ───────────────────────────────────────────────────────────────
+
+/// Parses everything after `ALTER TABLE` has been consumed.
+pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
+    let table = p.parse_table_ref()?;
+    let mut operations = Vec::new();
+
+    loop {
+        let op = match p.peek().clone() {
+            // ADD [COLUMN] col_def
+            Token::Add => {
+                p.advance();
+                p.eat(&Token::Column);
+                let col_def = parse_column_def(p)?;
+                AlterTableOp::AddColumn(col_def)
+            }
+            // DROP [COLUMN] [IF EXISTS] col_name
+            Token::Drop => {
+                p.advance();
+                p.eat(&Token::Column);
+                let if_exists =
+                    if matches!(p.peek(), Token::If) && matches!(p.peek_at(1), Token::Exists) {
+                        p.advance();
+                        p.advance();
+                        true
+                    } else {
+                        false
+                    };
+                let name = p.parse_identifier()?;
+                AlterTableOp::DropColumn { name, if_exists }
+            }
+            // RENAME COLUMN old TO new  |  RENAME TO new_name
+            Token::Rename => {
+                p.advance();
+                match p.peek().clone() {
+                    Token::Column => {
+                        p.advance();
+                        let old_name = p.parse_identifier()?;
+                        p.expect(&Token::To)?;
+                        let new_name = p.parse_identifier()?;
+                        AlterTableOp::RenameColumn { old_name, new_name }
+                    }
+                    Token::To => {
+                        p.advance();
+                        let new_name = p.parse_identifier()?;
+                        AlterTableOp::RenameTable(new_name)
+                    }
+                    other => {
+                        return Err(DbError::ParseError {
+                            message: format!(
+                                "expected COLUMN or TO after RENAME in ALTER TABLE, found {other:?} at position {}",
+                                p.current_pos()
+                            ),
+                        })
+                    }
+                }
+            }
+            // MODIFY [COLUMN] col_def — not yet implemented
+            Token::Modify => {
+                return Err(DbError::NotImplemented {
+                    feature: "ALTER TABLE MODIFY COLUMN — Phase N".into(),
+                });
+            }
+            _ => break,
+        };
+        operations.push(op);
+        if !p.eat(&Token::Comma) {
+            break;
+        }
+    }
+
+    if operations.is_empty() {
+        return Err(DbError::ParseError {
+            message: "ALTER TABLE: expected ADD, DROP, or RENAME after table name".into(),
+        });
+    }
+
+    Ok(Stmt::AlterTable(AlterTableStmt { table, operations }))
 }
