@@ -396,21 +396,4 @@ fn diagnose(data_dir: &Path, n_rows: usize) {
     }
     eprintln!("╚══════════════════════════════════════════════════════════╝");
     eprintln!();
-
-    eprintln!("=== DIAGNOSE (1K rows) ===");
-    eprintln!("  parse only:        {:>6} µs", parse_us);
-    eprintln!(
-        "  parse + analyze:   {:>6} µs  (analyze overhead: {} µs)",
-        analyze_us,
-        analyze_us - parse_us
-    );
-    eprintln!(
-        "  full execute:      {:>6} µs  (execute overhead: {} µs)",
-        execute_us,
-        execute_us - analyze_us
-    );
-    eprintln!(
-        "  analyze % of total: {:.0}%",
-        (analyze_us - parse_us) as f64 / execute_us as f64 * 100.0
-    );
 }
