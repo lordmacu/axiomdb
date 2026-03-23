@@ -9,3 +9,4 @@ license.workspace = true
 nexusdb-core  = { workspace = true }
 nexusdb-types = { workspace = true }
 thiserror     = { workspace = true }
+logos         = { workspace = true }
