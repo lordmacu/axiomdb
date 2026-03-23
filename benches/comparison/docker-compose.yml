@@ -86,8 +86,8 @@ services:
   # Container stays alive with `sleep infinity`.
   axiomdb:
     build:
-      context: ./axiomdb
-      dockerfile: Dockerfile
+      context: ../..          # workspace root — needs full Cargo workspace
+      dockerfile: benches/comparison/axiomdb/Dockerfile
     image: axiomdb-bench/axiomdb:latest
     container_name: axiomdb_bench_axiomdb
     restart: unless-stopped

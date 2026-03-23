@@ -259,3 +259,57 @@ fn main() {
 
     run_scenario(&scenario, n_rows, &data_dir);
 }
+
+// ── Diagnostic: timing breakdown per phase ────────────────────────────────────
+
+#[allow(dead_code)]
+fn diagnose(data_dir: &Path) {
+    let mut db = Db::open(data_dir);
+    let inserts = gen_inserts(1000);
+    load_batch(&mut db, &inserts);
+
+    let q = "SELECT * FROM bench_users";
+
+    // 1. Parse only
+    let t0 = Instant::now();
+    for _ in 0..100 {
+        parse(q, None).unwrap();
+    }
+    let parse_us = t0.elapsed().as_micros() / 100;
+
+    // 2. Parse + analyze
+    let t0 = Instant::now();
+    for _ in 0..100 {
+        let stmt = parse(q, None).unwrap();
+        let snap = db
+            .txn
+            .active_snapshot()
+            .unwrap_or_else(|_| db.txn.snapshot());
+        analyze(stmt, &mut db.storage, snap).unwrap();
+    }
+    let analyze_us = t0.elapsed().as_micros() / 100;
+
+    // 3. Full execute
+    let t0 = Instant::now();
+    for _ in 0..100 {
+        db.sql_count(q);
+    }
+    let execute_us = t0.elapsed().as_micros() / 100;
+
+    eprintln!("=== DIAGNOSE (1K rows) ===");
+    eprintln!("  parse only:        {:>6} µs", parse_us);
+    eprintln!(
+        "  parse + analyze:   {:>6} µs  (analyze overhead: {} µs)",
+        analyze_us,
+        analyze_us - parse_us
+    );
+    eprintln!(
+        "  full execute:      {:>6} µs  (execute overhead: {} µs)",
+        execute_us,
+        execute_us - analyze_us
+    );
+    eprintln!(
+        "  analyze % of total: {:.0}%",
+        (analyze_us - parse_us) as f64 / execute_us as f64 * 100.0
+    );
+}

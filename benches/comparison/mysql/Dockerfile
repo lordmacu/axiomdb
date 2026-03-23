@@ -1,7 +1,7 @@
 FROM mysql:8.0
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip && \
-    pip3 install pymysql --break-system-packages 2>/dev/null || \
+# MySQL 8.0 runs on Oracle Linux 9 — uses microdnf
+RUN microdnf install -y python3 python3-pip && \
     pip3 install pymysql && \
-    rm -rf /var/lib/apt/lists/*
+    microdnf clean all
+RUN mkdir -p /bench
 COPY bench.py /bench/bench.py

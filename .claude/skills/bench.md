@@ -39,44 +39,72 @@ AxiomDB       → port 3311  (Docker, via docker exec + JSON until Phase 8 wire 
 ```bash
 cd benches/comparison
 
-# Start containers (first time or after teardown)
-./setup.sh          # MySQL + PostgreSQL only (AxiomDB runs natively for now)
-./setup.sh --all    # + AxiomDB container (Phase 8+)
+# Primera vez — build images + arrancar los 3 containers
+./setup.sh
 
-# Run specific scenarios
-python3 bench.py insert_batch
-python3 bench.py point_lookup range_scan
+# Correr escenarios específicos (los 3 en paralelo)
+python3 bench.py full_scan
+python3 bench.py insert_batch count_star
 python3 bench.py --all
 python3 bench.py --all --rows 100000
+python3 bench.py --list    # ver escenarios disponibles
 
-# Run AxiomDB native benchmark (until Phase 8)
-cargo run --release -p axiomdb-bench-comparison -- --rows 10000
+# Después de cambiar código de AxiomDB — rebuild y restart solo AxiomDB
+docker compose build axiomdb
+docker compose up -d axiomdb
 
-# Stop containers
+# Parar todo
 ./teardown.sh
 ```
 
+## Cómo funciona internamente
+
+```
+bench.py (host)
+  ├── docker exec axiomdb_bench_mysql   python3 /bench/bench.py --scenario X  ┐
+  ├── docker exec axiomdb_bench_pg      python3 /bench/bench.py --scenario X  ├── en paralelo
+  └── docker exec axiomdb_bench_axiomdb /bench/axiomdb_bench  --scenario X   ┘
+       ↓
+  Cada container ejecuta contra su propio localhost (sin overhead de red)
+  Output: JSON → bench.py lo recoge y muestra tabla comparativa
+```
+
+El binario de AxiomDB **se compila dentro del container de AxiomDB** (Linux nativo).
+Cuando hay cambios de código: `docker compose build axiomdb` recompila todo para Linux.
+
 ## Available scenarios
 
-| Scenario | What it measures | Known issue |
+| Scenario | What it measures | AxiomDB status |
 |---|---|---|
-| `insert_batch` | N rows in 1 txn | AxiomDB: uses DROP+CREATE between runs (not DELETE) |
+| `insert_batch` | N rows in 1 txn | ✅ 6.4× faster than MySQL |
 | `insert_autocommit` | 1 txn per row | — |
-| `full_scan` | SELECT * (heap scan throughput) | AxiomDB already wins 3× vs MySQL |
-| `select_where` | SELECT WHERE active=TRUE (~50%) | — |
-| `point_lookup` | 100 PK lookups | AxiomDB: full scan until Phase 5 query planner |
-| `range_scan` | WHERE id BETWEEN X AND Y | AxiomDB: full scan until Phase 5 |
-| `count_star` | SELECT COUNT(*) | AxiomDB: full scan until Phase 5 |
-| `group_by` | GROUP BY age + AVG(score) | — |
+| `full_scan` | SELECT * heap scan | ⚠️ slower than MySQL inside Docker (mmap page cache pressure) |
+| `select_where` | SELECT WHERE active=TRUE (~50%) | ❌ full scan, no index |
+| `point_lookup` | 100 PK lookups | ❌ full scan until Phase 5 |
+| `range_scan` | WHERE id BETWEEN X AND Y | ❌ full scan until Phase 5 |
+| `count_star` | SELECT COUNT(*) | ❌ full scan until Phase 5 |
+| `group_by` | GROUP BY age + COUNT(*) | ❌ full scan until Phase 5 |
+
+## Benchmark results — 3 Dockers, 10K rows, fsync ON, 2CPU/2GB (2026-03-23)
+
+| Scenario | MySQL 8.0 | PostgreSQL 16 | AxiomDB | Veredicto |
+|---|---|---|---|---|
+| `insert_batch` | 1,980/s | 26,875/s | **12,672/s** | AxiomDB **6.4× > MySQL** ✅ |
+| `full_scan` | 267K/s | 2,258K/s | 141K/s | ⚠️ Docker mmap pressure |
+| `select_where` | 263K/s | 1,759K/s | 51K/s | ❌ full scan |
+| `count_star` | 3,102/s | 4,739/s | 21/s | ❌ full scan |
+| `group_by` | 300/s | 479/s | 23/s | ❌ full scan |
+
+**Note:** full_scan nativo (sin Docker) = 616K/s → ganaba a MySQL (267K/s). El Docker con 2GB limita el page cache del OS que usa mmap.
 
 ## Known issues and which phase fixes them
 
 | Problem | Root cause | Fixed in |
 |---|---|---|
-| Point lookup 192× slower than MySQL | No query planner — full scan instead of B+Tree index | Phase 5 |
-| Range scan 38× slower | Same — no index scan | Phase 5 |
-| COUNT(*) 17× slower | Same | Phase 5 |
-| INSERT 6× slower than MySQL | Parse+analyze overhead per row + DELETE scan | Phase 5 (bulk insert) + benchmark fix |
+| Point lookup, range scan, COUNT, GROUP BY muy lentos | No query planner — full scan en vez de B+Tree index | **Phase 5** |
+| full_scan más lento que MySQL DENTRO de Docker | mmap depende del OS page cache; Docker con 2GB lo presiona | Phase 5 (buffer pool propio) o aumentar RAM del container |
+| INSERT: parse+analyze overhead por cada fila | Cada SQL string se parsea individualmente | **Phase 8** (prepared statements / wire protocol) |
+| AxiomDB no conecta vía red todavía | Sin wire protocol | **Phase 8** |
 | AxiomDB needs docker exec | No wire protocol yet | Phase 8 |
 
 ## Benchmark results so far (2026-03-23, 10K rows, fsync ON)
