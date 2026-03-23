@@ -1,30 +1,23 @@
-//! AxiomDB end-to-end comparison benchmark.
+//! AxiomDB internal benchmark — runs INSIDE the AxiomDB container.
+//! Uses real MmapStorage + WAL (no network overhead).
+//! Outputs one JSON line per scenario to stdout.
 //!
-//! Runs the same workloads as benches/comparison/bench_runner.py but using
-//! AxiomDB's executor directly (no network layer yet — Phase 8).
-//!
-//! Storage: MmapStorage (real files on disk)
-//! WAL:     enabled with fsync=true (same durability as MySQL/PG in the Python bench)
-//! Network: none — direct function calls
-//!
-//! Usage:
-//!   cargo run --release -p axiomdb-bench-comparison -- --rows 10000
-//!
-//! The output format matches the Python bench_runner.py table so results
-//! can be placed side by side.
+//! Usage (from host via docker exec):
+//!   docker exec axiomdb_bench_axiomdb /bench/axiomdb_bench \
+//!     --scenario insert_batch --rows 10000
 
 use std::path::Path;
 use std::time::Instant;
 
 use axiomdb_catalog::CatalogBootstrap;
-use axiomdb_sql::{analyze, execute, parse};
+use axiomdb_sql::{analyze, execute, parse, QueryResult};
 use axiomdb_storage::MmapStorage;
 use axiomdb_wal::TxnManager;
 
 const WARMUP: usize = 2;
 const RUNS: usize = 5;
 
-// ── Engine setup ──────────────────────────────────────────────────────────────
+// ── Engine ────────────────────────────────────────────────────────────────────
 
 struct Db {
     storage: MmapStorage,
@@ -32,70 +25,66 @@ struct Db {
 }
 
 impl Db {
-    fn create(dir: &Path) -> Self {
+    fn open(dir: &Path) -> Self {
         let db_path = dir.join("bench.db");
         let wal_path = dir.join("bench.wal");
-        let mut storage = MmapStorage::create(&db_path).expect("create storage");
-        CatalogBootstrap::init(&mut storage).expect("bootstrap catalog");
-        let txn = TxnManager::create(&wal_path).expect("create WAL");
+
+        // Open existing or create fresh
+        let mut storage = if db_path.exists() {
+            MmapStorage::open(&db_path).expect("open storage")
+        } else {
+            let mut s = MmapStorage::create(&db_path).expect("create storage");
+            CatalogBootstrap::init(&mut s).expect("bootstrap");
+            s
+        };
+
+        // Bootstrap catalog if not yet initialized (fresh DB)
+        let txn = if wal_path.exists() {
+            TxnManager::open(&wal_path).expect("open WAL")
+        } else {
+            let t = TxnManager::create(&wal_path).expect("create WAL");
+            // Ensure catalog is bootstrapped
+            let _ = CatalogBootstrap::init(&mut storage);
+            t
+        };
+
         Self { storage, txn }
     }
 
-    fn sql(&mut self, query: &str) -> axiomdb_sql::QueryResult {
-        let stmt = parse(query, None).expect(query);
+    fn sql(&mut self, q: &str) -> QueryResult {
+        let stmt = parse(q, None).unwrap_or_else(|e| panic!("parse({q}): {e}"));
         let snap = self
             .txn
             .active_snapshot()
             .unwrap_or_else(|_| self.txn.snapshot());
-        let analyzed = analyze(stmt, &mut self.storage, snap).expect(query);
-        execute(analyzed, &mut self.storage, &mut self.txn).expect(query)
+        let analyzed =
+            analyze(stmt, &mut self.storage, snap).unwrap_or_else(|e| panic!("analyze({q}): {e}"));
+        execute(analyzed, &mut self.storage, &mut self.txn)
+            .unwrap_or_else(|e| panic!("execute({q}): {e}"))
     }
 
-    fn sql_rows(&mut self, query: &str) -> usize {
-        match self.sql(query) {
-            axiomdb_sql::QueryResult::Rows { rows, .. } => rows.len(),
+    fn sql_count(&mut self, q: &str) -> usize {
+        match self.sql(q) {
+            QueryResult::Rows { rows, .. } => rows.len(),
             _ => 0,
         }
     }
 }
 
-// ── Data generation ───────────────────────────────────────────────────────────
+// ── Data ──────────────────────────────────────────────────────────────────────
 
-fn gen_insert(n: usize) -> Vec<String> {
-    (1..=n)
-        .map(|i| {
-            let active = if i % 2 == 0 { "TRUE" } else { "FALSE" };
-            let score  = 100.0 + (i % 1000) as f64 * 0.1;
-            format!(
-                "INSERT INTO bench_users VALUES ({i}, 'user_{i:06}', {age}, {active}, {score:.1}, 'u{i}@b.local')",
-                age = 18 + (i % 62),
-            )
-        })
-        .collect()
+fn gen_inserts(n: usize) -> Vec<String> {
+    (1..=n).map(|i| {
+        let active = if i % 2 == 0 { "TRUE" } else { "FALSE" };
+        format!(
+            "INSERT INTO bench_users VALUES ({i}, 'user_{i:06}', {age}, {active}, {score:.1}, 'u{i}@b.local')",
+            age   = 18 + (i % 62),
+            score = 100.0 + (i % 1000) as f64 * 0.1,
+        )
+    }).collect()
 }
 
-// ── Measurement ───────────────────────────────────────────────────────────────
-
-fn measure<F: FnMut()>(mut f: F) -> (f64, f64) {
-    // warmup
-    for _ in 0..WARMUP {
-        f();
-    }
-    // measure
-    let mut times = Vec::with_capacity(RUNS);
-    for _ in 0..RUNS {
-        let t = Instant::now();
-        f();
-        times.push(t.elapsed().as_secs_f64());
-    }
-    let mean = times.iter().sum::<f64>() / times.len() as f64;
-    let var = times.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / times.len() as f64;
-    (mean, var.sqrt())
-}
-
-// ── Workloads ─────────────────────────────────────────────────────────────────
-
-fn setup_schema(db: &mut Db) {
+fn reset(db: &mut Db) {
     db.sql("DROP TABLE IF EXISTS bench_users");
     db.sql(
         "CREATE TABLE bench_users (
@@ -110,12 +99,8 @@ fn setup_schema(db: &mut Db) {
     );
 }
 
-fn truncate(db: &mut Db) {
-    db.sql("DELETE FROM bench_users");
-}
-
 fn load_batch(db: &mut Db, inserts: &[String]) {
-    truncate(db);
+    reset(db);
     db.sql("BEGIN");
     for sql in inserts {
         db.sql(sql);
@@ -123,143 +108,154 @@ fn load_batch(db: &mut Db, inserts: &[String]) {
     db.sql("COMMIT");
 }
 
-// ── Printer ───────────────────────────────────────────────────────────────────
+// ── Measurement ───────────────────────────────────────────────────────────────
 
-const COL: usize = 26;
-
-fn print_header() {
-    let label = "AxiomDB (no network)";
-    let sep = "=".repeat(40 + COL + 2);
-    println!("{sep}");
-    println!("  {:<38}  {:^width$}", "Benchmark", label, width = COL);
-    println!("{}", "-".repeat(40 + COL + 2));
-}
-
-fn print_row(name: &str, mean_s: f64, n_ops: usize) {
-    let ms = mean_s * 1000.0;
-    let ops = if mean_s > 0.0 {
-        n_ops as f64 / mean_s
-    } else {
-        0.0
-    };
-    let ops_str = format_ops(ops as u64);
-    let cell = format!("{ms:6.0} ms  {ops_str:>10}/s");
-    println!("  {name:<38}  {cell:^width$}", width = COL);
-}
-
-fn format_ops(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
+fn measure<F: FnMut()>(mut f: F) -> f64 {
+    for _ in 0..WARMUP {
+        f();
     }
-    result.chars().rev().collect()
+    let mut t = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let t0 = Instant::now();
+        f();
+        t.push(t0.elapsed().as_secs_f64());
+    }
+    t.iter().sum::<f64>() / t.len() as f64
+}
+
+// ── Output ────────────────────────────────────────────────────────────────────
+
+fn out(scenario: &str, n_rows: usize, mean_s: f64, note: &str) {
+    let ops = if mean_s > 0.0 {
+        (n_rows as f64 / mean_s) as u64
+    } else {
+        0
+    };
+    println!(
+        "{}",
+        format!(
+            r#"{{"engine":"AxiomDB","scenario":"{scenario}","rows":{n_rows},"mean_ms":{mean_ms:.1},"ops_per_s":{ops},"note":"{note}"}}"#,
+            mean_ms = mean_s * 1000.0,
+        )
+    );
+}
+
+// ── Scenarios ─────────────────────────────────────────────────────────────────
+
+fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
+    let mut db = Db::open(data_dir);
+    let inserts = gen_inserts(n_rows);
+    let ac_n = n_rows.min(300);
+    let ac = gen_inserts(ac_n);
+
+    match scenario {
+        "insert_batch" => {
+            let mean = measure(|| load_batch(&mut db, &inserts));
+            out(scenario, n_rows, mean, "");
+        }
+
+        "insert_autocommit" => {
+            let mean = measure(|| {
+                reset(&mut db);
+                for sql in &ac {
+                    db.sql(sql);
+                }
+            });
+            out(scenario, ac_n, mean, "");
+        }
+
+        _ => {
+            // Pre-load data for read benchmarks
+            load_batch(&mut db, &inserts);
+            let step = (n_rows.max(100) / 100).max(1);
+            let start = n_rows / 4;
+            let end = start + n_rows / 10;
+
+            let (mean, n_ops, note) = match scenario {
+                "full_scan" => (
+                    measure(|| {
+                        db.sql_count("SELECT * FROM bench_users");
+                    }),
+                    n_rows,
+                    "",
+                ),
+                "select_where" => (
+                    measure(|| {
+                        db.sql_count("SELECT * FROM bench_users WHERE active = TRUE");
+                    }),
+                    n_rows / 2,
+                    "",
+                ),
+                "point_lookup" => (
+                    measure(|| {
+                        for i in (1..=n_rows).step_by(step).take(100) {
+                            db.sql_count(&format!("SELECT * FROM bench_users WHERE id = {i}"));
+                        }
+                    }),
+                    100,
+                    "full scan — index scan in Phase 5",
+                ),
+                "range_scan" => (
+                    measure(|| {
+                        db.sql_count(&format!(
+                            "SELECT * FROM bench_users WHERE id >= {start} AND id < {end}"
+                        ));
+                    }),
+                    n_rows / 10,
+                    "full scan — index scan in Phase 5",
+                ),
+                "count_star" => (
+                    measure(|| {
+                        db.sql("SELECT COUNT(*) FROM bench_users");
+                    }),
+                    1,
+                    "full scan — index in Phase 5",
+                ),
+                "group_by" => (
+                    measure(|| {
+                        db.sql("SELECT age, COUNT(*) FROM bench_users GROUP BY age");
+                    }),
+                    1,
+                    "",
+                ),
+                other => {
+                    eprintln!("unknown scenario: {other}");
+                    std::process::exit(1);
+                }
+            };
+
+            out(scenario, n_ops, mean, note);
+        }
+    }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    let n_rows: usize = std::env::args()
-        .skip_while(|a| a != "--rows")
+    let args: Vec<String> = std::env::args().collect();
+
+    let scenario = args
+        .iter()
+        .skip_while(|a| *a != "--scenario")
+        .nth(1)
+        .expect("--scenario <name> required")
+        .as_str()
+        .to_owned();
+
+    let n_rows: usize = args
+        .iter()
+        .skip_while(|a| *a != "--rows")
         .nth(1)
         .and_then(|v| v.parse().ok())
         .unwrap_or(10_000);
 
-    let ac_rows = n_rows.min(300);
+    // Use /data inside container (or temp dir when testing locally)
+    let data_dir = if Path::new("/data").exists() {
+        std::path::PathBuf::from("/data")
+    } else {
+        std::env::temp_dir().join("axiomdb_bench")
+    };
+    std::fs::create_dir_all(&data_dir).unwrap();
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Db::create(dir.path());
-
-    println!("\nAxiomDB end-to-end benchmark");
-    println!(
-        "  Storage: MmapStorage (real disk I/O at {})",
-        dir.path().display()
-    );
-    println!("  WAL:     enabled (fsync=true)");
-    println!("  Network: none (direct function call — Phase 8 adds this)");
-    println!("  Rows: {n_rows}  |  {RUNS} runs + {WARMUP} warmup\n");
-
-    let inserts = gen_insert(n_rows);
-    let ac_inserts = gen_insert(ac_rows);
-
-    print_header();
-
-    // ── INSERT batch ──────────────────────────────────────────────────────────
-    println!("\n  INSERT (batch — 1 txn)");
-    setup_schema(&mut db);
-    let (mean, _) = measure(|| load_batch(&mut db, &inserts));
-    print_row(&format!("insert_batch_{}", n_rows / 1000), mean, n_rows);
-
-    // ── INSERT autocommit ─────────────────────────────────────────────────────
-    println!("\n  INSERT (autocommit — 1 txn/row, {ac_rows} rows)");
-    setup_schema(&mut db);
-    let (mean, _) = measure(|| {
-        truncate(&mut db);
-        for sql in &ac_inserts {
-            db.sql(sql);
-        }
-    });
-    print_row("insert_autocommit_300", mean, ac_rows);
-
-    // ── Reload for SELECT tests ───────────────────────────────────────────────
-    setup_schema(&mut db);
-    load_batch(&mut db, &inserts);
-
-    // ── SELECT / SCAN ─────────────────────────────────────────────────────────
-    println!("\n  SELECT / SCAN  ({n_rows} rows loaded)");
-
-    let (mean, _) = measure(|| {
-        db.sql_rows("SELECT * FROM bench_users");
-    });
-    print_row("select_* full scan", mean, n_rows);
-
-    let (mean, _) = measure(|| {
-        db.sql_rows("SELECT * FROM bench_users WHERE active = TRUE");
-    });
-    print_row("select_where active=1 (~50%)", mean, n_rows / 2);
-
-    // Point lookup: 100 individual queries
-    let step = n_rows.max(100) / 100;
-    let (mean, _) = measure(|| {
-        for i in (1..=n_rows).step_by(step).take(100) {
-            db.sql_rows(&format!("SELECT * FROM bench_users WHERE id = {i}"));
-        }
-    });
-    print_row("point_lookup PK × 100", mean, 100);
-
-    // Range scan: 10% of rows
-    let start = n_rows / 4;
-    let end = start + n_rows / 10;
-    let (mean, _) = measure(|| {
-        db.sql_rows(&format!(
-            "SELECT * FROM bench_users WHERE id >= {start} AND id < {end}"
-        ));
-    });
-    print_row(
-        &format!("range_scan 10% ({} rows)", n_rows / 10),
-        mean,
-        n_rows / 10,
-    );
-
-    // ── AGGREGATION ───────────────────────────────────────────────────────────
-    println!("\n  AGGREGATION");
-
-    let (mean, _) = measure(|| {
-        db.sql("SELECT COUNT(*) FROM bench_users");
-    });
-    print_row("count(*)", mean, 1);
-
-    let (mean, _) = measure(|| {
-        db.sql("SELECT age, COUNT(*) FROM bench_users GROUP BY age");
-    });
-    print_row("group by age + count(*)", mean, 1);
-
-    println!("{}", "=".repeat(40 + COL + 2));
-    println!(
-        "\nNote: no network overhead — add ~0.1-0.5ms/query when Phase 8 wire protocol lands."
-    );
-    println!("Compare INSERT ops/s with MySQL/PG after adding WAL flush cost (~same).\n");
+    run_scenario(&scenario, n_rows, &data_dir);
 }
