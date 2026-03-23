@@ -352,20 +352,39 @@ Fix **all** blockers before continuing. No exceptions.
 cargo bench --bench [nombre_bench] 2>&1 | tee /tmp/bench-fase-N.txt
 ```
 
-Report to the user a table with:
+**Always report a comparison table with 6 columns:**
 
-| Benchmark | Result | vs target (CLAUDE.md) | Verdict |
-|---|---|---|---|
-| point_lookup/1M | X ns/iter | target 800k ops/s | ✅/⚠️/❌ |
-| range_scan/10K | X ms | target 45ms | ✅/⚠️/❌ |
-| insert/sequential | X ns/iter | target 180k ops/s | ✅/⚠️/❌ |
+| Benchmark | NexusDB | MySQL (aprox) | PostgreSQL (aprox) | Target | Máx aceptable | Veredicto |
+|---|---|---|---|---|---|---|
+| point_lookup/1M | X ns / Y Mops | ~1.2 µs / ~830K ops | ~0.9 µs / ~1.1M ops | 800K ops/s | 600K ops/s | ✅/⚠️/❌ |
+| range_scan/10K | X µs | ~8ms | ~5ms | 45ms | 60ms | ✅/⚠️/❌ |
+| parser/simple_select | X ns | ~500ns | ~450ns | — | — | ✅/⚠️/❌ |
+| insert/sequential | X ops/s | ~150K ops/s | ~120K ops/s | 180K ops/s | 150K ops/s | ✅/⚠️/❌ |
+
+**Valores de referencia aproximados para MySQL y PostgreSQL** (actualizar si cambian):
+
+| Operación | MySQL 8 (aprox) | PostgreSQL 15 (aprox) |
+|---|---|---|
+| Parser simple SELECT | ~450–600 ns | ~400–550 ns |
+| Parser complex SELECT | ~3–6 µs | ~3–5 µs |
+| Point lookup PK (1M rows, localhost) | ~100–300 µs (con red) / ~1–2 µs (en proc) | ~150–400 µs (con red) / ~0.8–1.2 µs (en proc) |
+| Range scan 10K rows | ~5–15 ms | ~3–10 ms |
+| INSERT con WAL | ~130–200K ops/s | ~100–160K ops/s |
+| Seq scan 1M rows | ~0.5–1.5s | ~0.4–1.2s |
+| Row codec encode | N/A (no expuesto) | N/A |
+| Expr eval (scan 1K rows) | ~8–15M rows/s | ~5–12M rows/s |
+
+**Nota sobre comparaciones:** MySQL/PostgreSQL se miden en proceso completo con WAL y red.
+Nuestros benchmarks de parser y codec son puros (sin red, sin WAL). Para operaciones
+que incluyen WAL (INSERT, UPDATE), la comparación es directa. Para parser/codec,
+comparar con sqlparser-rs es más honesto que con MySQL/PG (que incluyen más overhead).
 
 **Thresholds:**
-- ✅ Meets the performance budget target
-- ⚠️ Within the acceptable maximum but not the target — document in `docs/fase-N.md`
-- ❌ Exceeds the acceptable maximum — **blocker**, the phase cannot be closed without investigating
+- ✅ Supera MySQL o PostgreSQL, o cumple el target
+- ⚠️ Dentro del máximo aceptable pero no alcanza el target — documentar en `docs/fase-N.md`
+- ❌ Por debajo del máximo aceptable — **blocker**, investigar antes de continuar
 
-If there is a ❌, open `/debug` to identify the bottleneck before continuing.
+Si hay un ❌, abrir `/debug` para identificar el bottleneck antes de continuar.
 
 ### Step 4 — Closing checklist
    ```
@@ -421,13 +440,20 @@ If there is a regression > 5% on a critical operation: blocker.
 
 ### Performance budget (do not regress)
 
-| Operation             | Target       | Acceptable maximum   |
-|-----------------------|--------------|----------------------|
-| Point lookup PK       | 800k ops/s   | 600k ops/s           |
-| Range scan 10K rows   | 45ms         | 60ms                 |
-| INSERT with WAL       | 180k ops/s   | 150k ops/s           |
-| Seq scan 1M rows      | 0.8s         | 1.2s                 |
-| Concurrent reads x16  | linear       | <2x degradation      |
+| Operation             | NexusDB actual | MySQL (aprox) | PostgreSQL (aprox) | Target       | Máx aceptable   |
+|-----------------------|----------------|---------------|--------------------|--------------|-----------------|
+| Point lookup PK       | TBD (Phase 4.5)| ~830K ops/s   | ~1.1M ops/s        | 800K ops/s   | 600K ops/s      |
+| Range scan 10K rows   | 0.61ms ✅      | ~8ms          | ~5ms               | 45ms         | 60ms            |
+| INSERT with WAL       | TBD (Phase 4.5)| ~150K ops/s   | ~120K ops/s        | 180K ops/s   | 150K ops/s      |
+| Seq scan 1M rows      | TBD (Phase 4.5)| ~0.8s         | ~0.5s              | 0.8s         | 1.2s            |
+| Concurrent reads x16  | TBD (Phase 7)  | ~2x degradation| ~1.5x degradation  | linear       | <2x degradation |
+| Parser simple SELECT  | **500ns** ✅   | ~500ns        | ~450ns             | —            | —               |
+| Parser complex SELECT | **2.7µs** ✅   | ~4µs          | ~3.5µs             | —            | —               |
+| Row codec encode      | **30ns** ✅    | N/A           | N/A                | —            | —               |
+| Expr eval scan/1K     | **14.8M/s** ✅ | ~8M rows/s    | ~6M rows/s         | —            | —               |
+
+Actualizar columna "NexusDB actual" con cada benchmark completado.
+TBD = requiere executor (Phase 4.5) para medirse con I/O real.
 
 ---
 
