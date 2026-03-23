@@ -373,6 +373,17 @@ impl TxnManager {
     pub fn active_txn_id(&self) -> Option<TxnId> {
         self.active.as_ref().map(|a| a.txn_id)
     }
+
+    /// Mutable access to the underlying [`WalWriter`].
+    ///
+    /// Used by [`crate::checkpoint::Checkpointer`] to append the Checkpoint
+    /// entry and fsync the WAL without duplicating the writer reference.
+    ///
+    /// Callers must not call this while a transaction is active and then
+    /// write arbitrary entries — only the Checkpointer should use this.
+    pub fn wal_mut(&mut self) -> &mut WalWriter {
+        &mut self.wal
+    }
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
