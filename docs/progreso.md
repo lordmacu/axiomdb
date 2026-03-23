@@ -32,29 +32,29 @@
 - [x] ✅ 2.5.2 — binary search + in-place inserts; 4.46M lookup ops/s, 222K insert ops/s (2026-03-22)
 - [x] ✅ Phase 1 — `expect()` eliminados de código de producción: mmap.rs, freelist.rs, memory.rs (2026-03-22)
 
-### Phase 3 — WAL and transactions `🔄` week 5-10
+### Phase 3 — WAL and transactions `✅` week 5-10
 - [x] 3.1 ✅ WAL entry format — `[LSN|Type|Table|Key|Old|New|CRC]` + backward scan
 - [x] 3.2 ✅ WalWriter — append-only, global LSN, fsync on commit, open() with scan_last_lsn
 - [x] 3.3 ✅ WalReader — scan_forward(from_lsn) streaming + scan_backward() with entry_len_2
-- [ ] 3.4 ⏳ RowHeader — `struct RowHeader { txn_id_created, txn_id_deleted, row_version, deleted_flag }` — prerequisite for 3.5 and Phase 7
-- [ ] 3.5 ⏳ BEGIN / COMMIT / ROLLBACK basic — transactions over RowHeader
-- [ ] 3.5a ⏳ Autocommit mode — each DML without explicit BEGIN is its own transaction; `autocommit=ON` flag by default (MySQL compatible); `SET autocommit=0` disables it
-- [ ] 3.5b ⏳ Implicit transaction start (MySQL mode) — in MySQL, the first DML without autocommit starts a transaction implicitly; required for compatibility with ORMs that do not issue explicit BEGIN
-- [ ] 3.5c ⏳ Error semantics mid-transaction — distinguish between: (a) constraint violation → statement rollback, transaction continues; (b) severe error → full transaction rollback; define explicit behavior
-- [ ] 3.6 ⏳ WAL Checkpoint — flush dirty pages to disk, truncate WAL up to checkpoint LSN
-- [ ] 3.6b ⏳ ENOSPC handling — detect `ENOSPC` (disk full) on WAL and page writes; perform graceful shutdown with error log instead of corrupting the file; alert before reaching the limit (configurable threshold)
-- [ ] 3.7 ⏳ WAL rotation — configurable max_wal_size, auto-checkpoint by size
-- [ ] 3.8 ⏳ Crash recovery state machine — explicit states: `CRASHED→RECOVERING→REPLAYING_WAL→VERIFYING→READY`; validate checkpoint metadata; recovery modes: `strict` (abort on inconsistency) / `permissive` (best-effort, warn and continue)
-- [ ] 3.8b ⏳ Partial page write detection — on DB open, detect pages whose checksum does not match (write interrupted by power loss); in strict mode: reject; in permissive mode: mark as corrupt and restore from WAL if there is a recent entry
-- [ ] 3.9 ⏳ Post-recovery integrity check — verify index vs main table consistency after replay; detect and report divergence before accepting connections
-- [ ] 3.10 ⏳ Durability tests — write → simulate crash → re-read → verify; cover: corrupt checkpoint, partial page write, truncated WAL, divergent indexes post-crash
-- [ ] 3.11 ⏳ Catalog bootstrap — reserved pages (0-N) for system tables on DB create/open
-- [ ] 3.12 ⏳ CatalogReader/Writer — API to read/write table, column, constraint, and index definitions
-- [ ] 3.13 ⏳ Catalog change notifier — internal pub-sub when DDL changes the schema (DDL writes → subscribers notified); prerequisite for invalidating plan cache (5.14) and stats (6.11)
-- [ ] 3.14 ⏳ Schema binding — executor resolves table/column names against the catalog
-- [ ] 3.13 ⏳ Page dirty tracker — in-memory bitmap of modified pages pending flush; basis for efficient WAL checkpoint
-- [ ] 3.15 ⏳ Page dirty tracker — in-memory bitmap of modified pages pending flush; basis for efficient WAL checkpoint
-- [ ] 3.16 ⏳ Basic configuration (dbyo.toml) — parse `page_size`, `max_wal_size`, `data_dir`, `fsync` with `config` crate; safe defaults if file is missing
+- [x] 3.4 ✅ RowHeader — `struct RowHeader { txn_id_created, txn_id_deleted, row_version, _flags }` + slotted heap pages + TransactionSnapshot
+- [x] 3.5 ✅ BEGIN / COMMIT / ROLLBACK — TxnManager with WAL + undo log; autocommit wrapper
+- [x] 3.6 ✅ WAL Checkpoint — flush + Checkpoint WAL entry + checkpoint_lsn in meta page
+- [x] 3.7 ✅ WAL Rotation — header v2 + start_lsn + WalRotator; max_wal_size trigger
+- [x] 3.8 ✅ Crash Recovery — undo in-progress txns + physical location encoding; CRASHED→READY state machine
+- [x] 3.9 ✅ Post-recovery integrity checker — heap structural + MVCC checks
+- [x] 3.10 ✅ Durability tests — 9 crash + recovery scenarios with MmapStorage real I/O
+- [x] 3.11 ✅ Catalog bootstrap — meta page extension + schema types (TableDef/ColumnDef/IndexDef) + CatalogBootstrap
+- [x] 3.12 ✅ CatalogReader/Writer — HeapChain multi-page + ID sequences + WAL-logged DDL + MVCC snapshots
+- [x] 3.13 ✅ Catalog change notifier — SchemaChangeKind/Event/Listener trait + CatalogChangeNotifier + CatalogWriter::with_notifier
+- [x] 3.14 ✅ Schema binding — SchemaResolver: resolve_table/column/table_exists with default schema + MVCC
+- [x] 3.15 ✅ Page dirty tracker — PageDirtyTracker in MmapStorage; mark on write/alloc, clear on flush
+- [x] 3.16 ✅ Basic configuration — DbConfig from dbyo.toml (serde+toml); safe defaults; partial TOML accepted
+- [ ] ⚠️ 3.5a Autocommit mode (`SET autocommit=0`) → Phase 5 (session state, wire protocol)
+- [ ] ⚠️ 3.5b Implicit transaction start (MySQL ORM compat) → Phase 5
+- [ ] ⚠️ 3.5c Error semantics mid-transaction (statement vs txn rollback) → Phase 4.25
+- [ ] ⚠️ 3.6b ENOSPC handling — graceful shutdown on disk full → Phase 5
+- [ ] ⚠️ 3.8b Partial page write detection on open → deferred to Phase 5
+- [ ] ⚠️ Per-page msync optimization (flush_range) → deferred pending profiling
 
 ### Phase 4 — SQL Parser + Executor `⏳` week 11-25
 <!-- Group A — Executor prerequisites -->
