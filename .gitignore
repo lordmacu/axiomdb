@@ -19,7 +19,7 @@ wal_archive/
 /var/log/
 
 # Configuración local con secretos
-dbyo.local.toml
+axiomdb.local.toml
 .env
 .env.*
 

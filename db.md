@@ -7390,30 +7390,30 @@ axiomdb/                           ← workspace root
 │   ├── axiomdb-wal/               ← WAL writer/reader, crash recovery
 │   ├── axiomdb-index/             ← B+ Tree CoW, HNSW, GIN, GiST, BRIN, Hash, FTS
 │   ├── axiomdb-mvcc/              ← transacciones, snapshot isolation, SSI, locks
-│   ├── dbyo-catalog/           ← schema, estadísticas, information_schema
-│   ├── dbyo-sql/               ← parser (nom), AST, planner, optimizer, executor
-│   ├── dbyo-functions/         ← todas las funciones built-in (string, math, date)
-│   ├── dbyo-network/           ← MySQL wire protocol + PostgreSQL wire protocol
-│   ├── dbyo-security/          ← RBAC, RLS, TLS, Argon2, audit, masking
-│   ├── dbyo-replication/       ← streaming replication, logical replication, PITR
-│   ├── dbyo-plugins/           ← WASM runtime, Lua scripting, UDFs, triggers
-│   ├── dbyo-cache/             ← query result cache, buffer management
-│   ├── dbyo-geo/               ← tipos geométricos, R-Tree, ST_* functions
-│   ├── dbyo-vector/            ← VECTOR(n), HNSW, cuantización, similitud
-│   ├── dbyo-migrations/        ← CLI de migrations, schema versioning
-│   ├── dbyo-sync/              ← Mobile sync layer: HLC, delta sync, CRDTs, conflict resolution [Fase 36]
+│   ├── axiomdb-catalog/           ← schema, estadísticas, information_schema
+│   ├── axiomdb-sql/               ← parser (nom), AST, planner, optimizer, executor
+│   ├── axiomdb-functions/         ← todas las funciones built-in (string, math, date)
+│   ├── axiomdb-network/           ← MySQL wire protocol + PostgreSQL wire protocol
+│   ├── axiomdb-security/          ← RBAC, RLS, TLS, Argon2, audit, masking
+│   ├── axiomdb-replication/       ← streaming replication, logical replication, PITR
+│   ├── axiomdb-plugins/           ← WASM runtime, Lua scripting, UDFs, triggers
+│   ├── axiomdb-cache/             ← query result cache, buffer management
+│   ├── axiomdb-geo/               ← tipos geométricos, R-Tree, ST_* functions
+│   ├── axiomdb-vector/            ← VECTOR(n), HNSW, cuantización, similitud
+│   ├── axiomdb-migrations/        ← CLI de migrations, schema versioning
+│   ├── axiomdb-sync/              ← Mobile sync layer: HLC, delta sync, CRDTs, conflict resolution [Fase 36]
 │   ├── axiomdb-server/            ← binario: modo servidor (TCP daemon)
-│   └── dbyo-embedded/          ← cdylib: modo embebido + C FFI + flutter_rust_bridge [Fase 10]
-│   └── dbyo-odbc/              ← cdylib: driver ODBC para Excel, R, SAP, Tableau [Fase 35]
-│   └── dbyo-graph/             ← Graph layer: SQL/PGQ, traversal, algorithms [Fase 37]
-│   └── dbyo-studio/            ← Web Studio: dashboard, editor SQL, schema designer [Fase 35]
-│   └── dbyo-rest/              ← Auto REST API: PostgREST-style, OpenAPI, RLS integrado [Fase 22]
-│   └── dbyo-kafka/             ← Kafka sink/source: CDC directo a Kafka sin Debezium [Fase 15]
+│   └── axiomdb-embedded/          ← cdylib: modo embebido + C FFI + flutter_rust_bridge [Fase 10]
+│   └── axiomdb-odbc/              ← cdylib: driver ODBC para Excel, R, SAP, Tableau [Fase 35]
+│   └── axiomdb-graph/             ← Graph layer: SQL/PGQ, traversal, algorithms [Fase 37]
+│   └── axiomdb-studio/            ← Web Studio: dashboard, editor SQL, schema designer [Fase 35]
+│   └── axiomdb-rest/              ← Auto REST API: PostgREST-style, OpenAPI, RLS integrado [Fase 22]
+│   └── axiomdb-kafka/             ← Kafka sink/source: CDC directo a Kafka sin Debezium [Fase 15]
 ├── tests/                      ← integration tests (usan toda la pila)
 ├── benches/                    ← benchmarks con criterion
 └── tools/
-    ├── dbyo-cli/               ← cliente interactivo (como psql)
-    └── dbyo-migrate/           ← herramienta de migración desde MySQL/PostgreSQL
+    ├── axiomdb-cli/               ← cliente interactivo (como psql)
+    └── axiomdb-migrate/           ← herramienta de migración desde MySQL/PostgreSQL
 ```
 
 ### Dependencias entre crates (sin ciclos)
@@ -7429,21 +7429,21 @@ axiomdb-index ←──────┘              índices sobre storage + WAL
     ↑
 axiomdb-mvcc  ←──────────────────── transacciones sobre índices
     ↑
-dbyo-catalog ─────────────────── schema + estadísticas
+axiomdb-catalog ─────────────────── schema + estadísticas
     ↑
-dbyo-sql ─────────────────────── parser + planner + executor
+axiomdb-sql ─────────────────────── parser + planner + executor
     ↑              ↑
-dbyo-functions    dbyo-plugins   funciones + extensiones
+axiomdb-functions    axiomdb-plugins   funciones + extensiones
     ↑
-dbyo-security ────────────────── RBAC, RLS, audit
+axiomdb-security ────────────────── RBAC, RLS, audit
     ↑
-dbyo-replication ─────────────── WAL streaming + logical
+axiomdb-replication ─────────────── WAL streaming + logical
     ↑              ↑
-dbyo-network   dbyo-sync ──────── Mobile sync (HLC, delta, CRDTs) [Fase 36]
+axiomdb-network   axiomdb-sync ──────── Mobile sync (HLC, delta, CRDTs) [Fase 36]
     ↑              ↑
-axiomdb-server   dbyo-embedded   dbyo-odbc   entry points (server / mobile / ODBC)
-              dbyo-sync       dbyo-graph  sync layer / graph layer
-              dbyo-studio                web UI (Axum + HTMX)
+axiomdb-server   axiomdb-embedded   axiomdb-odbc   entry points (server / mobile / ODBC)
+              axiomdb-sync       axiomdb-graph  sync layer / graph layer
+              axiomdb-studio                web UI (Axum + HTMX)
 ```
 
 ### Trait central: StorageEngine
@@ -7605,7 +7605,7 @@ crates/axiomdb-storage/
 ### Cargo.toml del workspace
 
 ```toml
-# dbyo/Cargo.toml
+# axiomdb/Cargo.toml
 [workspace]
 resolver = "2"
 members = [
@@ -7634,8 +7634,8 @@ members = [
     "crates/axiomdb-kafka",
     "crates/axiomdb-server",
     "crates/axiomdb-embedded",
-    "tools/dbyo-cli",
-    "tools/dbyo-migrate",
+    "tools/axiomdb-cli",
+    "tools/axiomdb-migrate",
 ]
 
 [workspace.dependencies]
@@ -8685,7 +8685,7 @@ impl LogicalOutputPlugin for JsonOutputPlugin {
 ### DSN Estándar — Connection Strings
 
 ```
-# Formato dbyo nativo
+# Formato AxiomDB nativo
 axiomdb://usuario:contraseña@host:3306/base_de_datos?ssl=true&timeout=30s
 
 # Formato PostgreSQL (para compatibilidad con ORMs)
@@ -8766,7 +8766,7 @@ CREATE EXTENSION IF NOT EXISTS vector;           -- pgvector compatible
 CREATE EXTENSION IF NOT EXISTS postgis;          -- geospatial
 CREATE EXTENSION IF NOT EXISTS uuid_ossp;        -- gen_random_uuid()
 CREATE EXTENSION IF NOT EXISTS tablefunc;        -- crosstab, pivot
-CREATE EXTENSION IF NOT EXISTS dbyo_ai;          -- funciones AI built-in
+CREATE EXTENSION IF NOT EXISTS axiomdb_ai;          -- funciones AI built-in
 
 -- Listar extensiones
 SELECT name, version, description FROM pg_available_extensions ORDER BY name;
@@ -9169,9 +9169,9 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y libssl3 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd -ms /bin/bash dbyo
+    && useradd -ms /bin/bash axiomdb
 COPY --from=builder /app/target/release/axiomdb-server /usr/local/bin/
-USER dbyo
+USER axiomdb
 EXPOSE 3306 5432
 VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s \
@@ -9184,19 +9184,19 @@ CMD ["axiomdb-server", "--data-dir", "/data", "--config", "/etc/axiomdb/axiomdb.
 ```yaml
 version: '3.9'
 services:
-  dbyo:
-    image: dbyo:latest
+  axiomdb:
+    image: axiomdb:latest
     build: .
     ports:
       - "3306:3306"   # MySQL protocol
       - "5432:5432"   # PostgreSQL protocol
     volumes:
-      - dbyo_data:/data
+      - axiomdb_data:/data
       - ./axiomdb.toml:/etc/axiomdb/axiomdb.toml:ro
     environment:
       AXIOMDB_PASSWORD: ${AXIOMDB_PASSWORD:-secret}
       AXIOMDB_DATABASE: ${AXIOMDB_DATABASE:-axiomdb}
-      DBYO_LOG_LEVEL: ${DBYO_LOG_LEVEL:-info}
+      AXIOMDB_LOG_LEVEL: ${AXIOMDB_LOG_LEVEL:-info}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "axiomdb-server", "--healthcheck"]
@@ -9205,7 +9205,7 @@ services:
       retries: 3
 
 volumes:
-  dbyo_data:
+  axiomdb_data:
     driver: local
 ```
 
@@ -9262,7 +9262,7 @@ connection_idle_timeout        = "10min"
 [logging]
 level            = "info"     # trace | debug | info | warn | error
 format           = "json"     # json | text
-file             = "/var/log/axiomdb/dbyo.log"
+file             = "/var/log/axiomdb/axiomdb.log"
 rotation         = "daily"    # daily | hourly | size:100MB
 keep_days        = 30
 slow_query_ms    = 100        # loggear queries más lentas que esto
@@ -9291,15 +9291,15 @@ wal_retention    = "7d"
 ```ini
 # /etc/systemd/system/axiomdb.service
 [Unit]
-Description=dbyo Database Server
-Documentation=https://github.com/usuario/dbyo
+Description=AxiomDB Database Server
+Documentation=https://github.com/usuario/axiomdb
 After=network.target
 Wants=network.target
 
 [Service]
 Type=simple
-User=dbyo
-Group=dbyo
+User=axiomdb
+Group=axiomdb
 ExecStart=/usr/local/bin/axiomdb-server --config /etc/axiomdb/axiomdb.toml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
@@ -9626,7 +9626,7 @@ axiomdb-client = "0.1"
 ```
 
 ```rust
-use dbyo_client::{Pool, Config, Row};
+use axiomdb_client::{Pool, Config, Row};
 
 // Pool de conexiones
 let pool = Pool::builder()
@@ -9641,7 +9641,7 @@ let rows: Vec<Row> = pool
     .await?;
 
 // Tipado fuerte con derive
-#[derive(dbyo_client::FromRow)]
+#[derive(axiomdb_client::FromRow)]
 struct User { id: i32, nombre: String }
 
 let user: User = pool.query_one("SELECT * FROM users WHERE id = $1", &[&1]).await?;
@@ -9669,14 +9669,14 @@ axiomdb-bench oltp_point_select \
 
 # Comparar vs MySQL
 axiomdb-bench compare \
-  --dbyo "axiomdb://root@localhost:3306/test" \
+  --axiomdb "axiomdb://root@localhost:3306/test" \
   --mysql "mysql://root@localhost:3307/test" \
   --scenario oltp_read_write \
   --time 60
 
 # Resultado:
 # ┌──────────────────┬──────────────┬──────────────┬──────────┐
-# │ Operación        │ dbyo         │ MySQL 8.0    │ Delta    │
+# │ Operación        │ AxiomDB      │ MySQL 8.0    │ Delta    │
 # ├──────────────────┼──────────────┼──────────────┼──────────┤
 # │ Point lookup     │ 823k ops/s   │ 347k ops/s   │ +137%    │
 # │ Range scan 10K   │ 43ms         │ 118ms        │ -64%     │
