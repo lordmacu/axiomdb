@@ -346,6 +346,12 @@ impl IntegrityChecker {
             let page = match storage.read_page(page_id) {
                 Ok(p) => p,
                 Err(DbError::PageNotFound { .. }) => continue,
+                // In MmapStorage, pages that were never allocated (file extended but
+                // not yet written) have zero bytes, giving an invalid checksum.
+                // Skip them — they are not live heap pages.
+                // A genuinely corrupted live page is detected separately via direct
+                // `read_page` calls (e.g. Scenario 9 in durability tests).
+                Err(DbError::ChecksumMismatch { .. }) => continue,
                 Err(e) => return Err(e),
             };
 

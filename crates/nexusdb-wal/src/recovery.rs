@@ -83,15 +83,22 @@ impl CrashRecovery {
         let mut ended: HashSet<u64> = HashSet::new(); // committed or rolled back
 
         for result in reader.scan_forward(checkpoint_lsn)? {
-            let entry = result?;
-            match entry.entry_type {
-                EntryType::Begin => {
-                    begun.insert(entry.txn_id);
+            match result {
+                Ok(entry) => match entry.entry_type {
+                    EntryType::Begin => {
+                        begun.insert(entry.txn_id);
+                    }
+                    EntryType::Commit | EntryType::Rollback => {
+                        ended.insert(entry.txn_id);
+                    }
+                    _ => {}
+                },
+                // Truncated or corrupt entry at the end of WAL (e.g. process crashed
+                // mid-write). Treat as end-of-valid-WAL — stop scanning.
+                Err(DbError::WalEntryTruncated { .. } | DbError::WalChecksumMismatch { .. }) => {
+                    break;
                 }
-                EntryType::Commit | EntryType::Rollback => {
-                    ended.insert(entry.txn_id);
-                }
-                _ => {}
+                Err(e) => return Err(e),
             }
         }
 
@@ -117,7 +124,14 @@ impl CrashRecovery {
         let mut in_progress: HashMap<u64, Vec<RecoveryOp>> = HashMap::new();
 
         for result in reader.scan_forward(checkpoint_lsn)? {
-            let entry = result?;
+            let entry = match result {
+                Ok(e) => e,
+                // Truncated or corrupt entry at end of WAL — stop scanning.
+                Err(DbError::WalEntryTruncated { .. } | DbError::WalChecksumMismatch { .. }) => {
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
             match entry.entry_type {
                 EntryType::Begin => {
                     in_progress.entry(entry.txn_id).or_default();
