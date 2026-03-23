@@ -127,6 +127,16 @@ pub enum DbError {
     #[error("invalid value: {reason}")]
     InvalidValue { reason: String },
 
+    // ── Expression evaluator ──────────────────────────────────────
+    #[error("division by zero")]
+    DivisionByZero,
+
+    #[error("integer overflow in expression")]
+    Overflow,
+
+    #[error("column index {idx} out of bounds (row has {len} columns)")]
+    ColumnIndexOutOfBounds { idx: usize, len: usize },
+
     #[error("table '{schema}.{name}' already exists")]
     TableAlreadyExists { schema: String, name: String },
 
