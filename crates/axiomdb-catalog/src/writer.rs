@@ -301,6 +301,118 @@ impl<'a> CatalogWriter<'a> {
         Ok(())
     }
 
+    /// Marks the column row with `(table_id, col_idx)` as deleted in `axiom_columns`.
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] if no transaction is active.
+    /// - [`DbError::Internal`] if the column row is not found (caller must validate first).
+    pub fn delete_column(&mut self, table_id: TableId, col_idx: u16) -> Result<(), DbError> {
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+        let snap = self.txn.active_snapshot()?;
+        let rows = HeapChain::scan_visible(self.storage, self.page_ids.columns, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = ColumnDef::from_bytes(&data)?;
+            if def.table_id == table_id && def.col_idx == col_idx {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let mut key = [0u8; 6];
+                key[0..4].copy_from_slice(&table_id.to_le_bytes());
+                key[4..6].copy_from_slice(&col_idx.to_le_bytes());
+                self.txn
+                    .record_delete(SYSTEM_TABLE_COLUMNS, &key, &data, page_id, slot_id)?;
+                return Ok(());
+            }
+        }
+        Err(DbError::Internal {
+            message: format!("delete_column: col_idx={col_idx} not found for table_id={table_id}"),
+        })
+    }
+
+    /// Renames a column by deleting the old catalog row and inserting a new one.
+    ///
+    /// All other fields (`col_type`, `nullable`, `auto_increment`, `col_idx`) are preserved.
+    pub fn rename_column(
+        &mut self,
+        table_id: TableId,
+        col_idx: u16,
+        new_name: String,
+    ) -> Result<(), DbError> {
+        let snap = self.txn.active_snapshot()?;
+        let rows = HeapChain::scan_visible(self.storage, self.page_ids.columns, snap)?;
+
+        // Find and remember the old ColumnDef.
+        let old_def = rows
+            .into_iter()
+            .find_map(|(_, _, data)| {
+                ColumnDef::from_bytes(&data).ok().and_then(|(def, _)| {
+                    if def.table_id == table_id && def.col_idx == col_idx {
+                        Some(def)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .ok_or_else(|| DbError::Internal {
+                message: format!(
+                    "rename_column: col_idx={col_idx} not found for table_id={table_id}"
+                ),
+            })?;
+
+        self.delete_column(table_id, col_idx)?;
+        self.create_column(ColumnDef {
+            name: new_name,
+            ..old_def
+        })?;
+        Ok(())
+    }
+
+    /// Renames a table by replacing its `TableDef` row in the catalog.
+    ///
+    /// The `table_id` and `data_root_page_id` are preserved.
+    pub fn rename_table(
+        &mut self,
+        table_id: TableId,
+        new_name: String,
+        schema: &str,
+    ) -> Result<(), DbError> {
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+        let snap = self.txn.active_snapshot()?;
+        let rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = TableDef::from_bytes(&data)?;
+            if def.id == table_id {
+                // Delete old row.
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = table_id.to_le_bytes();
+                self.txn
+                    .record_delete(SYSTEM_TABLE_TABLES, &key, &data, page_id, slot_id)?;
+
+                // Insert new row with updated name.
+                let new_def = TableDef {
+                    table_name: new_name,
+                    schema_name: schema.to_string(),
+                    ..def
+                };
+                let new_data = new_def.to_bytes();
+                let (pg2, sl2) =
+                    HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id)?;
+                self.txn
+                    .record_insert(SYSTEM_TABLE_TABLES, &key, &new_data, pg2, sl2)?;
+                return Ok(());
+            }
+        }
+        Err(DbError::Internal {
+            message: format!("rename_table: table_id={table_id} not found"),
+        })
+    }
+
     /// Marks the index row with `index_id` as deleted in `axiom_indexes`.
     ///
     /// # Errors

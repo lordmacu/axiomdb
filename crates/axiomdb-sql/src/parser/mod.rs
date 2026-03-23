@@ -252,6 +252,11 @@ impl<'src> Parser<'src> {
                 let table = self.parse_table_ref()?;
                 Ok(Stmt::ShowColumns(crate::ast::ShowColumnsStmt { table }))
             }
+            Token::Alter => {
+                self.advance();
+                self.expect(&Token::Table)?;
+                ddl::parse_alter_table(self)
+            }
             Token::Begin => {
                 self.advance();
                 // Accept optional TRANSACTION keyword

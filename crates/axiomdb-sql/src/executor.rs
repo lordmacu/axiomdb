@@ -45,9 +45,10 @@ use axiomdb_wal::TxnManager;
 
 use crate::{
     ast::{
-        ColumnConstraint, CreateIndexStmt, CreateTableStmt, DeleteStmt, DropIndexStmt,
-        DropTableStmt, FromClause, InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType,
-        NullsOrder, OrderByItem, SelectItem, SelectStmt, SortOrder, Stmt, UpdateStmt,
+        AlterTableOp, AlterTableStmt, ColumnConstraint, CreateIndexStmt, CreateTableStmt,
+        DeleteStmt, DropIndexStmt, DropTableStmt, FromClause, InsertSource, InsertStmt, JoinClause,
+        JoinCondition, JoinType, NullsOrder, OrderByItem, SelectItem, SelectStmt, SortOrder, Stmt,
+        UpdateStmt,
     },
     eval::{eval, eval_with, is_truthy, SubqueryRunner},
     expr::{BinaryOp, Expr},
@@ -363,6 +364,10 @@ fn dispatch_ctx(
         Stmt::DropIndex(s) => {
             ctx.invalidate_all();
             execute_drop_index(s, storage, txn)
+        }
+        Stmt::AlterTable(s) => {
+            ctx.invalidate_all();
+            execute_alter_table(s, storage, txn)
         }
         // Everything else: delegate to existing dispatch.
         other => dispatch(other, storage, txn),
@@ -831,9 +836,7 @@ fn dispatch(
         Stmt::Set(_) => Ok(QueryResult::Empty),
         // Deferred statements
         Stmt::TruncateTable(s) => execute_truncate(s, storage, txn),
-        Stmt::AlterTable(_) => Err(DbError::NotImplemented {
-            feature: "ALTER TABLE — Phase 4.22".into(),
-        }),
+        Stmt::AlterTable(s) => execute_alter_table(s, storage, txn),
         Stmt::ShowTables(s) => execute_show_tables(s, storage, txn),
         Stmt::ShowColumns(s) => execute_show_columns(s, storage, txn),
     }
@@ -2809,6 +2812,275 @@ fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Timestamp => "TIMESTAMP",
         ColumnType::Uuid => "UUID",
     }
+}
+
+// ── ALTER TABLE (4.22) ────────────────────────────────────────────────────────
+
+/// Rewrites all rows in `table_def` by applying `transform` to each row.
+///
+/// The row is decoded using `old_columns`, transformed, then encoded and
+/// reinserted using `new_columns`. Used by ADD COLUMN and DROP COLUMN.
+///
+/// **Ordering for ADD COLUMN**: call this AFTER updating the catalog so that
+/// the new rows match the new schema.
+/// **Ordering for DROP COLUMN**: call this BEFORE updating the catalog so that
+/// if the rewrite fails the catalog is still consistent with the existing rows.
+fn rewrite_rows(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_def: &axiomdb_catalog::schema::TableDef,
+    old_columns: &[axiomdb_catalog::schema::ColumnDef],
+    new_columns: &[axiomdb_catalog::schema::ColumnDef],
+    transform: &dyn Fn(Row) -> Row,
+) -> Result<(), DbError> {
+    let snap = txn.active_snapshot()?;
+    let rows = TableEngine::scan_table(storage, table_def, old_columns, snap)?;
+    for (rid, old_values) in rows {
+        let new_values = transform(old_values);
+        TableEngine::delete_row(storage, txn, table_def, rid)?;
+        TableEngine::insert_row(storage, txn, table_def, new_columns, new_values)?;
+    }
+    Ok(())
+}
+
+fn execute_alter_table(
+    stmt: AlterTableStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+) -> Result<QueryResult, DbError> {
+    let schema = stmt.table.schema.as_deref().unwrap_or("public");
+
+    // Resolve the table once upfront.
+    let table_def = {
+        let resolver = make_resolver(storage, txn)?;
+        resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
+    };
+    // Keep the current column list; update it as we apply operations.
+    let mut columns = table_def.columns.clone();
+
+    for op in stmt.operations {
+        match op {
+            AlterTableOp::AddColumn(col_def) => {
+                alter_add_column(storage, txn, &table_def.def, &mut columns, col_def, schema)?;
+            }
+            AlterTableOp::DropColumn { name, if_exists } => {
+                alter_drop_column(storage, txn, &table_def.def, &mut columns, &name, if_exists)?;
+            }
+            AlterTableOp::RenameColumn { old_name, new_name } => {
+                alter_rename_column(
+                    storage,
+                    txn,
+                    &table_def.def,
+                    &columns,
+                    &old_name,
+                    &new_name,
+                    schema,
+                )?;
+                // Refresh: catalog was updated, re-read column list.
+                let snap2 = txn.active_snapshot()?;
+                columns = CatalogReader::new(storage, snap2)?.list_columns(table_def.def.id)?;
+            }
+            AlterTableOp::RenameTable(new_name) => {
+                alter_rename_table(storage, txn, &table_def.def, &new_name, schema)?;
+                // After RENAME TABLE further operations would need the new table_def;
+                // for simplicity, only one op per statement is expected for RENAME TO.
+                break;
+            }
+            _ => {
+                return Err(DbError::NotImplemented {
+                    feature: "ALTER TABLE MODIFY COLUMN / ADD CONSTRAINT — Phase N".into(),
+                })
+            }
+        }
+    }
+
+    Ok(QueryResult::Empty)
+}
+
+fn alter_add_column(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_def: &axiomdb_catalog::schema::TableDef,
+    columns: &mut Vec<axiomdb_catalog::schema::ColumnDef>,
+    col_def: crate::ast::ColumnDef,
+    schema: &str,
+) -> Result<(), DbError> {
+    // Check for duplicate column name.
+    let table_name = &table_def.table_name;
+    if columns.iter().any(|c| c.name == col_def.name) {
+        return Err(DbError::ColumnAlreadyExists {
+            name: col_def.name.clone(),
+            table: table_name.clone(),
+        });
+    }
+
+    // Evaluate DEFAULT expression (or NULL if no default).
+    let default_value = col_def
+        .constraints
+        .iter()
+        .find_map(|c| match c {
+            crate::ast::ColumnConstraint::Default(expr) => {
+                Some(eval(expr, &[]).unwrap_or(Value::Null))
+            }
+            _ => None,
+        })
+        .unwrap_or(Value::Null);
+
+    let col_type = datatype_to_column_type(&col_def.data_type)?;
+    let nullable = !col_def
+        .constraints
+        .iter()
+        .any(|c| matches!(c, crate::ast::ColumnConstraint::NotNull));
+    let auto_increment = col_def
+        .constraints
+        .iter()
+        .any(|c| matches!(c, crate::ast::ColumnConstraint::AutoIncrement));
+
+    let new_col_idx = columns
+        .iter()
+        .map(|c| c.col_idx)
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
+
+    let new_catalog_col = CatalogColumnDef {
+        table_id: table_def.id,
+        col_idx: new_col_idx,
+        name: col_def.name.clone(),
+        col_type,
+        nullable,
+        auto_increment,
+    };
+
+    // 1. Add column to catalog.
+    CatalogWriter::new(storage, txn)?.create_column(new_catalog_col.clone())?;
+
+    // 2. Rewrite rows (AFTER catalog update — new rows must include the new column).
+    let old_columns = columns.clone();
+    let mut new_columns = columns.clone();
+    new_columns.push(new_catalog_col.clone());
+
+    let dv = default_value;
+    rewrite_rows(
+        storage,
+        txn,
+        table_def,
+        &old_columns,
+        &new_columns,
+        &|mut row| {
+            row.push(dv.clone());
+            row
+        },
+    )?;
+
+    columns.push(new_catalog_col);
+    let _ = schema; // schema already encoded in table_def
+    Ok(())
+}
+
+fn alter_drop_column(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_def: &axiomdb_catalog::schema::TableDef,
+    columns: &mut Vec<axiomdb_catalog::schema::ColumnDef>,
+    name: &str,
+    if_exists: bool,
+) -> Result<(), DbError> {
+    // Find the column by name.
+    let drop_pos = match columns.iter().position(|c| c.name == name) {
+        Some(pos) => pos,
+        None if if_exists => return Ok(()),
+        None => {
+            return Err(DbError::ColumnNotFound {
+                name: name.to_string(),
+                table: table_def.table_name.clone(),
+            })
+        }
+    };
+
+    let dropped_col_idx = columns[drop_pos].col_idx;
+    let old_columns = columns.clone();
+
+    // Build new column list (without the dropped column).
+    let mut new_columns = columns.clone();
+    new_columns.remove(drop_pos);
+
+    // 1. Rewrite rows BEFORE updating catalog (if rewrite fails, catalog is still consistent).
+    rewrite_rows(
+        storage,
+        txn,
+        table_def,
+        &old_columns,
+        &new_columns,
+        &move |mut row| {
+            if drop_pos < row.len() {
+                row.remove(drop_pos);
+            }
+            row
+        },
+    )?;
+
+    // 2. Delete column from catalog.
+    CatalogWriter::new(storage, txn)?.delete_column(table_def.id, dropped_col_idx)?;
+
+    *columns = new_columns;
+    Ok(())
+}
+
+fn alter_rename_column(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_def: &axiomdb_catalog::schema::TableDef,
+    columns: &[axiomdb_catalog::schema::ColumnDef],
+    old_name: &str,
+    new_name: &str,
+    _schema: &str,
+) -> Result<(), DbError> {
+    // Find old column.
+    let col =
+        columns
+            .iter()
+            .find(|c| c.name == old_name)
+            .ok_or_else(|| DbError::ColumnNotFound {
+                name: old_name.to_string(),
+                table: table_def.table_name.clone(),
+            })?;
+
+    // Check new name is not already in use.
+    if columns.iter().any(|c| c.name == new_name) {
+        return Err(DbError::ColumnAlreadyExists {
+            name: new_name.to_string(),
+            table: table_def.table_name.clone(),
+        });
+    }
+
+    CatalogWriter::new(storage, txn)?.rename_column(
+        table_def.id,
+        col.col_idx,
+        new_name.to_string(),
+    )?;
+    Ok(())
+}
+
+fn alter_rename_table(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_def: &axiomdb_catalog::schema::TableDef,
+    new_name: &str,
+    schema: &str,
+) -> Result<(), DbError> {
+    // Check new name not already in use.
+    let snap = txn.active_snapshot()?;
+    let reader = CatalogReader::new(storage, snap)?;
+    if reader.get_table(schema, new_name)?.is_some() {
+        return Err(DbError::TableAlreadyExists {
+            schema: schema.to_string(),
+            name: new_name.to_string(),
+        });
+    }
+
+    CatalogWriter::new(storage, txn)?.rename_table(table_def.id, new_name.to_string(), schema)?;
+    Ok(())
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
