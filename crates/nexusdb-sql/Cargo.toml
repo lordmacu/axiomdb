@@ -10,3 +10,10 @@ nexusdb-core  = { workspace = true }
 nexusdb-types = { workspace = true }
 thiserror     = { workspace = true }
 logos         = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name    = "sql_components"
+harness = false
