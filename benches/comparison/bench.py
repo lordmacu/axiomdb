@@ -4,6 +4,7 @@ AxiomDB Comparison Benchmark Orchestrator
 
 Runs the selected scenario(s) in parallel across MySQL, PostgreSQL, and AxiomDB.
 Each engine runs its benchmark INSIDE its own Docker container (localhost, no network overhead).
+The AxiomDB binary is pre-built inside the Docker image — no host build needed.
 
 Usage:
   python3 bench.py                        # interactive — asks what to bench
@@ -13,15 +14,9 @@ Usage:
   python3 bench.py full_scan --rows 50000 # custom dataset size
   python3 bench.py --list                 # show available scenarios
 
-Scenarios:
-  insert_batch       INSERT N rows in 1 transaction
-  insert_autocommit  INSERT 300 rows, 1 txn per row
-  full_scan          SELECT * full table scan
-  select_where       SELECT WHERE active=TRUE (~50% rows)
-  point_lookup       100 individual PK lookups
-  range_scan         SELECT WHERE id range 10%
-  count_star         SELECT COUNT(*)
-  group_by           GROUP BY age + COUNT(*) + AVG(score)
+To update AxiomDB binary after code changes:
+  cd ../..  &&  docker compose -f benches/comparison/docker-compose.yml build axiomdb
+  docker compose -f benches/comparison/docker-compose.yml up -d axiomdb
 """
 
 import argparse, json, subprocess, sys, time
@@ -34,9 +29,9 @@ SCENARIOS = {
     "insert_autocommit": "INSERT 300 rows, 1 txn per row",
     "full_scan":         "SELECT * full table scan",
     "select_where":      "SELECT WHERE active=TRUE (~50%)",
-    "point_lookup":      "100 PK lookups  ⚠️  AxiomDB: full scan until Phase 5",
-    "range_scan":        "Range scan 10%  ⚠️  AxiomDB: full scan until Phase 5",
-    "count_star":        "SELECT COUNT(*)  ⚠️  AxiomDB: full scan until Phase 5",
+    "point_lookup":      "100 PK lookups  ⚠️  AxiomDB full scan until Phase 5",
+    "range_scan":        "Range scan 10%  ⚠️  AxiomDB full scan until Phase 5",
+    "count_star":        "SELECT COUNT(*)  ⚠️  AxiomDB full scan until Phase 5",
     "group_by":          "GROUP BY age + COUNT(*) + AVG(score)",
 }
 
@@ -46,54 +41,43 @@ CONTAINERS = {
     "axiomdb":  "axiomdb_bench_axiomdb",
 }
 
-AXIOMDB_BINARY = "target/release/axiomdb_bench"
-
-# ── Engine runners ────────────────────────────────────────────────────────────
+# ── Engine runners (each runs docker exec against its own container) ───────────
 
 def run_mysql(scenario, rows):
-    result = subprocess.run(
+    r = subprocess.run(
         ["docker", "exec", CONTAINERS["mysql"],
          "python3", "/bench/bench.py", "--scenario", scenario, "--rows", str(rows)],
         capture_output=True, text=True, timeout=300,
     )
-    if result.returncode != 0:
-        return {"engine": "MySQL 8.0", "scenario": scenario, "error": result.stderr.strip()}
-    return json.loads(result.stdout.strip())
+    if r.returncode != 0:
+        return {"engine": "MySQL 8.0", "scenario": scenario,
+                "error": (r.stderr or r.stdout or "no output").strip()[:120]}
+    return json.loads(r.stdout.strip())
 
 def run_postgres(scenario, rows):
-    result = subprocess.run(
+    r = subprocess.run(
         ["docker", "exec", CONTAINERS["postgres"],
          "python3", "/bench/bench.py", "--scenario", scenario, "--rows", str(rows)],
         capture_output=True, text=True, timeout=300,
     )
-    if result.returncode != 0:
-        return {"engine": "PostgreSQL 16", "scenario": scenario, "error": result.stderr.strip()}
-    return json.loads(result.stdout.strip())
+    if r.returncode != 0:
+        return {"engine": "PostgreSQL 16", "scenario": scenario,
+                "error": (r.stderr or r.stdout or "no output").strip()[:120]}
+    return json.loads(r.stdout.strip())
 
 def run_axiomdb(scenario, rows):
-    # Build binary on host
-    build = subprocess.run(
-        ["cargo", "build", "--release", "-p", "axiomdb-bench-comparison"],
-        capture_output=True, text=True,
-    )
-    if build.returncode != 0:
-        return {"engine": "AxiomDB", "scenario": scenario,
-                "error": f"build failed: {build.stderr[-200:]}"}
-
-    # Copy binary into container (fresh each time so code changes are picked up)
-    subprocess.run(
-        ["docker", "cp", AXIOMDB_BINARY, f"{CONTAINERS['axiomdb']}:/bench/axiomdb_bench"],
-        capture_output=True, check=True,
-    )
-
-    result = subprocess.run(
+    # Binary is pre-built inside the Docker image (Linux native).
+    # To rebuild after code changes:
+    #   docker compose build axiomdb && docker compose up -d axiomdb
+    r = subprocess.run(
         ["docker", "exec", CONTAINERS["axiomdb"],
          "/bench/axiomdb_bench", "--scenario", scenario, "--rows", str(rows)],
         capture_output=True, text=True, timeout=600,
     )
-    if result.returncode != 0:
-        return {"engine": "AxiomDB", "scenario": scenario, "error": result.stderr.strip()}
-    return json.loads(result.stdout.strip())
+    if r.returncode != 0:
+        return {"engine": "AxiomDB", "scenario": scenario,
+                "error": (r.stderr or r.stdout or "no output").strip()[:120]}
+    return json.loads(r.stdout.strip())
 
 # ── Output ────────────────────────────────────────────────────────────────────
 
@@ -108,21 +92,17 @@ def fmt_ops(n):
 def print_result(scenario, results):
     desc = SCENARIOS.get(scenario, scenario)
     print(f"\n  ┌─ {scenario} — {desc}")
-
-    engines = ["MySQL 8.0", "PostgreSQL 16", "AxiomDB"]
-    for engine in engines:
+    for engine in ["MySQL 8.0", "PostgreSQL 16", "AxiomDB"]:
         r = next((x for x in results if x.get("engine") == engine), None)
         if r is None:
             print(f"  │  {engine:<16}  (no result)")
         elif "error" in r:
-            print(f"  │  {engine:<16}  ERROR: {r['error'][:60]}")
+            print(f"  │  {engine:<16}  ERROR: {r['error']}")
         else:
-            ms  = r["mean_ms"]
-            ops = fmt_ops(r["ops_per_s"])
+            ms   = r["mean_ms"]
+            ops  = fmt_ops(r["ops_per_s"])
             note = f"  [{r['note']}]" if r.get("note") else ""
             print(f"  │  {engine:<16}  {ms:8.1f} ms   {ops:>12}/s{note}")
-
-    # Winner
     valid = [r for r in results if "ops_per_s" in r and r["ops_per_s"] > 0]
     if len(valid) > 1:
         best = max(valid, key=lambda r: r["ops_per_s"])
@@ -153,10 +133,10 @@ def ask_scenarios():
 
 def main():
     p = argparse.ArgumentParser(description="AxiomDB comparison benchmark")
-    p.add_argument("scenarios",   nargs="*", help="Scenario name(s)")
-    p.add_argument("--all",       action="store_true", help="Run all scenarios")
-    p.add_argument("--rows",      type=int, default=10_000, help="Row count (default 10000)")
-    p.add_argument("--list",      action="store_true", help="List scenarios and exit")
+    p.add_argument("scenarios", nargs="*", help="Scenario name(s)")
+    p.add_argument("--all",  action="store_true", help="Run all scenarios")
+    p.add_argument("--rows", type=int, default=10_000)
+    p.add_argument("--list", action="store_true", help="List scenarios and exit")
     args = p.parse_args()
 
     if args.list:
@@ -170,8 +150,7 @@ def main():
     elif args.scenarios:
         invalid = [s for s in args.scenarios if s not in SCENARIOS]
         if invalid:
-            print(f"Unknown scenario(s): {', '.join(invalid)}")
-            print(f"Available: {', '.join(SCENARIOS)}")
+            print(f"Unknown: {', '.join(invalid)}  |  Available: {', '.join(SCENARIOS)}")
             sys.exit(1)
         selected = args.scenarios
     else:
@@ -182,33 +161,12 @@ def main():
 
     print(f"\n  Engines:   MySQL 8.0 | PostgreSQL 16 | AxiomDB")
     print(f"  Rows:      {args.rows:,}")
-    print(f"  Runs:      5 measured + 2 warmup")
-    print(f"  Resources: 2 CPU / 2 GB RAM per container | fsync ON")
-    print(f"  Scenarios: {', '.join(selected)}")
-
-    # Build AxiomDB binary once upfront
-    print("\n  Building AxiomDB binary...")
-    build = subprocess.run(
-        ["cargo", "build", "--release", "-p", "axiomdb-bench-comparison"],
-        capture_output=True, text=True,
-    )
-    if build.returncode != 0:
-        print(f"  Build failed:\n{build.stderr[-300:]}")
-        sys.exit(1)
-
-    # Copy binary to container once
-    subprocess.run(
-        ["docker", "cp", AXIOMDB_BINARY,
-         f"{CONTAINERS['axiomdb']}:/bench/axiomdb_bench"],
-        capture_output=True, check=True,
-    )
-    print("  Binary ready.\n")
+    print(f"  Runs:      5 measured + 2 warmup | fsync ON | 2 CPU / 2 GB per container")
+    print(f"  Scenarios: {', '.join(selected)}\n")
 
     for scenario in selected:
-        print(f"\n  Running: {scenario}...", flush=True)
+        print(f"  Running {scenario}...", flush=True)
         t0 = time.perf_counter()
-
-        # Run all three in parallel
         with ThreadPoolExecutor(max_workers=3) as ex:
             futures = {
                 ex.submit(run_mysql,    scenario, args.rows): "mysql",
@@ -221,10 +179,8 @@ def main():
                     results.append(future.result())
                 except Exception as e:
                     results.append({"engine": futures[future], "error": str(e)})
-
-        elapsed = time.perf_counter() - t0
         print_result(scenario, results)
-        print(f"  (wall time: {elapsed:.1f}s running all 3 in parallel)")
+        print(f"  (wall time: {time.perf_counter()-t0:.1f}s — all 3 ran in parallel)")
 
     print()
 
