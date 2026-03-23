@@ -933,10 +933,48 @@
 - [ ] 37.56 ⏳ `fiscal_lock('2023')` / `fiscal_unlock('2023')` — lock/unlock fiscal period (Phase 13.11)
 - [ ] 37.57 ⏳ `.explain(format: json)` / `.explain(format: text, buffers: true)` — extended EXPLAIN options
 
+#### 37.Q — Real-time change watching
+- [ ] 37.61 ⏳ `users.watch()` — returns a live stream of row changes (insert/update/delete); uses WAL CatalogChangeNotifier
+- [ ] 37.62 ⏳ `users.watch(filter: active)` — filtered watch; only emits changes matching the condition
+- [ ] 37.63 ⏳ `.on('insert', fn)`, `.on('update', fn)`, `.on('delete', fn)` — per-event handlers on watch stream
+- [ ] 37.64 ⏳ `users.watch().diff()` — emits `{old, new}` pairs on update; useful for audit trails
+
+#### 37.R — Schemas + multitenancy
+- [ ] 37.65 ⏳ `schema('tenant_123').users.filter(active)` — query within a specific schema; compiles to SET search_path or schema-qualified names
+- [ ] 37.66 ⏳ `create schema('tenant_123')` / `drop schema('tenant_123', cascade: true)` — CREATE/DROP SCHEMA
+- [ ] 37.67 ⏳ `schema('src').users.copy_to(schema: 'dst')` — copy table structure (and optionally data) between schemas
+
+#### 37.S — Sequences
+- [ ] 37.68 ⏳ `create sequence('order_num', start: 1000, step: 5)` — CREATE SEQUENCE with options
+- [ ] 37.69 ⏳ `sequence('order_num').next()` — NEXTVAL; `sequence('order_num').current()` — CURRVAL; `sequence('order_num').set(500)` — SETVAL
+- [ ] 37.70 ⏳ `drop sequence('order_num')` / `alter sequence('order_num', max: 99999)` — DDL on sequences
+
+#### 37.T — Materialized views
+- [ ] 37.71 ⏳ `materialized_view('active_users', users.filter(active).pick(id, name))` — CREATE MATERIALIZED VIEW from AxiomQL query
+- [ ] 37.72 ⏳ `active_users.refresh()` / `active_users.refresh(concurrent: true)` — REFRESH MATERIALIZED VIEW
+- [ ] 37.73 ⏳ `drop materialized_view('active_users')` — DROP MATERIALIZED VIEW
+- [ ] 37.74 ⏳ Materialized views are queryable like regular tables: `active_users.filter(name ~ 'A%').count()`
+
+#### 37.U — Schema metadata + comments
+- [ ] 37.75 ⏳ `users.comment('Registered application users')` — COMMENT ON TABLE
+- [ ] 37.76 ⏳ `users.col('email').comment('Primary contact, must be verified')` — COMMENT ON COLUMN
+- [ ] 37.77 ⏳ `users.labels(team: 'auth', domain: 'users')` — key/value labels on tables for tooling and autodoc
+
+#### 37.V — Extensions + statistics
+- [ ] 37.78 ⏳ `enable_extension('uuid-ossp')` / `enable_extension('pgvector')` — CREATE EXTENSION; required before using extension types/functions
+- [ ] 37.79 ⏳ `disable_extension('name')` — DROP EXTENSION
+- [ ] 37.80 ⏳ `list_extensions()` — show available and installed extensions
+- [ ] 37.81 ⏳ `statistics('stat_name', users, [age, country])` — CREATE STATISTICS; teaches planner about column correlations for better query plans
+
+#### 37.W — Table inheritance
+- [ ] 37.82 ⏳ `create employees extends persons { salary: real, department: text }` — CREATE TABLE ... INHERITS; employees rows appear in persons queries
+- [ ] 37.83 ⏳ `persons.only()` — SELECT from parent only, excluding inherited rows → ONLY keyword
+- [ ] 37.84 ⏳ `drop table employees (no_inherit: true)` — DROP TABLE without affecting parent
+
 #### 37.M — Quality
-- [ ] 37.58 ⏳ Documentation — AxiomQL reference in docs-site: every method with SQL equivalent side-by-side
-- [ ] 37.59 ⏳ Fuzz testing — malformed AxiomQL input; every panic = regression test
-- [ ] 37.60 ⏳ `.to_sql()` pretty-printer — `users.filter(active).to_sql()` returns the generated SQL (debug + learning tool)
+- [ ] 37.85 ⏳ Documentation — AxiomQL reference in docs-site: every method with SQL equivalent side-by-side
+- [ ] 37.86 ⏳ Fuzz testing — malformed AxiomQL input; every panic = regression test
+- [ ] 37.87 ⏳ `.to_sql()` pretty-printer — `users.filter(active).to_sql()` returns the generated SQL (debug + learning tool)
 
 ---
 
