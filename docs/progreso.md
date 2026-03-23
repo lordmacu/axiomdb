@@ -116,6 +116,8 @@
 - [ ] 4.5a ⏳ SELECT without FROM — `SELECT 1`, `SELECT NOW()`, `SELECT VERSION()`; health-check query used by every ORM on connect
 - [ ] 4.5b ⏳ Table engine — row storage interface: `scan_table(snap)→RowIter`, `insert_row(values)→RecordId`, `delete_row(rid)`, `update_row(rid, values)`; wraps HeapChain + Row codec + catalog; used by the executor for all DML on heap tables; **NEW subfase — gap identified in review**
 - [ ] 4.25 ⏳ Error handling framework — SQLSTATE codes (23505, 42P01, 40001), propagation without panic, recovery from constraint + type errors; base for all other modules
+- [ ] 4.25b ⏳ Structured error responses — every error includes: `code` (SQLSTATE), `message`, `detail` (table, column, constraint, offending value), `hint` (what to do), `position` (query line/col); inspired by Rust compiler errors — the most actionable error format in any language; `'duplicate key'` errors tell you which row already has that value; `'foreign key violation'` tells you which referenced row does not exist; available as JSON via `SET error_format = 'json'` and as human-readable text by default; no other SQL database provides this level of detail out of the box
+- [ ] 4.25c ⏳ Strict mode always on + warnings system — data truncation is always an error (not configurable); division by zero is always an error; `'42abc'` cast to INT is always an error; `SET warnings = 'all'` makes every implicit conversion visible as a warning; `SET warnings = 'error'` converts warnings to errors for strict applications; `SET warnings = 'silent'` suppresses all (MySQL-compatible mode); with `COMPAT='mysql'` the behavior matches MySQL's lenient defaults for migration
 - [ ] 4.7 ⏳ SQLSTATE codes — map all DbError variants to standard 5-char codes; consistent error format for Phase 5 wire protocol
 
 <!-- ── Group E — Core SQL (needs executor) ── -->
@@ -159,6 +161,7 @@
 - [ ] 5.1 ⏳ TCP listener with Tokio — accept connections on :3306
 - [ ] 5.2 ⏳ MySQL handshake — Server Greeting + Client Response
 - [ ] 5.2a ⏳ Charset/collation negotiation in handshake — `character_set_client`, `character_set_results`, `collation_connection` sent in Server Greeting; client chooses charset; without this modern MySQL clients cannot connect or display incorrect characters
+- [ ] 5.2c ⏳ ON_ERROR session behavior — `SET ON_ERROR = 'rollback_statement'` rolls back only the failing statement and continues the transaction (fixes the PostgreSQL silent-abort problem where developers lose all previous work); `SET ON_ERROR = 'rollback_transaction'` is PostgreSQL-standard behavior; `SET ON_ERROR = 'savepoint'` automatically creates a savepoint before each statement so errors can be recovered without losing the whole transaction; `SET ON_ERROR = 'ignore'` matches MySQL lenient behavior; solves the real production pain of `BEGIN ... multiple statements ... one fails ... COMMIT does ROLLBACK without warning`
 - [ ] 5.2b ⏳ Session-level collation and compat mode — `SET collation = 'es'` changes default sort for the session; `SET NEXUS_COMPAT = 'mysql'` makes the session behave like MySQL (CI+AI default); `SET NEXUS_COMPAT = 'postgresql'` for PG behavior; these settings propagate to all subsequent queries in the session and are reset on reconnect; foundation for the per-database compat mode in Phase 13
 - [ ] 5.3 ⏳ Authentication — basic `mysql_native_password` (SHA1-based for MySQL 5.x compatibility)
 - [ ] 5.3b ⏳ caching_sha2_password — MySQL 8.0+ auth plugin; required by MySQL Workbench, DBeaver and modern clients; full auth + fast auth path
@@ -207,7 +210,7 @@
 - [ ] 7.8 ⏳ Epoch-based reclamation — free CoW pages when no active snapshot references them
 - [ ] 7.9 ⏳ Resolve next_leaf CoW gap — linked list between leaves in Copy-on-Write (DEFERRED from 2.8)
 - [ ] 7.10 ⏳ Lock timeout — wait for lock with configurable timeout (`lock_timeout`); `LockTimeoutError` if expired; avoids simple deadlocks without a detector
-- [ ] 7.11 ⏳ Basic MVCC vacuum — purge dead row versions (txn_id_deleted < oldest_active_snapshot); frees space without blocking reads
+- [ ] 7.11 ⏳ Basic MVCC vacuum — purge dead row versions (txn_id_deleted < oldest_active_snapshot); frees space without blocking reads; aggressive autovacuum defaults out-of-the-box (unlike PostgreSQL where bad defaults cause table bloat in production); `SELECT * FROM nexus_bloat` system view shows: table_name, live_rows, dead_rows, bloat_ratio, last_vacuum_at, estimated_space_wasted; when bloat_ratio > 20% the engine logs a recommendation; no manual tuning required for the common case
 - [ ] 7.12 ⏳ Basic savepoints — `SAVEPOINT sp1`, `ROLLBACK TO sp1`, `RELEASE sp1`; ORMs use them for partial errors in long transactions
 - [ ] 7.13 ⏳ Isolation tests — verify READ COMMITTED and REPEATABLE READ with concurrent transactions; test dirty reads, non-repeatable reads, phantom reads; use real concurrent transactions (not mocks)
 - [ ] 7.14 ⏳ Cascading rollback prevention — if txn A aborts and txn B read data from A (dirty read), B must also abort; verify that READ COMMITTED prevents this structurally
@@ -279,9 +282,10 @@
 - [ ] 11.2d ⏳ BLOB reference tracking — reference count per BLOB page chain (for TOAST GC); counter lives in the overflow page header; `free_blob(page_id)` decrements and chains free only when count reaches 0; prerequisite for content-addressed dedup in Phase 14
 - [ ] 11.2e ⏳ Unicode NFC normalization on store — every TEXT value is normalized to NFC (Canonical Decomposition followed by Canonical Composition) before being written to disk; `'café'` (NFD: 6 bytes) and `'café'` (NFC: 5 bytes) become identical on store, making `=` always correct for visually identical strings; zero API surface change — completely transparent to the application; this is what DuckDB does and it eliminates an entire class of invisible Unicode bugs that cause `'García' = 'García'` to return FALSE when one was typed and one was pasted from a different source
 - [ ] 11.3 ⏳ In-memory mode — `open(":memory:")` without disk
-- [ ] 11.4 ⏳ Native JSON — JSON type, `->>`  extraction with jsonpath
+- [ ] 11.4 ⏳ Native JSON — single JSON type (always binary storage like PostgreSQL's jsonb, never text-json); no `json` vs `jsonb` confusion; JSONPath SQL:2016 standard syntax; automatic GIN index on JSON columns (opt-out via `WITHOUT INDEX`); `->` and `->>` operators for compatibility with both MySQL and PostgreSQL syntax; `JSON_SET`, `JSON_REMOVE`, `JSON_MERGE_PATCH` for atomic updates without rewriting the full document; comparison: PostgreSQL has two confusing types (json/jsonb), MySQL has non-standard operators — we have one type that does everything correctly
 - [ ] 11.4b ⏳ JSONB_SET — update JSON field without rewriting the entire document
 - [ ] 11.4c ⏳ JSONB_DELETE_PATH — remove specific field from JSONB
+- [ ] 11.4b ⏳ Trigram indexes for substring search — `CREATE INDEX ON productos (nombre) USING trigram`; makes `WHERE nombre LIKE '%García%'` use the index instead of full table scan; `WHERE nombre ILIKE '%garcia%'` also indexed (case-insensitive); PostgreSQL requires installing pg_trgm extension manually and it is not enabled by default — we include trigram support built-in; the query planner automatically suggests `CREATE INDEX ... USING trigram` in EXPLAIN output when it detects frequent `LIKE '%...%'` patterns causing sequential scans
 - [ ] 11.5 ⏳ Partial indexes — `CREATE INDEX ... WHERE condition`
 - [ ] 11.6 ⏳ Basic FTS — tokenizer + inverted index + BM25 ranking
 - [ ] 11.7 ⏳ Advanced FTS — phrases, booleans, prefixes, stop words
@@ -297,6 +301,8 @@
 - [ ] 12.5 ⏳ SQL parser fuzz testing — `cargo fuzz` on the parser with random inputs; register crashes as regression tests
 - [ ] 12.6 ⏳ Storage fuzz testing — pages with random bytes, deliberate corruptions; verify that crash recovery handles corrupted data
 - [ ] 12.7 ⏳ ORM compatibility tier 1 — Django ORM and SQLAlchemy connect, run simple migrations and SELECT/INSERT/UPDATE/DELETE queries without errors; document workarounds if any
+- [ ] 12.8 ⏳ Unified nexus_* observability system — all system views use consistent naming, types, and join keys; `SELECT * FROM nexus_queries` shows running queries with pid, duration, state, sql_text, plan_hash; `SELECT * FROM nexus_bloat` shows table bloat (from 7.11); `SELECT * FROM nexus_slow_queries` is auto-populated when query exceeds `slow_query_threshold` (default 1s); `SELECT * FROM nexus_stats` shows database-wide metrics (cache hit rate, rows read/written, lock waits); `SELECT * FROM nexus_index_usage` shows which indexes are used/unused; unlike MySQL's inconsistent SHOW commands and PostgreSQL's complex pg_catalog joins, every nexus_* view is self-documented, joinable, and has the same timestamp/duration formats
+- [ ] 12.9 ⏳ Date/time validation strictness — `'0000-00-00'` is always rejected with a clear error (MySQL allows this invalid date); `TIMESTAMP WITH TIME ZONE` is the single timestamp type with explicit timezone; no silent timezone conversion based on column type; `'2024-02-30'` is always an error; `'2024-13-01'` is always an error; retrocompatible: `SET NEXUS_COMPAT='mysql'` re-enables MySQL's lenient date behavior for migration
 
 ### Phase 13 — Advanced PostgreSQL `⏳` week 30-31
 - [ ] 13.1 ⏳ Materialized views — `CREATE MATERIALIZED VIEW` + `REFRESH`
@@ -411,6 +417,7 @@
 - [ ] 18.8 ⏳ WAL archiving — copy WAL segments to external storage (S3/local) automatically; prerequisite for PITR (18.6)
 - [ ] 18.9 ⏳ Replica lag monitoring — `replication_lag_bytes` and `replication_lag_seconds` metrics exposed in virtual system `sys.replication_status`
 - [ ] 18.10 ⏳ Basic automatic failover — detect primary down + promote standby; minimal configuration without Raft
+- [ ] 18.11 ⏳ Replication slot WAL retention protection — `max_replication_slot_wal_keep = '10 GB'` (safe default); when a replica falls behind and the retention limit is reached, the slot is dropped gracefully and the replica is disconnected with a clear error instead of silently filling the primary's disk; `SELECT * FROM nexus_replication_slots` shows slot name, active, wal_retained_bytes, age; this is a known production outage cause in PostgreSQL (fixed in PG 13 but not as default) — we ship with a safe default from day one
 
 ### Phase 19 — Maintenance + observability `⏳` week 44-46
 - [ ] 19.1 ⏳ Auto-vacuum — background task in Tokio, configurable threshold per table
