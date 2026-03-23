@@ -26,6 +26,7 @@ use nexusdb_core::{error::DbError, TransactionSnapshot, TxnId};
 use nexusdb_storage::{clear_deletion, mark_slot_dead, Page, StorageEngine};
 
 use crate::{
+    checkpoint::Checkpointer,
     entry::{EntryType, WalEntry},
     reader::WalReader,
     writer::WalWriter,
@@ -376,13 +377,66 @@ impl TxnManager {
 
     /// Mutable access to the underlying [`WalWriter`].
     ///
-    /// Used by [`crate::checkpoint::Checkpointer`] to append the Checkpoint
-    /// entry and fsync the WAL without duplicating the writer reference.
-    ///
-    /// Callers must not call this while a transaction is active and then
-    /// write arbitrary entries — only the Checkpointer should use this.
+    /// Used by [`Checkpointer`] to append the Checkpoint entry and fsync the WAL.
+    /// Callers must not write arbitrary entries through this — only Checkpointer uses it.
     pub fn wal_mut(&mut self) -> &mut WalWriter {
         &mut self.wal
+    }
+
+    // ── WAL Rotation ──────────────────────────────────────────────────────────
+
+    /// Triggers a checkpoint and rotates the WAL file.
+    ///
+    /// After rotation, the WAL file is truncated to just the 24-byte v2 header
+    /// with `start_lsn = checkpoint_lsn`. The next entry written will have
+    /// `LSN = checkpoint_lsn + 1`, preserving global monotonicity.
+    ///
+    /// **Must be called with no active transaction.** Rotating mid-transaction
+    /// would lose the in-progress undo log.
+    ///
+    /// Returns the checkpoint LSN.
+    ///
+    /// # Errors
+    /// - [`DbError::TransactionAlreadyActive`] if a transaction is in progress.
+    /// - Any I/O error from checkpoint or file truncation.
+    pub fn rotate_wal(
+        &mut self,
+        storage: &mut dyn StorageEngine,
+        wal_path: &Path,
+    ) -> Result<u64, DbError> {
+        if let Some(ref active) = self.active {
+            return Err(DbError::TransactionAlreadyActive {
+                txn_id: active.txn_id,
+            });
+        }
+
+        // 1. Checkpoint: flush pages + write Checkpoint WAL entry + fsync.
+        let checkpoint_lsn = Checkpointer::checkpoint(storage, &mut self.wal)?;
+
+        // 2. Truncate the WAL file to just the header with start_lsn.
+        WalWriter::rotate_file(wal_path, checkpoint_lsn)?;
+
+        // 3. Reopen the WAL: next_lsn = checkpoint_lsn + 1.
+        self.wal = WalWriter::open(wal_path)?;
+
+        Ok(checkpoint_lsn)
+    }
+
+    /// Rotates the WAL if its current size exceeds `max_wal_size` bytes.
+    ///
+    /// Returns `true` if rotation occurred, `false` if the WAL was below the threshold.
+    pub fn check_and_rotate(
+        &mut self,
+        storage: &mut dyn StorageEngine,
+        wal_path: &Path,
+        max_wal_size: u64,
+    ) -> Result<bool, DbError> {
+        if self.wal.file_offset() > max_wal_size {
+            self.rotate_wal(storage, wal_path)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }
 
