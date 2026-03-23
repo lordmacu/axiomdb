@@ -74,9 +74,24 @@ impl From<ColumnType> for u8 {
 // ── TableDef ──────────────────────────────────────────────────────────────────
 
 /// Metadata for a user table — one row in `nexus_tables`.
+///
+/// ## On-disk format (`to_bytes` / `from_bytes`)
+///
+/// ```text
+/// [table_id:4 LE][data_root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8]
+/// ```
+///
+/// `data_root_page_id` is the root page of the `HeapChain` that stores this
+/// table's user rows. It is allocated by `CatalogWriter::create_table` and
+/// never changes for the lifetime of the table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableDef {
     pub id: TableId,
+    /// Root page of the heap chain holding this table's user row data.
+    ///
+    /// Used by `TableEngine` to locate the data heap without an extra lookup.
+    /// Must never be 0 (page 0 is the meta page).
+    pub data_root_page_id: u64,
     pub schema_name: String,
     pub table_name: String,
 }
@@ -84,7 +99,7 @@ pub struct TableDef {
 impl TableDef {
     /// Serializes to binary row format.
     ///
-    /// Format: `[table_id:4][schema_len:1][schema bytes][name_len:1][name bytes]`
+    /// Format: `[table_id:4][data_root_page_id:8][schema_len:1][schema bytes][name_len:1][name bytes]`
     ///
     /// # Panics (debug only)
     /// If `schema_name` or `table_name` exceeds 255 bytes.
@@ -94,8 +109,9 @@ impl TableDef {
         debug_assert!(schema.len() <= 255, "schema_name too long");
         debug_assert!(name.len() <= 255, "table_name too long");
 
-        let mut buf = Vec::with_capacity(4 + 1 + schema.len() + 1 + name.len());
+        let mut buf = Vec::with_capacity(4 + 8 + 1 + schema.len() + 1 + name.len());
         buf.extend_from_slice(&self.id.to_le_bytes());
+        buf.extend_from_slice(&self.data_root_page_id.to_le_bytes());
         buf.push(schema.len() as u8);
         buf.extend_from_slice(schema);
         buf.push(name.len() as u8);
@@ -106,18 +122,25 @@ impl TableDef {
     /// Deserializes from binary row format.
     ///
     /// Returns `(TableDef, bytes_consumed)` on success.
+    ///
+    /// # Errors
+    /// - [`DbError::ParseError`] if `bytes` is too short or contains invalid UTF-8.
     pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), DbError> {
         let err = || DbError::ParseError {
             message: "truncated TableRow bytes".into(),
         };
 
-        if bytes.len() < 6 {
+        // Minimum: 4 (id) + 8 (root_page_id) + 1 (schema_len) + 0 + 1 (name_len) + 0 = 14
+        if bytes.len() < 14 {
             return Err(err());
         }
 
         let id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let schema_len = bytes[4] as usize;
-        let pos = 5;
+        let data_root_page_id = u64::from_le_bytes([
+            bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+        ]);
+        let schema_len = bytes[12] as usize;
+        let pos = 13;
 
         if bytes.len() < pos + schema_len + 1 {
             return Err(err());
@@ -144,6 +167,7 @@ impl TableDef {
         Ok((
             Self {
                 id,
+                data_root_page_id,
                 schema_name,
                 table_name,
             },
@@ -353,6 +377,7 @@ mod tests {
     fn test_table_def_roundtrip() {
         let def = TableDef {
             id: 42,
+            data_root_page_id: 7,
             schema_name: "public".to_string(),
             table_name: "users".to_string(),
         };
@@ -363,9 +388,25 @@ mod tests {
     }
 
     #[test]
+    fn test_table_def_roundtrip_with_root_page() {
+        // Verify that data_root_page_id round-trips correctly for various values.
+        for &root in &[1u64, 100, u64::MAX / 2, u64::MAX - 1] {
+            let def = TableDef {
+                id: 1,
+                data_root_page_id: root,
+                schema_name: "public".into(),
+                table_name: "t".into(),
+            };
+            let (back, _) = TableDef::from_bytes(&def.to_bytes()).unwrap();
+            assert_eq!(back.data_root_page_id, root);
+        }
+    }
+
+    #[test]
     fn test_table_def_empty_strings() {
         let def = TableDef {
             id: 1,
+            data_root_page_id: 5,
             schema_name: String::new(),
             table_name: String::new(),
         };
@@ -378,11 +419,14 @@ mod tests {
     fn test_table_def_truncated_input_error() {
         let def = TableDef {
             id: 1,
+            data_root_page_id: 3,
             schema_name: "s".into(),
             table_name: "t".into(),
         };
         let bytes = def.to_bytes();
-        // Truncate to 3 bytes — not enough for the fixed header.
+        // Minimum is 14 bytes; truncate to 10 (has id+root but no schema_len).
+        assert!(TableDef::from_bytes(&bytes[..10]).is_err());
+        // Old 3-byte truncation still fails.
         assert!(TableDef::from_bytes(&bytes[..3]).is_err());
     }
 

@@ -108,12 +108,14 @@ that has not yet committed is invisible to other transactions' `CatalogReader`.
 
 ```rust
 pub struct TableDef {
-    pub id:           u64,
-    pub schema_name:  String,
-    pub table_name:   String,
-    pub column_count: usize,
-    pub created_lsn:  u64,
+    pub id:                 u32,
+    pub data_root_page_id:  u64,    // heap chain root for user row data
+    pub schema_name:        String,
+    pub table_name:         String,
 }
+
+// On-disk binary format for nexus_tables rows:
+// [table_id:4 LE][data_root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8]
 
 pub struct ColumnDef {
     pub table_id:      u64,
@@ -142,12 +144,17 @@ pub struct IndexDef {
 When the executor processes `CREATE TABLE`, it:
 
 1. Opens a write transaction (or participates in the current one).
-2. Inserts a row into `nexus_tables` with the new table's metadata.
-3. Inserts one row per column into `nexus_columns`.
-4. Creates B+ Tree pages for the new table's primary key (or first UNIQUE column).
-5. Inserts the index definition into `nexus_indexes`.
-6. Appends all these mutations to the WAL.
-7. Commits (or defers the commit to the surrounding transaction).
+2. Allocates a new `TableId` from the meta page sequence.
+3. Allocates a `Data` page as the heap root for user row data (`data_root_page_id`).
+4. Inserts a row into `nexus_tables` with `{id, data_root_page_id, schema_name, table_name}`.
+5. Inserts one row per column into `nexus_columns`.
+6. Creates B+ Tree pages for the new table's primary key (or first UNIQUE column).
+7. Inserts the index definition into `nexus_indexes`.
+8. Appends all these mutations to the WAL.
+9. Commits (or defers the commit to the surrounding transaction).
+
+The `data_root_page_id` stored in `nexus_tables` is used by `TableEngine` (Phase 4.5b)
+to locate the heap chain for all DML on that table — no extra lookup required.
 
 Because the catalog is stored in heap pages and indexed like any other table, all
 crash recovery mechanisms apply automatically: WAL replay will reconstruct the catalog

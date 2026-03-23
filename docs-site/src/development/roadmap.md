@@ -54,6 +54,7 @@ functionality. The design is organized in three blocks:
 | 4.18 | Semantic analyzer | ✅ | BindContext, col_idx resolution |
 | 4.18b | Type coercion matrix | ✅ | coerce(), coerce_for_op(), CoercionMode strict/permissive |
 | 4.23 | QueryResult type | ✅ | Row, ColumnMeta, QueryResult (Rows/Affected/Empty) |
+| 4.5b | Table engine | ✅ | TableEngine scan/insert/delete/update; TableDef.data_root_page_id |
 | 4.5 | Value/DataType types | ✅ | Row codec, encode/decode, encoded_len |
 | 5 | Executor | ⚠️ Planned | Heap scan, index lookup, join, aggregate |
 | 6 | Query planner | ⚠️ Planned | Cost-based plan selection |

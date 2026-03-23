@@ -10,6 +10,7 @@ nexusdb-core    = { workspace = true }
 nexusdb-types   = { workspace = true }
 nexusdb-catalog = { workspace = true }
 nexusdb-storage = { workspace = true }
+nexusdb-wal     = { workspace = true }
 thiserror       = { workspace = true }
 logos           = { workspace = true }
 
@@ -17,7 +18,6 @@ logos           = { workspace = true }
 criterion    = { workspace = true }
 sqlparser    = "0.53"
 tempfile     = { workspace = true }
-nexusdb-wal  = { workspace = true }
 
 [[bench]]
 name    = "sql_components"

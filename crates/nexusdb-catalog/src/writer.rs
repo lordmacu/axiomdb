@@ -36,7 +36,7 @@
 use std::sync::Arc;
 
 use nexusdb_core::error::DbError;
-use nexusdb_storage::{alloc_index_id, alloc_table_id, HeapChain, StorageEngine};
+use nexusdb_storage::{alloc_index_id, alloc_table_id, HeapChain, Page, PageType, StorageEngine};
 use nexusdb_wal::TxnManager;
 
 use crate::{
@@ -125,7 +125,8 @@ impl<'a> CatalogWriter<'a> {
 
     // ── Table operations ──────────────────────────────────────────────────────
 
-    /// Allocates a new `TableId` and inserts a row into `nexus_tables`.
+    /// Allocates a new `TableId`, initializes a heap root page for user row data,
+    /// and inserts a row into `nexus_tables`.
     ///
     /// The row is WAL-logged as an Insert entry with
     /// `table_id = SYSTEM_TABLE_TABLES` and key = `allocated_table_id` as LE bytes.
@@ -136,8 +137,16 @@ impl<'a> CatalogWriter<'a> {
     /// - [`DbError::SequenceOverflow`] if the table ID space is exhausted.
     pub fn create_table(&mut self, schema: &str, name: &str) -> Result<TableId, DbError> {
         let table_id = alloc_table_id(self.storage)?;
+
+        // Allocate and initialize the heap root page for this table's user data.
+        // This page becomes the root of the HeapChain used by TableEngine.
+        let data_root_page_id = self.storage.alloc_page(PageType::Data)?;
+        let root_page = Page::new(PageType::Data, data_root_page_id);
+        self.storage.write_page(data_root_page_id, &root_page)?;
+
         let def = TableDef {
             id: table_id,
+            data_root_page_id,
             schema_name: schema.to_string(),
             table_name: name.to_string(),
         };
