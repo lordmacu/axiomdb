@@ -1278,3 +1278,173 @@ fn test_order_by_with_group_by() {
     assert_eq!(r[1][0], Value::Text("b".into()));
     assert_eq!(r[2][0], Value::Text("c".into()));
 }
+
+// ── DISTINCT tests ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_distinct_single_column() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (val INT)", &mut storage, &mut txn);
+    run(
+        "INSERT INTO t VALUES (1), (2), (1), (3), (2)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let r = rows(run(
+        "SELECT DISTINCT val FROM t ORDER BY val ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0][0], Value::Int(1));
+    assert_eq!(r[1][0], Value::Int(2));
+    assert_eq!(r[2][0], Value::Int(3));
+}
+
+#[test]
+fn test_distinct_multi_column() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (dept TEXT, role TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES ('eng', 'dev')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES ('eng', 'dev')",
+        &mut storage,
+        &mut txn,
+    ); // duplicate
+    run(
+        "INSERT INTO t VALUES ('eng', 'mgr')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES ('sales', 'dev')",
+        &mut storage,
+        &mut txn,
+    );
+
+    let r = rows(run(
+        "SELECT DISTINCT dept, role FROM t ORDER BY dept ASC, role ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 3); // (eng,dev), (eng,mgr), (sales,dev)
+}
+
+#[test]
+fn test_distinct_null_dedup() {
+    // Two NULLs → only one NULL row in result.
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (val INT)", &mut storage, &mut txn);
+    run(
+        "INSERT INTO t VALUES (NULL), (1), (NULL), (2)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let r = rows(run(
+        "SELECT DISTINCT val FROM t ORDER BY val ASC NULLS LAST",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 3); // (1,), (2,), (NULL,)
+    assert_eq!(r[2][0], Value::Null);
+    assert_ne!(r[0][0], Value::Null);
+}
+
+#[test]
+fn test_distinct_star() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (a INT, b TEXT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1, 'x')", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1, 'x')", &mut storage, &mut txn); // duplicate
+    run("INSERT INTO t VALUES (2, 'y')", &mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT DISTINCT * FROM t ORDER BY a ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 2);
+}
+
+#[test]
+fn test_distinct_empty_table() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (val INT)", &mut storage, &mut txn);
+    let r = rows(run("SELECT DISTINCT val FROM t", &mut storage, &mut txn));
+    assert_eq!(r.len(), 0);
+}
+
+#[test]
+fn test_distinct_no_duplicates() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1), (2), (3)", &mut storage, &mut txn);
+    let r = rows(run(
+        "SELECT DISTINCT id FROM t ORDER BY id ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 3);
+}
+
+#[test]
+fn test_distinct_with_where() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (dept TEXT, val INT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES ('eng', 1), ('eng', 2), ('sales', 3)",
+        &mut storage,
+        &mut txn,
+    );
+
+    // WHERE filters to 'eng' rows, DISTINCT deduplicates dept → 1 unique dept
+    let r = rows(run(
+        "SELECT DISTINCT dept FROM t WHERE dept = 'eng'",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Text("eng".into()));
+}
+
+#[test]
+fn test_distinct_with_limit() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (val INT)", &mut storage, &mut txn);
+    run(
+        "INSERT INTO t VALUES (3),(1),(3),(2),(1)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let r = rows(run(
+        "SELECT DISTINCT val FROM t ORDER BY val ASC LIMIT 2",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][0], Value::Int(1));
+    assert_eq!(r[1][0], Value::Int(2));
+}
+
+#[test]
+fn test_distinct_scalar() {
+    let (mut storage, mut txn) = setup();
+    let r = rows(run("SELECT DISTINCT 1", &mut storage, &mut txn));
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Int(1));
+}
