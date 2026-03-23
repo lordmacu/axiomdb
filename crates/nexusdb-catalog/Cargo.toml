@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 nexusdb-core    = { workspace = true }
 nexusdb-storage = { workspace = true }
+nexusdb-wal     = { workspace = true }
 thiserror       = { workspace = true }
 
 [dev-dependencies]
