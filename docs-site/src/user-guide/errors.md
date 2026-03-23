@@ -110,6 +110,44 @@ INSERT INTO products (name, price) VALUES ('Widget', -5.00);
 
 ---
 
+## Cardinality Errors (Class 21)
+
+### 21000 — cardinality_violation
+
+A scalar subquery returned more than one row. Scalar subqueries (a `SELECT` used
+where a single value is expected) must return exactly one row. Zero rows yield
+`NULL`; more than one row is an error.
+
+```sql
+-- Suppose users contains Alice and Bob
+SELECT (SELECT name FROM users) AS single_name FROM orders;
+-- ERROR 21000: subquery must return exactly one row, but returned 2 rows
+```
+
+**Fix:** add a `WHERE` condition that makes the result unique, or use `LIMIT 1`
+if you intentionally want only the first row:
+
+```sql
+-- Safe: guaranteed single row via primary key
+SELECT (SELECT name FROM users WHERE id = o.user_id) AS customer_name
+FROM orders o;
+
+-- Safe: explicit LIMIT 1 when you want "any one" result
+SELECT (SELECT name FROM users ORDER BY created_at LIMIT 1) AS oldest_user
+FROM config;
+```
+
+```python
+try:
+    db.execute("SELECT (SELECT name FROM users) FROM orders")
+except AxiomDbError as e:
+    if e.sqlstate == '21000':
+        # The subquery returned multiple rows — add a WHERE clause
+        ...
+```
+
+---
+
 ## Undefined Object Errors (Class 42)
 
 These errors indicate a reference to an object (table, column, index) that does
@@ -313,6 +351,7 @@ The following conversions happen automatically without raising 22018:
 
 | SQLSTATE | Name                          | Common Cause                              |
 |----------|-------------------------------|-------------------------------------------|
+| `21000`  | cardinality_violation         | Scalar subquery returned more than 1 row  |
 | `23505`  | unique_violation              | Duplicate value in UNIQUE / PK column     |
 | `23503`  | foreign_key_violation         | Referencing non-existent FK target        |
 | `23502`  | not_null_violation            | NULL inserted into NOT NULL column        |

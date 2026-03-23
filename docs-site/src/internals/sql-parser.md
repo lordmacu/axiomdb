@@ -252,6 +252,156 @@ order_item → expr [ASC | DESC] [NULLS (FIRST | LAST)]
 
 ---
 
+## Subquery Parsing
+
+Subqueries are parsed at three different points in the expression grammar, each
+corresponding to a different syntactic form.
+
+### Scalar Subqueries — `parse_atom`
+
+`parse_atom` is the lowest-precedence entry point for all atoms: literals, column
+references, function calls, and parenthesised expressions. When `parse_atom`
+encounters an `LParen`, it peeks at the next token. If it is `Select`, it parses
+a full `select_stmt` recursively and wraps it in `Expr::Subquery(Box<SelectStmt>)`.
+Otherwise, it parses the contents as a grouped expression `(expr)`.
+
+```
+parse_atom():
+  if peek = LParen:
+    if peek+1 = Select:
+      advance; stmt = parse_select_stmt(); expect(RParen)
+      return Expr::Subquery(stmt)
+    else:
+      advance; e = parse_expr(); expect(RParen)
+      return e
+  ...
+```
+
+This means `(SELECT MAX(id) FROM t)` is valid anywhere an expression is valid:
+`SELECT` list, `WHERE`, `HAVING`, `ORDER BY`, even nested inside function calls.
+
+### IN Subquery — `parse_predicate`
+
+`parse_predicate` handles comparison operators and the `IN` / `NOT IN` forms.
+After detecting the `In` or `Not In` tokens, the parser checks whether the next
+token is `LParen` followed by `Select`. If so, it parses a subquery and produces
+`Expr::InSubquery { expr, subquery, negated }`. If not, it falls through to the
+normal `IN (val1, val2, ...)` list form.
+
+```
+parse_predicate():
+  lhs = parse_addition()
+  if peek = Not:
+    advance; expect(In); negated = true
+  else if peek = In:
+    advance; negated = false
+  else: return lhs  // comparison ops handled here too
+
+  expect(LParen)
+  if peek = Select:
+    stmt = parse_select_stmt(); expect(RParen)
+    return Expr::InSubquery { expr: lhs, subquery: stmt, negated }
+  else:
+    values = parse_expr_list(); expect(RParen)
+    return Expr::InList { expr: lhs, values, negated }
+```
+
+### EXISTS / NOT EXISTS — `parse_not`
+
+`parse_not` handles unary `NOT`. When the parser sees `Exists` (or `Not Exists`),
+it consumes the token, expects `LParen`, recursively parses a `select_stmt`, and
+returns `Expr::Exists { subquery, negated }`. The result is always boolean — the
+SELECT list contents are irrelevant at the execution level.
+
+```
+parse_not():
+  if peek = Not:
+    advance
+    if peek = Exists:
+      advance; expect(LParen); stmt = parse_select_stmt(); expect(RParen)
+      return Expr::Exists { subquery: stmt, negated: true }
+    else:
+      return Expr::Not(parse_is_null())
+  if peek = Exists:
+    advance; expect(LParen); stmt = parse_select_stmt(); expect(RParen)
+    return Expr::Exists { subquery: stmt, negated: false }
+  return parse_is_null()
+```
+
+### Derived Tables — `parse_table_ref`
+
+`parse_table_ref` parses the `FROM` clause. When it encounters `LParen` (without
+a prior identifier), it recursively parses a `select_stmt`, expects `RParen`, and
+then requires an `AS alias` clause (the alias is mandatory for derived tables):
+
+```
+parse_table_ref():
+  if peek = LParen:
+    advance; stmt = parse_select_stmt(); expect(RParen)
+    expect(As); alias = parse_ident()
+    return TableRef::Derived { subquery: stmt, alias }
+  else:
+    name = parse_ident(); alias = optional AS ident
+    return TableRef::Named { name, alias }
+```
+
+### AST Nodes for Subqueries
+
+```rust
+pub enum Expr {
+    // A scalar subquery — returns one value (or NULL if no rows)
+    Subquery(Box<SelectStmt>),
+
+    // IN (SELECT ...) or NOT IN (SELECT ...)
+    InSubquery {
+        expr:     Box<Expr>,
+        subquery: Box<SelectStmt>,
+        negated:  bool,
+    },
+
+    // EXISTS (SELECT ...) or NOT EXISTS (SELECT ...)
+    Exists {
+        subquery: Box<SelectStmt>,
+        negated:  bool,
+    },
+
+    // Outer column reference (used inside correlated subqueries)
+    OuterColumn {
+        col_idx: usize,
+        depth:   u32,    // 1 = immediate outer query
+    },
+
+    // ... other variants unchanged
+}
+
+pub enum TableRef {
+    Named   { name: String, alias: Option<String> },
+    Derived { subquery: Box<SelectStmt>, alias: String },
+}
+```
+
+### Correlated Column Resolution — Semantic Analyzer
+
+Correlated subqueries introduce `Expr::OuterColumn` during semantic analysis
+(`analyze()`), not during parsing. The semantic analyzer maintains a stack of
+`BindContext` frames, one per query level. When a column reference inside a
+subquery cannot be resolved against the inner context, the analyzer walks up the
+stack and resolves it against the outer context, replacing the `Expr::Column`
+with `Expr::OuterColumn { col_idx, depth: 1 }`.
+
+This means the parser always produces `Expr::Column` for every column reference;
+`OuterColumn` only appears in the analyzed AST, never in the raw parse output.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Parse-Time vs Analyze-Time Correlation</span>
+Correlation detection is deferred to the semantic analyzer rather than the parser. The parser always emits <code>Expr::Column</code> for every column reference, regardless of nesting depth. This keeps the parser stateless and context-free. The semantic analyzer's <code>BindContext</code> stack then resolves ambiguity with full schema knowledge. This is the same split used by PostgreSQL's parser/analyzer boundary: the parser builds a syntactic tree; the analyzer attaches semantic meaning (column indices, correlated references, type information).
+</div>
+</div>
+
+---
+
 ## Output — The AST
 
 The parser returns a `Stmt` enum. After parsing, all `Expr::Column` nodes have

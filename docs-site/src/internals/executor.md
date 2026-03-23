@@ -260,6 +260,139 @@ After COMMIT:  source = {row1, row2, row3, row4}  ← exactly 2 new rows, not in
 
 ---
 
+## Subquery Execution
+
+Subquery execution is integrated into the expression evaluator via the
+`SubqueryRunner` trait. This design allows the compiler to eliminate all subquery
+dispatch overhead in the non-subquery path at zero runtime cost.
+
+### SubqueryRunner Trait
+
+```rust
+pub trait SubqueryRunner {
+    fn eval_scalar(&mut self, subquery: &SelectStmt) -> Result<Value, DbError>;
+    fn eval_in(&mut self, subquery: &SelectStmt, needle: &Value) -> Result<Value, DbError>;
+    fn eval_exists(&mut self, subquery: &SelectStmt) -> Result<bool, DbError>;
+}
+```
+
+All expression evaluation is dispatched through `eval_with<R: SubqueryRunner>`:
+
+```rust
+pub fn eval_with<R: SubqueryRunner>(
+    expr: &Expr,
+    row: &Row,
+    runner: &mut R,
+) -> Result<Value, DbError>
+```
+
+Two concrete implementations exist:
+
+| Implementation | Purpose |
+|---|---|
+| `NoSubquery` | Used for simple expressions with no subqueries. All three `SubqueryRunner` methods are `unreachable!()`. Monomorphization guarantees they are dead code. |
+| `ExecSubqueryRunner<'a>` | Used when the query contains at least one subquery. Holds mutable references to storage, the transaction manager, and the outer row for correlated access. |
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Generic Trait Monomorphization</span>
+Using <code>SubqueryRunner</code> as a generic trait parameter — rather than a runtime <code>Option&lt;&amp;mut dyn FnMut&gt;</code> or a boolean flag — allows the compiler to generate two separate code paths: <code>eval_with::&lt;NoSubquery&gt;</code> and <code>eval_with::&lt;ExecSubqueryRunner&gt;</code>. In the <code>NoSubquery</code> path, every subquery branch is dead code and is eliminated by LLVM. A runtime option would add a pointer-width check plus a potential indirect call on every expression node evaluation, even for the 99% of expressions that have no subqueries.
+</div>
+</div>
+
+### Scalar Subquery Evaluation
+
+`ExecSubqueryRunner::eval_scalar` executes the inner `SelectStmt` fully using
+the existing `execute_select` path, then inspects the result:
+
+```
+eval_scalar(subquery):
+  result = execute_select(subquery, storage, txn)
+  match result.rows.len():
+    0     → Value::Null
+    1     → result.rows[0][0]   // single column, single row
+    n > 1 → Err(CardinalityViolation { returned: n })
+```
+
+The inner SELECT is always run with a fresh output context. It inherits the outer
+transaction snapshot so it sees the same consistent view as the outer query.
+
+### IN Subquery Evaluation
+
+`eval_in` materializes the subquery result into a `HashSet<Value>`, then applies
+three-valued logic:
+
+```
+eval_in(subquery, needle):
+  rows = execute_select(subquery)
+  values: HashSet<Value> = rows.map(|r| r[0]).collect()
+
+  if values.contains(needle):
+    return Value::Bool(true)
+  if values.contains(Value::Null):
+    return Value::Null       // unknown — could match
+  return Value::Bool(false)
+```
+
+For `NOT IN`, the calling code wraps the result: `TRUE → FALSE`, `FALSE → TRUE`,
+`NULL → NULL` (NULL propagates unchanged).
+
+### EXISTS Evaluation
+
+`eval_exists` executes the subquery and checks whether the result set is non-empty.
+No rows are materialized beyond the first:
+
+```
+eval_exists(subquery):
+  rows = execute_select(subquery)
+  return !rows.is_empty()   // always bool, never null
+```
+
+### Correlated Subqueries — `substitute_outer`
+
+Before executing a correlated subquery, `ExecSubqueryRunner` walks the subquery
+AST and replaces every `Expr::OuterColumn { col_idx, depth: 1 }` with a concrete
+`Expr::Literal(value)` from the current outer row. This operation is called
+`substitute_outer`:
+
+```
+substitute_outer(expr_tree, outer_row):
+  for each node in expr_tree:
+    if node = OuterColumn { col_idx, depth: 1 }:
+      replace with Literal(outer_row[col_idx])
+    if node = OuterColumn { col_idx, depth: d > 1 }:
+      decrement depth by 1  // pass through for deeper nesting
+```
+
+After substitution, the subquery is a fully self-contained statement with no
+outer references, and it is executed by the standard `execute_select` path.
+
+Re-execution happens once per outer row: for a correlated `EXISTS` in a query
+that produces 10,000 outer rows, the inner query is executed 10,000 times.
+For large datasets, rewriting as a JOIN is recommended.
+
+### Derived Table Execution
+
+A derived table (`FROM (SELECT ...) AS alias`) is materialized once at the
+start of query execution, before any scan or filter of the outer query begins:
+
+```
+execute_select(stmt):
+  for each TableRef::Derived { subquery, alias } in stmt.from:
+    materialized[alias] = execute_select(subquery)   // fully materialized in memory
+  // outer query scans materialized[alias] as if it were a base table
+```
+
+The materialized result is an in-memory `Vec<Row>` wrapped in a
+`MaterializedTable`. The outer query uses the derived table's output schema
+(column names from the inner SELECT list) for column resolution.
+
+Derived tables are not correlated — they cannot reference columns from the outer
+query. Lateral joins (which allow correlation in `FROM`) are not yet supported.
+
+---
+
 ## Performance Characteristics
 
 | Operation | Time complexity | Notes |
