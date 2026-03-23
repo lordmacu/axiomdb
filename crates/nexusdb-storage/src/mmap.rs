@@ -14,7 +14,7 @@ use crate::{
     page::{Page, PageType, HEADER_SIZE, PAGE_SIZE},
 };
 
-// ── Constantes ────────────────────────────────────────────────────────────────
+// ── Constants ─────────────────────────────────────────────────────────────────
 
 const DB_FILE_MAGIC: u64 = 0x4E455855_53444201; // "NEXUSDB\1"
 const DB_VERSION: u32 = 1;
@@ -94,8 +94,9 @@ impl MmapStorage {
         // Acquire an exclusive lock before any write. If another process opened
         // the same file (rare with create_new, but possible in a race), fail
         // immediately instead of corrupting.
-        file.try_lock_exclusive()
-            .map_err(|_| DbError::FileLocked { path: path.to_owned() })?;
+        file.try_lock_exclusive().map_err(|_| DbError::FileLocked {
+            path: path.to_owned(),
+        })?;
 
         info!(path = %path.display(), pages = GROW_PAGES, "creating database");
 
@@ -132,8 +133,9 @@ impl MmapStorage {
         // Acquire an exclusive lock (non-blocking). If another process already
         // holds the file open, return an error immediately instead of blocking
         // or causing corruption.
-        file.try_lock_exclusive()
-            .map_err(|_| DbError::FileLocked { path: path.to_owned() })?;
+        file.try_lock_exclusive().map_err(|_| DbError::FileLocked {
+            path: path.to_owned(),
+        })?;
 
         info!(path = %path.display(), "opening database");
 
@@ -167,7 +169,10 @@ impl MmapStorage {
         };
 
         info!(path = %path.display(), page_count, "database opened");
-        debug!(free_pages = freelist.free_count(), "freelist loaded from disk");
+        debug!(
+            free_pages = freelist.free_count(),
+            "freelist loaded from disk"
+        );
 
         Ok(MmapStorage {
             mmap,
@@ -264,14 +269,19 @@ impl MmapStorage {
     /// or is a compile-time constant), so the conversion cannot fail.
     #[inline]
     fn read_u64_at(mmap: &[u8], offset: usize) -> u64 {
-        // SAFETY of try_into: the slice has exactly 8 bytes because
-        // `offset + 8 <= mmap.len()` is guaranteed by the invariant that the
-        // mmap has at least PAGE_SIZE bytes and PAGE_COUNT_OFFSET + 8 < PAGE_SIZE.
-        u64::from_le_bytes(
-            mmap[offset..offset + 8]
-                .try_into()
-                .expect("8-byte slice for u64 — guaranteed by mmap invariant"),
-        )
+        // Direct array construction avoids try_into() entirely.
+        // Bounds are guaranteed by the caller: offset + 8 <= mmap.len()
+        // (mmap has at least PAGE_SIZE bytes, PAGE_COUNT_OFFSET + 8 < PAGE_SIZE).
+        u64::from_le_bytes([
+            mmap[offset],
+            mmap[offset + 1],
+            mmap[offset + 2],
+            mmap[offset + 3],
+            mmap[offset + 4],
+            mmap[offset + 5],
+            mmap[offset + 6],
+            mmap[offset + 7],
+        ])
     }
 
     /// Updates page_count and the CRC32c of the meta page directly in the mmap.
@@ -305,7 +315,7 @@ impl StorageEngine for MmapStorage {
     }
 
     fn alloc_page(&mut self, page_type: PageType) -> Result<u64, DbError> {
-        // Intentar asignar desde la freelist actual.
+        // Try to allocate from the current freelist.
         if let Some(page_id) = self.freelist.alloc() {
             let new_page = Page::new(page_type, page_id);
             let offset = page_id as usize * PAGE_SIZE;
@@ -314,8 +324,8 @@ impl StorageEngine for MmapStorage {
             return Ok(page_id);
         }
 
-        // Freelist agotada: crecer el storage.
-        // grow() persiste freelist internamente porque cambia el page_count.
+        // Freelist exhausted: grow the storage.
+        // grow() persists the freelist internally because it changes page_count.
         let first_new = self.grow(GROW_PAGES)?;
         let page_id = self.freelist.alloc().ok_or(DbError::StorageFull)?;
         debug_assert_eq!(page_id, first_new);
@@ -403,7 +413,7 @@ mod tests {
         let path = tmp_path();
         {
             let _storage = MmapStorage::create(&path).unwrap();
-            // _storage tiene el lock
+            // _storage holds the lock
         }
         // Drop released the lock; reopening must succeed.
         let storage = MmapStorage::open(&path).unwrap();
