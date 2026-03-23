@@ -12,8 +12,13 @@ thiserror     = { workspace = true }
 logos         = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
+criterion  = { workspace = true }
+sqlparser  = "0.53"         # reference parser: DataFusion, Delta Lake, Ballista
 
 [[bench]]
 name    = "sql_components"
+harness = false
+
+[[bench]]
+name    = "parser_comparison"
 harness = false
