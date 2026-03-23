@@ -30,14 +30,16 @@ pub struct Span {
 }
 
 /// A SQL token paired with its source position.
+///
+/// The lifetime `'src` is tied to the input string passed to [`tokenize`].
 #[derive(Debug, Clone, PartialEq)]
-pub struct SpannedToken {
-    pub token: Token,
+pub struct SpannedToken<'src> {
+    pub token: Token<'src>,
     pub span: Span,
 }
 
-impl SpannedToken {
-    fn new(token: Token, start: usize, end: usize) -> Self {
+impl<'src> SpannedToken<'src> {
+    fn new(token: Token<'src>, start: usize, end: usize) -> Self {
         Self {
             token,
             span: Span { start, end },
@@ -49,6 +51,12 @@ impl SpannedToken {
 
 /// A SQL token produced by the lexer.
 ///
+/// ## Zero-copy identifiers
+///
+/// `Ident`, `QuotedIdent`, and `DqIdent` hold `&'src str` slices directly
+/// into the input string — no heap allocation. Only `StringLit` allocates
+/// a `String` because escape sequences transform the content in place.
+///
 /// Keywords are case-insensitive: `SELECT`, `select`, and `Select` all
 /// produce [`Token::Select`].
 #[derive(Logos, Debug, Clone, PartialEq)]
@@ -56,7 +64,7 @@ impl SpannedToken {
 #[logos(skip r"--[^\n]*")] // line comment (--)
 #[logos(skip r"#[^\n]*")] // MySQL line comment (#)
 #[logos(skip r"/\*([^*]|\*[^/])*\*/")] // block comment /* */
-pub enum Token {
+pub enum Token<'src> {
     // ── DML keywords ─────────────────────────────────────────────────────────
     #[token("SELECT", ignore(ascii_case))]
     Select,
@@ -320,25 +328,26 @@ pub enum Token {
 
     // ── Identifiers ───────────────────────────────────────────────────────────
     /// Unquoted identifier: does not match any keyword.
+    /// Zero-copy: holds a `&'src str` slice directly into the input.
     /// logos keyword tokens have higher priority than this regex.
-    #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
-    Ident(String),
+    #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice())]
+    Ident(&'src str),
 
     /// Backtick-quoted identifier (MySQL): `` `any content` ``.
-    /// Backticks are stripped from the returned string.
+    /// Zero-copy: returns a slice of the input with backticks stripped.
     #[regex(r"`[^`]*`", |lex| {
         let s = lex.slice();
-        s[1..s.len()-1].to_string()
+        &s[1..s.len() - 1]
     })]
-    QuotedIdent(String),
+    QuotedIdent(&'src str),
 
     /// Double-quote-quoted identifier (SQL standard): `"any content"`.
-    /// Quotes are stripped from the returned string.
+    /// Zero-copy: returns a slice of the input with quotes stripped.
     #[regex(r#""[^"]*""#, |lex| {
         let s = lex.slice();
-        s[1..s.len()-1].to_string()
+        &s[1..s.len() - 1]
     })]
-    DqIdent(String),
+    DqIdent(&'src str),
 
     // ── Operators ─────────────────────────────────────────────────────────────
     #[token("=")]
@@ -452,7 +461,10 @@ pub(crate) fn process_string_literal(raw: &str) -> Option<String> {
 /// - Unrecognized characters (`@`, `$`, `^`, …)
 /// - Unterminated string literals
 /// - Integer literals that overflow `i64`
-pub fn tokenize(input: &str, max_bytes: Option<usize>) -> Result<Vec<SpannedToken>, DbError> {
+pub fn tokenize<'src>(
+    input: &'src str,
+    max_bytes: Option<usize>,
+) -> Result<Vec<SpannedToken<'src>>, DbError> {
     // 4.2b: reject oversized queries before scanning.
     if let Some(max) = max_bytes {
         if input.len() > max {
@@ -466,7 +478,7 @@ pub fn tokenize(input: &str, max_bytes: Option<usize>) -> Result<Vec<SpannedToke
         }
     }
 
-    let mut tokens: Vec<SpannedToken> = Vec::new();
+    let mut tokens: Vec<SpannedToken<'src>> = Vec::new();
     let mut lex = Token::lexer(input);
 
     while let Some(result) = lex.next() {
@@ -535,7 +547,7 @@ mod tests {
     fn test_identifier_not_keyword() {
         assert!(matches!(
             &tok("my_table")[0],
-            Token::Ident(s) if s == "my_table"
+            Token::Ident(s) if *s == "my_table"
         ));
     }
 
@@ -543,7 +555,7 @@ mod tests {
     fn test_identifier_starts_with_underscore() {
         assert!(matches!(
             &tok("_col")[0],
-            Token::Ident(s) if s == "_col"
+            Token::Ident(s) if *s == "_col"
         ));
     }
 

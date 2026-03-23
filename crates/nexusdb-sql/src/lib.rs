@@ -23,4 +23,5 @@ pub use ast::{
 pub use eval::{eval, is_truthy};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lexer::{tokenize, Span, SpannedToken, Token};
+// Note: Token<'src> and SpannedToken<'src> carry a lifetime tied to the input string.
 pub use parser::parse;

@@ -2,16 +2,16 @@ use nexusdb_core::error::DbError;
 
 use crate::page::{Page, PageType};
 
-/// Interfaz unificada del motor de almacenamiento.
+/// Unified storage engine interface.
 ///
-/// Implementaciones: [`MmapStorage`] (disco, mmap) y [`MemoryStorage`] (RAM, tests).
+/// Implementations: [`MmapStorage`] (disk, mmap) and [`MemoryStorage`] (RAM, tests).
 ///
-/// ## Lifetimes y borrow checker
-/// `read_page` retorna `&Page` ligada a `&self` — mientras esa referencia exista,
-/// no es posible llamar métodos `&mut self`. Este invariante es correcto: previene
-/// modificaciones mientras se lee, sin necesitar locks.
+/// ## Lifetimes and borrow checker
+/// `read_page` returns `&Page` tied to `&self` — while that reference exists,
+/// `&mut self` methods cannot be called. This invariant is correct: it prevents
+/// modifications while reading, without needing locks.
 ///
-/// ## Uso con trait objects
+/// ## Usage with trait objects
 /// ```rust,ignore
 /// fn do_something(engine: &mut dyn StorageEngine) { ... }
 /// let engine: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
@@ -20,24 +20,24 @@ use crate::page::{Page, PageType};
 /// [`MmapStorage`]: crate::MmapStorage
 /// [`MemoryStorage`]: crate::MemoryStorage
 pub trait StorageEngine: Send {
-    /// Retorna una referencia zero-copy a la página `page_id`.
-    /// Verifica el checksum antes de retornar.
+    /// Returns a zero-copy reference to page `page_id`.
+    /// Verifies the checksum before returning.
     fn read_page(&self, page_id: u64) -> Result<&Page, DbError>;
 
-    /// Escribe `page` en `page_id`. La página debe tener checksum válido.
+    /// Writes `page` to `page_id`. The page must have a valid checksum.
     fn write_page(&mut self, page_id: u64, page: &Page) -> Result<(), DbError>;
 
-    /// Reserva una nueva página del tipo indicado. Crece el storage si es necesario.
+    /// Allocates a new page of the given type. Grows the storage if necessary.
     fn alloc_page(&mut self, page_type: PageType) -> Result<u64, DbError>;
 
-    /// Devuelve `page_id` al pool de páginas libres.
-    /// Retorna error en double-free o page_id inválido.
+    /// Returns `page_id` to the free page pool.
+    /// Returns an error on double-free or invalid page_id.
     fn free_page(&mut self, page_id: u64) -> Result<(), DbError>;
 
-    /// Sincroniza con almacenamiento durable. No-op en MemoryStorage.
+    /// Syncs to durable storage. No-op in MemoryStorage.
     fn flush(&mut self) -> Result<(), DbError>;
 
-    /// Capacidad actual (páginas totales en el storage).
+    /// Current capacity (total pages in storage).
     fn page_count(&self) -> u64;
 }
 
@@ -48,10 +48,10 @@ pub mod tests {
     use super::*;
     use crate::page::PageType;
 
-    /// Suite de tests genérica para cualquier implementación de StorageEngine.
-    /// Llamar desde los tests específicos de cada implementación.
+    /// Generic test suite for any StorageEngine implementation.
+    /// Call from the implementation-specific tests.
     pub fn run_storage_engine_suite(engine: &mut dyn StorageEngine) {
-        // alloc retorna page_ids únicos.
+        // alloc returns unique page_ids.
         let id1 = engine.alloc_page(PageType::Data).unwrap();
         let id2 = engine.alloc_page(PageType::Data).unwrap();
         let id3 = engine.alloc_page(PageType::Index).unwrap();
@@ -68,21 +68,21 @@ pub mod tests {
         assert_eq!(read.body()[0], 0xAB);
         assert_eq!(read.body()[1], 0xCD);
 
-        // free + realloc reutiliza el page_id.
+        // free + realloc reuses the page_id.
         engine.free_page(id1).unwrap();
         let id_reused = engine.alloc_page(PageType::Data).unwrap();
         assert_eq!(id_reused, id1);
 
-        // double-free: liberar id1 sin haberlo asignado de nuevo → error.
-        // id1 está USADO (lo acabamos de re-asignar), así que liberarlo una vez
-        // es correcto; liberarlo dos veces seguidas sí es double-free.
-        engine.free_page(id1).unwrap(); // primera liberación — válida
-        assert!(engine.free_page(id1).is_err()); // segunda — double-free
+        // double-free: freeing id1 without re-allocating it → error.
+        // id1 is USED (we just re-allocated it), so freeing it once
+        // is correct; freeing it twice in a row is a double-free.
+        engine.free_page(id1).unwrap(); // first free — valid
+        assert!(engine.free_page(id1).is_err()); // second — double-free
 
-        // read en página inexistente es error.
+        // read on non-existent page is an error.
         assert!(engine.read_page(999_999).is_err());
 
-        // flush no falla.
+        // flush does not fail.
         engine.flush().unwrap();
     }
 }

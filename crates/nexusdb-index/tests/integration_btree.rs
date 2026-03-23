@@ -1,6 +1,6 @@
-//! Tests de integración del B+ Tree.
+//! Integration tests for the B+ Tree.
 //!
-//! Cubren correctness end-to-end, crash recovery con MmapStorage, y concurrencia.
+//! Cover end-to-end correctness, crash recovery with MmapStorage, and concurrency.
 
 use std::ops::Bound;
 
@@ -36,17 +36,17 @@ fn test_btree_10k_sequential_inserts_lookup_all() {
     for i in 0..count {
         let key = format!("{:08}", i);
         let result = tree.lookup(key.as_bytes()).unwrap();
-        assert_eq!(result, Some(rid(i as u64)), "falla en key {key}");
+        assert_eq!(result, Some(rid(i as u64)), "lookup failed for key {key}");
     }
 }
 
 #[test]
 fn test_btree_10k_random_inserts_lookup_all() {
-    // Insertar en orden pseudoaleatorio (no secuencial)
+    // Insert in pseudorandom order (non-sequential)
     let mut tree = BTree::new(Box::new(MemoryStorage::new()), None).unwrap();
     let count = 10_000usize;
 
-    // Permutación simple: insert por saltos de 7 (coprimo con count)
+    // Simple permutation: insert with steps of 7 (coprime with count)
     let step = 7;
     let mut i = 0usize;
     let mut inserted = 0;
@@ -68,7 +68,7 @@ fn test_btree_range_scan_correctness() {
     let count = 500;
     let tree = build_memory_tree(count);
 
-    // Rango [100..=200]: 101 elementos
+    // Range [100..=200]: 101 elements
     let from = format!("{:08}", 100);
     let to = format!("{:08}", 200);
     let results: Vec<_> = tree
@@ -83,11 +83,11 @@ fn test_btree_range_scan_correctness() {
     assert_eq!(
         results.len(),
         101,
-        "esperado 101 resultados, obtenido {}",
+        "expected 101 results, got {}",
         results.len()
     );
 
-    // Verificar orden y valores
+    // Verify order and values
     for (idx, (key, rec_id)) in results.iter().enumerate() {
         let expected_i = 100 + idx;
         let expected_key = format!("{:08}", expected_i);
@@ -101,23 +101,23 @@ fn test_btree_delete_half_then_lookup() {
     let count = 1000;
     let mut tree = build_memory_tree(count);
 
-    // Eliminar pares
+    // Delete even-indexed keys
     for i in (0..count).step_by(2) {
         let key = format!("{:08}", i);
         assert!(
             tree.delete(key.as_bytes()).unwrap(),
-            "delete debería retornar true para {key}"
+            "delete should return true for {key}"
         );
     }
 
-    // Verificar impares existen y pares no
+    // Verify odd keys exist and even keys do not
     for i in 0..count {
         let key = format!("{:08}", i);
         let result = tree.lookup(key.as_bytes()).unwrap();
         if i % 2 == 0 {
-            assert_eq!(result, None, "key {key} debería haber sido eliminada");
+            assert_eq!(result, None, "key {key} should have been deleted");
         } else {
-            assert_eq!(result, Some(rid(i as u64)), "key {key} debería existir");
+            assert_eq!(result, Some(rid(i as u64)), "key {key} should exist");
         }
     }
 }
@@ -126,7 +126,7 @@ fn test_btree_delete_half_then_lookup() {
 fn test_btree_range_after_delete() {
     let mut tree = build_memory_tree(100);
 
-    // Eliminar todos los múltiplos de 10
+    // Delete all multiples of 10
     for i in (0..100usize).step_by(10) {
         let key = format!("{:08}", i);
         tree.delete(key.as_bytes()).unwrap();
@@ -138,10 +138,10 @@ fn test_btree_range_after_delete() {
         .map(|r| r.unwrap())
         .collect();
 
-    // Deben quedar 90 elementos
+    // 90 elements should remain
     assert_eq!(results.len(), 90);
 
-    // Verificar orden
+    // Verify order
     for i in 0..results.len() - 1 {
         assert!(results[i].0 < results[i + 1].0);
     }
@@ -154,7 +154,7 @@ fn test_btree_crash_recovery() {
 
     let root_pid;
 
-    // Fase 1: escribir datos
+    // Phase 1: write data
     {
         let storage = MmapStorage::create(&db_path).unwrap();
         let mut tree = BTree::new(Box::new(storage), None).unwrap();
@@ -164,20 +164,20 @@ fn test_btree_crash_recovery() {
             let key = format!("{:08}", i);
             tree.insert(key.as_bytes(), rid(i)).unwrap();
         }
-        // El flush ocurre implícitamente al drop de MmapStorage (en Fase 1 storage)
-        // Aquí guardamos el root_pid para reabrirlo
-        let _ = root_pid; // se guarda implícito
+        // Flush happens implicitly on MmapStorage drop (Phase 1 storage)
+        // Save root_pid here for reopening
+        let _ = root_pid; // saved implicitly
     }
 
-    // Fase 2: reabrir y verificar
-    // Nota: en Fase 2 no hay catálogo — usamos root_pid hardcodeado para el test
-    // En producción el catálogo guardaría el root_pid
-    // Para este test, simplemente verificamos que la storage persistió datos
+    // Phase 2: reopen and verify
+    // Note: in Phase 2 there is no catalog — we use a hardcoded root_pid for the test
+    // In production the catalog would store the root_pid
+    // For this test, we simply verify that the storage persisted data
     {
         let storage = MmapStorage::open(&db_path).unwrap();
-        // Verificar que la página raíz es legible
-        let page = storage.read_page(2).unwrap(); // página 2 = primera allocada tras meta+freelist
-        assert!(page.header().page_id >= 2, "página debe tener id válido");
+        // Verify that the root page is readable
+        let page = storage.read_page(2).unwrap(); // page 2 = first allocated after meta+freelist
+        assert!(page.header().page_id >= 2, "page must have a valid id");
     }
 }
 
@@ -185,7 +185,7 @@ fn test_btree_crash_recovery() {
 fn test_btree_insert_delete_interleaved() {
     let mut tree = BTree::new(Box::new(MemoryStorage::new()), None).unwrap();
 
-    // Intercalar inserts y deletes
+    // Interleave inserts and deletes
     for i in 0..500u64 {
         let key = format!("{:08}", i);
         tree.insert(key.as_bytes(), rid(i)).unwrap();
@@ -195,22 +195,22 @@ fn test_btree_insert_delete_interleaved() {
         }
     }
 
-    // Al final, solo deben existir [400..=499]
+    // At the end, only [400..=499] should exist
     for i in 0u64..500 {
         let key = format!("{:08}", i);
         let result = tree.lookup(key.as_bytes()).unwrap();
         if i < 400 {
-            assert_eq!(result, None, "key {key} debería haber sido eliminada");
+            assert_eq!(result, None, "key {key} should have been deleted");
         } else {
-            assert_eq!(result, Some(rid(i)), "key {key} debería existir");
+            assert_eq!(result, Some(rid(i)), "key {key} should exist");
         }
     }
 }
 
-/// Verifica las garantías de CoW + CAS del root:
-/// - El root_pid cambia atómicamente cuando hay splits.
-/// - Después de cada cambio de root, todos los datos son accesibles.
-/// - El root evoluciona de forma monotónica (nunca regresa a un pid anterior).
+/// Verifies CoW + CAS guarantees on the root:
+/// - root_pid changes atomically when splits occur.
+/// - After each root change, all data remains accessible.
+/// - The root evolves monotonically (never reverts to a previous pid).
 #[test]
 fn test_cow_atomic_root_consistency() {
     let mut tree = BTree::new(Box::new(MemoryStorage::new()), None).unwrap();
@@ -218,7 +218,7 @@ fn test_cow_atomic_root_consistency() {
     let mut root_changes = 0usize;
     let mut last_root = initial_root;
 
-    // Insertar suficientes keys para forzar múltiples splits y cambios de root
+    // Insert enough keys to force multiple splits and root changes
     let count = nexusdb_index::page_layout::ORDER_LEAF * 3 + 50;
     for i in 0..count {
         let key = format!("{:08}", i);
@@ -227,13 +227,13 @@ fn test_cow_atomic_root_consistency() {
         let current_root = tree.root_page_id();
         if current_root != last_root {
             root_changes += 1;
-            // Invariante CoW: cada cambio de root debe dejar TODOS los datos accesibles
+            // CoW invariant: every root change must leave ALL data accessible
             for j in 0..=i {
                 let k = format!("{:08}", j);
                 assert_eq!(
                     tree.lookup(k.as_bytes()).unwrap(),
                     Some(rid(j as u64)),
-                    "key {:08} inaccesible tras cambio de root (insert {})",
+                    "key {:08} inaccessible after root change (insert {})",
                     j,
                     i
                 );
@@ -244,7 +244,7 @@ fn test_cow_atomic_root_consistency() {
 
     assert!(
         root_changes > 0,
-        "el root debería haber cambiado al menos una vez con {} inserts",
+        "root should have changed at least once with {} inserts",
         count
     );
 }
@@ -254,7 +254,7 @@ fn test_btree_root_page_id_persists() {
     let mut tree = BTree::new(Box::new(MemoryStorage::new()), None).unwrap();
     let initial_root = tree.root_page_id();
 
-    // Forzar un split para que cambie el root
+    // Force a split to change the root
     let count = nexusdb_index::page_layout::ORDER_LEAF * 2 + 10;
     for i in 0..count {
         let key = format!("{:08}", i);
@@ -262,14 +262,14 @@ fn test_btree_root_page_id_persists() {
     }
 
     let new_root = tree.root_page_id();
-    // Después de splits, el root cambia
+    // After splits, the root changes
     assert_ne!(
         initial_root, new_root,
-        "el root debería haber cambiado tras splits"
+        "root should have changed after splits"
     );
 
-    // Reabrir con el nuevo root y verificar
-    // (simulado: verificamos que lookup funciona con el root actual)
+    // Reopen with the new root and verify
+    // (simulated: we verify that lookup works with the current root)
     for i in 0..count {
         let key = format!("{:08}", i);
         assert_eq!(tree.lookup(key.as_bytes()).unwrap(), Some(rid(i as u64)));

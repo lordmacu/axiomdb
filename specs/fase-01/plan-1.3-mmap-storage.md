@@ -1,21 +1,21 @@
 # Plan: 1.3 — MmapStorage
 
-## Archivos a crear/modificar
+## Files to create/modify
 - `crates/nexusdb-storage/src/mmap.rs` — MmapStorage + DbFileMeta
 - `crates/nexusdb-storage/src/lib.rs` — pub mod mmap
-- `crates/nexusdb-storage/Cargo.toml` — agregar memmap2
+- `crates/nexusdb-storage/Cargo.toml` — add memmap2
 
-## Dependencia
+## Dependency
 ```toml
 memmap2 = "0.9"
 ```
 
-## Estructuras
+## Structures
 
 ```rust
 const DB_FILE_MAGIC: u64 = 0x4E455855_53444201; // "NEXUSDB\1"
 const DB_VERSION: u32    = 1;
-const GROW_PAGES: u64    = 64; // 1MB por chunk
+const GROW_PAGES: u64    = 64; // 1MB per chunk
 
 #[repr(C)]
 struct DbFileMeta {
@@ -32,49 +32,49 @@ pub struct MmapStorage {
 }
 ```
 
-## Fases de implementación
+## Implementation phases
 
-1. Agregar `memmap2` a Cargo.toml
-2. Definir `DbFileMeta` con const assert `size_of == PAGE_SIZE - HEADER_SIZE`
-3. Implementar `MmapStorage::create(path)`
-   - Crear archivo, truncar a `GROW_PAGES * PAGE_SIZE`
-   - Mmap el archivo
-   - Escribir página 0: `Page::new(Meta, 0)` + DbFileMeta en body
+1. Add `memmap2` to Cargo.toml
+2. Define `DbFileMeta` with const assert `size_of == PAGE_SIZE - HEADER_SIZE`
+3. Implement `MmapStorage::create(path)`
+   - Create file, truncate to `GROW_PAGES * PAGE_SIZE`
+   - Mmap the file
+   - Write page 0: `Page::new(Meta, 0)` + DbFileMeta in body
    - flush
-4. Implementar `MmapStorage::open(path)`
-   - Abrir archivo existente en modo read-write
+4. Implement `MmapStorage::open(path)`
+   - Open existing file in read-write mode
    - Mmap
-   - Verificar página 0: magic + checksum
-5. Implementar `read_page(page_id) -> Result<&Page>`
-   - Bounds check vs page_count de la meta
-   - Cast ptr a &Page (SAFETY documented)
+   - Verify page 0: magic + checksum
+5. Implement `read_page(page_id) -> Result<&Page>`
+   - Bounds check vs page_count from meta
+   - Cast ptr to &Page (SAFETY documented)
    - verify_checksum
-6. Implementar `write_page(page_id, &Page)`
+6. Implement `write_page(page_id, &Page)`
    - Bounds check
-   - copy_from_slice bytes al offset correcto del mmap
-7. Implementar `flush()` → `mmap.flush()`
-8. Implementar `page_count()` → leer de meta
-9. Método privado `meta(&self) -> &DbFileMeta`
+   - copy_from_slice bytes to the correct mmap offset
+7. Implement `flush()` → `mmap.flush()`
+8. Implement `page_count()` → read from meta
+9. Private method `meta(&self) -> &DbFileMeta`
 10. Tests
 
-## SAFETY para read_page
+## SAFETY for read_page
 ```
-// SAFETY: offset = page_id * PAGE_SIZE está dentro de self.mmap (verificado por
-// bounds check). El mmap está alineado a OS page (≥4KB, múltiplo de 64).
-// PAGE_SIZE=16384 es múltiplo de 64, por lo que cada página está align(64).
-// Page es repr(C, align(64)). No existen aliases mutables simultáneos porque
-// write_page toma &mut self.
+// SAFETY: offset = page_id * PAGE_SIZE is within self.mmap (verified by
+// bounds check). The mmap is aligned to OS page (≥4KB, multiple of 64).
+// PAGE_SIZE=16384 is a multiple of 64, so each page is align(64).
+// Page is repr(C, align(64)). No simultaneous mutable aliases exist because
+// write_page takes &mut self.
 let page = unsafe { &*(ptr as *const Page) };
 ```
 
 ## Tests
-- `test_create_and_open` — create + drop + open → meta válida
-- `test_read_write_roundtrip` — write página 5 → read → datos idénticos
+- `test_create_and_open` — create + drop + open → valid meta
+- `test_read_write_roundtrip` — write page 5 → read → identical data
 - `test_out_of_bounds_read` — page_id >= page_count → PageNotFound
-- `test_flush_and_reopen` — write + flush + drop + open + read → datos persistidos
-- `test_checksum_corruption_detected` — corromper byte en disco → read_page Err
+- `test_flush_and_reopen` — write + flush + drop + open + read → data persisted
+- `test_checksum_corruption_detected` — corrupt byte on disk → read_page Err
 
-## Antipatrones a evitar
-- NO hacer MmapMut::map_anon — necesitamos un archivo real
-- NO truncar el archivo después del mmap sin re-mapear
-- NO calcular page_count desde file size en tiempo de lectura — usar la meta page
+## Antipatterns to avoid
+- DO NOT use MmapMut::map_anon — we need a real file
+- DO NOT truncate the file after mmap without re-mapping
+- DO NOT compute page_count from file size at read time — use the meta page

@@ -1,25 +1,25 @@
-# /fuzz — Testing con entradas aleatorias
+# /fuzz — Testing with random inputs
 
-Crítico para el parser SQL (entradas malformadas) y el storage (páginas corruptas).
+Critical for the SQL parser (malformed inputs) and storage (corrupt pages).
 
-## Setup inicial (una vez)
+## Initial setup (once)
 
 ```bash
-# Instalar cargo-fuzz
+# Install cargo-fuzz
 cargo install cargo-fuzz
 
-# Crear targets de fuzz
+# Create fuzz targets
 cd /Users/cristian/dbyo
-cargo fuzz init   # si es la primera vez
+cargo fuzz init   # if first time
 
-# Targets para dbyo
-cargo fuzz add fuzz_sql_parser      # parsear SQL aleatorio
-cargo fuzz add fuzz_storage_pages   # páginas con bytes corruptos
-cargo fuzz add fuzz_wal_recovery    # WAL truncado o corrupto
-cargo fuzz add fuzz_btree_ops       # operaciones en el B+ Tree
+# Targets for dbyo
+cargo fuzz add fuzz_sql_parser      # parse random SQL
+cargo fuzz add fuzz_storage_pages   # pages with corrupt bytes
+cargo fuzz add fuzz_wal_recovery    # truncated or corrupt WAL
+cargo fuzz add fuzz_btree_ops       # operations on the B+ Tree
 ```
 
-## Implementar cada target
+## Implement each target
 
 ```rust
 // fuzz/fuzz_targets/fuzz_sql_parser.rs
@@ -28,8 +28,8 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(sql) = std::str::from_utf8(data) {
-        // El parser NUNCA debe paniquear con entrada arbitraria
-        // Solo puede retornar Ok o Err — nunca panic/crash
+        // The parser must NEVER panic with arbitrary input
+        // It can only return Ok or Err — never panic/crash
         let _ = dbyo_sql::Parser::new().parse(sql);
     }
 });
@@ -40,52 +40,52 @@ fuzz_target!(|data: &[u8]| {
     let mut page_bytes = [0u8; 8192];
     page_bytes.copy_from_slice(&data[..8192]);
 
-    // El storage NUNCA debe paniquear leyendo página corrupta
+    // The storage must NEVER panic reading a corrupt page
     let _ = dbyo_storage::Page::from_bytes(&page_bytes);
 });
 ```
 
-## Correr fuzz tests
+## Run fuzz tests
 
 ```bash
-# Correr un target (Ctrl+C para parar)
+# Run a target (Ctrl+C to stop)
 cargo fuzz run fuzz_sql_parser
 
-# Con timeout
-cargo fuzz run fuzz_sql_parser -- -max_total_time=300   # 5 minutos
+# With timeout
+cargo fuzz run fuzz_sql_parser -- -max_total_time=300   # 5 minutes
 
-# Ver cobertura de código
+# View code coverage
 cargo fuzz coverage fuzz_sql_parser
 cargo fuzz fmt coverage fuzz_sql_parser
 
-# Ver crashes encontrados
+# View crashes found
 ls fuzz/artifacts/fuzz_sql_parser/
 ```
 
-## Por cada crash encontrado
+## For each crash found
 
 ```bash
-# Reproducir el crash
+# Reproduce the crash
 cargo fuzz run fuzz_sql_parser fuzz/artifacts/fuzz_sql_parser/crash-HASH
 
-# Minimizar el input (encontrar el mínimo que reproduce el crash)
+# Minimize the input (find the minimum that reproduces the crash)
 cargo fuzz tmin fuzz_sql_parser fuzz/artifacts/fuzz_sql_parser/crash-HASH
 ```
 
 ```rust
-// Agregar como test de regresión permanente
+// Add as a permanent regression test
 #[test]
 fn test_fuzz_regression_sql_crash_20260321() {
-    // Input que causó crash en fuzz testing (2026-03-21)
-    // Causa: el parser no manejaba UTF-8 inválido en nombre de tabla
+    // Input that caused a crash in fuzz testing (2026-03-21)
+    // Cause: the parser did not handle invalid UTF-8 in table name
     let input = b"\xff\xfe SELECT * FROM";
     let result = Parser::new().parse(std::str::from_utf8(input).unwrap_or(""));
-    // Debe retornar Err, nunca panic
-    assert!(result.is_err() || result.is_ok()); // no debe llegar aquí si hubo panic
+    // Must return Err, never panic
+    assert!(result.is_err() || result.is_ok()); // must not reach here if there was a panic
 }
 ```
 
-## En CI (automatizar)
+## In CI (automate)
 
 ```yaml
 # .github/workflows/fuzz.yml

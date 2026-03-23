@@ -1,46 +1,46 @@
-# Plan: B+ Tree (Fase 2)
+# Plan: B+ Tree (Phase 2)
 
-## Archivos a crear / modificar
+## Files to create / modify
 
 ```
 crates/nexusdb-index/
-├── Cargo.toml                     — agregar deps: nexusdb-core, nexusdb-storage, bytemuck
+├── Cargo.toml                     — add deps: nexusdb-core, nexusdb-storage, bytemuck
 └── src/
-    ├── lib.rs                     — re-exports públicos
+    ├── lib.rs                     — public re-exports
     ├── page_layout.rs             — InternalNodePage, LeafNodePage, RecordIdOnDisk (bytemuck)
-    ├── node.rs                    — BTreeNode (abstracción en memoria sobre page_layout)
-    ├── tree.rs                    — BTree, operaciones CRUD, CoW
-    ├── iter.rs                    — RangeIter (lazy, linked list de hojas)
+    ├── node.rs                    — BTreeNode (in-memory abstraction over page_layout)
+    ├── tree.rs                    — BTree, CRUD operations, CoW
+    ├── iter.rs                    — RangeIter (lazy, leaf linked list)
     └── prefix.rs                  — CompressedNode, prefix compression
 
 crates/nexusdb-index/tests/
-└── integration_btree.rs           — tests de integración
+└── integration_btree.rs           — integration tests
 
 crates/nexusdb-index/benches/
-└── btree.rs                       — benchmarks Criterion
+└── btree.rs                       — Criterion benchmarks
 
-Cargo.toml (workspace root)        — verificar que nexusdb-index ya está en members[]
+Cargo.toml (workspace root)        — verify that nexusdb-index is already in members[]
 ```
 
 ---
 
-## Constantes de layout (derivadas del spec)
+## Layout constants (derived from spec)
 
 ```rust
 // src/page_layout.rs
 pub const MAX_KEY_LEN: usize = 64;
 pub const ORDER_INTERNAL: usize = 223;
 pub const ORDER_LEAF: usize = 211;
-pub const NULL_PAGE: u64 = u64::MAX;  // sentinel: "no siguiente hoja" / "no child"
+pub const NULL_PAGE: u64 = u64::MAX;  // sentinel: "no next leaf" / "no child"
 
-// Compile-time assertions (en page_layout.rs)
+// Compile-time assertions (in page_layout.rs)
 const _: () = assert!(size_of::<InternalNodePage>() <= PAGE_BODY_SIZE);
 const _: () = assert!(size_of::<LeafNodePage>() <= PAGE_BODY_SIZE);
 ```
 
 ---
 
-## Estructuras de datos en página (page_layout.rs)
+## Page data structures (page_layout.rs)
 
 ```rust
 #[repr(C)]
@@ -51,11 +51,11 @@ pub struct RecordIdOnDisk {
     pub _pad:    u16,    // 2 bytes → total 12 bytes, aligned to 4
 }
 
-// ──── Nodo Interno ────────────────────────────────────────────────────
-// Layout en body de página (16,320 bytes):
+// ──── Internal Node ────────────────────────────────────────────────────
+// Layout in page body (16,320 bytes):
 //   header:    8 B  (is_leaf + _pad + num_keys + _pad)
-//   key_lens: 223 B (1 byte por key: longitud real, 0 = slot vacío)
-//   _align:    1 B  (pad a múltiplo de 8 para children)
+//   key_lens: 223 B (1 byte per key: actual length, 0 = empty slot)
+//   _align:    1 B  (pad to multiple of 8 for children)
 //   children: 1,792 B (224 * u64)
 //   keys:    14,272 B (223 * [u8; 64])
 //   ─────────────────
@@ -74,12 +74,12 @@ pub struct InternalNodePage {
     pub keys:      [[u8; MAX_KEY_LEN]; ORDER_INTERNAL],
 }
 
-// ──── Nodo Hoja ───────────────────────────────────────────────────────
-// Layout en body de página (16,320 bytes):
+// ──── Leaf Node ───────────────────────────────────────────────────────
+// Layout in page body (16,320 bytes):
 //   header:    8 B  (is_leaf + _pad + num_keys + _pad)
-//   next_leaf: 8 B  (u64, NULL_PAGE si es la última hoja)
+//   next_leaf: 8 B  (u64, NULL_PAGE if this is the last leaf)
 //   key_lens: 211 B
-//   _align:    1 B  (pad a múltiplo de 4 para rids)
+//   _align:    1 B  (pad to multiple of 4 for rids)
 //   rids:     2,532 B (211 * 12)
 //   keys:    13,504 B (211 * 64)
 //   ─────────────────
@@ -100,19 +100,19 @@ pub struct LeafNodePage {
 }
 ```
 
-### Acceso zero-copy desde `Page::body()`
+### Zero-copy access from `Page::body()`
 
 ```rust
-// en page_layout.rs — SAFETY comentado
+// in page_layout.rs — SAFETY commented
 pub fn read_internal(page: &Page) -> &InternalNodePage {
-    // SAFETY: InternalNodePage es Pod, alineación 1 (todos u8/u16/u64 packed en repr(C)).
-    // Page::body() tiene PAGE_BODY_SIZE bytes >= size_of::<InternalNodePage>().
-    // El contenido fue escrito como InternalNodePage (verificado por is_leaf == 0).
+    // SAFETY: InternalNodePage is Pod, alignment 1 (all u8/u16/u64 packed in repr(C)).
+    // Page::body() has PAGE_BODY_SIZE bytes >= size_of::<InternalNodePage>().
+    // Content was written as InternalNodePage (verified by is_leaf == 0).
     bytemuck::from_bytes(&page.body()[..size_of::<InternalNodePage>()])
 }
 
 pub fn read_leaf(page: &Page) -> &LeafNodePage {
-    // SAFETY: análogo a read_internal. is_leaf == 1 verificado antes de llamar.
+    // SAFETY: analogous to read_internal. is_leaf == 1 verified before calling.
     bytemuck::from_bytes(&page.body()[..size_of::<LeafNodePage>()])
 }
 
@@ -131,16 +131,16 @@ pub fn write_leaf(page: &mut Page, node: &LeafNodePage) {
 
 ---
 
-## Abstracción en memoria (node.rs)
+## In-memory abstraction (node.rs)
 
 ```rust
-// BTreeNode es la versión en memoria, con Vec para facilitar operaciones
-// Solo se convierte a/desde InternalNodePage/LeafNodePage en I/O
+// BTreeNode is the in-memory version, using Vec to facilitate operations.
+// Only converted to/from InternalNodePage/LeafNodePage on I/O.
 pub enum BTreeNode {
     Internal {
         page_id:  u64,
         num_keys: usize,
-        keys:     Vec<Box<[u8]>>,     // keys[i]: separador entre children[i] y children[i+1]
+        keys:     Vec<Box<[u8]>>,     // keys[i]: separator between children[i] and children[i+1]
         children: Vec<u64>,           // len = num_keys + 1
     },
     Leaf {
@@ -155,19 +155,19 @@ pub enum BTreeNode {
 impl BTreeNode {
     pub fn load(storage: &dyn StorageEngine, page_id: u64) -> Result<Self, DbError>;
     pub fn flush(&self, storage: &mut dyn StorageEngine) -> Result<(), DbError>;
-    pub fn is_full(&self) -> bool;    // num_keys >= ORDER - 1
+    pub fn is_full(&self) -> bool;       // num_keys >= ORDER - 1
     pub fn is_underfull(&self) -> bool;  // num_keys < ORDER / 2
 }
 ```
 
 ---
 
-## BTree principal (tree.rs)
+## Main BTree (tree.rs)
 
 ```rust
 pub struct BTree {
     storage:  Box<dyn StorageEngine>,
-    root_pid: AtomicU64,    // AtomicU64 para CoW root swap
+    root_pid: AtomicU64,    // AtomicU64 for CoW root swap
 }
 
 impl BTree {
@@ -183,7 +183,7 @@ impl BTree {
 }
 ```
 
-### Algoritmo de lookup
+### Lookup algorithm
 
 ```
 fn lookup(key):
@@ -196,43 +196,43 @@ fn lookup(key):
       pid = page.children[upper_bound(page.keys, key)]
 ```
 
-### Algoritmo de insert (CoW)
+### Insert algorithm (CoW)
 
 ```
 fn insert(key, rid):
   path = traverse_to_leaf(key)   // Vec<(page_id, index_in_parent)>
 
-  // Copiar hoja
+  // Copy leaf
   leaf = load(path.last())
   new_leaf_pid = alloc_page(Index)
   new_leaf = leaf.clone_with_insert(key, rid)
 
   if !new_leaf.is_full():
-    // Caso simple: escribir nueva hoja, actualizar padre
+    // Simple case: write new leaf, update parent
     write(new_leaf_pid, new_leaf)
     update_parent_pointer(path, new_leaf_pid)
     CAS(root_pid, old_root, new_root)
     free_old_pages(path)
     return Ok(())
 
-  // Split de hoja
+  // Leaf split
   (left, right, separator) = new_leaf.split()
   left_pid  = alloc_page(Index)
   right_pid = alloc_page(Index)
   write(left_pid, left)
   write(right_pid, right)
 
-  // Propagar split hacia arriba (puede iterar si padre también se llena)
+  // Propagate split upward (may iterate if parent is also full)
   propagate_split(path, separator, left_pid, right_pid)
 
-  // CAS del root
+  // CAS of root
   CAS(root_pid, old_root, new_root)
 
-  // Liberar páginas huérfanas
+  // Free orphaned pages
   free_old_pages(path)
 ```
 
-### Algoritmo de delete (CoW)
+### Delete algorithm (CoW)
 
 ```
 fn delete(key):
@@ -243,13 +243,13 @@ fn delete(key):
 
   new_leaf = leaf.clone_with_delete(key)
 
-  if !new_leaf.is_underfull() || path.len() == 1 (es root):
-    // Caso simple
+  if !new_leaf.is_underfull() || path.len() == 1 (is root):
+    // Simple case
     write(new_leaf_pid, new_leaf)
     CAS(root_pid, ...)
     return Ok(true)
 
-  // Intentar redistribución con hermano
+  // Try redistribution with sibling
   sibling = load_sibling(path)
   if sibling.can_lend():
     redistribute(new_leaf, sibling)
@@ -264,13 +264,13 @@ fn delete(key):
 
 ---
 
-## Iterator lazy (iter.rs)
+## Lazy iterator (iter.rs)
 
 ```rust
 pub struct RangeIter<'a> {
     storage:      &'a dyn StorageEngine,
-    current_pid:  u64,         // página hoja actual
-    slot_idx:     usize,       // posición dentro de la hoja actual
+    current_pid:  u64,         // current leaf page
+    slot_idx:     usize,       // position within the current leaf
     end_bound:    Bound<Box<[u8]>>,
 }
 
@@ -278,10 +278,10 @@ impl Iterator for RangeIter<'_> {
     type Item = Result<(Box<[u8]>, RecordId), DbError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // 1. Si slot_idx >= num_keys de la página actual → leer next_leaf
-        // 2. Verificar bound de fin → retornar None si superamos el límite
-        // 3. Retornar (key.clone(), rid) del slot actual
-        // 4. Incrementar slot_idx
+        // 1. If slot_idx >= num_keys of current page → read next_leaf
+        // 2. Check end bound → return None if we exceeded the limit
+        // 3. Return (key.clone(), rid) from current slot
+        // 4. Increment slot_idx
     }
 }
 ```
@@ -305,73 +305,73 @@ impl CompressedNode {
 }
 ```
 
-> Nota: prefix compression en subfase 2.7 es opcional en el layout de página.
-> Se implementa como transformación en memoria sobre `BTreeNode::Internal`.
-> No cambia el layout en disco (los keys se almacenan sin comprimir en páginas).
-> La compresión reduce el espacio en RAM y mejora cache locality en nodos internos.
+> Note: prefix compression in subfase 2.7 is optional in the page layout.
+> It is implemented as an in-memory transformation over `BTreeNode::Internal`.
+> It does not change the on-disk layout (keys are stored uncompressed in pages).
+> Compression reduces RAM usage and improves cache locality in internal nodes.
 
 ---
 
-## Fases de implementación
+## Implementation phases
 
-### Fase 2.1 — page_layout.rs + node.rs
-1. Definir `RecordIdOnDisk`, `InternalNodePage`, `LeafNodePage` con bytemuck
+### Phase 2.1 — page_layout.rs + node.rs
+1. Define `RecordIdOnDisk`, `InternalNodePage`, `LeafNodePage` with bytemuck
 2. Compile-time size asserts
-3. Funciones `read_internal`, `read_leaf`, `write_internal`, `write_leaf`
-4. `BTreeNode::load` y `BTreeNode::flush`
-5. Tests unitarios: roundtrip serialize/deserialize de nodo
+3. Functions `read_internal`, `read_leaf`, `write_internal`, `write_leaf`
+4. `BTreeNode::load` and `BTreeNode::flush`
+5. Unit tests: roundtrip serialize/deserialize of node
 
-### Fase 2.2 — Lookup (tree.rs)
-1. `BTree::new` — crear hoja raíz vacía
-2. `BTree::lookup` — traverse interno + binary search en hoja
-3. Tests: lookup en árbol vacío, lookup hit, lookup miss
+### Phase 2.2 — Lookup (tree.rs)
+1. `BTree::new` — create empty root leaf
+2. `BTree::lookup` — internal traverse + binary search in leaf
+3. Tests: lookup in empty tree, lookup hit, lookup miss
 
-### Fase 2.3 — Insert con split (tree.rs)
-1. `BTreeNode::clone_with_insert` — insertar en hoja (orden)
-2. `BTreeNode::split` — split de hoja, retorna (left, right, separator)
-3. `BTree::insert` — caso sin split
-4. `BTree::insert` — caso con split + propagación
-5. Tests: 1K inserts aleatorios → lookup todos
+### Phase 2.3 — Insert with split (tree.rs)
+1. `BTreeNode::clone_with_insert` — insert into leaf (ordered)
+2. `BTreeNode::split` — leaf split, returns (left, right, separator)
+3. `BTree::insert` — case without split
+4. `BTree::insert` — case with split + propagation
+5. Tests: 1K random inserts → lookup all
 
-### Fase 2.4 — Range scan (iter.rs)
-1. `BTree::find_start_leaf` — navegar hasta primera hoja en rango
-2. `RangeIter` con Bound
+### Phase 2.4 — Range scan (iter.rs)
+1. `BTree::find_start_leaf` — navigate to first leaf in range
+2. `RangeIter` with Bound
 3. Tests: range [10..=50], range [..], range (42..)
 
-### Fase 2.5 — Delete con merge (tree.rs)
+### Phase 2.5 — Delete with merge (tree.rs)
 1. `BTreeNode::clone_with_delete`
-2. Redistribución desde hermano
-3. Merge + propagación al padre
-4. Tests: delete → lookup miss, merge reduce altura
+2. Redistribution from sibling
+3. Merge + propagation to parent
+4. Tests: delete → lookup miss, merge reduces height
 
-### Fase 2.6 — Copy-on-Write (tree.rs refactor)
-1. `AtomicU64` para `root_pid`
+### Phase 2.6 — Copy-on-Write (tree.rs refactor)
+1. `AtomicU64` for `root_pid`
 2. `free_old_pages` post-CAS
-3. Test concurrencia: 4 readers + 1 writer simultáneos
+3. Concurrency test: 4 readers + 1 writer simultaneously
 
-### Fase 2.7 — Prefix compression (prefix.rs)
+### Phase 2.7 — Prefix compression (prefix.rs)
 1. `find_common_prefix_len`
 2. `CompressedNode` encode/decode
-3. Integrar en `BTreeNode::Internal` load/flush
-4. Test: nodo con 100 keys `"usuario:XXXXX"` → verificar ahorro
+3. Integrate into `BTreeNode::Internal` load/flush
+4. Test: node with 100 keys `"usuario:XXXXX"` → verify savings
 
-### Fase 2.8 — Tests + benchmarks
-1. Test de integración completo (10K inserts + range + delete)
-2. Test crash recovery (MmapStorage)
-3. `benches/btree.rs` con Criterion: point lookup, range 1K, 1M inserts
+### Phase 2.8 — Tests + benchmarks
+1. Full integration test (10K inserts + range + delete)
+2. Crash recovery test (MmapStorage)
+3. `benches/btree.rs` with Criterion: point lookup, range 1K, 1M inserts
 
 ---
 
-## Tests a escribir
+## Tests to write
 
 ### Unit (src/)
 ```rust
 #[cfg(test)]
 mod tests {
     // page_layout.rs
-    fn test_internal_node_roundtrip()  // serialize → deserialize → mismos datos
+    fn test_internal_node_roundtrip()  // serialize → deserialize → same data
     fn test_leaf_node_roundtrip()
-    fn test_size_constraints()         // size_of verificado en runtime también
+    fn test_size_constraints()         // size_of verified at runtime as well
 
     // node.rs
     fn test_load_flush_leaf()
@@ -406,30 +406,30 @@ fn test_btree_concurrent_reads_during_write()
 ### Benchmarks (benches/btree.rs)
 ```rust
 fn bench_point_lookup_1m()             // vs BTreeMap
-fn bench_range_scan_10k()              // 10k resultado
+fn bench_range_scan_10k()              // 10k result
 fn bench_insert_sequential_1m()        // throughput
-fn bench_insert_random_100k()          // con splits
+fn bench_insert_random_100k()          // with splits
 ```
 
 ---
 
-## Antipatrones a evitar
+## Anti-patterns to avoid
 
-- **NO** `unwrap()` en `src/` — siempre `?` o `map_err`
-- **NO** `unsafe` sin comentario `// SAFETY:`
-- **NO** cargar toda la página en Vec para operaciones simples (zero-copy primero)
-- **NO** `Clone` de `Page` innecesario en el path caliente de lookup
-- **NO** implementar CoW con `Mutex` — usar `AtomicU64` para el root
-- **NO** locks en readers — lookup debe ser completamente lock-free
+- **NO** `unwrap()` in `src/` — always `?` or `map_err`
+- **NO** `unsafe` without `// SAFETY:` comment
+- **NO** loading the entire page into a Vec for simple operations (zero-copy first)
+- **NO** unnecessary `Clone` of `Page` in the hot path of lookup
+- **NO** implementing CoW with `Mutex` — use `AtomicU64` for the root
+- **NO** locks in readers — lookup must be completely lock-free
 
 ---
 
-## Riesgos y mitigaciones
+## Risks and mitigations
 
-| Riesgo | Mitigación |
+| Risk | Mitigation |
 |---|---|
-| `bytemuck::Pod` rechaza la struct por padding implícito | Verificar con `assert_eq!(size_of::<InternalNodePage>(), N)` y ajustar `_pad` |
-| Split de nodo interno cuando padre también está lleno | Implementar `propagate_split` iterativo (no recursivo) para evitar stack overflow |
-| CoW libera páginas que readers aún usan | En Fase 2: un solo writer a la vez (`&mut self`). La liberación es segura. En Fase 7 (MVCC): epoch-based reclamation |
-| Merge incorrecto rompe linked list de hojas | Test explícito: después de merge, recorrer linked list y verificar que no hay saltos |
-| `AtomicU64` CAS falla en contención alta | En Fase 2: `&mut self` en writes garantiza que no hay contención. CAS en Fase 7 |
+| `bytemuck::Pod` rejects the struct due to implicit padding | Verify with `assert_eq!(size_of::<InternalNodePage>(), N)` and adjust `_pad` |
+| Internal node split when parent is also full | Implement `propagate_split` iteratively (not recursively) to avoid stack overflow |
+| CoW frees pages still in use by readers | In Phase 2: single writer at a time (`&mut self`). Freeing is safe. In Phase 7 (MVCC): epoch-based reclamation |
+| Incorrect merge breaks the leaf linked list | Explicit test: after merge, traverse linked list and verify no gaps |
+| `AtomicU64` CAS fails under high contention | In Phase 2: `&mut self` on writes guarantees no contention. CAS in Phase 7 |

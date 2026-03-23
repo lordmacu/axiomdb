@@ -1,28 +1,28 @@
 # Spec: 1.4 — MemoryStorage
 
-## Qué construir
-Implementación en RAM del storage engine. Misma API que MmapStorage pero sin
-ningún I/O. Usada en todos los tests unitarios de fases futuras.
+## What to build
+In-RAM implementation of the storage engine. Same API as MmapStorage but with
+no I/O whatsoever. Used in all unit tests for future phases.
 
 ## Inputs / Outputs
-- `new()` → MemoryStorage vacío (page 0 Meta inicializada automáticamente)
-- `read_page(page_id)` → `&Page`, verifica checksum
-- `write_page(page_id, &Page)` → almacena copia en RAM
-- `alloc_page_raw(page_type)` → u64 (page_id nuevo) — sin free list aún
-- `flush()` → no-op (retorna Ok(()))
+- `new()` → empty MemoryStorage (page 0 Meta initialized automatically)
+- `read_page(page_id)` → `&Page`, verifies checksum
+- `write_page(page_id, &Page)` → stores a copy in RAM
+- `alloc_page_raw(page_type)` → u64 (new page_id) — no free list yet
+- `flush()` → no-op (returns Ok(()))
 - `page_count()` → u64
 
-## Criterios de aceptación
-- [ ] `MemoryStorage::new()` retorna storage con página 0 válida
-- [ ] `write_page` + `read_page` roundtrip conserva datos exactos
-- [ ] `read_page` en página no escrita retorna `Err(PageNotFound)`
-- [ ] `alloc_page_raw` retorna page_ids consecutivos desde 1
-- [ ] `flush()` retorna `Ok(())`
-- [ ] No requiere ningún archivo en disco
+## Acceptance criteria
+- [ ] `MemoryStorage::new()` returns storage with a valid page 0
+- [ ] `write_page` + `read_page` roundtrip preserves exact data
+- [ ] `read_page` on an unwritten page returns `Err(PageNotFound)`
+- [ ] `alloc_page_raw` returns consecutive page_ids starting from 1
+- [ ] `flush()` returns `Ok(())`
+- [ ] Does not require any file on disk
 
-## Fuera del alcance
-- Free list real (1.5)
-- Trait StorageEngine (1.6)
+## Out of scope
+- Real free list (1.5)
+- StorageEngine trait (1.6)
 
-## Dependencias
-- `nexusdb-storage::page` (ya existe)
+## Dependencies
+- `nexusdb-storage::page` (already exists)

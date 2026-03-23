@@ -1,10 +1,10 @@
-//! # nexusdb-index — B+ Tree CoW, iteradores y prefix compression
+//! # nexusdb-index — B+ Tree CoW, iterators and prefix compression
 //!
-//! Implementa un B+ Tree persistente sobre el trait [`StorageEngine`]:
-//! - Keys binarios variables hasta 64 bytes
-//! - Copy-on-Write con raíz atómica (`AtomicU64`)
-//! - Range scan lazy por linked list de hojas
-//! - Prefix compression en memoria para nodos internos
+//! Implements a persistent B+ Tree over the [`StorageEngine`] trait:
+//! - Variable binary keys up to 64 bytes
+//! - Copy-on-Write with atomic root (`AtomicU64`)
+//! - Lazy range scan via leaf linked list
+//! - In-memory prefix compression for internal nodes
 
 pub mod page_layout;
 pub mod prefix;

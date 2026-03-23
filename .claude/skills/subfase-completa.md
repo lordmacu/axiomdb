@@ -1,120 +1,120 @@
-# /subfase-completa — Marcar subfase como completada
+# /subfase-completa — Mark a subphase as completed
 
-Ejecutar este skill al terminar cada subfase individual.
-Actualiza el progreso, la memoria y hace commit automático.
+Run this skill when finishing each individual subphase.
+Updates progress, memory, and makes an automatic commit.
 
-## Uso
+## Usage
 
 ```
 /subfase-completa N.M
 ```
 
-Ejemplo: `/subfase-completa 1.3` marca la subfase 1.3 como completada.
+Example: `/subfase-completa 1.3` marks subphase 1.3 as completed.
 
-## Proceso que ejecuta este skill
+## Process this skill executes
 
-### Paso 1 — Verificar que la subfase realmente está lista
+### Step 1 — Verify the subphase is truly ready
 
 ```bash
 cd /Users/cristian/dbyo
 
-# Tests del crate afectado
+# Tests for the affected crate
 cargo test -p dbyo-CRATE --quiet 2>&1 | tail -5
 
-# Clippy sin warnings
+# Clippy with no warnings
 cargo clippy -p dbyo-CRATE -- -D warnings 2>&1 | head -10
 
-# Formato correcto
+# Correct format
 cargo fmt --check 2>&1 | head -5
 ```
 
-Si alguno falla: **NO marcar como completada.** Resolver primero.
+If any fails: **DO NOT mark as completed.** Fix it first.
 
-### Paso 2 — Marcar en docs/progreso.md
+### Step 2 — Mark in docs/progreso.md
 
-Buscar la línea de la subfase N.M y cambiar:
+Find the line for subphase N.M and change:
 ```
-- [ ] N.M ⏳ descripción
+- [ ] N.M ⏳ description
 ```
-por:
+to:
 ```
-- [x] N.M ✅ descripción — completada YYYY-MM-DD
-```
-
-También actualizar el estado de la fase padre si todas sus subfases están completas:
-```
-### Fase N — Nombre `⏳`   →   ### Fase N — Nombre `✅`
+- [x] N.M ✅ description — completed YYYY-MM-DD
 ```
 
-### Paso 3 — Actualizar estadísticas al final del archivo
-
-Recalcular y actualizar el bloque de estadísticas:
+Also update the parent phase state if all its subphases are complete:
 ```
-Total subfases:  185
-Completadas:      X  (Y%)
-En progreso:      Z  (W%)
-Pendientes:     ...
-
-Fase actual:     [siguiente subfase pendiente]
-Última completada: N.M — descripción — YYYY-MM-DD
+### Phase N — Name `⏳`   →   ### Phase N — Name `✅`
 ```
 
-### Paso 4 — Actualizar memory/project_state.md
+### Step 3 — Update statistics at the end of the file
+
+Recalculate and update the statistics block:
+```
+Total subphases:  185
+Completed:         X  (Y%)
+In progress:       Z  (W%)
+Pending:         ...
+
+Current phase:     [next pending subphase]
+Last completed: N.M — description — YYYY-MM-DD
+```
+
+### Step 4 — Update memory/project_state.md
 
 ```markdown
-## En progreso
-- Subfase [N.M+1]: [descripción]
+## In progress
+- Subphase [N.M+1]: [description]
 
-## Completadas recientemente
-- Subfase N.M: descripción (YYYY-MM-DD)
+## Recently completed
+- Subphase N.M: description (YYYY-MM-DD)
 ```
 
-### Paso 5 — Si la fase completa terminó, actualizar memory/architecture.md
+### Step 5 — If the full phase finished, update memory/architecture.md
 
-Solo si N.M fue la última subfase de la Fase N:
+Only if N.M was the last subphase of Phase N:
 ```markdown
-## Crates implementados
-- `dbyo-NOMBRE` — descripción (Fase N completada YYYY-MM-DD)
+## Implemented crates
+- `dbyo-NAME` — description (Phase N completed YYYY-MM-DD)
 ```
 
-### Paso 6 — Commit
+### Step 6 — Commit
 
 ```bash
 git add docs/progreso.md .claude/projects/*/memory/project_state.md
-git commit -m "progress(N.M): completar [descripción breve de la subfase]
+git commit -m "progress(N.M): complete [brief subphase description]
 
-Subfase N.M de Fase N completada.
-Progreso: X/225 subfases (Y%)"
+Subphase N.M of Phase N completed.
+Progress: X/225 subphases (Y%)"
 ```
 
-### Paso 7 — Reportar al usuario
+### Step 7 — Report to user
 
 ```
-✅ Subfase N.M completada — [descripción]
+✅ Subphase N.M completed — [description]
 
-Progreso fase N: [X de Y subfases] ████░░░░ 60%
-Progreso total:  [X de 185]        ██░░░░░░  8%
+Phase N progress: [X of Y subphases] ████░░░░ 60%
+Total progress:   [X of 185]         ██░░░░░░  8%
 
-Siguiente subfase: N.M+1 — [descripción]
+Next subphase: N.M+1 — [description]
 ```
 
 ---
 
-## Formato de referencia rápida
+## Quick reference format
 
 ```
-⏳ pendiente
-🔄 en progreso (marcar manualmente si empiezas sin terminar)
-✅ completada
-⏸ bloqueada (depende de algo externo)
+⏳ pending
+🔄 in progress (mark manually if you start without finishing)
+✅ completed
+⏸ blocked (depends on something external)
 ```
 
-Para marcar en progreso sin completar:
+To mark as in progress without completing:
 ```
-- [ ] N.M 🔄 descripción — iniciada YYYY-MM-DD
+- [ ] N.M 🔄 description — started YYYY-MM-DD
 ```
 
-Para marcar como bloqueada:
+To mark as blocked:
 ```
-- [ ] N.M ⏸ descripción — bloqueada por: [razón]
+- [ ] N.M ⏸ description — blocked by: [reason]
 ```

@@ -1,16 +1,16 @@
 # Plan: 1.1 — Workspace Setup
 
-## Pasos de implementación
+## Implementation steps
 
-1. `rust-toolchain.toml` — fijar Rust stable 1.80
-2. `Cargo.toml` workspace root — todos los crates + deps compartidas + perfiles
-3. 19 crates con `cargo new --lib` — estructura mínima cada uno
-4. `nexusdb-core` — definir `DbError` con thiserror (única dep real)
-5. `.rustfmt.toml` y `.clippy.toml` — estilo uniforme
+1. `rust-toolchain.toml` — pin Rust stable 1.80
+2. `Cargo.toml` workspace root — all crates + shared deps + profiles
+3. 19 crates with `cargo new --lib` — minimal structure for each
+4. `nexusdb-core` — define `DbError` with thiserror (the only real dep)
+5. `.rustfmt.toml` and `.clippy.toml` — uniform style
 6. `.github/workflows/ci.yml` — test + clippy + fmt
-7. Verificar: `cargo build --workspace` limpio
+7. Verify: `cargo build --workspace` compiles clean
 
-## Decisiones
-- `thiserror` como única dependencia real en esta subfase
-- Todos los demás crates dependen de `nexusdb-core`
-- `nexusdb-server` es `[[bin]]`, `nexusdb-embedded` es `[lib] crate-type = ["cdylib","rlib"]`
+## Decisions
+- `thiserror` as the only real dependency in this subfase
+- All other crates depend on `nexusdb-core`
+- `nexusdb-server` is `[[bin]]`, `nexusdb-embedded` is `[lib] crate-type = ["cdylib","rlib"]`

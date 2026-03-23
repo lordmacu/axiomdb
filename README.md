@@ -1,74 +1,74 @@
-# NexusDB — Motor de Base de Datos en Rust
+# NexusDB — Database Engine in Rust
 
-Motor de base de datos diseñado para superar a MySQL en benchmarks específicos.
-Proyecto universitario en Rust con arquitectura moderna.
+Database engine designed to outperform MySQL on specific benchmarks.
+University project in Rust with modern architecture.
 
-## Features principales
+## Main features
 
-- **Storage**: mmap + páginas 8KB, sin double-buffering
-- **Índices**: Copy-on-Write B+ Tree — readers sin locks
-- **Concurrencia**: Tokio async (I/O) + Rayon (CPU) + MVCC
-- **Ejecución**: SIMD AVX2 + morsel parallelism + operator fusion
-- **Compatibilidad**: MySQL wire protocol (:3306) + PostgreSQL (:5432) simultáneos
-- **Embebido**: compila como `.so`/`.dll` para apps de escritorio
-- **AI-Native**: VECTOR(n), búsqueda híbrida BM25+HNSW, RAG pipeline nativo
+- **Storage**: mmap + 8KB pages, no double-buffering
+- **Indexes**: Copy-on-Write B+ Tree — lock-free readers
+- **Concurrency**: Tokio async (I/O) + Rayon (CPU) + MVCC
+- **Execution**: SIMD AVX2 + morsel parallelism + operator fusion
+- **Compatibility**: MySQL wire protocol (:3306) + PostgreSQL (:5432) simultaneous
+- **Embedded**: compiles as `.so`/`.dll` for desktop apps
+- **AI-Native**: VECTOR(n), hybrid BM25+HNSW search, native RAG pipeline
 
 ## Quickstart
 
 ```bash
-# Servidor
+# Server
 cargo run --bin nexusdb-server -- --data-dir ./data
 
-# Conectar con psql
+# Connect with psql
 psql -h localhost -p 5432 -U root myapp
 
-# Conectar con mysql client
+# Connect with mysql client
 mysql -h localhost -P 3306 -u root myapp
 
-# Modo embebido (Python)
+# Embedded mode (Python)
 pip install nexusdb-python
 python -c "import nexusdb; db = nexusdb.open('myapp.db'); db.execute('SELECT 1')"
 ```
 
-## Arquitectura
+## Architecture
 
 ```
-Cliente (MySQL/PostgreSQL protocol)
+Client (MySQL/PostgreSQL protocol)
     ↓
 SQL (Parser → Optimizer → Executor)
     ↓
 MVCC (Snapshot Isolation + SSI)
     ↓
-Índices (B+ Tree CoW + HNSW + GIN + FTS)
+Indexes (B+ Tree CoW + HNSW + GIN + FTS)
     ↓
 Storage (mmap + WAL + TOAST)
     ↓
-Disco (.db + .wal + .idx)
+Disk (.db + .wal + .idx)
 ```
 
-## Plan de desarrollo
+## Development plan
 
-35 fases / ~83 semanas. Ver [`docs/progreso.md`](docs/progreso.md) para el estado actual.
+35 phases / ~83 weeks. See [`docs/progreso.md`](docs/progreso.md) for current status.
 
-## Documentación de diseño
+## Design documentation
 
-Ver [`db.md`](db.md) para el diseño completo: tipos, optimizaciones, fases y decisiones.
+See [`db.md`](db.md) for the complete design: types, optimizations, phases and decisions.
 
-## Nombre
+## Name
 
-**NexusDB** — una base de datos es el punto central de conexión de toda aplicación.
-El nombre refleja exactamente eso: el nexo entre los datos y el mundo.
+**NexusDB** — a database is the central connection point of every application.
+The name reflects exactly that: the nexus between data and the world.
 
-## Benchmarks objetivo
+## Target benchmarks
 
-| Operación           | dbyo         | MySQL 8.0    | Delta   |
+| Operation           | dbyo         | MySQL 8.0    | Delta   |
 |---------------------|--------------|--------------|---------|
 | Point lookup PK     | 800k ops/s   | 350k ops/s   | +128%   |
 | Range scan 10K rows | 45ms         | 120ms        | -62%    |
 | Seq scan 1M rows    | 0.8s         | 3.4s         | -76%    |
-| INSERT con WAL      | 180k ops/s   | 95k ops/s    | +89%    |
-| Concurrent reads x16| escala lineal| se satura    | +200%+  |
+| INSERT with WAL     | 180k ops/s   | 95k ops/s    | +89%    |
+| Concurrent reads x16| linear scale | saturates    | +200%+  |
 
-## Licencia
+## License
 
 MIT

@@ -1,20 +1,20 @@
-//! WalReader — lectura streaming del archivo WAL.
+//! WalReader — streaming reads from the WAL file.
 //!
-//! ## Diseño
+//! ## Design
 //!
-//! `WalReader` es stateless — verifica el header en `open()` pero no mantiene
-//! un file handle abierto. Cada scan abre su propio `File` handle, lo que elimina
-//! shared mutable state y permite múltiples scans independientes.
+//! `WalReader` is stateless — it verifies the header in `open()` but does not
+//! keep a file handle open. Each scan opens its own `File` handle, which eliminates
+//! shared mutable state and allows multiple independent scans.
 //!
-//! - [`WalReader::scan_forward`]: `BufReader<File>` — amortiza syscalls en lectura secuencial.
-//! - [`WalReader::scan_backward`]: `File` seekable directo — los seeks invalidan el buffer
-//!   de `BufReader`, por lo que backward usa el file handle directamente.
+//! - [`WalReader::scan_forward`]: `BufReader<File>` — amortizes syscalls in sequential reads.
+//! - [`WalReader::scan_backward`]: direct seekable `File` — seeks invalidate the `BufReader`
+//!   buffer, so backward uses the file handle directly.
 //!
-//! ## Comportamiento ante corrupción
+//! ## Behavior on corruption
 //!
-//! Ambos iteradores retornan `Result<WalEntry>`. En el primer error (entry truncado,
-//! CRC inválido, tipo desconocido), el item es `Err(...)` y el iterator termina.
-//! El caller decide si propagar el error o ignorarlo según el caso de uso.
+//! Both iterators return `Result<WalEntry>`. On the first error (truncated entry,
+//! invalid CRC, unknown type), the item is `Err(...)` and the iterator stops.
+//! The caller decides whether to propagate the error or ignore it based on the use case.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -27,20 +27,20 @@ use crate::writer::{WAL_HEADER_SIZE, WAL_MAGIC, WAL_VERSION};
 
 // ── WalReader ─────────────────────────────────────────────────────────────────
 
-/// Lector del archivo WAL. Stateless — abre un `File` por cada scan.
+/// WAL file reader. Stateless — opens a `File` per scan.
 pub struct WalReader {
     path: PathBuf,
 }
 
 impl WalReader {
-    /// Abre un archivo WAL existente y verifica su header.
+    /// Opens an existing WAL file and verifies its header.
     ///
-    /// No mantiene el file handle abierto — solo valida que el archivo
-    /// es un WAL válido (magic + versión correctos).
+    /// Does not keep the file handle open — only validates that the file
+    /// is a valid WAL (correct magic + version).
     ///
-    /// # Errores
-    /// - [`DbError::WalInvalidHeader`] si el magic, versión o tamaño del header son incorrectos
-    /// - [`DbError::Io`] si el archivo no existe o no se puede leer
+    /// # Errors
+    /// - [`DbError::WalInvalidHeader`] if the magic, version, or header size are incorrect
+    /// - [`DbError::Io`] if the file does not exist or cannot be read
     pub fn open(path: &Path) -> Result<Self, DbError> {
         verify_header(path)?;
         Ok(Self {
@@ -48,17 +48,17 @@ impl WalReader {
         })
     }
 
-    /// Retorna un iterator que lee entries hacia adelante desde `from_lsn`.
+    /// Returns an iterator that reads entries forward from `from_lsn`.
     ///
-    /// Entries con `LSN < from_lsn` se saltan en un scan lineal desde el inicio.
-    /// Para leer todo el WAL usar `from_lsn = 0` (o `from_lsn = 1`).
+    /// Entries with `LSN < from_lsn` are skipped in a linear scan from the start.
+    /// To read the entire WAL use `from_lsn = 0` (or `from_lsn = 1`).
     ///
-    /// El iterator se detiene (retornando `Some(Err(...))`) en el primer entry
-    /// truncado o corrupto, luego retorna `None`.
+    /// The iterator stops (returning `Some(Err(...))`) on the first truncated
+    /// or corrupt entry, then returns `None`.
     pub fn scan_forward(&self, from_lsn: u64) -> Result<ForwardIter, DbError> {
         let file = File::open(&self.path)?;
         let mut reader = BufReader::with_capacity(64 * 1024, file);
-        // Saltar el header — ya fue verificado en open()
+        // Skip the header — already verified in open()
         reader.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
         Ok(ForwardIter {
             reader,
@@ -67,10 +67,10 @@ impl WalReader {
         })
     }
 
-    /// Retorna un iterator que lee entries hacia atrás desde el último entry válido.
+    /// Returns an iterator that reads entries backward from the last valid entry.
     ///
-    /// Retorna entries en orden LSN **decreciente** — el más reciente primero.
-    /// Útil para ROLLBACK (deshacer operaciones de lo más reciente a lo más antiguo).
+    /// Returns entries in **decreasing** LSN order — most recent first.
+    /// Useful for ROLLBACK (undoing operations from most recent to oldest).
     pub fn scan_backward(&self) -> Result<BackwardIter, DbError> {
         let mut file = File::open(&self.path)?;
         let file_len = file.seek(SeekFrom::End(0))?;
@@ -84,7 +84,7 @@ impl WalReader {
 
 // ── ForwardIter ───────────────────────────────────────────────────────────────
 
-/// Iterator de lectura secuencial del WAL (LSN creciente).
+/// Sequential WAL read iterator (increasing LSN).
 pub struct ForwardIter {
     reader: BufReader<File>,
     from_lsn: u64,
@@ -100,12 +100,12 @@ impl Iterator for ForwardIter {
         }
 
         loop {
-            // ── Leer entry_len (4 bytes) ──────────────────────────────────────
+            // ── Read entry_len (4 bytes) ──────────────────────────────────────
             let mut len_buf = [0u8; 4];
             match self.reader.read_exact(&mut len_buf) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // EOF limpio — el WAL terminó sin entries truncados
+                    // Clean EOF — the WAL ended without truncated entries
                     return None;
                 }
                 Err(e) => {
@@ -121,7 +121,7 @@ impl Iterator for ForwardIter {
                 return Some(Err(DbError::WalEntryTruncated { lsn: 0 }));
             }
 
-            // ── Leer el resto del entry ───────────────────────────────────────
+            // ── Read the rest of the entry ────────────────────────────────────
             let rest_len = entry_len - 4;
             let mut buf = vec![0u8; entry_len];
             buf[0..4].copy_from_slice(&len_buf);
@@ -134,13 +134,13 @@ impl Iterator for ForwardIter {
                 }
             }
 
-            let _ = rest_len; // usado implícitamente en el slice arriba
+            let _ = rest_len; // used implicitly in the slice above
 
-            // ── Parsear y verificar CRC ───────────────────────────────────────
+            // ── Parse and verify CRC ──────────────────────────────────────────
             match WalEntry::from_bytes(&buf) {
                 Ok((entry, _consumed)) => {
                     if entry.lsn < self.from_lsn {
-                        // Saltar este entry y continuar al siguiente
+                        // Skip this entry and continue to the next
                         continue;
                     }
                     return Some(Ok(entry));
@@ -156,14 +156,14 @@ impl Iterator for ForwardIter {
 
 // ── BackwardIter ──────────────────────────────────────────────────────────────
 
-/// Iterator de lectura inversa del WAL (LSN decreciente).
+/// Reverse WAL read iterator (decreasing LSN).
 ///
-/// Usa el campo `entry_len_2` (últimos 4 bytes de cada entry) para navegar
-/// hacia atrás sin leer el archivo completo.
+/// Uses the `entry_len_2` field (last 4 bytes of each entry) to navigate
+/// backward without reading the entire file.
 pub struct BackwardIter {
     file: File,
-    /// Posición en el archivo del byte inmediatamente después del último entry no leído.
-    /// Inicialmente = file_len.  Decrece con cada entry leído.
+    /// Position in the file of the byte immediately after the last unread entry.
+    /// Initially = file_len. Decreases with each entry read.
     cursor: u64,
     done: bool,
 }
@@ -176,12 +176,12 @@ impl Iterator for BackwardIter {
             return None;
         }
 
-        // Llegamos al inicio del área de entries
+        // We have reached the start of the entries area
         if self.cursor <= WAL_HEADER_SIZE as u64 {
             return None;
         }
 
-        // ── Leer entry_len_2 (últimos 4 bytes del entry actual) ───────────────
+        // ── Read entry_len_2 (last 4 bytes of the current entry) ─────────────
         if self.cursor < WAL_HEADER_SIZE as u64 + 4 {
             self.done = true;
             return Some(Err(DbError::WalEntryTruncated { lsn: 0 }));
@@ -206,7 +206,7 @@ impl Iterator for BackwardIter {
             return Some(Err(DbError::WalEntryTruncated { lsn: 0 }));
         }
 
-        // ── Calcular inicio del entry ─────────────────────────────────────────
+        // ── Calculate entry start ─────────────────────────────────────────────
         if self.cursor < entry_len {
             self.done = true;
             return Some(Err(DbError::WalEntryTruncated { lsn: 0 }));
@@ -219,7 +219,7 @@ impl Iterator for BackwardIter {
             return Some(Err(DbError::WalEntryTruncated { lsn: 0 }));
         }
 
-        // ── Leer el entry completo ────────────────────────────────────────────
+        // ── Read the complete entry ───────────────────────────────────────────
         if let Err(e) = self.file.seek(SeekFrom::Start(entry_start)) {
             self.done = true;
             return Some(Err(e.into()));
@@ -231,7 +231,7 @@ impl Iterator for BackwardIter {
             return Some(Err(DbError::WalEntryTruncated { lsn: 0 }));
         }
 
-        // ── Parsear y verificar CRC ───────────────────────────────────────────
+        // ── Parse and verify CRC ──────────────────────────────────────────────
         match WalEntry::from_bytes(&buf) {
             Ok((entry, _)) => {
                 self.cursor = entry_start;
@@ -245,7 +245,7 @@ impl Iterator for BackwardIter {
     }
 }
 
-// ── Helpers privados ──────────────────────────────────────────────────────────
+// ── Private helpers ───────────────────────────────────────────────────────────
 
 fn verify_header(path: &Path) -> Result<(), DbError> {
     let mut file = File::open(path)?;
@@ -269,7 +269,7 @@ fn verify_header(path: &Path) -> Result<(), DbError> {
     Ok(())
 }
 
-// ── Tests unitarios ───────────────────────────────────────────────────────────
+// ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

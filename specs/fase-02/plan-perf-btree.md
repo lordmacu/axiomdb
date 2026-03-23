@@ -1,23 +1,23 @@
-# Plan: Optimización de rendimiento del B+ Tree
+# Plan: B+ Tree Performance Optimization
 
-## Archivos a modificar
+## Files to modify
 
-- `crates/nexusdb-index/src/page_layout.rs` — binary search en `find_child_idx`
-- `crates/nexusdb-index/src/tree.rs` — eliminar alloc en lookup + in-place en insert
+- `crates/nexusdb-index/src/page_layout.rs` — binary search in `find_child_idx`
+- `crates/nexusdb-index/src/tree.rs` — remove alloc in lookup + in-place in insert
 
-## Subfase 2.5.1 — Lookup sin allocations
+## Subfase 2.5.1 — Lookup without allocations
 
-### Paso 1 — Binary search en `InternalNodePage::find_child_idx`
+### Step 1 — Binary search in `InternalNodePage::find_child_idx`
 
-**Archivo:** `page_layout.rs`, función `find_child_idx` (línea ~134)
+**File:** `page_layout.rs`, function `find_child_idx` (line ~134)
 
 ```
-Actual:
+Current:
     (0..n).find(|&i| self.key_at(i) > key).unwrap_or(n)
 
-Nuevo (binary search):
-    // Invariante: keys[0..n] están ordenadas por el B+ Tree.
-    // Buscamos el primer i tal que keys[i] > key → ese es el child idx.
+New (binary search):
+    // Invariant: keys[0..n] are sorted by the B+ Tree.
+    // We look for the first i such that keys[i] > key → that is the child idx.
     let mut lo = 0usize;
     let mut hi = n;
     while lo < hi {
@@ -31,37 +31,37 @@ Nuevo (binary search):
     lo
 ```
 
-Este es el patrón estándar de "lower bound" adaptado para `>`.
+This is the standard "lower bound" pattern adapted for `>`.
 
-### Paso 2 — Eliminar `find_child_compressed` y sus allocations
+### Step 2 — Remove `find_child_compressed` and its allocations
 
-**Archivo:** `tree.rs`
+**File:** `tree.rs`
 
-1. Eliminar la función `find_child_compressed` completa.
-2. En `lookup`, reemplazar:
+1. Remove the `find_child_compressed` function entirely.
+2. In `lookup`, replace:
    ```rust
-   // Antes:
+   // Before:
    pid = Self::find_child_compressed(&node, key);
-   // Después:
+   // After:
    pid = node.child_at(node.find_child_idx(key));
    ```
-3. Verificar que `use crate::prefix::CompressedNode` ya no se usa en `tree.rs`.
-   Si no se usa en ningún otro lugar del crate, eliminar el import (pero mantener el módulo).
+3. Verify that `use crate::prefix::CompressedNode` is no longer used in `tree.rs`.
+   If it is not used anywhere else in the crate, remove the import (but keep the module).
 
 ### Tests subfase 2.5.1
-- Correr todos los tests del workspace: `cargo test --workspace`
-- Correr benchmark para verificar: `cargo bench --bench btree -- point_lookup`
-- Objetivo: ≥ 800K ops/s para 1M keys
+- Run all workspace tests: `cargo test --workspace`
+- Run benchmark to verify: `cargo bench --bench btree -- point_lookup`
+- Target: ≥ 800K ops/s for 1M keys
 
 ---
 
-## Subfase 2.5.2 — Insert in-place
+## Subfase 2.5.2 — In-place insert
 
-### Paso 3 — In-place en `insert_leaf` (caso sin split)
+### Step 3 — In-place in `insert_leaf` (no-split case)
 
-**Archivo:** `tree.rs`, función `insert_leaf` (línea ~203)
+**File:** `tree.rs`, function `insert_leaf` (line ~203)
 
-Caso actual (sin split, líneas ~215-224):
+Current case (no split, lines ~215-224):
 ```rust
 if node.num_keys() < ORDER_LEAF {
     let new_pid = storage.alloc_page(PageType::Index)?;
@@ -76,7 +76,7 @@ if node.num_keys() < ORDER_LEAF {
 }
 ```
 
-Nuevo (in-place):
+New (in-place):
 ```rust
 if node.num_keys() < ORDER_LEAF {
     let mut p = Page::new(PageType::Index, old_pid);
@@ -85,22 +85,22 @@ if node.num_keys() < ORDER_LEAF {
     n.insert_at(ins_pos, key, rid);
     p.update_checksum();
     storage.write_page(old_pid, &p)?;
-    // Sin alloc_page, sin free_page
+    // No alloc_page, no free_page
     return Ok(InsertResult::Ok(old_pid));
 }
 ```
 
-La página sigue usando `old_pid` — el padre no necesita actualizar su puntero child,
-lo que permite optimizar el nivel superior también.
+The page continues using `old_pid` — the parent does not need to update its child pointer,
+which also allows optimizing the upper level.
 
-### Paso 4 — In-place en `cow_update_child`
+### Step 4 — In-place in `cow_update_child`
 
-**Archivo:** `tree.rs`, función `cow_update_child` (línea ~379)
+**File:** `tree.rs`, function `cow_update_child` (line ~379)
 
-Renombrar a `in_place_update_child` y cambiar implementación:
+Rename to `in_place_update_child` and change implementation:
 
 ```
-Actual:
+Current:
     node.set_child_at(child_idx, new_child);
     let new_pid = storage.alloc_page(PageType::Index)?;
     let mut p = Page::new(PageType::Index, new_pid);
@@ -110,7 +110,7 @@ Actual:
     storage.free_page(old_pid)?;
     Ok(new_pid)
 
-Nuevo:
+New:
     node.set_child_at(child_idx, new_child);
     let mut p = Page::new(PageType::Index, old_pid);
     *cast_internal_mut(&mut p) = node;
@@ -119,75 +119,75 @@ Nuevo:
     Ok(old_pid)
 ```
 
-Actualizar todos los call sites de `cow_update_child` en `insert_subtree` para que
-llamen a la función renombrada.
+Update all call sites of `cow_update_child` in `insert_subtree` to call
+the renamed function.
 
-### Paso 5 — Verificar que split sigue siendo CoW
+### Step 5 — Verify that splits remain CoW
 
-Los splits NO se tocan:
-- `insert_leaf` (caso split): alloca `left_pid` y `right_pid`, libera `old_pid` ✓
-- `split_internal`: ídem ✓
-- `alloc_root`: siempre alloca página nueva ✓
+Splits are NOT touched:
+- `insert_leaf` (split case): allocates `left_pid` and `right_pid`, frees `old_pid` ✓
+- `split_internal`: same ✓
+- `alloc_root`: always allocates a new page ✓
 
-El CAS en `root_pid` solo se ejecuta cuando cambia el root (split que llega a raíz).
-Con in-place, si no hay split, `root_pid` no cambia → el CAS no se ejecuta → cero overhead.
+The CAS on `root_pid` only executes when the root changes (split reaching the root).
+With in-place, if there is no split, `root_pid` does not change → the CAS does not execute → zero overhead.
 
-Esperar un momento: con in-place en insert_leaf retornando `Ok(old_pid)`, el parent
-recibe `InsertResult::Ok(old_pid)` y llama `cow_update_child(parent_pid, parent_node, child_idx, old_pid)`.
-Pero `new_child == old_pid` → el child pointer no cambió → `set_child_at` escribe el mismo valor.
-Con `in_place_update_child` esto sigue siendo correcto: reescribimos la página del padre
-con el mismo child pointer (no-op semántico), pero actualizamos el checksum.
+Wait: with in-place in insert_leaf returning `Ok(old_pid)`, the parent
+receives `InsertResult::Ok(old_pid)` and calls `cow_update_child(parent_pid, parent_node, child_idx, old_pid)`.
+But `new_child == old_pid` → the child pointer did not change → `set_child_at` writes the same value.
+With `in_place_update_child` this is still correct: we rewrite the parent page
+with the same child pointer (semantic no-op), but update the checksum.
 
-**Optimización adicional:** Si `new_child == old_child_pid`, skip the write entirely.
-Esto evita reescribir los nodos internos cuando el hijo no cambió de página.
+**Additional optimization:** If `new_child == old_child_pid`, skip the write entirely.
+This avoids rewriting internal nodes when the child page did not change.
 
-En `insert_subtree`, el match en `InsertResult::Ok`:
+In `insert_subtree`, the match on `InsertResult::Ok`:
 ```rust
 InsertResult::Ok(new_child_pid) => {
-    // Si new_child_pid == child_pid (in-place, sin cambio de pid):
-    // no hay que actualizar el padre.
+    // If new_child_pid == child_pid (in-place, no pid change):
+    // no need to update the parent.
     if new_child_pid == child_pid {
-        return Ok(InsertResult::Ok(pid)); // pid no cambió tampoco
+        return Ok(InsertResult::Ok(pid)); // pid did not change either
     }
     let new_pid = Self::in_place_update_child(storage, pid, node, child_idx, new_child_pid)?;
     Ok(InsertResult::Ok(new_pid))
 }
 ```
 
-Esto hace que un insert sin split (el caso más común) escribe SOLO la hoja y no toca
-ningún nodo interno. El árbol completo queda intacto salvo la página hoja modificada.
+This means a no-split insert (the most common case) writes ONLY the leaf and does not touch
+any internal node. The entire tree remains intact except for the modified leaf page.
 
 ### Tests subfase 2.5.2
-- `cargo test --workspace` — todos los tests deben pasar
-- `cargo bench --bench btree -- insert` — verificar ≥ 180K ops/s
-- Test específico de correctness: insertar 1M keys y luego lookup de todas → sin errores
+- `cargo test --workspace` — all tests must pass
+- `cargo bench --bench btree -- insert` — verify ≥ 180K ops/s
+- Specific correctness test: insert 1M keys then lookup all → no errors
 
 ---
 
-## Antipatrones a evitar
+## Anti-patterns to avoid
 
-- **NO** usar `unwrap()` en ningún lugar (ya está prohibido en src/)
-- **NO** romper el CAS pattern en `root_pid` — se mantiene para Fase 7
-- **NO** cambiar el path de splits — solo el path sin split es in-place
-- **NO** eliminar `CompressedNode` — se puede necesitar para análisis o bulk load futuro
+- **NO** `unwrap()` anywhere (already prohibited in src/)
+- **NO** breaking the CAS pattern on `root_pid` — kept for Phase 7
+- **NO** changing the split path — only the no-split path is in-place
+- **NO** removing `CompressedNode` — may be needed for analysis or future bulk load
 
-## Riesgos
+## Risks
 
-| Riesgo | Mitigación |
+| Risk | Mitigation |
 |---|---|
-| In-place rompería lectura concurrente | No hay lectores concurrentes con `&mut self` — Rust lo garantiza |
-| Binary search con comparación `<=` en vez de `<` puede regresar child erróneo | Verificar con test de invariante: lookup después de 1M inserts |
-| `new_child == old_pid` optimization introduce un bug de correctness | Agregar test: insert → lookup del mismo key inmediatamente |
+| In-place would break concurrent reads | There are no concurrent readers with `&mut self` — Rust guarantees it |
+| Binary search with `<=` comparison instead of `<` may return wrong child | Verify with invariant test: lookup after 1M inserts |
+| `new_child == old_pid` optimization introduces a correctness bug | Add test: insert → lookup of the same key immediately |
 
-## Orden de implementación
+## Implementation order
 
 ```
-1. [page_layout.rs] Binary search en find_child_idx
-2. [tree.rs] Eliminar find_child_compressed, usar node.find_child_idx directo
-3. cargo test && cargo bench -- point_lookup → verificar ≥800K ops/s
-4. [tree.rs] insert_leaf in-place (sin split)
+1. [page_layout.rs] Binary search in find_child_idx
+2. [tree.rs] Remove find_child_compressed, use node.find_child_idx directly
+3. cargo test && cargo bench -- point_lookup → verify ≥800K ops/s
+4. [tree.rs] insert_leaf in-place (no split)
 5. [tree.rs] cow_update_child → in_place_update_child
-6. [tree.rs] Optimization: skip parent write si pid no cambió
-7. cargo test && cargo bench -- insert → verificar ≥180K ops/s
-8. Protocolo de cierre completo
+6. [tree.rs] Optimization: skip parent write if pid did not change
+7. cargo test && cargo bench -- insert → verify ≥180K ops/s
+8. Full close protocol
 ```

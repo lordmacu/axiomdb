@@ -1,10 +1,10 @@
-//! Tests de integración para el storage engine.
+//! Integration tests for the storage engine.
 //!
-//! Diferencia con los unit tests en src/:
-//! - Prueban comportamiento end-to-end, no implementaciones internas.
-//! - Simulan crash recovery (drop + reabrir).
-//! - Verifican equivalencia de comportamiento entre MmapStorage y MemoryStorage.
-//! - Ejercitan el trait StorageEngine como interfaz unificada.
+//! Difference from unit tests in src/:
+//! - Test end-to-end behavior, not internal implementations.
+//! - Simulate crash recovery (drop + reopen).
+//! - Verify behavioral equivalence between MmapStorage and MemoryStorage.
+//! - Exercise the StorageEngine trait as a unified interface.
 
 use nexusdb_storage::{MemoryStorage, MmapStorage, Page, PageType, StorageEngine};
 use tempfile::TempDir;
@@ -12,7 +12,7 @@ use tempfile::TempDir;
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn tmp_dir() -> TempDir {
-    tempfile::tempdir().expect("crear directorio temporal")
+    tempfile::tempdir().expect("create temporary directory")
 }
 
 fn write_pattern(engine: &mut dyn StorageEngine, page_id: u64, pattern: u8) {
@@ -26,7 +26,7 @@ fn assert_pattern(engine: &dyn StorageEngine, page_id: u64, pattern: u8) {
     let page = engine.read_page(page_id).expect("read_page");
     assert!(
         page.body().iter().all(|&b| b == pattern),
-        "página {page_id}: patrón esperado {pattern:#x} no encontrado"
+        "page {page_id}: expected pattern {pattern:#x} not found"
     );
 }
 
@@ -38,16 +38,16 @@ fn test_crash_recovery_data_survives() {
     let db_path = dir.path().join("test.db");
     let page_id;
 
-    // Escribir datos y hacer flush.
+    // Write data and flush.
     {
         let mut engine = MmapStorage::create(&db_path).expect("create");
         page_id = engine.alloc_page(PageType::Data).expect("alloc");
         write_pattern(&mut engine, page_id, 0xAB);
         engine.flush().expect("flush");
-        // `engine` se dropea aquí — simula cierre limpio.
+        // `engine` is dropped here — simulates clean shutdown.
     }
 
-    // Reabrir y verificar que los datos sobrevivieron.
+    // Reopen and verify that data survived.
     {
         let engine = MmapStorage::open(&db_path).expect("reopen");
         assert_pattern(&engine, page_id, 0xAB);
@@ -65,26 +65,26 @@ fn test_crash_recovery_freelist_survives() {
         allocated_ids = (0..5)
             .map(|_| engine.alloc_page(PageType::Data).expect("alloc"))
             .collect();
-        // Liberar la primera página.
+        // Free the first page.
         engine.free_page(allocated_ids[0]).expect("free");
         engine.flush().expect("flush");
     }
 
-    // Tras reabrir, el freelist recuerda qué páginas estaban en uso.
+    // After reopening, the freelist remembers which pages were in use.
     {
         let mut engine = MmapStorage::open(&db_path).expect("reopen");
-        // La primera ID libre debe ser `allocated_ids[0]` (fue liberada).
+        // The first free ID must be `allocated_ids[0]` (it was freed).
         let next = engine.alloc_page(PageType::Data).expect("alloc");
         assert_eq!(
             next, allocated_ids[0],
-            "freelist no persistió: esperado {}, obtenido {}",
+            "freelist did not persist: expected {}, got {}",
             allocated_ids[0], next
         );
-        // Las páginas en uso siguen sin reasignarse.
+        // In-use pages are still not reassigned.
         let next2 = engine.alloc_page(PageType::Data).expect("alloc");
         assert!(
             !allocated_ids[1..].contains(&next2),
-            "página en uso reasignada tras recovery: {next2}"
+            "in-use page reassigned after recovery: {next2}"
         );
     }
 }
@@ -97,7 +97,7 @@ fn test_crash_recovery_multiple_grows() {
 
     {
         let mut engine = MmapStorage::create(&db_path).expect("create");
-        // Agotar la capacidad inicial para forzar dos grows.
+        // Exhaust initial capacity to force two grows.
         let initial = engine.page_count();
         for _ in 0..(initial - 2 + 64 + 1) {
             engine.alloc_page(PageType::Data).expect("alloc");
@@ -111,15 +111,15 @@ fn test_crash_recovery_multiple_grows() {
         assert_eq!(
             engine.page_count(),
             count_after_grows,
-            "page_count no persistió tras grows"
+            "page_count did not persist after grows"
         );
     }
 }
 
-// ── Equivalencia MmapStorage ↔ MemoryStorage ─────────────────────────────────
+// ── Equivalence MmapStorage ↔ MemoryStorage ──────────────────────────────────
 
 fn run_equivalence_test(engine: &mut dyn StorageEngine) {
-    // alloc retorna IDs desde 2 (0=meta, 1=bitmap).
+    // alloc returns IDs starting from 2 (0=meta, 1=bitmap).
     let id1 = engine.alloc_page(PageType::Data).expect("alloc 1");
     let id2 = engine.alloc_page(PageType::Index).expect("alloc 2");
     assert!(id1 >= 2);
@@ -131,26 +131,26 @@ fn run_equivalence_test(engine: &mut dyn StorageEngine) {
     write_pattern(engine, id2, 0xDD);
     assert_pattern(engine, id2, 0xDD);
 
-    // free + realloc reutiliza.
+    // free + realloc reuses.
     engine.free_page(id1).expect("free");
     let id_reused = engine.alloc_page(PageType::Data).expect("realloc");
     assert_eq!(id_reused, id1);
 
-    // double-free: liberar id2 (que sigue en uso) y luego liberarlo otra vez.
-    engine.free_page(id2).expect("primera liberación de id2");
+    // double-free: free id2 (still in use) and then free it again.
+    engine.free_page(id2).expect("first free of id2");
     assert!(
         engine.free_page(id2).is_err(),
-        "double-free de id2 debería fallar"
+        "double-free of id2 should fail"
     );
 
-    // páginas reservadas no liberables.
+    // reserved pages cannot be freed.
     assert!(engine.free_page(0).is_err());
     assert!(engine.free_page(1).is_err());
 
-    // read de página inexistente falla.
+    // read of non-existent page fails.
     assert!(engine.read_page(999_999).is_err());
 
-    // flush no falla.
+    // flush does not fail.
     engine.flush().expect("flush");
 }
 
@@ -168,7 +168,7 @@ fn test_memory_storage_equivalence() {
     run_equivalence_test(&mut engine);
 }
 
-// ── StorageEngine como trait object ──────────────────────────────────────────
+// ── StorageEngine as a trait object ──────────────────────────────────────────
 
 #[test]
 fn test_box_dyn_storage_engine_mmap() {
@@ -191,7 +191,7 @@ fn test_box_dyn_storage_engine_memory() {
     assert_pattern(engine.as_ref(), id, 0x42);
 }
 
-// ── Crecimiento automático ────────────────────────────────────────────────────
+// ── Automatic growth ─────────────────────────────────────────────────────────
 
 #[test]
 fn test_mmap_auto_grow_on_exhaustion() {
@@ -200,19 +200,19 @@ fn test_mmap_auto_grow_on_exhaustion() {
     let mut engine = MmapStorage::create(&db_path).expect("create");
     let initial_count = engine.page_count();
 
-    // Agotar páginas iniciales.
+    // Exhaust initial pages.
     for _ in 0..(initial_count - 2) {
         engine.alloc_page(PageType::Data).expect("alloc");
     }
-    // Este alloc debe crecer automáticamente.
-    let id = engine.alloc_page(PageType::Data).expect("alloc tras grow");
+    // This alloc must grow automatically.
+    let id = engine.alloc_page(PageType::Data).expect("alloc after grow");
     assert!(
         id >= initial_count,
-        "alloc tras grow debe retornar ID en el rango nuevo"
+        "alloc after grow must return an ID in the new range"
     );
     assert!(
         engine.page_count() > initial_count,
-        "page_count debe haber crecido"
+        "page_count must have grown"
     );
 }
 
@@ -223,12 +223,12 @@ fn test_memory_auto_grow_on_exhaustion() {
     for _ in 0..(initial - 2) {
         engine.alloc_page(PageType::Data).expect("alloc");
     }
-    let id = engine.alloc_page(PageType::Data).expect("alloc tras grow");
+    let id = engine.alloc_page(PageType::Data).expect("alloc after grow");
     assert!(id >= initial);
     assert!(engine.page_count() > initial);
 }
 
-// ── Integridad del checksum en disco ─────────────────────────────────────────
+// ── On-disk checksum integrity ────────────────────────────────────────────────
 
 #[test]
 fn test_corrupted_page_detected_on_read() {
@@ -245,26 +245,26 @@ fn test_corrupted_page_detected_on_read() {
         engine.flush().expect("flush");
     }
 
-    // Corromper 1 byte del body de la página en disco.
+    // Corrupt 1 byte of the page body on disk.
     {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .open(&db_path)
-            .expect("abrir archivo");
+            .expect("open file");
         let offset = page_id as u64 * nexusdb_storage::PAGE_SIZE as u64
             + nexusdb_storage::HEADER_SIZE as u64
             + 100;
         file.seek(SeekFrom::Start(offset)).expect("seek");
-        file.write_all(&[0xFFu8]).expect("write corrupción");
+        file.write_all(&[0xFFu8]).expect("write corruption");
     }
 
-    // Reabrir y verificar que la lectura detecta la corrupción.
+    // Reopen and verify that reading detects the corruption.
     {
         let engine = MmapStorage::open(&db_path).expect("reopen");
         let result = engine.read_page(page_id);
         assert!(
             result.is_err(),
-            "checksum inválido debería retornar error, no datos corruptos"
+            "invalid checksum should return an error, not corrupt data"
         );
     }
 }

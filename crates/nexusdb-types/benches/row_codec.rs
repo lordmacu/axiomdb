@@ -152,13 +152,17 @@ fn bench_bulk_encode(c: &mut Criterion) {
     for n_rows in [100u64, 1_000, 10_000] {
         let (v, s) = user_row();
         group.throughput(Throughput::Elements(n_rows));
-        group.bench_with_input(BenchmarkId::new("encode_user_rows", n_rows), &n_rows, |b, &n| {
-            b.iter(|| {
-                for _ in 0..n {
-                    black_box(encode_row(&v, &s).unwrap());
-                }
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("encode_user_rows", n_rows),
+            &n_rows,
+            |b, &n| {
+                b.iter(|| {
+                    for _ in 0..n {
+                        black_box(encode_row(&v, &s).unwrap());
+                    }
+                })
+            },
+        );
     }
 
     group.finish();

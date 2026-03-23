@@ -1,2 +1,2 @@
-//! # nexusdb-vector — VECTOR(n), HNSW index, cuantización, similitud
-//! Stub — implementación en Fase N.
+//! # nexusdb-vector — VECTOR(n), HNSW index, quantization, similarity
+//! Stub — implementation in Phase N.

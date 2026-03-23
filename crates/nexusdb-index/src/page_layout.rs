@@ -1,26 +1,26 @@
-//! Layout de nodos del B+ Tree en páginas de 16 KB.
+//! B+ Tree node layout in 16 KB pages.
 //!
-//! Todos los campos son arrays de `u8` (alignment 1) para garantizar que
-//! `bytemuck::Pod` funcione sin padding implícito y sin problemas de alineación.
-//! Los valores multibyte se almacenan en little-endian.
+//! All fields are `u8` arrays (alignment 1) to guarantee that
+//! `bytemuck::Pod` works without implicit padding or alignment issues.
+//! Multi-byte values are stored in little-endian.
 //!
-//! ## Constantes de layout
+//! ## Layout constants
 //!
-//! `PAGE_BODY_SIZE = 16_320` bytes disponibles.
+//! `PAGE_BODY_SIZE = 16_320` bytes available.
 //!
-//! ### Nodo interno (`ORDER_INTERNAL = 223`)
+//! ### Internal node (`ORDER_INTERNAL = 223`)
 //! ```text
 //! [header:    8 B]  is_leaf=0 | _pad | num_keys([u8;2]) | _pad([u8;4])
-//! [key_lens: 223 B] longitud real de cada key (0 = slot vacío)
-//! [children: 1792 B] (223+1) punteros a páginas, 8 bytes c/u
-//! [keys:   14272 B] 223 × 64 bytes, zero-padded hasta MAX_KEY_LEN
+//! [key_lens: 223 B] actual length of each key (0 = empty slot)
+//! [children: 1792 B] (223+1) page pointers, 8 bytes each
+//! [keys:   14272 B] 223 × 64 bytes, zero-padded to MAX_KEY_LEN
 //! Total: 16295 ≤ 16320 ✓
 //! ```
 //!
-//! ### Nodo hoja (`ORDER_LEAF = 217`)
+//! ### Leaf node (`ORDER_LEAF = 217`)
 //! ```text
 //! [header:    16 B]  is_leaf=1 | _pad | num_keys([u8;2]) | _pad([u8;4]) | next_leaf([u8;8])
-//! [key_lens: 217 B]  longitud real de cada key
+//! [key_lens: 217 B]  actual length of each key
 //! [rids:    2170 B]  217 × 10 bytes: page_id(8 LE) + slot_id(2 LE)
 //! [keys:   13888 B]  217 × 64 bytes, zero-padded
 //! Total: 16291 ≤ 16320 ✓
@@ -30,44 +30,44 @@ use std::mem::size_of;
 
 use nexusdb_core::RecordId;
 
-// ── Constantes públicas ───────────────────────────────────────────────────────
+// ── Public constants ──────────────────────────────────────────────────────────
 
-/// Longitud máxima de una key en bytes.
+/// Maximum length of a key in bytes.
 pub const MAX_KEY_LEN: usize = 64;
 
-/// Máximo número de keys en un nodo interno.
+/// Maximum number of keys in an internal node.
 pub const ORDER_INTERNAL: usize = 223;
 
-/// Máximo número de keys en un nodo hoja.
+/// Maximum number of keys in a leaf node.
 pub const ORDER_LEAF: usize = 217;
 
-/// Tamaño del body de una página (PAGE_SIZE - HEADER_SIZE).
+/// Size of a page body (PAGE_SIZE - HEADER_SIZE).
 pub const PAGE_BODY_SIZE: usize = nexusdb_storage::PAGE_SIZE - nexusdb_storage::HEADER_SIZE;
 
-/// Sentinel: no hay siguiente hoja / no hay child.
+/// Sentinel: no next leaf / no child.
 pub const NULL_PAGE: u64 = u64::MAX;
 
-/// Mínimo de keys en un nodo interno (excepto raíz).
+/// Minimum keys in an internal node (except the root).
 pub const MIN_KEYS_INTERNAL: usize = ORDER_INTERNAL / 2;
 
-/// Mínimo de keys en un nodo hoja (excepto cuando es también raíz).
+/// Minimum keys in a leaf node (except when it is also the root).
 pub const MIN_KEYS_LEAF: usize = ORDER_LEAF / 2;
 
-// ── Nodo Interno ─────────────────────────────────────────────────────────────
+// ── Internal Node ─────────────────────────────────────────────────────────────
 
-/// Representación binaria de un nodo interno en el body de una página.
+/// Binary representation of an internal node in the body of a page.
 ///
-/// Todos los campos son arrays de `[u8; N]` → alignment = 1, sin padding implícito.
+/// All fields are `[u8; N]` arrays → alignment = 1, no implicit padding.
 ///
 /// Layout (16295 bytes):
 /// ```text
-/// Offset    Tamaño  Campo
-///      0         1  is_leaf  (siempre 0)
+/// Offset    Size    Field
+///      0         1  is_leaf  (always 0)
 ///      1         1  _pad0
 ///      2         2  num_keys  (LE u16)
 ///      4         4  _pad1
-///      8       223  key_lens  (1 byte por key: longitud real)
-///    231      1792  children  (224 × [u8;8], LE u64 por entrada)
+///      8       223  key_lens  (1 byte per key: actual length)
+///    231      1792  children  (224 × [u8;8], LE u64 per entry)
 ///   2023     14272  keys      (223 × [u8;64], zero-padded)
 /// Total: 16295
 /// ```
@@ -86,17 +86,17 @@ pub struct InternalNodePage {
 const _: () = assert!(
     size_of::<InternalNodePage>()
         == 8 + ORDER_INTERNAL + (ORDER_INTERNAL + 1) * 8 + ORDER_INTERNAL * MAX_KEY_LEN,
-    "InternalNodePage: tamaño incorrecto"
+    "InternalNodePage: incorrect size"
 );
 const _: () = assert!(
     size_of::<InternalNodePage>() <= PAGE_BODY_SIZE,
-    "InternalNodePage no cabe en el body de una página"
+    "InternalNodePage does not fit in the page body"
 );
 
-// SAFETY: InternalNodePage es #[repr(C)] con todos los campos siendo arrays de u8.
-// - No hay padding implícito (alignment = 1, todos los campos son u8 o [u8;N]).
-// - Cualquier secuencia de bits es un valor válido (todos los campos son u8).
-// - El tamaño es exactamente la suma de los campos (verificado por el assert anterior).
+// SAFETY: InternalNodePage is #[repr(C)] with all fields being u8 arrays.
+// - No implicit padding (alignment = 1, all fields are u8 or [u8;N]).
+// - Any bit pattern is a valid value (all fields are u8).
+// - The size is exactly the sum of the fields (verified by the assert above).
 unsafe impl bytemuck::Zeroable for InternalNodePage {}
 unsafe impl bytemuck::Pod for InternalNodePage {}
 
@@ -117,7 +117,7 @@ impl InternalNodePage {
         debug_assert!(k.len() <= MAX_KEY_LEN);
         self.key_lens[i] = k.len() as u8;
         self.keys[i][..k.len()].copy_from_slice(k);
-        // Limpiar bytes restantes para evitar datos basura
+        // Clear remaining bytes to avoid stale data
         self.keys[i][k.len()..].fill(0);
     }
 
@@ -129,11 +129,11 @@ impl InternalNodePage {
         self.children[i] = pid.to_le_bytes();
     }
 
-    /// Índice del hijo a seguir para la key dada (binary search).
-    /// Retorna el índice `j` tal que `children[j]` contiene el rango de `key`.
+    /// Index of the child to follow for the given key (binary search).
+    /// Returns index `j` such that `children[j]` contains the range for `key`.
     ///
-    /// Busca el primer separador estrictamente mayor que `key` usando binary search.
-    /// Las keys están ordenadas por invariante del B+ Tree → O(log n) comparaciones.
+    /// Finds the first separator strictly greater than `key` using binary search.
+    /// Keys are sorted by the B+ Tree invariant → O(log n) comparisons.
     pub fn find_child_idx(&self, key: &[u8]) -> usize {
         let n = self.num_keys();
         let mut lo = 0usize;
@@ -149,20 +149,20 @@ impl InternalNodePage {
         lo
     }
 
-    /// Inserta un par (sep_key, right_child_pid) en la posición `pos`.
-    /// Desplaza los existentes hacia la derecha. Incrementa num_keys.
+    /// Inserts a (sep_key, right_child_pid) pair at position `pos`.
+    /// Shifts existing entries to the right. Increments num_keys.
     ///
-    /// Precondición: num_keys < ORDER_INTERNAL
+    /// Precondition: num_keys < ORDER_INTERNAL
     pub fn insert_at(&mut self, pos: usize, sep_key: &[u8], right_pid: u64) {
         let n = self.num_keys();
-        debug_assert!(n < ORDER_INTERNAL, "nodo interno lleno antes de insert");
+        debug_assert!(n < ORDER_INTERNAL, "internal node full before insert");
 
-        // Desplazar keys y key_lens
+        // Shift keys and key_lens
         for i in (pos..n).rev() {
             self.keys[i + 1] = self.keys[i];
             self.key_lens[i + 1] = self.key_lens[i];
         }
-        // Desplazar children (children[pos+1..=n+1])
+        // Shift children (children[pos+1..=n+1])
         for i in (pos..=n).rev() {
             let pid = self.child_at(i);
             self.set_child_at(i + 1, pid);
@@ -173,8 +173,8 @@ impl InternalNodePage {
         self.set_num_keys(n + 1);
     }
 
-    /// Elimina la key en posición `key_pos` y el child en `child_pos`.
-    /// Usado al mergear: se elimina el separador y uno de los hijos mergeados.
+    /// Removes the key at position `key_pos` and the child at `child_pos`.
+    /// Used during merge: removes the separator and one of the merged children.
     pub fn remove_at(&mut self, key_pos: usize, child_pos: usize) {
         let n = self.num_keys();
         debug_assert!(n > 0);
@@ -197,18 +197,18 @@ impl InternalNodePage {
     }
 }
 
-// ── Nodo Hoja ─────────────────────────────────────────────────────────────────
+// ── Leaf Node ─────────────────────────────────────────────────────────────────
 
-/// Representación binaria de un nodo hoja en el body de una página.
+/// Binary representation of a leaf node in the body of a page.
 ///
 /// Layout (16291 bytes):
 /// ```text
-/// Offset    Tamaño  Campo
-///      0         1  is_leaf  (siempre 1)
+/// Offset    Size    Field
+///      0         1  is_leaf  (always 1)
 ///      1         1  _pad0
 ///      2         2  num_keys  (LE u16)
 ///      4         4  _pad1
-///      8         8  next_leaf  (LE u64, NULL_PAGE si es la última hoja)
+///      8         8  next_leaf  (LE u64, NULL_PAGE if this is the last leaf)
 ///     16       217  key_lens
 ///    233      2170  rids      (217 × [u8;10]: page_id(8 LE) + slot_id(2 LE))
 ///   2403     13888  keys      (217 × [u8;64], zero-padded)
@@ -229,16 +229,16 @@ pub struct LeafNodePage {
 
 const _: () = assert!(
     size_of::<LeafNodePage>() == 16 + ORDER_LEAF + ORDER_LEAF * 10 + ORDER_LEAF * MAX_KEY_LEN,
-    "LeafNodePage: tamaño incorrecto"
+    "LeafNodePage: incorrect size"
 );
 const _: () = assert!(
     size_of::<LeafNodePage>() <= PAGE_BODY_SIZE,
-    "LeafNodePage no cabe en el body de una página"
+    "LeafNodePage does not fit in the page body"
 );
 
-// SAFETY: LeafNodePage es #[repr(C)] con todos los campos siendo arrays de u8.
-// - No hay padding implícito (alignment = 1).
-// - Cualquier secuencia de bits es válida (todos los campos son u8 o [u8;N]).
+// SAFETY: LeafNodePage is #[repr(C)] with all fields being u8 arrays.
+// - No implicit padding (alignment = 1).
+// - Any bit pattern is valid (all fields are u8 or [u8;N]).
 unsafe impl bytemuck::Zeroable for LeafNodePage {}
 unsafe impl bytemuck::Pod for LeafNodePage {}
 
@@ -278,8 +278,8 @@ impl LeafNodePage {
         self.rids[i] = encode_rid(rid);
     }
 
-    /// Búsqueda binaria de `key` en el nodo hoja.
-    /// Retorna `Ok(idx)` si existe, `Err(idx)` con posición de inserción si no.
+    /// Binary search for `key` in the leaf node.
+    /// Returns `Ok(idx)` if found, `Err(idx)` with insertion position if not.
     pub fn search(&self, key: &[u8]) -> Result<usize, usize> {
         let n = self.num_keys();
         let mut lo = 0usize;
@@ -295,8 +295,8 @@ impl LeafNodePage {
         Err(lo)
     }
 
-    /// Inserta (key, rid) en la posición `pos`. Desplaza los existentes.
-    /// Precondición: num_keys < ORDER_LEAF
+    /// Inserts (key, rid) at position `pos`. Shifts existing entries.
+    /// Precondition: num_keys < ORDER_LEAF
     pub fn insert_at(&mut self, pos: usize, key: &[u8], rid: RecordId) {
         let n = self.num_keys();
         debug_assert!(n < ORDER_LEAF);
@@ -311,7 +311,7 @@ impl LeafNodePage {
         self.set_num_keys(n + 1);
     }
 
-    /// Elimina la entrada en posición `pos`. Desplaza los restantes.
+    /// Removes the entry at position `pos`. Shifts remaining entries.
     pub fn remove_at(&mut self, pos: usize) {
         let n = self.num_keys();
         debug_assert!(pos < n);
@@ -328,9 +328,9 @@ impl LeafNodePage {
     }
 }
 
-// ── Helpers de serialización de RecordId ────────────────────────────────────
+// ── RecordId serialization helpers ───────────────────────────────────────────
 
-/// Serializa RecordId a 10 bytes: page_id (8 LE) + slot_id (2 LE).
+/// Serializes RecordId to 10 bytes: page_id (8 LE) + slot_id (2 LE).
 #[inline]
 pub fn encode_rid(rid: RecordId) -> [u8; 10] {
     let mut buf = [0u8; 10];
@@ -339,10 +339,10 @@ pub fn encode_rid(rid: RecordId) -> [u8; 10] {
     buf
 }
 
-/// Deserializa RecordId desde 10 bytes.
+/// Deserializes RecordId from 10 bytes.
 ///
-/// Usa indexación directa de arrays para evitar `try_into().unwrap()` en código
-/// de producción — el compilador verifica los tamaños en tiempo de compilación.
+/// Uses direct array indexing to avoid `try_into().unwrap()` in production code
+/// — the compiler verifies the sizes at compile time.
 #[inline]
 pub fn decode_rid(buf: [u8; 10]) -> RecordId {
     RecordId {
@@ -353,29 +353,29 @@ pub fn decode_rid(buf: [u8; 10]) -> RecordId {
     }
 }
 
-// ── Casts zero-copy ──────────────────────────────────────────────────────────
+// ── Zero-copy casts ───────────────────────────────────────────────────────────
 
-/// Obtiene una referencia inmutable al nodo interno desde el body de una página.
+/// Gets an immutable reference to the internal node from the page body.
 ///
 /// # SAFETY via bytemuck
-/// `InternalNodePage` es `Pod` (todos bytes válidos para cualquier bit pattern).
-/// El body tiene `PAGE_BODY_SIZE >= size_of::<InternalNodePage>()` bytes.
-/// Se verifica con `assert_eq!(page.body()[0], 0)` antes de llamar en producción.
+/// `InternalNodePage` is `Pod` (all bytes valid for any bit pattern).
+/// The body has `PAGE_BODY_SIZE >= size_of::<InternalNodePage>()` bytes.
+/// Verified with `assert_eq!(page.body()[0], 0)` before calling in production.
 pub fn cast_internal(page: &nexusdb_storage::Page) -> &InternalNodePage {
     bytemuck::from_bytes(&page.body()[..size_of::<InternalNodePage>()])
 }
 
-/// Obtiene una referencia mutable al nodo interno desde el body de una página.
+/// Gets a mutable reference to the internal node from the page body.
 pub fn cast_internal_mut(page: &mut nexusdb_storage::Page) -> &mut InternalNodePage {
     bytemuck::from_bytes_mut(&mut page.body_mut()[..size_of::<InternalNodePage>()])
 }
 
-/// Obtiene una referencia inmutable al nodo hoja desde el body de una página.
+/// Gets an immutable reference to the leaf node from the page body.
 pub fn cast_leaf(page: &nexusdb_storage::Page) -> &LeafNodePage {
     bytemuck::from_bytes(&page.body()[..size_of::<LeafNodePage>()])
 }
 
-/// Obtiene una referencia mutable al nodo hoja desde el body de una página.
+/// Gets a mutable reference to the leaf node from the page body.
 pub fn cast_leaf_mut(page: &mut nexusdb_storage::Page) -> &mut LeafNodePage {
     bytemuck::from_bytes_mut(&mut page.body_mut()[..size_of::<LeafNodePage>()])
 }
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn test_internal_node_size_fits_page() {
         assert!(size_of::<InternalNodePage>() <= PAGE_BODY_SIZE);
-        // Verificar el valor exacto calculado en el spec
+        // Verify the exact value calculated in the spec
         assert_eq!(
             size_of::<InternalNodePage>(),
             8 + ORDER_INTERNAL + (ORDER_INTERNAL + 1) * 8 + ORDER_INTERNAL * MAX_KEY_LEN
@@ -424,11 +424,11 @@ mod tests {
         node.is_leaf = 0;
         node.set_num_keys(0);
 
-        // Insertar 3 hijos y 2 separadores manualmente
+        // Manually insert 3 children and 2 separators
         node.set_child_at(0, 100);
         node.insert_at(0, b"key_b", 200);
         node.insert_at(1, b"key_d", 300);
-        // Ahora: children=[100, 200, 300], keys=["key_b", "key_d"]
+        // Now: children=[100, 200, 300], keys=["key_b", "key_d"]
         assert_eq!(node.num_keys(), 2);
         assert_eq!(node.key_at(0), b"key_b");
         assert_eq!(node.key_at(1), b"key_d");
@@ -479,13 +479,13 @@ mod tests {
         assert_eq!(node.key_at(0), b"bbb");
         assert_eq!(node.rid_at(0).page_id, 1);
 
-        // Insertar antes
+        // Insert before
         node.insert_at(0, b"aaa", rid2);
         assert_eq!(node.num_keys(), 2);
         assert_eq!(node.key_at(0), b"aaa");
         assert_eq!(node.key_at(1), b"bbb");
 
-        // Eliminar el primero
+        // Remove the first
         node.remove_at(0);
         assert_eq!(node.num_keys(), 1);
         assert_eq!(node.key_at(0), b"bbb");
@@ -503,11 +503,11 @@ mod tests {
         node.insert_at(1, b"eee", rid);
         node.insert_at(2, b"ggg", rid);
 
-        assert_eq!(node.search(b"aaa"), Err(0)); // antes de ccc
+        assert_eq!(node.search(b"aaa"), Err(0)); // before ccc
         assert_eq!(node.search(b"ccc"), Ok(0));
-        assert_eq!(node.search(b"ddd"), Err(1)); // entre ccc y eee
+        assert_eq!(node.search(b"ddd"), Err(1)); // between ccc and eee
         assert_eq!(node.search(b"eee"), Ok(1));
         assert_eq!(node.search(b"ggg"), Ok(2));
-        assert_eq!(node.search(b"zzz"), Err(3)); // después de ggg
+        assert_eq!(node.search(b"zzz"), Err(3)); // after ggg
     }
 }

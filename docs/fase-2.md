@@ -1,47 +1,47 @@
-# Fase 2 — B+ Tree CoW
+# Phase 2 — B+ Tree CoW
 
-**Estado:** ✅ Completada
+**Status:** ✅ Completed
 **Crate:** `nexusdb-index`
 **Spec/Plan:** `specs/fase-02/`
 
 ---
 
-## Qué se implementó
+## What was implemented
 
-Un B+ Tree persistente sobre `StorageEngine` con:
+A persistent B+ Tree on top of `StorageEngine` with:
 
-- **Keys binarias variables** hasta 64 bytes (`Box<[u8]>` en API, `[u8; 64]` zero-padded en disco)
-- **Copy-on-Write** con `AtomicU64` para la raíz (readers lock-free por diseño)
-- **Insert con split** — split de hoja y propagación recursiva hasta raíz si es necesario
-- **Delete con rebalanceo** — redistribución desde hermanos y merge
-- **Range scan lazy** — iterador `RangeIter` que traversa el árbol para pasar entre hojas
-- **Prefix compression** — `CompressedNode` en memoria para nodos internos
+- **Variable binary keys** up to 64 bytes (`Box<[u8]>` in API, `[u8; 64]` zero-padded on disk)
+- **Copy-on-Write** with `AtomicU64` for the root (readers lock-free by design)
+- **Insert with split** — leaf split and recursive propagation up to root when needed
+- **Delete with rebalancing** — redistribution from siblings and merge
+- **Lazy range scan** — `RangeIter` iterator that traverses the tree to move between leaves
+- **Prefix compression** — `CompressedNode` in memory for internal nodes
 
 ---
 
-## Decisiones técnicas
+## Technical decisions
 
-| Decisión | Elección | Razón |
+| Decision | Choice | Reason |
 |---|---|---|
-| KeyType en API | `&[u8]` (max 64 bytes) | Soporta u64, UUID, strings cortos sin overhead |
-| Serialización a disco | `bytemuck::Pod` + `unsafe impl` manual | Arrays grandes (>32) no tienen Pod automático |
-| Linked list de hojas | No usada en range scan | CoW invalida punteros `next_leaf`; iterator usa tree traversal |
-| Concurrencia | `AtomicU64` root, `&mut self` en writes | Correcto para Fase 2; extensible a lock-free en Fase 7 |
+| KeyType in API | `&[u8]` (max 64 bytes) | Supports u64, UUID, short strings without overhead |
+| Disk serialization | `bytemuck::Pod` + manual `unsafe impl` | Large arrays (>32) have no automatic Pod |
+| Leaf linked list | Not used in range scan | CoW invalidates `next_leaf` pointers; iterator uses tree traversal |
+| Concurrency | `AtomicU64` root, `&mut self` on writes | Correct for Phase 2; extensible to lock-free in Phase 7 |
 
-### Por qué `next_leaf` no se usa en el iterador
+### Why `next_leaf` is not used in the iterator
 
-Con CoW, al copiar una hoja `L_old → L_new`, la hoja anterior en la linked list
-sigue apuntando a `L_old` (ya liberada). Mantener la linked list en sync requeriría
-CoW de la hoja anterior también, lo cual requiere conocer su page_id durante cada insert.
+With CoW, when copying a leaf `L_old → L_new`, the previous leaf in the linked list
+still points to `L_old` (already freed). Keeping the linked list in sync would require
+CoW of the previous leaf as well, which requires knowing its page_id during each insert.
 
-**Solución adoptada**: el `RangeIter` traversa el árbol desde root para encontrar
-la siguiente hoja. Costo: O(log n) por cruce de frontera entre hojas (aceptable).
+**Adopted solution**: the `RangeIter` traverses the tree from root to find
+the next leaf. Cost: O(log n) per boundary crossing between leaves (acceptable).
 
 ---
 
-## Layout de páginas en disco
+## On-disk page layout
 
-### Nodo interno (`ORDER_INTERNAL = 223`, tamaño: 16,295 bytes)
+### Internal node (`ORDER_INTERNAL = 223`, size: 16,295 bytes)
 ```
 [is_leaf=0: 1B][_pad: 1B][num_keys: 2B LE][_pad: 4B]  = 8B
 [key_lens: 223B]                                         = 223B
@@ -50,7 +50,7 @@ la siguiente hoja. Costo: O(log n) por cruce de frontera entre hojas (aceptable)
 Total: 16,295B ≤ PAGE_BODY_SIZE (16,320B) ✓
 ```
 
-### Nodo hoja (`ORDER_LEAF = 217`, tamaño: 16,291 bytes)
+### Leaf node (`ORDER_LEAF = 217`, size: 16,291 bytes)
 ```
 [is_leaf=1: 1B][_pad: 1B][num_keys: 2B LE][_pad: 4B][next_leaf: 8B LE]  = 16B
 [key_lens: 217B]                                                           = 217B
@@ -61,7 +61,7 @@ Total: 16,291B ≤ PAGE_BODY_SIZE (16,320B) ✓
 
 ---
 
-## Archivos creados
+## Files created
 
 ```
 crates/nexusdb-index/
@@ -73,7 +73,7 @@ crates/nexusdb-index/
     ├── iter.rs                     — RangeIter (lazy, tree traversal)
     └── prefix.rs                   — CompressedNode (prefix compression)
 crates/nexusdb-index/tests/
-└── integration_btree.rs            — 8 tests de integración
+└── integration_btree.rs            — 8 integration tests
 crates/nexusdb-index/benches/
 └── btree.rs                        — Criterion: lookup, range scan, insert
 specs/fase-02/
@@ -83,32 +83,32 @@ specs/fase-02/
 
 ---
 
-## Métricas de calidad
+## Quality metrics
 
-- **Tests:** 37 pasan (28 unit + 8 integration + 1 doctest)
-- **Clippy:** 0 errores (`-D warnings`)
-- **Fmt:** limpio
-- **Benchmarks:** compilan y corren correctamente
-  - 100K inserts aleatorios: sin panics
-  - Point lookup 10K/100K/1M keys: funcional
-  - Range scan 100/1K/10K results: funcional
+- **Tests:** 37 pass (28 unit + 8 integration + 1 doctest)
+- **Clippy:** 0 errors (`-D warnings`)
+- **Fmt:** clean
+- **Benchmarks:** compile and run correctly
+  - 100K random inserts: no panics
+  - Point lookup 10K/100K/1M keys: functional
+  - Range scan 100/1K/10K results: functional
 
 ---
 
-## Bug notable corregido durante implementación
+## Notable bug fixed during implementation
 
-**`rotate_right` en split_internal panics cuando `child_idx == n`**
+**`rotate_right` in split_internal panics when `child_idx == n`**
 
-Causa: `kl[n+1..=n].rotate_right(1)` llama rotate_right(1) en una slice vacía → panic.
-Fix: reemplazar por `copy_within(child_idx..n, child_idx+1)` que maneja rangos vacíos.
+Cause: `kl[n+1..=n].rotate_right(1)` calls rotate_right(1) on an empty slice → panic.
+Fix: replace with `copy_within(child_idx..n, child_idx+1)` which handles empty ranges.
 
 ---
 
 ## Deferred items
 
-Nada crítico. Los siguientes quedan para fases posteriores:
+Nothing critical. The following are left for later phases:
 
-- `next_leaf` linked list mantenida en CoW (Fase 7, con MVCC y epoch reclamation)
-- Keys > 64 bytes con overflow pages (Fase posterior)
-- Bloom filter por índice (Fase 6)
-- Partial / covering / sparse indexes (Fase 6)
+- `next_leaf` linked list maintained in CoW (Phase 7, with MVCC and epoch reclamation)
+- Keys > 64 bytes with overflow pages (later phase)
+- Bloom filter per index (Phase 6)
+- Partial / covering / sparse indexes (Phase 6)

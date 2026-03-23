@@ -1,110 +1,110 @@
-# /fase-completa — Protocolo de cierre de fase
+# /fase-completa — Phase close protocol
 
-Ejecutar este protocolo COMPLETO al terminar cada fase. Sin excepciones.
+Run this COMPLETE protocol when finishing each phase. No exceptions.
 
-## Paso 1 — Verificar calidad del código
+## Step 1 — Verify code quality
 
 ```bash
 # Tests
 cargo test --workspace
-# Si falla: NO continuar hasta que pasen
+# If it fails: DO NOT continue until they pass
 
 # Linting
 cargo clippy --workspace -- -D warnings
-# Si hay warnings: NO continuar hasta resolverlos
+# If there are warnings: DO NOT continue until resolved
 
-# Formato
+# Format
 cargo fmt --check
-# Si hay diferencias: correr cargo fmt y agregar al commit
+# If there are differences: run cargo fmt and add to the commit
 
-# Documentación de unsafe
+# Unsafe documentation
 grep -r "unsafe" crates/ --include="*.rs" | grep -v "// SAFETY:"
-# Si hay bloques unsafe sin SAFETY: agregar el comentario
+# If there are unsafe blocks without SAFETY: add the comment
 ```
 
-## Paso 2 — Benchmarks (si aplica)
+## Step 2 — Benchmarks (if applicable)
 
 ```bash
 cargo bench --workspace 2>&1 | tail -30
-# Comparar contra presupuesto en CLAUDE.md
-# Si alguna operación crítica regresó >5%: investigar antes de continuar
+# Compare against budget in CLAUDE.md
+# If any critical operation regressed >5%: investigate before continuing
 ```
 
-## Paso 3 — Documentar la fase
+## Step 3 — Document the phase
 
-Crear `docs/fase-N.md` con este template:
+Create `docs/fase-N.md` with this template:
 
 ```markdown
-# Fase N — [Nombre]
+# Phase N — [Name]
 
-Completada: [fecha]
-Semanas estimadas: N-M | Semanas reales: X
+Completed: [date]
+Estimated weeks: N-M | Actual weeks: X
 
-## Qué se construyó
-[descripción de lo implementado]
+## What was built
+[description of what was implemented]
 
-## Crates creados/modificados
-- `crates/dbyo-X` — [qué hace]
+## Crates created/modified
+- `crates/dbyo-X` — [what it does]
 
-## Decisiones tomadas
-- [decisión] → [razón]
+## Decisions made
+- [decision] → [reason]
 
-## Tests escritos
-- [test] — [qué verifica]
+## Tests written
+- [test] — [what it verifies]
 
-## Cómo continuar desde aquí
-[instrucción exacta para la próxima sesión]
+## How to continue from here
+[exact instruction for the next session]
 
-## Próxima fase
-Fase N+1 — [nombre]. Ver `specs/fase-N+1/` y `db.md`.
+## Next phase
+Phase N+1 — [name]. See `specs/fase-N+1/` and `db.md`.
 ```
 
-## Paso 4 — Actualizar memoria
+## Step 4 — Update memory
 
 ```
 memory/project_state.md:
-  - Mover fase N de "pendientes" a "completadas"
-  - Actualizar "Fase actual" a N+1
+  - Move phase N from "pending" to "completed"
+  - Update "Current phase" to N+1
 
 memory/architecture.md:
-  - Agregar los crates y structs realmente implementados
-  - Actualizar el árbol de directorios
+  - Add the actually implemented crates and structs
+  - Update the directory tree
 
 memory/decisions.md:
-  - Agregar decisiones técnicas tomadas durante la fase
+  - Add technical decisions made during the phase
 
-memory/lessons.md (si hubo aprendizajes):
-  - ### [Fase N] Título del aprendizaje
-  - Problema, causa, solución, cuándo aplicar
+memory/lessons.md (if there were learnings):
+  - ### [Phase N] Learning title
+  - Problem, cause, solution, when to apply
 ```
 
-## Paso 5 — Commit
+## Step 5 — Commit
 
 ```bash
 git add -A
-git commit -m "feat(fase-N): [descripción concisa]
+git commit -m "feat(fase-N): [concise description]
 
-- [detalle 1]
-- [detalle 2]
+- [detail 1]
+- [detail 2]
 
-Fase N/34 completada. Ver docs/fase-N.md
-Spec: specs/fase-N/ | Tests: X pasando"
+Phase N/34 completed. See docs/fase-N.md
+Spec: specs/fase-N/ | Tests: X passing"
 ```
 
-## Paso 6 — Confirmar al usuario
+## Step 6 — Confirm to user
 
-Reportar:
+Report:
 ```
-✅ Fase N completada
+✅ Phase N completed
 
-Tests:      X/X pasando
+Tests:      X/X passing
 Clippy:     0 warnings
-Benchmarks: [dentro/fuera] del presupuesto
+Benchmarks: [within/outside] budget
 
-Documentado en: docs/fase-N.md
-Memoria:        actualizada
-Commit:         [hash]
+Documented in: docs/fase-N.md
+Memory:        updated
+Commit:        [hash]
 
-Próxima fase: N+1 — [nombre]
-Para continuar: /brainstorm sobre la Fase N+1
+Next phase: N+1 — [name]
+To continue: /brainstorm on Phase N+1
 ```

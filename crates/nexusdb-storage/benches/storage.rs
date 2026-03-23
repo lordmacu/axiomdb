@@ -8,7 +8,7 @@ use tempfile::tempdir;
 
 fn make_data_page(page_id: u64) -> Page {
     let mut page = Page::new(PageType::Data, page_id);
-    // Datos realistas — evita optimizaciones del OS/compilador para ceros.
+    // Realistic data — avoids OS/compiler optimizations for zeros.
     page.body_mut()
         .iter_mut()
         .enumerate()
@@ -103,8 +103,8 @@ fn bench_memory_sequential_reads(c: &mut Criterion) {
 
 // ── MmapStorage benchmarks ────────────────────────────────────────────────────
 //
-// El storage se crea UNA VEZ antes del loop de medición. Así medimos solo la
-// operación real (alloc, write, read) sin incluir create()/mmap()/set_len().
+// The storage is created ONCE before the measurement loop. This way we measure
+// only the real operation (alloc, write, read) without including create()/mmap()/set_len().
 
 fn bench_mmap_alloc(c: &mut Criterion) {
     let mut group = c.benchmark_group("mmap/alloc");
@@ -114,13 +114,13 @@ fn bench_mmap_alloc(c: &mut Criterion) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bench_alloc.db");
         let mut storage = MmapStorage::create(&path).unwrap();
-        // Pre-grow a 10_000 páginas para que el benchmark no dispare grows.
+        // Pre-grow to 10_000 pages so the benchmark does not trigger grows.
         storage.grow(10_000).unwrap();
 
         b.iter(|| {
             let id = storage.alloc_page(PageType::Data).unwrap();
-            // Liberar inmediatamente para reutilizar la misma página y evitar
-            // que el storage crezca durante la medición.
+            // Free immediately to reuse the same page and prevent
+            // the storage from growing during measurement.
             storage.free_page(id).unwrap();
         });
     });
@@ -138,12 +138,12 @@ fn bench_mmap_write_read(c: &mut Criterion) {
     let page_id = storage.alloc_page(PageType::Data).unwrap();
     let page = make_data_page(page_id);
 
-    // Medir solo el copy de 16KB al mmap.
+    // Measure only the 16 KB copy to mmap.
     group.bench_function("write_page", |b| {
         b.iter(|| storage.write_page(page_id, &page).unwrap());
     });
 
-    // Medir solo acceso zero-copy al mmap + verify CRC32c.
+    // Measure only zero-copy access to mmap + verify CRC32c.
     group.bench_function("read_page", |b| {
         b.iter(|| {
             let p = storage.read_page(page_id).unwrap();
@@ -159,7 +159,7 @@ fn bench_mmap_sequential_reads(c: &mut Criterion) {
     let mut group = c.benchmark_group("mmap/sequential");
     group.throughput(Throughput::Elements(N_PAGES));
 
-    // Setup único: storage con 1000 páginas ya escritas.
+    // One-time setup: storage with 1000 pages already written.
     let dir = tempdir().unwrap();
     let path = dir.path().join("bench_seq.db");
     let mut storage = MmapStorage::create(&path).unwrap();
@@ -173,7 +173,7 @@ fn bench_mmap_sequential_reads(c: &mut Criterion) {
         })
         .collect();
 
-    // Medir solo las 1000 lecturas.
+    // Measure only the 1000 reads.
     group.bench_function(BenchmarkId::new("read_sequential", N_PAGES), |b| {
         b.iter(|| {
             ids.iter().for_each(|&id| {
@@ -207,7 +207,7 @@ fn bench_checksum_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Registro ──────────────────────────────────────────────────────────────────
+// ── Registration ─────────────────────────────────────────────────────────────
 
 criterion_group!(
     benches,

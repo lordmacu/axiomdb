@@ -1,64 +1,64 @@
-# /brainstorm — Explorar antes de proponer
+# /brainstorm — Explore before proposing
 
-Antes de proponer ninguna solución, ejecutar este protocolo completo:
+Before proposing any solution, run this complete protocol:
 
-## Paso 1 — Leer contexto
-- Leer `db.md` sección de la fase actual
-- Leer `docs/fase-anterior.md` si existe
-- Leer archivos del codebase relevantes a la tarea
-- Leer `specs/fase-actual/` si existe
+## Step 1 — Read context
+- Read `db.md` section for the current phase
+- Read `docs/fase-anterior.md` if it exists
+- Read codebase files relevant to the task
+- Read `specs/fase-actual/` if it exists
 
-## Paso 2 — Hacer preguntas al usuario
-No proponer nada hasta tener respuestas a:
-- ¿Cuál es el comportamiento esperado exacto?
-- ¿Hay casos borde conocidos que debo manejar?
-- ¿Hay restricciones de rendimiento (latencia, throughput)?
-- ¿Hay restricciones de compatibilidad con fases anteriores?
-- ¿Cuánto tiempo aproximado tenemos para esta fase?
+## Step 2 — Ask the user questions
+Do not propose anything until you have answers to:
+- What is the exact expected behavior?
+- Are there known edge cases I need to handle?
+- Are there performance constraints (latency, throughput)?
+- Are there compatibility constraints with previous phases?
+- How much time do we have for this phase?
 
-## Paso 3 — Proponer enfoques con trade-offs
-Siempre presentar **al menos 2 opciones**, nunca solo la "mejor":
-
-```
-Enfoque A: [nombre]
-  Ventajas: [lista]
-  Desventajas: [lista]
-  Cuándo elegirlo: [condición]
-
-Enfoque B: [nombre]
-  Ventajas: [lista]
-  Desventajas: [lista]
-  Cuándo elegirlo: [condición]
-```
-
-## Paso 4 — Sprint con dependencias
-Si la tarea tiene subtareas, escribir sprint explícito:
+## Step 3 — Propose approaches with trade-offs
+Always present **at least 2 options**, never just the "best" one:
 
 ```
-Sprint: [nombre de la fase]
-Estimación: [N horas/días]
+Approach A: [name]
+  Pros: [list]
+  Cons: [list]
+  When to choose it: [condition]
 
-├── Tarea 1: [nombre]
-│   Descripción: [qué hace]
-│   Dependencias: ninguna
-│   Criterio de done: [verificable]
+Approach B: [name]
+  Pros: [list]
+  Cons: [list]
+  When to choose it: [condition]
+```
+
+## Step 4 — Sprint with dependencies
+If the task has subtasks, write an explicit sprint:
+
+```
+Sprint: [phase name]
+Estimate: [N hours/days]
+
+├── Task 1: [name]
+│   Description: [what it does]
+│   Dependencies: none
+│   Done criterion: [verifiable]
 │
-├── Tarea 2: [nombre]
-│   Descripción: [qué hace]
-│   Dependencias: Tarea 1
-│   Criterio de done: [verificable]
+├── Task 2: [name]
+│   Description: [what it does]
+│   Dependencies: Task 1
+│   Done criterion: [verifiable]
 │
-└── Tarea 3: [nombre]
-    Descripción: [qué hace]
-    Dependencias: Tarea 1
-    Criterio de done: [verificable]
+└── Task 3: [name]
+    Description: [what it does]
+    Dependencies: Task 1
+    Done criterion: [verifiable]
 ```
 
-## Output esperado
-Al final del brainstorm, el usuario y Claude deben tener acordado:
-- [ ] Enfoque elegido y por qué
-- [ ] Sprint con tareas y dependencias
-- [ ] Criterios de done claros
-- [ ] Riesgos identificados
+## Expected output
+At the end of the brainstorm, the user and Claude must have agreed on:
+- [ ] Chosen approach and why
+- [ ] Sprint with tasks and dependencies
+- [ ] Clear done criteria
+- [ ] Identified risks
 
-Siguiente paso: `/spec-task` para la primera tarea del sprint.
+Next step: `/spec-task` for the first task in the sprint.

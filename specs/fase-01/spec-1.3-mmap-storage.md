@@ -1,55 +1,55 @@
 # Spec: 1.3 — MmapStorage
 
-## Qué construir
-Motor de storage basado en mmap: abrir/crear un archivo `.db`, leer y escribir
-páginas con acceso zero-copy directo al mmap. Sin free list aún (eso es 1.5).
+## What to build
+mmap-based storage engine: open/create a `.db` file, read and write
+pages with direct zero-copy access to the mmap. No free list yet (that is 1.5).
 
 ## Inputs / Outputs
-- `create(path)` → `MmapStorage` con página 0 (Meta) inicializada
-- `open(path)` → `MmapStorage` validando magic + checksum de página 0
-- `read_page(page_id)` → `&Page` (zero-copy desde mmap), verifica checksum
-- `write_page(page_id, &Page)` → copia bytes al mmap
-- `flush()` → msync para garantizar durabilidad
+- `create(path)` → `MmapStorage` with page 0 (Meta) initialized
+- `open(path)` → `MmapStorage` validating magic + checksum of page 0
+- `read_page(page_id)` → `&Page` (zero-copy from mmap), verifies checksum
+- `write_page(page_id, &Page)` → copies bytes to the mmap
+- `flush()` → msync to guarantee durability
 - `page_count()` → u64
 
-## Layout del archivo
+## File layout
 ```
-offset 0          : Page 0 — Meta (header + DbFileMeta en body)
+offset 0          : Page 0 — Meta (header + DbFileMeta in body)
 offset PAGE_SIZE  : Page 1
 offset 2*PAGE_SIZE: Page 2
 ...
 ```
 
-## DbFileMeta (en body de página 0, offset 64 del archivo)
+## DbFileMeta (in body of page 0, offset 64 of the file)
 ```
-offset  size  campo
+offset  size  field
 0       8     db_magic: u64    — 0x4E455855_53444201 ("NEXUSDB\1")
-8       4     version: u32     — versión del formato (1)
+8       4     version: u32     — format version (1)
 12      4     _pad: u32
-16      8     page_count: u64  — total de páginas en el archivo
-24      ...   reservado
+16      8     page_count: u64  — total pages in the file
+24      ...   reserved
 ```
 
-## Crecimiento de archivo
-- Unidad de crecimiento: **64 páginas = 1MB** (reduce syscalls de truncate)
-- Al crear: archivo inicia con 64 páginas pre-allocadas
-- Al escribir fuera del rango actual: error `PageNotFound` (alloc es 1.5)
+## File growth
+- Growth unit: **64 pages = 1MB** (reduces truncate syscalls)
+- On create: file starts with 64 pre-allocated pages
+- On write beyond current range: error `PageNotFound` (alloc is 1.5)
 
-## Criterios de aceptación
-- [ ] `create` produce archivo válido con página 0 de tipo Meta
-- [ ] `open` sobre archivo creado con `create` funciona correctamente
-- [ ] `open` sobre archivo inexistente retorna `Err(DbError::Io(...))`
-- [ ] `read_page(0)` retorna la página Meta con checksum válido
-- [ ] `write_page` + `read_page` roundtrip conserva datos exactos
-- [ ] `read_page` fuera de rango retorna `Err(DbError::PageNotFound)`
-- [ ] `flush` completa sin error
-- [ ] Test de crash: escribir → drop → reabrir → leer → mismo contenido
+## Acceptance criteria
+- [ ] `create` produces a valid file with page 0 of type Meta
+- [ ] `open` on a file created with `create` works correctly
+- [ ] `open` on a nonexistent file returns `Err(DbError::Io(...))`
+- [ ] `read_page(0)` returns the Meta page with valid checksum
+- [ ] `write_page` + `read_page` roundtrip preserves exact data
+- [ ] `read_page` out of range returns `Err(DbError::PageNotFound)`
+- [ ] `flush` completes without error
+- [ ] Crash test: write → drop → reopen → read → same content
 
-## Fuera del alcance
-- Alloc/free de páginas (1.5)
+## Out of scope
+- Page alloc/free (1.5)
 - MemoryStorage (1.4)
-- Concurrencia (Fase 7)
+- Concurrency (Phase 7)
 
-## Dependencias
-- `nexusdb-storage::page` (ya existe)
-- crate `memmap2`
+## Dependencies
+- `nexusdb-storage::page` (already exists)
+- `memmap2` crate
