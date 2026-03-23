@@ -7,7 +7,7 @@ so the next session can continue without questions.
 
 ```bash
 DATE=$(date +%Y%m%d-%H%M)
-cat > /Users/cristian/dbyo/docs/checkpoint-$DATE.md << 'CHECKPOINT'
+cat > /Users/cristian/nexusdb/docs/checkpoint-$DATE.md << 'CHECKPOINT'
 # Checkpoint [DATE]
 
 ## Phase state
@@ -24,7 +24,7 @@ Current task: [name of the task within the sprint]
 
 ## Exact next step
 [precise instruction — enough to continue without context]
-Example: "Implement fn insert() in crates/dbyo-index/src/btree.rs line 42,
+Example: "Implement fn insert() in crates/axiomdb-index/src/btree.rs line 42,
          following the algorithm in the spec at specs/fase-02/spec-btree.md section 'Insert'"
 
 ## Test state

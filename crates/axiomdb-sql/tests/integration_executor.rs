@@ -7,15 +7,16 @@
 
 use axiomdb_catalog::{CatalogBootstrap, CatalogReader};
 use axiomdb_core::error::DbError;
-use axiomdb_sql::{analyze, execute, parse, tokenize, QueryResult, Value};
+use axiomdb_sql::{analyze, execute, parse, QueryResult};
 use axiomdb_storage::MemoryStorage;
+use axiomdb_types::Value;
 use axiomdb_wal::TxnManager;
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 /// Runs a SQL string through the full pipeline and returns the `QueryResult`.
 fn run(sql: &str, storage: &mut MemoryStorage, txn: &mut TxnManager) -> QueryResult {
-    run_result(sql, storage, txn).expect(sql)
+    run_result(sql, storage, txn).unwrap_or_else(|e| panic!("SQL failed: {sql}\nError: {e:?}"))
 }
 
 /// Runs a SQL string and returns the result or error.
@@ -24,15 +25,8 @@ fn run_result(
     storage: &mut MemoryStorage,
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
-    let tokens = tokenize(sql).map_err(|e| DbError::ParseError {
-        message: format!("{e:?}"),
-    })?;
-    let stmt = parse(&tokens).map_err(|e| DbError::ParseError {
-        message: format!("{e:?}"),
-    })?;
-    let snap = txn
-        .active_snapshot()
-        .unwrap_or_else(|_| txn.snapshot());
+    let stmt = parse(sql, None)?;
+    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
     let analyzed = analyze(stmt, storage, snap)?;
     execute(analyzed, storage, txn)
 }
@@ -117,7 +111,11 @@ fn test_create_table_if_not_exists() {
     let (mut storage, mut txn) = setup();
     run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
     // Second create with IF NOT EXISTS must not error.
-    let result = run("CREATE TABLE IF NOT EXISTS t (id INT)", &mut storage, &mut txn);
+    let result = run(
+        "CREATE TABLE IF NOT EXISTS t (id INT)",
+        &mut storage,
+        &mut txn,
+    );
     assert_eq!(result, QueryResult::Empty);
 }
 
@@ -154,7 +152,11 @@ fn test_drop_table_if_exists() {
 #[test]
 fn test_insert_and_scan() {
     let (mut storage, mut txn) = setup();
-    run("CREATE TABLE users (id INT, name TEXT)", &mut storage, &mut txn);
+    run(
+        "CREATE TABLE users (id INT, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
     let aff = affected_count(run(
         "INSERT INTO users VALUES (1, 'Alice')",
         &mut storage,
@@ -202,11 +204,7 @@ fn test_insert_named_columns() {
 #[test]
 fn test_insert_missing_column_is_null() {
     let (mut storage, mut txn) = setup();
-    run(
-        "CREATE TABLE t (id INT, name TEXT)",
-        &mut storage,
-        &mut txn,
-    );
+    run("CREATE TABLE t (id INT, name TEXT)", &mut storage, &mut txn);
     run("INSERT INTO t (id) VALUES (4)", &mut storage, &mut txn);
 
     let r = rows(run("SELECT * FROM t", &mut storage, &mut txn));
@@ -232,7 +230,11 @@ fn test_insert_unknown_column_error() {
 #[test]
 fn test_select_with_where() {
     let (mut storage, mut txn) = setup();
-    run("CREATE TABLE users (id INT, name TEXT)", &mut storage, &mut txn);
+    run(
+        "CREATE TABLE users (id INT, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
     run(
         "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')",
         &mut storage,
@@ -372,22 +374,10 @@ fn test_update_unknown_column_error() {
 #[test]
 fn test_delete_with_where() {
     let (mut storage, mut txn) = setup();
-    run(
-        "CREATE TABLE t (id INT)",
-        &mut storage,
-        &mut txn,
-    );
-    run(
-        "INSERT INTO t VALUES (1), (2), (3)",
-        &mut storage,
-        &mut txn,
-    );
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1), (2), (3)", &mut storage, &mut txn);
 
-    let aff = affected_count(run(
-        "DELETE FROM t WHERE id = 2",
-        &mut storage,
-        &mut txn,
-    ));
+    let aff = affected_count(run("DELETE FROM t WHERE id = 2", &mut storage, &mut txn));
     assert_eq!(aff, 1);
 
     let r = rows(run("SELECT * FROM t", &mut storage, &mut txn));
@@ -449,7 +439,11 @@ fn test_read_own_writes_in_txn() {
     let r = rows(run("SELECT * FROM t", &mut storage, &mut txn));
     run("COMMIT", &mut storage, &mut txn);
 
-    assert_eq!(r.len(), 1, "read-your-own-writes must work within a transaction");
+    assert_eq!(
+        r.len(),
+        1,
+        "read-your-own-writes must work within a transaction"
+    );
     assert_eq!(r[0][0], Value::Int(7));
 }
 
@@ -480,10 +474,7 @@ fn test_order_by_returns_not_implemented() {
     let (mut storage, mut txn) = setup();
     run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
     let err = run_result("SELECT * FROM t ORDER BY id", &mut storage, &mut txn).unwrap_err();
-    assert!(
-        matches!(err, DbError::NotImplemented { .. }),
-        "got {err:?}"
-    );
+    assert!(matches!(err, DbError::NotImplemented { .. }), "got {err:?}");
 }
 
 #[test]
@@ -491,10 +482,7 @@ fn test_limit_returns_not_implemented() {
     let (mut storage, mut txn) = setup();
     run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
     let err = run_result("SELECT * FROM t LIMIT 1", &mut storage, &mut txn).unwrap_err();
-    assert!(
-        matches!(err, DbError::NotImplemented { .. }),
-        "got {err:?}"
-    );
+    assert!(matches!(err, DbError::NotImplemented { .. }), "got {err:?}");
 }
 
 // ── Full round-trip ───────────────────────────────────────────────────────────

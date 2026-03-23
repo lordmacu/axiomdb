@@ -83,13 +83,13 @@ sysbench oltp_point_select \
   --tables=1 --table-size=1000000 \
   run > /tmp/mysql_results.txt
 
-# Benchmark dbyo (same sysbench, different port)
+# Benchmark AxiomDB (same sysbench, different port)
 sysbench oltp_point_select \
-  --mysql-host=localhost --mysql-port=3306 \  # dbyo speaks MySQL protocol
+  --mysql-host=localhost --mysql-port=3306 \  # axiomdb speaks MySQL protocol
   --mysql-db=test --mysql-user=root \
   --tables=1 --table-size=1000000 \
-  run > /tmp/dbyo_results.txt
+  run > /tmp/axiomdb_results.txt
 
 # Compare
-diff /tmp/mysql_results.txt /tmp/dbyo_results.txt
+diff /tmp/mysql_results.txt /tmp/axiomdb_results.txt
 ```

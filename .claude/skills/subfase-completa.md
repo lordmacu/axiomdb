@@ -16,13 +16,13 @@ Example: `/subfase-completa 1.3` marks subphase 1.3 as completed.
 ### Step 1 — Verify the subphase is truly ready
 
 ```bash
-cd /Users/cristian/dbyo
+cd /Users/cristian/nexusdb
 
 # Tests for the affected crate
-cargo test -p dbyo-CRATE --quiet 2>&1 | tail -5
+cargo test -p axiomdb-CRATE --quiet 2>&1 | tail -5
 
 # Clippy with no warnings
-cargo clippy -p dbyo-CRATE -- -D warnings 2>&1 | head -10
+cargo clippy -p axiomdb-CRATE -- -D warnings 2>&1 | head -10
 
 # Correct format
 cargo fmt --check 2>&1 | head -5
@@ -74,7 +74,7 @@ Last completed: N.M — description — YYYY-MM-DD
 Only if N.M was the last subphase of Phase N:
 ```markdown
 ## Implemented crates
-- `dbyo-NAME` — description (Phase N completed YYYY-MM-DD)
+- `axiomdb-NAME` — description (Phase N completed YYYY-MM-DD)
 ```
 
 ### Step 6 — Commit and push

@@ -1,4 +1,4 @@
-# Progress — dbyo Database Engine
+# Progress — AxiomDB Database Engine
 
 > Automatically updated with `/subfase-completa`
 > Legend: ✅ completed | 🔄 in progress | ⏳ pending | ⏸ blocked
@@ -112,8 +112,8 @@
 - [x] 4.23 ✅ QueryResult type — unified executor return: `Rows{columns: Vec<ColumnMeta>, rows: Vec<Row>}` for SELECT, `Affected{count, last_insert_id}` for DML, `Empty` for DDL; basis for Phase 5 wire protocol serialization
 
 <!-- ── Group D — Basic executor (needs Groups A + B + C) ── -->
-- [ ] 4.5 ⏳ Basic executor — connects AST→semantic→storage: executes CREATE/DROP TABLE, INSERT, SELECT (with WHERE), UPDATE, DELETE; uses TxnManager::autocommit per statement; **depends on: 4.0, 4.1–4.4, 4.17, 4.18, 4.23, SchemaResolver(3.14)**
-- [ ] 4.5a ⏳ SELECT without FROM — `SELECT 1`, `SELECT NOW()`, `SELECT VERSION()`; health-check query used by every ORM on connect
+- [x] 4.5 ✅ Basic executor — connects AST→semantic→storage: executes CREATE/DROP TABLE, INSERT, SELECT (with WHERE), UPDATE, DELETE; autocommit per statement
+- [x] 4.5a ✅ SELECT without FROM — `SELECT 1`, `SELECT NOW()`; included in 4.5
 - [x] 4.5b ✅ Table engine — row storage interface: `scan_table(snap)→RowIter`, `insert_row(values)→RecordId`, `delete_row(rid)`, `update_row(rid, values)`; wraps HeapChain + Row codec + catalog; used by the executor for all DML on heap tables
 - [ ] 4.25 ⏳ Error handling framework — SQLSTATE codes (23505, 42P01, 40001), propagation without panic, recovery from constraint + type errors; base for all other modules
 - [ ] 4.25b ⏳ Structured error responses — every error includes: `code` (SQLSTATE), `message`, `detail` (table, column, constraint, offending value), `hint` (what to do), `position` (query line/col); inspired by Rust compiler errors — the most actionable error format in any language; `'duplicate key'` errors tell you which row already has that value; `'foreign key violation'` tells you which referenced row does not exist; available as JSON via `SET error_format = 'json'` and as human-readable text by default; no other SQL database provides this level of detail out of the box
@@ -250,7 +250,7 @@
 
 ### Phase 10 — Embedded mode + FFI `⏳` week 24-25
 - [ ] 10.1 ⏳ Refactor engine as reusable `lib.rs`
-- [ ] 10.2 ⏳ C FFI — `dbyo_open`, `dbyo_execute`, `dbyo_close` with `#[no_mangle]`
+- [ ] 10.2 ⏳ C FFI — `axiomdb_open`, `axiomdb_execute`, `axiomdb_close` with `#[no_mangle]`
 - [ ] 10.3 ⏳ Compile as `cdylib` — `.so` / `.dll` / `.dylib`
 - [ ] 10.4 ⏳ Python binding — working `ctypes` demo
 - [ ] 10.5 ⏳ Embedded test — same DB used from server and from library
@@ -522,7 +522,7 @@
 - [ ] 22b.2 ⏳ Foreign Data Wrappers — HTTP + PostgreSQL as external sources
 - [ ] 22b.3 ⏳ Multi-database — `CREATE DATABASE`, `USE`, cross-db queries
 - [ ] 22b.4 ⏳ Schema namespacing — `CREATE SCHEMA`, `schema.table`
-- [ ] 22b.5 ⏳ Schema migrations CLI — `dbyo migrate up/down/status`
+- [ ] 22b.5 ⏳ Schema migrations CLI — `axiomdb migrate up/down/status`
 - [ ] 22b.6 ⏳ FDW pushdown — push SQL predicates to remote origin when possible; avoid fetching unnecessary rows
 - [ ] 22b.7 ⏳ Data lineage tracking — `SELECT * FROM axiom_lineage WHERE table_name = 'ml_features'` shows which tables fed this one and when; `CREATE TABLE ml_features AS SELECT ... FROM raw_events WITH LINEAGE`; tracks column-level derivations across transformations; ML pipelines need to know which training data produced which model; compliance systems need to trace PII through all derived tables; enables impact analysis ("if I change this source table, what downstream tables break?")
 - [ ] 22b.8 ⏳ Query result cache with auto-invalidation — `SELECT /*+ RESULT_CACHE */ * FROM products WHERE featured = TRUE`; engine caches the result set and automatically invalidates it when any of the underlying tables changes (not just TTL-based); `SELECT /*+ RESULT_CACHE(ttl=60s) */ ...` for TTL fallback; `SELECT * FROM axiom_result_cache` shows cached queries, hit rate, memory used; smarter than Phase 22b.8 original (TTL only) — inspired by Oracle SQL Result Cache which invalidates on data change: no stale data, no manual INVALIDATE needed
@@ -550,8 +550,8 @@
 ### Phase 23 — Backwards compatibility `⏳` week 64-66
 - [ ] 23.1 ⏳ Native SQLite reader — parse binary `.db`/`.sqlite` format
 - [ ] 23.2 ⏳ ATTACH sqlite — `ATTACH 'file.sqlite' AS src USING sqlite`
-- [ ] 23.3 ⏳ Migrate from MySQL — `dbyo migrate from-mysql` with `mysql_async`
-- [ ] 23.4 ⏳ Migrate from PostgreSQL — `dbyo migrate from-postgres` with `tokio-postgres`
+- [ ] 23.3 ⏳ Migrate from MySQL — `axiomdb migrate from-mysql` with `mysql_async`
+- [ ] 23.4 ⏳ Migrate from PostgreSQL — `axiomdb migrate from-postgres` with `tokio-postgres`
 - [ ] 23.5 ⏳ PostgreSQL wire protocol — port 5432, psql and psycopg2 connect
 - [ ] 23.6 ⏳ Both protocols simultaneously — :3306 MySQL + :5432 PostgreSQL
 - [ ] 23.7 ⏳ ORM compatibility tests — Django ORM, SQLAlchemy, ActiveRecord, Prisma connect without changes
@@ -700,7 +700,7 @@
 - [ ] 31.9 ⏳ Strict mode — no silent coercion, errors on truncation
 - [ ] 31.10 ⏳ Logical replication — `CREATE PUBLICATION` + `CREATE SUBSCRIPTION`
 - [ ] 31.11 ⏳ mTLS + pg_hba.conf equivalent
-- [ ] 31.12 ⏳ Connection string DSN — `dbyo://user:pass@host:port/dbname?param=val`; `postgres://` and `mysql://` as aliases
+- [ ] 31.12 ⏳ Connection string DSN — `axiomdb://user:pass@host:port/dbname?param=val`; `postgres://` and `mysql://` as aliases
 - [ ] 31.13 ⏳ Read replicas routing — automatically route read-only queries to replicas from the connection pool
 
 ### Phase 32 — Final architecture `⏳` week 91-93
@@ -744,12 +744,12 @@
 - [ ] 34.2 ⏳ Scatter-gather — execute plan on shards in parallel + merge
 - [ ] 34.3 ⏳ Shard rebalancing — without downtime
 - [ ] 34.4 ⏳ Logical decoding API — `pg_logical_slot_get_changes()` as JSON
-- [ ] 34.5 ⏳ Standard DSN — `dbyo://`, `postgres://`, `DATABASE_URL` env var
+- [ ] 34.5 ⏳ Standard DSN — `axiomdb://`, `postgres://`, `DATABASE_URL` env var
 - [ ] 34.6 ⏳ Extensions system — `CREATE EXTENSION` + `pg_available_extensions`
 - [ ] 34.7 ⏳ WASM extensions — `CREATE EXTENSION FROM FILE '*.wasm'`
 - [ ] 34.8 ⏳ VACUUM FREEZE — prevent Transaction ID Wraparound
 - [ ] 34.9 ⏳ Parallel DDL — `CREATE TABLE AS SELECT WITH PARALLEL N`
-- [ ] 34.10 ⏳ pgbench equivalent — `dbyo-bench` with standard OLTP scenarios
+- [ ] 34.10 ⏳ pgbench equivalent — `axiomdb-bench` with standard OLTP scenarios
 - [ ] 34.11 ⏳ Final benchmarks — full comparison vs MySQL, PostgreSQL, SQLite, DuckDB
 - [ ] 34.12 ⏳ Consensus protocol (basic Raft) — for automatic failover in cluster; replaces manual failover from 18.10
 - [ ] 34.13 ⏳ Distributed transactions — two-phase commit between shards; cross-shard consistency
@@ -757,12 +757,12 @@
 ### Phase 35 — Deployment and DevEx `⏳` week 111-113
 - [ ] 35.1 ⏳ Multi-stage Dockerfile — Rust builder + debian-slim runtime
 - [ ] 35.2 ⏳ docker-compose.yml — complete setup with volumes and env vars
-- [ ] 35.3 ⏳ systemd service file — `dbyo.service` for Linux production
+- [ ] 35.3 ⏳ systemd service file — `axiomdb.service` for Linux production
 - [ ] 35.4 ⏳ Complete axiomdb.toml — network, storage, logging, AI, TLS configuration
 - [ ] 35.5 ⏳ Log levels and rotation — trace/debug/info/warn/error + daily/size rotation
-- [ ] 35.6 ⏳ dbyo-client crate — official Rust SDK with connection pool
-- [ ] 35.7 ⏳ Python package — `pip install dbyo-python` with psycopg2-style API
-- [ ] 35.8 ⏳ Homebrew formula — `brew install dbyo` for macOS
+- [ ] 35.6 ⏳ axiomdb-client crate — official Rust SDK with connection pool
+- [ ] 35.7 ⏳ Python package — `pip install axiomdb-python` with psycopg2-style API
+- [ ] 35.8 ⏳ Homebrew formula — `brew install axiomdb` for macOS
 - [ ] 35.9 ⏳ GitHub Actions CI — test + clippy + bench + fuzz on each PR
 - [ ] 35.10 ⏳ Performance tuning guide — which parameters to adjust for each workload
 - [ ] 35.11 ⏳ Kubernetes operator — `AxiomDBCluster` CRD with replica management and auto-scaling

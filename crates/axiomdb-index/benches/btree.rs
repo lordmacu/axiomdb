@@ -8,10 +8,10 @@
 use std::collections::BTreeMap;
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use axiomdb_core::RecordId;
 use axiomdb_index::BTree;
 use axiomdb_storage::MemoryStorage;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 fn rid(n: u64) -> RecordId {
     RecordId {

@@ -26,9 +26,11 @@ prevents circular dependencies and makes each component independently testable.
 │  ├── ast       (Stmt, Expr, SelectStmt, InsertStmt, ...)            │
 │  ├── analyzer  (BindContext, col_idx resolution, catalog lookup)    │
 │  ├── eval      (expression evaluator, three-valued NULL logic)      │
-│  └── result    (QueryResult, ColumnMeta, Row — executor return type)│
+│  ├── result    (QueryResult, ColumnMeta, Row — executor return type)│
+│  ├── table     (TableEngine — scan/insert/delete/update over heap)  │
+│  └── executor  (execute() — SELECT/INSERT/UPDATE/DELETE/DDL/txn)    │
 │                                                                     │
-│  [executor, query planner — Phase 5]                                │
+│  [query planner, optimizer — Phase 6]                               │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
 ┌──────────────────────────────▼──────────────────────────────────────┐

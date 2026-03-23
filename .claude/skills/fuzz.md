@@ -9,10 +9,10 @@ Critical for the SQL parser (malformed inputs) and storage (corrupt pages).
 cargo install cargo-fuzz
 
 # Create fuzz targets
-cd /Users/cristian/dbyo
+cd /Users/cristian/nexusdb
 cargo fuzz init   # if first time
 
-# Targets for dbyo
+# Targets for axiomdb
 cargo fuzz add fuzz_sql_parser      # parse random SQL
 cargo fuzz add fuzz_storage_pages   # pages with corrupt bytes
 cargo fuzz add fuzz_wal_recovery    # truncated or corrupt WAL
@@ -30,7 +30,7 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(sql) = std::str::from_utf8(data) {
         // The parser must NEVER panic with arbitrary input
         // It can only return Ok or Err — never panic/crash
-        let _ = dbyo_sql::Parser::new().parse(sql);
+        let _ = axiomdb_sql::Parser::new().parse(sql);
     }
 });
 
@@ -41,7 +41,7 @@ fuzz_target!(|data: &[u8]| {
     page_bytes.copy_from_slice(&data[..8192]);
 
     // The storage must NEVER panic reading a corrupt page
-    let _ = dbyo_storage::Page::from_bytes(&page_bytes);
+    let _ = axiomdb_storage::Page::from_bytes(&page_bytes);
 });
 ```
 

@@ -44,7 +44,7 @@ Estimated weeks: N-M | Actual weeks: X
 [description of what was implemented]
 
 ## Crates created/modified
-- `crates/dbyo-X` — [what it does]
+- `crates/axiomdb-X` — [what it does]
 
 ## Decisions made
 - [decision] → [reason]

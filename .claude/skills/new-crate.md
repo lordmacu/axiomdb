@@ -5,14 +5,14 @@
 ### 1. Create the crate
 
 ```bash
-cd /Users/cristian/dbyo
-cargo new --lib crates/dbyo-NAME
+cd /Users/cristian/nexusdb
+cargo new --lib crates/axiomdb-NAME
 ```
 
 ### 2. Standard crate structure
 
 ```
-crates/dbyo-NAME/
+crates/axiomdb-NAME/
 ├── Cargo.toml
 ├── src/
 │   ├── lib.rs          ← only public re-exports and crate doc
@@ -26,13 +26,13 @@ crates/dbyo-NAME/
 
 ```toml
 [package]
-name    = "dbyo-NAME"
+name    = "axiomdb-NAME"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 # Use workspace versions when defined
-dbyo-core = { path = "../dbyo-core" }
+axiomdb-core = { path = "../axiomdb-core" }
 thiserror = { workspace = true }
 tracing   = { workspace = true }
 
@@ -44,13 +44,13 @@ tempfile  = "3"
 ### 4. Minimal src/lib.rs
 
 ```rust
-//! # dbyo-NAME
+//! # axiomdb-NAME
 //!
 //! [One-line description of what this crate does]
 //!
 //! ## Example
 //! ```rust
-//! use dbyo_name::MyTrait;
+//! use axiomdb_name::MyTrait;
 //! // minimal example
 //! ```
 
@@ -69,21 +69,21 @@ pub trait MyTrait: Send + Sync {
 [workspace]
 members = [
     # ... existing ...
-    "crates/dbyo-NAME",   # ← add here in alphabetical order
+    "crates/axiomdb-NAME",   # ← add here in alphabetical order
 ]
 ```
 
 ### 6. Verify no dependency cycle
 
 ```bash
-cargo tree --workspace 2>&1 | grep -E "dbyo-NAME|error\[E"
+cargo tree --workspace 2>&1 | grep -E "axiomdb-NAME|error\[E"
 ```
 
 ### 7. Initial compiling test
 
 ```rust
 // tests/integration.rs
-use dbyo_name::MyTrait;
+use axiomdb_name::MyTrait;
 
 #[test]
 fn crate_compiles_and_trait_exists() {
@@ -93,14 +93,14 @@ fn crate_compiles_and_trait_exists() {
 ```
 
 ```bash
-cargo test -p dbyo-NAME
+cargo test -p axiomdb-NAME
 ```
 
 ### 8. Update memory/architecture.md
 
 ```markdown
 ## Implemented crates
-- `dbyo-NAME` — [one-line description] (Phase N)
+- `axiomdb-NAME` — [one-line description] (Phase N)
 ```
 
 ### Checklist
@@ -111,7 +111,7 @@ cargo test -p dbyo-NAME
 [ ] Added to workspace members
 [ ] src/lib.rs with documented public traits
 [ ] Initial test compiling
-[ ] cargo test -p dbyo-NAME passes
-[ ] cargo clippy -p dbyo-NAME -- -D warnings passes
+[ ] cargo test -p axiomdb-NAME passes
+[ ] cargo clippy -p axiomdb-NAME -- -D warnings passes
 [ ] architecture.md updated
 ```
