@@ -1,0 +1,18 @@
+[package]
+name    = "axiomdb-bench-comparison"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "axiomdb_bench"
+path = "src/main.rs"
+
+[dependencies]
+axiomdb-catalog = { path = "../../../crates/axiomdb-catalog" }
+axiomdb-core    = { path = "../../../crates/axiomdb-core" }
+axiomdb-sql     = { path = "../../../crates/axiomdb-sql" }
+axiomdb-storage = { path = "../../../crates/axiomdb-storage" }
+axiomdb-types   = { path = "../../../crates/axiomdb-types" }
+axiomdb-wal     = { path = "../../../crates/axiomdb-wal" }
+tempfile        = "3"
