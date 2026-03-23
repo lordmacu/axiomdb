@@ -57,55 +57,101 @@
 - [ ] ⚠️ Per-page msync optimization (flush_range) → deferred pending profiling
 
 ### Phase 4 — SQL Parser + Executor `⏳` week 11-25
-<!-- Group A — Executor prerequisites -->
-- [ ] 4.0 ⏳ Row codec — encode/decode `Value[]` ↔ bytes with null_bitmap; covers basic types: BOOL, INT, BIGINT, REAL, DOUBLE, DECIMAL, TEXT, VARCHAR, DATE, TIMESTAMP, NULL
-<!-- Group B — Parser (AST first, then grammar) -->
+<!--
+  DEPENDENCY ORDER (must be respected when planning subfases):
+
+  Group A (foundations, no deps between them — can parallelize):
+    4.0 Row codec  ←  4.17 Expression evaluator  ←  4.17b NULL semantics
+
+  Group B (parser, parallel with Group A):
+    4.1 AST  →  4.2 Lexer  →  4.2b sanitization
+               4.2  →  4.3 (DDL: 4.3a, 4.3b, 4.3c, 4.3d)  →  4.4 DML
+
+  Group C (semantic layer, needs B + catalog from Phase 3):
+    4.18 semantic analyzer  →  4.18b type coercion  →  4.23 QueryResult type
+
+  Group D (basic executor, needs A + B + C):
+    4.5  →  4.5a  →  4.5b (table engine)  →  4.25 error handling  →  4.7 SQLSTATE
+
+  Group E (core SQL, needs executor):
+    4.8 JOIN  |  4.9a-d GROUP BY+agg  |  4.10-4.10d ORDER BY
+    4.11 subqueries  |  4.12 DISTINCT  |  4.12b CAST  |  4.24 CASE WHEN  |  4.6 INSERT..SELECT
+
+  Group F (functions, needs executor):
+    4.13 system funcs  |  4.14 LAST_INSERT_ID  |  4.19 built-ins
+
+  Group G (DevEx, parallel with E+F):
+    4.15 CLI  |  4.15b DEBUG mode
+
+  Group H (introspection + DDL, needs executor):
+    4.20 SHOW TABLES  |  4.21 TRUNCATE  |  4.22 ALTER TABLE  |  4.22b ALTER CONSTRAINT
+
+  Group I (validation, last):
+    4.16 SQL tests suite  |  4.16b INSERT benchmark real I/O
+-->
+
+<!-- ── Group A — Foundations (no dependencies, can start immediately) ── -->
+- [ ] 4.0 ⏳ Row codec — encode/decode `Value[]` ↔ bytes with null_bitmap; covers: BOOL, INT, BIGINT, REAL, DOUBLE, DECIMAL, TEXT, VARCHAR, DATE, TIMESTAMP, NULL
+- [ ] 4.17 ⏳ Expression evaluator — evaluation tree for arithmetic (`+`,`-`,`*`,`/`), booleans (`AND`,`OR`,`NOT`), comparisons (`=`,`<`,`>`), `LIKE`, `BETWEEN`, `IN (list)`, `IS NULL`; **prerequisite for 4.5 — must come before the executor**
+- [ ] 4.17b ⏳ Systematic NULL semantics — `NULL+1=NULL`, `NULL=NULL→UNKNOWN`, `NULL IN(1,2)=NULL`; 3-valued logic (TRUE/FALSE/UNKNOWN); `IS NULL` vs `= NULL`; without this, aggregation queries produce silent wrong results; **prerequisite for 4.5**
+
+<!-- ── Group B — Parser (parallel with Group A) ── -->
 - [ ] 4.1 ⏳ AST definitions — syntax tree types (Expr, Stmt, TableRef, ColumnDef nodes)
 - [ ] 4.2 ⏳ Lexer/Tokenizer — SQL tokens with `nom`
-- [ ] 4.2b ⏳ Input sanitization in parser — validate that malformed SQL returns a clear SQL error, never `panic`; configurable query length limit (`max_query_size`); immediate fuzz-test with random inputs
+- [ ] 4.2b ⏳ Input sanitization in parser — malformed SQL → clear SQL error, never `panic`; configurable `max_query_size`; fuzz-test immediately after implementation
 - [ ] 4.3 ⏳ DDL Parser — `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`
-- [ ] 4.3a ⏳ Column constraints in DDL — `NOT NULL`, `DEFAULT expr`, `UNIQUE`, `PRIMARY KEY`, `REFERENCES fk`; parsed as part of `CREATE TABLE`; prerequisite for the basic executor
-- [ ] 4.3b ⏳ Basic CHECK constraint in DDL — `CHECK (expr)` at column and table level; parsed in `CREATE TABLE`; evaluated in INSERT/UPDATE (moves advanced CHECK with DOMAIN to Phase 21.6)
-- [ ] 4.3c ⏳ AUTO_INCREMENT / SERIAL basic — `INT AUTO_INCREMENT` (MySQL) and `SERIAL` (PostgreSQL-compat); generates internal sequence per table; `LAST_INSERT_ID()` returns the last value; prerequisite for the basic executor (do not wait for Phase 24)
-- [ ] 4.3d ⏳ Max identifier length — limit of 64 characters for table, column, index names (MySQL/PostgreSQL compatible); clear SQL error when exceeded
+- [ ] 4.3a ⏳ Column constraints in DDL — `NOT NULL`, `DEFAULT expr`, `UNIQUE`, `PRIMARY KEY`, `REFERENCES fk`; parsed as part of `CREATE TABLE`
+- [ ] 4.3b ⏳ Basic CHECK constraint in DDL — `CHECK (expr)` at column and table level; evaluated in INSERT/UPDATE
+- [ ] 4.3c ⏳ AUTO_INCREMENT / SERIAL — `INT AUTO_INCREMENT` (MySQL) and `SERIAL` (PG-compat); internal sequence per table; `LAST_INSERT_ID()` returns last value
+- [ ] 4.3d ⏳ Max identifier length — 64-char limit for table/column/index names; clear SQL error when exceeded
 - [ ] 4.4 ⏳ DML Parser — `SELECT`, `INSERT`, `UPDATE`, `DELETE`
-<!-- Group C — Basic executor -->
-- [ ] 4.5 ⏳ Basic executor — connect AST with storage + B+ Tree + catalog (uses 3.12 schema binding); **depends on: 4.1-4.4, 4.18 semantics, 3.12 schema binding**
-- [ ] 4.5a ⏳ SELECT without FROM — `SELECT 1`, `SELECT NOW()`, `SELECT VERSION()`; ORMs and tools use this as a health check on connect; requires no table
-- [ ] 4.6 ⏳ INSERT ... SELECT — insert query result directly
-- [ ] 4.7 ⏳ SQLSTATE codes — standard SQL error codes (23505, 42P01, etc.)
-<!-- Group D — Fundamental SQL (needed before wire protocol) -->
+
+<!-- ── Group C — Semantic layer (needs Group B + Phase 3 catalog) ── -->
+- [ ] 4.18 ⏳ Semantic analyzer — validate table/column existence against catalog (uses SchemaResolver from 3.14), resolve ambiguities, clear SQL error per violation; **prerequisite for 4.5**
+- [ ] 4.18b ⏳ Type coercion matrix — rules for `'42'→INT`, `INT→BIGINT`, `DATE→TIMESTAMP`; MySQL-compatible permissive mode vs strict mode; errors on invalid conversions
+- [ ] 4.23 ⏳ QueryResult type — unified executor return: `Rows{columns: Vec<ColumnMeta>, rows: Vec<Row>}` for SELECT, `Affected{count, last_insert_id}` for DML, `Empty` for DDL; basis for Phase 5 wire protocol serialization
+
+<!-- ── Group D — Basic executor (needs Groups A + B + C) ── -->
+- [ ] 4.5 ⏳ Basic executor — connects AST→semantic→storage: executes CREATE/DROP TABLE, INSERT, SELECT (with WHERE), UPDATE, DELETE; uses TxnManager::autocommit per statement; **depends on: 4.0, 4.1–4.4, 4.17, 4.18, 4.23, SchemaResolver(3.14)**
+- [ ] 4.5a ⏳ SELECT without FROM — `SELECT 1`, `SELECT NOW()`, `SELECT VERSION()`; health-check query used by every ORM on connect
+- [ ] 4.5b ⏳ Table engine — row storage interface: `scan_table(snap)→RowIter`, `insert_row(values)→RecordId`, `delete_row(rid)`, `update_row(rid, values)`; wraps HeapChain + Row codec + catalog; used by the executor for all DML on heap tables; **NEW subfase — gap identified in review**
+- [ ] 4.25 ⏳ Error handling framework — SQLSTATE codes (23505, 42P01, 40001), propagation without panic, recovery from constraint + type errors; base for all other modules
+- [ ] 4.7 ⏳ SQLSTATE codes — map all DbError variants to standard 5-char codes; consistent error format for Phase 5 wire protocol
+
+<!-- ── Group E — Core SQL (needs executor) ── -->
 - [ ] 4.8 ⏳ JOIN — INNER, LEFT, RIGHT, CROSS with basic nested loop join
 - [ ] 4.9a ⏳ GROUP BY hash-based — hash table for grouping; optimal for high cardinality
-- [ ] 4.9b ⏳ GROUP BY sort-based — sort first, then stream; optimal when data is already sorted (index)
-- [ ] 4.9c ⏳ Aggregate functions — COUNT, SUM, MIN, MAX, AVG, COUNT DISTINCT; implement with state per group
-- [ ] 4.9d ⏳ HAVING clause — filter groups post-aggregation; needs to evaluate expression over group states
+- [ ] 4.9b ⏳ GROUP BY sort-based — sort first, then stream; optimal when data is pre-sorted by index
+- [ ] 4.9c ⏳ Aggregate functions — COUNT, SUM, MIN, MAX, AVG, COUNT DISTINCT; state per group
+- [ ] 4.9d ⏳ HAVING clause — filter groups post-aggregation; evaluates expression over group state
 - [ ] 4.10 ⏳ ORDER BY + LIMIT/OFFSET — in-memory sort + pagination
-- [ ] 4.10b ⏳ Multi-column ORDER BY with mixed direction — `ORDER BY a ASC, b DESC, c ASC`; composite comparator that respects direction per column; test with NULLs in each position
-- [ ] 4.10c ⏳ NULLS FIRST / NULLS LAST — `ORDER BY price ASC NULLS LAST`; default behavior MySQL (NULLs first in ASC) vs PostgreSQL (NULLs last in ASC); configurable
-- [ ] 4.10d ⏳ Parameterized LIMIT/OFFSET — `LIMIT $1 OFFSET $2` in prepared statements; avoid rebuilding plan for each pagination value
-- [ ] 4.11 ⏳ Scalar subqueries — `(SELECT MAX(id) FROM t)` in WHERE and SELECT
-- [ ] 4.12 ⏳ DISTINCT — `SELECT DISTINCT col1, col2` remove duplicates; implement with hash set or sort; interacts with ORDER BY
+- [ ] 4.10b ⏳ Multi-column ORDER BY with mixed direction — `ORDER BY a ASC, b DESC`; composite comparator; test with NULLs in each position
+- [ ] 4.10c ⏳ NULLS FIRST / NULLS LAST — MySQL default (NULLs first in ASC) vs PostgreSQL (NULLs last); configurable
+- [ ] 4.10d ⏳ Parameterized LIMIT/OFFSET — `LIMIT $1 OFFSET $2` in prepared statements; avoid re-parsing per pagination value
+- [ ] 4.11 ⏳ Scalar subqueries — `(SELECT MAX(id) FROM t)` in WHERE and SELECT list
+- [ ] 4.12 ⏳ DISTINCT — `SELECT DISTINCT col1, col2`; hash set or sort; interacts with ORDER BY
 - [ ] 4.12b ⏳ CAST + basic type coercion — explicit and implicit conversion between compatible types
-<!-- Group E — System functions and DevEx -->
-- [ ] 4.13 ⏳ version() / current_user / session_user / current_database() — ORMs call this on connect
-- [ ] 4.14 ⏳ LAST_INSERT_ID() / lastval() — get last auto-generated ID (MySQL + PG compat)
-- [ ] 4.15 ⏳ Interactive CLI — REPL like `sqlite3` shell
-- [ ] 4.15b ⏳ DEBUG/VERBOSE mode — `--verbose` flag in CLI and server; log AST, chosen plan, execution stats per query; needed for debugging during Phases 4-10 development
-- [ ] 4.16 ⏳ SQL Tests — full suite: DDL + DML + JOIN + GROUP BY + ORDER BY + subqueries
-<!-- Group F — Expression layer and semantics (required by executor for WHERE, SELECT expressions) -->
-- [ ] 4.17 ⏳ Expression evaluator — evaluation tree for arithmetic (`+`, `-`, `*`, `/`), booleans (`AND`, `OR`, `NOT`), comparisons (`=`, `<`, `>`), `LIKE`, `BETWEEN`, `IN (list)`, `IS NULL`
-- [ ] 4.17b ⏳ Systematic NULL semantics — `NULL + 1 = NULL`, `NULL = NULL → UNKNOWN`, `NULL IN (1,2) = NULL`; the 3 logics (TRUE/FALSE/UNKNOWN); `IS NULL` vs `= NULL`; functions that propagate NULL; without this, aggregation queries silently produce incorrect results
-- [ ] 4.18 ⏳ Semantic analyzer — validate table/column existence against catalog, resolve ambiguities, clear SQL error for each violation
-- [ ] 4.18b ⏳ Type coercion matrix — explicit rules for when/how to coerce types: `'42'→INT`, `INT→BIGINT`, `DATE→TIMESTAMP`; define MySQL-compatible mode (permissive) vs strict mode; clear errors on invalid conversions
+- [ ] 4.24 ⏳ CASE WHEN in any context — `CASE WHEN x THEN a ELSE b END` in SELECT, WHERE, ORDER BY, GROUP BY, HAVING; required by most ORMs from the first query
+- [ ] 4.6 ⏳ INSERT ... SELECT — insert result of a SELECT directly into a table
+
+<!-- ── Group F — Functions (needs executor) ── -->
+- [ ] 4.13 ⏳ version() / current_user / session_user / current_database() — ORMs call these on connect; required for Phase 5 compatibility
+- [ ] 4.14 ⏳ LAST_INSERT_ID() / lastval() — last auto-generated ID (MySQL + PG compat)
 - [ ] 4.19 ⏳ Basic built-in functions — `ABS`, `LENGTH`, `SUBSTR`, `UPPER`, `LOWER`, `TRIM`, `COALESCE`, `NOW()`, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `ROUND`, `FLOOR`, `CEIL`
-<!-- Group G — Introspection + modification DDL (needed for ORMs and early migrations) -->
-- [ ] 4.20 ⏳ SHOW TABLES / SHOW COLUMNS / DESCRIBE — basic introspection; ORMs and GUI clients use this on connect
+
+<!-- ── Group G — DevEx (parallel with E+F) ── -->
+- [ ] 4.15 ⏳ Interactive CLI — REPL like `sqlite3` shell; connects directly to storage
+- [ ] 4.15b ⏳ DEBUG/VERBOSE mode — `--verbose` flag: log AST, chosen plan, execution stats per query; critical for Phases 4–10 development
+
+<!-- ── Group H — Introspection + DDL modification (needs executor) ── -->
+- [ ] 4.20 ⏳ SHOW TABLES / SHOW COLUMNS / DESCRIBE — basic introspection; ORMs and GUI clients call these on connect
 - [ ] 4.21 ⏳ TRUNCATE TABLE — empty table without per-row WAL entry; faster than DELETE without WHERE
-- [ ] 4.22 ⏳ Basic ALTER TABLE — `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `RENAME TABLE` (blocking, no concurrent); prerequisite for any migration
-- [ ] 4.22b ⏳ ALTER TABLE ADD/DROP CONSTRAINT — `ADD CONSTRAINT fk_name FOREIGN KEY`, `DROP CONSTRAINT`, `ADD UNIQUE (col)`, `ADD CHECK (expr)`; without this ORMs cannot modify constraints post-creation
-- [ ] 4.24 ⏳ CASE WHEN in any context — `CASE WHEN x THEN a ELSE b END` in SELECT, WHERE, ORDER BY, GROUP BY, HAVING; Phase 28.7 lists it but it is needed from Phase 4 for basic queries from any ORM
-- [ ] 4.25 ⏳ Error handling framework — standard SQLSTATE codes (23505, 42P01, 40001), propagation without panic to the client, recovery from constraint and type errors; base for all other modules
+- [ ] 4.22 ⏳ Basic ALTER TABLE — `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `RENAME TABLE` (blocking, no concurrent); prerequisite for migrations
+- [ ] 4.22b ⏳ ALTER TABLE ADD/DROP CONSTRAINT — `ADD CONSTRAINT fk`, `DROP CONSTRAINT`, `ADD UNIQUE`, `ADD CHECK`; ORMs need this post-creation
+
+<!-- ── Group I — Validation (last, closes the phase) ── -->
+- [ ] 4.16 ⏳ SQL tests — full suite: DDL + DML + JOIN + GROUP BY + ORDER BY + subqueries; covers error cases and edge conditions
+- [ ] 4.16b ⏳ INSERT throughput benchmark (MmapStorage + WAL real) — validate 180K ops/s budget with real I/O; **NEW — gap identified in Phase 3 benchmark review; blocker for closing Phase 4**
 
 ### Phase 5 — MySQL Wire Protocol `⏳` week 26-30
 - [ ] 5.1 ⏳ TCP listener with Tokio — accept connections on :3306
