@@ -827,10 +827,30 @@
 - [ ] 36.27 ⏳ `.explain()` — appends EXPLAIN; `.explain(analyze: true)` → EXPLAIN ANALYZE
 - [ ] 36.28 ⏳ `show tables`, `show columns(users)`, `describe(users)` — introspection commands
 
-#### 36.H — Quality
-- [ ] 36.29 ⏳ Equivalence test suite — for every AxiomQL construct, assert SQL equivalent produces identical results
-- [ ] 36.30 ⏳ Parser benchmarks — AxiomQL throughput vs SQL parser on same queries
-- [ ] 36.31 ⏳ Error messages — when a construct isn't supported: "use the SQL equivalent: SELECT ... OVER (...)"
+#### 36.H — Advanced joins + inline data
+- [ ] 36.32 ⏳ `.lateral_join(fn)` — LATERAL JOIN; fn receives outer row: `orders.lateral_join(o => items.filter(order_id = o.id).limit(3))`
+- [ ] 36.33 ⏳ `values([[1,'a'],[2,'b']]).as('t', cols: [id, name])` — VALUES as inline table; useful in JOINs and CTEs
+- [ ] 36.34 ⏳ `users.sample(pct: 10)` / `users.sample(rows: 1000)` — TABLESAMPLE SYSTEM; approximate random sample
+
+#### 36.I — Statistical + ordered-set aggregates
+- [ ] 36.35 ⏳ `orders.percentile(amount, 0.95)` → PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY amount)
+- [ ] 36.36 ⏳ `orders.percentile_disc(amount, 0.5)`, `orders.mode(status)` → PERCENTILE_DISC / MODE()
+- [ ] 36.37 ⏳ `json_agg(expr)`, `json_build_object(k, v)`, `array_agg(col)` as aggregate functions in `.group()` and `.pick()`
+- [ ] 36.38 ⏳ `table.unnest(col)` — UNNEST array column into rows
+
+#### 36.J — Date/time + ranges
+- [ ] 36.39 ⏳ `col.in_tz('America/Bogota')` → AT TIME ZONE; `col.format('YYYY-MM-DD')` → TO_CHAR
+- [ ] 36.40 ⏳ Interval arithmetic: `created_at + interval(days: 7)`, `now() - interval(hours: 1)`
+- [ ] 36.41 ⏳ `series(from: 1, to: 100)` / `series(from: date1, to: date2, step: interval(days: 1))` → GENERATE_SERIES
+- [ ] 36.42 ⏳ Range operators: `period.overlaps(other)`, `period.contains(point)`, `period.adjacent(other)` → `&&`, `@>`, `-|-`
+
+#### 36.K — Collation
+- [ ] 36.43 ⏳ `.sort(name.collate('utf8mb4_unicode_ci'))` — per-expression COLLATE; `.filter(a.collate('C') = b)` for byte-level comparison
+
+#### 36.L — Quality
+- [ ] 36.44 ⏳ Equivalence test suite — for every AxiomQL construct, assert SQL equivalent produces identical results
+- [ ] 36.45 ⏳ Parser benchmarks — AxiomQL throughput vs SQL parser on same queries
+- [ ] 36.46 ⏳ Error messages — when a construct isn't supported: "use the SQL equivalent: SELECT ... OVER (...)"
 
 ### Phase 37 — AxiomQL Write + DDL + Control `⏳` week 118-121
 
@@ -898,10 +918,25 @@
 - [ ] 37.44 ⏳ `reindex(users)`, `reindex(users.email_idx)` — REINDEX table or index
 - [ ] 37.45 ⏳ `checkpoint()` — manual WAL checkpoint; flush all dirty pages
 
+#### 37.N — Prepared statements
+- [ ] 37.49 ⏳ `prepare('name', users.filter(id = $1).pick(name, email))` — PREPARE; compiles query once, reuses plan
+- [ ] 37.50 ⏳ `execute('name', args: [42])` — EXECUTE prepared statement with bound parameters
+- [ ] 37.51 ⏳ `deallocate('name')` / `deallocate_all()` — DEALLOCATE; free one or all prepared statements
+
+#### 37.O — Advanced write
+- [ ] 37.52 ⏳ `users.filter(...).into_table('archive')` — SELECT INTO; creates new table from query result
+- [ ] 37.53 ⏳ `.merge(source, on: key, matched: .update(amount: .new.amount), not_matched: .insert())` — full MERGE statement
+- [ ] 37.54 ⏳ `truncate(users, cascade: true)` — TRUNCATE with CASCADE; also truncates dependent FK tables
+
+#### 37.P — Special operations
+- [ ] 37.55 ⏳ `users.flashback(before_drop: true)` — restore table from recycle bin (Phase 13.17)
+- [ ] 37.56 ⏳ `fiscal_lock('2023')` / `fiscal_unlock('2023')` — lock/unlock fiscal period (Phase 13.11)
+- [ ] 37.57 ⏳ `.explain(format: json)` / `.explain(format: text, buffers: true)` — extended EXPLAIN options
+
 #### 37.M — Quality
-- [ ] 37.46 ⏳ Documentation — AxiomQL reference in docs-site: every method with SQL equivalent side-by-side
-- [ ] 37.47 ⏳ Fuzz testing — malformed AxiomQL input; every panic = regression test
-- [ ] 37.48 ⏳ `.to_sql()` pretty-printer — `users.filter(active).to_sql()` returns the generated SQL (debug + learning tool)
+- [ ] 37.58 ⏳ Documentation — AxiomQL reference in docs-site: every method with SQL equivalent side-by-side
+- [ ] 37.59 ⏳ Fuzz testing — malformed AxiomQL input; every panic = regression test
+- [ ] 37.60 ⏳ `.to_sql()` pretty-printer — `users.filter(active).to_sql()` returns the generated SQL (debug + learning tool)
 
 ---
 
