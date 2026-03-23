@@ -120,6 +120,13 @@ pub enum DbError {
     #[error("catalog not initialized — call CatalogBootstrap::init() first")]
     CatalogNotInitialized,
 
+    // ── Row codec ────────────────────────────────────────────────
+    #[error("value too large: {len} bytes (maximum {max})")]
+    ValueTooLarge { len: usize, max: usize },
+
+    #[error("invalid value: {reason}")]
+    InvalidValue { reason: String },
+
     #[error("table '{schema}.{name}' already exists")]
     TableAlreadyExists { schema: String, name: String },
 
