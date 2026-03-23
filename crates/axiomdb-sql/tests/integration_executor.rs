@@ -552,3 +552,235 @@ fn test_full_crud_roundtrip() {
     let err = run_result("SELECT * FROM employees", &mut storage, &mut txn).unwrap_err();
     assert!(matches!(err, DbError::TableNotFound { .. }), "got {err:?}");
 }
+
+// ── JOIN tests ────────────────────────────────────────────────────────────────
+
+fn setup_join_tables(storage: &mut MemoryStorage, txn: &mut TxnManager) {
+    run(
+        "CREATE TABLE users (id INT NOT NULL, name TEXT)",
+        storage,
+        txn,
+    );
+    run(
+        "CREATE TABLE orders (id INT NOT NULL, user_id INT, total INT)",
+        storage,
+        txn,
+    );
+    run("INSERT INTO users VALUES (1, 'Alice')", storage, txn);
+    run("INSERT INTO users VALUES (2, 'Bob')", storage, txn);
+    run("INSERT INTO users VALUES (3, 'Carol')", storage, txn);
+    run("INSERT INTO orders VALUES (10, 1, 100)", storage, txn);
+    run("INSERT INTO orders VALUES (11, 1, 200)", storage, txn);
+    run("INSERT INTO orders VALUES (12, 2, 50)", storage, txn);
+    // order 13 has no matching user
+    run("INSERT INTO orders VALUES (13, 99, 300)", storage, txn);
+}
+
+#[test]
+fn test_inner_join_basic() {
+    let (mut storage, mut txn) = setup();
+    setup_join_tables(&mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id",
+        &mut storage,
+        &mut txn,
+    ));
+    // 3 matching pairs: (Alice,100), (Alice,200), (Bob,50)
+    assert_eq!(r.len(), 3);
+    let names: Vec<&Value> = r.iter().map(|row| &row[0]).collect();
+    assert_eq!(
+        names
+            .iter()
+            .filter(|&&v| v == &Value::Text("Alice".into()))
+            .count(),
+        2
+    );
+    assert_eq!(
+        names
+            .iter()
+            .filter(|&&v| v == &Value::Text("Bob".into()))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn test_inner_join_where_filter() {
+    let (mut storage, mut txn) = setup();
+    setup_join_tables(&mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE o.total > 100",
+        &mut storage,
+        &mut txn,
+    ));
+    // Only (Alice, 200)
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][1], Value::Int(200));
+}
+
+#[test]
+fn test_inner_join_select_star() {
+    let (mut storage, mut txn) = setup();
+    setup_join_tables(&mut storage, &mut txn);
+
+    let result = run(
+        "SELECT * FROM users u JOIN orders o ON u.id = o.user_id",
+        &mut storage,
+        &mut txn,
+    );
+    if let QueryResult::Rows { columns, rows } = result {
+        // users has 2 cols, orders has 3 cols → 5 total
+        assert_eq!(columns.len(), 5);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[2].name, "id"); // orders.id
+        assert_eq!(rows.len(), 3);
+    } else {
+        panic!("expected Rows");
+    }
+}
+
+#[test]
+fn test_left_join_unmatched_left() {
+    let (mut storage, mut txn) = setup();
+    setup_join_tables(&mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT u.name, o.total FROM users u LEFT JOIN orders o ON u.id = o.user_id",
+        &mut storage,
+        &mut txn,
+    ));
+    // 3 (Alice) + 1 (Bob) + 1 (Carol with NULL) = 4 output rows
+    assert_eq!(r.len(), 4);
+    // Carol has no orders → total should be NULL
+    let carol_row = r
+        .iter()
+        .find(|row| row[0] == Value::Text("Carol".into()))
+        .unwrap();
+    assert_eq!(carol_row[1], Value::Null, "Carol's total must be NULL");
+}
+
+#[test]
+fn test_left_join_column_meta_nullable() {
+    let (mut storage, mut txn) = setup();
+    setup_join_tables(&mut storage, &mut txn);
+
+    let result = run(
+        "SELECT * FROM users u LEFT JOIN orders o ON u.id = o.user_id",
+        &mut storage,
+        &mut txn,
+    );
+    if let QueryResult::Rows { columns, .. } = result {
+        // users columns: nullable as per catalog (NOT NULL for id → false)
+        assert!(!columns[0].nullable, "users.id is NOT NULL");
+        // orders columns: must be nullable=true because of LEFT JOIN
+        assert!(
+            columns[2].nullable,
+            "orders.id must be nullable after LEFT JOIN"
+        );
+        assert!(
+            columns[3].nullable,
+            "orders.user_id must be nullable after LEFT JOIN"
+        );
+    } else {
+        panic!("expected Rows");
+    }
+}
+
+#[test]
+fn test_right_join_unmatched_right() {
+    let (mut storage, mut txn) = setup();
+    setup_join_tables(&mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT u.name, o.total FROM users u RIGHT JOIN orders o ON u.id = o.user_id",
+        &mut storage,
+        &mut txn,
+    ));
+    // 3 matched + order 13 (user_id=99, no matching user) → 4 rows
+    assert_eq!(r.len(), 4);
+    // The unmatched order has NULL for u.name
+    let unmatched = r.iter().find(|row| row[0] == Value::Null).unwrap();
+    assert_eq!(
+        unmatched[1],
+        Value::Int(300),
+        "unmatched order total must be 300"
+    );
+}
+
+#[test]
+fn test_cross_join() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE a (x INT)", &mut storage, &mut txn);
+    run("CREATE TABLE b (y INT)", &mut storage, &mut txn);
+    run("INSERT INTO a VALUES (1), (2)", &mut storage, &mut txn);
+    run(
+        "INSERT INTO b VALUES (10), (20), (30)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let r = rows(run(
+        "SELECT a.x, b.y FROM a CROSS JOIN b",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 6, "CROSS JOIN 2×3 should produce 6 rows");
+}
+
+#[test]
+fn test_three_table_join() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE users (id INT, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE TABLE orders (id INT, user_id INT, product_id INT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE TABLE products (id INT, label TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO users VALUES (1, 'Alice')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO products VALUES (100, 'Widget')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO orders VALUES (10, 1, 100)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let r = rows(run(
+        "SELECT u.name, p.label FROM users u JOIN orders o ON u.id = o.user_id JOIN products p ON o.product_id = p.id",
+        &mut storage, &mut txn,
+    ));
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Text("Alice".into()));
+    assert_eq!(r[0][1], Value::Text("Widget".into()));
+}
+
+#[test]
+fn test_full_outer_join_not_implemented() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    let err = run_result(
+        "SELECT * FROM t t1 FULL OUTER JOIN t t2 ON t1.id = t2.id",
+        &mut storage,
+        &mut txn,
+    )
+    .unwrap_err();
+    assert!(matches!(err, DbError::NotImplemented { .. }), "got {err:?}");
+}

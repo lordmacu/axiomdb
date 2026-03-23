@@ -44,8 +44,8 @@ use axiomdb_wal::TxnManager;
 use crate::{
     ast::{
         ColumnConstraint, CreateIndexStmt, CreateTableStmt, DeleteStmt, DropIndexStmt,
-        DropTableStmt, FromClause, InsertSource, InsertStmt, SelectItem, SelectStmt, Stmt,
-        UpdateStmt,
+        DropTableStmt, FromClause, InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType,
+        SelectItem, SelectStmt, Stmt, UpdateStmt,
     },
     eval::{eval, is_truthy},
     expr::Expr,
@@ -159,16 +159,11 @@ fn dispatch(
 // ── SELECT ───────────────────────────────────────────────────────────────────
 
 fn execute_select(
-    stmt: SelectStmt,
+    mut stmt: SelectStmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
-    // Guard unsupported clauses.
-    if !stmt.joins.is_empty() {
-        return Err(DbError::NotImplemented {
-            feature: "JOIN — Phase 4.8".into(),
-        });
-    }
+    // Guard unsupported clauses (ORDER BY, LIMIT, DISTINCT remain unimplemented).
     if !stmt.group_by.is_empty() {
         return Err(DbError::NotImplemented {
             feature: "GROUP BY — Phase 4.9".into(),
@@ -190,78 +185,478 @@ fn execute_select(
         });
     }
 
-    match stmt.from {
+    // Dispatch based on FROM clause type and whether JOINs are present.
+    if stmt.from.is_none() {
         // ── SELECT without FROM ───────────────────────────────────────────────
-        None => {
-            let mut out_row: Row = Vec::new();
-            let mut out_cols: Vec<ColumnMeta> = Vec::new();
-            for item in &stmt.columns {
-                match item {
-                    SelectItem::Expr { expr, alias } => {
-                        let v = eval(expr, &[])?;
-                        let name = alias
-                            .clone()
-                            .unwrap_or_else(|| expr_column_name(expr, None));
-                        // Use the actual value type for primitive literals.
-                        let dt = datatype_of_value(&v);
-                        out_cols.push(ColumnMeta::computed(name, dt));
-                        out_row.push(v);
+        let mut out_row: Row = Vec::new();
+        let mut out_cols: Vec<ColumnMeta> = Vec::new();
+        for item in &stmt.columns {
+            match item {
+                SelectItem::Expr { expr, alias } => {
+                    let v = eval(expr, &[])?;
+                    let name = alias
+                        .clone()
+                        .unwrap_or_else(|| expr_column_name(expr, None));
+                    let dt = datatype_of_value(&v);
+                    out_cols.push(ColumnMeta::computed(name, dt));
+                    out_row.push(v);
+                }
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                    return Err(DbError::NotImplemented {
+                        feature: "SELECT * without FROM".into(),
+                    });
+                }
+            }
+        }
+        return Ok(QueryResult::Rows {
+            columns: out_cols,
+            rows: vec![out_row],
+        });
+    }
+
+    // FROM is present — check for subquery vs table.
+    if matches!(stmt.from, Some(FromClause::Subquery { .. })) {
+        return Err(DbError::NotImplemented {
+            feature: "subquery in FROM — Phase 4.11".into(),
+        });
+    }
+
+    // Extract the FROM table reference.
+    // `stmt` still owns everything; destructure only what we need.
+    let from_table_ref = match stmt.from.take() {
+        Some(FromClause::Table(tref)) => tref,
+        _ => unreachable!("already handled None and Subquery above"),
+    };
+
+    if stmt.joins.is_empty() {
+        // ── Single-table path (no JOIN) ───────────────────────────────────────
+        let resolved = {
+            let resolver = make_resolver(storage, txn)?;
+            resolver.resolve_table(from_table_ref.schema.as_deref(), &from_table_ref.name)?
+        };
+
+        let snap = txn.active_snapshot()?;
+        let raw_rows = TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?;
+
+        let out_cols = build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
+
+        let mut rows: Vec<Row> = Vec::new();
+        for (_rid, values) in raw_rows {
+            if let Some(ref wc) = stmt.where_clause {
+                if !is_truthy(&eval(wc, &values)?) {
+                    continue;
+                }
+            }
+            rows.push(project_row(&stmt.columns, &values)?);
+        }
+
+        Ok(QueryResult::Rows {
+            columns: out_cols,
+            rows,
+        })
+    } else {
+        // ── Multi-table JOIN path ─────────────────────────────────────────────
+        execute_select_with_joins(stmt, from_table_ref, storage, txn)
+    }
+}
+
+// ── JOIN execution ───────────────────────────────────────────────────────────
+
+/// Executes a SELECT with one or more JOINs using nested-loop strategy.
+///
+/// All tables are pre-scanned once. The combined row is built progressively:
+/// - Stage 0: rows from the FROM table
+/// - Stage i: `apply_join(stage_{i-1}, scan(JOIN[i].table), ...)`
+///
+/// WHERE is applied to the fully combined row after all joins.
+fn execute_select_with_joins(
+    stmt: SelectStmt,
+    from_ref: crate::ast::TableRef,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+) -> Result<QueryResult, DbError> {
+    // Resolve all tables (FROM + each JOIN table) and compute col_offsets.
+    let mut all_resolved: Vec<axiomdb_catalog::ResolvedTable> = Vec::new();
+    let mut col_offsets: Vec<usize> = Vec::new(); // col_offset[i] = start of table i in combined row
+    let mut running_offset = 0usize;
+
+    {
+        let resolver = make_resolver(storage, txn)?;
+        let from_t = resolver.resolve_table(from_ref.schema.as_deref(), &from_ref.name)?;
+        col_offsets.push(running_offset);
+        running_offset += from_t.columns.len();
+        all_resolved.push(from_t);
+
+        for join in &stmt.joins {
+            match &join.table {
+                FromClause::Table(tref) => {
+                    let jt = resolver.resolve_table(tref.schema.as_deref(), &tref.name)?;
+                    col_offsets.push(running_offset);
+                    running_offset += jt.columns.len();
+                    all_resolved.push(jt);
+                }
+                FromClause::Subquery { .. } => {
+                    return Err(DbError::NotImplemented {
+                        feature: "subquery in JOIN — Phase 4.11".into(),
+                    })
+                }
+            }
+        }
+    } // resolver dropped — storage immutable borrow released
+
+    // Pre-scan all tables once (consistent snapshot for all).
+    let snap = txn.active_snapshot()?;
+    let mut scanned: Vec<Vec<Row>> = Vec::with_capacity(all_resolved.len());
+    for t in &all_resolved {
+        let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap)?;
+        scanned.push(rows.into_iter().map(|(_, r)| r).collect());
+    }
+
+    // Progressive nested-loop join.
+    let mut combined_rows: Vec<Row> = scanned[0].clone();
+    let mut left_col_count = all_resolved[0].columns.len();
+
+    // left_schema tracks (col_name, global_col_idx) for all accumulated left columns.
+    // Used by USING conditions to locate column positions by name.
+    let mut left_schema: Vec<(String, usize)> = all_resolved[0]
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.name.clone(), i))
+        .collect();
+
+    for (i, join) in stmt.joins.iter().enumerate() {
+        if join.join_type == JoinType::Full {
+            return Err(DbError::NotImplemented {
+                feature: "FULL OUTER JOIN — Phase 4.8+".into(),
+            });
+        }
+
+        let right_idx = i + 1;
+        let right_col_count = all_resolved[right_idx].columns.len();
+        let right_col_offset = col_offsets[right_idx];
+
+        combined_rows = apply_join(
+            combined_rows,
+            &scanned[right_idx],
+            left_col_count,
+            right_col_count,
+            join.join_type,
+            &join.condition,
+            &left_schema,
+            right_col_offset,
+            &all_resolved[right_idx].columns,
+        )?;
+
+        // Extend left_schema with the right table's columns at their global positions.
+        for (j, col) in all_resolved[right_idx].columns.iter().enumerate() {
+            left_schema.push((col.name.clone(), right_col_offset + j));
+        }
+        left_col_count += right_col_count;
+    }
+
+    // Apply WHERE against the full combined row.
+    if let Some(ref wc) = stmt.where_clause {
+        let mut filtered = Vec::with_capacity(combined_rows.len());
+        for row in combined_rows {
+            if is_truthy(&eval(wc, &row)?) {
+                filtered.push(row);
+            }
+        }
+        combined_rows = filtered;
+    }
+
+    // Build output ColumnMeta.
+    let out_cols = build_join_column_meta(&stmt.columns, &all_resolved, &stmt.joins)?;
+
+    // Project SELECT list.
+    let rows = combined_rows
+        .iter()
+        .map(|r| project_row(&stmt.columns, r))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(QueryResult::Rows {
+        columns: out_cols,
+        rows,
+    })
+}
+
+/// Nested-loop join of `left_rows` against `right_rows`.
+///
+/// Each output row is `left_row ++ right_row`. For OUTER joins, unmatched
+/// rows are padded with `Value::Null` on the non-driving side.
+///
+/// `right_col_offset` is the position of the right table's first column in
+/// the combined row. Used only for `JoinCondition::Using`.
+#[allow(clippy::too_many_arguments)] // 9 params needed: join context has inherent complexity
+fn apply_join(
+    left_rows: Vec<Row>,
+    right_rows: &[Row],
+    left_col_count: usize,
+    right_col_count: usize,
+    join_type: JoinType,
+    condition: &JoinCondition,
+    left_schema: &[(String, usize)], // for USING: (col_name, global_col_idx) for left side
+    right_col_offset: usize,
+    right_columns: &[axiomdb_catalog::schema::ColumnDef],
+) -> Result<Vec<Row>, DbError> {
+    match join_type {
+        JoinType::Inner | JoinType::Cross => {
+            let mut result = Vec::new();
+            for left in &left_rows {
+                for right in right_rows {
+                    let combined = concat_rows(left, right);
+                    if eval_join_cond(
+                        condition,
+                        &combined,
+                        left_schema,
+                        right_col_offset,
+                        right_columns,
+                    )? {
+                        result.push(combined);
                     }
-                    SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
-                        return Err(DbError::NotImplemented {
-                            feature: "SELECT * without FROM".into(),
+                }
+            }
+            Ok(result)
+        }
+
+        JoinType::Left => {
+            let null_right: Row = vec![Value::Null; right_col_count];
+            let mut result = Vec::new();
+            for left in &left_rows {
+                let mut matched = false;
+                for right in right_rows {
+                    let combined = concat_rows(left, right);
+                    if eval_join_cond(
+                        condition,
+                        &combined,
+                        left_schema,
+                        right_col_offset,
+                        right_columns,
+                    )? {
+                        result.push(combined);
+                        matched = true;
+                    }
+                }
+                if !matched {
+                    result.push(concat_rows(left, &null_right));
+                }
+            }
+            Ok(result)
+        }
+
+        JoinType::Right => {
+            let null_left: Row = vec![Value::Null; left_col_count];
+            let mut matched_right = vec![false; right_rows.len()];
+            let mut result = Vec::new();
+
+            for left in &left_rows {
+                for (i, right) in right_rows.iter().enumerate() {
+                    let combined = concat_rows(left, right);
+                    if eval_join_cond(
+                        condition,
+                        &combined,
+                        left_schema,
+                        right_col_offset,
+                        right_columns,
+                    )? {
+                        result.push(combined);
+                        matched_right[i] = true;
+                    }
+                }
+            }
+            // Emit unmatched right rows with NULLs on the left side.
+            for (i, right) in right_rows.iter().enumerate() {
+                if !matched_right[i] {
+                    result.push(concat_rows(&null_left, right));
+                }
+            }
+            Ok(result)
+        }
+
+        JoinType::Full => Err(DbError::NotImplemented {
+            feature: "FULL OUTER JOIN — Phase 4.8+".into(),
+        }),
+    }
+}
+
+/// Evaluates a join condition against a combined row.
+///
+/// - `On(expr)`: evaluates the expression directly (`col_idx` already resolved by analyzer).
+/// - `Using(names)`: for each name, finds its index in the left schema and in the right
+///   table, then checks equality. NULL = NULL is UNKNOWN (returns false per SQL semantics).
+///
+/// `left_schema` is a `(column_name, global_col_idx)` list for every column in the
+/// accumulated left side of this join stage.
+fn eval_join_cond(
+    cond: &JoinCondition,
+    combined: &[Value],
+    left_schema: &[(String, usize)],
+    right_col_offset: usize,
+    right_columns: &[axiomdb_catalog::schema::ColumnDef],
+) -> Result<bool, DbError> {
+    match cond {
+        JoinCondition::On(expr) => Ok(is_truthy(&eval(expr, combined)?)),
+
+        JoinCondition::Using(names) => {
+            for col_name in names {
+                // Find col_idx in the accumulated left schema.
+                let left_idx = left_schema
+                    .iter()
+                    .find(|(name, _)| name == col_name)
+                    .map(|(_, idx)| *idx)
+                    .ok_or_else(|| DbError::ColumnNotFound {
+                        name: col_name.clone(),
+                        table: "left side (USING)".into(),
+                    })?;
+
+                // Find col_idx in the right table.
+                let right_pos = right_columns
+                    .iter()
+                    .position(|c| &c.name == col_name)
+                    .ok_or_else(|| DbError::ColumnNotFound {
+                        name: col_name.clone(),
+                        table: "right table (USING)".into(),
+                    })?;
+                let right_idx = right_col_offset + right_pos;
+
+                let left_val = combined
+                    .get(left_idx)
+                    .ok_or(DbError::ColumnIndexOutOfBounds {
+                        idx: left_idx,
+                        len: combined.len(),
+                    })?;
+                let right_val = combined
+                    .get(right_idx)
+                    .ok_or(DbError::ColumnIndexOutOfBounds {
+                        idx: right_idx,
+                        len: combined.len(),
+                    })?;
+
+                // NULL = NULL is UNKNOWN in SQL 3-valued logic — no match.
+                if matches!(left_val, Value::Null) || matches!(right_val, Value::Null) {
+                    return Ok(false);
+                }
+                if left_val != right_val {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// Concatenates two row slices into a new combined row.
+#[inline]
+fn concat_rows(left: &[Value], right: &[Value]) -> Row {
+    let mut combined = Vec::with_capacity(left.len() + right.len());
+    combined.extend_from_slice(left);
+    combined.extend_from_slice(right);
+    combined
+}
+
+/// Builds `ColumnMeta` for the output of a JOIN query.
+fn build_join_column_meta(
+    items: &[SelectItem],
+    all_tables: &[axiomdb_catalog::ResolvedTable],
+    joins: &[JoinClause],
+) -> Result<Vec<ColumnMeta>, DbError> {
+    let mut out = Vec::new();
+
+    for item in items {
+        match item {
+            SelectItem::Wildcard => {
+                // Expand all columns from all tables in order.
+                for (t_idx, table) in all_tables.iter().enumerate() {
+                    let outer_nullable = is_outer_nullable(t_idx, joins);
+                    for col in &table.columns {
+                        out.push(ColumnMeta {
+                            name: col.name.clone(),
+                            data_type: column_type_to_datatype(col.col_type),
+                            nullable: col.nullable || outer_nullable,
+                            table_name: Some(table.def.table_name.clone()),
                         });
                     }
                 }
             }
-            Ok(QueryResult::Rows {
-                columns: out_cols,
-                rows: vec![out_row],
-            })
-        }
 
-        // ── Subquery in FROM — deferred ───────────────────────────────────────
-        Some(FromClause::Subquery { .. }) => Err(DbError::NotImplemented {
-            feature: "subquery in FROM — Phase 4.11".into(),
-        }),
-
-        // ── SELECT from a table ───────────────────────────────────────────────
-        Some(FromClause::Table(table_ref)) => {
-            let resolved = {
-                let resolver = make_resolver(storage, txn)?;
-                resolver.resolve_table(table_ref.schema.as_deref(), &table_ref.name)?
-                // resolver goes out of scope here, releasing immutable borrow on storage
-            };
-
-            let snap = txn.active_snapshot()?;
-            let raw_rows =
-                TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?;
-
-            // Build output column descriptors.
-            let out_cols =
-                build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
-
-            // Filter rows by WHERE, then project.
-            let mut rows: Vec<Row> = Vec::new();
-            for (_rid, values) in raw_rows {
-                // WHERE filter.
-                if let Some(ref wc) = stmt.where_clause {
-                    let result = eval(wc, &values)?;
-                    if !is_truthy(&result) {
-                        continue;
-                    }
+            SelectItem::QualifiedWildcard(qualifier) => {
+                // Expand only the columns from the matching table.
+                let t_idx = all_tables
+                    .iter()
+                    .position(|t| t.def.table_name == *qualifier || t.def.schema_name == *qualifier)
+                    .ok_or_else(|| DbError::TableNotFound {
+                        name: qualifier.clone(),
+                    })?;
+                let table = &all_tables[t_idx];
+                let outer_nullable = is_outer_nullable(t_idx, joins);
+                for col in &table.columns {
+                    out.push(ColumnMeta {
+                        name: col.name.clone(),
+                        data_type: column_type_to_datatype(col.col_type),
+                        nullable: col.nullable || outer_nullable,
+                        table_name: Some(table.def.table_name.clone()),
+                    });
                 }
-                // Project SELECT list.
-                let out_row = project_row(&stmt.columns, &values)?;
-                rows.push(out_row);
             }
 
-            Ok(QueryResult::Rows {
-                columns: out_cols,
-                rows,
-            })
+            SelectItem::Expr { expr, alias } => {
+                let name = expr_column_name(expr, alias.as_deref());
+                // Infer type: plain column reference uses catalog type; others use Text fallback.
+                let (dt, nullable) = infer_expr_type_join(expr, all_tables, joins);
+                out.push(ColumnMeta {
+                    name,
+                    data_type: dt,
+                    nullable,
+                    table_name: None,
+                });
+            }
         }
     }
+    Ok(out)
+}
+
+/// Returns true if the table at `t_idx` can have NULLs due to its position
+/// in the join chain.
+///
+/// - Table 0 (FROM table): nullable if the first join is RIGHT.
+/// - Table `i` (i > 0, the i-th JOIN table): nullable if join[i-1] is LEFT.
+fn is_outer_nullable(t_idx: usize, joins: &[JoinClause]) -> bool {
+    if t_idx == 0 {
+        // FROM table is nullable if the first join is RIGHT.
+        joins
+            .first()
+            .is_some_and(|j| j.join_type == JoinType::Right)
+    } else {
+        // JOIN[t_idx-1] table is nullable if that join is LEFT.
+        joins
+            .get(t_idx - 1)
+            .is_some_and(|j| j.join_type == JoinType::Left)
+    }
+}
+
+/// Infers (DataType, nullable) for an expression in a JOIN context.
+fn infer_expr_type_join(
+    expr: &Expr,
+    all_tables: &[axiomdb_catalog::ResolvedTable],
+    joins: &[JoinClause],
+) -> (DataType, bool) {
+    if let Expr::Column { col_idx, .. } = expr {
+        // Find which table owns this col_idx and what the column type is.
+        let mut offset = 0;
+        for (t_idx, table) in all_tables.iter().enumerate() {
+            let end = offset + table.columns.len();
+            if *col_idx < end {
+                let local_pos = col_idx - offset;
+                if let Some(col) = table.columns.get(local_pos) {
+                    let nullable = col.nullable || is_outer_nullable(t_idx, joins);
+                    return (column_type_to_datatype(col.col_type), nullable);
+                }
+            }
+            offset = end;
+        }
+    }
+    (DataType::Text, true) // safe fallback for computed expressions
 }
 
 // ── INSERT ────────────────────────────────────────────────────────────────────

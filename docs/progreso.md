@@ -121,7 +121,7 @@
 - [x] 4.7 ✅ SQLSTATE codes — all DbError variants mapped; SQL-reachable errors have precise 5-char codes
 
 <!-- ── Group E — Core SQL (needs executor) ── -->
-- [ ] 4.8 ⏳ JOIN — INNER, LEFT, RIGHT, CROSS with basic nested loop join
+- [x] 4.8 ✅ JOIN — INNER, LEFT, RIGHT, CROSS with nested loop; USING; multi-table; FULL → NotImplemented
 - [ ] 4.9a ⏳ GROUP BY hash-based — hash table for grouping; optimal for high cardinality
 - [ ] 4.9b ⏳ GROUP BY sort-based — sort first, then stream; optimal when data is pre-sorted by index
 - [ ] 4.9c ⏳ Aggregate functions — COUNT, SUM, MIN, MAX, AVG, COUNT DISTINCT; state per group
