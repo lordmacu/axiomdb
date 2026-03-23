@@ -170,6 +170,172 @@ SELECT * FROM products WHERE name NOT LIKE 'Test%';
 
 ---
 
+## Subqueries
+
+A subquery is a `SELECT` statement nested inside another statement. AxiomDB supports
+five subquery forms, each with full NULL semantics identical to PostgreSQL and MySQL.
+
+### Scalar Subqueries
+
+A scalar subquery appears anywhere an expression is valid (SELECT list, WHERE, HAVING,
+ORDER BY). It must return exactly one column. If it returns zero rows, the result is
+`NULL`. If it returns more than one row, AxiomDB raises `CardinalityViolation`
+(SQLSTATE 21000).
+
+```sql
+-- Compare each product price against the overall average
+SELECT
+    name,
+    price,
+    price - (SELECT AVG(price) FROM products) AS diff_from_avg
+FROM products
+ORDER BY diff_from_avg DESC;
+
+-- Find the most recently placed order date
+SELECT * FROM orders
+WHERE placed_at = (SELECT MAX(placed_at) FROM orders);
+
+-- Use a scalar subquery in HAVING
+SELECT user_id, COUNT(*) AS order_count
+FROM orders
+GROUP BY user_id
+HAVING COUNT(*) > (SELECT AVG(cnt) FROM (SELECT COUNT(*) AS cnt FROM orders GROUP BY user_id) AS sub);
+```
+
+If the subquery returns more than one row, AxiomDB raises:
+
+```
+ERROR 21000: subquery must return exactly one row, but returned 3 rows
+```
+
+Use `LIMIT 1` or a unique `WHERE` predicate to guarantee a single row.
+
+### IN Subquery
+
+`expr [NOT] IN (SELECT col FROM ...)` tests whether a value appears in the set of
+values produced by the subquery.
+
+```sql
+-- Orders for users who have placed more than 5 orders total
+SELECT * FROM orders
+WHERE user_id IN (
+    SELECT user_id FROM orders GROUP BY user_id HAVING COUNT(*) > 5
+);
+
+-- Products never sold
+SELECT * FROM products
+WHERE id NOT IN (
+    SELECT DISTINCT product_id FROM order_items
+);
+```
+
+**NULL semantics** — fully consistent with the SQL standard:
+
+| Value in outer expr | Subquery result | Result |
+|---|---|---|
+| `'Alice'` | contains `'Alice'` | `TRUE` |
+| `'Alice'` | does not contain `'Alice'`, no NULLs | `FALSE` |
+| `'Alice'` | does not contain `'Alice'`, contains `NULL` | `NULL` |
+| `NULL` | any non-empty set | `NULL` |
+| `NULL` | empty set | `NULL` |
+
+The third row is the subtle case: `x NOT IN (subquery with NULLs)` returns `NULL`,
+not `FALSE`. This means `NOT IN` combined with a subquery that may produce NULLs
+can silently exclude rows. A safe alternative is `NOT EXISTS`.
+
+### EXISTS / NOT EXISTS
+
+`[NOT] EXISTS (SELECT ...)` tests whether the subquery produces at least one row.
+The result is always `TRUE` or `FALSE` — never `NULL`.
+
+```sql
+-- Users who have at least one paid order
+SELECT * FROM users u
+WHERE EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.user_id = u.id AND o.status = 'paid'
+);
+
+-- Products with no associated order items
+SELECT * FROM products p
+WHERE NOT EXISTS (
+    SELECT 1 FROM order_items oi WHERE oi.product_id = p.id
+);
+```
+
+The select list inside an `EXISTS` subquery does not matter — `SELECT 1`, `SELECT *`,
+and `SELECT id` all behave identically. The engine only checks for row existence.
+
+### Correlated Subqueries
+
+A correlated subquery references columns from the outer query. AxiomDB re-executes
+the subquery for each outer row, substituting the current outer column values.
+
+```sql
+-- For each order, fetch the user's name (correlated scalar subquery in SELECT list)
+SELECT
+    o.id,
+    o.total,
+    (SELECT u.name FROM users u WHERE u.id = o.user_id) AS customer_name
+FROM orders o;
+
+-- Orders whose total exceeds the average total for that user (correlated in WHERE)
+SELECT * FROM orders o
+WHERE o.total > (
+    SELECT AVG(total) FROM orders WHERE user_id = o.user_id
+);
+
+-- Active products with above-average stock in their category
+SELECT * FROM products p
+WHERE p.stock > (
+    SELECT AVG(stock) FROM products WHERE category_id = p.category_id
+);
+```
+
+Correlated subqueries with large outer result sets can be slow (O(n) re-executions).
+For performance-critical paths, rewrite them as JOINs with aggregation.
+
+### Derived Tables (FROM Subquery)
+
+A subquery in the `FROM` clause is called a derived table. It must have an alias.
+AxiomDB materializes the derived table result in memory before executing the outer query.
+
+```sql
+-- Top spenders, computed as a subquery and then filtered
+SELECT customer_name, total_spent
+FROM (
+    SELECT u.name AS customer_name, SUM(o.total) AS total_spent
+    FROM users u
+    JOIN orders o ON o.user_id = u.id
+    WHERE o.status = 'delivered'
+    GROUP BY u.id, u.name
+) AS spending
+WHERE total_spent > 500
+ORDER BY total_spent DESC;
+
+-- Percentile bucketing: compute rank in a subquery, filter in outer
+SELECT *
+FROM (
+    SELECT
+        id,
+        name,
+        price,
+        RANK() OVER (ORDER BY price DESC) AS price_rank
+    FROM products
+) AS ranked
+WHERE price_rank <= 10;
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Full SQL Standard NULL Semantics</span>
+AxiomDB implements the same three-valued logic for <code>IN (subquery)</code> as PostgreSQL and MySQL: a non-matching lookup against a set that contains NULL returns NULL, not FALSE. This matches ISO SQL:2016 and avoids the "missing row" trap that catches developers when <code>NOT IN</code> is used against a nullable foreign key column. Every subquery form (scalar, IN, EXISTS, correlated, derived table) follows the same rules as PostgreSQL 15.
+</div>
+</div>
+
+---
+
 ## GROUP BY and HAVING
 
 `GROUP BY` collapses rows with the same values in the specified columns into a single
