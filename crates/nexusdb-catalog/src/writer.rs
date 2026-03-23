@@ -33,12 +33,15 @@
 //! SYSTEM_TABLE_INDEXES = u32::MAX      (nexus_indexes)
 //! ```
 
+use std::sync::Arc;
+
 use nexusdb_core::error::DbError;
 use nexusdb_storage::{alloc_index_id, alloc_table_id, HeapChain, StorageEngine};
 use nexusdb_wal::TxnManager;
 
 use crate::{
     bootstrap::{CatalogBootstrap, CatalogPageIds},
+    notifier::{CatalogChangeNotifier, SchemaChangeEvent, SchemaChangeKind},
     schema::{ColumnDef, IndexDef, TableDef, TableId},
 };
 
@@ -57,14 +60,22 @@ pub const SYSTEM_TABLE_INDEXES: u32 = u32::MAX;
 ///
 /// Requires an active transaction in the `TxnManager`. All heap mutations
 /// are WAL-logged for crash recovery and MVCC correctness.
+///
+/// Optionally carries a [`CatalogChangeNotifier`] that receives a
+/// [`SchemaChangeEvent`] after each successful DDL mutation. Set it via
+/// [`with_notifier`]. Without a notifier the writer behaves identically to
+/// before — the notifier is purely additive.
+///
+/// [`with_notifier`]: CatalogWriter::with_notifier
 pub struct CatalogWriter<'a> {
     storage: &'a mut dyn StorageEngine,
     txn: &'a mut TxnManager,
     page_ids: CatalogPageIds,
+    notifier: Option<Arc<CatalogChangeNotifier>>,
 }
 
 impl<'a> CatalogWriter<'a> {
-    /// Creates a new `CatalogWriter`.
+    /// Creates a new `CatalogWriter` without a notifier.
     ///
     /// # Errors
     /// - [`DbError::CatalogNotInitialized`] if [`CatalogBootstrap::init`] has not been called.
@@ -77,7 +88,39 @@ impl<'a> CatalogWriter<'a> {
             storage,
             txn,
             page_ids,
+            notifier: None,
         })
+    }
+
+    /// Attaches a [`CatalogChangeNotifier`].
+    ///
+    /// After this call, every DDL operation fires the appropriate
+    /// [`SchemaChangeEvent`] on the notifier immediately after the heap
+    /// mutation succeeds (before commit — see notifier module docs for
+    /// firing semantics).
+    ///
+    /// Returns `self` for builder-style chaining:
+    /// ```rust,ignore
+    /// let writer = CatalogWriter::new(&mut storage, &mut txn)?
+    ///     .with_notifier(Arc::clone(&notifier));
+    /// ```
+    pub fn with_notifier(mut self, notifier: Arc<CatalogChangeNotifier>) -> Self {
+        self.notifier = Some(notifier);
+        self
+    }
+
+    // ── Internal: fire notification ───────────────────────────────────────────
+
+    /// Fires a schema change event on the notifier, if one is set.
+    ///
+    /// Called after every successful DDL mutation. `txn_id` is taken from the
+    /// active transaction; falls back to 0 if somehow called outside one
+    /// (should not happen — DDL methods verify active txn before calling this).
+    fn fire(&self, kind: SchemaChangeKind) {
+        if let Some(n) = &self.notifier {
+            let txn_id = self.txn.active_txn_id().unwrap_or(0);
+            n.notify(&SchemaChangeEvent { kind, txn_id });
+        }
     }
 
     // ── Table operations ──────────────────────────────────────────────────────
@@ -111,6 +154,7 @@ impl<'a> CatalogWriter<'a> {
         self.txn
             .record_insert(SYSTEM_TABLE_TABLES, &key, &data, page_id, slot_id)?;
 
+        self.fire(SchemaChangeKind::TableCreated { table_id });
         Ok(table_id)
     }
 
@@ -174,6 +218,10 @@ impl<'a> CatalogWriter<'a> {
         self.txn
             .record_insert(SYSTEM_TABLE_INDEXES, &key, &data, page_id, slot_id)?;
 
+        self.fire(SchemaChangeKind::IndexCreated {
+            index_id,
+            table_id: row.table_id,
+        });
         Ok(index_id)
     }
 
@@ -222,15 +270,23 @@ impl<'a> CatalogWriter<'a> {
             }
         }
 
-        // Delete matching indexes from nexus_indexes.
+        // Delete matching indexes from nexus_indexes; collect dropped index_ids for events.
+        let mut dropped_index_ids: Vec<u32> = Vec::new();
         for (page_id, slot_id, data) in idx_rows {
             let (def, _) = IndexDef::from_bytes(&data)?;
             if def.table_id == table_id {
+                dropped_index_ids.push(def.index_id);
                 HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
                 let key = table_id.to_le_bytes();
                 self.txn
                     .record_delete(SYSTEM_TABLE_INDEXES, &key, &data, page_id, slot_id)?;
             }
+        }
+
+        // Fire notifications after all mutations succeed.
+        self.fire(SchemaChangeKind::TableDropped { table_id });
+        for index_id in dropped_index_ids {
+            self.fire(SchemaChangeKind::IndexDropped { index_id, table_id });
         }
 
         Ok(())
@@ -253,10 +309,12 @@ impl<'a> CatalogWriter<'a> {
         for (page_id, slot_id, data) in rows {
             let (def, _) = IndexDef::from_bytes(&data)?;
             if def.index_id == index_id {
+                let table_id = def.table_id;
                 HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
                 let key = index_id.to_le_bytes();
                 self.txn
                     .record_delete(SYSTEM_TABLE_INDEXES, &key, &data, page_id, slot_id)?;
+                self.fire(SchemaChangeKind::IndexDropped { index_id, table_id });
                 return Ok(());
             }
         }
