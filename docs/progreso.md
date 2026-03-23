@@ -126,10 +126,10 @@
 - [ ] 4.9b ⏳ GROUP BY sort-based — sort first, then stream; optimal when data is pre-sorted by index (deferred)
 - [x] 4.9c ✅ Aggregate functions — COUNT(*), COUNT(col), SUM, MIN, MAX, AVG (→ Real); skip NULL; finalize
 - [x] 4.9d ✅ HAVING clause — eval_with_aggs intercepts aggregate calls; representative_row for col refs
-- [ ] 4.10 ⏳ ORDER BY + LIMIT/OFFSET — in-memory sort + pagination
-- [ ] 4.10b ⏳ Multi-column ORDER BY with mixed direction — `ORDER BY a ASC, b DESC`; composite comparator; test with NULLs in each position
-- [ ] 4.10c ⏳ NULLS FIRST / NULLS LAST — MySQL default (NULLs first in ASC) vs PostgreSQL (NULLs last); configurable
-- [ ] 4.10d ⏳ Parameterized LIMIT/OFFSET — `LIMIT $1 OFFSET $2` in prepared statements; avoid re-parsing per pagination value
+- [x] 4.10 ✅ ORDER BY + LIMIT/OFFSET — in-memory sort; stable sort_by; sort_err pattern
+- [x] 4.10b ✅ Multi-column ORDER BY with mixed direction — composite comparator, left-to-right
+- [x] 4.10c ✅ NULLS FIRST / NULLS LAST — ASC→NULLS LAST, DESC→NULLS FIRST (PG defaults); explicit override
+- [ ] 4.10d ⏳ Parameterized LIMIT/OFFSET — `LIMIT $1 OFFSET $2` in prepared statements (deferred to Phase 5)
 - [ ] 4.11 ⏳ Scalar subqueries — `(SELECT MAX(id) FROM t)` in WHERE and SELECT list
 - [ ] 4.12 ⏳ DISTINCT — `SELECT DISTINCT col1, col2`; hash set or sort; interacts with ORDER BY
 - [ ] 4.12b ⏳ CAST + basic type coercion — explicit and implicit conversion between compatible types
