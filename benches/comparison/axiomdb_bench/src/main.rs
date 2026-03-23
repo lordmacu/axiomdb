@@ -257,44 +257,145 @@ fn main() {
     };
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    run_scenario(&scenario, n_rows, &data_dir);
+    if args.contains(&"--diagnose".to_string()) {
+        diagnose(&data_dir, n_rows);
+    } else {
+        run_scenario(&scenario, n_rows, &data_dir);
+    }
 }
 
 // ── Diagnostic: timing breakdown per phase ────────────────────────────────────
 
-#[allow(dead_code)]
-fn diagnose(data_dir: &Path) {
+fn diagnose(data_dir: &Path, n_rows: usize) {
     let mut db = Db::open(data_dir);
-    let inserts = gen_inserts(1000);
+    let inserts = gen_inserts(n_rows);
     load_batch(&mut db, &inserts);
 
-    let q = "SELECT * FROM bench_users";
+    let iters = 200usize;
+    let q_scan = "SELECT * FROM bench_users";
+    let q_where = "SELECT * FROM bench_users WHERE active = TRUE";
+    let q_count = "SELECT COUNT(*) FROM bench_users";
+    let q_group = "SELECT age, COUNT(*) FROM bench_users GROUP BY age";
 
-    // 1. Parse only
+    // ── 1. Parse overhead ─────────────────────────────────────────────────────
     let t0 = Instant::now();
-    for _ in 0..100 {
-        parse(q, None).unwrap();
+    for _ in 0..iters {
+        parse(q_scan, None).unwrap();
     }
-    let parse_us = t0.elapsed().as_micros() / 100;
+    let parse_ns = t0.elapsed().as_nanos() as usize / iters;
 
-    // 2. Parse + analyze
+    // ── 2. Analyze overhead (catalog lookup) ──────────────────────────────────
     let t0 = Instant::now();
-    for _ in 0..100 {
-        let stmt = parse(q, None).unwrap();
+    for _ in 0..iters {
+        let stmt = parse(q_scan, None).unwrap();
         let snap = db
             .txn
             .active_snapshot()
             .unwrap_or_else(|_| db.txn.snapshot());
         analyze(stmt, &mut db.storage, snap).unwrap();
     }
-    let analyze_us = t0.elapsed().as_micros() / 100;
+    let analyze_ns = t0.elapsed().as_nanos() as usize / iters;
 
-    // 3. Full execute
+    // ── 3. Execute — full scan ────────────────────────────────────────────────
     let t0 = Instant::now();
-    for _ in 0..100 {
-        db.sql_count(q);
+    for _ in 0..iters {
+        db.sql_count(q_scan);
     }
-    let execute_us = t0.elapsed().as_micros() / 100;
+    let scan_ns = t0.elapsed().as_nanos() as usize / iters;
+
+    // ── 4. Execute — scan with WHERE filter ──────────────────────────────────
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        db.sql_count(q_where);
+    }
+    let where_ns = t0.elapsed().as_nanos() as usize / iters;
+
+    // ── 5. Execute — COUNT(*) ─────────────────────────────────────────────────
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        db.sql(q_count);
+    }
+    let count_ns = t0.elapsed().as_nanos() as usize / iters;
+
+    // ── 6. Execute — GROUP BY ─────────────────────────────────────────────────
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        db.sql(q_group);
+    }
+    let group_ns = t0.elapsed().as_nanos() as usize / iters;
+
+    // ── Output ────────────────────────────────────────────────────────────────
+    let exec_ns = scan_ns.saturating_sub(analyze_ns);
+    let analyze_overhead_ns = analyze_ns.saturating_sub(parse_ns);
+
+    fn fmt_us(ns: usize) -> String {
+        format!("{:.1} µs", ns as f64 / 1000.0)
+    }
+    fn pct(part: usize, total: usize) -> String {
+        if total == 0 {
+            return "  —".to_string();
+        }
+        format!("{:3.0}%", part as f64 / total as f64 * 100.0)
+    }
+
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════════════╗");
+    eprintln!(
+        "║  AxiomDB Executor Profiling — {} rows, {} iterations",
+        n_rows, iters
+    );
+    eprintln!("╠══════════════════════════════════════════════════════════╣");
+    eprintln!("║  Phase breakdown per query call:                        ║");
+    eprintln!("║                                                          ║");
+    eprintln!(
+        "║  parse()         {:>10}                            ║",
+        fmt_us(parse_ns)
+    );
+    eprintln!(
+        "║  analyze()       {:>10}  ({} of scan total)      ║",
+        fmt_us(analyze_overhead_ns),
+        pct(analyze_overhead_ns, scan_ns)
+    );
+    eprintln!(
+        "║  execute-scan    {:>10}  ({} of scan total)      ║",
+        fmt_us(exec_ns),
+        pct(exec_ns, scan_ns)
+    );
+    eprintln!("║  ─────────────────────────────────────────────────────  ║");
+    eprintln!(
+        "║  full_scan total {:>10}                            ║",
+        fmt_us(scan_ns)
+    );
+    eprintln!("║                                                          ║");
+    eprintln!(
+        "║  SELECT WHERE    {:>10}  (+{} vs scan)           ║",
+        fmt_us(where_ns),
+        fmt_us(where_ns.saturating_sub(scan_ns))
+    );
+    eprintln!(
+        "║  COUNT(*)        {:>10}                            ║",
+        fmt_us(count_ns)
+    );
+    eprintln!(
+        "║  GROUP BY        {:>10}                            ║",
+        fmt_us(group_ns)
+    );
+    eprintln!("║                                                          ║");
+    eprintln!(
+        "║  Heap scan rate: {:.0} rows/s                          ║",
+        n_rows as f64 / (exec_ns as f64 / 1e9)
+    );
+    eprintln!("╠══════════════════════════════════════════════════════════╣");
+    eprintln!("║  Verdict:                                                ║");
+    if analyze_overhead_ns > exec_ns {
+        eprintln!("║  ⚠️  ANALYZE > EXECUTE — catalog lookup is the bottleneck║");
+        eprintln!("║     Fix: schema cache in analyzer (avoids heap scan)    ║");
+    } else {
+        eprintln!("║  ✅ EXECUTE dominates — bottleneck is the heap scan     ║");
+        eprintln!("║     Fix: Phase 5 index scan + vectorized execution       ║");
+    }
+    eprintln!("╚══════════════════════════════════════════════════════════╝");
+    eprintln!();
 
     eprintln!("=== DIAGNOSE (1K rows) ===");
     eprintln!("  parse only:        {:>6} µs", parse_us);

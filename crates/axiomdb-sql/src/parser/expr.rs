@@ -31,6 +31,17 @@ use crate::{
     lexer::Token,
 };
 
+// ── Subquery helper ───────────────────────────────────────────────────────────
+
+/// Parse a full SELECT statement in a subquery context.
+///
+/// Expects `SELECT` to be the current token; consumes it and parses
+/// everything up to (but not including) the closing `)`.
+fn parse_subquery(p: &mut super::Parser) -> Result<crate::ast::SelectStmt, DbError> {
+    p.expect(&Token::Select)?;
+    super::dml::parse_select(p)
+}
+
 use super::Parser;
 
 /// Parse a full SQL expression.
@@ -72,10 +83,32 @@ fn parse_and(p: &mut Parser) -> Result<Expr, DbError> {
 
 fn parse_not(p: &mut Parser) -> Result<Expr, DbError> {
     if p.eat(&Token::Not) {
+        // NOT EXISTS (SELECT ...) — handled here before the generic NOT path.
+        if matches!(p.peek(), Token::Exists) {
+            p.advance();
+            p.expect(&Token::LParen)?;
+            let query = parse_subquery(p)?;
+            p.expect(&Token::RParen)?;
+            return Ok(Expr::Exists {
+                query: Box::new(query),
+                negated: true,
+            });
+        }
         let operand = parse_not(p)?;
         return Ok(Expr::UnaryOp {
             op: UnaryOp::Not,
             operand: Box::new(operand),
+        });
+    }
+    // EXISTS (SELECT ...) — without NOT.
+    if matches!(p.peek(), Token::Exists) {
+        p.advance();
+        p.expect(&Token::LParen)?;
+        let query = parse_subquery(p)?;
+        p.expect(&Token::RParen)?;
+        return Ok(Expr::Exists {
+            query: Box::new(query),
+            negated: false,
         });
     }
     parse_is_null(p)
@@ -143,6 +176,17 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
         Token::In => {
             p.advance();
             p.expect(&Token::LParen)?;
+            // IN (SELECT ...) — subquery membership test.
+            if matches!(p.peek(), Token::Select) {
+                let query = parse_subquery(p)?;
+                p.expect(&Token::RParen)?;
+                return Ok(Expr::InSubquery {
+                    expr: Box::new(left),
+                    query: Box::new(query),
+                    negated,
+                });
+            }
+            // IN (value_list) — existing behavior.
             let mut list = vec![parse_expr(p)?];
             while p.eat(&Token::Comma) {
                 list.push(parse_expr(p)?);
@@ -278,6 +322,12 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
         }
         Token::LParen => {
             p.advance();
+            // (SELECT ...) — scalar subquery.
+            if matches!(p.peek(), Token::Select) {
+                let query = parse_subquery(p)?;
+                p.expect(&Token::RParen)?;
+                return Ok(Expr::Subquery(Box::new(query)));
+            }
             let expr = parse_expr(p)?;
             p.expect(&Token::RParen)?;
             Ok(expr)

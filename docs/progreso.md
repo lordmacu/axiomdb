@@ -130,16 +130,16 @@
 - [x] 4.10b ✅ Multi-column ORDER BY with mixed direction — composite comparator, left-to-right
 - [x] 4.10c ✅ NULLS FIRST / NULLS LAST — ASC→NULLS LAST, DESC→NULLS FIRST (PG defaults); explicit override
 - [ ] 4.10d ⏳ Parameterized LIMIT/OFFSET — `LIMIT $1 OFFSET $2` in prepared statements (deferred to Phase 5)
-- [ ] 4.11 ⏳ Scalar subqueries — `(SELECT MAX(id) FROM t)` in WHERE and SELECT list
+- [x] 4.11 ✅ Scalar subqueries — scalar `(SELECT ...)`, `IN (SELECT ...)`, `EXISTS/NOT EXISTS`, correlated subqueries, derived tables `FROM (SELECT ...)`, `SubqueryRunner` trait + `eval_with`; 14 integration tests
 - [x] 4.12 ✅ DISTINCT — HashSet dedup on projected output rows; NULL=NULL for grouping; pre-LIMIT
-- [ ] 4.12b ⏳ CAST + basic type coercion — explicit and implicit conversion between compatible types
+- [x] 4.12b ✅ CAST + basic type coercion — explicit and implicit conversion between compatible types
 - [x] 4.24 ✅ CASE WHEN — searched + simple form; NULL semantics; nested; SELECT/WHERE/ORDER BY/GROUP BY
 - [x] 4.6 ✅ INSERT ... SELECT — execute_select + col_map + insert_row; MVCC prevents self-reads
 
 <!-- ── Group F — Functions (needs executor) ── -->
-- [ ] 4.13 ⏳ version() / current_user / session_user / current_database() — ORMs call these on connect; required for Phase 5 compatibility
+- [x] 4.13 ✅ version() / current_user / session_user / current_database() — ORMs call these on connect; required for Phase 5 compatibility
 - [ ] 4.14 ⏳ LAST_INSERT_ID() / lastval() — last auto-generated ID (MySQL + PG compat)
-- [ ] 4.19 ⏳ Basic built-in functions — `ABS`, `LENGTH`, `SUBSTR`, `UPPER`, `LOWER`, `TRIM`, `COALESCE`, `NOW()`, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `ROUND`, `FLOOR`, `CEIL`
+- [x] 4.19 ✅ Basic built-in functions — `ABS`, `LENGTH`, `SUBSTR`, `UPPER`, `LOWER`, `TRIM`, `COALESCE`, `NOW()`, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `ROUND`, `FLOOR`, `CEIL`
 - [ ] 4.19b ⏳ BLOB functions — `FROM_BASE64(text)→BLOB` auto-decodes Base64 on insert (eliminates 33% overhead); `TO_BASE64(blob)→TEXT`; `OCTET_LENGTH(blob)→INT`; `ENCODE(blob,'hex'/'base64')→TEXT`; `DECODE(text,'hex'/'base64')→BLOB`; foundation for content-addressed storage in Phase 14
 - [ ] 4.19c ⏳ UUID generation functions — `gen_random_uuid()` returns UUID v4; `uuid_generate_v7()` returns UUID v7 (time-ordered, better for B+Tree index locality); `IS_VALID_UUID(text)→BOOL`; nearly every modern app uses UUIDs as primary keys and the DB must be able to generate them server-side without depending on application code
 

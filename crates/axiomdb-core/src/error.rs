@@ -169,9 +169,18 @@ pub enum DbError {
     #[error("sequence overflow: no more IDs available")]
     SequenceOverflow,
 
+    // ── Subqueries ───────────────────────────────────────────────
+    /// A scalar subquery returned more than one row.
+    /// SQLSTATE 21000 — Cardinality Violation.
+    #[error("subquery must return exactly one row, but returned {count} rows")]
+    CardinalityViolation { count: usize },
+
     // ── General ──────────────────────────────────────────────────
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
+
+    #[error("internal error: {message}")]
+    Internal { message: String },
 
     #[error("{0}")]
     Other(String),
@@ -211,6 +220,8 @@ impl DbError {
             DbError::KeyTooLong { .. } => "22001",
             DbError::ValueTooLarge { .. } => "22001",
             DbError::InvalidValue { .. } => "22P02",
+            // ── Subqueries ────────────────────────────────────────────────
+            DbError::CardinalityViolation { .. } => "21000",
             // ── Features ─────────────────────────────────────────────────
             DbError::NotImplemented { .. } => "0A000",
             // ── System / I/O ──────────────────────────────────────────────
