@@ -16,7 +16,7 @@
 //! **ColumnRow**: `[table_id:4][col_idx:2][col_type:1][flags:1][name_len:1][name bytes]`
 //! - `flags bit0` = nullable
 //!
-//! **IndexRow**: `[table_id:4][root_page_id:8][flags:1][name_len:1][name bytes]`
+//! **IndexRow**: `[index_id:4][table_id:4][root_page_id:8][flags:1][name_len:1][name bytes]`
 //! - `flags bit0` = unique, `flags bit1` = primary key
 
 use nexusdb_core::error::DbError;
@@ -229,6 +229,9 @@ impl ColumnDef {
 /// Metadata for an index — one row in `nexus_indexes`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDef {
+    /// Auto-incremented unique ID, allocated by `CatalogWriter::create_index`.
+    /// `0` is reserved (invalid / not yet assigned).
+    pub index_id: u32,
     pub table_id: TableId,
     pub name: String,
     pub root_page_id: u64,
@@ -239,7 +242,7 @@ pub struct IndexDef {
 impl IndexDef {
     /// Serializes to binary row format.
     ///
-    /// Format: `[table_id:4][root_page_id:8][flags:1][name_len:1][name bytes]`
+    /// Format: `[index_id:4][table_id:4][root_page_id:8][flags:1][name_len:1][name bytes]`
     /// - `flags bit0` = unique, `flags bit1` = primary key
     pub fn to_bytes(&self) -> Vec<u8> {
         let name = self.name.as_bytes();
@@ -253,7 +256,8 @@ impl IndexDef {
             flags |= 0x02;
         }
 
-        let mut buf = Vec::with_capacity(4 + 8 + 1 + 1 + name.len());
+        let mut buf = Vec::with_capacity(4 + 4 + 8 + 1 + 1 + name.len());
+        buf.extend_from_slice(&self.index_id.to_le_bytes());
         buf.extend_from_slice(&self.table_id.to_le_bytes());
         buf.extend_from_slice(&self.root_page_id.to_le_bytes());
         buf.push(flags);
@@ -263,36 +267,41 @@ impl IndexDef {
     }
 
     /// Deserializes from binary row format.
+    ///
+    /// Format: `[index_id:4][table_id:4][root_page_id:8][flags:1][name_len:1][name bytes]`
     pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), DbError> {
         let err = || DbError::ParseError {
             message: "truncated IndexRow bytes".into(),
         };
 
-        if bytes.len() < 14 {
+        // Fixed header: 4 (index_id) + 4 (table_id) + 8 (root_page_id) + 1 (flags) + 1 (name_len) = 18
+        if bytes.len() < 18 {
             return Err(err());
         }
 
-        let table_id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let index_id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let table_id = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         let root_page_id = u64::from_le_bytes([
-            bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
         ]);
-        let flags = bytes[12];
+        let flags = bytes[16];
         let is_unique = flags & 0x01 != 0;
         let is_primary = flags & 0x02 != 0;
-        let name_len = bytes[13] as usize;
+        let name_len = bytes[17] as usize;
 
-        if bytes.len() < 14 + name_len {
+        if bytes.len() < 18 + name_len {
             return Err(err());
         }
-        let name = std::str::from_utf8(&bytes[14..14 + name_len])
+        let name = std::str::from_utf8(&bytes[18..18 + name_len])
             .map_err(|_| DbError::ParseError {
                 message: "invalid UTF-8 in index name".into(),
             })?
             .to_string();
-        let consumed = 14 + name_len;
+        let consumed = 18 + name_len;
 
         Ok((
             Self {
+                index_id,
                 table_id,
                 name,
                 root_page_id,
@@ -427,6 +436,7 @@ mod tests {
     #[test]
     fn test_index_def_roundtrip_primary_unique() {
         let def = IndexDef {
+            index_id: 1,
             table_id: 3,
             name: "users_pkey".to_string(),
             root_page_id: 77,
@@ -442,6 +452,7 @@ mod tests {
     #[test]
     fn test_index_def_roundtrip_non_unique() {
         let def = IndexDef {
+            index_id: 5,
             table_id: 2,
             name: "orders_user_id_idx".to_string(),
             root_page_id: 100,
@@ -450,6 +461,7 @@ mod tests {
         };
         let bytes = def.to_bytes();
         let (back, _) = IndexDef::from_bytes(&bytes).unwrap();
+        assert_eq!(back.index_id, 5);
         assert_eq!(back.is_unique, false);
         assert_eq!(back.is_primary, false);
     }
@@ -457,6 +469,7 @@ mod tests {
     #[test]
     fn test_index_def_truncated_input_error() {
         let def = IndexDef {
+            index_id: 1,
             table_id: 1,
             name: "x".into(),
             root_page_id: 0,

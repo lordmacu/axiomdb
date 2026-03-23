@@ -120,6 +120,18 @@ pub enum DbError {
     #[error("catalog not initialized — call CatalogBootstrap::init() first")]
     CatalogNotInitialized,
 
+    #[error("table '{schema}.{name}' already exists")]
+    TableAlreadyExists { schema: String, name: String },
+
+    #[error("table with id {table_id} not found in catalog")]
+    CatalogTableNotFound { table_id: u32 },
+
+    #[error("index with id {index_id} not found in catalog")]
+    CatalogIndexNotFound { index_id: u32 },
+
+    #[error("sequence overflow: no more IDs available")]
+    SequenceOverflow,
+
     // ── General ──────────────────────────────────────────────────
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },

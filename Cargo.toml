@@ -62,6 +62,8 @@ bytemuck = { version = "1", features = ["derive"] }
 nexusdb-core    = { path = "crates/nexusdb-core" }
 nexusdb-types   = { path = "crates/nexusdb-types" }
 nexusdb-storage = { path = "crates/nexusdb-storage" }
+nexusdb-wal     = { path = "crates/nexusdb-wal" }
+nexusdb-catalog = { path = "crates/nexusdb-catalog" }
 
 [profile.dev]
 opt-level = 0

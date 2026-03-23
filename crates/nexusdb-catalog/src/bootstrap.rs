@@ -14,9 +14,10 @@
 
 use nexusdb_core::error::DbError;
 use nexusdb_storage::{
-    read_meta_u32, read_meta_u64, write_catalog_header, Page, PageType, StorageEngine,
-    CATALOG_COLUMNS_ROOT_BODY_OFFSET, CATALOG_INDEXES_ROOT_BODY_OFFSET,
-    CATALOG_SCHEMA_VER_BODY_OFFSET, CATALOG_TABLES_ROOT_BODY_OFFSET,
+    read_meta_u32, read_meta_u64, write_catalog_header, write_meta_u32, Page, PageType,
+    StorageEngine, CATALOG_COLUMNS_ROOT_BODY_OFFSET, CATALOG_INDEXES_ROOT_BODY_OFFSET,
+    CATALOG_SCHEMA_VER_BODY_OFFSET, CATALOG_TABLES_ROOT_BODY_OFFSET, NEXT_INDEX_ID_BODY_OFFSET,
+    NEXT_TABLE_ID_BODY_OFFSET,
 };
 
 // ── CatalogPageIds ────────────────────────────────────────────────────────────
@@ -77,6 +78,11 @@ impl CatalogBootstrap {
 
         // Atomically record the page IDs and schema version in the meta page.
         write_catalog_header(storage, tables_root, columns_root, indexes_root, 1)?;
+
+        // Initialize auto-increment sequences: next available ID = 1.
+        write_meta_u32(storage, NEXT_TABLE_ID_BODY_OFFSET, 1)?;
+        write_meta_u32(storage, NEXT_INDEX_ID_BODY_OFFSET, 1)?;
+
         storage.flush()?;
 
         Ok(CatalogPageIds {

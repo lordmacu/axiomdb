@@ -85,9 +85,22 @@ pub const CATALOG_INDEXES_ROOT_BODY_OFFSET: usize = 48;
 /// body offset of `catalog_schema_ver: u32` — 0 = uninitialized, 1 = v1.
 pub const CATALOG_SCHEMA_VER_BODY_OFFSET: usize = 56;
 
+/// body offset of `next_table_id: u32` — auto-increment sequence for user tables.
+/// Value 0 = uninitialized (catalog not yet bootstrapped). First valid ID = 1.
+pub const NEXT_TABLE_ID_BODY_OFFSET: usize = 64;
+
+/// body offset of `next_index_id: u32` — auto-increment sequence for indexes.
+/// Value 0 = uninitialized (catalog not yet bootstrapped). First valid ID = 1.
+pub const NEXT_INDEX_ID_BODY_OFFSET: usize = 68;
+
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMA_VER_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "catalog header must fit within page 0"
+);
+
+const _: () = assert!(
+    HEADER_SIZE + NEXT_INDEX_ID_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
+    "sequence fields must fit within page 0"
 );
 
 /// Reads a single `u64` from the meta page at `body_offset`.
@@ -118,6 +131,69 @@ pub fn read_meta_u32(storage: &dyn StorageEngine, body_offset: usize) -> Result<
         raw[off + 2],
         raw[off + 3],
     ]))
+}
+
+/// Writes a single `u32` to the meta page at `body_offset`.
+///
+/// Caller must flush storage afterward to guarantee durability.
+pub fn write_meta_u32(
+    storage: &mut dyn StorageEngine,
+    body_offset: usize,
+    value: u32,
+) -> Result<(), DbError> {
+    let bytes = *storage.read_page(0)?.as_bytes();
+    let mut page = Page::from_bytes(bytes)?;
+    let off = HEADER_SIZE + body_offset;
+    page.as_bytes_mut()[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    page.update_checksum();
+    storage.write_page(0, &page)?;
+    Ok(())
+}
+
+/// Writes a single `u64` to the meta page at `body_offset`.
+pub fn write_meta_u64(
+    storage: &mut dyn StorageEngine,
+    body_offset: usize,
+    value: u64,
+) -> Result<(), DbError> {
+    let bytes = *storage.read_page(0)?.as_bytes();
+    let mut page = Page::from_bytes(bytes)?;
+    let off = HEADER_SIZE + body_offset;
+    page.as_bytes_mut()[off..off + 8].copy_from_slice(&value.to_le_bytes());
+    page.update_checksum();
+    storage.write_page(0, &page)?;
+    Ok(())
+}
+
+/// Allocates the next `table_id` from the meta page sequence.
+///
+/// Reads the current value, increments it, writes it back, and returns the
+/// value that was allocated. The sequence is monotonically increasing and
+/// persists across database restarts.
+///
+/// # Errors
+/// - [`DbError::CatalogNotInitialized`] if the sequence is 0 (catalog not bootstrapped).
+/// - [`DbError::SequenceOverflow`] if `u32::MAX` would be exceeded.
+pub fn alloc_table_id(storage: &mut dyn StorageEngine) -> Result<u32, DbError> {
+    alloc_sequence_u32(storage, NEXT_TABLE_ID_BODY_OFFSET)
+}
+
+/// Allocates the next `index_id` from the meta page sequence.
+///
+/// Same semantics as [`alloc_table_id`].
+pub fn alloc_index_id(storage: &mut dyn StorageEngine) -> Result<u32, DbError> {
+    alloc_sequence_u32(storage, NEXT_INDEX_ID_BODY_OFFSET)
+}
+
+/// Internal: read-increment-write for a `u32` sequence stored in the meta page.
+fn alloc_sequence_u32(storage: &mut dyn StorageEngine, body_offset: usize) -> Result<u32, DbError> {
+    let current = read_meta_u32(storage, body_offset)?;
+    if current == 0 {
+        return Err(DbError::CatalogNotInitialized);
+    }
+    let next = current.checked_add(1).ok_or(DbError::SequenceOverflow)?;
+    write_meta_u32(storage, body_offset, next)?;
+    Ok(current)
 }
 
 /// Writes the entire catalog header block to the meta page in a single `write_page` call.
@@ -199,5 +275,71 @@ mod tests {
         storage.alloc_page(PageType::Data).unwrap();
         // checkpoint_lsn must be preserved.
         assert_eq!(read_checkpoint_lsn(&storage).unwrap(), 55);
+    }
+
+    // ── Sequence tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_alloc_table_id_uninitialized_returns_error() {
+        let mut storage = storage_with_meta();
+        // Fresh DB has next_table_id = 0 → CatalogNotInitialized.
+        let err = alloc_table_id(&mut storage).unwrap_err();
+        assert!(
+            matches!(err, nexusdb_core::error::DbError::CatalogNotInitialized),
+            "expected CatalogNotInitialized, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_alloc_table_id_monotonically_increasing() {
+        let mut storage = storage_with_meta();
+        // Manually seed the sequence to 1 (simulates CatalogBootstrap::init).
+        write_meta_u32(&mut storage, NEXT_TABLE_ID_BODY_OFFSET, 1).unwrap();
+        assert_eq!(alloc_table_id(&mut storage).unwrap(), 1);
+        assert_eq!(alloc_table_id(&mut storage).unwrap(), 2);
+        assert_eq!(alloc_table_id(&mut storage).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_alloc_index_id_monotonically_increasing() {
+        let mut storage = storage_with_meta();
+        write_meta_u32(&mut storage, NEXT_INDEX_ID_BODY_OFFSET, 1).unwrap();
+        assert_eq!(alloc_index_id(&mut storage).unwrap(), 1);
+        assert_eq!(alloc_index_id(&mut storage).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_sequences_independent() {
+        let mut storage = storage_with_meta();
+        write_meta_u32(&mut storage, NEXT_TABLE_ID_BODY_OFFSET, 1).unwrap();
+        write_meta_u32(&mut storage, NEXT_INDEX_ID_BODY_OFFSET, 1).unwrap();
+        let t1 = alloc_table_id(&mut storage).unwrap();
+        let i1 = alloc_index_id(&mut storage).unwrap();
+        let t2 = alloc_table_id(&mut storage).unwrap();
+        let i2 = alloc_index_id(&mut storage).unwrap();
+        assert_eq!(t1, 1);
+        assert_eq!(t2, 2);
+        assert_eq!(i1, 1);
+        assert_eq!(i2, 2);
+        // Sequences don't interfere with each other.
+        assert_eq!(
+            read_meta_u32(&storage, NEXT_TABLE_ID_BODY_OFFSET).unwrap(),
+            3
+        );
+        assert_eq!(
+            read_meta_u32(&storage, NEXT_INDEX_ID_BODY_OFFSET).unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_sequence_does_not_corrupt_other_meta_fields() {
+        let mut storage = storage_with_meta();
+        write_checkpoint_lsn(&mut storage, 42).unwrap();
+        write_meta_u32(&mut storage, NEXT_TABLE_ID_BODY_OFFSET, 1).unwrap();
+        alloc_table_id(&mut storage).unwrap();
+        // checkpoint_lsn must be preserved.
+        assert_eq!(read_checkpoint_lsn(&storage).unwrap(), 42);
+        assert!(storage.read_page(0).unwrap().verify_checksum().is_ok());
     }
 }
