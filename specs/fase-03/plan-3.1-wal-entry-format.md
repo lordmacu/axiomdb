@@ -1,149 +1,149 @@
 # Plan: WAL Entry Format (Subfase 3.1)
 
-## Archivos a crear/modificar
+## Files to create/modify
 
-| Archivo | Acción | Qué hace |
+| File | Action | What it does |
 |---|---|---|
-| `crates/nexusdb-core/src/error.rs` | Modificar | Añadir 3 variantes WAL al DbError |
-| `crates/nexusdb-wal/Cargo.toml` | Modificar | Añadir dependencia `crc32c` |
-| `crates/nexusdb-wal/src/lib.rs` | Reemplazar | Módulos públicos del crate |
-| `crates/nexusdb-wal/src/entry.rs` | Crear | `EntryType`, `WalEntry`, serialización |
-| `crates/nexusdb-wal/tests/integration_wal_entry.rs` | Crear | Tests de integración |
+| `crates/nexusdb-core/src/error.rs` | Modify | Add 3 WAL variants to DbError |
+| `crates/nexusdb-wal/Cargo.toml` | Modify | Add `crc32c` dependency |
+| `crates/nexusdb-wal/src/lib.rs` | Replace | Public modules of the crate |
+| `crates/nexusdb-wal/src/entry.rs` | Create | `EntryType`, `WalEntry`, serialization |
+| `crates/nexusdb-wal/tests/integration_wal_entry.rs` | Create | Integration tests |
 
 ---
 
-## Algoritmo de serialización — `WalEntry::to_bytes()`
+## Serialization algorithm — `WalEntry::to_bytes()`
 
 ```
-1. Calcular entry_len = tamaño total (ver fórmula abajo)
-2. Reservar Vec<u8> con capacidad entry_len
-3. Escribir entry_len         (4 bytes LE)
-4. Escribir lsn               (8 bytes LE)
-5. Escribir txn_id            (8 bytes LE)
-6. Escribir entry_type as u8  (1 byte)
-7. Escribir table_id          (4 bytes LE)
-8. Escribir key_len as u16    (2 bytes LE)
-9. Escribir key bytes         (key_len bytes)
-10. Escribir old_val_len      (4 bytes LE)
-11. Escribir old_value bytes  (old_val_len bytes)
-12. Escribir new_val_len      (4 bytes LE)
-13. Escribir new_value bytes  (new_val_len bytes)
-14. Calcular CRC32c de buf[0..pos]
-15. Escribir crc32c           (4 bytes LE)
-16. Escribir entry_len        (4 bytes LE) — copia para backward scan
+1. Compute entry_len = total size (see formula below)
+2. Reserve Vec<u8> with capacity entry_len
+3. Write entry_len         (4 bytes LE)
+4. Write lsn               (8 bytes LE)
+5. Write txn_id            (8 bytes LE)
+6. Write entry_type as u8  (1 byte)
+7. Write table_id          (4 bytes LE)
+8. Write key_len as u16    (2 bytes LE)
+9. Write key bytes         (key_len bytes)
+10. Write old_val_len      (4 bytes LE)
+11. Write old_value bytes  (old_val_len bytes)
+12. Write new_val_len      (4 bytes LE)
+13. Write new_value bytes  (new_val_len bytes)
+14. Compute CRC32c of buf[0..pos]
+15. Write crc32c           (4 bytes LE)
+16. Write entry_len        (4 bytes LE) — copy for backward scan
 ```
 
-**Fórmula de entry_len:**
+**entry_len formula:**
 ```
 4 + 8 + 8 + 1 + 4 + 2 + key.len() + 4 + old.len() + 4 + new.len() + 4 + 4
 = 43 + key.len() + old.len() + new.len()
 ```
 
-**Constante MIN_ENTRY_LEN = 43** (entry sin key ni valores).
+**Constant MIN_ENTRY_LEN = 43** (entry with no key or values).
 
 ---
 
-## Algoritmo de deserialización — `WalEntry::from_bytes(buf)`
+## Deserialization algorithm — `WalEntry::from_bytes(buf)`
 
 ```
-1. Verificar buf.len() >= 4 (al menos entry_len) → WalEntryTruncated si no
-2. Leer entry_len (4 bytes LE)
-3. Verificar buf.len() >= entry_len → WalEntryTruncated si no
-4. Leer lsn, txn_id, entry_type, table_id, key_len
-5. Verificar entry_type es valor conocido → WalUnknownEntryType si no
-6. Leer key[0..key_len]
-7. Leer old_val_len, old_value[0..old_val_len]
-8. Leer new_val_len, new_value[0..new_val_len]
-9. Leer crc32c esperado
-10. Calcular CRC32c de buf[0..pos_antes_de_crc]
-11. Comparar → WalChecksumMismatch si no coinciden
-12. Leer entry_len_2 (ignorar — solo usado para backward scan externo)
-13. Verificar entry_len_2 == entry_len → WalEntryTruncated si no coinciden
-14. Retornar (WalEntry, entry_len)
+1. Verify buf.len() >= 4 (at least entry_len) → WalEntryTruncated if not
+2. Read entry_len (4 bytes LE)
+3. Verify buf.len() >= entry_len → WalEntryTruncated if not
+4. Read lsn, txn_id, entry_type, table_id, key_len
+5. Verify entry_type is a known value → WalUnknownEntryType if not
+6. Read key[0..key_len]
+7. Read old_val_len, old_value[0..old_val_len]
+8. Read new_val_len, new_value[0..new_val_len]
+9. Read expected crc32c
+10. Compute CRC32c of buf[0..pos_before_crc]
+11. Compare → WalChecksumMismatch if they don't match
+12. Read entry_len_2 (ignore — only used for external backward scan)
+13. Verify entry_len_2 == entry_len → WalEntryTruncated if they don't match
+14. Return (WalEntry, entry_len)
 ```
 
 ---
 
-## Fases de implementación
+## Implementation phases
 
-### Paso 1 — Añadir errores WAL a DbError
-En `nexusdb-core/src/error.rs`, sección `// ── WAL`:
+### Step 1 — Add WAL errors to DbError
+In `nexusdb-core/src/error.rs`, section `// ── WAL`:
 ```rust
-#[error("WAL entry en LSN {lsn} tiene checksum inválido: esperado {expected:#010x}, obtenido {got:#010x}")]
+#[error("WAL entry at LSN {lsn} has invalid checksum: expected {expected:#010x}, got {got:#010x}")]
 WalChecksumMismatch { lsn: u64, expected: u32, got: u32 },
 
-#[error("WAL entry en LSN {lsn} está truncado — el archivo puede estar corrupto")]
+#[error("WAL entry at LSN {lsn} is truncated — the file may be corrupt")]
 WalEntryTruncated { lsn: u64 },
 
-#[error("WAL entry tiene tipo desconocido: {byte:#04x}")]
+#[error("WAL entry has unknown type: {byte:#04x}")]
 WalUnknownEntryType { byte: u8 },
 ```
 
-### Paso 2 — Añadir crc32c a nexusdb-wal/Cargo.toml
+### Step 2 — Add crc32c to nexusdb-wal/Cargo.toml
 ```toml
 crc32c = "0.6"
 ```
-(misma versión que nexusdb-storage — ya probada)
+(same version as nexusdb-storage — already tested)
 
-### Paso 3 — Implementar `entry.rs`
-En orden:
-1. `EntryType` enum `#[repr(u8)]` con `TryFrom<u8>`
-2. `WalEntry` struct con los 7 campos públicos
-3. `impl WalEntry` con:
+### Step 3 — Implement `entry.rs`
+In order:
+1. `EntryType` enum `#[repr(u8)]` with `TryFrom<u8>`
+2. `WalEntry` struct with the 7 public fields
+3. `impl WalEntry` with:
    - `pub fn new(...)` constructor
    - `pub fn serialized_len(&self) -> usize`
    - `pub fn to_bytes(&self) -> Vec<u8>`
    - `pub fn from_bytes(buf: &[u8]) -> Result<(Self, usize), DbError>`
-4. Tests unitarios inline `#[cfg(test)]`
+4. Inline unit tests `#[cfg(test)]`
 
-### Paso 4 — Actualizar `lib.rs`
-Exponer el módulo y los tipos públicos.
+### Step 4 — Update `lib.rs`
+Expose the module and public types.
 
-### Paso 5 — Tests de integración
-En `tests/integration_wal_entry.rs`:
-- Roundtrip para los 7 tipos de entry
-- Detección de corrupción (bit flip en key, payload, header)
-- Buffer truncado (buf más corto que entry_len)
-- Múltiples entries encadenados (parsear N entries de un buffer)
-- Backward scan: verificar entry_len == entry_len_2
+### Step 5 — Integration tests
+In `tests/integration_wal_entry.rs`:
+- Roundtrip for all 7 entry types
+- Corruption detection (bit flip in key, payload, header)
+- Truncated buffer (buf shorter than entry_len)
+- Multiple chained entries (parse N entries from a buffer)
+- Backward scan: verify entry_len == entry_len_2
 
 ---
 
-## Tests a escribir
+## Tests to write
 
-**Unitarios (en entry.rs `#[cfg(test)]`):**
-- `test_entry_type_roundtrip` — `u8 → EntryType → u8` para los 7 tipos
-- `test_entry_type_unknown` — byte inválido → `WalUnknownEntryType`
+**Unit tests (in entry.rs `#[cfg(test)]`):**
+- `test_entry_type_roundtrip` — `u8 → EntryType → u8` for all 7 types
+- `test_entry_type_unknown` — invalid byte → `WalUnknownEntryType`
 - `test_serialized_len_matches_to_bytes` — `serialized_len() == to_bytes().len()`
-- `test_min_entry_len_is_43` — BEGIN serializado tiene exactamente 43 bytes
-- `test_entry_len_repeated_at_end` — los últimos 4 bytes == los primeros 4 bytes
+- `test_min_entry_len_is_43` — serialized BEGIN has exactly 43 bytes
+- `test_entry_len_repeated_at_end` — last 4 bytes == first 4 bytes
 
-**Integración (en tests/):**
-- `test_roundtrip_all_entry_types` — to_bytes → from_bytes para Begin, Commit, Rollback, Insert, Delete, Update, Checkpoint
-- `test_crc_corruption_detected` — flip de 1 bit en key, old_value, new_value → WalChecksumMismatch
-- `test_header_corruption_detected` — flip en txn_id o table_id → WalChecksumMismatch
+**Integration tests (in tests/):**
+- `test_roundtrip_all_entry_types` — to_bytes → from_bytes for Begin, Commit, Rollback, Insert, Delete, Update, Checkpoint
+- `test_crc_corruption_detected` — 1-bit flip in key, old_value, new_value → WalChecksumMismatch
+- `test_header_corruption_detected` — flip in txn_id or table_id → WalChecksumMismatch
 - `test_truncated_buffer` — buf[..entry_len-1] → WalEntryTruncated
 - `test_empty_buffer` — buf[..0] → WalEntryTruncated (lsn=0)
-- `test_chain_of_entries` — serializar 100 entries, parsear todos en loop
-- `test_backward_scan_offset` — entry_len_2 permite calcular offset anterior correctamente
+- `test_chain_of_entries` — serialize 100 entries, parse all in a loop
+- `test_backward_scan_offset` — entry_len_2 allows correctly computing the previous offset
 
 ---
 
-## Antipatrones a evitar
+## Anti-patterns to avoid
 
-- **NO usar `unwrap()`** en código de producción — todo es `?` o `map_err`
-- **NO usar `unsafe`** — no hay cast de punteros, solo slices y LE bytes
-- **NO serializar con serde** — el formato binario es manual para control total del layout
-- **NO guardar crc ni entry_len en el struct** — se calculan en serialize/deserialize
-- **NO asumir alineación** — leer con `from_le_bytes([buf[i], buf[i+1], ...])`, igual que decode_rid
+- **DO NOT use `unwrap()`** in production code — everything uses `?` or `map_err`
+- **DO NOT use `unsafe`** — no pointer casts, only slices and LE bytes
+- **DO NOT serialize with serde** — the binary format is manual for full layout control
+- **DO NOT store crc or entry_len in the struct** — computed during serialize/deserialize
+- **DO NOT assume alignment** — read with `from_le_bytes([buf[i], buf[i+1], ...])`, same as decode_rid
 
 ---
 
-## Riesgos
+## Risks
 
-| Riesgo | Mitigación |
+| Risk | Mitigation |
 |---|---|
-| CRC cubre entry_len_2 accidentalmente | CRC se calcula antes de escribir entry_len_2 — test verifica esto |
-| key_len excede MAX_KEY_LEN en Fase 3 | `from_bytes` no valida key_len contra MAX_KEY_LEN — eso es responsabilidad del WalWriter. El formato es agnóstico al tamaño |
-| entry_len overflow con values muy grandes | u32 soporta hasta 4GB por entry — suficiente para cualquier operación SQL |
-| LSN=0 es ambiguo (entry sin LSN asignado) | El WalWriter asigna LSN — `WalEntry::new` recibe lsn como parámetro. LSN=0 solo en tests |
+| CRC accidentally covers entry_len_2 | CRC is computed before writing entry_len_2 — test verifies this |
+| key_len exceeds MAX_KEY_LEN in Phase 3 | `from_bytes` does not validate key_len against MAX_KEY_LEN — that is the WalWriter's responsibility. The format is size-agnostic |
+| entry_len overflow with very large values | u32 supports up to 4GB per entry — sufficient for any SQL operation |
+| LSN=0 is ambiguous (entry without assigned LSN) | The WalWriter assigns LSN — `WalEntry::new` receives lsn as a parameter. LSN=0 only in tests |

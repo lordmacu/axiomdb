@@ -1,146 +1,146 @@
 # Spec: WalWriter (Subfase 3.2)
 
-## Qué construir (no cómo)
+## What to build (not how)
 
-El `WalWriter` — componente que escribe entries al archivo WAL de forma append-only,
-gestiona el LSN global, hace fsync selectivo en COMMIT, y mantiene un header mágico
-para validación de integridad del archivo.
+The `WalWriter` — component that writes entries to the WAL file in append-only fashion,
+manages the global LSN, performs selective fsync on COMMIT, and maintains a magic header
+for file integrity validation.
 
 ---
 
-## Decisiones de diseño fijadas
+## Fixed design decisions
 
-| Aspecto | Decisión | Razón |
+| Aspect | Decision | Reason |
 |---|---|---|
-| fsync | **Solo en COMMIT** (y ROLLBACK) | Estándar industria — entries intermedios en BufWriter, solo el commit paga latencia de disco |
-| Header de archivo | **16 bytes mágicos** al inicio | Detectar archivo inválido antes de parsear entries |
-| LSN | **WalWriter es dueño** del contador AtomicU64 | LSN siempre monotónico, imposible duplicar desde el exterior |
-| Buffering | **BufWriter<File>** con flush en commit | Amortiza syscalls de write, cero overhead en entries intermedios |
-| Apertura | **Crear o reabrir** un archivo existente | Crash recovery requiere reabrir el WAL sin truncarlo |
+| fsync | **Only on COMMIT** (and ROLLBACK) | Industry standard — intermediate entries in BufWriter, only the commit pays disk latency |
+| File header | **16 magic bytes** at the start | Detect invalid file before parsing entries |
+| LSN | **WalWriter owns** the AtomicU64 counter | LSN always monotonic, impossible to duplicate from the outside |
+| Buffering | **BufWriter<File>** with flush on commit | Amortizes write syscalls, zero overhead on intermediate entries |
+| Opening | **Create or reopen** an existing file | Crash recovery requires reopening the WAL without truncating it |
 
 ---
 
-## Header del archivo WAL
+## WAL file header
 
 ```
-Offset  Tamaño  Campo
-     0       8  magic      — 0x4E455855_53574100 ("NEXUSWAL\0" en LE)
-     8       2  version    — u16 LE, actualmente 1
-    10       6  _reserved  — zeros, reservado para flags futuros
+Offset  Size    Field
+     0       8  magic      — 0x4E455855_53574100 ("NEXUSWAL\0" in LE)
+     8       2  version    — u16 LE, currently 1
+    10       6  _reserved  — zeros, reserved for future flags
 Total: 16 bytes
 ```
 
-Al crear: escribir header + fsync.
-Al reabrir: leer y verificar magic + version antes de hacer append.
+On create: write header + fsync.
+On reopen: read and verify magic + version before appending.
 
 ---
 
-## API pública
+## Public API
 
 ### `WalWriter::create(path: &Path) -> Result<Self, DbError>`
-- Crea un archivo WAL nuevo. Falla si ya existe.
-- Escribe el header de 16 bytes y hace fsync.
-- Inicializa `next_lsn = 1`.
+- Creates a new WAL file. Fails if it already exists.
+- Writes the 16-byte header and performs fsync.
+- Initializes `next_lsn = 1`.
 
 ### `WalWriter::open(path: &Path) -> Result<Self, DbError>`
-- Abre un archivo WAL existente para continuar escribiendo.
-- Verifica magic y version del header.
-- Hace seek al final del archivo.
-- Lee el LSN del último entry para inicializar `next_lsn = last_lsn + 1`.
-- Falla si el archivo no existe o el header es inválido.
+- Opens an existing WAL file for continued writing.
+- Verifies magic and version from the header.
+- Seeks to the end of the file.
+- Reads the LSN of the last entry to initialize `next_lsn = last_lsn + 1`.
+- Fails if the file does not exist or the header is invalid.
 
 ### `WalWriter::append(&mut self, entry: &mut WalEntry) -> Result<u64, DbError>`
-- Asigna el próximo LSN al entry (`entry.lsn = self.next_lsn`).
-- Serializa el entry con `WalEntry::to_bytes()`.
-- Escribe al BufWriter (sin fsync).
-- Incrementa `next_lsn`.
-- Retorna el LSN asignado.
-- **No hace fsync** — solo escribe al buffer en RAM.
+- Assigns the next LSN to the entry (`entry.lsn = self.next_lsn`).
+- Serializes the entry with `WalEntry::to_bytes()`.
+- Writes to the BufWriter (no fsync).
+- Increments `next_lsn`.
+- Returns the assigned LSN.
+- **Does not fsync** — only writes to the in-RAM buffer.
 
 ### `WalWriter::commit(&mut self) -> Result<(), DbError>`
-- Hace flush del BufWriter al OS.
-- Hace fsync del file descriptor — garantiza durabilidad en disco.
-- Retorna error si el fsync falla.
+- Flushes the BufWriter to the OS.
+- Fsyncs the file descriptor — guarantees durability on disk.
+- Returns an error if fsync fails.
 
 ### `WalWriter::current_lsn(&self) -> u64`
-- Retorna el valor de `next_lsn - 1` (último LSN asignado).
-- `0` si no se ha escrito ningún entry.
+- Returns the value of `next_lsn - 1` (last assigned LSN).
+- `0` if no entry has been written yet.
 
 ### `WalWriter::file_offset(&self) -> u64`
-- Retorna la posición actual en bytes en el archivo (tamaño total escrito).
-- Usado por el WalReader para saber hasta dónde leer.
+- Returns the current byte position in the file (total bytes written).
+- Used by the WalReader to know how far to read.
 
 ---
 
-## Comportamiento en crash
+## Crash behavior
 
-Si el proceso muere entre `append()` y `commit()`:
-- Los entries en el BufWriter se pierden (nunca llegaron a disco).
-- El WAL en disco queda en el estado del último `commit()` exitoso.
-- El WalReader/crash recovery ignorará entries incompletos (CRC los detecta).
+If the process dies between `append()` and `commit()`:
+- Entries in the BufWriter are lost (they never reached disk).
+- The WAL on disk remains in the state of the last successful `commit()`.
+- The WalReader/crash recovery will ignore incomplete entries (CRC detects them).
 
-Este es el comportamiento correcto: solo los entries con COMMIT en disco son duraderos.
+This is the correct behavior: only entries with COMMIT on disk are durable.
 
 ---
 
 ## Inputs / Outputs
 
 ### `append`
-- Input: `&mut WalEntry` (el LSN se asigna aquí, por eso es `&mut`)
-- Output: `Ok(lsn_asignado: u64)` o error
-- Errores: `Io` si falla el write al BufWriter
+- Input: `&mut WalEntry` (LSN is assigned here, hence `&mut`)
+- Output: `Ok(assigned_lsn: u64)` or error
+- Errors: `Io` if the write to the BufWriter fails
 
 ### `commit`
-- Input: ninguno
-- Output: `Ok(())` o error
-- Errores: `Io` si falla fsync
+- Input: none
+- Output: `Ok(())` or error
+- Errors: `Io` if fsync fails
 
 ### `create` / `open`
-- Errores:
-  - `Io` — no se puede crear/abrir el archivo
-  - `WalInvalidHeader { path }` — magic o version incorrectos (solo en `open`)
+- Errors:
+  - `Io` — cannot create/open the file
+  - `WalInvalidHeader { path }` — incorrect magic or version (only in `open`)
 
 ---
 
-## Casos de uso
+## Use cases
 
-1. **Crear WAL nuevo**: `create()` → archivo con header de 16 bytes en disco
-2. **Append sin commit**: `append()` × N → entries en buffer, nada en disco aún
-3. **Commit**: `append()` × N → `commit()` → todos los entries en disco, durables
-4. **Reabrir WAL existente**: `open()` → verifica header → continúa desde next_lsn correcto
-5. **Crash entre append y commit**: reabrir → entries no están (nunca llegaron a disco)
-6. **LSN siempre creciente**: dos `append()` consecutivos retornan LSNs n y n+1
-
----
-
-## Criterios de aceptación
-
-- [ ] `WalWriter::create()` crea archivo con header de 16 bytes exactos
-- [ ] `WalWriter::open()` rechaza archivo sin magic correcto → `WalInvalidHeader`
-- [ ] `WalWriter::open()` rechaza archivo con version desconocida → `WalInvalidHeader`
-- [ ] `append()` asigna LSN monotónico creciente (verificar con N llamadas consecutivas)
-- [ ] `append()` sin `commit()` → entries NO están en disco (simular con reabrir)
-- [ ] `append()` + `commit()` → entries SÍ están en disco (verificar leyendo el archivo)
-- [ ] `current_lsn()` retorna 0 antes del primer append, LSN correcto después
-- [ ] `file_offset()` crece con cada append
-- [ ] Reabrir con `open()` → `next_lsn` continúa desde donde se dejó
-- [ ] Cero `unwrap()` en código de producción
-- [ ] Cero `unsafe`
+1. **Create new WAL**: `create()` → file with 16-byte header on disk
+2. **Append without commit**: `append()` × N → entries in buffer, nothing on disk yet
+3. **Commit**: `append()` × N → `commit()` → all entries on disk, durable
+4. **Reopen existing WAL**: `open()` → verifies header → continues from correct next_lsn
+5. **Crash between append and commit**: reopen → entries are not there (never reached disk)
+6. **LSN always increasing**: two consecutive `append()` calls return LSNs n and n+1
 
 ---
 
-## Fuera del alcance
+## Acceptance criteria
+
+- [ ] `WalWriter::create()` creates file with exactly 16 header bytes
+- [ ] `WalWriter::open()` rejects file without correct magic → `WalInvalidHeader`
+- [ ] `WalWriter::open()` rejects file with unknown version → `WalInvalidHeader`
+- [ ] `append()` assigns monotonically increasing LSN (verify with N consecutive calls)
+- [ ] `append()` without `commit()` → entries are NOT on disk (simulate by reopening)
+- [ ] `append()` + `commit()` → entries ARE on disk (verify by reading the file)
+- [ ] `current_lsn()` returns 0 before the first append, correct LSN after
+- [ ] `file_offset()` grows with each append
+- [ ] Reopening with `open()` → `next_lsn` continues from where it left off
+- [ ] Zero `unwrap()` in production code
+- [ ] Zero `unsafe`
+
+---
+
+## Out of scope
 
 - WalReader (subfase 3.3)
-- Rotación/truncado del WAL (fase futura — checkpoint)
-- Compresión (fase futura)
-- WAL por tabla (descartado — WAL es global)
-- Escritura concurrente desde múltiples threads (Fase 7 con Mutex<WalWriter>)
+- WAL rotation/truncation (future phase — checkpoint)
+- Compression (future phase)
+- Per-table WAL (discarded — WAL is global)
+- Concurrent writing from multiple threads (Phase 7 with Mutex<WalWriter>)
 
 ---
 
-## Dependencias
+## Dependencies
 
 - `nexusdb-wal`: `WalEntry`, `EntryType`, `MIN_ENTRY_LEN` (subfase 3.1 ✅)
-- `nexusdb-core`: `DbError` — añadir `WalInvalidHeader { path: String }`
-- `std::fs`, `std::io::BufWriter` — sin dependencias externas nuevas
+- `nexusdb-core`: `DbError` — add `WalInvalidHeader { path: String }`
+- `std::fs`, `std::io::BufWriter` — no new external dependencies

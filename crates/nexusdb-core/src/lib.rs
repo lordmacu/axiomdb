@@ -1,12 +1,12 @@
 //! # nexusdb-core
 //!
-//! Tipos base, traits y errores compartidos por todos los crates de NexusDB.
-//! Sin dependencias externas excepto `thiserror`.
+//! Core types, traits, and errors shared by all NexusDB crates.
+//! No external dependencies except `thiserror`.
 
 pub mod error;
 pub mod traits;
 pub mod types;
 
 pub use error::DbError;
-pub use traits::{Index, PageId, RecordId, TxnId};
+pub use traits::{Index, PageId, RecordId, TransactionSnapshot, TxnId};
 pub type Result<T> = std::result::Result<T, DbError>;

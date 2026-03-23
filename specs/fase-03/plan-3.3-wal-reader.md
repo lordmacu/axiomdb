@@ -1,139 +1,139 @@
 # Plan: 3.3 — WalReader
 
-## Archivos a crear/modificar
+## Files to create/modify
 
 - `crates/nexusdb-wal/src/reader.rs` — WalReader, ForwardIter, BackwardIter
-- `crates/nexusdb-wal/src/lib.rs` — agregar `mod reader; pub use reader::WalReader;`
-- `crates/nexusdb-wal/tests/integration_wal_reader.rs` — tests de integración
+- `crates/nexusdb-wal/src/lib.rs` — add `mod reader; pub use reader::WalReader;`
+- `crates/nexusdb-wal/tests/integration_wal_reader.rs` — integration tests
 
-## Estructuras de datos
+## Data structures
 
 ```rust
-/// Lector del archivo WAL. Stateless — abre un File por cada scan.
+/// WAL file reader. Stateless — opens a File per scan.
 pub struct WalReader {
     path: PathBuf,
 }
 
-/// Iterator forward — BufReader para amortizar syscalls.
+/// Forward iterator — BufReader to amortize syscalls.
 pub struct ForwardIter {
     reader: BufReader<File>,
     from_lsn: u64,
-    done: bool,    // true tras el primer error — el iterator termina
+    done: bool,    // true after the first error — the iterator ends
 }
 
-/// Iterator backward — File seekable directo (seeks invalidan BufReader).
+/// Backward iterator — direct seekable File (seeks invalidate BufReader).
 pub struct BackwardIter {
     file: File,
-    cursor: u64,   // posición del inicio del próximo entry a leer (hacia atrás)
+    cursor: u64,   // position of the start of the next entry to read (going backwards)
     done: bool,
 }
 ```
 
-## Algoritmo
+## Algorithm
 
 ### `WalReader::open(path)`
 
 ```
-1. File::open(path) → si falla, mapear a DbError::Io
-2. Leer 16 bytes del header → si < 16 bytes, DbError::WalInvalidHeader
-3. Verificar magic + version → si inválido, DbError::WalInvalidHeader
-4. Retornar WalReader { path: path.to_path_buf() }
+1. File::open(path) → if it fails, map to DbError::Io
+2. Read 16 header bytes → if < 16 bytes, DbError::WalInvalidHeader
+3. Verify magic + version → if invalid, DbError::WalInvalidHeader
+4. Return WalReader { path: path.to_path_buf() }
 ```
 
-Nota: abrimos el archivo solo para verificar el header. No mantenemos el handle.
+Note: we open the file only to verify the header. We do not keep the handle.
 
 ### `WalReader::scan_forward(from_lsn)`
 
 ```
 1. File::open(path)
-2. Verificar header (ya verificado en open, pero puede haber sido corrompido)
-3. Seek a WAL_HEADER_SIZE
-4. BufReader::new(file) con capacidad 64KB
-5. Retornar ForwardIter { reader, from_lsn, done: false }
+2. Verify header (already verified in open, but may have been corrupted)
+3. Seek to WAL_HEADER_SIZE
+4. BufReader::new(file) with 64KB capacity
+5. Return ForwardIter { reader, from_lsn, done: false }
 ```
 
 ### `ForwardIter::next()`
 
 ```
-1. Si done → return None
-2. Leer 4 bytes (entry_len): si EOF → return None; si < 4 bytes → Err(Truncated), done=true
+1. If done → return None
+2. Read 4 bytes (entry_len): if EOF → return None; if < 4 bytes → Err(Truncated), done=true
 3. entry_len = u32::from_le_bytes(...)
-4. Leer (entry_len - 4) bytes restantes → si < esperado → Err(Truncated), done=true
-5. Construir slice completo (4 + resto) y llamar WalEntry::from_bytes()
-6. Si Err → done=true, return Some(Err(...))
-7. Si Ok((entry, _)):
-   - Si entry.lsn < from_lsn → continuar (siguiente iteración, no retornar)
-   - Si entry.lsn >= from_lsn → return Some(Ok(entry))
+4. Read remaining (entry_len - 4) bytes → if < expected → Err(Truncated), done=true
+5. Build full slice (4 + rest) and call WalEntry::from_bytes()
+6. If Err → done=true, return Some(Err(...))
+7. If Ok((entry, _)):
+   - If entry.lsn < from_lsn → continue (next iteration, do not return)
+   - If entry.lsn >= from_lsn → return Some(Ok(entry))
 ```
 
-Optimización: en vez de leer 4 + N bytes en dos operaciones, usar un buffer pre-allocado.
-Primero leer los 4 bytes, luego `read_exact` para los restantes `entry_len - 4`.
+Optimization: instead of reading 4 + N bytes in two operations, use a pre-allocated buffer.
+First read the 4 bytes, then `read_exact` for the remaining `entry_len - 4`.
 
 ### `WalReader::scan_backward()`
 
 ```
 1. File::open(path)
-2. Verificar header
+2. Verify header
 3. file_len = file.seek(End(0))
-4. Si file_len == WAL_HEADER_SIZE → no hay entries, cursor = WAL_HEADER_SIZE
-5. Retornar BackwardIter { file, cursor: file_len, done: false }
+4. If file_len == WAL_HEADER_SIZE → no entries, cursor = WAL_HEADER_SIZE
+5. Return BackwardIter { file, cursor: file_len, done: false }
 ```
 
 ### `BackwardIter::next()`
 
 ```
-1. Si done → return None
-2. Si cursor <= WAL_HEADER_SIZE → return None  (llegamos al inicio)
-3. Si cursor - WAL_HEADER_SIZE < 4 → Err(Truncated), done=true
+1. If done → return None
+2. If cursor <= WAL_HEADER_SIZE → return None  (reached the beginning)
+3. If cursor - WAL_HEADER_SIZE < 4 → Err(Truncated), done=true
 4. file.seek(cursor - 4)
-5. Leer 4 bytes → entry_len_2 (= longitud del entry que termina en cursor)
-6. Si cursor < entry_len_2 → Err(Truncated), done=true
+5. Read 4 bytes → entry_len_2 (= length of the entry ending at cursor)
+6. If cursor < entry_len_2 → Err(Truncated), done=true
 7. entry_start = cursor - entry_len_2
-8. Si entry_start < WAL_HEADER_SIZE → Err(Truncated), done=true
+8. If entry_start < WAL_HEADER_SIZE → Err(Truncated), done=true
 9. file.seek(entry_start)
-10. Leer entry_len_2 bytes → buf
-11. WalEntry::from_bytes(&buf) → si Err → done=true, return Some(Err(...))
+10. Read entry_len_2 bytes → buf
+11. WalEntry::from_bytes(&buf) → if Err → done=true, return Some(Err(...))
 12. cursor = entry_start
 13. return Some(Ok(entry))
 ```
 
-## Fases de implementación
+## Implementation phases
 
-1. Crear `src/reader.rs` con `WalReader`, `ForwardIter`, `BackwardIter`
-2. Exportar desde `src/lib.rs`
-3. Escribir tests de integración en `tests/integration_wal_reader.rs`
+1. Create `src/reader.rs` with `WalReader`, `ForwardIter`, `BackwardIter`
+2. Export from `src/lib.rs`
+3. Write integration tests in `tests/integration_wal_reader.rs`
 
-## Tests a escribir
+## Tests to write
 
-### Unitarios (en reader.rs)
+### Unit tests (in reader.rs)
 
-- `test_open_valid_wal` — open() sobre WAL válido (vacío) → Ok
-- `test_open_invalid_magic` — open() sobre archivo con magic incorrecto → Err(WalInvalidHeader)
-- `test_open_nonexistent` — open() sobre path inexistente → Err(Io)
-- `test_forward_empty_wal` — WAL con solo header → forward retorna None inmediatamente
-- `test_backward_empty_wal` — ídem para backward
+- `test_open_valid_wal` — open() on a valid (empty) WAL → Ok
+- `test_open_invalid_magic` — open() on file with incorrect magic → Err(WalInvalidHeader)
+- `test_open_nonexistent` — open() on non-existent path → Err(Io)
+- `test_forward_empty_wal` — WAL with header only → forward returns None immediately
+- `test_backward_empty_wal` — same for backward
 
-### Integración (`tests/integration_wal_reader.rs`)
+### Integration tests (`tests/integration_wal_reader.rs`)
 
-- `test_forward_all_entries` — escribir N entries con writer, leer con forward desde LSN 0
-- `test_forward_from_lsn` — skip de primeros K entries, verificar que se reciben desde LSN K+1
-- `test_forward_stops_on_truncation` — escribir entries, truncar el archivo a mitad del último → forward retorna N-1 entries + Err al final
-- `test_backward_all_entries` — verificar orden inverso de LSNs
-- `test_backward_matches_forward_reversed` — backward debe ser el reverso exacto de forward
-- `test_forward_crc_corruption` — flip de bit en payload de entry → Err(WalChecksumMismatch)
+- `test_forward_all_entries` — write N entries with writer, read with forward from LSN 0
+- `test_forward_from_lsn` — skip the first K entries, verify entries are received from LSN K+1
+- `test_forward_stops_on_truncation` — write entries, truncate file to middle of last entry → forward returns N-1 entries + Err at the end
+- `test_backward_all_entries` — verify reverse LSN order
+- `test_backward_matches_forward_reversed` — backward must be the exact reverse of forward
+- `test_forward_crc_corruption` — bit flip in entry payload → Err(WalChecksumMismatch)
 
-## Antipatrones a evitar
+## Anti-patterns to avoid
 
-- **NO** leer todo el archivo en RAM en `open()` — el scan debe ser lazy/streaming
-- **NO** usar `BufReader` en `BackwardIter` — los seeks invalidan el buffer interno
-- **NO** compartir un `File` handle entre `ForwardIter` y `BackwardIter` — cada uno abre el suyo
-- **NO** `unwrap()` en `src/reader.rs` — todo maneja `Result`
-- **NO** retornar `Iterator<Item = WalEntry>` sin el `Result` — la corrupción es un caso real
+- **DO NOT** read the entire file into RAM in `open()` — the scan must be lazy/streaming
+- **DO NOT** use `BufReader` in `BackwardIter` — seeks invalidate the internal buffer
+- **DO NOT** share a `File` handle between `ForwardIter` and `BackwardIter` — each opens its own
+- **DO NOT** `unwrap()` in `src/reader.rs` — everything handles `Result`
+- **DO NOT** return `Iterator<Item = WalEntry>` without the `Result` — corruption is a real case
 
-## Riesgos
+## Risks
 
-- **entry_len_2 corrupto en backward scan** → se detecta porque `WalEntry::from_bytes()` verifica
-  el CRC y también verifica que `entry_len_2 == entry_len` → retorna `Err` → iterator termina
-- **read_exact en ForwardIter puede bloquear en hardware lento** → aceptable, usamos `File` sincrónico
-- **file_len cambia entre open() y scan** → para recovery, el WAL no se escribe concurrentemente
-  con el read (recovery ocurre antes de abrir el motor) → no es un caso real
+- **Corrupt entry_len_2 in backward scan** → detected because `WalEntry::from_bytes()` verifies
+  the CRC and also verifies that `entry_len_2 == entry_len` → returns `Err` → iterator ends
+- **read_exact in ForwardIter may block on slow hardware** → acceptable, we use synchronous `File`
+- **file_len changes between open() and scan** → for recovery, the WAL is not written concurrently
+  with the read (recovery happens before opening the engine) → not a real case

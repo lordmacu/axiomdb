@@ -27,7 +27,7 @@ impl TryFrom<u8> for PageType {
             3 => Ok(PageType::Overflow),
             4 => Ok(PageType::Free),
             _ => Err(DbError::ParseError {
-                message: format!("page_type desconocido: {v}"),
+                message: format!("unknown page_type: {v}"),
             }),
         }
     }
@@ -35,63 +35,63 @@ impl TryFrom<u8> for PageType {
 
 // ── PageHeader ────────────────────────────────────────────────────────────────
 
-/// Cabecera de 64 bytes (1 cache line). `repr(C)` garantiza layout exacto.
+/// 64-byte header (1 cache line). `repr(C)` guarantees exact layout.
 ///
-/// El checksum cubre únicamente el body `[HEADER_SIZE..PAGE_SIZE]`, no el
-/// header mismo, para evitar incluir el campo `checksum` en su propio cálculo.
+/// The checksum covers only the body `[HEADER_SIZE..PAGE_SIZE]`, not the
+/// header itself, to avoid including the `checksum` field in its own calculation.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct PageHeader {
-    /// Número mágico para detectar archivo inválido o corrupción catastrófica.
+    /// Magic number to detect an invalid file or catastrophic corruption.
     pub magic: u64,
-    /// Tipo de página.
+    /// Page type.
     pub page_type: u8,
-    /// Flags de estado (dirty, pinned, compressed…).
+    /// Status flags (dirty, pinned, compressed…).
     pub flags: u8,
-    /// Número de ítems almacenados en el body.
+    /// Number of items stored in the body.
     pub item_count: u16,
-    /// CRC32c del body `[HEADER_SIZE..PAGE_SIZE]`.
+    /// CRC32c of the body `[HEADER_SIZE..PAGE_SIZE]`.
     pub checksum: u32,
-    /// Identificador lógico de la página (su índice en el archivo).
+    /// Logical page identifier (its index in the file).
     pub page_id: u64,
-    /// Log Sequence Number del último write que tocó esta página.
+    /// Log Sequence Number of the last write that touched this page.
     pub lsn: u64,
-    /// Offset desde el inicio de la página donde empieza el espacio libre.
+    /// Offset from the start of the page where free space begins.
     pub free_start: u16,
-    /// Offset desde el inicio de la página donde termina el espacio libre.
+    /// Offset from the start of the page where free space ends.
     pub free_end: u16,
     pub _reserved: [u8; 28],
 }
 
-// Verificación en tiempo de compilación: el header debe ocupar exactamente 64 bytes.
+// Compile-time check: the header must be exactly 64 bytes.
 const _: () = assert!(
     std::mem::size_of::<PageHeader>() == HEADER_SIZE,
-    "PageHeader debe ser exactamente 64 bytes"
+    "PageHeader must be exactly 64 bytes"
 );
 
 // ── Page ──────────────────────────────────────────────────────────────────────
 
-/// Página de 16KB alineada a 64 bytes (cache line).
+/// 16 KB page aligned to 64 bytes (cache line).
 ///
-/// Internamente es un buffer crudo `[u8; PAGE_SIZE]`; el header se accede
-/// mediante punteros raw para lograr acceso zero-copy sin serialización.
+/// Internally it is a raw buffer `[u8; PAGE_SIZE]`; the header is accessed
+/// via raw pointers to achieve zero-copy access without serialization.
 #[repr(C, align(64))]
 pub struct Page {
     data: [u8; PAGE_SIZE],
 }
 
-// Verificaciones en tiempo de compilación.
+// Compile-time checks.
 const _: () = assert!(
     std::mem::size_of::<Page>() == PAGE_SIZE,
-    "Page debe ser exactamente PAGE_SIZE bytes"
+    "Page must be exactly PAGE_SIZE bytes"
 );
 const _: () = assert!(
     std::mem::align_of::<Page>() == 64,
-    "Page debe estar alineada a 64 bytes"
+    "Page must be aligned to 64 bytes"
 );
 
 impl Page {
-    /// Crea una página nueva inicializada con header válido y body a cero.
+    /// Creates a new page initialized with a valid header and zeroed body.
     pub fn new(page_type: PageType, page_id: u64) -> Self {
         let mut page = Page {
             data: [0u8; PAGE_SIZE],
@@ -112,8 +112,8 @@ impl Page {
         page
     }
 
-    /// Construye una `Page` desde bytes crudos verificando magic y checksum.
-    /// Usado al leer desde disco o mmap.
+    /// Builds a `Page` from raw bytes, verifying magic and checksum.
+    /// Used when reading from disk or mmap.
     pub fn from_bytes(bytes: [u8; PAGE_SIZE]) -> Result<Self, DbError> {
         let page = Page { data: bytes };
 
@@ -130,42 +130,49 @@ impl Page {
         Ok(page)
     }
 
-    /// Referencia al header interpretando los primeros 64 bytes.
+    /// Reference to the header by interpreting the first 64 bytes.
     ///
     /// # SAFETY
-    /// `data` tiene `PAGE_SIZE >= HEADER_SIZE` bytes y `Page` es `repr(C,
-    /// align(64))`, por lo que los primeros 64 bytes están correctamente
-    /// alineados para `PageHeader` (`repr(C)`). `PageHeader` no tiene padding
-    /// oculto (verificado por el assert de tamaño).
+    /// `data` has `PAGE_SIZE >= HEADER_SIZE` bytes and `Page` is `repr(C,
+    /// align(64))`, so the first 64 bytes are correctly aligned for
+    /// `PageHeader` (`repr(C)`). `PageHeader` has no hidden padding
+    /// (verified by the size assert).
     pub fn header(&self) -> &PageHeader {
         unsafe { &*(self.data.as_ptr() as *const PageHeader) }
     }
 
-    /// Referencia mutable al header.
+    /// Mutable reference to the header.
     ///
     /// # SAFETY
-    /// Mismas garantías que `header()`. La mutabilidad es segura porque `Page`
-    /// posee el buffer completo y ningún otro alias existe.
+    /// Same guarantees as `header()`. Mutability is safe because `Page`
+    /// owns the complete buffer and no other alias exists.
     pub fn header_mut(&mut self) -> &mut PageHeader {
         unsafe { &mut *(self.data.as_mut_ptr() as *mut PageHeader) }
     }
 
-    /// Slice del body (bytes tras el header).
+    /// Slice of the body (bytes after the header).
     pub fn body(&self) -> &[u8] {
         &self.data[HEADER_SIZE..]
     }
 
-    /// Slice mutable del body.
+    /// Mutable slice of the body.
     pub fn body_mut(&mut self) -> &mut [u8] {
         &mut self.data[HEADER_SIZE..]
     }
 
-    /// Bytes crudos de la página completa (para escribir a disco).
+    /// Raw bytes of the complete page (for writing to disk).
     pub fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
         &self.data
     }
 
-    /// Verifica que el CRC32c del body coincide con `header.checksum`.
+    /// Mutable raw bytes of the complete page (for in-place writes to the body).
+    ///
+    /// Callers must call `update_checksum()` after mutating the body.
+    pub fn as_bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+        &mut self.data
+    }
+
+    /// Verifies that the CRC32c of the body matches `header.checksum`.
     pub fn verify_checksum(&self) -> Result<(), DbError> {
         let expected = self.header().checksum;
         let got = crc32c::crc32c(self.body());
@@ -179,8 +186,8 @@ impl Page {
         Ok(())
     }
 
-    /// Recalcula y escribe el CRC32c del body en el header.
-    /// Llamar siempre antes de hacer flush a disco.
+    /// Recalculates and writes the CRC32c of the body into the header.
+    /// Always call before flushing to disk.
     pub fn update_checksum(&mut self) {
         let checksum = crc32c::crc32c(self.body());
         self.header_mut().checksum = checksum;
@@ -212,7 +219,7 @@ mod tests {
     #[test]
     fn test_checksum_detects_corruption() {
         let mut page = Page::new(PageType::Data, 1);
-        // Corromper un byte en el body
+        // Corrupt a byte in the body
         page.data[HEADER_SIZE + 10] ^= 0xFF;
         assert!(page.verify_checksum().is_err());
     }
@@ -220,7 +227,7 @@ mod tests {
     #[test]
     fn test_invalid_magic_is_rejected() {
         let mut bytes = [0u8; PAGE_SIZE];
-        // Magic incorrecto
+        // Incorrect magic
         bytes[0..8].copy_from_slice(&0xDEADBEEFu64.to_ne_bytes());
         assert!(Page::from_bytes(bytes).is_err());
     }
@@ -229,7 +236,7 @@ mod tests {
     fn test_from_bytes_roundtrip() {
         let page = Page::new(PageType::Index, 99);
         let bytes = *page.as_bytes();
-        let page2 = Page::from_bytes(bytes).expect("roundtrip debe ser válido");
+        let page2 = Page::from_bytes(bytes).expect("roundtrip must be valid");
         assert_eq!(page2.header().page_id, 99);
         assert_eq!(page2.header().page_type, PageType::Index as u8);
     }
@@ -237,10 +244,10 @@ mod tests {
     #[test]
     fn test_update_checksum_after_body_write() {
         let mut page = Page::new(PageType::Data, 5);
-        // Escribir en el body sin actualizar checksum → inválido
+        // Write to the body without updating checksum → invalid
         page.data[HEADER_SIZE] = 0xAB;
         assert!(page.verify_checksum().is_err());
-        // Actualizar checksum → válido
+        // Update checksum → valid
         page.update_checksum();
         assert!(page.verify_checksum().is_ok());
     }
