@@ -153,3 +153,33 @@ and produces result rows. Planned sub-phases:
 
 The executor will be a simple volcano-model interpreter in Phase 5. Vectorized
 execution (morsel-driven, SIMD) is planned for Phase 14.
+
+---
+
+## AxiomQL — Alternative Query Language (Phases 36-37)
+
+AxiomDB will support two query languages sharing one AST and executor:
+
+**SQL** stays as the primary language with full wire protocol compatibility.
+Every ORM, client, and tool works without changes.
+
+**AxiomQL** is an optional method-chain alternative designed to be learned in
+minutes by any developer who already uses `.filter().sort().take()` in JavaScript,
+Python, Rust, or C#:
+
+```js
+users
+  .filter(active, age > 18)
+  .join(orders)
+  .group(country, total: count())
+  .sort(total.desc)
+  .take(10)
+```
+
+Both languages compile to the same `Stmt` AST — zero executor overhead, every SQL
+feature automatically available in AxiomQL. Planned after Phase 8 (wire protocol).
+
+| Phase | Scope |
+|-------|-------|
+| 36 | AxiomQL parser: SELECT, filter, join, group, subqueries, let bindings |
+| 37 | AxiomQL write + DDL: insert, update, delete, create, transaction, proc |

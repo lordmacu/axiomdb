@@ -773,9 +773,50 @@
 
 ---
 
-> **🏁 FEATURE-COMPLETE CHECKPOINT — week ~113**
-> On completing Phase 35, AxiomDB is a complete production database engine:
+## BLOCK 11 — AxiomQL (Phases 36-37)
+
+> **Design decision (2026-03-23):** AxiomDB will support two query languages sharing
+> one AST and executor. SQL stays as the primary language with full wire protocol
+> compatibility. AxiomQL is an optional method-chain alternative for developers who
+> prefer modern readable syntax. Both compile to the same `Stmt` enum — zero executor
+> overhead, every SQL feature automatically available in AxiomQL.
+>
+> **Prerequisite:** Phase 8 (wire protocol) must be complete so the AST is stable.
+
+### Phase 36 — AxiomQL Parser `⏳` week 114-117
+
+- [ ] 36.1 ⏳ AxiomQL lexer — tokenizer for method-chain syntax (`.`, `(`, `)`, `:` for named args, string/number literals, identifiers)
+- [ ] 36.2 ⏳ Core SELECT methods — `.filter()`, `.sort()`, `.take()`, `.pick()` parsing and compilation to SQL `Stmt`
+- [ ] 36.3 ⏳ `.join()` — infers ON condition from foreign key catalog; explicit `.join(orders, on: user_id)` also supported
+- [ ] 36.4 ⏳ `.group()` with aggregates — `count()`, `sum()`, `avg()`, `min()`, `max()` as named args; no need to repeat GROUP BY columns
+- [ ] 36.5 ⏳ Aggregate methods without group — `users.count()`, `orders.sum(amount)`, `orders.avg(amount)`
+- [ ] 36.6 ⏳ `match {}` expression — alternative to CASE WHEN; `match(age) { < 18 → 'minor', _ → 'adult' }`
+- [ ] 36.7 ⏳ Let bindings / named CTEs — `let top = orders.group(user_id, total: sum(amount))` compiles to WITH clause
+- [ ] 36.8 ⏳ Subquery in `.filter()` — `users.filter(id in orders.filter(amount > 1000).pick(user_id))`
+- [ ] 36.9 ⏳ Correlated subquery in `.pick()` — `users.pick(name, total: orders.filter(user_id = .id).sum(amount))`
+- [ ] 36.10 ⏳ Equivalence test suite — for every AxiomQL query, assert SQL equivalent produces identical results
+- [ ] 36.11 ⏳ Parser benchmarks — AxiomQL parse throughput vs SQL parser; should be comparable
+
+### Phase 37 — AxiomQL Write + DDL `⏳` week 118-120
+
+- [ ] 37.1 ⏳ `.insert()` — `users.insert(name: 'Alice', age: 30)` compiles to INSERT
+- [ ] 37.2 ⏳ `.update()` — `users.filter(id = 1).update(name: 'Bob')` compiles to UPDATE
+- [ ] 37.3 ⏳ `.delete()` — `users.filter(active = false).delete()` compiles to DELETE
+- [ ] 37.4 ⏳ `.upsert()` — `users.upsert(email: 'a@b.com', name: 'Alice', on: email)` compiles to INSERT ON CONFLICT
+- [ ] 37.5 ⏳ `create table {}` DDL — `create users { id: int @primary @auto, name: text @required }` compiles to CREATE TABLE
+- [ ] 37.6 ⏳ `index` and `migration {}` — `index users.email`, `migration 'name' { ... }`
+- [ ] 37.7 ⏳ `transaction {}` block — compiles to BEGIN/COMMIT with automatic ROLLBACK on error
+- [ ] 37.8 ⏳ `proc` and `fn` definitions — stored procedures and user-defined functions in AxiomQL syntax
+- [ ] 37.9 ⏳ `on table.after.insert {}` triggers — compiles to CREATE TRIGGER
+- [ ] 37.10 ⏳ Documentation — AxiomQL reference page in docs-site with side-by-side SQL comparison for every construct
+- [ ] 37.11 ⏳ Fuzz testing — AxiomQL parser against malformed inputs; every crash = regression test
+
+---
+
+> **🏁 FEATURE-COMPLETE CHECKPOINT — week ~120**
+> On completing Phase 37, AxiomDB is a complete production database engine with two query interfaces:
 > - MySQL + PostgreSQL + OData + GraphQL simultaneously
+> - AxiomQL method-chain language as modern alternative to SQL
 > - AI-native (embeddings, hybrid search, RAG)
 > - Horizontal distribution (sharding + Raft)
 > - Deploy on Docker/K8s/systemd
