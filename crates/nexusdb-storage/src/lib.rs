@@ -17,6 +17,10 @@ pub use heap::{
 };
 pub use integrity::{IntegrityChecker, IntegrityReport, IntegrityViolation, Severity};
 pub use memory::MemoryStorage;
-pub use meta::{read_checkpoint_lsn, write_checkpoint_lsn, CHECKPOINT_LSN_BODY_OFFSET};
+pub use meta::{
+    read_checkpoint_lsn, read_meta_u32, read_meta_u64, write_catalog_header, write_checkpoint_lsn,
+    CATALOG_COLUMNS_ROOT_BODY_OFFSET, CATALOG_INDEXES_ROOT_BODY_OFFSET,
+    CATALOG_SCHEMA_VER_BODY_OFFSET, CATALOG_TABLES_ROOT_BODY_OFFSET, CHECKPOINT_LSN_BODY_OFFSET,
+};
 pub use mmap::MmapStorage;
 pub use page::{Page, PageType, HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE};
