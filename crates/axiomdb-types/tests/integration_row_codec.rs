@@ -331,7 +331,7 @@ fn test_roundtrip_full_row_all_types() {
         Value::BigInt(i64::MAX),
         Value::Real(-0.001),
         Value::Decimal(-123, 4),
-        Value::Text("nexusdb row codec".into()),
+        Value::Text("axiomdb row codec".into()),
         Value::Bytes(b"binary\x00data".to_vec()),
         Value::Date(-365),
         Value::Timestamp(-1_000_000),

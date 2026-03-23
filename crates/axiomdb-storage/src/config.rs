@@ -1,16 +1,16 @@
-//! Engine configuration loaded from a TOML file (`dbyo.toml`).
+//! Engine configuration loaded from a TOML file (`axiomdb.toml`).
 //!
 //! [`DbConfig::load`] reads the file at the given path. If the path is `None`
 //! or the file does not exist, compiled-in defaults are returned. Partial TOML
 //! files are accepted — missing fields fall back to defaults via `#[serde(default)]`.
 //!
-//! ## Example `dbyo.toml`
+//! ## Example `axiomdb.toml`
 //!
 //! ```toml
 //! max_wal_size_mb = 512
 //! fsync           = true
 //! log_level       = "debug"
-//! data_dir        = "/var/lib/nexusdb"
+//! data_dir        = "/var/lib/axiomdb"
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -94,7 +94,7 @@ impl DbConfig {
         };
 
         toml::from_str(&text).map_err(|e| DbError::ParseError {
-            message: format!("invalid dbyo.toml: {e}"),
+            message: format!("invalid axiomdb.toml: {e}"),
         })
     }
 }
@@ -130,14 +130,14 @@ mod tests {
     #[test]
     fn test_load_full_config() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("dbyo.toml");
+        let path = dir.path().join("axiomdb.toml");
         std::fs::write(
             &path,
             r#"
 max_wal_size_mb = 512
 fsync           = false
 log_level       = "debug"
-data_dir        = "/var/lib/nexusdb"
+data_dir        = "/var/lib/axiomdb"
 "#,
         )
         .unwrap();
@@ -146,13 +146,13 @@ data_dir        = "/var/lib/nexusdb"
         assert_eq!(cfg.max_wal_size_mb, 512);
         assert!(!cfg.fsync);
         assert_eq!(cfg.log_level, "debug");
-        assert_eq!(cfg.data_dir, Some(PathBuf::from("/var/lib/nexusdb")));
+        assert_eq!(cfg.data_dir, Some(PathBuf::from("/var/lib/axiomdb")));
     }
 
     #[test]
     fn test_load_partial_config_uses_defaults_for_missing_fields() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("dbyo.toml");
+        let path = dir.path().join("axiomdb.toml");
         std::fs::write(&path, "fsync = false\n").unwrap();
 
         let cfg = DbConfig::load(Some(&path)).unwrap();
@@ -166,7 +166,7 @@ data_dir        = "/var/lib/nexusdb"
     #[test]
     fn test_load_invalid_toml_returns_parse_error() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("dbyo.toml");
+        let path = dir.path().join("axiomdb.toml");
         std::fs::write(&path, "not valid toml [[[").unwrap();
 
         let err = DbConfig::load(Some(&path)).unwrap_err();
@@ -179,7 +179,7 @@ data_dir        = "/var/lib/nexusdb"
     #[test]
     fn test_load_empty_file_uses_all_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("dbyo.toml");
+        let path = dir.path().join("axiomdb.toml");
         std::fs::write(&path, "").unwrap();
 
         let cfg = DbConfig::load(Some(&path)).unwrap();

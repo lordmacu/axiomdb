@@ -18,7 +18,7 @@ axiomdb-core = { workspace = true }
 ```rust
 pub const PAGE_SIZE: usize = 16_384;
 pub const HEADER_SIZE: usize = 64;
-pub const PAGE_MAGIC: u64 = 0x4E455855_53444200;
+pub const PAGE_MAGIC: u64 = 0x4158494F_4D444200;
 
 #[repr(u8)]
 pub enum PageType { Meta=0, Data=1, Index=2, Overflow=3, Free=4 }

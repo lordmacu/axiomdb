@@ -131,8 +131,8 @@ Append-only Write-Ahead Log:
 
 Schema persistence and lookup:
 
-- `CatalogBootstrap` — creates the three system tables (`nexus_tables`, `nexus_columns`,
-  `nexus_indexes`) in the meta page on first open
+- `CatalogBootstrap` — creates the three system tables (`axiom_tables`, `axiom_columns`,
+  `axiom_indexes`) in the meta page on first open
 - `CatalogReader` — reads schema from the system tables for use by the analyzer
   and executor; uses a `TransactionSnapshot` for MVCC-consistent reads
 - Schema types: `TableDef`, `ColumnDef`, `IndexDef`

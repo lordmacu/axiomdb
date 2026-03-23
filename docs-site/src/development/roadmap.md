@@ -44,7 +44,7 @@ functionality. The design is organized in three blocks:
 | 3.6 | Crash recovery | ✅ | CRASHED→RECOVERING→REPLAYING→VERIFYING→READY |
 | 3.7 | Durability tests | ✅ | 9 crash scenarios |
 | 3.8 | Post-recovery checker | ✅ | Heap structural + MVCC invariants |
-| 3.9 | Catalog bootstrap | ✅ | nexus_tables, nexus_columns, nexus_indexes |
+| 3.9 | Catalog bootstrap | ✅ | axiom_tables, axiom_columns, axiom_indexes |
 | 3.10 | Catalog reader | ✅ | MVCC-aware schema lookup |
 | 4.1 | SQL AST | ✅ | All statement types |
 | 4.2 | SQL lexer | ✅ | logos DFA, ~85 tokens, zero-copy |

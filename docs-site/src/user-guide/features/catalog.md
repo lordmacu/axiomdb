@@ -8,10 +8,10 @@ accessible through system tables, convenience commands, and direct SQL queries.
 
 ## System Tables
 
-The catalog exposes three system tables in the `nexus` schema. They are always readable
+The catalog exposes three system tables in the `axiom` schema. They are always readable
 without any special privileges.
 
-### nexus_tables
+### axiom_tables
 
 Contains one row per user-visible table.
 
@@ -26,17 +26,17 @@ Contains one row per user-visible table.
 ```sql
 -- List all user tables
 SELECT schema_name, table_name, column_count
-FROM nexus_tables
+FROM axiom_tables
 ORDER BY schema_name, table_name;
 ```
 
-### nexus_columns
+### axiom_columns
 
 Contains one row per column, in declaration order.
 
 | Column          | Type    | Description                                              |
 |-----------------|---------|----------------------------------------------------------|
-| `table_id`      | BIGINT  | Foreign key → `nexus_tables.id`                         |
+| `table_id`      | BIGINT  | Foreign key → `axiom_tables.id`                         |
 | `table_name`    | TEXT    | Denormalized table name for convenience                  |
 | `col_index`     | INT     | Zero-based position within the table                    |
 | `col_name`      | TEXT    | Column name                                              |
@@ -47,19 +47,19 @@ Contains one row per column, in declaration order.
 ```sql
 -- All columns of the orders table
 SELECT col_index, col_name, data_type, not_null, default_value
-FROM nexus_columns
+FROM axiom_columns
 WHERE table_name = 'orders'
 ORDER BY col_index;
 ```
 
-### nexus_indexes
+### axiom_indexes
 
 Contains one row per index (including automatically generated PK and UNIQUE indexes).
 
 | Column          | Type   | Description                                              |
 |-----------------|--------|----------------------------------------------------------|
 | `id`            | BIGINT | Internal index identifier                               |
-| `table_id`      | BIGINT | Foreign key → `nexus_tables.id`                         |
+| `table_id`      | BIGINT | Foreign key → `axiom_tables.id`                         |
 | `table_name`    | TEXT   | Denormalized table name                                 |
 | `index_name`    | TEXT   | Index name                                              |
 | `is_unique`     | BOOL   | TRUE for UNIQUE and PRIMARY KEY indexes                 |
@@ -70,7 +70,7 @@ Contains one row per index (including automatically generated PK and UNIQUE inde
 ```sql
 -- All indexes on the products table
 SELECT index_name, is_unique, is_primary, columns
-FROM nexus_indexes
+FROM axiom_indexes
 WHERE table_name = 'products'
 ORDER BY is_primary DESC, index_name;
 ```
@@ -141,7 +141,7 @@ it.
 
 ```sql
 SELECT table_name, col_name, data_type
-FROM nexus_columns
+FROM axiom_columns
 WHERE not_null = TRUE
 ORDER BY table_name, col_index;
 ```
@@ -150,8 +150,8 @@ ORDER BY table_name, col_index;
 
 ```sql
 SELECT t.table_name
-FROM nexus_tables t
-LEFT JOIN nexus_indexes i ON i.table_id = t.id
+FROM axiom_tables t
+LEFT JOIN axiom_indexes i ON i.table_id = t.id
 WHERE i.id IS NULL
 ORDER BY t.table_name;
 ```
@@ -161,8 +161,8 @@ ORDER BY t.table_name;
 ```sql
 -- Assumes FK columns follow the naming convention: <table>_id
 SELECT c.table_name, c.col_name
-FROM nexus_columns c
-LEFT JOIN nexus_indexes i
+FROM axiom_columns c
+LEFT JOIN axiom_indexes i
     ON i.table_id = c.table_id
    AND i.columns LIKE c.col_name || '%'
 WHERE c.col_name LIKE '%_id'
@@ -175,7 +175,7 @@ ORDER BY c.table_name, c.col_name;
 
 ```sql
 SELECT table_name, column_count
-FROM nexus_tables
+FROM axiom_tables
 ORDER BY column_count DESC;
 ```
 
@@ -184,7 +184,7 @@ ORDER BY column_count DESC;
 ## Catalog Bootstrap
 
 The catalog is bootstrapped on the very first `open()` call. AxiomDB writes the three
-system tables (`nexus_tables`, `nexus_columns`, `nexus_indexes`) into the meta page
+system tables (`axiom_tables`, `axiom_columns`, `axiom_indexes`) into the meta page
 using a special bootstrap transaction with LSN 0. Subsequent opens detect the
 bootstrapped meta page and skip the initialization step.
 
@@ -197,14 +197,14 @@ the next `open()` re-runs the bootstrap from scratch.
 ## Schema Visibility Rules
 
 The default schema is `public`. All tables created without an explicit schema prefix
-belong to `public`. System tables live in the `nexus` schema and are always visible.
+belong to `public`. System tables live in the `axiom` schema and are always visible.
 
 ```sql
 -- These are equivalent if the default schema is 'public'
 CREATE TABLE users (...);
 CREATE TABLE public.users (...);
 
--- System tables require the nexus. prefix or are accessible without schema
-SELECT * FROM nexus_tables;          -- works
-SELECT * FROM nexus.nexus_tables;   -- also works
+-- System tables require the axiom. prefix or are accessible without schema
+SELECT * FROM axiom_tables;          -- works
+SELECT * FROM axiom.axiom_tables;   -- also works
 ```

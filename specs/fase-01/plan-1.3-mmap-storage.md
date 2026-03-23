@@ -13,7 +13,7 @@ memmap2 = "0.9"
 ## Structures
 
 ```rust
-const DB_FILE_MAGIC: u64 = 0x4E455855_53444201; // "NEXUSDB\1"
+const DB_FILE_MAGIC: u64 = 0x4158494F_4D444201; // "AXIOMDB\1"
 const DB_VERSION: u32    = 1;
 const GROW_PAGES: u64    = 64; // 1MB per chunk
 

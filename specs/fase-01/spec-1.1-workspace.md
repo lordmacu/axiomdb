@@ -13,7 +13,7 @@ code quality configuration, and CI on GitHub Actions.
 
 ## Structure to create
 ```
-nexusdb/
+axiomdb/
 ├── Cargo.toml              ← workspace root with all crates
 ├── rust-toolchain.toml     ← pin Rust version
 ├── .rustfmt.toml           ← code style

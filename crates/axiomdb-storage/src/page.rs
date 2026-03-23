@@ -2,7 +2,7 @@ use axiomdb_core::error::DbError;
 
 pub const PAGE_SIZE: usize = 16_384;
 pub const HEADER_SIZE: usize = 64;
-pub const PAGE_MAGIC: u64 = 0x4E455855_53444200; // "NEXUSDB\0"
+pub const PAGE_MAGIC: u64 = 0x4158494F_4D444200; // "AXIOMDB\0"
 
 // ── PageType ──────────────────────────────────────────────────────────────────
 

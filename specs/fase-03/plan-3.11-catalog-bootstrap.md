@@ -24,11 +24,11 @@ CatalogNotInitialized,
 Add to `axiomdb-storage/src/meta.rs` after `CHECKPOINT_LSN_BODY_OFFSET`:
 
 ```rust
-/// body[32..40]: root heap page of nexus_tables (0 = uninitialized)
+/// body[32..40]: root heap page of axiom_tables (0 = uninitialized)
 pub const CATALOG_TABLES_ROOT_BODY_OFFSET: usize = 32;
-/// body[40..48]: root heap page of nexus_columns (0 = uninitialized)
+/// body[40..48]: root heap page of axiom_columns (0 = uninitialized)
 pub const CATALOG_COLUMNS_ROOT_BODY_OFFSET: usize = 40;
-/// body[48..56]: root heap page of nexus_indexes (0 = uninitialized)
+/// body[48..56]: root heap page of axiom_indexes (0 = uninitialized)
 pub const CATALOG_INDEXES_ROOT_BODY_OFFSET: usize = 48;
 /// body[56..60]: catalog schema version (0 = uninitialized, 1 = v1)
 pub const CATALOG_SCHEMA_VER_BODY_OFFSET: usize = 56;

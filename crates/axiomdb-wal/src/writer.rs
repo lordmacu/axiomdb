@@ -12,7 +12,7 @@
 //! ## WAL file header (v2, 24 bytes)
 //!
 //! ```text
-//! [0..8]   magic: u64      "NEXUSWAL\0"
+//! [0..8]   magic: u64      "AXIOMWAL\0"
 //! [8..10]  version: u16    2
 //! [10..14] _reserved: [u8; 4]
 //! [14..22] start_lsn: u64  0 for a fresh WAL; checkpoint_lsn for a rotated WAL
@@ -51,8 +51,8 @@ use crate::entry::WalEntry;
 
 // ── WAL file constants ────────────────────────────────────────────────────────
 
-/// Magic number for the WAL file: "NEXUSWAL\0" in little-endian.
-pub const WAL_MAGIC: u64 = 0x004C_4157_5355_584E; // "NEXUSWAL" in LE bytes
+/// Magic number for the WAL file: "AXIOMWAL" in little-endian.
+pub const WAL_MAGIC: u64 = 0x4C41574D_4F495841; // b"AXIOMWAL" as u64 LE
 
 /// Current WAL format version.
 pub const WAL_VERSION: u16 = 2;

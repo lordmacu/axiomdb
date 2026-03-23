@@ -6,11 +6,12 @@
 //! - 4.3–4.4: [`parse`] — recursive descent SQL parser
 //! - 4.18: [`analyze`] — semantic analyzer, col_idx resolution
 //! - 4.23: [`QueryResult`], [`ColumnMeta`], [`Row`] — unified executor return type
-//! - 4.5:  Executor (coming)
+//! - 4.5:  [`execute`] — basic executor (SELECT, INSERT, UPDATE, DELETE, DDL, txn control)
 
 pub mod analyzer;
 pub mod ast;
 pub mod eval;
+pub mod executor;
 pub mod expr;
 pub mod lexer;
 pub mod parser;
@@ -31,4 +32,5 @@ pub use lexer::{tokenize, Span, SpannedToken, Token};
 pub use analyzer::analyze;
 pub use parser::parse;
 pub use result::{ColumnMeta, QueryResult, Row};
+pub use executor::execute;
 pub use table::TableEngine;

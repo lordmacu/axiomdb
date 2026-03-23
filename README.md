@@ -20,14 +20,14 @@ University project in Rust with modern architecture.
 cargo run --bin axiomdb-server -- --data-dir ./data
 
 # Connect with psql
-psql -h localhost -p 5432 -U root nexusdb
+psql -h localhost -p 5432 -U root axiomdb
 
 # Connect with mysql client
-mysql -h localhost -P 3306 -u root nexusdb
+mysql -h localhost -P 3306 -u root axiomdb
 
 # Embedded mode (Python)
 pip install axiomdb-python
-python -c "import nexusdb; db = nexusdb.open('axiomdb.db'); db.execute('SELECT 1')"
+python -c "import axiomdb; db = axiomdb.open('axiomdb.db'); db.execute('SELECT 1')"
 ```
 
 ## Architecture
@@ -57,7 +57,7 @@ See [`db.md`](db.md) for the complete design: types, optimizations, phases and d
 ## Name
 
 **AxiomDB** — a database is the central connection point of every application.
-The name reflects exactly that: the nexus between data and the world.
+The name reflects exactly that: the axiom between data and the world.
 
 ## Target benchmarks
 

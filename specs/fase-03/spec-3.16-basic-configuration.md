@@ -1,4 +1,4 @@
-# Spec: 3.16 — Basic Configuration (dbyo.toml)
+# Spec: 3.16 — Basic Configuration (axiomdb.toml)
 
 ## What to build
 

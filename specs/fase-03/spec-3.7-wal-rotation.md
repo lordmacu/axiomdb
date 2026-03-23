@@ -20,12 +20,12 @@ would set `next_lsn = 1` — **breaking the global LSN sequence**.
 
 ```
 v1 (16 bytes — current):
-  [0..8]   magic: u64         "NEXUSWAL\0"
+  [0..8]   magic: u64         "AXIOMWAL\0"
   [8..10]  version: u16 = 1
   [10..16] reserved: [u8; 6]
 
 v2 (24 bytes — new):
-  [0..8]   magic: u64         "NEXUSWAL\0"  (unchanged)
+  [0..8]   magic: u64         "AXIOMWAL\0"  (unchanged)
   [8..10]  version: u16 = 2   (bumped)
   [10..14] _reserved: [u8; 4]
   [14..22] start_lsn: u64     0 for fresh WAL, checkpoint_lsn for rotated

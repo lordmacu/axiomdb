@@ -23,7 +23,7 @@ offset 2*PAGE_SIZE: Page 2
 ## DbFileMeta (in body of page 0, offset 64 of the file)
 ```
 offset  size  field
-0       8     db_magic: u64    — 0x4E455855_53444201 ("NEXUSDB\1")
+0       8     db_magic: u64    — 0x4158494F_4D444201 ("AXIOMDB\1")
 8       4     version: u32     — format version (1)
 12      4     _pad: u32
 16      8     page_count: u64  — total pages in the file

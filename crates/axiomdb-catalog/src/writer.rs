@@ -2,7 +2,7 @@
 //!
 //! ## Responsibilities
 //!
-//! - Insert rows into `nexus_tables`, `nexus_columns`, `nexus_indexes` heap pages.
+//! - Insert rows into `axiom_tables`, `axiom_columns`, `axiom_indexes` heap pages.
 //! - Delete rows (MVCC: stamps `txn_id_deleted`; rows remain for older snapshots).
 //! - WAL-log every mutation via [`TxnManager`] for crash recovery.
 //! - Allocate monotonically increasing `TableId` and `IndexId` from the meta page.
@@ -28,9 +28,9 @@
 //! the `u32` range to avoid collisions:
 //!
 //! ```text
-//! SYSTEM_TABLE_TABLES  = u32::MAX - 2  (nexus_tables)
-//! SYSTEM_TABLE_COLUMNS = u32::MAX - 1  (nexus_columns)
-//! SYSTEM_TABLE_INDEXES = u32::MAX      (nexus_indexes)
+//! SYSTEM_TABLE_TABLES  = u32::MAX - 2  (axiom_tables)
+//! SYSTEM_TABLE_COLUMNS = u32::MAX - 1  (axiom_columns)
+//! SYSTEM_TABLE_INDEXES = u32::MAX      (axiom_indexes)
 //! ```
 
 use std::sync::Arc;
@@ -47,11 +47,11 @@ use crate::{
 
 // ── WAL table_id constants for system tables ──────────────────────────────────
 
-/// WAL `table_id` used for inserts/deletes into `nexus_tables`.
+/// WAL `table_id` used for inserts/deletes into `axiom_tables`.
 pub const SYSTEM_TABLE_TABLES: u32 = u32::MAX - 2;
-/// WAL `table_id` used for inserts/deletes into `nexus_columns`.
+/// WAL `table_id` used for inserts/deletes into `axiom_columns`.
 pub const SYSTEM_TABLE_COLUMNS: u32 = u32::MAX - 1;
-/// WAL `table_id` used for inserts/deletes into `nexus_indexes`.
+/// WAL `table_id` used for inserts/deletes into `axiom_indexes`.
 pub const SYSTEM_TABLE_INDEXES: u32 = u32::MAX;
 
 // ── CatalogWriter ─────────────────────────────────────────────────────────────
@@ -126,7 +126,7 @@ impl<'a> CatalogWriter<'a> {
     // ── Table operations ──────────────────────────────────────────────────────
 
     /// Allocates a new `TableId`, initializes a heap root page for user row data,
-    /// and inserts a row into `nexus_tables`.
+    /// and inserts a row into `axiom_tables`.
     ///
     /// The row is WAL-logged as an Insert entry with
     /// `table_id = SYSTEM_TABLE_TABLES` and key = `allocated_table_id` as LE bytes.
@@ -169,7 +169,7 @@ impl<'a> CatalogWriter<'a> {
 
     // ── Column operations ─────────────────────────────────────────────────────
 
-    /// Inserts a column definition row into `nexus_columns`.
+    /// Inserts a column definition row into `axiom_columns`.
     ///
     /// The caller is responsible for setting `col_idx` to the correct 0-based
     /// position. No uniqueness check is performed here (enforced by the executor).
@@ -199,7 +199,7 @@ impl<'a> CatalogWriter<'a> {
     // ── Index operations ──────────────────────────────────────────────────────
 
     /// Allocates a new `index_id` and inserts an index definition row into
-    /// `nexus_indexes`.
+    /// `axiom_indexes`.
     ///
     /// The `def.index_id` field is ignored — the writer allocates a fresh ID
     /// from the meta page sequence and stores it in the row.
@@ -236,8 +236,8 @@ impl<'a> CatalogWriter<'a> {
 
     // ── Drop operations ───────────────────────────────────────────────────────
 
-    /// Marks all rows for `table_id` as deleted in `nexus_tables`,
-    /// `nexus_columns`, and `nexus_indexes`.
+    /// Marks all rows for `table_id` as deleted in `axiom_tables`,
+    /// `axiom_columns`, and `axiom_indexes`.
     ///
     /// Uses `active_snapshot()` to see the writer's own uncommitted inserts,
     /// so a table created and immediately dropped in the same transaction is
@@ -257,7 +257,7 @@ impl<'a> CatalogWriter<'a> {
         let col_rows = HeapChain::scan_visible(self.storage, self.page_ids.columns, snap)?;
         let idx_rows = HeapChain::scan_visible(self.storage, self.page_ids.indexes, snap)?;
 
-        // Delete matching rows from nexus_tables.
+        // Delete matching rows from axiom_tables.
         for (page_id, slot_id, data) in table_rows {
             let (def, _) = TableDef::from_bytes(&data)?;
             if def.id == table_id {
@@ -268,7 +268,7 @@ impl<'a> CatalogWriter<'a> {
             }
         }
 
-        // Delete matching columns from nexus_columns.
+        // Delete matching columns from axiom_columns.
         for (page_id, slot_id, data) in col_rows {
             let (def, _) = ColumnDef::from_bytes(&data)?;
             if def.table_id == table_id {
@@ -279,7 +279,7 @@ impl<'a> CatalogWriter<'a> {
             }
         }
 
-        // Delete matching indexes from nexus_indexes; collect dropped index_ids for events.
+        // Delete matching indexes from axiom_indexes; collect dropped index_ids for events.
         let mut dropped_index_ids: Vec<u32> = Vec::new();
         for (page_id, slot_id, data) in idx_rows {
             let (def, _) = IndexDef::from_bytes(&data)?;
@@ -301,7 +301,7 @@ impl<'a> CatalogWriter<'a> {
         Ok(())
     }
 
-    /// Marks the index row with `index_id` as deleted in `nexus_indexes`.
+    /// Marks the index row with `index_id` as deleted in `axiom_indexes`.
     ///
     /// # Errors
     /// - [`DbError::NoActiveTransaction`] if no transaction is active.

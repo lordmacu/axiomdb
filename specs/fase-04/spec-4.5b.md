@@ -39,7 +39,7 @@ pub struct TableDef {
 }
 ```
 
-### Updated binary format for `nexus_tables`
+### Updated binary format for `axiom_tables`
 
 Before: `[table_id:4][schema_len:1][schema bytes][name_len:1][name bytes]`
 After:  `[table_id:4][root_page_id:8][schema_len:1][schema bytes][name_len:1][name bytes]`
@@ -53,7 +53,7 @@ After allocating the `TableId`, the writer must:
 1. Allocate a `Data` page with `storage.alloc_page(PageType::Data)`.
 2. Initialize it as an empty heap page: `Page::new(PageType::Data, root_page_id)`.
 3. Write the page to storage: `storage.write_page(root_page_id, &page)`.
-4. Store `data_root_page_id` in the `TableDef` before inserting into `nexus_tables`.
+4. Store `data_root_page_id` in the `TableDef` before inserting into `axiom_tables`.
 
 ---
 

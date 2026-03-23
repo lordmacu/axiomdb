@@ -305,7 +305,7 @@ Input: DropIndexStmt { if_exists, name, table }
 
 Algorithm:
   1. Resolve the index by name from catalog (via CatalogReader::list_indexes
-     for the given table, or scan nexus_indexes):
+     for the given table, or scan axiom_indexes):
        Use SchemaResolver + CatalogReader to find the IndexDef by name.
        If not found && !if_exists: Err(NotImplemented or TableNotFound)
        If not found && if_exists: return Ok(QueryResult::Empty)

@@ -33,13 +33,13 @@ use crate::schema::TableId;
 /// The kind of schema change that occurred.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaChangeKind {
-    /// A new user table was registered in `nexus_tables`.
+    /// A new user table was registered in `axiom_tables`.
     TableCreated { table_id: TableId },
     /// All rows for a table were marked deleted across all system tables.
     TableDropped { table_id: TableId },
-    /// A new index was registered in `nexus_indexes`.
+    /// A new index was registered in `axiom_indexes`.
     IndexCreated { index_id: u32, table_id: TableId },
-    /// An index row was marked deleted in `nexus_indexes`.
+    /// An index row was marked deleted in `axiom_indexes`.
     IndexDropped { index_id: u32, table_id: TableId },
 }
 

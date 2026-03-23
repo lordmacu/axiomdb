@@ -56,7 +56,7 @@ Current code (simplified):
 ```
 alloc table_id
 build TableDef { id, schema_name, table_name }
-HeapChain::insert into nexus_tables
+HeapChain::insert into axiom_tables
 txn.record_insert
 ```
 
@@ -66,7 +66,7 @@ alloc table_id
 alloc data_root = storage.alloc_page(PageType::Data)
 init page: let p = Page::new(PageType::Data, data_root); storage.write_page(data_root, &p)
 build TableDef { id, schema_name, table_name, data_root_page_id: data_root }
-HeapChain::insert into nexus_tables  (now encodes root_page_id too)
+HeapChain::insert into axiom_tables  (now encodes root_page_id too)
 txn.record_insert
 ```
 

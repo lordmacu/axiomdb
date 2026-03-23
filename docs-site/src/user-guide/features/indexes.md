@@ -122,13 +122,13 @@ constraint first (via `ALTER TABLE DROP CONSTRAINT`).
 ```sql
 -- All indexes on a table
 SELECT index_name, is_unique, is_primary, columns
-FROM nexus_indexes
+FROM axiom_indexes
 WHERE table_name = 'orders'
 ORDER BY is_primary DESC, index_name;
 
 -- Root page of each index (useful for storage analysis)
 SELECT index_name, root_page_id
-FROM nexus_indexes;
+FROM axiom_indexes;
 ```
 
 ---

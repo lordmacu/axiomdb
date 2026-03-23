@@ -25,15 +25,15 @@ use axiomdb_storage::{
 /// Root heap page IDs for the three system tables.
 ///
 /// These are the starting points for [`CatalogReader`] and [`CatalogWriter`]
-/// when scanning or inserting rows into `nexus_tables`, `nexus_columns`, and
-/// `nexus_indexes`.
+/// when scanning or inserting rows into `axiom_tables`, `axiom_columns`, and
+/// `axiom_indexes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogPageIds {
-    /// Root page of the `nexus_tables` heap.
+    /// Root page of the `axiom_tables` heap.
     pub tables: u64,
-    /// Root page of the `nexus_columns` heap.
+    /// Root page of the `axiom_columns` heap.
     pub columns: u64,
-    /// Root page of the `nexus_indexes` heap.
+    /// Root page of the `axiom_indexes` heap.
     pub indexes: u64,
 }
 

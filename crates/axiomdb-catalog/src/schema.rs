@@ -1,9 +1,9 @@
 //! Catalog schema types and their binary serialization.
 //!
 //! These types represent rows in the three system tables:
-//! - `nexus_tables`  → [`TableDef`]
-//! - `nexus_columns` → [`ColumnDef`]
-//! - `nexus_indexes` → [`IndexDef`]
+//! - `axiom_tables`  → [`TableDef`]
+//! - `axiom_columns` → [`ColumnDef`]
+//! - `axiom_indexes` → [`IndexDef`]
 //!
 //! ## Binary row format
 //!
@@ -73,7 +73,7 @@ impl From<ColumnType> for u8 {
 
 // ── TableDef ──────────────────────────────────────────────────────────────────
 
-/// Metadata for a user table — one row in `nexus_tables`.
+/// Metadata for a user table — one row in `axiom_tables`.
 ///
 /// ## On-disk format (`to_bytes` / `from_bytes`)
 ///
@@ -178,7 +178,7 @@ impl TableDef {
 
 // ── ColumnDef ─────────────────────────────────────────────────────────────────
 
-/// Metadata for a single column — one row in `nexus_columns`.
+/// Metadata for a single column — one row in `axiom_columns`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
     pub table_id: TableId,
@@ -250,7 +250,7 @@ impl ColumnDef {
 
 // ── IndexDef ──────────────────────────────────────────────────────────────────
 
-/// Metadata for an index — one row in `nexus_indexes`.
+/// Metadata for an index — one row in `axiom_indexes`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDef {
     /// Auto-incremented unique ID, allocated by `CatalogWriter::create_index`.

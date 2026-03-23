@@ -14,7 +14,7 @@
 ## Constants
 
 ```rust
-pub const WAL_MAGIC: u64   = 0x4E455855_53574100; // "NEXUSWAL\0"
+pub const WAL_MAGIC: u64   = 0x4C41574D_4F495841; // "AXIOMWAL\0"
 pub const WAL_VERSION: u16 = 1;
 pub const WAL_HEADER_SIZE: usize = 16;
 ```

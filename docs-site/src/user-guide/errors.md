@@ -48,7 +48,7 @@ INSERT INTO users VALUES ('alice@example.com');  -- ERROR 23505
 ```python
 try:
     db.execute("INSERT INTO users (email) VALUES (?)", [email])
-except NexusDbError as e:
+except AxiomDbError as e:
     if e.sqlstate == '23505':
         return {"error": "Email already taken"}
     raise
