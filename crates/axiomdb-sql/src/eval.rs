@@ -561,6 +561,12 @@ fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, DbEr
         "connection_id" => Ok(Value::BigInt(1)),
         "row_count" => Ok(Value::BigInt(0)),
 
+        // ── LAST_INSERT_ID / lastval (4.14) ──────────────────────────────────
+        "last_insert_id" | "lastval" => {
+            let id = crate::executor::last_insert_id_value();
+            Ok(Value::BigInt(id as i64))
+        }
+
         // ── Null handling ────────────────────────────────────────────────────
         "coalesce" | "ifnull" | "nvl" => {
             for arg in args {

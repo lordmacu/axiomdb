@@ -56,6 +56,28 @@ use crate::{
     table::TableEngine,
 };
 
+// ── AUTO_INCREMENT sequence state ─────────────────────────────────────────────
+
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap as StdHashMap;
+
+thread_local! {
+    /// Per-table AUTO_INCREMENT sequence counter (TableId → next value to assign).
+    /// Initialized lazily: on first auto-insert, the executor scans the table to
+    /// find MAX(auto_col) and seeds the counter from MAX+1.
+    static AUTO_INC_SEQ: RefCell<StdHashMap<u32, u64>> = RefCell::new(StdHashMap::new());
+
+    /// The last auto-generated ID produced by this thread.
+    /// Read by `LAST_INSERT_ID()` / `lastval()` in the expression evaluator.
+    static THREAD_LAST_INSERT_ID: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Returns the value of `LAST_INSERT_ID()` for the current thread.
+/// Exported so `eval.rs` can call it from `eval_function`.
+pub(crate) fn last_insert_id_value() -> u64 {
+    THREAD_LAST_INSERT_ID.with(|v| v.get())
+}
+
 // ── Subquery execution support ────────────────────────────────────────────────
 
 /// Walks a `SelectStmt` AST and substitutes every `Expr::OuterColumn { col_idx }`
@@ -808,15 +830,12 @@ fn dispatch(
         // Session variables — stub for Phase 5
         Stmt::Set(_) => Ok(QueryResult::Empty),
         // Deferred statements
-        Stmt::TruncateTable(_) => Err(DbError::NotImplemented {
-            feature: "TRUNCATE TABLE — Phase 4.21".into(),
-        }),
+        Stmt::TruncateTable(s) => execute_truncate(s, storage, txn),
         Stmt::AlterTable(_) => Err(DbError::NotImplemented {
             feature: "ALTER TABLE — Phase 4.22".into(),
         }),
-        Stmt::ShowTables(_) | Stmt::ShowColumns(_) => Err(DbError::NotImplemented {
-            feature: "SHOW / DESCRIBE — Phase 4.20".into(),
-        }),
+        Stmt::ShowTables(s) => execute_show_tables(s, storage, txn),
+        Stmt::ShowColumns(s) => execute_show_columns(s, storage, txn),
     }
 }
 
@@ -2274,17 +2293,56 @@ fn execute_insert(
 
     let mut count = 0u64;
 
+    // Find the AUTO_INCREMENT column index (at most one per table).
+    let auto_inc_col: Option<usize> = schema_cols.iter().position(|c| c.auto_increment);
+
+    // Track the first generated ID for LAST_INSERT_ID() semantics.
+    let mut first_generated: Option<u64> = None;
+
+    /// Returns the next value from the per-table AUTO_INCREMENT sequence,
+    /// initializing it from MAX(col)+1 on first use (restart-safe).
+    fn next_auto_inc(
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
+        table_def: &axiomdb_catalog::schema::TableDef,
+        schema_cols: &[axiomdb_catalog::schema::ColumnDef],
+        col_idx: usize,
+    ) -> Result<u64, DbError> {
+        let table_id = table_def.id;
+        // Check if already initialized.
+        let cached = AUTO_INC_SEQ.with(|seq| seq.borrow().get(&table_id).copied());
+        if let Some(next) = cached {
+            AUTO_INC_SEQ.with(|seq| seq.borrow_mut().insert(table_id, next + 1));
+            return Ok(next);
+        }
+        // First use: scan the table to find MAX of the auto-increment column.
+        let snap = txn.active_snapshot()?;
+        let rows = TableEngine::scan_table(storage, table_def, schema_cols, snap)?;
+        let max_existing: u64 = rows
+            .iter()
+            .filter_map(|(_, vals)| vals.get(col_idx))
+            .filter_map(|v| match v {
+                Value::Int(n) => Some(*n as u64),
+                Value::BigInt(n) => Some(*n as u64),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let next = max_existing + 1;
+        AUTO_INC_SEQ.with(|seq| seq.borrow_mut().insert(table_id, next + 1));
+        Ok(next)
+    }
+
     match stmt.source {
         // ── INSERT ... VALUES ─────────────────────────────────────────────────
         InsertSource::Values(rows) => {
             for value_exprs in rows {
-                // Evaluate each expression against an empty row (VALUES has no FROM).
                 let provided: Vec<Value> = value_exprs
                     .iter()
                     .map(|e| eval(e, &[]))
                     .collect::<Result<_, _>>()?;
 
-                let full_values: Vec<Value> = col_positions
+                let mut full_values: Vec<Value> = col_positions
                     .iter()
                     .map(|&idx| {
                         if idx == usize::MAX {
@@ -2295,6 +2353,20 @@ fn execute_insert(
                     })
                     .collect();
 
+                // AUTO_INCREMENT: replace NULL in the auto column with next ID.
+                if let Some(ai_col) = auto_inc_col {
+                    if matches!(full_values.get(ai_col), Some(Value::Null)) {
+                        let id = next_auto_inc(storage, txn, &resolved.def, schema_cols, ai_col)?;
+                        full_values[ai_col] = match schema_cols[ai_col].col_type {
+                            axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
+                            _ => Value::Int(id as i32),
+                        };
+                        if first_generated.is_none() {
+                            first_generated = Some(id);
+                        }
+                    }
+                }
+
                 TableEngine::insert_row(storage, txn, &resolved.def, schema_cols, full_values)?;
                 count += 1;
             }
@@ -2302,10 +2374,6 @@ fn execute_insert(
 
         // ── INSERT ... SELECT ─────────────────────────────────────────────────
         InsertSource::Select(select_stmt) => {
-            // Execute the SELECT to get all rows.
-            // The SelectStmt arrives already analyzed (col_idx resolved).
-            // The active_snapshot is fixed at BEGIN — inserted rows are NOT
-            // visible to this SELECT (MVCC prevents the Halloween problem).
             let select_rows = match execute_select(*select_stmt, storage, txn)? {
                 QueryResult::Rows { rows, .. } => rows,
                 other => {
@@ -2315,9 +2383,8 @@ fn execute_insert(
                 }
             };
 
-            // Insert each SELECT row using the same column mapping as VALUES.
             for row_values in select_rows {
-                let full_values: Vec<Value> = col_positions
+                let mut full_values: Vec<Value> = col_positions
                     .iter()
                     .map(|&idx| {
                         if idx == usize::MAX {
@@ -2328,17 +2395,35 @@ fn execute_insert(
                     })
                     .collect();
 
+                if let Some(ai_col) = auto_inc_col {
+                    if matches!(full_values.get(ai_col), Some(Value::Null)) {
+                        let id = next_auto_inc(storage, txn, &resolved.def, schema_cols, ai_col)?;
+                        full_values[ai_col] = match schema_cols[ai_col].col_type {
+                            axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
+                            _ => Value::Int(id as i32),
+                        };
+                        if first_generated.is_none() {
+                            first_generated = Some(id);
+                        }
+                    }
+                }
+
                 TableEngine::insert_row(storage, txn, &resolved.def, schema_cols, full_values)?;
                 count += 1;
             }
         }
 
-        // ── INSERT ... DEFAULT VALUES (deferred) ──────────────────────────────
         InsertSource::DefaultValues => {
             return Err(DbError::NotImplemented {
                 feature: "DEFAULT VALUES — Phase 4.3c".into(),
             })
         }
+    }
+
+    // Update the thread-local LAST_INSERT_ID if we generated any IDs.
+    if let Some(id) = first_generated {
+        THREAD_LAST_INSERT_ID.with(|v| v.set(id));
+        return Ok(QueryResult::affected_with_id(count, id));
     }
 
     Ok(QueryResult::Affected {
@@ -2476,12 +2561,17 @@ fn execute_create_table(
             .constraints
             .iter()
             .any(|c| matches!(c, ColumnConstraint::NotNull));
+        let auto_increment = col_def
+            .constraints
+            .iter()
+            .any(|c| matches!(c, ColumnConstraint::AutoIncrement));
         writer.create_column(CatalogColumnDef {
             table_id,
             col_idx: i as u16,
             name: col_def.name.clone(),
             col_type,
             nullable,
+            auto_increment,
         })?;
     }
 
@@ -2595,6 +2685,129 @@ fn execute_drop_index(
             CatalogWriter::new(storage, txn)?.delete_index(id)?;
             Ok(QueryResult::Empty)
         }
+    }
+}
+
+// ── TRUNCATE TABLE (4.21) ─────────────────────────────────────────────────────
+
+fn execute_truncate(
+    stmt: crate::ast::TruncateTableStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+) -> Result<QueryResult, DbError> {
+    let resolved = {
+        let resolver = make_resolver(storage, txn)?;
+        resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
+    };
+
+    let snap = txn.active_snapshot()?;
+    let rows = TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?;
+    let rids: Vec<RecordId> = rows.into_iter().map(|(rid, _)| rid).collect();
+    for rid in rids {
+        TableEngine::delete_row(storage, txn, &resolved.def, rid)?;
+    }
+
+    // Reset the AUTO_INCREMENT sequence so the next insert starts from 1.
+    AUTO_INC_SEQ.with(|seq| {
+        seq.borrow_mut().remove(&resolved.def.id);
+    });
+
+    // MySQL convention: TRUNCATE returns count = 0, not the actual deleted count.
+    Ok(QueryResult::Affected {
+        count: 0,
+        last_insert_id: None,
+    })
+}
+
+// ── SHOW TABLES / SHOW COLUMNS / DESCRIBE (4.20) ─────────────────────────────
+
+fn execute_show_tables(
+    stmt: crate::ast::ShowTablesStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+) -> Result<QueryResult, DbError> {
+    let schema = stmt.schema.as_deref().unwrap_or("public");
+    let snap = txn.active_snapshot()?;
+    let reader = CatalogReader::new(storage, snap)?;
+    let tables = reader.list_tables(schema)?;
+
+    let col_name = format!("Tables_in_{schema}");
+    let out_cols = vec![ColumnMeta::computed(col_name, DataType::Text)];
+    let rows: Vec<Row> = tables
+        .into_iter()
+        .map(|t| vec![Value::Text(t.table_name)])
+        .collect();
+
+    Ok(QueryResult::Rows {
+        columns: out_cols,
+        rows,
+    })
+}
+
+fn execute_show_columns(
+    stmt: crate::ast::ShowColumnsStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+) -> Result<QueryResult, DbError> {
+    let schema = stmt.table.schema.as_deref().unwrap_or("public");
+    let snap = txn.active_snapshot()?;
+    let reader = CatalogReader::new(storage, snap)?;
+
+    let table_def =
+        reader
+            .get_table(schema, &stmt.table.name)?
+            .ok_or_else(|| DbError::TableNotFound {
+                name: stmt.table.name.clone(),
+            })?;
+    let columns = reader.list_columns(table_def.id)?;
+
+    let out_cols = vec![
+        ColumnMeta::computed("Field", DataType::Text),
+        ColumnMeta::computed("Type", DataType::Text),
+        ColumnMeta::computed("Null", DataType::Text),
+        ColumnMeta::computed("Key", DataType::Text),
+        ColumnMeta::computed("Default", DataType::Text),
+        ColumnMeta::computed("Extra", DataType::Text),
+    ];
+
+    let rows: Vec<Row> = columns
+        .iter()
+        .map(|c| {
+            let type_str = column_type_to_sql_name(c.col_type);
+            let null_str = if c.nullable { "YES" } else { "NO" };
+            let extra = if c.auto_increment {
+                "auto_increment"
+            } else {
+                ""
+            };
+            vec![
+                Value::Text(c.name.clone()),
+                Value::Text(type_str.into()),
+                Value::Text(null_str.into()),
+                Value::Text("".into()), // Key — deferred
+                Value::Null,            // Default — deferred
+                Value::Text(extra.into()),
+            ]
+        })
+        .collect();
+
+    Ok(QueryResult::Rows {
+        columns: out_cols,
+        rows,
+    })
+}
+
+/// Returns the SQL type name string for display in SHOW COLUMNS / DESCRIBE.
+fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
+    match ct {
+        ColumnType::Bool => "BOOL",
+        ColumnType::Int => "INT",
+        ColumnType::BigInt => "BIGINT",
+        ColumnType::Float => "REAL",
+        ColumnType::Text => "TEXT",
+        ColumnType::Bytes => "BYTES",
+        ColumnType::Timestamp => "TIMESTAMP",
+        ColumnType::Uuid => "UUID",
     }
 }
 

@@ -211,6 +211,47 @@ impl<'src> Parser<'src> {
             Token::Select | Token::Insert | Token::Update | Token::Delete => {
                 dml::parse_dml(self)
             }
+            Token::Truncate => {
+                self.advance();
+                // TRUNCATE [TABLE] table_name
+                self.eat(&Token::Table);
+                let table = self.parse_table_ref()?;
+                // Consume optional alias (some clients send it)
+                Ok(Stmt::TruncateTable(crate::ast::TruncateTableStmt { table }))
+            }
+            Token::Show => {
+                self.advance();
+                match self.peek().clone() {
+                    Token::Tables => {
+                        self.advance();
+                        let schema = if self.eat(&Token::From) {
+                            Some(self.parse_identifier()?)
+                        } else {
+                            None
+                        };
+                        Ok(Stmt::ShowTables(crate::ast::ShowTablesStmt { schema }))
+                    }
+                    // COLUMNS is not a reserved keyword — it tokenizes as Ident
+                    Token::Ident(kw) | Token::QuotedIdent(kw) if kw.eq_ignore_ascii_case("columns") => {
+                        self.advance();
+                        self.expect(&Token::From)?;
+                        let table = self.parse_table_ref()?;
+                        Ok(Stmt::ShowColumns(crate::ast::ShowColumnsStmt { table }))
+                    }
+                    other => Err(DbError::ParseError {
+                        message: format!(
+                            "expected TABLES or COLUMNS after SHOW, found {:?} at position {}",
+                            other, self.current_pos()
+                        ),
+                    }),
+                }
+            }
+            // DESCRIBE table_name / DESC table_name
+            Token::Describe => {
+                self.advance();
+                let table = self.parse_table_ref()?;
+                Ok(Stmt::ShowColumns(crate::ast::ShowColumnsStmt { table }))
+            }
             Token::Begin => {
                 self.advance();
                 // Accept optional TRANSACTION keyword

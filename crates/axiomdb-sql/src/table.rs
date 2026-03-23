@@ -316,6 +316,7 @@ mod tests {
             name: name.to_string(),
             col_type,
             nullable: true,
+            auto_increment: false,
         }
     }
 

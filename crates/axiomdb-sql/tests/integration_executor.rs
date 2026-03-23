@@ -1785,3 +1785,310 @@ fn test_insert_select_mvcc_no_self_read() {
         "total rows: 2 original + 2 copies"
     );
 }
+
+// ── 4.14: AUTO_INCREMENT + LAST_INSERT_ID ────────────────────────────────────
+
+#[test]
+fn test_auto_increment_basic() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT AUTO_INCREMENT, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+
+    // First insert: id should be auto-assigned to 1
+    let r = run(
+        "INSERT INTO t (name) VALUES ('Alice')",
+        &mut storage,
+        &mut txn,
+    );
+    match r {
+        QueryResult::Affected {
+            count,
+            last_insert_id,
+        } => {
+            assert_eq!(count, 1);
+            assert_eq!(last_insert_id, Some(1));
+        }
+        other => panic!("expected Affected, got {other:?}"),
+    }
+
+    // Second insert: id = 2
+    let r = run(
+        "INSERT INTO t (name) VALUES ('Bob')",
+        &mut storage,
+        &mut txn,
+    );
+    match r {
+        QueryResult::Affected { last_insert_id, .. } => assert_eq!(last_insert_id, Some(2)),
+        other => panic!("{other:?}"),
+    }
+
+    // Row values should be correct
+    let r = rows(run(
+        "SELECT id, name FROM t ORDER BY id",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][0], Value::Int(1));
+    assert_eq!(r[1][0], Value::Int(2));
+}
+
+#[test]
+fn test_auto_increment_explicit_null() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT AUTO_INCREMENT, val INT)",
+        &mut storage,
+        &mut txn,
+    );
+
+    // Explicit NULL should trigger auto-generation
+    let r = run("INSERT INTO t VALUES (NULL, 100)", &mut storage, &mut txn);
+    match r {
+        QueryResult::Affected { last_insert_id, .. } => assert_eq!(last_insert_id, Some(1)),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_auto_increment_explicit_value_no_advance() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT AUTO_INCREMENT, val INT)",
+        &mut storage,
+        &mut txn,
+    );
+
+    // Explicit non-NULL id should NOT set LAST_INSERT_ID
+    let r = run("INSERT INTO t VALUES (99, 1)", &mut storage, &mut txn);
+    match r {
+        QueryResult::Affected { last_insert_id, .. } => assert_eq!(last_insert_id, None),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_auto_increment_multi_row() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT AUTO_INCREMENT, val INT)",
+        &mut storage,
+        &mut txn,
+    );
+
+    // Multi-row INSERT: LAST_INSERT_ID = first generated id
+    let r = run(
+        "INSERT INTO t VALUES (NULL, 1), (NULL, 2), (NULL, 3)",
+        &mut storage,
+        &mut txn,
+    );
+    match r {
+        QueryResult::Affected {
+            count,
+            last_insert_id,
+        } => {
+            assert_eq!(count, 3);
+            assert_eq!(last_insert_id, Some(1)); // first generated
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let r = rows(run("SELECT id FROM t ORDER BY id", &mut storage, &mut txn));
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0][0], Value::Int(1));
+    assert_eq!(r[1][0], Value::Int(2));
+    assert_eq!(r[2][0], Value::Int(3));
+}
+
+#[test]
+fn test_last_insert_id_function() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT AUTO_INCREMENT, val INT)",
+        &mut storage,
+        &mut txn,
+    );
+    run("INSERT INTO t VALUES (NULL, 42)", &mut storage, &mut txn);
+
+    let r = rows(run("SELECT LAST_INSERT_ID()", &mut storage, &mut txn));
+    assert_eq!(r[0][0], Value::BigInt(1));
+
+    run("INSERT INTO t VALUES (NULL, 99)", &mut storage, &mut txn);
+    let r = rows(run("SELECT lastval()", &mut storage, &mut txn));
+    assert_eq!(r[0][0], Value::BigInt(2));
+}
+
+#[test]
+fn test_serial_synonym() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT SERIAL, val TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run("INSERT INTO t (val) VALUES ('x')", &mut storage, &mut txn);
+
+    let r = rows(run("SELECT id FROM t", &mut storage, &mut txn));
+    assert_eq!(r[0][0], Value::Int(1));
+}
+
+// ── 4.20: SHOW TABLES / SHOW COLUMNS / DESCRIBE ──────────────────────────────
+
+#[test]
+fn test_show_tables_empty() {
+    let (mut storage, mut txn) = setup();
+    // Fresh DB — catalog tables are system tables, user tables = 0
+    let r = rows(run("SHOW TABLES", &mut storage, &mut txn));
+    assert_eq!(r.len(), 0, "no user tables yet");
+}
+
+#[test]
+fn test_show_tables_after_create() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE users (id INT)", &mut storage, &mut txn);
+    run("CREATE TABLE orders (id INT)", &mut storage, &mut txn);
+
+    let r = rows(run("SHOW TABLES", &mut storage, &mut txn));
+    assert_eq!(r.len(), 2);
+    let names: Vec<String> = r
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(s) => s.clone(),
+            v => panic!("expected Text, got {v:?}"),
+        })
+        .collect();
+    assert!(names.contains(&"users".to_string()));
+    assert!(names.contains(&"orders".to_string()));
+}
+
+#[test]
+fn test_show_tables_from_schema() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    let r = rows(run("SHOW TABLES FROM public", &mut storage, &mut txn));
+    assert_eq!(r.len(), 1);
+}
+
+#[test]
+fn test_describe_basic() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE users (id INT NOT NULL, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let r = rows(run("DESCRIBE users", &mut storage, &mut txn));
+    assert_eq!(r.len(), 2);
+
+    // id column
+    assert_eq!(r[0][0], Value::Text("id".into())); // Field
+    assert_eq!(r[0][1], Value::Text("INT".into())); // Type
+    assert_eq!(r[0][2], Value::Text("NO".into())); // Null
+
+    // name column
+    assert_eq!(r[1][0], Value::Text("name".into()));
+    assert_eq!(r[1][1], Value::Text("TEXT".into()));
+    assert_eq!(r[1][2], Value::Text("YES".into())); // nullable by default
+}
+
+#[test]
+fn test_show_columns_same_as_describe() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (x INT)", &mut storage, &mut txn);
+
+    let r1 = rows(run("DESCRIBE t", &mut storage, &mut txn));
+    let r2 = rows(run("SHOW COLUMNS FROM t", &mut storage, &mut txn));
+    assert_eq!(r1, r2);
+}
+
+#[test]
+fn test_describe_auto_increment_extra() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT AUTO_INCREMENT, val TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let r = rows(run("DESCRIBE t", &mut storage, &mut txn));
+    // id column Extra should be "auto_increment"
+    assert_eq!(r[0][5], Value::Text("auto_increment".into()));
+    // val column Extra should be ""
+    assert_eq!(r[1][5], Value::Text("".into()));
+}
+
+#[test]
+fn test_describe_nonexistent_table() {
+    let (mut storage, mut txn) = setup();
+    let err = run_result("DESCRIBE nonexistent", &mut storage, &mut txn);
+    assert!(matches!(err, Err(DbError::TableNotFound { .. })));
+}
+
+// ── 4.21: TRUNCATE TABLE ─────────────────────────────────────────────────────
+
+#[test]
+fn test_truncate_deletes_all_rows() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1), (2), (3)", &mut storage, &mut txn);
+
+    run("TRUNCATE TABLE t", &mut storage, &mut txn);
+
+    let r = rows(run("SELECT COUNT(*) FROM t", &mut storage, &mut txn));
+    assert_eq!(r[0][0], Value::BigInt(0));
+}
+
+#[test]
+fn test_truncate_returns_zero_count() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1), (2)", &mut storage, &mut txn);
+
+    let r = run("TRUNCATE TABLE t", &mut storage, &mut txn);
+    match r {
+        QueryResult::Affected { count, .. } => assert_eq!(count, 0), // MySQL convention
+        other => panic!("expected Affected, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_truncate_resets_auto_increment() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT AUTO_INCREMENT, val INT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES (NULL, 1), (NULL, 2)",
+        &mut storage,
+        &mut txn,
+    );
+
+    run("TRUNCATE TABLE t", &mut storage, &mut txn);
+
+    // After truncate, next insert should start from 1 again
+    run("INSERT INTO t VALUES (NULL, 99)", &mut storage, &mut txn);
+    let r = rows(run("SELECT id FROM t", &mut storage, &mut txn));
+    assert_eq!(r[0][0], Value::Int(1));
+}
+
+#[test]
+fn test_truncate_empty_table_noop() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    // Should not error
+    let r = run("TRUNCATE TABLE t", &mut storage, &mut txn);
+    assert!(matches!(r, QueryResult::Affected { count: 0, .. }));
+}
+
+#[test]
+fn test_truncate_nonexistent_table() {
+    let (mut storage, mut txn) = setup();
+    let err = run_result("TRUNCATE TABLE nonexistent", &mut storage, &mut txn);
+    assert!(matches!(err, Err(DbError::TableNotFound { .. })));
+}
