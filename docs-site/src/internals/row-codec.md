@@ -225,3 +225,113 @@ This is enforced because:
 
 Code that constructs `Value::Real` must ensure the `f64` is not NaN before passing
 it to the codec. The executor's arithmetic operations must propagate NaN as NULL.
+
+---
+
+## Type Coercion (nexusdb-types::coerce)
+
+The `nexusdb-types::coerce` module implements implicit type conversion. It is
+separate from the codec: the codec only serializes well-typed `Value`s; coercion
+happens before encoding, at expression evaluation and column assignment time.
+
+### Two entry points
+
+#### `coerce(value, target: DataType, mode: CoercionMode) -> Result<Value, DbError>`
+
+Used by the executor on INSERT and UPDATE to convert a supplied value to the
+declared column type. Examples:
+
+- `coerce(Text("42"), DataType::Int, Strict)` → `Ok(Int(42))`
+- `coerce(Int(7), DataType::BigInt, Strict)` → `Ok(BigInt(7))`
+- `coerce(Date(1), DataType::Timestamp, Strict)` → `Ok(Timestamp(86_400_000_000))`
+- `coerce(Null, DataType::Int, Strict)` → `Ok(Null)` — NULL always passes through
+
+#### `coerce_for_op(l, r) -> Result<(Value, Value), DbError>`
+
+Used by the expression evaluator in `eval_binary` to promote two operands to a
+common type before arithmetic or comparison. Does **not** accept a
+`CoercionMode` — operator widening is always deterministic and does not attempt
+Text→numeric parsing.
+
+- `coerce_for_op(Int(5), Real(1.5))` → `(Real(5.0), Real(1.5))`
+- `coerce_for_op(Int(2), Decimal(314, 2))` → `(Decimal(200, 2), Decimal(314, 2))`
+  — Int is scaled by `10^scale` so it has the same unit as the Decimal mantissa
+
+### CoercionMode
+
+```rust
+pub enum CoercionMode {
+    Strict,      // NexusDB default — '42abc'→INT = error
+    Permissive,  // MySQL compat — '42abc'→INT = 42 (stops at first non-digit)
+}
+```
+
+### Complete conversion matrix
+
+The full set of implicit conversions supported by `coerce()`:
+
+| From | To | Rule |
+|---|---|---|
+| Any | same type | Identity — returned unchanged |
+| `NULL` | any | Returns `NULL` |
+| `Int(n)` | `BigInt` | `BigInt(n as i64)` — lossless |
+| `Int(n)` | `Real` | `Real(n as f64)` — may lose precision for large values |
+| `Int(n)` | `Decimal` | `Decimal(n, 0)` — lossless |
+| `BigInt(n)` | `Int` | Range check: error if `n ∉ [i32::MIN, i32::MAX]` |
+| `BigInt(n)` | `Real` | `Real(n as f64)` |
+| `BigInt(n)` | `Decimal` | `Decimal(n, 0)` |
+| `Text(s)` | `Int` | Parse full string as integer (strict) or leading digits (permissive) |
+| `Text(s)` | `BigInt` | Same as Int but target is i64 |
+| `Text(s)` | `Real` | Parse as f64; NaN/Inf are always rejected |
+| `Text(s)` | `Decimal` | Parse as `[-][int][.][frac]`; scale = fraction digit count |
+| `Date(d)` | `Timestamp` | `d * 86_400_000_000` µs — midnight UTC |
+| `Bool(b)` | `Int/BigInt/Real` | Permissive mode only: `true→1`, `false→0` |
+| everything else | | `DbError::InvalidCoercion` (SQLSTATE 22018) |
+
+### Text → integer parsing rules in detail
+
+**Strict mode** (NexusDB default):
+1. Strip leading/trailing ASCII whitespace.
+2. Parse the entire remaining string as a decimal integer (optional leading `-`/`+`).
+3. Any non-digit character after the optional sign → `InvalidCoercion`.
+4. Overflow (value does not fit in target type) → `InvalidCoercion`.
+
+**Permissive mode** (MySQL compat):
+1. Strip whitespace.
+2. Read optional sign.
+3. Consume as many leading ASCII digit characters as possible.
+4. If zero digits consumed → return `0` (e.g., `"abc"` → `0`).
+5. Parse accumulated digits; overflow → `InvalidCoercion` (not silently clamped).
+
+### Date → Timestamp conversion
+
+`Date` stores days since 1970-01-01 as `i32`. `Timestamp` stores microseconds
+since 1970-01-01 UTC as `i64`.
+
+```
+Timestamp = Date × 86_400_000_000
+          = days × 86400 seconds/day × 1_000_000 µs/second
+```
+
+Day 0 = `1970-01-01T00:00:00Z` = Timestamp 0. Negative days produce negative
+Timestamps (dates before the Unix epoch). The multiplication uses `checked_mul`
+— overflow is impossible for any plausible calendar date but is handled
+defensively.
+
+### Int → Decimal scale adoption in coerce_for_op
+
+When `coerce_for_op` promotes an `Int` or `BigInt` to match a `Decimal`, it uses
+the **Decimal operand's existing scale** so that the result is expressed in the
+same unit:
+
+```
+coerce_for_op(Int(5), Decimal(314, 2)):
+  factor = 10^2 = 100
+  Int(5) → Decimal(5 × 100, 2) = Decimal(500, 2)
+  → (Decimal(500, 2), Decimal(314, 2))
+
+eval_arithmetic(Add, Decimal(500, 2), Decimal(314, 2)):
+  → Decimal(814, 2)  = 8.14  ✓
+```
+
+Without scale adoption, `5 + 3.14` would compute `Decimal(5 + 314, 2) = Decimal(319, 2) = 3.19` — wrong.

@@ -108,7 +108,7 @@
 
 <!-- ── Group C — Semantic layer (needs Group B + Phase 3 catalog) ── -->
 - [x] 4.18 ✅ Semantic analyzer — validate table/column existence against catalog (uses SchemaResolver from 3.14), resolve ambiguities, clear SQL error per violation; **prerequisite for 4.5**
-- [ ] 4.18b ⏳ Type coercion matrix — rules for `'42'→INT`, `INT→BIGINT`, `DATE→TIMESTAMP`; MySQL-compatible permissive mode vs strict mode; errors on invalid conversions
+- [x] 4.18b ✅ Type coercion matrix — rules for `'42'→INT`, `INT→BIGINT`, `DATE→TIMESTAMP`; MySQL-compatible permissive mode vs strict mode; errors on invalid conversions
 - [ ] 4.23 ⏳ QueryResult type — unified executor return: `Rows{columns: Vec<ColumnMeta>, rows: Vec<Row>}` for SELECT, `Affected{count, last_insert_id}` for DML, `Empty` for DDL; basis for Phase 5 wire protocol serialization
 
 <!-- ── Group D — Basic executor (needs Groups A + B + C) ── -->

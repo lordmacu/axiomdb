@@ -241,6 +241,53 @@ SELECT 10 / 0;
 -- ERROR 22012: division by zero
 ```
 
+### 22018 — invalid_character_value_for_cast
+
+A value cannot be implicitly coerced to the target type. This error is raised
+when NexusDB is in **strict mode** (the default) and a conversion is attempted
+that would discard data or is not defined.
+
+```sql
+-- Text with non-numeric characters inserted into an INT column (strict mode):
+INSERT INTO users (age) VALUES ('42abc');
+-- ERROR 22018: cannot coerce '42abc' (Text) to INT: '42abc' is not a valid integer
+
+-- A type pair with no implicit conversion:
+SELECT 3.14 + DATE '2026-01-01';
+-- ERROR 22018: cannot coerce 3.14 (Real) to Date: no implicit numeric promotion between these types
+```
+
+**Hint:** Use explicit `CAST` for conversions that NexusDB does not apply
+automatically:
+
+```sql
+INSERT INTO users (age) VALUES (CAST('42' AS INT));   -- explicit — always works
+SELECT CAST(3 AS REAL) + 1.5;                         -- explicit widening
+```
+
+**MySQL compat mode** (permissive): if your application requires MySQL-style
+lenient coercion (`'42abc'` silently converted to `42`), set the session to
+permissive mode. This will be available via `SET NEXUS_COMPAT = 'mysql'` in
+Phase 5 (MySQL wire protocol). Until then, strict mode is always active.
+
+#### Implicit coercions that always succeed (no error)
+
+The following conversions happen automatically without raising 22018:
+
+| From | To | Example |
+|---|---|---|
+| `INT` | `BIGINT` | `1 + 9999999999` → `BIGINT` |
+| `INT` | `REAL` | `5 + 1.5` → `Real(6.5)` |
+| `INT` | `DECIMAL` | `2 + 3.14` → `Decimal(5.14)` |
+| `BIGINT` | `REAL` | `100 + 1.5` → `Real(101.5)` |
+| `BIGINT` | `DECIMAL` | `100 + 3.14` → `Decimal(103.14)` |
+| `BIGINT` | `INT` | only if value fits in INT range |
+| `TEXT` | `INT` / `BIGINT` | `'42'` → `42` (strict: entire string must be a number) |
+| `TEXT` | `REAL` | `'3.14'` → `3.14` |
+| `TEXT` | `DECIMAL` | `'3.14'` → `Decimal(314, 2)` |
+| `DATE` | `TIMESTAMP` | midnight UTC of the given date |
+| `NULL` | any | always passes through as `NULL` |
+
 ---
 
 ## Complete SQLSTATE Reference
@@ -262,4 +309,5 @@ SELECT 10 / 0;
 | `22001`  | string_data_right_truncation  | Value too long for column type            |
 | `22003`  | numeric_value_out_of_range    | Number exceeds type bounds                |
 | `22012`  | division_by_zero              | Division by zero in expression            |
+| `22018`  | invalid_character_value_for_cast | Implicit type coercion failed          |
 | `58030`  | io_error                      | OS-level I/O failure (disk, permissions)  |
