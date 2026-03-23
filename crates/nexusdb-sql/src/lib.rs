@@ -3,8 +3,9 @@
 //! - 4.17: [`Expr`], [`eval`], [`is_truthy`] — expression evaluator with full NULL semantics
 //! - 4.1:  [`Stmt`] and all statement AST types
 //! - 4.2:  [`Token`], [`tokenize`], [`Span`], [`SpannedToken`] — SQL lexer
-//! - 4.3–4.4: SQL parser (coming)
-//! - 4.18: Semantic analyzer (coming)
+//! - 4.3–4.4: [`parse`] — recursive descent SQL parser
+//! - 4.18: [`analyze`] — semantic analyzer, col_idx resolution
+//! - 4.23: [`QueryResult`], [`ColumnMeta`], [`Row`] — unified executor return type
 //! - 4.5:  Executor (coming)
 
 pub mod analyzer;
@@ -13,6 +14,7 @@ pub mod eval;
 pub mod expr;
 pub mod lexer;
 pub mod parser;
+pub mod result;
 
 pub use ast::{
     AlterTableOp, AlterTableStmt, Assignment, ColumnConstraint, ColumnDef, CreateIndexStmt,
@@ -27,3 +29,4 @@ pub use lexer::{tokenize, Span, SpannedToken, Token};
 // Note: Token<'src> and SpannedToken<'src> carry a lifetime tied to the input string.
 pub use analyzer::analyze;
 pub use parser::parse;
+pub use result::{ColumnMeta, QueryResult, Row};

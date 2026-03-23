@@ -25,7 +25,8 @@ prevents circular dependencies and makes each component independently testable.
 │  ├── parser    (recursive descent, LL(1)/LL(2))                     │
 │  ├── ast       (Stmt, Expr, SelectStmt, InsertStmt, ...)            │
 │  ├── analyzer  (BindContext, col_idx resolution, catalog lookup)    │
-│  └── eval      (expression evaluator, three-valued NULL logic)      │
+│  ├── eval      (expression evaluator, three-valued NULL logic)      │
+│  └── result    (QueryResult, ColumnMeta, Row — executor return type)│
 │                                                                     │
 │  [executor, query planner — Phase 5]                                │
 └──────────────────────────────┬──────────────────────────────────────┘
@@ -60,8 +61,8 @@ prevents circular dependencies and makes each component independently testable.
 └─────────────────────────────────────────────────────────────────────┘
                                │
                     ┌──────────▼────────┐
-                    │   mydb.db         │  ← mmap pages (16 KB each)
-                    │   mydb.wal        │  ← WAL append-only log
+                    │   nexusdb.db      │  ← mmap pages (16 KB each)
+                    │   nexusdb.wal     │  ← WAL append-only log
                     └───────────────────┘
 ```
 
@@ -157,6 +158,9 @@ The SQL processing pipeline:
 - `parser` — recursive descent; expression sub-parser with full operator precedence
 - `analyzer` — `BindContext` / `BoundTable`; resolves `col_idx` for JOINs
 - `eval` — expression evaluator with three-valued NULL logic
+- `result` — `QueryResult` enum (`Rows` / `Affected` / `Empty`), `ColumnMeta`
+  (name, data_type, nullable, table_name), `Row = Vec<Value>`; the contract
+  between the executor and all callers (embedded API, wire protocol, CLI)
 
 ### nexusdb-server
 
