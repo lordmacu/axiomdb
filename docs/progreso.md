@@ -131,7 +131,7 @@
 - [x] 4.10c ✅ NULLS FIRST / NULLS LAST — ASC→NULLS LAST, DESC→NULLS FIRST (PG defaults); explicit override
 - [ ] 4.10d ⏳ Parameterized LIMIT/OFFSET — `LIMIT $1 OFFSET $2` in prepared statements (deferred to Phase 5)
 - [ ] 4.11 ⏳ Scalar subqueries — `(SELECT MAX(id) FROM t)` in WHERE and SELECT list
-- [ ] 4.12 ⏳ DISTINCT — `SELECT DISTINCT col1, col2`; hash set or sort; interacts with ORDER BY
+- [x] 4.12 ✅ DISTINCT — HashSet dedup on projected output rows; NULL=NULL for grouping; pre-LIMIT
 - [ ] 4.12b ⏳ CAST + basic type coercion — explicit and implicit conversion between compatible types
 - [ ] 4.24 ⏳ CASE WHEN in any context — `CASE WHEN x THEN a ELSE b END` in SELECT, WHERE, ORDER BY, GROUP BY, HAVING; required by most ORMs from the first query
 - [ ] 4.6 ⏳ INSERT ... SELECT — insert result of a SELECT directly into a table

@@ -165,13 +165,6 @@ fn execute_select(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
-    // Guard unsupported clauses (DISTINCT remains unimplemented).
-    if stmt.distinct {
-        return Err(DbError::NotImplemented {
-            feature: "DISTINCT — Phase 4.12".into(),
-        });
-    }
-
     // Dispatch based on FROM clause type and whether JOINs are present.
     if stmt.from.is_none() {
         // ── SELECT without FROM ───────────────────────────────────────────────
@@ -195,9 +188,14 @@ fn execute_select(
                 }
             }
         }
+        let rows = if stmt.distinct {
+            apply_distinct(vec![out_row])
+        } else {
+            vec![out_row]
+        };
         return Ok(QueryResult::Rows {
             columns: out_cols,
-            rows: vec![out_row],
+            rows,
         });
     }
 
@@ -250,7 +248,11 @@ fn execute_select(
             .map(|v| project_row(&stmt.columns, v))
             .collect::<Result<Vec<_>, _>>()?;
 
-        // LIMIT/OFFSET applied to projected rows.
+        // DISTINCT deduplication (after projection, before LIMIT).
+        if stmt.distinct {
+            rows = apply_distinct(rows);
+        }
+        // LIMIT/OFFSET applied after deduplication.
         rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 
         Ok(QueryResult::Rows {
@@ -386,7 +388,11 @@ fn execute_select_with_joins(
         .map(|r| project_row(&stmt.columns, r))
         .collect::<Result<Vec<_>, _>>()?;
 
-    // LIMIT/OFFSET applied to projected rows.
+    // DISTINCT deduplication (after projection, before LIMIT).
+    if stmt.distinct {
+        rows = apply_distinct(rows);
+    }
+    // LIMIT/OFFSET applied after deduplication.
     rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 
     Ok(QueryResult::Rows {
@@ -1285,6 +1291,11 @@ fn execute_select_grouped(
         rows.push(out_row);
     }
 
+    // DISTINCT deduplication (after projection, before ORDER BY and LIMIT).
+    if stmt.distinct {
+        rows = apply_distinct(rows);
+    }
+
     // ORDER BY applied to projected output rows.
     // For GROUP BY queries, ORDER BY evaluates against the output row.
     rows = apply_order_by(rows, &stmt.order_by)?;
@@ -2037,6 +2048,24 @@ fn apply_limit_offset(
         .skip(offset_n)
         .take(limit_n.unwrap_or(usize::MAX))
         .collect())
+}
+
+/// Deduplicates output rows, keeping the first occurrence of each unique row.
+///
+/// Two rows are equal if every column value serializes to the same bytes via
+/// `value_to_key_bytes`. `NULL` values produce `[0x00]` — two NULLs in the
+/// same column position are considered equal, consistent with SQL DISTINCT
+/// semantics (unlike `NULL = NULL` which is UNKNOWN in comparisons).
+///
+/// Preserves the insertion order of first occurrences (stable deduplication).
+fn apply_distinct(rows: Vec<Row>) -> Vec<Row> {
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    rows.into_iter()
+        .filter(|row| {
+            let key: Vec<u8> = row.iter().flat_map(value_to_key_bytes).collect();
+            seen.insert(key)
+        })
+        .collect()
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
