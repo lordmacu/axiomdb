@@ -20,7 +20,16 @@ use crate::{
 };
 
 /// Byte offset of `checkpoint_lsn` within the page body (not the full page).
-pub const CHECKPOINT_LSN_BODY_OFFSET: usize = 16;
+///
+/// ## Meta page body layout (MmapStorage DbFileMeta)
+/// ```text
+/// body[0..8]   db_magic: u64
+/// body[8..12]  version: u32
+/// body[12..16] _pad: u32
+/// body[16..24] page_count: u64   ← MmapStorage uses this field
+/// body[24..32] checkpoint_lsn    ← we start here, safely after page_count
+/// ```
+pub const CHECKPOINT_LSN_BODY_OFFSET: usize = 24;
 
 /// Byte offset of `checkpoint_lsn` within the full page bytes (body starts at HEADER_SIZE).
 const CHECKPOINT_LSN_PAGE_OFFSET: usize = HEADER_SIZE + CHECKPOINT_LSN_BODY_OFFSET;
@@ -98,7 +107,8 @@ mod tests {
     #[test]
     fn test_write_does_not_corrupt_other_meta_fields() {
         let mut storage = storage_with_meta();
-        // page_count lives at body[8..16]; checkpoint_lsn at body[16..24].
+        // page_count lives at body[16..24] (DbFileMeta layout).
+        // checkpoint_lsn lives at body[24..32] — must not overlap.
         // Writing checkpoint_lsn must not touch page_count.
         let count_before = storage.page_count();
         write_checkpoint_lsn(&mut storage, 77).unwrap();

@@ -9,6 +9,7 @@
 mod checkpoint;
 mod entry;
 mod reader;
+mod recovery;
 mod rotation;
 mod txn;
 mod writer;
@@ -16,6 +17,7 @@ mod writer;
 pub use checkpoint::Checkpointer;
 pub use entry::{EntryType, WalEntry, MIN_ENTRY_LEN};
 pub use reader::{BackwardIter, ForwardIter, WalReader};
+pub use recovery::{CrashRecovery, RecoveryOp, RecoveryResult, RecoveryState};
 pub use rotation::WalRotator;
-pub use txn::{TxnManager, UndoOp};
+pub use txn::{decode_physical_loc, TxnManager, UndoOp, PHYSICAL_LOC_LEN};
 pub use writer::{WalWriter, WAL_HEADER_SIZE, WAL_MAGIC, WAL_VERSION};

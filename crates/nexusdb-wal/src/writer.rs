@@ -184,6 +184,18 @@ impl WalWriter {
     pub fn file_offset(&self) -> u64 {
         self.offset
     }
+
+    /// Flushes the internal `BufWriter` buffer to the OS without fsync.
+    ///
+    /// After this call, WAL entries are visible to other readers on the same
+    /// host (through the kernel page cache) but NOT guaranteed to survive a
+    /// power failure.
+    ///
+    /// Used in tests to simulate a process crash: flush the buffer so entries
+    /// are readable, then drop without committing.
+    pub fn flush_buffer(&mut self) -> Result<(), DbError> {
+        self.writer.flush().map_err(DbError::Io)
+    }
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
