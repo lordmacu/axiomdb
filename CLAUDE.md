@@ -219,12 +219,13 @@ One phase at a time. When finishing each phase — **mandatory closing protocol:
 3. cargo fmt --check with no differences
 4. Write docs/fase-N.md
 5. Update docs/progreso.md — mark subphase with [x] ✅ and parent phase with 🔄
-6. Update memory/project_state.md
-7. Update memory/architecture.md
-8. Update memory/lessons.md if there were learnings
-9. Commit with Conventional Commits format
-10. Report progress percentages to the user (see below)
-11. Confirm to the user
+6. Update docs-site/ — update ALL pages affected by this subphase (see Documentation protocol below)
+7. Update memory/project_state.md
+8. Update memory/architecture.md
+9. Update memory/lessons.md if there were learnings
+10. Commit with Conventional Commits format
+11. Report progress percentages to the user (see below)
+12. Confirm to the user
 ```
 
 ### Progress report — mandatory after every subfase close
@@ -255,6 +256,65 @@ Report format to show the user after every closed subfase:
 ```
 
 Generate the bar with: █ per 6.25% completed, ░ for remaining (16 chars total).
+
+### Documentation protocol — mandatory on every subphase close
+
+The `docs-site/` directory contains two types of documentation that must always be kept in sync with the code:
+
+#### Two audiences — both must be updated
+
+| Type | Location | Who reads it | Standard |
+|---|---|---|---|
+| **User docs** | `docs-site/src/user-guide/` | Developers using NexusDB as a database | Clear, example-heavy, covers behavior from the outside |
+| **Technical docs** | `docs-site/src/internals/` | Contributors, engineers reading the source | Deep, implementation-level, covers algorithms, data structures, invariants |
+
+#### What "explicit and descriptive" means
+
+Every page — user or technical — must meet this bar:
+
+- **User docs:** a developer who has never read the source code must be able to use the feature correctly after reading the page. Every SQL feature needs at least one real working example. Error messages must be shown with their SQLSTATE code and a fix hint.
+- **Technical docs:** a contributor who is new to the codebase must be able to understand the algorithm, the on-disk/in-memory layout, the invariants that must hold, and the edge cases. Include:
+  - Data structure layout (fields, sizes, bit-level format if relevant)
+  - Step-by-step description of every non-trivial algorithm
+  - The invariants that the code maintains
+  - What happens on error / recovery
+  - Code examples (Rust) showing the public API and the critical internal logic
+  - Performance characteristics (O(n) guarantees, cache behavior, allocation profile)
+
+#### Proactive update rule
+
+**If you modify, add, or delete any functionality that is already documented in `docs-site/`, you MUST update the relevant pages in the same commit.** No exceptions.
+
+This applies to:
+- Any change to a public struct, enum, trait, or function signature
+- Any change to an on-disk format (page layout, WAL entry format, codec format)
+- Any change to an algorithm (rebalance logic, recovery state machine, visibility function)
+- Any change to SQL syntax accepted or rejected by the parser/analyzer
+- Any new error type or changed error message
+- Any benchmark result that changes by more than 5%
+
+The review checklist (Step 1 of /review-task) includes checking that docs-site pages
+were updated. A subphase cannot be closed if the docs are stale.
+
+#### Which docs-site pages to update per component
+
+| Component changed | User doc to update | Technical doc to update |
+|---|---|---|
+| SQL syntax (parser) | `sql-reference/ddl.md` or `dml.md` | `internals/sql-parser.md` |
+| Expression evaluator | `sql-reference/expressions.md` | `internals/sql-parser.md` |
+| Semantic analyzer | `sql-reference/` (affected statements) | `internals/semantic-analyzer.md` |
+| Executor (Phase 5+) | `user-guide/getting-started.md`, `sql-reference/dml.md` | `internals/architecture.md` |
+| Storage / page format | — | `internals/storage.md` |
+| B+ Tree | `user-guide/features/indexes.md` | `internals/btree.md` |
+| WAL / crash recovery | `user-guide/features/transactions.md` | `internals/wal.md` |
+| MVCC / TxnManager | `user-guide/features/transactions.md` | `internals/mvcc.md` |
+| Catalog | `user-guide/features/catalog.md` | `internals/catalog.md` |
+| Row codec | — | `internals/row-codec.md` |
+| New error type | `user-guide/errors.md` | — |
+| Benchmark result | `user-guide/performance.md` | `development/benchmarks.md` |
+| New phase completed | `development/roadmap.md` | All internals pages for that phase |
+
+---
 
 ### Unimplemented items — anti-gap rule
 
@@ -334,6 +394,13 @@ Launch an Explore agent with instructions to review:
 5. **Benchmarks** in `benches/` — do they compile? → blocker if not
 6. **Test logic** — are the assertions correct? Are there tests that always pass without verifying anything real?
 7. **Unidentified gaps** — is there functionality promised in the spec that is not implemented?
+8. **Documentation staleness** — for every component touched in this phase:
+   - Is the corresponding `docs-site/src/internals/` page updated and accurate?
+   - Is the corresponding `docs-site/src/user-guide/` page updated and accurate?
+   - Are new error types added to `user-guide/errors.md`?
+   - Are benchmark results updated in `user-guide/performance.md` and `development/benchmarks.md`?
+   - Is `development/roadmap.md` updated with the new phase status?
+   → Stale documentation is a blocker.
 
 The subagent must return a report with:
 - List of fulfilled/unfulfilled criteria per subphase
@@ -399,6 +466,10 @@ Si hay un ❌, abrir `/debug` para identificar el bottleneck antes de continuar.
    [ ] No benchmark ❌ (blocker) ✅
    [ ] Test logic reviewed (no empty assertions) ✅
    [ ] docs/progreso.md updated ✅
+   [ ] docs-site/src/internals/ updated for all components touched ✅
+   [ ] docs-site/src/user-guide/ updated for all user-visible changes ✅
+   [ ] development/roadmap.md phase status updated ✅
+   [ ] Stale documentation checked (blocker if found) ✅
    [ ] Commit done ✅
    ```
 
