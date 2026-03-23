@@ -1,12 +1,12 @@
-//! B+ Tree persistente con Copy-on-Write y raíz atómica.
+//! Persistent B+ Tree with Copy-on-Write and an atomic root.
 //!
-//! ## Invariantes
-//! - Nodo interno con `n` keys tiene `n+1` children.
-//! - Para todo `i`: `children[i]` contiene keys `>= keys[i-1]` y `< keys[i]`.
-//! - Las hojas están enlazadas en orden ascendente por `next_leaf`
-//!   (aunque el iterador usa traversal del árbol para evitar punteros obsoletos en CoW).
-//! - Cada write crea páginas nuevas antes de liberar las antiguas.
-//! - `root_pid` se actualiza con `AtomicU64::store(Release)` al fin de cada mutación.
+//! ## Invariants
+//! - An internal node with `n` keys has `n+1` children.
+//! - For all `i`: `children[i]` contains keys `>= keys[i-1]` and `< keys[i]`.
+//! - Leaves are linked in ascending order by `next_leaf`
+//!   (though the iterator uses tree traversal to avoid stale pointers in CoW).
+//! - Each write creates new pages before freeing the old ones.
+//! - `root_pid` is updated with `AtomicU64::store(Release)` at the end of each mutation.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,7 +19,7 @@ use crate::page_layout::{
     MAX_KEY_LEN, MIN_KEYS_INTERNAL, MIN_KEYS_LEAF, NULL_PAGE, ORDER_INTERNAL, ORDER_LEAF,
 };
 
-// ── Tipos internos ───────────────────────────────────────────────────────────
+// ── Internal types ───────────────────────────────────────────────────────────
 
 enum InsertResult {
     Ok(u64),
@@ -35,7 +35,7 @@ enum DeleteResult {
     Deleted { new_pid: u64, underfull: bool },
 }
 
-/// Versión copiada de un nodo leído de página (libera el borrow de storage).
+/// Copied version of a node read from a page (releases the storage borrow).
 enum NodeCopy {
     Leaf(LeafNodePage),
     Internal(InternalNodePage),
@@ -54,14 +54,14 @@ impl NodeCopy {
 
 // ── BTree ────────────────────────────────────────────────────────────────────
 
-/// B+ Tree persistente sobre un `StorageEngine`.
+/// Persistent B+ Tree over a `StorageEngine`.
 pub struct BTree {
     storage: Box<dyn StorageEngine>,
     root_pid: AtomicU64,
 }
 
 impl BTree {
-    /// Crea o reabre un B+ Tree.
+    /// Creates or reopens a B+ Tree.
     pub fn new(
         mut storage: Box<dyn StorageEngine>,
         root_page_id: Option<u64>,
@@ -96,14 +96,17 @@ impl BTree {
         Self::check_key(key)?;
         let mut pid = self.root_pid.load(Ordering::Acquire);
         loop {
-            match NodeCopy::read(self.storage.as_ref(), pid)? {
-                NodeCopy::Leaf(node) => {
-                    return Ok(node.search(key).ok().map(|i| node.rid_at(i)));
-                }
-                NodeCopy::Internal(node) => {
-                    let idx = node.find_child_idx(key);
-                    pid = node.child_at(idx);
-                }
+            // Read the page as a reference — no 16 KB copy.
+            // The borrow ends at the bottom of each branch before the next read_page call.
+            let page = self.storage.read_page(pid)?;
+            if page.body()[0] == 1 {
+                let node = cast_leaf(page);
+                return Ok(node.search(key).ok().map(|i| node.rid_at(i)));
+            } else {
+                let node = cast_internal(page);
+                let idx = node.find_child_idx(key);
+                pid = node.child_at(idx);
+                // `page` and `node` drop here — borrow released before next iteration
             }
         }
     }
@@ -115,13 +118,13 @@ impl BTree {
         let root = self.root_pid.load(Ordering::Acquire);
         match Self::insert_subtree(self.storage.as_mut(), root, key, rid)? {
             InsertResult::Ok(new_root) => {
-                // CAS garantiza que si en Fase 7 hubiera otro writer concurrente,
-                // el segundo fallaría en lugar de sobrescribir silenciosamente.
-                // Con &mut self (Fase 2) siempre tiene éxito — el patrón queda listo.
+                // CAS ensures that if in Phase 7 there were a concurrent writer,
+                // the second would fail instead of silently overwriting.
+                // With &mut self (Phase 2) it always succeeds — the pattern is ready.
                 self.root_pid
                     .compare_exchange(root, new_root, Ordering::AcqRel, Ordering::Acquire)
                     .map_err(|_| DbError::BTreeCorrupted {
-                        msg: "root modificado concurrentemente durante insert".into(),
+                        msg: "root modified concurrently during insert".into(),
                     })?;
             }
             InsertResult::Split {
@@ -133,7 +136,7 @@ impl BTree {
                 self.root_pid
                     .compare_exchange(root, new_root, Ordering::AcqRel, Ordering::Acquire)
                     .map_err(|_| DbError::BTreeCorrupted {
-                        msg: "root modificado concurrentemente durante insert (split)".into(),
+                        msg: "root modified concurrently during insert (split)".into(),
                     })?;
             }
         }
@@ -155,8 +158,8 @@ impl BTree {
 
                 match Self::insert_subtree(storage, child_pid, key, rid)? {
                     InsertResult::Ok(new_child_pid) => {
-                        // Si el hijo se actualizó in-place (mismo pid), el padre no cambió:
-                        // no hay que reescribirlo ni actualizar su puntero child.
+                        // If the child was updated in-place (same pid), the parent did not change:
+                        // no need to rewrite it or update its child pointer.
                         if new_child_pid == child_pid {
                             return Ok(InsertResult::Ok(pid));
                         }
@@ -208,7 +211,7 @@ impl BTree {
         };
 
         if node.num_keys() < ORDER_LEAF {
-            // In-place: con &mut self no hay lectores concurrentes, no necesitamos CoW.
+            // In-place: with &mut self there are no concurrent readers, CoW not needed.
             let mut p = Page::new(PageType::Index, old_pid);
             let n = cast_leaf_mut(&mut p);
             *n = node;
@@ -294,11 +297,11 @@ impl BTree {
             *c = node.child_at(i);
         }
 
-        // Insertar sep en child_idx: desplazar [child_idx..n] una posición a la derecha.
-        // copy_within maneja correctamente child_idx == n (rango vacío → no-op).
+        // Insert sep at child_idx: shift [child_idx..n] one position to the right.
+        // copy_within correctly handles child_idx == n (empty range → no-op).
         kl.copy_within(child_idx..n, child_idx + 1);
         ks.copy_within(child_idx..n, child_idx + 1);
-        // children: desplazar [child_idx+1..=n] una posición a la derecha
+        // children: shift [child_idx+1..=n] one position to the right
         ch.copy_within(child_idx + 1..=n, child_idx + 2);
         kl[child_idx] = sep.len() as u8;
         ks[child_idx].fill(0);
@@ -377,7 +380,7 @@ impl BTree {
         child_idx: usize,
         new_child: u64,
     ) -> Result<u64, DbError> {
-        // In-place: con &mut self no hay lectores concurrentes, no necesitamos CoW.
+        // In-place: with &mut self there are no concurrent readers, CoW not needed.
         node.set_child_at(child_idx, new_child);
         let mut p = Page::new(PageType::Index, old_pid);
         *cast_internal_mut(&mut p) = node;
@@ -398,7 +401,7 @@ impl BTree {
                 self.root_pid
                     .compare_exchange(root, final_root, Ordering::AcqRel, Ordering::Acquire)
                     .map_err(|_| DbError::BTreeCorrupted {
-                        msg: "root modificado concurrentemente durante delete".into(),
+                        msg: "root modified concurrently during delete".into(),
                     })?;
                 Ok(true)
             }
@@ -881,9 +884,12 @@ impl BTree {
     fn find_leaf_for(&self, key: &[u8]) -> Result<u64, DbError> {
         let mut pid = self.root_pid.load(Ordering::Acquire);
         loop {
-            match NodeCopy::read(self.storage.as_ref(), pid)? {
-                NodeCopy::Leaf(_) => return Ok(pid),
-                NodeCopy::Internal(n) => pid = n.child_at(n.find_child_idx(key)),
+            let page = self.storage.read_page(pid)?;
+            if page.body()[0] == 1 {
+                return Ok(pid);
+            } else {
+                let node = cast_internal(page);
+                pid = node.child_at(node.find_child_idx(key));
             }
         }
     }
