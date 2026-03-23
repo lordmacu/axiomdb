@@ -11,6 +11,7 @@ pub mod ast;
 pub mod eval;
 pub mod expr;
 pub mod lexer;
+pub mod parser;
 
 pub use ast::{
     AlterTableOp, AlterTableStmt, Assignment, ColumnConstraint, ColumnDef, CreateIndexStmt,
@@ -22,3 +23,4 @@ pub use ast::{
 pub use eval::{eval, is_truthy};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lexer::{tokenize, Span, SpannedToken, Token};
+pub use parser::parse;
