@@ -127,6 +127,10 @@ pub enum DbError {
     #[error("invalid value: {reason}")]
     InvalidValue { reason: String },
 
+    // ── Semantic analyzer ─────────────────────────────────────────
+    #[error("column reference '{name}' is ambiguous — found in: {tables}")]
+    AmbiguousColumn { name: String, tables: String },
+
     // ── Expression evaluator ──────────────────────────────────────
     #[error("division by zero")]
     DivisionByZero,

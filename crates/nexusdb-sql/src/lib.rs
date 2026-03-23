@@ -7,6 +7,7 @@
 //! - 4.18: Semantic analyzer (coming)
 //! - 4.5:  Executor (coming)
 
+pub mod analyzer;
 pub mod ast;
 pub mod eval;
 pub mod expr;
@@ -24,4 +25,5 @@ pub use eval::{eval, is_truthy};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lexer::{tokenize, Span, SpannedToken, Token};
 // Note: Token<'src> and SpannedToken<'src> carry a lifetime tied to the input string.
+pub use analyzer::analyze;
 pub use parser::parse;

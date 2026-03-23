@@ -27,8 +27,7 @@ use sqlparser::{dialect::MySqlDialect, dialect::PostgreSqlDialect, parser::Parse
 
 const SIMPLE_SELECT: &str = "SELECT id, name FROM users WHERE id = 1";
 
-const MEDIUM_SELECT: &str =
-    "SELECT u.id, u.name, COUNT(o.id) AS orders \
+const MEDIUM_SELECT: &str = "SELECT u.id, u.name, COUNT(o.id) AS orders \
      FROM users AS u \
      LEFT JOIN orders AS o ON u.id = o.user_id \
      WHERE u.active = TRUE AND u.age >= 18 \
@@ -61,8 +60,7 @@ const CREATE_TABLE: &str = "
 const INSERT_STMT: &str =
     "INSERT INTO orders (user_id, product_id, qty, total) VALUES (1, 2, 3, 99.99)";
 
-const UPDATE_STMT: &str =
-    "UPDATE products SET price = 9.99, stock = stock - 1 WHERE id = 42";
+const UPDATE_STMT: &str = "UPDATE products SET price = 9.99, stock = stock - 1 WHERE id = 42";
 
 // ── Benchmark ─────────────────────────────────────────────────────────────────
 
@@ -88,18 +86,12 @@ fn bench_comparison(c: &mut Criterion) {
 
         // sqlparser-rs with MySQL dialect
         group.bench_function("sqlparser_mysql", |b| {
-            b.iter(|| {
-                SpParser::parse_sql(&mysql_dialect, black_box(sql))
-                    .unwrap()
-            })
+            b.iter(|| SpParser::parse_sql(&mysql_dialect, black_box(sql)).unwrap())
         });
 
         // sqlparser-rs with PostgreSQL dialect
         group.bench_function("sqlparser_pg", |b| {
-            b.iter(|| {
-                SpParser::parse_sql(&pg_dialect, black_box(sql))
-                    .unwrap()
-            })
+            b.iter(|| SpParser::parse_sql(&pg_dialect, black_box(sql)).unwrap())
         });
 
         group.finish();
@@ -133,9 +125,7 @@ fn bench_throughput(c: &mut Criterion) {
             |b, &n| {
                 b.iter(|| {
                     for _ in 0..n {
-                        black_box(
-                            SpParser::parse_sql(&mysql_dialect, SIMPLE_SELECT).unwrap(),
-                        );
+                        black_box(SpParser::parse_sql(&mysql_dialect, SIMPLE_SELECT).unwrap());
                     }
                 })
             },
