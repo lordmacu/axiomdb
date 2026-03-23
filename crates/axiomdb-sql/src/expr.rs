@@ -134,6 +134,49 @@ pub enum Expr {
         /// The target SQL type.
         target: axiomdb_types::DataType,
     },
+
+    // ── Subqueries ────────────────────────────────────────────────────────────
+    /// `(SELECT expr FROM ...)` — scalar subquery.
+    ///
+    /// Must return exactly one column. Returns `NULL` if 0 rows are produced.
+    /// Returns [`DbError::CardinalityViolation`] if more than one row is produced.
+    Subquery(Box<crate::ast::SelectStmt>),
+
+    /// `expr [NOT] IN (SELECT col FROM ...)` — membership test against a subquery.
+    ///
+    /// NULL semantics follow SQL `IN`:
+    /// - `expr` is NULL → NULL
+    /// - match found → TRUE
+    /// - no match, no NULLs in result → FALSE
+    /// - no match, at least one NULL in result → NULL (UNKNOWN)
+    InSubquery {
+        expr: Box<Expr>,
+        query: Box<crate::ast::SelectStmt>,
+        negated: bool,
+    },
+
+    /// `[NOT] EXISTS (SELECT ...)` — existence test.
+    ///
+    /// TRUE if the subquery returns at least one row, FALSE otherwise.
+    /// Never returns NULL — EXISTS is immune to NULL propagation.
+    Exists {
+        query: Box<crate::ast::SelectStmt>,
+        negated: bool,
+    },
+
+    /// A column reference resolved to the **outer** query's row.
+    ///
+    /// Emitted by the semantic analyzer when a column name is not found in the
+    /// inner (current) scope but IS found in an enclosing scope.
+    /// `col_idx` is the position in the outer row as resolved by the outer
+    /// [`BindContext`].
+    ///
+    /// Must be replaced with [`Expr::Literal`] via `substitute_outer` before
+    /// the inner query is executed. Reaching `eval_with` with an unsubstituted
+    /// `OuterColumn` is a programming error.
+    ///
+    /// [`BindContext`]: crate::analyzer::BindContext
+    OuterColumn { col_idx: usize, name: String },
 }
 
 // ── BinaryOp ──────────────────────────────────────────────────────────────────

@@ -336,40 +336,86 @@ fn virtual_columns_from_select(select: &SelectStmt) -> Vec<ColumnDef> {
 
 // ── Expression resolution ─────────────────────────────────────────────────────
 
+/// Storage + snapshot context threaded through `resolve_expr_full` so that
+/// subquery arms can call `analyze_select_with_outer`.
+///
+/// `None` is used on pure paths (UPDATE/DELETE/INSERT) where subqueries are not
+/// expected; subquery arms return `DbError::NotImplemented` when `state` is `None`.
+struct AnalyzeState<'a> {
+    storage: &'a dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_schema: &'a str,
+}
+
+/// Thin wrapper — resolves `expr` in `ctx` with no outer scopes and no state.
+///
+/// Sufficient for all non-subquery expressions (UPDATE SET, DELETE WHERE, etc.).
 fn resolve_expr(expr: Expr, ctx: &BindContext) -> Result<Expr, DbError> {
+    resolve_expr_full(expr, ctx, &[], None)
+}
+
+/// Resolves column references in `expr` against `ctx` (inner scope) and
+/// `outer_scopes` (enclosing query scopes, outermost last).
+///
+/// `state` must be `Some(...)` for any query that may contain subquery expressions
+/// (`Expr::Subquery`, `Expr::InSubquery`, `Expr::Exists`). When `state` is `None`
+/// those arms return `DbError::NotImplemented`.
+///
+/// When a column is found in an outer scope but not `ctx`, it is emitted as
+/// `Expr::OuterColumn` — a correlated reference the executor substitutes with the
+/// outer row before executing the inner query.
+///
+/// Only depth-1 correlation is supported (Phase 4.11). Deeper nesting returns
+/// `DbError::NotImplemented`.
+fn resolve_expr_full(
+    expr: Expr,
+    ctx: &BindContext,
+    outer_scopes: &[&BindContext],
+    state: Option<&AnalyzeState<'_>>,
+) -> Result<Expr, DbError> {
     match expr {
         Expr::Literal(v) => Ok(Expr::Literal(v)),
 
         Expr::Column { col_idx: _, name } => {
-            // If no tables in scope (SELECT without FROM), column refs are invalid
-            // unless it's a literal context — but the parser doesn't allow bare
-            // column refs without FROM, so this only happens in edge cases.
-            if ctx.tables.is_empty() {
+            // 1. Try the inner (current) scope first.
+            if !ctx.tables.is_empty() {
+                if let Ok(idx) = ctx.resolve_column(&name) {
+                    return Ok(Expr::Column { col_idx: idx, name });
+                }
+            }
+            // 2. Try outer scopes — emit OuterColumn if found.
+            for outer_ctx in outer_scopes {
+                if let Ok(idx) = outer_ctx.resolve_column(&name) {
+                    return Ok(Expr::OuterColumn { col_idx: idx, name });
+                }
+            }
+            // 3. Not found anywhere.
+            if ctx.tables.is_empty() && outer_scopes.is_empty() {
                 return Err(DbError::ColumnNotFound {
                     name: name.clone(),
                     table: "no tables in scope (missing FROM clause)".into(),
                 });
             }
-            let resolved_idx = ctx.resolve_column(&name)?;
-            Ok(Expr::Column {
-                col_idx: resolved_idx,
-                name,
-            })
+            // Delegate to ctx.resolve_column for the best error message.
+            ctx.resolve_column(&name).map(|_| unreachable!())?;
+            unreachable!()
         }
+
+        Expr::OuterColumn { .. } => Ok(expr), // already resolved — pass through
 
         Expr::UnaryOp { op, operand } => Ok(Expr::UnaryOp {
             op,
-            operand: Box::new(resolve_expr(*operand, ctx)?),
+            operand: Box::new(resolve_expr_full(*operand, ctx, outer_scopes, state)?),
         }),
 
         Expr::BinaryOp { op, left, right } => Ok(Expr::BinaryOp {
             op,
-            left: Box::new(resolve_expr(*left, ctx)?),
-            right: Box::new(resolve_expr(*right, ctx)?),
+            left: Box::new(resolve_expr_full(*left, ctx, outer_scopes, state)?),
+            right: Box::new(resolve_expr_full(*right, ctx, outer_scopes, state)?),
         }),
 
         Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
-            expr: Box::new(resolve_expr(*expr, ctx)?),
+            expr: Box::new(resolve_expr_full(*expr, ctx, outer_scopes, state)?),
             negated,
         }),
 
@@ -379,9 +425,9 @@ fn resolve_expr(expr: Expr, ctx: &BindContext) -> Result<Expr, DbError> {
             high,
             negated,
         } => Ok(Expr::Between {
-            expr: Box::new(resolve_expr(*expr, ctx)?),
-            low: Box::new(resolve_expr(*low, ctx)?),
-            high: Box::new(resolve_expr(*high, ctx)?),
+            expr: Box::new(resolve_expr_full(*expr, ctx, outer_scopes, state)?),
+            low: Box::new(resolve_expr_full(*low, ctx, outer_scopes, state)?),
+            high: Box::new(resolve_expr_full(*high, ctx, outer_scopes, state)?),
             negated,
         }),
 
@@ -390,8 +436,8 @@ fn resolve_expr(expr: Expr, ctx: &BindContext) -> Result<Expr, DbError> {
             pattern,
             negated,
         } => Ok(Expr::Like {
-            expr: Box::new(resolve_expr(*expr, ctx)?),
-            pattern: Box::new(resolve_expr(*pattern, ctx)?),
+            expr: Box::new(resolve_expr_full(*expr, ctx, outer_scopes, state)?),
+            pattern: Box::new(resolve_expr_full(*pattern, ctx, outer_scopes, state)?),
             negated,
         }),
 
@@ -400,10 +446,10 @@ fn resolve_expr(expr: Expr, ctx: &BindContext) -> Result<Expr, DbError> {
             list,
             negated,
         } => {
-            let expr = Box::new(resolve_expr(*expr, ctx)?);
+            let expr = Box::new(resolve_expr_full(*expr, ctx, outer_scopes, state)?);
             let list = list
                 .into_iter()
-                .map(|e| resolve_expr(e, ctx))
+                .map(|e| resolve_expr_full(e, ctx, outer_scopes, state))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Expr::In {
                 expr,
@@ -415,7 +461,7 @@ fn resolve_expr(expr: Expr, ctx: &BindContext) -> Result<Expr, DbError> {
         Expr::Function { name, args } => {
             let args = args
                 .into_iter()
-                .map(|a| resolve_expr(a, ctx))
+                .map(|a| resolve_expr_full(a, ctx, outer_scopes, state))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Expr::Function { name, args })
         }
@@ -425,22 +471,21 @@ fn resolve_expr(expr: Expr, ctx: &BindContext) -> Result<Expr, DbError> {
             when_thens,
             else_result,
         } => {
-            // Resolve column references in the base expression (simple CASE).
             let operand = operand
-                .map(|e| resolve_expr(*e, ctx).map(Box::new))
+                .map(|e| resolve_expr_full(*e, ctx, outer_scopes, state).map(Box::new))
                 .transpose()?;
-
-            // Resolve column references in all WHEN and THEN sub-expressions.
             let when_thens = when_thens
                 .into_iter()
-                .map(|(w, t)| Ok((resolve_expr(w, ctx)?, resolve_expr(t, ctx)?)))
+                .map(|(w, t)| {
+                    Ok((
+                        resolve_expr_full(w, ctx, outer_scopes, state)?,
+                        resolve_expr_full(t, ctx, outer_scopes, state)?,
+                    ))
+                })
                 .collect::<Result<Vec<_>, DbError>>()?;
-
-            // Resolve column references in the ELSE branch.
             let else_result = else_result
-                .map(|e| resolve_expr(*e, ctx).map(Box::new))
+                .map(|e| resolve_expr_full(*e, ctx, outer_scopes, state).map(Box::new))
                 .transpose()?;
-
             Ok(Expr::Case {
                 operand,
                 when_thens,
@@ -449,14 +494,94 @@ fn resolve_expr(expr: Expr, ctx: &BindContext) -> Result<Expr, DbError> {
         }
 
         Expr::Cast { expr, target } => Ok(Expr::Cast {
-            expr: Box::new(resolve_expr(*expr, ctx)?),
+            expr: Box::new(resolve_expr_full(*expr, ctx, outer_scopes, state)?),
             target,
         }),
+
+        // ── Subquery variants ────────────────────────────────────────────────
+        //
+        // The inner SELECT is analyzed with `ctx` pushed as an outer scope so
+        // that column references to the enclosing query become `OuterColumn`.
+        // Depth-1 correlated subqueries are fully supported.
+        // Depth > 1 correlated subqueries fail at executor time with a clear
+        // "unsubstituted OuterColumn" error (Phase 6 will fix this).
+        // Uncorrelated subqueries at any depth work correctly.
+        Expr::Subquery(inner) => {
+            let st = state.ok_or_else(|| DbError::NotImplemented {
+                feature: "subqueries require an analyze context (not available here)".into(),
+            })?;
+            let mut extended: Vec<&BindContext> = outer_scopes.to_vec();
+            extended.push(ctx);
+            let analyzed = analyze_select_with_outer(
+                *inner,
+                st.storage,
+                st.snapshot,
+                st.default_schema,
+                &extended,
+            )?;
+            Ok(Expr::Subquery(Box::new(analyzed)))
+        }
+
+        Expr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => {
+            let st = state.ok_or_else(|| DbError::NotImplemented {
+                feature: "subqueries require an analyze context (not available here)".into(),
+            })?;
+            let expr = Box::new(resolve_expr_full(*expr, ctx, outer_scopes, Some(st))?);
+            let mut extended: Vec<&BindContext> = outer_scopes.to_vec();
+            extended.push(ctx);
+            let analyzed = analyze_select_with_outer(
+                *query,
+                st.storage,
+                st.snapshot,
+                st.default_schema,
+                &extended,
+            )?;
+            Ok(Expr::InSubquery {
+                expr,
+                query: Box::new(analyzed),
+                negated,
+            })
+        }
+
+        Expr::Exists { query, negated } => {
+            let st = state.ok_or_else(|| DbError::NotImplemented {
+                feature: "subqueries require an analyze context (not available here)".into(),
+            })?;
+            let mut extended: Vec<&BindContext> = outer_scopes.to_vec();
+            extended.push(ctx);
+            let analyzed = analyze_select_with_outer(
+                *query,
+                st.storage,
+                st.snapshot,
+                st.default_schema,
+                &extended,
+            )?;
+            Ok(Expr::Exists {
+                query: Box::new(analyzed),
+                negated,
+            })
+        }
     }
 }
 
+/// Convenience wrapper for `Option<Expr>` with no outer scopes and no state.
 fn resolve_opt_expr(expr: Option<Expr>, ctx: &BindContext) -> Result<Option<Expr>, DbError> {
     expr.map(|e| resolve_expr(e, ctx)).transpose()
+}
+
+/// Convenience wrapper for `Option<Expr>` with full state threading.
+fn resolve_opt_expr_full(
+    expr: Option<Expr>,
+    ctx: &BindContext,
+    outer_scopes: &[&BindContext],
+    state: Option<&AnalyzeState<'_>>,
+) -> Result<Option<Expr>, DbError> {
+    expr.map(|e| resolve_expr_full(e, ctx, outer_scopes, state))
+        .transpose()
 }
 
 // ── Statement analysis ────────────────────────────────────────────────────────
@@ -491,23 +616,64 @@ fn analyze_stmt(
 
 // ── SELECT ────────────────────────────────────────────────────────────────────
 
+/// Public entry for analyzing a SELECT with no outer scopes.
+///
+/// Delegates to [`analyze_select_with_outer`] with an empty outer-scope slice.
 fn analyze_select(
-    mut s: SelectStmt,
+    s: SelectStmt,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
     default_schema: &str,
 ) -> Result<SelectStmt, DbError> {
+    analyze_select_with_outer(s, storage, snapshot, default_schema, &[])
+}
+
+/// Analyze a SELECT statement, threading `outer_scopes` through every expression
+/// so that correlated column references produce `Expr::OuterColumn` nodes.
+///
+/// Called recursively for subqueries: when a subquery is encountered inside
+/// `resolve_expr_full`, the current `BindContext` is appended to `outer_scopes`
+/// and this function is invoked on the inner `SelectStmt`.
+fn analyze_select_with_outer(
+    mut s: SelectStmt,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_schema: &str,
+    outer_scopes: &[&BindContext],
+) -> Result<SelectStmt, DbError> {
     // Build resolution context from FROM and JOINs.
     let ctx = build_context(&s.from, &s.joins, storage, snapshot, default_schema)?;
+
+    // If FROM is a derived table (subquery in FROM), `build_context` analyzed
+    // the inner query to extract virtual column names, but did NOT store the
+    // analyzed version back into `s.from`. Fix that here so the executor
+    // receives the analyzed inner query with correct `col_idx` values.
+    if let Some(FromClause::Subquery { query, alias }) = s.from {
+        let analyzed_inner =
+            analyze_select_with_outer(*query, storage, snapshot, default_schema, outer_scopes)?;
+        s.from = Some(FromClause::Subquery {
+            query: Box::new(analyzed_inner),
+            alias,
+        });
+    }
+
+    // AnalyzeState is needed so that subquery arms inside expressions can
+    // recurse back into analyze_select_with_outer.
+    let state = AnalyzeState {
+        storage,
+        snapshot,
+        default_schema,
+    };
 
     // Resolve JOIN conditions.
     let mut resolved_joins = Vec::with_capacity(s.joins.len());
     for mut join in s.joins {
         join.condition = match join.condition {
-            JoinCondition::On(expr) => JoinCondition::On(resolve_expr(expr, &ctx)?),
+            JoinCondition::On(expr) => {
+                JoinCondition::On(resolve_expr_full(expr, &ctx, outer_scopes, Some(&state))?)
+            }
             JoinCondition::Using(cols) => {
-                // Validate each column exists in both joined tables.
-                // (Detailed validation deferred — just pass through for now.)
+                // Detailed column-by-column validation deferred (Phase 4.22).
                 JoinCondition::Using(cols)
             }
         };
@@ -516,24 +682,24 @@ fn analyze_select(
     s.joins = resolved_joins;
 
     // Resolve WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET.
-    s.where_clause = resolve_opt_expr(s.where_clause, &ctx)?;
+    s.where_clause = resolve_opt_expr_full(s.where_clause, &ctx, outer_scopes, Some(&state))?;
     s.group_by = s
         .group_by
         .into_iter()
-        .map(|e| resolve_expr(e, &ctx))
+        .map(|e| resolve_expr_full(e, &ctx, outer_scopes, Some(&state)))
         .collect::<Result<_, _>>()?;
-    s.having = resolve_opt_expr(s.having, &ctx)?;
+    s.having = resolve_opt_expr_full(s.having, &ctx, outer_scopes, Some(&state))?;
 
     // Resolve ORDER BY.
     let mut resolved_order = Vec::with_capacity(s.order_by.len());
     for mut item in s.order_by {
-        item.expr = resolve_expr(item.expr, &ctx)?;
+        item.expr = resolve_expr_full(item.expr, &ctx, outer_scopes, Some(&state))?;
         resolved_order.push(item);
     }
     s.order_by = resolved_order;
 
-    s.limit = resolve_opt_expr(s.limit, &ctx)?;
-    s.offset = resolve_opt_expr(s.offset, &ctx)?;
+    s.limit = resolve_opt_expr_full(s.limit, &ctx, outer_scopes, Some(&state))?;
+    s.offset = resolve_opt_expr_full(s.offset, &ctx, outer_scopes, Some(&state))?;
 
     // Resolve SELECT list.
     let mut resolved_cols = Vec::with_capacity(s.columns.len());
@@ -550,7 +716,7 @@ fn analyze_select(
                 item
             }
             SelectItem::Expr { expr, alias } => SelectItem::Expr {
-                expr: resolve_expr(expr, &ctx)?,
+                expr: resolve_expr_full(expr, &ctx, outer_scopes, Some(&state))?,
                 alias,
             },
         };

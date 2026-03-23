@@ -22,7 +22,51 @@ use axiomdb_types::{
     Value,
 };
 
-use crate::expr::{BinaryOp, Expr, UnaryOp};
+use crate::{
+    ast::SelectStmt,
+    expr::{BinaryOp, Expr, UnaryOp},
+    result::QueryResult,
+};
+
+// ── SubqueryRunner ────────────────────────────────────────────────────────────
+
+/// Provides subquery execution to [`eval_with`].
+///
+/// Implement this trait for a type that can execute a [`SelectStmt`] and return
+/// its result. Use [`NoSubquery`] where subqueries are impossible; the compiler
+/// monomorphizes `eval_with::<NoSubquery>` and eliminates all subquery branches
+/// at zero runtime cost.
+pub trait SubqueryRunner {
+    fn run(&mut self, stmt: &SelectStmt) -> Result<QueryResult, DbError>;
+}
+
+/// Zero-cost runner for expression contexts that cannot contain subqueries.
+///
+/// `eval(expr, row)` uses this, so subquery `Expr` variants encountered by the
+/// pure evaluator return `NotImplemented` instead of panicking.
+pub struct NoSubquery;
+
+impl SubqueryRunner for NoSubquery {
+    fn run(&mut self, _: &SelectStmt) -> Result<QueryResult, DbError> {
+        Err(DbError::NotImplemented {
+            feature: "subquery in expression context — use eval_with instead of eval".into(),
+        })
+    }
+}
+
+/// Wrapper so a `FnMut` closure can be used as a [`SubqueryRunner`].
+pub struct ClosureRunner<F>(pub F)
+where
+    F: FnMut(&SelectStmt) -> Result<QueryResult, DbError>;
+
+impl<F> SubqueryRunner for ClosureRunner<F>
+where
+    F: FnMut(&SelectStmt) -> Result<QueryResult, DbError>,
+{
+    fn run(&mut self, stmt: &SelectStmt) -> Result<QueryResult, DbError> {
+        (self.0)(stmt)
+    }
+}
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -180,6 +224,322 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
                 None => Ok(Value::Null),
             }
         }
+
+        // Subquery variants — delegate to SubqueryRunner (NoSubquery returns NotImplemented).
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {
+            eval_with(expr, row, &mut NoSubquery)
+        }
+
+        // OuterColumn must be substituted by the executor before eval() is called.
+        Expr::OuterColumn { name, col_idx } => Err(DbError::Internal {
+            message: format!(
+                "unsubstituted OuterColumn '{name}' (col_idx={col_idx}) — \
+                 substitute_outer must be called before executing the inner query"
+            ),
+        }),
+    }
+}
+
+// ── eval_with — subquery-aware evaluator ──────────────────────────────────────
+
+/// Evaluates `expr` against `row` using `sq` to execute any subquery nodes.
+///
+/// This is the primary evaluator for expressions that may contain subqueries.
+/// All compound nodes (`AND`, `OR`, `CASE`, etc.) recurse through `eval_with`
+/// so that subqueries nested at any depth are correctly dispatched to `sq`.
+///
+/// ## SubqueryRunner
+///
+/// The `sq` parameter is called for each subquery node. The executor builds
+/// a [`ClosureRunner`] that captures `storage`, `txn`, and `SessionContext`,
+/// performing outer-row substitution before executing the inner query.
+///
+/// Use `eval(expr, row)` (which calls `eval_with(expr, row, &mut NoSubquery)`)
+/// for expression contexts that are provably subquery-free.
+pub fn eval_with<R: SubqueryRunner>(
+    expr: &Expr,
+    row: &[Value],
+    sq: &mut R,
+) -> Result<Value, DbError> {
+    match expr {
+        Expr::Literal(v) => Ok(v.clone()),
+
+        Expr::Column { col_idx, name: _ } => {
+            row.get(*col_idx)
+                .cloned()
+                .ok_or(DbError::ColumnIndexOutOfBounds {
+                    idx: *col_idx,
+                    len: row.len(),
+                })
+        }
+
+        Expr::OuterColumn { col_idx, name } => Err(DbError::Internal {
+            message: format!(
+                "unsubstituted OuterColumn '{name}' (col_idx={col_idx}) — \
+                 substitute_outer must be called before executing the inner query"
+            ),
+        }),
+
+        Expr::UnaryOp { op, operand } => {
+            let v = eval_with(operand, row, sq)?;
+            eval_unary(*op, v)
+        }
+
+        Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => eval_and_with(left, right, row, sq),
+
+        Expr::BinaryOp {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } => eval_or_with(left, right, row, sq),
+
+        Expr::BinaryOp { op, left, right } => {
+            let l = eval_with(left, row, sq)?;
+            let r = eval_with(right, row, sq)?;
+            eval_binary(*op, l, r)
+        }
+
+        Expr::IsNull { expr, negated } => {
+            let v = eval_with(expr, row, sq)?;
+            let is_null = matches!(v, Value::Null);
+            Ok(Value::Bool(if *negated { !is_null } else { is_null }))
+        }
+
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let v = eval_with(expr, row, sq)?;
+            let lo = eval_with(low, row, sq)?;
+            let hi = eval_with(high, row, sq)?;
+            let ge = eval_binary(BinaryOp::GtEq, v.clone(), lo)?;
+            let le = eval_binary(BinaryOp::LtEq, v, hi)?;
+            let result = apply_and_values(ge, le);
+            Ok(if *negated { apply_not(result) } else { result })
+        }
+
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let v = eval_with(expr, row, sq)?;
+            let p = eval_with(pattern, row, sq)?;
+            match (v, p) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Text(text), Value::Text(pat)) => {
+                    let matched = like_match(&text, &pat);
+                    Ok(Value::Bool(if *negated { !matched } else { matched }))
+                }
+                (v, p) => Err(DbError::TypeMismatch {
+                    expected: "Text LIKE Text".into(),
+                    got: format!("{} LIKE {}", v.variant_name(), p.variant_name()),
+                }),
+            }
+        }
+
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => {
+            let v = eval_with(expr, row, sq)?;
+            let result = eval_in_with(v, list, row, sq)?;
+            Ok(if *negated { apply_not(result) } else { result })
+        }
+
+        Expr::Function { name, args } => eval_function(name, args, row),
+
+        Expr::Cast { expr, target } => {
+            let v = eval_with(expr, row, sq)?;
+            coerce(v, *target, CoercionMode::Strict)
+        }
+
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => {
+            match operand {
+                None => {
+                    for (when_expr, then_expr) in when_thens {
+                        let condition = eval_with(when_expr, row, sq)?;
+                        if is_truthy(&condition) {
+                            return eval_with(then_expr, row, sq);
+                        }
+                    }
+                }
+                Some(base_expr) => {
+                    let base_val = eval_with(base_expr, row, sq)?;
+                    for (val_expr, then_expr) in when_thens {
+                        let val = eval_with(val_expr, row, sq)?;
+                        let eq = eval_binary(BinaryOp::Eq, base_val.clone(), val)?;
+                        if is_truthy(&eq) {
+                            return eval_with(then_expr, row, sq);
+                        }
+                    }
+                }
+            }
+            match else_result {
+                Some(else_expr) => eval_with(else_expr, row, sq),
+                None => Ok(Value::Null),
+            }
+        }
+
+        // ── Subquery variants ──────────────────────────────────────────────────
+        Expr::Subquery(stmt) => {
+            let result = sq.run(stmt)?;
+            match result {
+                QueryResult::Rows { rows, .. } => match rows.len() {
+                    0 => Ok(Value::Null),
+                    1 => rows
+                        .into_iter()
+                        .next()
+                        .and_then(|r| r.into_iter().next())
+                        .ok_or_else(|| DbError::Internal {
+                            message: "scalar subquery returned an empty row".into(),
+                        }),
+                    n => Err(DbError::CardinalityViolation { count: n }),
+                },
+                _ => Err(DbError::Internal {
+                    message: "scalar subquery did not return a Rows result".into(),
+                }),
+            }
+        }
+
+        Expr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => {
+            let left = eval_with(expr, row, sq)?;
+            if matches!(left, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let result = sq.run(query)?;
+            let subquery_rows = match result {
+                QueryResult::Rows { rows, .. } => rows,
+                _ => vec![],
+            };
+            let mut found = false;
+            let mut has_null = false;
+            for sq_row in &subquery_rows {
+                let v = sq_row.first().cloned().unwrap_or(Value::Null);
+                match v {
+                    Value::Null => has_null = true,
+                    ref iv if *iv == left => {
+                        found = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let raw = if found {
+                Value::Bool(true)
+            } else if has_null {
+                Value::Null
+            } else {
+                Value::Bool(false)
+            };
+            Ok(if *negated {
+                match raw {
+                    Value::Bool(b) => Value::Bool(!b),
+                    other => other, // NULL stays NULL
+                }
+            } else {
+                raw
+            })
+        }
+
+        Expr::Exists { query, negated } => {
+            let result = sq.run(query)?;
+            let has_rows = matches!(&result, QueryResult::Rows { rows, .. } if !rows.is_empty());
+            Ok(Value::Bool(if *negated { !has_rows } else { has_rows }))
+        }
+    }
+}
+
+// ── Short-circuit AND/OR with subquery support ────────────────────────────────
+
+fn eval_and_with<R: SubqueryRunner>(
+    left: &Expr,
+    right: &Expr,
+    row: &[Value],
+    sq: &mut R,
+) -> Result<Value, DbError> {
+    let l = eval_with(left, row, sq)?;
+    match l {
+        Value::Bool(false) => Ok(Value::Bool(false)),
+        Value::Bool(true) => eval_with(right, row, sq),
+        Value::Null => {
+            let r = eval_with(right, row, sq)?;
+            Ok(match r {
+                Value::Bool(false) => Value::Bool(false),
+                _ => Value::Null,
+            })
+        }
+        other => Err(DbError::TypeMismatch {
+            expected: "Bool".into(),
+            got: other.variant_name().into(),
+        }),
+    }
+}
+
+fn eval_or_with<R: SubqueryRunner>(
+    left: &Expr,
+    right: &Expr,
+    row: &[Value],
+    sq: &mut R,
+) -> Result<Value, DbError> {
+    let l = eval_with(left, row, sq)?;
+    match l {
+        Value::Bool(true) => Ok(Value::Bool(true)),
+        Value::Bool(false) => eval_with(right, row, sq),
+        Value::Null => {
+            let r = eval_with(right, row, sq)?;
+            Ok(match r {
+                Value::Bool(true) => Value::Bool(true),
+                _ => Value::Null,
+            })
+        }
+        other => Err(DbError::TypeMismatch {
+            expected: "Bool".into(),
+            got: other.variant_name().into(),
+        }),
+    }
+}
+
+fn eval_in_with<R: SubqueryRunner>(
+    v: Value,
+    list: &[Expr],
+    row: &[Value],
+    sq: &mut R,
+) -> Result<Value, DbError> {
+    if matches!(v, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let mut has_null_in_list = false;
+    for item_expr in list {
+        let item = eval_with(item_expr, row, sq)?;
+        match item {
+            Value::Null => has_null_in_list = true,
+            ref iv => match compare_values(&v, iv) {
+                Ok(std::cmp::Ordering::Equal) => return Ok(Value::Bool(true)),
+                Ok(_) => {}
+                Err(_) => {}
+            },
+        }
+    }
+    if has_null_in_list {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Bool(false))
     }
 }
 

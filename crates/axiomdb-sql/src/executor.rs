@@ -49,12 +49,169 @@ use crate::{
         DropTableStmt, FromClause, InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType,
         NullsOrder, OrderByItem, SelectItem, SelectStmt, SortOrder, Stmt, UpdateStmt,
     },
-    eval::{eval, is_truthy},
+    eval::{eval, eval_with, is_truthy, SubqueryRunner},
     expr::{BinaryOp, Expr},
     result::{ColumnMeta, QueryResult, Row},
     session::SessionContext,
     table::TableEngine,
 };
+
+// ── Subquery execution support ────────────────────────────────────────────────
+
+/// Walks a `SelectStmt` AST and substitutes every `Expr::OuterColumn { col_idx }`
+/// with `Expr::Literal(outer_row[col_idx])`, producing a fully self-contained
+/// statement ready for inner execution.
+///
+/// Called once per outer row for correlated subqueries. Uncorrelated subqueries
+/// contain no `OuterColumn` nodes — `substitute_outer` is a no-op for them.
+fn substitute_outer(mut stmt: SelectStmt, outer_row: &[Value]) -> SelectStmt {
+    stmt.where_clause = stmt.where_clause.map(|e| subst_expr(e, outer_row));
+    stmt.columns = stmt
+        .columns
+        .into_iter()
+        .map(|item| match item {
+            SelectItem::Expr { expr, alias } => SelectItem::Expr {
+                expr: subst_expr(expr, outer_row),
+                alias,
+            },
+            other => other,
+        })
+        .collect();
+    stmt.having = stmt.having.map(|e| subst_expr(e, outer_row));
+    stmt.group_by = stmt
+        .group_by
+        .into_iter()
+        .map(|e| subst_expr(e, outer_row))
+        .collect();
+    stmt.order_by = stmt
+        .order_by
+        .into_iter()
+        .map(|mut item| {
+            item.expr = subst_expr(item.expr, outer_row);
+            item
+        })
+        .collect();
+    stmt.joins = stmt
+        .joins
+        .into_iter()
+        .map(|mut join| {
+            use crate::ast::JoinCondition;
+            join.condition = match join.condition {
+                JoinCondition::On(e) => JoinCondition::On(subst_expr(e, outer_row)),
+                other => other,
+            };
+            join
+        })
+        .collect();
+    stmt
+}
+
+/// Recursively replaces `OuterColumn` nodes with `Literal` values from `outer_row`.
+fn subst_expr(expr: Expr, outer_row: &[Value]) -> Expr {
+    match expr {
+        Expr::OuterColumn { col_idx, .. } => {
+            Expr::Literal(outer_row.get(col_idx).cloned().unwrap_or(Value::Null))
+        }
+        // Compound nodes — recurse.
+        Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+            op,
+            operand: Box::new(subst_expr(*operand, outer_row)),
+        },
+        Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+            op,
+            left: Box::new(subst_expr(*left, outer_row)),
+            right: Box::new(subst_expr(*right, outer_row)),
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(subst_expr(*expr, outer_row)),
+            negated,
+        },
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(subst_expr(*expr, outer_row)),
+            low: Box::new(subst_expr(*low, outer_row)),
+            high: Box::new(subst_expr(*high, outer_row)),
+            negated,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(subst_expr(*expr, outer_row)),
+            pattern: Box::new(subst_expr(*pattern, outer_row)),
+            negated,
+        },
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => Expr::In {
+            expr: Box::new(subst_expr(*expr, outer_row)),
+            list: list.into_iter().map(|e| subst_expr(e, outer_row)).collect(),
+            negated,
+        },
+        Expr::Function { name, args } => Expr::Function {
+            name,
+            args: args.into_iter().map(|a| subst_expr(a, outer_row)).collect(),
+        },
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => Expr::Case {
+            operand: operand.map(|e| Box::new(subst_expr(*e, outer_row))),
+            when_thens: when_thens
+                .into_iter()
+                .map(|(w, t)| (subst_expr(w, outer_row), subst_expr(t, outer_row)))
+                .collect(),
+            else_result: else_result.map(|e| Box::new(subst_expr(*e, outer_row))),
+        },
+        Expr::Cast { expr, target } => Expr::Cast {
+            expr: Box::new(subst_expr(*expr, outer_row)),
+            target,
+        },
+        Expr::Subquery(inner) => Expr::Subquery(Box::new(substitute_outer(*inner, outer_row))),
+        Expr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => Expr::InSubquery {
+            expr: Box::new(subst_expr(*expr, outer_row)),
+            query: Box::new(substitute_outer(*query, outer_row)),
+            negated,
+        },
+        Expr::Exists { query, negated } => Expr::Exists {
+            query: Box::new(substitute_outer(*query, outer_row)),
+            negated,
+        },
+        // Leaf nodes — no substitution needed.
+        other => other,
+    }
+}
+
+/// [`SubqueryRunner`] that executes inner queries through the executor,
+/// substituting outer-row references before running.
+///
+/// Holds mutable refs to `storage`, `txn`, and `ctx`, plus the current
+/// outer row for `substitute_outer`. Created fresh for each outer row.
+struct ExecSubqueryRunner<'a> {
+    storage: &'a mut dyn StorageEngine,
+    txn: &'a mut TxnManager,
+    ctx: &'a mut SessionContext,
+    outer_row: &'a [Value],
+}
+
+impl<'a> SubqueryRunner for ExecSubqueryRunner<'a> {
+    fn run(&mut self, stmt: &SelectStmt) -> Result<QueryResult, DbError> {
+        let bound = substitute_outer(stmt.clone(), self.outer_row);
+        execute_select_ctx(bound, self.storage, self.txn, self.ctx)
+    }
+}
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -244,12 +401,19 @@ fn execute_select_ctx(
         )?;
 
         let snap = txn.active_snapshot()?;
+        // scan_table returns owned Vec — storage is free after this call.
         let raw_rows = TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?;
 
         let mut combined_rows: Vec<Row> = Vec::new();
         for (_rid, values) in raw_rows {
             if let Some(ref wc) = stmt.where_clause {
-                if !is_truthy(&eval(wc, &values)?) {
+                let mut runner = ExecSubqueryRunner {
+                    storage,
+                    txn,
+                    ctx,
+                    outer_row: &values,
+                };
+                if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
                     continue;
                 }
             }
@@ -265,7 +429,15 @@ fn execute_select_ctx(
         let out_cols = build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
         let mut rows = combined_rows
             .iter()
-            .map(|v| project_row(&stmt.columns, v))
+            .map(|v| {
+                let mut runner = ExecSubqueryRunner {
+                    storage,
+                    txn,
+                    ctx,
+                    outer_row: v,
+                };
+                project_row_with(&stmt.columns, v, &mut runner)
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         if stmt.distinct {
@@ -658,12 +830,21 @@ fn execute_select(
     // Dispatch based on FROM clause type and whether JOINs are present.
     if stmt.from.is_none() {
         // ── SELECT without FROM ───────────────────────────────────────────────
+        // Subqueries in the SELECT list (EXISTS, IN subquery, scalar subquery)
+        // require a runner; we use a temporary SessionContext.
+        let mut temp_ctx = SessionContext::new();
+        let mut runner = ExecSubqueryRunner {
+            storage,
+            txn,
+            ctx: &mut temp_ctx,
+            outer_row: &[],
+        };
         let mut out_row: Row = Vec::new();
         let mut out_cols: Vec<ColumnMeta> = Vec::new();
         for item in &stmt.columns {
             match item {
                 SelectItem::Expr { expr, alias } => {
-                    let v = eval(expr, &[])?;
+                    let v = eval_with(expr, &[], &mut runner)?;
                     let name = alias
                         .clone()
                         .unwrap_or_else(|| expr_column_name(expr, None));
@@ -689,15 +870,12 @@ fn execute_select(
         });
     }
 
-    // FROM is present — check for subquery vs table.
+    // FROM is present — handle derived table (subquery in FROM) or real table.
     if matches!(stmt.from, Some(FromClause::Subquery { .. })) {
-        return Err(DbError::NotImplemented {
-            feature: "subquery in FROM — Phase 4.11".into(),
-        });
+        return execute_select_derived(stmt, storage, txn);
     }
 
     // Extract the FROM table reference.
-    // `stmt` still owns everything; destructure only what we need.
     let from_table_ref = match stmt.from.take() {
         Some(FromClause::Table(tref)) => tref,
         _ => unreachable!("already handled None and Subquery above"),
@@ -711,38 +889,50 @@ fn execute_select(
         };
 
         let snap = txn.active_snapshot()?;
+        // scan_table returns owned Vec — storage is free after this call.
         let raw_rows = TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?;
 
-        // Collect post-WHERE combined rows (not yet projected).
         let mut combined_rows: Vec<Row> = Vec::new();
         for (_rid, values) in raw_rows {
             if let Some(ref wc) = stmt.where_clause {
-                if !is_truthy(&eval(wc, &values)?) {
+                let mut temp_ctx = SessionContext::new();
+                let mut runner = ExecSubqueryRunner {
+                    storage,
+                    txn,
+                    ctx: &mut temp_ctx,
+                    outer_row: &values,
+                };
+                if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
                     continue;
                 }
             }
             combined_rows.push(values);
         }
 
-        // Branch: aggregation or direct projection.
         if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
             return execute_select_grouped(stmt, combined_rows);
         }
 
-        // Sort source rows before projection (ORDER BY evaluated on source col_idx).
         combined_rows = apply_order_by(combined_rows, &stmt.order_by)?;
 
         let out_cols = build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
         let mut rows = combined_rows
             .iter()
-            .map(|v| project_row(&stmt.columns, v))
+            .map(|v| {
+                let mut temp_ctx = SessionContext::new();
+                let mut runner = ExecSubqueryRunner {
+                    storage,
+                    txn,
+                    ctx: &mut temp_ctx,
+                    outer_row: v,
+                };
+                project_row_with(&stmt.columns, v, &mut runner)
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // DISTINCT deduplication (after projection, before LIMIT).
         if stmt.distinct {
             rows = apply_distinct(rows);
         }
-        // LIMIT/OFFSET applied after deduplication.
         rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 
         Ok(QueryResult::Rows {
@@ -753,6 +943,75 @@ fn execute_select(
         // ── Multi-table JOIN path ─────────────────────────────────────────────
         execute_select_with_joins(stmt, from_table_ref, storage, txn)
     }
+}
+
+/// Executes a SELECT whose FROM clause is a derived table: `FROM (SELECT ...) AS alias`.
+///
+/// The inner query is executed to produce a materialized set of rows, which are
+/// then treated as a virtual table for the outer query's WHERE / GROUP BY / ORDER BY.
+fn execute_select_derived(
+    mut stmt: SelectStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+) -> Result<QueryResult, DbError> {
+    let (inner_query, _alias) = match stmt.from.take() {
+        Some(FromClause::Subquery { query, alias }) => (*query, alias),
+        _ => unreachable!("execute_select_derived called with non-subquery FROM"),
+    };
+
+    // Execute the inner query to materialize the derived table.
+    let mut temp_ctx = SessionContext::new();
+    let inner_result = execute_select_ctx(inner_query, storage, txn, &mut temp_ctx)?;
+    let (derived_cols, derived_rows) = match inner_result {
+        QueryResult::Rows { columns, rows } => (columns, rows),
+        _ => {
+            return Err(DbError::Internal {
+                message: "derived table inner query did not return rows".into(),
+            })
+        }
+    };
+
+    // Apply outer WHERE.
+    let mut combined_rows: Vec<Row> = Vec::new();
+    for values in derived_rows {
+        if let Some(ref wc) = stmt.where_clause {
+            let mut temp_ctx2 = SessionContext::new();
+            let mut runner = ExecSubqueryRunner {
+                storage,
+                txn,
+                ctx: &mut temp_ctx2,
+                outer_row: &values,
+            };
+            if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
+                continue;
+            }
+        }
+        combined_rows.push(values);
+    }
+
+    // GROUP BY / aggregation.
+    if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
+        return execute_select_grouped(stmt, combined_rows);
+    }
+
+    combined_rows = apply_order_by(combined_rows, &stmt.order_by)?;
+
+    // Build output columns from SELECT list against derived column metadata.
+    let out_cols = build_derived_output_columns(&stmt.columns, &derived_cols)?;
+    let mut rows = combined_rows
+        .iter()
+        .map(|v| project_row(&stmt.columns, v))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if stmt.distinct {
+        rows = apply_distinct(rows);
+    }
+    rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
+
+    Ok(QueryResult::Rows {
+        columns: out_cols,
+        rows,
+    })
 }
 
 // ── JOIN execution ───────────────────────────────────────────────────────────
@@ -1205,7 +1464,10 @@ fn contains_aggregate(expr: &Expr) -> bool {
                 || else_result.as_deref().is_some_and(contains_aggregate)
         }
         Expr::Cast { expr, .. } => contains_aggregate(expr),
-        Expr::Literal(_) | Expr::Column { .. } => false,
+        Expr::Literal(_) | Expr::Column { .. } | Expr::OuterColumn { .. } => false,
+        // Subquery internals are analyzed independently; aggregates inside them
+        // do not count as aggregates of the outer query.
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => false,
     }
 }
 
@@ -1313,7 +1575,9 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
             }
         }
         Expr::Cast { expr, .. } => collect_agg_exprs_from(expr, result),
-        Expr::Literal(_) | Expr::Column { .. } | Expr::Like { .. } => {}
+        Expr::Literal(_) | Expr::Column { .. } | Expr::Like { .. } | Expr::OuterColumn { .. } => {}
+        // Aggregates inside a subquery belong to the inner query, not the outer.
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {}
     }
 }
 
@@ -2463,8 +2727,22 @@ fn build_select_column_meta(
     Ok(out)
 }
 
-/// Projects a raw heap row through a SELECT item list to produce the output row.
+/// Projects a row through a SELECT item list (no subquery support).
 fn project_row(items: &[SelectItem], values: &[Value]) -> Result<Row, DbError> {
+    project_row_with(items, values, &mut crate::eval::NoSubquery)
+}
+
+/// Subquery-aware version of [`project_row`].
+///
+/// Uses `eval_with` so that scalar subqueries in the SELECT list
+/// (e.g., `(SELECT COUNT(*) FROM orders WHERE user_id = u.id)`) are executed
+/// via `sq`. Performance identical to `project_row` when using [`NoSubquery`]
+/// due to monomorphization.
+fn project_row_with<R: SubqueryRunner>(
+    items: &[SelectItem],
+    values: &[Value],
+    sq: &mut R,
+) -> Result<Row, DbError> {
     let mut out = Vec::new();
     for item in items {
         match item {
@@ -2472,7 +2750,33 @@ fn project_row(items: &[SelectItem], values: &[Value]) -> Result<Row, DbError> {
                 out.extend_from_slice(values);
             }
             SelectItem::Expr { expr, .. } => {
-                out.push(eval(expr, values)?);
+                out.push(eval_with(expr, values, sq)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Builds output column metadata for a SELECT over a derived table
+/// (`FROM (SELECT ...) AS alias`).
+///
+/// `SELECT *` expands to the derived table's own column metadata.
+/// `SELECT expr [AS alias]` uses the alias or the expression name.
+fn build_derived_output_columns(
+    items: &[SelectItem],
+    derived_cols: &[ColumnMeta],
+) -> Result<Vec<ColumnMeta>, DbError> {
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                out.extend_from_slice(derived_cols);
+            }
+            SelectItem::Expr { expr, alias } => {
+                let name = alias
+                    .clone()
+                    .unwrap_or_else(|| expr_column_name(expr, None));
+                out.push(ColumnMeta::computed(name, axiomdb_types::DataType::Text));
             }
         }
     }

@@ -20,6 +20,7 @@ members = [
     "crates/axiomdb-migrations",
     "crates/axiomdb-server",
     "crates/axiomdb-embedded",
+    "benches/comparison/axiomdb_bench",
 ]
 
 [workspace.package]
