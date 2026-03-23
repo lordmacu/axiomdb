@@ -211,6 +211,7 @@
 - [ ] 7.14 ⏳ Cascading rollback prevention — if txn A aborts and txn B read data from A (dirty read), B must also abort; verify that READ COMMITTED prevents this structurally
 - [ ] 7.15 ⏳ Basic transaction ID overflow prevention — `txn_id` is u64; log warning at 50% and 90% of capacity; plan for VACUUM FREEZE (complete in Phase 34) but detection must be early
 - [ ] 7.16 ⏳ Historical reads — `BEGIN READ ONLY AS OF TIMESTAMP '2023-12-31 23:59:59'` anchors the snapshot to a past point; MVCC already has the data, this adds the SQL syntax and executor support; critical for auditing financial data at a specific date without exporting first
+- [ ] 7.17 ⏳ Optimistic locking / Compare-And-Swap — `UPDATE t SET qty=qty-1, ver=ver+1 WHERE id=? AND ver=? AND qty>0` returns 0 rows if version changed; explicit `SELECT ... FOR UPDATE SKIP LOCKED` for job queues; gaming inventory, e-commerce checkout, concurrent reservations all depend on this pattern without full serializable isolation
 
 ---
 
@@ -318,6 +319,10 @@
 - [ ] 14.9 ⏳ Content-addressed BLOB store — SHA256 of blob bytes = content key; separate content-store area in the .db file (beyond the heap); on BLOB insert: compute SHA256 → lookup in content index → if found: increment ref_count + store only the 32-byte hash in the BLOB_REF (header=0x02) → if not found: write bytes once + ref_count=1; two rows with identical photo share exactly one copy on disk; transparent to SQL layer — `SELECT photo` returns the full bytes regardless of backend
 - [ ] 14.10 ⏳ BLOB garbage collector — periodic scan of content store ref_counts; blobs with ref_count=0 are reclaimed; integrates with MVCC vacuum cycle (runs after dead-tuple vacuum so rollback of inserts correctly decrements); safe under concurrent reads (ref_count never drops to 0 while a snapshot can see the blob)
 - [ ] 14.11 ⏳ BLOB dedup metrics — `SELECT * FROM nexus_blob_stats` returns: `total_blobs`, `unique_blobs`, `dedup_ratio`, `bytes_saved`, `avg_blob_size`; helps users understand storage efficiency and decide whether to enable/disable dedup per table (`WITH (blob_dedup = off)`)
+- [ ] 14.12 ⏳ IoT: LAST(value ORDER BY ts) aggregate — returns the most recent value per group ordered by timestamp; `SELECT device_id, LAST(temperature ORDER BY recorded_at) FROM readings GROUP BY device_id`; different from MAX; essential for "current state" dashboards of sensors, vehicles, wearables
+- [ ] 14.13 ⏳ IoT: Dead-band / change-only recording — `CREATE TABLE sensors WITH (dead_band_col = temp, dead_band = 0.5)`; engine skips INSERT when value differs from previous by less than threshold; reduces storage 80-95% for slowly-changing sensors without any application changes
+- [ ] 14.14 ⏳ IoT: Gap filling and interpolation — `INTERPOLATE(value, 'locf' | 'linear' | 'step')` fills NULL gaps from sensor disconnections; LOCF = last observation carried forward; essential for charting and ML pipelines that require continuous time series
+- [ ] 14.15 ⏳ IoT: EVERY interval syntax — `SELECT AVG(temp) EVERY '5 minutes' FROM sensors WHERE ts > NOW() - INTERVAL '1 day'`; declarative downsampling without explicit GROUP BY FLOOR(EXTRACT(EPOCH FROM ts)/300); reduces query complexity for time-bucketed analytics
 
 ### Phase 15 — MongoDB + DoltDB + Arrow `⏳` week 34-35
 - [ ] 15.1 ⏳ Change streams CDC — tail the WAL, emit Insert/Update/Delete events
@@ -358,6 +363,12 @@
 - [ ] 17.12 ⏳ Log levels and rotation — trace/debug/info/warn/error + daily rotation
 - [ ] 17.13 ⏳ SQL injection prevention — mandatory prepared statements in wire protocol; detect and block direct interpolation in internal APIs
 - [ ] 17.14 ⏳ Security tests — RLS bypass attempts, brute force, SQL injection, privilege escalation
+- [ ] 17.15 ⏳ Column-level encryption — `CREATE TABLE patients (name TEXT, ssn TEXT ENCRYPTED WITH KEY 'k1')`; encryption/decryption happens inside the engine using AES-256-GCM; ciphertext stored on disk; plaintext only visible in query results to authorized roles; key rotation without full table rewrite; healthcare (HIPAA), HR, legal all require this for PII fields
+- [ ] 17.16 ⏳ Dynamic data masking — `CREATE MASKING POLICY mask_ssn ON patients (ssn) USING MASKED WITH ('***-**-' || RIGHT(ssn,4))`; different roles see different representations of the same column without changing stored data; `SELECT ssn FROM patients` returns real value to admins, masked value to analysts; no application code changes required
+- [ ] 17.17 ⏳ Column-level GRANT — `GRANT SELECT (name, email, created_at) ON patients TO nurse_role`; deny access to diagnosis, ssn, medication columns for that role; currently Phase 17.2 grants at table level only; column-level is required when different departments have different sensitivity levels
+- [ ] 17.18 ⏳ Consent-based row access — `CREATE POLICY patient_consent ON records USING (has_consent(patient_id, CURRENT_USER))`; patient explicitly grants a specific doctor access to their records; revoking consent immediately removes access; beyond standard RLS — the USING expression calls a user-defined consent table
+- [ ] 17.19 ⏳ GDPR physical purge — `DELETE PERMANENTLY FROM patients WHERE id = 42 PURGE ALL VERSIONS`; with MVCC, normal DELETE leaves historical versions visible to old snapshots; PURGE physically overwrites all pages containing that row's versions across all WAL history; required for GDPR right-to-erasure and CCPA; audit entry records the purge but not the data
+- [ ] 17.20 ⏳ Digital signatures on rows — `SELECT SIGN_ROW(contract_id) FROM contracts` embeds an HMAC of the row's content + timestamp + signer_id; `VERIFY_ROW(contract_id)` returns TRUE if content matches signature; tamper detection for legal documents, audit logs, financial records; signatures stored alongside the row in the heap
 
 ---
 
@@ -412,6 +423,12 @@
 - [ ] 20.7 ⏳ Incremental backup — diff from last backup + full restore
 - [ ] 20.8 ⏳ COPY streaming — import CSV/JSON line-by-line without loading into memory; support files >RAM
 - [ ] 20.9 ⏳ Parquet write — export query result to Parquet with Snappy/Zstd compression; useful for data pipelines
+- [ ] 20.10 ⏳ GENERATE_SERIES — `SELECT * FROM GENERATE_SERIES(1, 100)` and `GENERATE_SERIES('2024-01-01'::date, '2024-12-31', '1 month')`; fill calendar gaps, generate synthetic data, pivot by time period; used in reporting, IoT dashboards, financial calendars; no app-side loop needed
+- [ ] 20.11 ⏳ TABLESAMPLE — `SELECT * FROM users TABLESAMPLE SYSTEM(1)` returns ~1% of rows with minimal I/O (page-level sampling); `TABLESAMPLE BERNOULLI(0.1)` for row-level random sampling; A/B testing, statistical analysis, ML train/test splits, approximate analytics on large tables without full scan
+- [ ] 20.12 ⏳ ORDER BY RANDOM() — `SELECT * FROM items WHERE rarity='epic' ORDER BY RANDOM() LIMIT 5`; random ordering using Fisher-Yates shuffle on result set; gaming loot drops, quiz randomization, A/B test group assignment, recommendation diversity; simple but missing from current plan
+- [ ] 20.13 ⏳ Range types — `int4range`, `int8range`, `numrange`, `daterange`, `tsrange`; operators: `@>` (contains), `&&` (overlaps), `+` (union), `*` (intersection), `-` (difference); hotel booking systems (no overlapping reservations), salary bands, price ranges, event scheduling; stored compactly as two values + bounds
+- [ ] 20.14 ⏳ UNNEST — `SELECT id, UNNEST(tags) AS tag FROM posts`; expands an array column into multiple rows; joins with array elements, search by tag, pivot unnested data; complement to Phase 20.4 (ARRAY types)
+- [ ] 20.15 ⏳ Regex in queries — `~` (match), `~*` (case-insensitive match), `!~` (not match), `REGEXP_MATCH(str, pattern)`, `REGEXP_REPLACE(str, pattern, replacement)`; more powerful than LIKE; legal document pattern extraction, log parsing, data validation, address/email format checking
 
 ### Phase 21 — Advanced SQL `⏳` week 49-51
 - [ ] 21.1 ⏳ Savepoints — `SAVEPOINT`, `ROLLBACK TO`, `RELEASE`
@@ -443,12 +460,17 @@
 
 ## BLOCK 7 — Product Features (Phases 22-23)
 
-### Phase 22 — Vector search + advanced search `⏳` week 52-54
+### Phase 22 — Vector search + advanced search + GIS `⏳` week 52-54
 - [ ] 22.1 ⏳ Vector similarity — `VECTOR(n)`, operators `<=>`, `<->`, `<#>`
 - [ ] 22.2 ⏳ HNSW index — `CREATE INDEX USING hnsw(col vector_cosine_ops)`
 - [ ] 22.3 ⏳ Fuzzy search — `SIMILARITY()`, trigrams, `LEVENSHTEIN()`
 - [ ] 22.4 ⏳ ANN benchmarks — compare HNSW vs pgvector vs FAISS on recall@10 and QPS; document quality/speed tradeoff
 - [ ] 22.5 ⏳ IVFFlat alternative index — lower RAM option than HNSW for collections >10M vectors
+- [ ] 22.6 ⏳ GIS: Spatial data types — POINT, LINESTRING, POLYGON, MULTIPOINT, MULTIPOLYGON, GEOMETRY; stored compactly as WKB (Well-Known Binary); implements nexusdb-geo crate (currently stub); required by every delivery, store-locator, logistics, real-estate, and fleet-management application
+- [ ] 22.7 ⏳ GIS: R-Tree spatial index — `CREATE INDEX ON locations USING rtree(coords)`; O(log n) bounding box queries; without this every spatial query is a full table scan; enables `WHERE ST_DWithin(location, point, 5000)` in milliseconds over millions of points
+- [ ] 22.8 ⏳ GIS: Core spatial functions — `ST_Distance`, `ST_Within`, `ST_Contains`, `ST_Intersects`, `ST_Area`, `ST_Length`, `ST_Buffer`, `ST_Union`, `ST_AsText`, `ST_GeomFromText`; the minimum vocabulary for geographic queries; `SELECT * FROM stores WHERE ST_Distance(location, ST_Point(-74.0, 40.7)) < 5000`
+- [ ] 22.9 ⏳ GIS: Coordinate system support — WGS84 (GPS coordinates) and local projections; `ST_Transform(geom, 4326)` converts between SRID systems; without this distances are in degrees instead of meters
+- [ ] 22.10 ⏳ GIS: Spatial benchmarks — compare range query and nearest-neighbor vs PostGIS on 1M point dataset; document performance characteristics
 
 ### Phase 22b — Platform features `⏳` week 55-57
 - [ ] 22b.1 ⏳ Scheduled jobs — `cron_schedule()` with `tokio-cron-scheduler`
