@@ -94,10 +94,11 @@ the "Max acceptable" column is a blocker.
 | Row codec encode | **33M rows/s** ✅ | — | — | 4 |
 | Expr eval (scan 1K rows) | **14.8M rows/s** ✅ | — | — | 4 |
 
-Operations marked **TBD** require the executor (Phase 5) to be measurable with real I/O:
-- Full query throughput (SELECT with filter + projection)
-- INSERT end-to-end (parse → analyze → execute → WAL → heap write)
-- Concurrent write throughput
+**Executor operations** (Phase 4 complete — end-to-end benchmarks pending integration with
+MmapStorage + WAL in the benchmark harness):
+- Full query throughput (SELECT with filter + projection) — executor implemented; benchmark harness uses MemoryStorage
+- INSERT end-to-end (parse → analyze → execute → WAL → heap write) — 195K ops/s measured on B+Tree layer; full executor path pending benchmark
+- Concurrent write throughput — single-writer in Phase 4; SSI concurrency in Phase 7
 
 ---
 

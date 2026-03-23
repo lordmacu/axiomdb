@@ -14,9 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed:** Phase 4 (partial) — SQL Parser + Semantic Analyzer
+**Last completed:** Phase 4 (near-complete, ~44%) — Full SQL executor with SELECT/INSERT/UPDATE/DELETE, JOIN, GROUP BY + aggregates, ORDER BY + LIMIT, DISTINCT, CASE WHEN, INSERT SELECT
 
-**Active development:** Phase 5 — Executor (planned)
+**Active development:** Phase 4 (remaining: GROUP F–I) — scalar functions, SHOW/DESCRIBE, ALTER TABLE, TRUNCATE, SQL test suite
+
+**Next milestone:** Phase 5 — MySQL wire protocol (TCP :3306, handshake, COM_QUERY)
 
 ---
 
