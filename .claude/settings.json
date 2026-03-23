@@ -28,6 +28,18 @@
     ]
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/cristian/nexusdb/.claude/check-docs-before-commit.sh",
+            "statusMessage": "Verificando docs antes de commit..."
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write",

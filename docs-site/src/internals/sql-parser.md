@@ -198,6 +198,7 @@ stmt → select_stmt | insert_stmt | update_stmt | delete_stmt
      | create_table_stmt | create_index_stmt
      | drop_table_stmt | drop_index_stmt
      | alter_table_stmt | truncate_stmt
+     | show_tables_stmt | show_columns_stmt
      | begin_stmt | commit_stmt | rollback_stmt | savepoint_stmt
 
 create_table_stmt →
@@ -222,6 +223,68 @@ table_constraint →
   | FOREIGN KEY LPAREN ident_list RPAREN REFERENCES ident LPAREN ident_list RPAREN
   | CHECK LPAREN expr RPAREN
   | CONSTRAINT ident (primary_key | unique | foreign_key | check)
+
+truncate_stmt →
+  TRUNCATE TABLE ident
+
+show_tables_stmt →
+  SHOW TABLES [FROM ident]
+
+show_columns_stmt →
+  SHOW COLUMNS FROM ident
+  | DESCRIBE ident
+  | DESC ident
+```
+
+### SHOW / DESCRIBE Parsing
+
+`SHOW` is a dedicated keyword (`Token::Show`). After consuming it, the parser
+peeks at the next token to dispatch:
+
+```
+parse_show():
+  consume Show
+  if peek = Ident("TABLES") | Ident("tables"):   // COLUMNS is not a reserved keyword
+    advance
+    schema = if eat(From): parse_ident() else "public"
+    return Stmt::ShowTables(ShowTablesStmt { schema })
+  if peek = Ident("COLUMNS") | Ident("columns"):
+    advance; expect(From); table = parse_ident()
+    return Stmt::ShowColumns(ShowColumnsStmt { table_name: table })
+  else:
+    return Err(ParseError { "expected TABLES or COLUMNS after SHOW" })
+```
+
+`DESCRIBE` and `DESC` are both tokenized as `Token::Describe` (the lexer
+aliases both spellings to the same token). The parser dispatches them directly
+to the `ShowColumns` AST node:
+
+```
+parse_stmt():
+  ...
+  Token::Describe => {
+    advance; table = parse_ident()
+    return Stmt::ShowColumns(ShowColumnsStmt { table_name: table })
+  }
+  ...
+```
+
+`COLUMNS` is not a reserved keyword in AxiomDB — a column or table named
+`columns` does not need quoting. The parser matches it by comparing the
+identifier string after lowercasing, not by token variant.
+
+### TRUNCATE Parsing
+
+`TRUNCATE` is tokenized as `Token::Truncate`. After consuming it, the parser
+expects the literal keyword `TABLE` (also a reserved token) and then the table
+name:
+
+```
+parse_truncate():
+  consume Truncate
+  expect(Table)
+  table_name = parse_ident()
+  return Stmt::Truncate(TruncateTableStmt { table_name })
 ```
 
 ### SELECT Grammar Sketch

@@ -436,6 +436,45 @@ LIMIT 20 OFFSET 40;   -- page 3 (0-indexed) of 20 items per page
 
 ### INSERT ... VALUES
 
+When a table has an `AUTO_INCREMENT` column, omit it from the column list and
+AxiomDB generates the next sequential ID automatically. Use `LAST_INSERT_ID()`
+(or the PostgreSQL alias `lastval()`) immediately after the INSERT to retrieve
+the generated value.
+
+```sql
+CREATE TABLE users (
+    id   BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name TEXT   NOT NULL
+);
+
+-- Single row — id is generated automatically
+INSERT INTO users (name) VALUES ('Alice');
+-- id=1
+
+SELECT LAST_INSERT_ID();   -- returns 1
+```
+
+For multi-row INSERT, `LAST_INSERT_ID()` returns the ID generated for the
+**first** row of the batch (MySQL semantics). Subsequent rows receive
+consecutive IDs.
+
+```sql
+INSERT INTO users (name) VALUES ('Bob'), ('Carol'), ('Dave');
+-- ids: 2, 3, 4
+SELECT LAST_INSERT_ID();   -- returns 2 (first of the batch)
+```
+
+Supplying an explicit non-NULL value in the AUTO_INCREMENT column bypasses the
+sequence and does not advance it.
+
+```sql
+INSERT INTO users (id, name) VALUES (100, 'Eve');
+-- id=100; sequence not advanced; next LAST_INSERT_ID() still returns 2
+```
+
+See [Expressions — Session Functions](expressions.md#session-functions) for
+full `LAST_INSERT_ID()` / `lastval()` semantics.
+
 ```sql
 -- Single row
 INSERT INTO users (name, email, age)
@@ -543,6 +582,105 @@ UPDATE users SET deleted_at = CURRENT_TIMESTAMP WHERE id = 7;
 > A DELETE without a WHERE clause removes **all rows**. For this use case,
 > `TRUNCATE TABLE` is faster and should be preferred when you intend to empty
 > a table entirely.
+
+---
+
+## TRUNCATE TABLE
+
+Removes all rows from a table and resets its `AUTO_INCREMENT` counter to 1.
+The table structure, indexes, and constraints are preserved.
+
+```sql
+TRUNCATE TABLE table_name;
+```
+
+```sql
+-- Empty a staging table before a fresh import
+TRUNCATE TABLE import_staging;
+
+-- After truncate, AUTO_INCREMENT restarts from 1
+CREATE TABLE counters (id INT AUTO_INCREMENT PRIMARY KEY, label TEXT);
+INSERT INTO counters (label) VALUES ('a'), ('b');  -- ids: 1, 2
+TRUNCATE TABLE counters;
+INSERT INTO counters (label) VALUES ('c');          -- id: 1 (reset)
+```
+
+`TRUNCATE TABLE` returns `Affected { count: 0 }`, matching MySQL convention.
+
+**TRUNCATE vs DELETE — when to use each:**
+
+| | `DELETE FROM t` | `TRUNCATE TABLE t` |
+|---|---|---|
+| Rows removed | All (without WHERE) | All |
+| WHERE clause | Supported | Not supported |
+| AUTO_INCREMENT | Not reset | Reset to 1 |
+| Rows affected | Returns actual count | Returns 0 |
+| Typical use | Conditional deletes | Full table wipe |
+
+---
+
+## SHOW TABLES
+
+Lists all tables in the current schema (or a named schema).
+
+```sql
+SHOW TABLES;
+SHOW TABLES FROM schema_name;
+```
+
+The result set has a single column named `Tables_in_<schema>`:
+
+```sql
+SHOW TABLES;
+-- Tables_in_public
+-- ────────────────
+-- users
+-- orders
+-- products
+-- order_items
+```
+
+---
+
+## SHOW COLUMNS / DESCRIBE
+
+Returns the column definitions of a table.
+
+```sql
+SHOW COLUMNS FROM table_name;
+DESCRIBE table_name;
+DESC table_name;            -- shorthand
+```
+
+All three forms are equivalent. The result has six columns:
+
+| Column    | Description                                           |
+|-----------|-------------------------------------------------------|
+| `Field`   | Column name                                           |
+| `Type`    | Data type as declared in `CREATE TABLE`               |
+| `Null`    | `YES` if the column accepts NULL, `NO` otherwise      |
+| `Key`     | `PRI` for primary key columns; empty otherwise (stub) |
+| `Default` | Default expression, or `NULL` if none (stub)          |
+| `Extra`   | `auto_increment` for AUTO_INCREMENT columns; empty otherwise |
+
+```sql
+CREATE TABLE users (
+    id   BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name TEXT   NOT NULL,
+    bio  TEXT
+);
+
+DESCRIBE users;
+-- Field  Type    Null  Key  Default  Extra
+-- ─────────────────────────────────────────────────
+-- id     BIGINT  NO    PRI  NULL     auto_increment
+-- name   TEXT    NO         NULL
+-- bio    TEXT    YES        NULL
+```
+
+> The `Key` and `Default` columns are stubs in the current release and do not
+> yet reflect all constraints or computed defaults. Full metadata is tracked
+> internally in the catalog and will be exposed in a future release.
 
 ---
 

@@ -87,15 +87,53 @@ CREATE TABLE accounts (
 
 #### AUTO_INCREMENT / SERIAL
 
-Automatically generates a monotonically increasing integer. These are equivalent:
+Automatically generates a monotonically increasing integer for each new row.
+The counter starts at 1 and increments by 1 for each inserted row. The following
+forms are all equivalent:
 
 ```sql
--- MySQL-style (both accepted)
+-- MySQL-style
 id BIGINT PRIMARY KEY AUTO_INCREMENT
 
--- PostgreSQL-style shorthand
-id SERIAL PRIMARY KEY       -- equivalent to: id INT NOT NULL DEFAULT nextval()
-id BIGSERIAL PRIMARY KEY    -- equivalent to: id BIGINT NOT NULL DEFAULT nextval()
+-- PostgreSQL-style shorthand (SERIAL = INT AUTO_INCREMENT, BIGSERIAL = BIGINT AUTO_INCREMENT)
+id SERIAL    PRIMARY KEY
+id BIGSERIAL PRIMARY KEY
+```
+
+**Behavior:**
+
+```sql
+CREATE TABLE users (
+    id   BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name TEXT   NOT NULL
+);
+
+-- Omit the AUTO_INCREMENT column — the engine generates the value
+INSERT INTO users (name) VALUES ('Alice');   -- id = 1
+INSERT INTO users (name) VALUES ('Bob');     -- id = 2
+
+-- Retrieve the last generated ID (current session only)
+SELECT LAST_INSERT_ID();   -- returns 2
+SELECT lastval();          -- PostgreSQL alias — same result
+
+-- Multi-row INSERT: LAST_INSERT_ID() returns the ID of the FIRST row in the batch
+INSERT INTO users (name) VALUES ('Carol'), ('Dave');  -- ids: 3, 4
+SELECT LAST_INSERT_ID();   -- returns 3
+
+-- Explicit non-NULL value bypasses the sequence and does NOT advance it
+INSERT INTO users (id, name) VALUES (100, 'Eve');
+-- id=100; sequence remains at 4; next auto id will be 5
+```
+
+`LAST_INSERT_ID()` returns `0` if no auto-increment INSERT has been performed
+in the current session. See [LAST_INSERT_ID() in expressions](expressions.md#session-functions)
+for the full function reference.
+
+**TRUNCATE resets the counter:**
+
+```sql
+TRUNCATE TABLE users;
+INSERT INTO users (name) VALUES ('Frank');  -- id = 1 (reset by TRUNCATE)
 ```
 
 #### REFERENCES — Foreign Keys
@@ -366,11 +404,25 @@ ALTER TABLE orders DROP CONSTRAINT chk_positive_total;
 
 ## TRUNCATE TABLE
 
-Removes all rows from a table without dropping its structure. Faster than
-`DELETE FROM table` for large tables because it does not generate individual
-WAL entries for each row.
+Removes all rows from a table without dropping its structure, and resets the
+`AUTO_INCREMENT` counter to 1. The table schema, indexes, and constraints are
+preserved.
 
 ```sql
-TRUNCATE TABLE import_staging;
-TRUNCATE TABLE import_staging RESTART IDENTITY;  -- also resets AUTO_INCREMENT counters
+TRUNCATE TABLE table_name;
 ```
+
+```sql
+-- Wipe a staging table before re-importing
+TRUNCATE TABLE import_staging;
+
+-- AUTO_INCREMENT is always reset after TRUNCATE
+CREATE TABLE log_events (id INT AUTO_INCREMENT PRIMARY KEY, msg TEXT);
+INSERT INTO log_events (msg) VALUES ('start'), ('end');  -- ids: 1, 2
+TRUNCATE TABLE log_events;
+INSERT INTO log_events (msg) VALUES ('restart');          -- id: 1
+```
+
+Returns `Affected { count: 0 }` (MySQL convention). See also
+[TRUNCATE TABLE in the DML reference](dml.md#truncate-table) for a comparison
+with `DELETE FROM table`.
