@@ -16,6 +16,7 @@ pub mod expr;
 pub mod lexer;
 pub mod parser;
 pub mod result;
+pub mod session;
 pub mod table;
 
 pub use ast::{
@@ -26,11 +27,12 @@ pub use ast::{
     SortOrder, Stmt, TableConstraint, TableRef, TruncateTableStmt, UpdateStmt,
 };
 pub use eval::{eval, is_truthy};
+pub use executor::{execute, execute_with_ctx};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lexer::{tokenize, Span, SpannedToken, Token};
 // Note: Token<'src> and SpannedToken<'src> carry a lifetime tied to the input string.
 pub use analyzer::analyze;
-pub use executor::execute;
 pub use parser::parse;
 pub use result::{ColumnMeta, QueryResult, Row};
+pub use session::SessionContext;
 pub use table::TableEngine;

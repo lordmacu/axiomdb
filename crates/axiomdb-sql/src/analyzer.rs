@@ -447,6 +447,11 @@ fn resolve_expr(expr: Expr, ctx: &BindContext) -> Result<Expr, DbError> {
                 else_result,
             })
         }
+
+        Expr::Cast { expr, target } => Ok(Expr::Cast {
+            expr: Box::new(resolve_expr(*expr, ctx)?),
+            target,
+        }),
     }
 }
 

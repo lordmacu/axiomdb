@@ -36,7 +36,7 @@ use std::collections::HashMap;
 
 use axiomdb_catalog::{
     schema::{ColumnDef as CatalogColumnDef, ColumnType, IndexDef, TableDef},
-    CatalogReader, CatalogWriter, SchemaResolver,
+    CatalogReader, CatalogWriter, ResolvedTable, SchemaResolver,
 };
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
 use axiomdb_storage::{Page, PageType, StorageEngine};
@@ -52,6 +52,7 @@ use crate::{
     eval::{eval, is_truthy},
     expr::{BinaryOp, Expr},
     result::{ColumnMeta, QueryResult, Row},
+    session::SessionContext,
     table::TableEngine,
 };
 
@@ -109,6 +110,495 @@ pub fn execute(
             }
         }
     }
+}
+
+// ── execute_with_ctx ──────────────────────────────────────────────────────────
+
+/// Like [`execute`] but uses a persistent [`SessionContext`] for schema caching.
+///
+/// Prefer this over `execute` for workloads that run many statements on the
+/// same connection. The `SessionContext` caches `ResolvedTable` values across
+/// calls, eliminating the O(n) catalog heap scan on every DML statement.
+///
+/// DDL statements (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`)
+/// automatically invalidate the full schema cache before executing, so the
+/// next lookup sees the updated catalog.
+pub fn execute_with_ctx(
+    stmt: Stmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    if txn.active_txn_id().is_some() {
+        dispatch_ctx(stmt, storage, txn, ctx)
+    } else {
+        match stmt {
+            Stmt::Begin => {
+                txn.begin()?;
+                Ok(QueryResult::Empty)
+            }
+            Stmt::Commit => Err(DbError::NoActiveTransaction),
+            Stmt::Rollback => Err(DbError::NoActiveTransaction),
+            other => {
+                txn.begin()?;
+                match dispatch_ctx(other, storage, txn, ctx) {
+                    Ok(result) => {
+                        txn.commit()?;
+                        Ok(result)
+                    }
+                    Err(e) => {
+                        let _ = txn.rollback(storage);
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Routes a statement to its handler using a `SessionContext` for schema caching.
+fn dispatch_ctx(
+    stmt: Stmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    match stmt {
+        Stmt::Select(s) => execute_select_ctx(s, storage, txn, ctx),
+        Stmt::Insert(s) => execute_insert_ctx(s, storage, txn, ctx),
+        Stmt::Update(s) => execute_update_ctx(s, storage, txn, ctx),
+        Stmt::Delete(s) => execute_delete_ctx(s, storage, txn, ctx),
+        // DDL: invalidate cache, then delegate to existing handlers.
+        Stmt::CreateTable(s) => {
+            ctx.invalidate_all();
+            execute_create_table(s, storage, txn)
+        }
+        Stmt::DropTable(s) => {
+            ctx.invalidate_all();
+            execute_drop_table(s, storage, txn)
+        }
+        Stmt::CreateIndex(s) => {
+            ctx.invalidate_all();
+            execute_create_index(s, storage, txn)
+        }
+        Stmt::DropIndex(s) => {
+            ctx.invalidate_all();
+            execute_drop_index(s, storage, txn)
+        }
+        // Everything else: delegate to existing dispatch.
+        other => dispatch(other, storage, txn),
+    }
+}
+
+/// Resolves a table, using the session cache to avoid repeated catalog scans.
+///
+/// On cache miss, calls `make_resolver` and stores the result in `ctx`.
+fn resolve_table_cached(
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    ctx: &mut SessionContext,
+    schema: Option<&str>,
+    table_name: &str,
+) -> Result<ResolvedTable, DbError> {
+    let schema_str = schema.unwrap_or("public");
+    if let Some(cached) = ctx.get_table(schema_str, table_name) {
+        return Ok(cached.clone());
+    }
+    let resolver = make_resolver(storage, txn)?;
+    let resolved = resolver.resolve_table(schema, table_name)?;
+    ctx.cache_table(schema_str, table_name, resolved.clone());
+    Ok(resolved)
+}
+
+// ── ctx-aware DML handlers ────────────────────────────────────────────────────
+
+fn execute_select_ctx(
+    mut stmt: SelectStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    // SELECT without FROM: no table resolution needed.
+    if stmt.from.is_none() {
+        return execute_select(stmt, storage, txn);
+    }
+
+    // Subquery in FROM: no caching path yet — delegate.
+    if matches!(stmt.from, Some(FromClause::Subquery { .. })) {
+        return execute_select(stmt, storage, txn);
+    }
+
+    let from_table_ref = match stmt.from.take() {
+        Some(FromClause::Table(tref)) => tref,
+        _ => unreachable!("already handled None and Subquery above"),
+    };
+
+    if stmt.joins.is_empty() {
+        // Single-table path — use cache.
+        let resolved = resolve_table_cached(
+            storage,
+            txn,
+            ctx,
+            from_table_ref.schema.as_deref(),
+            &from_table_ref.name,
+        )?;
+
+        let snap = txn.active_snapshot()?;
+        let raw_rows = TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?;
+
+        let mut combined_rows: Vec<Row> = Vec::new();
+        for (_rid, values) in raw_rows {
+            if let Some(ref wc) = stmt.where_clause {
+                if !is_truthy(&eval(wc, &values)?) {
+                    continue;
+                }
+            }
+            combined_rows.push(values);
+        }
+
+        if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
+            return execute_select_grouped(stmt, combined_rows);
+        }
+
+        combined_rows = apply_order_by(combined_rows, &stmt.order_by)?;
+
+        let out_cols = build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
+        let mut rows = combined_rows
+            .iter()
+            .map(|v| project_row(&stmt.columns, v))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if stmt.distinct {
+            rows = apply_distinct(rows);
+        }
+        rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
+
+        Ok(QueryResult::Rows {
+            columns: out_cols,
+            rows,
+        })
+    } else {
+        // Multi-table JOIN path — use cache for each table.
+        execute_select_with_joins_ctx(stmt, from_table_ref, storage, txn, ctx)
+    }
+}
+
+fn execute_select_with_joins_ctx(
+    stmt: SelectStmt,
+    from_ref: crate::ast::TableRef,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let mut all_resolved: Vec<axiomdb_catalog::ResolvedTable> = Vec::new();
+    let mut col_offsets: Vec<usize> = Vec::new();
+    let mut running_offset = 0usize;
+
+    {
+        let from_t = resolve_table_cached(
+            storage,
+            txn,
+            ctx,
+            from_ref.schema.as_deref(),
+            &from_ref.name,
+        )?;
+        col_offsets.push(running_offset);
+        running_offset += from_t.columns.len();
+        all_resolved.push(from_t);
+
+        for join in &stmt.joins {
+            match &join.table {
+                FromClause::Table(tref) => {
+                    let jt = resolve_table_cached(
+                        storage,
+                        txn,
+                        ctx,
+                        tref.schema.as_deref(),
+                        &tref.name,
+                    )?;
+                    col_offsets.push(running_offset);
+                    running_offset += jt.columns.len();
+                    all_resolved.push(jt);
+                }
+                FromClause::Subquery { .. } => {
+                    return Err(DbError::NotImplemented {
+                        feature: "subquery in JOIN — Phase 4.11".into(),
+                    })
+                }
+            }
+        }
+    }
+
+    let snap = txn.active_snapshot()?;
+    let mut scanned: Vec<Vec<Row>> = Vec::with_capacity(all_resolved.len());
+    for t in &all_resolved {
+        let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap)?;
+        scanned.push(rows.into_iter().map(|(_, r)| r).collect());
+    }
+
+    let mut combined_rows: Vec<Row> = scanned[0].clone();
+    let mut left_col_count = all_resolved[0].columns.len();
+
+    let mut left_schema: Vec<(String, usize)> = all_resolved[0]
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.name.clone(), i))
+        .collect();
+
+    for (i, join) in stmt.joins.iter().enumerate() {
+        if join.join_type == JoinType::Full {
+            return Err(DbError::NotImplemented {
+                feature: "FULL OUTER JOIN — Phase 4.8+".into(),
+            });
+        }
+
+        let right_idx = i + 1;
+        let right_col_count = all_resolved[right_idx].columns.len();
+        let right_col_offset = col_offsets[right_idx];
+
+        combined_rows = apply_join(
+            combined_rows,
+            &scanned[right_idx],
+            left_col_count,
+            right_col_count,
+            join.join_type,
+            &join.condition,
+            &left_schema,
+            right_col_offset,
+            &all_resolved[right_idx].columns,
+        )?;
+
+        for (j, col) in all_resolved[right_idx].columns.iter().enumerate() {
+            left_schema.push((col.name.clone(), right_col_offset + j));
+        }
+        left_col_count += right_col_count;
+    }
+
+    if let Some(ref wc) = stmt.where_clause {
+        let mut filtered = Vec::with_capacity(combined_rows.len());
+        for row in combined_rows {
+            if is_truthy(&eval(wc, &row)?) {
+                filtered.push(row);
+            }
+        }
+        combined_rows = filtered;
+    }
+
+    if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
+        return execute_select_grouped(stmt, combined_rows);
+    }
+
+    combined_rows = apply_order_by(combined_rows, &stmt.order_by)?;
+
+    let out_cols = build_join_column_meta(&stmt.columns, &all_resolved, &stmt.joins)?;
+
+    let mut rows = combined_rows
+        .iter()
+        .map(|r| project_row(&stmt.columns, r))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if stmt.distinct {
+        rows = apply_distinct(rows);
+    }
+    rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
+
+    Ok(QueryResult::Rows {
+        columns: out_cols,
+        rows,
+    })
+}
+
+fn execute_insert_ctx(
+    stmt: InsertStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let resolved = resolve_table_cached(
+        storage,
+        txn,
+        ctx,
+        stmt.table.schema.as_deref(),
+        &stmt.table.name,
+    )?;
+
+    let schema_cols = &resolved.columns;
+
+    let col_positions: Vec<usize> = match &stmt.columns {
+        None => (0..schema_cols.len()).collect(),
+        Some(named_cols) => {
+            let mut map = vec![usize::MAX; schema_cols.len()];
+            for (val_pos, col_name) in named_cols.iter().enumerate() {
+                let schema_pos = schema_cols
+                    .iter()
+                    .position(|c| &c.name == col_name)
+                    .ok_or_else(|| DbError::ColumnNotFound {
+                        name: col_name.clone(),
+                        table: resolved.def.table_name.clone(),
+                    })?;
+                map[schema_pos] = val_pos;
+            }
+            map
+        }
+    };
+
+    let mut count = 0u64;
+
+    match stmt.source {
+        InsertSource::Values(rows) => {
+            for value_exprs in rows {
+                let provided: Vec<Value> = value_exprs
+                    .iter()
+                    .map(|e| eval(e, &[]))
+                    .collect::<Result<_, _>>()?;
+
+                let full_values: Vec<Value> = col_positions
+                    .iter()
+                    .map(|&idx| {
+                        if idx == usize::MAX {
+                            Value::Null
+                        } else {
+                            provided.get(idx).cloned().unwrap_or(Value::Null)
+                        }
+                    })
+                    .collect();
+
+                TableEngine::insert_row(storage, txn, &resolved.def, schema_cols, full_values)?;
+                count += 1;
+            }
+        }
+        InsertSource::Select(select_stmt) => {
+            let select_rows = match execute_select_ctx(*select_stmt, storage, txn, ctx)? {
+                QueryResult::Rows { rows, .. } => rows,
+                other => {
+                    return Err(DbError::Other(format!(
+                        "INSERT SELECT: expected Rows from SELECT, got {other:?}"
+                    )))
+                }
+            };
+            for row_values in select_rows {
+                let full_values: Vec<Value> = col_positions
+                    .iter()
+                    .map(|&idx| {
+                        if idx == usize::MAX {
+                            Value::Null
+                        } else {
+                            row_values.get(idx).cloned().unwrap_or(Value::Null)
+                        }
+                    })
+                    .collect();
+                TableEngine::insert_row(storage, txn, &resolved.def, schema_cols, full_values)?;
+                count += 1;
+            }
+        }
+        InsertSource::DefaultValues => {
+            return Err(DbError::NotImplemented {
+                feature: "DEFAULT VALUES — Phase 4.3c".into(),
+            })
+        }
+    }
+
+    Ok(QueryResult::Affected {
+        count,
+        last_insert_id: None,
+    })
+}
+
+fn execute_update_ctx(
+    stmt: UpdateStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let resolved = resolve_table_cached(
+        storage,
+        txn,
+        ctx,
+        stmt.table.schema.as_deref(),
+        &stmt.table.name,
+    )?;
+
+    let schema_cols = resolved.columns.clone();
+
+    let assignments: Vec<(usize, Expr)> = stmt
+        .assignments
+        .into_iter()
+        .map(|a| {
+            let pos = schema_cols
+                .iter()
+                .position(|c| c.name == a.column)
+                .ok_or_else(|| DbError::ColumnNotFound {
+                    name: a.column.clone(),
+                    table: resolved.def.table_name.clone(),
+                })?;
+            Ok((pos, a.value))
+        })
+        .collect::<Result<_, DbError>>()?;
+
+    let snap = txn.active_snapshot()?;
+    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
+
+    let mut count = 0u64;
+    for (rid, current_values) in rows {
+        if let Some(ref wc) = stmt.where_clause {
+            if !is_truthy(&eval(wc, &current_values)?) {
+                continue;
+            }
+        }
+        let mut new_values = current_values.clone();
+        for (col_pos, val_expr) in &assignments {
+            new_values[*col_pos] = eval(val_expr, &current_values)?;
+        }
+        TableEngine::update_row(storage, txn, &resolved.def, &schema_cols, rid, new_values)?;
+        count += 1;
+    }
+
+    Ok(QueryResult::Affected {
+        count,
+        last_insert_id: None,
+    })
+}
+
+fn execute_delete_ctx(
+    stmt: DeleteStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let resolved = resolve_table_cached(
+        storage,
+        txn,
+        ctx,
+        stmt.table.schema.as_deref(),
+        &stmt.table.name,
+    )?;
+
+    let schema_cols = resolved.columns.clone();
+    let snap = txn.active_snapshot()?;
+    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
+
+    let to_delete: Vec<RecordId> = rows
+        .into_iter()
+        .filter_map(|(rid, values)| match &stmt.where_clause {
+            None => Some(Ok(rid)),
+            Some(wc) => match eval(wc, &values) {
+                Ok(v) if is_truthy(&v) => Some(Ok(rid)),
+                Ok(_) => None,
+                Err(e) => Some(Err(e)),
+            },
+        })
+        .collect::<Result<_, DbError>>()?;
+
+    let count = to_delete.len() as u64;
+    for rid in to_delete {
+        TableEngine::delete_row(storage, txn, &resolved.def, rid)?;
+    }
+
+    Ok(QueryResult::Affected {
+        count,
+        last_insert_id: None,
+    })
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────────────
@@ -714,6 +1204,7 @@ fn contains_aggregate(expr: &Expr) -> bool {
                     .any(|(w, t)| contains_aggregate(w) || contains_aggregate(t))
                 || else_result.as_deref().is_some_and(contains_aggregate)
         }
+        Expr::Cast { expr, .. } => contains_aggregate(expr),
         Expr::Literal(_) | Expr::Column { .. } => false,
     }
 }
@@ -821,6 +1312,7 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
                 collect_agg_exprs_from(e, result);
             }
         }
+        Expr::Cast { expr, .. } => collect_agg_exprs_from(expr, result),
         Expr::Literal(_) | Expr::Column { .. } | Expr::Like { .. } => {}
     }
 }

@@ -17,7 +17,10 @@
 //! Use [`is_truthy`] to convert a result to a Rust `bool` for row filtering.
 
 use axiomdb_core::error::DbError;
-use axiomdb_types::{coerce::coerce_for_op, Value};
+use axiomdb_types::{
+    coerce::{coerce, coerce_for_op, CoercionMode},
+    Value,
+};
 
 use crate::expr::{BinaryOp, Expr, UnaryOp};
 
@@ -124,9 +127,13 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             Ok(if *negated { apply_not(result) } else { result })
         }
 
-        Expr::Function { name, .. } => Err(DbError::NotImplemented {
-            feature: format!("function '{name}' — implemented in Phase 4.19"),
-        }),
+        Expr::Function { name, args } => eval_function(name, args, row),
+
+        // ── CAST ──────────────────────────────────────────────────────────────
+        Expr::Cast { expr, target } => {
+            let v = eval(expr, row)?;
+            coerce(v, *target, CoercionMode::Strict)
+        }
 
         // ── CASE WHEN ─────────────────────────────────────────────────────────
         Expr::Case {
@@ -173,6 +180,873 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
                 None => Ok(Value::Null),
             }
         }
+    }
+}
+
+// ── Scalar function evaluator ─────────────────────────────────────────────────
+
+/// Evaluates a scalar function call against `row`.
+///
+/// Covers system functions (4.13), null-handling, numeric (4.19), string (4.19),
+/// date/time (4.19 partial), and type inspection functions.
+fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, DbError> {
+    match name.to_ascii_lowercase().as_str() {
+        // ── System functions (4.13) ─────────────────────────────────────────
+        "version" | "axiomdb_version" => Ok(Value::Text("AxiomDB 0.1.0".into())),
+        "current_user" | "user" | "session_user" | "system_user" => {
+            Ok(Value::Text("axiomdb".into()))
+        }
+        "current_database" | "database" => Ok(Value::Text("main".into())),
+        "current_schema" | "schema" => Ok(Value::Text("public".into())),
+        "connection_id" => Ok(Value::BigInt(1)),
+        "row_count" => Ok(Value::BigInt(0)),
+
+        // ── Null handling ────────────────────────────────────────────────────
+        "coalesce" | "ifnull" | "nvl" => {
+            for arg in args {
+                let v = eval(arg, row)?;
+                if !matches!(v, Value::Null) {
+                    return Ok(v);
+                }
+            }
+            Ok(Value::Null)
+        }
+        "nullif" => {
+            if args.len() != 2 {
+                return Err(DbError::TypeMismatch {
+                    expected: "2 arguments".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let a = eval(&args[0], row)?;
+            let b = eval(&args[1], row)?;
+            let eq = eval(
+                &Expr::BinaryOp {
+                    op: BinaryOp::Eq,
+                    left: Box::new(Expr::Literal(a.clone())),
+                    right: Box::new(Expr::Literal(b)),
+                },
+                &[],
+            )?;
+            Ok(if is_truthy(&eq) { Value::Null } else { a })
+        }
+        "isnull" => {
+            if args.is_empty() {
+                return Ok(Value::Bool(true));
+            }
+            let v = eval(&args[0], row)?;
+            Ok(Value::Bool(matches!(v, Value::Null)))
+        }
+        "if" | "iff" => {
+            if args.len() != 3 {
+                return Err(DbError::TypeMismatch {
+                    expected: "3 arguments for IF(cond, true_val, false_val)".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let cond = eval(&args[0], row)?;
+            if is_truthy(&cond) {
+                eval(&args[1], row)
+            } else {
+                eval(&args[2], row)
+            }
+        }
+
+        // ── Numeric functions (4.19) ─────────────────────────────────────────
+        "abs" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 argument".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Int(n) => Ok(Value::Int(n.abs())),
+                Value::BigInt(n) => Ok(Value::BigInt(n.abs())),
+                Value::Real(f) => Ok(Value::Real(f.abs())),
+                Value::Decimal(m, s) => Ok(Value::Decimal(m.abs(), s)),
+                other => Err(DbError::TypeMismatch {
+                    expected: "numeric".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "ceil" | "ceiling" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Int(n) => Ok(Value::Real(n as f64)),
+                Value::BigInt(n) => Ok(Value::Real(n as f64)),
+                Value::Real(f) => Ok(Value::Real(f.ceil())),
+                other => Err(DbError::TypeMismatch {
+                    expected: "numeric".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "floor" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Int(n) => Ok(Value::Real(n as f64)),
+                Value::BigInt(n) => Ok(Value::Real(n as f64)),
+                Value::Real(f) => Ok(Value::Real(f.floor())),
+                other => Err(DbError::TypeMismatch {
+                    expected: "numeric".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "round" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1+ args".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            let decimals = if args.len() > 1 {
+                match eval(&args[1], row)? {
+                    Value::Int(d) => d.max(0) as u32,
+                    Value::BigInt(d) => d.max(0) as u32,
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Int(n) => Ok(Value::Int(n)),
+                Value::BigInt(n) => Ok(Value::BigInt(n)),
+                Value::Real(f) => {
+                    let factor = 10f64.powi(decimals as i32);
+                    Ok(Value::Real((f * factor).round() / factor))
+                }
+                other => Err(DbError::TypeMismatch {
+                    expected: "numeric".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "pow" | "power" => {
+            if args.len() != 2 {
+                return Err(DbError::TypeMismatch {
+                    expected: "2 args".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let base = eval(&args[0], row)?;
+            let exp = eval(&args[1], row)?;
+            fn to_f64(v: Value) -> Option<f64> {
+                match v {
+                    Value::Null => None,
+                    Value::Int(n) => Some(n as f64),
+                    Value::BigInt(n) => Some(n as f64),
+                    Value::Real(f) => Some(f),
+                    _ => None,
+                }
+            }
+            match (to_f64(base), to_f64(exp)) {
+                (None, _) | (_, None) => Ok(Value::Null),
+                (Some(b), Some(e)) => Ok(Value::Real(b.powf(e))),
+            }
+        }
+        "sqrt" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Int(n) => Ok(Value::Real((n as f64).sqrt())),
+                Value::BigInt(n) => Ok(Value::Real((n as f64).sqrt())),
+                Value::Real(f) => Ok(Value::Real(f.sqrt())),
+                other => Err(DbError::TypeMismatch {
+                    expected: "numeric".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "mod" => {
+            if args.len() != 2 {
+                return Err(DbError::TypeMismatch {
+                    expected: "2 args".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let a = eval(&args[0], row)?;
+            let b = eval(&args[1], row)?;
+            eval(
+                &Expr::BinaryOp {
+                    op: BinaryOp::Mod,
+                    left: Box::new(Expr::Literal(a)),
+                    right: Box::new(Expr::Literal(b)),
+                },
+                &[],
+            )
+        }
+        "sign" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Int(n) => Ok(Value::Int(n.signum())),
+                Value::BigInt(n) => Ok(Value::BigInt(n.signum())),
+                Value::Real(f) => Ok(Value::Real(f.signum())),
+                other => Err(DbError::TypeMismatch {
+                    expected: "numeric".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+
+        // ── String functions (4.19) ──────────────────────────────────────────
+        "length" | "char_length" | "character_length" | "len" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::Int(s.chars().count() as i32)),
+                Value::Bytes(b) => Ok(Value::Int(b.len() as i32)),
+                other => Err(DbError::TypeMismatch {
+                    expected: "Text or Bytes".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "octet_length" | "byte_length" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::Int(s.len() as i32)),
+                Value::Bytes(b) => Ok(Value::Int(b.len() as i32)),
+                other => Err(DbError::TypeMismatch {
+                    expected: "Text or Bytes".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "upper" | "ucase" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::Text(s.to_uppercase())),
+                other => Err(DbError::TypeMismatch {
+                    expected: "Text".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "lower" | "lcase" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::Text(s.to_lowercase())),
+                other => Err(DbError::TypeMismatch {
+                    expected: "Text".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "trim" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::Text(s.trim().to_string())),
+                other => Err(DbError::TypeMismatch {
+                    expected: "Text".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "ltrim" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::Text(s.trim_start().to_string())),
+                other => Err(DbError::TypeMismatch {
+                    expected: "Text".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "rtrim" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::Text(s.trim_end().to_string())),
+                other => Err(DbError::TypeMismatch {
+                    expected: "Text".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "substr" | "substring" | "mid" => {
+            // SUBSTR(str, start[, length]) — 1-based indexing (SQL standard)
+            if args.is_empty() {
+                return Err(DbError::TypeMismatch {
+                    expected: "2-3 args".into(),
+                    got: "0".into(),
+                });
+            }
+            let s = match eval(&args[0], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s,
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Text".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
+            let start = if args.len() > 1 {
+                match eval(&args[1], row)? {
+                    Value::Int(n) => n as usize,
+                    Value::BigInt(n) => n as usize,
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(DbError::TypeMismatch {
+                            expected: "Int".into(),
+                            got: other.variant_name().into(),
+                        })
+                    }
+                }
+            } else {
+                1
+            };
+            let chars: Vec<char> = s.chars().collect();
+            let start_idx = if start == 0 {
+                0
+            } else {
+                (start - 1).min(chars.len())
+            };
+            let result = if args.len() > 2 {
+                match eval(&args[2], row)? {
+                    Value::Int(n) => chars[start_idx..]
+                        .iter()
+                        .take(n.max(0) as usize)
+                        .collect::<String>(),
+                    Value::BigInt(n) => chars[start_idx..]
+                        .iter()
+                        .take(n.max(0) as usize)
+                        .collect::<String>(),
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(DbError::TypeMismatch {
+                            expected: "Int".into(),
+                            got: other.variant_name().into(),
+                        })
+                    }
+                }
+            } else {
+                chars[start_idx..].iter().collect::<String>()
+            };
+            Ok(Value::Text(result))
+        }
+        "concat" => {
+            let mut result = String::new();
+            for arg in args {
+                match eval(arg, row)? {
+                    Value::Null => {} // SQL CONCAT skips NULLs (MySQL behavior)
+                    Value::Text(s) => result.push_str(&s),
+                    Value::Int(n) => result.push_str(&n.to_string()),
+                    Value::BigInt(n) => result.push_str(&n.to_string()),
+                    Value::Real(f) => result.push_str(&f.to_string()),
+                    other => result.push_str(&other.to_string()),
+                }
+            }
+            Ok(Value::Text(result))
+        }
+        "concat_ws" => {
+            // CONCAT_WS(separator, val1, val2, ...)
+            if args.is_empty() {
+                return Ok(Value::Text(String::new()));
+            }
+            let sep = match eval(&args[0], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s,
+                other => other.to_string(),
+            };
+            let mut parts: Vec<String> = Vec::new();
+            for a in &args[1..] {
+                match eval(a, row)? {
+                    Value::Null => {} // skip NULLs
+                    v => parts.push(v.to_string()),
+                }
+            }
+            Ok(Value::Text(parts.join(&sep)))
+        }
+        "repeat" | "replicate" => {
+            if args.len() != 2 {
+                return Err(DbError::TypeMismatch {
+                    expected: "2 args".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let s = match eval(&args[0], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s,
+                other => other.to_string(),
+            };
+            let n = match eval(&args[1], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => n.max(0) as usize,
+                Value::BigInt(n) => n.max(0) as usize,
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Int".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
+            Ok(Value::Text(s.repeat(n)))
+        }
+        "replace" => {
+            if args.len() != 3 {
+                return Err(DbError::TypeMismatch {
+                    expected: "3 args".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let s = match eval(&args[0], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s,
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Text".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
+            let from = match eval(&args[1], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s,
+                other => other.to_string(),
+            };
+            let to = match eval(&args[2], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s,
+                other => other.to_string(),
+            };
+            Ok(Value::Text(s.replace(&from, &to)))
+        }
+        "reverse" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::Text(s.chars().rev().collect())),
+                other => Err(DbError::TypeMismatch {
+                    expected: "Text".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "left" => {
+            if args.len() != 2 {
+                return Err(DbError::TypeMismatch {
+                    expected: "2 args".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let s = match eval(&args[0], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s,
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Text".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
+            let n = match eval(&args[1], row)? {
+                Value::Int(n) => n.max(0) as usize,
+                Value::BigInt(n) => n.max(0) as usize,
+                _ => 0,
+            };
+            Ok(Value::Text(s.chars().take(n).collect()))
+        }
+        "right" => {
+            if args.len() != 2 {
+                return Err(DbError::TypeMismatch {
+                    expected: "2 args".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let s = match eval(&args[0], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s,
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Text".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
+            let n = match eval(&args[1], row)? {
+                Value::Int(n) => n.max(0) as usize,
+                Value::BigInt(n) => n.max(0) as usize,
+                _ => 0,
+            };
+            let chars: Vec<char> = s.chars().collect();
+            let start = chars.len().saturating_sub(n);
+            Ok(Value::Text(chars[start..].iter().collect()))
+        }
+        "lpad" => {
+            if args.len() < 2 {
+                return Err(DbError::TypeMismatch {
+                    expected: "2-3 args".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let s = match eval(&args[0], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s,
+                other => other.to_string(),
+            };
+            let len = match eval(&args[1], row)? {
+                Value::Int(n) => n.max(0) as usize,
+                Value::BigInt(n) => n.max(0) as usize,
+                _ => 0,
+            };
+            let pad = if args.len() > 2 {
+                match eval(&args[2], row)? {
+                    Value::Text(s) => s,
+                    _ => " ".into(),
+                }
+            } else {
+                " ".into()
+            };
+            let chars: Vec<char> = s.chars().collect();
+            if chars.len() >= len {
+                return Ok(Value::Text(chars[..len].iter().collect()));
+            }
+            let needed = len - chars.len();
+            let pad_chars: Vec<char> = pad.chars().cycle().take(needed).collect();
+            Ok(Value::Text(pad_chars.iter().chain(chars.iter()).collect()))
+        }
+        "rpad" => {
+            if args.len() < 2 {
+                return Err(DbError::TypeMismatch {
+                    expected: "2-3 args".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let s = match eval(&args[0], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s,
+                other => other.to_string(),
+            };
+            let len = match eval(&args[1], row)? {
+                Value::Int(n) => n.max(0) as usize,
+                Value::BigInt(n) => n.max(0) as usize,
+                _ => 0,
+            };
+            let pad = if args.len() > 2 {
+                match eval(&args[2], row)? {
+                    Value::Text(s) => s,
+                    _ => " ".into(),
+                }
+            } else {
+                " ".into()
+            };
+            let chars: Vec<char> = s.chars().collect();
+            if chars.len() >= len {
+                return Ok(Value::Text(chars[..len].iter().collect()));
+            }
+            let needed = len - chars.len();
+            let pad_chars: Vec<char> = pad.chars().cycle().take(needed).collect();
+            Ok(Value::Text(chars.iter().chain(pad_chars.iter()).collect()))
+        }
+        "locate" | "position" => {
+            // LOCATE(needle, haystack) / POSITION(needle IN haystack) — same runtime form
+            if args.len() < 2 {
+                return Ok(Value::Int(0));
+            }
+            let needle = match eval(&args[0], row)? {
+                Value::Text(s) => s,
+                _ => return Ok(Value::Int(0)),
+            };
+            let haystack = match eval(&args[1], row)? {
+                Value::Text(s) => s,
+                _ => return Ok(Value::Int(0)),
+            };
+            Ok(match haystack.find(&needle[..]) {
+                None => Value::Int(0),
+                Some(byte_pos) => Value::Int(haystack[..byte_pos].chars().count() as i32 + 1),
+            })
+        }
+        "instr" => {
+            // INSTR(haystack, needle) — argument order reversed vs LOCATE
+            if args.len() < 2 {
+                return Ok(Value::Int(0));
+            }
+            let haystack = match eval(&args[0], row)? {
+                Value::Text(s) => s,
+                _ => return Ok(Value::Int(0)),
+            };
+            let needle = match eval(&args[1], row)? {
+                Value::Text(s) => s,
+                _ => return Ok(Value::Int(0)),
+            };
+            Ok(match haystack.find(&needle[..]) {
+                None => Value::Int(0),
+                Some(byte_pos) => Value::Int(haystack[..byte_pos].chars().count() as i32 + 1),
+            })
+        }
+        "ascii" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::Int(s.chars().next().map(|c| c as i32).unwrap_or(0))),
+                other => Err(DbError::TypeMismatch {
+                    expected: "Text".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "char" | "chr" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Int(n) => Ok(Value::Text(
+                    char::from_u32(n as u32)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                )),
+                Value::BigInt(n) => Ok(Value::Text(
+                    char::from_u32(n as u32)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                )),
+                other => Err(DbError::TypeMismatch {
+                    expected: "Int".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "space" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Int(n) => Ok(Value::Text(" ".repeat(n.max(0) as usize))),
+                Value::BigInt(n) => Ok(Value::Text(" ".repeat(n.max(0) as usize))),
+                _ => Ok(Value::Text(String::new())),
+            }
+        }
+        "strcmp" => {
+            if args.len() != 2 {
+                return Err(DbError::TypeMismatch {
+                    expected: "2 args".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let a = match eval(&args[0], row)? {
+                Value::Text(s) => s,
+                _ => return Ok(Value::Null),
+            };
+            let b = match eval(&args[1], row)? {
+                Value::Text(s) => s,
+                _ => return Ok(Value::Null),
+            };
+            Ok(Value::Int(match a.cmp(&b) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }))
+        }
+
+        // ── Date/Time functions (4.19) ───────────────────────────────────────
+        "now" | "current_timestamp" | "getdate" | "sysdate" => {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let micros = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as i64;
+            Ok(Value::Timestamp(micros))
+        }
+        "current_date" | "curdate" | "today" => {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let days = (secs / 86400) as i32;
+            Ok(Value::Date(days))
+        }
+        "unix_timestamp" => {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            Ok(Value::BigInt(secs as i64))
+        }
+        "year" | "month" | "day" | "hour" | "minute" | "second" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Timestamp(micros) => {
+                    let secs = micros / 1_000_000;
+                    match name {
+                        "year" => Ok(Value::Int(1970 + (secs / 31_557_600) as i32)),
+                        "day" => Ok(Value::Int((secs % 86400) as i32 + 1)),
+                        // month/hour/minute/second need chrono — Phase 4.19 full
+                        _ => Ok(Value::Null),
+                    }
+                }
+                Value::Date(days) => match name {
+                    "year" => Ok(Value::Int(1970 + (days / 365))),
+                    _ => Ok(Value::Null),
+                },
+                other => Err(DbError::TypeMismatch {
+                    expected: "Timestamp or Date".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+        "datediff" => {
+            if args.len() != 2 {
+                return Err(DbError::TypeMismatch {
+                    expected: "2 args".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let a = eval(&args[0], row)?;
+            let b = eval(&args[1], row)?;
+            let days_a = match a {
+                Value::Date(d) => d as i64,
+                Value::Timestamp(t) => t / 86_400_000_000,
+                _ => return Ok(Value::Null),
+            };
+            let days_b = match b {
+                Value::Date(d) => d as i64,
+                Value::Timestamp(t) => t / 86_400_000_000,
+                _ => return Ok(Value::Null),
+            };
+            Ok(Value::Int((days_a - days_b) as i32))
+        }
+
+        // ── Type inspection / conversion ─────────────────────────────────────
+        "typeof" | "pg_typeof" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            Ok(Value::Text(v.variant_name().into()))
+        }
+        "to_char" | "str" | "tostring" => {
+            let v = eval(
+                args.first().ok_or_else(|| DbError::TypeMismatch {
+                    expected: "1 arg".into(),
+                    got: "0".into(),
+                })?,
+                row,
+            )?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                other => Ok(Value::Text(other.to_string())),
+            }
+        }
+
+        // ── Unimplemented ────────────────────────────────────────────────────
+        _ => Err(DbError::NotImplemented {
+            feature: format!("function '{name}' — add to Phase 4.19 eval.rs"),
+        }),
     }
 }
 
