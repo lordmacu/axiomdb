@@ -131,6 +131,22 @@ pub enum DbError {
     #[error("column reference '{name}' is ambiguous — found in: {tables}")]
     AmbiguousColumn { name: String, tables: String },
 
+    // ── Type coercion ─────────────────────────────────────────────
+    /// Implicit conversion between incompatible or invalid types.
+    ///
+    /// SQLSTATE: 22018 (invalid_character_value_for_cast)
+    #[error("cannot coerce {value} ({from}) to {to}: {reason}")]
+    InvalidCoercion {
+        /// Source type name, e.g. "Text".
+        from: String,
+        /// Target type name, e.g. "INT".
+        to: String,
+        /// Display representation of the input value, e.g. "'42abc'".
+        value: String,
+        /// Human-readable explanation of why the coercion failed.
+        reason: String,
+    },
+
     // ── Expression evaluator ──────────────────────────────────────
     #[error("division by zero")]
     DivisionByZero,
@@ -175,6 +191,7 @@ impl DbError {
             DbError::ColumnNotFound { .. } => "42703",
             DbError::PermissionDenied { .. } => "42501",
             DbError::TypeMismatch { .. } => "42804",
+            DbError::InvalidCoercion { .. } => "22018",
             DbError::Io(_) => "58030",
             DbError::FileLocked { .. } => "55006", // object_in_use
             _ => "XX000",

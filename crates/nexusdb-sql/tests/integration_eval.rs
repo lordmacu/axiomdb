@@ -194,8 +194,9 @@ fn test_int_overflow_negate_min() {
 
 #[test]
 fn test_type_mismatch_arithmetic() {
+    // Text + Int: coerce_for_op returns InvalidCoercion (no implicit Text→numeric at op time).
     let e = err(binop(BinaryOp::Add, text("a"), int(1)));
-    assert!(matches!(e, DbError::TypeMismatch { .. }));
+    assert!(matches!(e, DbError::InvalidCoercion { .. }));
 }
 
 #[test]
