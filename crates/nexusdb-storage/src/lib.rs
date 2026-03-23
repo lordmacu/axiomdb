@@ -1,8 +1,9 @@
-//! # nexusdb-storage — storage engine: pages, mmap, free list, heap, meta
+//! # nexusdb-storage — storage engine: pages, mmap, free list, heap, meta, integrity
 
 pub mod engine;
 pub mod freelist;
 pub mod heap;
+pub mod integrity;
 pub mod memory;
 pub mod meta;
 pub mod mmap;
@@ -14,6 +15,7 @@ pub use heap::{
     clear_deletion, delete_tuple, free_space, insert_tuple, mark_slot_dead, read_tuple,
     scan_visible, update_tuple, RowHeader, SlotEntry, MAX_TUPLE_DATA, MIN_TUPLE_OVERHEAD,
 };
+pub use integrity::{IntegrityChecker, IntegrityReport, IntegrityViolation, Severity};
 pub use memory::MemoryStorage;
 pub use meta::{read_checkpoint_lsn, write_checkpoint_lsn, CHECKPOINT_LSN_BODY_OFFSET};
 pub use mmap::MmapStorage;
