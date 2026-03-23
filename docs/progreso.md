@@ -783,33 +783,103 @@
 >
 > **Prerequisite:** Phase 8 (wire protocol) must be complete so the AST is stable.
 
-### Phase 36 — AxiomQL Parser `⏳` week 114-117
+### Phase 36 — AxiomQL Core (SELECT + READ) `⏳` week 114-117
 
-- [ ] 36.1 ⏳ AxiomQL lexer — tokenizer for method-chain syntax (`.`, `(`, `)`, `:` for named args, string/number literals, identifiers)
-- [ ] 36.2 ⏳ Core SELECT methods — `.filter()`, `.sort()`, `.take()`, `.pick()` parsing and compilation to SQL `Stmt`
-- [ ] 36.3 ⏳ `.join()` — infers ON condition from foreign key catalog; explicit `.join(orders, on: user_id)` also supported
-- [ ] 36.4 ⏳ `.group()` with aggregates — `count()`, `sum()`, `avg()`, `min()`, `max()` as named args; no need to repeat GROUP BY columns
-- [ ] 36.5 ⏳ Aggregate methods without group — `users.count()`, `orders.sum(amount)`, `orders.avg(amount)`
-- [ ] 36.6 ⏳ `match {}` expression — alternative to CASE WHEN; `match(age) { < 18 → 'minor', _ → 'adult' }`
-- [ ] 36.7 ⏳ Let bindings / named CTEs — `let top = orders.group(user_id, total: sum(amount))` compiles to WITH clause
-- [ ] 36.8 ⏳ Subquery in `.filter()` — `users.filter(id in orders.filter(amount > 1000).pick(user_id))`
-- [ ] 36.9 ⏳ Correlated subquery in `.pick()` — `users.pick(name, total: orders.filter(user_id = .id).sum(amount))`
-- [ ] 36.10 ⏳ Equivalence test suite — for every AxiomQL query, assert SQL equivalent produces identical results
-- [ ] 36.11 ⏳ Parser benchmarks — AxiomQL parse throughput vs SQL parser; should be comparable
+#### 36.A — Foundation
+- [ ] 36.1 ⏳ AxiomQL lexer — `.`, `(`, `)`, `:` named args, operators, string/number/bool literals, identifiers, `@` decorators
+- [ ] 36.2 ⏳ Core SELECT: `.filter()`, `.sort()`, `.take()`, `.pick()`, `.skip()` → compile to SQL `Stmt`
+- [ ] 36.3 ⏳ `.distinct()` — removes duplicate rows; `.distinct(col)` = DISTINCT ON(col)
 
-### Phase 37 — AxiomQL Write + DDL `⏳` week 118-120
+#### 36.B — Joins
+- [ ] 36.4 ⏳ `.join(table)` — auto-infers ON from FK catalog; `.join(orders, on: user_id)` for explicit
+- [ ] 36.5 ⏳ `.left_join()`, `.right_join()`, `.full_join()`, `.cross_join()` — all join types
+- [ ] 36.6 ⏳ `.join(table.join(other))` — nested/chained joins for multi-table queries
 
-- [ ] 37.1 ⏳ `.insert()` — `users.insert(name: 'Alice', age: 30)` compiles to INSERT
-- [ ] 37.2 ⏳ `.update()` — `users.filter(id = 1).update(name: 'Bob')` compiles to UPDATE
-- [ ] 37.3 ⏳ `.delete()` — `users.filter(active = false).delete()` compiles to DELETE
-- [ ] 37.4 ⏳ `.upsert()` — `users.upsert(email: 'a@b.com', name: 'Alice', on: email)` compiles to INSERT ON CONFLICT
-- [ ] 37.5 ⏳ `create table {}` DDL — `create users { id: int @primary @auto, name: text @required }` compiles to CREATE TABLE
-- [ ] 37.6 ⏳ `index` and `migration {}` — `index users.email`, `migration 'name' { ... }`
-- [ ] 37.7 ⏳ `transaction {}` block — compiles to BEGIN/COMMIT with automatic ROLLBACK on error
-- [ ] 37.8 ⏳ `proc` and `fn` definitions — stored procedures and user-defined functions in AxiomQL syntax
-- [ ] 37.9 ⏳ `on table.after.insert {}` triggers — compiles to CREATE TRIGGER
-- [ ] 37.10 ⏳ Documentation — AxiomQL reference page in docs-site with side-by-side SQL comparison for every construct
-- [ ] 37.11 ⏳ Fuzz testing — AxiomQL parser against malformed inputs; every crash = regression test
+#### 36.C — Aggregation
+- [ ] 36.7 ⏳ `.group(col, agg: fn())` — GROUP BY with aggregates; no need to repeat group key in pick
+- [ ] 36.8 ⏳ Aggregate functions: `count()`, `sum(col)`, `avg(col)`, `min(col)`, `max(col)`, `string_agg(col, sep)`
+- [ ] 36.9 ⏳ Aggregate with filter: `count(where: active)`, `sum(amount, where: status = 'ok')` → compiles to AGG FILTER(WHERE)
+- [ ] 36.10 ⏳ `.rollup(a, b)`, `.cube(a, b)`, `.grouping_sets([a], [b], [])` — analytical grouping
+- [ ] 36.11 ⏳ Terminal aggregates: `users.count()`, `orders.sum(amount)`, `orders.avg(amount)` — no group needed
+
+#### 36.D — Window functions
+- [ ] 36.12 ⏳ `.window(col: fn().over(partition).sort(order))` — OVER clause; `row_number()`, `rank()`, `dense_rank()`
+- [ ] 36.13 ⏳ Offset window functions: `lag(col)`, `lead(col)`, `first_value(col)`, `last_value(col)`, `nth_value(col, n)`
+- [ ] 36.14 ⏳ Window aggregates: `sum(col).over(partition)`, `avg(col).over(partition).rows(preceding: 3)`
+- [ ] 36.15 ⏳ Frame clauses: `.rows(unbounded_preceding)`, `.range(current_row)`, `.groups(n)` as chained methods
+
+#### 36.E — Set operations + advanced subqueries
+- [ ] 36.16 ⏳ `.union(other)`, `.union_all(other)`, `.intersect(other)`, `.except(other)` — set operations
+- [ ] 36.17 ⏳ Subquery in `.filter()`: `users.filter(id in orders.filter(amount > 1000).pick(user_id))`
+- [ ] 36.18 ⏳ `.exists(subquery)`, `.not_exists(subquery)` — EXISTS / NOT EXISTS
+- [ ] 36.19 ⏳ Correlated subquery in `.pick()`: `users.pick(name, total: orders.filter(user_id = .id).sum(amount))`
+- [ ] 36.20 ⏳ `let` bindings / named CTEs: `let top = orders.group(...)` → WITH clause; multiple lets compose
+- [ ] 36.21 ⏳ Recursive CTE: `let tree = nodes.recursive(parent_id = .id)` → WITH RECURSIVE
+
+#### 36.F — Expressions
+- [ ] 36.22 ⏳ `match {}` — alternative to CASE WHEN: `match(status) { 'ok' → 1, _ → 0 }`
+- [ ] 36.23 ⏳ Null-safe: `.filter(col.is_null())`, `.filter(col.not_null())`, `col.or(default)` → COALESCE
+- [ ] 36.24 ⏳ JSON navigation: `data.name`, `data['key']`, `data.tags[0]` → JSON operators `->>` / `->` / `#>>`
+- [ ] 36.25 ⏳ Full-text search: `.search(col, 'term')`, `.search(col, 'term', lang: 'english')` → tsvector/tsquery
+- [ ] 36.26 ⏳ `.filter(col ~ 'regex')` — regex match operator
+
+#### 36.G — Introspection + diagnostics
+- [ ] 36.27 ⏳ `.explain()` — appends EXPLAIN; `.explain(analyze: true)` → EXPLAIN ANALYZE
+- [ ] 36.28 ⏳ `show tables`, `show columns(users)`, `describe(users)` — introspection commands
+
+#### 36.H — Quality
+- [ ] 36.29 ⏳ Equivalence test suite — for every AxiomQL construct, assert SQL equivalent produces identical results
+- [ ] 36.30 ⏳ Parser benchmarks — AxiomQL throughput vs SQL parser on same queries
+- [ ] 36.31 ⏳ Error messages — when a construct isn't supported: "use the SQL equivalent: SELECT ... OVER (...)"
+
+### Phase 37 — AxiomQL Write + DDL + Control `⏳` week 118-121
+
+#### 37.A — DML write
+- [ ] 37.1 ⏳ `.insert(col: val, ...)` — single row; `users.insert_many([...])` — batch
+- [ ] 37.2 ⏳ `.insert_select(query)` — INSERT INTO ... SELECT
+- [ ] 37.3 ⏳ `.update(col: val, ...)` — UPDATE with filter chain
+- [ ] 37.4 ⏳ `.delete()` — DELETE with filter chain
+- [ ] 37.5 ⏳ `.upsert(on: col)` — INSERT ON CONFLICT DO UPDATE
+- [ ] 37.6 ⏳ `.returning(col, ...)` — RETURNING clause on insert/update/delete; returns affected rows
+- [ ] 37.7 ⏳ `.for_update()`, `.for_share()`, `.skip_locked()` — pessimistic locking on SELECT
+
+#### 37.B — DDL
+- [ ] 37.8 ⏳ `create table {}` with `@` decorators: `@primary`, `@auto`, `@unique`, `@required`, `@default(val)`, `@references(other.col)`
+- [ ] 37.9 ⏳ `alter table` — `.add(col: type)`, `.drop(col)`, `.rename(old, new)`, `.rename_to(name)`
+- [ ] 37.10 ⏳ `drop table`, `truncate table` — destructive DDL
+- [ ] 37.11 ⏳ `create table_as(query)` — CREATE TABLE AS SELECT
+- [ ] 37.12 ⏳ Indexes: `index table.col`, `index table(a, b)`, `@fulltext`, `@partial(filter_expr)`
+- [ ] 37.13 ⏳ `migration 'name' { }` block — versioned schema changes with up/down
+
+#### 37.C — Transactions + control flow
+- [ ] 37.14 ⏳ `transaction { }` block — BEGIN/COMMIT with auto ROLLBACK on error
+- [ ] 37.15 ⏳ `transaction(isolation: serializable) { }` — SET TRANSACTION ISOLATION LEVEL
+- [ ] 37.16 ⏳ `savepoint 'name'` / `rollback to 'name'` / `release 'name'` inside transaction blocks
+- [ ] 37.17 ⏳ `abort(msg)` inside transaction — manual ROLLBACK with error message
+
+#### 37.D — Reusable logic
+- [ ] 37.18 ⏳ `proc name(args) { }` — stored procedures in AxiomQL syntax
+- [ ] 37.19 ⏳ `fn name(args) -> type { }` — user-defined functions; callable inside `.filter()`, `.pick()`
+- [ ] 37.20 ⏳ `on table.after.insert { }`, `on table.before.update { }` — triggers with `.new` / `.old` access
+
+#### 37.E — Temporal (requires Phase 7 MVCC time-travel)
+- [ ] 37.21 ⏳ `users.as_of('2026-01-01')` — historical snapshot read → AS OF TIMESTAMP
+- [ ] 37.22 ⏳ `users.history()` — all versions of rows → temporal scan
+- [ ] 37.23 ⏳ `users.changes(from: t1, to: t2)` — delta between two snapshots
+
+#### 37.F — Quality
+- [ ] 37.24 ⏳ Documentation — AxiomQL reference in docs-site: every method with SQL equivalent side-by-side
+- [ ] 37.25 ⏳ Fuzz testing — malformed AxiomQL input; every panic = regression test
+- [ ] 37.26 ⏳ AxiomQL → SQL pretty-printer — `users.filter(active).to_sql()` returns the SQL string (useful for debugging)
+
+#### Out of scope for AxiomQL (handled by SQL only)
+> The following are intentionally not in AxiomQL. SQL handles them:
+> - VACUUM, CHECKPOINT, REINDEX, ANALYZE (administrative)
+> - LISTEN / NOTIFY (pub/sub — use the Rust SDK event API instead)
+> - Row-level security policies (CREATE POLICY)
+> - Cursors (DECLARE / FETCH / CLOSE)
+> - COPY TO / COPY FROM (bulk I/O — use the CLI or Rust API)
+> - Advisory locks
 
 ---
 
