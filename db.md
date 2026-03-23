@@ -225,7 +225,7 @@ path = "src/server.rs"
 ```python
 import ctypes
 db = ctypes.CDLL("./libdbyo.so")
-conn = db.dbyo_open(b"./myapp.db")
+conn = db.dbyo_open(b"./nexusdb.db")
 db.dbyo_execute(conn, b"SELECT * FROM users WHERE id = 1", ...)
 db.dbyo_close(conn)
 ```
@@ -233,7 +233,7 @@ db.dbyo_close(conn)
 **C++ / Qt:**
 ```cpp
 #include "dbyo.h"
-auto* db = dbyo_open("./myapp.db");
+auto* db = dbyo_open("./nexusdb.db");
 dbyo_execute(db, "INSERT INTO logs VALUES (1, 'inicio')", &result);
 dbyo_close(db);
 ```
@@ -241,7 +241,7 @@ dbyo_close(db);
 **Electron / Node.js (via Neon):**
 ```js
 const { Database } = require('./dbyo-node');
-const db = new Database('./myapp.db');
+const db = new Database('./nexusdb.db');
 const rows = db.execute('SELECT * FROM products LIMIT 10');
 ```
 
@@ -3221,8 +3221,8 @@ impl WalSender {
 
 ```sql
 -- Restaurar al estado exacto de hace 2 horas
-RESTORE DATABASE mydb
-  FROM BACKUP '/backups/mydb_2026-03-21.base'
+RESTORE DATABASE nexusdb
+  FROM BACKUP '/backups/nexusdb_2026-03-21.base'
   TO TIMESTAMP '2026-03-21 10:30:00';
 
 -- El motor:
@@ -3237,7 +3237,7 @@ async fn pitr_restore(backup_path: &str, target_time: u64) -> Result<()> {
     restore_base_backup(backup_path).await?;
 
     // 2. Reproducir WAL hasta target_time
-    let wal = WalReader::open("mydb.wal")?;
+    let wal = WalReader::open("nexusdb.wal")?;
     for entry in wal.iter() {
         if entry.timestamp > target_time { break; }
         entry.apply(&mut engine).await?;
@@ -3385,7 +3385,7 @@ log_format           = "json"   # o "text"
   "timestamp": "2026-03-21T10:30:00Z",
   "duration_ms": 342,
   "user": "ana",
-  "database": "myapp",
+  "database": "nexusdb",
   "query": "SELECT * FROM orders JOIN users ON ...",
   "rows_examined": 1000000,
   "rows_returned": 3,
@@ -3661,22 +3661,22 @@ Crate: `parquet = "52"` (mismo ecosistema que Arrow).
 
 ```sql
 -- Backup completo (hot backup — sin lockear la BD)
-BACKUP DATABASE mydb TO '/backups/mydb_20260321.backup'
+BACKUP DATABASE nexusdb TO '/backups/nexusdb_20260321.backup'
 WITH (FORMAT binary, COMPRESS true);
 
 -- Backup incremental (solo cambios desde el último backup)
-BACKUP DATABASE mydb TO '/backups/mydb_20260321_inc.backup'
-WITH (FORMAT binary, INCREMENTAL true, SINCE '/backups/mydb_20260320.backup');
+BACKUP DATABASE nexusdb TO '/backups/nexusdb_20260321_inc.backup'
+WITH (FORMAT binary, INCREMENTAL true, SINCE '/backups/nexusdb_20260320.backup');
 
 -- Restore
-RESTORE DATABASE mydb FROM '/backups/mydb_20260321.backup';
+RESTORE DATABASE nexusdb FROM '/backups/nexusdb_20260321.backup';
 
 -- Dump SQL (portable, texto legible)
-DUMP DATABASE mydb TO '/backups/mydb.sql'
+DUMP DATABASE nexusdb TO '/backups/nexusdb.sql'
 WITH (FORMAT sql, INCLUDE_SCHEMA true, INCLUDE_DATA true);
 
 -- Cargar dump SQL
-SOURCE '/backups/mydb.sql';
+SOURCE '/backups/nexusdb.sql';
 ```
 
 ---
@@ -4489,6 +4489,11 @@ Fase 16 — Lógica del servidor       (semana 27-29)
   ✓ Tests: plugin de riesgo crediticio en Rust compilado a WASM
   ✓ CREATE PROCEDURE con lenguaje procedural nativo PL/pgSQL: BEGIN/END, DECLARE, IF/ELSIF/LOOP
   ✓ RAISE EXCEPTION / RAISE NOTICE con SQLSTATE personalizado dentro de procedures
+  ✓ CREATE EXCEPTION nombre 'mensaje default' — excepción nombrada como objeto del schema (estilo Firebird)
+  ✓ ALTER EXCEPTION nombre 'nuevo mensaje' — actualizar mensaje default sin tocar procedures
+  ✓ DROP EXCEPTION nombre — eliminar excepción del schema
+  ✓ Lanzar por nombre desde procedures/triggers: EXCEPTION nombre; o EXCEPTION nombre 'override msg';
+  ✓ GRANT / REVOKE USAGE ON EXCEPTION nombre TO rol — control de acceso por excepción
   ✓ Parámetros IN / OUT / INOUT y RETURNS TABLE en procedures
   ✓ CALL statement + transacciones explícitas dentro de procedures (COMMIT/ROLLBACK internos)
   ✓ Variables de cursor dentro de procedures: OPEN / FETCH / CLOSE
@@ -4541,6 +4546,13 @@ Fase 18 — Alta disponibilidad       (semana 32-33)
   ✓ Rollback atómico: si la migración falla en cualquier punto el archivo original queda intacto
   ✓ Blue-green upgrade sin downtime: nueva versión arranca en puerto alterno, espera que terminen las transacciones activas, toma el control — 0 segundos de downtime
   ✓ Upgrade log: registro detallado de cada paso de la migración con tiempos y checksums antes/después
+  ✓ Feature tracking por archivo: el header del .db registra qué features de cada versión fueron usadas
+  ✓ nexusdb downgrade --check --to-version X: verifica si el downgrade es seguro sin modificar nada
+  ✓ nexusdb downgrade --to-version X: downgrade directo cuando no hay incompatibilidades — backup automático antes
+  ✓ Downgrade bloqueado con mensaje claro: lista exacta de qué features impiden el downgrade (tipo, tabla, columna)
+  ✓ nexusdb dump --compatible-with X: exporta a SQL omitiendo features que no existen en la versión destino con advertencias
+  ✓ Política de versiones: rollback inmediato siempre posible (via backup), downgrade directo en minor versions sin features nuevas, dump/restore para el resto
+  ✓ nexusdb restore --from-backup <path>: restaura un backup previo al estado exacto antes del upgrade
 
 Fase 19 — Mantenimiento + observabilidad  (semana 34-35)
   ✓ Auto-vacuum en Tokio background task
@@ -5127,6 +5139,7 @@ Fase 30 — Infraestructura pro       (semana 64-66)
   ✓ Índices Hash (O(1) para igualdad)
   ✓ CREATE INDEX CONCURRENTLY (sin bloquear writes)
   ✓ information_schema completo (tables, columns, constraints, referential_constraints)
+  ✓ information_schema.exceptions: nombre, mensaje default, owner — listado de todas las excepciones del schema
   ✓ pg_catalog básico (pg_class, pg_attribute, pg_index)
   ✓ DESCRIBE / SHOW TABLES / SHOW CREATE TABLE / SHOW PROCESSLIST
   ✓ Two-phase commit (PREPARE TRANSACTION / COMMIT PREPARED)
@@ -5595,8 +5608,8 @@ impl ForeignDataWrapper for HttpFdw {
 -- Múltiples bases de datos en el mismo servidor
 CREATE DATABASE ventas;
 CREATE DATABASE analytics;
-CREATE DATABASE myapp_test;
-DROP DATABASE myapp_test;
+CREATE DATABASE nexusdb_test;
+DROP DATABASE nexusdb_test;
 
 -- Cambiar de BD activa
 USE ventas;
@@ -5742,8 +5755,8 @@ dbyo migrate from-mysql \
   --port     3306       \
   --user     root       \
   --password secret     \
-  --database myapp      \
-  --target   myapp      \
+  --database nexusdb      \
+  --target   nexusdb      \
   --batch-size 1000
 
 # Lo que hace internamente:
@@ -5794,9 +5807,9 @@ Crate: `mysql_async = "0.34"`.
 
 ```bash
 dbyo migrate from-postgres \
-  --conn "postgresql://user:pass@host:5432/mydb" \
+  --conn "postgresql://user:pass@host:5432/sourcedb" \
   --schema public \
-  --target mydb_migrated
+  --target nexusdb_migrated
 
 # También acepta pg_dump:
 dbyo source dump.sql   # pg_dump --format=plain
@@ -6807,15 +6820,15 @@ impl ActivityMonitor {
 
 ```sql
 -- Cifrar BD completa con AES-256-GCM
-CREATE DATABASE myapp
-  WITH ENCRYPTION KEY 'vault://myapp/db-key';
+CREATE DATABASE nexusdb
+  WITH ENCRYPTION KEY 'vault://nexusdb/db-key';
 
 -- Con contraseña derivada (PBKDF2 → AES-256)
-CREATE DATABASE myapp
+CREATE DATABASE nexusdb
   WITH ENCRYPTION PASSWORD 'mi-clave-maestra';
 
 -- Rotación de clave sin downtime
-ALTER DATABASE myapp ROTATE ENCRYPTION KEY 'vault://myapp/db-key-v2';
+ALTER DATABASE nexusdb ROTATE ENCRYPTION KEY 'vault://nexusdb/db-key-v2';
 
 -- Ver estado
 SELECT datname, encrypted, key_version FROM pg_databases;
@@ -6889,7 +6902,7 @@ CREATE AUDIT POLICY datos_sensibles
   LOG TO TABLE security_audit_log;
 
 CREATE AUDIT POLICY acceso_total
-  ON DATABASE myapp
+  ON DATABASE nexusdb
   FOR ALL
   WHEN user != 'internal_service'
   LOG TO TABLE audit_log;
@@ -7283,7 +7296,7 @@ CREATE PUBLICATION errores_pub
 
 -- En la réplica: suscribirse
 CREATE SUBSCRIPTION ventas_sub
-  CONNECTION 'host=primary port=3306 user=repl password=xxx dbname=myapp'
+  CONNECTION 'host=primary port=3306 user=repl password=xxx dbname=nexusdb'
   PUBLICATION ventas_pub;
 
 -- Slot nombrado: WAL no se descarta hasta que el consumidor lo lea
@@ -7347,7 +7360,7 @@ method   = "scram-sha-256"
 [[auth.rules]]
 host     = "10.0.0.0/8"
 user     = "service_account"
-database = "myapp"
+database = "nexusdb"
 method   = "cert"      # autenticación por certificado cliente
 
 [[auth.rules]]
@@ -8682,8 +8695,8 @@ postgres://usuario:contraseña@host:5432/base_de_datos?sslmode=verify-full
 mysql://usuario:contraseña@host:3306/base_de_datos?charset=utf8mb4
 
 # Variables de entorno estándar (compatible con todos los ORMs)
-DATABASE_URL=postgres://ana:secret@localhost:5432/myapp
-DBYO_URL=dbyo://ana:secret@localhost:3306/myapp
+DATABASE_URL=postgres://ana:secret@localhost:5432/nexusdb
+DBYO_URL=dbyo://ana:secret@localhost:3306/nexusdb
 
 # Parámetros soportados
 ?ssl=true|false|verify-full
@@ -9182,7 +9195,7 @@ services:
       - ./dbyo.toml:/etc/dbyo/dbyo.toml:ro
     environment:
       DBYO_PASSWORD: ${DBYO_PASSWORD:-secret}
-      DBYO_DATABASE: ${DBYO_DATABASE:-myapp}
+      DBYO_DATABASE: ${DBYO_DATABASE:-nexusdb}
       DBYO_LOG_LEVEL: ${DBYO_LOG_LEVEL:-info}
     restart: unless-stopped
     healthcheck:
@@ -9204,7 +9217,7 @@ host              = "0.0.0.0"
 mysql_port        = 3306
 postgres_port     = 5432
 max_connections   = 200
-default_database  = "myapp"
+default_database  = "nexusdb"
 data_dir          = "/data"
 
 [auth]
@@ -9617,7 +9630,7 @@ use dbyo_client::{Pool, Config, Row};
 
 // Pool de conexiones
 let pool = Pool::builder()
-    .config(Config::from_url("dbyo://user:pass@localhost/myapp")?)
+    .config(Config::from_url("dbyo://user:pass@localhost/nexusdb")?)
     .max_connections(20)
     .build()
     .await?;

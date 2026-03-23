@@ -24,6 +24,14 @@ or hand-written code.
 `sqlparser-rs` (which uses nom internally) for the same SQL inputs. The advantage
 holds across simple SELECT, complex multi-join SELECT, and DDL statements.
 
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">9–17× Faster Than the Production Standard</span>
+<code>sqlparser-rs</code> is the SQL parser used by Apache Arrow DataFusion, Delta Lake, and InfluxDB. The DFA advantage is structural: logos compiles all keyword patterns into a single transition matrix at build time. Processing each character is one table lookup — nom combinators perform dynamic dispatch and build intermediate allocations for each combinator step.
+</div>
+</div>
+
 The primary reason is the DFA: logos compiles all keyword patterns into a single
 Deterministic Finite Automaton at compile time. Processing each character is a table
 lookup in a pre-computed transition matrix — constant time per character with a very
@@ -302,3 +310,11 @@ Measured on Apple M2 Pro, single-threaded, 1 million iterations each:
 These numbers represent parse throughput only — before semantic analysis or execution.
 At 2 million simple queries per second, parsing is never the bottleneck for OLTP
 workloads at realistic connection concurrency.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Zero-Copy Token Design</span>
+Identifiers are <code>&'src str</code> slices into the original SQL string — no heap allocation during lexing. The Rust lifetime <code>'src</code> enforces at compile time that tokens cannot outlive the input. Only <code>StringLit</code> allocates, because escape processing (<code>\'</code>, <code>\\</code>, <code>\n</code>) must transform the content in place.
+</div>
+</div>

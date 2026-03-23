@@ -281,6 +281,99 @@ Every page — user or technical — must meet this bar:
   - Code examples (Rust) showing the public API and the critical internal logic
   - Performance characteristics (O(n) guarantees, cache behavior, allocation profile)
 
+#### Callouts — show readers why NexusDB is better
+
+Every doc page that introduces a non-trivial design or implementation must have at
+least one callout wherever something noteworthy happened. The goal: a reader skimming
+the docs should be able to spot, at a glance, what decisions were made, why we made
+them, and how they compare to any relevant database or library.
+
+**Three callout types — use the right one:**
+
+| Type | HTML class | Icon | Use when |
+|---|---|---|---|
+| **Advantage** | `callout-advantage` | 🚀 | NexusDB measurably outperforms or avoids a cost that another database or library pays |
+| **Design Decision** | `callout-design` | ⚙️ | A non-obvious implementation choice was made — a trade-off was evaluated, an approach was borrowed from another system, or a constraint (page size, bit width, scan strategy) was derived deliberately |
+| **Tip** | `callout-tip` | 💡 | User-facing: a non-obvious usage pattern, a caveat, or a migration hint |
+
+**HTML syntax (copy-paste template):**
+
+```html
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage</span>
+Explanation here. Be specific: name the competitor, the metric, and the reason.
+</div>
+</div>
+```
+
+Replace `callout-advantage` / `🚀` / `Performance Advantage` with the appropriate
+type and label. The label is free-form but should be short (3–5 words).
+
+**Reference systems — compare against the most relevant one for each context:**
+
+| Category | Systems to compare against |
+|---|---|
+| Relational SQL | MySQL 8 (InnoDB), PostgreSQL 15, SQLite 3 |
+| Embedded / serverless | SQLite 3, DuckDB, libsql |
+| LSM-tree storage | RocksDB, LevelDB, PebbleDB (CockroachDB's engine) |
+| Distributed SQL | CockroachDB, TiDB, YugabyteDB, Spanner |
+| In-memory / cache | Redis, DragonflyDB |
+| Time-series | InfluxDB, TimescaleDB, ClickHouse |
+| Rust libraries | sqlparser-rs, gluesql, sled, fjall |
+
+Always pick the **most relevant** system — not always MySQL/PostgreSQL. If we
+implement something that beats RocksDB's compaction overhead, compare with RocksDB.
+If we beat DuckDB's vectorized scan for a specific case, say so.
+
+**Mandatory callout triggers — add one whenever ANY of these are true:**
+
+1. **Outperforms a known system** — NexusDB is faster, uses less memory, or requires
+   fewer I/O operations than any named database or library in the reference table.
+   → `callout-advantage`
+
+2. **Avoids a known cost** — We eliminate something another system pays: double-write
+   buffer (InnoDB), UNDO pass (PostgreSQL), compaction write amplification (RocksDB),
+   double-buffering in RAM (InnoDB), global read locks (SQLite WAL mode), etc.
+   → `callout-advantage`
+
+3. **Borrowed a technique** — We adapted an approach from another system: PostgreSQL's
+   physical WAL, RocksDB's LSM compaction ideas, CockroachDB's epoch-based reclamation,
+   DuckDB's vectorized morsel execution, logos DFA lexer, etc. Explain where it came
+   from and why we chose it. → `callout-design`
+
+4. **A constant or limit was derived** — ORDER_INTERNAL = 223, PAGE_SIZE = 16 KB,
+   u24 instead of u32, null bitmap instead of Option<T>. Show the derivation and the
+   trade-off vs. the alternative. → `callout-design`
+
+5. **A simpler design was explicitly rejected** — next_leaf not used, no UNDO pass,
+   no nom combinators, no buffer pool. Explain what was rejected and why.
+   → `callout-design`
+
+6. **A benchmark result is ≥ 2× better** than a named competitor. → `callout-advantage`
+
+**Where to place callouts:**
+
+- In **technical docs** (`internals/`): immediately after the paragraph or code block
+  that describes the notable thing. Not at the top of the page — at the exact point
+  where the reader needs to understand why.
+- In **user docs** (`user-guide/`): at the point of first contact with the feature,
+  to help the reader understand what they get that they wouldn't get elsewhere.
+- **Not inside code blocks.** Place them before or after, never inside a fenced block.
+- **Maximum 2 callouts per section** (H2 or H3). If you have more, consolidate or
+  pick the most impactful.
+
+**Quality bar for callout content:**
+
+- Name the competitor or alternative explicitly: "MySQL InnoDB", "PostgreSQL pg_wal",
+  "RocksDB compaction", "SQLite 4 KB pages", "sqlparser-rs" — not vague comparisons.
+- Quantify when possible: "2× disk writes", "9–17× faster", "1 GB disk savings at 100M rows".
+- State the reason: "because X" or "eliminating Y overhead".
+- One sentence is enough. Three is the max. Not a paragraph.
+
+---
+
 #### Proactive update rule
 
 **If you modify, add, or delete any functionality that is already documented in `docs-site/`, you MUST update the relevant pages in the same commit.** No exceptions.
@@ -402,6 +495,18 @@ Launch an Explore agent with instructions to review:
    - Is `development/roadmap.md` updated with the new phase status?
    → Stale documentation is a blocker.
 
+9. **Callout coverage** — for every doc page touched in this phase:
+   - Does each mandatory callout trigger (outperforms a known system, avoids a known
+     cost, borrowed a technique, derived a constant, rejected a simpler design,
+     benchmark ≥ 2× better) have a corresponding callout in the doc?
+   - Is the comparison against the **most relevant** system for the context — not
+     always MySQL/PostgreSQL? (e.g., LSM comparisons → RocksDB; embedded → SQLite/DuckDB;
+     Rust parsers → sqlparser-rs; distributed → CockroachDB/TiDB)
+   - Are callouts placed at the right location (after the paragraph/block, not at
+     the top of the page)?
+   - Do callouts name the competitor explicitly and quantify the benefit?
+   → Missing callouts for mandatory triggers are a blocker.
+
 The subagent must return a report with:
 - List of fulfilled/unfulfilled criteria per subphase
 - List of blockers found (with file:line)
@@ -470,6 +575,7 @@ Si hay un ❌, abrir `/debug` para identificar el bottleneck antes de continuar.
    [ ] docs-site/src/user-guide/ updated for all user-visible changes ✅
    [ ] development/roadmap.md phase status updated ✅
    [ ] Stale documentation checked (blocker if found) ✅
+   [ ] Callouts added for every mandatory trigger in this subphase ✅
    [ ] Commit done ✅
    ```
 

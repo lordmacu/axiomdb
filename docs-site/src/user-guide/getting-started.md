@@ -25,7 +25,7 @@ Application (PHP / Python / Node.js)
   nexusdb-server process
         │
         ▼
-  mydb.db   mydb.wal
+  nexusdb.db   nexusdb.wal
 ```
 
 **When to use server mode:**
@@ -47,7 +47,7 @@ Your Application (Rust / C++ / Python / Electron)
   NexusDB engine (in-process)
         │
         ▼
-  mydb.db   mydb.wal   (local files)
+  nexusdb.db   nexusdb.wal   (local files)
 ```
 
 **When to use embedded mode:**
@@ -81,7 +81,7 @@ nexusdb-server --data-dir /var/lib/nexusdb --port 3306
 ```php
 <?php
 $pdo = new PDO(
-    'mysql:host=127.0.0.1;port=3306;dbname=mydb',
+    'mysql:host=127.0.0.1;port=3306;dbname=nexusdb',
     'root',
     '',
     [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
@@ -101,7 +101,7 @@ import pymysql
 conn = pymysql.connect(
     host='127.0.0.1',
     port=3306,
-    db='mydb',
+    db='nexusdb',
     charset='utf8mb4',
 )
 
@@ -134,7 +134,7 @@ use nexusdb_embedded::{Database, QueryResult};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Open (or create) a database file on disk.
-    let db = Database::open("./myapp.db")?;
+    let db = Database::open("./nexusdb.db")?;
 
     // Or open an in-memory database for tests / temporary use.
     // let db = Database::open_in_memory()?;
@@ -166,7 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Explicit Transactions
 
 ```rust
-let db = Database::open("./myapp.db")?;
+let db = Database::open("./nexusdb.db")?;
 
 db.transaction(|txn| {
     txn.execute("INSERT INTO accounts (owner, balance) VALUES ('Alice', 1000.00)")?;
@@ -186,7 +186,7 @@ For C, C++, Qt, or Java (JNI):
 #include "nexusdb.h"
 
 int main(void) {
-    NexusDb* db = nexusdb_open("./myapp.db");
+    NexusDb* db = nexusdb_open("./nexusdb.db");
     if (!db) { fprintf(stderr, "failed to open\n"); return 1; }
 
     char* result = NULL;
@@ -211,7 +211,7 @@ lib.nexusdb_open.restype  = ctypes.c_void_p
 lib.nexusdb_close.argtypes = [ctypes.c_void_p]
 lib.nexusdb_execute.restype = ctypes.c_int
 
-db = lib.nexusdb_open(b"./myapp.db")
+db = lib.nexusdb_open(b"./nexusdb.db")
 result_ptr = ctypes.c_char_p()
 lib.nexusdb_execute(db, b"SELECT * FROM users", ctypes.byref(result_ptr))
 rows = json.loads(result_ptr.value)

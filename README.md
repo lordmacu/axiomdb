@@ -20,14 +20,14 @@ University project in Rust with modern architecture.
 cargo run --bin nexusdb-server -- --data-dir ./data
 
 # Connect with psql
-psql -h localhost -p 5432 -U root myapp
+psql -h localhost -p 5432 -U root nexusdb
 
 # Connect with mysql client
-mysql -h localhost -P 3306 -u root myapp
+mysql -h localhost -P 3306 -u root nexusdb
 
 # Embedded mode (Python)
 pip install nexusdb-python
-python -c "import nexusdb; db = nexusdb.open('myapp.db'); db.execute('SELECT 1')"
+python -c "import nexusdb; db = nexusdb.open('nexusdb.db'); db.execute('SELECT 1')"
 ```
 
 ## Architecture

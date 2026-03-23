@@ -51,6 +51,14 @@ The CRC32c checksum covers all bytes from offset 12 to the end of the page (4 by
 for the checksum field itself are excluded). On every `read_page`, NexusDB verifies
 the checksum and returns `DbError::ChecksumMismatch` if it fails.
 
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — CRC32c Instead of Double-Write Buffer</span>
+Traditional engines (InnoDB) use a double-write buffer to detect partial page writes caused by a crash mid-flush. NexusDB instead uses per-page CRC32c checksums: if a page's checksum fails on read, the WAL is replayed to reconstruct the correct state. Same crash-safety guarantee — zero write amplification.
+</div>
+</div>
+
 ### Page Types
 
 ```rust
@@ -71,7 +79,7 @@ pub enum PageType {
 accessible as `&Page` via a pointer into the mapped region.
 
 ```
-Physical file (mydb.db):
+Physical file (nexusdb.db):
 ┌──────────┬──────────┬──────────┬──────────┬──────────┐
 │  Page 0  │  Page 1  │  Page 2  │  Page 3  │  ...     │
 │ (Meta)   │ (Data)   │ (Index)  │ (Data)   │          │
@@ -87,6 +95,14 @@ Physical file (mydb.db):
 |-------------------------|------------------------|--------------|
 | mmap (NexusDB)          | OS kernel              | 0            |
 | Custom buffer pool (MySQL InnoDB) | Application + OS  | 1 (data in both) |
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">No Double-Buffer Overhead</span>
+MySQL InnoDB keeps every hot page in RAM twice — once in the OS page cache, once in the InnoDB buffer pool. NexusDB's mmap approach uses the OS page cache directly. For a working set that fits in RAM, this roughly halves the memory footprint of the storage layer.
+</div>
+</div>
 
 With mmap, `read_page(42)` is a pointer arithmetic operation: `mmap_ptr + 42 * 16384`.
 The OS handles readahead, eviction, and write-back (via `msync`). There is no

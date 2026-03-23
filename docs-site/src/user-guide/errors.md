@@ -178,7 +178,7 @@ deadlocks cannot form between two such transactions.
 The storage engine encountered an operating system I/O error.
 
 ```
-ERROR 58030: could not write to file "mydb.db": No space left on device
+ERROR 58030: could not write to file "nexusdb.db": No space left on device
 ```
 
 **Possible causes:**
