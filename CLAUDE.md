@@ -1,498 +1,589 @@
-# NexusDB — Motor de Base de Datos en Rust
+# NexusDB — Database Engine in Rust
 
-## Fuente de verdad
-El archivo `db.md` contiene el diseño completo: arquitectura, tipos, fases, crates y decisiones.
-**Léelo antes de cualquier tarea.**
+## Source of truth
+The `db.md` file contains the complete design: architecture, types, phases, crates, and decisions.
+**Read it before any task.**
 
 ---
 
-## Flujo de ingeniería obligatorio
+## Decision-making style
+
+Make decisions autonomously. Do not ask for confirmation on implementation details,
+approach choices, or anything that can be derived from the spec and plan.
+Only ask when there is a genuine blocker that cannot be resolved without user input
+(e.g., two valid approaches with fundamentally different trade-offs not covered in the spec).
+One question max per session, and only if truly necessary.
+
+---
+
+## Effort per phase
+
+- `/brainstorm`, `/spec-task`, `/plan-task`: reason in depth before responding,
+  consider multiple approaches, anticipate edge cases. Use `/effort max` for these phases.
+- `/implement-task`, `/review-task`: execute directly without excessive deliberation.
+  Default effort is sufficient.
+
+**Reminder:** activate `/effort max` before brainstorm/spec/plan, and `/effort` (no arg)
+before implementing. It takes 2 seconds and makes a difference in design decisions.
+
+### Effort level guidance — mandatory at two moments
+
+**1. At the START of every /brainstorm:**
+
+Before doing anything else, assess the subphase complexity and tell the user:
+
+```
+⚡ Effort recommendation for [subfase X.Y]:
+  Brainstorm + Spec:  [level]
+  Plan:               [level]
+  Implementation:     [level]
+  Review:             [level]
+```
+
+Use these criteria to determine the level:
+
+| Level | When to use |
+|-------|-------------|
+| `max` | Novel algorithm design, safety-critical decisions (crash recovery, MVCC, concurrency), choices with major downstream impact on multiple future phases, or any unsafe code |
+| `high` | Complex feature with non-obvious edge cases, significant data structure design, integration of multiple components |
+| `medium` | Standard implementation of a fully-defined spec, incremental features, adding methods to existing structures |
+| `low` | Mechanical work: adding tests, updating docs, minor additions to existing logic, format changes |
+
+**2. At the END of every /spec-task:**
+
+After writing the spec (while still at max effort), tell the user:
+
+```
+✅ Spec written. You can now switch to /effort [level] for the Plan phase.
+```
+
+This tells the user exactly when to switch — no guessing.
+
+---
+
+## Mandatory engineering workflow
 
 ```
 /brainstorm → /spec-task → /plan-task → /implement-task → /review-task
 ```
 
-Nunca saltar pasos. Specs antes que código. Planes antes que implementación.
-Reviews antes de cerrar. Sin excepciones.
+Never skip steps. Specs before code. Plans before implementation.
+Reviews before closing. No exceptions.
 
-### Unidad de trabajo: subfase, no fase
+### Unit of work: subphase, not phase
 
-El flujo completo se aplica **por subfase** (3.1, 3.2, 3.3…), no por fase entera.
-Cada subfase tiene su propio spec, plan, implementación y review antes de pasar a la siguiente.
-Nunca implementar varias subfases juntas sin cerrar cada una individualmente.
+The full workflow applies **per subphase** (3.1, 3.2, 3.3…), not per entire phase.
+Each subphase has its own spec, plan, implementation, and review before moving to the next.
+Never implement multiple subphases together without closing each one individually.
 
-**Por qué subfases y no fases completas:**
-Trabajar por subfase garantiza que cada pieza recibe toda la atención de ingeniería que necesita.
-Si se trabaja por fases completas, es fácil pasar por alto detalles que solo se notan al planear
-en profundidad una sola cosa a la vez — y esos detalles ignorados se convierten en gaps, bugs
-o retrabajo costoso en fases futuras. Una subfase bien cerrada (spec → plan → código → review)
-es una subfase que no volverá a abrirse. El objetivo no es avanzar rápido en papel, sino que
-cada componente quede correcto, robusto y sin deuda técnica oculta desde el primer día.
-
----
-
-## /brainstorm — Explorar antes de proponer
-
-1. Leer `db.md` sección de la fase actual
-2. Leer archivos relevantes del codebase
-3. Hacer preguntas al usuario ANTES de proponer:
-   - ¿Comportamiento esperado exacto?
-   - ¿Casos borde conocidos?
-   - ¿Restricciones de rendimiento?
-4. Proponer 2-3 enfoques con trade-offs (no el mejor solo)
-5. Escribir sprint con dependencias si hay subtareas:
-
-```
-Sprint: [nombre fase]
-├── Tarea 1: [descripción] — sin dependencias
-├── Tarea 2: [descripción] — depende de Tarea 1
-└── Tarea 3: [descripción] — depende de Tarea 1
-```
-
-**Output:** sprint + enfoque acordado.
+**Why subphases and not full phases:**
+Working per subphase ensures each piece receives all the engineering attention it needs.
+When working on full phases, it is easy to overlook details that only surface when planning
+a single thing in depth — and those overlooked details turn into gaps, bugs,
+or costly rework in future phases. A well-closed subphase (spec → plan → code → review)
+is a subphase that will never be reopened. The goal is not to move fast on paper, but to have
+each component correct, robust, and free of hidden technical debt from day one.
 
 ---
 
-## /spec-task — Requisitos antes de implementar
+## /brainstorm — Explore before proposing
 
-Guardar en `specs/fase-N/spec-nombre.md`:
+1. Read the `db.md` section for the current phase
+2. Read relevant files in the codebase
+3. Ask the user questions BEFORE proposing:
+   - What is the exact expected behavior?
+   - What are the known edge cases?
+   - What are the performance constraints?
+4. Propose 2-3 approaches with trade-offs (not just the best one)
+5. Write a sprint with dependencies if there are subtasks:
+
+```
+Sprint: [phase name]
+├── Task 1: [description] — no dependencies
+├── Task 2: [description] — depends on Task 1
+└── Task 3: [description] — depends on Task 1
+```
+
+**Output:** sprint + agreed approach.
+
+---
+
+## /spec-task — Requirements before implementing
+
+Save in `specs/fase-N/spec-nombre.md`:
 
 ```markdown
-# Spec: [nombre]
+# Spec: [name]
 
-## Qué construir (no cómo)
-[comportamiento exacto]
+## What to build (not how)
+[exact behavior]
 
 ## Inputs / Outputs
-- Input: [tipos exactos]
-- Output: [tipos exactos]
-- Errores: [cuándo y cuáles]
+- Input: [exact types]
+- Output: [exact types]
+- Errors: [when and which]
 
-## Casos de uso
-1. [caso feliz]
-2. [caso borde 1]
-3. [caso borde 2]
+## Use cases
+1. [happy path]
+2. [edge case 1]
+3. [edge case 2]
 
-## Criterios de aceptación
-- [ ] [criterio verificable]
+## Acceptance criteria
+- [ ] [verifiable criterion]
 
-## Fuera del alcance
-- [qué NO hace]
+## Out of scope
+- [what it does NOT do]
 
-## Dependencias
-- [qué debe existir antes]
+## Dependencies
+- [what must exist first]
 ```
 
-El spec debe ser autocontenido — una sesión nueva debe entenderlo sin contexto extra.
+The spec must be self-contained — a new session must understand it without extra context.
 
 ---
 
-## /plan-task — Plan técnico antes de codear
+## /plan-task — Technical plan before coding
 
-Guardar en `specs/fase-N/plan-nombre.md`:
+Save in `specs/fase-N/plan-nombre.md`:
 
 ```markdown
-# Plan: [nombre]
+# Plan: [name]
 
-## Archivos a crear/modificar
-- `crates/dbyo-X/src/Y.rs` — [qué hace]
+## Files to create/modify
+- `crates/dbyo-X/src/Y.rs` — [what it does]
 
-## Algoritmo / Estructura de datos
-[pseudocódigo del enfoque]
+## Algorithm / Data structure
+[pseudocode of the approach]
 
-## Fases de implementación
-1. [paso concreto verificable]
-2. [paso concreto verificable]
+## Implementation phases
+1. [concrete verifiable step]
+2. [concrete verifiable step]
 
-## Tests a escribir
-- unit: [qué probar]
-- integration: [qué probar end-to-end]
-- bench: [qué medir]
+## Tests to write
+- unit: [what to test]
+- integration: [what to test end-to-end]
+- bench: [what to measure]
 
-## Antipatrones a evitar
-- [NO hacer X porque Y]
+## Anti-patterns to avoid
+- [DO NOT do X because Y]
 
-## Riesgos
-- [riesgo conocido → mitigación]
+## Risks
+- [known risk → mitigation]
 ```
 
 ---
 
-## /implement-task — Ejecutar fase por fase
+## /implement-task — Execute phase by phase
 
-Una fase a la vez. Al terminar cada fase — **protocolo de cierre obligatorio:**
+### ⚡ MANDATORY: Declare effort level BEFORE writing any code
+
+Before starting implementation of any subphase, you MUST explicitly state:
 
 ```
-1. cargo test --workspace pasa limpio
-2. cargo clippy --workspace -- -D warnings sin errores
-3. cargo fmt --check sin diferencias
-4. Escribir docs/fase-N.md
-5. Actualizar docs/progreso.md — marcar subfase con [x] ✅ y fase padre con 🔄
-6. Actualizar memory/project_state.md
-7. Actualizar memory/architecture.md
-8. Actualizar memory/lessons.md si hubo aprendizajes
-9. Commit con formato Conventional Commits
-10. Confirmar al usuario
+⚡ Effort required: [medium | high | max]
+Reason: [one line — why this level, what makes it hard]
 ```
 
-### Items no implementados — regla anti-gaps
+Then STOP and wait for the user to confirm (and adjust the model if needed)
+before writing a single line of implementation code.
 
-Si algo no se puede implementar completamente (scope, limitación técnica, dependencia futura):
+**NEVER skip this declaration. NEVER start coding without user confirmation.**
 
-**NO** dejarlo sin marcar. En su lugar:
+#### Effort level criteria
 
-1. En el spec, agregar sección:
+| Level | When it applies |
+|---|---|
+| **medium** | Plumbing over existing infrastructure. Well-known pattern. Low risk of subtle bugs. No critical correctness invariants. |
+| **high** | Multiple interacting components. Algorithmic depth. Risk of subtle bugs. Ordering or timing matters. Wrong implementation causes detectable errors. |
+| **max** | Critical correctness for data integrity. Formal state machines. Concurrency. A bug = silent data corruption or data loss. Requires deep reasoning about invariants. |
+
+#### Examples by subphase
+
+| Subphase | Level | Reason |
+|---|---|---|
+| WAL Checkpoint | high | page flush → WAL truncate ordering is critical |
+| Crash Recovery | max | replay ordering + partial writes + state machine |
+| MVCC full (Phase 7) | max | snapshot isolation, SSI, concurrent access |
+| SQL DDL parser | high | grammar non-trivial, type system |
+| Vectorized execution | max | SIMD correctness + morsel-driven pipeline |
+| WAL Rotation | medium | plumbing over existing checkpoint |
+| Simple CRUD executor | high | heap+index integration, MVCC visibility |
+
+---
+
+One phase at a time. When finishing each phase — **mandatory closing protocol:**
+
+```
+1. cargo test --workspace passes clean
+2. cargo clippy --workspace -- -D warnings with no errors
+3. cargo fmt --check with no differences
+4. Write docs/fase-N.md
+5. Update docs/progreso.md — mark subphase with [x] ✅ and parent phase with 🔄
+6. Update memory/project_state.md
+7. Update memory/architecture.md
+8. Update memory/lessons.md if there were learnings
+9. Commit with Conventional Commits format
+10. Confirm to the user
+```
+
+### Unimplemented items — anti-gap rule
+
+If something cannot be fully implemented (scope, technical limitation, future dependency):
+
+**DO NOT** leave it unmarked. Instead:
+
+1. In the spec, add a section:
    ```
    ## ⚠️ DEFERRED
-   - [descripción del gap] → pendiente en subfase X.Y
+   - [description of the gap] → pending in subphase X.Y
    ```
 
-2. En `docs/progreso.md`, agregar línea bajo la subfase:
+2. In `docs/progreso.md`, add a line under the subphase:
    ```
-   - [ ] ⚠️ [descripción corta] — gap identificado, retomar en [subfase]
+   - [ ] ⚠️ [short description] — gap identified, revisit in [subphase]
    ```
 
-**Por qué:** Los gaps silenciosos se convierten en bugs o trabajo duplicado en fases futuras.
-El objetivo es tener visibilidad total del estado real del proyecto en todo momento.
+**Why:** Silent gaps turn into bugs or duplicated work in future phases.
+The goal is to have full visibility of the real state of the project at all times.
 
-### Principio de implementación máxima
+### Maximum implementation principle
 
-Siempre implementar la versión más completa y correcta posible, sin importar la complejidad.
-No simplificar por comodidad. Si algo es difícil, encontrar la forma correcta de hacerlo.
-Solo marcar como DEFERRED cuando existe una **dependencia real** de otra fase o una
-limitación externa documentada — nunca por complejidad o conveniencia.
+Always implement the most complete and correct version possible, regardless of complexity.
+Do not simplify for convenience. If something is difficult, find the correct way to do it.
+Only mark as DEFERRED when there is a **real dependency** on another phase or a
+documented external limitation — never due to complexity or convenience.
 
-**El contexto se compacta.** Escribir como si el lector no estuvo en esta sesión.
+**Context gets compacted.** Write as if the reader was not present in this session.
 
-### Formato de commit
+### Commit format
 
 ```
-feat(fase-N): descripción concisa
+feat(fase-N): concise description
 
-- detalle 1
-- detalle 2
+- detail 1
+- detail 2
 
-Fase N/34 completada. Ver docs/fase-N.md
+Phase N/34 completed. See docs/fase-N.md
 Spec: specs/fase-N/ | Tests: crates/dbyo-X/tests/
 ```
 
-### Cuenta de GitHub
+### GitHub account
 
-Siempre usar la cuenta **lordmacu** (personal, NO la cuenta del trabajo).
-El repo está configurado con:
+Always use the **lordmacu** account (personal, NOT the work account).
+The repo is configured with:
 - `user.name = lordmacu`
 - `user.email = lordmacu@users.noreply.github.com`
-- GitHub CLI autenticado como lordmacu
+- GitHub CLI authenticated as lordmacu
 
-No incluir Co-Authored-By de Claude en ningún commit de este proyecto.
+Do not include Co-Authored-By from Claude in any commit of this project.
 
-### Ramas git
+### Git branches
 
 ```
-main              → código estable
-fase-N-nombre     → desarrollo de la fase
-hotfix/nombre     → fixes urgentes sobre main
+main              → stable code
+fase-N-nombre     → phase development
+hotfix/nombre     → urgent fixes on top of main
 ```
 
-Nunca pushear directamente a main. Merge solo después de /review-task completo.
+Never push directly to main. Merge only after /review-task is complete.
 
 ---
 
-## /review-task — Auditar antes de cerrar
+## /review-task — Audit before closing
 
-**OBLIGATORIO antes de cerrar cualquier fase.** No se puede hacer commit de cierre sin pasar esta revisión completa.
+**MANDATORY before closing any phase.** A closing commit cannot be made without passing this full review.
 
-### Paso 1 — Revisión por subagente Explore
+### Step 1 — Review by Explore subagent
 
-Lanzar un agente Explore con instrucciones de revisar:
+Launch an Explore agent with instructions to review:
 
-1. **Cada criterio de aceptación** de todos los specs de la fase — marcar ✅/❌
-2. **`unwrap()` en código de producción** (`src/`, excluyendo `#[cfg(test)]`) → bloqueante si existe
-3. **`unsafe` sin comentario `SAFETY:`** → bloqueante si existe
-4. **Tests de integración** en `tests/` — ¿existen? → bloqueante si no
-5. **Benchmarks** en `benches/` — ¿compilan? → bloqueante si no
-6. **Lógica de los tests** — ¿los assertions son correctos? ¿hay tests que siempre pasan sin verificar nada real?
-7. **Gaps no identificados** — ¿hay funcionalidad prometida en el spec que no está implementada?
+1. **Each acceptance criterion** from all specs of the phase — mark ✅/❌
+2. **`unwrap()` in production code** (`src/`, excluding `#[cfg(test)]`) → blocker if found
+3. **`unsafe` without `SAFETY:` comment** → blocker if found
+4. **Integration tests** in `tests/` — do they exist? → blocker if not
+5. **Benchmarks** in `benches/` — do they compile? → blocker if not
+6. **Test logic** — are the assertions correct? Are there tests that always pass without verifying anything real?
+7. **Unidentified gaps** — is there functionality promised in the spec that is not implemented?
 
-El subagente debe retornar un reporte con:
-- Lista de criterios cumplidos/no cumplidos por subfase
-- Lista de blockers encontrados (con archivo:línea)
-- Lista de gaps o deferred items
+The subagent must return a report with:
+- List of fulfilled/unfulfilled criteria per subphase
+- List of blockers found (with file:line)
+- List of gaps or deferred items
 
-### Paso 2 — Fixes de blockers
+### Step 2 — Fix blockers
 
-Corregir **todos** los blockers antes de continuar. No hay excepciones.
+Fix **all** blockers before continuing. No exceptions.
 
-### Paso 3 — Benchmarks obligatorios
+### Step 3 — Mandatory benchmarks
 
-**OBLIGATORIO antes de cerrar.** Correr los benchmarks de la fase y reportar resultados al usuario.
+**MANDATORY before closing.** Run the benchmarks for the phase and report results to the user.
 
 ```bash
 cargo bench --bench [nombre_bench] 2>&1 | tee /tmp/bench-fase-N.txt
 ```
 
-Reportar al usuario una tabla con:
+Report to the user a table with:
 
-| Benchmark | Resultado | vs objetivo (CLAUDE.md) | Veredicto |
+| Benchmark | Result | vs target (CLAUDE.md) | Verdict |
 |---|---|---|---|
-| point_lookup/1M | X ns/iter | objetivo 800k ops/s | ✅/⚠️/❌ |
-| range_scan/10K | X ms | objetivo 45ms | ✅/⚠️/❌ |
-| insert/sequential | X ns/iter | objetivo 180k ops/s | ✅/⚠️/❌ |
+| point_lookup/1M | X ns/iter | target 800k ops/s | ✅/⚠️/❌ |
+| range_scan/10K | X ms | target 45ms | ✅/⚠️/❌ |
+| insert/sequential | X ns/iter | target 180k ops/s | ✅/⚠️/❌ |
 
-**Umbrales:**
-- ✅ Cumple el objetivo del presupuesto de rendimiento
-- ⚠️ Dentro del máximo aceptable pero no del objetivo — documentar en `docs/fase-N.md`
-- ❌ Supera el máximo aceptable — **bloqueante**, no se puede cerrar la fase sin investigar
+**Thresholds:**
+- ✅ Meets the performance budget target
+- ⚠️ Within the acceptable maximum but not the target — document in `docs/fase-N.md`
+- ❌ Exceeds the acceptable maximum — **blocker**, the phase cannot be closed without investigating
 
-Si hay un ❌, abrir `/debug` para identificar el cuello de botella antes de continuar.
+If there is a ❌, open `/debug` to identify the bottleneck before continuing.
 
-### Paso 4 — Checklist de cierre
+### Step 4 — Closing checklist
    ```
-   [ ] Todos los criterios de aceptación de todos los specs ✅
+   [ ] All acceptance criteria from all specs ✅
    [ ] cargo test --workspace ✅
    [ ] cargo clippy -- -D warnings ✅
    [ ] cargo fmt --check ✅
-   [ ] Sin unwrap() en src/ (solo en tests y benches) ✅
-   [ ] Todo unsafe tiene comentario SAFETY: ✅
-   [ ] Tests de integración en tests/ ✅
-   [ ] Benchmarks corridos y resultados reportados al usuario ✅
-   [ ] Ningún benchmark ❌ (bloqueante) ✅
-   [ ] Lógica de tests revisada (no assertions vacías) ✅
-   [ ] docs/progreso.md actualizado ✅
-   [ ] Commit hecho ✅
+   [ ] No unwrap() in src/ (only in tests and benches) ✅
+   [ ] All unsafe has SAFETY: comment ✅
+   [ ] Integration tests in tests/ ✅
+   [ ] Benchmarks run and results reported to the user ✅
+   [ ] No benchmark ❌ (blocker) ✅
+   [ ] Test logic reviewed (no empty assertions) ✅
+   [ ] docs/progreso.md updated ✅
+   [ ] Commit done ✅
    ```
 
 ---
 
-## /debug — Debugging sistemático
+## /debug — Systematic debugging
 
-Cuando algo no funciona:
+When something does not work:
 
-1. **Reproducir** con el test mínimo que demuestra el bug
-2. **Formular hipótesis** — al menos 2, no asumir la primera
-3. **Diseñar experimento** para validar/descartar cada hipótesis
-4. **Fix en el lugar correcto** — no parchar síntomas
-5. **Test de regresión** — que nunca vuelva
+1. **Reproduce** with the minimal test that demonstrates the bug
+2. **Formulate hypotheses** — at least 2, do not assume the first
+3. **Design an experiment** to validate/discard each hypothesis
+4. **Fix in the right place** — do not patch symptoms
+5. **Regression test** — make sure it never comes back
 
-Nunca hacer cambios aleatorios esperando que funcione.
+Never make random changes hoping it works.
 
 ---
 
-## /bench — Comparar rendimiento
+## /bench — Compare performance
 
-Antes de cualquier optimización:
+Before any optimization:
 
 ```bash
-# 1. Baseline ANTES del cambio
+# 1. Baseline BEFORE the change
 cargo bench --bench [nombre] > /tmp/before.txt
 
-# 2. Hacer el cambio
+# 2. Make the change
 
-# 3. Medir DESPUÉS
+# 3. Measure AFTER
 cargo bench --bench [nombre] > /tmp/after.txt
 
-# 4. Comparar
+# 4. Compare
 cargo install critcmp
 critcmp /tmp/before.txt /tmp/after.txt
 ```
 
-Si hay regresión > 5% en operación crítica: bloqueante.
+If there is a regression > 5% on a critical operation: blocker.
 
-### Presupuesto de rendimiento (no regresar)
+### Performance budget (do not regress)
 
-| Operación             | Objetivo     | Máximo aceptable |
-|-----------------------|--------------|------------------|
-| Point lookup PK       | 800k ops/s   | 600k ops/s       |
-| Range scan 10K rows   | 45ms         | 60ms             |
-| INSERT con WAL        | 180k ops/s   | 150k ops/s       |
-| Seq scan 1M rows      | 0.8s         | 1.2s             |
-| Concurrent reads x16  | lineal       | <2x degradación  |
+| Operation             | Target       | Acceptable maximum   |
+|-----------------------|--------------|----------------------|
+| Point lookup PK       | 800k ops/s   | 600k ops/s           |
+| Range scan 10K rows   | 45ms         | 60ms                 |
+| INSERT with WAL       | 180k ops/s   | 150k ops/s           |
+| Seq scan 1M rows      | 0.8s         | 1.2s                 |
+| Concurrent reads x16  | linear       | <2x degradation      |
 
 ---
 
-## /unsafe-review — Auditar bloques unsafe
+## /unsafe-review — Audit unsafe blocks
 
-Para cada bloque `unsafe` en el código:
+For each `unsafe` block in the code:
 
 ```
-1. ¿Por qué es necesario? ¿Existe alternativa safe?
-   → Intentar bytemuck, rkyv, o restructurar primero
+1. Why is it necessary? Does a safe alternative exist?
+   → Try bytemuck, rkyv, or restructure first
 
-2. ¿Qué invariante garantiza que es seguro?
-   → Documentar con comentario SAFETY:
+2. What invariant guarantees it is safe?
+   → Document with a SAFETY: comment
 
-3. ¿Hay test que verifica el contrato?
-   → Si no hay: escribirlo antes de mergear
+3. Is there a test that verifies the contract?
+   → If not: write it before merging
 
-4. ¿Está encapsulado en función safe pública?
-   → El caller no debería ver unsafe
+4. Is it encapsulated in a public safe function?
+   → The caller should not see unsafe
 ```
 
 ```rust
-// Formato obligatorio:
-// SAFETY: [invariante que garantiza que este código es seguro]
-// Específicamente: [qué condición debe cumplirse]
+// Mandatory format:
+// SAFETY: [invariant that guarantees this code is safe]
+// Specifically: [what condition must hold]
 let page = unsafe { &*(ptr as *const Page) };
 ```
 
 ---
 
-## /new-crate — Agregar crate al workspace
+## /new-crate — Add a crate to the workspace
 
 ```bash
-# 1. Crear estructura
+# 1. Create structure
 cargo new --lib crates/dbyo-X
 
-# 2. Agregar al workspace en Cargo.toml raíz
+# 2. Add to the workspace in the root Cargo.toml
 # members = [..., "crates/dbyo-X"]
 
-# 3. Definir SOLO tipos y traits públicos en src/lib.rs
+# 3. Define ONLY public types and traits in src/lib.rs
 
-# 4. Escribir test inicial (vacío pero compilando)
+# 4. Write initial test (empty but compiling)
 
-# 5. Actualizar memory/architecture.md
+# 5. Update memory/architecture.md
 ```
 
-Verificar que no hay dependencia circular:
+Verify there are no circular dependencies:
 ```bash
 cargo tree --workspace | grep "dbyo-X"
 ```
 
 ---
 
-## /profile — Encontrar cuellos de botella reales
+## /profile — Find real bottlenecks
 
 ```bash
-# Instalar herramientas una vez
+# Install tools once
 cargo install flamegraph
 cargo install cargo-samply
 
-# Perfil con flamegraph
+# Profile with flamegraph
 cargo flamegraph --bench [nombre_bench]
 open flamegraph.svg
 
-# O con samply (mejor en macOS)
+# Or with samply (better on macOS)
 cargo samply record cargo bench --bench [nombre]
 ```
 
-Proceso:
-1. Benchmark que reproduce el caso lento
-2. Flamegraph → función más costosa
-3. Optimizar SOLO esa función
-4. Verificar que el benchmark mejora
-5. Verificar que nada más regresó
+Process:
+1. Benchmark that reproduces the slow case
+2. Flamegraph → most costly function
+3. Optimize ONLY that function
+4. Verify the benchmark improves
+5. Verify nothing else regressed
 
 ---
 
-## /fuzz — Testing con entradas aleatorias
+## /fuzz — Testing with random inputs
 
-Crítico para el parser SQL y el storage engine:
+Critical for the SQL parser and the storage engine:
 
 ```bash
-# Instalar cargo-fuzz
+# Install cargo-fuzz
 cargo install cargo-fuzz
 
-# Crear target de fuzz
+# Create fuzz target
 cargo fuzz add fuzz_sql_parser
 cargo fuzz add fuzz_storage_pages
 cargo fuzz add fuzz_wal_recovery
 
-# Correr (mínimo 60 segundos en CI, más en local)
+# Run (minimum 60 seconds in CI, more locally)
 cargo fuzz run fuzz_sql_parser -- -max_total_time=300
 
-# Por cada crash encontrado:
-# 1. Agregar como test de regresión en tests/
-# 2. Fixear el bug
-# 3. Verificar que el test pasa
+# For each crash found:
+# 1. Add as a regression test in tests/
+# 2. Fix the bug
+# 3. Verify the test passes
 ```
 
 ---
 
-## /checkpoint — Guardar contexto al pausar
+## /checkpoint — Save context when pausing
 
-Cuando hay que pausar en medio de una tarea:
+When a task must be paused:
 
 ```bash
-# Crear checkpoint
+# Create checkpoint
 cat > docs/checkpoint-$(date +%Y%m%d).md << 'EOF'
-# Checkpoint [fecha]
+# Checkpoint [date]
 
-## Qué se estaba haciendo
-[descripción exacta]
+## What was being done
+[exact description]
 
-## Decisión pendiente
-[qué había que decidir]
+## Pending decision
+[what needed to be decided]
 
-## Próximo paso exacto
-[instrucción precisa para continuar]
+## Exact next step
+[precise instruction to continue]
 
-## Archivos modificados hasta ahora
-[lista]
+## Files modified so far
+[list]
 
-## Tests que fallan / pasan
-[estado actual]
+## Tests failing / passing
+[current state]
 EOF
 
 git add -A && git commit -m "checkpoint: pausar en [descripción]"
 ```
 
-La próxima sesión: leer el checkpoint antes de todo.
+Next session: read the checkpoint before anything else.
 
 ---
 
-## /invariant — Verificar invariantes de la BD
+## /invariant — Verify database invariants
 
-Después de operaciones complejas, verificar que el motor está consistente:
+After complex operations, verify the engine is consistent:
 
 ```rust
-// Invariantes que siempre deben cumplirse:
+// Invariants that must always hold:
 
-// 1. B+ Tree balanceado
+// 1. B+ Tree balanced
 assert!(btree.all_leaves_same_depth());
 
-// 2. Free list sin duplicados
+// 2. Free list with no duplicates
 assert!(free_list.has_no_duplicates());
 
-// 3. Ninguna página referenciada dos veces
+// 3. No page referenced twice
 assert!(page_refs.no_double_references());
 
-// 4. WAL LSN siempre creciente
+// 4. WAL LSN always increasing
 assert!(wal.is_monotonic());
 
-// 5. Todas las FK apuntan a filas existentes
+// 5. All FKs point to existing rows
 assert!(fk_checker.all_valid());
 
-// 6. Checksum de cada página es correcto
+// 6. Checksum of every page is correct
 assert!(storage.all_checksums_valid());
 ```
 
 ```bash
-# Comando SQL para verificar
+# SQL command to verify
 SELECT * FROM db_integrity_check();
--- Retorna: OK o lista de violaciones
+-- Returns: OK or list of violations
 ```
 
 ---
 
-## Convenciones de código Rust
+## Rust code conventions
 
-### Errores — siempre thiserror
+### Errors — always thiserror
 
 ```rust
-// CORRECTO
+// CORRECT
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
-    #[error("página {page_id} no encontrada")]
+    #[error("page {page_id} not found")]
     PageNotFound { page_id: u64 },
 
-    #[error("checksum inválido en página {page_id}: esperado {expected}, obtenido {got}")]
+    #[error("invalid checksum on page {page_id}: expected {expected}, got {got}")]
     ChecksumMismatch { page_id: u64, expected: u32, got: u32 },
 }
 
-// PROHIBIDO en src/ — solo en tests y benches
+// FORBIDDEN in src/ — only in tests and benches
 let page = storage.read_page(42).unwrap();
 
-// CORRECTO
+// CORRECT
 let page = storage.read_page(42)?;
 let page = storage.read_page(42).map_err(|e| DbError::StorageError(e))?;
 ```
@@ -500,35 +591,35 @@ let page = storage.read_page(42).map_err(|e| DbError::StorageError(e))?;
 ### Async vs sync
 
 ```rust
-// I/O y conexiones de red → tokio async
+// I/O and network connections → tokio async
 async fn handle_connection(stream: TcpStream) -> Result<()> { ... }
 
-// CPU intensivo → rayon (NO bloquear el runtime de tokio)
+// CPU intensive → rayon (DO NOT block the tokio runtime)
 fn parallel_scan(table: &Table) -> Vec<Row> {
     table.morsels(100_000).par_iter().flat_map(|m| scan(m)).collect()
 }
 
-// Llamar rayon desde tokio:
+// Call rayon from tokio:
 let result = tokio::task::spawn_blocking(|| parallel_scan(table)).await?;
 ```
 
-### Unsafe — siempre con SAFETY
+### Unsafe — always with SAFETY
 
 ```rust
-// CORRECTO
-// SAFETY: `ptr` apunta a una página válida dentro del mmap.
-// El mmap vive mientras `StorageEngine` existe (garantizado por Arc).
-// page_id < total_pages verificado antes de esta llamada.
+// CORRECT
+// SAFETY: `ptr` points to a valid page within the mmap.
+// The mmap lives as long as `StorageEngine` exists (guaranteed by Arc).
+// page_id < total_pages verified before this call.
 let page = unsafe { &*(ptr as *const Page) };
 
-// PROHIBIDO — unsafe sin justificación
+// FORBIDDEN — unsafe without justification
 let page = unsafe { &*(ptr as *const Page) };
 ```
 
 ### Testing pyramid
 
 ```rust
-// Unit: rápido, sin I/O, usar MemoryStorage
+// Unit: fast, no I/O, use MemoryStorage
 #[test]
 fn test_btree_insert() {
     let storage = MemoryStorage::new();
@@ -537,22 +628,22 @@ fn test_btree_insert() {
     assert_eq!(tree.lookup(b"key1").unwrap(), Some(RecordId(1)));
 }
 
-// Integration: I/O real, crash recovery
+// Integration: real I/O, crash recovery
 #[test]
 fn test_crash_recovery() {
     let dir = tempfile::tempdir().unwrap();
-    // Escribir datos
+    // Write data
     let engine = Engine::open(dir.path()).unwrap();
     engine.execute("INSERT INTO t VALUES (1)").unwrap();
-    drop(engine); // simular crash
+    drop(engine); // simulate crash
 
-    // Releer — debe recuperarse
+    // Re-read — must recover
     let engine = Engine::open(dir.path()).unwrap();
     let rows = engine.execute("SELECT * FROM t").unwrap();
     assert_eq!(rows.len(), 1);
 }
 
-// Bench: medir, no verificar
+// Bench: measure, do not verify
 #[bench]
 fn bench_point_lookup(b: &mut Bencher) {
     let engine = setup_bench_engine();
@@ -562,52 +653,52 @@ fn bench_point_lookup(b: &mut Bencher) {
 
 ---
 
-## Estructura del proyecto
+## Project structure
 
 ```
 dbyo/
-├── CLAUDE.md              ← este archivo (flujo de trabajo)
-├── db.md                  ← diseño completo (fuente de verdad)
+├── CLAUDE.md              ← this file (workflow)
+├── db.md                  ← complete design (source of truth)
 ├── Cargo.toml             ← workspace root
 ├── .claude/
-│   └── settings.json      ← hooks del proyecto (fmt + clippy)
-├── specs/                 ← specs y planes por fase
+│   └── settings.json      ← project hooks (fmt + clippy)
+├── specs/                 ← specs and plans per phase
 │   └── fase-01/
 │       ├── spec-storage.md
 │       └── plan-storage.md
-├── docs/                  ← documentación de lo implementado
+├── docs/                  ← documentation of what is implemented
 │   ├── README.md
-│   └── fase-01.md         ← se crea al completar la fase
-├── crates/                ← código
+│   └── fase-01.md         ← created when the phase is completed
+├── crates/                ← code
 │   ├── dbyo-core/
 │   ├── dbyo-storage/
 │   └── ...
 ├── tests/                 ← integration tests
-├── benches/               ← benchmarks con criterion
+├── benches/               ← benchmarks with criterion
 └── fuzz/                  ← cargo-fuzz targets
 ```
 
 ---
 
-## Protocolo de memoria — actualizar al completar cada fase
+## Memory protocol — update when completing each phase
 
-Archivos en `.claude/projects/-Users-cristian-dbyo/memory/`:
+Files in `.claude/projects/-Users-cristian-dbyo/memory/`:
 
-| Archivo | Cuándo actualizar |
+| File | When to update |
 |---|---|
-| `project_state.md` | Siempre al cerrar una fase |
-| `architecture.md` | Cuando se crea o modifica un crate |
-| `decisions.md` | Cuando se toma una decisión técnica importante |
-| `lessons.md` | Cuando algo sorpresivo ocurre (bien o mal) |
+| `project_state.md` | Always when closing a phase |
+| `architecture.md` | When a crate is created or modified |
+| `decisions.md` | When an important technical decision is made |
+| `lessons.md` | When something surprising happens (good or bad) |
 
 ---
 
-## Antes de cada sesión
+## Before each session
 
 ```
-1. leer docs/checkpoint-*.md si existe (continuar desde ahí)
-2. leer docs/fase-N.md de la última fase completada
-3. leer specs/fase-actual/ para recordar el spec
-4. correr: cargo test --workspace
-5. continuar desde donde se dejó
+1. read docs/checkpoint-*.md if it exists (continue from there)
+2. read docs/fase-N.md from the last completed phase
+3. read specs/fase-actual/ to recall the spec
+4. run: cargo test --workspace
+5. continue from where it was left off
 ```
