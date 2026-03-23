@@ -138,6 +138,7 @@
 - [ ] 4.13 ⏳ version() / current_user / session_user / current_database() — ORMs call these on connect; required for Phase 5 compatibility
 - [ ] 4.14 ⏳ LAST_INSERT_ID() / lastval() — last auto-generated ID (MySQL + PG compat)
 - [ ] 4.19 ⏳ Basic built-in functions — `ABS`, `LENGTH`, `SUBSTR`, `UPPER`, `LOWER`, `TRIM`, `COALESCE`, `NOW()`, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `ROUND`, `FLOOR`, `CEIL`
+- [ ] 4.19b ⏳ BLOB functions — `FROM_BASE64(text)→BLOB` auto-decodes Base64 on insert (eliminates 33% overhead); `TO_BASE64(blob)→TEXT`; `OCTET_LENGTH(blob)→INT`; `ENCODE(blob,'hex'/'base64')→TEXT`; `DECODE(text,'hex'/'base64')→BLOB`; foundation for content-addressed storage in Phase 14
 
 <!-- ── Group G — DevEx (parallel with E+F) ── -->
 - [ ] 4.15 ⏳ Interactive CLI — REPL like `sqlite3` shell; connects directly to storage
@@ -266,7 +267,10 @@
 
 ### Phase 11 — Robustness and indexes `⏳` week 26-27
 - [ ] 11.1 ⏳ Sparse index — one entry every N rows for timestamps
-- [ ] 11.2 ⏳ TOAST — values >2KB to overflow pages with LZ4
+- [ ] 11.2 ⏳ TOAST — values >2KB to overflow pages with LZ4; small blobs (≤ threshold) stay inline
+- [ ] 11.2b ⏳ BLOB_REF storage format — replace flat `u24+bytes` encoding in row codec with a 1-byte header that distinguishes: `0x00`=inline, `0x01`=TOAST pointer (8B page_id chain), `0x02`=content-hash (32B SHA256, Phase 14); this abstraction is the foundation that makes TOAST and content-addressed storage swappable without changing the executor or SQL layer
+- [ ] 11.2c ⏳ MIME_TYPE auto-detection — on BLOB insert, read first 16 magic bytes to detect PNG/JPEG/WebP/PDF/GIF/ZIP/etc.; cache as 1-byte enum alongside the BLOB_REF in the row; expose as `MIME_TYPE(col)→TEXT` SQL function; zero overhead on read (metadata is in the row)
+- [ ] 11.2d ⏳ BLOB reference tracking — reference count per BLOB page chain (for TOAST GC); counter lives in the overflow page header; `free_blob(page_id)` decrements and chains free only when count reaches 0; prerequisite for content-addressed dedup in Phase 14
 - [ ] 11.3 ⏳ In-memory mode — `open(":memory:")` without disk
 - [ ] 11.4 ⏳ Native JSON — JSON type, `->>`  extraction with jsonpath
 - [ ] 11.4b ⏳ JSONB_SET — update JSON field without rewriting the entire document
@@ -297,7 +301,7 @@
 - [ ] 13.7 ⏳ Row-level locking — lock specific row during UPDATE/DELETE; reduces contention vs per-table lock from 7.5
 - [ ] 13.8 ⏳ Deadlock detection — DFS on wait graph when lock_timeout expires; kill the youngest transaction
 
-### Phase 14 — TimescaleDB + Redis inspired `⏳` week 32-33
+### Phase 14 — TimescaleDB + Redis + Content-addressed BLOB `⏳` week 32-33
 - [ ] 14.1 ⏳ Table partitioning — `PARTITION BY RANGE/HASH/LIST`
 - [ ] 14.2 ⏳ Partition pruning — query planner skips irrelevant partitions
 - [ ] 14.3 ⏳ Automatic compression of historical partitions — LZ4 columnar
@@ -306,6 +310,9 @@
 - [ ] 14.6 ⏳ LRU eviction — for in-memory mode with RAM limit
 - [ ] 14.7 ⏳ Chunk-level compression statistics — track compression ratio per partition; decides when to compress automatically
 - [ ] 14.8 ⏳ Time-series benchmarks — insert 1M rows with timestamp; compare range scan vs TimescaleDB
+- [ ] 14.9 ⏳ Content-addressed BLOB store — SHA256 of blob bytes = content key; separate content-store area in the .db file (beyond the heap); on BLOB insert: compute SHA256 → lookup in content index → if found: increment ref_count + store only the 32-byte hash in the BLOB_REF (header=0x02) → if not found: write bytes once + ref_count=1; two rows with identical photo share exactly one copy on disk; transparent to SQL layer — `SELECT photo` returns the full bytes regardless of backend
+- [ ] 14.10 ⏳ BLOB garbage collector — periodic scan of content store ref_counts; blobs with ref_count=0 are reclaimed; integrates with MVCC vacuum cycle (runs after dead-tuple vacuum so rollback of inserts correctly decrements); safe under concurrent reads (ref_count never drops to 0 while a snapshot can see the blob)
+- [ ] 14.11 ⏳ BLOB dedup metrics — `SELECT * FROM nexus_blob_stats` returns: `total_blobs`, `unique_blobs`, `dedup_ratio`, `bytes_saved`, `avg_blob_size`; helps users understand storage efficiency and decide whether to enable/disable dedup per table (`WITH (blob_dedup = off)`)
 
 ### Phase 15 — MongoDB + DoltDB + Arrow `⏳` week 34-35
 - [ ] 15.1 ⏳ Change streams CDC — tail the WAL, emit Insert/Update/Delete events
