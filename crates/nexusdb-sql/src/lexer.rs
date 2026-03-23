@@ -140,6 +140,8 @@ pub enum Token {
     // ── JOIN ──────────────────────────────────────────────────────────────────
     #[token("JOIN", ignore(ascii_case))]
     Join,
+    #[token("OUTER", ignore(ascii_case))]
+    Outer,
     #[token("INNER", ignore(ascii_case))]
     Inner,
     #[token("LEFT", ignore(ascii_case))]
