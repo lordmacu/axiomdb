@@ -1,0 +1,17 @@
+[package]
+name        = "axiomdb-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "axiomdb-server"
+path = "src/main.rs"
+
+[dependencies]
+axiomdb-core       = { workspace = true }
+thiserror          = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }

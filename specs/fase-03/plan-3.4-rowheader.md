@@ -4,15 +4,15 @@
 
 | File | Action | What |
 |---|---|---|
-| `crates/nexusdb-core/src/traits.rs` | modify | Add `TransactionSnapshot` |
-| `crates/nexusdb-core/src/lib.rs` | modify | Re-export `TransactionSnapshot` |
-| `crates/nexusdb-core/src/error.rs` | modify | Add `HeapPageFull`, `InvalidSlot`, `AlreadyDeleted` |
-| `crates/nexusdb-storage/src/heap.rs` | create | `RowHeader`, `SlotEntry`, all heap ops |
-| `crates/nexusdb-storage/src/lib.rs` | modify | `pub mod heap; pub use heap::...` |
+| `crates/axiomdb-core/src/traits.rs` | modify | Add `TransactionSnapshot` |
+| `crates/axiomdb-core/src/lib.rs` | modify | Re-export `TransactionSnapshot` |
+| `crates/axiomdb-core/src/error.rs` | modify | Add `HeapPageFull`, `InvalidSlot`, `AlreadyDeleted` |
+| `crates/axiomdb-storage/src/heap.rs` | create | `RowHeader`, `SlotEntry`, all heap ops |
+| `crates/axiomdb-storage/src/lib.rs` | modify | `pub mod heap; pub use heap::...` |
 
-## Step 1 — TransactionSnapshot in nexusdb-core
+## Step 1 — TransactionSnapshot in axiomdb-core
 
-**File:** `crates/nexusdb-core/src/traits.rs`
+**File:** `crates/axiomdb-core/src/traits.rs`
 
 Add after the existing type aliases:
 ```rust
@@ -42,12 +42,12 @@ impl TransactionSnapshot {
 }
 ```
 
-**File:** `crates/nexusdb-core/src/lib.rs`
+**File:** `crates/axiomdb-core/src/lib.rs`
 Add: `pub use traits::TransactionSnapshot;`
 
 ## Step 2 — New DbError variants
 
-**File:** `crates/nexusdb-core/src/error.rs`
+**File:** `crates/axiomdb-core/src/error.rs`
 
 Add to the `DbError` enum:
 ```rust
@@ -77,7 +77,7 @@ AlreadyDeleted {
 
 ## Step 3 — heap.rs: RowHeader + SlotEntry
 
-**File:** `crates/nexusdb-storage/src/heap.rs`
+**File:** `crates/axiomdb-storage/src/heap.rs`
 
 ### RowHeader
 
@@ -385,7 +385,7 @@ fn test_visibility_dead_slot_skipped()        // use case 7
 fn test_scan_visible_filters_correctly()      // covers uses 1-7 in one scan
 ```
 
-**Integration test** in `crates/nexusdb-storage/tests/heap_btree.rs`:
+**Integration test** in `crates/axiomdb-storage/tests/heap_btree.rs`:
 ```rust
 // Insert 100 rows via heap page + record RecordIds in B+ Tree
 // Read all via B+ Tree → heap roundtrip
@@ -393,7 +393,7 @@ fn test_scan_visible_filters_correctly()      // covers uses 1-7 in one scan
 fn test_heap_btree_roundtrip_100_rows()
 ```
 
-**Benchmark** in `crates/nexusdb-storage/benches/storage.rs` (extend existing):
+**Benchmark** in `crates/axiomdb-storage/benches/storage.rs` (extend existing):
 ```rust
 // Insert throughput on a single page
 fn bench_heap_insert_sequential()  // target: > 1M inserts/s on MemoryStorage
@@ -424,13 +424,13 @@ fn bench_heap_scan_full_page()
 ## Implementation order
 
 ```
-1. nexusdb-core: TransactionSnapshot + re-export
-2. nexusdb-core: DbError variants (HeapPageFull, InvalidSlot, AlreadyDeleted)
-3. nexusdb-storage/page.rs: add as_bytes_mut() if missing
-4. nexusdb-storage/heap.rs: RowHeader + SlotEntry + free_space + helpers
-5. nexusdb-storage/heap.rs: insert_tuple + read_tuple
-6. cargo test -p nexusdb-storage — compile check
-7. nexusdb-storage/heap.rs: delete_tuple + update_tuple + scan_visible
+1. axiomdb-core: TransactionSnapshot + re-export
+2. axiomdb-core: DbError variants (HeapPageFull, InvalidSlot, AlreadyDeleted)
+3. axiomdb-storage/page.rs: add as_bytes_mut() if missing
+4. axiomdb-storage/heap.rs: RowHeader + SlotEntry + free_space + helpers
+5. axiomdb-storage/heap.rs: insert_tuple + read_tuple
+6. cargo test -p axiomdb-storage — compile check
+7. axiomdb-storage/heap.rs: delete_tuple + update_tuple + scan_visible
 8. Unit tests for all heap ops + all 9 visibility cases
 9. Integration test heap_btree_roundtrip
 10. Benchmark heap_insert_sequential

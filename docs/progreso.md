@@ -16,7 +16,7 @@
 - [x] 1.6 ✅ Trait StorageEngine — unify Mmap and Memory with interchangeable trait
 - [x] 1.7 ✅ Tests + benchmarks — unit, integration, bench for page read/write
 - [x] 1.8 ✅ File locking — `fs2::FileExt::try_lock_exclusive()` in `create()` and `open()`; `Drop` releases the lock; `DbError::FileLocked` (SQLSTATE 55006) if already taken; 2 new tests
-- [x] 1.9 ✅ Error logging from startup — `tracing_subscriber::fmt()` with `EnvFilter` in `nexusdb-server/main.rs`; `tracing::{info,debug,warn}` in `MmapStorage` (create, open, grow, drop)
+- [x] 1.9 ✅ Error logging from startup — `tracing_subscriber::fmt()` with `EnvFilter` in `axiomdb-server/main.rs`; `tracing::{info,debug,warn}` in `MmapStorage` (create, open, grow, drop)
 
 ### Phase 2 — B+ Tree `✅` week 3-4
 - [x] 2.1 ✅ Node structures — `InternalNodePage`, `LeafNodePage`, bytemuck::Pod
@@ -162,7 +162,7 @@
 - [ ] 5.2 ⏳ MySQL handshake — Server Greeting + Client Response
 - [ ] 5.2a ⏳ Charset/collation negotiation in handshake — `character_set_client`, `character_set_results`, `collation_connection` sent in Server Greeting; client chooses charset; without this modern MySQL clients cannot connect or display incorrect characters
 - [ ] 5.2c ⏳ ON_ERROR session behavior — `SET ON_ERROR = 'rollback_statement'` rolls back only the failing statement and continues the transaction (fixes the PostgreSQL silent-abort problem where developers lose all previous work); `SET ON_ERROR = 'rollback_transaction'` is PostgreSQL-standard behavior; `SET ON_ERROR = 'savepoint'` automatically creates a savepoint before each statement so errors can be recovered without losing the whole transaction; `SET ON_ERROR = 'ignore'` matches MySQL lenient behavior; solves the real production pain of `BEGIN ... multiple statements ... one fails ... COMMIT does ROLLBACK without warning`
-- [ ] 5.2b ⏳ Session-level collation and compat mode — `SET collation = 'es'` changes default sort for the session; `SET NEXUS_COMPAT = 'mysql'` makes the session behave like MySQL (CI+AI default); `SET NEXUS_COMPAT = 'postgresql'` for PG behavior; these settings propagate to all subsequent queries in the session and are reset on reconnect; foundation for the per-database compat mode in Phase 13
+- [ ] 5.2b ⏳ Session-level collation and compat mode — `SET collation = 'es'` changes default sort for the session; `SET AXIOM_COMPAT = 'mysql'` makes the session behave like MySQL (CI+AI default); `SET AXIOM_COMPAT = 'postgresql'` for PG behavior; these settings propagate to all subsequent queries in the session and are reset on reconnect; foundation for the per-database compat mode in Phase 13
 - [ ] 5.3 ⏳ Authentication — basic `mysql_native_password` (SHA1-based for MySQL 5.x compatibility)
 - [ ] 5.3b ⏳ caching_sha2_password — MySQL 8.0+ auth plugin; required by MySQL Workbench, DBeaver and modern clients; full auth + fast auth path
 - [ ] 5.4 ⏳ COM_QUERY handler — receive SQL, execute, respond
@@ -260,7 +260,7 @@
 ---
 
 > **🏁 MVP CHECKPOINT — week ~50**
-> On completing Phase 10, NexusDB must be able to:
+> On completing Phase 10, AxiomDB must be able to:
 > - Accept MySQL connections from PHP/Python/Node
 > - Execute DDL (CREATE TABLE, ALTER TABLE, DROP) and DML (SELECT/INSERT/UPDATE/DELETE)
 > - Transactions with COMMIT/ROLLBACK/SAVEPOINTS
@@ -303,7 +303,7 @@
 - [ ] 12.6 ⏳ Storage fuzz testing — pages with random bytes, deliberate corruptions; verify that crash recovery handles corrupted data
 - [ ] 12.7 ⏳ ORM compatibility tier 1 — Django ORM and SQLAlchemy connect, run simple migrations and SELECT/INSERT/UPDATE/DELETE queries without errors; document workarounds if any
 - [ ] 12.8 ⏳ Unified nexus_* observability system — all system views use consistent naming, types, and join keys; `SELECT * FROM nexus_queries` shows running queries with pid, duration, state, sql_text, plan_hash; `SELECT * FROM nexus_bloat` shows table bloat (from 7.11); `SELECT * FROM nexus_slow_queries` is auto-populated when query exceeds `slow_query_threshold` (default 1s); `SELECT * FROM nexus_stats` shows database-wide metrics (cache hit rate, rows read/written, lock waits); `SELECT * FROM nexus_index_usage` shows which indexes are used/unused; unlike MySQL's inconsistent SHOW commands and PostgreSQL's complex pg_catalog joins, every nexus_* view is self-documented, joinable, and has the same timestamp/duration formats
-- [ ] 12.9 ⏳ Date/time validation strictness — `'0000-00-00'` is always rejected with a clear error (MySQL allows this invalid date); `TIMESTAMP WITH TIME ZONE` is the single timestamp type with explicit timezone; no silent timezone conversion based on column type; `'2024-02-30'` is always an error; `'2024-13-01'` is always an error; retrocompatible: `SET NEXUS_COMPAT='mysql'` re-enables MySQL's lenient date behavior for migration
+- [ ] 12.9 ⏳ Date/time validation strictness — `'0000-00-00'` is always rejected with a clear error (MySQL allows this invalid date); `TIMESTAMP WITH TIME ZONE` is the single timestamp type with explicit timezone; no silent timezone conversion based on column type; `'2024-02-30'` is always an error; `'2024-13-01'` is always an error; retrocompatible: `SET AXIOM_COMPAT='mysql'` re-enables MySQL's lenient date behavior for migration
 
 ### Phase 13 — Advanced PostgreSQL `⏳` week 30-31
 - [ ] 13.1 ⏳ Materialized views — `CREATE MATERIALIZED VIEW` + `REFRESH`
@@ -322,7 +322,7 @@
   <!--
   Design: 6 layers, each overrides the previous:
     L1: Storage     — NFC normalization always (Phase 11.2e)
-    L2: Session     — SET collation / SET NEXUS_COMPAT (Phase 5.2b)
+    L2: Session     — SET collation / SET AXIOM_COMPAT (Phase 5.2b)
     L3: Database    — CREATE DATABASE db COMPAT='mysql'|'postgresql'|'standard'
     L4: Table       — CREATE TABLE t COLLATE 'unicode'
     L5: Column      — CREATE TABLE t (name TEXT COLLATE 'es_ES')
@@ -331,7 +331,7 @@
 - [ ] 13.13a ⏳ UCA root as default — replace byte-order comparison with Unicode Collation Algorithm Level 1 as the database default; `ñ` sorts after `n`, Arabic/Hebrew/CJK each in correct Unicode order, without any declaration; compatible with PostgreSQL CS/AS behavior; DuckDB does this — no OLTP database does it yet; `ORDER BY apellido` just works for every human language without configuration
 - [ ] 13.13b ⏳ Per-database COMPAT mode — `CREATE DATABASE nexusdb COMPAT = 'mysql'` makes all text comparisons in that database behave like MySQL utf8mb4_unicode_ci (CI+AI): `'garcia' = 'García'` is TRUE; `CREATE DATABASE nexusdb COMPAT = 'postgresql'` uses byte order like PostgreSQL C locale; the same server can host a MySQL-compat database and a PostgreSQL-compat database simultaneously — no other database engine offers this; critical for migration scenarios where you cannot change application code
 - [ ] 13.13c ⏳ nexus_collations registry — system table listing all available collations: `name`, `algorithm`, `case_sensitive`, `accent_sensitive`, `icu_locale`, `description`; includes cross-system aliases: `'utf8mb4_unicode_ci'` is an alias for MySQL CI+AI behavior; `'en-US-x-icu'` is an alias for PostgreSQL ICU syntax; `'C'` is an alias for binary/byte-order; apps migrating from MySQL or PostgreSQL use their existing collation names without changes
-- [ ] 13.13d ⏳ COLLATE 'auto' per-column script detection — when a column is declared `TEXT COLLATE 'auto'`, NexusDB analyzes the Unicode script property of stored data (Latin, Arabic, CJK, Cyrillic, etc.) and caches the dominant script in column metadata; subsequent `ORDER BY` uses the appropriate CLDR tailoring for that script automatically; `SELECT * FROM nexus_column_collations` shows detected scripts; no other database does this — inspired by how mobile OS keyboards auto-detect language
+- [ ] 13.13d ⏳ COLLATE 'auto' per-column script detection — when a column is declared `TEXT COLLATE 'auto'`, AxiomDB analyzes the Unicode script property of stored data (Latin, Arabic, CJK, Cyrillic, etc.) and caches the dominant script in column metadata; subsequent `ORDER BY` uses the appropriate CLDR tailoring for that script automatically; `SELECT * FROM nexus_column_collations` shows detected scripts; no other database does this — inspired by how mobile OS keyboards auto-detect language
 - [ ] 13.13e ⏳ Full ICU integration — link against libicu for industry-standard Unicode collation; `COLLATE 'de_DE'` applies German phone-book order (ß → ss); `COLLATE 'ja_JP'` handles Japanese kana/kanji ordering; `COLLATE 'tr_TR'` handles Turkish dotted/dotless I correctly; `CREATE COLLATION my_custom (BASE='es_ES', CASE_SENSITIVE=false)` for custom rules; exact same behavior as PostgreSQL ICU collations but with zero configuration for the common case
 - [ ] 13.14 ⏳ Custom aggregate functions — `CREATE AGGREGATE median(FLOAT) (SFUNC=median_state, STYPE=FLOAT[], FINALFUNC=median_final)`; user-defined aggregates beyond SUM/COUNT/AVG/MAX/MIN; enables: weighted average, geometric mean, mode, P95 latency, Gini coefficient, domain-specific business metrics; Phase 16.1 has scalar UDFs but aggregates have different execution semantics (called once per row, finalized once per group)
 - [ ] 13.15 ⏳ Filtered LISTEN/NOTIFY — `SUBSCRIBE TO orders WHERE status = 'pending' AND total > 1000 ON CHANGE`; current LISTEN/NOTIFY (13.4) notifies any change to the entire table; real-time dashboards need selective subscriptions — "notify me only about high-value pending orders" — without this the client receives all changes and filters in application code, wasting network bandwidth
@@ -510,7 +510,7 @@
 - [ ] 22.3 ⏳ Fuzzy search — `SIMILARITY()`, trigrams, `LEVENSHTEIN()`
 - [ ] 22.4 ⏳ ANN benchmarks — compare HNSW vs pgvector vs FAISS on recall@10 and QPS; document quality/speed tradeoff
 - [ ] 22.5 ⏳ IVFFlat alternative index — lower RAM option than HNSW for collections >10M vectors
-- [ ] 22.6 ⏳ GIS: Spatial data types — POINT, LINESTRING, POLYGON, MULTIPOINT, MULTIPOLYGON, GEOMETRY; stored compactly as WKB (Well-Known Binary); implements nexusdb-geo crate (currently stub); required by every delivery, store-locator, logistics, real-estate, and fleet-management application
+- [ ] 22.6 ⏳ GIS: Spatial data types — POINT, LINESTRING, POLYGON, MULTIPOINT, MULTIPOLYGON, GEOMETRY; stored compactly as WKB (Well-Known Binary); implements axiomdb-geo crate (currently stub); required by every delivery, store-locator, logistics, real-estate, and fleet-management application
 - [ ] 22.7 ⏳ GIS: R-Tree spatial index — `CREATE INDEX ON locations USING rtree(coords)`; O(log n) bounding box queries; without this every spatial query is a full table scan; enables `WHERE ST_DWithin(location, point, 5000)` in milliseconds over millions of points
 - [ ] 22.8 ⏳ GIS: Core spatial functions — `ST_Distance`, `ST_Within`, `ST_Contains`, `ST_Intersects`, `ST_Area`, `ST_Length`, `ST_Buffer`, `ST_Union`, `ST_AsText`, `ST_GeomFromText`; the minimum vocabulary for geographic queries; `SELECT * FROM stores WHERE ST_Distance(location, ST_Point(-74.0, 40.7)) < 5000`
 - [ ] 22.9 ⏳ GIS: Coordinate system support — WGS84 (GPS coordinates) and local projections; `ST_Transform(geom, 4326)` converts between SRID systems; without this distances are in degrees instead of meters
@@ -561,7 +561,7 @@
 ---
 
 > **🏁 PRODUCTION-READY CHECKPOINT — week ~67**
-> On completing Phase 23, NexusDB must be able to:
+> On completing Phase 23, AxiomDB must be able to:
 > - MySQL + PostgreSQL wire protocols simultaneously
 > - All major ORMs (Django, SQLAlchemy, Prisma, ActiveRecord, Typeorm, psycopg3)
 > - Schema migrations with standard tools (Alembic, Rails migrate, Prisma migrate)
@@ -765,7 +765,7 @@
 - [ ] 35.8 ⏳ Homebrew formula — `brew install dbyo` for macOS
 - [ ] 35.9 ⏳ GitHub Actions CI — test + clippy + bench + fuzz on each PR
 - [ ] 35.10 ⏳ Performance tuning guide — which parameters to adjust for each workload
-- [ ] 35.11 ⏳ Kubernetes operator — `NexusDBCluster` CRD with replica management and auto-scaling
+- [ ] 35.11 ⏳ Kubernetes operator — `AxiomDBCluster` CRD with replica management and auto-scaling
 - [ ] 35.12 ⏳ Helm chart — K8s deployment with production defaults
 - [ ] 35.13 ⏳ TPC-H production benchmark — run full TPC-H and publish results; public reference point
 - [ ] 35.14 ⏳ Public API documentation — complete reference of SQL dialect, wire protocol extensions, C FFI, configuration; auto-generated from code + hand-written where needed
@@ -774,7 +774,7 @@
 ---
 
 > **🏁 FEATURE-COMPLETE CHECKPOINT — week ~113**
-> On completing Phase 35, NexusDB is a complete production database engine:
+> On completing Phase 35, AxiomDB is a complete production database engine:
 > - MySQL + PostgreSQL + OData + GraphQL simultaneously
 > - AI-native (embeddings, hybrid search, RAG)
 > - Horizontal distribution (sharding + Raft)

@@ -306,8 +306,8 @@ DELETE FROM table_ref [WHERE expr]
 
 ## Dependencies
 
-- `nexusdb-sql/src/parser/expr.rs` — extended in-place
-- `nexusdb-sql/src/parser/dml.rs` — fully implemented (was stub)
-- `nexusdb-sql/src/ast.rs` — all types already defined in Phase 4.1
-- `nexusdb-types`: `Value`, `DataType`
+- `axiomdb-sql/src/parser/expr.rs` — extended in-place
+- `axiomdb-sql/src/parser/dml.rs` — fully implemented (was stub)
+- `axiomdb-sql/src/ast.rs` — all types already defined in Phase 4.1
+- `axiomdb-types`: `Value`, `DataType`
 - No new Cargo.toml dependencies

@@ -2,9 +2,9 @@
 
 ## Files to create/modify
 
-- `crates/nexusdb-wal/src/reader.rs` — WalReader, ForwardIter, BackwardIter
-- `crates/nexusdb-wal/src/lib.rs` — add `mod reader; pub use reader::WalReader;`
-- `crates/nexusdb-wal/tests/integration_wal_reader.rs` — integration tests
+- `crates/axiomdb-wal/src/reader.rs` — WalReader, ForwardIter, BackwardIter
+- `crates/axiomdb-wal/src/lib.rs` — add `mod reader; pub use reader::WalReader;`
+- `crates/axiomdb-wal/tests/integration_wal_reader.rs` — integration tests
 
 ## Data structures
 

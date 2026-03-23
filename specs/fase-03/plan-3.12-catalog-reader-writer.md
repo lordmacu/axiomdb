@@ -4,17 +4,17 @@
 
 | File | Action | Description |
 |---|---|---|
-| `crates/nexusdb-storage/src/heap_chain.rs` | CREATE | `HeapChain`: multi-page insert, delete, scan |
-| `crates/nexusdb-storage/src/meta.rs` | MODIFY | Add `alloc_table_id`, `alloc_index_id`, sequence constants |
-| `crates/nexusdb-storage/src/lib.rs` | MODIFY | Re-export `HeapChain` |
-| `crates/nexusdb-catalog/src/bootstrap.rs` | MODIFY | `init()` writes sequence initial values (1, 1) |
-| `crates/nexusdb-catalog/src/writer.rs` | CREATE | `CatalogWriter` |
-| `crates/nexusdb-catalog/src/reader.rs` | CREATE | `CatalogReader` |
-| `crates/nexusdb-catalog/src/lib.rs` | MODIFY | Add writer/reader modules + re-exports |
-| `crates/nexusdb-catalog/Cargo.toml` | MODIFY | Add `nexusdb-wal` dependency |
-| `crates/nexusdb-core/src/error.rs` | MODIFY | Add `TableAlreadyExists`, `TableNotFound`, `IndexNotFound` |
-| `crates/nexusdb-storage/src/meta.rs` | MODIFY | Add sequence body offsets |
-| `crates/nexusdb-catalog/tests/integration_catalog_rw.rs` | CREATE | Integration tests |
+| `crates/axiomdb-storage/src/heap_chain.rs` | CREATE | `HeapChain`: multi-page insert, delete, scan |
+| `crates/axiomdb-storage/src/meta.rs` | MODIFY | Add `alloc_table_id`, `alloc_index_id`, sequence constants |
+| `crates/axiomdb-storage/src/lib.rs` | MODIFY | Re-export `HeapChain` |
+| `crates/axiomdb-catalog/src/bootstrap.rs` | MODIFY | `init()` writes sequence initial values (1, 1) |
+| `crates/axiomdb-catalog/src/writer.rs` | CREATE | `CatalogWriter` |
+| `crates/axiomdb-catalog/src/reader.rs` | CREATE | `CatalogReader` |
+| `crates/axiomdb-catalog/src/lib.rs` | MODIFY | Add writer/reader modules + re-exports |
+| `crates/axiomdb-catalog/Cargo.toml` | MODIFY | Add `axiomdb-wal` dependency |
+| `crates/axiomdb-core/src/error.rs` | MODIFY | Add `TableAlreadyExists`, `TableNotFound`, `IndexNotFound` |
+| `crates/axiomdb-storage/src/meta.rs` | MODIFY | Add sequence body offsets |
+| `crates/axiomdb-catalog/tests/integration_catalog_rw.rs` | CREATE | Integration tests |
 
 ---
 
@@ -241,7 +241,7 @@ cols.sort_by_key(|c| c.col_idx);
 3. Implement `HeapChain::delete` (thin wrapper over `heap::delete_tuple` +
    `storage.write_page`).
 4. Implement `HeapChain::scan_visible` (see algorithm C).
-5. Re-export from `nexusdb-storage/src/lib.rs`.
+5. Re-export from `axiomdb-storage/src/lib.rs`.
 6. Unit tests:
    - Insert into root page → found in scan.
    - Insert until `HeapPageFull` → chain grows, second page exists.
@@ -256,8 +256,8 @@ cols.sort_by_key(|c| c.col_idx);
 
 ### Phase 4 — CatalogWriter
 
-1. Create `nexusdb-catalog/src/writer.rs`.
-2. Add `nexusdb-wal` to `nexusdb-catalog/Cargo.toml`.
+1. Create `axiomdb-catalog/src/writer.rs`.
+2. Add `axiomdb-wal` to `axiomdb-catalog/Cargo.toml`.
 3. Define `SYSTEM_TABLE_TABLES`, `SYSTEM_TABLE_COLUMNS`, `SYSTEM_TABLE_INDEXES`
    as `pub const u32` in `writer.rs` (or a new `constants.rs`).
 4. Implement `CatalogWriter::new`, `create_table`, `create_column`,
@@ -267,7 +267,7 @@ cols.sort_by_key(|c| c.col_idx);
 
 ### Phase 5 — CatalogReader
 
-1. Create `nexusdb-catalog/src/reader.rs`.
+1. Create `axiomdb-catalog/src/reader.rs`.
 2. Implement `CatalogReader::new`, `get_table`, `get_table_by_id`,
    `list_tables`, `list_columns` (sorted by col_idx), `list_indexes`.
 3. All reads use `HeapChain::scan_visible` with provided snapshot.
@@ -276,11 +276,11 @@ cols.sort_by_key(|c| c.col_idx);
 ### Phase 6 — New DbError variants
 
 1. Add `TableAlreadyExists`, `TableNotFound`, `IndexNotFound` to
-   `nexusdb-core/src/error.rs`.
+   `axiomdb-core/src/error.rs`.
 
 ### Phase 7 — Integration tests
 
-File: `crates/nexusdb-catalog/tests/integration_catalog_rw.rs`
+File: `crates/axiomdb-catalog/tests/integration_catalog_rw.rs`
 
 Tests (using `MemoryStorage` + `TxnManager::create` with a temp WAL path):
 
@@ -360,14 +360,14 @@ test_catalog_not_initialized_errors
 ## Dependency graph
 
 ```
-nexusdb-core          (DbError, TransactionSnapshot, TxnId, TableId)
+axiomdb-core          (DbError, TransactionSnapshot, TxnId, TableId)
     ↑
-nexusdb-storage       (StorageEngine, Page, heap_chain, meta)
+axiomdb-storage       (StorageEngine, Page, heap_chain, meta)
     ↑
-nexusdb-wal           (TxnManager)
+axiomdb-wal           (TxnManager)
     ↑
-nexusdb-catalog       (CatalogBootstrap, schema, writer, reader)
+axiomdb-catalog       (CatalogBootstrap, schema, writer, reader)
 ```
 
-No circular dependencies. `nexusdb-catalog` adds `nexusdb-wal` to its
+No circular dependencies. `axiomdb-catalog` adds `axiomdb-wal` to its
 `[dependencies]` in Cargo.toml.

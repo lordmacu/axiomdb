@@ -347,6 +347,6 @@ the MySQL default `max_allowed_packet` direction. Tests pass `None`.
 
 ## Dependencies
 
-- `logos = "0.14"` — add to `nexusdb-sql/Cargo.toml` and workspace
-- `nexusdb-core`: `DbError` (uses `ParseError` variant)
-- `nexusdb-sql/src/lexer.rs` — new file
+- `logos = "0.14"` — add to `axiomdb-sql/Cargo.toml` and workspace
+- `axiomdb-core`: `DbError` (uses `ParseError` variant)
+- `axiomdb-sql/src/lexer.rs` — new file

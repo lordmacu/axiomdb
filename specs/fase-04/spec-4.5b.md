@@ -61,11 +61,11 @@ After allocating the `TableId`, the writer must:
 
 ### Location
 
-`nexusdb-sql/src/table.rs`
+`axiomdb-sql/src/table.rs`
 
 ### New dependencies
 
-`nexusdb-sql/Cargo.toml`: add `nexusdb-wal` as a regular (non-dev) dependency.
+`axiomdb-sql/Cargo.toml`: add `axiomdb-wal` as a regular (non-dev) dependency.
 
 ### Design: stateless unit struct
 
@@ -352,8 +352,8 @@ assert!(rows.is_empty());
 
 ## Dependencies
 
-- `nexusdb-catalog` — `TableDef`, `ColumnDef`, `CatalogWriter` (already a dep)
-- `nexusdb-storage` — `HeapChain`, `StorageEngine` (already a dep)
-- `nexusdb-types` — `Value`, `DataType`, `encode_row`, `decode_row`, `coerce` (already a dep)
-- `nexusdb-wal` — `TxnManager` (**new regular dep** — currently dev-only)
-- `nexusdb-core` — `RecordId`, `TransactionSnapshot`, `DbError` (already a dep)
+- `axiomdb-catalog` — `TableDef`, `ColumnDef`, `CatalogWriter` (already a dep)
+- `axiomdb-storage` — `HeapChain`, `StorageEngine` (already a dep)
+- `axiomdb-types` — `Value`, `DataType`, `encode_row`, `decode_row`, `coerce` (already a dep)
+- `axiomdb-wal` — `TxnManager` (**new regular dep** — currently dev-only)
+- `axiomdb-core` — `RecordId`, `TransactionSnapshot`, `DbError` (already a dep)

@@ -44,7 +44,7 @@ store `next_page_id: u64 LE` for heap pages in a chain.
 The root page_id for each system table is read from the meta page via
 `CatalogBootstrap::page_ids()`. Traversal always starts from the root.
 
-### `HeapChain` (lives in `nexusdb-storage/src/heap_chain.rs`)
+### `HeapChain` (lives in `axiomdb-storage/src/heap_chain.rs`)
 
 ```rust
 /// Multi-page heap: insert to last page, grow chain on full, scan all pages.
@@ -104,7 +104,7 @@ body[64..68]: next_table_id: u32 LE    (0 = uninitialized, 1 = first valid)
 body[68..72]: next_index_id: u32 LE    (0 = uninitialized, 1 = first valid)
 ```
 
-New constants in `nexusdb-storage/src/meta.rs`:
+New constants in `axiomdb-storage/src/meta.rs`:
 
 ```
 NEXT_TABLE_ID_BODY_OFFSET  = 64
@@ -114,7 +114,7 @@ NEXT_INDEX_ID_BODY_OFFSET  = 68
 `CatalogBootstrap::init()` must write `next_table_id = 1` and
 `next_index_id = 1` on fresh DB creation (idempotent).
 
-API (free functions in `nexusdb-storage::meta`):
+API (free functions in `axiomdb-storage::meta`):
 
 ```rust
 /// Reads next_table_id and atomically increments it in the meta page.
@@ -132,7 +132,7 @@ Both functions use the read-modify-write pattern already established by
 
 ## CatalogWriter
 
-Lives in `nexusdb-catalog/src/writer.rs`.
+Lives in `axiomdb-catalog/src/writer.rs`.
 
 ```rust
 pub struct CatalogWriter<'a> {
@@ -182,7 +182,7 @@ The key bytes encode the row's logical primary key (table_id as u32 LE, etc.).
 
 ## CatalogReader
 
-Lives in `nexusdb-catalog/src/reader.rs`.
+Lives in `axiomdb-catalog/src/reader.rs`.
 
 ```rust
 pub struct CatalogReader<'a> {
@@ -300,7 +300,7 @@ MVCC filtering. No B+ Tree backing — linear scan over heap pages.
 
 ## New errors
 
-In `nexusdb-core::DbError`:
+In `axiomdb-core::DbError`:
 
 ```rust
 #[error("table '{schema}.{name}' already exists")]
@@ -342,11 +342,11 @@ IndexNotFound { index_id: u32 },
 
 ## Dependencies
 
-- `nexusdb-storage`: `StorageEngine`, `Page`, `PageType`, `insert_tuple`,
+- `axiomdb-storage`: `StorageEngine`, `Page`, `PageType`, `insert_tuple`,
   `delete_tuple`, `scan_visible`, `PageHeader._reserved`, `HEADER_SIZE`
-- `nexusdb-storage::meta`: `read_meta_u32`, `write_catalog_header`,
+- `axiomdb-storage::meta`: `read_meta_u32`, `write_catalog_header`,
   `CATALOG_SCHEMA_VER_BODY_OFFSET` (for sequence init check)
-- `nexusdb-wal`: `TxnManager` (`record_insert`, `record_delete`)
-- `nexusdb-core`: `DbError`, `TransactionSnapshot`, `TxnId`, `TableId`
-- `nexusdb-catalog` (3.11): `CatalogBootstrap`, `CatalogPageIds`,
+- `axiomdb-wal`: `TxnManager` (`record_insert`, `record_delete`)
+- `axiomdb-core`: `DbError`, `TransactionSnapshot`, `TxnId`, `TableId`
+- `axiomdb-catalog` (3.11): `CatalogBootstrap`, `CatalogPageIds`,
   `TableDef`, `ColumnDef`, `IndexDef`, `ColumnType`

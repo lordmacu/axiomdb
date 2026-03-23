@@ -1,11 +1,11 @@
 # MVCC and Transactions
 
-Multi-Version Concurrency Control (MVCC) is NexusDB's mechanism for allowing
+Multi-Version Concurrency Control (MVCC) is AxiomDB's mechanism for allowing
 concurrent readers and writers to operate without blocking each other. This page
 documents the MVCC model, the RowHeader format, the visibility function, and the
 TxnManager that coordinates transaction IDs and snapshots.
 
-> **Implementation status:** The `nexusdb-mvcc` crate contains the TxnManager and
+> **Implementation status:** The `axiomdb-mvcc` crate contains the TxnManager and
 > snapshot logic implemented in Phase 3. Full SSI (Serializable Snapshot Isolation)
 > and write-write conflict detection are planned for Phase 7. The documentation below
 > describes the target design; sections marked ⚠️ indicate planned features.

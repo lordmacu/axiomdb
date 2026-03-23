@@ -1,6 +1,6 @@
 # SQL Parser
 
-The SQL parser lives in `nexusdb-sql` and is split into three stages:
+The SQL parser lives in `axiomdb-sql` and is split into three stages:
 **lexer** (string → tokens), **parser** (tokens → AST), and **semantic analyzer**
 (AST → validated AST with resolved column indices). This page covers the lexer and
 parser. The semantic analyzer is documented in [Semantic Analyzer](semantic-analyzer.md).
@@ -9,7 +9,7 @@ parser. The semantic analyzer is documented in [Semantic Analyzer](semantic-anal
 
 ## Why logos, Not nom
 
-NexusDB uses the `logos` crate to generate the lexer, rather than `nom` combinators
+AxiomDB uses the `logos` crate to generate the lexer, rather than `nom` combinators
 or hand-written code.
 
 | Criterion            | logos                            | nom                              |
@@ -20,7 +20,7 @@ or hand-written code.
 | Case-insensitive keys| `ignore(ascii_case)` attribute   | Manual lowercasing pass needed   |
 | Error messages       | Byte offsets built-in            | Requires manual tracking         |
 
-**Benchmark result:** NexusDB's lexer achieves **9–17× higher throughput** than
+**Benchmark result:** AxiomDB's lexer achieves **9–17× higher throughput** than
 `sqlparser-rs` (which uses nom internally) for the same SQL inputs. The advantage
 holds across simple SELECT, complex multi-join SELECT, and DDL statements.
 

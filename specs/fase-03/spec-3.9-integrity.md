@@ -145,8 +145,8 @@ impl IntegrityReport {
 
 ## Dependencies
 
-- `nexusdb-storage`: `StorageEngine`, `Page`, `PageType`, `HEADER_SIZE`, heap types
-- `nexusdb-core`: `TxnId`, `DbError`
-- 3.8 `RecoveryResult` (used in `post_recovery_check`) — imported from nexusdb-wal
+- `axiomdb-storage`: `StorageEngine`, `Page`, `PageType`, `HEADER_SIZE`, heap types
+- `axiomdb-core`: `TxnId`, `DbError`
+- 3.8 `RecoveryResult` (used in `post_recovery_check`) — imported from axiomdb-wal
   → to avoid circular dep, `post_recovery_check` takes `max_committed: TxnId` directly,
   not the full RecoveryResult

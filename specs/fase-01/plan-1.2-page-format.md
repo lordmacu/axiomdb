@@ -1,16 +1,16 @@
 # Plan: 1.2 — Page Format
 
 ## Files to create/modify
-- `crates/nexusdb-storage/src/page.rs` — Page, PageHeader, PageType
-- `crates/nexusdb-storage/src/lib.rs` — re-export module
-- `crates/nexusdb-storage/Cargo.toml` — add crc32c, bytemuck
+- `crates/axiomdb-storage/src/page.rs` — Page, PageHeader, PageType
+- `crates/axiomdb-storage/src/lib.rs` — re-export module
+- `crates/axiomdb-storage/Cargo.toml` — add crc32c, bytemuck
 
 ## Dependencies to add
 ```toml
-# nexusdb-storage/Cargo.toml
+# axiomdb-storage/Cargo.toml
 crc32c   = "0.6"        # CRC32c with hardware acceleration (SSE4.2 / ARM CRC)
 bytemuck = { version = "1", features = ["derive"] }
-nexusdb-core = { workspace = true }
+axiomdb-core = { workspace = true }
 ```
 
 ## Data structures

@@ -17,7 +17,7 @@ compression on internal nodes.
 | Concurrency | Real CoW + `AtomicU64` root | Lock-free readers; no refactor in Phase 7 |
 | Serialization to page | `bytemuck` / manual `repr(C)` | Fixed layout, zero-copy cast, no heavy dependency |
 | Max key length on disk | 64 bytes | Covers u64 (8), UUID (16), short strings, composite keys |
-| Target crate | `nexusdb-index` | Already exists as stub |
+| Target crate | `axiomdb-index` | Already exists as stub |
 
 ---
 
@@ -171,6 +171,6 @@ achieving 217 entries per leaf vs 211 — 3% more capacity, 17% less space per R
 
 ## Dependencies
 
-- `nexusdb-core`: `RecordId`, `PageId`, `DbError`
-- `nexusdb-storage`: `StorageEngine` trait, `Page`, `PAGE_SIZE`, `HEADER_SIZE`, `PageType::Index`
+- `axiomdb-core`: `RecordId`, `PageId`, `DbError`
+- `axiomdb-storage`: `StorageEngine` trait, `Page`, `PAGE_SIZE`, `HEADER_SIZE`, `PageType::Index`
 - New crates: `bytemuck = { version = "1", features = ["derive"] }` (already in workspace deps)

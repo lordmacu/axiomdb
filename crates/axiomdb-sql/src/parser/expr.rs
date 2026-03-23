@@ -1,0 +1,348 @@
+//! Expression sub-parser — parses [`Expr`] from the token stream.
+//!
+//! ## Operator precedence (lowest to highest)
+//!
+//! ```text
+//! expr           ::= or_expr
+//! or_expr        ::= and_expr (OR and_expr)*
+//! and_expr       ::= not_expr (AND not_expr)*
+//! not_expr       ::= NOT not_expr | is_null_expr
+//! is_null_expr   ::= predicate (IS [NOT] NULL)?
+//! predicate      ::= addition ([NOT] BETWEEN addition AND addition)
+//!                  | addition [NOT] LIKE atom [ESCAPE atom]
+//!                  | addition [NOT] IN '(' expr_list ')'
+//!                  | addition (cmp_op addition)?
+//! addition       ::= multiplication (('+' | '-' | '||') multiplication)*
+//! multiplication ::= unary (('*' | '/' | '%') unary)*
+//! unary          ::= '-' unary | atom
+//! atom           ::= literal | col_ref | fn_call | '(' expr ')'
+//! col_ref        ::= identifier ['.' identifier]
+//! fn_call        ::= identifier '(' ([*] | [expr (',' expr)*]) ')'
+//! ```
+//!
+//! Phase 4.3 covered: literals, NOT, comparisons, AND, OR.
+//! Phase 4.4 adds: IS NULL, BETWEEN, LIKE, IN, arithmetic, table.col, function calls.
+
+use axiomdb_core::error::DbError;
+use axiomdb_types::Value;
+
+use crate::{
+    expr::{BinaryOp, Expr, UnaryOp},
+    lexer::Token,
+};
+
+use super::Parser;
+
+/// Parse a full SQL expression.
+pub(crate) fn parse_expr(p: &mut Parser) -> Result<Expr, DbError> {
+    parse_or(p)
+}
+
+// ── OR ────────────────────────────────────────────────────────────────────────
+
+fn parse_or(p: &mut Parser) -> Result<Expr, DbError> {
+    let mut left = parse_and(p)?;
+    while p.eat(&Token::Or) {
+        let right = parse_and(p)?;
+        left = Expr::BinaryOp {
+            op: BinaryOp::Or,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+    }
+    Ok(left)
+}
+
+// ── AND ───────────────────────────────────────────────────────────────────────
+
+fn parse_and(p: &mut Parser) -> Result<Expr, DbError> {
+    let mut left = parse_not(p)?;
+    while p.eat(&Token::And) {
+        let right = parse_not(p)?;
+        left = Expr::BinaryOp {
+            op: BinaryOp::And,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+    }
+    Ok(left)
+}
+
+// ── NOT ───────────────────────────────────────────────────────────────────────
+
+fn parse_not(p: &mut Parser) -> Result<Expr, DbError> {
+    if p.eat(&Token::Not) {
+        let operand = parse_not(p)?;
+        return Ok(Expr::UnaryOp {
+            op: UnaryOp::Not,
+            operand: Box::new(operand),
+        });
+    }
+    parse_is_null(p)
+}
+
+// ── IS NULL ───────────────────────────────────────────────────────────────────
+
+fn parse_is_null(p: &mut Parser) -> Result<Expr, DbError> {
+    let expr = parse_predicate(p)?;
+    if p.eat(&Token::Is) {
+        let negated = p.eat(&Token::Not);
+        p.expect(&Token::Null)?;
+        return Ok(Expr::IsNull {
+            expr: Box::new(expr),
+            negated,
+        });
+    }
+    Ok(expr)
+}
+
+// ── Predicate: BETWEEN, LIKE, IN, comparison ──────────────────────────────────
+
+fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
+    let left = parse_addition(p)?;
+
+    // Check for optional NOT before BETWEEN/LIKE/IN.
+    // Note: bare NOT here means `a NOT BETWEEN …`, not `NOT a`.
+    // Bare NOT before a comparison (`a NOT > b`) is a parse error.
+    let negated = if matches!(
+        (p.peek(), p.peek_at(1)),
+        (Token::Not, Token::Between) | (Token::Not, Token::Like) | (Token::Not, Token::In)
+    ) {
+        p.advance(); // consume NOT
+        true
+    } else {
+        false
+    };
+
+    match p.peek() {
+        Token::Between => {
+            p.advance();
+            let low = parse_addition(p)?;
+            p.expect(&Token::And)?;
+            let high = parse_addition(p)?;
+            Ok(Expr::Between {
+                expr: Box::new(left),
+                low: Box::new(low),
+                high: Box::new(high),
+                negated,
+            })
+        }
+        Token::Like => {
+            p.advance();
+            let pattern = parse_atom(p)?;
+            // Optional ESCAPE clause — consume and discard (Phase 4.x)
+            if p.eat(&Token::Escape) {
+                parse_atom(p)?; // discard escape char
+            }
+            Ok(Expr::Like {
+                expr: Box::new(left),
+                pattern: Box::new(pattern),
+                negated,
+            })
+        }
+        Token::In => {
+            p.advance();
+            p.expect(&Token::LParen)?;
+            let mut list = vec![parse_expr(p)?];
+            while p.eat(&Token::Comma) {
+                list.push(parse_expr(p)?);
+            }
+            p.expect(&Token::RParen)?;
+            Ok(Expr::In {
+                expr: Box::new(left),
+                list,
+                negated,
+            })
+        }
+        cmp if !negated => {
+            let op = match cmp {
+                Token::Eq => BinaryOp::Eq,
+                Token::NotEq => BinaryOp::NotEq,
+                Token::Lt => BinaryOp::Lt,
+                Token::LtEq => BinaryOp::LtEq,
+                Token::Gt => BinaryOp::Gt,
+                Token::GtEq => BinaryOp::GtEq,
+                _ => return Ok(left),
+            };
+            p.advance();
+            let right = parse_addition(p)?;
+            Ok(Expr::BinaryOp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        }
+        _ if negated => {
+            // NOT was consumed but no BETWEEN/LIKE/IN followed — error.
+            Err(DbError::ParseError {
+                message: format!(
+                    "expected BETWEEN, LIKE, or IN after NOT at position {}",
+                    p.current_pos()
+                ),
+            })
+        }
+        _ => Ok(left),
+    }
+}
+
+// ── Addition: +, -, || ────────────────────────────────────────────────────────
+
+fn parse_addition(p: &mut Parser) -> Result<Expr, DbError> {
+    let mut left = parse_multiplication(p)?;
+    loop {
+        let op = match p.peek() {
+            Token::Plus => BinaryOp::Add,
+            Token::Minus => BinaryOp::Sub,
+            Token::Concat => BinaryOp::Concat,
+            _ => break,
+        };
+        p.advance();
+        let right = parse_multiplication(p)?;
+        left = Expr::BinaryOp {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+    }
+    Ok(left)
+}
+
+// ── Multiplication: *, /, % ───────────────────────────────────────────────────
+
+fn parse_multiplication(p: &mut Parser) -> Result<Expr, DbError> {
+    let mut left = parse_unary(p)?;
+    loop {
+        let op = match p.peek() {
+            Token::Star => BinaryOp::Mul,
+            Token::Slash => BinaryOp::Div,
+            Token::Percent => BinaryOp::Mod,
+            _ => break,
+        };
+        p.advance();
+        let right = parse_unary(p)?;
+        left = Expr::BinaryOp {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+    }
+    Ok(left)
+}
+
+// ── Unary: unary minus ────────────────────────────────────────────────────────
+
+fn parse_unary(p: &mut Parser) -> Result<Expr, DbError> {
+    if p.eat(&Token::Minus) {
+        let operand = parse_unary(p)?;
+        return Ok(Expr::UnaryOp {
+            op: UnaryOp::Neg,
+            operand: Box::new(operand),
+        });
+    }
+    parse_atom(p)
+}
+
+// ── Atom ──────────────────────────────────────────────────────────────────────
+
+fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
+    let pos = p.current_pos();
+
+    match p.peek().clone() {
+        Token::Integer(n) => {
+            p.advance();
+            if n >= i32::MIN as i64 && n <= i32::MAX as i64 {
+                Ok(Expr::Literal(Value::Int(n as i32)))
+            } else {
+                Ok(Expr::Literal(Value::BigInt(n)))
+            }
+        }
+        Token::Float(f) => {
+            p.advance();
+            Ok(Expr::Literal(Value::Real(f)))
+        }
+        Token::StringLit(s) => {
+            p.advance();
+            Ok(Expr::Literal(Value::Text(s)))
+        }
+        Token::True => {
+            p.advance();
+            Ok(Expr::Literal(Value::Bool(true)))
+        }
+        Token::False => {
+            p.advance();
+            Ok(Expr::Literal(Value::Bool(false)))
+        }
+        Token::Null => {
+            p.advance();
+            Ok(Expr::Literal(Value::Null))
+        }
+        Token::LParen => {
+            p.advance();
+            let expr = parse_expr(p)?;
+            p.expect(&Token::RParen)?;
+            Ok(expr)
+        }
+        // Identifiers and unreserved keywords usable as column/function names.
+        Token::Ident(_)
+        | Token::QuotedIdent(_)
+        | Token::DqIdent(_)
+        | Token::Key
+        | Token::Index
+        | Token::Tables
+        | Token::Desc
+        | Token::Action
+        | Token::Names
+        | Token::Autocommit => parse_ident_or_call(p),
+
+        other => Err(DbError::ParseError {
+            message: format!(
+                "unexpected token {:?} in expression at position {}",
+                other, pos
+            ),
+        }),
+    }
+}
+
+/// Parse an identifier (possibly `table.col`) or a function call.
+fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
+    let name = p.parse_identifier()?;
+
+    // Check for table.column: `name.field`
+    if p.eat(&Token::Dot) {
+        let field = p.parse_identifier()?;
+        let qualified = format!("{name}.{field}");
+        // No function call after table.col in Phase 4.4
+        return Ok(Expr::Column {
+            col_idx: 0,
+            name: qualified,
+        });
+    }
+
+    // Check for function call: `name(`
+    if p.eat(&Token::LParen) {
+        // COUNT(*) and similar aggregate wildcards
+        if p.eat(&Token::Star) {
+            p.expect(&Token::RParen)?;
+            return Ok(Expr::Function {
+                name: name.to_ascii_lowercase(),
+                args: vec![],
+            });
+        }
+        // Regular args or no args
+        let mut args = Vec::new();
+        if !matches!(p.peek(), Token::RParen) {
+            args.push(parse_expr(p)?);
+            while p.eat(&Token::Comma) {
+                args.push(parse_expr(p)?);
+            }
+        }
+        p.expect(&Token::RParen)?;
+        return Ok(Expr::Function {
+            name: name.to_ascii_lowercase(),
+            args,
+        });
+    }
+
+    // Plain column reference
+    Ok(Expr::Column { col_idx: 0, name })
+}

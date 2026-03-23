@@ -1,6 +1,6 @@
 # Performance
 
-NexusDB is designed to outperform MySQL on specific workloads by eliminating several
+AxiomDB is designed to outperform MySQL on specific workloads by eliminating several
 layers of redundant work: double-buffering, the double-write buffer, row-by-row query
 evaluation, and thread-per-connection overhead. This page presents current benchmark
 numbers and guidance on how to write queries and schemas that stay fast.
@@ -14,7 +14,7 @@ warm data (all pages in OS page cache unless noted).
 
 ### SQL Parser Throughput
 
-| Query type            | NexusDB (logos lexer) | MySQL ~  | PostgreSQL ~ | Ratio vs MySQL |
+| Query type            | AxiomDB (logos lexer) | MySQL ~  | PostgreSQL ~ | Ratio vs MySQL |
 |-----------------------|-----------------------|----------|--------------|----------------|
 | Simple SELECT (1 tbl) | **492 ns**            | ~500 ns  | ~450 ns      | 1.0× (parity)  |
 | Complex SELECT (JOINs)| **2.7 µs**            | ~4.0 µs  | ~3.5 µs      | 1.5× faster    |
@@ -23,7 +23,7 @@ warm data (all pages in OS page cache unless noted).
 
 Compared to `sqlparser-rs` (the common Rust SQL parser library):
 
-| Query type            | NexusDB   | sqlparser-rs | Ratio         |
+| Query type            | AxiomDB   | sqlparser-rs | Ratio         |
 |-----------------------|-----------|--------------|---------------|
 | Simple SELECT         | 492 ns    | 4.8 µs       | **9.8× faster** |
 | Complex SELECT        | 2.7 µs    | 46 µs        | **17× faster**  |
@@ -36,7 +36,7 @@ The speed advantage comes from two decisions:
 
 ### Storage Engine Throughput
 
-| Operation                 | NexusDB       | Target       | Max acceptable | Status |
+| Operation                 | AxiomDB       | Target       | Max acceptable | Status |
 |---------------------------|---------------|--------------|----------------|--------|
 | B+ Tree point lookup (1M) | **1.2M ops/s**| 800K ops/s   | 600K ops/s     | ✅     |
 | Range scan 10K rows       | **0.61 ms**   | 45 ms        | 60 ms          | ✅     |
@@ -60,7 +60,7 @@ Row encoding is fast because:
 
 ---
 
-## Why NexusDB Is Fast — Architecture Reasons
+## Why AxiomDB Is Fast — Architecture Reasons
 
 ### 1. No Double-Buffering
 
@@ -71,11 +71,11 @@ The same data lives in RAM twice.
 MySQL:   Disk → OS page cache → InnoDB Buffer Pool → Query
                 (copy 1)            (copy 2)
 
-NexusDB: Disk → OS page cache → Query
+AxiomDB: Disk → OS page cache → Query
                 (mmap — single copy)
 ```
 
-NexusDB uses `mmap` to map the `.db` file directly. The OS page cache IS the
+AxiomDB uses `mmap` to map the `.db` file directly. The OS page cache IS the
 buffer. When a page is hot, it is served from L2/L3 cache with zero copies.
 
 ### 2. No Double-Write Buffer
@@ -84,8 +84,8 @@ MySQL writes each 16 KB page to a special "doublewrite buffer" area on disk befo
 writing it to its actual location. This prevents torn-page corruption but costs two
 disk writes per page.
 
-NexusDB uses a WAL + per-page CRC32c checksum. The WAL record is small (tens of bytes
-for the changed key-value pair). On recovery, NexusDB replays the WAL to reconstruct
+AxiomDB uses a WAL + per-page CRC32c checksum. The WAL record is small (tens of bytes
+for the changed key-value pair). On recovery, AxiomDB replays the WAL to reconstruct
 any page that has a checksum mismatch. No doublewrite buffer needed.
 
 ### 3. Lock-Free Concurrent Reads
@@ -127,7 +127,7 @@ blockers before any phase is closed.
 
 ### Rules of Thumb
 
-1. **Every foreign key column needs an index** — NexusDB does not auto-index FK
+1. **Every foreign key column needs an index** — AxiomDB does not auto-index FK
    columns. Without an index, every FK check during DELETE/UPDATE scans the child
    table linearly.
 
@@ -136,7 +136,7 @@ blockers before any phase is closed.
    if `user_id` is more selective (fewer distinct values match).
 
 3. **Covering indexes eliminate heap lookups** — If all columns in a SELECT are in
-   the index, NexusDB returns results directly from the index without touching heap
+   the index, AxiomDB returns results directly from the index without touching heap
    pages.
 
 4. **Partial indexes reduce size** — `CREATE INDEX ... WHERE deleted_at IS NULL`
@@ -207,10 +207,10 @@ EXPLAIN SELECT * FROM orders WHERE user_id = 42 ORDER BY placed_at DESC;
 
 ```bash
 # B+ Tree benchmarks
-cargo bench --bench btree -p nexusdb-index
+cargo bench --bench btree -p axiomdb-index
 
 # Storage engine benchmarks
-cargo bench --bench storage -p nexusdb-storage
+cargo bench --bench storage -p axiomdb-storage
 
 # Compare before/after an optimization
 cargo bench -- --save-baseline before

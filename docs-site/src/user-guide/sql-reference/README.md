@@ -1,6 +1,6 @@
 # SQL Reference
 
-This section covers the complete SQL dialect supported by NexusDB.
+This section covers the complete SQL dialect supported by AxiomDB.
 
 - [Data Types](data-types.md) — all supported column types with storage sizes and usage examples
 - [DDL — Schema Definition](ddl.md) — CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX, constraints

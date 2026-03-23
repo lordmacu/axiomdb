@@ -119,7 +119,7 @@ recovery must replay.
 
 ## Dependencies
 
-- `nexusdb-storage`: `StorageEngine::flush()`, `Page`, `MmapStorage` (already exist)
-- `nexusdb-wal`: `WalWriter`, `WalEntry`, `EntryType::Checkpoint` (already exist)
-- `nexusdb-core`: `DbError` (already exists)
+- `axiomdb-storage`: `StorageEngine::flush()`, `Page`, `MmapStorage` (already exist)
+- `axiomdb-wal`: `WalWriter`, `WalEntry`, `EntryType::Checkpoint` (already exist)
+- `axiomdb-core`: `DbError` (already exists)
 - `TxnManager::wal_mut()` accessor — needs to be added to expose `&mut WalWriter`

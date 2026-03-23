@@ -51,5 +51,5 @@ offset  size  field
 - Concurrency (Phase 7)
 
 ## Dependencies
-- `nexusdb-storage::page` (already exists)
+- `axiomdb-storage::page` (already exists)
 - `memmap2` crate

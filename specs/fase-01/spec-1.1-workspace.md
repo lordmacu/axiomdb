@@ -22,25 +22,25 @@ nexusdb/
 │   └── workflows/
 │       └── ci.yml          ← test + clippy + fmt on every push
 └── crates/
-    ├── nexusdb-core/       ← base types, traits, errors
-    ├── nexusdb-types/      ← Value enum, DataType
-    ├── nexusdb-storage/    ← mmap, pages, WAL
-    ├── nexusdb-wal/        ← Write-Ahead Log
-    ├── nexusdb-index/      ← B+ Tree, HNSW, FTS
-    ├── nexusdb-mvcc/       ← transactions, snapshots
-    ├── nexusdb-catalog/    ← schema, statistics
-    ├── nexusdb-sql/        ← parser, planner, executor
-    ├── nexusdb-functions/  ← built-in functions
-    ├── nexusdb-network/    ← MySQL + PostgreSQL wire protocol
-    ├── nexusdb-security/   ← RBAC, RLS, TLS
-    ├── nexusdb-replication/← streaming replication
-    ├── nexusdb-plugins/    ← WASM, Lua
-    ├── nexusdb-cache/      ← query cache
-    ├── nexusdb-geo/        ← geometric types
-    ├── nexusdb-vector/     ← embeddings, HNSW
-    ├── nexusdb-migrations/ ← CLI migrations
-    ├── nexusdb-server/     ← server binary (bin)
-    └── nexusdb-embedded/   ← embedded library (cdylib)
+    ├── axiomdb-core/       ← base types, traits, errors
+    ├── axiomdb-types/      ← Value enum, DataType
+    ├── axiomdb-storage/    ← mmap, pages, WAL
+    ├── axiomdb-wal/        ← Write-Ahead Log
+    ├── axiomdb-index/      ← B+ Tree, HNSW, FTS
+    ├── axiomdb-mvcc/       ← transactions, snapshots
+    ├── axiomdb-catalog/    ← schema, statistics
+    ├── axiomdb-sql/        ← parser, planner, executor
+    ├── axiomdb-functions/  ← built-in functions
+    ├── axiomdb-network/    ← MySQL + PostgreSQL wire protocol
+    ├── axiomdb-security/   ← RBAC, RLS, TLS
+    ├── axiomdb-replication/← streaming replication
+    ├── axiomdb-plugins/    ← WASM, Lua
+    ├── axiomdb-cache/      ← query cache
+    ├── axiomdb-geo/        ← geometric types
+    ├── axiomdb-vector/     ← embeddings, HNSW
+    ├── axiomdb-migrations/ ← CLI migrations
+    ├── axiomdb-server/     ← server binary (bin)
+    └── axiomdb-embedded/   ← embedded library (cdylib)
 
 ## Out of scope
 - Implementing real logic (that is Phase 1.2+)

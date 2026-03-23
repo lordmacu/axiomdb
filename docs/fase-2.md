@@ -1,7 +1,7 @@
 # Phase 2 — B+ Tree CoW
 
 **Status:** ✅ Completed
-**Crate:** `nexusdb-index`
+**Crate:** `axiomdb-index`
 **Spec/Plan:** `specs/fase-02/`
 
 ---
@@ -64,17 +64,17 @@ Total: 16,291B ≤ PAGE_BODY_SIZE (16,320B) ✓
 ## Files created
 
 ```
-crates/nexusdb-index/
-├── Cargo.toml                      — deps: bytemuck, nexusdb-storage
+crates/axiomdb-index/
+├── Cargo.toml                      — deps: bytemuck, axiomdb-storage
 └── src/
     ├── lib.rs                      — re-exports BTree, RangeIter
     ├── page_layout.rs              — InternalNodePage, LeafNodePage, bytemuck
     ├── tree.rs                     — BTree: insert, delete, lookup, range
     ├── iter.rs                     — RangeIter (lazy, tree traversal)
     └── prefix.rs                   — CompressedNode (prefix compression)
-crates/nexusdb-index/tests/
+crates/axiomdb-index/tests/
 └── integration_btree.rs            — 8 integration tests
-crates/nexusdb-index/benches/
+crates/axiomdb-index/benches/
 └── btree.rs                        — Criterion: lookup, range scan, insert
 specs/fase-02/
 ├── spec-btree.md

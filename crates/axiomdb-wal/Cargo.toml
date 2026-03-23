@@ -1,0 +1,15 @@
+[package]
+name        = "axiomdb-wal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+axiomdb-core    = { workspace = true }
+axiomdb-storage = { workspace = true }
+thiserror       = { workspace = true }
+crc32c          = "0.6"
+
+[dev-dependencies]
+tempfile = { workspace = true }

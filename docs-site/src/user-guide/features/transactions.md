@@ -1,7 +1,7 @@
 # Transactions
 
 A transaction is a sequence of SQL operations that execute as a single atomic unit:
-either all succeed (COMMIT) or none of them take effect (ROLLBACK). NexusDB implements
+either all succeed (COMMIT) or none of them take effect (ROLLBACK). AxiomDB implements
 full ACID transactions backed by a Write-Ahead Log and Multi-Version Concurrency Control.
 
 ---
@@ -36,7 +36,7 @@ COMMIT;
 ```
 
 If the connection drops after the first UPDATE but before COMMIT, the WAL records
-both the transaction start and the mutation. During crash recovery, NexusDB sees no
+both the transaction start and the mutation. During crash recovery, AxiomDB sees no
 COMMIT record for this transaction and discards the partial change. Account 1 keeps
 its original balance.
 
@@ -97,7 +97,7 @@ COMMIT;
 
 ## MVCC — Multi-Version Concurrency Control
 
-NexusDB uses MVCC to allow readers and writers to proceed concurrently without
+AxiomDB uses MVCC to allow readers and writers to proceed concurrently without
 blocking each other. The key insight is that **readers never block writers, and
 writers never block readers**.
 
@@ -131,7 +131,7 @@ Because readers access immutable snapshots, they require no locks. A long-runnin
 ### Write Conflicts
 
 Two concurrent writers can conflict if they both attempt to modify the same row.
-NexusDB uses first-writer-wins: the second writer's transaction is aborted with
+AxiomDB uses first-writer-wins: the second writer's transaction is aborted with
 error `40001 serialization_failure`. The application should retry the transaction.
 
 ```python
@@ -157,7 +157,7 @@ def transfer_with_retry(db, from_id, to_id, amount, max_retries=5):
 
 ## Isolation Levels
 
-NexusDB supports two isolation levels. The level is set per-transaction.
+AxiomDB supports two isolation levels. The level is set per-transaction.
 
 ### READ COMMITTED (default)
 

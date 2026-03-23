@@ -4,15 +4,15 @@
 
 | File | Action | Description |
 |---|---|---|
-| `crates/nexusdb-types/src/types.rs` | CREATE | `DataType` enum |
-| `crates/nexusdb-types/src/value.rs` | CREATE | `Value` enum + `Display` |
-| `crates/nexusdb-types/src/codec.rs` | CREATE | `encode_row`, `decode_row`, `encoded_len` |
-| `crates/nexusdb-types/src/lib.rs` | MODIFY | expose all modules + re-exports |
-| `crates/nexusdb-core/src/error.rs` | MODIFY | add `ValueTooLarge`, `InvalidValue` |
-| `crates/nexusdb-types/tests/integration_row_codec.rs` | CREATE | integration tests |
+| `crates/axiomdb-types/src/types.rs` | CREATE | `DataType` enum |
+| `crates/axiomdb-types/src/value.rs` | CREATE | `Value` enum + `Display` |
+| `crates/axiomdb-types/src/codec.rs` | CREATE | `encode_row`, `decode_row`, `encoded_len` |
+| `crates/axiomdb-types/src/lib.rs` | MODIFY | expose all modules + re-exports |
+| `crates/axiomdb-core/src/error.rs` | MODIFY | add `ValueTooLarge`, `InvalidValue` |
+| `crates/axiomdb-types/tests/integration_row_codec.rs` | CREATE | integration tests |
 
-**No Cargo.toml changes needed** — `nexusdb-types` already depends on
-`nexusdb-core`. No new dependencies.
+**No Cargo.toml changes needed** — `axiomdb-types` already depends on
+`axiomdb-core`. No new dependencies.
 
 ---
 
@@ -213,7 +213,7 @@ fn read_u24(bytes: &[u8], pos: usize) -> Result<usize, DbError> {
 
 ## Implementation phases
 
-### Phase 1 — DbError variants (nexusdb-core)
+### Phase 1 — DbError variants (axiomdb-core)
 1. Add to `error.rs`:
    ```rust
    #[error("value too large: {len} bytes (maximum {max})")]
@@ -222,11 +222,11 @@ fn read_u24(bytes: &[u8], pos: usize) -> Result<usize, DbError> {
    InvalidValue { reason: String },
    ```
 
-### Phase 2 — DataType (nexusdb-types/src/types.rs)
+### Phase 2 — DataType (axiomdb-types/src/types.rs)
 1. Define `DataType` with 10 variants.
 2. Derive `Debug, Clone, Copy, PartialEq, Eq`.
 
-### Phase 3 — Value (nexusdb-types/src/value.rs)
+### Phase 3 — Value (axiomdb-types/src/value.rs)
 1. Define `Value` with 11 variants.
 2. Derive `Clone, Debug, PartialEq`.
 3. Implement `Display`:
@@ -243,7 +243,7 @@ fn read_u24(bytes: &[u8], pos: usize) -> Result<usize, DbError> {
 4. Add `fn variant_name(&self) -> &'static str` for error messages.
 5. Inline unit tests for `Display`.
 
-### Phase 4 — Codec (nexusdb-types/src/codec.rs)
+### Phase 4 — Codec (axiomdb-types/src/codec.rs)
 1. Implement private helpers: `bitmap_len`, `is_null`, `set_null`,
    `write_u24`, `read_u24`, `validate_type`.
 2. Implement `encoded_len` (infallible, no schema).
@@ -263,7 +263,7 @@ pub use value::Value;
 ```
 
 ### Phase 6 — Integration tests
-File: `crates/nexusdb-types/tests/integration_row_codec.rs`
+File: `crates/axiomdb-types/tests/integration_row_codec.rs`
 
 24 tests:
 ```
@@ -302,7 +302,7 @@ test_null_bitmap_bit_positions_explicit
 - **DO NOT** use slice indexing without length check before `from_le_bytes` — always verify `pos + size <= bytes.len()`.
 - **DO NOT** use `String::from_utf8(...).unwrap()` — map the error to `ParseError`.
 - **DO NOT** mix up bit ordering in the null bitmap — use `is_null` / `set_null` helpers consistently in both encode and decode.
-- **DO NOT** add `nexusdb-catalog` to `nexusdb-types/Cargo.toml` — use `DataType` (local) not `ColumnType` (catalog).
+- **DO NOT** add `axiomdb-catalog` to `axiomdb-types/Cargo.toml` — use `DataType` (local) not `ColumnType` (catalog).
 - **DO NOT** implement `encoded_len` with `Result` — it must be infallible.
 
 ---

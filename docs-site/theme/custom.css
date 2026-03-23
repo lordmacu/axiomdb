@@ -1,4 +1,4 @@
-/* ── NexusDB Callouts ─────────────────────────────────────────────────── */
+/* ── AxiomDB Callouts ─────────────────────────────────────────────────── */
 
 .callout {
   display: flex;
@@ -29,7 +29,7 @@
   margin-bottom: 0.3rem;
 }
 
-/* Advantage — emerald: NexusDB does something better than MySQL/PostgreSQL */
+/* Advantage — emerald: AxiomDB does something better than MySQL/PostgreSQL */
 .callout-advantage {
   background: rgba(16, 185, 129, 0.09);
   border-left: 3px solid #10b981;

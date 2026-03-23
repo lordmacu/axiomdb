@@ -4,8 +4,8 @@
 
 | File | Action | What it does |
 |---|---|---|
-| `crates/nexusdb-sql/src/result.rs` | **create** | `Row`, `ColumnMeta`, `QueryResult` + impls + tests |
-| `crates/nexusdb-sql/src/lib.rs` | modify | `pub mod result` + re-exports |
+| `crates/axiomdb-sql/src/result.rs` | **create** | `Row`, `ColumnMeta`, `QueryResult` + impls + tests |
+| `crates/axiomdb-sql/src/lib.rs` | modify | `pub mod result` + re-exports |
 
 No new crate. No new dependency. Two files total.
 
@@ -42,7 +42,7 @@ result.rs
 ## Implementation phases
 
 1. **Create `result.rs`** with type definitions, derives, and doc comments.
-   Verify `cargo check -p nexusdb-sql`.
+   Verify `cargo check -p axiomdb-sql`.
 
 2. **Add `impl ColumnMeta`** — single constructor `new(name, data_type, nullable,
    table_name)`. Verify compiles.

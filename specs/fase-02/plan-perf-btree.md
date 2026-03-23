@@ -2,8 +2,8 @@
 
 ## Files to modify
 
-- `crates/nexusdb-index/src/page_layout.rs` — binary search in `find_child_idx`
-- `crates/nexusdb-index/src/tree.rs` — remove alloc in lookup + in-place in insert
+- `crates/axiomdb-index/src/page_layout.rs` — binary search in `find_child_idx`
+- `crates/axiomdb-index/src/tree.rs` — remove alloc in lookup + in-place in insert
 
 ## Subfase 2.5.1 — Lookup without allocations
 

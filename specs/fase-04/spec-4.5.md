@@ -469,10 +469,10 @@ catalog column's `DataType` and `nullable` instead of the fallback.
 
 ## Dependencies
 
-- `nexusdb-sql`: `Stmt`, `ast::*`, `eval`, `is_truthy`, `TableEngine`, `QueryResult`, `ColumnMeta`, `Row`, `analyzer::analyze` — all in same crate
-- `nexusdb-catalog`: `SchemaResolver`, `CatalogWriter`, `CatalogReader` — already a dep
-- `nexusdb-storage`: `StorageEngine`, `Page`, `PageType` — already a dep
-- `nexusdb-wal`: `TxnManager` — already a dep (added in 4.5b)
-- `nexusdb-types`: `Value`, `DataType` — already a dep
+- `axiomdb-sql`: `Stmt`, `ast::*`, `eval`, `is_truthy`, `TableEngine`, `QueryResult`, `ColumnMeta`, `Row`, `analyzer::analyze` — all in same crate
+- `axiomdb-catalog`: `SchemaResolver`, `CatalogWriter`, `CatalogReader` — already a dep
+- `axiomdb-storage`: `StorageEngine`, `Page`, `PageType` — already a dep
+- `axiomdb-wal`: `TxnManager` — already a dep (added in 4.5b)
+- `axiomdb-types`: `Value`, `DataType` — already a dep
 
-No new crate dependencies. Lives in `nexusdb-sql/src/executor.rs`.
+No new crate dependencies. Lives in `axiomdb-sql/src/executor.rs`.

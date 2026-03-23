@@ -56,5 +56,5 @@ Free = 4      — page in the free list
 - Row serialization inside the data area (later phases)
 
 ## Dependencies
-- `nexusdb-core` with `DbError` (already exists)
+- `axiomdb-core` with `DbError` (already exists)
 - `crc32c` crate for hardware-accelerated checksum

@@ -6,10 +6,10 @@ swappable interface. Allows all code in future phases (B-tree, WAL, SQL)
 to work with any storage backend without concrete coupling.
 
 ## Where it lives
-`nexusdb-storage::engine` — NOT in nexusdb-core, because it uses `Page` and `PageType`
-which live in nexusdb-storage. Placing it in nexusdb-core would create a dep cycle.
+`axiomdb-storage::engine` — NOT in axiomdb-core, because it uses `Page` and `PageType`
+which live in axiomdb-storage. Placing it in axiomdb-core would create a dep cycle.
 
-nexusdb-core keeps: `RecordId`, `PageId`, `TxnId`, `Index` trait (abstract, no Page).
+axiomdb-core keeps: `RecordId`, `PageId`, `TxnId`, `Index` trait (abstract, no Page).
 
 ## Trait API
 
@@ -37,7 +37,7 @@ pub trait StorageEngine: Send {
 - [ ] `MmapStorage::alloc_page` returns unique non-overlapping page_ids
 - [ ] `MmapStorage::free_page` + `alloc_page` reuses the page_id
 - [ ] FreeList of MmapStorage persists across reopen
-- [ ] nexusdb-core::traits::StorageEngine removed (replaced by the new one)
+- [ ] axiomdb-core::traits::StorageEngine removed (replaced by the new one)
 
 ## Out of scope
 - `Sync` (interior mutability, locks — Phase 7 MVCC)

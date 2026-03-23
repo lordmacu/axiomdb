@@ -68,7 +68,7 @@ future uses (bulk load, statistical analysis), but is NOT used in the lookup hot
 5. Internal node with keys sharing a long prefix → binary search works the same
 
 ### Acceptance criteria
-- [ ] `point_lookup/nexusdb_btree/1000000` ≥ 800K ops/s in benchmark
+- [ ] `point_lookup/axiomdb_btree/1000000` ≥ 800K ops/s in benchmark
 - [ ] All existing B+ Tree tests continue passing
 - [ ] Zero heap allocations in the lookup path (verifiable by removing the Vec)
 - [ ] `find_child_idx` uses binary search (verifiable by reading the code)
@@ -122,8 +122,8 @@ there is no window where another thread sees a page in an intermediate state.
 4. Insert causing split up to root → full CoW (new root)
 
 ### Acceptance criteria
-- [ ] `insert_1m_sequential/nexusdb_btree_1m` ≥ 180K ops/s
-- [ ] `insert_sequential/nexusdb_btree_1k` ≥ 180K ops/s
+- [ ] `insert_1m_sequential/axiomdb_btree_1m` ≥ 180K ops/s
+- [ ] `insert_sequential/axiomdb_btree_1k` ≥ 180K ops/s
 - [ ] All existing tests continue passing
 - [ ] Data is correct after 1M inserts + 1M lookups
 

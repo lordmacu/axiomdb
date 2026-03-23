@@ -1,6 +1,6 @@
-# NexusDB
+# AxiomDB
 
-**NexusDB** is a database engine written in Rust, designed to be fast, correct, and modern — while remaining compatible with the MySQL wire protocol so existing applications can connect without driver changes.
+**AxiomDB** is a database engine written in Rust, designed to be fast, correct, and modern — while remaining compatible with the MySQL wire protocol so existing applications can connect without driver changes.
 
 ## Goals
 
@@ -29,7 +29,7 @@
 
 ## Current Status
 
-NexusDB is under active development. The following layers are complete and production-quality:
+AxiomDB is under active development. The following layers are complete and production-quality:
 
 - ✅ **Storage engine** — mmap-based 16KB pages, freelist, heap pages
 - ✅ **B+ Tree** — Copy-on-Write, lock-free reads, prefix compression
@@ -39,17 +39,17 @@ NexusDB is under active development. The following layers are complete and produ
 
 The executor (which runs queries) is in active development in Phase 4.
 
-## What Makes NexusDB Different
+## What Makes AxiomDB Different
 
 ### 1. No double-write buffer
 
-MySQL InnoDB uses a double-write buffer to protect against partial page writes, adding significant write overhead. NexusDB uses a **WAL-first architecture** — pages are protected by the write-ahead log, eliminating this overhead entirely.
+MySQL InnoDB uses a double-write buffer to protect against partial page writes, adding significant write overhead. AxiomDB uses a **WAL-first architecture** — pages are protected by the write-ahead log, eliminating this overhead entirely.
 
 <div class="callout callout-advantage">
 <span class="callout-icon">🚀</span>
 <div class="callout-body">
 <span class="callout-label">Performance Advantage</span>
-MySQL InnoDB performs <strong>2× the disk writes</strong> for every page flush — once to the double-write buffer, once to the data file. NexusDB eliminates this overhead by using the WAL as the crash-safety mechanism, with per-page CRC32c checksums to detect and recover from partial writes.
+MySQL InnoDB performs <strong>2× the disk writes</strong> for every page flush — once to the double-write buffer, once to the data file. AxiomDB eliminates this overhead by using the WAL as the crash-safety mechanism, with per-page CRC32c checksums to detect and recover from partial writes.
 </div>
 </div>
 
@@ -61,17 +61,17 @@ The B+ Tree uses **Copy-on-Write semantics** with an atomic root pointer. Reader
 <span class="callout-icon">🚀</span>
 <div class="callout-body">
 <span class="callout-label">Concurrency Advantage</span>
-MySQL InnoDB requires shared read locks for consistent B+ Tree traversal. NexusDB readers load an atomic root pointer and traverse without acquiring any lock — read throughput scales linearly with CPU cores even under concurrent writes.
+MySQL InnoDB requires shared read locks for consistent B+ Tree traversal. AxiomDB readers load an atomic root pointer and traverse without acquiring any lock — read throughput scales linearly with CPU cores even under concurrent writes.
 </div>
 </div>
 
 ### 3. Smart collation out of the box
 
-Most databases require explicit `COLLATE` declarations for correct Unicode sorting. NexusDB defaults to **UCA root collation** (language-neutral Unicode ordering) and can be configured to behave like MySQL or PostgreSQL for migrations.
+Most databases require explicit `COLLATE` declarations for correct Unicode sorting. AxiomDB defaults to **UCA root collation** (language-neutral Unicode ordering) and can be configured to behave like MySQL or PostgreSQL for migrations.
 
 ### 4. Strict mode always on
 
-NexusDB rejects data truncation, invalid dates (`0000-00-00`), and silent type coercions that MySQL allows by default. With `SET NEXUS_COMPAT = 'mysql'`, lenient behavior is restored for migration scenarios.
+AxiomDB rejects data truncation, invalid dates (`0000-00-00`), and silent type coercions that MySQL allows by default. With `SET AXIOM_COMPAT = 'mysql'`, lenient behavior is restored for migration scenarios.
 
 ### 5. Structured error messages
 
@@ -79,9 +79,9 @@ Inspired by the Rust compiler, every error includes: what went wrong, which tabl
 
 ## Parser Performance
 
-NexusDB's SQL parser is **9–17× faster** than sqlparser-rs (the production standard used by Apache Arrow DataFusion and Delta Lake):
+AxiomDB's SQL parser is **9–17× faster** than sqlparser-rs (the production standard used by Apache Arrow DataFusion and Delta Lake):
 
-| Query type | NexusDB | sqlparser-rs | Speedup |
+| Query type | AxiomDB | sqlparser-rs | Speedup |
 |---|---|---|---|
 | Simple SELECT | 492 ns | 4.38 µs | **8.9×** |
 | Complex SELECT (multi-JOIN) | 2.74 µs | 27.0 µs | **9.8×** |

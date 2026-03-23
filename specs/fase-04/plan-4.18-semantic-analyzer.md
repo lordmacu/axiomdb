@@ -4,11 +4,11 @@
 
 | File | Action | Description |
 |---|---|---|
-| `crates/nexusdb-sql/src/analyzer.rs` | CREATE | `analyze()`, `BindContext`, `BoundTable`, resolver functions |
-| `crates/nexusdb-sql/src/lib.rs` | MODIFY | `pub mod analyzer` + re-export `analyze` |
-| `crates/nexusdb-sql/Cargo.toml` | MODIFY | Add `nexusdb-catalog = { workspace = true }` |
-| `crates/nexusdb-core/src/error.rs` | MODIFY | Add `AmbiguousColumn` variant |
-| `crates/nexusdb-sql/tests/integration_analyzer.rs` | CREATE | Integration tests |
+| `crates/axiomdb-sql/src/analyzer.rs` | CREATE | `analyze()`, `BindContext`, `BoundTable`, resolver functions |
+| `crates/axiomdb-sql/src/lib.rs` | MODIFY | `pub mod analyzer` + re-export `analyze` |
+| `crates/axiomdb-sql/Cargo.toml` | MODIFY | Add `axiomdb-catalog = { workspace = true }` |
+| `crates/axiomdb-core/src/error.rs` | MODIFY | Add `AmbiguousColumn` variant |
+| `crates/axiomdb-sql/tests/integration_analyzer.rs` | CREATE | Integration tests |
 
 ---
 
@@ -212,11 +212,11 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 ## Implementation phases
 
-### Phase 1 — nexusdb-core: add AmbiguousColumn
+### Phase 1 — axiomdb-core: add AmbiguousColumn
 Add `AmbiguousColumn { name: String, tables: String }` to `error.rs`.
 
 ### Phase 2 — Cargo.toml
-Add `nexusdb-catalog = { workspace = true }` to `nexusdb-sql/Cargo.toml`.
+Add `axiomdb-catalog = { workspace = true }` to `axiomdb-sql/Cargo.toml`.
 
 ### Phase 3 — analyzer.rs: data structures
 1. `BoundTable` struct.
@@ -242,7 +242,7 @@ Add `nexusdb-catalog = { workspace = true }` to `nexusdb-sql/Cargo.toml`.
 Add `pub mod analyzer` and `pub use analyzer::analyze`.
 
 ### Phase 9 — Integration tests
-File: `crates/nexusdb-sql/tests/integration_analyzer.rs`
+File: `crates/axiomdb-sql/tests/integration_analyzer.rs`
 
 Tests:
 ```
@@ -275,7 +275,7 @@ no_hint_for_very_different_name
   always check all tables and report ambiguity.
 - **DO NOT** mutate `col_idx` in-place on a shared reference — clone the Expr
   node when resolving (Expr derives Clone).
-- **DO NOT** add `nexusdb-catalog` to `nexusdb-types` — only to `nexusdb-sql`.
+- **DO NOT** add `axiomdb-catalog` to `axiomdb-types` — only to `axiomdb-sql`.
 - **DO NOT** call `CatalogReader` more than once per table — cache the column
   list in `BoundTable` at context-build time.
 

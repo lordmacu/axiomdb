@@ -2,7 +2,7 @@
 
 ## What to build (not how)
 
-A unified return type for every SQL statement executed by the NexusDB executor.
+A unified return type for every SQL statement executed by the AxiomDB executor.
 Every path through the executor — SELECT, INSERT, UPDATE, DELETE, DDL — returns
 exactly one `QueryResult`. Callers (embedded API, wire protocol server, CLI REPL)
 pattern-match on the variant to produce the appropriate response.
@@ -79,7 +79,7 @@ pub struct ColumnMeta {
 #### `QueryResult`
 
 ```rust
-/// Unified return value from the NexusDB executor for any SQL statement.
+/// Unified return value from the AxiomDB executor for any SQL statement.
 ///
 /// ## Variants
 ///
@@ -198,7 +198,7 @@ QueryResult::Rows {
 
 ## Acceptance criteria
 
-- [ ] `nexusdb-sql/src/result.rs` compiles with `cargo check`
+- [ ] `axiomdb-sql/src/result.rs` compiles with `cargo check`
 - [ ] `Row` type alias is `Vec<Value>` — no newtype wrapper
 - [ ] `ColumnMeta` has exactly four public fields: `name`, `data_type`, `nullable`, `table_name`
 - [ ] `QueryResult` has exactly three variants: `Rows`, `Affected`, `Empty`
@@ -207,7 +207,7 @@ QueryResult::Rows {
 - [ ] `ColumnMeta` additionally derives `PartialEq`
 - [ ] Convenience constructors on `QueryResult` and `ColumnMeta` exist
 - [ ] Unit tests: construction of each variant, clone, debug print, invariant checks
-- [ ] Re-exported from `nexusdb-sql/src/lib.rs`
+- [ ] Re-exported from `axiomdb-sql/src/lib.rs`
 - [ ] `cargo test --workspace` passes
 - [ ] `cargo clippy --workspace -- -D warnings` passes
 - [ ] `cargo fmt --check` passes
@@ -229,6 +229,6 @@ QueryResult::Rows {
 
 ## Dependencies
 
-- `nexusdb-types` — for `Value` and `DataType` (already a dep of `nexusdb-sql`)
+- `axiomdb-types` — for `Value` and `DataType` (already a dep of `axiomdb-sql`)
 - No new crate dependencies required
-- Lives in: `nexusdb-sql/src/result.rs`, re-exported from `nexusdb-sql/src/lib.rs`
+- Lives in: `axiomdb-sql/src/result.rs`, re-exported from `axiomdb-sql/src/lib.rs`

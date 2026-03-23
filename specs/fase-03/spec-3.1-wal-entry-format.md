@@ -13,7 +13,7 @@ Does not include I/O (that is 3.2 WalWriter and 3.3 WalReader).
 | Aspect | Decision | Reason |
 |---|---|---|
 | Granularity | **Logical** (semantic operation) | Small entries, recovery replays the operation, compatible with replication (Phase 18) and MVCC (Phase 7) |
-| WAL scope | **Global** (`nexusdb.wal`) | A single atomic LSN, a single fsync, multi-table transactions without coordination |
+| WAL scope | **Global** (`axiomdb.wal`) | A single atomic LSN, a single fsync, multi-table transactions without coordination |
 | Value encoding | **Raw bytes** (`&[u8]`) | No type overhead, extensible: today RecordId (10B), in Phase 4 full rows |
 | Endianness | **Little-endian** | Consistent with the rest of the codebase (PageHeader, page_layout) |
 | Checksum | **CRC32c** | Same algorithm as pages — a single dependency |
@@ -174,6 +174,6 @@ verified during deserialization.
 
 ## Dependencies
 
-- `nexusdb-core`: `DbError` (add variants `WalChecksumMismatch`, `WalEntryTruncated`, `WalUnknownEntryType`)
+- `axiomdb-core`: `DbError` (add variants `WalChecksumMismatch`, `WalEntryTruncated`, `WalUnknownEntryType`)
 - `crc32c` (already in workspace since Phase 1)
-- Does not depend on `nexusdb-storage` or `nexusdb-index`
+- Does not depend on `axiomdb-storage` or `axiomdb-index`

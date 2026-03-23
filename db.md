@@ -1,6 +1,6 @@
-# NexusDB — Database Engine in Rust
+# AxiomDB — Database Engine in Rust
 
-> University project: NexusDB is a portable, fast database engine with SQL, indexes, foreign keys, and concurrency.
+> University project: AxiomDB is a portable, fast database engine with SQL, indexes, foreign keys, and concurrency.
 
 > Inspired by ISAM but modern. Goal: outperform MySQL on specific benchmarks.
 
@@ -225,7 +225,7 @@ path = "src/server.rs"
 ```python
 import ctypes
 db = ctypes.CDLL("./libdbyo.so")
-conn = db.dbyo_open(b"./nexusdb.db")
+conn = db.dbyo_open(b"./axiomdb.db")
 db.dbyo_execute(conn, b"SELECT * FROM users WHERE id = 1", ...)
 db.dbyo_close(conn)
 ```
@@ -233,7 +233,7 @@ db.dbyo_close(conn)
 **C++ / Qt:**
 ```cpp
 #include "dbyo.h"
-auto* db = dbyo_open("./nexusdb.db");
+auto* db = dbyo_open("./axiomdb.db");
 dbyo_execute(db, "INSERT INTO logs VALUES (1, 'inicio')", &result);
 dbyo_close(db);
 ```
@@ -241,7 +241,7 @@ dbyo_close(db);
 **Electron / Node.js (via Neon):**
 ```js
 const { Database } = require('./dbyo-node');
-const db = new Database('./nexusdb.db');
+const db = new Database('./axiomdb.db');
 const rows = db.execute('SELECT * FROM products LIMIT 10');
 ```
 
@@ -3222,7 +3222,7 @@ impl WalSender {
 ```sql
 -- Restaurar al estado exacto de hace 2 horas
 RESTORE DATABASE nexusdb
-  FROM BACKUP '/backups/nexusdb_2026-03-21.base'
+  FROM BACKUP '/backups/axiomdb_2026-03-21.base'
   TO TIMESTAMP '2026-03-21 10:30:00';
 
 -- El motor:
@@ -3237,7 +3237,7 @@ async fn pitr_restore(backup_path: &str, target_time: u64) -> Result<()> {
     restore_base_backup(backup_path).await?;
 
     // 2. Reproducir WAL hasta target_time
-    let wal = WalReader::open("nexusdb.wal")?;
+    let wal = WalReader::open("axiomdb.wal")?;
     for entry in wal.iter() {
         if entry.timestamp > target_time { break; }
         entry.apply(&mut engine).await?;
@@ -3385,7 +3385,7 @@ log_format           = "json"   # o "text"
   "timestamp": "2026-03-21T10:30:00Z",
   "duration_ms": 342,
   "user": "ana",
-  "database": "nexusdb",
+  "database": "axiomdb",
   "query": "SELECT * FROM orders JOIN users ON ...",
   "rows_examined": 1000000,
   "rows_returned": 3,
@@ -3661,15 +3661,15 @@ Crate: `parquet = "52"` (mismo ecosistema que Arrow).
 
 ```sql
 -- Backup completo (hot backup — sin lockear la BD)
-BACKUP DATABASE nexusdb TO '/backups/nexusdb_20260321.backup'
+BACKUP DATABASE nexusdb TO '/backups/axiomdb_20260321.backup'
 WITH (FORMAT binary, COMPRESS true);
 
 -- Backup incremental (solo cambios desde el último backup)
-BACKUP DATABASE nexusdb TO '/backups/nexusdb_20260321_inc.backup'
-WITH (FORMAT binary, INCREMENTAL true, SINCE '/backups/nexusdb_20260320.backup');
+BACKUP DATABASE nexusdb TO '/backups/axiomdb_20260321_inc.backup'
+WITH (FORMAT binary, INCREMENTAL true, SINCE '/backups/axiomdb_20260320.backup');
 
 -- Restore
-RESTORE DATABASE nexusdb FROM '/backups/nexusdb_20260321.backup';
+RESTORE DATABASE nexusdb FROM '/backups/axiomdb_20260321.backup';
 
 -- Dump SQL (portable, texto legible)
 DUMP DATABASE nexusdb TO '/backups/nexusdb.sql'
@@ -4415,12 +4415,12 @@ Fase 10 — Modo embebido + FFI       (semana 15-16)
   ✓ Binding Python (ctypes) para pruebas
   ✓ Binding Node.js via Neon (opcional, para Electron)
   ✓ Tests: misma BD usada desde servidor y desde librería
-  ✓ [MOBILE] flutter_rust_bridge: bindings Dart generados desde la API Rust de nexusdb-embedded
+  ✓ [MOBILE] flutter_rust_bridge: bindings Dart generados desde la API Rust de axiomdb-embedded
   ✓ [MOBILE] Cross-compilación declarada: aarch64-apple-ios, aarch64-linux-android, x86_64-linux-android
   ✓ [MOBILE] Perfil de release mobile: opt-level="z", lto=true, strip=true, panic=abort
   ✓ [MOBILE] Tests de integración: misma BD usada desde Flutter (Dart) y desde C FFI
-  ✓ [DESKTOP] Tauri plugin: nexusdb-embedded como plugin Tauri — produce .msi/.dmg/.AppImage con nexusdb dentro
-  ✓ [DESKTOP] npm package nexusdb-node: wheels precompilados por plataforma (win32-x64, darwin-arm64, linux-x64)
+  ✓ [DESKTOP] Tauri plugin: axiomdb-embedded como plugin Tauri — produce .msi/.dmg/.AppImage con nexusdb dentro
+  ✓ [DESKTOP] npm package axiomdb-node: wheels precompilados por plataforma (win32-x64, darwin-arm64, linux-x64)
   ✓ [DESKTOP] Universal binary macOS: lipo -create arm64 + x86_64 → libnexusdb.dylib corre en Intel y Apple Silicon
   ✓ [DESKTOP] cargo-bundle: `cargo bundle --release` genera .app (macOS), .deb (Linux), instalador (Windows)
 
@@ -4476,7 +4476,7 @@ Fase 15 — MongoDB + DoltDB + Arrow  (semana 25-26)
   ✓ nexusdb branch list / merge / delete / diff — gestión completa desde CLI
   ✓ Casos de uso: probar migraciones sin riesgo, review apps por PR, entornos de CI/CD aislados
   ✓ Kafka sink nativo: CREATE KAFKA SINK ... FROM TABLE ... BROKER ... TOPIC — sin Debezium externo
-  ✓ Kafka source: CREATE KAFKA SOURCE ... — consumir topics de Kafka como tablas de NexusDB
+  ✓ Kafka source: CREATE KAFKA SOURCE ... — consumir topics de Kafka como tablas de AxiomDB
   ✓ Formatos Kafka: JSON, Avro (con Schema Registry), Protobuf
   ✓ Kafka exactly-once semantics usando transacciones + idempotent producer
 
@@ -4623,7 +4623,7 @@ Fase 22 — Features de producto      (semana 40-42)
   ✓ OData $metadata — EDMX autodescubierto desde catálogo (PowerBI lo usa al conectar)
   ✓ OData $filter/$select/$orderby/$top/$skip/$count/$expand/$batch
   ✓ OData interno: parser URL → AST OData → translator → SqlStatement → executor existente
-  ✓ Auto REST API (nexusdb-rest, PostgREST-style): puerto :3310, schema autodescubierto
+  ✓ Auto REST API (axiomdb-rest, PostgREST-style): puerto :3310, schema autodescubierto
   ✓ REST CRUD automático: GET/POST/PATCH/DELETE /rest/<tabla> sin escribir código
   ✓ REST filtros: ?column=eq.valor&order=col.desc&limit=10&offset=20
   ✓ REST joins: ?select=*,orders(*) — expand relaciones por FK automáticamente
@@ -4640,7 +4640,7 @@ Fase 22 — Features de producto      (semana 40-42)
 
 OData (Open Data Protocol) es el estándar REST usado por PowerBI, Excel Power Query,
 Tableau, SAP, Microsoft Dynamics y prácticamente todo el ecosistema enterprise.
-Con un endpoint OData, NexusDB se conecta a PowerBI sin drivers, sin ODBC, sin gateway —
+Con un endpoint OData, AxiomDB se conecta a PowerBI sin drivers, sin ODBC, sin gateway —
 el analista escribe la URL y tiene sus datos en segundos.
 
 ### Arquitectura
@@ -4667,28 +4667,28 @@ PowerBI / Excel / Tableau / SAP
 └─────────────────────────────┘
         │
         ▼
-   Motor NexusDB (compartido con MySQL, PostgreSQL, GraphQL)
+   Motor AxiomDB (compartido con MySQL, PostgreSQL, GraphQL)
 ```
 
 ### Endpoint $metadata — autodescubierto
 
-PowerBI llama a `GET /odata/$metadata` al conectar. NexusDB genera el documento
+PowerBI llama a `GET /odata/$metadata` al conectar. AxiomDB genera el documento
 EDMX desde el catálogo de tablas sin configuración manual:
 
 ```xml
 <!-- GET /odata/$metadata -->
 <edmx:Edmx Version="4.0">
   <edmx:DataServices>
-    <Schema Namespace="NexusDB">
+    <Schema Namespace="AxiomDB">
       <EntityType Name="User">
         <Key><PropertyRef Name="Id"/></Key>
         <Property Name="Id" Type="Edm.Guid" Nullable="false"/>
         <Property Name="Name" Type="Edm.String"/>
         <Property Name="Email" Type="Edm.String"/>
         <Property Name="CreatedAt" Type="Edm.DateTimeOffset"/>
-        <NavigationProperty Name="Orders" Type="Collection(NexusDB.Order)"/>
+        <NavigationProperty Name="Orders" Type="Collection(AxiomDB.Order)"/>
       </EntityType>
-      <EntitySet Name="Users" EntityType="NexusDB.User"/>
+      <EntitySet Name="Users" EntityType="AxiomDB.User"/>
     </Schema>
   </edmx:DataServices>
 </edmx:Edmx>
@@ -4719,13 +4719,13 @@ GET /odata/users/$count
 2. URL: http://servidor:3309/odata
 3. PowerBI llama a /odata/$metadata → descubre tablas automáticamente
 4. El analista elige qué tablas importar
-5. PowerBI genera queries OData → NexusDB las traduce a SQL → retorna JSON
+5. PowerBI genera queries OData → AxiomDB las traduce a SQL → retorna JSON
 6. Sin drivers, sin ODBC, sin gateway — funciona en cualquier OS
 ```
 
-### Tipos OData ↔ NexusDB
+### Tipos OData ↔ AxiomDB
 
-| Tipo NexusDB | Tipo OData (Edm) |
+| Tipo AxiomDB | Tipo OData (Edm) |
 |---|---|
 | INT, BIGINT | Edm.Int32, Edm.Int64 |
 | REAL, DOUBLE | Edm.Single, Edm.Double |
@@ -4751,7 +4751,7 @@ max_page = 1000       # máximo de filas por respuesta ($top implícito)
 
 ### Diferenciador
 
-| Herramienta | Forma de conectar a una BD | Con NexusDB OData |
+| Herramienta | Forma de conectar a una BD | Con AxiomDB OData |
 |---|---|---|
 | PowerBI | ODBC driver + gateway + configuración | URL directa, cero instalación |
 | Excel | Complemento + driver | Datos → OData Feed → URL |
@@ -4763,15 +4763,15 @@ max_page = 1000       # máximo de filas por respuesta ($top implícito)
 #### Crates involucrados
 
 ```
-nexusdb-odata          ← nuevo crate (Fase 22)
+axiomdb-odata          ← nuevo crate (Fase 22)
     ├── parser.rs      ← URL OData → AST OData
-    ├── translator.rs  ← AST OData → SqlStatement (reutiliza nexusdb-sql)
+    ├── translator.rs  ← AST OData → SqlStatement (reutiliza axiomdb-sql)
     ├── metadata.rs    ← catálogo → documento EDMX/XML autodescubierto
     ├── serializer.rs  ← QueryResult → JSON OData
     └── server.rs      ← servidor HTTP con axum en puerto :3309
 
-nexusdb-sql            ← Fase 4, reutilizado sin cambios
-nexusdb-catalog        ← Fase 4, fuente del $metadata y resolución de FKs
+axiomdb-sql            ← Fase 4, reutilizado sin cambios
+axiomdb-catalog        ← Fase 4, fuente del $metadata y resolución de FKs
 ```
 
 #### Flujo end-to-end de una request
@@ -4793,7 +4793,7 @@ ODataParser::parse()
          │
          ▼
 ODataTranslator::translate()          ← SOLO pieza nueva
-→ SqlStatement::Select {              ← tipo ya existente en nexusdb-sql
+→ SqlStatement::Select {              ← tipo ya existente en axiomdb-sql
     table: "orders",
     joins: [Join { table: "customers", on: "customer_id = id" }],
     where: BinaryOp(Column("total"), Gt, Literal(100)),
@@ -4879,7 +4879,7 @@ let router = Router::new()
 #### Lo que se reutiliza vs lo que es nuevo
 
 ```
-REUTILIZADO (cero cambios):          NUEVO (solo en nexusdb-odata):
+REUTILIZADO (cero cambios):          NUEVO (solo en axiomdb-odata):
 ─────────────────────────────        ────────────────────────────────
 ✅ Executor SQL (Fase 4)             🆕 OData URL parser → AST OData
 ✅ SqlStatement / AST SQL (Fase 4)   🆕 AST OData → SqlStatement translator
@@ -4891,7 +4891,7 @@ REUTILIZADO (cero cambios):          NUEVO (solo en nexusdb-odata):
 ```
 
 El 80% del trabajo ya está hecho al llegar a Fase 22.
-`nexusdb-odata` es un adaptador de protocolo — traduce OData al lenguaje
+`axiomdb-odata` es un adaptador de protocolo — traduce OData al lenguaje
 interno que el motor ya habla, igual que el MySQL wire protocol traduce el
 protocolo MySQL.
 
@@ -4899,9 +4899,9 @@ protocolo MySQL.
 
 ## GraphQL API Nativa
 
-### Por qué tiene sentido en NexusDB
+### Por qué tiene sentido en AxiomDB
 
-NexusDB ya expone el mismo motor por dos vías (MySQL wire protocol + C FFI embebido).
+AxiomDB ya expone el mismo motor por dos vías (MySQL wire protocol + C FFI embebido).
 GraphQL es un tercer protocolo de acceso que se construye encima de todo lo ya hecho,
 sin duplicar lógica. El WAL ya es un event bus — las subscriptions son una consecuencia
 natural de leerlo como stream.
@@ -4924,7 +4924,7 @@ Cliente (web/mobile/backend)
 └─────────────────────────────┘
         │
         ▼
-   Motor NexusDB (compartido)
+   Motor AxiomDB (compartido)
 ```
 
 ### Schema autodescubierto
@@ -5011,7 +5011,7 @@ max_depth = 10         # profundidad máxima de queries anidadas
 
 ### Diferenciador vs competencia
 
-| Característica | Hasura | PostGraphile | NexusDB GraphQL |
+| Característica | Hasura | PostGraphile | AxiomDB GraphQL |
 |---|---|---|---|
 | Arquitectura | Encima de Postgres | Encima de Postgres | Nativo dentro del motor |
 | Subscriptions | Polling o logical decoding | Polling | WAL stream directo |
@@ -5033,9 +5033,9 @@ Fase 23 — Retrocompatibilidad       (semana 43-45)
   ✓ Guía de conexión GUI: DBeaver / DataGrip / TablePlus / pgAdmin conectan como PostgreSQL (puerto 5432) sin drivers custom — information_schema + pg_catalog cubren el schema discovery completo
   ✓ dbt-nexusdb: profile adapter oficial publicado en PyPI — pip install dbt-nexusdb
   ✓ dbt materialization strategies: table, view, incremental, ephemeral — todas soportadas
-  ✓ dbt schema tests: not_null, unique, accepted_values, relationships — ejecutan sobre NexusDB
-  ✓ dbt docs generate: documenta el schema de NexusDB automáticamente
-  ✓ dbt seeds: cargar CSV como tablas en NexusDB desde el CLI de dbt
+  ✓ dbt schema tests: not_null, unique, accepted_values, relationships — ejecutan sobre AxiomDB
+  ✓ dbt docs generate: documenta el schema de AxiomDB automáticamente
+  ✓ dbt seeds: cargar CSV como tablas en AxiomDB desde el CLI de dbt
 
 Fase 24 — Sistema de tipos completo (semana 46-48)
   ✓ Enteros: TINYINT, SMALLINT, BIGINT, HUGEINT + variantes U (sin signo)
@@ -5157,7 +5157,7 @@ Fase 30 — Infraestructura pro       (semana 64-66)
   ✓ Multiplexing modes: session (1:1), transaction (retorna al pool entre transacciones), statement
   ✓ Server-side prepared statements preservados en modo transaction multiplexing
   ✓ SET / RESET de parámetros de sesión replicados al reconectar (search_path, timezone, etc.)
-  ✓ Stats: nexusdb_pool_stats vista con conexiones activas, idle, waiting, canceladas por timeout
+  ✓ Stats: axiomdb_pool_stats vista con conexiones activas, idle, waiting, canceladas por timeout
 
 Fase 31 — Features finales           (semana 67-69)
   ✓ Cifrado en reposo: AES-256-GCM por página (aes-gcm crate)
@@ -5234,7 +5234,7 @@ Fase 34 — Infraestructura distribuida y completitud  (semana 77-80)
   ✓ Quotas por tenant: storage, connections, max_rows, max_query_time — enforcement automático
   ✓ BACKUP TENANT / RESTORE TENANT — backup y restore aislado por tenant sin afectar otros
   ✓ ALTER TENANT ALL APPLY MIGRATION — aplicar migraciones de schema a todos los tenants en paralelo
-  ✓ Tenant billing view: nexusdb_tenant_usage con storage, queries, rows_read por tenant
+  ✓ Tenant billing view: axiomdb_tenant_usage con storage, queries, rows_read por tenant
 
 Fase 35 — Deployment y DevEx        (semana 81-83)
   ✓ Dockerfile multi-stage: builder Rust + runtime debian-slim mínimo
@@ -5247,10 +5247,10 @@ Fase 35 — Deployment y DevEx        (semana 81-83)
   ✓ GitHub Actions CI: test + clippy + fuzz + bench en cada PR
   ✓ [DESKTOP/WIN] nexusdb.dll precompilado para x86_64-pc-windows-msvc — descargable desde GitHub Releases
   ✓ [DESKTOP/WIN] Instalador .msi (WiX Toolset) para modo servidor local: instala como Windows Service
-  ✓ [DESKTOP/WIN] winget package: winget install nexusdb.NexusDB
+  ✓ [DESKTOP/WIN] winget package: winget install nexusdb.AxiomDB
   ✓ [DESKTOP/WIN] Chocolatey package: choco install nexusdb
   ✓ [DESKTOP/MAC] libnexusdb.dylib universal (arm64 + x86_64) — descargable desde GitHub Releases
-  ✓ [DESKTOP/MAC] .dmg para modo servidor local: instala nexusdb-server + LaunchAgent (arranque automático)
+  ✓ [DESKTOP/MAC] .dmg para modo servidor local: instala axiomdb-server + LaunchAgent (arranque automático)
   ✓ [DESKTOP/MAC] Code signing + notarización Apple para pasar Gatekeeper sin warnings
   ✓ [DESKTOP/MAC] brew services start nexusdb — gestiona el servidor local como LaunchAgent
   ✓ [DESKTOP/LINUX] libnexusdb.so precompilado para x86_64 y aarch64 — descargable desde GitHub Releases
@@ -5259,33 +5259,33 @@ Fase 35 — Deployment y DevEx        (semana 81-83)
   ✓ GitHub Releases publica binarios para todas las plataformas en cada tag: win/mac/linux × amd64/arm64
   ✓ Homebrew formula: brew install nexusdb para macOS
   ✓ Guía de performance tuning: parámetros por workload (OLTP, OLAP, mixto)
-  ✓ nexusdb-odbc: driver ODBC escrito en Rust (odbc-api crate) compilado como cdylib
+  ✓ axiomdb-odbc: driver ODBC escrito en Rust (odbc-api crate) compilado como cdylib
   ✓ Implementa: SQLConnect, SQLDisconnect, SQLExecDirect, SQLFetch, SQLDescribeCol, SQLGetTypeInfo
   ✓ Compilado como .dll (Windows) / .so (Linux) / .dylib (macOS) — registrable en unixODBC / iODBC / Windows ODBC Manager
-  ✓ Se conecta internamente vía PostgreSQL wire protocol — reutiliza nexusdb-network sin duplicar lógica
+  ✓ Se conecta internamente vía PostgreSQL wire protocol — reutiliza axiomdb-network sin duplicar lógica
   ✓ Habilitadores: Excel (Get Data), R (DBI + odbc), pyodbc, Tableau, SAP, Access, SSRS
   ✓ dbyo-odbc-installer: CLI que registra el driver en el ODBC Manager del sistema automáticamente
-  ✓ Paquete .deb (Ubuntu/Debian): nexusdb-server_X.Y.Z_amd64.deb — instala binario, usuario sistema, servicio systemd
-  ✓ Paquete .rpm (RHEL/CentOS/Fedora/AlmaLinux): nexusdb-server-X.Y.Z.x86_64.rpm — equivalente para distros RPM
+  ✓ Paquete .deb (Ubuntu/Debian): axiomdb-server_X.Y.Z_amd64.deb — instala binario, usuario sistema, servicio systemd
+  ✓ Paquete .rpm (RHEL/CentOS/Fedora/AlmaLinux): axiomdb-server-X.Y.Z.x86_64.rpm — equivalente para distros RPM
   ✓ Repositorio APT oficial: deb [signed-by] https://pkg.nexusdb.io/apt stable main
   ✓ Repositorio YUM/DNF oficial: https://pkg.nexusdb.io/rpm/nexusdb.repo
   ✓ Script de instalación universal: curl -sSf https://install.nexusdb.io | sh
       — detecta distro (apt/yum/dnf/brew/pacman), agrega repo, instala paquete, lanza wizard
   ✓ GitHub Actions publica .deb y .rpm en cada release tag vía cargo-deb + cargo-generate-rpm
-  ✓ nexusdb-wizard: wizard interactivo de configuración por terminal (ratatui + dialoguer)
+  ✓ axiomdb-wizard: wizard interactivo de configuración por terminal (ratatui + dialoguer)
       Paso 1 — Bienvenida: versión detectada, modo de instalación (nuevo / reconfigurar)
       Paso 2 — Directorio de datos: ruta con validación de permisos y espacio disponible
       Paso 3 — Puertos: MySQL (def. 3306) y PostgreSQL (def. 5432) con detección de conflictos
       Paso 4 — Admin: usuario admin + contraseña con confirmación y medidor de fortaleza
       Paso 5 — TLS: ninguno / auto-signed / certificado propio (pide rutas cert/key)
-      Paso 6 — Memoria: RAM detectada automáticamente, slider para asignar porcentaje a NexusDB
+      Paso 6 — Memoria: RAM detectada automáticamente, slider para asignar porcentaje a AxiomDB
       Paso 7 — Replicación: standalone / primary / replica (pide host del primary si aplica)
       Paso 8 — Resumen: muestra el nexusdb.toml que se va a generar, pide confirmación
       Paso 9 — Aplicar: crea directorios, escribe nexusdb.toml, habilita y arranca servicio systemd
       Paso 10 — Verificación: ping al puerto, muestra conexión de ejemplo (psql / mysql)
-  ✓ nexusdb-wizard --reconfigure: relanza el wizard sobre una instalación existente sin perder datos
-  ✓ nexusdb-wizard --non-interactive: modo CI con flags (--data-dir --port --password --no-tls)
-  ✓ [STUDIO] NexusDB Studio: web UI servida por el propio servidor en puerto :8080 — sin instalación extra
+  ✓ axiomdb-wizard --reconfigure: relanza el wizard sobre una instalación existente sin perder datos
+  ✓ axiomdb-wizard --non-interactive: modo CI con flags (--data-dir --port --password --no-tls)
+  ✓ [STUDIO] AxiomDB Studio: web UI servida por el propio servidor en puerto :8080 — sin instalación extra
   ✓ [STUDIO] Dashboard: queries/s, latencia p50/p95/p99, conexiones activas, hit rate de cache, WAL lag
   ✓ [STUDIO] Table editor: ver, filtrar, editar y eliminar filas con UI visual — sin escribir SQL
   ✓ [STUDIO] SQL editor: autocomplete de tablas/columnas/funciones, syntax highlighting, múltiples tabs
@@ -5296,17 +5296,17 @@ Fase 35 — Deployment y DevEx        (semana 81-83)
   ✓ [STUDIO] Replication monitor: lag por réplica, slots activos, publicaciones y suscripciones
   ✓ [STUDIO] AI assistant integrado: NL_QUERY() desde la UI — preguntar en lenguaje natural
   ✓ [STUDIO] Construido con Axum (backend) + HTMX + Tailwind (frontend) — sin framework JS pesado
-  ✓ [STUDIO] Autenticación: usa las credenciales existentes de NexusDB — sin usuario separado
-  ✓ [STUDIO] nexusdb-studio: crate separado, opcional, activado con --studio en nexusdb-server
-  ✓ [VSCODE] nexusdb-vscode: extensión publicada en VS Code Marketplace
+  ✓ [STUDIO] Autenticación: usa las credenciales existentes de AxiomDB — sin usuario separado
+  ✓ [STUDIO] axiomdb-studio: crate separado, opcional, activado con --studio en axiomdb-server
+  ✓ [VSCODE] axiomdb-vscode: extensión publicada en VS Code Marketplace
   ✓ [VSCODE] Schema explorer: árbol de conexiones → bases de datos → tablas → columnas/índices/FK
   ✓ [VSCODE] IntelliSense: autocomplete de tablas, columnas, tipos propios (VECTOR, LTREE, HLL, MAP...)
-  ✓ [VSCODE] Syntax highlighting: keywords NexusDB, operadores <=> <-> <#>, funciones AI_*
+  ✓ [VSCODE] Syntax highlighting: keywords AxiomDB, operadores <=> <-> <#>, funciones AI_*
   ✓ [VSCODE] Query runner: ejecutar SQL seleccionado con Ctrl+Enter, resultados en panel lateral
   ✓ [VSCODE] EXPLAIN inline: decoradores en el editor muestran costo estimado por cláusula
   ✓ [VSCODE] Connection manager: múltiples servidores/entornos guardados con soporte a .env
   ✓ [VSCODE] Migration runner: nexusdb migrate up/down/status desde la paleta de comandos
-  ✓ Kubernetes operator: CRD NexusDBCluster — gestiona deploy, scaling, backups y upgrades en K8s
+  ✓ Kubernetes operator: CRD AxiomDBCluster — gestiona deploy, scaling, backups y upgrades en K8s
   ✓ Helm chart oficial: helm install nexusdb nexusdb/nexusdb — values para primary/replicas/storage
   ✓ K8s operator features: rolling upgrades sin downtime, auto-failover, PVC resize automático
   ✓ Seed data tooling: nexusdb seed --file seeds/dev.sql — cargar datos iniciales en desarrollo
@@ -5314,7 +5314,7 @@ Fase 35 — Deployment y DevEx        (semana 81-83)
   ✓ nexusdb seed --anonymize --from <origen> — copiar datos de producción con PII reemplazado
   ✓ Prisma native adapter: driverAdapters para Prisma ORM — sin pasar por wire protocol PostgreSQL
   ✓ SQLAlchemy dialect oficial: pip install sqlalchemy-nexusdb — dialect registrado para ORM Python
-  ✓ ActiveRecord adapter: gem nexusdb-activerecord — Rails conecta directamente a NexusDB
+  ✓ ActiveRecord adapter: gem axiomdb-activerecord — Rails conecta directamente a AxiomDB
   ✓ Rolling upgrade en Kubernetes: K8s operator actualiza réplicas una por una, failover automático al terminar — manejado sin intervención manual
   ✓ OTA para modo embebido (mobile/desktop): al abrir un .db antiguo la nueva versión migra silenciosamente sin pantallas de espera
   ✓ OTA fail-safe: si la migración embebida falla el archivo original no se toca — la app recibe un error claro, nunca datos corruptos
@@ -5323,7 +5323,7 @@ Fase 35 — Deployment y DevEx        (semana 81-83)
   ✓ Version negotiation en wire protocol: cliente y servidor anuncian su versión en el handshake — servidor rechaza clientes demasiado viejos con mensaje claro
 
 Fase 36 — Mobile Sync Layer         (semana 84-87)
-  ✓ nexusdb-sync: nuevo crate (depende de nexusdb-wal, nexusdb-mvcc, nexusdb-replication, nexusdb-catalog)
+  ✓ axiomdb-sync: nuevo crate (depende de axiomdb-wal, axiomdb-mvcc, axiomdb-replication, axiomdb-catalog)
   ✓ HLC (Hybrid Logical Clock) por fila: timestamp físico + contador lógico, sin coordinador central
   ✓ Columna __hlc TIMESTAMPTZ GENERATED ALWAYS AS HLC() STORED — automática en tablas sync-enabled
   ✓ Columna __deleted BOOLEAN DEFAULT FALSE — soft delete integrado con sync (usa Fase 21)
@@ -5331,15 +5331,15 @@ Fase 36 — Mobile Sync Layer         (semana 84-87)
   ✓ Delta sync protocol: GET /sync?table=X&since=<lsn> — retorna solo filas modificadas desde LSN dado
   ✓ Conflict resolution trait: trait ConflictResolver { fn resolve(local: Row, remote: Row) -> Row }
   ✓ Estrategias built-in: LastWriteWins (HLC), FieldLevelMerge (por columna), ServerWins, ClientWins
-  ✓ CRDT types como feature flag en nexusdb-types: LWWRegister<T>, GCounter, PNCounter, ORSet<T>
+  ✓ CRDT types como feature flag en axiomdb-types: LWWRegister<T>, GCounter, PNCounter, ORSet<T>
   ✓ CREATE TABLE ... WITH (sync = true, conflict = 'last_write_wins') — sintaxis SQL unificada
   ✓ SyncManager: WalSubscriber que trackea posición por cliente y retiene WAL necesario
-  ✓ nexusdb-embedded opcional: feature "mobile-sync" activa nexusdb-sync en la build
+  ✓ axiomdb-embedded opcional: feature "mobile-sync" activa axiomdb-sync en la build
   ✓ Dart binding (flutter_rust_bridge): sync_pull(since_lsn) y sync_push(changes) como futures
   ✓ Tests: simular dos dispositivos offline, modificar mismas filas, sincronizar y verificar resolución
 
 Fase 37 — Graph Layer                (semana 88-91)
-  ✓ nexusdb-graph: nuevo crate para datos de grafos sobre el storage existente (B+ Tree + páginas)
+  ✓ axiomdb-graph: nuevo crate para datos de grafos sobre el storage existente (B+ Tree + páginas)
   ✓ Tipos DDL: CREATE GRAPH, CREATE NODE TABLE, CREATE EDGE TABLE con propiedades tipadas
   ✓ SQL/PGQ (ISO SQL:2023): MATCH (a:Persona)-[r:AMIGO_DE]->(b:Persona) dentro de SELECT
   ✓ Graph traversal: BFS, DFS, shortest path (Dijkstra, A*), all paths entre dos nodos
@@ -5608,8 +5608,8 @@ impl ForeignDataWrapper for HttpFdw {
 -- Múltiples bases de datos en el mismo servidor
 CREATE DATABASE ventas;
 CREATE DATABASE analytics;
-CREATE DATABASE nexusdb_test;
-DROP DATABASE nexusdb_test;
+CREATE DATABASE axiomdb_test;
+DROP DATABASE axiomdb_test;
 
 -- Cambiar de BD activa
 USE ventas;
@@ -5809,7 +5809,7 @@ Crate: `mysql_async = "0.34"`.
 dbyo migrate from-postgres \
   --conn "postgresql://user:pass@host:5432/sourcedb" \
   --schema public \
-  --target nexusdb_migrated
+  --target axiomdb_migrated
 
 # También acepta pg_dump:
 dbyo source dump.sql   # pg_dump --format=plain
@@ -7360,7 +7360,7 @@ method   = "scram-sha-256"
 [[auth.rules]]
 host     = "10.0.0.0/8"
 user     = "service_account"
-database = "nexusdb"
+database = "axiomdb"
 method   = "cert"      # autenticación por certificado cliente
 
 [[auth.rules]]
@@ -9217,7 +9217,7 @@ host              = "0.0.0.0"
 mysql_port        = 3306
 postgres_port     = 5432
 max_connections   = 200
-default_database  = "nexusdb"
+default_database  = "axiomdb"
 data_dir          = "/data"
 
 [auth]
@@ -9322,7 +9322,7 @@ Dos modelos de distribución completamente distintos:
 EMBEDDED (como SQLite)                   SERVER LOCAL (como MySQL local)
 ─────────────────────────────────────    ──────────────────────────────────
 nexusdb vive DENTRO de la app            nexusdb se instala SEPARADO
-El usuario solo instala "MiApp"          El usuario instala "NexusDB"
+El usuario solo instala "MiApp"          El usuario instala "AxiomDB"
 No hay puerto, no hay daemon             Corre como servicio del sistema
                                          Expone puertos 3306 / 5432
 
@@ -9349,15 +9349,15 @@ MiApp-Setup.exe
 
 ```powershell
 # WinGet
-winget install nexusdb.NexusDB
+winget install nexusdb.AxiomDB
 
 # Chocolatey
 choco install nexusdb
 
 # MSI directo
-msiexec /i nexusdb-1.0.0-x86_64.msi
+msiexec /i axiomdb-1.0.0-x86_64.msi
 
-# → instala nexusdb-server.exe como Windows Service
+# → instala axiomdb-server.exe como Windows Service
 # → se gestiona desde services.msc o PowerShell:
 Start-Service nexusdb
 Stop-Service nexusdb
@@ -9414,7 +9414,7 @@ chmod +x MiApp-1.0.0.AppImage
 ```toml
 # Cargo.toml de la app Tauri
 [dependencies]
-nexusdb-embedded = "1.0"   # se compila estáticamente en la app
+axiomdb-embedded = "1.0"   # se compila estáticamente en la app
 tauri = { version = "2", features = ["shell-open"] }
 ```
 
@@ -9430,39 +9430,39 @@ cargo tauri build
 # Linux    → src-tauri/target/release/bundle/appimage/MiApp_1.0.0_amd64.AppImage
 #             src-tauri/target/release/bundle/deb/MiApp_1.0.0_amd64.deb
 #
-# En TODOS: nexusdb-embedded compilado estáticamente — el usuario
-# nunca instala NexusDB por separado.
+# En TODOS: axiomdb-embedded compilado estáticamente — el usuario
+# nunca instala AxiomDB por separado.
 ```
 
 #### Electron — npm package con binarios nativos
 
 ```json
-{ "dependencies": { "nexusdb-node": "^1.0" } }
+{ "dependencies": { "axiomdb-node": "^1.0" } }
 ```
 
 ```bash
 # electron-builder empaqueta automáticamente para 3 plataformas:
 npx electron-builder --win --mac --linux
 
-# nexusdb-node descarga el binario correcto según plataforma:
-# node_modules/nexusdb-node/
-# ├── nexusdb-win32-x64.node
-# ├── nexusdb-darwin-arm64.node
-# ├── nexusdb-darwin-x64.node
-# └── nexusdb-linux-x64.node
+# axiomdb-node descarga el binario correcto según plataforma:
+# node_modules/axiomdb-node/
+# ├── axiomdb-win32-x64.node
+# ├── axiomdb-darwin-arm64.node
+# ├── axiomdb-darwin-x64.node
+# └── axiomdb-linux-x64.node
 ```
 
-### Installation Wizard — nexusdb-wizard
+### Installation Wizard — axiomdb-wizard
 
 Terminal wizard built with `ratatui` (TUI framework) + `dialoguer` (prompts) + `indicatif` (progress bars).
 
 ```
 ╔══════════════════════════════════════════════════════════╗
-║           NexusDB Installation Wizard v1.0               ║
+║           AxiomDB Installation Wizard v1.0               ║
 ║                                                          ║
-║  Welcome! This wizard will configure your NexusDB        ║
+║  Welcome! This wizard will configure your AxiomDB        ║
 ║  installation. You can re-run it anytime with:           ║
-║    nexusdb-wizard --reconfigure                          ║
+║    axiomdb-wizard --reconfigure                          ║
 ╚══════════════════════════════════════════════════════════╝
 
   [1/10] Installation mode
@@ -9489,7 +9489,7 @@ Terminal wizard built with `ratatui` (TUI framework) + `dialoguer` (prompts) + `
 
   [6/10] Memory allocation
   Detected RAM: 32 GB
-  Allocate to NexusDB: [████████████░░░░] 50% (16 GB)
+  Allocate to AxiomDB: [████████████░░░░] 50% (16 GB)
   ← → to adjust, ↵ to confirm
 
   [7/10] Replication
@@ -9528,7 +9528,7 @@ Terminal wizard built with `ratatui` (TUI framework) + `dialoguer` (prompts) + `
 ```
 
 ```rust
-// nexusdb-wizard/src/main.rs — structure
+// axiomdb-wizard/src/main.rs — structure
 // Crates: ratatui, dialoguer, indicatif, sysinfo, nix
 
 struct WizardState {
@@ -9573,7 +9573,7 @@ fn step_apply(state: &WizardState) -> Result<()> {
     let pb = ProgressBar::new(6);
     create_dir_all(&state.data_dir)?;        pb.inc(1);
     write_config(state)?;                    pb.inc(1);
-    create_system_user("nexusdb")?;          pb.inc(1);
+    create_system_user("axiomdb")?;          pb.inc(1);
     install_systemd_service()?;              pb.inc(1);
     run("systemctl enable nexusdb")?;        pb.inc(1);
     run("systemctl start nexusdb")?;         pb.inc(1);
@@ -9604,17 +9604,17 @@ install_package() {
     debian)
         curl -fsSL https://pkg.nexusdb.io/apt/gpg | gpg --dearmor             > /usr/share/keyrings/nexusdb.gpg
         echo "deb [signed-by=/usr/share/keyrings/nexusdb.gpg]             https://pkg.nexusdb.io/apt stable main"             > /etc/apt/sources.list.d/nexusdb.list
-        apt-get update && apt-get install -y nexusdb-server ;;
+        apt-get update && apt-get install -y axiomdb-server ;;
     rhel|fedora)
         curl -fsSL https://pkg.nexusdb.io/rpm/nexusdb.repo             > /etc/yum.repos.d/nexusdb.repo
-        dnf install -y nexusdb-server ;;
+        dnf install -y axiomdb-server ;;
     macos)
         brew install nexusdb ;;
     esac
 }
 
 install_package
-nexusdb-wizard   # launch wizard immediately after install
+axiomdb-wizard   # launch wizard immediately after install
 ```
 
 ### dbyo-client — SDK oficial Rust

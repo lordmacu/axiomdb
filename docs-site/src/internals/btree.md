@@ -1,6 +1,6 @@
 # B+ Tree (Copy-on-Write)
 
-NexusDB's indexing layer is a persistent B+ Tree implemented over the `StorageEngine`
+AxiomDB's indexing layer is a persistent B+ Tree implemented over the `StorageEngine`
 trait. Every index — including primary key and unique constraint indexes — is one
 such tree. The tree is Copy-on-Write: writes never modify existing pages in place.
 Instead, they create new pages for each node on the path from root to the modified
@@ -232,7 +232,7 @@ from a sibling if possible, merge otherwise).
 ## Prefix Compression — In-Memory Only
 
 Internal node keys are often highly redundant. For a tree indexing sequential IDs,
-consecutive separator keys share long common prefixes. NexusDB implements
+consecutive separator keys share long common prefixes. AxiomDB implements
 `CompressedNode` as an in-memory representation:
 
 ```rust

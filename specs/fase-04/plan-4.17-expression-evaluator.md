@@ -4,12 +4,12 @@
 
 | File | Action | Description |
 |---|---|---|
-| `crates/nexusdb-sql/src/expr.rs` | CREATE | `Expr`, `BinaryOp`, `UnaryOp` |
-| `crates/nexusdb-sql/src/eval.rs` | CREATE | `eval()`, `is_truthy()`, `like_match()`, coercion helpers |
-| `crates/nexusdb-sql/src/lib.rs` | MODIFY | expose modules + re-exports |
-| `crates/nexusdb-sql/Cargo.toml` | MODIFY | add `nexusdb-types` dependency |
-| `crates/nexusdb-core/src/error.rs` | MODIFY | add `DivisionByZero`, `Overflow`, `ColumnIndexOutOfBounds` |
-| `crates/nexusdb-sql/tests/integration_eval.rs` | CREATE | integration tests |
+| `crates/axiomdb-sql/src/expr.rs` | CREATE | `Expr`, `BinaryOp`, `UnaryOp` |
+| `crates/axiomdb-sql/src/eval.rs` | CREATE | `eval()`, `is_truthy()`, `like_match()`, coercion helpers |
+| `crates/axiomdb-sql/src/lib.rs` | MODIFY | expose modules + re-exports |
+| `crates/axiomdb-sql/Cargo.toml` | MODIFY | add `axiomdb-types` dependency |
+| `crates/axiomdb-core/src/error.rs` | MODIFY | add `DivisionByZero`, `Overflow`, `ColumnIndexOutOfBounds` |
+| `crates/axiomdb-sql/tests/integration_eval.rs` | CREATE | integration tests |
 
 ---
 
@@ -315,11 +315,11 @@ fn apply_not(v: Value) -> Value {
 
 ## Implementation phases
 
-### Phase 1 — DbError variants (nexusdb-core)
+### Phase 1 — DbError variants (axiomdb-core)
 1. Add `DivisionByZero`, `Overflow`, `ColumnIndexOutOfBounds` to `error.rs`.
 
-### Phase 2 — Cargo.toml (nexusdb-sql)
-1. Add `nexusdb-types = { workspace = true }` to dependencies.
+### Phase 2 — Cargo.toml (axiomdb-sql)
+1. Add `axiomdb-types = { workspace = true }` to dependencies.
 
 ### Phase 3 — expr.rs
 1. Define `Expr` with all variants.
@@ -345,7 +345,7 @@ pub use expr::{BinaryOp, Expr, UnaryOp};
 ```
 
 ### Phase 6 — Integration tests
-File: `crates/nexusdb-sql/tests/integration_eval.rs`
+File: `crates/axiomdb-sql/tests/integration_eval.rs`
 
 Tests grouped by category:
 ```

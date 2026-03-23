@@ -1,0 +1,10 @@
+[package]
+name        = "axiomdb-geo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+axiomdb-core = { workspace = true }
+thiserror    = { workspace = true }

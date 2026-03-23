@@ -4,9 +4,9 @@
 
 | File | Action | Description |
 |---|---|---|
-| `crates/nexusdb-sql/src/parser/expr.rs` | MODIFY | Add arithmetic, IS NULL, BETWEEN, LIKE, IN, fn calls, table.col |
-| `crates/nexusdb-sql/src/parser/dml.rs` | REWRITE | Full SELECT, INSERT, UPDATE, DELETE parsers |
-| `crates/nexusdb-sql/tests/integration_dml_parser.rs` | CREATE | Integration tests |
+| `crates/axiomdb-sql/src/parser/expr.rs` | MODIFY | Add arithmetic, IS NULL, BETWEEN, LIKE, IN, fn calls, table.col |
+| `crates/axiomdb-sql/src/parser/dml.rs` | REWRITE | Full SELECT, INSERT, UPDATE, DELETE parsers |
+| `crates/axiomdb-sql/tests/integration_dml_parser.rs` | CREATE | Integration tests |
 
 No Cargo.toml changes needed.
 
@@ -296,7 +296,7 @@ where_clause = if eat(WHERE): Some(parse_expr) else None
 10. `parse_delete`.
 
 ### Phase 3 — Integration tests
-File: `crates/nexusdb-sql/tests/integration_dml_parser.rs`
+File: `crates/axiomdb-sql/tests/integration_dml_parser.rs`
 
 ---
 

@@ -4,10 +4,10 @@
 
 | File | Action | Description |
 |---|---|---|
-| `crates/nexusdb-sql/src/ast.rs` | CREATE | All AST types: TableRef, ColumnDef, Stmt, … |
-| `crates/nexusdb-sql/src/lib.rs` | MODIFY | Add `pub mod ast` + re-exports |
+| `crates/axiomdb-sql/src/ast.rs` | CREATE | All AST types: TableRef, ColumnDef, Stmt, … |
+| `crates/axiomdb-sql/src/lib.rs` | MODIFY | Add `pub mod ast` + re-exports |
 
-No new Cargo.toml changes needed — `nexusdb-types` is already a dependency.
+No new Cargo.toml changes needed — `axiomdb-types` is already a dependency.
 
 ---
 

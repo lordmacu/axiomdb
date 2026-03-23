@@ -4,11 +4,11 @@
 
 | File | Action | What |
 |---|---|---|
-| `crates/nexusdb-core/src/error.rs` | modify | Add `TransactionAlreadyActive`, `NoActiveTransaction` |
-| `crates/nexusdb-storage/src/heap.rs` | modify | Add `mark_slot_dead`, `clear_deletion` |
-| `crates/nexusdb-wal/Cargo.toml` | modify | Add `nexusdb-storage` dependency |
-| `crates/nexusdb-wal/src/txn.rs` | create | `UndoOp`, `ActiveTxn`, `TxnManager` |
-| `crates/nexusdb-wal/src/lib.rs` | modify | Export `TxnManager`, `UndoOp` |
+| `crates/axiomdb-core/src/error.rs` | modify | Add `TransactionAlreadyActive`, `NoActiveTransaction` |
+| `crates/axiomdb-storage/src/heap.rs` | modify | Add `mark_slot_dead`, `clear_deletion` |
+| `crates/axiomdb-wal/Cargo.toml` | modify | Add `axiomdb-storage` dependency |
+| `crates/axiomdb-wal/src/txn.rs` | create | `UndoOp`, `ActiveTxn`, `TxnManager` |
+| `crates/axiomdb-wal/src/lib.rs` | modify | Export `TxnManager`, `UndoOp` |
 
 ## Step 1 — New DbError variants
 
@@ -22,7 +22,7 @@ NoActiveTransaction,
 
 ## Step 2 — Heap helpers for undo
 
-Add to `crates/nexusdb-storage/src/heap.rs`:
+Add to `crates/axiomdb-storage/src/heap.rs`:
 
 ```rust
 /// Marks slot `slot_id` as physically dead by zeroing its SlotEntry.
@@ -345,14 +345,14 @@ fn test_uncommitted_not_visible()
 | WalWriter BufWriter not flushed on crash | fsync in commit(); Rollback entry deliberately not fsynced |
 | Undo ops applied in wrong order | Vec reversed with `.rev()` — tested explicitly |
 | read+copy+write in undo is slow | Acceptable: rollback is rare, not hot path |
-| nexusdb-storage circular dep with nexusdb-wal | nexusdb-storage doesn't depend on nexusdb-wal; safe |
+| axiomdb-storage circular dep with axiomdb-wal | axiomdb-storage doesn't depend on axiomdb-wal; safe |
 
 ## Implementation order
 
 ```
 1. DbError: TransactionAlreadyActive, NoActiveTransaction
 2. heap.rs: mark_slot_dead + clear_deletion + export
-3. nexusdb-wal/Cargo.toml: add nexusdb-storage dependency
+3. axiomdb-wal/Cargo.toml: add axiomdb-storage dependency
 4. txn.rs: UndoOp + ActiveTxn + TxnManager struct
 5. txn.rs: create/open
 6. txn.rs: begin/commit/rollback/record_*

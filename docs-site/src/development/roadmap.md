@@ -1,6 +1,6 @@
 # Roadmap and Phases
 
-NexusDB is developed in phases, each of which adds a coherent vertical slice of
+AxiomDB is developed in phases, each of which adds a coherent vertical slice of
 functionality. The design is organized in three blocks:
 
 - **Block 1 (Phases 1–7):** Core engine — storage, indexing, WAL, transactions,

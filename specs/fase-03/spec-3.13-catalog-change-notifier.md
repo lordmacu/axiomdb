@@ -238,6 +238,6 @@ table (with its columns) now exists.
 
 ## Dependencies
 
-- `nexusdb-catalog`: `CatalogWriter`, `SchemaChangeEvent` and related types live here
-- `nexusdb-core`: `TxnId`, `TableId` (already in scope)
+- `axiomdb-catalog`: `CatalogWriter`, `SchemaChangeEvent` and related types live here
+- `axiomdb-core`: `TxnId`, `TableId` (already in scope)
 - `std::sync::RwLock`: for `CatalogChangeNotifier` internal list (no new deps)

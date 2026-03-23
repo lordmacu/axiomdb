@@ -1,6 +1,6 @@
 # WAL and Crash Recovery
 
-The Write-Ahead Log (WAL) is NexusDB's durability mechanism. Before any change
+The Write-Ahead Log (WAL) is AxiomDB's durability mechanism. Before any change
 reaches the storage engine's pages, a record of that change is appended to the WAL
 file. On crash recovery, the WAL is replayed to reconstruct any changes that were
 committed but not yet flushed to the data file.
@@ -139,7 +139,7 @@ checkpoint LSN — this is safe because step 2 already flushed the pages.
 
 ## Crash Recovery State Machine
 
-NexusDB tracks its recovery state through five well-defined phases. The state
+AxiomDB tracks its recovery state through five well-defined phases. The state
 transitions are strictly sequential; no transition can be skipped.
 
 ```
@@ -176,7 +176,7 @@ READY
 
 ### Why no UNDO pass
 
-NexusDB's WAL replay is **redo-only**. Uncommitted transactions are simply ignored
+AxiomDB's WAL replay is **redo-only**. Uncommitted transactions are simply ignored
 during the forward scan. Because the WAL records physical locations (page_id, slot_id),
 the page that contained the uncommitted write is overwritten with the committed state
 from the WAL. If the page has no committed mutations after the checkpoint, it retains
@@ -191,7 +191,7 @@ recovery is simpler and faster.
 <span class="callout-icon">🚀</span>
 <div class="callout-body">
 <span class="callout-label">Faster Recovery — Single Forward Scan</span>
-PostgreSQL's logical WAL requires two passes on recovery: a forward redo pass, then a backward undo pass to reverse uncommitted changes in B+ Tree pages. NexusDB's physical WAL (recording exact <code>page_id + slot_id</code>) requires only one forward pass — uncommitted writes are simply overwritten by committed redo entries.
+PostgreSQL's logical WAL requires two passes on recovery: a forward redo pass, then a backward undo pass to reverse uncommitted changes in B+ Tree pages. AxiomDB's physical WAL (recording exact <code>page_id + slot_id</code>) requires only one forward pass — uncommitted writes are simply overwritten by committed redo entries.
 </div>
 </div>
 

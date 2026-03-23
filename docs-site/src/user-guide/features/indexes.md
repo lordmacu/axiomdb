@@ -1,6 +1,6 @@
 # Indexes
 
-Indexes are B+ Tree data structures that allow NexusDB to find rows matching a
+Indexes are B+ Tree data structures that allow AxiomDB to find rows matching a
 condition without scanning the entire table. Every index is a Copy-on-Write B+ Tree
 stored in the same `.db` file as the table data.
 
@@ -8,7 +8,7 @@ stored in the same `.db` file as the table data.
 
 ## Automatic Indexes
 
-NexusDB automatically creates a unique B+ Tree index for:
+AxiomDB automatically creates a unique B+ Tree index for:
 
 - Every `PRIMARY KEY` declaration
 - Every `UNIQUE` column constraint or `UNIQUE` table constraint
@@ -95,7 +95,7 @@ the index's predicate.
 ## Index Key Size Limit
 
 The B+ Tree stores keys up to **64 bytes**. If the indexed column value exceeds 64
-bytes, NexusDB truncates the key and stores the full value in the heap row for
+bytes, AxiomDB truncates the key and stores the full value in the heap row for
 tie-breaking. This means:
 
 - All `BIGINT`, `INT`, `UUID`, and other fixed-size types fit comfortably.
@@ -135,7 +135,7 @@ FROM nexus_indexes;
 
 ## B+ Tree Implementation Details
 
-NexusDB's B+ Tree is a Copy-on-Write structure backed by the `StorageEngine` trait.
+AxiomDB's B+ Tree is a Copy-on-Write structure backed by the `StorageEngine` trait.
 Key properties:
 
 - **ORDER_INTERNAL = 223**: up to 223 separator keys and 224 child pointers per internal node

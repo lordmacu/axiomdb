@@ -4,9 +4,9 @@
 
 | File | Action | What |
 |---|---|---|
-| `crates/nexusdb-wal/src/txn.rs` | modify | `PHYSICAL_LOC_LEN`, update `record_insert/delete/update` |
-| `crates/nexusdb-wal/src/recovery.rs` | create | `RecoveryOp`, `RecoveryResult`, `RecoveryState`, `CrashRecovery` |
-| `crates/nexusdb-wal/src/lib.rs` | modify | Export recovery types |
+| `crates/axiomdb-wal/src/txn.rs` | modify | `PHYSICAL_LOC_LEN`, update `record_insert/delete/update` |
+| `crates/axiomdb-wal/src/recovery.rs` | create | `RecoveryOp`, `RecoveryResult`, `RecoveryState`, `CrashRecovery` |
+| `crates/axiomdb-wal/src/lib.rs` | modify | Export recovery types |
 
 ## Step 1 — Physical location encoding in WAL entries (txn.rs)
 

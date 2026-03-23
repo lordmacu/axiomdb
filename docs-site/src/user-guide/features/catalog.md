@@ -1,6 +1,6 @@
 # Catalog and Schema Introspection
 
-NexusDB maintains an internal catalog that records all tables, columns, and indexes.
+AxiomDB maintains an internal catalog that records all tables, columns, and indexes.
 The catalog is persisted on the first page of the database file (the meta page) and is
 accessible through system tables, convenience commands, and direct SQL queries.
 
@@ -183,12 +183,12 @@ ORDER BY column_count DESC;
 
 ## Catalog Bootstrap
 
-The catalog is bootstrapped on the very first `open()` call. NexusDB writes the three
+The catalog is bootstrapped on the very first `open()` call. AxiomDB writes the three
 system tables (`nexus_tables`, `nexus_columns`, `nexus_indexes`) into the meta page
 using a special bootstrap transaction with LSN 0. Subsequent opens detect the
 bootstrapped meta page and skip the initialization step.
 
-The bootstrap is idempotent: if NexusDB crashes during bootstrap, the incomplete
+The bootstrap is idempotent: if AxiomDB crashes during bootstrap, the incomplete
 transaction has no COMMIT record in the WAL, so crash recovery discards it and
 the next `open()` re-runs the bootstrap from scratch.
 

@@ -1,0 +1,363 @@
+//! Table engine — row storage interface for user tables.
+//!
+//! [`TableEngine`] bridges the SQL executor (which operates on [`Value`] rows)
+//! and the raw storage layer (which operates on `&[u8]` bytes in heap pages).
+//!
+//! ## Responsibilities
+//!
+//! - **Scan:** iterate all MVCC-visible rows, decoding bytes to `Vec<Value>`.
+//! - **Insert:** coerce + encode values, write to `HeapChain`, WAL-log.
+//! - **Delete:** read old bytes, stamp deletion in `HeapChain`, WAL-log.
+//! - **Update:** delete old row + insert new row (two WAL entries).
+//!
+//! ## Usage
+//!
+//! All methods are stateless — the caller provides `storage` and `txn` on each
+//! call. The executor (Phase 4.5) constructs a `TableEngine` and passes them
+//! through for the lifetime of the statement.
+//!
+//! ```rust,ignore
+//! // Resolve table from catalog first:
+//! let resolved = resolver.resolve_table(None, "users")?;
+//!
+//! // Scan:
+//! let rows = TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?;
+//!
+//! // Insert (requires active transaction):
+//! txn.begin()?;
+//! let rid = TableEngine::insert_row(
+//!     storage, txn, &resolved.def, &resolved.columns,
+//!     vec![Value::BigInt(1), Value::Text("alice".into())],
+//! )?;
+//! txn.commit()?;
+//! ```
+//!
+//! ## WAL key convention
+//!
+//! Since Phase 4.5b does not enforce primary key constraints, the WAL `key` for
+//! every user-table DML entry is the physical location of the row encoded as
+//! 10 bytes: `[page_id: 8 LE][slot_id: 2 LE]`. This is supplemented by the
+//! physical location already embedded in the WAL value bytes by `TxnManager`.
+//!
+//! ## UPDATE semantics
+//!
+//! `update_row` is implemented as `delete_row` + `insert_row` (two separate WAL
+//! entries). `TxnManager::record_update` is not used because it assumes old and
+//! new slots are on the same page, which is not guaranteed when the old page is
+//! full and the chain must grow.
+
+use axiomdb_catalog::schema::{ColumnDef, ColumnType, TableDef};
+use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
+use axiomdb_storage::{HeapChain, StorageEngine};
+use axiomdb_types::{
+    codec::{decode_row, encode_row},
+    coerce::{coerce, CoercionMode},
+    DataType, Value,
+};
+use axiomdb_wal::TxnManager;
+
+// ── TableEngine ───────────────────────────────────────────────────────────────
+
+/// Stateless row storage interface for user tables.
+///
+/// Follows the same unit-struct pattern as [`HeapChain`]: all methods take
+/// storage and transaction state as explicit parameters.
+pub struct TableEngine;
+
+impl TableEngine {
+    /// Returns all MVCC-visible rows in the table, decoded as `Vec<Value>`.
+    ///
+    /// Rows are returned in heap chain order (root page first, slot order within
+    /// each page). Dead slots and rows not visible to `snap` are excluded.
+    ///
+    /// An empty table returns `Ok(vec![])` — not an error.
+    ///
+    /// `columns` must be sorted ascending by `col_idx` (catalog declaration order).
+    ///
+    /// # Errors
+    /// - [`DbError::ParseError`] — a stored row is structurally invalid (corruption).
+    /// - I/O errors from storage reads.
+    pub fn scan_table(
+        storage: &dyn StorageEngine,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        snap: TransactionSnapshot,
+    ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+        let col_types = column_data_types(columns);
+        let raw_rows = HeapChain::scan_visible(storage, table_def.data_root_page_id, snap)?;
+
+        let mut result = Vec::with_capacity(raw_rows.len());
+        for (page_id, slot_id, bytes) in raw_rows {
+            let values = decode_row(&bytes, &col_types)?;
+            result.push((RecordId { page_id, slot_id }, values));
+        }
+        Ok(result)
+    }
+
+    /// Encodes and inserts a row into the table heap, WAL-logging the insert.
+    ///
+    /// Applies implicit coercion (strict mode) from each value to the declared
+    /// column type before encoding. For example, `Text("42")` into an `INT`
+    /// column becomes `Int(42)`.
+    ///
+    /// Must be called inside an active transaction (`txn.begin()` already called).
+    ///
+    /// # Errors
+    /// - [`DbError::TypeMismatch`] — `values.len() != columns.len()`.
+    /// - [`DbError::InvalidCoercion`] — a value cannot be coerced to the column type.
+    /// - [`DbError::NoActiveTransaction`] — no transaction is active.
+    /// - I/O errors from storage or WAL writes.
+    pub fn insert_row(
+        storage: &mut dyn StorageEngine,
+        txn: &mut TxnManager,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        values: Vec<Value>,
+    ) -> Result<RecordId, DbError> {
+        if values.len() != columns.len() {
+            return Err(DbError::TypeMismatch {
+                expected: format!("{} columns", columns.len()),
+                got: format!("{} values", values.len()),
+            });
+        }
+
+        let col_types = column_data_types(columns);
+        let coerced = coerce_values(values, columns)?;
+        let encoded = encode_row(&coerced, &col_types)?;
+
+        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+        let (page_id, slot_id) =
+            HeapChain::insert(storage, table_def.data_root_page_id, &encoded, txn_id)?;
+
+        let key = encode_rid(page_id, slot_id);
+        txn.record_insert(table_def.id, &key, &encoded, page_id, slot_id)?;
+
+        Ok(RecordId { page_id, slot_id })
+    }
+
+    /// Stamps an MVCC deletion on the row at `record_id`, WAL-logging the delete.
+    ///
+    /// The old row bytes are read before deletion to include as `old_value` in
+    /// the WAL entry for crash recovery.
+    ///
+    /// Must be called inside an active transaction.
+    ///
+    /// # Errors
+    /// - [`DbError::AlreadyDeleted`] — the slot is already dead.
+    /// - [`DbError::InvalidSlot`] — `record_id` points to a non-existent slot.
+    /// - [`DbError::NoActiveTransaction`] — no transaction is active.
+    /// - I/O errors from storage or WAL writes.
+    pub fn delete_row(
+        storage: &mut dyn StorageEngine,
+        txn: &mut TxnManager,
+        table_def: &TableDef,
+        record_id: RecordId,
+    ) -> Result<(), DbError> {
+        // Read old bytes BEFORE deletion — read_tuple returns None on dead slots.
+        let old_bytes = HeapChain::read_row(storage, record_id.page_id, record_id.slot_id)?.ok_or(
+            DbError::AlreadyDeleted {
+                page_id: record_id.page_id,
+                slot_id: record_id.slot_id,
+            },
+        )?;
+
+        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+        HeapChain::delete(storage, record_id.page_id, record_id.slot_id, txn_id)?;
+
+        let key = encode_rid(record_id.page_id, record_id.slot_id);
+        txn.record_delete(
+            table_def.id,
+            &key,
+            &old_bytes,
+            record_id.page_id,
+            record_id.slot_id,
+        )?;
+
+        Ok(())
+    }
+
+    /// Replaces the row at `record_id` with `new_values`, WAL-logging both the
+    /// delete and the insert.
+    ///
+    /// Implemented as `delete_row` + `insert_row` to avoid the same-page
+    /// assumption of `TxnManager::record_update`. The returned `RecordId` is
+    /// the physical location of the new row, which may differ from `record_id`
+    /// if the old page was full and the chain grew.
+    ///
+    /// Must be called inside an active transaction.
+    ///
+    /// # Errors
+    /// - [`DbError::TypeMismatch`] — `new_values.len() != columns.len()`.
+    /// - [`DbError::InvalidCoercion`] — a new value cannot be coerced to the column type.
+    /// - [`DbError::AlreadyDeleted`] — the old row slot is already dead.
+    /// - [`DbError::NoActiveTransaction`] — no transaction is active.
+    /// - I/O errors from storage or WAL writes.
+    pub fn update_row(
+        storage: &mut dyn StorageEngine,
+        txn: &mut TxnManager,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        record_id: RecordId,
+        new_values: Vec<Value>,
+    ) -> Result<RecordId, DbError> {
+        if new_values.len() != columns.len() {
+            return Err(DbError::TypeMismatch {
+                expected: format!("{} columns", columns.len()),
+                got: format!("{} values", new_values.len()),
+            });
+        }
+
+        // Read old bytes BEFORE any mutation (slot becomes dead after delete).
+        let old_bytes = HeapChain::read_row(storage, record_id.page_id, record_id.slot_id)?.ok_or(
+            DbError::AlreadyDeleted {
+                page_id: record_id.page_id,
+                slot_id: record_id.slot_id,
+            },
+        )?;
+
+        let col_types = column_data_types(columns);
+        let coerced = coerce_values(new_values, columns)?;
+        let new_encoded = encode_row(&coerced, &col_types)?;
+
+        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+
+        // Step 1: stamp deletion on the old row, WAL-log the delete.
+        HeapChain::delete(storage, record_id.page_id, record_id.slot_id, txn_id)?;
+        let old_key = encode_rid(record_id.page_id, record_id.slot_id);
+        txn.record_delete(
+            table_def.id,
+            &old_key,
+            &old_bytes,
+            record_id.page_id,
+            record_id.slot_id,
+        )?;
+
+        // Step 2: insert the new row into the chain, WAL-log the insert.
+        let (new_page_id, new_slot_id) =
+            HeapChain::insert(storage, table_def.data_root_page_id, &new_encoded, txn_id)?;
+        let new_key = encode_rid(new_page_id, new_slot_id);
+        txn.record_insert(
+            table_def.id,
+            &new_key,
+            &new_encoded,
+            new_page_id,
+            new_slot_id,
+        )?;
+
+        Ok(RecordId {
+            page_id: new_page_id,
+            slot_id: new_slot_id,
+        })
+    }
+}
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+/// Extracts `DataType` from each `ColumnDef` in declaration order.
+///
+/// `ColumnType` (compact catalog representation) maps to `DataType`
+/// (full in-memory type used by the row codec and expression evaluator).
+fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
+    columns
+        .iter()
+        .map(|c| match c.col_type {
+            ColumnType::Bool => DataType::Bool,
+            ColumnType::Int => DataType::Int,
+            ColumnType::BigInt => DataType::BigInt,
+            ColumnType::Float => DataType::Real,
+            ColumnType::Text => DataType::Text,
+            ColumnType::Bytes => DataType::Bytes,
+            ColumnType::Timestamp => DataType::Timestamp,
+            ColumnType::Uuid => DataType::Uuid,
+        })
+        .collect()
+}
+
+/// Encodes a `RecordId` as a 10-byte WAL key: `[page_id:8 LE][slot_id:2 LE]`.
+fn encode_rid(page_id: u64, slot_id: u16) -> [u8; 10] {
+    let mut buf = [0u8; 10];
+    buf[..8].copy_from_slice(&page_id.to_le_bytes());
+    buf[8..].copy_from_slice(&slot_id.to_le_bytes());
+    buf
+}
+
+/// Applies strict-mode coercion to each value against its target column type.
+fn coerce_values(values: Vec<Value>, columns: &[ColumnDef]) -> Result<Vec<Value>, DbError> {
+    values
+        .into_iter()
+        .zip(columns.iter())
+        .map(|(v, col)| {
+            let target = match col.col_type {
+                ColumnType::Bool => DataType::Bool,
+                ColumnType::Int => DataType::Int,
+                ColumnType::BigInt => DataType::BigInt,
+                ColumnType::Float => DataType::Real,
+                ColumnType::Text => DataType::Text,
+                ColumnType::Bytes => DataType::Bytes,
+                ColumnType::Timestamp => DataType::Timestamp,
+                ColumnType::Uuid => DataType::Uuid,
+            };
+            coerce(v, target, CoercionMode::Strict)
+        })
+        .collect()
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axiomdb_catalog::schema::ColumnType;
+
+    fn make_col(name: &str, col_type: ColumnType) -> ColumnDef {
+        ColumnDef {
+            table_id: 1,
+            col_idx: 0,
+            name: name.to_string(),
+            col_type,
+            nullable: true,
+        }
+    }
+
+    #[test]
+    fn test_column_data_types_all_variants() {
+        let cols = vec![
+            make_col("a", ColumnType::Bool),
+            make_col("b", ColumnType::Int),
+            make_col("c", ColumnType::BigInt),
+            make_col("d", ColumnType::Float),
+            make_col("e", ColumnType::Text),
+            make_col("f", ColumnType::Bytes),
+            make_col("g", ColumnType::Timestamp),
+            make_col("h", ColumnType::Uuid),
+        ];
+        let types = column_data_types(&cols);
+        assert_eq!(
+            types,
+            vec![
+                DataType::Bool,
+                DataType::Int,
+                DataType::BigInt,
+                DataType::Real,
+                DataType::Text,
+                DataType::Bytes,
+                DataType::Timestamp,
+                DataType::Uuid,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_encode_rid() {
+        let key = encode_rid(7, 3);
+        // page_id=7 in little-endian 8 bytes, slot_id=3 in 2 bytes
+        assert_eq!(&key[..8], &7u64.to_le_bytes());
+        assert_eq!(&key[8..], &3u16.to_le_bytes());
+    }
+
+    #[test]
+    fn test_encode_rid_zero() {
+        let key = encode_rid(0, 0);
+        assert_eq!(key, [0u8; 10]);
+    }
+}

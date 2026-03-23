@@ -1,4 +1,4 @@
-# NexusDB — Database Engine in Rust
+# AxiomDB — Database Engine in Rust
 
 ## Source of truth
 The `db.md` file contains the complete design: architecture, types, phases, crates, and decisions.
@@ -266,7 +266,7 @@ The `docs-site/` directory contains two types of documentation that must always 
 
 | Type | Location | Who reads it | Standard |
 |---|---|---|---|
-| **User docs** | `docs-site/src/user-guide/` | Developers using NexusDB as a database | Clear, example-heavy, covers behavior from the outside |
+| **User docs** | `docs-site/src/user-guide/` | Developers using AxiomDB as a database | Clear, example-heavy, covers behavior from the outside |
 | **Technical docs** | `docs-site/src/internals/` | Contributors, engineers reading the source | Deep, implementation-level, covers algorithms, data structures, invariants |
 
 #### What "explicit and descriptive" means
@@ -282,7 +282,7 @@ Every page — user or technical — must meet this bar:
   - Code examples (Rust) showing the public API and the critical internal logic
   - Performance characteristics (O(n) guarantees, cache behavior, allocation profile)
 
-#### Callouts — show readers why NexusDB is better
+#### Callouts — show readers why AxiomDB is better
 
 Every doc page that introduces a non-trivial design or implementation must have at
 least one callout wherever something noteworthy happened. The goal: a reader skimming
@@ -293,7 +293,7 @@ them, and how they compare to any relevant database or library.
 
 | Type | HTML class | Icon | Use when |
 |---|---|---|---|
-| **Advantage** | `callout-advantage` | 🚀 | NexusDB measurably outperforms or avoids a cost that another database or library pays |
+| **Advantage** | `callout-advantage` | 🚀 | AxiomDB measurably outperforms or avoids a cost that another database or library pays |
 | **Design Decision** | `callout-design` | ⚙️ | A non-obvious implementation choice was made — a trade-off was evaluated, an approach was borrowed from another system, or a constraint (page size, bit width, scan strategy) was derived deliberately |
 | **Tip** | `callout-tip` | 💡 | User-facing: a non-obvious usage pattern, a caveat, or a migration hint |
 
@@ -330,7 +330,7 @@ If we beat DuckDB's vectorized scan for a specific case, say so.
 
 **Mandatory callout triggers — add one whenever ANY of these are true:**
 
-1. **Outperforms a known system** — NexusDB is faster, uses less memory, or requires
+1. **Outperforms a known system** — AxiomDB is faster, uses less memory, or requires
    fewer I/O operations than any named database or library in the reference table.
    → `callout-advantage`
 
@@ -527,7 +527,7 @@ cargo bench --bench [nombre_bench] 2>&1 | tee /tmp/bench-fase-N.txt
 
 **Always report a comparison table with 6 columns:**
 
-| Benchmark | NexusDB | MySQL (aprox) | PostgreSQL (aprox) | Target | Máx aceptable | Veredicto |
+| Benchmark | AxiomDB | MySQL (aprox) | PostgreSQL (aprox) | Target | Máx aceptable | Veredicto |
 |---|---|---|---|---|---|---|
 | point_lookup/1M | X ns / Y Mops | ~1.2 µs / ~830K ops | ~0.9 µs / ~1.1M ops | 800K ops/s | 600K ops/s | ✅/⚠️/❌ |
 | range_scan/10K | X µs | ~8ms | ~5ms | 45ms | 60ms | ✅/⚠️/❌ |
@@ -619,7 +619,7 @@ If there is a regression > 5% on a critical operation: blocker.
 
 ### Performance budget (do not regress)
 
-| Operation             | NexusDB actual | MySQL (aprox) | PostgreSQL (aprox) | Target       | Máx aceptable   |
+| Operation             | AxiomDB actual | MySQL (aprox) | PostgreSQL (aprox) | Target       | Máx aceptable   |
 |-----------------------|----------------|---------------|--------------------|--------------|-----------------|
 | Point lookup PK       | TBD (Phase 4.5)| ~830K ops/s   | ~1.1M ops/s        | 800K ops/s   | 600K ops/s      |
 | Range scan 10K rows   | 0.61ms ✅      | ~8ms          | ~5ms               | 45ms         | 60ms            |
@@ -631,7 +631,7 @@ If there is a regression > 5% on a critical operation: blocker.
 | Row codec encode      | **30ns** ✅    | N/A           | N/A                | —            | —               |
 | Expr eval scan/1K     | **14.8M/s** ✅ | ~8M rows/s    | ~6M rows/s         | —            | —               |
 
-Actualizar columna "NexusDB actual" con cada benchmark completado.
+Actualizar columna "AxiomDB actual" con cada benchmark completado.
 TBD = requiere executor (Phase 4.5) para medirse con I/O real.
 
 ---

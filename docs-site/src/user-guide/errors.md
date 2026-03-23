@@ -1,6 +1,6 @@
 # Error Reference
 
-NexusDB returns structured errors with a SQLSTATE code, a human-readable message,
+AxiomDB returns structured errors with a SQLSTATE code, a human-readable message,
 and optional detail fields. Understanding these codes allows applications to handle
 specific failure scenarios correctly (for example: catching a uniqueness violation
 to show a "email already taken" message rather than a generic crash page).
@@ -9,7 +9,7 @@ to show a "email already taken" message rather than a generic crash page).
 
 ## Error Format
 
-Every error from NexusDB has the following structure:
+Every error from AxiomDB has the following structure:
 
 ```json
 {
@@ -161,7 +161,7 @@ Two transactions are each waiting for a lock held by the other.
 ```sql
 -- Txn A holds lock on row 1, waiting for row 2
 -- Txn B holds lock on row 2, waiting for row 1
--- → NexusDB detects the cycle and aborts one transaction with 40P01
+-- → AxiomDB detects the cycle and aborts one transaction with 40P01
 -- ERROR 40P01: deadlock detected
 ```
 
@@ -178,12 +178,12 @@ deadlocks cannot form between two such transactions.
 The storage engine encountered an operating system I/O error.
 
 ```
-ERROR 58030: could not write to file "nexusdb.db": No space left on device
+ERROR 58030: could not write to file "axiomdb.db": No space left on device
 ```
 
 **Possible causes:**
 - Disk full — free space or expand the volume
-- File permissions — ensure the NexusDB process can write to the data directory
+- File permissions — ensure the AxiomDB process can write to the data directory
 - Hardware error — check dmesg / system logs for disk errors
 
 ---
@@ -244,7 +244,7 @@ SELECT 10 / 0;
 ### 22018 — invalid_character_value_for_cast
 
 A value cannot be implicitly coerced to the target type. This error is raised
-when NexusDB is in **strict mode** (the default) and a conversion is attempted
+when AxiomDB is in **strict mode** (the default) and a conversion is attempted
 that would discard data or is not defined.
 
 ```sql
@@ -257,7 +257,7 @@ SELECT 3.14 + DATE '2026-01-01';
 -- ERROR 22018: cannot coerce 3.14 (Real) to Date: no implicit numeric promotion between these types
 ```
 
-**Hint:** Use explicit `CAST` for conversions that NexusDB does not apply
+**Hint:** Use explicit `CAST` for conversions that AxiomDB does not apply
 automatically:
 
 ```sql
@@ -267,7 +267,7 @@ SELECT CAST(3 AS REAL) + 1.5;                         -- explicit widening
 
 **MySQL compat mode** (permissive): if your application requires MySQL-style
 lenient coercion (`'42abc'` silently converted to `42`), set the session to
-permissive mode. This will be available via `SET NEXUS_COMPAT = 'mysql'` in
+permissive mode. This will be available via `SET AXIOM_COMPAT = 'mysql'` in
 Phase 5 (MySQL wire protocol). Until then, strict mode is always active.
 
 #### Implicit coercions that always succeed (no error)

@@ -2,14 +2,14 @@
 
 ## What to build (not how)
 
-A standalone `coerce` module in `nexusdb-types` that converts a `Value` to a
+A standalone `coerce` module in `axiomdb-types` that converts a `Value` to a
 target `DataType`, applying either strict or permissive rules. This module is
 used by the expression evaluator (for implicit widening in arithmetic and
 comparisons) and will be used by the executor (for column assignment on
 INSERT/UPDATE).
 
 The module replaces the private `coerce_numeric` and `coerce_for_compare`
-functions currently in `nexusdb-sql/src/eval.rs` with a clean, testable,
+functions currently in `axiomdb-sql/src/eval.rs` with a clean, testable,
 re-exportable API.
 
 ---
@@ -47,12 +47,12 @@ lattice. Replaces `coerce_numeric` in `eval.rs`.
 
 ```rust
 pub enum CoercionMode {
-    /// NexusDB default. Rejects any Text→numeric conversion where the string
+    /// AxiomDB default. Rejects any Text→numeric conversion where the string
     /// contains non-numeric characters after parsing. '42abc' → error.
     Strict,
 
     /// MySQL-compatible lenient mode. '42abc' → 42 (strips non-numeric suffix).
-    /// Used when the session has SET NEXUS_COMPAT = 'mysql'.
+    /// Used when the session has SET AXIOM_COMPAT = 'mysql'.
     Permissive,
 }
 ```
@@ -164,7 +164,7 @@ but must be handled for correctness).
 `Bool(true)` → `BigInt(1)`, `Bool(false)` → `BigInt(0)`.
 `Bool(true)` → `Real(1.0)`, `Bool(false)` → `Real(0.0)`.
 
-In strict mode: `InvalidCoercion` (NexusDB does not implicitly treat booleans
+In strict mode: `InvalidCoercion` (AxiomDB does not implicitly treat booleans
 as integers).
 
 #### All other combinations
@@ -201,7 +201,7 @@ Rules:
 
 ## New error variant
 
-Add to `nexusdb-core/src/error.rs`:
+Add to `axiomdb-core/src/error.rs`:
 
 ```rust
 #[error("cannot coerce {value} ({from}) to {to}: {reason}")]
@@ -241,7 +241,7 @@ INSERT INTO t VALUES ('42abc');  -- Strict → InvalidCoercion
 ### 4. Text with garbage in permissive mode
 
 ```sql
-SET NEXUS_COMPAT = 'mysql';
+SET AXIOM_COMPAT = 'mysql';
 INSERT INTO t VALUES ('42abc');  -- Permissive → Int(42)
 ```
 
@@ -269,7 +269,7 @@ INSERT INTO t (age) VALUES (NULL);  -- coerce(Null, DataType::Int, Strict) → N
 
 ## Acceptance criteria
 
-- [ ] `nexusdb-types/src/coerce.rs` compiles with `cargo check`
+- [ ] `axiomdb-types/src/coerce.rs` compiles with `cargo check`
 - [ ] `coerce(value, target, Strict)` passes the full matrix for all valid conversions
 - [ ] `coerce(value, target, Strict)` returns `InvalidCoercion` for all `E` cells
 - [ ] `coerce(value, target, Permissive)` applies MySQL lenient rules for Text→numeric
@@ -278,7 +278,7 @@ INSERT INTO t (age) VALUES (NULL);  -- coerce(Null, DataType::Int, Strict) → N
   for the cases it previously handled (Int/BigInt/Real/Decimal widening)
 - [ ] `coerce_for_op` returns `InvalidCoercion` for previously-unreachable combinations
   (Text+numeric, Date+anything)
-- [ ] `DbError::InvalidCoercion` variant added to `nexusdb-core/src/error.rs`
+- [ ] `DbError::InvalidCoercion` variant added to `axiomdb-core/src/error.rs`
 - [ ] `DbError::sqlstate()` maps `InvalidCoercion` → `"22018"`
 - [ ] Unit tests: at least 2 tests per conversion rule, including overflow and NULL
 - [ ] `cargo test --workspace` passes
@@ -295,15 +295,15 @@ INSERT INTO t (age) VALUES (NULL);  -- coerce(Null, DataType::Int, Strict) → N
 - Text → Bool (`'true'→BOOL`) — not needed until 4.19
 - Timestamp → Date truncation — not needed until executor handles ORDER BY / GROUP BY on mixed temporal types
 - Decimal → Real explicit conversion (only via CAST, Phase 4.12b)
-- The `SET NEXUS_COMPAT` session variable — Phase 5. Until then, `CoercionMode::Strict` is always used from application code; tests will call both modes directly.
+- The `SET AXIOM_COMPAT` session variable — Phase 5. Until then, `CoercionMode::Strict` is always used from application code; tests will call both modes directly.
 - Real → Int narrowing (lossy — requires explicit CAST per SQL standard)
 
 ---
 
 ## Dependencies
 
-- `nexusdb-types` — houses the new module; already has `Value` and `DataType`
-- `nexusdb-core` — add `DbError::InvalidCoercion`
-- `nexusdb-sql/src/eval.rs` — replace `coerce_numeric` / `coerce_for_compare` with calls to `coerce_for_op`
+- `axiomdb-types` — houses the new module; already has `Value` and `DataType`
+- `axiomdb-core` — add `DbError::InvalidCoercion`
+- `axiomdb-sql/src/eval.rs` — replace `coerce_numeric` / `coerce_for_compare` with calls to `coerce_for_op`
 
 No new crate dependencies required.
