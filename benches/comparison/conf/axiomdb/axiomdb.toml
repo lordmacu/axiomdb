@@ -1,0 +1,26 @@
+# AxiomDB — Benchmark configuration
+#
+# Mirror of MySQL bench.cnf and postgresql.conf in terms of durability posture.
+# All fsync-equivalent settings match: full durability ON.
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+data_dir        = "/data"
+
+# WAL fsync: ON — matches MySQL innodb_flush_log_at_trx_commit=1
+#            and PostgreSQL fsync=on
+fsync           = true
+
+# Maximum WAL size before rotation
+max_wal_size_mb = 256
+
+# ── Server ────────────────────────────────────────────────────────────────────
+# MySQL wire protocol (Phase 8+)
+mysql_port      = 3306
+mysql_host      = "0.0.0.0"
+
+# PostgreSQL wire protocol (Phase 9+)
+# pg_port       = 5432
+# pg_host       = "0.0.0.0"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_level       = "warn"
