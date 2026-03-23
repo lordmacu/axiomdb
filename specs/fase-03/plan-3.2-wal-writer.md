@@ -4,10 +4,10 @@
 
 | File | Action | What it does |
 |---|---|---|
-| `crates/nexusdb-core/src/error.rs` | Modify | Add `WalInvalidHeader` |
-| `crates/nexusdb-wal/src/writer.rs` | Create | Complete `WalWriter` |
-| `crates/nexusdb-wal/src/lib.rs` | Modify | Expose `writer` module |
-| `crates/nexusdb-wal/tests/integration_wal_writer.rs` | Create | Integration tests |
+| `crates/axiomdb-core/src/error.rs` | Modify | Add `WalInvalidHeader` |
+| `crates/axiomdb-wal/src/writer.rs` | Create | Complete `WalWriter` |
+| `crates/axiomdb-wal/src/lib.rs` | Modify | Expose `writer` module |
+| `crates/axiomdb-wal/tests/integration_wal_writer.rs` | Create | Integration tests |
 
 ---
 

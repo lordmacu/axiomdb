@@ -71,4 +71,4 @@ The WalReader does not keep the file open between scans — each iterator opens 
 
 - `WalEntry::from_bytes()` — subfase 3.1 ✅
 - `WalWriter` + constants `WAL_HEADER_SIZE`, `WAL_MAGIC`, `WAL_VERSION` — subfase 3.2 ✅
-- `DbError::WalEntryTruncated`, `WalChecksumMismatch`, `WalInvalidHeader` — already in nexusdb-core ✅
+- `DbError::WalEntryTruncated`, `WalChecksumMismatch`, `WalInvalidHeader` — already in axiomdb-core ✅

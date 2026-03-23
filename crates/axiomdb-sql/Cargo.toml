@@ -1,0 +1,28 @@
+[package]
+name        = "axiomdb-sql"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+axiomdb-core    = { workspace = true }
+axiomdb-types   = { workspace = true }
+axiomdb-catalog = { workspace = true }
+axiomdb-storage = { workspace = true }
+axiomdb-wal     = { workspace = true }
+thiserror       = { workspace = true }
+logos           = { workspace = true }
+
+[dev-dependencies]
+criterion    = { workspace = true }
+sqlparser    = "0.53"
+tempfile     = { workspace = true }
+
+[[bench]]
+name    = "sql_components"
+harness = false
+
+[[bench]]
+name    = "parser_comparison"
+harness = false

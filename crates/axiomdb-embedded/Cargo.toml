@@ -1,0 +1,14 @@
+[package]
+name        = "axiomdb-embedded"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name       = "axiomdb_embedded"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+axiomdb-core = { workspace = true }
+thiserror    = { workspace = true }

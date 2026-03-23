@@ -4,12 +4,12 @@
 
 | File | Action | Description |
 |---|---|---|
-| `crates/nexusdb-sql/src/parser/mod.rs` | CREATE | `Parser` struct, helpers, `parse()` entry point |
-| `crates/nexusdb-sql/src/parser/expr.rs` | CREATE | Expression sub-parser |
-| `crates/nexusdb-sql/src/parser/ddl.rs` | CREATE | DDL statement parsers |
-| `crates/nexusdb-sql/src/parser/dml.rs` | CREATE | Stub (Phase 4.4) |
-| `crates/nexusdb-sql/src/lib.rs` | MODIFY | `pub mod parser` + re-export `parse` |
-| `crates/nexusdb-sql/tests/integration_ddl_parser.rs` | CREATE | Integration tests |
+| `crates/axiomdb-sql/src/parser/mod.rs` | CREATE | `Parser` struct, helpers, `parse()` entry point |
+| `crates/axiomdb-sql/src/parser/expr.rs` | CREATE | Expression sub-parser |
+| `crates/axiomdb-sql/src/parser/ddl.rs` | CREATE | DDL statement parsers |
+| `crates/axiomdb-sql/src/parser/dml.rs` | CREATE | Stub (Phase 4.4) |
+| `crates/axiomdb-sql/src/lib.rs` | MODIFY | `pub mod parser` + re-export `parse` |
+| `crates/axiomdb-sql/tests/integration_ddl_parser.rs` | CREATE | Integration tests |
 
 ---
 
@@ -380,7 +380,7 @@ fn parse_references(p):
 ## Implementation phases
 
 ### Phase 1 — Directory structure
-1. Create `crates/nexusdb-sql/src/parser/` directory.
+1. Create `crates/axiomdb-sql/src/parser/` directory.
 2. Create stub files: `mod.rs`, `expr.rs`, `ddl.rs`, `dml.rs`.
 
 ### Phase 2 — Parser struct (mod.rs)
@@ -417,7 +417,7 @@ fn parse_references(p):
 1. Add `pub mod parser;` with `pub use parser::parse;`.
 
 ### Phase 7 — Integration tests
-File: `crates/nexusdb-sql/tests/integration_ddl_parser.rs`
+File: `crates/axiomdb-sql/tests/integration_ddl_parser.rs`
 
 Tests:
 ```

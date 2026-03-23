@@ -38,7 +38,7 @@ pub fn parse(input: &str, max_bytes: Option<usize>) -> Result<Stmt, DbError>
 ## Parser structure
 
 ```
-nexusdb-sql/src/
+axiomdb-sql/src/
   parser/
     mod.rs     ← parse() entry point; Parser struct; helpers
     expr.rs    ← expression sub-parser (grows in Phase 4.4)
@@ -325,8 +325,8 @@ Applies to: table names, column names, index names, constraint names, alias name
 
 ## Dependencies
 
-- `nexusdb-sql`: `lexer.rs` (Token, tokenize), `ast.rs` (Stmt, CreateTableStmt, etc.),
+- `axiomdb-sql`: `lexer.rs` (Token, tokenize), `ast.rs` (Stmt, CreateTableStmt, etc.),
   `expr.rs` (Expr, BinaryOp, UnaryOp)
-- `nexusdb-types`: `Value`, `DataType`
-- `nexusdb-core`: `DbError`
+- `axiomdb-types`: `Value`, `DataType`
+- `axiomdb-core`: `DbError`
 - No new Cargo.toml dependencies

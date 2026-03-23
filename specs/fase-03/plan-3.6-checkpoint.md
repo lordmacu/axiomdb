@@ -4,13 +4,13 @@
 
 | File | Action | What |
 |---|---|---|
-| `crates/nexusdb-storage/src/meta.rs` | create | `MetaPage` reader/writer — checkpoint_lsn at body[16..24] |
-| `crates/nexusdb-storage/src/lib.rs` | modify | `pub mod meta; pub use meta::...` |
-| `crates/nexusdb-wal/src/checkpoint.rs` | create | `Checkpointer` struct + `checkpoint()` + `last_checkpoint_lsn()` |
-| `crates/nexusdb-wal/src/lib.rs` | modify | `pub mod checkpoint; pub use checkpoint::Checkpointer;` |
-| `crates/nexusdb-wal/src/txn.rs` | modify | Add `wal_mut() -> &mut WalWriter` accessor |
+| `crates/axiomdb-storage/src/meta.rs` | create | `MetaPage` reader/writer — checkpoint_lsn at body[16..24] |
+| `crates/axiomdb-storage/src/lib.rs` | modify | `pub mod meta; pub use meta::...` |
+| `crates/axiomdb-wal/src/checkpoint.rs` | create | `Checkpointer` struct + `checkpoint()` + `last_checkpoint_lsn()` |
+| `crates/axiomdb-wal/src/lib.rs` | modify | `pub mod checkpoint; pub use checkpoint::Checkpointer;` |
+| `crates/axiomdb-wal/src/txn.rs` | modify | Add `wal_mut() -> &mut WalWriter` accessor |
 
-## Step 1 — MetaPage helpers (nexusdb-storage/src/meta.rs)
+## Step 1 — MetaPage helpers (axiomdb-storage/src/meta.rs)
 
 Constants and functions for reading/writing the meta page body:
 
@@ -55,7 +55,7 @@ but `as_bytes_mut()` returns the full page. Be precise about offset arithmetic.
 
 ## Step 2 — TxnManager::wal_mut()
 
-Add to `crates/nexusdb-wal/src/txn.rs`:
+Add to `crates/axiomdb-wal/src/txn.rs`:
 
 ```rust
 /// Mutable access to the underlying WalWriter.
@@ -65,7 +65,7 @@ pub fn wal_mut(&mut self) -> &mut WalWriter {
 }
 ```
 
-## Step 3 — Checkpointer (nexusdb-wal/src/checkpoint.rs)
+## Step 3 — Checkpointer (axiomdb-wal/src/checkpoint.rs)
 
 ```rust
 pub struct Checkpointer;  // stateless — all state in storage and wal
@@ -203,11 +203,11 @@ This is documented in the spec's use case 4.
 ## Implementation order
 
 ```
-1. nexusdb-storage/src/meta.rs — read/write_checkpoint_lsn
-2. nexusdb-storage/src/lib.rs — export
-3. nexusdb-wal/src/txn.rs — wal_mut() accessor
-4. nexusdb-wal/src/checkpoint.rs — Checkpointer::checkpoint() + last_checkpoint_lsn()
-5. nexusdb-wal/src/lib.rs — export Checkpointer
+1. axiomdb-storage/src/meta.rs — read/write_checkpoint_lsn
+2. axiomdb-storage/src/lib.rs — export
+3. axiomdb-wal/src/txn.rs — wal_mut() accessor
+4. axiomdb-wal/src/checkpoint.rs — Checkpointer::checkpoint() + last_checkpoint_lsn()
+5. axiomdb-wal/src/lib.rs — export Checkpointer
 6. Unit tests (MemoryStorage, ordering, monotonic)
 7. Integration test (MmapStorage, reopen, lsn survives)
 8. cargo test --workspace + clippy + fmt

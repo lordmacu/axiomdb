@@ -1,7 +1,7 @@
 # Phase 3 — WAL and Transactions
 
 **Status:** ✅ Completed (2026-03-22)
-**Crates:** `nexusdb-wal`, `nexusdb-storage`, `nexusdb-catalog`
+**Crates:** `axiomdb-wal`, `axiomdb-storage`, `axiomdb-catalog`
 **Specs/Plans:** `specs/fase-03/`
 
 ---
@@ -93,7 +93,7 @@ fills missing fields from defaults.
 ## Files created / key crates
 
 ```
-crates/nexusdb-wal/src/
+crates/axiomdb-wal/src/
   entry.rs       — WalEntry binary format, CRC32c
   writer.rs      — WalWriter append-only
   reader.rs      — WalReader scan_forward + scan_backward
@@ -101,28 +101,28 @@ crates/nexusdb-wal/src/
   checkpoint.rs  — Checkpointer 5-step protocol
   rotation.rs    — WalRotator with start_lsn header v2
   recovery.rs    — CrashRecovery state machine
-crates/nexusdb-wal/tests/
+crates/axiomdb-wal/tests/
   integration_wal_entry.rs, integration_wal_reader.rs
   integration_wal_writer.rs, integration_durability.rs
 
-crates/nexusdb-storage/src/
+crates/axiomdb-storage/src/
   heap.rs        — RowHeader, SlotEntry, insert/delete/scan_visible
   heap_chain.rs  — HeapChain multi-page linked list
   meta.rs        — meta page r/w + sequences (alloc_table_id/index_id)
   dirty.rs       — PageDirtyTracker
   config.rs      — DbConfig (dbyo.toml)
   integrity.rs   — IntegrityChecker + post-recovery checks
-crates/nexusdb-storage/tests/
+crates/axiomdb-storage/tests/
   integration_storage.rs
 
-crates/nexusdb-catalog/src/
+crates/axiomdb-catalog/src/
   bootstrap.rs   — CatalogBootstrap + catalog header in meta page
   schema.rs      — TableDef, ColumnDef, IndexDef, ColumnType
   reader.rs      — CatalogReader with MVCC snapshots
   writer.rs      — CatalogWriter with WAL + notifier
   notifier.rs    — CatalogChangeNotifier + SchemaChangeListener
   resolver.rs    — SchemaResolver (schema binding)
-crates/nexusdb-catalog/tests/
+crates/axiomdb-catalog/tests/
   integration_catalog_rw.rs     — 18 tests
   integration_catalog_notifier.rs — 10 tests
   integration_schema_binding.rs   — 13 tests
@@ -148,9 +148,9 @@ crates/nexusdb-catalog/tests/
 ## Quality metrics
 
 - **Tests:** 345 pass (0 fail)
-  - nexusdb-wal: 103 unit + 8+13+18+11 integration = 153
-  - nexusdb-storage: 76 unit + 28 integration = 104
-  - nexusdb-catalog: 27+10+13 unit + 18+10+13 integration = 91
+  - axiomdb-wal: 103 unit + 8+13+18+11 integration = 153
+  - axiomdb-storage: 76 unit + 28 integration = 104
+  - axiomdb-catalog: 27+10+13 unit + 18+10+13 integration = 91
 - **Clippy:** 0 errors (`-D warnings`)
 - **Fmt:** clean
 - **Benchmarks:** compile and run; page checksum 18 GiB/s (verify), 9.5 GiB/s (update)

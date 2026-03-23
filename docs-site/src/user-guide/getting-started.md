@@ -1,15 +1,15 @@
 # Getting Started
 
-NexusDB is a relational database engine written in Rust. It supports standard SQL, ACID
+AxiomDB is a relational database engine written in Rust. It supports standard SQL, ACID
 transactions, a Write-Ahead Log for crash recovery, and a Copy-on-Write B+ Tree for
-lock-free concurrent reads. This guide walks you through connecting to NexusDB, choosing
+lock-free concurrent reads. This guide walks you through connecting to AxiomDB, choosing
 a usage mode, and running your first queries.
 
 ---
 
 ## Choosing a Usage Mode
 
-NexusDB operates in two distinct modes that share the exact same engine code.
+AxiomDB operates in two distinct modes that share the exact same engine code.
 
 ### Server Mode
 
@@ -22,10 +22,10 @@ Application (PHP / Python / Node.js)
         │
         │ TCP :3306  (MySQL wire protocol)
         ▼
-  nexusdb-server process
+  axiomdb-server process
         │
         ▼
-  nexusdb.db   nexusdb.wal
+  axiomdb.db   axiomdb.wal
 ```
 
 **When to use server mode:**
@@ -44,10 +44,10 @@ Your Application (Rust / C++ / Python / Electron)
         │
         │ direct function call (C FFI / Rust crate)
         ▼
-  NexusDB engine (in-process)
+  AxiomDB engine (in-process)
         │
         ▼
-  nexusdb.db   nexusdb.wal   (local files)
+  axiomdb.db   axiomdb.wal   (local files)
 ```
 
 **When to use embedded mode:**
@@ -73,7 +73,7 @@ Your Application (Rust / C++ / Python / Electron)
 ### Starting the Server
 
 ```bash
-nexusdb-server --data-dir /var/lib/nexusdb --port 3306
+axiomdb-server --data-dir /var/lib/nexusdb --port 3306
 ```
 
 ### Connecting with PHP (PDO)
@@ -120,21 +120,21 @@ installation is required — the MySQL wire protocol is fully compatible.
 
 ## Embedded Mode — Rust API
 
-Add NexusDB to your `Cargo.toml`:
+Add AxiomDB to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-nexusdb-embedded = { path = "../nexusdb/crates/nexusdb-embedded" }
+axiomdb-embedded = { path = "../nexusdb/crates/axiomdb-embedded" }
 ```
 
 ### Open a Database
 
 ```rust
-use nexusdb_embedded::{Database, QueryResult};
+use axiomdb_embedded::{Database, QueryResult};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Open (or create) a database file on disk.
-    let db = Database::open("./nexusdb.db")?;
+    let db = Database::open("./axiomdb.db")?;
 
     // Or open an in-memory database for tests / temporary use.
     // let db = Database::open_in_memory()?;
@@ -166,7 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Explicit Transactions
 
 ```rust
-let db = Database::open("./nexusdb.db")?;
+let db = Database::open("./axiomdb.db")?;
 
 db.transaction(|txn| {
     txn.execute("INSERT INTO accounts (owner, balance) VALUES ('Alice', 1000.00)")?;
@@ -186,17 +186,17 @@ For C, C++, Qt, or Java (JNI):
 #include "nexusdb.h"
 
 int main(void) {
-    NexusDb* db = nexusdb_open("./nexusdb.db");
+    NexusDb* db = axiomdb_open("./axiomdb.db");
     if (!db) { fprintf(stderr, "failed to open\n"); return 1; }
 
     char* result = NULL;
-    int rc = nexusdb_execute(db, "SELECT id, name FROM users", &result);
+    int rc = axiomdb_execute(db, "SELECT id, name FROM users", &result);
     if (rc == 0) {
         printf("%s\n", result);   // result is JSON
-        nexusdb_free_string(result);
+        axiomdb_free_string(result);
     }
 
-    nexusdb_close(db);
+    axiomdb_close(db);
     return 0;
 }
 ```
@@ -207,15 +207,15 @@ int main(void) {
 import ctypes, json
 
 lib = ctypes.CDLL("./libnexusdb.dylib")
-lib.nexusdb_open.restype  = ctypes.c_void_p
-lib.nexusdb_close.argtypes = [ctypes.c_void_p]
-lib.nexusdb_execute.restype = ctypes.c_int
+lib.axiomdb_open.restype  = ctypes.c_void_p
+lib.axiomdb_close.argtypes = [ctypes.c_void_p]
+lib.axiomdb_execute.restype = ctypes.c_int
 
-db = lib.nexusdb_open(b"./nexusdb.db")
+db = lib.axiomdb_open(b"./axiomdb.db")
 result_ptr = ctypes.c_char_p()
-lib.nexusdb_execute(db, b"SELECT * FROM users", ctypes.byref(result_ptr))
+lib.axiomdb_execute(db, b"SELECT * FROM users", ctypes.byref(result_ptr))
 rows = json.loads(result_ptr.value)
-lib.nexusdb_close(db)
+lib.axiomdb_close(db)
 ```
 
 ---

@@ -7,15 +7,15 @@ Phase 4, plus a binary codec (`encode_row` / `decode_row`) that converts
 between `&[Value]` (typed, in-memory representation used by the executor)
 and `&[u8]` (compact binary representation stored in heap pages).
 
-Both types live in `nexusdb-types`, which depends only on `nexusdb-core`.
-The executor (`nexusdb-sql`) bridges between `DataType` (nexusdb-types) and
-`ColumnType` (nexusdb-catalog) when reading column definitions from the catalog.
+Both types live in `axiomdb-types`, which depends only on `axiomdb-core`.
+The executor (`axiomdb-sql`) bridges between `DataType` (axiomdb-types) and
+`ColumnType` (axiomdb-catalog) when reading column definitions from the catalog.
 
 ---
 
 ## DataType enum
 
-Lives in `nexusdb-types/src/types.rs`. Represents a SQL column type as seen
+Lives in `axiomdb-types/src/types.rs`. Represents a SQL column type as seen
 by the executor and the codec. Does NOT carry parameters (precision, scale,
 max-length) yet — those come in Phase 4.3 with DDL parsing.
 
@@ -36,14 +36,14 @@ pub enum DataType {
 ```
 
 `DataType` is the codec-facing type descriptor. `ColumnType` in
-`nexusdb-catalog` remains the disk-storage discriminant (compact `repr(u8)`).
+`axiomdb-catalog` remains the disk-storage discriminant (compact `repr(u8)`).
 The executor converts `ColumnType → DataType` via a simple `match`.
 
 ---
 
 ## Value enum
 
-Lives in `nexusdb-types/src/value.rs`, re-exported from the crate root.
+Lives in `axiomdb-types/src/value.rs`, re-exported from the crate root.
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
@@ -153,7 +153,7 @@ handles the page-size limit.
 
 ## API
 
-Located in `nexusdb-types/src/codec.rs`.
+Located in `axiomdb-types/src/codec.rs`.
 
 ```rust
 /// Encodes `values` into a compact binary row.
@@ -277,8 +277,8 @@ InvalidValue { reason: String },
 - [ ] `encoded_len(values) == encode_row(values, schema)?.len()` for all valid inputs
 - [ ] All 10 non-Null type roundtrips pass (one test per type)
 - [ ] 9-column row uses 2-byte bitmap correctly
-- [ ] `ValueTooLarge` and `InvalidValue` added to `DbError` in nexusdb-core
-- [ ] `nexusdb-types` depends only on `nexusdb-core` (no nexusdb-catalog)
+- [ ] `ValueTooLarge` and `InvalidValue` added to `DbError` in axiomdb-core
+- [ ] `axiomdb-types` depends only on `axiomdb-core` (no axiomdb-catalog)
 - [ ] No `unwrap()` in `src/`
 
 ---
@@ -303,6 +303,6 @@ InvalidValue { reason: String },
 
 ## Dependencies
 
-- `nexusdb-types`: new crate content (currently stub)
-- `nexusdb-core`: `DbError` (adds `ValueTooLarge`, `InvalidValue`)
-- **`nexusdb-types` depends ONLY on `nexusdb-core`** — no catalog, no storage
+- `axiomdb-types`: new crate content (currently stub)
+- `axiomdb-core`: `DbError` (adds `ValueTooLarge`, `InvalidValue`)
+- **`axiomdb-types` depends ONLY on `axiomdb-core`** — no catalog, no storage

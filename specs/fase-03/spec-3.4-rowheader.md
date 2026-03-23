@@ -109,7 +109,7 @@ A tuple with header H is visible to snapshot S if:
 
 - [ ] `RowHeader` is 24 bytes, `repr(C)`, implements `bytemuck::Pod` + `bytemuck::Zeroable`
 - [ ] `SlotEntry` is 4 bytes, `repr(C)`, implements `bytemuck::Pod`
-- [ ] `TransactionSnapshot` lives in `nexusdb-core`
+- [ ] `TransactionSnapshot` lives in `axiomdb-core`
 - [ ] `insert_tuple` + `read_tuple` roundtrip: data in == data out, RowHeader fields correct
 - [ ] `delete_tuple` marks `txn_id_deleted` in-place; read_tuple still returns Some (tuple exists)
 - [ ] `scan_visible` skips dead slots and non-visible tuples; yields correct (slot_id, data) pairs
@@ -134,7 +134,7 @@ A tuple with header H is visible to snapshot S if:
 
 ## Dependencies
 
-- `nexusdb-core`: `TxnId`, `RecordId` (already exist)
-- `nexusdb-storage`: `Page`, `PageHeader`, `PageType`, `StorageEngine`, `HEADER_SIZE`, `PAGE_SIZE` (already exist)
-- `bytemuck`: already a dependency of `nexusdb-storage`
+- `axiomdb-core`: `TxnId`, `RecordId` (already exist)
+- `axiomdb-storage`: `Page`, `PageHeader`, `PageType`, `StorageEngine`, `HEADER_SIZE`, `PAGE_SIZE` (already exist)
+- `bytemuck`: already a dependency of `axiomdb-storage`
 - New `DbError` variants needed: `HeapPageFull`, `InvalidSlot { slot_id: u16 }`, `AlreadyDeleted { slot_id: u16 }`

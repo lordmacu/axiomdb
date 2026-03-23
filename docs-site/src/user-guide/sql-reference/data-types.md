@@ -1,6 +1,6 @@
 # Data Types
 
-NexusDB implements a rich type system that covers the common SQL standard types as well
+AxiomDB implements a rich type system that covers the common SQL standard types as well
 as several extensions for modern workloads (UUID, JSON, VECTOR for AI embeddings, RANGE
 types for temporal and numeric overlaps).
 

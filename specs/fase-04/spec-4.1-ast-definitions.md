@@ -6,14 +6,14 @@ The complete SQL statement AST: all types that the parser (4.2–4.4) produces
 and the executor (4.5) consumes. The AST captures semantic structure, not
 concrete syntax — no source positions, no raw tokens.
 
-`Expr` is already defined in Phase 4.17 (`nexusdb-sql/src/expr.rs`). This
+`Expr` is already defined in Phase 4.17 (`axiomdb-sql/src/expr.rs`). This
 phase defines `Stmt` and all the statement-level types that contain `Expr`.
 
 ---
 
 ## Naming: `ColumnDef` in AST vs catalog
 
-`nexusdb-catalog::schema::ColumnDef` is the **stored** form (col_idx,
+`axiomdb-catalog::schema::ColumnDef` is the **stored** form (col_idx,
 ColumnType, nullable). The AST `ColumnDef` is the **parsed** form (name,
 DataType, constraints). Both use the same name in different crates — no
 conflict. The executor converts between them.
@@ -22,7 +22,7 @@ conflict. The executor converts between them.
 
 ## Types
 
-All types live in `nexusdb-sql/src/ast.rs`.
+All types live in `axiomdb-sql/src/ast.rs`.
 
 ### Base types
 
@@ -70,7 +70,7 @@ impl Default for ForeignKeyAction {
 
 ```rust
 /// A column definition as it appears in CREATE TABLE or ALTER TABLE ADD COLUMN.
-/// Different from `nexusdb_catalog::schema::ColumnDef` (the stored form).
+/// Different from `axiomdb_catalog::schema::ColumnDef` (the stored form).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDef {
     pub name: String,
@@ -376,7 +376,7 @@ pub enum Stmt {
 
 ## Dependencies
 
-- `nexusdb-sql`: same crate, `ast.rs` alongside `expr.rs`
-- `nexusdb-types`: `DataType` (used in `ColumnDef.data_type`)
-- `nexusdb-sql/src/expr.rs`: `Expr` (used throughout)
+- `axiomdb-sql`: same crate, `ast.rs` alongside `expr.rs`
+- `axiomdb-types`: `DataType` (used in `ColumnDef.data_type`)
+- `axiomdb-sql/src/expr.rs`: `Expr` (used throughout)
 - No new crate dependencies needed

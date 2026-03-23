@@ -1,25 +1,25 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/nexusdb-core",
-    "crates/nexusdb-types",
-    "crates/nexusdb-storage",
-    "crates/nexusdb-wal",
-    "crates/nexusdb-index",
-    "crates/nexusdb-mvcc",
-    "crates/nexusdb-catalog",
-    "crates/nexusdb-sql",
-    "crates/nexusdb-functions",
-    "crates/nexusdb-network",
-    "crates/nexusdb-security",
-    "crates/nexusdb-replication",
-    "crates/nexusdb-plugins",
-    "crates/nexusdb-cache",
-    "crates/nexusdb-geo",
-    "crates/nexusdb-vector",
-    "crates/nexusdb-migrations",
-    "crates/nexusdb-server",
-    "crates/nexusdb-embedded",
+    "crates/axiomdb-core",
+    "crates/axiomdb-types",
+    "crates/axiomdb-storage",
+    "crates/axiomdb-wal",
+    "crates/axiomdb-index",
+    "crates/axiomdb-mvcc",
+    "crates/axiomdb-catalog",
+    "crates/axiomdb-sql",
+    "crates/axiomdb-functions",
+    "crates/axiomdb-network",
+    "crates/axiomdb-security",
+    "crates/axiomdb-replication",
+    "crates/axiomdb-plugins",
+    "crates/axiomdb-cache",
+    "crates/axiomdb-geo",
+    "crates/axiomdb-vector",
+    "crates/axiomdb-migrations",
+    "crates/axiomdb-server",
+    "crates/axiomdb-embedded",
 ]
 
 [workspace.package]
@@ -28,7 +28,7 @@ edition     = "2021"
 rust-version = "1.80"
 authors     = ["lordmacu"]
 license     = "MIT"
-repository  = "https://github.com/lordmacu/nexusdb"
+repository  = "https://github.com/lordmacu/axiomdb"
 
 [workspace.dependencies]
 # Error handling
@@ -65,11 +65,11 @@ toml = "1"
 logos = "0.14"
 
 # Internal crates
-nexusdb-core    = { path = "crates/nexusdb-core" }
-nexusdb-types   = { path = "crates/nexusdb-types" }
-nexusdb-storage = { path = "crates/nexusdb-storage" }
-nexusdb-wal     = { path = "crates/nexusdb-wal" }
-nexusdb-catalog = { path = "crates/nexusdb-catalog" }
+axiomdb-core    = { path = "crates/axiomdb-core" }
+axiomdb-types   = { path = "crates/axiomdb-types" }
+axiomdb-storage = { path = "crates/axiomdb-storage" }
+axiomdb-wal     = { path = "crates/axiomdb-wal" }
+axiomdb-catalog = { path = "crates/axiomdb-catalog" }
 
 [profile.dev]
 opt-level = 0

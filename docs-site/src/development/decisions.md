@@ -1,6 +1,6 @@
 # Design Decisions
 
-This page documents the most consequential architectural choices made during NexusDB's
+This page documents the most consequential architectural choices made during AxiomDB's
 design. Each entry explains the alternatives considered, the reasoning, and the
 trade-offs accepted.
 
@@ -80,7 +80,7 @@ trade-offs accepted.
 
 **Why not LSM:**
 - LSM-trees have superior write throughput (sequential I/O only) but inferior read
-  performance (must check multiple levels). NexusDB's target is OLTP with read-heavy
+  performance (must check multiple levels). AxiomDB's target is OLTP with read-heavy
   workloads. A B+ Tree point lookup is O(log n) I/Os; an LSM lookup is O(L) compaction
   levels, each potentially requiring a disk seek.
 - Compaction in LSM introduces unpredictable write amplification spikes that are
@@ -120,7 +120,7 @@ of 0.61 ms for 10,000 rows, this is within the 45 ms budget by a factor of 73.
 - MySQL writes each page twice: once to the doublewrite buffer and once to the actual
   position. The doublewrite buffer protects against torn writes (partial page writes
   due to power failure mid-write).
-- NexusDB protects against torn writes with a CRC32c checksum per page. If a page has
+- AxiomDB protects against torn writes with a CRC32c checksum per page. If a page has
   an invalid checksum on startup, it is reconstructed from the WAL. This requires the
   WAL to contain the information needed for reconstruction — which it does (the WAL
   records the full new_value for each UPDATE/INSERT).

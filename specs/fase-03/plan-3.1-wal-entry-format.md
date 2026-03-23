@@ -4,11 +4,11 @@
 
 | File | Action | What it does |
 |---|---|---|
-| `crates/nexusdb-core/src/error.rs` | Modify | Add 3 WAL variants to DbError |
-| `crates/nexusdb-wal/Cargo.toml` | Modify | Add `crc32c` dependency |
-| `crates/nexusdb-wal/src/lib.rs` | Replace | Public modules of the crate |
-| `crates/nexusdb-wal/src/entry.rs` | Create | `EntryType`, `WalEntry`, serialization |
-| `crates/nexusdb-wal/tests/integration_wal_entry.rs` | Create | Integration tests |
+| `crates/axiomdb-core/src/error.rs` | Modify | Add 3 WAL variants to DbError |
+| `crates/axiomdb-wal/Cargo.toml` | Modify | Add `crc32c` dependency |
+| `crates/axiomdb-wal/src/lib.rs` | Replace | Public modules of the crate |
+| `crates/axiomdb-wal/src/entry.rs` | Create | `EntryType`, `WalEntry`, serialization |
+| `crates/axiomdb-wal/tests/integration_wal_entry.rs` | Create | Integration tests |
 
 ---
 
@@ -67,7 +67,7 @@
 ## Implementation phases
 
 ### Step 1 — Add WAL errors to DbError
-In `nexusdb-core/src/error.rs`, section `// ── WAL`:
+In `axiomdb-core/src/error.rs`, section `// ── WAL`:
 ```rust
 #[error("WAL entry at LSN {lsn} has invalid checksum: expected {expected:#010x}, got {got:#010x}")]
 WalChecksumMismatch { lsn: u64, expected: u32, got: u32 },
@@ -79,11 +79,11 @@ WalEntryTruncated { lsn: u64 },
 WalUnknownEntryType { byte: u8 },
 ```
 
-### Step 2 — Add crc32c to nexusdb-wal/Cargo.toml
+### Step 2 — Add crc32c to axiomdb-wal/Cargo.toml
 ```toml
 crc32c = "0.6"
 ```
-(same version as nexusdb-storage — already tested)
+(same version as axiomdb-storage — already tested)
 
 ### Step 3 — Implement `entry.rs`
 In order:

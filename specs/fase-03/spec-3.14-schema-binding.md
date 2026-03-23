@@ -194,6 +194,6 @@ error messages are unambiguous.
 
 ## Dependencies
 
-- `nexusdb-catalog`: `CatalogReader`, `TableDef`, `ColumnDef`, `IndexDef`, `TableId`
-- `nexusdb-core`: `DbError`, `TransactionSnapshot`
-- `nexusdb-storage`: `StorageEngine` (passed through to `CatalogReader::new`)
+- `axiomdb-catalog`: `CatalogReader`, `TableDef`, `ColumnDef`, `IndexDef`, `TableId`
+- `axiomdb-core`: `DbError`, `TransactionSnapshot`
+- `axiomdb-storage`: `StorageEngine` (passed through to `CatalogReader::new`)

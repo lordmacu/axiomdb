@@ -4,11 +4,11 @@
 
 | File | Action | Description |
 |---|---|---|
-| `crates/nexusdb-sql/src/lexer.rs` | CREATE | `Token`, `Span`, `SpannedToken`, `tokenize`, `process_string_literal` |
-| `crates/nexusdb-sql/src/lib.rs` | MODIFY | Add `pub mod lexer` + re-exports |
-| `crates/nexusdb-sql/Cargo.toml` | MODIFY | Add `logos = "0.14"` |
+| `crates/axiomdb-sql/src/lexer.rs` | CREATE | `Token`, `Span`, `SpannedToken`, `tokenize`, `process_string_literal` |
+| `crates/axiomdb-sql/src/lib.rs` | MODIFY | Add `pub mod lexer` + re-exports |
+| `crates/axiomdb-sql/Cargo.toml` | MODIFY | Add `logos = "0.14"` |
 | `Cargo.toml` (workspace) | MODIFY | Add `logos = "0.14"` to workspace deps |
-| `crates/nexusdb-sql/tests/integration_lexer.rs` | CREATE | Integration tests |
+| `crates/axiomdb-sql/tests/integration_lexer.rs` | CREATE | Integration tests |
 
 ---
 
@@ -189,7 +189,7 @@ fn tokenize(input: &str, max_bytes: Option<usize>) -> Result<Vec<SpannedToken>>:
 
 ### Phase 1 — Cargo.toml
 1. Add `logos = "0.14"` to workspace `Cargo.toml`.
-2. Add `logos = { workspace = true }` to `nexusdb-sql/Cargo.toml`.
+2. Add `logos = { workspace = true }` to `axiomdb-sql/Cargo.toml`.
 
 ### Phase 2 — lexer.rs: Span, SpannedToken
 1. Define `Span { start: usize, end: usize }` with `Copy`.
@@ -223,7 +223,7 @@ fn tokenize(input: &str, max_bytes: Option<usize>) -> Result<Vec<SpannedToken>>:
 2. Re-export: `Span`, `SpannedToken`, `Token`, `tokenize`.
 
 ### Phase 7 — Integration tests
-File: `crates/nexusdb-sql/tests/integration_lexer.rs`
+File: `crates/axiomdb-sql/tests/integration_lexer.rs`
 
 Tests:
 ```

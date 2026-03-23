@@ -9,7 +9,7 @@ can know exactly which pages need flushing, without scanning all pages.
 ## PageDirtyTracker
 
 ```rust
-// nexusdb-storage/src/dirty.rs
+// axiomdb-storage/src/dirty.rs
 pub struct PageDirtyTracker {
     dirty: HashSet<u64>,
 }

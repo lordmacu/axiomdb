@@ -9,7 +9,7 @@ entry point and the embedded API.
 ## DbConfig
 
 ```rust
-// nexusdb-storage/src/config.rs
+// axiomdb-storage/src/config.rs
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DbConfig {
     pub data_dir: Option<PathBuf>,      // default: None (caller chooses)

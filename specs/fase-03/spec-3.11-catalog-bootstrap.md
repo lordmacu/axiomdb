@@ -57,7 +57,7 @@ flags: u8         — bit0 = unique, bit1 = primary key
 index_name: &str
 ```
 
-## Schema types (nexusdb-catalog/src/schema.rs)
+## Schema types (axiomdb-catalog/src/schema.rs)
 
 ```rust
 pub type TableId = u32;
@@ -118,7 +118,7 @@ Each schema type serializes to bytes for storage in heap slots:
 
 Serialization errors: `DbError::ParseError` for invalid bytes.
 
-## CatalogBootstrap (nexusdb-catalog/src/bootstrap.rs)
+## CatalogBootstrap (axiomdb-catalog/src/bootstrap.rs)
 
 ```rust
 pub struct CatalogPageIds {
@@ -201,6 +201,6 @@ CatalogNotInitialized,
 
 ## Dependencies
 
-- `nexusdb-storage`: `StorageEngine`, `Page`, `PageType`, `HEADER_SIZE` → must be added to Cargo.toml
-- `nexusdb-core`: `DbError`, `TxnId` (already in deps)
-- New `DbError::CatalogNotInitialized` variant in nexusdb-core
+- `axiomdb-storage`: `StorageEngine`, `Page`, `PageType`, `HEADER_SIZE` → must be added to Cargo.toml
+- `axiomdb-core`: `DbError`, `TxnId` (already in deps)
+- New `DbError::CatalogNotInitialized` variant in axiomdb-core

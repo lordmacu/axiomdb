@@ -1,13 +1,13 @@
 [book]
-title       = "NexusDB Documentation"
-authors     = ["NexusDB Team"]
+title       = "AxiomDB Documentation"
+authors     = ["AxiomDB Team"]
 language    = "en"
 src         = "src"
 
 [output.html]
 default-theme         = "navy"
 preferred-dark-theme  = "navy"
-git-repository-url    = "https://github.com/lordmacu/nexusdb"
+git-repository-url    = "https://github.com/lordmacu/axiomdb"
 no-section-label      = true
 additional-css        = ["theme/custom.css"]
 

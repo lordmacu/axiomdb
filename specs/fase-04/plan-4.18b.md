@@ -4,10 +4,10 @@
 
 | File | Action | What it does |
 |---|---|---|
-| `crates/nexusdb-core/src/error.rs` | modify | Add `InvalidCoercion` variant + SQLSTATE 22018 |
-| `crates/nexusdb-types/src/coerce.rs` | **create** | `CoercionMode`, `coerce()`, `coerce_for_op()`, all helpers |
-| `crates/nexusdb-types/src/lib.rs` | modify | `pub mod coerce` + re-exports |
-| `crates/nexusdb-sql/src/eval.rs` | modify | Replace `coerce_numeric`/`coerce_for_compare` with `coerce_for_op` |
+| `crates/axiomdb-core/src/error.rs` | modify | Add `InvalidCoercion` variant + SQLSTATE 22018 |
+| `crates/axiomdb-types/src/coerce.rs` | **create** | `CoercionMode`, `coerce()`, `coerce_for_op()`, all helpers |
+| `crates/axiomdb-types/src/lib.rs` | modify | `pub mod coerce` + re-exports |
+| `crates/axiomdb-sql/src/eval.rs` | modify | Replace `coerce_numeric`/`coerce_for_compare` with `coerce_for_op` |
 
 No new crate, no new dependency. All changes within the existing workspace.
 
@@ -18,7 +18,7 @@ No new crate, no new dependency. All changes within the existing workspace.
 ### Step 1 — `DbError::InvalidCoercion`
 
 ```rust
-// nexusdb-core/src/error.rs — add variant:
+// axiomdb-core/src/error.rs — add variant:
 #[error("cannot coerce {value} ({from}) to {to}: {reason}")]
 InvalidCoercion {
     from:   String,   // e.g. "Text"
@@ -34,7 +34,7 @@ DbError::InvalidCoercion { .. } => "22018",
 ### Step 2 — `CoercionMode` enum
 
 ```rust
-// nexusdb-types/src/coerce.rs
+// axiomdb-types/src/coerce.rs
 pub enum CoercionMode {
     Strict,      // default — '42abc'→INT = error
     Permissive,  // MySQL compat — '42abc'→INT = 42
@@ -178,7 +178,7 @@ fn coerce_for_compare(l: Value, r: Value) -> Result<(Value, Value), DbError> {
 With:
 ```rust
 // ADD at top of eval.rs:
-use nexusdb_types::coerce::coerce_for_op;
+use axiomdb_types::coerce::coerce_for_op;
 
 // In eval_arithmetic and compare_values, replace calls to coerce_numeric/coerce_for_compare:
 let (l, r) = coerce_for_op(l, r)?;
@@ -192,11 +192,11 @@ through now return `InvalidCoercion` instead of an unrelated `TypeMismatch`.
 
 ## Implementation phases
 
-1. **Add `DbError::InvalidCoercion`** to `nexusdb-core/src/error.rs` + map SQLSTATE.
-   Verify `cargo check -p nexusdb-core`.
+1. **Add `DbError::InvalidCoercion`** to `axiomdb-core/src/error.rs` + map SQLSTATE.
+   Verify `cargo check -p axiomdb-core`.
 
 2. **Create `coerce.rs`** with `CoercionMode` enum and skeleton `coerce()` + `coerce_for_op()`
-   that return `NotImplemented`. Verify `cargo check -p nexusdb-types`.
+   that return `NotImplemented`. Verify `cargo check -p axiomdb-types`.
 
 3. **Implement `coerce_for_op()`** — numeric widening lattice. Write unit tests.
    Verify all 10+ test cases pass.
@@ -215,14 +215,14 @@ through now return `InvalidCoercion` instead of an unrelated `TypeMismatch`.
    Write unit tests for each cell in the matrix (identity, widening, narrowing,
    text→numeric, date→timestamp, bool→numeric permissive, invalid pairs).
 
-8. **Export from `nexusdb-types/src/lib.rs`**:
+8. **Export from `axiomdb-types/src/lib.rs`**:
    ```rust
    pub mod coerce;
    pub use coerce::{coerce, coerce_for_op, CoercionMode};
    ```
 
 9. **Integrate into `eval.rs`** — remove `coerce_numeric` and `coerce_for_compare`,
-   add `use nexusdb_types::coerce::coerce_for_op`, update call sites.
+   add `use axiomdb_types::coerce::coerce_for_op`, update call sites.
    Verify all existing `eval.rs` tests still pass.
 
 10. **Run full workspace check** — `cargo test --workspace`, `cargo clippy`, `cargo fmt`.
@@ -231,7 +231,7 @@ through now return `InvalidCoercion` instead of an unrelated `TypeMismatch`.
 
 ## Tests to write
 
-### In `nexusdb-types/src/coerce.rs` (unit tests, no I/O)
+### In `axiomdb-types/src/coerce.rs` (unit tests, no I/O)
 
 ```
 // Identity
@@ -290,7 +290,7 @@ test_coerce_real_to_int_is_error      — Real → Int: InvalidCoercion (use CAS
 test_coerce_int_to_text_is_error      — Int → Text: InvalidCoercion
 ```
 
-### In `nexusdb-types/src/coerce.rs` (unit tests for `coerce_for_op`)
+### In `axiomdb-types/src/coerce.rs` (unit tests for `coerce_for_op`)
 
 ```
 test_op_same_types_all               — all same-type pairs return unchanged
@@ -305,7 +305,7 @@ test_op_text_int_error               — (Text, Int) → InvalidCoercion
 test_op_null_error                   — (Null, Int) → InvalidCoercion (Null handled before coerce_for_op)
 ```
 
-### In `nexusdb-sql/src/eval.rs` (integration — existing tests must still pass)
+### In `axiomdb-sql/src/eval.rs` (integration — existing tests must still pass)
 
 ```
 test_eval_int_plus_bigint             — eval(Int(1) + BigInt(999)) → BigInt(1000)
@@ -342,4 +342,4 @@ test_eval_incompatible_types_error    — eval(Int(1) + Text("a")) → Err(Inval
 | `parse_text_to_decimal` has complex edge cases (negative zero, leading zeros in fraction) | Test `"-0.5"`, `"0.00"`, `"007"`, `".5"` explicitly |
 | `Int → Decimal` scale depends on the Decimal operand — easy to get wrong in `coerce_for_op` | Test `(Int(5), Decimal(314, 2))` → `(Decimal(500, 2), Decimal(314, 2))` and verify arithmetic gives `8.14` |
 | Permissive `"abc"→0` mimics MySQL but may surprise users | Document clearly in module-level doc comment and in error hint |
-| Removing `coerce_numeric` may break `eval.rs` tests | Run `cargo test -p nexusdb-sql` after step 9 before committing |
+| Removing `coerce_numeric` may break `eval.rs` tests | Run `cargo test -p axiomdb-sql` after step 9 before committing |

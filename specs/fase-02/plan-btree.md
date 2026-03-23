@@ -3,8 +3,8 @@
 ## Files to create / modify
 
 ```
-crates/nexusdb-index/
-├── Cargo.toml                     — add deps: nexusdb-core, nexusdb-storage, bytemuck
+crates/axiomdb-index/
+├── Cargo.toml                     — add deps: axiomdb-core, axiomdb-storage, bytemuck
 └── src/
     ├── lib.rs                     — public re-exports
     ├── page_layout.rs             — InternalNodePage, LeafNodePage, RecordIdOnDisk (bytemuck)
@@ -13,13 +13,13 @@ crates/nexusdb-index/
     ├── iter.rs                    — RangeIter (lazy, leaf linked list)
     └── prefix.rs                  — CompressedNode, prefix compression
 
-crates/nexusdb-index/tests/
+crates/axiomdb-index/tests/
 └── integration_btree.rs           — integration tests
 
-crates/nexusdb-index/benches/
+crates/axiomdb-index/benches/
 └── btree.rs                       — Criterion benchmarks
 
-Cargo.toml (workspace root)        — verify that nexusdb-index is already in members[]
+Cargo.toml (workspace root)        — verify that axiomdb-index is already in members[]
 ```
 
 ---

@@ -4,13 +4,13 @@
 
 | File | Action | What it does |
 |---|---|---|
-| `crates/nexusdb-catalog/src/schema.rs` | modify | Add `data_root_page_id` to `TableDef`; update `to_bytes`/`from_bytes` |
-| `crates/nexusdb-catalog/src/writer.rs` | modify | `create_table()` allocs + inits the data root page |
-| `crates/nexusdb-storage/src/heap_chain.rs` | modify | Add `HeapChain::read_row()` |
-| `crates/nexusdb-storage/src/lib.rs` | modify | Re-export `HeapChain::read_row` if needed (via `heap_chain`) |
-| `crates/nexusdb-sql/Cargo.toml` | modify | Add `nexusdb-wal` as regular dep |
-| `crates/nexusdb-sql/src/table.rs` | **create** | `TableEngine` struct + 4 methods + helpers |
-| `crates/nexusdb-sql/src/lib.rs` | modify | `pub mod table` + re-export `TableEngine` |
+| `crates/axiomdb-catalog/src/schema.rs` | modify | Add `data_root_page_id` to `TableDef`; update `to_bytes`/`from_bytes` |
+| `crates/axiomdb-catalog/src/writer.rs` | modify | `create_table()` allocs + inits the data root page |
+| `crates/axiomdb-storage/src/heap_chain.rs` | modify | Add `HeapChain::read_row()` |
+| `crates/axiomdb-storage/src/lib.rs` | modify | Re-export `HeapChain::read_row` if needed (via `heap_chain`) |
+| `crates/axiomdb-sql/Cargo.toml` | modify | Add `axiomdb-wal` as regular dep |
+| `crates/axiomdb-sql/src/table.rs` | **create** | `TableEngine` struct + 4 methods + helpers |
+| `crates/axiomdb-sql/src/lib.rs` | modify | `pub mod table` + re-export `TableEngine` |
 
 ---
 
@@ -90,7 +90,7 @@ pub fn read_row(
 ### Step 4 — `TableEngine` module
 
 ```
-// nexusdb-sql/src/table.rs
+// axiomdb-sql/src/table.rs
 
 pub struct TableEngine;
 
@@ -204,22 +204,22 @@ fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
 ## Implementation order
 
 1. **`schema.rs`** — add field, update `to_bytes`/`from_bytes`, update tests.
-   `cargo check -p nexusdb-catalog` must pass.
+   `cargo check -p axiomdb-catalog` must pass.
 
 2. **`writer.rs`** — update `create_table()` to alloc + init the data page.
-   `cargo test -p nexusdb-catalog` must pass (existing tests updated).
+   `cargo test -p axiomdb-catalog` must pass (existing tests updated).
 
 3. **`heap_chain.rs`** — add `read_row()`.
-   `cargo test -p nexusdb-storage` must pass.
+   `cargo test -p axiomdb-storage` must pass.
 
-4. **`nexusdb-sql/Cargo.toml`** — add `nexusdb-wal = { workspace = true }`.
+4. **`axiomdb-sql/Cargo.toml`** — add `axiomdb-wal = { workspace = true }`.
 
 5. **`table.rs`** — create module with `TableEngine` + helpers.
-   `cargo check -p nexusdb-sql` must pass.
+   `cargo check -p axiomdb-sql` must pass.
 
 6. **`lib.rs`** — add `pub mod table` + re-export.
 
-7. **Write tests** in `table.rs` (unit) and `crates/nexusdb-sql/tests/` (integration).
+7. **Write tests** in `table.rs` (unit) and `crates/axiomdb-sql/tests/` (integration).
 
 8. **Full check**: `cargo test --workspace`, `cargo clippy`, `cargo fmt`.
 
@@ -227,7 +227,7 @@ fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
 
 ## Tests to write
 
-### Unit tests in `nexusdb-catalog/src/schema.rs`
+### Unit tests in `axiomdb-catalog/src/schema.rs`
 
 ```
 test_table_def_roundtrip_with_root_page
@@ -244,7 +244,7 @@ test_table_def_root_page_id_zero
   — data_root_page_id=0 roundtrips correctly (0 is valid in the codec)
 ```
 
-### Unit tests in `nexusdb-storage/src/heap_chain.rs`
+### Unit tests in `axiomdb-storage/src/heap_chain.rs`
 
 ```
 test_read_row_live_slot
@@ -257,7 +257,7 @@ test_read_row_invalid_slot
   — read_row with slot_id >= num_slots returns Err(InvalidSlot)
 ```
 
-### Unit tests in `nexusdb-sql/src/table.rs`
+### Unit tests in `axiomdb-sql/src/table.rs`
 
 ```
 test_column_data_types_all_variants
@@ -267,7 +267,7 @@ test_encode_rid_roundtrip
   — encode_rid(page_id=7, slot_id=3) produces [7,0,0,0,0,0,0,0, 3,0]
 ```
 
-### Integration tests in `crates/nexusdb-sql/tests/integration_table.rs`
+### Integration tests in `crates/axiomdb-sql/tests/integration_table.rs`
 
 All tests use `MemoryStorage` + `TxnManager::create` in a tempdir.
 
@@ -337,5 +337,5 @@ test_table_engine_chain_growth
 | Existing catalog tests use old `TableDef` format (3 fields) | Update all `TableDef { id, schema_name, table_name }` constructors to include `data_root_page_id` — compiler will flag every missing field |
 | `from_bytes` truncation check was `< 6`; new minimum is `14` — integration tests with hard-coded bytes will break | Search for literal `TableDef::from_bytes` test cases and update offset math |
 | `CatalogWriter::create_table` integration tests don't verify `data_root_page_id` | Add assertion: `table_def.data_root_page_id != 0` in create tests |
-| `nexusdb-wal` as regular dep may introduce a build cycle | Verify: `nexusdb-wal` depends on `nexusdb-storage`, `nexusdb-core`; it does NOT depend on `nexusdb-sql` — no cycle |
+| `axiomdb-wal` as regular dep may introduce a build cycle | Verify: `axiomdb-wal` depends on `axiomdb-storage`, `axiomdb-core`; it does NOT depend on `axiomdb-sql` — no cycle |
 | `update_row` DELETE+INSERT creates two WAL entries; rollback applies both undo ops | `TxnManager` undo log applies ops in reverse chronological order: `UndoInsert(new)` runs first (kills new row), then `UndoDelete(old)` runs (restores old row) — correct |

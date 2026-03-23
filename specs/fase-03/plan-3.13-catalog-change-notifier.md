@@ -4,10 +4,10 @@
 
 | File | Action | Description |
 |---|---|---|
-| `crates/nexusdb-catalog/src/notifier.rs` | CREATE | `SchemaChangeKind`, `SchemaChangeEvent`, `SchemaChangeListener`, `CatalogChangeNotifier` |
-| `crates/nexusdb-catalog/src/writer.rs` | MODIFY | Add `notifier: Option<Arc<CatalogChangeNotifier>>` field + `with_notifier` + fire events |
-| `crates/nexusdb-catalog/src/lib.rs` | MODIFY | Add `pub mod notifier` + re-exports |
-| `crates/nexusdb-catalog/tests/integration_catalog_notifier.rs` | CREATE | Integration tests |
+| `crates/axiomdb-catalog/src/notifier.rs` | CREATE | `SchemaChangeKind`, `SchemaChangeEvent`, `SchemaChangeListener`, `CatalogChangeNotifier` |
+| `crates/axiomdb-catalog/src/writer.rs` | MODIFY | Add `notifier: Option<Arc<CatalogChangeNotifier>>` field + `with_notifier` + fire events |
+| `crates/axiomdb-catalog/src/lib.rs` | MODIFY | Add `pub mod notifier` + re-exports |
+| `crates/axiomdb-catalog/tests/integration_catalog_notifier.rs` | CREATE | Integration tests |
 
 No new crates, no new Cargo.toml dependencies (`std::sync::RwLock` is sufficient).
 
@@ -127,7 +127,7 @@ create_column → no event
 
 ### Phase 4 — Integration tests
 
-File: `crates/nexusdb-catalog/tests/integration_catalog_notifier.rs`
+File: `crates/axiomdb-catalog/tests/integration_catalog_notifier.rs`
 
 ```
 test_no_notifier_backward_compatible
@@ -259,13 +259,13 @@ fn test_spurious_notification_on_rollback() {
 ## Dependency graph (unchanged)
 
 ```
-nexusdb-core          (TxnId, TableId, DbError)
+axiomdb-core          (TxnId, TableId, DbError)
     ↑
-nexusdb-storage       (StorageEngine, HeapChain, meta)
+axiomdb-storage       (StorageEngine, HeapChain, meta)
     ↑
-nexusdb-wal           (TxnManager)
+axiomdb-wal           (TxnManager)
     ↑
-nexusdb-catalog       (notifier, bootstrap, schema, writer, reader)
+axiomdb-catalog       (notifier, bootstrap, schema, writer, reader)
 ```
 
 No new external crates required.

@@ -130,7 +130,7 @@ Concurrent readers are served via `TransactionSnapshot` without locking.
 
 ## Dependencies
 
-- `nexusdb-wal`: WalWriter, WalEntry, EntryType (already exist)
-- `nexusdb-storage`: StorageEngine, Page, heap::mark_slot_dead, heap::clear_deletion (new helpers needed)
-- `nexusdb-core`: TxnId, TransactionSnapshot, DbError (already exist)
+- `axiomdb-wal`: WalWriter, WalEntry, EntryType (already exist)
+- `axiomdb-storage`: StorageEngine, Page, heap::mark_slot_dead, heap::clear_deletion (new helpers needed)
+- `axiomdb-core`: TxnId, TransactionSnapshot, DbError (already exist)
 - New DbError variants: `TransactionAlreadyActive`, `NoActiveTransaction`

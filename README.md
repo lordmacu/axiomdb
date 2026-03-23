@@ -1,4 +1,4 @@
-# NexusDB — Database Engine in Rust
+# AxiomDB — Database Engine in Rust
 
 Database engine designed to outperform MySQL on specific benchmarks.
 University project in Rust with modern architecture.
@@ -17,7 +17,7 @@ University project in Rust with modern architecture.
 
 ```bash
 # Server
-cargo run --bin nexusdb-server -- --data-dir ./data
+cargo run --bin axiomdb-server -- --data-dir ./data
 
 # Connect with psql
 psql -h localhost -p 5432 -U root nexusdb
@@ -26,8 +26,8 @@ psql -h localhost -p 5432 -U root nexusdb
 mysql -h localhost -P 3306 -u root nexusdb
 
 # Embedded mode (Python)
-pip install nexusdb-python
-python -c "import nexusdb; db = nexusdb.open('nexusdb.db'); db.execute('SELECT 1')"
+pip install axiomdb-python
+python -c "import nexusdb; db = nexusdb.open('axiomdb.db'); db.execute('SELECT 1')"
 ```
 
 ## Architecture
@@ -56,7 +56,7 @@ See [`db.md`](db.md) for the complete design: types, optimizations, phases and d
 
 ## Name
 
-**NexusDB** — a database is the central connection point of every application.
+**AxiomDB** — a database is the central connection point of every application.
 The name reflects exactly that: the nexus between data and the world.
 
 ## Target benchmarks

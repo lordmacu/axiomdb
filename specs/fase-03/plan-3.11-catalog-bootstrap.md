@@ -4,13 +4,13 @@
 
 | File | Action | What |
 |---|---|---|
-| `crates/nexusdb-core/src/error.rs` | modify | Add `CatalogNotInitialized` |
-| `crates/nexusdb-storage/src/meta.rs` | modify | Add catalog header constants + read/write |
-| `crates/nexusdb-storage/src/lib.rs` | modify | Export new catalog meta symbols |
-| `crates/nexusdb-catalog/Cargo.toml` | modify | Add `nexusdb-storage` dependency |
-| `crates/nexusdb-catalog/src/schema.rs` | create | `ColumnType`, `TableDef`, `ColumnDef`, `IndexDef` + serialization |
-| `crates/nexusdb-catalog/src/bootstrap.rs` | create | `CatalogPageIds`, `CatalogBootstrap` |
-| `crates/nexusdb-catalog/src/lib.rs` | modify | Export all public types |
+| `crates/axiomdb-core/src/error.rs` | modify | Add `CatalogNotInitialized` |
+| `crates/axiomdb-storage/src/meta.rs` | modify | Add catalog header constants + read/write |
+| `crates/axiomdb-storage/src/lib.rs` | modify | Export new catalog meta symbols |
+| `crates/axiomdb-catalog/Cargo.toml` | modify | Add `axiomdb-storage` dependency |
+| `crates/axiomdb-catalog/src/schema.rs` | create | `ColumnType`, `TableDef`, `ColumnDef`, `IndexDef` + serialization |
+| `crates/axiomdb-catalog/src/bootstrap.rs` | create | `CatalogPageIds`, `CatalogBootstrap` |
+| `crates/axiomdb-catalog/src/lib.rs` | modify | Export all public types |
 
 ## Step 1 — DbError::CatalogNotInitialized
 
@@ -21,7 +21,7 @@ CatalogNotInitialized,
 
 ## Step 2 — meta.rs: catalog header constants
 
-Add to `nexusdb-storage/src/meta.rs` after `CHECKPOINT_LSN_BODY_OFFSET`:
+Add to `axiomdb-storage/src/meta.rs` after `CHECKPOINT_LSN_BODY_OFFSET`:
 
 ```rust
 /// body[32..40]: root heap page of nexus_tables (0 = uninitialized)
@@ -84,12 +84,12 @@ pub use meta::{
 };
 ```
 
-## Step 3 — nexusdb-catalog/Cargo.toml
+## Step 3 — axiomdb-catalog/Cargo.toml
 
 ```toml
 [dependencies]
-nexusdb-core    = { workspace = true }
-nexusdb-storage = { workspace = true }
+axiomdb-core    = { workspace = true }
+axiomdb-storage = { workspace = true }
 thiserror       = { workspace = true }
 
 [dev-dependencies]
@@ -99,7 +99,7 @@ tempfile = { workspace = true }
 ## Step 4 — schema.rs: ColumnType
 
 ```rust
-/// SQL column type stored in the catalog. A subset of DataType from nexusdb-core
+/// SQL column type stored in the catalog. A subset of DataType from axiomdb-core
 /// sufficient for Phase 3-4; extended in later phases.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,7 +249,7 @@ fn test_catalog_survives_reopen()         // MmapStorage: init → close → ope
 1. error.rs: CatalogNotInitialized
 2. meta.rs: catalog header constants + read/write functions
 3. lib.rs: export new symbols
-4. catalog/Cargo.toml: add nexusdb-storage
+4. catalog/Cargo.toml: add axiomdb-storage
 5. schema.rs: ColumnType + TryFrom<u8>
 6. schema.rs: TableDef + to_bytes/from_bytes
 7. schema.rs: ColumnDef + IndexDef + to_bytes/from_bytes

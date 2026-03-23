@@ -4,11 +4,11 @@
 
 | File | Action | What |
 |---|---|---|
-| `crates/nexusdb-wal/src/writer.rs` | modify | Header v2 (24B), start_lsn, WalWriter::rotate_file(), open() logic |
-| `crates/nexusdb-wal/src/reader.rs` | modify | Seek past 24-byte header instead of 16-byte |
-| `crates/nexusdb-wal/src/txn.rs` | modify | rotate_wal() + check_and_rotate() |
-| `crates/nexusdb-wal/src/rotation.rs` | create | WalRotator convenience wrapper |
-| `crates/nexusdb-wal/src/lib.rs` | modify | Export WalRotator, update WAL_HEADER_SIZE/VERSION |
+| `crates/axiomdb-wal/src/writer.rs` | modify | Header v2 (24B), start_lsn, WalWriter::rotate_file(), open() logic |
+| `crates/axiomdb-wal/src/reader.rs` | modify | Seek past 24-byte header instead of 16-byte |
+| `crates/axiomdb-wal/src/txn.rs` | modify | rotate_wal() + check_and_rotate() |
+| `crates/axiomdb-wal/src/rotation.rs` | create | WalRotator convenience wrapper |
+| `crates/axiomdb-wal/src/lib.rs` | modify | Export WalRotator, update WAL_HEADER_SIZE/VERSION |
 
 ## Step 1 — WAL header v2: writer.rs
 

@@ -4,9 +4,9 @@
 
 | File | Action | Description |
 |---|---|---|
-| `crates/nexusdb-catalog/src/resolver.rs` | CREATE | `ResolvedTable`, `SchemaResolver` |
-| `crates/nexusdb-catalog/src/lib.rs` | MODIFY | Add `pub mod resolver` + re-exports |
-| `crates/nexusdb-catalog/tests/integration_schema_binding.rs` | CREATE | Integration tests |
+| `crates/axiomdb-catalog/src/resolver.rs` | CREATE | `ResolvedTable`, `SchemaResolver` |
+| `crates/axiomdb-catalog/src/lib.rs` | MODIFY | Add `pub mod resolver` + re-exports |
+| `crates/axiomdb-catalog/tests/integration_schema_binding.rs` | CREATE | Integration tests |
 
 No new crates, no new Cargo.toml dependencies.
 
@@ -86,7 +86,7 @@ fn table_exists(schema: Option<&str>, table_name: &str) -> Result<bool>:
 
 ### Phase 3 — integration tests
 
-File: `crates/nexusdb-catalog/tests/integration_schema_binding.rs`
+File: `crates/axiomdb-catalog/tests/integration_schema_binding.rs`
 
 ```
 test_resolve_table_by_default_schema

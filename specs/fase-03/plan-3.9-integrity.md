@@ -4,8 +4,8 @@
 
 | File | Action | What |
 |---|---|---|
-| `crates/nexusdb-storage/src/integrity.rs` | create | `IntegrityViolation`, `IntegrityReport`, `IntegrityChecker` |
-| `crates/nexusdb-storage/src/lib.rs` | modify | Export integrity types |
+| `crates/axiomdb-storage/src/integrity.rs` | create | `IntegrityViolation`, `IntegrityReport`, `IntegrityChecker` |
+| `crates/axiomdb-storage/src/lib.rs` | modify | Export integrity types |
 
 ## Step 1 — IntegrityViolation + Severity
 

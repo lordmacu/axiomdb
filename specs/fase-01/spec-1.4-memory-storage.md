@@ -25,4 +25,4 @@ no I/O whatsoever. Used in all unit tests for future phases.
 - StorageEngine trait (1.6)
 
 ## Dependencies
-- `nexusdb-storage::page` (already exists)
+- `axiomdb-storage::page` (already exists)

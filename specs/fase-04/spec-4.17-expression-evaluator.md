@@ -14,7 +14,7 @@ inseparable from correct NULL (3-valued logic) semantics.
 
 ## Expr type
 
-Lives in `nexusdb-sql/src/expr.rs`. This is the expression tree type that
+Lives in `axiomdb-sql/src/expr.rs`. This is the expression tree type that
 the parser (Phase 4.1–4.4) will produce and the evaluator consumes.
 
 ```rust
@@ -93,7 +93,7 @@ pub enum BinaryOp {
 
 ## Evaluator API
 
-Lives in `nexusdb-sql/src/eval.rs`.
+Lives in `axiomdb-sql/src/eval.rs`.
 
 ```rust
 /// Evaluates `expr` in the context of `row`.
@@ -379,6 +379,6 @@ ColumnIndexOutOfBounds { idx: usize, len: usize },
 
 ## Dependencies
 
-- `nexusdb-types`: `Value`, `DataType` (for coercion)
-- `nexusdb-core`: `DbError` (adds `DivisionByZero`, `Overflow`, `ColumnIndexOutOfBounds`)
-- `nexusdb-sql/Cargo.toml`: add `nexusdb-types = { workspace = true }`
+- `axiomdb-types`: `Value`, `DataType` (for coercion)
+- `axiomdb-core`: `DbError` (adds `DivisionByZero`, `Overflow`, `ColumnIndexOutOfBounds`)
+- `axiomdb-sql/Cargo.toml`: add `axiomdb-types = { workspace = true }`

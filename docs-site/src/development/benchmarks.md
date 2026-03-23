@@ -12,7 +12,7 @@ without WAL for pure codec/parser operations. Operations that include WAL
 
 ## SQL Parser
 
-| Benchmark | NexusDB | sqlparser-rs | MySQL ~ | PostgreSQL ~ | Verdict |
+| Benchmark | AxiomDB | sqlparser-rs | MySQL ~ | PostgreSQL ~ | Verdict |
 |---|---|---|---|---|---|
 | Simple SELECT (1 table) | **492 ns** | 4.8 µs | ~500 ns | ~450 ns | ✅ parity with PG |
 | Complex SELECT (multi-JOIN) | **2.7 µs** | 46 µs | ~4.0 µs | ~3.5 µs | ✅ 1.3× faster than PG |
@@ -32,7 +32,7 @@ The speed advantage comes from two decisions:
 
 ## B+ Tree Index
 
-| Benchmark | NexusDB | MySQL ~ | PostgreSQL ~ | Target | Max acceptable | Verdict |
+| Benchmark | AxiomDB | MySQL ~ | PostgreSQL ~ | Target | Max acceptable | Verdict |
 |---|---|---|---|---|---|---|
 | Point lookup (1M rows) | **1.2M ops/s** | ~830K ops/s | ~1.1M ops/s | 800K ops/s | 600K ops/s | ✅ |
 | Range scan 10K rows | **0.61 ms** | ~8 ms | ~5 ms | 45 ms | 60 ms | ✅ |
@@ -67,7 +67,7 @@ length prefix.
 
 ## Expression Evaluator
 
-| Benchmark | NexusDB | MySQL ~ | PostgreSQL ~ | Verdict |
+| Benchmark | AxiomDB | MySQL ~ | PostgreSQL ~ | Verdict |
 |---|---|---|---|---|
 | Expr eval over 1K rows | **14.8M rows/s** | ~8M rows/s | ~6M rows/s | ✅ 1.9× faster than MySQL |
 
@@ -82,7 +82,7 @@ that `col_idx` is resolved once by the semantic analyzer — no name lookup at e
 The following thresholds are enforced before any phase is closed. A result below
 the "Max acceptable" column is a blocker.
 
-| Operation | NexusDB | Target | Max acceptable | Phase measured |
+| Operation | AxiomDB | Target | Max acceptable | Phase measured |
 |---|---|---|---|---|
 | Point lookup PK | **1.2M ops/s** ✅ | 800K ops/s | 600K ops/s | 2 |
 | Range scan 10K rows | **0.61 ms** ✅ | 45 ms | 60 ms | 2 |
@@ -105,13 +105,13 @@ Operations marked **TBD** require the executor (Phase 5) to be measurable with r
 
 ```bash
 # B+ Tree
-cargo bench --bench btree -p nexusdb-index
+cargo bench --bench btree -p axiomdb-index
 
 # Storage engine
-cargo bench --bench storage -p nexusdb-storage
+cargo bench --bench storage -p axiomdb-storage
 
 # SQL parser
-cargo bench --bench parser -p nexusdb-sql
+cargo bench --bench parser -p axiomdb-sql
 
 # All benchmarks
 cargo bench --workspace

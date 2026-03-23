@@ -2,7 +2,7 @@
 
 The row codec converts between `&[Value]` (the in-memory representation used by
 the executor) and `&[u8]` (the on-disk binary format stored in heap pages). The codec
-is in `nexusdb-types::codec`.
+is in `axiomdb-types::codec`.
 
 ---
 
@@ -138,7 +138,7 @@ Decimal(0, 0)          →  0
 maximum precision supported by most SQL databases including PostgreSQL and SQL Server.
 
 The alternative, `rust_decimal::Decimal`, packs the same i128 internally but adds
-struct overhead and a dependency. The NexusDB codec stores the i128 mantissa and
+struct overhead and a dependency. The AxiomDB codec stores the i128 mantissa and
 scale byte directly, with no intermediary struct.
 
 ---
@@ -244,9 +244,9 @@ it to the codec. The executor's arithmetic operations must propagate NaN as NULL
 
 ---
 
-## Type Coercion (nexusdb-types::coerce)
+## Type Coercion (axiomdb-types::coerce)
 
-The `nexusdb-types::coerce` module implements implicit type conversion. It is
+The `axiomdb-types::coerce` module implements implicit type conversion. It is
 separate from the codec: the codec only serializes well-typed `Value`s; coercion
 happens before encoding, at expression evaluation and column assignment time.
 
@@ -277,7 +277,7 @@ Text→numeric parsing.
 
 ```rust
 pub enum CoercionMode {
-    Strict,      // NexusDB default — '42abc'→INT = error
+    Strict,      // AxiomDB default — '42abc'→INT = error
     Permissive,  // MySQL compat — '42abc'→INT = 42 (stops at first non-digit)
 }
 ```
@@ -306,7 +306,7 @@ The full set of implicit conversions supported by `coerce()`:
 
 ### Text → integer parsing rules in detail
 
-**Strict mode** (NexusDB default):
+**Strict mode** (AxiomDB default):
 1. Strip leading/trailing ASCII whitespace.
 2. Parse the entire remaining string as a decimal integer (optional leading `-`/`+`).
 3. Any non-digit character after the optional sign → `InvalidCoercion`.

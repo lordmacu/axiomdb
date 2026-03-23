@@ -232,7 +232,7 @@ AmbiguousColumn { name: String, tables: String },
 - [ ] UPDATE: unknown SET column → `ColumnNotFound`
 - [ ] CREATE TABLE REFERENCES: unknown table → `TableNotFound`
 - [ ] DROP TABLE without IF EXISTS: unknown table → `TableNotFound`
-- [ ] `DbError::AmbiguousColumn` added to nexusdb-core
+- [ ] `DbError::AmbiguousColumn` added to axiomdb-core
 - [ ] No `unwrap()` in `src/`
 
 ---
@@ -257,8 +257,8 @@ AmbiguousColumn { name: String, tables: String },
 
 ## Dependencies
 
-- `nexusdb-sql`: `analyzer.rs` (new), uses `Stmt`, `Expr`, `BinaryOp`
-- `nexusdb-catalog`: `CatalogReader`, `ColumnDef`, `SchemaResolver` (Phase 3.14)
-- `nexusdb-storage`: `StorageEngine`
-- `nexusdb-core`: `DbError` (adds `AmbiguousColumn`)
-- `nexusdb-sql/Cargo.toml`: add `nexusdb-catalog` dependency
+- `axiomdb-sql`: `analyzer.rs` (new), uses `Stmt`, `Expr`, `BinaryOp`
+- `axiomdb-catalog`: `CatalogReader`, `ColumnDef`, `SchemaResolver` (Phase 3.14)
+- `axiomdb-storage`: `StorageEngine`
+- `axiomdb-core`: `DbError` (adds `AmbiguousColumn`)
+- `axiomdb-sql/Cargo.toml`: add `axiomdb-catalog` dependency

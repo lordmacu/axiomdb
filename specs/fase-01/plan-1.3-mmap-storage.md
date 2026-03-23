@@ -1,9 +1,9 @@
 # Plan: 1.3 — MmapStorage
 
 ## Files to create/modify
-- `crates/nexusdb-storage/src/mmap.rs` — MmapStorage + DbFileMeta
-- `crates/nexusdb-storage/src/lib.rs` — pub mod mmap
-- `crates/nexusdb-storage/Cargo.toml` — add memmap2
+- `crates/axiomdb-storage/src/mmap.rs` — MmapStorage + DbFileMeta
+- `crates/axiomdb-storage/src/lib.rs` — pub mod mmap
+- `crates/axiomdb-storage/Cargo.toml` — add memmap2
 
 ## Dependency
 ```toml

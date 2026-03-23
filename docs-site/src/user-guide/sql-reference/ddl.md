@@ -1,7 +1,7 @@
 # DDL — Schema Definition Language
 
 DDL statements define and modify the structure of the database: tables, columns,
-constraints, and indexes. All DDL operations are transactional in NexusDB — a failed
+constraints, and indexes. All DDL operations are transactional in AxiomDB — a failed
 DDL statement is automatically rolled back.
 
 ---
@@ -240,7 +240,7 @@ CREATE TABLE order_items (
 
 ## CREATE INDEX
 
-Indexes accelerate lookups and range scans. NexusDB automatically creates a unique B+
+Indexes accelerate lookups and range scans. AxiomDB automatically creates a unique B+
 Tree index for every PRIMARY KEY and UNIQUE constraint. Additional indexes are created
 explicitly.
 
@@ -272,7 +272,7 @@ WHERE deleted_at IS NULL;
 ### When to Add an Index
 
 - Columns appearing in `WHERE`, `JOIN ON`, or `ORDER BY` clauses on large tables
-- Foreign key columns (NexusDB does not auto-index FK columns — add them explicitly)
+- Foreign key columns (AxiomDB does not auto-index FK columns — add them explicitly)
 - Columns used in range queries (`BETWEEN`, `>`, `<`)
 
 See [Indexes](../features/indexes.md) for the query planner interaction and composite

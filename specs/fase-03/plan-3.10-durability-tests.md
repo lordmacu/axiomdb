@@ -4,11 +4,11 @@
 
 | File | What |
 |---|---|
-| `crates/nexusdb-wal/tests/integration_durability.rs` | All 9 durability scenarios |
+| `crates/axiomdb-wal/tests/integration_durability.rs` | All 9 durability scenarios |
 
-## Why nexusdb-wal/tests?
+## Why axiomdb-wal/tests?
 
-`nexusdb-wal` depends on `nexusdb-storage`, so integration tests here can use
+`axiomdb-wal` depends on `axiomdb-storage`, so integration tests here can use
 both `TxnManager`, `CrashRecovery`, `Checkpointer`, `MmapStorage`, and
 `IntegrityChecker` without circular dependencies.
 
@@ -265,7 +265,7 @@ fn test_corrupt_checkpoint_lsn_failure_mode() {
     // Corrupt checkpoint_lsn to a value beyond all WAL LSNs.
     {
         let mut storage = MmapStorage::open(&env.db).unwrap();
-        nexusdb_storage::write_checkpoint_lsn(&mut storage, 99999).unwrap();
+        axiomdb_storage::write_checkpoint_lsn(&mut storage, 99999).unwrap();
         storage.flush().unwrap();
     }
 
@@ -336,7 +336,7 @@ fn test_partial_page_write_detected() {
 3. Implement scenario 4 (truncated WAL)
 4. Implement scenarios 5, 6 (rotation + multiple cycles)
 5. Implement scenarios 8, 9 (documented failure modes)
-6. cargo test -p nexusdb-wal integration_durability -- all pass
+6. cargo test -p axiomdb-wal integration_durability -- all pass
 7. cargo test --workspace (no regressions)
 8. cargo clippy --workspace -- -D warnings
 ```

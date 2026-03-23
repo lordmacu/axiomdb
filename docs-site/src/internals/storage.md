@@ -1,6 +1,6 @@
 # Storage Engine
 
-The storage engine is the lowest user-accessible layer in NexusDB. It manages raw
+The storage engine is the lowest user-accessible layer in AxiomDB. It manages raw
 16-kilobyte pages on disk or in memory, provides a freelist for page allocation, and
 exposes a simple trait that all higher layers depend on.
 
@@ -48,14 +48,14 @@ Total:    64 bytes
 ```
 
 The CRC32c checksum covers all bytes from offset 12 to the end of the page (4 bytes
-for the checksum field itself are excluded). On every `read_page`, NexusDB verifies
+for the checksum field itself are excluded). On every `read_page`, AxiomDB verifies
 the checksum and returns `DbError::ChecksumMismatch` if it fails.
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
 <span class="callout-label">Design Decision — CRC32c Instead of Double-Write Buffer</span>
-Traditional engines (InnoDB) use a double-write buffer to detect partial page writes caused by a crash mid-flush. NexusDB instead uses per-page CRC32c checksums: if a page's checksum fails on read, the WAL is replayed to reconstruct the correct state. Same crash-safety guarantee — zero write amplification.
+Traditional engines (InnoDB) use a double-write buffer to detect partial page writes caused by a crash mid-flush. AxiomDB instead uses per-page CRC32c checksums: if a page's checksum fails on read, the WAL is replayed to reconstruct the correct state. Same crash-safety guarantee — zero write amplification.
 </div>
 </div>
 
@@ -79,7 +79,7 @@ pub enum PageType {
 accessible as `&Page` via a pointer into the mapped region.
 
 ```
-Physical file (nexusdb.db):
+Physical file (axiomdb.db):
 ┌──────────┬──────────┬──────────┬──────────┬──────────┐
 │  Page 0  │  Page 1  │  Page 2  │  Page 3  │  ...     │
 │ (Meta)   │ (Data)   │ (Index)  │ (Data)   │          │
@@ -93,14 +93,14 @@ Physical file (nexusdb.db):
 
 | Approach                | Who manages page cache | Extra copies |
 |-------------------------|------------------------|--------------|
-| mmap (NexusDB)          | OS kernel              | 0            |
+| mmap (AxiomDB)          | OS kernel              | 0            |
 | Custom buffer pool (MySQL InnoDB) | Application + OS  | 1 (data in both) |
 
 <div class="callout callout-advantage">
 <span class="callout-icon">🚀</span>
 <div class="callout-body">
 <span class="callout-label">No Double-Buffer Overhead</span>
-MySQL InnoDB keeps every hot page in RAM twice — once in the OS page cache, once in the InnoDB buffer pool. NexusDB's mmap approach uses the OS page cache directly. For a working set that fits in RAM, this roughly halves the memory footprint of the storage layer.
+MySQL InnoDB keeps every hot page in RAM twice — once in the OS page cache, once in the InnoDB buffer pool. AxiomDB's mmap approach uses the OS page cache directly. For a working set that fits in RAM, this roughly halves the memory footprint of the storage layer.
 </div>
 </div>
 
@@ -232,7 +232,7 @@ Page 0 is the `PageType::Meta` page. It is written during database creation
 
 ```text
 Offset  Size  Field
-     0     8  format_version     — NexusDB file format version
+     0     8  format_version     — AxiomDB file format version
      8     8  catalog_root_page  — Page ID of the catalog root (nexus_tables B+ Tree root)
     16     8  freelist_root_page — Page ID of the freelist bitmap root
     24     8  next_txn_id        — Next transaction ID to assign

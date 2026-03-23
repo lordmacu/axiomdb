@@ -89,7 +89,7 @@ SELECT * FROM orders   WHERE total >= 100;
 
 ## NULL Semantics — Three-Valued Logic
 
-NexusDB implements SQL three-valued logic: every boolean expression evaluates to
+AxiomDB implements SQL three-valued logic: every boolean expression evaluates to
 TRUE, FALSE, or **UNKNOWN** (which SQL represents as NULL in boolean context).
 The rules below are critical for writing correct WHERE clauses.
 

@@ -141,6 +141,6 @@ This is the correct behavior: only entries with COMMIT on disk are durable.
 
 ## Dependencies
 
-- `nexusdb-wal`: `WalEntry`, `EntryType`, `MIN_ENTRY_LEN` (subfase 3.1 ✅)
-- `nexusdb-core`: `DbError` — add `WalInvalidHeader { path: String }`
+- `axiomdb-wal`: `WalEntry`, `EntryType`, `MIN_ENTRY_LEN` (subfase 3.1 ✅)
+- `axiomdb-core`: `DbError` — add `WalInvalidHeader { path: String }`
 - `std::fs`, `std::io::BufWriter` — no new external dependencies

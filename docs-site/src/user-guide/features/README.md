@@ -1,6 +1,6 @@
 # Features
 
-Advanced NexusDB capabilities beyond basic SQL.
+Advanced AxiomDB capabilities beyond basic SQL.
 
 - [Transactions](transactions.md) — BEGIN, COMMIT, ROLLBACK, SAVEPOINT, MVCC, isolation levels
 - [Catalog & Schema](catalog.md) — system tables, SHOW TABLES, DESCRIBE, introspection queries

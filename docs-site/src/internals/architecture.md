@@ -1,6 +1,6 @@
 # Architecture Overview
 
-NexusDB is organized as a Cargo workspace of purpose-built crates. Each crate has a
+AxiomDB is organized as a Cargo workspace of purpose-built crates. Each crate has a
 single responsibility and depends only on crates below it in the stack. The layering
 prevents circular dependencies and makes each component independently testable.
 
@@ -12,7 +12,7 @@ prevents circular dependencies and makes each component independently testable.
 ┌─────────────────────────────────────────────────────────────────────┐
 │                          ENTRY POINTS                               │
 │                                                                     │
-│  nexusdb-server        nexusdb-embedded                             │
+│  axiomdb-server        axiomdb-embedded                             │
 │  (TCP daemon,          (Rust API + C FFI,                           │
 │   MySQL wire protocol)  in-process library)                         │
 └──────────────────────────────┬──────────────────────────────────────┘
@@ -20,7 +20,7 @@ prevents circular dependencies and makes each component independently testable.
 ┌──────────────────────────────▼──────────────────────────────────────┐
 │                       QUERY PIPELINE                                │
 │                                                                     │
-│  nexusdb-sql                                                        │
+│  axiomdb-sql                                                        │
 │  ├── lexer     (logos DFA, zero-copy tokens)                        │
 │  ├── parser    (recursive descent, LL(1)/LL(2))                     │
 │  ├── ast       (Stmt, Expr, SelectStmt, InsertStmt, ...)            │
@@ -34,35 +34,35 @@ prevents circular dependencies and makes each component independently testable.
 ┌──────────────────────────────▼──────────────────────────────────────┐
 │                    TRANSACTION LAYER                                │
 │                                                                     │
-│  nexusdb-mvcc          (TxnManager, snapshot isolation, SSI)        │
-│  nexusdb-wal           (WalWriter, WalReader, crash recovery)       │
-│  nexusdb-catalog       (CatalogBootstrap, CatalogReader, schema)    │
+│  axiomdb-mvcc          (TxnManager, snapshot isolation, SSI)        │
+│  axiomdb-wal           (WalWriter, WalReader, crash recovery)       │
+│  axiomdb-catalog       (CatalogBootstrap, CatalogReader, schema)    │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
 ┌──────────────────────────────▼──────────────────────────────────────┐
 │                     INDEX LAYER                                     │
 │                                                                     │
-│  nexusdb-index         (BTree CoW, RangeIter, prefix compression)   │
+│  axiomdb-index         (BTree CoW, RangeIter, prefix compression)   │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
 ┌──────────────────────────────▼──────────────────────────────────────┐
 │                    STORAGE LAYER                                    │
 │                                                                     │
-│  nexusdb-storage       (StorageEngine trait, MmapStorage,           │
+│  axiomdb-storage       (StorageEngine trait, MmapStorage,           │
 │                         MemoryStorage, FreeList, heap pages)        │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
 ┌──────────────────────────────▼──────────────────────────────────────┐
 │                     TYPE FOUNDATION                                 │
 │                                                                     │
-│  nexusdb-types         (Value, DataType, row codec)                 │
-│  nexusdb-core          (DbError, RecordId, TransactionSnapshot,     │
+│  axiomdb-types         (Value, DataType, row codec)                 │
+│  axiomdb-core          (DbError, RecordId, TransactionSnapshot,     │
 │                         PageId, LsnId, common types)               │
 └─────────────────────────────────────────────────────────────────────┘
                                │
                     ┌──────────▼────────┐
-                    │   nexusdb.db      │  ← mmap pages (16 KB each)
-                    │   nexusdb.wal     │  ← WAL append-only log
+                    │   axiomdb.db      │  ← mmap pages (16 KB each)
+                    │   axiomdb.wal     │  ← WAL append-only log
                     └───────────────────┘
 ```
 
@@ -70,7 +70,7 @@ prevents circular dependencies and makes each component independently testable.
 
 ## Crate Responsibilities
 
-### nexusdb-core
+### axiomdb-core
 
 The dependency-free foundation. Contains:
 
@@ -79,20 +79,20 @@ The dependency-free foundation. Contains:
 - `TransactionSnapshot` — snapshot ID and visibility predicate for MVCC
 - `PageId`, `LsnId` — type aliases that document intent
 
-No crate in the workspace depends on a crate above `nexusdb-core`.
+No crate in the workspace depends on a crate above `axiomdb-core`.
 
-### nexusdb-types
+### axiomdb-types
 
 SQL value representation and binary serialization:
 
 - `Value` — the in-memory enum (`Null`, `Bool`, `Int`, `BigInt`, `Real`, `Decimal`,
   `Text`, `Bytes`, `Date`, `Timestamp`, `Uuid`)
-- `DataType` — schema descriptor for a column's type (mirrors `nexusdb-core::DataType`
+- `DataType` — schema descriptor for a column's type (mirrors `axiomdb-core::DataType`
   but with full type system including parameterized types)
 - `encode_row` / `decode_row` — binary codec from `&[Value]` to `&[u8]` and back
 - `encoded_len` — O(n) size computation without allocation
 
-### nexusdb-storage
+### axiomdb-storage
 
 The raw page I/O layer:
 
@@ -106,7 +106,7 @@ The raw page I/O layer:
 - Heap page format — slotted page with null bitmap and tuples growing from the end
   toward the beginning
 
-### nexusdb-index
+### axiomdb-index
 
 The Copy-on-Write B+ Tree:
 
@@ -116,7 +116,7 @@ The Copy-on-Write B+ Tree:
   for zero-copy serialization
 - `prefix` module — `CompressedNode` for in-memory prefix compression of internal keys
 
-### nexusdb-wal
+### axiomdb-wal
 
 Append-only Write-Ahead Log:
 
@@ -127,7 +127,7 @@ Append-only Write-Ahead Log:
   key, old_value, new_value, and checksum
 - Crash recovery state machine — `CRASHED → RECOVERING → REPLAYING_WAL → VERIFYING → READY`
 
-### nexusdb-catalog
+### axiomdb-catalog
 
 Schema persistence and lookup:
 
@@ -137,7 +137,7 @@ Schema persistence and lookup:
   and executor; uses a `TransactionSnapshot` for MVCC-consistent reads
 - Schema types: `TableDef`, `ColumnDef`, `IndexDef`
 
-### nexusdb-mvcc
+### axiomdb-mvcc
 
 Transaction management and snapshot isolation:
 
@@ -146,7 +146,7 @@ Transaction management and snapshot isolation:
 - `RowHeader` — embedded in each heap row: `(xmin, xmax, deleted)` for visibility
 - MVCC visibility function — determines whether a row version is visible to a snapshot
 
-### nexusdb-sql
+### axiomdb-sql
 
 The SQL processing pipeline:
 
@@ -162,18 +162,18 @@ The SQL processing pipeline:
   (name, data_type, nullable, table_name), `Row = Vec<Value>`; the contract
   between the executor and all callers (embedded API, wire protocol, CLI)
 
-### nexusdb-server
+### axiomdb-server
 
 Entry point for server mode. Sets up a Tokio TCP listener, performs the MySQL handshake,
 parses the MySQL wire protocol, dispatches SQL statements to the engine, and serializes
 results as MySQL result-set packets.
 
-### nexusdb-embedded
+### axiomdb-embedded
 
 Entry point for embedded mode. Exposes:
 
 - A safe Rust API (`Database::open`, `Database::execute`, `Database::transaction`)
-- A C FFI (`nexusdb_open`, `nexusdb_execute`, `nexusdb_close`, `nexusdb_free_string`)
+- A C FFI (`axiomdb_open`, `axiomdb_execute`, `axiomdb_close`, `axiomdb_free_string`)
 
 ---
 
@@ -184,25 +184,25 @@ Entry point for embedded mode. Exposes:
    │
 2. SQL string extracted from MySQL COM_QUERY packet
    │
-3. nexusdb-sql::tokenize(sql)
+3. axiomdb-sql::tokenize(sql)
    → Vec<SpannedToken>  (logos DFA, zero-copy)
    │
-4. nexusdb-sql::parse(tokens)
+4. axiomdb-sql::parse(tokens)
    → Stmt  (recursive descent; all col_idx = placeholder 0)
    │
-5. nexusdb-sql::analyze(stmt, storage, snapshot)
+5. axiomdb-sql::analyze(stmt, storage, snapshot)
    → Stmt  (col_idx resolved against catalog; names validated)
    │
 6. Executor (Phase 5) interprets the analyzed Stmt
-   → reads from nexusdb-index (BTree lookups / range scans)
-   → calls nexusdb-types::decode_row on heap page bytes
+   → reads from axiomdb-index (BTree lookups / range scans)
+   → calls axiomdb-types::decode_row on heap page bytes
    → builds Vec<Vec<Value>> result rows
    │
 7. WAL write (for INSERT / UPDATE / DELETE)
-   → nexusdb-wal::WalWriter::append(WalEntry)
+   → axiomdb-wal::WalWriter::append(WalEntry)
    │
 8. Heap page write (for INSERT / UPDATE / DELETE)
-   → nexusdb-storage::StorageEngine::write_page
+   → axiomdb-storage::StorageEngine::write_page
    │
 9. Result serialized
    → MySQL result-set packets (server mode)
@@ -215,7 +215,7 @@ Entry point for embedded mode. Exposes:
 
 ### mmap over a custom buffer pool
 
-NexusDB maps the `.db` file with `mmap`. The OS page cache manages eviction (LRU) and
+AxiomDB maps the `.db` file with `mmap`. The OS page cache manages eviction (LRU) and
 readahead automatically. InnoDB maintains a separate buffer pool on top of the OS page
 cache, causing the same data to live in RAM twice. mmap eliminates the second copy.
 
@@ -237,7 +237,7 @@ write. At 16 KB per page, that is 64 KB of write amplification per key insert.
 ### WAL without double-write
 
 The WAL records logical changes (key, old_value, new_value) rather than full page
-images. Each WAL record has a CRC32c checksum. On recovery, NexusDB reads the WAL
+images. Each WAL record has a CRC32c checksum. On recovery, AxiomDB reads the WAL
 forward, identifies committed transactions, and replays their mutations. Pages with
 incorrect checksums are rebuilt from WAL records.
 

@@ -1,6 +1,6 @@
 # Catalog System
 
-The catalog is NexusDB's schema repository. It stores the definition of every table,
+The catalog is AxiomDB's schema repository. It stores the definition of every table,
 column, and index, and makes that information available to the SQL analyzer and
 executor through a consistent, MVCC-aware reader interface.
 
@@ -121,7 +121,7 @@ pub struct ColumnDef {
     pub table_id:      u64,
     pub col_index:     usize,       // zero-based position within the table
     pub col_name:      String,
-    pub data_type:     DataType,    // from nexusdb-core::types::DataType
+    pub data_type:     DataType,    // from axiomdb-core::types::DataType
     pub not_null:      bool,
     pub default_value: Option<String>,  // DEFAULT expression as source text
 }
@@ -184,7 +184,7 @@ in use, and the meta page records the root page IDs for each catalog B+ Tree.
 ## Catalog Invariants
 
 The following invariants must hold at all times. The post-recovery integrity checker
-(`nexusdb-embedded::integrity`) verifies them after crash recovery:
+(`axiomdb-embedded::integrity`) verifies them after crash recovery:
 
 1. Every table listed in `nexus_tables` has at least one row in `nexus_columns`.
 2. Every column in `nexus_columns` references a `table_id` that exists in `nexus_tables`.
@@ -194,5 +194,5 @@ The following invariants must hold at all times. The post-recovery integrity che
 6. No two tables in the same schema have the same name.
 7. No two indexes on the same table have the same name.
 
-If any invariant is violated after recovery, NexusDB enters a read-only safe mode and
+If any invariant is violated after recovery, AxiomDB enters a read-only safe mode and
 requires manual intervention.
