@@ -139,6 +139,7 @@
 - [ ] 4.14 ⏳ LAST_INSERT_ID() / lastval() — last auto-generated ID (MySQL + PG compat)
 - [ ] 4.19 ⏳ Basic built-in functions — `ABS`, `LENGTH`, `SUBSTR`, `UPPER`, `LOWER`, `TRIM`, `COALESCE`, `NOW()`, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `ROUND`, `FLOOR`, `CEIL`
 - [ ] 4.19b ⏳ BLOB functions — `FROM_BASE64(text)→BLOB` auto-decodes Base64 on insert (eliminates 33% overhead); `TO_BASE64(blob)→TEXT`; `OCTET_LENGTH(blob)→INT`; `ENCODE(blob,'hex'/'base64')→TEXT`; `DECODE(text,'hex'/'base64')→BLOB`; foundation for content-addressed storage in Phase 14
+- [ ] 4.19c ⏳ UUID generation functions — `gen_random_uuid()` returns UUID v4; `uuid_generate_v7()` returns UUID v7 (time-ordered, better for B+Tree index locality); `IS_VALID_UUID(text)→BOOL`; nearly every modern app uses UUIDs as primary keys and the DB must be able to generate them server-side without depending on application code
 
 <!-- ── Group G — DevEx (parallel with E+F) ── -->
 - [ ] 4.15 ⏳ Interactive CLI — REPL like `sqlite3` shell; connects directly to storage
@@ -212,6 +213,8 @@
 - [ ] 7.15 ⏳ Basic transaction ID overflow prevention — `txn_id` is u64; log warning at 50% and 90% of capacity; plan for VACUUM FREEZE (complete in Phase 34) but detection must be early
 - [ ] 7.16 ⏳ Historical reads — `BEGIN READ ONLY AS OF TIMESTAMP '2023-12-31 23:59:59'` anchors the snapshot to a past point; MVCC already has the data, this adds the SQL syntax and executor support; critical for auditing financial data at a specific date without exporting first
 - [ ] 7.17 ⏳ Optimistic locking / Compare-And-Swap — `UPDATE t SET qty=qty-1, ver=ver+1 WHERE id=? AND ver=? AND qty>0` returns 0 rows if version changed; explicit `SELECT ... FOR UPDATE SKIP LOCKED` for job queues; gaming inventory, e-commerce checkout, concurrent reservations all depend on this pattern without full serializable isolation
+- [ ] 7.18 ⏳ Cancel / kill query — `SELECT nexus_cancel_query(pid)` sends a cancellation signal to a running query (like `pg_cancel_backend`); `nexus_terminate_session(pid)` forcibly closes a connection; without this, a long-running accidental `SELECT * FROM logs` (millions of rows) has no way to be stopped from another session without restarting the server
+- [ ] 7.19 ⏳ Lock contention visibility — `SELECT * FROM nexus_lock_waits` system view shows: waiting_pid, blocking_pid, waiting_query, lock_type, wait_duration; `SELECT * FROM nexus_locks` shows all currently held locks; essential for diagnosing deadlocks and performance problems in production without guessing
 
 ---
 
@@ -306,6 +309,10 @@
 - [ ] 13.10 ⏳ Gapless sequences — `CREATE SEQUENCE inv_num GAPLESS START 1`; unlike AUTO_INCREMENT (which skips numbers on rollback), a gapless sequence uses a dedicated lock + WAL entry to guarantee no gaps even across failures; `NEXTVAL('inv_num')` blocks until the sequence number is committed; required by tax law in most countries for invoice numbering; `LAST_VALUE`, `RESET TO n` for administration
 - [ ] 13.11 ⏳ Fiscal period locking — `LOCK FISCAL PERIOD '2023'`; after locking, INSERT/UPDATE/DELETE of rows with any date column falling within that period returns an error; `UNLOCK FISCAL PERIOD '2023'` for corrections; stored in a system table `nexus_locked_periods`; the executor checks against it for tables that have a designated date column (`CREATE TABLE t (..., WITH FISCAL_DATE = created_at)`)
 - [ ] 13.12 ⏳ Statement-level triggers — `CREATE TRIGGER t AFTER INSERT ON journal FOR EACH STATEMENT`; fires once after the entire DML statement, not once per row; receives aggregated counts; enables double-entry validation: after a batch of journal inserts, verify that SUM(debits) = SUM(credits) within the same transaction, rejecting the commit if not balanced
+- [ ] 13.13 ⏳ Locale-aware collation in ORDER BY — `ORDER BY nombre COLLATE 'es_ES'` sorts correctly for Spanish (ñ after n, á = a); `ORDER BY name COLLATE 'de_DE'` applies German phone-book order (Ö after O); uses ICU library; without this, ordering user-facing data in non-English apps produces wrong results that confuse users; different from Phase 5.9 charset negotiation (that affects encoding, not sort order)
+- [ ] 13.14 ⏳ Custom aggregate functions — `CREATE AGGREGATE median(FLOAT) (SFUNC=median_state, STYPE=FLOAT[], FINALFUNC=median_final)`; user-defined aggregates beyond SUM/COUNT/AVG/MAX/MIN; enables: weighted average, geometric mean, mode, P95 latency, Gini coefficient, domain-specific business metrics; Phase 16.1 has scalar UDFs but aggregates have different execution semantics (called once per row, finalized once per group)
+- [ ] 13.15 ⏳ Filtered LISTEN/NOTIFY — `SUBSCRIBE TO orders WHERE status = 'pending' AND total > 1000 ON CHANGE`; current LISTEN/NOTIFY (13.4) notifies any change to the entire table; real-time dashboards need selective subscriptions — "notify me only about high-value pending orders" — without this the client receives all changes and filters in application code, wasting network bandwidth
+- [ ] 13.16 ⏳ Transactional reservations with auto-release — `INSERT INTO reservations (resource_id, session_id) VALUES (42, 'sess_abc') ON CONFLICT DO NOTHING RETURNING CASE WHEN id IS NULL THEN 'unavailable' ELSE 'reserved' END`; plus automatic release when session expires or connection drops; hotel booking, concert tickets, parking spots, inventory hold — "hold this item for 15 minutes while the user checks out"
 
 ### Phase 14 — TimescaleDB + Redis + Content-addressed BLOB `⏳` week 32-33
 - [ ] 14.1 ⏳ Table partitioning — `PARTITION BY RANGE/HASH/LIST`
@@ -331,6 +338,7 @@
 - [ ] 15.4 ⏳ Apache Arrow output — results in columnar format for Python/pandas
 - [ ] 15.5 ⏳ Flight SQL — Arrow Flight protocol for high-speed columnar transfer (Python, Rust, Java without JDBC)
 - [ ] 15.6 ⏳ CDC + Git tests — verify change streams and branch merge with real conflicts
+- [ ] 15.7 ⏳ CDC with full OLD/NEW row — `REPLICA IDENTITY FULL` equivalent; UPDATE events include the complete before-image (all column values before the change) and after-image; without this, UPDATE events in CDC only show the new values and primary key, making it impossible to detect which specific fields changed; required for audit trails, sync systems, and data pipelines that need to compute diffs
 
 ---
 
@@ -347,6 +355,7 @@
 - [ ] 16.7 ⏳ Stored procedures — `CREATE PROCEDURE` with flow control (`IF`, `LOOP`, `WHILE`, `BEGIN/END`)
 - [ ] 16.8 ⏳ Exception handling in procedures — `DECLARE ... HANDLER FOR SQLSTATE`, re-raise, cleanup handlers
 - [ ] 16.9 ⏳ UDF and trigger tests — correctness, error handling, WHEN conditions, INSTEAD OF over views
+- [ ] 16.10 ⏳ Built-in connection pooler — Pgbouncer-equivalent implemented inside the engine; multiplexes N application connections into M database backend connections (N >> M); transaction-mode pooling (connection returned to pool after each COMMIT/ROLLBACK); session variables reset between borrows; eliminates the need for external Pgbouncer/Pgpool deployment; critical for any app with >100 concurrent users since creating one OS thread per TCP connection does not scale
 
 ### Phase 17 — Security `⏳` week 39-40
 - [ ] 17.1 ⏳ CREATE USER / CREATE ROLE — user and role model
@@ -369,6 +378,7 @@
 - [ ] 17.18 ⏳ Consent-based row access — `CREATE POLICY patient_consent ON records USING (has_consent(patient_id, CURRENT_USER))`; patient explicitly grants a specific doctor access to their records; revoking consent immediately removes access; beyond standard RLS — the USING expression calls a user-defined consent table
 - [ ] 17.19 ⏳ GDPR physical purge — `DELETE PERMANENTLY FROM patients WHERE id = 42 PURGE ALL VERSIONS`; with MVCC, normal DELETE leaves historical versions visible to old snapshots; PURGE physically overwrites all pages containing that row's versions across all WAL history; required for GDPR right-to-erasure and CCPA; audit entry records the purge but not the data
 - [ ] 17.20 ⏳ Digital signatures on rows — `SELECT SIGN_ROW(contract_id) FROM contracts` embeds an HMAC of the row's content + timestamp + signer_id; `VERIFY_ROW(contract_id)` returns TRUE if content matches signature; tamper detection for legal documents, audit logs, financial records; signatures stored alongside the row in the heap
+- [ ] 17.21 ⏳ Storage quotas per tenant — `ALTER TENANT acme SET (max_storage = '10 GB', max_rows = 1000000)`; engine tracks storage used per schema/tenant and rejects INSERTs when quota is exceeded with a clear SQLSTATE error; `SELECT * FROM nexus_tenant_usage` for monitoring; critical for SaaS billing and preventing one tenant from monopolizing disk space
 
 ---
 
@@ -429,6 +439,10 @@
 - [ ] 20.13 ⏳ Range types — `int4range`, `int8range`, `numrange`, `daterange`, `tsrange`; operators: `@>` (contains), `&&` (overlaps), `+` (union), `*` (intersection), `-` (difference); hotel booking systems (no overlapping reservations), salary bands, price ranges, event scheduling; stored compactly as two values + bounds
 - [ ] 20.14 ⏳ UNNEST — `SELECT id, UNNEST(tags) AS tag FROM posts`; expands an array column into multiple rows; joins with array elements, search by tag, pivot unnested data; complement to Phase 20.4 (ARRAY types)
 - [ ] 20.15 ⏳ Regex in queries — `~` (match), `~*` (case-insensitive match), `!~` (not match), `REGEXP_MATCH(str, pattern)`, `REGEXP_REPLACE(str, pattern, replacement)`; more powerful than LIKE; legal document pattern extraction, log parsing, data validation, address/email format checking
+- [ ] 20.16 ⏳ Business calendar functions — `NEXT_BUSINESS_DAY(date, country_code)` returns next non-weekend non-holiday date; `BUSINESS_DAYS_BETWEEN(date1, date2, country_code)` counts working days excluding weekends and public holidays; `IS_BUSINESS_DAY(date, country_code)→BOOL`; holidays configurable per country via `CREATE HOLIDAY CALENDAR 'CO' ...`; used in HR (vacation days), legal (filing deadlines), logistics (delivery estimates), finance (settlement dates T+2); virtually every business app needs this but most implement it incorrectly in application code
+- [ ] 20.17 ⏳ MONEY type with multi-currency arithmetic — `MONEY(amount DECIMAL, currency CHAR(3))`; `100 USD + 85 EUR` converts using a configurable exchange rate table (`nexus_exchange_rates`); `CONVERT(amount, from_currency, to_currency, AS OF date)`; stored as (amount, currency_code) pair; arithmetic rejects mixing currencies without explicit conversion; apps with international pricing, multi-currency invoicing, forex trading need this to avoid embedding currency logic in application code
+- [ ] 20.18 ⏳ Composite / user-defined types — `CREATE TYPE address AS (street TEXT, city TEXT, state CHAR(2), zip TEXT)`; used as column type: `ALTER TABLE users ADD COLUMN home_address address`; queried with dot notation: `SELECT home_address.city FROM users`; more type-safe than JSON, more compact than separate columns; domain modeling for complex objects (coordinates, ranges, contact info, product dimensions)
+- [ ] 20.19 ⏳ ltree — hierarchical path type — `CREATE TABLE categories (path ltree)`; stores paths like `electronics.phones.smartphones`; operators: `@>` (ancestor), `<@` (descendant), `~` (pattern match), `||` (concatenate); GIN index makes subtree queries O(1) regardless of depth; for deep hierarchies (100+ levels) recursive CTEs become slow — ltree solves this without schema changes; file systems, org charts, category trees, DNS zones
 
 ### Phase 21 — Advanced SQL `⏳` week 49-51
 - [ ] 21.1 ⏳ Savepoints — `SAVEPOINT`, `ROLLBACK TO`, `RELEASE`
@@ -454,6 +468,7 @@
 - [ ] 21.21 ⏳ GROUPING SETS / ROLLUP / CUBE — aggregate multiple GROUP BY levels in a single query
 - [ ] 21.22 ⏳ VALUES as inline table — `SELECT * FROM (VALUES (1,'a'), (2,'b')) AS t(id, name)`
 - [ ] 21.23 ⏳ Advanced SQL tests — suite covering CTE, window functions, MERGE, savepoints, cursors
+- [ ] 21.25 ⏳ PIVOT dynamic — `SELECT * FROM sales PIVOT (SUM(amount) FOR month IN ('Jan', 'Feb', 'Mar', 'Apr'))` transforms rows into columns dynamically; unlike CASE WHEN (which requires knowing column names at write time), dynamic PIVOT adapts to the data; BI reports, cross-tab analysis, cohort studies, financial summaries by period
 - [ ] 21.24 ⏳ ORM compatibility tier 2 — Prisma and ActiveRecord connect; migrations with RETURNING, GENERATED IDENTITY and deferred FK; document incompatibilities
 
 ---
@@ -471,6 +486,7 @@
 - [ ] 22.8 ⏳ GIS: Core spatial functions — `ST_Distance`, `ST_Within`, `ST_Contains`, `ST_Intersects`, `ST_Area`, `ST_Length`, `ST_Buffer`, `ST_Union`, `ST_AsText`, `ST_GeomFromText`; the minimum vocabulary for geographic queries; `SELECT * FROM stores WHERE ST_Distance(location, ST_Point(-74.0, 40.7)) < 5000`
 - [ ] 22.9 ⏳ GIS: Coordinate system support — WGS84 (GPS coordinates) and local projections; `ST_Transform(geom, 4326)` converts between SRID systems; without this distances are in degrees instead of meters
 - [ ] 22.10 ⏳ GIS: Spatial benchmarks — compare range query and nearest-neighbor vs PostGIS on 1M point dataset; document performance characteristics
+- [ ] 22.11 ⏳ Approximate query processing — `SELECT APPROX_COUNT_DISTINCT(user_id) FROM events` uses HyperLogLog (error < 2%, 10000x faster than COUNT DISTINCT); `SELECT PERCENTILE_APPROX(response_ms, 0.95) FROM requests` uses t-digest (accurate tail estimation); `SELECT APPROX_TOP_K(product_id, 10) FROM purchases` returns approximate top-10 using Count-Min Sketch; for analytics on billions of rows where exact answers take minutes and approximate answers (99.9% accurate) take milliseconds
 
 ### Phase 22b — Platform features `⏳` week 55-57
 - [ ] 22b.1 ⏳ Scheduled jobs — `cron_schedule()` with `tokio-cron-scheduler`
@@ -479,6 +495,8 @@
 - [ ] 22b.4 ⏳ Schema namespacing — `CREATE SCHEMA`, `schema.table`
 - [ ] 22b.5 ⏳ Schema migrations CLI — `dbyo migrate up/down/status`
 - [ ] 22b.6 ⏳ FDW pushdown — push SQL predicates to remote origin when possible; avoid fetching unnecessary rows
+- [ ] 22b.7 ⏳ Data lineage tracking — `SELECT * FROM nexus_lineage WHERE table_name = 'ml_features'` shows which tables fed this one and when; `CREATE TABLE ml_features AS SELECT ... FROM raw_events WITH LINEAGE`; tracks column-level derivations across transformations; ML pipelines need to know which training data produced which model; compliance systems need to trace PII through all derived tables; enables impact analysis ("if I change this source table, what downstream tables break?")
+- [ ] 22b.8 ⏳ Query result cache — `SELECT /*+ CACHE(ttl=60s, key='featured_products') */ * FROM products WHERE featured = TRUE`; engine stores the result set and serves it from memory for subsequent identical queries within TTL; `INVALIDATE CACHE 'featured_products'` on product update; reduces load on storage for repeated expensive queries; different from materialized views (which require explicit REFRESH) — cache invalidates automatically by TTL or manual trigger
 
 ### Phase 22c — Native GraphQL API `⏳` week 58-60
 - [ ] 22c.1 ⏳ GraphQL server on port `:3308` — schema auto-discovered from catalog
