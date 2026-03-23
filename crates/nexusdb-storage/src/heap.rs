@@ -348,12 +348,16 @@ pub fn mark_slot_dead(page: &mut Page, slot_id: u16) -> Result<(), DbError> {
 
 /// Clears the `txn_id_deleted` field of the tuple at `slot_id` (sets it back to `0`).
 ///
-/// Used exclusively during transaction **ROLLBACK** to undo a DELETE.
+/// Used during transaction **ROLLBACK** and **crash recovery** to undo a DELETE.
 /// After this call, the row is live again and visible to future snapshots.
+///
+/// This function is **idempotent**: if `txn_id_deleted` is already `0` (row is
+/// already live), the call succeeds with no change. This is required for crash
+/// recovery, which may be called multiple times on the same database.
 ///
 /// # Errors
 /// - [`DbError::InvalidSlot`] if `slot_id >= num_slots`.
-/// - [`DbError::AlreadyDeleted`] if the slot is already dead (cannot undo a delete on a dead slot).
+/// - [`DbError::AlreadyDeleted`] if the slot is physically dead (offset=0, length=0).
 pub fn clear_deletion(page: &mut Page, slot_id: u16) -> Result<(), DbError> {
     let n = num_slots(page);
     if slot_id >= n {
@@ -373,6 +377,22 @@ pub fn clear_deletion(page: &mut Page, slot_id: u16) -> Result<(), DbError> {
     // Clear txn_id_deleted (bytes 8..16 of the RowHeader in the page body).
     const TXN_DELETED_OFFSET_IN_HEADER: usize = 8;
     let field_abs = entry.offset as usize + TXN_DELETED_OFFSET_IN_HEADER;
+
+    // Idempotent: if already 0, no write needed (avoids unnecessary checksum update).
+    let current = u64::from_le_bytes([
+        page.as_bytes()[field_abs],
+        page.as_bytes()[field_abs + 1],
+        page.as_bytes()[field_abs + 2],
+        page.as_bytes()[field_abs + 3],
+        page.as_bytes()[field_abs + 4],
+        page.as_bytes()[field_abs + 5],
+        page.as_bytes()[field_abs + 6],
+        page.as_bytes()[field_abs + 7],
+    ]);
+    if current == 0 {
+        return Ok(()); // already cleared — idempotent no-op
+    }
+
     page.as_bytes_mut()[field_abs..field_abs + size_of::<u64>()]
         .copy_from_slice(&0u64.to_le_bytes());
     page.update_checksum();

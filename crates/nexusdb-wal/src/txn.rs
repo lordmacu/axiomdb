@@ -29,6 +29,7 @@ use crate::{
     checkpoint::Checkpointer,
     entry::{EntryType, WalEntry},
     reader::WalReader,
+    recovery::{CrashRecovery, RecoveryResult},
     writer::WalWriter,
 };
 
@@ -195,6 +196,10 @@ impl TxnManager {
 
     // ── DML recording ────────────────────────────────────────────────────────
 
+    // NOTE: record_* methods prepend PHYSICAL_LOC_LEN bytes to new_value (Insert/Update)
+    // and old_value (Delete) so crash recovery can locate the heap slot without an
+    // in-memory undo log.  See `PHYSICAL_LOC_LEN` and `decode_physical_loc`.
+
     /// Records an INSERT into the WAL and enqueues an undo operation.
     ///
     /// Must be called **after** the heap + index changes have been applied to storage.
@@ -212,6 +217,11 @@ impl TxnManager {
         let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
         let txn_id = active.txn_id;
 
+        // Prepend physical location so crash recovery can undo without RAM state.
+        let mut new_value = Vec::with_capacity(PHYSICAL_LOC_LEN + value.len());
+        new_value.extend_from_slice(&encode_physical_loc(page_id, slot_id));
+        new_value.extend_from_slice(value);
+
         let mut entry = WalEntry::new(
             0,
             txn_id,
@@ -219,7 +229,7 @@ impl TxnManager {
             table_id,
             key.to_vec(),
             vec![],
-            value.to_vec(),
+            new_value,
         );
         self.wal.append(&mut entry)?;
         active
@@ -245,13 +255,18 @@ impl TxnManager {
         let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
         let txn_id = active.txn_id;
 
+        // Prepend physical location to old_value for crash recovery.
+        let mut ov = Vec::with_capacity(PHYSICAL_LOC_LEN + old_value.len());
+        ov.extend_from_slice(&encode_physical_loc(page_id, slot_id));
+        ov.extend_from_slice(old_value);
+
         let mut entry = WalEntry::new(
             0,
             txn_id,
             EntryType::Delete,
             table_id,
             key.to_vec(),
-            old_value.to_vec(),
+            ov,
             vec![],
         );
         self.wal.append(&mut entry)?;
@@ -280,15 +295,16 @@ impl TxnManager {
         let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
         let txn_id = active.txn_id;
 
-        let mut entry = WalEntry::new(
-            0,
-            txn_id,
-            EntryType::Update,
-            table_id,
-            key.to_vec(),
-            old_value.to_vec(),
-            new_value.to_vec(),
-        );
+        // Prepend physical locations to both sides for crash recovery.
+        let mut ov = Vec::with_capacity(PHYSICAL_LOC_LEN + old_value.len());
+        ov.extend_from_slice(&encode_physical_loc(page_id, old_slot));
+        ov.extend_from_slice(old_value);
+
+        let mut nv = Vec::with_capacity(PHYSICAL_LOC_LEN + new_value.len());
+        nv.extend_from_slice(&encode_physical_loc(page_id, new_slot));
+        nv.extend_from_slice(new_value);
+
+        let mut entry = WalEntry::new(0, txn_id, EntryType::Update, table_id, key.to_vec(), ov, nv);
         self.wal.append(&mut entry)?;
         // Push in chronological order; on rollback they are reversed:
         // UndoDelete(old_slot) runs first (restores old row), then
@@ -422,6 +438,28 @@ impl TxnManager {
         Ok(checkpoint_lsn)
     }
 
+    /// Opens an existing WAL and runs crash recovery, returning a ready `TxnManager`.
+    ///
+    /// Equivalent to `CrashRecovery::recover() + TxnManager::open()`, initialising
+    /// `max_committed` from the WAL scan instead of a separate pass.
+    ///
+    /// Use this instead of [`TxnManager::open`] when reopening a database that
+    /// may have crashed.
+    pub fn open_with_recovery(
+        storage: &mut dyn StorageEngine,
+        wal_path: &Path,
+    ) -> Result<(Self, RecoveryResult), DbError> {
+        let result = CrashRecovery::recover(storage, wal_path)?;
+        let wal = WalWriter::open(wal_path)?;
+        let mgr = Self {
+            wal,
+            next_txn_id: result.max_committed + 1,
+            max_committed: result.max_committed,
+            active: None,
+        };
+        Ok((mgr, result))
+    }
+
     /// Rotates the WAL if its current size exceeds `max_wal_size` bytes.
     ///
     /// Returns `true` if rotation occurred, `false` if the WAL was below the threshold.
@@ -438,6 +476,34 @@ impl TxnManager {
             Ok(false)
         }
     }
+}
+
+// ── Physical location helpers ─────────────────────────────────────────────────
+
+/// Bytes prepended to `new_value` (Insert/Update) and `old_value` (Delete)
+/// to encode the heap physical location for crash recovery:
+/// `[page_id: u64 LE][slot_id: u16 LE]` = 10 bytes.
+pub const PHYSICAL_LOC_LEN: usize = 10;
+
+/// Encodes `(page_id, slot_id)` into a 10-byte array.
+pub(crate) fn encode_physical_loc(page_id: u64, slot_id: u16) -> [u8; PHYSICAL_LOC_LEN] {
+    let mut loc = [0u8; PHYSICAL_LOC_LEN];
+    loc[0..8].copy_from_slice(&page_id.to_le_bytes());
+    loc[8..10].copy_from_slice(&slot_id.to_le_bytes());
+    loc
+}
+
+/// Decodes `(page_id, slot_id)` from the first 10 bytes of a WAL payload.
+/// Returns `None` if the slice is too short (e.g. legacy or control entries).
+pub fn decode_physical_loc(bytes: &[u8]) -> Option<(u64, u16)> {
+    if bytes.len() < PHYSICAL_LOC_LEN {
+        return None;
+    }
+    let page_id = u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    let slot_id = u16::from_le_bytes([bytes[8], bytes[9]]);
+    Some((page_id, slot_id))
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
