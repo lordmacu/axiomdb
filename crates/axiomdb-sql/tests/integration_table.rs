@@ -22,6 +22,7 @@ fn col(idx: u16, name: &str, col_type: ColumnType) -> ColumnDef {
         name: name.to_string(),
         col_type,
         nullable: true,
+        auto_increment: false,
     }
 }
 
@@ -477,6 +478,7 @@ fn create_table_helper(
                 name: col.name.clone(),
                 col_type: col.col_type,
                 nullable: col.nullable,
+                auto_increment: false,
             })
             .unwrap();
     }

@@ -329,6 +329,7 @@ fn virtual_columns_from_select(select: &SelectStmt) -> Vec<ColumnDef> {
                 name,
                 col_type: ColumnType::Text, // type unknown without full type inference
                 nullable: true,
+                auto_increment: false,
             }
         })
         .collect()

@@ -126,6 +126,7 @@ fn test_create_columns_list_ordered_by_col_idx() {
             name: "email".to_string(),
             col_type: ColumnType::Text,
             nullable: true,
+            auto_increment: false,
         })
         .unwrap();
         w.create_column(ColumnDef {
@@ -134,6 +135,7 @@ fn test_create_columns_list_ordered_by_col_idx() {
             name: "id".to_string(),
             col_type: ColumnType::BigInt,
             nullable: false,
+            auto_increment: false,
         })
         .unwrap();
         w.create_column(ColumnDef {
@@ -142,6 +144,7 @@ fn test_create_columns_list_ordered_by_col_idx() {
             name: "username".to_string(),
             col_type: ColumnType::Text,
             nullable: false,
+            auto_increment: false,
         })
         .unwrap();
         tid
@@ -300,6 +303,7 @@ fn test_delete_table_cascades_columns_and_indexes() {
             name: "id".to_string(),
             col_type: ColumnType::Int,
             nullable: false,
+            auto_increment: false,
         })
         .unwrap();
         w.create_index(IndexDef {

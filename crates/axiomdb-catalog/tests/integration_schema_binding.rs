@@ -106,6 +106,7 @@ fn test_resolve_table_columns_sorted_by_col_idx() {
                 name: name.to_string(),
                 col_type: ColumnType::Text,
                 nullable: idx != 0,
+                auto_increment: false,
             })
             .unwrap();
         }
@@ -184,6 +185,7 @@ fn test_resolve_column_found() {
             name: "id".into(),
             col_type: ColumnType::BigInt,
             nullable: false,
+            auto_increment: false,
         })
         .unwrap();
         w.create_column(ColumnDef {
@@ -192,6 +194,7 @@ fn test_resolve_column_found() {
             name: "email".into(),
             col_type: ColumnType::Text,
             nullable: true,
+            auto_increment: false,
         })
         .unwrap();
         tid
@@ -221,6 +224,7 @@ fn test_resolve_column_not_found_returns_column_not_found_error() {
             name: "id".into(),
             col_type: ColumnType::BigInt,
             nullable: false,
+            auto_increment: false,
         })
         .unwrap();
         tid

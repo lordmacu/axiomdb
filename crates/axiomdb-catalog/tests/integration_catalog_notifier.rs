@@ -139,6 +139,7 @@ fn test_create_column_fires_no_event() {
             name: "id".into(),
             col_type: ColumnType::BigInt,
             nullable: false,
+            auto_increment: false,
         })
         .unwrap();
         let count_after_column = events.lock().unwrap().len();

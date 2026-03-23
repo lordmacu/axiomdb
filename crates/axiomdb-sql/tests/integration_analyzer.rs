@@ -45,6 +45,7 @@ impl Fixture {
                     name: col_name.to_string(),
                     col_type: *col_type,
                     nullable: true,
+                    auto_increment: false,
                 })
                 .unwrap();
             }

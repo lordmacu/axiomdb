@@ -186,6 +186,8 @@ pub struct ColumnDef {
     pub name: String,
     pub col_type: ColumnType,
     pub nullable: bool,
+    /// `true` if this column was declared `AUTO_INCREMENT` or `SERIAL`.
+    pub auto_increment: bool,
 }
 
 impl ColumnDef {
@@ -193,11 +195,19 @@ impl ColumnDef {
     ///
     /// Format: `[table_id:4][col_idx:2][col_type:1][flags:1][name_len:1][name bytes]`
     /// - `flags bit0` = nullable
+    /// - `flags bit1` = auto_increment
     pub fn to_bytes(&self) -> Vec<u8> {
         let name = self.name.as_bytes();
         debug_assert!(name.len() <= 255, "column name too long");
 
-        let flags: u8 = if self.nullable { 0x01 } else { 0x00 };
+        let mut flags: u8 = 0;
+        if self.nullable {
+            flags |= 0x01;
+        }
+        if self.auto_increment {
+            flags |= 0x02;
+        }
+
         let mut buf = Vec::with_capacity(4 + 2 + 1 + 1 + 1 + name.len());
         buf.extend_from_slice(&self.table_id.to_le_bytes());
         buf.extend_from_slice(&self.col_idx.to_le_bytes());
@@ -209,6 +219,9 @@ impl ColumnDef {
     }
 
     /// Deserializes from binary row format.
+    ///
+    /// Backward-compatible: bit1 of flags was always 0 in older rows,
+    /// so `auto_increment` defaults to `false` for pre-4.14 catalog data.
     pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), DbError> {
         let err = || DbError::ParseError {
             message: "truncated ColumnRow bytes".into(),
@@ -223,6 +236,7 @@ impl ColumnDef {
         let col_type = ColumnType::try_from(bytes[6])?;
         let flags = bytes[7];
         let nullable = flags & 0x01 != 0;
+        let auto_increment = flags & 0x02 != 0;
         let name_len = bytes[8] as usize;
 
         if bytes.len() < 9 + name_len {
@@ -242,6 +256,7 @@ impl ColumnDef {
                 name,
                 col_type,
                 nullable,
+                auto_increment,
             },
             consumed,
         ))
@@ -440,6 +455,7 @@ mod tests {
             name: "email".to_string(),
             col_type: ColumnType::Text,
             nullable: true,
+            auto_increment: false,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -455,6 +471,7 @@ mod tests {
             name: "id".to_string(),
             col_type: ColumnType::BigInt,
             nullable: false,
+            auto_increment: false,
         };
         let bytes = def.to_bytes();
         let (back, _) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -470,6 +487,7 @@ mod tests {
             name: "x".into(),
             col_type: ColumnType::Int,
             nullable: false,
+            auto_increment: false,
         };
         let bytes = def.to_bytes();
         assert!(ColumnDef::from_bytes(&bytes[..5]).is_err());

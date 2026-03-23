@@ -138,7 +138,7 @@
 
 <!-- ── Group F — Functions (needs executor) ── -->
 - [x] 4.13 ✅ version() / current_user / session_user / current_database() — ORMs call these on connect; required for Phase 5 compatibility
-- [ ] 4.14 ⏳ LAST_INSERT_ID() / lastval() — last auto-generated ID (MySQL + PG compat)
+- [x] 4.14 ✅ LAST_INSERT_ID() / lastval() — AUTO_INCREMENT execution + per-table thread-local sequence; ColumnDef.auto_increment flag (bit1 of existing flags byte); LAST_INSERT_ID()/lastval() in eval_function
 - [x] 4.19 ✅ Basic built-in functions — `ABS`, `LENGTH`, `SUBSTR`, `UPPER`, `LOWER`, `TRIM`, `COALESCE`, `NOW()`, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `ROUND`, `FLOOR`, `CEIL`
 - [ ] 4.19b ⏳ BLOB functions — `FROM_BASE64(text)→BLOB` auto-decodes Base64 on insert (eliminates 33% overhead); `TO_BASE64(blob)→TEXT`; `OCTET_LENGTH(blob)→INT`; `ENCODE(blob,'hex'/'base64')→TEXT`; `DECODE(text,'hex'/'base64')→BLOB`; foundation for content-addressed storage in Phase 14
 - [ ] 4.19c ⏳ UUID generation functions — `gen_random_uuid()` returns UUID v4; `uuid_generate_v7()` returns UUID v7 (time-ordered, better for B+Tree index locality); `IS_VALID_UUID(text)→BOOL`; nearly every modern app uses UUIDs as primary keys and the DB must be able to generate them server-side without depending on application code
@@ -148,8 +148,8 @@
 - [ ] 4.15b ⏳ DEBUG/VERBOSE mode — `--verbose` flag: log AST, chosen plan, execution stats per query; critical for Phases 4–10 development
 
 <!-- ── Group H — Introspection + DDL modification (needs executor) ── -->
-- [ ] 4.20 ⏳ SHOW TABLES / SHOW COLUMNS / DESCRIBE — basic introspection; ORMs and GUI clients call these on connect
-- [ ] 4.21 ⏳ TRUNCATE TABLE — empty table without per-row WAL entry; faster than DELETE without WHERE
+- [x] 4.20 ✅ SHOW TABLES / SHOW COLUMNS / DESCRIBE — parser + executor using CatalogReader; MySQL-compatible 6-column output; Extra shows auto_increment
+- [x] 4.21 ✅ TRUNCATE TABLE — delete-all + AUTO_INCREMENT sequence reset; MySQL convention (returns count=0)
 - [ ] 4.22 ⏳ Basic ALTER TABLE — `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `RENAME TABLE` (blocking, no concurrent); prerequisite for migrations
 - [ ] 4.22b ⏳ ALTER TABLE ADD/DROP CONSTRAINT — `ADD CONSTRAINT fk`, `DROP CONSTRAINT`, `ADD UNIQUE`, `ADD CHECK`; ORMs need this post-creation
 
