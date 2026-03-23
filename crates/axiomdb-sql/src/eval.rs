@@ -127,6 +127,52 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
         Expr::Function { name, .. } => Err(DbError::NotImplemented {
             feature: format!("function '{name}' — implemented in Phase 4.19"),
         }),
+
+        // ── CASE WHEN ─────────────────────────────────────────────────────────
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => {
+            match operand {
+                // ── Searched CASE: conditions are boolean expressions ──────────
+                None => {
+                    for (when_expr, then_expr) in when_thens {
+                        let condition = eval(when_expr, row)?;
+                        if is_truthy(&condition) {
+                            return eval(then_expr, row);
+                        }
+                    }
+                }
+
+                // ── Simple CASE: compare base value against WHEN values ────────
+                Some(base_expr) => {
+                    let base_val = eval(base_expr, row)?;
+                    for (val_expr, then_expr) in when_thens {
+                        let val = eval(val_expr, row)?;
+                        // Use eval() for NULL-safe equality and type coercion.
+                        // NULL base or NULL val → UNKNOWN → is_truthy = false → no match.
+                        let eq = eval(
+                            &Expr::BinaryOp {
+                                op: crate::expr::BinaryOp::Eq,
+                                left: Box::new(Expr::Literal(base_val.clone())),
+                                right: Box::new(Expr::Literal(val)),
+                            },
+                            &[],
+                        )?;
+                        if is_truthy(&eq) {
+                            return eval(then_expr, row);
+                        }
+                    }
+                }
+            }
+
+            // No WHEN branch matched — return ELSE or NULL.
+            match else_result {
+                Some(else_expr) => eval(else_expr, row),
+                None => Ok(Value::Null),
+            }
+        }
     }
 }
 

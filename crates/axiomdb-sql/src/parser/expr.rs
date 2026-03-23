@@ -294,6 +294,51 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
         | Token::Names
         | Token::Autocommit => parse_ident_or_call(p),
 
+        // ── CASE WHEN ... END ─────────────────────────────────────────────────
+        Token::Case => {
+            p.advance();
+
+            // Simple CASE if the next token is not WHEN (has a base expression).
+            let operand = if !matches!(p.peek(), Token::When) {
+                Some(Box::new(parse_expr(p)?))
+            } else {
+                None
+            };
+
+            // Parse one or more WHEN condition/value THEN result pairs.
+            let mut when_thens: Vec<(Expr, Expr)> = Vec::new();
+            while p.eat(&Token::When) {
+                let condition = parse_expr(p)?;
+                p.expect(&Token::Then)?;
+                let result = parse_expr(p)?;
+                when_thens.push((condition, result));
+            }
+            if when_thens.is_empty() {
+                return Err(DbError::ParseError {
+                    message: format!(
+                        "CASE requires at least one WHEN branch, found {:?} at position {}",
+                        p.peek(),
+                        p.current_pos()
+                    ),
+                });
+            }
+
+            // Optional ELSE clause.
+            let else_result = if p.eat(&Token::Else) {
+                Some(Box::new(parse_expr(p)?))
+            } else {
+                None
+            };
+
+            p.expect(&Token::End)?;
+
+            Ok(Expr::Case {
+                operand,
+                when_thens,
+                else_result,
+            })
+        }
+
         other => Err(DbError::ParseError {
             message: format!(
                 "unexpected token {:?} in expression at position {}",
