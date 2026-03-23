@@ -17,7 +17,7 @@
 //! Use [`is_truthy`] to convert a result to a Rust `bool` for row filtering.
 
 use nexusdb_core::error::DbError;
-use nexusdb_types::Value;
+use nexusdb_types::{coerce::coerce_for_op, Value};
 
 use crate::expr::{BinaryOp, Expr, UnaryOp};
 
@@ -275,13 +275,13 @@ fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbError> {
 // ── Arithmetic ────────────────────────────────────────────────────────────────
 
 fn eval_arithmetic(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbError> {
-    let (l, r) = coerce_numeric(l, r)?;
+    let (l, r) = coerce_for_op(l, r)?;
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => int_arith(op, a, b),
         (Value::BigInt(a), Value::BigInt(b)) => bigint_arith(op, a, b),
         (Value::Real(a), Value::Real(b)) => Ok(Value::Real(real_arith(op, a, b)?)),
         (Value::Decimal(m1, s1), Value::Decimal(m2, s2)) => decimal_arith(op, m1, s1, m2, s2),
-        _ => unreachable!("coerce_numeric ensures matching types"),
+        _ => unreachable!("coerce_for_op ensures matching types"),
     }
 }
 
@@ -384,50 +384,6 @@ fn decimal_arith(op: BinaryOp, m1: i128, s1: u8, m2: i128, s2: u8) -> Result<Val
     }
 }
 
-/// Implicit numeric type promotion. Returns operands coerced to the same type.
-fn coerce_numeric(l: Value, r: Value) -> Result<(Value, Value), DbError> {
-    match (&l, &r) {
-        // Same type — no coercion needed.
-        (Value::Int(_), Value::Int(_))
-        | (Value::BigInt(_), Value::BigInt(_))
-        | (Value::Real(_), Value::Real(_))
-        | (Value::Decimal(..), Value::Decimal(..)) => Ok((l, r)),
-
-        // Int ↔ BigInt
-        (Value::Int(a), Value::BigInt(_)) => Ok((Value::BigInt(*a as i64), r)),
-        (Value::BigInt(_), Value::Int(b)) => Ok((l, Value::BigInt(*b as i64))),
-
-        // Int/BigInt → Real
-        (Value::Int(a), Value::Real(_)) => Ok((Value::Real(*a as f64), r)),
-        (Value::Real(_), Value::Int(b)) => Ok((l, Value::Real(*b as f64))),
-        (Value::BigInt(a), Value::Real(_)) => Ok((Value::Real(*a as f64), r)),
-        (Value::Real(_), Value::BigInt(b)) => Ok((l, Value::Real(*b as f64))),
-
-        // Int/BigInt → Decimal (use same scale as Decimal operand)
-        (Value::Int(a), Value::Decimal(_, s)) => {
-            let (a, s) = (*a as i128, *s);
-            Ok((Value::Decimal(a, s), r))
-        }
-        (Value::Decimal(_, s), Value::Int(b)) => {
-            let (b, s) = (*b as i128, *s);
-            Ok((l, Value::Decimal(b, s)))
-        }
-        (Value::BigInt(a), Value::Decimal(_, s)) => {
-            let (a, s) = (*a as i128, *s);
-            Ok((Value::Decimal(a, s), r))
-        }
-        (Value::Decimal(_, s), Value::BigInt(b)) => {
-            let (b, s) = (*b as i128, *s);
-            Ok((l, Value::Decimal(b, s)))
-        }
-
-        _ => Err(DbError::TypeMismatch {
-            expected: "numeric types".into(),
-            got: format!("{} and {}", l.variant_name(), r.variant_name()),
-        }),
-    }
-}
-
 // ── Comparison ────────────────────────────────────────────────────────────────
 
 fn eval_comparison(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbError> {
@@ -445,8 +401,8 @@ fn eval_comparison(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbError> {
 
 /// Compares two non-NULL values of compatible types.
 fn compare_values(l: &Value, r: &Value) -> Result<std::cmp::Ordering, DbError> {
-    // Try numeric coercion for mixed types first.
-    let (l, r) = match coerce_for_compare(l.clone(), r.clone()) {
+    // Try numeric widening for mixed types first; fall through on incompatible types.
+    let (l, r) = match coerce_for_op(l.clone(), r.clone()) {
         Ok(pair) => pair,
         Err(_) => (l.clone(), r.clone()),
     };
@@ -481,12 +437,6 @@ fn compare_values(l: &Value, r: &Value) -> Result<std::cmp::Ordering, DbError> {
             got: format!("{} and {}", l.variant_name(), r.variant_name()),
         }),
     }
-}
-
-/// Coerce numeric types for comparison (same rules as `coerce_numeric` but
-/// also handles non-arithmetic types which are passed through as-is).
-fn coerce_for_compare(l: Value, r: Value) -> Result<(Value, Value), DbError> {
-    coerce_numeric(l, r)
 }
 
 // ── String concat ─────────────────────────────────────────────────────────────
@@ -647,25 +597,59 @@ mod tests {
         assert!(like_match("🦀rust", "%rust"));
     }
 
-    // ── coerce_numeric ────────────────────────────────────────────────────────
+    // ── coerce_for_op integration ─────────────────────────────────────────────
 
     #[test]
-    fn test_coerce_int_to_bigint() {
-        let (l, r) = coerce_numeric(Value::Int(3), Value::BigInt(100)).unwrap();
-        assert_eq!(l, Value::BigInt(3));
-        assert_eq!(r, Value::BigInt(100));
+    fn test_eval_int_plus_bigint() {
+        // Int(1) + BigInt(999) — coerce_for_op widens Int to BigInt.
+        let expr = Expr::BinaryOp {
+            op: BinaryOp::Add,
+            left: Box::new(Expr::Literal(Value::Int(1))),
+            right: Box::new(Expr::Literal(Value::BigInt(999))),
+        };
+        assert_eq!(eval(&expr, &[]).unwrap(), Value::BigInt(1000));
     }
 
     #[test]
-    fn test_coerce_int_to_real() {
-        let (l, r) = coerce_numeric(Value::Int(5), Value::Real(2.0)).unwrap();
-        assert_eq!(l, Value::Real(5.0));
-        assert_eq!(r, Value::Real(2.0));
+    fn test_eval_int_eq_real() {
+        // Int(5) = Real(5.0) — coerce_for_op widens Int to Real for comparison.
+        let expr = Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Literal(Value::Int(5))),
+            right: Box::new(Expr::Literal(Value::Real(5.0))),
+        };
+        assert_eq!(eval(&expr, &[]).unwrap(), Value::Bool(true));
     }
 
     #[test]
-    fn test_coerce_incompatible_types() {
-        assert!(coerce_numeric(Value::Text("a".into()), Value::Int(1)).is_err());
+    fn test_eval_int_lt_real() {
+        let expr = Expr::BinaryOp {
+            op: BinaryOp::Lt,
+            left: Box::new(Expr::Literal(Value::Int(3))),
+            right: Box::new(Expr::Literal(Value::Real(3.5))),
+        };
+        assert_eq!(eval(&expr, &[]).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn test_eval_int_plus_decimal() {
+        // Int(2) + Decimal(314, 2) = Decimal(514, 2) = 5.14
+        let expr = Expr::BinaryOp {
+            op: BinaryOp::Add,
+            left: Box::new(Expr::Literal(Value::Int(2))),
+            right: Box::new(Expr::Literal(Value::Decimal(314, 2))),
+        };
+        assert_eq!(eval(&expr, &[]).unwrap(), Value::Decimal(514, 2));
+    }
+
+    #[test]
+    fn test_eval_incompatible_types_error() {
+        let expr = Expr::BinaryOp {
+            op: BinaryOp::Add,
+            left: Box::new(Expr::Literal(Value::Int(1))),
+            right: Box::new(Expr::Literal(Value::Text("a".into()))),
+        };
+        assert!(eval(&expr, &[]).is_err());
     }
 
     // ── is_truthy ────────────────────────────────────────────────────────────
