@@ -176,6 +176,42 @@ OLTP workload requirements).
 
 ---
 
+## INSERT ... SELECT — Snapshot Isolation
+
+`INSERT INTO target SELECT ... FROM source` executes the SELECT under the same
+snapshot that was fixed at `BEGIN`. This is critical for correctness:
+
+**The Halloween problem** is a classic database bug where an `INSERT ... SELECT`
+on the same table re-reads rows it just inserted, causing an infinite loop (the
+database inserts rows, those rows qualify the SELECT condition, they get inserted
+again, ad infinitum).
+
+AxiomDB prevents this automatically through MVCC snapshot semantics:
+
+1. The snapshot is fixed at `BEGIN`: `snapshot_id = max_committed + 1`
+2. Rows inserted by this statement get `txn_id_created = current_txn_id`
+3. The MVCC visibility rule: a row is visible only if `txn_id_created < snapshot_id`
+4. Since `current_txn_id ≥ snapshot_id`, newly inserted rows are **never** visible
+   to the SELECT scan within the same transaction
+
+```
+Before BEGIN:    source = {row_A (xmin=1), row_B (xmin=2)}
+Snapshot taken:  snapshot_id = 3
+
+INSERT INTO source SELECT * FROM source:
+  SELECT sees:  row_A (1 < 3 ✅), row_B (2 < 3 ✅)   → 2 rows
+  Inserts:      row_C (xmin=3), row_D (xmin=3)        → 3 ≮ 3 ❌ not re-read
+  SELECT stops:  only 2 original rows were seen
+
+After COMMIT:    source = {row_A, row_B, row_C, row_D}  ← exactly 4 rows
+```
+
+This also means rows inserted by a **concurrent transaction** that commits after
+this transaction's `BEGIN` are not seen by the SELECT — consistent snapshot
+throughout the entire INSERT operation.
+
+---
+
 ## ⚠️ Planned: Serializable Snapshot Isolation (Phase 7)
 
 SSI detects read-write dependencies between concurrent transactions and aborts

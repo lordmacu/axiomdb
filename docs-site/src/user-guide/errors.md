@@ -9,18 +9,37 @@ to show a "email already taken" message rather than a generic crash page).
 
 ## Error Format
 
-Every error from AxiomDB has the following structure:
+Every error from AxiomDB is represented as an `ErrorResponse` struct with these fields:
+
+| Field | Type | Always present? | Description |
+|---|---|---|---|
+| `sqlstate` | string (5 chars) | **Yes** | SQLSTATE code for programmatic handling (e.g. `"23505"`) |
+| `severity` | string | **Yes** | `"ERROR"`, `"WARNING"`, or `"NOTICE"` |
+| `message` | string | **Yes** | Short human-readable description. Do not parse this — use `sqlstate` |
+| `detail` | string | Sometimes | Extended context about the failure (offending value, referenced row) |
+| `hint` | string | Sometimes | Actionable suggestion for how to fix the error |
+| `position` | integer | Future | Byte offset of the error in the SQL query (Phase 4.25b) |
 
 ```json
 {
   "sqlstate": "23505",
   "severity": "ERROR",
-  "message": "duplicate key value violates unique constraint \"uq_users_email\"",
-  "detail": "Key (email)=(alice@example.com) already exists.",
-  "table": "users",
-  "constraint": "uq_users_email"
+  "message": "unique key violation on users.email",
+  "hint": "A row with the same email already exists in users. Use INSERT ... ON CONFLICT to handle duplicates."
 }
 ```
+
+```json
+{
+  "sqlstate": "23503",
+  "severity": "ERROR",
+  "message": "foreign key violation: orders.user_id = 999",
+  "detail": "Key (user_id)=(999) is not present in table users.",
+  "hint": "Insert the referenced row first, or use ON DELETE CASCADE."
+}
+```
+
+**Always use `sqlstate` for programmatic handling.** The `message` text may change between versions; SQLSTATE codes are stable.
 
 When using the MySQL wire protocol, the error is delivered as a MySQL error packet
 with the SQLSTATE code in the `sql_state` field (5 bytes following the `#` marker).

@@ -32,6 +32,7 @@
 - [Row Codec](internals/row-codec.md)
 - [SQL Parser](internals/sql-parser.md)
 - [Semantic Analyzer](internals/semantic-analyzer.md)
+- [Executor](internals/executor.md)
 
 ---
 
