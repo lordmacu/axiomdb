@@ -116,6 +116,10 @@ pub enum DbError {
     #[error("B+ tree corrupted: {msg}")]
     BTreeCorrupted { msg: String },
 
+    // ── Catalog ──────────────────────────────────────────────────
+    #[error("catalog not initialized — call CatalogBootstrap::init() first")]
+    CatalogNotInitialized,
+
     // ── General ──────────────────────────────────────────────────
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },

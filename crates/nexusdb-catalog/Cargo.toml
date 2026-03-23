@@ -6,5 +6,9 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-nexusdb-core = { workspace = true }
-thiserror    = { workspace = true }
+nexusdb-core    = { workspace = true }
+nexusdb-storage = { workspace = true }
+thiserror       = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
