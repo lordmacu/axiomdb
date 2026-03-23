@@ -1,0 +1,51 @@
+/* ── NexusDB Callouts ─────────────────────────────────────────────────── */
+
+.callout {
+  display: flex;
+  gap: 0.8rem;
+  padding: 0.85rem 1rem;
+  border-radius: 4px;
+  margin: 1.4rem 0;
+  line-height: 1.65;
+  font-size: 0.93em;
+}
+
+.callout-icon {
+  font-size: 1.05rem;
+  flex-shrink: 0;
+  padding-top: 1px;
+}
+
+.callout-body {
+  min-width: 0;
+}
+
+.callout-label {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  margin-bottom: 0.3rem;
+}
+
+/* Advantage — emerald: NexusDB does something better than MySQL/PostgreSQL */
+.callout-advantage {
+  background: rgba(16, 185, 129, 0.09);
+  border-left: 3px solid #10b981;
+}
+.callout-advantage .callout-label { color: #34d399; }
+
+/* Design — blue: notable internal design decision */
+.callout-design {
+  background: rgba(59, 130, 246, 0.09);
+  border-left: 3px solid #3b82f6;
+}
+.callout-design .callout-label { color: #60a5fa; }
+
+/* Tip — amber: user-facing tip or note */
+.callout-tip {
+  background: rgba(245, 158, 11, 0.09);
+  border-left: 3px solid #f59e0b;
+}
+.callout-tip .callout-label { color: #fbbf24; }

@@ -82,6 +82,14 @@ bitmap[i / 8] |= 1 << (i % 8);
 This design saves 7 bytes per nullable column compared to wrapping each value in
 `Option<T>` (which adds a full word of overhead in Rust's memory layout).
 
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Packed Null Bitmap</span>
+1 bit per column instead of 1 byte. For a table with 16 nullable columns, that is 15 bytes saved per row vs. a byte-per-column scheme. At 100M rows, that is 1.5 GB of disk savings — plus proportionally faster range scans (fewer bytes to read per row).
+</div>
+</div>
+
 ---
 
 ## Why u24 for Variable-Length Fields
@@ -104,6 +112,14 @@ u24 saves 1 byte per string column — for a table with 10 text columns, every r
 
 The u24 also signals that future TOAST (out-of-line storage for large values) will take
 over before values approach 16 MB — TOAST is planned for Phase 6.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — u24 Length Prefix</span>
+Saving 1 byte per text/bytes column is significant at scale: a table with 10 text columns × 100M rows saves 1 GB of disk and proportionally faster I/O. The 16 MB per-value ceiling is intentional — values above ~16 KB will use TOAST (Phase 6) long before reaching it, making the u32 range unused in practice.
+</div>
+</div>
 
 ---
 

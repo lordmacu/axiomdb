@@ -9,6 +9,7 @@ default-theme         = "navy"
 preferred-dark-theme  = "navy"
 git-repository-url    = "https://github.com/lordmacu/nexusdb"
 no-section-label      = true
+additional-css        = ["theme/custom.css"]
 
 [output.html.search]
 enable            = true

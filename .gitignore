@@ -53,3 +53,6 @@ docs/checkpoint-*.md
 server.crt
 server.key
 ca.crt
+
+# mdBook generated output (rebuilt by GitHub Actions)
+docs-site/book/

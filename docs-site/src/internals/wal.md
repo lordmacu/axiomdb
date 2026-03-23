@@ -63,6 +63,14 @@ entry_start = current_position - entry_len_2
 The reader seeks to `entry_start`, reads `entry_len`, verifies it equals `entry_len_2`,
 then reads the full entry. If the lengths do not match, the entry is corrupt.
 
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — O(1) Backward Traversal Without an Index</span>
+Storing <code>entry_len</code> at both ends of every entry enables backward scanning with a single seek per entry — no secondary index or reverse pointer table needed. The cost is 4 bytes per entry (overhead for a WAL with 10M entries: 40 MB, negligible relative to data payload).
+</div>
+</div>
+
 ### Physical Key Encoding
 
 The key field encodes the physical row location for data mutations:
@@ -178,6 +186,14 @@ changes up to `checkpoint_lsn`).
 This avoids the UNDO pass required by logical WALs (like PostgreSQL's pg_wal), which
 must undo changes to B+ Tree pages in reverse order. Physical WAL with redo-only
 recovery is simpler and faster.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Faster Recovery — Single Forward Scan</span>
+PostgreSQL's logical WAL requires two passes on recovery: a forward redo pass, then a backward undo pass to reverse uncommitted changes in B+ Tree pages. NexusDB's physical WAL (recording exact <code>page_id + slot_id</code>) requires only one forward pass — uncommitted writes are simply overwritten by committed redo entries.
+</div>
+</div>
 
 ---
 

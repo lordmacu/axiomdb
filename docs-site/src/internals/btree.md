@@ -38,6 +38,14 @@ Solving `16 + 73n ≤ 16,320`:
 
 Total size: `16 + 73 × 223 = 16 + 16,279 = 16,295 bytes ≤ 16,320 ✓`
 
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Why 16 KB Pages</span>
+PAGE_SIZE = 16 KB was chosen to maximize B+ Tree fanout. With 4 KB pages (SQLite's default), ORDER_INTERNAL would be ~54 — requiring 4× more tree levels for the same number of rows, meaning more page reads per lookup. At ORDER_INTERNAL = 223, a billion-row table fits in a 4-level tree requiring only 4 page reads for a point lookup.
+</div>
+</div>
+
 ### Leaf Node Capacity
 
 A leaf node with `n` entries stores `n` keys and `n` record IDs. A `RecordId`
@@ -150,6 +158,14 @@ A reader that loaded `old_root_id` before the swap continues accessing old pages
 safely — they are freed only after all reads complete (tracked in Phase 7 with
 epoch-based reclamation).
 
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Lock-Free Reads</span>
+Readers load the root pointer with <code>Acquire</code> semantics and traverse the tree without acquiring any lock. A write in progress is invisible to readers until the <code>Release</code> store completes — at which point the entire new subtree is already consistent. This is what allows read throughput to scale linearly with core count.
+</div>
+</div>
+
 ---
 
 ## Why next_leaf Is Not Used in Range Scans
@@ -168,6 +184,14 @@ next leaf when crossing a leaf boundary. The cost is O(log n) per boundary cross
 not O(1) as with a linked list. For a tree of 1 billion rows with ORDER_LEAF = 217,
 the depth is `log₂₁₇(10⁹) ≈ 4`, so each boundary crossing is 4 page reads.
 Measured cost for a range scan of 10,000 rows: **0.61 ms** — well within the 45 ms budget.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Re-traversal vs. Linked-List Leaf Scan</span>
+The <code>next_leaf</code> pointer exists on-disk but <code>RangeIter</code> does not use it. Under CoW, keeping a consistent linked list would require copying the <em>previous</em> leaf on every split — which itself requires finding that leaf from the root. Re-traversal costs O(log n) per leaf boundary (4 reads at 1B rows) and is simpler to reason about correctly.
+</div>
+</div>
 
 ---
 
