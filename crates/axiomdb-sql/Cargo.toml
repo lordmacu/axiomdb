@@ -26,3 +26,7 @@ harness = false
 [[bench]]
 name    = "parser_comparison"
 harness = false
+
+[[bench]]
+name    = "executor_e2e"
+harness = false
