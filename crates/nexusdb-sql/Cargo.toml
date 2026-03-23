@@ -6,14 +6,18 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-nexusdb-core  = { workspace = true }
-nexusdb-types = { workspace = true }
-thiserror     = { workspace = true }
-logos         = { workspace = true }
+nexusdb-core    = { workspace = true }
+nexusdb-types   = { workspace = true }
+nexusdb-catalog = { workspace = true }
+nexusdb-storage = { workspace = true }
+thiserror       = { workspace = true }
+logos           = { workspace = true }
 
 [dev-dependencies]
-criterion  = { workspace = true }
-sqlparser  = "0.53"         # reference parser: DataFusion, Delta Lake, Ballista
+criterion    = { workspace = true }
+sqlparser    = "0.53"
+tempfile     = { workspace = true }
+nexusdb-wal  = { workspace = true }
 
 [[bench]]
 name    = "sql_components"
