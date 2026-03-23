@@ -223,8 +223,38 @@ One phase at a time. When finishing each phase — **mandatory closing protocol:
 7. Update memory/architecture.md
 8. Update memory/lessons.md if there were learnings
 9. Commit with Conventional Commits format
-10. Confirm to the user
+10. Report progress percentages to the user (see below)
+11. Confirm to the user
 ```
+
+### Progress report — mandatory after every subfase close
+
+After marking the subfase `[x]` in progreso.md, always calculate and report:
+
+```
+COMPLETED_GLOBAL=$(grep "^\- \[x\]" docs/progreso.md | wc -l | tr -d ' ')
+TOTAL_GLOBAL=$(grep "^\- \[.\]" docs/progreso.md | wc -l | tr -d ' ')
+PCT_GLOBAL=$(echo "scale=1; $COMPLETED_GLOBAL * 100 / $TOTAL_GLOBAL" | bc)
+
+# Count current phase subfases from progreso.md (adjust pattern per phase)
+PHASE_DONE=<count completed subfases of current phase>
+PHASE_TOTAL=<count total subfases of current phase>
+PCT_PHASE=$(echo "scale=1; $PHASE_DONE * 100 / $PHASE_TOTAL" | bc)
+
+echo "📊 Phase N:  $PHASE_DONE/$PHASE_TOTAL subfases ($PCT_PHASE%)"
+echo "🌍 Global:   $COMPLETED_GLOBAL/$TOTAL_GLOBAL subfases ($PCT_GLOBAL%)"
+```
+
+Report format to show the user after every closed subfase:
+
+```
+✅ Subfase X.Y cerrada
+
+📊 Phase N — [████████░░░░░░░░] X/Y subfases (Z.Z%)
+🌍 Global  — [██░░░░░░░░░░░░░░] A/B subfases (C.C%)
+```
+
+Generate the bar with: █ per 6.25% completed, ░ for remaining (16 chars total).
 
 ### Unimplemented items — anti-gap rule
 
