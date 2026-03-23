@@ -784,3 +784,216 @@ fn test_full_outer_join_not_implemented() {
     .unwrap_err();
     assert!(matches!(err, DbError::NotImplemented { .. }), "got {err:?}");
 }
+
+// ── GROUP BY / Aggregate tests ────────────────────────────────────────────────
+
+fn setup_employees(storage: &mut MemoryStorage, txn: &mut TxnManager) {
+    run(
+        "CREATE TABLE employees (id INT NOT NULL, name TEXT, dept TEXT, salary INT)",
+        storage,
+        txn,
+    );
+    run(
+        "INSERT INTO employees VALUES (1, 'Alice', 'eng', 90000)",
+        storage,
+        txn,
+    );
+    run(
+        "INSERT INTO employees VALUES (2, 'Bob', 'eng', 80000)",
+        storage,
+        txn,
+    );
+    run(
+        "INSERT INTO employees VALUES (3, 'Carol', 'eng', 70000)",
+        storage,
+        txn,
+    );
+    run(
+        "INSERT INTO employees VALUES (4, 'Dave', 'sales', 60000)",
+        storage,
+        txn,
+    );
+    run(
+        "INSERT INTO employees VALUES (5, 'Eve', 'sales', 55000)",
+        storage,
+        txn,
+    );
+}
+
+#[test]
+fn test_group_by_count_star() {
+    let (mut storage, mut txn) = setup();
+    setup_employees(&mut storage, &mut txn);
+
+    let result = run(
+        "SELECT dept, COUNT(*) FROM employees GROUP BY dept",
+        &mut storage,
+        &mut txn,
+    );
+    let r = rows(result);
+    assert_eq!(r.len(), 2); // eng and sales
+                            // eng → 3, sales → 2
+    let mut counts: Vec<(String, i64)> = r
+        .iter()
+        .map(|row| {
+            let dept = match &row[0] {
+                Value::Text(s) => s.clone(),
+                _ => panic!("expected Text"),
+            };
+            let cnt = match row[1] {
+                Value::BigInt(n) => n,
+                _ => panic!("expected BigInt"),
+            };
+            (dept, cnt)
+        })
+        .collect();
+    counts.sort_by_key(|(d, _)| d.clone());
+    assert_eq!(counts, vec![("eng".into(), 3), ("sales".into(), 2)]);
+}
+
+#[test]
+fn test_group_by_sum_and_avg() {
+    let (mut storage, mut txn) = setup();
+    setup_employees(&mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT dept, SUM(salary), AVG(salary) FROM employees GROUP BY dept",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 2);
+    // Find eng row
+    let eng = r
+        .iter()
+        .find(|row| row[0] == Value::Text("eng".into()))
+        .unwrap();
+    assert_eq!(eng[1], Value::Int(240000), "eng sum = 90000+80000+70000");
+    if let Value::Real(avg) = eng[2] {
+        assert!((avg - 80000.0).abs() < 1.0, "eng avg ≈ 80000");
+    } else {
+        panic!("expected Real for avg");
+    }
+}
+
+#[test]
+fn test_group_by_min_max() {
+    let (mut storage, mut txn) = setup();
+    setup_employees(&mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT dept, MIN(salary), MAX(salary) FROM employees GROUP BY dept",
+        &mut storage,
+        &mut txn,
+    ));
+    let eng = r
+        .iter()
+        .find(|row| row[0] == Value::Text("eng".into()))
+        .unwrap();
+    assert_eq!(eng[1], Value::Int(70000)); // MIN
+    assert_eq!(eng[2], Value::Int(90000)); // MAX
+}
+
+#[test]
+fn test_group_by_null_key_grouped() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT, dept TEXT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1, 'eng')", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (2, NULL)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (3, NULL)", &mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT dept, COUNT(*) FROM t GROUP BY dept",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 2); // 'eng' group + NULL group
+    let null_group = r.iter().find(|row| row[0] == Value::Null).unwrap();
+    assert_eq!(null_group[1], Value::BigInt(2)); // 2 NULLs → 1 group of 2
+}
+
+#[test]
+fn test_ungrouped_count_star() {
+    let (mut storage, mut txn) = setup();
+    setup_employees(&mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT COUNT(*) FROM employees",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::BigInt(5));
+}
+
+#[test]
+fn test_ungrouped_count_empty_table() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+
+    // Empty table → COUNT(*) returns 1 row with (0), not 0 rows.
+    let r = rows(run("SELECT COUNT(*) FROM t", &mut storage, &mut txn));
+    assert_eq!(
+        r.len(),
+        1,
+        "empty table must still return 1 row for COUNT(*)"
+    );
+    assert_eq!(r[0][0], Value::BigInt(0));
+}
+
+#[test]
+fn test_count_col_skips_null() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT, mgr INT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1, 100)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (2, NULL)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (3, NULL)", &mut storage, &mut txn);
+
+    let r = rows(run("SELECT COUNT(mgr) FROM t", &mut storage, &mut txn));
+    assert_eq!(r[0][0], Value::BigInt(1)); // only 1 non-NULL manager
+}
+
+#[test]
+fn test_sum_all_null() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT, val INT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1, NULL)", &mut storage, &mut txn);
+
+    let r = rows(run("SELECT SUM(val) FROM t", &mut storage, &mut txn));
+    assert_eq!(r[0][0], Value::Null, "SUM of all NULLs must be NULL");
+}
+
+#[test]
+fn test_having_filter() {
+    let (mut storage, mut txn) = setup();
+    setup_employees(&mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT dept, COUNT(*) FROM employees GROUP BY dept HAVING COUNT(*) > 2",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 1); // only eng has 3 > 2
+    assert_eq!(r[0][0], Value::Text("eng".into()));
+}
+
+#[test]
+fn test_having_with_sum() {
+    let (mut storage, mut txn) = setup();
+    setup_employees(&mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT dept, SUM(salary) FROM employees GROUP BY dept HAVING SUM(salary) > 200000",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 1); // only eng: 240000 > 200000
+    assert_eq!(r[0][0], Value::Text("eng".into()));
+}
+
+#[test]
+fn test_select_star_with_group_by_error() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    let err = run_result("SELECT * FROM t GROUP BY id", &mut storage, &mut txn).unwrap_err();
+    assert!(matches!(err, DbError::TypeMismatch { .. }), "got {err:?}");
+}

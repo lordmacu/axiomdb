@@ -122,10 +122,10 @@
 
 <!-- ── Group E — Core SQL (needs executor) ── -->
 - [x] 4.8 ✅ JOIN — INNER, LEFT, RIGHT, CROSS with nested loop; USING; multi-table; FULL → NotImplemented
-- [ ] 4.9a ⏳ GROUP BY hash-based — hash table for grouping; optimal for high cardinality
-- [ ] 4.9b ⏳ GROUP BY sort-based — sort first, then stream; optimal when data is pre-sorted by index
-- [ ] 4.9c ⏳ Aggregate functions — COUNT, SUM, MIN, MAX, AVG, COUNT DISTINCT; state per group
-- [ ] 4.9d ⏳ HAVING clause — filter groups post-aggregation; evaluates expression over group state
+- [x] 4.9a ✅ GROUP BY hash-based — HashMap<key_bytes, GroupState>; value_to_key_bytes; NULL keys group correctly
+- [ ] 4.9b ⏳ GROUP BY sort-based — sort first, then stream; optimal when data is pre-sorted by index (deferred)
+- [x] 4.9c ✅ Aggregate functions — COUNT(*), COUNT(col), SUM, MIN, MAX, AVG (→ Real); skip NULL; finalize
+- [x] 4.9d ✅ HAVING clause — eval_with_aggs intercepts aggregate calls; representative_row for col refs
 - [ ] 4.10 ⏳ ORDER BY + LIMIT/OFFSET — in-memory sort + pagination
 - [ ] 4.10b ⏳ Multi-column ORDER BY with mixed direction — `ORDER BY a ASC, b DESC`; composite comparator; test with NULLs in each position
 - [ ] 4.10c ⏳ NULLS FIRST / NULLS LAST — MySQL default (NULLs first in ASC) vs PostgreSQL (NULLs last); configurable

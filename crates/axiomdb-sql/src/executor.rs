@@ -32,6 +32,8 @@
 //! JOIN, GROUP BY, ORDER BY, LIMIT, DISTINCT, subqueries in FROM, INSERT SELECT,
 //! TRUNCATE, ALTER TABLE, SHOW TABLES / DESCRIBE.
 
+use std::collections::HashMap;
+
 use axiomdb_catalog::{
     schema::{ColumnDef as CatalogColumnDef, ColumnType, IndexDef, TableDef},
     CatalogReader, CatalogWriter, SchemaResolver,
@@ -48,7 +50,7 @@ use crate::{
         SelectItem, SelectStmt, Stmt, UpdateStmt,
     },
     eval::{eval, is_truthy},
-    expr::Expr,
+    expr::{BinaryOp, Expr},
     result::{ColumnMeta, QueryResult, Row},
     table::TableEngine,
 };
@@ -164,11 +166,6 @@ fn execute_select(
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
     // Guard unsupported clauses (ORDER BY, LIMIT, DISTINCT remain unimplemented).
-    if !stmt.group_by.is_empty() {
-        return Err(DbError::NotImplemented {
-            feature: "GROUP BY — Phase 4.9".into(),
-        });
-    }
     if !stmt.order_by.is_empty() {
         return Err(DbError::NotImplemented {
             feature: "ORDER BY — Phase 4.10".into(),
@@ -238,18 +235,27 @@ fn execute_select(
         let snap = txn.active_snapshot()?;
         let raw_rows = TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?;
 
-        let out_cols = build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
-
-        let mut rows: Vec<Row> = Vec::new();
+        // Collect post-WHERE combined rows (not yet projected).
+        let mut combined_rows: Vec<Row> = Vec::new();
         for (_rid, values) in raw_rows {
             if let Some(ref wc) = stmt.where_clause {
                 if !is_truthy(&eval(wc, &values)?) {
                     continue;
                 }
             }
-            rows.push(project_row(&stmt.columns, &values)?);
+            combined_rows.push(values);
         }
 
+        // Branch: aggregation or direct projection.
+        if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
+            return execute_select_grouped(stmt, combined_rows);
+        }
+
+        let out_cols = build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
+        let rows = combined_rows
+            .iter()
+            .map(|v| project_row(&stmt.columns, v))
+            .collect::<Result<_, _>>()?;
         Ok(QueryResult::Rows {
             columns: out_cols,
             rows,
@@ -364,6 +370,11 @@ fn execute_select_with_joins(
             }
         }
         combined_rows = filtered;
+    }
+
+    // Branch: aggregation (GROUP BY / aggregate functions) or direct projection.
+    if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
+        return execute_select_grouped(stmt, combined_rows);
     }
 
     // Build output ColumnMeta.
@@ -657,6 +668,717 @@ fn infer_expr_type_join(
         }
     }
     (DataType::Text, true) // safe fallback for computed expressions
+}
+
+// ── GROUP BY / AGGREGATE execution ───────────────────────────────────────────
+
+// ── Aggregate detection ───────────────────────────────────────────────────────
+
+/// Returns `true` if `name` is a known aggregate function.
+fn is_aggregate(name: &str) -> bool {
+    matches!(name, "count" | "sum" | "min" | "max" | "avg")
+}
+
+/// Returns `true` if `expr` or any sub-expression is an aggregate call.
+fn contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function { name, .. } if is_aggregate(name.as_str()) => true,
+        Expr::BinaryOp { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
+        Expr::UnaryOp { operand, .. } => contains_aggregate(operand),
+        Expr::IsNull { expr, .. } => contains_aggregate(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
+        Expr::Like { expr, pattern, .. } => contains_aggregate(expr) || contains_aggregate(pattern),
+        Expr::In { expr, list, .. } => {
+            contains_aggregate(expr) || list.iter().any(contains_aggregate)
+        }
+        Expr::Function { args, .. } => args.iter().any(contains_aggregate),
+        Expr::Literal(_) | Expr::Column { .. } => false,
+    }
+}
+
+/// Returns `true` if the SELECT list or HAVING clause contain any aggregate call.
+fn has_aggregates(items: &[SelectItem], having: &Option<Expr>) -> bool {
+    let in_select = items.iter().any(|item| match item {
+        SelectItem::Expr { expr, .. } => contains_aggregate(expr),
+        _ => false,
+    });
+    let in_having = having.as_ref().is_some_and(contains_aggregate);
+    in_select || in_having
+}
+
+// ── Aggregate descriptor ──────────────────────────────────────────────────────
+
+/// Descriptor for one aggregate expression in the query.
+///
+/// Collected from the SELECT list and HAVING clause before the scan loop.
+/// Deduplicated: if `COUNT(*)` appears in both SELECT and HAVING, only one
+/// `AggExpr` is created and both share the same accumulator index.
+#[derive(Debug, Clone)]
+struct AggExpr {
+    /// Lowercase function name: "count", "sum", "min", "max", "avg".
+    name: String,
+    /// The argument expression. `None` for `COUNT(*)`.
+    arg: Option<Expr>,
+    /// Position in `GroupState::accumulators`. Preserved for diagnostics.
+    #[allow(dead_code)]
+    agg_idx: usize,
+}
+
+impl AggExpr {
+    /// Returns `true` if this descriptor matches the given function call.
+    fn matches(&self, name: &str, args: &[Expr]) -> bool {
+        if self.name != name {
+            return false;
+        }
+        match (&self.arg, args.first()) {
+            // Both COUNT(*): arg = None, args is empty
+            (None, None) => args.is_empty(),
+            // Both have an argument — compare by col_idx if both are Column refs
+            (Some(Expr::Column { col_idx: a, .. }), Some(Expr::Column { col_idx: b, .. })) => {
+                a == b
+            }
+            // One has an arg, the other doesn't
+            _ => false,
+        }
+    }
+}
+
+/// Walks `expr` and registers any aggregate function calls into `result`.
+fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
+    match expr {
+        Expr::Function { name, args } if is_aggregate(name.as_str()) => {
+            let arg = args.first().cloned();
+            // Deduplicate: only add if not already registered.
+            let already = result.iter().any(|ae| ae.matches(name.as_str(), args));
+            if !already {
+                let idx = result.len();
+                result.push(AggExpr {
+                    name: name.clone(),
+                    arg,
+                    agg_idx: idx,
+                });
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_agg_exprs_from(left, result);
+            collect_agg_exprs_from(right, result);
+        }
+        Expr::UnaryOp { operand, .. } => collect_agg_exprs_from(operand, result),
+        Expr::IsNull { expr, .. } => collect_agg_exprs_from(expr, result),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_agg_exprs_from(expr, result);
+            collect_agg_exprs_from(low, result);
+            collect_agg_exprs_from(high, result);
+        }
+        Expr::In { expr, list, .. } => {
+            collect_agg_exprs_from(expr, result);
+            for e in list {
+                collect_agg_exprs_from(e, result);
+            }
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_agg_exprs_from(a, result);
+            }
+        }
+        Expr::Literal(_) | Expr::Column { .. } | Expr::Like { .. } => {}
+    }
+}
+
+/// Builds the deduplicated list of aggregate expressions from SELECT + HAVING.
+fn collect_agg_exprs(items: &[SelectItem], having: &Option<Expr>) -> Vec<AggExpr> {
+    let mut result = Vec::new();
+    for item in items {
+        if let SelectItem::Expr { expr, .. } = item {
+            collect_agg_exprs_from(expr, &mut result);
+        }
+    }
+    if let Some(h) = having {
+        collect_agg_exprs_from(h, &mut result);
+    }
+    result
+}
+
+// ── Accumulator ───────────────────────────────────────────────────────────────
+
+/// Per-group state for a single aggregate expression.
+#[derive(Debug)]
+enum AggAccumulator {
+    /// `COUNT(*)` — increments for every row.
+    CountStar { n: u64 },
+    /// `COUNT(col)` — increments only for non-NULL values.
+    CountCol { n: u64 },
+    /// `SUM(col)` — sum of non-NULL values. `None` = all values were NULL.
+    Sum { acc: Option<Value> },
+    /// `MIN(col)` — minimum non-NULL value.
+    Min { acc: Option<Value> },
+    /// `MAX(col)` — maximum non-NULL value.
+    Max { acc: Option<Value> },
+    /// `AVG(col)` — running sum + count; final = sum / count as Real.
+    Avg { sum: Value, count: u64 },
+}
+
+impl AggAccumulator {
+    fn new(agg: &AggExpr) -> Self {
+        match agg.name.as_str() {
+            "count" if agg.arg.is_none() => Self::CountStar { n: 0 },
+            "count" => Self::CountCol { n: 0 },
+            "sum" => Self::Sum { acc: None },
+            "min" => Self::Min { acc: None },
+            "max" => Self::Max { acc: None },
+            "avg" => Self::Avg {
+                sum: Value::Int(0),
+                count: 0,
+            },
+            _ => unreachable!("AggAccumulator::new called with non-aggregate"),
+        }
+    }
+
+    fn update(&mut self, row: &[Value], agg: &AggExpr) -> Result<(), DbError> {
+        match self {
+            Self::CountStar { n } => *n += 1,
+
+            Self::CountCol { n } => {
+                let v = eval(agg.arg.as_ref().unwrap(), row)?;
+                if !matches!(v, Value::Null) {
+                    *n += 1;
+                }
+            }
+
+            Self::Sum { acc } => {
+                let v = eval(agg.arg.as_ref().unwrap(), row)?;
+                if !matches!(v, Value::Null) {
+                    *acc = Some(match acc.take() {
+                        None => v,
+                        Some(a) => agg_add(a, v)?,
+                    });
+                }
+            }
+
+            Self::Min { acc } => {
+                let v = eval(agg.arg.as_ref().unwrap(), row)?;
+                if !matches!(v, Value::Null) {
+                    *acc = Some(match acc.take() {
+                        None => v.clone(),
+                        Some(a) => {
+                            if agg_compare(&v, &a)? == std::cmp::Ordering::Less {
+                                v
+                            } else {
+                                a
+                            }
+                        }
+                    });
+                }
+            }
+
+            Self::Max { acc } => {
+                let v = eval(agg.arg.as_ref().unwrap(), row)?;
+                if !matches!(v, Value::Null) {
+                    *acc = Some(match acc.take() {
+                        None => v.clone(),
+                        Some(a) => {
+                            if agg_compare(&v, &a)? == std::cmp::Ordering::Greater {
+                                v
+                            } else {
+                                a
+                            }
+                        }
+                    });
+                }
+            }
+
+            Self::Avg { sum, count } => {
+                let v = eval(agg.arg.as_ref().unwrap(), row)?;
+                if !matches!(v, Value::Null) {
+                    *sum = agg_add(sum.clone(), v)?;
+                    *count += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(self) -> Result<Value, DbError> {
+        match self {
+            Self::CountStar { n } => Ok(Value::BigInt(n as i64)),
+            Self::CountCol { n } => Ok(Value::BigInt(n as i64)),
+            Self::Sum { acc } => Ok(acc.unwrap_or(Value::Null)),
+            Self::Min { acc } => Ok(acc.unwrap_or(Value::Null)),
+            Self::Max { acc } => Ok(acc.unwrap_or(Value::Null)),
+            Self::Avg { sum, count } => finalize_avg(sum, count),
+        }
+    }
+}
+
+/// Add two values for aggregation (reuses `eval` for type handling and coercion).
+fn agg_add(a: Value, b: Value) -> Result<Value, DbError> {
+    eval(
+        &Expr::BinaryOp {
+            op: BinaryOp::Add,
+            left: Box::new(Expr::Literal(a)),
+            right: Box::new(Expr::Literal(b)),
+        },
+        &[],
+    )
+}
+
+/// Compare two values for MIN/MAX (returns Ordering).
+fn agg_compare(a: &Value, b: &Value) -> Result<std::cmp::Ordering, DbError> {
+    // Delegate to eval: if a < b → Less, if a = b → Equal, else Greater.
+    let lt = eval(
+        &Expr::BinaryOp {
+            op: BinaryOp::Lt,
+            left: Box::new(Expr::Literal(a.clone())),
+            right: Box::new(Expr::Literal(b.clone())),
+        },
+        &[],
+    )?;
+    if is_truthy(&lt) {
+        return Ok(std::cmp::Ordering::Less);
+    }
+    let eq = eval(
+        &Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Literal(a.clone())),
+            right: Box::new(Expr::Literal(b.clone())),
+        },
+        &[],
+    )?;
+    if is_truthy(&eq) {
+        Ok(std::cmp::Ordering::Equal)
+    } else {
+        Ok(std::cmp::Ordering::Greater)
+    }
+}
+
+/// Finalize AVG: always produces `Real`. Returns `Null` if count == 0.
+fn finalize_avg(sum: Value, count: u64) -> Result<Value, DbError> {
+    if count == 0 {
+        return Ok(Value::Null);
+    }
+    // Convert sum to Real.
+    let sum_real = match sum {
+        Value::Int(n) => Value::Real(n as f64),
+        Value::BigInt(n) => Value::Real(n as f64),
+        Value::Real(f) => Value::Real(f),
+        Value::Decimal(m, s) => Value::Real(m as f64 * 10f64.powi(-(s as i32))),
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "numeric".into(),
+                got: other.variant_name().into(),
+            })
+        }
+    };
+    eval(
+        &Expr::BinaryOp {
+            op: BinaryOp::Div,
+            left: Box::new(Expr::Literal(sum_real)),
+            right: Box::new(Expr::Literal(Value::Real(count as f64))),
+        },
+        &[],
+    )
+}
+
+// ── GroupState ────────────────────────────────────────────────────────────────
+
+/// State for one GROUP BY group.
+struct GroupState {
+    /// Evaluated GROUP BY expression values (for future sort-based output — 4.9b).
+    #[allow(dead_code)]
+    key_values: Vec<Value>,
+    /// One source row from this group — used by HAVING/SELECT to resolve column refs.
+    representative_row: Row,
+    /// One accumulator per aggregate in the query (SELECT + HAVING).
+    accumulators: Vec<AggAccumulator>,
+}
+
+// ── GROUP BY key hashing ──────────────────────────────────────────────────────
+
+/// Serializes a `Value` to a self-describing byte sequence for use as a
+/// GROUP BY hash key.
+///
+/// Properties:
+/// - Two `NULL` values produce identical bytes `[0x00]` → they form one group
+///   (SQL grouping semantics: NULLs are considered equal for GROUP BY).
+/// - `Real(f64)` uses `to_bits()` for bit-exact representation. `NaN` would
+///   produce a fixed bit pattern, but NaN is forbidden in stored values.
+/// - The tag byte guarantees values of different types never collide.
+fn value_to_key_bytes(v: &Value) -> Vec<u8> {
+    let mut buf = Vec::new();
+    match v {
+        Value::Null => buf.push(0x00),
+        Value::Bool(b) => {
+            buf.push(0x01);
+            buf.push(*b as u8);
+        }
+        Value::Int(n) => {
+            buf.push(0x02);
+            buf.extend_from_slice(&n.to_le_bytes());
+        }
+        Value::BigInt(n) => {
+            buf.push(0x03);
+            buf.extend_from_slice(&n.to_le_bytes());
+        }
+        Value::Real(f) => {
+            buf.push(0x04);
+            buf.extend_from_slice(&f.to_bits().to_le_bytes());
+        }
+        Value::Decimal(m, s) => {
+            buf.push(0x05);
+            buf.extend_from_slice(&m.to_le_bytes());
+            buf.push(*s);
+        }
+        Value::Text(s) => {
+            buf.push(0x06);
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        Value::Bytes(b) => {
+            buf.push(0x07);
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
+        Value::Date(d) => {
+            buf.push(0x08);
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        Value::Timestamp(t) => {
+            buf.push(0x09);
+            buf.extend_from_slice(&t.to_le_bytes());
+        }
+        Value::Uuid(u) => {
+            buf.push(0x0A);
+            buf.extend_from_slice(u.as_slice());
+        }
+    }
+    buf
+}
+
+/// Serializes a GROUP BY key (multiple values) to a single byte sequence.
+fn group_key_bytes(key_values: &[Value]) -> Vec<u8> {
+    key_values.iter().flat_map(value_to_key_bytes).collect()
+}
+
+// ── HAVING evaluator ──────────────────────────────────────────────────────────
+
+/// Evaluates a HAVING expression against a finalized group.
+///
+/// `Expr::Column` references are evaluated against `representative_row`
+/// (the original source row, so `col_idx` values from the analyzer are valid).
+///
+/// `Expr::Function` aggregate calls are looked up in `agg_values` by name + arg.
+///
+/// All other expressions are evaluated by delegating sub-expression results to
+/// the standard `eval()` via synthetic `Expr::Literal` nodes.
+fn eval_with_aggs(
+    expr: &Expr,
+    representative_row: &[Value],
+    agg_values: &[Value],
+    agg_exprs: &[AggExpr],
+) -> Result<Value, DbError> {
+    match expr {
+        Expr::Literal(v) => Ok(v.clone()),
+
+        Expr::Column { col_idx, .. } => {
+            representative_row
+                .get(*col_idx)
+                .cloned()
+                .ok_or(DbError::ColumnIndexOutOfBounds {
+                    idx: *col_idx,
+                    len: representative_row.len(),
+                })
+        }
+
+        Expr::Function { name, args } if is_aggregate(name.as_str()) => {
+            let idx = agg_exprs
+                .iter()
+                .position(|ae| ae.matches(name.as_str(), args))
+                .ok_or_else(|| {
+                    DbError::Other(format!(
+                        "aggregate '{name}' not pre-registered — internal error"
+                    ))
+                })?;
+            Ok(agg_values[idx].clone())
+        }
+
+        // AND: short-circuit
+        Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            let l = eval_with_aggs(left, representative_row, agg_values, agg_exprs)?;
+            match l {
+                Value::Bool(false) => Ok(Value::Bool(false)),
+                Value::Bool(true) => {
+                    eval_with_aggs(right, representative_row, agg_values, agg_exprs)
+                }
+                Value::Null => {
+                    let r = eval_with_aggs(right, representative_row, agg_values, agg_exprs)?;
+                    Ok(if matches!(r, Value::Bool(false)) {
+                        Value::Bool(false)
+                    } else {
+                        Value::Null
+                    })
+                }
+                other => Err(DbError::TypeMismatch {
+                    expected: "Bool".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+
+        // OR: short-circuit
+        Expr::BinaryOp {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } => {
+            let l = eval_with_aggs(left, representative_row, agg_values, agg_exprs)?;
+            match l {
+                Value::Bool(true) => Ok(Value::Bool(true)),
+                Value::Bool(false) => {
+                    eval_with_aggs(right, representative_row, agg_values, agg_exprs)
+                }
+                Value::Null => {
+                    let r = eval_with_aggs(right, representative_row, agg_values, agg_exprs)?;
+                    Ok(if matches!(r, Value::Bool(true)) {
+                        Value::Bool(true)
+                    } else {
+                        Value::Null
+                    })
+                }
+                other => Err(DbError::TypeMismatch {
+                    expected: "Bool".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+
+        // Other binary ops: evaluate both sides, delegate to eval() via Literal.
+        Expr::BinaryOp { op, left, right } => {
+            let l = eval_with_aggs(left, representative_row, agg_values, agg_exprs)?;
+            let r = eval_with_aggs(right, representative_row, agg_values, agg_exprs)?;
+            eval(
+                &Expr::BinaryOp {
+                    op: *op,
+                    left: Box::new(Expr::Literal(l)),
+                    right: Box::new(Expr::Literal(r)),
+                },
+                &[],
+            )
+        }
+
+        Expr::UnaryOp { op, operand } => {
+            let v = eval_with_aggs(operand, representative_row, agg_values, agg_exprs)?;
+            eval(
+                &Expr::UnaryOp {
+                    op: *op,
+                    operand: Box::new(Expr::Literal(v)),
+                },
+                &[],
+            )
+        }
+
+        Expr::IsNull { expr, negated } => {
+            let v = eval_with_aggs(expr, representative_row, agg_values, agg_exprs)?;
+            eval(
+                &Expr::IsNull {
+                    expr: Box::new(Expr::Literal(v)),
+                    negated: *negated,
+                },
+                &[],
+            )
+        }
+
+        // For remaining variants: fall back to standard eval against representative_row.
+        other => eval(other, representative_row),
+    }
+}
+
+// ── execute_select_grouped ────────────────────────────────────────────────────
+
+/// Executes the GROUP BY + aggregation path.
+///
+/// `combined_rows` are the post-scan, post-WHERE rows (not yet projected).
+/// They are the "source" rows for the GROUP BY grouping.
+fn execute_select_grouped(
+    stmt: SelectStmt,
+    combined_rows: Vec<Row>,
+) -> Result<QueryResult, DbError> {
+    // Build aggregate registry.
+    let agg_exprs = collect_agg_exprs(&stmt.columns, &stmt.having);
+
+    // One-pass hash aggregation.
+    let mut groups: HashMap<Vec<u8>, GroupState> = HashMap::new();
+
+    for row in &combined_rows {
+        // Evaluate GROUP BY expressions → key values.
+        let key_values: Vec<Value> = stmt
+            .group_by
+            .iter()
+            .map(|e| eval(e, row))
+            .collect::<Result<_, _>>()?;
+
+        let key_bytes = group_key_bytes(&key_values);
+
+        let state = groups.entry(key_bytes).or_insert_with(|| GroupState {
+            key_values: key_values.clone(),
+            representative_row: row.clone(),
+            accumulators: agg_exprs.iter().map(AggAccumulator::new).collect(),
+        });
+
+        // Update each accumulator.
+        for (acc, agg) in state.accumulators.iter_mut().zip(&agg_exprs) {
+            acc.update(row, agg)?;
+        }
+    }
+
+    // Ungrouped aggregate: if no GROUP BY and no rows, still emit one output group.
+    // (e.g., SELECT COUNT(*) FROM empty_table → returns (0), not 0 rows)
+    if stmt.group_by.is_empty() && groups.is_empty() {
+        groups.insert(
+            vec![],
+            GroupState {
+                key_values: vec![],
+                representative_row: vec![],
+                accumulators: agg_exprs.iter().map(AggAccumulator::new).collect(),
+            },
+        );
+    }
+
+    // Build output column metadata.
+    let out_cols = build_grouped_column_meta(&stmt.columns, &agg_exprs)?;
+
+    // Finalize, HAVING filter, project.
+    let mut rows: Vec<Row> = Vec::new();
+    for (_, state) in groups {
+        // Finalize all accumulators.
+        let agg_values: Vec<Value> = state
+            .accumulators
+            .into_iter()
+            .map(|acc| acc.finalize())
+            .collect::<Result<_, _>>()?;
+
+        // HAVING filter.
+        if let Some(ref having) = stmt.having {
+            let v = eval_with_aggs(having, &state.representative_row, &agg_values, &agg_exprs)?;
+            if !is_truthy(&v) {
+                continue;
+            }
+        }
+
+        // Project SELECT list.
+        let out_row = project_grouped_row(
+            &stmt.columns,
+            &state.representative_row,
+            &agg_values,
+            &agg_exprs,
+        )?;
+        rows.push(out_row);
+    }
+
+    Ok(QueryResult::Rows {
+        columns: out_cols,
+        rows,
+    })
+}
+
+/// Projects one output row for the grouped path.
+///
+/// For each `SelectItem::Expr`:
+/// - If the expression contains an aggregate → `eval_with_aggs`
+/// - Otherwise → standard `eval` against `representative_row`
+fn project_grouped_row(
+    items: &[SelectItem],
+    representative_row: &[Value],
+    agg_values: &[Value],
+    agg_exprs: &[AggExpr],
+) -> Result<Row, DbError> {
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                return Err(DbError::TypeMismatch {
+                    expected: "column in GROUP BY or aggregate function".into(),
+                    got: "SELECT * (wildcard) with GROUP BY".into(),
+                });
+            }
+            SelectItem::Expr { expr, .. } => {
+                let v = if contains_aggregate(expr) {
+                    eval_with_aggs(expr, representative_row, agg_values, agg_exprs)?
+                } else {
+                    eval(expr, representative_row)?
+                };
+                out.push(v);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Builds `ColumnMeta` for the output of a grouped SELECT.
+fn build_grouped_column_meta(
+    items: &[SelectItem],
+    agg_exprs: &[AggExpr],
+) -> Result<Vec<ColumnMeta>, DbError> {
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                return Err(DbError::TypeMismatch {
+                    expected: "column in GROUP BY or aggregate function".into(),
+                    got: "SELECT * (wildcard) with GROUP BY".into(),
+                });
+            }
+            SelectItem::Expr { expr, alias } => {
+                let name = alias
+                    .clone()
+                    .unwrap_or_else(|| grouped_expr_name(expr, agg_exprs));
+                let (dt, nullable) = grouped_expr_type(expr, agg_exprs);
+                out.push(ColumnMeta {
+                    name,
+                    data_type: dt,
+                    nullable,
+                    table_name: None,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Returns a display name for a grouped SELECT expression.
+fn grouped_expr_name(expr: &Expr, _agg_exprs: &[AggExpr]) -> String {
+    match expr {
+        Expr::Column { name, .. } => name.clone(),
+        Expr::Function { name, args } if is_aggregate(name.as_str()) => {
+            if args.is_empty() {
+                format!("{name}(*)")
+            } else {
+                format!("{name}(...)")
+            }
+        }
+        _ => "?column?".into(),
+    }
+}
+
+/// Infers `(DataType, nullable)` for a grouped SELECT expression.
+/// Aggregate results: COUNT → BigInt non-null; SUM/MIN/MAX/AVG → nullable.
+fn grouped_expr_type(expr: &Expr, _agg_exprs: &[AggExpr]) -> (DataType, bool) {
+    match expr {
+        Expr::Function { name, .. } if is_aggregate(name.as_str()) => match name.as_str() {
+            "count" => (DataType::BigInt, false),
+            "avg" => (DataType::Real, true),
+            _ => (DataType::Text, true), // SUM/MIN/MAX: type depends on column — Text fallback
+        },
+        Expr::Column { .. } => (DataType::Text, true), // Column refs: safe fallback
+        _ => (DataType::Text, true),
+    }
 }
 
 // ── INSERT ────────────────────────────────────────────────────────────────────
