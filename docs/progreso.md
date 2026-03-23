@@ -56,7 +56,7 @@
 - [ ] ⚠️ 3.8b Partial page write detection on open → deferred to Phase 5
 - [ ] ⚠️ Per-page msync optimization (flush_range) → deferred pending profiling
 
-### Phase 4 — SQL Parser + Executor `⏳` week 11-25
+### Phase 4 — SQL Parser + Executor `🔄` week 11-25
 <!--
   DEPENDENCY ORDER (must be respected when planning subfases):
 
@@ -91,23 +91,23 @@
 -->
 
 <!-- ── Group A — Foundations (no dependencies, can start immediately) ── -->
-- [ ] 4.0 ⏳ Row codec — encode/decode `Value[]` ↔ bytes with null_bitmap; covers: BOOL, INT, BIGINT, REAL, DOUBLE, DECIMAL, TEXT, VARCHAR, DATE, TIMESTAMP, NULL
-- [ ] 4.17 ⏳ Expression evaluator — evaluation tree for arithmetic (`+`,`-`,`*`,`/`), booleans (`AND`,`OR`,`NOT`), comparisons (`=`,`<`,`>`), `LIKE`, `BETWEEN`, `IN (list)`, `IS NULL`; **prerequisite for 4.5 — must come before the executor**
-- [ ] 4.17b ⏳ Systematic NULL semantics — `NULL+1=NULL`, `NULL=NULL→UNKNOWN`, `NULL IN(1,2)=NULL`; 3-valued logic (TRUE/FALSE/UNKNOWN); `IS NULL` vs `= NULL`; without this, aggregation queries produce silent wrong results; **prerequisite for 4.5**
+- [x] 4.0 ✅ Row codec — encode/decode `Value[]` ↔ bytes with null_bitmap; covers: BOOL, INT, BIGINT, REAL, DOUBLE, DECIMAL, TEXT, VARCHAR, DATE, TIMESTAMP, NULL
+- [x] 4.17 ✅ Expression evaluator — evaluation tree for arithmetic (`+`,`-`,`*`,`/`), booleans (`AND`,`OR`,`NOT`), comparisons (`=`,`<`,`>`), `LIKE`, `BETWEEN`, `IN (list)`, `IS NULL`; **prerequisite for 4.5 — must come before the executor**
+- [x] 4.17b ✅ Systematic NULL semantics — `NULL+1=NULL`, `NULL=NULL→UNKNOWN`, `NULL IN(1,2)=NULL`; 3-valued logic (TRUE/FALSE/UNKNOWN); `IS NULL` vs `= NULL`; without this, aggregation queries produce silent wrong results; **prerequisite for 4.5**
 
 <!-- ── Group B — Parser (parallel with Group A) ── -->
-- [ ] 4.1 ⏳ AST definitions — syntax tree types (Expr, Stmt, TableRef, ColumnDef nodes)
-- [ ] 4.2 ⏳ Lexer/Tokenizer — SQL tokens with `nom`
-- [ ] 4.2b ⏳ Input sanitization in parser — malformed SQL → clear SQL error, never `panic`; configurable `max_query_size`; fuzz-test immediately after implementation
-- [ ] 4.3 ⏳ DDL Parser — `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`
-- [ ] 4.3a ⏳ Column constraints in DDL — `NOT NULL`, `DEFAULT expr`, `UNIQUE`, `PRIMARY KEY`, `REFERENCES fk`; parsed as part of `CREATE TABLE`
-- [ ] 4.3b ⏳ Basic CHECK constraint in DDL — `CHECK (expr)` at column and table level; evaluated in INSERT/UPDATE
-- [ ] 4.3c ⏳ AUTO_INCREMENT / SERIAL — `INT AUTO_INCREMENT` (MySQL) and `SERIAL` (PG-compat); internal sequence per table; `LAST_INSERT_ID()` returns last value
-- [ ] 4.3d ⏳ Max identifier length — 64-char limit for table/column/index names; clear SQL error when exceeded
-- [ ] 4.4 ⏳ DML Parser — `SELECT`, `INSERT`, `UPDATE`, `DELETE`
+- [x] 4.1 ✅ AST definitions — syntax tree types (Expr, Stmt, TableRef, ColumnDef nodes)
+- [x] 4.2 ✅ Lexer/Tokenizer — logos DFA, ~85 tokens, zero-copy &'src str identifiers
+- [x] 4.2b ✅ Input sanitization in parser — malformed SQL → clear SQL error, never `panic`; configurable `max_query_size`; fuzz-test immediately after implementation
+- [x] 4.3 ✅ DDL Parser — `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`
+- [x] 4.3a ✅ Column constraints in DDL — `NOT NULL`, `DEFAULT expr`, `UNIQUE`, `PRIMARY KEY`, `REFERENCES fk`; parsed as part of `CREATE TABLE`
+- [x] 4.3b ✅ Basic CHECK constraint in DDL — `CHECK (expr)` at column and table level; evaluated in INSERT/UPDATE
+- [x] 4.3c ✅ AUTO_INCREMENT / SERIAL — `INT AUTO_INCREMENT` (MySQL) and `SERIAL` (PG-compat); internal sequence per table; `LAST_INSERT_ID()` returns last value
+- [x] 4.3d ✅ Max identifier length — 64-char limit for table/column/index names; clear SQL error when exceeded
+- [x] 4.4 ✅ DML Parser — `SELECT`, `INSERT`, `UPDATE`, `DELETE`
 
 <!-- ── Group C — Semantic layer (needs Group B + Phase 3 catalog) ── -->
-- [ ] 4.18 ⏳ Semantic analyzer — validate table/column existence against catalog (uses SchemaResolver from 3.14), resolve ambiguities, clear SQL error per violation; **prerequisite for 4.5**
+- [x] 4.18 ✅ Semantic analyzer — validate table/column existence against catalog (uses SchemaResolver from 3.14), resolve ambiguities, clear SQL error per violation; **prerequisite for 4.5**
 - [ ] 4.18b ⏳ Type coercion matrix — rules for `'42'→INT`, `INT→BIGINT`, `DATE→TIMESTAMP`; MySQL-compatible permissive mode vs strict mode; errors on invalid conversions
 - [ ] 4.23 ⏳ QueryResult type — unified executor return: `Rows{columns: Vec<ColumnMeta>, rows: Vec<Row>}` for SELECT, `Affected{count, last_insert_id}` for DML, `Empty` for DDL; basis for Phase 5 wire protocol serialization
 
