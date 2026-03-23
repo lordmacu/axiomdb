@@ -68,6 +68,12 @@ pub enum DbError {
     WalInvalidHeader { path: String },
 
     // ── Transactions ─────────────────────────────────────────────
+    #[error("a transaction is already active (txn_id = {txn_id})")]
+    TransactionAlreadyActive { txn_id: u64 },
+
+    #[error("no active transaction — call begin() first")]
+    NoActiveTransaction,
+
     #[error("deadlock detected between transactions")]
     DeadlockDetected,
 

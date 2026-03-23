@@ -317,6 +317,68 @@ pub fn update_tuple(
     insert_tuple(page, new_data, txn_id)
 }
 
+/// Marks `slot_id` as physically dead by zeroing its [`SlotEntry`].
+///
+/// Used exclusively during transaction **ROLLBACK** to undo an INSERT.
+/// After this call, [`read_tuple`] returns `None` and [`scan_visible`] skips the slot.
+/// The tuple bytes remain in the page body; VACUUM reclaims the space in Phase 7.
+///
+/// # Errors
+/// - [`DbError::InvalidSlot`] if `slot_id >= num_slots`.
+pub fn mark_slot_dead(page: &mut Page, slot_id: u16) -> Result<(), DbError> {
+    let n = num_slots(page);
+    if slot_id >= n {
+        return Err(DbError::InvalidSlot {
+            page_id: page.header().page_id,
+            slot_id,
+            num_slots: n,
+        });
+    }
+    write_slot(
+        page,
+        slot_id,
+        SlotEntry {
+            offset: 0,
+            length: 0,
+        },
+    );
+    page.update_checksum();
+    Ok(())
+}
+
+/// Clears the `txn_id_deleted` field of the tuple at `slot_id` (sets it back to `0`).
+///
+/// Used exclusively during transaction **ROLLBACK** to undo a DELETE.
+/// After this call, the row is live again and visible to future snapshots.
+///
+/// # Errors
+/// - [`DbError::InvalidSlot`] if `slot_id >= num_slots`.
+/// - [`DbError::AlreadyDeleted`] if the slot is already dead (cannot undo a delete on a dead slot).
+pub fn clear_deletion(page: &mut Page, slot_id: u16) -> Result<(), DbError> {
+    let n = num_slots(page);
+    if slot_id >= n {
+        return Err(DbError::InvalidSlot {
+            page_id: page.header().page_id,
+            slot_id,
+            num_slots: n,
+        });
+    }
+    let entry = read_slot(page, slot_id);
+    if entry.is_dead() {
+        return Err(DbError::AlreadyDeleted {
+            page_id: page.header().page_id,
+            slot_id,
+        });
+    }
+    // Clear txn_id_deleted (bytes 8..16 of the RowHeader in the page body).
+    const TXN_DELETED_OFFSET_IN_HEADER: usize = 8;
+    let field_abs = entry.offset as usize + TXN_DELETED_OFFSET_IN_HEADER;
+    page.as_bytes_mut()[field_abs..field_abs + size_of::<u64>()]
+        .copy_from_slice(&0u64.to_le_bytes());
+    page.update_checksum();
+    Ok(())
+}
+
 /// Returns an iterator over `(slot_id, data)` for all tuples visible to `snap`.
 ///
 /// Dead slots and tuples whose [`RowHeader`] is not visible to `snap` are skipped.
