@@ -3,14 +3,14 @@
 //! ## Layout of page 0 body
 //!
 //! ```text
-//! body[0..8]   db_magic: u64 LE        — "NEXUSDB\1" (MmapStorage)
+//! body[0..8]   db_magic: u64 LE        — "AXIOMDB\1" (MmapStorage)
 //! body[8..12]  db_version: u32 LE      — MmapStorage version
 //! body[12..16] _pad: u32
 //! body[16..24] page_count: u64 LE      — MmapStorage manages this
 //! body[24..32] checkpoint_lsn: u64 LE  — LSN of last checkpoint (0 = none)
-//! body[32..40] catalog_tables_root: u64 LE  — nexus_tables heap root page (0 = uninit)
-//! body[40..48] catalog_columns_root: u64 LE — nexus_columns heap root page (0 = uninit)
-//! body[48..56] catalog_indexes_root: u64 LE — nexus_indexes heap root page (0 = uninit)
+//! body[32..40] catalog_tables_root: u64 LE  — axiom_tables heap root page (0 = uninit)
+//! body[40..48] catalog_columns_root: u64 LE — axiom_columns heap root page (0 = uninit)
+//! body[48..56] catalog_indexes_root: u64 LE — axiom_indexes heap root page (0 = uninit)
 //! body[56..60] catalog_schema_ver: u32 LE   — 0 = uninitialized, 1 = v1
 //! body[60..64] _catalog_pad: u32
 //! ```
@@ -76,11 +76,11 @@ pub fn write_checkpoint_lsn(storage: &mut dyn StorageEngine, lsn: u64) -> Result
 
 // ── Catalog header ────────────────────────────────────────────────────────────
 
-/// body offset of `catalog_tables_root` — root heap page for `nexus_tables`.
+/// body offset of `catalog_tables_root` — root heap page for `axiom_tables`.
 pub const CATALOG_TABLES_ROOT_BODY_OFFSET: usize = 32;
-/// body offset of `catalog_columns_root` — root heap page for `nexus_columns`.
+/// body offset of `catalog_columns_root` — root heap page for `axiom_columns`.
 pub const CATALOG_COLUMNS_ROOT_BODY_OFFSET: usize = 40;
-/// body offset of `catalog_indexes_root` — root heap page for `nexus_indexes`.
+/// body offset of `catalog_indexes_root` — root heap page for `axiom_indexes`.
 pub const CATALOG_INDEXES_ROOT_BODY_OFFSET: usize = 48;
 /// body offset of `catalog_schema_ver: u32` — 0 = uninitialized, 1 = v1.
 pub const CATALOG_SCHEMA_VER_BODY_OFFSET: usize = 56;

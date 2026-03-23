@@ -146,7 +146,7 @@ that returns `Err(NoActiveTransaction)` if no txn is open.
 
 ```
 fn delete_table(table_id) -> Result<()>:
-    // Delete from nexus_tables
+    // Delete from axiom_tables
     snap = self.txn.active_snapshot()
     rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, snap)?
     for (page_id, slot_id, data) in rows:
@@ -156,7 +156,7 @@ fn delete_table(table_id) -> Result<()>:
             key = table_id.to_le_bytes()
             self.txn.record_delete(SYSTEM_TABLE_TABLES, &key, &data, page_id, slot_id)?
 
-    // Delete matching columns from nexus_columns
+    // Delete matching columns from axiom_columns
     rows = HeapChain::scan_visible(self.storage, self.page_ids.columns, snap)?
     for (page_id, slot_id, data) in rows:
         def = ColumnDef::from_bytes(&data)?
@@ -164,7 +164,7 @@ fn delete_table(table_id) -> Result<()>:
             HeapChain::delete(self.storage, page_id, slot_id, txn_id)?
             self.txn.record_delete(SYSTEM_TABLE_COLUMNS, &table_id.to_le_bytes(), &data, page_id, slot_id)?
 
-    // Delete matching indexes from nexus_indexes
+    // Delete matching indexes from axiom_indexes
     rows = HeapChain::scan_visible(self.storage, self.page_ids.indexes, snap)?
     for (page_id, slot_id, data) in rows:
         def = IndexDef::from_bytes(&data)?

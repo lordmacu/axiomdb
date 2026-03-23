@@ -73,7 +73,7 @@ Your Application (Rust / C++ / Python / Electron)
 ### Starting the Server
 
 ```bash
-axiomdb-server --data-dir /var/lib/nexusdb --port 3306
+axiomdb-server --data-dir /var/lib/axiomdb --port 3306
 ```
 
 ### Connecting with PHP (PDO)
@@ -81,7 +81,7 @@ axiomdb-server --data-dir /var/lib/nexusdb --port 3306
 ```php
 <?php
 $pdo = new PDO(
-    'mysql:host=127.0.0.1;port=3306;dbname=nexusdb',
+    'mysql:host=127.0.0.1;port=3306;dbname=axiomdb',
     'root',
     '',
     [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
@@ -101,7 +101,7 @@ import pymysql
 conn = pymysql.connect(
     host='127.0.0.1',
     port=3306,
-    db='nexusdb',
+    db='axiomdb',
     charset='utf8mb4',
 )
 
@@ -124,7 +124,7 @@ Add AxiomDB to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-axiomdb-embedded = { path = "../nexusdb/crates/axiomdb-embedded" }
+axiomdb-embedded = { path = "../axiomdb/crates/axiomdb-embedded" }
 ```
 
 ### Open a Database
@@ -183,10 +183,10 @@ db.transaction(|txn| {
 For C, C++, Qt, or Java (JNI):
 
 ```c
-#include "nexusdb.h"
+#include "axiomdb.h"
 
 int main(void) {
-    NexusDb* db = axiomdb_open("./axiomdb.db");
+    AxiomDb* db = axiomdb_open("./axiomdb.db");
     if (!db) { fprintf(stderr, "failed to open\n"); return 1; }
 
     char* result = NULL;
@@ -206,7 +206,7 @@ int main(void) {
 ```python
 import ctypes, json
 
-lib = ctypes.CDLL("./libnexusdb.dylib")
+lib = ctypes.CDLL("./libaxiomdb.dylib")
 lib.axiomdb_open.restype  = ctypes.c_void_p
 lib.axiomdb_close.argtypes = [ctypes.c_void_p]
 lib.axiomdb_execute.restype = ctypes.c_int

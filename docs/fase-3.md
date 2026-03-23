@@ -110,7 +110,7 @@ crates/axiomdb-storage/src/
   heap_chain.rs  — HeapChain multi-page linked list
   meta.rs        — meta page r/w + sequences (alloc_table_id/index_id)
   dirty.rs       — PageDirtyTracker
-  config.rs      — DbConfig (dbyo.toml)
+  config.rs      — DbConfig (axiomdb.toml)
   integrity.rs   — IntegrityChecker + post-recovery checks
 crates/axiomdb-storage/tests/
   integration_storage.rs

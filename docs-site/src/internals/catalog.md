@@ -22,17 +22,17 @@ executor through a consistent, MVCC-aware reader interface.
 
 ## System Tables
 
-The catalog consists of three tables stored in the `nexus` internal schema.
+The catalog consists of three tables stored in the `axiom` internal schema.
 Their structure is described in [Catalog & Schema](../user-guide/features/catalog.md).
 
 | Table             | Contents                                  |
 |-------------------|-------------------------------------------|
-| `nexus_tables`    | One row per user-visible table            |
-| `nexus_columns`   | One row per column, in declaration order  |
-| `nexus_indexes`   | One row per index                         |
+| `axiom_tables`    | One row per user-visible table            |
+| `axiom_columns`   | One row per column, in declaration order  |
+| `axiom_indexes`   | One row per index                         |
 
 These tables are themselves stored in heap pages and indexed by a B+ Tree keyed on
-`(table_id, col_index)` for `nexus_columns` and `table_id` for `nexus_indexes`.
+`(table_id, col_index)` for `axiom_columns` and `table_id` for `axiom_indexes`.
 
 ---
 
@@ -51,14 +51,14 @@ database file (or a file with the meta page uninitialized).
    Initialize the bitmap (all pages allocated so far are marked used).
    Write freelist_root_page into the meta page.
 
-3. Allocate B+ Tree pages for nexus_tables.
-   Insert the row describing nexus_tables into nexus_tables itself.
+3. Allocate B+ Tree pages for axiom_tables.
+   Insert the row describing axiom_tables into axiom_tables itself.
    Write catalog_root_page into the meta page.
 
-4. Allocate B+ Tree pages for nexus_columns.
-   Insert the column definitions for nexus_tables, nexus_columns, nexus_indexes.
+4. Allocate B+ Tree pages for axiom_columns.
+   Insert the column definitions for axiom_tables, axiom_columns, axiom_indexes.
 
-5. Allocate B+ Tree pages for nexus_indexes.
+5. Allocate B+ Tree pages for axiom_indexes.
    Insert the index definitions for the three system tables' own indexes.
 
 6. Write a COMMIT WAL entry with LSN 1.
@@ -114,7 +114,7 @@ pub struct TableDef {
     pub table_name:         String,
 }
 
-// On-disk binary format for nexus_tables rows:
+// On-disk binary format for axiom_tables rows:
 // [table_id:4 LE][data_root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8]
 
 pub struct ColumnDef {
@@ -146,14 +146,14 @@ When the executor processes `CREATE TABLE`, it:
 1. Opens a write transaction (or participates in the current one).
 2. Allocates a new `TableId` from the meta page sequence.
 3. Allocates a `Data` page as the heap root for user row data (`data_root_page_id`).
-4. Inserts a row into `nexus_tables` with `{id, data_root_page_id, schema_name, table_name}`.
-5. Inserts one row per column into `nexus_columns`.
+4. Inserts a row into `axiom_tables` with `{id, data_root_page_id, schema_name, table_name}`.
+5. Inserts one row per column into `axiom_columns`.
 6. Creates B+ Tree pages for the new table's primary key (or first UNIQUE column).
-7. Inserts the index definition into `nexus_indexes`.
+7. Inserts the index definition into `axiom_indexes`.
 8. Appends all these mutations to the WAL.
 9. Commits (or defers the commit to the surrounding transaction).
 
-The `data_root_page_id` stored in `nexus_tables` is used by `TableEngine` (Phase 4.5b)
+The `data_root_page_id` stored in `axiom_tables` is used by `TableEngine` (Phase 4.5b)
 to locate the heap chain for all DML on that table — no extra lookup required.
 
 Because the catalog is stored in heap pages and indexed like any other table, all
@@ -168,9 +168,9 @@ any other table mutation.
 ```
 Page 0:      Meta page (format_version, catalog_root_page, freelist_root_page, ...)
 Page 1:      FreeList bitmap root
-Pages 2–N:   B+ Tree pages for nexus_tables
-Pages N+1–M: Heap pages for nexus_tables row data
-Pages M+1–P: B+ Tree pages for nexus_columns
+Pages 2–N:   B+ Tree pages for axiom_tables
+Pages N+1–M: Heap pages for axiom_tables row data
+Pages M+1–P: B+ Tree pages for axiom_columns
 ...
 Pages P+1–Q: User table data begins here
 ```
@@ -186,10 +186,10 @@ in use, and the meta page records the root page IDs for each catalog B+ Tree.
 The following invariants must hold at all times. The post-recovery integrity checker
 (`axiomdb-embedded::integrity`) verifies them after crash recovery:
 
-1. Every table listed in `nexus_tables` has at least one row in `nexus_columns`.
-2. Every column in `nexus_columns` references a `table_id` that exists in `nexus_tables`.
-3. Every index in `nexus_indexes` references a `table_id` that exists in `nexus_tables`.
-4. Every `root_page_id` in `nexus_indexes` points to a page of type `Index`.
+1. Every table listed in `axiom_tables` has at least one row in `axiom_columns`.
+2. Every column in `axiom_columns` references a `table_id` that exists in `axiom_tables`.
+3. Every index in `axiom_indexes` references a `table_id` that exists in `axiom_tables`.
+4. Every `root_page_id` in `axiom_indexes` points to a page of type `Index`.
 5. Every column listed in an index definition exists in the referenced table.
 6. No two tables in the same schema have the same name.
 7. No two indexes on the same table have the same name.

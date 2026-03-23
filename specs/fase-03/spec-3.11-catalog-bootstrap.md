@@ -3,8 +3,8 @@
 ## What to build (not how)
 
 The physical infrastructure for the database catalog: fixed-location storage of
-root page IDs for the three system tables (`nexus_tables`, `nexus_columns`,
-`nexus_indexes`), plus the in-memory schema types that both bootstrap (3.11)
+root page IDs for the three system tables (`axiom_tables`, `axiom_columns`,
+`axiom_indexes`), plus the in-memory schema types that both bootstrap (3.11)
 and the reader/writer (3.12) share.
 
 ## Meta page extension — catalog header
@@ -17,9 +17,9 @@ body[8..12]  db_version: u32          (existing)
 body[12..16] _pad: u32                (existing)
 body[16..24] page_count: u64          (existing)
 body[24..32] checkpoint_lsn: u64      (3.6)
-body[32..40] catalog_tables_root: u64  ← NEW: root page of nexus_tables heap (0 = uninit)
-body[40..48] catalog_columns_root: u64 ← NEW: root page of nexus_columns heap (0 = uninit)
-body[48..56] catalog_indexes_root: u64 ← NEW: root page of nexus_indexes heap (0 = uninit)
+body[32..40] catalog_tables_root: u64  ← NEW: root page of axiom_tables heap (0 = uninit)
+body[40..48] catalog_columns_root: u64 ← NEW: root page of axiom_columns heap (0 = uninit)
+body[48..56] catalog_indexes_root: u64 ← NEW: root page of axiom_indexes heap (0 = uninit)
 body[56..60] catalog_schema_ver: u32   ← NEW: 0 = uninitialized, 1 = v1 initialized
 body[60..64] _catalog_pad: u32         ← reserved
 ```
@@ -29,7 +29,7 @@ and the root page IDs are valid.
 
 ## System table schema
 
-### nexus_tables (one row per user table)
+### axiom_tables (one row per user table)
 
 ```
 table_id: u32     — unique, auto-incremented from 1 (0 = invalid)
@@ -37,7 +37,7 @@ schema_name: &str — e.g. "public"
 table_name: &str  — e.g. "users"
 ```
 
-### nexus_columns (one row per column)
+### axiom_columns (one row per column)
 
 ```
 table_id: u32
@@ -47,7 +47,7 @@ flags: u8         — bit0 = nullable
 col_name: &str
 ```
 
-### nexus_indexes (one row per index)
+### axiom_indexes (one row per index)
 
 ```
 index_id: u32     — unique, auto-incremented from 1
@@ -122,9 +122,9 @@ Serialization errors: `DbError::ParseError` for invalid bytes.
 
 ```rust
 pub struct CatalogPageIds {
-    pub tables: u64,   // root heap page of nexus_tables
-    pub columns: u64,  // root heap page of nexus_columns
-    pub indexes: u64,  // root heap page of nexus_indexes
+    pub tables: u64,   // root heap page of axiom_tables
+    pub columns: u64,  // root heap page of axiom_columns
+    pub indexes: u64,  // root heap page of axiom_indexes
 }
 
 pub struct CatalogBootstrap;

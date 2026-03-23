@@ -35,7 +35,7 @@ bytes are the page header; the remaining `PAGE_BODY_SIZE = 16,320` bytes are the
 ```text
 Offset   Size   Field            Description
 ──────── ────── ──────────────── ──────────────────────────────────────
-     0      4   magic            0xNEXUS_DB — identifies valid pages
+     0      4   magic            0xAXIOM_DB — identifies valid pages
      4      1   page_type        PageType enum (see below)
      5      3   _pad             alignment padding
      8      4   checksum         CRC32c of bytes [12..PAGE_SIZE)
@@ -233,7 +233,7 @@ Page 0 is the `PageType::Meta` page. It is written during database creation
 ```text
 Offset  Size  Field
      0     8  format_version     — AxiomDB file format version
-     8     8  catalog_root_page  — Page ID of the catalog root (nexus_tables B+ Tree root)
+     8     8  catalog_root_page  — Page ID of the catalog root (axiom_tables B+ Tree root)
     16     8  freelist_root_page — Page ID of the freelist bitmap root
     24     8  next_txn_id        — Next transaction ID to assign
     32     8  checkpoint_lsn     — LSN of the last successful checkpoint

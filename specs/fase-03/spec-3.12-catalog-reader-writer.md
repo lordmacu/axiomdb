@@ -2,8 +2,8 @@
 
 ## What to build (not how)
 
-A read/write API for the three system catalog tables (`nexus_tables`,
-`nexus_columns`, `nexus_indexes`) backed by heap pages allocated in 3.11.
+A read/write API for the three system catalog tables (`axiom_tables`,
+`axiom_columns`, `axiom_indexes`) backed by heap pages allocated in 3.11.
 
 This includes:
 
@@ -23,9 +23,9 @@ This includes:
 To distinguish catalog entries in the WAL without user table_id collisions:
 
 ```
-SYSTEM_TABLE_TABLES  = u32::MAX - 2   // nexus_tables
-SYSTEM_TABLE_COLUMNS = u32::MAX - 1   // nexus_columns
-SYSTEM_TABLE_INDEXES = u32::MAX       // nexus_indexes
+SYSTEM_TABLE_TABLES  = u32::MAX - 2   // axiom_tables
+SYSTEM_TABLE_COLUMNS = u32::MAX - 1   // axiom_columns
+SYSTEM_TABLE_INDEXES = u32::MAX       // axiom_indexes
 ```
 
 User `TableId`s start at 1 and grow upward. The `u32::MAX - N` range is
@@ -147,22 +147,22 @@ impl<'a> CatalogWriter<'a> {
         txn: &'a mut TxnManager,
     ) -> Result<Self, DbError>
 
-    /// Allocates a new TableId, inserts a row in nexus_tables, WAL-logs it.
+    /// Allocates a new TableId, inserts a row in axiom_tables, WAL-logs it.
     /// Returns the allocated TableId.
     pub fn create_table(&mut self, schema: &str, name: &str) -> Result<TableId, DbError>
 
-    /// Inserts a row in nexus_columns. col_idx is set by the caller.
+    /// Inserts a row in axiom_columns. col_idx is set by the caller.
     pub fn create_column(&mut self, def: ColumnDef) -> Result<(), DbError>
 
-    /// Allocates a new IndexId, inserts a row in nexus_indexes, WAL-logs it.
+    /// Allocates a new IndexId, inserts a row in axiom_indexes, WAL-logs it.
     /// Returns the allocated IndexId (u32).
     pub fn create_index(&mut self, def: IndexDef) -> Result<u32, DbError>
 
-    /// Marks all rows in nexus_tables, nexus_columns, and nexus_indexes
+    /// Marks all rows in axiom_tables, axiom_columns, and axiom_indexes
     /// for table_id as deleted. WAL-logs each deletion.
     pub fn delete_table(&mut self, table_id: TableId) -> Result<(), DbError>
 
-    /// Marks the matching row in nexus_indexes as deleted. WAL-logs it.
+    /// Marks the matching row in axiom_indexes as deleted. WAL-logs it.
     pub fn delete_index(&mut self, index_id: u32) -> Result<(), DbError>
 }
 ```

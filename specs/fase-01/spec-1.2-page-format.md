@@ -11,7 +11,7 @@ Foundation of the entire storage engine — all future phases read/write pages.
 ## Constants
 - `PAGE_SIZE = 16_384` (16KB)
 - `HEADER_SIZE = 64` (1 cache line)
-- `PAGE_MAGIC = 0x4E455855_53444200u64` ("NEXUSDB\0")
+- `PAGE_MAGIC = 0x4158494F_4D444200u64` ("AXIOMDB\0")
 
 ## PageHeader layout (64 bytes, repr(C))
 ```

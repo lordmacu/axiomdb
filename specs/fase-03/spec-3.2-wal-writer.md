@@ -24,7 +24,7 @@ for file integrity validation.
 
 ```
 Offset  Size    Field
-     0       8  magic      — 0x4E455855_53574100 ("NEXUSWAL\0" in LE)
+     0       8  magic      — 0x4C41574D_4F495841 ("AXIOMWAL\0" in LE)
      8       2  version    — u16 LE, currently 1
     10       6  _reserved  — zeros, reserved for future flags
 Total: 16 bytes

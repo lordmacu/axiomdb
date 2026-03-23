@@ -4,9 +4,9 @@
 
 | File | Action | What it does |
 |---|---|---|
-| `crates/nexusdb-sql/src/executor.rs` | **create** | `execute()` + all sub-handlers + helpers |
-| `crates/nexusdb-sql/src/lib.rs` | modify | `pub mod executor` + re-export `execute` |
-| `crates/nexusdb-sql/tests/integration_executor.rs` | **create** | End-to-end integration tests |
+| `crates/axiomdb-sql/src/executor.rs` | **create** | `execute()` + all sub-handlers + helpers |
+| `crates/axiomdb-sql/src/lib.rs` | modify | `pub mod executor` + re-export `execute` |
+| `crates/axiomdb-sql/tests/integration_executor.rs` | **create** | End-to-end integration tests |
 
 No new crate. No new dependency (all deps already present from 4.5b).
 
@@ -513,7 +513,7 @@ fn expr_column_name(expr: &Expr, alias: Option<String>) -> String {
 ## Implementation order
 
 1. **Create `executor.rs`** with imports, `execute()`, `dispatch()`, and all sub-functions.
-   `cargo check -p nexusdb-sql` must pass.
+   `cargo check -p axiomdb-sql` must pass.
 
 2. **Export from `lib.rs`**: `pub mod executor; pub use executor::execute;`
 
