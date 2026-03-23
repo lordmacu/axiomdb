@@ -1,0 +1,129 @@
+# AxiomDB Benchmark Stack
+#
+# Runs MySQL 8.0, PostgreSQL 16, and AxiomDB with IDENTICAL resource limits
+# (2 CPU cores, 2 GB RAM) and full durability enabled so comparisons are fair.
+#
+# AxiomDB requires Phase 8 (MySQL wire protocol) to accept external connections.
+# Until then, start only MySQL + PostgreSQL with the 'db' profile:
+#   docker compose --profile db up -d
+#
+# Once Phase 8 is complete, start all three:
+#   docker compose --profile db --profile axiomdb up -d
+#
+# Ports:
+#   MySQL:    localhost:3310
+#   PG:       localhost:5433
+#   AxiomDB:  localhost:3311 (MySQL protocol, Phase 8+)
+#
+# Stop and delete volumes:
+#   docker compose down -v
+
+# ── Resource limits (applied identically to all three) ───────────────────────
+x-resources: &resources
+  deploy:
+    resources:
+      limits:
+        cpus: "2.0"
+        memory: 2G
+      reservations:
+        cpus: "2.0"
+        memory: 2G
+
+services:
+
+  # ── MySQL 8.0 ──────────────────────────────────────────────────────────────
+  mysql:
+    profiles: ["db", "all"]
+    image: mysql:8.0
+    container_name: axiomdb_bench_mysql
+    restart: unless-stopped
+    <<: *resources
+
+    ports:
+      - "3310:3306"
+
+    environment:
+      MYSQL_ROOT_PASSWORD: bench
+      MYSQL_DATABASE: bench
+      MYSQL_ROOT_HOST: "%"
+
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./conf/mysql/my.cnf:/etc/mysql/conf.d/bench.cnf:ro
+
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pbench"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+
+  # ── PostgreSQL 16 ──────────────────────────────────────────────────────────
+  postgres:
+    profiles: ["db", "all"]
+    image: postgres:16
+    container_name: axiomdb_bench_pg
+    restart: unless-stopped
+    <<: *resources
+
+    ports:
+      - "5433:5432"
+
+    environment:
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+      POSTGRES_USER: postgres
+
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./conf/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+
+  # ── AxiomDB (Phase 8+) ─────────────────────────────────────────────────────
+  # Build from repo root: docker compose build axiomdb
+  # NOTE: requires Phase 8 (MySQL wire protocol) for external connections.
+  axiomdb:
+    profiles: ["axiomdb", "all"]
+    build:
+      context: ../..          # repo root — needs full workspace
+      dockerfile: benches/comparison/Dockerfile.axiomdb
+    image: axiomdb:bench
+    container_name: axiomdb_bench_axiomdb
+    restart: unless-stopped
+    <<: *resources
+
+    ports:
+      - "3311:3306"           # MySQL wire protocol (Phase 8+)
+      # - "5434:5432"         # PostgreSQL wire protocol (Phase 9+)
+
+    volumes:
+      - axiomdb_data:/data
+      - ./conf/axiomdb/axiomdb.toml:/etc/axiomdb/axiomdb.toml:ro
+
+    healthcheck:
+      test: ["CMD-SHELL", "axiomdb-server --health-check || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  mysql_data:
+    driver: local
+  pg_data:
+    driver: local
+  axiomdb_data:
+    driver: local
