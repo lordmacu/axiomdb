@@ -6,9 +6,10 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-nexusdb-core = { workspace = true }
-thiserror    = { workspace = true }
-crc32c       = "0.6"
+nexusdb-core    = { workspace = true }
+nexusdb-storage = { workspace = true }
+thiserror       = { workspace = true }
+crc32c          = "0.6"
 
 [dev-dependencies]
 tempfile = { workspace = true }

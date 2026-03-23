@@ -10,8 +10,8 @@ pub mod page;
 pub use engine::StorageEngine;
 pub use freelist::FreeList;
 pub use heap::{
-    delete_tuple, free_space, insert_tuple, read_tuple, scan_visible, update_tuple, RowHeader,
-    SlotEntry, MAX_TUPLE_DATA, MIN_TUPLE_OVERHEAD,
+    clear_deletion, delete_tuple, free_space, insert_tuple, mark_slot_dead, read_tuple,
+    scan_visible, update_tuple, RowHeader, SlotEntry, MAX_TUPLE_DATA, MIN_TUPLE_OVERHEAD,
 };
 pub use memory::MemoryStorage;
 pub use mmap::MmapStorage;
