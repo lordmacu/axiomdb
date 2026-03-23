@@ -22,10 +22,10 @@
 
 .callout-label {
   display: block;
-  font-size: 0.75rem;
+  font-size: 0.95rem;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.07em;
+  letter-spacing: 0.05em;
   margin-bottom: 0.3rem;
 }
 
