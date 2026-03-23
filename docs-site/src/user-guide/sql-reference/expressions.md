@@ -300,6 +300,156 @@ SELECT
 FROM orders;
 ```
 
+---
+
+## CASE WHEN — Conditional Expressions
+
+`CASE WHEN` is a general-purpose conditional expression that can appear anywhere an
+expression is valid: SELECT projections, WHERE clauses, ORDER BY, GROUP BY, HAVING,
+and as arguments to aggregate functions.
+
+AxiomDB supports two forms: **searched CASE** (any boolean condition per branch) and
+**simple CASE** (equality comparison against a single value).
+
+### Searched CASE
+
+Evaluates each `WHEN` condition left to right and returns the `THEN` value of the
+first condition that is TRUE. If no condition matches and an `ELSE` is present, the
+`ELSE` value is returned. If no condition matches and there is no `ELSE`, the result
+is NULL.
+
+```sql
+CASE
+    WHEN condition1 THEN result1
+    WHEN condition2 THEN result2
+    ...
+    [ELSE default_result]
+END
+```
+
+```sql
+-- Categorize orders by total amount
+SELECT
+    id,
+    total,
+    CASE
+        WHEN total < 50    THEN 'small'
+        WHEN total < 200   THEN 'medium'
+        WHEN total < 1000  THEN 'large'
+        ELSE                    'enterprise'
+    END AS order_size
+FROM orders;
+```
+
+```sql
+-- Compute a human-readable status label, including NULL handling
+SELECT
+    id,
+    CASE
+        WHEN shipped_at IS NULL AND status = 'paid' THEN 'awaiting shipment'
+        WHEN shipped_at IS NOT NULL                 THEN 'shipped'
+        WHEN status = 'cancelled'                   THEN 'cancelled'
+        ELSE                                             'unknown'
+    END AS display_status
+FROM orders;
+```
+
+### Simple CASE
+
+Compares a single expression against a list of values. Equivalent to a searched CASE
+using `=` for each `WHEN` comparison.
+
+```sql
+CASE expression
+    WHEN value1 THEN result1
+    WHEN value2 THEN result2
+    ...
+    [ELSE default_result]
+END
+```
+
+```sql
+-- Map status codes to display labels
+SELECT
+    id,
+    CASE status
+        WHEN 'pending'   THEN 'Pending Payment'
+        WHEN 'paid'      THEN 'Paid'
+        WHEN 'shipped'   THEN 'Shipped'
+        WHEN 'delivered' THEN 'Delivered'
+        WHEN 'cancelled' THEN 'Cancelled'
+        ELSE                  'Unknown'
+    END AS status_label
+FROM orders;
+```
+
+### NULL Semantics in CASE
+
+In a **searched CASE**, a `WHEN` condition that evaluates to UNKNOWN (NULL in boolean
+context) is treated the same as FALSE — it does not match, and evaluation continues
+to the next branch. This means a NULL condition never triggers a `THEN` clause.
+
+In a **simple CASE**, the comparison `expression = value` uses standard SQL equality,
+which returns UNKNOWN when either side is NULL. As a result, `WHEN NULL` never matches.
+Use a searched CASE with `IS NULL` to handle NULL values explicitly.
+
+```sql
+-- Simple CASE: WHEN NULL never matches (NULL <> NULL in equality)
+SELECT CASE NULL WHEN NULL THEN 'matched' ELSE 'no match' END;
+-- Result: 'no match'
+
+-- Correct way to handle NULL in a simple CASE: use searched form
+SELECT
+    CASE
+        WHEN status IS NULL THEN 'no status'
+        ELSE status
+    END AS safe_status
+FROM orders;
+```
+
+### CASE in ORDER BY — Controlled Sort Order
+
+`CASE` can produce a sort key that cannot be expressed with a single column reference.
+
+```sql
+-- Sort orders: unshipped first (status='paid'), then by recency
+SELECT id, status, placed_at
+FROM orders
+ORDER BY
+    CASE WHEN status = 'paid' AND shipped_at IS NULL THEN 0 ELSE 1 END,
+    placed_at DESC;
+```
+
+### CASE in GROUP BY — Dynamic Grouping
+
+```sql
+-- Group products by price tier and count items per tier
+SELECT
+    CASE
+        WHEN price < 25   THEN 'budget'
+        WHEN price < 100  THEN 'mid-range'
+        ELSE                   'premium'
+    END      AS tier,
+    COUNT(*) AS product_count,
+    AVG(price) AS avg_price
+FROM products
+WHERE deleted_at IS NULL
+GROUP BY
+    CASE
+        WHEN price < 25   THEN 'budget'
+        WHEN price < 100  THEN 'mid-range'
+        ELSE                   'premium'
+    END
+ORDER BY avg_price;
+```
+
+> **Design note:** AxiomDB evaluates `CASE` expressions during row processing in the
+> executor's expression evaluator. Short-circuit evaluation guarantees that branches
+> after the first matching `WHEN` are never evaluated, which prevents side effects
+> (e.g., division by zero in an unreachable branch).
+
+---
+
 ### Date / Time Functions
 
 | Function                        | Description                              |

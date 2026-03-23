@@ -25,10 +25,14 @@ prevents circular dependencies and makes each component independently testable.
 │  ├── parser    (recursive descent, LL(1)/LL(2))                     │
 │  ├── ast       (Stmt, Expr, SelectStmt, InsertStmt, ...)            │
 │  ├── analyzer  (BindContext, col_idx resolution, catalog lookup)    │
-│  ├── eval      (expression evaluator, three-valued NULL logic)      │
+│  ├── eval      (expression evaluator, three-valued NULL logic,      │
+│  │              CASE WHEN searched + simple form, short-circuit)    │
 │  ├── result    (QueryResult, ColumnMeta, Row — executor return type)│
 │  ├── table     (TableEngine — scan/insert/delete/update over heap)  │
-│  └── executor  (execute() — SELECT/INSERT/UPDATE/DELETE/DDL/txn)    │
+│  └── executor  (execute() — SELECT/INSERT/UPDATE/DELETE/DDL/txn;   │
+│                 GROUP BY + COUNT/SUM/MIN/MAX/AVG, HAVING,          │
+│                 ORDER BY multi-column + NULLS FIRST/LAST,          │
+│                 LIMIT/OFFSET, SELECT DISTINCT, INSERT … SELECT)    │
 │                                                                     │
 │  [query planner, optimizer — Phase 6]                               │
 └──────────────────────────────┬──────────────────────────────────────┘
@@ -157,12 +161,23 @@ The SQL processing pipeline:
   `CreateTableStmt`, `CreateIndexStmt`, `DropTableStmt`, `DropIndexStmt`, `AlterTableStmt`
 - `expr` — `Expr` enum for the expression tree: `BinaryOp`, `UnaryOp`, `Column`,
   `Literal`, `IsNull`, `Between`, `Like`, `In`, `Case`, `Function`
-- `parser` — recursive descent; expression sub-parser with full operator precedence
+- `parser` — recursive descent; expression sub-parser with full operator precedence;
+  parses `GROUP BY`, `HAVING`, `ORDER BY` with `NULLS FIRST/LAST`, `LIMIT/OFFSET`,
+  `SELECT DISTINCT`, `INSERT … SELECT`, and both forms of `CASE WHEN`
 - `analyzer` — `BindContext` / `BoundTable`; resolves `col_idx` for JOINs
-- `eval` — expression evaluator with three-valued NULL logic
+- `eval` — expression evaluator with three-valued NULL logic; implements searched
+  CASE (arbitrary boolean conditions) and simple CASE (equality dispatch) with
+  short-circuit evaluation — unreachable branches are never evaluated
 - `result` — `QueryResult` enum (`Rows` / `Affected` / `Empty`), `ColumnMeta`
   (name, data_type, nullable, table_name), `Row = Vec<Value>`; the contract
   between the executor and all callers (embedded API, wire protocol, CLI)
+- `executor` — interprets analyzed statements against live storage; Phase 4 Group E
+  capabilities: `GROUP BY` with hash-based aggregation (`COUNT(*)`, `COUNT(col)`,
+  `SUM`, `MIN`, `MAX`, `AVG` with proper NULL exclusion), `HAVING` post-filter,
+  `ORDER BY` with multi-column sort keys and per-column `NULLS FIRST/LAST` control,
+  `LIMIT n OFFSET m` for pagination, `SELECT DISTINCT` with NULL-equality dedup
+  (two NULL values are considered equal for deduplication), and `INSERT … SELECT`
+  for bulk copy and aggregate materialization
 
 ### axiomdb-server
 
