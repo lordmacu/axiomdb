@@ -3,9 +3,9 @@ use std::{
     path::Path,
 };
 
+use axiomdb_core::error::DbError;
 use fs2::FileExt;
 use memmap2::MmapMut;
-use axiomdb_core::error::DbError;
 use tracing::{debug, info, warn};
 
 use crate::{

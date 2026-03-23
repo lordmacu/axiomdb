@@ -61,7 +61,7 @@ The name reflects exactly that: the axiom between data and the world.
 
 ## Target benchmarks
 
-| Operation           | dbyo         | MySQL 8.0    | Delta   |
+| Operation           | AxiomDB      | MySQL 8.0    | Delta   |
 |---------------------|--------------|--------------|---------|
 | Point lookup PK     | 800k ops/s   | 350k ops/s   | +128%   |
 | Range scan 10K rows | 45ms         | 120ms        | -62%    |

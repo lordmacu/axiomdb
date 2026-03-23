@@ -2,8 +2,8 @@
 //!
 //! Measures: rows/second and MB/second for typical row shapes.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use axiomdb_types::{decode_row, encode_row, encoded_len, DataType, Value};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 // ── Shared row fixtures ────────────────────────────────────────────────────────
 

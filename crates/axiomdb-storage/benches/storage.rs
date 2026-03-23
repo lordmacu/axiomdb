@@ -1,7 +1,7 @@
+use axiomdb_storage::{MemoryStorage, MmapStorage, Page, PageType, StorageEngine};
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
-use axiomdb_storage::{MemoryStorage, MmapStorage, Page, PageType, StorageEngine};
 use tempfile::tempdir;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

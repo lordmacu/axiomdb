@@ -30,7 +30,7 @@ pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lexer::{tokenize, Span, SpannedToken, Token};
 // Note: Token<'src> and SpannedToken<'src> carry a lifetime tied to the input string.
 pub use analyzer::analyze;
+pub use executor::execute;
 pub use parser::parse;
 pub use result::{ColumnMeta, QueryResult, Row};
-pub use executor::execute;
 pub use table::TableEngine;

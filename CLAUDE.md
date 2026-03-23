@@ -150,7 +150,7 @@ Save in `specs/fase-N/plan-nombre.md`:
 # Plan: [name]
 
 ## Files to create/modify
-- `crates/dbyo-X/src/Y.rs` — [what it does]
+- `crates/axiomdb-X/src/Y.rs` — [what it does]
 
 ## Algorithm / Data structure
 [pseudocode of the approach]
@@ -448,7 +448,7 @@ feat(fase-N): concise description
 - detail 2
 
 Phase N/34 completed. See docs/fase-N.md
-Spec: specs/fase-N/ | Tests: crates/dbyo-X/tests/
+Spec: specs/fase-N/ | Tests: crates/axiomdb-X/tests/
 ```
 
 ### GitHub account
@@ -667,10 +667,10 @@ let page = unsafe { &*(ptr as *const Page) };
 
 ```bash
 # 1. Create structure
-cargo new --lib crates/dbyo-X
+cargo new --lib crates/axiomdb-X
 
 # 2. Add to the workspace in the root Cargo.toml
-# members = [..., "crates/dbyo-X"]
+# members = [..., "crates/axiomdb-X"]
 
 # 3. Define ONLY public types and traits in src/lib.rs
 
@@ -681,7 +681,7 @@ cargo new --lib crates/dbyo-X
 
 Verify there are no circular dependencies:
 ```bash
-cargo tree --workspace | grep "dbyo-X"
+cargo tree --workspace | grep "axiomdb-X"
 ```
 
 ---
@@ -891,7 +891,7 @@ fn bench_point_lookup(b: &mut Bencher) {
 ## Project structure
 
 ```
-dbyo/
+axiomdb/
 ├── CLAUDE.md              ← this file (workflow)
 ├── db.md                  ← complete design (source of truth)
 ├── Cargo.toml             ← workspace root
@@ -905,8 +905,8 @@ dbyo/
 │   ├── README.md
 │   └── fase-01.md         ← created when the phase is completed
 ├── crates/                ← code
-│   ├── dbyo-core/
-│   ├── dbyo-storage/
+│   ├── axiomdb-core/
+│   ├── axiomdb-storage/
 │   └── ...
 ├── tests/                 ← integration tests
 ├── benches/               ← benchmarks with criterion

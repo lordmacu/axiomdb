@@ -138,7 +138,7 @@ connects directly without modifications.
 ### Crate Structure
 
 ```
-dbyo/
+axiomdb/
 ├── Cargo.toml
 ├── src/
 │   ├── lib.rs          ← Public Rust API + C FFI
@@ -178,7 +178,7 @@ impl Database {
 use std::ffi::{CStr, CString};
 
 #[no_mangle]
-pub extern "C" fn dbyo_open(path: *const c_char) -> *mut Database {
+pub extern "C" fn axiomdb_open(path: *const c_char) -> *mut Database {
     let path = unsafe { CStr::from_ptr(path) }.to_str().unwrap();
     match Database::open(path) {
         Ok(db) => Box::into_raw(Box::new(db)),
@@ -187,7 +187,7 @@ pub extern "C" fn dbyo_open(path: *const c_char) -> *mut Database {
 }
 
 #[no_mangle]
-pub extern "C" fn dbyo_execute(
+pub extern "C" fn axiomdb_execute(
     db: *mut Database,
     sql: *const c_char,
     out_json: *mut *mut c_char,  // result as JSON
@@ -197,7 +197,7 @@ pub extern "C" fn dbyo_execute(
 }
 
 #[no_mangle]
-pub extern "C" fn dbyo_close(db: *mut Database) {
+pub extern "C" fn axiomdb_close(db: *mut Database) {
     if !db.is_null() {
         unsafe { drop(Box::from_raw(db)) };
     }
@@ -208,13 +208,13 @@ pub extern "C" fn dbyo_close(db: *mut Database) {
 
 ```toml
 [lib]
-name = "dbyo"
+name = "axiomdb"
 crate-type = ["cdylib", "rlib"]
 # cdylib → .so (Linux) / .dll (Windows) / .dylib (macOS) for C FFI
 # rlib   → Rust library for native Rust apps
 
 [[bin]]
-name = "dbyo-server"
+name = "axiomdb-server"
 path = "src/server.rs"
 # The TCP server runs as an independent binary
 ```
@@ -224,23 +224,23 @@ path = "src/server.rs"
 **Python (ctypes):**
 ```python
 import ctypes
-db = ctypes.CDLL("./libdbyo.so")
-conn = db.dbyo_open(b"./axiomdb.db")
-db.dbyo_execute(conn, b"SELECT * FROM users WHERE id = 1", ...)
-db.dbyo_close(conn)
+db = ctypes.CDLL("./libaxiomdb.so")
+conn = db.axiomdb_open(b"./axiomdb.db")
+db.axiomdb_execute(conn, b"SELECT * FROM users WHERE id = 1", ...)
+db.axiomdb_close(conn)
 ```
 
 **C++ / Qt:**
 ```cpp
-#include "dbyo.h"
-auto* db = dbyo_open("./axiomdb.db");
-dbyo_execute(db, "INSERT INTO logs VALUES (1, 'inicio')", &result);
-dbyo_close(db);
+#include "axiomdb.h"
+auto* db = axiomdb_open("./axiomdb.db");
+axiomdb_execute(db, "INSERT INTO logs VALUES (1, 'inicio')", &result);
+axiomdb_close(db);
 ```
 
 **Electron / Node.js (via Neon):**
 ```js
-const { Database } = require('./dbyo-node');
+const { Database } = require('./axiomdb-node');
 const db = new Database('./axiomdb.db');
 const rows = db.execute('SELECT * FROM products LIMIT 10');
 ```
@@ -3115,8 +3115,8 @@ Wire protocol: **Scram-SHA-256** (estándar PostgreSQL moderno, nunca envía el 
 # axiomdb.toml
 [tls]
 enabled  = true
-cert     = "/etc/dbyo/server.crt"
-key      = "/etc/dbyo/server.key"
+cert     = "/etc/axiomdb/server.crt"
+key      = "/etc/axiomdb/server.key"
 min_version = "TLS1.3"
 require_client_cert = false   # true para mTLS
 ```
@@ -3376,7 +3376,7 @@ impl StatCollector {
 [logging]
 slow_query_log       = true
 slow_query_threshold = "100ms"
-log_file             = "/var/log/dbyo/slow.log"
+log_file             = "/var/log/axiomdb/slow.log"
 log_format           = "json"   # o "text"
 ```
 
@@ -4410,7 +4410,7 @@ Fase 9 — DuckDB-inspired            (semana 13-14)
 
 Fase 10 — Modo embebido + FFI       (semana 15-16)
   ✓ Refactor del motor como crate reutilizable (lib.rs)
-  ✓ C FFI: dbyo_open / dbyo_execute / dbyo_close
+  ✓ C FFI: axiomdb_open / axiomdb_execute / axiomdb_close
   ✓ Compilar como cdylib (.so / .dll / .dylib)
   ✓ Binding Python (ctypes) para pruebas
   ✓ Binding Node.js via Neon (opcional, para Electron)
@@ -4614,7 +4614,7 @@ Fase 22 — Features de producto      (semana 40-42)
   ✓ Foreign Data Wrappers: CREATE FOREIGN TABLE ... SERVER
   ✓ Multi-database: CREATE DATABASE, USE, cross-database queries
   ✓ Schema namespacing: CREATE SCHEMA, schema.tabla
-  ✓ Schema migrations CLI: dbyo migrate up/down/status
+  ✓ Schema migrations CLI: axiomdb migrate up/down/status
   ✓ GraphQL API nativa — puerto :3308, schema autodescubierto, queries/mutations/subscriptions
   ✓ GraphQL subscriptions vía WAL stream — WebSocket, eventos en tiempo real sin polling
   ✓ GraphQL DataLoader integrado — batch loading automático, cero N+1
@@ -5024,7 +5024,7 @@ Fase 23 — Retrocompatibilidad       (semana 43-45)
   ✓ ATTACH sqlite_file AS src USING sqlite
   ✓ Migración desde MySQL: conectar live + leer INFORMATION_SCHEMA
   ✓ Migración desde PostgreSQL: conectar live vía tokio-postgres
-  ✓ CLI: dbyo migrate from-mysql / from-postgres / from-sqlite
+  ✓ CLI: axiomdb migrate from-mysql / from-postgres / from-sqlite
   ✓ PostgreSQL wire protocol en puerto 5432 (psql, psycopg2, pgx)
   ✓ Puerto 3306 MySQL + Puerto 5432 PostgreSQL simultáneos
   ✓ HSTORE — tipo key-value de PostgreSQL, necesario para migración transparente de schemas existentes
@@ -5212,8 +5212,8 @@ Fase 34 — Infraestructura distribuida y completitud  (semana 77-80)
   ✓ Synchronous commit: off, local, remote_write, remote_apply
   ✓ Cascading replication: primary → réplica → sub-réplicas
   ✓ Logical decoding API: pg_logical_slot_get_changes() con plugin JSON
-  ✓ Logical output plugins: dbyo_json, wal2json compatible
-  ✓ DSN estándar: dbyo://, postgres://, mysql:// + DATABASE_URL env var
+  ✓ Logical output plugins: axiomdb_json, wal2json compatible
+  ✓ DSN estándar: axiomdb://, postgres://, mysql:// + DATABASE_URL env var
   ✓ Extensions system: CREATE/DROP/ALTER EXTENSION + pg_available_extensions
   ✓ Extensiones WASM: CREATE EXTENSION FROM FILE '*.wasm'
   ✓ Online VACUUM sin locks: Normal, Concurrent (sin downtime), Full
@@ -5222,7 +5222,7 @@ Fase 34 — Infraestructura distribuida y completitud  (semana 77-80)
   ✓ Parallel DDL: CREATE TABLE AS SELECT WITH PARALLEL N
   ✓ REFRESH MATERIALIZED VIEW CONCURRENTLY WITH PARALLEL N
   ✓ pg_stat_progress_create_index: ver progreso de index build
-  ✓ pgbench equivalente: dbyo-bench con escenarios OLTP estándar
+  ✓ pgbench equivalente: axiomdb-bench con escenarios OLTP estándar
   ✓ SQLSTATE codes: códigos de error estándar SQL para compatibilidad con ORMs
   ✓ Arrow Flight: servidor gRPC en puerto :8815 para streaming columnar de alta velocidad (100M rows en segundos)
   ✓ Arrow Flight — do_get(ticket): stream de RecordBatches desde cualquier query SQL
@@ -5239,11 +5239,11 @@ Fase 34 — Infraestructura distribuida y completitud  (semana 77-80)
 Fase 35 — Deployment y DevEx        (semana 81-83)
   ✓ Dockerfile multi-stage: builder Rust + runtime debian-slim mínimo
   ✓ docker-compose.yml: setup completo con volúmenes y healthcheck
-  ✓ systemd service: dbyo.service para Linux producción
+  ✓ systemd service: axiomdb.service para Linux producción
   ✓ axiomdb.toml completo: red, storage, auth, TLS, timeouts, logging, AI, replicación
   ✓ Log levels y rotación: trace/debug/info/warn/error + daily/size rotation
-  ✓ dbyo-client crate: SDK oficial Rust con pool, tipos fuertes, transacciones
-  ✓ Python package: pip install dbyo-python, API estilo psycopg2
+  ✓ axiomdb-client crate: SDK oficial Rust con pool, tipos fuertes, transacciones
+  ✓ Python package: pip install axiomdb-python, API estilo psycopg2
   ✓ GitHub Actions CI: test + clippy + fuzz + bench en cada PR
   ✓ [DESKTOP/WIN] axiomdb.dll precompilado para x86_64-pc-windows-msvc — descargable desde GitHub Releases
   ✓ [DESKTOP/WIN] Instalador .msi (WiX Toolset) para modo servidor local: instala como Windows Service
@@ -5264,7 +5264,7 @@ Fase 35 — Deployment y DevEx        (semana 81-83)
   ✓ Compilado como .dll (Windows) / .so (Linux) / .dylib (macOS) — registrable en unixODBC / iODBC / Windows ODBC Manager
   ✓ Se conecta internamente vía PostgreSQL wire protocol — reutiliza axiomdb-network sin duplicar lógica
   ✓ Habilitadores: Excel (Get Data), R (DBI + odbc), pyodbc, Tableau, SAP, Access, SSRS
-  ✓ dbyo-odbc-installer: CLI que registra el driver en el ODBC Manager del sistema automáticamente
+  ✓ axiomdb-odbc-installer: CLI que registra el driver en el ODBC Manager del sistema automáticamente
   ✓ Paquete .deb (Ubuntu/Debian): axiomdb-server_X.Y.Z_amd64.deb — instala binario, usuario sistema, servicio systemd
   ✓ Paquete .rpm (RHEL/CentOS/Fedora/AlmaLinux): axiomdb-server-X.Y.Z.x86_64.rpm — equivalente para distros RPM
   ✓ Repositorio APT oficial: deb [signed-by] https://pkg.axiomdb.io/apt stable main
@@ -5640,31 +5640,31 @@ JOIN analytics.public.scores a ON v.id = a.order_id;
 
 ```bash
 # Inicializar sistema de migrations
-dbyo migrate init
+axiomdb migrate init
 
 # Crear nueva migration
-dbyo migrate new "agregar_columna_activo_a_users"
+axiomdb migrate new "agregar_columna_activo_a_users"
 # → crea migrations/0001_agregar_columna_activo_a_users.sql
 
 # Aplicar migrations pendientes
-dbyo migrate up
+axiomdb migrate up
 
 # Revertir última migration
-dbyo migrate down
+axiomdb migrate down
 
 # Estado actual
-dbyo migrate status
+axiomdb migrate status
 # 0001_init                    ✓ applied  2026-03-01
 # 0002_add_roles               ✓ applied  2026-03-10
 # 0003_agregar_columna_activo  ✗ pending
 
 # Ir a versión específica
-dbyo migrate to 0002
+axiomdb migrate to 0002
 ```
 
 ```sql
 -- Tabla interna de control
-CREATE TABLE _dbyo_migrations (
+CREATE TABLE _axiomdb_migrations (
   version    INT PRIMARY KEY,
   name       TEXT NOT NULL,
   applied_at TIMESTAMP DEFAULT NOW(),
@@ -5750,7 +5750,7 @@ fn read_sqlite(path: &str) -> Result<impl ForeignDataWrapper> {
 
 ```bash
 # CLI — migración completa
-dbyo migrate from-mysql \
+axiomdb migrate from-mysql \
   --host     localhost  \
   --port     3306       \
   --user     root       \
@@ -5806,13 +5806,13 @@ Crate: `mysql_async = "0.34"`.
 ### Migración desde PostgreSQL
 
 ```bash
-dbyo migrate from-postgres \
+axiomdb migrate from-postgres \
   --conn "postgresql://user:pass@host:5432/sourcedb" \
   --schema public \
   --target axiomdb_migrated
 
 # También acepta pg_dump:
-dbyo source dump.sql   # pg_dump --format=plain
+axiomdb source dump.sql   # pg_dump --format=plain
 ```
 
 ```rust
@@ -6660,9 +6660,9 @@ ON table_rewrite       -- cuando se reescribe una tabla (VACUUM FULL, ALTER TYPE
 
 ```sql
 -- Definir ubicaciones de almacenamiento
-CREATE TABLESPACE nvme  LOCATION '/mnt/nvme/dbyo';   -- SSD rápido
-CREATE TABLESPACE sata  LOCATION '/mnt/sata/dbyo';   -- HDD normal
-CREATE TABLESPACE cold  LOCATION '/mnt/cold/dbyo';   -- almacenamiento frío
+CREATE TABLESPACE nvme  LOCATION '/mnt/nvme/axiomdb';   -- SSD rápido
+CREATE TABLESPACE sata  LOCATION '/mnt/sata/axiomdb';   -- HDD normal
+CREATE TABLESPACE cold  LOCATION '/mnt/cold/axiomdb';   -- almacenamiento frío
 
 -- Asignar objetos a tablespaces
 CREATE TABLE logs (...) TABLESPACE cold;              -- datos fríos en HDD
@@ -6721,7 +6721,7 @@ ALTER USER bot SET work_mem = '16MB';
 -- Cambiar globalmente (persiste al reiniciar)
 ALTER SYSTEM SET max_connections = 200;
 ALTER SYSTEM SET shared_buffers = '512MB';
-SELECT dbyo_reload_config();      -- aplicar sin reiniciar
+SELECT axiomdb_reload_config();      -- aplicar sin reiniciar
 
 -- Ver de dónde viene cada valor
 SELECT name, setting, source, context FROM pg_settings WHERE name = 'max_connections';
@@ -7314,7 +7314,7 @@ SELECT * FROM pg_logical_slot_get_changes('mi_cdc_slot', NULL, NULL);
 ```rust
 struct LogicalReplicationSlot {
     name:        String,
-    plugin:      String,          // decodificador: 'dbyo_output', 'wal2json'
+    plugin:      String,          // decodificador: 'axiomdb_output', 'wal2json'
     restart_lsn: AtomicU64,       // WAL se guarda desde aquí
     confirmed:   AtomicU64,       // hasta aquí el consumidor confirmó
 }
@@ -7344,9 +7344,9 @@ impl WalDecoder {
 # axiomdb.toml
 [tls]
 enabled      = true
-cert         = "/etc/dbyo/server.crt"
-key          = "/etc/dbyo/server.key"
-ca           = "/etc/dbyo/ca.crt"
+cert         = "/etc/axiomdb/server.crt"
+key          = "/etc/axiomdb/server.key"
+ca           = "/etc/axiomdb/ca.crt"
 verify_client = true   # mTLS: el cliente también presenta certificado
 
 [auth]
@@ -7381,15 +7381,15 @@ Un crate por responsabilidad → compilación paralela → tests aislados → l�
 ```
 
 ```
-dbyo/                           ← workspace root
+axiomdb/                           ← workspace root
 ├── Cargo.toml                  ← workspace manifest
 ├── crates/
-│   ├── dbyo-core/              ← tipos base, errores, traits — SIN dependencias
-│   ├── dbyo-types/             ← Value enum, DataType, collation, encoding
-│   ├── dbyo-storage/           ← mmap, páginas, free list, TOAST
-│   ├── dbyo-wal/               ← WAL writer/reader, crash recovery
-│   ├── dbyo-index/             ← B+ Tree CoW, HNSW, GIN, GiST, BRIN, Hash, FTS
-│   ├── dbyo-mvcc/              ← transacciones, snapshot isolation, SSI, locks
+│   ├── axiomdb-core/              ← tipos base, errores, traits — SIN dependencias
+│   ├── axiomdb-types/             ← Value enum, DataType, collation, encoding
+│   ├── axiomdb-storage/           ← mmap, páginas, free list, TOAST
+│   ├── axiomdb-wal/               ← WAL writer/reader, crash recovery
+│   ├── axiomdb-index/             ← B+ Tree CoW, HNSW, GIN, GiST, BRIN, Hash, FTS
+│   ├── axiomdb-mvcc/              ← transacciones, snapshot isolation, SSI, locks
 │   ├── dbyo-catalog/           ← schema, estadísticas, information_schema
 │   ├── dbyo-sql/               ← parser (nom), AST, planner, optimizer, executor
 │   ├── dbyo-functions/         ← todas las funciones built-in (string, math, date)
@@ -7402,7 +7402,7 @@ dbyo/                           ← workspace root
 │   ├── dbyo-vector/            ← VECTOR(n), HNSW, cuantización, similitud
 │   ├── dbyo-migrations/        ← CLI de migrations, schema versioning
 │   ├── dbyo-sync/              ← Mobile sync layer: HLC, delta sync, CRDTs, conflict resolution [Fase 36]
-│   ├── dbyo-server/            ← binario: modo servidor (TCP daemon)
+│   ├── axiomdb-server/            ← binario: modo servidor (TCP daemon)
 │   └── dbyo-embedded/          ← cdylib: modo embebido + C FFI + flutter_rust_bridge [Fase 10]
 │   └── dbyo-odbc/              ← cdylib: driver ODBC para Excel, R, SAP, Tableau [Fase 35]
 │   └── dbyo-graph/             ← Graph layer: SQL/PGQ, traversal, algorithms [Fase 37]
@@ -7419,15 +7419,15 @@ dbyo/                           ← workspace root
 ### Dependencias entre crates (sin ciclos)
 
 ```
-dbyo-core  ←──────────────────── base de todo (sin deps externas)
+axiomdb-core  ←──────────────────── base de todo (sin deps externas)
     ↑
-dbyo-types ←──────────────────── Value, DataType, collation
+axiomdb-types ←──────────────────── Value, DataType, collation
     ↑
-dbyo-storage  dbyo-wal           I/O físico
+axiomdb-storage  axiomdb-wal           I/O físico
     ↑              ↑
-dbyo-index ←──────┘              índices sobre storage + WAL
+axiomdb-index ←──────┘              índices sobre storage + WAL
     ↑
-dbyo-mvcc  ←──────────────────── transacciones sobre índices
+axiomdb-mvcc  ←──────────────────── transacciones sobre índices
     ↑
 dbyo-catalog ─────────────────── schema + estadísticas
     ↑
@@ -7441,7 +7441,7 @@ dbyo-replication ─────────────── WAL streaming + l
     ↑              ↑
 dbyo-network   dbyo-sync ──────── Mobile sync (HLC, delta, CRDTs) [Fase 36]
     ↑              ↑
-dbyo-server   dbyo-embedded   dbyo-odbc   entry points (server / mobile / ODBC)
+axiomdb-server   dbyo-embedded   dbyo-odbc   entry points (server / mobile / ODBC)
               dbyo-sync       dbyo-graph  sync layer / graph layer
               dbyo-studio                web UI (Axum + HTMX)
 ```
@@ -7449,7 +7449,7 @@ dbyo-server   dbyo-embedded   dbyo-odbc   entry points (server / mobile / ODBC)
 ### Trait central: StorageEngine
 
 ```rust
-// dbyo-core/src/traits.rs
+// axiomdb-core/src/traits.rs
 // Todo el motor depende de este trait, no de implementaciones concretas
 
 pub trait StorageEngine: Send + Sync {
@@ -7489,7 +7489,7 @@ pub struct FtsIndex    { .. }
 ### Engine central — punto de entrada único
 
 ```rust
-// dbyo-core/src/engine.rs
+// axiomdb-core/src/engine.rs
 pub struct Engine {
     // Storage
     storage:     Arc<dyn StorageEngine>,
@@ -7586,7 +7586,7 @@ impl WalSubscriber for AuditLogger        { .. }   // registrar cambios
 ### Estructura de un crate típico
 
 ```
-crates/dbyo-storage/
+crates/axiomdb-storage/
 ├── Cargo.toml
 ├── src/
 │   ├── lib.rs          ← re-exports públicos
@@ -7609,31 +7609,31 @@ crates/dbyo-storage/
 [workspace]
 resolver = "2"
 members = [
-    "crates/dbyo-core",
-    "crates/dbyo-types",
-    "crates/dbyo-storage",
-    "crates/dbyo-wal",
-    "crates/dbyo-index",
-    "crates/dbyo-mvcc",
-    "crates/dbyo-catalog",
-    "crates/dbyo-sql",
-    "crates/dbyo-functions",
-    "crates/dbyo-network",
-    "crates/dbyo-security",
-    "crates/dbyo-replication",
-    "crates/dbyo-plugins",
-    "crates/dbyo-cache",
-    "crates/dbyo-geo",
-    "crates/dbyo-vector",
-    "crates/dbyo-migrations",
-    "crates/dbyo-sync",
-    "crates/dbyo-odbc",
-    "crates/dbyo-graph",
-    "crates/dbyo-studio",
-    "crates/dbyo-rest",
-    "crates/dbyo-kafka",
-    "crates/dbyo-server",
-    "crates/dbyo-embedded",
+    "crates/axiomdb-core",
+    "crates/axiomdb-types",
+    "crates/axiomdb-storage",
+    "crates/axiomdb-wal",
+    "crates/axiomdb-index",
+    "crates/axiomdb-mvcc",
+    "crates/axiomdb-catalog",
+    "crates/axiomdb-sql",
+    "crates/axiomdb-functions",
+    "crates/axiomdb-network",
+    "crates/axiomdb-security",
+    "crates/axiomdb-replication",
+    "crates/axiomdb-plugins",
+    "crates/axiomdb-cache",
+    "crates/axiomdb-geo",
+    "crates/axiomdb-vector",
+    "crates/axiomdb-migrations",
+    "crates/axiomdb-sync",
+    "crates/axiomdb-odbc",
+    "crates/axiomdb-graph",
+    "crates/axiomdb-studio",
+    "crates/axiomdb-rest",
+    "crates/axiomdb-kafka",
+    "crates/axiomdb-server",
+    "crates/axiomdb-embedded",
     "tools/dbyo-cli",
     "tools/dbyo-migrate",
 ]
@@ -8619,7 +8619,7 @@ impl CascadeReplicator {
 
 ```sql
 -- Crear slot de decodificación lógica
-CREATE REPLICATION SLOT mi_cdc LOGICAL OUTPUT PLUGIN 'dbyo_json';
+CREATE REPLICATION SLOT mi_cdc LOGICAL OUTPUT PLUGIN 'axiomdb_json';
 CREATE REPLICATION SLOT mi_cdc LOGICAL OUTPUT PLUGIN 'wal2json';
 
 -- Consumir cambios como JSON
@@ -8686,7 +8686,7 @@ impl LogicalOutputPlugin for JsonOutputPlugin {
 
 ```
 # Formato dbyo nativo
-dbyo://usuario:contraseña@host:3306/base_de_datos?ssl=true&timeout=30s
+axiomdb://usuario:contraseña@host:3306/base_de_datos?ssl=true&timeout=30s
 
 # Formato PostgreSQL (para compatibilidad con ORMs)
 postgres://usuario:contraseña@host:5432/base_de_datos?sslmode=verify-full
@@ -8696,7 +8696,7 @@ mysql://usuario:contraseña@host:3306/base_de_datos?charset=utf8mb4
 
 # Variables de entorno estándar (compatible con todos los ORMs)
 DATABASE_URL=postgres://ana:secret@localhost:5432/axiomdb
-DBYO_URL=dbyo://ana:secret@localhost:3306/axiomdb
+AXIOMDB_URL=axiomdb://ana:secret@localhost:3306/axiomdb
 
 # Parámetros soportados
 ?ssl=true|false|verify-full
@@ -8746,7 +8746,7 @@ impl ConnectionConfig {
 
     fn from_env() -> Result<Self> {
         let url = std::env::var("DATABASE_URL")
-            .or_else(|_| std::env::var("DBYO_URL"))
+            .or_else(|_| std::env::var("AXIOMDB_URL"))
             .map_err(|_| DbError::NoDsnConfigured)?;
         Self::from_url(&url)
     }
@@ -9163,20 +9163,20 @@ FROM rust:1.80-slim AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
-RUN cargo build --release --bin dbyo-server
+RUN cargo build --release --bin axiomdb-server
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y libssl3 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -ms /bin/bash dbyo
-COPY --from=builder /app/target/release/dbyo-server /usr/local/bin/
+COPY --from=builder /app/target/release/axiomdb-server /usr/local/bin/
 USER dbyo
 EXPOSE 3306 5432
 VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s \
-  CMD dbyo-server --healthcheck || exit 1
-CMD ["dbyo-server", "--data-dir", "/data", "--config", "/etc/dbyo/axiomdb.toml"]
+  CMD axiomdb-server --healthcheck || exit 1
+CMD ["axiomdb-server", "--data-dir", "/data", "--config", "/etc/axiomdb/axiomdb.toml"]
 ```
 
 ### docker-compose.yml
@@ -9192,14 +9192,14 @@ services:
       - "5432:5432"   # PostgreSQL protocol
     volumes:
       - dbyo_data:/data
-      - ./axiomdb.toml:/etc/dbyo/axiomdb.toml:ro
+      - ./axiomdb.toml:/etc/axiomdb/axiomdb.toml:ro
     environment:
-      DBYO_PASSWORD: ${DBYO_PASSWORD:-secret}
-      DBYO_DATABASE: ${DBYO_DATABASE:-nexusdb}
+      AXIOMDB_PASSWORD: ${AXIOMDB_PASSWORD:-secret}
+      AXIOMDB_DATABASE: ${AXIOMDB_DATABASE:-axiomdb}
       DBYO_LOG_LEVEL: ${DBYO_LOG_LEVEL:-info}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "dbyo-server", "--healthcheck"]
+      test: ["CMD", "axiomdb-server", "--healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -9237,8 +9237,8 @@ method   = "reject"
 
 [tls]
 enabled          = true
-cert             = "/etc/dbyo/server.crt"
-key              = "/etc/dbyo/server.key"
+cert             = "/etc/axiomdb/server.crt"
+key              = "/etc/axiomdb/server.key"
 min_version      = "TLS1.3"
 
 [storage]
@@ -9262,7 +9262,7 @@ connection_idle_timeout        = "10min"
 [logging]
 level            = "info"     # trace | debug | info | warn | error
 format           = "json"     # json | text
-file             = "/var/log/dbyo/dbyo.log"
+file             = "/var/log/axiomdb/dbyo.log"
 rotation         = "daily"    # daily | hourly | size:100MB
 keep_days        = 30
 slow_query_ms    = 100        # loggear queries más lentas que esto
@@ -9289,7 +9289,7 @@ wal_retention    = "7d"
 ### systemd service
 
 ```ini
-# /etc/systemd/system/dbyo.service
+# /etc/systemd/system/axiomdb.service
 [Unit]
 Description=dbyo Database Server
 Documentation=https://github.com/usuario/dbyo
@@ -9300,7 +9300,7 @@ Wants=network.target
 Type=simple
 User=dbyo
 Group=dbyo
-ExecStart=/usr/local/bin/dbyo-server --config /etc/dbyo/axiomdb.toml
+ExecStart=/usr/local/bin/axiomdb-server --config /etc/axiomdb/axiomdb.toml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
@@ -9617,12 +9617,12 @@ install_package
 axiomdb-wizard   # launch wizard immediately after install
 ```
 
-### dbyo-client — SDK oficial Rust
+### axiomdb-client — SDK oficial Rust
 
 ```toml
 # En tu app:
 [dependencies]
-dbyo-client = "0.1"
+axiomdb-client = "0.1"
 ```
 
 ```rust
@@ -9630,7 +9630,7 @@ use dbyo_client::{Pool, Config, Row};
 
 // Pool de conexiones
 let pool = Pool::builder()
-    .config(Config::from_url("dbyo://user:pass@localhost/axiomdb")?)
+    .config(Config::from_url("axiomdb://user:pass@localhost/axiomdb")?)
     .max_connections(20)
     .build()
     .await?;
@@ -9653,14 +9653,14 @@ txn.execute("UPDATE accounts SET balance = balance + $1 WHERE id = $2", &[&100, 
 txn.commit().await?;
 ```
 
-### dbyo-bench — herramienta de carga
+### axiomdb-bench — herramienta de carga
 
 ```bash
 # Instalar
-cargo install dbyo-bench
+cargo install axiomdb-bench
 
 # Escenario OLTP point select (equivalente sysbench)
-dbyo-bench oltp_point_select \
+axiomdb-bench oltp_point_select \
   --host localhost --port 3306 \
   --user root --database test \
   --tables 1 --table-size 1000000 \
@@ -9668,8 +9668,8 @@ dbyo-bench oltp_point_select \
   --time 60
 
 # Comparar vs MySQL
-dbyo-bench compare \
-  --dbyo "dbyo://root@localhost:3306/test" \
+axiomdb-bench compare \
+  --dbyo "axiomdb://root@localhost:3306/test" \
   --mysql "mysql://root@localhost:3307/test" \
   --scenario oltp_read_write \
   --time 60

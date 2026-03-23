@@ -227,10 +227,11 @@ fn execute_select(
 
         // ── SELECT from a table ───────────────────────────────────────────────
         Some(FromClause::Table(table_ref)) => {
-            let resolver = make_resolver(storage, txn)?;
-            let resolved =
-                resolver.resolve_table(table_ref.schema.as_deref(), &table_ref.name)?;
-            drop(resolver); // release immutable borrow on storage before mutable ops
+            let resolved = {
+                let resolver = make_resolver(storage, txn)?;
+                resolver.resolve_table(table_ref.schema.as_deref(), &table_ref.name)?
+                // resolver goes out of scope here, releasing immutable borrow on storage
+            };
 
             let snap = txn.active_snapshot()?;
             let raw_rows =
@@ -270,9 +271,10 @@ fn execute_insert(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
-    let resolver = make_resolver(storage, txn)?;
-    let resolved = resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?;
-    drop(resolver);
+    let resolved = {
+        let resolver = make_resolver(storage, txn)?;
+        resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
+    };
 
     let schema_cols = &resolved.columns;
 
@@ -324,10 +326,7 @@ fn execute_insert(
                 if idx == usize::MAX {
                     Value::Null
                 } else {
-                    provided
-                        .get(idx)
-                        .cloned()
-                        .unwrap_or(Value::Null)
+                    provided.get(idx).cloned().unwrap_or(Value::Null)
                 }
             })
             .collect();
@@ -349,9 +348,10 @@ fn execute_update(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
-    let resolver = make_resolver(storage, txn)?;
-    let resolved = resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?;
-    drop(resolver);
+    let resolved = {
+        let resolver = make_resolver(storage, txn)?;
+        resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
+    };
 
     let schema_cols = resolved.columns.clone();
 
@@ -404,9 +404,10 @@ fn execute_delete(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
-    let resolver = make_resolver(storage, txn)?;
-    let resolved = resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?;
-    drop(resolver);
+    let resolved = {
+        let resolver = make_resolver(storage, txn)?;
+        resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
+    };
 
     let schema_cols = resolved.columns.clone();
     let snap = txn.active_snapshot()?;
@@ -601,9 +602,7 @@ fn make_resolver<'a>(
     storage: &'a dyn StorageEngine,
     txn: &TxnManager,
 ) -> Result<SchemaResolver<'a>, DbError> {
-    let snap: TransactionSnapshot = txn
-        .active_snapshot()
-        .unwrap_or_else(|_| txn.snapshot());
+    let snap: TransactionSnapshot = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
     SchemaResolver::new(storage, snap, "public")
 }
 
@@ -746,14 +745,38 @@ mod tests {
 
     #[test]
     fn test_datatype_to_column_type_supported() {
-        assert_eq!(datatype_to_column_type(&DataType::Bool).unwrap(), ColumnType::Bool);
-        assert_eq!(datatype_to_column_type(&DataType::Int).unwrap(), ColumnType::Int);
-        assert_eq!(datatype_to_column_type(&DataType::BigInt).unwrap(), ColumnType::BigInt);
-        assert_eq!(datatype_to_column_type(&DataType::Real).unwrap(), ColumnType::Float);
-        assert_eq!(datatype_to_column_type(&DataType::Text).unwrap(), ColumnType::Text);
-        assert_eq!(datatype_to_column_type(&DataType::Bytes).unwrap(), ColumnType::Bytes);
-        assert_eq!(datatype_to_column_type(&DataType::Timestamp).unwrap(), ColumnType::Timestamp);
-        assert_eq!(datatype_to_column_type(&DataType::Uuid).unwrap(), ColumnType::Uuid);
+        assert_eq!(
+            datatype_to_column_type(&DataType::Bool).unwrap(),
+            ColumnType::Bool
+        );
+        assert_eq!(
+            datatype_to_column_type(&DataType::Int).unwrap(),
+            ColumnType::Int
+        );
+        assert_eq!(
+            datatype_to_column_type(&DataType::BigInt).unwrap(),
+            ColumnType::BigInt
+        );
+        assert_eq!(
+            datatype_to_column_type(&DataType::Real).unwrap(),
+            ColumnType::Float
+        );
+        assert_eq!(
+            datatype_to_column_type(&DataType::Text).unwrap(),
+            ColumnType::Text
+        );
+        assert_eq!(
+            datatype_to_column_type(&DataType::Bytes).unwrap(),
+            ColumnType::Bytes
+        );
+        assert_eq!(
+            datatype_to_column_type(&DataType::Timestamp).unwrap(),
+            ColumnType::Timestamp
+        );
+        assert_eq!(
+            datatype_to_column_type(&DataType::Uuid).unwrap(),
+            ColumnType::Uuid
+        );
     }
 
     #[test]
@@ -771,8 +794,14 @@ mod tests {
     #[test]
     fn test_column_type_to_datatype_roundtrip() {
         for &dt in &[
-            DataType::Bool, DataType::Int, DataType::BigInt, DataType::Real,
-            DataType::Text, DataType::Bytes, DataType::Timestamp, DataType::Uuid,
+            DataType::Bool,
+            DataType::Int,
+            DataType::BigInt,
+            DataType::Real,
+            DataType::Text,
+            DataType::Bytes,
+            DataType::Timestamp,
+            DataType::Uuid,
         ] {
             let ct = datatype_to_column_type(&dt).unwrap();
             assert_eq!(column_type_to_datatype(ct), dt);
@@ -787,7 +816,10 @@ mod tests {
 
     #[test]
     fn test_expr_column_name_column_expr() {
-        let expr = Expr::Column { name: "age".into(), col_idx: 0 };
+        let expr = Expr::Column {
+            name: "age".into(),
+            col_idx: 0,
+        };
         assert_eq!(expr_column_name(&expr, None), "age");
     }
 

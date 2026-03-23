@@ -34,7 +34,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd /Users/cristian/dbyo && [ -f Cargo.toml ] && cargo fmt 2>/dev/null; exit 0"
+            "command": "cd /Users/cristian/nexusdb && [ -f Cargo.toml ] && cargo fmt 2>/dev/null; exit 0"
           }
         ]
       }
@@ -44,7 +44,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd /Users/cristian/dbyo && [ -f Cargo.toml ] && echo '\\n── Estado al parar ──' && cargo test --workspace --quiet 2>&1 | tail -5 || echo 'Cargo.toml no existe aún'; exit 0"
+            "command": "cd /Users/cristian/nexusdb && [ -f Cargo.toml ] && echo '\\n── Estado al parar ──' && cargo test --workspace --quiet 2>&1 | tail -5 || echo 'Cargo.toml no existe aún'; exit 0"
           }
         ]
       }

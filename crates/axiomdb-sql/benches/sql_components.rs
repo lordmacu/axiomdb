@@ -2,13 +2,13 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use axiomdb_sql::{
     eval,
     expr::{BinaryOp, Expr, UnaryOp},
     is_truthy, parse, tokenize,
 };
 use axiomdb_types::Value;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 // ── SQL fixtures ──────────────────────────────────────────────────────────────
 

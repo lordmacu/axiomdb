@@ -17,8 +17,8 @@
 //! String escape processing is handled by [`process_string_literal`], which
 //! is called from within the logos callback for `StringLit`.
 
-use logos::Logos;
 use axiomdb_core::error::DbError;
+use logos::Logos;
 
 // ── Span / SpannedToken ───────────────────────────────────────────────────────
 
