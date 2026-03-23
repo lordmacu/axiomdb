@@ -1,7 +1,7 @@
-//! Tests de integración del formato WAL entry (subfase 3.1).
+//! Integration tests for the WAL entry format (subphase 3.1).
 //!
-//! Verifican correctness end-to-end: serialización, deserialización, detección
-//! de corrupción, entries encadenados y backward scan.
+//! Verify end-to-end correctness: serialization, deserialization, corruption
+//! detection, chained entries, and backward scan.
 
 use nexusdb_core::error::DbError;
 use nexusdb_wal::{EntryType, WalEntry, MIN_ENTRY_LEN};
@@ -19,7 +19,7 @@ fn rid_bytes(page: u64, slot: u16) -> Vec<u8> {
     b
 }
 
-// ── Roundtrip — los 7 tipos ───────────────────────────────────────────────────
+// ── Roundtrip — all 7 types ───────────────────────────────────────────────────
 
 #[test]
 fn test_roundtrip_all_entry_types() {
@@ -38,17 +38,17 @@ fn test_roundtrip_all_entry_types() {
     for original in &entries {
         let bytes = original.to_bytes();
         let (parsed, consumed) = WalEntry::from_bytes(&bytes)
-            .unwrap_or_else(|e| panic!("fallo en {:?}: {e}", original.entry_type));
+            .unwrap_or_else(|e| panic!("failed on {:?}: {e}", original.entry_type));
 
         assert_eq!(
             consumed,
             bytes.len(),
-            "bytes_consumidos != bytes.len() en {:?}",
+            "bytes_consumed != bytes.len() in {:?}",
             original.entry_type
         );
         assert_eq!(
             &parsed, original,
-            "roundtrip fallido en {:?}",
+            "roundtrip failed in {:?}",
             original.entry_type
         );
     }
@@ -66,24 +66,24 @@ fn test_control_entries_have_min_len() {
         assert_eq!(
             entry.to_bytes().len(),
             MIN_ENTRY_LEN,
-            "entry {:?} debería ser exactamente {MIN_ENTRY_LEN} bytes",
+            "entry {:?} should be exactly {MIN_ENTRY_LEN} bytes",
             et
         );
     }
 }
 
-// ── Detección de corrupción ───────────────────────────────────────────────────
+// ── Corruption detection ──────────────────────────────────────────────────────
 
-/// Flip de 1 bit en distintas posiciones del buffer — todas deben detectarse.
+/// Flip 1 bit at different positions in the buffer — all must be detected.
 #[test]
 fn test_crc_detects_single_bit_flip() {
     let entry = make_entry(10, EntryType::Insert, b"order:0042", &[], &rid_bytes(8, 1));
     let bytes = entry.to_bytes();
     let len = bytes.len();
 
-    // Posiciones a corromper: dentro del header, key y new_value
-    // Excluimos los últimos 8 bytes (crc32c + entry_len_2) porque modificarlos
-    // cambia el crc almacenado o el len de backward — ambos errores igualmente válidos
+    // Positions to corrupt: inside the header, key, and new_value
+    // We exclude the last 8 bytes (crc32c + entry_len_2) because modifying them
+    // changes the stored crc or the backward len — both errors are equally valid
     let positions_to_test = [4, 12, 20, 21, 27, len - 9];
 
     for pos in positions_to_test {
@@ -92,7 +92,7 @@ fn test_crc_detects_single_bit_flip() {
         let result = WalEntry::from_bytes(&corrupted);
         assert!(
             result.is_err(),
-            "corrupción en posición {pos} no fue detectada"
+            "corruption at position {pos} was not detected"
         );
     }
 }
@@ -101,7 +101,7 @@ fn test_crc_detects_single_bit_flip() {
 fn test_corruption_in_key() {
     let entry = make_entry(11, EntryType::Delete, b"product:99", &rid_bytes(2, 0), &[]);
     let mut bytes = entry.to_bytes();
-    // Corromper un byte dentro del área de la key (offset 27)
+    // Corrupt a byte inside the key area (offset 27)
     bytes[27] ^= 0xFF;
     assert!(matches!(
         WalEntry::from_bytes(&bytes),
@@ -119,7 +119,7 @@ fn test_corruption_in_old_value() {
         &rid_bytes(2, 0),
     );
     let mut bytes = entry.to_bytes();
-    // old_value empieza en offset 27 + 1(key) + 4(old_val_len) = 32
+    // old_value starts at offset 27 + 1(key) + 4(old_val_len) = 32
     bytes[32] ^= 0x01;
     assert!(matches!(
         WalEntry::from_bytes(&bytes),
@@ -131,7 +131,7 @@ fn test_corruption_in_old_value() {
 fn test_corruption_in_lsn() {
     let entry = make_entry(99, EntryType::Commit, &[], &[], &[]);
     let mut bytes = entry.to_bytes();
-    // LSN empieza en offset 4
+    // LSN starts at offset 4
     bytes[4] ^= 0xFF;
     assert!(matches!(
         WalEntry::from_bytes(&bytes),
@@ -139,7 +139,7 @@ fn test_corruption_in_lsn() {
     ));
 }
 
-// ── Buffers truncados ─────────────────────────────────────────────────────────
+// ── Truncated buffers ─────────────────────────────────────────────────────────
 
 #[test]
 fn test_empty_buffer_is_truncated() {
@@ -168,14 +168,14 @@ fn test_buffer_one_byte_short() {
     ));
 }
 
-// ── Entries encadenados ───────────────────────────────────────────────────────
+// ── Chained entries ───────────────────────────────────────────────────────────
 
 #[test]
 fn test_chain_of_100_entries() {
     let mut buf: Vec<u8> = Vec::new();
     let count = 100usize;
 
-    // Serializar: BEGIN + 98 INSERTs + COMMIT
+    // Serialize: BEGIN + 98 INSERTs + COMMIT
     let begin = make_entry(0, EntryType::Begin, &[], &[], &[]);
     buf.extend_from_slice(&begin.to_bytes());
 
@@ -188,18 +188,18 @@ fn test_chain_of_100_entries() {
     let commit = make_entry(99, EntryType::Commit, &[], &[], &[]);
     buf.extend_from_slice(&commit.to_bytes());
 
-    // Deserializar en loop
+    // Deserialize in a loop
     let mut pos = 0usize;
     let mut parsed_count = 0usize;
     let mut last_lsn = 0u64;
 
     while pos < buf.len() {
-        let (entry, consumed) =
-            WalEntry::from_bytes(&buf[pos..]).unwrap_or_else(|e| panic!("fallo en pos {pos}: {e}"));
+        let (entry, consumed) = WalEntry::from_bytes(&buf[pos..])
+            .unwrap_or_else(|e| panic!("failed at pos {pos}: {e}"));
 
         assert!(
             entry.lsn >= last_lsn,
-            "LSN no monotónico: {} < {}",
+            "non-monotonic LSN: {} < {}",
             entry.lsn,
             last_lsn
         );
@@ -211,12 +211,12 @@ fn test_chain_of_100_entries() {
 
     assert_eq!(
         parsed_count, count,
-        "se esperaban {count} entries, se parsearon {parsed_count}"
+        "expected {count} entries, parsed {parsed_count}"
     );
-    assert_eq!(pos, buf.len(), "no se consumieron todos los bytes");
+    assert_eq!(pos, buf.len(), "not all bytes were consumed");
 }
 
-// ── Backward scan ─────────────────────────────────────────────────────────────
+// ── Backward scan ────────────────────────────────────────────────────────────
 
 #[test]
 fn test_backward_scan_offset() {
@@ -227,7 +227,7 @@ fn test_backward_scan_offset() {
         make_entry(4, EntryType::Commit, &[], &[], &[]),
     ];
 
-    // Serializar todos en un buffer continuo y guardar offsets de inicio
+    // Serialize all into a contiguous buffer and save start offsets
     let mut buf: Vec<u8> = Vec::new();
     let mut start_offsets: Vec<usize> = Vec::new();
 
@@ -238,12 +238,12 @@ fn test_backward_scan_offset() {
 
     let total = buf.len();
 
-    // Recorrer hacia atrás usando entry_len_2 (últimos 4 bytes de cada entry)
+    // Traverse backward using entry_len_2 (last 4 bytes of each entry)
     let mut pos = total;
     let mut backward_lsns: Vec<u64> = Vec::new();
 
     while pos > 0 {
-        // Leer entry_len_2 (últimos 4 bytes del entry actual)
+        // Read entry_len_2 (last 4 bytes of the current entry)
         let len_pos = pos - 4;
         let entry_len = u32::from_le_bytes([
             buf[len_pos],
@@ -258,16 +258,16 @@ fn test_backward_scan_offset() {
         pos = entry_start;
     }
 
-    // Los LSN en orden inverso deben ser [4, 3, 2, 1]
+    // LSNs in reverse order must be [4, 3, 2, 1]
     let forward_lsns: Vec<u64> = entries.iter().map(|e| e.lsn).collect();
     let expected_backward: Vec<u64> = forward_lsns.iter().rev().copied().collect();
     assert_eq!(
         backward_lsns, expected_backward,
-        "backward scan no produjo LSNs en orden inverso"
+        "backward scan did not produce LSNs in reverse order"
     );
 }
 
-// ── serialized_len ────────────────────────────────────────────────────────────
+// ── serialized_len ───────────────────────────────────────────────────────────
 
 #[test]
 fn test_serialized_len_equals_to_bytes_len_all_types() {
@@ -283,13 +283,13 @@ fn test_serialized_len_equals_to_bytes_len_all_types() {
         assert_eq!(
             entry.serialized_len(),
             entry.to_bytes().len(),
-            "serialized_len() != to_bytes().len() en {:?}",
+            "serialized_len() != to_bytes().len() in {:?}",
             entry.entry_type
         );
     }
 }
 
-// ── Campos correctamente parseados ───────────────────────────────────────────
+// ── Fields correctly parsed ───────────────────────────────────────────────────
 
 #[test]
 fn test_fields_preserved_after_roundtrip() {

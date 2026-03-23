@@ -1,37 +1,37 @@
-# /new-crate — Scaffoldear crate en el workspace
+# /new-crate — Scaffold a crate in the workspace
 
-## Proceso completo
+## Complete process
 
-### 1. Crear el crate
+### 1. Create the crate
 
 ```bash
 cd /Users/cristian/dbyo
-cargo new --lib crates/dbyo-NOMBRE
+cargo new --lib crates/dbyo-NAME
 ```
 
-### 2. Estructura estándar del crate
+### 2. Standard crate structure
 
 ```
-crates/dbyo-NOMBRE/
+crates/dbyo-NAME/
 ├── Cargo.toml
 ├── src/
-│   ├── lib.rs          ← solo re-exports públicos y doc del crate
-│   ├── error.rs        ← DbError con thiserror
-│   └── [módulos].rs
+│   ├── lib.rs          ← only public re-exports and crate doc
+│   ├── error.rs        ← DbError with thiserror
+│   └── [modules].rs
 └── tests/
-    └── integration.rs  ← tests de integración
+    └── integration.rs  ← integration tests
 ```
 
-### 3. Cargo.toml del crate nuevo
+### 3. New crate's Cargo.toml
 
 ```toml
 [package]
-name    = "dbyo-NOMBRE"
+name    = "dbyo-NAME"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Usar versiones del workspace cuando estén definidas
+# Use workspace versions when defined
 dbyo-core = { path = "../dbyo-core" }
 thiserror = { workspace = true }
 tracing   = { workspace = true }
@@ -41,77 +41,77 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tempfile  = "3"
 ```
 
-### 4. src/lib.rs mínimo
+### 4. Minimal src/lib.rs
 
 ```rust
-//! # dbyo-NOMBRE
+//! # dbyo-NAME
 //!
-//! [Descripción de una línea de qué hace este crate]
+//! [One-line description of what this crate does]
 //!
-//! ## Ejemplo
+//! ## Example
 //! ```rust
-//! use dbyo_nombre::MiTrait;
-//! // ejemplo mínimo
+//! use dbyo_name::MyTrait;
+//! // minimal example
 //! ```
 
 mod error;
 pub use error::Error;
 
-// Traits públicos primero
-pub trait MiTrait: Send + Sync {
-    fn operacion(&self) -> Result<(), Error>;
+// Public traits first
+pub trait MyTrait: Send + Sync {
+    fn operation(&self) -> Result<(), Error>;
 }
 ```
 
-### 5. Agregar al workspace Cargo.toml raíz
+### 5. Add to root workspace Cargo.toml
 
 ```toml
 [workspace]
 members = [
-    # ... existentes ...
-    "crates/dbyo-NOMBRE",   # ← agregar aquí en orden alfabético
+    # ... existing ...
+    "crates/dbyo-NAME",   # ← add here in alphabetical order
 ]
 ```
 
-### 6. Verificar que no hay ciclo de dependencias
+### 6. Verify no dependency cycle
 
 ```bash
-cargo tree --workspace 2>&1 | grep -E "dbyo-NOMBRE|error\[E"
+cargo tree --workspace 2>&1 | grep -E "dbyo-NAME|error\[E"
 ```
 
-### 7. Test inicial que compile
+### 7. Initial compiling test
 
 ```rust
 // tests/integration.rs
-use dbyo_nombre::MiTrait;
+use dbyo_name::MyTrait;
 
 #[test]
-fn crate_compila_y_trait_existe() {
-    // Solo verificar que compila por ahora
-    // Los tests reales se agregan en la fase de implementación
+fn crate_compiles_and_trait_exists() {
+    // Just verify it compiles for now
+    // Real tests are added in the implementation phase
 }
 ```
 
 ```bash
-cargo test -p dbyo-NOMBRE
+cargo test -p dbyo-NAME
 ```
 
-### 8. Actualizar memory/architecture.md
+### 8. Update memory/architecture.md
 
 ```markdown
-## Crates implementados
-- `dbyo-NOMBRE` — [descripción de una línea] (Fase N)
+## Implemented crates
+- `dbyo-NAME` — [one-line description] (Phase N)
 ```
 
 ### Checklist
 
 ```
-[ ] cargo new --lib ejecutado
-[ ] Cargo.toml del crate con dependencias correctas
-[ ] Agregado a workspace members
-[ ] src/lib.rs con traits públicos documentados
-[ ] Test inicial compilando
-[ ] cargo test -p dbyo-NOMBRE pasa
-[ ] cargo clippy -p dbyo-NOMBRE -- -D warnings pasa
-[ ] architecture.md actualizado
+[ ] cargo new --lib executed
+[ ] crate's Cargo.toml with correct dependencies
+[ ] Added to workspace members
+[ ] src/lib.rs with documented public traits
+[ ] Initial test compiling
+[ ] cargo test -p dbyo-NAME passes
+[ ] cargo clippy -p dbyo-NAME -- -D warnings passes
+[ ] architecture.md updated
 ```

@@ -1,14 +1,14 @@
-//! Iterador lazy de range scan sobre el B+ Tree.
+//! Lazy range scan iterator over the B+ Tree.
 //!
-//! ## Por qué no usamos `next_leaf`
+//! ## Why we do not use `next_leaf`
 //!
-//! Con Copy-on-Write, cada write a una hoja crea un nuevo page_id. La hoja
-//! izquierda que apuntaba a `old_leaf_pid` via `next_leaf` queda con un puntero
-//! a una página ya liberada. Para evitar este problema, el iterador traversa
-//! el árbol desde la raíz cuando necesita avanzar a la siguiente hoja.
+//! With Copy-on-Write, each write to a leaf creates a new page_id. The left
+//! leaf that pointed to `old_leaf_pid` via `next_leaf` is left with a pointer
+//! to an already-freed page. To avoid this problem, the iterator traverses
+//! the tree from the root whenever it needs to advance to the next leaf.
 //!
-//! **Costo**: O(log n) por cruce de frontera entre hojas — aceptable para
-//! range scans donde la mayoría del tiempo se consume en las hojas.
+//! **Cost**: O(log n) per leaf boundary crossing — acceptable for
+//! range scans where most time is spent in the leaves.
 
 use std::ops::Bound;
 
@@ -18,10 +18,10 @@ use nexusdb_storage::StorageEngine;
 use crate::page_layout::{cast_internal, cast_leaf, NULL_PAGE};
 use crate::prefix::CompressedNode;
 
-/// Iterador lazy de range scan.
+/// Lazy range scan iterator.
 ///
-/// Cada `next()` carga una entrada de la hoja actual.
-/// Al agotar una hoja, traversa el árbol para encontrar la siguiente.
+/// Each `next()` loads an entry from the current leaf.
+/// When a leaf is exhausted, it traverses the tree to find the next one.
 pub struct RangeIter<'a> {
     storage: &'a dyn StorageEngine,
     root_pid: u64,
@@ -29,7 +29,7 @@ pub struct RangeIter<'a> {
     slot_idx: usize,
     from: Bound<Vec<u8>>,
     to: Bound<Vec<u8>>,
-    last_key: Option<Vec<u8>>, // última key retornada (para buscar siguiente hoja)
+    last_key: Option<Vec<u8>>, // last key returned (to find the next leaf)
     done: bool,
 }
 
@@ -53,7 +53,7 @@ impl<'a> RangeIter<'a> {
         }
     }
 
-    /// Verifica si `key` está dentro del bound de inicio del rango.
+    /// Checks whether `key` is within the lower bound of the range.
     fn above_lower(&self, key: &[u8]) -> bool {
         match &self.from {
             Bound::Unbounded => true,
@@ -62,7 +62,7 @@ impl<'a> RangeIter<'a> {
         }
     }
 
-    /// Verifica si `key` está dentro del bound de fin del rango.
+    /// Checks whether `key` is within the upper bound of the range.
     fn below_upper(&self, key: &[u8]) -> bool {
         match &self.to {
             Bound::Unbounded => true,
@@ -71,27 +71,27 @@ impl<'a> RangeIter<'a> {
         }
     }
 
-    /// Encuentra la siguiente hoja después de `after_key`.
+    /// Finds the next leaf after `after_key`.
     ///
-    /// Traversa el árbol desde root, desciendo hasta el nodo que contendría
-    /// `after_key`, luego sube buscando el primer hermano a la derecha, y
-    /// finalmente baja hasta la hoja más a la izquierda de ese subárbol.
+    /// Traverses the tree from the root, descending to the node that would contain
+    /// `after_key`, then climbs searching for the first right sibling, and
+    /// finally descends to the leftmost leaf of that subtree.
     fn find_next_leaf(&self, after_key: &[u8]) -> Result<Option<u64>, DbError> {
-        // 1. Descender y guardar el stack con (page_id, next_sibling_idx)
+        // 1. Descend and save the stack with (page_id, next_sibling_idx)
         let mut stack: Vec<(u64, usize)> = Vec::new();
         let mut pid = self.root_pid;
 
         loop {
             let page = self.storage.read_page(pid)?;
             if page.body()[0] == 1 {
-                // Llegamos a la hoja. Salir y buscar el siguiente hermano.
+                // We reached a leaf. Exit and search for the next sibling.
                 break;
             }
             let node = cast_internal(page);
             let n = node.num_keys();
 
-            // Usar prefix compression para comparar solo sufijos en nodos
-            // con keys que comparten prefijo común (e.g., UUIDs, namespaced keys).
+            // Use prefix compression to compare only suffixes in nodes
+            // with keys sharing a common prefix (e.g., UUIDs, namespaced keys).
             let keys: Vec<Box<[u8]>> = (0..n)
                 .map(|i| node.key_at(i).to_vec().into_boxed_slice())
                 .collect();
@@ -99,29 +99,29 @@ impl<'a> RangeIter<'a> {
             let compressed = CompressedNode::from_keys(&keys, children);
             let idx = compressed.find_child_idx(after_key);
 
-            // Guardar este nodo con el índice del SIGUIENTE hermano (idx+1)
+            // Save this node with the index of the NEXT sibling (idx+1)
             stack.push((pid, idx + 1));
             pid = compressed.children[idx];
         }
 
-        // 2. Subir hasta encontrar un hermano a la derecha
+        // 2. Climb until we find a right sibling
         loop {
             let Some((parent_pid, next_idx)) = stack.pop() else {
-                return Ok(None); // Sin más hojas
+                return Ok(None); // No more leaves
             };
 
             let page = self.storage.read_page(parent_pid)?;
             let node = cast_internal(page);
             if next_idx <= node.num_keys() {
-                // Hay un hijo en next_idx → descender hasta la hoja más a la izquierda
+                // There is a child at next_idx → descend to the leftmost leaf
                 let subtree_root = node.child_at(next_idx);
                 return Ok(Some(Self::leftmost_leaf(self.storage, subtree_root)?));
             }
-            // Este nodo tampoco tiene más hijos → seguir subiendo
+            // This node also has no more children → keep climbing
         }
     }
 
-    /// Retorna el page_id de la hoja más a la izquierda del subárbol.
+    /// Returns the page_id of the leftmost leaf of the subtree.
     fn leftmost_leaf(storage: &dyn StorageEngine, pid: u64) -> Result<u64, DbError> {
         let mut pid = pid;
         loop {
@@ -148,8 +148,8 @@ impl<'a> Iterator for RangeIter<'a> {
                 return None;
             }
 
-            // Leer hoja y buscar el siguiente slot en rango.
-            // El bloque asegura que el borrow de `page` expira antes de `find_next_leaf`.
+            // Read the leaf and find the next in-range slot.
+            // The block ensures the borrow of `page` expires before `find_next_leaf`.
             enum SlotResult {
                 Found(Vec<u8>, RecordId),
                 Before,
@@ -184,7 +184,7 @@ impl<'a> Iterator for RangeIter<'a> {
 
             match result {
                 SlotResult::Before => {
-                    // Antes del rango: continuar al siguiente slot
+                    // Before the range: continue to the next slot
                     continue;
                 }
                 SlotResult::After => {
@@ -196,11 +196,11 @@ impl<'a> Iterator for RangeIter<'a> {
                     return Some(Ok((key, rid)));
                 }
                 SlotResult::Exhausted => {
-                    // Hoja agotada: buscar la siguiente vía traversal del árbol
+                    // Leaf exhausted: find the next one via tree traversal
                     let after_key = match self.last_key.take() {
                         Some(k) => k,
                         None => {
-                            // Hoja vacía o todo era Before, no hay más
+                            // Empty leaf or all entries were Before, no more
                             self.done = true;
                             return None;
                         }
@@ -260,10 +260,7 @@ mod tests {
             .collect();
         assert_eq!(results.len(), 100);
         for i in 0..99 {
-            assert!(
-                results[i].0 < results[i + 1].0,
-                "no está en orden en índice {i}"
-            );
+            assert!(results[i].0 < results[i + 1].0, "out of order at index {i}");
         }
     }
 
@@ -345,7 +342,7 @@ mod tests {
 
     #[test]
     fn test_range_spans_multiple_leaves() {
-        // Usar suficientes keys para forzar múltiples hojas
+        // Use enough keys to force multiple leaves
         let count = 500;
         let tree = build_tree(count);
         let results: Vec<_> = tree
@@ -353,12 +350,9 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
-        assert_eq!(results.len(), count, "deben retornarse todas las keys");
+        assert_eq!(results.len(), count, "all keys must be returned");
         for i in 0..results.len() - 1 {
-            assert!(
-                results[i].0 < results[i + 1].0,
-                "no está en orden en índice {i}"
-            );
+            assert!(results[i].0 < results[i + 1].0, "out of order at index {i}");
         }
     }
 }

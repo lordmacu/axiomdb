@@ -1,11 +1,11 @@
-# /bench — Medir rendimiento correctamente
+# /bench — Measure performance correctly
 
-Nunca optimizar sin medir. Nunca mergear sin verificar que no se regresó.
+Never optimize without measuring. Never merge without verifying there was no regression.
 
-## Setup de benchmarks
+## Benchmark setup
 
 ```toml
-# Cargo.toml del crate
+# crate's Cargo.toml
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
@@ -44,36 +44,36 @@ criterion_group!(benches, bench_point_lookup, bench_range_scan);
 criterion_main!(benches);
 ```
 
-## Workflow antes de optimizar
+## Workflow before optimizing
 
 ```bash
-# 1. Guardar baseline ANTES del cambio
+# 1. Save baseline BEFORE the change
 cargo bench --workspace -- --save-baseline before
 
-# 2. Hacer el cambio
+# 2. Make the change
 
-# 3. Medir DESPUÉS
+# 3. Measure AFTER
 cargo bench --workspace -- --baseline before
 
-# Criterion muestra automáticamente:
-# point_lookup_pk: 1.2µs → 0.8µs  (-33%) ✅ mejora
-# range_scan/10000: 45ms → 48ms   (+6%)  ⚠️  regresión menor
+# Criterion automatically shows:
+# point_lookup_pk: 1.2µs → 0.8µs  (-33%) ✅ improvement
+# range_scan/10000: 45ms → 48ms   (+6%)  ⚠️  minor regression
 ```
 
-## Presupuesto de rendimiento
+## Performance budget
 
-| Operación             | Objetivo     | Máximo     | Acción si supera máximo |
+| Operation             | Target       | Maximum    | Action if exceeded      |
 |-----------------------|--------------|------------|------------------------|
-| Point lookup PK       | 800k ops/s   | 600k ops/s | Bloqueante — investigar |
-| Range scan 10K rows   | 45ms         | 60ms       | Bloqueante — investigar |
-| INSERT con WAL        | 180k ops/s   | 150k ops/s | Bloqueante — investigar |
-| Seq scan 1M rows      | 0.8s         | 1.2s       | Bloqueante — investigar |
-| Concurrent reads x16  | escala lineal| <2x drop   | Bloqueante — investigar |
+| Point lookup PK       | 800k ops/s   | 600k ops/s | Blocker — investigate  |
+| Range scan 10K rows   | 45ms         | 60ms       | Blocker — investigate  |
+| INSERT with WAL       | 180k ops/s   | 150k ops/s | Blocker — investigate  |
+| Seq scan 1M rows      | 0.8s         | 1.2s       | Blocker — investigate  |
+| Concurrent reads x16  | linear scale | <2x drop   | Blocker — investigate  |
 
-## Comparar vs MySQL (objetivo final)
+## Compare vs MySQL (final goal)
 
 ```bash
-# Instalar sysbench
+# Install sysbench
 brew install sysbench
 
 # Benchmark MySQL
@@ -83,13 +83,13 @@ sysbench oltp_point_select \
   --tables=1 --table-size=1000000 \
   run > /tmp/mysql_results.txt
 
-# Benchmark dbyo (mismo sysbench, diferente puerto)
+# Benchmark dbyo (same sysbench, different port)
 sysbench oltp_point_select \
-  --mysql-host=localhost --mysql-port=3306 \  # dbyo habla MySQL protocol
+  --mysql-host=localhost --mysql-port=3306 \  # dbyo speaks MySQL protocol
   --mysql-db=test --mysql-user=root \
   --tables=1 --table-size=1000000 \
   run > /tmp/dbyo_results.txt
 
-# Comparar
+# Compare
 diff /tmp/mysql_results.txt /tmp/dbyo_results.txt
 ```

@@ -1,61 +1,61 @@
-# /checkpoint — Guardar contexto al pausar
+# /checkpoint — Save context when pausing
 
-Cuando hay que pausar en medio de una tarea, guardar el estado exacto
-para que la próxima sesión pueda continuar sin preguntas.
+When a task must be paused mid-way, save the exact state
+so the next session can continue without questions.
 
-## Crear checkpoint
+## Create checkpoint
 
 ```bash
-FECHA=$(date +%Y%m%d-%H%M)
-cat > /Users/cristian/dbyo/docs/checkpoint-$FECHA.md << 'CHECKPOINT'
-# Checkpoint [FECHA]
+DATE=$(date +%Y%m%d-%H%M)
+cat > /Users/cristian/dbyo/docs/checkpoint-$DATE.md << 'CHECKPOINT'
+# Checkpoint [DATE]
 
-## Estado de la fase
-Fase: N — [nombre]
-Tarea actual: [nombre de la tarea dentro del sprint]
+## Phase state
+Phase: N — [name]
+Current task: [name of the task within the sprint]
 
-## Qué se estaba haciendo exactamente
-[descripción precisa — qué función, qué archivo, qué problema]
+## What was being done exactly
+[precise description — which function, which file, which problem]
 
-## Decisión pendiente (si hay)
-[qué había que decidir antes de continuar]
-[opciones consideradas]
-[información faltante para decidir]
+## Pending decision (if any)
+[what needed to be decided before continuing]
+[options considered]
+[missing information to decide]
 
-## Próximo paso exacto
-[instrucción precisa — suficiente para continuar sin contexto]
-Ejemplo: "Implementar fn insert() en crates/dbyo-index/src/btree.rs línea 42,
-         siguiendo el algoritmo del spec en specs/fase-02/spec-btree.md sección 'Insert'"
+## Exact next step
+[precise instruction — enough to continue without context]
+Example: "Implement fn insert() in crates/dbyo-index/src/btree.rs line 42,
+         following the algorithm in the spec at specs/fase-02/spec-btree.md section 'Insert'"
 
-## Estado de los tests
-cargo test resultado: [X pasando, Y fallando]
-Tests que fallan (esperado durante desarrollo):
-- [nombre del test] — [por qué falla, qué falta]
+## Test state
+cargo test result: [X passing, Y failing]
+Failing tests (expected during development):
+- [test name] — [why it fails, what is missing]
 
-## Archivos modificados
-- [archivo] — [qué cambió]
-- [archivo] — [qué cambió]
+## Modified files
+- [file] — [what changed]
+- [file] — [what changed]
 
-## Lo que NO hay que volver a hacer
-[cosas ya intentadas que no funcionaron]
+## What NOT to redo
+[things already tried that did not work]
 CHECKPOINT
 
-git add docs/checkpoint-$FECHA.md
-git commit -m "checkpoint: pausar en [descripción breve]"
+git add docs/checkpoint-$DATE.md
+git commit -m "checkpoint: pause at [brief description]"
 ```
 
-## Al iniciar una sesión con checkpoint
+## When starting a session with a checkpoint
 
 ```
-1. Leer docs/checkpoint-FECHA.md más reciente
-2. Correr cargo test --workspace para ver el estado actual
-3. Leer el "Próximo paso exacto" y ejecutarlo
-4. Borrar el checkpoint cuando la tarea se complete
+1. Read the most recent docs/checkpoint-DATE.md
+2. Run cargo test --workspace to see the current state
+3. Read the "Exact next step" and execute it
+4. Delete the checkpoint when the task is complete
 ```
 
-## Cuándo crear checkpoint
+## When to create a checkpoint
 
-- Al final de la sesión sin haber completado la fase
-- Antes de una pausa larga (> 2 horas)
-- Cuando el contexto de la conversación está casi lleno
-- Cuando hay una decisión pendiente que requiere input externo
+- At the end of a session without having completed the phase
+- Before a long pause (> 2 hours)
+- When the conversation context is nearly full
+- When there is a pending decision that requires external input

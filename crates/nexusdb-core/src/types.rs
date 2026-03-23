@@ -1,5 +1,5 @@
-/// Tipos de datos SQL soportados por NexusDB.
-/// La implementación completa de Value estará en nexusdb-types.
+/// SQL data types supported by NexusDB.
+/// The full Value implementation will live in nexusdb-types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataType {
     Bool,

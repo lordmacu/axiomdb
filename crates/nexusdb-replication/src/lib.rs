@@ -1,2 +1,2 @@
 //! # nexusdb-replication — Streaming replication, logical replication, PITR
-//! Stub — implementación en Fase N.
+//! Stub — implementation in Phase N.

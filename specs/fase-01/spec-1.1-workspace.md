@@ -1,48 +1,48 @@
 # Spec: 1.1 — Workspace Setup
 
-## Qué construir
-Estructura completa del workspace Rust con todos los crates declarados,
-configuración de calidad de código y CI en GitHub Actions.
+## What to build
+Complete Rust workspace structure with all crates declared,
+code quality configuration, and CI on GitHub Actions.
 
-## Criterios de aceptación
-- [ ] `cargo build --workspace` compila sin errores ni warnings
-- [ ] `cargo test --workspace` pasa (sin tests reales aún, solo que compile)
-- [ ] `cargo clippy --workspace -- -D warnings` pasa limpio
-- [ ] `cargo fmt --check` pasa limpio
-- [ ] GitHub Actions corre automáticamente en cada push a main
+## Acceptance criteria
+- [ ] `cargo build --workspace` compiles without errors or warnings
+- [ ] `cargo test --workspace` passes (no real tests yet, just that it compiles)
+- [ ] `cargo clippy --workspace -- -D warnings` passes clean
+- [ ] `cargo fmt --check` passes clean
+- [ ] GitHub Actions runs automatically on every push to main
 
-## Estructura a crear
+## Structure to create
 ```
 nexusdb/
-├── Cargo.toml              ← workspace root con todos los crates
-├── rust-toolchain.toml     ← fijar versión de Rust
-├── .rustfmt.toml           ← estilo de código
-├── .clippy.toml            ← reglas de linting
+├── Cargo.toml              ← workspace root with all crates
+├── rust-toolchain.toml     ← pin Rust version
+├── .rustfmt.toml           ← code style
+├── .clippy.toml            ← linting rules
 ├── .github/
 │   └── workflows/
-│       └── ci.yml          ← test + clippy + fmt en cada push
+│       └── ci.yml          ← test + clippy + fmt on every push
 └── crates/
-    ├── nexusdb-core/       ← tipos base, traits, errores
+    ├── nexusdb-core/       ← base types, traits, errors
     ├── nexusdb-types/      ← Value enum, DataType
-    ├── nexusdb-storage/    ← mmap, páginas, WAL
+    ├── nexusdb-storage/    ← mmap, pages, WAL
     ├── nexusdb-wal/        ← Write-Ahead Log
     ├── nexusdb-index/      ← B+ Tree, HNSW, FTS
-    ├── nexusdb-mvcc/       ← transacciones, snapshots
-    ├── nexusdb-catalog/    ← schema, estadísticas
+    ├── nexusdb-mvcc/       ← transactions, snapshots
+    ├── nexusdb-catalog/    ← schema, statistics
     ├── nexusdb-sql/        ← parser, planner, executor
-    ├── nexusdb-functions/  ← funciones built-in
+    ├── nexusdb-functions/  ← built-in functions
     ├── nexusdb-network/    ← MySQL + PostgreSQL wire protocol
     ├── nexusdb-security/   ← RBAC, RLS, TLS
     ├── nexusdb-replication/← streaming replication
     ├── nexusdb-plugins/    ← WASM, Lua
     ├── nexusdb-cache/      ← query cache
-    ├── nexusdb-geo/        ← tipos geométricos
+    ├── nexusdb-geo/        ← geometric types
     ├── nexusdb-vector/     ← embeddings, HNSW
     ├── nexusdb-migrations/ ← CLI migrations
-    ├── nexusdb-server/     ← binario servidor (bin)
-    └── nexusdb-embedded/   ← librería embebida (cdylib)
+    ├── nexusdb-server/     ← server binary (bin)
+    └── nexusdb-embedded/   ← embedded library (cdylib)
 
-## Fuera del alcance
-- Implementar lógica real (eso es Fase 1.2+)
-- Tests reales (solo que compile)
-- Dependencias externas aún (solo std por ahora excepto thiserror)
+## Out of scope
+- Implementing real logic (that is Phase 1.2+)
+- Real tests (just that it compiles)
+- External dependencies yet (only std for now except thiserror)

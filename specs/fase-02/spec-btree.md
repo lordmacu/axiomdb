@@ -1,56 +1,56 @@
-# Spec: B+ Tree (Fase 2)
+# Spec: B+ Tree (Phase 2)
 
-## Qué construir (no cómo)
+## What to build (not how)
 
-Un B+ Tree persistente que vive en páginas del `StorageEngine`, con soporte para
-keys binarios de longitud variable (hasta 64 bytes), operaciones CRUD completas,
-range scan por linked list de hojas, Copy-on-Write con raíz atómica, y compresión
-de prefijos en nodos internos.
+A persistent B+ Tree that lives in pages of the `StorageEngine`, with support for
+variable-length binary keys (up to 64 bytes), full CRUD operations,
+range scan via leaf linked list, Copy-on-Write with atomic root, and prefix
+compression on internal nodes.
 
 ---
 
-## Decisiones de diseño fijadas
+## Fixed design decisions
 
-| Aspecto | Decisión | Razón |
+| Aspect | Decision | Reason |
 |---|---|---|
-| Tipo de key en API | `Box<[u8]>` | Inmutable, 2 words, soporta u64/UUID/strings serializado |
-| Concurrencia | CoW real + `AtomicU64` root | Lock-free readers; no refactor en Fase 7 |
-| Serialización a página | `bytemuck` / `repr(C)` manual | Layout fijo, zero-copy cast, sin dependencia pesada |
-| Max key length en disco | 64 bytes | Cubre u64 (8), UUID (16), strings cortos, claves compuestas |
-| Crate destino | `nexusdb-index` | Ya existe como stub |
+| Key type in API | `Box<[u8]>` | Immutable, 2 words, supports u64/UUID/serialized strings |
+| Concurrency | Real CoW + `AtomicU64` root | Lock-free readers; no refactor in Phase 7 |
+| Serialization to page | `bytemuck` / manual `repr(C)` | Fixed layout, zero-copy cast, no heavy dependency |
+| Max key length on disk | 64 bytes | Covers u64 (8), UUID (16), short strings, composite keys |
+| Target crate | `nexusdb-index` | Already exists as stub |
 
 ---
 
-## Constantes de layout de página
+## Page layout constants
 
-Page body disponible: `16,384 - 64 = 16,320 bytes`
+Available page body: `16,384 - 64 = 16,320 bytes`
 
-### Nodo interno (`ORDER_INTERNAL = 223`)
+### Internal node (`ORDER_INTERNAL = 223`)
 
 ```
 [header:    8 bytes] is_leaf=0, pad, num_keys (u16), pad
-[key_lens: 223 bytes] longitud real de cada key (1 byte cada una)
-[_pad:       1 byte]  alinear a múltiplo de 8 para children
-[children: 1,792 bytes] (223+1) * 8 bytes = 224 punteros u64
-[keys:    14,272 bytes] 223 * 64 bytes = arrays fijos zero-padded
+[key_lens: 223 bytes] actual length of each key (1 byte each)
+[_pad:       1 byte]  align to multiple of 8 for children
+[children: 1,792 bytes] (223+1) * 8 bytes = 224 u64 pointers
+[keys:    14,272 bytes] 223 * 64 bytes = fixed arrays zero-padded
 ────────────────────────────────────────────────
-Total usado: 16,296 bytes ≤ 16,320 ✓
+Total used: 16,296 bytes ≤ 16,320 ✓
 ```
 
-### Nodo hoja (`ORDER_LEAF = 217`)
+### Leaf node (`ORDER_LEAF = 217`)
 
 ```
 [header:    16 bytes] is_leaf=1, pad, num_keys (u16), pad + next_leaf (u64)
-[key_lens: 217 bytes] longitud real de cada key (1 byte por key)
+[key_lens: 217 bytes] actual length of each key (1 byte per key)
 [rids:    2,170 bytes] 217 × 10 bytes: page_id([u8;8] LE) + slot_id([u8;2] LE)
-                       — sin padding: bytemuck usa [u8;10], alignment=1
+                       — no padding: bytemuck uses [u8;10], alignment=1
 [keys:   13,888 bytes] 217 × 64 bytes, zero-padded
 ────────────────────────────────────────────────
-Total usado: 16,291 bytes ≤ 16,320 ✓
+Total used: 16,291 bytes ≤ 16,320 ✓
 
-Nota: el spec original usaba RIDs de 12 bytes con padding de alineación.
-La implementación usa 10 bytes sin padding (bytemuck+[u8;N] no necesita alignment),
-logrando 217 entradas por hoja vs 211 — 3% más capacidad, 17% menos espacio por RID.
+Note: the original spec used 12-byte RIDs with alignment padding.
+The implementation uses 10 bytes without padding (bytemuck+[u8;N] needs no alignment),
+achieving 217 entries per leaf vs 211 — 3% more capacity, 17% less space per RID.
 ```
 
 ---
@@ -58,119 +58,119 @@ logrando 217 entradas por hoja vs 211 — 3% más capacidad, 17% menos espacio p
 ## Inputs / Outputs
 
 ### `BTree::new(storage, root_page_id) -> BTree`
-- Crea árbol vacío. Alloca una hoja raíz si `root_page_id == None`.
+- Creates an empty tree. Allocates a root leaf if `root_page_id == None`.
 
 ### `BTree::lookup(key: &[u8]) -> Result<Option<RecordId>>`
-- Input: slice de bytes, longitud 1..=64
-- Output: `Some(RecordId)` si existe, `None` si no
-- Errores: `KeyTooLong { len }`, `StorageError`
+- Input: byte slice, length 1..=64
+- Output: `Some(RecordId)` if it exists, `None` if not
+- Errors: `KeyTooLong { len }`, `StorageError`
 
 ### `BTree::insert(key: &[u8], rid: RecordId) -> Result<()>`
 - Input: key + RecordId
-- Output: `Ok(())` o error
-- Errores: `DuplicateKey { key }`, `KeyTooLong`, `StorageError`
-- Semántica CoW: copia el path root→hoja, CAS del root al final
+- Output: `Ok(())` or error
+- Errors: `DuplicateKey { key }`, `KeyTooLong`, `StorageError`
+- CoW semantics: copies the path root→leaf, CAS of root at the end
 
 ### `BTree::delete(key: &[u8]) -> Result<bool>`
 - Input: key
-- Output: `true` si existía y se eliminó, `false` si no existía
-- Con merge/redistribución cuando nodo queda < ORDER/2 keys
+- Output: `true` if it existed and was deleted, `false` if it did not exist
+- With merge/redistribution when node has < ORDER/2 keys
 
 ### `BTree::range(from: Bound<&[u8]>, to: Bound<&[u8]>) -> RangeIter`
-- Iterator que recorre linked list de hojas
-- Soporta `Bound::Included`, `Bound::Excluded`, `Bound::Unbounded`
+- Iterator that traverses the leaf linked list
+- Supports `Bound::Included`, `Bound::Excluded`, `Bound::Unbounded`
 
 ### `BTree::root_page_id() -> u64`
-- Retorna el page_id actual de la raíz (para persistir en catálogo)
+- Returns the current page_id of the root (for persisting in catalog)
 
 ---
 
-## Casos de uso
+## Use cases
 
-1. **Lookup PK entero**: `key = 42u64.to_be_bytes()` → `Some(RecordId)`
-2. **Lookup inexistente**: key no en árbol → `None`
-3. **Insert que causa split de hoja**: hoja llena → split → nuevo nodo interno
-4. **Insert que propaga split al root**: root lleno → nuevo root
-5. **Range scan `[10..=50]`**: recorre linked list, retorna exactamente las filas en rango
-6. **Delete con redistribución**: nodo queda con ORDER/2 - 1 keys → toma prestada de hermano
-7. **Delete con merge**: hermano también mínimo → merge + actualizar padre
-8. **Concurrent reads durante write CoW**: readers ven snapshot anterior hasta CAS del root
+1. **Integer PK lookup**: `key = 42u64.to_be_bytes()` → `Some(RecordId)`
+2. **Non-existent lookup**: key not in tree → `None`
+3. **Insert causing leaf split**: full leaf → split → new internal node
+4. **Insert propagating split to root**: full root → new root
+5. **Range scan `[10..=50]`**: traverses linked list, returns exactly the rows in range
+6. **Delete with redistribution**: node has ORDER/2 - 1 keys → borrows from sibling
+7. **Delete with merge**: sibling is also at minimum → merge + update parent
+8. **Concurrent reads during CoW write**: readers see previous snapshot until root CAS
 
 ---
 
-## Criterios de aceptación
+## Acceptance criteria
 
-### 2.1 — Estructuras de nodo
-- [ ] `InternalNodePage` y `LeafNodePage` son `bytemuck::Pod + Zeroable`
+### 2.1 — Node structures
+- [ ] `InternalNodePage` and `LeafNodePage` are `bytemuck::Pod + Zeroable`
 - [ ] `size_of::<InternalNodePage>() <= PAGE_BODY_SIZE` (compile-time assert)
 - [ ] `size_of::<LeafNodePage>() <= PAGE_BODY_SIZE` (compile-time assert)
-- [ ] Conversión zero-copy: cast de `Page::body()` a `&InternalNodePage` sin copia
-- [ ] Linked list de hojas: `next_leaf` apunta a siguiente hoja o `u64::MAX` si es la última
+- [ ] Zero-copy conversion: cast of `Page::body()` to `&InternalNodePage` without copy
+- [ ] Leaf linked list: `next_leaf` points to next leaf or `u64::MAX` if it is the last one
 
 ### 2.2 — Lookup
-- [ ] Lookup de key existente retorna `RecordId` correcto
-- [ ] Lookup de key inexistente retorna `None`
-- [ ] Complejidad O(log n): no recorre hojas innecesariamente
-- [ ] No requiere ningún lock
+- [ ] Lookup of existing key returns correct `RecordId`
+- [ ] Lookup of non-existent key returns `None`
+- [ ] O(log n) complexity: does not traverse leaves unnecessarily
+- [ ] Requires no lock
 
-### 2.3 — Insert con split
-- [ ] Insert en hoja vacía funciona
-- [ ] Insert en hoja llena hace split correcto (mitad izquierda / mitad derecha)
-- [ ] Split propaga key al nodo interno padre
-- [ ] Split del root crea nuevo root (árbol crece en altura)
-- [ ] Después de N inserts, todos los keys son recuperables con lookup
-- [ ] `DuplicateKey` error si el key ya existe
+### 2.3 — Insert with split
+- [ ] Insert into empty leaf works
+- [ ] Insert into full leaf performs correct split (left half / right half)
+- [ ] Split propagates key to the internal parent node
+- [ ] Root split creates a new root (tree grows in height)
+- [ ] After N inserts, all keys are recoverable with lookup
+- [ ] `DuplicateKey` error if the key already exists
 
 ### 2.4 — Range scan
-- [ ] `Bound::Unbounded` retorna todas las filas en orden
-- [ ] `Bound::Included(k)` incluye k
-- [ ] `Bound::Excluded(k)` excluye k
-- [ ] Orden del iterator es ascendente por key (comparación lexicográfica de bytes)
-- [ ] Iterator es lazy (no carga todas las páginas a memoria)
+- [ ] `Bound::Unbounded` returns all rows in order
+- [ ] `Bound::Included(k)` includes k
+- [ ] `Bound::Excluded(k)` excludes k
+- [ ] Iterator order is ascending by key (lexicographic byte comparison)
+- [ ] Iterator is lazy (does not load all pages into memory)
 
-### 2.5 — Delete con merge
-- [ ] Delete de key existente retorna `true`
-- [ ] Delete de key inexistente retorna `false`
-- [ ] Redistribución cuando hermano tiene keys de sobra (robar del vecino)
-- [ ] Merge cuando hermano también está en mínimo
-- [ ] Merge reduce altura del árbol si el root queda vacío
+### 2.5 — Delete with merge
+- [ ] Delete of existing key returns `true`
+- [ ] Delete of non-existent key returns `false`
+- [ ] Redistribution when sibling has extra keys (borrow from neighbor)
+- [ ] Merge when sibling is also at minimum
+- [ ] Merge reduces tree height if root becomes empty
 
 ### 2.6 — Copy-on-Write
-- [ ] `root_page_id()` usa `AtomicU64::load(Acquire)`
-- [ ] Write copia solo el path root→hoja (O(log n) páginas nuevas)
-- [ ] Swap del root es `AtomicU64::compare_exchange` (CAS)
-- [ ] Páginas huérfanas (versión anterior) son liberadas con `free_page()` post-commit
-- [ ] Concurrent readers: threads que tienen referencia a root anterior ven datos consistentes
+- [ ] `root_page_id()` uses `AtomicU64::load(Acquire)`
+- [ ] Write copies only the path root→leaf (O(log n) new pages)
+- [ ] Root swap is `AtomicU64::compare_exchange` (CAS)
+- [ ] Orphaned pages (previous version) are freed with `free_page()` post-commit
+- [ ] Concurrent readers: threads holding a reference to the old root see consistent data
 
 ### 2.7 — Prefix compression
-- [ ] Nodos internos calculan prefijo común de sus keys
-- [ ] `CompressedNode::reconstruct_key(idx)` retorna key original completa
-- [ ] Keys con prefijo común ocupan menos bytes en el nodo
-- [ ] Lookup y range scan funcionan igual con compresión activada
+- [ ] Internal nodes compute the common prefix of their keys
+- [ ] `CompressedNode::reconstruct_key(idx)` returns the full original key
+- [ ] Keys with a common prefix occupy fewer bytes in the node
+- [ ] Lookup and range scan work the same with compression enabled
 
 ### 2.8 — Tests + benchmarks
-- [ ] Tests unitarios para cada operación (MemoryStorage, sin I/O)
-- [ ] Test de integración: insert 10K rows + lookup todos + range scan + delete mitad
-- [ ] Test de crash recovery: insert → flush → reabrir → lookup
-- [ ] Benchmark vs `std::collections::BTreeMap` para point lookup y range scan
-- [ ] Benchmark: 1M inserts secuenciales (mide throughput y splits)
+- [ ] Unit tests for each operation (MemoryStorage, no I/O)
+- [ ] Integration test: insert 10K rows + lookup all + range scan + delete half
+- [ ] Crash recovery test: insert → flush → reopen → lookup
+- [ ] Benchmark vs `std::collections::BTreeMap` for point lookup and range scan
+- [ ] Benchmark: 1M sequential inserts (measures throughput and splits)
 
 ---
 
-## Fuera del alcance
+## Out of scope
 
-- Claves compuestas multi-columna (Fase 6)
-- Bloom filter por índice (Fase 6)
-- Partial / covering indexes (Fase 6)
-- Sparse index (Fase 6)
-- Collations / sort keys (Fase 6)
-- rkyv zero-copy deserialization (decisión: bytemuck es suficiente)
-- Keys > 64 bytes (overflow pages — Fase posterior)
+- Multi-column composite keys (Phase 6)
+- Bloom filter per index (Phase 6)
+- Partial / covering indexes (Phase 6)
+- Sparse index (Phase 6)
+- Collations / sort keys (Phase 6)
+- rkyv zero-copy deserialization (decision: bytemuck is sufficient)
+- Keys > 64 bytes (overflow pages — later phase)
 
 ---
 
-## Dependencias
+## Dependencies
 
 - `nexusdb-core`: `RecordId`, `PageId`, `DbError`
 - `nexusdb-storage`: `StorageEngine` trait, `Page`, `PAGE_SIZE`, `HEADER_SIZE`, `PageType::Index`
-- Crates nuevas: `bytemuck = { version = "1", features = ["derive"] }` (ya en workspace deps)
+- New crates: `bytemuck = { version = "1", features = ["derive"] }` (already in workspace deps)

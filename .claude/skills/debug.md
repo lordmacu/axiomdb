@@ -1,103 +1,103 @@
-# /debug — Debugging sistemático
+# /debug — Systematic debugging
 
-Nunca hacer cambios aleatorios esperando que funcione. Seguir este proceso.
+Never make random changes hoping they work. Follow this process.
 
-## Paso 1 — Reproducir con test mínimo
+## Step 1 — Reproduce with a minimal test
 
-Antes de investigar, escribir el test más pequeño posible que demuestre el bug:
+Before investigating, write the smallest possible test that demonstrates the bug:
 
 ```rust
 #[test]
-fn test_bug_reproduccion() {
-    // Setup mínimo — solo lo necesario para reproducir
+fn test_bug_reproduction() {
+    // Minimal setup — only what is needed to reproduce
     let storage = MemoryStorage::new();
 
-    // Acción que causa el bug
+    // Action that causes the bug
     let result = do_thing(storage);
 
-    // Verificar el comportamiento incorrecto
-    assert_eq!(result, expected); // esto debe FALLAR para confirmar el bug
+    // Verify the incorrect behavior
+    assert_eq!(result, expected); // this must FAIL to confirm the bug
 }
 ```
 
-Si no puedes escribir un test que reproduzca el bug, el bug no está bien definido.
-Volver al usuario y pedir más información.
+If you cannot write a test that reproduces the bug, the bug is not well defined.
+Go back to the user and ask for more information.
 
-## Paso 2 — Formular hipótesis (mínimo 2)
+## Step 2 — Formulate hypotheses (minimum 2)
 
 ```
-Hipótesis A: [qué crees que está mal]
-  Evidencia a favor: [qué observaciones apoyan esto]
-  Cómo verificar: [experimento concreto]
+Hypothesis A: [what you think is wrong]
+  Evidence in favor: [what observations support this]
+  How to verify: [concrete experiment]
 
-Hipótesis B: [otra causa posible]
-  Evidencia a favor: [qué observaciones apoyan esto]
-  Cómo verificar: [experimento concreto]
+Hypothesis B: [another possible cause]
+  Evidence in favor: [what observations support this]
+  How to verify: [concrete experiment]
 ```
 
-No asumir la primera hipótesis. Siempre considerar al menos una alternativa.
+Do not assume the first hypothesis. Always consider at least one alternative.
 
-## Paso 3 — Verificar cada hipótesis
+## Step 3 — Verify each hypothesis
 
 ```rust
-// Agregar logging temporal para verificar (remover después)
-tracing::debug!("valor en punto X: {:?}", valor);
+// Add temporary logging to verify (remove afterwards)
+tracing::debug!("value at point X: {:?}", value);
 
-// O usar dbg! para valores rápidos
-dbg!(&estructura);
+// Or use dbg! for quick values
+dbg!(&structure);
 
-// Para concurrencia: agregar contadores atómicos
+// For concurrency: add atomic counters
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 COUNTER.fetch_add(1, Ordering::Relaxed);
 ```
 
-Verificar hipótesis en orden, no en paralelo.
-Una vez descartada una hipótesis, documentar por qué.
+Verify hypotheses in order, not in parallel.
+Once a hypothesis is discarded, document why.
 
-## Paso 4 — Fix en el lugar correcto
+## Step 4 — Fix in the right place
 
 ```
-❌ Parchar el síntoma:
+❌ Patch the symptom:
    if result.is_err() { return Ok(default_value); }
 
-✅ Fix la causa raíz:
-   // El problema era que X no inicializaba Y correctamente
-   // Fix: inicializar Y antes de usar X
+✅ Fix the root cause:
+   // The problem was that X did not initialize Y correctly
+   // Fix: initialize Y before using X
 ```
 
-El fix debe ser el mínimo cambio que resuelve la causa raíz.
-No aprovechar para "limpiar" código no relacionado (eso va en otro commit).
+The fix must be the minimum change that resolves the root cause.
+Do not take the opportunity to "clean up" unrelated code (that goes in a separate commit).
 
-## Paso 5 — Test de regresión
+## Step 5 — Regression test
 
 ```rust
-// El test de reproducción del paso 1 ahora debe PASAR
-// Renombrarlo para que documente el bug que previene:
+// The reproduction test from step 1 must now PASS
+// Rename it to document the bug it prevents:
 
 #[test]
-fn test_btree_no_pierde_keys_despues_de_split() {
-    // Este test previene la regresión del bug donde el split
-    // del nodo interno perdía la primera key del hijo derecho
+fn test_btree_does_not_lose_keys_after_split() {
+    // This test prevents regression of the bug where the internal node
+    // split lost the first key of the right child
     ...
 }
 ```
 
-Agregar el test a la suite permanente. Nunca borrarlo.
+Add the test to the permanent suite. Never delete it.
 
-## Herramientas de debugging en Rust
+## Debugging tools in Rust
 
 ```bash
-# Ver backtrace completo
-RUST_BACKTRACE=full cargo test nombre_del_test
+# Show full backtrace
+RUST_BACKTRACE=full cargo test test_name
 
-# Sanitizers (detectar UB, memory leaks)
+# Sanitizers (detect UB, memory leaks)
 RUSTFLAGS="-Z sanitizer=address" cargo +nightly test
 RUSTFLAGS="-Z sanitizer=thread" cargo +nightly test  # race conditions
 
-# Miri (detectar UB en código unsafe)
-cargo +nightly miri test nombre_del_test
+# Miri (detect UB in unsafe code)
+cargo +nightly miri test test_name
 
-# Para async: tokio-console
+# For async: tokio-console
 cargo add tokio-console
-# En código: console_subscriber::init();
+# In code: console_subscriber::init();
 ```

@@ -1,2 +1,2 @@
-//! # nexusdb-functions — Funciones built-in SQL (string, math, date, json)
-//! Stub — implementación en Fase N.
+//! # nexusdb-functions — Built-in SQL functions (string, math, date, json)
+//! Stub — implementation in Phase N.

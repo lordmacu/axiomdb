@@ -1,2 +1,2 @@
 //! # nexusdb-cache — Query result cache, LRU eviction
-//! Stub — implementación en Fase N.
+//! Stub — implementation in Phase N.

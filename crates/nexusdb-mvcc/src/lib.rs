@@ -1,2 +1,2 @@
-//! # nexusdb-mvcc — Transacciones, snapshot isolation, SSI, locks
-//! Stub — implementación en Fase N.
+//! # nexusdb-mvcc — Transactions, snapshot isolation, SSI, locks
+//! Stub — implementation in Phase N.

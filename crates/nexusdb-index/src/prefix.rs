@@ -1,47 +1,47 @@
-//! Prefix compression para nodos internos del B+ Tree.
+//! Prefix compression for B+ Tree internal nodes.
 //!
-//! Los nodos internos suelen tener keys con prefijos comunes (e.g., todos empiezan
-//! con `"usuario:"`). Extraer el prefijo una sola vez permite almacenar solo los
-//! sufijos únicos, reduciendo el uso de RAM y mejorando cache locality.
+//! Internal nodes often have keys with common prefixes (e.g., all starting
+//! with `"user:"`). Extracting the prefix once allows storing only the unique
+//! suffixes, reducing RAM usage and improving cache locality.
 //!
-//! Esta compresión opera **solo en memoria** — el layout en disco no cambia.
+//! This compression operates **in memory only** — the on-disk layout does not change.
 
-/// Nodo interno con compresión de prefijos.
+/// Internal node with prefix compression.
 ///
-/// # Ejemplo
+/// # Example
 /// ```
 /// use nexusdb_index::prefix::CompressedNode;
 ///
 /// let keys: Vec<Box<[u8]>> = vec![
-///     b"usuario:00001".to_vec().into_boxed_slice(),
-///     b"usuario:00002".to_vec().into_boxed_slice(),
-///     b"usuario:00003".to_vec().into_boxed_slice(),
+///     b"user:00001".to_vec().into_boxed_slice(),
+///     b"user:00002".to_vec().into_boxed_slice(),
+///     b"user:00003".to_vec().into_boxed_slice(),
 /// ];
 /// let children = vec![10u64, 20, 30, 40];
 /// let node = CompressedNode::from_keys(&keys, children);
-/// // prefijo común de "usuario:00001/2/3" = "usuario:0000"
-/// assert_eq!(node.common_prefix, b"usuario:0000");
-/// assert_eq!(node.reconstruct_key(0), b"usuario:00001");
+/// // common prefix of "user:00001/2/3" = "user:0000"
+/// assert_eq!(node.common_prefix, b"user:0000");
+/// assert_eq!(node.reconstruct_key(0), b"user:00001");
 /// ```
 pub struct CompressedNode {
-    /// Prefijo común de todas las keys del nodo.
+    /// Common prefix of all keys in the node.
     pub common_prefix: Vec<u8>,
-    /// Sufijos (la parte única de cada key, sin el prefijo).
+    /// Suffixes (the unique part of each key, without the prefix).
     pub suffixes: Vec<Vec<u8>>,
-    /// Punteros a páginas hijas (len = suffixes.len() + 1).
+    /// Pointers to child pages (len = suffixes.len() + 1).
     pub children: Vec<u64>,
 }
 
 impl CompressedNode {
-    /// Construye un `CompressedNode` desde keys y children.
+    /// Builds a `CompressedNode` from keys and children.
     ///
-    /// Si todas las keys comparten un prefijo, se extrae. Si no hay prefijo común
-    /// (o hay 0 keys), `common_prefix` queda vacío.
+    /// If all keys share a prefix, it is extracted. If there is no common prefix
+    /// (or there are 0 keys), `common_prefix` remains empty.
     pub fn from_keys(keys: &[Box<[u8]>], children: Vec<u64>) -> Self {
         debug_assert_eq!(
             children.len(),
             keys.len() + 1,
-            "children.len() debe ser keys.len() + 1"
+            "children.len() must be keys.len() + 1"
         );
 
         let common_prefix = Self::find_common_prefix(keys);
@@ -55,24 +55,24 @@ impl CompressedNode {
         }
     }
 
-    /// Reconstruye la key completa en posición `idx`.
+    /// Reconstructs the full key at position `idx`.
     pub fn reconstruct_key(&self, idx: usize) -> Vec<u8> {
         let mut key = self.common_prefix.clone();
         key.extend_from_slice(&self.suffixes[idx]);
         key
     }
 
-    /// Encuentra el child page_id para una `search_key` dada.
+    /// Finds the child page_id for a given `search_key`.
     ///
-    /// Equivalente a `find_child_idx` pero operando sobre los sufijos comprimidos.
+    /// Equivalent to `find_child_idx` but operating on compressed suffixes.
     pub fn find_child(&self, search_key: &[u8]) -> u64 {
         let n = self.suffixes.len();
         let plen = self.common_prefix.len();
 
-        // Comparar con el prefijo primero
+        // Compare with the prefix first
         if search_key.len() < plen || &search_key[..plen] != self.common_prefix.as_slice() {
-            // Si search_key < common_prefix: ir al primer child
-            // Si search_key > todos: ir al último child
+            // If search_key < common_prefix: go to the first child
+            // If search_key > all: go to the last child
             if search_key < self.common_prefix.as_slice() {
                 return self.children[0];
             }
@@ -86,39 +86,39 @@ impl CompressedNode {
         self.children[child_idx]
     }
 
-    /// Encuentra el índice del child para una `search_key` dada.
+    /// Finds the child index for a given `search_key`.
     ///
-    /// Opera sobre los sufijos comprimidos — compara solo la parte única de cada key
-    /// tras extraer el prefijo común. Equivalente a `InternalNodePage::find_child_idx`
-    /// pero más eficiente cuando el prefijo común es largo.
+    /// Operates on compressed suffixes — compares only the unique part of each key
+    /// after extracting the common prefix. Equivalent to `InternalNodePage::find_child_idx`
+    /// but more efficient when the common prefix is long.
     ///
-    /// Retorna el índice `j` tal que `self.children[j]` contiene el rango de `search_key`.
+    /// Returns index `j` such that `self.children[j]` contains the range for `search_key`.
     pub fn find_child_idx(&self, search_key: &[u8]) -> usize {
         let n = self.suffixes.len();
         let plen = self.common_prefix.len();
 
-        // Si search_key no empieza con el prefijo común, navegar por extremos
+        // If search_key does not start with the common prefix, navigate to extremes
         if search_key.len() < plen || &search_key[..plen] != self.common_prefix.as_slice() {
             return if search_key < self.common_prefix.as_slice() {
-                0 // antes de todas las keys → primer child
+                0 // before all keys → first child
             } else {
-                n // después de todas las keys → último child
+                n // after all keys → last child
             };
         }
 
-        // Comparar solo el sufijo (la parte única)
+        // Compare only the suffix (the unique part)
         let suffix = &search_key[plen..];
         (0..n)
             .find(|&i| self.suffixes[i].as_slice() > suffix)
             .unwrap_or(n)
     }
 
-    /// Longitud del prefijo común de una lista de keys.
+    /// Length of the common prefix of a list of keys.
     pub fn common_prefix_len(keys: &[Box<[u8]>]) -> usize {
         Self::find_common_prefix(keys).len()
     }
 
-    /// Calcula el ahorro en bytes respecto a almacenar keys sin comprimir.
+    /// Calculates the byte savings compared to storing uncompressed keys.
     pub fn bytes_saved(&self) -> usize {
         let plen = self.common_prefix.len();
         plen * self.suffixes.len()
@@ -157,14 +157,14 @@ mod tests {
     #[test]
     fn test_prefix_extraction() {
         let keys = vec![
-            bkey(b"usuario:00001"),
-            bkey(b"usuario:00002"),
-            bkey(b"usuario:00003"),
+            bkey(b"user:00001"),
+            bkey(b"user:00002"),
+            bkey(b"user:00003"),
         ];
         let children = vec![1u64, 2, 3, 4];
         let node = CompressedNode::from_keys(&keys, children);
-        // prefijo común = "usuario:0000" (los 3 difieren solo en el último dígito)
-        assert_eq!(node.common_prefix, b"usuario:0000");
+        // common prefix = "user:0000" (the 3 differ only in the last digit)
+        assert_eq!(node.common_prefix, b"user:0000");
         assert_eq!(node.suffixes[0], b"1");
         assert_eq!(node.suffixes[1], b"2");
         assert_eq!(node.suffixes[2], b"3");
@@ -195,12 +195,12 @@ mod tests {
         let children = vec![100u64, 200, 300, 400];
         let node = CompressedNode::from_keys(&keys, children.clone());
 
-        assert_eq!(node.find_child(b"item:0005"), 100); // antes del primero
-        assert_eq!(node.find_child(b"item:0010"), 200); // igual al primero → right
-        assert_eq!(node.find_child(b"item:0015"), 200); // entre primero y segundo
+        assert_eq!(node.find_child(b"item:0005"), 100); // before the first
+        assert_eq!(node.find_child(b"item:0010"), 200); // equal to first → right
+        assert_eq!(node.find_child(b"item:0015"), 200); // between first and second
         assert_eq!(node.find_child(b"item:0020"), 300);
         assert_eq!(node.find_child(b"item:0030"), 400);
-        assert_eq!(node.find_child(b"item:0099"), 400); // después del último
+        assert_eq!(node.find_child(b"item:0099"), 400); // after the last
     }
 
     #[test]
@@ -212,7 +212,7 @@ mod tests {
         ];
         let children = vec![1u64, 2, 3, 4];
         let node = CompressedNode::from_keys(&keys, children);
-        // prefijo = "prefix_long:" = 12 bytes × 3 keys = 36 bytes ahorrados
+        // prefix = "prefix_long:" = 12 bytes × 3 keys = 36 bytes saved
         assert_eq!(node.bytes_saved(), 12 * 3);
     }
 

@@ -269,27 +269,27 @@ fn test_string_unknown_escape_passthrough() {
 
 #[test]
 fn test_plain_identifier() {
-    assert!(matches!(&tokens("my_table")[0], Token::Ident(s) if s == "my_table"));
+    assert!(matches!(&tokens("my_table")[0], Token::Ident(s) if *s == "my_table"));
 }
 
 #[test]
 fn test_identifier_with_digits() {
-    assert!(matches!(&tokens("col1")[0], Token::Ident(s) if s == "col1"));
+    assert!(matches!(&tokens("col1")[0], Token::Ident(s) if *s == "col1"));
 }
 
 #[test]
 fn test_identifier_underscore_prefix() {
-    assert!(matches!(&tokens("_private")[0], Token::Ident(s) if s == "_private"));
+    assert!(matches!(&tokens("_private")[0], Token::Ident(s) if *s == "_private"));
 }
 
 #[test]
 fn test_backtick_identifier() {
-    assert!(matches!(&tokens("`my table`")[0], Token::QuotedIdent(s) if s == "my table"));
+    assert!(matches!(&tokens("`my table`")[0], Token::QuotedIdent(s) if *s == "my table"));
 }
 
 #[test]
 fn test_double_quote_identifier() {
-    assert!(matches!(&tokens(r#""my col""#)[0], Token::DqIdent(s) if s == "my col"));
+    assert!(matches!(&tokens(r#""my col""#)[0], Token::DqIdent(s) if *s == "my col"));
 }
 
 // ── Operators ─────────────────────────────────────────────────────────────────
@@ -503,18 +503,18 @@ fn test_never_panics_unicode_text() {
 fn test_full_select_query() {
     let toks = tokens("SELECT id, name FROM users WHERE age > 18 ORDER BY name ASC LIMIT 10");
     assert_eq!(toks[0], Token::Select);
-    assert!(matches!(&toks[1], Token::Ident(s) if s == "id"));
+    assert!(matches!(&toks[1], Token::Ident(s) if *s == "id"));
     assert_eq!(toks[2], Token::Comma);
-    assert!(matches!(&toks[3], Token::Ident(s) if s == "name"));
+    assert!(matches!(&toks[3], Token::Ident(s) if *s == "name"));
     assert_eq!(toks[4], Token::From);
-    assert!(matches!(&toks[5], Token::Ident(s) if s == "users"));
+    assert!(matches!(&toks[5], Token::Ident(s) if *s == "users"));
     assert_eq!(toks[6], Token::Where);
-    assert!(matches!(&toks[7], Token::Ident(s) if s == "age"));
+    assert!(matches!(&toks[7], Token::Ident(s) if *s == "age"));
     assert_eq!(toks[8], Token::Gt);
     assert_eq!(toks[9], Token::Integer(18));
     assert_eq!(toks[10], Token::Order);
     assert_eq!(toks[11], Token::By);
-    assert!(matches!(&toks[12], Token::Ident(s) if s == "name"));
+    assert!(matches!(&toks[12], Token::Ident(s) if *s == "name"));
     assert_eq!(toks[13], Token::Asc);
     assert_eq!(toks[14], Token::Limit);
     assert_eq!(toks[15], Token::Integer(10));
@@ -526,7 +526,7 @@ fn test_full_insert_query() {
     let toks = tokens("INSERT INTO users (id, name) VALUES (1, 'Alice')");
     assert_eq!(toks[0], Token::Insert);
     assert_eq!(toks[1], Token::Into);
-    assert!(matches!(&toks[2], Token::Ident(s) if s == "users"));
+    assert!(matches!(&toks[2], Token::Ident(s) if *s == "users"));
     assert_eq!(toks[3], Token::LParen);
     assert_eq!(toks[5], Token::Comma);
     assert_eq!(toks[7], Token::RParen);
@@ -543,14 +543,14 @@ fn test_create_table_query() {
     let toks = tokens("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)");
     assert_eq!(toks[0], Token::Create);
     assert_eq!(toks[1], Token::Table);
-    assert!(matches!(&toks[2], Token::Ident(s) if s == "users"));
+    assert!(matches!(&toks[2], Token::Ident(s) if *s == "users"));
     assert_eq!(toks[3], Token::LParen);
-    assert!(matches!(&toks[4], Token::Ident(s) if s == "id"));
+    assert!(matches!(&toks[4], Token::Ident(s) if *s == "id"));
     assert_eq!(toks[5], Token::TyBigint);
     assert_eq!(toks[6], Token::Primary);
     assert_eq!(toks[7], Token::Key);
     assert_eq!(toks[8], Token::Comma);
-    assert!(matches!(&toks[9], Token::Ident(s) if s == "name"));
+    assert!(matches!(&toks[9], Token::Ident(s) if *s == "name"));
     assert_eq!(toks[10], Token::TyText);
     assert_eq!(toks[11], Token::Not);
     assert_eq!(toks[12], Token::Null);

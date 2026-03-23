@@ -1,68 +1,68 @@
-//! WAL Entry — formato binario de cada registro del Write-Ahead Log.
+//! WAL Entry — binary format of each Write-Ahead Log record.
 //!
-//! ## Layout en disco
+//! ## On-disk layout
 //!
 //! ```text
-//! Offset    Tamaño  Campo
-//!      0         4  entry_len      u32 LE — longitud total del entry
-//!      4         8  lsn            u64 LE — Log Sequence Number, monotónico global
+//! Offset    Size    Field
+//!      0         4  entry_len      u32 LE — total entry length
+//!      4         8  lsn            u64 LE — Log Sequence Number, globally monotonic
 //!     12         8  txn_id         u64 LE — Transaction ID (0 = autocommit)
 //!     20         1  entry_type     u8     — EntryType
-//!     21         4  table_id       u32 LE — identificador de tabla (0 = sistema)
-//!     25         2  key_len        u16 LE — longitud de key en bytes
-//!     27  key_len   key            [u8]   — bytes de la key
-//!      ?         4  old_val_len    u32 LE — longitud del valor anterior (0 en INSERT)
-//!      ?  old_len   old_value      [u8]   — valor anterior (vacío en INSERT)
-//!      ?         4  new_val_len    u32 LE — longitud del valor nuevo (0 en DELETE)
-//!      ?  new_len   new_value      [u8]   — valor nuevo (vacío en DELETE)
-//!      ?         4  crc32c         u32 LE — CRC32c de todos los bytes anteriores
-//!      ?         4  entry_len_2    u32 LE — copia de entry_len para scan backward
+//!     21         4  table_id       u32 LE — table identifier (0 = system)
+//!     25         2  key_len        u16 LE — key length in bytes
+//!     27  key_len   key            [u8]   — key bytes
+//!      ?         4  old_val_len    u32 LE — old value length (0 on INSERT)
+//!      ?  old_len   old_value      [u8]   — old value (empty on INSERT)
+//!      ?         4  new_val_len    u32 LE — new value length (0 on DELETE)
+//!      ?  new_len   new_value      [u8]   — new value (empty on DELETE)
+//!      ?         4  crc32c         u32 LE — CRC32c of all preceding bytes
+//!      ?         4  entry_len_2    u32 LE — copy of entry_len for backward scan
 //! ```
 //!
-//! **Tamaño mínimo** (BEGIN/COMMIT/ROLLBACK sin key ni valores): 43 bytes.
+//! **Minimum size** (BEGIN/COMMIT/ROLLBACK without key or values): 43 bytes.
 //!
-//! ## Scan backward
+//! ## Backward scan
 //!
-//! Para recorrer el WAL hacia atrás (ROLLBACK, crash recovery):
+//! To traverse the WAL backward (ROLLBACK, crash recovery):
 //! ```text
-//! pos_inicio_entry = pos_fin_entry - entry_len_2
+//! entry_start_pos = entry_end_pos - entry_len_2
 //! ```
-//! donde `entry_len_2` son los últimos 4 bytes del entry.
+//! where `entry_len_2` are the last 4 bytes of the entry.
 
 use nexusdb_core::error::DbError;
 
-// ── Constantes ────────────────────────────────────────────────────────────────
+// ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Tamaño del header fijo antes de los campos variables.
+/// Size of the fixed header before variable fields.
 /// 4 (entry_len) + 8 (lsn) + 8 (txn_id) + 1 (entry_type) + 4 (table_id) + 2 (key_len) = 27
 const FIXED_HEADER: usize = 27;
 
-/// Tamaño del trailer fijo después de los campos variables.
+/// Size of the fixed trailer after variable fields.
 /// 4 (old_val_len) + 4 (new_val_len) + 4 (crc32c) + 4 (entry_len_2) = 16
-/// — más los payloads variables entre medias.
-/// El overhead fijo total (sin payloads) es:
+/// — plus variable payloads in between.
+/// Total fixed overhead (without payloads):
 /// FIXED_HEADER + 4 (old_val_len) + 4 (new_val_len) + 4 (crc32c) + 4 (entry_len_2) = 43
 pub const MIN_ENTRY_LEN: usize = 43;
 
 // ── EntryType ─────────────────────────────────────────────────────────────────
 
-/// Tipo de operación registrada en el WAL.
+/// Type of operation recorded in the WAL.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryType {
-    /// Inicio de transacción explícita (`BEGIN`).
+    /// Start of an explicit transaction (`BEGIN`).
     Begin = 1,
-    /// Confirmación de transacción (`COMMIT`).
+    /// Transaction commit (`COMMIT`).
     Commit = 2,
-    /// Cancelación de transacción (`ROLLBACK`).
+    /// Transaction rollback (`ROLLBACK`).
     Rollback = 3,
-    /// Inserción de un nuevo par key→value. `old_value` vacío.
+    /// Insertion of a new key→value pair. `old_value` is empty.
     Insert = 4,
-    /// Eliminación de un par key→value. `new_value` vacío, `old_value` = valor antes del delete.
+    /// Deletion of a key→value pair. `new_value` is empty, `old_value` = value before deletion.
     Delete = 5,
-    /// Modificación de un par key→value. Ambos `old_value` y `new_value` presentes.
+    /// Modification of a key→value pair. Both `old_value` and `new_value` are present.
     Update = 6,
-    /// Punto de checkpoint — marca hasta dónde los datos están en disco. Sin payload.
+    /// Checkpoint point — marks how far data is on disk. No payload.
     Checkpoint = 7,
 }
 
@@ -85,34 +85,34 @@ impl TryFrom<u8> for EntryType {
 
 // ── WalEntry ──────────────────────────────────────────────────────────────────
 
-/// Registro lógico del Write-Ahead Log.
+/// Logical Write-Ahead Log record.
 ///
-/// Representa una operación semántica (INSERT, DELETE, UPDATE, control de transacción).
-/// La serialización a bytes se hace con [`WalEntry::to_bytes`]; la deserialización
-/// con [`WalEntry::from_bytes`].
+/// Represents a semantic operation (INSERT, DELETE, UPDATE, transaction control).
+/// Serialization to bytes is done with [`WalEntry::to_bytes`]; deserialization
+/// with [`WalEntry::from_bytes`].
 ///
-/// Los campos `entry_len` y `crc32c` no se almacenan en memoria — se calculan
-/// automáticamente al serializar y se verifican al deserializar.
+/// The `entry_len` and `crc32c` fields are not stored in memory — they are
+/// calculated automatically on serialization and verified on deserialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalEntry {
-    /// Log Sequence Number — número monotónico global. Asignado por el WalWriter.
+    /// Log Sequence Number — globally monotonic number. Assigned by the WalWriter.
     pub lsn: u64,
-    /// Identificador de transacción. `0` = autocommit (sin transacción explícita).
+    /// Transaction identifier. `0` = autocommit (no explicit transaction).
     pub txn_id: u64,
-    /// Tipo de operación.
+    /// Operation type.
     pub entry_type: EntryType,
-    /// Identificador de la tabla afectada. `0` = sistema/meta.
+    /// Identifier of the affected table. `0` = system/meta.
     pub table_id: u32,
-    /// Key de la operación. Vacío en entries de control (Begin, Commit, Rollback, Checkpoint).
+    /// Operation key. Empty for control entries (Begin, Commit, Rollback, Checkpoint).
     pub key: Vec<u8>,
-    /// Valor anterior al cambio. Vacío en INSERT y entries de control.
+    /// Value before the change. Empty on INSERT and control entries.
     pub old_value: Vec<u8>,
-    /// Valor nuevo tras el cambio. Vacío en DELETE y entries de control.
+    /// Value after the change. Empty on DELETE and control entries.
     pub new_value: Vec<u8>,
 }
 
 impl WalEntry {
-    /// Crea un nuevo `WalEntry`.
+    /// Creates a new `WalEntry`.
     pub fn new(
         lsn: u64,
         txn_id: u64,
@@ -133,23 +133,23 @@ impl WalEntry {
         }
     }
 
-    /// Calcula el tamaño total serializado en bytes, sin allocar.
+    /// Calculates the total serialized size in bytes, without allocating.
     ///
-    /// Útil para que el WalWriter prealoque el buffer exacto.
+    /// Useful for the WalWriter to pre-allocate the exact buffer.
     pub fn serialized_len(&self) -> usize {
         MIN_ENTRY_LEN + self.key.len() + self.old_value.len() + self.new_value.len()
     }
 
-    /// Serializa el entry al formato binario listo para escribir al archivo WAL.
+    /// Serializes the entry to binary format ready to write to the WAL file.
     ///
-    /// El resultado incluye `entry_len`, todos los campos, `crc32c` y `entry_len_2`.
+    /// The result includes `entry_len`, all fields, `crc32c`, and `entry_len_2`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let total = self.serialized_len();
         let mut buf = Vec::with_capacity(total);
 
         let total_u32 = total as u32;
 
-        // ── Header fijo ──────────────────────────────────────────
+        // ── Fixed header ─────────────────────────────────────────
         buf.extend_from_slice(&total_u32.to_le_bytes()); // entry_len
         buf.extend_from_slice(&self.lsn.to_le_bytes()); // lsn
         buf.extend_from_slice(&self.txn_id.to_le_bytes()); // txn_id
@@ -157,7 +157,7 @@ impl WalEntry {
         buf.extend_from_slice(&self.table_id.to_le_bytes()); // table_id
         buf.extend_from_slice(&(self.key.len() as u16).to_le_bytes()); // key_len
 
-        // ── Payload variable ─────────────────────────────────────
+        // ── Variable payload ─────────────────────────────────────
         buf.extend_from_slice(&self.key); // key
 
         buf.extend_from_slice(&(self.old_value.len() as u32).to_le_bytes()); // old_val_len
@@ -166,32 +166,32 @@ impl WalEntry {
         buf.extend_from_slice(&(self.new_value.len() as u32).to_le_bytes()); // new_val_len
         buf.extend_from_slice(&self.new_value); // new_value
 
-        // ── CRC32c (cubre todo lo anterior) ──────────────────────
+        // ── CRC32c (covers everything above) ─────────────────────
         let crc = crc32c::crc32c(&buf);
         buf.extend_from_slice(&crc.to_le_bytes()); // crc32c
 
-        // ── Trailer para backward scan ───────────────────────────
+        // ── Trailer for backward scan ────────────────────────────
         buf.extend_from_slice(&total_u32.to_le_bytes()); // entry_len_2
 
         debug_assert_eq!(
             buf.len(),
             total,
-            "serialized_len() no coincide con to_bytes().len()"
+            "serialized_len() does not match to_bytes().len()"
         );
         buf
     }
 
-    /// Deserializa un `WalEntry` desde un slice de bytes.
+    /// Deserializes a `WalEntry` from a byte slice.
     ///
-    /// Retorna `(entry, bytes_consumidos)`. El caller puede llamar en loop
-    /// incrementando el offset para parsear entries encadenados.
+    /// Returns `(entry, bytes_consumed)`. The caller can loop, incrementing
+    /// the offset, to parse chained entries.
     ///
-    /// # Errores
-    /// - [`DbError::WalEntryTruncated`] — el buffer es más corto que el entry
-    /// - [`DbError::WalChecksumMismatch`] — el CRC32c no coincide
-    /// - [`DbError::WalUnknownEntryType`] — tipo de entry desconocido
+    /// # Errors
+    /// - [`DbError::WalEntryTruncated`] — buffer is shorter than the entry
+    /// - [`DbError::WalChecksumMismatch`] — CRC32c does not match
+    /// - [`DbError::WalUnknownEntryType`] — unknown entry type
     pub fn from_bytes(buf: &[u8]) -> Result<(Self, usize), DbError> {
-        // Necesitamos al menos 4 bytes para leer entry_len
+        // We need at least 4 bytes to read entry_len
         if buf.len() < 4 {
             return Err(DbError::WalEntryTruncated { lsn: 0 });
         }
@@ -202,12 +202,12 @@ impl WalEntry {
             return Err(DbError::WalEntryTruncated { lsn: 0 });
         }
 
-        // Necesitamos al menos MIN_ENTRY_LEN bytes para un entry válido
+        // We need at least MIN_ENTRY_LEN bytes for a valid entry
         if entry_len < MIN_ENTRY_LEN {
             return Err(DbError::WalEntryTruncated { lsn: 0 });
         }
 
-        // ── Leer header fijo ─────────────────────────────────────
+        // ── Read fixed header ────────────────────────────────────
         let lsn = u64::from_le_bytes([
             buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
         ]);
@@ -220,7 +220,7 @@ impl WalEntry {
 
         let mut pos = FIXED_HEADER;
 
-        // ── Leer payload variable ────────────────────────────────
+        // ── Read variable payload ────────────────────────────────
         if pos + key_len > entry_len {
             return Err(DbError::WalEntryTruncated { lsn });
         }
@@ -253,7 +253,7 @@ impl WalEntry {
         let new_value = buf[pos..pos + new_val_len].to_vec();
         pos += new_val_len;
 
-        // ── Verificar CRC32c ─────────────────────────────────────
+        // ── Verify CRC32c ────────────────────────────────────────
         if pos + 4 > entry_len {
             return Err(DbError::WalEntryTruncated { lsn });
         }
@@ -268,7 +268,7 @@ impl WalEntry {
         }
         pos += 4;
 
-        // ── Verificar entry_len_2 (backward scan) ────────────────
+        // ── Verify entry_len_2 (backward scan) ───────────────────
         if pos + 4 > entry_len {
             return Err(DbError::WalEntryTruncated { lsn });
         }
@@ -293,7 +293,7 @@ impl WalEntry {
     }
 }
 
-// ── Tests unitarios ───────────────────────────────────────────────────────────
+// ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -307,7 +307,7 @@ mod tests {
             1,
             b"user:001".to_vec(),
             vec![],
-            vec![5u8, 0, 0, 0, 0, 0, 0, 0, 3, 0], // RecordId simulado (10 bytes)
+            vec![5u8, 0, 0, 0, 0, 0, 0, 0, 3, 0], // simulated RecordId (10 bytes)
         )
     }
 
@@ -349,7 +349,7 @@ mod tests {
         let entry = make_insert(5);
         let bytes = entry.to_bytes();
         let len = bytes.len();
-        // Primeros 4 bytes == últimos 4 bytes
+        // First 4 bytes == last 4 bytes
         let front = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let back = u32::from_le_bytes([
             bytes[len - 4],
@@ -359,7 +359,7 @@ mod tests {
         ]);
         assert_eq!(
             front, back,
-            "entry_len al inicio debe coincidir con entry_len_2 al final"
+            "entry_len at the start must match entry_len_2 at the end"
         );
     }
 
@@ -385,7 +385,7 @@ mod tests {
     fn test_crc_corruption_detected() {
         let entry = make_insert(10);
         let mut bytes = entry.to_bytes();
-        // Flip de un bit en el payload (posición 30 = dentro de key)
+        // Flip one bit in the payload (position 30 = inside key)
         bytes[30] ^= 0xFF;
         assert!(matches!(
             WalEntry::from_bytes(&bytes),
@@ -397,7 +397,7 @@ mod tests {
     fn test_truncated_buffer() {
         let entry = make_insert(20);
         let bytes = entry.to_bytes();
-        // Buffer más corto que entry_len
+        // Buffer shorter than entry_len
         let truncated = &bytes[..bytes.len() - 1];
         assert!(matches!(
             WalEntry::from_bytes(truncated),

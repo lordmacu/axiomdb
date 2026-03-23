@@ -1,9 +1,9 @@
-//! Benchmarks del B+ Tree con Criterion.
+//! B+ Tree benchmarks with Criterion.
 //!
-//! Comparaciones objetivo (ver CLAUDE.md presupuesto de rendimiento):
-//! - Point lookup: 800k ops/s objetivo
-//! - Range scan 10K rows: 45ms objetivo
-//! - INSERT con splits: 180k ops/s objetivo
+//! Target comparisons (see CLAUDE.md performance budget):
+//! - Point lookup: 800k ops/s target
+//! - Range scan 10K rows: 45ms target
+//! - INSERT with splits: 180k ops/s target
 
 use std::collections::BTreeMap;
 use std::hint::black_box;
@@ -46,7 +46,7 @@ fn bench_point_lookup(c: &mut Criterion) {
     for size in [10_000usize, 100_000, 1_000_000] {
         group.throughput(Throughput::Elements(1));
 
-        // BTree nuestro
+        // Our BTree
         let tree = build_tree(size);
         group.bench_with_input(BenchmarkId::new("nexusdb_btree", size), &size, |b, &n| {
             let mut i = 0usize;
@@ -57,7 +57,7 @@ fn bench_point_lookup(c: &mut Criterion) {
             });
         });
 
-        // std::collections::BTreeMap como referencia
+        // std::collections::BTreeMap as baseline reference
         let std_map = build_std_btreemap(size);
         group.bench_with_input(BenchmarkId::new("std_btreemap", size), &size, |b, &n| {
             let mut i = 0usize;
@@ -123,7 +123,7 @@ fn bench_range_scan(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Insert secuencial ────────────────────────────────────────────────────────
+// ── Sequential insert ────────────────────────────────────────────────────────
 
 fn bench_insert_sequential(c: &mut Criterion) {
     let mut group = c.benchmark_group("insert_sequential");
@@ -154,16 +154,16 @@ fn bench_insert_sequential(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Insert aleatorio ─────────────────────────────────────────────────────────
+// ── Random insert ─────────────────────────────────────────────────────────────
 
 fn bench_insert_random(c: &mut Criterion) {
     let mut group = c.benchmark_group("insert_random");
     group.throughput(Throughput::Elements(1));
 
-    // Generar keys aleatorias (pseudoaleatorio determinista)
+    // Generate random keys (deterministic pseudorandom)
     let keys: Vec<Vec<u8>> = (0..100_000u64)
         .map(|i| {
-            // Mezclar con XOR shift para romper la secuencialidad
+            // Scramble with XOR shift to break sequential ordering
             let scrambled = i
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
@@ -184,11 +184,11 @@ fn bench_insert_random(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Insert 1M secuencial — throughput y splits a escala ─────────────────────
+// ── 1M sequential insert — throughput and splits at scale ────────────────────
 
 fn bench_insert_1m_sequential(c: &mut Criterion) {
     let mut group = c.benchmark_group("insert_1m_sequential");
-    // Tiempo de medición extendido para 1M inserts
+    // Extended measurement time for 1M inserts
     group.measurement_time(std::time::Duration::from_secs(60));
     group.sample_size(10);
     group.throughput(Throughput::Elements(1_000_000));
@@ -197,7 +197,7 @@ fn bench_insert_1m_sequential(c: &mut Criterion) {
         b.iter(|| {
             let mut tree = BTree::new(Box::new(MemoryStorage::new()), None).unwrap();
             for i in 0..1_000_000u64 {
-                let key = i.to_be_bytes(); // 8 bytes, secuencial ordenado
+                let key = i.to_be_bytes(); // 8 bytes, sequentially ordered
                 tree.insert(&key, rid(i)).unwrap();
             }
             black_box(tree.root_page_id())

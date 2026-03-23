@@ -1,105 +1,105 @@
-# /unsafe-review — Auditar bloques unsafe
+# /unsafe-review — Audit unsafe blocks
 
-## Encontrar todos los bloques unsafe
+## Find all unsafe blocks
 
 ```bash
-# Listar todos los unsafe en el proyecto
+# List all unsafe in the project
 grep -rn "unsafe" crates/ --include="*.rs" | grep -v "// SAFETY:"
 
-# Ver contexto completo de cada unsafe
+# See full context of each unsafe
 grep -rn -A 5 -B 2 "unsafe {" crates/ --include="*.rs"
 ```
 
-## Para cada bloque unsafe, responder estas preguntas
+## For each unsafe block, answer these questions
 
-### 1. ¿Es realmente necesario?
+### 1. Is it really necessary?
 
-Intentar alternativas safe primero:
+Try safe alternatives first:
 
 ```rust
-// ¿Puede resolverse con bytemuck?
+// Can it be solved with bytemuck?
 use bytemuck::{Pod, Zeroable};
 #[repr(C)]
 #[derive(Pod, Zeroable, Clone, Copy)]
 struct Page { ... }
 let page: &Page = bytemuck::from_bytes(&bytes);  // safe!
 
-// ¿Puede resolverse con rkyv?
+// Can it be solved with rkyv?
 use rkyv::{Archive, Deserialize};
 let archived = unsafe { rkyv::access_unchecked::<Page>(&bytes) };
-// rkyv hace el unsafe internamente con invariantes garantizados
+// rkyv handles the unsafe internally with guaranteed invariants
 
-// ¿Puede restructurarse para evitar el raw pointer?
+// Can it be restructured to avoid the raw pointer?
 ```
 
-### 2. ¿Qué invariante garantiza que es seguro?
+### 2. What invariant guarantees it is safe?
 
-El comentario SAFETY debe ser específico, no genérico:
+The SAFETY comment must be specific, not generic:
 
 ```rust
-// ❌ MAL — demasiado vago
-// SAFETY: es seguro
+// ❌ BAD — too vague
+// SAFETY: it is safe
 
-// ❌ MAL — no explica el invariante
-// SAFETY: confiamos en que el puntero es válido
+// ❌ BAD — does not explain the invariant
+// SAFETY: we trust the pointer is valid
 
-// ✅ BIEN — específico y verificable
-// SAFETY: `ptr` es válido porque:
-//   1. Se obtiene de `mmap.as_ptr()` que siempre retorna memoria válida
-//   2. `page_id < self.total_pages` verificado en la línea 42
-//   3. La alineación de Page (align=64) es compatible con el puntero del mmap
-//   4. El mmap vive mientras `StorageEngine` existe (garantizado por Arc<Mmap>)
+// ✅ GOOD — specific and verifiable
+// SAFETY: `ptr` is valid because:
+//   1. It comes from `mmap.as_ptr()` which always returns valid memory
+//   2. `page_id < self.total_pages` verified at line 42
+//   3. The alignment of Page (align=64) is compatible with the mmap pointer
+//   4. The mmap lives as long as `StorageEngine` exists (guaranteed by Arc<Mmap>)
 let page = unsafe { &*(ptr as *const Page) };
 ```
 
-### 3. ¿Hay test que verifica el contrato?
+### 3. Is there a test that verifies the contract?
 
 ```rust
 #[test]
 fn test_safety_invariant_mmap_pointer() {
-    // Verificar que el unsafe es realmente seguro en los casos límite
+    // Verify the unsafe is truly safe at edge cases
     let storage = MmapStorage::create_temp();
 
-    // Caso límite: última página válida
+    // Edge case: last valid page
     let last_page = storage.total_pages() - 1;
     let result = storage.read_page(last_page);
     assert!(result.is_ok());
 
-    // Verificar que falla apropiadamente fuera de rango
+    // Verify it fails appropriately out of range
     let result = storage.read_page(storage.total_pages());
     assert!(matches!(result, Err(DbError::PageNotFound { .. })));
 }
 ```
 
-### 4. ¿Está encapsulado correctamente?
+### 4. Is it correctly encapsulated?
 
 ```rust
-// ❌ MAL — unsafe expuesto al caller
+// ❌ BAD — unsafe exposed to caller
 pub fn get_page_ptr(id: u64) -> *const Page { ... }
 
-// ✅ BIEN — unsafe encapsulado, interfaz pública es safe
+// ✅ GOOD — unsafe encapsulated, public interface is safe
 pub fn read_page(&self, id: u64) -> Result<&Page, DbError> {
     if id >= self.total_pages {
         return Err(DbError::PageNotFound { page_id: id });
     }
     let ptr = self.mmap.as_ptr().add(id as usize * PAGE_SIZE);
-    // SAFETY: [invariante completo aquí]
+    // SAFETY: [complete invariant here]
     Ok(unsafe { &*(ptr as *const Page) })
 }
 ```
 
-## Checklist por bloque unsafe
+## Checklist per unsafe block
 
 ```
-[ ] ¿Intenté bytemuck/rkyv/restructurar primero?
-[ ] ¿El comentario SAFETY explica el invariante específico?
-[ ] ¿El comentario menciona por qué cada condición se cumple?
-[ ] ¿Hay test que verifica el contrato en casos límite?
-[ ] ¿La función pública tiene firma safe aunque internamente use unsafe?
-[ ] ¿Corrí miri sobre este código?
+[ ] Did I try bytemuck/rkyv/restructuring first?
+[ ] Does the SAFETY comment explain the specific invariant?
+[ ] Does the comment mention why each condition holds?
+[ ] Is there a test that verifies the contract at edge cases?
+[ ] Does the public function have a safe signature even if it uses unsafe internally?
+[ ] Did I run miri on this code?
 ```
 
 ```bash
-# Verificar con miri (detecta UB en unsafe)
-cargo +nightly miri test nombre_del_test_unsafe
+# Verify with miri (detects UB in unsafe)
+cargo +nightly miri test unsafe_test_name
 ```

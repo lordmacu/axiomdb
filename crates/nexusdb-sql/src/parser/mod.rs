@@ -54,20 +54,22 @@ pub fn parse(input: &str, max_bytes: Option<usize>) -> Result<Stmt, DbError> {
 // ── Parser struct ─────────────────────────────────────────────────────────────
 
 /// Recursive descent parser over a slice of [`SpannedToken`]s.
-pub(crate) struct Parser<'a> {
-    tokens: &'a [SpannedToken],
+///
+/// The lifetime `'src` is tied to the original SQL input string.
+pub(crate) struct Parser<'src> {
+    tokens: &'src [SpannedToken<'src>],
     pos: usize,
 }
 
-impl<'a> Parser<'a> {
-    pub(crate) fn new(tokens: &'a [SpannedToken]) -> Self {
+impl<'src> Parser<'src> {
+    pub(crate) fn new(tokens: &'src [SpannedToken<'src>]) -> Self {
         Self { tokens, pos: 0 }
     }
 
     // ── Peek helpers ──────────────────────────────────────────────────────────
 
     /// Current token without advancing. Returns `&Token::Eof` at end of stream.
-    pub(crate) fn peek(&self) -> &Token {
+    pub(crate) fn peek(&self) -> &Token<'src> {
         self.tokens
             .get(self.pos)
             .map(|st| &st.token)
@@ -76,7 +78,7 @@ impl<'a> Parser<'a> {
 
     /// Look-ahead by `offset` positions. Returns `&Token::Eof` past end.
     #[allow(dead_code)]
-    pub(crate) fn peek_at(&self, offset: usize) -> &Token {
+    pub(crate) fn peek_at(&self, offset: usize) -> &Token<'src> {
         self.tokens
             .get(self.pos + offset)
             .map(|st| &st.token)
@@ -104,14 +106,14 @@ impl<'a> Parser<'a> {
 
     /// Consume current token and advance. Panics only if already at Eof
     /// (should not happen — callers must check `peek() != Eof` first).
-    pub(crate) fn advance(&mut self) -> &SpannedToken {
+    pub(crate) fn advance(&mut self) -> &SpannedToken<'src> {
         let st = &self.tokens[self.pos];
         self.pos += 1;
         st
     }
 
     /// Consume if the current token equals `expected`; return error otherwise.
-    pub(crate) fn expect(&mut self, expected: &Token) -> Result<(), DbError> {
+    pub(crate) fn expect(&mut self, expected: &Token<'_>) -> Result<(), DbError> {
         if self.peek() == expected {
             self.pos += 1;
             Ok(())
@@ -128,7 +130,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Consume if current token equals `expected`; return `false` if not.
-    pub(crate) fn eat(&mut self, expected: &Token) -> bool {
+    pub(crate) fn eat(&mut self, expected: &Token<'_>) -> bool {
         if self.peek() == expected {
             self.pos += 1;
             true
@@ -141,13 +143,14 @@ impl<'a> Parser<'a> {
 
     /// Parse an unquoted or quoted identifier.
     ///
+    /// Converts the zero-copy `&'src str` to an owned `String` exactly once.
     /// Validates the 64-character limit (4.3d).
     pub(crate) fn parse_identifier(&mut self) -> Result<String, DbError> {
         let pos = self.current_pos();
         let name = match self.peek().clone() {
-            Token::Ident(name) | Token::QuotedIdent(name) | Token::DqIdent(name) => {
+            Token::Ident(s) | Token::QuotedIdent(s) | Token::DqIdent(s) => {
                 self.pos += 1;
-                name
+                s.to_string() // &'src str → String: the one allocation per identifier
             }
             // Allow certain keywords to be used as identifiers (unreserved words).
             Token::Key
@@ -307,7 +310,7 @@ fn validate_identifier_length(name: &str, pos: usize) -> Result<(), DbError> {
 
 /// Convert a keyword token to its string representation (for unreserved keyword
 /// use as identifier).
-fn keyword_as_identifier(tok: &Token) -> String {
+fn keyword_as_identifier(tok: &Token<'_>) -> String {
     match tok {
         Token::Key => "key".into(),
         Token::Index => "index".into(),

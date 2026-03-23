@@ -1,14 +1,14 @@
-# Documentación de implementación
+# Implementation documentation
 
-Cada fase completada tiene su propio archivo aquí.
-El archivo describe qué se construyó, decisiones tomadas y cómo continuar.
+Each completed phase has its own file here.
+The file describes what was built, decisions made, and how to continue.
 
-| Fase | Archivo | Estado |
+| Phase | File | Status |
 |------|---------|--------|
-| 1 — Storage básico | [fase-01.md](fase-01.md) | ⏳ pendiente |
-| 2 — B+ Tree | [fase-02.md](fase-02.md) | ⏳ pendiente |
-| 3 — WAL y transacciones | [fase-03.md](fase-03.md) | ⏳ pendiente |
-| 4 — SQL Parser + Executor | [fase-04.md](fase-04.md) | ⏳ pendiente |
-| 5 — MySQL wire protocol | [fase-05.md](fase-05.md) | ⏳ pendiente |
+| 1 — Basic storage | [fase-01.md](fase-01.md) | ⏳ pending |
+| 2 — B+ Tree | [fase-02.md](fase-02.md) | ⏳ pending |
+| 3 — WAL and transactions | [fase-03.md](fase-03.md) | ⏳ pending |
+| 4 — SQL Parser + Executor | [fase-04.md](fase-04.md) | ⏳ pending |
+| 5 — MySQL wire protocol | [fase-05.md](fase-05.md) | ⏳ pending |
 
-Ver `db.md` para el plan completo de 34 fases.
+See `db.md` for the complete 34-phase plan.

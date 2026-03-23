@@ -1,19 +1,19 @@
-# Spec: Optimización de rendimiento del B+ Tree (subfases 2.5.1 y 2.5.2)
+# Spec: B+ Tree Performance Optimization (subfases 2.5.1 and 2.5.2)
 
-## Qué construir (no cómo)
+## What to build (not how)
 
-Eliminar los dos bloqueantes de rendimiento del B+ Tree que impiden cumplir el
-presupuesto definido en CLAUDE.md:
+Eliminate the two performance blockers in the B+ Tree that prevent meeting the
+budget defined in CLAUDE.md:
 
-1. **Point lookup demasiado lento** — 96K ops/s vs objetivo 800K ops/s.
-2. **Insert demasiado lento** — 60-104K ops/s vs objetivo 180K ops/s.
+1. **Point lookup too slow** — 96K ops/s vs target 800K ops/s.
+2. **Insert too slow** — 60-104K ops/s vs target 180K ops/s.
 
-## Contexto del problema
+## Problem context
 
-### Blocker 1 — `find_child_compressed` alloca en el hot path
+### Blocker 1 — `find_child_compressed` allocates in the hot path
 
-En `tree.rs::lookup`, cada nodo interno visitado llama a `find_child_compressed`,
-que construye tres `Vec` por nodo:
+In `tree.rs::lookup`, each visited internal node calls `find_child_compressed`,
+which constructs three `Vec`s per node:
 
 ```rust
 let keys: Vec<Box<[u8]>> = (0..n).map(|i| node.key_at(i).to_vec().into_boxed_slice()).collect();
@@ -21,116 +21,116 @@ let children: Vec<u64> = (0..=n).map(|i| node.child_at(i)).collect();
 let compressed = CompressedNode::from_keys(&keys, children);
 ```
 
-Cada heap allocation en el hot path destruye el cache del CPU. Un árbol de 1M keys
-tiene 3-4 niveles → 9-12 heap allocations + cientos de copias de strings por lookup.
+Each heap allocation in the hot path destroys the CPU cache. A tree with 1M keys
+has 3-4 levels → 9-12 heap allocations + hundreds of string copies per lookup.
 
-Además, `InternalNodePage::find_child_idx` usa linear scan O(n) sobre hasta 223 keys.
+In addition, `InternalNodePage::find_child_idx` uses O(n) linear scan over up to 223 keys.
 
-### Blocker 2 — CoW en inserts sin concurrencia
+### Blocker 2 — CoW in inserts without concurrency
 
-`insert_leaf` y `cow_update_child` siempre hacen alloc+write+free por cada página en
-el path, incluso cuando no hay split y no hay lector concurrente. Con `&mut self`, el
-ownership exclusivo garantiza que ningún lector puede ver el estado intermedio — el CoW
-es innecesario para cada página individual (solo se necesita para garantizar que `root_pid`
-cambia atómicamente, lo cual ya está manejado por `AtomicU64`).
+`insert_leaf` and `cow_update_child` always perform alloc+write+free for each page in
+the path, even when there is no split and no concurrent reader. With `&mut self`, the
+exclusive ownership guarantees that no reader can observe the intermediate state — CoW
+is unnecessary for each individual page (it is only needed to ensure that `root_pid`
+changes atomically, which is already handled by `AtomicU64`).
 
-## Subfase 2.5.1 — Lookup sin allocations
+## Subfase 2.5.1 — Lookup without allocations
 
 ### Inputs / Outputs
-- Input: `BTree::lookup(key: &[u8])` — sin cambios en la firma
-- Output: `Result<Option<RecordId>, DbError>` — sin cambios
-- Comportamiento observable: idéntico al actual (mismos resultados)
-- Rendimiento: ≥ 800K ops/s para 1M keys
+- Input: `BTree::lookup(key: &[u8])` — no changes to the signature
+- Output: `Result<Option<RecordId>, DbError>` — no changes
+- Observable behavior: identical to current (same results)
+- Performance: ≥ 800K ops/s for 1M keys
 
-### Qué cambia
+### What changes
 
 **`page_layout.rs` — `InternalNodePage::find_child_idx`:**
-Reemplazar el linear scan por binary search sobre las keys del nodo.
-No se necesita allocation. Las keys ya están ordenadas por invariante del B+ Tree.
+Replace the linear scan with binary search over the node's keys.
+No allocation needed. Keys are already sorted by the B+ Tree invariant.
 
 ```
-Antes: (0..n).find(|&i| self.key_at(i) > key).unwrap_or(n)   → O(n) lineal
-Después: binary search sobre (0..n)                             → O(log n)
+Before: (0..n).find(|&i| self.key_at(i) > key).unwrap_or(n)   → O(n) linear
+After:  binary search over (0..n)                               → O(log n)
 ```
 
 **`tree.rs` — `find_child_compressed`:**
-Eliminar el método. Reemplazar la llamada en `lookup` por `node.find_child_idx(key)`
-directo sobre el `InternalNodePage`, sin construcción de `CompressedNode`.
+Remove the method. Replace the call in `lookup` with `node.find_child_idx(key)`
+directly on the `InternalNodePage`, without constructing a `CompressedNode`.
 
-La prefix compression (`CompressedNode`) queda disponible como utilidad para otros
-usos futuros (bulk load, análisis estadístico), pero NO se usa en el hot path de lookup.
+The prefix compression (`CompressedNode`) remains available as a utility for other
+future uses (bulk load, statistical analysis), but is NOT used in the lookup hot path.
 
-### Casos de uso
-1. Lookup en árbol vacío → `Ok(None)`
-2. Lookup de key existente en árbol de 1M → `Ok(Some(rid))`
-3. Lookup de key inexistente → `Ok(None)`
-4. Nodo interno con keys sin prefijo común → binary search funciona igual
-5. Nodo interno con keys con prefijo largo → binary search funciona igual
+### Use cases
+1. Lookup in empty tree → `Ok(None)`
+2. Lookup of existing key in tree with 1M entries → `Ok(Some(rid))`
+3. Lookup of non-existent key → `Ok(None)`
+4. Internal node with keys sharing no common prefix → binary search works the same
+5. Internal node with keys sharing a long prefix → binary search works the same
 
-### Criterios de aceptación
-- [ ] `point_lookup/nexusdb_btree/1000000` ≥ 800K ops/s en benchmark
-- [ ] Todos los tests existentes del B+ Tree siguen pasando
-- [ ] Cero heap allocations en el path de lookup (verificable eliminando el Vec)
-- [ ] `find_child_idx` usa binary search (verificable leyendo el código)
+### Acceptance criteria
+- [ ] `point_lookup/nexusdb_btree/1000000` ≥ 800K ops/s in benchmark
+- [ ] All existing B+ Tree tests continue passing
+- [ ] Zero heap allocations in the lookup path (verifiable by removing the Vec)
+- [ ] `find_child_idx` uses binary search (verifiable by reading the code)
 
-### Fuera del alcance
-- Cambiar el formato en disco
-- Cambiar la API pública de `BTree`
-- Modificar `CompressedNode` (solo dejar de llamarlo desde el hot path)
+### Out of scope
+- Changing the on-disk format
+- Changing the public API of `BTree`
+- Modifying `CompressedNode` (only stop calling it from the hot path)
 
-### Dependencias
-- Ninguna
+### Dependencies
+- None
 
 ---
 
-## Subfase 2.5.2 — Insert in-place cuando no hay split
+## Subfase 2.5.2 — In-place insert when there is no split
 
 ### Inputs / Outputs
-- Input: `BTree::insert(key: &[u8], rid: RecordId)` — sin cambios en la firma
-- Output: `Result<(), DbError>` — sin cambios
-- Comportamiento observable: idéntico (mismos datos, mismos errores)
-- Rendimiento: ≥ 180K ops/s insert secuencial 1M
+- Input: `BTree::insert(key: &[u8], rid: RecordId)` — no changes to the signature
+- Output: `Result<(), DbError>` — no changes
+- Observable behavior: identical (same data, same errors)
+- Performance: ≥ 180K ops/s sequential insert of 1M entries
 
-### Qué cambia
+### What changes
 
-**`tree.rs` — `insert_leaf` (caso sin split):**
-Cuando `num_keys < ORDER_LEAF`, en lugar de alloc+write+free, escribir directamente
-sobre `old_pid`. Elimina 1 alloc_page + 1 free_page por insert no-split.
+**`tree.rs` — `insert_leaf` (no-split case):**
+When `num_keys < ORDER_LEAF`, instead of alloc+write+free, write directly
+to `old_pid`. Eliminates 1 alloc_page + 1 free_page per no-split insert.
 
 **`tree.rs` — `cow_update_child`:**
-Renombrar / reemplazar por `in_place_update_child`: en lugar de alloc+write+free,
-escribir la página modificada directamente en `old_pid`. Elimina N alloc+free por
-insert no-split donde N = profundidad del árbol.
+Rename / replace with `in_place_update_child`: instead of alloc+write+free,
+write the modified page directly to `old_pid`. Eliminates N alloc+free per
+no-split insert where N = tree depth.
 
-**Splits siguen siendo CoW:**
-Cuando hay split (leaf o internal), se siguen allocando dos páginas nuevas y liberando
-la original — esto es correcto e inevitable porque un split crea dos nodos de una página.
+**Splits remain CoW:**
+When there is a split (leaf or internal), two new pages are still allocated and the
+original is freed — this is correct and unavoidable because a split creates two nodes from one page.
 
-**`root_pid` sigue usando CAS:**
-El patrón `compare_exchange` en `root_pid` se mantiene porque prepara la base para
-concurrencia en Fase 7. Con `&mut self` siempre tiene éxito.
+**`root_pid` still uses CAS:**
+The `compare_exchange` pattern on `root_pid` is kept because it lays the foundation for
+concurrency in Phase 7. With `&mut self` it always succeeds.
 
-### Invariante de corrección
-Con `&mut self`, Rust garantiza exclusividad — ningún otro lector puede acceder a las
-páginas durante el insert. Por tanto, modificar una página in-place es correcto:
-no hay ventana donde otro hilo vea una página en estado intermedio.
+### Correctness invariant
+With `&mut self`, Rust guarantees exclusivity — no other reader can access the
+pages during the insert. Therefore, modifying a page in-place is correct:
+there is no window where another thread sees a page in an intermediate state.
 
-### Casos de uso
-1. Insert secuencial 1M sin splits frecuentes → in-place dominante
-2. Insert aleatorio 100K con splits frecuentes → in-place en los niveles superiores
-3. Insert que causa split en hoja → CoW en hoja (alloc 2 nuevas), in-place en internos
-4. Insert que causa split hasta raíz → todo CoW (nueva raíz)
+### Use cases
+1. Sequential insert of 1M entries without frequent splits → in-place dominant
+2. Random insert of 100K entries with frequent splits → in-place on upper levels
+3. Insert causing leaf split → CoW on leaf (alloc 2 new), in-place on internals
+4. Insert causing split up to root → full CoW (new root)
 
-### Criterios de aceptación
+### Acceptance criteria
 - [ ] `insert_1m_sequential/nexusdb_btree_1m` ≥ 180K ops/s
 - [ ] `insert_sequential/nexusdb_btree_1k` ≥ 180K ops/s
-- [ ] Todos los tests existentes siguen pasando
-- [ ] Los datos son correctos después de 1M inserts + 1M lookups
+- [ ] All existing tests continue passing
+- [ ] Data is correct after 1M inserts + 1M lookups
 
-### Fuera del alcance
-- Concurrencia (se maneja en Fase 7)
-- Cambiar el comportamiento de splits
+### Out of scope
+- Concurrency (handled in Phase 7)
+- Changing the behavior of splits
 - Bulk load / bulk insert
 
-### Dependencias
-- Subfase 2.5.1 completada (no técnica, solo orden lógico)
+### Dependencies
+- Subfase 2.5.1 completed (not technical, just logical order)

@@ -4,9 +4,9 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use nexusdb_sql::{
-    eval, is_truthy,
+    eval,
     expr::{BinaryOp, Expr, UnaryOp},
-    parse, tokenize,
+    is_truthy, parse, tokenize,
 };
 use nexusdb_types::Value;
 
@@ -51,9 +51,7 @@ fn bench_lexer(c: &mut Criterion) {
         ("insert", INSERT_STMT),
     ] {
         group.throughput(Throughput::Bytes(sql.len() as u64));
-        group.bench_function(name, |b| {
-            b.iter(|| tokenize(black_box(sql), None).unwrap())
-        });
+        group.bench_function(name, |b| b.iter(|| tokenize(black_box(sql), None).unwrap()));
     }
 
     group.finish();
@@ -73,9 +71,7 @@ fn bench_parser(c: &mut Criterion) {
         ("delete", DELETE_STMT),
     ] {
         group.throughput(Throughput::Elements(1));
-        group.bench_function(name, |b| {
-            b.iter(|| parse(black_box(sql), None).unwrap())
-        });
+        group.bench_function(name, |b| b.iter(|| parse(black_box(sql), None).unwrap()));
     }
 
     group.finish();
@@ -122,7 +118,10 @@ fn bench_eval(c: &mut Criterion) {
     // Benchmark 1: simple equality  `id = 1`
     let eq_expr = Expr::BinaryOp {
         op: BinaryOp::Eq,
-        left: Box::new(Expr::Column { col_idx: 0, name: "id".into() }),
+        left: Box::new(Expr::Column {
+            col_idx: 0,
+            name: "id".into(),
+        }),
         right: Box::new(Expr::Literal(Value::BigInt(1))),
     };
     group.bench_function("eq_col_literal", |b| {
@@ -137,11 +136,17 @@ fn bench_eval(c: &mut Criterion) {
         op: BinaryOp::And,
         left: Box::new(Expr::BinaryOp {
             op: BinaryOp::Gt,
-            left: Box::new(Expr::Column { col_idx: 1, name: "age".into() }),
+            left: Box::new(Expr::Column {
+                col_idx: 1,
+                name: "age".into(),
+            }),
             right: Box::new(Expr::Literal(Value::Int(18))),
         }),
         right: Box::new(Expr::IsNull {
-            expr: Box::new(Expr::Column { col_idx: 4, name: "email_verified".into() }),
+            expr: Box::new(Expr::Column {
+                col_idx: 4,
+                name: "email_verified".into(),
+            }),
             negated: true,
         }),
     };
@@ -154,7 +159,10 @@ fn bench_eval(c: &mut Criterion) {
 
     // Benchmark 3: BETWEEN  `age BETWEEN 18 AND 65`
     let between_expr = Expr::Between {
-        expr: Box::new(Expr::Column { col_idx: 1, name: "age".into() }),
+        expr: Box::new(Expr::Column {
+            col_idx: 1,
+            name: "age".into(),
+        }),
         low: Box::new(Expr::Literal(Value::Int(18))),
         high: Box::new(Expr::Literal(Value::Int(65))),
         negated: false,
@@ -173,18 +181,27 @@ fn bench_eval(c: &mut Criterion) {
             op: BinaryOp::And,
             left: Box::new(Expr::BinaryOp {
                 op: BinaryOp::Gt,
-                left: Box::new(Expr::Column { col_idx: 0, name: "id".into() }),
+                left: Box::new(Expr::Column {
+                    col_idx: 0,
+                    name: "id".into(),
+                }),
                 right: Box::new(Expr::Literal(Value::Int(0))),
             }),
             right: Box::new(Expr::BinaryOp {
                 op: BinaryOp::GtEq,
-                left: Box::new(Expr::Column { col_idx: 1, name: "age".into() }),
+                left: Box::new(Expr::Column {
+                    col_idx: 1,
+                    name: "age".into(),
+                }),
                 right: Box::new(Expr::Literal(Value::Int(18))),
             }),
         }),
         right: Box::new(Expr::BinaryOp {
             op: BinaryOp::Eq,
-            left: Box::new(Expr::Column { col_idx: 3, name: "active".into() }),
+            left: Box::new(Expr::Column {
+                col_idx: 3,
+                name: "active".into(),
+            }),
             right: Box::new(Expr::Literal(Value::Bool(true))),
         }),
     };
@@ -213,12 +230,18 @@ fn bench_eval(c: &mut Criterion) {
         op: BinaryOp::And,
         left: Box::new(Expr::BinaryOp {
             op: BinaryOp::Gt,
-            left: Box::new(Expr::Column { col_idx: 1, name: "age".into() }),
+            left: Box::new(Expr::Column {
+                col_idx: 1,
+                name: "age".into(),
+            }),
             right: Box::new(Expr::Literal(Value::Int(18))),
         }),
         right: Box::new(Expr::BinaryOp {
             op: BinaryOp::Eq,
-            left: Box::new(Expr::Column { col_idx: 3, name: "active".into() }),
+            left: Box::new(Expr::Column {
+                col_idx: 3,
+                name: "active".into(),
+            }),
             right: Box::new(Expr::Literal(Value::Bool(true))),
         }),
     };
@@ -250,11 +273,5 @@ fn bench_eval(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_lexer,
-    bench_parser,
-    bench_qps,
-    bench_eval,
-);
+criterion_group!(benches, bench_lexer, bench_parser, bench_qps, bench_eval,);
 criterion_main!(benches);
