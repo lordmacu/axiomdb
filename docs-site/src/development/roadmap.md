@@ -58,6 +58,7 @@ functionality. The design is organized in three blocks:
 | 4.5 + 4.5a | Basic executor | ✅ | SELECT/INSERT/UPDATE/DELETE, DDL, txn control, SELECT without FROM |
 | 4.25 + 4.7 | Error handling framework | ✅ | Complete SQLSTATE mapping; ErrorResponse{sqlstate,message,detail,hint} |
 | 4.8 | JOIN (nested loop) | ✅ | INNER/LEFT/RIGHT/CROSS; USING; multi-table; FULL→NotImplemented |
+| 4.9a+4.9c+4.9d | GROUP BY + Aggregates + HAVING | ✅ | COUNT/SUM/MIN/MAX/AVG; hash-based; HAVING; NULL grouping |
 | 5 | Executor (advanced) | ⚠️ Planned | JOIN, GROUP BY, ORDER BY, index lookup, aggregate |
 | 6 | Query planner | ⚠️ Planned | Cost-based plan selection |
 | 7 | Full MVCC | ⚠️ Planned | SSI, write-write conflicts, epoch reclamation |
