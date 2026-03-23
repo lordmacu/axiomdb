@@ -1606,3 +1606,182 @@ fn test_case_no_when_parse_error() {
     let err = run_result("SELECT CASE END", &mut storage, &mut txn).unwrap_err();
     assert!(matches!(err, DbError::ParseError { .. }), "got {err:?}");
 }
+
+// ── INSERT ... SELECT tests ───────────────────────────────────────────────────
+
+#[test]
+fn test_insert_select_copy_all() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE src (id INT, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO src VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE TABLE dst (id INT, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let aff = affected_count(run(
+        "INSERT INTO dst SELECT * FROM src",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(aff, 3);
+
+    let r = rows(run(
+        "SELECT * FROM dst ORDER BY id ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0][1], Value::Text("Alice".into()));
+}
+
+#[test]
+fn test_insert_select_with_where() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE src (id INT, val INT)", &mut storage, &mut txn);
+    run(
+        "INSERT INTO src VALUES (1, 10), (2, 50), (3, 100)",
+        &mut storage,
+        &mut txn,
+    );
+    run("CREATE TABLE dst (id INT, val INT)", &mut storage, &mut txn);
+
+    let aff = affected_count(run(
+        "INSERT INTO dst SELECT * FROM src WHERE val > 20",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(aff, 2);
+    let r = rows(run(
+        "SELECT * FROM dst ORDER BY id ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][0], Value::Int(2));
+}
+
+#[test]
+fn test_insert_select_named_columns() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE src (a INT, b TEXT)", &mut storage, &mut txn);
+    run(
+        "INSERT INTO src VALUES (1, 'x'), (2, 'y')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE TABLE dst (id INT, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+
+    // Map src.a → dst.name (only named column)
+    run(
+        "INSERT INTO dst (name) SELECT b FROM src ORDER BY a ASC",
+        &mut storage,
+        &mut txn,
+    );
+
+    let r = rows(run(
+        "SELECT id, name FROM dst ORDER BY name ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][0], Value::Null, "id not in column list → NULL");
+    assert_eq!(r[0][1], Value::Text("x".into()));
+}
+
+#[test]
+fn test_insert_select_with_limit() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE src (id INT)", &mut storage, &mut txn);
+    for i in 1..=10i32 {
+        run(
+            &format!("INSERT INTO src VALUES ({i})"),
+            &mut storage,
+            &mut txn,
+        );
+    }
+    run("CREATE TABLE dst (id INT)", &mut storage, &mut txn);
+
+    let aff = affected_count(run(
+        "INSERT INTO dst SELECT * FROM src ORDER BY id ASC LIMIT 3",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(aff, 3);
+
+    let r = rows(run(
+        "SELECT * FROM dst ORDER BY id ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[2][0], Value::Int(3));
+}
+
+#[test]
+fn test_insert_select_aggregation() {
+    let (mut storage, mut txn) = setup();
+    setup_employees(&mut storage, &mut txn); // reuse existing helper
+    run(
+        "CREATE TABLE summary (dept TEXT, cnt INT)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let aff = affected_count(run(
+        "INSERT INTO summary (dept, cnt) SELECT dept, COUNT(*) FROM employees GROUP BY dept",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(aff, 2); // eng + sales
+
+    let r = rows(run(
+        "SELECT * FROM summary ORDER BY dept ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 2);
+    let eng = r
+        .iter()
+        .find(|row| row[0] == Value::Text("eng".into()))
+        .unwrap();
+    // COUNT(*) returns BigInt; coerced to Int when stored in the INT column.
+    assert!(
+        eng[1] == Value::Int(3) || eng[1] == Value::BigInt(3),
+        "eng count must be 3, got {:?}",
+        eng[1]
+    );
+}
+
+#[test]
+fn test_insert_select_mvcc_no_self_read() {
+    // INSERT INTO t SELECT * FROM t where t already has 2 rows.
+    // MVCC: the SELECT sees snapshot at BEGIN — new rows not visible.
+    // After commit: t has 4 rows (2 original + 2 copies), not infinite.
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1), (2)", &mut storage, &mut txn);
+
+    let aff = affected_count(run("INSERT INTO t SELECT * FROM t", &mut storage, &mut txn));
+    assert_eq!(aff, 2, "should insert exactly the 2 pre-existing rows");
+
+    let r = rows(run("SELECT COUNT(*) FROM t", &mut storage, &mut txn));
+    assert_eq!(
+        r[0][0],
+        Value::BigInt(4),
+        "total rows: 2 original + 2 copies"
+    );
+}
