@@ -15,6 +15,7 @@ pub mod expr;
 pub mod lexer;
 pub mod parser;
 pub mod result;
+pub mod table;
 
 pub use ast::{
     AlterTableOp, AlterTableStmt, Assignment, ColumnConstraint, ColumnDef, CreateIndexStmt,
@@ -30,3 +31,4 @@ pub use lexer::{tokenize, Span, SpannedToken, Token};
 pub use analyzer::analyze;
 pub use parser::parse;
 pub use result::{ColumnMeta, QueryResult, Row};
+pub use table::TableEngine;

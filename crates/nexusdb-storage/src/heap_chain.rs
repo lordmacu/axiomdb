@@ -173,6 +173,33 @@ impl HeapChain {
         Ok(result)
     }
 
+    /// Reads the application payload of the tuple at `(page_id, slot_id)`.
+    ///
+    /// Returns `None` if the slot is dead (already deleted). The returned bytes
+    /// are the row data portion of the tuple, excluding the [`RowHeader`].
+    ///
+    /// Used by `TableEngine::delete_row` and `TableEngine::update_row` to obtain
+    /// the old row bytes before stamping the deletion, so they can be included
+    /// in the WAL `record_delete` entry for crash recovery.
+    ///
+    /// # Errors
+    /// - [`DbError::InvalidSlot`] if `slot_id >= num_slots` on that page.
+    /// - I/O errors from storage reads.
+    ///
+    /// [`RowHeader`]: crate::heap::RowHeader
+    pub fn read_row(
+        storage: &dyn StorageEngine,
+        page_id: u64,
+        slot_id: u16,
+    ) -> Result<Option<Vec<u8>>, DbError> {
+        let raw = *storage.read_page(page_id)?.as_bytes();
+        let page = Page::from_bytes(raw)?;
+        match crate::heap::read_tuple(&page, slot_id)? {
+            None => Ok(None),
+            Some((_header, data)) => Ok(Some(data.to_vec())),
+        }
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     /// Walks the chain from `root_page_id` and returns the ID of the last page
