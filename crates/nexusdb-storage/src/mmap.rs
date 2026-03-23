@@ -9,6 +9,7 @@ use nexusdb_core::error::DbError;
 use tracing::{debug, info, warn};
 
 use crate::{
+    dirty::PageDirtyTracker,
     engine::StorageEngine,
     freelist::FreeList,
     page::{Page, PageType, HEADER_SIZE, PAGE_SIZE},
@@ -65,6 +66,8 @@ pub struct MmapStorage {
     freelist: FreeList,
     /// Set when the freelist was modified and needs to be written on the next flush.
     freelist_dirty: bool,
+    /// Tracks pages written since the last flush. Cleared on `flush()`.
+    dirty: PageDirtyTracker,
 }
 
 impl Drop for MmapStorage {
@@ -123,6 +126,7 @@ impl MmapStorage {
             file,
             freelist,
             freelist_dirty: false,
+            dirty: PageDirtyTracker::new(),
         })
     }
 
@@ -179,6 +183,7 @@ impl MmapStorage {
             file,
             freelist,
             freelist_dirty: false,
+            dirty: PageDirtyTracker::new(),
         })
     }
 
@@ -311,6 +316,7 @@ impl StorageEngine for MmapStorage {
         }
         let offset = page_id as usize * PAGE_SIZE;
         self.mmap[offset..offset + PAGE_SIZE].copy_from_slice(page.as_bytes());
+        self.dirty.mark(page_id);
         Ok(())
     }
 
@@ -321,6 +327,7 @@ impl StorageEngine for MmapStorage {
             let offset = page_id as usize * PAGE_SIZE;
             self.mmap[offset..offset + PAGE_SIZE].copy_from_slice(new_page.as_bytes());
             self.freelist_dirty = true;
+            self.dirty.mark(page_id);
             return Ok(page_id);
         }
 
@@ -334,6 +341,7 @@ impl StorageEngine for MmapStorage {
         let offset = page_id as usize * PAGE_SIZE;
         self.mmap[offset..offset + PAGE_SIZE].copy_from_slice(new_page.as_bytes());
         self.freelist_dirty = true;
+        self.dirty.mark(page_id);
         Ok(page_id)
     }
 
@@ -355,6 +363,8 @@ impl StorageEngine for MmapStorage {
             self.freelist_dirty = false;
         }
         self.mmap.flush()?;
+        // All pages are now on disk — clear the dirty set.
+        self.dirty.clear();
         Ok(())
     }
 
@@ -367,6 +377,13 @@ impl MmapStorage {
     /// Returns the number of currently free pages (for benchmarks and monitoring).
     pub fn free_count(&self) -> u64 {
         self.freelist.free_count()
+    }
+
+    /// Returns the number of pages written since the last `flush()`.
+    ///
+    /// Useful for monitoring and for deciding whether a checkpoint is needed.
+    pub fn dirty_page_count(&self) -> usize {
+        self.dirty.count()
     }
 }
 

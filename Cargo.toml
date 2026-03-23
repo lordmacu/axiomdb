@@ -58,6 +58,9 @@ tempfile = "3"
 # Zero-copy casting
 bytemuck = { version = "1", features = ["derive"] }
 
+# Configuration file parsing
+toml = "1"
+
 # Internal crates
 nexusdb-core    = { path = "crates/nexusdb-core" }
 nexusdb-types   = { path = "crates/nexusdb-types" }

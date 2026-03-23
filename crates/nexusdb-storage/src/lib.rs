@@ -1,5 +1,7 @@
 //! # nexusdb-storage — storage engine: pages, mmap, free list, heap, meta, integrity
 
+pub mod config;
+pub mod dirty;
 pub mod engine;
 pub mod freelist;
 pub mod heap;
@@ -10,6 +12,8 @@ pub mod meta;
 pub mod mmap;
 pub mod page;
 
+pub use config::DbConfig;
+pub use dirty::PageDirtyTracker;
 pub use engine::StorageEngine;
 pub use freelist::FreeList;
 pub use heap::{
