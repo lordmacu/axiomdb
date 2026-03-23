@@ -122,6 +122,18 @@ pub enum Expr {
         /// Optional ELSE result. Returns `NULL` if absent and no WHEN matched.
         else_result: Option<Box<Expr>>,
     },
+
+    /// `CAST(expr AS type)` — explicit type conversion.
+    ///
+    /// Evaluates `expr` and coerces the result to `target` using strict mode.
+    /// `NULL` always returns `NULL`. Invalid conversions return
+    /// [`DbError::InvalidCoercion`].
+    Cast {
+        /// The expression to convert.
+        expr: Box<Expr>,
+        /// The target SQL type.
+        target: axiomdb_types::DataType,
+    },
 }
 
 // ── BinaryOp ──────────────────────────────────────────────────────────────────

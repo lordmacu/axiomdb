@@ -24,7 +24,7 @@
 //! Phase 4.4 adds: IS NULL, BETWEEN, LIKE, IN, arithmetic, table.col, function calls.
 
 use axiomdb_core::error::DbError;
-use axiomdb_types::Value;
+use axiomdb_types::{DataType, Value};
 
 use crate::{
     expr::{BinaryOp, Expr, UnaryOp},
@@ -365,6 +365,23 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
 
     // Check for function call: `name(`
     if p.eat(&Token::LParen) {
+        // CAST(expr AS type) — special syntax, not a regular function call.
+        if name.eq_ignore_ascii_case("cast") {
+            let expr = parse_expr(p)?;
+            if !p.eat(&Token::As) {
+                return Err(DbError::ParseError {
+                    message: format!("expected AS in CAST at position {}", p.current_pos()),
+                });
+            }
+            let type_name = p.parse_identifier()?;
+            p.expect(&Token::RParen)?;
+            let target = parse_data_type(&type_name)?;
+            return Ok(Expr::Cast {
+                expr: Box::new(expr),
+                target,
+            });
+        }
+
         // COUNT(*) and similar aggregate wildcards
         if p.eat(&Token::Star) {
             p.expect(&Token::RParen)?;
@@ -390,4 +407,26 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
 
     // Plain column reference
     Ok(Expr::Column { col_idx: 0, name })
+}
+
+/// Maps a SQL type name string to a [`DataType`].
+///
+/// Used by the CAST parser to convert the `AS type` part into the
+/// `DataType` variant stored in `Expr::Cast`.
+fn parse_data_type(name: &str) -> Result<DataType, DbError> {
+    match name.to_ascii_uppercase().as_str() {
+        "INT" | "INTEGER" => Ok(DataType::Int),
+        "BIGINT" => Ok(DataType::BigInt),
+        "REAL" | "FLOAT" | "DOUBLE" => Ok(DataType::Real),
+        "TEXT" | "VARCHAR" | "CHAR" | "STRING" => Ok(DataType::Text),
+        "BOOL" | "BOOLEAN" => Ok(DataType::Bool),
+        "BYTES" | "BLOB" | "BYTEA" => Ok(DataType::Bytes),
+        "TIMESTAMP" => Ok(DataType::Timestamp),
+        "DATE" => Ok(DataType::Date),
+        "DECIMAL" | "NUMERIC" => Ok(DataType::Decimal),
+        "UUID" => Ok(DataType::Uuid),
+        other => Err(DbError::ParseError {
+            message: format!("unknown type '{other}' in CAST"),
+        }),
+    }
 }
