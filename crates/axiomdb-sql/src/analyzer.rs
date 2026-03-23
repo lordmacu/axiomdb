@@ -419,6 +419,34 @@ fn resolve_expr(expr: Expr, ctx: &BindContext) -> Result<Expr, DbError> {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Expr::Function { name, args })
         }
+
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => {
+            // Resolve column references in the base expression (simple CASE).
+            let operand = operand
+                .map(|e| resolve_expr(*e, ctx).map(Box::new))
+                .transpose()?;
+
+            // Resolve column references in all WHEN and THEN sub-expressions.
+            let when_thens = when_thens
+                .into_iter()
+                .map(|(w, t)| Ok((resolve_expr(w, ctx)?, resolve_expr(t, ctx)?)))
+                .collect::<Result<Vec<_>, DbError>>()?;
+
+            // Resolve column references in the ELSE branch.
+            let else_result = else_result
+                .map(|e| resolve_expr(*e, ctx).map(Box::new))
+                .transpose()?;
+
+            Ok(Expr::Case {
+                operand,
+                when_thens,
+                else_result,
+            })
+        }
     }
 }
 

@@ -133,7 +133,7 @@
 - [ ] 4.11 ⏳ Scalar subqueries — `(SELECT MAX(id) FROM t)` in WHERE and SELECT list
 - [x] 4.12 ✅ DISTINCT — HashSet dedup on projected output rows; NULL=NULL for grouping; pre-LIMIT
 - [ ] 4.12b ⏳ CAST + basic type coercion — explicit and implicit conversion between compatible types
-- [ ] 4.24 ⏳ CASE WHEN in any context — `CASE WHEN x THEN a ELSE b END` in SELECT, WHERE, ORDER BY, GROUP BY, HAVING; required by most ORMs from the first query
+- [x] 4.24 ✅ CASE WHEN — searched + simple form; NULL semantics; nested; SELECT/WHERE/ORDER BY/GROUP BY
 - [ ] 4.6 ⏳ INSERT ... SELECT — insert result of a SELECT directly into a table
 
 <!-- ── Group F — Functions (needs executor) ── -->

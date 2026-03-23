@@ -703,6 +703,17 @@ fn contains_aggregate(expr: &Expr) -> bool {
             contains_aggregate(expr) || list.iter().any(contains_aggregate)
         }
         Expr::Function { args, .. } => args.iter().any(contains_aggregate),
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(contains_aggregate)
+                || when_thens
+                    .iter()
+                    .any(|(w, t)| contains_aggregate(w) || contains_aggregate(t))
+                || else_result.as_deref().is_some_and(contains_aggregate)
+        }
         Expr::Literal(_) | Expr::Column { .. } => false,
     }
 }
@@ -792,6 +803,22 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
         Expr::Function { args, .. } => {
             for a in args {
                 collect_agg_exprs_from(a, result);
+            }
+        }
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                collect_agg_exprs_from(op, result);
+            }
+            for (w, t) in when_thens {
+                collect_agg_exprs_from(w, result);
+                collect_agg_exprs_from(t, result);
+            }
+            if let Some(e) = else_result {
+                collect_agg_exprs_from(e, result);
             }
         }
         Expr::Literal(_) | Expr::Column { .. } | Expr::Like { .. } => {}
@@ -1202,6 +1229,60 @@ fn eval_with_aggs(
                 },
                 &[],
             )
+        }
+
+        // CASE WHEN in HAVING context — recurse through eval_with_aggs for sub-exprs.
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => {
+            match operand {
+                None => {
+                    for (when_expr, then_expr) in when_thens {
+                        let cond =
+                            eval_with_aggs(when_expr, representative_row, agg_values, agg_exprs)?;
+                        if is_truthy(&cond) {
+                            return eval_with_aggs(
+                                then_expr,
+                                representative_row,
+                                agg_values,
+                                agg_exprs,
+                            );
+                        }
+                    }
+                }
+                Some(base_expr) => {
+                    let base_val =
+                        eval_with_aggs(base_expr, representative_row, agg_values, agg_exprs)?;
+                    for (val_expr, then_expr) in when_thens {
+                        let val =
+                            eval_with_aggs(val_expr, representative_row, agg_values, agg_exprs)?;
+                        let eq = eval(
+                            &Expr::BinaryOp {
+                                op: BinaryOp::Eq,
+                                left: Box::new(Expr::Literal(base_val.clone())),
+                                right: Box::new(Expr::Literal(val)),
+                            },
+                            &[],
+                        )?;
+                        if is_truthy(&eq) {
+                            return eval_with_aggs(
+                                then_expr,
+                                representative_row,
+                                agg_values,
+                                agg_exprs,
+                            );
+                        }
+                    }
+                }
+            }
+            match else_result {
+                Some(else_expr) => {
+                    eval_with_aggs(else_expr, representative_row, agg_values, agg_exprs)
+                }
+                None => Ok(Value::Null),
+            }
         }
 
         // For remaining variants: fall back to standard eval against representative_row.

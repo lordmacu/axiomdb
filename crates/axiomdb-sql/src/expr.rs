@@ -88,6 +88,40 @@ pub enum Expr {
     /// Function implementations are registered in Phase 4.19. Evaluating an
     /// unregistered function returns `DbError::NotImplemented`.
     Function { name: String, args: Vec<Expr> },
+
+    // ── CASE WHEN ─────────────────────────────────────────────────────────────
+    /// `CASE [operand] WHEN ... THEN ... [ELSE ...] END`
+    ///
+    /// ## Searched CASE (`operand = None`)
+    ///
+    /// Each `when_thens.0` is a boolean condition evaluated with `is_truthy`.
+    /// The first truthy branch wins; the rest are not evaluated.
+    ///
+    /// ```sql
+    /// CASE WHEN salary > 100000 THEN 'senior' ELSE 'junior' END
+    /// ```
+    ///
+    /// ## Simple CASE (`operand = Some(base)`)
+    ///
+    /// Each `when_thens.0` is compared to `base` using SQL equality semantics.
+    /// `NULL base` or `NULL value` produces UNKNOWN → no match.
+    ///
+    /// ```sql
+    /// CASE status WHEN 'active' THEN 1 WHEN 'inactive' THEN 0 ELSE -1 END
+    /// ```
+    ///
+    /// ## No match
+    ///
+    /// If no WHEN branch matches and `else_result` is `None`, the expression
+    /// evaluates to `NULL`.
+    Case {
+        /// `None` for searched CASE; `Some(base_expr)` for simple CASE.
+        operand: Option<Box<Expr>>,
+        /// `(condition_or_value, result)` pairs evaluated left-to-right.
+        when_thens: Vec<(Expr, Expr)>,
+        /// Optional ELSE result. Returns `NULL` if absent and no WHEN matched.
+        else_result: Option<Box<Expr>>,
+    },
 }
 
 // ── BinaryOp ──────────────────────────────────────────────────────────────────

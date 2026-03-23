@@ -1448,3 +1448,161 @@ fn test_distinct_scalar() {
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Int(1));
 }
+
+// ── CASE WHEN tests ───────────────────────────────────────────────────────────
+
+fn setup_case_table(storage: &mut MemoryStorage, txn: &mut TxnManager) {
+    run("CREATE TABLE t (id INT, val INT, label TEXT)", storage, txn);
+    run("INSERT INTO t VALUES (1, 120000, 'Alice')", storage, txn);
+    run("INSERT INTO t VALUES (2, 60000, 'Bob')", storage, txn);
+    run("INSERT INTO t VALUES (3, 30000, 'Carol')", storage, txn);
+}
+
+#[test]
+fn test_case_when_searched_basic() {
+    let (mut storage, mut txn) = setup();
+    setup_case_table(&mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT id, CASE WHEN val > 100000 THEN 'senior' WHEN val > 50000 THEN 'mid' ELSE 'junior' END FROM t ORDER BY id ASC",
+        &mut storage, &mut txn,
+    ));
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0][1], Value::Text("senior".into())); // 120000 > 100000
+    assert_eq!(r[1][1], Value::Text("mid".into())); // 60000 > 50000
+    assert_eq!(r[2][1], Value::Text("junior".into())); // 30000 → ELSE
+}
+
+#[test]
+fn test_case_when_no_else_returns_null() {
+    let (mut storage, mut txn) = setup();
+    setup_case_table(&mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT CASE WHEN id = 99 THEN 'found' END FROM t ORDER BY id ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 3);
+    for row in &r {
+        assert_eq!(row[0], Value::Null, "no match + no ELSE → NULL");
+    }
+}
+
+#[test]
+fn test_case_when_null_condition_not_truthy() {
+    // CASE WHEN NULL THEN 1 ELSE 0 END → 0 (NULL is UNKNOWN, not truthy)
+    let (mut storage, mut txn) = setup();
+    let r = rows(run(
+        "SELECT CASE WHEN NULL THEN 1 ELSE 0 END",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r[0][0], Value::Int(0));
+}
+
+#[test]
+fn test_case_simple_form() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT, status TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run("INSERT INTO t VALUES (1, 'active')", &mut storage, &mut txn);
+    run(
+        "INSERT INTO t VALUES (2, 'inactive')",
+        &mut storage,
+        &mut txn,
+    );
+    run("INSERT INTO t VALUES (3, 'other')", &mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT id, CASE status WHEN 'active' THEN 1 WHEN 'inactive' THEN 0 ELSE -1 END FROM t ORDER BY id ASC",
+        &mut storage, &mut txn,
+    ));
+    assert_eq!(r[0][1], Value::Int(1));
+    assert_eq!(r[1][1], Value::Int(0));
+    assert_eq!(r[2][1], Value::Int(-1));
+}
+
+#[test]
+fn test_case_simple_null_no_match() {
+    // CASE NULL WHEN NULL THEN 1 END → NULL (NULL ≠ NULL in simple CASE)
+    let (mut storage, mut txn) = setup();
+    let r = rows(run(
+        "SELECT CASE NULL WHEN NULL THEN 1 END",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r[0][0], Value::Null);
+}
+
+#[test]
+fn test_case_then_null() {
+    // THEN can produce NULL
+    let (mut storage, mut txn) = setup();
+    let r = rows(run(
+        "SELECT CASE WHEN 1 = 1 THEN NULL ELSE 1 END",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r[0][0], Value::Null);
+}
+
+#[test]
+fn test_case_in_where() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT, type TEXT)", &mut storage, &mut txn);
+    run(
+        "INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'x')",
+        &mut storage,
+        &mut txn,
+    );
+
+    let r = rows(run(
+        "SELECT id FROM t WHERE CASE type WHEN 'x' THEN 1 ELSE 0 END = 1 ORDER BY id ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][0], Value::Int(1));
+    assert_eq!(r[1][0], Value::Int(3));
+}
+
+#[test]
+fn test_case_in_order_by() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT, dept TEXT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1, 'sales')", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (2, 'eng')", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (3, 'hr')", &mut storage, &mut txn);
+
+    // Order: eng=1 first, sales=2 second, others=3 last
+    let r = rows(run(
+        "SELECT id FROM t ORDER BY CASE dept WHEN 'eng' THEN 1 WHEN 'sales' THEN 2 ELSE 3 END ASC",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r[0][0], Value::Int(2)); // eng
+    assert_eq!(r[1][0], Value::Int(1)); // sales
+    assert_eq!(r[2][0], Value::Int(3)); // hr
+}
+
+#[test]
+fn test_case_nested() {
+    let (mut storage, mut txn) = setup();
+    let r = rows(run(
+        "SELECT CASE WHEN 1 > 0 THEN CASE WHEN 2 > 1 THEN 'both' ELSE 'a_only' END ELSE 'none' END",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r[0][0], Value::Text("both".into()));
+}
+
+#[test]
+fn test_case_no_when_parse_error() {
+    let (mut storage, mut txn) = setup();
+    let err = run_result("SELECT CASE END", &mut storage, &mut txn).unwrap_err();
+    assert!(matches!(err, DbError::ParseError { .. }), "got {err:?}");
+}
