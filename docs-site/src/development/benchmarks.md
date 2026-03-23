@@ -94,11 +94,34 @@ the "Max acceptable" column is a blocker.
 | Row codec encode | **33M rows/s** ✅ | — | — | 4 |
 | Expr eval (scan 1K rows) | **14.8M rows/s** ✅ | — | — | 4 |
 
-**Executor operations** (Phase 4 complete — end-to-end benchmarks pending integration with
-MmapStorage + WAL in the benchmark harness):
-- Full query throughput (SELECT with filter + projection) — executor implemented; benchmark harness uses MemoryStorage
-- INSERT end-to-end (parse → analyze → execute → WAL → heap write) — 195K ops/s measured on B+Tree layer; full executor path pending benchmark
-- Concurrent write throughput — single-writer in Phase 4; SSI concurrency in Phase 7
+**Executor end-to-end (Phase 4, MmapStorage + WAL, full pipeline)**
+
+Measured with `cargo bench --bench executor_e2e -p axiomdb-sql` (Apple M2 Pro, NVMe):
+
+| Operation | AxiomDB | MySQL 8.0† | PG 16† | Notes |
+|---|---|---|---|---|
+| INSERT batch 10K (1 txn) | **55K/s** | 41K/s | 14K/s | AxiomDB 33% faster than MySQL |
+| INSERT autocommit (1 txn/row) | **284/s** | ~1K/s | ~2K/s | ⚠️ catalog scan per statement |
+| SELECT * full scan 10K rows | **50K rows/s** | 190K/s | 1.4M/s | ⚠️ no catalog cache yet |
+| Point lookup PK ×100 | **7.3M ops/s** | 9.8K/s | 20K/s | ✅ B+Tree CoW lock-free |
+| B+Tree INSERT (storage only) | **293K/s** | — | — | ✅ above 180K/s target |
+
+*†MySQL/PG measured via Docker TCP connection (adds ~1-2ms/query overhead). AxiomDB runs in-process.*
+
+**Known bottleneck:** `analyze()` performs a linear O(n) catalog heap scan on every statement
+(no catalog cache). This dominates INSERT autocommit and SELECT latency. **Fix:** SchemaCache
+in Phase 5/6 — estimated 50-100× improvement for per-statement overhead, bringing INSERT
+autocommit to ~20K/s.
+
+**Run end-to-end benchmarks:**
+```bash
+cargo bench --bench executor_e2e -p axiomdb-sql
+
+# MySQL + PostgreSQL comparison (requires Docker):
+./benches/comparison/setup.sh
+python3 benches/comparison/bench_runner.py --rows 10000
+./benches/comparison/teardown.sh
+```
 
 ---
 
