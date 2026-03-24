@@ -1,6 +1,7 @@
 'use client'
-import { useState } from 'react'
+import { useState, useCallback } from 'react'
 import dynamic from 'next/dynamic'
+import type * as Monaco from 'monaco-editor'
 import {
   Play, Plus, Trash2, ToggleLeft, ToggleRight,
   ChevronDown, ChevronRight, Code2, Zap,
@@ -9,6 +10,44 @@ import { PROCEDURES, FUNCTIONS, TRIGGERS, SEQUENCES, type Procedure, type Func, 
 import { cn } from '@/lib/utils'
 
 const MonacoEditor = dynamic(() => import('@monaco-editor/react'), { ssr: false })
+
+// ── AxiomQL language + theme registration (same as Query Editor) ───────────────
+
+function registerAxiomQL(monaco: typeof Monaco) {
+  if (monaco.languages.getLanguages().some((l: { id: string }) => l.id === 'axiomql')) return
+
+  monaco.languages.register({ id: 'axiomql' })
+  monaco.languages.setMonarchTokensProvider('axiomql', {
+    tokenizer: {
+      root: [
+        [/--.*$/, 'comment'],
+        [/\.(filter|pick|sort|join|group|take|skip|distinct|count|sum|avg|min|max|union|intersect|except|window|explain|export|insert|update|delete|upsert|returning|watch|subscribe)\b/, 'keyword'],
+        [/\b(true|false|null)\b/, 'constant'],
+        [/\b(from|where|let|proc|fn|on|transaction|create|drop|index|migration)\b/, 'type'],
+        [/'[^']*'/, 'string'],
+        [/"[^"]*"/, 'string'],
+        [/\b\d+(\.\d+)?\b/, 'number'],
+        [/[(),.:]/, 'delimiter'],
+        [/→/, 'keyword'],
+        [/\w+(?=\s*\()/, 'function'],
+      ],
+    },
+  })
+  monaco.editor.defineTheme('axiomql-dark', {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: 'keyword',  foreground: '10b981', fontStyle: 'bold' },
+      { token: 'constant', foreground: 'f59e0b' },
+      { token: 'type',     foreground: '60a5fa' },
+      { token: 'function', foreground: 'c084fc' },
+      { token: 'string',   foreground: '86efac' },
+      { token: 'number',   foreground: 'fb923c' },
+      { token: 'comment',  foreground: '6b7280', fontStyle: 'italic' },
+    ],
+    colors: { 'editor.background': '#0d1117' },
+  })
+}
 
 type Tab = 'procedures' | 'functions' | 'triggers' | 'sequences'
 
@@ -72,6 +111,7 @@ function CodePanel({ title, language, body, args, returns, onBodyChange }: {
           value={body}
           onChange={v => onBodyChange(v ?? '')}
           theme={language === 'axiomql' ? 'axiomql-dark' : 'vs-dark'}
+          onMount={(_editor, monaco) => registerAxiomQL(monaco)}
           options={{
             fontSize: 13,
             fontFamily: 'var(--font-geist-mono)',
