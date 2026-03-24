@@ -117,34 +117,37 @@ def arrow_menu(title, options, hint=""):
             except (ValueError, EOFError): pass
         return
 
-    idx = 0
+    idx   = 0
+    drawn = False   # local — never persists between calls
+    # line count: 1 title + 1 hint/blank + N options + 1 trailing blank = N+3
+    lines = len(options) + 3
+
     while True:
-        # Render
-        print(f"\033[{len(options)+4}A", end="") if hasattr(arrow_menu, "_drawn") else None
-        arrow_menu._drawn = True
+        if drawn:
+            # Move cursor up AND clear everything below — handles any residual text
+            print(f"\033[{lines}A\033[J", end="", flush=True)
 
         print(c(f"  {title}", BOLD, WHITE))
         if hint: print(c(f"  {hint}", DIM))
-        else: print()
+        else:    print()
         for i, (key, label, desc) in enumerate(options):
             if i == idx:
                 cursor = c("❯", CYAN, BOLD)
                 row    = BG_SEL + BOLD + f"  {cursor} {label:<40}" + RESET
                 dsc    = c(f"  {desc}", CYAN, DIM)
             else:
-                cursor = " "
                 row    = f"    {c(label, WHITE):<40}"
                 dsc    = c(f"  {desc}", DIM)
             print(f"{row}{dsc}")
         print()
+        sys.stdout.flush()
+        drawn = True
 
         key = _getch()
-        if key == "UP":    idx = (idx - 1) % len(options)
-        elif key == "DOWN": idx = (idx + 1) % len(options)
-        elif key in ("\r", "\n", " "):
-            arrow_menu._drawn = False
-            return idx, options[idx][0]
-        elif key == "\x03": sys.exit(0)  # Ctrl+C
+        if key == "UP":             idx = (idx - 1) % len(options)
+        elif key == "DOWN":         idx = (idx + 1) % len(options)
+        elif key in ("\r", "\n"):   return idx, options[idx][0]
+        elif key == "\x03":         sys.exit(0)
 
 
 def arrow_checkbox(title, options, hint=""):

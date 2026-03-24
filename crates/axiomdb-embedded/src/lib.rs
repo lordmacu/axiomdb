@@ -47,7 +47,8 @@ mod db {
     use axiomdb_catalog::bootstrap::CatalogBootstrap;
     use axiomdb_core::error::DbError;
     use axiomdb_sql::{
-        analyze_cached, execute_with_ctx, parse, result::QueryResult, SchemaCache, SessionContext,
+        analyze_cached, bloom::BloomRegistry, execute_with_ctx, parse, result::QueryResult,
+        SchemaCache, SessionContext,
     };
     use axiomdb_storage::MmapStorage;
     use axiomdb_wal::TxnManager;
@@ -67,6 +68,7 @@ mod db {
     pub struct Db {
         storage: MmapStorage,
         txn: TxnManager,
+        bloom: BloomRegistry,
         schema_cache: SchemaCache,
         session: SessionContext,
     }
@@ -102,6 +104,7 @@ mod db {
             Ok(Self {
                 storage,
                 txn,
+                bloom: BloomRegistry::new(),
                 schema_cache: SchemaCache::new(),
                 session: SessionContext::default(),
             })
@@ -156,6 +159,7 @@ mod db {
                 analyzed,
                 &mut self.storage,
                 &mut self.txn,
+                &mut self.bloom,
                 &mut self.session,
             )
         }

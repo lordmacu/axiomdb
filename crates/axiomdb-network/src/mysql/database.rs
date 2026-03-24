@@ -35,8 +35,8 @@ use tokio::sync::{oneshot, Mutex};
 use axiomdb_catalog::bootstrap::CatalogBootstrap;
 use axiomdb_core::error::DbError;
 use axiomdb_sql::{
-    analyze_cached, ast::Stmt, execute_with_ctx, parse, result::QueryResult, SchemaCache,
-    SessionContext,
+    analyze_cached, ast::Stmt, bloom::BloomRegistry, execute_with_ctx, parse, result::QueryResult,
+    SchemaCache, SessionContext,
 };
 use axiomdb_storage::MmapStorage;
 use axiomdb_wal::TxnManager;
@@ -53,6 +53,8 @@ pub type CommitRx = oneshot::Receiver<Result<(), DbError>>;
 pub struct Database {
     pub storage: MmapStorage,
     pub txn: TxnManager,
+    /// Bloom filter registry for secondary index lookups.
+    pub bloom: BloomRegistry,
     /// Group commit coordinator. `None` when group commit is disabled
     /// (`group_commit_interval_ms = 0`), in which case every DML commit
     /// fsyncs inline as in pre-3.19 behavior.
@@ -90,6 +92,7 @@ impl Database {
         Ok(Self {
             storage,
             txn,
+            bloom: BloomRegistry::new(),
             coordinator: None,
             schema_version: Arc::new(AtomicU64::new(0)),
         })
@@ -145,7 +148,13 @@ impl Database {
             .active_snapshot()
             .unwrap_or_else(|_| self.txn.snapshot());
         let analyzed = analyze_cached(stmt, &self.storage, snap, schema_cache)?;
-        let result = execute_with_ctx(analyzed, &mut self.storage, &mut self.txn, session)?;
+        let result = execute_with_ctx(
+            analyzed,
+            &mut self.storage,
+            &mut self.txn,
+            &mut self.bloom,
+            session,
+        )?;
         if is_ddl {
             self.schema_version.fetch_add(1, Ordering::Release);
         }
@@ -162,7 +171,13 @@ impl Database {
         session: &mut SessionContext,
     ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
         let is_ddl = is_schema_changing(&stmt);
-        let result = execute_with_ctx(stmt, &mut self.storage, &mut self.txn, session)?;
+        let result = execute_with_ctx(
+            stmt,
+            &mut self.storage,
+            &mut self.txn,
+            &mut self.bloom,
+            session,
+        )?;
         if is_ddl {
             self.schema_version.fetch_add(1, Ordering::Release);
         }

@@ -7,7 +7,9 @@
 //!   cargo bench --bench executor_e2e -p axiomdb-sql
 
 use axiomdb_catalog::CatalogBootstrap;
-use axiomdb_sql::{analyze, execute, execute_with_ctx, parse, SessionContext};
+use axiomdb_sql::{
+    analyze, bloom::BloomRegistry, execute, execute_with_ctx, parse, SessionContext,
+};
 use axiomdb_storage::{MemoryStorage, MmapStorage};
 use axiomdb_wal::TxnManager;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
@@ -17,6 +19,7 @@ use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughpu
 struct Db {
     storage: MmapStorage,
     txn: TxnManager,
+    bloom: BloomRegistry,
     _dir: tempfile::TempDir, // keeps tempdir alive
 }
 
@@ -31,6 +34,7 @@ impl Db {
         Db {
             storage,
             txn,
+            bloom: BloomRegistry::new(),
             _dir: dir,
         }
     }
@@ -52,7 +56,14 @@ impl Db {
             .active_snapshot()
             .unwrap_or_else(|_| self.txn.snapshot());
         let analyzed = analyze(stmt, &self.storage, snap).unwrap();
-        execute_with_ctx(analyzed, &mut self.storage, &mut self.txn, ctx).unwrap();
+        execute_with_ctx(
+            analyzed,
+            &mut self.storage,
+            &mut self.txn,
+            &mut self.bloom,
+            ctx,
+        )
+        .unwrap();
     }
 }
 
@@ -330,6 +341,7 @@ fn bench_insert_batch_memory(c: &mut Criterion) {
                         CatalogBootstrap::init(&mut storage).unwrap();
                         let txn = TxnManager::create(&wal_path).unwrap();
                         let mut ctx = SessionContext::new();
+                        let mut bloom = BloomRegistry::new();
                         let mut db_mem = (storage, txn, dir);
                         let snap = db_mem
                             .1
@@ -337,15 +349,23 @@ fn bench_insert_batch_memory(c: &mut Criterion) {
                             .unwrap_or_else(|_| db_mem.1.snapshot());
                         let stmt = parse("CREATE TABLE t (id INT, val TEXT)", None).unwrap();
                         let analyzed = analyze(stmt, &db_mem.0, snap).unwrap();
-                        execute_with_ctx(analyzed, &mut db_mem.0, &mut db_mem.1, &mut ctx).unwrap();
-                        (db_mem, ctx)
+                        execute_with_ctx(
+                            analyzed,
+                            &mut db_mem.0,
+                            &mut db_mem.1,
+                            &mut bloom,
+                            &mut ctx,
+                        )
+                        .unwrap();
+                        (db_mem, ctx, bloom)
                     },
-                    |((mut storage, mut txn, _dir), mut ctx)| {
+                    |((mut storage, mut txn, _dir), mut ctx, mut bloom)| {
                         execute_with_ctx(
                             analyze(parse("BEGIN", None).unwrap(), &storage, txn.snapshot())
                                 .unwrap(),
                             &mut storage,
                             &mut txn,
+                            &mut bloom,
                             &mut ctx,
                         )
                         .unwrap();
@@ -354,7 +374,14 @@ fn bench_insert_batch_memory(c: &mut Criterion) {
                             let snap = txn.active_snapshot().unwrap();
                             let analyzed =
                                 analyze(parse(&sql, None).unwrap(), &storage, snap).unwrap();
-                            execute_with_ctx(analyzed, &mut storage, &mut txn, &mut ctx).unwrap();
+                            execute_with_ctx(
+                                analyzed,
+                                &mut storage,
+                                &mut txn,
+                                &mut bloom,
+                                &mut ctx,
+                            )
+                            .unwrap();
                         }
                         execute_with_ctx(
                             analyze(
@@ -365,6 +392,7 @@ fn bench_insert_batch_memory(c: &mut Criterion) {
                             .unwrap(),
                             &mut storage,
                             &mut txn,
+                            &mut bloom,
                             &mut ctx,
                         )
                         .unwrap();

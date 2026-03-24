@@ -199,7 +199,7 @@
 - [x] 6.2b ✅ Index maintenance on INSERT/UPDATE/DELETE — secondary indexes kept in sync with heap; UNIQUE violation detection
 - [x] 6.3 ✅ Basic query planner — detects `WHERE col = literal` and `WHERE col > lo AND col < hi` on indexed columns; replaces full scan with B-Tree lookup/range
 - [ ] ⚠️ Composite index planner (> 1 column) — encoding supports it, planner deferred to 6.8
-- [ ] 6.4 ⏳ Bloom filter per index — avoid I/O for non-existent keys
+- [x] 6.4 ✅ Bloom filter per index — `BloomRegistry` per-DB; CREATE INDEX populates filter; INSERT adds keys; DELETE/UPDATE marks dirty; SELECT IndexLookup skips B-Tree on definite absence (1% FPR)
 - [ ] 6.5 ⏳ Foreign key checker — validation on INSERT/UPDATE with reverse index
 - [ ] 6.6 ⏳ ON DELETE CASCADE / RESTRICT / SET NULL
 - [ ] 6.7 ⏳ Partial UNIQUE index — `UNIQUE WHERE condition` for soft delete

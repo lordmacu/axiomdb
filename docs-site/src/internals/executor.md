@@ -393,6 +393,74 @@ query. Lateral joins (which allow correlation in `FROM`) are not yet supported.
 
 ---
 
+## Bloom Filter — Index Lookup Shortcut
+
+The executor holds a `BloomRegistry` (one per database connection) that maps
+`index_id → Bloom<Vec<u8>>`. Before performing any B-Tree lookup for an index
+equality predicate, the executor consults the filter:
+
+```rust
+// In execute_select_ctx — IndexLookup path
+if !bloom.might_exist(index_def.index_id, &encoded_key) {
+    // Definite absence: skip B-Tree entirely.
+    return Ok(vec![]);
+}
+// False positive or true positive: proceed with B-Tree.
+BTree::lookup_in(storage, index_def.root_page_id, &encoded_key)?
+```
+
+### BloomRegistry API
+
+```rust
+pub struct BloomRegistry { /* per-index filters */ }
+
+impl BloomRegistry {
+    pub fn create(&mut self, index_id: u32, expected_items: usize);
+    pub fn add(&mut self, index_id: u32, key: &[u8]);
+    pub fn might_exist(&self, index_id: u32, key: &[u8]) -> bool;
+    pub fn mark_dirty(&mut self, index_id: u32);
+    pub fn remove(&mut self, index_id: u32);
+}
+```
+
+`might_exist` returns `true` (conservative) for unknown `index_id`s — correct
+behavior for indexes that existed before the current server session (no filter
+was populated for them at startup).
+
+### DML Integration
+
+Every DML handler in the `execute_with_ctx` path updates the registry:
+
+| Handler | Bloom action |
+|---------|-------------|
+| `execute_insert_ctx` | `bloom.add(index_id, &key)` after each B-Tree insert |
+| `execute_update_ctx` | `mark_dirty()` for delete side; `add()` for insert side |
+| `execute_delete_ctx` | `mark_dirty(index_id)` per deleted row |
+| `execute_create_index` | `create(index_id, n)` then `add()` for every existing key |
+| `execute_drop_index` | `remove(index_id)` |
+
+### Memory Budget
+
+Each filter is sized at `max(2 × expected_items, 1000)` with a 1% FPR target
+(~9.6 bits/key, 7 hash functions). For a 1M-row table with one secondary index:
+2M × 9.6 bits ≈ **2.4 MB**.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Standard Bloom, Not Counting</span>
+A standard (non-counting) Bloom filter is used instead of a counting variant.
+Deleted keys cannot be removed — the filter is marked <em>dirty</em> instead.
+This avoids the 4× memory overhead of counting Bloom filters (used by Apache
+Cassandra and some RocksDB SST configurations) while maintaining full
+correctness: dirty filters produce more false positives but never false
+negatives. Reconstruction is deferred to <code>ANALYZE TABLE</code> (Phase 6.12),
+mirroring PostgreSQL's lazy statistics-rebuild model.
+</div>
+</div>
+
+---
+
 ## Performance Characteristics
 
 | Operation | Time complexity | Notes |
