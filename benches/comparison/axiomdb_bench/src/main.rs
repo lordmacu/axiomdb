@@ -10,7 +10,10 @@ use std::path::Path;
 use std::time::Instant;
 
 use axiomdb_catalog::CatalogBootstrap;
-use axiomdb_sql::{analyze, analyze_cached, execute, parse, QueryResult, SchemaCache};
+use axiomdb_sql::{
+    analyze, analyze_cached, execute, execute_with_ctx, parse, QueryResult, SchemaCache,
+    SessionContext,
+};
 use axiomdb_storage::MmapStorage;
 use axiomdb_wal::TxnManager;
 
@@ -63,18 +66,25 @@ impl Db {
             .unwrap_or_else(|e| panic!("execute({q}): {e}"))
     }
 
-    /// Like `sql()` but uses a schema cache — avoids catalog heap scan on repeated
-    /// inserts into the same table. Pass the same `cache` for the whole batch.
-    fn sql_cached(&mut self, q: &str, cache: &mut SchemaCache) -> QueryResult {
+    /// Like `sql()` but uses both schema caches:
+    /// - `SchemaCache` in analyze() → skips catalog scan for repeated tables
+    /// - `SessionContext` in execute_with_ctx() → skips executor-side catalog scan
+    /// Pass the same `schema_cache` and `ctx` for the whole batch.
+    fn sql_cached(
+        &mut self,
+        q: &str,
+        schema_cache: &mut SchemaCache,
+        ctx: &mut SessionContext,
+    ) -> QueryResult {
         let stmt = parse(q, None).unwrap_or_else(|e| panic!("parse({q}): {e}"));
         let snap = self
             .txn
             .active_snapshot()
             .unwrap_or_else(|_| self.txn.snapshot());
-        let analyzed = analyze_cached(stmt, &mut self.storage, snap, cache)
+        let analyzed = analyze_cached(stmt, &mut self.storage, snap, schema_cache)
             .unwrap_or_else(|e| panic!("analyze_cached({q}): {e}"));
-        execute(analyzed, &mut self.storage, &mut self.txn)
-            .unwrap_or_else(|e| panic!("execute({q}): {e}"))
+        execute_with_ctx(analyzed, &mut self.storage, &mut self.txn, ctx)
+            .unwrap_or_else(|e| panic!("execute_with_ctx({q}): {e}"))
     }
 
     fn sql_count(&mut self, q: &str) -> usize {
@@ -115,12 +125,15 @@ fn reset(db: &mut Db) {
 
 fn load_batch(db: &mut Db, inserts: &[String]) {
     reset(db);
-    // Use schema cache: analyze() only reads the catalog on the first INSERT,
-    // all subsequent rows reuse the cached TableDef + Vec<ColumnDef>.
-    let mut cache = SchemaCache::new();
+    // Dual schema cache:
+    // - SchemaCache: eliminates catalog heap scan in analyze() per row
+    // - SessionContext: eliminates catalog heap scan in execute_with_ctx() per row
+    // Together they reduce catalog I/O from 4×N to 2 total (1 miss each, then cached).
+    let mut schema_cache = SchemaCache::new();
+    let mut ctx = SessionContext::default();
     db.sql("BEGIN");
     for sql in inserts {
-        db.sql_cached(sql, &mut cache);
+        db.sql_cached(sql, &mut schema_cache, &mut ctx);
     }
     db.sql("COMMIT");
 }
