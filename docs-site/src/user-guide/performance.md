@@ -63,9 +63,28 @@ see [Benchmarks → Phase 5.14](../development/benchmarks.md#phase-514-wire-prot
 the technical explanation.
 
 **Remaining bottlenecks:**
-- SELECT: one full parse + analyze cycle per query (Phase 5.13 plan cache will amortize this)
 - INSERT (single connection): one `fdatasync` per autocommit statement; enable Group Commit
   for concurrent workloads (see below)
+
+### Prepared Statement Plan Cache (Phase 5.13)
+
+`COM_STMT_PREPARE` compiles the SQL once (parse + analyze). Every subsequent
+`COM_STMT_EXECUTE` reuses the compiled plan — no re-parsing, no catalog scan:
+
+| Path | Per-execute cost |
+|---|---|
+| `COM_QUERY` (plain string) | parse + analyze + execute (~5 ms) |
+| `COM_STMT_EXECUTE` — plan valid | substitute params + execute (~0.1 ms) — **50× faster** |
+| `COM_STMT_EXECUTE` — after DDL | re-analyze once, then fast path resumes |
+
+**Schema invalidation (correctness guarantee):** after `ALTER TABLE`, `DROP TABLE`,
+`CREATE INDEX`, etc., the cached plan is re-analyzed automatically on the next execute.
+The `schema_version` counter in `Database` increments on every successful DDL; each
+connection polls it lock-free (`Arc<AtomicU64>`) before each execute.
+
+**LRU eviction:** each connection caches up to `max_prepared_stmts_per_connection`
+(default 1024) compiled plans. The least-recently-used plan is evicted silently when
+the limit is reached. Configurable in `axiomdb.toml`.
 
 ### Group Commit — Concurrent Write Throughput (Phase 3.19)
 
