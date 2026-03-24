@@ -154,7 +154,7 @@
 - [x] 4.20 ✅ SHOW TABLES / SHOW COLUMNS / DESCRIBE — parser + executor using CatalogReader; MySQL-compatible 6-column output; Extra shows auto_increment
 - [x] 4.21 ✅ TRUNCATE TABLE — delete-all + AUTO_INCREMENT sequence reset; MySQL convention (returns count=0)
 - [x] 4.22 ✅ Basic ALTER TABLE — `ADD COLUMN` (row rewrite + default), `DROP COLUMN` (row rewrite), `RENAME COLUMN`, `RENAME TO`; parser + CatalogWriter extensions; 15 integration tests; ColumnAlreadyExists (SQLSTATE 42701)
-- [ ] 4.22b ⏳ ALTER TABLE ADD/DROP CONSTRAINT — `ADD CONSTRAINT fk`, `DROP CONSTRAINT`, `ADD UNIQUE`, `ADD CHECK`; ORMs need this post-creation
+- [x] 4.22b ✅ ALTER TABLE ADD/DROP CONSTRAINT — parser handles ADD CONSTRAINT UNIQUE/CHECK, DROP CONSTRAINT [IF EXISTS]; UNIQUE→creates unique index; CHECK→persists in new axiom_constraints catalog table (4th system table, lazy-init); check_row_constraints() enforced on INSERT; expr_to_sql_string() for persistence; drop searches both axiom_indexes and axiom_constraints; FK/PK return NotImplemented
 
 <!-- ── Group I — Validation (last, closes the phase) ── -->
 - [x] 4.16 ✅ SQL full test suite — LIKE/BETWEEN/IN/IS NULL, CAST, scalar functions (ABS/LENGTH/UPPER/LOWER/TRIM/SUBSTR/ROUND/COALESCE/NOW), NULL semantics, string concat, arithmetic expressions, error cases (division by zero, InvalidCoercion); documents NOT NULL/UNIQUE/CHECK gaps; 1046 total tests

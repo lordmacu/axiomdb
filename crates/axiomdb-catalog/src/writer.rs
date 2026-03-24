@@ -36,13 +36,15 @@
 use std::sync::Arc;
 
 use axiomdb_core::error::DbError;
-use axiomdb_storage::{alloc_index_id, alloc_table_id, HeapChain, Page, PageType, StorageEngine};
+use axiomdb_storage::{
+    alloc_constraint_id, alloc_index_id, alloc_table_id, HeapChain, Page, PageType, StorageEngine,
+};
 use axiomdb_wal::TxnManager;
 
 use crate::{
     bootstrap::{CatalogBootstrap, CatalogPageIds},
     notifier::{CatalogChangeNotifier, SchemaChangeEvent, SchemaChangeKind},
-    schema::{ColumnDef, IndexDef, TableDef, TableId},
+    schema::{ColumnDef, ConstraintDef, IndexDef, TableDef, TableId},
 };
 
 // ── WAL table_id constants for system tables ──────────────────────────────────
@@ -53,6 +55,8 @@ pub const SYSTEM_TABLE_TABLES: u32 = u32::MAX - 2;
 pub const SYSTEM_TABLE_COLUMNS: u32 = u32::MAX - 1;
 /// WAL `table_id` used for inserts/deletes into `axiom_indexes`.
 pub const SYSTEM_TABLE_INDEXES: u32 = u32::MAX;
+/// WAL `table_id` used for inserts/deletes into `axiom_constraints`.
+pub const SYSTEM_TABLE_CONSTRAINTS: u32 = u32::MAX - 3;
 
 // ── CatalogWriter ─────────────────────────────────────────────────────────────
 
@@ -487,5 +491,79 @@ impl<'a> CatalogWriter<'a> {
             }
         }
         Err(DbError::CatalogIndexNotFound { index_id })
+    }
+
+    // ── Constraint operations (Phase 4.22b) ───────────────────────────────────
+
+    /// Allocates a new `constraint_id` and inserts a constraint definition row
+    /// into `axiom_constraints`.
+    ///
+    /// Returns the allocated `constraint_id`.
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] if no transaction is active.
+    pub fn create_constraint(&mut self, def: ConstraintDef) -> Result<u32, DbError> {
+        let constraint_id = alloc_constraint_id(self.storage)?;
+        let constraints_root = CatalogBootstrap::ensure_constraints_root(self.storage)?;
+
+        let row = ConstraintDef {
+            constraint_id,
+            ..def
+        };
+        let data = row.to_bytes();
+
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+        let (page_id, slot_id) = HeapChain::insert(self.storage, constraints_root, &data, txn_id)?;
+
+        let key = constraint_id.to_le_bytes();
+        self.txn
+            .record_insert(SYSTEM_TABLE_CONSTRAINTS, &key, &data, page_id, slot_id)?;
+
+        Ok(constraint_id)
+    }
+
+    /// MVCC-deletes the constraint row with `constraint_id` from `axiom_constraints`.
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] if no transaction is active.
+    /// - Returns `Ok(())` silently if the constraint is not found (idempotent).
+    pub fn drop_constraint(&mut self, constraint_id: u32) -> Result<(), DbError> {
+        let constraints_root = CatalogBootstrap::ensure_constraints_root(self.storage)?;
+        let snap = self.txn.active_snapshot()?;
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+
+        let rids = crate::reader::CatalogReader::scan_constraints_root(
+            self.storage,
+            constraints_root,
+            snap,
+        )?;
+        for (rid, data) in rids {
+            if let Ok((def, _)) = ConstraintDef::from_bytes(&data) {
+                if def.constraint_id == constraint_id {
+                    let key = constraint_id.to_le_bytes();
+                    axiomdb_storage::HeapChain::delete(
+                        self.storage,
+                        rid.page_id,
+                        rid.slot_id,
+                        txn_id,
+                    )?;
+                    self.txn.record_delete(
+                        SYSTEM_TABLE_CONSTRAINTS,
+                        &key,
+                        &data,
+                        rid.page_id,
+                        rid.slot_id,
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        Ok(()) // not found — idempotent
     }
 }

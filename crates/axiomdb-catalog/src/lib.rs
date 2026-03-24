@@ -17,5 +17,10 @@ pub use notifier::{
 };
 pub use reader::CatalogReader;
 pub use resolver::{ResolvedTable, SchemaResolver};
-pub use schema::{ColumnDef, ColumnType, IndexColumnDef, IndexDef, SortOrder, TableDef, TableId};
-pub use writer::{CatalogWriter, SYSTEM_TABLE_COLUMNS, SYSTEM_TABLE_INDEXES, SYSTEM_TABLE_TABLES};
+pub use schema::{
+    ColumnDef, ColumnType, ConstraintDef, IndexColumnDef, IndexDef, SortOrder, TableDef, TableId,
+};
+pub use writer::{
+    CatalogWriter, SYSTEM_TABLE_COLUMNS, SYSTEM_TABLE_CONSTRAINTS, SYSTEM_TABLE_INDEXES,
+    SYSTEM_TABLE_TABLES,
+};
