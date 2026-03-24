@@ -3,6 +3,30 @@
 Database engine designed to outperform MySQL on specific benchmarks.
 University project in Rust with modern architecture.
 
+[![CI](https://github.com/lordmacu/axiomdb/actions/workflows/ci.yml/badge.svg)](https://github.com/lordmacu/axiomdb/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/lordmacu/axiomdb?include_prereleases&label=release&color=orange)](https://github.com/lordmacu/axiomdb/releases/latest)
+
+## Download
+
+Pre-built binaries — always the latest release:
+
+| Platform | Download | Notes |
+|---|---|---|
+| Linux x86-64 | [axiomdb-server-linux-x86_64](https://github.com/lordmacu/axiomdb/releases/latest/download/axiomdb-server-linux-x86_64) | Static musl — any Linux, Docker |
+| macOS Apple Silicon | [axiomdb-server-macos-aarch64](https://github.com/lordmacu/axiomdb/releases/latest/download/axiomdb-server-macos-aarch64) | M1 / M2 / M3 |
+| macOS Intel | [axiomdb-server-macos-x86_64](https://github.com/lordmacu/axiomdb/releases/latest/download/axiomdb-server-macos-x86_64) | Intel Mac |
+
+```bash
+# Linux / macOS
+chmod +x axiomdb-server-linux-x86_64
+./axiomdb-server-linux-x86_64
+
+# Connect with any MySQL client
+mysql -h 127.0.0.1 -P 3306 -u root
+```
+
+> See [all releases](https://github.com/lordmacu/axiomdb/releases) for changelogs and older versions.
+
 ## Main features
 
 - **Storage**: mmap + 8KB pages, no double-buffering
