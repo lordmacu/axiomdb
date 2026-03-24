@@ -133,6 +133,82 @@ with conn.cursor() as cursor:
 conn.close()
 ```
 
+### Parameterized Queries and ORMs (Prepared Statements)
+
+When you pass parameters to `cursor.execute()`, PyMySQL (and any MySQL-compatible
+driver) automatically uses `COM_STMT_PREPARE` / `COM_STMT_EXECUTE` — the MySQL
+binary prepared statement protocol. AxiomDB supports this natively from Phase 5.10.
+
+```python
+import pymysql
+
+conn = pymysql.connect(host='127.0.0.1', port=3306, user='root', db='axiomdb')
+
+with conn.cursor() as cursor:
+    cursor.execute("""
+        CREATE TABLE products (
+            id    BIGINT PRIMARY KEY AUTO_INCREMENT,
+            name  TEXT   NOT NULL,
+            price DOUBLE NOT NULL,
+            active BOOL  NOT NULL DEFAULT TRUE
+        )
+    """)
+    conn.commit()
+
+    # Parameterized INSERT — uses COM_STMT_PREPARE/EXECUTE automatically
+    cursor.execute(
+        "INSERT INTO products (name, price, active) VALUES (%s, %s, %s)",
+        ('Wireless Keyboard', 49.99, True),
+    )
+
+    # NULL parameters work transparently
+    cursor.execute(
+        "INSERT INTO products (name, price, active) VALUES (%s, %s, %s)",
+        ('USB-C Hub', 29.99, None),
+    )
+
+    # Parameterized SELECT
+    cursor.execute("SELECT id, name, price FROM products WHERE price < %s", (50.0,))
+    for row in cursor.fetchall():
+        print(row)
+
+    # Boolean column comparison works with integer literals (MySQL-compatible)
+    cursor.execute("SELECT name FROM products WHERE active = %s", (1,))
+    for row in cursor.fetchall():
+        print(row)
+
+conn.close()
+```
+
+ORMs such as SQLAlchemy use parameterized queries for all data-bearing operations.
+Connecting through the MySQL dialect works without any additional configuration:
+
+```python
+from sqlalchemy import create_engine, text
+
+engine = create_engine("mysql+pymysql://root@127.0.0.1:3306/axiomdb")
+
+with engine.connect() as conn:
+    result = conn.execute(
+        text("SELECT id, name FROM products WHERE price < :max_price"),
+        {"max_price": 40.0},
+    )
+    for row in result:
+        print(row)
+```
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Prepared Statement Lifecycle</span>
+Each call to <code>cursor.execute(sql, params)</code> sends a <code>COM_STMT_PREPARE</code>
+to parse the SQL and register a statement ID, followed by <code>COM_STMT_EXECUTE</code>
+with the binary-encoded parameters. The statement is cached per connection in AxiomDB
+and released with <code>COM_STMT_CLOSE</code> when the cursor closes. This matches the
+behavior expected by PyMySQL, mysqlclient, and SQLAlchemy's MySQL dialect.
+</div>
+</div>
+
 ### Connecting with PHP (PDO)
 
 ```php

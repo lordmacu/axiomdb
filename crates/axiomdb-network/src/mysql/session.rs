@@ -10,6 +10,45 @@
 
 use std::collections::HashMap;
 
+// ── PreparedStatement ─────────────────────────────────────────────────────────
+
+/// A compiled prepared statement stored per-connection.
+///
+/// Created by `COM_STMT_PREPARE` and used by subsequent `COM_STMT_EXECUTE` calls
+/// with the same `stmt_id`. Freed on `COM_STMT_CLOSE`.
+#[derive(Debug, Clone)]
+pub struct PreparedStatement {
+    pub stmt_id: u32,
+    /// Original SQL with `?` placeholders, as sent by the client.
+    pub sql_template: String,
+    /// Number of `?` placeholders detected at prepare time.
+    pub param_count: u16,
+    /// MySQL type codes for each parameter (populated from first COM_STMT_EXECUTE).
+    /// Empty until the first execution with `new_params_bound_flag = 1`.
+    pub param_types: Vec<u16>,
+}
+
+/// Counts unquoted `?` placeholders in a SQL string.
+///
+/// `?` characters inside single-quoted string literals are NOT counted.
+pub fn count_params(sql: &str) -> u16 {
+    let mut count = 0u16;
+    let mut in_string = false;
+    let mut prev = '\0';
+    for ch in sql.chars() {
+        match ch {
+            '\'' if !in_string => in_string = true,
+            '\'' if in_string && prev != '\\' => in_string = false,
+            '?' if !in_string => count += 1,
+            _ => {}
+        }
+        prev = ch;
+    }
+    count
+}
+
+// ── ConnectionState ───────────────────────────────────────────────────────────
+
 /// Per-connection session state.
 #[derive(Debug)]
 pub struct ConnectionState {
@@ -21,6 +60,10 @@ pub struct ConnectionState {
     pub character_set_client: String,
     /// Generic key=value session variables.
     pub variables: HashMap<String, String>,
+    /// Prepared statements cached for this connection.
+    pub prepared_statements: HashMap<u32, PreparedStatement>,
+    /// Monotonically increasing statement ID (never 0).
+    pub next_stmt_id: u32,
 }
 
 impl Default for ConnectionState {
@@ -47,6 +90,8 @@ impl ConnectionState {
             autocommit: true,
             character_set_client: "utf8mb4".into(),
             variables,
+            prepared_statements: HashMap::new(),
+            next_stmt_id: 1,
         }
     }
 
@@ -142,6 +187,27 @@ impl ConnectionState {
             ),
             other => self.variables.get(other).cloned(),
         }
+    }
+
+    /// Registers a new prepared statement and returns `(stmt_id, param_count)`.
+    pub fn prepare_statement(&mut self, sql: String) -> (u32, u16) {
+        let param_count = count_params(&sql);
+        let stmt_id = self.next_stmt_id;
+        // Advance, wrapping to 1 (never 0)
+        self.next_stmt_id = self.next_stmt_id.wrapping_add(1).max(1);
+        if self.next_stmt_id == 0 {
+            self.next_stmt_id = 1;
+        }
+        self.prepared_statements.insert(
+            stmt_id,
+            PreparedStatement {
+                stmt_id,
+                sql_template: sql,
+                param_count,
+                param_types: vec![],
+            },
+        );
+        (stmt_id, param_count)
     }
 }
 

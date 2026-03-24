@@ -25,6 +25,7 @@ pub mod database;
 pub mod error;
 pub mod handler;
 pub mod packets;
+pub mod prepared;
 pub mod result;
 pub mod session;
 

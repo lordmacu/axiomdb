@@ -82,6 +82,10 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
     }
 
     match (value, target) {
+        // ── Int / BigInt → Bool (MySQL: any non-zero = true) ─────────────────
+        (Value::Int(n), DataType::Bool) => Ok(Value::Bool(n != 0)),
+        (Value::BigInt(n), DataType::Bool) => Ok(Value::Bool(n != 0)),
+
         // ── Numeric widening (lossless) ───────────────────────────────────────
         (Value::Int(n), DataType::BigInt) => Ok(Value::BigInt(n as i64)),
         (Value::Int(n), DataType::Real) => Ok(Value::Real(n as f64)),
@@ -268,6 +272,13 @@ pub fn coerce_for_op(l: Value, r: Value) -> Result<(Value, Value), DbError> {
                     })?;
             Ok((l, Value::Decimal(mantissa, scale)))
         }
+
+        // Bool ↔ Int — MySQL: TRUE=1, FALSE=0 for comparisons.
+        // e.g. `active = 1` works in MySQL; we follow the same rule.
+        (Value::Bool(a), Value::Int(_)) => Ok((Value::Int(if *a { 1 } else { 0 }), r)),
+        (Value::Int(_), Value::Bool(b)) => Ok((l, Value::Int(if *b { 1 } else { 0 }))),
+        (Value::Bool(a), Value::BigInt(_)) => Ok((Value::BigInt(if *a { 1 } else { 0 }), r)),
+        (Value::BigInt(_), Value::Bool(b)) => Ok((l, Value::BigInt(if *b { 1 } else { 0 }))),
 
         // All other pairs are not implicitly promotable.
         _ => Err(DbError::InvalidCoercion {
