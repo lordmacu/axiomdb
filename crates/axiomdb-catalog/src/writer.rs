@@ -442,4 +442,50 @@ impl<'a> CatalogWriter<'a> {
 
         Err(DbError::CatalogIndexNotFound { index_id })
     }
+
+    /// Updates the `root_page_id` of an existing index.
+    ///
+    /// Called after a B-Tree root split during DML — the old catalog row is
+    /// deleted and a new one is inserted with the updated `root_page_id`.
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] if no transaction is active.
+    /// - [`DbError::CatalogIndexNotFound`] if no visible index with that ID exists.
+    pub fn update_index_root(&mut self, index_id: u32, new_root: u64) -> Result<(), DbError> {
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+        let snap = self.txn.active_snapshot()?;
+
+        let rows = HeapChain::scan_visible(self.storage, self.page_ids.indexes, snap)?;
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = IndexDef::from_bytes(&data)?;
+            if def.index_id == index_id {
+                // Delete old row.
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = index_id.to_le_bytes();
+                self.txn
+                    .record_delete(SYSTEM_TABLE_INDEXES, &key, &data, page_id, slot_id)?;
+
+                // Insert updated row.
+                let updated = IndexDef {
+                    root_page_id: new_root,
+                    ..def
+                };
+                let new_data = updated.to_bytes();
+                let (new_page_id, new_slot_id) =
+                    HeapChain::insert(self.storage, self.page_ids.indexes, &new_data, txn_id)?;
+                self.txn.record_insert(
+                    SYSTEM_TABLE_INDEXES,
+                    &key,
+                    &new_data,
+                    new_page_id,
+                    new_slot_id,
+                )?;
+                return Ok(());
+            }
+        }
+        Err(DbError::CatalogIndexNotFound { index_id })
+    }
 }

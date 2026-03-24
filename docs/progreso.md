@@ -191,11 +191,15 @@
 - [ ] 5.13 ⏳ Prepared statement plan cache — cache compiled plan by statement_id; reuse without re-parsing on successive executions; subscribe to catalog change notifier (3.13) to invalidate automatically when schema changes; LRU eviction with configurable limit
 - [x] 5.14 ✅ Throughput benchmarks + perf fix — SELECT 185 q/s (3.3× vs 56 q/s antes); INSERT 58 q/s (fsync necesario); root cause: read-only txns hacían fsync innecesario; fix: flush_no_sync para undo_ops.is_empty()
 
-### Phase 6 — Secondary indexes + FK `⏳` week 31-39
-- [ ] 6.1 ⏳ Multiple B+ Trees per table — one tree per index
+### Phase 6 — Secondary indexes + FK `🔄` week 31-39
+- [x] 6.1 ✅ `IndexColumnDef` + `IndexDef.columns` — catalog stores which columns each index covers; backward-compatible serialization
+- [x] 6.1b ✅ Key encoding — order-preserving `Value` → `[u8]` for all SQL types (NULL sorts first, sign-flip for ints, NUL-escaped text)
+- [x] 6.2 ✅ CREATE INDEX executor — scans table, builds B-Tree from existing data; `columns` persisted in catalog
+- [x] 6.2b ✅ Index maintenance on INSERT/UPDATE/DELETE — secondary indexes kept in sync with heap; UNIQUE violation detection
+- [x] 6.3 ✅ Basic query planner — detects `WHERE col = literal` and `WHERE col > lo AND col < hi` on indexed columns; replaces full scan with B-Tree lookup/range
+- [ ] ⚠️ Composite index planner (> 1 column) — encoding supports it, planner deferred to 6.8
+- [ ] 6.4 ⏳ Bloom filter per index — avoid I/O for non-existent keys
 - [ ] 6.1b ⏳ Composite indexes — multi-column indexes (a, b, c) with lexicographic comparison
-- [ ] 6.2 ⏳ CREATE INDEX — create tree and populate from existing data
-- [ ] 6.3 ⏳ Basic query planner — choose index vs full scan with simple statistics
 - [ ] 6.4 ⏳ Bloom filter per index — avoid I/O for non-existent keys
 - [ ] 6.5 ⏳ Foreign key checker — validation on INSERT/UPDATE with reverse index
 - [ ] 6.6 ⏳ ON DELETE CASCADE / RESTRICT / SET NULL

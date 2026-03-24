@@ -193,6 +193,7 @@ fn test_create_and_list_index() {
                 root_page_id: 42,
                 is_unique: true,
                 is_primary: true,
+                columns: vec![],
             })
             .unwrap();
         (tid, iid)
@@ -227,6 +228,7 @@ fn test_index_ids_are_unique_across_tables() {
                 root_page_id: 10,
                 is_unique: false,
                 is_primary: false,
+                columns: vec![],
             })
             .unwrap();
         let i2 = w
@@ -237,6 +239,7 @@ fn test_index_ids_are_unique_across_tables() {
                 root_page_id: 11,
                 is_unique: false,
                 is_primary: false,
+                columns: vec![],
             })
             .unwrap();
         (i1, i2)
@@ -264,6 +267,7 @@ fn test_delete_index() {
                 root_page_id: 5,
                 is_unique: false,
                 is_primary: false,
+                columns: vec![],
             })
             .unwrap();
         (tid, iid)
@@ -313,6 +317,7 @@ fn test_delete_table_cascades_columns_and_indexes() {
             root_page_id: 99,
             is_unique: true,
             is_primary: true,
+            columns: vec![],
         })
         .unwrap();
         tid

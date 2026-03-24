@@ -181,6 +181,16 @@ pub enum DbError {
     #[error("column '{name}' already exists in table '{table}'")]
     ColumnAlreadyExists { name: String, table: String },
 
+    /// An index with this name already exists on the table.
+    /// SQLSTATE 42P07 — duplicate_table (reused for objects)
+    #[error("index '{name}' already exists on table '{table}'")]
+    IndexAlreadyExists { name: String, table: String },
+
+    /// An index key exceeds the maximum allowed byte length.
+    /// SQLSTATE 54000 — program_limit_exceeded
+    #[error("index key length {key_len} exceeds maximum {max} bytes")]
+    IndexKeyTooLong { key_len: usize, max: usize },
+
     // ── General ──────────────────────────────────────────────────
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
@@ -215,6 +225,7 @@ impl DbError {
             DbError::ParseError { .. } => "42601",
             DbError::TableNotFound { .. } => "42P01",
             DbError::TableAlreadyExists { .. } => "42P07",
+            DbError::IndexAlreadyExists { .. } => "42P07",
             DbError::ColumnNotFound { .. } => "42703",
             DbError::AmbiguousColumn { .. } => "42702",
             DbError::PermissionDenied { .. } => "42501",
@@ -224,6 +235,7 @@ impl DbError {
             DbError::DivisionByZero => "22012",
             DbError::Overflow => "22003",
             DbError::KeyTooLong { .. } => "22001",
+            DbError::IndexKeyTooLong { .. } => "54000",
             DbError::ValueTooLarge { .. } => "22001",
             DbError::InvalidValue { .. } => "22P02",
             // ── Subqueries ────────────────────────────────────────────────

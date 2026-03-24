@@ -9,6 +9,7 @@ license.workspace = true
 axiomdb-core    = { workspace = true }
 axiomdb-types   = { workspace = true }
 axiomdb-catalog = { workspace = true }
+axiomdb-index   = { workspace = true }
 axiomdb-storage = { workspace = true }
 axiomdb-wal     = { workspace = true }
 thiserror       = { workspace = true }

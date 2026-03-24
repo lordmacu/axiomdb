@@ -905,6 +905,151 @@ impl BTree {
         let page = storage.read_page(pid)?;
         Ok(cast_internal(page).num_keys() < MIN_KEYS_INTERNAL)
     }
+
+    // ── Static API (shared storage) ──────────────────────────────────────────
+    //
+    // These functions take an external `&mut dyn StorageEngine` instead of the
+    // owned `self.storage`.  They are used when the caller already holds a
+    // mutable borrow of storage (e.g., the SQL executor) and cannot hand it to
+    // a `BTree` instance.
+
+    /// Looks up `key` in the B-Tree rooted at `root_pid`.
+    ///
+    /// Equivalent to `BTree::lookup` but works with external storage.
+    pub fn lookup_in(
+        storage: &dyn StorageEngine,
+        root_pid: u64,
+        key: &[u8],
+    ) -> Result<Option<RecordId>, DbError> {
+        Self::check_key(key)?;
+        let mut pid = root_pid;
+        loop {
+            let page = storage.read_page(pid)?;
+            if page.body()[0] == 1 {
+                let node = cast_leaf(page);
+                return Ok(node.search(key).ok().map(|i| node.rid_at(i)));
+            } else {
+                let node = cast_internal(page);
+                pid = node.child_at(node.find_child_idx(key));
+            }
+        }
+    }
+
+    /// Inserts `(key, rid)` into the B-Tree rooted at `*root_pid`.
+    ///
+    /// Updates `*root_pid` atomically if the root splits.
+    /// Uses `Ordering::AcqRel` store (safe: single-writer in Phase 6).
+    pub fn insert_in(
+        storage: &mut dyn StorageEngine,
+        root_pid: &AtomicU64,
+        key: &[u8],
+        rid: RecordId,
+    ) -> Result<(), DbError> {
+        Self::check_key(key)?;
+        let root = root_pid.load(Ordering::Acquire);
+        match Self::insert_subtree(storage, root, key, rid)? {
+            InsertResult::Ok(new_root) => {
+                root_pid.store(new_root, Ordering::Release);
+            }
+            InsertResult::Split {
+                left_pid,
+                right_pid,
+                sep,
+            } => {
+                let new_root = Self::alloc_root(storage, &sep, left_pid, right_pid)?;
+                root_pid.store(new_root, Ordering::Release);
+            }
+        }
+        Ok(())
+    }
+
+    /// Range scan on the B-Tree rooted at `root_pid`.
+    ///
+    /// Returns an iterator over `(RecordId, key_bytes)` pairs in key order.
+    /// `lo` / `hi` are inclusive bounds (pass `None` for unbounded).
+    ///
+    /// # Note
+    /// This returns owned `(RecordId, Vec<u8>)` pairs rather than a lazy
+    /// iterator to avoid lifetime conflicts with the caller's storage borrow.
+    pub fn range_in(
+        storage: &dyn StorageEngine,
+        root_pid: u64,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+    ) -> Result<Vec<(RecordId, Vec<u8>)>, DbError> {
+        use std::ops::Bound;
+
+        let from = match lo {
+            None => Bound::Unbounded,
+            Some(k) => Bound::Included(k),
+        };
+        let to = match hi {
+            None => Bound::Unbounded,
+            Some(k) => Bound::Included(k),
+        };
+
+        // Find the starting leaf.
+        let start_pid = match &from {
+            Bound::Unbounded => Self::leftmost_leaf_in(storage, root_pid)?,
+            Bound::Included(k) | Bound::Excluded(k) => {
+                Self::find_leaf_for_in(storage, root_pid, k)?
+            }
+        };
+
+        let from_owned = from.map(|k| k.to_vec());
+        let to_owned = to.map(|k| k.to_vec());
+
+        let iter = RangeIter::new(storage, root_pid, start_pid, from_owned, to_owned);
+        iter.map(|r| r.map(|(key, rid)| (rid, key))).collect()
+    }
+
+    /// Deletes `key` from the B-Tree rooted at `*root_pid`.
+    ///
+    /// Updates `*root_pid` if the root collapses after deletion.
+    /// Returns `true` if the key was found and deleted, `false` if not found.
+    pub fn delete_in(
+        storage: &mut dyn StorageEngine,
+        root_pid: &AtomicU64,
+        key: &[u8],
+    ) -> Result<bool, DbError> {
+        Self::check_key(key)?;
+        let root = root_pid.load(Ordering::Acquire);
+        match Self::delete_subtree(storage, root, key, true)? {
+            DeleteResult::NotFound => Ok(false),
+            DeleteResult::Deleted { new_pid, .. } => {
+                let final_root = Self::collapse_root(storage, new_pid)?;
+                root_pid.store(final_root, Ordering::Release);
+                Ok(true)
+            }
+        }
+    }
+
+    fn leftmost_leaf_in(storage: &dyn StorageEngine, root_pid: u64) -> Result<u64, DbError> {
+        let mut pid = root_pid;
+        loop {
+            match NodeCopy::read(storage, pid)? {
+                NodeCopy::Leaf(_) => return Ok(pid),
+                NodeCopy::Internal(n) => pid = n.child_at(0),
+            }
+        }
+    }
+
+    fn find_leaf_for_in(
+        storage: &dyn StorageEngine,
+        root_pid: u64,
+        key: &[u8],
+    ) -> Result<u64, DbError> {
+        let mut pid = root_pid;
+        loop {
+            let page = storage.read_page(pid)?;
+            if page.body()[0] == 1 {
+                return Ok(pid);
+            } else {
+                let node = cast_internal(page);
+                pid = node.child_at(node.find_child_idx(key));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

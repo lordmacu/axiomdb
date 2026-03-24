@@ -143,6 +143,7 @@ fn test_resolve_table_includes_indexes() {
             root_page_id: 10,
             is_unique: true,
             is_primary: true,
+            columns: vec![],
         })
         .unwrap();
         w.create_index(IndexDef {
@@ -152,6 +153,7 @@ fn test_resolve_table_includes_indexes() {
             root_page_id: 11,
             is_unique: false,
             is_primary: false,
+            columns: vec![],
         })
         .unwrap();
         tid

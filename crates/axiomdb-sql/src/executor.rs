@@ -35,10 +35,14 @@
 use std::collections::HashMap;
 
 use axiomdb_catalog::{
-    schema::{ColumnDef as CatalogColumnDef, ColumnType, IndexDef, TableDef},
+    schema::{
+        ColumnDef as CatalogColumnDef, ColumnType, IndexColumnDef, IndexDef,
+        SortOrder as CatalogSortOrder, TableDef,
+    },
     CatalogReader, CatalogWriter, ResolvedTable, SchemaResolver,
 };
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
+use axiomdb_index::BTree;
 use axiomdb_storage::{Page, PageType, StorageEngine};
 use axiomdb_types::{DataType, Value};
 use axiomdb_wal::TxnManager;
@@ -977,8 +981,51 @@ fn execute_select(
         };
 
         let snap = txn.active_snapshot()?;
-        // scan_table returns owned Vec — storage is free after this call.
-        let raw_rows = TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?;
+
+        // ── Query planner: pick the best access method ────────────────────
+        let access_method = {
+            let indexes = {
+                let reader = CatalogReader::new(storage, snap)?;
+                reader.list_indexes(resolved.def.id)?
+            };
+            crate::planner::plan_select(stmt.where_clause.as_ref(), &indexes, &resolved.columns)
+        };
+
+        // ── Fetch rows via the chosen access method ───────────────────────
+        let raw_rows: Vec<(RecordId, Vec<Value>)> = match &access_method {
+            crate::planner::AccessMethod::Scan => {
+                // Full sequential scan — existing behavior.
+                TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?
+            }
+            crate::planner::AccessMethod::IndexLookup { index_def, key } => {
+                // Point lookup: B-Tree → single RecordId → heap read.
+                match BTree::lookup_in(storage, index_def.root_page_id, key)? {
+                    None => vec![],
+                    Some(rid) => {
+                        match TableEngine::read_row(storage, &resolved.columns, rid)? {
+                            None => vec![], // row was deleted
+                            Some(values) => vec![(rid, values)],
+                        }
+                    }
+                }
+            }
+            crate::planner::AccessMethod::IndexRange { index_def, lo, hi } => {
+                // Range scan: iterate B-Tree entries → heap reads.
+                let pairs = BTree::range_in(
+                    storage,
+                    index_def.root_page_id,
+                    lo.as_deref(),
+                    hi.as_deref(),
+                )?;
+                let mut result = Vec::with_capacity(pairs.len());
+                for (rid, _key) in pairs {
+                    if let Some(values) = TableEngine::read_row(storage, &resolved.columns, rid)? {
+                        result.push((rid, values));
+                    }
+                }
+                result
+            }
+        };
 
         let mut combined_rows: Vec<Row> = Vec::new();
         for (_rid, values) in raw_rows {
@@ -2368,6 +2415,17 @@ fn execute_insert(
 
     let mut count = 0u64;
 
+    // Load secondary indexes once (before the row loop) for maintenance.
+    let secondary_indexes: Vec<IndexDef> = {
+        let snap = txn.active_snapshot()?;
+        let reader = CatalogReader::new(storage, snap)?;
+        reader
+            .list_indexes(resolved.def.id)?
+            .into_iter()
+            .filter(|i| !i.is_primary && !i.columns.is_empty())
+            .collect()
+    };
+
     // Find the AUTO_INCREMENT column index (at most one per table).
     let auto_inc_col: Option<usize> = schema_cols.iter().position(|c| c.auto_increment);
 
@@ -2442,7 +2500,25 @@ fn execute_insert(
                     }
                 }
 
-                TableEngine::insert_row(storage, txn, &resolved.def, schema_cols, full_values)?;
+                let rid = TableEngine::insert_row(
+                    storage,
+                    txn,
+                    &resolved.def,
+                    schema_cols,
+                    full_values.clone(),
+                )?;
+                // Index maintenance: insert into secondary indexes.
+                if !secondary_indexes.is_empty() {
+                    let updated = crate::index_maintenance::insert_into_indexes(
+                        &secondary_indexes,
+                        &full_values,
+                        rid,
+                        storage,
+                    )?;
+                    for (index_id, new_root) in updated {
+                        CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
+                    }
+                }
                 count += 1;
             }
         }
@@ -2483,7 +2559,24 @@ fn execute_insert(
                     }
                 }
 
-                TableEngine::insert_row(storage, txn, &resolved.def, schema_cols, full_values)?;
+                let rid = TableEngine::insert_row(
+                    storage,
+                    txn,
+                    &resolved.def,
+                    schema_cols,
+                    full_values.clone(),
+                )?;
+                if !secondary_indexes.is_empty() {
+                    let updated = crate::index_maintenance::insert_into_indexes(
+                        &secondary_indexes,
+                        &full_values,
+                        rid,
+                        storage,
+                    )?;
+                    for (index_id, new_root) in updated {
+                        CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
+                    }
+                }
                 count += 1;
             }
         }
@@ -2540,6 +2633,16 @@ fn execute_update(
     let snap = txn.active_snapshot()?;
     let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
 
+    // Load secondary indexes for maintenance.
+    let mut secondary_indexes: Vec<IndexDef> = {
+        let reader = CatalogReader::new(storage, snap)?;
+        reader
+            .list_indexes(resolved.def.id)?
+            .into_iter()
+            .filter(|i| !i.is_primary && !i.columns.is_empty())
+            .collect()
+    };
+
     let mut count = 0u64;
     for (rid, current_values) in rows {
         // WHERE filter.
@@ -2553,7 +2656,44 @@ fn execute_update(
         for (col_pos, val_expr) in &assignments {
             new_values[*col_pos] = eval(val_expr, &current_values)?;
         }
-        TableEngine::update_row(storage, txn, &resolved.def, &schema_cols, rid, new_values)?;
+        let new_rid = TableEngine::update_row(
+            storage,
+            txn,
+            &resolved.def,
+            &schema_cols,
+            rid,
+            new_values.clone(),
+        )?;
+        // Index maintenance: delete old key, insert new key.
+        if !secondary_indexes.is_empty() {
+            let del_updated = crate::index_maintenance::delete_from_indexes(
+                &secondary_indexes,
+                &current_values,
+                storage,
+            )?;
+            for (index_id, new_root) in &del_updated {
+                CatalogWriter::new(storage, txn)?.update_index_root(*index_id, *new_root)?;
+            }
+            // Update in-memory root_page_ids before insert so insert uses the
+            // correct (post-delete) root page.
+            for (index_id, new_root) in del_updated {
+                if let Some(idx) = secondary_indexes
+                    .iter_mut()
+                    .find(|i| i.index_id == index_id)
+                {
+                    idx.root_page_id = new_root;
+                }
+            }
+            let ins_updated = crate::index_maintenance::insert_into_indexes(
+                &secondary_indexes,
+                &new_values,
+                new_rid,
+                storage,
+            )?;
+            for (index_id, new_root) in ins_updated {
+                CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
+            }
+        }
         count += 1;
     }
 
@@ -2579,14 +2719,23 @@ fn execute_delete(
     let snap = txn.active_snapshot()?;
     let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
 
-    // Collect all matching RecordIds BEFORE deleting any row.
-    // Deleting a slot during iteration can cause scan to see stale slot states.
-    let to_delete: Vec<RecordId> = rows
+    // Load secondary indexes for maintenance.
+    let secondary_indexes: Vec<IndexDef> = {
+        let reader = CatalogReader::new(storage, snap)?;
+        reader
+            .list_indexes(resolved.def.id)?
+            .into_iter()
+            .filter(|i| !i.is_primary && !i.columns.is_empty())
+            .collect()
+    };
+
+    // Collect all matching (rid, row_values) BEFORE deleting any row.
+    let to_delete: Vec<(RecordId, Vec<Value>)> = rows
         .into_iter()
         .filter_map(|(rid, values)| match &stmt.where_clause {
-            None => Some(Ok(rid)),
+            None => Some(Ok((rid, values))),
             Some(wc) => match eval(wc, &values) {
-                Ok(v) if is_truthy(&v) => Some(Ok(rid)),
+                Ok(v) if is_truthy(&v) => Some(Ok((rid, values))),
                 Ok(_) => None,
                 Err(e) => Some(Err(e)),
             },
@@ -2594,8 +2743,19 @@ fn execute_delete(
         .collect::<Result<_, DbError>>()?;
 
     let count = to_delete.len() as u64;
-    for rid in to_delete {
+    for (rid, row_vals) in to_delete {
         TableEngine::delete_row(storage, txn, &resolved.def, rid)?;
+        // Index maintenance: remove from secondary indexes.
+        if !secondary_indexes.is_empty() {
+            let updated = crate::index_maintenance::delete_from_indexes(
+                &secondary_indexes,
+                &row_vals,
+                storage,
+            )?;
+            for (index_id, new_root) in updated {
+                CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
+            }
+        }
     }
 
     Ok(QueryResult::Affected {
@@ -2690,27 +2850,104 @@ fn execute_create_index(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
-    let schema = stmt.table.schema.as_deref().unwrap_or("public");
+    use crate::key_encoding::{encode_index_key, MAX_INDEX_KEY};
+    use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    let table_id = {
+    let schema = stmt.table.schema.as_deref().unwrap_or("public");
+    let snap = txn.active_snapshot()?;
+
+    // 1. Resolve table definition + column list.
+    let (table_def, col_defs) = {
         let resolver = make_resolver(storage, txn)?;
         let resolved = resolver.resolve_table(Some(schema), &stmt.table.name)?;
-        resolved.def.id
-    }; // resolver dropped
+        (resolved.def.clone(), resolved.columns.clone())
+    };
 
-    // Allocate an empty B-Tree root page for this index.
+    // 2. Check for a duplicate index name on this table.
+    {
+        let reader = CatalogReader::new(storage, snap)?;
+        let existing = reader.list_indexes(table_def.id)?;
+        if existing.iter().any(|i| i.name == stmt.name) {
+            return Err(DbError::IndexAlreadyExists {
+                name: stmt.name.clone(),
+                table: stmt.table.name.clone(),
+            });
+        }
+    }
+
+    // 3. Build IndexColumnDef list from the CREATE INDEX statement.
+    let index_columns: Vec<IndexColumnDef> = stmt
+        .columns
+        .iter()
+        .map(|ic| {
+            let col = col_defs
+                .iter()
+                .find(|c| c.name == ic.name)
+                .expect("analyzer guarantees index columns exist in the table");
+            IndexColumnDef {
+                col_idx: col.col_idx,
+                order: match ic.order {
+                    crate::ast::SortOrder::Asc => CatalogSortOrder::Asc,
+                    crate::ast::SortOrder::Desc => CatalogSortOrder::Desc,
+                },
+            }
+        })
+        .collect();
+
+    // 4. Allocate and initialize a fresh B-Tree leaf root page.
     let root_page_id = storage.alloc_page(PageType::Index)?;
-    let root_page = Page::new(PageType::Index, root_page_id);
-    storage.write_page(root_page_id, &root_page)?;
+    {
+        let mut page = Page::new(PageType::Index, root_page_id);
+        let leaf = cast_leaf_mut(&mut page);
+        leaf.is_leaf = 1;
+        leaf.set_num_keys(0);
+        leaf.set_next_leaf(NULL_PAGE);
+        page.update_checksum();
+        storage.write_page(root_page_id, &page)?;
+    }
+    let root_pid = AtomicU64::new(root_page_id);
 
+    // 5. Scan the table and insert existing rows into the B-Tree.
+    let rows = TableEngine::scan_table(storage, &table_def, &col_defs, snap)?;
+    let mut skipped = 0usize;
+    for (rid, row_vals) in rows {
+        let key_vals: Vec<Value> = index_columns
+            .iter()
+            .map(|ic| row_vals[ic.col_idx as usize].clone())
+            .collect();
+        // Skip rows with NULL key values — NULLs are not indexed.
+        if key_vals.iter().any(|v| matches!(v, Value::Null)) {
+            continue;
+        }
+        match encode_index_key(&key_vals) {
+            Ok(key) => {
+                BTree::insert_in(storage, &root_pid, &key, rid)?;
+            }
+            Err(DbError::IndexKeyTooLong { .. }) => {
+                skipped += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if skipped > 0 {
+        eprintln!(
+            "CREATE INDEX \"{}\": skipped {skipped} row(s) with index key > {MAX_INDEX_KEY} bytes",
+            stmt.name
+        );
+    }
+
+    // 6. Persist IndexDef with column list and final root_page_id (may have changed after splits).
+    let final_root = root_pid.load(Ordering::Acquire);
     let mut writer = CatalogWriter::new(storage, txn)?;
     writer.create_index(IndexDef {
-        index_id: 0, // allocated by create_index
-        table_id,
+        index_id: 0, // allocated by CatalogWriter::create_index
+        table_id: table_def.id,
         name: stmt.name.clone(),
-        root_page_id,
+        root_page_id: final_root,
         is_unique: stmt.unique,
         is_primary: false,
+        columns: index_columns,
     })?;
 
     Ok(QueryResult::Empty)
@@ -2733,7 +2970,8 @@ fn execute_drop_index(
 
     let schema = table_ref.schema.as_deref().unwrap_or("public");
 
-    let index_id = {
+    // Capture both index_id and root_page_id for catalog deletion + B-Tree page reclamation.
+    let (index_id, root_page_id) = {
         let reader = CatalogReader::new(storage, snap)?;
         let table_def = match reader.get_table(schema, &table_ref.name)? {
             Some(d) => d,
@@ -2745,10 +2983,10 @@ fn execute_drop_index(
             }
         };
         let indexes = reader.list_indexes(table_def.id)?;
-        indexes
-            .into_iter()
-            .find(|i| i.name == stmt.name)
-            .map(|i| i.index_id)
+        match indexes.into_iter().find(|i| i.name == stmt.name) {
+            Some(i) => (Some(i.index_id), Some(i.root_page_id)),
+            None => (None, None),
+        }
     }; // reader dropped
 
     match index_id {
@@ -2757,10 +2995,41 @@ fn execute_drop_index(
             feature: format!("DROP INDEX — index '{}' not found", stmt.name),
         }),
         Some(id) => {
+            // Delete catalog entry first.
             CatalogWriter::new(storage, txn)?.delete_index(id)?;
+            // Then free all B-Tree pages to avoid leaks.
+            if let Some(root) = root_page_id {
+                free_btree_pages(storage, root)?;
+            }
             Ok(QueryResult::Empty)
         }
     }
+}
+
+/// Frees all pages of a B-Tree rooted at `root_pid`.
+///
+/// Iteratively walks the tree (BFS via a stack) and calls `free_page` on each
+/// node — both internal and leaf pages.
+fn free_btree_pages(storage: &mut dyn StorageEngine, root_pid: u64) -> Result<(), DbError> {
+    use axiomdb_index::page_layout::{cast_internal, cast_leaf};
+
+    let mut stack = vec![root_pid];
+    while let Some(pid) = stack.pop() {
+        let page = storage.read_page(pid)?;
+        if page.body()[0] != 1 {
+            // Internal node — push all children before freeing.
+            let node = cast_internal(page);
+            let n = node.num_keys();
+            for i in 0..=n {
+                stack.push(node.child_at(i));
+            }
+        } else {
+            // Leaf node — no children to push.
+            let _leaf = cast_leaf(page); // just validate it reads correctly
+        }
+        storage.free_page(pid)?;
+    }
+    Ok(())
 }
 
 // ── TRUNCATE TABLE (4.21) ─────────────────────────────────────────────────────
