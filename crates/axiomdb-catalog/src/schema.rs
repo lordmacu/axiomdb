@@ -21,6 +21,49 @@
 
 use axiomdb_core::error::DbError;
 
+// ── SortOrder ─────────────────────────────────────────────────────────────────
+
+/// Sort direction for an index column.
+///
+/// Used in [`IndexColumnDef`] to indicate whether a column is indexed
+/// in ascending or descending order.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortOrder {
+    Asc = 0,
+    Desc = 1,
+}
+
+impl TryFrom<u8> for SortOrder {
+    type Error = DbError;
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            0 => Ok(Self::Asc),
+            1 => Ok(Self::Desc),
+            _ => Err(DbError::ParseError {
+                message: format!("unknown SortOrder discriminant: {v}"),
+            }),
+        }
+    }
+}
+
+// ── IndexColumnDef ────────────────────────────────────────────────────────────
+
+/// One column entry within an [`IndexDef`].
+///
+/// Records which column position (`col_idx`) is part of the index key
+/// and in which sort direction.
+///
+/// ## On-disk format (3 bytes per entry)
+/// `[col_idx:2 LE][order:1]`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexColumnDef {
+    /// Position of this column in the table (matches `ColumnDef.col_idx`).
+    pub col_idx: u16,
+    /// Sort direction for this column in the index key.
+    pub order: SortOrder,
+}
+
 // ── Public type aliases ───────────────────────────────────────────────────────
 
 /// Unique identifier for a table in the catalog. `0` is reserved (invalid).
@@ -266,6 +309,17 @@ impl ColumnDef {
 // ── IndexDef ──────────────────────────────────────────────────────────────────
 
 /// Metadata for an index — one row in `axiom_indexes`.
+///
+/// ## On-disk format
+///
+/// ```text
+/// [index_id:4 LE][table_id:4 LE][root_page_id:8 LE][flags:1][name_len:1][name bytes]
+/// [ncols:1][col_idx:2 LE, order:1]×ncols
+/// ```
+///
+/// The `columns` section (starting at `ncols`) is optional — old rows that
+/// predate Phase 6.1 end after `name bytes`.  `from_bytes` returns
+/// `columns: vec![]` for such rows (backward-compatible).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDef {
     /// Auto-incremented unique ID, allocated by `CatalogWriter::create_index`.
@@ -276,16 +330,21 @@ pub struct IndexDef {
     pub root_page_id: u64,
     pub is_unique: bool,
     pub is_primary: bool,
+    /// Ordered list of columns that form the index key.
+    ///
+    /// Empty for indexes created before Phase 6.1 (treated as unusable by planner).
+    pub columns: Vec<IndexColumnDef>,
 }
 
 impl IndexDef {
     /// Serializes to binary row format.
     ///
-    /// Format: `[index_id:4][table_id:4][root_page_id:8][flags:1][name_len:1][name bytes]`
+    /// Format: `[index_id:4][table_id:4][root_page_id:8][flags:1][name_len:1][name bytes][ncols:1][col_idx:2 LE, order:1]×ncols`
     /// - `flags bit0` = unique, `flags bit1` = primary key
     pub fn to_bytes(&self) -> Vec<u8> {
         let name = self.name.as_bytes();
         debug_assert!(name.len() <= 255, "index name too long");
+        debug_assert!(self.columns.len() <= 63, "too many index columns");
 
         let mut flags: u8 = 0;
         if self.is_unique {
@@ -295,19 +354,26 @@ impl IndexDef {
             flags |= 0x02;
         }
 
-        let mut buf = Vec::with_capacity(4 + 4 + 8 + 1 + 1 + name.len());
+        let mut buf =
+            Vec::with_capacity(4 + 4 + 8 + 1 + 1 + name.len() + 1 + self.columns.len() * 3);
         buf.extend_from_slice(&self.index_id.to_le_bytes());
         buf.extend_from_slice(&self.table_id.to_le_bytes());
         buf.extend_from_slice(&self.root_page_id.to_le_bytes());
         buf.push(flags);
         buf.push(name.len() as u8);
         buf.extend_from_slice(name);
+        // Columns section
+        buf.push(self.columns.len() as u8);
+        for col in &self.columns {
+            buf.extend_from_slice(&col.col_idx.to_le_bytes());
+            buf.push(col.order as u8);
+        }
         buf
     }
 
     /// Deserializes from binary row format.
     ///
-    /// Format: `[index_id:4][table_id:4][root_page_id:8][flags:1][name_len:1][name bytes]`
+    /// Backward-compatible: if the `ncols` byte is absent (old row format), returns `columns: vec![]`.
     pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), DbError> {
         let err = || DbError::ParseError {
             message: "truncated IndexRow bytes".into(),
@@ -336,7 +402,26 @@ impl IndexDef {
                 message: "invalid UTF-8 in index name".into(),
             })?
             .to_string();
-        let consumed = 18 + name_len;
+        let mut consumed = 18 + name_len;
+
+        // Backward-compatible: columns section is optional
+        let columns = if bytes.len() > consumed {
+            let ncols = bytes[consumed] as usize;
+            consumed += 1;
+            let mut cols = Vec::with_capacity(ncols);
+            for _ in 0..ncols {
+                if bytes.len() < consumed + 3 {
+                    return Err(err());
+                }
+                let col_idx = u16::from_le_bytes([bytes[consumed], bytes[consumed + 1]]);
+                let order = SortOrder::try_from(bytes[consumed + 2])?;
+                consumed += 3;
+                cols.push(IndexColumnDef { col_idx, order });
+            }
+            cols
+        } else {
+            vec![]
+        };
 
         Ok((
             Self {
@@ -346,6 +431,7 @@ impl IndexDef {
                 root_page_id,
                 is_unique,
                 is_primary,
+                columns,
             },
             consumed,
         ))
@@ -504,6 +590,10 @@ mod tests {
             root_page_id: 77,
             is_unique: true,
             is_primary: true,
+            columns: vec![IndexColumnDef {
+                col_idx: 0,
+                order: SortOrder::Asc,
+            }],
         };
         let bytes = def.to_bytes();
         let (back, consumed) = IndexDef::from_bytes(&bytes).unwrap();
@@ -520,12 +610,18 @@ mod tests {
             root_page_id: 100,
             is_unique: false,
             is_primary: false,
+            columns: vec![IndexColumnDef {
+                col_idx: 2,
+                order: SortOrder::Asc,
+            }],
         };
         let bytes = def.to_bytes();
         let (back, _) = IndexDef::from_bytes(&bytes).unwrap();
         assert_eq!(back.index_id, 5);
         assert_eq!(back.is_unique, false);
         assert_eq!(back.is_primary, false);
+        assert_eq!(back.columns.len(), 1);
+        assert_eq!(back.columns[0].col_idx, 2);
     }
 
     #[test]
@@ -537,8 +633,55 @@ mod tests {
             root_page_id: 0,
             is_unique: false,
             is_primary: false,
+            columns: vec![],
         };
         let bytes = def.to_bytes();
         assert!(IndexDef::from_bytes(&bytes[..10]).is_err());
+    }
+
+    #[test]
+    fn test_index_def_roundtrip_multi_column() {
+        let def = IndexDef {
+            index_id: 7,
+            table_id: 4,
+            name: "composite_idx".to_string(),
+            root_page_id: 200,
+            is_unique: false,
+            is_primary: false,
+            columns: vec![
+                IndexColumnDef {
+                    col_idx: 1,
+                    order: SortOrder::Asc,
+                },
+                IndexColumnDef {
+                    col_idx: 3,
+                    order: SortOrder::Desc,
+                },
+            ],
+        };
+        let bytes = def.to_bytes();
+        let (back, consumed) = IndexDef::from_bytes(&bytes).unwrap();
+        assert_eq!(back, def);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn test_index_def_old_format_backward_compat() {
+        // Simulate an old-format row that ends after the name (no columns section).
+        let def = IndexDef {
+            index_id: 2,
+            table_id: 1,
+            name: "old_idx".to_string(),
+            root_page_id: 50,
+            is_unique: false,
+            is_primary: false,
+            columns: vec![],
+        };
+        let full_bytes = def.to_bytes();
+        // Truncate the columns section (last byte is ncols=0, remove it).
+        let old_bytes = &full_bytes[..full_bytes.len() - 1];
+        let (back, consumed) = IndexDef::from_bytes(old_bytes).unwrap();
+        assert_eq!(back.columns, vec![]);
+        assert_eq!(consumed, old_bytes.len());
     }
 }

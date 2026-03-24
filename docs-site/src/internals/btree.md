@@ -266,3 +266,88 @@ prefix to compress. For a 64-byte composite key `(category_id || product_name)`,
 A tree of 1 billion rows has depth 4 — a point lookup requires reading 4 pages
 (1 per level). At 16 KB pages, a warm cache point lookup is ~4 memory accesses
 with no disk I/O.
+
+---
+
+## Static API — Shared-Storage Operations (Phase 6.2)
+
+`BTree` normally owns its `Box<dyn StorageEngine>`. This is convenient for tests but
+prevents sharing one `MmapStorage` between the table heap and multiple indexes. Phase
+6.2 adds static functions that accept an external `&mut dyn StorageEngine`:
+
+```rust
+// Point lookup — read-only, no ownership needed
+BTree::lookup_in(storage: &dyn StorageEngine, root_pid: u64, key: &[u8])
+    -> Result<Option<RecordId>, DbError>
+
+// Insert — mutates storage, updates root_pid atomically on root split
+BTree::insert_in(storage: &mut dyn StorageEngine, root_pid: &AtomicU64, key: &[u8], rid: RecordId)
+    -> Result<(), DbError>
+
+// Delete — mutates storage, updates root_pid atomically on root collapse
+BTree::delete_in(storage: &mut dyn StorageEngine, root_pid: &AtomicU64, key: &[u8])
+    -> Result<bool, DbError>
+
+// Range scan — collects all (RecordId, key_bytes) in [lo, hi] into a Vec
+BTree::range_in(storage: &dyn StorageEngine, root_pid: u64, lo: Option<&[u8]>, hi: Option<&[u8]>)
+    -> Result<Vec<(RecordId, Vec<u8>)>, DbError>
+```
+
+These delegate to the same private helpers as the owned API. The `insert_in` and
+`delete_in` variants use `AtomicU64::store(Release)` instead of `compare_exchange`
+(safe in Phase 6 — single writer).
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision</span>
+`range_in` returns `Vec<(RecordId, Vec<u8>)>` rather than an iterator to avoid
+lifetime conflicts between the borrow of storage needed to drive the iterator and the
+caller's existing `&mut storage` borrow. The heap reads happen after the range scan
+completes, which requires full ownership of the results.
+</div>
+</div>
+
+---
+
+## Order-Preserving Key Encoding (Phase 6.1b)
+
+Secondary index keys are encoded as byte slices in `axiomdb-sql/src/key_encoding.rs`
+such that `encode(a) < encode(b)` iff `a < b` under SQL comparison semantics. Each
+`Value` variant is prefixed with a 1-byte type tag:
+
+| Type | Tag | Payload | Order property |
+|------|-----|---------|----------------|
+| `NULL` | 0x00 | none | Sorts before all non-NULL |
+| `Bool` | 0x01 | 1 byte | false < true |
+| `Int(i32)` | 0x02 | 8 BE bytes after `n ^ i64::MIN` | Negative < positive |
+| `BigInt(i64)` | 0x03 | 8 BE bytes after `n ^ i64::MIN` | Negative < positive |
+| `Real(f64)` | 0x04 | 8 bytes (NaN=0, pos=MSB set, neg=all flipped) | IEEE order |
+| `Decimal(i128, u8)` | 0x05 | 1 (scale) + 16 BE bytes after sign-flip | |
+| `Date(i32)` | 0x06 | 8 BE bytes after sign-flip | |
+| `Timestamp(i64)` | 0x07 | 8 BE bytes after sign-flip | Older < newer |
+| `Text` | 0x08 | NUL-terminated UTF-8, 0x00 escaped as `[0xFF, 0x00]` | Lexicographic |
+| `Bytes` | 0x09 | NUL-terminated, same escape | Lexicographic |
+| `Uuid` | 0x0A | 16 raw bytes | Lexicographic |
+
+For composite keys the encodings are concatenated — the first column has the most
+significant sort influence.
+
+**NULL handling**: NULL values are not inserted into secondary index B-Trees. This is
+consistent with SQL semantics (`NULL ≠ NULL`) and avoids DuplicateKey errors when
+multiple NULLs appear in a UNIQUE index. `WHERE col = NULL` always falls through to a
+full scan.
+
+**Maximum key length**: 768 bytes. Keys exceeding this return `DbError::IndexKeyTooLong`
+and are silently skipped during `CREATE INDEX`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision</span>
+Integer sign-flip (`n ^ i64::MIN`) converts a signed two's-complement integer into
+an unsigned value that sorts in the same order. This is the same technique used by
+RocksDB's `WriteBatchWithIndex`, CockroachDB's key encoding, and PostgreSQL's
+`btint4cmp` — proven correct and branch-free at O(1).
+</div>
+</div>

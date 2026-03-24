@@ -94,23 +94,73 @@ the index's predicate.
 
 ## Index Key Size Limit
 
-The B+ Tree stores keys up to **64 bytes**. If the indexed column value exceeds 64
-bytes, AxiomDB truncates the key and stores the full value in the heap row for
-tie-breaking. This means:
+The B+ Tree stores encoded keys up to **768 bytes**. For most column types this is
+never an issue:
 
-- All `BIGINT`, `INT`, `UUID`, and other fixed-size types fit comfortably.
-- Short `TEXT` and `VARCHAR` values fit (ASCII names, emails up to 64 chars).
-- Very long text values are truncated in the index but remain correct for lookup
-  (the engine verifies the heap value after using the index).
+- `INT`, `BIGINT`, `UUID`, `TIMESTAMP` — fixed-size, always well under the limit.
+- `TEXT`, `VARCHAR` — a 760-character value will just fit. If you index a column
+  with very long strings (> 750 characters), rows exceeding the limit are silently
+  skipped at `CREATE INDEX` time and return `IndexKeyTooLong` on INSERT.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision</span>
+768 bytes is chosen to match the page-layout constant `MAX_KEY_LEN` (derived so that
+`ORDER_LEAF × 768 + overhead ≤ 16 384 bytes`). Unlike MySQL InnoDB which silently
+truncates long keys (leading to false positives on lookup), AxiomDB rejects
+oversized keys at write time — correctness is never compromised.
+</div>
+</div>
+
+---
+
+## Query Planner — Phase 6.3
+
+The planner rewrites the execution plan before running the scan. Currently recognized patterns:
+
+**Equality lookup** — exact match on the leading indexed column:
+```sql
+-- Uses B-Tree point lookup (O(log n) instead of O(n))
+SELECT * FROM users WHERE email = 'alice@example.com';
+SELECT * FROM orders WHERE id = 42;
+```
+
+**Range scan** — upper and lower bound on the leading indexed column:
+```sql
+-- Uses B-Tree range scan
+SELECT * FROM orders WHERE created_at > '2024-01-01' AND created_at < '2025-01-01';
+SELECT * FROM products WHERE price >= 10.0 AND price <= 50.0;
+```
+
+**Full scan fallback** — any pattern not recognized above:
+```sql
+-- Falls back to full table scan (no index for OR, function, or non-leading column)
+SELECT * FROM users WHERE email LIKE '%gmail.com';
+SELECT * FROM orders WHERE status = 'paid' OR total > 1000;
+```
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage</span>
+A point lookup on a 1M-row table takes O(log n) ≈ 20 page reads vs O(n) = 1M reads
+for a full scan — roughly a 50,000× reduction in I/O. AxiomDB's planner applies this
+automatically when a matching secondary index exists, with zero configuration required.
+</div>
+</div>
 
 ---
 
 ## Dropping an Index
 
 ```sql
-DROP INDEX index_name;
-DROP INDEX IF EXISTS idx_old;
+-- MySQL syntax (required when the server is in MySQL wire protocol mode)
+DROP INDEX index_name ON table_name;
+DROP INDEX IF EXISTS idx_old ON table_name;
 ```
+
+Dropping an index frees all B-Tree pages, reclaiming disk space immediately.
 
 Dropping an index that backs a PRIMARY KEY or UNIQUE constraint requires dropping the
 constraint first (via `ALTER TABLE DROP CONSTRAINT`).

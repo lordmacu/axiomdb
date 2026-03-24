@@ -94,6 +94,28 @@ impl TableEngine {
         Ok(result)
     }
 
+    /// Reads a single row by `RecordId` and decodes it into `Vec<Value>`.
+    ///
+    /// Returns `None` if the slot has been deleted (tombstone).
+    ///
+    /// # Errors
+    /// - [`DbError::ParseError`] — the row bytes are structurally invalid.
+    /// - I/O errors from storage reads.
+    pub fn read_row(
+        storage: &dyn StorageEngine,
+        columns: &[ColumnDef],
+        rid: RecordId,
+    ) -> Result<Option<Vec<Value>>, DbError> {
+        match HeapChain::read_row(storage, rid.page_id, rid.slot_id)? {
+            None => Ok(None),
+            Some(bytes) => {
+                let col_types = column_data_types(columns);
+                let values = decode_row(&bytes, &col_types)?;
+                Ok(Some(values))
+            }
+        }
+    }
+
     /// Encodes and inserts a row into the table heap, WAL-logging the insert.
     ///
     /// Applies implicit coercion (strict mode) from each value to the declared

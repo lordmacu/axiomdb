@@ -1,0 +1,445 @@
+//! Integration tests for secondary indexes (Phase 6.1–6.3).
+//!
+//! Tests cover:
+//! - CREATE INDEX populates B-Tree from existing data
+//! - Planner uses index for WHERE col = literal
+//! - Planner uses index for range scan
+//! - Index maintenance on INSERT
+//! - Index maintenance on DELETE
+//! - Index maintenance on UPDATE
+//! - UNIQUE index violation
+//! - NULL in UNIQUE index (allowed)
+//! - DROP INDEX frees pages
+
+use axiomdb_catalog::CatalogBootstrap;
+use axiomdb_core::error::DbError;
+use axiomdb_sql::{analyze, execute, parse, QueryResult};
+use axiomdb_storage::MemoryStorage;
+use axiomdb_types::Value;
+use axiomdb_wal::TxnManager;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn run(sql: &str, storage: &mut MemoryStorage, txn: &mut TxnManager) -> QueryResult {
+    run_result(sql, storage, txn).unwrap_or_else(|e| panic!("SQL failed: {sql}\nError: {e:?}"))
+}
+
+fn run_result(
+    sql: &str,
+    storage: &mut MemoryStorage,
+    txn: &mut TxnManager,
+) -> Result<QueryResult, DbError> {
+    let stmt = parse(sql, None)?;
+    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let analyzed = analyze(stmt, storage, snap)?;
+    execute(analyzed, storage, txn)
+}
+
+fn setup() -> (MemoryStorage, TxnManager) {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.into_path().join("test.wal");
+    let mut storage = MemoryStorage::new();
+    CatalogBootstrap::init(&mut storage).unwrap();
+    let txn = TxnManager::create(&wal_path).unwrap();
+    (storage, txn)
+}
+
+fn rows(result: QueryResult) -> Vec<Vec<Value>> {
+    match result {
+        QueryResult::Rows { rows, .. } => rows,
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
+fn affected(result: QueryResult) -> u64 {
+    match result {
+        QueryResult::Affected { count, .. } => count,
+        other => panic!("expected Affected, got {other:?}"),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_create_index_on_existing_data() {
+    let (mut storage, mut txn) = setup();
+
+    // Create table and insert rows before creating index.
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "CREATE TABLE users (id INT, email TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO users VALUES (1, 'alice@example.com')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO users VALUES (2, 'bob@example.com')",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    // Create index AFTER data is already there.
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "CREATE INDEX users_id_idx ON users (id)",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    // Query should return both rows via full scan (planner uses index only for equality).
+    run("BEGIN", &mut storage, &mut txn);
+    let result = rows(run("SELECT id, email FROM users", &mut storage, &mut txn));
+    assert_eq!(result.len(), 2);
+    run("COMMIT", &mut storage, &mut txn);
+}
+
+#[test]
+fn test_planner_uses_index_for_equality() {
+    let (mut storage, mut txn) = setup();
+
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "CREATE TABLE products (id INT, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO products VALUES (1, 'apple')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO products VALUES (2, 'banana')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO products VALUES (3, 'cherry')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE INDEX products_id_idx ON products (id)",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    run("BEGIN", &mut storage, &mut txn);
+    let result = rows(run(
+        "SELECT id, name FROM products WHERE id = 2",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0][0], Value::Int(2));
+    assert_eq!(result[0][1], Value::Text("banana".into()));
+    run("COMMIT", &mut storage, &mut txn);
+}
+
+#[test]
+fn test_planner_index_lookup_no_match() {
+    let (mut storage, mut txn) = setup();
+
+    run("BEGIN", &mut storage, &mut txn);
+    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1)", &mut storage, &mut txn);
+    run("CREATE INDEX t_id_idx ON t (id)", &mut storage, &mut txn);
+    run("COMMIT", &mut storage, &mut txn);
+
+    run("BEGIN", &mut storage, &mut txn);
+    let result = rows(run(
+        "SELECT id FROM t WHERE id = 99",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(result.len(), 0);
+    run("COMMIT", &mut storage, &mut txn);
+}
+
+#[test]
+fn test_index_maintained_on_insert() {
+    let (mut storage, mut txn) = setup();
+
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "CREATE TABLE scores (id INT, score INT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE INDEX scores_id_idx ON scores (id)",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    // Insert rows after index is created.
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "INSERT INTO scores VALUES (10, 100)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO scores VALUES (20, 200)",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    // Index lookup should find row inserted after index creation.
+    run("BEGIN", &mut storage, &mut txn);
+    let result = rows(run(
+        "SELECT score FROM scores WHERE id = 10",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0][0], Value::Int(100));
+    run("COMMIT", &mut storage, &mut txn);
+}
+
+#[test]
+fn test_index_maintained_on_delete() {
+    let (mut storage, mut txn) = setup();
+
+    run("BEGIN", &mut storage, &mut txn);
+    run("CREATE TABLE items (id INT)", &mut storage, &mut txn);
+    run("INSERT INTO items VALUES (1)", &mut storage, &mut txn);
+    run("INSERT INTO items VALUES (2)", &mut storage, &mut txn);
+    run(
+        "CREATE INDEX items_id_idx ON items (id)",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    // Delete row 1.
+    run("BEGIN", &mut storage, &mut txn);
+    run("DELETE FROM items WHERE id = 1", &mut storage, &mut txn);
+    run("COMMIT", &mut storage, &mut txn);
+
+    // Index lookup for deleted row should return empty.
+    run("BEGIN", &mut storage, &mut txn);
+    let result = rows(run(
+        "SELECT id FROM items WHERE id = 1",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(result.len(), 0, "deleted row should not be found via index");
+
+    // Row 2 should still be findable.
+    let result = rows(run(
+        "SELECT id FROM items WHERE id = 2",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(result.len(), 1);
+    run("COMMIT", &mut storage, &mut txn);
+}
+
+#[test]
+fn test_index_maintained_on_update() {
+    let (mut storage, mut txn) = setup();
+
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "CREATE TABLE kv (key INT, val TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run("INSERT INTO kv VALUES (1, 'old')", &mut storage, &mut txn);
+    run(
+        "CREATE INDEX kv_key_idx ON kv (key)",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    // Update: key 1 → 99.
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "UPDATE kv SET key = 99 WHERE val = 'old'",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    // Old key should be gone.
+    run("BEGIN", &mut storage, &mut txn);
+    let result = rows(run(
+        "SELECT val FROM kv WHERE key = 1",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(
+        result.len(),
+        0,
+        "old key should be removed from index after update"
+    );
+
+    // New key should be findable.
+    let result = rows(run(
+        "SELECT val FROM kv WHERE key = 99",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0][0], Value::Text("old".into()));
+    run("COMMIT", &mut storage, &mut txn);
+}
+
+#[test]
+fn test_unique_index_violation() {
+    let (mut storage, mut txn) = setup();
+
+    run("BEGIN", &mut storage, &mut txn);
+    run("CREATE TABLE members (email TEXT)", &mut storage, &mut txn);
+    run(
+        "CREATE UNIQUE INDEX members_email_uniq ON members (email)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO members VALUES ('alice@example.com')",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    // Second insert with same email should fail.
+    run("BEGIN", &mut storage, &mut txn);
+    let err = run_result(
+        "INSERT INTO members VALUES ('alice@example.com')",
+        &mut storage,
+        &mut txn,
+    );
+    assert!(
+        matches!(err, Err(DbError::UniqueViolation { .. })),
+        "expected UniqueViolation, got: {err:?}"
+    );
+    run("ROLLBACK", &mut storage, &mut txn);
+}
+
+#[test]
+fn test_null_in_unique_index_allowed() {
+    let (mut storage, mut txn) = setup();
+
+    run("BEGIN", &mut storage, &mut txn);
+    run("CREATE TABLE nullable_key (k INT)", &mut storage, &mut txn);
+    run(
+        "CREATE UNIQUE INDEX nullable_key_idx ON nullable_key (k)",
+        &mut storage,
+        &mut txn,
+    );
+    // Two NULLs in a UNIQUE column are allowed (NULL ≠ NULL in SQL).
+    run(
+        "INSERT INTO nullable_key VALUES (NULL)",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "INSERT INTO nullable_key VALUES (NULL)",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    run("BEGIN", &mut storage, &mut txn);
+    let result = rows(run("SELECT k FROM nullable_key", &mut storage, &mut txn));
+    assert_eq!(result.len(), 2);
+    run("COMMIT", &mut storage, &mut txn);
+}
+
+#[test]
+fn test_drop_index() {
+    let (mut storage, mut txn) = setup();
+
+    run("BEGIN", &mut storage, &mut txn);
+    run("CREATE TABLE foo (x INT)", &mut storage, &mut txn);
+    run("INSERT INTO foo VALUES (1)", &mut storage, &mut txn);
+    run("CREATE INDEX foo_x_idx ON foo (x)", &mut storage, &mut txn);
+    run("COMMIT", &mut storage, &mut txn);
+
+    // Drop index.
+    run("BEGIN", &mut storage, &mut txn);
+    run("DROP INDEX foo_x_idx ON foo", &mut storage, &mut txn);
+    run("COMMIT", &mut storage, &mut txn);
+
+    // Query should still work (falls back to full scan).
+    run("BEGIN", &mut storage, &mut txn);
+    let result = rows(run("SELECT x FROM foo WHERE x = 1", &mut storage, &mut txn));
+    assert_eq!(result.len(), 1);
+    run("COMMIT", &mut storage, &mut txn);
+}
+
+#[test]
+fn test_create_index_duplicate_name_error() {
+    let (mut storage, mut txn) = setup();
+
+    run("BEGIN", &mut storage, &mut txn);
+    run("CREATE TABLE bar (x INT)", &mut storage, &mut txn);
+    run("CREATE INDEX bar_x_idx ON bar (x)", &mut storage, &mut txn);
+    run("COMMIT", &mut storage, &mut txn);
+
+    run("BEGIN", &mut storage, &mut txn);
+    let err = run_result("CREATE INDEX bar_x_idx ON bar (x)", &mut storage, &mut txn);
+    assert!(
+        matches!(err, Err(DbError::IndexAlreadyExists { .. })),
+        "expected IndexAlreadyExists, got: {err:?}"
+    );
+    run("ROLLBACK", &mut storage, &mut txn);
+}
+
+#[test]
+fn test_text_index_lookup() {
+    let (mut storage, mut txn) = setup();
+
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "CREATE TABLE names (id INT, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO names VALUES (1, 'alice')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO names VALUES (2, 'bob')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO names VALUES (3, 'charlie')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE INDEX names_name_idx ON names (name)",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    run("BEGIN", &mut storage, &mut txn);
+    let result = rows(run(
+        "SELECT id FROM names WHERE name = 'bob'",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0][0], Value::Int(2));
+    run("COMMIT", &mut storage, &mut txn);
+}

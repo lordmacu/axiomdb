@@ -37,7 +37,15 @@ thiserror = "1"
 anyhow    = "1"
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio      = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures    = "0.3"
+
+# Wire protocol
+bytes = "1"
+sha1  = "0.10"
+sha2  = "0.10"
+rand  = "0.8"
 
 # Serialization
 serde      = { version = "1", features = ["derive"] }
@@ -71,6 +79,7 @@ axiomdb-types   = { path = "crates/axiomdb-types" }
 axiomdb-storage = { path = "crates/axiomdb-storage" }
 axiomdb-wal     = { path = "crates/axiomdb-wal" }
 axiomdb-catalog = { path = "crates/axiomdb-catalog" }
+axiomdb-index   = { path = "crates/axiomdb-index" }
 
 [profile.dev]
 opt-level = 0
