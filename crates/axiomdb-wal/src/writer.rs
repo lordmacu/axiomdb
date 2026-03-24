@@ -167,11 +167,25 @@ impl WalWriter {
 
     /// Flushes the buffer to the OS and fsyncs — guarantees on-disk durability.
     ///
-    /// Must be called after writing the COMMIT entry of a transaction.
+    /// Must be called after writing the COMMIT entry of a DML transaction.
     /// If the process dies before `commit()`, entries in the buffer are lost.
     pub fn commit(&mut self) -> Result<(), DbError> {
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
+        Ok(())
+    }
+
+    /// Flushes the buffer to the OS page cache WITHOUT fsync.
+    ///
+    /// Used for read-only transaction commits: the COMMIT entry is visible to
+    /// subsequent readers (including crash recovery) because the OS page cache
+    /// is shared, but it is NOT guaranteed to survive an OS crash.
+    ///
+    /// This is safe for read-only transactions because no heap data was
+    /// modified — even if the COMMIT is lost after an OS crash, max_committed
+    /// will simply be lower, with no data loss.
+    pub fn flush_no_sync(&mut self) -> Result<(), DbError> {
+        self.writer.flush()?;
         Ok(())
     }
 

@@ -72,6 +72,13 @@ async fn main() {
     loop {
         match listener.accept().await {
             Ok((stream, _peer)) => {
+                // TCP_NODELAY: disable Nagle algorithm so small packets
+                // (like individual MySQL result packets) are sent immediately.
+                // Without this, latency for request-response protocols is
+                // ~200ms per packet due to TCP buffering.
+                if let Err(e) = stream.set_nodelay(true) {
+                    tracing::warn!(err = %e, "TCP_NODELAY failed");
+                }
                 let db = Arc::clone(&db);
                 let id = conn_id;
                 tokio::spawn(async move {

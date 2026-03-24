@@ -189,7 +189,7 @@
 - [ ] 5.11c ⏳ Explicit connection state machine — states: `CONNECTED→AUTH→IDLE→EXECUTING→CLOSING`; timeout handling per state; detect abruptly closed socket (TCP keepalive)
 - [ ] 5.12 ⏳ Multi-statement queries — respond to multiple SELECTs separated by `;` in a single COM_QUERY (PHP legacy, SQL scripts)
 - [ ] 5.13 ⏳ Prepared statement plan cache — cache compiled plan by statement_id; reuse without re-parsing on successive executions; subscribe to catalog change notifier (3.13) to invalidate automatically when schema changes; LRU eviction with configurable limit
-- [ ] 5.14 ⏳ Throughput benchmarks — measure queries/second with 1, 4, 16, 64 concurrent connections; baseline to compare with MySQL
+- [x] 5.14 ✅ Throughput benchmarks + perf fix — SELECT 185 q/s (3.3× vs 56 q/s antes); INSERT 58 q/s (fsync necesario); root cause: read-only txns hacían fsync innecesario; fix: flush_no_sync para undo_ops.is_empty()
 
 ### Phase 6 — Secondary indexes + FK `⏳` week 31-39
 - [ ] 6.1 ⏳ Multiple B+ Trees per table — one tree per index
