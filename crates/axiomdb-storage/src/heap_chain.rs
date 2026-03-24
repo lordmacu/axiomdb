@@ -200,6 +200,102 @@ impl HeapChain {
         }
     }
 
+    /// Inserts multiple pre-encoded row payloads into the chain rooted at
+    /// `root_page_id`, loading each heap page exactly **once** regardless of
+    /// how many rows are written to it.
+    ///
+    /// ## Performance contract
+    ///
+    /// For N rows that span P pages, this method does P `read_page` + P `write_page`
+    /// calls (plus one extra write per page transition for the chain pointer).
+    /// The individual `insert()` method does N reads + N writes — i.e., this is
+    /// `N/rows_per_page` times cheaper for large batches.
+    ///
+    /// ## Crash safety
+    ///
+    /// Each page is written before `record_insert()` is called for the rows it
+    /// contains (that happens in `TableEngine::insert_rows_batch()`). The WAL
+    /// BufWriter is not flushed here; durability comes from `TxnManager::commit()`.
+    ///
+    /// Chain growth follows the same two-write ordering as `insert()`:
+    /// 1. Write the new page (with its rows) first.
+    /// 2. Then update `next_page_id` in the previous page.
+    ///
+    /// ## Returns
+    ///
+    /// One `(page_id, slot_id)` per input row, in the same order as `rows`.
+    /// Empty `rows` returns `Ok(vec![])` immediately.
+    pub fn insert_batch(
+        storage: &mut dyn StorageEngine,
+        root_page_id: u64,
+        rows: &[Vec<u8>],
+        txn_id: TxnId,
+    ) -> Result<Vec<(u64, u16)>, DbError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Walk to the last page once, before the hot loop.
+        let mut last_id = Self::last_page_id(storage, root_page_id)?;
+
+        // Load the last page into a local copy.
+        // Subsequent rows on the same page reuse this copy — no further reads.
+        let mut page = Page::from_bytes(*storage.read_page(last_id)?.as_bytes())?;
+        let mut dirty = false;
+        let mut result = Vec::with_capacity(rows.len());
+
+        for data in rows {
+            match insert_tuple(&mut page, data, txn_id) {
+                // ── Row fits on current page ───────────────────────────────────
+                Ok(slot_id) => {
+                    result.push((last_id, slot_id));
+                    dirty = true;
+                }
+
+                // ── Current page is full → flush, allocate new, retry ─────────
+                Err(DbError::HeapPageFull { .. }) => {
+                    // Step 1: flush current page with its accumulated rows.
+                    page.update_checksum();
+                    storage.write_page(last_id, &page)?;
+
+                    // Step 2: allocate an empty new page.
+                    let new_id = storage.alloc_page(PageType::Data)?;
+                    let mut new_page = Page::new(PageType::Data, new_id);
+
+                    // Step 3: link — re-read the page we just wrote, set the
+                    // chain pointer, and write it again.
+                    // (Same two-write ordering as HeapChain::insert().)
+                    let raw2 = *storage.read_page(last_id)?.as_bytes();
+                    let mut prev = Page::from_bytes(raw2)?;
+                    chain_set_next_page(&mut prev, new_id);
+                    prev.update_checksum();
+                    storage.write_page(last_id, &prev)?;
+
+                    // Step 4: switch to the new page.
+                    last_id = new_id;
+                    page = new_page;
+                    dirty = false;
+
+                    // Step 5: retry insert on the empty new page (guaranteed fit).
+                    let slot_id = insert_tuple(&mut page, data, txn_id)?;
+                    result.push((last_id, slot_id));
+                    dirty = true;
+                }
+
+                Err(other) => return Err(other),
+            }
+        }
+
+        // Flush the last page if it has any unsaved rows.
+        // (If the last row triggered a page transition, the new page is dirty.)
+        if dirty {
+            page.update_checksum();
+            storage.write_page(last_id, &page)?;
+        }
+
+        Ok(result)
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     /// Walks the chain from `root_page_id` and returns the ID of the last page
@@ -356,5 +452,93 @@ mod tests {
         // Read back and verify chain pointer is preserved.
         let read_back = storage.read_page(p1).unwrap();
         assert_eq!(chain_next_page(read_back), p2);
+    }
+
+    // ── HeapChain::insert_batch tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_insert_batch_empty_is_noop() {
+        let (mut storage, root) = storage_with_root();
+        let result = HeapChain::insert_batch(&mut storage, root, &[], 1).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_insert_batch_single_page_matches_individual() {
+        let n = 20usize;
+        let rows: Vec<Vec<u8>> = (0..n).map(|i| vec![i as u8; 32]).collect();
+
+        let (mut s1, root1) = storage_with_root();
+        let batch_rids = HeapChain::insert_batch(&mut s1, root1, &rows, 1).unwrap();
+
+        let (mut s2, root2) = storage_with_root();
+        let mut indiv_rids = Vec::new();
+        for row in &rows {
+            indiv_rids.push(HeapChain::insert(&mut s2, root2, row, 1).unwrap());
+        }
+
+        assert_eq!(batch_rids.len(), n);
+        assert_eq!(
+            batch_rids, indiv_rids,
+            "batch must assign same (page_id, slot_id) pairs as individual inserts"
+        );
+    }
+
+    #[test]
+    fn test_insert_batch_multi_page_chain_growth() {
+        // 300-byte rows → ~47 rows per 16KB page → 150 rows forces ~3 pages
+        let n = 150usize;
+        let rows: Vec<Vec<u8>> = (0..n).map(|i| vec![i as u8; 300]).collect();
+        let (mut storage, root) = storage_with_root();
+        let rids = HeapChain::insert_batch(&mut storage, root, &rows, 1).unwrap();
+        assert_eq!(rids.len(), n, "all rows must be inserted");
+
+        // committed(txn_id) makes txn visible: snapshot_id = txn_id+1 > txn_id_created
+        let snap = TransactionSnapshot::committed(1);
+        let scanned = HeapChain::scan_visible(&storage, root, snap).unwrap();
+        assert_eq!(
+            scanned.len(),
+            n,
+            "all rows must be scannable after batch insert"
+        );
+    }
+
+    #[test]
+    fn test_insert_batch_same_heap_contents_as_individual() {
+        // 500 rows × 40 bytes each — exercises multiple pages
+        let n = 500usize;
+        let rows: Vec<Vec<u8>> = (0..n)
+            .map(|i| {
+                let mut r = vec![0u8; 40];
+                r[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+                r
+            })
+            .collect();
+
+        let (mut s1, root1) = storage_with_root();
+        HeapChain::insert_batch(&mut s1, root1, &rows, 1).unwrap();
+
+        let (mut s2, root2) = storage_with_root();
+        for row in &rows {
+            HeapChain::insert(&mut s2, root2, row, 1).unwrap();
+        }
+
+        let snap = TransactionSnapshot::committed(1);
+        let mut d1: Vec<Vec<u8>> = HeapChain::scan_visible(&s1, root1, snap)
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, d)| d)
+            .collect();
+        let mut d2: Vec<Vec<u8>> = HeapChain::scan_visible(&s2, root2, snap)
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, d)| d)
+            .collect();
+        d1.sort();
+        d2.sort();
+        assert_eq!(
+            d1, d2,
+            "batch and individual insert must produce identical heap contents"
+        );
     }
 }
