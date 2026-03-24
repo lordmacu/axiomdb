@@ -191,6 +191,7 @@ function DataTable({ data: initial, tableName = 'result' }: { data: Record<strin
   const [editing, setEditing] = useState<EditCell>(null)
   const [editVal, setEditVal] = useState('')
   const [lastSql, setLastSql] = useState<{ sql: string; axiomql: string } | null>(null)
+  const [confirmDelete, setConfirmDelete] = useState<number | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const pageSize = 10
   const readOnly = new Set(['id', 'created_at'])
@@ -211,6 +212,13 @@ function DataTable({ data: initial, tableName = 'result' }: { data: Record<strin
     const v = typeof editVal === 'string' ? `'${editVal}'` : editVal
     setLastSql({ sql: `UPDATE ${tableName} SET ${editing.col} = ${v} WHERE id = ${row.id};`, axiomql: `${tableName}.filter(id = ${row.id}).update(${editing.col}: ${v})` })
     setEditing(null)
+  }
+
+  function deleteRow(idx: number) {
+    const row = rows[idx]
+    setRows(p => p.filter((_, i) => i !== idx))
+    setLastSql({ sql: `DELETE FROM ${tableName} WHERE id = ${row.id};`, axiomql: `${tableName}.filter(id = ${row.id}).delete()` })
+    setConfirmDelete(null)
   }
 
   const columns: ColumnDef<Record<string, unknown>>[] = rows.length > 0
@@ -253,6 +261,27 @@ function DataTable({ data: initial, tableName = 'result' }: { data: Record<strin
           <tbody>
             {table.getRowModel().rows.map(row => (
               <tr key={row.id} className="border-b border-border/50 hover:bg-elevated transition-colors group">
+                {/* Delete column */}
+                <td className="pl-1 pr-0 py-1.5 w-6">
+                  {confirmDelete === row.index ? (
+                    <div className="flex items-center gap-0.5">
+                      <button onClick={() => deleteRow(row.index)}
+                        className="text-[9px] px-1 py-0.5 rounded bg-error/10 text-error hover:bg-error/20 transition-colors">
+                        Del
+                      </button>
+                      <button onClick={() => setConfirmDelete(null)}
+                        className="text-[9px] px-1 py-0.5 rounded text-text-secondary hover:bg-elevated transition-colors">
+                        ×
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => setConfirmDelete(row.index)}
+                      className="opacity-0 group-hover:opacity-100 text-text-secondary hover:text-error transition-all">
+                      <Trash2 className="w-3 h-3" />
+                    </button>
+                  )}
+                </td>
                 {row.getVisibleCells().map(cell => {
                   const col = cell.column.id
                   const isEditing = editing?.rowIdx === row.index && editing?.col === col
