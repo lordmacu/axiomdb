@@ -21,25 +21,93 @@ const MOCK_RESULTS: Record<string, unknown[]> = {
   orders: generateOrders(20),
 }
 
-const DEFAULT_SQL = `-- AxiomDB Query Editor
--- Press Cmd+Enter to run
+const DEFAULT_SQL = `-- AxiomDB Query Editor  (⌘↵ to run)
 
-SELECT
-  u.id,
-  u.name,
-  u.email,
-  u.age,
-  u.active,
-  u.created_at
-FROM users u
-WHERE u.active = TRUE
-ORDER BY u.created_at DESC
+SELECT id, name, email, age, active, created_at
+FROM users
+WHERE active = TRUE
+ORDER BY created_at DESC
 LIMIT 50`
 
-const DEFAULT_AXIOMQL = `users
-  .filter(active)
+const DEFAULT_AXIOMQL = `-- AxiomDB Query Editor  (⌘↵ to run)
+
+users
+  .filter(active = true)
+  .pick(id, name, email, age, active, created_at)
   .sort(created_at.desc)
   .take(50)`
+
+// ── SQL ↔ AxiomQL translator (mock/heuristic — real one arrives in Phase 36) ─
+
+function sqlToAxiomql(sql: string): string {
+  try {
+    const s = sql.replace(/--[^\n]*/g, '').replace(/\s+/g, ' ').trim()
+    const tableM = s.match(/FROM\s+(\w+)(?:\s+(?:AS\s+)?\w+)?/i)
+    if (!tableM) return '-- Could not parse table name'
+    const table = tableM[1]
+    const lines: string[] = [table]
+    const whereM = s.match(/WHERE\s+(.+?)(?:GROUP BY|ORDER BY|LIMIT|HAVING|$)/i)
+    if (whereM) {
+      const w = whereM[1].trim()
+        .replace(/(\w+\.)(\w+)/g, '$2')            // strip aliases
+        .replace(/TRUE/gi, 'true').replace(/FALSE/gi, 'false')
+        .replace(/AND/gi, ',').replace(/OR/gi, ' or ')
+      lines.push(`  .filter(${w})`)
+    }
+    const groupM = s.match(/GROUP BY\s+(.+?)(?:ORDER BY|LIMIT|HAVING|$)/i)
+    if (groupM) {
+      const g = groupM[1].replace(/(\w+\.)(\w+)/g, '$2').trim()
+      lines.push(`  .group(${g})`)
+    }
+    const orderM = s.match(/ORDER BY\s+(.+?)(?:LIMIT|$)/i)
+    if (orderM) {
+      const parts = orderM[1].split(',').map(p => {
+        const [col, dir] = p.trim().split(/\s+/)
+        const c = col.replace(/\w+\./, '')
+        return dir?.toUpperCase() === 'DESC' ? `${c}.desc` : c
+      })
+      lines.push(`  .sort(${parts.join(', ')})`)
+    }
+    const limitM = s.match(/LIMIT\s+(\d+)/i)
+    if (limitM) lines.push(`  .take(${limitM[1]})`)
+    const selectM = s.match(/SELECT\s+(.+?)\s+FROM/is)
+    if (selectM) {
+      const cols = selectM[1].replace(/\s+/g, ' ').replace(/(\w+\.)(\w+)/g, '$2')
+      if (!cols.trim().startsWith('*')) lines.push(`  .pick(${cols.trim()})`)
+    }
+    return lines.join('\n')
+  } catch { return '-- Translation error' }
+}
+
+function axiomqlToSql(aql: string): string {
+  try {
+    const lines = aql.replace(/--[^\n]*/g, '').split('\n').map(l => l.trim()).filter(Boolean)
+    const table = lines[0]?.match(/^(\w+)/)?.[1]
+    if (!table) return '-- Could not parse table name'
+    let select = '*', where = '', order = '', limit = '', group = ''
+    for (const line of lines.slice(1)) {
+      const m = line.match(/\.(\w+)\((.+)\)/)
+      if (!m) continue
+      const [, fn, args] = m
+      if (fn === 'filter') where = args.replace(/,/g, ' AND').replace(/true/g, 'TRUE').replace(/false/g, 'FALSE')
+      if (fn === 'pick') select = args
+      if (fn === 'sort') {
+        order = args.split(',').map(p => {
+          const t = p.trim()
+          return t.endsWith('.desc') ? `${t.replace('.desc', '')} DESC` : t
+        }).join(', ')
+      }
+      if (fn === 'take') limit = args
+      if (fn === 'group') group = args.split(',')[0]?.trim() ?? ''
+    }
+    let sql = `SELECT ${select}\nFROM ${table}`
+    if (where) sql += `\nWHERE ${where}`
+    if (group) sql += `\nGROUP BY ${group}`
+    if (order) sql += `\nORDER BY ${order}`
+    if (limit) sql += `\nLIMIT ${limit}`
+    return sql + ';'
+  } catch { return '-- Translation error' }
+}
 
 type QueryMode = 'sql' | 'axiomql'
 
@@ -208,16 +276,32 @@ export default function QueryPage() {
       {/* Header */}
       <div className="border-b border-border px-6 py-3 flex items-center justify-between">
         <h1 className="text-sm font-semibold text-text-primary">Query Editor</h1>
-        <div className="flex items-center gap-1 bg-elevated rounded p-0.5">
-          {(['sql', 'axiomql'] as QueryMode[]).map(m => (
-            <button key={m} onClick={() => setMode(m)}
-              className={cn(
-                'px-3 py-1 text-xs rounded font-medium transition-colors',
-                mode === m ? 'bg-surface text-text-primary shadow-sm' : 'text-text-secondary hover:text-text-primary'
-              )}>
-              {m === 'sql' ? 'SQL' : 'AxiomQL'}
-            </button>
-          ))}
+        <div className="flex items-center gap-2">
+          {/* Translate button */}
+          <button
+            onClick={() => {
+              if (mode === 'sql') {
+                setAxiomqlValue(sqlToAxiomql(sqlValue))
+                setMode('axiomql')
+              } else {
+                setSqlValue(axiomqlToSql(axiomqlValue))
+                setMode('sql')
+              }
+            }}
+            className="flex items-center gap-1.5 px-2 py-1 text-xs text-text-secondary border border-border rounded hover:border-accent/50 hover:text-accent transition-colors font-medium">
+            {mode === 'sql' ? '→ AxiomQL' : '→ SQL'}
+          </button>
+          <div className="flex items-center gap-1 bg-elevated rounded p-0.5">
+            {(['sql', 'axiomql'] as QueryMode[]).map(m => (
+              <button key={m} onClick={() => setMode(m)}
+                className={cn(
+                  'px-3 py-1 text-xs rounded font-medium transition-colors',
+                  mode === m ? 'bg-surface text-text-primary shadow-sm' : 'text-text-secondary hover:text-text-primary'
+                )}>
+                {m === 'sql' ? 'SQL' : 'AxiomQL'}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
