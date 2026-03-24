@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-AxiomDB Build Wizard v2.0 — interactive build profile selector.
+AxiomDB Build Wizard v2.1 — interactive build profile selector.
 
 No external dependencies — pure Python 3.6+ stdlib.
 
 Usage:
     python3 tools/build-wizard.py              # interactive wizard
     python3 tools/build-wizard.py --run        # wizard + auto build
+    python3 tools/build-wizard.py --run --test --strip --timings
+    python3 tools/build-wizard.py --check      # fast cargo check --workspace
     python3 tools/build-wizard.py --profiles   # quick reference
     python3 tools/build-wizard.py --last       # repeat last build
+    python3 tools/build-wizard.py --list       # list saved profiles
     python3 tools/build-wizard.py --save web   # save selection as "web"
     python3 tools/build-wizard.py --load web   # load and run saved profile
+    python3 tools/build-wizard.py --delete web # delete saved profile
     python3 tools/build-wizard.py --ci --profile web  # CI/CD non-interactive
 """
 import argparse, json, os, subprocess, sys, time, shutil
@@ -92,7 +96,7 @@ def header(subtitle=""):
     for line in [_L1, _L2, _L3, _L4, _L5]:
         print(c(line, CYAN, BOLD))
     print()
-    print(c("  Build Wizard  v2.0", WHITE, BOLD), end="")
+    print(c("  Build Wizard  v2.1", WHITE, BOLD), end="")
     print(c(f"  ·  {subtitle}", DIM) if subtitle else "")
     print(c("  " + "─" * 60, DIM))
     print()
@@ -231,11 +235,16 @@ def detect_env(workspace):
     except Exception:
         env["targets"] = set()
 
+    # Cross-compilation tools
+    env["cross"]    = shutil.which("cross")          is not None
+    env["zigbuild"] = shutil.which("cargo-zigbuild") is not None
+
     # Existing builds
     builds = {}
     for name, path in [
         ("server",   workspace / "target/release/axiomdb-server"),
         ("embedded", workspace / "target/release/libaxiomdb_embedded.dylib"),
+        ("linux",    workspace / "target/x86_64-unknown-linux-musl/release/axiomdb-server"),
     ]:
         s = fmt_size(path)
         if s:
@@ -252,6 +261,12 @@ def print_env_status(env):
     rust_icon = c("✓", GREEN) if env["rust_ok"] else c("✗", RED)
     rust_ver  = c(env["rust"], WHITE) if env["rust_ok"] else c("not found — install rustup.rs", RED)
     print(f"  {rust_icon} Rust {rust_ver}")
+
+    cross_parts = []
+    if env.get("zigbuild"): cross_parts.append(c("cargo-zigbuild", GREEN))
+    if env.get("cross"):    cross_parts.append(c("cross", GREEN))
+    if not cross_parts:     cross_parts.append(c("none — Linux cross-compile unavailable", DIM))
+    print(f"  {c('~', DIM)} Cross tools: {', '.join(cross_parts)}")
 
     if env["builds"]:
         for name, info in env["builds"].items():
@@ -319,6 +334,25 @@ PROFILES = {
         "optional_features": ["vectors"],
         "required_target": "aarch64-apple-ios",
         "docker": False,
+        "ci": True,
+    },
+    "linux-musl": {
+        "name": "Linux x86-64 (cross from macOS)",
+        "emoji": "🐧",
+        "desc": "Static musl binary — VPS, Docker, CI",
+        "cmd_base": None,   # resolved dynamically from env
+        "output": "target/x86_64-unknown-linux-musl/release/axiomdb-server",
+        "size_est": "~2.1 MB (static musl)",
+        "includes": [
+            ("✓", "Static musl binary",           "Zero libc dependency — runs on any Linux"),
+            ("✓", "MySQL wire protocol (:3306)",  "Identical to web profile"),
+            ("✓", "Full SQL + WAL + recovery",    "Crash-safe, ACID"),
+            ("✓", "Docker FROM scratch",          "Copy single binary, no base image needed"),
+        ],
+        "optional_features": ["tls", "metrics"],
+        "required_target": "x86_64-unknown-linux-musl",
+        "cross_build": True,
+        "docker": True,
         "ci": True,
     },
     "rust-embedded": {
@@ -410,16 +444,20 @@ CUSTOM_FEATURES = [
 def config_path(workspace):
     return workspace / ".axiomdb-build.json"
 
-def save_config(workspace, name, profile_key, extras):
+def save_config(workspace, name, profile_key, extras, elapsed=None):
     path = config_path(workspace)
     try:
         data = json.loads(path.read_text()) if path.exists() else {}
     except Exception:
         data = {}
-    data[name] = {"profile": profile_key, "extras": extras}
-    data["__last__"] = {"profile": profile_key, "extras": extras}
+    entry = {"profile": profile_key, "extras": extras}
+    if elapsed is not None:
+        entry["last_elapsed"] = round(elapsed, 1)
+    data[name] = entry
+    data["__last__"] = entry
     path.write_text(json.dumps(data, indent=2))
-    print(c(f"  ✓ Saved as '{name}'", GREEN))
+    if not name.startswith("__"):
+        print(c(f"  ✓ Saved as '{name}'", GREEN))
 
 def load_config(workspace, name):
     path = config_path(workspace)
@@ -437,33 +475,78 @@ def list_configs(workspace):
     data = json.loads(path.read_text())
     return {k: v for k, v in data.items() if not k.startswith("__")}
 
+def delete_config(workspace, name):
+    path = config_path(workspace)
+    if not path.exists():
+        print(c("  No saved configs found.", RED)); sys.exit(1)
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        data = {}
+    if name not in data or name.startswith("__"):
+        keys = [k for k in data if not k.startswith("__")]
+        print(c(f"  Profile '{name}' not found. Available: {', '.join(keys) or 'none'}", RED))
+        sys.exit(1)
+    del data[name]
+    path.write_text(json.dumps(data, indent=2))
+    print(c(f"  ✓ Deleted '{name}'", GREEN))
+
+def show_saved_configs(workspace):
+    """Print all saved profiles in a human-readable table."""
+    configs = list_configs(workspace)
+    if not configs:
+        print(c("  No saved profiles. Use --save NAME after a build.", DIM))
+        return
+    print(c("  Saved profiles:", BOLD, WHITE))
+    print()
+    for name, cfg in configs.items():
+        cmd     = build_command(cfg["profile"], cfg.get("extras", []))
+        elapsed = cfg.get("last_elapsed")
+        time_s  = c(f"  (last: {elapsed}s)", DIM) if elapsed else ""
+        print(f"  {c(name, CYAN, BOLD)}{time_s}")
+        print(f"    {c(cmd, WHITE)}")
+        print()
+
 # ── Build command builder ──────────────────────────────────────────────────────
 
-def build_command(profile_key, extras):
+def build_command(profile_key, extras, env=None):
     profile = PROFILES[profile_key]
     if profile_key == "custom":
         pkg = "axiomdb-server" if "wire-protocol" in extras else "axiomdb-embedded"
         feat = " ".join(extras)
         base = f"cargo build -p {pkg} --no-default-features"
         return f"{base} --features '{feat}' --release" if feat else f"{base} --release"
+    if profile_key == "linux-musl":
+        env = env or {}
+        if env.get("zigbuild"):
+            base = "cargo zigbuild -p axiomdb-server --target x86_64-unknown-linux-musl --release"
+        elif env.get("cross"):
+            base = "cross build -p axiomdb-server --target x86_64-unknown-linux-musl --release"
+        else:
+            base = "cargo build -p axiomdb-server --target x86_64-unknown-linux-musl --release"
+        if extras:
+            base += f" --features '{' '.join(extras)}'"
+        return base
     base = profile["cmd_base"]
     if not base: return ""
     if extras:
         base += f" --features '{' '.join(extras)}'"
     return base
 
-# ── Real-time build with progress ─────────────────────────────────────────────
+# ── Build runners ──────────────────────────────────────────────────────────────
 
-def run_build(cmd, workspace, ci=False):
-    """Run the build command with live progress output."""
+def _stream_cargo(cmd, workspace, ci=False, label="Building"):
+    """
+    Stream a cargo command and show a live progress bar.
+    Returns (returncode, elapsed_seconds).
+    """
     print()
-    print(c("  Building...", BOLD, WHITE))
+    print(c(f"  {label}...", BOLD, WHITE))
     print(c("  " + "─" * 60, DIM))
     print()
 
-    start   = time.time()
+    start    = time.time()
     compiled = 0
-    last_line = ""
 
     proc = subprocess.Popen(
         cmd, shell=True, cwd=workspace,
@@ -479,12 +562,11 @@ def run_build(cmd, workspace, ci=False):
             print(line)
             continue
 
-        if line.startswith("   Compiling"):
+        if line.startswith("   Compiling") or line.startswith("   Checking"):
             compiled += 1
             crate = line.split()[-2] if len(line.split()) >= 2 else ""
             bar   = ("█" * min(compiled, 20)).ljust(20, "░")
             print(f"\r  {c(bar, CYAN)}  {c(crate, DIM):<40}", end="", flush=True)
-            last_line = line
 
         elif line.startswith("    Finished"):
             print(f"\r  {c('█'*20, GREEN)}  {c('Done', GREEN, BOLD):<40}", flush=True)
@@ -500,19 +582,147 @@ def run_build(cmd, workspace, ci=False):
     elapsed = time.time() - start
     print()
     print(c("  " + "─" * 60, DIM))
+    return proc.returncode, elapsed
 
-    if proc.returncode == 0:
+
+def run_build(cmd, workspace, ci=False, timings=False):
+    """Run cargo build. Returns (success: bool, elapsed: float)."""
+    if timings:
+        cmd += " --timings"
+    rc, elapsed = _stream_cargo(cmd, workspace, ci=ci, label="Building")
+    if rc == 0:
         print(c(f"  ✓ Build succeeded in {elapsed:.1f}s", GREEN, BOLD))
-        return True
+        if timings and not ci:
+            _open_timings(workspace)
     else:
-        print(c(f"  ✗ Build failed (exit {proc.returncode}) in {elapsed:.1f}s", RED, BOLD))
-        return False
+        print(c(f"  ✗ Build failed (exit {rc}) in {elapsed:.1f}s", RED, BOLD))
+    return rc == 0, elapsed
+
+
+def run_check(workspace, ci=False):
+    """Run cargo check --workspace — fast check without linking. Returns (success, elapsed)."""
+    rc, elapsed = _stream_cargo("cargo check --workspace", workspace, ci=ci, label="Checking")
+    if rc == 0:
+        print(c(f"  ✓ Check passed in {elapsed:.1f}s", GREEN, BOLD))
+    else:
+        print(c(f"  ✗ Check failed in {elapsed:.1f}s", RED, BOLD))
+    return rc == 0, elapsed
+
+
+def run_tests(workspace, ci=False):
+    """Run cargo test --workspace. Returns success bool."""
+    print()
+    print(c("  Running tests...", BOLD, WHITE))
+    print(c("  " + "─" * 60, DIM))
+    start  = time.time()
+    passed = 0
+    failed = 0
+
+    proc = subprocess.Popen(
+        "cargo test --workspace", shell=True, cwd=workspace,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    for raw in iter(proc.stdout.readline, ""):
+        line = raw.rstrip()
+        if not line: continue
+        if ci:
+            print(line); continue
+        if " ... ok" in line:
+            passed += 1
+            fail_s = f"  {c(str(failed)+' failed', RED)}" if failed else ""
+            print(f"\r  {c('●', GREEN)} {c(str(passed), WHITE, BOLD)} passed{fail_s}",
+                  end="", flush=True)
+        elif "FAILED" in line:
+            failed += 1
+            print(f"\n  {c(line, RED)}")
+        elif line.startswith("error"):
+            print(f"\n  {c(line, RED)}")
+    proc.wait()
+    elapsed = time.time() - start
+    print()
+    print(c("  " + "─" * 60, DIM))
+    if proc.returncode == 0:
+        print(c(f"  ✓ {passed} tests passed in {elapsed:.1f}s", GREEN, BOLD))
+    else:
+        print(c(f"  ✗ {failed} test(s) failed in {elapsed:.1f}s", RED, BOLD))
+    return proc.returncode == 0
+
+
+def strip_binary(out_path):
+    """Strip debug symbols from binary. Reports size before/after."""
+    path = Path(out_path)
+    if not path.exists():
+        print(c(f"  ⚠  Binary not found at {out_path} — skipping strip", YELLOW))
+        return
+    before = path.stat().st_size
+    try:
+        subprocess.run(["strip", str(path)], check=True, stderr=subprocess.DEVNULL)
+        after  = path.stat().st_size
+        saved  = (1 - after / before) * 100
+        print(c(f"  ✓ Stripped: {fmt_size(str(path))}  (saved {saved:.0f}%)", GREEN))
+    except FileNotFoundError:
+        print(c("  ⚠  strip not found — skipping", YELLOW))
+    except subprocess.CalledProcessError as e:
+        print(c(f"  ⚠  strip failed: {e}", YELLOW))
+
+
+def notify_done(profile_name, success, elapsed):
+    """Desktop notification when a build finishes (macOS + Linux)."""
+    icon   = "✓" if success else "✗"
+    status = "succeeded" if success else "FAILED"
+    msg    = f"{icon} {profile_name} — {status} in {elapsed:.0f}s"
+    if sys.platform == "darwin":
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 f'display notification "{msg}" with title "AxiomDB Build"'],
+                stderr=subprocess.DEVNULL, timeout=3,
+            )
+        except Exception:
+            pass
+    elif sys.platform.startswith("linux"):
+        try:
+            subprocess.run(["notify-send", "AxiomDB Build", msg],
+                           stderr=subprocess.DEVNULL, timeout=3)
+        except Exception:
+            pass
+
+
+def _open_timings(workspace):
+    """Open the cargo-timings HTML report in the default browser."""
+    timing_dir = workspace / "target" / "cargo-timings"
+    reports = sorted(timing_dir.glob("cargo-timing-*.html")) if timing_dir.exists() else []
+    if not reports:
+        print(c("  ⚠  No timings report found", YELLOW))
+        return
+    report = reports[-1]
+    print(c(f"  ⏱  Opening timings: {report.name}", CYAN))
+    try:
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
+        subprocess.Popen([opener, str(report)], stderr=subprocess.DEVNULL)
+    except Exception:
+        print(c(f"  → {report}", DIM))
 
 # ── Artifact generation ────────────────────────────────────────────────────────
 
 def gen_dockerfile(profile_key):
-    if profile_key != "web": return None
-    return """\
+    if profile_key not in ("web", "linux-musl"): return None
+    if profile_key == "linux-musl":
+        build_cmds    = (
+            "RUN rustup target add x86_64-unknown-linux-musl && cargo install cargo-zigbuild\n"
+            "RUN cargo zigbuild -p axiomdb-server --target x86_64-unknown-linux-musl --release"
+        )
+        base_image    = "scratch"
+        runtime_setup = ""
+        bin_path      = PROFILES["linux-musl"]["output"]
+    else:
+        build_cmds    = "RUN cargo build -p axiomdb-server --release"
+        base_image    = "debian:bookworm-slim"
+        runtime_setup = "RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*\n"
+        bin_path      = PROFILES["web"]["output"]
+
+    return f"""\
 # AxiomDB — production Docker image
 # Build: docker build -t axiomdb .
 # Run:   docker run -p 3306:3306 -v axiomdb_data:/data axiomdb
@@ -520,11 +730,10 @@ def gen_dockerfile(profile_key):
 FROM rust:1.80-slim AS builder
 WORKDIR /app
 COPY . .
-RUN cargo build -p axiomdb-server --release
+{build_cmds}
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/axiomdb-server /usr/local/bin/axiomdb-server
+FROM {base_image}
+{runtime_setup}COPY --from=builder /app/{bin_path} /usr/local/bin/axiomdb-server
 VOLUME ["/data"]
 EXPOSE 3306
 ENV AXIOMDB_DATA=/data
@@ -584,11 +793,15 @@ jobs:
 def gen_makefile_targets(configs):
     lines = ["# AxiomDB Makefile targets — auto-generated by Build Wizard", ""]
     for name, cfg in configs.items():
-        cmd = build_command(cfg["profile"], cfg["extras"])
+        cmd = build_command(cfg["profile"], cfg.get("extras", []))
         lines.append(f".PHONY: {name}")
         lines.append(f"{name}:")
         lines.append(f"\t{cmd}")
         lines.append("")
+    lines.append(".PHONY: check")
+    lines.append("check:")
+    lines.append("\tcargo check --workspace")
+    lines.append("")
     lines.append(".PHONY: test")
     lines.append("test:")
     lines.append("\tcargo test --workspace")
@@ -598,26 +811,35 @@ def gen_makefile_targets(configs):
     lines.append("\tcargo clean")
     return "\n".join(lines)
 
-# ── Post-build info ────────────────────────────────────────────────────────────
+# ── Post-build summary ─────────────────────────────────────────────────────────
 
-def post_build_info(profile_key, cmd, workspace, prev_size=None):
-    profile = PROFILES[profile_key]
-
-    # Actual binary size
+def post_build_info(profile_key, cmd, workspace, prev_size=None, elapsed=None):
+    profile  = PROFILES[profile_key]
     out_path = workspace / profile["output"].split("{")[0].rstrip(".")
     actual   = fmt_size(out_path)
 
     print()
-    if actual:
-        size_line = c(actual, WHITE, BOLD)
-        if prev_size and prev_size != actual:
-            size_line += c(f"  (was {prev_size})", DIM)
-        print(f"  {c('Binary:', DIM)} {out_path}  {size_line}")
-        print()
+    print(c("  " + "─" * 60, DIM))
 
-    # How to use
+    # ── Binary size block ──────────────────────────────────────────────────────
+    if actual:
+        diff = ""
+        if prev_size and prev_size != actual:
+            diff = c(f"  ← was {prev_size}", DIM)
+        print(f"  {c('📦 Binary size', BOLD)}  {c(actual, WHITE, BOLD)}{diff}")
+        print(f"  {c(str(out_path), DIM)}")
+    else:
+        print(f"  {c('📦 Output:', BOLD)} {c(profile['output'], DIM)}")
+
+    if elapsed is not None:
+        print(f"  {c('⏱  Build time', BOLD)}   {c(f'{elapsed:.1f}s', WHITE)}")
+
+    print(c("  " + "─" * 60, DIM))
+    print()
+
+    # ── How to use ─────────────────────────────────────────────────────────────
     print(c("  Next steps:", BOLD))
-    if profile_key == "web":
+    if profile_key in ("web", "linux-musl"):
         print(f"  {c('1.', CYAN)} Start the server:")
         print(f"     {c('./target/release/axiomdb-server', WHITE)}")
         print(f"  {c('2.', CYAN)} Connect with any MySQL client:")
@@ -659,7 +881,7 @@ def show_profiles(workspace):
         status = c("future", YELLOW) if profile.get("future") else c("ready", GREEN)
         print(f"  {profile['emoji']}  {c(profile['name'], BOLD, WHITE)}  [{status}]")
         cmd = build_command(key, [])
-        print(f"  {c(cmd, CYAN)}")
+        print(f"  {c(cmd or '(see wizard)', CYAN)}")
         out_path = workspace / profile["output"].split("{")[0].rstrip(".")
         actual = fmt_size(out_path)
         size = f"built: {actual}" if actual else f"est: {profile['size_est']}"
@@ -669,29 +891,49 @@ def show_profiles(workspace):
     if configs:
         print(c("  Saved profiles:", BOLD))
         for name, cfg in configs.items():
-            cmd = build_command(cfg["profile"], cfg["extras"])
-            print(f"  {c(name, CYAN)}  →  {c(cmd, WHITE)}")
+            cmd     = build_command(cfg["profile"], cfg.get("extras", []))
+            elapsed = cfg.get("last_elapsed")
+            time_s  = c(f"  ({elapsed}s)", DIM) if elapsed else ""
+            print(f"  {c(name, CYAN)}  →  {c(cmd, WHITE)}{time_s}")
         print()
 
 # ── Main wizard flow ───────────────────────────────────────────────────────────
 
-def wizard(workspace, env, auto_run=False, ci=False):
+def wizard(workspace, env, auto_run=False, ci=False, preset_save_name=None,
+           do_test=False, do_strip=False, do_timings=False, do_notify=False):
     # ── Step 1: choose target ──────────────────────────────────────────────────
     clear()
     header("Step 1 of 3 — Choose your target")
     print_env_status(env)
 
     target_options = [
-        ("web",          "🌐 Web / Cloud Server",         "MySQL wire protocol, Docker, VPS"),
-        ("desktop",      "🖥️  Desktop Application",        "Tauri, native GUI, offline app"),
-        ("mobile",       "📱 Mobile App",                  "iOS (Swift), Android (Kotlin)"),
-        ("rust-embedded","⚙️  Embedded in Rust app",        "cargo dependency, sync API"),
-        ("async-rust",   "⚡ Async Rust (Axum / Tokio)",  "AsyncDb with tokio"),
-        ("wasm",         "🌍 WebAssembly",                 "browser, in-memory — future"),
-        ("custom",       "🔧 Custom",                      "pick individual features"),
+        ("web",          "🌐 Web / Cloud Server",           "MySQL wire protocol, Docker, VPS"),
+        ("desktop",      "🖥️  Desktop Application",          "Tauri, native GUI, offline app"),
+        ("mobile",       "📱 Mobile App",                    "iOS (Swift), Android (Kotlin)"),
+        ("linux-musl",   "🐧 Linux x86-64 (cross)",          "Static musl — VPS, Docker, CI"),
+        ("rust-embedded","⚙️  Embedded in Rust app",          "cargo dependency, sync API"),
+        ("async-rust",   "⚡ Async Rust (Axum / Tokio)",    "AsyncDb with tokio"),
+        ("wasm",         "🌍 WebAssembly",                   "browser, in-memory — future"),
+        ("custom",       "🔧 Custom",                        "pick individual features"),
     ]
     _, profile_key = arrow_menu("What are you building?", target_options,
                                  hint="↑↓ to move · Enter to select")
+
+    # Cross-compile tool check for linux-musl
+    if profile_key == "linux-musl":
+        if not env.get("zigbuild") and not env.get("cross"):
+            print()
+            print(c("  ⚠  No cross-compilation tool found.", YELLOW))
+            print(c("     Best option:  cargo install cargo-zigbuild", WHITE))
+            print(c("     Alternative:  cargo install cross", DIM))
+            if not confirm("Continue anyway (native cargo, may fail on macOS)?", default=False):
+                sys.exit(0)
+        elif env.get("zigbuild"):
+            print()
+            print(c("  ✓ Using cargo-zigbuild for Linux cross-compilation", GREEN))
+        else:
+            print()
+            print(c("  ✓ Using cross for Linux cross-compilation", GREEN))
 
     # Check required target
     req = PROFILES[profile_key].get("required_target")
@@ -711,7 +953,8 @@ def wizard(workspace, env, auto_run=False, ci=False):
         print(c("     This profile will be available in a future release.", DIM))
         print()
         input(c("  Press Enter to go back...", DIM))
-        return wizard(workspace, env, auto_run, ci)
+        return wizard(workspace, env, auto_run, ci, preset_save_name,
+                      do_test, do_strip, do_timings, do_notify)
 
     # ── Step 2: optional extras ────────────────────────────────────────────────
     extras = []
@@ -742,7 +985,7 @@ def wizard(workspace, env, auto_run=False, ci=False):
     clear()
     header("Step 3 of 3 — Build summary")
     profile = PROFILES[profile_key]
-    cmd     = build_command(profile_key, extras)
+    cmd     = build_command(profile_key, extras, env=env)
 
     status  = c(" READY ", GREEN, BOLD) if not profile.get("future") else c(" FUTURE ", YELLOW, BOLD)
     print(f"  {profile['emoji']}  {c(profile['name'], BOLD, WHITE)} {status}")
@@ -769,6 +1012,21 @@ def wizard(workspace, env, auto_run=False, ci=False):
     print(c("  Build command:", BOLD))
     print(f"\n    {c(cmd, CYAN, BOLD)}\n")
 
+    # ── Post-build options ─────────────────────────────────────────────────────
+    if not ci:
+        post_opts = [
+            ("test",    "Run tests after build",   "cargo test --workspace",             do_test),
+            ("strip",   "Strip binary",            "remove debug symbols, smaller file", do_strip),
+            ("timings", "Open build timings",      "HTML report of slow crates",         do_timings),
+            ("notify",  "Desktop notification",    "alert when build finishes",          do_notify),
+        ]
+        selected_post = arrow_checkbox("Post-build actions:", post_opts,
+                                        hint="Optional — all off by default")
+        do_test    = "test"    in selected_post
+        do_strip   = "strip"   in selected_post
+        do_timings = "timings" in selected_post
+        do_notify  = "notify"  in selected_post
+
     # ── Artifacts to generate ──────────────────────────────────────────────────
     to_gen = []
     if profile.get("docker") or profile.get("ci"):
@@ -785,24 +1043,29 @@ def wizard(workspace, env, auto_run=False, ci=False):
                                      hint="Optional files to scaffold")
 
     # ── Save config ────────────────────────────────────────────────────────────
-    if not ci:
-        save_name = None
+    save_name = preset_save_name
+    if not ci and save_name is None:
         print()
         if confirm("Save this profile for later? (--last always saved automatically)", default=False):
             save_name = input(c("  Profile name: ", CYAN)).strip() or "default"
-        save_config(workspace, save_name or "__last_only__", profile_key, extras)
-        if save_name and save_name != "__last_only__":
-            save_config(workspace, save_name, profile_key, extras)
 
     # ── Run ────────────────────────────────────────────────────────────────────
     print()
     should_run = auto_run or ci or confirm("Run this build now?", default=True)
 
+    elapsed = None
+    ok      = False
     if should_run:
-        ok = run_build(cmd, workspace, ci=ci)
+        ok, elapsed = run_build(cmd, workspace, ci=ci, timings=do_timings)
 
-        # Generate requested artifacts
         if ok:
+            if do_strip:
+                out_path = workspace / profile["output"].split("{")[0].rstrip(".")
+                strip_binary(str(out_path))
+
+            if do_test:
+                run_tests(workspace, ci=ci)
+
             if "dockerfile" in to_gen:
                 content = gen_dockerfile(profile_key)
                 if content:
@@ -824,7 +1087,10 @@ def wizard(workspace, env, auto_run=False, ci=False):
                 (workspace / "Makefile").write_text(content)
                 print(c("  ✓ Makefile written", GREEN))
 
-            post_build_info(profile_key, cmd, workspace, prev_size)
+            post_build_info(profile_key, cmd, workspace, prev_size, elapsed=elapsed)
+
+        if do_notify and elapsed is not None:
+            notify_done(profile["name"], ok, elapsed)
 
         if ci:
             sys.exit(0 if ok else 1)
@@ -833,6 +1099,11 @@ def wizard(workspace, env, auto_run=False, ci=False):
         print(c("  Copy and run when ready:", DIM))
         print(f"  {c(cmd, CYAN, BOLD)}")
         print()
+
+    # Save after build so we can record elapsed time
+    save_config(workspace, save_name or "__last_only__", profile_key, extras, elapsed=elapsed)
+    if save_name and save_name != "__last_only__":
+        save_config(workspace, save_name, profile_key, extras, elapsed=elapsed)
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
@@ -853,18 +1124,32 @@ def main():
 examples:
   python3 tools/build-wizard.py                    interactive wizard
   python3 tools/build-wizard.py --run              wizard + auto build
+  python3 tools/build-wizard.py --run --test       build + run tests
+  python3 tools/build-wizard.py --run --strip      build + strip binary
+  python3 tools/build-wizard.py --run --timings    build + open timing report
+  python3 tools/build-wizard.py --run --notify     build + desktop notification
+  python3 tools/build-wizard.py --check            fast cargo check --workspace
   python3 tools/build-wizard.py --profiles         show all profiles
   python3 tools/build-wizard.py --last             repeat last build
+  python3 tools/build-wizard.py --list             list saved profiles
   python3 tools/build-wizard.py --save prod-web    save as "prod-web"
   python3 tools/build-wizard.py --load prod-web    load and run saved
+  python3 tools/build-wizard.py --delete prod-web  delete saved profile
   python3 tools/build-wizard.py --ci --profile web CI/CD non-interactive
         """,
     )
     p.add_argument("--run",      action="store_true", help="auto-build after selection")
     p.add_argument("--profiles", action="store_true", help="show all profiles and exit")
     p.add_argument("--last",     action="store_true", help="repeat the last build")
+    p.add_argument("--check",    action="store_true", help="run cargo check --workspace (fast, no linking)")
+    p.add_argument("--list",     action="store_true", help="list saved profiles")
     p.add_argument("--save",     metavar="NAME",      help="save selection with a name")
     p.add_argument("--load",     metavar="NAME",      help="load and run a saved profile")
+    p.add_argument("--delete",   metavar="NAME",      help="delete a saved profile")
+    p.add_argument("--test",     action="store_true", help="run cargo test --workspace after build")
+    p.add_argument("--strip",    action="store_true", help="strip debug symbols from binary after build")
+    p.add_argument("--timings",  action="store_true", help="open build timings HTML report after build")
+    p.add_argument("--notify",   action="store_true", help="send desktop notification when build finishes")
     p.add_argument("--ci",       action="store_true", help="non-interactive CI/CD mode")
     p.add_argument("--profile",  metavar="KEY",       help="profile key for --ci mode",
                    choices=list(PROFILES.keys()))
@@ -877,31 +1162,64 @@ examples:
     workspace = find_workspace()
     env = detect_env(workspace)
 
+    # ── --check ────────────────────────────────────────────────────────────────
+    if a.check:
+        ok, _ = run_check(workspace)
+        sys.exit(0 if ok else 1)
+
     # ── --profiles ─────────────────────────────────────────────────────────────
     if a.profiles:
         show_profiles(workspace)
         return
 
+    # ── --list ─────────────────────────────────────────────────────────────────
+    if a.list:
+        show_saved_configs(workspace)
+        return
+
+    # ── --delete ───────────────────────────────────────────────────────────────
+    if a.delete:
+        delete_config(workspace, a.delete)
+        return
+
     # ── --last ─────────────────────────────────────────────────────────────────
     if a.last:
         profile_key, extras = load_config(workspace, "__last__")
-        cmd = build_command(profile_key, extras)
+        cmd = build_command(profile_key, extras, env=env)
         print(c(f"  Repeating: {cmd}", CYAN))
-        ok = run_build(cmd, workspace)
-        if ok: post_build_info(profile_key, cmd, workspace)
+        ok, elapsed = run_build(cmd, workspace, timings=a.timings)
+        if ok:
+            if a.strip:
+                out_path = workspace / PROFILES[profile_key]["output"].split("{")[0].rstrip(".")
+                strip_binary(str(out_path))
+            if a.test:
+                run_tests(workspace)
+            post_build_info(profile_key, cmd, workspace, elapsed=elapsed)
+        if a.notify:
+            notify_done(PROFILES[profile_key]["name"], ok, elapsed)
+        save_config(workspace, "__last__", profile_key, extras, elapsed=elapsed)
         sys.exit(0 if ok else 1)
 
     # ── --load ─────────────────────────────────────────────────────────────────
     if a.load:
         profile_key, extras = load_config(workspace, a.load)
-        cmd = build_command(profile_key, extras)
+        cmd = build_command(profile_key, extras, env=env)
         clear()
         header(f"Loading profile: {a.load}")
         print(c(f"  Command: {cmd}", CYAN))
         print()
         if confirm("Run?", default=True):
-            ok = run_build(cmd, workspace)
-            if ok: post_build_info(profile_key, cmd, workspace)
+            ok, elapsed = run_build(cmd, workspace, timings=a.timings)
+            if ok:
+                if a.strip:
+                    out_path = workspace / PROFILES[profile_key]["output"].split("{")[0].rstrip(".")
+                    strip_binary(str(out_path))
+                if a.test:
+                    run_tests(workspace)
+                post_build_info(profile_key, cmd, workspace, elapsed=elapsed)
+            if a.notify:
+                notify_done(PROFILES[profile_key]["name"], ok, elapsed)
+            save_config(workspace, a.load, profile_key, extras, elapsed=elapsed)
             sys.exit(0 if ok else 1)
         return
 
@@ -909,13 +1227,17 @@ examples:
     if a.ci:
         if not a.profile:
             p.error("--ci requires --profile")
-        cmd = build_command(a.profile, [])
+        cmd = build_command(a.profile, [], env=env)
         print(f"CI build: {cmd}")
-        ok = run_build(cmd, workspace, ci=True)
+        ok, elapsed = run_build(cmd, workspace, ci=True)
+        if ok and a.test:
+            run_tests(workspace, ci=True)
         sys.exit(0 if ok else 1)
 
     # ── interactive wizard ─────────────────────────────────────────────────────
-    wizard(workspace, env, auto_run=a.run)
+    wizard(workspace, env, auto_run=a.run, preset_save_name=a.save,
+           do_test=a.test, do_strip=a.strip,
+           do_timings=a.timings, do_notify=a.notify)
 
 if __name__ == "__main__":
     main()
