@@ -250,7 +250,7 @@ export default function DiagramPage() {
       const rect = svg.getBoundingClientRect()
       const x    = (e.clientX - rect.left - pan.x) / zoom - dragOffset.current.x
       const y    = (e.clientY - rect.top  - pan.y) / zoom - dragOffset.current.y
-      setPositions(prev => ({ ...prev, [dragging]: { x: Math.max(0, x), y: Math.max(0, y) } }))
+      if (dragging) setPositions(prev => ({ ...prev, [dragging]: { x: Math.max(0, x), y: Math.max(0, y) } }))
     }
 
     function onMouseUp() { setDragging(null) }
