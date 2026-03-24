@@ -324,3 +324,96 @@ These live in `localStorage` only and do NOT need a server endpoint:
 - `axiomstudio_history` — query history (last 20)
 - `axiomstudio_saved` — saved queries / bookmarks
 - Studio preferences: font size, tab size, word wrap, minimap, default language, theme
+
+---
+
+## 9. DB Objects (`app/objects/page.tsx`)
+
+### Load procedures
+**Mock:** `PROCEDURES` array in `lib/mock.ts`
+**Real:** `GET /_api/procedures`
+```typescript
+Array<{
+  name: string; language: 'axiomql' | 'sql'
+  args: { name: string; type: string }[]
+  body: string; created_at: string; updated_at: string
+}>
+```
+
+### Create / update procedure
+**Mock:** local state edit in Monaco
+**Real:**
+- Create: `POST /_api/procedures` with `{ name, language, args, body }`
+- Update: `PUT /_api/procedures/:name` with `{ body?, args? }`
+- Delete: `DELETE /_api/procedures/:name`
+
+### Execute procedure
+**Mock:** `setTimeout` + mock success
+**Real:** `POST /_api/procedures/:name/execute`
+```typescript
+// Request: { args: Record<string, unknown> }
+// Response: { ok: true; duration_ms: number } | { error: string }
+```
+
+### Load functions
+**Mock:** `FUNCTIONS` array in `lib/mock.ts`
+**Real:** `GET /_api/functions`
+```typescript
+Array<{
+  name: string; language: 'axiomql' | 'sql'
+  args: { name: string; type: string }[]
+  returns: string; body: string; created_at: string
+}>
+```
+
+### Create / update / delete function
+**Real:**
+- Create: `POST /_api/functions`
+- Update: `PUT /_api/functions/:name`
+- Delete: `DELETE /_api/functions/:name`
+
+### Load triggers
+**Mock:** `TRIGGERS` array in `lib/mock.ts`
+**Real:** `GET /_api/triggers`
+```typescript
+Array<{
+  name: string; table: string
+  event: 'INSERT' | 'UPDATE' | 'DELETE'
+  timing: 'BEFORE' | 'AFTER'
+  language: 'axiomql' | 'sql'
+  enabled: boolean; body: string; created_at: string
+}>
+```
+
+### Enable / disable trigger
+**Mock:** local toggle state
+**Real:** `PATCH /_api/triggers/:name` with `{ enabled: boolean }`
+
+### Load sequences
+**Mock:** `SEQUENCES` array in `lib/mock.ts`
+**Real:** `GET /_api/sequences`
+```typescript
+Array<{
+  name: string; current: number; start: number
+  step: number; min: number; max: number | null; cycle: boolean
+}>
+```
+
+### Get next value / reset sequence
+**Real:**
+- Next value: `POST /_api/sequences/:name/next` → `{ value: number }`
+- Reset: `PUT /_api/sequences/:name` with `{ current?, start?, step?, max?, cycle? }`
+- Drop: `DELETE /_api/sequences/:name`
+
+---
+
+## 10. ER Diagram (`app/diagram/page.tsx`)
+
+### Table positions (layout)
+**Mock:** auto-computed grid layout on first render, then stored in component state
+**Real:** Store positions in `localStorage` key `axiomstudio_diagram_positions` (already client-only)
+The diagram reads schema from `SCHEMAS` — replace with `GET /_api/tables/:name/schema` calls on mount.
+
+### FK relationships
+**Mock:** derived from `SCHEMAS[table].columns.filter(c => c.fk)` in `lib/mock.ts`
+**Real:** same — read from the schema endpoint. No separate endpoint needed.
