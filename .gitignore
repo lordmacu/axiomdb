@@ -64,3 +64,4 @@ studio/tsconfig.tsbuildinfo
 
 # Research — external source code (no commitear)
 research/
+studio/out/
