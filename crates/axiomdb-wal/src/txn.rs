@@ -415,27 +415,33 @@ impl TxnManager {
         Ok(())
     }
 
-    /// Records N bulk-insert pages into the WAL as `PageWrite` entries (Phase 3.18).
+    /// Records N bulk-insert pages into the WAL as compact `PageWrite` entries.
     ///
-    /// Each element of `page_writes` is `(page_id, page_bytes, slot_ids)` where:
-    /// - `page_bytes` is the **post-modification** state of the page.
-    /// - `slot_ids` lists the slots inserted by this transaction on that page.
+    /// Each element of `page_writes` is `(page_id, slot_ids)` where `slot_ids`
+    /// lists the slots inserted by this transaction on that page.
     ///
-    /// Emits one `PageWrite` WAL entry per page, using `reserve_lsns + write_batch`
-    /// for O(1) BufWriter calls. The entries replace N individual `Insert` entries,
-    /// reducing WAL CPU work from O(N rows) to O(P pages) — typically 200-500× fewer
-    /// serializations for bulk inserts.
+    /// ## Compact WAL format
     ///
-    /// The `new_value` format encodes `page_bytes || num_slots (u16 LE) || slot_ids`
-    /// so crash recovery can undo uncommitted `PageWrite` entries by marking each
-    /// slot dead — identical in effect to undoing N `Insert` entries.
+    /// `new_value = [num_slots: u16 LE][slot_id × num_slots: u16 LE each]`
+    ///
+    /// No page bytes are stored — crash recovery only needs the slot IDs to mark
+    /// inserted slots dead on undo. Eliminating the 16 KB page image reduces WAL
+    /// size from ~820 KB to ~20 KB per 10K-row batch (40× reduction).
+    ///
+    /// Inspired by MariaDB's InnoDB redo log (logical delta) and OceanBase's
+    /// `ObDASWriteBuffer` (row-level buffering, not page-level snapshot).
+    ///
+    /// ## WAL ordering
+    ///
+    /// Uses `reserve_lsns + write_batch` for O(1) BufWriter calls — same
+    /// pattern as `record_insert_batch`.
     ///
     /// # Errors
     /// - [`DbError::NoActiveTransaction`] if called outside a transaction.
     pub fn record_page_writes(
         &mut self,
         table_id: u32,
-        page_writes: &[(u64, &[u8; PAGE_SIZE], &[u16])],
+        page_writes: &[(u64, &[u16])], // (page_id, slot_ids)
     ) -> Result<(), DbError> {
         let n = page_writes.len();
         if n == 0 {
@@ -448,12 +454,12 @@ impl TxnManager {
         let lsn_base = self.wal.reserve_lsns(n);
         self.wal_scratch.clear();
 
-        for (i, (page_id, page_bytes, slot_ids)) in page_writes.iter().enumerate() {
+        for (i, (page_id, slot_ids)) in page_writes.iter().enumerate() {
             let key = page_id.to_le_bytes();
 
-            // new_value: [page_bytes: PAGE_SIZE][num_slots: u16 LE][slot_id × N: u16 LE]
-            let mut new_value = Vec::with_capacity(PAGE_SIZE + 2 + slot_ids.len() * 2);
-            new_value.extend_from_slice(page_bytes.as_slice());
+            // Compact new_value: [num_slots: u16 LE][slot_id × N: u16 LE]
+            // No page bytes — crash recovery only needs slot IDs for undo.
+            let mut new_value = Vec::with_capacity(2 + slot_ids.len() * 2);
             new_value.extend_from_slice(&(slot_ids.len() as u16).to_le_bytes());
             for &slot_id in slot_ids.iter() {
                 new_value.extend_from_slice(&slot_id.to_le_bytes());
@@ -474,7 +480,7 @@ impl TxnManager {
         self.wal.write_batch(&self.wal_scratch)?;
 
         // Enqueue in-memory undo ops (used by ROLLBACK and group commit mode).
-        for (page_id, _page_bytes, slot_ids) in page_writes {
+        for (page_id, slot_ids) in page_writes {
             for &slot_id in slot_ids.iter() {
                 active.undo_ops.push(UndoOp::UndoInsert {
                     page_id: *page_id,

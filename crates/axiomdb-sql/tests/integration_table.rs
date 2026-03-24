@@ -127,7 +127,8 @@ fn test_table_engine_insert_mvcc_visibility() {
 
     // Fresh snapshot sees 1 row.
     let snap_after = txn.snapshot();
-    let rows_new = TableEngine::scan_table(&mut storage, &table_def, &columns, snap_after, None).unwrap();
+    let rows_new =
+        TableEngine::scan_table(&mut storage, &table_def, &columns, snap_after, None).unwrap();
     assert_eq!(rows_new.len(), 1);
     assert_eq!(rows_new[0].1[0], Value::Int(42));
 }
@@ -411,13 +412,15 @@ fn test_table_engine_scan_respects_snapshot() {
     txn.commit().unwrap();
 
     // snap_after_a must still see only row A.
-    let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap_after_a, None).unwrap();
+    let rows =
+        TableEngine::scan_table(&mut storage, &table_def, &columns, snap_after_a, None).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].1[0], Value::Int(1));
 
     // Current snapshot sees both.
     let snap_current = txn.snapshot();
-    let rows2 = TableEngine::scan_table(&mut storage, &table_def, &columns, snap_current, None).unwrap();
+    let rows2 =
+        TableEngine::scan_table(&mut storage, &table_def, &columns, snap_current, None).unwrap();
     assert_eq!(rows2.len(), 2);
 }
 
