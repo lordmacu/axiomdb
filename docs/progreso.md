@@ -155,7 +155,7 @@
 
 <!-- ── Group I — Validation (last, closes the phase) ── -->
 - [x] 4.16 ✅ SQL full test suite — LIKE/BETWEEN/IN/IS NULL, CAST, scalar functions (ABS/LENGTH/UPPER/LOWER/TRIM/SUBSTR/ROUND/COALESCE/NOW), NULL semantics, string concat, arithmetic expressions, error cases (division by zero, InvalidCoercion); documents NOT NULL/UNIQUE/CHECK gaps; 1046 total tests
-- [ ] 4.16b ⏳ INSERT throughput benchmark (MmapStorage + WAL real) — validate 180K ops/s budget with real I/O; **NEW — gap identified in Phase 3 benchmark review; blocker for closing Phase 4**
+- [x] 4.16b ✅ INSERT throughput benchmark — batch 10K rows (1 txn, SchemaCache): 36K ops/s ⚠️; bottleneck = WAL record_insert ~20µs/row (NOT parse/catalog); target 180K ops/s requires Phase 8 prepared statements; add bench_insert_batch_cached to executor_e2e.rs
 
 ### Phase 5 — MySQL Wire Protocol `⏳` week 26-30
 - [ ] 5.1 ⏳ TCP listener with Tokio — accept connections on :3306

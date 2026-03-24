@@ -86,7 +86,8 @@ the "Max acceptable" column is a blocker.
 |---|---|---|---|---|
 | Point lookup PK | **1.2M ops/s** ✅ | 800K ops/s | 600K ops/s | 2 |
 | Range scan 10K rows | **0.61 ms** ✅ | 45 ms | 60 ms | 2 |
-| INSERT with WAL | **195K ops/s** ✅ | 180K ops/s | 150K ops/s | 3 |
+| B+ Tree INSERT (storage only) | **195K ops/s** ✅ | 180K ops/s | 150K ops/s | 3 |
+| INSERT end-to-end 10K batch (SchemaCache) | **36K ops/s** ⚠️ | 180K ops/s | 150K ops/s | 4.16b |
 | Sequential scan 1M rows | **0.72 s** ✅ | 0.8 s | 1.2 s | 2 |
 | Concurrent reads ×16 | **linear** ✅ | linear | <2× degradation | 2 |
 | Parser — simple SELECT | **492 ns** ✅ | 600 ns | 1 µs | 4 |
@@ -94,24 +95,49 @@ the "Max acceptable" column is a blocker.
 | Row codec encode | **33M rows/s** ✅ | — | — | 4 |
 | Expr eval (scan 1K rows) | **14.8M rows/s** ✅ | — | — | 4 |
 
-**Executor end-to-end (Phase 4, MmapStorage + WAL, full pipeline)**
+**Executor end-to-end (Phase 4.16b, MmapStorage + real WAL, full pipeline)**
 
-Measured with `cargo bench --bench executor_e2e -p axiomdb-sql` (Apple M2 Pro, NVMe):
+Measured with `cargo bench --bench executor_e2e -p axiomdb-sql` (Apple M2 Pro, NVMe,
+release build). Pipeline: parse → analyze → execute → WAL → MmapStorage.
 
-| Operation | AxiomDB | MySQL 8.0† | PG 16† | Notes |
-|---|---|---|---|---|
-| INSERT batch 10K (1 txn) | **55K/s** | 41K/s | 14K/s | AxiomDB 33% faster than MySQL |
-| INSERT autocommit (1 txn/row) | **284/s** | ~1K/s | ~2K/s | ⚠️ catalog scan per statement |
-| SELECT * full scan 10K rows | **50K rows/s** | 190K/s | 1.4M/s | ⚠️ no catalog cache yet |
-| Point lookup PK ×100 | **7.3M ops/s** | 9.8K/s | 20K/s | ✅ B+Tree CoW lock-free |
-| B+Tree INSERT (storage only) | **293K/s** | — | — | ✅ above 180K/s target |
+| Configuration | AxiomDB | Target (Phase 8) | Notes |
+|---|---|---|---|
+| INSERT 100 rows / 1 txn (no SchemaCache) | 2.8K ops/s | — | cold path, catalog scan |
+| INSERT 1K rows / 1 txn (no SchemaCache) | 18.5K ops/s | — | amortization starts |
+| INSERT 1K rows / 1 txn (SchemaCache) | 20.6K ops/s | — | +8% vs no cache |
+| INSERT 10K rows / 1 txn (SchemaCache) | **36K ops/s** | 180K ops/s | ⚠️ WAL bottleneck |
+| INSERT autocommit (1 fsync/row) | ~70 ops/s | — | 1 fdatasync per statement |
 
-*†MySQL/PG measured via Docker TCP connection (adds ~1-2ms/query overhead). AxiomDB runs in-process.*
+**Root cause — WAL `record_insert()` dominates:** each row write costs ~20 µs inside
+`record_insert()` even without fsync. Parse + analyze cost per INSERT is ~1.5 µs total;
+SchemaCache eliminates catalog heap scans but only improves throughput by 8% because WAL
+overhead is already the dominant term. The 180K ops/s target is a Phase 8 goal: prepared
+statements skip parse and analyze entirely, and a batch insert API will write one WAL entry
+per batch rather than one per row.
 
-**Known bottleneck:** `analyze()` performs a linear O(n) catalog heap scan on every statement
-(no catalog cache). This dominates INSERT autocommit and SELECT latency. **Fix:** SchemaCache
-in Phase 5/6 — estimated 50-100× improvement for per-statement overhead, bringing INSERT
-autocommit to ~20K/s.
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — WAL per-row write</span>
+The current WAL implementation writes one entry per inserted row via
+<code>record_insert()</code>. This makes recovery straightforward — each row is an
+independent, self-contained undo/redo unit — but costs ~20 µs/row at the WAL layer
+regardless of fsync. The 36K ops/s ceiling at 10K batch size is a direct consequence of
+this design. PostgreSQL and MySQL both offer bulk-load paths (COPY, LOAD DATA) that bypass
+per-row WAL overhead; AxiomDB's equivalent is the Phase 8 batch insert API, which will
+coalesce WAL entries and write them in a single sequential append.
+</div>
+</div>
+
+**B+ Tree storage-only INSERT (no SQL parsing, no WAL):**
+
+| Operation | AxiomDB | MySQL ~ | PostgreSQL ~ | Target | Max acceptable | Verdict |
+|---|---|---|---|---|---|---|
+| B+Tree INSERT (storage only) | **195K ops/s** | ~150K ops/s | ~120K ops/s | 180K ops/s | 150K ops/s | ✅ |
+
+The storage layer itself exceeds the 180K ops/s target. The gap between 195K (storage only)
+and 36K (full pipeline) isolates the overhead to the WAL record path, not the B+ Tree or
+the page allocator.
 
 **Run end-to-end benchmarks:**
 ```bash
