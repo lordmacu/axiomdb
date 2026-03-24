@@ -35,10 +35,15 @@ use tokio::sync::{oneshot, Mutex};
 use axiomdb_catalog::bootstrap::CatalogBootstrap;
 use axiomdb_core::error::DbError;
 use axiomdb_sql::{
-    analyze_cached, ast::Stmt, bloom::BloomRegistry, execute_with_ctx, parse, result::QueryResult,
+    analyze_cached,
+    ast::Stmt,
+    bloom::BloomRegistry,
+    execute_with_ctx, parse,
+    result::{ColumnMeta, QueryResult},
     SchemaCache, SessionContext,
 };
 use axiomdb_storage::MmapStorage;
+use axiomdb_types::{DataType, Value};
 use axiomdb_wal::TxnManager;
 
 use super::commit_coordinator::CommitCoordinator;
@@ -141,6 +146,76 @@ impl Database {
         session: &mut SessionContext,
         schema_cache: &mut SchemaCache,
     ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
+        // Clear warnings from the previous statement (MySQL clears on each new statement),
+        // except for SHOW WARNINGS itself — it must see the warnings it's reporting.
+        let lower_trim = sql.trim().to_ascii_lowercase();
+        if !lower_trim.starts_with("show warnings") {
+            session.clear_warnings();
+        }
+
+        let lower = sql.trim().to_ascii_lowercase();
+
+        // ── @@in_transaction ──────────────────────────────────────────────────
+        // Returns 1 when inside an active transaction, 0 otherwise.
+        // Handled here (not in the executor) because it requires txn state.
+        if lower.contains("@@in_transaction") && lower.starts_with("select") {
+            let val = if self.txn.active_txn_id().is_some() {
+                Value::Int(1)
+            } else {
+                Value::Int(0)
+            };
+            let result = QueryResult::Rows {
+                columns: vec![ColumnMeta {
+                    name: "@@in_transaction".into(),
+                    data_type: DataType::Int,
+                    nullable: false,
+                    table_name: None,
+                }],
+                rows: vec![vec![val]],
+            };
+            return Ok((result, None));
+        }
+
+        // ── SHOW WARNINGS ─────────────────────────────────────────────────────
+        // Returns the warnings accumulated by the previous statement.
+        if lower == "show warnings" || lower == "show warnings;" {
+            let rows = session
+                .warnings
+                .iter()
+                .map(|w| {
+                    vec![
+                        Value::Text(w.level.to_string()),
+                        Value::Int(w.code as i32),
+                        Value::Text(w.message.clone()),
+                    ]
+                })
+                .collect();
+            let result = QueryResult::Rows {
+                columns: vec![
+                    ColumnMeta {
+                        name: "Level".into(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        table_name: None,
+                    },
+                    ColumnMeta {
+                        name: "Code".into(),
+                        data_type: DataType::Int,
+                        nullable: false,
+                        table_name: None,
+                    },
+                    ColumnMeta {
+                        name: "Message".into(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        table_name: None,
+                    },
+                ],
+                rows,
+            };
+            return Ok((result, None));
+        }
+
         let stmt = parse(sql, None)?;
         let is_ddl = is_schema_changing(&stmt);
         let snap = self
