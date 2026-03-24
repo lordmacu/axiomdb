@@ -57,6 +57,7 @@
 - [ ] ⚠️ Per-page msync optimization (flush_range) → deferred pending profiling
 - [ ] 3.17 ⏳ WAL batch append — `WalWriter::append_batch(entries: &[WalEntry])` accumulates N entries and writes them in a single BufWriter call; reduces per-row overhead from individual serialization to amortized batch; prerequisite for 4.16d (WAL record per page)
 - [ ] 3.18 ⏳ WAL record per page (PostgreSQL COPY strategy) — instead of 1 WAL entry per inserted row, buffer rows until a page is full and emit 1 WAL entry of type `PageWrite(page_id, page_bytes)`; crash recovery replays page writes instead of row inserts; reduces WAL I/O from O(rows) to O(pages) = ~200× fewer WAL writes for bulk inserts; expected to bring AxiomDB bulk insert from ~30K/s to ~100K+/s; requires changes to WalEntry format + crash recovery state machine
+- [x] 3.19 ✅ WAL Group Commit — CommitCoordinator batches fsyncs across concurrent connections; deferred_commit_mode in TxnManager; background Tokio task; enable_group_commit() in Database; handler.rs releases lock before await; group_commit_interval_ms config (default 0=disabled); 10 integration tests; up to N× throughput for N concurrent writers
 
 ### Phase 4 — SQL Parser + Executor `🔄` week 11-25
 <!--
@@ -198,8 +199,6 @@
 - [x] 6.2b ✅ Index maintenance on INSERT/UPDATE/DELETE — secondary indexes kept in sync with heap; UNIQUE violation detection
 - [x] 6.3 ✅ Basic query planner — detects `WHERE col = literal` and `WHERE col > lo AND col < hi` on indexed columns; replaces full scan with B-Tree lookup/range
 - [ ] ⚠️ Composite index planner (> 1 column) — encoding supports it, planner deferred to 6.8
-- [ ] 6.4 ⏳ Bloom filter per index — avoid I/O for non-existent keys
-- [ ] 6.1b ⏳ Composite indexes — multi-column indexes (a, b, c) with lexicographic comparison
 - [ ] 6.4 ⏳ Bloom filter per index — avoid I/O for non-existent keys
 - [ ] 6.5 ⏳ Foreign key checker — validation on INSERT/UPDATE with reverse index
 - [ ] 6.6 ⏳ ON DELETE CASCADE / RESTRICT / SET NULL
