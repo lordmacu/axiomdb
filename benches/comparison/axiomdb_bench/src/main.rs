@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use axiomdb_catalog::CatalogBootstrap;
-use axiomdb_sql::{analyze, execute, parse, QueryResult};
+use axiomdb_sql::{analyze, analyze_cached, execute, parse, QueryResult, SchemaCache};
 use axiomdb_storage::MmapStorage;
 use axiomdb_wal::TxnManager;
 
@@ -63,6 +63,20 @@ impl Db {
             .unwrap_or_else(|e| panic!("execute({q}): {e}"))
     }
 
+    /// Like `sql()` but uses a schema cache — avoids catalog heap scan on repeated
+    /// inserts into the same table. Pass the same `cache` for the whole batch.
+    fn sql_cached(&mut self, q: &str, cache: &mut SchemaCache) -> QueryResult {
+        let stmt = parse(q, None).unwrap_or_else(|e| panic!("parse({q}): {e}"));
+        let snap = self
+            .txn
+            .active_snapshot()
+            .unwrap_or_else(|_| self.txn.snapshot());
+        let analyzed = analyze_cached(stmt, &mut self.storage, snap, cache)
+            .unwrap_or_else(|e| panic!("analyze_cached({q}): {e}"));
+        execute(analyzed, &mut self.storage, &mut self.txn)
+            .unwrap_or_else(|e| panic!("execute({q}): {e}"))
+    }
+
     fn sql_count(&mut self, q: &str) -> usize {
         match self.sql(q) {
             QueryResult::Rows { rows, .. } => rows.len(),
@@ -101,9 +115,12 @@ fn reset(db: &mut Db) {
 
 fn load_batch(db: &mut Db, inserts: &[String]) {
     reset(db);
+    // Use schema cache: analyze() only reads the catalog on the first INSERT,
+    // all subsequent rows reuse the cached TableDef + Vec<ColumnDef>.
+    let mut cache = SchemaCache::new();
     db.sql("BEGIN");
     for sql in inserts {
-        db.sql(sql);
+        db.sql_cached(sql, &mut cache);
     }
     db.sql("COMMIT");
 }

@@ -33,6 +33,7 @@ use crate::{
         Stmt, TableRef, UpdateStmt,
     },
     expr::Expr,
+    schema_cache::SchemaCache,
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -54,6 +55,25 @@ pub fn analyze(
 ) -> Result<Stmt, DbError> {
     let default_schema = "public";
     analyze_stmt(stmt, storage, snapshot, default_schema)
+}
+
+/// Cached variant of [`analyze`] — skips catalog heap scans for tables already
+/// seen in this session.
+///
+/// Pass the same `cache` across repeated calls to the same tables (e.g. bulk
+/// INSERT loops). The caller is responsible for calling [`SchemaCache::invalidate`]
+/// after any DDL statement that changes the schema.
+///
+/// First call per table: normal catalog scan + populates cache.
+/// Subsequent calls: cache hit, zero catalog I/O.
+pub fn analyze_cached(
+    stmt: Stmt,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    cache: &mut SchemaCache,
+) -> Result<Stmt, DbError> {
+    let default_schema = "public";
+    analyze_stmt_cached(stmt, storage, snapshot, default_schema, cache)
 }
 
 // ── BindContext ───────────────────────────────────────────────────────────────
@@ -613,6 +633,84 @@ fn analyze_stmt(
         // Statements that need no semantic analysis for Phase 4.18:
         other => Ok(other),
     }
+}
+
+// ── Cached analysis dispatcher ────────────────────────────────────────────────
+
+fn analyze_stmt_cached(
+    stmt: Stmt,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_schema: &str,
+    cache: &mut SchemaCache,
+) -> Result<Stmt, DbError> {
+    match stmt {
+        // INSERT is the hot path — use the cached variant
+        Stmt::Insert(s) => {
+            analyze_insert_cached(s, storage, snapshot, default_schema, cache).map(Stmt::Insert)
+        }
+        // DDL invalidates the cache
+        Stmt::CreateTable(_) | Stmt::DropTable(_) | Stmt::AlterTable(_) => {
+            cache.invalidate();
+            analyze_stmt(stmt, storage, snapshot, default_schema)
+        }
+        // Everything else: fall back to uncached
+        other => analyze_stmt(other, storage, snapshot, default_schema),
+    }
+}
+
+fn analyze_insert_cached(
+    mut s: InsertStmt,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_schema: &str,
+    cache: &mut SchemaCache,
+) -> Result<InsertStmt, DbError> {
+    let schema = s.table.schema.as_deref().unwrap_or(default_schema);
+
+    // Try cache first — avoids HeapChain::scan_visible × 2 on repeated inserts
+    let (table_def, columns) = if let Some(td) = cache.get_table(schema, &s.table.name) {
+        let cols = cache.get_columns(td.id).cloned().unwrap_or_default();
+        (td.clone(), cols)
+    } else {
+        // Cache miss: normal catalog lookup
+        let reader = CatalogReader::new(storage, snapshot)?;
+        let td =
+            reader
+                .get_table(schema, &s.table.name)?
+                .ok_or_else(|| DbError::TableNotFound {
+                    name: s.table.name.clone(),
+                })?;
+        let cols = reader.list_columns(td.id)?;
+        cache.insert(schema, &s.table.name, td.clone(), cols.clone());
+        (td, cols)
+    };
+    let _ = table_def; // used only to populate cache; executor reads from catalog directly
+
+    // Validate named column list if provided
+    if let Some(ref col_names) = s.columns {
+        for col_name in col_names {
+            if !columns.iter().any(|c| &c.name == col_name) {
+                let available = columns
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(DbError::ColumnNotFound {
+                    name: col_name.clone(),
+                    table: format!("\"{}\" (available: {})", s.table.name, available),
+                });
+            }
+        }
+    }
+
+    // Analyze SELECT source if present
+    if let InsertSource::Select(ref select) = s.source {
+        let analyzed = analyze_select(*select.clone(), storage, snapshot, default_schema)?;
+        s.source = InsertSource::Select(Box::new(analyzed));
+    }
+
+    Ok(s)
 }
 
 // ── SELECT ────────────────────────────────────────────────────────────────────

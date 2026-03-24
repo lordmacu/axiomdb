@@ -16,6 +16,7 @@ pub mod expr;
 pub mod lexer;
 pub mod parser;
 pub mod result;
+pub mod schema_cache;
 pub mod session;
 pub mod table;
 
@@ -31,8 +32,9 @@ pub use executor::{execute, execute_with_ctx};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lexer::{tokenize, Span, SpannedToken, Token};
 // Note: Token<'src> and SpannedToken<'src> carry a lifetime tied to the input string.
-pub use analyzer::analyze;
+pub use analyzer::{analyze, analyze_cached};
 pub use parser::parse;
 pub use result::{ColumnMeta, QueryResult, Row};
+pub use schema_cache::SchemaCache;
 pub use session::SessionContext;
 pub use table::TableEngine;
