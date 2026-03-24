@@ -142,3 +142,216 @@ export const SPARKLINE_DATA = {
   connections: [8, 9, 11, 10, 12, 11, 13, 12, 12],
   cache: [91, 92, 93, 92, 94, 93, 95, 94, 94.2],
 }
+
+// ── Stored Procedures ─────────────────────────────────────────────────────────
+
+export type Procedure = {
+  name: string
+  language: 'axiomql' | 'sql'
+  args: { name: string; type: string }[]
+  body: string
+  createdAt: string
+  updatedAt: string
+}
+
+export const PROCEDURES: Procedure[] = [
+  {
+    name: 'transfer_funds',
+    language: 'axiomql',
+    args: [{ name: 'from_id', type: 'int' }, { name: 'to_id', type: 'int' }, { name: 'amount', type: 'real' }],
+    createdAt: '2026-03-01 10:00:00',
+    updatedAt: '2026-03-15 14:32:00',
+    body: `proc transfer_funds(from_id: int, to_id: int, amount: real) {
+  transaction {
+    let src = accounts.filter(id = from_id).first()
+    if src.balance < amount { abort('Insufficient funds') }
+
+    accounts
+      .filter(id = from_id)
+      .update(balance: balance - amount)
+
+    accounts
+      .filter(id = to_id)
+      .update(balance: balance + amount)
+  }
+}`,
+  },
+  {
+    name: 'archive_old_orders',
+    language: 'axiomql',
+    args: [{ name: 'days_old', type: 'int' }],
+    createdAt: '2026-02-20 09:15:00',
+    updatedAt: '2026-02-20 09:15:00',
+    body: `proc archive_old_orders(days_old: int) {
+  transaction {
+    let cutoff = now() - interval(days: days_old)
+
+    let old = orders
+      .filter(status = 'completed', created_at < cutoff)
+
+    orders_archive.insert_select(old)
+
+    old.delete()
+  }
+}`,
+  },
+  {
+    name: 'recalculate_user_stats',
+    language: 'sql',
+    args: [{ name: 'user_id', type: 'INT' }],
+    createdAt: '2026-03-10 16:00:00',
+    updatedAt: '2026-03-10 16:00:00',
+    body: `CREATE PROCEDURE recalculate_user_stats(user_id INT)
+BEGIN
+  UPDATE users
+  SET
+    total_orders = (SELECT COUNT(*) FROM orders WHERE orders.user_id = user_id),
+    total_spent  = (SELECT COALESCE(SUM(amount), 0) FROM orders
+                    WHERE orders.user_id = user_id AND status = 'completed')
+  WHERE id = user_id;
+END`,
+  },
+]
+
+// ── Functions ─────────────────────────────────────────────────────────────────
+
+export type Func = {
+  name: string
+  language: 'axiomql' | 'sql'
+  args: { name: string; type: string }[]
+  returns: string
+  body: string
+  createdAt: string
+}
+
+export const FUNCTIONS: Func[] = [
+  {
+    name: 'age_category',
+    language: 'axiomql',
+    args: [{ name: 'age', type: 'int' }],
+    returns: 'text',
+    createdAt: '2026-03-05 11:00:00',
+    body: `fn age_category(age: int) -> text {
+  match age {
+    < 18  → 'minor'
+    < 65  → 'adult'
+    _     → 'senior'
+  }
+}`,
+  },
+  {
+    name: 'order_total',
+    language: 'axiomql',
+    args: [{ name: 'user_id', type: 'int' }],
+    returns: 'real',
+    createdAt: '2026-03-08 14:20:00',
+    body: `fn order_total(user_id: int) -> real {
+  orders
+    .filter(user_id = user_id, status = 'completed')
+    .sum(amount)
+    .or(0.0)
+}`,
+  },
+  {
+    name: 'full_name',
+    language: 'sql',
+    args: [{ name: 'first', type: 'TEXT' }, { name: 'last', type: 'TEXT' }],
+    returns: 'TEXT',
+    createdAt: '2026-02-15 08:30:00',
+    body: `CREATE FUNCTION full_name(first TEXT, last TEXT)
+RETURNS TEXT
+LANGUAGE SQL
+AS $$
+  SELECT first || ' ' || last
+$$`,
+  },
+]
+
+// ── Triggers ──────────────────────────────────────────────────────────────────
+
+export type Trigger = {
+  name: string
+  table: string
+  event: 'INSERT' | 'UPDATE' | 'DELETE'
+  timing: 'BEFORE' | 'AFTER'
+  language: 'axiomql' | 'sql'
+  enabled: boolean
+  body: string
+  createdAt: string
+}
+
+export const TRIGGERS: Trigger[] = [
+  {
+    name: 'users_audit_insert',
+    table: 'users',
+    event: 'INSERT',
+    timing: 'AFTER',
+    language: 'axiomql',
+    enabled: true,
+    createdAt: '2026-03-01 10:00:00',
+    body: `on users.after.insert {
+  audit_log.insert(
+    table_name: 'users',
+    action:     'INSERT',
+    row_id:     .new.id,
+    new_data:   json(.new),
+    created_at: now()
+  )
+}`,
+  },
+  {
+    name: 'orders_status_change',
+    table: 'orders',
+    event: 'UPDATE',
+    timing: 'AFTER',
+    language: 'axiomql',
+    enabled: true,
+    createdAt: '2026-03-10 15:00:00',
+    body: `on orders.after.update {
+  if .old.status != .new.status {
+    order_events.insert(
+      order_id:   .new.id,
+      from_status: .old.status,
+      to_status:   .new.status,
+      changed_at:  now()
+    )
+  }
+}`,
+  },
+  {
+    name: 'prevent_delete_active_users',
+    table: 'users',
+    event: 'DELETE',
+    timing: 'BEFORE',
+    language: 'sql',
+    enabled: false,
+    createdAt: '2026-02-28 09:00:00',
+    body: `CREATE TRIGGER prevent_delete_active_users
+BEFORE DELETE ON users
+FOR EACH ROW
+BEGIN
+  IF OLD.active = TRUE THEN
+    SIGNAL SQLSTATE '45000'
+    SET MESSAGE_TEXT = 'Cannot delete active user';
+  END IF;
+END`,
+  },
+]
+
+// ── Sequences ─────────────────────────────────────────────────────────────────
+
+export type Sequence = {
+  name: string
+  current: number
+  start: number
+  step: number
+  min: number
+  max: number | null
+  cycle: boolean
+}
+
+export const SEQUENCES: Sequence[] = [
+  { name: 'users_id_seq',      current: 10235, start: 1, step: 1, min: 1, max: null,       cycle: false },
+  { name: 'orders_id_seq',     current: 51848, start: 1, step: 1, min: 1, max: null,       cycle: false },
+  { name: 'invoice_number_seq',current: 2047,  start: 1000, step: 1, min: 1000, max: 9999, cycle: true  },
+]
