@@ -1,35 +1,26 @@
-//! Session context — per-connection state including the schema cache.
-//!
-//! [`SessionContext`] holds a cache of resolved table schemas to avoid
-//! repeating expensive catalog heap scans on every statement.
-//!
-//! ## The problem without cache
-//!
-//! Every `execute()` call creates a fresh `SchemaResolver`, which creates a
-//! fresh `CatalogReader`, which scans `nexus_tables` and `nexus_columns` linearly
-//! (O(n) heap reads) to find the table definition. For a table with 10 columns,
-//! this is ~14 mmap page reads per statement — completely dominating the cost of
-//! simple queries.
-//!
-//! ## The solution
-//!
-//! `SessionContext` caches `ResolvedTable` values by `"schema.table_name"`.
-//! The cache is:
-//! - **Populated lazily** on the first access to each table.
-//! - **Fully invalidated** on any DDL that could change the schema
-//!   (CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX, ALTER TABLE).
-//! - **Not shared** across connections — each connection owns its context.
-//!
-//! ## Isolation semantics
-//!
-//! The cache stores the schema as seen at the time of the first lookup within
-//! the current transaction. DDL within the same transaction is applied
-//! immediately (invalidation happens before the DDL executes, so the next
-//! lookup re-reads the fresh catalog).
+//! Session context — per-connection state including the schema cache and warnings.
 
 use std::collections::HashMap;
 
 use axiomdb_catalog::ResolvedTable;
+
+// ── SqlWarning ────────────────────────────────────────────────────────────────
+
+/// A single SQL warning, surfaced via `SHOW WARNINGS`.
+///
+/// Warnings are accumulated during a statement and cleared before the next one.
+/// The warning_count field in the OK packet tells the client how many to fetch.
+#[derive(Debug, Clone)]
+pub struct SqlWarning {
+    /// Severity level shown in `SHOW WARNINGS` Level column.
+    pub level: &'static str, // "Note" | "Warning" | "Error"
+    /// MySQL warning code (e.g. 1592 for "no active transaction").
+    pub code: u16,
+    /// Human-readable message shown in `SHOW WARNINGS` Message column.
+    pub message: String,
+}
+
+// ── SessionContext ────────────────────────────────────────────────────────────
 
 /// Per-connection state: schema cache + session variables visible to the executor.
 #[derive(Debug)]
@@ -43,6 +34,12 @@ pub struct SessionContext {
     /// transaction that remains open until the client sends an explicit `COMMIT`
     /// or `ROLLBACK`. DDL always triggers an implicit commit of any open transaction.
     pub autocommit: bool,
+    /// Warnings accumulated during the last statement.
+    ///
+    /// Cleared automatically before each new statement execution (in
+    /// `Database::execute_query`). The handler reads `warnings.len()` to set
+    /// `warning_count` in the OK packet, and `SHOW WARNINGS` returns this list.
+    pub warnings: Vec<SqlWarning>,
 }
 
 impl Default for SessionContext {
@@ -57,41 +54,52 @@ impl SessionContext {
         Self {
             cache: HashMap::new(),
             autocommit: true,
+            warnings: Vec::new(),
         }
     }
 
-    /// Returns the cache key for a table.
+    /// Clears all accumulated warnings. Called before each statement.
+    pub fn clear_warnings(&mut self) {
+        self.warnings.clear();
+    }
+
+    /// Appends a warning. Called by the executor when a no-op or non-fatal
+    /// condition is detected (e.g. COMMIT/ROLLBACK with no active transaction).
+    pub fn warn(&mut self, code: u16, message: impl Into<String>) {
+        self.warnings.push(SqlWarning {
+            level: "Warning",
+            code,
+            message: message.into(),
+        });
+    }
+
+    /// Returns the number of warnings from the last statement.
+    pub fn warning_count(&self) -> u16 {
+        self.warnings.len().min(u16::MAX as usize) as u16
+    }
+
+    // ── Schema cache ──────────────────────────────────────────────────────────
+
     fn key(schema: &str, table: &str) -> String {
         format!("{schema}.{table}")
     }
 
-    /// Returns the cached `ResolvedTable` for the given schema + table, if any.
     pub fn get_table(&self, schema: &str, table: &str) -> Option<&ResolvedTable> {
         self.cache.get(&Self::key(schema, table))
     }
 
-    /// Stores a resolved table in the cache.
     pub fn cache_table(&mut self, schema: &str, table: &str, resolved: ResolvedTable) {
         self.cache.insert(Self::key(schema, table), resolved);
     }
 
-    /// Removes a specific table from the cache.
-    ///
-    /// Call this before executing a DDL statement that affects one table
-    /// (e.g., `ALTER TABLE`, targeted `DROP TABLE`).
     pub fn invalidate_table(&mut self, schema: &str, table: &str) {
         self.cache.remove(&Self::key(schema, table));
     }
 
-    /// Clears the entire schema cache.
-    ///
-    /// Call this before any DDL statement that could affect multiple tables
-    /// (e.g., `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`).
     pub fn invalidate_all(&mut self) {
         self.cache.clear();
     }
 
-    /// Returns the number of cached table schemas.
     pub fn cached_count(&self) -> usize {
         self.cache.len()
     }

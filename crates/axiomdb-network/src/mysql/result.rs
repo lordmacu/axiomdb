@@ -41,6 +41,15 @@ pub fn serialize_query_result_multi(
     seq_start: u8,
     more_results: bool,
 ) -> PacketSeq {
+    serialize_query_result_multi_warn(result, seq_start, more_results, 0)
+}
+
+pub fn serialize_query_result_multi_warn(
+    result: QueryResult,
+    seq_start: u8,
+    more_results: bool,
+    warning_count: u16,
+) -> PacketSeq {
     let status = if more_results {
         SERVER_STATUS_AUTOCOMMIT | SERVER_MORE_RESULTS_EXISTS
     } else {
@@ -54,10 +63,13 @@ pub fn serialize_query_result_multi(
             last_insert_id,
         } => {
             let last_id = last_insert_id.unwrap_or(0);
-            vec![(seq_start, build_ok_with_status(count, last_id, 0, status))]
+            vec![(
+                seq_start,
+                build_ok_with_status(count, last_id, warning_count, status),
+            )]
         }
         QueryResult::Empty => {
-            vec![(seq_start, build_ok_with_status(0, 0, 0, status))]
+            vec![(seq_start, build_ok_with_status(0, 0, warning_count, status))]
         }
     }
 }

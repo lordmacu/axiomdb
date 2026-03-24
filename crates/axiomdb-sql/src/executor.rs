@@ -376,8 +376,16 @@ pub fn execute_with_ctx(
                 txn.begin()?;
                 Ok(QueryResult::Empty)
             }
-            // MySQL: COMMIT/ROLLBACK with no active transaction is a silent no-op.
-            Stmt::Commit | Stmt::Rollback => Ok(QueryResult::Empty),
+            // No active transaction: COMMIT/ROLLBACK is a no-op (MySQL compat).
+            // Emit warning 1592 so clients can see it via SHOW WARNINGS.
+            Stmt::Commit => {
+                ctx.warn(1592, "There is no active transaction");
+                Ok(QueryResult::Empty)
+            }
+            Stmt::Rollback => {
+                ctx.warn(1592, "There is no active transaction");
+                Ok(QueryResult::Empty)
+            }
             other => {
                 txn.begin()?;
                 match dispatch_ctx(other, storage, txn, bloom, ctx) {
@@ -401,8 +409,16 @@ pub fn execute_with_ctx(
                 txn.begin()?;
                 Ok(QueryResult::Empty)
             }
-            // MySQL: COMMIT/ROLLBACK with no active transaction is a silent no-op.
-            Stmt::Commit | Stmt::Rollback => Ok(QueryResult::Empty),
+            // No active transaction: COMMIT/ROLLBACK is a no-op (MySQL compat).
+            // Emit warning 1592 so clients can see it via SHOW WARNINGS.
+            Stmt::Commit => {
+                ctx.warn(1592, "There is no active transaction");
+                Ok(QueryResult::Empty)
+            }
+            Stmt::Rollback => {
+                ctx.warn(1592, "There is no active transaction");
+                Ok(QueryResult::Empty)
+            }
 
             // SELECT (read-only) — wrap in a read-only begin/commit so the executor
             // has a valid snapshot. The transaction is committed immediately after,

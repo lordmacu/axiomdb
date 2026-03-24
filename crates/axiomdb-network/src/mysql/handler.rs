@@ -29,7 +29,7 @@ use axiomdb_types::DataType;
 
 use super::database::CommitRx;
 
-use super::result::serialize_query_result_multi;
+use super::result::{serialize_query_result_multi, serialize_query_result_multi_warn};
 use super::{
     auth::{gen_challenge, is_allowed_user, verify_native_password, verify_sha256_password},
     codec::MySqlCodec,
@@ -276,7 +276,12 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                                 }
                                 break 'stmts;
                             }
-                            let packets = serialize_query_result_multi(qr, seq, !is_last);
+                            let packets = serialize_query_result_multi_warn(
+                                qr,
+                                seq,
+                                !is_last,
+                                session.warning_count(),
+                            );
                             seq = packets
                                 .last()
                                 .map(|(s, _)| s.wrapping_add(1))
@@ -629,6 +634,8 @@ fn intercept_special_query(
 
     // ── SELECT @@variable (single-variable form) ──────────────────────────────
     // Handles: SELECT @@x, SELECT @@session.x, SELECT @@x AS alias
+    // @@in_transaction is NOT handled here — it requires live txn state and is
+    // intercepted in database.execute_query() instead.
     if lower.starts_with("select @@") || lower.starts_with("select @@session.") {
         // Extract the variable name (stop at whitespace, comma, or 'as')
         let rest = lower
@@ -639,6 +646,10 @@ fn intercept_special_query(
             .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
             .next()
             .unwrap_or("");
+        // Let @@in_transaction fall through to database.execute_query().
+        if varname == "in_transaction" {
+            return None;
+        }
         if let Some(val) = conn_state.get_variable(varname) {
             return Some(single_text_row(varname, &val));
         }
@@ -667,19 +678,8 @@ fn intercept_special_query(
         ));
     }
 
-    // ── SHOW WARNINGS ─────────────────────────────────────────────────────────
-    if lower.starts_with("show warnings") || lower.starts_with("show errors") {
-        let cols = vec![
-            ColumnMeta::computed("Level".to_string(), DataType::Text),
-            ColumnMeta::computed("Code".to_string(), DataType::BigInt),
-            ColumnMeta::computed("Message".to_string(), DataType::Text),
-        ];
-        let qr = QueryResult::Rows {
-            columns: cols,
-            rows: vec![],
-        };
-        return Some(serialize_query_result(qr, 1));
-    }
+    // SHOW WARNINGS / SHOW ERRORS are handled in database.execute_query()
+    // where session.warnings is accessible. Do NOT intercept here.
 
     // ── SHOW DATABASES ────────────────────────────────────────────────────────
     if lower.starts_with("show databases") {
