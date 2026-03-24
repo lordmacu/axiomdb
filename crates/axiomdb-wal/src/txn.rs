@@ -23,7 +23,9 @@
 use std::path::Path;
 
 use axiomdb_core::{error::DbError, TransactionSnapshot, TxnId};
-use axiomdb_storage::{clear_deletion, heap_chain::HeapChain, mark_slot_dead, Page, StorageEngine};
+use axiomdb_storage::{
+    clear_deletion, heap_chain::HeapChain, mark_slot_dead, Page, StorageEngine, PAGE_SIZE,
+};
 
 use crate::{
     checkpoint::Checkpointer,
@@ -408,6 +410,77 @@ impl TxnManager {
                 page_id: *page_id,
                 slot_id: *slot_id,
             });
+        }
+
+        Ok(())
+    }
+
+    /// Records N bulk-insert pages into the WAL as `PageWrite` entries (Phase 3.18).
+    ///
+    /// Each element of `page_writes` is `(page_id, page_bytes, slot_ids)` where:
+    /// - `page_bytes` is the **post-modification** state of the page.
+    /// - `slot_ids` lists the slots inserted by this transaction on that page.
+    ///
+    /// Emits one `PageWrite` WAL entry per page, using `reserve_lsns + write_batch`
+    /// for O(1) BufWriter calls. The entries replace N individual `Insert` entries,
+    /// reducing WAL CPU work from O(N rows) to O(P pages) — typically 200-500× fewer
+    /// serializations for bulk inserts.
+    ///
+    /// The `new_value` format encodes `page_bytes || num_slots (u16 LE) || slot_ids`
+    /// so crash recovery can undo uncommitted `PageWrite` entries by marking each
+    /// slot dead — identical in effect to undoing N `Insert` entries.
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] if called outside a transaction.
+    pub fn record_page_writes(
+        &mut self,
+        table_id: u32,
+        page_writes: &[(u64, &[u8; PAGE_SIZE], &[u16])],
+    ) -> Result<(), DbError> {
+        let n = page_writes.len();
+        if n == 0 {
+            return Ok(());
+        }
+
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = active.txn_id;
+
+        let lsn_base = self.wal.reserve_lsns(n);
+        self.wal_scratch.clear();
+
+        for (i, (page_id, page_bytes, slot_ids)) in page_writes.iter().enumerate() {
+            let key = page_id.to_le_bytes();
+
+            // new_value: [page_bytes: PAGE_SIZE][num_slots: u16 LE][slot_id × N: u16 LE]
+            let mut new_value = Vec::with_capacity(PAGE_SIZE + 2 + slot_ids.len() * 2);
+            new_value.extend_from_slice(page_bytes.as_slice());
+            new_value.extend_from_slice(&(slot_ids.len() as u16).to_le_bytes());
+            for &slot_id in slot_ids.iter() {
+                new_value.extend_from_slice(&slot_id.to_le_bytes());
+            }
+
+            let entry = WalEntry::new(
+                lsn_base + i as u64,
+                txn_id,
+                EntryType::PageWrite,
+                table_id,
+                key.to_vec(),
+                vec![],
+                new_value,
+            );
+            entry.serialize_into(&mut self.wal_scratch);
+        }
+
+        self.wal.write_batch(&self.wal_scratch)?;
+
+        // Enqueue in-memory undo ops (used by ROLLBACK and group commit mode).
+        for (page_id, _page_bytes, slot_ids) in page_writes {
+            for &slot_id in slot_ids.iter() {
+                active.undo_ops.push(UndoOp::UndoInsert {
+                    page_id: *page_id,
+                    slot_id,
+                });
+            }
         }
 
         Ok(())

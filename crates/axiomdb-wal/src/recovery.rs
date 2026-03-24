@@ -25,7 +25,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use axiomdb_core::{error::DbError, TxnId};
-use axiomdb_storage::{clear_deletion, mark_slot_dead, Page, StorageEngine};
+use axiomdb_storage::{
+    clear_deletion, heap_chain::HeapChain, mark_slot_dead, Page, StorageEngine, PAGE_SIZE,
+};
 
 use crate::{
     checkpoint::Checkpointer, entry::EntryType, reader::WalReader, txn::decode_physical_loc,
@@ -40,6 +42,9 @@ pub enum RecoveryOp {
     Insert { page_id: u64, slot_id: u16 },
     /// Undo a DELETE: clear `txn_id_deleted` in the RowHeader (restore the row).
     Delete { page_id: u64, slot_id: u16 },
+    /// Undo a full-table delete: clear txn_id_deleted for all slots deleted by
+    /// this transaction in the heap chain starting at root_page_id.
+    Truncate { root_page_id: u64, txn_id: TxnId },
 }
 
 /// Observable phase of a crash recovery run (informational).
@@ -91,7 +96,14 @@ impl CrashRecovery {
                     EntryType::Commit | EntryType::Rollback => {
                         ended.insert(entry.txn_id);
                     }
-                    _ => {}
+                    // PageWrite behaves like Insert for is_needed: it means
+                    // the txn modified heap pages and may need undoing.
+                    EntryType::Insert
+                    | EntryType::Delete
+                    | EntryType::Update
+                    | EntryType::Truncate
+                    | EntryType::PageWrite
+                    | EntryType::Checkpoint => {}
                 },
                 // Truncated or corrupt entry at the end of WAL (e.g. process crashed
                 // mid-write). Treat as end-of-valid-WAL — stop scanning.
@@ -180,6 +192,54 @@ impl CrashRecovery {
                     }
                 }
                 EntryType::Checkpoint => {} // no heap changes to undo
+                EntryType::PageWrite => {
+                    // new_value layout:
+                    //   [0..PAGE_SIZE]         post-modification page bytes (for future REDO)
+                    //   [PAGE_SIZE..+2]        num_slots as u16 LE
+                    //   [+2..+2+num_slots*2]   slot_id × num_slots as u16 LE
+                    //
+                    // For an uncommitted PageWrite we undo at slot granularity:
+                    // mark each embedded slot dead, identical to undoing N Insert entries.
+                    if let Some(ops) = in_progress.get_mut(&entry.txn_id) {
+                        // key = page_id as 8 bytes LE
+                        if entry.key.len() < 8 {
+                            continue; // malformed entry — skip gracefully
+                        }
+                        let page_id =
+                            u64::from_le_bytes(entry.key[..8].try_into().unwrap_or([0u8; 8]));
+
+                        let nv = &entry.new_value;
+                        if nv.len() < PAGE_SIZE + 2 {
+                            continue; // truncated entry — skip gracefully
+                        }
+                        let num_slots =
+                            u16::from_le_bytes([nv[PAGE_SIZE], nv[PAGE_SIZE + 1]]) as usize;
+
+                        let slots_bytes = &nv[PAGE_SIZE + 2..];
+                        for i in 0..num_slots {
+                            let off = i * 2;
+                            if off + 2 > slots_bytes.len() {
+                                break; // partial slot list — stop
+                            }
+                            let slot_id =
+                                u16::from_le_bytes([slots_bytes[off], slots_bytes[off + 1]]);
+                            ops.push(RecoveryOp::Insert { page_id, slot_id });
+                        }
+                    }
+                }
+                EntryType::Truncate => {
+                    if let Some(ops) = in_progress.get_mut(&entry.txn_id) {
+                        // key = root_page_id as 8 bytes LE
+                        if entry.key.len() >= 8 {
+                            let root_page_id =
+                                u64::from_le_bytes(entry.key[..8].try_into().unwrap());
+                            ops.push(RecoveryOp::Truncate {
+                                root_page_id,
+                                txn_id: entry.txn_id,
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -208,6 +268,12 @@ impl CrashRecovery {
                             Err(e) => return Err(e),
                         }
                         storage.write_page(page_id, &page)?;
+                    }
+                    RecoveryOp::Truncate {
+                        root_page_id,
+                        txn_id,
+                    } => {
+                        HeapChain::clear_deletions_by_txn(storage, root_page_id, txn_id)?;
                     }
                 }
             }
@@ -591,5 +657,55 @@ mod tests {
                 "crashed insert must be dead after mmap recovery"
             );
         }
+    }
+
+    // ── recover: undo TRUNCATE ────────────────────────────────────────────────
+
+    /// Verifies that a crash during a Truncate (no commit) is fully undone by
+    /// crash recovery — all rows that were logically deleted are restored.
+    #[test]
+    fn test_crash_during_truncate_recovers_rows() {
+        use axiomdb_core::TransactionSnapshot;
+        use axiomdb_storage::{heap_chain::HeapChain, PageType};
+
+        let (_dir, wal) = temp_setup();
+        let mut storage = MemoryStorage::new();
+
+        // Allocate root heap page and seed it.
+        let root_page_id = storage.alloc_page(PageType::Data).unwrap();
+        let init_page = Page::new(PageType::Data, root_page_id);
+        storage.write_page(root_page_id, &init_page).unwrap();
+
+        let mut mgr = TxnManager::create(&wal).unwrap();
+
+        // Txn 1: insert 5 rows + commit.
+        let txn1 = mgr.begin().unwrap();
+        for i in 0u8..5 {
+            HeapChain::insert(&mut storage, root_page_id, &[i; 8], txn1).unwrap();
+        }
+        mgr.commit().unwrap();
+
+        // Txn 2: delete_batch + record_truncate — then CRASH (no commit).
+        let txn2 = mgr.begin().unwrap();
+        let snap = mgr.active_snapshot().unwrap();
+        let raw_rids = HeapChain::scan_rids_visible(&storage, root_page_id, snap).unwrap();
+        HeapChain::delete_batch(&mut storage, &raw_rids, txn2).unwrap();
+        mgr.record_truncate(1, root_page_id).unwrap();
+        // Flush WAL buffer to disk (simulate kernel flush on crash).
+        mgr.wal_mut().flush_buffer().unwrap();
+        drop(mgr); // crash — no commit
+
+        // Recovery must undo the truncate.
+        let result = CrashRecovery::recover(&mut storage, &wal).unwrap();
+        assert_eq!(result.undone_txns, 1, "one in-progress txn must be undone");
+
+        // After recovery: all 5 rows must be visible to a committed snapshot.
+        let snap_after = TransactionSnapshot::committed(result.max_committed);
+        let visible = HeapChain::scan_rids_visible(&storage, root_page_id, snap_after).unwrap();
+        assert_eq!(
+            visible.len(),
+            5,
+            "all 5 rows must be visible after crash recovery of truncate"
+        );
     }
 }

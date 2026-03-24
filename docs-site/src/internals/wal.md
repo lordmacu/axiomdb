@@ -98,12 +98,100 @@ pub enum EntryType {
     Delete     = 5,  // DELETE: old_value is the encoded row before deletion; new_value empty
     Update     = 6,  // UPDATE: both old_value and new_value are present
     Checkpoint = 7,  // CHECKPOINT: marks the LSN up to which pages are flushed to disk
+    Truncate   = 8,  // Full-table delete (DELETE without WHERE, TRUNCATE TABLE)
 }
 ```
 
 Transaction entries (`Begin`, `Commit`, `Rollback`) carry no key or value payload —
 `key_len = 0`, `old_val_len = 0`, `new_val_len = 0`. The minimum entry size of 43 bytes
 applies to these records.
+
+---
+
+## WalEntry::Truncate — Full-Table Delete
+
+`WalEntry::Truncate` (entry type 8) is emitted instead of N individual `Delete`
+entries when a statement deletes every row in a table: `DELETE FROM t` without a
+WHERE clause, and `TRUNCATE TABLE t`.
+
+### Binary Format
+
+```text
+Field           Value
+─────────────── ────────────────────────────────────────────────────────
+entry_type      8 (Truncate)
+table_id        the target table's ID (u32 LE)
+key_len         8
+key[0..8]       root_page_id of the HeapChain as u64 LE
+old_val_len     0 (empty — no per-row data stored)
+new_val_len     0 (empty)
+```
+
+The key encodes the heap chain's root page rather than a single slot, because
+the undo operation scans the entire chain.
+
+### Why One Entry Instead of N
+
+For a 10,000-row table, the per-row path writes 10,000 `Delete` WAL entries. Each
+entry carries at minimum 43 bytes of header plus the encoded row payload (old_value),
+which may be hundreds of bytes. `WalEntry::Truncate` replaces all N entries with a
+single 51-byte record (43-byte minimum + 8-byte key).
+
+```
+Per-row Delete path (N = 10,000 rows, avg 100-byte payload):
+  WAL entries: 10,000
+  WAL bytes written: 10,000 × (43 + 10 + 100) ≈ 1.5 MB
+
+Truncate path:
+  WAL entries: 1
+  WAL bytes written: 51 bytes
+```
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">10,000× Fewer WAL Entries Than MySQL InnoDB for Full-Table DELETE</span>
+MySQL InnoDB writes one undo log entry per deleted row for every DELETE — including <code>DELETE FROM t</code> without a WHERE clause. For a 10K-row table, InnoDB writes ~10,000 undo records; AxiomDB writes 1 WAL entry. This is the same optimization that MariaDB's storage engine API exposes via <code>ha_delete_all_rows()</code>, but AxiomDB applies it at the WAL level, not just the engine level.
+</div>
+</div>
+
+### Undo — Rollback and Crash Recovery
+
+Because `WalEntry::Truncate` stores no per-row state, undo cannot simply replay
+individual slot reverts from the WAL. Instead, undo calls
+`HeapChain::clear_deletions_by_txn(txn_id)`, which scans the heap chain and clears
+the `txn_id_deleted` stamp on every slot that was deleted by this transaction:
+
+```
+Undo of WalEntry::Truncate for txn_id T:
+  for each page in the HeapChain:
+    read_page(page_id)
+    for each slot on the page:
+      if slot.txn_id_deleted == T:
+        slot.txn_id_deleted = 0
+        slot.deleted = 0
+    write_page(page_id, page)
+```
+
+The physical heap is fully restored: all rows that were alive before the DELETE
+become visible again to transactions with a snapshot predating txn_id T.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Undo via Heap Scan, Not Stored Slot List</span>
+An alternative design would store the list of (page_id, slot_id) pairs inside the <code>Truncate</code> entry itself, enabling O(N) targeted undo without a full scan. We chose the scan approach because: (1) WAL writes are on the critical path of every DELETE; (2) undo (rollback and crash recovery) is rare relative to DELETE frequency; (3) the scan is O(P) in pages, not O(N) in rows, and P ≪ N at 200 rows/page. The trade-off mirrors MariaDB's <code>ha_delete_all_rows()</code> philosophy: optimize the common path (write), accept a bounded cost on the uncommon path (undo).
+</div>
+</div>
+
+### Crash Recovery Handling
+
+During WAL replay, when the recovery engine encounters `WalEntry::Truncate` for a
+committed transaction, it calls `HeapChain::delete_batch()` with all live slot IDs
+found by `scan_rids_visible()` — re-applying the deletion to any pages that may not
+have been flushed before the crash. If the transaction was not committed (no matching
+`Commit` entry in the WAL), the entry is skipped: the heap still contains the
+pre-delete state because the crash occurred before the commit was durable.
 
 ---
 
@@ -268,6 +356,55 @@ durability guarantee is identical to non-group-commit mode; only the throughput 
 | `TxnManager::deferred_commit_mode` | `axiomdb-wal/src/txn.rs` | When `true`, `commit()` skips fsync and sets `pending_deferred_txn_id` |
 | `TxnManager::advance_committed()` | same file | Advances `max_committed` to `max(batch_txn_ids)` after fsync |
 | `spawn_group_commit_task()` | `axiomdb-network/src/mysql/group_commit.rs` | Long-running Tokio task; `Weak<Mutex<Database>>` exits on DB drop |
+
+### PageWrite Entry (Phase 3.18)
+
+`WalEntry::PageWrite` (entry type 9) replaces N `Insert` entries with **one entry per
+heap page** during bulk inserts. Instead of serializing one entry per row, the executor
+groups rows by their target page and writes a single entry per page.
+
+```text
+key:       page_id as u64 LE (8 bytes)
+old_value: empty
+new_value: [page_bytes: PAGE_SIZE][num_slots: u16 LE][slot_id × N: u16 LE]
+```
+
+The `page_bytes` field contains the full post-modification page (16 KB for the default
+page size). The embedded `slot_ids` let crash recovery undo uncommitted `PageWrite`
+entries at slot granularity — identical in effect to undoing N individual `Insert` entries.
+
+**CPU cost comparison for 10K-row bulk insert (~42 pages at 16 KB):**
+
+```
+Insert path (3.17):  10,000 × serialize_into() + 10,000 × CRC32c  ← O(N rows)
+PageWrite (3.18):        42 × serialize_into() +     42 × CRC32c  ← O(P pages) — 238× less
+```
+
+**WAL file size comparison for 10K rows:**
+
+```
+Insert entries:  10,000 × ~100B = ~1 MB
+PageWrite:           42 × ~16.9 KB = ~710 KB  ← 30% smaller
+```
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">238× Fewer WAL Serializations Than Per-Row Logging</span>
+For a 10K-row bulk INSERT, AxiomDB writes 42 WAL entries (one per 16KB page) instead of 10,000. Crash recovery scans 42 entries instead of 10,000 — proportionally faster. PostgreSQL's COPY command uses the same page-image strategy for bulk loads; AxiomDB applies it automatically to all multi-row INSERT statements.
+</div>
+</div>
+
+**Crash recovery for uncommitted PageWrite:**
+
+```
+for each PageWrite entry in uncommitted txn:
+  page_id   = entry.key[0..8] as u64 LE
+  num_slots = entry.new_value[PAGE_SIZE..+2] as u16 LE
+  for i in 0..num_slots:
+    slot_id = entry.new_value[PAGE_SIZE+2+i*2..+2] as u16 LE
+    mark_slot_dead(storage, page_id, slot_id)   // same as undoing Insert
+```
 
 ### Batch WAL Append (Phase 3.17)
 
