@@ -56,3 +56,10 @@ ca.crt
 
 # mdBook generated output (rebuilt by GitHub Actions)
 docs-site/book/
+studio/.next/
+studio/node_modules/
+
+# Studio build artifacts
+studio/.next/
+studio/node_modules/
+studio/tsconfig.tsbuildinfo
