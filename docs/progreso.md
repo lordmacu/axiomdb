@@ -755,6 +755,30 @@
 - [ ] 34.13 ⏳ Distributed transactions — two-phase commit between shards; cross-shard consistency
 
 ### Phase 35 — Deployment and DevEx `⏳` week 111-113
+
+#### 35.0 — AxiomStudio (UI built, needs wire-up post Phase 8)
+> **Status:** UI complete with mock data (2026-03-24). Connection layer pending Phase 8 (wire protocol).
+> All features are implemented and documented in `studio/CONNECT.md`.
+
+- [x] 35.0.1 ✅ Core layout — sidebar, dark theme, Geist fonts, routing
+- [x] 35.0.2 ✅ Dashboard — metrics cards, sparklines, recent queries, slow queries, live auto-refresh
+- [x] 35.0.3 ✅ Query Editor — Monaco SQL/AxiomQL, tabs, ⌘↵, history, saved queries, export CSV
+- [x] 35.0.4 ✅ Query Editor extras — split view, format SQL, variables ($name), chart (SVG bar)
+- [x] 35.0.5 ✅ Monaco intelligence — AxiomQL syntax highlighting, SQL autocompletion (tables/columns)
+- [x] 35.0.6 ✅ SQL ↔ AxiomQL translator (heuristic, replaces with real parser in Phase 36)
+- [x] 35.0.7 ✅ Tables browser — grid of tables/views with row count, size, last updated
+- [x] 35.0.8 ✅ Table detail — Data tab (inline edit, boolean toggle, add/delete row, filter, column visibility, copy DDL, right-click context menu)
+- [x] 35.0.9 ✅ Table detail — Schema tab (type dropdown, nullable toggle, FK editor)
+- [x] 35.0.10 ✅ Table detail — Indexes tab (add, edit inline, delete)
+- [x] 35.0.11 ✅ SQL + AxiomQL preview after every edit (shows generated statement)
+- [x] 35.0.12 ✅ Settings page — connections manager, engine config, studio prefs, security, about
+- [x] 35.0.13 ✅ Command palette ⌘K — tables, actions, recent queries
+- [ ] 35.0.14 ⏳ Wire up to real AxiomDB API — replace mock data with `/_api/` calls (Phase 8+)
+- [ ] 35.0.15 ⏳ AxiomDB serves Studio — `axiomdb-server` serves `studio/out/` at `/studio` route
+- [ ] 35.0.16 ⏳ Real-time features — `.watch()` reactive queries via WebSocket (Phase 8+)
+- [ ] 35.0.17 ⏳ EXPLAIN plan visualization — tree/graph rendering of real explain output (Phase 5+)
+- [ ] 35.0.18 ⏳ ER diagram — visual relationships between tables (Phase 8+)
+
 - [ ] 35.1 ⏳ Multi-stage Dockerfile — Rust builder + debian-slim runtime
 - [ ] 35.2 ⏳ docker-compose.yml — complete setup with volumes and env vars
 - [ ] 35.3 ⏳ systemd service file — `axiomdb.service` for Linux production
