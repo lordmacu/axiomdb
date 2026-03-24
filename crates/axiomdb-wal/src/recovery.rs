@@ -25,9 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use axiomdb_core::{error::DbError, TxnId};
-use axiomdb_storage::{
-    clear_deletion, heap_chain::HeapChain, mark_slot_dead, Page, StorageEngine, PAGE_SIZE,
-};
+use axiomdb_storage::{clear_deletion, heap_chain::HeapChain, mark_slot_dead, Page, StorageEngine};
 
 use crate::{
     checkpoint::Checkpointer, entry::EntryType, reader::WalReader, txn::decode_physical_loc,

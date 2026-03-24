@@ -822,6 +822,9 @@ fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, DbEr
                 }),
             }
         }
+        // OCTET_LENGTH / BYTE_LENGTH — returns byte count (not character count for TEXT).
+        // Handles BLOB, TEXT, and UUID (always 16 bytes). Returns NULL for NULL input.
+        // Extended in Phase 4.19b to cover UUID.
         "octet_length" | "byte_length" => {
             let v = eval(
                 args.first().ok_or_else(|| DbError::TypeMismatch {
@@ -834,6 +837,7 @@ fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, DbEr
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => Ok(Value::Int(s.len() as i32)),
                 Value::Bytes(b) => Ok(Value::Int(b.len() as i32)),
+                Value::Uuid(_) => Ok(Value::Int(16)),
                 other => Err(DbError::TypeMismatch {
                     expected: "Text or Bytes".into(),
                     got: other.variant_name().into(),
@@ -1517,24 +1521,6 @@ fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, DbEr
             }
         }
 
-        // OCTET_LENGTH(value) / LENGTH_IN_BYTES(value) → INT
-        // Returns the byte length of a BLOB, TEXT (UTF-8 bytes), UUID (always 16),
-        // or NULL if the argument is NULL.
-        // OCTET_LENGTH differs from LENGTH: LENGTH counts characters, OCTET_LENGTH bytes.
-        "octet_length" | "length_in_bytes" | "bytelength" => {
-            let arg = args.first().ok_or_else(|| DbError::TypeMismatch {
-                expected: "1 arg".into(),
-                got: "0".into(),
-            })?;
-            match eval(arg, row)? {
-                Value::Null => Ok(Value::Null),
-                Value::Bytes(b) => Ok(Value::Int(b.len() as i32)),
-                Value::Text(s) => Ok(Value::Int(s.len() as i32)), // UTF-8 byte count
-                Value::Uuid(_) => Ok(Value::Int(16)),
-                _ => Ok(Value::Null),
-            }
-        }
-
         // ENCODE(blob, format) → TEXT
         // Encodes binary data to a text representation.
         // format: 'base64' or 'hex'
@@ -1636,7 +1622,7 @@ const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw
 
 /// Encodes `bytes` to standard base64 (with `=` padding).
 fn b64_encode(bytes: &[u8]) -> String {
-    let mut out = Vec::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
@@ -1723,7 +1709,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .or_else(|| s.strip_prefix("0X"))
         .or_else(|| s.strip_prefix("\\x"))
         .unwrap_or(s);
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     s.as_bytes()
