@@ -512,7 +512,8 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                 // Peek: is this ADD CONSTRAINT or ADD UNIQUE (without CONSTRAINT keyword)?
                 if matches!(p.peek(), Token::Constraint) {
                     // ADD CONSTRAINT name <type>
-                    p.advance(); // consume CONSTRAINT
+                    // Do NOT pre-consume CONSTRAINT — parse_table_constraint
+                    // handles the optional CONSTRAINT name prefix itself.
                     let constraint = parse_table_constraint(p)?;
                     AlterTableOp::AddConstraint(constraint)
                 } else if matches!(p.peek(), Token::Unique) {

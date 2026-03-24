@@ -21,7 +21,7 @@ use axiomdb_storage::StorageEngine;
 
 use crate::{
     reader::CatalogReader,
-    schema::{ColumnDef, ConstraintDef, IndexDef, TableDef, TableId},
+    schema::{ColumnDef, ConstraintDef, FkDef, IndexDef, TableDef, TableId},
 };
 
 // ── ResolvedTable ─────────────────────────────────────────────────────────────
@@ -30,7 +30,8 @@ use crate::{
 ///
 /// The executor uses this to avoid multiple round-trips to the catalog when
 /// binding a FROM clause — it obtains the table definition, all its columns
-/// (sorted by `col_idx`), all its indexes, and all named constraints at once.
+/// (sorted by `col_idx`), all its indexes, named constraints, and FK
+/// constraints at once.
 #[derive(Debug, Clone)]
 pub struct ResolvedTable {
     /// Table definition (id, schema_name, table_name).
@@ -41,6 +42,8 @@ pub struct ResolvedTable {
     pub indexes: Vec<IndexDef>,
     /// All visible named constraints (CHECK) for this table (Phase 4.22b).
     pub constraints: Vec<ConstraintDef>,
+    /// All FK constraints where this table is the **child** (Phase 6.5).
+    pub foreign_keys: Vec<FkDef>,
 }
 
 // ── SchemaResolver ────────────────────────────────────────────────────────────
@@ -102,12 +105,14 @@ impl<'a> SchemaResolver<'a> {
         let columns = self.reader.list_columns(def.id)?;
         let indexes = self.reader.list_indexes(def.id)?;
         let constraints = self.reader.list_constraints(def.id)?;
+        let foreign_keys = self.reader.list_fk_constraints(def.id)?;
 
         Ok(ResolvedTable {
             def,
             columns,
             indexes,
             constraints,
+            foreign_keys,
         })
     }
 

@@ -18,9 +18,10 @@ pub use notifier::{
 pub use reader::CatalogReader;
 pub use resolver::{ResolvedTable, SchemaResolver};
 pub use schema::{
-    ColumnDef, ColumnType, ConstraintDef, IndexColumnDef, IndexDef, SortOrder, TableDef, TableId,
+    ColumnDef, ColumnType, ConstraintDef, FkAction, FkDef, IndexColumnDef, IndexDef, SortOrder,
+    TableDef, TableId,
 };
 pub use writer::{
-    CatalogWriter, SYSTEM_TABLE_COLUMNS, SYSTEM_TABLE_CONSTRAINTS, SYSTEM_TABLE_INDEXES,
-    SYSTEM_TABLE_TABLES,
+    CatalogWriter, SYSTEM_TABLE_COLUMNS, SYSTEM_TABLE_CONSTRAINTS, SYSTEM_TABLE_FOREIGN_KEYS,
+    SYSTEM_TABLE_INDEXES, SYSTEM_TABLE_TABLES,
 };

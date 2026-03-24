@@ -37,14 +37,15 @@ use std::sync::Arc;
 
 use axiomdb_core::error::DbError;
 use axiomdb_storage::{
-    alloc_constraint_id, alloc_index_id, alloc_table_id, HeapChain, Page, PageType, StorageEngine,
+    alloc_constraint_id, alloc_fk_id, alloc_index_id, alloc_table_id, HeapChain, Page, PageType,
+    StorageEngine,
 };
 use axiomdb_wal::TxnManager;
 
 use crate::{
     bootstrap::{CatalogBootstrap, CatalogPageIds},
     notifier::{CatalogChangeNotifier, SchemaChangeEvent, SchemaChangeKind},
-    schema::{ColumnDef, ConstraintDef, IndexDef, TableDef, TableId},
+    schema::{ColumnDef, ConstraintDef, FkDef, IndexDef, TableDef, TableId},
 };
 
 // ── WAL table_id constants for system tables ──────────────────────────────────
@@ -57,6 +58,8 @@ pub const SYSTEM_TABLE_COLUMNS: u32 = u32::MAX - 1;
 pub const SYSTEM_TABLE_INDEXES: u32 = u32::MAX;
 /// WAL `table_id` used for inserts/deletes into `axiom_constraints`.
 pub const SYSTEM_TABLE_CONSTRAINTS: u32 = u32::MAX - 3;
+/// WAL `table_id` used for inserts/deletes into `axiom_foreign_keys` (Phase 6.5).
+pub const SYSTEM_TABLE_FOREIGN_KEYS: u32 = u32::MAX - 4;
 
 // ── CatalogWriter ─────────────────────────────────────────────────────────────
 
@@ -555,6 +558,77 @@ impl<'a> CatalogWriter<'a> {
                     )?;
                     self.txn.record_delete(
                         SYSTEM_TABLE_CONSTRAINTS,
+                        &key,
+                        &data,
+                        rid.page_id,
+                        rid.slot_id,
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        Ok(()) // not found — idempotent
+    }
+
+    // ── FK operations (Phase 6.5) ─────────────────────────────────────────────
+
+    /// Allocates a new `fk_id` and inserts a FK definition row into
+    /// `axiom_foreign_keys`.
+    ///
+    /// Returns the allocated `fk_id`.
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] if no transaction is active.
+    pub fn create_foreign_key(&mut self, def: FkDef) -> Result<u32, DbError> {
+        let fk_id = alloc_fk_id(self.storage)?;
+        let fk_root = CatalogBootstrap::ensure_fk_root(self.storage)?;
+
+        let row = FkDef { fk_id, ..def };
+        let data = row.to_bytes();
+
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+        let (page_id, slot_id) = HeapChain::insert(self.storage, fk_root, &data, txn_id)?;
+
+        let key = fk_id.to_le_bytes();
+        self.txn
+            .record_insert(SYSTEM_TABLE_FOREIGN_KEYS, &key, &data, page_id, slot_id)?;
+
+        Ok(fk_id)
+    }
+
+    /// MVCC-deletes the FK row with `fk_id` from `axiom_foreign_keys`.
+    ///
+    /// Returns `Ok(())` silently if the FK is not found (idempotent).
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] if no transaction is active.
+    pub fn drop_foreign_key(&mut self, fk_id: u32) -> Result<(), DbError> {
+        let fk_root = match CatalogBootstrap::page_ids(self.storage) {
+            Ok(ids) if ids.foreign_keys != 0 => ids.foreign_keys,
+            _ => return Ok(()), // no FK table yet — nothing to drop
+        };
+        let snap = self.txn.active_snapshot()?;
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+
+        let rows = crate::reader::CatalogReader::scan_fk_root(self.storage, fk_root, snap)?;
+        for (rid, data) in rows {
+            if let Ok((def, _)) = FkDef::from_bytes(&data) {
+                if def.fk_id == fk_id {
+                    let key = fk_id.to_le_bytes();
+                    axiomdb_storage::HeapChain::delete(
+                        self.storage,
+                        rid.page_id,
+                        rid.slot_id,
+                        txn_id,
+                    )?;
+                    self.txn.record_delete(
+                        SYSTEM_TABLE_FOREIGN_KEYS,
                         &key,
                         &data,
                         rid.page_id,

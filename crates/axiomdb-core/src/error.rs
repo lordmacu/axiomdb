@@ -39,12 +39,40 @@ pub enum DbError {
     #[error("unique key violation on {table}.{column}")]
     UniqueViolation { table: String, column: String },
 
+    /// Child row references a parent key that does not exist (INSERT/UPDATE child).
+    /// SQLSTATE 23503
     #[error("foreign key violation: {table}.{column} = {value}")]
     ForeignKeyViolation {
         table: String,
         column: String,
         value: String,
     },
+
+    /// Parent row cannot be deleted/updated because child rows reference it.
+    /// SQLSTATE 23503
+    #[error(
+        "foreign key constraint \"{constraint}\": {child_table}.{child_column} references this row"
+    )]
+    ForeignKeyParentViolation {
+        constraint: String,
+        child_table: String,
+        child_column: String,
+    },
+
+    /// ON DELETE CASCADE exceeded the maximum allowed recursion depth.
+    /// SQLSTATE 23503
+    #[error("foreign key cascade depth exceeded limit of {limit}")]
+    ForeignKeyCascadeDepth { limit: u32 },
+
+    /// ON DELETE SET NULL attempted on a NOT NULL column.
+    /// SQLSTATE 23000
+    #[error("cannot set FK column {table}.{column} to NULL: column is NOT NULL")]
+    ForeignKeySetNullNotNullable { table: String, column: String },
+
+    /// The referenced parent column has no PRIMARY KEY or UNIQUE index.
+    /// SQLSTATE 42830
+    #[error("no unique index on {table}.{column} to satisfy foreign key constraint")]
+    ForeignKeyNoParentIndex { table: String, column: String },
 
     #[error("NOT NULL violation on {table}.{column}")]
     NotNullViolation { table: String, column: String },
@@ -216,6 +244,10 @@ impl DbError {
             // ── Integrity ─────────────────────────────────────────────────
             DbError::UniqueViolation { .. } => "23505",
             DbError::ForeignKeyViolation { .. } => "23503",
+            DbError::ForeignKeyParentViolation { .. } => "23503",
+            DbError::ForeignKeyCascadeDepth { .. } => "23503",
+            DbError::ForeignKeySetNullNotNullable { .. } => "23000",
+            DbError::ForeignKeyNoParentIndex { .. } => "42830",
             DbError::NotNullViolation { .. } => "23502",
             DbError::CheckViolation { .. } => "23514",
             DbError::DuplicateKey => "23505",

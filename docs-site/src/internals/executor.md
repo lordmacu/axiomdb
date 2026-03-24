@@ -393,6 +393,65 @@ query. Lateral joins (which allow correlation in `FROM`) are not yet supported.
 
 ---
 
+## Foreign Key Enforcement
+
+FK constraints are validated during DML operations by `crates/axiomdb-sql/src/fk_enforcement.rs`.
+
+### Catalog Storage
+
+Each FK is stored as a `FkDef` row in the `axiom_foreign_keys` heap (5th system table,
+root page at meta offset 84). Fields:
+
+```
+fk_id, child_table_id, child_col_idx, parent_table_id, parent_col_idx,
+on_delete: FkAction, on_update: FkAction, fk_index_id: u32, name: String
+```
+
+`FkAction` encoding: 0=NoAction, 1=Restrict, 2=Cascade, 3=SetNull, 4=SetDefault.
+`fk_index_id = 0` means no auto-created index (Phase 6.5 deferred item).
+
+### INSERT / UPDATE child — `check_fk_child_insert`
+
+```
+For each FK on the child table:
+  1. FK column is NULL → skip (MATCH SIMPLE)
+  2. Encode FK value as B-Tree key
+  3. Find parent's PK or UNIQUE index covering parent_col_idx
+  4a. If parent index is_primary: full scan of parent table (PK B-Trees not
+      yet populated via insert_into_indexes in Phase 6.5)
+  4b. If parent index is non-primary UNIQUE: B-Tree point lookup (populated)
+  5. No match → ForeignKeyViolation (SQLSTATE 23503)
+```
+
+### DELETE parent — `enforce_fk_on_parent_delete`
+
+Called **before** the parent rows are deleted. For each FK referencing this table:
+
+| Action | Behavior |
+|--------|---------|
+| RESTRICT / NO ACTION | Full scan child table; error if any child references deleted parent key |
+| CASCADE | Full scan child; recursively delete children (depth limit = 10) |
+| SET NULL | Full scan child; update FK column to NULL before parent delete |
+
+Cascade recursion uses `depth` parameter — exceeding 10 levels returns
+`ForeignKeyCascadeDepth` (SQLSTATE 23503).
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Full Scan for Phase 6.5</span>
+FK enforcement uses a full table scan of the parent (for INSERT child check) and
+child (for DELETE parent enforcement) rather than a dedicated B-Tree index. This
+is correct at all times. The index-based optimization is deferred to Phase 6.9,
+which will add composite keys (fk_val + RecordId bytes) to non-unique FK indexes,
+solving the duplicate-key limitation of the current B-Tree implementation. This
+follows the same incremental approach used by SQLite, which also started with
+table scans for FK enforcement before adding index acceleration.
+</div>
+</div>
+
+---
+
 ## Bloom Filter — Index Lookup Shortcut
 
 The executor holds a `BloomRegistry` (one per database connection) that maps

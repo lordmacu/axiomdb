@@ -61,6 +61,19 @@ use crate::{
     table::TableEngine,
 };
 
+/// Inline FK spec collected during CREATE TABLE column processing.
+/// `(child_col_idx, child_col_name, (parent_table, parent_col, on_delete, on_update))`
+type InlineFkSpec = (
+    u16,
+    String,
+    (
+        String,
+        Option<String>,
+        crate::ast::ForeignKeyAction,
+        crate::ast::ForeignKeyAction,
+    ),
+);
+
 // ── AUTO_INCREMENT sequence state ─────────────────────────────────────────────
 
 use std::cell::{Cell, RefCell};
@@ -825,6 +838,17 @@ fn execute_insert_ctx(
                     &resolved.def.table_name,
                 )?;
 
+                // FK validation: every non-NULL FK value must reference an existing parent row.
+                if !resolved.foreign_keys.is_empty() {
+                    crate::fk_enforcement::check_fk_child_insert(
+                        &full_values,
+                        &resolved.foreign_keys,
+                        storage,
+                        txn,
+                        bloom,
+                    )?;
+                }
+
                 // Clone so full_values remains available for index maintenance.
                 let rid = TableEngine::insert_row(
                     storage,
@@ -886,6 +910,16 @@ fn execute_insert_ctx(
                             first_generated = Some(id);
                         }
                     }
+                }
+                // FK validation for INSERT SELECT path.
+                if !resolved.foreign_keys.is_empty() {
+                    crate::fk_enforcement::check_fk_child_insert(
+                        &full_values,
+                        &resolved.foreign_keys,
+                        storage,
+                        txn,
+                        bloom,
+                    )?;
                 }
                 // Clone so full_values remains available for index maintenance.
                 let rid = TableEngine::insert_row(
@@ -996,6 +1030,37 @@ fn execute_update_ctx(
 
     let count = to_update.len() as u64;
 
+    // FK child validation: check new FK values before applying any updates.
+    if !resolved.foreign_keys.is_empty() {
+        for (_, old_values, new_values) in &to_update {
+            crate::fk_enforcement::check_fk_child_update(
+                old_values,
+                new_values,
+                &resolved.foreign_keys,
+                storage,
+                txn,
+                bloom,
+            )?;
+        }
+    }
+
+    // FK parent enforcement: check if this table is referenced by any FK and
+    // the referenced column value is changing (RESTRICT/NO ACTION).
+    if !to_update.is_empty() {
+        let old_rows: Vec<(RecordId, Vec<Value>)> = to_update
+            .iter()
+            .map(|(rid, old, _)| (*rid, old.clone()))
+            .collect();
+        let new_rows: Vec<Vec<Value>> = to_update.iter().map(|(_, _, new)| new.clone()).collect();
+        crate::fk_enforcement::enforce_fk_on_parent_update(
+            &old_rows,
+            &new_rows,
+            resolved.def.id,
+            storage,
+            txn,
+        )?;
+    }
+
     if secondary_indexes.is_empty() {
         // Fast path: no secondary indexes — use batch heap update (O(P) page I/O).
         let heap_updates: Vec<(RecordId, Vec<Value>)> = to_update
@@ -1103,10 +1168,18 @@ fn execute_delete_ctx(
 
     let snap = txn.active_snapshot()?;
 
-    // No-WHERE + no secondary indexes → fast path: skip full row decode.
-    // When secondary indexes exist we must scan rows to extract index keys for
-    // deletion and to mark the bloom filters dirty.
-    if stmt.where_clause.is_none() && secondary_indexes.is_empty() {
+    // Check if any FK constraint references THIS table as the parent.
+    // If so, we must scan rows (to get parent key values) and cannot use the fast path.
+    let has_fk_references = {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        !reader
+            .list_fk_constraints_referencing(resolved.def.id)?
+            .is_empty()
+    };
+
+    // No-WHERE + no secondary indexes + no FK parent references → fast path.
+    // All three conditions must hold: we skip full row decode entirely.
+    if stmt.where_clause.is_none() && secondary_indexes.is_empty() && !has_fk_references {
         // Collect only (page_id, slot_id) pairs — MariaDB ha_delete_all_rows pattern.
         let raw_rids = HeapChain::scan_rids_visible(storage, resolved.def.data_root_page_id, snap)?;
         let count = raw_rids.len() as u64;
@@ -1128,11 +1201,10 @@ fn execute_delete_ctx(
         });
     }
 
-    // Full scan: need row values either for WHERE evaluation or for secondary
-    // index key extraction. When secondary indexes exist, skip the column mask
-    // optimisation — all column values may be needed for index key encoding.
+    // Full scan: needed for WHERE evaluation, secondary index maintenance, or FK enforcement.
+    // When secondary indexes or FK exist, skip column mask — all column values needed.
     let schema_cols = resolved.columns.clone();
-    let column_mask: Option<Vec<bool>> = if secondary_indexes.is_empty() {
+    let column_mask: Option<Vec<bool>> = if secondary_indexes.is_empty() && !has_fk_references {
         // WHERE-only path: lazy-decode only referenced columns.
         let n_cols = schema_cols.len();
         stmt.where_clause
@@ -1172,6 +1244,19 @@ fn execute_delete_ctx(
             },
         })
         .collect::<Result<_, DbError>>()?;
+
+    // FK parent enforcement: must run BEFORE heap delete so RESTRICT can abort
+    // cleanly and CASCADE/SET NULL can still read/update child rows.
+    if has_fk_references && !to_delete.is_empty() {
+        crate::fk_enforcement::enforce_fk_on_parent_delete(
+            &to_delete,
+            resolved.def.id,
+            storage,
+            txn,
+            bloom,
+            0,
+        )?;
+    }
 
     // Batch-delete from heap: each page read+written once instead of 3× per row.
     let rids_only: Vec<RecordId> = to_delete.iter().map(|(rid, _)| *rid).collect();
@@ -3306,6 +3391,10 @@ fn execute_create_table(
     let mut writer = CatalogWriter::new(storage, txn)?;
     let table_id = writer.create_table(schema, &stmt.table.name)?;
 
+    // Collect inline REFERENCES constraints for processing after all columns are created.
+    // We must create all columns first so col_idx values are stable.
+    let mut inline_fk_specs: Vec<InlineFkSpec> = Vec::new();
+
     for (i, col_def) in stmt.columns.iter().enumerate() {
         let col_type = datatype_to_column_type(&col_def.data_type)?;
         let nullable = !col_def
@@ -3316,6 +3405,23 @@ fn execute_create_table(
             .constraints
             .iter()
             .any(|c| matches!(c, ColumnConstraint::AutoIncrement));
+        // Also detect inline REFERENCES constraints — collect for processing below.
+        if let Some(refs) = col_def.constraints.iter().find_map(|c| {
+            if let ColumnConstraint::References {
+                table,
+                column,
+                on_delete,
+                on_update,
+            } = c
+            {
+                Some((table.clone(), column.clone(), *on_delete, *on_update))
+            } else {
+                None
+            }
+        }) {
+            inline_fk_specs.push((i as u16, col_def.name.clone(), refs));
+        }
+
         writer.create_column(CatalogColumnDef {
             table_id,
             col_idx: i as u16,
@@ -3326,7 +3432,347 @@ fn execute_create_table(
         })?;
     }
 
+    // Create B-Tree indexes for PRIMARY KEY and UNIQUE column constraints.
+    //
+    // `CREATE TABLE t (id INT PRIMARY KEY)` must create a unique B-Tree index on
+    // `id` so that:
+    // (a) the planner can use it for O(log n) point lookups, and
+    // (b) FK validation in `persist_fk_constraint` can verify parent key existence.
+    //
+    // Since the table was just created (empty heap), index build is trivial.
+    {
+        use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let mut pk_col: Option<(u16, String)> = None; // (col_idx, col_name) for PK
+        let mut unique_cols: Vec<(u16, String)> = Vec::new(); // (col_idx, col_name) for UNIQUE
+
+        for (i, col_def) in stmt.columns.iter().enumerate() {
+            for constraint in &col_def.constraints {
+                match constraint {
+                    ColumnConstraint::PrimaryKey => {
+                        pk_col = Some((i as u16, col_def.name.clone()));
+                    }
+                    crate::ast::ColumnConstraint::Unique => {
+                        unique_cols.push((i as u16, col_def.name.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Also check table-level PRIMARY KEY and UNIQUE constraints.
+        for tc in &stmt.table_constraints {
+            match tc {
+                crate::ast::TableConstraint::PrimaryKey { columns, .. } => {
+                    if columns.len() == 1 {
+                        let snap = txn.active_snapshot()?;
+                        let col_idx = {
+                            let mut reader = CatalogReader::new(storage, snap)?;
+                            let cols = reader.list_columns(table_id)?;
+                            cols.iter()
+                                .find(|c| c.name == columns[0])
+                                .map(|c| c.col_idx)
+                        };
+                        if let Some(idx) = col_idx {
+                            pk_col = Some((idx, columns[0].clone()));
+                        }
+                    }
+                }
+                crate::ast::TableConstraint::Unique { columns, .. } => {
+                    if columns.len() == 1 {
+                        let snap = txn.active_snapshot()?;
+                        let col_idx = {
+                            let mut reader = CatalogReader::new(storage, snap)?;
+                            let cols = reader.list_columns(table_id)?;
+                            cols.iter()
+                                .find(|c| c.name == columns[0])
+                                .map(|c| c.col_idx)
+                        };
+                        if let Some(idx) = col_idx {
+                            unique_cols.push((idx, columns[0].clone()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Helper: create a single-column B-Tree index on an empty table.
+        let create_empty_index = |col_idx: u16,
+                                  index_name: String,
+                                  is_unique: bool,
+                                  is_primary: bool,
+                                  storage: &mut dyn StorageEngine,
+                                  txn: &mut TxnManager|
+         -> Result<u32, DbError> {
+            let root_page_id = storage.alloc_page(PageType::Index)?;
+            {
+                let mut page = Page::new(PageType::Index, root_page_id);
+                let leaf = cast_leaf_mut(&mut page);
+                leaf.is_leaf = 1;
+                leaf.set_num_keys(0);
+                leaf.set_next_leaf(NULL_PAGE);
+                page.update_checksum();
+                storage.write_page(root_page_id, &page)?;
+            }
+            let final_root = AtomicU64::new(root_page_id).load(Ordering::Acquire);
+            let idx_id = CatalogWriter::new(storage, txn)?.create_index(IndexDef {
+                index_id: 0,
+                table_id,
+                name: index_name,
+                root_page_id: final_root,
+                is_unique,
+                is_primary,
+                columns: vec![IndexColumnDef {
+                    col_idx,
+                    order: CatalogSortOrder::Asc,
+                }],
+            })?;
+            Ok(idx_id)
+        };
+
+        // Create PRIMARY KEY index.
+        if let Some((col_idx, col_name)) = pk_col {
+            let idx_name = format!("{}_pkey", stmt.table.name);
+            let idx_id = create_empty_index(col_idx, idx_name, true, true, storage, txn)?;
+            // Populate bloom for the new PK index (table is empty, so no keys to add).
+            // bloom is not available here (non-ctx path), handled lazily.
+            let _ = idx_id;
+            let _ = col_name;
+        }
+
+        // Create UNIQUE indexes.
+        for (col_idx, col_name) in unique_cols {
+            let idx_name = format!("{}_{}_unique", stmt.table.name, col_name);
+            let idx_id = create_empty_index(col_idx, idx_name, true, false, storage, txn)?;
+            let _ = idx_id;
+        }
+    }
+
+    // Process FK constraints collected from inline column definitions.
+    for (child_col_idx, child_col_name, (ref_table, ref_col, on_delete, on_update)) in
+        inline_fk_specs
+    {
+        persist_fk_constraint(
+            table_id,
+            &stmt.table.name,
+            child_col_idx,
+            &child_col_name,
+            &ref_table,
+            ref_col.as_deref(),
+            ast_fk_action_to_catalog(on_delete),
+            ast_fk_action_to_catalog(on_update),
+            None, // auto-name
+            storage,
+            txn,
+        )?;
+    }
+
+    // Process FK constraints from table-level FOREIGN KEY declarations.
+    for tc in &stmt.table_constraints {
+        if let crate::ast::TableConstraint::ForeignKey {
+            name,
+            columns,
+            ref_table,
+            ref_columns,
+            on_delete,
+            on_update,
+        } = tc
+        {
+            if columns.len() != 1 {
+                return Err(DbError::NotImplemented {
+                    feature: "composite foreign key (multiple columns) — Phase 6.9".into(),
+                });
+            }
+            let child_col_name = &columns[0];
+            // Find col_idx for the FK column.
+            let snap = txn.active_snapshot()?;
+            let child_col_idx = {
+                let mut reader = CatalogReader::new(storage, snap)?;
+                let cols = reader.list_columns(table_id)?;
+                cols.iter()
+                    .find(|c| &c.name == child_col_name)
+                    .map(|c| c.col_idx)
+                    .ok_or_else(|| DbError::ColumnNotFound {
+                        name: child_col_name.clone(),
+                        table: stmt.table.name.clone(),
+                    })?
+            };
+            let ref_col = ref_columns.first().map(|s| s.as_str());
+            persist_fk_constraint(
+                table_id,
+                &stmt.table.name,
+                child_col_idx,
+                child_col_name,
+                ref_table,
+                ref_col,
+                ast_fk_action_to_catalog(*on_delete),
+                ast_fk_action_to_catalog(*on_update),
+                name.as_deref(),
+                storage,
+                txn,
+            )?;
+        }
+    }
+
     Ok(QueryResult::Empty)
+}
+
+// ── FK helpers ────────────────────────────────────────────────────────────────
+
+/// Converts an AST [`ForeignKeyAction`] to the catalog [`FkAction`] used in `FkDef`.
+fn ast_fk_action_to_catalog(action: crate::ast::ForeignKeyAction) -> axiomdb_catalog::FkAction {
+    use crate::ast::ForeignKeyAction;
+    use axiomdb_catalog::FkAction;
+    match action {
+        ForeignKeyAction::NoAction => FkAction::NoAction,
+        ForeignKeyAction::Restrict => FkAction::Restrict,
+        ForeignKeyAction::Cascade => FkAction::Cascade,
+        ForeignKeyAction::SetNull => FkAction::SetNull,
+        ForeignKeyAction::SetDefault => FkAction::SetDefault,
+    }
+}
+
+/// Validates and persists a single FK constraint definition.
+///
+/// Called from `execute_create_table` (inline `REFERENCES` and table-level
+/// `FOREIGN KEY`) and from `alter_add_constraint`.
+///
+/// # Steps
+/// 1. Resolve parent table and referenced column (defaults to PK if unspecified).
+/// 2. Verify parent column has a PRIMARY KEY or UNIQUE index.
+/// 3. Auto-generate constraint name if not provided.
+/// 4. Check uniqueness of constraint name on this child table.
+/// 5. Create an index on the FK column in the child table if none exists.
+/// 6. Persist `FkDef` in `axiom_foreign_keys`.
+#[allow(clippy::too_many_arguments)]
+fn persist_fk_constraint(
+    child_table_id: u32,
+    child_table_name: &str,
+    child_col_idx: u16,
+    child_col_name: &str,
+    ref_table: &str,
+    ref_col: Option<&str>,
+    on_delete: axiomdb_catalog::FkAction,
+    on_update: axiomdb_catalog::FkAction,
+    fk_name: Option<&str>,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+) -> Result<(), DbError> {
+    use axiomdb_catalog::FkDef;
+
+    let snap = txn.active_snapshot()?;
+
+    // 1. Resolve parent table.
+    let parent_def = {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        reader
+            .get_table("public", ref_table)?
+            .ok_or_else(|| DbError::TableNotFound {
+                name: ref_table.to_string(),
+            })?
+    };
+
+    // 2. Find the referenced column in the parent table.
+    let parent_cols = {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        reader.list_columns(parent_def.id)?
+    };
+    let parent_col_idx: u16 = if let Some(col_name) = ref_col {
+        parent_cols
+            .iter()
+            .find(|c| c.name == col_name)
+            .map(|c| c.col_idx)
+            .ok_or_else(|| DbError::ColumnNotFound {
+                name: col_name.to_string(),
+                table: ref_table.to_string(),
+            })?
+    } else {
+        // Default: use the leading column of the primary key index.
+        let parent_indexes = {
+            let mut reader = CatalogReader::new(storage, snap)?;
+            reader.list_indexes(parent_def.id)?
+        };
+        let pk_idx = parent_indexes
+            .iter()
+            .find(|i| i.is_primary && !i.columns.is_empty())
+            .ok_or_else(|| DbError::ForeignKeyNoParentIndex {
+                table: ref_table.to_string(),
+                column: "<primary key>".to_string(),
+            })?;
+        pk_idx.columns[0].col_idx
+    };
+
+    // 3. Verify the parent column has a PRIMARY KEY or UNIQUE index covering it.
+    {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        let parent_indexes = reader.list_indexes(parent_def.id)?;
+        let has_unique = parent_indexes.iter().any(|i| {
+            (i.is_primary || i.is_unique)
+                && i.columns.len() == 1
+                && i.columns[0].col_idx == parent_col_idx
+        });
+        if !has_unique {
+            let col_name = parent_cols
+                .iter()
+                .find(|c| c.col_idx == parent_col_idx)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| format!("col_{parent_col_idx}"));
+            return Err(DbError::ForeignKeyNoParentIndex {
+                table: ref_table.to_string(),
+                column: col_name,
+            });
+        }
+    }
+
+    // 4. Auto-generate FK name if not provided.
+    let constraint_name: String = fk_name
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| format!("fk_{child_table_name}_{child_col_name}_{ref_table}"));
+
+    // 5. Check FK name uniqueness on this child table.
+    {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        if reader
+            .get_fk_by_name(child_table_id, &constraint_name)?
+            .is_some()
+        {
+            return Err(DbError::Other(format!(
+                "foreign key constraint '{constraint_name}' already exists on table \
+                 '{child_table_name}'"
+            )));
+        }
+    }
+
+    // 6. FK index on child table.
+    //
+    // Phase 6.5 limitation: the current B-Tree stores exactly ONE RecordId per
+    // key. A non-unique FK column (multiple rows with the same FK value) would
+    // cause DuplicateKey errors when inserting the second row with the same key.
+    //
+    // Deferred to Phase 6.9: auto-create an index that uses a composite key
+    // (fk_val + RecordId bytes) so every entry is unique in the B-Tree, while
+    // still allowing range lookups by fk_val prefix.
+    //
+    // For Phase 6.5, FK enforcement always uses a full table scan of the parent
+    // for INSERT validation, and a full scan of the child for DELETE enforcement.
+    // This is O(n) but always correct regardless of index state.
+    let fk_index_id: u32 = 0; // ⚠️ DEFERRED — see above
+
+    // 7. Persist FkDef in axiom_foreign_keys.
+    CatalogWriter::new(storage, txn)?.create_foreign_key(FkDef {
+        fk_id: 0, // allocated by CatalogWriter::create_foreign_key
+        child_table_id,
+        child_col_idx,
+        parent_table_id: parent_def.id,
+        parent_col_idx,
+        on_delete,
+        on_update,
+        fk_index_id,
+        name: constraint_name,
+    })?;
+
+    Ok(())
 }
 
 // ── DROP TABLE ────────────────────────────────────────────────────────────────
@@ -3531,6 +3977,51 @@ fn execute_drop_index(
             Ok(QueryResult::Empty)
         }
     }
+}
+
+/// Drops an index by its catalog `index_id`, without requiring the index name.
+///
+/// Used by `alter_drop_constraint` to remove the auto-created FK index when a
+/// FK constraint is dropped.
+fn execute_drop_index_by_id(
+    index_id: u32,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
+) -> Result<(), DbError> {
+    let snap = txn.active_snapshot()?;
+    // Find the root page ID so we can free the B-Tree pages.
+    let root_page_id = {
+        // Scan all indexes looking for this index_id.
+        // We scan axiom_indexes; CatalogReader::list_indexes requires a table_id,
+        // so we use a raw catalog reader to get the TableDef first, but since we
+        // only have index_id, we scan all tables. For Phase 6.5 this is acceptable
+        // (index count is small). A direct get_index_by_id is deferred.
+        // Scan axiom_indexes heap directly to find root by index_id (no table filter needed).
+        let page_ids = axiomdb_catalog::bootstrap::CatalogBootstrap::page_ids(storage)?;
+        let rows = axiomdb_storage::heap_chain::HeapChain::scan_visible_ro(
+            storage,
+            page_ids.indexes,
+            snap,
+        )?;
+        let mut found_root = None;
+        for (_, _, data) in rows {
+            if let Ok((def, _)) = axiomdb_catalog::schema::IndexDef::from_bytes(&data) {
+                if def.index_id == index_id {
+                    found_root = Some(def.root_page_id);
+                    break;
+                }
+            }
+        }
+        found_root
+    };
+
+    CatalogWriter::new(storage, txn)?.delete_index(index_id)?;
+    bloom.remove(index_id);
+    if let Some(root) = root_page_id {
+        free_btree_pages(storage, root)?;
+    }
+    Ok(())
 }
 
 /// Frees all pages of a B-Tree rooted at `root_pid`.
@@ -3995,7 +4486,7 @@ fn alter_add_constraint(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
     table_def: &axiomdb_catalog::ResolvedTable,
-    columns: &[axiomdb_catalog::schema::ColumnDef],
+    columns_arg: &[axiomdb_catalog::schema::ColumnDef],
     tc: crate::ast::TableConstraint,
     schema: &str,
 ) -> Result<(), DbError> {
@@ -4059,7 +4550,7 @@ fn alter_add_constraint(
 
             // Validate all existing rows.
             let existing_rows =
-                TableEngine::scan_table(storage, &table_def.def, columns, snap, None)?;
+                TableEngine::scan_table(storage, &table_def.def, columns_arg, snap, None)?;
             for (_rid, row_values) in &existing_rows {
                 let result = eval(&expr, row_values)?;
                 if !crate::eval::is_truthy(&result) {
@@ -4083,9 +4574,93 @@ fn alter_add_constraint(
             Ok(())
         }
 
-        TableConstraint::ForeignKey { .. } => Err(DbError::NotImplemented {
-            feature: "ADD CONSTRAINT FOREIGN KEY — Phase 6.5".into(),
-        }),
+        TableConstraint::ForeignKey {
+            name,
+            columns,
+            ref_table,
+            ref_columns,
+            on_delete,
+            on_update,
+        } => {
+            if columns.len() != 1 {
+                return Err(DbError::NotImplemented {
+                    feature: "composite foreign key (multiple columns) — Phase 6.9".into(),
+                });
+            }
+            let child_col_name = &columns[0];
+            let child_col_idx = columns_arg
+                .iter()
+                .find(|c| &c.name == child_col_name)
+                .map(|c| c.col_idx)
+                .ok_or_else(|| DbError::ColumnNotFound {
+                    name: child_col_name.clone(),
+                    table: table_def.def.table_name.clone(),
+                })?;
+            let ref_col = ref_columns.first().map(|s| s.as_str());
+
+            // Persist the FK definition (validates parent, creates auto-index if needed).
+            persist_fk_constraint(
+                table_def.def.id,
+                &table_def.def.table_name,
+                child_col_idx,
+                child_col_name,
+                &ref_table,
+                ref_col,
+                ast_fk_action_to_catalog(on_delete),
+                ast_fk_action_to_catalog(on_update),
+                name.as_deref(),
+                storage,
+                txn,
+            )?;
+
+            // Validate existing data: every non-NULL FK value must reference a parent row.
+            let snap = txn.active_snapshot()?;
+            let default_constraint_name = format!(
+                "fk_{}_{}_{ref_table}",
+                table_def.def.table_name, child_col_name
+            );
+            let constraint_name = name.as_deref().unwrap_or(&default_constraint_name);
+            let new_fk = {
+                let mut reader = CatalogReader::new(storage, snap)?;
+                reader
+                    .get_fk_by_name(table_def.def.id, constraint_name)?
+                    .ok_or_else(|| DbError::Internal {
+                        message: "FK just created not found in catalog".into(),
+                    })?
+            };
+            let existing_rows =
+                TableEngine::scan_table(storage, &table_def.def, columns_arg, snap, None)?;
+            let mut noop_bloom = crate::bloom::BloomRegistry::new();
+            for (_, row) in &existing_rows {
+                if let Err(e) = crate::fk_enforcement::check_fk_child_insert(
+                    row,
+                    std::slice::from_ref(&new_fk),
+                    storage,
+                    txn,
+                    &mut noop_bloom,
+                ) {
+                    // Roll back: drop the FK definition (and its auto-created index).
+                    let snap2 = txn.active_snapshot()?;
+                    if let Ok(Some(fk)) = CatalogReader::new(storage, snap2)?
+                        .get_fk_by_name(table_def.def.id, &new_fk.name)
+                    {
+                        let fk_index_id = fk.fk_index_id;
+                        CatalogWriter::new(storage, txn)?.drop_foreign_key(fk.fk_id)?;
+                        if fk_index_id != 0 {
+                            let _ = execute_drop_index_by_id(
+                                fk_index_id,
+                                storage,
+                                txn,
+                                &mut noop_bloom,
+                            );
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+
+            Ok(())
+        }
 
         TableConstraint::PrimaryKey { .. } => Err(DbError::NotImplemented {
             feature: "ADD CONSTRAINT PRIMARY KEY — requires full table rewrite".into(),
@@ -4127,16 +4702,35 @@ fn alter_drop_constraint(
         reader.get_constraint_by_name(table_id, name)?
     };
 
-    match constraint {
-        Some(c) => {
-            CatalogWriter::new(storage, txn)?.drop_constraint(c.constraint_id)?;
-            Ok(())
+    if let Some(c) = constraint {
+        CatalogWriter::new(storage, txn)?.drop_constraint(c.constraint_id)?;
+        return Ok(());
+    }
+
+    // 3. Search in axiom_foreign_keys (FK constraints — Phase 6.5).
+    let fk = {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        reader.get_fk_by_name(table_id, name)?
+    };
+
+    if let Some(fk_def) = fk {
+        let fk_index_id = fk_def.fk_index_id;
+        CatalogWriter::new(storage, txn)?.drop_foreign_key(fk_def.fk_id)?;
+        // Drop the auto-created FK index (fk_index_id != 0 means we created it).
+        if fk_index_id != 0 {
+            let mut noop_bloom = crate::bloom::BloomRegistry::new();
+            execute_drop_index_by_id(fk_index_id, storage, txn, &mut noop_bloom)?;
         }
-        None if if_exists => Ok(()),
-        None => Err(DbError::Other(format!(
+        return Ok(());
+    }
+
+    if if_exists {
+        Ok(())
+    } else {
+        Err(DbError::Other(format!(
             "constraint '{name}' not found on table '{}'",
             table_def.def.table_name
-        ))),
+        )))
     }
 }
 

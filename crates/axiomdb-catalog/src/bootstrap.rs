@@ -16,18 +16,18 @@ use axiomdb_core::error::DbError;
 use axiomdb_storage::{
     read_meta_u32, read_meta_u64, write_catalog_header, write_meta_u32, write_meta_u64, Page,
     PageType, StorageEngine, CATALOG_COLUMNS_ROOT_BODY_OFFSET,
-    CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, CATALOG_INDEXES_ROOT_BODY_OFFSET,
-    CATALOG_SCHEMA_VER_BODY_OFFSET, CATALOG_TABLES_ROOT_BODY_OFFSET, NEXT_INDEX_ID_BODY_OFFSET,
-    NEXT_TABLE_ID_BODY_OFFSET,
+    CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET,
+    CATALOG_INDEXES_ROOT_BODY_OFFSET, CATALOG_SCHEMA_VER_BODY_OFFSET,
+    CATALOG_TABLES_ROOT_BODY_OFFSET, NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
 };
 
 // ── CatalogPageIds ────────────────────────────────────────────────────────────
 
-/// Root heap page IDs for the four system tables.
+/// Root heap page IDs for the five system tables.
 ///
 /// These are the starting points for [`CatalogReader`] and [`CatalogWriter`]
 /// when scanning or inserting rows into `axiom_tables`, `axiom_columns`,
-/// `axiom_indexes`, and `axiom_constraints`.
+/// `axiom_indexes`, `axiom_constraints`, and `axiom_foreign_keys`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogPageIds {
     /// Root page of the `axiom_tables` heap.
@@ -40,6 +40,10 @@ pub struct CatalogPageIds {
     /// Zero on databases created before Phase 4.22b; lazily initialized on
     /// first use via `CatalogBootstrap::ensure_constraints_root()`.
     pub constraints: u64,
+    /// Root page of the `axiom_foreign_keys` heap (Phase 6.5).
+    /// Zero on databases created before Phase 6.5; lazily initialized on
+    /// first use via `CatalogBootstrap::ensure_fk_root()`.
+    pub foreign_keys: u64,
 }
 
 // ── CatalogBootstrap ─────────────────────────────────────────────────────────
@@ -98,6 +102,12 @@ impl CatalogBootstrap {
         write_meta_u32(storage, NEXT_TABLE_ID_BODY_OFFSET, 1)?;
         write_meta_u32(storage, NEXT_INDEX_ID_BODY_OFFSET, 1)?;
 
+        // Allocate the foreign keys root (Phase 6.5).
+        let fk_root = storage.alloc_page(PageType::Data)?;
+        let fk_page = Page::new(PageType::Data, fk_root);
+        storage.write_page(fk_root, &fk_page)?;
+        write_meta_u64(storage, CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET, fk_root)?;
+
         storage.flush()?;
 
         Ok(CatalogPageIds {
@@ -105,6 +115,7 @@ impl CatalogBootstrap {
             columns: columns_root,
             indexes: indexes_root,
             constraints: constraints_root,
+            foreign_keys: fk_root,
         })
     }
 
@@ -125,11 +136,13 @@ impl CatalogBootstrap {
         let columns = read_meta_u64(storage, CATALOG_COLUMNS_ROOT_BODY_OFFSET)?;
         let indexes = read_meta_u64(storage, CATALOG_INDEXES_ROOT_BODY_OFFSET)?;
         let constraints = read_meta_u64(storage, CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET)?;
+        let foreign_keys = read_meta_u64(storage, CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET)?;
         Ok(CatalogPageIds {
             tables,
             columns,
             indexes,
             constraints,
+            foreign_keys,
         })
     }
 
@@ -148,6 +161,25 @@ impl CatalogBootstrap {
         let page = Page::new(PageType::Data, new_root);
         storage.write_page(new_root, &page)?;
         write_meta_u64(storage, CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, new_root)?;
+        storage.flush()?;
+        Ok(new_root)
+    }
+
+    /// Ensures the `axiom_foreign_keys` root page exists (Phase 6.5).
+    ///
+    /// If the database was created before Phase 6.5, the FK root is 0.
+    /// This method allocates and persists it on first call. Idempotent.
+    ///
+    /// Returns the (possibly newly allocated) FK root page ID.
+    pub fn ensure_fk_root(storage: &mut dyn StorageEngine) -> Result<u64, DbError> {
+        let root = read_meta_u64(storage, CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET)?;
+        if root != 0 {
+            return Ok(root);
+        }
+        let new_root = storage.alloc_page(PageType::Data)?;
+        let page = Page::new(PageType::Data, new_root);
+        storage.write_page(new_root, &page)?;
+        write_meta_u64(storage, CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET, new_root)?;
         storage.flush()?;
         Ok(new_root)
     }

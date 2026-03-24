@@ -152,6 +152,58 @@ automatically when a matching secondary index exists, with zero configuration re
 
 ---
 
+## Foreign Key Constraints
+
+Foreign key constraints ensure referential integrity between tables. Every non-NULL
+value in the FK column of the child table must reference an existing row in the
+parent table.
+
+```sql
+-- Inline REFERENCES syntax
+CREATE TABLE orders (
+  id      INT PRIMARY KEY,
+  user_id INT REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Table-level FOREIGN KEY syntax
+CREATE TABLE order_items (
+  id         INT PRIMARY KEY,
+  order_id   INT,
+  product_id INT,
+  CONSTRAINT fk_order   FOREIGN KEY (order_id)   REFERENCES orders(id)   ON DELETE CASCADE,
+  CONSTRAINT fk_product FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE RESTRICT
+);
+
+-- Add FK after the fact
+ALTER TABLE orders
+  ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id);
+
+-- Remove a FK constraint
+ALTER TABLE orders DROP CONSTRAINT fk_user;
+```
+
+### ON DELETE Actions
+
+| Action | Behavior |
+|--------|----------|
+| `RESTRICT` / `NO ACTION` (default) | Error if child rows reference the deleted parent row |
+| `CASCADE` | Automatically delete all child rows (recursive, max depth 10) |
+| `SET NULL` | Set child FK column to NULL (column must be nullable) |
+
+### NULL FK Values
+
+A NULL value in a FK column is always allowed — it does not reference any parent row.
+This follows SQL standard MATCH SIMPLE semantics.
+
+### Phase 6.5 Limitations
+
+- Only single-column FKs are supported. Composite FKs are planned for Phase 6.9.
+- `ON UPDATE CASCADE` / `ON UPDATE SET NULL` are planned for Phase 6.9.
+- FK enforcement uses a full table scan of the parent for validation. An optimized
+  index-based check is planned for Phase 6.9.
+
+---
+
 ## Bloom Filter Optimization
 
 AxiomDB maintains an in-memory **Bloom filter** for each secondary index. The

@@ -102,6 +102,15 @@ pub const CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET: usize = 72;
 /// named constraints (CHECK). Value 0 = uninitialized. First valid ID = 1.
 pub const NEXT_CONSTRAINT_ID_BODY_OFFSET: usize = 80;
 
+/// body offset of `catalog_foreign_keys_root: u64` — root heap page for
+/// `axiom_foreign_keys` (Phase 6.5). Value 0 = not yet allocated (lazily
+/// initialized on first use so existing databases remain compatible).
+pub const CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET: usize = 84;
+
+/// body offset of `next_fk_id: u32` — auto-increment sequence for FK
+/// constraint definitions. Value 0 = uninitialized. First valid ID = 1.
+pub const NEXT_FK_ID_BODY_OFFSET: usize = 92;
+
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMA_VER_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "catalog header must fit within page 0"
@@ -110,6 +119,11 @@ const _: () = assert!(
 const _: () = assert!(
     HEADER_SIZE + NEXT_CONSTRAINT_ID_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "constraint sequence field must fit within page 0"
+);
+
+const _: () = assert!(
+    HEADER_SIZE + NEXT_FK_ID_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
+    "FK sequence field must fit within page 0"
 );
 
 /// Reads a single `u64` from the meta page at `body_offset`.
@@ -206,6 +220,20 @@ pub fn alloc_constraint_id(storage: &mut dyn StorageEngine) -> Result<u32, DbErr
     }
     let next = current.checked_add(1).ok_or(DbError::SequenceOverflow)?;
     write_meta_u32(storage, NEXT_CONSTRAINT_ID_BODY_OFFSET, next)?;
+    Ok(current)
+}
+
+/// Allocates the next `fk_id` from the meta page sequence (Phase 6.5).
+///
+/// Lazy-initializes to 1 on first call if still 0 (compatible with pre-6.5 DBs).
+pub fn alloc_fk_id(storage: &mut dyn StorageEngine) -> Result<u32, DbError> {
+    let current = read_meta_u32(storage, NEXT_FK_ID_BODY_OFFSET)?;
+    if current == 0 {
+        write_meta_u32(storage, NEXT_FK_ID_BODY_OFFSET, 2)?;
+        return Ok(1);
+    }
+    let next = current.checked_add(1).ok_or(DbError::SequenceOverflow)?;
+    write_meta_u32(storage, NEXT_FK_ID_BODY_OFFSET, next)?;
     Ok(current)
 }
 
