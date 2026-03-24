@@ -219,11 +219,76 @@ and stops. The caller decides whether to propagate or recover gracefully.
 
 ## WAL and Concurrency
 
-In the current implementation (`Phase 3`), WAL writes are serialized through a single
-`WalWriter` protected by the `TxnManager`. All concurrent transactions append to the
-same WAL file sequentially.
+### Single-Writer Model
 
-Phase 7 will introduce concurrent WAL writers using group commit: multiple transactions
-accumulate entries in per-thread buffers and a single "commit group leader" flushes the
-batch with one `fsync`. This is the same technique used by PostgreSQL 14+ and reduces
-`fsync` latency from O(n transactions) to O(1) per commit group.
+WAL writes are serialized through a single `WalWriter` inside `TxnManager`. The
+`Database` is wrapped in `Arc<tokio::sync::Mutex<Database>>` — only one connection
+executes DML at a time. This eliminates write–write conflicts without record-level
+locking (Phase 7 will lift this constraint).
+
+### Group Commit (Phase 3.19)
+
+Under the default single-fsync-per-commit model, N concurrent connections pay N
+sequential `fsync` calls. **Group Commit** batches those fsyncs: connections write
+their `Commit` WAL entries to the `BufWriter` (fast, RAM only) and register with the
+`CommitCoordinator` instead of fsyncing inline. A background Tokio task wakes every
+`group_commit_interval_ms` (or immediately when `group_commit_max_batch` connections
+are waiting), acquires the Database lock, executes a **single** `flush + fsync`, then
+notifies all waiting connections.
+
+```
+Disabled (default):
+  Conn A → lock → DML → commit() [flush+fsync inline] → unlock → OK
+  Conn B →                        lock → DML → commit() [flush+fsync] → unlock → OK
+  Cost: 2 fsyncs
+
+Enabled (group_commit_interval_ms = 1):
+  Conn A → lock → DML → commit_deferred() → unlock → await rx ──────┐
+  Conn B →         lock → DML → commit_deferred() → unlock → await ──┤
+  Background task:  lock → flush+fsync → advance_committed → unlock  │
+                    notify A ──────────────────────────────────────── ┘
+                    notify B
+  Cost: 1 fsync for both A and B
+```
+
+#### Durability Guarantee
+
+A connection does **not** receive `Ok` until the fsync covering its `Commit` entry
+completes. `max_committed` advances only after `advance_committed()` is called — which
+happens only inside the background task, after a successful fsync. If the process
+crashes before the fsync, the transaction is lost and no client received `Ok`. The
+durability guarantee is identical to non-group-commit mode; only the throughput changes.
+
+#### Key Structures
+
+| Component | Location | Role |
+|---|---|---|
+| `CommitCoordinator` | `axiomdb-network/src/mysql/commit_coordinator.rs` | Pending queue (`std::sync::Mutex<Vec<CommitTicket>>`), `Notify` trigger |
+| `CommitTicket` | same file | `txn_id + oneshot::Sender<Result<(), DbError>>` per waiting connection |
+| `TxnManager::deferred_commit_mode` | `axiomdb-wal/src/txn.rs` | When `true`, `commit()` skips fsync and sets `pending_deferred_txn_id` |
+| `TxnManager::advance_committed()` | same file | Advances `max_committed` to `max(batch_txn_ids)` after fsync |
+| `spawn_group_commit_task()` | `axiomdb-network/src/mysql/group_commit.rs` | Long-running Tokio task; `Weak<Mutex<Database>>` exits on DB drop |
+
+#### Configuration
+
+```toml
+# axiomdb.toml
+group_commit_interval_ms = 1   # 0 = disabled (default); 1ms recommended for production
+group_commit_max_batch   = 64  # trigger fsync immediately when 64 connections are waiting
+```
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage</span>
+PostgreSQL uses group commit with <code>synchronous_commit=on</code> (the default) and still pays one fsync per transaction under low concurrency. AxiomDB's coordinator batches across all concurrent connections with a configurable interval, reducing fsync overhead from O(N connections) to O(1) per batch window — the same improvement PostgreSQL achieves only at high concurrency.
+</div>
+</div>
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — std::sync::Mutex for CommitCoordinator</span>
+The <code>CommitCoordinator::pending</code> queue uses <code>std::sync::Mutex</code> (not Tokio's async mutex) so that <code>register_pending()</code> can be called from synchronous code inside <code>Database::execute_query</code> without infecting the function signature with <code>async</code>. The lock is held only for an O(1) Vec push — never across an <code>.await</code> point, so no deadlock risk and no blocking of the Tokio runtime.
+</div>
+</div>

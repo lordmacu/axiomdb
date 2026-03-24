@@ -20,8 +20,11 @@ use tokio::sync::Mutex;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, info, warn};
 
+use axiomdb_core::error::DbError;
 use axiomdb_sql::{ast::Stmt, result::ColumnMeta, SchemaCache, SessionContext};
 use axiomdb_types::DataType;
+
+use super::database::CommitRx;
 
 use super::{
     auth::{gen_challenge, is_allowed_user, verify_native_password, verify_sha256_password},
@@ -204,13 +207,26 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 }
 
                 // Execute via the engine.
-                let result = {
+                // The Database lock is released BEFORE awaiting fsync confirmation
+                // so that other connections can proceed while this one waits.
+                let exec_result = {
                     let mut guard = db.lock().await;
                     guard.execute_query(sql, &mut session, &mut schema_cache)
-                };
+                }; // lock released here
 
-                match result {
-                    Ok(qr) => {
+                match exec_result {
+                    Ok((qr, commit_rx)) => {
+                        // Await fsync confirmation outside the lock (group commit).
+                        // No-op when commit_rx is None (disabled or read-only).
+                        if let Err(e) = await_commit_rx(commit_rx).await {
+                            let me = dberror_to_mysql(&e);
+                            debug!(conn_id, code = me.code, msg = %me.message, "commit error");
+                            let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
+                            if writer.send((1u8, pkt.as_slice())).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
                         let packets = serialize_query_result(qr, 1);
                         if send_packets(&mut writer, &packets).await.is_err() {
                             break;
@@ -309,6 +325,7 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                                     Ok(ready_stmt) => {
                                         let mut guard = db.lock().await;
                                         guard.execute_stmt(ready_stmt, &mut session)
+                                        // lock released here, before await below
                                     }
                                     Err(e) => Err(e),
                                 }
@@ -324,6 +341,7 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                                             &mut session,
                                             &mut schema_cache,
                                         )
+                                        // lock released here, before await below
                                     }
                                     Err(e) => Err(e),
                                 }
@@ -338,7 +356,14 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 };
 
                 match result {
-                    Ok(qr) => {
+                    Ok((qr, commit_rx)) => {
+                        // Await fsync confirmation outside the lock (group commit).
+                        if let Err(e) = await_commit_rx(commit_rx).await {
+                            let me = dberror_to_mysql(&e);
+                            let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
+                            let _ = writer.send((1u8, pkt.as_slice())).await;
+                            continue;
+                        }
                         let packets = serialize_query_result(qr, 1);
                         if send_packets(&mut writer, &packets).await.is_err() {
                             break;
@@ -388,6 +413,28 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
     }
 
     info!(conn_id, "connection closed");
+}
+
+// ── Group commit helper ───────────────────────────────────────────────────────
+
+/// Awaits fsync confirmation from the `CommitCoordinator`.
+///
+/// - `None` → group commit is disabled or the transaction was read-only;
+///   returns `Ok(())` immediately (no-op).
+/// - `Some(rx)` → waits for the background task to fsync and confirm;
+///   returns `Ok(())` on success or `Err(WalGroupCommitFailed)` on failure.
+///
+/// Must be called **after** the `Database` lock has been released so that
+/// other connections can proceed while this one awaits the fsync.
+async fn await_commit_rx(rx: Option<CommitRx>) -> Result<(), DbError> {
+    match rx {
+        None => Ok(()),
+        Some(rx) => rx.await.unwrap_or_else(|_| {
+            Err(DbError::WalGroupCommitFailed {
+                message: "commit coordinator dropped before fsync".into(),
+            })
+        }),
+    }
 }
 
 // ── ORM / driver query interception ──────────────────────────────────────────
