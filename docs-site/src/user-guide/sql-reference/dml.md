@@ -739,3 +739,50 @@ WHERE u.deleted_at IS NULL
 GROUP BY u.id, u.name, u.email
 ORDER BY lifetime_value DESC NULLS LAST;
 ```
+
+---
+
+## Multi-Statement Queries
+
+AxiomDB accepts multiple SQL statements separated by `;` in a single `COM_QUERY`
+call. Each statement executes sequentially, and the client receives one result set
+per statement.
+
+```sql
+-- Three statements in one call
+CREATE TABLE IF NOT EXISTS sessions (
+    id         UUID NOT NULL,
+    user_id    INT  NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+INSERT INTO sessions (id, user_id) VALUES (gen_random_uuid(), 42);
+SELECT COUNT(*) FROM sessions WHERE user_id = 42;
+```
+
+**How it works (protocol):**
+
+Each intermediate result set is sent with the `SERVER_MORE_RESULTS_EXISTS` flag
+(`0x0008`) set in the EOF/OK status bytes, telling the client to read the next
+result set. The final result set has the flag cleared.
+
+**Behavior on error:**
+
+If any statement fails, execution stops at that point and an error packet is sent.
+Statements after the failing one are not executed.
+
+```sql
+-- If INSERT fails (e.g. UNIQUE violation), SELECT is not executed
+INSERT INTO users (email) VALUES ('duplicate@example.com');
+SELECT * FROM users WHERE email = 'duplicate@example.com';
+```
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Tip — SQL scripts and migrations</span>
+Multi-statement support makes it easy to run SQL migration scripts directly via the
+MySQL wire protocol. The <code>mysql</code> CLI, pymysql, and most ORMs handle
+multi-statement results automatically when the client flag
+<code>CLIENT_MULTI_STATEMENTS</code> is set (default in most clients).
+</div>
+</div>
