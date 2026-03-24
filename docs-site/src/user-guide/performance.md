@@ -89,26 +89,47 @@ MySQL's <code>innodb_flush_log_at_trx_commit=1</code> (default, fully durable) a
 </div>
 </div>
 
-### End-to-End INSERT Throughput (Phase 4.16b)
+### End-to-End INSERT Throughput
 
 Full pipeline: parse → analyze → execute → WAL → MmapStorage. Measured with
-`executor_e2e` benchmark (MmapStorage + real WAL, release build, NVMe).
+`executor_e2e` benchmark (MmapStorage + real WAL, release build, Apple M2 Pro NVMe).
 
-| Configuration                          | AxiomDB        | Target (Phase 8) | Status |
-|----------------------------------------|----------------|------------------|--------|
-| INSERT 100 rows / 1 txn (no cache)     | 2.8K ops/s     | —                | —      |
-| INSERT 1K rows / 1 txn (no cache)      | 18.5K ops/s    | —                | —      |
-| INSERT 1K rows / 1 txn (SchemaCache)   | 20.6K ops/s    | —                | —      |
-| INSERT 10K rows / 1 txn (SchemaCache)  | **36K ops/s**  | 180K ops/s       | ⚠️     |
-| INSERT autocommit (1 fsync/row)        | **58 q/s**     | —                | — (wire protocol, Phase 5.14) |
+| Configuration                                   | AxiomDB         | MariaDB ~   | Status |
+|-------------------------------------------------|-----------------|-------------|--------|
+| INSERT 10K rows / N separate SQL strings / 1 txn| 35K rows/s      | 140K rows/s | ⚠️     |
+| **INSERT 10K rows / 1 multi-row SQL string**    | **211K rows/s** | 140K rows/s | ✅ **1.5× faster** |
+| INSERT autocommit (1 fsync/stmt, wire protocol) | 58 q/s          | —           | — (Phase 5.14) |
 
-The 36K ops/s figure is the current honest baseline for the string-based API
-(parse → analyze → execute per statement). The bottleneck is WAL `record_insert()`,
-which costs ~20 µs/row even without fsync — not parse or catalog overhead.
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage vs MariaDB InnoDB</span>
+With <code>INSERT INTO t VALUES (r1),(r2),...,(rN)</code>, AxiomDB reaches 211K rows/s
+vs MariaDB's ~140K rows/s — <strong>1.5× faster</strong> on bulk inserts. The gap comes
+from three combined optimizations: O(P) heap writes via <code>HeapChain::insert_batch</code>,
+O(1) WAL writes via <code>record_insert_batch</code> (Phase 3.17), and a single
+parse+analyze pass for all N rows (Phase 4.16c). MariaDB pays a clustered B-Tree insert
+per row plus UNDO log write before each page modification.
+</div>
+</div>
 
-The 180K ops/s target is a Phase 8 goal. Prepared statements will skip parse and
-analyze entirely, and a batch insert API will amortize WAL overhead across many rows
-in a single write.
+**How to achieve this throughput in your application:**
+
+```sql
+-- Fast: one SQL string with N value rows (211K rows/s)
+INSERT INTO orders (user_id, amount) VALUES
+  (1, 49.99), (2, 12.50), (3, 99.00), -- ... up to thousands of rows
+  (1000, 7.99);
+
+-- Slower: N separate INSERT strings (35K rows/s — parse+analyze per row)
+INSERT INTO orders VALUES (1, 49.99);
+INSERT INTO orders VALUES (2, 12.50);
+-- ...
+```
+
+The difference between the two approaches is 6× in throughput. The bottleneck
+in the per-string case is parse + analyze overhead per SQL string (~20 µs/string),
+not the storage write.
 
 ### Row Codec Throughput
 

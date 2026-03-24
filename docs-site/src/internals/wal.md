@@ -269,6 +269,29 @@ durability guarantee is identical to non-group-commit mode; only the throughput 
 | `TxnManager::advance_committed()` | same file | Advances `max_committed` to `max(batch_txn_ids)` after fsync |
 | `spawn_group_commit_task()` | `axiomdb-network/src/mysql/group_commit.rs` | Long-running Tokio task; `Weak<Mutex<Database>>` exits on DB drop |
 
+### Batch WAL Append (Phase 3.17)
+
+For bulk inserts (`INSERT INTO t VALUES (r1),(r2),...`) `TxnManager::record_insert_batch()`
+writes all N Insert WAL entries in **a single `write_all` call**:
+
+```
+Per-row path (before 3.17):
+  for each of N rows: append_with_buf(entry, scratch)  ← N × write_all to BufWriter
+
+Batch path (3.17):
+  lsn_base = wal.reserve_lsns(N)
+  for each row: entry.serialize_into(&mut wal_scratch)  ← accumulate in RAM
+  wal.write_batch(&wal_scratch)                         ← 1 × write_all
+```
+
+The entries written to disk are byte-for-byte identical to the per-row path —
+crash recovery reads them the same way. The improvement is purely in CPU and
+syscall overhead: O(1) BufWriter calls instead of O(N).
+
+Combined with `HeapChain::insert_batch()` (O(P) page writes for P pages) and
+a single parse+analyze pass for multi-row VALUES, the full bulk INSERT pipeline
+is O(P) in both storage I/O and WAL I/O, where P = number of pages filled ≈ N/200.
+
 #### Configuration
 
 ```toml

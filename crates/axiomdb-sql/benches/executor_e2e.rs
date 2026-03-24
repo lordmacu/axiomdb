@@ -157,6 +157,55 @@ fn bench_insert_batch_txn(c: &mut Criterion) {
     group.finish();
 }
 
+/// Multi-row INSERT: one SQL string with N VALUES rows.
+///
+/// Measures the full pipeline with one parse + one analyze + one execute
+/// for all N rows. Uses record_insert_batch (Phase 3.17) internally, so
+/// WAL writes are O(1) instead of O(N).
+///
+/// Compare with `bench_insert_batch_transaction` (N separate SQL strings in
+/// one txn) to isolate the parse/analyze overhead per SQL string.
+fn bench_insert_multi_row(c: &mut Criterion) {
+    let sizes = [100u32, 1_000, 10_000];
+    let mut group = c.benchmark_group("insert_multi_row");
+
+    for &n in &sizes {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(
+            criterion::BenchmarkId::new("axiomdb_mmap_wal", n),
+            &n,
+            |b, &n| {
+                // Build the multi-row SQL once per benchmark (not included in timing).
+                let sql = {
+                    let mut s = String::from("INSERT INTO t VALUES ");
+                    for i in 1..=n {
+                        if i > 1 {
+                            s.push(',');
+                        }
+                        s.push_str(&format!("({i},'row{i}')"));
+                    }
+                    s
+                };
+
+                b.iter_batched(
+                    || {
+                        let mut db = Db::open();
+                        db.run("CREATE TABLE t (id INT NOT NULL, val TEXT)");
+                        db
+                    },
+                    |mut db| {
+                        // One parse + one analyze + one execute for all N rows.
+                        db.run(&sql);
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_select_full_scan(c: &mut Criterion) {
     let sizes = [100u32, 1_000, 10_000];
     let mut group = c.benchmark_group("select_full_scan");
@@ -410,6 +459,7 @@ criterion_group!(
     bench_insert_single,
     bench_insert_sequential,
     bench_insert_batch_txn,
+    bench_insert_multi_row,
     bench_insert_batch_memory,
     bench_insert_batch_cached,
     bench_select_full_scan,
