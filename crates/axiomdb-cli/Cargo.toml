@@ -1,0 +1,17 @@
+[package]
+name        = "axiomdb-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "axiomdb-cli"
+path = "src/main.rs"
+
+[dependencies]
+axiomdb-core    = { workspace = true }
+axiomdb-network = { path = "../axiomdb-network" }
+axiomdb-sql     = { path = "../axiomdb-sql" }
+axiomdb-types   = { path = "../axiomdb-types" }
+rustyline       = "14"

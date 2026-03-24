@@ -143,18 +143,18 @@
 - [x] 4.13 ✅ version() / current_user / session_user / current_database() — ORMs call these on connect; required for Phase 5 compatibility
 - [x] 4.14 ✅ LAST_INSERT_ID() / lastval() — AUTO_INCREMENT execution + per-table thread-local sequence; ColumnDef.auto_increment flag (bit1 of existing flags byte); LAST_INSERT_ID()/lastval() in eval_function
 - [x] 4.19 ✅ Basic built-in functions — `ABS`, `LENGTH`, `SUBSTR`, `UPPER`, `LOWER`, `TRIM`, `COALESCE`, `NOW()`, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `ROUND`, `FLOOR`, `CEIL`
-- [ ] 4.19b ⏳ BLOB functions — `FROM_BASE64(text)→BLOB` auto-decodes Base64 on insert (eliminates 33% overhead); `TO_BASE64(blob)→TEXT`; `OCTET_LENGTH(blob)→INT`; `ENCODE(blob,'hex'/'base64')→TEXT`; `DECODE(text,'hex'/'base64')→BLOB`; foundation for content-addressed storage in Phase 14
-- [ ] 4.19c ⏳ UUID generation functions — `gen_random_uuid()` returns UUID v4; `uuid_generate_v7()` returns UUID v7 (time-ordered, better for B+Tree index locality); `IS_VALID_UUID(text)→BOOL`; nearly every modern app uses UUIDs as primary keys and the DB must be able to generate them server-side without depending on application code
+- [x] 4.19b ✅ BLOB functions — `FROM_BASE64(text)→BLOB`, `TO_BASE64(blob)→TEXT`, `OCTET_LENGTH(value)→INT`, `ENCODE(blob,'base64'/'hex')→TEXT`, `DECODE(text,'base64'/'hex')→BLOB`; b64_encode/b64_decode/hex_encode/hex_decode helpers inline (no external crate)
+- [x] 4.19c ✅ UUID generation functions — `gen_random_uuid()`/`uuid_generate_v4()` (UUID v4 random); `uuid_generate_v7()`/`uuid7()` (UUID v7 time-ordered, better B+Tree locality); `is_valid_uuid(text)→BOOL`; `parse_uuid_str` helper; rand crate added to axiomdb-sql
 
 <!-- ── Group G — DevEx (parallel with E+F) ── -->
-- [ ] 4.15 ⏳ Interactive CLI — REPL like `sqlite3` shell; connects directly to storage
-- [ ] 4.15b ⏳ DEBUG/VERBOSE mode — `--verbose` flag: log AST, chosen plan, execution stats per query; critical for Phases 4–10 development
+- [x] 4.15 ✅ Interactive CLI — axiomdb-cli REPL: multi-line SQL, ASCII table formatter, .tables/.schema/.quit/.open/.help dot commands, TTY detection (no prompt in pipe mode), timing per query, pipe/script mode; new crate axiomdb-cli
+- [x] 4.15b ✅ CLI history + autocomplete — rustyline Editor with SqlHelper: ↑/↓ history, Ctrl-R reverse search, Tab SQL keyword completion, ~/.axiomdb_history persistence; Ctrl-C clears buffer; pipe mode reads all stdin then splits on ';'
 
 <!-- ── Group H — Introspection + DDL modification (needs executor) ── -->
 - [x] 4.20 ✅ SHOW TABLES / SHOW COLUMNS / DESCRIBE — parser + executor using CatalogReader; MySQL-compatible 6-column output; Extra shows auto_increment
 - [x] 4.21 ✅ TRUNCATE TABLE — delete-all + AUTO_INCREMENT sequence reset; MySQL convention (returns count=0)
 - [x] 4.22 ✅ Basic ALTER TABLE — `ADD COLUMN` (row rewrite + default), `DROP COLUMN` (row rewrite), `RENAME COLUMN`, `RENAME TO`; parser + CatalogWriter extensions; 15 integration tests; ColumnAlreadyExists (SQLSTATE 42701)
-- [ ] 4.22b ⏳ ALTER TABLE ADD/DROP CONSTRAINT — `ADD CONSTRAINT fk`, `DROP CONSTRAINT`, `ADD UNIQUE`, `ADD CHECK`; ORMs need this post-creation
+- [x] 4.22b ✅ ALTER TABLE ADD/DROP CONSTRAINT — parser handles ADD CONSTRAINT UNIQUE/CHECK, DROP CONSTRAINT [IF EXISTS]; UNIQUE→creates unique index; CHECK→persists in new axiom_constraints catalog table (4th system table, lazy-init); check_row_constraints() enforced on INSERT; expr_to_sql_string() for persistence; drop searches both axiom_indexes and axiom_constraints; FK/PK return NotImplemented
 
 <!-- ── Group I — Validation (last, closes the phase) ── -->
 - [x] 4.16 ✅ SQL full test suite — LIKE/BETWEEN/IN/IS NULL, CAST, scalar functions (ABS/LENGTH/UPPER/LOWER/TRIM/SUBSTR/ROUND/COALESCE/NOW), NULL semantics, string concat, arithmetic expressions, error cases (division by zero, InvalidCoercion); documents NOT NULL/UNIQUE/CHECK gaps; 1046 total tests
@@ -166,7 +166,7 @@
   - Remaining gap cause: per-row HeapChain::insert() + WalEntry serialization (~20µs/row)
   - Full scan: AxiomDB 501K/s vs MariaDB 213K/s → AxiomDB **2.4× faster** ✅
 - [x] 4.16c ✅ Multi-row INSERT optimization — insert_rows_batch() uses record_insert_batch() (3.17); bench_insert_multi_row/10K: 211K rows/s (1 SQL string) vs 35K rows/s (N strings) = 6× faster; AxiomDB 211K/s vs MariaDB ~140K/s = 1.5× faster in bulk INSERT
-- [ ] 4.16d ⏳ WAL record per page (like PostgreSQL COPY) — buffer N row inserts, emit 1 WAL entry per modified page (~200 rows/page) instead of 1 WAL entry per row; reduces WAL I/O from 10K writes to ~50 writes for 10K rows; implement in WalWriter as append_batch(); expected gain: ~3× on batch insert; see docs/perf-insert-analysis.md
+- [x] 4.16d ✅ WAL record per page — implemented in Phase 3.18 (EntryType::PageWrite=9); insert_rows_batch() emits 1 PageWrite per affected page; 238× fewer WAL entries for 10K-row insert; 30% smaller WAL; crash recovery parses slot_ids for undo
 
 ### Phase 5 — MySQL Wire Protocol `🔄` week 26-30
 - [x] 5.1 ✅ TCP listener with Tokio — accept connections on :3306; Arc<Mutex<Database>>; tokio::spawn per connection
@@ -188,8 +188,8 @@
 - [x] 5.11 ✅ COM_PING / COM_QUIT / COM_RESET_CONNECTION / COM_INIT_DB — all handled in handler.rs command loop (0x0e, 0x01, 0x1f, 0x02)
 - [ ] 5.11b ⏳ COM_STMT_SEND_LONG_DATA — chunked transmission of large parameters (BLOBs, TEXTs) in multiple packets; required for INSERT of images/documents via prepared statements
 - [ ] 5.11c ⏳ Explicit connection state machine — states: `CONNECTED→AUTH→IDLE→EXECUTING→CLOSING`; timeout handling per state; detect abruptly closed socket (TCP keepalive)
-- [ ] 5.12 ⏳ Multi-statement queries — respond to multiple SELECTs separated by `;` in a single COM_QUERY (PHP legacy, SQL scripts)
-- [ ] 5.13 ⏳ Prepared statement plan cache — cache compiled plan by statement_id; reuse without re-parsing on successive executions; subscribe to catalog change notifier (3.13) to invalidate automatically when schema changes; LRU eviction with configurable limit
+- [x] 5.12 ✅ Multi-statement queries — split_sql_statements() handles `;` with quoted-string awareness; COM_QUERY loop executes each stmt; SERVER_MORE_RESULTS_EXISTS (0x0008) flag in intermediate EOF/OK; serialize_query_result_multi(); build_eof_with_status()/build_ok_with_status()
+- [x] 5.13 ✅ Prepared statement plan cache — schema_version Arc<AtomicU64> in Database; compiled_at_version in PreparedStatement; lock-free version check on COM_STMT_EXECUTE; re-analyze on DDL mismatch; LRU eviction with max_prepared_stmts_per_connection (default 1024); 6 unit tests
 - [x] 5.14 ✅ Throughput benchmarks + perf fix — SELECT 185 q/s (3.3× vs 56 q/s antes); INSERT 58 q/s (fsync necesario); root cause: read-only txns hacían fsync innecesario; fix: flush_no_sync para undo_ops.is_empty()
 
 ### Phase 6 — Secondary indexes + FK `🔄` week 31-39
@@ -199,7 +199,7 @@
 - [x] 6.2b ✅ Index maintenance on INSERT/UPDATE/DELETE — secondary indexes kept in sync with heap; UNIQUE violation detection
 - [x] 6.3 ✅ Basic query planner — detects `WHERE col = literal` and `WHERE col > lo AND col < hi` on indexed columns; replaces full scan with B-Tree lookup/range
 - [ ] ⚠️ Composite index planner (> 1 column) — encoding supports it, planner deferred to 6.8
-- [ ] 6.4 ⏳ Bloom filter per index — avoid I/O for non-existent keys
+- [x] 6.4 ✅ Bloom filter per index — `BloomRegistry` per-DB; CREATE INDEX populates filter; INSERT adds keys; DELETE/UPDATE marks dirty; SELECT IndexLookup skips B-Tree on definite absence (1% FPR)
 - [ ] 6.5 ⏳ Foreign key checker — validation on INSERT/UPDATE with reverse index
 - [ ] 6.6 ⏳ ON DELETE CASCADE / RESTRICT / SET NULL
 - [ ] 6.7 ⏳ Partial UNIQUE index — `UNIQUE WHERE condition` for soft delete

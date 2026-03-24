@@ -10,7 +10,7 @@ pub mod coerce;
 pub mod types;
 pub mod value;
 
-pub use codec::{decode_row, encode_row, encoded_len};
+pub use codec::{decode_row, decode_row_masked, encode_row, encoded_len};
 pub use coerce::{coerce, coerce_for_op, CoercionMode};
 pub use types::DataType;
 pub use value::Value;

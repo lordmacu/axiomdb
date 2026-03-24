@@ -9,10 +9,43 @@ license.workspace = true
 name = "axiomdb-server"
 path = "src/main.rs"
 
+# ── Build profiles ─────────────────────────────────────────────────────────────
+#
+# server (default) — MySQL wire protocol server for web/cloud:
+#   cargo build -p axiomdb-server
+#   cargo build -p axiomdb-server --release
+#
+# embedded — engine only, no wire protocol, for desktop apps:
+#   cargo build -p axiomdb-server --no-default-features
+#
+# server-tls — wire protocol + TLS (future):
+#   cargo build -p axiomdb-server --features tls
+#
+# server-full — all optional extras (future):
+#   cargo build -p axiomdb-server --features full
+#
+[features]
+# Preset profiles
+default        = ["wire-protocol"]
+
+# ── Included in default ────────────────────────────────────────────────────────
+wire-protocol  = ["dep:axiomdb-network", "dep:tokio", "dep:tracing-subscriber"]
+
+# ── Future optional extras (uncomment when implemented) ───────────────────────
+# tls            = ["wire-protocol"]             # rustls — adds ~500 KB
+# metrics        = []                            # Prometheus endpoint
+# replication    = []                            # WAL streaming replication
+# full           = ["wire-protocol"]             # all stable extras
+
 [dependencies]
+# Always included — the database engine
 axiomdb-core       = { workspace = true }
-axiomdb-network    = { path = "../axiomdb-network" }
-thiserror          = { workspace = true }
-tokio              = { workspace = true }
-tracing            = { workspace = true }
-tracing-subscriber = { workspace = true }
+
+# Only when wire-protocol feature is enabled
+axiomdb-network    = { path = "../axiomdb-network", optional = true }
+tokio              = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+# Always included
+thiserror = { workspace = true }
+tracing   = { workspace = true }

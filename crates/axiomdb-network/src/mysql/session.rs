@@ -19,7 +19,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
     pub stmt_id: u32,
-    /// Original SQL with `?` placeholders (kept for fallback/debugging).
+    /// Original SQL with `?` placeholders (kept for fallback/re-analysis).
     pub sql_template: String,
     /// Number of `?` placeholders detected at prepare time.
     pub param_count: u16,
@@ -31,8 +31,17 @@ pub struct PreparedStatement {
     /// `parse()` + `analyze()` (~5ms overhead) — only `substitute_params_in_ast`
     /// (~1µs tree walk) + `execute_with_ctx()` are needed.
     ///
-    /// `None` until the first successful parse+analyze at prepare time.
+    /// Set to `None` when re-analysis fails after a schema change.
     pub analyzed_stmt: Option<axiomdb_sql::ast::Stmt>,
+    /// `Database::schema_version` snapshot at the last successful parse+analyze.
+    ///
+    /// If `compiled_at_version != current_schema_version`, the plan is stale
+    /// and must be re-analyzed before the next `COM_STMT_EXECUTE` (Phase 5.13).
+    pub compiled_at_version: u64,
+    /// Logical clock for LRU eviction. Updated to `ConnectionState::execute_seq`
+    /// on every `COM_STMT_EXECUTE`. The statement with the lowest value is
+    /// evicted when the per-connection cache reaches its limit.
+    pub last_used_seq: u64,
 }
 
 /// Counts unquoted `?` placeholders in a SQL string.
@@ -71,6 +80,12 @@ pub struct ConnectionState {
     pub prepared_statements: HashMap<u32, PreparedStatement>,
     /// Monotonically increasing statement ID (never 0).
     pub next_stmt_id: u32,
+    /// Maximum number of prepared statements to cache.
+    /// When full, the LRU statement is evicted on the next PREPARE.
+    pub max_prepared_stmts: usize,
+    /// Monotonically increasing counter incremented on every COM_STMT_EXECUTE.
+    /// Used as the `last_used_seq` for LRU eviction ordering.
+    execute_seq: u64,
 }
 
 impl Default for ConnectionState {
@@ -80,6 +95,14 @@ impl Default for ConnectionState {
 }
 
 impl ConnectionState {
+    /// Creates a connection state with MySQL-compatible defaults and the
+    /// given prepared-statement cache limit.
+    pub fn new_with_limit(max_prepared_stmts: usize) -> Self {
+        let mut s = Self::new();
+        s.max_prepared_stmts = max_prepared_stmts;
+        s
+    }
+
     /// Creates a connection state with MySQL-compatible defaults.
     pub fn new() -> Self {
         let mut variables = HashMap::new();
@@ -99,7 +122,18 @@ impl ConnectionState {
             variables,
             prepared_statements: HashMap::new(),
             next_stmt_id: 1,
+            max_prepared_stmts: 1024,
+            execute_seq: 0,
         }
+    }
+
+    /// Increments and returns the execute sequence counter.
+    ///
+    /// Called on every `COM_STMT_EXECUTE` to update `PreparedStatement::last_used_seq`
+    /// for LRU eviction ordering.
+    pub fn next_execute_seq(&mut self) -> u64 {
+        self.execute_seq += 1;
+        self.execute_seq
     }
 
     /// Applies a SET statement, updating the relevant session variable.
@@ -197,7 +231,26 @@ impl ConnectionState {
     }
 
     /// Registers a new prepared statement and returns `(stmt_id, param_count)`.
-    pub fn prepare_statement(&mut self, sql: String) -> (u32, u16) {
+    ///
+    /// `schema_version` is the current `Database::schema_version` snapshot,
+    /// stored as `compiled_at_version` so that `COM_STMT_EXECUTE` can detect
+    /// stale plans after DDL (Phase 5.13).
+    ///
+    /// If the cache is at `max_prepared_stmts` capacity, the least-recently-used
+    /// statement (lowest `last_used_seq`) is evicted before inserting the new one.
+    pub fn prepare_statement(&mut self, sql: String, schema_version: u64) -> (u32, u16) {
+        // LRU eviction when at capacity.
+        if self.prepared_statements.len() >= self.max_prepared_stmts {
+            if let Some(&lru_id) = self
+                .prepared_statements
+                .iter()
+                .min_by_key(|(_, ps)| ps.last_used_seq)
+                .map(|(id, _)| id)
+            {
+                self.prepared_statements.remove(&lru_id);
+            }
+        }
+
         let param_count = count_params(&sql);
         let stmt_id = self.next_stmt_id;
         // Advance, wrapping to 1 (never 0)
@@ -213,6 +266,8 @@ impl ConnectionState {
                 param_count,
                 param_types: vec![],
                 analyzed_stmt: None, // populated by handler after parse+analyze
+                compiled_at_version: schema_version,
+                last_used_seq: 0,
             },
         );
         (stmt_id, param_count)
@@ -266,5 +321,77 @@ mod tests {
     fn test_current_database_starts_empty() {
         let s = ConnectionState::new();
         assert!(s.current_database.is_empty());
+    }
+
+    // ── Phase 5.13: plan cache version + LRU tests ───────────────────────────
+
+    #[test]
+    fn test_prepare_statement_sets_compiled_at_version() {
+        let mut s = ConnectionState::new();
+        let (id, _) = s.prepare_statement("SELECT 1".into(), 42);
+        assert_eq!(s.prepared_statements[&id].compiled_at_version, 42);
+        assert_eq!(s.prepared_statements[&id].last_used_seq, 0);
+    }
+
+    #[test]
+    fn test_next_execute_seq_is_monotonic() {
+        let mut s = ConnectionState::new();
+        assert_eq!(s.next_execute_seq(), 1);
+        assert_eq!(s.next_execute_seq(), 2);
+        assert_eq!(s.next_execute_seq(), 3);
+    }
+
+    #[test]
+    fn test_lru_eviction_at_limit() {
+        let mut s = ConnectionState::new_with_limit(3);
+
+        let (id1, _) = s.prepare_statement("SELECT 1".into(), 0);
+        let (id2, _) = s.prepare_statement("SELECT 2".into(), 0);
+        let (id3, _) = s.prepare_statement("SELECT 3".into(), 0);
+
+        // Mark id2 as recently used (higher seq)
+        s.prepared_statements.get_mut(&id1).unwrap().last_used_seq = 1;
+        s.prepared_statements.get_mut(&id2).unwrap().last_used_seq = 3;
+        s.prepared_statements.get_mut(&id3).unwrap().last_used_seq = 2;
+
+        // Prepare a 4th statement — should evict id1 (seq=1, the lowest)
+        let (id4, _) = s.prepare_statement("SELECT 4".into(), 0);
+
+        assert!(
+            !s.prepared_statements.contains_key(&id1),
+            "id1 (LRU) should be evicted"
+        );
+        assert!(
+            s.prepared_statements.contains_key(&id2),
+            "id2 (MRU) should survive"
+        );
+        assert!(s.prepared_statements.contains_key(&id3));
+        assert!(s.prepared_statements.contains_key(&id4));
+        assert_eq!(s.prepared_statements.len(), 3);
+    }
+
+    #[test]
+    fn test_lru_no_eviction_below_limit() {
+        let mut s = ConnectionState::new_with_limit(5);
+        for i in 0..4 {
+            s.prepare_statement(format!("SELECT {i}"), 0);
+        }
+        assert_eq!(s.prepared_statements.len(), 4, "no eviction below limit");
+    }
+
+    #[test]
+    fn test_new_with_limit_sets_max() {
+        let s = ConnectionState::new_with_limit(32);
+        assert_eq!(s.max_prepared_stmts, 32);
+    }
+
+    #[test]
+    fn test_prepare_statement_new_fields_have_defaults() {
+        let mut s = ConnectionState::new();
+        let (id, _) = s.prepare_statement("SELECT ?".into(), 7);
+        let ps = &s.prepared_statements[&id];
+        assert_eq!(ps.compiled_at_version, 7);
+        assert_eq!(ps.last_used_seq, 0);
+        assert!(ps.analyzed_stmt.is_none());
     }
 }

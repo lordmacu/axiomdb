@@ -301,7 +301,7 @@ fn bound_table_ref(
     col_offset: &mut usize,
 ) -> Result<BoundTable, DbError> {
     let schema = table_ref.schema.as_deref().unwrap_or(default_schema);
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
 
     let table_def =
         reader
@@ -678,7 +678,7 @@ fn analyze_insert_cached(
         (td.clone(), cols)
     } else {
         // Cache miss: normal catalog lookup
-        let reader = CatalogReader::new(storage, snapshot)?;
+        let mut reader = CatalogReader::new(storage, snapshot)?;
         let td =
             reader
                 .get_table(schema, &s.table.name)?
@@ -839,7 +839,7 @@ fn analyze_insert(
     default_schema: &str,
 ) -> Result<InsertStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
 
     let table_def =
         reader
@@ -885,7 +885,7 @@ fn analyze_update(
     default_schema: &str,
 ) -> Result<UpdateStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
 
     let table_def =
         reader
@@ -939,7 +939,7 @@ fn analyze_delete(
     default_schema: &str,
 ) -> Result<DeleteStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
 
     let table_def =
         reader
@@ -971,7 +971,7 @@ fn analyze_create_table(
     snapshot: TransactionSnapshot,
     default_schema: &str,
 ) -> Result<CreateTableStmt, DbError> {
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
 
     // Validate FK REFERENCES targets.
     for col_def in &s.columns {
@@ -1024,7 +1024,7 @@ fn analyze_drop_table(
         return Ok(s); // IF EXISTS: no validation needed
     }
 
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
     for table_ref in &s.tables {
         let schema = table_ref.schema.as_deref().unwrap_or(default_schema);
         let exists = reader.get_table(schema, &table_ref.name)?.is_some();
@@ -1047,7 +1047,7 @@ fn analyze_create_index(
     default_schema: &str,
 ) -> Result<CreateIndexStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
 
     let table_def =
         reader
@@ -1084,7 +1084,7 @@ fn analyze_alter_table(
     default_schema: &str,
 ) -> Result<AlterTableStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
 
     // Validate the target table exists.
     reader

@@ -61,3 +61,6 @@ docs-site/book/
 studio/.next/
 studio/node_modules/
 studio/tsconfig.tsbuildinfo
+
+# Research — external source code (no commitear)
+research/

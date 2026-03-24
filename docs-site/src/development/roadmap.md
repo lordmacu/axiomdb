@@ -16,7 +16,7 @@ functionality. The design is organized in three blocks:
 
 **Last completed phase:** Phase 3 WAL (100%) — Group Commit, WAL batch append, PageWrite; Phases 4–6 in active development
 
-**Active development:** Phase 4 SQL (remaining: 4.19b BLOB, 4.19c UUID, 4.22b ALTER CONSTRAINT) · Phase 5 Wire Protocol (5.13 plan cache, 5.12 multi-stmt) · Phase 6 Indexes (6.4 bloom filter, 6.5/6.6 FK)
+**Active development:** Phase 6 Indexes (6.5 FK checker, 6.6 ON DELETE CASCADE, 6.7–6.15 planned)
 
 **Next milestone:** Phase 7 — full MVCC + concurrent writers (removes global mutex)
 

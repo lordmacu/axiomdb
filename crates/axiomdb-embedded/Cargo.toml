@@ -7,8 +7,62 @@ license.workspace = true
 
 [lib]
 name       = "axiomdb_embedded"
-crate-type = ["cdylib", "rlib"]
+# rlib:      use from Rust apps (cargo dependency)
+# cdylib:    C dynamic library (.so/.dll/.dylib) — Python, Swift, Kotlin, Unity
+# staticlib: C static library (.a) — iOS, embedded systems, Unity AOT
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+# ── Build profiles ─────────────────────────────────────────────────────────────
+#
+#  desktop (default) — Rust API + C FFI, synchronous, mmap storage:
+#    cargo build -p axiomdb-embedded
+#    cargo build -p axiomdb-embedded --release
+#    → libaxiomdb_embedded.{dylib,so,dll} + .a
+#
+#  async — tokio async API on top of desktop (for async Rust services):
+#    cargo build -p axiomdb-embedded --features async-api
+#
+#  wasm — WebAssembly, in-memory storage (future):
+#    cargo build -p axiomdb-embedded \
+#      --target wasm32-unknown-unknown --features wasm
+#
+# ── Optional extras (stack on any profile) ────────────────────────────────────
+#  + full-text:  full-text search (Phase 10)
+#  + vectors:    pgvector-style embeddings (Phase 14)
+#  + python:     Python bindings via PyO3 (future)
+#  + nodejs:     Node.js bindings via napi-rs (future)
+#
+[features]
+# ── Preset profiles ────────────────────────────────────────────────────────────
+default    = ["desktop"]
+
+desktop    = ["sync-api", "c-ffi"]         # mmap + sync Rust API + C exports
+async-api  = ["sync-api", "dep:tokio"]     # adds tokio async on top of sync-api
+wasm       = ["sync-api"]                  # future: MemoryStorage, no mmap
+
+# ── Internal building blocks ───────────────────────────────────────────────────
+sync-api   = [
+    "dep:axiomdb-core",
+    "dep:axiomdb-types",
+    "dep:axiomdb-storage",
+    "dep:axiomdb-wal",
+    "dep:axiomdb-catalog",
+    "dep:axiomdb-sql",
+]
+c-ffi      = ["sync-api"]   # enables #[no_mangle] C exports
+
+# ── Future optional extras ─────────────────────────────────────────────────────
+# full-text  = ["sync-api"]              # tokenizer + inverted index (Phase 10)
+# vectors    = ["sync-api"]              # HNSW + distance ops (Phase 14)
+# python     = ["sync-api"]              # PyO3 bindings
+# nodejs     = ["sync-api"]              # napi-rs bindings
 
 [dependencies]
-axiomdb-core = { workspace = true }
-thiserror    = { workspace = true }
+axiomdb-core    = { workspace = true, optional = true }
+axiomdb-types   = { workspace = true, optional = true }
+axiomdb-storage = { workspace = true, optional = true }
+axiomdb-wal     = { workspace = true, optional = true }
+axiomdb-catalog = { workspace = true, optional = true }
+axiomdb-sql     = { path = "../axiomdb-sql", optional = true }
+tokio           = { workspace = true, optional = true }
+thiserror       = { workspace = true }

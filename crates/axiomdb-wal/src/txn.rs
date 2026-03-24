@@ -23,9 +23,7 @@
 use std::path::Path;
 
 use axiomdb_core::{error::DbError, TransactionSnapshot, TxnId};
-use axiomdb_storage::{
-    clear_deletion, heap_chain::HeapChain, mark_slot_dead, Page, StorageEngine, PAGE_SIZE,
-};
+use axiomdb_storage::{clear_deletion, heap_chain::HeapChain, mark_slot_dead, Page, StorageEngine};
 
 use crate::{
     checkpoint::Checkpointer,
@@ -415,27 +413,33 @@ impl TxnManager {
         Ok(())
     }
 
-    /// Records N bulk-insert pages into the WAL as `PageWrite` entries (Phase 3.18).
+    /// Records N bulk-insert pages into the WAL as compact `PageWrite` entries.
     ///
-    /// Each element of `page_writes` is `(page_id, page_bytes, slot_ids)` where:
-    /// - `page_bytes` is the **post-modification** state of the page.
-    /// - `slot_ids` lists the slots inserted by this transaction on that page.
+    /// Each element of `page_writes` is `(page_id, slot_ids)` where `slot_ids`
+    /// lists the slots inserted by this transaction on that page.
     ///
-    /// Emits one `PageWrite` WAL entry per page, using `reserve_lsns + write_batch`
-    /// for O(1) BufWriter calls. The entries replace N individual `Insert` entries,
-    /// reducing WAL CPU work from O(N rows) to O(P pages) — typically 200-500× fewer
-    /// serializations for bulk inserts.
+    /// ## Compact WAL format
     ///
-    /// The `new_value` format encodes `page_bytes || num_slots (u16 LE) || slot_ids`
-    /// so crash recovery can undo uncommitted `PageWrite` entries by marking each
-    /// slot dead — identical in effect to undoing N `Insert` entries.
+    /// `new_value = [num_slots: u16 LE][slot_id × num_slots: u16 LE each]`
+    ///
+    /// No page bytes are stored — crash recovery only needs the slot IDs to mark
+    /// inserted slots dead on undo. Eliminating the 16 KB page image reduces WAL
+    /// size from ~820 KB to ~20 KB per 10K-row batch (40× reduction).
+    ///
+    /// Inspired by MariaDB's InnoDB redo log (logical delta) and OceanBase's
+    /// `ObDASWriteBuffer` (row-level buffering, not page-level snapshot).
+    ///
+    /// ## WAL ordering
+    ///
+    /// Uses `reserve_lsns + write_batch` for O(1) BufWriter calls — same
+    /// pattern as `record_insert_batch`.
     ///
     /// # Errors
     /// - [`DbError::NoActiveTransaction`] if called outside a transaction.
     pub fn record_page_writes(
         &mut self,
         table_id: u32,
-        page_writes: &[(u64, &[u8; PAGE_SIZE], &[u16])],
+        page_writes: &[(u64, &[u16])], // (page_id, slot_ids)
     ) -> Result<(), DbError> {
         let n = page_writes.len();
         if n == 0 {
@@ -448,12 +452,12 @@ impl TxnManager {
         let lsn_base = self.wal.reserve_lsns(n);
         self.wal_scratch.clear();
 
-        for (i, (page_id, page_bytes, slot_ids)) in page_writes.iter().enumerate() {
+        for (i, (page_id, slot_ids)) in page_writes.iter().enumerate() {
             let key = page_id.to_le_bytes();
 
-            // new_value: [page_bytes: PAGE_SIZE][num_slots: u16 LE][slot_id × N: u16 LE]
-            let mut new_value = Vec::with_capacity(PAGE_SIZE + 2 + slot_ids.len() * 2);
-            new_value.extend_from_slice(page_bytes.as_slice());
+            // Compact new_value: [num_slots: u16 LE][slot_id × N: u16 LE]
+            // No page bytes — crash recovery only needs slot IDs for undo.
+            let mut new_value = Vec::with_capacity(2 + slot_ids.len() * 2);
             new_value.extend_from_slice(&(slot_ids.len() as u16).to_le_bytes());
             for &slot_id in slot_ids.iter() {
                 new_value.extend_from_slice(&slot_id.to_le_bytes());
@@ -474,7 +478,7 @@ impl TxnManager {
         self.wal.write_batch(&self.wal_scratch)?;
 
         // Enqueue in-memory undo ops (used by ROLLBACK and group commit mode).
-        for (page_id, _page_bytes, slot_ids) in page_writes {
+        for (page_id, slot_ids) in page_writes {
             for &slot_id in slot_ids.iter() {
                 active.undo_ops.push(UndoOp::UndoInsert {
                     page_id: *page_id,
@@ -1178,8 +1182,8 @@ mod tests {
         // Txn 2: delete_batch + record_truncate (simulates no-WHERE DELETE).
         let txn2 = mgr.begin().unwrap();
         let snap = mgr.active_snapshot().unwrap();
-        let raw_rids = HeapChain::scan_rids_visible(&storage, root_page_id, snap).unwrap();
-        HeapChain::delete_batch(&mut storage, &raw_rids, txn2).unwrap();
+        let raw_rids = HeapChain::scan_rids_visible(&mut storage, root_page_id, snap).unwrap();
+        HeapChain::delete_batch(&mut storage, root_page_id, &raw_rids, txn2).unwrap();
         mgr.record_truncate(1, root_page_id).unwrap();
         mgr.commit().unwrap();
 
@@ -1234,21 +1238,21 @@ mod tests {
         // Verify 5 rows visible after txn1 commit.
         let snap_after_insert = TransactionSnapshot::committed(mgr.max_committed());
         let before =
-            HeapChain::scan_rids_visible(&storage, root_page_id, snap_after_insert).unwrap();
+            HeapChain::scan_rids_visible(&mut storage, root_page_id, snap_after_insert).unwrap();
         assert_eq!(before.len(), 5, "5 rows must be visible before truncate");
 
         // Txn 2: delete_batch + record_truncate, then ROLLBACK.
         let txn2 = mgr.begin().unwrap();
         let snap2 = mgr.active_snapshot().unwrap();
-        let raw_rids = HeapChain::scan_rids_visible(&storage, root_page_id, snap2).unwrap();
-        HeapChain::delete_batch(&mut storage, &raw_rids, txn2).unwrap();
+        let raw_rids = HeapChain::scan_rids_visible(&mut storage, root_page_id, snap2).unwrap();
+        HeapChain::delete_batch(&mut storage, root_page_id, &raw_rids, txn2).unwrap();
         mgr.record_truncate(1, root_page_id).unwrap();
         mgr.rollback(&mut storage).unwrap();
 
         // After rollback: all 5 rows must be visible again.
         let snap_after_rollback = TransactionSnapshot::committed(mgr.max_committed());
         let after =
-            HeapChain::scan_rids_visible(&storage, root_page_id, snap_after_rollback).unwrap();
+            HeapChain::scan_rids_visible(&mut storage, root_page_id, snap_after_rollback).unwrap();
         assert_eq!(
             after.len(),
             5,

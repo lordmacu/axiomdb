@@ -25,9 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use axiomdb_core::{error::DbError, TxnId};
-use axiomdb_storage::{
-    clear_deletion, heap_chain::HeapChain, mark_slot_dead, Page, StorageEngine, PAGE_SIZE,
-};
+use axiomdb_storage::{clear_deletion, heap_chain::HeapChain, mark_slot_dead, Page, StorageEngine};
 
 use crate::{
     checkpoint::Checkpointer, entry::EntryType, reader::WalReader, txn::decode_physical_loc,
@@ -193,10 +191,9 @@ impl CrashRecovery {
                 }
                 EntryType::Checkpoint => {} // no heap changes to undo
                 EntryType::PageWrite => {
-                    // new_value layout:
-                    //   [0..PAGE_SIZE]         post-modification page bytes (for future REDO)
-                    //   [PAGE_SIZE..+2]        num_slots as u16 LE
-                    //   [+2..+2+num_slots*2]   slot_id × num_slots as u16 LE
+                    // Compact new_value layout (no page bytes stored):
+                    //   [0..2]           num_slots as u16 LE
+                    //   [2..2+N*2]       slot_id × N as u16 LE each
                     //
                     // For an uncommitted PageWrite we undo at slot granularity:
                     // mark each embedded slot dead, identical to undoing N Insert entries.
@@ -209,13 +206,12 @@ impl CrashRecovery {
                             u64::from_le_bytes(entry.key[..8].try_into().unwrap_or([0u8; 8]));
 
                         let nv = &entry.new_value;
-                        if nv.len() < PAGE_SIZE + 2 {
+                        if nv.len() < 2 {
                             continue; // truncated entry — skip gracefully
                         }
-                        let num_slots =
-                            u16::from_le_bytes([nv[PAGE_SIZE], nv[PAGE_SIZE + 1]]) as usize;
+                        let num_slots = u16::from_le_bytes([nv[0], nv[1]]) as usize;
 
-                        let slots_bytes = &nv[PAGE_SIZE + 2..];
+                        let slots_bytes = &nv[2..];
                         for i in 0..num_slots {
                             let off = i * 2;
                             if off + 2 > slots_bytes.len() {
@@ -688,8 +684,8 @@ mod tests {
         // Txn 2: delete_batch + record_truncate — then CRASH (no commit).
         let txn2 = mgr.begin().unwrap();
         let snap = mgr.active_snapshot().unwrap();
-        let raw_rids = HeapChain::scan_rids_visible(&storage, root_page_id, snap).unwrap();
-        HeapChain::delete_batch(&mut storage, &raw_rids, txn2).unwrap();
+        let raw_rids = HeapChain::scan_rids_visible(&mut storage, root_page_id, snap).unwrap();
+        HeapChain::delete_batch(&mut storage, root_page_id, &raw_rids, txn2).unwrap();
         mgr.record_truncate(1, root_page_id).unwrap();
         // Flush WAL buffer to disk (simulate kernel flush on crash).
         mgr.wal_mut().flush_buffer().unwrap();
@@ -701,7 +697,7 @@ mod tests {
 
         // After recovery: all 5 rows must be visible to a committed snapshot.
         let snap_after = TransactionSnapshot::committed(result.max_committed);
-        let visible = HeapChain::scan_rids_visible(&storage, root_page_id, snap_after).unwrap();
+        let visible = HeapChain::scan_rids_visible(&mut storage, root_page_id, snap_after).unwrap();
         assert_eq!(
             visible.len(),
             5,

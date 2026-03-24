@@ -1,9 +1,10 @@
 //! Catalog schema types and their binary serialization.
 //!
-//! These types represent rows in the three system tables:
-//! - `axiom_tables`  → [`TableDef`]
-//! - `axiom_columns` → [`ColumnDef`]
-//! - `axiom_indexes` → [`IndexDef`]
+//! These types represent rows in the four system tables:
+//! - `axiom_tables`      → [`TableDef`]
+//! - `axiom_columns`     → [`ColumnDef`]
+//! - `axiom_indexes`     → [`IndexDef`]
+//! - `axiom_constraints` → [`ConstraintDef`] (Phase 4.22b)
 //!
 //! ## Binary row format
 //!
@@ -434,6 +435,91 @@ impl IndexDef {
                 columns,
             },
             consumed,
+        ))
+    }
+}
+
+// ── ConstraintDef ─────────────────────────────────────────────────────────────
+
+/// A row in `axiom_constraints` — a named constraint persisted in the catalog.
+///
+/// Currently used for CHECK constraints added via `ALTER TABLE ADD CONSTRAINT`.
+/// UNIQUE constraints are stored as indexes in `axiom_indexes` instead.
+///
+/// ## Binary row format
+///
+/// ```text
+/// [constraint_id: u32 LE][table_id: u32 LE]
+/// [name_len: u32 LE][name: utf-8 bytes]
+/// [expr_len: u32 LE][check_expr: utf-8 bytes]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintDef {
+    /// Catalog-allocated monotonic ID.
+    pub constraint_id: u32,
+    /// Table this constraint belongs to.
+    pub table_id: u32,
+    /// Constraint name (required — anonymous constraints not supported in ALTER TABLE).
+    pub name: String,
+    /// SQL expression string for CHECK constraints. Empty for future types.
+    pub check_expr: String,
+}
+
+impl ConstraintDef {
+    /// Serializes this definition to bytes for heap storage.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let name_bytes = self.name.as_bytes();
+        let expr_bytes = self.check_expr.as_bytes();
+        let mut buf = Vec::with_capacity(4 + 4 + 4 + name_bytes.len() + 4 + expr_bytes.len());
+        buf.extend_from_slice(&self.constraint_id.to_le_bytes());
+        buf.extend_from_slice(&self.table_id.to_le_bytes());
+        buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(name_bytes);
+        buf.extend_from_slice(&(expr_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(expr_bytes);
+        buf
+    }
+
+    /// Deserializes a `ConstraintDef` from a byte slice.
+    ///
+    /// Returns `(def, bytes_consumed)`.
+    pub fn from_bytes(data: &[u8]) -> Result<(Self, usize), DbError> {
+        if data.len() < 8 {
+            return Err(DbError::ParseError {
+                message: "ConstraintDef row too short".into(),
+            });
+        }
+        let constraint_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let table_id = u32::from_le_bytes(data[4..8].try_into().unwrap());
+
+        let mut pos = 8usize;
+
+        let name_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        let name = String::from_utf8(data[pos..pos + name_len].to_vec()).map_err(|e| {
+            DbError::ParseError {
+                message: format!("ConstraintDef name not valid UTF-8: {e}"),
+            }
+        })?;
+        pos += name_len;
+
+        let expr_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        let check_expr = String::from_utf8(data[pos..pos + expr_len].to_vec()).map_err(|e| {
+            DbError::ParseError {
+                message: format!("ConstraintDef check_expr not valid UTF-8: {e}"),
+            }
+        })?;
+        pos += expr_len;
+
+        Ok((
+            Self {
+                constraint_id,
+                table_id,
+                name,
+                check_expr,
+            },
+            pos,
         ))
     }
 }

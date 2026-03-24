@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use axiomdb_catalog::CatalogBootstrap;
 use axiomdb_sql::{
-    analyze, analyze_cached, execute, execute_with_ctx, parse, QueryResult, SchemaCache,
-    SessionContext,
+    analyze, analyze_cached, bloom::BloomRegistry, execute, execute_with_ctx, parse, QueryResult,
+    SchemaCache, SessionContext,
 };
 use axiomdb_storage::MmapStorage;
 use axiomdb_wal::TxnManager;
@@ -25,6 +25,7 @@ const RUNS: usize = 5;
 struct Db {
     storage: MmapStorage,
     txn: TxnManager,
+    bloom: BloomRegistry,
 }
 
 impl Db {
@@ -51,7 +52,11 @@ impl Db {
             t
         };
 
-        Self { storage, txn }
+        Self {
+            storage,
+            txn,
+            bloom: BloomRegistry::new(),
+        }
     }
 
     fn sql(&mut self, q: &str) -> QueryResult {
@@ -85,8 +90,14 @@ impl Db {
             .unwrap_or_else(|_| self.txn.snapshot());
         let analyzed = analyze_cached(stmt, &self.storage, snap, schema_cache)
             .unwrap_or_else(|e| panic!("analyze_cached({q}): {e}"));
-        execute_with_ctx(analyzed, &mut self.storage, &mut self.txn, ctx)
-            .unwrap_or_else(|e| panic!("execute_with_ctx({q}): {e}"))
+        execute_with_ctx(
+            analyzed,
+            &mut self.storage,
+            &mut self.txn,
+            &mut self.bloom,
+            ctx,
+        )
+        .unwrap_or_else(|e| panic!("execute_with_ctx({q}): {e}"))
     }
 
     fn sql_count(&mut self, q: &str) -> usize {
