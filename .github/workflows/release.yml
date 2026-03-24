@@ -23,15 +23,15 @@ jobs:
             artifact: axiomdb-server-linux-x86_64
             use_zigbuild: true
 
-          # macOS — Apple Silicon
+          # macOS — Apple Silicon (native)
           - target: aarch64-apple-darwin
             runner: macos-latest
             artifact: axiomdb-server-macos-aarch64
             use_zigbuild: false
 
-          # macOS — Intel
+          # macOS — Intel (cross-compiled from arm64, Xcode SDK included)
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-latest
             artifact: axiomdb-server-macos-x86_64
             use_zigbuild: false
 
