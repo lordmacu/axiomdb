@@ -432,8 +432,53 @@ fn execute_select_ctx(
         )?;
 
         let snap = txn.active_snapshot()?;
+
+        // Build column mask for lazy decode: only decode columns referenced in
+        // SELECT list, WHERE, ORDER BY, GROUP BY, HAVING. SELECT * passes None.
+        let n_cols = resolved.columns.len();
+        let has_wildcard = stmt.columns.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_)
+            )
+        });
+        let column_mask: Option<Vec<bool>> = if has_wildcard || n_cols == 0 {
+            None
+        } else {
+            let mut expr_ptrs: Vec<&Expr> = Vec::new();
+            for item in &stmt.columns {
+                if let SelectItem::Expr { expr, .. } = item {
+                    expr_ptrs.push(expr);
+                }
+            }
+            if let Some(ref wc) = stmt.where_clause {
+                expr_ptrs.push(wc);
+            }
+            for ob in &stmt.order_by {
+                expr_ptrs.push(&ob.expr);
+            }
+            for gb in &stmt.group_by {
+                expr_ptrs.push(gb);
+            }
+            if let Some(ref hav) = stmt.having {
+                expr_ptrs.push(hav);
+            }
+            let mask = build_column_mask(n_cols, &expr_ptrs);
+            if mask.iter().all(|&b| b) {
+                None
+            } else {
+                Some(mask)
+            }
+        };
+
         // scan_table returns owned Vec — storage is free after this call.
-        let raw_rows = TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?;
+        let raw_rows = TableEngine::scan_table(
+            storage,
+            &resolved.def,
+            &resolved.columns,
+            snap,
+            column_mask.as_deref(),
+        )?;
 
         let mut combined_rows: Vec<Row> = Vec::new();
         for (_rid, values) in raw_rows {
@@ -535,7 +580,7 @@ fn execute_select_with_joins_ctx(
     let snap = txn.active_snapshot()?;
     let mut scanned: Vec<Vec<Row>> = Vec::with_capacity(all_resolved.len());
     for t in &all_resolved {
-        let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap)?;
+        let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap, None)?;
         scanned.push(rows.into_iter().map(|(_, r)| r).collect());
     }
 
@@ -666,7 +711,7 @@ fn execute_insert_ctx(
             return Ok(next);
         }
         let snap = txn.active_snapshot()?;
-        let rows = TableEngine::scan_table(storage, table_def, schema_cols, snap)?;
+        let rows = TableEngine::scan_table(storage, table_def, schema_cols, snap, None)?;
         let max_existing: u64 = rows
             .iter()
             .filter_map(|(_, vals)| vals.get(col_idx))
@@ -806,7 +851,7 @@ fn execute_update_ctx(
         .collect::<Result<_, DbError>>()?;
 
     let snap = txn.active_snapshot()?;
-    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
+    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?;
 
     let mut count = 0u64;
     for (rid, current_values) in rows {
@@ -869,8 +914,28 @@ fn execute_delete_ctx(
     }
 
     // WHERE clause path: need decoded row values to evaluate the predicate.
+    // Build a column mask so only WHERE-referenced columns are decoded.
     let schema_cols = resolved.columns.clone();
-    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
+    let n_cols = schema_cols.len();
+    let column_mask: Option<Vec<bool>> = stmt
+        .where_clause
+        .as_ref()
+        .map(|wc| {
+            let mask = build_column_mask(n_cols, &[wc]);
+            if mask.iter().all(|&b| b) {
+                vec![]
+            } else {
+                mask
+            }
+        })
+        .filter(|m| !m.is_empty());
+    let rows = TableEngine::scan_table(
+        storage,
+        &resolved.def,
+        &schema_cols,
+        snap,
+        column_mask.as_deref(),
+    )?;
     let to_delete: Vec<RecordId> = rows
         .into_iter()
         .filter_map(|(rid, values)| match &stmt.where_clause {
@@ -890,6 +955,90 @@ fn execute_delete_ctx(
         count,
         last_insert_id: None,
     })
+}
+
+// ── Column mask for lazy decode ───────────────────────────────────────────────
+
+/// Builds a boolean mask over `n_cols` columns. `mask[i]` is `true` if column
+/// `i` is referenced by any expression in `exprs`. Used by `execute_select_ctx`
+/// and `execute_delete_ctx` to tell `scan_table` which columns to decode.
+///
+/// Conservative: any [`SelectItem::Wildcard`] or [`SelectItem::QualifiedWildcard`]
+/// in the query's SELECT list will cause the caller to pass `None` instead (full
+/// decode), so this function is only called when the select list is fully
+/// resolved to column expressions.
+fn build_column_mask(n_cols: usize, exprs: &[&Expr]) -> Vec<bool> {
+    let mut mask = vec![false; n_cols];
+    for expr in exprs {
+        collect_column_refs(expr, &mut mask);
+    }
+    mask
+}
+
+/// Walks `expr` and marks every referenced local column index in `mask`.
+///
+/// Does **not** recurse into subquery bodies (`Subquery`, `InSubquery`,
+/// `Exists`) — those reference an inner scope with a different row layout.
+/// [`OuterColumn`] references point to an enclosing scope, not this row.
+fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
+    match expr {
+        Expr::Column { col_idx, .. } => {
+            if *col_idx < mask.len() {
+                mask[*col_idx] = true;
+            }
+        }
+        Expr::Literal(_) | Expr::OuterColumn { .. } | Expr::Param { .. } => {}
+        Expr::UnaryOp { operand, .. } => collect_column_refs(operand, mask),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_column_refs(left, mask);
+            collect_column_refs(right, mask);
+        }
+        Expr::IsNull { expr, .. } => collect_column_refs(expr, mask),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_column_refs(expr, mask);
+            collect_column_refs(low, mask);
+            collect_column_refs(high, mask);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_column_refs(expr, mask);
+            collect_column_refs(pattern, mask);
+        }
+        Expr::In { expr, list, .. } => {
+            collect_column_refs(expr, mask);
+            for e in list {
+                collect_column_refs(e, mask);
+            }
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_column_refs(a, mask);
+            }
+        }
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_column_refs(op, mask);
+            }
+            for (w, t) in when_thens {
+                collect_column_refs(w, mask);
+                collect_column_refs(t, mask);
+            }
+            if let Some(e) = else_result {
+                collect_column_refs(e, mask);
+            }
+        }
+        Expr::Cast { expr, .. } => collect_column_refs(expr, mask),
+        // InSubquery: recurse only on the outer expression, not the inner query.
+        Expr::InSubquery { expr, .. } => collect_column_refs(expr, mask),
+        // Subquery and Exists reference inner scopes — do not recurse.
+        Expr::Subquery(_) | Expr::Exists { .. } => {}
+    }
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────────────
@@ -1016,7 +1165,7 @@ fn execute_select(
         let raw_rows: Vec<(RecordId, Vec<Value>)> = match &access_method {
             crate::planner::AccessMethod::Scan => {
                 // Full sequential scan — existing behavior.
-                TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?
+                TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap, None)?
             }
             crate::planner::AccessMethod::IndexLookup { index_def, key } => {
                 // Point lookup: B-Tree → single RecordId → heap read.
@@ -1218,7 +1367,7 @@ fn execute_select_with_joins(
     let snap = txn.active_snapshot()?;
     let mut scanned: Vec<Vec<Row>> = Vec::with_capacity(all_resolved.len());
     for t in &all_resolved {
-        let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap)?;
+        let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap, None)?;
         scanned.push(rows.into_iter().map(|(_, r)| r).collect());
     }
 
@@ -2469,7 +2618,7 @@ fn execute_insert(
         }
         // First use: scan the table to find MAX of the auto-increment column.
         let snap = txn.active_snapshot()?;
-        let rows = TableEngine::scan_table(storage, table_def, schema_cols, snap)?;
+        let rows = TableEngine::scan_table(storage, table_def, schema_cols, snap, None)?;
         let max_existing: u64 = rows
             .iter()
             .filter_map(|(_, vals)| vals.get(col_idx))
@@ -2707,7 +2856,7 @@ fn execute_update(
         .collect::<Result<_, DbError>>()?;
 
     let snap = txn.active_snapshot()?;
-    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
+    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?;
 
     // Use the already-loaded indexes from the resolved table (cached by SchemaCache).
     let mut secondary_indexes: Vec<IndexDef> = resolved
@@ -2819,7 +2968,7 @@ fn execute_delete(
     }
 
     let schema_cols = resolved.columns.clone();
-    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
+    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?;
 
     // Collect all matching (rid, row_values) BEFORE deleting any row.
     let to_delete: Vec<(RecordId, Vec<Value>)> = rows
@@ -3004,7 +3153,7 @@ fn execute_create_index(
     let root_pid = AtomicU64::new(root_page_id);
 
     // 5. Scan the table and insert existing rows into the B-Tree.
-    let rows = TableEngine::scan_table(storage, &table_def, &col_defs, snap)?;
+    let rows = TableEngine::scan_table(storage, &table_def, &col_defs, snap, None)?;
     let mut skipped = 0usize;
     for (rid, row_vals) in rows {
         let key_vals: Vec<Value> = index_columns
@@ -3275,7 +3424,7 @@ fn rewrite_rows(
     transform: &dyn Fn(Row) -> Row,
 ) -> Result<(), DbError> {
     let snap = txn.active_snapshot()?;
-    let rows = TableEngine::scan_table(storage, table_def, old_columns, snap)?;
+    let rows = TableEngine::scan_table(storage, table_def, old_columns, snap, None)?;
     for (rid, old_values) in rows {
         let new_values = transform(old_values);
         TableEngine::delete_row(storage, txn, table_def, rid)?;

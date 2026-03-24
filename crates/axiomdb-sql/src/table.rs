@@ -52,7 +52,7 @@ use axiomdb_catalog::schema::{ColumnDef, ColumnType, TableDef};
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
 use axiomdb_storage::{HeapChain, StorageEngine, PAGE_SIZE};
 use axiomdb_types::{
-    codec::{decode_row, encode_row},
+    codec::{decode_row, decode_row_masked, encode_row},
     coerce::{coerce, CoercionMode},
     DataType, Value,
 };
@@ -79,18 +79,38 @@ impl TableEngine {
     /// # Errors
     /// - [`DbError::ParseError`] — a stored row is structurally invalid (corruption).
     /// - I/O errors from storage reads.
+    /// Scans all visible rows in the table and decodes them.
+    ///
+    /// `column_mask` controls which columns are decoded:
+    /// - `None` — decode all columns (default, same as before).
+    /// - `Some(mask)` — decode only columns where `mask[i]` is `true`; skipped
+    ///   columns have `Value::Null` in the output. This eliminates allocation and
+    ///   parsing cost for columns not referenced by the query (lazy column decode).
+    ///
+    /// When `mask` is all-`true`, [`decode_row`] is used directly so there is no
+    /// overhead compared to passing `None`.
     pub fn scan_table(
         storage: &mut dyn StorageEngine,
         table_def: &TableDef,
         columns: &[ColumnDef],
         snap: TransactionSnapshot,
+        column_mask: Option<&[bool]>,
     ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
         let col_types = column_data_types(columns);
         let raw_rows = HeapChain::scan_visible(storage, table_def.data_root_page_id, snap)?;
 
         let mut result = Vec::with_capacity(raw_rows.len());
         for (page_id, slot_id, bytes) in raw_rows {
-            let values = decode_row(&bytes, &col_types)?;
+            let values = match column_mask {
+                None => decode_row(&bytes, &col_types)?,
+                Some(mask) => {
+                    if mask.iter().all(|&b| b) {
+                        decode_row(&bytes, &col_types)?
+                    } else {
+                        decode_row_masked(&bytes, &col_types, mask)?
+                    }
+                }
+            };
             result.push((RecordId { page_id, slot_id }, values));
         }
         Ok(result)

@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
 AxiomDB vs MySQL 8.0 vs PostgreSQL 16 — comparison benchmark.
+All engines run locally (no Docker).
+
+Ports:
+  MySQL 8.0     :3310  root/bench   (brew install mysql@8.0)
+  PostgreSQL 16 :5433  postgres/bench (brew install postgresql@16)
+  AxiomDB       :3311  root/bench   (axiomdb-server --port 3311)
 
 Usage:
   python3 bench_runner.py              # MySQL + PostgreSQL
   python3 bench_runner.py --rows 50000
-  python3 bench_runner.py --all        # + AxiomDB (Phase 8+)
+  python3 bench_runner.py --all        # + AxiomDB
 
 Prerequisites:
   pip3 install pymysql psycopg2-binary
-  ./setup.sh
 """
 
 import argparse, statistics, sys, time
@@ -208,7 +213,7 @@ def run(n_rows, include_axiomdb):
     def bench(name, fns, n_ops=None):
         print_row(name, [measure(fn) for fn in fns], n_ops or n_rows)
 
-    print(f"\n  {n_rows:,} rows | {RUNS} runs + {WARMUP} warmup | fsync ON | Docker 2CPU/2GB")
+    print(f"\n  {n_rows:,} rows | {RUNS} runs + {WARMUP} warmup | fsync ON | native local")
     print_header(engines)
 
     # ── INSERT batch ─────────────────────────────────────────────────────────
