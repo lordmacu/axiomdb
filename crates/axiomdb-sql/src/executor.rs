@@ -760,6 +760,13 @@ fn execute_insert_ctx(
                     }
                 }
 
+                // Evaluate active CHECK constraints from axiom_constraints.
+                check_row_constraints(
+                    &resolved.constraints,
+                    &full_values,
+                    &resolved.def.table_name,
+                )?;
+
                 TableEngine::insert_row(storage, txn, &resolved.def, schema_cols, full_values)?;
                 count += 1;
             }
@@ -3496,9 +3503,15 @@ fn execute_alter_table(
                 // for simplicity, only one op per statement is expected for RENAME TO.
                 break;
             }
+            AlterTableOp::AddConstraint(tc) => {
+                alter_add_constraint(storage, txn, &table_def, &columns, tc, schema)?;
+            }
+            AlterTableOp::DropConstraint { name, if_exists } => {
+                alter_drop_constraint(storage, txn, &table_def, &name, if_exists)?;
+            }
             _ => {
                 return Err(DbError::NotImplemented {
-                    feature: "ALTER TABLE MODIFY COLUMN / ADD CONSTRAINT — Phase N".into(),
+                    feature: "ALTER TABLE MODIFY COLUMN — Phase N".into(),
                 })
             }
         }
@@ -3691,6 +3704,247 @@ fn alter_rename_table(
 
     CatalogWriter::new(storage, txn)?.rename_table(table_def.id, new_name.to_string(), schema)?;
     Ok(())
+}
+
+// ── CHECK constraint enforcement (Phase 4.22b) ────────────────────────────────
+
+/// Evaluates active CHECK constraints for a row about to be inserted/updated.
+fn check_row_constraints(
+    constraints: &[axiomdb_catalog::schema::ConstraintDef],
+    row_values: &[Value],
+    table_name: &str,
+) -> Result<(), DbError> {
+    for c in constraints {
+        if c.check_expr.is_empty() {
+            continue;
+        }
+        let expr = match crate::parser::parse_expr_only(&c.check_expr) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let result = eval(&expr, row_values)?;
+        if !crate::eval::is_truthy(&result) {
+            return Err(DbError::CheckViolation {
+                table: table_name.to_string(),
+                constraint: c.name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+// ── ALTER TABLE constraint helpers (Phase 4.22b) ──────────────────────────────
+
+fn alter_add_constraint(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_def: &axiomdb_catalog::ResolvedTable,
+    columns: &[axiomdb_catalog::schema::ColumnDef],
+    tc: crate::ast::TableConstraint,
+    schema: &str,
+) -> Result<(), DbError> {
+    use crate::ast::TableConstraint;
+    use axiomdb_catalog::schema::ConstraintDef;
+
+    match tc {
+        TableConstraint::Unique {
+            name,
+            columns: col_names,
+        } => {
+            // ADD CONSTRAINT name UNIQUE (cols) → create a unique index named `name`.
+            let idx_name = name.unwrap_or_else(|| {
+                format!(
+                    "axiom_uq_{}_{}",
+                    table_def.def.table_name,
+                    col_names.join("_")
+                )
+            });
+            let stmt = crate::ast::CreateIndexStmt {
+                name: idx_name,
+                table: crate::ast::TableRef {
+                    schema: Some(schema.to_string()),
+                    name: table_def.def.table_name.clone(),
+                    alias: None,
+                },
+                columns: col_names
+                    .into_iter()
+                    .map(|c| crate::ast::IndexColumn {
+                        name: c,
+                        order: crate::ast::SortOrder::Asc,
+                    })
+                    .collect(),
+                unique: true,
+                if_not_exists: false,
+            };
+            execute_create_index(stmt, storage, txn)?;
+            Ok(())
+        }
+
+        TableConstraint::Check { name, expr } => {
+            let cname = name.ok_or_else(|| DbError::ParseError {
+                message: "ADD CONSTRAINT CHECK requires an explicit constraint name".into(),
+            })?;
+
+            // Check for duplicate constraint name.
+            let snap = txn.active_snapshot()?;
+            {
+                let mut reader = CatalogReader::new(storage, snap)?;
+                if reader
+                    .get_constraint_by_name(table_def.def.id, &cname)?
+                    .is_some()
+                {
+                    return Err(DbError::Other(format!(
+                        "constraint '{cname}' already exists on table '{}'",
+                        table_def.def.table_name
+                    )));
+                }
+            }
+
+            // Validate all existing rows.
+            let existing_rows =
+                TableEngine::scan_table(storage, &table_def.def, columns, snap, None)?;
+            for (_rid, row_values) in &existing_rows {
+                let result = eval(&expr, row_values)?;
+                if !crate::eval::is_truthy(&result) {
+                    return Err(DbError::CheckViolation {
+                        table: table_def.def.table_name.clone(),
+                        constraint: cname.clone(),
+                    });
+                }
+            }
+
+            // Serialize the expression to SQL string for persistence.
+            let check_expr = expr_to_sql_string(&expr);
+
+            // Persist in axiom_constraints.
+            CatalogWriter::new(storage, txn)?.create_constraint(ConstraintDef {
+                constraint_id: 0, // allocated by writer
+                table_id: table_def.def.id,
+                name: cname,
+                check_expr,
+            })?;
+            Ok(())
+        }
+
+        TableConstraint::ForeignKey { .. } => Err(DbError::NotImplemented {
+            feature: "ADD CONSTRAINT FOREIGN KEY — Phase 6.5".into(),
+        }),
+
+        TableConstraint::PrimaryKey { .. } => Err(DbError::NotImplemented {
+            feature: "ADD CONSTRAINT PRIMARY KEY — requires full table rewrite".into(),
+        }),
+    }
+}
+
+fn alter_drop_constraint(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_def: &axiomdb_catalog::ResolvedTable,
+    name: &str,
+    if_exists: bool,
+) -> Result<(), DbError> {
+    let snap = txn.active_snapshot()?;
+    let table_id = table_def.def.id;
+
+    // 1. Search in axiom_indexes (UNIQUE constraints stored as indexes).
+    let (idx_id, idx_root) = {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        let indexes = reader.list_indexes(table_id)?;
+        match indexes.into_iter().find(|i| i.name == name) {
+            Some(i) => (Some(i.index_id), Some(i.root_page_id)),
+            None => (None, None),
+        }
+    };
+
+    if let Some(index_id) = idx_id {
+        CatalogWriter::new(storage, txn)?.delete_index(index_id)?;
+        if let Some(root) = idx_root {
+            free_btree_pages(storage, root)?;
+        }
+        return Ok(());
+    }
+
+    // 2. Search in axiom_constraints (CHECK constraints).
+    let constraint = {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        reader.get_constraint_by_name(table_id, name)?
+    };
+
+    match constraint {
+        Some(c) => {
+            CatalogWriter::new(storage, txn)?.drop_constraint(c.constraint_id)?;
+            Ok(())
+        }
+        None if if_exists => Ok(()),
+        None => Err(DbError::Other(format!(
+            "constraint '{name}' not found on table '{}'",
+            table_def.def.table_name
+        ))),
+    }
+}
+
+/// Converts an [`Expr`] to a SQL string suitable for storing in `axiom_constraints`.
+///
+/// Not a perfect round-trip — whitespace and casing may differ from the original
+/// input, but the output is valid SQL that can be re-parsed and evaluated.
+fn expr_to_sql_string(expr: &Expr) -> String {
+    use crate::expr::BinaryOp;
+
+    match expr {
+        Expr::Literal(v) => match v {
+            Value::Int(n) => n.to_string(),
+            Value::BigInt(n) => n.to_string(),
+            Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+            Value::Null => "NULL".to_string(),
+            Value::Real(f) => f.to_string(),
+            _ => format!("{v}"),
+        },
+        Expr::Column { name, .. } => name.clone(),
+        Expr::BinaryOp { left, op, right } => {
+            let op_str = match op {
+                BinaryOp::Eq => "=",
+                BinaryOp::NotEq => "!=",
+                BinaryOp::Lt => "<",
+                BinaryOp::LtEq => "<=",
+                BinaryOp::Gt => ">",
+                BinaryOp::GtEq => ">=",
+                BinaryOp::And => "AND",
+                BinaryOp::Or => "OR",
+                BinaryOp::Add => "+",
+                BinaryOp::Sub => "-",
+                BinaryOp::Mul => "*",
+                BinaryOp::Div => "/",
+                BinaryOp::Mod => "%",
+                BinaryOp::Concat => "||",
+            };
+            format!(
+                "({} {op_str} {})",
+                expr_to_sql_string(left),
+                expr_to_sql_string(right)
+            )
+        }
+        Expr::UnaryOp {
+            op: crate::expr::UnaryOp::Not,
+            operand,
+        } => {
+            format!("NOT {}", expr_to_sql_string(operand))
+        }
+        Expr::IsNull {
+            expr: inner,
+            negated: false,
+        } => {
+            format!("{} IS NULL", expr_to_sql_string(inner))
+        }
+        Expr::IsNull {
+            expr: inner,
+            negated: true,
+        } => {
+            format!("{} IS NOT NULL", expr_to_sql_string(inner))
+        }
+        // For complex expressions not yet handled, fall back to a debug representation.
+        other => format!("{other:?}"),
+    }
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────

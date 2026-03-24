@@ -93,14 +93,23 @@ pub const NEXT_TABLE_ID_BODY_OFFSET: usize = 64;
 /// Value 0 = uninitialized (catalog not yet bootstrapped). First valid ID = 1.
 pub const NEXT_INDEX_ID_BODY_OFFSET: usize = 68;
 
+/// body offset of `catalog_constraints_root: u64` — root heap page for
+/// `axiom_constraints` (Phase 4.22b). Value 0 = not yet allocated (lazily
+/// initialized on first use so existing databases remain compatible).
+pub const CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET: usize = 72;
+
+/// body offset of `next_constraint_id: u32` — auto-increment sequence for
+/// named constraints (CHECK). Value 0 = uninitialized. First valid ID = 1.
+pub const NEXT_CONSTRAINT_ID_BODY_OFFSET: usize = 80;
+
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMA_VER_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "catalog header must fit within page 0"
 );
 
 const _: () = assert!(
-    HEADER_SIZE + NEXT_INDEX_ID_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
-    "sequence fields must fit within page 0"
+    HEADER_SIZE + NEXT_CONSTRAINT_ID_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
+    "constraint sequence field must fit within page 0"
 );
 
 /// Reads a single `u64` from the meta page at `body_offset`.
@@ -183,6 +192,21 @@ pub fn alloc_table_id(storage: &mut dyn StorageEngine) -> Result<u32, DbError> {
 /// Same semantics as [`alloc_table_id`].
 pub fn alloc_index_id(storage: &mut dyn StorageEngine) -> Result<u32, DbError> {
     alloc_sequence_u32(storage, NEXT_INDEX_ID_BODY_OFFSET)
+}
+
+/// Allocates the next `constraint_id` from the meta page sequence (Phase 4.22b).
+///
+/// Same semantics as [`alloc_table_id`].
+pub fn alloc_constraint_id(storage: &mut dyn StorageEngine) -> Result<u32, DbError> {
+    // Initialize to 1 on first call if still 0 (lazy-init for existing DBs).
+    let current = read_meta_u32(storage, NEXT_CONSTRAINT_ID_BODY_OFFSET)?;
+    if current == 0 {
+        write_meta_u32(storage, NEXT_CONSTRAINT_ID_BODY_OFFSET, 2)?;
+        return Ok(1);
+    }
+    let next = current.checked_add(1).ok_or(DbError::SequenceOverflow)?;
+    write_meta_u32(storage, NEXT_CONSTRAINT_ID_BODY_OFFSET, next)?;
+    Ok(current)
 }
 
 /// Internal: read-increment-write for a `u32` sequence stored in the meta page.

@@ -331,6 +331,7 @@ pub enum AlterTableOp {
     AddConstraint(TableConstraint),
     DropConstraint {
         name: String,
+        if_exists: bool,
     },
     /// MySQL `MODIFY COLUMN col new_type [constraints]`
     ModifyColumn(ColumnDef),

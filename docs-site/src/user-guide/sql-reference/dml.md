@@ -786,3 +786,57 @@ multi-statement results automatically when the client flag
 <code>CLIENT_MULTI_STATEMENTS</code> is set (default in most clients).
 </div>
 </div>
+
+---
+
+## ALTER TABLE — Constraints
+
+### ADD CONSTRAINT UNIQUE
+
+```sql
+-- Named unique constraint (recommended for DROP CONSTRAINT later)
+ALTER TABLE users ADD CONSTRAINT uq_users_email UNIQUE (email);
+
+-- Anonymous unique constraint (auto-named)
+ALTER TABLE users ADD UNIQUE (username);
+```
+
+`ADD CONSTRAINT UNIQUE` creates a unique index internally. Fails with
+`IndexAlreadyExists` if a constraint/index with that name already exists on the table,
+or `UniqueViolation` if the column already has duplicate values.
+
+### ADD CONSTRAINT CHECK
+
+```sql
+ALTER TABLE orders ADD CONSTRAINT chk_positive_amount CHECK (amount > 0);
+ALTER TABLE products ADD CONSTRAINT chk_stock CHECK (stock >= 0);
+```
+
+The CHECK expression is validated against all existing rows at the time of the
+`ALTER TABLE`. If any row fails the check, the statement returns `CheckViolation`.
+After the constraint is added, every subsequent `INSERT` and `UPDATE` on the table
+evaluates the expression.
+
+### DROP CONSTRAINT
+
+```sql
+-- Drop by name (works for both UNIQUE and CHECK constraints)
+ALTER TABLE users DROP CONSTRAINT uq_users_email;
+
+-- Silent no-op if the constraint does not exist
+ALTER TABLE users DROP CONSTRAINT IF EXISTS uq_users_old;
+```
+
+`DROP CONSTRAINT` searches first in indexes (for UNIQUE constraints), then in the
+named constraint catalog (for CHECK constraints).
+
+### Limitations (Phase 4.22b)
+
+```sql
+-- Not yet supported:
+ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users (id);
+-- → NotImplemented: ADD CONSTRAINT FOREIGN KEY — Phase 6.5
+
+ALTER TABLE users ADD CONSTRAINT pk_users PRIMARY KEY (id);
+-- → NotImplemented: ADD CONSTRAINT PRIMARY KEY — requires full table rewrite
+```
