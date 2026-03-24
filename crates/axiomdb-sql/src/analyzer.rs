@@ -762,7 +762,7 @@ fn analyze_select_with_outer(
 
     // AnalyzeState is needed so that subquery arms inside expressions can
     // recurse back into analyze_select_with_outer.
-    let mut state = AnalyzeState {
+    let state = AnalyzeState {
         storage,
         snapshot,
         default_schema,
@@ -772,12 +772,9 @@ fn analyze_select_with_outer(
     let mut resolved_joins = Vec::with_capacity(s.joins.len());
     for mut join in s.joins {
         join.condition = match join.condition {
-            JoinCondition::On(expr) => JoinCondition::On(resolve_expr_full(
-                expr,
-                &ctx,
-                outer_scopes,
-                Some(&mut state),
-            )?),
+            JoinCondition::On(expr) => {
+                JoinCondition::On(resolve_expr_full(expr, &ctx, outer_scopes, Some(&state))?)
+            }
             JoinCondition::Using(cols) => {
                 // Detailed column-by-column validation deferred (Phase 4.22).
                 JoinCondition::Using(cols)
@@ -788,24 +785,24 @@ fn analyze_select_with_outer(
     s.joins = resolved_joins;
 
     // Resolve WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET.
-    s.where_clause = resolve_opt_expr_full(s.where_clause, &ctx, outer_scopes, Some(&mut state))?;
+    s.where_clause = resolve_opt_expr_full(s.where_clause, &ctx, outer_scopes, Some(&state))?;
     s.group_by = s
         .group_by
         .into_iter()
-        .map(|e| resolve_expr_full(e, &ctx, outer_scopes, Some(&mut state)))
+        .map(|e| resolve_expr_full(e, &ctx, outer_scopes, Some(&state)))
         .collect::<Result<_, _>>()?;
-    s.having = resolve_opt_expr_full(s.having, &ctx, outer_scopes, Some(&mut state))?;
+    s.having = resolve_opt_expr_full(s.having, &ctx, outer_scopes, Some(&state))?;
 
     // Resolve ORDER BY.
     let mut resolved_order = Vec::with_capacity(s.order_by.len());
     for mut item in s.order_by {
-        item.expr = resolve_expr_full(item.expr, &ctx, outer_scopes, Some(&mut state))?;
+        item.expr = resolve_expr_full(item.expr, &ctx, outer_scopes, Some(&state))?;
         resolved_order.push(item);
     }
     s.order_by = resolved_order;
 
-    s.limit = resolve_opt_expr_full(s.limit, &ctx, outer_scopes, Some(&mut state))?;
-    s.offset = resolve_opt_expr_full(s.offset, &ctx, outer_scopes, Some(&mut state))?;
+    s.limit = resolve_opt_expr_full(s.limit, &ctx, outer_scopes, Some(&state))?;
+    s.offset = resolve_opt_expr_full(s.offset, &ctx, outer_scopes, Some(&state))?;
 
     // Resolve SELECT list.
     let mut resolved_cols = Vec::with_capacity(s.columns.len());
@@ -822,7 +819,7 @@ fn analyze_select_with_outer(
                 item
             }
             SelectItem::Expr { expr, alias } => SelectItem::Expr {
-                expr: resolve_expr_full(expr, &ctx, outer_scopes, Some(&mut state))?,
+                expr: resolve_expr_full(expr, &ctx, outer_scopes, Some(&state))?,
                 alias,
             },
         };
