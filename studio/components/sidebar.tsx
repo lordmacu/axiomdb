@@ -2,7 +2,7 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { useState } from 'react'
-import { Table2, Eye, Search, Activity, Code2, Settings, Zap } from 'lucide-react'
+import { Table2, Eye, Search, Activity, Code2, Settings, Zap, GitGraph } from 'lucide-react'
 import { TABLES } from '@/lib/mock'
 import { cn } from '@/lib/utils'
 
@@ -34,6 +34,7 @@ export function Sidebar() {
         {[
           { href: '/', icon: Activity, label: 'Dashboard' },
           { href: '/query', icon: Code2, label: 'Query Editor' },
+          { href: '/diagram', icon: GitGraph, label: 'ER Diagram' },
         ].map(({ href, icon: Icon, label }) => (
           <Link key={href} href={href}
             className={cn(

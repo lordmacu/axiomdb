@@ -7,7 +7,7 @@
 //!   cargo bench --bench executor_e2e -p axiomdb-sql
 
 use axiomdb_catalog::CatalogBootstrap;
-use axiomdb_sql::{analyze, execute, parse};
+use axiomdb_sql::{analyze, execute, execute_with_ctx, parse, SessionContext};
 use axiomdb_storage::MmapStorage;
 use axiomdb_wal::TxnManager;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
@@ -43,6 +43,16 @@ impl Db {
             .unwrap_or_else(|_| self.txn.snapshot());
         let analyzed = analyze(stmt, &self.storage, snap).unwrap();
         execute(analyzed, &mut self.storage, &mut self.txn).unwrap();
+    }
+
+    fn run_ctx(&mut self, sql: &str, ctx: &mut SessionContext) {
+        let stmt = parse(sql, None).unwrap();
+        let snap = self
+            .txn
+            .active_snapshot()
+            .unwrap_or_else(|_| self.txn.snapshot());
+        let analyzed = analyze(stmt, &self.storage, snap).unwrap();
+        execute_with_ctx(analyzed, &mut self.storage, &mut self.txn, ctx).unwrap();
     }
 }
 
@@ -250,11 +260,53 @@ fn bench_full_pipeline(c: &mut Criterion) {
     group.finish();
 }
 
+/// INSERT batch with SessionContext schema cache enabled.
+///
+/// This is the most realistic benchmark for a long-lived connection:
+/// the schema is cached after the first lookup, so repeated INSERTs
+/// do not re-scan the catalog heap on every statement.
+///
+/// Compare with `insert_batch_transaction` (no cache) to isolate the
+/// catalog scan overhead per statement.
+fn bench_insert_batch_cached(c: &mut Criterion) {
+    let sizes = [100u32, 1_000, 10_000];
+    let mut group = c.benchmark_group("insert_batch_cached");
+
+    for &n in &sizes {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(
+            criterion::BenchmarkId::new("axiomdb_mmap_wal_ctx", n),
+            &n,
+            |b, &n| {
+                b.iter_batched(
+                    || {
+                        let mut db = Db::open();
+                        db.run("CREATE TABLE t (id INT, val TEXT)");
+                        db
+                    },
+                    |mut db| {
+                        let mut ctx = SessionContext::new();
+                        db.run_ctx("BEGIN", &mut ctx);
+                        for i in 1..=n {
+                            db.run_ctx(&format!("INSERT INTO t VALUES ({i}, 'row{i}')"), &mut ctx);
+                        }
+                        db.run_ctx("COMMIT", &mut ctx);
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert_single,
     bench_insert_sequential,
     bench_insert_batch_txn,
+    bench_insert_batch_cached,
     bench_select_full_scan,
     bench_select_where_filter,
     bench_select_count_aggregate,

@@ -40,9 +40,30 @@ The speed advantage comes from two decisions:
 |---------------------------|---------------|--------------|----------------|--------|
 | B+ Tree point lookup (1M) | **1.2M ops/s**| 800K ops/s   | 600K ops/s     | ✅     |
 | Range scan 10K rows       | **0.61 ms**   | 45 ms        | 60 ms          | ✅     |
-| INSERT with WAL           | **195K ops/s**| 180K ops/s   | 150K ops/s     | ✅     |
+| B+ Tree INSERT (storage only) | **195K ops/s** | 180K ops/s | 150K ops/s  | ✅     |
 | Sequential scan 1M rows   | **0.72 s**    | 0.8 s        | 1.2 s          | ✅     |
 | Concurrent reads ×16      | **linear**    | linear       | <2× degradation| ✅     |
+
+### End-to-End INSERT Throughput (Phase 4.16b)
+
+Full pipeline: parse → analyze → execute → WAL → MmapStorage. Measured with
+`executor_e2e` benchmark (MmapStorage + real WAL, release build, NVMe).
+
+| Configuration                          | AxiomDB        | Target (Phase 8) | Status |
+|----------------------------------------|----------------|------------------|--------|
+| INSERT 100 rows / 1 txn (no cache)     | 2.8K ops/s     | —                | —      |
+| INSERT 1K rows / 1 txn (no cache)      | 18.5K ops/s    | —                | —      |
+| INSERT 1K rows / 1 txn (SchemaCache)   | 20.6K ops/s    | —                | —      |
+| INSERT 10K rows / 1 txn (SchemaCache)  | **36K ops/s**  | 180K ops/s       | ⚠️     |
+| INSERT autocommit (1 fsync/row)        | ~70 ops/s      | —                | —      |
+
+The 36K ops/s figure is the current honest baseline for the string-based API
+(parse → analyze → execute per statement). The bottleneck is WAL `record_insert()`,
+which costs ~20 µs/row even without fsync — not parse or catalog overhead.
+
+The 180K ops/s target is a Phase 8 goal. Prepared statements will skip parse and
+analyze entirely, and a batch insert API will amortize WAL overhead across many rows
+in a single write.
 
 ### Row Codec Throughput
 
@@ -111,15 +132,16 @@ The following table defines the minimum acceptable performance for each critical
 operation. Benchmarks that fall below the "acceptable maximum" column are treated as
 blockers before any phase is closed.
 
-| Operation               | Target        | Acceptable maximum  |
-|-------------------------|---------------|---------------------|
-| Point lookup (PK)       | 800K ops/s    | 600K ops/s          |
-| Range scan 10K rows     | 45 ms         | 60 ms               |
-| INSERT with WAL         | 180K ops/s    | 150K ops/s          |
-| Sequential scan 1M rows | 0.8 s         | 1.2 s               |
-| Concurrent reads ×16    | linear        | <2× degradation     |
-| Parser (simple SELECT)  | 600 ns        | 1 µs                |
-| Parser (complex SELECT) | 3 µs          | 6 µs                |
+| Operation                               | Target        | Acceptable maximum  |
+|-----------------------------------------|---------------|---------------------|
+| Point lookup (PK)                       | 800K ops/s    | 600K ops/s          |
+| Range scan 10K rows                     | 45 ms         | 60 ms               |
+| B+ Tree INSERT with WAL (storage only)  | 180K ops/s    | 150K ops/s          |
+| INSERT end-to-end 10K batch (Phase 8)   | 180K ops/s    | 150K ops/s          |
+| Sequential scan 1M rows                 | 0.8 s         | 1.2 s               |
+| Concurrent reads ×16                    | linear        | <2× degradation     |
+| Parser (simple SELECT)                  | 600 ns        | 1 µs                |
+| Parser (complex SELECT)                 | 3 µs          | 6 µs                |
 
 ---
 
