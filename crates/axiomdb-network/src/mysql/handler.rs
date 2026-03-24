@@ -119,13 +119,25 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
         // Then send OK immediately at seq=3 — pymysql reads it directly
         // without sending an ack first. The previous ack-read caused a
         // deadlock: server waited for ack, pymysql waited for OK.
+        // caching_sha2_password fast-auth sequence:
+        //   seq=0  Server → HandshakeV10
+        //   seq=1  Client → HandshakeResponse41
+        //   seq=2  Server → AuthMoreData(0x03)  ← fast_auth_success
+        //   seq=3  Client → b"" (empty ack — pymysql _roundtrip sends this)
+        //   seq=4  Server → OK_Packet
         let more_data = build_auth_more_data(0x03);
         if writer.send((2u8, more_data.as_slice())).await.is_err() {
             return;
         }
 
+        // Read the empty ack from the client (seq=3) before sending OK.
+        match reader.next().await {
+            Some(Ok(_)) => {}
+            _ => return, // client disconnected
+        }
+
         let ok = build_ok_packet(0, 0, 0);
-        if writer.send((3u8, ok.as_slice())).await.is_err() {
+        if writer.send((4u8, ok.as_slice())).await.is_err() {
             return;
         }
     } else {
