@@ -55,7 +55,7 @@
 - [ ] ⚠️ 3.6b ENOSPC handling — graceful shutdown on disk full → Phase 5
 - [ ] ⚠️ 3.8b Partial page write detection on open → deferred to Phase 5
 - [ ] ⚠️ Per-page msync optimization (flush_range) → deferred pending profiling
-- [ ] 3.17 ⏳ WAL batch append — `WalWriter::append_batch(entries: &[WalEntry])` accumulates N entries and writes them in a single BufWriter call; reduces per-row overhead from individual serialization to amortized batch; prerequisite for 4.16d (WAL record per page)
+- [x] 3.17 ✅ WAL batch append — `TxnManager::record_insert_batch()`: reserve_lsns(N) + serialize all N Insert entries into wal_scratch + write_batch() in one write_all; O(1) BufWriter calls instead of O(N); entries byte-for-byte identical to per-row path; crash recovery unchanged
 - [ ] 3.18 ⏳ WAL record per page (PostgreSQL COPY strategy) — instead of 1 WAL entry per inserted row, buffer rows until a page is full and emit 1 WAL entry of type `PageWrite(page_id, page_bytes)`; crash recovery replays page writes instead of row inserts; reduces WAL I/O from O(rows) to O(pages) = ~200× fewer WAL writes for bulk inserts; expected to bring AxiomDB bulk insert from ~30K/s to ~100K+/s; requires changes to WalEntry format + crash recovery state machine
 - [x] 3.19 ✅ WAL Group Commit — CommitCoordinator batches fsyncs across concurrent connections; deferred_commit_mode in TxnManager; background Tokio task; enable_group_commit() in Database; handler.rs releases lock before await; group_commit_interval_ms config (default 0=disabled); 10 integration tests; up to N× throughput for N concurrent writers
 
@@ -165,7 +165,7 @@
   - MariaDB 12.1 reference: 140,926/s (4.7× faster)
   - Remaining gap cause: per-row HeapChain::insert() + WalEntry serialization (~20µs/row)
   - Full scan: AxiomDB 501K/s vs MariaDB 213K/s → AxiomDB **2.4× faster** ✅
-- [ ] 4.16c ⏳ Multi-row INSERT optimization — `INSERT INTO t VALUES (r1),(r2),...(rN)` as single parse+analyze+execute call (N rows); eliminates per-row parse+analyze overhead; expected gain: ~3-5× on batch insert throughput; the benchmark currently issues 10K separate SQL strings
+- [x] 4.16c ✅ Multi-row INSERT optimization — insert_rows_batch() uses record_insert_batch() (3.17); bench_insert_multi_row/10K: 211K rows/s (1 SQL string) vs 35K rows/s (N strings) = 6× faster; AxiomDB 211K/s vs MariaDB ~140K/s = 1.5× faster in bulk INSERT
 - [ ] 4.16d ⏳ WAL record per page (like PostgreSQL COPY) — buffer N row inserts, emit 1 WAL entry per modified page (~200 rows/page) instead of 1 WAL entry per row; reduces WAL I/O from 10K writes to ~50 writes for 10K rows; implement in WalWriter as append_batch(); expected gain: ~3× on batch insert; see docs/perf-insert-analysis.md
 
 ### Phase 5 — MySQL Wire Protocol `🔄` week 26-30
