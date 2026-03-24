@@ -33,6 +33,20 @@ use crate::{
     writer::WalWriter,
 };
 
+// ── Savepoint ─────────────────────────────────────────────────────────────────
+
+/// An in-memory statement-level savepoint.
+///
+/// Created by [`TxnManager::savepoint`] before executing a statement inside an
+/// explicit transaction. Passing it to [`TxnManager::rollback_to_savepoint`]
+/// undoes only that statement's writes, leaving the transaction active.
+///
+/// Savepoints are **not persisted** to the WAL — they are valid only within the
+/// lifetime of the current `TxnManager` instance. Crash recovery handles
+/// transactions at transaction granularity (full redo/undo), not statement level.
+#[derive(Debug, Clone, Copy)]
+pub struct Savepoint(usize);
+
 // ── UndoOp ───────────────────────────────────────────────────────────────────
 
 /// A single undo operation recorded for each DML within a transaction.
@@ -251,6 +265,72 @@ impl TxnManager {
     /// Rolls back the active transaction: undoes heap changes and writes a
     /// Rollback WAL entry (not fsynced — rolled-back data is intentionally ephemeral).
     ///
+    /// Captures the current undo log position as a statement-level savepoint.
+    ///
+    /// The returned `Savepoint` can be passed to [`rollback_to_savepoint`] to undo
+    /// only the operations recorded *after* this call, leaving the transaction active.
+    ///
+    /// Call this **before** executing each statement inside an explicit transaction
+    /// to implement MySQL-style statement-level rollback on error.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds if called outside an active transaction.
+    ///
+    /// [`rollback_to_savepoint`]: TxnManager::rollback_to_savepoint
+    pub fn savepoint(&self) -> Savepoint {
+        debug_assert!(
+            self.active.is_some(),
+            "savepoint() called outside an active transaction"
+        );
+        Savepoint(self.active.as_ref().map_or(0, |a| a.undo_ops.len()))
+    }
+
+    /// Undoes all operations recorded **after** `sp`, leaving the transaction active.
+    ///
+    /// This implements MySQL's statement-level rollback semantics: when a statement
+    /// errors inside an explicit transaction, only that statement's writes are
+    /// undone. The transaction remains open; subsequent statements can execute.
+    ///
+    /// Undo ops are applied in reverse order (last write first), identical to the
+    /// full `rollback()` path but scoped to `sp.0..undo_ops.len()`.
+    ///
+    /// # Errors
+    ///
+    /// - [`DbError::NoActiveTransaction`] if no transaction is active.
+    /// - I/O errors from undo writes.
+    pub fn rollback_to_savepoint(
+        &mut self,
+        sp: Savepoint,
+        storage: &mut dyn StorageEngine,
+    ) -> Result<(), DbError> {
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = active.txn_id;
+
+        // Drain only the ops recorded after the savepoint.
+        let ops_to_undo: Vec<UndoOp> = active.undo_ops.drain(sp.0..).rev().collect();
+        for op in ops_to_undo {
+            match op {
+                UndoOp::UndoInsert { page_id, slot_id } => {
+                    let bytes = *storage.read_page(page_id)?.as_bytes();
+                    let mut page = Page::from_bytes(bytes)?;
+                    mark_slot_dead(&mut page, slot_id)?;
+                    storage.write_page(page_id, &page)?;
+                }
+                UndoOp::UndoDelete { page_id, slot_id } => {
+                    let bytes = *storage.read_page(page_id)?.as_bytes();
+                    let mut page = Page::from_bytes(bytes)?;
+                    clear_deletion(&mut page, slot_id)?;
+                    storage.write_page(page_id, &page)?;
+                }
+                UndoOp::UndoTruncate { root_page_id } => {
+                    HeapChain::clear_deletions_by_txn(storage, root_page_id, txn_id)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Applies undo operations in **reverse chronological order**:
     /// - `UndoInsert`: marks the slot dead (row hidden from all future snapshots).
     /// - `UndoDelete`: clears `txn_id_deleted` (row is live again).

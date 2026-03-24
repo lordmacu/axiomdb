@@ -31,18 +31,32 @@ use std::collections::HashMap;
 
 use axiomdb_catalog::ResolvedTable;
 
-/// Per-connection state: schema cache + future session variables.
-#[derive(Debug, Default)]
+/// Per-connection state: schema cache + session variables visible to the executor.
+#[derive(Debug)]
 pub struct SessionContext {
     /// Cached table schemas keyed by `"schema_name.table_name"`.
     cache: HashMap<String, ResolvedTable>,
+    /// Whether the connection is in autocommit mode (MySQL default: `true`).
+    ///
+    /// When `false` (`SET autocommit=0`), the executor does not wrap DML statements
+    /// in implicit `BEGIN / COMMIT`. Instead, the first DML starts an implicit
+    /// transaction that remains open until the client sends an explicit `COMMIT`
+    /// or `ROLLBACK`. DDL always triggers an implicit commit of any open transaction.
+    pub autocommit: bool,
+}
+
+impl Default for SessionContext {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SessionContext {
-    /// Creates an empty session context with no cached schemas.
+    /// Creates an empty session context with autocommit enabled (MySQL default).
     pub fn new() -> Self {
         Self {
             cache: HashMap::new(),
+            autocommit: true,
         }
     }
 

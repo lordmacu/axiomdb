@@ -72,7 +72,7 @@ pub fn plan_select(
 
     // ── Rule 1: col = literal ─────────────────────────────────────────────
     if let Some((col_name, value)) = extract_eq_col_literal(expr) {
-        if let Some(idx) = find_index_on_col(col_name, indexes, columns) {
+        if let Some(idx) = find_index_on_col(col_name, indexes, columns, Some(expr)) {
             if let Ok(key) = encode_index_key(&[value]) {
                 return AccessMethod::IndexLookup {
                     index_def: idx.clone(),
@@ -83,7 +83,7 @@ pub fn plan_select(
     }
 
     // ── Rule 2: col > lo AND col < hi (or >=, <=) ─────────────────────────
-    if let Some((idx, lo_val, hi_val)) = extract_range(expr, indexes, columns) {
+    if let Some((idx, lo_val, hi_val)) = extract_range(expr, indexes, columns, Some(expr)) {
         let lo = lo_val.and_then(|v| encode_index_key(&[v]).ok());
         let hi = hi_val.and_then(|v| encode_index_key(&[v]).ok());
         return AccessMethod::IndexRange {
@@ -118,19 +118,36 @@ fn extract_eq_col_literal(expr: &Expr) -> Option<(&str, Value)> {
     None
 }
 
-/// Returns the first non-primary index whose first column matches `col_name`.
+/// Returns the first non-primary index whose first column matches `col_name`
+/// and whose partial index predicate (if any) is implied by the query WHERE.
+///
+/// `query_where` is the full WHERE clause of the query, used for partial index
+/// predicate implication checking (Phase 6.7).
 fn find_index_on_col<'a>(
     col_name: &str,
     indexes: &'a [IndexDef],
     columns: &[ColumnDef],
+    query_where: Option<&Expr>,
 ) -> Option<&'a IndexDef> {
     // Find the col_idx for this column name.
     let col_idx = columns.iter().find(|c| c.name == col_name)?.col_idx;
 
-    // Find a non-primary index whose first column is this col_idx.
-    indexes
-        .iter()
-        .find(|idx| !idx.is_primary && idx.columns.first().map(|c| c.col_idx) == Some(col_idx))
+    // Find a non-primary index whose first column is this col_idx AND whose
+    // predicate (if any) is implied by the query WHERE clause.
+    indexes.iter().find(|idx| {
+        if idx.is_primary {
+            return false;
+        }
+        if idx.columns.first().map(|c| c.col_idx) != Some(col_idx) {
+            return false;
+        }
+        // Partial index guard (Phase 6.7): only use if predicate is implied.
+        if let Some(pred_sql) = &idx.predicate {
+            crate::partial_index::predicate_implied_by_query(pred_sql, query_where, columns)
+        } else {
+            true // full index — always usable
+        }
+    })
 }
 
 // ── Helper: extract range predicate ──────────────────────────────────────────
@@ -141,6 +158,7 @@ fn extract_range<'a>(
     expr: &Expr,
     indexes: &'a [IndexDef],
     columns: &[ColumnDef],
+    query_where: Option<&Expr>,
 ) -> Option<(&'a IndexDef, Option<Value>, Option<Value>)> {
     // expr must be `AND(left, right)`.
     let (lhs, rhs) = match expr {
@@ -161,7 +179,7 @@ fn extract_range<'a>(
         return None;
     }
 
-    let idx = find_index_on_col(col1, indexes, columns)?;
+    let idx = find_index_on_col(col1, indexes, columns, query_where)?;
     // bound1 = lo side, bound2 = hi side (order may be loose but correct for 6.3)
     Some((idx, bound1, bound2))
 }
@@ -235,6 +253,7 @@ mod tests {
                 col_idx,
                 order: SortOrder::Asc,
             }],
+            predicate: None,
         }
     }
 
@@ -316,6 +335,7 @@ mod tests {
             is_unique: false,
             is_primary: false,
             columns: vec![], // old format — no column info
+            predicate: None,
         };
         let expr = Expr::BinaryOp {
             op: BinaryOp::Eq,

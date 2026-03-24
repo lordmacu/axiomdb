@@ -288,6 +288,9 @@ pub struct CreateIndexStmt {
     pub name: String,
     pub table: TableRef,
     pub columns: Vec<IndexColumn>,
+    /// Optional WHERE predicate for partial indexes (Phase 6.7).
+    /// `None` = full index (covers all rows).
+    pub predicate: Option<crate::expr::Expr>,
 }
 
 /// `DROP TABLE`
@@ -691,6 +694,7 @@ mod tests {
                 name: "email".into(),
                 order: SortOrder::Asc,
             }],
+            predicate: None,
         });
         assert!(matches!(stmt, Stmt::CreateIndex(_)));
     }
