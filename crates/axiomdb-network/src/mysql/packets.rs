@@ -72,42 +72,45 @@ pub const SERVER_CAPABILITIES: u32 = CLIENT_LONG_PASSWORD
 /// Builds a MySQL HandshakeV10 payload (sent by server after TCP accept).
 ///
 /// `challenge` must be exactly 20 bytes of random data.
-/// The client will use them to compute the auth response.
-pub fn build_server_greeting(conn_id: u32, challenge: &[u8; 20]) -> Vec<u8> {
+/// `auth_plugin` is the plugin name to advertise (e.g.
+/// `"caching_sha2_password"` or `"mysql_native_password"`).
+pub fn build_server_greeting(conn_id: u32, challenge: &[u8; 20], auth_plugin: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
 
-    // Protocol version = 10
-    buf.push(10u8);
-    // Server version string (null-terminated) — report as MySQL 8.0 for compat
+    buf.push(10u8); // protocol version
     write_nul_str(&mut buf, b"8.0.36-AxiomDB-0.1.0");
-    // Connection ID
     buf.extend_from_slice(&conn_id.to_le_bytes());
-    // auth_plugin_data part 1 (first 8 bytes of challenge)
-    buf.extend_from_slice(&challenge[..8]);
-    // Filler
-    buf.push(0x00);
+    buf.extend_from_slice(&challenge[..8]); // auth_plugin_data_part1
+    buf.push(0x00); // filler
 
     let cap_lower = (SERVER_CAPABILITIES & 0xFFFF) as u16;
     let cap_upper = (SERVER_CAPABILITIES >> 16) as u16;
 
     buf.extend_from_slice(&cap_lower.to_le_bytes());
-    // character_set = 255 (utf8mb4_0900_ai_ci)
-    buf.push(255u8);
-    // status_flags = SERVER_STATUS_AUTOCOMMIT
-    buf.extend_from_slice(&0x0002u16.to_le_bytes());
+    buf.push(255u8); // character_set = utf8mb4
+    buf.extend_from_slice(&0x0002u16.to_le_bytes()); // status = autocommit
     buf.extend_from_slice(&cap_upper.to_le_bytes());
-
-    // auth_plugin_data_len: total challenge length + 1 (for null terminator)
-    buf.push(21u8); // 8 + 12 + 1 null = 21
-                    // reserved (10 bytes of zeros)
-    buf.extend_from_slice(&[0u8; 10]);
-    // auth_plugin_data part 2 (remaining 12 bytes + null terminator)
-    buf.extend_from_slice(&challenge[8..]);
-    buf.push(0x00); // null terminator for part 2
-                    // auth_plugin_name (null-terminated)
-    write_nul_str(&mut buf, b"mysql_native_password");
+    buf.push(21u8); // auth_plugin_data_len = 21 (8+12+1)
+    buf.extend_from_slice(&[0u8; 10]); // reserved
+    buf.extend_from_slice(&challenge[8..]); // auth_plugin_data_part2 (12 bytes)
+    buf.push(0x00); // null terminator
+    write_nul_str(&mut buf, auth_plugin.as_bytes()); // auth_plugin_name
 
     buf
+}
+
+// ── Auth more data (for caching_sha2_password) ────────────────────────────────
+
+/// Builds an Auth More Data packet.
+///
+/// Used by `caching_sha2_password` fast auth:
+/// - `data = 0x03` means fast_auth_success (server has cached hash, auth OK).
+/// - `data = 0x04` means full_auth_required (server needs RSA/TLS exchange).
+///
+/// This single-byte packet is sent BEFORE the OK_Packet, with the sequence
+/// ID incremented from the HandshakeResponse.
+pub fn build_auth_more_data(data: u8) -> Vec<u8> {
+    vec![0x01, data] // 0x01 = AUTH_MORE_DATA marker, then the status byte
 }
 
 // ── Parsed HandshakeResponse41 ────────────────────────────────────────────────
@@ -118,6 +121,9 @@ pub struct HandshakeResponse {
     pub username: String,
     pub auth_response: Vec<u8>,
     pub database: Option<String>,
+    /// Auth plugin name declared by the client (e.g. "caching_sha2_password").
+    /// `None` if the client did not include a plugin name.
+    pub auth_plugin_name: Option<String>,
 }
 
 /// Parses a HandshakeResponse41 packet payload.
@@ -160,7 +166,23 @@ pub fn parse_handshake_response(payload: &[u8]) -> Option<HandshakeResponse> {
             .position(|&b| b == 0)
             .unwrap_or(payload.len() - pos);
         let db = String::from_utf8(payload[pos..pos + db_end].to_vec()).ok()?;
-        Some(db)
+        pos += db_end + 1;
+        if db.is_empty() {
+            None
+        } else {
+            Some(db)
+        }
+    } else {
+        None
+    };
+
+    // auth_plugin_name (optional, if CLIENT_PLUGIN_AUTH)
+    let auth_plugin_name = if capability_flags & CLIENT_PLUGIN_AUTH != 0 && pos < payload.len() {
+        let end = payload[pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(payload.len() - pos);
+        String::from_utf8(payload[pos..pos + end].to_vec()).ok()
     } else {
         None
     };
@@ -171,6 +193,7 @@ pub fn parse_handshake_response(payload: &[u8]) -> Option<HandshakeResponse> {
         username,
         auth_response,
         database,
+        auth_plugin_name,
     })
 }
 

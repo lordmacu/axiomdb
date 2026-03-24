@@ -24,7 +24,7 @@ prevents circular dependencies and makes each component independently testable.
 │  └── mysql/                                                         │
 │      ├── codec.rs    (MySqlCodec — 4-byte packet framing)           │
 │      ├── packets.rs  (HandshakeV10, HandshakeResponse41, OK, ERR)   │
-│      ├── auth.rs     (mysql_native_password SHA1 challenge-response)│
+│      ├── auth.rs     (mysql_native_password SHA1 + caching_sha2_password)│
 │      ├── handler.rs  (handle_connection — async task per TCP conn)  │
 │      ├── result.rs   (QueryResult → result-set packets)             │
 │      ├── error.rs    (DbError → MySQL error code + SQLSTATE)        │
@@ -215,20 +215,29 @@ TCP accept
   ▼  (seq 0)
 Server → HandshakeV10
   │       20-byte random challenge, capabilities, server version
+  │       auth_plugin_name = "mysql_native_password"
   │
   ▼  (seq 1)
 Client → HandshakeResponse41
-  │       username, auth_response (SHA1-XOR token), capabilities
+  │       username, auth_response (SHA1-XOR token or caching_sha2 token),
+  │       capabilities, auth_plugin_name
   │
-  ▼  (seq 2)
-Server → OK  (permissive mode: password ignored if username is in allowlist)
+  ▼  (seq 2)  — two paths depending on the plugin negotiated:
+  │
+  │  mysql_native_password path:
+  │  └── Server → OK  (permissive mode: username in allowlist → accepted)
+  │
+  │  caching_sha2_password path (MySQL 8.0+ default):
+  │  ├── Server → AuthMoreData(0x03)  ← fast_auth_success indicator
+  │  ├── Client → empty ack packet    ← pymysql sends this automatically
+  │  └── Server → OK
   │
   ▼  COMMAND LOOP
   │
   ├── COM_QUERY (0x03)  → parse SQL → intercept? → execute → result packets
   ├── COM_PING  (0x0e)  → OK
-  ├── COM_INIT_DB (0x02)→ OK  (database name accepted, no-op)
-  ├── COM_RESET_CONNECTION (0x1f) → new SessionContext + OK
+  ├── COM_INIT_DB (0x02)→ updates current_database in ConnectionState + OK
+  ├── COM_RESET_CONNECTION (0x1f) → resets ConnectionState + OK
   └── COM_QUIT  (0x01)  → close
 ```
 
@@ -309,6 +318,40 @@ management. The <code>verify_native_password</code> function is fully correct �
 called and its result logged — but the decision to accept or reject is based solely
 on the username allowlist until Phase 13 (Security) adds stored credentials and real
 enforcement.
+</div>
+</div>
+
+#### caching_sha2_password (MySQL 8.0+)
+
+MySQL 8.0 changed the default authentication plugin from `mysql_native_password` to
+`caching_sha2_password`. When a client using the new default (e.g., PyMySQL ≥ 1.0,
+MySQL Connector/Python, mysql2 for Ruby) connects, the server must complete a 5-packet
+handshake instead of the 3-packet one:
+
+| Seq | Direction | Packet | Notes |
+|-----|-----------|--------|-------|
+| 0 | S → C | HandshakeV10 | includes 20-byte challenge |
+| 1 | C → S | HandshakeResponse41 | `auth_plugin_name = "caching_sha2_password"` |
+| 2 | S → C | AuthMoreData(0x03) | fast_auth_success — byte `0x03` signals that password verification is skipped in permissive mode |
+| 3 | C → S | empty ack | client acknowledges the fast-auth signal before expecting OK |
+| 4 | S → C | OK | connection established |
+
+The critical implementation detail is that the ack packet at seq=3 **must be read**
+before sending OK. If the server sends OK at seq=2 instead, the client has already
+queued the empty ack packet. The server then reads that empty packet as a `COM_QUERY`
+command (command byte `0x00` = COM_SLEEP, or simply an unknown command), which causes
+the connection to close silently — no error is reported to the application.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">caching_sha2_password Sequence Number Gotcha</span>
+MySQL 8.0 clients send an empty ack packet (seq=3) after receiving <code>AuthMoreData(fast_auth_success)</code>.
+If the server skips reading that ack and sends OK immediately at seq=2, the client's
+buffered ack arrives in the command loop, where it is misread as a <code>COM_QUERY</code>
+(command byte <code>0x00</code> = COM_SLEEP). The connection closes silently with no error
+visible to the application. The fix is one extra <code>read_packet()</code> call before
+writing OK.
 </div>
 </div>
 

@@ -23,12 +23,16 @@ use tracing::{debug, info, warn};
 use axiomdb_sql::SessionContext;
 
 use super::{
-    auth::{gen_challenge, is_allowed_user, verify_native_password},
+    auth::{gen_challenge, is_allowed_user, verify_native_password, verify_sha256_password},
     codec::MySqlCodec,
     database::Database,
     error::dberror_to_mysql,
-    packets::{build_err_packet, build_ok_packet, build_server_greeting, parse_handshake_response},
+    packets::{
+        build_auth_more_data, build_err_packet, build_ok_packet, build_server_greeting,
+        parse_handshake_response,
+    },
     result::serialize_query_result,
+    session::ConnectionState,
 };
 
 /// Handles one MySQL connection from handshake to disconnection.
@@ -44,8 +48,10 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
     let mut writer = FramedWrite::new(writer, MySqlCodec);
 
     // ── Phase 1: Send Server Greeting ─────────────────────────────────────────
+    // Advertise caching_sha2_password for MySQL 8.0+ client compatibility.
+    // mysql_native_password clients also accepted (plugin negotiated per-connection).
     let challenge = gen_challenge();
-    let greeting = build_server_greeting(conn_id, &challenge);
+    let greeting = build_server_greeting(conn_id, &challenge, "caching_sha2_password");
     if writer.send((0u8, greeting.as_slice())).await.is_err() {
         return;
     }
@@ -69,7 +75,11 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
         }
     };
 
-    debug!(conn_id, username = %response.username, "auth attempt");
+    let plugin = response
+        .auth_plugin_name
+        .as_deref()
+        .unwrap_or("caching_sha2_password");
+    debug!(conn_id, username = %response.username, %plugin, "auth attempt");
 
     // ── Phase 3: Authenticate ─────────────────────────────────────────────────
     if !is_allowed_user(&response.username) {
@@ -83,20 +93,53 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
         return;
     }
 
-    // Phase 5: permissive auth — accept any password for allowed users.
-    // verify_native_password is called for correctness logging; result ignored.
+    // Phase 5 permissive: accept all allowed users regardless of password.
     // Real auth in Phase 13.
-    let _ = verify_native_password("", &challenge, &response.auth_response);
+    if plugin.contains("caching_sha2") {
+        // caching_sha2_password fast-auth sequence (4 packets total):
+        //   seq=0: Server → HandshakeV10
+        //   seq=1: Client → HandshakeResponse41
+        //   seq=2: Server → AuthMoreData(0x03)  ← fast_auth_success
+        //   seq=3: Client → empty ack (pymysql sends b"" to confirm)
+        //   seq=4: Server → OK_Packet
+        let _ = verify_sha256_password(&challenge, &response.auth_response);
 
-    let ok = build_ok_packet(0, 0, 0);
-    if writer.send((2u8, ok.as_slice())).await.is_err() {
-        return;
+        let more_data = build_auth_more_data(0x03);
+        if writer.send((2u8, more_data.as_slice())).await.is_err() {
+            return;
+        }
+
+        // Read the client's confirmation ack (empty packet at seq=3).
+        // Without consuming this packet, the command loop would see it as
+        // a command and immediately close the connection.
+        match reader.next().await {
+            Some(Ok(_)) => {} // ack consumed, continue
+            _ => return,      // client disconnected
+        }
+
+        let ok = build_ok_packet(0, 0, 0);
+        if writer.send((4u8, ok.as_slice())).await.is_err() {
+            return;
+        }
+    } else {
+        // mysql_native_password (or unknown plugin): send OK directly (seq=2).
+        let _ = verify_native_password("", &challenge, &response.auth_response);
+        let ok = build_ok_packet(0, 0, 0);
+        if writer.send((2u8, ok.as_slice())).await.is_err() {
+            return;
+        }
     }
 
-    info!(conn_id, username = %response.username, "authenticated");
+    info!(conn_id, username = %response.username, %plugin, "authenticated");
 
     // ── Phase 4: Command loop ─────────────────────────────────────────────────
     let mut session = SessionContext::new();
+    let mut conn_state = ConnectionState::new();
+
+    // Populate initial current_database from handshake (if client sent one).
+    if let Some(ref db) = response.database {
+        conn_state.current_database = db.clone();
+    }
 
     loop {
         let (_, payload) = match reader.next().await {
@@ -127,7 +170,9 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
 
             // COM_INIT_DB (USE database)
             0x02 => {
-                debug!(conn_id, db = ?String::from_utf8_lossy(body), "COM_INIT_DB");
+                let db_name = String::from_utf8_lossy(body).trim().to_string();
+                debug!(conn_id, db = %db_name, "COM_INIT_DB");
+                conn_state.current_database = db_name;
                 let ok = build_ok_packet(0, 0, 0);
                 if writer.send((1u8, ok.as_slice())).await.is_err() {
                     break;
@@ -147,7 +192,7 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 debug!(conn_id, %sql, "COM_QUERY");
 
                 // Intercept queries that ORMs/clients send automatically on connect.
-                if let Some(packets) = intercept_special_query(sql) {
+                if let Some(packets) = intercept_special_query(sql, &mut conn_state) {
                     for (seq, pkt) in packets {
                         if writer.send((seq, pkt.as_slice())).await.is_err() {
                             break;
@@ -192,6 +237,7 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
             // COM_RESET_CONNECTION
             0x1f => {
                 session = SessionContext::new();
+                conn_state = ConnectionState::new();
                 let ok = build_ok_packet(0, 0, 0);
                 if writer.send((1u8, ok.as_slice())).await.is_err() {
                     break;
@@ -218,7 +264,10 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
 ///
 /// Without these stubs, most clients (PyMySQL, SQLAlchemy, ActiveRecord, etc.)
 /// fail to connect because they receive ERR packets for these mandatory queries.
-fn intercept_special_query(sql: &str) -> Option<Vec<(u8, Vec<u8>)>> {
+fn intercept_special_query(
+    sql: &str,
+    conn_state: &mut ConnectionState,
+) -> Option<Vec<(u8, Vec<u8>)>> {
     use super::packets::build_ok_packet;
     use super::result::serialize_query_result;
     use axiomdb_sql::result::{ColumnMeta, QueryResult};
@@ -226,43 +275,54 @@ fn intercept_special_query(sql: &str) -> Option<Vec<(u8, Vec<u8>)>> {
 
     let lower = sql.trim().to_ascii_lowercase();
 
-    // SET statements (SET NAMES, SET autocommit, SET character_set_*, etc.)
+    // ── SET statements ────────────────────────────────────────────────────────
     if lower.starts_with("set ") {
+        conn_state.apply_set(sql);
         return Some(vec![(1u8, build_ok_packet(0, 0, 0))]);
     }
 
-    // SELECT @@version or SELECT VERSION()
-    if lower.contains("@@version") && !lower.contains("from ") || lower == "select version()" {
-        return Some(single_text_row("version", "8.0.36-AxiomDB-0.1.0"));
+    // ── SELECT @@variable (single-variable form) ──────────────────────────────
+    // Handles: SELECT @@x, SELECT @@session.x, SELECT @@x AS alias
+    if lower.starts_with("select @@") || lower.starts_with("select @@session.") {
+        // Extract the variable name (stop at whitespace, comma, or 'as')
+        let rest = lower
+            .trim_start_matches("select ")
+            .trim_start_matches("@@session.")
+            .trim_start_matches("@@");
+        let varname = rest
+            .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+            .next()
+            .unwrap_or("");
+        if let Some(val) = conn_state.get_variable(varname) {
+            return Some(single_text_row(varname, &val));
+        }
+        // Unknown @@variable → return NULL (not an error)
+        return Some(single_null_row(varname));
     }
 
-    // SELECT @@version_comment
-    if lower.contains("@@version_comment") {
-        return Some(single_text_row("@@version_comment", "AxiomDB"));
+    // ── SELECT version() / VERSION() ─────────────────────────────────────────
+    if lower == "select version()" || lower.starts_with("select version()") {
+        return Some(single_text_row("version()", "8.0.36-AxiomDB-0.1.0"));
     }
 
-    // SELECT DATABASE() or SELECT current_database()
+    // ── SELECT @@version mixed with other vars ────────────────────────────────
+    if lower.contains("@@version") && !lower.contains("from ") {
+        return Some(single_text_row("@@version", "8.0.36-AxiomDB-0.1.0"));
+    }
+
+    // ── SELECT DATABASE() / current_database() ────────────────────────────────
     if lower.contains("database()") || lower.contains("current_database()") {
-        return Some(single_text_row("DATABASE()", "axiomdb"));
+        if conn_state.current_database.is_empty() {
+            return Some(single_null_row("DATABASE()"));
+        }
+        return Some(single_text_row(
+            "DATABASE()",
+            &conn_state.current_database.clone(),
+        ));
     }
 
-    // SELECT @@sql_mode
-    if lower.contains("@@sql_mode") {
-        return Some(single_text_row("@@sql_mode", ""));
-    }
-
-    // SELECT @@lower_case_table_names
-    if lower.contains("@@lower_case_table_names") {
-        return Some(single_text_row("@@lower_case_table_names", "0"));
-    }
-
-    // SELECT @@max_allowed_packet
-    if lower.contains("@@max_allowed_packet") {
-        return Some(single_text_row("@@max_allowed_packet", "67108864"));
-    }
-
-    // SHOW WARNINGS — empty result set
-    if lower == "show warnings" {
+    // ── SHOW WARNINGS ─────────────────────────────────────────────────────────
+    if lower.starts_with("show warnings") || lower.starts_with("show errors") {
         let cols = vec![
             ColumnMeta::computed("Level".to_string(), DataType::Text),
             ColumnMeta::computed("Code".to_string(), DataType::BigInt),
@@ -275,10 +335,62 @@ fn intercept_special_query(sql: &str) -> Option<Vec<(u8, Vec<u8>)>> {
         return Some(serialize_query_result(qr, 1));
     }
 
-    // SHOW DATABASES
-    if lower == "show databases" || lower.starts_with("show databases") {
+    // ── SHOW DATABASES ────────────────────────────────────────────────────────
+    if lower.starts_with("show databases") {
         let cols = vec![ColumnMeta::computed("Database".to_string(), DataType::Text)];
         let rows = vec![vec![Value::Text("axiomdb".into())]];
+        let qr = QueryResult::Rows {
+            columns: cols,
+            rows,
+        };
+        return Some(serialize_query_result(qr, 1));
+    }
+
+    // ── SHOW VARIABLES ────────────────────────────────────────────────────────
+    if lower.starts_with("show") && lower.contains("variables") {
+        return Some(show_variables_result(&lower, conn_state));
+    }
+
+    // ── SHOW SESSION STATUS (e.g. LIKE 'Ssl%') ────────────────────────────────
+    if lower.starts_with("show") && lower.contains("status") {
+        let cols = vec![
+            ColumnMeta::computed("Variable_name".to_string(), DataType::Text),
+            ColumnMeta::computed("Value".to_string(), DataType::Text),
+        ];
+        let qr = QueryResult::Rows {
+            columns: cols,
+            rows: vec![],
+        };
+        return Some(serialize_query_result(qr, 1));
+    }
+
+    // ── SHOW FULL PROCESSLIST ─────────────────────────────────────────────────
+    if lower.starts_with("show") && lower.contains("processlist") {
+        let cols = vec![
+            ColumnMeta::computed("Id".to_string(), DataType::BigInt),
+            ColumnMeta::computed("User".to_string(), DataType::Text),
+            ColumnMeta::computed("Host".to_string(), DataType::Text),
+            ColumnMeta::computed("db".to_string(), DataType::Text),
+            ColumnMeta::computed("Command".to_string(), DataType::Text),
+            ColumnMeta::computed("Time".to_string(), DataType::BigInt),
+            ColumnMeta::computed("State".to_string(), DataType::Text),
+            ColumnMeta::computed("Info".to_string(), DataType::Text),
+        ];
+        let db_val = if conn_state.current_database.is_empty() {
+            Value::Null
+        } else {
+            Value::Text(conn_state.current_database.clone())
+        };
+        let rows = vec![vec![
+            Value::BigInt(1),
+            Value::Text("root".into()),
+            Value::Text("localhost".into()),
+            db_val,
+            Value::Text("Query".into()),
+            Value::BigInt(0),
+            Value::Null,
+            Value::Null,
+        ]];
         let qr = QueryResult::Rows {
             columns: cols,
             rows,
@@ -289,6 +401,61 @@ fn intercept_special_query(sql: &str) -> Option<Vec<(u8, Vec<u8>)>> {
     None
 }
 
+/// Builds a SHOW VARIABLES result filtered by the LIKE pattern in `lower`.
+fn show_variables_result(lower: &str, conn_state: &ConnectionState) -> Vec<(u8, Vec<u8>)> {
+    use super::result::serialize_query_result;
+    use axiomdb_sql::result::{ColumnMeta, QueryResult};
+    use axiomdb_types::{DataType, Value};
+
+    let cols = vec![
+        ColumnMeta::computed("Variable_name".to_string(), DataType::Text),
+        ColumnMeta::computed("Value".to_string(), DataType::Text),
+    ];
+
+    let charset = conn_state.character_set_client.clone();
+    let all_vars: Vec<(&str, String)> = vec![
+        ("character_set_client", charset.clone()),
+        ("character_set_connection", charset.clone()),
+        ("character_set_database", "utf8mb4".into()),
+        ("character_set_results", charset.clone()),
+        ("character_set_server", "utf8mb4".into()),
+        ("character_set_system", "utf8mb3".into()),
+        ("collation_connection", "utf8mb4_0900_ai_ci".into()),
+        ("collation_database", "utf8mb4_0900_ai_ci".into()),
+        ("collation_server", "utf8mb4_0900_ai_ci".into()),
+    ];
+
+    // Extract LIKE pattern if present
+    let like_pattern = if lower.contains("like") {
+        lower.split("like").nth(1).map(|s| {
+            s.trim()
+                .trim_matches('\'')
+                .trim_matches('"')
+                .replace('%', "")
+        })
+    } else {
+        None
+    };
+
+    let rows: Vec<Vec<Value>> = all_vars
+        .into_iter()
+        .filter(|(name, _)| {
+            if let Some(ref pat) = like_pattern {
+                name.contains(pat.as_str())
+            } else {
+                true
+            }
+        })
+        .map(|(name, val)| vec![Value::Text(name.into()), Value::Text(val)])
+        .collect();
+
+    let qr = QueryResult::Rows {
+        columns: cols,
+        rows,
+    };
+    serialize_query_result(qr, 1)
+}
+
 /// Builds a single-column, single-row text result set.
 fn single_text_row(col_name: &str, value: &str) -> Vec<(u8, Vec<u8>)> {
     use super::result::serialize_query_result;
@@ -297,6 +464,22 @@ fn single_text_row(col_name: &str, value: &str) -> Vec<(u8, Vec<u8>)> {
 
     let cols = vec![ColumnMeta::computed(col_name.to_string(), DataType::Text)];
     let rows = vec![vec![Value::Text(value.into())]];
+    let qr = QueryResult::Rows {
+        columns: cols,
+        rows,
+    };
+    serialize_query_result(qr, 1)
+}
+
+/// Builds a single-column, single-row result set with a NULL value.
+/// Used for unknown @@variables that should return NULL instead of an error.
+fn single_null_row(col_name: &str) -> Vec<(u8, Vec<u8>)> {
+    use super::result::serialize_query_result;
+    use axiomdb_sql::result::{ColumnMeta, QueryResult};
+    use axiomdb_types::{DataType, Value};
+
+    let cols = vec![ColumnMeta::computed(col_name.to_string(), DataType::Text)];
+    let rows = vec![vec![Value::Null]];
     let qr = QueryResult::Rows {
         columns: cols,
         rows,

@@ -26,6 +26,8 @@ pub mod error;
 pub mod handler;
 pub mod packets;
 pub mod result;
+pub mod session;
 
 pub use database::Database;
 pub use handler::handle_connection;
+pub use session::ConnectionState;

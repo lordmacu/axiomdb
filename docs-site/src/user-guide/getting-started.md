@@ -157,9 +157,19 @@ installation is required — the MySQL wire protocol is fully compatible.
 
 ### Authentication
 
-AxiomDB Phase 5 uses **permissive authentication**: the server performs the full
-`mysql_native_password` handshake (SHA1 challenge-response) but accepts any password
-for usernames in the allowlist: `root`, `axiomdb`, `admin`, and the empty string.
+AxiomDB Phase 5 uses **permissive authentication**: the server accepts any password
+for usernames in the allowlist (`root`, `axiomdb`, `admin`, and the empty string).
+Both of the most common MySQL authentication plugins are supported with no client-side
+configuration required:
+
+| Plugin | Clients | Notes |
+|--------|---------|-------|
+| `mysql_native_password` | MySQL 5.x clients, older PyMySQL, mysql2 < 0.5 | 3-packet handshake (greeting → response → OK) |
+| `caching_sha2_password` | MySQL 8.0+ default, PyMySQL >= 1.0, MySQL Connector/Python | 5-packet handshake (greeting → response → fast_auth_success → ack → OK) |
+
+If your client connects with MySQL 8.0+ defaults and you see silent connection drops,
+your client is using `caching_sha2_password` — AxiomDB handles this automatically.
+No `--default-auth` flag or `authPlugin` option is needed.
 
 Full password enforcement with stored credentials is planned for Phase 13 (Security).
 

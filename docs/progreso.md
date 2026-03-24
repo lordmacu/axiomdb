@@ -164,17 +164,17 @@
 - [ ] 5.2c ⏳ ON_ERROR session behavior — `SET ON_ERROR = 'rollback_statement'` rolls back only the failing statement and continues the transaction (fixes the PostgreSQL silent-abort problem where developers lose all previous work); `SET ON_ERROR = 'rollback_transaction'` is PostgreSQL-standard behavior; `SET ON_ERROR = 'savepoint'` automatically creates a savepoint before each statement so errors can be recovered without losing the whole transaction; `SET ON_ERROR = 'ignore'` matches MySQL lenient behavior; solves the real production pain of `BEGIN ... multiple statements ... one fails ... COMMIT does ROLLBACK without warning`
 - [ ] 5.2b ⏳ Session-level collation and compat mode — `SET collation = 'es'` changes default sort for the session; `SET AXIOM_COMPAT = 'mysql'` makes the session behave like MySQL (CI+AI default); `SET AXIOM_COMPAT = 'postgresql'` for PG behavior; these settings propagate to all subsequent queries in the session and are reset on reconnect; foundation for the per-database compat mode in Phase 13
 - [x] 5.3 ✅ Authentication — mysql_native_password (SHA1-based); permissive mode (Phase 5); root/axiomdb accepted
-- [ ] 5.3b ⏳ caching_sha2_password — MySQL 8.0+ auth plugin; required by MySQL Workbench, DBeaver and modern clients; full auth + fast auth path
+- [x] 5.3b ✅ caching_sha2_password — fast auth path (0x01 0x03 + ack read + OK at seq=4); pymysql default plugin works
 - [x] 5.4 ✅ COM_QUERY handler — receive SQL → parse → analyze → execute_with_ctx → respond; COM_PING/QUIT/INIT_DB; ORM query interception (SET, @@version, SHOW DATABASES)
 - [ ] 5.4a ⏳ max_allowed_packet enforcement — limit incoming packet size (default 64MB); reject with error if exceeded; prevent OOM from malicious or accidental query
 - [x] 5.5 ✅ Result set serialization — column_count + column_defs + EOF + rows (lenenc text) + EOF; all AxiomDB types mapped to MySQL type codes
 - [ ] 5.5a ⏳ Binary result encoding by type — MySQL binary protocol for prepared statements: DATE as `{year,month,day}`, DECIMAL as precision-exact string, BLOB as length-prefixed bytes, BIGINT as little-endian 8 bytes; without this types are corrupted in prepared statement results
 - [x] 5.6 ✅ Error packets — DbError → MySQL error code + SQLSTATE; full mapping for all error variants
 - [x] 5.7 ✅ Test with real client — pymysql: connect, CREATE, INSERT (AUTO_INCREMENT), SELECT, error handling all pass
-- [ ] 5.8 ⏳ Protocol unit tests — verify handshake/COM_QUERY/error/result-set packets without external client
-- [ ] 5.9 ⏳ Session state — per-connection session variables: current_database, SET/SHOW, autocommit
+- [x] 5.8 ✅ Protocol unit tests — 47 tests: codec round-trip, greeting structure, OK/ERR/EOF, lenenc boundaries, result set sequence IDs, auth, session state
+- [x] 5.9 ✅ Session state — ConnectionState: SET autocommit/NAMES/@@vars stored; SHOW VARIABLES result set; SELECT @@var from state; COM_INIT_DB updates current_database
 - [ ] 5.10 ⏳ COM_STMT_PREPARE / COM_STMT_EXECUTE — prepared statements over wire protocol; all ORMs use them, avoid parse overhead per query
-- [ ] 5.11 ⏳ COM_PING / COM_QUIT / COM_RESET_CONNECTION / COM_INIT_DB — connection management commands that clients send automatically
+- [x] 5.11 ✅ COM_PING / COM_QUIT / COM_RESET_CONNECTION / COM_INIT_DB — all handled in handler.rs command loop (0x0e, 0x01, 0x1f, 0x02)
 - [ ] 5.11b ⏳ COM_STMT_SEND_LONG_DATA — chunked transmission of large parameters (BLOBs, TEXTs) in multiple packets; required for INSERT of images/documents via prepared statements
 - [ ] 5.11c ⏳ Explicit connection state machine — states: `CONNECTED→AUTH→IDLE→EXECUTING→CLOSING`; timeout handling per state; detect abruptly closed socket (TCP keepalive)
 - [ ] 5.12 ⏳ Multi-statement queries — respond to multiple SELECTs separated by `;` in a single COM_QUERY (PHP legacy, SQL scripts)

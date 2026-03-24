@@ -1,4 +1,4 @@
-//! mysql_native_password authentication.
+//! MySQL authentication — mysql_native_password and caching_sha2_password.
 //!
 //! Implements the challenge-response auth used by MySQL 5.x clients.
 //!
@@ -12,6 +12,7 @@
 
 use rand::RngCore;
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 
 /// Generates a 20-byte random challenge for use in the handshake.
 pub fn gen_challenge() -> [u8; 20] {
@@ -51,6 +52,34 @@ pub fn verify_native_password(password: &str, challenge: &[u8; 20], auth_respons
         .collect();
 
     auth_response == expected.as_slice()
+}
+
+// ── caching_sha2_password ─────────────────────────────────────────────────────
+
+/// Computes a caching_sha2_password fast-auth token for testing.
+///
+/// `token = SHA256(password) XOR SHA256(challenge || SHA256(SHA256(password)))`
+///
+/// The token is 32 bytes (SHA256 output), unlike mysql_native_password which
+/// produces 20 bytes (SHA1 output).
+pub fn compute_sha256_token(password: &str, challenge: &[u8; 20]) -> [u8; 32] {
+    let sha256_pwd: [u8; 32] = Sha256::digest(password.as_bytes()).into();
+    let sha256_sha256_pwd: [u8; 32] = Sha256::digest(sha256_pwd).into();
+    let mut h = Sha256::new();
+    h.update(challenge);
+    h.update(sha256_sha256_pwd);
+    let xor_key: [u8; 32] = h.finalize().into();
+    let mut token = [0u8; 32];
+    for i in 0..32 {
+        token[i] = sha256_pwd[i] ^ xor_key[i];
+    }
+    token
+}
+
+/// Phase 5 permissive mode: accepts any caching_sha2_password response for
+/// allowed users. Real hash verification is Phase 13.
+pub fn verify_sha256_password(_challenge: &[u8; 20], _auth_response: &[u8]) -> bool {
+    true // permissive — all allowed users accepted
 }
 
 /// Allowed users for Phase 5 — permissive mode.
