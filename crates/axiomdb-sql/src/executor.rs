@@ -644,6 +644,40 @@ fn execute_insert_ctx(
 
     let mut count = 0u64;
 
+    // Find the AUTO_INCREMENT column (at most one per table).
+    let auto_inc_col: Option<usize> = schema_cols.iter().position(|c| c.auto_increment);
+    let mut first_generated: Option<u64> = None;
+
+    fn next_auto_inc_ctx(
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
+        table_def: &axiomdb_catalog::schema::TableDef,
+        schema_cols: &[axiomdb_catalog::schema::ColumnDef],
+        col_idx: usize,
+    ) -> Result<u64, DbError> {
+        let table_id = table_def.id;
+        let cached = AUTO_INC_SEQ.with(|seq| seq.borrow().get(&table_id).copied());
+        if let Some(next) = cached {
+            AUTO_INC_SEQ.with(|seq| seq.borrow_mut().insert(table_id, next + 1));
+            return Ok(next);
+        }
+        let snap = txn.active_snapshot()?;
+        let rows = TableEngine::scan_table(storage, table_def, schema_cols, snap)?;
+        let max_existing: u64 = rows
+            .iter()
+            .filter_map(|(_, vals)| vals.get(col_idx))
+            .filter_map(|v| match v {
+                Value::Int(n) => Some(*n as u64),
+                Value::BigInt(n) => Some(*n as u64),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let next = max_existing + 1;
+        AUTO_INC_SEQ.with(|seq| seq.borrow_mut().insert(table_id, next + 1));
+        Ok(next)
+    }
+
     match stmt.source {
         InsertSource::Values(rows) => {
             for value_exprs in rows {
@@ -652,7 +686,7 @@ fn execute_insert_ctx(
                     .map(|e| eval(e, &[]))
                     .collect::<Result<_, _>>()?;
 
-                let full_values: Vec<Value> = col_positions
+                let mut full_values: Vec<Value> = col_positions
                     .iter()
                     .map(|&idx| {
                         if idx == usize::MAX {
@@ -662,6 +696,20 @@ fn execute_insert_ctx(
                         }
                     })
                     .collect();
+
+                if let Some(ai_col) = auto_inc_col {
+                    if matches!(full_values.get(ai_col), Some(Value::Null)) {
+                        let id =
+                            next_auto_inc_ctx(storage, txn, &resolved.def, schema_cols, ai_col)?;
+                        full_values[ai_col] = match schema_cols[ai_col].col_type {
+                            axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
+                            _ => Value::Int(id as i32),
+                        };
+                        if first_generated.is_none() {
+                            first_generated = Some(id);
+                        }
+                    }
+                }
 
                 TableEngine::insert_row(storage, txn, &resolved.def, schema_cols, full_values)?;
                 count += 1;
@@ -677,7 +725,7 @@ fn execute_insert_ctx(
                 }
             };
             for row_values in select_rows {
-                let full_values: Vec<Value> = col_positions
+                let mut full_values: Vec<Value> = col_positions
                     .iter()
                     .map(|&idx| {
                         if idx == usize::MAX {
@@ -687,6 +735,19 @@ fn execute_insert_ctx(
                         }
                     })
                     .collect();
+                if let Some(ai_col) = auto_inc_col {
+                    if matches!(full_values.get(ai_col), Some(Value::Null)) {
+                        let id =
+                            next_auto_inc_ctx(storage, txn, &resolved.def, schema_cols, ai_col)?;
+                        full_values[ai_col] = match schema_cols[ai_col].col_type {
+                            axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
+                            _ => Value::Int(id as i32),
+                        };
+                        if first_generated.is_none() {
+                            first_generated = Some(id);
+                        }
+                    }
+                }
                 TableEngine::insert_row(storage, txn, &resolved.def, schema_cols, full_values)?;
                 count += 1;
             }
@@ -696,6 +757,11 @@ fn execute_insert_ctx(
                 feature: "DEFAULT VALUES — Phase 4.3c".into(),
             })
         }
+    }
+
+    if let Some(id) = first_generated {
+        THREAD_LAST_INSERT_ID.with(|v| v.set(id));
+        return Ok(QueryResult::affected_with_id(count, id));
     }
 
     Ok(QueryResult::Affected {

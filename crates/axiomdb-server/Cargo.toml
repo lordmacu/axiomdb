@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 axiomdb-core       = { workspace = true }
+axiomdb-network    = { path = "../axiomdb-network" }
 thiserror          = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }

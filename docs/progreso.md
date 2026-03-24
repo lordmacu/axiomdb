@@ -157,20 +157,20 @@
 - [x] 4.16 ✅ SQL full test suite — LIKE/BETWEEN/IN/IS NULL, CAST, scalar functions (ABS/LENGTH/UPPER/LOWER/TRIM/SUBSTR/ROUND/COALESCE/NOW), NULL semantics, string concat, arithmetic expressions, error cases (division by zero, InvalidCoercion); documents NOT NULL/UNIQUE/CHECK gaps; 1046 total tests
 - [x] 4.16b ✅ INSERT throughput benchmark — batch 10K rows (1 txn, SchemaCache): 36K ops/s ⚠️; bottleneck = WAL record_insert ~20µs/row (NOT parse/catalog); target 180K ops/s requires Phase 8 prepared statements; add bench_insert_batch_cached to executor_e2e.rs
 
-### Phase 5 — MySQL Wire Protocol `⏳` week 26-30
-- [ ] 5.1 ⏳ TCP listener with Tokio — accept connections on :3306
-- [ ] 5.2 ⏳ MySQL handshake — Server Greeting + Client Response
+### Phase 5 — MySQL Wire Protocol `🔄` week 26-30
+- [x] 5.1 ✅ TCP listener with Tokio — accept connections on :3306; Arc<Mutex<Database>>; tokio::spawn per connection
+- [x] 5.2 ✅ MySQL handshake — HandshakeV10 (greeting) + HandshakeResponse41 (client response)
 - [ ] 5.2a ⏳ Charset/collation negotiation in handshake — `character_set_client`, `character_set_results`, `collation_connection` sent in Server Greeting; client chooses charset; without this modern MySQL clients cannot connect or display incorrect characters
 - [ ] 5.2c ⏳ ON_ERROR session behavior — `SET ON_ERROR = 'rollback_statement'` rolls back only the failing statement and continues the transaction (fixes the PostgreSQL silent-abort problem where developers lose all previous work); `SET ON_ERROR = 'rollback_transaction'` is PostgreSQL-standard behavior; `SET ON_ERROR = 'savepoint'` automatically creates a savepoint before each statement so errors can be recovered without losing the whole transaction; `SET ON_ERROR = 'ignore'` matches MySQL lenient behavior; solves the real production pain of `BEGIN ... multiple statements ... one fails ... COMMIT does ROLLBACK without warning`
 - [ ] 5.2b ⏳ Session-level collation and compat mode — `SET collation = 'es'` changes default sort for the session; `SET AXIOM_COMPAT = 'mysql'` makes the session behave like MySQL (CI+AI default); `SET AXIOM_COMPAT = 'postgresql'` for PG behavior; these settings propagate to all subsequent queries in the session and are reset on reconnect; foundation for the per-database compat mode in Phase 13
-- [ ] 5.3 ⏳ Authentication — basic `mysql_native_password` (SHA1-based for MySQL 5.x compatibility)
+- [x] 5.3 ✅ Authentication — mysql_native_password (SHA1-based); permissive mode (Phase 5); root/axiomdb accepted
 - [ ] 5.3b ⏳ caching_sha2_password — MySQL 8.0+ auth plugin; required by MySQL Workbench, DBeaver and modern clients; full auth + fast auth path
-- [ ] 5.4 ⏳ COM_QUERY handler — receive SQL, execute, respond
+- [x] 5.4 ✅ COM_QUERY handler — receive SQL → parse → analyze → execute_with_ctx → respond; COM_PING/QUIT/INIT_DB; ORM query interception (SET, @@version, SHOW DATABASES)
 - [ ] 5.4a ⏳ max_allowed_packet enforcement — limit incoming packet size (default 64MB); reject with error if exceeded; prevent OOM from malicious or accidental query
-- [ ] 5.5 ⏳ Result set serialization — columns + rows in wire protocol (text protocol)
+- [x] 5.5 ✅ Result set serialization — column_count + column_defs + EOF + rows (lenenc text) + EOF; all AxiomDB types mapped to MySQL type codes
 - [ ] 5.5a ⏳ Binary result encoding by type — MySQL binary protocol for prepared statements: DATE as `{year,month,day}`, DECIMAL as precision-exact string, BLOB as length-prefixed bytes, BIGINT as little-endian 8 bytes; without this types are corrupted in prepared statement results
-- [ ] 5.6 ⏳ Error packets — serialize `DbError` as MySQL error
-- [ ] 5.7 ⏳ Test with real client — PHP PDO or Python PyMySQL connects and queries
+- [x] 5.6 ✅ Error packets — DbError → MySQL error code + SQLSTATE; full mapping for all error variants
+- [x] 5.7 ✅ Test with real client — pymysql: connect, CREATE, INSERT (AUTO_INCREMENT), SELECT, error handling all pass
 - [ ] 5.8 ⏳ Protocol unit tests — verify handshake/COM_QUERY/error/result-set packets without external client
 - [ ] 5.9 ⏳ Session state — per-connection session variables: current_database, SET/SHOW, autocommit
 - [ ] 5.10 ⏳ COM_STMT_PREPARE / COM_STMT_EXECUTE — prepared statements over wire protocol; all ORMs use them, avoid parse overhead per query

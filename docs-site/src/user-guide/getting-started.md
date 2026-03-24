@@ -73,7 +73,64 @@ Your Application (Rust / C++ / Python / Electron)
 ### Starting the Server
 
 ```bash
+# Default: stores data in ./data, listens on port 3306
+axiomdb-server
+
+# Custom data directory and port
 axiomdb-server --data-dir /var/lib/axiomdb --port 3306
+
+# Override port via environment variable
+AXIOMDB_PORT=3307 axiomdb-server
+```
+
+The server is ready when you see:
+
+```
+INFO axiomdb_server: listening on 0.0.0.0:3306
+```
+
+### Connecting with the mysql CLI
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u root
+```
+
+No password is required in Phase 5. Any username from the allowlist (`root`, `axiomdb`,
+`admin`) is accepted. See the [Authentication](#authentication) section below for details.
+
+### Connecting with Python (PyMySQL)
+
+```python
+import pymysql
+
+conn = pymysql.connect(
+    host='127.0.0.1',
+    port=3306,
+    user='root',
+    db='axiomdb',
+    charset='utf8mb4',
+)
+
+with conn.cursor() as cursor:
+    # CREATE TABLE with AUTO_INCREMENT
+    cursor.execute("""
+        CREATE TABLE users (
+            id    BIGINT PRIMARY KEY AUTO_INCREMENT,
+            name  TEXT   NOT NULL,
+            email TEXT   NOT NULL
+        )
+    """)
+
+    # INSERT — last_insert_id is returned in the OK packet
+    cursor.execute("INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com')")
+    print("inserted id:", cursor.lastrowid)
+
+    # SELECT
+    cursor.execute("SELECT id, name FROM users")
+    for row in cursor.fetchall():
+        print(row)
+
+conn.close()
 ```
 
 ### Connecting with PHP (PDO)
@@ -93,28 +150,28 @@ foreach ($stmt as $row) {
 }
 ```
 
-### Connecting with Python (PyMySQL)
-
-```python
-import pymysql
-
-conn = pymysql.connect(
-    host='127.0.0.1',
-    port=3306,
-    db='axiomdb',
-    charset='utf8mb4',
-)
-
-with conn.cursor() as cursor:
-    cursor.execute('SELECT id, name FROM users LIMIT 5')
-    for row in cursor.fetchall():
-        print(row)
-```
-
 ### Connecting with any MySQL GUI
 
 Point MySQL Workbench, DBeaver, or TablePlus to `127.0.0.1:3306`. No driver
 installation is required — the MySQL wire protocol is fully compatible.
+
+### Authentication
+
+AxiomDB Phase 5 uses **permissive authentication**: the server performs the full
+`mysql_native_password` handshake (SHA1 challenge-response) but accepts any password
+for usernames in the allowlist: `root`, `axiomdb`, `admin`, and the empty string.
+
+Full password enforcement with stored credentials is planned for Phase 13 (Security).
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Connecting from ORMs</span>
+SQLAlchemy, ActiveRecord, and similar ORMs send several setup queries on connect
+(<code>SET NAMES</code>, <code>SELECT @@version</code>, <code>SHOW DATABASES</code>, etc.).
+AxiomDB intercepts and stubs these automatically — no configuration needed.
+</div>
+</div>
 
 ---
 
