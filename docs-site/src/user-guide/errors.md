@@ -92,17 +92,58 @@ except AxiomDbError as e:
 
 ### 23503 — foreign_key_violation
 
-An INSERT or UPDATE references a row in another table that does not exist, or a
-DELETE would leave referencing rows without a parent.
+#### Child insert / update — parent key does not exist
+
+An INSERT or UPDATE references a value in the FK column that has no matching row
+in the parent table.
 
 ```sql
-INSERT INTO orders (user_id, total) VALUES (99999, 100);  -- user 99999 does not exist
--- ERROR 23503: insert into "orders" violates foreign key constraint "fk_orders_user"
--- Detail: Key (user_id)=(99999) is not present in table "users".
+INSERT INTO orders (user_id, total) VALUES (99999, 100);
+-- ERROR 23503: Foreign key constraint fails: 'orders.user_id' = '99999'
 ```
 
-**Typical application response:** Validate that the referenced entity exists before
-inserting, or show "Referenced record not found."
+**Typical response:** Validate that the referenced entity exists before inserting,
+or surface "Referenced record not found."
+
+#### Parent delete — children still reference it (RESTRICT / NO ACTION)
+
+A DELETE on the parent table was blocked because child rows reference the row
+being deleted and the FK action is `RESTRICT` or `NO ACTION` (the default).
+
+```sql
+-- orders.user_id REFERENCES users(id) ON DELETE RESTRICT
+DELETE FROM users WHERE id = 1;
+-- ERROR 23503: foreign key constraint "fk_orders_user": orders.user_id references this row
+```
+
+**Typical response:** Either delete child rows first, use `ON DELETE CASCADE`, or
+prevent parent deletion in the application layer.
+
+#### Cascade depth exceeded
+
+A chain of `ON DELETE CASCADE` constraints exceeded the maximum depth of 10 levels.
+
+```sql
+-- If table chain A→B→C→...→K (11 levels all with CASCADE) and you delete from A:
+DELETE FROM a WHERE id = 1;
+-- ERROR 23503: foreign key cascade depth exceeded limit of 10
+```
+
+**Typical response:** Restructure the schema to reduce cascade depth, or perform
+the deletes manually level-by-level.
+
+#### SET NULL on a NOT NULL column
+
+`ON DELETE SET NULL` is defined on a foreign key column that was declared `NOT NULL`.
+
+```sql
+-- orders.user_id is NOT NULL, but ON DELETE SET NULL is declared
+DELETE FROM users WHERE id = 1;
+-- ERROR 23503: cannot set FK column orders.user_id to NULL: column is NOT NULL
+```
+
+**Typical response:** Either remove the `NOT NULL` constraint from the FK column,
+or change the action to `ON DELETE RESTRICT` or `ON DELETE CASCADE`.
 
 ### 23502 — not_null_violation
 

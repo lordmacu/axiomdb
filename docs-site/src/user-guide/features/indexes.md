@@ -245,17 +245,52 @@ ALTER TABLE orders DROP CONSTRAINT fk_user;
 | `CASCADE` | Automatically delete all child rows (recursive, max depth 10) |
 | `SET NULL` | Set child FK column to NULL (column must be nullable) |
 
+### Enforcement Examples
+
+```sql
+CREATE TABLE users  (id INT PRIMARY KEY, email TEXT);
+CREATE TABLE orders (id INT PRIMARY KEY, user_id INT REFERENCES users(id) ON DELETE CASCADE);
+
+INSERT INTO users  VALUES (1, 'alice@x.com');
+INSERT INTO orders VALUES (10, 1);            -- ✅ user 1 exists
+
+-- INSERT with missing parent → error
+INSERT INTO orders VALUES (20, 999);
+-- ERROR 23503: Foreign key constraint fails: 'orders.user_id' = '999'
+
+-- DELETE parent with CASCADE → child rows automatically deleted
+DELETE FROM users WHERE id = 1;
+SELECT COUNT(*) FROM orders;  -- → 0 (orders were cascaded)
+
+-- DELETE parent with RESTRICT (default) → blocked if children exist
+CREATE TABLE invoices (id INT PRIMARY KEY, order_id INT REFERENCES orders(id));
+INSERT INTO users   VALUES (2, 'bob@x.com');
+INSERT INTO orders  VALUES (30, 2);
+INSERT INTO invoices VALUES (1, 30);
+DELETE FROM orders WHERE id = 30;
+-- ERROR 23503: foreign key constraint "fk_invoices_order_id": invoices.order_id references this row
+```
+
 ### NULL FK Values
 
 A NULL value in a FK column is always allowed — it does not reference any parent row.
 This follows SQL standard MATCH SIMPLE semantics.
 
+```sql
+INSERT INTO orders VALUES (99, NULL);  -- ✅ NULL user_id is always allowed
+```
+
+### ON UPDATE
+
+Only `ON UPDATE RESTRICT` (the default) is enforced. Updating a parent key while
+child rows reference it is rejected. `ON UPDATE CASCADE` and `ON UPDATE SET NULL`
+are planned for Phase 6.9.
+
 ### Phase 6.5 Limitations
 
-- Only single-column FKs are supported. Composite FKs are planned for Phase 6.9.
+- Only single-column FKs are supported. Composite FKs — `FOREIGN KEY (a, b) REFERENCES t(x, y)` — are planned for Phase 6.9.
 - `ON UPDATE CASCADE` / `ON UPDATE SET NULL` are planned for Phase 6.9.
-- FK enforcement uses a full table scan of the parent for validation. An optimized
-  index-based check is planned for Phase 6.9.
+- FK validation uses a full table scan of the parent table (optimized index-based check planned for Phase 6.9).
 
 ---
 
