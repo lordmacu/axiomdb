@@ -4,6 +4,15 @@ pub const PAGE_SIZE: usize = 16_384;
 pub const HEADER_SIZE: usize = 64;
 pub const PAGE_MAGIC: u64 = 0x4158494F_4D444200; // "AXIOMDB\0"
 
+/// Bit 0 of `PageHeader.flags`: all alive slots on this page were inserted by
+/// committed transactions and none have been deleted. When set, sequential scans
+/// can skip per-slot MVCC visibility checks for this page entirely.
+///
+/// Cleared unconditionally by [`crate::heap::mark_deleted`] before any slot
+/// deletion stamp. Set lazily by `HeapChain::scan_visible` after verifying
+/// all alive slots are visible to every possible reader.
+pub const PAGE_FLAG_ALL_VISIBLE: u8 = 0x01;
+
 // ── PageType ──────────────────────────────────────────────────────────────────
 
 #[repr(u8)]
@@ -192,6 +201,21 @@ impl Page {
         let checksum = crc32c::crc32c(self.body());
         self.header_mut().checksum = checksum;
     }
+
+    /// Returns `true` if the all-visible flag (bit 0 of `PageHeader.flags`) is set.
+    pub fn is_all_visible(&self) -> bool {
+        self.header().flags & PAGE_FLAG_ALL_VISIBLE != 0
+    }
+
+    /// Sets the all-visible flag. Caller must call `update_checksum()` afterward.
+    pub fn set_all_visible(&mut self) {
+        self.header_mut().flags |= PAGE_FLAG_ALL_VISIBLE;
+    }
+
+    /// Clears the all-visible flag. Caller must call `update_checksum()` afterward.
+    pub fn clear_all_visible(&mut self) {
+        self.header_mut().flags &= !PAGE_FLAG_ALL_VISIBLE;
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -264,5 +288,48 @@ mod tests {
             assert_eq!(PageType::try_from(byte).unwrap(), expected);
         }
         assert!(PageType::try_from(99).is_err());
+    }
+
+    #[test]
+    fn test_all_visible_flag_set_and_clear() {
+        let mut page = Page::new(crate::PageType::Data, 1);
+        assert!(!page.is_all_visible());
+        page.set_all_visible();
+        page.update_checksum();
+        assert!(page.is_all_visible());
+        assert!(page.verify_checksum().is_ok());
+        page.clear_all_visible();
+        page.update_checksum();
+        assert!(!page.is_all_visible());
+        assert!(page.verify_checksum().is_ok());
+    }
+
+    #[test]
+    fn test_all_visible_does_not_affect_other_flags() {
+        let mut page = Page::new(crate::PageType::Data, 1);
+        page.header_mut().flags = 0xFF;
+        page.clear_all_visible();
+        assert_eq!(page.header().flags, 0xFE);
+        page.set_all_visible();
+        assert_eq!(page.header().flags, 0xFF);
+    }
+
+    #[test]
+    fn test_checksum_valid_after_flag_and_body_write() {
+        // The checksum covers body bytes [HEADER_SIZE..PAGE_SIZE].
+        // Mutating a body byte without update_checksum invalidates the checksum;
+        // calling update_checksum restores it even after a flag change.
+        let mut page = Page::new(crate::PageType::Data, 1);
+        page.set_all_visible();
+        page.update_checksum();
+        assert!(page.verify_checksum().is_ok());
+        // Corrupt a body byte without updating the checksum.
+        page.as_bytes_mut()[HEADER_SIZE + 5] ^= 0xFF;
+        assert!(page.verify_checksum().is_err());
+        // After recomputing the checksum the page is valid again.
+        page.update_checksum();
+        assert!(page.verify_checksum().is_ok());
+        // Flag must still be set.
+        assert!(page.is_all_visible());
     }
 }

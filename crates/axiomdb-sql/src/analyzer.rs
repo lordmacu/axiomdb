@@ -301,7 +301,7 @@ fn bound_table_ref(
     col_offset: &mut usize,
 ) -> Result<BoundTable, DbError> {
     let schema = table_ref.schema.as_deref().unwrap_or(default_schema);
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
 
     let table_def =
         reader
@@ -678,7 +678,7 @@ fn analyze_insert_cached(
         (td.clone(), cols)
     } else {
         // Cache miss: normal catalog lookup
-        let reader = CatalogReader::new(storage, snapshot)?;
+        let mut reader = CatalogReader::new(storage, snapshot)?;
         let td =
             reader
                 .get_table(schema, &s.table.name)?
@@ -762,7 +762,7 @@ fn analyze_select_with_outer(
 
     // AnalyzeState is needed so that subquery arms inside expressions can
     // recurse back into analyze_select_with_outer.
-    let state = AnalyzeState {
+    let mut state = AnalyzeState {
         storage,
         snapshot,
         default_schema,
@@ -772,9 +772,12 @@ fn analyze_select_with_outer(
     let mut resolved_joins = Vec::with_capacity(s.joins.len());
     for mut join in s.joins {
         join.condition = match join.condition {
-            JoinCondition::On(expr) => {
-                JoinCondition::On(resolve_expr_full(expr, &ctx, outer_scopes, Some(&state))?)
-            }
+            JoinCondition::On(expr) => JoinCondition::On(resolve_expr_full(
+                expr,
+                &ctx,
+                outer_scopes,
+                Some(&mut state),
+            )?),
             JoinCondition::Using(cols) => {
                 // Detailed column-by-column validation deferred (Phase 4.22).
                 JoinCondition::Using(cols)
@@ -785,24 +788,24 @@ fn analyze_select_with_outer(
     s.joins = resolved_joins;
 
     // Resolve WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET.
-    s.where_clause = resolve_opt_expr_full(s.where_clause, &ctx, outer_scopes, Some(&state))?;
+    s.where_clause = resolve_opt_expr_full(s.where_clause, &ctx, outer_scopes, Some(&mut state))?;
     s.group_by = s
         .group_by
         .into_iter()
-        .map(|e| resolve_expr_full(e, &ctx, outer_scopes, Some(&state)))
+        .map(|e| resolve_expr_full(e, &ctx, outer_scopes, Some(&mut state)))
         .collect::<Result<_, _>>()?;
-    s.having = resolve_opt_expr_full(s.having, &ctx, outer_scopes, Some(&state))?;
+    s.having = resolve_opt_expr_full(s.having, &ctx, outer_scopes, Some(&mut state))?;
 
     // Resolve ORDER BY.
     let mut resolved_order = Vec::with_capacity(s.order_by.len());
     for mut item in s.order_by {
-        item.expr = resolve_expr_full(item.expr, &ctx, outer_scopes, Some(&state))?;
+        item.expr = resolve_expr_full(item.expr, &ctx, outer_scopes, Some(&mut state))?;
         resolved_order.push(item);
     }
     s.order_by = resolved_order;
 
-    s.limit = resolve_opt_expr_full(s.limit, &ctx, outer_scopes, Some(&state))?;
-    s.offset = resolve_opt_expr_full(s.offset, &ctx, outer_scopes, Some(&state))?;
+    s.limit = resolve_opt_expr_full(s.limit, &ctx, outer_scopes, Some(&mut state))?;
+    s.offset = resolve_opt_expr_full(s.offset, &ctx, outer_scopes, Some(&mut state))?;
 
     // Resolve SELECT list.
     let mut resolved_cols = Vec::with_capacity(s.columns.len());
@@ -819,7 +822,7 @@ fn analyze_select_with_outer(
                 item
             }
             SelectItem::Expr { expr, alias } => SelectItem::Expr {
-                expr: resolve_expr_full(expr, &ctx, outer_scopes, Some(&state))?,
+                expr: resolve_expr_full(expr, &ctx, outer_scopes, Some(&mut state))?,
                 alias,
             },
         };
@@ -839,7 +842,7 @@ fn analyze_insert(
     default_schema: &str,
 ) -> Result<InsertStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
 
     let table_def =
         reader
@@ -885,7 +888,7 @@ fn analyze_update(
     default_schema: &str,
 ) -> Result<UpdateStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
 
     let table_def =
         reader
@@ -939,7 +942,7 @@ fn analyze_delete(
     default_schema: &str,
 ) -> Result<DeleteStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
 
     let table_def =
         reader
@@ -971,7 +974,7 @@ fn analyze_create_table(
     snapshot: TransactionSnapshot,
     default_schema: &str,
 ) -> Result<CreateTableStmt, DbError> {
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
 
     // Validate FK REFERENCES targets.
     for col_def in &s.columns {
@@ -1024,7 +1027,7 @@ fn analyze_drop_table(
         return Ok(s); // IF EXISTS: no validation needed
     }
 
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
     for table_ref in &s.tables {
         let schema = table_ref.schema.as_deref().unwrap_or(default_schema);
         let exists = reader.get_table(schema, &table_ref.name)?.is_some();
@@ -1047,7 +1050,7 @@ fn analyze_create_index(
     default_schema: &str,
 ) -> Result<CreateIndexStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
 
     let table_def =
         reader
@@ -1084,7 +1087,7 @@ fn analyze_alter_table(
     default_schema: &str,
 ) -> Result<AlterTableStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
 
     // Validate the target table exists.
     reader

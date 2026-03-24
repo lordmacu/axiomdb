@@ -120,7 +120,7 @@ impl SlotEntry {
 
 /// Total number of slot entries on this page.
 #[inline]
-fn num_slots(page: &Page) -> u16 {
+pub fn num_slots(page: &Page) -> u16 {
     page.header().item_count
 }
 
@@ -132,7 +132,7 @@ fn slot_abs_offset(i: u16) -> usize {
 
 /// Reads slot entry `i` from the page (zero-copy cast).
 #[inline]
-fn read_slot(page: &Page, i: u16) -> SlotEntry {
+pub(crate) fn read_slot(page: &Page, i: u16) -> SlotEntry {
     let off = slot_abs_offset(i);
     *bytemuck::from_bytes(&page.as_bytes()[off..off + size_of::<SlotEntry>()])
 }
@@ -261,15 +261,61 @@ pub fn read_tuple(page: &Page, slot_id: u16) -> Result<Option<(&RowHeader, &[u8]
     Ok(Some((header, data)))
 }
 
-/// Marks `slot_id` as deleted by `txn_id` by writing `txn_id_deleted` in-place.
+/// Reads only the `txn_id_deleted` field from the [`RowHeader`] at `slot_id`.
 ///
-/// The slot remains physically present (MVCC: old versions must be readable
-/// by concurrent snapshots). VACUUM will reclaim the space later (Phase 7).
+/// Returns `None` if the slot is physically dead (zeroed SlotEntry).
+/// Returns `Some(txn_id_deleted)` otherwise — value is `0` if the row is live,
+/// non-zero if it has been stamped with a deletion transaction id.
+///
+/// This is cheaper than [`read_tuple`] for callers that only need to check
+/// which transaction deleted a slot (e.g., undo of `WalEntry::Truncate`).
+///
+/// # Errors
+/// - [`DbError::InvalidSlot`] if `slot_id >= num_slots`.
+pub fn read_tuple_header(page: &Page, slot_id: u16) -> Result<Option<u64>, DbError> {
+    let n = num_slots(page);
+    if slot_id >= n {
+        return Err(DbError::InvalidSlot {
+            page_id: page.header().page_id,
+            slot_id,
+            num_slots: n,
+        });
+    }
+    let entry = read_slot(page, slot_id);
+    if entry.is_dead() {
+        return Ok(None);
+    }
+    // txn_id_deleted is at bytes 8..16 of the RowHeader.
+    const TXN_DELETED_OFFSET_IN_HEADER: usize = 8;
+    let field_abs = entry.offset as usize + TXN_DELETED_OFFSET_IN_HEADER;
+    let txn_id_deleted = u64::from_le_bytes([
+        page.as_bytes()[field_abs],
+        page.as_bytes()[field_abs + 1],
+        page.as_bytes()[field_abs + 2],
+        page.as_bytes()[field_abs + 3],
+        page.as_bytes()[field_abs + 4],
+        page.as_bytes()[field_abs + 5],
+        page.as_bytes()[field_abs + 6],
+        page.as_bytes()[field_abs + 7],
+    ]);
+    Ok(Some(txn_id_deleted))
+}
+
+/// Marks `slot_id` as deleted **without** recomputing the page checksum.
+///
+/// This is the hot-path primitive used by both the single-row and batch-delete
+/// paths. The caller is responsible for calling `page.update_checksum()` exactly
+/// once after all mutations on the page are complete.
 ///
 /// # Errors
 /// - [`DbError::InvalidSlot`] if `slot_id >= num_slots`.
 /// - [`DbError::AlreadyDeleted`] if the slot is already dead.
-pub fn delete_tuple(page: &mut Page, slot_id: u16, txn_id: TxnId) -> Result<(), DbError> {
+pub(crate) fn mark_deleted(page: &mut Page, slot_id: u16, txn_id: TxnId) -> Result<(), DbError> {
+    // Unconditionally clear the all-visible flag before stamping txn_id_deleted.
+    // No is_all_visible() check — one branch eliminated, same cache line as the
+    // subsequent write. The single update_checksum() in delete_tuple() covers both.
+    page.clear_all_visible();
+
     let n = num_slots(page);
     if slot_id >= n {
         return Err(DbError::InvalidSlot {
@@ -293,6 +339,22 @@ pub fn delete_tuple(page: &mut Page, slot_id: u16, txn_id: TxnId) -> Result<(), 
     page.as_bytes_mut()[field_abs..field_abs + size_of::<u64>()]
         .copy_from_slice(&txn_id.to_le_bytes());
 
+    Ok(())
+}
+
+/// Marks `slot_id` as deleted by `txn_id` and updates the page checksum.
+///
+/// The slot remains physically present (MVCC: old versions must be readable
+/// by concurrent snapshots). VACUUM will reclaim the space later (Phase 7).
+///
+/// For batch deletions on the same page, prefer calling [`mark_deleted`]
+/// for each slot and [`Page::update_checksum`] once at the end.
+///
+/// # Errors
+/// - [`DbError::InvalidSlot`] if `slot_id >= num_slots`.
+/// - [`DbError::AlreadyDeleted`] if the slot is already dead.
+pub fn delete_tuple(page: &mut Page, slot_id: u16, txn_id: TxnId) -> Result<(), DbError> {
+    mark_deleted(page, slot_id, txn_id)?;
     page.update_checksum();
     Ok(())
 }

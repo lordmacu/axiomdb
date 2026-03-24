@@ -688,8 +688,8 @@ mod tests {
         // Txn 2: delete_batch + record_truncate — then CRASH (no commit).
         let txn2 = mgr.begin().unwrap();
         let snap = mgr.active_snapshot().unwrap();
-        let raw_rids = HeapChain::scan_rids_visible(&storage, root_page_id, snap).unwrap();
-        HeapChain::delete_batch(&mut storage, &raw_rids, txn2).unwrap();
+        let raw_rids = HeapChain::scan_rids_visible(&mut storage, root_page_id, snap).unwrap();
+        HeapChain::delete_batch(&mut storage, root_page_id, &raw_rids, txn2).unwrap();
         mgr.record_truncate(1, root_page_id).unwrap();
         // Flush WAL buffer to disk (simulate kernel flush on crash).
         mgr.wal_mut().flush_buffer().unwrap();
@@ -701,7 +701,7 @@ mod tests {
 
         // After recovery: all 5 rows must be visible to a committed snapshot.
         let snap_after = TransactionSnapshot::committed(result.max_committed);
-        let visible = HeapChain::scan_rids_visible(&storage, root_page_id, snap_after).unwrap();
+        let visible = HeapChain::scan_rids_visible(&mut storage, root_page_id, snap_after).unwrap();
         assert_eq!(
             visible.len(),
             5,

@@ -27,7 +27,7 @@
 use axiomdb_core::{error::DbError, TransactionSnapshot, TxnId};
 
 use crate::{
-    heap::{insert_tuple, scan_visible},
+    heap::{clear_deletion, insert_tuple, num_slots, read_slot, read_tuple_header, scan_visible},
     page::{Page, PageType},
     StorageEngine,
 };
@@ -173,12 +173,14 @@ impl HeapChain {
     /// - I/O errors from `storage`.
     pub fn delete_batch(
         storage: &mut dyn StorageEngine,
+        root_page_id: u64,
         rids: &[(u64, u16)],
         txn_id: TxnId,
     ) -> Result<Vec<(u64, u16, Vec<u8>)>, DbError> {
         if rids.is_empty() {
             return Ok(vec![]);
         }
+        storage.prefetch_hint(root_page_id, 0);
 
         // Sort by (page_id, slot_id) so all slots on the same page are adjacent.
         let mut sorted: Vec<(u64, u16)> = rids.to_vec();
@@ -229,25 +231,110 @@ impl HeapChain {
     ///
     /// Eliminates all `Vec<u8>` allocations for the row data and all
     /// row-decode overhead compared to [`scan_visible`] + discard.
+    ///
+    /// Uses the all-visible fast path: if a page's `PAGE_FLAG_ALL_VISIBLE` bit
+    /// is set, per-slot MVCC checks are skipped entirely. After the first slow-path
+    /// scan that finds all slots committed and undeleted, the flag is set on the
+    /// page (lazy-set write) so every subsequent scan takes the fast path.
     pub fn scan_rids_visible(
-        storage: &dyn StorageEngine,
+        storage: &mut dyn StorageEngine,
         root_page_id: u64,
         snap: TransactionSnapshot,
     ) -> Result<Vec<(u64, u16)>, DbError> {
+        let mut result = Vec::new();
+        let mut current = root_page_id;
+        storage.prefetch_hint(root_page_id, 0);
+
+        while current != 0 {
+            let raw = *storage.read_page(current)?.as_bytes();
+            let mut page = Page::from_bytes(raw)?;
+            let next = chain_next_page(&page);
+
+            if page.is_all_visible() {
+                // Fast path: no txn_id_deleted stamps on this page — skip
+                // the all_vis tracking and lazy-set write overhead. We still
+                // call is_visible() for snapshot correctness: the flag means
+                // "no deleted rows", not "visible to every possible snapshot".
+                for slot_id in 0..num_slots(&page) {
+                    let entry = read_slot(&page, slot_id);
+                    if entry.is_dead() {
+                        continue;
+                    }
+                    let off = entry.offset as usize;
+                    let len = entry.length as usize;
+                    let bytes = &page.as_bytes()[off..off + len];
+                    let header: &crate::heap::RowHeader = bytemuck::from_bytes(
+                        &bytes[..std::mem::size_of::<crate::heap::RowHeader>()],
+                    );
+                    if header.is_visible(&snap) {
+                        result.push((current, slot_id));
+                    }
+                }
+            } else {
+                // Slow path: per-slot MVCC check + lazy-set tracking.
+                let mut all_vis = true;
+                let mut has_alive = false;
+
+                for slot_id in 0..num_slots(&page) {
+                    let entry = read_slot(&page, slot_id);
+                    if entry.is_dead() {
+                        continue;
+                    }
+                    has_alive = true;
+                    let off = entry.offset as usize;
+                    let len = entry.length as usize;
+                    let bytes = &page.as_bytes()[off..off + len];
+                    let header: &crate::heap::RowHeader = bytemuck::from_bytes(
+                        &bytes[..std::mem::size_of::<crate::heap::RowHeader>()],
+                    );
+                    // all_vis requires universal visibility: created must be
+                    // committed (txn_id_created < snapshot_id), not just visible
+                    // to this specific snapshot via current_txn_id.
+                    if header.txn_id_deleted != 0 || header.txn_id_created >= snap.snapshot_id {
+                        all_vis = false;
+                    }
+                    if !header.is_visible(&snap) {
+                        continue;
+                    }
+                    result.push((current, slot_id));
+                }
+
+                // Lazy-set: one-time write per page. After this, future scans use fast path.
+                if all_vis && has_alive && page.header().item_count > 0 {
+                    page.set_all_visible();
+                    page.update_checksum();
+                    storage.write_page(current, &page)?;
+                }
+            }
+
+            current = next;
+        }
+
+        Ok(result)
+    }
+
+    /// Read-only variant of [`scan_visible`] — takes `&dyn StorageEngine`
+    /// (immutable borrow) and never sets the all-visible flag.
+    ///
+    /// Used by `CatalogReader` and any other path that holds only a shared
+    /// reference to storage. Catalog tables are small (a few pages) and not
+    /// hot enough to warrant the lazy-set write.
+    pub fn scan_visible_ro(
+        storage: &dyn StorageEngine,
+        root_page_id: u64,
+        snap: TransactionSnapshot,
+    ) -> Result<Vec<(u64, u16, Vec<u8>)>, DbError> {
         let mut result = Vec::new();
         let mut current = root_page_id;
 
         while current != 0 {
             let page = storage.read_page(current)?;
             let next = chain_next_page(page);
-
-            for (slot_id, _data) in scan_visible(page, &snap) {
-                result.push((current, slot_id));
+            for (slot_id, data) in scan_visible(page, &snap) {
+                result.push((current, slot_id, data.to_vec()));
             }
-
             current = next;
         }
-
         Ok(result)
     }
 
@@ -259,21 +346,95 @@ impl HeapChain {
     /// Tuples are returned in chain order (root page first, within a page in
     /// slot order). Dead slots and MVCC-invisible tuples are excluded.
     ///
+    /// Uses the all-visible fast path: if a page's `PAGE_FLAG_ALL_VISIBLE` bit
+    /// is set, per-slot `txn_id_deleted` tracking and `all_vis` bookkeeping are
+    /// skipped. The flag means "no deleted rows on this page" — MVCC visibility
+    /// (`is_visible`) is still checked per slot for snapshot correctness. After
+    /// the first slow-path scan that finds all slots committed and undeleted,
+    /// the flag is written to the page so subsequent scans take the fast path.
+    ///
+    /// For read-only callers (catalog scans), use [`scan_visible_ro`] instead.
+    ///
     /// [`RowHeader`]: crate::heap::RowHeader
     pub fn scan_visible(
-        storage: &dyn StorageEngine,
+        storage: &mut dyn StorageEngine,
         root_page_id: u64,
         snap: TransactionSnapshot,
     ) -> Result<Vec<(u64, u16, Vec<u8>)>, DbError> {
         let mut result = Vec::new();
         let mut current = root_page_id;
+        storage.prefetch_hint(root_page_id, 0);
 
         while current != 0 {
-            let page = storage.read_page(current)?;
-            let next = chain_next_page(page);
+            let raw = *storage.read_page(current)?.as_bytes();
+            let mut page = Page::from_bytes(raw)?;
+            let next = chain_next_page(&page);
 
-            for (slot_id, data) in scan_visible(page, &snap) {
-                result.push((current, slot_id, data.to_vec()));
+            if page.is_all_visible() {
+                // Fast path: no txn_id_deleted stamps on this page — skip
+                // the all_vis tracking and lazy-set write overhead. We still
+                // call is_visible() for snapshot correctness: the flag means
+                // "no deleted rows", not "visible to every possible snapshot".
+                for slot_id in 0..num_slots(&page) {
+                    let entry = read_slot(&page, slot_id);
+                    if entry.is_dead() {
+                        continue;
+                    }
+                    let off = entry.offset as usize;
+                    let len = entry.length as usize;
+                    let bytes = &page.as_bytes()[off..off + len];
+                    let header: &crate::heap::RowHeader = bytemuck::from_bytes(
+                        &bytes[..std::mem::size_of::<crate::heap::RowHeader>()],
+                    );
+                    if !header.is_visible(&snap) {
+                        continue;
+                    }
+                    let data = bytes[std::mem::size_of::<crate::heap::RowHeader>()..].to_vec();
+                    result.push((current, slot_id, data));
+                }
+            } else {
+                // Slow path: per-slot MVCC check + lazy-set tracking.
+                // `page_rows` buffers results so that the lazy-set write
+                // (needing &mut page) executes after all borrows of page.as_bytes() are dropped.
+                let mut all_vis = true;
+                let mut has_alive = false;
+                let mut page_rows: Vec<(u16, Vec<u8>)> = Vec::new();
+
+                for slot_id in 0..num_slots(&page) {
+                    let entry = read_slot(&page, slot_id);
+                    if entry.is_dead() {
+                        continue;
+                    }
+                    has_alive = true;
+                    let off = entry.offset as usize;
+                    let len = entry.length as usize;
+                    let bytes = &page.as_bytes()[off..off + len];
+                    let header: &crate::heap::RowHeader = bytemuck::from_bytes(
+                        &bytes[..std::mem::size_of::<crate::heap::RowHeader>()],
+                    );
+                    // all_vis requires universal visibility: created must be
+                    // committed (txn_id_created < snapshot_id), not just visible
+                    // to this specific snapshot via current_txn_id.
+                    if header.txn_id_deleted != 0 || header.txn_id_created >= snap.snapshot_id {
+                        all_vis = false;
+                    }
+                    if !header.is_visible(&snap) {
+                        continue;
+                    }
+                    let data = bytes[std::mem::size_of::<crate::heap::RowHeader>()..].to_vec();
+                    page_rows.push((slot_id, data));
+                }
+
+                // Lazy-set: one-time write per page. After this, future scans use fast path.
+                if all_vis && has_alive && page.header().item_count > 0 {
+                    page.set_all_visible();
+                    page.update_checksum();
+                    storage.write_page(current, &page)?;
+                }
+
+                for (slot_id, data) in page_rows {
+                    result.push((current, slot_id, data));
+                }
             }
 
             current = next;
@@ -404,6 +565,59 @@ impl HeapChain {
         Ok(result)
     }
 
+    /// Scans every page in the chain rooted at `root_page_id` and clears
+    /// `txn_id_deleted` on every slot that was deleted by `txn_id`.
+    ///
+    /// Used by ROLLBACK and crash recovery to undo a `WalEntry::Truncate`:
+    /// each affected slot has its deletion stamp cleared, making the row
+    /// visible again to future snapshots.
+    ///
+    /// Each page is read once, modified in-place for all matching slots,
+    /// and written back once — O(P) page I/O for P pages in the chain.
+    ///
+    /// # Errors
+    /// - I/O errors from storage reads/writes.
+    pub fn clear_deletions_by_txn(
+        storage: &mut dyn StorageEngine,
+        root_page_id: u64,
+        txn_id: TxnId,
+    ) -> Result<(), DbError> {
+        let mut current = root_page_id;
+
+        while current != 0 {
+            let raw = *storage.read_page(current)?.as_bytes();
+            let mut page = Page::from_bytes(raw)?;
+            let next = chain_next_page(&page);
+            let n = num_slots(&page);
+            let mut modified = false;
+
+            for slot_id in 0..n {
+                if let Some(deleted_by) = read_tuple_header(&page, slot_id)? {
+                    if deleted_by == txn_id {
+                        // clear_deletion is idempotent: safe to call even if
+                        // already cleared (e.g., second recovery run).
+                        match clear_deletion(&mut page, slot_id) {
+                            Ok(()) => modified = true,
+                            // AlreadyDeleted means the slot is physically dead
+                            // (not just logically deleted) — skip it.
+                            Err(axiomdb_core::DbError::AlreadyDeleted { .. }) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+            }
+
+            if modified {
+                // Checksum was already updated by each clear_deletion() call.
+                storage.write_page(current, &page)?;
+            }
+
+            current = next;
+        }
+
+        Ok(())
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     /// Walks the chain from `root_page_id` and returns the ID of the last page
@@ -466,12 +680,12 @@ mod tests {
 
         // Snapshot that sees txn 1 as committed.
         let snap = TransactionSnapshot::committed(1);
-        let rows = HeapChain::scan_visible(&storage, root, snap).unwrap();
+        let rows = HeapChain::scan_visible(&mut storage, root, snap).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].2, b"hello");
 
         // Snapshot before the insert sees nothing.
-        let rows_before = HeapChain::scan_visible(&storage, root, snap_before).unwrap();
+        let rows_before = HeapChain::scan_visible(&mut storage, root, snap_before).unwrap();
         assert_eq!(rows_before.len(), 0);
     }
 
@@ -484,7 +698,7 @@ mod tests {
         HeapChain::insert(&mut storage, root, b"row3", 1).unwrap();
 
         let snap = TransactionSnapshot::committed(1);
-        let rows = HeapChain::scan_visible(&storage, root, snap).unwrap();
+        let rows = HeapChain::scan_visible(&mut storage, root, snap).unwrap();
         assert_eq!(rows.len(), 3);
         let payloads: Vec<&[u8]> = rows.iter().map(|(_, _, d)| d.as_slice()).collect();
         assert!(payloads.contains(&b"row1".as_slice()));
@@ -504,7 +718,7 @@ mod tests {
 
         // Snapshot at max_committed=2 sees only the non-deleted row.
         let snap = TransactionSnapshot::committed(2);
-        let rows = HeapChain::scan_visible(&storage, root, snap).unwrap();
+        let rows = HeapChain::scan_visible(&mut storage, root, snap).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].2, b"also_alive");
     }
@@ -530,15 +744,15 @@ mod tests {
 
         // All inserted rows must be visible.
         let snap = TransactionSnapshot::committed(1);
-        let rows = HeapChain::scan_visible(&storage, root, snap).unwrap();
+        let rows = HeapChain::scan_visible(&mut storage, root, snap).unwrap();
         assert_eq!(rows.len(), inserted, "all inserted rows must be visible");
     }
 
     #[test]
     fn test_scan_empty_chain_returns_empty() {
-        let (storage, root) = storage_with_root();
+        let (mut storage, root) = storage_with_root();
         let snap = committed_snap();
-        let rows = HeapChain::scan_visible(&storage, root, snap).unwrap();
+        let rows = HeapChain::scan_visible(&mut storage, root, snap).unwrap();
         assert!(rows.is_empty());
     }
 
@@ -603,7 +817,7 @@ mod tests {
 
         // committed(txn_id) makes txn visible: snapshot_id = txn_id+1 > txn_id_created
         let snap = TransactionSnapshot::committed(1);
-        let scanned = HeapChain::scan_visible(&storage, root, snap).unwrap();
+        let scanned = HeapChain::scan_visible(&mut storage, root, snap).unwrap();
         assert_eq!(
             scanned.len(),
             n,
@@ -632,12 +846,12 @@ mod tests {
         }
 
         let snap = TransactionSnapshot::committed(1);
-        let mut d1: Vec<Vec<u8>> = HeapChain::scan_visible(&s1, root1, snap)
+        let mut d1: Vec<Vec<u8>> = HeapChain::scan_visible(&mut s1, root1, snap)
             .unwrap()
             .into_iter()
             .map(|(_, _, d)| d)
             .collect();
-        let mut d2: Vec<Vec<u8>> = HeapChain::scan_visible(&s2, root2, snap)
+        let mut d2: Vec<Vec<u8>> = HeapChain::scan_visible(&mut s2, root2, snap)
             .unwrap()
             .into_iter()
             .map(|(_, _, d)| d)

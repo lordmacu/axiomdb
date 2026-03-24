@@ -33,10 +33,10 @@ use crate::key_encoding::encode_index_key;
 /// The caller can filter with `!idx.is_primary` to get only secondary indexes.
 pub fn indexes_for_table(
     table_id: u32,
-    storage: &dyn StorageEngine,
+    storage: &mut dyn StorageEngine,
     snapshot: TransactionSnapshot,
 ) -> Result<Vec<IndexDef>, DbError> {
-    let reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot)?;
     reader.list_indexes(table_id)
 }
 

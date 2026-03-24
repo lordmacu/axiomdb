@@ -84,7 +84,7 @@ impl<'a> SchemaResolver<'a> {
     /// # Errors
     /// - [`DbError::TableNotFound`] — no visible table with that name in the schema.
     pub fn resolve_table(
-        &self,
+        &mut self,
         schema: Option<&str>,
         table_name: &str,
     ) -> Result<ResolvedTable, DbError> {
@@ -115,7 +115,11 @@ impl<'a> SchemaResolver<'a> {
     /// soon as the first match is found without loading columns or indexes.
     ///
     /// [`resolve_table`]: SchemaResolver::resolve_table
-    pub fn table_exists(&self, schema: Option<&str>, table_name: &str) -> Result<bool, DbError> {
+    pub fn table_exists(
+        &mut self,
+        schema: Option<&str>,
+        table_name: &str,
+    ) -> Result<bool, DbError> {
         let schema = schema.unwrap_or(self.default_schema);
         Ok(self.reader.get_table(schema, table_name)?.is_some())
     }
@@ -129,7 +133,11 @@ impl<'a> SchemaResolver<'a> {
     ///
     /// # Errors
     /// - [`DbError::ColumnNotFound`] — no column with that name in the table.
-    pub fn resolve_column(&self, table_id: TableId, col_name: &str) -> Result<ColumnDef, DbError> {
+    pub fn resolve_column(
+        &mut self,
+        table_id: TableId,
+        col_name: &str,
+    ) -> Result<ColumnDef, DbError> {
         let columns = self.reader.list_columns(table_id)?;
 
         if let Some(col) = columns.into_iter().find(|c| c.name == col_name) {

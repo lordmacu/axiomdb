@@ -102,7 +102,7 @@ fn test_create_table() {
 
     // Table must be visible in catalog.
     let snap = txn.snapshot();
-    let reader = CatalogReader::new(&storage, snap).unwrap();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
     assert!(reader.get_table("public", "users").unwrap().is_some());
 }
 
