@@ -85,9 +85,13 @@ pub fn check_fk_child_insert(
                         && i.columns.len() == 1
                         && i.columns[0].col_idx == fk.parent_col_idx
                 })
-                .ok_or_else(|| DbError::ForeignKeyNoParentIndex {
-                    table: format!("table_id={}", fk.parent_table_id),
-                    column: format!("col_idx={}", fk.parent_col_idx),
+                .ok_or_else(|| {
+                    let (tname, cname) =
+                        resolve_names(storage, snap, fk.parent_table_id, fk.parent_col_idx);
+                    DbError::ForeignKeyNoParentIndex {
+                        table: tname,
+                        column: cname,
+                    }
                 })?;
             (parent_idx.is_primary, parent_idx.root_page_id)
         }; // reader dropped here → &storage released
@@ -128,9 +132,10 @@ pub fn check_fk_child_insert(
         };
 
         if !parent_exists {
+            let (tname, cname) = resolve_names(storage, snap, fk.child_table_id, fk.child_col_idx);
             return Err(DbError::ForeignKeyViolation {
-                table: format!("table_id={}", fk.child_table_id),
-                column: format!("col_idx={}", fk.child_col_idx),
+                table: tname,
+                column: cname,
                 value: format!("{fk_val}"),
             });
         }
@@ -580,4 +585,33 @@ fn find_children_via_scan(
                 .unwrap_or(false)
         })
         .collect())
+}
+
+/// Resolves `(table_id, col_idx)` to `(table_name, column_name)` using the catalog.
+///
+/// Returns placeholder strings on catalog miss so error messages are always
+/// human-readable even if the catalog is temporarily inconsistent.
+pub(crate) fn resolve_names(
+    storage: &dyn StorageEngine,
+    snap: axiomdb_core::TransactionSnapshot,
+    table_id: u32,
+    col_idx: u16,
+) -> (String, String) {
+    let mut reader = match CatalogReader::new(storage, snap) {
+        Ok(r) => r,
+        Err(_) => return (format!("table#{table_id}"), format!("col#{col_idx}")),
+    };
+    let table_name = reader
+        .get_table_by_id(table_id)
+        .ok()
+        .flatten()
+        .map(|t| t.table_name)
+        .unwrap_or_else(|| format!("table#{table_id}"));
+    let col_name = reader
+        .list_columns(table_id)
+        .ok()
+        .and_then(|cols| cols.into_iter().find(|c| c.col_idx == col_idx))
+        .map(|c| c.name)
+        .unwrap_or_else(|| format!("col#{col_idx}"));
+    (table_name, col_name)
 }
