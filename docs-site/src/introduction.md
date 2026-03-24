@@ -29,15 +29,29 @@
 
 ## Current Status
 
-AxiomDB is under active development. The following layers are complete and production-quality:
+AxiomDB is under active development. Phases 1–6 are substantially complete:
 
-- ✅ **Storage engine** — mmap-based 16KB pages, freelist, heap pages
-- ✅ **B+ Tree** — Copy-on-Write, lock-free reads, prefix compression
-- ✅ **WAL** — append-only, crash recovery, MVCC
-- ✅ **Catalog** — schema management, DDL change notifications
-- ✅ **SQL layer** — lexer, parser (DDL + DML), expression evaluator, semantic analyzer
+- ✅ **Storage engine** — mmap-based 16 KB pages, freelist, heap pages, CRC32c checksums
+- ✅ **B+ Tree** — Copy-on-Write, lock-free readers, prefix compression, range scan
+- ✅ **WAL** — append-only, crash recovery, Group Commit, PageWrite bulk optimization
+- ✅ **Catalog** — schema management, DDL change notifications, MVCC-consistent reads
+- ✅ **SQL layer** — full DDL + DML parser, expression evaluator, semantic analyzer
+- ✅ **Executor** — SELECT/INSERT/UPDATE/DELETE, JOIN, GROUP BY + aggregates, ORDER BY,
+  subqueries, CASE WHEN, DISTINCT, TRUNCATE, ALTER TABLE
+- ✅ **Secondary indexes** — CREATE INDEX, UNIQUE, query planner (index lookup + range)
+- ✅ **MySQL wire protocol** — port 3306, COM_QUERY, prepared statements, pymysql compatible
 
-The executor (which runs queries) is in active development in Phase 4.
+**Active development:** Phase 7 (full MVCC + concurrent writers) · Phase 5 remaining (plan cache) · Phase 6 remaining (FK, bloom filter)
+
+### Performance highlights
+
+| Operation | AxiomDB | vs competition |
+|---|---|---|
+| Bulk INSERT (multi-row, 10K rows) | **211K rows/s** | 1.5× faster than MariaDB 12.1 |
+| Full-table DELETE (10K rows) | **1M rows/s** | 3× faster than MariaDB, 40× than MySQL 8.0 |
+| Full scan SELECT (10K rows) | **212K rows/s** | ≈ MySQL 8.0 |
+| Simple SELECT parse | **492 ns** | parity with MySQL |
+| Range scan 10K rows | **0.61 ms** | 13× faster than MySQL (45 ms target) |
 
 ## What Makes AxiomDB Different
 

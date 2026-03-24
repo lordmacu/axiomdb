@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed:** Phase 4 (near-complete, ~44%) — Full SQL executor with SELECT/INSERT/UPDATE/DELETE, JOIN, GROUP BY + aggregates, ORDER BY + LIMIT, DISTINCT, CASE WHEN, INSERT SELECT
+**Last completed phase:** Phase 3 WAL (100%) — Group Commit, WAL batch append, PageWrite; Phases 4–6 in active development
 
-**Active development:** Phase 4 (remaining: GROUP F–I) — scalar functions, SHOW/DESCRIBE, ALTER TABLE, TRUNCATE, SQL test suite
+**Active development:** Phase 4 SQL (remaining: 4.19b BLOB, 4.19c UUID, 4.22b ALTER CONSTRAINT) · Phase 5 Wire Protocol (5.13 plan cache, 5.12 multi-stmt) · Phase 6 Indexes (6.4 bloom filter, 6.5/6.6 FK)
 
-**Next milestone:** Phase 5 — MySQL wire protocol (TCP :3306, handshake, COM_QUERY)
+**Next milestone:** Phase 7 — full MVCC + concurrent writers (removes global mutex)
 
 ---
 
@@ -48,6 +48,9 @@ functionality. The design is organized in three blocks:
 | 3.8 | Post-recovery checker | ✅ | Heap structural + MVCC invariants |
 | 3.9 | Catalog bootstrap | ✅ | axiom_tables, axiom_columns, axiom_indexes |
 | 3.10 | Catalog reader | ✅ | MVCC-aware schema lookup |
+| 3.17 | WAL batch append | ✅ | `record_insert_batch()`: O(1) `write_all` for N entries via `reserve_lsns+write_batch` |
+| 3.18 | WAL PageWrite | ✅ | `EntryType::PageWrite=9`: 1 WAL entry/page vs N/row; 238× fewer for 10K-row insert |
+| 3.19 | WAL Group Commit | ✅ | `CommitCoordinator`: batches fsyncs across connections; up to 16× concurrent throughput |
 | 4.1 | SQL AST | ✅ | All statement types |
 | 4.2 | SQL lexer | ✅ | logos DFA, ~85 tokens, zero-copy |
 | 4.3 | DDL parser | ✅ | CREATE/DROP/ALTER TABLE, CREATE/DROP INDEX |
@@ -114,7 +117,7 @@ Root is an `AtomicU64` — readers are lock-free by design. Supports insert (wit
 recursive split), delete (with rebalance/redistribute/merge), and range scan via
 `RangeIter`. Prefix compression for internal nodes in memory.
 
-### Phase 3 — WAL and Transactions
+### Phase 3 — WAL and Transactions ✅ 100% complete
 
 Append-only Write-Ahead Log with binary entries, CRC32c checksums, and forward/backward
 scan iterators. `TxnManager` coordinates BEGIN/COMMIT/ROLLBACK with snapshot assignment.
@@ -122,6 +125,23 @@ Five-step checkpoint protocol. Crash recovery state machine (five states). Catal
 bootstrap creates the three system tables on first open. `CatalogReader` provides
 MVCC-consistent schema reads. Nine crash scenario tests with a post-recovery integrity
 checker.
+
+**Phase 3 late additions (3.17–3.19):**
+
+- **3.17 WAL batch append** — `record_insert_batch()` uses `WalWriter::reserve_lsns(N)` +
+  `write_batch()` to write N Insert WAL entries in a single `write_all` call. Reduces
+  BufWriter overhead from O(N rows) to O(1) for bulk inserts.
+
+- **3.18 WAL PageWrite** — `EntryType::PageWrite = 9`. One WAL entry per affected heap
+  page instead of one per row. `new_value` = post-modification page bytes (16 KB) +
+  embedded slot IDs for crash recovery undo. For a 10K-row bulk insert: 42 WAL entries
+  instead of 10,000 — 238× fewer serializations and 30% smaller WAL file.
+
+- **3.19 WAL Group Commit** — `CommitCoordinator` batches DML commits from concurrent
+  connections. DML commits write to the WAL BufWriter, register with the coordinator,
+  and release the Database lock before awaiting fsync confirmation. A background Tokio
+  task performs one `flush+fsync` per batch window (`group_commit_interval_ms`), then
+  notifies all waiting connections. Enables near-linear concurrent write scaling.
 
 ### Phase 4 — SQL Processing
 
@@ -135,13 +155,27 @@ O(n) `encoded_len()`.
 
 ---
 
-## Near-Term Priorities (Phase 5)
+## Near-Term Priorities
 
-Phase 5 will implement the executor — the component that interprets the analyzed AST
-and produces result rows. Planned sub-phases:
+### Phase 7 — Full MVCC + Concurrent Writers
 
-1. **Table scan** — linear scan of heap pages with MVCC visibility filtering.
-2. **Index lookup** — point lookup via B+ Tree given a primary key value.
+The current implementation serializes all DML through a global `Arc<tokio::sync::Mutex<Database>>`.
+Phase 7 removes this constraint with per-table record locks, snapshot isolation (READ
+COMMITTED and REPEATABLE READ), and epoch-based memory reclamation for CoW B+ Tree nodes.
+This is the largest remaining item in Block 1.
+
+### Phase 5 remaining — Wire protocol completeness
+
+- **5.13 Prepared statement plan cache** — eliminates parse+analyze (~5ms) on every
+  `COM_STMT_EXECUTE` by caching the compiled plan per statement ID.
+- **5.12 Multi-statement** — semicolon-separated queries in a single `COM_QUERY`.
+
+### Phase 6 remaining — Index completeness
+
+- **6.4 Bloom filter** — per-index probabilistic filter to skip B+ Tree traversal for
+  non-existent keys. Relevant for sparse lookups.
+- **6.5/6.6 Foreign keys** — `REFERENCES` constraint enforcement + `ON DELETE CASCADE /
+  RESTRICT / SET NULL`. Required for ORM schema migrations (Rails, Django, Prisma).
 3. **Index range scan** — range predicate via `RangeIter`.
 4. **Projection** — evaluate SELECT expressions over rows from the scan.
 5. **Filter** — apply WHERE expression using the evaluator from Phase 4.17.
