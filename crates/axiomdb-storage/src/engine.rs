@@ -39,6 +39,14 @@ pub trait StorageEngine: Send {
 
     /// Current capacity (total pages in storage).
     fn page_count(&self) -> u64;
+
+    /// Hint to the storage backend that pages starting at `start_page_id` will be
+    /// read sequentially. The backend may prefetch `count` pages ahead
+    /// (0 = use the backend-defined default). Implementations that do not support
+    /// prefetch provide a default no-op.
+    fn prefetch_hint(&self, start_page_id: u64, count: u64) {
+        let _ = (start_page_id, count);
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -47,6 +55,16 @@ pub trait StorageEngine: Send {
 pub mod tests {
     use super::*;
     use crate::page::PageType;
+
+    #[test]
+    fn test_prefetch_hint_noop_on_memory_storage() {
+        use crate::MemoryStorage;
+        let storage = MemoryStorage::new();
+        storage.prefetch_hint(0, 0);
+        storage.prefetch_hint(0, 64);
+        storage.prefetch_hint(9_999_999, 64);
+        storage.prefetch_hint(u64::MAX, u64::MAX);
+    }
 
     /// Generic test suite for any StorageEngine implementation.
     /// Call from the implementation-specific tests.

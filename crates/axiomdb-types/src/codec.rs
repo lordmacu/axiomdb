@@ -309,6 +309,164 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
     Ok(values)
 }
 
+/// Like [`decode_row`] but skips decoding columns where `mask[i] == false`.
+///
+/// For skipped columns the byte cursor is still advanced by the column's wire
+/// size (so subsequent columns decode correctly), but no heap allocation is
+/// made and `Value::Null` is stored in the output slot.
+///
+/// ## Null + mask interaction
+///
+/// If `is_null_bit(bitmap, i)` is true, the column has no wire bytes regardless
+/// of `mask[i]`. The cursor is not advanced and `Value::Null` is pushed.
+///
+/// ## Errors
+/// - [`DbError::TypeMismatch`] — `mask.len() != schema.len()`
+/// - [`DbError::ParseError`] — bytes truncated or structurally invalid (even
+///   for skipped columns — corrupt input is always an error)
+pub fn decode_row_masked(
+    bytes: &[u8],
+    schema: &[DataType],
+    mask: &[bool],
+) -> Result<Vec<Value>, DbError> {
+    if mask.len() != schema.len() {
+        return Err(DbError::TypeMismatch {
+            expected: format!("mask length {}", schema.len()),
+            got: format!("mask length {}", mask.len()),
+        });
+    }
+
+    let n = schema.len();
+    let blen = bitmap_len(n);
+
+    if bytes.len() < blen {
+        return Err(DbError::ParseError {
+            message: format!("truncated: need {blen} bitmap bytes, got {}", bytes.len()),
+        });
+    }
+
+    let bitmap = &bytes[0..blen];
+    let mut pos = blen;
+    let mut values = Vec::with_capacity(n);
+
+    for (i, &dt) in schema.iter().enumerate() {
+        // NULL columns have no wire bytes — handle before checking mask.
+        if is_null_bit(bitmap, i) {
+            values.push(Value::Null);
+            continue;
+        }
+
+        if mask[i] {
+            // Decode normally — identical to decode_row arms.
+            let v = match dt {
+                DataType::Bool => {
+                    ensure_bytes(bytes, pos, 1)?;
+                    let v = bytes[pos] != 0;
+                    pos += 1;
+                    Value::Bool(v)
+                }
+                DataType::Int => {
+                    ensure_bytes(bytes, pos, 4)?;
+                    let v = i32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+                    pos += 4;
+                    Value::Int(v)
+                }
+                DataType::BigInt => {
+                    ensure_bytes(bytes, pos, 8)?;
+                    let v = i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+                    pos += 8;
+                    Value::BigInt(v)
+                }
+                DataType::Real => {
+                    ensure_bytes(bytes, pos, 8)?;
+                    let v = f64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+                    pos += 8;
+                    Value::Real(v)
+                }
+                DataType::Decimal => {
+                    ensure_bytes(bytes, pos, 17)?;
+                    let m = i128::from_le_bytes(bytes[pos..pos + 16].try_into().unwrap());
+                    let s = bytes[pos + 16];
+                    pos += 17;
+                    Value::Decimal(m, s)
+                }
+                DataType::Text => {
+                    let len = read_u24(bytes, pos)?;
+                    pos += 3;
+                    ensure_bytes(bytes, pos, len)?;
+                    let s = std::str::from_utf8(&bytes[pos..pos + len])
+                        .map_err(|_| DbError::ParseError {
+                            message: format!("invalid UTF-8 in Text column at offset {pos}"),
+                        })?
+                        .to_string();
+                    pos += len;
+                    Value::Text(s)
+                }
+                DataType::Bytes => {
+                    let len = read_u24(bytes, pos)?;
+                    pos += 3;
+                    ensure_bytes(bytes, pos, len)?;
+                    let b = bytes[pos..pos + len].to_vec();
+                    pos += len;
+                    Value::Bytes(b)
+                }
+                DataType::Date => {
+                    ensure_bytes(bytes, pos, 4)?;
+                    let v = i32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+                    pos += 4;
+                    Value::Date(v)
+                }
+                DataType::Timestamp => {
+                    ensure_bytes(bytes, pos, 8)?;
+                    let v = i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+                    pos += 8;
+                    Value::Timestamp(v)
+                }
+                DataType::Uuid => {
+                    ensure_bytes(bytes, pos, 16)?;
+                    let u: [u8; 16] = bytes[pos..pos + 16].try_into().unwrap();
+                    pos += 16;
+                    Value::Uuid(u)
+                }
+            };
+            values.push(v);
+        } else {
+            // Skip: advance cursor without allocating.
+            match dt {
+                DataType::Bool => {
+                    ensure_bytes(bytes, pos, 1)?;
+                    pos += 1;
+                }
+                DataType::Int | DataType::Date => {
+                    ensure_bytes(bytes, pos, 4)?;
+                    pos += 4;
+                }
+                DataType::BigInt | DataType::Real | DataType::Timestamp => {
+                    ensure_bytes(bytes, pos, 8)?;
+                    pos += 8;
+                }
+                DataType::Decimal => {
+                    ensure_bytes(bytes, pos, 17)?;
+                    pos += 17;
+                }
+                DataType::Uuid => {
+                    ensure_bytes(bytes, pos, 16)?;
+                    pos += 16;
+                }
+                DataType::Text | DataType::Bytes => {
+                    let len = read_u24(bytes, pos)?;
+                    pos += 3;
+                    ensure_bytes(bytes, pos, len)?;
+                    pos += len; // skip payload — no copy, no allocation
+                }
+            }
+            values.push(Value::Null);
+        }
+    }
+
+    Ok(values)
+}
+
 /// Checks that `bytes[pos..pos+need]` is within bounds.
 #[inline]
 fn ensure_bytes(bytes: &[u8], pos: usize, need: usize) -> Result<(), DbError> {

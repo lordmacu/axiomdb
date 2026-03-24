@@ -51,6 +51,17 @@ pub fn parse(input: &str, max_bytes: Option<usize>) -> Result<Stmt, DbError> {
     Ok(stmt)
 }
 
+/// Parses a single SQL expression from `input`.
+///
+/// Used to re-evaluate CHECK constraint expressions stored in `axiom_constraints`
+/// (Phase 4.22b). Returns `DbError::ParseError` if `input` is not a valid expression.
+pub fn parse_expr_only(input: &str) -> Result<crate::expr::Expr, DbError> {
+    let tokens = tokenize(input, None)?;
+    let mut p = Parser::new(&tokens);
+    let e = expr::parse_expr(&mut p)?;
+    Ok(e)
+}
+
 // ── Parser struct ─────────────────────────────────────────────────────────────
 
 /// Recursive descent parser over a slice of [`SpannedToken`]s.

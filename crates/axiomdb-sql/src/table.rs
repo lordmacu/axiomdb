@@ -46,13 +46,11 @@
 //! new slots are on the same page, which is not guaranteed when the old page is
 //! full and the chain must grow.
 
-use std::collections::HashMap;
-
 use axiomdb_catalog::schema::{ColumnDef, ColumnType, TableDef};
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
-use axiomdb_storage::{HeapChain, StorageEngine, PAGE_SIZE};
+use axiomdb_storage::{HeapChain, StorageEngine};
 use axiomdb_types::{
-    codec::{decode_row, encode_row},
+    codec::{decode_row, decode_row_masked, encode_row},
     coerce::{coerce, CoercionMode},
     DataType, Value,
 };
@@ -76,21 +74,42 @@ impl TableEngine {
     ///
     /// `columns` must be sorted ascending by `col_idx` (catalog declaration order).
     ///
+    /// Scans all visible rows in the table and decodes them.
+    ///
     /// # Errors
     /// - [`DbError::ParseError`] — a stored row is structurally invalid (corruption).
     /// - I/O errors from storage reads.
+    ///
+    /// `column_mask` controls which columns are decoded:
+    /// - `None` — decode all columns (default, same as before).
+    /// - `Some(mask)` — decode only columns where `mask[i]` is `true`; skipped
+    ///   columns have `Value::Null` in the output. This eliminates allocation and
+    ///   parsing cost for columns not referenced by the query (lazy column decode).
+    ///
+    /// When `mask` is all-`true`, [`decode_row`] is used directly so there is no
+    /// overhead compared to passing `None`.
     pub fn scan_table(
-        storage: &dyn StorageEngine,
+        storage: &mut dyn StorageEngine,
         table_def: &TableDef,
         columns: &[ColumnDef],
         snap: TransactionSnapshot,
+        column_mask: Option<&[bool]>,
     ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
         let col_types = column_data_types(columns);
         let raw_rows = HeapChain::scan_visible(storage, table_def.data_root_page_id, snap)?;
 
         let mut result = Vec::with_capacity(raw_rows.len());
         for (page_id, slot_id, bytes) in raw_rows {
-            let values = decode_row(&bytes, &col_types)?;
+            let values = match column_mask {
+                None => decode_row(&bytes, &col_types)?,
+                Some(mask) => {
+                    if mask.iter().all(|&b| b) {
+                        decode_row(&bytes, &col_types)?
+                    } else {
+                        decode_row_masked(&bytes, &col_types, mask)?
+                    }
+                }
+            };
             result.push((RecordId { page_id, slot_id }, values));
         }
         Ok(result)
@@ -221,21 +240,13 @@ impl TableEngine {
         let phys_locs =
             HeapChain::insert_batch(storage, table_def.data_root_page_id, &encoded_rows, txn_id)?;
 
-        // ── WAL: one PageWrite entry per affected page (Phase 3.18) ─────────
-        // Instead of N Insert entries (one per row), emit one PageWrite per
-        // unique page touched by the batch. Each entry carries the full page
-        // post-image plus the list of slot_ids inserted by this transaction,
-        // so crash recovery can undo uncommitted writes at slot granularity.
-        //
-        // For a 10K-row insert spanning ~625 pages (at 16-row capacity each):
-        //   Before: 10K serialize_into() calls + 10K CRC32c computations
-        //   After:  ~625 serialize_into() calls + ~625 CRC32c computations
-        //
-        // The page reads below (read_page per unique page) are mmap cache hits
-        // because HeapChain::insert_batch() just wrote those same pages.
-
-        // Group slot_ids by page_id.
-        let mut page_slot_map: HashMap<u64, Vec<u16>> = HashMap::new();
+        // ── WAL: one compact PageWrite entry per affected page ───────────────
+        // Group slot_ids by page_id. Each PageWrite entry carries only the
+        // slot_ids (not the 16 KB page image), reducing WAL from ~820 KB to
+        // ~20 KB per 10 K-row batch — a 40× reduction.
+        // Crash recovery only needs slot_ids to mark inserted slots dead on undo.
+        let mut page_slot_map: std::collections::HashMap<u64, Vec<u16>> =
+            std::collections::HashMap::new();
         for &(page_id, slot_id) in &phys_locs {
             page_slot_map.entry(page_id).or_default().push(slot_id);
         }
@@ -244,18 +255,10 @@ impl TableEngine {
         let mut sorted_pages: Vec<(u64, Vec<u16>)> = page_slot_map.into_iter().collect();
         sorted_pages.sort_unstable_by_key(|(page_id, _)| *page_id);
 
-        // Read final page bytes for each affected page (mmap cache hit — just written).
-        let mut page_write_args: Vec<(u64, [u8; PAGE_SIZE], Vec<u16>)> =
-            Vec::with_capacity(sorted_pages.len());
-        for (page_id, slot_ids) in sorted_pages {
-            let page_bytes = *storage.read_page(page_id)?.as_bytes();
-            page_write_args.push((page_id, page_bytes, slot_ids));
-        }
-
         // Emit one PageWrite WAL entry per affected page.
-        let pw_refs: Vec<(u64, &[u8; PAGE_SIZE], &[u16])> = page_write_args
+        let pw_refs: Vec<(u64, &[u16])> = sorted_pages
             .iter()
-            .map(|(pid, bytes, slots)| (*pid, bytes, slots.as_slice()))
+            .map(|(pid, slots)| (*pid, slots.as_slice()))
             .collect();
         txn.record_page_writes(table_def.id, &pw_refs)?;
 
@@ -335,7 +338,8 @@ impl TableEngine {
         let raw_rids: Vec<(u64, u16)> = rids.iter().map(|r| (r.page_id, r.slot_id)).collect();
 
         // Batch-delete on the heap: each page read+written once.
-        let deleted = HeapChain::delete_batch(storage, &raw_rids, txn_id)?;
+        let deleted =
+            HeapChain::delete_batch(storage, table_def.data_root_page_id, &raw_rids, txn_id)?;
 
         // WAL entries: one per row, after all page writes (ordering invariant).
         for (page_id, slot_id, old_bytes) in &deleted {
@@ -344,6 +348,58 @@ impl TableEngine {
         }
 
         Ok(deleted.len() as u64)
+    }
+
+    /// Updates multiple rows in two batch passes: delete all old slots, then
+    /// insert all new rows.
+    ///
+    /// Inspired by OceanBase's dual-row buffer (`ObDASUpdIterator`) and
+    /// MariaDB's `ha_bulk_update_row()`: accumulate all (old, new) pairs first,
+    /// then flush as a single delete_batch + insert_batch operation.
+    ///
+    /// ## Performance
+    ///
+    /// Per-row `update_row()` does ~3 page ops per row (read + read+write for
+    /// delete + read+write for insert). This function does O(P) ops for P pages:
+    /// - `delete_rows_batch`: 1 read + 1 write per page holding old rows
+    /// - `insert_rows_batch`: 1 read + 1 write per page receiving new rows
+    ///
+    /// For 5,000 rows across 50 pages: ~200 page ops vs ~15,000.
+    ///
+    /// ## WAL ordering
+    ///
+    /// All deletes (heap write + WAL) happen before all inserts, ensuring that
+    /// crash recovery can undo the update by undoing inserts (killing new slots)
+    /// then undoing deletes (resurrecting old slots) in reverse WAL order.
+    ///
+    /// Must be called inside an active transaction.
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] — no transaction is active.
+    /// - [`DbError::TypeMismatch`] — any new row has wrong column count.
+    /// - I/O errors from storage or WAL writes.
+    pub fn update_rows_batch(
+        storage: &mut dyn StorageEngine,
+        txn: &mut TxnManager,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        updates: Vec<(RecordId, Vec<Value>)>,
+    ) -> Result<u64, DbError> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+
+        let (rids, new_values): (Vec<RecordId>, Vec<Vec<Value>>) = updates.into_iter().unzip();
+
+        // Phase 1: batch-delete all old rows (O(P) page I/O for P pages).
+        // Reads each page once, marks all targeted slots dead, writes once.
+        Self::delete_rows_batch(storage, txn, table_def, &rids)?;
+
+        // Phase 2: batch-insert all new rows (O(P') page I/O for P' pages).
+        // Encodes all rows first (fail-fast), then appends in one heap pass.
+        Self::insert_rows_batch(storage, txn, table_def, columns, &new_values)?;
+
+        Ok(rids.len() as u64)
     }
 
     /// Replaces the row at `record_id` with `new_values`, WAL-logging both the

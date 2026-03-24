@@ -506,27 +506,56 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
 
     loop {
         let op = match p.peek().clone() {
-            // ADD [COLUMN] col_def
+            // ADD [CONSTRAINT name] <constraint> | ADD [COLUMN] col_def
             Token::Add => {
                 p.advance();
-                p.eat(&Token::Column);
-                let col_def = parse_column_def(p)?;
-                AlterTableOp::AddColumn(col_def)
+                // Peek: is this ADD CONSTRAINT or ADD UNIQUE (without CONSTRAINT keyword)?
+                if matches!(p.peek(), Token::Constraint) {
+                    // ADD CONSTRAINT name <type>
+                    p.advance(); // consume CONSTRAINT
+                    let constraint = parse_table_constraint(p)?;
+                    AlterTableOp::AddConstraint(constraint)
+                } else if matches!(p.peek(), Token::Unique) {
+                    // ADD UNIQUE (cols) — shorthand without CONSTRAINT name
+                    let constraint = parse_table_constraint(p)?; // eats Unique
+                    AlterTableOp::AddConstraint(constraint)
+                } else {
+                    // ADD [COLUMN] col_def — existing behavior
+                    p.eat(&Token::Column);
+                    let col_def = parse_column_def(p)?;
+                    AlterTableOp::AddColumn(col_def)
+                }
             }
-            // DROP [COLUMN] [IF EXISTS] col_name
+            // DROP CONSTRAINT [IF EXISTS] name | DROP [COLUMN] [IF EXISTS] col_name
             Token::Drop => {
                 p.advance();
-                p.eat(&Token::Column);
-                let if_exists =
-                    if matches!(p.peek(), Token::If) && matches!(p.peek_at(1), Token::Exists) {
-                        p.advance();
-                        p.advance();
-                        true
-                    } else {
-                        false
-                    };
-                let name = p.parse_identifier()?;
-                AlterTableOp::DropColumn { name, if_exists }
+                if matches!(p.peek(), Token::Constraint) {
+                    // DROP CONSTRAINT [IF EXISTS] name
+                    p.advance(); // consume CONSTRAINT
+                    let if_exists =
+                        if matches!(p.peek(), Token::If) && matches!(p.peek_at(1), Token::Exists) {
+                            p.advance();
+                            p.advance();
+                            true
+                        } else {
+                            false
+                        };
+                    let name = p.parse_identifier()?;
+                    AlterTableOp::DropConstraint { name, if_exists }
+                } else {
+                    // DROP [COLUMN] [IF EXISTS] col_name — existing behavior
+                    p.eat(&Token::Column);
+                    let if_exists =
+                        if matches!(p.peek(), Token::If) && matches!(p.peek_at(1), Token::Exists) {
+                            p.advance();
+                            p.advance();
+                            true
+                        } else {
+                            false
+                        };
+                    let name = p.parse_identifier()?;
+                    AlterTableOp::DropColumn { name, if_exists }
+                }
             }
             // RENAME COLUMN old TO new  |  RENAME TO new_name
             Token::Rename => {

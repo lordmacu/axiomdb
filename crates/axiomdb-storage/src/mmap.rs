@@ -5,6 +5,7 @@ use std::{
 
 use axiomdb_core::error::DbError;
 use fs2::FileExt;
+use libc;
 use memmap2::MmapMut;
 use tracing::{debug, info, warn};
 
@@ -21,6 +22,9 @@ const DB_FILE_MAGIC: u64 = 0x4158494F_4D444201; // "AXIOMDB\1"
 const DB_VERSION: u32 = 1;
 /// Growth unit: 64 pages = 1 MB.
 const GROW_PAGES: u64 = 64;
+/// Number of pages to prefetch when the caller passes `count = 0`.
+/// 64 × 16 KB = 1 MB — matches one `GROW_PAGES` growth unit.
+const PREFETCH_DEFAULT_PAGES: u64 = 64;
 
 // Fixed offsets for in-place updates without re-parsing the full meta page.
 // PageHeader(64) + db_magic(8) + version(4) + _pad(4) = 80
@@ -371,6 +375,32 @@ impl StorageEngine for MmapStorage {
     fn page_count(&self) -> u64 {
         Self::read_u64_at(&self.mmap, PAGE_COUNT_OFFSET)
     }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn prefetch_hint(&self, start_page_id: u64, count: u64) {
+        let mmap_len = self.mmap.len();
+        let Some(offset) = (start_page_id as usize).checked_mul(PAGE_SIZE) else {
+            return;
+        };
+        if offset >= mmap_len {
+            return;
+        }
+        let effective_count = if count == 0 {
+            PREFETCH_DEFAULT_PAGES
+        } else {
+            count
+        };
+        let requested_len = (effective_count as usize).saturating_mul(PAGE_SIZE);
+        let clamped_len = requested_len.min(mmap_len - offset);
+        // SAFETY: `ptr` is derived from a live `MmapMut` via checked offset arithmetic.
+        // `offset < mmap_len` is verified above; `clamped_len <= mmap_len - offset`
+        // ensures [ptr, ptr + clamped_len) lies entirely within the mapping.
+        // `madvise` is a pure hint — it does not dereference the pointer or mutate
+        // any Rust state. No aliasing rules are violated.
+        let ptr = unsafe { self.mmap.as_ptr().add(offset) };
+        let _ =
+            unsafe { libc::madvise(ptr as *mut libc::c_void, clamped_len, libc::MADV_SEQUENTIAL) };
+    }
 }
 
 impl MmapStorage {
@@ -529,5 +559,23 @@ mod tests {
         }
         let storage = MmapStorage::open(&path).unwrap();
         assert_eq!(storage.read_page(id).unwrap().body()[0], 0x42);
+    }
+
+    #[test]
+    fn test_prefetch_hint_count_zero_uses_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.db");
+        let storage = MmapStorage::create(&path).unwrap();
+        storage.prefetch_hint(0, 0);
+        storage.prefetch_hint(2, 0);
+    }
+
+    #[test]
+    fn test_prefetch_hint_out_of_range_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.db");
+        let storage = MmapStorage::create(&path).unwrap();
+        storage.prefetch_hint(storage.page_count() + 1_000, 64);
+        storage.prefetch_hint(0, u64::MAX);
     }
 }

@@ -48,6 +48,15 @@ pub struct DbConfig {
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
+    /// Maximum number of prepared statements cached per connection.
+    ///
+    /// When the limit is reached, the least-recently-used prepared statement is
+    /// evicted to make room for the new one. The evicted statement's `stmt_id`
+    /// returns error 1243 on subsequent `COM_STMT_EXECUTE` calls.
+    /// Default: `1024`.
+    #[serde(default = "default_max_prepared_stmts")]
+    pub max_prepared_stmts_per_connection: usize,
+
     /// WAL Group Commit interval in milliseconds.
     ///
     /// When > 0, DML commits are batched: instead of one `fsync` per transaction,
@@ -84,6 +93,10 @@ fn default_group_commit_max_batch() -> usize {
     64
 }
 
+fn default_max_prepared_stmts() -> usize {
+    1024
+}
+
 impl Default for DbConfig {
     fn default() -> Self {
         Self {
@@ -93,6 +106,7 @@ impl Default for DbConfig {
             log_level: default_log_level(),
             group_commit_interval_ms: 0,
             group_commit_max_batch: default_group_commit_max_batch(),
+            max_prepared_stmts_per_connection: default_max_prepared_stmts(),
         }
     }
 }

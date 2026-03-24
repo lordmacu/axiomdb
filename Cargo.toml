@@ -19,6 +19,7 @@ members = [
     "crates/axiomdb-vector",
     "crates/axiomdb-migrations",
     "crates/axiomdb-server",
+    "crates/axiomdb-cli",
     "crates/axiomdb-embedded",
     "benches/comparison/axiomdb_bench",
 ]
@@ -57,6 +58,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Concurrent data structures
 dashmap = "5"
+
+# Probabilistic data structures
+bloomfilter = "3"
 
 # Testing / benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }

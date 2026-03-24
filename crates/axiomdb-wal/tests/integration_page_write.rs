@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use axiomdb_storage::{
     heap::{insert_tuple, read_tuple},
-    MmapStorage, Page, PageType, StorageEngine, PAGE_SIZE,
+    MmapStorage, Page, PageType, StorageEngine,
 };
 use axiomdb_wal::{CrashRecovery, EntryType, ForwardIter, TxnManager, WalEntry, WalReader};
 use tempfile::TempDir;
@@ -71,12 +71,11 @@ fn test_page_write_entry_type_value() {
 
 #[test]
 fn test_page_write_entry_roundtrip() {
-    let page_bytes = [0xABu8; PAGE_SIZE];
+    // Compact format: [num_slots: u16 LE][slot_ids: u16 LE each] — no page bytes.
     let slot_ids: &[u16] = &[0, 1, 2];
     let page_id: u64 = 42;
 
-    let mut new_value = Vec::with_capacity(PAGE_SIZE + 2 + slot_ids.len() * 2);
-    new_value.extend_from_slice(&page_bytes);
+    let mut new_value = Vec::with_capacity(2 + slot_ids.len() * 2);
     new_value.extend_from_slice(&(slot_ids.len() as u16).to_le_bytes());
     for &s in slot_ids {
         new_value.extend_from_slice(&s.to_le_bytes());
@@ -98,10 +97,12 @@ fn test_page_write_entry_roundtrip() {
     assert_eq!(parsed.entry_type, EntryType::PageWrite);
     assert_eq!(parsed.key, page_id.to_le_bytes());
     assert_eq!(parsed.old_value, Vec::<u8>::new());
-    assert_eq!(&parsed.new_value[..PAGE_SIZE], &page_bytes);
-    // num_slots
-    let ns = u16::from_le_bytes([parsed.new_value[PAGE_SIZE], parsed.new_value[PAGE_SIZE + 1]]);
+    // num_slots at offset 0
+    let ns = u16::from_le_bytes([parsed.new_value[0], parsed.new_value[1]]);
     assert_eq!(ns, 3);
+    // slot_ids follow immediately
+    let s0 = u16::from_le_bytes([parsed.new_value[2], parsed.new_value[3]]);
+    assert_eq!(s0, 0);
 }
 
 // ── record_page_writes ────────────────────────────────────────────────────────
@@ -131,9 +132,7 @@ fn test_record_page_writes_produces_readable_wal_entries() {
         page_id,
         &[b"row0", b"row1", b"row2"],
     );
-    let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
-    txn.record_page_writes(1, &[(page_id, &page_bytes, &slot_ids)])
-        .unwrap();
+    txn.record_page_writes(1, &[(page_id, &slot_ids)]).unwrap();
     txn.commit().unwrap();
 
     // Read back WAL and find the PageWrite entry.
@@ -153,17 +152,16 @@ fn test_record_page_writes_produces_readable_wal_entries() {
     let recovered_pid = u64::from_le_bytes(e.key[..8].try_into().unwrap());
     assert_eq!(recovered_pid, page_id);
 
-    // Verify new_value starts with page bytes
-    assert!(e.new_value.len() >= PAGE_SIZE + 2 + slot_ids.len() * 2);
-    assert_eq!(&e.new_value[..PAGE_SIZE], &page_bytes);
+    // Compact format: [num_slots: u16 LE][slot_ids: u16 LE each] — no page bytes.
+    assert!(e.new_value.len() >= 2 + slot_ids.len() * 2);
 
-    // Verify num_slots
-    let ns = u16::from_le_bytes([e.new_value[PAGE_SIZE], e.new_value[PAGE_SIZE + 1]]) as usize;
+    // Verify num_slots at offset 0
+    let ns = u16::from_le_bytes([e.new_value[0], e.new_value[1]]) as usize;
     assert_eq!(ns, slot_ids.len());
 
-    // Verify slot_ids
+    // Verify slot_ids starting at offset 2
     for (i, &expected_slot) in slot_ids.iter().enumerate() {
-        let off = PAGE_SIZE + 2 + i * 2;
+        let off = 2 + i * 2;
         let got = u16::from_le_bytes([e.new_value[off], e.new_value[off + 1]]);
         assert_eq!(got, expected_slot);
     }
@@ -185,9 +183,7 @@ fn test_crash_recovery_undoes_uncommitted_page_write() {
         page_id,
         &[b"should be lost", b"also lost", b"gone too"],
     );
-    let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
-    txn.record_page_writes(1, &[(page_id, &page_bytes, &slot_ids)])
-        .unwrap();
+    txn.record_page_writes(1, &[(page_id, &slot_ids)]).unwrap();
     // Flush to OS page cache (simulates crash — WAL in kernel buffer, no fsync).
     // Drop without commit: undo_ops lost, WAL has Begin+PageWrite but no Commit.
     drop(txn);
@@ -225,9 +221,7 @@ fn test_committed_page_write_rows_visible_after_restart() {
         page_id,
         &[b"row_a", b"row_b", b"row_c"],
     );
-    let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
-    txn.record_page_writes(1, &[(page_id, &page_bytes, &slot_ids)])
-        .unwrap();
+    txn.record_page_writes(1, &[(page_id, &slot_ids)]).unwrap();
     txn.commit().unwrap(); // fsync — durable
 
     drop(txn);
@@ -263,9 +257,7 @@ fn test_page_write_recovery_is_idempotent() {
 
     txn.begin().unwrap();
     let slot_ids = insert_rows_on_page(&mut storage, &mut txn, page_id, &[b"idempotent"]);
-    let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
-    txn.record_page_writes(1, &[(page_id, &page_bytes, &slot_ids)])
-        .unwrap();
+    txn.record_page_writes(1, &[(page_id, &slot_ids)]).unwrap();
     drop(txn); // no commit
 
     // First recovery

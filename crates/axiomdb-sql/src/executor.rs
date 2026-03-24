@@ -43,7 +43,7 @@ use axiomdb_catalog::{
 };
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
 use axiomdb_index::BTree;
-use axiomdb_storage::{Page, PageType, StorageEngine};
+use axiomdb_storage::{heap_chain::HeapChain, Page, PageType, StorageEngine};
 use axiomdb_types::{DataType, Value};
 use axiomdb_wal::TxnManager;
 
@@ -229,6 +229,7 @@ fn subst_expr(expr: Expr, outer_row: &[Value]) -> Expr {
 struct ExecSubqueryRunner<'a> {
     storage: &'a mut dyn StorageEngine,
     txn: &'a mut TxnManager,
+    bloom: &'a mut crate::bloom::BloomRegistry,
     ctx: &'a mut SessionContext,
     outer_row: &'a [Value],
 }
@@ -236,7 +237,7 @@ struct ExecSubqueryRunner<'a> {
 impl<'a> SubqueryRunner for ExecSubqueryRunner<'a> {
     fn run(&mut self, stmt: &SelectStmt) -> Result<QueryResult, DbError> {
         let bound = substitute_outer(stmt.clone(), self.outer_row);
-        execute_select_ctx(bound, self.storage, self.txn, self.ctx)
+        execute_select_ctx(bound, self.storage, self.txn, self.bloom, self.ctx)
     }
 }
 
@@ -311,10 +312,11 @@ pub fn execute_with_ctx(
     stmt: Stmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     if txn.active_txn_id().is_some() {
-        dispatch_ctx(stmt, storage, txn, ctx)
+        dispatch_ctx(stmt, storage, txn, bloom, ctx)
     } else {
         match stmt {
             Stmt::Begin => {
@@ -325,7 +327,7 @@ pub fn execute_with_ctx(
             Stmt::Rollback => Err(DbError::NoActiveTransaction),
             other => {
                 txn.begin()?;
-                match dispatch_ctx(other, storage, txn, ctx) {
+                match dispatch_ctx(other, storage, txn, bloom, ctx) {
                     Ok(result) => {
                         txn.commit()?;
                         Ok(result)
@@ -345,13 +347,14 @@ fn dispatch_ctx(
     stmt: Stmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     match stmt {
-        Stmt::Select(s) => execute_select_ctx(s, storage, txn, ctx),
-        Stmt::Insert(s) => execute_insert_ctx(s, storage, txn, ctx),
-        Stmt::Update(s) => execute_update_ctx(s, storage, txn, ctx),
-        Stmt::Delete(s) => execute_delete_ctx(s, storage, txn, ctx),
+        Stmt::Select(s) => execute_select_ctx(s, storage, txn, bloom, ctx),
+        Stmt::Insert(s) => execute_insert_ctx(s, storage, txn, bloom, ctx),
+        Stmt::Update(s) => execute_update_ctx(s, storage, txn, bloom, ctx),
+        Stmt::Delete(s) => execute_delete_ctx(s, storage, txn, bloom, ctx),
         // DDL: invalidate cache, then delegate to existing handlers.
         Stmt::CreateTable(s) => {
             ctx.invalidate_all();
@@ -363,11 +366,11 @@ fn dispatch_ctx(
         }
         Stmt::CreateIndex(s) => {
             ctx.invalidate_all();
-            execute_create_index(s, storage, txn)
+            execute_create_index(s, storage, txn, bloom)
         }
         Stmt::DropIndex(s) => {
             ctx.invalidate_all();
-            execute_drop_index(s, storage, txn)
+            execute_drop_index(s, storage, txn, bloom)
         }
         Stmt::AlterTable(s) => {
             ctx.invalidate_all();
@@ -382,7 +385,7 @@ fn dispatch_ctx(
 ///
 /// On cache miss, calls `make_resolver` and stores the result in `ctx`.
 fn resolve_table_cached(
-    storage: &dyn StorageEngine,
+    storage: &mut dyn StorageEngine,
     txn: &TxnManager,
     ctx: &mut SessionContext,
     schema: Option<&str>,
@@ -392,7 +395,7 @@ fn resolve_table_cached(
     if let Some(cached) = ctx.get_table(schema_str, table_name) {
         return Ok(cached.clone());
     }
-    let resolver = make_resolver(storage, txn)?;
+    let mut resolver = make_resolver(storage, txn)?;
     let resolved = resolver.resolve_table(schema, table_name)?;
     ctx.cache_table(schema_str, table_name, resolved.clone());
     Ok(resolved)
@@ -404,6 +407,7 @@ fn execute_select_ctx(
     mut stmt: SelectStmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     // SELECT without FROM: no table resolution needed.
@@ -432,8 +436,98 @@ fn execute_select_ctx(
         )?;
 
         let snap = txn.active_snapshot()?;
-        // scan_table returns owned Vec — storage is free after this call.
-        let raw_rows = TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?;
+
+        // Query planner: pick the best access method.
+        let access_method = crate::planner::plan_select(
+            stmt.where_clause.as_ref(),
+            &resolved.indexes,
+            &resolved.columns,
+        );
+
+        // Fetch rows via the chosen access method.
+        let raw_rows: Vec<(RecordId, Vec<Value>)> = match &access_method {
+            crate::planner::AccessMethod::Scan => {
+                // Build column mask for lazy decode: only decode columns referenced in
+                // SELECT list, WHERE, ORDER BY, GROUP BY, HAVING. SELECT * passes None.
+                let n_cols = resolved.columns.len();
+                let has_wildcard = stmt.columns.iter().any(|item| {
+                    matches!(
+                        item,
+                        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_)
+                    )
+                });
+                let column_mask: Option<Vec<bool>> = if has_wildcard || n_cols == 0 {
+                    None
+                } else {
+                    let mut expr_ptrs: Vec<&Expr> = Vec::new();
+                    for item in &stmt.columns {
+                        if let SelectItem::Expr { expr, .. } = item {
+                            expr_ptrs.push(expr);
+                        }
+                    }
+                    if let Some(ref wc) = stmt.where_clause {
+                        expr_ptrs.push(wc);
+                    }
+                    for ob in &stmt.order_by {
+                        expr_ptrs.push(&ob.expr);
+                    }
+                    for gb in &stmt.group_by {
+                        expr_ptrs.push(gb);
+                    }
+                    if let Some(ref hav) = stmt.having {
+                        expr_ptrs.push(hav);
+                    }
+                    let mask = build_column_mask(n_cols, &expr_ptrs);
+                    if mask.iter().all(|&b| b) {
+                        None
+                    } else {
+                        Some(mask)
+                    }
+                };
+
+                // scan_table returns owned Vec — storage is free after this call.
+                TableEngine::scan_table(
+                    storage,
+                    &resolved.def,
+                    &resolved.columns,
+                    snap,
+                    column_mask.as_deref(),
+                )?
+            }
+            crate::planner::AccessMethod::IndexLookup { index_def, key } => {
+                // Bloom filter: skip B-Tree read if key is definitely absent.
+                if !bloom.might_exist(index_def.index_id, key) {
+                    vec![]
+                } else {
+                    // Point lookup: B-Tree → single RecordId → heap read.
+                    match BTree::lookup_in(storage, index_def.root_page_id, key)? {
+                        None => vec![],
+                        Some(rid) => {
+                            match TableEngine::read_row(storage, &resolved.columns, rid)? {
+                                None => vec![], // row was deleted
+                                Some(values) => vec![(rid, values)],
+                            }
+                        }
+                    }
+                }
+            }
+            crate::planner::AccessMethod::IndexRange { index_def, lo, hi } => {
+                // Range scan: iterate B-Tree entries → heap reads.
+                let pairs = BTree::range_in(
+                    storage,
+                    index_def.root_page_id,
+                    lo.as_deref(),
+                    hi.as_deref(),
+                )?;
+                let mut result = Vec::with_capacity(pairs.len());
+                for (rid, _key) in pairs {
+                    if let Some(values) = TableEngine::read_row(storage, &resolved.columns, rid)? {
+                        result.push((rid, values));
+                    }
+                }
+                result
+            }
+        };
 
         let mut combined_rows: Vec<Row> = Vec::new();
         for (_rid, values) in raw_rows {
@@ -441,6 +535,7 @@ fn execute_select_ctx(
                 let mut runner = ExecSubqueryRunner {
                     storage,
                     txn,
+                    bloom,
                     ctx,
                     outer_row: &values,
                 };
@@ -464,6 +559,7 @@ fn execute_select_ctx(
                 let mut runner = ExecSubqueryRunner {
                     storage,
                     txn,
+                    bloom,
                     ctx,
                     outer_row: v,
                 };
@@ -535,7 +631,7 @@ fn execute_select_with_joins_ctx(
     let snap = txn.active_snapshot()?;
     let mut scanned: Vec<Vec<Row>> = Vec::with_capacity(all_resolved.len());
     for t in &all_resolved {
-        let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap)?;
+        let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap, None)?;
         scanned.push(rows.into_iter().map(|(_, r)| r).collect());
     }
 
@@ -616,6 +712,7 @@ fn execute_insert_ctx(
     stmt: InsertStmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     let resolved = resolve_table_cached(
@@ -627,6 +724,12 @@ fn execute_insert_ctx(
     )?;
 
     let schema_cols = &resolved.columns;
+    let mut secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
+        .indexes
+        .iter()
+        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .cloned()
+        .collect();
 
     let col_positions: Vec<usize> = match &stmt.columns {
         None => (0..schema_cols.len()).collect(),
@@ -653,7 +756,7 @@ fn execute_insert_ctx(
     let mut first_generated: Option<u64> = None;
 
     fn next_auto_inc_ctx(
-        storage: &dyn StorageEngine,
+        storage: &mut dyn StorageEngine,
         txn: &TxnManager,
         table_def: &axiomdb_catalog::schema::TableDef,
         schema_cols: &[axiomdb_catalog::schema::ColumnDef],
@@ -666,7 +769,7 @@ fn execute_insert_ctx(
             return Ok(next);
         }
         let snap = txn.active_snapshot()?;
-        let rows = TableEngine::scan_table(storage, table_def, schema_cols, snap)?;
+        let rows = TableEngine::scan_table(storage, table_def, schema_cols, snap, None)?;
         let max_existing: u64 = rows
             .iter()
             .filter_map(|(_, vals)| vals.get(col_idx))
@@ -715,12 +818,44 @@ fn execute_insert_ctx(
                     }
                 }
 
-                TableEngine::insert_row(storage, txn, &resolved.def, schema_cols, full_values)?;
+                // Evaluate active CHECK constraints from axiom_constraints.
+                check_row_constraints(
+                    &resolved.constraints,
+                    &full_values,
+                    &resolved.def.table_name,
+                )?;
+
+                // Clone so full_values remains available for index maintenance.
+                let rid = TableEngine::insert_row(
+                    storage,
+                    txn,
+                    &resolved.def,
+                    schema_cols,
+                    full_values.clone(),
+                )?;
+                if !secondary_indexes.is_empty() {
+                    let updated = crate::index_maintenance::insert_into_indexes(
+                        &secondary_indexes,
+                        &full_values,
+                        rid,
+                        storage,
+                        bloom,
+                    )?;
+                    for (index_id, new_root) in updated {
+                        CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
+                        if let Some(idx) = secondary_indexes
+                            .iter_mut()
+                            .find(|i| i.index_id == index_id)
+                        {
+                            idx.root_page_id = new_root;
+                        }
+                    }
+                }
                 count += 1;
             }
         }
         InsertSource::Select(select_stmt) => {
-            let select_rows = match execute_select_ctx(*select_stmt, storage, txn, ctx)? {
+            let select_rows = match execute_select_ctx(*select_stmt, storage, txn, bloom, ctx)? {
                 QueryResult::Rows { rows, .. } => rows,
                 other => {
                     return Err(DbError::Other(format!(
@@ -752,7 +887,32 @@ fn execute_insert_ctx(
                         }
                     }
                 }
-                TableEngine::insert_row(storage, txn, &resolved.def, schema_cols, full_values)?;
+                // Clone so full_values remains available for index maintenance.
+                let rid = TableEngine::insert_row(
+                    storage,
+                    txn,
+                    &resolved.def,
+                    schema_cols,
+                    full_values.clone(),
+                )?;
+                if !secondary_indexes.is_empty() {
+                    let updated = crate::index_maintenance::insert_into_indexes(
+                        &secondary_indexes,
+                        &full_values,
+                        rid,
+                        storage,
+                        bloom,
+                    )?;
+                    for (index_id, new_root) in updated {
+                        CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
+                        if let Some(idx) = secondary_indexes
+                            .iter_mut()
+                            .find(|i| i.index_id == index_id)
+                        {
+                            idx.root_page_id = new_root;
+                        }
+                    }
+                }
                 count += 1;
             }
         }
@@ -778,6 +938,7 @@ fn execute_update_ctx(
     stmt: UpdateStmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     let resolved = resolve_table_cached(
@@ -789,6 +950,12 @@ fn execute_update_ctx(
     )?;
 
     let schema_cols = resolved.columns.clone();
+    let secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
+        .indexes
+        .iter()
+        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .cloned()
+        .collect();
 
     let assignments: Vec<(usize, Expr)> = stmt
         .assignments
@@ -806,9 +973,14 @@ fn execute_update_ctx(
         .collect::<Result<_, DbError>>()?;
 
     let snap = txn.active_snapshot()?;
-    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
+    // UPDATE always needs all columns: unchanged columns carry over as-is to
+    // the new row. Lazy decode (column_mask) does not help here.
+    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?;
 
-    let mut count = 0u64;
+    // Collect all matching (rid, old_values, new_values) triples before touching
+    // the heap. Old values are kept for secondary index maintenance (delete old
+    // key before inserting new key into each B-Tree).
+    let mut to_update: Vec<(RecordId, Vec<Value>, Vec<Value>)> = Vec::new();
     for (rid, current_values) in rows {
         if let Some(ref wc) = stmt.where_clause {
             if !is_truthy(&eval(wc, &current_values)?) {
@@ -819,8 +991,86 @@ fn execute_update_ctx(
         for (col_pos, val_expr) in &assignments {
             new_values[*col_pos] = eval(val_expr, &current_values)?;
         }
-        TableEngine::update_row(storage, txn, &resolved.def, &schema_cols, rid, new_values)?;
-        count += 1;
+        to_update.push((rid, current_values, new_values));
+    }
+
+    let count = to_update.len() as u64;
+
+    if secondary_indexes.is_empty() {
+        // Fast path: no secondary indexes — use batch heap update (O(P) page I/O).
+        let heap_updates: Vec<(RecordId, Vec<Value>)> = to_update
+            .into_iter()
+            .map(|(rid, _old, new)| (rid, new))
+            .collect();
+        match heap_updates.len() {
+            0 => {}
+            1 => {
+                let (rid, new_values) = heap_updates.into_iter().next().unwrap();
+                TableEngine::update_row(
+                    storage,
+                    txn,
+                    &resolved.def,
+                    &schema_cols,
+                    rid,
+                    new_values,
+                )?;
+            }
+            _ => {
+                // Multi-row batch: delete_batch + insert_batch — O(P) page I/O.
+                TableEngine::update_rows_batch(
+                    storage,
+                    txn,
+                    &resolved.def,
+                    &schema_cols,
+                    heap_updates,
+                )?;
+            }
+        }
+    } else {
+        // Secondary indexes present: per-row update so index maintenance has
+        // both old key (for delete) and new RecordId (for insert + bloom.add).
+        let mut current_indexes = secondary_indexes;
+        for (rid, old_values, new_values) in to_update {
+            let new_rid = TableEngine::update_row(
+                storage,
+                txn,
+                &resolved.def,
+                &schema_cols,
+                rid,
+                new_values.clone(),
+            )?;
+            // Remove old key from each secondary index; mark bloom dirty.
+            let del_updated = crate::index_maintenance::delete_from_indexes(
+                &current_indexes,
+                &old_values,
+                storage,
+                bloom,
+            )?;
+            for (index_id, new_root) in &del_updated {
+                CatalogWriter::new(storage, txn)?.update_index_root(*index_id, *new_root)?;
+            }
+            // Refresh in-memory roots before insert so the insert uses the
+            // correct (post-delete) root page.
+            for (index_id, new_root) in del_updated {
+                if let Some(idx) = current_indexes.iter_mut().find(|i| i.index_id == index_id) {
+                    idx.root_page_id = new_root;
+                }
+            }
+            // Insert new key into each secondary index; add to bloom.
+            let ins_updated = crate::index_maintenance::insert_into_indexes(
+                &current_indexes,
+                &new_values,
+                new_rid,
+                storage,
+                bloom,
+            )?;
+            for (index_id, new_root) in ins_updated {
+                CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
+                if let Some(idx) = current_indexes.iter_mut().find(|i| i.index_id == index_id) {
+                    idx.root_page_id = new_root;
+                }
+            }
+        }
     }
 
     Ok(QueryResult::Affected {
@@ -833,6 +1083,7 @@ fn execute_delete_ctx(
     stmt: DeleteStmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     let resolved = resolve_table_cached(
@@ -843,31 +1094,192 @@ fn execute_delete_ctx(
         &stmt.table.name,
     )?;
 
-    let schema_cols = resolved.columns.clone();
-    let snap = txn.active_snapshot()?;
-    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
+    let secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
+        .indexes
+        .iter()
+        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .cloned()
+        .collect();
 
-    let to_delete: Vec<RecordId> = rows
+    let snap = txn.active_snapshot()?;
+
+    // No-WHERE + no secondary indexes → fast path: skip full row decode.
+    // When secondary indexes exist we must scan rows to extract index keys for
+    // deletion and to mark the bloom filters dirty.
+    if stmt.where_clause.is_none() && secondary_indexes.is_empty() {
+        // Collect only (page_id, slot_id) pairs — MariaDB ha_delete_all_rows pattern.
+        let raw_rids = HeapChain::scan_rids_visible(storage, resolved.def.data_root_page_id, snap)?;
+        let count = raw_rids.len() as u64;
+
+        // Physical heap update: mark all slots dead with ONE heap-chain pass.
+        HeapChain::delete_batch(
+            storage,
+            resolved.def.data_root_page_id,
+            &raw_rids,
+            snap.current_txn_id,
+        )?;
+
+        // WAL: ONE Truncate entry instead of N Delete entries — 10,000× fewer WAL writes.
+        txn.record_truncate(resolved.def.id, resolved.def.data_root_page_id)?;
+
+        return Ok(QueryResult::Affected {
+            count,
+            last_insert_id: None,
+        });
+    }
+
+    // Full scan: need row values either for WHERE evaluation or for secondary
+    // index key extraction. When secondary indexes exist, skip the column mask
+    // optimisation — all column values may be needed for index key encoding.
+    let schema_cols = resolved.columns.clone();
+    let column_mask: Option<Vec<bool>> = if secondary_indexes.is_empty() {
+        // WHERE-only path: lazy-decode only referenced columns.
+        let n_cols = schema_cols.len();
+        stmt.where_clause
+            .as_ref()
+            .map(|wc| {
+                let mask = build_column_mask(n_cols, &[wc]);
+                if mask.iter().all(|&b| b) {
+                    vec![]
+                } else {
+                    mask
+                }
+            })
+            .filter(|m| !m.is_empty())
+    } else {
+        // Secondary indexes present: full decode required.
+        None
+    };
+
+    let rows = TableEngine::scan_table(
+        storage,
+        &resolved.def,
+        &schema_cols,
+        snap,
+        column_mask.as_deref(),
+    )?;
+
+    // Collect all matching (rid, row_values) before deleting from the heap.
+    // Row values are needed for secondary index key extraction.
+    let to_delete: Vec<(RecordId, Vec<Value>)> = rows
         .into_iter()
         .filter_map(|(rid, values)| match &stmt.where_clause {
-            None => Some(Ok(rid)),
+            None => Some(Ok((rid, values))),
             Some(wc) => match eval(wc, &values) {
-                Ok(v) if is_truthy(&v) => Some(Ok(rid)),
+                Ok(v) if is_truthy(&v) => Some(Ok((rid, values))),
                 Ok(_) => None,
                 Err(e) => Some(Err(e)),
             },
         })
         .collect::<Result<_, DbError>>()?;
 
-    let count = to_delete.len() as u64;
-    for rid in to_delete {
-        TableEngine::delete_row(storage, txn, &resolved.def, rid)?;
+    // Batch-delete from heap: each page read+written once instead of 3× per row.
+    let rids_only: Vec<RecordId> = to_delete.iter().map(|(rid, _)| *rid).collect();
+    let count = TableEngine::delete_rows_batch(storage, txn, &resolved.def, &rids_only)?;
+
+    // Index maintenance: per-row B-Tree deletes; bloom marked dirty per index.
+    if !secondary_indexes.is_empty() {
+        for (_, row_vals) in &to_delete {
+            let updated = crate::index_maintenance::delete_from_indexes(
+                &secondary_indexes,
+                row_vals,
+                storage,
+                bloom,
+            )?;
+            for (index_id, new_root) in updated {
+                CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
+            }
+        }
     }
 
     Ok(QueryResult::Affected {
         count,
         last_insert_id: None,
     })
+}
+
+// ── Column mask for lazy decode ───────────────────────────────────────────────
+
+/// Builds a boolean mask over `n_cols` columns. `mask[i]` is `true` if column
+/// `i` is referenced by any expression in `exprs`. Used by `execute_select_ctx`
+/// and `execute_delete_ctx` to tell `scan_table` which columns to decode.
+///
+/// Conservative: any [`SelectItem::Wildcard`] or [`SelectItem::QualifiedWildcard`]
+/// in the query's SELECT list will cause the caller to pass `None` instead (full
+/// decode), so this function is only called when the select list is fully
+/// resolved to column expressions.
+fn build_column_mask(n_cols: usize, exprs: &[&Expr]) -> Vec<bool> {
+    let mut mask = vec![false; n_cols];
+    for expr in exprs {
+        collect_column_refs(expr, &mut mask);
+    }
+    mask
+}
+
+/// Walks `expr` and marks every referenced local column index in `mask`.
+///
+/// Does **not** recurse into subquery bodies (`Subquery`, `InSubquery`,
+/// `Exists`) — those reference an inner scope with a different row layout.
+/// [`OuterColumn`] references point to an enclosing scope, not this row.
+fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
+    match expr {
+        Expr::Column { col_idx, .. } => {
+            if *col_idx < mask.len() {
+                mask[*col_idx] = true;
+            }
+        }
+        Expr::Literal(_) | Expr::OuterColumn { .. } | Expr::Param { .. } => {}
+        Expr::UnaryOp { operand, .. } => collect_column_refs(operand, mask),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_column_refs(left, mask);
+            collect_column_refs(right, mask);
+        }
+        Expr::IsNull { expr, .. } => collect_column_refs(expr, mask),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_column_refs(expr, mask);
+            collect_column_refs(low, mask);
+            collect_column_refs(high, mask);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_column_refs(expr, mask);
+            collect_column_refs(pattern, mask);
+        }
+        Expr::In { expr, list, .. } => {
+            collect_column_refs(expr, mask);
+            for e in list {
+                collect_column_refs(e, mask);
+            }
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_column_refs(a, mask);
+            }
+        }
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_column_refs(op, mask);
+            }
+            for (w, t) in when_thens {
+                collect_column_refs(w, mask);
+                collect_column_refs(t, mask);
+            }
+            if let Some(e) = else_result {
+                collect_column_refs(e, mask);
+            }
+        }
+        Expr::Cast { expr, .. } => collect_column_refs(expr, mask),
+        // InSubquery: recurse only on the outer expression, not the inner query.
+        Expr::InSubquery { expr, .. } => collect_column_refs(expr, mask),
+        // Subquery and Exists reference inner scopes — do not recurse.
+        Expr::Subquery(_) | Expr::Exists { .. } => {}
+    }
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────────────
@@ -888,8 +1300,14 @@ fn dispatch(
         // DDL
         Stmt::CreateTable(s) => execute_create_table(s, storage, txn),
         Stmt::DropTable(s) => execute_drop_table(s, storage, txn),
-        Stmt::CreateIndex(s) => execute_create_index(s, storage, txn),
-        Stmt::DropIndex(s) => execute_drop_index(s, storage, txn),
+        Stmt::CreateIndex(s) => {
+            let mut noop_bloom = crate::bloom::BloomRegistry::new();
+            execute_create_index(s, storage, txn, &mut noop_bloom)
+        }
+        Stmt::DropIndex(s) => {
+            let mut noop_bloom = crate::bloom::BloomRegistry::new();
+            execute_drop_index(s, storage, txn, &mut noop_bloom)
+        }
         // Transaction control (when already inside a txn)
         Stmt::Begin => Err(DbError::TransactionAlreadyActive {
             txn_id: txn.active_txn_id().unwrap_or(0),
@@ -923,11 +1341,13 @@ fn execute_select(
     if stmt.from.is_none() {
         // ── SELECT without FROM ───────────────────────────────────────────────
         // Subqueries in the SELECT list (EXISTS, IN subquery, scalar subquery)
-        // require a runner; we use a temporary SessionContext.
+        // require a runner; we use a temporary SessionContext and a temporary bloom.
         let mut temp_ctx = SessionContext::new();
+        let mut temp_bloom = crate::bloom::BloomRegistry::new();
         let mut runner = ExecSubqueryRunner {
             storage,
             txn,
+            bloom: &mut temp_bloom,
             ctx: &mut temp_ctx,
             outer_row: &[],
         };
@@ -976,7 +1396,7 @@ fn execute_select(
     if stmt.joins.is_empty() {
         // ── Single-table path (no JOIN) ───────────────────────────────────────
         let resolved = {
-            let resolver = make_resolver(storage, txn)?;
+            let mut resolver = make_resolver(storage, txn)?;
             resolver.resolve_table(from_table_ref.schema.as_deref(), &from_table_ref.name)?
         };
 
@@ -994,7 +1414,7 @@ fn execute_select(
         let raw_rows: Vec<(RecordId, Vec<Value>)> = match &access_method {
             crate::planner::AccessMethod::Scan => {
                 // Full sequential scan — existing behavior.
-                TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?
+                TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap, None)?
             }
             crate::planner::AccessMethod::IndexLookup { index_def, key } => {
                 // Point lookup: B-Tree → single RecordId → heap read.
@@ -1030,9 +1450,11 @@ fn execute_select(
         for (_rid, values) in raw_rows {
             if let Some(ref wc) = stmt.where_clause {
                 let mut temp_ctx = SessionContext::new();
+                let mut temp_bloom = crate::bloom::BloomRegistry::new();
                 let mut runner = ExecSubqueryRunner {
                     storage,
                     txn,
+                    bloom: &mut temp_bloom,
                     ctx: &mut temp_ctx,
                     outer_row: &values,
                 };
@@ -1054,9 +1476,11 @@ fn execute_select(
             .iter()
             .map(|v| {
                 let mut temp_ctx = SessionContext::new();
+                let mut temp_bloom = crate::bloom::BloomRegistry::new();
                 let mut runner = ExecSubqueryRunner {
                     storage,
                     txn,
+                    bloom: &mut temp_bloom,
                     ctx: &mut temp_ctx,
                     outer_row: v,
                 };
@@ -1095,7 +1519,9 @@ fn execute_select_derived(
 
     // Execute the inner query to materialize the derived table.
     let mut temp_ctx = SessionContext::new();
-    let inner_result = execute_select_ctx(inner_query, storage, txn, &mut temp_ctx)?;
+    let mut temp_bloom = crate::bloom::BloomRegistry::new();
+    let inner_result =
+        execute_select_ctx(inner_query, storage, txn, &mut temp_bloom, &mut temp_ctx)?;
     let (derived_cols, derived_rows) = match inner_result {
         QueryResult::Rows { columns, rows } => (columns, rows),
         _ => {
@@ -1110,9 +1536,11 @@ fn execute_select_derived(
     for values in derived_rows {
         if let Some(ref wc) = stmt.where_clause {
             let mut temp_ctx2 = SessionContext::new();
+            let mut temp_bloom2 = crate::bloom::BloomRegistry::new();
             let mut runner = ExecSubqueryRunner {
                 storage,
                 txn,
+                bloom: &mut temp_bloom2,
                 ctx: &mut temp_ctx2,
                 outer_row: &values,
             };
@@ -1169,7 +1597,7 @@ fn execute_select_with_joins(
     let mut running_offset = 0usize;
 
     {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         let from_t = resolver.resolve_table(from_ref.schema.as_deref(), &from_ref.name)?;
         col_offsets.push(running_offset);
         running_offset += from_t.columns.len();
@@ -1196,7 +1624,7 @@ fn execute_select_with_joins(
     let snap = txn.active_snapshot()?;
     let mut scanned: Vec<Vec<Row>> = Vec::with_capacity(all_resolved.len());
     for t in &all_resolved {
-        let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap)?;
+        let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap, None)?;
         scanned.push(rows.into_iter().map(|(_, r)| r).collect());
     }
 
@@ -2387,7 +2815,7 @@ fn execute_insert(
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
     let resolved = {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
 
@@ -2423,6 +2851,9 @@ fn execute_insert(
         .cloned()
         .collect();
 
+    // No-op bloom for the non-ctx path (bloom is managed by execute_with_ctx callers).
+    let mut noop_bloom = crate::bloom::BloomRegistry::new();
+
     // Find the AUTO_INCREMENT column index (at most one per table).
     let auto_inc_col: Option<usize> = schema_cols.iter().position(|c| c.auto_increment);
 
@@ -2432,7 +2863,7 @@ fn execute_insert(
     /// Returns the next value from the per-table AUTO_INCREMENT sequence,
     /// initializing it from MAX(col)+1 on first use (restart-safe).
     fn next_auto_inc(
-        storage: &dyn StorageEngine,
+        storage: &mut dyn StorageEngine,
         txn: &TxnManager,
         table_def: &axiomdb_catalog::schema::TableDef,
         schema_cols: &[axiomdb_catalog::schema::ColumnDef],
@@ -2447,7 +2878,7 @@ fn execute_insert(
         }
         // First use: scan the table to find MAX of the auto-increment column.
         let snap = txn.active_snapshot()?;
-        let rows = TableEngine::scan_table(storage, table_def, schema_cols, snap)?;
+        let rows = TableEngine::scan_table(storage, table_def, schema_cols, snap, None)?;
         let max_existing: u64 = rows
             .iter()
             .filter_map(|(_, vals)| vals.get(col_idx))
@@ -2535,6 +2966,7 @@ fn execute_insert(
                         &full_values,
                         rid,
                         storage,
+                        &mut noop_bloom,
                     )?;
                     for (index_id, new_root) in updated {
                         CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -2568,6 +3000,7 @@ fn execute_insert(
                         &full_values,
                         rid,
                         storage,
+                        &mut noop_bloom,
                     )?;
                     for (index_id, new_root) in updated {
                         CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -2626,6 +3059,7 @@ fn execute_insert(
                         &full_values,
                         rid,
                         storage,
+                        &mut noop_bloom,
                     )?;
                     for (index_id, new_root) in updated {
                         CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -2662,7 +3096,7 @@ fn execute_update(
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
     let resolved = {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
 
@@ -2685,7 +3119,7 @@ fn execute_update(
         .collect::<Result<_, DbError>>()?;
 
     let snap = txn.active_snapshot()?;
-    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
+    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?;
 
     // Use the already-loaded indexes from the resolved table (cached by SchemaCache).
     let mut secondary_indexes: Vec<IndexDef> = resolved
@@ -2694,6 +3128,9 @@ fn execute_update(
         .filter(|i| !i.is_primary && !i.columns.is_empty())
         .cloned()
         .collect();
+
+    // No-op bloom for the non-ctx path (bloom is managed by execute_with_ctx callers).
+    let mut noop_bloom = crate::bloom::BloomRegistry::new();
 
     let mut count = 0u64;
     for (rid, current_values) in rows {
@@ -2722,6 +3159,7 @@ fn execute_update(
                 &secondary_indexes,
                 &current_values,
                 storage,
+                &mut noop_bloom,
             )?;
             for (index_id, new_root) in &del_updated {
                 CatalogWriter::new(storage, txn)?.update_index_root(*index_id, *new_root)?;
@@ -2741,6 +3179,7 @@ fn execute_update(
                 &new_values,
                 new_rid,
                 storage,
+                &mut noop_bloom,
             )?;
             for (index_id, new_root) in ins_updated {
                 CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -2763,13 +3202,11 @@ fn execute_delete(
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
     let resolved = {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
 
-    let schema_cols = resolved.columns.clone();
     let snap = txn.active_snapshot()?;
-    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
 
     // Use the already-loaded indexes from the resolved table (cached by SchemaCache).
     let secondary_indexes: Vec<IndexDef> = resolved
@@ -2778,6 +3215,31 @@ fn execute_delete(
         .filter(|i| !i.is_primary && !i.columns.is_empty())
         .cloned()
         .collect();
+
+    // No-op bloom for the non-ctx path (bloom is managed by execute_with_ctx callers).
+    let mut noop_bloom = crate::bloom::BloomRegistry::new();
+
+    // No-WHERE + no secondary indexes → single Truncate WAL entry (10,000× less WAL I/O).
+    // Secondary indexes need per-row values for key extraction, so we fall through to the
+    // slow path when any secondary index exists.
+    if stmt.where_clause.is_none() && secondary_indexes.is_empty() {
+        let raw_rids = HeapChain::scan_rids_visible(storage, resolved.def.data_root_page_id, snap)?;
+        let count = raw_rids.len() as u64;
+        HeapChain::delete_batch(
+            storage,
+            resolved.def.data_root_page_id,
+            &raw_rids,
+            snap.current_txn_id,
+        )?;
+        txn.record_truncate(resolved.def.id, resolved.def.data_root_page_id)?;
+        return Ok(QueryResult::Affected {
+            count,
+            last_insert_id: None,
+        });
+    }
+
+    let schema_cols = resolved.columns.clone();
+    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?;
 
     // Collect all matching (rid, row_values) BEFORE deleting any row.
     let to_delete: Vec<(RecordId, Vec<Value>)> = rows
@@ -2792,15 +3254,19 @@ fn execute_delete(
         })
         .collect::<Result<_, DbError>>()?;
 
-    let count = to_delete.len() as u64;
-    for (rid, row_vals) in to_delete {
-        TableEngine::delete_row(storage, txn, &resolved.def, rid)?;
-        // Index maintenance: remove from secondary indexes.
-        if !secondary_indexes.is_empty() {
+    // Batch-delete from heap: each page read+written once instead of 3× per row.
+    let rids_only: Vec<RecordId> = to_delete.iter().map(|(rid, _)| *rid).collect();
+    let count = TableEngine::delete_rows_batch(storage, txn, &resolved.def, &rids_only)?;
+
+    // Index maintenance: still per-row (each B+Tree remove is its own traversal),
+    // but heap I/O is now fully batched above.
+    if !secondary_indexes.is_empty() {
+        for (_, row_vals) in &to_delete {
             let updated = crate::index_maintenance::delete_from_indexes(
                 &secondary_indexes,
-                &row_vals,
+                row_vals,
                 storage,
+                &mut noop_bloom,
             )?;
             for (index_id, new_root) in updated {
                 CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -2825,7 +3291,7 @@ fn execute_create_table(
 
     // Check existence before constructing CatalogWriter (avoids double mutable borrow).
     {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         if resolver.table_exists(Some(schema), &stmt.table.name)? {
             if stmt.if_not_exists {
                 return Ok(QueryResult::Empty);
@@ -2875,7 +3341,7 @@ fn execute_drop_table(
         let snap = txn.active_snapshot()?;
 
         let table_id = {
-            let reader = CatalogReader::new(storage, snap)?;
+            let mut reader = CatalogReader::new(storage, snap)?;
             match reader.get_table(schema, &table_ref.name)? {
                 Some(def) => def.id,
                 None if stmt.if_exists => continue,
@@ -2899,6 +3365,7 @@ fn execute_create_index(
     stmt: CreateIndexStmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
 ) -> Result<QueryResult, DbError> {
     use crate::key_encoding::{encode_index_key, MAX_INDEX_KEY};
     use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
@@ -2909,14 +3376,14 @@ fn execute_create_index(
 
     // 1. Resolve table definition + column list.
     let (table_def, col_defs) = {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         let resolved = resolver.resolve_table(Some(schema), &stmt.table.name)?;
         (resolved.def.clone(), resolved.columns.clone())
     };
 
     // 2. Check for a duplicate index name on this table.
     {
-        let reader = CatalogReader::new(storage, snap)?;
+        let mut reader = CatalogReader::new(storage, snap)?;
         let existing = reader.list_indexes(table_def.id)?;
         if existing.iter().any(|i| i.name == stmt.name) {
             return Err(DbError::IndexAlreadyExists {
@@ -2959,8 +3426,9 @@ fn execute_create_index(
     let root_pid = AtomicU64::new(root_page_id);
 
     // 5. Scan the table and insert existing rows into the B-Tree.
-    let rows = TableEngine::scan_table(storage, &table_def, &col_defs, snap)?;
+    let rows = TableEngine::scan_table(storage, &table_def, &col_defs, snap, None)?;
     let mut skipped = 0usize;
+    let mut bloom_keys: Vec<Vec<u8>> = Vec::new();
     for (rid, row_vals) in rows {
         let key_vals: Vec<Value> = index_columns
             .iter()
@@ -2973,6 +3441,7 @@ fn execute_create_index(
         match encode_index_key(&key_vals) {
             Ok(key) => {
                 BTree::insert_in(storage, &root_pid, &key, rid)?;
+                bloom_keys.push(key);
             }
             Err(DbError::IndexKeyTooLong { .. }) => {
                 skipped += 1;
@@ -2990,7 +3459,7 @@ fn execute_create_index(
     // 6. Persist IndexDef with column list and final root_page_id (may have changed after splits).
     let final_root = root_pid.load(Ordering::Acquire);
     let mut writer = CatalogWriter::new(storage, txn)?;
-    writer.create_index(IndexDef {
+    let new_index_id = writer.create_index(IndexDef {
         index_id: 0, // allocated by CatalogWriter::create_index
         table_id: table_def.id,
         name: stmt.name.clone(),
@@ -2999,6 +3468,12 @@ fn execute_create_index(
         is_primary: false,
         columns: index_columns,
     })?;
+
+    // 7. Populate bloom filter for the newly created index.
+    bloom.create(new_index_id, bloom_keys.len().max(1));
+    for key in &bloom_keys {
+        bloom.add(new_index_id, key);
+    }
 
     Ok(QueryResult::Empty)
 }
@@ -3009,6 +3484,7 @@ fn execute_drop_index(
     stmt: DropIndexStmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
 ) -> Result<QueryResult, DbError> {
     let snap = txn.active_snapshot()?;
 
@@ -3022,7 +3498,7 @@ fn execute_drop_index(
 
     // Capture both index_id and root_page_id for catalog deletion + B-Tree page reclamation.
     let (index_id, root_page_id) = {
-        let reader = CatalogReader::new(storage, snap)?;
+        let mut reader = CatalogReader::new(storage, snap)?;
         let table_def = match reader.get_table(schema, &table_ref.name)? {
             Some(d) => d,
             None if stmt.if_exists => return Ok(QueryResult::Empty),
@@ -3047,6 +3523,7 @@ fn execute_drop_index(
         Some(id) => {
             // Delete catalog entry first.
             CatalogWriter::new(storage, txn)?.delete_index(id)?;
+            bloom.remove(id);
             // Then free all B-Tree pages to avoid leaks.
             if let Some(root) = root_page_id {
                 free_btree_pages(storage, root)?;
@@ -3090,16 +3567,21 @@ fn execute_truncate(
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
     let resolved = {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
 
+    // TRUNCATE has no WHERE predicate — use the no-WAL-per-row fast path.
+    // delete_batch() marks slots dead; record_truncate() writes ONE WAL entry.
     let snap = txn.active_snapshot()?;
-    let rows = TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?;
-    let rids: Vec<RecordId> = rows.into_iter().map(|(rid, _)| rid).collect();
-    for rid in rids {
-        TableEngine::delete_row(storage, txn, &resolved.def, rid)?;
-    }
+    let raw_rids = HeapChain::scan_rids_visible(storage, resolved.def.data_root_page_id, snap)?;
+    HeapChain::delete_batch(
+        storage,
+        resolved.def.data_root_page_id,
+        &raw_rids,
+        snap.current_txn_id,
+    )?;
+    txn.record_truncate(resolved.def.id, resolved.def.data_root_page_id)?;
 
     // Reset the AUTO_INCREMENT sequence so the next insert starts from 1.
     AUTO_INC_SEQ.with(|seq| {
@@ -3122,7 +3604,7 @@ fn execute_show_tables(
 ) -> Result<QueryResult, DbError> {
     let schema = stmt.schema.as_deref().unwrap_or("public");
     let snap = txn.active_snapshot()?;
-    let reader = CatalogReader::new(storage, snap)?;
+    let mut reader = CatalogReader::new(storage, snap)?;
     let tables = reader.list_tables(schema)?;
 
     let col_name = format!("Tables_in_{schema}");
@@ -3145,7 +3627,7 @@ fn execute_show_columns(
 ) -> Result<QueryResult, DbError> {
     let schema = stmt.table.schema.as_deref().unwrap_or("public");
     let snap = txn.active_snapshot()?;
-    let reader = CatalogReader::new(storage, snap)?;
+    let mut reader = CatalogReader::new(storage, snap)?;
 
     let table_def =
         reader
@@ -3225,7 +3707,7 @@ fn rewrite_rows(
     transform: &dyn Fn(Row) -> Row,
 ) -> Result<(), DbError> {
     let snap = txn.active_snapshot()?;
-    let rows = TableEngine::scan_table(storage, table_def, old_columns, snap)?;
+    let rows = TableEngine::scan_table(storage, table_def, old_columns, snap, None)?;
     for (rid, old_values) in rows {
         let new_values = transform(old_values);
         TableEngine::delete_row(storage, txn, table_def, rid)?;
@@ -3243,7 +3725,7 @@ fn execute_alter_table(
 
     // Resolve the table once upfront.
     let table_def = {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
     // Keep the current column list; update it as we apply operations.
@@ -3277,9 +3759,15 @@ fn execute_alter_table(
                 // for simplicity, only one op per statement is expected for RENAME TO.
                 break;
             }
+            AlterTableOp::AddConstraint(tc) => {
+                alter_add_constraint(storage, txn, &table_def, &columns, tc, schema)?;
+            }
+            AlterTableOp::DropConstraint { name, if_exists } => {
+                alter_drop_constraint(storage, txn, &table_def, &name, if_exists)?;
+            }
             _ => {
                 return Err(DbError::NotImplemented {
-                    feature: "ALTER TABLE MODIFY COLUMN / ADD CONSTRAINT — Phase N".into(),
+                    feature: "ALTER TABLE MODIFY COLUMN — Phase N".into(),
                 })
             }
         }
@@ -3462,7 +3950,7 @@ fn alter_rename_table(
 ) -> Result<(), DbError> {
     // Check new name not already in use.
     let snap = txn.active_snapshot()?;
-    let reader = CatalogReader::new(storage, snap)?;
+    let mut reader = CatalogReader::new(storage, snap)?;
     if reader.get_table(schema, new_name)?.is_some() {
         return Err(DbError::TableAlreadyExists {
             schema: schema.to_string(),
@@ -3474,6 +3962,248 @@ fn alter_rename_table(
     Ok(())
 }
 
+// ── CHECK constraint enforcement (Phase 4.22b) ────────────────────────────────
+
+/// Evaluates active CHECK constraints for a row about to be inserted/updated.
+fn check_row_constraints(
+    constraints: &[axiomdb_catalog::schema::ConstraintDef],
+    row_values: &[Value],
+    table_name: &str,
+) -> Result<(), DbError> {
+    for c in constraints {
+        if c.check_expr.is_empty() {
+            continue;
+        }
+        let expr = match crate::parser::parse_expr_only(&c.check_expr) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let result = eval(&expr, row_values)?;
+        if !crate::eval::is_truthy(&result) {
+            return Err(DbError::CheckViolation {
+                table: table_name.to_string(),
+                constraint: c.name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+// ── ALTER TABLE constraint helpers (Phase 4.22b) ──────────────────────────────
+
+fn alter_add_constraint(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_def: &axiomdb_catalog::ResolvedTable,
+    columns: &[axiomdb_catalog::schema::ColumnDef],
+    tc: crate::ast::TableConstraint,
+    schema: &str,
+) -> Result<(), DbError> {
+    use crate::ast::TableConstraint;
+    use axiomdb_catalog::schema::ConstraintDef;
+
+    match tc {
+        TableConstraint::Unique {
+            name,
+            columns: col_names,
+        } => {
+            // ADD CONSTRAINT name UNIQUE (cols) → create a unique index named `name`.
+            let idx_name = name.unwrap_or_else(|| {
+                format!(
+                    "axiom_uq_{}_{}",
+                    table_def.def.table_name,
+                    col_names.join("_")
+                )
+            });
+            let stmt = crate::ast::CreateIndexStmt {
+                name: idx_name,
+                table: crate::ast::TableRef {
+                    schema: Some(schema.to_string()),
+                    name: table_def.def.table_name.clone(),
+                    alias: None,
+                },
+                columns: col_names
+                    .into_iter()
+                    .map(|c| crate::ast::IndexColumn {
+                        name: c,
+                        order: crate::ast::SortOrder::Asc,
+                    })
+                    .collect(),
+                unique: true,
+                if_not_exists: false,
+            };
+            let mut noop_bloom = crate::bloom::BloomRegistry::new();
+            execute_create_index(stmt, storage, txn, &mut noop_bloom)?;
+            Ok(())
+        }
+
+        TableConstraint::Check { name, expr } => {
+            let cname = name.ok_or_else(|| DbError::ParseError {
+                message: "ADD CONSTRAINT CHECK requires an explicit constraint name".into(),
+            })?;
+
+            // Check for duplicate constraint name.
+            let snap = txn.active_snapshot()?;
+            {
+                let mut reader = CatalogReader::new(storage, snap)?;
+                if reader
+                    .get_constraint_by_name(table_def.def.id, &cname)?
+                    .is_some()
+                {
+                    return Err(DbError::Other(format!(
+                        "constraint '{cname}' already exists on table '{}'",
+                        table_def.def.table_name
+                    )));
+                }
+            }
+
+            // Validate all existing rows.
+            let existing_rows =
+                TableEngine::scan_table(storage, &table_def.def, columns, snap, None)?;
+            for (_rid, row_values) in &existing_rows {
+                let result = eval(&expr, row_values)?;
+                if !crate::eval::is_truthy(&result) {
+                    return Err(DbError::CheckViolation {
+                        table: table_def.def.table_name.clone(),
+                        constraint: cname.clone(),
+                    });
+                }
+            }
+
+            // Serialize the expression to SQL string for persistence.
+            let check_expr = expr_to_sql_string(&expr);
+
+            // Persist in axiom_constraints.
+            CatalogWriter::new(storage, txn)?.create_constraint(ConstraintDef {
+                constraint_id: 0, // allocated by writer
+                table_id: table_def.def.id,
+                name: cname,
+                check_expr,
+            })?;
+            Ok(())
+        }
+
+        TableConstraint::ForeignKey { .. } => Err(DbError::NotImplemented {
+            feature: "ADD CONSTRAINT FOREIGN KEY — Phase 6.5".into(),
+        }),
+
+        TableConstraint::PrimaryKey { .. } => Err(DbError::NotImplemented {
+            feature: "ADD CONSTRAINT PRIMARY KEY — requires full table rewrite".into(),
+        }),
+    }
+}
+
+fn alter_drop_constraint(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_def: &axiomdb_catalog::ResolvedTable,
+    name: &str,
+    if_exists: bool,
+) -> Result<(), DbError> {
+    let snap = txn.active_snapshot()?;
+    let table_id = table_def.def.id;
+
+    // 1. Search in axiom_indexes (UNIQUE constraints stored as indexes).
+    let (idx_id, idx_root) = {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        let indexes = reader.list_indexes(table_id)?;
+        match indexes.into_iter().find(|i| i.name == name) {
+            Some(i) => (Some(i.index_id), Some(i.root_page_id)),
+            None => (None, None),
+        }
+    };
+
+    if let Some(index_id) = idx_id {
+        CatalogWriter::new(storage, txn)?.delete_index(index_id)?;
+        if let Some(root) = idx_root {
+            free_btree_pages(storage, root)?;
+        }
+        return Ok(());
+    }
+
+    // 2. Search in axiom_constraints (CHECK constraints).
+    let constraint = {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        reader.get_constraint_by_name(table_id, name)?
+    };
+
+    match constraint {
+        Some(c) => {
+            CatalogWriter::new(storage, txn)?.drop_constraint(c.constraint_id)?;
+            Ok(())
+        }
+        None if if_exists => Ok(()),
+        None => Err(DbError::Other(format!(
+            "constraint '{name}' not found on table '{}'",
+            table_def.def.table_name
+        ))),
+    }
+}
+
+/// Converts an [`Expr`] to a SQL string suitable for storing in `axiom_constraints`.
+///
+/// Not a perfect round-trip — whitespace and casing may differ from the original
+/// input, but the output is valid SQL that can be re-parsed and evaluated.
+fn expr_to_sql_string(expr: &Expr) -> String {
+    use crate::expr::BinaryOp;
+
+    match expr {
+        Expr::Literal(v) => match v {
+            Value::Int(n) => n.to_string(),
+            Value::BigInt(n) => n.to_string(),
+            Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+            Value::Null => "NULL".to_string(),
+            Value::Real(f) => f.to_string(),
+            _ => format!("{v}"),
+        },
+        Expr::Column { name, .. } => name.clone(),
+        Expr::BinaryOp { left, op, right } => {
+            let op_str = match op {
+                BinaryOp::Eq => "=",
+                BinaryOp::NotEq => "!=",
+                BinaryOp::Lt => "<",
+                BinaryOp::LtEq => "<=",
+                BinaryOp::Gt => ">",
+                BinaryOp::GtEq => ">=",
+                BinaryOp::And => "AND",
+                BinaryOp::Or => "OR",
+                BinaryOp::Add => "+",
+                BinaryOp::Sub => "-",
+                BinaryOp::Mul => "*",
+                BinaryOp::Div => "/",
+                BinaryOp::Mod => "%",
+                BinaryOp::Concat => "||",
+            };
+            format!(
+                "({} {op_str} {})",
+                expr_to_sql_string(left),
+                expr_to_sql_string(right)
+            )
+        }
+        Expr::UnaryOp {
+            op: crate::expr::UnaryOp::Not,
+            operand,
+        } => {
+            format!("NOT {}", expr_to_sql_string(operand))
+        }
+        Expr::IsNull {
+            expr: inner,
+            negated: false,
+        } => {
+            format!("{} IS NULL", expr_to_sql_string(inner))
+        }
+        Expr::IsNull {
+            expr: inner,
+            negated: true,
+        } => {
+            format!("{} IS NOT NULL", expr_to_sql_string(inner))
+        }
+        // For complex expressions not yet handled, fall back to a debug representation.
+        other => format!("{other:?}"),
+    }
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Creates a [`SchemaResolver`] using the current snapshot.
@@ -3481,7 +4211,7 @@ fn alter_rename_table(
 /// Uses `active_snapshot()` when a transaction is active, falling back to
 /// `snapshot()` for read-only access outside a transaction.
 fn make_resolver<'a>(
-    storage: &'a dyn StorageEngine,
+    storage: &'a mut dyn StorageEngine,
     txn: &TxnManager,
 ) -> Result<SchemaResolver<'a>, DbError> {
     let snap: TransactionSnapshot = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());

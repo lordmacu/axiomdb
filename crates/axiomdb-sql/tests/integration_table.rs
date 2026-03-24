@@ -40,7 +40,7 @@ fn test_table_engine_empty_scan() {
     let table_def = create_table_helper(&mut storage, &mut txn, "t", &columns);
 
     let snap = txn.snapshot();
-    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap).unwrap();
+    let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
     assert!(rows.is_empty(), "fresh table must have 0 rows");
 }
 
@@ -86,7 +86,7 @@ fn test_table_engine_insert_and_scan() {
     txn.commit().unwrap();
 
     let snap = txn.snapshot();
-    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap).unwrap();
+    let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
     assert_eq!(rows.len(), 3);
 
     let names: Vec<&Value> = rows.iter().map(|(_, v)| &v[1]).collect();
@@ -121,12 +121,14 @@ fn test_table_engine_insert_mvcc_visibility() {
     txn.commit().unwrap();
 
     // Old snapshot sees 0 rows.
-    let rows_old = TableEngine::scan_table(&storage, &table_def, &columns, snap_before).unwrap();
+    let rows_old =
+        TableEngine::scan_table(&mut storage, &table_def, &columns, snap_before, None).unwrap();
     assert_eq!(rows_old.len(), 0, "snapshot before insert must see 0 rows");
 
     // Fresh snapshot sees 1 row.
     let snap_after = txn.snapshot();
-    let rows_new = TableEngine::scan_table(&storage, &table_def, &columns, snap_after).unwrap();
+    let rows_new =
+        TableEngine::scan_table(&mut storage, &table_def, &columns, snap_after, None).unwrap();
     assert_eq!(rows_new.len(), 1);
     assert_eq!(rows_new[0].1[0], Value::Int(42));
 }
@@ -169,7 +171,7 @@ fn test_table_engine_delete_row() {
 
     // Scan sees only row 2.
     let snap = txn.snapshot();
-    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap).unwrap();
+    let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].1[0], Value::Int(2));
 }
@@ -250,7 +252,7 @@ fn test_table_engine_update_row() {
     txn.commit().unwrap();
 
     let snap = txn.snapshot();
-    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap).unwrap();
+    let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
     assert_eq!(
         rows.len(),
         1,
@@ -300,7 +302,7 @@ fn test_table_engine_update_changes_record_id() {
 
     // The new RecordId is valid and the value was updated.
     let snap = txn.snapshot();
-    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap).unwrap();
+    let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
     let rids: Vec<RecordId> = rows.iter().map(|(r, _)| *r).collect();
     assert!(
         rids.contains(&new_rid),
@@ -336,7 +338,7 @@ fn test_table_engine_coercion_on_insert() {
     txn.commit().unwrap();
 
     let snap = txn.snapshot();
-    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap).unwrap();
+    let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].1[0],
@@ -410,13 +412,15 @@ fn test_table_engine_scan_respects_snapshot() {
     txn.commit().unwrap();
 
     // snap_after_a must still see only row A.
-    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap_after_a).unwrap();
+    let rows =
+        TableEngine::scan_table(&mut storage, &table_def, &columns, snap_after_a, None).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].1[0], Value::Int(1));
 
     // Current snapshot sees both.
     let snap_current = txn.snapshot();
-    let rows2 = TableEngine::scan_table(&storage, &table_def, &columns, snap_current).unwrap();
+    let rows2 =
+        TableEngine::scan_table(&mut storage, &table_def, &columns, snap_current, None).unwrap();
     assert_eq!(rows2.len(), 2);
 }
 
@@ -451,7 +455,7 @@ fn test_table_engine_chain_growth() {
     txn.commit().unwrap();
 
     let snap = txn.snapshot();
-    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap).unwrap();
+    let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
     assert_eq!(
         rows.len(),
         n_rows,
@@ -486,7 +490,7 @@ fn create_table_helper(
     txn.commit().unwrap();
 
     let snap = txn.snapshot();
-    let reader = axiomdb_catalog::CatalogReader::new(storage, snap).unwrap();
+    let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap).unwrap();
     reader
         .get_table("public", name)
         .unwrap()

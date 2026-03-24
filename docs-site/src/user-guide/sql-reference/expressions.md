@@ -599,3 +599,109 @@ SELECT
 FROM orders
 WHERE status != 'cancelled';
 ```
+
+---
+
+## BLOB / Binary Functions
+
+AxiomDB stores binary data as the `BLOB` / `BYTES` type and provides functions for
+encoding, decoding, and measuring binary values.
+
+| Function | Returns | Description |
+|---|---|---|
+| `FROM_BASE64(text)` | `BLOB` | Decode standard base64 → raw bytes. Returns `NULL` on invalid input. |
+| `TO_BASE64(blob)` | `TEXT` | Encode raw bytes → base64 string. Also accepts `TEXT` and `UUID`. |
+| `OCTET_LENGTH(value)` | `INT` | Byte length of a `BLOB`, `TEXT` (UTF-8 bytes), or `UUID` (always 16). |
+| `ENCODE(blob, fmt)` | `TEXT` | Encode bytes as `'base64'` or `'hex'`. |
+| `DECODE(text, fmt)` | `BLOB` | Decode `'base64'` or `'hex'` text → raw bytes. |
+
+### Usage examples
+
+```sql
+-- Store binary data encoded as base64
+INSERT INTO files (name, data)
+VALUES ('logo.png', FROM_BASE64('iVBORw0KGgoAAAANSUhEUgAA...'));
+
+-- Retrieve as base64 for transport
+SELECT name, TO_BASE64(data) AS data_b64 FROM files;
+
+-- Check byte size of a blob
+SELECT name, OCTET_LENGTH(data) AS size_bytes FROM files;
+
+-- Hex encoding (PostgreSQL / MySQL ENCODE style)
+SELECT ENCODE(data, 'hex') FROM files;          -- → 'deadbeef...'
+SELECT DECODE('deadbeef', 'hex');               -- → binary bytes
+
+-- OCTET_LENGTH vs LENGTH for text
+SELECT LENGTH('héllo');       -- 5 (characters)
+SELECT OCTET_LENGTH('héllo'); -- 6 (UTF-8 bytes: é = 2 bytes)
+```
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Tip — Base64 for JSON APIs</span>
+When returning binary data through a JSON API, wrap the column with
+<code>TO_BASE64(data)</code> to get a transport-safe string. The client reverses it
+with <code>FROM_BASE64()</code> on INSERT. This pattern avoids binary encoding
+issues in MySQL wire protocol text mode.
+</div>
+</div>
+
+---
+
+## UUID Functions
+
+AxiomDB generates and validates UUIDs server-side. No application-level library
+needed — the DB handles UUID primary keys directly.
+
+| Function | Returns | Description |
+|---|---|---|
+| `gen_random_uuid()` | `UUID` | UUID v4 — 122 random bits. Aliases: `uuid_generate_v4()`, `random_uuid()`, `newid()` |
+| `uuid_generate_v7()` | `UUID` | UUID v7 — 48-bit unix timestamp + random bits. Alias: `uuid7()` |
+| `is_valid_uuid(text)` | `BOOL` | `TRUE` if text is a valid UUID string (hyphenated or compact). Alias: `is_uuid()`. Returns `NULL` if arg is `NULL`. |
+
+### Usage
+
+```sql
+-- Auto-generate a UUID primary key at insert time
+CREATE TABLE events (
+    id   UUID NOT NULL,
+    name TEXT NOT NULL
+);
+
+INSERT INTO events (id, name)
+VALUES (gen_random_uuid(), 'page_view');
+
+-- Use UUID v7 for tables that benefit from time-ordered inserts
+INSERT INTO events (id, name)
+VALUES (uuid_generate_v7(), 'checkout');
+
+-- Validate an incoming UUID string before inserting
+SELECT is_valid_uuid('550e8400-e29b-41d4-a716-446655440000');  -- TRUE
+SELECT is_valid_uuid('not-a-uuid');                             -- FALSE
+SELECT is_valid_uuid(NULL);                                     -- NULL
+```
+
+### UUID v4 vs UUID v7 — which to use?
+
+```sql
+-- UUID v4: fully random, best for security-sensitive IDs
+-- Format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx (122 random bits)
+SELECT gen_random_uuid();
+-- → 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
+
+-- UUID v7: time-ordered prefix, best for primary keys on B+ Tree indexes
+-- Format: [48-bit ms timestamp]-[12-bit rand]-[62-bit rand]
+SELECT uuid_generate_v7();
+-- → '018e2e3a-1234-7abc-8def-0123456789ab'
+--    ^^^^^^^^^^^ always increasing
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — UUID v7 for Primary Keys</span>
+UUID v4 generates random 122-bit keys. When used as a B+ Tree primary key, each insert lands at a random leaf position, causing frequent page splits and poor cache locality. UUID v7 embeds a 48-bit millisecond timestamp as a prefix — inserts are nearly always at the rightmost leaf, eliminating most splits and matching the sequential-insert performance of <code>AUTO_INCREMENT</code>. For tables receiving hundreds of inserts per second, UUID v7 can be 2-5× faster than v4 for write throughput.
+</div>
+</div>

@@ -228,9 +228,36 @@ pub fn build_err_packet(error_code: u16, sql_state: &[u8; 5], message: &str) -> 
 
 /// Builds an EOF_Packet payload (used between column defs and rows, and after rows).
 pub fn build_eof_packet() -> Vec<u8> {
+    build_eof_with_status(0x0002)
+}
+
+/// Builds an EOF_Packet with custom status flags.
+///
+/// Use `status | 0x0008` to set `SERVER_MORE_RESULTS_EXISTS` for multi-statement
+/// responses (Phase 5.12).
+pub fn build_eof_with_status(status: u16) -> Vec<u8> {
     let mut buf = Vec::with_capacity(5);
-    buf.push(0xfe); // EOF header
+    buf.push(0xfe);
     buf.extend_from_slice(&0u16.to_le_bytes()); // warnings = 0
-    buf.extend_from_slice(&0x0002u16.to_le_bytes()); // status = SERVER_STATUS_AUTOCOMMIT
+    buf.extend_from_slice(&status.to_le_bytes());
+    buf
+}
+
+/// Builds an OK_Packet with custom status flags.
+///
+/// Use `status | 0x0008` to set `SERVER_MORE_RESULTS_EXISTS` for multi-statement
+/// responses (Phase 5.12).
+pub fn build_ok_with_status(
+    affected_rows: u64,
+    last_insert_id: u64,
+    warnings: u16,
+    status: u16,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16);
+    buf.push(0x00);
+    write_lenenc_int(&mut buf, affected_rows);
+    write_lenenc_int(&mut buf, last_insert_id);
+    buf.extend_from_slice(&status.to_le_bytes());
+    buf.extend_from_slice(&warnings.to_le_bytes());
     buf
 }

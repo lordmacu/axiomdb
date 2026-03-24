@@ -12,7 +12,10 @@
 //!   Server → result set | OK | ERR
 //! ```
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -26,6 +29,7 @@ use axiomdb_types::DataType;
 
 use super::database::CommitRx;
 
+use super::result::serialize_query_result_multi;
 use super::{
     auth::{gen_challenge, is_allowed_user, verify_native_password, verify_sha256_password},
     codec::MySqlCodec,
@@ -141,6 +145,14 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
     // same table across queries. Warm on second query to the same table.
     // Automatically invalidated by analyze_cached() on DDL statements.
     let mut schema_cache = SchemaCache::new();
+
+    // Clone Arc<AtomicU64> once per connection — no lock needed to read it.
+    // Used in COM_STMT_EXECUTE to detect stale prepared statement plans (5.13).
+    let schema_version: Arc<AtomicU64> = {
+        let guard = db.lock().await;
+        Arc::clone(&guard.schema_version)
+    };
+
     let mut conn_state = ConnectionState::new();
 
     // Populate initial current_database from handshake (if client sent one).
@@ -206,40 +218,72 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     continue;
                 }
 
-                // Execute via the engine.
-                // The Database lock is released BEFORE awaiting fsync confirmation
-                // so that other connections can proceed while this one waits.
-                let exec_result = {
-                    let mut guard = db.lock().await;
-                    guard.execute_query(sql, &mut session, &mut schema_cache)
-                }; // lock released here
+                // Split on ';' to support multi-statement COM_QUERY (Phase 5.12).
+                // Each non-empty statement is executed and its result set sent
+                // with SERVER_MORE_RESULTS_EXISTS in the final EOF/OK, except the
+                // last statement which uses normal status flags.
+                let stmts: Vec<&str> = split_sql_statements(sql);
+                let stmt_count = stmts.len();
+                let mut seq: u8 = 1;
+                let mut connection_broken = false;
 
-                match exec_result {
-                    Ok((qr, commit_rx)) => {
-                        // Await fsync confirmation outside the lock (group commit).
-                        // No-op when commit_rx is None (disabled or read-only).
-                        if let Err(e) = await_commit_rx(commit_rx).await {
-                            let me = dberror_to_mysql(&e);
-                            debug!(conn_id, code = me.code, msg = %me.message, "commit error");
-                            let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
-                            if writer.send((1u8, pkt.as_slice())).await.is_err() {
-                                break;
-                            }
-                            continue;
-                        }
-                        let packets = serialize_query_result(qr, 1);
+                'stmts: for (idx, stmt_sql) in stmts.into_iter().enumerate() {
+                    let is_last = idx == stmt_count - 1;
+
+                    if let Some(packets) = intercept_special_query(stmt_sql, &mut conn_state) {
                         if send_packets(&mut writer, &packets).await.is_err() {
-                            break;
+                            connection_broken = true;
+                            break 'stmts;
+                        }
+                        if !packets.is_empty() {
+                            seq = packets
+                                .last()
+                                .map(|(s, _)| s.wrapping_add(1))
+                                .unwrap_or(seq);
+                        }
+                        continue 'stmts;
+                    }
+
+                    let exec_result = {
+                        let mut guard = db.lock().await;
+                        guard.execute_query(stmt_sql, &mut session, &mut schema_cache)
+                    };
+
+                    match exec_result {
+                        Ok((qr, commit_rx)) => {
+                            if let Err(e) = await_commit_rx(commit_rx).await {
+                                let me = dberror_to_mysql(&e);
+                                debug!(conn_id, code = me.code, msg = %me.message, "commit error");
+                                let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
+                                if writer.send((seq, pkt.as_slice())).await.is_err() {
+                                    connection_broken = true;
+                                }
+                                break 'stmts;
+                            }
+                            let packets = serialize_query_result_multi(qr, seq, !is_last);
+                            seq = packets
+                                .last()
+                                .map(|(s, _)| s.wrapping_add(1))
+                                .unwrap_or(seq);
+                            if send_packets(&mut writer, &packets).await.is_err() {
+                                connection_broken = true;
+                                break 'stmts;
+                            }
+                        }
+                        Err(e) => {
+                            let me = dberror_to_mysql(&e);
+                            debug!(conn_id, code = me.code, msg = %me.message, "query error");
+                            let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
+                            if writer.send((seq, pkt.as_slice())).await.is_err() {
+                                connection_broken = true;
+                            }
+                            break 'stmts;
                         }
                     }
-                    Err(e) => {
-                        let me = dberror_to_mysql(&e);
-                        debug!(conn_id, code = me.code, msg = %me.message, "query error");
-                        let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
-                        if writer.send((1u8, pkt.as_slice())).await.is_err() {
-                            break;
-                        }
-                    }
+                }
+
+                if connection_broken {
+                    break;
                 }
             }
 
@@ -293,10 +337,12 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     }
                 };
 
-                let (stmt_id, param_count) = conn_state.prepare_statement(sql);
-                // Store the cached analyzed statement.
+                let current_version = schema_version.load(Ordering::Acquire);
+                let (stmt_id, param_count) = conn_state.prepare_statement(sql, current_version);
+                // Store the cached analyzed statement and its schema version.
                 if let Some(ps) = conn_state.prepared_statements.get_mut(&stmt_id) {
                     ps.analyzed_stmt = analyzed_stmt;
+                    ps.compiled_at_version = current_version;
                 }
                 let packets = build_prepare_response(stmt_id, param_count, &result_cols, 1);
                 if send_packets(&mut writer, &packets).await.is_err() {
@@ -313,9 +359,51 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 }
                 let stmt_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
 
+                // Pre-compute next LRU seq before taking a mutable ref to the
+                // statement (borrow checker: &mut conn_state ends here).
+                let next_seq = conn_state.next_execute_seq();
+
                 let result = if let Some(stmt) = conn_state.prepared_statements.get_mut(&stmt_id) {
                     match parse_execute_packet(body, stmt) {
                         Ok(exec) => {
+                            // ── Plan cache version check (Phase 5.13) ─────────────
+                            // If the schema changed since this plan was compiled, re-analyze
+                            // before using the cached plan. Lock is held only for analysis.
+                            let current_version = schema_version.load(Ordering::Acquire);
+                            if stmt.compiled_at_version != current_version
+                                || stmt.analyzed_stmt.is_none()
+                            {
+                                debug!(
+                                    conn_id,
+                                    stmt_id,
+                                    old_ver = stmt.compiled_at_version,
+                                    new_ver = current_version,
+                                    "plan stale: re-analyzing"
+                                );
+                                let (new_plan, _) = {
+                                    let guard = db.lock().await;
+                                    let snap = guard
+                                        .txn
+                                        .active_snapshot()
+                                        .unwrap_or_else(|_| guard.txn.snapshot());
+                                    match axiomdb_sql::parse(&stmt.sql_template, None)
+                                        .and_then(|s| axiomdb_sql::analyze(s, &guard.storage, snap))
+                                    {
+                                        Ok(analyzed) => {
+                                            let cols = extract_result_columns(&analyzed);
+                                            (Some(analyzed), cols)
+                                        }
+                                        Err(_) => (None, vec![]),
+                                    }
+                                };
+                                stmt.analyzed_stmt = new_plan;
+                                // Update version even on failure — prevents infinite re-analysis.
+                                stmt.compiled_at_version = current_version;
+                            }
+
+                            // Update LRU sequence (pre-computed above the borrow).
+                            stmt.last_used_seq = next_seq;
+
                             if let Some(cached) = stmt.analyzed_stmt.clone() {
                                 // ── FAST PATH: use cached plan (skip parse+analyze) ──
                                 // Substitute Expr::Param nodes with actual values (~1µs)
@@ -413,6 +501,68 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
     }
 
     info!(conn_id, "connection closed");
+}
+
+// ── Multi-statement SQL splitter ─────────────────────────────────────────────
+
+/// Splits a SQL string on `;` delimiters, returning non-empty trimmed statements.
+///
+/// Respects single-quoted string literals: a `;` inside `'...'` is not treated
+/// as a statement separator. Backslash-escaped quotes `\'` inside strings are
+/// handled correctly.
+///
+/// Strips a trailing `;` on the last statement (common in SQL scripts).
+/// Returns `[sql]` unchanged if there is only one statement.
+fn split_sql_statements(sql: &str) -> Vec<&str> {
+    let mut stmts: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut in_string = false;
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_string => {
+                in_string = true;
+                i += 1;
+            }
+            b'\'' if in_string => {
+                // Handle escaped quote `''` (SQL standard) or `\'` (MySQL extension)
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2; // skip both quotes
+                } else {
+                    in_string = false;
+                    i += 1;
+                }
+            }
+            b'\\' if in_string => {
+                i += 2; // skip escaped character
+            }
+            b';' if !in_string => {
+                let stmt = sql[start..i].trim();
+                if !stmt.is_empty() {
+                    stmts.push(stmt);
+                }
+                start = i + 1;
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    // Remaining text after the last `;`
+    let tail = sql[start..].trim();
+    if !tail.is_empty() {
+        stmts.push(tail);
+    }
+
+    if stmts.is_empty() {
+        stmts.push(sql.trim());
+    }
+
+    stmts
 }
 
 // ── Group commit helper ───────────────────────────────────────────────────────

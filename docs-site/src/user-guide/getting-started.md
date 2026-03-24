@@ -68,6 +68,61 @@ Your Application (Rust / C++ / Python / Electron)
 
 ---
 
+## Interactive Shell (CLI)
+
+The `axiomdb-cli` binary connects directly to a database file — no server needed.
+It works like `sqlite3` or `psql`:
+
+```bash
+# Open an existing database (or create a new one)
+axiomdb-cli ./mydb.db
+
+# Pipe SQL from a file
+axiomdb-cli ./mydb.db < migration.sql
+
+# One-liner
+echo "SELECT COUNT(*) FROM users;" | axiomdb-cli ./mydb.db
+```
+
+Inside the shell:
+
+```
+AxiomDB 0.1.0 — interactive shell
+Type SQL ending with ; to execute. Type .help for commands.
+
+axiomdb> CREATE TABLE users (id INT, name TEXT);
+OK (1ms)
+
+axiomdb> INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+2 rows affected (0ms)
+
+axiomdb> SELECT * FROM users;
++----+-------+
+| id | name  |
++----+-------+
+|  1 | Alice |
+|  2 | Bob   |
++----+-------+
+2 rows (0ms)
+
+axiomdb> .tables
+users
+
+axiomdb> .schema users
+Table: users
+  id    INT   NOT NULL
+  name  TEXT  nullable
+
+axiomdb> .quit
+Bye.
+```
+
+**Dot commands:** `.help` · `.tables` · `.schema [table]` · `.open <path>` · `.quit`
+
+**Keyboard shortcuts (interactive mode):** ↑ / ↓ history · Tab SQL completion · Ctrl-R reverse search · Ctrl-C cancel line · Ctrl-D exit. History is saved to `~/.axiomdb_history` between sessions.
+
+---
+
 ## Server Mode — Connecting
 
 ### Starting the Server

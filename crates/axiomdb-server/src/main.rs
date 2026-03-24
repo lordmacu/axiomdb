@@ -1,26 +1,33 @@
-//! # axiomdb-server — AxiomDB server binary
+//! # axiomdb-server
 //!
-//! Listens on :3306 (MySQL wire protocol).
-//! Any MySQL-compatible client can connect without a custom driver.
+//! AxiomDB server binary. Behavior depends on the build profile:
 //!
-//! ## Usage
+//! ## Profiles
+//!
+//! | Profile | Command | What runs |
+//! |---|---|---|
+//! | **server** (default) | `cargo build -p axiomdb-server` | MySQL wire protocol on :3306 |
+//! | **embedded** | `--no-default-features` | Prints usage for in-process embedding |
+//!
+//! ## Environment variables
 //!
 //! ```bash
-//! axiomdb-server                    # uses ./data directory
-//! AXIOMDB_DATA=/var/lib/axiomdb axiomdb-server
-//! AXIOMDB_PORT=3307 axiomdb-server  # custom port
+//! AXIOMDB_DATA=/var/lib/axiomdb   # data directory (default: ./data)
+//! AXIOMDB_PORT=3307               # TCP port (default: 3306, wire-protocol only)
+//! RUST_LOG=debug                  # log level
 //! ```
 
-use std::sync::Arc;
+// ── Wire-protocol server ───────────────────────────────────────────────────────
 
-use tokio::net::TcpListener;
-use tokio::sync::Mutex;
-use tracing::info;
-use tracing_subscriber::EnvFilter;
-
+#[cfg(feature = "wire-protocol")]
 #[tokio::main]
 async fn main() {
-    // Initialize structured logging.
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+    use tracing::info;
+    use tracing_subscriber::EnvFilter;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -42,7 +49,6 @@ async fn main() {
         "AxiomDB starting"
     );
 
-    // Open (or create) the database.
     let db = match axiomdb_network::mysql::Database::open(std::path::Path::new(&data_dir)) {
         Ok(db) => {
             info!("database opened successfully");
@@ -54,7 +60,6 @@ async fn main() {
         }
     };
 
-    // Bind TCP listener.
     let addr = format!("0.0.0.0:{port}");
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => {
@@ -67,15 +72,10 @@ async fn main() {
         }
     };
 
-    // Accept loop — spawn one task per connection.
     let mut conn_id = 1u32;
     loop {
         match listener.accept().await {
             Ok((stream, _peer)) => {
-                // TCP_NODELAY: disable Nagle algorithm so small packets
-                // (like individual MySQL result packets) are sent immediately.
-                // Without this, latency for request-response protocols is
-                // ~200ms per packet due to TCP buffering.
                 if let Err(e) = stream.set_nodelay(true) {
                     tracing::warn!(err = %e, "TCP_NODELAY failed");
                 }
@@ -91,4 +91,24 @@ async fn main() {
             }
         }
     }
+}
+
+// ── Embedded mode (no wire protocol) ─────────────────────────────────────────
+
+#[cfg(not(feature = "wire-protocol"))]
+fn main() {
+    eprintln!(
+        "axiomdb-server v{} — embedded mode (wire-protocol disabled)",
+        env!("CARGO_PKG_VERSION")
+    );
+    eprintln!();
+    eprintln!("This binary was compiled without the wire-protocol feature.");
+    eprintln!("To use AxiomDB embedded in your app, use the axiomdb-embedded crate:");
+    eprintln!();
+    eprintln!("  [dependencies]");
+    eprintln!("  axiomdb-embedded = {{ path = \"...\" }}");
+    eprintln!();
+    eprintln!("To build the full server with wire protocol:");
+    eprintln!("  cargo build -p axiomdb-server --features wire-protocol");
+    std::process::exit(1);
 }
