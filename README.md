@@ -5,6 +5,7 @@
 [![CI](https://github.com/lordmacu/axiomdb/actions/workflows/ci.yml/badge.svg)](https://github.com/lordmacu/axiomdb/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/lordmacu/axiomdb?include_prereleases&label=release&color=orange)](https://github.com/lordmacu/axiomdb/releases/latest)
 [![Docs](https://img.shields.io/badge/docs-lordmacu.github.io%2Faxiomdb-blue?logo=mdbook)](https://lordmacu.github.io/axiomdb/)
+[![Studio](https://img.shields.io/badge/studio-live%20demo-8b5cf6?logo=react)](https://lordmacu.github.io/axiomdb/studio/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-orange?logo=rust)
 
@@ -272,6 +273,29 @@ python3 tools/build-wizard.py
 ```
 
 ---
+
+## AxiomStudio
+
+**[lordmacu.github.io/axiomdb/studio](https://lordmacu.github.io/axiomdb/studio/)** — GUI for managing AxiomDB.
+
+Built with Next.js 15, Monaco editor and Framer Motion. Currently runs on mock data — connects to the real engine in Phase 8 (HTTP API).
+
+| Feature | Status |
+|---|---|
+| Dashboard — queries/sec, connections, cache hit, slow queries | ✅ |
+| Query editor — Monaco, syntax highlight, query history | ✅ |
+| Tables browser — data viewer, inline edit, filters | ✅ |
+| Schema editor — columns, types, indexes, FK | ✅ |
+| ER Diagram — visual relationships between tables | ✅ |
+| Objects — procedures, functions, triggers, sequences | ✅ |
+| Live mode — auto-refresh metrics every 5/10/30s | ✅ |
+| Real connection to AxiomDB engine | ⏳ Phase 8 |
+
+```bash
+# Run locally
+cd studio && npm install && npm run dev
+# → http://localhost:3001
+```
 
 ## Documentation
 
