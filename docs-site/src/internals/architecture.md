@@ -18,6 +18,20 @@ prevents circular dependencies and makes each component independently testable.
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
 ┌──────────────────────────────▼──────────────────────────────────────┐
+│                        NETWORK LAYER                                │
+│                                                                     │
+│  axiomdb-network                                                    │
+│  └── mysql/                                                         │
+│      ├── codec.rs    (MySqlCodec — 4-byte packet framing)           │
+│      ├── packets.rs  (HandshakeV10, HandshakeResponse41, OK, ERR)   │
+│      ├── auth.rs     (mysql_native_password SHA1 challenge-response)│
+│      ├── handler.rs  (handle_connection — async task per TCP conn)  │
+│      ├── result.rs   (QueryResult → result-set packets)             │
+│      ├── error.rs    (DbError → MySQL error code + SQLSTATE)        │
+│      └── database.rs (Arc<Mutex<Database>> wrapper)                 │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+┌──────────────────────────────▼──────────────────────────────────────┐
 │                       QUERY PIPELINE                                │
 │                                                                     │
 │  axiomdb-sql                                                        │
@@ -179,11 +193,131 @@ The SQL processing pipeline:
   (two NULL values are considered equal for deduplication), and `INSERT … SELECT`
   for bulk copy and aggregate materialization
 
+### axiomdb-network
+
+The MySQL wire protocol implementation. Lives in `crates/axiomdb-network/src/mysql/`:
+
+| Module | Responsibility |
+|---|---|
+| `codec.rs` | `MySqlCodec` — `tokio_util` framing codec; reads/writes the 4-byte header (`u24 LE` payload length + `u8` sequence ID) |
+| `packets.rs` | Builders for HandshakeV10, HandshakeResponse41, OK, ERR, EOF; length-encoded integer/string helpers |
+| `auth.rs` | `gen_challenge` (20-byte CSPRNG), `verify_native_password` (SHA1-XOR), `is_allowed_user` allowlist |
+| `handler.rs` | `handle_connection` — async task per TCP connection; full handshake → auth → command loop |
+| `result.rs` | `serialize_query_result` — `QueryResult` → `column_count + column_defs + EOF + rows + EOF` packets |
+| `error.rs` | `dberror_to_mysql` — maps every `DbError` variant to a MySQL error code + SQLSTATE |
+| `database.rs` | `Database` wrapper — holds `Arc<Mutex<axiomdb_sql::Database>>`, exposes `execute_query` |
+
+#### Connection lifecycle
+
+```
+TCP accept
+  │
+  ▼  (seq 0)
+Server → HandshakeV10
+  │       20-byte random challenge, capabilities, server version
+  │
+  ▼  (seq 1)
+Client → HandshakeResponse41
+  │       username, auth_response (SHA1-XOR token), capabilities
+  │
+  ▼  (seq 2)
+Server → OK  (permissive mode: password ignored if username is in allowlist)
+  │
+  ▼  COMMAND LOOP
+  │
+  ├── COM_QUERY (0x03)  → parse SQL → intercept? → execute → result packets
+  ├── COM_PING  (0x0e)  → OK
+  ├── COM_INIT_DB (0x02)→ OK  (database name accepted, no-op)
+  ├── COM_RESET_CONNECTION (0x1f) → new SessionContext + OK
+  └── COM_QUIT  (0x01)  → close
+```
+
+#### Packet framing (codec.rs)
+
+Every MySQL message in both directions — client to server and server to client — uses
+the same 4-byte envelope:
+
+```
+[payload_length: u24 LE] [sequence_id: u8] [payload: payload_length bytes]
+```
+
+`MySqlCodec` implements `tokio_util::codec::{Decoder, Encoder}`. The decoder buffers
+bytes until the full payload is available, then returns `(sequence_id, Bytes)`. The
+encoder writes the header and payload in a single `BytesMut` write — no separate
+syscall for the header.
+
+#### Result set serialization (result.rs)
+
+A `QueryResult::Rows` is serialized as a sequence of packets with monotonically
+increasing sequence IDs:
+
+```
+column_count   (lenenc integer)
+column_def_1   (lenenc strings: catalog, schema, table, org_table, name, org_name
+                + 12-byte fixed section: charset, display_len, type_byte, flags, decimals)
+…
+column_def_N
+EOF
+row_1          (each value: 0xfb for NULL, or lenenc_str of text encoding)
+…
+row_M
+EOF
+```
+
+AxiomDB type codes sent in `column_def.type_byte`:
+
+| AxiomDB type | MySQL type byte | MySQL name |
+|---|---|---|
+| `Int` | `0x03` | LONG |
+| `BigInt` | `0x08` | LONGLONG |
+| `Real` | `0x05` | DOUBLE |
+| `Decimal` | `0x00` | DECIMAL |
+| `Text` | `0xfd` | VAR_STRING |
+| `Bytes` | `0xfc` | BLOB |
+| `Bool` | `0x10` | BIT |
+| `Date` | `0x0a` | DATE |
+| `Timestamp` | `0x07` | TIMESTAMP |
+| `Uuid` | `0xfd` | VAR_STRING |
+
+#### ORM query interception (handler.rs)
+
+MySQL drivers and ORMs send several queries automatically before any user SQL:
+`SET NAMES`, `SET autocommit`, `SELECT @@version`, `SELECT @@version_comment`,
+`SELECT DATABASE()`, `SELECT @@sql_mode`, `SELECT @@lower_case_table_names`,
+`SELECT @@max_allowed_packet`, `SHOW WARNINGS`, `SHOW DATABASES`.
+
+`intercept_special_query` matches these by prefix/content and returns pre-built
+packet sequences without touching the engine. Without this interception, most clients
+fail to connect because they receive ERR packets for mandatory queries.
+
+#### DB lock strategy
+
+The `Database` struct wraps `Arc<Mutex<axiomdb_sql::Database>>`. Each `COM_QUERY`
+acquires the mutex for the duration of the query, releases it before writing the
+response packets. This is a single-writer model suitable for Phase 5; concurrent
+query execution is planned for Phase 8 (Connection Pool + MVCC).
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Permissive Auth — Phase 5 Design Decision</span>
+Phase 5 implements the full <code>mysql_native_password</code> SHA1 challenge-response
+handshake (the same algorithm used by MySQL 5.x clients) but ignores the password
+result for users in the allowlist (<code>root</code>, <code>axiomdb</code>, <code>admin</code>).
+This lets any MySQL-compatible client connect during development without credential
+management. The <code>verify_native_password</code> function is fully correct — it is
+called and its result logged — but the decision to accept or reject is based solely
+on the username allowlist until Phase 13 (Security) adds stored credentials and real
+enforcement.
+</div>
+</div>
+
 ### axiomdb-server
 
-Entry point for server mode. Sets up a Tokio TCP listener, performs the MySQL handshake,
-parses the MySQL wire protocol, dispatches SQL statements to the engine, and serializes
-results as MySQL result-set packets.
+Entry point for server mode. Parses CLI flags (`--data-dir`, `--port`), opens the
+`axiomdb-network::Database`, starts a Tokio TCP listener, and spawns one
+`handle_connection` task per accepted connection, passing each task a clone of the
+`Arc<Mutex<Database>>`.
 
 ### axiomdb-embedded
 
@@ -197,34 +331,54 @@ Entry point for embedded mode. Exposes:
 ## Query Lifecycle — From Wire to Storage
 
 ```
-1. TCP packet received (server mode) or Rust call (embedded mode)
+1. TCP bytes arrive on the socket
    │
-2. SQL string extracted from MySQL COM_QUERY packet
+2. axiomdb-network::mysql::codec::MySqlCodec decodes the 4-byte header
+   → (sequence_id, payload)
    │
-3. axiomdb-sql::tokenize(sql)
+3. handler.rs inspects payload[0] (command byte)
+   ├── 0x01 COM_QUIT  → close
+   ├── 0x02 COM_INIT_DB → OK
+   ├── 0x0e COM_PING  → OK
+   └── 0x03 COM_QUERY → continue ↓
+   │
+4. intercept_special_query(sql) — ORM/driver stubs
+   ├── match → return pre-built packet sequence  (no engine call)
+   └── no match → continue ↓
+   │
+5. db.lock() → execute_query(sql, &mut session)
+   │
+6. axiomdb-sql::tokenize(sql)
    → Vec<SpannedToken>  (logos DFA, zero-copy)
    │
-4. axiomdb-sql::parse(tokens)
+7. axiomdb-sql::parse(tokens)
    → Stmt  (recursive descent; all col_idx = placeholder 0)
    │
-5. axiomdb-sql::analyze(stmt, storage, snapshot)
+8. axiomdb-sql::analyze(stmt, storage, snapshot)
    → Stmt  (col_idx resolved against catalog; names validated)
    │
-6. Executor (Phase 5) interprets the analyzed Stmt
+9. Executor interprets the analyzed Stmt
    → reads from axiomdb-index (BTree lookups / range scans)
    → calls axiomdb-types::decode_row on heap page bytes
    → builds Vec<Vec<Value>> result rows
    │
-7. WAL write (for INSERT / UPDATE / DELETE)
-   → axiomdb-wal::WalWriter::append(WalEntry)
-   │
-8. Heap page write (for INSERT / UPDATE / DELETE)
-   → axiomdb-storage::StorageEngine::write_page
-   │
-9. Result serialized
-   → MySQL result-set packets (server mode)
-   → QueryResult struct (embedded mode)
+10. WAL write (for INSERT / UPDATE / DELETE)
+    → axiomdb-wal::WalWriter::append(WalEntry)
+    │
+11. Heap page write (for INSERT / UPDATE / DELETE)
+    → axiomdb-storage::StorageEngine::write_page
+    │
+12. db.lock() released
+    │
+13. result::serialize_query_result(QueryResult, seq=1)
+    → column_count + column_defs + EOF + rows + EOF  (Rows)
+    → OK packet with affected_rows + last_insert_id  (Affected)
+    │
+14. MySqlCodec encodes each packet with 4-byte header → TCP send
 ```
+
+For embedded mode, steps 1–4 and 12–14 are replaced by a direct Rust function call
+that returns a `QueryResult` struct.
 
 ---
 

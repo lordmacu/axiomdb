@@ -6,5 +6,20 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-axiomdb-core = { workspace = true }
-thiserror    = { workspace = true }
+axiomdb-core    = { workspace = true }
+axiomdb-types   = { path = "../axiomdb-types" }
+axiomdb-storage = { path = "../axiomdb-storage" }
+axiomdb-wal     = { path = "../axiomdb-wal" }
+axiomdb-catalog = { path = "../axiomdb-catalog" }
+axiomdb-sql     = { path = "../axiomdb-sql" }
+thiserror       = { workspace = true }
+tokio           = { workspace = true }
+tokio-util      = { workspace = true }
+bytes           = { workspace = true }
+sha1            = { workspace = true }
+rand            = { workspace = true }
+tracing         = { workspace = true }
+futures         = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
