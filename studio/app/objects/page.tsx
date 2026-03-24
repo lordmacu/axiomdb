@@ -157,6 +157,7 @@ function CodePanel({ title, language, body, args, returns, onBodyChange }: {
           value={body}
           onChange={v => onBodyChange(v ?? '')}
           theme={language === 'axiomql' ? 'axiomql-dark' : 'vs-dark'}
+          beforeMount={monaco => registerAxiomQL(monaco)}
           onMount={(_editor, monaco) => registerAxiomQL(monaco)}
           options={{
             fontSize: 13,

@@ -1246,6 +1246,7 @@ export default function QueryPage() {
         value={currentValue}
         onChange={v => setCurrentValue(v ?? '')}
         theme={editorTheme}
+        beforeMount={monaco => registerAxiomQL(monaco)}
         onMount={handleEditorMountCb}
         options={{
           fontSize: 13,
