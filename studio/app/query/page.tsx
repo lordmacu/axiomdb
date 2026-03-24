@@ -529,6 +529,80 @@ function axiomqlToSql(aql: string): string {
   } catch { return '-- Translation error' }
 }
 
+// ── EXPLAIN plan ──────────────────────────────────────────────────────────────
+
+type PlanNode = {
+  type: string
+  table?: string
+  cost: number
+  rows: number
+  filter?: string
+  children: PlanNode[]
+}
+
+function generateMockPlan(sql: string): PlanNode {
+  const hasJoin = /JOIN/i.test(sql)
+  const hasWhere = /WHERE/i.test(sql)
+  const table = sql.match(/FROM\s+(\w+)/i)?.[1] ?? 'table'
+
+  if (hasJoin) {
+    return {
+      type: 'Hash Join', cost: 285, rows: 1847, children: [
+        { type: 'Seq Scan', table, cost: 45, rows: 10234, filter: hasWhere ? 'active = TRUE' : undefined, children: [] },
+        {
+          type: 'Hash', cost: 12, rows: 51847, children: [
+            { type: 'Seq Scan', table: 'orders', cost: 12, rows: 51847, children: [] },
+          ]
+        },
+      ]
+    }
+  }
+  return {
+    type: 'Seq Scan', table, cost: 45, rows: 10234,
+    filter: hasWhere ? 'filter applied' : undefined,
+    children: [],
+  }
+}
+
+function PlanTree({ node, depth = 0 }: { node: PlanNode; depth?: number }) {
+  const [open, setOpen] = useState(true)
+  const isExpensive = node.cost > 200
+  return (
+    <div className="font-mono text-xs">
+      <div
+        className={cn(
+          'flex items-center gap-2 py-1.5 rounded hover:bg-elevated cursor-pointer',
+          depth === 0 && 'font-semibold',
+        )}
+        onClick={() => setOpen(o => !o)}
+        style={{ paddingLeft: `${depth * 20 + 8}px` }}
+      >
+        {node.children.length > 0 && (
+          <span className="text-text-secondary text-[10px] w-3 shrink-0">
+            {open ? '▾' : '▸'}
+          </span>
+        )}
+        {node.children.length === 0 && <span className="w-3 shrink-0" />}
+        <span className={isExpensive ? 'text-[#d29922]' : 'text-[#10b981]'}>{node.type}</span>
+        {node.table && (
+          <span className="text-text-secondary">
+            on <span className="text-text-primary">{node.table}</span>
+          </span>
+        )}
+        <span className="ml-auto text-text-secondary text-[11px] pr-3">
+          cost={node.cost}&nbsp;&nbsp;rows={node.rows.toLocaleString()}
+        </span>
+        {node.filter && (
+          <span className="text-[#d29922] text-[10px] pr-2">filter: {node.filter}</span>
+        )}
+      </div>
+      {open && node.children.map((child, i) => (
+        <PlanTree key={i} node={child} depth={depth + 1} />
+      ))}
+    </div>
+  )
+}
+
 // ── CSV Export ─────────────────────────────────────────────────────────────────
 
 function exportCsv(data: Record<string, unknown>[], filename = 'results.csv') {
@@ -1039,6 +1113,7 @@ export default function QueryPage() {
   const [splitView, setSplitView] = useState(false)
   const [showVars, setShowVars] = useState(false)
   const [queryVars, setQueryVars] = useState<QueryVar[]>([])
+  const [explainPlan, setExplainPlan] = useState<PlanNode | null>(null)
   const tabCounterRef = useRef(2)
 
   const activeTab = tabs.find(t => t.id === activeTabId) ?? tabs[0]
@@ -1190,18 +1265,36 @@ export default function QueryPage() {
   )
 
   const resultsNode = (
-    <div className={cn('overflow-hidden', splitView ? 'flex-1 h-full' : 'flex-1')}>
-      {error && (
-        <div className="flex items-start gap-2 m-4 p-3 rounded bg-error/10 border border-error/30 text-xs text-error">
-          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-          {error}
-        </div>
-      )}
-      {results && !error && <DataTable data={results} />}
-      {!results && !error && (
-        <div className="flex items-center justify-center h-full text-text-secondary text-xs">
-          Run a query to see results
-        </div>
+    <div className={cn('overflow-hidden flex flex-col', splitView ? 'flex-1 h-full' : 'flex-1')}>
+      {explainPlan ? (
+        <>
+          <div className="flex items-center justify-between px-3 py-2 border-b border-border shrink-0 bg-elevated/40">
+            <span className="text-xs font-semibold text-text-primary">EXPLAIN Plan</span>
+            <button
+              onClick={() => setExplainPlan(null)}
+              className="text-xs text-text-secondary hover:text-accent transition-colors border border-border px-2 py-0.5 rounded">
+              ← Back to results
+            </button>
+          </div>
+          <div className="flex-1 overflow-auto p-3">
+            <PlanTree node={explainPlan} />
+          </div>
+        </>
+      ) : (
+        <>
+          {error && (
+            <div className="flex items-start gap-2 m-4 p-3 rounded bg-error/10 border border-error/30 text-xs text-error">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              {error}
+            </div>
+          )}
+          {results && !error && <DataTable data={results} />}
+          {!results && !error && (
+            <div className="flex items-center justify-center h-full text-text-secondary text-xs">
+              Run a query to see results
+            </div>
+          )}
+        </>
       )}
     </div>
   )
@@ -1329,7 +1422,9 @@ export default function QueryPage() {
               <span className="text-white/50 text-[10px] ml-1">⌘↵</span>
             </button>
 
-            <button className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium text-blue-400 border border-blue-400/30 hover:bg-blue-400/10 transition-colors">
+            <button
+              onClick={() => setExplainPlan(generateMockPlan(currentValue))}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium text-blue-400 border border-blue-400/30 hover:bg-blue-400/10 transition-colors">
               <Zap className="w-3 h-3" />
               Explain
             </button>
@@ -1439,7 +1534,9 @@ export default function QueryPage() {
               <span className="text-white/50 text-[10px] ml-1">⌘↵</span>
             </button>
 
-            <button className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium text-blue-400 border border-blue-400/30 hover:bg-blue-400/10 transition-colors">
+            <button
+              onClick={() => setExplainPlan(generateMockPlan(currentValue))}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium text-blue-400 border border-blue-400/30 hover:bg-blue-400/10 transition-colors">
               <Zap className="w-3 h-3" />
               Explain
             </button>

@@ -38,7 +38,7 @@ export function CommandPalette() {
     setSelected(0)
   }, [])
 
-  // Open on ⌘K / Ctrl+K
+  // Open on ⌘K / Ctrl+K; navigate to /shortcuts on ⌘/
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
@@ -48,11 +48,15 @@ export function CommandPalette() {
           return true
         })
       }
+      if ((e.metaKey || e.ctrlKey) && e.key === '/') {
+        e.preventDefault()
+        router.push('/shortcuts')
+      }
       if (e.key === 'Escape') close()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [close])
+  }, [close, router])
 
   // Focus input when opened
   useEffect(() => {

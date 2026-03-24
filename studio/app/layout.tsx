@@ -26,13 +26,14 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en" className={`${GeistSans.variable} ${GeistMono.variable}`}>
       <body className="bg-bg text-text-primary antialiased flex h-screen overflow-hidden">
-        <Sidebar />
-        <main className="flex-1 flex flex-col overflow-hidden">
-          <Suspense fallback={<PageLoader />}>
-            {children}
-          </Suspense>
-        </main>
-        <ClientProviders />
+        <ClientProviders>
+          <Sidebar />
+          <main className="flex-1 flex flex-col overflow-hidden">
+            <Suspense fallback={<PageLoader />}>
+              {children}
+            </Suspense>
+          </main>
+        </ClientProviders>
       </body>
     </html>
   )
