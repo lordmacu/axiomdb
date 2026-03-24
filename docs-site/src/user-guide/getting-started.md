@@ -418,6 +418,52 @@ Expected output:
 
 ---
 
+## Bulk Insert — Best Practices
+
+The way you issue INSERT statements has a large impact on throughput. AxiomDB is
+optimized for the **multi-row VALUES** form — one SQL string with all N rows:
+
+```sql
+-- Fast: one SQL string, all rows in one VALUES clause (~211K rows/s for 10K rows)
+INSERT INTO products (name, price, stock) VALUES
+  ('Widget A', 9.99, 100),
+  ('Widget B', 14.99, 50),
+  ('Widget C', 4.99, 200);
+```
+
+```python
+# Python — build one multi-row string, one execute() call
+rows = [(f"product_{i}", i * 1.5, i * 10) for i in range(10_000)]
+placeholders = ", ".join("(%s, %s, %s)" for _ in rows)
+flat_values   = [v for row in rows for v in row]
+cursor.execute(f"INSERT INTO products (name, price, stock) VALUES {placeholders}",
+               flat_values)
+conn.commit()
+```
+
+**Why this matters:** issuing N separate INSERT statements each pays its own
+parse + analyze overhead (~20 µs per string). A single multi-row string pays that
+cost once for all rows.
+
+| Approach | Throughput |
+|---|---|
+| **Multi-row VALUES** (1 string, N rows) | **211K rows/s** — recommended |
+| N separate INSERT strings (1 txn) | ~35K rows/s — 6× slower |
+| N separate autocommit INSERTs | ~58 q/s — 1 fsync per row |
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Tip — Batching large datasets</span>
+For millions of rows, wrap every 5,000–10,000 rows in an explicit <code>BEGIN … COMMIT</code>
+block. This limits WAL growth per transaction while keeping throughput high. See
+<a href="features/transactions.md">Transactions</a> for Group Commit configuration,
+which further improves concurrent write throughput.
+</div>
+</div>
+
+---
+
 ## Next Steps
 
 - [SQL Reference — Data Types](sql-reference/data-types.md) — full type system

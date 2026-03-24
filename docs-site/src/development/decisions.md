@@ -283,6 +283,54 @@ and DFA is the optimal algorithm for it.
 
 ---
 
+## WAL Optimization
+
+### Per-Page WAL Entries (PageWrite) vs Per-Row WAL Entries
+
+| Aspect | Decision |
+|--------|----------|
+| **Chosen** | `EntryType::PageWrite = 9`: one WAL entry per heap page for bulk inserts |
+| **Alternatives** | Per-row `Insert` entries (original approach); full redo log (PostgreSQL WAL) |
+| **Phase** | Phase 3.18 |
+
+**Why per-page:**
+
+For bulk inserts (`INSERT INTO t VALUES (r1),(r2),...`), the per-row approach writes one
+WAL entry per row: 10,000 rows = 10,000 `serialize_into()` calls + 10,000 CRC32c
+computations. Per-page replaces these with ~42 entries (one per 16 KB page, holding ~240
+rows each) — **238× fewer serializations** and a **30% smaller WAL file**.
+
+The `PageWrite` entry format stores:
+1. The full post-modification page bytes (`new_value[0..PAGE_SIZE]`) — available for
+   future REDO-based power-failure recovery (Phase 3.8b).
+2. The inserted slot IDs (`new_value[PAGE_SIZE+2..]`) — used by crash recovery to undo
+   uncommitted `PageWrite` entries by marking each slot dead, identical in effect to
+   undoing N individual `Insert` entries.
+
+**Trade-offs accepted:**
+- Each `PageWrite` entry is ~16 KB vs ~100 bytes for an `Insert` entry. For sparse
+  inserts (a few rows per page), `PageWrite` is larger. The optimization only applies to
+  `insert_rows_batch()` (multi-row INSERT) — single-row inserts still use `Insert` entries.
+- Crash recovery must parse the embedded slot list instead of simply reading a single
+  physical location. The parsing is O(num_slots) per entry — still O(N) total, identical
+  asymptotic cost.
+
+**Why not a full redo log (like PostgreSQL WAL):**
+PostgreSQL writes a physical page image + logical redo records for every page modification.
+Our `PageWrite` is a simplified version: we write only the post-image (for bulk inserts)
+and rely on the existing in-memory undo log for rollback. Full redo would require per-page
+LSNs and a replay pass on startup — reserved for Phase 3.8b.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Slot IDs Embedded in WAL Entry</span>
+An alternative design would reconstruct which slots to undo by scanning the heap page looking for slots with <code>txn_id_created == crashed_txn_id</code>. We rejected this because it requires reading the page from storage during the crash recovery scan — before the undo phase even begins. Embedding the slot IDs in the <code>PageWrite</code> entry keeps crash recovery a pure WAL read pass: no storage I/O needed to determine what to undo.
+</div>
+</div>
+
+---
+
 ## Content-Addressed BLOB Storage (Planned Phase 6)
 
 | Aspect | Decision |
@@ -297,3 +345,4 @@ and DFA is the optimal algorithm for it.
 - The BLOB store is append-only with immutable entries — no locking on BLOB reads.
 - Deletion is handled by reference counting: when the last row referencing a BLOB
   is deleted, the BLOB can be garbage collected.
+
