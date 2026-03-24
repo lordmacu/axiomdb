@@ -15,6 +15,7 @@ axiomdb-wal     = { workspace = true }
 thiserror       = { workspace = true }
 logos           = { workspace = true }
 rand            = { workspace = true }
+bloomfilter     = { workspace = true }
 
 [dev-dependencies]
 criterion    = { workspace = true }

@@ -55,6 +55,7 @@ pub fn insert_into_indexes(
     row: &[Value],
     rid: RecordId,
     storage: &mut dyn StorageEngine,
+    bloom: &mut crate::bloom::BloomRegistry,
 ) -> Result<Vec<(u32, u64)>, DbError> {
     let mut updated_roots = Vec::new();
 
@@ -93,6 +94,7 @@ pub fn insert_into_indexes(
 
         let root_pid = AtomicU64::new(idx.root_page_id);
         BTree::insert_in(storage, &root_pid, &key, rid)?;
+        bloom.add(idx.index_id, &key);
         let new_root = root_pid.load(Ordering::Acquire);
         if new_root != idx.root_page_id {
             updated_roots.push((idx.index_id, new_root));
@@ -115,6 +117,7 @@ pub fn delete_from_indexes(
     indexes: &[IndexDef],
     row: &[Value],
     storage: &mut dyn StorageEngine,
+    bloom: &mut crate::bloom::BloomRegistry,
 ) -> Result<Vec<(u32, u64)>, DbError> {
     let mut updated_roots = Vec::new();
 
@@ -142,6 +145,7 @@ pub fn delete_from_indexes(
         let root_pid = AtomicU64::new(idx.root_page_id);
         // Ignore NotFound (key may not exist if index was created after the row).
         let _ = BTree::delete_in(storage, &root_pid, &key)?;
+        bloom.mark_dirty(idx.index_id);
         let new_root = root_pid.load(Ordering::Acquire);
         if new_root != idx.root_page_id {
             updated_roots.push((idx.index_id, new_root));

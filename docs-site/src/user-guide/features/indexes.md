@@ -152,6 +152,70 @@ automatically when a matching secondary index exists, with zero configuration re
 
 ---
 
+## Bloom Filter Optimization
+
+AxiomDB maintains an in-memory **Bloom filter** for each secondary index. The
+filter allows the query executor to skip B-Tree page reads entirely when a
+lookup key is **definitively absent** from the index.
+
+### How It Works
+
+When the planner chooses an index lookup for a `WHERE col = value` condition,
+the executor checks the Bloom filter before touching the B-Tree:
+
+- Filter says **no** → key is 100% absent. Zero B-Tree pages read. Empty result
+  returned immediately.
+- Filter says **maybe** → normal B-Tree lookup proceeds.
+
+The filter is a probabilistic data structure: it never produces false negatives
+(a key that exists will always get a "maybe"), but can produce false positives
+(a key that does not exist may occasionally get a "maybe" instead of "no"). The
+false positive rate is tuned to **1%** — at most 1 in 100 absent-key lookups
+will still read the B-Tree.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage</span>
+For workloads where many queries look up keys that do not exist (authentication
+checks, cache-miss patterns, soft-delete queries), the Bloom filter eliminates
+all B-Tree I/O for ~99% of misses. A B-Tree point lookup on a 1M-row table
+reads ~20 pages; with a Bloom filter hit, it reads zero.
+</div>
+</div>
+
+### Lifecycle
+
+| Event | Effect on Bloom filter |
+|-------|----------------------|
+| `CREATE INDEX` | Filter created and populated with all existing keys |
+| `INSERT` | New key added to filter |
+| `UPDATE` | Old key marks filter dirty; new key added |
+| `DELETE` | Filter marked dirty (deleted keys cannot be removed from a standard Bloom filter) |
+| `DROP INDEX` | Filter removed from memory |
+| Server restart | Filters start empty; `might_exist` returns `true` (conservative) until `CREATE INDEX` is run again |
+
+### Dirty Filters
+
+After a `DELETE` or `UPDATE`, the filter is marked **dirty**: it may still
+return "maybe" for keys that were deleted. This does not affect correctness —
+the B-Tree lookup simply finds no matching row. It only means that some absent
+keys may not benefit from the zero-I/O shortcut until the filter is rebuilt via
+`ANALYZE TABLE` (planned for Phase 6.12).
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Tip</span>
+The Bloom filter is most effective on tables where reads vastly outnumber
+deletes. For high-churn tables (frequent INSERT + DELETE cycles), run
+<code>ANALYZE TABLE t</code> periodically to rebuild the filter and restore
+optimal miss performance.
+</div>
+</div>
+
+---
+
 ## Dropping an Index
 
 ```sql

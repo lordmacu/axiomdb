@@ -59,6 +59,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Concurrent data structures
 dashmap = "5"
 
+# Probabilistic data structures
+bloomfilter = "3"
+
 # Testing / benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
 

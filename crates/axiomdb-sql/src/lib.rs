@@ -10,6 +10,7 @@
 
 pub mod analyzer;
 pub mod ast;
+pub mod bloom;
 pub mod eval;
 pub mod executor;
 pub mod expr;
@@ -30,6 +31,7 @@ pub use ast::{
     OrderByItem, SelectItem, SelectStmt, SetStmt, SetValue, ShowColumnsStmt, ShowTablesStmt,
     SortOrder, Stmt, TableConstraint, TableRef, TruncateTableStmt, UpdateStmt,
 };
+pub use bloom::BloomRegistry;
 pub use eval::{eval, eval_with, is_truthy, ClosureRunner, NoSubquery, SubqueryRunner};
 pub use executor::{execute, execute_with_ctx};
 pub use expr::{BinaryOp, Expr, UnaryOp};
