@@ -12,7 +12,10 @@
 //!   Server → result set | OK | ERR
 //! ```
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -141,6 +144,14 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
     // same table across queries. Warm on second query to the same table.
     // Automatically invalidated by analyze_cached() on DDL statements.
     let mut schema_cache = SchemaCache::new();
+
+    // Clone Arc<AtomicU64> once per connection — no lock needed to read it.
+    // Used in COM_STMT_EXECUTE to detect stale prepared statement plans (5.13).
+    let schema_version: Arc<AtomicU64> = {
+        let guard = db.lock().await;
+        Arc::clone(&guard.schema_version)
+    };
+
     let mut conn_state = ConnectionState::new();
 
     // Populate initial current_database from handshake (if client sent one).
@@ -293,10 +304,12 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     }
                 };
 
-                let (stmt_id, param_count) = conn_state.prepare_statement(sql);
-                // Store the cached analyzed statement.
+                let current_version = schema_version.load(Ordering::Acquire);
+                let (stmt_id, param_count) = conn_state.prepare_statement(sql, current_version);
+                // Store the cached analyzed statement and its schema version.
                 if let Some(ps) = conn_state.prepared_statements.get_mut(&stmt_id) {
                     ps.analyzed_stmt = analyzed_stmt;
+                    ps.compiled_at_version = current_version;
                 }
                 let packets = build_prepare_response(stmt_id, param_count, &result_cols, 1);
                 if send_packets(&mut writer, &packets).await.is_err() {
@@ -313,9 +326,51 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 }
                 let stmt_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
 
+                // Pre-compute next LRU seq before taking a mutable ref to the
+                // statement (borrow checker: &mut conn_state ends here).
+                let next_seq = conn_state.next_execute_seq();
+
                 let result = if let Some(stmt) = conn_state.prepared_statements.get_mut(&stmt_id) {
                     match parse_execute_packet(body, stmt) {
                         Ok(exec) => {
+                            // ── Plan cache version check (Phase 5.13) ─────────────
+                            // If the schema changed since this plan was compiled, re-analyze
+                            // before using the cached plan. Lock is held only for analysis.
+                            let current_version = schema_version.load(Ordering::Acquire);
+                            if stmt.compiled_at_version != current_version
+                                || stmt.analyzed_stmt.is_none()
+                            {
+                                debug!(
+                                    conn_id,
+                                    stmt_id,
+                                    old_ver = stmt.compiled_at_version,
+                                    new_ver = current_version,
+                                    "plan stale: re-analyzing"
+                                );
+                                let (new_plan, _) = {
+                                    let guard = db.lock().await;
+                                    let snap = guard
+                                        .txn
+                                        .active_snapshot()
+                                        .unwrap_or_else(|_| guard.txn.snapshot());
+                                    match axiomdb_sql::parse(&stmt.sql_template, None)
+                                        .and_then(|s| axiomdb_sql::analyze(s, &guard.storage, snap))
+                                    {
+                                        Ok(analyzed) => {
+                                            let cols = extract_result_columns(&analyzed);
+                                            (Some(analyzed), cols)
+                                        }
+                                        Err(_) => (None, vec![]),
+                                    }
+                                };
+                                stmt.analyzed_stmt = new_plan;
+                                // Update version even on failure — prevents infinite re-analysis.
+                                stmt.compiled_at_version = current_version;
+                            }
+
+                            // Update LRU sequence (pre-computed above the borrow).
+                            stmt.last_used_seq = next_seq;
+
                             if let Some(cached) = stmt.analyzed_stmt.clone() {
                                 // ── FAST PATH: use cached plan (skip parse+analyze) ──
                                 // Substitute Expr::Param nodes with actual values (~1µs)

@@ -16,8 +16,18 @@
 //!   all waiting connections.
 //! - Read-only transactions and disabled mode return `(result, None)` and
 //!   behave identically to pre-3.19 behavior.
+//!
+//! ## Prepared Statement Plan Cache (Phase 5.13)
+//!
+//! `schema_version` is a global monotonic counter incremented after every
+//! successful DDL statement (CREATE/DROP/ALTER TABLE, CREATE/DROP INDEX,
+//! TRUNCATE). Each connection clones `Arc<AtomicU64>` at connect time and
+//! can poll it lock-free. When a connection's cached `compiled_at_version`
+//! diverges from `schema_version`, the cached plan is stale and must be
+//! re-analyzed before execution.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{oneshot, Mutex};
@@ -25,7 +35,8 @@ use tokio::sync::{oneshot, Mutex};
 use axiomdb_catalog::bootstrap::CatalogBootstrap;
 use axiomdb_core::error::DbError;
 use axiomdb_sql::{
-    analyze_cached, execute_with_ctx, parse, result::QueryResult, SchemaCache, SessionContext,
+    analyze_cached, ast::Stmt, execute_with_ctx, parse, result::QueryResult, SchemaCache,
+    SessionContext,
 };
 use axiomdb_storage::MmapStorage;
 use axiomdb_wal::TxnManager;
@@ -46,6 +57,13 @@ pub struct Database {
     /// (`group_commit_interval_ms = 0`), in which case every DML commit
     /// fsyncs inline as in pre-3.19 behavior.
     pub coordinator: Option<CommitCoordinator>,
+    /// Global schema version. Incremented after every successful DDL
+    /// (CREATE/DROP/ALTER TABLE, CREATE/DROP INDEX, TRUNCATE).
+    ///
+    /// Connections clone this `Arc` at connect time. Reading it requires no
+    /// lock — use `load(Ordering::Acquire)`. Writing requires holding the
+    /// `Database` lock (only `execute_query`/`execute_stmt` write it).
+    pub schema_version: Arc<AtomicU64>,
 }
 
 impl Database {
@@ -73,6 +91,7 @@ impl Database {
             storage,
             txn,
             coordinator: None,
+            schema_version: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -106,14 +125,13 @@ impl Database {
     ///
     /// Returns `(QueryResult, Option<CommitRx>)`.
     ///
+    /// Increments `schema_version` after any successful DDL statement so that
+    /// connections can detect stale prepared statement plans (Phase 5.13).
+    ///
     /// When group commit is enabled and the statement was DML, `CommitRx`
     /// is `Some`. The caller **must release the Database lock** before
     /// awaiting the receiver to avoid blocking all other connections for
     /// the duration of the fsync.
-    ///
-    /// When group commit is disabled or the statement was read-only,
-    /// `CommitRx` is `None` and the commit has already been fsynced before
-    /// this function returned.
     pub fn execute_query(
         &mut self,
         sql: &str,
@@ -121,23 +139,33 @@ impl Database {
         schema_cache: &mut SchemaCache,
     ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
         let stmt = parse(sql, None)?;
+        let is_ddl = is_schema_changing(&stmt);
         let snap = self
             .txn
             .active_snapshot()
             .unwrap_or_else(|_| self.txn.snapshot());
         let analyzed = analyze_cached(stmt, &self.storage, snap, schema_cache)?;
         let result = execute_with_ctx(analyzed, &mut self.storage, &mut self.txn, session)?;
+        if is_ddl {
+            self.schema_version.fetch_add(1, Ordering::Release);
+        }
         Ok((result, self.take_commit_rx()))
     }
 
     /// Executes an already-analyzed `Stmt` — used by the prepared statement
     /// plan cache path to skip `parse()` + `analyze()` entirely.
+    ///
+    /// Also increments `schema_version` on DDL (Phase 5.13).
     pub fn execute_stmt(
         &mut self,
-        stmt: axiomdb_sql::ast::Stmt,
+        stmt: Stmt,
         session: &mut SessionContext,
     ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
+        let is_ddl = is_schema_changing(&stmt);
         let result = execute_with_ctx(stmt, &mut self.storage, &mut self.txn, session)?;
+        if is_ddl {
+            self.schema_version.fetch_add(1, Ordering::Release);
+        }
         Ok((result, self.take_commit_rx()))
     }
 
@@ -156,4 +184,21 @@ impl Database {
         let coordinator = self.coordinator.as_ref()?;
         Some(coordinator.register_pending(txn_id))
     }
+}
+
+/// Returns `true` if `stmt` is a DDL statement that modifies the schema.
+///
+/// Used to decide whether to increment `Database::schema_version` after
+/// a successful execution, signalling connections to re-validate their
+/// cached prepared statement plans (Phase 5.13).
+fn is_schema_changing(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::CreateTable(_)
+            | Stmt::DropTable(_)
+            | Stmt::AlterTable(_)
+            | Stmt::CreateIndex(_)
+            | Stmt::DropIndex(_)
+            | Stmt::TruncateTable(_)
+    )
 }
