@@ -186,6 +186,7 @@
 - [x] 5.9 ✅ Session state — ConnectionState: SET autocommit/NAMES/@@vars stored; SHOW VARIABLES result set; SELECT @@var from state; COM_INIT_DB updates current_database
 - [x] 5.10 ✅ COM_STMT_PREPARE / COM_STMT_EXECUTE — binary param decoding (TINY/SHORT/LONG/LONGLONG/FLOAT/DOUBLE/DATE/DATETIME/strings); ? substitution with escape; COM_STMT_CLOSE/RESET; pymysql full test suite passes (INT/Bool/NULL/quotes/DictCursor)
 - [x] 5.11 ✅ COM_PING / COM_QUIT / COM_RESET_CONNECTION / COM_INIT_DB — all handled in handler.rs command loop (0x0e, 0x01, 0x1f, 0x02)
+- [ ] 5.9b ⏳ `@@in_transaction` system variable — returns 1 inside an active transaction, 0 otherwise; visible via `SELECT @@in_transaction`; lets developers and ORMs verify transaction state without tracking it themselves; also add warning in OK packet (warning_count=1) when COMMIT/ROLLBACK is a no-op (no active txn), queryable via `SHOW WARNINGS`
 - [ ] 5.11b ⏳ COM_STMT_SEND_LONG_DATA — chunked transmission of large parameters (BLOBs, TEXTs) in multiple packets; required for INSERT of images/documents via prepared statements
 - [ ] 5.11c ⏳ Explicit connection state machine — states: `CONNECTED→AUTH→IDLE→EXECUTING→CLOSING`; timeout handling per state; detect abruptly closed socket (TCP keepalive)
 - [x] 5.12 ✅ Multi-statement queries — split_sql_statements() handles `;` with quoted-string awareness; COM_QUERY loop executes each stmt; SERVER_MORE_RESULTS_EXISTS (0x0008) flag in intermediate EOF/OK; serialize_query_result_multi(); build_eof_with_status()/build_ok_with_status()
