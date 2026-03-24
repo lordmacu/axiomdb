@@ -45,7 +45,7 @@ use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
 use axiomdb_index::BTree;
 use axiomdb_storage::{heap_chain::HeapChain, Page, PageType, StorageEngine};
 use axiomdb_types::{DataType, Value};
-use axiomdb_wal::TxnManager;
+use axiomdb_wal::{Savepoint, TxnManager};
 
 use crate::{
     ast::{
@@ -328,9 +328,49 @@ pub fn execute_with_ctx(
     bloom: &mut crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    // ── Explicit transaction active ────────────────────────────────────────────
+    // Statement runs inside the caller's transaction.
+    // Wrap in a savepoint so that a statement error only undoes that statement's
+    // writes — the transaction remains open (MySQL statement-level rollback).
     if txn.active_txn_id().is_some() {
-        dispatch_ctx(stmt, storage, txn, bloom, ctx)
-    } else {
+        // TCL inside an active transaction
+        match &stmt {
+            Stmt::Commit => return txn.commit().map(|_| QueryResult::Empty),
+            Stmt::Rollback => return txn.rollback(storage).map(|_| QueryResult::Empty),
+            Stmt::Begin => {
+                let txn_id = txn.active_txn_id().unwrap_or(0);
+                return Err(DbError::TransactionAlreadyActive { txn_id });
+            }
+            _ => {}
+        }
+        // DDL inside an open transaction: implicit COMMIT of the current transaction
+        // first (MySQL semantics), then DDL runs in its own autocommit transaction.
+        if is_ddl(&stmt) {
+            txn.commit()?;
+            txn.begin()?;
+            return match dispatch_ctx(stmt, storage, txn, bloom, ctx) {
+                Ok(result) => {
+                    txn.commit()?;
+                    Ok(result)
+                }
+                Err(e) => {
+                    let _ = txn.rollback(storage);
+                    Err(e)
+                }
+            };
+        }
+        let sp: Savepoint = txn.savepoint();
+        match dispatch_ctx(stmt, storage, txn, bloom, ctx) {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                // Undo only this statement's writes; transaction stays active.
+                let _ = txn.rollback_to_savepoint(sp, storage);
+                Err(e)
+            }
+        }
+
+    // ── No active transaction — autocommit=true (default) ─────────────────────
+    } else if ctx.autocommit {
         match stmt {
             Stmt::Begin => {
                 txn.begin()?;
@@ -352,7 +392,85 @@ pub fn execute_with_ctx(
                 }
             }
         }
+
+    // ── No active transaction — autocommit=false (SET autocommit=0) ───────────
+    } else {
+        match stmt {
+            // Explicit TCL — BEGIN is no-op if no txn active yet (MySQL compat).
+            Stmt::Begin => {
+                txn.begin()?;
+                Ok(QueryResult::Empty)
+            }
+            Stmt::Commit => Err(DbError::NoActiveTransaction),
+            Stmt::Rollback => Err(DbError::NoActiveTransaction),
+
+            // SELECT (read-only) — wrap in a read-only begin/commit so the executor
+            // has a valid snapshot. The transaction is committed immediately after,
+            // leaving no open transaction (MySQL: SELECT in autocommit=0 does not
+            // start a lasting implicit transaction).
+            Stmt::Select(_) => {
+                txn.begin()?;
+                match dispatch_ctx(stmt, storage, txn, bloom, ctx) {
+                    Ok(result) => {
+                        txn.commit()?;
+                        Ok(result)
+                    }
+                    Err(e) => {
+                        let _ = txn.rollback(storage);
+                        Err(e)
+                    }
+                }
+            }
+
+            // DDL — implicit commit of any open txn (handled above), then DDL
+            // runs in its own autocommit transaction.
+            other if is_ddl(&other) => {
+                txn.begin()?;
+                match dispatch_ctx(other, storage, txn, bloom, ctx) {
+                    Ok(result) => {
+                        txn.commit()?;
+                        Ok(result)
+                    }
+                    Err(e) => {
+                        let _ = txn.rollback(storage);
+                        Err(e)
+                    }
+                }
+            }
+
+            // DML (INSERT, UPDATE, DELETE) — implicit BEGIN, no COMMIT.
+            // Transaction stays open until the client sends explicit COMMIT/ROLLBACK.
+            other => {
+                txn.begin()?;
+                match dispatch_ctx(other, storage, txn, bloom, ctx) {
+                    Ok(result) => Ok(result),
+                    Err(e) => {
+                        // Statement failed before any partial writes, or the
+                        // savepoint is not available (no active txn yet).
+                        // Roll back the whole implicit transaction.
+                        let _ = txn.rollback(storage);
+                        Err(e)
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Returns `true` for DDL statements that require their own autocommit transaction.
+///
+/// MySQL DDL always causes an implicit COMMIT of any open transaction and then
+/// executes in its own single-statement transaction.
+fn is_ddl(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::CreateTable(_)
+            | Stmt::DropTable(_)
+            | Stmt::CreateIndex(_)
+            | Stmt::DropIndex(_)
+            | Stmt::AlterTable(_)
+            | Stmt::TruncateTable(_)
+    )
 }
 
 /// Routes a statement to its handler using a `SessionContext` for schema caching.
@@ -798,6 +916,9 @@ fn execute_insert_ctx(
         Ok(next)
     }
 
+    let compiled_preds =
+        crate::partial_index::compile_index_predicates(&secondary_indexes, schema_cols)?;
+
     match stmt.source {
         InsertSource::Values(rows) => {
             for value_exprs in rows {
@@ -864,6 +985,7 @@ fn execute_insert_ctx(
                         rid,
                         storage,
                         bloom,
+                        &compiled_preds,
                     )?;
                     for (index_id, new_root) in updated {
                         CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -936,6 +1058,7 @@ fn execute_insert_ctx(
                         rid,
                         storage,
                         bloom,
+                        &compiled_preds,
                     )?;
                     for (index_id, new_root) in updated {
                         CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -1061,6 +1184,9 @@ fn execute_update_ctx(
         )?;
     }
 
+    let compiled_preds =
+        crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;
+
     if secondary_indexes.is_empty() {
         // Fast path: no secondary indexes — use batch heap update (O(P) page I/O).
         let heap_updates: Vec<(RecordId, Vec<Value>)> = to_update
@@ -1110,6 +1236,7 @@ fn execute_update_ctx(
                 &old_values,
                 storage,
                 bloom,
+                &compiled_preds,
             )?;
             for (index_id, new_root) in &del_updated {
                 CatalogWriter::new(storage, txn)?.update_index_root(*index_id, *new_root)?;
@@ -1128,6 +1255,7 @@ fn execute_update_ctx(
                 new_rid,
                 storage,
                 bloom,
+                &compiled_preds,
             )?;
             for (index_id, new_root) in ins_updated {
                 CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -1136,6 +1264,9 @@ fn execute_update_ctx(
                 }
             }
         }
+        // B-Tree CoW operations change root page IDs. Invalidate the session
+        // cache after the full update so subsequent queries reload fresh roots.
+        ctx.invalidate_all();
     }
 
     Ok(QueryResult::Affected {
@@ -1264,16 +1395,27 @@ fn execute_delete_ctx(
 
     // Index maintenance: per-row B-Tree deletes; bloom marked dirty per index.
     if !secondary_indexes.is_empty() {
+        let compiled_preds =
+            crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;
+        let mut any_root_changed = false;
         for (_, row_vals) in &to_delete {
             let updated = crate::index_maintenance::delete_from_indexes(
                 &secondary_indexes,
                 row_vals,
                 storage,
                 bloom,
+                &compiled_preds,
             )?;
             for (index_id, new_root) in updated {
                 CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
+                any_root_changed = true;
             }
+        }
+        // B-Tree CoW delete allocates a new root page and frees the old one.
+        // Invalidate the session cache so the next query reloads fresh root IDs
+        // from the catalog instead of using the stale freed page IDs.
+        if any_root_changed {
+            ctx.invalidate_all();
         }
     }
 
@@ -2979,6 +3121,9 @@ fn execute_insert(
         Ok(next)
     }
 
+    let compiled_preds =
+        crate::partial_index::compile_index_predicates(&secondary_indexes, schema_cols)?;
+
     match stmt.source {
         // ── INSERT ... VALUES ─────────────────────────────────────────────────
         InsertSource::Values(rows) => {
@@ -3052,6 +3197,7 @@ fn execute_insert(
                         rid,
                         storage,
                         &mut noop_bloom,
+                        &compiled_preds,
                     )?;
                     for (index_id, new_root) in updated {
                         CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -3086,6 +3232,7 @@ fn execute_insert(
                         rid,
                         storage,
                         &mut noop_bloom,
+                        &compiled_preds,
                     )?;
                     for (index_id, new_root) in updated {
                         CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -3145,6 +3292,7 @@ fn execute_insert(
                         rid,
                         storage,
                         &mut noop_bloom,
+                        &compiled_preds,
                     )?;
                     for (index_id, new_root) in updated {
                         CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -3217,6 +3365,9 @@ fn execute_update(
     // No-op bloom for the non-ctx path (bloom is managed by execute_with_ctx callers).
     let mut noop_bloom = crate::bloom::BloomRegistry::new();
 
+    let compiled_preds =
+        crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;
+
     let mut count = 0u64;
     for (rid, current_values) in rows {
         // WHERE filter.
@@ -3245,6 +3396,7 @@ fn execute_update(
                 &current_values,
                 storage,
                 &mut noop_bloom,
+                &compiled_preds,
             )?;
             for (index_id, new_root) in &del_updated {
                 CatalogWriter::new(storage, txn)?.update_index_root(*index_id, *new_root)?;
@@ -3265,6 +3417,7 @@ fn execute_update(
                 new_rid,
                 storage,
                 &mut noop_bloom,
+                &compiled_preds,
             )?;
             for (index_id, new_root) in ins_updated {
                 CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -3346,12 +3499,15 @@ fn execute_delete(
     // Index maintenance: still per-row (each B+Tree remove is its own traversal),
     // but heap I/O is now fully batched above.
     if !secondary_indexes.is_empty() {
+        let compiled_preds =
+            crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;
         for (_, row_vals) in &to_delete {
             let updated = crate::index_maintenance::delete_from_indexes(
                 &secondary_indexes,
                 row_vals,
                 storage,
                 &mut noop_bloom,
+                &compiled_preds,
             )?;
             for (index_id, new_root) in updated {
                 CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -3527,6 +3683,7 @@ fn execute_create_table(
                     col_idx,
                     order: CatalogSortOrder::Asc,
                 }],
+                predicate: None,
             })?;
             Ok(idx_id)
         };
@@ -3872,10 +4029,28 @@ fn execute_create_index(
     let root_pid = AtomicU64::new(root_page_id);
 
     // 5. Scan the table and insert existing rows into the B-Tree.
+    //    For partial indexes, compile the predicate once and skip non-matching rows.
+    let pred_expr: Option<crate::expr::Expr> = match &stmt.predicate {
+        Some(pred) => {
+            let sql = expr_to_sql_string(pred);
+            Some(crate::partial_index::compile_predicate_sql(
+                &sql, &col_defs,
+            )?)
+        }
+        None => None,
+    };
+
     let rows = TableEngine::scan_table(storage, &table_def, &col_defs, snap, None)?;
     let mut skipped = 0usize;
     let mut bloom_keys: Vec<Vec<u8>> = Vec::new();
     for (rid, row_vals) in rows {
+        // Partial index: skip rows that don't satisfy the predicate.
+        if let Some(pred) = &pred_expr {
+            if !crate::eval::is_truthy(&crate::eval::eval(pred, &row_vals)?) {
+                continue;
+            }
+        }
+
         let key_vals: Vec<Value> = index_columns
             .iter()
             .map(|ic| row_vals[ic.col_idx as usize].clone())
@@ -3905,6 +4080,10 @@ fn execute_create_index(
     // 6. Persist IndexDef with column list and final root_page_id (may have changed after splits).
     let final_root = root_pid.load(Ordering::Acquire);
     let mut writer = CatalogWriter::new(storage, txn)?;
+    // Serialize the predicate expression to SQL string for catalog storage.
+    // Stored as a human-readable string for debuggability and backward-compat.
+    let predicate_sql: Option<String> = stmt.predicate.as_ref().map(expr_to_sql_string);
+
     let new_index_id = writer.create_index(IndexDef {
         index_id: 0, // allocated by CatalogWriter::create_index
         table_id: table_def.id,
@@ -3913,6 +4092,7 @@ fn execute_create_index(
         is_unique: stmt.unique,
         is_primary: false,
         columns: index_columns,
+        predicate: predicate_sql,
     })?;
 
     // 7. Populate bloom filter for the newly created index.
@@ -4522,6 +4702,7 @@ fn alter_add_constraint(
                     .collect(),
                 unique: true,
                 if_not_exists: false,
+                predicate: None, // UNIQUE constraints are always full indexes
             };
             let mut noop_bloom = crate::bloom::BloomRegistry::new();
             execute_create_index(stmt, storage, txn, &mut noop_bloom)?;

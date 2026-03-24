@@ -443,12 +443,20 @@ pub(crate) fn parse_create_index(p: &mut Parser, unique: bool) -> Result<Stmt, D
     }
     p.expect(&Token::RParen)?;
 
+    // Optional WHERE predicate for partial indexes (Phase 6.7).
+    let predicate = if p.eat(&Token::Where) {
+        Some(parse_expr(p)?)
+    } else {
+        None
+    };
+
     Ok(Stmt::CreateIndex(CreateIndexStmt {
         if_not_exists,
         unique,
         name,
         table,
         columns,
+        predicate,
     }))
 }
 

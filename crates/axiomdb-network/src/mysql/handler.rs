@@ -212,6 +212,9 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
 
                 // Intercept queries that ORMs/clients send automatically on connect.
                 if let Some(packets) = intercept_special_query(sql, &mut conn_state) {
+                    // Sync session autocommit flag after SET statements so that the
+                    // executor respects the new mode on the next DML statement.
+                    session.autocommit = conn_state.autocommit;
                     if send_packets(&mut writer, &packets).await.is_err() {
                         break;
                     }
@@ -231,6 +234,7 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     let is_last = idx == stmt_count - 1;
 
                     if let Some(packets) = intercept_special_query(stmt_sql, &mut conn_state) {
+                        session.autocommit = conn_state.autocommit;
                         if send_packets(&mut writer, &packets).await.is_err() {
                             connection_broken = true;
                             break 'stmts;

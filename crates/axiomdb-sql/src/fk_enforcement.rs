@@ -349,6 +349,7 @@ pub fn enforce_fk_on_parent_delete(
                                 child_row_vals,
                                 storage,
                                 bloom,
+                                &[],
                             )?;
                             for (index_id, new_root) in updated {
                                 CatalogWriter::new(storage, txn)?
@@ -389,6 +390,7 @@ pub fn enforce_fk_on_parent_delete(
                                 child_row,
                                 storage,
                                 bloom,
+                                &[],
                             )?;
                             for (index_id, new_root) in del_updated {
                                 CatalogWriter::new(storage, txn)?

@@ -152,6 +152,61 @@ automatically when a matching secondary index exists, with zero configuration re
 
 ---
 
+## Partial Indexes
+
+A partial index covers only the rows matching a WHERE predicate. This reduces
+index size, speeds up maintenance, and — for UNIQUE indexes — restricts
+uniqueness enforcement to the matching subset.
+
+```sql
+-- Only active users need unique emails.
+CREATE UNIQUE INDEX uq_active_email ON users(email) WHERE deleted_at IS NULL;
+
+-- Index only pending orders for fast user lookups.
+CREATE INDEX idx_pending ON orders(user_id) WHERE status = 'pending';
+```
+
+### Partial UNIQUE indexes
+
+The uniqueness constraint applies only among rows satisfying the predicate.
+Rows that do not satisfy the predicate are never inserted into the index.
+
+```sql
+-- alice deleted, then re-created: no conflict.
+INSERT INTO users VALUES (1, 'alice@x.com', '2025-01-01'); -- deleted
+INSERT INTO users VALUES (2, 'alice@x.com', NULL);          -- active ✅
+INSERT INTO users VALUES (3, 'alice@x.com', NULL);          -- ❌ UniqueViolation
+INSERT INTO users VALUES (4, 'alice@x.com', '2025-06-01');  -- deleted ✅
+```
+
+### Planner support
+
+The planner uses a partial index only when the query's WHERE clause implies the
+index predicate. If the implication cannot be verified, the planner falls back
+to a full scan or a full index — always correct.
+
+```sql
+-- Uses partial index (WHERE contains `deleted_at IS NULL`):
+SELECT * FROM users WHERE email = 'alice@x.com' AND deleted_at IS NULL;
+
+-- Falls back to full scan (predicate not in WHERE):
+SELECT * FROM users WHERE email = 'alice@x.com';
+```
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage</span>
+A partial unique index on a soft-delete table (e.g., <code>WHERE deleted_at IS
+NULL</code>) is typically 10–100× smaller than a full unique index, since most
+rows in high-churn tables are in the deleted state. This reduces build time,
+per-INSERT maintenance cost, and bloom filter memory. MySQL InnoDB does not
+support partial indexes, so this optimization is not available there.
+</div>
+</div>
+
+---
+
 ## Foreign Key Constraints
 
 Foreign key constraints ensure referential integrity between tables. Every non-NULL

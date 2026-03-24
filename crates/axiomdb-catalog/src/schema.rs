@@ -316,11 +316,15 @@ impl ColumnDef {
 /// ```text
 /// [index_id:4 LE][table_id:4 LE][root_page_id:8 LE][flags:1][name_len:1][name bytes]
 /// [ncols:1][col_idx:2 LE, order:1]×ncols
+/// [pred_len:2 LE][pred_sql: pred_len UTF-8 bytes]   ← Phase 6.7; omitted if predicate = None
 /// ```
 ///
 /// The `columns` section (starting at `ncols`) is optional — old rows that
 /// predate Phase 6.1 end after `name bytes`.  `from_bytes` returns
 /// `columns: vec![]` for such rows (backward-compatible).
+///
+/// The `pred_len` section is optional — old rows without it get `predicate = None`
+/// (backward-compatible with pre-6.7 databases).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDef {
     /// Auto-incremented unique ID, allocated by `CatalogWriter::create_index`.
@@ -335,12 +339,23 @@ pub struct IndexDef {
     ///
     /// Empty for indexes created before Phase 6.1 (treated as unusable by planner).
     pub columns: Vec<IndexColumnDef>,
+    /// WHERE predicate as a SQL expression string (Phase 6.7).
+    ///
+    /// `None` = full index (covers all rows).
+    /// `Some(sql)` = partial index; only rows satisfying the predicate are indexed.
+    ///
+    /// Example: `Some("deleted_at IS NULL")` or `Some("status = 'active'")`.
+    pub predicate: Option<String>,
 }
 
 impl IndexDef {
     /// Serializes to binary row format.
     ///
-    /// Format: `[index_id:4][table_id:4][root_page_id:8][flags:1][name_len:1][name bytes][ncols:1][col_idx:2 LE, order:1]×ncols`
+    /// Format:
+    /// `[index_id:4][table_id:4][root_page_id:8][flags:1][name_len:1][name bytes]`
+    /// `[ncols:1][col_idx:2 LE, order:1]×ncols`
+    /// `[pred_len:2 LE][pred_sql bytes]` — only present if predicate is Some
+    ///
     /// - `flags bit0` = unique, `flags bit1` = primary key
     pub fn to_bytes(&self) -> Vec<u8> {
         let name = self.name.as_bytes();
@@ -355,8 +370,19 @@ impl IndexDef {
             flags |= 0x02;
         }
 
-        let mut buf =
-            Vec::with_capacity(4 + 4 + 8 + 1 + 1 + name.len() + 1 + self.columns.len() * 3);
+        let pred_bytes = self.predicate.as_deref().map(str::as_bytes);
+        let pred_len = pred_bytes.map(|b| b.len()).unwrap_or(0);
+
+        let mut buf = Vec::with_capacity(
+            4 + 4
+                + 8
+                + 1
+                + 1
+                + name.len()
+                + 1
+                + self.columns.len() * 3
+                + if pred_len > 0 { 2 + pred_len } else { 0 },
+        );
         buf.extend_from_slice(&self.index_id.to_le_bytes());
         buf.extend_from_slice(&self.table_id.to_le_bytes());
         buf.extend_from_slice(&self.root_page_id.to_le_bytes());
@@ -368,6 +394,12 @@ impl IndexDef {
         for col in &self.columns {
             buf.extend_from_slice(&col.col_idx.to_le_bytes());
             buf.push(col.order as u8);
+        }
+        // Predicate section (Phase 6.7) — only written when predicate is Some.
+        // Old readers stop at end of columns and never see these bytes.
+        if let Some(pred) = pred_bytes {
+            buf.extend_from_slice(&(pred.len() as u16).to_le_bytes());
+            buf.extend_from_slice(pred);
         }
         buf
     }
@@ -424,6 +456,31 @@ impl IndexDef {
             vec![]
         };
 
+        // Predicate section (Phase 6.7) — backward-compatible:
+        // only present when 2+ bytes remain after the columns section.
+        let predicate = if bytes.len() >= consumed + 2 {
+            let pred_len = u16::from_le_bytes([bytes[consumed], bytes[consumed + 1]]) as usize;
+            consumed += 2;
+            if pred_len == 0 {
+                None
+            } else {
+                if bytes.len() < consumed + pred_len {
+                    return Err(DbError::ParseError {
+                        message: "IndexDef predicate section truncated".into(),
+                    });
+                }
+                let sql = std::str::from_utf8(&bytes[consumed..consumed + pred_len])
+                    .map_err(|_| DbError::ParseError {
+                        message: "IndexDef predicate not valid UTF-8".into(),
+                    })?
+                    .to_string();
+                consumed += pred_len;
+                Some(sql)
+            }
+        } else {
+            None // pre-6.7 row — no predicate bytes
+        };
+
         Ok((
             Self {
                 index_id,
@@ -433,6 +490,7 @@ impl IndexDef {
                 is_unique,
                 is_primary,
                 columns,
+                predicate,
             },
             consumed,
         ))
@@ -848,6 +906,7 @@ mod tests {
                 col_idx: 0,
                 order: SortOrder::Asc,
             }],
+            predicate: None,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = IndexDef::from_bytes(&bytes).unwrap();
@@ -868,6 +927,7 @@ mod tests {
                 col_idx: 2,
                 order: SortOrder::Asc,
             }],
+            predicate: None,
         };
         let bytes = def.to_bytes();
         let (back, _) = IndexDef::from_bytes(&bytes).unwrap();
@@ -888,6 +948,7 @@ mod tests {
             is_unique: false,
             is_primary: false,
             columns: vec![],
+            predicate: None,
         };
         let bytes = def.to_bytes();
         assert!(IndexDef::from_bytes(&bytes[..10]).is_err());
@@ -912,6 +973,7 @@ mod tests {
                     order: SortOrder::Desc,
                 },
             ],
+            predicate: None,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = IndexDef::from_bytes(&bytes).unwrap();
@@ -930,6 +992,7 @@ mod tests {
             is_unique: false,
             is_primary: false,
             columns: vec![],
+            predicate: None,
         };
         let full_bytes = def.to_bytes();
         // Truncate the columns section (last byte is ncols=0, remove it).

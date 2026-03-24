@@ -24,7 +24,7 @@ use axiomdb_index::BTree;
 use axiomdb_storage::StorageEngine;
 use axiomdb_types::Value;
 
-use crate::key_encoding::encode_index_key;
+use crate::{eval::eval, eval::is_truthy, expr::Expr, key_encoding::encode_index_key};
 
 // ── indexes_for_table ─────────────────────────────────────────────────────────
 
@@ -47,6 +47,15 @@ pub fn indexes_for_table(
 /// For UNIQUE indexes, checks for duplicate keys before inserting (NULL values
 /// skip the uniqueness check — NULL ≠ NULL in SQL).
 ///
+/// For **partial indexes** (where `idx.predicate.is_some()`), `compiled_preds[i]`
+/// holds the pre-compiled predicate expression for `indexes[i]`. If the predicate
+/// is not satisfied by `row`, the index is skipped entirely (no B-Tree insert, no
+/// uniqueness check). Callers produce `compiled_preds` via
+/// [`crate::partial_index::compile_index_predicates`] once per statement.
+///
+/// Passing `&[]` for `compiled_preds` is equivalent to "no predicates" — all
+/// indexes are treated as full indexes regardless of their stored predicate.
+///
 /// Returns a list of `(index_id, new_root_page_id)` for indexes whose root
 /// changed due to a B-Tree split.  The caller should persist these via
 /// `CatalogWriter::update_index_root`.
@@ -56,13 +65,23 @@ pub fn insert_into_indexes(
     rid: RecordId,
     storage: &mut dyn StorageEngine,
     bloom: &mut crate::bloom::BloomRegistry,
+    compiled_preds: &[Option<Expr>],
 ) -> Result<Vec<(u32, u64)>, DbError> {
     let mut updated_roots = Vec::new();
 
-    for idx in indexes
+    for (i, idx) in indexes
         .iter()
-        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .enumerate()
+        .filter(|(_, i)| !i.is_primary && !i.columns.is_empty())
     {
+        // Partial index predicate check (Phase 6.7).
+        // compiled_preds[i] is None for full indexes OR when caller passes &[].
+        if let Some(Some(pred)) = compiled_preds.get(i) {
+            if !is_truthy(&eval(pred, row)?) {
+                continue; // row doesn't satisfy predicate → skip this index
+            }
+        }
+
         let key_vals: Vec<Value> = idx
             .columns
             .iter()
@@ -111,6 +130,10 @@ pub fn insert_into_indexes(
 /// Encodes the key from `row` and calls `BTree::delete_in` on each index.
 /// Not an error if the key is not found (e.g., index was created after the row).
 ///
+/// For **partial indexes**, if the row does not satisfy the predicate the row was
+/// never indexed — the delete is skipped. Pass compiled predicates via
+/// `compiled_preds` (parallel to `indexes`); pass `&[]` to treat all as full indexes.
+///
 /// Returns a list of `(index_id, new_root_page_id)` for indexes whose root
 /// changed due to a collapse after deletion.
 pub fn delete_from_indexes(
@@ -118,13 +141,21 @@ pub fn delete_from_indexes(
     row: &[Value],
     storage: &mut dyn StorageEngine,
     bloom: &mut crate::bloom::BloomRegistry,
+    compiled_preds: &[Option<Expr>],
 ) -> Result<Vec<(u32, u64)>, DbError> {
     let mut updated_roots = Vec::new();
 
-    for idx in indexes
+    for (i, idx) in indexes
         .iter()
-        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .enumerate()
+        .filter(|(_, i)| !i.is_primary && !i.columns.is_empty())
     {
+        // Partial index predicate check (Phase 6.7).
+        if let Some(Some(pred)) = compiled_preds.get(i) {
+            if !is_truthy(&eval(pred, row)?) {
+                continue; // row was never in this index → nothing to delete
+            }
+        }
         let key_vals: Vec<Value> = idx
             .columns
             .iter()

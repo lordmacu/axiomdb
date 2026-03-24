@@ -204,7 +204,7 @@
 - [x] 6.6 ✅ ON DELETE CASCADE / SET NULL — recursive cascade (depth ≤ 10); SET NULL with nullable check; ON UPDATE RESTRICT; ON UPDATE CASCADE/SET NULL deferred to 6.9
 - [ ] ⚠️ FK auto-index (non-unique B-Tree duplicate keys) — deferred to 6.9; FK enforcement uses full scan (correct, O(n))
 - [ ] ⚠️ PK B-Tree index population on INSERT — PK indexes created empty; FK uses full scan for parent lookup → deferred to 6.9
-- [ ] 6.7 ⏳ Partial UNIQUE index — `UNIQUE WHERE condition` for soft delete
+- [x] 6.7 ✅ Partial UNIQUE index — `CREATE [UNIQUE] INDEX ... WHERE predicate`; predicate stored as SQL string in IndexDef; build/INSERT/UPDATE/DELETE filter by predicate; planner uses index only when query WHERE implies predicate; session cache invalidated after CoW B-Tree root change
 - [ ] 6.8 ⏳ Fill factor — `WITH (fillfactor=70)` for tables with many inserts
 - [ ] 6.9 ⏳ FK and index tests — violations, cascades, restrictions
 - [ ] 6.10 ⏳ Index statistics bootstrap — on CREATE INDEX: count rows, estimate NDV (distinct values) per column; feeds query planner (6.3)

@@ -19,6 +19,7 @@ pub mod index_maintenance;
 pub mod key_encoding;
 pub mod lexer;
 pub mod parser;
+pub mod partial_index;
 pub mod planner;
 pub mod result;
 pub mod schema_cache;
