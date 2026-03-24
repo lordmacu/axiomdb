@@ -154,7 +154,7 @@
 - [ ] 4.22b ⏳ ALTER TABLE ADD/DROP CONSTRAINT — `ADD CONSTRAINT fk`, `DROP CONSTRAINT`, `ADD UNIQUE`, `ADD CHECK`; ORMs need this post-creation
 
 <!-- ── Group I — Validation (last, closes the phase) ── -->
-- [ ] 4.16 ⏳ SQL tests — full suite: DDL + DML + JOIN + GROUP BY + ORDER BY + subqueries; covers error cases and edge conditions
+- [x] 4.16 ✅ SQL full test suite — LIKE/BETWEEN/IN/IS NULL, CAST, scalar functions (ABS/LENGTH/UPPER/LOWER/TRIM/SUBSTR/ROUND/COALESCE/NOW), NULL semantics, string concat, arithmetic expressions, error cases (division by zero, InvalidCoercion); documents NOT NULL/UNIQUE/CHECK gaps; 1046 total tests
 - [ ] 4.16b ⏳ INSERT throughput benchmark (MmapStorage + WAL real) — validate 180K ops/s budget with real I/O; **NEW — gap identified in Phase 3 benchmark review; blocker for closing Phase 4**
 
 ### Phase 5 — MySQL Wire Protocol `⏳` week 26-30

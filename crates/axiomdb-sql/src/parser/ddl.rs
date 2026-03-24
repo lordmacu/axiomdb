@@ -293,7 +293,7 @@ fn parse_check_column_constraint(p: &mut Parser) -> Result<ColumnConstraint, DbE
 
 // ── Data type ─────────────────────────────────────────────────────────────────
 
-fn parse_data_type(p: &mut Parser) -> Result<DataType, DbError> {
+pub(crate) fn parse_data_type(p: &mut Parser) -> Result<DataType, DbError> {
     let pos = p.current_pos();
     match p.peek().clone() {
         Token::TyInt | Token::TyInteger => {
