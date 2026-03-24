@@ -44,6 +44,29 @@ The speed advantage comes from two decisions:
 | Sequential scan 1M rows   | **0.72 s**    | 0.8 s        | 1.2 s          | ✅     |
 | Concurrent reads ×16      | **linear**    | linear       | <2× degradation| ✅     |
 
+### Wire Protocol Throughput (Phase 5.14)
+
+End-to-end throughput measured via the MySQL wire protocol (pymysql client, autocommit
+mode, 1 connection, localhost). Includes: network round-trip, protocol encode/decode,
+parse, analyze, execute, WAL, MmapStorage.
+
+| Operation                         | Throughput       | Notes                                      |
+|-----------------------------------|------------------|--------------------------------------------|
+| COM_PING                          | **24,865 pings/s** | Pure protocol overhead baseline           |
+| SET NAMES (intercepted)           | **46,672 q/s**   | Handled in protocol layer, no SQL engine   |
+| SELECT 1 (autocommit)             | **185 q/s**      | Full SQL pipeline, read-only               |
+| INSERT (autocommit, 1 fsync/stmt) | **58 q/s**       | Full SQL pipeline + fsync for durability   |
+
+The 185 q/s SELECT result reflects a **3.3× improvement** in Phase 5.14 over the prior
+56 q/s baseline. Read-only transactions (SELECT, SHOW, etc.) no longer fsync the WAL —
+see [Benchmarks → Phase 5.14](../development/benchmarks.md#phase-514-wire-protocol) for
+the technical explanation.
+
+**Remaining bottlenecks:**
+- SELECT: one full parse + analyze cycle per query (Phase 5.13 plan cache will amortize this)
+- INSERT: one `fdatasync` per autocommit statement is required for durability; the Phase 8
+  batch API will amortize fsync across many rows
+
 ### End-to-End INSERT Throughput (Phase 4.16b)
 
 Full pipeline: parse → analyze → execute → WAL → MmapStorage. Measured with
@@ -55,7 +78,7 @@ Full pipeline: parse → analyze → execute → WAL → MmapStorage. Measured w
 | INSERT 1K rows / 1 txn (no cache)      | 18.5K ops/s    | —                | —      |
 | INSERT 1K rows / 1 txn (SchemaCache)   | 20.6K ops/s    | —                | —      |
 | INSERT 10K rows / 1 txn (SchemaCache)  | **36K ops/s**  | 180K ops/s       | ⚠️     |
-| INSERT autocommit (1 fsync/row)        | ~70 ops/s      | —                | —      |
+| INSERT autocommit (1 fsync/row)        | **58 q/s**     | —                | — (wire protocol, Phase 5.14) |
 
 The 36K ops/s figure is the current honest baseline for the string-based API
 (parse → analyze → execute per statement). The bottleneck is WAL `record_insert()`,
@@ -138,6 +161,8 @@ blockers before any phase is closed.
 | Range scan 10K rows                     | 45 ms         | 60 ms               |
 | B+ Tree INSERT with WAL (storage only)  | 180K ops/s    | 150K ops/s          |
 | INSERT end-to-end 10K batch (Phase 8)   | 180K ops/s    | 150K ops/s          |
+| SELECT via wire protocol (autocommit)   | —             | —                   |
+| INSERT via wire protocol (autocommit)   | —             | —                   |
 | Sequential scan 1M rows                 | 0.8 s         | 1.2 s               |
 | Concurrent reads ×16                    | linear        | <2× degradation     |
 | Parser (simple SELECT)                  | 600 ns        | 1 µs                |

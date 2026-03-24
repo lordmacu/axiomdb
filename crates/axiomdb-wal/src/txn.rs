@@ -146,7 +146,16 @@ impl TxnManager {
 
         let mut entry = WalEntry::new(0, txn_id, EntryType::Commit, 0, vec![], vec![], vec![]);
         self.wal.append(&mut entry)?;
-        self.wal.commit()?; // fsync — durability guarantee
+
+        if active.undo_ops.is_empty() {
+            // Read-only transaction: flush to OS page cache (visible to
+            // readers/recovery) but skip the expensive fsync (~10-20ms).
+            // No heap data was modified, so OS-level durability is sufficient.
+            self.wal.flush_no_sync()?;
+        } else {
+            // DML transaction: full flush + fsync to guarantee durability.
+            self.wal.commit()?;
+        }
 
         self.max_committed = txn_id;
         Ok(())
