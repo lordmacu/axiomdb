@@ -166,7 +166,7 @@
   - Remaining gap cause: per-row HeapChain::insert() + WalEntry serialization (~20µs/row)
   - Full scan: AxiomDB 501K/s vs MariaDB 213K/s → AxiomDB **2.4× faster** ✅
 - [x] 4.16c ✅ Multi-row INSERT optimization — insert_rows_batch() uses record_insert_batch() (3.17); bench_insert_multi_row/10K: 211K rows/s (1 SQL string) vs 35K rows/s (N strings) = 6× faster; AxiomDB 211K/s vs MariaDB ~140K/s = 1.5× faster in bulk INSERT
-- [ ] 4.16d ⏳ WAL record per page (like PostgreSQL COPY) — buffer N row inserts, emit 1 WAL entry per modified page (~200 rows/page) instead of 1 WAL entry per row; reduces WAL I/O from 10K writes to ~50 writes for 10K rows; implement in WalWriter as append_batch(); expected gain: ~3× on batch insert; see docs/perf-insert-analysis.md
+- [x] 4.16d ✅ WAL record per page — implemented in Phase 3.18 (EntryType::PageWrite=9); insert_rows_batch() emits 1 PageWrite per affected page; 238× fewer WAL entries for 10K-row insert; 30% smaller WAL; crash recovery parses slot_ids for undo
 
 ### Phase 5 — MySQL Wire Protocol `🔄` week 26-30
 - [x] 5.1 ✅ TCP listener with Tokio — accept connections on :3306; Arc<Mutex<Database>>; tokio::spawn per connection
