@@ -56,7 +56,7 @@
 - [ ] ⚠️ 3.8b Partial page write detection on open → deferred to Phase 5
 - [ ] ⚠️ Per-page msync optimization (flush_range) → deferred pending profiling
 - [x] 3.17 ✅ WAL batch append — `TxnManager::record_insert_batch()`: reserve_lsns(N) + serialize all N Insert entries into wal_scratch + write_batch() in one write_all; O(1) BufWriter calls instead of O(N); entries byte-for-byte identical to per-row path; crash recovery unchanged
-- [ ] 3.18 ⏳ WAL record per page (PostgreSQL COPY strategy) — instead of 1 WAL entry per inserted row, buffer rows until a page is full and emit 1 WAL entry of type `PageWrite(page_id, page_bytes)`; crash recovery replays page writes instead of row inserts; reduces WAL I/O from O(rows) to O(pages) = ~200× fewer WAL writes for bulk inserts; expected to bring AxiomDB bulk insert from ~30K/s to ~100K+/s; requires changes to WalEntry format + crash recovery state machine
+- [x] 3.18 ✅ WAL PageWrite — EntryType::PageWrite=9; record_page_writes() emits 1 entry per affected page (key=page_id, new_value=page_bytes+slot_ids); insert_rows_batch groups phys_locs by page_id; crash recovery parses slot_ids for undo; 238x fewer WAL entries for 10K-row insert; 30% smaller WAL; 7 integration tests
 - [x] 3.19 ✅ WAL Group Commit — CommitCoordinator batches fsyncs across concurrent connections; deferred_commit_mode in TxnManager; background Tokio task; enable_group_commit() in Database; handler.rs releases lock before await; group_commit_interval_ms config (default 0=disabled); 10 integration tests; up to N× throughput for N concurrent writers
 
 ### Phase 4 — SQL Parser + Executor `🔄` week 11-25
