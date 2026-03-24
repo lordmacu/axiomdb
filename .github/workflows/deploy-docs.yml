@@ -3,6 +3,10 @@ name: Deploy docs + studio to GitHub Pages
 on:
   push:
     branches: [main]
+    paths:
+      - 'docs-site/**'
+      - 'studio/**'
+      - '.github/workflows/deploy-docs.yml'
   workflow_dispatch:
 
 permissions:
@@ -20,18 +24,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ── mdBook docs ─────────────────────────────────────────────────────────
+      # ── Docs — only rebuild if docs-site/ changed ──────────────────────────
+      - name: Cache docs build
+        uses: actions/cache@v4
+        id: docs-cache
+        with:
+          path: docs-site/book
+          key: docs-${{ hashFiles('docs-site/**') }}
+
       - name: Install mdbook
+        if: steps.docs-cache.outputs.cache-hit != 'true'
         run: |
           curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.5.2/mdbook-v0.5.2-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xz
           sudo mv mdbook /usr/local/bin/
 
       - name: Build docs
+        if: steps.docs-cache.outputs.cache-hit != 'true'
         run: mdbook build docs-site
 
-      # ── AxiomStudio (Next.js static export) ─────────────────────────────────
+      # ── Studio — only rebuild if studio/ changed ───────────────────────────
+      - name: Cache studio build
+        uses: actions/cache@v4
+        id: studio-cache
+        with:
+          path: studio/out
+          key: studio-${{ hashFiles('studio/src/**', 'studio/app/**', 'studio/components/**', 'studio/lib/**', 'studio/public/**', 'studio/package-lock.json', 'studio/next.config.ts', 'studio/tailwind.config.ts') }}
+
       - name: Setup Node.js
+        if: steps.studio-cache.outputs.cache-hit != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -39,17 +60,19 @@ jobs:
           cache-dependency-path: studio/package-lock.json
 
       - name: Install studio dependencies
+        if: steps.studio-cache.outputs.cache-hit != 'true'
         run: npm ci
         working-directory: studio
 
       - name: Build studio
+        if: steps.studio-cache.outputs.cache-hit != 'true'
         run: npm run build
         working-directory: studio
 
+      # ── Combine and upload ─────────────────────────────────────────────────
       - name: Copy studio into docs output
         run: cp -r studio/out docs-site/book/studio
 
-      # ── Upload combined artifact ─────────────────────────────────────────────
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
