@@ -983,13 +983,12 @@ fn execute_select(
         let snap = txn.active_snapshot()?;
 
         // ── Query planner: pick the best access method ────────────────────
-        let access_method = {
-            let indexes = {
-                let reader = CatalogReader::new(storage, snap)?;
-                reader.list_indexes(resolved.def.id)?
-            };
-            crate::planner::plan_select(stmt.where_clause.as_ref(), &indexes, &resolved.columns)
-        };
+        // Use indexes already loaded by resolve_table (cached by SchemaCache).
+        let access_method = crate::planner::plan_select(
+            stmt.where_clause.as_ref(),
+            &resolved.indexes,
+            &resolved.columns,
+        );
 
         // ── Fetch rows via the chosen access method ───────────────────────
         let raw_rows: Vec<(RecordId, Vec<Value>)> = match &access_method {
@@ -2415,16 +2414,14 @@ fn execute_insert(
 
     let mut count = 0u64;
 
-    // Load secondary indexes once (before the row loop) for maintenance.
-    let secondary_indexes: Vec<IndexDef> = {
-        let snap = txn.active_snapshot()?;
-        let reader = CatalogReader::new(storage, snap)?;
-        reader
-            .list_indexes(resolved.def.id)?
-            .into_iter()
-            .filter(|i| !i.is_primary && !i.columns.is_empty())
-            .collect()
-    };
+    // Use the already-loaded indexes from the resolved table (cached by SchemaCache).
+    // Avoids a second catalog heap scan per INSERT.
+    let secondary_indexes: Vec<IndexDef> = resolved
+        .indexes
+        .iter()
+        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .cloned()
+        .collect();
 
     // Find the AUTO_INCREMENT column index (at most one per table).
     let auto_inc_col: Option<usize> = schema_cols.iter().position(|c| c.auto_increment);
@@ -2469,7 +2466,13 @@ fn execute_insert(
     match stmt.source {
         // ── INSERT ... VALUES ─────────────────────────────────────────────────
         InsertSource::Values(rows) => {
-            for value_exprs in rows {
+            // ── Phase 1: evaluate expressions + resolve AUTO_INCREMENT for all rows ──
+            // This is done upfront so that:
+            // (a) any expression error fails fast before touching the heap, and
+            // (b) the batch path receives final Value vecs (no per-row eval inside batch).
+            let mut full_batch: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+
+            for value_exprs in &rows {
                 let provided: Vec<Value> = value_exprs
                     .iter()
                     .map(|e| eval(e, &[]))
@@ -2486,7 +2489,7 @@ fn execute_insert(
                     })
                     .collect();
 
-                // AUTO_INCREMENT: replace NULL in the auto column with next ID.
+                // AUTO_INCREMENT: assign the next ID before batching.
                 if let Some(ai_col) = auto_inc_col {
                     if matches!(full_values.get(ai_col), Some(Value::Null)) {
                         let id = next_auto_inc(storage, txn, &resolved.def, schema_cols, ai_col)?;
@@ -2500,6 +2503,25 @@ fn execute_insert(
                     }
                 }
 
+                full_batch.push(full_values);
+            }
+
+            // ── Phase 2: insert into the heap ─────────────────────────────────
+            //
+            // Single-row path: use insert_row() directly — no Vec allocation
+            // overhead, same as before this optimization.
+            //
+            // Multi-row path (N > 1, no secondary indexes): use insert_rows_batch()
+            // which loads each heap page once for the entire batch (vs. once per row).
+            //
+            // Multi-row path (N > 1, with secondary indexes): fall back to the
+            // per-row loop so that secondary index maintenance has the Value vecs
+            // available for each row. This maintains correctness at a minor
+            // performance cost; optimizing secondary-index batch maintenance is
+            // deferred to a follow-up.
+            if full_batch.len() == 1 {
+                // ── Single row — existing path, no overhead ────────────────────
+                let full_values = full_batch.remove(0);
                 let rid = TableEngine::insert_row(
                     storage,
                     txn,
@@ -2507,7 +2529,6 @@ fn execute_insert(
                     schema_cols,
                     full_values.clone(),
                 )?;
-                // Index maintenance: insert into secondary indexes.
                 if !secondary_indexes.is_empty() {
                     let updated = crate::index_maintenance::insert_into_indexes(
                         &secondary_indexes,
@@ -2519,7 +2540,40 @@ fn execute_insert(
                         CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
                     }
                 }
-                count += 1;
+                count = 1;
+            } else if secondary_indexes.is_empty() {
+                // ── Multi-row batch, no secondary indexes — fast path ──────────
+                // HeapChain::insert_batch() loads each page once, writes once.
+                let n = full_batch.len() as u64;
+                TableEngine::insert_rows_batch(
+                    storage,
+                    txn,
+                    &resolved.def,
+                    schema_cols,
+                    &full_batch,
+                )?;
+                count = n;
+            } else {
+                // ── Multi-row with secondary indexes — per-row fallback ────────
+                for full_values in full_batch {
+                    let rid = TableEngine::insert_row(
+                        storage,
+                        txn,
+                        &resolved.def,
+                        schema_cols,
+                        full_values.clone(),
+                    )?;
+                    let updated = crate::index_maintenance::insert_into_indexes(
+                        &secondary_indexes,
+                        &full_values,
+                        rid,
+                        storage,
+                    )?;
+                    for (index_id, new_root) in updated {
+                        CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
+                    }
+                    count += 1;
+                }
             }
         }
 
@@ -2633,15 +2687,13 @@ fn execute_update(
     let snap = txn.active_snapshot()?;
     let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
 
-    // Load secondary indexes for maintenance.
-    let mut secondary_indexes: Vec<IndexDef> = {
-        let reader = CatalogReader::new(storage, snap)?;
-        reader
-            .list_indexes(resolved.def.id)?
-            .into_iter()
-            .filter(|i| !i.is_primary && !i.columns.is_empty())
-            .collect()
-    };
+    // Use the already-loaded indexes from the resolved table (cached by SchemaCache).
+    let mut secondary_indexes: Vec<IndexDef> = resolved
+        .indexes
+        .iter()
+        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .cloned()
+        .collect();
 
     let mut count = 0u64;
     for (rid, current_values) in rows {
@@ -2719,15 +2771,13 @@ fn execute_delete(
     let snap = txn.active_snapshot()?;
     let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
 
-    // Load secondary indexes for maintenance.
-    let secondary_indexes: Vec<IndexDef> = {
-        let reader = CatalogReader::new(storage, snap)?;
-        reader
-            .list_indexes(resolved.def.id)?
-            .into_iter()
-            .filter(|i| !i.is_primary && !i.columns.is_empty())
-            .collect()
-    };
+    // Use the already-loaded indexes from the resolved table (cached by SchemaCache).
+    let secondary_indexes: Vec<IndexDef> = resolved
+        .indexes
+        .iter()
+        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .cloned()
+        .collect();
 
     // Collect all matching (rid, row_values) BEFORE deleting any row.
     let to_delete: Vec<(RecordId, Vec<Value>)> = rows

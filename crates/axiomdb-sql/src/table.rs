@@ -157,6 +157,84 @@ impl TableEngine {
         Ok(RecordId { page_id, slot_id })
     }
 
+    /// Encodes and inserts **multiple rows** into the table heap in one pass,
+    /// WAL-logging each insert.
+    ///
+    /// This is the batch counterpart of [`insert_row`]. It calls
+    /// [`HeapChain::insert_batch`] which loads each heap page exactly once
+    /// regardless of how many rows are written to it — reducing per-row
+    /// `read_page` + `write_page` calls from O(N) to O(pages).
+    ///
+    /// ## Encoding phase (fail-fast)
+    ///
+    /// All rows are coerced and encoded before any heap or WAL write. If any
+    /// row fails type coercion, the function returns an error and the heap is
+    /// untouched.
+    ///
+    /// ## WAL ordering
+    ///
+    /// `HeapChain::insert_batch()` writes pages before returning the
+    /// `(page_id, slot_id)` pairs. `record_insert()` is then called for each
+    /// row. Both heap and WAL writes are in the BufWriter / mmap (not yet
+    /// durable). Durability comes from `TxnManager::commit()`.
+    ///
+    /// Must be called inside an active transaction.
+    ///
+    /// # Errors
+    /// - [`DbError::TypeMismatch`] — any row has wrong column count.
+    /// - [`DbError::InvalidCoercion`] — any value cannot be coerced.
+    /// - [`DbError::NoActiveTransaction`] — no transaction is active.
+    /// - I/O errors from storage or WAL writes.
+    pub fn insert_rows_batch(
+        storage: &mut dyn StorageEngine,
+        txn: &mut TxnManager,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        batch: &[Vec<Value>],
+    ) -> Result<Vec<RecordId>, DbError> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let col_types = column_data_types(columns);
+
+        // ── Encode all rows first (fail-fast, no heap writes yet) ─────────────
+        let encoded_rows: Vec<Vec<u8>> = batch
+            .iter()
+            .map(|values| {
+                let values = values.clone();
+                if values.len() != columns.len() {
+                    return Err(DbError::TypeMismatch {
+                        expected: format!("{} columns", columns.len()),
+                        got: format!("{} values", values.len()),
+                    });
+                }
+                let coerced = coerce_values(values, columns)?;
+                encode_row(&coerced, &col_types)
+            })
+            .collect::<Result<_, _>>()?;
+
+        // ── Insert all rows into the heap in one batch pass ───────────────────
+        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+        let phys_locs =
+            HeapChain::insert_batch(storage, table_def.data_root_page_id, &encoded_rows, txn_id)?;
+
+        // ── WAL: one record_insert per row (same per-row granularity as today) ─
+        // This runs after write_page() has been called for each page in insert_batch,
+        // maintaining the WAL-before-data invariant at page granularity.
+        let mut result = Vec::with_capacity(phys_locs.len());
+        for ((page_id, slot_id), encoded) in phys_locs.iter().zip(encoded_rows.iter()) {
+            let key = encode_rid(*page_id, *slot_id);
+            txn.record_insert(table_def.id, &key, encoded, *page_id, *slot_id)?;
+            result.push(RecordId {
+                page_id: *page_id,
+                slot_id: *slot_id,
+            });
+        }
+
+        Ok(result)
+    }
+
     /// Stamps an MVCC deletion on the row at `record_id`, WAL-logging the delete.
     ///
     /// The old row bytes are read before deletion to include as `old_value` in
