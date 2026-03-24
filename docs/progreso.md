@@ -200,8 +200,10 @@
 - [x] 6.3 ✅ Basic query planner — detects `WHERE col = literal` and `WHERE col > lo AND col < hi` on indexed columns; replaces full scan with B-Tree lookup/range
 - [ ] ⚠️ Composite index planner (> 1 column) — encoding supports it, planner deferred to 6.8
 - [x] 6.4 ✅ Bloom filter per index — `BloomRegistry` per-DB; CREATE INDEX populates filter; INSERT adds keys; DELETE/UPDATE marks dirty; SELECT IndexLookup skips B-Tree on definite absence (1% FPR)
-- [ ] 6.5 ⏳ Foreign key checker — validation on INSERT/UPDATE with reverse index
-- [ ] 6.6 ⏳ ON DELETE CASCADE / RESTRICT / SET NULL
+- [x] 6.5 ✅ Foreign key checker — `axiom_foreign_keys` catalog; DDL (CREATE TABLE REFERENCES, ALTER TABLE ADD/DROP CONSTRAINT FK); INSERT/UPDATE child validates parent; DELETE/UPDATE parent enforces RESTRICT
+- [x] 6.6 ✅ ON DELETE CASCADE / SET NULL — recursive cascade (depth ≤ 10); SET NULL with nullable check; ON UPDATE RESTRICT; ON UPDATE CASCADE/SET NULL deferred to 6.9
+- [ ] ⚠️ FK auto-index (non-unique B-Tree duplicate keys) — deferred to 6.9; FK enforcement uses full scan (correct, O(n))
+- [ ] ⚠️ PK B-Tree index population on INSERT — PK indexes created empty; FK uses full scan for parent lookup → deferred to 6.9
 - [ ] 6.7 ⏳ Partial UNIQUE index — `UNIQUE WHERE condition` for soft delete
 - [ ] 6.8 ⏳ Fill factor — `WITH (fillfactor=70)` for tables with many inserts
 - [ ] 6.9 ⏳ FK and index tests — violations, cascades, restrictions

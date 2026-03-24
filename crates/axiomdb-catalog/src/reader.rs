@@ -16,7 +16,7 @@ use axiomdb_core::RecordId;
 
 use crate::{
     bootstrap::{CatalogBootstrap, CatalogPageIds},
-    schema::{ColumnDef, ConstraintDef, IndexDef, TableDef, TableId},
+    schema::{ColumnDef, ConstraintDef, FkDef, IndexDef, TableDef, TableId},
 };
 
 // ── CatalogReader ─────────────────────────────────────────────────────────────
@@ -168,6 +168,92 @@ impl<'a> CatalogReader<'a> {
     ///
     /// Used by `CatalogWriter::drop_constraint` to locate the physical slot.
     pub(crate) fn scan_constraints_root(
+        storage: &dyn StorageEngine,
+        root: u64,
+        snapshot: TransactionSnapshot,
+    ) -> Result<Vec<(RecordId, Vec<u8>)>, DbError> {
+        if root == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = HeapChain::scan_visible_ro(storage, root, snapshot)?;
+        Ok(rows
+            .into_iter()
+            .map(|(page_id, slot_id, data)| (RecordId { page_id, slot_id }, data))
+            .collect())
+    }
+
+    // ── FK reads (Phase 6.5) ──────────────────────────────────────────────────
+
+    /// Returns all FK constraints where `table_id` is the **child** table.
+    ///
+    /// Returns an empty Vec for pre-6.5 databases (FK root = 0).
+    pub fn list_fk_constraints(&mut self, table_id: TableId) -> Result<Vec<FkDef>, DbError> {
+        let root = self.page_ids.foreign_keys;
+        if root == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        let mut result = Vec::new();
+        for (_, _, data) in rows {
+            if let Ok((def, _)) = FkDef::from_bytes(&data) {
+                if def.child_table_id == table_id {
+                    result.push(def);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Returns all FK constraints where `parent_table_id` is the **parent** table.
+    ///
+    /// Used by DELETE/UPDATE parent enforcement to find all child tables that
+    /// reference this table. Returns empty Vec for pre-6.5 databases.
+    pub fn list_fk_constraints_referencing(
+        &mut self,
+        parent_table_id: u32,
+    ) -> Result<Vec<FkDef>, DbError> {
+        let root = self.page_ids.foreign_keys;
+        if root == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        let mut result = Vec::new();
+        for (_, _, data) in rows {
+            if let Ok((def, _)) = FkDef::from_bytes(&data) {
+                if def.parent_table_id == parent_table_id {
+                    result.push(def);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Finds a FK constraint by name on `child_table_id`. Returns `None` if
+    /// not found.
+    pub fn get_fk_by_name(
+        &mut self,
+        child_table_id: TableId,
+        name: &str,
+    ) -> Result<Option<FkDef>, DbError> {
+        let root = self.page_ids.foreign_keys;
+        if root == 0 {
+            return Ok(None);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        for (_, _, data) in rows {
+            if let Ok((def, _)) = FkDef::from_bytes(&data) {
+                if def.child_table_id == child_table_id && def.name == name {
+                    return Ok(Some(def));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Scans the raw FK heap returning (RecordId, row_bytes) pairs.
+    ///
+    /// Used by `CatalogWriter::drop_foreign_key` to locate the physical slot.
+    pub(crate) fn scan_fk_root(
         storage: &dyn StorageEngine,
         root: u64,
         snapshot: TransactionSnapshot,

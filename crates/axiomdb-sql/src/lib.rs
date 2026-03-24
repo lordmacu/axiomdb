@@ -14,6 +14,7 @@ pub mod bloom;
 pub mod eval;
 pub mod executor;
 pub mod expr;
+pub mod fk_enforcement;
 pub mod index_maintenance;
 pub mod key_encoding;
 pub mod lexer;

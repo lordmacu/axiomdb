@@ -2561,9 +2561,9 @@ fn test_not_null_constraint_violated() {
 }
 
 #[test]
-fn test_unique_constraint_not_yet_enforced() {
-    // UNIQUE constraints are parsed but the executor does not check for duplicates
-    // at insert time (no index scan for uniqueness yet — deferred to Phase 5+).
+fn test_unique_constraint_enforced() {
+    // UNIQUE column constraint creates a B-Tree unique index at CREATE TABLE time
+    // (Phase 6.5). Duplicate values are rejected at INSERT time.
     let (mut storage, mut txn) = setup();
     run(
         "CREATE TABLE t (id INT UNIQUE, name TEXT)",
@@ -2571,10 +2571,16 @@ fn test_unique_constraint_not_yet_enforced() {
         &mut txn,
     );
     run("INSERT INTO t VALUES (1, 'Alice')", &mut storage, &mut txn);
-    // Currently succeeds (UNIQUE not enforced)
-    run("INSERT INTO t VALUES (1, 'Bob')", &mut storage, &mut txn);
+    // Second insert with same id should fail with UniqueViolation.
+    let err = run_result("INSERT INTO t VALUES (1, 'Bob')", &mut storage, &mut txn)
+        .expect_err("expected UniqueViolation");
+    assert!(
+        matches!(err, DbError::UniqueViolation { .. }),
+        "expected UniqueViolation, got: {err}"
+    );
+    // Only the first row should exist.
     let r = rows(run("SELECT COUNT(*) FROM t", &mut storage, &mut txn));
-    assert_eq!(r[0][0], Value::BigInt(2)); // both rows inserted
+    assert_eq!(r[0][0], Value::BigInt(1));
 }
 
 #[test]

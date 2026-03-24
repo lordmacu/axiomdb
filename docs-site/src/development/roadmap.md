@@ -16,7 +16,7 @@ functionality. The design is organized in three blocks:
 
 **Last completed phase:** Phase 3 WAL (100%) — Group Commit, WAL batch append, PageWrite; Phases 4–6 in active development
 
-**Active development:** Phase 6 Indexes (6.5 FK checker, 6.6 ON DELETE CASCADE, 6.7–6.15 planned)
+**Active development:** Phase 6 Indexes (6.7 partial unique index, 6.9 FK composite index + ON UPDATE CASCADE, 6.10–6.15 planned)
 
 **Next milestone:** Phase 7 — full MVCC + concurrent writers (removes global mutex)
 
