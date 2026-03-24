@@ -8,7 +8,7 @@
 
 use axiomdb_catalog::CatalogBootstrap;
 use axiomdb_sql::{analyze, execute, execute_with_ctx, parse, SessionContext};
-use axiomdb_storage::MmapStorage;
+use axiomdb_storage::{MemoryStorage, MmapStorage};
 use axiomdb_wal::TxnManager;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 
@@ -260,6 +260,75 @@ fn bench_full_pipeline(c: &mut Criterion) {
     group.finish();
 }
 
+/// INSERT batch with MemoryStorage (no mmap, no disk I/O).
+///
+/// Establishes a baseline: any overhead vs `insert_batch_cached` is pure mmap cost.
+fn bench_insert_batch_memory(c: &mut Criterion) {
+    let sizes = [1_000u32, 10_000];
+    let mut group = c.benchmark_group("insert_batch_memory");
+
+    for &n in &sizes {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(
+            criterion::BenchmarkId::new("axiomdb_memory_wal", n),
+            &n,
+            |b, &n| {
+                b.iter_batched(
+                    || {
+                        let dir = tempfile::tempdir().unwrap();
+                        let wal_path = dir.path().join("bench.wal");
+                        let mut storage = MemoryStorage::new();
+                        CatalogBootstrap::init(&mut storage).unwrap();
+                        let txn = TxnManager::create(&wal_path).unwrap();
+                        let mut ctx = SessionContext::new();
+                        let mut db_mem = (storage, txn, dir);
+                        let snap = db_mem
+                            .1
+                            .active_snapshot()
+                            .unwrap_or_else(|_| db_mem.1.snapshot());
+                        let stmt = parse("CREATE TABLE t (id INT, val TEXT)", None).unwrap();
+                        let analyzed = analyze(stmt, &db_mem.0, snap).unwrap();
+                        execute_with_ctx(analyzed, &mut db_mem.0, &mut db_mem.1, &mut ctx).unwrap();
+                        (db_mem, ctx)
+                    },
+                    |((mut storage, mut txn, _dir), mut ctx)| {
+                        execute_with_ctx(
+                            analyze(parse("BEGIN", None).unwrap(), &storage, txn.snapshot())
+                                .unwrap(),
+                            &mut storage,
+                            &mut txn,
+                            &mut ctx,
+                        )
+                        .unwrap();
+                        for i in 1..=n {
+                            let sql = format!("INSERT INTO t VALUES ({i}, 'row{i}')");
+                            let snap = txn.active_snapshot().unwrap();
+                            let analyzed =
+                                analyze(parse(&sql, None).unwrap(), &storage, snap).unwrap();
+                            execute_with_ctx(analyzed, &mut storage, &mut txn, &mut ctx).unwrap();
+                        }
+                        execute_with_ctx(
+                            analyze(
+                                parse("COMMIT", None).unwrap(),
+                                &storage,
+                                txn.active_snapshot().unwrap(),
+                            )
+                            .unwrap(),
+                            &mut storage,
+                            &mut txn,
+                            &mut ctx,
+                        )
+                        .unwrap();
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
 /// INSERT batch with SessionContext schema cache enabled.
 ///
 /// This is the most realistic benchmark for a long-lived connection:
@@ -306,6 +375,7 @@ criterion_group!(
     bench_insert_single,
     bench_insert_sequential,
     bench_insert_batch_txn,
+    bench_insert_batch_memory,
     bench_insert_batch_cached,
     bench_select_full_scan,
     bench_select_where_filter,
