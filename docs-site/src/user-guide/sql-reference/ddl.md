@@ -159,7 +159,13 @@ CREATE TABLE orders (
 | `SET DEFAULT` | Set the foreign key column to its DEFAULT value      |
 | `NO ACTION`| Same as RESTRICT but deferred to end of statement       |
 
-**ON UPDATE actions:** Same options — apply when the referenced primary key is updated.
+**ON UPDATE actions:** Same options as ON DELETE — apply when the referenced primary
+key is updated.
+
+> **Phase 6.5 limitation:** Only `ON UPDATE RESTRICT` (the default) is enforced.
+> `ON UPDATE CASCADE` and `ON UPDATE SET NULL` return `NotImplemented` and are
+> planned for Phase 6.9. Write `ON UPDATE RESTRICT` or omit the clause entirely
+> for correct behaviour today.
 
 ```sql
 CREATE TABLE order_items (

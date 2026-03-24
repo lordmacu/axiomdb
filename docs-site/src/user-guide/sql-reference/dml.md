@@ -830,13 +830,22 @@ ALTER TABLE users DROP CONSTRAINT IF EXISTS uq_users_old;
 `DROP CONSTRAINT` searches first in indexes (for UNIQUE constraints), then in the
 named constraint catalog (for CHECK constraints).
 
-### Limitations (Phase 4.22b)
+### ADD CONSTRAINT FOREIGN KEY (Phase 6.5)
+
+Adds a foreign key constraint after the table is created. Validates all existing
+rows before persisting — fails if any existing value violates the new constraint.
+
+```sql
+ALTER TABLE orders
+  ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+```
+
+Fails if any existing `user_id` value has no matching row in `users`.
+
+### Limitations
 
 ```sql
 -- Not yet supported:
-ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users (id);
--- → NotImplemented: ADD CONSTRAINT FOREIGN KEY — Phase 6.5
-
 ALTER TABLE users ADD CONSTRAINT pk_users PRIMARY KEY (id);
 -- → NotImplemented: ADD CONSTRAINT PRIMARY KEY — requires full table rewrite
 ```

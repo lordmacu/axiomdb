@@ -68,8 +68,12 @@ functionality. The design is organized in three blocks:
 | 4.12 | DISTINCT | ✅ | HashSet dedup on output rows; NULL=NULL; pre-LIMIT |
 | 4.24 | CASE WHEN | ✅ | Searched + simple form; NULL semantics; all contexts |
 | 4.6 | INSERT ... SELECT | ✅ | Reuses execute_select; MVCC prevents self-reads |
+| 6.1–6.3 | Secondary indexes + planner | ✅ | CREATE INDEX, index maintenance, B-Tree point/range lookup |
+| 6.4 | Bloom filter per index | ✅ | BloomRegistry; zero B-Tree reads for definite-absent keys (1% FPR) |
+| 6.5/6.6 | Foreign key constraints | ✅ | REFERENCES, ALTER TABLE FK; INSERT/DELETE/CASCADE/SET NULL enforcement |
+| 6.7 | Partial UNIQUE index | ✅ | CREATE INDEX … WHERE predicate; soft-delete uniqueness pattern |
 | 5 | Executor (advanced) | ⚠️ Planned | JOIN, GROUP BY, ORDER BY, index lookup, aggregate |
-| 6 | Query planner | ⚠️ Planned | Cost-based plan selection |
+| 6.8+ | Index statistics, FK improvements | ⚠️ Planned | Fill factor, composite FKs, ON UPDATE CASCADE, ANALYZE, index-only scans |
 | 7 | Full MVCC | ⚠️ Planned | SSI, write-write conflicts, epoch reclamation |
 
 ### Block 2 — SQL Completeness

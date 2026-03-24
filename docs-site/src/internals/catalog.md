@@ -16,23 +16,61 @@ executor through a consistent, MVCC-aware reader interface.
   statements in the same transaction but invisible to concurrent transactions until
   committed.
 - **Bootstrappable:** An empty database file contains no catalog rows. The first
-  `open()` runs a special bootstrap transaction that creates the three system tables.
+  `open()` runs a special bootstrap transaction that creates the five system tables.
 
 ---
 
 ## System Tables
 
-The catalog consists of three tables stored in the `axiom` internal schema.
+The catalog consists of five tables stored in the `axiom` internal schema.
 Their structure is described in [Catalog & Schema](../user-guide/features/catalog.md).
 
-| Table             | Contents                                  |
-|-------------------|-------------------------------------------|
-| `axiom_tables`    | One row per user-visible table            |
-| `axiom_columns`   | One row per column, in declaration order  |
-| `axiom_indexes`   | One row per index                         |
+| Table                   | Meta offset | Contents                                         |
+|-------------------------|-------------|--------------------------------------------------|
+| `axiom_tables`          | 32          | One row per user-visible table                   |
+| `axiom_columns`         | 40          | One row per column, in declaration order         |
+| `axiom_indexes`         | 48          | One row per index (includes partial index predicate since Phase 6.7) |
+| `axiom_constraints`     | 72          | Named CHECK constraints (Phase 4.22b)            |
+| `axiom_foreign_keys`    | 84          | One row per FK constraint (Phase 6.5)            |
 
-These tables are themselves stored in heap pages and indexed by a B+ Tree keyed on
-`(table_id, col_index)` for `axiom_columns` and `table_id` for `axiom_indexes`.
+Each table root page is stored at the corresponding u64 body offset in the meta
+page (page 0). Offsets 84 and 92 are lazily initialized (value = 0 on pre-Phase
+6.5 databases; allocated on first use).
+
+### `axiom_foreign_keys` row format (`FkDef`)
+
+```text
+[fk_id:          4 bytes LE u32]
+[child_table_id: 4 bytes LE u32]   — table with the FK column
+[child_col_idx:  2 bytes LE u16]   — FK column index in child table
+[parent_table_id:4 bytes LE u32]   — referenced (parent) table
+[parent_col_idx: 2 bytes LE u16]   — referenced column in parent table
+[on_delete:      1 byte  u8   ]    — 0=NoAction, 1=Restrict, 2=Cascade, 3=SetNull
+[on_update:      1 byte  u8   ]    — same encoding
+[fk_index_id:    4 bytes LE u32]   — 0 = user-provided index (not auto-created)
+[name_len:       4 bytes LE u32]
+[name:           name_len bytes UTF-8]
+```
+
+`FkAction` encoding: `0` = NoAction, `1` = Restrict, `2` = Cascade,
+`3` = SetNull, `4` = SetDefault.
+
+`fk_index_id = 0` means the FK column already had a user-provided index; the FK
+did not auto-create one and will not drop one on `DROP CONSTRAINT`.
+
+### `axiom_indexes` — predicate extension (Phase 6.7)
+
+The `IndexDef` binary format was extended in Phase 6.7 with a backward-compatible
+predicate section appended after the columns:
+
+```text
+[...existing fields...][ncols:1][col_idx:2, order:1]×ncols
+[pred_len:2 LE][pred_sql: pred_len UTF-8 bytes]   ← absent on pre-6.7 rows
+```
+
+`pred_len = 0` (or section absent) → full index. Pre-6.7 databases open without
+migration because `from_bytes` checks `bytes.len() > consumed` before reading
+the predicate section.
 
 ---
 
