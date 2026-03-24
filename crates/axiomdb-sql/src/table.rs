@@ -46,9 +46,11 @@
 //! new slots are on the same page, which is not guaranteed when the old page is
 //! full and the chain must grow.
 
+use std::collections::HashMap;
+
 use axiomdb_catalog::schema::{ColumnDef, ColumnType, TableDef};
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
-use axiomdb_storage::{HeapChain, StorageEngine};
+use axiomdb_storage::{HeapChain, StorageEngine, PAGE_SIZE};
 use axiomdb_types::{
     codec::{decode_row, encode_row},
     coerce::{coerce, CoercionMode},
@@ -219,12 +221,43 @@ impl TableEngine {
         let phys_locs =
             HeapChain::insert_batch(storage, table_def.data_root_page_id, &encoded_rows, txn_id)?;
 
-        // ── WAL: all N inserts in one write_batch call (Phase 3.17) ─────────
-        // record_insert_batch uses reserve_lsns(N) + write_batch to emit all
-        // WAL Insert entries in a single write_all, reducing BufWriter calls
-        // from O(N rows) to O(1). Entries are byte-for-byte identical to the
-        // previous per-row path — crash recovery is unchanged.
-        txn.record_insert_batch(table_def.id, &phys_locs, &encoded_rows)?;
+        // ── WAL: one PageWrite entry per affected page (Phase 3.18) ─────────
+        // Instead of N Insert entries (one per row), emit one PageWrite per
+        // unique page touched by the batch. Each entry carries the full page
+        // post-image plus the list of slot_ids inserted by this transaction,
+        // so crash recovery can undo uncommitted writes at slot granularity.
+        //
+        // For a 10K-row insert spanning ~625 pages (at 16-row capacity each):
+        //   Before: 10K serialize_into() calls + 10K CRC32c computations
+        //   After:  ~625 serialize_into() calls + ~625 CRC32c computations
+        //
+        // The page reads below (read_page per unique page) are mmap cache hits
+        // because HeapChain::insert_batch() just wrote those same pages.
+
+        // Group slot_ids by page_id.
+        let mut page_slot_map: HashMap<u64, Vec<u16>> = HashMap::new();
+        for &(page_id, slot_id) in &phys_locs {
+            page_slot_map.entry(page_id).or_default().push(slot_id);
+        }
+
+        // Sort by page_id for deterministic WAL ordering.
+        let mut sorted_pages: Vec<(u64, Vec<u16>)> = page_slot_map.into_iter().collect();
+        sorted_pages.sort_unstable_by_key(|(page_id, _)| *page_id);
+
+        // Read final page bytes for each affected page (mmap cache hit — just written).
+        let mut page_write_args: Vec<(u64, [u8; PAGE_SIZE], Vec<u16>)> =
+            Vec::with_capacity(sorted_pages.len());
+        for (page_id, slot_ids) in sorted_pages {
+            let page_bytes = *storage.read_page(page_id)?.as_bytes();
+            page_write_args.push((page_id, page_bytes, slot_ids));
+        }
+
+        // Emit one PageWrite WAL entry per affected page.
+        let pw_refs: Vec<(u64, &[u8; PAGE_SIZE], &[u16])> = page_write_args
+            .iter()
+            .map(|(pid, bytes, slots)| (*pid, bytes, slots.as_slice()))
+            .collect();
+        txn.record_page_writes(table_def.id, &pw_refs)?;
 
         let result = phys_locs
             .iter()

@@ -64,6 +64,20 @@ pub enum EntryType {
     Update = 6,
     /// Checkpoint point — marks how far data is on disk. No payload.
     Checkpoint = 7,
+    /// Full-table delete (DELETE without WHERE or TRUNCATE TABLE).
+    /// `key` contains `root_page_id` as 8 bytes LE.
+    /// No per-row payload — undo by scanning the heap chain.
+    Truncate = 8,
+    /// Bulk-insert page image — replaces N `Insert` entries with one entry per page.
+    ///
+    /// `key`       = `page_id` as u64 LE (8 bytes).
+    /// `old_value` = empty.
+    /// `new_value` = `[page_bytes: PAGE_SIZE][num_slots: u16 LE][slot_id × N: u16 LE]`.
+    ///
+    /// Crash recovery undoes an uncommitted `PageWrite` by marking each embedded
+    /// `slot_id` dead on the given page — identical to undoing N `Insert` entries.
+    /// The `page_bytes` are preserved for future REDO support (Phase 3.8b).
+    PageWrite = 9,
 }
 
 impl TryFrom<u8> for EntryType {
@@ -78,6 +92,8 @@ impl TryFrom<u8> for EntryType {
             5 => Ok(Self::Delete),
             6 => Ok(Self::Update),
             7 => Ok(Self::Checkpoint),
+            8 => Ok(Self::Truncate),
+            9 => Ok(Self::PageWrite),
             _ => Err(DbError::WalUnknownEntryType { byte }),
         }
     }
@@ -356,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_entry_type_roundtrip() {
-        for byte in [1u8, 2, 3, 4, 5, 6, 7] {
+        for byte in [1u8, 2, 3, 4, 5, 6, 7, 8] {
             let et = EntryType::try_from(byte).unwrap();
             assert_eq!(et as u8, byte);
         }
