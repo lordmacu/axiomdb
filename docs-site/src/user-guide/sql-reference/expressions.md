@@ -602,6 +602,54 @@ WHERE status != 'cancelled';
 
 ---
 
+## BLOB / Binary Functions
+
+AxiomDB stores binary data as the `BLOB` / `BYTES` type and provides functions for
+encoding, decoding, and measuring binary values.
+
+| Function | Returns | Description |
+|---|---|---|
+| `FROM_BASE64(text)` | `BLOB` | Decode standard base64 → raw bytes. Returns `NULL` on invalid input. |
+| `TO_BASE64(blob)` | `TEXT` | Encode raw bytes → base64 string. Also accepts `TEXT` and `UUID`. |
+| `OCTET_LENGTH(value)` | `INT` | Byte length of a `BLOB`, `TEXT` (UTF-8 bytes), or `UUID` (always 16). |
+| `ENCODE(blob, fmt)` | `TEXT` | Encode bytes as `'base64'` or `'hex'`. |
+| `DECODE(text, fmt)` | `BLOB` | Decode `'base64'` or `'hex'` text → raw bytes. |
+
+### Usage examples
+
+```sql
+-- Store binary data encoded as base64
+INSERT INTO files (name, data)
+VALUES ('logo.png', FROM_BASE64('iVBORw0KGgoAAAANSUhEUgAA...'));
+
+-- Retrieve as base64 for transport
+SELECT name, TO_BASE64(data) AS data_b64 FROM files;
+
+-- Check byte size of a blob
+SELECT name, OCTET_LENGTH(data) AS size_bytes FROM files;
+
+-- Hex encoding (PostgreSQL / MySQL ENCODE style)
+SELECT ENCODE(data, 'hex') FROM files;          -- → 'deadbeef...'
+SELECT DECODE('deadbeef', 'hex');               -- → binary bytes
+
+-- OCTET_LENGTH vs LENGTH for text
+SELECT LENGTH('héllo');       -- 5 (characters)
+SELECT OCTET_LENGTH('héllo'); -- 6 (UTF-8 bytes: é = 2 bytes)
+```
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Tip — Base64 for JSON APIs</span>
+When returning binary data through a JSON API, wrap the column with
+<code>TO_BASE64(data)</code> to get a transport-safe string. The client reverses it
+with <code>FROM_BASE64()</code> on INSERT. This pattern avoids binary encoding
+issues in MySQL wire protocol text mode.
+</div>
+</div>
+
+---
+
 ## UUID Functions
 
 AxiomDB generates and validates UUIDs server-side. No application-level library
