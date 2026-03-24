@@ -108,21 +108,17 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
         //   seq=4: Server → OK_Packet
         let _ = verify_sha256_password(&challenge, &response.auth_response);
 
+        // Send AuthMoreData(0x03) = fast_auth_success.
+        // Then send OK immediately at seq=3 — pymysql reads it directly
+        // without sending an ack first. The previous ack-read caused a
+        // deadlock: server waited for ack, pymysql waited for OK.
         let more_data = build_auth_more_data(0x03);
         if writer.send((2u8, more_data.as_slice())).await.is_err() {
             return;
         }
 
-        // Read the client's confirmation ack (empty packet at seq=3).
-        // Without consuming this packet, the command loop would see it as
-        // a command and immediately close the connection.
-        match reader.next().await {
-            Some(Ok(_)) => {} // ack consumed, continue
-            _ => return,      // client disconnected
-        }
-
         let ok = build_ok_packet(0, 0, 0);
-        if writer.send((4u8, ok.as_slice())).await.is_err() {
+        if writer.send((3u8, ok.as_slice())).await.is_err() {
             return;
         }
     } else {
