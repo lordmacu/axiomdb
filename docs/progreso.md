@@ -143,7 +143,7 @@
 - [x] 4.13 ✅ version() / current_user / session_user / current_database() — ORMs call these on connect; required for Phase 5 compatibility
 - [x] 4.14 ✅ LAST_INSERT_ID() / lastval() — AUTO_INCREMENT execution + per-table thread-local sequence; ColumnDef.auto_increment flag (bit1 of existing flags byte); LAST_INSERT_ID()/lastval() in eval_function
 - [x] 4.19 ✅ Basic built-in functions — `ABS`, `LENGTH`, `SUBSTR`, `UPPER`, `LOWER`, `TRIM`, `COALESCE`, `NOW()`, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `ROUND`, `FLOOR`, `CEIL`
-- [ ] 4.19b ⏳ BLOB functions — `FROM_BASE64(text)→BLOB` auto-decodes Base64 on insert (eliminates 33% overhead); `TO_BASE64(blob)→TEXT`; `OCTET_LENGTH(blob)→INT`; `ENCODE(blob,'hex'/'base64')→TEXT`; `DECODE(text,'hex'/'base64')→BLOB`; foundation for content-addressed storage in Phase 14
+- [x] 4.19b ✅ BLOB functions — `FROM_BASE64(text)→BLOB`, `TO_BASE64(blob)→TEXT`, `OCTET_LENGTH(value)→INT`, `ENCODE(blob,'base64'/'hex')→TEXT`, `DECODE(text,'base64'/'hex')→BLOB`; b64_encode/b64_decode/hex_encode/hex_decode helpers inline (no external crate)
 - [x] 4.19c ✅ UUID generation functions — `gen_random_uuid()`/`uuid_generate_v4()` (UUID v4 random); `uuid_generate_v7()`/`uuid7()` (UUID v7 time-ordered, better B+Tree locality); `is_valid_uuid(text)→BOOL`; `parse_uuid_str` helper; rand crate added to axiomdb-sql
 
 <!-- ── Group G — DevEx (parallel with E+F) ── -->
