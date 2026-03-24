@@ -23,17 +23,13 @@ jobs:
             artifact: axiomdb-server-linux-x86_64
             use_zigbuild: true
 
-          # macOS — Apple Silicon (native)
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-            artifact: axiomdb-server-macos-aarch64
-            use_zigbuild: false
-
-          # macOS — Intel (cross-compiled from arm64, Xcode SDK included)
-          - target: x86_64-apple-darwin
-            runner: macos-latest
-            artifact: axiomdb-server-macos-x86_64
-            use_zigbuild: false
+          # macOS builds disabled — re-enable when approaching stable release
+          # - target: aarch64-apple-darwin
+          #   runner: macos-latest
+          #   artifact: axiomdb-server-macos-aarch64
+          # - target: x86_64-apple-darwin
+          #   runner: macos-latest
+          #   artifact: axiomdb-server-macos-x86_64
 
     steps:
       - uses: actions/checkout@v4
@@ -89,9 +85,10 @@ jobs:
           - os: ubuntu-latest
             artifact: libaxiomdb_embedded-linux-x86_64
             lib: target/release/libaxiomdb_embedded.a
-          - os: macos-latest
-            artifact: libaxiomdb_embedded-macos
-            lib: target/release/libaxiomdb_embedded.a
+          # macOS disabled — re-enable when approaching stable release
+          # - os: macos-latest
+          #   artifact: libaxiomdb_embedded-macos
+          #   lib: target/release/libaxiomdb_embedded.a
 
     steps:
       - uses: actions/checkout@v4
