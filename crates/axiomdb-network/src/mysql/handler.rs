@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, info, warn};
 
-use axiomdb_sql::{ast::Stmt, result::ColumnMeta, SessionContext};
+use axiomdb_sql::{ast::Stmt, result::ColumnMeta, SchemaCache, SessionContext};
 use axiomdb_types::DataType;
 
 use super::{
@@ -134,6 +134,10 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
 
     // ── Phase 4: Command loop ─────────────────────────────────────────────────
     let mut session = SessionContext::new();
+    // Per-connection schema cache — avoids repeated catalog heap scans for the
+    // same table across queries. Warm on second query to the same table.
+    // Automatically invalidated by analyze_cached() on DDL statements.
+    let mut schema_cache = SchemaCache::new();
     let mut conn_state = ConnectionState::new();
 
     // Populate initial current_database from handshake (if client sent one).
@@ -202,7 +206,7 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 // Execute via the engine.
                 let result = {
                     let mut guard = db.lock().await;
-                    guard.execute_query(sql, &mut session)
+                    guard.execute_query(sql, &mut session, &mut schema_cache)
                 };
 
                 match result {
@@ -315,7 +319,11 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                                     Ok(final_sql) => {
                                         debug!(conn_id, sql = %final_sql, "COM_STMT_EXECUTE (no cache)");
                                         let mut guard = db.lock().await;
-                                        guard.execute_query(&final_sql, &mut session)
+                                        guard.execute_query(
+                                            &final_sql,
+                                            &mut session,
+                                            &mut schema_cache,
+                                        )
                                     }
                                     Err(e) => Err(e),
                                 }
