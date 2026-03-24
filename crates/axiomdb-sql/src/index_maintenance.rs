@@ -100,14 +100,13 @@ pub fn insert_into_indexes(
 
         // Uniqueness check.
         if idx.is_unique && BTree::lookup_in(storage, idx.root_page_id, &key)?.is_some() {
-            let col_name = idx
-                .columns
-                .first()
-                .map(|c| format!("col_idx={}", c.col_idx))
-                .unwrap_or_default();
+            // Use the index name as the key identifier (most readable without a
+            // catalog read) and the duplicate value as the column field.
+            // Message: "unique key violation on uq_email.alice@x.com"
+            let dup_val = key_vals.first().map(|v| format!("{v}")).unwrap_or_default();
             return Err(DbError::UniqueViolation {
-                table: format!("index_id={}", idx.index_id),
-                column: col_name,
+                table: idx.name.clone(),
+                column: dup_val,
             });
         }
 
