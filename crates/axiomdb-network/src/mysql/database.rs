@@ -8,7 +8,9 @@ use std::path::Path;
 
 use axiomdb_catalog::bootstrap::CatalogBootstrap;
 use axiomdb_core::error::DbError;
-use axiomdb_sql::{analyze, execute_with_ctx, parse, result::QueryResult, SessionContext};
+use axiomdb_sql::{
+    analyze_cached, execute_with_ctx, parse, result::QueryResult, SchemaCache, SessionContext,
+};
 use axiomdb_storage::MmapStorage;
 use axiomdb_wal::TxnManager;
 
@@ -42,7 +44,12 @@ impl Database {
     }
 
     /// Executes a SQL string through the full pipeline:
-    /// `parse → analyze → execute_with_ctx`.
+    /// `parse → analyze_cached → execute_with_ctx`.
+    ///
+    /// The `schema_cache` is per-connection and avoids repeating catalog heap
+    /// scans for the same table across queries. DDL automatically invalidates
+    /// it via `analyze_cached` (which calls `SchemaCache::invalidate()` on
+    /// CREATE TABLE / DROP TABLE / ALTER TABLE).
     ///
     /// Uses `autocommit` semantics: each statement is wrapped in BEGIN/COMMIT
     /// unless an explicit transaction is already active.
@@ -50,13 +57,14 @@ impl Database {
         &mut self,
         sql: &str,
         session: &mut SessionContext,
+        schema_cache: &mut SchemaCache,
     ) -> Result<QueryResult, DbError> {
         let stmt = parse(sql, None)?;
         let snap = self
             .txn
             .active_snapshot()
             .unwrap_or_else(|_| self.txn.snapshot());
-        let analyzed = analyze(stmt, &self.storage, snap)?;
+        let analyzed = analyze_cached(stmt, &self.storage, snap, schema_cache)?;
         execute_with_ctx(analyzed, &mut self.storage, &mut self.txn, session)
     }
 
