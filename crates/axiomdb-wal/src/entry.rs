@@ -140,6 +140,49 @@ impl WalEntry {
         MIN_ENTRY_LEN + self.key.len() + self.old_value.len() + self.new_value.len()
     }
 
+    /// Serializes this entry **directly into** an existing `Vec<u8>` without
+    /// creating an intermediate allocation.
+    ///
+    /// This is the batch-write counterpart of [`to_bytes`]. Call this in a
+    /// loop for all entries in a transaction, then write the accumulated buffer
+    /// to the WAL file in a single `write_all()`. This follows the same
+    /// strategy LMDB uses: accumulate all dirty-page writes, then flush once.
+    ///
+    /// The `lsn` argument must be the LSN already assigned to this entry.
+    pub fn serialize_into(&self, buf: &mut Vec<u8>) {
+        let start = buf.len();
+        let total = self.serialized_len();
+        buf.reserve(total);
+
+        // ── Fixed header ──────────────────────────────────────────────────────
+        buf.extend_from_slice(&(total as u32).to_le_bytes()); // entry_len
+        buf.extend_from_slice(&self.lsn.to_le_bytes()); // lsn
+        buf.extend_from_slice(&self.txn_id.to_le_bytes()); // txn_id
+        buf.push(self.entry_type as u8); // entry_type
+        buf.extend_from_slice(&self.table_id.to_le_bytes()); // table_id
+        buf.extend_from_slice(&(self.key.len() as u16).to_le_bytes()); // key_len
+
+        // ── Variable payload ──────────────────────────────────────────────────
+        buf.extend_from_slice(&self.key);
+        buf.extend_from_slice(&(self.old_value.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.old_value);
+        buf.extend_from_slice(&(self.new_value.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.new_value);
+
+        // ── CRC32c over all bytes written in this entry ───────────────────────
+        let crc = crc32c::crc32c(&buf[start..]);
+        buf.extend_from_slice(&crc.to_le_bytes());
+
+        // ── Trailer for backward scan ─────────────────────────────────────────
+        buf.extend_from_slice(&(total as u32).to_le_bytes()); // entry_len_2
+
+        debug_assert_eq!(
+            buf.len() - start,
+            total,
+            "serialize_into: serialized_len() mismatch"
+        );
+    }
+
     /// Serializes the entry to binary format ready to write to the WAL file.
     ///
     /// The result includes `entry_len`, all fields, `crc32c`, and `entry_len_2`.

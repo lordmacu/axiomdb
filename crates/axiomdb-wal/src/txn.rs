@@ -68,6 +68,13 @@ pub struct TxnManager {
     next_txn_id: u64,
     max_committed: u64,
     active: Option<ActiveTxn>,
+    /// Reusable scratch buffer for WAL entry serialization.
+    ///
+    /// Passed to `WalWriter::append_with_buf()` to avoid a fresh Vec allocation
+    /// per DML operation. Capacity grows to the largest entry seen and is
+    /// retained across operations — inspired by LMDB's approach of reusing
+    /// a single write buffer for all modifications in a batch.
+    wal_scratch: Vec<u8>,
 }
 
 impl TxnManager {
@@ -83,6 +90,7 @@ impl TxnManager {
             next_txn_id: 1,
             max_committed: 0,
             active: None,
+            wal_scratch: Vec::with_capacity(256),
         })
     }
 
@@ -99,6 +107,7 @@ impl TxnManager {
             next_txn_id: max_committed + 1,
             max_committed,
             active: None,
+            wal_scratch: Vec::with_capacity(256),
         })
     }
 
@@ -240,7 +249,8 @@ impl TxnManager {
             vec![],
             new_value,
         );
-        self.wal.append(&mut entry)?;
+        self.wal
+            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
         active
             .undo_ops
             .push(UndoOp::UndoInsert { page_id, slot_id });
@@ -278,7 +288,8 @@ impl TxnManager {
             ov,
             vec![],
         );
-        self.wal.append(&mut entry)?;
+        self.wal
+            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
         active
             .undo_ops
             .push(UndoOp::UndoDelete { page_id, slot_id });
@@ -314,7 +325,8 @@ impl TxnManager {
         nv.extend_from_slice(new_value);
 
         let mut entry = WalEntry::new(0, txn_id, EntryType::Update, table_id, key.to_vec(), ov, nv);
-        self.wal.append(&mut entry)?;
+        self.wal
+            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
         // Push in chronological order; on rollback they are reversed:
         // UndoDelete(old_slot) runs first (restores old row), then
         // UndoInsert(new_slot) kills the replacement.
@@ -465,6 +477,7 @@ impl TxnManager {
             next_txn_id: result.max_committed + 1,
             max_committed: result.max_committed,
             active: None,
+            wal_scratch: Vec::with_capacity(256),
         };
         Ok((mgr, result))
     }

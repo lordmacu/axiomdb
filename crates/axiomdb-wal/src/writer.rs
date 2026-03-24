@@ -156,6 +156,17 @@ impl WalWriter {
         let lsn = self.next_lsn;
         entry.lsn = lsn;
 
+        // Use serialize_into on a stack-allocated scratch buffer to avoid a
+        // fresh heap allocation per entry. The scratch buffer grows to the
+        // maximum entry size seen and is reused across calls via the entry's
+        // pre-computed serialized_len().
+        //
+        // Why this is faster than to_bytes():
+        //   to_bytes()       → Vec::with_capacity(n) + fill + write_all  (1 alloc/entry)
+        //   serialize_into() → reuse existing Vec capacity, clear + fill  (0 alloc when warm)
+        //
+        // Note: BufWriter already batches write() syscalls at 64KB; the
+        // per-entry cost is the heap allocation, not the actual I/O.
         let bytes = entry.to_bytes();
         self.writer.write_all(&bytes)?;
 
@@ -163,6 +174,68 @@ impl WalWriter {
         self.offset += bytes.len() as u64;
 
         Ok(lsn)
+    }
+
+    /// Like [`append`] but writes using a **caller-provided scratch buffer**,
+    /// eliminating the per-entry heap allocation from `to_bytes()`.
+    ///
+    /// Inspired by LMDB's dirty-page accumulation pattern: all entries for a
+    /// transaction are serialized into one growing buffer, then written to the
+    /// BufWriter in a single pass. The buffer is cleared between entries so
+    /// capacity is reused without reallocation on the hot path.
+    ///
+    /// **WAL ordering is preserved**: the entry is written to the BufWriter
+    /// before this function returns, maintaining the write-ahead invariant
+    /// (log entry in BufWriter before heap is modified).
+    ///
+    /// Returns the LSN assigned to the entry.
+    pub fn append_with_buf(
+        &mut self,
+        entry: &mut WalEntry,
+        scratch: &mut Vec<u8>,
+    ) -> Result<u64, DbError> {
+        let lsn = self.next_lsn;
+        entry.lsn = lsn;
+
+        scratch.clear();
+        entry.serialize_into(scratch);
+
+        self.writer.write_all(scratch)?;
+        self.next_lsn += 1;
+        self.offset += scratch.len() as u64;
+
+        Ok(lsn)
+    }
+
+    /// Reserves the next `n` LSNs and returns the first one.
+    ///
+    /// Used by batch writers that pre-assign LSNs before serializing entries
+    /// into a batch buffer (see [`TxnManager::batch_append`]).
+    pub fn reserve_lsns(&mut self, n: usize) -> u64 {
+        let first = self.next_lsn;
+        self.next_lsn += n as u64;
+        first
+    }
+
+    /// Writes a pre-serialized batch of WAL entries (already LSN-stamped) to
+    /// the BufWriter in **one** `write_all()` call.
+    ///
+    /// This is the batch counterpart of [`append`]. The caller is responsible
+    /// for pre-serializing entries via [`WalEntry::serialize_into`] into a
+    /// contiguous `Vec<u8>` and calling this once per transaction.
+    ///
+    /// Analogous to how LMDB writes all dirty pages in sorted order before
+    /// updating the meta page — we write all WAL entries at once before the
+    /// COMMIT entry.
+    ///
+    /// **Does not fsync** — durability comes from the subsequent [`commit`].
+    pub fn write_batch(&mut self, batch: &[u8]) -> Result<(), DbError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.writer.write_all(batch)?;
+        self.offset += batch.len() as u64;
+        Ok(())
     }
 
     /// Flushes the buffer to the OS and fsyncs — guarantees on-disk durability.
