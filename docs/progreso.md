@@ -147,7 +147,7 @@
 - [x] 4.19c ✅ UUID generation functions — `gen_random_uuid()`/`uuid_generate_v4()` (UUID v4 random); `uuid_generate_v7()`/`uuid7()` (UUID v7 time-ordered, better B+Tree locality); `is_valid_uuid(text)→BOOL`; `parse_uuid_str` helper; rand crate added to axiomdb-sql
 
 <!-- ── Group G — DevEx (parallel with E+F) ── -->
-- [ ] 4.15 ⏳ Interactive CLI — REPL like `sqlite3` shell; connects directly to storage
+- [x] 4.15 ✅ Interactive CLI — axiomdb-cli REPL: multi-line SQL, ASCII table formatter, .tables/.schema/.quit/.open/.help dot commands, TTY detection (no prompt in pipe mode), timing per query, pipe/script mode; new crate axiomdb-cli
 - [ ] 4.15b ⏳ DEBUG/VERBOSE mode — `--verbose` flag: log AST, chosen plan, execution stats per query; critical for Phases 4–10 development
 
 <!-- ── Group H — Introspection + DDL modification (needs executor) ── -->

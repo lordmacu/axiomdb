@@ -19,6 +19,7 @@ members = [
     "crates/axiomdb-vector",
     "crates/axiomdb-migrations",
     "crates/axiomdb-server",
+    "crates/axiomdb-cli",
     "crates/axiomdb-embedded",
     "benches/comparison/axiomdb_bench",
 ]

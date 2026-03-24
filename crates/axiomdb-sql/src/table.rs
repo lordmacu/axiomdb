@@ -46,11 +46,9 @@
 //! new slots are on the same page, which is not guaranteed when the old page is
 //! full and the chain must grow.
 
-use std::collections::HashMap;
-
 use axiomdb_catalog::schema::{ColumnDef, ColumnType, TableDef};
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
-use axiomdb_storage::{HeapChain, StorageEngine, PAGE_SIZE};
+use axiomdb_storage::{HeapChain, StorageEngine};
 use axiomdb_types::{
     codec::{decode_row, decode_row_masked, encode_row},
     coerce::{coerce, CoercionMode},
@@ -76,10 +74,11 @@ impl TableEngine {
     ///
     /// `columns` must be sorted ascending by `col_idx` (catalog declaration order).
     ///
+    /// Scans all visible rows in the table and decodes them.
+    ///
     /// # Errors
     /// - [`DbError::ParseError`] — a stored row is structurally invalid (corruption).
     /// - I/O errors from storage reads.
-    /// Scans all visible rows in the table and decodes them.
     ///
     /// `column_mask` controls which columns are decoded:
     /// - `None` — decode all columns (default, same as before).
