@@ -17,8 +17,9 @@ pub use dirty::PageDirtyTracker;
 pub use engine::StorageEngine;
 pub use freelist::FreeList;
 pub use heap::{
-    clear_deletion, delete_tuple, free_space, insert_tuple, mark_slot_dead, read_tuple,
-    scan_visible, update_tuple, RowHeader, SlotEntry, MAX_TUPLE_DATA, MIN_TUPLE_OVERHEAD,
+    clear_deletion, delete_tuple, free_space, insert_tuple, mark_slot_dead, num_slots, read_tuple,
+    read_tuple_header, scan_visible, update_tuple, RowHeader, SlotEntry, MAX_TUPLE_DATA,
+    MIN_TUPLE_OVERHEAD,
 };
 pub use heap_chain::{chain_next_page, chain_set_next_page, HeapChain};
 pub use integrity::{IntegrityChecker, IntegrityReport, IntegrityViolation, Severity};
@@ -31,4 +32,4 @@ pub use meta::{
     NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
 };
 pub use mmap::MmapStorage;
-pub use page::{Page, PageType, HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE};
+pub use page::{Page, PageType, HEADER_SIZE, PAGE_FLAG_ALL_VISIBLE, PAGE_MAGIC, PAGE_SIZE};

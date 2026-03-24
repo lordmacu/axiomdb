@@ -41,10 +41,25 @@ def reset(cur, conn):
     cur.execute(DDL_CREATE)
     conn.commit()
 
+def truncate(conn):
+    """O(1) table reset — used as setup outside INSERT timing."""
+    cur = conn.cursor()
+    cur.execute("TRUNCATE TABLE bench_users")
+    conn.commit(); cur.close()
+
 def measure(fn):
     for _ in range(WARMUP): fn()
     t = []
     for _ in range(RUNS):
+        t0 = time.perf_counter(); fn(); t.append(time.perf_counter()-t0)
+    return statistics.mean(t)
+
+def measure_with_setup(setup_fn, fn):
+    """Run setup_fn before each iteration (warmup + timed), measure only fn()."""
+    for _ in range(WARMUP): setup_fn(); fn()
+    t = []
+    for _ in range(RUNS):
+        setup_fn()
         t0 = time.perf_counter(); fn(); t.append(time.perf_counter()-t0)
     return statistics.mean(t)
 
@@ -57,14 +72,14 @@ def out(scenario, rows_n, mean_s, note=""):
 # ── Scenarios ─────────────────────────────────────────────────────────────────
 
 def s_insert_batch(conn, data):
+    """Only INSERT — reset/TRUNCATE happens outside measure via measure_with_setup."""
     cur = conn.cursor()
-    reset(cur, conn)                    # DROP+CREATE, not DELETE
     cur.executemany("INSERT INTO bench_users VALUES (%s,%s,%s,%s,%s,%s)", data)
     conn.commit(); cur.close()
 
 def s_insert_autocommit(conn, data):
+    """Only INSERT — reset/TRUNCATE happens outside measure via measure_with_setup."""
     cur = conn.cursor()
-    reset(cur, conn)
     for row in data:
         cur.execute("INSERT INTO bench_users VALUES (%s,%s,%s,%s,%s,%s)", row)
         conn.commit()
@@ -106,12 +121,46 @@ def run(scenario, n_rows):
     ac   = data[:min(n_rows, 300)]
 
     if scenario == "insert_batch":
-        mean = measure(lambda: s_insert_batch(conn, data))
-        out(scenario, n_rows, mean)
+        # TRUNCATE outside timing — measures INSERT only (fair comparison)
+        mean = measure_with_setup(lambda: truncate(conn),
+                                  lambda: s_insert_batch(conn, data))
+        out(scenario, n_rows, mean, "TRUNCATE outside timing")
 
     elif scenario == "insert_autocommit":
-        mean = measure(lambda: s_insert_autocommit(conn, ac))
-        out(scenario, len(ac), mean)
+        mean = measure_with_setup(lambda: truncate(conn),
+                                  lambda: s_insert_autocommit(conn, ac))
+        out(scenario, len(ac), mean, "TRUNCATE outside timing")
+
+    elif scenario == "crud_flow":
+        # Full cycle: INSERT → SELECT * → DELETE, measured separately per phase.
+        # Each iteration resets (TRUNCATE-equivalent via DROP+CREATE) outside timing.
+        ins_t, sel_t, del_t = [], [], []
+        for i in range(WARMUP + RUNS):
+            cur2 = conn.cursor(); reset(cur2, conn); cur2.close()
+            # INSERT
+            cur2 = conn.cursor()
+            t0 = time.perf_counter()
+            cur2.executemany("INSERT INTO bench_users VALUES (%s,%s,%s,%s,%s,%s)", data)
+            conn.commit()
+            t_ins = time.perf_counter() - t0
+            cur2.close()
+            # SELECT *
+            cur2 = conn.cursor()
+            t0 = time.perf_counter()
+            cur2.execute("SELECT * FROM bench_users"); cur2.fetchall()
+            t_sel = time.perf_counter() - t0
+            cur2.close()
+            # DELETE
+            cur2 = conn.cursor()
+            t0 = time.perf_counter()
+            cur2.execute("DELETE FROM bench_users"); conn.commit()
+            t_del = time.perf_counter() - t0
+            cur2.close()
+            if i >= WARMUP:
+                ins_t.append(t_ins); sel_t.append(t_sel); del_t.append(t_del)
+        out("crud_flow/insert", n_rows, statistics.mean(ins_t))
+        out("crud_flow/select", n_rows, statistics.mean(sel_t))
+        out("crud_flow/delete", n_rows, statistics.mean(del_t))
 
     else:
         # Pre-load data for read benchmarks

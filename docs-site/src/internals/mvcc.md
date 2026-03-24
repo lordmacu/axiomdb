@@ -67,6 +67,29 @@ UPDATE in txn T2 (implemented as DELETE + INSERT):
     New version: RowHeader { xmin: T2, xmax: 0,  deleted: 0 }
 ```
 
+### Batch DELETE and Full-Table DELETE
+
+When a DELETE has a WHERE clause, `TableEngine::delete_rows_batch()` collects all
+matching `(page_id, slot_id)` pairs and calls `HeapChain::delete_batch()` with them.
+Each affected slot receives `xmax = txn_id` and `deleted = 1` in a single pass per
+page. The WAL receives one `WalEntry::Delete` per matched row (for correct per-row
+redo/undo).
+
+When a DELETE has **no** WHERE clause or is a `TRUNCATE TABLE`, the executor takes a
+different path:
+
+1. `HeapChain::scan_rids_visible()` collects live `(page_id, slot_id)` pairs without
+   decoding row data.
+2. `HeapChain::delete_batch()` marks all slots dead in O(P) page I/O.
+3. A **single** `WalEntry::Truncate` is appended to the WAL instead of N per-row
+   Delete entries.
+
+The MVCC visibility result is identical to the per-row path: every slot has
+`xmax = txn_id` and `deleted = 1`, so any snapshot with `xmax ≤ txn_id` will see
+the row as deleted after the transaction commits. Concurrent readers that took their
+snapshot before this transaction began continue to see all rows as live throughout
+the delete — standard snapshot isolation.
+
 ---
 
 ## Visibility Function
