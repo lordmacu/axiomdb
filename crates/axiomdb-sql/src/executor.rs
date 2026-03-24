@@ -851,9 +851,15 @@ fn execute_update_ctx(
         .collect::<Result<_, DbError>>()?;
 
     let snap = txn.active_snapshot()?;
+    // UPDATE always needs all columns: unchanged columns carry over as-is to
+    // the new row. Lazy decode (column_mask) does not help here.
     let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?;
 
-    let mut count = 0u64;
+    // Collect all matching (rid, new_values) pairs before touching the heap.
+    // Inspired by OceanBase ObDASUpdIterator: accumulate (old, new) pairs,
+    // then flush as one delete_batch + insert_batch pass — O(P) page I/O
+    // instead of O(3N) for N per-row update_row() calls.
+    let mut to_update: Vec<(RecordId, Vec<Value>)> = Vec::new();
     for (rid, current_values) in rows {
         if let Some(ref wc) = stmt.where_clause {
             if !is_truthy(&eval(wc, &current_values)?) {
@@ -864,8 +870,22 @@ fn execute_update_ctx(
         for (col_pos, val_expr) in &assignments {
             new_values[*col_pos] = eval(val_expr, &current_values)?;
         }
-        TableEngine::update_row(storage, txn, &resolved.def, &schema_cols, rid, new_values)?;
-        count += 1;
+        to_update.push((rid, new_values));
+    }
+
+    let count = to_update.len() as u64;
+
+    match to_update.len() {
+        0 => {}
+        1 => {
+            // Single-row path: avoid Vec allocation overhead of batch.
+            let (rid, new_values) = to_update.pop().unwrap();
+            TableEngine::update_row(storage, txn, &resolved.def, &schema_cols, rid, new_values)?;
+        }
+        _ => {
+            // Multi-row batch: delete_batch + insert_batch — O(P) page I/O.
+            TableEngine::update_rows_batch(storage, txn, &resolved.def, &schema_cols, to_update)?;
+        }
     }
 
     Ok(QueryResult::Affected {

@@ -29,6 +29,7 @@ use axiomdb_types::DataType;
 
 use super::database::CommitRx;
 
+use super::result::serialize_query_result_multi;
 use super::{
     auth::{gen_challenge, is_allowed_user, verify_native_password, verify_sha256_password},
     codec::MySqlCodec,
@@ -217,40 +218,72 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     continue;
                 }
 
-                // Execute via the engine.
-                // The Database lock is released BEFORE awaiting fsync confirmation
-                // so that other connections can proceed while this one waits.
-                let exec_result = {
-                    let mut guard = db.lock().await;
-                    guard.execute_query(sql, &mut session, &mut schema_cache)
-                }; // lock released here
+                // Split on ';' to support multi-statement COM_QUERY (Phase 5.12).
+                // Each non-empty statement is executed and its result set sent
+                // with SERVER_MORE_RESULTS_EXISTS in the final EOF/OK, except the
+                // last statement which uses normal status flags.
+                let stmts: Vec<&str> = split_sql_statements(sql);
+                let stmt_count = stmts.len();
+                let mut seq: u8 = 1;
+                let mut connection_broken = false;
 
-                match exec_result {
-                    Ok((qr, commit_rx)) => {
-                        // Await fsync confirmation outside the lock (group commit).
-                        // No-op when commit_rx is None (disabled or read-only).
-                        if let Err(e) = await_commit_rx(commit_rx).await {
-                            let me = dberror_to_mysql(&e);
-                            debug!(conn_id, code = me.code, msg = %me.message, "commit error");
-                            let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
-                            if writer.send((1u8, pkt.as_slice())).await.is_err() {
-                                break;
-                            }
-                            continue;
-                        }
-                        let packets = serialize_query_result(qr, 1);
+                'stmts: for (idx, stmt_sql) in stmts.into_iter().enumerate() {
+                    let is_last = idx == stmt_count - 1;
+
+                    if let Some(packets) = intercept_special_query(stmt_sql, &mut conn_state) {
                         if send_packets(&mut writer, &packets).await.is_err() {
-                            break;
+                            connection_broken = true;
+                            break 'stmts;
+                        }
+                        if !packets.is_empty() {
+                            seq = packets
+                                .last()
+                                .map(|(s, _)| s.wrapping_add(1))
+                                .unwrap_or(seq);
+                        }
+                        continue 'stmts;
+                    }
+
+                    let exec_result = {
+                        let mut guard = db.lock().await;
+                        guard.execute_query(stmt_sql, &mut session, &mut schema_cache)
+                    };
+
+                    match exec_result {
+                        Ok((qr, commit_rx)) => {
+                            if let Err(e) = await_commit_rx(commit_rx).await {
+                                let me = dberror_to_mysql(&e);
+                                debug!(conn_id, code = me.code, msg = %me.message, "commit error");
+                                let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
+                                if writer.send((seq, pkt.as_slice())).await.is_err() {
+                                    connection_broken = true;
+                                }
+                                break 'stmts;
+                            }
+                            let packets = serialize_query_result_multi(qr, seq, !is_last);
+                            seq = packets
+                                .last()
+                                .map(|(s, _)| s.wrapping_add(1))
+                                .unwrap_or(seq);
+                            if send_packets(&mut writer, &packets).await.is_err() {
+                                connection_broken = true;
+                                break 'stmts;
+                            }
+                        }
+                        Err(e) => {
+                            let me = dberror_to_mysql(&e);
+                            debug!(conn_id, code = me.code, msg = %me.message, "query error");
+                            let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
+                            if writer.send((seq, pkt.as_slice())).await.is_err() {
+                                connection_broken = true;
+                            }
+                            break 'stmts;
                         }
                     }
-                    Err(e) => {
-                        let me = dberror_to_mysql(&e);
-                        debug!(conn_id, code = me.code, msg = %me.message, "query error");
-                        let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
-                        if writer.send((1u8, pkt.as_slice())).await.is_err() {
-                            break;
-                        }
-                    }
+                }
+
+                if connection_broken {
+                    break;
                 }
             }
 
@@ -468,6 +501,68 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
     }
 
     info!(conn_id, "connection closed");
+}
+
+// ── Multi-statement SQL splitter ─────────────────────────────────────────────
+
+/// Splits a SQL string on `;` delimiters, returning non-empty trimmed statements.
+///
+/// Respects single-quoted string literals: a `;` inside `'...'` is not treated
+/// as a statement separator. Backslash-escaped quotes `\'` inside strings are
+/// handled correctly.
+///
+/// Strips a trailing `;` on the last statement (common in SQL scripts).
+/// Returns `[sql]` unchanged if there is only one statement.
+fn split_sql_statements(sql: &str) -> Vec<&str> {
+    let mut stmts: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut in_string = false;
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_string => {
+                in_string = true;
+                i += 1;
+            }
+            b'\'' if in_string => {
+                // Handle escaped quote `''` (SQL standard) or `\'` (MySQL extension)
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2; // skip both quotes
+                } else {
+                    in_string = false;
+                    i += 1;
+                }
+            }
+            b'\\' if in_string => {
+                i += 2; // skip escaped character
+            }
+            b';' if !in_string => {
+                let stmt = sql[start..i].trim();
+                if !stmt.is_empty() {
+                    stmts.push(stmt);
+                }
+                start = i + 1;
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    // Remaining text after the last `;`
+    let tail = sql[start..].trim();
+    if !tail.is_empty() {
+        stmts.push(tail);
+    }
+
+    if stmts.is_empty() {
+        stmts.push(sql.trim());
+    }
+
+    stmts
 }
 
 // ── Group commit helper ───────────────────────────────────────────────────────

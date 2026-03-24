@@ -8,7 +8,17 @@
 use axiomdb_sql::result::{ColumnMeta, QueryResult, Row};
 use axiomdb_types::{DataType, Value};
 
-use super::packets::{build_eof_packet, build_ok_packet, write_lenenc_int, write_lenenc_str};
+use super::packets::{
+    build_eof_packet, build_eof_with_status, build_ok_packet, build_ok_with_status,
+    write_lenenc_int, write_lenenc_str,
+};
+
+/// MySQL `SERVER_MORE_RESULTS_EXISTS` status flag (0x0008).
+///
+/// Set in the final EOF/OK of every intermediate result set in a multi-statement
+/// response so the client knows to read the next result set (Phase 5.12).
+const SERVER_MORE_RESULTS_EXISTS: u16 = 0x0008;
+const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
 
 /// A sequence of `(sequence_id, payload)` packets ready to be sent.
 pub type PacketSeq = Vec<(u8, Vec<u8>)>;
@@ -17,23 +27,47 @@ pub type PacketSeq = Vec<(u8, Vec<u8>)>;
 ///
 /// `seq_start` is the sequence_id for the first response packet
 /// (usually 1, since the client's COM_QUERY was seq=0).
+///
+/// `more_results` sets `SERVER_MORE_RESULTS_EXISTS` in the final EOF/OK packet,
+/// telling the client that another result set follows (used by COM_QUERY
+/// multi-statement responses, Phase 5.12).
 pub fn serialize_query_result(result: QueryResult, seq_start: u8) -> PacketSeq {
+    serialize_query_result_multi(result, seq_start, false)
+}
+
+/// Like [`serialize_query_result`] but with explicit `more_results` flag.
+pub fn serialize_query_result_multi(
+    result: QueryResult,
+    seq_start: u8,
+    more_results: bool,
+) -> PacketSeq {
+    let status = if more_results {
+        SERVER_STATUS_AUTOCOMMIT | SERVER_MORE_RESULTS_EXISTS
+    } else {
+        SERVER_STATUS_AUTOCOMMIT
+    };
+
     match result {
-        QueryResult::Rows { columns, rows } => serialize_rows(&columns, &rows, seq_start),
+        QueryResult::Rows { columns, rows } => serialize_rows(&columns, &rows, seq_start, status),
         QueryResult::Affected {
             count,
             last_insert_id,
         } => {
             let last_id = last_insert_id.unwrap_or(0);
-            vec![(seq_start, build_ok_packet(count, last_id, 0))]
+            vec![(seq_start, build_ok_with_status(count, last_id, 0, status))]
         }
         QueryResult::Empty => {
-            vec![(seq_start, build_ok_packet(0, 0, 0))]
+            vec![(seq_start, build_ok_with_status(0, 0, 0, status))]
         }
     }
 }
 
-fn serialize_rows(cols: &[ColumnMeta], rows: &[Row], seq_start: u8) -> PacketSeq {
+fn serialize_rows(
+    cols: &[ColumnMeta],
+    rows: &[Row],
+    seq_start: u8,
+    final_status: u16,
+) -> PacketSeq {
     let mut packets = PacketSeq::new();
     let mut seq = seq_start;
 
@@ -49,7 +83,7 @@ fn serialize_rows(cols: &[ColumnMeta], rows: &[Row], seq_start: u8) -> PacketSeq
         seq += 1;
     }
 
-    // 3. EOF after column defs
+    // 3. EOF after column defs (always normal — MORE_RESULTS only on the last EOF)
     packets.push((seq, build_eof_packet()));
     seq += 1;
 
@@ -59,8 +93,8 @@ fn serialize_rows(cols: &[ColumnMeta], rows: &[Row], seq_start: u8) -> PacketSeq
         seq += 1;
     }
 
-    // 5. EOF after rows
-    packets.push((seq, build_eof_packet()));
+    // 5. Final EOF — carries MORE_RESULTS flag when there are more statements
+    packets.push((seq, build_eof_with_status(final_status)));
 
     packets
 }

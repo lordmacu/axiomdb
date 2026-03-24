@@ -193,10 +193,9 @@ impl CrashRecovery {
                 }
                 EntryType::Checkpoint => {} // no heap changes to undo
                 EntryType::PageWrite => {
-                    // new_value layout:
-                    //   [0..PAGE_SIZE]         post-modification page bytes (for future REDO)
-                    //   [PAGE_SIZE..+2]        num_slots as u16 LE
-                    //   [+2..+2+num_slots*2]   slot_id × num_slots as u16 LE
+                    // Compact new_value layout (no page bytes stored):
+                    //   [0..2]           num_slots as u16 LE
+                    //   [2..2+N*2]       slot_id × N as u16 LE each
                     //
                     // For an uncommitted PageWrite we undo at slot granularity:
                     // mark each embedded slot dead, identical to undoing N Insert entries.
@@ -209,13 +208,12 @@ impl CrashRecovery {
                             u64::from_le_bytes(entry.key[..8].try_into().unwrap_or([0u8; 8]));
 
                         let nv = &entry.new_value;
-                        if nv.len() < PAGE_SIZE + 2 {
+                        if nv.len() < 2 {
                             continue; // truncated entry — skip gracefully
                         }
-                        let num_slots =
-                            u16::from_le_bytes([nv[PAGE_SIZE], nv[PAGE_SIZE + 1]]) as usize;
+                        let num_slots = u16::from_le_bytes([nv[0], nv[1]]) as usize;
 
-                        let slots_bytes = &nv[PAGE_SIZE + 2..];
+                        let slots_bytes = &nv[2..];
                         for i in 0..num_slots {
                             let off = i * 2;
                             if off + 2 > slots_bytes.len() {
