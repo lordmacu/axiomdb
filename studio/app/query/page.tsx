@@ -1,7 +1,10 @@
 'use client'
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import dynamic from 'next/dynamic'
-import { Play, Zap, Download, AlertCircle, ChevronUp, ChevronDown, ChevronsUpDown, Check, X } from 'lucide-react'
+import {
+  Play, Zap, Download, AlertCircle, ChevronUp, ChevronDown,
+  ChevronsUpDown, Check, X, Clock, Trash2, Plus,
+} from 'lucide-react'
 import { generateUsers, generateOrders } from '@/lib/mock'
 import { cn } from '@/lib/utils'
 import {
@@ -37,6 +40,9 @@ users
   .sort(created_at.desc)
   .take(50)`
 
+const HISTORY_KEY = 'axiomstudio_history'
+const MAX_HISTORY = 20
+
 // ── SQL ↔ AxiomQL translator (mock/heuristic — real one arrives in Phase 36) ─
 
 function sqlToAxiomql(sql: string): string {
@@ -49,7 +55,7 @@ function sqlToAxiomql(sql: string): string {
     const whereM = s.match(/WHERE\s+(.+?)(?:GROUP BY|ORDER BY|LIMIT|HAVING|$)/i)
     if (whereM) {
       const w = whereM[1].trim()
-        .replace(/(\w+\.)(\w+)/g, '$2')            // strip aliases
+        .replace(/(\w+\.)(\w+)/g, '$2')
         .replace(/TRUE/gi, 'true').replace(/FALSE/gi, 'false')
         .replace(/AND/gi, ',').replace(/OR/gi, ' or ')
       lines.push(`  .filter(${w})`)
@@ -70,7 +76,7 @@ function sqlToAxiomql(sql: string): string {
     }
     const limitM = s.match(/LIMIT\s+(\d+)/i)
     if (limitM) lines.push(`  .take(${limitM[1]})`)
-    const selectM = s.match(/SELECT\s+(.+?)\s+FROM/is)
+    const selectM = s.match(/SELECT\s+([\s\S]+?)\s+FROM/i)
     if (selectM) {
       const cols = selectM[1].replace(/\s+/g, ' ').replace(/(\w+\.)(\w+)/g, '$2')
       if (!cols.trim().startsWith('*')) lines.push(`  .pick(${cols.trim()})`)
@@ -109,7 +115,72 @@ function axiomqlToSql(aql: string): string {
   } catch { return '-- Translation error' }
 }
 
+// ── CSV Export ────────────────────────────────────────────────────────────────
+
+function exportCsv(data: Record<string, unknown>[], filename = 'results.csv') {
+  if (!data.length) return
+  const headers = Object.keys(data[0])
+  const csv = [
+    headers.join(','),
+    ...data.map(row =>
+      headers.map(h => JSON.stringify(row[h] ?? '')).join(',')
+    ),
+  ].join('\n')
+  const blob = new Blob([csv], { type: 'text/csv' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+// ── History helpers ───────────────────────────────────────────────────────────
+
+type HistoryEntry = {
+  id: string
+  query: string
+  duration: number
+  rows: number
+  timestamp: string
+}
+
+function loadHistory(): HistoryEntry[] {
+  if (typeof window === 'undefined') return []
+  try {
+    return JSON.parse(localStorage.getItem(HISTORY_KEY) ?? '[]') as HistoryEntry[]
+  } catch { return [] }
+}
+
+function saveHistory(entries: HistoryEntry[]) {
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(entries.slice(0, MAX_HISTORY)))
+}
+
+// ── Tab types ─────────────────────────────────────────────────────────────────
+
 type QueryMode = 'sql' | 'axiomql'
+
+type QueryTab = {
+  id: string
+  title: string
+  sqlValue: string
+  axiomqlValue: string
+  results: Record<string, unknown>[] | null
+  duration: number | null
+}
+
+function makeTab(idx: number): QueryTab {
+  return {
+    id: crypto.randomUUID(),
+    title: `Query ${idx}`,
+    sqlValue: idx === 1 ? DEFAULT_SQL : `-- Query ${idx}\nSELECT * FROM users LIMIT 10`,
+    axiomqlValue: idx === 1 ? DEFAULT_AXIOMQL : `-- Query ${idx}\nusers\n  .take(10)`,
+    results: null,
+    duration: null,
+  }
+}
+
+// ── DataTable ─────────────────────────────────────────────────────────────────
 
 type EditCell = { rowIdx: number; col: string } | null
 
@@ -249,42 +320,186 @@ function DataTable({ data: initial, tableName = 'result' }: { data: Record<strin
   )
 }
 
-export default function QueryPage() {
-  const [mode, setMode] = useState<QueryMode>('sql')
-  const [sqlValue, setSqlValue] = useState(DEFAULT_SQL)
-  const [axiomqlValue, setAxiomqlValue] = useState(DEFAULT_AXIOMQL)
-  const [results, setResults] = useState<Record<string, unknown>[] | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [duration, setDuration] = useState<number | null>(null)
-  const [running, setRunning] = useState(false)
+// ── History panel ─────────────────────────────────────────────────────────────
 
-  const handleRun = async () => {
+function HistoryPanel({
+  onLoad,
+  onClose,
+}: {
+  onLoad: (entry: HistoryEntry) => void
+  onClose: () => void
+}) {
+  const [entries, setEntries] = useState<HistoryEntry[]>(() => loadHistory())
+
+  function clearAll() {
+    localStorage.removeItem(HISTORY_KEY)
+    setEntries([])
+  }
+
+  return (
+    <div className="absolute right-0 top-full mt-1 z-50 w-96 bg-surface border border-border rounded-lg shadow-xl overflow-hidden">
+      <div className="flex items-center justify-between px-3 py-2 border-b border-border">
+        <span className="text-xs font-semibold text-text-primary">Query History</span>
+        <div className="flex items-center gap-2">
+          {entries.length > 0 && (
+            <button onClick={clearAll}
+              className="text-[10px] text-error/70 hover:text-error transition-colors">
+              Clear all
+            </button>
+          )}
+          <button onClick={onClose} className="text-text-secondary hover:text-text-primary transition-colors">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+      <div className="max-h-80 overflow-y-auto">
+        {entries.length === 0 ? (
+          <div className="px-4 py-6 text-center text-xs text-text-secondary">No queries yet</div>
+        ) : (
+          entries.map(e => (
+            <button key={e.id} onClick={() => { onLoad(e); onClose() }}
+              className="w-full text-left px-3 py-2.5 border-b border-border/50 hover:bg-elevated transition-colors group">
+              <div className="font-mono text-[11px] text-text-primary truncate">{e.query.slice(0, 60)}{e.query.length > 60 ? '…' : ''}</div>
+              <div className="flex items-center gap-3 mt-1">
+                <span className="text-[10px] text-text-secondary font-mono">{e.timestamp}</span>
+                <span className="text-[10px] text-accent font-mono">{e.duration}ms</span>
+                <span className="text-[10px] text-text-secondary font-mono">{e.rows} rows</span>
+              </div>
+            </button>
+          ))
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Main page ─────────────────────────────────────────────────────────────────
+
+export default function QueryPage() {
+  const [tabs, setTabs] = useState<QueryTab[]>([makeTab(1)])
+  const [activeTabId, setActiveTabId] = useState<string>(() => tabs[0].id)
+  const [mode, setMode] = useState<QueryMode>('sql')
+  const [error, setError] = useState<string | null>(null)
+  const [running, setRunning] = useState(false)
+  const [showHistory, setShowHistory] = useState(false)
+  const tabCounterRef = useRef(2)
+
+  const activeTab = tabs.find(t => t.id === activeTabId) ?? tabs[0]
+
+  function updateActiveTab(patch: Partial<QueryTab>) {
+    setTabs(prev => prev.map(t => t.id === activeTabId ? { ...t, ...patch } : t))
+  }
+
+  const sqlValue = activeTab.sqlValue
+  const axiomqlValue = activeTab.axiomqlValue
+  const currentValue = mode === 'sql' ? sqlValue : axiomqlValue
+
+  function setCurrentValue(v: string) {
+    if (mode === 'sql') updateActiveTab({ sqlValue: v })
+    else updateActiveTab({ axiomqlValue: v })
+  }
+
+  const handleRun = useCallback(async () => {
     setRunning(true)
     setError(null)
     await new Promise(r => setTimeout(r, 300 + Math.random() * 200))
     const d = Math.round(4 + Math.random() * 40)
-    setDuration(d)
-    setResults(MOCK_RESULTS.default as Record<string, unknown>[])
+    const results = MOCK_RESULTS.default as Record<string, unknown>[]
+    updateActiveTab({ results, duration: d })
     setRunning(false)
+
+    // Save to history
+    const query = mode === 'sql' ? activeTab.sqlValue : activeTab.axiomqlValue
+    const entry: HistoryEntry = {
+      id: crypto.randomUUID(),
+      query: query.replace(/--[^\n]*/g, '').trim(),
+      duration: d,
+      rows: results.length,
+      timestamp: new Date().toLocaleTimeString(),
+    }
+    const prev = loadHistory()
+    saveHistory([entry, ...prev])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTabId, mode, activeTab.sqlValue, activeTab.axiomqlValue])
+
+  // ⌘+Enter / Ctrl+Enter shortcut
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault()
+        if (!running) handleRun()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [running, handleRun])
+
+  function addTab() {
+    const tab = makeTab(tabCounterRef.current++)
+    setTabs(prev => [...prev, tab])
+    setActiveTabId(tab.id)
   }
 
-  const currentValue = mode === 'sql' ? sqlValue : axiomqlValue
-  const setCurrentValue = mode === 'sql' ? setSqlValue : setAxiomqlValue
+  function closeTab(id: string) {
+    if (tabs.length === 1) return
+    setTabs(prev => {
+      const next = prev.filter(t => t.id !== id)
+      if (activeTabId === id) setActiveTabId(next[next.length - 1].id)
+      return next
+    })
+  }
+
+  function loadHistoryEntry(entry: HistoryEntry) {
+    updateActiveTab({ sqlValue: entry.query, results: null, duration: null })
+    setMode('sql')
+  }
+
+  const results = activeTab.results
+  const duration = activeTab.duration
 
   return (
     <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="border-b border-border px-6 py-3 flex items-center justify-between">
+      {/* Tab bar */}
+      <div className="border-b border-border flex items-center overflow-x-auto shrink-0 bg-surface">
+        <div className="flex items-center min-w-0 flex-1 overflow-x-auto">
+          {tabs.map(tab => (
+            <div key={tab.id}
+              className={cn(
+                'flex items-center gap-1.5 px-3 py-2 text-xs font-medium border-r border-border shrink-0 cursor-pointer select-none transition-colors group',
+                tab.id === activeTabId
+                  ? 'bg-bg text-text-primary border-b-bg -mb-px relative z-10'
+                  : 'text-text-secondary hover:text-text-primary hover:bg-elevated'
+              )}
+              onClick={() => setActiveTabId(tab.id)}>
+              <span>{tab.title}</span>
+              <button
+                onClick={e => { e.stopPropagation(); closeTab(tab.id) }}
+                className={cn(
+                  'rounded hover:bg-border transition-colors p-0.5',
+                  tab.id === activeTabId ? 'opacity-60 hover:opacity-100' : 'opacity-0 group-hover:opacity-60'
+                )}>
+                <X className="w-2.5 h-2.5" />
+              </button>
+            </div>
+          ))}
+        </div>
+        <button onClick={addTab}
+          className="px-3 py-2 text-text-secondary hover:text-text-primary hover:bg-elevated transition-colors shrink-0 border-l border-border">
+          <Plus className="w-3.5 h-3.5" />
+        </button>
+      </div>
+
+      {/* Mode header */}
+      <div className="border-b border-border px-6 py-3 flex items-center justify-between shrink-0">
         <h1 className="text-sm font-semibold text-text-primary">Query Editor</h1>
         <div className="flex items-center gap-2">
-          {/* Translate button */}
           <button
             onClick={() => {
               if (mode === 'sql') {
-                setAxiomqlValue(sqlToAxiomql(sqlValue))
+                updateActiveTab({ axiomqlValue: sqlToAxiomql(sqlValue) })
                 setMode('axiomql')
               } else {
-                setSqlValue(axiomqlToSql(axiomqlValue))
+                updateActiveTab({ sqlValue: axiomqlToSql(axiomqlValue) })
                 setMode('sql')
               }
             }}
@@ -306,8 +521,9 @@ export default function QueryPage() {
       </div>
 
       {/* Editor */}
-      <div className="border-b border-border" style={{ height: 280 }}>
+      <div className="border-b border-border shrink-0" style={{ height: 280 }}>
         <MonacoEditor
+          key={activeTabId + '-' + mode}
           height="100%"
           language={mode === 'sql' ? 'sql' : 'plaintext'}
           value={currentValue}
@@ -330,7 +546,7 @@ export default function QueryPage() {
       </div>
 
       {/* Toolbar */}
-      <div className="border-b border-border px-4 py-2 flex items-center gap-2">
+      <div className="border-b border-border px-4 py-2 flex items-center gap-2 shrink-0">
         <button onClick={handleRun} disabled={running}
           className={cn(
             'flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold transition-all',
@@ -348,10 +564,33 @@ export default function QueryPage() {
           Explain
         </button>
 
-        <button className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium text-text-secondary border border-border hover:bg-elevated hover:text-text-primary transition-colors">
+        <button
+          onClick={() => results && exportCsv(results, `${activeTab.title.replace(/\s+/g, '_').toLowerCase()}.csv`)}
+          disabled={!results}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium text-text-secondary border border-border hover:bg-elevated hover:text-text-primary transition-colors disabled:opacity-40">
           <Download className="w-3 h-3" />
           Export CSV
         </button>
+
+        {/* History toggle */}
+        <div className="relative">
+          <button
+            onClick={() => setShowHistory(p => !p)}
+            className={cn(
+              'flex items-center gap-1.5 px-2.5 py-1.5 rounded text-xs font-medium border transition-colors',
+              showHistory
+                ? 'border-accent text-accent bg-accent/10'
+                : 'border-border text-text-secondary hover:bg-elevated hover:text-text-primary'
+            )}>
+            <Clock className="w-3 h-3" />
+          </button>
+          {showHistory && (
+            <HistoryPanel
+              onLoad={loadHistoryEntry}
+              onClose={() => setShowHistory(false)}
+            />
+          )}
+        </div>
 
         {duration !== null && results && (
           <div className="ml-auto flex items-center gap-1.5 text-xs text-text-secondary font-mono">
