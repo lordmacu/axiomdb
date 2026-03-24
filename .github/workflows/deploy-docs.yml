@@ -1,4 +1,4 @@
-name: Deploy docs to GitHub Pages
+name: Deploy docs + studio to GitHub Pages
 
 on:
   push:
@@ -20,6 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ── mdBook docs ─────────────────────────────────────────────────────────
       - name: Install mdbook
         run: |
           curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.5.2/mdbook-v0.5.2-x86_64-unknown-linux-gnu.tar.gz \
@@ -29,6 +30,26 @@ jobs:
       - name: Build docs
         run: mdbook build docs-site
 
+      # ── AxiomStudio (Next.js static export) ─────────────────────────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: studio/package-lock.json
+
+      - name: Install studio dependencies
+        run: npm ci
+        working-directory: studio
+
+      - name: Build studio
+        run: npm run build
+        working-directory: studio
+
+      - name: Copy studio into docs output
+        run: cp -r studio/out docs-site/book/studio
+
+      # ── Upload combined artifact ─────────────────────────────────────────────
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
