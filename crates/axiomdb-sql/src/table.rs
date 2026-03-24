@@ -80,7 +80,7 @@ impl TableEngine {
     /// - [`DbError::ParseError`] — a stored row is structurally invalid (corruption).
     /// - I/O errors from storage reads.
     pub fn scan_table(
-        storage: &dyn StorageEngine,
+        storage: &mut dyn StorageEngine,
         table_def: &TableDef,
         columns: &[ColumnDef],
         snap: TransactionSnapshot,
@@ -335,7 +335,8 @@ impl TableEngine {
         let raw_rids: Vec<(u64, u16)> = rids.iter().map(|r| (r.page_id, r.slot_id)).collect();
 
         // Batch-delete on the heap: each page read+written once.
-        let deleted = HeapChain::delete_batch(storage, &raw_rids, txn_id)?;
+        let deleted =
+            HeapChain::delete_batch(storage, table_def.data_root_page_id, &raw_rids, txn_id)?;
 
         // WAL entries: one per row, after all page writes (ordering invariant).
         for (page_id, slot_id, old_bytes) in &deleted {

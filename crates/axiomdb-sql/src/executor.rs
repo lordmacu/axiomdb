@@ -43,7 +43,7 @@ use axiomdb_catalog::{
 };
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
 use axiomdb_index::BTree;
-use axiomdb_storage::{Page, PageType, StorageEngine};
+use axiomdb_storage::{heap_chain::HeapChain, Page, PageType, StorageEngine};
 use axiomdb_types::{DataType, Value};
 use axiomdb_wal::TxnManager;
 
@@ -382,7 +382,7 @@ fn dispatch_ctx(
 ///
 /// On cache miss, calls `make_resolver` and stores the result in `ctx`.
 fn resolve_table_cached(
-    storage: &dyn StorageEngine,
+    storage: &mut dyn StorageEngine,
     txn: &TxnManager,
     ctx: &mut SessionContext,
     schema: Option<&str>,
@@ -392,7 +392,7 @@ fn resolve_table_cached(
     if let Some(cached) = ctx.get_table(schema_str, table_name) {
         return Ok(cached.clone());
     }
-    let resolver = make_resolver(storage, txn)?;
+    let mut resolver = make_resolver(storage, txn)?;
     let resolved = resolver.resolve_table(schema, table_name)?;
     ctx.cache_table(schema_str, table_name, resolved.clone());
     Ok(resolved)
@@ -653,7 +653,7 @@ fn execute_insert_ctx(
     let mut first_generated: Option<u64> = None;
 
     fn next_auto_inc_ctx(
-        storage: &dyn StorageEngine,
+        storage: &mut dyn StorageEngine,
         txn: &TxnManager,
         table_def: &axiomdb_catalog::schema::TableDef,
         schema_cols: &[axiomdb_catalog::schema::ColumnDef],
@@ -843,14 +843,38 @@ fn execute_delete_ctx(
         &stmt.table.name,
     )?;
 
-    let schema_cols = resolved.columns.clone();
     let snap = txn.active_snapshot()?;
-    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
 
+    if stmt.where_clause.is_none() {
+        // No-WHERE fast path: collect only (page_id, slot_id) pairs — skip full
+        // row decode entirely (MariaDB ha_delete_all_rows pattern).
+        let raw_rids = HeapChain::scan_rids_visible(storage, resolved.def.data_root_page_id, snap)?;
+        let count = raw_rids.len() as u64;
+
+        // Physical heap update: mark all slots dead with ONE heap-chain pass.
+        HeapChain::delete_batch(
+            storage,
+            resolved.def.data_root_page_id,
+            &raw_rids,
+            snap.current_txn_id,
+        )?;
+
+        // WAL: ONE Truncate entry instead of N Delete entries — 10,000× fewer WAL writes.
+        txn.record_truncate(resolved.def.id, resolved.def.data_root_page_id)?;
+
+        return Ok(QueryResult::Affected {
+            count,
+            last_insert_id: None,
+        });
+    }
+
+    // WHERE clause path: need decoded row values to evaluate the predicate.
+    let schema_cols = resolved.columns.clone();
+    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
     let to_delete: Vec<RecordId> = rows
         .into_iter()
         .filter_map(|(rid, values)| match &stmt.where_clause {
-            None => Some(Ok(rid)),
+            None => unreachable!(),
             Some(wc) => match eval(wc, &values) {
                 Ok(v) if is_truthy(&v) => Some(Ok(rid)),
                 Ok(_) => None,
@@ -859,10 +883,8 @@ fn execute_delete_ctx(
         })
         .collect::<Result<_, DbError>>()?;
 
-    let count = to_delete.len() as u64;
-    for rid in to_delete {
-        TableEngine::delete_row(storage, txn, &resolved.def, rid)?;
-    }
+    // Batch-delete: each heap page read+written once instead of 3× per row.
+    let count = TableEngine::delete_rows_batch(storage, txn, &resolved.def, &to_delete)?;
 
     Ok(QueryResult::Affected {
         count,
@@ -976,7 +998,7 @@ fn execute_select(
     if stmt.joins.is_empty() {
         // ── Single-table path (no JOIN) ───────────────────────────────────────
         let resolved = {
-            let resolver = make_resolver(storage, txn)?;
+            let mut resolver = make_resolver(storage, txn)?;
             resolver.resolve_table(from_table_ref.schema.as_deref(), &from_table_ref.name)?
         };
 
@@ -1169,7 +1191,7 @@ fn execute_select_with_joins(
     let mut running_offset = 0usize;
 
     {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         let from_t = resolver.resolve_table(from_ref.schema.as_deref(), &from_ref.name)?;
         col_offsets.push(running_offset);
         running_offset += from_t.columns.len();
@@ -2387,7 +2409,7 @@ fn execute_insert(
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
     let resolved = {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
 
@@ -2432,7 +2454,7 @@ fn execute_insert(
     /// Returns the next value from the per-table AUTO_INCREMENT sequence,
     /// initializing it from MAX(col)+1 on first use (restart-safe).
     fn next_auto_inc(
-        storage: &dyn StorageEngine,
+        storage: &mut dyn StorageEngine,
         txn: &TxnManager,
         table_def: &axiomdb_catalog::schema::TableDef,
         schema_cols: &[axiomdb_catalog::schema::ColumnDef],
@@ -2662,7 +2684,7 @@ fn execute_update(
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
     let resolved = {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
 
@@ -2763,13 +2785,11 @@ fn execute_delete(
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
     let resolved = {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
 
-    let schema_cols = resolved.columns.clone();
     let snap = txn.active_snapshot()?;
-    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
 
     // Use the already-loaded indexes from the resolved table (cached by SchemaCache).
     let secondary_indexes: Vec<IndexDef> = resolved
@@ -2778,6 +2798,28 @@ fn execute_delete(
         .filter(|i| !i.is_primary && !i.columns.is_empty())
         .cloned()
         .collect();
+
+    // No-WHERE + no secondary indexes → single Truncate WAL entry (10,000× less WAL I/O).
+    // Secondary indexes need per-row values for key extraction, so we fall through to the
+    // slow path when any secondary index exists.
+    if stmt.where_clause.is_none() && secondary_indexes.is_empty() {
+        let raw_rids = HeapChain::scan_rids_visible(storage, resolved.def.data_root_page_id, snap)?;
+        let count = raw_rids.len() as u64;
+        HeapChain::delete_batch(
+            storage,
+            resolved.def.data_root_page_id,
+            &raw_rids,
+            snap.current_txn_id,
+        )?;
+        txn.record_truncate(resolved.def.id, resolved.def.data_root_page_id)?;
+        return Ok(QueryResult::Affected {
+            count,
+            last_insert_id: None,
+        });
+    }
+
+    let schema_cols = resolved.columns.clone();
+    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap)?;
 
     // Collect all matching (rid, row_values) BEFORE deleting any row.
     let to_delete: Vec<(RecordId, Vec<Value>)> = rows
@@ -2792,14 +2834,17 @@ fn execute_delete(
         })
         .collect::<Result<_, DbError>>()?;
 
-    let count = to_delete.len() as u64;
-    for (rid, row_vals) in to_delete {
-        TableEngine::delete_row(storage, txn, &resolved.def, rid)?;
-        // Index maintenance: remove from secondary indexes.
-        if !secondary_indexes.is_empty() {
+    // Batch-delete from heap: each page read+written once instead of 3× per row.
+    let rids_only: Vec<RecordId> = to_delete.iter().map(|(rid, _)| *rid).collect();
+    let count = TableEngine::delete_rows_batch(storage, txn, &resolved.def, &rids_only)?;
+
+    // Index maintenance: still per-row (each B+Tree remove is its own traversal),
+    // but heap I/O is now fully batched above.
+    if !secondary_indexes.is_empty() {
+        for (_, row_vals) in &to_delete {
             let updated = crate::index_maintenance::delete_from_indexes(
                 &secondary_indexes,
-                &row_vals,
+                row_vals,
                 storage,
             )?;
             for (index_id, new_root) in updated {
@@ -2825,7 +2870,7 @@ fn execute_create_table(
 
     // Check existence before constructing CatalogWriter (avoids double mutable borrow).
     {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         if resolver.table_exists(Some(schema), &stmt.table.name)? {
             if stmt.if_not_exists {
                 return Ok(QueryResult::Empty);
@@ -2875,7 +2920,7 @@ fn execute_drop_table(
         let snap = txn.active_snapshot()?;
 
         let table_id = {
-            let reader = CatalogReader::new(storage, snap)?;
+            let mut reader = CatalogReader::new(storage, snap)?;
             match reader.get_table(schema, &table_ref.name)? {
                 Some(def) => def.id,
                 None if stmt.if_exists => continue,
@@ -2909,14 +2954,14 @@ fn execute_create_index(
 
     // 1. Resolve table definition + column list.
     let (table_def, col_defs) = {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         let resolved = resolver.resolve_table(Some(schema), &stmt.table.name)?;
         (resolved.def.clone(), resolved.columns.clone())
     };
 
     // 2. Check for a duplicate index name on this table.
     {
-        let reader = CatalogReader::new(storage, snap)?;
+        let mut reader = CatalogReader::new(storage, snap)?;
         let existing = reader.list_indexes(table_def.id)?;
         if existing.iter().any(|i| i.name == stmt.name) {
             return Err(DbError::IndexAlreadyExists {
@@ -3022,7 +3067,7 @@ fn execute_drop_index(
 
     // Capture both index_id and root_page_id for catalog deletion + B-Tree page reclamation.
     let (index_id, root_page_id) = {
-        let reader = CatalogReader::new(storage, snap)?;
+        let mut reader = CatalogReader::new(storage, snap)?;
         let table_def = match reader.get_table(schema, &table_ref.name)? {
             Some(d) => d,
             None if stmt.if_exists => return Ok(QueryResult::Empty),
@@ -3090,16 +3135,21 @@ fn execute_truncate(
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
     let resolved = {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
 
+    // TRUNCATE has no WHERE predicate — use the no-WAL-per-row fast path.
+    // delete_batch() marks slots dead; record_truncate() writes ONE WAL entry.
     let snap = txn.active_snapshot()?;
-    let rows = TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap)?;
-    let rids: Vec<RecordId> = rows.into_iter().map(|(rid, _)| rid).collect();
-    for rid in rids {
-        TableEngine::delete_row(storage, txn, &resolved.def, rid)?;
-    }
+    let raw_rids = HeapChain::scan_rids_visible(storage, resolved.def.data_root_page_id, snap)?;
+    HeapChain::delete_batch(
+        storage,
+        resolved.def.data_root_page_id,
+        &raw_rids,
+        snap.current_txn_id,
+    )?;
+    txn.record_truncate(resolved.def.id, resolved.def.data_root_page_id)?;
 
     // Reset the AUTO_INCREMENT sequence so the next insert starts from 1.
     AUTO_INC_SEQ.with(|seq| {
@@ -3122,7 +3172,7 @@ fn execute_show_tables(
 ) -> Result<QueryResult, DbError> {
     let schema = stmt.schema.as_deref().unwrap_or("public");
     let snap = txn.active_snapshot()?;
-    let reader = CatalogReader::new(storage, snap)?;
+    let mut reader = CatalogReader::new(storage, snap)?;
     let tables = reader.list_tables(schema)?;
 
     let col_name = format!("Tables_in_{schema}");
@@ -3145,7 +3195,7 @@ fn execute_show_columns(
 ) -> Result<QueryResult, DbError> {
     let schema = stmt.table.schema.as_deref().unwrap_or("public");
     let snap = txn.active_snapshot()?;
-    let reader = CatalogReader::new(storage, snap)?;
+    let mut reader = CatalogReader::new(storage, snap)?;
 
     let table_def =
         reader
@@ -3243,7 +3293,7 @@ fn execute_alter_table(
 
     // Resolve the table once upfront.
     let table_def = {
-        let resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver(storage, txn)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
     // Keep the current column list; update it as we apply operations.
@@ -3462,7 +3512,7 @@ fn alter_rename_table(
 ) -> Result<(), DbError> {
     // Check new name not already in use.
     let snap = txn.active_snapshot()?;
-    let reader = CatalogReader::new(storage, snap)?;
+    let mut reader = CatalogReader::new(storage, snap)?;
     if reader.get_table(schema, new_name)?.is_some() {
         return Err(DbError::TableAlreadyExists {
             schema: schema.to_string(),
@@ -3481,7 +3531,7 @@ fn alter_rename_table(
 /// Uses `active_snapshot()` when a transaction is active, falling back to
 /// `snapshot()` for read-only access outside a transaction.
 fn make_resolver<'a>(
-    storage: &'a dyn StorageEngine,
+    storage: &'a mut dyn StorageEngine,
     txn: &TxnManager,
 ) -> Result<SchemaResolver<'a>, DbError> {
     let snap: TransactionSnapshot = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());

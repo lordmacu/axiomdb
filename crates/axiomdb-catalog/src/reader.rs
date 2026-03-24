@@ -52,8 +52,8 @@ impl<'a> CatalogReader<'a> {
     /// Returns the first visible table matching `(schema_name, table_name)`.
     ///
     /// Returns `None` if no such table is visible to the current snapshot.
-    pub fn get_table(&self, schema: &str, name: &str) -> Result<Option<TableDef>, DbError> {
-        let rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, self.snapshot)?;
+    pub fn get_table(&mut self, schema: &str, name: &str) -> Result<Option<TableDef>, DbError> {
+        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot)?;
         for (_, _, data) in rows {
             let (def, _) = TableDef::from_bytes(&data)?;
             if def.schema_name == schema && def.table_name == name {
@@ -66,8 +66,8 @@ impl<'a> CatalogReader<'a> {
     /// Returns the first visible table with the given `table_id`.
     ///
     /// Returns `None` if no such table is visible to the current snapshot.
-    pub fn get_table_by_id(&self, table_id: TableId) -> Result<Option<TableDef>, DbError> {
-        let rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, self.snapshot)?;
+    pub fn get_table_by_id(&mut self, table_id: TableId) -> Result<Option<TableDef>, DbError> {
+        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot)?;
         for (_, _, data) in rows {
             let (def, _) = TableDef::from_bytes(&data)?;
             if def.id == table_id {
@@ -78,8 +78,8 @@ impl<'a> CatalogReader<'a> {
     }
 
     /// Returns all visible tables in the given schema.
-    pub fn list_tables(&self, schema: &str) -> Result<Vec<TableDef>, DbError> {
-        let rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, self.snapshot)?;
+    pub fn list_tables(&mut self, schema: &str) -> Result<Vec<TableDef>, DbError> {
+        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot)?;
         let mut result = Vec::new();
         for (_, _, data) in rows {
             let (def, _) = TableDef::from_bytes(&data)?;
@@ -93,8 +93,8 @@ impl<'a> CatalogReader<'a> {
     // ── Column lookups ────────────────────────────────────────────────────────
 
     /// Returns all visible columns for `table_id`, ordered by `col_idx`.
-    pub fn list_columns(&self, table_id: TableId) -> Result<Vec<ColumnDef>, DbError> {
-        let rows = HeapChain::scan_visible(self.storage, self.page_ids.columns, self.snapshot)?;
+    pub fn list_columns(&mut self, table_id: TableId) -> Result<Vec<ColumnDef>, DbError> {
+        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.columns, self.snapshot)?;
         let mut result = Vec::new();
         for (_, _, data) in rows {
             let (def, _) = ColumnDef::from_bytes(&data)?;
@@ -109,8 +109,8 @@ impl<'a> CatalogReader<'a> {
     // ── Index lookups ─────────────────────────────────────────────────────────
 
     /// Returns all visible indexes for `table_id`.
-    pub fn list_indexes(&self, table_id: TableId) -> Result<Vec<IndexDef>, DbError> {
-        let rows = HeapChain::scan_visible(self.storage, self.page_ids.indexes, self.snapshot)?;
+    pub fn list_indexes(&mut self, table_id: TableId) -> Result<Vec<IndexDef>, DbError> {
+        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.indexes, self.snapshot)?;
         let mut result = Vec::new();
         for (_, _, data) in rows {
             let (def, _) = IndexDef::from_bytes(&data)?;

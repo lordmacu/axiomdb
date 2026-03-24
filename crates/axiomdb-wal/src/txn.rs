@@ -1178,8 +1178,8 @@ mod tests {
         // Txn 2: delete_batch + record_truncate (simulates no-WHERE DELETE).
         let txn2 = mgr.begin().unwrap();
         let snap = mgr.active_snapshot().unwrap();
-        let raw_rids = HeapChain::scan_rids_visible(&storage, root_page_id, snap).unwrap();
-        HeapChain::delete_batch(&mut storage, &raw_rids, txn2).unwrap();
+        let raw_rids = HeapChain::scan_rids_visible(&mut storage, root_page_id, snap).unwrap();
+        HeapChain::delete_batch(&mut storage, root_page_id, &raw_rids, txn2).unwrap();
         mgr.record_truncate(1, root_page_id).unwrap();
         mgr.commit().unwrap();
 
@@ -1234,21 +1234,21 @@ mod tests {
         // Verify 5 rows visible after txn1 commit.
         let snap_after_insert = TransactionSnapshot::committed(mgr.max_committed());
         let before =
-            HeapChain::scan_rids_visible(&storage, root_page_id, snap_after_insert).unwrap();
+            HeapChain::scan_rids_visible(&mut storage, root_page_id, snap_after_insert).unwrap();
         assert_eq!(before.len(), 5, "5 rows must be visible before truncate");
 
         // Txn 2: delete_batch + record_truncate, then ROLLBACK.
         let txn2 = mgr.begin().unwrap();
         let snap2 = mgr.active_snapshot().unwrap();
-        let raw_rids = HeapChain::scan_rids_visible(&storage, root_page_id, snap2).unwrap();
-        HeapChain::delete_batch(&mut storage, &raw_rids, txn2).unwrap();
+        let raw_rids = HeapChain::scan_rids_visible(&mut storage, root_page_id, snap2).unwrap();
+        HeapChain::delete_batch(&mut storage, root_page_id, &raw_rids, txn2).unwrap();
         mgr.record_truncate(1, root_page_id).unwrap();
         mgr.rollback(&mut storage).unwrap();
 
         // After rollback: all 5 rows must be visible again.
         let snap_after_rollback = TransactionSnapshot::committed(mgr.max_committed());
         let after =
-            HeapChain::scan_rids_visible(&storage, root_page_id, snap_after_rollback).unwrap();
+            HeapChain::scan_rids_visible(&mut storage, root_page_id, snap_after_rollback).unwrap();
         assert_eq!(
             after.len(),
             5,
