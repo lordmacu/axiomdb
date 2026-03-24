@@ -1,7 +1,10 @@
 'use client'
-import { useState, use, useRef, useEffect } from 'react'
+import { useState, use, useRef, useEffect, useCallback } from 'react'
 import { notFound } from 'next/navigation'
-import { Table2, ChevronUp, ChevronDown, ChevronsUpDown, Check, X } from 'lucide-react'
+import {
+  Table2, ChevronUp, ChevronDown, ChevronsUpDown,
+  Check, X, Trash2, Search, Columns3, Copy,
+} from 'lucide-react'
 import { TABLES, SCHEMAS, INDEXES, generateUsers, generateOrders } from '@/lib/mock'
 import { cn } from '@/lib/utils'
 import {
@@ -36,13 +39,38 @@ const TABLE_DATA: Record<string, unknown[]> = {
     name: `Category ${i + 1}`,
     slug: `category-${i + 1}`,
   })),
-  // Views
   active_users: ALL_USERS.filter(u => u.active).map(u => ({
     id: u.id, name: u.name, email: u.email, age: u.age, created_at: u.created_at,
   })),
 }
 
 type EditingCell = { rowIndex: number; colKey: string } | null
+
+// ── Context menu types ────────────────────────────────────────────────────────
+
+type ContextMenu = {
+  x: number
+  y: number
+  value: unknown
+  rowData: Record<string, unknown>
+  colKey: string
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+
+function Toast({ message, onDone }: { message: string; onDone: () => void }) {
+  useEffect(() => {
+    const t = setTimeout(onDone, 2000)
+    return () => clearTimeout(t)
+  }, [onDone])
+  return (
+    <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-accent text-white text-xs px-4 py-2 rounded-lg shadow-xl font-semibold animate-fade-in">
+      {message}
+    </div>
+  )
+}
+
+// ── Cell value renderer ───────────────────────────────────────────────────────
 
 function CellValue({ value, colKey }: { value: unknown; colKey: string }) {
   if (typeof value === 'boolean') {
@@ -70,6 +98,8 @@ function CellValue({ value, colKey }: { value: unknown; colKey: string }) {
 
 type SqlLog = { sql: string; axiomql: string; ts: string }
 
+// ── DataTab ───────────────────────────────────────────────────────────────────
+
 function DataTab({ tableName }: { tableName: string }) {
   const initial = (TABLE_DATA[tableName] ?? []) as Record<string, unknown>[]
   const [rows, setRows] = useState(initial)
@@ -79,11 +109,62 @@ function DataTab({ tableName }: { tableName: string }) {
   const [editValue, setEditValue] = useState('')
   const [lastSql, setLastSql] = useState<SqlLog | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+
+  // Quick filter
+  const [filterText, setFilterText] = useState('')
+
+  // Column visibility
+  const allColKeys = rows.length > 0 ? Object.keys(rows[0]) : []
+  const [visibleCols, setVisibleCols] = useState<Set<string>>(() => new Set(allColKeys))
+  const [showColMenu, setShowColMenu] = useState(false)
+  const colMenuRef = useRef<HTMLDivElement>(null)
+
+  // Add row
+  const [addingRow, setAddingRow] = useState(false)
+  const [newRowValues, setNewRowValues] = useState<Record<string, string>>({})
+
+  // Delete confirmation
+  const [deletingRowIdx, setDeletingRowIdx] = useState<number | null>(null)
+
+  // Context menu
+  const [contextMenu, setContextMenu] = useState<ContextMenu | null>(null)
+
+  // Filter applied on rows (before pagination)
+  const filteredRows = filterText.trim() === ''
+    ? rows
+    : rows.filter(row =>
+        Object.values(row).some(v =>
+          String(v ?? '').toLowerCase().includes(filterText.toLowerCase())
+        )
+      )
+
   const pageSize = 15
+  const nonEditableCols = new Set(['id', 'created_at', 'status'])
 
   useEffect(() => { if (editing) inputRef.current?.focus() }, [editing])
 
-  const nonEditableCols = new Set(['id', 'created_at', 'status'])
+  // Close col visibility menu on outside click
+  useEffect(() => {
+    function handle(e: MouseEvent) {
+      if (colMenuRef.current && !colMenuRef.current.contains(e.target as Node)) {
+        setShowColMenu(false)
+      }
+    }
+    if (showColMenu) document.addEventListener('mousedown', handle)
+    return () => document.removeEventListener('mousedown', handle)
+  }, [showColMenu])
+
+  // Close context menu on outside click / scroll
+  useEffect(() => {
+    if (!contextMenu) return
+    function close() { setContextMenu(null) }
+    document.addEventListener('mousedown', close)
+    document.addEventListener('scroll', close, true)
+    return () => {
+      document.removeEventListener('mousedown', close)
+      document.removeEventListener('scroll', close, true)
+    }
+  }, [contextMenu])
 
   function buildSql(rowId: unknown, col: string, val: unknown) {
     const v = typeof val === 'string' ? `'${val}'` : String(val)
@@ -124,8 +205,61 @@ function DataTab({ tableName }: { tableName: string }) {
 
   function cancelEdit() { setEditing(null) }
 
-  const columns: ColumnDef<Record<string, unknown>>[] = rows.length > 0
-    ? Object.keys(rows[0]).map(key => ({
+  // Delete row
+  function deleteRow(rowIndex: number) {
+    const row = rows[rowIndex]
+    setRows(prev => prev.filter((_, i) => i !== rowIndex))
+    setDeletingRowIdx(null)
+    const now = new Date().toTimeString().slice(0, 8)
+    setLastSql({
+      sql: `DELETE FROM ${tableName} WHERE id = ${row.id};`,
+      axiomql: `${tableName}.filter(id = ${row.id}).delete()`,
+      ts: now,
+    })
+  }
+
+  // Add row
+  function commitAddRow() {
+    const maxId = rows.reduce((m, r) => Math.max(m, Number(r.id ?? 0)), 0)
+    const newRow: Record<string, unknown> = { id: maxId + 1 }
+    for (const key of allColKeys) {
+      if (key === 'id') continue
+      newRow[key] = newRowValues[key] ?? ''
+    }
+    setRows(prev => [...prev, newRow])
+    setAddingRow(false)
+    setNewRowValues({})
+    const now = new Date().toTimeString().slice(0, 8)
+    const cols = allColKeys.filter(k => k !== 'id').join(', ')
+    const vals = allColKeys.filter(k => k !== 'id').map(k => `'${newRowValues[k] ?? ''}'`).join(', ')
+    setLastSql({
+      sql: `INSERT INTO ${tableName} (${cols}) VALUES (${vals});`,
+      axiomql: `${tableName}.insert({${allColKeys.filter(k => k !== 'id').map(k => `${k}: '${newRowValues[k] ?? ''}'`).join(', ')}})`,
+      ts: now,
+    })
+  }
+
+  // Context menu actions
+  function copyValue(value: unknown) {
+    navigator.clipboard.writeText(String(value ?? '')).catch(() => null)
+    setContextMenu(null)
+  }
+
+  function copyRowAsJson(row: Record<string, unknown>) {
+    navigator.clipboard.writeText(JSON.stringify(row, null, 2)).catch(() => null)
+    setContextMenu(null)
+  }
+
+  function filterByValue(value: unknown) {
+    setFilterText(String(value ?? ''))
+    setContextMenu(null)
+  }
+
+  // Table columns — only visible ones
+  const displayKeys = allColKeys.filter(k => visibleCols.has(k))
+
+  const columns: ColumnDef<Record<string, unknown>>[] = filteredRows.length > 0
+    ? displayKeys.map(key => ({
         accessorKey: key,
         header: key,
         enableSorting: true,
@@ -133,22 +267,91 @@ function DataTab({ tableName }: { tableName: string }) {
     : []
 
   const table = useReactTable({
-    data: rows,
+    data: filteredRows,
     columns,
     state: { pagination: { pageIndex, pageSize }, sorting },
     onSortingChange: setSorting,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
-    // track original row index for editing
   })
 
-  // Map page rows back to their original indices
-  const sortedData = table.getSortedRowModel().rows
   const pageRows = table.getRowModel().rows
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
+      {/* Toolbar above table */}
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0 bg-elevated/40">
+        {/* Filter input */}
+        <div className="flex items-center gap-1.5 flex-1 max-w-64 px-2 py-1 rounded bg-elevated border border-border text-xs">
+          <Search className="w-3 h-3 text-text-secondary shrink-0" />
+          <input
+            value={filterText}
+            onChange={e => { setFilterText(e.target.value); setPageIndex(0) }}
+            placeholder="Filter rows..."
+            className="bg-transparent outline-none text-text-secondary placeholder-text-secondary/50 w-full font-mono text-xs"
+          />
+          {filterText && (
+            <button onClick={() => { setFilterText(''); setPageIndex(0) }}
+              className="text-text-secondary hover:text-text-primary transition-colors shrink-0">
+              <X className="w-3 h-3" />
+            </button>
+          )}
+        </div>
+
+        {filterText && (
+          <span className="text-[10px] text-text-secondary font-mono">
+            {filteredRows.length} of {rows.length} rows
+          </span>
+        )}
+
+        {/* Column visibility */}
+        <div className="relative ml-auto" ref={colMenuRef}>
+          <button
+            onClick={() => setShowColMenu(p => !p)}
+            className={cn(
+              'flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium border transition-colors',
+              showColMenu
+                ? 'border-accent text-accent bg-accent/10'
+                : 'border-border text-text-secondary hover:bg-elevated hover:text-text-primary'
+            )}>
+            <Columns3 className="w-3 h-3" />
+            Columns
+          </button>
+          {showColMenu && (
+            <div className="absolute right-0 top-full mt-1 z-50 bg-surface border border-border rounded-lg shadow-xl p-2 min-w-36">
+              <div className="flex items-center justify-between mb-2 px-1">
+                <span className="text-[10px] text-text-secondary uppercase tracking-wider font-semibold">Visibility</span>
+                <button
+                  onClick={() => setVisibleCols(new Set(allColKeys))}
+                  className="text-[10px] text-accent hover:text-accent/70 transition-colors">
+                  Reset
+                </button>
+              </div>
+              {allColKeys.map(key => (
+                <label key={key}
+                  className="flex items-center gap-2 px-1 py-1 rounded hover:bg-elevated cursor-pointer transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={visibleCols.has(key)}
+                    onChange={e => {
+                      setVisibleCols(prev => {
+                        const next = new Set(prev)
+                        if (e.target.checked) next.add(key)
+                        else next.delete(key)
+                        return next
+                      })
+                    }}
+                    className="accent-[#10b981] w-3 h-3"
+                  />
+                  <span className="font-mono text-xs text-text-primary">{key}</span>
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
       <div className="flex-1 overflow-auto">
         <table className="w-full text-xs">
           <thead className="sticky top-0 bg-surface z-10">
@@ -174,12 +377,16 @@ function DataTab({ tableName }: { tableName: string }) {
                     </th>
                   )
                 })}
+                {/* Actions column header */}
+                <th className="w-12 px-2 py-2" />
               </tr>
             ))}
           </thead>
           <tbody>
             {pageRows.map(row => {
               const originalIndex = row.index
+              const isDeletingThis = deletingRowIdx === originalIndex
+              const fullRow = filteredRows[originalIndex]
               return (
                 <tr key={row.id} className="border-b border-border/50 hover:bg-elevated transition-colors group">
                   {row.getVisibleCells().map(cell => {
@@ -193,7 +400,17 @@ function DataTab({ tableName }: { tableName: string }) {
                           isEditable && 'cursor-pointer',
                           isEditing && 'p-0'
                         )}
-                        onClick={() => !isEditing && startEdit(originalIndex, colKey, cell.getValue())}>
+                        onClick={() => !isEditing && startEdit(originalIndex, colKey, cell.getValue())}
+                        onContextMenu={e => {
+                          e.preventDefault()
+                          setContextMenu({
+                            x: e.clientX,
+                            y: e.clientY,
+                            value: cell.getValue(),
+                            rowData: fullRow,
+                            colKey,
+                          })
+                        }}>
                         {isEditing ? (
                           <div className="flex items-center">
                             <input
@@ -232,12 +449,78 @@ function DataTab({ tableName }: { tableName: string }) {
                       </td>
                     )
                   })}
+                  {/* Delete action cell */}
+                  <td className="px-2 py-1.5 w-12">
+                    {isDeletingThis ? (
+                      <div className="flex items-center gap-1">
+                        <span className="text-[10px] text-error whitespace-nowrap">Delete?</span>
+                        <button onClick={() => deleteRow(originalIndex)}
+                          className="text-[10px] px-1.5 py-0.5 rounded bg-error/20 text-error hover:bg-error/30 font-semibold transition-colors">
+                          Yes
+                        </button>
+                        <button onClick={() => setDeletingRowIdx(null)}
+                          className="text-[10px] px-1.5 py-0.5 rounded bg-elevated text-text-secondary hover:text-text-primary transition-colors">
+                          No
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => setDeletingRowIdx(originalIndex)}
+                        className="opacity-0 group-hover:opacity-60 hover:!opacity-100 text-error transition-all">
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    )}
+                  </td>
                 </tr>
               )
             })}
+
+            {/* Add row inline form */}
+            {addingRow && (
+              <tr className="border-b border-accent/30 bg-elevated/50">
+                {displayKeys.map(key => (
+                  <td key={key} className="px-2 py-1.5">
+                    {key === 'id' ? (
+                      <span className="font-mono text-xs text-text-secondary italic">auto</span>
+                    ) : (
+                      <input
+                        value={newRowValues[key] ?? ''}
+                        onChange={e => setNewRowValues(prev => ({ ...prev, [key]: e.target.value }))}
+                        placeholder={key}
+                        className="w-full bg-surface border border-border rounded px-2 py-0.5 font-mono text-xs text-text-primary outline-none focus:border-accent transition-colors"
+                      />
+                    )}
+                  </td>
+                ))}
+                <td className="px-2 py-1.5">
+                  <div className="flex items-center gap-1">
+                    <button onClick={commitAddRow}
+                      className="text-[10px] px-2 py-0.5 rounded bg-accent text-white font-semibold hover:bg-accent/80 transition-colors">
+                      Save
+                    </button>
+                    <button onClick={() => { setAddingRow(false); setNewRowValues({}) }}
+                      className="text-[10px] px-2 py-0.5 rounded text-text-secondary hover:bg-elevated transition-colors">
+                      Cancel
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
+
+      {/* Add row button */}
+      {!addingRow && (
+        <div className="border-t border-border/50 px-3 py-1.5 shrink-0 bg-elevated/30">
+          <button
+            onClick={() => { setAddingRow(true); setNewRowValues({}) }}
+            className="flex items-center gap-1 text-xs text-text-secondary hover:text-accent transition-colors font-medium">
+            <span className="text-base leading-none">+</span> Add row
+          </button>
+        </div>
+      )}
+
       {/* SQL Preview footer */}
       {lastSql && (
         <div className="border-t border-border/50 bg-elevated px-3 py-2 shrink-0">
@@ -264,7 +547,11 @@ function DataTab({ tableName }: { tableName: string }) {
 
       <div className="border-t border-border px-3 py-2 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-3">
-          <span className="text-xs text-text-secondary font-mono">{rows.length.toLocaleString()} rows</span>
+          <span className="text-xs text-text-secondary font-mono">
+            {filterText
+              ? `${filteredRows.length} of ${rows.length} rows`
+              : `${rows.length.toLocaleString()} rows`}
+          </span>
           {sorting.length > 0 && (
             <span className="text-[10px] text-accent">
               sorted by {sorting[0].id} {sorting[0].desc ? '↓' : '↑'}
@@ -277,7 +564,7 @@ function DataTab({ tableName }: { tableName: string }) {
             ← Prev
           </button>
           <span className="text-xs text-text-secondary">
-            Page {pageIndex + 1} / {table.getPageCount()}
+            Page {pageIndex + 1} / {table.getPageCount() || 1}
           </span>
           <button onClick={() => setPageIndex(p => Math.min(table.getPageCount() - 1, p + 1))} disabled={pageIndex >= table.getPageCount() - 1}
             className="text-xs text-text-secondary hover:text-text-primary disabled:opacity-30 px-2 py-1 rounded hover:bg-elevated transition-colors">
@@ -285,6 +572,34 @@ function DataTab({ tableName }: { tableName: string }) {
           </button>
         </div>
       </div>
+
+      {/* Context menu */}
+      {contextMenu && (
+        <div
+          style={{ position: 'fixed', top: contextMenu.y, left: contextMenu.x, zIndex: 9999 }}
+          className="bg-surface border border-border rounded-lg shadow-xl py-1 min-w-40 text-xs"
+          onMouseDown={e => e.stopPropagation()}>
+          <button
+            onClick={() => copyValue(contextMenu.value)}
+            className="w-full text-left px-3 py-1.5 hover:bg-elevated transition-colors flex items-center gap-2 text-text-primary">
+            <Copy className="w-3 h-3 text-text-secondary" />
+            Copy value
+          </button>
+          <button
+            onClick={() => copyRowAsJson(contextMenu.rowData)}
+            className="w-full text-left px-3 py-1.5 hover:bg-elevated transition-colors flex items-center gap-2 text-text-primary">
+            <Copy className="w-3 h-3 text-text-secondary" />
+            Copy row as JSON
+          </button>
+          <div className="border-t border-border/50 my-1" />
+          <button
+            onClick={() => filterByValue(contextMenu.value)}
+            className="w-full text-left px-3 py-1.5 hover:bg-elevated transition-colors flex items-center gap-2 text-text-primary">
+            <Search className="w-3 h-3 text-text-secondary" />
+            Filter by this value
+          </button>
+        </div>
+      )}
     </div>
   )
 }
@@ -348,7 +663,6 @@ function SchemaTab({ tableName }: { tableName: string }) {
                 </div>
               </td>
 
-              {/* Type — click to open dropdown */}
               <td className="px-4 py-2 relative">
                 {editingType === c.name ? (
                   <div className="flex items-center gap-1">
@@ -373,7 +687,6 @@ function SchemaTab({ tableName }: { tableName: string }) {
                 )}
               </td>
 
-              {/* Nullable — click to toggle */}
               <td className="px-4 py-2.5">
                 <button
                   onClick={() => toggleNullable(c.name)}
@@ -388,7 +701,7 @@ function SchemaTab({ tableName }: { tableName: string }) {
               </td>
 
               <td className="px-4 py-2.5 font-mono text-text-secondary text-[11px]">{c.default ?? '—'}</td>
-              {/* FK — click to edit, × to remove */}
+
               <td className="px-4 py-2">
                 {editingFk === c.name ? (
                   <div className="flex items-center gap-1">
@@ -534,7 +847,6 @@ function IndexesTab({ tableName }: { tableName: string }) {
         </table>
       </div>
 
-      {/* Add new index */}
       {adding ? (
         <div className="border-t border-border px-4 py-3 flex items-center gap-2 bg-elevated">
           <input value={newName} onChange={e => setNewName(e.target.value)}
@@ -569,17 +881,43 @@ function IndexesTab({ tableName }: { tableName: string }) {
   )
 }
 
+// ── Generate DDL ──────────────────────────────────────────────────────────────
+
+function generateDDL(tableName: string): string {
+  const schema = SCHEMAS[tableName]
+  if (!schema) return `-- No schema found for ${tableName}`
+  const cols = schema.map(c => {
+    const parts = [`  ${c.name} ${c.type}`]
+    if (!c.nullable) parts.push('NOT NULL')
+    if (c.pk) parts.push('PRIMARY KEY')
+    if (c.default) parts.push(`DEFAULT ${c.default}`)
+    if (c.fk) parts.push(`REFERENCES ${c.fk}`)
+    return parts.join(' ')
+  })
+  return `CREATE TABLE ${tableName} (\n${cols.join(',\n')}\n);`
+}
+
+// ── Table detail page ─────────────────────────────────────────────────────────
+
 export default function TableDetailPage({ params }: { params: Promise<{ table: string }> }) {
   const { table: tableName } = use(params)
   const tableInfo = TABLES.find(t => t.name === tableName)
   if (!tableInfo) notFound()
 
   const [tab, setTab] = useState<Tab>('data')
+  const [toast, setToast] = useState<string | null>(null)
   const TABS: { id: Tab; label: string }[] = [
     { id: 'data', label: 'Data' },
     { id: 'schema', label: 'Schema' },
     { id: 'indexes', label: 'Indexes' },
   ]
+
+  const handleCopyDDL = useCallback(() => {
+    const ddl = generateDDL(tableName)
+    navigator.clipboard.writeText(ddl).then(() => {
+      setToast('Copied!')
+    }).catch(() => null)
+  }, [tableName])
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -590,6 +928,12 @@ export default function TableDetailPage({ params }: { params: Promise<{ table: s
           <span className="text-xs text-text-secondary">
             · {tableInfo.rows.toLocaleString()} rows · {tableInfo.size}
           </span>
+          <button
+            onClick={handleCopyDDL}
+            className="flex items-center gap-1 ml-2 px-2 py-0.5 rounded text-[10px] font-medium border border-border text-text-secondary hover:border-accent/50 hover:text-accent transition-colors">
+            <Copy className="w-2.5 h-2.5" />
+            Copy DDL
+          </button>
         </div>
         <div className="flex gap-1 bg-elevated rounded p-0.5">
           {TABS.map(t => (
@@ -610,6 +954,8 @@ export default function TableDetailPage({ params }: { params: Promise<{ table: s
         {tab === 'schema' && <SchemaTab tableName={tableName} />}
         {tab === 'indexes' && <IndexesTab tableName={tableName} />}
       </div>
+
+      {toast && <Toast message={toast} onDone={() => setToast(null)} />}
     </div>
   )
 }

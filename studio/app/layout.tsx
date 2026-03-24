@@ -3,6 +3,7 @@ import { GeistSans } from 'geist/font/sans'
 import { GeistMono } from 'geist/font/mono'
 import './globals.css'
 import { Sidebar } from '@/components/sidebar'
+import { ClientProviders } from '@/components/client-providers'
 
 export const metadata: Metadata = {
   title: 'AxiomStudio',
@@ -17,6 +18,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <main className="flex-1 flex flex-col overflow-hidden">
           {children}
         </main>
+        <ClientProviders />
       </body>
     </html>
   )
