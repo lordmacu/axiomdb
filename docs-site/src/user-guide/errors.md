@@ -51,6 +51,23 @@ with the SQLSTATE code in the `sql_state` field (5 bytes following the `#` marke
 These errors indicate that an INSERT, UPDATE, or DELETE violated a declared
 constraint. The application should handle them and return a user-facing message.
 
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Constraint Enforcement Status (Phase 4.16)</span>
+The following constraints are <strong>parsed and stored in the schema</strong> but are
+<strong>not yet enforced at INSERT/UPDATE time</strong>:
+<ul>
+<li><strong>NOT NULL</strong> — declared columns accept NULL without error</li>
+<li><strong>UNIQUE</strong> — duplicate values are allowed</li>
+<li><strong>CHECK</strong> — expressions are not evaluated at write time</li>
+</ul>
+As a result, <code>23502</code>, <code>23505</code>, and <code>23514</code> are not raised
+by DML in the current release. Enforcement will be added in a future phase.
+<strong>PRIMARY KEY uniqueness is enforced</strong> via the B+ tree index.
+</div>
+</div>
+
 ### 23505 — unique_violation
 
 A row with the same value already exists in a column or set of columns declared

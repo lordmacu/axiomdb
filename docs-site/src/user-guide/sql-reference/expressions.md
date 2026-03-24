@@ -271,6 +271,66 @@ WHERE NOT EXISTS (
 | `LPAD(s, n, pad)`     | Pad on the left to length n            | `LPAD('42', 5, '0')` → `'00042'` |
 | `RPAD(s, n, pad)`     | Pad on the right to length n           | —                               |
 
+### String Concatenation — `||`
+
+The `||` operator concatenates two string values. It is the SQL-standard alternative
+to `CONCAT()` and works in any expression context.
+
+```sql
+-- Build a full name from two columns
+SELECT first_name || ' ' || last_name AS full_name FROM users;
+
+-- Append a suffix
+SELECT sku || '-v2' AS new_sku FROM products;
+
+-- NULL propagates: if either operand is NULL the result is NULL
+SELECT 'hello' || NULL;   -- NULL
+```
+
+Use `COALESCE` to guard against NULL operands:
+
+```sql
+SELECT COALESCE(first_name, '') || ' ' || COALESCE(last_name, '') AS full_name
+FROM users;
+```
+
+### CAST — Explicit Type Conversion
+
+`CAST(expr AS type)` converts a value to the specified type. Use it when an implicit
+coercion would be rejected in strict mode (the default).
+
+```sql
+-- Text-to-number: always works when the text is a valid number
+SELECT CAST('42' AS INT);        -- 42
+SELECT CAST('3.14' AS REAL);     -- 3.14
+SELECT CAST('100' AS BIGINT);    -- 100
+
+-- Use CAST to store a text literal in a numeric column
+INSERT INTO users (age) VALUES (CAST('30' AS INT));
+```
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Current Limitation</span>
+<code>CAST(numeric AS TEXT)</code> — converting an integer or real value to text — is not
+supported in the current release and raises <code>22018 invalid_character_value_for_cast</code>.
+Use application-side formatting or wait for Phase 5 (full coercion matrix). The supported
+direction is <strong>text → number</strong>, not number → text.
+</div>
+</div>
+
+**Supported CAST pairs (Phase 4.16):**
+
+| From    | To                        | Notes                                 |
+|---------|---------------------------|---------------------------------------|
+| `TEXT`  | `INT`, `BIGINT`           | Entire string must be a valid integer |
+| `TEXT`  | `REAL`                    | Entire string must be a valid float   |
+| `TEXT`  | `DECIMAL`                 | Entire string must be a valid decimal |
+| `INT`   | `BIGINT`, `REAL`, `DECIMAL` | Widening — always succeeds          |
+| `BIGINT`| `REAL`, `DECIMAL`         | Widening — always succeeds            |
+| `NULL`  | any                       | Always returns NULL                   |
+
 ### Conditional Functions
 
 | Function                          | Description                                        |
