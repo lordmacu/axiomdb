@@ -75,6 +75,14 @@ pub struct TxnManager {
     /// retained across operations — inspired by LMDB's approach of reusing
     /// a single write buffer for all modifications in a batch.
     wal_scratch: Vec<u8>,
+    /// When `true`, DML `commit()` skips flush+fsync and stores the committed
+    /// `txn_id` in `pending_deferred_txn_id` for the caller to register with
+    /// the `CommitCoordinator`. Set once at startup by `Database` when group
+    /// commit is enabled. Read-only transactions always flush_no_sync regardless.
+    deferred_commit_mode: bool,
+    /// Set by `commit()` when `deferred_commit_mode` is true and the transaction
+    /// contained DML. Cleared by `take_pending_deferred_commit()`.
+    pending_deferred_txn_id: Option<TxnId>,
 }
 
 impl TxnManager {
@@ -91,6 +99,8 @@ impl TxnManager {
             max_committed: 0,
             active: None,
             wal_scratch: Vec::with_capacity(256),
+            deferred_commit_mode: false,
+            pending_deferred_txn_id: None,
         })
     }
 
@@ -108,6 +118,8 @@ impl TxnManager {
             max_committed,
             active: None,
             wal_scratch: Vec::with_capacity(256),
+            deferred_commit_mode: false,
+            pending_deferred_txn_id: None,
         })
     }
 
@@ -146,6 +158,11 @@ impl TxnManager {
     /// Advances `max_committed` to the committed TxnId, making the transaction's
     /// writes visible to future [`TransactionSnapshot`]s.
     ///
+    /// When `deferred_commit_mode` is enabled (group commit active), DML commits
+    /// skip the fsync and store the txn_id in `pending_deferred_txn_id`. The caller
+    /// must retrieve it with `take_pending_deferred_commit()` and register it with
+    /// the `CommitCoordinator`, which will fsync + advance `max_committed` later.
+    ///
     /// # Errors
     /// - [`DbError::NoActiveTransaction`] if no transaction is open.
     /// - I/O errors from WAL write or fsync.
@@ -154,20 +171,78 @@ impl TxnManager {
         let txn_id = active.txn_id;
 
         let mut entry = WalEntry::new(0, txn_id, EntryType::Commit, 0, vec![], vec![], vec![]);
-        self.wal.append(&mut entry)?;
+        self.wal
+            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
 
         if active.undo_ops.is_empty() {
             // Read-only transaction: flush to OS page cache (visible to
             // readers/recovery) but skip the expensive fsync (~10-20ms).
             // No heap data was modified, so OS-level durability is sufficient.
             self.wal.flush_no_sync()?;
+            self.max_committed = txn_id;
+        } else if self.deferred_commit_mode {
+            // Group commit mode: Commit entry is in the BufWriter but NOT
+            // flushed or fsynced. max_committed does NOT advance here — it
+            // advances only after the CommitCoordinator confirms fsync.
+            // INVARIANT: pending_deferred_txn_id is always None here because
+            // the single-writer constraint ensures one commit at a time.
+            self.pending_deferred_txn_id = Some(txn_id);
         } else {
-            // DML transaction: full flush + fsync to guarantee durability.
+            // Immediate mode: full flush + fsync to guarantee durability.
             self.wal.commit()?;
+            self.max_committed = txn_id;
         }
 
-        self.max_committed = txn_id;
         Ok(())
+    }
+
+    /// Enables or disables deferred commit mode for group commit.
+    ///
+    /// When enabled, DML `commit()` skips flush+fsync and stores the txn_id
+    /// in `pending_deferred_txn_id`. Must be called once at startup by
+    /// `Database` when the `CommitCoordinator` is active.
+    pub fn set_deferred_commit_mode(&mut self, enabled: bool) {
+        self.deferred_commit_mode = enabled;
+    }
+
+    /// Takes the pending deferred commit txn_id, if any.
+    ///
+    /// Returns `Some(txn_id)` if the last `commit()` was a DML transaction in
+    /// deferred mode (the Commit entry is in the BufWriter but not fsynced).
+    /// Returns `None` if the last commit was read-only or deferred mode is off.
+    ///
+    /// Called by `Database::execute_query` to register the txn with the
+    /// `CommitCoordinator` after releasing the Database lock.
+    pub fn take_pending_deferred_commit(&mut self) -> Option<TxnId> {
+        self.pending_deferred_txn_id.take()
+    }
+
+    /// Advances `max_committed` to the maximum of the given txn_ids.
+    ///
+    /// Called by the `CommitCoordinator` background task **after** a successful
+    /// `wal_flush_and_fsync()`, while holding the Database lock. Makes all
+    /// transactions in the batch visible to future snapshots.
+    ///
+    /// Does not regress `max_committed` — if `max(txn_ids) < self.max_committed`,
+    /// no change is made (safe for out-of-order batch notification, though in
+    /// practice batches are always monotone under the single-writer constraint).
+    pub fn advance_committed(&mut self, txn_ids: &[TxnId]) {
+        if let Some(&max) = txn_ids.iter().max() {
+            if max > self.max_committed {
+                self.max_committed = max;
+            }
+        }
+    }
+
+    /// Flushes the WAL BufWriter to the OS and fsyncs to disk.
+    ///
+    /// Called by the `CommitCoordinator` background task while holding the
+    /// Database lock, covering all Commit entries written since the last fsync.
+    ///
+    /// # Errors
+    /// - I/O errors from flush or fsync propagated to all batch waiters.
+    pub fn wal_flush_and_fsync(&mut self) -> Result<(), DbError> {
+        self.wal.commit()
     }
 
     /// Rolls back the active transaction: undoes heap changes and writes a
@@ -478,6 +553,8 @@ impl TxnManager {
             max_committed: result.max_committed,
             active: None,
             wal_scratch: Vec::with_capacity(256),
+            deferred_commit_mode: false,
+            pending_deferred_txn_id: None,
         };
         Ok((mgr, result))
     }

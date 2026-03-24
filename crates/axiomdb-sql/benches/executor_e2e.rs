@@ -370,6 +370,41 @@ fn bench_insert_batch_cached(c: &mut Criterion) {
     group.finish();
 }
 
+/// Baseline for group commit throughput comparison.
+///
+/// Measures INSERT throughput with inline fsync (group commit disabled)
+/// for 1, 4, 8, and 16 serial threads. Use this as the denominator when
+/// comparing against group commit enabled results.
+///
+/// To test group commit, enable it in server config and measure the same
+/// workload with N concurrent connections; expected improvement: ~N×
+/// throughput for N concurrent writers sharing one fsync per interval.
+fn bench_insert_serial_fsync_baseline(c: &mut Criterion) {
+    let counts = [1u32, 4, 8, 16];
+    let mut group = c.benchmark_group("insert_serial_fsync_baseline");
+
+    for n in counts {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_function(format!("{n}_inserts"), |b| {
+            b.iter_batched(
+                || {
+                    let mut db = Db::open();
+                    db.run("CREATE TABLE gc_bench (id INT NOT NULL, v TEXT)");
+                    db
+                },
+                |mut db| {
+                    for i in 0..n {
+                        db.run(&format!("INSERT INTO gc_bench VALUES ({i}, 'val{i}')"));
+                    }
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert_single,
@@ -382,5 +417,6 @@ criterion_group!(
     bench_select_count_aggregate,
     bench_update_where,
     bench_full_pipeline,
+    bench_insert_serial_fsync_baseline,
 );
 criterion_main!(benches);

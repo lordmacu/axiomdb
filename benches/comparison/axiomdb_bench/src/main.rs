@@ -61,14 +61,16 @@ impl Db {
             .active_snapshot()
             .unwrap_or_else(|_| self.txn.snapshot());
         let analyzed =
-            analyze(stmt, &mut self.storage, snap).unwrap_or_else(|e| panic!("analyze({q}): {e}"));
+            analyze(stmt, &self.storage, snap).unwrap_or_else(|e| panic!("analyze({q}): {e}"));
         execute(analyzed, &mut self.storage, &mut self.txn)
             .unwrap_or_else(|e| panic!("execute({q}): {e}"))
     }
 
     /// Like `sql()` but uses both schema caches:
+    ///
     /// - `SchemaCache` in analyze() → skips catalog scan for repeated tables
     /// - `SessionContext` in execute_with_ctx() → skips executor-side catalog scan
+    ///
     /// Pass the same `schema_cache` and `ctx` for the whole batch.
     fn sql_cached(
         &mut self,
@@ -81,7 +83,7 @@ impl Db {
             .txn
             .active_snapshot()
             .unwrap_or_else(|_| self.txn.snapshot());
-        let analyzed = analyze_cached(stmt, &mut self.storage, snap, schema_cache)
+        let analyzed = analyze_cached(stmt, &self.storage, snap, schema_cache)
             .unwrap_or_else(|e| panic!("analyze_cached({q}): {e}"));
         execute_with_ctx(analyzed, &mut self.storage, &mut self.txn, ctx)
             .unwrap_or_else(|e| panic!("execute_with_ctx({q}): {e}"))
@@ -123,12 +125,16 @@ fn reset(db: &mut Db) {
     );
 }
 
+/// Full load: reset then INSERT. Used for pre-loading data before read benchmarks
+/// and for the diagnose helper. NOT used in timed INSERT scenarios.
 fn load_batch(db: &mut Db, inserts: &[String]) {
     reset(db);
-    // Dual schema cache:
-    // - SchemaCache: eliminates catalog heap scan in analyze() per row
-    // - SessionContext: eliminates catalog heap scan in execute_with_ctx() per row
-    // Together they reduce catalog I/O from 4×N to 2 total (1 miss each, then cached).
+    insert_batch_pure(db, inserts);
+}
+
+/// INSERT only — reset happens outside timing via measure_with_setup.
+/// Dual schema cache eliminates catalog heap scans (4×N → 2 total per batch).
+fn insert_batch_pure(db: &mut Db, inserts: &[String]) {
     let mut schema_cache = SchemaCache::new();
     let mut ctx = SessionContext::default();
     db.sql("BEGIN");
@@ -153,6 +159,26 @@ fn measure<F: FnMut()>(mut f: F) -> f64 {
     t.iter().sum::<f64>() / t.len() as f64
 }
 
+/// Measure a closure that returns `Duration` — the closure is responsible for
+/// running setup BEFORE starting the timer and returning only the timed portion.
+/// This sidesteps the double-`&mut` borrow problem that two separate closures
+/// would cause when both capture the same mutable resource.
+///
+/// Pattern:
+/// ```rust
+/// measure_timed(|| { reset(&mut db); let t0 = Instant::now(); work(&mut db); t0.elapsed() })
+/// ```
+fn measure_timed<F: FnMut() -> std::time::Duration>(mut f: F) -> f64 {
+    for _ in 0..WARMUP {
+        f();
+    }
+    let mut t = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        t.push(f().as_secs_f64());
+    }
+    t.iter().sum::<f64>() / t.len() as f64
+}
+
 // ── Output ────────────────────────────────────────────────────────────────────
 
 fn out(scenario: &str, n_rows: usize, mean_s: f64, note: &str) {
@@ -162,11 +188,8 @@ fn out(scenario: &str, n_rows: usize, mean_s: f64, note: &str) {
         0
     };
     println!(
-        "{}",
-        format!(
-            r#"{{"engine":"AxiomDB","scenario":"{scenario}","rows":{n_rows},"mean_ms":{mean_ms:.1},"ops_per_s":{ops},"note":"{note}"}}"#,
-            mean_ms = mean_s * 1000.0,
-        )
+        r#"{{"engine":"AxiomDB","scenario":"{scenario}","rows":{n_rows},"mean_ms":{mean_ms:.1},"ops_per_s":{ops},"note":"{note}"}}"#,
+        mean_ms = mean_s * 1000.0,
     );
 }
 
@@ -180,18 +203,69 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
 
     match scenario {
         "insert_batch" => {
-            let mean = measure(|| load_batch(&mut db, &inserts));
-            out(scenario, n_rows, mean, "");
+            // reset (DROP+CREATE) outside timing — measures INSERT only (fair comparison)
+            let mean = measure_timed(|| {
+                reset(&mut db);
+                let t0 = Instant::now();
+                insert_batch_pure(&mut db, &inserts);
+                t0.elapsed()
+            });
+            out(scenario, n_rows, mean, "reset outside timing");
+        }
+
+        "crud_flow" => {
+            // Full cycle: INSERT → SELECT * → DELETE, measured separately per phase.
+            // Reset (DROP+CREATE) is outside timing for each iteration.
+            let mut ins_t = Vec::with_capacity(RUNS);
+            let mut sel_t = Vec::with_capacity(RUNS);
+            let mut del_t = Vec::with_capacity(RUNS);
+
+            for i in 0..(WARMUP + RUNS) {
+                reset(&mut db);
+
+                // INSERT
+                let t0 = Instant::now();
+                insert_batch_pure(&mut db, &inserts);
+                let t_ins = t0.elapsed().as_secs_f64();
+
+                // SELECT *
+                let t0 = Instant::now();
+                db.sql_count("SELECT * FROM bench_users");
+                let t_sel = t0.elapsed().as_secs_f64();
+
+                // DELETE all rows
+                let t0 = Instant::now();
+                db.sql("DELETE FROM bench_users");
+                let t_del = t0.elapsed().as_secs_f64();
+
+                if i >= WARMUP {
+                    ins_t.push(t_ins);
+                    sel_t.push(t_sel);
+                    del_t.push(t_del);
+                }
+            }
+
+            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+            out("crud_flow/insert", n_rows, mean(&ins_t), "");
+            out("crud_flow/select", n_rows, mean(&sel_t), "full scan");
+            out(
+                "crud_flow/delete",
+                n_rows,
+                mean(&del_t),
+                "full scan — index in Phase 5",
+            );
         }
 
         "insert_autocommit" => {
-            let mean = measure(|| {
+            let mean = measure_timed(|| {
                 reset(&mut db);
+                let t0 = Instant::now();
                 for sql in &ac {
                     db.sql(sql);
                 }
+                t0.elapsed()
             });
-            out(scenario, ac_n, mean, "");
+            out(scenario, ac_n, mean, "reset outside timing");
         }
 
         _ => {
@@ -322,7 +396,7 @@ fn diagnose(data_dir: &Path, n_rows: usize) {
             .txn
             .active_snapshot()
             .unwrap_or_else(|_| db.txn.snapshot());
-        analyze(stmt, &mut db.storage, snap).unwrap();
+        analyze(stmt, &db.storage, snap).unwrap();
     }
     let analyze_ns = t0.elapsed().as_nanos() as usize / iters;
 

@@ -142,6 +142,115 @@ impl HeapChain {
         Ok(())
     }
 
+    /// Deletes multiple tuples in a single pass — each heap page is read and
+    /// written **exactly once**, regardless of how many slots are deleted on it.
+    ///
+    /// ## Algorithm
+    ///
+    /// 1. Sort `rids` by `page_id` so that all slots on the same page are
+    ///    processed in one contiguous run.
+    /// 2. For each page: read once, call [`mark_deleted`] for every slot on
+    ///    that page, compute the checksum **once**, and write back.
+    /// 3. Return `(page_id, slot_id, old_bytes)` for each input slot — the
+    ///    `old_bytes` are the application payload extracted before marking dead,
+    ///    required for WAL `record_delete` entries.
+    ///
+    /// ## Performance
+    ///
+    /// For N rows across P pages this is **O(P)** page I/O instead of the
+    /// **O(3N)** of N individual [`delete`] calls (read + read + write per row).
+    /// At ~200 rows/page, a 10 K-row DELETE goes from ~30 K page ops to ~100.
+    ///
+    /// ## WAL ordering invariant
+    ///
+    /// `write_page()` happens **before** the caller records WAL entries — the
+    /// same ordering as [`insert_batch`] and the single-row [`delete`] path.
+    ///
+    /// ## Errors
+    ///
+    /// - [`DbError::AlreadyDeleted`] if any slot is already dead (fails fast,
+    ///   prior pages may already have been written).
+    /// - I/O errors from `storage`.
+    pub fn delete_batch(
+        storage: &mut dyn StorageEngine,
+        rids: &[(u64, u16)],
+        txn_id: TxnId,
+    ) -> Result<Vec<(u64, u16, Vec<u8>)>, DbError> {
+        if rids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Sort by (page_id, slot_id) so all slots on the same page are adjacent.
+        let mut sorted: Vec<(u64, u16)> = rids.to_vec();
+        sorted.sort_unstable_by_key(|&(page_id, slot_id)| (page_id, slot_id));
+
+        let mut result = Vec::with_capacity(rids.len());
+        let mut i = 0;
+
+        while i < sorted.len() {
+            let page_id = sorted[i].0;
+
+            // ── Read page ONCE ────────────────────────────────────────────────
+            let raw = *storage.read_page(page_id)?.as_bytes();
+            let mut page = Page::from_bytes(raw)?;
+
+            // ── Mark all slots on this page dead in-memory ────────────────────
+            // `mark_deleted` stamps txn_id_deleted without recomputing the
+            // checksum — we do that once below after all slots are processed.
+            while i < sorted.len() && sorted[i].0 == page_id {
+                let slot_id = sorted[i].1;
+
+                // Extract old_bytes BEFORE marking dead.
+                let old_bytes = match crate::heap::read_tuple(&page, slot_id)? {
+                    None => {
+                        return Err(DbError::AlreadyDeleted { page_id, slot_id });
+                    }
+                    Some((_header, data)) => data.to_vec(),
+                };
+
+                crate::heap::mark_deleted(&mut page, slot_id, txn_id)?;
+                result.push((page_id, slot_id, old_bytes));
+                i += 1;
+            }
+
+            // ── One checksum + one write for all slots on this page ───────────
+            page.update_checksum();
+            storage.write_page(page_id, &page)?;
+        }
+
+        Ok(result)
+    }
+
+    /// Returns only the `(page_id, slot_id)` of every tuple visible to `snap`.
+    ///
+    /// Equivalent to [`scan_visible`] but skips copying the row payload —
+    /// useful when the caller only needs record locations (e.g. DELETE without
+    /// a WHERE clause) and never needs to decode the row values.
+    ///
+    /// Eliminates all `Vec<u8>` allocations for the row data and all
+    /// row-decode overhead compared to [`scan_visible`] + discard.
+    pub fn scan_rids_visible(
+        storage: &dyn StorageEngine,
+        root_page_id: u64,
+        snap: TransactionSnapshot,
+    ) -> Result<Vec<(u64, u16)>, DbError> {
+        let mut result = Vec::new();
+        let mut current = root_page_id;
+
+        while current != 0 {
+            let page = storage.read_page(current)?;
+            let next = chain_next_page(page);
+
+            for (slot_id, _data) in scan_visible(page, &snap) {
+                result.push((current, slot_id));
+            }
+
+            current = next;
+        }
+
+        Ok(result)
+    }
+
     /// Returns all tuples visible to `snap` across the entire chain.
     ///
     /// Each item is `(page_id, slot_id, data_bytes)` where `data_bytes` is the
@@ -260,7 +369,7 @@ impl HeapChain {
 
                     // Step 2: allocate an empty new page.
                     let new_id = storage.alloc_page(PageType::Data)?;
-                    let mut new_page = Page::new(PageType::Data, new_id);
+                    let new_page = Page::new(PageType::Data, new_id);
 
                     // Step 3: link — re-read the page we just wrote, set the
                     // chain pointer, and write it again.
@@ -274,7 +383,6 @@ impl HeapChain {
                     // Step 4: switch to the new page.
                     last_id = new_id;
                     page = new_page;
-                    dirty = false;
 
                     // Step 5: retry insert on the empty new page (guaranteed fit).
                     let slot_id = insert_tuple(&mut page, data, txn_id)?;

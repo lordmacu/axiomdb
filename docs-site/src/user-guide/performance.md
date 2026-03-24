@@ -64,8 +64,30 @@ the technical explanation.
 
 **Remaining bottlenecks:**
 - SELECT: one full parse + analyze cycle per query (Phase 5.13 plan cache will amortize this)
-- INSERT: one `fdatasync` per autocommit statement is required for durability; the Phase 8
-  batch API will amortize fsync across many rows
+- INSERT (single connection): one `fdatasync` per autocommit statement; enable Group Commit
+  for concurrent workloads (see below)
+
+### Group Commit — Concurrent Write Throughput (Phase 3.19)
+
+With `group_commit_interval_ms = 0` (default), every DML commit fsyncs individually.
+With Group Commit enabled, N concurrent connections share one fsync per batch window:
+
+| Concurrency | group_commit disabled | group_commit_interval_ms=1 | Improvement |
+|---|---|---|---|
+| 1 connection  | 58 q/s (baseline) | ~57 q/s (+1ms latency)  | ~1× (no gain) |
+| 4 connections | ~58 q/s (serialized) | ~200+ q/s (shared fsync) | ~4× |
+| 8 connections | ~58 q/s             | ~400+ q/s                | ~8× |
+| 16 connections| ~58 q/s             | ~800+ q/s                | ~16× |
+
+*Theoretical upper bound — actual numbers depend on NVMe latency and connection overlap.*
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage vs MySQL InnoDB</span>
+MySQL's <code>innodb_flush_log_at_trx_commit=1</code> (default, fully durable) also pays one fsync per transaction under low concurrency. MySQL's group commit kicks in automatically at high concurrency. AxiomDB's Group Commit is explicit and configurable, achieving the same batching effect without the InnoDB overhead of a separate undo tablespace write before each row mutation.
+</div>
+</div>
 
 ### End-to-End INSERT Throughput (Phase 4.16b)
 

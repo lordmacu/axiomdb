@@ -53,6 +53,9 @@ pub enum DbError {
     CheckViolation { table: String, constraint: String },
 
     // ── WAL ──────────────────────────────────────────────────────
+    #[error("WAL group commit fsync failed: {message}")]
+    WalGroupCommitFailed { message: String },
+
     #[error(
         "WAL entry at LSN {lsn} has invalid checksum: expected {expected:#010x}, got {got:#010x}"
     )]
@@ -217,6 +220,7 @@ impl DbError {
             DbError::CheckViolation { .. } => "23514",
             DbError::DuplicateKey => "23505",
             // ── Transaction ───────────────────────────────────────────────
+            DbError::WalGroupCommitFailed { .. } => "XX000",
             DbError::DeadlockDetected => "40P01",
             DbError::TransactionAlreadyActive { .. } => "25001",
             DbError::NoActiveTransaction => "25P01",

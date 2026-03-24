@@ -260,3 +260,30 @@ ensures the entire transaction is rolled back on recovery.
 - Use `INSERT ... SELECT` to batch multiple rows rather than thousands of individual
   INSERTs in a loop within one transaction.
 - For bulk loads, consider committing every 10,000 rows to limit WAL growth.
+
+### Group Commit — High-Concurrency Throughput
+
+Under the default configuration every DML commit pays one `fsync` (~0.1–10ms on
+SSD/HDD). With many concurrent connections this adds up fast. Enable **Group Commit**
+to amortise `fsync` cost across all connections that commit within the same window:
+
+```toml
+# axiomdb.toml
+group_commit_interval_ms = 1   # batch window in milliseconds (0 = disabled)
+group_commit_max_batch   = 64  # trigger fsync immediately when 64 connections wait
+```
+
+With `group_commit_interval_ms = 1` and 16 concurrent writers, each issuing one
+INSERT per transaction, the expected improvement is **up to 16× throughput** — all 16
+connections share a single `fsync` instead of paying 16 sequential ones.
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Tip</span>
+Group Commit adds at most <code>group_commit_interval_ms</code> of latency to each
+individual DML commit. For latency-sensitive single-connection workloads keep the
+default <code>group_commit_interval_ms = 0</code>. For throughput-sensitive workloads
+with many concurrent connections, <code>1</code> is a good starting value.
+</div>
+</div>
