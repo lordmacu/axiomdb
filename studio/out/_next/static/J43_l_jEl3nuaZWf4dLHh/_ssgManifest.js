@@ -1,0 +1,1 @@
+self.__SSG_MANIFEST=new Set(["\u002Ftables\u002F[table]"]);self.__SSG_MANIFEST_CB&&self.__SSG_MANIFEST_CB()
