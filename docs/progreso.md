@@ -173,7 +173,7 @@
 - [x] 5.7 ✅ Test with real client — pymysql: connect, CREATE, INSERT (AUTO_INCREMENT), SELECT, error handling all pass
 - [x] 5.8 ✅ Protocol unit tests — 47 tests: codec round-trip, greeting structure, OK/ERR/EOF, lenenc boundaries, result set sequence IDs, auth, session state
 - [x] 5.9 ✅ Session state — ConnectionState: SET autocommit/NAMES/@@vars stored; SHOW VARIABLES result set; SELECT @@var from state; COM_INIT_DB updates current_database
-- [ ] 5.10 ⏳ COM_STMT_PREPARE / COM_STMT_EXECUTE — prepared statements over wire protocol; all ORMs use them, avoid parse overhead per query
+- [x] 5.10 ✅ COM_STMT_PREPARE / COM_STMT_EXECUTE — binary param decoding (TINY/SHORT/LONG/LONGLONG/FLOAT/DOUBLE/DATE/DATETIME/strings); ? substitution with escape; COM_STMT_CLOSE/RESET; pymysql full test suite passes (INT/Bool/NULL/quotes/DictCursor)
 - [x] 5.11 ✅ COM_PING / COM_QUIT / COM_RESET_CONNECTION / COM_INIT_DB — all handled in handler.rs command loop (0x0e, 0x01, 0x1f, 0x02)
 - [ ] 5.11b ⏳ COM_STMT_SEND_LONG_DATA — chunked transmission of large parameters (BLOBs, TEXTs) in multiple packets; required for INSERT of images/documents via prepared statements
 - [ ] 5.11c ⏳ Explicit connection state machine — states: `CONNECTED→AUTH→IDLE→EXECUTING→CLOSING`; timeout handling per state; detect abruptly closed socket (TCP keepalive)

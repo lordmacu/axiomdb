@@ -20,7 +20,8 @@ use tokio::sync::Mutex;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, info, warn};
 
-use axiomdb_sql::SessionContext;
+use axiomdb_sql::{ast::Stmt, result::ColumnMeta, SessionContext};
+use axiomdb_types::DataType;
 
 use super::{
     auth::{gen_challenge, is_allowed_user, verify_native_password, verify_sha256_password},
@@ -31,6 +32,7 @@ use super::{
         build_auth_more_data, build_err_packet, build_ok_packet, build_server_greeting,
         parse_handshake_response,
     },
+    prepared::{build_prepare_response, parse_execute_packet, substitute_params},
     result::serialize_query_result,
     session::ConnectionState,
 };
@@ -242,6 +244,114 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 if writer.send((1u8, ok.as_slice())).await.is_err() {
                     break;
                 }
+            }
+
+            // COM_STMT_PREPARE
+            0x16 => {
+                let sql = match std::str::from_utf8(body) {
+                    Ok(s) => s.trim().to_string(),
+                    Err(_) => {
+                        let e = build_err_packet(1064, b"42000", "Invalid UTF-8 in prepare");
+                        let _ = writer.send((1u8, e.as_slice())).await;
+                        continue;
+                    }
+                };
+                debug!(conn_id, sql = %sql, "COM_STMT_PREPARE");
+
+                // Validate SQL and get result column metadata.
+                let result_cols = {
+                    let guard = db.lock().await;
+                    let snap = guard
+                        .txn
+                        .active_snapshot()
+                        .unwrap_or_else(|_| guard.txn.snapshot());
+                    match axiomdb_sql::parse(&sql, None)
+                        .and_then(|s| axiomdb_sql::analyze(s, &guard.storage, snap))
+                    {
+                        Ok(analyzed) => extract_result_columns(&analyzed),
+                        Err(_) => vec![], // unknown columns at prepare time — acceptable
+                    }
+                };
+
+                let (stmt_id, param_count) = conn_state.prepare_statement(sql);
+                let packets = build_prepare_response(stmt_id, param_count, &result_cols, 1);
+                for (seq, pkt) in packets {
+                    if writer.send((seq, pkt.as_slice())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            // COM_STMT_EXECUTE
+            0x17 => {
+                if body.len() < 4 {
+                    let e = build_err_packet(1105, b"HY000", "Malformed COM_STMT_EXECUTE");
+                    let _ = writer.send((1u8, e.as_slice())).await;
+                    continue;
+                }
+                let stmt_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+
+                // Find statement and decode parameters
+                let result = if let Some(stmt) = conn_state.prepared_statements.get_mut(&stmt_id) {
+                    match parse_execute_packet(body, stmt) {
+                        Ok(exec) => {
+                            let sql_template = stmt.sql_template.clone();
+                            match substitute_params(&sql_template, &exec.params) {
+                                Ok(final_sql) => {
+                                    debug!(conn_id, sql = %final_sql, "COM_STMT_EXECUTE");
+                                    let mut guard = db.lock().await;
+                                    guard.execute_query(&final_sql, &mut session)
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Err(axiomdb_core::error::DbError::Internal {
+                        message: format!("Unknown prepared statement handler: stmt_id={stmt_id}"),
+                    })
+                };
+
+                match result {
+                    Ok(qr) => {
+                        for (seq, pkt) in serialize_query_result(qr, 1) {
+                            if writer.send((seq, pkt.as_slice())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Map unknown stmt to error 1243
+                        let me = if e.to_string().contains("Unknown prepared statement") {
+                            super::error::MysqlError {
+                                code: 1243,
+                                sql_state: *b"HY000",
+                                message: e.to_string(),
+                            }
+                        } else {
+                            super::error::dberror_to_mysql(&e)
+                        };
+                        let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
+                        let _ = writer.send((1u8, pkt.as_slice())).await;
+                    }
+                }
+            }
+
+            // COM_STMT_CLOSE — no response
+            0x19 => {
+                if body.len() >= 4 {
+                    let stmt_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                    conn_state.prepared_statements.remove(&stmt_id);
+                    debug!(conn_id, stmt_id, "COM_STMT_CLOSE");
+                }
+                // No response for COM_STMT_CLOSE
+            }
+
+            // COM_STMT_RESET
+            0x1a => {
+                let ok = build_ok_packet(0, 0, 0);
+                let _ = writer.send((1u8, ok.as_slice())).await;
             }
 
             other => {
@@ -485,4 +595,28 @@ fn single_null_row(col_name: &str) -> Vec<(u8, Vec<u8>)> {
         rows,
     };
     serialize_query_result(qr, 1)
+}
+
+// ── Prepared statement helpers ────────────────────────────────────────────────
+
+/// Extracts the result column metadata from an analyzed SELECT statement.
+/// Returns an empty vec for non-SELECT statements (INSERT/UPDATE/DELETE/DDL).
+fn extract_result_columns(stmt: &Stmt) -> Vec<ColumnMeta> {
+    use axiomdb_sql::ast::SelectItem;
+    match stmt {
+        Stmt::Select(s) => s
+            .columns
+            .iter()
+            .map(|item| match item {
+                SelectItem::Expr { alias, expr } => {
+                    let name = alias.clone().unwrap_or_else(|| format!("{expr:?}"));
+                    ColumnMeta::computed(name, DataType::Text) // type unknown without full inference
+                }
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                    ColumnMeta::computed("*".to_string(), DataType::Text)
+                }
+            })
+            .collect(),
+        _ => vec![],
+    }
 }

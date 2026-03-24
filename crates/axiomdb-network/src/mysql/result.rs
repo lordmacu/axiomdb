@@ -65,6 +65,10 @@ fn serialize_rows(cols: &[ColumnMeta], rows: &[Row], seq_start: u8) -> PacketSeq
     packets
 }
 
+pub(crate) fn build_column_def_pub(col: &ColumnMeta) -> Vec<u8> {
+    build_column_def(col)
+}
+
 fn build_column_def(col: &ColumnMeta) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
 
@@ -188,6 +192,10 @@ fn value_to_text(v: &Value) -> String {
     }
 }
 
+pub(crate) fn format_decimal_pub(mantissa: i128, scale: u8) -> String {
+    format_decimal(mantissa, scale)
+}
+
 fn format_decimal(mantissa: i128, scale: u8) -> String {
     if scale == 0 {
         return mantissa.to_string();
@@ -204,12 +212,20 @@ fn format_decimal(mantissa: i128, scale: u8) -> String {
     }
 }
 
+pub(crate) fn format_date_pub(days_since_epoch: i32) -> String {
+    format_date(days_since_epoch)
+}
+
 fn format_date(days_since_epoch: i32) -> String {
     // days_since_epoch: days since 1970-01-01 (same as chrono NaiveDate)
     // Simple implementation using arithmetic (avoids chrono dependency).
     let d = i64::from(days_since_epoch);
     let (year, month, day) = days_to_ymd(d);
     format!("{year:04}-{month:02}-{day:02}")
+}
+
+pub(crate) fn format_timestamp_pub(micros: i64) -> String {
+    format_timestamp(micros)
 }
 
 fn format_timestamp(micros: i64) -> String {

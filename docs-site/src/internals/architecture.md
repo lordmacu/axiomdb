@@ -234,12 +234,120 @@ Client → HandshakeResponse41
   │
   ▼  COMMAND LOOP
   │
-  ├── COM_QUERY (0x03)  → parse SQL → intercept? → execute → result packets
-  ├── COM_PING  (0x0e)  → OK
-  ├── COM_INIT_DB (0x02)→ updates current_database in ConnectionState + OK
+  ├── COM_QUERY (0x03)        → parse SQL → intercept? → execute → result packets
+  ├── COM_PING  (0x0e)        → OK
+  ├── COM_INIT_DB (0x02)      → updates current_database in ConnectionState + OK
   ├── COM_RESET_CONNECTION (0x1f) → resets ConnectionState + OK
-  └── COM_QUIT  (0x01)  → close
+  ├── COM_STMT_PREPARE (0x16) → parse SQL with ? placeholders → stmt_ok packet
+  ├── COM_STMT_EXECUTE (0x17) → decode binary params → substitute → execute → result packets
+  ├── COM_STMT_RESET (0x1a)   → OK
+  ├── COM_STMT_CLOSE (0x19)   → remove from cache, no response
+  └── COM_QUIT  (0x01)        → close
 ```
+
+#### Prepared statements (prepared.rs)
+
+Prepared statements allow a client to send SQL once and execute it many times with
+different parameters, avoiding repeated parsing and enabling binary parameter encoding
+that is more efficient than string escaping.
+
+**Protocol flow:**
+
+```
+Client → COM_STMT_PREPARE  (SQL with ? placeholders)
+  │
+Server reads the SQL, counts ? placeholders, assigns a stmt_id.
+  │
+Server → Statement OK packet
+  │       stmt_id: u32
+  │       num_columns: u16  (columns in the result set, or 0 for DML)
+  │       num_params:  u16  (number of ? placeholders)
+  │       followed by num_params parameter-definition packets + EOF
+  │       followed by num_columns column-definition packets + EOF
+  │
+Client → COM_STMT_EXECUTE
+  │       stmt_id: u32
+  │       flags: u8  (0 = CURSOR_TYPE_NO_CURSOR)
+  │       iteration_count: u32  (always 1)
+  │       null_bitmap: ceil(num_params / 8) bytes  (one bit per param)
+  │       new_params_bound_flag: u8  (1 = type list follows)
+  │       param_types: [u8; num_params * 2]  (type byte + unsigned flag)
+  │       param_values: binary-encoded values for non-NULL params
+  │
+Server → result set packets  (same text-protocol format as COM_QUERY)
+  │
+Client → COM_STMT_CLOSE (stmt_id)   — no response expected
+```
+
+**Binary parameter decoding (`decode_binary_value`):**
+
+Each parameter is decoded according to its MySQL type byte:
+
+| MySQL type byte | Type name | Decoded as |
+|---|---|---|
+| `0x01` | TINY | `i8` → `Value::Int` |
+| `0x02` | SHORT | `i16` → `Value::Int` |
+| `0x03` | LONG | `i32` → `Value::Int` |
+| `0x08` | LONGLONG | `i64` → `Value::BigInt` |
+| `0x04` | FLOAT | `f32` → `Value::Real` |
+| `0x05` | DOUBLE | `f64` → `Value::Real` |
+| `0x0a` | DATE | 4-byte packed date → `Value::Date` |
+| `0x07` / `0x0c` | TIMESTAMP / DATETIME | 7-byte packed datetime → `Value::Timestamp` |
+| `0xfd` / `0xfe` / `0xfc` | VAR_STRING / STRING / BLOB | lenenc bytes → `Value::Text` |
+
+NULL parameters are identified by the null-bitmap before the type list is read;
+they produce `Value::Null` without consuming any bytes from the value region.
+
+**Parameter substitution (`substitute_params`):**
+
+After decoding, `value_to_sql_literal` converts each `Value` to a SQL literal string:
+- `Null` → `NULL`
+- `Bool` → `TRUE` / `FALSE`
+- `Int` / `BigInt` / `Real` → numeric literal (no quotes)
+- `Text` → `'...'` with single-quote escaping (`'` → `''`)
+- `Date` → `'YYYY-MM-DD'`
+- `Timestamp` → `'YYYY-MM-DD HH:MM:SS'`
+
+`substitute_params` then replaces each `?` placeholder in the original SQL text with
+the corresponding literal, left to right, producing a complete SQL string that is
+passed to the standard `execute_query` path.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Text-Protocol Response for Prepared Statement Results</span>
+<code>COM_STMT_EXECUTE</code> responses use the same text-protocol result-set format as
+<code>COM_QUERY</code> (column defs + EOF + text-encoded rows + EOF), not the MySQL
+binary result-set format. The binary result-set format requires a separate
+<code>CLIENT_PS_MULTI_RESULTS</code> serialization path for every column type and adds
+substantial protocol complexity with marginal benefit for typical workloads. The
+text-protocol response is fully accepted by PyMySQL, SQLAlchemy, and the <code>mysql</code>
+CLI. Binary result-set serialization is deferred to subphase 5.5a when a concrete
+performance need arises.
+</div>
+</div>
+
+**`ConnectionState` — per-connection prepared statement cache:**
+
+```rust
+pub struct ConnectionState {
+    pub current_database: Option<String>,
+    pub prepared_statements: HashMap<u32, PreparedStatement>,
+    pub next_stmt_id: u32,
+}
+
+pub struct PreparedStatement {
+    pub id: u32,
+    pub sql: String,       // original SQL with ? placeholders
+    pub num_params: u16,
+}
+```
+
+Each connection maintains its own `HashMap<u32, PreparedStatement>`. Statement IDs are
+assigned by incrementing `next_stmt_id` (starting at 1) and are local to the connection
+— the same ID on two connections refers to two different statements. `COM_STMT_CLOSE`
+removes the entry; subsequent `COM_STMT_EXECUTE` calls for the closed ID return an
+`Unknown prepared statement` error.
 
 #### Packet framing (codec.rs)
 
