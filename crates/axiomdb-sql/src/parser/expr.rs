@@ -292,6 +292,14 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
     let pos = p.current_pos();
 
     match p.peek().clone() {
+        // `?` — positional prepared-statement parameter placeholder.
+        Token::Question => {
+            p.advance();
+            let idx = p.param_count;
+            p.param_count += 1;
+            Ok(Expr::Param { idx })
+        }
+
         Token::Integer(n) => {
             p.advance();
             if n >= i32::MIN as i64 && n <= i32::MAX as i64 {

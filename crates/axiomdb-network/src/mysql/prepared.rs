@@ -7,7 +7,11 @@
 //! - Substituting decoded parameters into SQL `?` placeholders
 
 use axiomdb_core::error::DbError;
-use axiomdb_sql::result::ColumnMeta;
+use axiomdb_sql::{
+    ast::{SelectItem, SelectStmt, Stmt},
+    expr::Expr,
+    result::ColumnMeta,
+};
 use axiomdb_types::Value;
 
 use super::{
@@ -450,6 +454,174 @@ pub fn value_to_sql_literal(v: &Value) -> String {
                 u[8],u[9],u[10],u[11],u[12],u[13],u[14],u[15]
             )
         }
+    }
+}
+
+// ── AST parameter substitution ────────────────────────────────────────────────
+
+/// Replaces every `Expr::Param { idx }` in `stmt` with `Expr::Literal(params[idx])`.
+///
+/// Called on each `COM_STMT_EXECUTE` using a **cached** analyzed statement.
+/// This is a simple tree-walk (~1µs) — orders of magnitude faster than
+/// re-running `parse()` + `analyze()` (~5ms combined).
+pub fn substitute_params_in_ast(stmt: Stmt, params: &[Value]) -> Result<Stmt, DbError> {
+    match stmt {
+        Stmt::Select(s) => Ok(Stmt::Select(subst_select(s, params)?)),
+        Stmt::Insert(mut s) => {
+            use axiomdb_sql::ast::InsertSource;
+            s.source = match s.source {
+                InsertSource::Values(rows) => InsertSource::Values(
+                    rows.into_iter()
+                        .map(|row| {
+                            row.into_iter()
+                                .map(|e| subst_expr_param(e, params))
+                                .collect()
+                        })
+                        .collect(),
+                ),
+                InsertSource::Select(sel) => {
+                    InsertSource::Select(Box::new(subst_select(*sel, params)?))
+                }
+                other => other,
+            };
+            Ok(Stmt::Insert(s))
+        }
+        Stmt::Update(mut s) => {
+            s.where_clause = s.where_clause.map(|e| subst_expr_param(e, params));
+            s.assignments = s
+                .assignments
+                .into_iter()
+                .map(|mut a| {
+                    a.value = subst_expr_param(a.value, params);
+                    a
+                })
+                .collect();
+            Ok(Stmt::Update(s))
+        }
+        Stmt::Delete(mut s) => {
+            s.where_clause = s.where_clause.map(|e| subst_expr_param(e, params));
+            Ok(Stmt::Delete(s))
+        }
+        other => Ok(other), // DDL and control statements have no params
+    }
+}
+
+fn subst_select(mut s: SelectStmt, params: &[Value]) -> Result<SelectStmt, DbError> {
+    s.where_clause = s.where_clause.map(|e| subst_expr_param(e, params));
+    s.having = s.having.map(|e| subst_expr_param(e, params));
+    s.columns = s
+        .columns
+        .into_iter()
+        .map(|item| match item {
+            SelectItem::Expr { expr, alias } => SelectItem::Expr {
+                expr: subst_expr_param(expr, params),
+                alias,
+            },
+            other => other,
+        })
+        .collect();
+    s.group_by = s
+        .group_by
+        .into_iter()
+        .map(|e| subst_expr_param(e, params))
+        .collect();
+    s.order_by = s
+        .order_by
+        .into_iter()
+        .map(|mut item| {
+            item.expr = subst_expr_param(item.expr, params);
+            item
+        })
+        .collect();
+    s.limit = s.limit.map(|e| subst_expr_param(e, params));
+    s.offset = s.offset.map(|e| subst_expr_param(e, params));
+    Ok(s)
+}
+
+/// Recursively replaces `Expr::Param { idx }` with `Expr::Literal(params[idx])`.
+fn subst_expr_param(expr: Expr, params: &[Value]) -> Expr {
+    match expr {
+        Expr::Param { idx } => Expr::Literal(params.get(idx).cloned().unwrap_or(Value::Null)),
+        // Compound nodes — recurse.
+        Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+            op,
+            operand: Box::new(subst_expr_param(*operand, params)),
+        },
+        Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+            op,
+            left: Box::new(subst_expr_param(*left, params)),
+            right: Box::new(subst_expr_param(*right, params)),
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(subst_expr_param(*expr, params)),
+            negated,
+        },
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(subst_expr_param(*expr, params)),
+            low: Box::new(subst_expr_param(*low, params)),
+            high: Box::new(subst_expr_param(*high, params)),
+            negated,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(subst_expr_param(*expr, params)),
+            pattern: Box::new(subst_expr_param(*pattern, params)),
+            negated,
+        },
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => Expr::In {
+            expr: Box::new(subst_expr_param(*expr, params)),
+            list: list
+                .into_iter()
+                .map(|e| subst_expr_param(e, params))
+                .collect(),
+            negated,
+        },
+        Expr::Function { name, args } => Expr::Function {
+            name,
+            args: args
+                .into_iter()
+                .map(|e| subst_expr_param(e, params))
+                .collect(),
+        },
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => Expr::Case {
+            operand: operand.map(|e| Box::new(subst_expr_param(*e, params))),
+            when_thens: when_thens
+                .into_iter()
+                .map(|(w, t)| (subst_expr_param(w, params), subst_expr_param(t, params)))
+                .collect(),
+            else_result: else_result.map(|e| Box::new(subst_expr_param(*e, params))),
+        },
+        Expr::Cast { expr, target } => Expr::Cast {
+            expr: Box::new(subst_expr_param(*expr, params)),
+            target,
+        },
+        Expr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => Expr::InSubquery {
+            expr: Box::new(subst_expr_param(*expr, params)),
+            query,
+            negated,
+        },
+        // Leaf nodes — pass through unchanged.
+        other => other,
     }
 }
 

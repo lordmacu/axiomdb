@@ -32,7 +32,9 @@ use super::{
         build_auth_more_data, build_err_packet, build_ok_packet, build_server_greeting,
         parse_handshake_response,
     },
-    prepared::{build_prepare_response, parse_execute_packet, substitute_params},
+    prepared::{
+        build_prepare_response, parse_execute_packet, substitute_params, substitute_params_in_ast,
+    },
     result::serialize_query_result,
     session::ConnectionState,
 };
@@ -243,7 +245,7 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 }
             }
 
-            // COM_STMT_PREPARE
+            // COM_STMT_PREPARE — parse+analyze once and cache the result.
             0x16 => {
                 let sql = match std::str::from_utf8(body) {
                     Ok(s) => s.trim().to_string(),
@@ -255,8 +257,10 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 };
                 debug!(conn_id, sql = %sql, "COM_STMT_PREPARE");
 
-                // Validate SQL and get result column metadata.
-                let result_cols = {
+                // Parse+analyze once. The analyzed Stmt (with Expr::Param nodes)
+                // is cached in PreparedStatement.analyzed_stmt for reuse on every
+                // COM_STMT_EXECUTE without re-parsing or re-analyzing.
+                let (analyzed_stmt, result_cols) = {
                     let guard = db.lock().await;
                     let snap = guard
                         .txn
@@ -265,19 +269,26 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     match axiomdb_sql::parse(&sql, None)
                         .and_then(|s| axiomdb_sql::analyze(s, &guard.storage, snap))
                     {
-                        Ok(analyzed) => extract_result_columns(&analyzed),
-                        Err(_) => vec![], // unknown columns at prepare time — acceptable
+                        Ok(analyzed) => {
+                            let cols = extract_result_columns(&analyzed);
+                            (Some(analyzed), cols)
+                        }
+                        Err(_) => (None, vec![]),
                     }
                 };
 
                 let (stmt_id, param_count) = conn_state.prepare_statement(sql);
+                // Store the cached analyzed statement.
+                if let Some(ps) = conn_state.prepared_statements.get_mut(&stmt_id) {
+                    ps.analyzed_stmt = analyzed_stmt;
+                }
                 let packets = build_prepare_response(stmt_id, param_count, &result_cols, 1);
                 if send_packets(&mut writer, &packets).await.is_err() {
                     break;
                 }
             }
 
-            // COM_STMT_EXECUTE
+            // COM_STMT_EXECUTE — use cached plan, skip parse+analyze.
             0x17 => {
                 if body.len() < 4 {
                     let e = build_err_packet(1105, b"HY000", "Malformed COM_STMT_EXECUTE");
@@ -286,18 +297,32 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 }
                 let stmt_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
 
-                // Find statement and decode parameters
                 let result = if let Some(stmt) = conn_state.prepared_statements.get_mut(&stmt_id) {
                     match parse_execute_packet(body, stmt) {
                         Ok(exec) => {
-                            let sql_template = stmt.sql_template.clone();
-                            match substitute_params(&sql_template, &exec.params) {
-                                Ok(final_sql) => {
-                                    debug!(conn_id, sql = %final_sql, "COM_STMT_EXECUTE");
-                                    let mut guard = db.lock().await;
-                                    guard.execute_query(&final_sql, &mut session)
+                            if let Some(cached) = stmt.analyzed_stmt.clone() {
+                                // ── FAST PATH: use cached plan (skip parse+analyze) ──
+                                // Substitute Expr::Param nodes with actual values (~1µs)
+                                // then execute directly (~50µs). Eliminates ~5ms overhead.
+                                debug!(conn_id, stmt_id, "COM_STMT_EXECUTE (plan cache hit)");
+                                match substitute_params_in_ast(cached, &exec.params) {
+                                    Ok(ready_stmt) => {
+                                        let mut guard = db.lock().await;
+                                        guard.execute_stmt(ready_stmt, &mut session)
+                                    }
+                                    Err(e) => Err(e),
                                 }
-                                Err(e) => Err(e),
+                            } else {
+                                // ── FALLBACK: no cached plan, use string substitution ──
+                                let sql_template = stmt.sql_template.clone();
+                                match substitute_params(&sql_template, &exec.params) {
+                                    Ok(final_sql) => {
+                                        debug!(conn_id, sql = %final_sql, "COM_STMT_EXECUTE (no cache)");
+                                        let mut guard = db.lock().await;
+                                        guard.execute_query(&final_sql, &mut session)
+                                    }
+                                    Err(e) => Err(e),
+                                }
                             }
                         }
                         Err(e) => Err(e),

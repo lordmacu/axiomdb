@@ -60,6 +60,16 @@ impl Database {
         execute_with_ctx(analyzed, &mut self.storage, &mut self.txn, session)
     }
 
+    /// Executes an already-analyzed `Stmt` — used by the prepared statement
+    /// plan cache path to skip `parse()` + `analyze()` entirely.
+    pub fn execute_stmt(
+        &mut self,
+        stmt: axiomdb_sql::ast::Stmt,
+        session: &mut SessionContext,
+    ) -> Result<QueryResult, DbError> {
+        execute_with_ctx(stmt, &mut self.storage, &mut self.txn, session)
+    }
+
     /// Returns the current database name (always "axiomdb" for Phase 5).
     pub fn current_database(&self) -> &str {
         "axiomdb"

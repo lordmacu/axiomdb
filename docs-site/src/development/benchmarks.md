@@ -206,14 +206,55 @@ consistency within the same process.
 
 **Bottleneck analysis:**
 
-- **SELECT 185 q/s:** each query still runs a full parse + analyze cycle (~1.5 µs) plus
+- **SELECT 185 q/s:** each `COM_QUERY` runs a full parse + analyze cycle (~1.5 µs) plus
   one wire protocol round-trip (~40 µs on localhost). The dominant cost is the round-trip.
-  Phase 5.13 plan cache will eliminate the parse/analyze overhead; throughput will then be
-  limited purely by network latency.
+  For prepared statements (`COM_STMT_EXECUTE`), Phase 5.13 plan cache eliminates the
+  parse/analyze step entirely — the cached AST is reused and only a ~1 µs parameter
+  substitution pass runs before execution. The remaining bottleneck for higher throughput
+  is WAL transaction overhead per statement (BEGIN/COMMIT I/O); this will be addressed
+  by Phase 6 indexed reads (eliminating full-table scans) and the Phase 8 batch API.
 - **INSERT 58 q/s:** one `fdatasync` per autocommit statement is required for durability.
   At ~10–20 ms/fsync on NVMe this caps single-connection autocommit INSERT at ~50–100 q/s,
   consistent with the observed 58 q/s. The Phase 8 batch API will coalesce multiple inserts
   into one WAL append + one fsync, targeting the 180K ops/s budget.
+
+---
+
+## Phase 5.13 — Prepared Statement Plan Cache {#phase-513-plan-cache}
+
+Phase 5.13 introduces an AST-level plan cache for prepared statements. The full parse +
+analyze pipeline runs **once** at `COM_STMT_PREPARE` time; each subsequent
+`COM_STMT_EXECUTE` performs only a tree walk to substitute parameter values (~1 µs)
+and then calls `execute_stmt()` directly.
+
+| Path | Parse + Analyze | Param substitution | Total SQL overhead |
+|---|---|---|---|
+| `COM_QUERY` (text protocol) | ~1.5 µs per call | — | ~1.5 µs |
+| `COM_STMT_EXECUTE` before 5.13 | ~1.5 µs per call (re-parse) | string replace | ~1.5 µs |
+| `COM_STMT_EXECUTE` after 5.13 | 0 (cached) | ~1 µs AST walk | **~1 µs** |
+
+The ~0.5 µs saving per execute is meaningful for high-frequency statement patterns
+(e.g., ORM-generated queries that re-execute the same SELECT or INSERT with different
+parameters on every request).
+
+**Remaining bottleneck:** the dominant cost per `COM_STMT_EXECUTE` is now the WAL
+transaction overhead (BEGIN/COMMIT I/O) rather than parse/analyze. For read-only
+prepared statements, Phase 6 indexed reads will eliminate full-table scans, reducing
+the per-query execution cost. For write statements, the Phase 8 batch API will coalesce
+WAL entries, targeting the 180K ops/s budget.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — AST cache, not string cache</span>
+The plan cache stores the analyzed <code>Stmt</code> (AST with resolved column indices)
+rather than the original SQL string. This means each execute avoids both lexing and
+semantic analysis, not just parsing. The trade-off is that the cached AST must be
+cloned before parameter substitution to avoid mutating shared state — a shallow clone
+of the expression tree is ~200 ns, well below the ~1.5 µs that parse + analyze would
+cost. MySQL and PostgreSQL cache parsed + planned query trees for the same reason.
+</div>
+</div>
 
 ---
 

@@ -392,6 +392,9 @@ pub enum Token<'src> {
     Semicolon,
     #[token(":")]
     Colon,
+    /// `?` — positional parameter placeholder in a prepared statement template.
+    #[token("?")]
+    Question,
 
     // ── Sentinel ──────────────────────────────────────────────────────────────
     /// End-of-input sentinel added by [`tokenize`]. Never produced by logos.

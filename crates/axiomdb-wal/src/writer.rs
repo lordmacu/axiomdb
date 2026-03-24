@@ -250,13 +250,10 @@ impl WalWriter {
 
     /// Flushes the buffer to the OS page cache WITHOUT fsync.
     ///
-    /// Used for read-only transaction commits: the COMMIT entry is visible to
-    /// subsequent readers (including crash recovery) because the OS page cache
-    /// is shared, but it is NOT guaranteed to survive an OS crash.
-    ///
-    /// This is safe for read-only transactions because no heap data was
-    /// modified — even if the COMMIT is lost after an OS crash, max_committed
-    /// will simply be lower, with no data loss.
+    /// Used for read-only transaction commits. The data is visible to subsequent
+    /// readers (including crash recovery after process restart) because the OS
+    /// page cache is shared. Not guaranteed to survive a kernel crash, but safe
+    /// since no heap data was modified.
     pub fn flush_no_sync(&mut self) -> Result<(), DbError> {
         self.writer.flush()?;
         Ok(())
