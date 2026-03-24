@@ -23,7 +23,7 @@
 use std::path::Path;
 
 use axiomdb_core::{error::DbError, TransactionSnapshot, TxnId};
-use axiomdb_storage::{clear_deletion, mark_slot_dead, Page, StorageEngine};
+use axiomdb_storage::{clear_deletion, heap_chain::HeapChain, mark_slot_dead, Page, StorageEngine};
 
 use crate::{
     checkpoint::Checkpointer,
@@ -48,6 +48,9 @@ pub enum UndoOp {
     // UPDATE is recorded as UndoInsert(new_slot) + UndoDelete(old_slot).
     // Reversed: UndoDelete(old_slot) runs first (restores old), then
     // UndoInsert(new_slot) (kills the replacement). Correct MVCC undo.
+    /// Undo a full-table delete: scan the heap chain and clear txn_id_deleted
+    /// for every slot deleted by this transaction.
+    UndoTruncate { root_page_id: u64 },
 }
 
 // ── ActiveTxn ────────────────────────────────────────────────────────────────
@@ -280,6 +283,9 @@ impl TxnManager {
                     clear_deletion(&mut page, slot_id)?;
                     storage.write_page(page_id, &page)?;
                 }
+                UndoOp::UndoTruncate { root_page_id } => {
+                    HeapChain::clear_deletions_by_txn(storage, root_page_id, txn_id)?;
+                }
             }
         }
         // max_committed is unchanged — the rolled-back txn's inserts are invisible
@@ -329,6 +335,81 @@ impl TxnManager {
         active
             .undo_ops
             .push(UndoOp::UndoInsert { page_id, slot_id });
+        Ok(())
+    }
+
+    /// Records N INSERTs into the WAL in a **single `write_all` call**.
+    ///
+    /// Equivalent to calling [`record_insert`] N times but uses
+    /// [`WalWriter::reserve_lsns`] + [`WalWriter::write_batch`] to write all
+    /// entries in one shot, reducing BufWriter call overhead from O(N) to O(1).
+    ///
+    /// `phys_locs[i]` and `values[i]` must correspond to the same row.
+    /// Both slices must have the same length; a length mismatch is an internal
+    /// error (caller invariant — never caused by user SQL).
+    ///
+    /// The entries written to disk are byte-for-byte identical to those produced
+    /// by N calls to `record_insert` — crash recovery is unchanged.
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] if called outside a transaction.
+    pub fn record_insert_batch(
+        &mut self,
+        table_id: u32,
+        phys_locs: &[(u64, u16)], // (page_id, slot_id) per row
+        values: &[Vec<u8>],       // encoded row bytes per row (same order as phys_locs)
+    ) -> Result<(), DbError> {
+        let n = phys_locs.len();
+        debug_assert_eq!(
+            n,
+            values.len(),
+            "record_insert_batch: phys_locs and values must have the same length"
+        );
+        if n == 0 {
+            return Ok(());
+        }
+
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = active.txn_id;
+
+        // Reserve N consecutive LSNs atomically before serializing.
+        let lsn_base = self.wal.reserve_lsns(n);
+
+        // Accumulate all N entries into wal_scratch in one pass.
+        // Clear once — do NOT clear between entries.
+        self.wal_scratch.clear();
+
+        for (i, ((page_id, slot_id), value)) in phys_locs.iter().zip(values.iter()).enumerate() {
+            let key = encode_physical_loc(*page_id, *slot_id);
+
+            // Prepend physical location to new_value (same as record_insert).
+            let mut new_value = Vec::with_capacity(PHYSICAL_LOC_LEN + value.len());
+            new_value.extend_from_slice(&key);
+            new_value.extend_from_slice(value);
+
+            let entry = WalEntry::new(
+                lsn_base + i as u64, // pre-assigned LSN
+                txn_id,
+                EntryType::Insert,
+                table_id,
+                key.to_vec(),
+                vec![],
+                new_value,
+            );
+            entry.serialize_into(&mut self.wal_scratch);
+        }
+
+        // Single write_all for all N entries.
+        self.wal.write_batch(&self.wal_scratch)?;
+
+        // Enqueue undo ops after the WAL write succeeds.
+        for (page_id, slot_id) in phys_locs {
+            active.undo_ops.push(UndoOp::UndoInsert {
+                page_id: *page_id,
+                slot_id: *slot_id,
+            });
+        }
+
         Ok(())
     }
 
@@ -413,6 +494,34 @@ impl TxnManager {
             page_id,
             slot_id: old_slot,
         });
+        Ok(())
+    }
+
+    /// Records a full-table delete (DELETE without WHERE / TRUNCATE) as a
+    /// single WAL entry instead of N per-row entries.
+    ///
+    /// The physical heap pages must already have been updated by `delete_batch()`
+    /// before calling this. ONE WAL entry replaces N `record_delete()` calls.
+    ///
+    /// The `key` field of the WAL entry holds `root_page_id` as 8 bytes LE —
+    /// sufficient for crash recovery to locate the heap chain and undo the deletion.
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] if no transaction is open.
+    pub fn record_truncate(&mut self, table_id: u32, root_page_id: u64) -> Result<(), DbError> {
+        let txn = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        let mut entry = WalEntry::new(
+            0,
+            txn.txn_id,
+            EntryType::Truncate,
+            table_id,
+            root_page_id.to_le_bytes().to_vec(), // key = root_page_id (for recovery)
+            vec![],
+            vec![],
+        );
+        self.wal
+            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
+        txn.undo_ops.push(UndoOp::UndoTruncate { root_page_id });
         Ok(())
     }
 
@@ -967,5 +1076,110 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(mgr.max_committed(), 0); // nothing committed
         assert!(mgr.active_txn_id().is_none()); // no active txn
+    }
+
+    // ── record_truncate ───────────────────────────────────────────────────────
+
+    /// Verifies that record_truncate writes exactly ONE WAL entry (Truncate type)
+    /// instead of N Delete entries — the core WAL I/O reduction.
+    #[test]
+    fn test_record_truncate_single_wal_entry() {
+        use crate::reader::WalReader;
+        use axiomdb_storage::{heap_chain::HeapChain, PageType};
+
+        let (_dir, path) = temp_wal();
+        let mut mgr = TxnManager::create(&path).unwrap();
+        let mut storage = MemoryStorage::new();
+
+        // Allocate a root heap page and insert 5 rows (txn 1).
+        let root_page_id = storage.alloc_page(PageType::Data).unwrap();
+        let init_page = axiomdb_storage::Page::new(PageType::Data, root_page_id);
+        storage.write_page(root_page_id, &init_page).unwrap();
+
+        let txn1 = mgr.begin().unwrap();
+        for i in 0u8..5 {
+            HeapChain::insert(&mut storage, root_page_id, &[i; 8], txn1).unwrap();
+        }
+        mgr.commit().unwrap();
+
+        // Txn 2: delete_batch + record_truncate (simulates no-WHERE DELETE).
+        let txn2 = mgr.begin().unwrap();
+        let snap = mgr.active_snapshot().unwrap();
+        let raw_rids = HeapChain::scan_rids_visible(&storage, root_page_id, snap).unwrap();
+        HeapChain::delete_batch(&mut storage, &raw_rids, txn2).unwrap();
+        mgr.record_truncate(1, root_page_id).unwrap();
+        mgr.commit().unwrap();
+
+        // Scan WAL and count DML entries for txn2.
+        let reader = WalReader::open(&path).unwrap();
+        let txn2_dml: Vec<_> = reader
+            .scan_forward(0)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .filter(|e| e.txn_id == txn2)
+            .filter(|e| {
+                matches!(
+                    e.entry_type,
+                    EntryType::Insert | EntryType::Delete | EntryType::Update | EntryType::Truncate
+                )
+            })
+            .collect();
+
+        // Must be exactly 1 Truncate entry — not 5 Delete entries.
+        assert_eq!(txn2_dml.len(), 1, "expected exactly 1 WAL DML entry");
+        assert_eq!(
+            txn2_dml[0].entry_type,
+            EntryType::Truncate,
+            "DML entry must be Truncate type"
+        );
+        // key must encode root_page_id as 8 bytes LE.
+        let encoded_root = u64::from_le_bytes(txn2_dml[0].key[..8].try_into().unwrap());
+        assert_eq!(encoded_root, root_page_id, "key must contain root_page_id");
+    }
+
+    /// Verifies that rolling back a record_truncate restores all deleted rows.
+    #[test]
+    fn test_truncate_rollback_restores_rows() {
+        use axiomdb_core::TransactionSnapshot;
+        use axiomdb_storage::{heap_chain::HeapChain, PageType};
+
+        let (_dir, path) = temp_wal();
+        let mut mgr = TxnManager::create(&path).unwrap();
+        let mut storage = MemoryStorage::new();
+
+        // Insert 5 rows in txn 1 (committed).
+        let root_page_id = storage.alloc_page(PageType::Data).unwrap();
+        let init_page = axiomdb_storage::Page::new(PageType::Data, root_page_id);
+        storage.write_page(root_page_id, &init_page).unwrap();
+
+        let txn1 = mgr.begin().unwrap();
+        for i in 0u8..5 {
+            HeapChain::insert(&mut storage, root_page_id, &[i; 8], txn1).unwrap();
+        }
+        mgr.commit().unwrap();
+
+        // Verify 5 rows visible after txn1 commit.
+        let snap_after_insert = TransactionSnapshot::committed(mgr.max_committed());
+        let before =
+            HeapChain::scan_rids_visible(&storage, root_page_id, snap_after_insert).unwrap();
+        assert_eq!(before.len(), 5, "5 rows must be visible before truncate");
+
+        // Txn 2: delete_batch + record_truncate, then ROLLBACK.
+        let txn2 = mgr.begin().unwrap();
+        let snap2 = mgr.active_snapshot().unwrap();
+        let raw_rids = HeapChain::scan_rids_visible(&storage, root_page_id, snap2).unwrap();
+        HeapChain::delete_batch(&mut storage, &raw_rids, txn2).unwrap();
+        mgr.record_truncate(1, root_page_id).unwrap();
+        mgr.rollback(&mut storage).unwrap();
+
+        // After rollback: all 5 rows must be visible again.
+        let snap_after_rollback = TransactionSnapshot::committed(mgr.max_committed());
+        let after =
+            HeapChain::scan_rids_visible(&storage, root_page_id, snap_after_rollback).unwrap();
+        assert_eq!(
+            after.len(),
+            5,
+            "all 5 rows must be visible again after truncate rollback"
+        );
     }
 }

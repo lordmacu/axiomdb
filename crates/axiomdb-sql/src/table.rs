@@ -219,18 +219,20 @@ impl TableEngine {
         let phys_locs =
             HeapChain::insert_batch(storage, table_def.data_root_page_id, &encoded_rows, txn_id)?;
 
-        // ── WAL: one record_insert per row (same per-row granularity as today) ─
-        // This runs after write_page() has been called for each page in insert_batch,
-        // maintaining the WAL-before-data invariant at page granularity.
-        let mut result = Vec::with_capacity(phys_locs.len());
-        for ((page_id, slot_id), encoded) in phys_locs.iter().zip(encoded_rows.iter()) {
-            let key = encode_rid(*page_id, *slot_id);
-            txn.record_insert(table_def.id, &key, encoded, *page_id, *slot_id)?;
-            result.push(RecordId {
+        // ── WAL: all N inserts in one write_batch call (Phase 3.17) ─────────
+        // record_insert_batch uses reserve_lsns(N) + write_batch to emit all
+        // WAL Insert entries in a single write_all, reducing BufWriter calls
+        // from O(N rows) to O(1). Entries are byte-for-byte identical to the
+        // previous per-row path — crash recovery is unchanged.
+        txn.record_insert_batch(table_def.id, &phys_locs, &encoded_rows)?;
+
+        let result = phys_locs
+            .iter()
+            .map(|(page_id, slot_id)| RecordId {
                 page_id: *page_id,
                 slot_id: *slot_id,
-            });
-        }
+            })
+            .collect();
 
         Ok(result)
     }
@@ -274,6 +276,41 @@ impl TableEngine {
         )?;
 
         Ok(())
+    }
+
+    /// Deletes multiple rows in a single pass over the heap.
+    ///
+    /// Each heap page is read and written **exactly once** regardless of how
+    /// many rows are deleted from it — compared to N × `delete_row()` calls
+    /// which do 3 page operations per row (read + read + write).
+    ///
+    /// WAL entries are emitted after the page writes, preserving the invariant
+    /// that `write_page()` always precedes `record_delete()`.
+    ///
+    /// Returns the number of rows deleted.
+    pub fn delete_rows_batch(
+        storage: &mut dyn StorageEngine,
+        txn: &mut TxnManager,
+        table_def: &TableDef,
+        rids: &[RecordId],
+    ) -> Result<u64, DbError> {
+        if rids.is_empty() {
+            return Ok(0);
+        }
+
+        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+        let raw_rids: Vec<(u64, u16)> = rids.iter().map(|r| (r.page_id, r.slot_id)).collect();
+
+        // Batch-delete on the heap: each page read+written once.
+        let deleted = HeapChain::delete_batch(storage, &raw_rids, txn_id)?;
+
+        // WAL entries: one per row, after all page writes (ordering invariant).
+        for (page_id, slot_id, old_bytes) in &deleted {
+            let key = encode_rid(*page_id, *slot_id);
+            txn.record_delete(table_def.id, &key, old_bytes, *page_id, *slot_id)?;
+        }
+
+        Ok(deleted.len() as u64)
     }
 
     /// Replaces the row at `record_id` with `new_values`, WAL-logging both the
