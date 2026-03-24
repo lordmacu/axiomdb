@@ -1,12 +1,14 @@
 'use client'
 import { useState, use, useRef, useEffect, useCallback } from 'react'
 import { notFound } from 'next/navigation'
+import Link from 'next/link'
 import {
   Table2, ChevronUp, ChevronDown, ChevronsUpDown,
-  Check, X, Trash2, Search, Columns3, Copy,
+  Check, X, Trash2, Search, Columns3, Copy, Upload, FileDown,
 } from 'lucide-react'
 import { TABLES, SCHEMAS, INDEXES, generateUsers, generateOrders } from '@/lib/mock'
 import { cn } from '@/lib/utils'
+import { useToast } from '@/components/toast'
 import {
   useReactTable,
   getCoreRowModel,
@@ -98,6 +100,117 @@ function CellValue({ value, colKey }: { value: unknown; colKey: string }) {
 
 type SqlLog = { sql: string; axiomql: string; ts: string }
 
+// ── CSV parser ────────────────────────────────────────────────────────────────
+
+function parseCsv(text: string): Record<string, unknown>[] {
+  const lines = text.trim().split('\n')
+  if (lines.length < 2) return []
+  const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''))
+  return lines.slice(1).map(line => {
+    const vals = line.split(',').map(v => v.trim().replace(/^"|"$/g, ''))
+    return Object.fromEntries(headers.map((h, i) => [h, vals[i] ?? '']))
+  })
+}
+
+// ── SQL exporter ──────────────────────────────────────────────────────────────
+
+function exportSql(tableName: string, rows: Record<string, unknown>[]) {
+  if (!rows.length) return
+  const cols = Object.keys(rows[0])
+  const header = `-- Export: ${tableName} (${rows.length} rows)\n-- Generated: ${new Date().toLocaleString()} by AxiomStudio\n\n`
+  const values = rows.map(row =>
+    '  (' + cols.map(c => {
+      const v = row[c]
+      if (v === null || v === undefined) return 'NULL'
+      if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE'
+      if (typeof v === 'number') return String(v)
+      return `'${String(v).replace(/'/g, "''")}'`
+    }).join(', ') + ')'
+  ).join(',\n')
+  const sql = header + `INSERT INTO ${tableName} (${cols.join(', ')}) VALUES\n${values}\n;\n`
+  const blob = new Blob([sql], { type: 'text/sql' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${tableName}.sql`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+// ── Confirm modal ─────────────────────────────────────────────────────────────
+
+function ConfirmModal({ title, message, onConfirm, onCancel, danger = false }: {
+  title: string
+  message: string
+  onConfirm: () => void
+  onCancel: () => void
+  danger?: boolean
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-5 w-80 shadow-xl">
+        <h3 className="text-sm font-semibold text-[#e6edf3] mb-2">{title}</h3>
+        <p className="text-xs text-[#8b949e] mb-4">{message}</p>
+        <div className="flex justify-end gap-2">
+          <button onClick={onCancel}
+            className="px-3 py-1.5 rounded text-xs text-[#8b949e] border border-[#30363d] hover:bg-[#21262d] transition-colors">
+            Cancel
+          </button>
+          <button onClick={onConfirm}
+            className={cn(
+              'px-3 py-1.5 rounded text-xs font-semibold transition-colors',
+              danger
+                ? 'bg-[#f85149] text-white hover:bg-[#f85149]/80'
+                : 'bg-[#10b981] text-white hover:bg-[#10b981]/80'
+            )}>
+            Confirm
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Import modal ──────────────────────────────────────────────────────────────
+
+function ImportModal({ previewRows, onConfirm, onCancel, error }: {
+  previewRows: Record<string, unknown>[] | null
+  onConfirm: () => void
+  onCancel: () => void
+  error: string | null
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-5 w-96 shadow-xl">
+        <h3 className="text-sm font-semibold text-[#e6edf3] mb-3">Import data</h3>
+        {error ? (
+          <div className="mb-4 px-3 py-2 rounded bg-[#f85149]/10 border border-[#f85149]/30 text-xs text-[#f85149]">
+            {error}
+          </div>
+        ) : previewRows ? (
+          <p className="text-xs text-[#8b949e] mb-4">
+            Ready to import <span className="text-[#e6edf3] font-semibold">{previewRows.length} rows</span>.
+            This will append rows to the current table.
+          </p>
+        ) : null}
+        <div className="flex justify-end gap-2">
+          <button onClick={onCancel}
+            className="px-3 py-1.5 rounded text-xs text-[#8b949e] border border-[#30363d] hover:bg-[#21262d] transition-colors">
+            Cancel
+          </button>
+          {!error && previewRows && (
+            <button onClick={onConfirm}
+              className="px-3 py-1.5 rounded text-xs font-semibold bg-[#10b981] text-white hover:bg-[#10b981]/80 transition-colors">
+              Import {previewRows.length} rows
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
 // ── DataTab ───────────────────────────────────────────────────────────────────
 
 function DataTab({ tableName }: { tableName: string }) {
@@ -109,6 +222,8 @@ function DataTab({ tableName }: { tableName: string }) {
   const [editValue, setEditValue] = useState('')
   const [lastSql, setLastSql] = useState<SqlLog | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const { show: showToast } = useToast()
 
   // Quick filter
   const [filterText, setFilterText] = useState('')
@@ -123,8 +238,16 @@ function DataTab({ tableName }: { tableName: string }) {
   const [addingRow, setAddingRow] = useState(false)
   const [newRowValues, setNewRowValues] = useState<Record<string, string>>({})
 
-  // Delete confirmation
-  const [deletingRowIdx, setDeletingRowIdx] = useState<number | null>(null)
+  // Delete confirmation (unused inline — modal used instead)
+  const [deletingRowIdx] = useState<number | null>(null)
+
+  // Import state
+  const [importPreview, setImportPreview] = useState<Record<string, unknown>[] | null>(null)
+  const [importError, setImportError] = useState<string | null>(null)
+  const [showImportModal, setShowImportModal] = useState(false)
+
+  // Delete confirm modal
+  const [confirmDeleteIdx, setConfirmDeleteIdx] = useState<number | null>(null)
 
   // Context menu
   const [contextMenu, setContextMenu] = useState<ContextMenu | null>(null)
@@ -209,7 +332,6 @@ function DataTab({ tableName }: { tableName: string }) {
   function deleteRow(rowIndex: number) {
     const row = rows[rowIndex]
     setRows(prev => prev.filter((_, i) => i !== rowIndex))
-    setDeletingRowIdx(null)
     const now = new Date().toTimeString().slice(0, 8)
     setLastSql({
       sql: `DELETE FROM ${tableName} WHERE id = ${row.id};`,
@@ -255,6 +377,60 @@ function DataTab({ tableName }: { tableName: string }) {
     setContextMenu(null)
   }
 
+  // Import handler
+  function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    // Reset input so same file can be re-selected
+    e.target.value = ''
+    const reader = new FileReader()
+    reader.onload = ev => {
+      const text = ev.target?.result as string
+      try {
+        if (file.name.endsWith('.json')) {
+          const parsed = JSON.parse(text)
+          if (!Array.isArray(parsed)) {
+            setImportError('JSON must be an array of objects.')
+            setImportPreview(null)
+          } else {
+            setImportPreview(parsed as Record<string, unknown>[])
+            setImportError(null)
+          }
+        } else {
+          const parsed = parseCsv(text)
+          if (!parsed.length) {
+            setImportError('CSV is empty or has no data rows.')
+            setImportPreview(null)
+          } else {
+            setImportPreview(parsed)
+            setImportError(null)
+          }
+        }
+      } catch {
+        setImportError('Failed to parse file. Check the format.')
+        setImportPreview(null)
+      }
+      setShowImportModal(true)
+    }
+    reader.readAsText(file)
+  }
+
+  function confirmImport() {
+    if (!importPreview) return
+    const maxId = rows.reduce((m, r) => Math.max(m, Number(r.id ?? 0)), 0)
+    const withIds = importPreview.map((r, i) => ({ id: maxId + i + 1, ...r }))
+    setRows(prev => [...prev, ...withIds])
+    showToast(`${importPreview.length} rows imported`)
+    setShowImportModal(false)
+    setImportPreview(null)
+  }
+
+  function cancelImport() {
+    setShowImportModal(false)
+    setImportPreview(null)
+    setImportError(null)
+  }
+
   // Table columns — only visible ones
   const displayKeys = allColKeys.filter(k => visibleCols.has(k))
 
@@ -280,6 +456,36 @@ function DataTab({ tableName }: { tableName: string }) {
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
+      {/* Hidden file input for import */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".csv,.json"
+        onChange={handleFileChange}
+        className="hidden"
+      />
+
+      {/* Import modal */}
+      {showImportModal && (
+        <ImportModal
+          previewRows={importPreview}
+          onConfirm={confirmImport}
+          onCancel={cancelImport}
+          error={importError}
+        />
+      )}
+
+      {/* Delete confirm modal */}
+      {confirmDeleteIdx !== null && (
+        <ConfirmModal
+          title="Delete row"
+          message={`Delete row with id = ${rows[confirmDeleteIdx]?.id ?? confirmDeleteIdx}? This cannot be undone.`}
+          danger
+          onConfirm={() => { deleteRow(confirmDeleteIdx); setConfirmDeleteIdx(null) }}
+          onCancel={() => setConfirmDeleteIdx(null)}
+        />
+      )}
+
       {/* Toolbar above table */}
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0 bg-elevated/40">
         {/* Filter input */}
@@ -305,8 +511,23 @@ function DataTab({ tableName }: { tableName: string }) {
           </span>
         )}
 
+        {/* Import + Export SQL */}
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium border border-border text-text-secondary hover:bg-elevated hover:text-text-primary transition-colors ml-auto">
+          <Upload className="w-3 h-3" />
+          Import
+        </button>
+        <button
+          onClick={() => exportSql(tableName, rows)}
+          disabled={!rows.length}
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium border border-border text-text-secondary hover:bg-elevated hover:text-text-primary transition-colors disabled:opacity-40">
+          <FileDown className="w-3 h-3" />
+          Export SQL
+        </button>
+
         {/* Column visibility */}
-        <div className="relative ml-auto" ref={colMenuRef}>
+        <div className="relative" ref={colMenuRef}>
           <button
             onClick={() => setShowColMenu(p => !p)}
             className={cn(
@@ -385,7 +606,6 @@ function DataTab({ tableName }: { tableName: string }) {
           <tbody>
             {pageRows.map(row => {
               const originalIndex = row.index
-              const isDeletingThis = deletingRowIdx === originalIndex
               const fullRow = filteredRows[originalIndex]
               return (
                 <tr key={row.id} className="border-b border-border/50 hover:bg-elevated transition-colors group">
@@ -451,25 +671,11 @@ function DataTab({ tableName }: { tableName: string }) {
                   })}
                   {/* Delete action cell */}
                   <td className="px-2 py-1.5 w-12">
-                    {isDeletingThis ? (
-                      <div className="flex items-center gap-1">
-                        <span className="text-[10px] text-error whitespace-nowrap">Delete?</span>
-                        <button onClick={() => deleteRow(originalIndex)}
-                          className="text-[10px] px-1.5 py-0.5 rounded bg-error/20 text-error hover:bg-error/30 font-semibold transition-colors">
-                          Yes
-                        </button>
-                        <button onClick={() => setDeletingRowIdx(null)}
-                          className="text-[10px] px-1.5 py-0.5 rounded bg-elevated text-text-secondary hover:text-text-primary transition-colors">
-                          No
-                        </button>
-                      </div>
-                    ) : (
-                      <button
-                        onClick={() => setDeletingRowIdx(originalIndex)}
-                        className="opacity-0 group-hover:opacity-60 hover:!opacity-100 text-error transition-all">
-                        <Trash2 className="w-3 h-3" />
-                      </button>
-                    )}
+                    <button
+                      onClick={() => setConfirmDeleteIdx(originalIndex)}
+                      className="opacity-0 group-hover:opacity-60 hover:!opacity-100 text-error transition-all">
+                      <Trash2 className="w-3 h-3" />
+                    </button>
                   </td>
                 </tr>
               )
@@ -750,6 +956,7 @@ function IndexesTab({ tableName }: { tableName: string }) {
   const [newName, setNewName] = useState('')
   const [newCols, setNewCols] = useState('')
   const [newUnique, setNewUnique] = useState(false)
+  const [confirmDropIdx, setConfirmDropIdx] = useState<string | null>(null)
 
   function startEdit(idx: typeof idxs[0]) {
     setEditing(idx.name)
@@ -783,6 +990,16 @@ function IndexesTab({ tableName }: { tableName: string }) {
 
   return (
     <div className="flex flex-col gap-0">
+      {/* Confirm drop modal */}
+      {confirmDropIdx !== null && (
+        <ConfirmModal
+          title="Drop index"
+          message={`Drop index "${confirmDropIdx}"? This cannot be undone.`}
+          danger
+          onConfirm={() => { deleteIdx(confirmDropIdx); setConfirmDropIdx(null) }}
+          onCancel={() => setConfirmDropIdx(null)}
+        />
+      )}
       <div className="overflow-auto">
         <table className="w-full text-xs">
           <thead>
@@ -835,7 +1052,7 @@ function IndexesTab({ tableName }: { tableName: string }) {
                       <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                         <button onClick={() => startEdit(idx)}
                           className="text-[10px] text-text-secondary hover:text-text-primary transition-colors">Edit</button>
-                        <button onClick={() => deleteIdx(idx.name)}
+                        <button onClick={() => setConfirmDropIdx(idx.name)}
                           className="text-[10px] text-error/60 hover:text-error transition-colors">Delete</button>
                       </div>
                     </td>
@@ -905,7 +1122,7 @@ export default function TableDetailPage({ params }: { params: Promise<{ table: s
   if (!tableInfo) notFound()
 
   const [tab, setTab] = useState<Tab>('data')
-  const [toast, setToast] = useState<string | null>(null)
+  const { show: showToast } = useToast()
   const TABS: { id: Tab; label: string }[] = [
     { id: 'data', label: 'Data' },
     { id: 'schema', label: 'Schema' },
@@ -915,25 +1132,32 @@ export default function TableDetailPage({ params }: { params: Promise<{ table: s
   const handleCopyDDL = useCallback(() => {
     const ddl = generateDDL(tableName)
     navigator.clipboard.writeText(ddl).then(() => {
-      setToast('Copied!')
+      showToast('DDL copied to clipboard')
     }).catch(() => null)
-  }, [tableName])
+  }, [tableName, showToast])
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
       <div className="border-b border-border px-6 py-3 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-2">
-          <Table2 className="w-4 h-4 text-accent" />
-          <h1 className="text-sm font-semibold font-mono text-text-primary">{tableName}</h1>
-          <span className="text-xs text-text-secondary">
-            · {tableInfo.rows.toLocaleString()} rows · {tableInfo.size}
-          </span>
-          <button
-            onClick={handleCopyDDL}
-            className="flex items-center gap-1 ml-2 px-2 py-0.5 rounded text-[10px] font-medium border border-border text-text-secondary hover:border-accent/50 hover:text-accent transition-colors">
-            <Copy className="w-2.5 h-2.5" />
-            Copy DDL
-          </button>
+        <div className="flex flex-col gap-1">
+          {/* Breadcrumbs */}
+          <div className="flex items-center gap-1.5 text-xs">
+            <Link href="/tables" className="text-text-secondary hover:text-accent transition-colors">Tables</Link>
+            <span className="text-border">/</span>
+            <span className="text-text-primary font-semibold font-mono">{tableName}</span>
+            <span className="text-text-secondary">· {tableInfo.rows.toLocaleString()} rows</span>
+          </div>
+          {/* Actions row */}
+          <div className="flex items-center gap-2">
+            <Table2 className="w-3.5 h-3.5 text-accent" />
+            <span className="text-xs text-text-secondary">{tableInfo.size}</span>
+            <button
+              onClick={handleCopyDDL}
+              className="flex items-center gap-1 ml-1 px-2 py-0.5 rounded text-[10px] font-medium border border-border text-text-secondary hover:border-accent/50 hover:text-accent transition-colors">
+              <Copy className="w-2.5 h-2.5" />
+              Copy DDL
+            </button>
+          </div>
         </div>
         <div className="flex gap-1 bg-elevated rounded p-0.5">
           {TABS.map(t => (
@@ -955,7 +1179,6 @@ export default function TableDetailPage({ params }: { params: Promise<{ table: s
         {tab === 'indexes' && <IndexesTab tableName={tableName} />}
       </div>
 
-      {toast && <Toast message={toast} onDone={() => setToast(null)} />}
     </div>
   )
 }

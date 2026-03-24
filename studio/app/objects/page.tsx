@@ -4,7 +4,7 @@ import dynamic from 'next/dynamic'
 import type * as Monaco from 'monaco-editor'
 import {
   Play, Plus, Trash2, ToggleLeft, ToggleRight,
-  ChevronDown, ChevronRight, Code2, Zap,
+  ChevronDown, ChevronRight, Code2, Zap, Search, X,
 } from 'lucide-react'
 import { PROCEDURES, FUNCTIONS, TRIGGERS, SEQUENCES, type Procedure, type Func, type Trigger, type Sequence } from '@/lib/mock'
 import { cn } from '@/lib/utils'
@@ -50,6 +50,52 @@ function registerAxiomQL(monaco: typeof Monaco) {
 }
 
 type Tab = 'procedures' | 'functions' | 'triggers' | 'sequences'
+
+// ── Highlight matching text ───────────────────────────────────────────────────
+
+function HighlightMatch({ text, query }: { text: string; query: string }) {
+  if (!query.trim()) return <>{text}</>
+  const idx = text.toLowerCase().indexOf(query.toLowerCase())
+  if (idx === -1) return <>{text}</>
+  return (
+    <>
+      {text.slice(0, idx)}
+      <span className="text-accent font-bold">{text.slice(idx, idx + query.length)}</span>
+      {text.slice(idx + query.length)}
+    </>
+  )
+}
+
+// ── Search input for object lists ─────────────────────────────────────────────
+
+function ObjectSearch({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string
+  onChange: (v: string) => void
+  placeholder: string
+}) {
+  return (
+    <div className="px-2 py-1.5 border-b border-border shrink-0">
+      <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-elevated border border-border text-xs">
+        <Search className="w-3 h-3 text-text-secondary shrink-0" />
+        <input
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          placeholder={placeholder}
+          className="bg-transparent outline-none text-text-secondary placeholder-text-secondary/50 w-full font-mono text-[11px]"
+        />
+        {value && (
+          <button onClick={() => onChange('')} className="text-text-secondary hover:text-text-primary transition-colors shrink-0">
+            <X className="w-3 h-3" />
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
 
 // ── Shared editor panel ───────────────────────────────────────────────────────
 
@@ -139,6 +185,11 @@ function CodePanel({ title, language, body, args, returns, onBodyChange }: {
 function ProceduresTab() {
   const [procs, setProcs] = useState<Procedure[]>(PROCEDURES)
   const [selected, setSelected] = useState<string>(procs[0]?.name ?? '')
+  const [search, setSearch] = useState('')
+
+  const filtered = search.trim()
+    ? procs.filter(p => p.name.toLowerCase().includes(search.toLowerCase()))
+    : procs
 
   const proc = procs.find(p => p.name === selected)
 
@@ -146,7 +197,7 @@ function ProceduresTab() {
     <div className="flex h-full">
       {/* List */}
       <div className="w-52 border-r border-border flex flex-col shrink-0">
-        <div className="px-3 py-2 border-b border-border flex items-center justify-between">
+        <div className="px-3 py-2 border-b border-border flex items-center justify-between shrink-0">
           <span className="text-[10px] font-semibold tracking-widest text-text-secondary uppercase">
             Procedures ({procs.length})
           </span>
@@ -154,8 +205,14 @@ function ProceduresTab() {
             <Plus className="w-3.5 h-3.5" />
           </button>
         </div>
+        <ObjectSearch value={search} onChange={setSearch} placeholder="Search procedures…" />
+        {search && (
+          <div className="px-3 py-1 shrink-0 text-[10px] text-text-secondary border-b border-border/50">
+            {filtered.length} of {procs.length} procedures
+          </div>
+        )}
         <div className="flex-1 overflow-y-auto">
-          {procs.map(p => (
+          {filtered.map(p => (
             <button key={p.name} onClick={() => setSelected(p.name)}
               className={cn(
                 'w-full text-left px-3 py-2.5 border-b border-border/50 transition-colors group',
@@ -163,7 +220,7 @@ function ProceduresTab() {
               )}>
               <div className={cn('text-xs font-mono font-semibold truncate',
                 selected === p.name ? 'text-accent' : 'text-text-primary')}>
-                {p.name}
+                <HighlightMatch text={p.name} query={search} />
               </div>
               <div className="flex items-center gap-1 mt-0.5">
                 <span className={cn('text-[9px] px-1 py-0.5 rounded font-semibold',
@@ -174,6 +231,9 @@ function ProceduresTab() {
               </div>
             </button>
           ))}
+          {filtered.length === 0 && (
+            <div className="px-3 py-4 text-[11px] text-text-secondary text-center">No matches</div>
+          )}
         </div>
       </div>
 
@@ -202,13 +262,18 @@ function ProceduresTab() {
 function FunctionsTab() {
   const [fns, setFns] = useState<Func[]>(FUNCTIONS)
   const [selected, setSelected] = useState<string>(fns[0]?.name ?? '')
+  const [search, setSearch] = useState('')
+
+  const filtered = search.trim()
+    ? fns.filter(f => f.name.toLowerCase().includes(search.toLowerCase()))
+    : fns
 
   const fn = fns.find(f => f.name === selected)
 
   return (
     <div className="flex h-full">
       <div className="w-52 border-r border-border flex flex-col shrink-0">
-        <div className="px-3 py-2 border-b border-border flex items-center justify-between">
+        <div className="px-3 py-2 border-b border-border flex items-center justify-between shrink-0">
           <span className="text-[10px] font-semibold tracking-widest text-text-secondary uppercase">
             Functions ({fns.length})
           </span>
@@ -216,8 +281,14 @@ function FunctionsTab() {
             <Plus className="w-3.5 h-3.5" />
           </button>
         </div>
+        <ObjectSearch value={search} onChange={setSearch} placeholder="Search functions…" />
+        {search && (
+          <div className="px-3 py-1 shrink-0 text-[10px] text-text-secondary border-b border-border/50">
+            {filtered.length} of {fns.length} functions
+          </div>
+        )}
         <div className="flex-1 overflow-y-auto">
-          {fns.map(f => (
+          {filtered.map(f => (
             <button key={f.name} onClick={() => setSelected(f.name)}
               className={cn(
                 'w-full text-left px-3 py-2.5 border-b border-border/50 transition-colors',
@@ -225,7 +296,7 @@ function FunctionsTab() {
               )}>
               <div className={cn('text-xs font-mono font-semibold truncate',
                 selected === f.name ? 'text-accent' : 'text-text-primary')}>
-                {f.name}
+                <HighlightMatch text={f.name} query={search} />
               </div>
               <div className="flex items-center gap-1 mt-0.5">
                 <span className={cn('text-[9px] px-1 py-0.5 rounded font-semibold',
@@ -236,6 +307,9 @@ function FunctionsTab() {
               </div>
             </button>
           ))}
+          {filtered.length === 0 && (
+            <div className="px-3 py-4 text-[11px] text-text-secondary text-center">No matches</div>
+          )}
         </div>
       </div>
       <div className="flex-1 min-w-0">
@@ -263,6 +337,11 @@ function FunctionsTab() {
 function TriggersTab() {
   const [triggers, setTriggers] = useState<Trigger[]>(TRIGGERS)
   const [selected, setSelected] = useState<string>(triggers[0]?.name ?? '')
+  const [search, setSearch] = useState('')
+
+  const filtered = search.trim()
+    ? triggers.filter(t => t.name.toLowerCase().includes(search.toLowerCase()))
+    : triggers
 
   const trig = triggers.find(t => t.name === selected)
 
@@ -276,7 +355,7 @@ function TriggersTab() {
   return (
     <div className="flex h-full">
       <div className="w-52 border-r border-border flex flex-col shrink-0">
-        <div className="px-3 py-2 border-b border-border flex items-center justify-between">
+        <div className="px-3 py-2 border-b border-border flex items-center justify-between shrink-0">
           <span className="text-[10px] font-semibold tracking-widest text-text-secondary uppercase">
             Triggers ({triggers.length})
           </span>
@@ -284,8 +363,14 @@ function TriggersTab() {
             <Plus className="w-3.5 h-3.5" />
           </button>
         </div>
+        <ObjectSearch value={search} onChange={setSearch} placeholder="Search triggers…" />
+        {search && (
+          <div className="px-3 py-1 shrink-0 text-[10px] text-text-secondary border-b border-border/50">
+            {filtered.length} of {triggers.length} triggers
+          </div>
+        )}
         <div className="flex-1 overflow-y-auto">
-          {triggers.map(t => (
+          {filtered.map(t => (
             <button key={t.name} onClick={() => setSelected(t.name)}
               className={cn(
                 'w-full text-left px-3 py-2.5 border-b border-border/50 transition-colors',
@@ -294,7 +379,7 @@ function TriggersTab() {
               )}>
               <div className={cn('text-xs font-mono font-semibold truncate',
                 selected === t.name ? 'text-accent' : 'text-text-primary')}>
-                {t.name}
+                <HighlightMatch text={t.name} query={search} />
               </div>
               <div className="flex items-center gap-1 mt-0.5 flex-wrap">
                 <span className={cn('text-[9px] px-1 py-0.5 rounded font-semibold', eventColor[t.event])}>
@@ -307,6 +392,9 @@ function TriggersTab() {
               </div>
             </button>
           ))}
+          {filtered.length === 0 && (
+            <div className="px-3 py-4 text-[11px] text-text-secondary text-center">No matches</div>
+          )}
         </div>
       </div>
       <div className="flex-1 min-w-0 flex flex-col">
