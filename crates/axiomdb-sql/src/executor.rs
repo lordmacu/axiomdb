@@ -376,8 +376,8 @@ pub fn execute_with_ctx(
                 txn.begin()?;
                 Ok(QueryResult::Empty)
             }
-            Stmt::Commit => Err(DbError::NoActiveTransaction),
-            Stmt::Rollback => Err(DbError::NoActiveTransaction),
+            // MySQL: COMMIT/ROLLBACK with no active transaction is a silent no-op.
+            Stmt::Commit | Stmt::Rollback => Ok(QueryResult::Empty),
             other => {
                 txn.begin()?;
                 match dispatch_ctx(other, storage, txn, bloom, ctx) {
@@ -401,8 +401,8 @@ pub fn execute_with_ctx(
                 txn.begin()?;
                 Ok(QueryResult::Empty)
             }
-            Stmt::Commit => Err(DbError::NoActiveTransaction),
-            Stmt::Rollback => Err(DbError::NoActiveTransaction),
+            // MySQL: COMMIT/ROLLBACK with no active transaction is a silent no-op.
+            Stmt::Commit | Stmt::Rollback => Ok(QueryResult::Empty),
 
             // SELECT (read-only) — wrap in a read-only begin/commit so the executor
             // has a valid snapshot. The transaction is committed immediately after,
