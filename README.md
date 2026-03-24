@@ -4,6 +4,7 @@
 
 [![CI](https://github.com/lordmacu/axiomdb/actions/workflows/ci.yml/badge.svg)](https://github.com/lordmacu/axiomdb/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/lordmacu/axiomdb?include_prereleases&label=release&color=orange)](https://github.com/lordmacu/axiomdb/releases/latest)
+[![Docs](https://img.shields.io/badge/docs-lordmacu.github.io%2Faxiomdb-blue?logo=mdbook)](https://lordmacu.github.io/axiomdb/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-orange?logo=rust)
 
@@ -272,9 +273,17 @@ python3 tools/build-wizard.py
 
 ---
 
-## Design
+## Documentation
 
-See [`db.md`](db.md) for the complete engine design: storage format, algorithms, type system, and every architectural decision with its rationale.
+**[lordmacu.github.io/axiomdb](https://lordmacu.github.io/axiomdb/)** — full documentation site:
+
+| Section | Content |
+|---|---|
+| [User Guide](https://lordmacu.github.io/axiomdb/user-guide/) | Getting started, SQL reference, configuration, error codes |
+| [Internals](https://lordmacu.github.io/axiomdb/internals/) | Storage format, B+ Tree, WAL, MVCC, row codec, catalog |
+| [Development](https://lordmacu.github.io/axiomdb/development/) | Roadmap, benchmarks, contributing |
+
+For the full engine design (types, algorithms, phases, decisions) see also [`db.md`](db.md).
 
 ---
 
