@@ -119,6 +119,8 @@ Bye.
 
 **Dot commands:** `.help` · `.tables` · `.schema [table]` · `.open <path>` · `.quit`
 
+**Keyboard shortcuts (interactive mode):** ↑ / ↓ history · Tab SQL completion · Ctrl-R reverse search · Ctrl-C cancel line · Ctrl-D exit. History is saved to `~/.axiomdb_history` between sessions.
+
 ---
 
 ## Server Mode — Connecting

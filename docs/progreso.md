@@ -148,7 +148,7 @@
 
 <!-- ── Group G — DevEx (parallel with E+F) ── -->
 - [x] 4.15 ✅ Interactive CLI — axiomdb-cli REPL: multi-line SQL, ASCII table formatter, .tables/.schema/.quit/.open/.help dot commands, TTY detection (no prompt in pipe mode), timing per query, pipe/script mode; new crate axiomdb-cli
-- [ ] 4.15b ⏳ DEBUG/VERBOSE mode — `--verbose` flag: log AST, chosen plan, execution stats per query; critical for Phases 4–10 development
+- [x] 4.15b ✅ CLI history + autocomplete — rustyline Editor with SqlHelper: ↑/↓ history, Ctrl-R reverse search, Tab SQL keyword completion, ~/.axiomdb_history persistence; Ctrl-C clears buffer; pipe mode reads all stdin then splits on ';'
 
 <!-- ── Group H — Introspection + DDL modification (needs executor) ── -->
 - [x] 4.20 ✅ SHOW TABLES / SHOW COLUMNS / DESCRIBE — parser + executor using CatalogReader; MySQL-compatible 6-column output; Extra shows auto_increment

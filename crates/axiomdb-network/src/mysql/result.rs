@@ -9,8 +9,8 @@ use axiomdb_sql::result::{ColumnMeta, QueryResult, Row};
 use axiomdb_types::{DataType, Value};
 
 use super::packets::{
-    build_eof_packet, build_eof_with_status, build_ok_packet, build_ok_with_status,
-    write_lenenc_int, write_lenenc_str,
+    build_eof_packet, build_eof_with_status, build_ok_with_status, write_lenenc_int,
+    write_lenenc_str,
 };
 
 /// MySQL `SERVER_MORE_RESULTS_EXISTS` status flag (0x0008).
