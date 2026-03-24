@@ -237,6 +237,14 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
                  substitute_outer must be called before executing the inner query"
             ),
         }),
+
+        // Param must be substituted before eval — programming error if reached.
+        Expr::Param { idx } => Err(DbError::Internal {
+            message: format!(
+                "unsubstituted Param ?{idx} — substitute_params_in_ast must be \
+                 called before executing a prepared statement"
+            ),
+        }),
     }
 }
 
@@ -277,6 +285,13 @@ pub fn eval_with<R: SubqueryRunner>(
             message: format!(
                 "unsubstituted OuterColumn '{name}' (col_idx={col_idx}) — \
                  substitute_outer must be called before executing the inner query"
+            ),
+        }),
+
+        Expr::Param { idx } => Err(DbError::Internal {
+            message: format!(
+                "unsubstituted Param ?{idx} — substitute_params_in_ast must be \
+                 called before executing a prepared statement"
             ),
         }),
 

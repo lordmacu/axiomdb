@@ -424,6 +424,10 @@ fn resolve_expr_full(
 
         Expr::OuterColumn { .. } => Ok(expr), // already resolved — pass through
 
+        // Prepared statement parameter: type is determined at execute time.
+        // No column resolution needed — pass through unchanged.
+        Expr::Param { .. } => Ok(expr),
+
         Expr::UnaryOp { op, operand } => Ok(Expr::UnaryOp {
             op,
             operand: Box::new(resolve_expr_full(*operand, ctx, outer_scopes, state)?),

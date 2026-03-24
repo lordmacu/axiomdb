@@ -19,13 +19,20 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
     pub stmt_id: u32,
-    /// Original SQL with `?` placeholders, as sent by the client.
+    /// Original SQL with `?` placeholders (kept for fallback/debugging).
     pub sql_template: String,
     /// Number of `?` placeholders detected at prepare time.
     pub param_count: u16,
     /// MySQL type codes for each parameter (populated from first COM_STMT_EXECUTE).
-    /// Empty until the first execution with `new_params_bound_flag = 1`.
     pub param_types: Vec<u16>,
+    /// Analyzed statement with `Expr::Param` nodes.
+    ///
+    /// Cached at `COM_STMT_PREPARE` time. Used by `COM_STMT_EXECUTE` to skip
+    /// `parse()` + `analyze()` (~5ms overhead) — only `substitute_params_in_ast`
+    /// (~1µs tree walk) + `execute_with_ctx()` are needed.
+    ///
+    /// `None` until the first successful parse+analyze at prepare time.
+    pub analyzed_stmt: Option<axiomdb_sql::ast::Stmt>,
 }
 
 /// Counts unquoted `?` placeholders in a SQL string.
@@ -205,6 +212,7 @@ impl ConnectionState {
                 sql_template: sql,
                 param_count,
                 param_types: vec![],
+                analyzed_stmt: None, // populated by handler after parse+analyze
             },
         );
         (stmt_id, param_count)

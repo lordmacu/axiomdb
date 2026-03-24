@@ -177,6 +177,16 @@ pub enum Expr {
     ///
     /// [`BindContext`]: crate::analyzer::BindContext
     OuterColumn { col_idx: usize, name: String },
+
+    /// A positional parameter placeholder — the `?` in a prepared statement.
+    ///
+    /// `idx` is the 0-based index of the parameter (first `?` → 0, second → 1).
+    ///
+    /// Produced by the parser when parsing a prepared statement SQL template.
+    /// Must be replaced with `Expr::Literal(value)` via `substitute_params_in_ast`
+    /// before the statement is executed. Reaching `eval_with` with an
+    /// unsubstituted `Param` is a programming error.
+    Param { idx: usize },
 }
 
 // ── BinaryOp ──────────────────────────────────────────────────────────────────

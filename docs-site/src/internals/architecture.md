@@ -174,7 +174,8 @@ The SQL processing pipeline:
 - `ast` — all statement types: `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`,
   `CreateTableStmt`, `CreateIndexStmt`, `DropTableStmt`, `DropIndexStmt`, `AlterTableStmt`
 - `expr` — `Expr` enum for the expression tree: `BinaryOp`, `UnaryOp`, `Column`,
-  `Literal`, `IsNull`, `Between`, `Like`, `In`, `Case`, `Function`
+  `Literal`, `IsNull`, `Between`, `Like`, `In`, `Case`, `Function`,
+  `Param { idx: usize }` (positional `?` placeholder resolved at execute time)
 - `parser` — recursive descent; expression sub-parser with full operator precedence;
   parses `GROUP BY`, `HAVING`, `ORDER BY` with `NULLS FIRST/LAST`, `LIMIT/OFFSET`,
   `SELECT DISTINCT`, `INSERT … SELECT`, and both forms of `CASE WHEN`
@@ -298,19 +299,42 @@ Each parameter is decoded according to its MySQL type byte:
 NULL parameters are identified by the null-bitmap before the type list is read;
 they produce `Value::Null` without consuming any bytes from the value region.
 
-**Parameter substitution (`substitute_params`):**
+**Parameter substitution — AST-level plan cache (`substitute_params_in_ast`):**
 
-After decoding, `value_to_sql_literal` converts each `Value` to a SQL literal string:
-- `Null` → `NULL`
-- `Bool` → `TRUE` / `FALSE`
-- `Int` / `BigInt` / `Real` → numeric literal (no quotes)
-- `Text` → `'...'` with single-quote escaping (`'` → `''`)
-- `Date` → `'YYYY-MM-DD'`
-- `Timestamp` → `'YYYY-MM-DD HH:MM:SS'`
+`COM_STMT_PREPARE` runs parse + analyze **once** and stores the resulting `Stmt` in
+`PreparedStatement.analyzed_stmt`. On each `COM_STMT_EXECUTE`, `substitute_params_in_ast`
+walks the cached AST and replaces every `Expr::Param { idx }` node with
+`Expr::Literal(params[idx])` in a single O(n) tree walk (~1 µs), then calls
+`execute_stmt()` directly — bypassing parse and analyze entirely.
 
-`substitute_params` then replaces each `?` placeholder in the original SQL text with
-the corresponding literal, left to right, producing a complete SQL string that is
-passed to the standard `execute_query` path.
+The `?` token is recognized by the lexer as `Token::Question` and emitted by the parser
+as `Expr::Param { idx: N }` (0-based position). The semantic analyzer passes `Expr::Param`
+through unchanged because the type is not yet known; type resolution happens at execute
+time once the binary-encoded parameter values are decoded from the `COM_STMT_EXECUTE`
+packet.
+
+`value_to_sql_literal` converts each decoded `Value` to the appropriate `Expr::Literal`
+variant:
+- `Value::Null` → `Expr::Literal(Value::Null)`
+- `Value::Int` / `BigInt` / `Real` → numeric literal node
+- `Value::Text` → text literal node (single-quote escaping preserved at the protocol
+  boundary, not needed in the AST)
+- `Value::Date` / `Timestamp` → date/timestamp literal node
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — AST cache vs string substitution</span>
+The initial prepared-statement implementation substituted parameters by replacing
+<code>?</code> markers in the original SQL text and then running the full parse + analyze
+pipeline on each <code>COM_STMT_EXECUTE</code> call (~1.5 µs per execution). Phase 5.13
+replaces this with an AST-level plan cache: parse + analyze run once at
+<code>COM_STMT_PREPARE</code> time; each execute performs only a tree walk to splice in
+the decoded parameter values (~1 µs). MySQL and PostgreSQL use the same strategy —
+parsing and planning are separated from execution precisely so that repeated executions
+avoid repeated parse overhead.
+</div>
+</div>
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
@@ -338,10 +362,17 @@ pub struct ConnectionState {
 
 pub struct PreparedStatement {
     pub id: u32,
-    pub sql: String,       // original SQL with ? placeholders
+    pub sql: String,              // original SQL with ? placeholders
     pub num_params: u16,
+    pub analyzed_stmt: Option<Stmt>,  // cached parse+analyze result (plan cache)
 }
 ```
+
+`analyzed_stmt` is populated by `COM_STMT_PREPARE` after parse + analyze succeed. On
+`COM_STMT_EXECUTE`, if `analyzed_stmt` is `Some`, the handler calls
+`substitute_params_in_ast` on the cached `Stmt` and invokes `execute_stmt()` directly,
+skipping the parse and analyze steps entirely. If `analyzed_stmt` is `None` (should not
+occur in normal operation), the handler falls back to the full parse + analyze path.
 
 Each connection maintains its own `HashMap<u32, PreparedStatement>`. Statement IDs are
 assigned by incrementing `next_stmt_id` (starting at 1) and are local to the connection
@@ -491,6 +522,8 @@ Entry point for embedded mode. Exposes:
    ├── 0x01 COM_QUIT  → close
    ├── 0x02 COM_INIT_DB → OK
    ├── 0x0e COM_PING  → OK
+   ├── 0x16 COM_STMT_PREPARE → parse + analyze → store in PreparedStatement.analyzed_stmt → stmt_ok
+   ├── 0x17 COM_STMT_EXECUTE → substitute_params_in_ast(cached_stmt, params) → execute_stmt() ↓ (step 9)
    └── 0x03 COM_QUERY → continue ↓
    │
 4. intercept_special_query(sql) — ORM/driver stubs

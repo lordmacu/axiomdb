@@ -1552,7 +1552,9 @@ fn contains_aggregate(expr: &Expr) -> bool {
                 || else_result.as_deref().is_some_and(contains_aggregate)
         }
         Expr::Cast { expr, .. } => contains_aggregate(expr),
-        Expr::Literal(_) | Expr::Column { .. } | Expr::OuterColumn { .. } => false,
+        Expr::Literal(_) | Expr::Column { .. } | Expr::OuterColumn { .. } | Expr::Param { .. } => {
+            false
+        }
         // Subquery internals are analyzed independently; aggregates inside them
         // do not count as aggregates of the outer query.
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => false,
@@ -1663,7 +1665,11 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
             }
         }
         Expr::Cast { expr, .. } => collect_agg_exprs_from(expr, result),
-        Expr::Literal(_) | Expr::Column { .. } | Expr::Like { .. } | Expr::OuterColumn { .. } => {}
+        Expr::Literal(_)
+        | Expr::Column { .. }
+        | Expr::Like { .. }
+        | Expr::OuterColumn { .. }
+        | Expr::Param { .. } => {}
         // Aggregates inside a subquery belong to the inner query, not the outer.
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {}
     }

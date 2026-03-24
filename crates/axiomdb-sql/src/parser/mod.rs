@@ -59,11 +59,18 @@ pub fn parse(input: &str, max_bytes: Option<usize>) -> Result<Stmt, DbError> {
 pub(crate) struct Parser<'src> {
     tokens: &'src [SpannedToken<'src>],
     pos: usize,
+    /// Parameter index counter for `?` placeholders in prepared statement templates.
+    /// Incremented each time `Token::Question` is consumed via `parse_atom`.
+    pub(crate) param_count: usize,
 }
 
 impl<'src> Parser<'src> {
     pub(crate) fn new(tokens: &'src [SpannedToken<'src>]) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            param_count: 0,
+        }
     }
 
     // ── Peek helpers ──────────────────────────────────────────────────────────
