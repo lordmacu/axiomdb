@@ -119,7 +119,7 @@
 - [x] 4.5a ✅ SELECT without FROM — `SELECT 1`, `SELECT NOW()`; included in 4.5
 - [x] 4.5b ✅ Table engine — row storage interface: `scan_table(snap)→RowIter`, `insert_row(values)→RecordId`, `delete_row(rid)`, `update_row(rid, values)`; wraps HeapChain + Row codec + catalog; used by the executor for all DML on heap tables
 - [x] 4.25 ✅ Error handling framework — complete SQLSTATE mapping + ErrorResponse{sqlstate,severity,message,detail,hint} with hints for 15 variants
-- [ ] 4.25b ⏳ Structured error responses — position (byte offset), offending value in UniqueViolation, JSON format via SET error_format='json'
+- [x] 4.25b ✅ Structured error responses — ParseError position field (byte offset) + visual snippet in ERR packet; UniqueViolation renamed {index_name, value: Option<String>}; SET error_format='json' returns JSON-structured ERR payload; 10 integration tests + 12 wire assertions
 - [ ] 4.25c ⏳ Strict mode always on + warnings system — requires session state (Phase 5)
 - [x] 4.7 ✅ SQLSTATE codes — all DbError variants mapped; SQL-reachable errors have precise 5-char codes
 

@@ -169,10 +169,10 @@ fn parse_table_constraint(p: &mut Parser) -> Result<TableConstraint, DbError> {
         }
         other => Err(DbError::ParseError {
             message: format!(
-                "expected PRIMARY, UNIQUE, FOREIGN, or CHECK in table constraint, found {:?} at position {}",
+                "expected PRIMARY, UNIQUE, FOREIGN, or CHECK in table constraint, found {:?}",
                 other,
-                p.current_pos()
             ),
+            position: Some(p.current_pos()),
         }),
     }
 }
@@ -223,11 +223,8 @@ fn parse_fk_actions(p: &mut Parser) -> Result<(ForeignKeyAction, ForeignKeyActio
             }
             other => {
                 return Err(DbError::ParseError {
-                    message: format!(
-                        "expected DELETE or UPDATE after ON, found {:?} at position {}",
-                        other,
-                        p.current_pos()
-                    ),
+                    message: format!("expected DELETE or UPDATE after ON, found {:?}", other,),
+                    position: Some(p.current_pos()),
                 });
             }
         }
@@ -259,10 +256,10 @@ fn parse_fk_action(p: &mut Parser) -> Result<ForeignKeyAction, DbError> {
                 }
                 other => Err(DbError::ParseError {
                     message: format!(
-                        "expected NULL or DEFAULT after SET in FK action, found {:?} at position {}",
+                        "expected NULL or DEFAULT after SET in FK action, found {:?}",
                         other,
-                        p.current_pos()
                     ),
+                    position: Some(p.current_pos()),
                 }),
             }
         }
@@ -273,10 +270,10 @@ fn parse_fk_action(p: &mut Parser) -> Result<ForeignKeyAction, DbError> {
         }
         other => Err(DbError::ParseError {
             message: format!(
-                "expected CASCADE, RESTRICT, SET NULL, SET DEFAULT, or NO ACTION in FK action, found {:?} at position {}",
+                "expected CASCADE, RESTRICT, SET NULL, SET DEFAULT, or NO ACTION in FK action, found {:?}",
                 other,
-                p.current_pos()
             ),
+            position: Some(p.current_pos()),
         }),
     }
 }
@@ -344,9 +341,10 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<DataType, DbError> {
         }
         other => Err(DbError::ParseError {
             message: format!(
-                "expected a data type (INT, TEXT, BIGINT, …) but found {:?} at position {}",
-                other, pos
+                "expected a data type (INT, TEXT, BIGINT, …) but found {:?}",
+                other,
             ),
+            position: Some(pos),
         }),
     }
 }
@@ -355,20 +353,16 @@ fn eat_optional_precision_scale(p: &mut Parser) -> Result<(), DbError> {
     if p.eat(&Token::LParen) {
         if !matches!(p.peek(), Token::Integer(_)) {
             return Err(DbError::ParseError {
-                message: format!(
-                    "expected precision integer in type parameters at position {}",
-                    p.current_pos()
-                ),
+                message: "expected precision integer in type parameters".into(),
+                position: Some(p.current_pos()),
             });
         }
         p.advance();
         if p.eat(&Token::Comma) {
             if !matches!(p.peek(), Token::Integer(_)) {
                 return Err(DbError::ParseError {
-                    message: format!(
-                        "expected scale integer after comma in type parameters at position {}",
-                        p.current_pos()
-                    ),
+                    message: "expected scale integer after comma in type parameters".into(),
+                    position: Some(p.current_pos()),
                 });
             }
             p.advance();
@@ -382,10 +376,8 @@ fn eat_optional_length(p: &mut Parser) -> Result<(), DbError> {
     if p.eat(&Token::LParen) {
         if !matches!(p.peek(), Token::Integer(_)) {
             return Err(DbError::ParseError {
-                message: format!(
-                    "expected length integer in type parameter at position {}",
-                    p.current_pos()
-                ),
+                message: "expected length integer in type parameter".into(),
+                position: Some(p.current_pos()),
             });
         }
         p.advance();
@@ -480,12 +472,14 @@ pub(crate) fn parse_create_index(p: &mut Parser, unique: bool) -> Result<Stmt, D
                     other => {
                         return Err(DbError::ParseError {
                             message: format!("fillfactor must be an integer, found {:?}", other),
+                            position: Some(p.current_pos()),
                         });
                     }
                 };
                 if !(10..=100).contains(&val) {
                     return Err(DbError::ParseError {
                         message: "fillfactor must be between 10 and 100".into(),
+                        position: Some(p.current_pos()),
                     });
                 }
                 val as u8
@@ -493,6 +487,7 @@ pub(crate) fn parse_create_index(p: &mut Parser, unique: bool) -> Result<Stmt, D
             other => {
                 return Err(DbError::ParseError {
                     message: format!("unknown index option: {other}"),
+                    position: Some(p.current_pos()),
                 });
             }
         };
@@ -641,9 +636,9 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                     other => {
                         return Err(DbError::ParseError {
                             message: format!(
-                                "expected COLUMN or TO after RENAME in ALTER TABLE, found {other:?} at position {}",
-                                p.current_pos()
-                            ),
+                            "expected COLUMN or TO after RENAME in ALTER TABLE, found {other:?}",
+                        ),
+                            position: Some(p.current_pos()),
                         })
                     }
                 }
@@ -665,6 +660,7 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
     if operations.is_empty() {
         return Err(DbError::ParseError {
             message: "ALTER TABLE: expected ADD, DROP, or RENAME after table name".into(),
+            position: Some(p.current_pos()),
         });
     }
 

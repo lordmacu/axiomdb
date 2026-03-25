@@ -8,14 +8,60 @@ pub struct MysqlError {
     pub message: String,
 }
 
+// ── Visual snippet ─────────────────────────────────────────────────────────────
+
+/// Builds a 2-line visual snippet showing where in `sql` the error occurred.
+///
+/// `pos` is the 0-based byte offset of the unexpected token (as stored in
+/// `DbError::ParseError::position`). Returns an empty string when `pos` is
+/// out of bounds or `sql` is empty, so the caller can safely append it.
+///
+/// Example output (prepended with `\n`):
+/// ```text
+///
+///   SELECT * FORM t
+///            ^
+/// ```
+fn build_error_snippet(sql: &str, pos: usize) -> String {
+    if sql.is_empty() || pos >= sql.len() {
+        return String::new();
+    }
+    // Byte-safe: parser positions are always at token start boundaries.
+    let line_start = sql[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = sql[pos..].find('\n').map(|i| pos + i).unwrap_or(sql.len());
+    let line = &sql[line_start..line_end];
+    let col = pos - line_start;
+
+    const MAX_LINE: usize = 120;
+    let (display_line, display_col) = if line.len() > MAX_LINE {
+        (line[..MAX_LINE].to_string(), col.min(MAX_LINE - 1))
+    } else {
+        (line.to_string(), col)
+    };
+
+    format!("\n  {display_line}\n  {}^", " ".repeat(display_col))
+}
+
+// ── dberror_to_mysql ───────────────────────────────────────────────────────────
+
 /// Converts a `DbError` to the closest MySQL error code and SQLSTATE.
-pub fn dberror_to_mysql(e: &DbError) -> MysqlError {
+///
+/// `sql` is the original SQL string that caused the error, used to build
+/// a visual snippet for `ParseError`. Pass `None` when the SQL is unavailable
+/// (e.g. auth errors, commit callbacks).
+pub fn dberror_to_mysql(e: &DbError, sql: Option<&str>) -> MysqlError {
     let (code, state, msg): (u16, &[u8; 5], String) = match e {
-        DbError::ParseError { message } => (
-            1064,
-            b"42000",
-            format!("You have an error in your SQL syntax: {message}"),
-        ),
+        DbError::ParseError { message, position } => {
+            let snippet = position
+                .and_then(|pos| sql.map(|s| build_error_snippet(s, pos)))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default();
+            (
+                1064,
+                b"42000",
+                format!("You have an error in your SQL syntax: {message}{snippet}"),
+            )
+        }
         DbError::TableNotFound { name } => {
             (1146, b"42S02", format!("Table '{name}' doesn't exist"))
         }
@@ -34,10 +80,13 @@ pub fn dberror_to_mysql(e: &DbError) -> MysqlError {
             b"42S01",
             format!("Table '{schema}.{name}' already exists"),
         ),
-        DbError::UniqueViolation { table, column } => (
+        DbError::UniqueViolation { index_name, value } => (
             1062,
             b"23000",
-            format!("Duplicate entry for key '{table}.{column}'"),
+            match value {
+                Some(v) => format!("Duplicate entry '{v}' for key '{index_name}'"),
+                None => format!("Duplicate entry for key '{index_name}'"),
+            },
         ),
         DbError::NotNullViolation { table, column } => (
             1048,
@@ -106,5 +155,101 @@ pub fn dberror_to_mysql(e: &DbError) -> MysqlError {
         code,
         sql_state: *state,
         message: msg,
+    }
+}
+
+// ── Unit tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axiomdb_core::error::DbError;
+
+    #[test]
+    fn parse_error_with_snippet() {
+        let sql = "SELECT * FORM t";
+        let err = DbError::ParseError {
+            message: "unexpected identifier 'FORM'".into(),
+            position: Some(9),
+        };
+        let me = dberror_to_mysql(&err, Some(sql));
+        assert_eq!(me.code, 1064);
+        assert!(
+            me.message.contains('^'),
+            "should contain ^ marker: {}",
+            me.message
+        );
+        assert!(
+            me.message.contains("FORM"),
+            "should contain the offending token: {}",
+            me.message
+        );
+    }
+
+    #[test]
+    fn parse_error_no_sql_no_snippet() {
+        let err = DbError::ParseError {
+            message: "unexpected token".into(),
+            position: Some(5),
+        };
+        let me = dberror_to_mysql(&err, None);
+        assert_eq!(me.code, 1064);
+        assert!(!me.message.contains('^'), "no snippet when sql is None");
+    }
+
+    #[test]
+    fn parse_error_no_position_no_snippet() {
+        let err = DbError::ParseError {
+            message: "input too long".into(),
+            position: None,
+        };
+        let me = dberror_to_mysql(&err, Some("anything"));
+        assert!(
+            !me.message.contains('^'),
+            "no snippet when position is None"
+        );
+    }
+
+    #[test]
+    fn unique_violation_with_value() {
+        let err = DbError::UniqueViolation {
+            index_name: "users_email_idx".into(),
+            value: Some("bob@example.com".into()),
+        };
+        let me = dberror_to_mysql(&err, None);
+        assert_eq!(me.code, 1062);
+        assert_eq!(
+            me.message,
+            "Duplicate entry 'bob@example.com' for key 'users_email_idx'"
+        );
+    }
+
+    #[test]
+    fn unique_violation_without_value() {
+        let err = DbError::UniqueViolation {
+            index_name: "pk_idx".into(),
+            value: None,
+        };
+        let me = dberror_to_mysql(&err, None);
+        assert_eq!(me.message, "Duplicate entry for key 'pk_idx'");
+    }
+
+    #[test]
+    fn build_error_snippet_basic() {
+        let sql = "SELECT * FORM t";
+        let snippet = build_error_snippet(sql, 9);
+        assert!(snippet.contains("SELECT * FORM t"));
+        assert!(snippet.contains('^'));
+        // 9 spaces before ^
+        let lines: Vec<&str> = snippet.trim_start_matches('\n').lines().collect();
+        assert_eq!(lines.len(), 2);
+        let caret_line = lines[1];
+        assert!(caret_line.trim_start().starts_with('^'));
+    }
+
+    #[test]
+    fn build_error_snippet_out_of_bounds() {
+        assert_eq!(build_error_snippet("abc", 99), "");
+        assert_eq!(build_error_snippet("", 0), "");
     }
 }

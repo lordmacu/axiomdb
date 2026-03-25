@@ -131,7 +131,7 @@ fn test_parse_handshake_response_minimal() {
 
     let response = parse_handshake_response(&payload).unwrap();
     assert_eq!(response.username, "root");
-    assert_eq!(response.auth_response, vec![]);
+    assert_eq!(response.auth_response, Vec::<u8>::new());
 }
 
 // ── OK / ERR / EOF packet tests ───────────────────────────────────────────────

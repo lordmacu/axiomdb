@@ -134,6 +134,7 @@ impl DbConfig {
 
         toml::from_str(&text).map_err(|e| DbError::ParseError {
             message: format!("invalid axiomdb.toml: {e}"),
+            position: None,
         })
     }
 }

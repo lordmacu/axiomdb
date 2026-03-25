@@ -220,10 +220,8 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
         _ if negated => {
             // NOT was consumed but no BETWEEN/LIKE/IN followed — error.
             Err(DbError::ParseError {
-                message: format!(
-                    "expected BETWEEN, LIKE, or IN after NOT at position {}",
-                    p.current_pos()
-                ),
+                message: "expected BETWEEN, LIKE, or IN after NOT".into(),
+                position: Some(p.current_pos()),
             })
         }
         _ => Ok(left),
@@ -375,10 +373,10 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
             if when_thens.is_empty() {
                 return Err(DbError::ParseError {
                     message: format!(
-                        "CASE requires at least one WHEN branch, found {:?} at position {}",
+                        "CASE requires at least one WHEN branch, found {:?}",
                         p.peek(),
-                        p.current_pos()
                     ),
+                    position: Some(p.current_pos()),
                 });
             }
 
@@ -399,10 +397,8 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
         }
 
         other => Err(DbError::ParseError {
-            message: format!(
-                "unexpected token {:?} in expression at position {}",
-                other, pos
-            ),
+            message: format!("unexpected token {:?} in expression", other,),
+            position: Some(pos),
         }),
     }
 }
@@ -468,6 +464,7 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
                                 "expected string literal after SEPARATOR, got {:?}",
                                 other
                             ),
+                            position: Some(p.current_pos()),
                         })
                     }
                 }
@@ -501,6 +498,7 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
                             "string_agg separator must be a string literal, got {:?}",
                             other
                         ),
+                        position: Some(p.current_pos()),
                     })
                 }
             };
@@ -518,7 +516,8 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
             let expr = parse_expr(p)?;
             if !p.eat(&Token::As) {
                 return Err(DbError::ParseError {
-                    message: format!("expected AS in CAST at position {}", p.current_pos()),
+                    message: "expected AS in CAST".into(),
+                    position: Some(p.current_pos()),
                 });
             }
             let target = super::ddl::parse_data_type(p)?;

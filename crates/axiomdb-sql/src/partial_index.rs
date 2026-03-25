@@ -57,10 +57,12 @@ pub fn compile_predicate_sql(sql: &str, col_defs: &[ColumnDef]) -> Result<Expr, 
     let where_expr = match stmt {
         crate::ast::Stmt::Select(s) => s.where_clause.ok_or_else(|| DbError::ParseError {
             message: format!("partial index predicate produced no WHERE clause: {sql}"),
+            position: None,
         })?,
         _ => {
             return Err(DbError::ParseError {
                 message: format!("partial index predicate must be an expression: {sql}"),
+                position: None,
             })
         }
     };

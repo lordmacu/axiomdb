@@ -43,6 +43,7 @@ impl TryFrom<u8> for SortOrder {
             1 => Ok(Self::Desc),
             _ => Err(DbError::ParseError {
                 message: format!("unknown SortOrder discriminant: {v}"),
+                position: None,
             }),
         }
     }
@@ -104,6 +105,7 @@ impl TryFrom<u8> for ColumnType {
             8 => Ok(Self::Uuid),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
+                position: None,
             }),
         }
     }
@@ -172,6 +174,7 @@ impl TableDef {
     pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), DbError> {
         let err = || DbError::ParseError {
             message: "truncated TableRow bytes".into(),
+            position: None,
         };
 
         // Minimum: 4 (id) + 8 (root_page_id) + 1 (schema_len) + 0 + 1 (name_len) + 0 = 14
@@ -192,6 +195,7 @@ impl TableDef {
         let schema_name = std::str::from_utf8(&bytes[pos..pos + schema_len])
             .map_err(|_| DbError::ParseError {
                 message: "invalid UTF-8 in schema_name".into(),
+                position: None,
             })?
             .to_string();
         let pos = pos + schema_len;
@@ -204,6 +208,7 @@ impl TableDef {
         let table_name = std::str::from_utf8(&bytes[pos..pos + name_len])
             .map_err(|_| DbError::ParseError {
                 message: "invalid UTF-8 in table_name".into(),
+                position: None,
             })?
             .to_string();
         let consumed = pos + name_len;
@@ -269,6 +274,7 @@ impl ColumnDef {
     pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), DbError> {
         let err = || DbError::ParseError {
             message: "truncated ColumnRow bytes".into(),
+            position: None,
         };
 
         if bytes.len() < 9 {
@@ -289,6 +295,7 @@ impl ColumnDef {
         let name = std::str::from_utf8(&bytes[9..9 + name_len])
             .map_err(|_| DbError::ParseError {
                 message: "invalid UTF-8 in column name".into(),
+                position: None,
             })?
             .to_string();
         let consumed = 9 + name_len;
@@ -450,6 +457,7 @@ impl IndexDef {
     pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), DbError> {
         let err = || DbError::ParseError {
             message: "truncated IndexRow bytes".into(),
+            position: None,
         };
 
         // Fixed header: 4 (index_id) + 4 (table_id) + 8 (root_page_id) + 1 (flags) + 1 (name_len) = 18
@@ -474,6 +482,7 @@ impl IndexDef {
         let name = std::str::from_utf8(&bytes[18..18 + name_len])
             .map_err(|_| DbError::ParseError {
                 message: "invalid UTF-8 in index name".into(),
+                position: None,
             })?
             .to_string();
         let mut consumed = 18 + name_len;
@@ -508,11 +517,13 @@ impl IndexDef {
                 if bytes.len() < consumed + pred_len {
                     return Err(DbError::ParseError {
                         message: "IndexDef predicate section truncated".into(),
+                        position: None,
                     });
                 }
                 let sql = std::str::from_utf8(&bytes[consumed..consumed + pred_len])
                     .map_err(|_| DbError::ParseError {
                         message: "IndexDef predicate not valid UTF-8".into(),
+                        position: None,
                     })?
                     .to_string();
                 consumed += pred_len;
@@ -542,6 +553,7 @@ impl IndexDef {
                 if bytes.len() < consumed + 2 {
                     return Err(DbError::ParseError {
                         message: "IndexDef include_columns truncated".into(),
+                        position: None,
                     });
                 }
                 let col_idx = u16::from_le_bytes([bytes[consumed], bytes[consumed + 1]]);
@@ -620,6 +632,7 @@ impl ConstraintDef {
         if data.len() < 8 {
             return Err(DbError::ParseError {
                 message: "ConstraintDef row too short".into(),
+                position: None,
             });
         }
         let constraint_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
@@ -632,6 +645,7 @@ impl ConstraintDef {
         let name = String::from_utf8(data[pos..pos + name_len].to_vec()).map_err(|e| {
             DbError::ParseError {
                 message: format!("ConstraintDef name not valid UTF-8: {e}"),
+                position: None,
             }
         })?;
         pos += name_len;
@@ -641,6 +655,7 @@ impl ConstraintDef {
         let check_expr = String::from_utf8(data[pos..pos + expr_len].to_vec()).map_err(|e| {
             DbError::ParseError {
                 message: format!("ConstraintDef check_expr not valid UTF-8: {e}"),
+                position: None,
             }
         })?;
         pos += expr_len;
@@ -691,6 +706,7 @@ impl TryFrom<u8> for FkAction {
             4 => Ok(Self::SetDefault),
             _ => Err(DbError::ParseError {
                 message: format!("unknown FkAction byte: {value}"),
+                position: None,
             }),
         }
     }
@@ -781,6 +797,7 @@ impl FkDef {
                     "FkDef row too short: need {FIXED} bytes, got {}",
                     data.len()
                 ),
+                position: None,
             });
         }
 
@@ -801,11 +818,13 @@ impl FkDef {
                     "FkDef row truncated: name claims {name_len} bytes but only {} remain",
                     data.len() - FIXED
                 ),
+                position: None,
             });
         }
         let name =
             String::from_utf8(data[FIXED..end].to_vec()).map_err(|e| DbError::ParseError {
                 message: format!("FkDef name not valid UTF-8: {e}"),
+                position: None,
             })?;
 
         Ok((
@@ -871,6 +890,7 @@ impl StatsDef {
         if data.len() < 22 {
             return Err(DbError::ParseError {
                 message: format!("StatsDef row too short: need 22 bytes, got {}", data.len()),
+                position: None,
             });
         }
         let table_id = u32::from_le_bytes(data[0..4].try_into().unwrap());

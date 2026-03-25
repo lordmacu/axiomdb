@@ -3,7 +3,7 @@
 AxiomDB wire protocol test.
 Updated at each subphase close — always overwrite this file, never create new ones.
 
-Last updated: subphase 4.19d (DATE_FORMAT, STR_TO_DATE, FIND_IN_SET, date extractors)
+Last updated: subphase 4.25b (structured error responses: parse position, UV value, JSON format)
 """
 import os
 import signal
@@ -408,6 +408,81 @@ ok("HAVING GROUP_CONCAT LIKE row count", len(rows) == 2, [r[0] for r in rows])
 post_ids_having = sorted(int(r[0]) for r in rows)
 ok("HAVING GROUP_CONCAT LIKE has post_id=1", 1 in post_ids_having, post_ids_having)
 ok("HAVING GROUP_CONCAT LIKE has post_id=2", 2 in post_ids_having, post_ids_having)
+
+# ── [4.25b] Structured Error Responses ────────────────────────────────────────
+
+print("\n[4.25b] Structured Error Responses")
+
+# --- ParseError: visual snippet in text error messages ---
+try:
+    cur.execute("SELECT * FORM t")
+    ok("parse error on bad query", False, "should have raised")
+except pymysql.err.ProgrammingError as ex:
+    msg = str(ex)
+    ok("parse error code 1064", "1064" in msg, msg)
+    ok("parse error message not empty", len(msg) > 10, msg)
+
+# Syntax error with position info
+try:
+    cur.execute("SELECT id, FROM users")
+    ok("parse error mid-query", False, "should have raised")
+except pymysql.err.ProgrammingError as ex:
+    msg = str(ex)
+    ok("mid-query parse error code 1064", "1064" in msg, msg)
+
+# --- UniqueViolation: offending value in error message ---
+cur.execute("CREATE TABLE uv_test (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE)")
+cur.execute("INSERT INTO uv_test VALUES (1, 'alice@example.com')")
+conn.commit()
+
+try:
+    cur.execute("INSERT INTO uv_test VALUES (2, 'alice@example.com')")
+    conn.commit()
+    ok("unique violation raises error", False, "should have raised")
+except pymysql.err.IntegrityError as ex:
+    msg = str(ex)
+    ok("unique violation error code 1062", "1062" in msg, msg)
+    ok("unique violation message contains value", "alice@example.com" in msg, msg)
+    conn.rollback()
+
+try:
+    cur.execute("INSERT INTO uv_test VALUES (1, 'bob@example.com')")
+    conn.commit()
+    ok("pk violation raises error", False, "should have raised")
+except pymysql.err.IntegrityError as ex:
+    msg = str(ex)
+    ok("pk violation error code 1062", "1062" in msg, msg)
+    conn.rollback()
+
+# --- SET error_format = 'json': errors return valid JSON in message ---
+cur.execute("SET error_format = 'json'")
+try:
+    cur.execute("SELECT * FORM t")
+    ok("json format parse error raised", False, "should have raised")
+except pymysql.err.ProgrammingError as ex:
+    import json as _json
+    # ex.args[1] is the raw message string (no extra Python escaping)
+    raw_msg = ex.args[1] if len(ex.args) >= 2 else str(ex)
+    try:
+        obj = _json.loads(raw_msg)
+        ok("json error is valid JSON",     True)
+        ok("json error has code field",    "code"     in obj, obj)
+        ok("json error has sqlstate",      "sqlstate" in obj, obj)
+        ok("json error has message field", "message"  in obj, obj)
+        ok("json error sqlstate 42601",    obj.get("sqlstate") == "42601", obj)
+    except _json.JSONDecodeError:
+        ok("json error is valid JSON", False, f"not JSON: {raw_msg!r}")
+
+# Reset error_format to text
+cur.execute("SET error_format = 'text'")
+
+# Confirm text mode is restored
+try:
+    cur.execute("SELECT * FORM t")
+    ok("text mode restored — error raised", False, "should have raised")
+except pymysql.err.ProgrammingError as ex:
+    msg = str(ex)
+    ok("text mode restored — not raw JSON", not msg.strip().startswith('{'), msg)
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

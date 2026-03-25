@@ -36,10 +36,10 @@ pub(crate) fn parse_dml(p: &mut Parser) -> Result<Stmt, DbError> {
         }
         other => Err(DbError::ParseError {
             message: format!(
-                "expected SELECT, INSERT, UPDATE, or DELETE, found {:?} at position {}",
+                "expected SELECT, INSERT, UPDATE, or DELETE, found {:?}",
                 other,
-                p.current_pos()
             ),
+            position: Some(p.current_pos()),
         }),
     }
 }
@@ -182,11 +182,8 @@ fn parse_alias(p: &mut Parser) -> Result<String, DbError> {
             Ok("autocommit".into())
         }
         other => Err(DbError::ParseError {
-            message: format!(
-                "expected alias name after AS, found {:?} at position {}",
-                other,
-                p.current_pos()
-            ),
+            message: format!("expected alias name after AS, found {:?}", other,),
+            position: Some(p.current_pos()),
         }),
     }
 }
@@ -294,10 +291,10 @@ fn parse_join_clauses(p: &mut Parser) -> Result<Vec<JoinClause>, DbError> {
                 } else {
                     return Err(DbError::ParseError {
                         message: format!(
-                            "expected ON or USING after JOIN table, found {:?} at position {}",
+                            "expected ON or USING after JOIN table, found {:?}",
                             other,
-                            p.current_pos()
                         ),
+                        position: Some(p.current_pos()),
                     });
                 }
             }
@@ -338,10 +335,8 @@ fn parse_order_item(p: &mut Parser) -> Result<OrderByItem, DbError> {
             Some(NullsOrder::Last)
         } else {
             return Err(DbError::ParseError {
-                message: format!(
-                    "expected FIRST or LAST after NULLS at position {}",
-                    p.current_pos()
-                ),
+                message: "expected FIRST or LAST after NULLS".into(),
+                position: Some(p.current_pos()),
             });
         }
     } else {
@@ -425,10 +420,10 @@ fn parse_insert(p: &mut Parser) -> Result<Stmt, DbError> {
         other => {
             return Err(DbError::ParseError {
                 message: format!(
-                "expected VALUES, DEFAULT VALUES, or SELECT in INSERT, found {:?} at position {}",
-                other,
-                p.current_pos()
-            ),
+                    "expected VALUES, DEFAULT VALUES, or SELECT in INSERT, found {:?}",
+                    other,
+                ),
+                position: Some(p.current_pos()),
             })
         }
     };

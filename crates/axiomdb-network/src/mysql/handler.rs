@@ -35,6 +35,7 @@ use super::{
     codec::MySqlCodec,
     database::Database,
     error::dberror_to_mysql,
+    json_error::build_json_error,
     packets::{
         build_auth_more_data, build_err_packet, build_ok_packet, build_server_greeting,
         parse_handshake_response,
@@ -45,6 +46,27 @@ use super::{
     result::serialize_query_result,
     session::ConnectionState,
 };
+
+/// Builds an ERR packet for a database error that occurred while processing `sql`.
+///
+/// Respects the `error_format` session variable:
+/// - `"json"` → ERR message is a JSON string (structured fields for ORM / tooling).
+/// - `"text"` (default) → MySQL-compatible plain text message with optional snippet.
+fn build_query_err_packet(e: &DbError, sql: &str, session: &ConnectionState) -> Vec<u8> {
+    let error_format = session
+        .variables
+        .get("error_format")
+        .map(|s| s.as_str())
+        .unwrap_or("text");
+    if error_format == "json" {
+        let me = dberror_to_mysql(e, None); // code + sqlstate only
+        let json_msg = build_json_error(e, Some(sql));
+        build_err_packet(me.code, &me.sql_state, &json_msg)
+    } else {
+        let me = dberror_to_mysql(e, Some(sql));
+        build_err_packet(me.code, &me.sql_state, &me.message)
+    }
+}
 
 /// Handles one MySQL connection from handshake to disconnection.
 pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn_id: u32) {
@@ -268,9 +290,9 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     match exec_result {
                         Ok((qr, commit_rx)) => {
                             if let Err(e) = await_commit_rx(commit_rx).await {
-                                let me = dberror_to_mysql(&e);
+                                let me = dberror_to_mysql(&e, Some(stmt_sql));
                                 debug!(conn_id, code = me.code, msg = %me.message, "commit error");
-                                let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
+                                let pkt = build_query_err_packet(&e, stmt_sql, &conn_state);
                                 if writer.send((seq, pkt.as_slice())).await.is_err() {
                                     connection_broken = true;
                                 }
@@ -292,9 +314,9 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                             }
                         }
                         Err(e) => {
-                            let me = dberror_to_mysql(&e);
+                            let me = dberror_to_mysql(&e, Some(stmt_sql));
                             debug!(conn_id, code = me.code, msg = %me.message, "query error");
-                            let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
+                            let pkt = build_query_err_packet(&e, stmt_sql, &conn_state);
                             if writer.send((seq, pkt.as_slice())).await.is_err() {
                                 connection_broken = true;
                             }
@@ -468,7 +490,7 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     Ok((qr, commit_rx)) => {
                         // Await fsync confirmation outside the lock (group commit).
                         if let Err(e) = await_commit_rx(commit_rx).await {
-                            let me = dberror_to_mysql(&e);
+                            let me = dberror_to_mysql(&e, None);
                             let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
                             let _ = writer.send((1u8, pkt.as_slice())).await;
                             continue;
@@ -487,7 +509,7 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                                 message: e.to_string(),
                             }
                         } else {
-                            super::error::dberror_to_mysql(&e)
+                            super::error::dberror_to_mysql(&e, None)
                         };
                         let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
                         let _ = writer.send((1u8, pkt.as_slice())).await;

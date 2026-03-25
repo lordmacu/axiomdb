@@ -143,10 +143,10 @@ pub fn insert_into_indexes(
             && !idx.is_fk_index
             && BTree::lookup_in(storage, idx.root_page_id, &key)?.is_some()
         {
-            let dup_val = key_vals.first().map(|v| format!("{v}")).unwrap_or_default();
+            let dup_val = key_vals.first().map(|v| format!("{v}"));
             return Err(DbError::UniqueViolation {
-                table: idx.name.clone(),
-                column: dup_val,
+                index_name: idx.name.clone(),
+                value: dup_val,
             });
         }
 
