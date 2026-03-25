@@ -3,7 +3,7 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import Link from 'next/link'
 import { SCHEMAS, TABLES } from '@/lib/mock'
 import { cn } from '@/lib/utils'
-import { ZoomIn, ZoomOut, Maximize2, LayoutGrid, ExternalLink } from 'lucide-react'
+import { ZoomIn, ZoomOut, Maximize2, LayoutGrid, ExternalLink, Download } from 'lucide-react'
 
 // ── Layout constants ───────────────────────────────────────────────────────────
 
@@ -208,11 +208,26 @@ function TableNode({
   )
 }
 
+// ── localStorage key ──────────────────────────────────────────────────────────
+
+const LS_POSITIONS = 'axiomstudio_diagram_positions'
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function DiagramPage() {
-  const initialPositions = autoLayout()
-  const [positions, setPositions] = useState<Record<string, Pos>>(initialPositions)
+  const [positions, setPositions] = useState<Record<string, Pos>>(() => {
+    const initial = autoLayout()
+    if (typeof window === 'undefined') return initial
+    try {
+      const saved = localStorage.getItem(LS_POSITIONS)
+      if (saved) {
+        const parsed = JSON.parse(saved) as Record<string, Pos>
+        // Only use saved if all current tables are present
+        if (Object.keys(initial).every(k => parsed[k])) return parsed
+      }
+    } catch {}
+    return initial
+  })
   const [zoom, setZoom]           = useState(0.85)
   const [pan, setPan]             = useState<Pos>({ x: 0, y: 0 })
   const [selected, setSelected]   = useState<string | null>(null)
@@ -304,6 +319,33 @@ export default function DiagramPage() {
     setPositions(autoLayout()); setZoom(0.85); setPan({ x: 0, y: 0 })
   }
 
+  // ── Persist positions ─────────────────────────────────────────────────────
+
+  useEffect(() => {
+    try { localStorage.setItem(LS_POSITIONS, JSON.stringify(positions)) } catch {}
+  }, [positions])
+
+  // ── SVG export ────────────────────────────────────────────────────────────
+
+  function exportSvg() {
+    const svg = svgRef.current
+    if (!svg) return
+    const clone = svg.cloneNode(true) as SVGSVGElement
+    const rect = svg.getBoundingClientRect()
+    clone.setAttribute('width', String(Math.round(rect.width)))
+    clone.setAttribute('height', String(Math.round(rect.height)))
+    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    clone.style.background = '#0d1117'
+    const str = new XMLSerializer().serializeToString(clone)
+      .replace(/var\(--font-geist-mono\)/g, 'monospace')
+      .replace(/var\(--font-geist-sans\)/g, 'sans-serif')
+    const blob = new Blob([str], { type: 'image/svg+xml' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url; a.download = 'er-diagram.svg'; a.click()
+    URL.revokeObjectURL(url)
+  }
+
   // ── Render ────────────────────────────────────────────────────────────────────
 
   const tables = TABLES.filter(t => t.type === 'table' && SCHEMAS[t.name])
@@ -342,6 +384,12 @@ export default function DiagramPage() {
             title="Reset layout">
             <LayoutGrid className="w-4 h-4" />
           </button>
+          <div className="w-px h-4 bg-border mx-1" />
+          <button onClick={exportSvg}
+            className="p-1.5 rounded text-text-secondary hover:text-text-primary hover:bg-elevated transition-colors"
+            title="Export as SVG">
+            <Download className="w-4 h-4" />
+          </button>
         </div>
       </div>
 
@@ -358,9 +406,17 @@ export default function DiagramPage() {
             <span className="text-[10px] text-text-secondary">{label}</span>
           </div>
         ))}
-        <div className="ml-auto flex items-center gap-1 text-[10px] text-text-secondary">
-          <div className="w-6 h-px bg-accent/60 inline-block mr-1" />
-          FK relationship
+        <div className="ml-auto flex items-center gap-3 text-[10px] text-text-secondary">
+          <div className="flex items-center gap-1">
+            <div className="w-6 h-px bg-accent/60 inline-block mr-1" />
+            FK relationship
+          </div>
+          <div className="flex items-center gap-1">
+            <span className="font-mono font-bold text-[#60a5fa]">N</span>
+            <span>:</span>
+            <span className="font-mono font-bold text-[#8b949e]">1</span>
+            <span className="ml-0.5">cardinality</span>
+          </div>
         </div>
       </div>
 
@@ -429,6 +485,24 @@ export default function DiagramPage() {
                     strokeDasharray={isHovered ? 'none' : '4 3'}
                     opacity={isHovered ? 1 : 0.5}
                     markerEnd={`url(#arrow-${isHovered ? 'green' : 'blue'})`} />
+
+                  {/* Cardinality labels */}
+                  {(() => {
+                    const fY = getColY(rel.fromTable, rel.fromCol, fromPos)
+                    const tY = getColY(rel.toTable, rel.toCol, toPos)
+                    const fX = reversed ? fromPos.x - 16 : fromPos.x + TABLE_W + 6
+                    const tX = reversed ? toPos.x + TABLE_W + 6 : toPos.x - 16
+                    return (
+                      <>
+                        <text x={fX} y={fY + 4} fontSize="10" fontWeight="700"
+                          fill={isHovered ? '#10b981' : '#60a5fa'}
+                          fontFamily="monospace">N</text>
+                        <text x={tX} y={tY + 4} fontSize="10" fontWeight="700"
+                          fill={isHovered ? '#10b981' : '#8b949e'}
+                          fontFamily="monospace">1</text>
+                      </>
+                    )
+                  })()}
 
                   {/* Relationship label on hover */}
                   {isHovered && (() => {

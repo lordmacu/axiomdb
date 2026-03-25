@@ -74,6 +74,7 @@ functionality. The design is organized in three blocks:
 | 6.7 | Partial UNIQUE index | ✅ | CREATE INDEX … WHERE predicate; soft-delete uniqueness pattern |
 | 6.8 | Fill factor | ✅ | WITH (fillfactor=N) on CREATE INDEX; B-Tree leaf split at ⌈FF×ORDER_LEAF/100⌉ |
 | 6.9 | FK + Index improvements | ✅ | PK B-Tree population; FK composite key index; composite index planner |
+| 6.10–6.12 | Index statistics + ANALYZE | ✅ | Per-column NDV/row_count; planner cost gate (sel > 20% → Scan); ANALYZE command; staleness tracking |
 | 5 | Executor (advanced) | ⚠️ Planned | JOIN, GROUP BY, ORDER BY, index lookup, aggregate |
 | 6.8+ | Index statistics, FK improvements | ⚠️ Planned | Fill factor, composite FKs, ON UPDATE CASCADE, ANALYZE, index-only scans |
 | 7 | Full MVCC | ⚠️ Planned | SSI, write-write conflicts, epoch reclamation |

@@ -789,6 +789,70 @@ impl FkDef {
     }
 }
 
+// ── StatsDef ──────────────────────────────────────────────────────────────────
+
+/// Per-column statistics stored in `axiom_stats` (Phase 6.10).
+///
+/// Used by the query planner to choose between index scan and full table scan
+/// via selectivity estimation: `selectivity = 1.0 / ndv`.
+///
+/// ## Binary format (22 bytes fixed)
+///
+/// ```text
+/// [table_id:  4 bytes LE u32]
+/// [col_idx:   2 bytes LE u16]
+/// [row_count: 8 bytes LE u64]  — visible rows at last ANALYZE / CREATE INDEX
+/// [ndv:       8 bytes LE i64]  — distinct non-NULL values (PostgreSQL dual-encoding)
+/// ```
+///
+/// `ndv` encoding (same as PostgreSQL `stadistinct`):
+/// - `> 0` → absolute distinct count (e.g. 9999 unique emails)
+/// - `< 0` → proportion multiplier (reserved; Phase 6.10 always writes > 0)
+/// - `= 0` → unknown → planner uses `DEFAULT_NUM_DISTINCT = 200`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsDef {
+    pub table_id: u32,
+    pub col_idx: u16,
+    pub row_count: u64,
+    pub ndv: i64,
+}
+
+impl StatsDef {
+    /// Serializes to the 22-byte binary format.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(22);
+        buf.extend_from_slice(&self.table_id.to_le_bytes());
+        buf.extend_from_slice(&self.col_idx.to_le_bytes());
+        buf.extend_from_slice(&self.row_count.to_le_bytes());
+        buf.extend_from_slice(&self.ndv.to_le_bytes());
+        buf
+    }
+
+    /// Deserializes from the 22-byte binary format.
+    ///
+    /// Returns `(def, bytes_consumed)`.
+    pub fn from_bytes(data: &[u8]) -> Result<(Self, usize), DbError> {
+        if data.len() < 22 {
+            return Err(DbError::ParseError {
+                message: format!("StatsDef row too short: need 22 bytes, got {}", data.len()),
+            });
+        }
+        let table_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let col_idx = u16::from_le_bytes(data[4..6].try_into().unwrap());
+        let row_count = u64::from_le_bytes(data[6..14].try_into().unwrap());
+        let ndv = i64::from_le_bytes(data[14..22].try_into().unwrap());
+        Ok((
+            Self {
+                table_id,
+                col_idx,
+                row_count,
+                ndv,
+            },
+            22,
+        ))
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

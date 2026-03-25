@@ -111,6 +111,12 @@ pub const CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET: usize = 84;
 /// constraint definitions. Value 0 = uninitialized. First valid ID = 1.
 pub const NEXT_FK_ID_BODY_OFFSET: usize = 92;
 
+/// body offset of `catalog_stats_root: u64` — root heap page for
+/// `axiom_stats` per-column statistics (Phase 6.10). Value 0 = not yet
+/// allocated (lazily initialized on first write; pre-6.10 databases open
+/// without error and use conservative planner defaults).
+pub const CATALOG_STATS_ROOT_BODY_OFFSET: usize = 96;
+
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMA_VER_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "catalog header must fit within page 0"

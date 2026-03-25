@@ -8,6 +8,7 @@ import {
 } from 'lucide-react'
 import { PROCEDURES, FUNCTIONS, TRIGGERS, SEQUENCES, type Procedure, type Func, type Trigger, type Sequence } from '@/lib/mock'
 import { cn } from '@/lib/utils'
+import { useToast } from '@/components/toast'
 
 const MonacoEditor = dynamic(() => import('@monaco-editor/react'), { ssr: false })
 
@@ -99,13 +100,14 @@ function ObjectSearch({
 
 // ── Shared editor panel ───────────────────────────────────────────────────────
 
-function CodePanel({ title, language, body, args, returns, onBodyChange }: {
+function CodePanel({ title, language, body, args, returns, onBodyChange, onSave }: {
   title: string
   language: string
   body: string
   args?: { name: string; type: string }[]
   returns?: string
   onBodyChange: (v: string) => void
+  onSave?: () => void
 }) {
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState<string | null>(null)
@@ -138,6 +140,12 @@ function CodePanel({ title, language, body, args, returns, onBodyChange }: {
           )}>
             {language.toUpperCase()}
           </span>
+          {onSave && (
+            <button onClick={onSave}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold border border-[#30363d] text-[#8b949e] hover:text-[#e6edf3] hover:border-[#10b981]/50 transition-all">
+              Save
+            </button>
+          )}
           <button onClick={run} disabled={running}
             className={cn(
               'flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold transition-all',
@@ -181,12 +189,97 @@ function CodePanel({ title, language, body, args, returns, onBodyChange }: {
   )
 }
 
+// ── Confirm modal ─────────────────────────────────────────────────────────────
+
+function ConfirmModal({ title, message, onConfirm, onCancel }: {
+  title: string; message: string; onConfirm: () => void; onCancel: () => void
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-5 w-80 shadow-xl">
+        <h3 className="text-sm font-semibold text-[#e6edf3] mb-2">{title}</h3>
+        <p className="text-xs text-[#8b949e] mb-4">{message}</p>
+        <div className="flex justify-end gap-2">
+          <button onClick={onCancel}
+            className="px-3 py-1.5 rounded text-xs text-[#8b949e] border border-[#30363d] hover:bg-[#21262d] transition-colors">
+            Cancel
+          </button>
+          <button onClick={onConfirm}
+            className="px-3 py-1.5 rounded text-xs font-semibold bg-[#f85149] text-white hover:bg-[#f85149]/80 transition-colors">
+            Confirm
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Create object modal ────────────────────────────────────────────────────────
+
+function CreateObjectModal({ title, onSave, onCancel, extraFields }: {
+  title: string
+  onSave: (name: string, language: string, body: string) => void
+  onCancel: () => void
+  extraFields?: React.ReactNode
+}) {
+  const [name, setName] = useState('')
+  const [language, setLanguage] = useState<'sql' | 'axiomql'>('sql')
+  const [body, setBody] = useState('')
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-5 w-96 shadow-xl flex flex-col gap-3">
+        <h3 className="text-sm font-semibold text-[#e6edf3]">{title}</h3>
+        <div className="flex flex-col gap-1">
+          <label className="text-[10px] text-[#8b949e] uppercase tracking-wider">Name</label>
+          <input value={name} onChange={e => setName(e.target.value)}
+            placeholder="object_name"
+            className="bg-[#0d1117] border border-[#30363d] rounded px-3 py-1.5 text-xs font-mono text-[#e6edf3] outline-none focus:border-[#10b981]" />
+        </div>
+        <div className="flex flex-col gap-1">
+          <label className="text-[10px] text-[#8b949e] uppercase tracking-wider">Language</label>
+          <div className="flex gap-1">
+            {(['sql', 'axiomql'] as const).map(l => (
+              <button key={l} onClick={() => setLanguage(l)}
+                className={cn('px-3 py-1 rounded text-xs font-semibold transition-colors',
+                  language === l ? 'bg-[#10b981] text-white' : 'border border-[#30363d] text-[#8b949e] hover:text-[#e6edf3]')}>
+                {l.toUpperCase()}
+              </button>
+            ))}
+          </div>
+        </div>
+        {extraFields}
+        <div className="flex flex-col gap-1">
+          <label className="text-[10px] text-[#8b949e] uppercase tracking-wider">Body</label>
+          <textarea value={body} onChange={e => setBody(e.target.value)}
+            placeholder={language === 'sql' ? 'BEGIN\n  -- body\nEND' : '-- axiomql body'}
+            rows={5}
+            className="bg-[#0d1117] border border-[#30363d] rounded px-3 py-2 text-xs font-mono text-[#e6edf3] outline-none focus:border-[#10b981] resize-none" />
+        </div>
+        <div className="flex justify-end gap-2">
+          <button onClick={onCancel}
+            className="px-3 py-1.5 rounded text-xs text-[#8b949e] border border-[#30363d] hover:bg-[#21262d] transition-colors">
+            Cancel
+          </button>
+          <button onClick={() => name.trim() && onSave(name.trim(), language, body)}
+            disabled={!name.trim()}
+            className="px-3 py-1.5 rounded text-xs font-semibold bg-[#10b981] text-white hover:bg-[#10b981]/80 disabled:opacity-40 transition-colors">
+            Create
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Procedures tab ────────────────────────────────────────────────────────────
 
 function ProceduresTab() {
   const [procs, setProcs] = useState<Procedure[]>(PROCEDURES)
   const [selected, setSelected] = useState<string>(procs[0]?.name ?? '')
   const [search, setSearch] = useState('')
+  const [showCreate, setShowCreate] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+  const { show: showToast } = useToast()
 
   const filtered = search.trim()
     ? procs.filter(p => p.name.toLowerCase().includes(search.toLowerCase()))
@@ -196,13 +289,38 @@ function ProceduresTab() {
 
   return (
     <div className="flex h-full">
+      {showCreate && (
+        <CreateObjectModal
+          title="New Procedure"
+          onSave={(name, language, body) => {
+            setProcs(ps => [...ps, { name, language: language as 'sql' | 'axiomql', args: [], body, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }])
+            setSelected(name)
+            setShowCreate(false)
+            showToast('Procedure created')
+          }}
+          onCancel={() => setShowCreate(false)}
+        />
+      )}
+      {confirmDelete && (
+        <ConfirmModal
+          title="Delete procedure"
+          message={`Delete procedure "${confirmDelete}"? This cannot be undone.`}
+          onConfirm={() => {
+            setProcs(ps => ps.filter(p => p.name !== confirmDelete))
+            if (selected === confirmDelete) setSelected(procs.find(p => p.name !== confirmDelete)?.name ?? '')
+            setConfirmDelete(null)
+            showToast('Procedure deleted')
+          }}
+          onCancel={() => setConfirmDelete(null)}
+        />
+      )}
       {/* List */}
       <div className="w-52 border-r border-border flex flex-col shrink-0">
         <div className="px-3 py-2 border-b border-border flex items-center justify-between shrink-0">
           <span className="text-[10px] font-semibold tracking-widest text-text-secondary uppercase">
             Procedures ({procs.length})
           </span>
-          <button className="text-text-secondary hover:text-accent transition-colors">
+          <button onClick={() => setShowCreate(true)} className="text-text-secondary hover:text-accent transition-colors">
             <Plus className="w-3.5 h-3.5" />
           </button>
         </div>
@@ -229,6 +347,11 @@ function ProceduresTab() {
                   {p.language}
                 </span>
                 <span className="text-[10px] text-text-secondary">{p.args.length} args</span>
+                <button
+                  onClick={e => { e.stopPropagation(); setConfirmDelete(p.name) }}
+                  className="opacity-0 group-hover:opacity-60 hover:!opacity-100 text-[#f85149] transition-all mt-1 ml-auto self-start">
+                  <Trash2 className="w-3 h-3" />
+                </button>
               </div>
             </button>
           ))}
@@ -247,6 +370,7 @@ function ProceduresTab() {
             body={proc.body}
             args={proc.args}
             onBodyChange={v => setProcs(ps => ps.map(p => p.name === selected ? { ...p, body: v } : p))}
+            onSave={() => showToast('Procedure saved')}
           />
         ) : (
           <div className="flex items-center justify-center h-full text-xs text-text-secondary">
@@ -264,6 +388,10 @@ function FunctionsTab() {
   const [fns, setFns] = useState<Func[]>(FUNCTIONS)
   const [selected, setSelected] = useState<string>(fns[0]?.name ?? '')
   const [search, setSearch] = useState('')
+  const [showCreate, setShowCreate] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+  const [returnsValue, setReturnsValue] = useState('TEXT')
+  const { show: showToast } = useToast()
 
   const filtered = search.trim()
     ? fns.filter(f => f.name.toLowerCase().includes(search.toLowerCase()))
@@ -273,12 +401,46 @@ function FunctionsTab() {
 
   return (
     <div className="flex h-full">
+      {showCreate && (
+        <CreateObjectModal
+          title="New Function"
+          onSave={(name, language, body) => {
+            setFns(fs => [...fs, { name, language: language as 'sql' | 'axiomql', args: [], returns: returnsValue || 'VOID', body, createdAt: new Date().toISOString() }])
+            setSelected(name)
+            setShowCreate(false)
+            setReturnsValue('TEXT')
+            showToast('Function created')
+          }}
+          onCancel={() => { setShowCreate(false); setReturnsValue('TEXT') }}
+          extraFields={
+            <div className="flex flex-col gap-1">
+              <label className="text-[10px] text-[#8b949e] uppercase tracking-wider">Returns</label>
+              <input value={returnsValue} onChange={e => setReturnsValue(e.target.value)}
+                placeholder="TEXT"
+                className="bg-[#0d1117] border border-[#30363d] rounded px-3 py-1.5 text-xs font-mono text-[#e6edf3] outline-none focus:border-[#10b981]" />
+            </div>
+          }
+        />
+      )}
+      {confirmDelete && (
+        <ConfirmModal
+          title="Delete function"
+          message={`Delete function "${confirmDelete}"? This cannot be undone.`}
+          onConfirm={() => {
+            setFns(fs => fs.filter(f => f.name !== confirmDelete))
+            if (selected === confirmDelete) setSelected(fns.find(f => f.name !== confirmDelete)?.name ?? '')
+            setConfirmDelete(null)
+            showToast('Function deleted')
+          }}
+          onCancel={() => setConfirmDelete(null)}
+        />
+      )}
       <div className="w-52 border-r border-border flex flex-col shrink-0">
         <div className="px-3 py-2 border-b border-border flex items-center justify-between shrink-0">
           <span className="text-[10px] font-semibold tracking-widest text-text-secondary uppercase">
             Functions ({fns.length})
           </span>
-          <button className="text-text-secondary hover:text-accent transition-colors">
+          <button onClick={() => setShowCreate(true)} className="text-text-secondary hover:text-accent transition-colors">
             <Plus className="w-3.5 h-3.5" />
           </button>
         </div>
@@ -292,7 +454,7 @@ function FunctionsTab() {
           {filtered.map(f => (
             <button key={f.name} onClick={() => setSelected(f.name)}
               className={cn(
-                'w-full text-left px-3 py-2.5 border-b border-border/50 transition-colors',
+                'w-full text-left px-3 py-2.5 border-b border-border/50 transition-colors group',
                 selected === f.name ? 'bg-accent/10' : 'hover:bg-elevated'
               )}>
               <div className={cn('text-xs font-mono font-semibold truncate',
@@ -305,6 +467,11 @@ function FunctionsTab() {
                   {f.language}
                 </span>
                 <span className="text-[10px] text-accent">→ {f.returns}</span>
+                <button
+                  onClick={e => { e.stopPropagation(); setConfirmDelete(f.name) }}
+                  className="opacity-0 group-hover:opacity-60 hover:!opacity-100 text-[#f85149] transition-all mt-1 ml-auto self-start">
+                  <Trash2 className="w-3 h-3" />
+                </button>
               </div>
             </button>
           ))}
@@ -322,6 +489,7 @@ function FunctionsTab() {
             args={fn.args}
             returns={fn.returns}
             onBodyChange={v => setFns(fs => fs.map(f => f.name === selected ? { ...f, body: v } : f))}
+            onSave={() => showToast('Function saved')}
           />
         ) : (
           <div className="flex items-center justify-center h-full text-xs text-text-secondary">
@@ -339,6 +507,12 @@ function TriggersTab() {
   const [triggers, setTriggers] = useState<Trigger[]>(TRIGGERS)
   const [selected, setSelected] = useState<string>(triggers[0]?.name ?? '')
   const [search, setSearch] = useState('')
+  const [showCreate, setShowCreate] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+  const [newTriggerTable, setNewTriggerTable] = useState('users')
+  const [newTriggerEvent, setNewTriggerEvent] = useState<'INSERT' | 'UPDATE' | 'DELETE'>('INSERT')
+  const [newTriggerTiming, setNewTriggerTiming] = useState<'BEFORE' | 'AFTER'>('BEFORE')
+  const { show: showToast } = useToast()
 
   const filtered = search.trim()
     ? triggers.filter(t => t.name.toLowerCase().includes(search.toLowerCase()))
@@ -355,12 +529,77 @@ function TriggersTab() {
 
   return (
     <div className="flex h-full">
+      {showCreate && (
+        <CreateObjectModal
+          title="New Trigger"
+          onSave={(name, language, body) => {
+            setTriggers(ts => [...ts, {
+              name, language: language as 'sql' | 'axiomql', body,
+              table: newTriggerTable || 'users',
+              event: newTriggerEvent || 'INSERT',
+              timing: newTriggerTiming || 'BEFORE',
+              enabled: true,
+              createdAt: new Date().toISOString(),
+            }])
+            setSelected(name)
+            setShowCreate(false)
+            showToast('Trigger created')
+          }}
+          onCancel={() => setShowCreate(false)}
+          extraFields={
+            <>
+              <div className="flex flex-col gap-1">
+                <label className="text-[10px] text-[#8b949e] uppercase tracking-wider">Table</label>
+                <select value={newTriggerTable} onChange={e => setNewTriggerTable(e.target.value)}
+                  className="bg-[#0d1117] border border-[#30363d] rounded px-3 py-1.5 text-xs font-mono text-[#e6edf3] outline-none focus:border-[#10b981]">
+                  {['users', 'orders', 'products', 'categories'].map(t => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex gap-2">
+                <div className="flex flex-col gap-1 flex-1">
+                  <label className="text-[10px] text-[#8b949e] uppercase tracking-wider">Event</label>
+                  <select value={newTriggerEvent} onChange={e => setNewTriggerEvent(e.target.value as 'INSERT' | 'UPDATE' | 'DELETE')}
+                    className="bg-[#0d1117] border border-[#30363d] rounded px-3 py-1.5 text-xs font-mono text-[#e6edf3] outline-none focus:border-[#10b981]">
+                    {['INSERT', 'UPDATE', 'DELETE'].map(ev => (
+                      <option key={ev} value={ev}>{ev}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex flex-col gap-1 flex-1">
+                  <label className="text-[10px] text-[#8b949e] uppercase tracking-wider">Timing</label>
+                  <select value={newTriggerTiming} onChange={e => setNewTriggerTiming(e.target.value as 'BEFORE' | 'AFTER')}
+                    className="bg-[#0d1117] border border-[#30363d] rounded px-3 py-1.5 text-xs font-mono text-[#e6edf3] outline-none focus:border-[#10b981]">
+                    {['BEFORE', 'AFTER'].map(t => (
+                      <option key={t} value={t}>{t}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            </>
+          }
+        />
+      )}
+      {confirmDelete && (
+        <ConfirmModal
+          title="Delete trigger"
+          message={`Delete trigger "${confirmDelete}"? This cannot be undone.`}
+          onConfirm={() => {
+            setTriggers(ts => ts.filter(t => t.name !== confirmDelete))
+            if (selected === confirmDelete) setSelected(triggers.find(t => t.name !== confirmDelete)?.name ?? '')
+            setConfirmDelete(null)
+            showToast('Trigger deleted')
+          }}
+          onCancel={() => setConfirmDelete(null)}
+        />
+      )}
       <div className="w-52 border-r border-border flex flex-col shrink-0">
         <div className="px-3 py-2 border-b border-border flex items-center justify-between shrink-0">
           <span className="text-[10px] font-semibold tracking-widest text-text-secondary uppercase">
             Triggers ({triggers.length})
           </span>
-          <button className="text-text-secondary hover:text-accent transition-colors">
+          <button onClick={() => setShowCreate(true)} className="text-text-secondary hover:text-accent transition-colors">
             <Plus className="w-3.5 h-3.5" />
           </button>
         </div>
@@ -374,7 +613,7 @@ function TriggersTab() {
           {filtered.map(t => (
             <button key={t.name} onClick={() => setSelected(t.name)}
               className={cn(
-                'w-full text-left px-3 py-2.5 border-b border-border/50 transition-colors',
+                'w-full text-left px-3 py-2.5 border-b border-border/50 transition-colors group',
                 selected === t.name ? 'bg-accent/10' : 'hover:bg-elevated',
                 !t.enabled && 'opacity-50'
               )}>
@@ -390,6 +629,11 @@ function TriggersTab() {
                   {t.timing}
                 </span>
                 <span className="text-[10px] text-text-secondary font-mono">{t.table}</span>
+                <button
+                  onClick={e => { e.stopPropagation(); setConfirmDelete(t.name) }}
+                  className="opacity-0 group-hover:opacity-60 hover:!opacity-100 text-[#f85149] transition-all mt-1 ml-auto self-start">
+                  <Trash2 className="w-3 h-3" />
+                </button>
               </div>
             </button>
           ))}
@@ -423,6 +667,7 @@ function TriggersTab() {
                 language={trig.language}
                 body={trig.body}
                 onBodyChange={v => setTriggers(ts => ts.map(t => t.name === selected ? { ...t, body: v } : t))}
+                onSave={() => showToast('Trigger saved')}
               />
             </div>
           </>

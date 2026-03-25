@@ -2,6 +2,18 @@ import Link from 'next/link'
 import { Table2, Eye, Clock, HardDrive } from 'lucide-react'
 import { TABLES } from '@/lib/mock'
 
+function timeAgo(dateStr: string): string {
+  const date = new Date(dateStr.replace(' ', 'T'))
+  const diff = Date.now() - date.getTime()
+  const mins = Math.floor(diff / 60_000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24) return `${hrs}h ago`
+  const days = Math.floor(hrs / 24)
+  return `${days}d ago`
+}
+
 export default function TablesPage() {
   return (
     <div className="flex-1 overflow-y-auto">
@@ -39,7 +51,7 @@ export default function TablesPage() {
                 </div>
                 <div className="flex items-center gap-1">
                   <Clock className="w-3 h-3" />
-                  <span className="font-mono text-[10px]">{t.lastUpdated.split(' ')[1]}</span>
+                  <span className="font-mono text-[10px]">{timeAgo(t.lastUpdated)}</span>
                 </div>
               </div>
             </div>

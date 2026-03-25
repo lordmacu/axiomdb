@@ -6,6 +6,62 @@ stored in the same `.db` file as the table data.
 
 ---
 
+## Index Statistics and Query Planner
+
+AxiomDB maintains per-column statistics to help the query planner choose
+between an index scan and a full table scan.
+
+### How it works
+
+When you create an index, AxiomDB automatically computes:
+- **`row_count`** — total visible rows in the table
+- **`ndv`** (number of distinct values) — exact count of distinct non-NULL values
+
+The planner uses `selectivity = 1 / ndv` for equality predicates. If
+`selectivity > 20%` of rows would be returned, a full table scan is cheaper
+than an index scan, so the planner uses the table scan.
+
+```
+ndv = 3,   rows = 10,000  →  selectivity = 33%  > 20%  →  Scan
+ndv = 100, rows = 10,000  →  selectivity = 1%   < 20%  →  Index
+```
+
+### ANALYZE command
+
+Run `ANALYZE` to refresh statistics after bulk inserts or deletes:
+
+```sql
+-- Analyze a specific table (all indexed columns)
+ANALYZE TABLE users;
+
+-- Analyze a specific column only
+ANALYZE TABLE orders (status);
+```
+
+Statistics are automatically computed at `CREATE INDEX` time. Run `ANALYZE` when:
+- Significant data was added after the index was created
+- Query plans seem wrong (e.g., full scan when index would be faster)
+
+### Automatic staleness detection
+
+After enough row changes (>20% of the analyzed row count), the planner
+automatically uses conservative defaults (`ndv = 200`) until the next `ANALYZE`.
+This prevents stale statistics from causing poor query plans.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Exact NDV, No Sampling</span>
+AxiomDB computes exact distinct value counts (no sampling). PostgreSQL uses
+Vitter's reservoir sampling algorithm for large tables. Exact counting is
+simpler and correct for the typical table sizes of an embedded database.
+Reservoir sampling (Duj1 estimator) is planned for Phase 6.15 when tables
+exceed 1M rows.
+</div>
+</div>
+
+---
+
 ## Composite Indexes
 
 A composite index covers two or more columns. The query planner uses it when

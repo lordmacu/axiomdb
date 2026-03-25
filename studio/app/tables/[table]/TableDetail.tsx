@@ -340,6 +340,27 @@ function DataTab({ tableName }: { tableName: string }) {
     })
   }
 
+  // Clone row
+  function cloneRow(rowIndex: number) {
+    const source = rows[rowIndex] as Record<string, unknown>
+    const maxId = rows.reduce((m, r) => Math.max(m, Number((r as Record<string, unknown>).id ?? 0)), 0)
+    const clone: Record<string, unknown> = { ...source, id: maxId + 1 }
+    setRows(prev => {
+      const next = [...prev]
+      next.splice(rowIndex + 1, 0, clone)
+      return next
+    })
+    const now = new Date().toTimeString().slice(0, 8)
+    const cols = allColKeys.filter(k => k !== 'id').join(', ')
+    const vals = allColKeys.filter(k => k !== 'id').map(k => `'${source[k] ?? ''}'`).join(', ')
+    setLastSql({
+      sql: `INSERT INTO ${tableName} (${cols}) VALUES (${vals});`,
+      axiomql: `${tableName}.insert({${allColKeys.filter(k => k !== 'id').map(k => `${k}: '${source[k] ?? ''}'`).join(', ')}})`,
+      ts: now,
+    })
+    showToast('Row cloned')
+  }
+
   // Add row
   function commitAddRow() {
     const maxId = rows.reduce((m, r) => Math.max(m, Number(r.id ?? 0)), 0)
@@ -599,7 +620,7 @@ function DataTab({ tableName }: { tableName: string }) {
                   )
                 })}
                 {/* Actions column header */}
-                <th className="w-12 px-2 py-2" />
+                <th className="w-16 px-2 py-2" />
               </tr>
             ))}
           </thead>
@@ -669,13 +690,22 @@ function DataTab({ tableName }: { tableName: string }) {
                       </td>
                     )
                   })}
-                  {/* Delete action cell */}
-                  <td className="px-2 py-1.5 w-12">
-                    <button
-                      onClick={() => setConfirmDeleteIdx(originalIndex)}
-                      className="opacity-0 group-hover:opacity-60 hover:!opacity-100 text-error transition-all">
-                      <Trash2 className="w-3 h-3" />
-                    </button>
+                  {/* Row action buttons: clone + delete */}
+                  <td className="px-2 py-1.5 w-16">
+                    <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <button
+                        title="Clone row"
+                        onClick={() => cloneRow(originalIndex)}
+                        className="p-0.5 rounded text-text-secondary hover:text-accent hover:bg-accent/10 transition-colors">
+                        <Copy className="w-3 h-3" />
+                      </button>
+                      <button
+                        title="Delete row"
+                        onClick={() => setConfirmDeleteIdx(originalIndex)}
+                        className="p-0.5 rounded text-text-secondary hover:text-error hover:bg-error/10 transition-colors">
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    </div>
                   </td>
                 </tr>
               )

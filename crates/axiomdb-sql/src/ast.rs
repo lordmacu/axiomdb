@@ -320,6 +320,17 @@ pub struct TruncateTableStmt {
     pub table: TableRef,
 }
 
+/// `ANALYZE [TABLE table_name [(column_name)]]` — refresh per-column statistics (Phase 6.12).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnalyzeStmt {
+    /// `None` = analyze all tables in the current schema.
+    /// `Some(name)` = analyze a specific table.
+    pub table: Option<String>,
+    /// `None` = all indexed columns.
+    /// `Some(name)` = a specific column only.
+    pub column: Option<String>,
+}
+
 /// `ALTER TABLE` operation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterTableOp {
@@ -401,6 +412,8 @@ pub enum Stmt {
     DropIndex(DropIndexStmt),
     TruncateTable(TruncateTableStmt),
     AlterTable(AlterTableStmt),
+    /// `ANALYZE [TABLE name [(col)]]` — refresh per-column statistics (Phase 6.12).
+    Analyze(AnalyzeStmt),
     // Introspection
     ShowTables(ShowTablesStmt),
     ShowColumns(ShowColumnsStmt),

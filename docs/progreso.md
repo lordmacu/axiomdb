@@ -208,9 +208,9 @@
 - [x] 6.7 ✅ Partial UNIQUE index — `CREATE [UNIQUE] INDEX ... WHERE predicate`; predicate stored as SQL string in IndexDef; build/INSERT/UPDATE/DELETE filter by predicate; planner uses index only when query WHERE implies predicate; session cache invalidated after CoW B-Tree root change
 - [x] 6.8 ✅ Fill factor — `CREATE INDEX ... WITH (fillfactor=N)`; persisted in IndexDef (u8, default 90); BTree::insert_in threads fillfactor → split threshold = ceil(FF×ORDER_LEAF/100); backward-compat
 - [x] 6.9 ✅ PK B-Tree population on INSERT; FK composite key index (fk_val|RecordId); composite index planner Rule 0; B-Tree range scan for FK enforcement
-- [ ] 6.10 ⏳ Index statistics bootstrap — on CREATE INDEX: count rows, estimate NDV (distinct values) per column; feeds query planner (6.3)
-- [ ] 6.11 ⏳ Auto-update statistics — recalculate stats when INSERT/DELETE exceeds configurable threshold (20% of table); avoids stale plans
-- [ ] 6.12 ⏳ ANALYZE SQL command — `ANALYZE [TABLE [column]]` to force manual statistics update
+- [x] 6.10 ✅ Index statistics bootstrap — axiom_stats heap; StatsDef (row_count, ndv); bootstrapped at CREATE INDEX
+- [x] 6.11 ✅ Auto-update statistics — StaleStatsTracker in SessionContext; marks stale after >20% row change
+- [x] 6.12 ✅ ANALYZE [TABLE name [(column)]] — exact NDV full scan; resets staleness
 - [ ] 6.13 ⏳ Index-only scans — when SELECT columns are all in the index, do not read the main table (covering scan)
 - [ ] 6.14 ⏳ MVCC on secondary indexes — each index entry includes `(key, RecordId, txn_id_visible_from)`; UPDATE of indexed column inserts new version without deleting the old one; vacuum cleans dead index versions
 - [ ] 6.15 ⏳ Index corruption detection — on DB open verify index checksums; detect index vs table divergence; automatic `REINDEX` if divergent (recovery mode)

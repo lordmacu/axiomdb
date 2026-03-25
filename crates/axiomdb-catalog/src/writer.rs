@@ -45,7 +45,7 @@ use axiomdb_wal::TxnManager;
 use crate::{
     bootstrap::{CatalogBootstrap, CatalogPageIds},
     notifier::{CatalogChangeNotifier, SchemaChangeEvent, SchemaChangeKind},
-    schema::{ColumnDef, ConstraintDef, FkDef, IndexDef, TableDef, TableId},
+    schema::{ColumnDef, ConstraintDef, FkDef, IndexDef, StatsDef, TableDef, TableId},
 };
 
 // ── WAL table_id constants for system tables ──────────────────────────────────
@@ -60,6 +60,8 @@ pub const SYSTEM_TABLE_INDEXES: u32 = u32::MAX;
 pub const SYSTEM_TABLE_CONSTRAINTS: u32 = u32::MAX - 3;
 /// WAL `table_id` used for inserts/deletes into `axiom_foreign_keys` (Phase 6.5).
 pub const SYSTEM_TABLE_FOREIGN_KEYS: u32 = u32::MAX - 4;
+/// WAL `table_id` used for inserts/deletes into `axiom_stats` (Phase 6.10).
+pub const SYSTEM_TABLE_STATS: u32 = u32::MAX - 5;
 
 // ── CatalogWriter ─────────────────────────────────────────────────────────────
 
@@ -639,5 +641,64 @@ impl<'a> CatalogWriter<'a> {
             }
         }
         Ok(()) // not found — idempotent
+    }
+
+    // ── Statistics operations (Phase 6.10) ───────────────────────────────────
+
+    /// Upserts per-column statistics into `axiom_stats`.
+    ///
+    /// If a row already exists for `(table_id, col_idx)`, it is MVCC-deleted
+    /// and the new row is inserted. Both operations run within the same txn.
+    ///
+    /// Called at `CREATE INDEX` (bootstrap) and `ANALYZE` (refresh).
+    /// Statistics writes are advisory — callers may ignore errors.
+    pub fn upsert_stats(&mut self, def: StatsDef) -> Result<(), DbError> {
+        let stats_root = CatalogBootstrap::ensure_stats_root(self.storage)?;
+        let snap = self.txn.active_snapshot()?;
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+
+        // MVCC-delete existing row for this (table_id, col_idx) if present.
+        let existing =
+            crate::reader::CatalogReader::scan_stats_root(self.storage, stats_root, snap)?;
+        for (rid, old_data) in existing {
+            if let Ok((old_def, _)) = StatsDef::from_bytes(&old_data) {
+                if old_def.table_id == def.table_id && old_def.col_idx == def.col_idx {
+                    let key = [
+                        old_def.table_id.to_le_bytes(),
+                        [old_def.col_idx as u8, (old_def.col_idx >> 8) as u8, 0, 0],
+                    ]
+                    .concat();
+                    axiomdb_storage::HeapChain::delete(
+                        self.storage,
+                        rid.page_id,
+                        rid.slot_id,
+                        txn_id,
+                    )?;
+                    self.txn.record_delete(
+                        SYSTEM_TABLE_STATS,
+                        &key,
+                        &old_data,
+                        rid.page_id,
+                        rid.slot_id,
+                    )?;
+                    break;
+                }
+            }
+        }
+
+        // Insert new stats row.
+        let data = def.to_bytes();
+        let key = [
+            def.table_id.to_le_bytes(),
+            [def.col_idx as u8, (def.col_idx >> 8) as u8, 0, 0],
+        ]
+        .concat();
+        let (page_id, slot_id) = HeapChain::insert(self.storage, stats_root, &data, txn_id)?;
+        self.txn
+            .record_insert(SYSTEM_TABLE_STATS, &key, &data, page_id, slot_id)?;
+        Ok(())
     }
 }

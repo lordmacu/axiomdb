@@ -18,7 +18,8 @@ use axiomdb_storage::{
     PageType, StorageEngine, CATALOG_COLUMNS_ROOT_BODY_OFFSET,
     CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET,
     CATALOG_INDEXES_ROOT_BODY_OFFSET, CATALOG_SCHEMA_VER_BODY_OFFSET,
-    CATALOG_TABLES_ROOT_BODY_OFFSET, NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
+    CATALOG_STATS_ROOT_BODY_OFFSET, CATALOG_TABLES_ROOT_BODY_OFFSET, NEXT_INDEX_ID_BODY_OFFSET,
+    NEXT_TABLE_ID_BODY_OFFSET,
 };
 
 // ── CatalogPageIds ────────────────────────────────────────────────────────────
@@ -44,6 +45,10 @@ pub struct CatalogPageIds {
     /// Zero on databases created before Phase 6.5; lazily initialized on
     /// first use via `CatalogBootstrap::ensure_fk_root()`.
     pub foreign_keys: u64,
+    /// Root page of the `axiom_stats` heap (Phase 6.10).
+    /// Zero on pre-6.10 databases; lazily initialized on first write.
+    /// `list_stats` returns empty vec when zero (no stats yet).
+    pub stats: u64,
 }
 
 // ── CatalogBootstrap ─────────────────────────────────────────────────────────
@@ -108,6 +113,12 @@ impl CatalogBootstrap {
         storage.write_page(fk_root, &fk_page)?;
         write_meta_u64(storage, CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET, fk_root)?;
 
+        // Allocate the stats root (Phase 6.10).
+        let stats_root = storage.alloc_page(PageType::Data)?;
+        let stats_page = Page::new(PageType::Data, stats_root);
+        storage.write_page(stats_root, &stats_page)?;
+        write_meta_u64(storage, CATALOG_STATS_ROOT_BODY_OFFSET, stats_root)?;
+
         storage.flush()?;
 
         Ok(CatalogPageIds {
@@ -116,6 +127,7 @@ impl CatalogBootstrap {
             indexes: indexes_root,
             constraints: constraints_root,
             foreign_keys: fk_root,
+            stats: stats_root,
         })
     }
 
@@ -137,12 +149,14 @@ impl CatalogBootstrap {
         let indexes = read_meta_u64(storage, CATALOG_INDEXES_ROOT_BODY_OFFSET)?;
         let constraints = read_meta_u64(storage, CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET)?;
         let foreign_keys = read_meta_u64(storage, CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET)?;
+        let stats = read_meta_u64(storage, CATALOG_STATS_ROOT_BODY_OFFSET)?;
         Ok(CatalogPageIds {
             tables,
             columns,
             indexes,
             constraints,
             foreign_keys,
+            stats,
         })
     }
 
@@ -161,6 +175,22 @@ impl CatalogBootstrap {
         let page = Page::new(PageType::Data, new_root);
         storage.write_page(new_root, &page)?;
         write_meta_u64(storage, CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, new_root)?;
+        storage.flush()?;
+        Ok(new_root)
+    }
+
+    /// Ensures the `axiom_stats` root page exists (Phase 6.10).
+    ///
+    /// Lazily initialized on first write. Pre-6.10 databases return empty stats.
+    pub fn ensure_stats_root(storage: &mut dyn StorageEngine) -> Result<u64, DbError> {
+        let root = read_meta_u64(storage, CATALOG_STATS_ROOT_BODY_OFFSET)?;
+        if root != 0 {
+            return Ok(root);
+        }
+        let new_root = storage.alloc_page(PageType::Data)?;
+        let page = Page::new(PageType::Data, new_root);
+        storage.write_page(new_root, &page)?;
+        write_meta_u64(storage, CATALOG_STATS_ROOT_BODY_OFFSET, new_root)?;
         storage.flush()?;
         Ok(new_root)
     }

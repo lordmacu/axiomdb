@@ -96,6 +96,8 @@ pub enum Token<'src> {
     Drop,
     #[token("ALTER", ignore(ascii_case))]
     Alter,
+    #[token("ANALYZE", ignore(ascii_case))]
+    Analyze,
     #[token("ADD", ignore(ascii_case))]
     Add,
     #[token("COLUMN", ignore(ascii_case))]

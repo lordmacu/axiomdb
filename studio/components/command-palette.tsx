@@ -18,6 +18,16 @@ type ResultItem = {
   group: 'Tables' | 'Actions' | 'Recent queries'
 }
 
+function fuzzyMatch(str: string, pattern: string): boolean {
+  const s = str.toLowerCase()
+  const p = pattern.toLowerCase()
+  let j = 0
+  for (let i = 0; i < s.length && j < p.length; i++) {
+    if (s[i] === p[j]) j++
+  }
+  return j === p.length
+}
+
 function loadRecentQueries(): HistoryEntry[] {
   if (typeof window === 'undefined') return []
   try {
@@ -70,7 +80,7 @@ export function CommandPalette() {
     const q = query.toLowerCase().trim()
 
     const tableItems: ResultItem[] = TABLES
-      .filter(t => !q || t.name.includes(q))
+      .filter(t => !q || fuzzyMatch(t.name, q))
       .map(t => ({
         id: `table-${t.name}`,
         label: t.name,
@@ -105,11 +115,11 @@ export function CommandPalette() {
         action: () => { router.push('/settings'); close() },
         group: 'Actions' as const,
       },
-    ].filter(a => !q || a.label.toLowerCase().includes(q))
+    ].filter(a => !q || fuzzyMatch(a.label, q))
 
     const histEntries = loadRecentQueries()
     const recentItems: ResultItem[] = histEntries
-      .filter(e => !q || e.query.toLowerCase().includes(q))
+      .filter(e => !q || fuzzyMatch(e.query, q))
       .slice(0, 5)
       .map(e => ({
         id: `hist-${e.id}`,
