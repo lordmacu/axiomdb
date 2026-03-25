@@ -270,6 +270,7 @@ fn test_index_def_fillfactor_roundtrip() {
         }],
         predicate: None,
         fillfactor: 70,
+        is_fk_index: false,
     };
 
     let bytes = def.to_bytes();
@@ -298,6 +299,7 @@ fn test_pre_68_index_row_reads_fillfactor_as_90() {
         }],
         predicate: None,
         fillfactor: 90,
+        is_fk_index: false,
     };
 
     let full_bytes = def.to_bytes();

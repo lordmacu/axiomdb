@@ -874,7 +874,7 @@ fn execute_insert_ctx(
     let mut secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
         .indexes
         .iter()
-        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .filter(|i| !i.columns.is_empty())
         .cloned()
         .collect();
 
@@ -1126,7 +1126,7 @@ fn execute_update_ctx(
     let secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
         .indexes
         .iter()
-        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .filter(|i| !i.columns.is_empty())
         .cloned()
         .collect();
 
@@ -1250,6 +1250,7 @@ fn execute_update_ctx(
             let del_updated = crate::index_maintenance::delete_from_indexes(
                 &current_indexes,
                 &old_values,
+                rid,
                 storage,
                 bloom,
                 &compiled_preds,
@@ -1309,7 +1310,7 @@ fn execute_delete_ctx(
     let secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
         .indexes
         .iter()
-        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .filter(|i| !i.columns.is_empty())
         .cloned()
         .collect();
 
@@ -1414,10 +1415,11 @@ fn execute_delete_ctx(
         let compiled_preds =
             crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;
         let mut any_root_changed = false;
-        for (_, row_vals) in &to_delete {
+        for (rid, row_vals) in &to_delete {
             let updated = crate::index_maintenance::delete_from_indexes(
                 &secondary_indexes,
                 row_vals,
+                *rid,
                 storage,
                 bloom,
                 &compiled_preds,
@@ -3090,7 +3092,7 @@ fn execute_insert(
     let secondary_indexes: Vec<IndexDef> = resolved
         .indexes
         .iter()
-        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .filter(|i| !i.columns.is_empty())
         .cloned()
         .collect();
 
@@ -3374,7 +3376,7 @@ fn execute_update(
     let mut secondary_indexes: Vec<IndexDef> = resolved
         .indexes
         .iter()
-        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .filter(|i| !i.columns.is_empty())
         .cloned()
         .collect();
 
@@ -3410,6 +3412,7 @@ fn execute_update(
             let del_updated = crate::index_maintenance::delete_from_indexes(
                 &secondary_indexes,
                 &current_values,
+                rid,
                 storage,
                 &mut noop_bloom,
                 &compiled_preds,
@@ -3466,7 +3469,7 @@ fn execute_delete(
     let secondary_indexes: Vec<IndexDef> = resolved
         .indexes
         .iter()
-        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .filter(|i| !i.columns.is_empty())
         .cloned()
         .collect();
 
@@ -3517,10 +3520,11 @@ fn execute_delete(
     if !secondary_indexes.is_empty() {
         let compiled_preds =
             crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;
-        for (_, row_vals) in &to_delete {
+        for (rid, row_vals) in &to_delete {
             let updated = crate::index_maintenance::delete_from_indexes(
                 &secondary_indexes,
                 row_vals,
+                *rid,
                 storage,
                 &mut noop_bloom,
                 &compiled_preds,
@@ -3701,6 +3705,7 @@ fn execute_create_table(
                     order: CatalogSortOrder::Asc,
                 }],
                 predicate: None,
+                is_fk_index: false,
             })?;
             Ok(idx_id)
         };
@@ -3918,20 +3923,86 @@ fn persist_fk_constraint(
         }
     }
 
-    // 6. FK index on child table.
+    // 6. FK auto-index on child table (Phase 6.9).
+    use axiomdb_catalog::{IndexColumnDef as CatIndexColumnDef, SortOrder as CatSortOrder};
     //
-    // Phase 6.5 limitation: the current B-Tree stores exactly ONE RecordId per
-    // key. A non-unique FK column (multiple rows with the same FK value) would
-    // cause DuplicateKey errors when inserting the second row with the same key.
-    //
-    // Deferred to Phase 6.9: auto-create an index that uses a composite key
-    // (fk_val + RecordId bytes) so every entry is unique in the B-Tree, while
-    // still allowing range lookups by fk_val prefix.
-    //
-    // For Phase 6.5, FK enforcement always uses a full table scan of the parent
-    // for INSERT validation, and a full scan of the child for DELETE enforcement.
-    // This is O(n) but always correct regardless of index state.
-    let fk_index_id: u32 = 0; // ⚠️ DEFERRED — see above
+    // Uses composite keys: encode_index_key(&[fk_val]) ++ encode_rid(rid) (10 bytes).
+    // Every entry is globally unique even when multiple rows share the same FK value —
+    // the InnoDB approach (appending PK as tiebreaker). This enables O(log n)
+    // range scans for RESTRICT/CASCADE/SET NULL enforcement.
+    let fk_index_id: u32 = {
+        use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Check if child already has a suitable covering index on child_col_idx
+        // (user-provided, not an FK auto-index).
+        let existing_covers = {
+            let mut reader = CatalogReader::new(storage, snap)?;
+            reader.list_indexes(child_table_id)?.into_iter().any(|i| {
+                !i.is_fk_index && !i.columns.is_empty() && i.columns[0].col_idx == child_col_idx
+            })
+        };
+
+        if existing_covers {
+            0 // reuse existing user-provided index; will not be dropped with FK
+        } else {
+            // Build FK auto-index with composite keys from existing child rows.
+            let root_page_id = storage.alloc_page(PageType::Index)?;
+            {
+                let mut page = Page::new(PageType::Index, root_page_id);
+                let leaf = cast_leaf_mut(&mut page);
+                leaf.is_leaf = 1;
+                leaf.set_num_keys(0);
+                leaf.set_next_leaf(NULL_PAGE);
+                page.update_checksum();
+                storage.write_page(root_page_id, &page)?;
+            }
+            let root_pid = AtomicU64::new(root_page_id);
+
+            let child_table_def = {
+                let mut reader = CatalogReader::new(storage, snap)?;
+                reader
+                    .get_table_by_id(child_table_id)?
+                    .ok_or(DbError::CatalogTableNotFound {
+                        table_id: child_table_id,
+                    })?
+            };
+            let child_cols = {
+                let mut reader = CatalogReader::new(storage, snap)?;
+                reader.list_columns(child_table_id)?
+            };
+
+            // Insert composite key entry for every existing child row.
+            let rows = TableEngine::scan_table(storage, &child_table_def, &child_cols, snap, None)?;
+            for (rid, row_vals) in rows {
+                let fk_val = row_vals.get(child_col_idx as usize).unwrap_or(&Value::Null);
+                if matches!(fk_val, Value::Null) {
+                    continue;
+                }
+                if let Ok(key) = crate::index_maintenance::fk_composite_key(fk_val, rid) {
+                    BTree::insert_in(storage, &root_pid, &key, rid, 90)?;
+                }
+            }
+
+            let final_root = root_pid.load(Ordering::Acquire);
+            let new_idx_id = CatalogWriter::new(storage, txn)?.create_index(IndexDef {
+                index_id: 0,
+                table_id: child_table_id,
+                name: format!("_fk_{constraint_name}"),
+                root_page_id: final_root,
+                is_unique: false,
+                is_primary: false,
+                is_fk_index: true, // marks composite-key FK auto-index
+                columns: vec![CatIndexColumnDef {
+                    col_idx: child_col_idx,
+                    order: CatSortOrder::Asc,
+                }],
+                predicate: None,
+                fillfactor: 90,
+            })?;
+            new_idx_id
+        }
+    };
 
     // 7. Persist FkDef in axiom_foreign_keys.
     CatalogWriter::new(storage, txn)?.create_foreign_key(FkDef {
@@ -4112,6 +4183,7 @@ fn execute_create_index(
         columns: index_columns,
         predicate: predicate_sql,
         fillfactor: stmt.fillfactor.unwrap_or(90),
+        is_fk_index: false, // user-created indexes are never FK auto-indexes
     })?;
 
     // 7. Populate bloom filter for the newly created index.

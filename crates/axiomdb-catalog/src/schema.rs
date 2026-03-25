@@ -359,6 +359,13 @@ pub struct IndexDef {
     /// Stored as 1 byte after the predicate section. Absent in pre-6.8 rows;
     /// `from_bytes` returns 90 for backward compatibility.
     pub fillfactor: u8,
+    /// `true` for FK auto-indexes that use composite keys `(fk_val | RecordId)`.
+    ///
+    /// Allows multiple rows with the same FK value (InnoDB approach: append 10
+    /// RecordId bytes to the key to guarantee global uniqueness in the B-Tree).
+    ///
+    /// Stored in `flags bit 2` (`0x04`). Pre-6.9 rows have bit 2 = 0 → `false`.
+    pub is_fk_index: bool,
 }
 
 impl IndexDef {
@@ -369,7 +376,7 @@ impl IndexDef {
     /// `[ncols:1][col_idx:2 LE, order:1]×ncols`
     /// `[pred_len:2 LE][pred_sql bytes]` — only present if predicate is Some
     ///
-    /// - `flags bit0` = unique, `flags bit1` = primary key
+    /// - `flags bit0` = unique, `flags bit1` = primary key, `flags bit2` = fk_index
     pub fn to_bytes(&self) -> Vec<u8> {
         let name = self.name.as_bytes();
         debug_assert!(name.len() <= 255, "index name too long");
@@ -381,6 +388,9 @@ impl IndexDef {
         }
         if self.is_primary {
             flags |= 0x02;
+        }
+        if self.is_fk_index {
+            flags |= 0x04;
         }
 
         let pred_bytes = self.predicate.as_deref().map(str::as_bytes);
@@ -441,6 +451,7 @@ impl IndexDef {
         let flags = bytes[16];
         let is_unique = flags & 0x01 != 0;
         let is_primary = flags & 0x02 != 0;
+        let is_fk_index = flags & 0x04 != 0; // Phase 6.9
         let name_len = bytes[17] as usize;
 
         if bytes.len() < 18 + name_len {
@@ -518,6 +529,7 @@ impl IndexDef {
                 columns,
                 predicate,
                 fillfactor,
+                is_fk_index,
             },
             consumed,
         ))
@@ -935,6 +947,7 @@ mod tests {
             }],
             predicate: None,
             fillfactor: 90,
+            is_fk_index: false,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = IndexDef::from_bytes(&bytes).unwrap();
@@ -957,6 +970,7 @@ mod tests {
             }],
             predicate: None,
             fillfactor: 90,
+            is_fk_index: false,
         };
         let bytes = def.to_bytes();
         let (back, _) = IndexDef::from_bytes(&bytes).unwrap();
@@ -979,6 +993,7 @@ mod tests {
             columns: vec![],
             predicate: None,
             fillfactor: 90,
+            is_fk_index: false,
         };
         let bytes = def.to_bytes();
         assert!(IndexDef::from_bytes(&bytes[..10]).is_err());
@@ -1005,6 +1020,7 @@ mod tests {
             ],
             predicate: None,
             fillfactor: 90,
+            is_fk_index: false,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = IndexDef::from_bytes(&bytes).unwrap();
@@ -1025,6 +1041,7 @@ mod tests {
             columns: vec![],
             predicate: None,
             fillfactor: 90,
+            is_fk_index: false,
         };
         let full_bytes = def.to_bytes();
         // Truncate the columns section (last byte is ncols=0, remove it).
