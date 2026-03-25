@@ -3,7 +3,7 @@
 AxiomDB wire protocol test.
 Updated at each subphase close — always overwrite this file, never create new ones.
 
-Last updated: subphase 5.9b (@@in_transaction + SHOW WARNINGS)
+Last updated: subphase 6.13 (index-only scans + non-unique composite keys)
 """
 import os
 import signal
@@ -170,6 +170,66 @@ cur.execute("INSERT INTO wt_items VALUES (4, 'd')")
 conn.commit()
 cur.execute("SHOW WARNINGS")
 ok("No warnings after real COMMIT", len(cur.fetchall()) == 0)
+
+# ── [6.13] Index-only scans ───────────────────────────────────────────────────
+
+print("\n[6.13] Index-only scans — covered queries skip heap read")
+
+cur.execute("CREATE TABLE iox_scores (id INT, score INT, label TEXT)")
+cur.execute("CREATE INDEX idx_score ON iox_scores (score)")
+cur.execute("INSERT INTO iox_scores VALUES (1, 10, 'low')")
+cur.execute("INSERT INTO iox_scores VALUES (2, 20, 'mid')")
+cur.execute("INSERT INTO iox_scores VALUES (3, 30, 'high')")
+cur.execute("INSERT INTO iox_scores VALUES (4, 20, 'mid2')")
+conn.commit()
+
+# Covered equality — SELECT score WHERE score = 20 (only score in SELECT, score indexed)
+cur.execute("SELECT score FROM iox_scores WHERE score = 20")
+rows = cur.fetchall()
+ok("Index-only scan equality: 2 rows with score=20", len(rows) == 2)
+ok("Index-only scan equality: all values = 20", all(r[0] == 20 for r in rows))
+
+# Covered range — SELECT score WHERE score >= 20 AND score <= 30
+cur.execute("SELECT score FROM iox_scores WHERE score >= 20 AND score <= 30")
+rows = cur.fetchall()
+scores = sorted(r[0] for r in rows)
+ok("Index-only scan range: scores 20,20,30 returned", scores == [20, 20, 30])
+
+# Non-covered SELECT returns correct full rows (regression)
+cur.execute("SELECT id, score, label FROM iox_scores WHERE score = 10")
+rows = cur.fetchall()
+ok("Non-covered select: 1 row with score=10", len(rows) == 1)
+ok("Non-covered select: label = 'low'", rows[0][2] == 'low')
+
+# Non-unique index: duplicate values must work — no DuplicateKey
+cur.execute("CREATE TABLE iox_tags (id INT, tag TEXT)")
+cur.execute("CREATE INDEX idx_tag ON iox_tags (tag)")
+cur.execute("INSERT INTO iox_tags VALUES (1, 'rust')")
+cur.execute("INSERT INTO iox_tags VALUES (2, 'go')")
+cur.execute("INSERT INTO iox_tags VALUES (3, 'rust')")
+cur.execute("INSERT INTO iox_tags VALUES (4, 'rust')")
+conn.commit()
+
+cur.execute("SELECT tag FROM iox_tags WHERE tag = 'rust'")
+rows = cur.fetchall()
+ok("Non-unique index: 3 rows with tag='rust' (duplicate values allowed)", len(rows) == 3)
+ok("Non-unique index: all returned tags = 'rust'", all(r[0] == 'rust' for r in rows))
+
+# INCLUDE syntax accepted
+try:
+    cur.execute("CREATE TABLE iox_include (id INT, val INT, extra TEXT)")
+    cur.execute("CREATE INDEX idx_cover ON iox_include (val) INCLUDE (extra)")
+    conn.commit()
+    ok("INCLUDE (cols) DDL syntax accepted", True)
+except Exception as e:
+    ok("INCLUDE (cols) DDL syntax accepted", False, e)
+
+# DELETE visibility: deleted row must not appear in index-only scan
+cur.execute("DELETE FROM iox_tags WHERE id = 1")
+conn.commit()
+cur.execute("SELECT tag FROM iox_tags WHERE tag = 'rust'")
+rows = cur.fetchall()
+ok("Index-only scan: deleted row not returned (MVCC)", len(rows) == 2)
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 
