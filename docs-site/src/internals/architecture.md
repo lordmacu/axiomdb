@@ -433,10 +433,17 @@ Rejecting at the codec boundary means zero heap allocation for oversized inputs.
 </div>
 </div>
 
-#### Result set serialization (result.rs)
+#### Result set serialization (result.rs — subphase 5.5a)
 
-A `QueryResult::Rows` is serialized as a sequence of packets with monotonically
-increasing sequence IDs:
+AxiomDB has two result serializers sharing the same `column_count + column_defs + EOF`
+framing but differing in row encoding:
+
+| Serializer | Used for | Row format |
+|---|---|---|
+| `serialize_query_result` | `COM_QUERY` | Text protocol — NULL = `0xfb`, values as lenenc ASCII strings |
+| `serialize_query_result_binary` | `COM_STMT_EXECUTE` | Binary protocol — null bitmap + fixed-width/lenenc values |
+
+Both paths produce the same packet sequence shape:
 
 ```
 column_count   (lenenc integer)
@@ -445,26 +452,65 @@ column_def_1   (lenenc strings: catalog, schema, table, org_table, name, org_nam
 …
 column_def_N
 EOF
-row_1          (each value: 0xfb for NULL, or lenenc_str of text encoding)
+row_1
 …
 row_M
 EOF
 ```
 
-AxiomDB type codes sent in `column_def.type_byte`:
+**Binary row packet layout:**
+
+```
+0x00                      row header (always)
+null_bitmap[ceil((N+2)/8)]  MySQL offset-2 null bitmap: column i → bit (i+2)
+value_0 ... value_k         non-null values in column order (no per-cell headers)
+```
+
+The null bitmap uses MySQL's prepared-row offset of 2 — bits 0 and 1 are reserved.
+Column 0 → bit 2, column 1 → bit 3, and so on.
+
+**Binary cell encoding per type:**
+
+| AxiomDB type | Encoding |
+|---|---|
+| `Bool` | 1 byte: `0x00` or `0x01` |
+| `Int` | 4-byte signed LE |
+| `BigInt` | 8-byte signed LE |
+| `Real` | 8-byte IEEE-754 LE (`f64`) |
+| `Decimal` | lenenc ASCII decimal string (exact, no float rounding) |
+| `Text` | lenenc UTF-8 bytes |
+| `Bytes` | lenenc raw bytes (no UTF-8 conversion) |
+| `Date` | `[4][year u16 LE][month u8][day u8]` |
+| `Timestamp` | `[7][year u16 LE][month][day][h][m][s]` or `[11][...][micros u32 LE]` |
+| `Uuid` | lenenc canonical UUID string |
+
+**Column type codes** (shared between both serializers):
 
 | AxiomDB type | MySQL type byte | MySQL name |
 |---|---|---|
 | `Int` | `0x03` | LONG |
 | `BigInt` | `0x08` | LONGLONG |
 | `Real` | `0x05` | DOUBLE |
-| `Decimal` | `0x00` | DECIMAL |
+| `Decimal` | `0xf6` | NEWDECIMAL |
 | `Text` | `0xfd` | VAR_STRING |
 | `Bytes` | `0xfc` | BLOB |
-| `Bool` | `0x10` | BIT |
+| `Bool` | `0x01` | TINY |
 | `Date` | `0x0a` | DATE |
 | `Timestamp` | `0x07` | TIMESTAMP |
 | `Uuid` | `0xfd` | VAR_STRING |
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Single column-definition builder</span>
+Both the text and binary serializers share one <code>build_column_def()</code> function
+and one <code>datatype_to_mysql_type()</code> mapping. This guarantees that the type
+byte in column metadata always agrees with the wire encoding of the row values.
+A divergence (e.g., advertising <code>LONGLONG</code> but sending ASCII digits) would
+cause silent data corruption on the client — a class of bug that is impossible when
+there is only one mapping.
+</div>
+</div>
 
 #### ORM query interception (handler.rs)
 

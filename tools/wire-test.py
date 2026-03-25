@@ -655,6 +655,114 @@ ok("Threads_connected >= 1", int(g6.get("Threads_connected", 0)) >= 1,
    g6.get("Threads_connected"))
 conn6.close()
 
+# ── 5.5a: binary result encoding (COM_STMT_EXECUTE) ──────────────────────────
+
+print("\n[5.5a binary result encoding]")
+
+# Use a dedicated connection so the schema state is clean.
+conn_bin = connect()
+cb = conn_bin.cursor()
+
+# Create a table with typed columns and insert one row.
+cb.execute("DROP TABLE IF EXISTS t_binary_test")
+cb.execute("""
+    CREATE TABLE t_binary_test (
+        id    INT,
+        big   BIGINT,
+        label TEXT
+    )
+""")
+cb.execute("INSERT INTO t_binary_test VALUES (1, 9876543210, 'hello')")
+cb.execute("INSERT INTO t_binary_test VALUES (2, -1, NULL)")
+conn_bin.commit()
+
+# High-level check: pymysql reads back the correct Python types.
+cb.execute("SELECT big, label FROM t_binary_test WHERE id = 1")
+row_hl = cb.fetchone()
+ok("High-level: BIGINT round-trips correctly (9876543210)",
+   row_hl[0] == 9876543210, row_hl[0])
+ok("High-level: TEXT round-trips correctly",
+   row_hl[1] == "hello", row_hl[1])
+
+# High-level NULL in prepared result.
+cb.execute("SELECT big, label FROM t_binary_test WHERE id = 2")
+row_null = cb.fetchone()
+ok("High-level: NULL column returns None", row_null[1] is None, row_null[1])
+ok("High-level: negative BIGINT round-trips correctly (-1)",
+   row_null[0] == -1, row_null[0])
+
+# Low-level: parse the raw COM_STMT_EXECUTE row packet and prove it is binary.
+# We use PyMySQL's internal _execute_command to get the raw packet bytes.
+import struct as _struct
+import pymysql.constants.COMMAND as _CMD
+
+conn_raw = connect()
+try:
+    # Prepare at the wire level for raw packet inspection.
+    # Query: SELECT big, label FROM t_binary_test WHERE id = 1
+    # Result: BIGINT + TEXT, zero params.
+    sql_bytes = b"SELECT big, label FROM t_binary_test WHERE id = 1"
+    conn_raw._execute_command(_CMD.COM_STMT_PREPARE, sql_bytes)
+    # Read prepare response and extract stmt_id from raw bytes.
+    prep_pkt = conn_raw._read_packet()
+    prep_data = prep_pkt._data if hasattr(prep_pkt, '_data') else b''
+    stmt_id = _struct.unpack_from('<I', prep_data[1:5])[0] if len(prep_data) >= 5 else 0
+    # Drain column-def + EOF packets from prepare response (2 col defs + EOF).
+    for _ in range(3):
+        conn_raw._read_packet()
+
+    # Build a zero-param COM_STMT_EXECUTE payload.
+    execute_payload = _struct.pack('<I', stmt_id)  # stmt_id
+    execute_payload += bytes([0x00])               # flags = 0
+    execute_payload += _struct.pack('<I', 1)        # iteration-count = 1
+    conn_raw._execute_command(_CMD.COM_STMT_EXECUTE, execute_payload)
+
+    # Drain: column-count + 2 column-def packets + EOF after column defs.
+    for _ in range(4):
+        conn_raw._read_packet()
+    # Read the binary row packet.
+    row_pkt = conn_raw._read_packet()
+    raw = row_pkt._data if hasattr(row_pkt, '_data') else b''
+
+    ok("Binary row packet first byte is 0x00 (not 0xfb text marker)",
+       len(raw) > 1 and raw[0] == 0x00, hex(raw[0]) if raw else "empty")
+
+    # Layout: header(1) + bitmap(1) + BIGINT(8) + TEXT lenenc(1+5) = 16 bytes total
+    # bitmap_len = (2 + 7 + 2) / 8 = 1 byte
+    if len(raw) >= 10:
+        bigint_bytes = raw[2:10]
+        bigint_val = _struct.unpack_from('<q', bigint_bytes)[0]
+        ok("Binary BIGINT is 8-byte LE, value = 9876543210",
+           bigint_val == 9876543210, bigint_val)
+        # First byte of bigint must NOT be '9' (0x39), which would indicate ASCII encoding.
+        ok("BIGINT first byte is not ASCII digit '9' (binary, not text)",
+           bigint_bytes[0] != ord('9'), hex(bigint_bytes[0]))
+    else:
+        ok("Binary BIGINT is 8-byte LE, value = 9876543210",
+           False, f"packet too short: {len(raw)}")
+        ok("BIGINT first byte is not ASCII digit '9' (binary, not text)", False, "")
+
+    # TEXT follows immediately after the 8-byte BIGINT: lenenc(1) + "hello"(5)
+    if len(raw) >= 16:
+        text_len = raw[10]
+        text_val = raw[11:11 + text_len].decode('utf-8', errors='replace')
+        ok("TEXT after BIGINT is lenenc-encoded string 'hello'",
+           text_val == "hello", repr(text_val))
+    else:
+        ok("TEXT after BIGINT is lenenc-encoded string 'hello'",
+           False, f"packet too short: {len(raw)}")
+except Exception as e:
+    ok("Binary row packet first byte is 0x00 (not 0xfb text marker)", False, str(e))
+    ok("Binary BIGINT is 8-byte LE, value = 9876543210", False, str(e))
+    ok("BIGINT first byte is not ASCII digit '9' (binary, not text)", False, str(e))
+    ok("TEXT after BIGINT is lenenc-encoded string 'hello'", False, str(e))
+finally:
+    conn_raw.close()
+
+cb.execute("DROP TABLE IF EXISTS t_binary_test")
+conn_bin.commit()
+conn_bin.close()
+
 # ── 5.4a: max_allowed_packet enforcement ─────────────────────────────────────
 
 print("\n[5.4a max_allowed_packet]")
