@@ -116,6 +116,54 @@ The OS handles readahead, eviction, and write-back (via `msync`). There is no
 
 ---
 
+## Dirty Page Tracking and Targeted Flush
+
+`MmapStorage` tracks every page written since the last `flush()` in a
+`PageDirtyTracker` (an in-memory `HashSet<u64>`). On `flush()`, instead of
+calling `mmap.flush()` (which issues `msync` over the entire file), AxiomDB
+coalesces the dirty page IDs into contiguous runs and issues one `flush_range`
+call per run.
+
+### Coalescing algorithm
+
+`PageDirtyTracker::contiguous_runs()` sorts the dirty IDs and merges adjacent
+IDs into `(start_page, run_length)` pairs:
+
+```rust
+// Dirty pages: {2, 3, 5, 6, 7}  →  runs: [(2, 2), (5, 3)]
+// Byte ranges: [(2*16384, 32768), (5*16384, 49152)]
+```
+
+The merge is O(n log n) on the number of dirty pages and produces the minimum
+number of `msync` syscalls for any given dirty set.
+
+### Freelist integration
+
+When the freelist changes (`alloc_page`, `free_page`), `freelist_dirty` is set.
+On `flush()`, the freelist bitmap is serialized into page 1 first, and page 1 is
+added to the effective flush set even if it was not already in the dirty tracker.
+Only after **all** targeted flushes succeed are `freelist_dirty` and the dirty
+tracker cleared. A partial failure leaves both intact so the next `flush()` can
+retry safely.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Sub-file msync</span>
+SQLite and PostgreSQL issue `fsync` over the entire data file on every checkpoint or WAL sync. AxiomDB's targeted `flush_range` (backed by `msync(MS_SYNC)`) touches only the pages that actually changed. On workloads where a small fraction of pages are written per checkpoint, this reduces I/O proportionally to the dirty-page ratio.
+</div>
+</div>
+
+### Invariants
+
+- `flush()` returns `Ok(())` only after all dirty pages are durable.
+- Dirty tracking is cleared only on success — never on failure.
+- The freelist page (page 1) is always included when `freelist_dirty` is set,
+  regardless of whether it appears in the tracker.
+- `dirty_page_count()` always reflects the count since the last successful flush.
+
+---
+
 ## MemoryStorage — In-Memory for Tests
 
 `MemoryStorage` stores pages in a `Vec<Box<Page>>`. It implements the same

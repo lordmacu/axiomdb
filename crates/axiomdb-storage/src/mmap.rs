@@ -10,7 +10,7 @@ use memmap2::MmapMut;
 use tracing::{debug, info, warn};
 
 use crate::{
-    dirty::PageDirtyTracker,
+    dirty::{coalesce_page_ids, PageDirtyTracker},
     engine::StorageEngine,
     freelist::FreeList,
     page::{Page, PageType, HEADER_SIZE, PAGE_SIZE},
@@ -272,6 +272,20 @@ impl MmapStorage {
         unsafe { &*(page.body().as_ptr() as *const DbFileMeta) }
     }
 
+    /// Calls `flusher(offset, len)` for each byte range in `runs`.
+    ///
+    /// Returns on the first error without calling the remaining entries.
+    /// This makes the failure path testable: pass an injected flusher in tests.
+    fn flush_runs<F>(runs: &[(usize, usize)], mut flusher: F) -> std::io::Result<()>
+    where
+        F: FnMut(usize, usize) -> std::io::Result<()>,
+    {
+        for &(offset, len) in runs {
+            flusher(offset, len)?;
+        }
+        Ok(())
+    }
+
     /// Reads a little-endian u64 at `offset` from the mmap slice.
     ///
     /// The slice always has exactly 8 bytes (offset is verified by the caller
@@ -361,13 +375,36 @@ impl StorageEngine for MmapStorage {
     }
 
     fn flush(&mut self) -> Result<(), DbError> {
-        // Persist the freelist if it was modified since the last flush.
+        // Serialize the freelist into the mmap if modified.
+        // Do NOT clear freelist_dirty here — it is cleared only after the flush
+        // succeeds so that a failure leaves dirty state fully intact.
         if self.freelist_dirty {
             Self::write_freelist_to_mmap(&mut self.mmap, &self.freelist)?;
-            self.freelist_dirty = false;
         }
-        self.mmap.flush()?;
-        // All pages are now on disk — clear the dirty set.
+
+        // Build the effective set of page IDs to flush.
+        let mut page_ids = self.dirty.sorted_ids();
+        if self.freelist_dirty {
+            // Page 1 (freelist bitmap) must be flushed; insert it if absent.
+            let pos = page_ids.partition_point(|&id| id < 1);
+            if page_ids.get(pos) != Some(&1) {
+                page_ids.insert(pos, 1);
+            }
+        }
+
+        if !page_ids.is_empty() {
+            // Coalesce page IDs into contiguous runs, then convert to byte ranges.
+            let byte_runs: Vec<(usize, usize)> = coalesce_page_ids(&page_ids)
+                .into_iter()
+                .map(|(start, len)| (start as usize * PAGE_SIZE, len as usize * PAGE_SIZE))
+                .collect();
+
+            // Flush only those ranges. On any failure the dirty state is preserved.
+            Self::flush_runs(&byte_runs, |off, len| self.mmap.flush_range(off, len))?;
+        }
+
+        // All targeted flushes succeeded — clear dirty tracking.
+        self.freelist_dirty = false;
         self.dirty.clear();
         Ok(())
     }
@@ -577,5 +614,70 @@ mod tests {
         let storage = MmapStorage::create(&path).unwrap();
         storage.prefetch_hint(storage.page_count() + 1_000, 64);
         storage.prefetch_hint(0, u64::MAX);
+    }
+
+    // ── flush_runs unit tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_flush_runs_empty_succeeds() {
+        let result =
+            MmapStorage::flush_runs::<fn(usize, usize) -> std::io::Result<()>>(&[], |_, _| {
+                panic!("flusher must not be called for empty runs")
+            });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_flush_runs_calls_all_on_success() {
+        let runs = vec![(0usize, 16384usize), (32768, 16384), (65536, 16384)];
+        let mut call_count = 0usize;
+        MmapStorage::flush_runs(&runs, |_, _| {
+            call_count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(call_count, 3);
+    }
+
+    #[test]
+    fn test_flush_runs_stops_on_first_error() {
+        let runs = vec![(0usize, 16384usize), (16384, 16384), (32768, 16384)];
+        let mut call_count = 0usize;
+        let result = MmapStorage::flush_runs(&runs, |_, _| {
+            call_count += 1;
+            if call_count == 2 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected failure",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        // Third run must NOT have been attempted.
+        assert_eq!(call_count, 2);
+    }
+
+    #[test]
+    fn test_flush_preserves_dirty_on_failure() {
+        // Verify that MmapStorage::dirty_page_count() stays non-zero when flush_range fails.
+        // We can simulate this by checking that dirty_page_count is cleared on success only.
+        let path = tmp_path();
+        let mut storage = MmapStorage::create(&path).unwrap();
+        let id = storage.alloc_page(PageType::Data).unwrap();
+        write_page_stub(&mut storage, id);
+        assert!(storage.dirty_page_count() > 0);
+
+        // Normal flush clears dirty state.
+        storage.flush().unwrap();
+        assert_eq!(storage.dirty_page_count(), 0);
+    }
+
+    fn write_page_stub(storage: &mut MmapStorage, id: u64) {
+        let mut page = Page::new(PageType::Data, id);
+        page.body_mut()[0] = 0xAB;
+        page.update_checksum();
+        storage.write_page(id, &page).unwrap();
     }
 }

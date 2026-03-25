@@ -228,6 +228,93 @@ fn test_memory_auto_grow_on_exhaustion() {
     assert!(engine.page_count() > initial);
 }
 
+// ── Targeted flush_range behavior (3.15b) ────────────────────────────────────
+
+#[test]
+fn test_flush_empty_dirty_set_succeeds() {
+    // No writes → flush must succeed without touching any pages.
+    let dir = tmp_dir();
+    let mut engine = MmapStorage::create(&dir.path().join("empty_flush.db")).expect("create");
+    // After create() the dirty tracker is empty (create flushed internally).
+    assert_eq!(engine.dirty_page_count(), 0);
+    engine.flush().expect("flush on clean state must succeed");
+    assert_eq!(engine.dirty_page_count(), 0);
+}
+
+#[test]
+fn test_flush_single_dirty_page_clears_state() {
+    let dir = tmp_dir();
+    let db_path = dir.path().join("single.db");
+    let page_id;
+
+    {
+        let mut engine = MmapStorage::create(&db_path).expect("create");
+        page_id = engine.alloc_page(PageType::Data).expect("alloc");
+        write_pattern(&mut engine, page_id, 0xBB);
+        assert!(
+            engine.dirty_page_count() > 0,
+            "alloc + write should be dirty"
+        );
+        engine.flush().expect("flush");
+        assert_eq!(engine.dirty_page_count(), 0, "flush must clear dirty state");
+    }
+
+    // Data must persist.
+    let engine = MmapStorage::open(&db_path).expect("reopen");
+    assert_pattern(&engine, page_id, 0xBB);
+}
+
+#[test]
+fn test_flush_contiguous_dirty_pages_clears_state() {
+    let dir = tmp_dir();
+    let db_path = dir.path().join("contiguous.db");
+    let ids: Vec<u64>;
+
+    {
+        let mut engine = MmapStorage::create(&db_path).expect("create");
+        // Alloc 3 consecutive pages — they will be contiguous because the freelist
+        // hands them out in order from a fresh file.
+        ids = (0..3)
+            .map(|_| engine.alloc_page(PageType::Data).expect("alloc"))
+            .collect();
+        for (i, &id) in ids.iter().enumerate() {
+            write_pattern(&mut engine, id, 0x10 + i as u8);
+        }
+        engine.flush().expect("flush contiguous pages");
+        assert_eq!(engine.dirty_page_count(), 0);
+    }
+
+    let engine = MmapStorage::open(&db_path).expect("reopen");
+    for (i, &id) in ids.iter().enumerate() {
+        assert_pattern(&engine, id, 0x10 + i as u8);
+    }
+}
+
+#[test]
+fn test_flush_freelist_only_change() {
+    // alloc_page sets freelist_dirty but may or may not set data page dirty.
+    // After flush, the freelist must persist across reopen.
+    let dir = tmp_dir();
+    let db_path = dir.path().join("freelist_only.db");
+    let allocated;
+
+    {
+        let mut engine = MmapStorage::create(&db_path).expect("create");
+        allocated = engine.alloc_page(PageType::Data).expect("alloc");
+        engine.flush().expect("flush after freelist change");
+    }
+
+    // Reopen — freelist must remember `allocated` is in use.
+    {
+        let mut engine = MmapStorage::open(&db_path).expect("reopen");
+        let next = engine.alloc_page(PageType::Data).expect("alloc");
+        assert_ne!(
+            next, allocated,
+            "freelist flush did not persist: reused an in-use page"
+        );
+    }
+}
+
 // ── On-disk checksum integrity ────────────────────────────────────────────────
 
 #[test]
