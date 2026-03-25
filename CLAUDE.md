@@ -217,16 +217,21 @@ One phase at a time. When finishing each phase — **mandatory closing protocol:
 1. cargo test --workspace passes clean
 2. cargo clippy --workspace -- -D warnings with no errors
 3. cargo fmt --check with no differences
-4. Write docs/fase-N.md
-5. Update docs/progreso.md — mark subphase with [x] ✅ and parent phase with 🔄
-6. Update docs-site/ — update ALL pages affected by this subphase (see Documentation protocol below)
-7. Update memory/project_state.md
-8. Update memory/architecture.md
-9. Update memory/lessons.md if there were learnings
-10. Commit with Conventional Commits format
-11. Push: `git push origin main`
-12. Report progress percentages to the user (see below)
-13. Confirm to the user
+4. Wire protocol smoke test — if the subphase touches anything observable
+   from a MySQL client (SQL execution, transactions, session variables,
+   wire protocol, error handling): build the server, connect with pymysql,
+   run a scenario that validates specifically what was implemented, report
+   results. Blocker if any assertion fails.
+5. Write docs/fase-N.md
+6. Update docs/progreso.md — mark subphase with [x] ✅ and parent phase with 🔄
+7. Update docs-site/ — update ALL pages affected by this subphase (see Documentation protocol below)
+8. Update memory/project_state.md
+9. Update memory/architecture.md
+10. Update memory/lessons.md if there were learnings
+11. Commit with Conventional Commits format
+12. Push: `git push origin main`
+13. Report progress percentages to the user (see below)
+14. Confirm to the user
 ```
 
 ### Progress report — mandatory after every subfase close
@@ -568,6 +573,7 @@ Si hay un ❌, abrir `/debug` para identificar el bottleneck antes de continuar.
    [ ] No unwrap() in src/ (only in tests and benches) ✅
    [ ] All unsafe has SAFETY: comment ✅
    [ ] Integration tests in tests/ ✅
+   [ ] Wire protocol smoke test — pymysql scenario for what was implemented ✅
    [ ] Benchmarks run and results reported to the user ✅
    [ ] No benchmark ❌ (blocker) ✅
    [ ] Test logic reviewed (no empty assertions) ✅
