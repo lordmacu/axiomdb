@@ -619,6 +619,82 @@ INSERT INTO counters (label) VALUES ('c');          -- id: 1 (reset)
 
 ---
 
+## Session Variables
+
+Session variables hold connection-scoped state. Read them with `SELECT @@name` and
+change them with `SET name = value`.
+
+### Reading session variables
+
+```sql
+SELECT @@autocommit;        -- 1 (autocommit on) or 0 (autocommit off)
+SELECT @@in_transaction;    -- 1 inside an active transaction, 0 otherwise
+SELECT @@version;           -- '8.0.36-AxiomDB-0.1.0'
+SELECT @@character_set_client;   -- 'utf8mb4'
+SELECT @@transaction_isolation;  -- 'REPEATABLE-READ'
+```
+
+### Supported variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `@@autocommit` | `1` | `1` = each statement auto-committed; `0` = explicit COMMIT required |
+| `@@in_transaction` | `0` | `1` when inside an active transaction, `0` otherwise |
+| `@@version` | `'8.0.36-AxiomDB-0.1.0'` | Server version (MySQL 8 compatible format) |
+| `@@version_comment` | `'AxiomDB'` | Server variant |
+| `@@character_set_client` | `'utf8mb4'` | Client character set |
+| `@@character_set_results` | `'utf8mb4'` | Result character set |
+| `@@collation_connection` | `'utf8mb4_general_ci'` | Connection collation |
+| `@@max_allowed_packet` | `67108864` | Maximum packet size (64 MB) |
+| `@@sql_mode` | `'STRICT_TRANS_TABLES'` | Active SQL mode |
+| `@@transaction_isolation` | `'REPEATABLE-READ'` | Isolation level |
+
+### Changing session variables
+
+```sql
+-- Switch to manual transaction mode (used by SQLAlchemy, Django ORM, etc.)
+SET autocommit = 0;
+SET autocommit = 1;   -- restore
+
+-- Character set (accepted for ORM compatibility, utf8mb4 is always used internally)
+SET NAMES 'utf8mb4';
+SET character_set_client = 'utf8mb4';
+```
+
+### @@in_transaction — transaction state check
+
+```sql
+SELECT @@in_transaction;    -- 0 — no transaction active
+
+INSERT INTO t VALUES (1);   -- starts implicit txn when autocommit=0
+SELECT @@in_transaction;    -- 1 — inside transaction
+
+COMMIT;
+SELECT @@in_transaction;    -- 0 — transaction closed
+```
+
+Use `@@in_transaction` to verify transaction state before issuing a `COMMIT` or
+`ROLLBACK`. This avoids the warning generated when `COMMIT` is called with no
+active transaction.
+
+### SHOW WARNINGS
+
+After any statement that completes with warnings (e.g. a `COMMIT` when no transaction
+is active), query the warning list:
+
+```sql
+COMMIT;               -- no-op if no active transaction — emits warning 1592
+SHOW WARNINGS;
+-- Level    Code   Message
+-- ───────────────────────────────────────────────
+-- Warning  1592   There is no active transaction
+```
+
+`SHOW WARNINGS` returns the warnings from the **most recent statement only**. The
+list is cleared before each new statement executes.
+
+---
+
 ## SHOW TABLES
 
 Lists all tables in the current schema (or a named schema).
