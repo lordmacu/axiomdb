@@ -32,10 +32,44 @@ Their structure is described in [Catalog & Schema](../user-guide/features/catalo
 | `axiom_indexes`         | 48          | One row per index (includes partial index predicate since Phase 6.7) |
 | `axiom_constraints`     | 72          | Named CHECK constraints (Phase 4.22b)            |
 | `axiom_foreign_keys`    | 84          | One row per FK constraint (Phase 6.5)            |
+| `axiom_stats`           | 96          | Per-column NDV and row_count for planner (Phase 6.10) |
 
 Each table root page is stored at the corresponding u64 body offset in the meta
 page (page 0). Offsets 84 and 92 are lazily initialized (value = 0 on pre-Phase
 6.5 databases; allocated on first use).
+
+### `axiom_stats` row format (`StatsDef`)
+
+```text
+[table_id:  4 bytes LE u32]
+[col_idx:   2 bytes LE u16]
+[row_count: 8 bytes LE u64]  — visible rows at last ANALYZE / CREATE INDEX
+[ndv:       8 bytes LE i64]  — distinct non-NULL values (PostgreSQL stadistinct encoding)
+```
+
+`ndv` encoding (same as PostgreSQL `stadistinct`):
+- `> 0` → absolute count (e.g. 9999 unique emails)
+- `= 0` → unknown → planner uses `DEFAULT_NUM_DISTINCT = 200`
+
+Stats root is **lazily initialized** at first write (`ensure_stats_root`). Pre-6.10
+databases open without migration: `list_stats` returns empty vec when root = 0,
+causing the planner to use the conservative default (always use index).
+
+Stats are bootstrapped at `CREATE INDEX` time by reusing the table scan already
+performed for B-Tree build — no extra I/O. `ANALYZE TABLE` refreshes them with
+an exact full-table NDV count.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Exact NDV, Not Sampling</span>
+AxiomDB computes exact distinct value counts using a HashSet of encoded key bytes.
+PostgreSQL uses Vitter's reservoir sampling algorithm (Duj1 estimator) for large
+tables to avoid the O(n) full scan. Exact counting is correct and simpler for the
+typical table sizes of an embedded database. Sampling is planned for Phase 6.15
+when tables exceed 1 M rows.
+</div>
+</div>
 
 ### `axiom_foreign_keys` row format (`FkDef`)
 

@@ -418,13 +418,13 @@ INSERT INTO orders VALUES (99, NULL);  -- ✅ NULL user_id is always allowed
 
 Only `ON UPDATE RESTRICT` (the default) is enforced. Updating a parent key while
 child rows reference it is rejected. `ON UPDATE CASCADE` and `ON UPDATE SET NULL`
-are planned for Phase 6.9.
+are planned for Phase 6.10.
 
-### Phase 6.5 Limitations
+### Current Limitations
 
-- Only single-column FKs are supported. Composite FKs — `FOREIGN KEY (a, b) REFERENCES t(x, y)` — are planned for Phase 6.9.
-- `ON UPDATE CASCADE` / `ON UPDATE SET NULL` are planned for Phase 6.9.
-- FK validation uses a full table scan of the parent table (optimized index-based check planned for Phase 6.9).
+- Only single-column FKs are supported. Composite FKs — `FOREIGN KEY (a, b) REFERENCES t(x, y)` — are planned for Phase 6.10.
+- `ON UPDATE CASCADE` / `ON UPDATE SET NULL` are planned for Phase 6.10.
+- FK validation uses B-Tree range scans via the FK auto-index (Phase 6.9). Falls back to full table scan for pre-6.9 FKs.
 
 ---
 
@@ -477,7 +477,7 @@ After a `DELETE` or `UPDATE`, the filter is marked **dirty**: it may still
 return "maybe" for keys that were deleted. This does not affect correctness —
 the B-Tree lookup simply finds no matching row. It only means that some absent
 keys may not benefit from the zero-I/O shortcut until the filter is rebuilt via
-`ANALYZE TABLE` (planned for Phase 6.12).
+`ANALYZE TABLE` (available since Phase 6.12).
 
 <div class="callout callout-tip">
 <span class="callout-icon">💡</span>

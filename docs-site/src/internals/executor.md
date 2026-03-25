@@ -408,7 +408,27 @@ on_delete: FkAction, on_update: FkAction, fk_index_id: u32, name: String
 ```
 
 `FkAction` encoding: 0=NoAction, 1=Restrict, 2=Cascade, 3=SetNull, 4=SetDefault.
-`fk_index_id = 0` means no auto-created index (Phase 6.5 deferred item).
+`fk_index_id != 0` → FK auto-index exists (composite key, Phase 6.9).
+`fk_index_id = 0` → no auto-index; enforcement falls back to full table scan.
+
+### FK auto-index — composite key `(fk_val | RecordId)` (Phase 6.9)
+
+Each FK constraint auto-creates a B-Tree index on the child FK column using a
+composite key format that makes every entry globally unique:
+
+```
+key = encode_index_key(&[fk_val]) ++ encode_rid(rid)  (10 bytes RecordId suffix)
+```
+
+This follows **InnoDB's approach** of appending the primary key as a tiebreaker
+(`row0row.cc`). Every entry is unique even when many rows share the same FK value.
+
+Range scan for all children with a given parent key:
+```rust
+lo = encode_index_key(&[parent_key]) ++ [0x00; 10]  // smallest RecordId
+hi = encode_index_key(&[parent_key]) ++ [0xFF; 10]  // largest RecordId
+children = BTree::range_in(fk_index_root, lo, hi)   // O(log n + k)
+```
 
 ### INSERT / UPDATE child — `check_fk_child_insert`
 
@@ -417,11 +437,13 @@ For each FK on the child table:
   1. FK column is NULL → skip (MATCH SIMPLE)
   2. Encode FK value as B-Tree key
   3. Find parent's PK or UNIQUE index covering parent_col_idx
-  4a. If parent index is_primary: full scan of parent table (PK B-Trees not
-      yet populated via insert_into_indexes in Phase 6.5)
-  4b. If parent index is non-primary UNIQUE: B-Tree point lookup (populated)
-  5. No match → ForeignKeyViolation (SQLSTATE 23503)
+  4. Bloom shortcut: if filter says absent → ForeignKeyViolation immediately
+  5. BTree::lookup_in(parent_index_root, key) — O(log n)
+  6. No match → ForeignKeyViolation (SQLSTATE 23503)
 ```
+
+PK indexes are populated on every INSERT since Phase 6.9 (removed `!is_primary`
+filter in `insert_into_indexes`). All index types now use B-Tree + Bloom lookup.
 
 ### DELETE parent — `enforce_fk_on_parent_delete`
 
@@ -429,26 +451,74 @@ Called **before** the parent rows are deleted. For each FK referencing this tabl
 
 | Action | Behavior |
 |--------|---------|
-| RESTRICT / NO ACTION | Full scan child table; error if any child references deleted parent key |
-| CASCADE | Full scan child; recursively delete children (depth limit = 10) |
-| SET NULL | Full scan child; update FK column to NULL before parent delete |
+| RESTRICT / NO ACTION | `BTree::range_in(fk_index)` — O(log n); error if any child found |
+| CASCADE | Range scan finds all children; recursive delete (depth limit = 10) |
+| SET NULL | Range scan finds all children; updates FK column to NULL |
 
 Cascade recursion uses `depth` parameter — exceeding 10 levels returns
 `ForeignKeyCascadeDepth` (SQLSTATE 23503).
 
-<div class="callout callout-design">
-<span class="callout-icon">⚙️</span>
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
 <div class="callout-body">
-<span class="callout-label">Design Decision — Full Scan for Phase 6.5</span>
-FK enforcement uses a full table scan of the parent (for INSERT child check) and
-child (for DELETE parent enforcement) rather than a dedicated B-Tree index. This
-is correct at all times. The index-based optimization is deferred to Phase 6.9,
-which will add composite keys (fk_val + RecordId bytes) to non-unique FK indexes,
-solving the duplicate-key limitation of the current B-Tree implementation. This
-follows the same incremental approach used by SQLite, which also started with
-table scans for FK enforcement before adding index acceleration.
+<span class="callout-label">Performance Advantage</span>
+Phase 6.9 replaced full table scans with B-Tree range scans for FK enforcement.
+RESTRICT check: O(log n) vs O(n). CASCADE with 1,000 children: O(log n + 1000)
+vs O(n × 1000). This follows InnoDB's composite secondary index approach
+(`dict_foreign_t.foreign_index`) rather than PostgreSQL's trigger-based strategy.
 </div>
 </div>
+
+---
+
+## Query Planner Cost Gate (Phase 6.10)
+
+Before returning `IndexLookup` or `IndexRange`, `plan_select` applies a cost gate
+using per-column statistics to decide if the index scan is worth the overhead.
+
+### Algorithm
+
+```
+ndv = stats.ndv > 0 ? stats.ndv : DEFAULT_NUM_DISTINCT (= 200)
+selectivity = 1.0 / ndv        // equality predicate: 1/ndv rows match
+if selectivity > 0.20:
+    return Scan                 // too many rows — full scan is cheaper
+if stats.row_count < 1,000:
+    return Scan                 // tiny table — index overhead not worth it
+return IndexLookup / IndexRange // selective enough — use index
+```
+
+Constants derived from PostgreSQL:
+- `INDEX_SELECTIVITY_THRESHOLD = 0.20` (PG default: `seq/random_page_cost = 0.25`; AxiomDB is slightly more conservative for embedded storage)
+- `DEFAULT_NUM_DISTINCT = 200` (PG `DEFAULT_NUM_DISTINCT` in `selfuncs.c`)
+
+### Stats are loaded once per SELECT
+
+In `execute_select_ctx`, before calling `plan_select`:
+
+```rust
+let table_stats = CatalogReader::new(storage, snap)?.list_stats(table_id)?;
+let access_method = plan_select(where_clause, indexes, columns, table_id,
+                                &table_stats, &mut ctx.stats);
+```
+
+If `table_stats` is empty (pre-6.10 database or ANALYZE never run),
+`plan_select` conservatively uses the index — never wrong, just possibly suboptimal.
+
+### Staleness (`StaleStatsTracker`)
+
+`StaleStatsTracker` lives in `SessionContext` and tracks row changes per table:
+
+```
+INSERT / DELETE row  → on_row_changed(table_id)
+changes > 20% of baseline  → mark stale
+planner loads stats  → set_baseline(table_id, row_count)
+ANALYZE TABLE        → mark_fresh(table_id)
+```
+
+When stale, the planner uses `ndv = DEFAULT_NUM_DISTINCT = 200` regardless of
+catalog stats, preventing stale low-NDV estimates from causing full scans on
+high-selectivity columns.
 
 ---
 
