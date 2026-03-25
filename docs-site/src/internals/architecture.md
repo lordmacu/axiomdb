@@ -438,6 +438,85 @@ MySQL drivers and ORMs send several queries automatically before any user SQL:
 packet sequences without touching the engine. Without this interception, most clients
 fail to connect because they receive ERR packets for mandatory queries.
 
+#### SHOW STATUS — server and session counters (status.rs, subphase 5.9c)
+
+MySQL clients, ORMs, and monitoring tools (PMM, Datadog MySQL integration, ProxySQL)
+call `SHOW STATUS` on connect or periodically to query server health. Returning an
+error or empty result breaks these integrations.
+
+**Counter architecture:**
+
+Two independent counter stores keep telemetry decoupled from correctness:
+
+| Store | Type | Scope | Reset policy |
+|---|---|---|---|
+| `StatusRegistry` | `Arc<StatusRegistry>` with `AtomicU64` fields | Server-wide, shared across all connections | Only on server restart |
+| `SessionStatus` | Plain `u64` fields inside `ConnectionState` | Per-connection | On `COM_RESET_CONNECTION` (which recreates `ConnectionState`) |
+
+`Database` owns an `Arc<StatusRegistry>`. Each `handle_connection` task clones
+the `Arc` once at connect time — the same pattern used by `schema_version`. The
+`SHOW STATUS` intercept never acquires the `Database` mutex; it reads directly
+from the cloned `Arc<StatusRegistry>` and the local `SessionStatus`. This means
+the query cannot block other connections.
+
+**RAII guards:**
+
+```rust
+// Increments threads_connected +1 after auth; drops −1 on disconnect (even on error).
+let _connected_guard = ConnectedGuard::new(Arc::clone(&status));
+
+// Increments threads_running +1 for the duration of COM_QUERY / COM_STMT_EXECUTE.
+let _running = RunningGuard::new(&status);
+```
+
+`threads_connected` and `threads_running` are always accurate with no manual bookkeeping
+because Rust's drop guarantees run on early returns and panics.
+
+**Counters tracked:**
+
+| Variable name | Scope | Description |
+|---|---|---|
+| `Bytes_received` | Session + Global | Bytes received from client (payload + 4-byte header) |
+| `Bytes_sent` | Session + Global | Bytes sent to client |
+| `Com_insert` | Session + Global | `INSERT` statement count |
+| `Com_select` | Session + Global | `SELECT` statement count |
+| `Innodb_buffer_pool_read_requests` | Global | Best-effort mmap access counter |
+| `Innodb_buffer_pool_reads` | Global | Physical page reads (compatibility alias) |
+| `Questions` | Session + Global | All statements executed (any command type) |
+| `Threads_connected` | Global | Active authenticated connections |
+| `Threads_running` | Session + Global | Connections actively executing a command |
+| `Uptime` | Global | Seconds since server start |
+
+**SHOW STATUS syntax:**
+
+All four MySQL-compatible forms are intercepted before hitting the engine:
+
+```sql
+SHOW STATUS
+SHOW SESSION STATUS
+SHOW LOCAL STATUS
+SHOW GLOBAL STATUS
+-- Any of the above with LIKE filter:
+SHOW STATUS LIKE 'Com_%'
+SHOW GLOBAL STATUS LIKE 'Threads%'
+```
+
+LIKE filtering reuses `like_match` from `axiomdb-sql` (proper `%` / `_` wildcard
+semantics, case-insensitive against variable names). Results are always returned in
+ascending alphabetical order.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Lock-Free Status Reads</span>
+<code>SHOW STATUS</code> reads <code>AtomicU64</code> counters directly from a cloned
+<code>Arc</code> — it never acquires the <code>Database</code> mutex. MySQL InnoDB
+reads status from the engine layer, which requires acquiring internal mutexes under
+high concurrency. AxiomDB's design means monitoring queries cannot interfere with
+query execution at any load level.
+</div>
+</div>
+
 #### DB lock strategy
 
 The `Database` struct wraps `Arc<Mutex<axiomdb_sql::Database>>`. Each `COM_QUERY`

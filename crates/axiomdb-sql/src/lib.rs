@@ -34,7 +34,7 @@ pub use ast::{
     SortOrder, Stmt, TableConstraint, TableRef, TruncateTableStmt, UpdateStmt,
 };
 pub use bloom::BloomRegistry;
-pub use eval::{eval, eval_with, is_truthy, ClosureRunner, NoSubquery, SubqueryRunner};
+pub use eval::{eval, eval_with, is_truthy, like_match, ClosureRunner, NoSubquery, SubqueryRunner};
 pub use executor::{execute, execute_with_ctx};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lexer::{tokenize, Span, SpannedToken, Token};

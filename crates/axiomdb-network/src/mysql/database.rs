@@ -48,6 +48,7 @@ use axiomdb_wal::TxnManager;
 
 use super::commit_coordinator::CommitCoordinator;
 use super::group_commit::spawn_group_commit_task;
+use super::status::StatusRegistry;
 
 /// Receiver for group commit fsync confirmation.
 ///
@@ -71,6 +72,11 @@ pub struct Database {
     /// lock — use `load(Ordering::Acquire)`. Writing requires holding the
     /// `Database` lock (only `execute_query`/`execute_stmt` write it).
     pub schema_version: Arc<AtomicU64>,
+    /// Server-wide status counters (Phase 5.9c).
+    ///
+    /// Connections clone this `Arc` once at connect time. Counter updates
+    /// use atomics — no lock needed after the initial clone.
+    pub status: Arc<StatusRegistry>,
 }
 
 impl Database {
@@ -100,6 +106,7 @@ impl Database {
             bloom: BloomRegistry::new(),
             coordinator: None,
             schema_version: Arc::new(AtomicU64::new(0)),
+            status: Arc::new(StatusRegistry::new()),
         })
     }
 

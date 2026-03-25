@@ -30,6 +30,7 @@ use axiomdb_types::DataType;
 use super::database::CommitRx;
 
 use super::result::serialize_query_result_multi_warn;
+use super::status::{ConnectedGuard, RunningGuard, SqlCommandClass};
 use super::{
     auth::{gen_challenge, is_allowed_user, verify_native_password, verify_sha256_password},
     codec::MySqlCodec,
@@ -45,6 +46,7 @@ use super::{
     },
     result::serialize_query_result,
     session::ConnectionState,
+    status::StatusRegistry,
 };
 
 /// Builds an ERR packet for a database error that occurred while processing `sql`.
@@ -180,12 +182,16 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
     // Automatically invalidated by analyze_cached() on DDL statements.
     let mut schema_cache = SchemaCache::new();
 
-    // Clone Arc<AtomicU64> once per connection — no lock needed to read it.
-    // Used in COM_STMT_EXECUTE to detect stale prepared statement plans (5.13).
-    let schema_version: Arc<AtomicU64> = {
+    // Clone Arc<AtomicU64> and Arc<StatusRegistry> once per connection — no lock
+    // needed after this point for either. (Phase 5.13 + 5.9c)
+    let (schema_version, status): (Arc<AtomicU64>, Arc<StatusRegistry>) = {
         let guard = db.lock().await;
-        Arc::clone(&guard.schema_version)
+        (Arc::clone(&guard.schema_version), Arc::clone(&guard.status))
     };
+
+    // RAII guard: increments `threads_connected` now, decrements on drop.
+    // Placed after auth so only authenticated connections are counted.
+    let _connected_guard = ConnectedGuard::new(Arc::clone(&status));
 
     let mut conn_state = ConnectionState::new();
 
@@ -210,6 +216,11 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
         if payload.is_empty() {
             break;
         }
+
+        // Count bytes_received: payload + 4-byte MySQL packet header.
+        let pkt_len = (payload.len() + 4) as u64;
+        status.bytes_received.fetch_add(pkt_len, Ordering::Relaxed);
+        conn_state.session_status.bytes_received += pkt_len;
 
         let cmd = payload[0];
         let body = &payload[1..];
@@ -245,13 +256,19 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 debug!(conn_id, %sql, "COM_QUERY");
 
                 // Intercept queries that ORMs/clients send automatically on connect.
-                if let Some(packets) = intercept_special_query(sql, &mut conn_state) {
+                if let Some(packets) = intercept_special_query(sql, &mut conn_state, &status) {
                     // Sync session autocommit flag after SET statements so that the
                     // executor respects the new mode on the next DML statement.
                     session.autocommit = conn_state.autocommit;
+                    // Count Questions + Com_* for intercepted single-statement queries.
+                    // SHOW/SET statements count as Questions but not as Com_select/insert.
+                    let class = SqlCommandClass::from_sql(sql);
+                    bump_statement_counters(&status, &mut conn_state.session_status, class);
+                    let nbytes = wire_size(&packets);
                     if send_packets(&mut writer, &packets).await.is_err() {
                         break;
                     }
+                    bump_bytes_sent(nbytes, &status, &mut conn_state.session_status);
                     continue;
                 }
 
@@ -264,15 +281,26 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 let mut seq: u8 = 1;
                 let mut connection_broken = false;
 
+                // RAII guard: threads_running tracks active command execution.
+                let _running = RunningGuard::new(&status);
+
                 'stmts: for (idx, stmt_sql) in stmts.into_iter().enumerate() {
                     let is_last = idx == stmt_count - 1;
 
-                    if let Some(packets) = intercept_special_query(stmt_sql, &mut conn_state) {
+                    // Classify statement for counter updates.
+                    let class = SqlCommandClass::from_sql(stmt_sql);
+
+                    if let Some(packets) =
+                        intercept_special_query(stmt_sql, &mut conn_state, &status)
+                    {
                         session.autocommit = conn_state.autocommit;
+                        bump_statement_counters(&status, &mut conn_state.session_status, class);
+                        let nbytes = wire_size(&packets);
                         if send_packets(&mut writer, &packets).await.is_err() {
                             connection_broken = true;
                             break 'stmts;
                         }
+                        bump_bytes_sent(nbytes, &status, &mut conn_state.session_status);
                         if !packets.is_empty() {
                             seq = packets
                                 .last()
@@ -281,6 +309,8 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                         }
                         continue 'stmts;
                     }
+
+                    bump_statement_counters(&status, &mut conn_state.session_status, class);
 
                     let exec_result = {
                         let mut guard = db.lock().await;
@@ -293,8 +323,15 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                                 let me = dberror_to_mysql(&e, Some(stmt_sql));
                                 debug!(conn_id, code = me.code, msg = %me.message, "commit error");
                                 let pkt = build_query_err_packet(&e, stmt_sql, &conn_state);
+                                let err_bytes = pkt.len() as u64 + 4;
                                 if writer.send((seq, pkt.as_slice())).await.is_err() {
                                     connection_broken = true;
+                                } else {
+                                    bump_bytes_sent(
+                                        err_bytes,
+                                        &status,
+                                        &mut conn_state.session_status,
+                                    );
                                 }
                                 break 'stmts;
                             }
@@ -308,22 +345,28 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                                 .last()
                                 .map(|(s, _)| s.wrapping_add(1))
                                 .unwrap_or(seq);
+                            let nbytes = wire_size(&packets);
                             if send_packets(&mut writer, &packets).await.is_err() {
                                 connection_broken = true;
                                 break 'stmts;
                             }
+                            bump_bytes_sent(nbytes, &status, &mut conn_state.session_status);
                         }
                         Err(e) => {
                             let me = dberror_to_mysql(&e, Some(stmt_sql));
                             debug!(conn_id, code = me.code, msg = %me.message, "query error");
                             let pkt = build_query_err_packet(&e, stmt_sql, &conn_state);
+                            let err_bytes = pkt.len() as u64 + 4;
                             if writer.send((seq, pkt.as_slice())).await.is_err() {
                                 connection_broken = true;
+                            } else {
+                                bump_bytes_sent(err_bytes, &status, &mut conn_state.session_status);
                             }
                             break 'stmts;
                         }
                     }
                 }
+                // RunningGuard dropped here — threads_running decremented.
 
                 if connection_broken {
                     break;
@@ -401,6 +444,17 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     continue;
                 }
                 let stmt_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+
+                // RAII guard: threads_running incremented while executing.
+                let _running = RunningGuard::new(&status);
+
+                // Classify the statement for Com_* counters before the borrow
+                // of conn_state.prepared_statements (two borrows can't overlap).
+                let stmt_class = conn_state
+                    .prepared_statements
+                    .get(&stmt_id)
+                    .map(|ps| SqlCommandClass::from_sql(&ps.sql_template))
+                    .unwrap_or(SqlCommandClass::Other);
 
                 // Pre-compute next LRU seq before taking a mutable ref to the
                 // statement (borrow checker: &mut conn_state ends here).
@@ -486,19 +540,27 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     })
                 };
 
+                // Count this execution regardless of success/failure.
+                bump_statement_counters(&status, &mut conn_state.session_status, stmt_class);
+
                 match result {
                     Ok((qr, commit_rx)) => {
                         // Await fsync confirmation outside the lock (group commit).
                         if let Err(e) = await_commit_rx(commit_rx).await {
                             let me = dberror_to_mysql(&e, None);
                             let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
-                            let _ = writer.send((1u8, pkt.as_slice())).await;
+                            let err_bytes = pkt.len() as u64 + 4;
+                            if writer.send((1u8, pkt.as_slice())).await.is_ok() {
+                                bump_bytes_sent(err_bytes, &status, &mut conn_state.session_status);
+                            }
                             continue;
                         }
                         let packets = serialize_query_result(qr, 1);
+                        let nbytes = wire_size(&packets);
                         if send_packets(&mut writer, &packets).await.is_err() {
                             break;
                         }
+                        bump_bytes_sent(nbytes, &status, &mut conn_state.session_status);
                     }
                     Err(e) => {
                         // Map unknown stmt to error 1243
@@ -512,9 +574,13 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                             super::error::dberror_to_mysql(&e, None)
                         };
                         let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
-                        let _ = writer.send((1u8, pkt.as_slice())).await;
+                        let err_bytes = pkt.len() as u64 + 4;
+                        if writer.send((1u8, pkt.as_slice())).await.is_ok() {
+                            bump_bytes_sent(err_bytes, &status, &mut conn_state.session_status);
+                        }
                     }
                 }
+                // RunningGuard dropped here.
             }
 
             // COM_STMT_CLOSE — no response
@@ -637,9 +703,12 @@ async fn await_commit_rx(rx: Option<CommitRx>) -> Result<(), DbError> {
 ///
 /// Without these stubs, most clients (PyMySQL, SQLAlchemy, ActiveRecord, etc.)
 /// fail to connect because they receive ERR packets for these mandatory queries.
+///
+/// `status` is used by `SHOW STATUS` to build the live counter rowset (5.9c).
 fn intercept_special_query(
     sql: &str,
     conn_state: &mut ConnectionState,
+    status: &Arc<StatusRegistry>,
 ) -> Option<Vec<(u8, Vec<u8>)>> {
     use super::packets::build_ok_packet;
     use super::result::serialize_query_result;
@@ -719,8 +788,14 @@ fn intercept_special_query(
         return Some(show_variables_result(&lower, conn_state));
     }
 
-    // ── SHOW SESSION STATUS (e.g. LIKE 'Ssl%') ────────────────────────────────
+    // ── SHOW [GLOBAL|SESSION|LOCAL] STATUS [LIKE '...'] (5.9c) ───────────────
     if lower.starts_with("show") && lower.contains("status") {
+        use super::status::{build_status_rows, parse_show_status};
+        if let Some(query) = parse_show_status(&lower) {
+            let qr = build_status_rows(&query, status, &conn_state.session_status);
+            return Some(serialize_query_result(qr, 1));
+        }
+        // Unrecognised SHOW ... STATUS variant — return empty two-column rowset.
         let cols = vec![
             ColumnMeta::computed("Variable_name".to_string(), DataType::Text),
             ColumnMeta::computed("Value".to_string(), DataType::Text),
@@ -909,4 +984,43 @@ async fn send_packets(
         }
     }
     Ok(())
+}
+
+// ── Status counter helpers ─────────────────────────────────────────────────────
+
+/// Increments Questions, Com_select, and Com_insert for one processed statement.
+fn bump_statement_counters(
+    status: &Arc<StatusRegistry>,
+    sess: &mut super::status::SessionStatus,
+    class: SqlCommandClass,
+) {
+    status.questions.fetch_add(1, Ordering::Relaxed);
+    sess.questions += 1;
+    match class {
+        SqlCommandClass::Select => {
+            status.com_select.fetch_add(1, Ordering::Relaxed);
+            sess.com_select += 1;
+        }
+        SqlCommandClass::Insert => {
+            status.com_insert.fetch_add(1, Ordering::Relaxed);
+            sess.com_insert += 1;
+        }
+        SqlCommandClass::Other => {}
+    }
+}
+
+/// Increments Bytes_sent by `nbytes` in both the global registry and the
+/// per-connection session counters.
+fn bump_bytes_sent(
+    nbytes: u64,
+    status: &Arc<StatusRegistry>,
+    sess: &mut super::status::SessionStatus,
+) {
+    status.bytes_sent.fetch_add(nbytes, Ordering::Relaxed);
+    sess.bytes_sent += nbytes;
+}
+
+/// Total wire size of a packet batch (payload + 4-byte MySQL header per packet).
+fn wire_size(packets: &[(u8, Vec<u8>)]) -> u64 {
+    packets.iter().map(|(_, p)| p.len() as u64 + 4).sum()
 }

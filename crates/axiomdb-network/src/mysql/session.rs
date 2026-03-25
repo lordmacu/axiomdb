@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 
+use super::status::SessionStatus;
+
 // ── PreparedStatement ─────────────────────────────────────────────────────────
 
 /// A compiled prepared statement stored per-connection.
@@ -86,6 +88,9 @@ pub struct ConnectionState {
     /// Monotonically increasing counter incremented on every COM_STMT_EXECUTE.
     /// Used as the `last_used_seq` for LRU eviction ordering.
     execute_seq: u64,
+    /// Per-connection cumulative status counters (Phase 5.9c).
+    /// Reset to zero by `COM_RESET_CONNECTION` (which recreates `ConnectionState`).
+    pub session_status: SessionStatus,
 }
 
 impl Default for ConnectionState {
@@ -124,6 +129,7 @@ impl ConnectionState {
             next_stmt_id: 1,
             max_prepared_stmts: 1024,
             execute_seq: 0,
+            session_status: SessionStatus::default(),
         }
     }
 

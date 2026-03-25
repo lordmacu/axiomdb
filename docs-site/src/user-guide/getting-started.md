@@ -314,6 +314,38 @@ AxiomDB intercepts and stubs these automatically — no configuration needed.
 </div>
 </div>
 
+### Monitoring with SHOW STATUS
+
+Monitoring tools, proxy servers, and health checks can query live server counters
+using the standard MySQL `SHOW STATUS` syntax:
+
+```sql
+SHOW STATUS
+SHOW GLOBAL STATUS
+SHOW SESSION STATUS
+SHOW STATUS LIKE 'Threads%'
+SHOW GLOBAL STATUS LIKE 'Com_%'
+```
+
+Available variables:
+
+| Variable | Scope | Description |
+|---|---|---|
+| `Uptime` | Global | Seconds since server start |
+| `Threads_connected` | Global | Currently authenticated connections |
+| `Threads_running` | Global | Connections actively executing a command |
+| `Questions` | Session + Global | Total statements executed |
+| `Bytes_received` | Session + Global | Bytes received from clients |
+| `Bytes_sent` | Session + Global | Bytes sent to clients |
+| `Com_select` | Session + Global | `SELECT` statement count |
+| `Com_insert` | Session + Global | `INSERT` statement count |
+| `Innodb_buffer_pool_read_requests` | Global | Storage read requests (compatibility) |
+| `Innodb_buffer_pool_reads` | Global | Physical page reads (compatibility) |
+
+Session scope (`SHOW STATUS`, `SHOW SESSION STATUS`, `SHOW LOCAL STATUS`) returns
+per-connection values. Global scope (`SHOW GLOBAL STATUS`) returns server-wide totals.
+Session counters reset when a connection is closed or `COM_RESET_CONNECTION` is issued.
+
 ---
 
 ## Embedded Mode — Rust API
