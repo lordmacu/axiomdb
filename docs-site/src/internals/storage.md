@@ -183,6 +183,56 @@ are rejected immediately without re-entering the storage layer.
 
 ---
 
+## Verified Open — Corruption Detection at Startup
+
+`MmapStorage::open()` validates every **allocated** page before making the
+database available. The startup sequence is:
+
+1. Map the file and verify page 0 (meta) — magic, version, page count.
+2. Load the freelist from page 1 and verify its checksum.
+3. Scan pages `2..page_count`, skipping any page the freelist marks as free.
+   For each allocated page, call `read_page_from_mmap()` which re-computes
+   the CRC32c of the body and compares it to the stored `header.checksum`.
+
+```rust
+for page_id in 2..page_count {
+    if !freelist.is_free(page_id) {
+        Self::read_page_from_mmap(&mmap, page_id)?;
+    }
+}
+```
+
+If any page fails, `open()` returns `DbError::ChecksumMismatch { page_id, expected, got }`
+immediately. No connection is accepted and no `Db` handle is returned.
+
+Free pages are skipped because they are never written by the storage engine
+and therefore have no valid page header or checksum. Scanning them would
+produce false positives on a freshly created or partially filled database.
+
+### Recovery wiring
+
+Both the network server (`Database::open`) and the embedded handle (`Db::open`)
+route through `TxnManager::open_with_recovery()` on every reopen:
+
+```rust
+let (txn, _recovery) = TxnManager::open_with_recovery(&mut storage, &wal_path)?;
+```
+
+This ensures WAL replay runs before the first query is executed, even if the
+only change in this subphase is the corruption scan. Bypassing
+`open_with_recovery()` with the older `TxnManager::open()` was an oversight
+that this subphase closes.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Scan only allocated pages</span>
+Free pages contain no valid page header — `file.set_len()` zero-initializes them, giving `checksum = 0`. The CRC32c of an all-zero body is non-zero, so scanning free pages would produce a spurious `ChecksumMismatch` on every fresh or sparsely-used database. The freelist (already in memory by step 2) provides the allocation bitmap at zero extra I/O cost.
+</div>
+</div>
+
+---
+
 ## MemoryStorage — In-Memory for Tests
 
 `MemoryStorage` stores pages in a `Vec<Box<Page>>`. It implements the same

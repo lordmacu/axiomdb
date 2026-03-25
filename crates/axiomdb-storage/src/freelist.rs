@@ -176,6 +176,17 @@ impl FreeList {
         self.total_pages
     }
 
+    /// Returns `true` if `page_id` is free (not yet allocated).
+    ///
+    /// Out-of-range page IDs are treated as not-free (they don't exist).
+    pub fn is_free(&self, page_id: u64) -> bool {
+        if page_id >= self.total_pages {
+            return false;
+        }
+        let (word_idx, bit) = Self::bit_pos(page_id);
+        (self.words[word_idx] >> bit) & 1 == 1
+    }
+
     /// Number of currently free pages.
     pub fn free_count(&self) -> u64 {
         self.words.iter().map(|w| w.count_ones() as u64).sum()

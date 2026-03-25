@@ -400,16 +400,13 @@ fn test_partial_page_write_detected_as_checksum_mismatch() {
         f.sync_all().unwrap();
     }
 
-    // Reading the corrupted page must return ChecksumMismatch — not silently succeed.
-    let storage = MmapStorage::open(&env.db).unwrap();
-    let result = storage.read_page(page_id);
+    // Since 3.8b, open() verifies all allocated pages on startup.
+    // Corruption must be caught before the first query.
+    let result = MmapStorage::open(&env.db);
     assert!(
         matches!(result, Err(DbError::ChecksumMismatch { .. })),
-        "corrupted page must be detected as ChecksumMismatch, got err={}",
-        result
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "Ok(page)".to_string())
+        "corrupted page must be detected as ChecksumMismatch on open, got: {:?}",
+        result.err()
     );
     // Documents: full recovery from partial page write requires WAL redo (Phase 3.8b).
 }

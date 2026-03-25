@@ -53,7 +53,7 @@
 - [x] 3.5b ✅ Implicit transaction start (MySQL ORM compat) — implemented in executor semantics; covered by `spec-3.5abc-autocommit-txn-semantics.md`
 - [x] 3.5c ✅ Error semantics mid-transaction (statement vs txn rollback) — implemented with savepoint-based rollback in executor; covered by `spec-3.5abc-autocommit-txn-semantics.md`
 - [x] ✅ 3.6b ENOSPC handling — read-only degraded mode on disk full
-- [ ] ⚠️ 3.8b Verified open — detect page checksum corruption on startup before serving traffic
+- [x] ✅ 3.8b Verified open — detect page checksum corruption on startup; scan all allocated pages; swap reopen to open_with_recovery in server + embedded
 - [ ] ⚠️ 3.8c Full committed-page redo after power loss — broader WAL page-image coverage still missing
 - [x] ✅ 3.15b Per-page flush_range optimization — targeted durable flush of dirty mmap ranges
 - [x] 3.17 ✅ WAL batch append — `TxnManager::record_insert_batch()`: reserve_lsns(N) + serialize all N Insert entries into wal_scratch + write_batch() in one write_all; O(1) BufWriter calls instead of O(N); entries byte-for-byte identical to per-row path; crash recovery unchanged

@@ -6,6 +6,7 @@
 //! - Verify behavioral equivalence between MmapStorage and MemoryStorage.
 //! - Exercise the StorageEngine trait as a unified interface.
 
+use axiomdb_core::error::DbError;
 use axiomdb_storage::{MemoryStorage, MmapStorage, Page, PageType, StorageEngine};
 use tempfile::TempDir;
 
@@ -315,6 +316,111 @@ fn test_flush_freelist_only_change() {
     }
 }
 
+// ── Verified open — corruption detected at startup (3.8b) ────────────────────
+
+#[test]
+fn test_verified_open_detects_data_page_corruption() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tmp_dir();
+    let db_path = dir.path().join("corrupt_data.db");
+    let page_id;
+
+    // Write a page and flush so it is on disk.
+    {
+        let mut engine = MmapStorage::create(&db_path).expect("create");
+        page_id = engine.alloc_page(PageType::Data).expect("alloc");
+        write_pattern(&mut engine, page_id, 0xAA);
+        engine.flush().expect("flush");
+    }
+
+    // Corrupt the page body on disk (bypass the mmap).
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .expect("open for corruption");
+        let offset = page_id as u64 * axiomdb_storage::PAGE_SIZE as u64
+            + axiomdb_storage::HEADER_SIZE as u64
+            + 42;
+        file.seek(SeekFrom::Start(offset)).expect("seek");
+        file.write_all(&[0xFFu8]).expect("corrupt byte");
+    }
+
+    // Reopen must fail immediately — before any query.
+    let result = MmapStorage::open(&db_path);
+    assert!(
+        result.is_err(),
+        "open() must fail when a data page has a bad checksum"
+    );
+    assert!(
+        matches!(result, Err(DbError::ChecksumMismatch { .. })),
+        "error must be ChecksumMismatch, got: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_verified_open_clean_database_succeeds() {
+    let dir = tmp_dir();
+    let db_path = dir.path().join("clean_reopen.db");
+
+    {
+        let mut engine = MmapStorage::create(&db_path).expect("create");
+        let id = engine.alloc_page(PageType::Data).expect("alloc");
+        write_pattern(&mut engine, id, 0x7F);
+        engine.flush().expect("flush");
+    }
+
+    // Reopen of a clean file must always succeed.
+    let engine = MmapStorage::open(&db_path).expect("clean reopen must succeed");
+    assert!(
+        engine.page_count() >= 2,
+        "page_count must be valid after clean open"
+    );
+}
+
+#[test]
+fn test_verified_open_multiple_pages_any_corruption_detected() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tmp_dir();
+    let db_path = dir.path().join("multi_corrupt.db");
+
+    // Allocate several pages.
+    let ids: Vec<u64> = {
+        let mut engine = MmapStorage::create(&db_path).expect("create");
+        let ids: Vec<u64> = (0..5)
+            .map(|_| engine.alloc_page(PageType::Data).expect("alloc"))
+            .collect();
+        for &id in &ids {
+            write_pattern(&mut engine, id, 0x55);
+        }
+        engine.flush().expect("flush");
+        ids
+    };
+
+    // Corrupt the last allocated page.
+    {
+        let last_id = *ids.last().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .expect("open");
+        let offset = last_id as u64 * axiomdb_storage::PAGE_SIZE as u64
+            + axiomdb_storage::HEADER_SIZE as u64
+            + 1;
+        file.seek(SeekFrom::Start(offset)).expect("seek");
+        file.write_all(&[0x00u8]).expect("corrupt");
+    }
+
+    let result = MmapStorage::open(&db_path);
+    assert!(
+        result.is_err(),
+        "open() must fail when any page is corrupted, not only the first"
+    );
+}
+
 // ── On-disk checksum integrity ────────────────────────────────────────────────
 
 #[test]
@@ -345,13 +451,16 @@ fn test_corrupted_page_detected_on_read() {
         file.write_all(&[0xFFu8]).expect("write corruption");
     }
 
-    // Reopen and verify that reading detects the corruption.
-    {
-        let engine = MmapStorage::open(&db_path).expect("reopen");
-        let result = engine.read_page(page_id);
-        assert!(
-            result.is_err(),
-            "invalid checksum should return an error, not corrupt data"
-        );
-    }
+    // Since 3.8b, open() itself verifies all allocated pages.
+    // Corruption must be caught at startup, not lazily on read.
+    let result = MmapStorage::open(&db_path);
+    assert!(
+        result.is_err(),
+        "open() must fail when an allocated page has a bad checksum"
+    );
+    assert!(
+        matches!(result, Err(DbError::ChecksumMismatch { .. })),
+        "error must be ChecksumMismatch, got: {:?}",
+        result.err()
+    );
 }

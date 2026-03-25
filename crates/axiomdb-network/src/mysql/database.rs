@@ -108,8 +108,8 @@ impl Database {
         let wal_path = data_dir.join("axiomdb.wal");
 
         let (storage, txn) = if db_path.exists() {
-            let storage = MmapStorage::open(&db_path)?;
-            let txn = TxnManager::open(&wal_path)?;
+            let mut storage = MmapStorage::open(&db_path)?;
+            let (txn, _recovery) = TxnManager::open_with_recovery(&mut storage, &wal_path)?;
             (storage, txn)
         } else {
             let mut storage = MmapStorage::create(&db_path)?;
