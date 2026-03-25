@@ -450,6 +450,47 @@ pub(crate) fn parse_create_index(p: &mut Parser, unique: bool) -> Result<Stmt, D
         None
     };
 
+    // Optional WITH (key = value, ...) storage options (Phase 6.8).
+    // Only `fillfactor` is supported; other keys return ParseError.
+    let fillfactor: Option<u8> = if p.eat(&Token::With) {
+        p.expect(&Token::LParen)?;
+        let key = p.parse_identifier()?;
+        p.expect(&Token::Eq)?;
+        let ff = match key.to_lowercase().as_str() {
+            "fillfactor" => {
+                let val = match p.peek() {
+                    Token::Integer(n) => {
+                        let n = *n;
+                        p.advance();
+                        n
+                    }
+                    other => {
+                        return Err(DbError::ParseError {
+                            message: format!("fillfactor must be an integer, found {:?}", other),
+                        });
+                    }
+                };
+                if !(10..=100).contains(&val) {
+                    return Err(DbError::ParseError {
+                        message: "fillfactor must be between 10 and 100".into(),
+                    });
+                }
+                val as u8
+            }
+            other => {
+                return Err(DbError::ParseError {
+                    message: format!("unknown index option: {other}"),
+                });
+            }
+        };
+        // Allow trailing comma before closing paren.
+        p.eat(&Token::Comma);
+        p.expect(&Token::RParen)?;
+        Some(ff)
+    } else {
+        None
+    };
+
     Ok(Stmt::CreateIndex(CreateIndexStmt {
         if_not_exists,
         unique,
@@ -457,6 +498,7 @@ pub(crate) fn parse_create_index(p: &mut Parser, unique: bool) -> Result<Stmt, D
         table,
         columns,
         predicate,
+        fillfactor,
     }))
 }
 

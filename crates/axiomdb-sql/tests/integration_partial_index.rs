@@ -328,6 +328,7 @@ fn test_index_def_roundtrip_with_predicate() {
             order: SortOrder::Asc,
         }],
         predicate: Some("deleted_at IS NULL".to_string()),
+        fillfactor: 90,
     };
 
     let bytes = def.to_bytes();
@@ -353,6 +354,7 @@ fn test_index_def_roundtrip_no_predicate_backward_compat() {
             order: SortOrder::Asc,
         }],
         predicate: None,
+        fillfactor: 90,
     };
 
     let bytes = def.to_bytes();
@@ -380,6 +382,7 @@ fn test_pre_67_index_row_reads_predicate_as_none() {
             order: SortOrder::Asc,
         }],
         predicate: None,
+        fillfactor: 90,
     };
 
     let old_bytes = old_def.to_bytes();

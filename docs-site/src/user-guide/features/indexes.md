@@ -6,6 +6,52 @@ stored in the same `.db` file as the table data.
 
 ---
 
+## Fill Factor
+
+Fill factor controls how full a B-Tree leaf page is allowed to get before it
+splits. A lower fill factor leaves intentional free space on each page, reducing
+split frequency for workloads that add rows after index creation.
+
+```sql
+-- Append-heavy time-series table: pages fill to 70% before splitting.
+CREATE INDEX idx_ts ON events(created_at) WITH (fillfactor = 70);
+
+-- Compact read-only index: fill pages completely.
+CREATE UNIQUE INDEX uq_email ON users(email) WITH (fillfactor = 100);
+
+-- Default (90%) — equivalent to omitting WITH:
+CREATE INDEX idx_x ON t(x);
+```
+
+### Range and default
+
+Valid range: **10–100**. Default: **90** (matches PostgreSQL's
+`BTREE_DEFAULT_FILLFACTOR`). `fillfactor = 100` reproduces the current behavior
+exactly — pages fill completely before splitting.
+
+### Effect on splits
+
+With `fillfactor = F`:
+- Leaf page splits when it reaches `⌈F × ORDER_LEAF / 100⌉` entries
+  (instead of at full capacity).
+- After a split, both new pages hold roughly `F/2 %` of capacity —
+  leaving room for future inserts without triggering another split.
+- Internal pages always fill to capacity (not user-configurable).
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage</span>
+For append-heavy tables (time-series, log tables, auto-increment keys), a fill
+factor of 70–80 reduces split frequency during inserts because each page has
+20–30% free space instead of splitting immediately on the next insert. This
+lowers write amplification for sequential insert workloads — an optimization
+also used by PostgreSQL and MariaDB InnoDB for INSERT-heavy indexes.
+</div>
+</div>
+
+---
+
 ## Automatic Indexes
 
 AxiomDB automatically creates a unique B+ Tree index for:

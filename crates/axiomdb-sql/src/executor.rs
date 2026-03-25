@@ -3694,6 +3694,7 @@ fn execute_create_table(
                 name: index_name,
                 root_page_id: final_root,
                 is_unique,
+                fillfactor: 90, // auto-created indexes use default
                 is_primary,
                 columns: vec![IndexColumnDef {
                     col_idx,
@@ -4046,6 +4047,7 @@ fn execute_create_index(
 
     // 5. Scan the table and insert existing rows into the B-Tree.
     //    For partial indexes, compile the predicate once and skip non-matching rows.
+    let index_fillfactor = stmt.fillfactor.unwrap_or(90);
     let pred_expr: Option<crate::expr::Expr> = match &stmt.predicate {
         Some(pred) => {
             let sql = expr_to_sql_string(pred);
@@ -4077,7 +4079,7 @@ fn execute_create_index(
         }
         match encode_index_key(&key_vals) {
             Ok(key) => {
-                BTree::insert_in(storage, &root_pid, &key, rid)?;
+                BTree::insert_in(storage, &root_pid, &key, rid, index_fillfactor)?;
                 bloom_keys.push(key);
             }
             Err(DbError::IndexKeyTooLong { .. }) => {
@@ -4109,6 +4111,7 @@ fn execute_create_index(
         is_primary: false,
         columns: index_columns,
         predicate: predicate_sql,
+        fillfactor: stmt.fillfactor.unwrap_or(90),
     })?;
 
     // 7. Populate bloom filter for the newly created index.
@@ -4718,7 +4721,8 @@ fn alter_add_constraint(
                     .collect(),
                 unique: true,
                 if_not_exists: false,
-                predicate: None, // UNIQUE constraints are always full indexes
+                predicate: None,  // UNIQUE constraints are always full indexes
+                fillfactor: None, // use default 90
             };
             let mut noop_bloom = crate::bloom::BloomRegistry::new();
             execute_create_index(stmt, storage, txn, &mut noop_bloom)?;

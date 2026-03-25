@@ -346,6 +346,19 @@ pub struct IndexDef {
     ///
     /// Example: `Some("deleted_at IS NULL")` or `Some("status = 'active'")`.
     pub predicate: Option<String>,
+    /// Target leaf-page fill factor in percent (Phase 6.8).
+    ///
+    /// Controls when a leaf page splits during INSERT. A leaf page with
+    /// `num_keys >= ceil(ORDER_LEAF × fillfactor / 100)` triggers a split,
+    /// leaving the specified percentage of capacity used and `100 - fillfactor`
+    /// free for future inserts without another split.
+    ///
+    /// Valid range: 10–100. Default: 90 (matches PostgreSQL `BTREE_DEFAULT_FILLFACTOR`).
+    /// `fillfactor = 100` → pages fill completely before splitting (current behavior).
+    ///
+    /// Stored as 1 byte after the predicate section. Absent in pre-6.8 rows;
+    /// `from_bytes` returns 90 for backward compatibility.
+    pub fillfactor: u8,
 }
 
 impl IndexDef {
@@ -401,6 +414,9 @@ impl IndexDef {
             buf.extend_from_slice(&(pred.len() as u16).to_le_bytes());
             buf.extend_from_slice(pred);
         }
+        // Fill factor (Phase 6.8) — always written as 1 byte after predicate.
+        // Pre-6.8 readers stop before this byte and use the default of 90.
+        buf.push(self.fillfactor);
         buf
     }
 
@@ -481,6 +497,16 @@ impl IndexDef {
             None // pre-6.7 row — no predicate bytes
         };
 
+        // Fill factor (Phase 6.8) — 1 byte after predicate. Pre-6.8 rows lack
+        // this byte; default to 90 (PostgreSQL BTREE_DEFAULT_FILLFACTOR).
+        let fillfactor = if bytes.len() > consumed {
+            let ff = bytes[consumed];
+            consumed += 1;
+            ff
+        } else {
+            90 // default for pre-6.8 rows
+        };
+
         Ok((
             Self {
                 index_id,
@@ -491,6 +517,7 @@ impl IndexDef {
                 is_primary,
                 columns,
                 predicate,
+                fillfactor,
             },
             consumed,
         ))
@@ -907,6 +934,7 @@ mod tests {
                 order: SortOrder::Asc,
             }],
             predicate: None,
+            fillfactor: 90,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = IndexDef::from_bytes(&bytes).unwrap();
@@ -928,6 +956,7 @@ mod tests {
                 order: SortOrder::Asc,
             }],
             predicate: None,
+            fillfactor: 90,
         };
         let bytes = def.to_bytes();
         let (back, _) = IndexDef::from_bytes(&bytes).unwrap();
@@ -949,6 +978,7 @@ mod tests {
             is_primary: false,
             columns: vec![],
             predicate: None,
+            fillfactor: 90,
         };
         let bytes = def.to_bytes();
         assert!(IndexDef::from_bytes(&bytes[..10]).is_err());
@@ -974,6 +1004,7 @@ mod tests {
                 },
             ],
             predicate: None,
+            fillfactor: 90,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = IndexDef::from_bytes(&bytes).unwrap();
@@ -993,6 +1024,7 @@ mod tests {
             is_primary: false,
             columns: vec![],
             predicate: None,
+            fillfactor: 90,
         };
         let full_bytes = def.to_bytes();
         // Truncate the columns section (last byte is ncols=0, remove it).

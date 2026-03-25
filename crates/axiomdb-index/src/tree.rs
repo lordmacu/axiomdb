@@ -19,6 +19,38 @@ use crate::page_layout::{
     MAX_KEY_LEN, MIN_KEYS_INTERNAL, MIN_KEYS_LEAF, NULL_PAGE, ORDER_INTERNAL, ORDER_LEAF,
 };
 
+// ── Fill factor ──────────────────────────────────────────────────────────────
+
+/// Returns the maximum number of keys a leaf page may hold before splitting.
+///
+/// Uses ceiling division so `fillfactor = 100` gives exactly `order`
+/// (identical to the pre-6.8 behavior — no regression).
+///
+/// # Examples (ORDER_LEAF = 217)
+/// ```text
+/// fillfactor=100 → 217  (no change)
+/// fillfactor=90  → 196  (default)
+/// fillfactor=70  → 152
+/// fillfactor=10  →  22  (minimum useful)
+/// ```
+pub(crate) const fn fill_threshold(order: usize, fillfactor: u8) -> usize {
+    let ff = fillfactor as usize;
+    // usize::div_ceil is stable since Rust 1.73; use it for correctness and
+    // to satisfy clippy's "manually reimplementing div_ceil" lint.
+    let t = (order * ff).div_ceil(100);
+    if t < 1 {
+        1
+    } else {
+        t
+    }
+}
+
+// Compile-time guarantee: fillfactor=100 produces exactly ORDER_LEAF.
+const _: () = assert!(
+    fill_threshold(ORDER_LEAF, 100) == ORDER_LEAF,
+    "fill_threshold(ORDER_LEAF, 100) must equal ORDER_LEAF — regression guard"
+);
+
 // ── Internal types ───────────────────────────────────────────────────────────
 
 enum InsertResult {
@@ -116,7 +148,7 @@ impl BTree {
     pub fn insert(&mut self, key: &[u8], rid: RecordId) -> Result<(), DbError> {
         Self::check_key(key)?;
         let root = self.root_pid.load(Ordering::Acquire);
-        match Self::insert_subtree(self.storage.as_mut(), root, key, rid)? {
+        match Self::insert_subtree(self.storage.as_mut(), root, key, rid, 90)? {
             InsertResult::Ok(new_root) => {
                 // CAS ensures that if in Phase 7 there were a concurrent writer,
                 // the second would fail instead of silently overwriting.
@@ -148,15 +180,16 @@ impl BTree {
         pid: u64,
         key: &[u8],
         rid: RecordId,
+        fillfactor: u8,
     ) -> Result<InsertResult, DbError> {
         match NodeCopy::read(storage, pid)? {
-            NodeCopy::Leaf(node) => Self::insert_leaf(storage, pid, node, key, rid),
+            NodeCopy::Leaf(node) => Self::insert_leaf(storage, pid, node, key, rid, fillfactor),
             NodeCopy::Internal(node) => {
                 let n = node.num_keys();
                 let child_idx = node.find_child_idx(key);
                 let child_pid = node.child_at(child_idx);
 
-                match Self::insert_subtree(storage, child_pid, key, rid)? {
+                match Self::insert_subtree(storage, child_pid, key, rid, fillfactor)? {
                     InsertResult::Ok(new_child_pid) => {
                         // If the child was updated in-place (same pid), the parent did not change:
                         // no need to rewrite it or update its child pointer.
@@ -204,13 +237,19 @@ impl BTree {
         node: LeafNodePage,
         key: &[u8],
         rid: RecordId,
+        fillfactor: u8,
     ) -> Result<InsertResult, DbError> {
         let ins_pos = match node.search(key) {
             Ok(_) => return Err(DbError::DuplicateKey),
             Err(pos) => pos,
         };
 
-        if node.num_keys() < ORDER_LEAF {
+        // Split threshold: max keys before splitting.
+        // fillfactor=100 → ORDER_LEAF (current behavior, no regression).
+        // fillfactor=90  → ⌈0.90 × 217⌉ = 196 (default).
+        // Internal pages always split at ORDER_INTERNAL (not fillfactor-controlled).
+        let threshold = fill_threshold(ORDER_LEAF, fillfactor);
+        if node.num_keys() < threshold {
             // In-place: with &mut self there are no concurrent readers, CoW not needed.
             let mut p = Page::new(PageType::Index, old_pid);
             let n = cast_leaf_mut(&mut p);
@@ -937,17 +976,24 @@ impl BTree {
 
     /// Inserts `(key, rid)` into the B-Tree rooted at `*root_pid`.
     ///
+    /// `fillfactor` (10–100) controls the leaf-page split threshold:
+    /// a leaf splits when `num_keys >= ceil(ORDER_LEAF × fillfactor / 100)`.
+    /// `fillfactor = 100` reproduces current behavior (split at full capacity).
+    /// `fillfactor = 90` (the default) splits at ~90% capacity.
+    ///
+    /// Internal pages always split at `ORDER_INTERNAL` regardless of fillfactor.
+    ///
     /// Updates `*root_pid` atomically if the root splits.
-    /// Uses `Ordering::AcqRel` store (safe: single-writer in Phase 6).
     pub fn insert_in(
         storage: &mut dyn StorageEngine,
         root_pid: &AtomicU64,
         key: &[u8],
         rid: RecordId,
+        fillfactor: u8,
     ) -> Result<(), DbError> {
         Self::check_key(key)?;
         let root = root_pid.load(Ordering::Acquire);
-        match Self::insert_subtree(storage, root, key, rid)? {
+        match Self::insert_subtree(storage, root, key, rid, fillfactor)? {
             InsertResult::Ok(new_root) => {
                 root_pid.store(new_root, Ordering::Release);
             }
@@ -1049,6 +1095,19 @@ impl BTree {
                 pid = node.child_at(node.find_child_idx(key));
             }
         }
+    }
+
+    /// Public accessor for the fill-factor split threshold (Phase 6.8).
+    ///
+    /// Returns the maximum number of keys a leaf page holds before splitting,
+    /// given the configured `fillfactor` (10–100). `fillfactor = 100` returns
+    /// `order` exactly — identical to the pre-6.8 behavior.
+    ///
+    /// Exposed as a public method so callers (e.g., integration tests and
+    /// monitoring tools) can verify threshold values without re-implementing
+    /// the ceiling-division formula.
+    pub fn fill_threshold_pub(order: usize, fillfactor: u8) -> usize {
+        fill_threshold(order, fillfactor)
     }
 }
 

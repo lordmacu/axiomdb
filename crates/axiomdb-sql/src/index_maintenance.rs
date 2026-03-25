@@ -111,7 +111,7 @@ pub fn insert_into_indexes(
         }
 
         let root_pid = AtomicU64::new(idx.root_page_id);
-        BTree::insert_in(storage, &root_pid, &key, rid)?;
+        BTree::insert_in(storage, &root_pid, &key, rid, idx.fillfactor)?;
         bloom.add(idx.index_id, &key);
         let new_root = root_pid.load(Ordering::Acquire);
         if new_root != idx.root_page_id {
