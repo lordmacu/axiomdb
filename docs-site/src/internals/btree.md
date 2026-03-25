@@ -200,13 +200,13 @@ The <code>next_leaf</code> pointer exists on-disk but <code>RangeIter</code> doe
 ```
 1. Descend from root to the target leaf, recording the path.
 
-2. If the leaf has room (num_keys < ORDER_LEAF):
+2. If the leaf has room (num_keys < fill_threshold):
    → Copy the leaf to a new page.
    → Insert the new (key, rid) in sorted position.
    → Update the parent's child pointer (CoW the parent too).
    → Propagate CoW up to the root.
 
-3. If the leaf is full:
+3. If the leaf is at or above the fill threshold:
    → Allocate two new leaf pages.
    → Distribute: left gets floor((ORDER_LEAF+1)/2) entries,
                  right gets the remaining entries.
@@ -216,6 +216,61 @@ The <code>next_leaf</code> pointer exists on-disk but <code>RangeIter</code> doe
    → If the parent is also full, recursively split upward.
    → If the root splits, allocate a new root with two children.
 ```
+
+The split point `fill_threshold` depends on the index fill factor (see below).
+Internal pages always split at `ORDER_INTERNAL` regardless of fill factor.
+
+---
+
+## Fill Factor — Adaptive Leaf Splits
+
+The fill factor controls how full leaf pages are allowed to get before splitting.
+It is set per-index via `WITH (fillfactor=N)` on `CREATE INDEX` and stored in
+`IndexDef.fillfactor: u8`.
+
+### Formula
+
+```
+fill_threshold(order, ff) = ⌈order × ff / 100⌉   (integer ceiling division)
+```
+
+| fillfactor | fill_threshold (ORDER_LEAF = 216) | Effect |
+|---|---|---|
+| 100 (compact) | 216 | Splits only when completely full — max density, slowest inserts on busy pages |
+| 90 (default)  | 195 | Leaves ~10% free — balances density and insert speed |
+| 70 (write-heavy) | 152 | Leaves ~30% free — fewer splits for append-heavy workloads |
+| 10 (minimum)  | 22  | Very sparse pages — extreme fragmentation, rarely useful |
+
+A compile-time assert verifies that `fill_threshold(ORDER_LEAF, 100) == ORDER_LEAF`,
+ensuring fillfactor=100 always preserves the original behavior exactly.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision</span>
+Internal pages are <strong>not</strong> affected by fill factor — they always split at
+<code>ORDER_INTERNAL</code>. Only leaf splits benefit from the extra free space, because
+inserts always land on leaf pages. Applying fill factor to internal pages would reduce
+tree fan-out without any benefit for typical insert patterns, matching PostgreSQL's
+implementation of the same concept.
+</div>
+</div>
+
+### Catalog field
+
+`IndexDef.fillfactor` is serialized as a single byte appended after the predicate
+section in the catalog heap entry. Pre-6.8 index rows are read with a default of 90
+(backward-compatible). Valid range: 10–100; values outside this range are rejected
+at `CREATE INDEX` parse time with a `ParseError`.
+
+### When to use a lower fill factor
+
+- **Append-heavy tables** — rows inserted in bulk after the index is created. A
+  fill factor of 70–80 prevents cascading splits during the bulk load.
+- **Write-heavy OLTP** — high-frequency single-row inserts that land on the same
+  hot pages. More free space means fewer page splits per second.
+- **Read-heavy / archival** — use fillfactor=100. Maximum density reduces I/O for
+  full scans at the cost of slower writes.
 
 ### Minimum Occupancy Invariant
 
