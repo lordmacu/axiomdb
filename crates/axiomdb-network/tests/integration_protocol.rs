@@ -27,7 +27,7 @@ fn test_codec_encode_decode_round_trip() {
     let seq_id = 42u8;
 
     let mut dst = BytesMut::new();
-    let mut codec = MySqlCodec;
+    let mut codec = MySqlCodec::default();
     codec
         .encode((seq_id, payload.as_slice()), &mut dst)
         .unwrap();
@@ -43,14 +43,14 @@ fn test_codec_encode_decode_round_trip() {
 
 #[test]
 fn test_codec_partial_header_returns_none() {
-    let mut codec = MySqlCodec;
+    let mut codec = MySqlCodec::default();
     let mut buf = BytesMut::from(&[0x01, 0x00][..]);
     assert!(codec.decode(&mut buf).unwrap().is_none());
 }
 
 #[test]
 fn test_codec_partial_payload_returns_none() {
-    let mut codec = MySqlCodec;
+    let mut codec = MySqlCodec::default();
     // Header says 10 bytes, but only 3 in buffer
     let mut buf = BytesMut::from(&[0x0a, 0x00, 0x00, 0x01, 0x41, 0x42, 0x43][..]);
     assert!(codec.decode(&mut buf).unwrap().is_none());
@@ -59,7 +59,7 @@ fn test_codec_partial_payload_returns_none() {
 #[test]
 fn test_codec_empty_payload() {
     let mut dst = BytesMut::new();
-    let mut codec = MySqlCodec;
+    let mut codec = MySqlCodec::default();
     codec.encode((0u8, &[][..]), &mut dst).unwrap();
     assert_eq!(dst.len(), 4); // header only
     assert_eq!(&dst[..4], &[0x00, 0x00, 0x00, 0x00]);
@@ -309,7 +309,7 @@ fn test_session_default_autocommit() {
 #[test]
 fn test_session_set_autocommit_false() {
     let mut s = ConnectionState::new();
-    s.apply_set("SET autocommit=0");
+    s.apply_set("SET autocommit=0").unwrap();
     assert!(!s.autocommit);
     assert_eq!(s.get_variable("@@autocommit"), Some("0".into()));
 }
@@ -317,15 +317,15 @@ fn test_session_set_autocommit_false() {
 #[test]
 fn test_session_set_autocommit_back_to_true() {
     let mut s = ConnectionState::new();
-    s.apply_set("SET autocommit=0");
-    s.apply_set("SET autocommit=1");
+    s.apply_set("SET autocommit=0").unwrap();
+    s.apply_set("SET autocommit=1").unwrap();
     assert!(s.autocommit);
 }
 
 #[test]
 fn test_session_set_names() {
     let mut s = ConnectionState::new();
-    s.apply_set("SET NAMES latin1");
+    s.apply_set("SET NAMES latin1").unwrap();
     assert_eq!(s.character_set_client, "latin1");
 }
 

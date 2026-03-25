@@ -655,6 +655,72 @@ ok("Threads_connected >= 1", int(g6.get("Threads_connected", 0)) >= 1,
    g6.get("Threads_connected"))
 conn6.close()
 
+# ── 5.4a: max_allowed_packet enforcement ─────────────────────────────────────
+
+print("\n[5.4a max_allowed_packet]")
+
+# SET max_allowed_packet to a small value, verify SELECT @@max_allowed_packet reflects it
+conn_map = connect()
+cm = conn_map.cursor()
+cm.execute("SET max_allowed_packet = 2048")
+cm.execute("SELECT @@max_allowed_packet")
+row = cm.fetchone()
+ok("SET max_allowed_packet = 2048 is reflected in SELECT @@max_allowed_packet",
+   row is not None and int(row[0]) == 2048, row)
+
+# Reset to default before the next test
+cm.execute("SET max_allowed_packet = 67108864")
+cm.execute("SELECT @@max_allowed_packet")
+row2 = cm.fetchone()
+ok("SET max_allowed_packet = 67108864 restores default",
+   row2 is not None and int(row2[0]) == 67108864, row2)
+conn_map.close()
+
+# Invalid SET max_allowed_packet returns ERR, previous limit unchanged
+conn_inv = connect()
+ci = conn_inv.cursor()
+err_code_inv = None
+try:
+    ci.execute("SET max_allowed_packet = 'abc'")
+    conn_inv.commit()
+except Exception as e:
+    err_code_inv = getattr(e, 'args', [None])[0]
+ok("SET max_allowed_packet = 'abc' returns an error (not silently accepted)",
+   err_code_inv is not None, err_code_inv)
+# After the error the connection should still be usable
+try:
+    ci.execute("SELECT @@max_allowed_packet")
+    row_inv = ci.fetchone()
+    ok("Connection still usable after invalid SET max_allowed_packet",
+       row_inv is not None, row_inv)
+except Exception:
+    ok("Connection still usable after invalid SET max_allowed_packet", False)
+conn_inv.close()
+
+# Oversize COM_QUERY: lower the limit to 64 bytes, then send a query larger than that.
+# The server must return MySQL error 1153 / SQLSTATE 08S01 and close the connection.
+# We use a normal pymysql connection because pymysql honours the server-side ERR packet.
+conn_oversize = connect()
+co = conn_oversize.cursor()
+co.execute("SET max_allowed_packet = 64")
+conn_oversize.commit()
+err_code_oversize = None
+sqlstate_oversize = None
+try:
+    # Query body is well over 64 bytes so the framing layer rejects it.
+    big_query = "SELECT " + ", ".join(["1"] * 50)  # ~150 bytes
+    co.execute(big_query)
+    co.fetchall()
+except Exception as e:
+    err_code_oversize = getattr(e, 'args', [None])[0]
+    err_msg_oversize = getattr(e, 'args', [None, None])[1] if len(getattr(e, 'args', [])) > 1 else str(e)
+ok("Oversize COM_QUERY returns MySQL error code 1153",
+   err_code_oversize == 1153, err_code_oversize)
+ok("Oversize COM_QUERY error message is the canonical max_allowed_packet message",
+   err_msg_oversize is not None and "max_allowed_packet" in str(err_msg_oversize),
+   err_msg_oversize)
+conn_oversize.close()
+
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 
 print("\n[Connectivity]")

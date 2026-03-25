@@ -33,13 +33,13 @@ use super::result::serialize_query_result_multi_warn;
 use super::status::{ConnectedGuard, RunningGuard, SqlCommandClass};
 use super::{
     auth::{gen_challenge, is_allowed_user, verify_native_password, verify_sha256_password},
-    codec::MySqlCodec,
+    codec::{MySqlCodec, MySqlCodecError},
     database::Database,
     error::dberror_to_mysql,
     json_error::build_json_error,
     packets::{
-        build_auth_more_data, build_err_packet, build_ok_packet, build_server_greeting,
-        parse_handshake_response,
+        build_auth_more_data, build_err_packet, build_ok_packet, build_packet_too_large_err,
+        build_server_greeting, parse_handshake_response,
     },
     prepared::{
         build_prepare_response, parse_execute_packet, substitute_params, substitute_params_in_ast,
@@ -48,6 +48,9 @@ use super::{
     session::ConnectionState,
     status::StatusRegistry,
 };
+
+/// Packets returned by `intercept_special_query`: a sequence of `(seq_id, payload)` pairs.
+type InterceptResult = Result<Option<Vec<(u8, Vec<u8>)>>, DbError>;
 
 /// Builds an ERR packet for a database error that occurred while processing `sql`.
 ///
@@ -79,8 +82,13 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
     info!(conn_id, %peer, "connection accepted");
 
     let (reader, writer) = stream.into_split();
-    let mut reader = FramedRead::new(reader, MySqlCodec);
-    let mut writer = FramedWrite::new(writer, MySqlCodec);
+    // Decoder starts with the default 64 MiB limit; synced to the session
+    // value after auth and after every SET max_allowed_packet.
+    let mut reader = FramedRead::new(
+        reader,
+        MySqlCodec::new(super::session::ConnectionState::DEFAULT_MAX_ALLOWED_PACKET),
+    );
+    let mut writer = FramedWrite::new(writer, MySqlCodec::default());
 
     // ── Phase 1: Send Server Greeting ─────────────────────────────────────────
     // Advertise caching_sha2_password for MySQL 8.0+ client compatibility.
@@ -94,6 +102,12 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
     // ── Phase 2: Receive HandshakeResponse41 ──────────────────────────────────
     let (_, payload) = match reader.next().await {
         Some(Ok(p)) => p,
+        Some(Err(MySqlCodecError::PacketTooLarge { .. })) => {
+            // Oversized handshake — send 1153 and close before attempting auth.
+            let err = build_packet_too_large_err();
+            let _ = writer.send((2u8, err.as_slice())).await;
+            return;
+        }
         _ => {
             warn!(conn_id, "client disconnected during handshake");
             return;
@@ -157,6 +171,11 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
         // Read the empty ack from the client (seq=3) before sending OK.
         match reader.next().await {
             Some(Ok(_)) => {}
+            Some(Err(MySqlCodecError::PacketTooLarge { .. })) => {
+                let err = build_packet_too_large_err();
+                let _ = writer.send((4u8, err.as_slice())).await;
+                return;
+            }
             _ => return, // client disconnected
         }
 
@@ -200,9 +219,23 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
         conn_state.current_database = db.clone();
     }
 
+    // Sync decoder limit to the session value after auth.  The session default
+    // matches the codec default (67 108 864), but a future SET may change it.
+    reader.decoder_mut().set_max_payload_len(
+        conn_state
+            .max_allowed_packet_bytes()
+            .unwrap_or(ConnectionState::DEFAULT_MAX_ALLOWED_PACKET),
+    );
+
     loop {
         let (_, payload) = match reader.next().await {
             Some(Ok(p)) => p,
+            Some(Err(MySqlCodecError::PacketTooLarge { .. })) => {
+                // Connection stream is unsalvageable — send error then close.
+                let err = build_packet_too_large_err();
+                let _ = writer.send((1u8, err.as_slice())).await;
+                break;
+            }
             Some(Err(e)) => {
                 debug!(conn_id, err = %e, "read error");
                 break;
@@ -256,20 +289,37 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 debug!(conn_id, %sql, "COM_QUERY");
 
                 // Intercept queries that ORMs/clients send automatically on connect.
-                if let Some(packets) = intercept_special_query(sql, &mut conn_state, &status) {
-                    // Sync session autocommit flag after SET statements so that the
-                    // executor respects the new mode on the next DML statement.
-                    session.autocommit = conn_state.autocommit;
-                    // Count Questions + Com_* for intercepted single-statement queries.
-                    // SHOW/SET statements count as Questions but not as Com_select/insert.
-                    let class = SqlCommandClass::from_sql(sql);
-                    bump_statement_counters(&status, &mut conn_state.session_status, class);
-                    let nbytes = wire_size(&packets);
-                    if send_packets(&mut writer, &packets).await.is_err() {
-                        break;
+                match intercept_special_query(sql, &mut conn_state, &status) {
+                    Ok(Some(packets)) => {
+                        // Sync session autocommit flag after SET statements so that the
+                        // executor respects the new mode on the next DML statement.
+                        session.autocommit = conn_state.autocommit;
+                        // Sync decoder limit after SET max_allowed_packet.
+                        reader.decoder_mut().set_max_payload_len(
+                            conn_state
+                                .max_allowed_packet_bytes()
+                                .unwrap_or(ConnectionState::DEFAULT_MAX_ALLOWED_PACKET),
+                        );
+                        let class = SqlCommandClass::from_sql(sql);
+                        bump_statement_counters(&status, &mut conn_state.session_status, class);
+                        let nbytes = wire_size(&packets);
+                        if send_packets(&mut writer, &packets).await.is_err() {
+                            break;
+                        }
+                        bump_bytes_sent(nbytes, &status, &mut conn_state.session_status);
+                        continue;
                     }
-                    bump_bytes_sent(nbytes, &status, &mut conn_state.session_status);
-                    continue;
+                    Ok(None) => {} // fall through to engine
+                    Err(e) => {
+                        // Validation error (e.g., invalid SET max_allowed_packet value).
+                        let pkt = build_query_err_packet(&e, sql, &conn_state);
+                        let err_bytes = pkt.len() as u64 + 4;
+                        if writer.send((1u8, pkt.as_slice())).await.is_err() {
+                            break;
+                        }
+                        bump_bytes_sent(err_bytes, &status, &mut conn_state.session_status);
+                        continue;
+                    }
                 }
 
                 // Split on ';' to support multi-statement COM_QUERY (Phase 5.12).
@@ -290,24 +340,40 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     // Classify statement for counter updates.
                     let class = SqlCommandClass::from_sql(stmt_sql);
 
-                    if let Some(packets) =
-                        intercept_special_query(stmt_sql, &mut conn_state, &status)
-                    {
-                        session.autocommit = conn_state.autocommit;
-                        bump_statement_counters(&status, &mut conn_state.session_status, class);
-                        let nbytes = wire_size(&packets);
-                        if send_packets(&mut writer, &packets).await.is_err() {
-                            connection_broken = true;
+                    match intercept_special_query(stmt_sql, &mut conn_state, &status) {
+                        Ok(Some(packets)) => {
+                            session.autocommit = conn_state.autocommit;
+                            reader.decoder_mut().set_max_payload_len(
+                                conn_state
+                                    .max_allowed_packet_bytes()
+                                    .unwrap_or(ConnectionState::DEFAULT_MAX_ALLOWED_PACKET),
+                            );
+                            bump_statement_counters(&status, &mut conn_state.session_status, class);
+                            let nbytes = wire_size(&packets);
+                            if send_packets(&mut writer, &packets).await.is_err() {
+                                connection_broken = true;
+                                break 'stmts;
+                            }
+                            bump_bytes_sent(nbytes, &status, &mut conn_state.session_status);
+                            if !packets.is_empty() {
+                                seq = packets
+                                    .last()
+                                    .map(|(s, _)| s.wrapping_add(1))
+                                    .unwrap_or(seq);
+                            }
+                            continue 'stmts;
+                        }
+                        Ok(None) => {} // fall through to engine
+                        Err(e) => {
+                            let pkt = build_query_err_packet(&e, stmt_sql, &conn_state);
+                            let err_bytes = pkt.len() as u64 + 4;
+                            if writer.send((seq, pkt.as_slice())).await.is_err() {
+                                connection_broken = true;
+                            } else {
+                                bump_bytes_sent(err_bytes, &status, &mut conn_state.session_status);
+                            }
                             break 'stmts;
                         }
-                        bump_bytes_sent(nbytes, &status, &mut conn_state.session_status);
-                        if !packets.is_empty() {
-                            seq = packets
-                                .last()
-                                .map(|(s, _)| s.wrapping_add(1))
-                                .unwrap_or(seq);
-                        }
-                        continue 'stmts;
                     }
 
                     bump_statement_counters(&status, &mut conn_state.session_status, class);
@@ -385,6 +451,10 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
             0x1f => {
                 session = SessionContext::new();
                 conn_state = ConnectionState::new();
+                // Restore the codec limit to the default after session reset.
+                reader
+                    .decoder_mut()
+                    .set_max_payload_len(ConnectionState::DEFAULT_MAX_ALLOWED_PACKET);
                 let ok = build_ok_packet(0, 0, 0);
                 if writer.send((1u8, ok.as_slice())).await.is_err() {
                     break;
@@ -709,7 +779,7 @@ fn intercept_special_query(
     sql: &str,
     conn_state: &mut ConnectionState,
     status: &Arc<StatusRegistry>,
-) -> Option<Vec<(u8, Vec<u8>)>> {
+) -> InterceptResult {
     use super::packets::build_ok_packet;
     use super::result::serialize_query_result;
     use axiomdb_sql::result::{ColumnMeta, QueryResult};
@@ -719,8 +789,8 @@ fn intercept_special_query(
 
     // ── SET statements ────────────────────────────────────────────────────────
     if lower.starts_with("set ") {
-        conn_state.apply_set(sql);
-        return Some(vec![(1u8, build_ok_packet(0, 0, 0))]);
+        conn_state.apply_set(sql)?;
+        return Ok(Some(vec![(1u8, build_ok_packet(0, 0, 0))]));
     }
 
     // ── SELECT @@variable (single-variable form) ──────────────────────────────
@@ -739,34 +809,34 @@ fn intercept_special_query(
             .unwrap_or("");
         // Let @@in_transaction fall through to database.execute_query().
         if varname == "in_transaction" {
-            return None;
+            return Ok(None);
         }
         if let Some(val) = conn_state.get_variable(varname) {
-            return Some(single_text_row(varname, &val));
+            return Ok(Some(single_text_row(varname, &val)));
         }
         // Unknown @@variable → return NULL (not an error)
-        return Some(single_null_row(varname));
+        return Ok(Some(single_null_row(varname)));
     }
 
     // ── SELECT version() / VERSION() ─────────────────────────────────────────
     if lower == "select version()" || lower.starts_with("select version()") {
-        return Some(single_text_row("version()", "8.0.36-AxiomDB-0.1.0"));
+        return Ok(Some(single_text_row("version()", "8.0.36-AxiomDB-0.1.0")));
     }
 
     // ── SELECT @@version mixed with other vars ────────────────────────────────
     if lower.contains("@@version") && !lower.contains("from ") {
-        return Some(single_text_row("@@version", "8.0.36-AxiomDB-0.1.0"));
+        return Ok(Some(single_text_row("@@version", "8.0.36-AxiomDB-0.1.0")));
     }
 
     // ── SELECT DATABASE() / current_database() ────────────────────────────────
     if lower.contains("database()") || lower.contains("current_database()") {
         if conn_state.current_database.is_empty() {
-            return Some(single_null_row("DATABASE()"));
+            return Ok(Some(single_null_row("DATABASE()")));
         }
-        return Some(single_text_row(
+        return Ok(Some(single_text_row(
             "DATABASE()",
             &conn_state.current_database.clone(),
-        ));
+        )));
     }
 
     // SHOW WARNINGS / SHOW ERRORS are handled in database.execute_query()
@@ -780,12 +850,12 @@ fn intercept_special_query(
             columns: cols,
             rows,
         };
-        return Some(serialize_query_result(qr, 1));
+        return Ok(Some(serialize_query_result(qr, 1)));
     }
 
     // ── SHOW VARIABLES ────────────────────────────────────────────────────────
     if lower.starts_with("show") && lower.contains("variables") {
-        return Some(show_variables_result(&lower, conn_state));
+        return Ok(Some(show_variables_result(&lower, conn_state)));
     }
 
     // ── SHOW [GLOBAL|SESSION|LOCAL] STATUS [LIKE '...'] (5.9c) ───────────────
@@ -793,7 +863,7 @@ fn intercept_special_query(
         use super::status::{build_status_rows, parse_show_status};
         if let Some(query) = parse_show_status(&lower) {
             let qr = build_status_rows(&query, status, &conn_state.session_status);
-            return Some(serialize_query_result(qr, 1));
+            return Ok(Some(serialize_query_result(qr, 1)));
         }
         // Unrecognised SHOW ... STATUS variant — return empty two-column rowset.
         let cols = vec![
@@ -804,7 +874,7 @@ fn intercept_special_query(
             columns: cols,
             rows: vec![],
         };
-        return Some(serialize_query_result(qr, 1));
+        return Ok(Some(serialize_query_result(qr, 1)));
     }
 
     // ── SHOW FULL PROCESSLIST ─────────────────────────────────────────────────
@@ -838,10 +908,10 @@ fn intercept_special_query(
             columns: cols,
             rows,
         };
-        return Some(serialize_query_result(qr, 1));
+        return Ok(Some(serialize_query_result(qr, 1)));
     }
 
-    None
+    Ok(None)
 }
 
 /// Builds a SHOW VARIABLES result filtered by the LIKE pattern in `lower`.

@@ -224,6 +224,20 @@ pub fn build_err_packet(error_code: u16, sql_state: &[u8; 5], message: &str) -> 
     buf
 }
 
+/// Builds the canonical `ER_NET_PACKET_TOO_LARGE` ERR packet (error 1153 /
+/// SQLSTATE `08S01`).
+///
+/// Returned when an inbound logical packet exceeds the connection's
+/// `max_allowed_packet` limit.  The connection must be closed after this
+/// packet is sent — the server cannot safely resume reading on the same stream.
+pub fn build_packet_too_large_err() -> Vec<u8> {
+    build_err_packet(
+        1153,
+        b"08S01",
+        "Got a packet bigger than 'max_allowed_packet' bytes",
+    )
+}
+
 // ── EOF Packet ────────────────────────────────────────────────────────────────
 
 /// Builds an EOF_Packet payload (used between column defs and rows, and after rows).

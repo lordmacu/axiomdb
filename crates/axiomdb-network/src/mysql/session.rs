@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 
+use axiomdb_core::error::DbError;
+
 use super::status::SessionStatus;
 
 // ── PreparedStatement ─────────────────────────────────────────────────────────
@@ -100,6 +102,13 @@ impl Default for ConnectionState {
 }
 
 impl ConnectionState {
+    /// Default inbound payload limit: 64 MiB.
+    ///
+    /// Must match `MySqlCodec::default()` in `codec.rs`.  Both values are
+    /// kept in sync by `handle_connection` after auth and after each
+    /// `SET max_allowed_packet`.
+    pub const DEFAULT_MAX_ALLOWED_PACKET: usize = 67_108_864;
+
     /// Creates a connection state with MySQL-compatible defaults and the
     /// given prepared-statement cache limit.
     pub fn new_with_limit(max_prepared_stmts: usize) -> Self {
@@ -142,15 +151,37 @@ impl ConnectionState {
         self.execute_seq
     }
 
+    /// Parses the current `max_allowed_packet` session value into a byte limit.
+    ///
+    /// Accepts a plain decimal integer or a quoted decimal integer (e.g., `'2048'`).
+    /// Returns `Err(DbError::InvalidValue)` for non-numeric or zero values.
+    pub fn max_allowed_packet_bytes(&self) -> Result<usize, DbError> {
+        let raw = self
+            .variables
+            .get("max_allowed_packet")
+            .map(|s| s.as_str())
+            .unwrap_or("67108864");
+        let stripped = raw.trim().trim_matches('\'').trim_matches('"');
+        stripped
+            .parse::<usize>()
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or_else(|| DbError::InvalidValue {
+                reason: format!("max_allowed_packet must be a positive integer, got '{raw}'"),
+            })
+    }
+
     /// Applies a SET statement, updating the relevant session variable.
     ///
-    /// Returns `true` if the statement was recognized (caller should send OK).
-    /// Returns `false` if it should be executed by the engine instead.
-    pub fn apply_set(&mut self, sql: &str) -> bool {
+    /// Returns `Ok(true)` if the statement was recognized (caller should send OK).
+    /// Returns `Ok(false)` if it should be executed by the engine instead.
+    /// Returns `Err(DbError::InvalidValue)` if the value for a validated variable
+    /// (currently only `max_allowed_packet`) is invalid — caller should send ERR.
+    pub fn apply_set(&mut self, sql: &str) -> Result<bool, DbError> {
         let trimmed = sql.trim();
         // Only handle SET statements.
         if !trimmed.to_ascii_lowercase().starts_with("set ") {
-            return false;
+            return Ok(false);
         }
         let rest = trimmed[4..].trim();
 
@@ -165,7 +196,7 @@ impl ConnectionState {
                 .trim_matches('"')
                 .to_string();
             self.character_set_client = charset;
-            return true;
+            return Ok(true);
         }
 
         // Parse: [@@session. | @@][varname] = value
@@ -186,15 +217,32 @@ impl ConnectionState {
                 "character_set_client" | "character_set_connection" | "character_set_results" => {
                     self.character_set_client = value;
                 }
+                "max_allowed_packet" => {
+                    // Validate before storing: must be a positive decimal integer.
+                    let candidate = raw_val.trim().trim_matches('\'').trim_matches('"');
+                    match candidate.parse::<usize>() {
+                        Ok(n) if n > 0 => {
+                            self.variables
+                                .insert("max_allowed_packet".to_string(), n.to_string());
+                        }
+                        _ => {
+                            return Err(DbError::InvalidValue {
+                                reason: format!(
+                                    "max_allowed_packet must be a positive integer, got '{raw_val}'"
+                                ),
+                            });
+                        }
+                    }
+                }
                 other => {
                     self.variables.insert(other.to_string(), value);
                 }
             }
-            return true;
+            return Ok(true);
         }
 
         // SET without '=' (e.g., SET TRANSACTION ...) — just accept
-        true
+        Ok(true)
     }
 
     /// Returns the value of a session variable by name.
@@ -294,7 +342,7 @@ mod tests {
     #[test]
     fn test_set_autocommit_false() {
         let mut s = ConnectionState::new();
-        assert!(s.apply_set("SET autocommit=0"));
+        assert!(s.apply_set("SET autocommit=0").unwrap());
         assert!(!s.autocommit);
         assert_eq!(s.get_variable("@@autocommit"), Some("0".into()));
     }
@@ -302,7 +350,7 @@ mod tests {
     #[test]
     fn test_set_names() {
         let mut s = ConnectionState::new();
-        assert!(s.apply_set("SET NAMES latin1"));
+        assert!(s.apply_set("SET NAMES latin1").unwrap());
         assert_eq!(s.character_set_client, "latin1");
         assert_eq!(
             s.get_variable("@@character_set_client"),
@@ -313,8 +361,49 @@ mod tests {
     #[test]
     fn test_set_session_variable() {
         let mut s = ConnectionState::new();
-        assert!(s.apply_set("SET @@session.time_zone = 'UTC'"));
+        assert!(s.apply_set("SET @@session.time_zone = 'UTC'").unwrap());
         assert_eq!(s.get_variable("time_zone"), Some("UTC".into()));
+    }
+
+    // ── Phase 5.4a: max_allowed_packet validation ─────────────────────────────
+
+    #[test]
+    fn test_set_max_allowed_packet_valid() {
+        let mut s = ConnectionState::new();
+        s.apply_set("SET max_allowed_packet = 2048").unwrap();
+        assert_eq!(s.max_allowed_packet_bytes().unwrap(), 2048);
+    }
+
+    #[test]
+    fn test_set_max_allowed_packet_quoted() {
+        let mut s = ConnectionState::new();
+        s.apply_set("SET max_allowed_packet = '4096'").unwrap();
+        assert_eq!(s.max_allowed_packet_bytes().unwrap(), 4096);
+    }
+
+    #[test]
+    fn test_set_max_allowed_packet_invalid_leaves_previous_limit() {
+        let mut s = ConnectionState::new();
+        s.apply_set("SET max_allowed_packet = 1024").unwrap();
+        let err = s.apply_set("SET max_allowed_packet = 'abc'").unwrap_err();
+        assert!(err.to_string().contains("max_allowed_packet"));
+        // Previous valid value must survive
+        assert_eq!(s.max_allowed_packet_bytes().unwrap(), 1024);
+    }
+
+    #[test]
+    fn test_set_max_allowed_packet_zero_is_invalid() {
+        let mut s = ConnectionState::new();
+        assert!(s.apply_set("SET max_allowed_packet = 0").is_err());
+    }
+
+    #[test]
+    fn test_max_allowed_packet_bytes_default() {
+        let s = ConnectionState::new();
+        assert_eq!(
+            s.max_allowed_packet_bytes().unwrap(),
+            ConnectionState::DEFAULT_MAX_ALLOWED_PACKET
+        );
     }
 
     #[test]

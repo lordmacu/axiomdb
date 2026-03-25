@@ -179,7 +179,7 @@
 - [x] 5.3 ✅ Authentication — mysql_native_password (SHA1-based); permissive mode (Phase 5); root/axiomdb accepted
 - [x] 5.3b ✅ caching_sha2_password — fast auth path (0x01 0x03 + ack read + OK at seq=4); pymysql default plugin works
 - [x] 5.4 ✅ COM_QUERY handler — receive SQL → parse → analyze → execute_with_ctx → respond; COM_PING/QUIT/INIT_DB; ORM query interception (SET, @@version, SHOW DATABASES)
-- [ ] 5.4a ⏳ max_allowed_packet enforcement — limit incoming packet size (default 64MB); reject with error if exceeded; prevent OOM from malicious or accidental query
+- [x] 5.4a ✅ max_allowed_packet enforcement — `MySqlCodec` stateful decoder with configurable `max_payload_len`; logical multi-packet reassembly (0xFFFFFF continuation fragments); `PacketTooLarge` error before buffer allocation; ERR 1153/08S01 + connection close on oversize; `SET max_allowed_packet` validated and syncs live decoder limit; `COM_RESET_CONNECTION` restores default; 12 codec unit tests + 6 wire assertions
 - [x] 5.5 ✅ Result set serialization — column_count + column_defs + EOF + rows (lenenc text) + EOF; all AxiomDB types mapped to MySQL type codes
 - [ ] 5.5a ⏳ Binary result encoding by type — MySQL binary protocol for prepared statements: DATE as `{year,month,day}`, DECIMAL as precision-exact string, BLOB as length-prefixed bytes, BIGINT as little-endian 8 bytes; without this types are corrupted in prepared statement results
 - [x] 5.6 ✅ Error packets — DbError → MySQL error code + SQLSTATE; full mapping for all error variants

@@ -380,7 +380,7 @@ assigned by incrementing `next_stmt_id` (starting at 1) and are local to the con
 removes the entry; subsequent `COM_STMT_EXECUTE` calls for the closed ID return an
 `Unknown prepared statement` error.
 
-#### Packet framing (codec.rs)
+#### Packet framing and size enforcement (codec.rs — subphase 5.4a)
 
 Every MySQL message in both directions — client to server and server to client — uses
 the same 4-byte envelope:
@@ -389,10 +389,49 @@ the same 4-byte envelope:
 [payload_length: u24 LE] [sequence_id: u8] [payload: payload_length bytes]
 ```
 
-`MySqlCodec` implements `tokio_util::codec::{Decoder, Encoder}`. The decoder buffers
-bytes until the full payload is available, then returns `(sequence_id, Bytes)`. The
-encoder writes the header and payload in a single `BytesMut` write — no separate
-syscall for the header.
+`MySqlCodec` implements `tokio_util::codec::{Decoder, Encoder}`. It holds a
+configurable `max_payload_len` (default 64 MiB) that matches the session variable
+`@@max_allowed_packet`.
+
+**Two-phase decoder algorithm:**
+
+1. **Scan phase** — walk physical packet headers without consuming bytes, accumulating
+   `total_payload`. If `total_payload > max_payload_len`, return
+   `MySqlCodecError::PacketTooLarge { actual, max }` before any buffer allocation.
+   If any fragment is missing, return `Ok(None)` (backpressure).
+2. **Consume phase** — advance the buffer and return `(seq_id, Bytes)`. For a single
+   physical fragment this is a zero-copy `split_to` into the existing `BytesMut`. For
+   multi-fragment logical packets one contiguous `BytesMut` is allocated with
+   `capacity = total_payload` to avoid per-fragment copies.
+
+**Multi-packet reassembly.** MySQL splits commands larger than 16,777,215 bytes
+(`0xFF_FFFF`) across multiple physical packets. A fragment with
+`payload_length = 0xFF_FFFF` signals continuation; the final fragment has
+`payload_length < 0xFF_FFFF`. The limit applies to the **reassembled logical payload**,
+not to each individual fragment.
+
+**Live per-connection limit.** `handle_connection` calls
+`reader.decoder_mut().set_max_payload_len(n)`:
+- After auth (from `conn_state.max_allowed_packet_bytes()`)
+- After a valid `SET max_allowed_packet = N`
+- After `COM_RESET_CONNECTION` (restores `DEFAULT_MAX_ALLOWED_PACKET`)
+
+**Oversize behavior.** On `PacketTooLarge`, the handler sends MySQL ERR
+`1153 / SQLSTATE 08S01` ("Got a packet bigger than 'max_allowed_packet' bytes") and
+breaks the connection loop. The stream is never re-used — re-synchronisation after an
+oversize packet is unsafe.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Framing-layer enforcement</span>
+The limit is enforced in <code>MySqlCodec::decode()</code>, before the payload reaches
+UTF-8 decoding, SQL parsing, or binary-protocol decoding. MySQL 8 and MariaDB enforce
+<code>max_allowed_packet</code> at the network I/O layer for the same reason: a SQL
+parser that receives an oversized payload has already spent memory allocating it.
+Rejecting at the codec boundary means zero heap allocation for oversized inputs.
+</div>
+</div>
 
 #### Result set serialization (result.rs)
 
