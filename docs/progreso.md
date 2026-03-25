@@ -207,7 +207,7 @@
 - [ ] ⚠️ PK B-Tree index population on INSERT — PK indexes created empty; FK uses full scan for parent lookup → deferred to 6.9
 - [x] 6.7 ✅ Partial UNIQUE index — `CREATE [UNIQUE] INDEX ... WHERE predicate`; predicate stored as SQL string in IndexDef; build/INSERT/UPDATE/DELETE filter by predicate; planner uses index only when query WHERE implies predicate; session cache invalidated after CoW B-Tree root change
 - [x] 6.8 ✅ Fill factor — `CREATE INDEX ... WITH (fillfactor=N)`; persisted in IndexDef (u8, default 90); BTree::insert_in threads fillfactor → split threshold = ceil(FF×ORDER_LEAF/100); backward-compat
-- [ ] 6.9 ⏳ FK and index tests — violations, cascades, restrictions
+- [x] 6.9 ✅ PK B-Tree population on INSERT; FK composite key index (fk_val|RecordId); composite index planner Rule 0; B-Tree range scan for FK enforcement
 - [ ] 6.10 ⏳ Index statistics bootstrap — on CREATE INDEX: count rows, estimate NDV (distinct values) per column; feeds query planner (6.3)
 - [ ] 6.11 ⏳ Auto-update statistics — recalculate stats when INSERT/DELETE exceeds configurable threshold (20% of table); avoids stale plans
 - [ ] 6.12 ⏳ ANALYZE SQL command — `ANALYZE [TABLE [column]]` to force manual statistics update

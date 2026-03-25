@@ -24,7 +24,36 @@ use axiomdb_index::BTree;
 use axiomdb_storage::StorageEngine;
 use axiomdb_types::Value;
 
+use axiomdb_index::page_layout::encode_rid;
+
 use crate::{eval::eval, eval::is_truthy, expr::Expr, key_encoding::encode_index_key};
+
+// ── FK composite key helpers ──────────────────────────────────────────────────
+
+/// Builds the B-Tree key for an FK auto-index entry (Phase 6.9).
+///
+/// Format: `encode_index_key(&[fk_val])` ++ `encode_rid(rid)` (10 bytes).
+/// Every entry is globally unique even when multiple rows share the same `fk_val`,
+/// following InnoDB's approach of appending the primary key as a tiebreaker.
+pub fn fk_composite_key(fk_val: &axiomdb_types::Value, rid: RecordId) -> Result<Vec<u8>, DbError> {
+    let mut key = encode_index_key(std::slice::from_ref(fk_val))?;
+    key.extend_from_slice(&encode_rid(rid));
+    Ok(key)
+}
+
+/// Returns `(lo, hi)` bounds for `BTree::range_in` to find all FK index entries
+/// with a given `fk_val`, regardless of which RecordId they point to.
+///
+/// `lo = prefix + [0x00; 10]` — smallest possible RecordId suffix.
+/// `hi = prefix + [0xFF; 10]` — largest possible RecordId suffix.
+pub fn fk_key_range(fk_val: &axiomdb_types::Value) -> Result<(Vec<u8>, Vec<u8>), DbError> {
+    let prefix = encode_index_key(std::slice::from_ref(fk_val))?;
+    let mut lo = prefix.clone();
+    lo.extend_from_slice(&[0u8; 10]);
+    let mut hi = prefix;
+    hi.extend_from_slice(&[0xFF; 10]);
+    Ok((lo, hi))
+}
 
 // ── indexes_for_table ─────────────────────────────────────────────────────────
 
@@ -72,7 +101,7 @@ pub fn insert_into_indexes(
     for (i, idx) in indexes
         .iter()
         .enumerate()
-        .filter(|(_, i)| !i.is_primary && !i.columns.is_empty())
+        .filter(|(_, i)| !i.columns.is_empty())
     {
         // Partial index predicate check (Phase 6.7).
         // compiled_preds[i] is None for full indexes OR when caller passes &[].
@@ -96,13 +125,20 @@ pub fn insert_into_indexes(
             continue;
         }
 
-        let key = encode_index_key(&key_vals)?;
+        // FK auto-indexes use composite keys: fk_val + RecordId (10 bytes).
+        // This makes every entry globally unique in the B-Tree even when multiple
+        // rows share the same FK value (InnoDB approach — Phase 6.9).
+        let key = if idx.is_fk_index {
+            fk_composite_key(&key_vals[0], rid)?
+        } else {
+            encode_index_key(&key_vals)?
+        };
 
-        // Uniqueness check.
-        if idx.is_unique && BTree::lookup_in(storage, idx.root_page_id, &key)?.is_some() {
-            // Use the index name as the key identifier (most readable without a
-            // catalog read) and the duplicate value as the column field.
-            // Message: "unique key violation on uq_email.alice@x.com"
+        // Uniqueness check — skip for FK auto-indexes (never unique by FK semantics).
+        if idx.is_unique
+            && !idx.is_fk_index
+            && BTree::lookup_in(storage, idx.root_page_id, &key)?.is_some()
+        {
             let dup_val = key_vals.first().map(|v| format!("{v}")).unwrap_or_default();
             return Err(DbError::UniqueViolation {
                 table: idx.name.clone(),
@@ -138,6 +174,7 @@ pub fn insert_into_indexes(
 pub fn delete_from_indexes(
     indexes: &[IndexDef],
     row: &[Value],
+    rid: RecordId,
     storage: &mut dyn StorageEngine,
     bloom: &mut crate::bloom::BloomRegistry,
     compiled_preds: &[Option<Expr>],
@@ -147,7 +184,7 @@ pub fn delete_from_indexes(
     for (i, idx) in indexes
         .iter()
         .enumerate()
-        .filter(|(_, i)| !i.is_primary && !i.columns.is_empty())
+        .filter(|(_, i)| !i.columns.is_empty())
     {
         // Partial index predicate check (Phase 6.7).
         if let Some(Some(pred)) = compiled_preds.get(i) {
@@ -166,10 +203,19 @@ pub fn delete_from_indexes(
             continue;
         }
 
-        let key = match encode_index_key(&key_vals) {
-            Ok(k) => k,
-            Err(DbError::IndexKeyTooLong { .. }) => continue, // row was never indexed
-            Err(e) => return Err(e),
+        // FK auto-indexes use composite keys; all others use plain encode_index_key.
+        let key = if idx.is_fk_index {
+            match fk_composite_key(&key_vals[0], rid) {
+                Ok(k) => k,
+                Err(DbError::IndexKeyTooLong { .. }) => continue,
+                Err(e) => return Err(e),
+            }
+        } else {
+            match encode_index_key(&key_vals) {
+                Ok(k) => k,
+                Err(DbError::IndexKeyTooLong { .. }) => continue,
+                Err(e) => return Err(e),
+            }
         };
 
         let root_pid = AtomicU64::new(idx.root_page_id);

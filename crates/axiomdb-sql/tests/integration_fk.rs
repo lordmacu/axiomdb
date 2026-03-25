@@ -97,9 +97,8 @@ fn test_create_table_persists_fk() {
 }
 
 #[test]
-fn test_create_table_fk_no_auto_index_phase_65() {
-    // Phase 6.5: FK auto-index creation is deferred (B-Tree can't handle
-    // duplicate keys in non-unique indexes). FK enforcement uses full scan.
+fn test_create_table_fk_has_composite_key_index() {
+    // Phase 6.9: FK auto-index is created with composite keys (fk_val | RecordId).
     let mut db = Db::new();
     setup!(
         db,
@@ -111,9 +110,20 @@ fn test_create_table_fk_no_auto_index_phase_65() {
     let orders = reader.get_table("public", "orders").unwrap().unwrap();
     let fks = reader.list_fk_constraints(orders.id).unwrap();
     assert_eq!(fks.len(), 1, "FK should be persisted in catalog");
-    assert_eq!(
+    assert_ne!(
         fks[0].fk_index_id, 0,
-        "fk_index_id should be 0 (no auto-index in Phase 6.5)"
+        "fk_index_id must be non-zero (auto-index created in 6.9)"
+    );
+
+    // The FK auto-index should be marked is_fk_index=true.
+    let indexes = reader.list_indexes(orders.id).unwrap();
+    let fk_idx = indexes
+        .iter()
+        .find(|i| i.index_id == fks[0].fk_index_id)
+        .unwrap();
+    assert!(
+        fk_idx.is_fk_index,
+        "FK auto-index must have is_fk_index=true"
     );
 }
 

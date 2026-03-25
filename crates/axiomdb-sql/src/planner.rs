@@ -70,14 +70,36 @@ pub fn plan_select(
         None => return AccessMethod::Scan,
     };
 
+    // ── Rule 0: composite equality (N ≥ 2 columns) ────────────────────────
+    // Must run before Rule 1 to prefer composite indexes over single-column.
+    if let Some(am) = plan_composite_eq(expr, indexes, columns) {
+        return am;
+    }
+
     // ── Rule 1: col = literal ─────────────────────────────────────────────
     if let Some((col_name, value)) = extract_eq_col_literal(expr) {
         if let Some(idx) = find_index_on_col(col_name, indexes, columns, Some(expr)) {
             if let Ok(key) = encode_index_key(&[value]) {
-                return AccessMethod::IndexLookup {
-                    index_def: idx.clone(),
-                    key,
-                };
+                if idx.columns.len() == 1 {
+                    // Single-column index: exact lookup (efficient, returns ≤ 1 row
+                    // for unique, possibly 1 row for non-unique due to B-Tree design).
+                    return AccessMethod::IndexLookup {
+                        index_def: idx.clone(),
+                        key,
+                    };
+                } else {
+                    // Composite index: the B-Tree keys include all N columns, so a
+                    // single-column lookup key is a prefix. Use range scan with
+                    // lo = prefix and hi = prefix + max suffix, so all rows matching
+                    // the leading column are returned.
+                    let mut hi = key.clone();
+                    hi.extend_from_slice(&[0xFF; crate::key_encoding::MAX_INDEX_KEY]);
+                    return AccessMethod::IndexRange {
+                        index_def: idx.clone(),
+                        lo: Some(key),
+                        hi: Some(hi),
+                    };
+                }
             }
         }
     }
@@ -94,6 +116,79 @@ pub fn plan_select(
     }
 
     AccessMethod::Scan
+}
+
+// ── Rule 0: composite equality planner ───────────────────────────────────────
+
+/// Collects all atomic `col = literal` equality conditions reachable via
+/// AND-clauses in `expr`. Stops at OR, NOT, or any non-equality operator.
+fn collect_eq_conditions(expr: &Expr) -> Vec<(&str, Value)> {
+    match expr {
+        Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            let mut v = collect_eq_conditions(left);
+            v.extend(collect_eq_conditions(right));
+            v
+        }
+        other => extract_eq_col_literal(other).into_iter().collect(),
+    }
+}
+
+/// Rule 0: try to match WHERE AND-clauses to the leading columns of a composite
+/// index (≥ 2 columns). Returns `IndexRange { lo=hi=composite_key }` if a
+/// composite match with at least 2 columns is found.
+///
+/// `IndexRange lo=hi` is used instead of `IndexLookup` because composite
+/// non-unique indexes may have multiple rows per composite key — range scan
+/// correctly returns all of them, while `lookup_in` only returns one.
+fn plan_composite_eq(
+    expr: &Expr,
+    indexes: &[IndexDef],
+    columns: &[ColumnDef],
+) -> Option<AccessMethod> {
+    use crate::key_encoding::encode_index_key;
+
+    let eq_conds = collect_eq_conditions(expr);
+    if eq_conds.len() < 2 {
+        return None; // single-column → Rule 1 handles it
+    }
+
+    for idx in indexes.iter().filter(|i| {
+        // Skip primary, FK auto-indexes, single-column indexes, partial indexes.
+        !i.is_primary && !i.is_fk_index && i.columns.len() >= 2 && i.predicate.is_none()
+    }) {
+        let mut key_parts: Vec<Value> = Vec::new();
+
+        // Try to match leading columns of the index to equality conditions.
+        // Stops at the first unmatched column (prefix property).
+        for idx_col in &idx.columns {
+            let col_name = columns
+                .iter()
+                .find(|c| c.col_idx == idx_col.col_idx)
+                .map(|c| c.name.as_str())?;
+
+            match eq_conds.iter().find(|(name, _)| *name == col_name) {
+                Some((_, val)) => key_parts.push(val.clone()),
+                None => break, // gap in leading columns — can't use this index
+            }
+        }
+
+        if key_parts.len() >= 2 {
+            if let Ok(key) = encode_index_key(&key_parts) {
+                // Also check partial index predicate implication (same as Rule 1).
+                // For Phase 6.9, we already filtered out partial indexes above (predicate.is_none()).
+                return Some(AccessMethod::IndexRange {
+                    index_def: idx.clone(),
+                    lo: Some(key.clone()),
+                    hi: Some(key),
+                });
+            }
+        }
+    }
+    None
 }
 
 // ── Helper: extract col = literal from WHERE ─────────────────────────────────
@@ -136,6 +231,11 @@ fn find_index_on_col<'a>(
     // predicate (if any) is implied by the query WHERE clause.
     indexes.iter().find(|idx| {
         if idx.is_primary {
+            return false;
+        }
+        // FK auto-indexes use composite keys (fk_val | RecordId) — never usable
+        // for plain SELECT column = value lookups.
+        if idx.is_fk_index {
             return false;
         }
         if idx.columns.first().map(|c| c.col_idx) != Some(col_idx) {
@@ -255,6 +355,7 @@ mod tests {
             }],
             predicate: None,
             fillfactor: 90,
+            is_fk_index: false,
         }
     }
 
@@ -338,6 +439,7 @@ mod tests {
             columns: vec![], // old format — no column info
             predicate: None,
             fillfactor: 90,
+            is_fk_index: false,
         };
         let expr = Expr::BinaryOp {
             op: BinaryOp::Eq,

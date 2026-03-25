@@ -499,6 +499,15 @@ fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
         .collect()
 }
 
+/// Decodes a raw row byte slice into a `Vec<Value>` using column definitions.
+///
+/// Public helper for modules (e.g., `fk_enforcement`) that read rows from the
+/// heap and need to decode them without going through `scan_table`.
+pub fn decode_row_from_bytes(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<Value>, DbError> {
+    let col_types = column_data_types(columns);
+    decode_row(bytes, &col_types)
+}
+
 /// Encodes a `RecordId` as a 10-byte WAL key: `[page_id:8 LE][slot_id:2 LE]`.
 fn encode_rid(page_id: u64, slot_id: u16) -> [u8; 10] {
     let mut buf = [0u8; 10];

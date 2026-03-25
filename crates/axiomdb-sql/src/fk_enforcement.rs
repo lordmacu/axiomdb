@@ -58,7 +58,7 @@ pub fn check_fk_child_insert(
     if foreign_keys.is_empty() {
         return Ok(());
     }
-    let _ = bloom; // Bloom not yet used for FK parent lookup — see TODO in module.
+    // Bloom is now used for FK parent lookup (Phase 6.9: PK B-Trees populated).
 
     let snap = txn.active_snapshot()?;
 
@@ -75,7 +75,7 @@ pub fn check_fk_child_insert(
         // Find the parent's PRIMARY KEY or UNIQUE index covering parent_col_idx.
         // We use a block scope so the reader (which holds &storage) is dropped
         // before any call that needs &mut storage.
-        let (is_primary, parent_index_root) = {
+        let (parent_index_id, parent_index_root) = {
             let mut reader = CatalogReader::new(storage, snap)?;
             let parent_indexes = reader.list_indexes(fk.parent_table_id)?;
             let parent_idx = parent_indexes
@@ -93,43 +93,23 @@ pub fn check_fk_child_insert(
                         column: cname,
                     }
                 })?;
-            (parent_idx.is_primary, parent_idx.root_page_id)
+            (parent_idx.index_id, parent_idx.root_page_id)
         }; // reader dropped here → &storage released
 
-        // Look up the parent key.
+        // Phase 6.9: PK B-Trees are now populated via insert_into_indexes
+        // (the `!is_primary` filter was removed). All index types use B-Tree lookup.
         //
-        // Primary key B-Tree indexes are created empty and are NOT populated
-        // during INSERT (insert_into_indexes skips primary indexes in Phase 6.5).
-        // For PK indexes → fall back to a full parent table scan.
-        //
-        // Non-primary UNIQUE indexes are populated via insert_into_indexes →
-        // B-Tree point lookup is correct and efficient.
-        //
-        // TODO Phase 6.9: populate PK B-Trees via insert_into_indexes and use
-        //   B-Tree + Bloom shortcut for all index types.
-        let parent_exists = if is_primary {
-            // Load parent table def + cols, then scan.
-            let (parent_table_def, parent_cols) = {
-                let mut reader = CatalogReader::new(storage, snap)?;
-                let tdef = reader.get_table_by_id(fk.parent_table_id)?.ok_or(
-                    DbError::CatalogTableNotFound {
-                        table_id: fk.parent_table_id,
-                    },
-                )?;
-                let pcols = reader.list_columns(fk.parent_table_id)?;
-                (tdef, pcols)
-            }; // reader dropped
-            let rows =
-                TableEngine::scan_table(storage, &parent_table_def, &parent_cols, snap, None)?;
-            rows.iter().any(|(_, row)| {
-                row.get(fk.parent_col_idx as usize)
-                    .map(|v| v == fk_val)
-                    .unwrap_or(false)
-            })
-        } else {
-            // Non-primary UNIQUE index — populated via insert_into_indexes.
-            BTree::lookup_in(storage, parent_index_root, &key)?.is_some()
-        };
+        // Bloom shortcut: if the filter says definitely absent, skip B-Tree entirely.
+        if !bloom.might_exist(parent_index_id, &key) {
+            let (tname, cname) = resolve_names(storage, snap, fk.child_table_id, fk.child_col_idx);
+            return Err(DbError::ForeignKeyViolation {
+                table: tname,
+                column: cname,
+                value: format!("{fk_val}"),
+            });
+        }
+
+        let parent_exists = BTree::lookup_in(storage, parent_index_root, &key)?.is_some();
 
         if !parent_exists {
             let (tname, cname) = resolve_names(storage, snap, fk.child_table_id, fk.child_col_idx);
@@ -253,17 +233,18 @@ pub fn enforce_fk_on_parent_delete(
             }
         }
 
-        // Find the FK index on the child (for RESTRICT fast path).
-        let fk_index_root: Option<u64> = {
+        // Find the FK auto-index on the child (Phase 6.9: composite key index).
+        // fk_index_id != 0 means a composite-key FK auto-index was created.
+        // fk_index_id == 0 means the user provided their own index (or pre-6.9 FK).
+        let fk_index_root: Option<u64> = if fk.fk_index_id != 0 {
             let mut reader = CatalogReader::new(storage, snap)?;
-            let child_indexes = reader.list_indexes(fk.child_table_id)?;
-            child_indexes
-                .iter()
-                .find(|i| {
-                    (fk.fk_index_id != 0 && i.index_id == fk.fk_index_id)
-                        || (!i.columns.is_empty() && i.columns[0].col_idx == fk.child_col_idx)
-                })
+            reader
+                .list_indexes(fk.child_table_id)?
+                .into_iter()
+                .find(|i| i.index_id == fk.fk_index_id)
                 .map(|i| i.root_page_id)
+        } else {
+            None // pre-6.9 FK or user-provided index — use full scan
         };
 
         for (_, parent_row) in deleted_rows {
@@ -276,15 +257,14 @@ pub fn enforce_fk_on_parent_delete(
                 continue;
             }
 
-            let parent_key = encode_index_key(std::slice::from_ref(parent_key_val))?;
-
             match fk.on_delete {
                 FkAction::NoAction | FkAction::Restrict => {
-                    // Fast path: use FK index for existence check if available.
+                    // Phase 6.9: use FK composite index for O(log n) existence check.
                     let has_child = if let Some(root) = fk_index_root {
-                        BTree::lookup_in(storage, root, &parent_key)?.is_some()
+                        let (lo, hi) = crate::index_maintenance::fk_key_range(parent_key_val)?;
+                        !BTree::range_in(storage, root, Some(&lo), Some(&hi))?.is_empty()
                     } else {
-                        // Slow path: full scan.
+                        // Pre-6.9 FK or user index: fall back to full scan.
                         children_exist_via_scan(
                             storage,
                             &child_table_def,
@@ -305,15 +285,36 @@ pub fn enforce_fk_on_parent_delete(
                 }
 
                 FkAction::Cascade => {
-                    // Full scan to find ALL children (BTree may miss duplicates).
-                    let child_rows = find_children_via_scan(
-                        storage,
-                        &child_table_def,
-                        &child_cols,
-                        fk.child_col_idx,
-                        parent_key_val,
-                        snap,
-                    )?;
+                    // Phase 6.9: use FK composite index range scan if available (O(log n + k)).
+                    // Falls back to full scan for pre-6.9 FKs (fk_index_id=0).
+                    let child_rows = if let Some(root) = fk_index_root {
+                        let (lo, hi) = crate::index_maintenance::fk_key_range(parent_key_val)?;
+                        let entries = BTree::range_in(storage, root, Some(&lo), Some(&hi))?;
+                        // Read full row values for each child (needed for index maintenance).
+                        let mut rows = Vec::with_capacity(entries.len());
+                        for (child_rid, _) in entries {
+                            let row_bytes = axiomdb_storage::heap_chain::HeapChain::read_row(
+                                storage,
+                                child_rid.page_id,
+                                child_rid.slot_id,
+                            )?;
+                            if let Some(bytes) = row_bytes {
+                                let vals =
+                                    crate::table::decode_row_from_bytes(&bytes, &child_cols)?;
+                                rows.push((child_rid, vals));
+                            }
+                        }
+                        rows
+                    } else {
+                        find_children_via_scan(
+                            storage,
+                            &child_table_def,
+                            &child_cols,
+                            fk.child_col_idx,
+                            parent_key_val,
+                            snap,
+                        )?
+                    };
 
                     if child_rows.is_empty() {
                         continue;
@@ -340,18 +341,23 @@ pub fn enforce_fk_on_parent_delete(
                     )?;
 
                     // Maintain secondary indexes on the child table.
-                    let secondary_indexes = {
+                    // IMPORTANT: update `current_secondary` in-memory after each row
+                    // to propagate CoW root changes. B-Tree delete is CoW: it frees
+                    // the old root page and allocates a new one. Without in-memory
+                    // updates, the next row's delete would use a freed page.
+                    let mut current_secondary = {
                         let mut reader = CatalogReader::new(storage, snap)?;
                         let all = reader.list_indexes(fk.child_table_id)?;
                         all.into_iter()
-                            .filter(|i| !i.is_primary && !i.columns.is_empty())
+                            .filter(|i| !i.columns.is_empty())
                             .collect::<Vec<_>>()
                     };
-                    if !secondary_indexes.is_empty() {
-                        for (_, child_row_vals) in &child_rows {
+                    if !current_secondary.is_empty() {
+                        for (child_rid, child_row_vals) in &child_rows {
                             let updated = crate::index_maintenance::delete_from_indexes(
-                                &secondary_indexes,
+                                &current_secondary,
                                 child_row_vals,
+                                *child_rid,
                                 storage,
                                 bloom,
                                 &[],
@@ -359,40 +365,69 @@ pub fn enforce_fk_on_parent_delete(
                             for (index_id, new_root) in updated {
                                 CatalogWriter::new(storage, txn)?
                                     .update_index_root(index_id, new_root)?;
+                                // Refresh in-memory roots so the next row uses the
+                                // correct (post-CoW) root page.
+                                if let Some(idx) = current_secondary
+                                    .iter_mut()
+                                    .find(|i| i.index_id == index_id)
+                                {
+                                    idx.root_page_id = new_root;
+                                }
                             }
                         }
                     }
                 }
 
                 FkAction::SetNull => {
-                    // Full scan to find ALL children.
-                    let child_rows = find_children_via_scan(
-                        storage,
-                        &child_table_def,
-                        &child_cols,
-                        fk.child_col_idx,
-                        parent_key_val,
-                        snap,
-                    )?;
+                    // Phase 6.9: same range-scan approach as CASCADE.
+                    let child_rows = if let Some(root) = fk_index_root {
+                        let (lo, hi) = crate::index_maintenance::fk_key_range(parent_key_val)?;
+                        let entries = BTree::range_in(storage, root, Some(&lo), Some(&hi))?;
+                        let mut rows = Vec::with_capacity(entries.len());
+                        for (child_rid, _) in entries {
+                            let row_bytes = axiomdb_storage::heap_chain::HeapChain::read_row(
+                                storage,
+                                child_rid.page_id,
+                                child_rid.slot_id,
+                            )?;
+                            if let Some(bytes) = row_bytes {
+                                let vals =
+                                    crate::table::decode_row_from_bytes(&bytes, &child_cols)?;
+                                rows.push((child_rid, vals));
+                            }
+                        }
+                        rows
+                    } else {
+                        find_children_via_scan(
+                            storage,
+                            &child_table_def,
+                            &child_cols,
+                            fk.child_col_idx,
+                            parent_key_val,
+                            snap,
+                        )?
+                    };
 
                     if child_rows.is_empty() {
                         continue;
                     }
 
-                    let secondary_indexes = {
+                    let mut current_secondary_sn = {
                         let mut reader = CatalogReader::new(storage, snap)?;
                         let all = reader.list_indexes(fk.child_table_id)?;
                         all.into_iter()
-                            .filter(|i| !i.is_primary && !i.columns.is_empty())
+                            .filter(|i| !i.columns.is_empty())
                             .collect::<Vec<_>>()
                     };
 
                     for (child_rid, child_row) in &child_rows {
                         // Delete old FK key from secondary indexes before update.
-                        if !secondary_indexes.is_empty() {
+                        // Update current_secondary_sn in-memory to avoid stale CoW roots.
+                        if !current_secondary_sn.is_empty() {
                             let del_updated = crate::index_maintenance::delete_from_indexes(
-                                &secondary_indexes,
+                                &current_secondary_sn,
                                 child_row,
+                                *child_rid,
                                 storage,
                                 bloom,
                                 &[],
@@ -400,6 +435,12 @@ pub fn enforce_fk_on_parent_delete(
                             for (index_id, new_root) in del_updated {
                                 CatalogWriter::new(storage, txn)?
                                     .update_index_root(index_id, new_root)?;
+                                if let Some(idx) = current_secondary_sn
+                                    .iter_mut()
+                                    .find(|i| i.index_id == index_id)
+                                {
+                                    idx.root_page_id = new_root;
+                                }
                             }
                         }
 
@@ -480,16 +521,16 @@ pub fn enforce_fk_on_parent_update(
             .map(|c| c.name.clone())
             .unwrap_or_else(|| format!("col_{}", fk.child_col_idx));
 
-        let fk_index_root: Option<u64> = {
+        // Use FK composite index if available (fk_index_id != 0), else fallback to scan.
+        let fk_index_root: Option<u64> = if fk.fk_index_id != 0 {
             let mut reader = CatalogReader::new(storage, snap)?;
-            let child_indexes = reader.list_indexes(fk.child_table_id)?;
-            child_indexes
-                .iter()
-                .find(|i| {
-                    (fk.fk_index_id != 0 && i.index_id == fk.fk_index_id)
-                        || (!i.columns.is_empty() && i.columns[0].col_idx == fk.child_col_idx)
-                })
+            reader
+                .list_indexes(fk.child_table_id)?
+                .into_iter()
+                .find(|i| i.index_id == fk.fk_index_id)
                 .map(|i| i.root_page_id)
+        } else {
+            None
         };
 
         for ((_, old_values), new_values) in old_rows.iter().zip(new_values_per_row.iter()) {
@@ -505,10 +546,10 @@ pub fn enforce_fk_on_parent_update(
                 continue;
             }
 
-            let old_parent_key = encode_index_key(std::slice::from_ref(old_key_val))?;
-
+            // Phase 6.9: use FK composite index range scan if available.
             let has_children = if let Some(root) = fk_index_root {
-                BTree::lookup_in(storage, root, &old_parent_key)?.is_some()
+                let (lo, hi) = crate::index_maintenance::fk_key_range(old_key_val)?;
+                !BTree::range_in(storage, root, Some(&lo), Some(&hi))?.is_empty()
             } else {
                 children_exist_via_scan(
                     storage,

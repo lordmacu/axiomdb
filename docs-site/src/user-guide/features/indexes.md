@@ -6,6 +6,38 @@ stored in the same `.db` file as the table data.
 
 ---
 
+## Composite Indexes
+
+A composite index covers two or more columns. The query planner uses it when
+the WHERE clause contains equality conditions on the leading columns.
+
+```sql
+CREATE INDEX idx_user_status ON orders(user_id, status);
+
+-- Uses composite index: both leading columns matched
+SELECT * FROM orders WHERE user_id = 42 AND status = 'active';
+
+-- Also uses index via prefix scan: leading column only
+SELECT * FROM orders WHERE user_id = 42;
+
+-- Does NOT use index: leading column absent from WHERE
+SELECT * FROM orders WHERE status = 'active';
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Prefix Scan for Leading Column</span>
+When only the leading column is in the WHERE clause, AxiomDB performs a B-Tree
+range scan (prefix scan) rather than an exact lookup. This correctly returns all
+rows matching the leading column, at the cost of a slightly wider range scan
+vs. a point lookup. PostgreSQL uses the same strategy for index scans on the
+leading column of a composite index.
+</div>
+</div>
+
+---
+
 ## Fill Factor
 
 Fill factor controls how full a B-Tree leaf page is allowed to get before it

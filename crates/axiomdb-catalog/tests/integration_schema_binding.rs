@@ -146,6 +146,7 @@ fn test_resolve_table_includes_indexes() {
             columns: vec![],
             predicate: None,
             fillfactor: 90,
+            is_fk_index: false,
         })
         .unwrap();
         w.create_index(IndexDef {
@@ -158,6 +159,7 @@ fn test_resolve_table_includes_indexes() {
             columns: vec![],
             predicate: None,
             fillfactor: 90,
+            is_fk_index: false,
         })
         .unwrap();
         tid
