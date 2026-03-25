@@ -177,6 +177,18 @@ impl MmapStorage {
             FreeList::from_bytes(bitmap_page.body(), page_count)
         };
 
+        // Verify every allocated page's checksum before accepting any traffic.
+        // Free pages are never written to and have no valid header; skip them.
+        // This surfaces partial writes caused by a crash mid-flush before the
+        // first query touches the corrupted page.
+        //
+        // O(page_count) is intentional: fail-fast on open is the explicit goal.
+        for page_id in 2..page_count {
+            if !freelist.is_free(page_id) {
+                Self::read_page_from_mmap(&mmap, page_id)?;
+            }
+        }
+
         info!(path = %path.display(), page_count, "database opened");
         debug!(
             free_pages = freelist.free_count(),
