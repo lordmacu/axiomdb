@@ -218,10 +218,13 @@ One phase at a time. When finishing each phase — **mandatory closing protocol:
 2. cargo clippy --workspace -- -D warnings with no errors
 3. cargo fmt --check with no differences
 4. Wire protocol smoke test — if the subphase touches anything observable
-   from a MySQL client (SQL execution, transactions, session variables,
-   wire protocol, error handling): build the server, connect with pymysql,
-   run a scenario that validates specifically what was implemented, report
-   results. Blocker if any assertion fails.
+   from a MySQL client: build the server, connect with pymysql and run TWO
+   things:
+   a) A scenario specific to what was implemented in this subphase
+      (proves the new feature works end-to-end through the wire).
+   b) The generic smoke test: python3 tools/smoke-test.py
+      (proves nothing existing broke).
+   Blocker if any assertion fails in either.
 5. Write docs/fase-N.md
 6. Update docs/progreso.md — mark subphase with [x] ✅ and parent phase with 🔄
 7. Update docs-site/ — update ALL pages affected by this subphase (see Documentation protocol below)
