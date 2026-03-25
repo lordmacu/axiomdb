@@ -2495,7 +2495,7 @@ fn eval_in(v: Value, list: &[Expr], row: &[Value]) -> Result<Value, DbError> {
 ///
 /// Algorithm: O(n·m) with backtracking, handles all patterns including
 /// multiple `%` without exponential blowup.
-pub(crate) fn like_match(text: &str, pattern: &str) -> bool {
+pub fn like_match(text: &str, pattern: &str) -> bool {
     let text: Vec<char> = text.chars().collect();
     let pat: Vec<char> = pattern.chars().collect();
     let (n, m) = (text.len(), pat.len());

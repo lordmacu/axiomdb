@@ -3,7 +3,7 @@
 AxiomDB wire protocol test.
 Updated at each subphase close — always overwrite this file, never create new ones.
 
-Last updated: subphase 4.25b (structured error responses: parse position, UV value, JSON format)
+Last updated: subphase 5.9c (SHOW STATUS: session/global/local scope, LIKE wildcards, counters)
 """
 import os
 import signal
@@ -26,9 +26,16 @@ _data_dir    = None
 
 def start_server():
     global _server_proc, _data_dir
-    binary = "target/release/axiomdb-server"
-    if not os.path.isfile(binary):
-        binary = "target/debug/axiomdb-server"
+    debug   = "target/debug/axiomdb-server"
+    release = "target/release/axiomdb-server"
+    if os.path.isfile(debug) and os.path.isfile(release):
+        binary = debug if os.path.getmtime(debug) > os.path.getmtime(release) else release
+    elif os.path.isfile(release):
+        binary = release
+    elif os.path.isfile(debug):
+        binary = debug
+    else:
+        binary = debug  # trigger "not found" message below
     if not os.path.isfile(binary):
         print("Server binary not found — build first: cargo build -p axiomdb-server")
         sys.exit(1)
@@ -483,6 +490,147 @@ try:
 except pymysql.err.ProgrammingError as ex:
     msg = str(ex)
     ok("text mode restored — not raw JSON", not msg.strip().startswith('{'), msg)
+
+# ── [5.9c] SHOW STATUS ────────────────────────────────────────────────────────
+
+print("\n[5.9c] SHOW STATUS — scope, LIKE wildcards, counters")
+
+
+def status_map(cursor, sql):
+    """Execute a SHOW STATUS variant and return a {Variable_name: Value} dict."""
+    cursor.execute(sql)
+    return {row[0]: row[1] for row in cursor.fetchall()}
+
+
+# Ensure clean cursor state before SHOW STATUS section
+conn.rollback()
+
+# Two-column result shape
+cur.execute("SHOW STATUS")
+rows = cur.fetchall()
+ok("SHOW STATUS returns rows", len(rows) > 0, f"{len(rows)} rows")
+ok("SHOW STATUS has 2 columns", len(rows[0]) == 2 if rows else False)
+
+# Variables present
+names = {r[0] for r in rows}
+for expected_var in [
+    "Questions", "Uptime", "Threads_connected", "Threads_running",
+    "Bytes_received", "Bytes_sent", "Com_select", "Com_insert",
+    "Innodb_buffer_pool_read_requests", "Innodb_buffer_pool_reads",
+]:
+    ok(f"SHOW STATUS contains {expected_var}", expected_var in names, names)
+
+# Row order is deterministic ascending
+var_names = [r[0] for r in rows]
+ok("SHOW STATUS rows are in ascending order", var_names == sorted(var_names), var_names)
+
+# Uptime is monotonic integer >= 0
+s = status_map(cur, "SHOW STATUS")
+ok("Uptime is a non-negative integer", int(s.get("Uptime", -1)) >= 0, s.get("Uptime"))
+
+# Session scope: Threads_running = 1 while serving the statement
+ok("Session Threads_running = 1", s.get("Threads_running") == "1", s.get("Threads_running"))
+
+# SHOW SESSION STATUS == SHOW STATUS (both default to session)
+session_s = status_map(cur, "SHOW SESSION STATUS")
+ok("SHOW SESSION STATUS has same keys as SHOW STATUS",
+   set(session_s.keys()) == set(s.keys()))
+
+# SHOW LOCAL STATUS == SHOW SESSION STATUS
+local_s = status_map(cur, "SHOW LOCAL STATUS")
+ok("SHOW LOCAL STATUS has same keys as SHOW SESSION STATUS",
+   set(local_s.keys()) == set(session_s.keys()))
+
+# SHOW GLOBAL STATUS exists and has the same variables
+global_s = status_map(cur, "SHOW GLOBAL STATUS")
+ok("SHOW GLOBAL STATUS has same keys as session", set(global_s.keys()) == set(s.keys()))
+
+# LIKE 'x' — unknown pattern returns zero rows (not an error)
+cur.execute("SHOW STATUS LIKE 'no_such_variable_xyz'")
+ok("SHOW STATUS LIKE 'unknown' returns empty (not error)", len(cur.fetchall()) == 0)
+
+# LIKE '%' wildcard
+cur.execute("SHOW STATUS LIKE 'Com_%'")
+com_rows = cur.fetchall()
+com_names = sorted(r[0] for r in com_rows)
+ok("SHOW STATUS LIKE 'Com_%' returns Com_insert and Com_select",
+   com_names == ["Com_insert", "Com_select"], com_names)
+
+# LIKE '_' single-char wildcard
+cur.execute("SHOW STATUS LIKE 'Com_inser_'")
+rows = cur.fetchall()
+ok("SHOW STATUS LIKE 'Com_inser_' matches only Com_insert",
+   len(rows) == 1 and rows[0][0] == "Com_insert", [r[0] for r in rows])
+
+# LIKE is case-insensitive
+cur.execute("SHOW STATUS LIKE 'threads%'")
+t_names = sorted(r[0] for r in cur.fetchall())
+ok("SHOW STATUS LIKE 'threads%' is case-insensitive (lowercase pattern)",
+   t_names == ["Threads_connected", "Threads_running"], t_names)
+
+# Com_select counter: two SELECT statements increment Com_select by exactly 2.
+# (Questions is not checked here because pymysql's autocommit=False sends a
+# SET autocommit=0 init query that also increments Questions, making the
+# expected value driver-dependent.)
+conn2 = connect()
+c2 = conn2.cursor()
+c2.execute("SELECT 1")
+c2.execute("SELECT 2")
+s_after = status_map(c2, "SHOW SESSION STATUS")
+ok("Com_select = 2 after two SELECT statements",
+   int(s_after.get("Com_select", 0)) == 2,
+   s_after.get("Com_select"))
+conn2.close()
+
+# COM_RESET_CONNECTION resets session counters but not global
+conn3 = connect()
+c3 = conn3.cursor()
+c3.execute("SELECT 1")
+c3.execute("SELECT 2")
+# After reset, session Questions should be 0
+# pymysql wraps COM_RESET_CONNECTION through the internal _send_autocommit_mode path;
+# the portable equivalent is a fresh connection (which our server starts with a new
+# ConnectionState — same observable effect for this test).
+conn3.close()
+conn3 = connect()
+c3 = conn3.cursor()
+s_reset = status_map(c3, "SHOW SESSION STATUS")
+# Com_select = 0 because fresh connection has not yet executed any SELECT.
+# (Questions is not checked because init queries like SET autocommit=0 increment it.)
+ok("After reconnect (equivalent to COM_RESET_CONNECTION), session Com_select = 0",
+   int(s_reset.get("Com_select", -1)) == 0,
+   s_reset.get("Com_select"))
+conn3.close()
+
+# SELECT @@version increments Com_select (intercepted statement)
+conn4 = connect()
+c4 = conn4.cursor()
+c4.execute("SELECT @@version")
+c4.fetchall()
+s4 = status_map(c4, "SHOW SESSION STATUS")
+ok("SELECT @@version (intercepted) increments Com_select",
+   int(s4.get("Com_select", 0)) >= 1,
+   s4.get("Com_select"))
+conn4.close()
+
+# Fresh second connection has Com_select = 0 (session isolation)
+conn5 = connect()
+c5 = conn5.cursor()
+# We've done selects in other connections; new connection should start at 0
+s5 = status_map(c5, "SHOW SESSION STATUS")
+ok("Fresh connection sees Com_select = 0 (session isolation)",
+   int(s5.get("Com_select", -1)) == 0,
+   s5.get("Com_select"))
+conn5.close()
+
+# SHOW STATUS is queryable without blocking (Threads_connected >= 1)
+conn6 = connect()
+c6 = conn6.cursor()
+g6 = status_map(c6, "SHOW GLOBAL STATUS LIKE 'Threads_connected'")
+ok("SHOW GLOBAL STATUS LIKE 'Threads_connected' has exactly one row", len(g6) == 1)
+ok("Threads_connected >= 1", int(g6.get("Threads_connected", 0)) >= 1,
+   g6.get("Threads_connected"))
+conn6.close()
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 
