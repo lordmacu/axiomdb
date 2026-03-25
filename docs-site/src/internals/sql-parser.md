@@ -567,6 +567,105 @@ Uses byte positions (safe for all ASCII date strings) and avoids allocations.
 
 ---
 
+## GROUP_CONCAT Parsing
+
+`GROUP_CONCAT` cannot be represented as a plain `Expr::Function { args: Vec<Expr> }` because
+its interior grammar — `[DISTINCT] expr [ORDER BY ...] [SEPARATOR 'str']` — is not a
+standard argument list. It gets its own AST variant and a dedicated parser branch.
+
+### The `Expr::GroupConcat` Variant
+
+```rust
+pub enum Expr {
+    // ...
+    GroupConcat {
+        expr: Box<Expr>,
+        distinct: bool,
+        order_by: Vec<(Expr, SortOrder)>,
+        separator: String,          // defaults to ","
+    },
+}
+```
+
+The variant stores the sub-expression to concatenate, the deduplication flag, an ordered
+list of `(sort_key_expr, direction)` pairs, and the separator string.
+
+### `Token::Separator` — Disambiguating the Keyword
+
+`SEPARATOR` is not a reserved word in standard SQL, so the lexer could produce either
+`Token::Ident("SEPARATOR")` or a dedicated `Token::Separator`. AxiomDB uses the
+dedicated token so that the ORDER BY loop inside `parse_group_concat` can stop cleanly:
+
+```rust
+// In the ORDER BY loop — stop if we see SEPARATOR or closing paren
+if matches!(p.peek(), Token::Separator | Token::RParen) {
+    break;
+}
+```
+
+Without the dedicated token, the parser would need to look ahead through a comma and an
+identifier to decide whether the comma ends the ORDER BY clause or separates two sort
+keys.
+
+### `parse_group_concat` — The Parser Branch
+
+Invoked when `parse_ident_or_call` encounters `group_concat` (case-insensitive):
+
+```
+parse_group_concat:
+  consume '('
+  if DISTINCT: set distinct=true, advance
+  parse_expr() → sub-expression
+  if ORDER BY:
+    loop:
+      parse_expr() → sort key
+      optional ASC|DESC → direction
+      if peek == SEPARATOR or RParen: break
+      else: consume ','
+  if SEPARATOR:
+    consume SEPARATOR
+    consume StringLit(s) → separator string
+  consume ')'
+  return Expr::GroupConcat { expr, distinct, order_by, separator }
+```
+
+### `string_agg` — PostgreSQL Alias
+
+`string_agg(expr, separator_literal)` is parsed in the same branch with simplified
+logic: two arguments separated by a comma, the second being a string literal that
+becomes the `separator` field. `distinct` is `false` and `order_by` is empty.
+
+```sql
+-- These are equivalent:
+SELECT GROUP_CONCAT(name SEPARATOR ', ')   FROM t;
+SELECT string_agg(name, ', ')              FROM t;
+```
+
+### Aggregate Execution in the Executor
+
+At execution time, `Expr::GroupConcat` is handled by an `AggAccumulator::GroupConcat`
+variant. Each row accumulates `(value_string, sort_key_values)`. At finalize:
+
+1. Sort by the `order_by` key vector using `compare_values_null_last` — a type-aware
+   comparator that sorts integers numerically and text lexicographically.
+2. If `DISTINCT`: deduplicate by value string.
+3. Join with separator, truncate at 1 MB.
+4. Return `Value::Null` if no non-NULL values were accumulated.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Dedicated AST Variant</span>
+MySQL's <code>GROUP_CONCAT</code> syntax is structurally different from a regular function call:
+it embeds its own <code>ORDER BY</code> and uses a keyword (<code>SEPARATOR</code>) as a
+positional argument delimiter. Forcing it into <code>Expr::Function { args }</code> would
+require post-parse AST surgery to extract the separator and ORDER BY. A dedicated variant
+keeps parsing and execution logic clean and makes semantic analysis and partial-index rejection straightforward.
+</div>
+</div>
+
+---
+
 ## Error Reporting
 
 Parse errors include the position (byte offset) where the unexpected token was found:

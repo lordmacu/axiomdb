@@ -149,16 +149,17 @@ pub fn resolve_predicate_columns(expr: Expr, col_defs: &[ColumnDef]) -> Result<E
                 .map(|e| resolve_predicate_columns(e, col_defs))
                 .collect::<Result<_, _>>()?,
         }),
-        // Subqueries, correlated references, CASE, etc. cannot appear in a
-        // partial index predicate — reject them clearly at CREATE INDEX time.
+        // Subqueries, correlated references, CASE, aggregates, etc. cannot appear
+        // in a partial index predicate — reject them clearly at CREATE INDEX time.
         Expr::Subquery(_)
         | Expr::InSubquery { .. }
         | Expr::Exists { .. }
         | Expr::OuterColumn { .. }
         | Expr::Param { .. }
         | Expr::Case { .. }
-        | Expr::Cast { .. } => Err(DbError::NotImplemented {
-            feature: "partial index predicate: unsupported expression (subquery/CASE/param/cast)"
+        | Expr::Cast { .. }
+        | Expr::GroupConcat { .. } => Err(DbError::NotImplemented {
+            feature: "partial index predicate: unsupported expression (subquery/CASE/param/cast/aggregate)"
                 .into(),
         }),
     }

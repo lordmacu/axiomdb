@@ -247,6 +247,11 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
                  called before executing a prepared statement"
             ),
         }),
+
+        // GroupConcat is only valid as an aggregate — never reached by scalar eval.
+        Expr::GroupConcat { .. } => Err(DbError::InvalidValue {
+            reason: "GROUP_CONCAT can only be used as an aggregate function".into(),
+        }),
     }
 }
 
@@ -479,6 +484,11 @@ pub fn eval_with<R: SubqueryRunner>(
             let has_rows = matches!(&result, QueryResult::Rows { rows, .. } if !rows.is_empty());
             Ok(Value::Bool(if *negated { !has_rows } else { has_rows }))
         }
+
+        // GroupConcat is only valid as an aggregate — never reached by scalar eval_with.
+        Expr::GroupConcat { .. } => Err(DbError::InvalidValue {
+            reason: "GROUP_CONCAT can only be used as an aggregate function".into(),
+        }),
     }
 }
 

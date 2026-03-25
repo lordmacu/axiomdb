@@ -8,6 +8,8 @@
 
 use axiomdb_types::Value;
 
+use crate::ast::SortOrder;
+
 // ── Expr ──────────────────────────────────────────────────────────────────────
 
 /// A SQL expression tree node.
@@ -187,6 +189,31 @@ pub enum Expr {
     /// before the statement is executed. Reaching `eval_with` with an
     /// unsubstituted `Param` is a programming error.
     Param { idx: usize },
+
+    // ── Aggregate-specific forms ───────────────────────────────────────────────
+    /// `GROUP_CONCAT([DISTINCT] expr [ORDER BY e [ASC|DESC], ...] [SEPARATOR 'str'])`
+    ///
+    /// Concatenates values from a group into a single text string.
+    /// MySQL-compatible syntax; `string_agg(expr, sep)` is an alias (PostgreSQL form).
+    ///
+    /// - NULL values are silently skipped.
+    /// - Empty group (or all-NULL group) returns `Value::Null`.
+    /// - Result is truncated at 1,048,576 bytes (`group_concat_max_len`).
+    ///
+    /// Only valid as an aggregate in a grouped or implicitly-grouped SELECT.
+    /// Reaching `eval()` with this variant (outside aggregate context) returns
+    /// `DbError::InvalidValue`.
+    GroupConcat {
+        /// The expression to evaluate and concatenate per row (coerced to TEXT).
+        expr: Box<Expr>,
+        /// If true, duplicate values are removed before concatenation.
+        distinct: bool,
+        /// Optional per-aggregate ORDER BY: list of `(sort_expr, direction)`.
+        /// Values are sorted by these keys before concatenation.
+        order_by: Vec<(Expr, SortOrder)>,
+        /// String placed between consecutive values. Default: `","`.
+        separator: String,
+    },
 }
 
 // ── BinaryOp ──────────────────────────────────────────────────────────────────

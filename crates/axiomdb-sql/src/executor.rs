@@ -229,6 +229,21 @@ fn subst_expr(expr: Expr, outer_row: &[Value]) -> Expr {
             query: Box::new(substitute_outer(*query, outer_row)),
             negated,
         },
+        // GroupConcat: substitute outer column refs inside the concat expr and ORDER BY.
+        Expr::GroupConcat {
+            expr,
+            distinct,
+            order_by,
+            separator,
+        } => Expr::GroupConcat {
+            expr: Box::new(subst_expr(*expr, outer_row)),
+            distinct,
+            order_by: order_by
+                .into_iter()
+                .map(|(e, dir)| (subst_expr(e, outer_row), dir))
+                .collect(),
+            separator,
+        },
         // Leaf nodes — no substitution needed.
         other => other,
     }
@@ -1602,6 +1617,13 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
         Expr::InSubquery { expr, .. } => collect_column_refs(expr, mask),
         // Subquery and Exists reference inner scopes — do not recurse.
         Expr::Subquery(_) | Expr::Exists { .. } => {}
+        // GroupConcat: recurse into the concatenated expr and ORDER BY exprs.
+        Expr::GroupConcat { expr, order_by, .. } => {
+            collect_column_refs(expr, mask);
+            for (e, _) in order_by {
+                collect_column_refs(e, mask);
+            }
+        }
     }
 }
 
@@ -2355,6 +2377,8 @@ fn is_aggregate(name: &str) -> bool {
 /// Returns `true` if `expr` or any sub-expression is an aggregate call.
 fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
+        // GROUP_CONCAT is always an aggregate — detected via the dedicated AST variant.
+        Expr::GroupConcat { .. } => true,
         Expr::Function { name, .. } if is_aggregate(name.as_str()) => true,
         Expr::BinaryOp { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
         Expr::UnaryOp { operand, .. } => contains_aggregate(operand),
@@ -2406,31 +2430,86 @@ fn has_aggregates(items: &[SelectItem], having: &Option<Expr>) -> bool {
 /// Deduplicated: if `COUNT(*)` appears in both SELECT and HAVING, only one
 /// `AggExpr` is created and both share the same accumulator index.
 #[derive(Debug, Clone)]
-struct AggExpr {
-    /// Lowercase function name: "count", "sum", "min", "max", "avg".
-    name: String,
-    /// The argument expression. `None` for `COUNT(*)`.
-    arg: Option<Expr>,
-    /// Position in `GroupState::accumulators`. Preserved for diagnostics.
-    #[allow(dead_code)]
-    agg_idx: usize,
+enum AggExpr {
+    /// Standard aggregate: COUNT, SUM, MIN, MAX, AVG.
+    Simple {
+        /// Lowercase function name: "count", "sum", "min", "max", "avg".
+        name: String,
+        /// The argument expression. `None` for `COUNT(*)`.
+        arg: Option<Expr>,
+        /// Position in `GroupState::accumulators`. Preserved for diagnostics.
+        #[allow(dead_code)]
+        agg_idx: usize,
+    },
+    /// GROUP_CONCAT / string_agg aggregate.
+    GroupConcat {
+        /// Expression to evaluate and concatenate per row.
+        expr: Box<Expr>,
+        /// If true, deduplicate values before concatenating.
+        distinct: bool,
+        /// Per-aggregate ORDER BY: (sort_expr, direction) pairs.
+        order_by: Vec<(Expr, crate::ast::SortOrder)>,
+        /// Separator string (default `","`).
+        separator: String,
+        /// Position in `GroupState::accumulators`. Preserved for diagnostics.
+        #[allow(dead_code)]
+        agg_idx: usize,
+    },
 }
 
 impl AggExpr {
-    /// Returns `true` if this descriptor matches the given function call.
-    fn matches(&self, name: &str, args: &[Expr]) -> bool {
-        if self.name != name {
-            return false;
+    /// Returns the accumulator index for this aggregate.
+    #[allow(dead_code)]
+    fn agg_idx(&self) -> usize {
+        match self {
+            Self::Simple { agg_idx, .. } | Self::GroupConcat { agg_idx, .. } => *agg_idx,
         }
-        match (&self.arg, args.first()) {
-            // Both COUNT(*): arg = None, args is empty
-            (None, None) => args.is_empty(),
-            // Both have an argument — compare by col_idx if both are Column refs
-            (Some(Expr::Column { col_idx: a, .. }), Some(Expr::Column { col_idx: b, .. })) => {
-                a == b
+    }
+
+    /// Returns `true` if this descriptor matches the given simple function call.
+    fn matches_simple(&self, name: &str, args: &[Expr]) -> bool {
+        match self {
+            Self::Simple { name: n, arg, .. } => {
+                if n != name {
+                    return false;
+                }
+                match (arg, args.first()) {
+                    // Both COUNT(*): arg = None, args is empty
+                    (None, None) => args.is_empty(),
+                    // Both have an argument — compare by col_idx if both are Column refs
+                    (
+                        Some(Expr::Column { col_idx: a, .. }),
+                        Some(Expr::Column { col_idx: b, .. }),
+                    ) => a == b,
+                    _ => false,
+                }
             }
-            // One has an arg, the other doesn't
-            _ => false,
+            Self::GroupConcat { .. } => false,
+        }
+    }
+
+    /// Returns `true` if this descriptor matches the given GROUP_CONCAT call.
+    fn matches_group_concat(
+        &self,
+        gc_expr: &Expr,
+        distinct: bool,
+        order_by: &[(Expr, crate::ast::SortOrder)],
+        separator: &str,
+    ) -> bool {
+        match self {
+            Self::GroupConcat {
+                expr,
+                distinct: d,
+                order_by: ob,
+                separator: sep,
+                ..
+            } => {
+                expr.as_ref() == gc_expr
+                    && *d == distinct
+                    && ob == order_by
+                    && sep.as_str() == separator
+            }
+            Self::Simple { .. } => false,
         }
     }
 }
@@ -2438,13 +2517,41 @@ impl AggExpr {
 /// Walks `expr` and registers any aggregate function calls into `result`.
 fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
     match expr {
+        // GROUP_CONCAT: register as GroupConcat AggExpr and deduplicate.
+        // Do NOT recurse into `gc_expr` itself (it IS the aggregate root).
+        // Only recurse into ORDER BY sub-exprs (they could contain subqueries, etc.).
+        Expr::GroupConcat {
+            expr: gc_expr,
+            distinct,
+            order_by,
+            separator,
+        } => {
+            let already = result
+                .iter()
+                .any(|ae| ae.matches_group_concat(gc_expr, *distinct, order_by, separator));
+            if !already {
+                let idx = result.len();
+                result.push(AggExpr::GroupConcat {
+                    expr: gc_expr.clone(),
+                    distinct: *distinct,
+                    order_by: order_by.clone(),
+                    separator: separator.clone(),
+                    agg_idx: idx,
+                });
+            }
+            for (e, _) in order_by {
+                collect_agg_exprs_from(e, result);
+            }
+        }
         Expr::Function { name, args } if is_aggregate(name.as_str()) => {
             let arg = args.first().cloned();
             // Deduplicate: only add if not already registered.
-            let already = result.iter().any(|ae| ae.matches(name.as_str(), args));
+            let already = result
+                .iter()
+                .any(|ae| ae.matches_simple(name.as_str(), args));
             if !already {
                 let idx = result.len();
-                result.push(AggExpr {
+                result.push(AggExpr::Simple {
                     name: name.clone(),
                     arg,
                     agg_idx: idx,
@@ -2492,11 +2599,11 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
             }
         }
         Expr::Cast { expr, .. } => collect_agg_exprs_from(expr, result),
-        Expr::Literal(_)
-        | Expr::Column { .. }
-        | Expr::Like { .. }
-        | Expr::OuterColumn { .. }
-        | Expr::Param { .. } => {}
+        Expr::Like { expr, pattern, .. } => {
+            collect_agg_exprs_from(expr, result);
+            collect_agg_exprs_from(pattern, result);
+        }
+        Expr::Literal(_) | Expr::Column { .. } | Expr::OuterColumn { .. } | Expr::Param { .. } => {}
         // Aggregates inside a subquery belong to the inner query, not the outer.
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {}
     }
@@ -2533,37 +2640,70 @@ enum AggAccumulator {
     Max { acc: Option<Value> },
     /// `AVG(col)` — running sum + count; final = sum / count as Real.
     Avg { sum: Value, count: u64 },
+    /// `GROUP_CONCAT(...)` — accumulates `(text_value, sort_key_values)` per row.
+    GroupConcat {
+        /// Accumulated rows: (coerced-to-text value, evaluated ORDER BY key values).
+        rows: Vec<(String, Vec<Value>)>,
+        /// Separator string placed between values in finalize.
+        separator: String,
+        /// Whether to deduplicate values before concatenating.
+        distinct: bool,
+        /// Sort directions: `true` = ASC, `false` = DESC. One per ORDER BY key.
+        order_by_dirs: Vec<bool>,
+    },
 }
 
 impl AggAccumulator {
     fn new(agg: &AggExpr) -> Self {
-        match agg.name.as_str() {
-            "count" if agg.arg.is_none() => Self::CountStar { n: 0 },
-            "count" => Self::CountCol { n: 0 },
-            "sum" => Self::Sum { acc: None },
-            "min" => Self::Min { acc: None },
-            "max" => Self::Max { acc: None },
-            "avg" => Self::Avg {
-                sum: Value::Int(0),
-                count: 0,
+        match agg {
+            AggExpr::GroupConcat {
+                separator,
+                distinct,
+                order_by,
+                ..
+            } => Self::GroupConcat {
+                rows: Vec::new(),
+                separator: separator.clone(),
+                distinct: *distinct,
+                order_by_dirs: order_by
+                    .iter()
+                    .map(|(_, dir)| matches!(dir, crate::ast::SortOrder::Asc))
+                    .collect(),
             },
-            _ => unreachable!("AggAccumulator::new called with non-aggregate"),
+            AggExpr::Simple { name, arg, .. } => match name.as_str() {
+                "count" if arg.is_none() => Self::CountStar { n: 0 },
+                "count" => Self::CountCol { n: 0 },
+                "sum" => Self::Sum { acc: None },
+                "min" => Self::Min { acc: None },
+                "max" => Self::Max { acc: None },
+                "avg" => Self::Avg {
+                    sum: Value::Int(0),
+                    count: 0,
+                },
+                _ => unreachable!("AggAccumulator::new called with non-aggregate"),
+            },
         }
     }
 
     fn update(&mut self, row: &[Value], agg: &AggExpr) -> Result<(), DbError> {
+        // Extract the argument expression from Simple aggregates.
+        let simple_arg = match agg {
+            AggExpr::Simple { arg, .. } => arg.as_ref(),
+            AggExpr::GroupConcat { .. } => None,
+        };
+
         match self {
             Self::CountStar { n } => *n += 1,
 
             Self::CountCol { n } => {
-                let v = eval(agg.arg.as_ref().unwrap(), row)?;
+                let v = eval(simple_arg.unwrap(), row)?;
                 if !matches!(v, Value::Null) {
                     *n += 1;
                 }
             }
 
             Self::Sum { acc } => {
-                let v = eval(agg.arg.as_ref().unwrap(), row)?;
+                let v = eval(simple_arg.unwrap(), row)?;
                 if !matches!(v, Value::Null) {
                     *acc = Some(match acc.take() {
                         None => v,
@@ -2573,7 +2713,7 @@ impl AggAccumulator {
             }
 
             Self::Min { acc } => {
-                let v = eval(agg.arg.as_ref().unwrap(), row)?;
+                let v = eval(simple_arg.unwrap(), row)?;
                 if !matches!(v, Value::Null) {
                     *acc = Some(match acc.take() {
                         None => v.clone(),
@@ -2589,7 +2729,7 @@ impl AggAccumulator {
             }
 
             Self::Max { acc } => {
-                let v = eval(agg.arg.as_ref().unwrap(), row)?;
+                let v = eval(simple_arg.unwrap(), row)?;
                 if !matches!(v, Value::Null) {
                     *acc = Some(match acc.take() {
                         None => v.clone(),
@@ -2605,11 +2745,35 @@ impl AggAccumulator {
             }
 
             Self::Avg { sum, count } => {
-                let v = eval(agg.arg.as_ref().unwrap(), row)?;
+                let v = eval(simple_arg.unwrap(), row)?;
                 if !matches!(v, Value::Null) {
                     *sum = agg_add(sum.clone(), v)?;
                     *count += 1;
                 }
+            }
+
+            Self::GroupConcat { rows, .. } => {
+                // Extract the GROUP_CONCAT expression and ORDER BY from the AggExpr descriptor.
+                let (gc_expr, gc_order_by) = match agg {
+                    AggExpr::GroupConcat { expr, order_by, .. } => (expr.as_ref(), order_by),
+                    _ => {
+                        unreachable!("GroupConcat accumulator paired with non-GroupConcat AggExpr")
+                    }
+                };
+
+                // Evaluate the concatenated expression; skip NULLs.
+                let val = match eval(gc_expr, row)? {
+                    Value::Null => return Ok(()),
+                    v => value_to_display_string(v),
+                };
+
+                // Evaluate ORDER BY key expressions for this row.
+                let keys: Vec<Value> = gc_order_by
+                    .iter()
+                    .map(|(e, _)| eval(e, row))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                rows.push((val, keys));
             }
         }
         Ok(())
@@ -2623,6 +2787,58 @@ impl AggAccumulator {
             Self::Min { acc } => Ok(acc.unwrap_or(Value::Null)),
             Self::Max { acc } => Ok(acc.unwrap_or(Value::Null)),
             Self::Avg { sum, count } => finalize_avg(sum, count),
+            Self::GroupConcat {
+                mut rows,
+                separator,
+                distinct,
+                order_by_dirs,
+            } => {
+                if rows.is_empty() {
+                    return Ok(Value::Null);
+                }
+
+                // 1. Sort if ORDER BY keys are present.
+                if !order_by_dirs.is_empty() {
+                    rows.sort_by(|(_, keys_a), (_, keys_b)| {
+                        for (i, &asc) in order_by_dirs.iter().enumerate() {
+                            let a = keys_a.get(i).unwrap_or(&Value::Null);
+                            let b = keys_b.get(i).unwrap_or(&Value::Null);
+                            let cmp = compare_values_null_last(a, b);
+                            let cmp = if asc { cmp } else { cmp.reverse() };
+                            if cmp != std::cmp::Ordering::Equal {
+                                return cmp;
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+                }
+
+                // 2. Deduplicate if DISTINCT (preserves sorted order).
+                let values: Vec<&str> = if distinct {
+                    let mut seen = std::collections::HashSet::new();
+                    rows.iter()
+                        .filter(|(v, _)| seen.insert(v.as_str()))
+                        .map(|(v, _)| v.as_str())
+                        .collect()
+                } else {
+                    rows.iter().map(|(v, _)| v.as_str()).collect()
+                };
+
+                // 3. Concatenate with separator; truncate at 1 MB (group_concat_max_len).
+                const MAX_LEN: usize = 1_048_576;
+                let mut result = String::new();
+                for (i, val) in values.into_iter().enumerate() {
+                    if i > 0 {
+                        result.push_str(&separator);
+                    }
+                    result.push_str(val);
+                    if result.len() >= MAX_LEN {
+                        result.truncate(MAX_LEN);
+                        break;
+                    }
+                }
+                Ok(Value::Text(result))
+            }
         }
     }
 }
@@ -2694,6 +2910,59 @@ fn finalize_avg(sum: Value, count: u64) -> Result<Value, DbError> {
         },
         &[],
     )
+}
+
+// ── GROUP_CONCAT helpers ──────────────────────────────────────────────────────
+
+/// Converts a non-NULL `Value` to its text representation for GROUP_CONCAT.
+///
+/// Mirrors MySQL's `val_str()` coercion rules:
+/// - `Text` → unchanged
+/// - `Int`/`BigInt` → decimal representation
+/// - `Real` → Rust default float formatting
+/// - `Bool` → `"1"` (true) or `"0"` (false) — MySQL behavior
+/// - Others → debug representation (fallback; should not occur in practice)
+fn value_to_display_string(v: Value) -> String {
+    match v {
+        Value::Text(s) => s,
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::Real(f) => format!("{f}"),
+        Value::Bool(b) => {
+            if b {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
+        Value::Null => String::new(), // should not be reached (callers skip NULLs)
+        other => format!("{other:?}"),
+    }
+}
+
+/// Compares two `Value`s for ORDER BY inside GROUP_CONCAT.
+///
+/// Uses proper type-aware comparison:
+/// - `NULL` sorts last (greater than any non-NULL), matching MySQL behavior.
+/// - Numeric types compared numerically.
+/// - `Text` compared lexicographically (not by length).
+/// - Other types fall back to `value_to_key_bytes` for a stable total order.
+fn compare_values_null_last(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Greater,
+        (_, Value::Null) => std::cmp::Ordering::Less,
+        // Numeric types — proper numeric ordering.
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::BigInt(x), Value::BigInt(y)) => x.cmp(y),
+        (Value::Int(x), Value::BigInt(y)) => (*x as i64).cmp(y),
+        (Value::BigInt(x), Value::Int(y)) => x.cmp(&(*y as i64)),
+        (Value::Real(x), Value::Real(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        // Text — lexicographic (not length-prefixed).
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        // All other types — stable fallback via key-bytes.
+        _ => value_to_key_bytes(a).cmp(&value_to_key_bytes(b)),
+    }
 }
 
 // ── GroupState ────────────────────────────────────────────────────────────────
@@ -2806,10 +3075,26 @@ fn eval_with_aggs(
                 })
         }
 
+        // GROUP_CONCAT: look up the pre-computed finalized value by structural match.
+        Expr::GroupConcat {
+            expr: gc_expr,
+            distinct,
+            order_by,
+            separator,
+        } => {
+            let idx = agg_exprs
+                .iter()
+                .position(|ae| ae.matches_group_concat(gc_expr, *distinct, order_by, separator))
+                .ok_or_else(|| {
+                    DbError::Other("GROUP_CONCAT not pre-registered — internal error".to_string())
+                })?;
+            Ok(agg_values[idx].clone())
+        }
+
         Expr::Function { name, args } if is_aggregate(name.as_str()) => {
             let idx = agg_exprs
                 .iter()
-                .position(|ae| ae.matches(name.as_str(), args))
+                .position(|ae| ae.matches_simple(name.as_str(), args))
                 .ok_or_else(|| {
                     DbError::Other(format!(
                         "aggregate '{name}' not pre-registered — internal error"
@@ -2960,6 +3245,77 @@ fn eval_with_aggs(
                 }
                 None => Ok(Value::Null),
             }
+        }
+
+        // Compound predicates that may contain aggregates in sub-expressions.
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let v = eval_with_aggs(expr, representative_row, agg_values, agg_exprs)?;
+            let p = eval_with_aggs(pattern, representative_row, agg_values, agg_exprs)?;
+            eval(
+                &Expr::Like {
+                    expr: Box::new(Expr::Literal(v)),
+                    pattern: Box::new(Expr::Literal(p)),
+                    negated: *negated,
+                },
+                &[],
+            )
+        }
+
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let v = eval_with_aggs(expr, representative_row, agg_values, agg_exprs)?;
+            let lo = eval_with_aggs(low, representative_row, agg_values, agg_exprs)?;
+            let hi = eval_with_aggs(high, representative_row, agg_values, agg_exprs)?;
+            eval(
+                &Expr::Between {
+                    expr: Box::new(Expr::Literal(v)),
+                    low: Box::new(Expr::Literal(lo)),
+                    high: Box::new(Expr::Literal(hi)),
+                    negated: *negated,
+                },
+                &[],
+            )
+        }
+
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => {
+            let v = eval_with_aggs(expr, representative_row, agg_values, agg_exprs)?;
+            let evaluated_list: Result<Vec<Expr>, _> = list
+                .iter()
+                .map(|e| {
+                    eval_with_aggs(e, representative_row, agg_values, agg_exprs).map(Expr::Literal)
+                })
+                .collect();
+            eval(
+                &Expr::In {
+                    expr: Box::new(Expr::Literal(v)),
+                    list: evaluated_list?,
+                    negated: *negated,
+                },
+                &[],
+            )
+        }
+
+        Expr::Cast { expr, target } => {
+            let v = eval_with_aggs(expr, representative_row, agg_values, agg_exprs)?;
+            eval(
+                &Expr::Cast {
+                    expr: Box::new(Expr::Literal(v)),
+                    target: *target,
+                },
+                &[],
+            )
         }
 
         // For remaining variants: fall back to standard eval against representative_row.
@@ -3135,6 +3491,7 @@ fn build_grouped_column_meta(
 fn grouped_expr_name(expr: &Expr, _agg_exprs: &[AggExpr]) -> String {
     match expr {
         Expr::Column { name, .. } => name.clone(),
+        Expr::GroupConcat { .. } => "GROUP_CONCAT(...)".into(),
         Expr::Function { name, args } if is_aggregate(name.as_str()) => {
             if args.is_empty() {
                 format!("{name}(*)")
@@ -3150,6 +3507,8 @@ fn grouped_expr_name(expr: &Expr, _agg_exprs: &[AggExpr]) -> String {
 /// Aggregate results: COUNT → BigInt non-null; SUM/MIN/MAX/AVG → nullable.
 fn grouped_expr_type(expr: &Expr, _agg_exprs: &[AggExpr]) -> (DataType, bool) {
     match expr {
+        // GROUP_CONCAT always produces TEXT; nullable (empty group → NULL).
+        Expr::GroupConcat { .. } => (DataType::Text, true),
         Expr::Function { name, .. } if is_aggregate(name.as_str()) => match name.as_str() {
             "count" => (DataType::BigInt, false),
             "avg" => (DataType::Real, true),

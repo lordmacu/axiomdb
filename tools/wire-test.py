@@ -333,6 +333,82 @@ ok("year(NOW()) in 2020-2100", 2020 <= row[0] <= 2100, row[0])
 ok("month(NOW()) in 1-12", 1 <= row[1] <= 12, row[1])
 ok("day(NOW()) in 1-31", 1 <= row[2] <= 31, row[2])
 
+# ── 4.9e GROUP_CONCAT ────────────────────────────────────────────────────────
+
+print("\n[4.9e] GROUP_CONCAT / string_agg")
+
+cur.execute("CREATE TABLE gc_tags (post_id INT NOT NULL, tag TEXT)")
+for (pid, tag) in [(1,'rust'),(1,'db'),(1,'async'),(2,'rust'),(2,'web'),(3,None)]:
+    if tag is None:
+        cur.execute("INSERT INTO gc_tags VALUES (%s, NULL)", (pid,))
+    else:
+        cur.execute("INSERT INTO gc_tags VALUES (%s, %s)", (pid, tag))
+
+# Basic GROUP_CONCAT with ORDER BY — deterministic order
+cur.execute(
+    "SELECT GROUP_CONCAT(tag ORDER BY tag ASC) FROM gc_tags WHERE post_id = 1"
+)
+ok("GROUP_CONCAT ordered ASC", cur.fetchone()[0] == "async,db,rust")
+
+# Custom SEPARATOR
+cur.execute(
+    "SELECT GROUP_CONCAT(tag ORDER BY tag ASC SEPARATOR ' | ') FROM gc_tags WHERE post_id = 1"
+)
+ok("GROUP_CONCAT custom separator", cur.fetchone()[0] == "async | db | rust")
+
+# ORDER BY DESC
+cur.execute(
+    "SELECT GROUP_CONCAT(tag ORDER BY tag DESC) FROM gc_tags WHERE post_id = 1"
+)
+ok("GROUP_CONCAT ORDER BY DESC", cur.fetchone()[0] == "rust,db,async")
+
+# NULL values skipped
+cur.execute("SELECT GROUP_CONCAT(tag) FROM gc_tags WHERE post_id = 3")
+ok("GROUP_CONCAT all-NULL → NULL", cur.fetchone()[0] is None)
+
+# Empty group → NULL
+cur.execute("SELECT GROUP_CONCAT(tag) FROM gc_tags WHERE post_id = 99")
+ok("GROUP_CONCAT empty group → NULL", cur.fetchone()[0] is None)
+
+# DISTINCT deduplication
+cur.execute("CREATE TABLE gc_dup (v TEXT)")
+cur.execute("INSERT INTO gc_dup VALUES ('a')")
+cur.execute("INSERT INTO gc_dup VALUES ('b')")
+cur.execute("INSERT INTO gc_dup VALUES ('a')")
+cur.execute("INSERT INTO gc_dup VALUES ('c')")
+cur.execute("SELECT GROUP_CONCAT(DISTINCT v ORDER BY v ASC) FROM gc_dup")
+ok("GROUP_CONCAT DISTINCT", cur.fetchone()[0] == "a,b,c")
+
+# string_agg alias
+cur.execute("SELECT string_agg(tag, ', ') FROM gc_tags WHERE post_id = 2")
+row = cur.fetchone()[0]
+ok("string_agg separator present", row is not None and ', ' in row)
+ok("string_agg contains rust", row is not None and 'rust' in row)
+
+# GROUP BY query
+cur.execute(
+    "SELECT post_id, GROUP_CONCAT(tag ORDER BY tag ASC) "
+    "FROM gc_tags GROUP BY post_id ORDER BY post_id ASC"
+)
+rows = cur.fetchall()
+ok("GROUP_CONCAT GROUP BY row count", len(rows) == 3)
+ok("GROUP_CONCAT GROUP BY post_id=1", rows[0][1] == "async,db,rust")
+ok("GROUP_CONCAT GROUP BY post_id=2", rows[1][1] == "rust,web")
+ok("GROUP_CONCAT GROUP BY post_id=3 NULL", rows[2][1] is None)
+
+# HAVING with GROUP_CONCAT
+cur.execute(
+    "SELECT post_id FROM gc_tags "
+    "GROUP BY post_id "
+    "HAVING GROUP_CONCAT(tag ORDER BY tag ASC) LIKE '%rust%' "
+    "ORDER BY post_id ASC"
+)
+rows = cur.fetchall()
+ok("HAVING GROUP_CONCAT LIKE row count", len(rows) == 2, [r[0] for r in rows])
+post_ids_having = sorted(int(r[0]) for r in rows)
+ok("HAVING GROUP_CONCAT LIKE has post_id=1", 1 in post_ids_having, post_ids_having)
+ok("HAVING GROUP_CONCAT LIKE has post_id=2", 2 in post_ids_having, post_ids_having)
+
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 
 print("\n[Connectivity]")
