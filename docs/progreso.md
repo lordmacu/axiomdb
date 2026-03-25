@@ -128,7 +128,7 @@
 - [x] 4.9a ✅ GROUP BY hash-based — HashMap<key_bytes, GroupState>; value_to_key_bytes; NULL keys group correctly
 - [ ] 4.9b ⏳ GROUP BY sort-based — sort first, then stream; optimal when data is pre-sorted by index (deferred)
 - [x] 4.9c ✅ Aggregate functions — COUNT(*), COUNT(col), SUM, MIN, MAX, AVG (→ Real); skip NULL; finalize
-- [ ] 4.9e ⏳ GROUP_CONCAT() — `SELECT GROUP_CONCAT(tag ORDER BY tag SEPARATOR ', ') FROM tags GROUP BY post_id`; MySQL's most-used aggregate function; DISTINCT modifier to deduplicate before concatenating; max length configurable; NULL values skipped; returns NULL for empty group; without this, virtually every MySQL codebase that stores tags, roles, or categories fails to migrate
+- [x] 4.9e ✅ GROUP_CONCAT() — `SELECT GROUP_CONCAT(tag ORDER BY tag SEPARATOR ', ') FROM tags GROUP BY post_id`; MySQL's most-used aggregate function; DISTINCT modifier to deduplicate before concatenating; max length configurable; NULL values skipped; returns NULL for empty group; `string_agg(expr, sep)` PostgreSQL alias; 18 integration tests + 15 wire assertions
 - [x] 4.9d ✅ HAVING clause — eval_with_aggs intercepts aggregate calls; representative_row for col refs
 - [x] 4.10 ✅ ORDER BY + LIMIT/OFFSET — in-memory sort; stable sort_by; sort_err pattern
 - [x] 4.10b ✅ Multi-column ORDER BY with mixed direction — composite comparator, left-to-right

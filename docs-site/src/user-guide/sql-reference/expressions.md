@@ -755,6 +755,83 @@ FROM orders
 WHERE status != 'cancelled';
 ```
 
+### GROUP_CONCAT — String Aggregation
+
+`GROUP_CONCAT` concatenates non-NULL values across the rows of a group into a single
+string. It is MySQL's most widely-used aggregate function for collecting tags, roles,
+categories, and comma-separated lists without a client-side join.
+
+`string_agg(expr, separator)` is the PostgreSQL-compatible alias.
+
+#### Syntax
+
+```sql
+GROUP_CONCAT([DISTINCT] expr [ORDER BY col [ASC|DESC], ...] [SEPARATOR 'str'])
+
+string_agg(expr, separator)
+```
+
+| Clause      | Default | Description |
+|-------------|---------|-------------|
+| `DISTINCT`  | off     | Deduplicate values before concatenating |
+| `ORDER BY`  | none    | Sort values within the group before joining |
+| `SEPARATOR` | `','`   | String inserted between values |
+
+#### Behavior
+
+- NULL values are **skipped** — they do not appear in the result and do not add a separator.
+- An empty group (no rows) or a group where every value is NULL returns `NULL`.
+- A single value returns that value with no separator added.
+- Result is truncated to **1 MB** (1,048,576 bytes) maximum.
+
+```sql
+-- Basic: comma-separated tags per post
+SELECT post_id, GROUP_CONCAT(tag ORDER BY tag ASC)
+FROM post_tags
+GROUP BY post_id;
+-- post 1 → 'async,db,rust'
+-- post 2 → 'rust,web'
+-- post 3 (all NULL tags) → NULL
+
+-- Custom separator
+SELECT GROUP_CONCAT(tag ORDER BY tag ASC SEPARATOR ' | ')
+FROM post_tags
+WHERE post_id = 1;
+-- → 'async | db | rust'
+
+-- DISTINCT: deduplicate before joining
+SELECT GROUP_CONCAT(DISTINCT tag ORDER BY tag ASC)
+FROM tags;
+-- Duplicate 'rust' rows → 'async,db,rust' (appears once)
+
+-- string_agg PostgreSQL alias
+SELECT string_agg(tag, ', ')
+FROM post_tags
+WHERE post_id = 2;
+-- → 'rust, web' (or 'web, rust' — insertion order)
+
+-- HAVING on a GROUP_CONCAT result
+SELECT post_id, GROUP_CONCAT(tag ORDER BY tag ASC) AS tags
+FROM post_tags
+GROUP BY post_id
+HAVING GROUP_CONCAT(tag ORDER BY tag ASC) LIKE '%rust%';
+-- Only posts that have the 'rust' tag
+
+-- Collect integers as text
+SELECT GROUP_CONCAT(n ORDER BY n ASC) FROM nums;
+-- 1, 2, 3 → '1,2,3'
+```
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Tip — MySQL compatibility</span>
+AxiomDB supports the full MySQL <code>GROUP_CONCAT</code> syntax including <code>DISTINCT</code>,
+multi-column <code>ORDER BY</code>, and the <code>SEPARATOR</code> keyword. MySQL codebases
+that use <code>GROUP_CONCAT</code> for tags or role lists migrate without modification.
+</div>
+</div>
+
 ---
 
 ## BLOB / Binary Functions

@@ -523,6 +523,25 @@ fn resolve_expr_full(
             target,
         }),
 
+        Expr::GroupConcat {
+            expr,
+            distinct,
+            order_by,
+            separator,
+        } => {
+            let expr = resolve_expr_full(*expr, ctx, outer_scopes, state)?;
+            let order_by = order_by
+                .into_iter()
+                .map(|(e, dir)| Ok((resolve_expr_full(e, ctx, outer_scopes, state)?, dir)))
+                .collect::<Result<Vec<_>, DbError>>()?;
+            Ok(Expr::GroupConcat {
+                expr: Box::new(expr),
+                distinct,
+                order_by,
+                separator,
+            })
+        }
+
         // ── Subquery variants ────────────────────────────────────────────────
         //
         // The inner SELECT is analyzed with `ctx` pushed as an outer scope so

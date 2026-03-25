@@ -27,6 +27,7 @@ use axiomdb_core::error::DbError;
 use axiomdb_types::Value;
 
 use crate::{
+    ast::SortOrder,
     expr::{BinaryOp, Expr, UnaryOp},
     lexer::Token,
 };
@@ -423,6 +424,95 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
 
     // Check for function call: `name(`
     if p.eat(&Token::LParen) {
+        // ── GROUP_CONCAT special syntax ───────────────────────────────────────
+        // GROUP_CONCAT([DISTINCT] expr [ORDER BY e [ASC|DESC] [, ...]] [SEPARATOR 'str'])
+        if name.eq_ignore_ascii_case("group_concat") {
+            let distinct = p.eat(&Token::Distinct);
+            let expr = parse_expr(p)?;
+
+            // Optional ORDER BY inside GROUP_CONCAT.
+            let mut order_by: Vec<(Expr, SortOrder)> = Vec::new();
+            if p.eat(&Token::Order) {
+                p.expect(&Token::By)?;
+                loop {
+                    let ob_expr = parse_expr(p)?;
+                    let dir = if p.eat(&Token::Asc) {
+                        SortOrder::Asc
+                    } else if p.eat(&Token::Desc) {
+                        SortOrder::Desc
+                    } else {
+                        SortOrder::Asc
+                    };
+                    order_by.push((ob_expr, dir));
+                    // Stop if the next token is SEPARATOR, RParen, or not a Comma.
+                    if !p.eat(&Token::Comma) {
+                        break;
+                    }
+                    // After consuming the comma, peek — stop if SEPARATOR or RParen.
+                    if matches!(p.peek(), Token::Separator | Token::RParen) {
+                        break;
+                    }
+                }
+            }
+
+            // Optional SEPARATOR 'string'.
+            let separator = if p.eat(&Token::Separator) {
+                match p.peek().clone() {
+                    Token::StringLit(s) => {
+                        p.advance();
+                        s
+                    }
+                    other => {
+                        return Err(DbError::ParseError {
+                            message: format!(
+                                "expected string literal after SEPARATOR, got {:?}",
+                                other
+                            ),
+                        })
+                    }
+                }
+            } else {
+                ",".to_string()
+            };
+
+            p.expect(&Token::RParen)?;
+            return Ok(Expr::GroupConcat {
+                expr: Box::new(expr),
+                distinct,
+                order_by,
+                separator,
+            });
+        }
+
+        // ── STRING_AGG alias (PostgreSQL-compatible) ───────────────────────────
+        // string_agg(expr, separator) — equivalent to GROUP_CONCAT(expr SEPARATOR sep)
+        if name.eq_ignore_ascii_case("string_agg") {
+            let expr = parse_expr(p)?;
+            p.expect(&Token::Comma)?;
+            // The separator must be a string literal at parse time.
+            let separator = match p.peek().clone() {
+                Token::StringLit(s) => {
+                    p.advance();
+                    s
+                }
+                other => {
+                    return Err(DbError::ParseError {
+                        message: format!(
+                            "string_agg separator must be a string literal, got {:?}",
+                            other
+                        ),
+                    })
+                }
+            };
+            p.expect(&Token::RParen)?;
+            return Ok(Expr::GroupConcat {
+                expr: Box::new(expr),
+                distinct: false,
+                order_by: vec![],
+                separator,
+            });
+        }
+
         // CAST(expr AS type) — special syntax, not a regular function call.
         if name.eq_ignore_ascii_case("cast") {
             let expr = parse_expr(p)?;

@@ -306,6 +306,8 @@ pub enum Token<'src> {
     TyUuid,
 
     // ── Miscellaneous ─────────────────────────────────────────────────────────
+    #[token("SEPARATOR", ignore(ascii_case))]
+    Separator,
     #[token("WITH", ignore(ascii_case))]
     With,
     #[token("AUTOCOMMIT", ignore(ascii_case))]
