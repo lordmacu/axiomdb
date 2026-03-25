@@ -19,10 +19,27 @@
 //! - OR predicates, JOINs, and subqueries always fall through to `Scan`.
 //! - Indexes with empty `columns` field (pre-6.1) are ignored.
 
-use axiomdb_catalog::{ColumnDef, IndexDef};
+use axiomdb_catalog::{ColumnDef, IndexDef, StatsDef};
 use axiomdb_types::Value;
 
-use crate::expr::{BinaryOp, Expr};
+use crate::{
+    expr::{BinaryOp, Expr},
+    session::StaleStatsTracker,
+};
+
+// ── Statistics cost constants (Phase 6.10) ───────────────────────────────────
+
+/// Fraction of rows below which an index scan beats a full scan.
+/// Derived from PostgreSQL: seq_page_cost=1 / random_page_cost=4 ≈ 0.25.
+/// AxiomDB uses 0.20 (slightly conservative for embedded single-file storage).
+const INDEX_SELECTIVITY_THRESHOLD: f64 = 0.20;
+
+/// Fallback NDV when no statistics exist (PostgreSQL `DEFAULT_NUM_DISTINCT`).
+const DEFAULT_NUM_DISTINCT: i64 = 200;
+
+/// Tables with fewer than this many rows always use a full scan.
+/// Index overhead dominates for very small tables.
+const SMALL_TABLE_THRESHOLD: u64 = 1_000;
 
 // ── AccessMethod ─────────────────────────────────────────────────────────────
 
@@ -58,10 +75,21 @@ pub enum AccessMethod {
 /// Chooses an [`AccessMethod`] for the given `WHERE` clause and available indexes.
 ///
 /// Returns [`AccessMethod::Scan`] if no suitable index is found.
+///
+/// `table_stats` contains per-column statistics for the table being scanned.
+/// An empty slice means "no statistics available" — the planner always uses
+/// indexes (conservative: never wrong, just potentially suboptimal).
+///
+/// `stale_tracker` is used to:
+/// 1. Register the row count baseline when stats are loaded (for Phase 6.11).
+/// 2. Use `DEFAULT_NUM_DISTINCT` instead of catalog stats for stale tables.
 pub fn plan_select(
     where_clause: Option<&Expr>,
     indexes: &[IndexDef],
     columns: &[ColumnDef],
+    table_id: u32,
+    table_stats: &[StatsDef],
+    stale_tracker: &mut StaleStatsTracker,
 ) -> AccessMethod {
     use crate::key_encoding::encode_index_key;
 
@@ -73,6 +101,12 @@ pub fn plan_select(
     // ── Rule 0: composite equality (N ≥ 2 columns) ────────────────────────
     // Must run before Rule 1 to prefer composite indexes over single-column.
     if let Some(am) = plan_composite_eq(expr, indexes, columns) {
+        // Apply cost gate to composite result too.
+        if let AccessMethod::IndexRange { ref index_def, .. } = am {
+            if !stats_cost_gate(index_def, columns, table_id, table_stats, stale_tracker) {
+                return AccessMethod::Scan;
+            }
+        }
         return am;
     }
 
@@ -80,25 +114,22 @@ pub fn plan_select(
     if let Some((col_name, value)) = extract_eq_col_literal(expr) {
         if let Some(idx) = find_index_on_col(col_name, indexes, columns, Some(expr)) {
             if let Ok(key) = encode_index_key(&[value]) {
-                if idx.columns.len() == 1 {
-                    // Single-column index: exact lookup (efficient, returns ≤ 1 row
-                    // for unique, possibly 1 row for non-unique due to B-Tree design).
-                    return AccessMethod::IndexLookup {
-                        index_def: idx.clone(),
-                        key,
-                    };
-                } else {
-                    // Composite index: the B-Tree keys include all N columns, so a
-                    // single-column lookup key is a prefix. Use range scan with
-                    // lo = prefix and hi = prefix + max suffix, so all rows matching
-                    // the leading column are returned.
-                    let mut hi = key.clone();
-                    hi.extend_from_slice(&[0xFF; crate::key_encoding::MAX_INDEX_KEY]);
-                    return AccessMethod::IndexRange {
-                        index_def: idx.clone(),
-                        lo: Some(key),
-                        hi: Some(hi),
-                    };
+                // Cost gate: skip index if selectivity too low (Phase 6.10).
+                if stats_cost_gate(idx, columns, table_id, table_stats, stale_tracker) {
+                    if idx.columns.len() == 1 {
+                        return AccessMethod::IndexLookup {
+                            index_def: idx.clone(),
+                            key,
+                        };
+                    } else {
+                        let mut hi = key.clone();
+                        hi.extend_from_slice(&[0xFF; crate::key_encoding::MAX_INDEX_KEY]);
+                        return AccessMethod::IndexRange {
+                            index_def: idx.clone(),
+                            lo: Some(key),
+                            hi: Some(hi),
+                        };
+                    }
                 }
             }
         }
@@ -106,16 +137,74 @@ pub fn plan_select(
 
     // ── Rule 2: col > lo AND col < hi (or >=, <=) ─────────────────────────
     if let Some((idx, lo_val, hi_val)) = extract_range(expr, indexes, columns, Some(expr)) {
-        let lo = lo_val.and_then(|v| encode_index_key(&[v]).ok());
-        let hi = hi_val.and_then(|v| encode_index_key(&[v]).ok());
-        return AccessMethod::IndexRange {
-            index_def: idx.clone(),
-            lo,
-            hi,
-        };
+        // Cost gate: range scans are even less selective — apply same threshold.
+        if stats_cost_gate(idx, columns, table_id, table_stats, stale_tracker) {
+            let lo = lo_val.and_then(|v| encode_index_key(&[v]).ok());
+            let hi = hi_val.and_then(|v| encode_index_key(&[v]).ok());
+            return AccessMethod::IndexRange {
+                index_def: idx.clone(),
+                lo,
+                hi,
+            };
+        }
     }
 
     AccessMethod::Scan
+}
+
+// ── Statistics cost gate (Phase 6.10) ────────────────────────────────────────
+
+/// Returns `true` if an index scan is worth using given the column statistics.
+///
+/// Uses `selectivity = 1 / NDV` for equality predicates. If selectivity is
+/// above `INDEX_SELECTIVITY_THRESHOLD` (0.20 = 20% of rows), a full table
+/// scan is cheaper. For small tables or when no stats exist, the function
+/// conservatively returns `true` (use the index — never wrong, just possibly
+/// suboptimal).
+///
+/// Also sets the staleness baseline if stats are loaded here for the first time.
+fn stats_cost_gate(
+    index_def: &IndexDef,
+    _columns: &[ColumnDef],
+    table_id: u32,
+    table_stats: &[StatsDef],
+    stale_tracker: &mut StaleStatsTracker,
+) -> bool {
+    // No stats → always use index (conservative default).
+    if table_stats.is_empty() {
+        return true;
+    }
+
+    // Find the first indexed column's col_idx.
+    let col_idx = match index_def.columns.first() {
+        Some(c) => c.col_idx,
+        None => return true,
+    };
+
+    // Find stats for this column.
+    let stats = match table_stats.iter().find(|s| s.col_idx == col_idx) {
+        Some(s) => s,
+        None => return true, // no stats for this column → use index
+    };
+
+    // Register baseline for Phase 6.11 staleness tracking.
+    stale_tracker.set_baseline(table_id, stats.row_count);
+
+    // Small table: always scan (index overhead not worth it).
+    if stats.row_count < SMALL_TABLE_THRESHOLD {
+        return false;
+    }
+
+    // Compute NDV (handle dual-encoding and zero/unknown).
+    let ndv = if stats.ndv > 0 {
+        stats.ndv
+    } else {
+        DEFAULT_NUM_DISTINCT
+    };
+
+    // selectivity = 1 / NDV for equality predicates.
+    let selectivity = 1.0 / (ndv.max(1) as f64);
+    selectivity <= INDEX_SELECTIVITY_THRESHOLD
 }
 
 // ── Rule 0: composite equality planner ───────────────────────────────────────
@@ -371,7 +460,17 @@ mod tests {
     fn test_no_where_returns_scan() {
         let cols = vec![make_col("id", 0)];
         let idxs = vec![make_index("id_idx", 0, false)];
-        assert_eq!(plan_select(None, &idxs, &cols), AccessMethod::Scan);
+        assert_eq!(
+            plan_select(
+                None,
+                &idxs,
+                &cols,
+                1,
+                &[],
+                &mut StaleStatsTracker::default()
+            ),
+            AccessMethod::Scan
+        );
     }
 
     #[test]
@@ -383,7 +482,14 @@ mod tests {
             left: Box::new(col_expr("id")),
             right: Box::new(Expr::Literal(Value::Int(42))),
         };
-        let am = plan_select(Some(&expr), &idxs, &cols);
+        let am = plan_select(
+            Some(&expr),
+            &idxs,
+            &cols,
+            1,
+            &[],
+            &mut StaleStatsTracker::default(),
+        );
         assert!(matches!(am, AccessMethod::IndexLookup { .. }));
     }
 
@@ -397,7 +503,14 @@ mod tests {
             left: Box::new(col_expr("id")),
             right: Box::new(Expr::Literal(Value::Int(1))),
         };
-        let am = plan_select(Some(&expr), &idxs, &cols);
+        let am = plan_select(
+            Some(&expr),
+            &idxs,
+            &cols,
+            1,
+            &[],
+            &mut StaleStatsTracker::default(),
+        );
         assert_eq!(am, AccessMethod::Scan);
     }
 
@@ -410,7 +523,14 @@ mod tests {
             left: Box::new(col_expr("name")),
             right: Box::new(Expr::Literal(Value::Text("alice".into()))),
         };
-        let am = plan_select(Some(&expr), &idxs, &cols);
+        let am = plan_select(
+            Some(&expr),
+            &idxs,
+            &cols,
+            1,
+            &[],
+            &mut StaleStatsTracker::default(),
+        );
         assert_eq!(am, AccessMethod::Scan);
     }
 
@@ -422,7 +542,14 @@ mod tests {
             left: Box::new(col_expr("id")),
             right: Box::new(Expr::Literal(Value::Int(1))),
         };
-        let am = plan_select(Some(&expr), &[], &cols);
+        let am = plan_select(
+            Some(&expr),
+            &[],
+            &cols,
+            1,
+            &[],
+            &mut StaleStatsTracker::default(),
+        );
         assert_eq!(am, AccessMethod::Scan);
     }
 
@@ -446,7 +573,14 @@ mod tests {
             left: Box::new(col_expr("id")),
             right: Box::new(Expr::Literal(Value::Int(1))),
         };
-        let am = plan_select(Some(&expr), &[idx_no_cols], &cols);
+        let am = plan_select(
+            Some(&expr),
+            &[idx_no_cols],
+            &cols,
+            1,
+            &[],
+            &mut StaleStatsTracker::default(),
+        );
         assert_eq!(am, AccessMethod::Scan);
     }
 
@@ -467,7 +601,14 @@ mod tests {
                 right: Box::new(Expr::Literal(Value::Int(30))),
             }),
         };
-        let am = plan_select(Some(&expr), &idxs, &cols);
+        let am = plan_select(
+            Some(&expr),
+            &idxs,
+            &cols,
+            1,
+            &[],
+            &mut StaleStatsTracker::default(),
+        );
         assert!(matches!(am, AccessMethod::IndexRange { .. }));
     }
 }

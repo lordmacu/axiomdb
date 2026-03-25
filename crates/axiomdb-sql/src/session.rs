@@ -1,6 +1,6 @@
 //! Session context — per-connection state including the schema cache and warnings.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axiomdb_catalog::ResolvedTable;
 
@@ -20,6 +20,70 @@ pub struct SqlWarning {
     pub message: String,
 }
 
+// ── StaleStatsTracker ─────────────────────────────────────────────────────────
+
+/// Tracks per-table row changes since the last stats load or ANALYZE (Phase 6.11).
+///
+/// When accumulated changes exceed 20% of the baseline row count, the table's
+/// stats are considered stale. The query planner falls back to
+/// `DEFAULT_NUM_DISTINCT = 200` for stale tables so it doesn't make expensive
+/// index scan decisions based on outdated selectivity estimates.
+///
+/// This is **in-memory only** — resets on server restart. Persistent stale
+/// tracking (like PostgreSQL's `pg_stat_user_tables.n_mod_since_analyze`) is
+/// deferred to Phase 6.15.
+#[derive(Debug, Default)]
+pub struct StaleStatsTracker {
+    /// Accumulated row changes per table since the last `set_baseline` call.
+    changes: HashMap<u32, u64>,
+    /// Row count at the last stats load (from `StatsDef.row_count`).
+    baseline: HashMap<u32, u64>,
+    /// Tables currently considered stale (changes > 20% of baseline).
+    stale: HashSet<u32>,
+}
+
+impl StaleStatsTracker {
+    /// Records one row INSERT or DELETE for `table_id`.
+    /// Marks the table stale if accumulated changes exceed 20% of baseline.
+    pub fn on_row_changed(&mut self, table_id: u32) {
+        *self.changes.entry(table_id).or_insert(0) += 1;
+        self.check_stale(table_id);
+    }
+
+    /// Records multiple row changes at once (e.g. after batch DELETE).
+    pub fn on_rows_changed(&mut self, table_id: u32, count: u64) {
+        *self.changes.entry(table_id).or_insert(0) += count;
+        self.check_stale(table_id);
+    }
+
+    /// Sets the baseline row count from loaded `StatsDef.row_count`.
+    /// Called by the planner on first stats use for a table in this session.
+    pub fn set_baseline(&mut self, table_id: u32, row_count: u64) {
+        self.baseline.insert(table_id, row_count);
+        self.check_stale(table_id);
+    }
+
+    /// Clears staleness for `table_id`. Called after a successful ANALYZE.
+    pub fn mark_fresh(&mut self, table_id: u32) {
+        self.stale.remove(&table_id);
+        self.changes.remove(&table_id);
+    }
+
+    /// Returns `true` if the stats for `table_id` are considered stale.
+    pub fn is_stale(&self, table_id: u32) -> bool {
+        self.stale.contains(&table_id)
+    }
+
+    fn check_stale(&mut self, table_id: u32) {
+        let changes = self.changes.get(&table_id).copied().unwrap_or(0);
+        let baseline = self.baseline.get(&table_id).copied().unwrap_or(0);
+        // Threshold: > 20% change = > baseline / 5
+        if baseline > 0 && changes > baseline / 5 {
+            self.stale.insert(table_id);
+        }
+    }
+}
+
 // ── SessionContext ────────────────────────────────────────────────────────────
 
 /// Per-connection state: schema cache + session variables visible to the executor.
@@ -27,6 +91,8 @@ pub struct SqlWarning {
 pub struct SessionContext {
     /// Cached table schemas keyed by `"schema_name.table_name"`.
     cache: HashMap<String, ResolvedTable>,
+    /// Staleness tracker for per-column statistics (Phase 6.11).
+    pub stats: StaleStatsTracker,
     /// Whether the connection is in autocommit mode (MySQL default: `true`).
     ///
     /// When `false` (`SET autocommit=0`), the executor does not wrap DML statements
@@ -55,6 +121,7 @@ impl SessionContext {
             cache: HashMap::new(),
             autocommit: true,
             warnings: Vec::new(),
+            stats: StaleStatsTracker::default(),
         }
     }
 

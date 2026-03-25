@@ -16,7 +16,7 @@ use axiomdb_core::RecordId;
 
 use crate::{
     bootstrap::{CatalogBootstrap, CatalogPageIds},
-    schema::{ColumnDef, ConstraintDef, FkDef, IndexDef, TableDef, TableId},
+    schema::{ColumnDef, ConstraintDef, FkDef, IndexDef, StatsDef, TableDef, TableId},
 };
 
 // ── CatalogReader ─────────────────────────────────────────────────────────────
@@ -248,6 +248,62 @@ impl<'a> CatalogReader<'a> {
             }
         }
         Ok(None)
+    }
+
+    // ── Statistics reads (Phase 6.10) ─────────────────────────────────────────
+
+    /// Returns the stats for a specific `(table_id, col_idx)`.
+    /// Returns `None` for pre-6.10 databases (stats root = 0).
+    pub fn get_stats(&mut self, table_id: u32, col_idx: u16) -> Result<Option<StatsDef>, DbError> {
+        let root = self.page_ids.stats;
+        if root == 0 {
+            return Ok(None);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        for (_, _, data) in rows {
+            if let Ok((def, _)) = StatsDef::from_bytes(&data) {
+                if def.table_id == table_id && def.col_idx == col_idx {
+                    return Ok(Some(def));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns all stats rows for `table_id`.
+    /// Returns empty vec for pre-6.10 databases.
+    pub fn list_stats(&mut self, table_id: u32) -> Result<Vec<StatsDef>, DbError> {
+        let root = self.page_ids.stats;
+        if root == 0 {
+            return Ok(vec![]);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        let mut result = Vec::new();
+        for (_, _, data) in rows {
+            if let Ok((def, _)) = StatsDef::from_bytes(&data) {
+                if def.table_id == table_id {
+                    result.push(def);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Scans the raw stats heap returning (RecordId, row_bytes) pairs.
+    /// Used by `CatalogWriter::upsert_stats` to locate rows to delete.
+    pub(crate) fn scan_stats_root(
+        storage: &dyn StorageEngine,
+        root: u64,
+        snapshot: TransactionSnapshot,
+    ) -> Result<Vec<(RecordId, Vec<u8>)>, DbError> {
+        if root == 0 {
+            return Ok(vec![]);
+        }
+        let rows = HeapChain::scan_visible_ro(storage, root, snapshot)?;
+        Ok(rows
+            .into_iter()
+            .map(|(page_id, slot_id, data)| (RecordId { page_id, slot_id }, data))
+            .collect())
     }
 
     /// Scans the raw FK heap returning (RecordId, row_bytes) pairs.

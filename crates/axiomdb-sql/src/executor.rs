@@ -523,6 +523,7 @@ fn dispatch_ctx(
             ctx.invalidate_all();
             execute_alter_table(s, storage, txn)
         }
+        Stmt::Analyze(s) => execute_analyze(s, storage, txn, ctx),
         // Everything else: delegate to existing dispatch.
         other => dispatch(other, storage, txn),
     }
@@ -584,11 +585,19 @@ fn execute_select_ctx(
 
         let snap = txn.active_snapshot()?;
 
-        // Query planner: pick the best access method.
+        // ── Query planner: pick the best access method ────────────────────
+        // Load per-column statistics for cost-based index selection (Phase 6.10).
+        let table_stats: Vec<axiomdb_catalog::StatsDef> = {
+            let mut reader = CatalogReader::new(storage, snap)?;
+            reader.list_stats(resolved.def.id).unwrap_or_default()
+        };
         let access_method = crate::planner::plan_select(
             stmt.where_clause.as_ref(),
             &resolved.indexes,
             &resolved.columns,
+            resolved.def.id,
+            &table_stats,
+            &mut ctx.stats,
         );
 
         // Fetch rows via the chosen access method.
@@ -1098,8 +1107,13 @@ fn execute_insert_ctx(
 
     if let Some(id) = first_generated {
         THREAD_LAST_INSERT_ID.with(|v| v.set(id));
+        // Track row changes for stats staleness (Phase 6.11).
+        ctx.stats.on_rows_changed(resolved.def.id, count);
         return Ok(QueryResult::affected_with_id(count, id));
     }
+
+    // Track row changes for stats staleness (Phase 6.11).
+    ctx.stats.on_rows_changed(resolved.def.id, count);
 
     Ok(QueryResult::Affected {
         count,
@@ -1437,6 +1451,11 @@ fn execute_delete_ctx(
         }
     }
 
+    // Track row changes for stats staleness (Phase 6.11).
+    if count > 0 {
+        ctx.stats.on_rows_changed(resolved.def.id, count);
+    }
+
     Ok(QueryResult::Affected {
         count,
         last_insert_id: None,
@@ -1572,6 +1591,9 @@ fn dispatch(
         Stmt::AlterTable(s) => execute_alter_table(s, storage, txn),
         Stmt::ShowTables(s) => execute_show_tables(s, storage, txn),
         Stmt::ShowColumns(s) => execute_show_columns(s, storage, txn),
+        Stmt::Analyze(_) => Err(DbError::NotImplemented {
+            feature: "ANALYZE requires session context — use execute_with_ctx".into(),
+        }),
     }
 }
 
@@ -1647,12 +1669,15 @@ fn execute_select(
 
         let snap = txn.active_snapshot()?;
 
-        // ── Query planner: pick the best access method ────────────────────
-        // Use indexes already loaded by resolve_table (cached by SchemaCache).
+        // ── Query planner: pick the best access method (non-ctx path) ────
+        // No session context available — use conservative defaults (no stats).
         let access_method = crate::planner::plan_select(
             stmt.where_clause.as_ref(),
             &resolved.indexes,
             &resolved.columns,
+            resolved.def.id,
+            &[], // no stats in non-ctx path — always use index (conservative)
+            &mut crate::session::StaleStatsTracker::default(),
         );
 
         // ── Fetch rows via the chosen access method ───────────────────────
@@ -4132,10 +4157,11 @@ fn execute_create_index(
     let rows = TableEngine::scan_table(storage, &table_def, &col_defs, snap, None)?;
     let mut skipped = 0usize;
     let mut bloom_keys: Vec<Vec<u8>> = Vec::new();
-    for (rid, row_vals) in rows {
+    for (rid, row_vals) in &rows {
+        let (rid, row_vals) = (*rid, row_vals);
         // Partial index: skip rows that don't satisfy the predicate.
         if let Some(pred) = &pred_expr {
-            if !crate::eval::is_truthy(&crate::eval::eval(pred, &row_vals)?) {
+            if !crate::eval::is_truthy(&crate::eval::eval(pred, row_vals)?) {
                 continue;
             }
         }
@@ -4180,7 +4206,7 @@ fn execute_create_index(
         root_page_id: final_root,
         is_unique: stmt.unique,
         is_primary: false,
-        columns: index_columns,
+        columns: index_columns.clone(), // clone kept for stats bootstrap step 8
         predicate: predicate_sql,
         fillfactor: stmt.fillfactor.unwrap_or(90),
         is_fk_index: false, // user-created indexes are never FK auto-indexes
@@ -4192,7 +4218,43 @@ fn execute_create_index(
         bloom.add(new_index_id, key);
     }
 
+    // 8. Bootstrap per-column statistics (Phase 6.10).
+    // Reuses the `rows` scan from step 5 — no extra I/O.
+    for idx_col in &index_columns {
+        let ndv = compute_ndv_exact(idx_col.col_idx, &rows);
+        // Ignore stats write errors — stats are advisory, not correctness-critical.
+        let _ = CatalogWriter::new(storage, txn)?.upsert_stats(axiomdb_catalog::StatsDef {
+            table_id: table_def.id,
+            col_idx: idx_col.col_idx,
+            row_count: rows.len() as u64,
+            ndv,
+        });
+    }
+
     Ok(QueryResult::Empty)
+}
+
+// ── NDV helper (Phase 6.10) ───────────────────────────────────────────────────
+
+/// Computes the exact number of distinct non-NULL values for `col_idx` in `rows`.
+///
+/// Uses order-preserving encoded key bytes as the hash key so that the result
+/// is consistent with the B-Tree key encoding (encode_index_key).
+/// Phase 6.15 will add reservoir sampling (Duj1 estimator) for large tables.
+fn compute_ndv_exact(col_idx: u16, rows: &[(RecordId, Vec<Value>)]) -> i64 {
+    use crate::key_encoding::encode_index_key;
+    use std::collections::HashSet;
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    for (_, row) in rows {
+        let val = row.get(col_idx as usize).unwrap_or(&Value::Null);
+        if matches!(val, Value::Null) {
+            continue; // NULLs are not indexed and don't count toward NDV
+        }
+        if let Ok(key) = encode_index_key(std::slice::from_ref(val)) {
+            seen.insert(key);
+        }
+    }
+    seen.len() as i64
 }
 
 // ── DROP INDEX ────────────────────────────────────────────────────────────────
@@ -4319,6 +4381,89 @@ fn free_btree_pages(storage: &mut dyn StorageEngine, root_pid: u64) -> Result<()
         storage.free_page(pid)?;
     }
     Ok(())
+}
+
+// ── ANALYZE (Phase 6.12) ──────────────────────────────────────────────────────
+
+/// Refreshes per-column statistics by doing an exact full-table scan.
+///
+/// Computes `row_count` and `ndv` (distinct non-NULL values) for each target
+/// column and writes them to `axiom_stats` via `CatalogWriter::upsert_stats`.
+///
+/// After ANALYZE, the staleness counter for the table is cleared in `ctx.stats`
+/// so the query planner can immediately use the fresh statistics.
+fn execute_analyze(
+    stmt: crate::ast::AnalyzeStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let schema = "public";
+    let snap = txn.active_snapshot()?;
+
+    // Collect target tables.
+    let target_tables: Vec<String> = if let Some(table_name) = stmt.table {
+        vec![table_name]
+    } else {
+        // ANALYZE without TABLE — all tables in schema.
+        let mut reader = CatalogReader::new(storage, snap)?;
+        reader
+            .list_tables(schema)?
+            .into_iter()
+            .map(|t| t.table_name)
+            .collect()
+    };
+
+    for table_name in target_tables {
+        let resolved = {
+            let mut resolver = make_resolver(storage, txn)?;
+            match resolver.resolve_table(Some(schema), &table_name) {
+                Ok(r) => r,
+                Err(_) => continue, // table may not exist — skip
+            }
+        };
+
+        // Scan the full table once.
+        let rows = TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap, None)?;
+        let row_count = rows.len() as u64;
+
+        // Determine target columns: all indexed columns OR a specific one.
+        let target_col_idxs: Vec<u16> = if let Some(col_name) = &stmt.column {
+            resolved
+                .columns
+                .iter()
+                .filter(|c| &c.name == col_name)
+                .map(|c| c.col_idx)
+                .collect()
+        } else {
+            // All columns that appear as leading columns of any index.
+            let mut seen = std::collections::HashSet::new();
+            resolved
+                .indexes
+                .iter()
+                .filter_map(|i| i.columns.first().map(|c| c.col_idx))
+                .filter(|col_idx| seen.insert(*col_idx))
+                .collect()
+        };
+
+        for col_idx in target_col_idxs {
+            let ndv = compute_ndv_exact(col_idx, &rows);
+            // Ignore write errors — stats are advisory.
+            let _ = CatalogWriter::new(storage, txn)?.upsert_stats(axiomdb_catalog::StatsDef {
+                table_id: resolved.def.id,
+                col_idx,
+                row_count,
+                ndv,
+            });
+        }
+
+        // Clear staleness so the planner uses fresh stats immediately.
+        ctx.stats.mark_fresh(resolved.def.id);
+        // Invalidate schema cache so next query gets fresh resolved table.
+        ctx.invalidate_table(schema, &table_name);
+    }
+
+    Ok(QueryResult::Empty)
 }
 
 // ── TRUNCATE TABLE (4.21) ─────────────────────────────────────────────────────

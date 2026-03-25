@@ -237,6 +237,24 @@ impl<'src> Parser<'src> {
                 // Consume optional alias (some clients send it)
                 Ok(Stmt::TruncateTable(crate::ast::TruncateTableStmt { table }))
             }
+            Token::Analyze => {
+                self.advance();
+                // ANALYZE [TABLE name [(column)]]
+                let table = if self.eat(&Token::Table) {
+                    Some(self.parse_identifier()?)
+                } else {
+                    None
+                };
+                let column = if self.peek() == &Token::LParen {
+                    self.advance();
+                    let col = self.parse_identifier()?;
+                    self.expect(&Token::RParen)?;
+                    Some(col)
+                } else {
+                    None
+                };
+                Ok(Stmt::Analyze(crate::ast::AnalyzeStmt { table, column }))
+            }
             Token::Show => {
                 self.advance();
                 match self.peek().clone() {
