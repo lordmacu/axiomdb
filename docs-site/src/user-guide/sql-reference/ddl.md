@@ -293,13 +293,18 @@ explicitly.
 ```sql
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] index_name
 ON table_name (column [ASC|DESC], ...)
+[WITH (fillfactor = N)]
 [WHERE condition];
 ```
+
+`fillfactor` controls how full a B-Tree leaf page gets before splitting (10–100,
+default 90). Lower values leave room for future inserts without triggering splits.
+See [Fill Factor](../features/indexes.md#fill-factor) for details.
 
 ### Examples
 
 ```sql
--- Accelerate lookups by email in a large users table
+-- Standard index
 CREATE INDEX idx_users_email ON users (email);
 
 -- Composite index: queries filtering by (user_id, placed_at) benefit
@@ -311,6 +316,14 @@ CREATE UNIQUE INDEX uq_products_sku ON products (sku);
 -- Partial index: index only active products (reduces index size)
 CREATE INDEX idx_active_products ON products (category_id)
 WHERE deleted_at IS NULL;
+
+-- Fill factor: append-heavy time-series table (leaves 30% free for inserts)
+CREATE INDEX idx_ts ON events(created_at) WITH (fillfactor = 70);
+
+-- Fill factor + partial index combined
+CREATE UNIQUE INDEX uq_active_email ON users(email)
+WHERE deleted_at IS NULL
+-- WITH clause can appear before or after WHERE (both are accepted)
 ```
 
 ### When to Add an Index
@@ -506,3 +519,33 @@ INSERT INTO log_events (msg) VALUES ('restart');          -- id: 1
 Returns `Affected { count: 0 }` (MySQL convention). See also
 [TRUNCATE TABLE in the DML reference](dml.md#truncate-table) for a comparison
 with `DELETE FROM table`.
+
+
+---
+
+## ANALYZE
+
+Refreshes per-column statistics used by the query planner to choose between
+an index scan and a full table scan.
+
+```sql
+ANALYZE;                          -- all tables in the current schema
+ANALYZE TABLE table_name;         -- specific table, all indexed columns
+ANALYZE TABLE table_name (col);   -- specific table, one column only
+```
+
+`ANALYZE` computes exact `row_count` and NDV (number of distinct non-NULL
+values) for each target column by scanning the full table. Results are stored
+in the `axiom_stats` system catalog and are immediately available to the planner.
+
+```sql
+-- After a bulk import, refresh stats so the planner uses correct selectivity:
+INSERT INTO products SELECT * FROM products_staging;
+ANALYZE TABLE products;
+
+-- Check a single column after targeted inserts:
+ANALYZE TABLE orders (status);
+```
+
+See [Index Statistics](../features/indexes.md#index-statistics-and-query-planner)
+for how NDV and row_count affect query planning decisions.
