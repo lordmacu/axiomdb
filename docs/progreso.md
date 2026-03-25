@@ -128,6 +128,7 @@
 - [x] 4.9a ✅ GROUP BY hash-based — HashMap<key_bytes, GroupState>; value_to_key_bytes; NULL keys group correctly
 - [ ] 4.9b ⏳ GROUP BY sort-based — sort first, then stream; optimal when data is pre-sorted by index (deferred)
 - [x] 4.9c ✅ Aggregate functions — COUNT(*), COUNT(col), SUM, MIN, MAX, AVG (→ Real); skip NULL; finalize
+- [ ] 4.9e ⏳ GROUP_CONCAT() — `SELECT GROUP_CONCAT(tag ORDER BY tag SEPARATOR ', ') FROM tags GROUP BY post_id`; MySQL's most-used aggregate function; DISTINCT modifier to deduplicate before concatenating; max length configurable; NULL values skipped; returns NULL for empty group; without this, virtually every MySQL codebase that stores tags, roles, or categories fails to migrate
 - [x] 4.9d ✅ HAVING clause — eval_with_aggs intercepts aggregate calls; representative_row for col refs
 - [x] 4.10 ✅ ORDER BY + LIMIT/OFFSET — in-memory sort; stable sort_by; sort_err pattern
 - [x] 4.10b ✅ Multi-column ORDER BY with mixed direction — composite comparator, left-to-right
@@ -144,6 +145,7 @@
 - [x] 4.14 ✅ LAST_INSERT_ID() / lastval() — AUTO_INCREMENT execution + per-table thread-local sequence; ColumnDef.auto_increment flag (bit1 of existing flags byte); LAST_INSERT_ID()/lastval() in eval_function
 - [x] 4.19 ✅ Basic built-in functions — `ABS`, `LENGTH`, `SUBSTR`, `UPPER`, `LOWER`, `TRIM`, `COALESCE`, `NOW()`, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `ROUND`, `FLOOR`, `CEIL`
 - [x] 4.19b ✅ BLOB functions — `FROM_BASE64(text)→BLOB`, `TO_BASE64(blob)→TEXT`, `OCTET_LENGTH(value)→INT`, `ENCODE(blob,'base64'/'hex')→TEXT`, `DECODE(text,'base64'/'hex')→BLOB`; b64_encode/b64_decode/hex_encode/hex_decode helpers inline (no external crate)
+- [x] 4.19d ✅ MySQL scalar functions — `DATE_FORMAT(ts, fmt)` (MySQL strftime-style, all 18 specifiers + passthrough for unknowns); `STR_TO_DATE(str, fmt)` (inverse parser, NULL on failure, 2-digit year rule); `FIND_IN_SET(needle, csv)` (1-indexed, case-insensitive); fixed `year/month/day/hour/minute/second` extractors (were stub, now use chrono); `IF/IFNULL/NULLIF` were already implemented
 - [x] 4.19c ✅ UUID generation functions — `gen_random_uuid()`/`uuid_generate_v4()` (UUID v4 random); `uuid_generate_v7()`/`uuid7()` (UUID v7 time-ordered, better B+Tree locality); `is_valid_uuid(text)→BOOL`; `parse_uuid_str` helper; rand crate added to axiomdb-sql
 
 <!-- ── Group G — DevEx (parallel with E+F) ── -->
@@ -186,6 +188,7 @@
 - [x] 5.9 ✅ Session state — ConnectionState: SET autocommit/NAMES/@@vars stored; SHOW VARIABLES result set; SELECT @@var from state; COM_INIT_DB updates current_database
 - [x] 5.10 ✅ COM_STMT_PREPARE / COM_STMT_EXECUTE — binary param decoding (TINY/SHORT/LONG/LONGLONG/FLOAT/DOUBLE/DATE/DATETIME/strings); ? substitution with escape; COM_STMT_CLOSE/RESET; pymysql full test suite passes (INT/Bool/NULL/quotes/DictCursor)
 - [x] 5.11 ✅ COM_PING / COM_QUIT / COM_RESET_CONNECTION / COM_INIT_DB — all handled in handler.rs command loop (0x0e, 0x01, 0x1f, 0x02)
+- [ ] 5.9c ⏳ SHOW STATUS — server counters queryable via `SHOW STATUS` and `SHOW GLOBAL STATUS`: `Threads_connected`, `Threads_running`, `Questions`, `Uptime`, `Bytes_received`, `Bytes_sent`, `Com_select`, `Com_insert`, `Innodb_buffer_pool_read_requests`, `Innodb_buffer_pool_reads`; MySQL ORMs, monitoring tools (PMM, Datadog MySQL integration), and health checks all call `SHOW STATUS` on connect or periodically; returning empty or error breaks compatibility
 - [ ] 5.9b ⏳ `@@in_transaction` system variable — returns 1 inside an active transaction, 0 otherwise; visible via `SELECT @@in_transaction`; lets developers and ORMs verify transaction state without tracking it themselves; also add warning in OK packet (warning_count=1) when COMMIT/ROLLBACK is a no-op (no active txn), queryable via `SHOW WARNINGS`
 - [ ] 5.11b ⏳ COM_STMT_SEND_LONG_DATA — chunked transmission of large parameters (BLOBs, TEXTs) in multiple packets; required for INSERT of images/documents via prepared statements
 - [ ] 5.11c ⏳ Explicit connection state machine — states: `CONNECTED→AUTH→IDLE→EXECUTING→CLOSING`; timeout handling per state; detect abruptly closed socket (TCP keepalive)
@@ -463,6 +466,7 @@
 - [ ] 19.17 ⏳ Prometheus metrics endpoint — `/metrics` HTTP on configurable port; expose ops/s, p99 latency, cache hit rate, replication lag
 - [ ] 19.18 ⏳ Health check endpoint — `/health` and `/ready` for load balancers; verify WAL, storage and replicas
 - [ ] 19.19 ⏳ pg_stat_wal — bytes written, syncs, sync time; detect WAL as bottleneck
+- [ ] 19.21 ⏳ performance_schema equivalent — `axiom_performance_schema` namespace with: `events_statements_current` (running queries with digest, timer, rows_examined), `events_statements_history` (last 10 per connection), `events_waits_current` (lock waits, I/O waits), `table_io_waits_summary_by_table` (read/write latency per table), `file_io_summary` (bytes read/written per file); activated via `SET axiom_performance_schema = ON`; zero overhead when off (unlike MySQL where it's always on); MySQL monitoring tools (PMM, Datadog, New Relic MySQL integration) query these tables — this makes those tools work with AxiomDB without a custom plugin
 - [ ] 19.20 ⏳ Audit trail infrastructure — write audit logs async (circular buffer, without blocking writer); JSON format with: user, IP, SQL, bind params, rows_affected, duration, result; daily rotation; prerequisite for 17.7 (CREATE AUDIT POLICY)
 
 ---
@@ -475,6 +479,7 @@
 - [ ] 20.3 ⏳ ENUMs — `CREATE TYPE ... AS ENUM` with validation and semantic order
 - [ ] 20.4 ⏳ Arrays — `TEXT[]`, `FLOAT[]`, `ANY()`, `@>`
 - [ ] 20.5 ⏳ COPY FROM/TO — import/export CSV, JSON, JSONL
+- [ ] 20.5b ⏳ SELECT … INTO OUTFILE — `SELECT id, name FROM users INTO OUTFILE '/tmp/users.csv' FIELDS TERMINATED BY ',' ENCLOSED BY '"' LINES TERMINATED BY '\n'`; MySQL syntax for exporting query results directly to a file on the server; complement of `LOAD DATA INFILE`; used in ETL pipelines and scheduled data exports; server-side write (unlike COPY TO CLIENT which sends data over wire)
 - [ ] 20.6 ⏳ Parquet — direct `READ_PARQUET()` + export with `crate parquet`
 - [ ] 20.7 ⏳ Incremental backup — diff from last backup + full restore
 - [ ] 20.8 ⏳ COPY streaming — import CSV/JSON line-by-line without loading into memory; support files >RAM
@@ -497,7 +502,11 @@
 - [ ] 21.3 ⏳ Recursive CTEs — `WITH RECURSIVE` for trees and hierarchies
 - [ ] 21.4 ⏳ RETURNING — in INSERT, UPDATE, DELETE
 - [ ] 21.5 ⏳ MERGE / UPSERT — `ON CONFLICT DO UPDATE` + standard `MERGE`
+- [ ] 21.5b ⏳ REPLACE INTO — `REPLACE INTO users (id, name) VALUES (1, 'Alice')`; MySQL shorthand for DELETE-then-INSERT; if the row does not exist it inserts; if it does, it deletes the old row and inserts the new one (triggers ON DELETE + ON INSERT, unlike ON DUPLICATE KEY UPDATE which triggers ON UPDATE); AUTO_INCREMENT increments on replace; very common in MySQL codebases for upsert-by-PK patterns
+- [ ] 21.5c ⏳ INSERT IGNORE — `INSERT IGNORE INTO tags (post_id, tag) VALUES (1, 'rust')`; silences unique/FK/NOT NULL violations and inserts only the rows that don't conflict; returns warning count instead of error; used extensively for idempotent imports, tag systems, and bulk loads where partial success is acceptable
+- [ ] 21.5d ⏳ Multi-table UPDATE/DELETE — `UPDATE orders o JOIN customers c ON o.customer_id = c.id SET o.priority = c.tier WHERE c.country = 'CO'`; and `DELETE o FROM orders o JOIN customers c ON o.customer_id = c.id WHERE c.deleted_at IS NOT NULL`; MySQL-specific syntax widely used in data migrations and cleanup scripts; different from standard SQL MERGE — simpler for the common "join + update/delete" pattern
 - [ ] 21.6 ⏳ CHECK constraints + DOMAIN types
+- [ ] 21.6b ⏳ Exclusion constraints — `CREATE TABLE reservations (..., EXCLUDE USING btree (room_id WITH =, period WITH &&))`; prevents rows where ALL specified operators return TRUE simultaneously; B-Tree exclusion for equality (e.g., no duplicate active slugs); full range-overlap exclusion (hotel rooms, calendar slots, parking spots) requires GiST index (Phase 30.2); use case: `EXCLUDE USING gist (room WITH =, during WITH &&)` guarantees no two reservations overlap the same room in the same time period — impossible to enforce with CHECK or UNIQUE; `period` requires range type (Phase 20.13); document B-Tree subset now, GiST full power after Phase 30.2
 - [ ] 21.7 ⏳ TEMP and UNLOGGED tables
 - [ ] 21.8 ⏳ Expression indexes — `CREATE INDEX ON users(LOWER(email))`
 - [ ] 21.9 ⏳ LATERAL joins
@@ -665,6 +674,7 @@
 - [ ] 24.11 ⏳ RANGE(T) — `int4range`, `daterange`, `tsrange` with `@>` and `&&`
 - [ ] 24.12 ⏳ COMPOSITE types — `CREATE TYPE ... AS (fields)`
 - [ ] 24.13 ⏳ Domain types — `CREATE DOMAIN email AS TEXT CHECK (VALUE ~ '^.+@.+$')` with constraint inheritance
+- [ ] 24.14b ⏳ MySQL type aliases — `TINYTEXT` (≤255B), `MEDIUMTEXT` (≤16MB), `LONGTEXT` (≤4GB) stored as TEXT with length constraint; `TINYBLOB`, `MEDIUMBLOB`, `LONGBLOB` stored as BLOB with limit; `ZEROFILL` display attribute on integer columns (`INT(10) ZEROFILL` pads with zeros on display, stored as normal INT); `SET('a','b','c')` multi-value type (stores a bitmask, displays as comma-separated subset of declared values; different from ENUM which allows one value); these types are required to import `mysqldump` output without manual schema rewriting
 - [ ] 24.14 ⏳ Complete type tests — coercion, overflow, DECIMAL precision, timezone conversions
 
 ### Phase 25 — Type optimizations `⏳` week 70-72
@@ -741,11 +751,13 @@
 - [ ] 29.16 ⏳ COPY binary protocol — bulk load in binary format (faster than CSV)
 - [ ] 29.17 ⏳ Network functions — `HOST()`, `NETWORK()`, `BROADCAST()`, `MASKLEN()` for INET/CIDR types
 - [ ] 29.18 ⏳ Function tests — suite covering all function types: text, date, math, JSON, array
+- [ ] 29.19 ⏳ CONVERT_TZ() — `CONVERT_TZ(ts, 'UTC', 'America/Bogota')` converts a TIMESTAMP between timezone identifiers; uses embedded tzdata (29.6); prerequisite for apps that store UTC internally and display in local time per user; `@@global.time_zone` and `@@session.time_zone` variables affect implicit conversion
+- [ ] 29.20 ⏳ BIT aggregates — `BIT_AND(flags)`, `BIT_OR(flags)`, `BIT_XOR(flags)` aggregate functions; `BIT_OR` used for permission bitmask accumulation (`SELECT BIT_OR(permission_mask) FROM roles WHERE user_id = ?`); `BIT_XOR` used for row checksums (change detection without hashing); all skip NULL values per SQL standard
 
 ### Phase 30 — Pro infrastructure `⏳` week 85-87
 - [ ] 30.1 ⏳ GIN indexes — for arrays, JSONB and trigrams
 - [ ] 30.2 ⏳ GiST indexes — for ranges and geometry
-- [ ] 30.3 ⏳ BRIN indexes — huge tables with ordered data, minimum space
+- [ ] 30.3 ⏳ BRIN advanced — multi-column BRIN, custom `pages_per_range`, `BRIN_SUMMARIZE_NEW_VALUES()`, integration with GiST for geometric ranges (basic BRIN implemented in 11.1b)
 - [ ] 30.4 ⏳ Hash indexes — O(1) for exact equality
 - [ ] 30.5 ⏳ CREATE INDEX CONCURRENTLY — without blocking writes
 - [ ] 30.6 ⏳ Complete information_schema — tables, columns, constraints
