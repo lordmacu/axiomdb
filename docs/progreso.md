@@ -216,6 +216,7 @@
 - [ ] 6.15 ⏳ Index corruption detection — on DB open verify index checksums; detect index vs table divergence; automatic `REINDEX` if divergent (recovery mode)
 
 ### Phase 7 — Concurrency + MVCC `⏳` week 40-48
+- [ ] ⚠️ **ANTES DE 7.1** — Non-unique secondary indexes composite key: aplicar patrón `(value | RecordId)` a TODOS los secondary indexes no-únicos (igual que FK auto-indexes en 6.9). Actualmente el B-Tree rechaza DuplicateKey cuando dos rows tienen el mismo valor en un índice no-único. Blocker para MVCC on secondary indexes (6.14).
 - [ ] 7.1 ⏳ MVCC visibility rules — snapshot_id rules over RowHeader (struct defined in 3.4): which rows are visible; implement READ COMMITTED (snapshot per statement) and REPEATABLE READ (snapshot per transaction) explicitly
 - [ ] 7.2 ⏳ Transaction manager — global atomic txn_id counter
 - [ ] 7.3 ⏳ Snapshot isolation — visibility rules per snapshot_id
