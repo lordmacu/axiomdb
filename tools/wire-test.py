@@ -24,6 +24,28 @@ _server_proc = None
 _data_dir    = None
 
 
+def _check_binary_freshness(binary):
+    """Abort if any .rs source file is newer than the binary.
+
+    Catches the 'stale release binary' trap: cargo build updates target/debug/
+    but wire-test.py would silently pick an older target/release/ binary, running
+    tests against code that predates the current changes.
+    """
+    import glob
+    binary_mtime = os.path.getmtime(binary)
+    stale = [
+        f for f in glob.glob("crates/**/*.rs", recursive=True)
+        if os.path.getmtime(f) > binary_mtime
+    ]
+    if stale:
+        print(f"\nERROR: binary '{binary}' is stale.")
+        print(f"  {len(stale)} source file(s) are newer than the binary, e.g.:")
+        for f in stale[:3]:
+            print(f"    {f}")
+        print("\nFix: cargo build --bin axiomdb-server")
+        sys.exit(1)
+
+
 def start_server():
     global _server_proc, _data_dir
     debug   = "target/debug/axiomdb-server"
@@ -39,6 +61,7 @@ def start_server():
     if not os.path.isfile(binary):
         print("Server binary not found — build first: cargo build -p axiomdb-server")
         sys.exit(1)
+    _check_binary_freshness(binary)
     _data_dir = tempfile.mkdtemp(prefix="axiomdb-wire-")
     env = os.environ.copy()
     env["AXIOMDB_DATA"] = _data_dir
