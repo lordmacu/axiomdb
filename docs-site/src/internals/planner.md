@@ -36,6 +36,20 @@ pub enum AccessMethod {
 
 `plan_select(where_clause, indexes, columns)` applies rules in order:
 
+### Rule 0 — Composite equality (Phase 6.9)
+
+```
+WHERE col1 = v1 AND col2 = v2    (N ≥ 2 leading columns of index)
+```
+
+Condition: `col1, col2, ...` match the **N leading columns** of a composite index
+`(col1, col2, ...)` as equality conditions in the AND-tree.
+
+Result: `AccessMethod::IndexRange { lo: encode(v1, v2), hi: encode(v1, v2) }`
+
+Both unique and non-unique composite indexes return all matching rows via range
+scan with `lo = hi = composite_key`.
+
 ### Rule 1 — Equality lookup
 
 ```
@@ -44,7 +58,9 @@ WHERE col = literal    OR    literal = col
 
 Condition: `col` is the **first column** of a non-primary secondary index.
 
-Result: `AccessMethod::IndexLookup { index_def, key: encode(literal) }`
+- Single-column index → `AccessMethod::IndexLookup { key: encode(literal) }`
+- Composite index → `AccessMethod::IndexRange { lo: prefix, hi: prefix + [0xFF…] }`
+  (prefix scan returns all rows matching the leading column regardless of trailing columns)
 
 ### Rule 2 — Range scan
 
@@ -59,11 +75,28 @@ non-primary secondary index.
 
 Result: `AccessMethod::IndexRange { index_def, lo: encode(lo_val), hi: encode(hi_val) }`
 
+### Statistics cost gate (Phase 6.10)
+
+After any Rule 0–2 match, the planner applies a statistics-based cost gate before
+returning the index access method:
+
+```
+ndv       = stats.ndv > 0 ? stats.ndv : DEFAULT_NUM_DISTINCT (= 200)
+selectivity = 1.0 / ndv            // equality predicate: ~1/ndv rows match
+if row_count < 1,000: return Scan  // tiny table — index overhead not worth it
+if selectivity > 0.20: return Scan // low-cardinality — full scan is cheaper
+→ return IndexLookup / IndexRange  // selective enough for an index scan
+```
+
+`DEFAULT_NUM_DISTINCT = 200` is used when no statistics exist (pre-Phase 6.10
+databases, or ANALYZE has not been run). This is conservative — always uses the
+index when uncertain, which is never wrong.
+
 ### Fallback
 
 All other patterns → `AccessMethod::Scan`.
 
-Patterns **not** recognized (Phase 6.3):
+Patterns **not** recognized:
 - OR predicates
 - Functions (`WHERE lower(name) = 'alice'`)
 - Non-leading index column (`WHERE col2 = x` when index is `(col1, col2)`)
@@ -207,10 +240,11 @@ index absent-key path.
 
 ## Deferred Items
 
-| Feature | Phase |
-|---------|-------|
-| Composite multi-column planner (> 1 column WHERE) | 6.8 |
-| Cost-based optimizer (NDV, row counts) | 6.10 |
-| `EXPLAIN` statement | 8.x |
-| Covering indexes (index-only scan, no heap read) | 9.x |
-| Partial index predicate matching in planner | 10.x |
+| Feature | Status | Phase |
+|---------|--------|-------|
+| Composite multi-column planner (> 1 column WHERE) | ✅ Done | 6.9 |
+| Statistics cost gate (NDV, selectivity threshold) | ✅ Done | 6.10 |
+| `EXPLAIN` statement | ⏳ Planned | 8.x |
+| Covering indexes (index-only scan, no heap read) | ⏳ Planned | 6.13 |
+| Partial index predicate matching (complex implication) | ⏳ Planned | 6.15 |
+| Join selectivity estimation | ⏳ Planned | 6.15 |
