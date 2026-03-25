@@ -564,7 +564,64 @@
 - [ ] 22d.6 ⏳ OData authentication — Bearer token + Basic Auth for enterprise connectors
 - [ ] 22d.7 ⏳ OData end-to-end tests — connect real Excel/PowerBI + automated $filter/$expand/$batch suite
 
-### Phase 23 — Backwards compatibility `⏳` week 64-66
+### Phase 22e — Native Toolkit System `⏳` week 64-67
+
+> **Design:** `db.md` § "Native Toolkit System" — the complete spec.
+> Toolkits are built-in domain packs (blog, ecommerce, iot, saas, analytics) that activate
+> types, functions, schema templates, optimizer hints, and monitoring views with one SQL command.
+> Zero external dependencies — everything compiled into the binary.
+
+#### 22e.A — Core infrastructure
+- [ ] 22e.1 ⏳ `INSTALL TOOLKIT` / `UNINSTALL TOOLKIT` / `LIST TOOLKITS` — DDL parser + executor; persists activation in `axiom_toolkits` catalog table; one row per installed toolkit with name, version, installed_at
+- [ ] 22e.2 ⏳ `DESCRIBE TOOLKIT name` — shows types, functions, templates, and monitoring views provided by the toolkit
+- [ ] 22e.3 ⏳ `axiom_toolkits` system view — name, version, installed_at, objects_count
+- [ ] 22e.4 ⏳ `axiom_toolkit_objects` system view — object_type, object_name, schema, toolkit
+- [ ] 22e.5 ⏳ `axiom_toolkit_functions` system view — function_name, signature, toolkit, description
+- [ ] 22e.6 ⏳ Schema templates — `CREATE TABLE t LIKE TOOLKIT blog.posts`; generates DDL with best-practice column definitions, constraints, indexes, and RLS policies for the template; does NOT auto-create tables
+- [ ] 22e.7 ⏳ Toolkit optimizer hints — planner reads `axiom_toolkits` at session start; adjusts prefetch strategy, join preference, and index suggestion thresholds based on declared workload (read-heavy/write-heavy/analytical)
+- [ ] 22e.8 ⏳ Toolkit combinability — multiple toolkits can be installed simultaneously; their namespaces are orthogonal (`toolkit_blog.*`, `toolkit_saas.*`); conflict detection for overlapping type names
+
+#### 22e.B — Toolkit: blog
+- [ ] 22e.10 ⏳ Domain types — `SLUG TEXT CHECK (value ~ '^[a-z0-9][a-z0-9-]*[a-z0-9]$')`, `POST_STATUS ENUM('draft','published','scheduled','archived')`, `READING_LEVEL ENUM('easy','moderate','advanced')`
+- [ ] 22e.11 ⏳ Domain functions — `SLUG(text)→TEXT` (normalizes to URL-safe slug), `EXCERPT(text, max_words INT)→TEXT`, `READING_TIME(text)→INT` (minutes at 200 wpm), `WORD_COUNT(text)→INT`, `EXTRACT_HEADINGS(text)→TEXT[]`, `RANK_POSTS(query TEXT, col TEXT)→REAL` (BM25 + recency score)
+- [ ] 22e.12 ⏳ Schema templates — `blog.posts` (id, title, slug SLUG, content, excerpt, author_id, status POST_STATUS, published_at, fts_vector; + partial index on published_at WHERE status='published', FTS index), `blog.comments` (with parent_id for nesting), `blog.tags`, `blog.post_tags`, `blog.categories` (with ltree path)
+- [ ] 22e.13 ⏳ Monitoring — `axiom_blog_stats` (post_count by status, draft_count, avg_reading_time, comment_count_today, top_tags TEXT[])
+
+#### 22e.C — Toolkit: ecommerce
+- [ ] 22e.20 ⏳ Domain types — `MONEY` composite `(amount DECIMAL(12,4), currency CHAR(3))` with `+`, `-`, `*` operators, `SKU TEXT CHECK (value ~ '^[A-Z0-9][A-Z0-9\-_]{1,63}$')`, `ORDER_STATUS ENUM('pending','confirmed','processing','shipped','delivered','cancelled','refunded')`
+- [ ] 22e.21 ⏳ Domain functions — `APPLY_TAX(amount, country CHAR(2), category TEXT)→MONEY`, `CONVERT_CURRENCY(amount DECIMAL, from CHAR(3), to CHAR(3))→DECIMAL` (uses `axiom_exchange_rates`), `NEXT_INVOICE_NUM(series TEXT)→TEXT` (gapless sequence, same guarantee as 13.10)
+- [ ] 22e.22 ⏳ Inventory functions — `RESERVE_INVENTORY(sku, qty INT, session_id TEXT)→BIGINT` (returns reservation_id), `COMMIT_RESERVATION(reservation_id BIGINT)→BOOL`, `RELEASE_RESERVATION(reservation_id BIGINT)→BOOL`; reservations stored in `toolkit_ecommerce.reservations` with TTL
+- [ ] 22e.23 ⏳ Schema templates — `ecommerce.products`, `ecommerce.inventory` (sku, stock, reserved, available as generated column), `ecommerce.orders`, `ecommerce.order_items`, `ecommerce.invoices` (gapless seq, fiscal period aware)
+- [ ] 22e.24 ⏳ Monitoring — `axiom_inventory_status` (sku, stock, reserved, available), `axiom_order_pipeline` (orders by status + age bucket), `axiom_revenue_today` (total by currency)
+
+#### 22e.D — Toolkit: iot
+- [ ] 22e.30 ⏳ Domain types — `DEVICE_STATUS ENUM('active','inactive','error','maintenance')`, `READING_QUALITY ENUM('good','uncertain','bad')`
+- [ ] 22e.31 ⏳ Domain functions — `TIME_BUCKET(bucket INTERVAL, ts TIMESTAMP)→TIMESTAMP` (like TimescaleDB), `DEAD_BAND(new_val REAL, prev_val REAL, threshold REAL)→BOOL`, `INTERPOLATE_LOCF(ts TIMESTAMP, val REAL)→REAL`, `INTERPOLATE_LINEAR(ts1 TIMESTAMP, v1 REAL, ts2 TIMESTAMP, v2 REAL, target TIMESTAMP)→REAL`, `SENSOR_DRIFT(readings REAL[], expected REAL)→REAL`
+- [ ] 22e.32 ⏳ Schema templates — `iot.devices` (id, name, type, location POINT, status), `iot.readings` (device_id, ts, value, quality; auto-partitioned by month, BRIN on ts, TTL configurable), `iot.alerts` (device_id, ts, severity, message, resolved_at)
+- [ ] 22e.33 ⏳ Monitoring — `axiom_device_status` (last_seen, reading_count_24h, alert_count_open per device), `axiom_data_freshness` (table, last_insert, expected_interval, status), `axiom_sensor_health` (devices silent for > expected interval)
+
+#### 22e.E — Toolkit: saas
+- [ ] 22e.40 ⏳ Domain types — `TENANT_ID BIGINT NOT NULL`, `SUBSCRIPTION_TIER ENUM('free','starter','pro','enterprise')`
+- [ ] 22e.41 ⏳ Domain functions — `CURRENT_TENANT()→BIGINT` (reads from session variable `app.tenant_id`), `TENANT_QUOTA_CHECK(resource TEXT, amount BIGINT)→BOOL` (consults `axiom_quota_limits`), `ANONYMIZE(text TEXT)→TEXT` (SHA-256 prefix, GDPR-safe), `MASK_PII(text TEXT, policy TEXT)→TEXT`
+- [ ] 22e.42 ⏳ Auto-RLS — when saas toolkit is active, `CREATE TABLE` with a `tenant_id` column automatically gets a RLS policy `USING (tenant_id = CURRENT_TENANT())`; opt-out via `WITH (no_toolkit_rls = true)`
+- [ ] 22e.43 ⏳ Schema templates — `saas.tenants`, `saas.subscriptions`, `saas.audit_log` (immutable, append-only via 13.9), `saas.quota_usage`
+- [ ] 22e.44 ⏳ Monitoring — `axiom_tenant_usage` (tenant_id, storage_bytes, row_count, queries_today), `axiom_quota_alerts` (tenants at >80% of any quota), `axiom_compliance_log` (accesses to PII columns with user + timestamp)
+
+#### 22e.F — Toolkit: analytics
+- [ ] 22e.50 ⏳ Domain functions — `PERCENTILE_RANK(value REAL, dataset REAL[])→REAL`, `Z_SCORE(value REAL, mean REAL, stddev REAL)→REAL`, `MOVING_AVG(col, window_size INT)→REAL` (sugar for window function), `COHORT_DATE(ts TIMESTAMP, granularity TEXT)→DATE` ('week'/'month'/'quarter'), `RETENTION_RATE(cohort_date DATE, event_date DATE)→REAL`, `FUNNEL_STEP(user_id BIGINT, step INT, ts TIMESTAMP)→BOOL`
+- [ ] 22e.51 ⏳ Schema templates — `analytics.events` (user_id, event TEXT, ts, properties JSON; GIN on properties), `analytics.sessions` (session_id, user_id, started_at, ended_at, event_count), `analytics.funnels` (funnel_id, step_order, event_name, description)
+- [ ] 22e.52 ⏳ Monitoring — `axiom_query_stats` (top queries by cost + frequency), `axiom_slow_analytical` (analytical queries > threshold), `axiom_cache_efficiency` (buffer pool hit rate per table)
+
+#### 22e.G — Quality
+- [ ] 22e.60 ⏳ Toolkit combination tests — install blog+saas, ecommerce+saas, iot+analytics; verify no namespace conflicts, RLS applies correctly, optimizer hints don't conflict
+- [ ] 22e.61 ⏳ Schema template tests — `CREATE TABLE LIKE TOOLKIT x.y`; verify generated DDL compiles, indexes are created, RLS policies are attached
+- [ ] 22e.62 ⏳ Domain function tests — unit tests for every toolkit function; edge cases (empty string, NULL, overflow, invalid currency code)
+- [ ] 22e.63 ⏳ Monitoring view tests — insert test data, verify all `axiom_*` views return correct aggregates
+- [ ] 22e.64 ⏳ Documentation — user guide page per toolkit: SQL examples, schema template output, monitoring queries, combination guide
+
+---
+
+### Phase 23 — Backwards compatibility `⏳` week 68-71
 - [ ] 23.1 ⏳ Native SQLite reader — parse binary `.db`/`.sqlite` format
 - [ ] 23.2 ⏳ ATTACH sqlite — `ATTACH 'file.sqlite' AS src USING sqlite`
 - [ ] 23.3 ⏳ Migrate from MySQL — `axiomdb migrate from-mysql` with `mysql_async`
@@ -1027,3 +1084,188 @@
 > - Horizontal distribution (sharding + Raft)
 > - Deploy on Docker/K8s/systemd
 > - Complete documentation and TPC-H published
+
+---
+
+## USE CASE PROFILES
+
+Each profile maps a target workload to the minimum set of subfases needed to make
+AxiomDB production-ready for that use case. Use these as prioritization guides when
+deciding which phases to tackle next.
+
+---
+
+### 📝 Blog / CMS
+
+**Pattern:** 95% reads, content with rich text, tags, comments, authors, drafts, SEO.
+
+#### Minimum viable
+| Feature | Subfase |
+|---|---|
+| Full-text search (title + body) | 11.6, 11.7 |
+| Partial index (`WHERE published = true`) | 11.5 |
+| `RETURNING` (get post id after insert) | 21.4 |
+| `INSERT ... ON CONFLICT DO UPDATE` (view counters) | 21.5 |
+| CTEs (related posts, tag cloud) | 21.2 |
+| `WITH RECURSIVE` (nested comments, category trees) | 21.3 |
+
+#### Production-grade
+| Feature | Subfase |
+|---|---|
+| JSON native (metadata, SEO, custom fields) | 11.4 |
+| Materialized views (comment counts, post stats) | 13.1 |
+| LISTEN/NOTIFY (real-time comments) | 13.4 |
+| Filtered LISTEN/NOTIFY (high-value events only) | 13.15 |
+| Window functions (trending, rank by period) | 13.2 |
+| Generated columns (auto-slug from title) | 13.3 |
+| Covering indexes (listing queries without heap) | 13.5 |
+| Trigram indexes (`ILIKE '%query%'`, slug search) | 11.4b |
+| `DISTINCT ON` (latest post per category) | 21.12 |
+| Row-Level Security (multi-author, subscriber tiers) | 17.3 |
+| Immutable tables (content audit log) | 13.9 |
+| Expression index (`LOWER(title)` case-insensitive) | 21.8 |
+
+#### At scale
+| Feature | Subfase |
+|---|---|
+| Hybrid search BM25 + HNSW (semantic + keyword) | 33.3 |
+| AI embeddings (similar posts, auto-tagging) | 33.1, 33.2 |
+| CDC (search index sync, cache invalidation) | 15.1 |
+| GDPR physical purge (right to deletion) | 17.19 |
+| Table partitioning (archive old posts) | 14.1 |
+| Adaptive indexing (auto-suggest missing indexes) | 33d.1 |
+
+---
+
+### 🛒 E-commerce
+
+**Pattern:** Mixed reads/writes, inventory, orders, pricing, payments, ACID-critical.
+
+#### Minimum viable
+| Feature | Subfase |
+|---|---|
+| `RETURNING` (order ID after insert) | 21.4 |
+| `ON CONFLICT DO UPDATE` (inventory upserts) | 21.5 |
+| Serializable isolation (prevent overselling) | 28.1, 28.9 |
+| `SELECT FOR UPDATE SKIP LOCKED` (job queues) | 28.2, 28.11 |
+| `DEFERRABLE` constraints (FK without insert order) | 21.16 |
+| Range types (price ranges, date ranges) | 24.11 |
+
+#### Production-grade
+| Feature | Subfase |
+|---|---|
+| Transactional reservations + auto-release | 13.16 |
+| Gapless sequences (invoice numbering) | 13.10 |
+| Fiscal period locking (close accounting month) | 13.11 |
+| Statement-level triggers (double-entry validation) | 13.12 |
+| Row-Level Security (multi-tenant isolation) | 17.3 |
+| Partitioning (orders by month, auto-prune) | 14.1, 14.2 |
+| Column encryption (card data, PII) | 17.15 |
+
+#### At scale
+| Feature | Subfase |
+|---|---|
+| Bi-temporal tables (price history, corrections) | 13.18 |
+| Transactional message queue (payment pipeline) | 22b.9 |
+| Job chains DAG (order fulfillment workflow) | 22b.10 |
+| Continuous aggregates (revenue dashboards) | 14.4 |
+| OLTP compression (orders table, FK-heavy rows) | 25.10 |
+
+---
+
+### 📡 IoT / Time-series
+
+**Pattern:** High insert throughput, time-ordered, rare reads, aggregations, downsampling.
+
+#### Minimum viable
+| Feature | Subfase |
+|---|---|
+| Partitioning by time range | 14.1, 14.2 |
+| Partition pruning (planner skips old data) | 14.2 |
+| `GENERATE_SERIES` (fill time gaps in reports) | 20.10 |
+| `LAST(value ORDER BY ts)` aggregate | 14.12 |
+| TTL per row (auto-expire stale readings) | 14.5 |
+
+#### Production-grade
+| Feature | Subfase |
+|---|---|
+| Dead-band recording (skip redundant readings) | 14.13 |
+| Gap filling + interpolation (LOCF / linear) | 14.14 |
+| `EVERY interval` downsampling syntax | 14.15 |
+| Continuous aggregates (incremental refresh) | 14.4 |
+| BRIN indexes (huge tables, ordered by time) | 30.3 |
+| Compression of historical partitions (LZ4) | 14.3 |
+
+#### At scale
+| Feature | Subfase |
+|---|---|
+| Approximate aggregates (HLL, t-digest) | 22.11 |
+| Arrow output (Python/pandas pipelines) | 15.4 |
+| PAX layout (columnar reads within pages) | 25.4 |
+| Anomaly detection (`ANOMALY_SCORE()`) | 33d.3 |
+
+---
+
+### 🏢 Multi-tenant SaaS
+
+**Pattern:** Many customers sharing one DB instance, strict isolation, quotas, compliance.
+
+#### Minimum viable
+| Feature | Subfase |
+|---|---|
+| Row-Level Security (`tenant_id = current_user()`) | 17.3 |
+| Schema namespacing (one schema per tenant) | 22b.4 |
+| Storage quotas per tenant | 17.21 |
+
+#### Production-grade
+| Feature | Subfase |
+|---|---|
+| Column-level encryption (PII fields) | 17.15 |
+| Dynamic data masking (analysts see `***-**-1234`) | 17.16 |
+| Column-level `GRANT` (per-role field access) | 17.17 |
+| Consent-based row access (HIPAA, GDPR) | 17.18 |
+| Audit trail (who changed what, when) | 17.7, 19.20 |
+| GDPR physical purge (right to erasure) | 17.19 |
+| Non-blocking `ALTER TABLE` (zero downtime migrations) | 13.6 |
+
+#### At scale
+| Feature | Subfase |
+|---|---|
+| Transparent Data Encryption at rest (TDE) | 17.22 |
+| Logical replication (per-tenant read replica) | 31.10 |
+| Sharding by tenant hash | 34.1 |
+| Data lineage tracking (PII audit) | 22b.7, 33d.5 |
+
+---
+
+### 📊 Analytics / BI
+
+**Pattern:** Complex queries, aggregations, few writes, dashboards, reporting.
+
+#### Minimum viable
+| Feature | Subfase |
+|---|---|
+| Window functions (RANK, LAG, LEAD, running totals) | 13.2 |
+| `GROUPING SETS / ROLLUP / CUBE` | 21.21 |
+| Materialized views (pre-computed summaries) | 13.1 |
+| `DISTINCT ON` (first row per dimension) | 21.12 |
+| `STRING_AGG`, `ARRAY_AGG`, `JSON_AGG` | 29.1 |
+
+#### Production-grade
+| Feature | Subfase |
+|---|---|
+| OData v4 (PowerBI / Excel / Tableau connector) | 22d |
+| Arrow output (pandas, Polars, DuckDB handoff) | 15.4 |
+| `TABLESAMPLE` (approximate analysis, A/B tests) | 20.11 |
+| Approximate aggregates (HLL, P95 t-digest) | 22.11 |
+| Vectorized execution + SIMD | 8 |
+| PAX layout (columnar within pages) | 25.4 |
+
+#### At scale
+| Feature | Subfase |
+|---|---|
+| Parallel query planning (split plan across cores) | 27.7 |
+| Adaptive cardinality estimation | 27.10 |
+| Flight SQL (high-speed columnar to Python/Java) | 15.5 |
+| Hybrid search (semantic + keyword, AI re-rank) | 33.3, 33.4 |
+| Text-to-SQL (`NL_QUERY()` natural language) | 33d.2 |

@@ -137,6 +137,20 @@ function exportSql(tableName: string, rows: Record<string, unknown>[]) {
   URL.revokeObjectURL(url)
 }
 
+// ── JSON exporter ─────────────────────────────────────────────────────────────
+
+function exportJson(tableName: string, rows: Record<string, unknown>[]) {
+  if (!rows.length) return
+  const json = JSON.stringify(rows, null, 2)
+  const blob = new Blob([json], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${tableName}.json`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
 // ── Confirm modal ─────────────────────────────────────────────────────────────
 
 function ConfirmModal({ title, message, onConfirm, onCancel, danger = false }: {
@@ -213,7 +227,11 @@ function ImportModal({ previewRows, onConfirm, onCancel, error }: {
 
 // ── DataTab ───────────────────────────────────────────────────────────────────
 
-function DataTab({ tableName }: { tableName: string }) {
+function DataTab({ tableName, filterText, setFilterText }: {
+  tableName: string
+  filterText: string
+  setFilterText: (v: string) => void
+}) {
   const initial = (TABLE_DATA[tableName] ?? []) as Record<string, unknown>[]
   const [rows, setRows] = useState(initial)
   const [pageIndex, setPageIndex] = useState(0)
@@ -225,8 +243,8 @@ function DataTab({ tableName }: { tableName: string }) {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const { show: showToast } = useToast()
 
-  // Quick filter
-  const [filterText, setFilterText] = useState('')
+  // Bulk selection
+  const [selectedIds, setSelectedIds] = useState<Set<unknown>>(new Set())
 
   // Column visibility
   const allColKeys = rows.length > 0 ? Object.keys(rows[0]) : []
@@ -289,6 +307,28 @@ function DataTab({ tableName }: { tableName: string }) {
     }
   }, [contextMenu])
 
+  function toggleSelectRow(id: unknown) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  function bulkDelete() {
+    const count = selectedIds.size
+    setRows(prev => prev.filter(r => !selectedIds.has((r as Record<string, unknown>).id)))
+    setSelectedIds(new Set())
+    showToast(`${count} rows deleted`)
+  }
+
+  function bulkExportJson() {
+    const selected = rows.filter(r => selectedIds.has((r as Record<string, unknown>).id))
+    exportJson(tableName, selected)
+    setSelectedIds(new Set())
+  }
+
   function buildSql(rowId: unknown, col: string, val: unknown) {
     const v = typeof val === 'string' ? `'${val}'` : String(val)
     return `UPDATE ${tableName} SET ${col} = ${v} WHERE id = ${rowId};`
@@ -320,6 +360,18 @@ function DataTab({ tableName }: { tableName: string }) {
 
   function commitEdit() {
     if (!editing) return
+    const schema = SCHEMAS[tableName] ?? []
+    const colDef = schema.find(c => c.name === editing.colKey)
+    if (colDef) {
+      const numericTypes = ['INT', 'BIGINT', 'REAL', 'DECIMAL']
+      if (numericTypes.includes(colDef.type)) {
+        if (editValue.trim() !== '' && isNaN(Number(editValue))) {
+          showToast(`"${editValue}" is not a valid ${colDef.type}`)
+          cancelEdit()
+          return
+        }
+      }
+    }
     const row = rows[editing.rowIndex]
     setRows(prev => prev.map((r, i) => i === editing.rowIndex ? { ...r, [editing.colKey]: editValue } : r))
     logEdit(row, editing.colKey, editValue)
@@ -475,6 +527,26 @@ function DataTab({ tableName }: { tableName: string }) {
 
   const pageRows = table.getRowModel().rows
 
+  // Bulk selection computed values (need pageRows)
+  const allPageIds = pageRows.map(r => (filteredRows[r.index] as Record<string, unknown>).id)
+  const allPageSelected = allPageIds.length > 0 && allPageIds.every(id => selectedIds.has(id))
+
+  function toggleSelectAll() {
+    if (allPageSelected) {
+      setSelectedIds(prev => {
+        const next = new Set(prev)
+        allPageIds.forEach(id => next.delete(id))
+        return next
+      })
+    } else {
+      setSelectedIds(prev => {
+        const next = new Set(prev)
+        allPageIds.forEach(id => next.add(id))
+        return next
+      })
+    }
+  }
+
   return (
     <div className="flex flex-col h-full overflow-hidden">
       {/* Hidden file input for import */}
@@ -546,6 +618,13 @@ function DataTab({ tableName }: { tableName: string }) {
           <FileDown className="w-3 h-3" />
           Export SQL
         </button>
+        <button
+          onClick={() => exportJson(tableName, rows)}
+          disabled={!rows.length}
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium border border-border text-text-secondary hover:bg-elevated hover:text-text-primary transition-colors disabled:opacity-40">
+          <FileDown className="w-3 h-3" />
+          Export JSON
+        </button>
 
         {/* Column visibility */}
         <div className="relative" ref={colMenuRef}>
@@ -594,11 +673,37 @@ function DataTab({ tableName }: { tableName: string }) {
         </div>
       </div>
 
+      {selectedIds.size > 0 && (
+        <div className="flex items-center gap-3 px-3 py-1.5 bg-accent/5 border-b border-accent/20 shrink-0">
+          <span className="text-xs text-accent font-semibold">{selectedIds.size} selected</span>
+          <button onClick={bulkDelete}
+            className="flex items-center gap-1 text-xs text-error hover:text-error/80 transition-colors font-medium">
+            <Trash2 className="w-3 h-3" />
+            Delete
+          </button>
+          <button onClick={bulkExportJson}
+            className="flex items-center gap-1 text-xs text-text-secondary hover:text-text-primary transition-colors font-medium">
+            <FileDown className="w-3 h-3" />
+            Export JSON
+          </button>
+          <button onClick={() => setSelectedIds(new Set())}
+            className="ml-auto text-xs text-text-secondary hover:text-text-primary transition-colors">
+            Deselect all
+          </button>
+        </div>
+      )}
+
       <div className="flex-1 overflow-auto">
         <table className="w-full text-xs">
           <thead className="sticky top-0 bg-surface z-10">
             {table.getHeaderGroups().map(hg => (
               <tr key={hg.id} className="border-b border-border">
+                <th className="w-8 px-2 py-2">
+                  <input type="checkbox"
+                    checked={allPageSelected}
+                    onChange={toggleSelectAll}
+                    className="w-3 h-3 accent-[#10b981] cursor-pointer" />
+                </th>
                 {hg.headers.map(h => {
                   const sorted = h.column.getIsSorted()
                   return (
@@ -630,6 +735,12 @@ function DataTab({ tableName }: { tableName: string }) {
               const fullRow = filteredRows[originalIndex]
               return (
                 <tr key={row.id} className="border-b border-border/50 hover:bg-elevated transition-colors group">
+                  <td className="w-8 px-2 py-1.5" onClick={e => e.stopPropagation()}>
+                    <input type="checkbox"
+                      checked={selectedIds.has(fullRow.id)}
+                      onChange={() => toggleSelectRow(fullRow.id)}
+                      className="w-3 h-3 accent-[#10b981] cursor-pointer" />
+                  </td>
                   {row.getVisibleCells().map(cell => {
                     const colKey = cell.column.id
                     const isEditing = editing?.rowIndex === originalIndex && editing?.colKey === colKey
@@ -714,6 +825,7 @@ function DataTab({ tableName }: { tableName: string }) {
             {/* Add row inline form */}
             {addingRow && (
               <tr className="border-b border-accent/30 bg-elevated/50">
+                <td className="w-8 px-2 py-1.5" />
                 {displayKeys.map(key => (
                   <td key={key} className="px-2 py-1.5">
                     {key === 'id' ? (
@@ -853,6 +965,11 @@ function SchemaTab({ tableName }: { tableName: string }) {
   const [editingType, setEditingType] = useState<string | null>(null)
   const [editingFk, setEditingFk] = useState<string | null>(null)
   const [fkValue, setFkValue] = useState('')
+  const [renamingCol, setRenamingCol] = useState<string | null>(null)
+  const [renameValue, setRenameValue] = useState('')
+  const [addingCol, setAddingCol] = useState(false)
+  const [newCol, setNewCol] = useState({ name: '', type: 'TEXT', nullable: true, default: '' })
+  const [confirmDeleteCol, setConfirmDeleteCol] = useState<string | null>(null)
 
   function setType(colName: string, type: string) {
     setCols(prev => prev.map(c => c.name === colName ? { ...c, type } : c))
@@ -877,8 +994,46 @@ function SchemaTab({ tableName }: { tableName: string }) {
     setCols(prev => prev.map(c => c.name === colName ? { ...c, fk: null } : c))
   }
 
+  function startRename(colName: string) {
+    if (cols.find(c => c.name === colName)?.pk) return
+    setRenamingCol(colName)
+    setRenameValue(colName)
+  }
+
+  function commitRename(oldName: string) {
+    if (!renameValue.trim() || renameValue === oldName) { setRenamingCol(null); return }
+    setCols(prev => prev.map(c => c.name === oldName ? { ...c, name: renameValue.trim() } : c))
+    setRenamingCol(null)
+  }
+
+  function addColumn() {
+    if (!newCol.name.trim()) return
+    setCols(prev => [...prev, {
+      name: newCol.name.trim(),
+      type: newCol.type,
+      nullable: newCol.nullable,
+      default: newCol.default.trim() || null,
+      pk: false,
+      fk: null,
+    }])
+    setNewCol({ name: '', type: 'TEXT', nullable: true, default: '' })
+    setAddingCol(false)
+  }
+
+  function deleteColumn(colName: string) {
+    setCols(prev => prev.filter(c => c.name !== colName))
+  }
+
   return (
     <div className="overflow-auto">
+      {confirmDeleteCol && (
+        <ConfirmModal
+          title="Delete column"
+          message={`Delete column "${confirmDeleteCol}"? This cannot be undone.`}
+          onConfirm={() => { deleteColumn(confirmDeleteCol); setConfirmDeleteCol(null) }}
+          onCancel={() => setConfirmDeleteCol(null)}
+        />
+      )}
       <table className="w-full text-xs">
         <thead>
           <tr className="border-b border-border">
@@ -887,6 +1042,7 @@ function SchemaTab({ tableName }: { tableName: string }) {
                 {h}
               </th>
             ))}
+            <th className="w-10 px-2 py-2" />
           </tr>
         </thead>
         <tbody>
@@ -894,7 +1050,25 @@ function SchemaTab({ tableName }: { tableName: string }) {
             <tr key={c.name} className="border-b border-border/50 hover:bg-elevated transition-colors group">
               <td className="px-4 py-2.5">
                 <div className="flex items-center gap-2">
-                  <span className="font-mono font-semibold text-text-primary">{c.name}</span>
+                  {renamingCol === c.name ? (
+                    <input
+                      autoFocus
+                      value={renameValue}
+                      onChange={e => setRenameValue(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') commitRename(c.name); if (e.key === 'Escape') setRenamingCol(null) }}
+                      onBlur={() => commitRename(c.name)}
+                      className="font-mono text-xs bg-elevated border border-accent rounded px-1.5 py-0.5 text-text-primary outline-none w-28"
+                    />
+                  ) : (
+                    <button
+                      onClick={() => startRename(c.name)}
+                      className={cn('font-mono font-semibold text-text-primary text-xs',
+                        !c.pk && 'hover:text-accent transition-colors cursor-pointer',
+                        c.pk && 'cursor-default'
+                      )}>
+                      {c.name}
+                    </button>
+                  )}
                   {c.pk && <span className="text-[9px] px-1 py-0.5 rounded bg-warning/10 text-warning font-semibold">PK</span>}
                 </div>
               </td>
@@ -967,10 +1141,53 @@ function SchemaTab({ tableName }: { tableName: string }) {
                   </button>
                 )}
               </td>
+              <td className="px-2 py-2">
+                {!c.pk && (
+                  <button
+                    onClick={() => setConfirmDeleteCol(c.name)}
+                    className="opacity-0 group-hover:opacity-60 hover:!opacity-100 text-error transition-all">
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+                )}
+              </td>
             </tr>
           ))}
         </tbody>
       </table>
+      {addingCol ? (
+        <div className="border-t border-border px-4 py-3 flex items-center gap-2 bg-elevated flex-wrap">
+          <input value={newCol.name} onChange={e => setNewCol(p => ({ ...p, name: e.target.value }))}
+            placeholder="column_name"
+            className="bg-surface border border-border rounded px-2 py-1 font-mono text-xs text-text-primary outline-none focus:border-accent w-32" />
+          <select value={newCol.type} onChange={e => setNewCol(p => ({ ...p, type: e.target.value }))}
+            className="bg-surface border border-border rounded px-2 py-1 text-xs font-mono text-accent outline-none focus:border-accent cursor-pointer">
+            {AXIOMDB_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+          <button onClick={() => setNewCol(p => ({ ...p, nullable: !p.nullable }))}
+            className={cn('text-[10px] px-2 py-1 rounded font-semibold border transition-colors',
+              newCol.nullable ? 'border-border text-text-secondary' : 'border-accent text-accent bg-accent/10')}>
+            {newCol.nullable ? 'NULLABLE' : 'NOT NULL'}
+          </button>
+          <input value={newCol.default} onChange={e => setNewCol(p => ({ ...p, default: e.target.value }))}
+            placeholder="default (optional)"
+            className="bg-surface border border-border rounded px-2 py-1 font-mono text-xs text-text-secondary outline-none focus:border-accent w-32" />
+          <button onClick={addColumn}
+            className="px-3 py-1 rounded bg-accent text-white text-xs font-semibold hover:bg-accent/80 transition-colors">
+            Add
+          </button>
+          <button onClick={() => setAddingCol(false)}
+            className="px-2 py-1 rounded text-text-secondary text-xs hover:bg-elevated transition-colors">
+            Cancel
+          </button>
+        </div>
+      ) : (
+        <div className="border-t border-border px-4 py-2">
+          <button onClick={() => setAddingCol(true)}
+            className="text-xs text-text-secondary hover:text-accent transition-colors flex items-center gap-1">
+            <span className="text-lg leading-none">+</span> Add column
+          </button>
+        </div>
+      )}
     </div>
   )
 }
@@ -1152,6 +1369,7 @@ export default function TableDetailPage({ params }: { params: Promise<{ table: s
   if (!tableInfo) notFound()
 
   const [tab, setTab] = useState<Tab>('data')
+  const [filterText, setFilterText] = useState('')
   const { show: showToast } = useToast()
   const TABS: { id: Tab; label: string }[] = [
     { id: 'data', label: 'Data' },
@@ -1204,7 +1422,7 @@ export default function TableDetailPage({ params }: { params: Promise<{ table: s
         </div>
       </div>
       <div className="flex-1 overflow-hidden">
-        {tab === 'data' && <DataTab tableName={tableName} />}
+        {tab === 'data' && <DataTab tableName={tableName} filterText={filterText} setFilterText={setFilterText} />}
         {tab === 'schema' && <SchemaTab tableName={tableName} />}
         {tab === 'indexes' && <IndexesTab tableName={tableName} />}
       </div>
