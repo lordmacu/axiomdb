@@ -470,6 +470,24 @@ impl HeapChain {
         }
     }
 
+    /// Returns `true` if the heap slot at `(page_id, slot_id)` is MVCC-visible
+    /// to `snapshot`, reading **only the slot header** (24 bytes) — not the full
+    /// row payload. Used by the index-only scan path (Phase 6.13) to verify
+    /// visibility without decoding all row columns.
+    pub fn is_slot_visible(
+        storage: &dyn StorageEngine,
+        page_id: u64,
+        slot_id: u16,
+        snap: axiomdb_core::TransactionSnapshot,
+    ) -> Result<bool, DbError> {
+        let raw = *storage.read_page(page_id)?.as_bytes();
+        let page = Page::from_bytes(raw)?;
+        match crate::heap::read_tuple(&page, slot_id)? {
+            None => Ok(false),
+            Some((header, _data)) => Ok(header.is_visible(&snap)),
+        }
+    }
+
     /// Inserts multiple pre-encoded row payloads into the chain rooted at
     /// `root_page_id`, loading each heap page exactly **once** regardless of
     /// how many rows are written to it.

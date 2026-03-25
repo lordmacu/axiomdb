@@ -42,7 +42,7 @@ use axiomdb_catalog::{
     CatalogReader, CatalogWriter, ResolvedTable, SchemaResolver,
 };
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
-use axiomdb_index::BTree;
+use axiomdb_index::{page_layout::encode_rid, BTree};
 use axiomdb_storage::{heap_chain::HeapChain, Page, PageType, StorageEngine};
 use axiomdb_types::{DataType, Value};
 use axiomdb_wal::{Savepoint, TxnManager};
@@ -591,6 +591,10 @@ fn execute_select_ctx(
             let mut reader = CatalogReader::new(storage, snap)?;
             reader.list_stats(resolved.def.id).unwrap_or_default()
         };
+        // Collect SELECT column indices for index-only scan detection (Phase 6.13).
+        // Returns empty slice for SELECT * (wildcard) → conservative, no index-only.
+        let select_col_idxs: Vec<u16> = collect_select_col_idxs(&stmt);
+
         let access_method = crate::planner::plan_select(
             stmt.where_clause.as_ref(),
             &resolved.indexes,
@@ -598,6 +602,7 @@ fn execute_select_ctx(
             resolved.def.id,
             &table_stats,
             &mut ctx.stats,
+            &select_col_idxs,
         );
 
         // Fetch rows via the chosen access method.
@@ -654,8 +659,8 @@ fn execute_select_ctx(
                 // Bloom filter: skip B-Tree read if key is definitely absent.
                 if !bloom.might_exist(index_def.index_id, key) {
                     vec![]
-                } else {
-                    // Point lookup: B-Tree → single RecordId → heap read.
+                } else if index_def.is_unique {
+                    // Unique index: exact key lookup → at most one RecordId.
                     match BTree::lookup_in(storage, index_def.root_page_id, key)? {
                         None => vec![],
                         Some(rid) => {
@@ -665,21 +670,75 @@ fn execute_select_ctx(
                             }
                         }
                     }
+                } else {
+                    // Non-unique index: key stored as key||RID — use range scan with
+                    // [key||0x00..00, key||0xFF..FF] to find all rows with this value.
+                    let lo = rid_lo(key);
+                    let hi = rid_hi(key);
+                    let pairs =
+                        BTree::range_in(storage, index_def.root_page_id, Some(&lo), Some(&hi))?;
+                    let mut result = Vec::with_capacity(pairs.len());
+                    for (rid, _k) in pairs {
+                        if let Some(values) =
+                            TableEngine::read_row(storage, &resolved.columns, rid)?
+                        {
+                            result.push((rid, values));
+                        }
+                    }
+                    result
                 }
             }
             crate::planner::AccessMethod::IndexRange { index_def, lo, hi } => {
                 // Range scan: iterate B-Tree entries → heap reads.
-                let pairs = BTree::range_in(
-                    storage,
-                    index_def.root_page_id,
-                    lo.as_deref(),
-                    hi.as_deref(),
-                )?;
+                // Non-unique: append RID suffix to bounds so the range covers all RIDs.
+                let (lo_adjusted, hi_adjusted);
+                let (lo_ref, hi_ref) = if index_def.is_unique {
+                    (lo.as_deref(), hi.as_deref())
+                } else {
+                    lo_adjusted = lo.as_deref().map(rid_lo);
+                    hi_adjusted = hi.as_deref().map(rid_hi);
+                    (lo_adjusted.as_deref(), hi_adjusted.as_deref())
+                };
+                let pairs = BTree::range_in(storage, index_def.root_page_id, lo_ref, hi_ref)?;
                 let mut result = Vec::with_capacity(pairs.len());
                 for (rid, _key) in pairs {
                     if let Some(values) = TableEngine::read_row(storage, &resolved.columns, rid)? {
                         result.push((rid, values));
                     }
+                }
+                result
+            }
+            crate::planner::AccessMethod::IndexOnlyScan {
+                index_def,
+                lo,
+                hi,
+                n_key_cols,
+                needed_key_positions,
+            } => {
+                // Index-only scan (Phase 6.13): values decoded from B-Tree key bytes.
+                // Only the 24-byte heap slot header is read for MVCC visibility.
+                // Non-unique: lo/hi need RID suffix for correct range bounds.
+                let (lo_adj, hi_adj);
+                let (lo_ref, hi_ref) = if index_def.is_unique {
+                    (Some(lo.as_slice()), hi.as_deref())
+                } else {
+                    lo_adj = rid_lo(lo);
+                    hi_adj = hi.as_deref().map(rid_hi);
+                    (Some(lo_adj.as_slice()), hi_adj.as_deref())
+                };
+                let pairs = BTree::range_in(storage, index_def.root_page_id, lo_ref, hi_ref)?;
+                let mut result = Vec::with_capacity(pairs.len());
+                for (rid, key_bytes) in pairs {
+                    if !HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap)? {
+                        continue;
+                    }
+                    let (all_key_vals, _) =
+                        crate::key_encoding::decode_index_key(&key_bytes, *n_key_cols)?;
+                    let row_values: Vec<Value> = needed_key_positions
+                        .iter()
+                        .map(|&pos| all_key_vals.get(pos).cloned().unwrap_or(Value::Null))
+                        .collect();
+                    result.push((rid, row_values));
                 }
                 result
             }
@@ -1678,6 +1737,7 @@ fn execute_select(
             resolved.def.id,
             &[], // no stats in non-ctx path — always use index (conservative)
             &mut crate::session::StaleStatsTracker::default(),
+            &[], // no select_col_idxs in non-ctx path — no index-only scan
         );
 
         // ── Fetch rows via the chosen access method ───────────────────────
@@ -1687,25 +1747,44 @@ fn execute_select(
                 TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap, None)?
             }
             crate::planner::AccessMethod::IndexLookup { index_def, key } => {
-                // Point lookup: B-Tree → single RecordId → heap read.
-                match BTree::lookup_in(storage, index_def.root_page_id, key)? {
-                    None => vec![],
-                    Some(rid) => {
-                        match TableEngine::read_row(storage, &resolved.columns, rid)? {
-                            None => vec![], // row was deleted
-                            Some(values) => vec![(rid, values)],
+                // Point lookup: unique → exact match; non-unique → range with RID suffix.
+                if index_def.is_unique {
+                    match BTree::lookup_in(storage, index_def.root_page_id, key)? {
+                        None => vec![],
+                        Some(rid) => {
+                            match TableEngine::read_row(storage, &resolved.columns, rid)? {
+                                None => vec![], // row was deleted
+                                Some(values) => vec![(rid, values)],
+                            }
                         }
                     }
+                } else {
+                    let lo = rid_lo(key);
+                    let hi = rid_hi(key);
+                    let pairs =
+                        BTree::range_in(storage, index_def.root_page_id, Some(&lo), Some(&hi))?;
+                    let mut result = Vec::with_capacity(pairs.len());
+                    for (rid, _k) in pairs {
+                        if let Some(values) =
+                            TableEngine::read_row(storage, &resolved.columns, rid)?
+                        {
+                            result.push((rid, values));
+                        }
+                    }
+                    result
                 }
             }
             crate::planner::AccessMethod::IndexRange { index_def, lo, hi } => {
                 // Range scan: iterate B-Tree entries → heap reads.
-                let pairs = BTree::range_in(
-                    storage,
-                    index_def.root_page_id,
-                    lo.as_deref(),
-                    hi.as_deref(),
-                )?;
+                let (lo_adjusted, hi_adjusted);
+                let (lo_ref, hi_ref) = if index_def.is_unique {
+                    (lo.as_deref(), hi.as_deref())
+                } else {
+                    lo_adjusted = lo.as_deref().map(rid_lo);
+                    hi_adjusted = hi.as_deref().map(rid_hi);
+                    (lo_adjusted.as_deref(), hi_adjusted.as_deref())
+                };
+                let pairs = BTree::range_in(storage, index_def.root_page_id, lo_ref, hi_ref)?;
                 let mut result = Vec::with_capacity(pairs.len());
                 for (rid, _key) in pairs {
                     if let Some(values) = TableEngine::read_row(storage, &resolved.columns, rid)? {
@@ -1713,6 +1792,10 @@ fn execute_select(
                     }
                 }
                 result
+            }
+            // IndexOnlyScan not used in non-ctx path (select_col_idxs = &[] above).
+            crate::planner::AccessMethod::IndexOnlyScan { .. } => {
+                unreachable!("IndexOnlyScan only emitted when select_col_idxs is non-empty")
             }
         };
 
@@ -3731,6 +3814,7 @@ fn execute_create_table(
                 }],
                 predicate: None,
                 is_fk_index: false,
+                include_columns: vec![],
             })?;
             Ok(idx_id)
         };
@@ -4024,6 +4108,7 @@ fn persist_fk_constraint(
                 }],
                 predicate: None,
                 fillfactor: 90,
+                include_columns: vec![],
             })?;
             new_idx_id
         }
@@ -4175,7 +4260,16 @@ fn execute_create_index(
             continue;
         }
         match encode_index_key(&key_vals) {
-            Ok(key) => {
+            Ok(base_key) => {
+                // Non-unique indexes append the RecordId so that multiple rows with
+                // the same indexed value each get a unique B-Tree key (InnoDB approach).
+                let key = if !stmt.unique {
+                    let mut k = base_key;
+                    k.extend_from_slice(&encode_rid(rid));
+                    k
+                } else {
+                    base_key
+                };
                 BTree::insert_in(storage, &root_pid, &key, rid, index_fillfactor)?;
                 bloom_keys.push(key);
             }
@@ -4199,6 +4293,13 @@ fn execute_create_index(
     // Stored as a human-readable string for debuggability and backward-compat.
     let predicate_sql: Option<String> = stmt.predicate.as_ref().map(expr_to_sql_string);
 
+    // Resolve INCLUDE column names to col_idx values for catalog storage (Phase 6.13).
+    let include_col_idxs: Vec<u16> = stmt
+        .include_columns
+        .iter()
+        .filter_map(|name| col_defs.iter().find(|c| &c.name == name).map(|c| c.col_idx))
+        .collect();
+
     let new_index_id = writer.create_index(IndexDef {
         index_id: 0, // allocated by CatalogWriter::create_index
         table_id: table_def.id,
@@ -4210,6 +4311,7 @@ fn execute_create_index(
         predicate: predicate_sql,
         fillfactor: stmt.fillfactor.unwrap_or(90),
         is_fk_index: false, // user-created indexes are never FK auto-indexes
+        include_columns: include_col_idxs,
     })?;
 
     // 7. Populate bloom filter for the newly created index.
@@ -4232,6 +4334,33 @@ fn execute_create_index(
     }
 
     Ok(QueryResult::Empty)
+}
+
+// ── Index-only scan helpers (Phase 6.13) ────────────────────────────────────
+
+/// Collects the set of column indices (`col_idx`) needed in the SELECT output.
+///
+/// Returns an empty vec for `SELECT *` or when window functions / expressions
+/// prevent precise tracking — in those cases, the planner conservatively
+/// falls back to a regular index scan (never wrong, just no index-only optimization).
+fn collect_select_col_idxs(stmt: &SelectStmt) -> Vec<u16> {
+    let mut col_idxs = Vec::new();
+    for item in &stmt.columns {
+        match item {
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                return vec![]; // wildcard → conservative, no index-only scan
+            }
+            SelectItem::Expr { expr, .. } => match expr {
+                // Plain column reference: directly use its col_idx.
+                Expr::Column { col_idx, .. } => {
+                    col_idxs.push(*col_idx as u16);
+                }
+                // Any other expression (function call, literal, etc.) → conservative.
+                _ => return vec![],
+            },
+        }
+    }
+    col_idxs
 }
 
 // ── NDV helper (Phase 6.10) ───────────────────────────────────────────────────
@@ -4938,8 +5067,9 @@ fn alter_add_constraint(
                     .collect(),
                 unique: true,
                 if_not_exists: false,
-                predicate: None,  // UNIQUE constraints are always full indexes
-                fillfactor: None, // use default 90
+                predicate: None,         // UNIQUE constraints are always full indexes
+                fillfactor: None,        // use default 90
+                include_columns: vec![], // UNIQUE constraints have no included columns
             };
             let mut noop_bloom = crate::bloom::BloomRegistry::new();
             execute_create_index(stmt, storage, txn, &mut noop_bloom)?;
@@ -5584,6 +5714,26 @@ fn apply_limit_offset(
 /// semantics (unlike `NULL = NULL` which is UNKNOWN in comparisons).
 ///
 /// Preserves the insertion order of first occurrences (stable deduplication).
+// ── Non-unique index key helpers ──────────────────────────────────────────────
+
+/// Returns the lower bound for a non-unique index range scan on `prefix`.
+///
+/// Non-unique secondary indexes store `encode_index_key(vals) || encode_rid(rid)`
+/// so that multiple rows with the same indexed value each get a unique B-Tree key.
+/// To find all entries with a given prefix, use `[prefix||0x00..00, prefix||0xFF..FF]`.
+fn rid_lo(prefix: &[u8]) -> Vec<u8> {
+    let mut v = prefix.to_vec();
+    v.extend_from_slice(&[0u8; 10]);
+    v
+}
+
+/// Returns the upper bound for a non-unique index range scan on `prefix`.
+fn rid_hi(prefix: &[u8]) -> Vec<u8> {
+    let mut v = prefix.to_vec();
+    v.extend_from_slice(&[0xFFu8; 10]);
+    v
+}
+
 fn apply_distinct(rows: Vec<Row>) -> Vec<Row> {
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     rows.into_iter()

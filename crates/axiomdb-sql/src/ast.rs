@@ -294,6 +294,8 @@ pub struct CreateIndexStmt {
     /// Target leaf-page fill factor (Phase 6.8). `None` → default 90.
     /// Valid range: 10–100.
     pub fillfactor: Option<u8>,
+    /// INCLUDE columns for covering indexes (Phase 6.13). `vec![]` = no included cols.
+    pub include_columns: Vec<String>,
 }
 
 /// `DROP TABLE`
@@ -712,6 +714,7 @@ mod tests {
             }],
             predicate: None,
             fillfactor: None,
+            include_columns: vec![],
         });
         assert!(matches!(stmt, Stmt::CreateIndex(_)));
     }

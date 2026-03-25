@@ -523,6 +523,95 @@ FROM axiom_indexes;
 
 ---
 
+## Index-Only Scans (Covering Indexes)
+
+When every column referenced by a `SELECT` is already stored as a key column of
+the chosen index, AxiomDB can satisfy the query entirely from the B-Tree — no
+heap page read is needed. This is called an **index-only scan**.
+
+### Example
+
+```sql
+CREATE INDEX idx_age ON users (age);
+
+-- Index-only scan: only column needed (age) is the index key.
+SELECT age FROM users WHERE age = 25;
+```
+
+The executor reads the matching B-Tree leaf entries, extracts the `age` value
+from the encoded key bytes, and returns the rows without ever touching the heap.
+
+### INCLUDE syntax — declaring covering intent
+
+You can declare additional columns as part of a covering index using the
+`INCLUDE` clause:
+
+```sql
+CREATE INDEX idx_name_dept ON employees (name) INCLUDE (department, salary);
+```
+
+`INCLUDE` columns are recorded in the catalog metadata so the planner knows
+the index covers those columns. **Note:** physical storage of INCLUDE column
+values in B-Tree leaf nodes is deferred to Phase 6.15. Until then, the planner
+uses `INCLUDE` to correctly identify `IndexOnlyScan` opportunities, but the
+values are read from the key portion of the B-Tree entry.
+
+### MVCC and the 24-byte header read
+
+Index-only scans still perform a lightweight visibility check per row. For each
+B-Tree entry, the executor reads only the 24-byte `RowHeader` (the slot header
+containing `txn_id_created`, `txn_id_deleted`, and sequence number) to determine
+whether the row is visible to the current transaction snapshot. The full row
+payload is never decoded.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage</span>
+PostgreSQL requires an all-visible map (a per-page bitmap written by VACUUM) to
+perform true index-only scans — without it, PostgreSQL falls back to a full
+heap fetch. AxiomDB performs a 24-byte RowHeader read for MVCC instead, which
+is simpler, requires no VACUUM pass, and still eliminates the expensive full row
+decode and heap page traversal.
+</div>
+</div>
+
+---
+
+## Non-Unique Secondary Index Key Format
+
+Non-unique secondary indexes store the indexed column values **together with the
+row's `RecordId`** as the B-Tree key:
+
+```
+key = encode_index_key(col_vals) || encode_rid(rid)   // 10-byte RecordId suffix
+```
+
+This ensures every B-Tree entry is globally unique even when multiple rows share
+the same indexed value — making `INSERT` safe without a `DuplicateKey` error.
+
+When looking up all rows with a given indexed value, the executor performs a
+range scan with synthetic bounds:
+
+```
+lo = encode_index_key(val) || [0x00; 10]   // smallest possible RecordId
+hi = encode_index_key(val) || [0xFF; 10]   // largest possible RecordId
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — InnoDB Composite Key Approach</span>
+This is the same strategy used by MySQL InnoDB secondary indexes, where the
+primary key is appended as a tiebreaker in the B-Tree entry. AxiomDB uses
+<code>RecordId</code> (page_id + slot_id + sequence number) instead of a
+separate primary key column, keeping the suffix at a fixed 10 bytes regardless
+of the table's key type.
+</div>
+</div>
+
+---
+
 ## B+ Tree Implementation Details
 
 AxiomDB's B+ Tree is a Copy-on-Write structure backed by the `StorageEngine` trait.

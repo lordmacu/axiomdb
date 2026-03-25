@@ -211,12 +211,12 @@
 - [x] 6.10 ✅ Index statistics bootstrap — axiom_stats heap; StatsDef (row_count, ndv); bootstrapped at CREATE INDEX
 - [x] 6.11 ✅ Auto-update statistics — StaleStatsTracker in SessionContext; marks stale after >20% row change
 - [x] 6.12 ✅ ANALYZE [TABLE name [(column)]] — exact NDV full scan; resets staleness
-- [ ] 6.13 ⏳ Index-only scans — when SELECT columns are all in the index, do not read the main table (covering scan)
+- [x] 6.13 ✅ Index-only scans — `IndexOnlyScan` planner variant; `decode_index_key` inverse codec; `is_slot_visible` MVCC header-only check; `INCLUDE (cols)` DDL syntax + catalog storage; non-unique secondary indexes fixed to use `key||RecordId` format (InnoDB approach) — DuplicateKey on duplicate non-unique values fixed
 - [ ] 6.14 ⏳ MVCC on secondary indexes — each index entry includes `(key, RecordId, txn_id_visible_from)`; UPDATE of indexed column inserts new version without deleting the old one; vacuum cleans dead index versions
 - [ ] 6.15 ⏳ Index corruption detection — on DB open verify index checksums; detect index vs table divergence; automatic `REINDEX` if divergent (recovery mode)
 
 ### Phase 7 — Concurrency + MVCC `⏳` week 40-48
-- [ ] ⚠️ **ANTES DE 7.1** — Non-unique secondary indexes composite key: aplicar patrón `(value | RecordId)` a TODOS los secondary indexes no-únicos (igual que FK auto-indexes en 6.9). Actualmente el B-Tree rechaza DuplicateKey cuando dos rows tienen el mismo valor en un índice no-único. Blocker para MVCC on secondary indexes (6.14).
+- [x] ✅ Non-unique secondary indexes composite key — Fixed in 6.13: all non-unique non-FK secondary indexes now use `key||RecordId` format (same as FK auto-indexes). DuplicateKey blocker for MVCC removed.
 - [ ] 7.1 ⏳ MVCC visibility rules — snapshot_id rules over RowHeader (struct defined in 3.4): which rows are visible; implement READ COMMITTED (snapshot per statement) and REPEATABLE READ (snapshot per transaction) explicitly
 - [ ] 7.2 ⏳ Transaction manager — global atomic txn_id counter
 - [ ] 7.3 ⏳ Snapshot isolation — visibility rules per snapshot_id
@@ -294,6 +294,7 @@
 
 ### Phase 11 — Robustness and indexes `⏳` week 26-27
 - [ ] 11.1 ⏳ Sparse index — one entry every N rows for timestamps
+- [ ] 11.1b ⏳ BRIN indexes — Block Range INdex; stores only min/max per block range (128 pages default); `CREATE INDEX ON events USING brin(created_at)`; occupies ~100x less space than B-Tree; only useful for columns that are physically ordered on disk (timestamps, auto-increment IDs, IOT sensor readings in arrival order); O(1) build, near-zero maintenance; planner uses it for range scans when column correlation is high; benchmark vs B-Tree on 10M-row time-series table
 - [ ] 11.2 ⏳ TOAST — values >2KB to overflow pages with LZ4; small blobs (≤ threshold) stay inline
 - [ ] 11.2b ⏳ BLOB_REF storage format — replace flat `u24+bytes` encoding in row codec with a 1-byte header that distinguishes: `0x00`=inline, `0x01`=TOAST pointer (8B page_id chain), `0x02`=content-hash (32B SHA256, Phase 14); this abstraction is the foundation that makes TOAST and content-addressed storage swappable without changing the executor or SQL layer
 - [ ] 11.2c ⏳ MIME_TYPE auto-detection — on BLOB insert, read first 16 magic bytes to detect PNG/JPEG/WebP/PDF/GIF/ZIP/etc.; cache as 1-byte enum alongside the BLOB_REF in the row; expose as `MIME_TYPE(col)→TEXT` SQL function; zero overhead on read (metadata is in the row)

@@ -155,6 +155,171 @@ fn encode_bytes_nul(b: &[u8], buf: &mut Vec<u8>) {
     buf.push(0x00); // terminator
 }
 
+// ── Key decoding (Phase 6.13) ─────────────────────────────────────────────────
+
+/// Decodes `n_values` values from an encoded index key byte slice.
+///
+/// The encoding is self-delimiting: each value starts with a 1-byte type tag
+/// that determines how many bytes follow. Returns `(values, bytes_consumed)`.
+///
+/// This is the exact inverse of `encode_index_key` for all Value variants
+/// except NaN floats (which encode to 0.0 and cannot round-trip).
+pub fn decode_index_key(key: &[u8], n_values: usize) -> Result<(Vec<Value>, usize), DbError> {
+    let mut values = Vec::with_capacity(n_values);
+    let mut pos = 0;
+    for _ in 0..n_values {
+        if pos >= key.len() {
+            return Err(DbError::ParseError {
+                message: format!(
+                    "decode_index_key: key truncated at pos {pos} (need {n_values} values)"
+                ),
+            });
+        }
+        let (v, new_pos) = decode_value(key, pos)?;
+        values.push(v);
+        pos = new_pos;
+    }
+    Ok((values, pos))
+}
+
+fn decode_value(key: &[u8], pos: usize) -> Result<(Value, usize), DbError> {
+    if pos >= key.len() {
+        return Err(DbError::ParseError {
+            message: "decode_value: unexpected end of key bytes".into(),
+        });
+    }
+    match key[pos] {
+        0x00 => Ok((Value::Null, pos + 1)),
+        0x01 => {
+            if pos + 2 > key.len() {
+                return Err(trunc());
+            }
+            Ok((Value::Bool(key[pos + 1] != 0), pos + 2))
+        }
+        0x02 => {
+            // Int(i32): sign-flip 8 BE bytes → i64 → truncate to i32
+            if pos + 9 > key.len() {
+                return Err(trunc());
+            }
+            let u = u64::from_be_bytes(key[pos + 1..pos + 9].try_into().unwrap());
+            let n = (u ^ (i64::MIN as u64)) as i64 as i32;
+            Ok((Value::Int(n), pos + 9))
+        }
+        0x03 => {
+            // BigInt(i64): sign-flip 8 BE bytes
+            if pos + 9 > key.len() {
+                return Err(trunc());
+            }
+            let u = u64::from_be_bytes(key[pos + 1..pos + 9].try_into().unwrap());
+            let n = (u ^ (i64::MIN as u64)) as i64;
+            Ok((Value::BigInt(n), pos + 9))
+        }
+        0x04 => {
+            // Real(f64): reverse encode_f64
+            if pos + 9 > key.len() {
+                return Err(trunc());
+            }
+            let bytes: [u8; 8] = key[pos + 1..pos + 9].try_into().unwrap();
+            Ok((Value::Real(decode_f64(bytes)), pos + 9))
+        }
+        0x05 => {
+            // Decimal(i128, u8): 1 scale byte + sign-flip 16 BE bytes
+            if pos + 18 > key.len() {
+                return Err(trunc());
+            }
+            let scale = key[pos + 1];
+            let u = u128::from_be_bytes(key[pos + 2..pos + 18].try_into().unwrap());
+            let m = (u ^ (i128::MIN as u128)) as i128;
+            Ok((Value::Decimal(m, scale), pos + 18))
+        }
+        0x06 => {
+            // Date(i32): sign-flip 8 BE bytes → i64 → i32
+            if pos + 9 > key.len() {
+                return Err(trunc());
+            }
+            let u = u64::from_be_bytes(key[pos + 1..pos + 9].try_into().unwrap());
+            let n = (u ^ (i64::MIN as u64)) as i64 as i32;
+            Ok((Value::Date(n), pos + 9))
+        }
+        0x07 => {
+            // Timestamp(i64): sign-flip 8 BE bytes
+            if pos + 9 > key.len() {
+                return Err(trunc());
+            }
+            let u = u64::from_be_bytes(key[pos + 1..pos + 9].try_into().unwrap());
+            let n = (u ^ (i64::MIN as u64)) as i64;
+            Ok((Value::Timestamp(n), pos + 9))
+        }
+        0x08 => {
+            // Text: NUL-terminated with 0xFF escape
+            let (raw, end) = decode_bytes_nul(&key[pos + 1..])?;
+            let s = String::from_utf8(raw).map_err(|_| DbError::ParseError {
+                message: "decode_index_key: invalid UTF-8 in Text value".into(),
+            })?;
+            Ok((Value::Text(s), pos + 1 + end))
+        }
+        0x09 => {
+            // Bytes: NUL-terminated with 0xFF escape
+            let (raw, end) = decode_bytes_nul(&key[pos + 1..])?;
+            Ok((Value::Bytes(raw), pos + 1 + end))
+        }
+        0x0A => {
+            // Uuid: 16 raw bytes
+            if pos + 17 > key.len() {
+                return Err(trunc());
+            }
+            let mut u = [0u8; 16];
+            u.copy_from_slice(&key[pos + 1..pos + 17]);
+            Ok((Value::Uuid(u), pos + 17))
+        }
+        tag => Err(DbError::ParseError {
+            message: format!("decode_index_key: unknown type tag 0x{tag:02x}"),
+        }),
+    }
+}
+
+/// Reverses `encode_f64`. Note: NaN encodes to 0-bytes and decodes to 0.0 (not roundtrippable).
+fn decode_f64(bytes: [u8; 8]) -> f64 {
+    let u = u64::from_be_bytes(bytes);
+    // Reverse: if MSB set → positive (was `bits | MSB`) → strip MSB
+    //           if MSB clear → negative (was `!bits`) → flip all bits
+    let bits = if u & (1u64 << 63) != 0 {
+        u ^ (1u64 << 63)
+    } else {
+        !u
+    };
+    f64::from_bits(bits)
+}
+
+/// Decodes a NUL-terminated byte sequence with 0xFF escaping.
+/// Returns `(decoded_bytes, total_bytes_consumed_including_terminator)`.
+fn decode_bytes_nul(src: &[u8]) -> Result<(Vec<u8>, usize), DbError> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        if i >= src.len() {
+            return Err(DbError::ParseError {
+                message: "decode_index_key: unterminated bytes value".into(),
+            });
+        }
+        if src[i] == 0xFF && i + 1 < src.len() && src[i + 1] == 0x00 {
+            out.push(0x00);
+            i += 2;
+        } else if src[i] == 0x00 {
+            return Ok((out, i + 1)); // +1 for the NUL terminator
+        } else {
+            out.push(src[i]);
+            i += 1;
+        }
+    }
+}
+
+fn trunc() -> DbError {
+    DbError::ParseError {
+        message: "decode_index_key: key bytes truncated".into(),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

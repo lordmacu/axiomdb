@@ -125,11 +125,15 @@ pub fn insert_into_indexes(
             continue;
         }
 
-        // FK auto-indexes use composite keys: fk_val + RecordId (10 bytes).
-        // This makes every entry globally unique in the B-Tree even when multiple
-        // rows share the same FK value (InnoDB approach — Phase 6.9).
-        let key = if idx.is_fk_index {
-            fk_composite_key(&key_vals[0], rid)?
+        // Key encoding:
+        // - FK auto-indexes and non-unique indexes: key || encode_rid(rid) (10 bytes).
+        //   Makes every B-Tree entry globally unique even when multiple rows share the
+        //   same indexed value (InnoDB approach — Phase 6.9 for FK; generalized here).
+        // - Unique indexes: plain encode_index_key (duplicate → UniqueViolation above).
+        let key = if idx.is_fk_index || !idx.is_unique {
+            let mut k = encode_index_key(&key_vals)?;
+            k.extend_from_slice(&encode_rid(rid));
+            k
         } else {
             encode_index_key(&key_vals)?
         };
@@ -203,13 +207,17 @@ pub fn delete_from_indexes(
             continue;
         }
 
-        // FK auto-indexes use composite keys; all others use plain encode_index_key.
-        let key = if idx.is_fk_index {
-            match fk_composite_key(&key_vals[0], rid) {
+        // FK auto-indexes and non-unique indexes: key || encode_rid(rid).
+        // Unique indexes: plain encode_index_key.
+        let key = if idx.is_fk_index || !idx.is_unique {
+            let base = match encode_index_key(&key_vals) {
                 Ok(k) => k,
                 Err(DbError::IndexKeyTooLong { .. }) => continue,
                 Err(e) => return Err(e),
-            }
+            };
+            let mut k = base;
+            k.extend_from_slice(&encode_rid(rid));
+            k
         } else {
             match encode_index_key(&key_vals) {
                 Ok(k) => k,

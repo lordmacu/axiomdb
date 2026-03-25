@@ -366,6 +366,14 @@ pub struct IndexDef {
     ///
     /// Stored in `flags bit 2` (`0x04`). Pre-6.9 rows have bit 2 = 0 → `false`.
     pub is_fk_index: bool,
+    /// INCLUDE columns for covering index scans (Phase 6.13).
+    ///
+    /// Catalog-only metadata in Phase 6.13. B-Tree leaf storage of these values
+    /// is planned for Phase 6.15.
+    ///
+    /// Stored after `is_fk_index`: `[include_len: 1 byte][col_idx: u16 LE] × len`.
+    /// Absent in pre-6.13 rows → `include_columns = vec![]`.
+    pub include_columns: Vec<u16>,
 }
 
 impl IndexDef {
@@ -418,15 +426,21 @@ impl IndexDef {
             buf.extend_from_slice(&col.col_idx.to_le_bytes());
             buf.push(col.order as u8);
         }
-        // Predicate section (Phase 6.7) — only written when predicate is Some.
-        // Old readers stop at end of columns and never see these bytes.
+        // Predicate section (Phase 6.7) — always write pred_len u16 (0 if no predicate).
+        // Pre-6.7 rows have no pred_len bytes; from_bytes skips when < 2 bytes remain.
+        buf.extend_from_slice(&(pred_len as u16).to_le_bytes());
         if let Some(pred) = pred_bytes {
-            buf.extend_from_slice(&(pred.len() as u16).to_le_bytes());
             buf.extend_from_slice(pred);
         }
         // Fill factor (Phase 6.8) — always written as 1 byte after predicate.
         // Pre-6.8 readers stop before this byte and use the default of 90.
         buf.push(self.fillfactor);
+        // Include columns (Phase 6.13) — after fillfactor, always written.
+        // Pre-6.13 readers stop at fillfactor and never see this section.
+        buf.push(self.include_columns.len() as u8);
+        for &col_idx in &self.include_columns {
+            buf.extend_from_slice(&col_idx.to_le_bytes());
+        }
         buf
     }
 
@@ -518,6 +532,27 @@ impl IndexDef {
             90 // default for pre-6.8 rows
         };
 
+        // Include columns (Phase 6.13) — [include_len: 1][col_idx: u16 LE] × len.
+        // Absent in pre-6.13 rows → empty vec.
+        let include_columns = if bytes.len() > consumed {
+            let include_len = bytes[consumed] as usize;
+            consumed += 1;
+            let mut cols = Vec::with_capacity(include_len);
+            for _ in 0..include_len {
+                if bytes.len() < consumed + 2 {
+                    return Err(DbError::ParseError {
+                        message: "IndexDef include_columns truncated".into(),
+                    });
+                }
+                let col_idx = u16::from_le_bytes([bytes[consumed], bytes[consumed + 1]]);
+                consumed += 2;
+                cols.push(col_idx);
+            }
+            cols
+        } else {
+            vec![] // pre-6.13 row
+        };
+
         Ok((
             Self {
                 index_id,
@@ -530,6 +565,7 @@ impl IndexDef {
                 predicate,
                 fillfactor,
                 is_fk_index,
+                include_columns,
             },
             consumed,
         ))
@@ -1012,6 +1048,7 @@ mod tests {
             predicate: None,
             fillfactor: 90,
             is_fk_index: false,
+            include_columns: vec![],
         };
         let bytes = def.to_bytes();
         let (back, consumed) = IndexDef::from_bytes(&bytes).unwrap();
@@ -1035,6 +1072,7 @@ mod tests {
             predicate: None,
             fillfactor: 90,
             is_fk_index: false,
+            include_columns: vec![],
         };
         let bytes = def.to_bytes();
         let (back, _) = IndexDef::from_bytes(&bytes).unwrap();
@@ -1058,6 +1096,7 @@ mod tests {
             predicate: None,
             fillfactor: 90,
             is_fk_index: false,
+            include_columns: vec![],
         };
         let bytes = def.to_bytes();
         assert!(IndexDef::from_bytes(&bytes[..10]).is_err());
@@ -1085,6 +1124,7 @@ mod tests {
             predicate: None,
             fillfactor: 90,
             is_fk_index: false,
+            include_columns: vec![],
         };
         let bytes = def.to_bytes();
         let (back, consumed) = IndexDef::from_bytes(&bytes).unwrap();
@@ -1106,6 +1146,7 @@ mod tests {
             predicate: None,
             fillfactor: 90,
             is_fk_index: false,
+            include_columns: vec![],
         };
         let full_bytes = def.to_bytes();
         // Truncate the columns section (last byte is ncols=0, remove it).

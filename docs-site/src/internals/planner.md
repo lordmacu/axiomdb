@@ -27,6 +27,16 @@ pub enum AccessMethod {
         lo: Option<Vec<u8>>,
         hi: Option<Vec<u8>>,
     },
+
+    /// Index-only scan: all SELECT columns are covered by index key columns.
+    /// No heap read is needed — values are decoded directly from B-Tree key bytes.
+    IndexOnlyScan {
+        index_def: IndexDef,
+        lo: Option<Vec<u8>>,
+        hi: Option<Vec<u8>>,
+        n_key_cols: usize,              // number of encoded columns in the key
+        needed_key_positions: Vec<usize>, // position of each SELECT column in the decoded key
+    },
 }
 ```
 
@@ -102,6 +112,52 @@ Patterns **not** recognized:
 - Non-leading index column (`WHERE col2 = x` when index is `(col1, col2)`)
 - JOIN conditions
 
+### Rule 3 — Index-only scan (Phase 6.13)
+
+After any Rule 0–2 match selects an index, `plan_select` checks whether the
+query's projected columns are all covered by the index key. If so, it upgrades
+the access method to `IndexOnlyScan`.
+
+**Coverage check — `index_covers_query`:**
+
+```
+index_covers_query(index_def, select_col_idxs) -> bool:
+  if select_col_idxs is empty:
+    return false          // SELECT * → Scan/Lookup, never IndexOnlyScan
+  for each col_idx in select_col_idxs:
+    if col_idx not in index_def.key_col_idxs:
+      return false        // at least one column is not in the key
+  return true
+```
+
+**Key position mapping — `build_key_positions`:**
+
+```
+build_key_positions(index_def, select_col_idxs) -> Vec<usize>:
+  for each col_idx in select_col_idxs:
+    position = index_def.key_col_idxs.iter().position(|&k| k == col_idx)
+    needed_key_positions.push(position)
+  return needed_key_positions
+```
+
+Coverage only triggers when `select_col_idxs` is **non-empty**. A bare
+`SELECT *` always produces an empty `select_col_idxs` (all columns requested)
+and falls back to `Scan` or a regular `IndexLookup`/`IndexRange`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Coverage Without Visibility Map</span>
+PostgreSQL's <code>check_index_only</code> function in <code>indxpath.c</code>
+uses the all-visible map bit to decide whether a heap fetch can be skipped per
+page. AxiomDB uses the same coverage check (all SELECT columns must be index key
+columns) but without the visibility map: a 24-byte <code>RowHeader</code> read
+performs the MVCC check instead. This eliminates the VACUUM dependency at the
+cost of one 24-byte I/O per visible row. A full all-visible bitmap is planned
+for Phase 6.14.
+</div>
+</div>
+
 ---
 
 ## Executor Integration
@@ -113,9 +169,12 @@ rows:
 1. Load indexes from catalog: CatalogReader::list_indexes(table_id)
 2. plan_select(where_clause, indexes, columns) → access_method
 3. Fetch rows:
-   Scan       → TableEngine::scan_table (full heap scan)
-   IndexLookup → BTree::lookup_in → TableEngine::read_row (at most 1 row)
-   IndexRange  → BTree::range_in → TableEngine::read_row (per B-Tree hit)
+   Scan            → TableEngine::scan_table (full heap scan)
+   IndexLookup     → BTree::lookup_in → TableEngine::read_row (at most 1 row)
+   IndexRange      → BTree::range_in → TableEngine::read_row (per B-Tree hit)
+   IndexOnlyScan   → BTree::range_in → HeapChain::is_slot_visible (24-byte header read)
+                     → decode_index_key(key_bytes, n_key_cols)
+                     → project needed_key_positions from decoded key (no heap decode)
 4. Apply residual WHERE filter on fetched rows (for conditions not consumed by index)
 5. Continue with ORDER BY / LIMIT / projection as before
 ```
@@ -245,6 +304,6 @@ index absent-key path.
 | Composite multi-column planner (> 1 column WHERE) | ✅ Done | 6.9 |
 | Statistics cost gate (NDV, selectivity threshold) | ✅ Done | 6.10 |
 | `EXPLAIN` statement | ⏳ Planned | 8.x |
-| Covering indexes (index-only scan, no heap read) | ⏳ Planned | 6.13 |
+| Covering indexes (index-only scan, no heap read) | ✅ Done | 6.13 |
 | Partial index predicate matching (complex implication) | ⏳ Planned | 6.15 |
 | Join selectivity estimation | ⏳ Planned | 6.15 |

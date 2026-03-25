@@ -330,6 +330,7 @@ fn test_index_def_roundtrip_with_predicate() {
         predicate: Some("deleted_at IS NULL".to_string()),
         fillfactor: 90,
         is_fk_index: false,
+        include_columns: vec![],
     };
 
     let bytes = def.to_bytes();
@@ -357,6 +358,7 @@ fn test_index_def_roundtrip_no_predicate_backward_compat() {
         predicate: None,
         fillfactor: 90,
         is_fk_index: false,
+        include_columns: vec![],
     };
 
     let bytes = def.to_bytes();
@@ -386,6 +388,7 @@ fn test_pre_67_index_row_reads_predicate_as_none() {
         predicate: None,
         fillfactor: 90,
         is_fk_index: false,
+        include_columns: vec![],
     };
 
     let old_bytes = old_def.to_bytes();
