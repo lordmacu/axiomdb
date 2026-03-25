@@ -507,6 +507,50 @@ a BLOB upload via <code>COM_STMT_EXECUTE</code>).
 
 ---
 
+## Disk-Full Errors (Class 53)
+
+### 53100 — disk_full
+
+Returned when the OS reports that the volume is full (`ENOSPC`) or over quota
+(`EDQUOT`) during a durable write — a WAL append, WAL fsync, storage grow, or
+mmap flush.
+
+```
+ERROR 53100: disk full during 'wal commit fsync': no space left on device
+HINT: The database volume is full or over quota. Free disk space and restart
+      the server to restore write access. The database is now in read-only
+      degraded mode.
+```
+
+**What happens after the error:**
+
+AxiomDB enters **read-only degraded mode** immediately. In this mode:
+
+| Statement type | Allowed? |
+|---|---|
+| `SELECT`, `SHOW`, `EXPLAIN` | ✅ Yes |
+| `SET` (session variables)    | ✅ Yes |
+| `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` | ❌ No — returns `53100` |
+| `CREATE TABLE`, `DROP TABLE`, DDL | ❌ No — returns `53100` |
+| `BEGIN`, `COMMIT`, `ROLLBACK` | ❌ No — returns `53100` |
+
+The mode persists until the server process is restarted. There is no way to
+return to read-write mode without restarting.
+
+**Fix:**
+1. Free disk space or remove the quota restriction.
+2. Restart the server — AxiomDB will reopen in read-write mode if space is available.
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Reads Are Always Safe</span>
+In degraded mode, all read traffic continues uninterrupted. Applications can continue serving queries while the operator resolves the disk space issue — no connection restart needed for reads.
+</div>
+</div>
+
+---
+
 ## Complete SQLSTATE Reference
 
 | SQLSTATE | Name                          | Common Cause                              |

@@ -154,6 +154,23 @@ SQLite and PostgreSQL issue `fsync` over the entire data file on every checkpoin
 </div>
 </div>
 
+### Disk-full error classification
+
+Every durable I/O call in `flush()` (and in `create()`/`grow()`) passes its
+`std::io::Error` through `classify_io()` before returning:
+
+```rust
+// axiomdb-core/src/error.rs
+pub fn classify_io(err: std::io::Error, operation: &'static str) -> DbError {
+    // ENOSPC (28) and EDQUOT (69/122) → DbError::DiskFull { operation }
+    // All other errors → DbError::Io(err)
+}
+```
+
+When a `DiskFull` error propagates out of `MmapStorage`, the server runtime
+transitions to **read-only degraded mode** — all subsequent mutating statements
+are rejected immediately without re-entering the storage layer.
+
 ### Invariants
 
 - `flush()` returns `Ok(())` only after all dirty pages are durable.
@@ -161,6 +178,8 @@ SQLite and PostgreSQL issue `fsync` over the entire data file on every checkpoin
 - The freelist page (page 1) is always included when `freelist_dirty` is set,
   regardless of whether it appears in the tracker.
 - `dirty_page_count()` always reflects the count since the last successful flush.
+- `ENOSPC`/`EDQUOT` errors are always surfaced as `DbError::DiskFull`, never
+  silently wrapped in `DbError::Io`.
 
 ---
 

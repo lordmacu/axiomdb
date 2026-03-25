@@ -27,7 +27,7 @@
 //! re-analyzed before execution.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{oneshot, Mutex};
@@ -53,8 +53,20 @@ use super::status::StatusRegistry;
 /// Receiver for group commit fsync confirmation.
 ///
 /// Resolves to `Ok(())` when the fsync covering the DML commit completes,
-/// or `Err(WalGroupCommitFailed)` if the fsync fails.
+/// or `Err(WalGroupCommitFailed)` / `Err(DiskFull)` if the fsync fails.
 pub type CommitRx = oneshot::Receiver<Result<(), DbError>>;
+
+// ── RuntimeMode ───────────────────────────────────────────────────────────────
+
+/// Shared runtime mode for the whole opened database process.
+///
+/// Stored as an `AtomicU8` so the background group-commit task and all
+/// connection handlers can read it without holding the `Database` lock.
+///
+/// The transition is one-way: `ReadWrite → ReadOnlyDegraded`. Once degraded
+/// the mode persists until the process restarts.
+pub const RUNTIME_MODE_READ_WRITE: u8 = 0;
+pub const RUNTIME_MODE_DEGRADED: u8 = 1;
 
 pub struct Database {
     pub storage: MmapStorage,
@@ -77,6 +89,12 @@ pub struct Database {
     /// Connections clone this `Arc` once at connect time. Counter updates
     /// use atomics — no lock needed after the initial clone.
     pub status: Arc<StatusRegistry>,
+    /// Shared runtime mode (`RUNTIME_MODE_READ_WRITE` / `RUNTIME_MODE_DEGRADED`).
+    ///
+    /// Connections clone this `Arc` at connect time and poll it without
+    /// holding the `Database` lock. The group-commit background task also
+    /// holds a clone so it can flip the mode on a disk-full fsync failure.
+    pub runtime_mode: Arc<AtomicU8>,
 }
 
 impl Database {
@@ -107,6 +125,7 @@ impl Database {
             coordinator: None,
             schema_version: Arc::new(AtomicU64::new(0)),
             status: Arc::new(StatusRegistry::new()),
+            runtime_mode: Arc::new(AtomicU8::new(RUNTIME_MODE_READ_WRITE)),
         })
     }
 
@@ -223,6 +242,12 @@ impl Database {
             return Ok((result, None));
         }
 
+        if self.is_degraded() && sql_may_mutate(sql) {
+            return Err(DbError::DiskFull {
+                operation: "database is in read-only degraded mode",
+            });
+        }
+
         let stmt = parse(sql, None)?;
         let is_ddl = is_schema_changing(&stmt);
         let snap = self
@@ -236,7 +261,13 @@ impl Database {
             &mut self.txn,
             &mut self.bloom,
             session,
-        )?;
+        );
+        if let Err(ref e) = result {
+            if matches!(e, DbError::DiskFull { .. }) {
+                self.enter_degraded_mode();
+            }
+        }
+        let result = result?;
         if is_ddl {
             self.schema_version.fetch_add(1, Ordering::Release);
         }
@@ -252,6 +283,11 @@ impl Database {
         stmt: Stmt,
         session: &mut SessionContext,
     ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
+        if self.is_degraded() && stmt_may_mutate(&stmt) {
+            return Err(DbError::DiskFull {
+                operation: "database is in read-only degraded mode",
+            });
+        }
         let is_ddl = is_schema_changing(&stmt);
         let result = execute_with_ctx(
             stmt,
@@ -259,11 +295,31 @@ impl Database {
             &mut self.txn,
             &mut self.bloom,
             session,
-        )?;
+        );
+        if let Err(ref e) = result {
+            if matches!(e, DbError::DiskFull { .. }) {
+                self.enter_degraded_mode();
+            }
+        }
+        let result = result?;
         if is_ddl {
             self.schema_version.fetch_add(1, Ordering::Release);
         }
         Ok((result, self.take_commit_rx()))
+    }
+
+    /// Returns `true` if the database has entered read-only degraded mode due
+    /// to a previous disk-full error.
+    pub fn is_degraded(&self) -> bool {
+        self.runtime_mode.load(Ordering::Acquire) == RUNTIME_MODE_DEGRADED
+    }
+
+    /// Transitions the database to read-only degraded mode (one-way).
+    ///
+    /// Safe to call from any thread. Has no effect if already degraded.
+    pub fn enter_degraded_mode(&self) {
+        self.runtime_mode
+            .store(RUNTIME_MODE_DEGRADED, Ordering::Release);
     }
 
     /// Returns the current database name (always "axiomdb" for Phase 5).
@@ -297,5 +353,45 @@ fn is_schema_changing(stmt: &Stmt) -> bool {
             | Stmt::CreateIndex(_)
             | Stmt::DropIndex(_)
             | Stmt::TruncateTable(_)
+    )
+}
+
+/// Quick keyword-level check: does this SQL string look like it may mutate
+/// durable state?
+///
+/// Used to gate statements before they reach WAL/storage when the database
+/// is in read-only degraded mode. Conservative — prefers false positives
+/// (blocking a SELECT that starts with "INSERT" is fine; never allow a real
+/// INSERT to slip through).
+///
+/// Not a substitute for the parser — only used as a fast pre-check.
+pub fn sql_may_mutate(sql: &str) -> bool {
+    let lower = sql.trim_start().to_ascii_lowercase();
+    // DML
+    lower.starts_with("insert")
+        || lower.starts_with("update")
+        || lower.starts_with("delete")
+        || lower.starts_with("truncate")
+        // DDL
+        || lower.starts_with("create")
+        || lower.starts_with("drop")
+        || lower.starts_with("alter")
+        // Transaction control
+        || lower.starts_with("begin")
+        || lower.starts_with("start transaction")
+        || lower.starts_with("commit")
+        || lower.starts_with("rollback")
+        || lower.starts_with("savepoint")
+        || lower.starts_with("release")
+}
+
+/// Returns `true` if the parsed `Stmt` may mutate durable state.
+///
+/// Used for the prepared-statement execute path where we already have
+/// the parsed AST — avoids re-parsing just for the gate check.
+fn stmt_may_mutate(stmt: &Stmt) -> bool {
+    !matches!(
+        stmt,
+        Stmt::Select(_) | Stmt::ShowTables(_) | Stmt::ShowColumns(_) | Stmt::Set(_)
     )
 }

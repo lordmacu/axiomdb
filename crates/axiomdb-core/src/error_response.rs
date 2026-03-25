@@ -359,6 +359,16 @@ fn derive_detail_hint(err: &DbError) -> (Option<String>, Option<String>) {
         ),
 
         // ── System errors ─────────────────────────────────────────────────
+        DbError::DiskFull { .. } => (
+            None,
+            Some(
+                "The database volume is full or over quota. \
+                 Free disk space and restart the server to restore write access. \
+                 The database is now in read-only degraded mode."
+                    .into(),
+            ),
+        ),
+
         DbError::StorageFull => (
             None,
             Some(
