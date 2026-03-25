@@ -294,6 +294,13 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                         // Sync session autocommit flag after SET statements so that the
                         // executor respects the new mode on the next DML statement.
                         session.autocommit = conn_state.autocommit;
+                        // Sync strict_mode from sql_mode so the executor uses the new setting.
+                        session.strict_mode = axiomdb_sql::session::sql_mode_is_strict(
+                            conn_state
+                                .get_variable("sql_mode")
+                                .as_deref()
+                                .unwrap_or("STRICT_TRANS_TABLES"),
+                        );
                         // Sync decoder limit after SET max_allowed_packet.
                         reader.decoder_mut().set_max_payload_len(
                             conn_state
@@ -343,6 +350,12 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     match intercept_special_query(stmt_sql, &mut conn_state, &status) {
                         Ok(Some(packets)) => {
                             session.autocommit = conn_state.autocommit;
+                            session.strict_mode = axiomdb_sql::session::sql_mode_is_strict(
+                                conn_state
+                                    .get_variable("sql_mode")
+                                    .as_deref()
+                                    .unwrap_or("STRICT_TRANS_TABLES"),
+                            );
                             reader.decoder_mut().set_max_payload_len(
                                 conn_state
                                     .max_allowed_packet_bytes()
@@ -926,6 +939,12 @@ fn show_variables_result(lower: &str, conn_state: &ConnectionState) -> Vec<(u8, 
     ];
 
     let charset = conn_state.character_set_client.clone();
+    let sql_mode_val = conn_state
+        .get_variable("sql_mode")
+        .unwrap_or_else(|| "STRICT_TRANS_TABLES".into());
+    let strict_mode_val = conn_state
+        .get_variable("strict_mode")
+        .unwrap_or_else(|| "ON".into());
     let all_vars: Vec<(&str, String)> = vec![
         ("character_set_client", charset.clone()),
         ("character_set_connection", charset.clone()),
@@ -936,6 +955,8 @@ fn show_variables_result(lower: &str, conn_state: &ConnectionState) -> Vec<(u8, 
         ("collation_connection", "utf8mb4_0900_ai_ci".into()),
         ("collation_database", "utf8mb4_0900_ai_ci".into()),
         ("collation_server", "utf8mb4_0900_ai_ci".into()),
+        ("sql_mode", sql_mode_val),
+        ("strict_mode", strict_mode_val),
     ];
 
     // Extract LIKE pattern if present

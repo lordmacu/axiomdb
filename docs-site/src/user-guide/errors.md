@@ -440,10 +440,17 @@ INSERT INTO users (age) VALUES (CAST('42' AS INT));   -- explicit — always wor
 SELECT CAST(3 AS REAL) + 1.5;                         -- explicit widening
 ```
 
-**MySQL compat mode** (permissive): if your application requires MySQL-style
-lenient coercion (`'42abc'` silently converted to `42`), set the session to
-permissive mode. This will be available via `SET AXIOM_COMPAT = 'mysql'` in
-Phase 5 (MySQL wire protocol). Until then, strict mode is always active.
+**Permissive mode**: if your application requires MySQL-style lenient coercion
+(`'42abc'` silently converted to `42`), disable strict mode for the session:
+
+```sql
+SET strict_mode = OFF;   -- or: SET sql_mode = ''
+```
+
+In permissive mode, failed coercions fall back to a best-effort conversion and
+emit warning **1265** instead of returning `22018`. Use `SHOW WARNINGS` after
+bulk loads to audit any truncated values. See
+[Strict Mode](dml.md#strict-mode) for full details.
 
 #### Implicit coercions that always succeed (no error)
 

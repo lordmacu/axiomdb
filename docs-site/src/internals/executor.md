@@ -959,3 +959,77 @@ execute_alter_table(stmt):
 This ensures that the next query against the altered table re-reads the catalog
 and sees the updated column list, rather than operating on a stale schema that
 may reference columns that no longer exist or omit newly added ones.
+
+---
+
+## Strict Mode and Warning 1265
+
+`SessionContext.strict_mode` is a `bool` flag (default `true`) that controls
+how `INSERT` and `UPDATE` column coercion failures are handled.
+
+### Coercion paths
+
+```
+INSERT / UPDATE column value assignment:
+  if ctx.strict_mode:
+    coerce(value, target_type, CoercionMode::Strict)
+      → Ok(v)    : use v
+      → Err(e)   : return Err immediately (SQLSTATE 22018)
+  else:
+    coerce(value, target_type, CoercionMode::Strict)
+      → Ok(v)    : use v  (no warning — strict succeeded)
+      → Err(_)   : try CoercionMode::Permissive
+          → Ok(v) : use v, emit ctx.warn(1265, "Data truncated for column '<col>' at row <n>")
+          → Err(e): return Err (both paths failed)
+```
+
+`CoercionMode::Permissive` performs best-effort conversion: `'42abc'` → `42`,
+`'abc'` → `0`, overflowing integers clamped to the type bounds.
+
+### Row numbering
+
+`insert_row_with_ctx` and `insert_rows_batch_with_ctx` accept an explicit
+`row_num: usize` (1-based). The VALUES loop in `execute_insert_ctx` passes
+`row_idx + 1` from `enumerate()`:
+
+```rust
+for (row_idx, value_exprs) in rows.into_iter().enumerate() {
+    let values = eval_value_exprs(value_exprs, ...)?;
+    engine.insert_row_with_ctx(&mut ctx, values, row_idx + 1)?;
+}
+```
+
+This makes warning 1265 messages meaningful for multi-row inserts:
+`"Data truncated for column 'stock' at row 2"`.
+
+### SET strict_mode / SET sql_mode
+
+The executor intercepts `SET strict_mode` and `SET sql_mode` in `execute_set_ctx`
+(called from `dispatch_ctx`). It delegates to helpers from `session.rs`:
+
+```rust
+"strict_mode" => {
+    let b = parse_boolish_setting(&raw)?;
+    ctx.strict_mode = b;
+}
+"sql_mode" => {
+    let normalized = normalize_sql_mode(&raw);
+    ctx.strict_mode = sql_mode_is_strict(&normalized);
+}
+```
+
+The wire layer (`handler.rs`) syncs the wire-visible `@@sql_mode` and
+`@@strict_mode` variables with the session `bool` after every intercepted SET.
+Both variables are surfaced in `SHOW VARIABLES`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Try Strict First, Then Permissive</span>
+In permissive mode, AxiomDB always tries strict coercion first. A warning is
+only emitted when the strict path fails and the permissive path succeeds.
+This means values that coerce cleanly in strict mode (e.g. <code>'42'</code> →
+<code>42</code>) never generate a warning in either mode — matching MySQL 8's
+behavior where warning 1265 is reserved for actual data loss, not clean widening.
+</div>
+</div>

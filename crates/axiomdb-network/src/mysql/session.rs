@@ -11,6 +11,9 @@
 use std::collections::HashMap;
 
 use axiomdb_core::error::DbError;
+use axiomdb_sql::session::{
+    apply_strict_to_sql_mode, normalize_sql_mode, parse_boolish_setting, sql_mode_is_strict,
+};
 
 use super::status::SessionStatus;
 
@@ -121,7 +124,8 @@ impl ConnectionState {
     pub fn new() -> Self {
         let mut variables = HashMap::new();
         variables.insert("time_zone".into(), "SYSTEM".into());
-        variables.insert("sql_mode".into(), String::new());
+        variables.insert("sql_mode".into(), "STRICT_TRANS_TABLES".into());
+        variables.insert("strict_mode".into(), "ON".into());
         variables.insert("transaction_isolation".into(), "REPEATABLE-READ".into());
         variables.insert("tx_isolation".into(), "REPEATABLE-READ".into());
         variables.insert("max_allowed_packet".into(), "67108864".into());
@@ -233,6 +237,36 @@ impl ConnectionState {
                             });
                         }
                     }
+                }
+                "strict_mode" => {
+                    let enabled = if value.eq_ignore_ascii_case("DEFAULT") {
+                        true
+                    } else {
+                        parse_boolish_setting(&value)?
+                    };
+                    let strict_str = if enabled { "ON" } else { "OFF" };
+                    self.variables
+                        .insert("strict_mode".to_string(), strict_str.to_string());
+                    let current_sql_mode =
+                        self.variables.get("sql_mode").cloned().unwrap_or_default();
+                    let new_sql_mode = apply_strict_to_sql_mode(&current_sql_mode, enabled);
+                    self.variables.insert("sql_mode".to_string(), new_sql_mode);
+                }
+                "sql_mode" => {
+                    let normalized = if value.eq_ignore_ascii_case("DEFAULT") {
+                        "STRICT_TRANS_TABLES".to_string()
+                    } else {
+                        normalize_sql_mode(&value)
+                    };
+                    self.variables
+                        .insert("sql_mode".to_string(), normalized.clone());
+                    let strict_str = if sql_mode_is_strict(&normalized) {
+                        "ON"
+                    } else {
+                        "OFF"
+                    };
+                    self.variables
+                        .insert("strict_mode".to_string(), strict_str.to_string());
                 }
                 other => {
                     self.variables.insert(other.to_string(), value);
@@ -478,6 +512,110 @@ mod tests {
     fn test_new_with_limit_sets_max() {
         let s = ConnectionState::new_with_limit(32);
         assert_eq!(s.max_prepared_stmts, 32);
+    }
+
+    // ── Phase 4.25c: strict_mode / sql_mode wire tests ────────────────────────
+
+    #[test]
+    fn test_default_sql_mode_is_strict_trans_tables() {
+        let s = ConnectionState::new();
+        assert_eq!(
+            s.get_variable("sql_mode"),
+            Some("STRICT_TRANS_TABLES".into())
+        );
+    }
+
+    #[test]
+    fn test_default_strict_mode_is_on() {
+        let s = ConnectionState::new();
+        assert_eq!(s.get_variable("strict_mode"), Some("ON".into()));
+    }
+
+    #[test]
+    fn test_set_strict_mode_off_updates_sql_mode() {
+        let mut s = ConnectionState::new();
+        assert!(s.apply_set("SET strict_mode = OFF").unwrap());
+        assert_eq!(s.get_variable("strict_mode"), Some("OFF".into()));
+        // sql_mode must no longer contain STRICT_TRANS_TABLES
+        let sql_mode = s.get_variable("sql_mode").unwrap();
+        assert!(
+            !sql_mode.contains("STRICT_TRANS_TABLES"),
+            "sql_mode should not contain STRICT_TRANS_TABLES after OFF: {sql_mode}"
+        );
+    }
+
+    #[test]
+    fn test_set_strict_mode_on_updates_sql_mode() {
+        let mut s = ConnectionState::new();
+        s.apply_set("SET strict_mode = OFF").unwrap();
+        s.apply_set("SET strict_mode = ON").unwrap();
+        assert_eq!(s.get_variable("strict_mode"), Some("ON".into()));
+        let sql_mode = s.get_variable("sql_mode").unwrap();
+        assert!(
+            sql_mode.contains("STRICT_TRANS_TABLES"),
+            "sql_mode should contain STRICT_TRANS_TABLES after ON: {sql_mode}"
+        );
+    }
+
+    #[test]
+    fn test_set_strict_mode_default_restores_strict() {
+        let mut s = ConnectionState::new();
+        s.apply_set("SET strict_mode = OFF").unwrap();
+        s.apply_set("SET strict_mode = DEFAULT").unwrap();
+        assert_eq!(s.get_variable("strict_mode"), Some("ON".into()));
+    }
+
+    #[test]
+    fn test_set_sql_mode_empty_disables_strict() {
+        let mut s = ConnectionState::new();
+        s.apply_set("SET sql_mode = ''").unwrap();
+        assert_eq!(s.get_variable("strict_mode"), Some("OFF".into()));
+        assert_eq!(s.get_variable("sql_mode"), Some("".into()));
+    }
+
+    #[test]
+    fn test_set_sql_mode_strict_trans_tables_enables_strict() {
+        let mut s = ConnectionState::new();
+        s.apply_set("SET sql_mode = ''").unwrap();
+        s.apply_set("SET sql_mode = 'STRICT_TRANS_TABLES'").unwrap();
+        assert_eq!(s.get_variable("strict_mode"), Some("ON".into()));
+        assert_eq!(
+            s.get_variable("sql_mode"),
+            Some("STRICT_TRANS_TABLES".into())
+        );
+    }
+
+    #[test]
+    fn test_set_sql_mode_ansi_quotes_with_strict_trans_tables() {
+        let mut s = ConnectionState::new();
+        s.apply_set("SET sql_mode = 'ANSI_QUOTES,STRICT_TRANS_TABLES'")
+            .unwrap();
+        assert_eq!(s.get_variable("strict_mode"), Some("ON".into()));
+        let sql_mode = s.get_variable("sql_mode").unwrap();
+        assert!(sql_mode.contains("STRICT_TRANS_TABLES"), "{sql_mode}");
+        assert!(sql_mode.contains("ANSI_QUOTES"), "{sql_mode}");
+    }
+
+    #[test]
+    fn test_set_sql_mode_default_restores_strict() {
+        let mut s = ConnectionState::new();
+        s.apply_set("SET sql_mode = ''").unwrap();
+        s.apply_set("SET sql_mode = DEFAULT").unwrap();
+        assert_eq!(s.get_variable("strict_mode"), Some("ON".into()));
+        assert_eq!(
+            s.get_variable("sql_mode"),
+            Some("STRICT_TRANS_TABLES".into())
+        );
+    }
+
+    #[test]
+    fn test_set_strict_mode_invalid_value_returns_error() {
+        let mut s = ConnectionState::new();
+        let err = s.apply_set("SET strict_mode = maybe").unwrap_err();
+        assert!(
+            err.to_string().contains("ON/OFF"),
+            "error must mention ON/OFF: {err}"
+        );
     }
 
     #[test]

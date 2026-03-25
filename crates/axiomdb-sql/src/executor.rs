@@ -51,13 +51,13 @@ use crate::{
     ast::{
         AlterTableOp, AlterTableStmt, ColumnConstraint, CreateIndexStmt, CreateTableStmt,
         DeleteStmt, DropIndexStmt, DropTableStmt, FromClause, InsertSource, InsertStmt, JoinClause,
-        JoinCondition, JoinType, NullsOrder, OrderByItem, SelectItem, SelectStmt, SortOrder, Stmt,
-        UpdateStmt,
+        JoinCondition, JoinType, NullsOrder, OrderByItem, SelectItem, SelectStmt, SetStmt,
+        SetValue, SortOrder, Stmt, UpdateStmt,
     },
     eval::{eval, eval_with, is_truthy, SubqueryRunner},
     expr::{BinaryOp, Expr},
     result::{ColumnMeta, QueryResult, Row},
-    session::SessionContext,
+    session::{normalize_sql_mode, parse_boolish_setting, sql_mode_is_strict, SessionContext},
     table::TableEngine,
 };
 
@@ -539,9 +539,89 @@ fn dispatch_ctx(
             execute_alter_table(s, storage, txn)
         }
         Stmt::Analyze(s) => execute_analyze(s, storage, txn, ctx),
+        Stmt::Set(s) => execute_set_ctx(s, ctx),
         // Everything else: delegate to existing dispatch.
         other => dispatch(other, storage, txn),
     }
+}
+
+/// Handles `SET variable = value` in the ctx execution path.
+///
+/// Supported variables:
+/// - `autocommit` — boolish ON/OFF/1/0/TRUE/FALSE
+/// - `strict_mode` — boolish or DEFAULT (resets to `true`)
+/// - `sql_mode` — normalized string; strict tokens control `ctx.strict_mode`
+///
+/// All other variables are accepted silently (existing stub behavior).
+fn execute_set_ctx(stmt: SetStmt, ctx: &mut SessionContext) -> Result<QueryResult, DbError> {
+    match stmt.variable.to_ascii_lowercase().as_str() {
+        "autocommit" => match stmt.value {
+            SetValue::Default => ctx.autocommit = true,
+            SetValue::Expr(expr) => {
+                let v = eval(&expr, &[])?;
+                let raw = match &v {
+                    Value::Text(s) => s.clone(),
+                    Value::Int(n) => n.to_string(),
+                    Value::BigInt(n) => n.to_string(),
+                    Value::Bool(b) => {
+                        if *b {
+                            "1".to_string()
+                        } else {
+                            "0".to_string()
+                        }
+                    }
+                    other => {
+                        return Err(DbError::InvalidValue {
+                            reason: format!("autocommit: unsupported value type {other:?}"),
+                        })
+                    }
+                };
+                ctx.autocommit = parse_boolish_setting(&raw)?;
+            }
+        },
+        "strict_mode" => match stmt.value {
+            SetValue::Default => ctx.strict_mode = true,
+            SetValue::Expr(expr) => {
+                let v = eval(&expr, &[])?;
+                let raw = match &v {
+                    Value::Text(s) => s.clone(),
+                    Value::Int(n) => n.to_string(),
+                    Value::BigInt(n) => n.to_string(),
+                    Value::Bool(b) => {
+                        if *b {
+                            "1".to_string()
+                        } else {
+                            "0".to_string()
+                        }
+                    }
+                    other => {
+                        return Err(DbError::InvalidValue {
+                            reason: format!("strict_mode: unsupported value type {other:?}"),
+                        })
+                    }
+                };
+                ctx.strict_mode = parse_boolish_setting(&raw)?;
+            }
+        },
+        "sql_mode" => match stmt.value {
+            SetValue::Default => ctx.strict_mode = true,
+            SetValue::Expr(expr) => {
+                let v = eval(&expr, &[])?;
+                let raw = match &v {
+                    Value::Text(s) => s.clone(),
+                    other => {
+                        return Err(DbError::InvalidValue {
+                            reason: format!("sql_mode: expected string literal, got {other:?}"),
+                        })
+                    }
+                };
+                let normalized = normalize_sql_mode(&raw);
+                ctx.strict_mode = sql_mode_is_strict(&normalized);
+            }
+        },
+        _ => {} // other variables: silently accepted
+    }
+    Ok(QueryResult::Empty)
 }
 
 /// Resolves a table, using the session cache to avoid repeated catalog scans.
@@ -1020,7 +1100,7 @@ fn execute_insert_ctx(
 
     match stmt.source {
         InsertSource::Values(rows) => {
-            for value_exprs in rows {
+            for (row_idx, value_exprs) in rows.into_iter().enumerate() {
                 let provided: Vec<Value> = value_exprs
                     .iter()
                     .map(|e| eval(e, &[]))
@@ -1070,12 +1150,14 @@ fn execute_insert_ctx(
                 }
 
                 // Clone so full_values remains available for index maintenance.
-                let rid = TableEngine::insert_row(
+                let rid = TableEngine::insert_row_with_ctx(
                     storage,
                     txn,
                     &resolved.def,
                     schema_cols,
+                    ctx,
                     full_values.clone(),
+                    row_idx + 1,
                 )?;
                 if !secondary_indexes.is_empty() {
                     let updated = crate::index_maintenance::insert_into_indexes(
@@ -1108,7 +1190,7 @@ fn execute_insert_ctx(
                     )))
                 }
             };
-            for row_values in select_rows {
+            for (row_idx, row_values) in select_rows.into_iter().enumerate() {
                 let mut full_values: Vec<Value> = col_positions
                     .iter()
                     .map(|&idx| {
@@ -1143,12 +1225,14 @@ fn execute_insert_ctx(
                     )?;
                 }
                 // Clone so full_values remains available for index maintenance.
-                let rid = TableEngine::insert_row(
+                let rid = TableEngine::insert_row_with_ctx(
                     storage,
                     txn,
                     &resolved.def,
                     schema_cols,
+                    ctx,
                     full_values.clone(),
+                    row_idx + 1,
                 )?;
                 if !secondary_indexes.is_empty() {
                     let updated = crate::index_maintenance::insert_into_indexes(
@@ -1301,22 +1385,24 @@ fn execute_update_ctx(
             0 => {}
             1 => {
                 let (rid, new_values) = heap_updates.into_iter().next().unwrap();
-                TableEngine::update_row(
+                TableEngine::update_row_with_ctx(
                     storage,
                     txn,
                     &resolved.def,
                     &schema_cols,
+                    ctx,
                     rid,
                     new_values,
                 )?;
             }
             _ => {
                 // Multi-row batch: delete_batch + insert_batch — O(P) page I/O.
-                TableEngine::update_rows_batch(
+                TableEngine::update_rows_batch_with_ctx(
                     storage,
                     txn,
                     &resolved.def,
                     &schema_cols,
+                    ctx,
                     heap_updates,
                 )?;
             }
@@ -1326,11 +1412,12 @@ fn execute_update_ctx(
         // both old key (for delete) and new RecordId (for insert + bloom.add).
         let mut current_indexes = secondary_indexes;
         for (rid, old_values, new_values) in to_update {
-            let new_rid = TableEngine::update_row(
+            let new_rid = TableEngine::update_row_with_ctx(
                 storage,
                 txn,
                 &resolved.def,
                 &schema_cols,
+                ctx,
                 rid,
                 new_values.clone(),
             )?;

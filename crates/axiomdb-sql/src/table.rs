@@ -56,6 +56,8 @@ use axiomdb_types::{
 };
 use axiomdb_wal::TxnManager;
 
+use crate::session::SessionContext;
+
 // ── TableEngine ───────────────────────────────────────────────────────────────
 
 /// Stateless row storage interface for user tables.
@@ -475,6 +477,203 @@ impl TableEngine {
             slot_id: new_slot_id,
         })
     }
+
+    // ── ctx-aware write variants (session strict_mode + warning emission) ─────
+
+    /// Session-aware insert: applies strict or permissive coercion depending on
+    /// `ctx.strict_mode`, emitting warning 1265 on permissive fallback.
+    ///
+    /// `row_num` is 1-based and statement-local — used in the warning message so
+    /// multi-row `INSERT VALUES` callers can pass the loop counter.
+    pub fn insert_row_with_ctx(
+        storage: &mut dyn StorageEngine,
+        txn: &mut TxnManager,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        ctx: &mut SessionContext,
+        values: Vec<Value>,
+        row_num: usize,
+    ) -> Result<RecordId, DbError> {
+        if values.len() != columns.len() {
+            return Err(DbError::TypeMismatch {
+                expected: format!("{} columns", columns.len()),
+                got: format!("{} values", values.len()),
+            });
+        }
+        let col_types = column_data_types(columns);
+        let coerced = coerce_values_with_ctx(values, columns, ctx, row_num)?;
+        let encoded = encode_row(&coerced, &col_types)?;
+        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+        let (page_id, slot_id) =
+            HeapChain::insert(storage, table_def.data_root_page_id, &encoded, txn_id)?;
+        let key = encode_rid(page_id, slot_id);
+        txn.record_insert(table_def.id, &key, &encoded, page_id, slot_id)?;
+        Ok(RecordId { page_id, slot_id })
+    }
+
+    /// Session-aware batch insert: applies strict or permissive coercion per row,
+    /// emitting warning 1265 (with 1-based row numbers) on permissive fallback.
+    pub fn insert_rows_batch_with_ctx(
+        storage: &mut dyn StorageEngine,
+        txn: &mut TxnManager,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        ctx: &mut SessionContext,
+        batch: &[Vec<Value>],
+    ) -> Result<Vec<RecordId>, DbError> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        let col_types = column_data_types(columns);
+
+        let encoded_rows: Vec<Vec<u8>> = batch
+            .iter()
+            .enumerate()
+            .map(|(i, values)| {
+                let values = values.clone();
+                if values.len() != columns.len() {
+                    return Err(DbError::TypeMismatch {
+                        expected: format!("{} columns", columns.len()),
+                        got: format!("{} values", values.len()),
+                    });
+                }
+                let coerced = coerce_values_with_ctx(values, columns, ctx, i + 1)?;
+                encode_row(&coerced, &col_types)
+            })
+            .collect::<Result<_, _>>()?;
+
+        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+        let phys_locs =
+            HeapChain::insert_batch(storage, table_def.data_root_page_id, &encoded_rows, txn_id)?;
+
+        let mut page_slot_map: std::collections::HashMap<u64, Vec<u16>> =
+            std::collections::HashMap::new();
+        for &(page_id, slot_id) in &phys_locs {
+            page_slot_map.entry(page_id).or_default().push(slot_id);
+        }
+        let mut sorted_pages: Vec<(u64, Vec<u16>)> = page_slot_map.into_iter().collect();
+        sorted_pages.sort_unstable_by_key(|(page_id, _)| *page_id);
+        let pw_refs: Vec<(u64, &[u16])> = sorted_pages
+            .iter()
+            .map(|(pid, slots)| (*pid, slots.as_slice()))
+            .collect();
+        txn.record_page_writes(table_def.id, &pw_refs)?;
+
+        Ok(phys_locs
+            .iter()
+            .map(|(page_id, slot_id)| RecordId {
+                page_id: *page_id,
+                slot_id: *slot_id,
+            })
+            .collect())
+    }
+
+    /// Session-aware single-row update: applies strict or permissive coercion,
+    /// emitting warning 1265 on permissive fallback.
+    pub fn update_row_with_ctx(
+        storage: &mut dyn StorageEngine,
+        txn: &mut TxnManager,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        ctx: &mut SessionContext,
+        record_id: RecordId,
+        new_values: Vec<Value>,
+    ) -> Result<RecordId, DbError> {
+        if new_values.len() != columns.len() {
+            return Err(DbError::TypeMismatch {
+                expected: format!("{} columns", columns.len()),
+                got: format!("{} values", new_values.len()),
+            });
+        }
+        let old_bytes = HeapChain::read_row(storage, record_id.page_id, record_id.slot_id)?.ok_or(
+            DbError::AlreadyDeleted {
+                page_id: record_id.page_id,
+                slot_id: record_id.slot_id,
+            },
+        )?;
+        let col_types = column_data_types(columns);
+        let coerced = coerce_values_with_ctx(new_values, columns, ctx, 1)?;
+        let new_encoded = encode_row(&coerced, &col_types)?;
+        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+        HeapChain::delete(storage, record_id.page_id, record_id.slot_id, txn_id)?;
+        let old_key = encode_rid(record_id.page_id, record_id.slot_id);
+        txn.record_delete(
+            table_def.id,
+            &old_key,
+            &old_bytes,
+            record_id.page_id,
+            record_id.slot_id,
+        )?;
+        let (new_page_id, new_slot_id) =
+            HeapChain::insert(storage, table_def.data_root_page_id, &new_encoded, txn_id)?;
+        let new_key = encode_rid(new_page_id, new_slot_id);
+        txn.record_insert(
+            table_def.id,
+            &new_key,
+            &new_encoded,
+            new_page_id,
+            new_slot_id,
+        )?;
+        Ok(RecordId {
+            page_id: new_page_id,
+            slot_id: new_slot_id,
+        })
+    }
+
+    /// Session-aware batch update: applies strict or permissive coercion per row
+    /// (1-based row numbers for warning messages).
+    pub fn update_rows_batch_with_ctx(
+        storage: &mut dyn StorageEngine,
+        txn: &mut TxnManager,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        ctx: &mut SessionContext,
+        updates: Vec<(RecordId, Vec<Value>)>,
+    ) -> Result<u64, DbError> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let (rids, new_values_vec): (Vec<RecordId>, Vec<Vec<Value>>) = updates.into_iter().unzip();
+
+        // Delete all old rows first.
+        Self::delete_rows_batch(storage, txn, table_def, &rids)?;
+
+        // Encode all new rows with ctx-aware coercion, then batch-insert.
+        let col_types = column_data_types(columns);
+        let encoded_rows: Vec<Vec<u8>> = new_values_vec
+            .into_iter()
+            .enumerate()
+            .map(|(i, values)| {
+                if values.len() != columns.len() {
+                    return Err(DbError::TypeMismatch {
+                        expected: format!("{} columns", columns.len()),
+                        got: format!("{} values", values.len()),
+                    });
+                }
+                let coerced = coerce_values_with_ctx(values, columns, ctx, i + 1)?;
+                encode_row(&coerced, &col_types)
+            })
+            .collect::<Result<_, _>>()?;
+
+        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+        let phys_locs =
+            HeapChain::insert_batch(storage, table_def.data_root_page_id, &encoded_rows, txn_id)?;
+
+        let mut page_slot_map: std::collections::HashMap<u64, Vec<u16>> =
+            std::collections::HashMap::new();
+        for &(page_id, slot_id) in &phys_locs {
+            page_slot_map.entry(page_id).or_default().push(slot_id);
+        }
+        let mut sorted_pages: Vec<(u64, Vec<u16>)> = page_slot_map.into_iter().collect();
+        sorted_pages.sort_unstable_by_key(|(page_id, _)| *page_id);
+        let pw_refs: Vec<(u64, &[u16])> = sorted_pages
+            .iter()
+            .map(|(pid, slots)| (*pid, slots.as_slice()))
+            .collect();
+        txn.record_page_writes(table_def.id, &pw_refs)?;
+
+        Ok(rids.len() as u64)
+    }
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -535,6 +734,62 @@ fn coerce_values(values: Vec<Value>, columns: &[ColumnDef]) -> Result<Vec<Value>
             coerce(v, target, CoercionMode::Strict)
         })
         .collect()
+}
+
+/// Session-aware coercion for a single row.
+///
+/// When `ctx.strict_mode` is `true`, behaves identically to [`coerce_values`].
+///
+/// When `ctx.strict_mode` is `false`:
+/// - Tries strict coercion first.
+/// - If strict fails, tries permissive coercion.
+/// - If permissive succeeds, emits warning 1265 and stores the permissive result.
+/// - If permissive also fails, returns the permissive error (no warning emitted).
+///
+/// `row_num` is 1-based and statement-local (used in the warning message).
+fn coerce_values_with_ctx(
+    values: Vec<Value>,
+    columns: &[ColumnDef],
+    ctx: &mut SessionContext,
+    row_num: usize,
+) -> Result<Vec<Value>, DbError> {
+    let mut out = Vec::with_capacity(values.len());
+    for (v, col) in values.into_iter().zip(columns.iter()) {
+        let target = match col.col_type {
+            ColumnType::Bool => DataType::Bool,
+            ColumnType::Int => DataType::Int,
+            ColumnType::BigInt => DataType::BigInt,
+            ColumnType::Float => DataType::Real,
+            ColumnType::Text => DataType::Text,
+            ColumnType::Bytes => DataType::Bytes,
+            ColumnType::Timestamp => DataType::Timestamp,
+            ColumnType::Uuid => DataType::Uuid,
+        };
+
+        if ctx.strict_mode {
+            out.push(coerce(v, target, CoercionMode::Strict)?);
+            continue;
+        }
+
+        // Strict first, permissive fallback.
+        match coerce(v.clone(), target, CoercionMode::Strict) {
+            Ok(strict_val) => {
+                out.push(strict_val);
+            }
+            Err(_) => {
+                let permissive_val = coerce(v, target, CoercionMode::Permissive)?;
+                ctx.warn(
+                    1265,
+                    format!(
+                        "Data truncated for column '{}' at row {}",
+                        col.name, row_num
+                    ),
+                );
+                out.push(permissive_val);
+            }
+        }
+    }
+    Ok(out)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
