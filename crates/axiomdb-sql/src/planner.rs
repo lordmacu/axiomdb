@@ -68,6 +68,25 @@ pub enum AccessMethod {
         /// Upper bound key (inclusive, already encoded).
         hi: Option<Vec<u8>>,
     },
+
+    /// Index-only scan: all needed columns are in the index key columns (Phase 6.13).
+    ///
+    /// The executor decodes column values from the B-Tree key bytes instead of
+    /// fetching the full heap row. A lightweight MVCC check (slot header only)
+    /// is still performed on the heap to verify row visibility.
+    IndexOnlyScan {
+        /// The covering index.
+        index_def: IndexDef,
+        /// Lower bound key (inclusive). Equal to `hi` for point lookups.
+        lo: Vec<u8>,
+        /// Upper bound key (inclusive, `None` = unbounded; for point lookup: `Some(lo.clone())`).
+        hi: Option<Vec<u8>>,
+        /// Number of columns in the index key (= `index_def.columns.len()`).
+        n_key_cols: usize,
+        /// For each needed SELECT column (in output order): the position within
+        /// the decoded key values (0 = first key column, 1 = second, …).
+        needed_key_positions: Vec<usize>,
+    },
 }
 
 // ── plan_select ──────────────────────────────────────────────────────────────
@@ -90,6 +109,8 @@ pub fn plan_select(
     table_id: u32,
     table_stats: &[StatsDef],
     stale_tracker: &mut StaleStatsTracker,
+    // Column indices needed in the SELECT output. Empty = SELECT * → no index-only scan.
+    select_col_idxs: &[u16],
 ) -> AccessMethod {
     use crate::key_encoding::encode_index_key;
 
@@ -101,10 +122,26 @@ pub fn plan_select(
     // ── Rule 0: composite equality (N ≥ 2 columns) ────────────────────────
     // Must run before Rule 1 to prefer composite indexes over single-column.
     if let Some(am) = plan_composite_eq(expr, indexes, columns) {
-        // Apply cost gate to composite result too.
-        if let AccessMethod::IndexRange { ref index_def, .. } = am {
+        if let AccessMethod::IndexRange {
+            ref index_def,
+            ref lo,
+            ..
+        } = am
+        {
             if !stats_cost_gate(index_def, columns, table_id, table_stats, stale_tracker) {
                 return AccessMethod::Scan;
+            }
+            // Index-only scan upgrade: composite key covers all SELECT columns.
+            if index_covers_query(index_def, select_col_idxs) {
+                if let Some(lo_key) = lo.clone() {
+                    return AccessMethod::IndexOnlyScan {
+                        n_key_cols: index_def.columns.len(),
+                        needed_key_positions: build_key_positions(index_def, select_col_idxs),
+                        hi: Some(lo_key.clone()),
+                        lo: lo_key,
+                        index_def: index_def.clone(),
+                    };
+                }
             }
         }
         return am;
@@ -116,6 +153,16 @@ pub fn plan_select(
             if let Ok(key) = encode_index_key(&[value]) {
                 // Cost gate: skip index if selectivity too low (Phase 6.10).
                 if stats_cost_gate(idx, columns, table_id, table_stats, stale_tracker) {
+                    // Index-only scan upgrade (Phase 6.13): all SELECT cols in key.
+                    if index_covers_query(idx, select_col_idxs) {
+                        return AccessMethod::IndexOnlyScan {
+                            index_def: idx.clone(),
+                            lo: key.clone(),
+                            hi: Some(key), // point lookup: lo == hi
+                            n_key_cols: idx.columns.len(),
+                            needed_key_positions: build_key_positions(idx, select_col_idxs),
+                        };
+                    }
                     if idx.columns.len() == 1 {
                         return AccessMethod::IndexLookup {
                             index_def: idx.clone(),
@@ -150,6 +197,32 @@ pub fn plan_select(
     }
 
     AccessMethod::Scan
+}
+
+// ── Index-only scan coverage (Phase 6.13) ────────────────────────────────────
+
+/// Returns `true` if all columns in `select_col_idxs` are covered by the index
+/// KEY columns. Used to decide if an index-only scan is safe.
+///
+/// Only key columns count (not INCLUDE columns — B-Tree leaf storage for INCLUDE
+/// is deferred to Phase 6.15). For Phase 6.13, coverage means every needed col
+/// is directly decodable from the encoded key bytes.
+fn index_covers_query(index_def: &IndexDef, select_col_idxs: &[u16]) -> bool {
+    if select_col_idxs.is_empty() {
+        return false; // SELECT * or unknown — never use index-only
+    }
+    let key_cols: std::collections::HashSet<u16> =
+        index_def.columns.iter().map(|c| c.col_idx).collect();
+    select_col_idxs.iter().all(|col| key_cols.contains(col))
+}
+
+/// Builds the `needed_key_positions` vector for `IndexOnlyScan`.
+/// For each column in `select_col_idxs`, finds its position in `index.columns`.
+fn build_key_positions(index_def: &IndexDef, select_col_idxs: &[u16]) -> Vec<usize> {
+    select_col_idxs
+        .iter()
+        .filter_map(|col_idx| index_def.columns.iter().position(|c| c.col_idx == *col_idx))
+        .collect()
 }
 
 // ── Statistics cost gate (Phase 6.10) ────────────────────────────────────────
@@ -445,6 +518,7 @@ mod tests {
             predicate: None,
             fillfactor: 90,
             is_fk_index: false,
+            include_columns: vec![],
         }
     }
 
@@ -467,7 +541,8 @@ mod tests {
                 &cols,
                 1,
                 &[],
-                &mut StaleStatsTracker::default()
+                &mut StaleStatsTracker::default(),
+                &[]
             ),
             AccessMethod::Scan
         );
@@ -489,6 +564,7 @@ mod tests {
             1,
             &[],
             &mut StaleStatsTracker::default(),
+            &[],
         );
         assert!(matches!(am, AccessMethod::IndexLookup { .. }));
     }
@@ -510,6 +586,7 @@ mod tests {
             1,
             &[],
             &mut StaleStatsTracker::default(),
+            &[],
         );
         assert_eq!(am, AccessMethod::Scan);
     }
@@ -530,6 +607,7 @@ mod tests {
             1,
             &[],
             &mut StaleStatsTracker::default(),
+            &[],
         );
         assert_eq!(am, AccessMethod::Scan);
     }
@@ -549,6 +627,7 @@ mod tests {
             1,
             &[],
             &mut StaleStatsTracker::default(),
+            &[],
         );
         assert_eq!(am, AccessMethod::Scan);
     }
@@ -567,6 +646,7 @@ mod tests {
             predicate: None,
             fillfactor: 90,
             is_fk_index: false,
+            include_columns: vec![],
         };
         let expr = Expr::BinaryOp {
             op: BinaryOp::Eq,
@@ -580,6 +660,7 @@ mod tests {
             1,
             &[],
             &mut StaleStatsTracker::default(),
+            &[],
         );
         assert_eq!(am, AccessMethod::Scan);
     }
@@ -608,6 +689,7 @@ mod tests {
             1,
             &[],
             &mut StaleStatsTracker::default(),
+            &[],
         );
         assert!(matches!(am, AccessMethod::IndexRange { .. }));
     }

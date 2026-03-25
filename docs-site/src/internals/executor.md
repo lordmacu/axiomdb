@@ -590,6 +590,114 @@ mirroring PostgreSQL's lazy statistics-rebuild model.
 
 ---
 
+## IndexOnlyScan — Heap-Free Execution
+
+When `plan_select` returns `AccessMethod::IndexOnlyScan`, the executor reads
+all result values directly from the B-Tree key bytes, with only a lightweight
+MVCC visibility check against the heap slot header.
+
+### Execution Path
+
+```
+IndexOnlyScan { index_def, lo, hi, n_key_cols, needed_key_positions }:
+
+for (rid, key_bytes) in BTree::range_in(storage, index_def.root_page_id, lo, hi):
+  page_id = rid.page_id
+  slot_id = rid.slot_id
+
+  // MVCC: read only the 24-byte RowHeader — no full row decode.
+  visible = HeapChain::is_slot_visible(storage, page_id, slot_id, snap)
+  if !visible:
+    continue
+
+  // Extract column values from B-Tree key bytes (no heap page needed).
+  (decoded_cols, _) = decode_index_key(&key_bytes, n_key_cols)
+
+  // Project only the columns the query requested.
+  row = needed_key_positions.iter().map(|&p| decoded_cols[p].clone()).collect()
+  emit row
+```
+
+The 24-byte `RowHeader` contains `txn_id_created`, `txn_id_deleted`, and a
+sequence number — enough for full MVCC visibility evaluation without loading
+the row payload.
+
+### `decode_index_key` — Self-Delimiting Key Decoder
+
+`decode_index_key` lives in `key_encoding.rs` and is the exact inverse of
+`encode_index_key`. It uses type tags embedded in the key bytes to self-delimit
+each value without needing an external schema:
+
+| Tag byte | Type | Encoding |
+|---|---|---|
+| `0x00` | NULL | tag only, 0 payload bytes |
+| `0x01` | Bool | tag + 1 byte (0 = false, 1 = true) |
+| `0x02` | Int (positive, 1 B) | tag + 1 LE byte |
+| `0x03` | Int (positive, 2 B) | tag + 2 LE bytes |
+| `0x04` | Int (positive, 4 B) | tag + 4 LE bytes |
+| `0x05` | Int (negative, 4 B) | tag + 4 LE bytes (i32) |
+| `0x06` | BigInt (positive, 1 B) | tag + 1 byte |
+| `0x07` | BigInt (positive, 4 B) | tag + 4 LE bytes |
+| `0x08` | BigInt (positive, 8 B) | tag + 8 LE bytes |
+| `0x09` | BigInt (negative, 8 B) | tag + 8 LE bytes (i64) |
+| `0x0A` | Real | tag + 8 LE bytes (f64 bits) |
+| `0x0B` | Text | tag + NUL-terminated UTF-8 (NUL = end marker) |
+| `0x0C` | Bytes | tag + NUL-escaped bytes (0x00 → [0x00, 0xFF], NUL terminator = [0x00, 0x00]) |
+
+```rust
+// Signature
+pub fn decode_index_key(key: &[u8], n_cols: usize) -> (Vec<Value>, usize)
+// Returns: (decoded column values, total bytes consumed)
+```
+
+The self-delimiting format means `decode_index_key` requires no column type
+metadata — the tag bytes carry all necessary type information. This is the
+same approach used by SQLite's record format and RocksDB's comparator-encoded
+keys.
+
+---
+
+## Non-Unique Secondary Index Key Format
+
+Non-unique secondary indexes append a 10-byte `RecordId` suffix to every
+B-Tree key to guarantee uniqueness across all entries:
+
+```
+key = encode_index_key(col_vals) || encode_rid(rid)
+                                    ^^^^^^^^^^^^^^
+                                    page_id (4 B) + slot_id (2 B) + seq (4 B) = 10 bytes
+```
+
+This prevents `DuplicateKey` errors when two rows share the same indexed value,
+because the `RecordId` suffix always makes the full key distinct.
+
+### Lookup Bounds for Non-Unique Indexes
+
+To find all rows matching a specific indexed value, the executor performs a
+range scan using synthetic `[lo, hi]` bounds that span all possible `RecordId`
+suffixes:
+
+```rust
+lo = encode_index_key(&[val]) + [0x00; 10]   // smallest RecordId
+hi = encode_index_key(&[val]) + [0xFF; 10]   // largest RecordId
+BTree::range_in(root, lo, hi)                // returns all entries for val
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — InnoDB Secondary Index Approach</span>
+MySQL InnoDB secondary indexes append the primary key as a tiebreaker in every
+non-unique B-Tree entry (<code>row0row.cc</code>). AxiomDB uses
+<code>RecordId</code> (page_id + slot_id + sequence) instead of a separate
+primary key column, keeping the suffix at a fixed 10 bytes regardless of the
+table's key type — simpler to encode and guaranteed to be globally unique within
+the storage engine's address space.
+</div>
+</div>
+
+---
+
 ## Performance Characteristics
 
 | Operation | Time complexity | Notes |

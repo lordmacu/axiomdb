@@ -177,6 +177,7 @@ fn test_create_index_fires_index_created() {
                 predicate: None,
                 fillfactor: 90,
                 is_fk_index: false,
+                include_columns: vec![],
             })
             .unwrap();
         (tid, iid)
@@ -254,6 +255,7 @@ fn test_delete_table_with_indexes_fires_index_dropped_per_index() {
                 predicate: None,
                 fillfactor: 90,
                 is_fk_index: false,
+                include_columns: vec![],
             })
             .unwrap();
         let i2 = w
@@ -268,6 +270,7 @@ fn test_delete_table_with_indexes_fires_index_dropped_per_index() {
                 predicate: None,
                 fillfactor: 90,
                 is_fk_index: false,
+                include_columns: vec![],
             })
             .unwrap();
         (tid, i1, i2)
@@ -338,6 +341,7 @@ fn test_delete_index_fires_index_dropped() {
                 predicate: None,
                 fillfactor: 90,
                 is_fk_index: false,
+                include_columns: vec![],
             })
             .unwrap();
         (tid, iid)

@@ -443,6 +443,19 @@ pub(crate) fn parse_create_index(p: &mut Parser, unique: bool) -> Result<Stmt, D
     }
     p.expect(&Token::RParen)?;
 
+    // Optional INCLUDE (col1, col2, ...) for covering indexes (Phase 6.13).
+    let include_columns: Vec<String> = if p.eat(&Token::Include) {
+        p.expect(&Token::LParen)?;
+        let mut cols = vec![p.parse_identifier()?];
+        while p.eat(&Token::Comma) {
+            cols.push(p.parse_identifier()?);
+        }
+        p.expect(&Token::RParen)?;
+        cols
+    } else {
+        vec![]
+    };
+
     // Optional WHERE predicate for partial indexes (Phase 6.7).
     let predicate = if p.eat(&Token::Where) {
         Some(parse_expr(p)?)
@@ -497,6 +510,7 @@ pub(crate) fn parse_create_index(p: &mut Parser, unique: bool) -> Result<Stmt, D
         name,
         table,
         columns,
+        include_columns,
         predicate,
         fillfactor,
     }))
