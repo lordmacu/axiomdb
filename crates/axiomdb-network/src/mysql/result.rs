@@ -1,6 +1,10 @@
-//! QueryResult → MySQL text protocol wire format.
+//! QueryResult → MySQL wire format (text and binary protocols).
 //!
-//! Converts `axiomdb_sql::QueryResult` into a sequence of MySQL packets:
+//! Two public serializers:
+//! - [`serialize_query_result`] — text protocol (COM_QUERY)
+//! - [`serialize_query_result_binary`] — binary protocol (COM_STMT_EXECUTE)
+//!
+//! Both produce:
 //! - `Rows`     → column_count + column_defs + EOF + rows + EOF
 //! - `Affected` → OK_Packet
 //! - `Empty`    → OK_Packet
@@ -73,6 +77,181 @@ pub fn serialize_query_result_multi_warn(
         }
     }
 }
+
+// ── Binary protocol serializer (COM_STMT_EXECUTE) ─────────────────────────────
+
+/// Converts a `QueryResult` into MySQL **binary** protocol packets for
+/// `COM_STMT_EXECUTE` responses.
+///
+/// Row encoding differs from the text protocol:
+/// - Row header is `0x00` (not per-cell NULL markers)
+/// - NULL values are encoded in a compact null bitmap (offset 2)
+/// - Numeric types are fixed-width little-endian, not ASCII text
+/// - DATE / TIMESTAMP use compact binary payloads
+///
+/// Non-row results (`Affected`, `Empty`) still use OK_Packets, identical to the
+/// text protocol.
+pub fn serialize_query_result_binary(result: QueryResult, seq_start: u8) -> PacketSeq {
+    match result {
+        QueryResult::Rows { columns, rows } => {
+            serialize_rows_binary(&columns, &rows, seq_start, SERVER_STATUS_AUTOCOMMIT)
+        }
+        QueryResult::Affected {
+            count,
+            last_insert_id,
+        } => {
+            let last_id = last_insert_id.unwrap_or(0);
+            vec![(
+                seq_start,
+                build_ok_with_status(count, last_id, 0, SERVER_STATUS_AUTOCOMMIT),
+            )]
+        }
+        QueryResult::Empty => {
+            vec![(
+                seq_start,
+                build_ok_with_status(0, 0, 0, SERVER_STATUS_AUTOCOMMIT),
+            )]
+        }
+    }
+}
+
+fn serialize_rows_binary(
+    cols: &[ColumnMeta],
+    rows: &[Row],
+    seq_start: u8,
+    final_status: u16,
+) -> PacketSeq {
+    let mut packets = PacketSeq::new();
+    let mut seq = seq_start;
+
+    // 1. Column count
+    let mut col_count_buf = Vec::with_capacity(2);
+    write_lenenc_int(&mut col_count_buf, cols.len() as u64);
+    packets.push((seq, col_count_buf));
+    seq += 1;
+
+    // 2. Column definition packets (shared with text path)
+    for col in cols {
+        packets.push((seq, build_column_def(col)));
+        seq += 1;
+    }
+
+    // 3. EOF after column defs
+    packets.push((seq, build_eof_packet()));
+    seq += 1;
+
+    // 4. Binary row packets
+    for row in rows {
+        packets.push((seq, build_binary_row_packet(cols, row)));
+        seq += 1;
+    }
+
+    // 5. Final EOF
+    packets.push((seq, build_eof_with_status(final_status)));
+
+    packets
+}
+
+/// Builds one binary row packet payload.
+///
+/// Layout:
+/// ```text
+/// 0x00                        (row header)
+/// null_bitmap[bitmap_len]     (MySQL offset-2 null bitmap)
+/// value_1 ... value_n         (only non-null values, in column order)
+/// ```
+fn build_binary_row_packet(cols: &[ColumnMeta], row: &[Value]) -> Vec<u8> {
+    debug_assert_eq!(cols.len(), row.len());
+
+    let bitmap_len = (cols.len() + 7 + 2) / 8;
+    let mut buf = Vec::with_capacity(1 + bitmap_len + cols.len() * 8);
+    buf.push(0x00); // binary row header
+
+    let bitmap_start = buf.len();
+    buf.resize(bitmap_start + bitmap_len, 0);
+
+    for (idx, (col, value)) in cols.iter().zip(row.iter()).enumerate() {
+        if matches!(value, Value::Null) {
+            set_binary_null_bit(&mut buf[bitmap_start..bitmap_start + bitmap_len], idx);
+            continue;
+        }
+        encode_binary_cell(&mut buf, col.data_type, value);
+    }
+
+    buf
+}
+
+/// Sets the null-bitmap bit for `field_index` using MySQL's prepared-row
+/// offset of 2 (bits 0 and 1 are reserved).
+fn set_binary_null_bit(bitmap: &mut [u8], field_index: usize) {
+    let shifted = field_index + 2;
+    let byte = shifted / 8;
+    let bit = shifted % 8;
+    bitmap[byte] |= 1 << bit;
+}
+
+/// Encodes one non-null cell value using the MySQL binary row protocol.
+fn encode_binary_cell(buf: &mut Vec<u8>, data_type: DataType, value: &Value) {
+    match (data_type, value) {
+        (DataType::Bool, Value::Bool(v)) => buf.push(u8::from(*v)),
+        (DataType::Int, Value::Int(v)) => buf.extend_from_slice(&v.to_le_bytes()),
+        (DataType::BigInt, Value::BigInt(v)) => buf.extend_from_slice(&v.to_le_bytes()),
+        (DataType::Real, Value::Real(v)) => buf.extend_from_slice(&v.to_le_bytes()),
+        (DataType::Decimal, Value::Decimal(m, s)) => {
+            write_lenenc_str(buf, format_decimal(*m, *s).as_bytes())
+        }
+        (DataType::Text, Value::Text(s)) => write_lenenc_str(buf, s.as_bytes()),
+        (DataType::Bytes, Value::Bytes(b)) => write_lenenc_str(buf, b),
+        (DataType::Date, Value::Date(days)) => encode_binary_date(buf, *days),
+        (DataType::Timestamp, Value::Timestamp(ts)) => encode_binary_timestamp(buf, *ts),
+        (DataType::Uuid, Value::Uuid(u)) => write_lenenc_str(buf, format_uuid(u).as_bytes()),
+        // Any mismatch is a QueryResult invariant violation — not a user-visible error.
+        (_, other) => unreachable!("binary cell type/value mismatch: {other:?}"),
+    }
+}
+
+/// Encodes a DATE value as the MySQL binary date payload.
+///
+/// Format: `[4][year u16 LE][month u8][day u8]`
+fn encode_binary_date(buf: &mut Vec<u8>, days_since_epoch: i32) {
+    let (year, month, day) = days_to_ymd(i64::from(days_since_epoch));
+    buf.push(4);
+    buf.extend_from_slice(&(year as u16).to_le_bytes());
+    buf.push(month as u8);
+    buf.push(day as u8);
+}
+
+/// Encodes a TIMESTAMP value as the MySQL binary datetime payload.
+///
+/// - 7 bytes when microseconds are zero:  `[7][year u16][month][day][h][m][s]`
+/// - 11 bytes when microseconds are non-zero: same + `[micros u32 LE]`
+fn encode_binary_timestamp(buf: &mut Vec<u8>, micros: i64) {
+    let secs = micros.div_euclid(1_000_000);
+    let micros_part = micros.rem_euclid(1_000_000) as u32;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (year, month, day) = days_to_ymd(days);
+    let hour = (rem / 3_600) as u8;
+    let min = ((rem % 3_600) / 60) as u8;
+    let sec = (rem % 60) as u8;
+
+    if micros_part == 0 {
+        buf.push(7);
+    } else {
+        buf.push(11);
+    }
+    buf.extend_from_slice(&(year as u16).to_le_bytes());
+    buf.push(month as u8);
+    buf.push(day as u8);
+    buf.push(hour);
+    buf.push(min);
+    buf.push(sec);
+    if micros_part != 0 {
+        buf.extend_from_slice(&micros_part.to_le_bytes());
+    }
+}
+
+// ── Text protocol serializer (COM_QUERY) ──────────────────────────────────────
 
 fn serialize_rows(
     cols: &[ColumnMeta],
@@ -162,11 +341,11 @@ fn build_row_packet(row: &[Value]) -> Vec<u8> {
 
 fn datatype_to_mysql_type(dt: DataType) -> u8 {
     match dt {
-        DataType::Bool => 0x10,      // BIT (rendered as TINYINT)
+        DataType::Bool => 0x01,      // TINY
         DataType::Int => 0x03,       // LONG
         DataType::BigInt => 0x08,    // LONGLONG
         DataType::Real => 0x05,      // DOUBLE
-        DataType::Decimal => 0x00,   // DECIMAL
+        DataType::Decimal => 0xf6,   // NEWDECIMAL
         DataType::Text => 0xfd,      // VAR_STRING
         DataType::Bytes => 0xfc,     // BLOB
         DataType::Date => 0x0a,      // DATE
@@ -314,6 +493,9 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axiomdb_sql::result::ColumnMeta;
+
+    // ── Text protocol helpers ─────────────────────────────────────────────────
 
     #[test]
     fn test_format_date_epoch() {
@@ -342,5 +524,203 @@ mod tests {
         let mut buf = Vec::new();
         write_lenenc_int(&mut buf, 251);
         assert_eq!(buf, [0xfc, 0xfb, 0x00]); // 251 as u16 LE = 0xfb 0x00
+    }
+
+    // ── Binary row packet ─────────────────────────────────────────────────────
+
+    fn make_col(name: &str, dt: DataType) -> ColumnMeta {
+        ColumnMeta::computed(name.to_string(), dt)
+    }
+
+    #[test]
+    fn test_binary_row_header_is_0x00() {
+        let cols = vec![make_col("x", DataType::Int)];
+        let row = vec![Value::Int(1)];
+        let pkt = build_binary_row_packet(&cols, &row);
+        assert_eq!(pkt[0], 0x00, "binary row header must be 0x00");
+    }
+
+    #[test]
+    fn test_binary_null_bitmap_offset_2() {
+        // Column 0 NULL → bit position 2 in byte 0 (offset 2 means bit 2 of byte 0)
+        let cols = vec![make_col("a", DataType::Int)];
+        let row = vec![Value::Null];
+        let pkt = build_binary_row_packet(&cols, &row);
+        // bitmap byte 0 = bit 2 set = 0x04
+        assert_eq!(
+            pkt[1], 0x04,
+            "null at col 0 must set bit 2 of bitmap byte 0"
+        );
+        // no value bytes after the bitmap
+        assert_eq!(
+            pkt.len(),
+            2,
+            "null row must have only header + 1 bitmap byte"
+        );
+    }
+
+    #[test]
+    fn test_binary_null_bitmap_col1() {
+        // Column 1 NULL → bit position 3 in byte 0
+        let cols = vec![make_col("a", DataType::Int), make_col("b", DataType::Int)];
+        let row = vec![Value::Int(42), Value::Null];
+        let pkt = build_binary_row_packet(&cols, &row);
+        // col 1 → shifted = 3 → byte 0 bit 3 = 0x08
+        assert_eq!(
+            pkt[1] & 0x08,
+            0x08,
+            "null at col 1 must set bit 3 of bitmap byte 0"
+        );
+    }
+
+    #[test]
+    fn test_binary_bigint_is_8_byte_le() {
+        let cols = vec![make_col("n", DataType::BigInt)];
+        let row = vec![Value::BigInt(0x0102030405060708_i64)];
+        let pkt = build_binary_row_packet(&cols, &row);
+        // header(1) + bitmap(1) + value(8) = 10 bytes
+        assert_eq!(pkt.len(), 10);
+        let val = i64::from_le_bytes(pkt[2..10].try_into().unwrap());
+        assert_eq!(val, 0x0102030405060708_i64);
+    }
+
+    #[test]
+    fn test_binary_int_is_4_byte_le() {
+        let cols = vec![make_col("n", DataType::Int)];
+        let row = vec![Value::Int(-1)];
+        let pkt = build_binary_row_packet(&cols, &row);
+        assert_eq!(pkt.len(), 6); // 1 + 1 + 4
+        let val = i32::from_le_bytes(pkt[2..6].try_into().unwrap());
+        assert_eq!(val, -1);
+    }
+
+    #[test]
+    fn test_binary_bool_is_one_byte() {
+        let cols = vec![make_col("b", DataType::Bool)];
+        let row_t = vec![Value::Bool(true)];
+        let row_f = vec![Value::Bool(false)];
+        let pkt_t = build_binary_row_packet(&cols, &row_t);
+        let pkt_f = build_binary_row_packet(&cols, &row_f);
+        assert_eq!(pkt_t.len(), 3); // 1 + 1 + 1
+        assert_eq!(pkt_t[2], 0x01);
+        assert_eq!(pkt_f[2], 0x00);
+    }
+
+    #[test]
+    fn test_binary_decimal_is_lenenc_ascii() {
+        let cols = vec![make_col("d", DataType::Decimal)];
+        let row = vec![Value::Decimal(12345, 2)]; // 123.45
+        let pkt = build_binary_row_packet(&cols, &row);
+        // After header(1) + bitmap(1): lenenc length byte + "123.45"
+        assert_eq!(pkt[2], 6); // lenenc length = 6
+        assert_eq!(&pkt[3..9], b"123.45");
+    }
+
+    #[test]
+    fn test_binary_bytes_preserved_raw() {
+        let cols = vec![make_col("b", DataType::Bytes)];
+        let raw = vec![0x00, 0xff, 0x42]; // contains null byte
+        let row = vec![Value::Bytes(raw.clone())];
+        let pkt = build_binary_row_packet(&cols, &row);
+        assert_eq!(pkt[2], 3); // lenenc length = 3
+        assert_eq!(&pkt[3..6], raw.as_slice());
+    }
+
+    #[test]
+    fn test_binary_date_payload() {
+        // 2024-01-15: days since epoch = 19737
+        let cols = vec![make_col("d", DataType::Date)];
+        let row = vec![Value::Date(19737)];
+        let pkt = build_binary_row_packet(&cols, &row);
+        // header(1) + bitmap(1) + length_byte(1) + year_u16(2) + month(1) + day(1) = 7
+        assert_eq!(pkt.len(), 7);
+        assert_eq!(pkt[2], 4); // length byte = 4
+        let year = u16::from_le_bytes([pkt[3], pkt[4]]);
+        let month = pkt[5];
+        let day = pkt[6];
+        assert_eq!(year, 2024);
+        assert_eq!(month, 1);
+        assert_eq!(day, 15);
+    }
+
+    #[test]
+    fn test_binary_timestamp_7_bytes_when_no_micros() {
+        // 2024-01-15 10:30:00 UTC = 19737 days * 86400 + 10*3600 + 30*60 = 1705314600 secs
+        let micros: i64 = 1_705_314_600 * 1_000_000;
+        let cols = vec![make_col("ts", DataType::Timestamp)];
+        let row = vec![Value::Timestamp(micros)];
+        let pkt = build_binary_row_packet(&cols, &row);
+        // header(1) + bitmap(1) + len(1) + year(2) + month(1) + day(1) + h(1) + m(1) + s(1) = 10
+        assert_eq!(pkt.len(), 10);
+        assert_eq!(pkt[2], 7); // length byte = 7 (no micros)
+        let year = u16::from_le_bytes([pkt[3], pkt[4]]);
+        assert_eq!(year, 2024);
+        assert_eq!(pkt[5], 1); // month
+        assert_eq!(pkt[6], 15); // day
+        assert_eq!(pkt[7], 10); // hour
+        assert_eq!(pkt[8], 30); // min
+        assert_eq!(pkt[9], 0); // sec
+    }
+
+    #[test]
+    fn test_binary_timestamp_11_bytes_when_micros_nonzero() {
+        let micros: i64 = 1_705_314_600 * 1_000_000 + 123_456;
+        let cols = vec![make_col("ts", DataType::Timestamp)];
+        let row = vec![Value::Timestamp(micros)];
+        let pkt = build_binary_row_packet(&cols, &row);
+        // header(1) + bitmap(1) + len(1) + year(2) + month(1) + day(1) + h(1) + m(1) + s(1) + micros(4) = 14
+        assert_eq!(pkt.len(), 14);
+        assert_eq!(pkt[2], 11); // length byte = 11
+        let micros_decoded = u32::from_le_bytes(pkt[10..14].try_into().unwrap());
+        assert_eq!(micros_decoded, 123_456);
+    }
+
+    // ── Type-code alignment ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_bool_advertises_tiny_not_bit() {
+        assert_eq!(
+            datatype_to_mysql_type(DataType::Bool),
+            0x01,
+            "Bool must advertise TINY (0x01)"
+        );
+    }
+
+    #[test]
+    fn test_decimal_advertises_newdecimal() {
+        assert_eq!(
+            datatype_to_mysql_type(DataType::Decimal),
+            0xf6,
+            "Decimal must advertise NEWDECIMAL (0xf6)"
+        );
+    }
+
+    // ── Text protocol regression ──────────────────────────────────────────────
+
+    #[test]
+    fn test_text_null_still_0xfb() {
+        let cols = vec![ColumnMeta::computed("x".to_string(), DataType::Text)];
+        let rows = vec![vec![Value::Null]];
+        let qr = QueryResult::Rows {
+            columns: cols,
+            rows,
+        };
+        let packets = serialize_query_result(qr, 1);
+        let row_pkt = packets.iter().find(|(seq, _)| *seq == 4).unwrap();
+        assert_eq!(row_pkt.1[0], 0xfb, "text protocol NULL must remain 0xfb");
+    }
+
+    #[test]
+    fn test_binary_framing_packet_sequence() {
+        // 1 column, 1 row → col_count(1) + col_def(2) + EOF(3) + row(4) + EOF(5)
+        let cols = vec![ColumnMeta::computed("n".to_string(), DataType::Int)];
+        let rows = vec![vec![Value::Int(1)]];
+        let qr = QueryResult::Rows {
+            columns: cols,
+            rows,
+        };
+        let packets = serialize_query_result_binary(qr, 1);
+        let seqs: Vec<u8> = packets.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, [1, 2, 3, 4, 5]);
     }
 }

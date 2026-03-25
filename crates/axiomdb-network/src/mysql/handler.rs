@@ -44,7 +44,7 @@ use super::{
     prepared::{
         build_prepare_response, parse_execute_packet, substitute_params, substitute_params_in_ast,
     },
-    result::serialize_query_result,
+    result::serialize_query_result_binary,
     session::ConnectionState,
     status::StatusRegistry,
 };
@@ -625,7 +625,7 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                             }
                             continue;
                         }
-                        let packets = serialize_query_result(qr, 1);
+                        let packets = serialize_query_result_binary(qr, 1);
                         let nbytes = wire_size(&packets);
                         if send_packets(&mut writer, &packets).await.is_err() {
                             break;
