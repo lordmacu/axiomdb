@@ -162,9 +162,9 @@ CREATE TABLE orders (
 **ON UPDATE actions:** Same options as ON DELETE — apply when the referenced primary
 key is updated.
 
-> **Phase 6.5 limitation:** Only `ON UPDATE RESTRICT` (the default) is enforced.
+> **Current limitation:** Only `ON UPDATE RESTRICT` (the default) is enforced.
 > `ON UPDATE CASCADE` and `ON UPDATE SET NULL` return `NotImplemented` and are
-> planned for Phase 6.9. Write `ON UPDATE RESTRICT` or omit the clause entirely
+> planned for Phase 6.10. Write `ON UPDATE RESTRICT` or omit the clause entirely
 > for correct behaviour today.
 
 ```sql

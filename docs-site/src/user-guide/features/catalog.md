@@ -8,8 +8,17 @@ accessible through system tables, convenience commands, and direct SQL queries.
 
 ## System Tables
 
-The catalog exposes three system tables in the `axiom` schema. They are always readable
+The catalog exposes six system tables in the `axiom` schema. They are always readable
 without any special privileges.
+
+| Table | Purpose |
+|-------|---------|
+| `axiom_tables` | One row per user table |
+| `axiom_columns` | One row per column |
+| `axiom_indexes` | One row per index (B-Tree metadata) |
+| `axiom_constraints` | Named CHECK constraints |
+| `axiom_foreign_keys` | FK constraint definitions |
+| `axiom_stats` | Per-column NDV and row_count for the query planner |
 
 ### axiom_tables
 
