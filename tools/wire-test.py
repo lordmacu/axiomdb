@@ -5,12 +5,67 @@ Updated at each subphase close — always overwrite this file, never create new 
 
 Last updated: subphase 5.9b (@@in_transaction + SHOW WARNINGS)
 """
+import os
+import signal
+import subprocess
 import sys
+import tempfile
+import time
+
 import pymysql
 
 PORT = 13306
 PASS = 0
 FAIL = 0
+
+# ── Server lifecycle ───────────────────────────────────────────────────────────
+
+_server_proc = None
+_data_dir    = None
+
+
+def start_server():
+    global _server_proc, _data_dir
+    binary = "target/release/axiomdb-server"
+    if not os.path.isfile(binary):
+        binary = "target/debug/axiomdb-server"
+    if not os.path.isfile(binary):
+        print("Server binary not found — build first: cargo build -p axiomdb-server")
+        sys.exit(1)
+    _data_dir = tempfile.mkdtemp(prefix="axiomdb-wire-")
+    env = os.environ.copy()
+    env["AXIOMDB_DATA"] = _data_dir
+    env["AXIOMDB_PORT"] = str(PORT)
+    _server_proc = subprocess.Popen(
+        [binary], env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    # Wait up to 5s for the server to be ready
+    import socket
+    for _ in range(50):
+        try:
+            with socket.create_connection(("127.0.0.1", PORT), timeout=0.1):
+                return
+        except OSError:
+            time.sleep(0.1)
+    stop_server()
+    print(f"Server did not start on :{PORT} within 5s")
+    sys.exit(1)
+
+
+def stop_server():
+    global _server_proc, _data_dir
+    if _server_proc:
+        _server_proc.terminate()
+        try:
+            _server_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            _server_proc.kill()
+        _server_proc = None
+    if _data_dir and os.path.isdir(_data_dir):
+        import shutil
+        shutil.rmtree(_data_dir, ignore_errors=True)
+        _data_dir = None
 
 
 def ok(label, cond, got=None):
@@ -31,7 +86,11 @@ def connect():
     )
 
 
-# ── Setup ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+print(f"Starting AxiomDB on :{PORT}...")
+start_server()
+print("Server ready\n")
 
 conn = connect()
 cur = conn.cursor()
@@ -123,6 +182,8 @@ ok("version() contains AxiomDB", "AxiomDB" in cur.fetchone()[0])
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()
+stop_server()
+
 total = PASS + FAIL
 print(f"\n{'✓' if FAIL == 0 else '✗'} {PASS}/{total} passed" +
       (f"  ({FAIL} failed)" if FAIL else ""))
