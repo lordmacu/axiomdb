@@ -685,14 +685,86 @@ function TriggersTab() {
 
 function SequencesTab() {
   const [seqs, setSeqs] = useState<Sequence[]>(SEQUENCES)
+  const [showCreate, setShowCreate] = useState(false)
+  const [confirmDrop, setConfirmDrop] = useState<string | null>(null)
+  const [newSeq, setNewSeq] = useState({ name: '', start: '1', step: '1', min: '1', max: '', cycle: false })
+  const { show: showToast } = useToast()
 
   return (
     <div className="overflow-auto p-4">
+      {showCreate && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-5 w-80 shadow-xl flex flex-col gap-3">
+            <h3 className="text-sm font-semibold text-[#e6edf3]">New Sequence</h3>
+            {[
+              { key: 'name', label: 'Name', placeholder: 'seq_name' },
+              { key: 'start', label: 'Start', placeholder: '1' },
+              { key: 'step', label: 'Step', placeholder: '1' },
+              { key: 'min', label: 'Min', placeholder: '1' },
+              { key: 'max', label: 'Max (empty = ∞)', placeholder: '' },
+            ].map(f => (
+              <div key={f.key} className="flex flex-col gap-1">
+                <label className="text-[10px] text-[#8b949e] uppercase tracking-wider">{f.label}</label>
+                <input
+                  value={newSeq[f.key as keyof typeof newSeq] as string}
+                  onChange={e => setNewSeq(prev => ({ ...prev, [f.key]: e.target.value }))}
+                  placeholder={f.placeholder}
+                  className="bg-[#0d1117] border border-[#30363d] rounded px-3 py-1.5 text-xs font-mono text-[#e6edf3] outline-none focus:border-[#10b981]" />
+              </div>
+            ))}
+            <div className="flex items-center gap-2">
+              <button onClick={() => setNewSeq(prev => ({ ...prev, cycle: !prev.cycle }))}
+                className={cn('text-[10px] px-2 py-1 rounded font-semibold border transition-colors',
+                  newSeq.cycle ? 'border-[#10b981] text-[#10b981] bg-[#10b981]/10' : 'border-[#30363d] text-[#8b949e]')}>
+                {newSeq.cycle ? 'CYCLE' : 'NO CYCLE'}
+              </button>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => { setShowCreate(false); setNewSeq({ name: '', start: '1', step: '1', min: '1', max: '', cycle: false }) }}
+                className="px-3 py-1.5 rounded text-xs text-[#8b949e] border border-[#30363d] hover:bg-[#21262d] transition-colors">
+                Cancel
+              </button>
+              <button
+                disabled={!newSeq.name.trim()}
+                onClick={() => {
+                  if (!newSeq.name.trim()) return
+                  setSeqs(ss => [...ss, {
+                    name: newSeq.name.trim(),
+                    current: Number(newSeq.start) || 1,
+                    start: Number(newSeq.start) || 1,
+                    step: Number(newSeq.step) || 1,
+                    min: Number(newSeq.min) || 1,
+                    max: newSeq.max ? Number(newSeq.max) : null,
+                    cycle: newSeq.cycle,
+                  }])
+                  showToast('Sequence created')
+                  setShowCreate(false)
+                  setNewSeq({ name: '', start: '1', step: '1', min: '1', max: '', cycle: false })
+                }}
+                className="px-3 py-1.5 rounded text-xs font-semibold bg-[#10b981] text-white hover:bg-[#10b981]/80 disabled:opacity-40 transition-colors">
+                Create
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {confirmDrop && (
+        <ConfirmModal
+          title="Drop sequence"
+          message={`Drop sequence "${confirmDrop}"? This cannot be undone.`}
+          onConfirm={() => {
+            setSeqs(ss => ss.filter(s => s.name !== confirmDrop))
+            setConfirmDrop(null)
+            showToast('Sequence dropped')
+          }}
+          onCancel={() => setConfirmDrop(null)}
+        />
+      )}
       <div className="flex items-center justify-between mb-3">
         <span className="text-xs font-semibold text-text-secondary uppercase tracking-wider">
           Sequences ({seqs.length})
         </span>
-        <button className="flex items-center gap-1 text-xs text-text-secondary hover:text-accent transition-colors">
+        <button onClick={() => setShowCreate(true)} className="flex items-center gap-1 text-xs text-text-secondary hover:text-accent transition-colors">
           <Plus className="w-3.5 h-3.5" />
           New sequence
         </button>
@@ -708,24 +780,31 @@ function SequencesTab() {
           </tr>
         </thead>
         <tbody>
-          {seqs.map(s => (
-            <tr key={s.name} className="border-b border-border/50 hover:bg-elevated transition-colors group">
-              <td className="px-3 py-2.5 font-mono font-semibold text-text-primary">{s.name}</td>
-              <td className="px-3 py-2.5 font-mono text-accent">{s.current.toLocaleString()}</td>
-              <td className="px-3 py-2.5 font-mono text-text-secondary">{s.start.toLocaleString()}</td>
-              <td className="px-3 py-2.5 font-mono text-text-secondary">{s.step}</td>
-              <td className="px-3 py-2.5 font-mono text-text-secondary">{s.min.toLocaleString()}</td>
-              <td className="px-3 py-2.5 font-mono text-text-secondary">{s.max?.toLocaleString() ?? '∞'}</td>
+          {seqs.map(seq => (
+            <tr key={seq.name} className="border-b border-border/50 hover:bg-elevated transition-colors group">
+              <td className="px-3 py-2.5 font-mono font-semibold text-text-primary">{seq.name}</td>
+              <td className="px-3 py-2.5 font-mono text-accent">{seq.current.toLocaleString()}</td>
+              <td className="px-3 py-2.5 font-mono text-text-secondary">{seq.start.toLocaleString()}</td>
+              <td className="px-3 py-2.5 font-mono text-text-secondary">{seq.step}</td>
+              <td className="px-3 py-2.5 font-mono text-text-secondary">{seq.min.toLocaleString()}</td>
+              <td className="px-3 py-2.5 font-mono text-text-secondary">{seq.max?.toLocaleString() ?? '∞'}</td>
               <td className="px-3 py-2.5">
                 <span className={cn('text-[10px] px-1.5 py-0.5 rounded font-semibold',
-                  s.cycle ? 'bg-accent/10 text-accent' : 'bg-border text-text-secondary')}>
-                  {s.cycle ? 'YES' : 'NO'}
+                  seq.cycle ? 'bg-accent/10 text-accent' : 'bg-border text-text-secondary')}>
+                  {seq.cycle ? 'YES' : 'NO'}
                 </span>
               </td>
               <td className="px-3 py-2.5">
                 <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <button className="text-xs text-text-secondary hover:text-accent transition-colors">Next val</button>
-                  <button className="text-xs text-text-secondary hover:text-error transition-colors">Drop</button>
+                  <button
+                    onClick={() => {
+                      setSeqs(ss => ss.map(s => s.name === seq.name ? { ...s, current: s.current + s.step } : s))
+                      showToast(`${seq.name}: next = ${seq.current + seq.step}`)
+                    }}
+                    className="text-xs text-text-secondary hover:text-accent transition-colors">Next val</button>
+                  <button
+                    onClick={() => setConfirmDrop(seq.name)}
+                    className="text-xs text-text-secondary hover:text-error transition-colors">Drop</button>
                 </div>
               </td>
             </tr>

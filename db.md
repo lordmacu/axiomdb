@@ -9701,6 +9701,318 @@ axiomdb-bench compare \
 
 ---
 
+## Native Toolkit System
+
+### Filosofía
+
+AxiomDB no es solo un motor SQL genérico — puede *enfocarse* en un dominio con un solo
+comando. El sistema de toolkits es la diferencia entre "una base de datos que tiene FTS"
+y "una base de datos lista para un blog". Un toolkit activa todo lo que ese workload
+necesita: tipos, funciones, plantillas de esquema, estrategias de índices, hints al
+optimizer y vistas de monitoreo. Sin código externo, sin compilación, completamente
+built-in y versionado con el motor.
+
+```sql
+-- Activar un toolkit
+INSTALL TOOLKIT blog;
+INSTALL TOOLKIT ecommerce;
+INSTALL TOOLKIT iot;
+INSTALL TOOLKIT saas;
+INSTALL TOOLKIT analytics;
+
+-- Combinar toolkits (son ortogonales)
+INSTALL TOOLKIT blog;
+INSTALL TOOLKIT saas;    -- → CMS multi-tenant
+
+-- Inspeccionar
+LIST TOOLKITS;
+DESCRIBE TOOLKIT blog;
+UNINSTALL TOOLKIT blog;
+```
+
+### Diferencia vs extensiones
+
+| | PostgreSQL extensions | AxiomDB toolkits |
+|---|---|---|
+| Código externo | Sí (C, Rust, Python) | No — todo built-in |
+| Compilación / instalación | `CREATE EXTENSION` + package manager | `INSTALL TOOLKIT` |
+| Versionado | Independiente del motor | Lock con la versión del motor |
+| Curado / mantenido | Comunidad (calidad variable) | Equipo AxiomDB |
+| Combinable | Conflictos posibles | Diseñado para combinarse |
+
+### Lo que provee cada toolkit
+
+Cada toolkit instala hasta 6 capas:
+
+1. **Domain types** — tipos validados con semántica de dominio (`SLUG`, `MONEY`, `SKU`)
+2. **Domain functions** — funciones SQL de alto nivel (`SLUG(text)`, `TIME_BUCKET(interval, ts)`)
+3. **Schema templates** — `CREATE TABLE LIKE TOOLKIT blog.posts` genera DDL con best practices
+4. **Index advisor** — EXPLAIN incluye sugerencias de índices específicas del dominio
+5. **Optimizer hints** — el planner conoce los patrones de acceso esperados del workload
+6. **Monitoring views** — `axiom_blog_stats`, `axiom_inventory_status` siempre actualizadas
+
+### Implementación interna
+
+- Los toolkits se compilan dentro del binario — no hay carga en runtime
+- `INSTALL TOOLKIT x` registra la activación en `axiom_toolkits` (tabla de catálogo)
+- Los objetos del toolkit viven en el schema `toolkit_x.*`
+- Las plantillas de esquema son generadores DDL — el desarrollador decide qué crear
+- El optimizer consulta `axiom_toolkits` al inicio de cada sesión para ajustar el planner
+
+---
+
+### Toolkit: `blog`
+
+*Workload: 95% reads, FTS, SEO, comentarios anidados, multi-autor*
+
+**Domain types**
+
+| Tipo | Definición | Validación |
+|---|---|---|
+| `SLUG` | `TEXT` | `CHECK (value ~ '^[a-z0-9][a-z0-9-]*[a-z0-9]$')` |
+| `POST_STATUS` | `ENUM` | `'draft' \| 'published' \| 'scheduled' \| 'archived'` |
+| `READING_LEVEL` | `ENUM` | `'easy' \| 'moderate' \| 'advanced'` |
+
+**Domain functions**
+
+| Función | Descripción |
+|---|---|
+| `SLUG(text)` | Normaliza texto a slug URL-safe (`'Hello World!'` → `'hello-world'`) |
+| `EXCERPT(text, max_words INT)` | Extrae las primeras N palabras con elipsis |
+| `READING_TIME(text)` | Minutos estimados de lectura (200 wpm) como INT |
+| `WORD_COUNT(text)` | Conteo de palabras |
+| `EXTRACT_HEADINGS(text)` | Retorna `TEXT[]` con los encabezados (H1, H2, H3) |
+| `RANK_POSTS(query TEXT, col TEXT)` | Score BM25 + recencia combinados |
+
+**Schema templates**
+
+```sql
+CREATE TABLE posts     LIKE TOOLKIT blog.posts;      -- id, title, slug, content,
+                                                      --   excerpt, author_id, status,
+                                                      --   published_at, fts_vector;
+                                                      --   + índice FTS, partial idx
+CREATE TABLE comments  LIKE TOOLKIT blog.comments;   -- id, post_id, parent_id (nested)
+CREATE TABLE tags      LIKE TOOLKIT blog.tags;
+CREATE TABLE post_tags LIKE TOOLKIT blog.post_tags;
+CREATE TABLE categories LIKE TOOLKIT blog.categories; -- con ltree path para jerarquía
+```
+
+**Optimizer hints activadas:** read-heavy, slug lookup frecuente → prioriza B-Tree sobre
+hash para IDs, sugiere covering index en `(status, published_at DESC)`.
+
+**Monitoring**
+
+```sql
+SELECT * FROM axiom_blog_stats;
+-- post_count, draft_count, avg_reading_time, top_tags, comments_today
+```
+
+---
+
+### Toolkit: `ecommerce`
+
+*Workload: ACID-crítico, inventario, pedidos, pagos, facturas con numeración fiscal*
+
+**Domain types**
+
+| Tipo | Definición |
+|---|---|
+| `MONEY(currency)` | `(amount DECIMAL(12,4), currency CHAR(3))` con operadores aritméticos |
+| `SKU` | `TEXT CHECK (value ~ '^[A-Z0-9][A-Z0-9\-_]{1,63}$')` |
+| `ORDER_STATUS` | `ENUM('pending','confirmed','processing','shipped','delivered','cancelled','refunded')` |
+
+**Domain functions**
+
+| Función | Descripción |
+|---|---|
+| `APPLY_TAX(amount, country, category)` | Cálculo de IVA/tax por país y categoría |
+| `CONVERT_CURRENCY(amount, from, to)` | Conversión usando `axiom_exchange_rates` |
+| `NEXT_INVOICE_NUM(series)` | Secuencia sin gaps para numeración fiscal |
+| `RESERVE_INVENTORY(sku, qty, session)` | Hold transaccional con auto-release |
+| `COMMIT_RESERVATION(reservation_id)` | Convierte hold en deducción permanente |
+| `RELEASE_RESERVATION(reservation_id)` | Cancela hold y libera stock |
+
+**Schema templates**
+
+```sql
+CREATE TABLE products    LIKE TOOLKIT ecommerce.products;
+CREATE TABLE inventory   LIKE TOOLKIT ecommerce.inventory;   -- con reservas, holds
+CREATE TABLE orders      LIKE TOOLKIT ecommerce.orders;
+CREATE TABLE order_items LIKE TOOLKIT ecommerce.order_items;
+CREATE TABLE invoices    LIKE TOOLKIT ecommerce.invoices;    -- gapless seq, FK fiscal
+```
+
+**Optimizer hints:** mixed read/write → activa group commit, sugiere partial indexes
+por `status` en orders, habilita `SELECT FOR UPDATE SKIP LOCKED` como plan preferido
+para colas de trabajo.
+
+**Monitoring**
+
+```sql
+SELECT * FROM axiom_inventory_status;   -- stock, reserved, available por SKU
+SELECT * FROM axiom_order_pipeline;     -- pedidos por estado con aging
+SELECT * FROM axiom_revenue_today;      -- ingresos del día por moneda
+```
+
+---
+
+### Toolkit: `iot`
+
+*Workload: alta velocidad de insert, datos ordenados por tiempo, downsampling, alertas*
+
+**Domain types**
+
+| Tipo | Definición |
+|---|---|
+| `DEVICE_STATUS` | `ENUM('active','inactive','error','maintenance')` |
+| `READING_QUALITY` | `ENUM('good','uncertain','bad')` |
+
+**Domain functions**
+
+| Función | Descripción |
+|---|---|
+| `TIME_BUCKET(interval, ts)` | Como TimescaleDB — trunca a bucket de tiempo |
+| `DEAD_BAND(new_val, prev_val, threshold)` | TRUE si el cambio supera el umbral |
+| `INTERPOLATE_LOCF(ts, val)` | Last observation carried forward |
+| `INTERPOLATE_LINEAR(ts1, v1, ts2, v2, ts)` | Interpolación lineal entre dos puntos |
+| `SENSOR_DRIFT(readings, expected)` | Detecta deriva de calibración |
+| `DOWNSAMPLE(col, interval, fn)` | Wrapper de TIME_BUCKET + aggregate |
+
+**Schema templates**
+
+```sql
+CREATE TABLE devices  LIKE TOOLKIT iot.devices;   -- id, name, type, location, status
+CREATE TABLE readings LIKE TOOLKIT iot.readings;  -- device_id, ts, value, quality
+                                                  --   auto-partition por mes, BRIN idx, TTL
+CREATE TABLE alerts   LIKE TOOLKIT iot.alerts;    -- device_id, ts, severity, message
+```
+
+**Optimizer hints:** write-heavy, ordered by ts → desactiva read-ahead aleatorio,
+activa WAL group commit agresivo, sugiere BRIN en lugar de B-Tree para `ts`.
+
+**Monitoring**
+
+```sql
+SELECT * FROM axiom_device_status;    -- last_seen, reading_count, alert_count por device
+SELECT * FROM axiom_data_freshness;   -- tablas con último insert + intervalo esperado
+SELECT * FROM axiom_sensor_health;    -- devices sin datos en el último intervalo esperado
+```
+
+---
+
+### Toolkit: `saas`
+
+*Workload: multi-tenant, cuotas, compliance, aislamiento estricto, GDPR*
+
+**Domain types**
+
+| Tipo | Definición |
+|---|---|
+| `TENANT_ID` | `BIGINT NOT NULL` con función `CURRENT_TENANT()` automática |
+| `SUBSCRIPTION_TIER` | `ENUM('free','starter','pro','enterprise')` |
+
+**Domain functions**
+
+| Función | Descripción |
+|---|---|
+| `CURRENT_TENANT()` | Retorna `tenant_id` de la sesión actual |
+| `TENANT_QUOTA_CHECK(resource, amount)` | TRUE si el tenant está dentro de su cuota |
+| `ANONYMIZE(text)` | Anonimización one-way compatible con GDPR |
+| `MASK_PII(text, policy)` | Aplica política de masking por nombre |
+| `TENANT_USAGE(tenant_id)` | Storage + filas + queries del tenant |
+
+**Schema templates**
+
+```sql
+CREATE TABLE tenants       LIKE TOOLKIT saas.tenants;
+CREATE TABLE subscriptions LIKE TOOLKIT saas.subscriptions;
+CREATE TABLE audit_log     LIKE TOOLKIT saas.audit_log;   -- inmutable, append-only
+CREATE TABLE quota_usage   LIKE TOOLKIT saas.quota_usage;
+```
+
+**Optimizer hints:** activa RLS automáticamente en todas las tablas que tengan columna
+`tenant_id`, sugiere schema-per-tenant cuando el tenant count supera 1000.
+
+**Monitoring**
+
+```sql
+SELECT * FROM axiom_tenant_usage;    -- storage, filas, queries por tenant
+SELECT * FROM axiom_quota_alerts;    -- tenants que superaron el 80% de su cuota
+SELECT * FROM axiom_compliance_log;  -- accesos a datos PII con usuario + timestamp
+```
+
+---
+
+### Toolkit: `analytics`
+
+*Workload: queries complejas, agregaciones, dashboards, BI tools, reporting*
+
+**Domain functions**
+
+| Función | Descripción |
+|---|---|
+| `PERCENTILE_RANK(value, dataset)` | Rango percentil dentro de un conjunto |
+| `Z_SCORE(value, mean, stddev)` | Score estándar |
+| `MOVING_AVG(col, window_size)` | Media móvil como sugar para window function |
+| `COHORT_DATE(ts, granularity)` | Trunca a período de cohorte ('week','month','quarter') |
+| `RETENTION_RATE(cohort_date, event_date)` | Tasa de retención por cohorte |
+| `FUNNEL_STEP(user_id, step, ts)` | Helper para análisis de embudo de conversión |
+
+**Schema templates**
+
+```sql
+CREATE TABLE events   LIKE TOOLKIT analytics.events;    -- user_id, event, ts, props JSON
+CREATE TABLE sessions LIKE TOOLKIT analytics.sessions;  -- session_id, user_id, start, end
+CREATE TABLE funnels  LIKE TOOLKIT analytics.funnels;   -- definición de pasos de embudo
+```
+
+**Optimizer hints:** read-heavy analytical — activa PAX layout sugerido, prefetch
+agresivo en seq scan, prioriza hash join sobre nested loop para grandes tablas.
+
+**Monitoring**
+
+```sql
+SELECT * FROM axiom_query_stats;      -- top queries por costo, tablas más usadas
+SELECT * FROM axiom_slow_analytical;  -- queries analíticas > umbral configurable
+SELECT * FROM axiom_cache_efficiency; -- hit rate por tabla en buffer pool
+```
+
+---
+
+### Combinación de toolkits
+
+Los toolkits son ortogonales y se pueden combinar sin conflictos:
+
+| Combinación | Caso de uso |
+|---|---|
+| `blog + saas` | CMS multi-tenant (Medium, Substack) |
+| `ecommerce + saas` | Marketplace SaaS (Shopify) |
+| `iot + analytics` | Dashboard de telemetría en tiempo real |
+| `saas + analytics` | SaaS con reporting por tenant |
+| `blog + analytics` | Blog con analytics propios sin Google |
+
+---
+
+### Introspección SQL
+
+```sql
+-- Toolkits instalados en la base actual
+SELECT name, version, installed_at, objects_count
+FROM axiom_toolkits;
+
+-- Objetos registrados por un toolkit
+SELECT object_type, object_name, schema
+FROM axiom_toolkit_objects
+WHERE toolkit = 'blog';
+
+-- Qué toolkit provee una función
+SELECT toolkit, description
+FROM axiom_toolkit_functions
+WHERE function_name = 'SLUG';
+```
+
+---
+
 ## Referencias
 
 - **LMDB** (Lightning Memory-Mapped Database) — arquitectura mmap + CoW B+ Tree
