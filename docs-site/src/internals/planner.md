@@ -166,6 +166,45 @@ Consequence: `WHERE col IS NULL` always falls back to a full table scan.
 
 ---
 
+## Bloom Filter — Skip B-Tree on Definite Absence
+
+Each secondary index has a per-index Bloom filter managed by `BloomRegistry`.
+Before performing an `IndexLookup` or `IndexRange`, the planner checks whether
+the key is _definitely absent_ from the index:
+
+```
+1. Hash the key with the index's Bloom filter.
+2. If the filter says ABSENT → skip the B-Tree lookup entirely.
+3. If the filter says POSSIBLY PRESENT → proceed with the B-Tree lookup.
+```
+
+The filter is populated at `CREATE INDEX` time (bulk-load from the existing table)
+and maintained incrementally:
+
+| Operation | Filter update |
+|---|---|
+| `INSERT` | `bloom.add(index_id, key)` — key added |
+| `DELETE` | `bloom.mark_dirty(index_id)` — filter rebuilt lazily |
+| `UPDATE` | marks dirty if indexed columns changed |
+
+**False positive rate:** ≈1% (configurable at build time via the number of hash
+functions and bit array size). False positives cause unnecessary B-Tree lookups but
+never produce incorrect results.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage</span>
+For workloads with many point-lookups for keys that do not exist (e.g. cache-miss
+patterns, existence checks before INSERT), the Bloom filter eliminates the B-Tree
+traversal entirely — reducing a 3–5 page I/O operation to a single in-memory hash
+check. This matches the optimization used in RocksDB's SST files and DuckDB's ART
+index absent-key path.
+</div>
+</div>
+
+---
+
 ## Deferred Items
 
 | Feature | Phase |
@@ -173,5 +212,5 @@ Consequence: `WHERE col IS NULL` always falls back to a full table scan.
 | Composite multi-column planner (> 1 column WHERE) | 6.8 |
 | Cost-based optimizer (NDV, row counts) | 6.10 |
 | `EXPLAIN` statement | 8.x |
-| Covering indexes (no heap read) | 9.x |
-| Partial index predicate matching | 10.x |
+| Covering indexes (index-only scan, no heap read) | 9.x |
+| Partial index predicate matching in planner | 10.x |
