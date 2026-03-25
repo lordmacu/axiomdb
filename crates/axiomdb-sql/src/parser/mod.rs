@@ -14,8 +14,10 @@ pub(crate) mod expr;
 
 use axiomdb_core::error::DbError;
 
+use axiomdb_types::Value;
+
 use crate::{
-    ast::{Stmt, TableRef},
+    ast::{SetStmt, SetValue, Stmt, TableRef},
     lexer::{tokenize, Span, SpannedToken, Token},
 };
 
@@ -304,6 +306,13 @@ impl<'src> Parser<'src> {
                 self.advance();
                 Ok(Stmt::Rollback)
             }
+            Token::Set => {
+                self.advance(); // consume SET
+                let variable = self.parse_identifier()?;
+                self.expect(&Token::Eq)?;
+                let value = self.parse_set_value()?;
+                Ok(Stmt::Set(SetStmt { variable, value }))
+            }
             Token::Eof => Err(DbError::ParseError {
                 message: "empty input: no SQL statement found".into(),
                 position: Some(self.current_pos()),
@@ -354,6 +363,42 @@ impl<'src> Parser<'src> {
                 message: format!("expected TABLE or INDEX after DROP, found {:?}", other,),
                 position: Some(self.current_pos()),
             }),
+        }
+    }
+
+    /// Parses the value side of a `SET variable = <value>` statement.
+    ///
+    /// Handles the common MySQL SET value forms:
+    /// - `DEFAULT`    → `SetValue::Default`
+    /// - `ON`         → `SetValue::Expr(Literal(Text("ON")))`
+    /// - `OFF`        → `SetValue::Expr(Literal(Text("OFF")))`
+    /// - `TRUE`       → `SetValue::Expr(Literal(Bool(true)))`
+    /// - `FALSE`      → `SetValue::Expr(Literal(Bool(false)))`
+    /// - Any other expression (literals, integers, strings) → `SetValue::Expr`
+    pub(crate) fn parse_set_value(&mut self) -> Result<SetValue, DbError> {
+        use crate::expr::Expr;
+        match self.peek().clone() {
+            Token::Default => {
+                self.advance();
+                Ok(SetValue::Default)
+            }
+            Token::On => {
+                self.advance();
+                Ok(SetValue::Expr(Expr::Literal(Value::Text("ON".into()))))
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("off") => {
+                self.advance();
+                Ok(SetValue::Expr(Expr::Literal(Value::Text("OFF".into()))))
+            }
+            Token::True => {
+                self.advance();
+                Ok(SetValue::Expr(Expr::Literal(Value::Bool(true))))
+            }
+            Token::False => {
+                self.advance();
+                Ok(SetValue::Expr(Expr::Literal(Value::Bool(false))))
+            }
+            _ => Ok(SetValue::Expr(expr::parse_expr(self)?)),
         }
     }
 }

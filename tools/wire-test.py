@@ -3,7 +3,7 @@
 AxiomDB wire protocol test.
 Updated at each subphase close — always overwrite this file, never create new ones.
 
-Last updated: subphase 5.9c (SHOW STATUS: session/global/local scope, LIKE wildcards, counters)
+Last updated: subphase 4.25c (strict mode + warnings: SET strict_mode, SET sql_mode, SHOW WARNINGS)
 """
 import os
 import signal
@@ -828,6 +828,88 @@ ok("Oversize COM_QUERY error message is the canonical max_allowed_packet message
    err_msg_oversize is not None and "max_allowed_packet" in str(err_msg_oversize),
    err_msg_oversize)
 conn_oversize.close()
+
+# ── Phase 4.25c: strict mode + warnings ──────────────────────────────────────
+
+print("\n[strict_mode / sql_mode defaults]")
+cur.execute("SELECT @@strict_mode")
+ok("@@strict_mode defaults to ON", cur.fetchone()[0] == "ON")
+
+cur.execute("SELECT @@sql_mode")
+sql_mode_default = cur.fetchone()[0]
+ok("@@sql_mode defaults to contain STRICT_TRANS_TABLES",
+   "STRICT_TRANS_TABLES" in sql_mode_default, sql_mode_default)
+
+print("\n[SHOW VARIABLES: strict_mode / sql_mode]")
+cur.execute("SHOW VARIABLES LIKE 'strict_mode'")
+rows_sv = cur.fetchall()
+ok("SHOW VARIABLES LIKE 'strict_mode' returns row",
+   len(rows_sv) == 1 and rows_sv[0][1] == "ON", rows_sv)
+
+cur.execute("SHOW VARIABLES LIKE 'sql_mode'")
+rows_sqlmode = cur.fetchall()
+ok("SHOW VARIABLES LIKE 'sql_mode' returns row with STRICT_TRANS_TABLES",
+   len(rows_sqlmode) == 1 and "STRICT_TRANS_TABLES" in rows_sqlmode[0][1], rows_sqlmode)
+
+print("\n[SET strict_mode = OFF → permissive INSERT warns]")
+conn_strict = pymysql.connect(host="127.0.0.1", port=PORT, user="root", password="",
+                               database="test", charset="utf8mb4")
+cs = conn_strict.cursor()
+cs.execute("CREATE TABLE IF NOT EXISTS t_wire_strict (age INT)")
+cs.execute("DELETE FROM t_wire_strict")
+
+# With strict ON, '42abc' into INT must error.
+try:
+    cs.execute("INSERT INTO t_wire_strict VALUES ('42abc')")
+    ok("strict ON: '42abc' into INT errors", False, "no error raised")
+except Exception:
+    ok("strict ON: '42abc' into INT errors", True)
+
+# Turn strict OFF, same insert should succeed and produce a warning.
+cs.execute("SET strict_mode = OFF")
+cur2 = conn_strict.cursor()
+cur2.execute("SELECT @@strict_mode")
+ok("@@strict_mode is OFF after SET", cur2.fetchone()[0] == "OFF")
+
+cs.execute("INSERT INTO t_wire_strict VALUES ('42abc')")
+ok("strict OFF + '42abc' into INT: row inserted", True)
+
+cs.execute("SHOW WARNINGS")
+warnings = cs.fetchall()
+ok("SHOW WARNINGS returns at least 1 warning after permissive INSERT",
+   len(warnings) >= 1, warnings)
+if warnings:
+    ok("warning code is 1265", warnings[0][1] == 1265, warnings[0])
+    ok("warning message contains 'age'", "age" in warnings[0][2], warnings[0][2])
+    ok("warning message contains 'row 1'", "row 1" in warnings[0][2], warnings[0][2])
+
+cs.execute("SELECT age FROM t_wire_strict")
+row_val = cs.fetchone()
+ok("permissive INSERT stored 42 (not '42abc')", row_val is not None and row_val[0] == 42, row_val)
+
+# Regression: SHOW WARNINGS after a clean statement returns empty.
+cs.execute("SELECT 1")
+cs.execute("SHOW WARNINGS")
+_warnings_after_clean = cs.fetchall()
+ok("SHOW WARNINGS is empty after clean SELECT",
+   len(_warnings_after_clean) == 0, _warnings_after_clean)
+
+print("\n[SET sql_mode = '' disables strict]")
+cs.execute("SET sql_mode = ''")
+cur2.execute("SELECT @@strict_mode")
+ok("@@strict_mode is OFF after SET sql_mode = ''", cur2.fetchone()[0] == "OFF")
+
+cur2.execute("SELECT @@sql_mode")
+ok("@@sql_mode is empty after SET sql_mode = ''", cur2.fetchone()[0] == "")
+
+print("\n[SET sql_mode = 'STRICT_TRANS_TABLES' re-enables strict]")
+cs.execute("SET sql_mode = 'STRICT_TRANS_TABLES'")
+cur2.execute("SELECT @@strict_mode")
+ok("@@strict_mode is ON after SET sql_mode = 'STRICT_TRANS_TABLES'",
+   cur2.fetchone()[0] == "ON")
+
+cs.execute("DROP TABLE IF EXISTS t_wire_strict")
+conn_strict.close()
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

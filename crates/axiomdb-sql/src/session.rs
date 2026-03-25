@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use axiomdb_catalog::ResolvedTable;
+use axiomdb_core::error::DbError;
 
 // ── SqlWarning ────────────────────────────────────────────────────────────────
 
@@ -84,6 +85,69 @@ impl StaleStatsTracker {
     }
 }
 
+// ── Strict-mode helpers ───────────────────────────────────────────────────────
+
+/// Parses a boolish setting value (`ON`/`OFF`/`1`/`0`/`TRUE`/`FALSE`).
+///
+/// Used by `SET strict_mode = ...` in both the executor and the wire layer so
+/// both code paths accept the same set of literals.
+pub fn parse_boolish_setting(raw: &str) -> Result<bool, DbError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" => Ok(true),
+        "0" | "off" | "false" => Ok(false),
+        other => Err(DbError::InvalidValue {
+            reason: format!("expected ON/OFF/1/0/TRUE/FALSE, got '{other}'"),
+        }),
+    }
+}
+
+/// Normalises a raw `sql_mode` string.
+///
+/// - Trims outer quotes.
+/// - Splits on `,`, trims and uppercases each token.
+/// - Removes empty tokens and duplicates (first occurrence wins).
+/// - Rejoins with `,`.
+pub fn normalize_sql_mode(raw: &str) -> String {
+    let stripped = raw.trim().trim_matches('\'').trim_matches('"');
+    let mut seen = std::collections::HashSet::new();
+    let mut tokens: Vec<String> = Vec::new();
+    for part in stripped.split(',') {
+        let token = part.trim().to_ascii_uppercase();
+        if !token.is_empty() && seen.insert(token.clone()) {
+            tokens.push(token);
+        }
+    }
+    tokens.join(",")
+}
+
+/// Returns `true` when `normalized` contains `STRICT_TRANS_TABLES` or
+/// `STRICT_ALL_TABLES` (i.e. strict DML assignment is enabled).
+pub fn sql_mode_is_strict(normalized: &str) -> bool {
+    normalized
+        .split(',')
+        .any(|t| t.trim() == "STRICT_TRANS_TABLES" || t.trim() == "STRICT_ALL_TABLES")
+}
+
+/// Returns a new `sql_mode` string with the strict tokens added or removed.
+///
+/// All non-strict tokens from `current` are preserved. When `enabled` is
+/// `true`, `STRICT_TRANS_TABLES` is prepended. The result is always normalised.
+pub fn apply_strict_to_sql_mode(current: &str, enabled: bool) -> String {
+    let normalized = normalize_sql_mode(current);
+    let others: Vec<&str> = normalized
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && *t != "STRICT_TRANS_TABLES" && *t != "STRICT_ALL_TABLES")
+        .collect();
+    if enabled {
+        let mut parts = vec!["STRICT_TRANS_TABLES"];
+        parts.extend_from_slice(&others);
+        parts.join(",")
+    } else {
+        others.join(",")
+    }
+}
+
 // ── SessionContext ────────────────────────────────────────────────────────────
 
 /// Per-connection state: schema cache + session variables visible to the executor.
@@ -100,6 +164,16 @@ pub struct SessionContext {
     /// transaction that remains open until the client sends an explicit `COMMIT`
     /// or `ROLLBACK`. DDL always triggers an implicit commit of any open transaction.
     pub autocommit: bool,
+    /// Whether DML column assignment coercion is in strict mode (default: `true`).
+    ///
+    /// When `true` (default): `INSERT`/`UPDATE` column values that cannot be
+    /// coerced under `CoercionMode::Strict` return an error immediately.
+    ///
+    /// When `false` (`SET strict_mode = OFF` / `SET sql_mode = ''`): the engine
+    /// first tries strict coercion; on failure it falls back to permissive
+    /// coercion, stores the result, and appends a SQL warning 1265 to the
+    /// session. If permissive coercion also fails the error is returned.
+    pub strict_mode: bool,
     /// Warnings accumulated during the last statement.
     ///
     /// Cleared automatically before each new statement execution (in
@@ -120,6 +194,7 @@ impl SessionContext {
         Self {
             cache: HashMap::new(),
             autocommit: true,
+            strict_mode: true,
             warnings: Vec::new(),
             stats: StaleStatsTracker::default(),
         }
@@ -169,5 +244,87 @@ impl SessionContext {
 
     pub fn cached_count(&self) -> usize {
         self.cache.len()
+    }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_session_context_strict_mode_default_true() {
+        let ctx = SessionContext::new();
+        assert!(ctx.strict_mode, "strict_mode must default to true");
+    }
+
+    #[test]
+    fn test_parse_boolish_setting_on_off() {
+        assert!(parse_boolish_setting("ON").unwrap());
+        assert!(parse_boolish_setting("on").unwrap());
+        assert!(parse_boolish_setting("1").unwrap());
+        assert!(parse_boolish_setting("TRUE").unwrap());
+        assert!(parse_boolish_setting("true").unwrap());
+        assert!(!parse_boolish_setting("OFF").unwrap());
+        assert!(!parse_boolish_setting("off").unwrap());
+        assert!(!parse_boolish_setting("0").unwrap());
+        assert!(!parse_boolish_setting("FALSE").unwrap());
+        assert!(!parse_boolish_setting("false").unwrap());
+        assert!(parse_boolish_setting("maybe").is_err());
+    }
+
+    #[test]
+    fn test_normalize_sql_mode_deduplicates_and_uppercases() {
+        let result = normalize_sql_mode("ansi_quotes,strict_trans_tables,ansi_quotes");
+        assert_eq!(result, "ANSI_QUOTES,STRICT_TRANS_TABLES");
+    }
+
+    #[test]
+    fn test_normalize_sql_mode_trims_quotes() {
+        assert_eq!(
+            normalize_sql_mode("'STRICT_TRANS_TABLES'"),
+            "STRICT_TRANS_TABLES"
+        );
+        assert_eq!(
+            normalize_sql_mode("\"STRICT_ALL_TABLES\""),
+            "STRICT_ALL_TABLES"
+        );
+    }
+
+    #[test]
+    fn test_normalize_sql_mode_empty() {
+        assert_eq!(normalize_sql_mode(""), "");
+        assert_eq!(normalize_sql_mode("''"), "");
+    }
+
+    #[test]
+    fn test_sql_mode_is_strict() {
+        assert!(sql_mode_is_strict("STRICT_TRANS_TABLES"));
+        assert!(sql_mode_is_strict("ANSI_QUOTES,STRICT_TRANS_TABLES"));
+        assert!(sql_mode_is_strict("STRICT_ALL_TABLES"));
+        assert!(!sql_mode_is_strict("ANSI_QUOTES"));
+        assert!(!sql_mode_is_strict(""));
+    }
+
+    #[test]
+    fn test_apply_strict_to_sql_mode_enable() {
+        let result = apply_strict_to_sql_mode("ANSI_QUOTES", true);
+        assert!(result.starts_with("STRICT_TRANS_TABLES"));
+        assert!(result.contains("ANSI_QUOTES"));
+    }
+
+    #[test]
+    fn test_apply_strict_to_sql_mode_disable() {
+        let result = apply_strict_to_sql_mode("STRICT_TRANS_TABLES,ANSI_QUOTES", false);
+        assert!(!result.contains("STRICT_TRANS_TABLES"));
+        assert!(result.contains("ANSI_QUOTES"));
+    }
+
+    #[test]
+    fn test_apply_strict_to_sql_mode_idempotent_enable() {
+        // Enabling when already strict should not duplicate the token.
+        let result = apply_strict_to_sql_mode("STRICT_TRANS_TABLES", true);
+        assert_eq!(result, "STRICT_TRANS_TABLES");
     }
 }

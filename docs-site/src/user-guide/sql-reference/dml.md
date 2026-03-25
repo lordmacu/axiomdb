@@ -646,7 +646,8 @@ SELECT @@transaction_isolation;  -- 'REPEATABLE-READ'
 | `@@character_set_results` | `'utf8mb4'` | Result character set |
 | `@@collation_connection` | `'utf8mb4_general_ci'` | Connection collation |
 | `@@max_allowed_packet` | `67108864` | Maximum packet size (64 MB) |
-| `@@sql_mode` | `'STRICT_TRANS_TABLES'` | Active SQL mode |
+| `@@sql_mode` | `'STRICT_TRANS_TABLES'` | Active SQL mode (see [Strict Mode](#strict-mode)) |
+| `@@strict_mode` | `'ON'` | AxiomDB strict coercion flag (alias for `STRICT_TRANS_TABLES` in sql_mode) |
 | `@@transaction_isolation` | `'REPEATABLE-READ'` | Isolation level |
 
 ### Changing session variables
@@ -659,6 +660,10 @@ SET autocommit = 1;   -- restore
 -- Character set (accepted for ORM compatibility, utf8mb4 is always used internally)
 SET NAMES 'utf8mb4';
 SET character_set_client = 'utf8mb4';
+
+-- Control coercion strictness (see Strict Mode below)
+SET strict_mode = OFF;
+SET sql_mode = '';
 ```
 
 ### @@in_transaction — transaction state check
@@ -677,21 +682,103 @@ Use `@@in_transaction` to verify transaction state before issuing a `COMMIT` or
 `ROLLBACK`. This avoids the warning generated when `COMMIT` is called with no
 active transaction.
 
-### SHOW WARNINGS
+### Strict Mode
 
-After any statement that completes with warnings (e.g. a `COMMIT` when no transaction
-is active), query the warning list:
+AxiomDB operates in **strict mode** by default. In strict mode, an `INSERT` or
+`UPDATE` that cannot coerce a value to the column's declared type returns an error
+immediately (SQLSTATE 22018). This prevents silent data corruption.
 
 ```sql
-COMMIT;               -- no-op if no active transaction — emits warning 1592
+CREATE TABLE products (name TEXT, stock INT);
+
+-- Strict mode (default): error on bad coercion
+INSERT INTO products VALUES ('Widget', 'abc');
+-- ERROR 22018: cannot coerce 'abc' (Text) to INT
+```
+
+To enable **permissive mode**, disable strict mode for the session:
+
+```sql
+SET strict_mode = OFF;
+-- or equivalently:
+SET sql_mode = '';
+```
+
+In permissive mode, AxiomDB first tries the strict coercion. If it fails, it
+falls back to a best-effort conversion (e.g. `'42abc'` → `42`, `'abc'` → `0`),
+stores the result, and emits warning **1265** instead of returning an error:
+
+```sql
+SET strict_mode = OFF;
+
+CREATE TABLE products (name TEXT, stock INT);
+INSERT INTO products VALUES ('Widget', '99abc');
+-- Succeeds — stock stored as 99; warning emitted
+
+SHOW WARNINGS;
+-- Level    Code   Message
+-- ─────────────────────────────────────────────────────────────────────
+-- Warning  1265   Data truncated for column 'stock' at row 1
+```
+
+For multi-row INSERT, the row number in warning 1265 is 1-based and identifies
+the specific row that triggered the fallback:
+
+```sql
+INSERT INTO products VALUES ('A', '10'), ('B', '99x'), ('C', '30');
+SHOW WARNINGS;
+-- Warning  1265   Data truncated for column 'stock' at row 2
+```
+
+Re-enable strict mode at any time:
+
+```sql
+SET strict_mode = ON;
+-- or equivalently:
+SET sql_mode = 'STRICT_TRANS_TABLES';
+```
+
+`SET strict_mode = DEFAULT` also restores the server default (ON).
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Tip — ORM Compatibility</span>
+Some ORMs (e.g. older SQLAlchemy versions, legacy Rails) set <code>sql_mode = ''</code>
+at connection time to get MySQL 5 permissive behavior. AxiomDB supports this pattern:
+<code>SET sql_mode = ''</code> disables strict mode for that connection. Use
+<code>SHOW WARNINGS</code> after bulk loads to audit truncated values.
+</div>
+</div>
+
+### SHOW WARNINGS
+
+After any statement that completes with warnings, query the warning list:
+
+```sql
+-- Warning from no-op COMMIT
+COMMIT;               -- no active transaction — emits warning 1592
 SHOW WARNINGS;
 -- Level    Code   Message
 -- ───────────────────────────────────────────────
 -- Warning  1592   There is no active transaction
+
+-- Warning from permissive coercion (strict_mode = OFF)
+SET strict_mode = OFF;
+INSERT INTO products VALUES ('Widget', '99abc');
+SHOW WARNINGS;
+-- Level    Code   Message
+-- ─────────────────────────────────────────────────────────────────────
+-- Warning  1265   Data truncated for column 'stock' at row 1
 ```
 
 `SHOW WARNINGS` returns the warnings from the **most recent statement only**. The
 list is cleared before each new statement executes.
+
+| Warning Code | Condition |
+|---|---|
+| `1265` | Permissive coercion fallback: value was truncated/converted to fit the column type |
+| `1592` | COMMIT or ROLLBACK issued with no active transaction |
 
 ---
 
