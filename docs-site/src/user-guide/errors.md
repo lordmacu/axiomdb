@@ -465,6 +465,48 @@ The following conversions happen automatically without raising 22018:
 
 ---
 
+## Connection Protocol Errors (Class 08)
+
+### MySQL 1153 / 08S01 — ER_NET_PACKET_TOO_LARGE
+
+Returned when an incoming MySQL logical command payload exceeds the connection's
+current `max_allowed_packet` limit.
+
+```
+ERROR 1153 (08S01): Got a packet bigger than 'max_allowed_packet' bytes
+```
+
+**What triggers it:**
+- A `COM_QUERY` whose SQL text exceeds `@@max_allowed_packet` bytes.
+- A `COM_STMT_PREPARE` or `COM_STMT_EXECUTE` packet above the limit.
+- A `HandshakeResponse41` above the default 64 MiB limit (rare in practice).
+- A multi-packet logical command whose total reassembled payload exceeds the limit,
+  even if each individual physical fragment is below the limit.
+
+**What happens after the error:**
+The server closes the connection immediately. The stream cannot be safely reused
+because the framing layer cannot determine where the next command begins.
+
+**Fix:** Raise `max_allowed_packet` before sending the large command:
+
+```sql
+SET max_allowed_packet = 134217728;  -- 128 MiB
+```
+
+Or reconnect after the error — the new connection starts with the server default.
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Session Scope</span>
+<code>SET max_allowed_packet</code> affects only the current connection. Use it before
+any statement whose payload may be large (e.g., bulk INSERT with many values, or
+a BLOB upload via <code>COM_STMT_EXECUTE</code>).
+</div>
+</div>
+
+---
+
 ## Complete SQLSTATE Reference
 
 | SQLSTATE | Name                          | Common Cause                              |
@@ -495,5 +537,6 @@ The following conversions happen automatically without raising 22018:
 | `25P01`  | no_active_sql_transaction     | COMMIT/ROLLBACK with no active transaction|
 | `25006`  | read_only_sql_transaction     | Transaction expired                       |
 | `0A000`  | feature_not_supported         | SQL feature not yet implemented           |
+| `08S01`  | connection_failure (MySQL ext)| Incoming packet exceeds max_allowed_packet|
 | `53100`  | disk_full                     | Storage volume is full                    |
 | `58030`  | io_error                      | OS-level I/O failure (disk, permissions)  |
