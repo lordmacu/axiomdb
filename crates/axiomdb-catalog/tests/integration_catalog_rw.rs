@@ -195,6 +195,7 @@ fn test_create_and_list_index() {
                 is_primary: true,
                 columns: vec![],
                 predicate: None,
+                fillfactor: 90,
             })
             .unwrap();
         (tid, iid)
@@ -231,6 +232,7 @@ fn test_index_ids_are_unique_across_tables() {
                 is_primary: false,
                 columns: vec![],
                 predicate: None,
+                fillfactor: 90,
             })
             .unwrap();
         let i2 = w
@@ -243,6 +245,7 @@ fn test_index_ids_are_unique_across_tables() {
                 is_primary: false,
                 columns: vec![],
                 predicate: None,
+                fillfactor: 90,
             })
             .unwrap();
         (i1, i2)
@@ -272,6 +275,7 @@ fn test_delete_index() {
                 is_primary: false,
                 columns: vec![],
                 predicate: None,
+                fillfactor: 90,
             })
             .unwrap();
         (tid, iid)
@@ -323,6 +327,7 @@ fn test_delete_table_cascades_columns_and_indexes() {
             is_primary: true,
             columns: vec![],
             predicate: None,
+            fillfactor: 90,
         })
         .unwrap();
         tid

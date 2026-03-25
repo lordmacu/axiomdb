@@ -29,7 +29,7 @@ use axiomdb_types::DataType;
 
 use super::database::CommitRx;
 
-use super::result::{serialize_query_result_multi, serialize_query_result_multi_warn};
+use super::result::serialize_query_result_multi_warn;
 use super::{
     auth::{gen_challenge, is_allowed_user, verify_native_password, verify_sha256_password},
     codec::MySqlCodec,

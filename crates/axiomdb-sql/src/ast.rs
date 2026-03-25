@@ -291,6 +291,9 @@ pub struct CreateIndexStmt {
     /// Optional WHERE predicate for partial indexes (Phase 6.7).
     /// `None` = full index (covers all rows).
     pub predicate: Option<crate::expr::Expr>,
+    /// Target leaf-page fill factor (Phase 6.8). `None` → default 90.
+    /// Valid range: 10–100.
+    pub fillfactor: Option<u8>,
 }
 
 /// `DROP TABLE`
@@ -695,6 +698,7 @@ mod tests {
                 order: SortOrder::Asc,
             }],
             predicate: None,
+            fillfactor: None,
         });
         assert!(matches!(stmt, Stmt::CreateIndex(_)));
     }

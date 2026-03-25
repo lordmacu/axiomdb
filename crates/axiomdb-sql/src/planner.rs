@@ -254,6 +254,7 @@ mod tests {
                 order: SortOrder::Asc,
             }],
             predicate: None,
+            fillfactor: 90,
         }
     }
 
@@ -336,6 +337,7 @@ mod tests {
             is_primary: false,
             columns: vec![], // old format — no column info
             predicate: None,
+            fillfactor: 90,
         };
         let expr = Expr::BinaryOp {
             op: BinaryOp::Eq,

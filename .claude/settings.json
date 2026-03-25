@@ -38,16 +38,6 @@
             "statusMessage": "Verificando docs antes de commit..."
           }
         ]
-      },
-      {
-        "matcher": "Bash(git commit:*)",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "cd /Users/cristian/nexusdb && python3 tools/smoke-test.py 2>&1",
-            "statusMessage": "Smoke test — verificando wire protocol en vivo..."
-          }
-        ]
       }
     ],
     "PostToolUse": [

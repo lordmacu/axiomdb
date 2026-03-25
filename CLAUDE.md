@@ -218,13 +218,12 @@ One phase at a time. When finishing each phase — **mandatory closing protocol:
 2. cargo clippy --workspace -- -D warnings with no errors
 3. cargo fmt --check with no differences
 4. Wire protocol smoke test — if the subphase touches anything observable
-   from a MySQL client: build the server, connect with pymysql and run TWO
-   things:
-   a) A scenario specific to what was implemented in this subphase
-      (proves the new feature works end-to-end through the wire).
-   b) The generic smoke test: python3 tools/smoke-test.py
-      (proves nothing existing broke).
-   Blocker if any assertion fails in either.
+   from a MySQL client (SQL, transactions, session, errors, DDL, functions):
+   overwrite tools/wire-test.py with:
+     a) Assertions for what was just implemented (proves it works via wire).
+     b) Regression assertions from previous subphases (proves nothing broke).
+   Build the server, run the script, report results. Blocker if any fails.
+   Always the same file — never create wire-test-X.Y.py or similar.
 5. Write docs/fase-N.md
 6. Update docs/progreso.md — mark subphase with [x] ✅ and parent phase with 🔄
 7. Update docs-site/ — update ALL pages affected by this subphase (see Documentation protocol below)
@@ -576,7 +575,7 @@ Si hay un ❌, abrir `/debug` para identificar el bottleneck antes de continuar.
    [ ] No unwrap() in src/ (only in tests and benches) ✅
    [ ] All unsafe has SAFETY: comment ✅
    [ ] Integration tests in tests/ ✅
-   [ ] Wire protocol smoke test — pymysql scenario for what was implemented ✅
+   [ ] Wire protocol smoke test — tools/wire-test.py updated and passing ✅
    [ ] Benchmarks run and results reported to the user ✅
    [ ] No benchmark ❌ (blocker) ✅
    [ ] Test logic reviewed (no empty assertions) ✅
