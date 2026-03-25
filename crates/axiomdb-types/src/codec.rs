@@ -64,6 +64,7 @@ fn read_u24(bytes: &[u8], pos: usize) -> Result<usize, DbError> {
     if pos + 3 > bytes.len() {
         return Err(DbError::ParseError {
             message: format!("truncated: expected u24 length at offset {pos}"),
+            position: None,
         });
     }
     Ok(bytes[pos] as usize | (bytes[pos + 1] as usize) << 8 | (bytes[pos + 2] as usize) << 16)
@@ -219,6 +220,7 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
     if bytes.len() < blen {
         return Err(DbError::ParseError {
             message: format!("truncated: need {blen} bitmap bytes, got {}", bytes.len()),
+            position: None,
         });
     }
 
@@ -271,6 +273,7 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                 let s = std::str::from_utf8(&bytes[pos..pos + len])
                     .map_err(|_| DbError::ParseError {
                         message: format!("invalid UTF-8 in Text column at offset {pos}"),
+                        position: None,
                     })?
                     .to_string();
                 pos += len;
@@ -342,6 +345,7 @@ pub fn decode_row_masked(
     if bytes.len() < blen {
         return Err(DbError::ParseError {
             message: format!("truncated: need {blen} bitmap bytes, got {}", bytes.len()),
+            position: None,
         });
     }
 
@@ -397,6 +401,7 @@ pub fn decode_row_masked(
                     let s = std::str::from_utf8(&bytes[pos..pos + len])
                         .map_err(|_| DbError::ParseError {
                             message: format!("invalid UTF-8 in Text column at offset {pos}"),
+                            position: None,
                         })?
                         .to_string();
                     pos += len;
@@ -477,6 +482,7 @@ fn ensure_bytes(bytes: &[u8], pos: usize, need: usize) -> Result<(), DbError> {
                 need,
                 bytes.len().saturating_sub(pos)
             ),
+            position: None,
         })
     } else {
         Ok(())

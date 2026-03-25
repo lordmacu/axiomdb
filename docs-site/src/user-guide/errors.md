@@ -18,24 +18,24 @@ Every error from AxiomDB is represented as an `ErrorResponse` struct with these 
 | `message` | string | **Yes** | Short human-readable description. Do not parse this — use `sqlstate` |
 | `detail` | string | Sometimes | Extended context about the failure (offending value, referenced row) |
 | `hint` | string | Sometimes | Actionable suggestion for how to fix the error |
-| `position` | integer | Future | Byte offset of the error in the SQL query (Phase 4.25b) |
+| `position` | integer | Sometimes | 0-based byte offset of the unexpected token in the SQL string (parse errors only) |
 
 ```json
 {
   "sqlstate": "23505",
   "severity": "ERROR",
-  "message": "unique key violation on users.email",
-  "hint": "A row with the same email already exists in users. Use INSERT ... ON CONFLICT to handle duplicates."
+  "message": "unique key violation on index 'users_email_idx'",
+  "detail": "Key (value)=(alice@example.com) is already present in index users_email_idx.",
+  "hint": "A row with the same value already exists in index users_email_idx. Use INSERT ... ON CONFLICT to handle duplicates."
 }
 ```
 
 ```json
 {
-  "sqlstate": "23503",
+  "sqlstate": "42601",
   "severity": "ERROR",
-  "message": "foreign key violation: orders.user_id = 999",
-  "detail": "Key (user_id)=(999) is not present in table users.",
-  "hint": "Insert the referenced row first, or use ON DELETE CASCADE."
+  "message": "SQL syntax error: unexpected token 'FORM'",
+  "position": 9
 }
 ```
 
@@ -43,6 +43,40 @@ Every error from AxiomDB is represented as an `ErrorResponse` struct with these 
 
 When using the MySQL wire protocol, the error is delivered as a MySQL error packet
 with the SQLSTATE code in the `sql_state` field (5 bytes following the `#` marker).
+
+### JSON Error Format
+
+For clients that need structured errors without screen-scraping message strings, AxiomDB
+supports a JSON error format that carries all `ErrorResponse` fields in the MySQL ERR packet:
+
+```sql
+SET error_format = 'json';
+```
+
+After this, every ERR packet carries a JSON string instead of plain text:
+
+```json
+{"code":1064,"sqlstate":"42601","severity":"ERROR","message":"SQL syntax error: unexpected token 'FORM'","position":9}
+```
+
+```json
+{"code":1062,"sqlstate":"23505","severity":"ERROR","message":"unique key violation on index 'users_email_idx'","detail":"Key (value)=(alice@example.com) is already present in index users_email_idx."}
+```
+
+Reset to plain text with `SET error_format = 'text'`. This setting is per-connection and
+does not persist after disconnect.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — JSON on MySQL Wire</span>
+The MySQL wire protocol has no structured error field beyond a plain string message. AxiomDB
+encodes the full <code>ErrorResponse</code> as a JSON string in that message field when
+<code>error_format = 'json'</code> is set. This mirrors how PostgreSQL's <code>ErrorResponse</code>
+packet carries <code>detail</code>, <code>hint</code>, and <code>position</code> in separate fields —
+achieving the same semantics over MySQL's more limited protocol.
+</div>
+</div>
 
 ---
 
@@ -77,6 +111,18 @@ UNIQUE or PRIMARY KEY.
 CREATE TABLE users (email TEXT NOT NULL UNIQUE);
 INSERT INTO users VALUES ('alice@example.com');
 INSERT INTO users VALUES ('alice@example.com');  -- ERROR 23505
+```
+
+The error message identifies both the index and the offending value:
+
+```
+Duplicate entry 'alice@example.com' for key 'users_email_uq'
+```
+
+The `detail` field (available in JSON format) provides a PostgreSQL-style message:
+
+```
+Key (value)=(alice@example.com) is already present in index users_email_uq.
 ```
 
 **Typical application response:** Show "An account with this email already exists."

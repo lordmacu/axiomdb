@@ -458,7 +458,7 @@ fn test_error_unexpected_dollar() {
 #[test]
 fn test_error_unexpected_char_position_in_message() {
     let e = tokens_err("SELECT @");
-    if let DbError::ParseError { message } = e {
+    if let DbError::ParseError { message, .. } = e {
         assert!(
             message.contains('@'),
             "error message should contain '@': {message}"

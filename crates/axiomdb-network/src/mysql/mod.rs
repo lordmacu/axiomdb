@@ -26,6 +26,7 @@ pub mod database;
 pub mod error;
 pub mod group_commit;
 pub mod handler;
+pub mod json_error;
 pub mod packets;
 pub mod prepared;
 pub mod result;

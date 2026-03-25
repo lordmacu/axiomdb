@@ -136,13 +136,17 @@ impl ErrorResponse {
     /// This function is infallible — it never panics.
     pub fn from_error(err: &DbError) -> Self {
         let (detail, hint) = derive_detail_hint(err);
+        let position = match err {
+            DbError::ParseError { position, .. } => *position,
+            _ => None,
+        };
         Self {
             sqlstate: err.sqlstate().to_string(),
             severity: Severity::Error,
             message: err.to_string(),
             detail,
             hint,
-            position: None,
+            position,
         }
     }
 
@@ -193,10 +197,13 @@ impl From<DbError> for ErrorResponse {
 fn derive_detail_hint(err: &DbError) -> (Option<String>, Option<String>) {
     match err {
         // ── Integrity violations ───────────────────────────────────────────
-        DbError::UniqueViolation { table, column } => (
-            None, // offending value requires constraint enforcement (Phase 4.25b)
+        DbError::UniqueViolation { index_name, value } => (
+            Some(match value {
+                Some(v) => format!("Key (value)=({v}) is already present in index {index_name}."),
+                None => format!("Duplicate key in index {index_name}."),
+            }),
             Some(format!(
-                "A row with the same {column} already exists in {table}. \
+                "A row with the same value already exists in index {index_name}. \
                  Use INSERT ... ON CONFLICT to handle duplicates."
             )),
         ),
@@ -388,8 +395,8 @@ mod tests {
     fn test_sqlstate_integrity_variants() {
         assert_eq!(
             DbError::UniqueViolation {
-                table: "t".into(),
-                column: "c".into()
+                index_name: "t_c_idx".into(),
+                value: None,
             }
             .sqlstate(),
             "23505"
@@ -440,7 +447,8 @@ mod tests {
     fn test_sqlstate_schema_variants() {
         assert_eq!(
             DbError::ParseError {
-                message: "x".into()
+                message: "x".into(),
+                position: None,
             }
             .sqlstate(),
             "42601"
@@ -618,16 +626,46 @@ mod tests {
     #[test]
     fn test_from_error_unique_violation() {
         let err = DbError::UniqueViolation {
-            table: "users".into(),
-            column: "email".into(),
+            index_name: "users_email_idx".into(),
+            value: Some("bob@example.com".into()),
         };
         let resp = ErrorResponse::from_error(&err);
         assert_eq!(resp.sqlstate, "23505");
+        let detail = resp.detail.unwrap();
+        assert!(
+            detail.contains("bob@example.com"),
+            "detail should contain offending value, got: {detail}"
+        );
+        assert!(
+            detail.contains("users_email_idx"),
+            "detail should contain index name, got: {detail}"
+        );
         let hint = resp.hint.unwrap();
         assert!(
-            hint.contains("email") || hint.contains("users"),
-            "hint should reference table/column"
+            hint.contains("users_email_idx"),
+            "hint should reference index name, got: {hint}"
         );
+    }
+
+    #[test]
+    fn test_from_error_parse_error_position() {
+        let err = DbError::ParseError {
+            message: "unexpected token 'FORM'".into(),
+            position: Some(9),
+        };
+        let resp = ErrorResponse::from_error(&err);
+        assert_eq!(resp.sqlstate, "42601");
+        assert_eq!(resp.position, Some(9));
+    }
+
+    #[test]
+    fn test_from_error_parse_error_no_position() {
+        let err = DbError::ParseError {
+            message: "input too long".into(),
+            position: None,
+        };
+        let resp = ErrorResponse::from_error(&err);
+        assert_eq!(resp.position, None);
     }
 
     #[test]
@@ -740,6 +778,7 @@ mod tests {
     fn test_from_error_parse_error() {
         let err = DbError::ParseError {
             message: "unexpected token".into(),
+            position: None,
         };
         let resp = ErrorResponse::from_error(&err);
         assert_eq!(resp.sqlstate, "42601");

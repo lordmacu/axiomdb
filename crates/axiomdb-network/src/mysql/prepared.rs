@@ -107,6 +107,7 @@ pub fn parse_execute_packet(
     if payload.len() < 9 {
         return Err(DbError::ParseError {
             message: "COM_STMT_EXECUTE payload too short".into(),
+            position: None,
         });
     }
 
@@ -128,6 +129,7 @@ pub fn parse_execute_packet(
     if pos + bitmap_len > payload.len() {
         return Err(DbError::ParseError {
             message: "null bitmap truncated in COM_STMT_EXECUTE".into(),
+            position: None,
         });
     }
     let null_bitmap = payload[pos..pos + bitmap_len].to_vec();
@@ -137,6 +139,7 @@ pub fn parse_execute_packet(
     if pos >= payload.len() {
         return Err(DbError::ParseError {
             message: "missing new_params_bound_flag".into(),
+            position: None,
         });
     }
     let bound = payload[pos] == 1;
@@ -147,6 +150,7 @@ pub fn parse_execute_packet(
         if pos + n * 2 > payload.len() {
             return Err(DbError::ParseError {
                 message: "param type list truncated".into(),
+                position: None,
             });
         }
         stmt.param_types = (0..n)
@@ -166,6 +170,7 @@ pub fn parse_execute_packet(
         let (value, consumed) =
             decode_binary_value(&payload[pos..], type_code).map_err(|msg| DbError::ParseError {
                 message: format!("param {i}: {msg}"),
+                position: None,
             })?;
         params.push(value);
         pos += consumed;
@@ -398,6 +403,7 @@ pub fn substitute_params(template: &str, params: &[Value]) -> Result<String, DbE
                             count_question_marks(template),
                             params.len()
                         ),
+                        position: None,
                     });
                 }
                 result.push_str(&value_to_sql_literal(&params[param_idx]));

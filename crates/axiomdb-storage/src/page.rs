@@ -37,6 +37,7 @@ impl TryFrom<u8> for PageType {
             4 => Ok(PageType::Free),
             _ => Err(DbError::ParseError {
                 message: format!("unknown page_type: {v}"),
+                position: None,
             }),
         }
     }

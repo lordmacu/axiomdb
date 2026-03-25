@@ -40,11 +40,8 @@ pub fn parse(input: &str, max_bytes: Option<usize>) -> Result<Stmt, DbError> {
     p.eat(&Token::Semicolon);
     if p.peek() != &Token::Eof {
         return Err(DbError::ParseError {
-            message: format!(
-                "unexpected token {:?} after statement at position {}",
-                p.peek(),
-                p.current_pos()
-            ),
+            message: format!("unexpected token {:?} after statement", p.peek(),),
+            position: Some(p.current_pos()),
         });
     }
 
@@ -137,12 +134,8 @@ impl<'src> Parser<'src> {
             Ok(())
         } else {
             Err(DbError::ParseError {
-                message: format!(
-                    "expected {:?} but found {:?} at position {}",
-                    expected,
-                    self.peek(),
-                    self.current_pos()
-                ),
+                message: format!("expected {:?} but found {:?}", expected, self.peek(),),
+                position: Some(self.current_pos()),
             })
         }
     }
@@ -184,10 +177,8 @@ impl<'src> Parser<'src> {
             }
             other => {
                 return Err(DbError::ParseError {
-                    message: format!(
-                        "expected identifier but found {:?} at position {}",
-                        other, pos
-                    ),
+                    message: format!("expected identifier but found {:?}", other,),
+                    position: Some(pos),
                 })
             }
         };
@@ -276,9 +267,10 @@ impl<'src> Parser<'src> {
                     }
                     other => Err(DbError::ParseError {
                         message: format!(
-                            "expected TABLES or COLUMNS after SHOW, found {:?} at position {}",
-                            other, self.current_pos()
+                            "expected TABLES or COLUMNS after SHOW, found {:?}",
+                            other,
                         ),
+                        position: Some(self.current_pos()),
                     }),
                 }
             }
@@ -314,13 +306,14 @@ impl<'src> Parser<'src> {
             }
             Token::Eof => Err(DbError::ParseError {
                 message: "empty input: no SQL statement found".into(),
+                position: Some(self.current_pos()),
             }),
             other => Err(DbError::ParseError {
                 message: format!(
-                    "unexpected token {:?} at position {} — expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, BEGIN, COMMIT, or ROLLBACK",
+                    "unexpected token {:?} — expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, BEGIN, COMMIT, or ROLLBACK",
                     other,
-                    self.current_pos()
                 ),
+                position: Some(self.current_pos()),
             }),
         }
     }
@@ -341,11 +334,8 @@ impl<'src> Parser<'src> {
                 ddl::parse_create_index(self, false)
             }
             other => Err(DbError::ParseError {
-                message: format!(
-                    "expected TABLE or INDEX after CREATE, found {:?} at position {}",
-                    other,
-                    self.current_pos()
-                ),
+                message: format!("expected TABLE or INDEX after CREATE, found {:?}", other,),
+                position: Some(self.current_pos()),
             }),
         }
     }
@@ -361,11 +351,8 @@ impl<'src> Parser<'src> {
                 ddl::parse_drop_index(self)
             }
             other => Err(DbError::ParseError {
-                message: format!(
-                    "expected TABLE or INDEX after DROP, found {:?} at position {}",
-                    other,
-                    self.current_pos()
-                ),
+                message: format!("expected TABLE or INDEX after DROP, found {:?}", other,),
+                position: Some(self.current_pos()),
             }),
         }
     }
@@ -379,12 +366,12 @@ fn validate_identifier_length(name: &str, pos: usize) -> Result<(), DbError> {
     if name.len() > MAX_IDENTIFIER_LEN {
         return Err(DbError::ParseError {
             message: format!(
-                "identifier '{}' exceeds maximum length of {} characters ({} chars) at position {}",
+                "identifier '{}' exceeds maximum length of {} characters ({} chars)",
                 name,
                 MAX_IDENTIFIER_LEN,
                 name.len(),
-                pos
             ),
+            position: Some(pos),
         });
     }
     Ok(())

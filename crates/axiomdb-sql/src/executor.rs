@@ -5438,6 +5438,7 @@ fn alter_add_constraint(
         TableConstraint::Check { name, expr } => {
             let cname = name.ok_or_else(|| DbError::ParseError {
                 message: "ADD CONSTRAINT CHECK requires an explicit constraint name".into(),
+                position: None,
             })?;
 
             // Check for duplicate constraint name.

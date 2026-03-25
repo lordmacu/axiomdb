@@ -547,7 +547,7 @@ fn test_identifier_65_chars_error() {
     let sql = format!("CREATE TABLE {name} (id INT)");
     let e = parse_err(&sql);
     assert!(matches!(e, DbError::ParseError { .. }));
-    if let DbError::ParseError { message } = e {
+    if let DbError::ParseError { message, .. } = e {
         assert!(
             message.contains("exceeds maximum length"),
             "error should mention length: {message}"

@@ -173,6 +173,7 @@ pub fn decode_index_key(key: &[u8], n_values: usize) -> Result<(Vec<Value>, usiz
                 message: format!(
                     "decode_index_key: key truncated at pos {pos} (need {n_values} values)"
                 ),
+                position: None,
             });
         }
         let (v, new_pos) = decode_value(key, pos)?;
@@ -186,6 +187,7 @@ fn decode_value(key: &[u8], pos: usize) -> Result<(Value, usize), DbError> {
     if pos >= key.len() {
         return Err(DbError::ParseError {
             message: "decode_value: unexpected end of key bytes".into(),
+            position: None,
         });
     }
     match key[pos] {
@@ -255,6 +257,7 @@ fn decode_value(key: &[u8], pos: usize) -> Result<(Value, usize), DbError> {
             let (raw, end) = decode_bytes_nul(&key[pos + 1..])?;
             let s = String::from_utf8(raw).map_err(|_| DbError::ParseError {
                 message: "decode_index_key: invalid UTF-8 in Text value".into(),
+                position: None,
             })?;
             Ok((Value::Text(s), pos + 1 + end))
         }
@@ -274,6 +277,7 @@ fn decode_value(key: &[u8], pos: usize) -> Result<(Value, usize), DbError> {
         }
         tag => Err(DbError::ParseError {
             message: format!("decode_index_key: unknown type tag 0x{tag:02x}"),
+            position: None,
         }),
     }
 }
@@ -300,6 +304,7 @@ fn decode_bytes_nul(src: &[u8]) -> Result<(Vec<u8>, usize), DbError> {
         if i >= src.len() {
             return Err(DbError::ParseError {
                 message: "decode_index_key: unterminated bytes value".into(),
+                position: None,
             });
         }
         if src[i] == 0xFF && i + 1 < src.len() && src[i + 1] == 0x00 {
@@ -317,6 +322,7 @@ fn decode_bytes_nul(src: &[u8]) -> Result<(Vec<u8>, usize), DbError> {
 fn trunc() -> DbError {
     DbError::ParseError {
         message: "decode_index_key: key bytes truncated".into(),
+        position: None,
     }
 }
 

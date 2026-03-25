@@ -27,7 +27,10 @@ pub enum DbError {
 
     // ── SQL ──────────────────────────────────────────────────────
     #[error("SQL syntax error: {message}")]
-    ParseError { message: String },
+    ParseError {
+        message: String,
+        position: Option<usize>,
+    },
 
     #[error("table '{name}' not found")]
     TableNotFound { name: String },
@@ -36,8 +39,11 @@ pub enum DbError {
     ColumnNotFound { name: String, table: String },
 
     // ── Integrity ────────────────────────────────────────────────
-    #[error("unique key violation on {table}.{column}")]
-    UniqueViolation { table: String, column: String },
+    #[error("unique key violation on index '{index_name}'")]
+    UniqueViolation {
+        index_name: String,
+        value: Option<String>,
+    },
 
     /// Child row references a parent key that does not exist (INSERT/UPDATE child).
     /// SQLSTATE 23503

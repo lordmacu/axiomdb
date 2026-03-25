@@ -483,6 +483,7 @@ pub fn tokenize<'src>(
                     input.len(),
                     max
                 ),
+                position: None,
             });
         }
     }
@@ -502,6 +503,7 @@ pub fn tokenize<'src>(
                 let ch = input[start..].chars().next().unwrap_or('\u{FFFD}');
                 return Err(DbError::ParseError {
                     message: format!("unexpected character '{}' at position {}", ch, start),
+                    position: None,
                 });
             }
         }
