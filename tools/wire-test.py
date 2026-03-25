@@ -3,7 +3,7 @@
 AxiomDB wire protocol test.
 Updated at each subphase close — always overwrite this file, never create new ones.
 
-Last updated: subphase 6.13 (index-only scans + non-unique composite keys)
+Last updated: subphase 4.19d (DATE_FORMAT, STR_TO_DATE, FIND_IN_SET, date extractors)
 """
 import os
 import signal
@@ -230,6 +230,108 @@ conn.commit()
 cur.execute("SELECT tag FROM iox_tags WHERE tag = 'rust'")
 rows = cur.fetchall()
 ok("Index-only scan: deleted row not returned (MVCC)", len(rows) == 2)
+
+# ── [4.19d] DATE_FORMAT / STR_TO_DATE / FIND_IN_SET / date extractors ─────────
+
+print("\n[4.19d] DATE_FORMAT")
+
+cur.execute("SELECT DATE_FORMAT(NULL, '%Y-%m-%d')")
+ok("DATE_FORMAT(NULL, ...) = NULL", cur.fetchone()[0] is None)
+
+# STR_TO_DATE('2025-03-25', ...) returns a Date value; DATE_FORMAT formats it
+cur.execute("SELECT DATE_FORMAT(STR_TO_DATE('2025-03-25', '%Y-%m-%d'), '%Y-%m-%d')")
+v = cur.fetchone()[0]
+ok("DATE_FORMAT(date, '%Y-%m-%d') = '2025-03-25'", v == "2025-03-25", v)
+
+cur.execute("SELECT DATE_FORMAT(STR_TO_DATE('2025-03-25', '%Y-%m-%d'), '%d/%m/%Y')")
+v = cur.fetchone()[0]
+ok("DATE_FORMAT(date, '%d/%m/%Y') = '25/03/2025'", v == "25/03/2025", v)
+
+cur.execute(
+    "SELECT DATE_FORMAT(STR_TO_DATE('2025-03-25 14:30:45', '%Y-%m-%d %H:%i:%s'), '%H:%i:%s')"
+)
+v = cur.fetchone()[0]
+ok("DATE_FORMAT(timestamp, '%H:%i:%s') = '14:30:45'", v == "14:30:45", v)
+
+# Unknown specifier passes through literally
+cur.execute("SELECT DATE_FORMAT(STR_TO_DATE('2025-03-25', '%Y-%m-%d'), '%Y-%X-%d')")
+v = cur.fetchone()[0]
+ok("DATE_FORMAT unknown specifier passthrough: '%Y-%X-%d'", v == "2025-%X-25", v)
+
+print("\n[4.19d] STR_TO_DATE")
+
+cur.execute("SELECT STR_TO_DATE('not-a-date', '%Y-%m-%d')")
+ok("STR_TO_DATE bad input = NULL", cur.fetchone()[0] is None)
+
+cur.execute("SELECT STR_TO_DATE(NULL, '%Y-%m-%d')")
+ok("STR_TO_DATE(NULL, ...) = NULL", cur.fetchone()[0] is None)
+
+# Round-trip: parse then format recovers the original string
+cur.execute(
+    "SELECT DATE_FORMAT(STR_TO_DATE('2025-03-25', '%Y-%m-%d'), '%Y-%m-%d')"
+)
+v = cur.fetchone()[0]
+ok("STR_TO_DATE round-trip '%Y-%m-%d'", v == "2025-03-25", v)
+
+# Alternate separator
+cur.execute(
+    "SELECT DATE_FORMAT(STR_TO_DATE('25/03/2025', '%d/%m/%Y'), '%Y-%m-%d')"
+)
+v = cur.fetchone()[0]
+ok("STR_TO_DATE slash separator", v == "2025-03-25", v)
+
+# Invalid day-in-month
+cur.execute("SELECT STR_TO_DATE('2025-02-30', '%Y-%m-%d')")
+ok("STR_TO_DATE Feb-30 = NULL", cur.fetchone()[0] is None)
+
+print("\n[4.19d] FIND_IN_SET")
+
+cur.execute("SELECT FIND_IN_SET('b', 'a,b,c')")
+ok("FIND_IN_SET('b','a,b,c') = 2", cur.fetchone()[0] == 2)
+
+cur.execute("SELECT FIND_IN_SET('z', 'a,b,c')")
+ok("FIND_IN_SET('z','a,b,c') = 0", cur.fetchone()[0] == 0)
+
+cur.execute("SELECT FIND_IN_SET('B', 'a,b,c')")
+ok("FIND_IN_SET case-insensitive 'B' = 2", cur.fetchone()[0] == 2)
+
+cur.execute("SELECT FIND_IN_SET(NULL, 'a,b,c')")
+ok("FIND_IN_SET(NULL, ...) = NULL", cur.fetchone()[0] is None)
+
+cur.execute("SELECT FIND_IN_SET('a', NULL)")
+ok("FIND_IN_SET(..., NULL) = NULL", cur.fetchone()[0] is None)
+
+cur.execute("SELECT FIND_IN_SET('a', '')")
+ok("FIND_IN_SET('a', '') = 0", cur.fetchone()[0] == 0)
+
+print("\n[4.19d] year/month/day/hour/minute/second extractors")
+
+cur.execute(
+    "SELECT year(STR_TO_DATE('2025-03-25 14:30:45', '%Y-%m-%d %H:%i:%s')), "
+    "       month(STR_TO_DATE('2025-03-25 14:30:45', '%Y-%m-%d %H:%i:%s')), "
+    "       day(STR_TO_DATE('2025-03-25 14:30:45', '%Y-%m-%d %H:%i:%s'))"
+)
+row = cur.fetchone()
+ok("year(ts) = 2025", row[0] == 2025, row[0])
+ok("month(ts) = 3", row[1] == 3, row[1])
+ok("day(ts) = 25", row[2] == 25, row[2])
+
+cur.execute(
+    "SELECT hour(STR_TO_DATE('2025-03-25 14:30:45', '%Y-%m-%d %H:%i:%s')), "
+    "       minute(STR_TO_DATE('2025-03-25 14:30:45', '%Y-%m-%d %H:%i:%s')), "
+    "       second(STR_TO_DATE('2025-03-25 14:30:45', '%Y-%m-%d %H:%i:%s'))"
+)
+row = cur.fetchone()
+ok("hour(ts) = 14", row[0] == 14, row[0])
+ok("minute(ts) = 30", row[1] == 30, row[1])
+ok("second(ts) = 45", row[2] == 45, row[2])
+
+# NOW() extractors — just check they return plausible values
+cur.execute("SELECT year(NOW()), month(NOW()), day(NOW())")
+row = cur.fetchone()
+ok("year(NOW()) in 2020-2100", 2020 <= row[0] <= 2100, row[0])
+ok("month(NOW()) in 1-12", 1 <= row[1] <= 12, row[1])
+ok("day(NOW()) in 1-31", 1 <= row[2] <= 31, row[2])
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

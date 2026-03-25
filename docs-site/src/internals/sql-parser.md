@@ -493,6 +493,80 @@ pub enum Stmt {
 
 ---
 
+## Scalar Function Evaluator (`eval.rs`)
+
+The expression evaluator (`crates/axiomdb-sql/src/eval.rs`) dispatches on
+function name (lowercased) in `eval_function`. The function registry is a
+single `match` arm — no hash map, no dynamic dispatch.
+
+### Date / Time Functions (4.19d)
+
+Four internal helpers drive the MySQL-compatible date functions:
+
+```rust
+// Converts Value::Timestamp(micros_since_epoch) to NaiveDateTime.
+// Uses Euclidean division for correct sub-second handling of pre-epoch timestamps.
+fn micros_to_ndt(micros: i64) -> NaiveDateTime
+
+// Converts Value::Date(days_since_epoch) to NaiveDate.
+fn days_to_ndate(days: i32) -> NaiveDate
+
+// Formats NaiveDateTime using MySQL-style format specifiers.
+// Maps specifiers manually — NOT via chrono's format strings — to guarantee
+// exact MySQL semantics (e.g. chrono's %m has different behavior).
+fn date_format_str(ndt: NaiveDateTime, fmt: &str) -> String
+
+// Parses a string into NaiveDateTime + a has_time flag.
+// Returns None on any failure (caller maps to Value::Null).
+fn str_to_date_inner(s: &str, fmt: &str) -> Option<(NaiveDateTime, bool)>
+```
+
+**`DATE_FORMAT` arm** — evaluates both args, dispatches `ts` on type:
+
+```
+ts: Timestamp(micros) → micros_to_ndt → NaiveDateTime
+ts: Date(days)        → days_to_ndate → NaiveDate.and_time(MIN) → NaiveDateTime
+ts: Text(s)           → try "%Y-%m-%d %H:%i:%s" then "%Y-%m-%d" via str_to_date_inner
+ts: NULL              → return NULL immediately
+```
+
+**`STR_TO_DATE` arm** — calls `str_to_date_inner` and converts back to a Value:
+
+```
+has_time = true  → Value::Timestamp((ndt - epoch).num_microseconds())
+has_time = false → Value::Date((ndt.date() - epoch).num_days() as i32)
+failure          → Value::Null
+```
+
+The epoch used for both conversions is always `NaiveDate(1970-01-01) 00:00:00`
+constructed with `from_ymd_opt(1970,1,1).unwrap().and_hms_opt(0,0,0).unwrap()`.
+This avoids any `DateTime<Utc>` and is stable across all chrono 0.4.x versions.
+
+**`str_to_date_inner`** processes the format string character by character:
+
+- Literal characters: must match verbatim in the input (returns `None` on mismatch).
+- `%Y`: consume exactly 4 digits.
+- `%y`: consume 1–2 digits; apply MySQL 2-digit rule (`<70 → +2000`, else `+1900`).
+- `%m`, `%c`, `%d`, `%e`, `%H`, `%h`, `%i`, `%s`/`%S`: consume 1–2 digits.
+- Unknown specifier: skip one character in the input string.
+- After parsing: validate with `NaiveDate::from_ymd_opt` + `NaiveTime::from_hms_opt`
+  (catches invalid dates such as Feb 30).
+
+**`take_digits(s, max)`** — helper used by the parser:
+
+```rust
+fn take_digits(s: &str, max: usize) -> Option<(u32, &str)> {
+    let n = s.bytes().take(max).take_while(|b| b.is_ascii_digit()).count();
+    if n == 0 { return None; }
+    let val: u32 = s[..n].parse().ok()?;
+    Some((val, &s[n..]))
+}
+```
+
+Uses byte positions (safe for all ASCII date strings) and avoids allocations.
+
+---
+
 ## Error Reporting
 
 Parse errors include the position (byte offset) where the unexpected token was found:

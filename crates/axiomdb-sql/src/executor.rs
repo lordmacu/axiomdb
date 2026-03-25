@@ -5706,14 +5706,6 @@ fn apply_limit_offset(
         .collect())
 }
 
-/// Deduplicates output rows, keeping the first occurrence of each unique row.
-///
-/// Two rows are equal if every column value serializes to the same bytes via
-/// `value_to_key_bytes`. `NULL` values produce `[0x00]` — two NULLs in the
-/// same column position are considered equal, consistent with SQL DISTINCT
-/// semantics (unlike `NULL = NULL` which is UNKNOWN in comparisons).
-///
-/// Preserves the insertion order of first occurrences (stable deduplication).
 // ── Non-unique index key helpers ──────────────────────────────────────────────
 
 /// Returns the lower bound for a non-unique index range scan on `prefix`.

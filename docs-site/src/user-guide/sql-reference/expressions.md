@@ -512,24 +512,167 @@ ORDER BY avg_price;
 
 ### Date / Time Functions
 
-| Function                        | Description                              |
-|---------------------------------|------------------------------------------|
-| `NOW()`                         | Current timestamp with timezone          |
-| `CURRENT_DATE`                  | Current date (no time)                   |
-| `CURRENT_TIME`                  | Current time (no date)                   |
-| `CURRENT_TIMESTAMP`             | Alias for `NOW()`                        |
-| `DATE_TRUNC('unit', ts)`        | Truncate to year/month/day/hour/...      |
-| `DATE_PART('unit', ts)`         | Extract year, month, day, hour, ...      |
-| `AGE(ts1, ts2)`                 | Interval between two timestamps          |
+#### Current date / time
+
+| Function            | Return type | Description                        |
+|---------------------|-------------|------------------------------------|
+| `NOW()`             | TIMESTAMP   | Current timestamp (UTC)            |
+| `CURRENT_DATE`      | DATE        | Current date (no time)             |
+| `CURRENT_TIME`      | TIMESTAMP   | Current time (no date)             |
+| `CURRENT_TIMESTAMP` | TIMESTAMP   | Alias for `NOW()`                  |
+| `UNIX_TIMESTAMP()`  | BIGINT      | Current time as Unix seconds       |
+
+#### Date component extractors
+
+| Function         | Returns | Description                                       |
+|------------------|---------|---------------------------------------------------|
+| `year(val)`      | INT     | Year (e.g. `2025`)                                |
+| `month(val)`     | INT     | Month `1–12`                                      |
+| `day(val)`       | INT     | Day of month `1–31`                               |
+| `hour(val)`      | INT     | Hour `0–23`                                       |
+| `minute(val)`    | INT     | Minute `0–59`                                     |
+| `second(val)`    | INT     | Second `0–59`                                     |
+| `DATEDIFF(a, b)` | INT     | Days between two dates (`a - b`)                  |
+
+`val` accepts `DATE`, `TIMESTAMP`, or a text string coercible to a date.
+Returns `NULL` if the input is `NULL` or not a valid date type.
 
 ```sql
--- Current timestamp
-SELECT NOW();
+SELECT year(NOW()),  month(NOW()),  day(NOW());   -- e.g. 2025, 3, 25
+SELECT hour(NOW()),  minute(NOW()), second(NOW()); -- e.g. 14, 30, 45
+```
 
--- Truncate to month (for GROUP BY month)
+#### DATE_FORMAT — format a date as text
+
+```sql
+DATE_FORMAT(ts, format_string) → TEXT
+```
+
+Formats a `DATE` or `TIMESTAMP` value using MySQL-compatible format specifiers.
+Returns `NULL` if either argument is `NULL` or the format string is empty.
+
+| Specifier | Description              | Example   |
+|-----------|--------------------------|-----------|
+| `%Y`      | 4-digit year             | `2025`    |
+| `%y`      | 2-digit year             | `25`      |
+| `%m`      | Month `01–12`            | `03`      |
+| `%c`      | Month `1–12` (no pad)    | `3`       |
+| `%M`      | Full month name          | `March`   |
+| `%b`      | Abbreviated month name   | `Mar`     |
+| `%d`      | Day `01–31`              | `05`      |
+| `%e`      | Day `1–31` (no pad)      | `5`       |
+| `%H`      | Hour `00–23`             | `14`      |
+| `%h`      | Hour `01–12` (12-hour)   | `02`      |
+| `%i`      | Minute `00–59`           | `30`      |
+| `%s`/`%S` | Second `00–59`           | `45`      |
+| `%p`      | AM / PM                  | `PM`      |
+| `%W`      | Full weekday name        | `Tuesday` |
+| `%a`      | Abbreviated weekday      | `Tue`     |
+| `%j`      | Day of year `001–366`    | `084`     |
+| `%w`      | Weekday `0=Sun…6=Sat`    | `2`       |
+| `%T`      | Time `HH:MM:SS` (24h)    | `14:30:45`|
+| `%r`      | Time `HH:MM:SS AM/PM`    | `02:30:45 PM` |
+| `%%`      | Literal `%`              | `%`       |
+
+Unknown specifiers are passed through literally (`%X` → `%X`).
+
+```sql
+-- Format a stored timestamp as ISO date
+SELECT DATE_FORMAT(created_at, '%Y-%m-%d') FROM orders;
+-- '2025-03-25'
+
+-- European date format
+SELECT DATE_FORMAT(NOW(), '%d/%m/%Y');
+-- '25/03/2025'
+
+-- Full datetime
+SELECT DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s');
+-- '2025-03-25 14:30:45'
+
+-- NULL input → NULL output
+SELECT DATE_FORMAT(NULL, '%Y-%m-%d');  -- NULL
+```
+
+#### STR_TO_DATE — parse a date string
+
+```sql
+STR_TO_DATE(str, format_string) → DATE | TIMESTAMP | NULL
+```
+
+Parses a text string into a date or timestamp using MySQL-compatible format
+specifiers (same table as `DATE_FORMAT` above).
+
+- Returns `DATE` if the format contains only date components.
+- Returns `TIMESTAMP` if the format contains any time components (`%H`, `%i`, `%s`).
+- Returns `NULL` on any parse failure — **never raises an error** (MySQL behavior).
+- Returns `NULL` if either argument is `NULL`.
+
+**2-digit year rule (`%y`):** `00–69` → `2000–2069`; `70–99` → `1970–1999`.
+
+```sql
+-- Parse ISO date → Value::Date
+SELECT STR_TO_DATE('2025-03-25', '%Y-%m-%d');
+
+-- Parse European date → Value::Date
+SELECT STR_TO_DATE('25/03/2025', '%d/%m/%Y');
+
+-- Parse datetime → Value::Timestamp
+SELECT STR_TO_DATE('2025-03-25 14:30:00', '%Y-%m-%d %H:%i:%s');
+
+-- Extract components from a parsed date
+SELECT year(STR_TO_DATE('2025-03-25', '%Y-%m-%d'));  -- 2025
+
+-- Round-trip: parse then format
+SELECT DATE_FORMAT(STR_TO_DATE('2025-03-25', '%Y-%m-%d'), '%d/%m/%Y');
+-- '25/03/2025'
+
+-- Invalid date → NULL (Feb 30 does not exist)
+SELECT STR_TO_DATE('2025-02-30', '%Y-%m-%d');  -- NULL
+
+-- Bad format → NULL (never an error)
+SELECT STR_TO_DATE('not-a-date', '%Y-%m-%d');  -- NULL
+```
+
+#### FIND_IN_SET — search a comma-separated list
+
+```sql
+FIND_IN_SET(needle, csv_list) → INT
+```
+
+Returns the **1-indexed** position of `needle` in the comma-separated string
+`csv_list`. Returns `0` if not found. Comparison is **case-insensitive**.
+Returns `NULL` if either argument is `NULL`.
+
+```sql
+SELECT FIND_IN_SET('b', 'a,b,c');   -- 2
+SELECT FIND_IN_SET('B', 'a,b,c');   -- 2  (case-insensitive)
+SELECT FIND_IN_SET('z', 'a,b,c');   -- 0  (not found)
+SELECT FIND_IN_SET('a', '');        -- 0  (empty list)
+SELECT FIND_IN_SET(NULL, 'a,b,c'); -- NULL
+```
+
+Useful for querying rows where a column holds a comma-separated tag list:
+
+```sql
+SELECT * FROM articles WHERE FIND_IN_SET('rust', tags) > 0;
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision</span>
+DATE_FORMAT and STR_TO_DATE map MySQL format specifiers manually rather than
+delegating to chrono's own format strings. This is intentional: MySQL's
+<code>%m</code> means zero-padded month but chrono uses <code>%m</code> differently.
+Manual mapping guarantees exact MySQL semantics for all 18 specifiers including
+<code>%T</code>, <code>%r</code>, and 2-digit year rules, without risking divergence
+from the underlying library's format grammar.
+</div>
+</div>
+
+```sql
+-- DATE_TRUNC and DATE_PART (PostgreSQL-compatible aliases)
 SELECT DATE_TRUNC('month', placed_at) AS month, COUNT(*) FROM orders GROUP BY 1;
-
--- Extract year from a date
 SELECT DATE_PART('year', created_at) AS signup_year FROM users;
 ```
 
