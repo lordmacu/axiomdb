@@ -108,6 +108,12 @@ pub fn spawn_group_commit_task(db: Arc<Mutex<Database>>, interval_ms: u64) -> Jo
                     let ids: Vec<TxnId> = tickets.iter().map(|t| t.txn_id).collect();
                     guard.txn.advance_committed(&ids);
                 }
+                if let Err(ref e) = r {
+                    if matches!(e, DbError::DiskFull { .. }) {
+                        // Flip runtime mode while still holding the lock.
+                        guard.enter_degraded_mode();
+                    }
+                }
                 r
             }; // Database lock released here
 
@@ -129,10 +135,21 @@ pub fn spawn_group_commit_task(db: Arc<Mutex<Database>>, interval_ms: u64) -> Jo
                         error = %msg,
                         "group commit: fsync FAILED — database in degraded state"
                     );
+                    // Propagate DiskFull directly so callers receive the right
+                    // error variant and can inspect it programmatically.
+                    // WalGroupCommitFailed is used for all other fsync failures.
+                    let is_disk_full = matches!(e, DbError::DiskFull { .. });
                     for ticket in tickets {
-                        let _ = ticket.reply.send(Err(DbError::WalGroupCommitFailed {
-                            message: msg.clone(),
-                        }));
+                        let reply_err = if is_disk_full {
+                            DbError::DiskFull {
+                                operation: "wal group commit fsync",
+                            }
+                        } else {
+                            DbError::WalGroupCommitFailed {
+                                message: msg.clone(),
+                            }
+                        };
+                        let _ = ticket.reply.send(Err(reply_err));
                     }
                 }
             }

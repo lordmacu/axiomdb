@@ -45,7 +45,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use axiomdb_core::error::DbError;
+use axiomdb_core::error::{classify_io, DbError};
 
 use crate::entry::WalEntry;
 
@@ -91,7 +91,8 @@ impl WalWriter {
     pub fn create(path: &Path) -> Result<Self, DbError> {
         let mut file = File::create_new(path)?;
         write_header(&mut file, 0)?;
-        file.sync_all()?;
+        file.sync_all()
+            .map_err(|e| classify_io(e, "wal create sync"))?;
 
         let offset = WAL_HEADER_SIZE as u64;
         Ok(Self {
@@ -141,9 +142,11 @@ impl WalWriter {
     /// (all pages and the Checkpoint WAL entry are durable) before calling this.
     pub fn rotate_file(path: &Path, start_lsn: u64) -> Result<(), DbError> {
         let mut file = OpenOptions::new().write(true).open(path)?;
-        file.set_len(0)?;
+        file.set_len(0)
+            .map_err(|e| classify_io(e, "wal rotate truncate"))?;
         write_header(&mut file, start_lsn)?;
-        file.sync_all()?;
+        file.sync_all()
+            .map_err(|e| classify_io(e, "wal rotate sync"))?;
         Ok(())
     }
 
@@ -168,7 +171,9 @@ impl WalWriter {
         // Note: BufWriter already batches write() syscalls at 64KB; the
         // per-entry cost is the heap allocation, not the actual I/O.
         let bytes = entry.to_bytes();
-        self.writer.write_all(&bytes)?;
+        self.writer
+            .write_all(&bytes)
+            .map_err(|e| classify_io(e, "wal append"))?;
 
         self.next_lsn += 1;
         self.offset += bytes.len() as u64;
@@ -200,7 +205,9 @@ impl WalWriter {
         scratch.clear();
         entry.serialize_into(scratch);
 
-        self.writer.write_all(scratch)?;
+        self.writer
+            .write_all(scratch)
+            .map_err(|e| classify_io(e, "wal append"))?;
         self.next_lsn += 1;
         self.offset += scratch.len() as u64;
 
@@ -233,7 +240,9 @@ impl WalWriter {
         if batch.is_empty() {
             return Ok(());
         }
-        self.writer.write_all(batch)?;
+        self.writer
+            .write_all(batch)
+            .map_err(|e| classify_io(e, "wal write batch"))?;
         self.offset += batch.len() as u64;
         Ok(())
     }
@@ -243,8 +252,13 @@ impl WalWriter {
     /// Must be called after writing the COMMIT entry of a DML transaction.
     /// If the process dies before `commit()`, entries in the buffer are lost.
     pub fn commit(&mut self) -> Result<(), DbError> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        self.writer
+            .flush()
+            .map_err(|e| classify_io(e, "wal commit flush"))?;
+        self.writer
+            .get_ref()
+            .sync_all()
+            .map_err(|e| classify_io(e, "wal commit fsync"))?;
         Ok(())
     }
 
@@ -294,7 +308,8 @@ fn write_header(file: &mut File, start_lsn: u64) -> Result<(), DbError> {
     header[8..10].copy_from_slice(&WAL_VERSION.to_le_bytes());
     // bytes [10..14]: reserved, already zero
     header[START_LSN_OFFSET..START_LSN_OFFSET + 8].copy_from_slice(&start_lsn.to_le_bytes());
-    file.write_all(&header)?;
+    file.write_all(&header)
+        .map_err(|e| classify_io(e, "wal write header"))?;
     Ok(())
 }
 

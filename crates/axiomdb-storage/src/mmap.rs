@@ -3,7 +3,7 @@ use std::{
     path::Path,
 };
 
-use axiomdb_core::error::DbError;
+use axiomdb_core::error::{classify_io, DbError};
 use fs2::FileExt;
 use libc;
 use memmap2::MmapMut;
@@ -108,7 +108,8 @@ impl MmapStorage {
         info!(path = %path.display(), pages = GROW_PAGES, "creating database");
 
         let initial_size = GROW_PAGES * PAGE_SIZE as u64;
-        file.set_len(initial_size)?;
+        file.set_len(initial_size)
+            .map_err(|e| classify_io(e, "storage create"))?;
 
         // SAFETY: freshly created file with the correct size. No other mappings.
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -200,7 +201,9 @@ impl MmapStorage {
         debug!(old_count, new_count, extra_pages, "growing storage");
         let new_size = new_count * PAGE_SIZE as u64;
 
-        self.file.set_len(new_size)?;
+        self.file
+            .set_len(new_size)
+            .map_err(|e| classify_io(e, "storage grow"))?;
 
         // SAFETY: file extended to `new_size` bytes. No external references to
         // the previous mapping (we hold `&mut self`).
@@ -400,7 +403,8 @@ impl StorageEngine for MmapStorage {
                 .collect();
 
             // Flush only those ranges. On any failure the dirty state is preserved.
-            Self::flush_runs(&byte_runs, |off, len| self.mmap.flush_range(off, len))?;
+            Self::flush_runs(&byte_runs, |off, len| self.mmap.flush_range(off, len))
+                .map_err(|e| classify_io(e, "storage flush"))?;
         }
 
         // All targeted flushes succeeded — clear dirty tracking.

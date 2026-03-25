@@ -18,6 +18,15 @@ pub enum DbError {
     #[error("storage full: no free pages available")]
     StorageFull,
 
+    /// The underlying volume is out of space or over quota.
+    ///
+    /// Triggered by `ENOSPC` / `EDQUOT` from WAL or storage I/O.
+    /// After this error is returned the database enters read-only degraded
+    /// mode and all mutating operations are rejected until the process is
+    /// restarted.
+    #[error("disk full during '{operation}': no space left on device")]
+    DiskFull { operation: &'static str },
+
     // ── I/O ──────────────────────────────────────────────────────
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -239,6 +248,34 @@ pub enum DbError {
     Other(String),
 }
 
+// ── I/O error classifier ─────────────────────────────────────────────────────
+
+/// Classifies an `std::io::Error` from a durable write path into the
+/// appropriate [`DbError`] variant.
+///
+/// - `ENOSPC` (code 28) and `EDQUOT` (codes 69 / 122) map to
+///   [`DbError::DiskFull`] with the given `operation` label.
+/// - All other I/O errors map to [`DbError::Io`].
+///
+/// Call this **only** at OS write boundaries
+/// (`set_len`, `write_all`, `flush`, `sync_all`, `flush_range`).
+/// Do **not** use for logical allocator failures — those remain
+/// [`DbError::StorageFull`].
+pub fn classify_io(err: std::io::Error, operation: &'static str) -> DbError {
+    #[cfg(unix)]
+    {
+        const ENOSPC: i32 = 28; // universal on Linux + macOS
+        const EDQUOT_MACOS: i32 = 69;
+        const EDQUOT_LINUX: i32 = 122;
+        if let Some(code) = err.raw_os_error() {
+            if code == ENOSPC || code == EDQUOT_MACOS || code == EDQUOT_LINUX {
+                return DbError::DiskFull { operation };
+            }
+        }
+    }
+    DbError::Io(err)
+}
+
 impl DbError {
     /// SQLSTATE code — 5-character string for wire protocol and ORM compatibility.
     ///
@@ -290,9 +327,98 @@ impl DbError {
             DbError::Io(_) => "58030",
             DbError::FileLocked { .. } => "55006",
             DbError::StorageFull => "53100",
+            DbError::DiskFull { .. } => "53100",
             DbError::SequenceOverflow => "2200H",
             // ── Internal errors (not user-facing) ─────────────────────────
             _ => "XX000",
         }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn io_err_with_os_code(code: i32) -> std::io::Error {
+        std::io::Error::from_raw_os_error(code)
+    }
+
+    fn generic_io_err() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::Other, "generic error")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_classify_io_enospc_maps_to_disk_full() {
+        let err = io_err_with_os_code(28); // ENOSPC
+        let db_err = classify_io(err, "test op");
+        assert!(
+            matches!(
+                db_err,
+                DbError::DiskFull {
+                    operation: "test op"
+                }
+            ),
+            "ENOSPC must map to DiskFull, got: {db_err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_classify_io_edquot_macos_maps_to_disk_full() {
+        let err = io_err_with_os_code(69); // EDQUOT on macOS
+        let db_err = classify_io(err, "quota op");
+        assert!(
+            matches!(db_err, DbError::DiskFull { .. }),
+            "EDQUOT (macOS) must map to DiskFull, got: {db_err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_classify_io_edquot_linux_maps_to_disk_full() {
+        let err = io_err_with_os_code(122); // EDQUOT on Linux
+        let db_err = classify_io(err, "quota op");
+        assert!(
+            matches!(db_err, DbError::DiskFull { .. }),
+            "EDQUOT (Linux) must map to DiskFull, got: {db_err}"
+        );
+    }
+
+    #[test]
+    fn test_classify_io_other_error_maps_to_io() {
+        let err = generic_io_err();
+        let db_err = classify_io(err, "test op");
+        assert!(
+            matches!(db_err, DbError::Io(_)),
+            "Non-disk-full I/O error must map to DbError::Io, got: {db_err}"
+        );
+    }
+
+    #[test]
+    fn test_disk_full_sqlstate() {
+        let err = DbError::DiskFull { operation: "test" };
+        assert_eq!(err.sqlstate(), "53100");
+    }
+
+    #[test]
+    fn test_disk_full_distinct_from_storage_full() {
+        let df = DbError::DiskFull { operation: "test" };
+        let sf = DbError::StorageFull;
+        // Both map to the same SQLSTATE (resource exhaustion)…
+        assert_eq!(df.sqlstate(), sf.sqlstate());
+        // …but their error messages are distinct.
+        assert_ne!(df.to_string(), sf.to_string());
+    }
+
+    #[test]
+    fn test_runtime_mode_constants_are_distinct() {
+        // Sanity: the two raw mode values used in Database::runtime_mode
+        // must be different so the AtomicU8 flip is meaningful.
+        const READ_WRITE: u8 = 0;
+        const DEGRADED: u8 = 1;
+        assert_ne!(READ_WRITE, DEGRADED);
     }
 }

@@ -71,6 +71,10 @@ mod db {
         bloom: BloomRegistry,
         schema_cache: SchemaCache,
         session: SessionContext,
+        /// Set to `true` after the first `DiskFull` error. When degraded,
+        /// all mutating operations are rejected immediately without touching
+        /// WAL or storage again.
+        degraded: bool,
     }
 
     impl Db {
@@ -107,6 +111,7 @@ mod db {
                 bloom: BloomRegistry::new(),
                 schema_cache: SchemaCache::new(),
                 session: SessionContext::default(),
+                degraded: false,
             })
         }
 
@@ -149,19 +154,30 @@ mod db {
         ///
         /// Useful when you need column metadata, last_insert_id, etc.
         pub fn run(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+            if self.degraded && sql_may_mutate(sql) {
+                return Err(DbError::DiskFull {
+                    operation: "database is in read-only degraded mode",
+                });
+            }
             let stmt = parse(sql, None)?;
             let snap = self
                 .txn
                 .active_snapshot()
                 .unwrap_or_else(|_| self.txn.snapshot());
             let analyzed = analyze_cached(stmt, &self.storage, snap, &mut self.schema_cache)?;
-            execute_with_ctx(
+            let result = execute_with_ctx(
                 analyzed,
                 &mut self.storage,
                 &mut self.txn,
                 &mut self.bloom,
                 &mut self.session,
-            )
+            );
+            if let Err(ref e) = result {
+                if matches!(e, DbError::DiskFull { .. }) {
+                    self.degraded = true;
+                }
+            }
+            result
         }
 
         /// Opens an explicit transaction. All subsequent `execute()`/`query()`
@@ -182,6 +198,28 @@ mod db {
             self.run("ROLLBACK")?;
             Ok(())
         }
+    }
+
+    /// Returns `true` if the SQL string looks like it may mutate durable state.
+    ///
+    /// Conservative keyword check — used to gate statements in degraded mode
+    /// before they reach WAL/storage. False positives are acceptable (blocking
+    /// a read); false negatives are not (allowing a write).
+    fn sql_may_mutate(sql: &str) -> bool {
+        let lower = sql.trim_start().to_ascii_lowercase();
+        lower.starts_with("insert")
+            || lower.starts_with("update")
+            || lower.starts_with("delete")
+            || lower.starts_with("truncate")
+            || lower.starts_with("create")
+            || lower.starts_with("drop")
+            || lower.starts_with("alter")
+            || lower.starts_with("begin")
+            || lower.starts_with("start transaction")
+            || lower.starts_with("commit")
+            || lower.starts_with("rollback")
+            || lower.starts_with("savepoint")
+            || lower.starts_with("release")
     }
 }
 

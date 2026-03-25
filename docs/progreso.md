@@ -52,7 +52,7 @@
 - [x] 3.5a ✅ Autocommit mode (`SET autocommit=0`) — implemented in `SessionContext` + executor + wire sync; covered by `spec-3.5abc-autocommit-txn-semantics.md`
 - [x] 3.5b ✅ Implicit transaction start (MySQL ORM compat) — implemented in executor semantics; covered by `spec-3.5abc-autocommit-txn-semantics.md`
 - [x] 3.5c ✅ Error semantics mid-transaction (statement vs txn rollback) — implemented with savepoint-based rollback in executor; covered by `spec-3.5abc-autocommit-txn-semantics.md`
-- [ ] ⚠️ 3.6b ENOSPC handling — read-only degraded mode on disk full
+- [x] ✅ 3.6b ENOSPC handling — read-only degraded mode on disk full
 - [ ] ⚠️ 3.8b Verified open — detect page checksum corruption on startup before serving traffic
 - [ ] ⚠️ 3.8c Full committed-page redo after power loss — broader WAL page-image coverage still missing
 - [x] ✅ 3.15b Per-page flush_range optimization — targeted durable flush of dirty mmap ranges
