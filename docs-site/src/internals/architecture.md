@@ -27,7 +27,7 @@ prevents circular dependencies and makes each component independently testable.
 │      ├── auth.rs     (mysql_native_password SHA1 + caching_sha2_password)│
 │      ├── charset.rs  (charset/collation registry, encode_text/decode_text)│
 │      ├── session.rs  (ConnectionState — typed charset fields,       │
-│      │               SET NAMES, per-connection collation)           │
+│      │               prepared stmt cache, pending long data)        │
 │      ├── handler.rs  (handle_connection — async task per TCP conn)  │
 │      ├── result.rs   (QueryResult → result-set packets, charset-aware)│
 │      ├── error.rs    (DbError → MySQL error code + SQLSTATE)        │
@@ -245,8 +245,9 @@ Client → HandshakeResponse41
   ├── COM_INIT_DB (0x02)      → updates current_database in ConnectionState + OK
   ├── COM_RESET_CONNECTION (0x1f) → resets ConnectionState + OK
   ├── COM_STMT_PREPARE (0x16) → parse SQL with ? placeholders → stmt_ok packet
-  ├── COM_STMT_EXECUTE (0x17) → decode binary params → substitute → execute → result packets
-  ├── COM_STMT_RESET (0x1a)   → OK
+  ├── COM_STMT_SEND_LONG_DATA (0x18) → append raw bytes to stmt-local buffers, no reply
+  ├── COM_STMT_EXECUTE (0x17) → merge long data + decode params → substitute → execute → result packets
+  ├── COM_STMT_RESET (0x1a)   → clear stmt-local long-data state → OK
   ├── COM_STMT_CLOSE (0x19)   → remove from cache, no response
   └── COM_QUIT  (0x01)        → close
 ```
@@ -270,6 +271,13 @@ Server → Statement OK packet
   │       num_params:  u16  (number of ? placeholders)
   │       followed by num_params parameter-definition packets + EOF
   │       followed by num_columns column-definition packets + EOF
+  │
+Client → COM_STMT_SEND_LONG_DATA (optional, repeatable)
+  │       stmt_id: u32
+  │       param_id: u16
+  │       raw chunk bytes
+  │
+Server appends raw bytes to stmt-local state, sends no response.
   │
 Client → COM_STMT_EXECUTE
   │       stmt_id: u32
@@ -299,10 +307,36 @@ Each parameter is decoded according to its MySQL type byte:
 | `0x05` | DOUBLE | `f64` → `Value::Real` |
 | `0x0a` | DATE | 4-byte packed date → `Value::Date` |
 | `0x07` / `0x0c` | TIMESTAMP / DATETIME | 7-byte packed datetime → `Value::Timestamp` |
-| `0xfd` / `0xfe` / `0xfc` | VAR_STRING / STRING / BLOB | lenenc bytes → `Value::Text` |
+| `0xfd` / `0xfe` / `0x0f` | VAR_STRING / STRING / VARCHAR | lenenc bytes → `Value::Text` |
+| `0xf9` / `0xfa` / `0xfb` / `0xfc` | TINY_BLOB / MEDIUM_BLOB / LONG_BLOB / BLOB | lenenc bytes → `Value::Bytes` |
 
 NULL parameters are identified by the null-bitmap before the type list is read;
 they produce `Value::Null` without consuming any bytes from the value region.
+
+**Long-data buffering (`COM_STMT_SEND_LONG_DATA`):**
+
+`PreparedStatement` owns stmt-local pending buffers:
+
+```rust
+pub struct PreparedStatement {
+    // ...
+    pub pending_long_data: Vec<Option<Vec<u8>>>,
+    pub pending_long_data_error: Option<String>,
+}
+```
+
+Rules:
+
+- chunks are appended as raw bytes in `handler.rs`
+- `COM_STMT_SEND_LONG_DATA` never takes the `Database` mutex
+- the next `COM_STMT_EXECUTE` consumes pending long data before inline values
+- long data wins over both the inline execute payload and the null bitmap
+- state is cleared immediately after every execute attempt
+- `COM_STMT_RESET` clears only this long-data state, not the cached plan
+
+AxiomDB follows MariaDB's `COM_STMT_SEND_LONG_DATA` model here: accumulate raw
+bytes per placeholder and decode them only at execute time. That keeps chunked
+multibyte text correct without dragging the command through the engine path.
 
 **Parameter substitution — AST-level plan cache (`substitute_params_in_ast`):**
 
@@ -402,6 +436,8 @@ pub struct PreparedStatement {
     pub analyzed_stmt: Option<Stmt>,  // cached parse+analyze result (plan cache)
     pub compiled_at_version: u64,
     pub last_used_seq: u64,
+    pub pending_long_data: Vec<Option<Vec<u8>>>,
+    pub pending_long_data_error: Option<String>,
 }
 ```
 
@@ -415,7 +451,8 @@ Each connection maintains its own `HashMap<u32, PreparedStatement>`. Statement I
 assigned by incrementing `next_stmt_id` (starting at 1) and are local to the connection
 — the same ID on two connections refers to two different statements. `COM_STMT_CLOSE`
 removes the entry; subsequent `COM_STMT_EXECUTE` calls for the closed ID return an
-`Unknown prepared statement` error.
+`Unknown prepared statement` error. `COM_STMT_RESET` leaves the entry in place and
+clears only the stmt-local long-data buffers plus any deferred long-data error.
 
 #### Packet framing and size enforcement (codec.rs — subphase 5.4a)
 

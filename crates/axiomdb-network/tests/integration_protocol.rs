@@ -449,3 +449,84 @@ fn test_execute_packet_mysql_type_string_limit_param() {
     assert_eq!(exec.params.len(), 1);
     assert_eq!(exec.params[0], Value::Text("2".into()));
 }
+
+// ── 5.11b — COM_STMT_SEND_LONG_DATA packet semantics ────────────────────────
+
+#[test]
+fn test_prepare_statement_initializes_long_data_state() {
+    use axiomdb_network::mysql::session::ConnectionState;
+
+    let mut s = ConnectionState::new();
+    let (stmt_id, param_count) = s.prepare_statement("INSERT INTO t VALUES (?, ?, ?)".into(), 7);
+
+    assert_eq!(param_count, 3);
+    let stmt = s.prepared_statements.get(&stmt_id).unwrap();
+    assert_eq!(stmt.pending_long_data.len(), 3);
+    assert!(stmt.pending_long_data.iter().all(|slot| slot.is_none()));
+    assert!(stmt.pending_long_data_error.is_none());
+}
+
+#[test]
+fn test_execute_packet_long_data_text_wins_over_null_and_inline() {
+    use axiomdb_network::mysql::{
+        charset::UTF8MB4_CHARSET, prepared::parse_execute_packet, session::PreparedStatement,
+    };
+
+    let mut stmt = PreparedStatement {
+        stmt_id: 1,
+        sql_template: "INSERT INTO t VALUES (?)".into(),
+        param_count: 1,
+        param_types: vec![0xfd], // MYSQL_TYPE_VAR_STRING
+        analyzed_stmt: None,
+        compiled_at_version: 0,
+        last_used_seq: 0,
+        pending_long_data: vec![Some("mañana".as_bytes().to_vec())],
+        pending_long_data_error: None,
+    };
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u32.to_le_bytes()); // stmt_id
+    payload.push(0); // flags
+    payload.extend_from_slice(&1u32.to_le_bytes()); // iteration_count
+    payload.push(0x01); // null bitmap: param 0 marked NULL
+    payload.push(1); // new_params_bound_flag
+    payload.push(0xfd); // MYSQL_TYPE_VAR_STRING
+    payload.push(0x00); // unsigned flag
+    payload.push(7); // inline lenenc string length
+    payload.extend_from_slice(b"ignored");
+
+    let exec = parse_execute_packet(&payload, &mut stmt, &UTF8MB4_CHARSET).unwrap();
+    assert_eq!(exec.params, vec![Value::Text("mañana".into())]);
+}
+
+#[test]
+fn test_execute_packet_long_data_blob_decodes_as_bytes() {
+    use axiomdb_network::mysql::{
+        charset::UTF8MB4_CHARSET, prepared::parse_execute_packet, session::PreparedStatement,
+    };
+
+    let raw = b"\x00\xff\x00\x42".to_vec();
+    let mut stmt = PreparedStatement {
+        stmt_id: 1,
+        sql_template: "INSERT INTO t VALUES (?)".into(),
+        param_count: 1,
+        param_types: vec![0xfc], // MYSQL_TYPE_BLOB
+        analyzed_stmt: None,
+        compiled_at_version: 0,
+        last_used_seq: 0,
+        pending_long_data: vec![Some(raw.clone())],
+        pending_long_data_error: None,
+    };
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u32.to_le_bytes()); // stmt_id
+    payload.push(0); // flags
+    payload.extend_from_slice(&1u32.to_le_bytes()); // iteration_count
+    payload.push(0x00); // null bitmap
+    payload.push(1); // new_params_bound_flag
+    payload.push(0xfc); // MYSQL_TYPE_BLOB
+    payload.push(0x00); // unsigned flag
+
+    let exec = parse_execute_packet(&payload, &mut stmt, &UTF8MB4_CHARSET).unwrap();
+    assert_eq!(exec.params, vec![Value::Bytes(raw)]);
+}
