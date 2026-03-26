@@ -53,9 +53,6 @@ impl Db {
         self.run(sql)
             .unwrap_or_else(|e| panic!("SQL failed: {sql}\nError: {e}"))
     }
-    fn err(&mut self, sql: &str) -> DbError {
-        self.run(sql).expect_err(&format!("expected error: {sql}"))
-    }
     fn rows(&mut self, sql: &str) -> Vec<Vec<Value>> {
         match self.ok(sql) {
             QueryResult::Rows { rows, .. } => rows,

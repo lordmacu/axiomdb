@@ -1,55 +1,52 @@
-# Phase 5 — MySQL Wire Protocol
+# Phase 5 — MySQL Wire Protocol + executor/runtime cleanup
 
-## Subfases completed in this session: 5.11b
+## Subfases completed in this session: 5.19a
 
 ## What was built
 
-### 5.11b — COM_STMT_SEND_LONG_DATA
+### 5.19a — Executor decomposition
 
-AxiomDB now closes the MySQL prepared-statement large-parameter path end to end.
+AxiomDB's SQL executor is no longer a single giant source file. The old
+`crates/axiomdb-sql/src/executor.rs` monolith was replaced by a directory module
+under `crates/axiomdb-sql/src/executor/` with a stable facade in `mod.rs`.
 
-Supported behavior:
+What changed:
 
-- `COM_STMT_SEND_LONG_DATA (0x18)` appends raw bytes per `stmt_id` + `param_id`
-- long-data buffers live inside `PreparedStatement`, not in the engine
-- chunks are stored as raw bytes and decoded only at `COM_STMT_EXECUTE`
-- long data takes precedence over both the inline execute payload and the null bitmap
-- `COM_STMT_RESET` clears only stmt-local long-data state and deferred errors
-- `COM_STMT_CLOSE` drops the statement and therefore its long-data state too
-- `SHOW STATUS LIKE 'Com_stmt_send_long_data'` exposes chunk counts in session/global scope
+- `mod.rs` keeps the public entrypoints stable:
+  - `execute(...)`
+  - `execute_with_ctx(...)`
+  - `last_insert_id_value()`
+- Statement logic is now split by responsibility:
+  - `shared.rs`
+  - `select.rs`
+  - `joins.rs`
+  - `aggregate.rs`
+  - `insert.rs`
+  - `update.rs`
+  - `delete.rs`
+  - `bulk_empty.rs`
+  - `ddl.rs`
+- Existing callers in `lib.rs`, `eval.rs`, and integration tests keep the same import paths.
+- This subphase is structural only: it changes source layout, not SQL semantics.
 
-Implementation highlights:
+Why this matters:
 
-- `axiomdb-network/src/mysql/handler.rs`
-  - handles `0x18` with no response and no `Database` mutex
-  - `0x1a` now resets stmt-local long-data state for the addressed statement
-- `axiomdb-network/src/mysql/session.rs`
-  - `PreparedStatement.pending_long_data: Vec<Option<Vec<u8>>>`
-  - `PreparedStatement.pending_long_data_error: Option<String>`
-  - `append_long_data(...)` and `clear_long_data_state()`
-- `axiomdb-network/src/mysql/prepared.rs`
-  - `parse_execute_packet()` merges long-data buffers before inline decoding
-  - text-like long data decodes with the negotiated client charset
-  - binary-like long data becomes `Value::Bytes`
-- `axiomdb-network/src/mysql/status.rs`
-  - adds `Com_stmt_send_long_data` to global + session status snapshots
+- later DML work such as `5.19` no longer has to edit a 7K-line file
+- SELECT, GROUP BY, JOIN, DDL, and DML paths can evolve independently
+- executor-local helpers are now easier to find and reason about without widening public API
 
-## Tests
+## Validation
 
-- Unit tests:
-  - `crates/axiomdb-network/src/mysql/prepared.rs` — chunk accumulation, empty long data, precedence, binary preservation, deferred overflow, clear-after-execute
-- Protocol tests:
-  - `crates/axiomdb-network/tests/integration_protocol.rs` — prepared-state initialization plus public packet decode tests for long-text precedence and binary decode
-- Wire smoke test:
-  - `tools/wire-test.py` now covers:
-    - multibyte text split across long-data chunks
-    - `COM_STMT_RESET`
-    - binary `BLOB` params with `0x00`
-    - deferred `max_allowed_packet` overflow on execute
-    - session/global `Com_stmt_send_long_data`
+- `cargo test -p axiomdb-sql`
+- `cargo clippy -p axiomdb-sql --lib -- -D warnings`
+- `cargo clippy -p axiomdb-sql --tests -- -D warnings`
+- `cargo fmt --check`
+- `cargo test --workspace`
+- `cargo clippy --workspace -- -D warnings`
+- `python3 tools/wire-test.py` → `204/204 passed`
 
 ## Follow-up subfases still open in Phase 5
 
 - `5.11c` — explicit connection state machine
 - `5.15` — DSN parsing
-- `5.17` — in-place B+Tree write-path expansion
+- `5.19` — B+tree batch delete

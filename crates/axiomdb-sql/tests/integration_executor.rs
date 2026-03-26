@@ -34,7 +34,7 @@ fn run_result(
 /// Creates a fresh `MemoryStorage` + `TxnManager` with catalog initialized.
 fn setup() -> (MemoryStorage, TxnManager) {
     let dir = tempfile::tempdir().unwrap();
-    let wal_path = dir.into_path().join("test.wal");
+    let wal_path = dir.keep().join("test.wal");
     let mut storage = MemoryStorage::new();
     CatalogBootstrap::init(&mut storage).unwrap();
     let txn = TxnManager::create(&wal_path).unwrap();
@@ -3319,9 +3319,7 @@ fn test_full_sql_suite_roundtrip() {
 
 // ── Phase 4.25c: strict mode + warnings ──────────────────────────────────────
 
-use axiomdb_sql::{
-    bloom::BloomRegistry, execute_with_ctx, session::SessionContext, SessionContext as SC,
-};
+use axiomdb_sql::{bloom::BloomRegistry, execute_with_ctx, SessionContext};
 
 fn run_ctx(
     sql: &str,
@@ -3338,7 +3336,7 @@ fn run_ctx(
 
 fn setup_ctx() -> (MemoryStorage, TxnManager, BloomRegistry, SessionContext) {
     let dir = tempfile::tempdir().unwrap();
-    let wal_path = dir.into_path().join("test.wal");
+    let wal_path = dir.keep().join("test.wal");
     let mut storage = MemoryStorage::new();
     CatalogBootstrap::init(&mut storage).unwrap();
     let txn = TxnManager::create(&wal_path).unwrap();

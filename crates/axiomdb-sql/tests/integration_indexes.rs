@@ -37,7 +37,7 @@ fn run_result(
 
 fn setup() -> (MemoryStorage, TxnManager) {
     let dir = tempfile::tempdir().unwrap();
-    let wal_path = dir.into_path().join("test.wal");
+    let wal_path = dir.keep().join("test.wal");
     let mut storage = MemoryStorage::new();
     CatalogBootstrap::init(&mut storage).unwrap();
     let txn = TxnManager::create(&wal_path).unwrap();
@@ -48,13 +48,6 @@ fn rows(result: QueryResult) -> Vec<Vec<Value>> {
     match result {
         QueryResult::Rows { rows, .. } => rows,
         other => panic!("expected Rows, got {other:?}"),
-    }
-}
-
-fn affected(result: QueryResult) -> u64 {
-    match result {
-        QueryResult::Affected { count, .. } => count,
-        other => panic!("expected Affected, got {other:?}"),
     }
 }
 
