@@ -601,7 +601,11 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 let client_charset = conn_state.client_charset();
 
                 let result = if let Some(stmt) = conn_state.prepared_statements.get_mut(&stmt_id) {
-                    match parse_execute_packet(body, stmt, client_charset) {
+                    // Parse the execute packet and immediately clear long-data state
+                    // regardless of parse success or failure (long data is single-use).
+                    let parse_result = parse_execute_packet(body, stmt, client_charset);
+                    stmt.clear_long_data_state();
+                    match parse_result {
                         Ok(exec) => {
                             // ── Plan cache version check (Phase 5.13) ─────────────
                             // If the schema changed since this plan was compiled, re-analyze
@@ -742,6 +746,32 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 // RunningGuard dropped here.
             }
 
+            // COM_STMT_SEND_LONG_DATA — no response, no engine lock
+            // Payload: [stmt_id:4][param_id:2][chunk_bytes...]
+            0x18 => {
+                conn_state.session_status.com_stmt_send_long_data += 1;
+                status
+                    .com_stmt_send_long_data
+                    .fetch_add(1, Ordering::Relaxed);
+
+                if body.len() < 6 {
+                    // Malformed: ignore silently per MySQL wire contract
+                    continue;
+                }
+                let stmt_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let param_idx = u16::from_le_bytes([body[4], body[5]]) as usize;
+                let chunk = &body[6..];
+                let limit = conn_state
+                    .max_allowed_packet_bytes()
+                    .unwrap_or(ConnectionState::DEFAULT_MAX_ALLOWED_PACKET);
+
+                if let Some(stmt) = conn_state.prepared_statements.get_mut(&stmt_id) {
+                    stmt.append_long_data(param_idx, chunk, limit);
+                }
+                // Unknown stmt_id: ignore silently (no response either way)
+                continue; // never send an OK packet for this command
+            }
+
             // COM_STMT_CLOSE — no response
             0x19 => {
                 if body.len() >= 4 {
@@ -752,10 +782,26 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 // No response for COM_STMT_CLOSE
             }
 
-            // COM_STMT_RESET
+            // COM_STMT_RESET — clears pending long-data for the addressed statement
             0x1a => {
-                let ok = build_ok_packet(0, 0, 0);
-                let _ = writer.send((1u8, ok.as_slice())).await;
+                if body.len() < 4 {
+                    let err = build_err_packet(1105, b"HY000", "Malformed COM_STMT_RESET");
+                    let _ = writer.send((1u8, err.as_slice())).await;
+                    continue;
+                }
+                let stmt_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                if let Some(stmt) = conn_state.prepared_statements.get_mut(&stmt_id) {
+                    stmt.clear_long_data_state();
+                    let ok = build_ok_packet(0, 0, 0);
+                    let _ = writer.send((1u8, ok.as_slice())).await;
+                } else {
+                    let err = build_err_packet(
+                        1243,
+                        b"HY000",
+                        &format!("Unknown prepared statement handler: stmt_id={stmt_id}"),
+                    );
+                    let _ = writer.send((1u8, err.as_slice())).await;
+                }
             }
 
             other => {
@@ -1032,6 +1078,9 @@ fn show_variables_result(lower: &str, conn_state: &ConnectionState) -> Vec<(u8, 
     let strict_mode_val = conn_state
         .get_variable("strict_mode")
         .unwrap_or_else(|| "ON".into());
+    let on_error_val = conn_state
+        .get_variable("on_error")
+        .unwrap_or_else(|| "rollback_statement".into());
     let all_vars: Vec<(&str, String)> = vec![
         (
             "character_set_client",
@@ -1054,6 +1103,7 @@ fn show_variables_result(lower: &str, conn_state: &ConnectionState) -> Vec<(u8, 
         ),
         ("collation_database", "utf8mb4_0900_ai_ci".into()),
         ("collation_server", "utf8mb4_0900_ai_ci".into()),
+        ("on_error", on_error_val),
         ("sql_mode", sql_mode_val),
         ("strict_mode", strict_mode_val),
     ];
@@ -1216,4 +1266,26 @@ fn bump_bytes_sent(
 /// Total wire size of a packet batch (payload + 4-byte MySQL header per packet).
 fn wire_size(packets: &[(u8, Vec<u8>)]) -> u64 {
     packets.iter().map(|(_, p)| p.len() as u64 + 4).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{show_variables_result, ConnectionState};
+
+    #[test]
+    fn test_show_variables_includes_on_error() {
+        let conn = ConnectionState::new();
+        let packets = show_variables_result("show variables like 'on_error'", &conn);
+        let payloads: Vec<u8> = packets.into_iter().flat_map(|(_, p)| p).collect();
+        assert!(
+            payloads.windows("on_error".len()).any(|w| w == b"on_error"),
+            "SHOW VARIABLES LIKE 'on_error' must include the variable name"
+        );
+        assert!(
+            payloads
+                .windows("rollback_statement".len())
+                .any(|w| w == b"rollback_statement"),
+            "SHOW VARIABLES LIKE 'on_error' must expose the live default value"
+        );
+    }
 }

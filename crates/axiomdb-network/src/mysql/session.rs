@@ -51,6 +51,60 @@ pub struct PreparedStatement {
     /// on every `COM_STMT_EXECUTE`. The statement with the lowest value is
     /// evicted when the per-connection cache reaches its limit.
     pub last_used_seq: u64,
+    /// Pending long-data buffers for `COM_STMT_SEND_LONG_DATA` (Phase 5.11b).
+    ///
+    /// `None` = no long data provided for this parameter.
+    /// `Some(vec![])` = explicit empty long data (distinct from "no long data").
+    ///
+    /// Indexed by parameter position. Cleared after every `COM_STMT_EXECUTE`
+    /// attempt (success or failure). Bounds: one entry per `param_count`.
+    pub pending_long_data: Vec<Option<Vec<u8>>>,
+    /// Deferred error recorded by `COM_STMT_SEND_LONG_DATA` when a chunk
+    /// overflows `max_allowed_packet` or targets an out-of-range parameter.
+    /// Returned as ERR on the next `COM_STMT_EXECUTE` then cleared.
+    pub pending_long_data_error: Option<String>,
+}
+
+impl PreparedStatement {
+    /// Appends `chunk` to the pending long-data buffer for `param_idx`.
+    ///
+    /// If the accumulated size would exceed `max_len`, stores a deferred error
+    /// instead of appending (the command still sends no response — the error is
+    /// surfaced on the next `COM_STMT_EXECUTE`).
+    ///
+    /// Out-of-range `param_idx` also stores a deferred error.
+    pub fn append_long_data(&mut self, param_idx: usize, chunk: &[u8], max_len: usize) {
+        if param_idx >= self.pending_long_data.len() {
+            self.pending_long_data_error = Some(format!(
+                "COM_STMT_SEND_LONG_DATA: parameter index {param_idx} out of range \
+                 (statement has {} parameters)",
+                self.param_count
+            ));
+            return;
+        }
+        let entry = &mut self.pending_long_data[param_idx];
+        let current_len = entry.as_deref().map_or(0, |v| v.len());
+        if current_len + chunk.len() > max_len {
+            self.pending_long_data_error = Some(format!(
+                "COM_STMT_SEND_LONG_DATA: accumulated value for parameter {param_idx} \
+                 exceeds max_allowed_packet ({max_len} bytes)"
+            ));
+            return;
+        }
+        match entry {
+            Some(buf) => buf.extend_from_slice(chunk),
+            None => *entry = Some(chunk.to_vec()),
+        }
+    }
+
+    /// Clears all pending long-data buffers and the deferred error.
+    ///
+    /// Called immediately after every `COM_STMT_EXECUTE` attempt, regardless
+    /// of whether parsing or execution succeeded.
+    pub fn clear_long_data_state(&mut self) {
+        self.pending_long_data.fill(None);
+        self.pending_long_data_error = None;
+    }
 }
 
 /// Counts unquoted `?` placeholders in a SQL string.
@@ -511,6 +565,8 @@ impl ConnectionState {
                 analyzed_stmt: None, // populated by handler after parse+analyze
                 compiled_at_version: schema_version,
                 last_used_seq: 0,
+                pending_long_data: vec![None; param_count as usize],
+                pending_long_data_error: None,
             },
         );
         (stmt_id, param_count)

@@ -369,6 +369,38 @@ fn test_session_transaction_isolation() {
     );
 }
 
+#[test]
+fn test_session_default_on_error_variable() {
+    let s = ConnectionState::new();
+    assert_eq!(
+        s.get_variable("@@on_error"),
+        Some("rollback_statement".into())
+    );
+    assert_eq!(
+        s.get_variable("@@session.on_error"),
+        Some("rollback_statement".into())
+    );
+}
+
+#[test]
+fn test_session_set_on_error_updates_visible_variable() {
+    let mut s = ConnectionState::new();
+    s.apply_set("SET on_error = savepoint").unwrap();
+    assert_eq!(s.get_variable("on_error"), Some("savepoint".into()));
+    assert_eq!(s.get_variable("@@on_error"), Some("savepoint".into()));
+}
+
+#[test]
+fn test_session_invalid_on_error_preserves_previous_value() {
+    let mut s = ConnectionState::new();
+    s.apply_set("SET on_error = rollback_transaction").unwrap();
+    assert!(s.apply_set("SET on_error = banana").is_err());
+    assert_eq!(
+        s.get_variable("@@on_error"),
+        Some("rollback_transaction".into())
+    );
+}
+
 // ── 4.10d — COM_STMT_EXECUTE packet decoding for LIMIT/OFFSET params ─────────
 
 #[test]
@@ -389,6 +421,8 @@ fn test_execute_packet_mysql_type_string_limit_param() {
         analyzed_stmt: None,
         compiled_at_version: 0,
         last_used_seq: 0,
+        pending_long_data: vec![None; 1],
+        pending_long_data_error: None,
     };
 
     // Minimal COM_STMT_EXECUTE payload layout:

@@ -764,7 +764,8 @@ COMMIT;
 **`ignore`** — Ignorable SQL errors (parse errors, semantic errors, constraint
 violations, type mismatches) are converted to session warnings and the statement
 is reported as success. Non-ignorable errors (I/O failures, WAL errors, storage
-corruption) still return ERR.
+corruption) still return ERR; if one happens inside an active transaction,
+AxiomDB eagerly rolls that transaction back before returning the error.
 
 ```sql
 SET on_error = 'ignore';
@@ -1125,4 +1126,69 @@ Fails if any existing `user_id` value has no matching row in `users`.
 -- Not yet supported:
 ALTER TABLE users ADD CONSTRAINT pk_users PRIMARY KEY (id);
 -- → NotImplemented: ADD CONSTRAINT PRIMARY KEY — requires full table rewrite
+```
+
+---
+
+## Prepared Statements — Binary Protocol
+
+AxiomDB supports the full MySQL binary prepared statement protocol, including
+large parameter transmission via `COM_STMT_SEND_LONG_DATA`.
+
+### Large parameters (BLOB / TEXT)
+
+When a parameter value is too large to send in a single `COM_STMT_EXECUTE`
+packet, client libraries split it into multiple `COM_STMT_SEND_LONG_DATA`
+chunks before execute. AxiomDB buffers all chunks and assembles the final value
+at execute time.
+
+**Python (PyMySQL):**
+
+```python
+import pymysql, os
+
+conn = pymysql.connect(host="127.0.0.1", port=3306, user="root", db="test")
+cur = conn.cursor()
+cur.execute("CREATE TABLE IF NOT EXISTS files (id INT, data LONGBLOB)")
+
+# PyMySQL automatically uses COM_STMT_SEND_LONG_DATA for values > 8 KB
+large_blob = os.urandom(64 * 1024)   # 64 KB binary data
+cur.execute("INSERT INTO files VALUES (%s, %s)", (1, large_blob))
+conn.commit()
+```
+
+**Binary parameters** (`BLOB`, `LONGBLOB`, `MEDIUMBLOB`, `TINYBLOB`) are stored
+as raw bytes — `0x00` bytes and non-UTF-8 sequences are preserved exactly.
+
+**Text parameters** (`VARCHAR`, `TEXT`, `LONGTEXT`) are decoded with the
+connection's `character_set_client` after all chunks are assembled, so multibyte
+characters split across chunk boundaries are reconstructed correctly.
+
+### Parameter type mapping
+
+| MySQL type | AxiomDB type | Notes |
+|---|---|---|
+| `MYSQL_TYPE_STRING` / `VAR_STRING` / `VARCHAR` | `TEXT` | UTF-8 decoded |
+| `MYSQL_TYPE_BLOB` / `TINY_BLOB` / `MEDIUM_BLOB` / `LONG_BLOB` | `BYTES` | Raw bytes, no charset |
+| `MYSQL_TYPE_LONG` / `LONGLONG` | `INT` / `BIGINT` | |
+| `MYSQL_TYPE_FLOAT` / `DOUBLE` | `REAL` | |
+| `MYSQL_TYPE_DATE` | `DATE` | |
+| `MYSQL_TYPE_DATETIME` | `TIMESTAMP` | |
+
+### COM_STMT_RESET
+
+Calling `mysql_stmt_reset()` (or the equivalent in any MySQL driver) clears any
+pending long-data buffers for that statement without deallocating the prepared
+statement itself. The statement can then be re-executed with fresh parameters.
+
+### SHOW STATUS counter
+
+`SHOW STATUS LIKE 'Com_stmt_send_long_data'` reports how many long-data chunks
+have been received by the current session (session scope) or by the server since
+startup (global scope).
+
+```sql
+SHOW STATUS LIKE 'Com_stmt_send_long_data';
+-- Variable_name                | Value
+-- Com_stmt_send_long_data      | 3
 ```

@@ -168,9 +168,24 @@ pub fn parse_execute_packet(
         pos += n * 2;
     }
 
-    // Decode values
+    // Deferred long-data error from COM_STMT_SEND_LONG_DATA?
+    if let Some(ref reason) = stmt.pending_long_data_error.clone() {
+        return Err(DbError::InvalidValue {
+            reason: reason.clone(),
+        });
+    }
+
+    // Decode values — long-data params take precedence over null bitmap and
+    // inline payload (matches MariaDB has_long_data_value() semantics).
     let mut params = Vec::with_capacity(n);
     for i in 0..n {
+        // Long-data takes highest precedence.
+        if let Some(raw) = stmt.pending_long_data.get(i).and_then(|o| o.as_deref()) {
+            let type_code = stmt.param_types.get(i).copied().unwrap_or(0xfd);
+            params.push(decode_long_data_value(raw, type_code, client_charset)?);
+            continue;
+        }
+
         if is_null(&null_bitmap, i) {
             params.push(Value::Null);
             continue;
@@ -323,10 +338,16 @@ fn decode_binary_value(
             let (s, consumed) = read_lenenc_str(buf, client_charset)?;
             Ok((Value::Text(s), consumed))
         }
-        // All string/blob types: lenenc-prefixed bytes decoded with client charset
-        0x0f | 0xfc | 0xfd | 0xfe | 0xf5 | 0x10 | 0xf3 | 0xf4 => {
+        // Text-like: lenenc bytes decoded with client charset → Value::Text
+        0x0f | 0xfd | 0xfe | 0xf5 | 0x10 | 0xf3 | 0xf4 => {
             let (s, consumed) = read_lenenc_str(buf, client_charset)?;
             Ok((Value::Text(s), consumed))
+        }
+        // Binary-like (TINY_BLOB / MEDIUM_BLOB / LONG_BLOB / BLOB):
+        // raw bytes, no charset decoding — preserves 0x00 bytes intact.
+        0xf9 | 0xfa | 0xfb | 0xfc => {
+            let (bytes, consumed) = read_lenenc_bytes(buf)?;
+            Ok((Value::Bytes(bytes), consumed))
         }
         _ => {
             // Unknown type — read as lenenc string with client charset
@@ -384,6 +405,55 @@ fn read_lenenc_str(
     let s =
         charset::decode_text(client_charset, &buf[llen..llen + len]).map(|cow| cow.into_owned())?;
     Ok((s, llen + len))
+}
+
+/// Reads a lenenc-prefixed byte string without charset decoding.
+///
+/// Used for `MYSQL_TYPE_BLOB` family inline parameters and for long-data
+/// binary params — raw bytes including `0x00` must be preserved intact.
+fn read_lenenc_bytes(buf: &[u8]) -> Result<(Vec<u8>, usize), DbError> {
+    let (len, llen) = read_lenenc_int(buf).map_err(|msg| DbError::ParseError {
+        message: format!("lenenc bytes: {msg}"),
+        position: None,
+    })?;
+    let len = len as usize;
+    if buf.len() < llen + len {
+        return Err(DbError::ParseError {
+            message: "lenenc bytes data truncated in COM_STMT_EXECUTE".into(),
+            position: None,
+        });
+    }
+    Ok((buf[llen..llen + len].to_vec(), llen + len))
+}
+
+/// Decodes an assembled long-data buffer into a `Value`.
+///
+/// Text-like types are decoded with the negotiated client charset — this is
+/// the single decode point so multibyte characters split across chunks are
+/// reassembled correctly.
+///
+/// Binary-like types become `Value::Bytes` with no charset conversion.
+pub fn decode_long_data_value(
+    raw: &[u8],
+    type_code: u16,
+    client_charset: &'static CharsetDef,
+) -> Result<Value, DbError> {
+    let type_base = (type_code & 0x00FF) as u8;
+    match type_base {
+        // Text-like: VARCHAR, VAR_STRING, STRING
+        0x0f | 0xfd | 0xfe => {
+            let s = charset::decode_text(client_charset, raw).map(|cow| cow.into_owned())?;
+            Ok(Value::Text(s))
+        }
+        // Binary-like: TINY_BLOB, MEDIUM_BLOB, LONG_BLOB, BLOB
+        0xf9 | 0xfa | 0xfb | 0xfc => Ok(Value::Bytes(raw.to_vec())),
+        other => Err(DbError::InvalidValue {
+            reason: format!(
+                "COM_STMT_SEND_LONG_DATA is only valid for string/binary params, \
+                 got MySQL type code {other:#04x}"
+            ),
+        }),
+    }
 }
 
 /// Converts year/month/day to days since Unix epoch (1970-01-01 = 0).
@@ -839,6 +909,8 @@ mod tests {
             analyzed_stmt: None,
             compiled_at_version: 0,
             last_used_seq: 0,
+            pending_long_data: vec![None; 1],
+            pending_long_data_error: None,
         };
 
         // Build a minimal COM_STMT_EXECUTE payload:
@@ -864,5 +936,208 @@ mod tests {
         let exec = parse_execute_packet(&payload, &mut stmt, &UTF8MB4_CHARSET).unwrap();
         assert_eq!(exec.params.len(), 1);
         assert_eq!(exec.params[0], Value::Text("2".into()));
+    }
+
+    // ── Long-data unit tests (Phase 5.11b) ───────────────────────────────────
+
+    fn make_stmt(param_count: u16) -> PreparedStatement {
+        PreparedStatement {
+            stmt_id: 1,
+            sql_template: "INSERT INTO t VALUES (?, ?)".into(),
+            param_count,
+            param_types: vec![0xfd; param_count as usize], // VAR_STRING by default
+            analyzed_stmt: None,
+            compiled_at_version: 0,
+            last_used_seq: 0,
+            pending_long_data: vec![None; param_count as usize],
+            pending_long_data_error: None,
+        }
+    }
+
+    /// Build minimal COM_STMT_EXECUTE payload: 2 params, param0 uses long data,
+    /// param1 is inline text "world".
+    fn execute_payload_two_params(
+        param0_type: u16,
+        param1_type: u16,
+        param1_value: &[u8],
+    ) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&1u32.to_le_bytes()); // stmt_id
+        p.push(0); // flags
+        p.extend_from_slice(&1u32.to_le_bytes()); // iteration_count
+        p.push(0x00); // null bitmap (neither is null at wire level)
+        p.push(1); // new_params_bound_flag
+        p.extend_from_slice(&(param0_type as u16).to_le_bytes());
+        p.extend_from_slice(&(param1_type as u16).to_le_bytes());
+        // param0 has long data — no inline bytes for it
+        // param1: lenenc + value
+        p.push(param1_value.len() as u8);
+        p.extend_from_slice(param1_value);
+        p
+    }
+
+    #[test]
+    fn test_append_long_data_distinguishes_none_from_empty() {
+        let mut stmt = make_stmt(2);
+        // No long data set → None
+        assert!(stmt.pending_long_data[0].is_none());
+
+        // First chunk with zero bytes → explicitly Some(vec![])
+        stmt.append_long_data(0, &[], 1024);
+        assert!(stmt.pending_long_data[0].is_some());
+        assert_eq!(stmt.pending_long_data[0].as_ref().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_append_long_data_accumulates_chunks() {
+        let mut stmt = make_stmt(1);
+        stmt.append_long_data(0, b"hello", 1024);
+        stmt.append_long_data(0, b" world", 1024);
+        assert_eq!(
+            stmt.pending_long_data[0].as_deref().unwrap(),
+            b"hello world"
+        );
+    }
+
+    #[test]
+    fn test_append_long_data_overflow_stores_deferred_error() {
+        let mut stmt = make_stmt(1);
+        stmt.append_long_data(0, b"hello", 4); // 5 > 4
+        assert!(stmt.pending_long_data_error.is_some());
+        // Buffer is not modified after overflow
+        assert!(stmt.pending_long_data[0].is_none());
+    }
+
+    #[test]
+    fn test_append_long_data_out_of_range_param_stores_deferred_error() {
+        let mut stmt = make_stmt(1);
+        stmt.append_long_data(5, b"data", 1024); // idx 5, only 1 param
+        assert!(stmt.pending_long_data_error.is_some());
+    }
+
+    #[test]
+    fn test_clear_long_data_state_resets_all() {
+        let mut stmt = make_stmt(2);
+        stmt.append_long_data(0, b"data", 1024);
+        stmt.pending_long_data_error = Some("some error".into());
+        stmt.clear_long_data_state();
+        assert!(stmt.pending_long_data[0].is_none());
+        assert!(stmt.pending_long_data[1].is_none());
+        assert!(stmt.pending_long_data_error.is_none());
+    }
+
+    #[test]
+    fn test_inline_blob_decode_returns_bytes() {
+        let mut stmt = make_stmt(1);
+        stmt.param_types = vec![0xfc]; // MYSQL_TYPE_BLOB
+                                       // Build execute payload with one blob param
+        let blob_data = b"\x00\x01\x02\xFF\x00";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes()); // stmt_id
+        payload.push(0);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(0x00); // null bitmap
+        payload.push(1); // bound flag
+        payload.push(0xfc);
+        payload.push(0x00); // MYSQL_TYPE_BLOB
+        payload.push(blob_data.len() as u8);
+        payload.extend_from_slice(blob_data);
+        let exec = parse_execute_packet(&payload, &mut stmt, &UTF8MB4_CHARSET).unwrap();
+        assert_eq!(exec.params[0], Value::Bytes(blob_data.to_vec()));
+    }
+
+    #[test]
+    fn test_long_data_text_takes_precedence_over_null_and_inline() {
+        let mut stmt = make_stmt(2);
+        stmt.param_types = vec![0xfd, 0xfd]; // VAR_STRING
+        stmt.pending_long_data[0] = Some(b"from_long_data".to_vec());
+
+        let payload = execute_payload_two_params(0xfd, 0xfd, b"inline_world");
+        let exec = parse_execute_packet(&payload, &mut stmt, &UTF8MB4_CHARSET).unwrap();
+        // param0: long data wins
+        assert_eq!(exec.params[0], Value::Text("from_long_data".into()));
+        // param1: inline (no long data)
+        assert_eq!(exec.params[1], Value::Text("inline_world".into()));
+    }
+
+    #[test]
+    fn test_long_data_binary_preserves_null_bytes() {
+        let mut stmt = make_stmt(1);
+        stmt.param_types = vec![0xfc]; // BLOB
+        let raw = b"\x00\xFF\x00\x42";
+        stmt.pending_long_data[0] = Some(raw.to_vec());
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(0x00); // null bitmap
+        payload.push(1); // bound
+        payload.push(0xfc);
+        payload.push(0x00);
+        // No inline bytes for param0 — long data takes over
+
+        let exec = parse_execute_packet(&payload, &mut stmt, &UTF8MB4_CHARSET).unwrap();
+        assert_eq!(exec.params[0], Value::Bytes(raw.to_vec()));
+    }
+
+    #[test]
+    fn test_long_data_cleared_after_execute() {
+        let mut stmt = make_stmt(1);
+        stmt.param_types = vec![0xfd];
+        stmt.pending_long_data[0] = Some(b"data".to_vec());
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(0x00);
+        payload.push(1);
+        payload.push(0xfd);
+        payload.push(0x00);
+        // No inline bytes
+
+        parse_execute_packet(&payload, &mut stmt, &UTF8MB4_CHARSET).unwrap();
+        // After execute, pending state must be cleared
+        stmt.clear_long_data_state();
+        assert!(stmt.pending_long_data[0].is_none());
+    }
+
+    #[test]
+    fn test_deferred_long_data_error_returned_on_execute() {
+        let mut stmt = make_stmt(1);
+        stmt.pending_long_data_error = Some("accumulated too large".into());
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(0x00);
+        payload.push(0);
+
+        let result = parse_execute_packet(&payload, &mut stmt, &UTF8MB4_CHARSET);
+        assert!(matches!(
+            result,
+            Err(axiomdb_core::error::DbError::InvalidValue { .. })
+        ));
+    }
+
+    #[test]
+    fn test_empty_long_data_becomes_empty_text() {
+        let mut stmt = make_stmt(1);
+        stmt.param_types = vec![0xfd];
+        stmt.pending_long_data[0] = Some(vec![]); // explicit empty
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(0x00);
+        payload.push(1);
+        payload.push(0xfd);
+        payload.push(0x00);
+
+        let exec = parse_execute_packet(&payload, &mut stmt, &UTF8MB4_CHARSET).unwrap();
+        assert_eq!(exec.params[0], Value::Text(String::new()));
     }
 }
