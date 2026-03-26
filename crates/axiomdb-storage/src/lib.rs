@@ -21,7 +21,7 @@ pub use heap::{
     read_tuple_header, scan_visible, update_tuple, RowHeader, SlotEntry, MAX_TUPLE_DATA,
     MIN_TUPLE_OVERHEAD,
 };
-pub use heap_chain::{chain_next_page, chain_set_next_page, HeapChain};
+pub use heap_chain::{chain_next_page, chain_set_next_page, HeapAppendHint, HeapChain};
 pub use integrity::{IntegrityChecker, IntegrityReport, IntegrityViolation, Severity};
 pub use memory::MemoryStorage;
 pub use meta::{

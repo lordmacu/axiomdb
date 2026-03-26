@@ -382,6 +382,11 @@ pub fn apply_strict_to_sql_mode(current: &str, enabled: bool) -> String {
 pub struct SessionContext {
     /// Cached table schemas keyed by `"schema_name.table_name"`.
     cache: HashMap<String, ResolvedTable>,
+    /// Per-table heap-tail hint cache (Phase 5.18).
+    ///
+    /// Key: `table_id`. Value: `(root_page_id, tail_page_id)`.
+    /// Cleared whenever the schema cache is invalidated or a root rotation is detected.
+    heap_tail: HashMap<u32, (u64, u64)>,
     /// Staleness tracker for per-column statistics (Phase 6.11).
     pub stats: StaleStatsTracker,
     /// Whether the connection is in autocommit mode (MySQL default: `true`).
@@ -436,6 +441,7 @@ impl SessionContext {
     pub fn new() -> Self {
         Self {
             cache: HashMap::new(),
+            heap_tail: HashMap::new(),
             autocommit: true,
             strict_mode: true,
             on_error: OnErrorMode::RollbackStatement,
@@ -501,11 +507,49 @@ impl SessionContext {
     }
 
     pub fn invalidate_table(&mut self, schema: &str, table: &str) {
+        // Also clear any heap-tail hint for this table so a stale tail is not
+        // reused after a DDL change or root rotation.
+        if let Some(resolved) = self.cache.get(&Self::key(schema, table)) {
+            self.heap_tail.remove(&resolved.def.id);
+        }
         self.cache.remove(&Self::key(schema, table));
     }
 
     pub fn invalidate_all(&mut self) {
         self.cache.clear();
+        self.heap_tail.clear();
+    }
+
+    // ── Heap tail hint cache (Phase 5.18) ─────────────────────────────────────
+
+    /// Returns a [`axiomdb_storage::HeapAppendHint`] for `table_id` if one is
+    /// cached and the stored `root_page_id` matches the caller's current root.
+    ///
+    /// Returns `None` on root mismatch (root-rotation detected) or cache miss.
+    pub fn get_heap_tail_hint(
+        &self,
+        table_id: u32,
+        root_page_id: u64,
+    ) -> Option<axiomdb_storage::HeapAppendHint> {
+        let (cached_root, tail) = self.heap_tail.get(&table_id)?;
+        if *cached_root != root_page_id {
+            return None; // root rotation — discard stale hint
+        }
+        Some(axiomdb_storage::HeapAppendHint {
+            root_page_id: *cached_root,
+            tail_page_id: *tail,
+        })
+    }
+
+    /// Stores (or updates) the heap tail hint for `table_id`.
+    pub fn set_heap_tail_hint(&mut self, table_id: u32, root_page_id: u64, tail_page_id: u64) {
+        self.heap_tail
+            .insert(table_id, (root_page_id, tail_page_id));
+    }
+
+    /// Clears the heap tail hint for a specific `table_id`.
+    pub fn invalidate_heap_tail(&mut self, table_id: u32) {
+        self.heap_tail.remove(&table_id);
     }
 
     pub fn cached_count(&self) -> usize {
