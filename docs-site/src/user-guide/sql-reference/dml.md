@@ -637,9 +637,21 @@ UPDATE users SET deleted_at = CURRENT_TIMESTAMP WHERE id = 7;
 -- Then filter: SELECT * FROM users WHERE deleted_at IS NULL;
 ```
 
-> A DELETE without a WHERE clause removes **all rows**. For this use case,
-> `TRUNCATE TABLE` is faster and should be preferred when you intend to empty
-> a table entirely.
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Bulk-empty fast path</span>
+<code>DELETE FROM t</code> without a <code>WHERE</code> clause uses a <strong>root-rotation fast path</strong>
+instead of per-row B-Tree deletes. New empty heap and index roots are allocated,
+the catalog is updated atomically inside the transaction, and old pages are freed
+only after WAL fsync confirms commit durability. This eliminates the 10,000× slowdown
+that previously occurred when a table had any index (PK, UNIQUE, or secondary).
+The operation is fully transactional: <code>ROLLBACK</code> restores original roots.
+</div>
+</div>
+
+> **When parent FK references exist**, `DELETE FROM t` keeps the row-by-row path so
+> `RESTRICT`/`CASCADE`/`SET NULL` FK enforcement still fires correctly.
 
 ---
 
@@ -673,7 +685,14 @@ INSERT INTO counters (label) VALUES ('c');          -- id: 1 (reset)
 | WHERE clause | Supported | Not supported |
 | AUTO_INCREMENT | Not reset | Reset to 1 |
 | Rows affected | Returns actual count | Returns 0 |
+| FK parent table | Row-by-row (enforces FK) | Fails if child FKs exist |
 | Typical use | Conditional deletes | Full table wipe |
+
+`TRUNCATE TABLE` fails with an error if any FK constraint references the table as
+the parent. Delete or truncate child tables first, then truncate the parent.
+
+Both `DELETE FROM t` (no WHERE) and `TRUNCATE TABLE t` use the same bulk-empty
+root-rotation machinery internally and are fully transactional.
 
 ---
 

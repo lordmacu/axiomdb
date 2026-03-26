@@ -422,6 +422,55 @@ impl<'a> CatalogWriter<'a> {
         })
     }
 
+    /// Replaces the `data_root_page_id` of a table in `axiom_tables`.
+    ///
+    /// Used by the bulk-empty fast path (Phase 5.16) to rotate the heap root
+    /// to a freshly-allocated empty page. All other `TableDef` fields are preserved.
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] if no transaction is active.
+    /// - [`DbError::Internal`] if `table_id` is not found in `axiom_tables`.
+    pub fn update_table_data_root(
+        &mut self,
+        table_id: TableId,
+        new_root_page_id: u64,
+    ) -> Result<(), DbError> {
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+        let snap = self.txn.active_snapshot()?;
+        let rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = TableDef::from_bytes(&data)?;
+            if def.id == table_id {
+                // Delete old row.
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = table_id.to_le_bytes();
+                self.txn
+                    .record_delete(SYSTEM_TABLE_TABLES, &key, &data, page_id, slot_id)?;
+
+                // Insert new row with updated data_root_page_id.
+                let new_def = TableDef {
+                    data_root_page_id: new_root_page_id,
+                    ..def
+                };
+                let new_data = new_def.to_bytes();
+                let (pg2, sl2) =
+                    HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id)?;
+                self.txn
+                    .record_insert(SYSTEM_TABLE_TABLES, &key, &new_data, pg2, sl2)?;
+                return Ok(());
+            }
+        }
+        Err(DbError::Internal {
+            message: format!(
+                "update_table_data_root: table_id={table_id} not found in axiom_tables"
+            ),
+        })
+    }
+
     /// Marks the index row with `index_id` as deleted in `axiom_indexes`.
     ///
     /// # Errors
