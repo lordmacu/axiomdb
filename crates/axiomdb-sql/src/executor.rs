@@ -58,8 +58,8 @@ use crate::{
     expr::{BinaryOp, Expr},
     result::{ColumnMeta, QueryResult, Row},
     session::{
-        normalize_sql_mode, on_error_mode_name, parse_boolish_setting, parse_on_error_setting,
-        sql_mode_is_strict, OnErrorMode, SessionContext,
+        normalize_sql_mode, parse_boolish_setting, parse_on_error_setting, sql_mode_is_strict,
+        OnErrorMode, SessionContext,
     },
     table::TableEngine,
 };
@@ -400,6 +400,11 @@ pub fn execute_with_ctx(
                     }
                     Err(e) // database.rs intercepts this and converts to QueryResult::Empty
                 }
+                OnErrorMode::Ignore => {
+                    // Infrastructure/runtime failures must not leave the txn open.
+                    let _ = txn.rollback(storage);
+                    Err(e)
+                }
                 _ => {
                     // RollbackStatement / Savepoint / Ignore non-ignorable:
                     // undo only this statement's writes, keep the transaction active.
@@ -513,18 +518,27 @@ pub fn execute_with_ctx(
                 };
                 match dispatch_ctx(other, storage, txn, bloom, ctx) {
                     Ok(result) => Ok(result),
-                    Err(e) => {
-                        if let Some(sp) = sp_opt {
-                            // savepoint / ignore: undo only the failing statement,
-                            // keep the implicit transaction open.
-                            let _ = txn.rollback_to_savepoint(sp, storage);
-                        } else {
-                            // rollback_statement / rollback_transaction:
-                            // roll back the entire implicit transaction.
-                            let _ = txn.rollback(storage);
+                    Err(e) => match ctx.on_error {
+                        OnErrorMode::Ignore if crate::session::is_ignorable_on_error(&e) => {
+                            if let Some(sp) = sp_opt {
+                                // Ignore is Savepoint-like for ignorable SQL errors.
+                                let _ = txn.rollback_to_savepoint(sp, storage);
+                            }
+                            Err(e)
                         }
-                        Err(e)
-                    }
+                        OnErrorMode::Savepoint => {
+                            if let Some(sp) = sp_opt {
+                                let _ = txn.rollback_to_savepoint(sp, storage);
+                            }
+                            Err(e)
+                        }
+                        _ => {
+                            // rollback_statement / rollback_transaction / ignore
+                            // non-ignorable: close the implicit txn completely.
+                            let _ = txn.rollback(storage);
+                            Err(e)
+                        }
+                    },
                 }
             }
         }

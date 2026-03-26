@@ -3,7 +3,7 @@
 AxiomDB wire protocol test.
 Updated at each subphase close — always overwrite this file, never create new ones.
 
-Last updated: subphase 5.2a (charset/collation negotiation at the wire boundary)
+Last updated: subphase 5.2c (ON_ERROR session behavior)
 """
 import os
 import signal
@@ -116,6 +116,21 @@ def connect():
     )
 
 
+def connect_multi():
+    from pymysql.constants import CLIENT
+    return pymysql.connect(
+        host="127.0.0.1", port=PORT, user="root", password="",
+        autocommit=False,
+        client_flag=CLIENT.MULTI_STATEMENTS,
+    )
+
+
+def reset_connection(conn):
+    """Send COM_RESET_CONNECTION (0x1f) using PyMySQL internals."""
+    conn._execute_command(0x1F, b"")
+    conn._read_ok_packet()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 print(f"Starting AxiomDB on :{PORT}...")
@@ -168,6 +183,117 @@ except pymysql.err.IntegrityError:
     conn.commit()
     cur.execute("SELECT COUNT(*) FROM wt_items")
     ok("Txn continues after error — 2 rows committed", cur.fetchone()[0] == 2)
+
+# ── [5.2c] ON_ERROR session behavior ──────────────────────────────────────────
+
+print("\n[5.2c] ON_ERROR session behavior")
+conn_oe = connect()
+co = conn_oe.cursor()
+co.execute("CREATE TABLE wt_on_error (id INT UNIQUE NOT NULL)")
+conn_oe.commit()
+
+co.execute("SELECT @@on_error")
+ok("@@on_error defaults to rollback_statement",
+   co.fetchone()[0] == "rollback_statement")
+
+co.execute("SHOW VARIABLES LIKE 'on_error'")
+rows = co.fetchall()
+ok("SHOW VARIABLES LIKE 'on_error' returns current mode",
+   len(rows) == 1 and rows[0] == ("on_error", "rollback_statement"), rows)
+
+co.execute("SET on_error = 'rollback_transaction'")
+co.execute("BEGIN")
+co.execute("INSERT INTO wt_on_error VALUES (1)")
+try:
+    co.execute("INSERT INTO wt_on_error VALUES (1)")
+    ok("rollback_transaction duplicate raises IntegrityError", False, "no error raised")
+except pymysql.err.IntegrityError:
+    ok("rollback_transaction duplicate raises IntegrityError", True)
+
+co.execute("SELECT @@in_transaction")
+ok("rollback_transaction closes the txn after error",
+   co.fetchone()[0] == 0)
+
+co.execute("SELECT COUNT(*) FROM wt_on_error")
+ok("rollback_transaction discards prior writes in the txn",
+   co.fetchone()[0] == 0)
+
+co.execute("INSERT INTO wt_on_error VALUES (99)")
+conn_oe.commit()
+co.execute("SET autocommit = 0")
+co.execute("SET on_error = 'savepoint'")
+try:
+    co.execute("INSERT INTO wt_on_error VALUES (99)")
+    ok("savepoint first failing DML still surfaces as error", False, "no error raised")
+except pymysql.err.IntegrityError:
+    ok("savepoint first failing DML still surfaces as error", True)
+
+co.execute("SELECT @@in_transaction")
+ok("savepoint keeps the implicit txn open after first failing DML",
+   co.fetchone()[0] == 1)
+
+co.execute("INSERT INTO wt_on_error VALUES (2)")
+co.execute("COMMIT")
+co.execute("SELECT COUNT(*) FROM wt_on_error WHERE id = 2")
+ok("savepoint keeps the txn usable after the failed statement",
+   co.fetchone()[0] == 1)
+
+co.execute("SET on_error = 'ignore'")
+co.execute("BEGIN")
+co.execute("INSERT INTO wt_on_error VALUES (10)")
+try:
+    co.execute("INSERT INTO wt_on_error VALUES (10)")
+    ok("ignore duplicate key returns success instead of ERR", True)
+except pymysql.MySQLError as e:
+    ok("ignore duplicate key returns success instead of ERR", False, e)
+
+warning_count = getattr(getattr(conn_oe, "_result", None), "warning_count", 0)
+ok("ignore duplicate OK packet carries warning_count > 0",
+   warning_count > 0, warning_count)
+
+co.execute("SHOW WARNINGS")
+warnings = co.fetchall()
+ok("ignore populates SHOW WARNINGS",
+   len(warnings) >= 1, warnings)
+if warnings:
+    ok("ignore warning code is 1062 for duplicate key",
+       warnings[0][1] == 1062, warnings[0])
+    ok("ignore warning preserves original duplicate-key message",
+       "duplicate" in warnings[0][2].lower() or "unique" in warnings[0][2].lower(),
+       warnings[0][2])
+
+co.execute("INSERT INTO wt_on_error VALUES (11)")
+co.execute("COMMIT")
+co.execute("SELECT id FROM wt_on_error WHERE id IN (10, 11) ORDER BY id")
+ok("ignore commits rows before and after the ignored error",
+   co.fetchall() == ((10,), (11,)))
+
+conn_multi = connect_multi()
+cm = conn_multi.cursor()
+cm.execute("SET on_error = 'ignore'")
+cm.execute(
+    "INSERT INTO wt_on_error VALUES (20); "
+    "INSERT INTO wt_on_error VALUES (20); "
+    "INSERT INTO wt_on_error VALUES (21); "
+    "COMMIT"
+)
+while cm.nextset():
+    pass
+cm.execute("SELECT id FROM wt_on_error WHERE id IN (20, 21) ORDER BY id")
+ok("ignore continues executing later statements in multi-statement COM_QUERY",
+   cm.fetchall() == ((20,), (21,)))
+cm.execute("SHOW WARNINGS")
+ok("SHOW WARNINGS after later statements still follows last-statement-only rule",
+   len(cm.fetchall()) == 0)
+conn_multi.close()
+
+co.execute("SET on_error = 'rollback_transaction'")
+reset_connection(conn_oe)
+co = conn_oe.cursor()
+co.execute("SELECT @@on_error")
+ok("COM_RESET_CONNECTION resets @@on_error to rollback_statement",
+   co.fetchone()[0] == "rollback_statement")
+conn_oe.close()
 
 # ── [5.9b] @@in_transaction ────────────────────────────────────────────────────
 

@@ -560,6 +560,46 @@ MySQL drivers and ORMs send several queries automatically before any user SQL:
 packet sequences without touching the engine. Without this interception, most clients
 fail to connect because they receive ERR packets for mandatory queries.
 
+#### ON_ERROR session behavior (executor.rs, database.rs, subphase 5.2c)
+
+`ON_ERROR` is implemented as one typed session enum shared by both layers that
+own statement execution:
+
+| Layer | State owner | Responsibility |
+|---|---|---|
+| SQL executor | `SessionContext.on_error` | Controls rollback policy for executor-time failures |
+| Wire/session layer | `ConnectionState.on_error` | Exposes `SET on_error`, `@@on_error`, `SHOW VARIABLES`, and reset semantics |
+
+This split is required by the current AxiomDB architecture. `handler.rs`
+intercepts `SET` and `SELECT @@var` before the engine, but `database.rs` owns
+the full `parse -> analyze -> execute_with_ctx` pipeline. A wire-only flag would
+leave embedded execution inconsistent; an executor-only flag would make the MySQL
+session variables lie.
+
+**Execution modes:**
+
+| Mode | Active transaction error | First failing DML with `autocommit=0` | Parse/analyze failure |
+|---|---|---|---|
+| `rollback_statement` | rollback to statement boundary, txn stays open | full rollback, txn closes | return ERR, txn state unchanged |
+| `rollback_transaction` | eager full rollback, txn closes | eager full rollback, txn closes | eager full rollback if txn active |
+| `savepoint` | same as `rollback_statement` | keep implicit txn open after rolling back the failing DML | return ERR, txn state unchanged |
+| `ignore` | ignorable SQL errors -> warning + continue; non-ignorable runtime errors -> eager full rollback + ERR | ignorable SQL errors -> warning + continue; non-ignorable runtime errors -> eager full rollback + ERR | same split as active txn |
+
+`ignore` reuses the existing `SHOW WARNINGS` path. For ignorable SQL/user
+errors, `database.rs` maps the original `DbError` to the corresponding MySQL
+warning code/message and returns `QueryResult::Empty`, which the serializer
+turns into an OK packet with `warning_count > 0`. For non-ignorable errors
+(`DiskFull`, WAL failures, storage/runtime corruption), the error still
+surfaces as ERR and the transaction is eagerly rolled back if one is active.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Borrowed Savepoint Model</span>
+AxiomDB borrows the "statement as anonymous savepoint" idea from MariaDB and SQLite, but adapts PostgreSQL's fail-fast use case into eager rollback instead of a persistent aborted-transaction latch. That keeps MySQL compatibility where it matters while avoiding a second long-lived txn state machine in the Phase 5 wire path.
+</div>
+</div>
+
 #### SHOW STATUS — server and session counters (status.rs, subphase 5.9c)
 
 MySQL clients, ORMs, and monitoring tools (PMM, Datadog MySQL integration, ProxySQL)
