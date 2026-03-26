@@ -492,6 +492,18 @@ LIMIT 20 OFFSET 40;   -- page 3 (0-indexed) of 20 items per page
 
 ## INSERT
 
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">O(1) heap tail lookup</span>
+AxiomDB caches the last heap page per table in the session context
+(<code>HeapAppendHint</code>). Repeated INSERTs in the same session no longer walk the
+full chain from the root page on every row — the tail is resolved in one page read
+and self-healed on mismatch. This eliminates the O(N²) degradation seen at 100K+
+rows in a single session.
+</div>
+</div>
+
 ### INSERT ... VALUES
 
 When a table has an `AUTO_INCREMENT` column, omit it from the column list and

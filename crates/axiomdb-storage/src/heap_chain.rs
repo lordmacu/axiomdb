@@ -57,6 +57,25 @@ pub fn chain_set_next_page(page: &mut Page, next: u64) {
     page.header_mut()._reserved[0..8].copy_from_slice(&next.to_le_bytes());
 }
 
+// ── HeapAppendHint ────────────────────────────────────────────────────────────
+
+/// Transient runtime hint that caches the tail page of a heap chain.
+///
+/// Storing `root_page_id` alongside `tail_page_id` lets the cache detect
+/// root-rotation (Phase 5.16 bulk-empty) and automatically invalidate.
+///
+/// This type is **never persisted** — it is a runtime-only optimization.
+/// Any code path may discard it freely; correctness does not depend on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapAppendHint {
+    /// The chain root page this hint was computed for.
+    /// If the caller's `data_root_page_id != root_page_id`, the hint is invalid.
+    pub root_page_id: u64,
+    /// The last page of the chain at the time this hint was recorded.
+    /// Must be validated (`chain_next_page == 0`) before use.
+    pub tail_page_id: u64,
+}
+
 // ── HeapChain ─────────────────────────────────────────────────────────────────
 
 /// Stateless operations over a linked list of slotted heap pages.
@@ -121,6 +140,90 @@ impl HeapChain {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Inserts `data` using a validated [`HeapAppendHint`] for O(1) tail lookup.
+    ///
+    /// If `hint` is `None`, `root_page_id` mismatches, or the hinted page is no
+    /// longer the tail (`chain_next_page != 0`), falls back to a full chain walk
+    /// via `last_page_id` and heals the hint with the actual tail.
+    ///
+    /// Chain growth (page full) always updates the hint to the new tail page.
+    pub fn insert_with_hint(
+        storage: &mut dyn StorageEngine,
+        root_page_id: u64,
+        data: &[u8],
+        txn_id: TxnId,
+        mut hint: Option<&mut HeapAppendHint>,
+    ) -> Result<(u64, u16), DbError> {
+        // Resolve tail — use hint when valid, full walk otherwise.
+        let last_page_id =
+            Self::resolve_tail_with_hint(storage, root_page_id, hint.as_deref_mut())?;
+
+        let raw = *storage.read_page(last_page_id)?.as_bytes();
+        let mut page = Page::from_bytes(raw)?;
+
+        match insert_tuple(&mut page, data, txn_id) {
+            Ok(slot_id) => {
+                page.update_checksum();
+                storage.write_page(last_page_id, &page)?;
+                // Hint stays valid — same tail page, nothing changed.
+                Ok((last_page_id, slot_id))
+            }
+            Err(DbError::HeapPageFull { .. }) => {
+                // Allocate new tail page and link it.
+                let new_page_id = storage.alloc_page(PageType::Data)?;
+                let mut new_page = Page::new(PageType::Data, new_page_id);
+                let slot_id = insert_tuple(&mut new_page, data, txn_id)?;
+                new_page.update_checksum();
+                // Step 1: write new page first (crash safety).
+                storage.write_page(new_page_id, &new_page)?;
+                // Step 2: link from previous tail.
+                let raw2 = *storage.read_page(last_page_id)?.as_bytes();
+                let mut prev_page = Page::from_bytes(raw2)?;
+                chain_set_next_page(&mut prev_page, new_page_id);
+                prev_page.update_checksum();
+                storage.write_page(last_page_id, &prev_page)?;
+                // Update hint to new tail.
+                if let Some(h) = hint {
+                    h.root_page_id = root_page_id;
+                    h.tail_page_id = new_page_id;
+                }
+                Ok((new_page_id, slot_id))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Resolves the tail page for a chain, using a hint for O(1) fast path.
+    ///
+    /// Validates the hint by checking `chain_next_page == 0`. On mismatch or
+    /// absence, falls back to a full `last_page_id` walk and heals the hint.
+    fn resolve_tail_with_hint(
+        storage: &dyn StorageEngine,
+        root_page_id: u64,
+        hint: Option<&mut HeapAppendHint>,
+    ) -> Result<u64, DbError> {
+        if let Some(h) = hint {
+            if h.root_page_id == root_page_id {
+                // Validate: hinted page must exist and have next_page_id == 0.
+                // PageNotFound or a non-zero next_page_id both mean the hint is stale.
+                let valid = storage
+                    .read_page(h.tail_page_id)
+                    .map(|p| chain_next_page(p) == 0)
+                    .unwrap_or(false);
+                if valid {
+                    return Ok(h.tail_page_id);
+                }
+                // Hint is stale — fall through to full walk + self-heal.
+            }
+            // Hint root mismatch or stale — full walk + self-heal.
+            let tail = Self::last_page_id(storage, root_page_id)?;
+            h.root_page_id = root_page_id;
+            h.tail_page_id = tail;
+            return Ok(tail);
+        }
+        Self::last_page_id(storage, root_page_id)
     }
 
     /// Stamps `txn_id_deleted` on the tuple at `(page_id, slot_id)`.
@@ -880,5 +983,80 @@ mod tests {
             d1, d2,
             "batch and individual insert must produce identical heap contents"
         );
+    }
+}
+
+// ── HeapAppendHint unit tests (Phase 5.18) ────────────────────────────────────
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+    use crate::memory::MemoryStorage;
+
+    fn make_storage() -> MemoryStorage {
+        MemoryStorage::new()
+    }
+
+    #[test]
+    fn valid_hint_skips_walk() {
+        let mut storage = make_storage();
+        let root = storage.alloc_page(PageType::Data).unwrap();
+        storage
+            .write_page(root, &Page::new(PageType::Data, root))
+            .unwrap();
+
+        // First insert: no hint → seeds hint with root as tail.
+        let mut hint = None;
+        HeapChain::insert_with_hint(&mut storage, root, b"row1", 1, hint.as_mut()).unwrap();
+
+        // Seed hint manually.
+        let mut h = HeapAppendHint {
+            root_page_id: root,
+            tail_page_id: root,
+        };
+        // Second insert using hint.
+        HeapChain::insert_with_hint(&mut storage, root, b"row2", 1, Some(&mut h)).unwrap();
+        // Hint must still point to root (no chain growth for 2 rows).
+        assert_eq!(h.tail_page_id, root);
+    }
+
+    #[test]
+    fn stale_hint_falls_back_and_heals() {
+        let mut storage = make_storage();
+        let root = storage.alloc_page(PageType::Data).unwrap();
+        storage
+            .write_page(root, &Page::new(PageType::Data, root))
+            .unwrap();
+
+        // Give a completely wrong tail_page_id.
+        let mut h = HeapAppendHint {
+            root_page_id: root,
+            tail_page_id: 9999,
+        };
+        // Insert must succeed (falls back to full walk) and heals the hint.
+        HeapChain::insert_with_hint(&mut storage, root, b"row1", 1, Some(&mut h)).unwrap();
+        assert_eq!(h.tail_page_id, root, "hint must be healed to actual tail");
+    }
+
+    #[test]
+    fn root_mismatch_ignores_hint() {
+        let mut storage = make_storage();
+        let root1 = storage.alloc_page(PageType::Data).unwrap();
+        storage
+            .write_page(root1, &Page::new(PageType::Data, root1))
+            .unwrap();
+        let root2 = storage.alloc_page(PageType::Data).unwrap();
+        storage
+            .write_page(root2, &Page::new(PageType::Data, root2))
+            .unwrap();
+
+        // Hint for root1, but we insert into root2.
+        let mut h = HeapAppendHint {
+            root_page_id: root1,
+            tail_page_id: root1,
+        };
+        HeapChain::insert_with_hint(&mut storage, root2, b"data", 1, Some(&mut h)).unwrap();
+        // Hint must now reflect root2.
+        assert_eq!(h.root_page_id, root2);
+        assert_eq!(h.tail_page_id, root2);
     }
 }

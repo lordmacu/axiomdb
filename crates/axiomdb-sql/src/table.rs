@@ -48,7 +48,7 @@
 
 use axiomdb_catalog::schema::{ColumnDef, ColumnType, TableDef};
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
-use axiomdb_storage::{HeapChain, StorageEngine};
+use axiomdb_storage::{HeapAppendHint, HeapChain, StorageEngine};
 use axiomdb_types::{
     codec::{decode_row, decode_row_masked, encode_row},
     coerce::{coerce, CoercionMode},
@@ -177,6 +177,44 @@ impl TableEngine {
         let key = encode_rid(page_id, slot_id);
         txn.record_insert(table_def.id, &key, &encoded, page_id, slot_id)?;
 
+        Ok(RecordId { page_id, slot_id })
+    }
+
+    /// Inserts one row using an optional heap-tail hint for O(1) tail lookup.
+    ///
+    /// If `hint` is `Some(...)`, the tail page is resolved via
+    /// [`HeapChain::insert_with_hint`] instead of walking from the root.
+    /// The hint is updated in place after the insert so the caller can pass the
+    /// same reference to subsequent calls and accumulate tail state.
+    ///
+    /// Use this in hot loops (ctx per-row insert paths) to avoid O(N²) behavior.
+    pub fn insert_row_with_hint(
+        storage: &mut dyn StorageEngine,
+        txn: &mut TxnManager,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        values: Vec<Value>,
+        hint: Option<&mut HeapAppendHint>,
+    ) -> Result<RecordId, DbError> {
+        if values.len() != columns.len() {
+            return Err(DbError::TypeMismatch {
+                expected: format!("{} columns", columns.len()),
+                got: format!("{} values", values.len()),
+            });
+        }
+        let col_types = column_data_types(columns);
+        let coerced = coerce_values(values, columns)?;
+        let encoded = encode_row(&coerced, &col_types)?;
+        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+        let (page_id, slot_id) = HeapChain::insert_with_hint(
+            storage,
+            table_def.data_root_page_id,
+            &encoded,
+            txn_id,
+            hint,
+        )?;
+        let key = encode_rid(page_id, slot_id);
+        txn.record_insert(table_def.id, &key, &encoded, page_id, slot_id)?;
         Ok(RecordId { page_id, slot_id })
     }
 
@@ -478,6 +516,66 @@ impl TableEngine {
         })
     }
 
+    /// Updates one row using a heap-tail hint for the insert half.
+    ///
+    /// The delete half is unchanged; the insert half calls
+    /// [`HeapChain::insert_with_hint`] to avoid re-walking the chain from root
+    /// on each iteration of a bulk UPDATE loop.
+    pub fn update_row_with_hint(
+        storage: &mut dyn StorageEngine,
+        txn: &mut TxnManager,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        record_id: RecordId,
+        new_values: Vec<Value>,
+        hint: Option<&mut HeapAppendHint>,
+    ) -> Result<RecordId, DbError> {
+        if new_values.len() != columns.len() {
+            return Err(DbError::TypeMismatch {
+                expected: format!("{} columns", columns.len()),
+                got: format!("{} values", new_values.len()),
+            });
+        }
+        let old_bytes =
+            axiomdb_storage::HeapChain::read_row(storage, record_id.page_id, record_id.slot_id)?
+                .ok_or(DbError::AlreadyDeleted {
+                    page_id: record_id.page_id,
+                    slot_id: record_id.slot_id,
+                })?;
+        let col_types = column_data_types(columns);
+        let coerced = coerce_values(new_values, columns)?;
+        let new_encoded = encode_row(&coerced, &col_types)?;
+        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+        axiomdb_storage::HeapChain::delete(storage, record_id.page_id, record_id.slot_id, txn_id)?;
+        let old_key = encode_rid(record_id.page_id, record_id.slot_id);
+        txn.record_delete(
+            table_def.id,
+            &old_key,
+            &old_bytes,
+            record_id.page_id,
+            record_id.slot_id,
+        )?;
+        let (new_page_id, new_slot_id) = HeapChain::insert_with_hint(
+            storage,
+            table_def.data_root_page_id,
+            &new_encoded,
+            txn_id,
+            hint,
+        )?;
+        let new_key = encode_rid(new_page_id, new_slot_id);
+        txn.record_insert(
+            table_def.id,
+            &new_key,
+            &new_encoded,
+            new_page_id,
+            new_slot_id,
+        )?;
+        Ok(RecordId {
+            page_id: new_page_id,
+            slot_id: new_slot_id,
+        })
+    }
+
     // ── ctx-aware write variants (session strict_mode + warning emission) ─────
 
     /// Session-aware insert: applies strict or permissive coercion depending on
@@ -504,8 +602,24 @@ impl TableEngine {
         let coerced = coerce_values_with_ctx(values, columns, ctx, row_num)?;
         let encoded = encode_row(&coerced, &col_types)?;
         let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
-        let (page_id, slot_id) =
-            HeapChain::insert(storage, table_def.data_root_page_id, &encoded, txn_id)?;
+
+        // Phase 5.18: pull heap-tail hint from the session cache, use it for O(1)
+        // tail lookup, and write the updated hint back after the insert.
+        let mut hint_opt = ctx.get_heap_tail_hint(table_def.id, table_def.data_root_page_id);
+        let (page_id, slot_id) = HeapChain::insert_with_hint(
+            storage,
+            table_def.data_root_page_id,
+            &encoded,
+            txn_id,
+            hint_opt.as_mut(),
+        )?;
+        if let Some(h) = hint_opt {
+            ctx.set_heap_tail_hint(table_def.id, h.root_page_id, h.tail_page_id);
+        } else {
+            // No existing hint — seed one for the next call.
+            ctx.set_heap_tail_hint(table_def.id, table_def.data_root_page_id, page_id);
+        }
+
         let key = encode_rid(page_id, slot_id);
         txn.record_insert(table_def.id, &key, &encoded, page_id, slot_id)?;
         Ok(RecordId { page_id, slot_id })
@@ -604,8 +718,20 @@ impl TableEngine {
             record_id.page_id,
             record_id.slot_id,
         )?;
-        let (new_page_id, new_slot_id) =
-            HeapChain::insert(storage, table_def.data_root_page_id, &new_encoded, txn_id)?;
+        // Phase 5.18: use session heap-tail hint for the insert half of UPDATE.
+        let mut hint_opt = ctx.get_heap_tail_hint(table_def.id, table_def.data_root_page_id);
+        let (new_page_id, new_slot_id) = HeapChain::insert_with_hint(
+            storage,
+            table_def.data_root_page_id,
+            &new_encoded,
+            txn_id,
+            hint_opt.as_mut(),
+        )?;
+        if let Some(h) = hint_opt {
+            ctx.set_heap_tail_hint(table_def.id, h.root_page_id, h.tail_page_id);
+        } else {
+            ctx.set_heap_tail_hint(table_def.id, table_def.data_root_page_id, new_page_id);
+        }
         let new_key = encode_rid(new_page_id, new_slot_id);
         txn.record_insert(
             table_def.id,
