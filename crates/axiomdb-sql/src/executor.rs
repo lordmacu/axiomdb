@@ -43,7 +43,10 @@ use axiomdb_catalog::{
 };
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
 use axiomdb_index::{page_layout::encode_rid, BTree};
-use axiomdb_storage::{heap_chain::HeapChain, Page, PageType, StorageEngine};
+use axiomdb_storage::{
+    heap_chain::{chain_next_page, HeapChain},
+    Page, PageType, StorageEngine,
+};
 use axiomdb_types::{DataType, Value};
 use axiomdb_wal::{Savepoint, TxnManager};
 
@@ -316,7 +319,11 @@ pub fn execute(
                 txn.begin()?;
                 match dispatch(other, storage, txn) {
                     Ok(result) => {
+                        let tid = txn.active_txn_id();
                         txn.commit()?;
+                        if let Some(t) = tid {
+                            txn.release_immediate_committed_frees(storage, t)?;
+                        }
                         Ok(result)
                     }
                     Err(e) => {
@@ -366,11 +373,19 @@ pub fn execute_with_ctx(
         // DDL inside an open transaction: implicit COMMIT of the current transaction
         // first (MySQL semantics), then DDL runs in its own autocommit transaction.
         if is_ddl(&stmt) {
+            let pre_tid = txn.active_txn_id();
             txn.commit()?;
+            if let Some(t) = pre_tid {
+                txn.release_immediate_committed_frees(storage, t)?;
+            }
             txn.begin()?;
             return match dispatch_ctx(stmt, storage, txn, bloom, ctx) {
                 Ok(result) => {
+                    let ddl_tid = txn.active_txn_id();
                     txn.commit()?;
+                    if let Some(t) = ddl_tid {
+                        txn.release_immediate_committed_frees(storage, t)?;
+                    }
                     Ok(result)
                 }
                 Err(e) => {
@@ -439,7 +454,11 @@ pub fn execute_with_ctx(
                 txn.begin()?;
                 match dispatch_ctx(other, storage, txn, bloom, ctx) {
                     Ok(result) => {
+                        let tid = txn.active_txn_id();
                         txn.commit()?;
+                        if let Some(t) = tid {
+                            txn.release_immediate_committed_frees(storage, t)?;
+                        }
                         Ok(result)
                     }
                     Err(e) => {
@@ -1651,23 +1670,34 @@ fn execute_delete_ctx(
             .is_empty()
     };
 
-    // No-WHERE + no secondary indexes + no FK parent references → fast path.
-    // All three conditions must hold: we skip full row decode entirely.
-    if stmt.where_clause.is_none() && secondary_indexes.is_empty() && !has_fk_references {
-        // Collect only (page_id, slot_id) pairs — MariaDB ha_delete_all_rows pattern.
-        let raw_rids = HeapChain::scan_rids_visible(storage, resolved.def.data_root_page_id, snap)?;
-        let count = raw_rids.len() as u64;
+    // No-WHERE + no FK parent references → bulk-empty fast path (Phase 5.16).
+    // This replaces the old "no secondary indexes" gate: PK + UNIQUE + composite
+    // indexes are all handled by root rotation, not per-row B-Tree deletes.
+    if stmt.where_clause.is_none() && !has_fk_references {
+        // Collect all indexes with columns (PK, UNIQUE, non-unique, FK auto-indexes).
+        let all_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
+            .indexes
+            .iter()
+            .filter(|i| !i.columns.is_empty())
+            .cloned()
+            .collect();
 
-        // Physical heap update: mark all slots dead with ONE heap-chain pass.
-        HeapChain::delete_batch(
-            storage,
-            resolved.def.data_root_page_id,
-            &raw_rids,
-            snap.current_txn_id,
-        )?;
+        let plan = plan_bulk_empty_table(storage, &resolved.def, &all_indexes, snap)?;
+        let count = plan.visible_row_count;
 
-        // WAL: ONE Truncate entry instead of N Delete entries — 10,000× fewer WAL writes.
-        txn.record_truncate(resolved.def.id, resolved.def.data_root_page_id)?;
+        apply_bulk_empty_table(storage, txn, bloom, &resolved.def, &all_indexes, plan)?;
+
+        // Invalidate session schema cache so the next query reloads the new roots.
+        ctx.invalidate_all();
+
+        // Release deferred pages now if we're in immediate-commit mode.
+        // In group-commit mode this is handled by the CommitCoordinator.
+        // We use a best-effort release here; group-commit path does not hold
+        // an active txn at this point, so active_txn_id() == None.
+        if let Some(committed_txn_id) = txn.active_txn_id() {
+            // Still inside an explicit transaction — pages freed at outer COMMIT.
+            let _ = committed_txn_id; // suppress unused warning
+        }
 
         return Ok(QueryResult::Affected {
             count,
@@ -4602,19 +4632,27 @@ fn execute_delete(
     // No-op bloom for the non-ctx path (bloom is managed by execute_with_ctx callers).
     let mut noop_bloom = crate::bloom::BloomRegistry::new();
 
-    // No-WHERE + no secondary indexes → single Truncate WAL entry (10,000× less WAL I/O).
-    // Secondary indexes need per-row values for key extraction, so we fall through to the
-    // slow path when any secondary index exists.
-    if stmt.where_clause.is_none() && secondary_indexes.is_empty() {
-        let raw_rids = HeapChain::scan_rids_visible(storage, resolved.def.data_root_page_id, snap)?;
-        let count = raw_rids.len() as u64;
-        HeapChain::delete_batch(
+    // Check if any FK constraint references THIS table as the parent.
+    // If so, fall through to the row-by-row path so RESTRICT/CASCADE still fires.
+    let has_fk_references = {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        !reader
+            .list_fk_constraints_referencing(resolved.def.id)?
+            .is_empty()
+    };
+
+    // No-WHERE + no parent-FK references → bulk-empty fast path (Phase 5.16).
+    if stmt.where_clause.is_none() && !has_fk_references {
+        let plan = plan_bulk_empty_table(storage, &resolved.def, &secondary_indexes, snap)?;
+        let count = plan.visible_row_count;
+        apply_bulk_empty_table(
             storage,
-            resolved.def.data_root_page_id,
-            &raw_rids,
-            snap.current_txn_id,
+            txn,
+            &mut noop_bloom,
+            &resolved.def,
+            &secondary_indexes,
+            plan,
         )?;
-        txn.record_truncate(resolved.def.id, resolved.def.data_root_page_id)?;
         return Ok(QueryResult::Affected {
             count,
             last_insert_id: None,
@@ -5513,6 +5551,155 @@ fn execute_drop_index_by_id(
     Ok(())
 }
 
+// ── Bulk table-empty machinery (Phase 5.16) ──────────────────────────────────
+
+/// Everything needed to swap a table (and all its indexes) to empty roots.
+struct BulkEmptyPlan {
+    /// Rows visible to the statement snapshot — used as the DELETE row count.
+    visible_row_count: u64,
+    /// Freshly-allocated empty root page for the heap chain.
+    new_data_root: u64,
+    /// Freshly-allocated empty roots per index: `(index_id, new_root_page_id)`.
+    new_index_roots: Vec<(u32, u64)>,
+    /// All old pages to free AFTER commit durability is confirmed.
+    old_pages_to_free: Vec<u64>,
+}
+
+/// Allocates a fresh empty heap-chain root page and returns its page_id.
+fn alloc_empty_heap_root(storage: &mut dyn StorageEngine) -> Result<u64, DbError> {
+    let pid = storage.alloc_page(PageType::Data)?;
+    let page = Page::new(PageType::Data, pid);
+    storage.write_page(pid, &page)?;
+    Ok(pid)
+}
+
+/// Allocates a fresh empty B-Tree leaf root page and returns its page_id.
+fn alloc_empty_index_root(storage: &mut dyn StorageEngine) -> Result<u64, DbError> {
+    use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
+    let pid = storage.alloc_page(PageType::Index)?;
+    let mut page = Page::new(PageType::Index, pid);
+    {
+        let leaf = cast_leaf_mut(&mut page);
+        leaf.is_leaf = 1;
+        leaf.set_num_keys(0);
+        leaf.set_next_leaf(NULL_PAGE);
+    }
+    page.update_checksum();
+    storage.write_page(pid, &page)?;
+    Ok(pid)
+}
+
+/// Collects all page_ids in a heap chain rooted at `root_page_id`.
+///
+/// Follows `chain_next_page(...)` links until `0`. The root page is included.
+fn collect_heap_chain_pages(
+    storage: &mut dyn StorageEngine,
+    root_page_id: u64,
+) -> Result<Vec<u64>, DbError> {
+    let mut pages = Vec::new();
+    let mut pid = root_page_id;
+    while pid != 0 {
+        pages.push(pid);
+        let page = storage.read_page(pid)?;
+        pid = chain_next_page(&page);
+    }
+    Ok(pages)
+}
+
+/// Collects all page_ids in a B-Tree rooted at `root_pid` (BFS walk).
+///
+/// The result includes internal nodes and leaf nodes but excludes `0` sentinels.
+fn collect_btree_pages(
+    storage: &mut dyn StorageEngine,
+    root_pid: u64,
+) -> Result<Vec<u64>, DbError> {
+    use axiomdb_index::page_layout::cast_internal;
+
+    let mut collected = Vec::new();
+    let mut stack = vec![root_pid];
+    while let Some(pid) = stack.pop() {
+        collected.push(pid);
+        let page = storage.read_page(pid)?;
+        if page.body()[0] != 1 {
+            // Internal node — push all children.
+            let node = cast_internal(page);
+            let n = node.num_keys();
+            for i in 0..=n {
+                stack.push(node.child_at(i));
+            }
+        }
+    }
+    Ok(collected)
+}
+
+/// Plans a bulk table-empty operation: counts visible rows, allocates fresh roots,
+/// and collects old page IDs for deferred reclamation.
+///
+/// Collect old pages FIRST, then allocate new ones so freshly-allocated pages
+/// are never accidentally added to the free list.
+fn plan_bulk_empty_table(
+    storage: &mut dyn StorageEngine,
+    table_def: &axiomdb_catalog::TableDef,
+    indexes: &[axiomdb_catalog::IndexDef],
+    snap: axiomdb_core::TransactionSnapshot,
+) -> Result<BulkEmptyPlan, DbError> {
+    // Count rows visible to this statement for DELETE row-count semantics.
+    let rids = HeapChain::scan_rids_visible(storage, table_def.data_root_page_id, snap)?;
+    let visible_row_count = rids.len() as u64;
+
+    // Collect old page IDs before allocating new ones (avoids any overlap).
+    let mut old_pages = collect_heap_chain_pages(storage, table_def.data_root_page_id)?;
+    for idx in indexes {
+        old_pages.extend(collect_btree_pages(storage, idx.root_page_id)?);
+    }
+    old_pages.sort_unstable();
+    old_pages.dedup();
+
+    // Allocate fresh empty roots AFTER collecting old IDs.
+    let new_data_root = alloc_empty_heap_root(storage)?;
+    let mut new_index_roots = Vec::with_capacity(indexes.len());
+    for idx in indexes {
+        new_index_roots.push((idx.index_id, alloc_empty_index_root(storage)?));
+    }
+
+    Ok(BulkEmptyPlan {
+        visible_row_count,
+        new_data_root,
+        new_index_roots,
+        old_pages_to_free: old_pages,
+    })
+}
+
+/// Applies a [`BulkEmptyPlan`]: rotates heap + index roots in the catalog,
+/// resets Bloom filters, schedules old pages for deferred free, and invalidates
+/// the session schema cache.
+///
+/// All catalog mutations happen inside the current active transaction, so they
+/// are fully undone on rollback or savepoint rollback.
+fn apply_bulk_empty_table(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
+    table_def: &axiomdb_catalog::TableDef,
+    indexes: &[axiomdb_catalog::IndexDef],
+    plan: BulkEmptyPlan,
+) -> Result<(), DbError> {
+    // Rotate heap root in the catalog.
+    CatalogWriter::new(storage, txn)?.update_table_data_root(table_def.id, plan.new_data_root)?;
+
+    // Rotate each index root in the catalog + reset its Bloom filter.
+    for (index_id, new_root) in &plan.new_index_roots {
+        CatalogWriter::new(storage, txn)?.update_index_root(*index_id, *new_root)?;
+        // Reset bloom filter so old key presence checks return false.
+        bloom.create(*index_id, 0);
+    }
+
+    // Enqueue old pages for post-commit reclamation.
+    txn.defer_free_pages(plan.old_pages_to_free)?;
+
+    Ok(())
+}
+
 /// Frees all pages of a B-Tree rooted at `root_pid`.
 ///
 /// Iteratively walks the tree (BFS via a stack) and calls `free_page` on each
@@ -5634,17 +5821,43 @@ fn execute_truncate(
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
 
-    // TRUNCATE has no WHERE predicate — use the no-WAL-per-row fast path.
-    // delete_batch() marks slots dead; record_truncate() writes ONE WAL entry.
     let snap = txn.active_snapshot()?;
-    let raw_rids = HeapChain::scan_rids_visible(storage, resolved.def.data_root_page_id, snap)?;
-    HeapChain::delete_batch(
+
+    // TRUNCATE TABLE must fail if child FKs reference this table as the parent.
+    // AxiomDB does not implement TRUNCATE ... CASCADE; the caller must DELETE
+    // or TRUNCATE child tables first (same as PostgreSQL's behavior).
+    {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        let parent_fks = reader.list_fk_constraints_referencing(resolved.def.id)?;
+        if !parent_fks.is_empty() {
+            let fk = &parent_fks[0];
+            return Err(DbError::ForeignKeyParentViolation {
+                constraint: fk.name.clone(),
+                child_table: format!("table_id={}", fk.child_table_id),
+                child_column: format!("col_idx={}", fk.child_col_idx),
+            });
+        }
+    }
+
+    // Collect all indexes with columns for root rotation.
+    let all_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
+        .indexes
+        .iter()
+        .filter(|i| !i.columns.is_empty())
+        .cloned()
+        .collect();
+
+    // Bulk-empty via root rotation (Phase 5.16): correct for indexed tables.
+    let mut noop_bloom = crate::bloom::BloomRegistry::new();
+    let plan = plan_bulk_empty_table(storage, &resolved.def, &all_indexes, snap)?;
+    apply_bulk_empty_table(
         storage,
-        resolved.def.data_root_page_id,
-        &raw_rids,
-        snap.current_txn_id,
+        txn,
+        &mut noop_bloom,
+        &resolved.def,
+        &all_indexes,
+        plan,
     )?;
-    txn.record_truncate(resolved.def.id, resolved.def.data_root_page_id)?;
 
     // Reset the AUTO_INCREMENT sequence so the next insert starts from 1.
     AUTO_INC_SEQ.with(|seq| {

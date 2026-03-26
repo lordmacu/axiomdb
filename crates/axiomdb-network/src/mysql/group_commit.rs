@@ -107,6 +107,10 @@ pub fn spawn_group_commit_task(db: Arc<Mutex<Database>>, interval_ms: u64) -> Jo
                 if r.is_ok() {
                     let ids: Vec<TxnId> = tickets.iter().map(|t| t.txn_id).collect();
                     guard.txn.advance_committed(&ids);
+                    // Release deferred-free pages for this committed batch.
+                    // Pages were enqueued by bulk DELETE/TRUNCATE and must not be
+                    // freed until WAL fsync confirms durability.
+                    let _ = guard.release_deferred_frees(&ids);
                 }
                 if let Err(ref e) = r {
                     if matches!(e, DbError::DiskFull { .. }) {

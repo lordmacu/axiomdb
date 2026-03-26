@@ -370,6 +370,18 @@ impl Database {
         Ok((result, self.take_commit_rx()))
     }
 
+    /// Releases deferred-free pages for the given committed transaction IDs.
+    ///
+    /// Called by the group-commit background task after WAL fsync succeeds.
+    /// Wraps `TxnManager::release_committed_frees` to avoid split-borrow issues
+    /// when both `txn` and `storage` are fields of the same `Database`.
+    pub fn release_deferred_frees(
+        &mut self,
+        txn_ids: &[axiomdb_core::TxnId],
+    ) -> Result<(), axiomdb_core::error::DbError> {
+        self.txn.release_committed_frees(&mut self.storage, txn_ids)
+    }
+
     /// Returns `true` if the database has entered read-only degraded mode due
     /// to a previous disk-full error.
     pub fn is_degraded(&self) -> bool {

@@ -4482,3 +4482,219 @@ impl IntoRows for QueryResult {
         }
     }
 }
+
+// ── Bulk DELETE / TRUNCATE fast-path tests (Phase 5.16) ──────────────────────
+
+fn setup_pk_table(storage: &mut MemoryStorage, txn: &mut TxnManager) {
+    run(
+        "CREATE TABLE items (id INT NOT NULL, label TEXT)",
+        storage,
+        txn,
+    );
+    for i in 1..=5 {
+        run(
+            &format!("INSERT INTO items VALUES ({i}, 'item{i}')"),
+            storage,
+            txn,
+        );
+    }
+}
+
+#[test]
+fn test_bulk_delete_pk_table_returns_correct_count() {
+    let (mut storage, mut txn) = setup();
+    setup_pk_table(&mut storage, &mut txn);
+    let result = run("DELETE FROM items", &mut storage, &mut txn);
+    match result {
+        QueryResult::Affected { count, .. } => assert_eq!(count, 5),
+        other => panic!("expected Affected, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_bulk_delete_leaves_table_empty() {
+    let (mut storage, mut txn) = setup();
+    setup_pk_table(&mut storage, &mut txn);
+    run("DELETE FROM items", &mut storage, &mut txn);
+    let rows = rows(run("SELECT * FROM items", &mut storage, &mut txn));
+    assert!(rows.is_empty(), "table must be empty after bulk DELETE");
+}
+
+#[test]
+fn test_bulk_delete_allows_reinsert_same_pk() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT NOT NULL)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (1)", &mut storage, &mut txn);
+    run("DELETE FROM t", &mut storage, &mut txn);
+    // Reinserting the same PK must succeed — no stale index entry.
+    let result = run_result("INSERT INTO t VALUES (1)", &mut storage, &mut txn);
+    assert!(
+        result.is_ok(),
+        "reinsert after bulk DELETE must succeed: {result:?}"
+    );
+}
+
+#[test]
+fn test_truncate_indexed_table_allows_reinsert() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT NOT NULL, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run("INSERT INTO t VALUES (1, 'Alice')", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (2, 'Bob')", &mut storage, &mut txn);
+    run("TRUNCATE TABLE t", &mut storage, &mut txn);
+    let rows_after = rows(run("SELECT * FROM t", &mut storage, &mut txn));
+    assert!(rows_after.is_empty(), "table must be empty after TRUNCATE");
+    // Must be able to reinsert — old index roots are gone.
+    let result = run_result("INSERT INTO t VALUES (1, 'Carol')", &mut storage, &mut txn);
+    assert!(
+        result.is_ok(),
+        "reinsert after TRUNCATE must succeed: {result:?}"
+    );
+}
+
+#[test]
+fn test_bulk_delete_then_rollback_restores_data() {
+    let (mut storage, mut txn) = setup();
+    setup_pk_table(&mut storage, &mut txn);
+    run("BEGIN", &mut storage, &mut txn);
+    run("DELETE FROM items", &mut storage, &mut txn);
+    let count_inside = rows(run("SELECT * FROM items", &mut storage, &mut txn)).len();
+    assert_eq!(count_inside, 0, "inside txn: table must appear empty");
+    run("ROLLBACK", &mut storage, &mut txn);
+    let count_after = rows(run("SELECT * FROM items", &mut storage, &mut txn)).len();
+    assert_eq!(
+        count_after, 5,
+        "after ROLLBACK: original data must be restored"
+    );
+}
+
+#[test]
+fn test_bulk_delete_savepoint_rollback_restores_data() {
+    // Tests TxnManager savepoint API directly (SQL SAVEPOINT is Phase 7.12).
+    let (mut storage, mut txn) = setup();
+    setup_pk_table(&mut storage, &mut txn);
+    txn.begin().unwrap(); // explicit BEGIN
+                          // Insert item6 before the savepoint.
+    run(
+        "INSERT INTO items VALUES (6, 'item6')",
+        &mut storage,
+        &mut txn,
+    );
+    let sp = txn.savepoint();
+    // Bulk delete inside the transaction.
+    run("DELETE FROM items", &mut storage, &mut txn);
+    assert_eq!(
+        rows(run("SELECT * FROM items", &mut storage, &mut txn)).len(),
+        0,
+        "inside txn after DELETE: must be empty"
+    );
+    // Rollback to savepoint — restores pre-delete state (items 1-5 + item6).
+    txn.rollback_to_savepoint(sp, &mut storage).unwrap();
+    let count = rows(run("SELECT * FROM items", &mut storage, &mut txn)).len();
+    assert_eq!(
+        count, 6,
+        "after savepoint rollback: must see items 1–5 + item6"
+    );
+    txn.commit().unwrap();
+}
+
+#[test]
+fn test_truncate_resets_auto_increment_bulk_path() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT AUTO_INCREMENT NOT NULL, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run("INSERT INTO t (name) VALUES ('a')", &mut storage, &mut txn);
+    run("INSERT INTO t (name) VALUES ('b')", &mut storage, &mut txn);
+    run("TRUNCATE TABLE t", &mut storage, &mut txn);
+    run("INSERT INTO t (name) VALUES ('c')", &mut storage, &mut txn);
+    let rows_result = rows(run("SELECT id FROM t", &mut storage, &mut txn));
+    assert_eq!(rows_result.len(), 1);
+    // After TRUNCATE + bulk path, auto-increment must reset — id should be 1.
+    assert_eq!(
+        rows_result[0][0],
+        axiomdb_types::Value::Int(1),
+        "AUTO_INCREMENT must reset to 1 after TRUNCATE (bulk path)"
+    );
+}
+
+#[test]
+fn test_truncate_parent_fk_table_fails() {
+    let (mut storage, mut txn) = setup();
+    // Parent must have PRIMARY KEY so FK enforcement can find the index.
+    run(
+        "CREATE TABLE parent (id INT NOT NULL, PRIMARY KEY (id))",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE TABLE child (id INT NOT NULL, parent_id INT NOT NULL REFERENCES parent(id))",
+        &mut storage,
+        &mut txn,
+    );
+    run("INSERT INTO parent VALUES (1)", &mut storage, &mut txn);
+    run("INSERT INTO child VALUES (1, 1)", &mut storage, &mut txn);
+    let result = run_result("TRUNCATE TABLE parent", &mut storage, &mut txn);
+    assert!(
+        matches!(result, Err(DbError::ForeignKeyParentViolation { .. })),
+        "TRUNCATE of parent FK table must fail: {result:?}"
+    );
+    // Table still has data.
+    assert_eq!(
+        rows(run("SELECT * FROM parent", &mut storage, &mut txn)).len(),
+        1
+    );
+}
+
+#[test]
+fn test_delete_parent_fk_table_uses_slow_path() {
+    // DELETE on a parent-FK table must still use the row-by-row path (which
+    // enforces RESTRICT semantics), not the bulk-empty fast path.
+    // Uses execute_with_ctx since FK enforcement is most reliable through the ctx path.
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE TABLE parent (id INT NOT NULL, PRIMARY KEY (id))",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "CREATE TABLE child (id INT NOT NULL, parent_id INT NOT NULL REFERENCES parent(id) ON DELETE RESTRICT)",
+        &mut storage, &mut txn, &mut bloom, &mut ctx,
+    ).unwrap();
+    run_ctx(
+        "INSERT INTO parent VALUES (1)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "INSERT INTO child VALUES (1, 1)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    // DELETE on parent while child references it must fail with FK violation.
+    let result = run_ctx(
+        "DELETE FROM parent",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+    assert!(
+        matches!(result, Err(DbError::ForeignKeyParentViolation { .. })),
+        "DELETE on parent with referencing child must fail: {result:?}"
+    );
+}

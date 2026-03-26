@@ -44,8 +44,17 @@ use crate::{
 /// Savepoints are **not persisted** to the WAL — they are valid only within the
 /// lifetime of the current `TxnManager` instance. Crash recovery handles
 /// transactions at transaction granularity (full redo/undo), not statement level.
+///
+/// In Phase 5.16 the savepoint also records the length of the deferred-free
+/// page queue so that bulk-empty pages allocated after the savepoint are
+/// discarded (not freed) on `rollback_to_savepoint`.
 #[derive(Debug, Clone, Copy)]
-pub struct Savepoint(usize);
+pub struct Savepoint {
+    /// Index into `ActiveTxn::undo_ops` at savepoint creation time.
+    pub(crate) undo_len: usize,
+    /// Length of `ActiveTxn::deferred_free_pages` at savepoint creation time.
+    pub(crate) deferred_free_len: usize,
+}
 
 // ── UndoOp ───────────────────────────────────────────────────────────────────
 
@@ -75,6 +84,14 @@ struct ActiveTxn {
     snapshot_id_at_begin: u64,
     /// Undo ops in chronological order; applied last-to-first on rollback.
     undo_ops: Vec<UndoOp>,
+    /// Pages to free **after** this transaction is durably committed.
+    ///
+    /// Populated by `defer_free_pages(...)` during bulk-empty operations (Phase 5.16).
+    /// On `rollback` or `rollback_to_savepoint`, these pages are NOT freed — the
+    /// catalog undo already restored the old roots, so the old pages remain live.
+    /// On `commit`, this list moves to `TxnManager::committed_free_batches` keyed
+    /// by `txn_id` and is freed only after `release_committed_frees(...)` is called.
+    deferred_free_pages: Vec<u64>,
 }
 
 // ── TxnManager ───────────────────────────────────────────────────────────────
@@ -100,6 +117,12 @@ pub struct TxnManager {
     /// Set by `commit()` when `deferred_commit_mode` is true and the transaction
     /// contained DML. Cleared by `take_pending_deferred_commit()`.
     pending_deferred_txn_id: Option<TxnId>,
+    /// Pages waiting to be freed after their transaction is durably committed.
+    ///
+    /// Each entry is `(txn_id, pages)`. Populated by `commit()` from
+    /// `ActiveTxn::deferred_free_pages`. Released by `release_committed_frees(...)`
+    /// after WAL fsync confirms durability, in both immediate and group-commit modes.
+    committed_free_batches: Vec<(TxnId, Vec<u64>)>,
 }
 
 impl TxnManager {
@@ -118,6 +141,7 @@ impl TxnManager {
             wal_scratch: Vec::with_capacity(256),
             deferred_commit_mode: false,
             pending_deferred_txn_id: None,
+            committed_free_batches: Vec::new(),
         })
     }
 
@@ -137,6 +161,7 @@ impl TxnManager {
             wal_scratch: Vec::with_capacity(256),
             deferred_commit_mode: false,
             pending_deferred_txn_id: None,
+            committed_free_batches: Vec::new(),
         })
     }
 
@@ -166,6 +191,7 @@ impl TxnManager {
             txn_id,
             snapshot_id_at_begin: self.max_committed + 1,
             undo_ops: Vec::new(),
+            deferred_free_pages: Vec::new(),
         });
         Ok(txn_id)
     }
@@ -186,6 +212,7 @@ impl TxnManager {
     pub fn commit(&mut self) -> Result<(), DbError> {
         let active = self.active.take().ok_or(DbError::NoActiveTransaction)?;
         let txn_id = active.txn_id;
+        let deferred_pages = active.deferred_free_pages;
 
         let mut entry = WalEntry::new(0, txn_id, EntryType::Commit, 0, vec![], vec![], vec![]);
         self.wal
@@ -208,6 +235,13 @@ impl TxnManager {
             // Immediate mode: full flush + fsync to guarantee durability.
             self.wal.commit()?;
             self.max_committed = txn_id;
+        }
+
+        // Register deferred-free pages (if any) for post-commit reclamation.
+        // Pages are only freed after `release_committed_frees(txn_id)` confirms
+        // WAL durability — never before.
+        if !deferred_pages.is_empty() {
+            self.committed_free_batches.push((txn_id, deferred_pages));
         }
 
         Ok(())
@@ -251,6 +285,82 @@ impl TxnManager {
         }
     }
 
+    /// Enqueues `pages` for deferred reclamation after the current transaction
+    /// is durably committed.
+    ///
+    /// Must be called **inside an active transaction**. The pages are moved to
+    /// `committed_free_batches` on `commit()` and physically freed only when
+    /// `release_committed_frees(...)` is called with a matching `txn_id`.
+    ///
+    /// On `rollback` or `rollback_to_savepoint`, deferred pages are simply
+    /// discarded — the catalog undo restores the old roots so old pages remain live.
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] if no transaction is open.
+    pub fn defer_free_pages(
+        &mut self,
+        pages: impl IntoIterator<Item = u64>,
+    ) -> Result<(), DbError> {
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        active.deferred_free_pages.extend(pages);
+        Ok(())
+    }
+
+    /// Frees pages whose transactions have been durably committed.
+    ///
+    /// Called after WAL fsync succeeds (immediate mode: right after `commit()`;
+    /// group-commit mode: after `advance_committed(&ids)` in the background task).
+    ///
+    /// Pages are freed via `storage.free_page(pid)`. Any `txn_id` in `txn_ids`
+    /// that has no pending batch is silently ignored.
+    ///
+    /// # Errors
+    /// - I/O errors from `storage.free_page(...)`.
+    pub fn release_committed_frees(
+        &mut self,
+        storage: &mut dyn StorageEngine,
+        txn_ids: &[TxnId],
+    ) -> Result<(), DbError> {
+        if txn_ids.is_empty() || self.committed_free_batches.is_empty() {
+            return Ok(());
+        }
+        let id_set: std::collections::HashSet<TxnId> = txn_ids.iter().copied().collect();
+        let mut remaining = Vec::with_capacity(self.committed_free_batches.len());
+        for (txn_id, pages) in self.committed_free_batches.drain(..) {
+            if id_set.contains(&txn_id) {
+                for pid in pages {
+                    // Best-effort: ignore double-free errors (page already freed
+                    // by earlier recovery or duplicate call).
+                    let _ = storage.free_page(pid);
+                }
+            } else {
+                remaining.push((txn_id, pages));
+            }
+        }
+        self.committed_free_batches = remaining;
+        Ok(())
+    }
+
+    /// Releases deferred-free pages for `txn_id` only in immediate-commit mode.
+    ///
+    /// In group-commit mode this is a no-op — the `CommitCoordinator` background
+    /// task calls [`release_committed_frees`] after batch fsync confirms durability.
+    ///
+    /// Call this right after a successful `txn.commit()` in immediate-commit paths,
+    /// passing the txn_id captured from `active_txn_id()` before the commit call.
+    ///
+    /// [`release_committed_frees`]: TxnManager::release_committed_frees
+    pub fn release_immediate_committed_frees(
+        &mut self,
+        storage: &mut dyn StorageEngine,
+        txn_id: TxnId,
+    ) -> Result<(), DbError> {
+        if !self.deferred_commit_mode {
+            self.release_committed_frees(storage, &[txn_id])?;
+        }
+        Ok(())
+    }
+
     /// Flushes the WAL BufWriter to the OS and fsyncs to disk.
     ///
     /// Called by the `CommitCoordinator` background task while holding the
@@ -283,7 +393,15 @@ impl TxnManager {
             self.active.is_some(),
             "savepoint() called outside an active transaction"
         );
-        Savepoint(self.active.as_ref().map_or(0, |a| a.undo_ops.len()))
+        let (undo_len, deferred_free_len) = self
+            .active
+            .as_ref()
+            .map(|a| (a.undo_ops.len(), a.deferred_free_pages.len()))
+            .unwrap_or((0, 0));
+        Savepoint {
+            undo_len,
+            deferred_free_len,
+        }
     }
 
     /// Undoes all operations recorded **after** `sp`, leaving the transaction active.
@@ -307,8 +425,12 @@ impl TxnManager {
         let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
         let txn_id = active.txn_id;
 
-        // Drain only the ops recorded after the savepoint.
-        let ops_to_undo: Vec<UndoOp> = active.undo_ops.drain(sp.0..).rev().collect();
+        // Discard deferred-free pages recorded after this savepoint.
+        // Catalog undo (below) restores old roots, so old pages remain live.
+        active.deferred_free_pages.truncate(sp.deferred_free_len);
+
+        // Drain only the undo ops recorded after the savepoint.
+        let ops_to_undo: Vec<UndoOp> = active.undo_ops.drain(sp.undo_len..).rev().collect();
         for op in ops_to_undo {
             match op {
                 UndoOp::UndoInsert { page_id, slot_id } => {
@@ -347,6 +469,10 @@ impl TxnManager {
         // Write Rollback entry — informational for crash recovery. No fsync.
         let mut entry = WalEntry::new(0, txn_id, EntryType::Rollback, 0, vec![], vec![], vec![]);
         self.wal.append(&mut entry)?;
+
+        // Discard deferred-free pages: catalog undo will restore old roots,
+        // so the old pages remain live and must not be freed.
+        // (deferred_free_pages is dropped with `active` after the loop.)
 
         // Apply undo ops in reverse (last DML first).
         for op in active.undo_ops.into_iter().rev() {
@@ -821,6 +947,7 @@ impl TxnManager {
             wal_scratch: Vec::with_capacity(256),
             deferred_commit_mode: false,
             pending_deferred_txn_id: None,
+            committed_free_batches: Vec::new(),
         };
         Ok((mgr, result))
     }
