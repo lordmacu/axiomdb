@@ -383,6 +383,48 @@ where `NULL = NULL` returns UNKNOWN.
 
 ---
 
+## LIMIT / OFFSET — Row-Count Coercion (Phase 4.10d)
+
+`apply_limit_offset` runs after ORDER BY and DISTINCT. It calls
+`eval_row_count_as_usize` for each row-count expression.
+
+### Row-count coercion contract
+
+| Evaluated value | Result |
+|---|---|
+| `Int(n)` where `n ≥ 0` | `n as usize` |
+| `BigInt(n)` where `n ≥ 0` | `usize::try_from(n)` — errors on overflow |
+| `Text(s)` where `s.trim()` parses as an exact base-10 integer `≥ 0` | parsed value as `usize` |
+| negative `Int` or `BigInt` | `DbError::TypeMismatch` |
+| non-integral `Text` (`"10.1"`, `"1e3"`, `"abc"`) | `DbError::TypeMismatch` |
+| `NULL`, `Bool`, `Real`, `Decimal`, `Date`, `Timestamp` | `DbError::TypeMismatch` |
+
+Text coercion is intentionally narrow: only exact base-10 integers are accepted.
+Scientific notation, decimal fractions, and time-like strings are all rejected.
+
+### Why Text is accepted
+
+The prepared-statement SQL-string substitution path serializes a `Value::Text("2")`
+parameter as `LIMIT '2'` in the generated SQL. Without Text coercion, the fallback
+path would always fail for string-bound LIMIT parameters — which is the binding
+type used by some MariaDB clients. Accepting exact integer Text keeps the
+cached-AST prepared path and the SQL-string fallback path on identical semantics.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision</span>
+AxiomDB does not call the general <code>coerce()</code> function here.
+<code>coerce()</code> uses assignment-coercion semantics and would change the
+error class to <code>InvalidCoercion</code>, masking the semantic error.
+<code>eval_row_count_as_usize</code> implements the narrower 4.10d contract
+directly in the executor, keeping the error class and message family consistent
+for both prepared paths.
+</div>
+</div>
+
+---
+
 ## INSERT ... SELECT — MVCC Isolation
 
 `INSERT INTO target SELECT ... FROM source` executes the SELECT phase under

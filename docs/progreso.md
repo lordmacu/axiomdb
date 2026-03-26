@@ -135,7 +135,7 @@
 - [x] 4.10 ✅ ORDER BY + LIMIT/OFFSET — in-memory sort; stable sort_by; sort_err pattern
 - [x] 4.10b ✅ Multi-column ORDER BY with mixed direction — composite comparator, left-to-right
 - [x] 4.10c ✅ NULLS FIRST / NULLS LAST — ASC→NULLS LAST, DESC→NULLS FIRST (PG defaults); explicit override
-- [ ] 4.10d ⏳ Parameterized LIMIT/OFFSET — `LIMIT $1 OFFSET $2` in prepared statements (deferred to Phase 5)
+- [x] 4.10d ✅ Parameterized LIMIT/OFFSET — `LIMIT ?` / `OFFSET ?` in prepared statements; accepts Int/BigInt/>0 and exact integer Text; rejects negatives, non-integral text, NULL; safe usize::try_from for BigInt
 - [x] 4.11 ✅ Scalar subqueries — scalar `(SELECT ...)`, `IN (SELECT ...)`, `EXISTS/NOT EXISTS`, correlated subqueries, derived tables `FROM (SELECT ...)`, `SubqueryRunner` trait + `eval_with`; 14 integration tests
 - [x] 4.12 ✅ DISTINCT — HashSet dedup on projected output rows; NULL=NULL for grouping; pre-LIMIT
 - [x] 4.12b ✅ CAST + basic type coercion — explicit and implicit conversion between compatible types

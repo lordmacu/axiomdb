@@ -732,4 +732,108 @@ mod tests {
         assert_eq!(packets[0].0, 1); // OK at seq=1
         assert_eq!(packets[0].1[0], 0x00); // status = OK
     }
+
+    // ── 4.10d — Parameterized LIMIT/OFFSET substitution ──────────────────────
+
+    #[test]
+    fn test_substitute_params_limit_offset_string_path() {
+        // SQL-string substitution path: Text params become single-quoted literals.
+        // The executor's eval_row_count_as_usize then accepts them as valid row counts.
+        let sql = substitute_params(
+            "SELECT * FROM t ORDER BY a LIMIT ? OFFSET ?",
+            &[Value::Text("2".into()), Value::Text("1".into())],
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT * FROM t ORDER BY a LIMIT '2' OFFSET '1'");
+    }
+
+    #[test]
+    fn test_substitute_params_limit_offset_int_path() {
+        // Int params remain unquoted — still valid row counts.
+        let sql = substitute_params(
+            "SELECT * FROM t ORDER BY a LIMIT ? OFFSET ?",
+            &[Value::Int(5), Value::Int(10)],
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT * FROM t ORDER BY a LIMIT 5 OFFSET 10");
+    }
+
+    #[test]
+    fn test_subst_select_limit_offset_ast_path() {
+        // Verify the cached-AST substitution path replaces Param nodes in
+        // limit and offset without requiring a full DB setup.
+        // parse() builds an AST with Expr::Param nodes in limit/offset;
+        // substitute_params_in_ast() replaces them with Literal values.
+        let template =
+            axiomdb_sql::parse("SELECT a FROM t ORDER BY a LIMIT ? OFFSET ?", None).unwrap();
+
+        let substituted =
+            substitute_params_in_ast(template, &[Value::Int(2), Value::Int(1)]).unwrap();
+
+        if let axiomdb_sql::Stmt::Select(s) = substituted {
+            assert!(
+                matches!(s.limit, Some(axiomdb_sql::Expr::Literal(Value::Int(2)))),
+                "limit should be Literal(Int(2)), got {:?}",
+                s.limit
+            );
+            assert!(
+                matches!(s.offset, Some(axiomdb_sql::Expr::Literal(Value::Int(1)))),
+                "offset should be Literal(Int(1)), got {:?}",
+                s.offset
+            );
+        } else {
+            panic!("expected Select stmt");
+        }
+    }
+
+    #[test]
+    fn test_decode_string_type_for_limit_param() {
+        // MYSQL_TYPE_STRING (0xfd) carrying the text "1" decodes to Value::Text("1").
+        // This is the compatibility case from MariaDB clients that bind LIMIT ?
+        // as a string type.
+        let s = b"1";
+        let mut buf = vec![s.len() as u8]; // lenenc: 1 byte length prefix
+        buf.extend_from_slice(s);
+        let (val, consumed) = decode_binary_value(&buf, 0xfd).unwrap();
+        assert_eq!(val, Value::Text("1".into()));
+        assert_eq!(consumed, 2); // 1 byte lenenc + 1 byte payload
+    }
+
+    #[test]
+    fn test_parse_execute_packet_string_limit_param() {
+        // Full parse_execute_packet path: one MYSQL_TYPE_STRING param carrying "2".
+        let mut stmt = PreparedStatement {
+            stmt_id: 1,
+            sql_template: "SELECT a FROM t LIMIT ?".into(),
+            param_count: 1,
+            param_types: vec![0xfd], // MYSQL_TYPE_STRING
+            analyzed_stmt: None,
+            compiled_at_version: 0,
+            last_used_seq: 0,
+        };
+
+        // Build a minimal COM_STMT_EXECUTE payload:
+        //   [0..4]  stmt_id = 1 (LE u32)
+        //   [4]     flags = 0
+        //   [5..9]  iteration_count = 1 (LE u32)
+        //   [9]     null_bitmap: 1 param, not null → 0x00
+        //   [10]    new_params_bound_flag = 1
+        //   [11..13] type list: 0xfd 0x00 (MYSQL_TYPE_STRING, unsigned=0)
+        //   [13]    lenenc length = 1
+        //   [14]    payload = b'2'
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes()); // stmt_id
+        payload.push(0); // flags
+        payload.extend_from_slice(&1u32.to_le_bytes()); // iteration_count
+        payload.push(0x00); // null_bitmap (param 0 is not null)
+        payload.push(1); // new_params_bound_flag
+        payload.push(0xfd); // MYSQL_TYPE_STRING
+        payload.push(0x00); // unsigned flag
+        payload.push(1); // lenenc: length = 1
+        payload.push(b'2'); // the string "2"
+
+        let exec = parse_execute_packet(&payload, &mut stmt).unwrap();
+        assert_eq!(exec.params.len(), 1);
+        assert_eq!(exec.params[0], Value::Text("2".into()));
+    }
 }

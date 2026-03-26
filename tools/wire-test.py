@@ -3,7 +3,7 @@
 AxiomDB wire protocol test.
 Updated at each subphase close — always overwrite this file, never create new ones.
 
-Last updated: subphase 4.10e (ORDER BY + GROUP BY: remap col_idx to output position in grouped executors)
+Last updated: subphase 4.10d (parameterized LIMIT/OFFSET in prepared statements)
 """
 import os
 import signal
@@ -992,6 +992,59 @@ ok("@@strict_mode is ON after SET sql_mode = 'STRICT_TRANS_TABLES'",
 
 cs.execute("DROP TABLE IF EXISTS t_wire_strict")
 conn_strict.close()
+
+# ── [4.10d] Parameterized LIMIT/OFFSET in prepared statements ─────────────────
+
+print("\n[4.10d] Parameterized LIMIT/OFFSET in prepared statements")
+
+cur.execute("DROP TABLE IF EXISTS t_param_limit")
+cur.execute("CREATE TABLE t_param_limit (a INT)")
+for i in range(1, 6):
+    cur.execute("INSERT INTO t_param_limit VALUES (%s)", (i,))
+
+# Integer params: LIMIT 2 OFFSET 1 → rows 2, 3
+stmt = cur.connection.cursor()
+stmt.execute("SELECT a FROM t_param_limit ORDER BY a ASC LIMIT %s OFFSET %s", (2, 1))
+rows_pl = stmt.fetchall()
+ok("param LIMIT 2 OFFSET 1 — row count", len(rows_pl) == 2)
+ok("param LIMIT 2 OFFSET 1 — first row", rows_pl[0][0] == 2)
+ok("param LIMIT 2 OFFSET 1 — second row", rows_pl[1][0] == 3)
+
+# LIMIT only
+stmt.execute("SELECT a FROM t_param_limit ORDER BY a ASC LIMIT %s", (3,))
+rows_pl2 = stmt.fetchall()
+ok("param LIMIT 3 — row count", len(rows_pl2) == 3)
+ok("param LIMIT 3 — first row", rows_pl2[0][0] == 1)
+
+# OFFSET only (LIMIT is literal MAX)
+stmt.execute("SELECT a FROM t_param_limit ORDER BY a ASC LIMIT 100 OFFSET %s", (3,))
+rows_pl3 = stmt.fetchall()
+ok("param OFFSET 3 — row count (5 - 3 = 2)", len(rows_pl3) == 2)
+ok("param OFFSET 3 — first row", rows_pl3[0][0] == 4)
+
+# LIMIT 0 — valid, returns zero rows
+stmt.execute("SELECT a FROM t_param_limit LIMIT %s", (0,))
+ok("param LIMIT 0 — empty result", len(stmt.fetchall()) == 0)
+
+# Invalid: negative LIMIT — must raise an error
+try:
+    conn_neg = pymysql.connect(host="127.0.0.1", port=PORT, user="root",
+                               password="", database="test", autocommit=True)
+    cn = conn_neg.cursor()
+    cn.execute("DROP TABLE IF EXISTS t_neg_lim")
+    cn.execute("CREATE TABLE t_neg_lim (a INT)")
+    cn.execute("INSERT INTO t_neg_lim VALUES (1)")
+    cn.execute("SELECT a FROM t_neg_lim LIMIT -1")
+    ok("param LIMIT -1 raises error", False)
+except Exception:
+    ok("param LIMIT -1 raises error", True)
+finally:
+    try:
+        conn_neg.close()
+    except Exception:
+        pass
+
+cur.execute("DROP TABLE IF EXISTS t_param_limit")
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

@@ -6464,22 +6464,65 @@ fn remap_expr_for_grouped(expr: &Expr, select_items: &[SelectItem]) -> Expr {
     }
 }
 
-/// Evaluates a LIMIT or OFFSET expression as a non-negative integer.
+/// Evaluates a LIMIT or OFFSET expression as a non-negative `usize`.
 ///
-/// # Errors
-/// - [`DbError::TypeMismatch`] if the value is negative or not an integer.
-fn eval_as_usize(expr: &Expr) -> Result<usize, DbError> {
+/// Accepted value types and their contracts:
+/// - `Int(n)`    where `n >= 0`  → `n as usize`
+/// - `BigInt(n)` where `n >= 0`  → `usize::try_from(n)` (errors on overflow)
+/// - `Text(s)`   where `s.trim()` is an exact base-10 integer `>= 0`  → parsed
+///
+/// Everything else — negatives, non-integral text, NULL, REAL, BOOL, etc. —
+/// returns `DbError::TypeMismatch`.
+///
+/// This function is the single enforcement point for LIMIT/OFFSET row-count
+/// coercion for both the cached-AST prepared-statement path and the
+/// SQL-string substitution fallback path.
+fn eval_row_count_as_usize(expr: &Expr) -> Result<usize, DbError> {
+    fn mismatch(expected: &str, got: &str) -> DbError {
+        DbError::TypeMismatch {
+            expected: expected.into(),
+            got: got.into(),
+        }
+    }
+
     match eval(expr, &[])? {
         Value::Int(n) if n >= 0 => Ok(n as usize),
-        Value::BigInt(n) if n >= 0 => Ok(n as usize),
-        Value::Int(_) | Value::BigInt(_) => Err(DbError::TypeMismatch {
-            expected: "non-negative integer for LIMIT/OFFSET".into(),
-            got: "negative integer".into(),
+        Value::Int(_) => Err(mismatch(
+            "non-negative integer for LIMIT/OFFSET",
+            "negative integer",
+        )),
+        Value::BigInt(n) if n >= 0 => usize::try_from(n).map_err(|_| {
+            mismatch(
+                "non-negative integer for LIMIT/OFFSET",
+                "integer too large for this platform",
+            )
         }),
-        other => Err(DbError::TypeMismatch {
-            expected: "integer for LIMIT/OFFSET".into(),
-            got: other.variant_name().into(),
-        }),
+        Value::BigInt(_) => Err(mismatch(
+            "non-negative integer for LIMIT/OFFSET",
+            "negative integer",
+        )),
+        Value::Text(s) => {
+            let trimmed = s.trim();
+            let parsed = trimmed.parse::<i64>().map_err(|_| {
+                mismatch(
+                    "non-negative integer for LIMIT/OFFSET",
+                    &format!("non-integral text: {trimmed:?}"),
+                )
+            })?;
+            if parsed < 0 {
+                return Err(mismatch(
+                    "non-negative integer for LIMIT/OFFSET",
+                    "negative integer",
+                ));
+            }
+            usize::try_from(parsed).map_err(|_| {
+                mismatch(
+                    "non-negative integer for LIMIT/OFFSET",
+                    "integer too large for this platform",
+                )
+            })
+        }
+        other => Err(mismatch("integer for LIMIT/OFFSET", other.variant_name())),
     }
 }
 
@@ -6492,8 +6535,12 @@ fn apply_limit_offset(
     limit: &Option<Expr>,
     offset: &Option<Expr>,
 ) -> Result<Vec<Row>, DbError> {
-    let offset_n = offset.as_ref().map(eval_as_usize).transpose()?.unwrap_or(0);
-    let limit_n = limit.as_ref().map(eval_as_usize).transpose()?;
+    let offset_n = offset
+        .as_ref()
+        .map(eval_row_count_as_usize)
+        .transpose()?
+        .unwrap_or(0);
+    let limit_n = limit.as_ref().map(eval_row_count_as_usize).transpose()?;
     Ok(rows
         .into_iter()
         .skip(offset_n)
