@@ -33,7 +33,7 @@ use crate::page_layout::{
 /// fillfactor=70  → 152
 /// fillfactor=10  →  22  (minimum useful)
 /// ```
-pub(crate) const fn fill_threshold(order: usize, fillfactor: u8) -> usize {
+pub const fn fill_threshold(order: usize, fillfactor: u8) -> usize {
     let ff = fillfactor as usize;
     // usize::div_ceil is stable since Rust 1.73; use it for correctness and
     // to satisfy clippy's "manually reimplementing div_ceil" lint.
@@ -214,15 +214,10 @@ impl BTree {
                         node2.set_child_at(child_idx, left_pid);
 
                         if n < ORDER_INTERNAL {
+                            // Parent has room: absorb separator + right child in place.
+                            // Same page ID propagates upward → ancestors need no rewrite.
                             node2.insert_at(child_idx, &sep, right_pid);
-                            #[cfg(debug_assertions)]
-                            node2.validate();
-                            let new_pid = storage.alloc_page(PageType::Index)?;
-                            let mut p = Page::new(PageType::Index, new_pid);
-                            *cast_internal_mut(&mut p) = node2;
-                            p.update_checksum();
-                            storage.write_page(new_pid, &p)?;
-                            storage.free_page(pid)?;
+                            let new_pid = Self::write_internal_same_pid(storage, pid, node2)?;
                             Ok(InsertResult::Ok(new_pid))
                         } else {
                             Self::split_internal(storage, pid, node2, child_idx, &sep, right_pid)
@@ -414,6 +409,41 @@ impl BTree {
         Ok(pid)
     }
 
+    /// Persists `node` (a leaf) back to the **same** page `pid`.
+    ///
+    /// Never allocates or frees pages. Returns `pid` unchanged so callers
+    /// can propagate `InsertResult::Ok(pid)` / `DeleteResult::Deleted { new_pid: pid }`.
+    #[inline]
+    fn write_leaf_same_pid(
+        storage: &mut dyn StorageEngine,
+        pid: u64,
+        node: LeafNodePage,
+    ) -> Result<u64, DbError> {
+        let mut p = Page::new(PageType::Index, pid);
+        *cast_leaf_mut(&mut p) = node;
+        p.update_checksum();
+        storage.write_page(pid, &p)?;
+        Ok(pid)
+    }
+
+    /// Persists `node` (an internal node) back to the **same** page `pid`.
+    ///
+    /// Never allocates or frees pages. Returns `pid` unchanged.
+    #[inline]
+    fn write_internal_same_pid(
+        storage: &mut dyn StorageEngine,
+        pid: u64,
+        node: InternalNodePage,
+    ) -> Result<u64, DbError> {
+        #[cfg(debug_assertions)]
+        node.validate();
+        let mut p = Page::new(PageType::Index, pid);
+        *cast_internal_mut(&mut p) = node;
+        p.update_checksum();
+        storage.write_page(pid, &p)?;
+        Ok(pid)
+    }
+
     fn in_place_update_child(
         storage: &mut dyn StorageEngine,
         old_pid: u64,
@@ -421,15 +451,8 @@ impl BTree {
         child_idx: usize,
         new_child: u64,
     ) -> Result<u64, DbError> {
-        // In-place: with &mut self there are no concurrent readers, CoW not needed.
         node.set_child_at(child_idx, new_child);
-        #[cfg(debug_assertions)]
-        node.validate();
-        let mut p = Page::new(PageType::Index, old_pid);
-        *cast_internal_mut(&mut p) = node;
-        p.update_checksum();
-        storage.write_page(old_pid, &p)?;
-        Ok(old_pid)
+        Self::write_internal_same_pid(storage, old_pid, node)
     }
 
     // ── Delete ───────────────────────────────────────────────────────────────
@@ -470,6 +493,18 @@ impl BTree {
                         underfull,
                     } => {
                         if !underfull {
+                            if new_child_pid == child_pid {
+                                // Child stayed on the same page — parent's child pointer
+                                // is already correct. No rewrite needed and the parent's
+                                // key count is unchanged, so it cannot have become underfull.
+                                return Ok(DeleteResult::Deleted {
+                                    new_pid: pid,
+                                    underfull: false,
+                                });
+                            }
+                            // Child moved to a different page — update the pointer in place.
+                            // in_place_update_child only changes a child pointer, not key count,
+                            // so the parent cannot become underfull from this operation alone.
                             let new_pid = Self::in_place_update_child(
                                 storage,
                                 pid,
@@ -477,13 +512,13 @@ impl BTree {
                                 child_idx,
                                 new_child_pid,
                             )?;
-                            let underfull2 =
-                                !is_root && Self::internal_underfull(storage, new_pid)?;
                             Ok(DeleteResult::Deleted {
                                 new_pid,
-                                underfull: underfull2,
+                                underfull: false,
                             })
                         } else {
+                            // Child underflowed — structural rebalance (rotate/merge).
+                            // Rebalance may change the parent's key count, so check underflow.
                             let new_pid =
                                 Self::rebalance(storage, pid, node, child_idx, new_child_pid)?;
                             let underfull2 =
@@ -512,6 +547,21 @@ impl BTree {
         };
         node.remove_at(idx);
 
+        // Fast path: root leaves and leaves that remain at or above MIN_KEYS_LEAF
+        // do not need structural rebalancing. Write back to the same page ID so
+        // the parent does not need to update its child pointer.
+        let underfull = !is_root && node.num_keys() < MIN_KEYS_LEAF;
+        if !underfull {
+            let new_pid = Self::write_leaf_same_pid(storage, old_pid, node)?;
+            return Ok(DeleteResult::Deleted {
+                new_pid,
+                underfull: false,
+            });
+        }
+
+        // Structural path: leaf will underflow — allocate a replacement page so
+        // the rebalance path (`rotate_left`, `rotate_right`, `merge_children`)
+        // can produce a new page ID that the parent can update.
         let new_pid = storage.alloc_page(PageType::Index)?;
         let mut p = Page::new(PageType::Index, new_pid);
         *cast_leaf_mut(&mut p) = node;
@@ -519,8 +569,10 @@ impl BTree {
         storage.write_page(new_pid, &p)?;
         storage.free_page(old_pid)?;
 
-        let underfull = !is_root && node.num_keys() < MIN_KEYS_LEAF;
-        Ok(DeleteResult::Deleted { new_pid, underfull })
+        Ok(DeleteResult::Deleted {
+            new_pid,
+            underfull: true,
+        })
     }
 
     fn rebalance(
