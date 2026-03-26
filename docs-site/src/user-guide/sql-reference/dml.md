@@ -653,6 +653,18 @@ The operation is fully transactional: <code>ROLLBACK</code> restores original ro
 > **When parent FK references exist**, `DELETE FROM t` keeps the row-by-row path so
 > `RESTRICT`/`CASCADE`/`SET NULL` FK enforcement still fires correctly.
 
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Indexed DELETE WHERE</span>
+<code>DELETE ... WHERE col = value</code> or <code>WHERE col &gt; lo</code> uses the available index
+to discover candidate rows instead of scanning the full heap. The planner always
+prefers the index for DELETE (unlike SELECT, which may reject an index when selectivity
+is too low) because avoiding a heap scan is always beneficial even when many rows match.
+The full <code>WHERE</code> predicate is rechecked on fetched rows before deletion.
+</div>
+</div>
+
 ---
 
 ## TRUNCATE TABLE
@@ -1332,3 +1344,4 @@ SHOW STATUS LIKE 'Com_stmt_send_long_data';
 -- Variable_name                | Value
 -- Com_stmt_send_long_data      | 3
 ```
+

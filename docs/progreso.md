@@ -211,6 +211,7 @@
 - [x] 6.2 ✅ CREATE INDEX executor — scans table, builds B-Tree from existing data; `columns` persisted in catalog
 - [x] 6.2b ✅ Index maintenance on INSERT/UPDATE/DELETE — secondary indexes kept in sync with heap; UNIQUE violation detection
 - [x] 6.3 ✅ Basic query planner — detects `WHERE col = literal` and `WHERE col > lo AND col < hi` on indexed columns; replaces full scan with B-Tree lookup/range
+- [x] 6.3b ✅ Indexed DELETE WHERE fast path — `plan_delete_candidates` / `plan_delete_candidates_ctx` skip stats_cost_gate (always use index for DELETE); `collect_delete_candidates` helper: IndexLookup/IndexRange → materialize RIDs → heap read → full WHERE recheck before deletion; wired into execute_delete_ctx and execute_delete; FK enforcement, index maintenance, partial-index predicates, collation guard all preserved; 5 integration tests
 - [ ] ⚠️ Composite index planner (> 1 column) — encoding supports it, planner deferred to 6.8
 - [x] 6.4 ✅ Bloom filter per index — `BloomRegistry` per-DB; CREATE INDEX populates filter; INSERT adds keys; DELETE/UPDATE marks dirty; SELECT IndexLookup skips B-Tree on definite absence (1% FPR)
 - [x] 6.5 ✅ Foreign key checker — `axiom_foreign_keys` catalog; DDL (CREATE TABLE REFERENCES, ALTER TABLE ADD/DROP CONSTRAINT FK); INSERT/UPDATE child validates parent; DELETE/UPDATE parent enforces RESTRICT
