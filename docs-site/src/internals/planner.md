@@ -93,6 +93,7 @@ returning the index access method:
 ```
 ndv       = stats.ndv > 0 ? stats.ndv : DEFAULT_NUM_DISTINCT (= 200)
 selectivity = 1.0 / ndv            // equality predicate: ~1/ndv rows match
+if row_count == 0: return Index    // stats bootstrapped on empty table — conservative
 if row_count < 1,000: return Scan  // tiny table — index overhead not worth it
 if selectivity > 0.20: return Scan // low-cardinality — full scan is cheaper
 → return IndexLookup / IndexRange  // selective enough for an index scan
@@ -101,6 +102,11 @@ if selectivity > 0.20: return Scan // low-cardinality — full scan is cheaper
 `DEFAULT_NUM_DISTINCT = 200` is used when no statistics exist (pre-Phase 6.10
 databases, or ANALYZE has not been run). This is conservative — always uses the
 index when uncertain, which is never wrong.
+
+`row_count == 0` is treated as "no reliable statistics" (not "empty table") because
+stats are bootstrapped at `CREATE INDEX` time. If `CREATE INDEX` runs before any
+`INSERT`s, the stats reflect an empty table but become stale immediately after the
+first insert. The conservative default is to use the index.
 
 ### Fallback
 

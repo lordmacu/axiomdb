@@ -127,7 +127,8 @@
 <!-- ── Group E — Core SQL (needs executor) ── -->
 - [x] 4.8 ✅ JOIN — INNER, LEFT, RIGHT, CROSS with nested loop; USING; multi-table; FULL → NotImplemented
 - [x] 4.9a ✅ GROUP BY hash-based — HashMap<key_bytes, GroupState>; value_to_key_bytes; NULL keys group correctly
-- [ ] 4.9b ⏳ GROUP BY sort-based — sort first, then stream; optimal when data is pre-sorted by index (deferred)
+- [x] 4.9b ✅ GROUP BY sort-based — sorted streaming executor; auto-selects when access method is IndexLookup/IndexRange/IndexOnlyScan with matching GROUP BY prefix; hash path remains default fallback; 9 integration tests + 11 wire assertions
+  - [ ] ⚠️ ORDER BY + GROUP BY col_idx mismatch — ORDER BY after grouped projection uses table col_idx but output rows use SELECT output positions; affects both hash and sorted paths; deferred to Phase 4.10e (post-group projection rewrite)
 - [x] 4.9c ✅ Aggregate functions — COUNT(*), COUNT(col), SUM, MIN, MAX, AVG (→ Real); skip NULL; finalize
 - [x] 4.9e ✅ GROUP_CONCAT() — `SELECT GROUP_CONCAT(tag ORDER BY tag SEPARATOR ', ') FROM tags GROUP BY post_id`; MySQL's most-used aggregate function; DISTINCT modifier to deduplicate before concatenating; max length configurable; NULL values skipped; returns NULL for empty group; `string_agg(expr, sep)` PostgreSQL alias; 18 integration tests + 15 wire assertions
 - [x] 4.9d ✅ HAVING clause — eval_with_aggs intercepts aggregate calls; representative_row for col refs

@@ -752,7 +752,11 @@ fn execute_select_ctx(
             }
             crate::planner::AccessMethod::IndexLookup { index_def, key } => {
                 // Bloom filter: skip B-Tree read if key is definitely absent.
-                if !bloom.might_exist(index_def.index_id, key) {
+                // Only applied for UNIQUE indexes — non-unique indexes store key||RID in
+                // the bloom (one entry per row), but the lookup key here is the bare value.
+                // Checking a bare value key against a bloom populated with key||RID entries
+                // produces false negatives, so we skip the bloom check for non-unique indexes.
+                if index_def.is_unique && !bloom.might_exist(index_def.index_id, key) {
                     vec![]
                 } else if index_def.is_unique {
                     // Unique index: exact key lookup → at most one RecordId.
@@ -808,7 +812,7 @@ fn execute_select_ctx(
                 lo,
                 hi,
                 n_key_cols,
-                needed_key_positions,
+                needed_key_positions: _,
             } => {
                 // Index-only scan (Phase 6.13): values decoded from B-Tree key bytes.
                 // Only the 24-byte heap slot header is read for MVCC visibility.
@@ -822,6 +826,7 @@ fn execute_select_ctx(
                     (Some(lo_adj.as_slice()), hi_adj.as_deref())
                 };
                 let pairs = BTree::range_in(storage, index_def.root_page_id, lo_ref, hi_ref)?;
+                let n_table_cols = resolved.columns.len();
                 let mut result = Vec::with_capacity(pairs.len());
                 for (rid, key_bytes) in pairs {
                     if !HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap)? {
@@ -829,10 +834,19 @@ fn execute_select_ctx(
                     }
                     let (all_key_vals, _) =
                         crate::key_encoding::decode_index_key(&key_bytes, *n_key_cols)?;
-                    let row_values: Vec<Value> = needed_key_positions
-                        .iter()
-                        .map(|&pos| all_key_vals.get(pos).cloned().unwrap_or(Value::Null))
-                        .collect();
+                    // Build a full-width row (Null for non-indexed cols) so that
+                    // WHERE and SELECT expressions can access values by table col_idx.
+                    // Populate all decoded key columns — not just the SELECT ones —
+                    // so that WHERE re-evaluation can access them too.
+                    let mut row_values = vec![Value::Null; n_table_cols];
+                    for (key_pos, idx_col) in index_def.columns.iter().enumerate() {
+                        let table_idx = idx_col.col_idx as usize;
+                        if let (true, Some(val)) =
+                            (table_idx < n_table_cols, all_key_vals.get(key_pos))
+                        {
+                            row_values[table_idx] = val.clone();
+                        }
+                    }
                     result.push((rid, row_values));
                 }
                 result
@@ -857,7 +871,10 @@ fn execute_select_ctx(
         }
 
         if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
-            return execute_select_grouped(stmt, combined_rows);
+            // Single-table path: choose sorted strategy when the access method
+            // already delivers rows in group-key order (Phase 4.9b).
+            let strategy = choose_group_by_strategy_ctx(&stmt.group_by, &access_method);
+            return execute_select_grouped(stmt, combined_rows, strategy);
         }
 
         combined_rows = apply_order_by(combined_rows, &stmt.order_by)?;
@@ -995,7 +1012,8 @@ fn execute_select_with_joins_ctx(
     }
 
     if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
-        return execute_select_grouped(stmt, combined_rows);
+        // JOIN path: no ordering guarantee — always hash aggregate.
+        return execute_select_grouped(stmt, combined_rows, GroupByStrategy::Hash);
     }
 
     combined_rows = apply_order_by(combined_rows, &stmt.order_by)?;
@@ -1928,7 +1946,7 @@ fn execute_select(
         }
 
         if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
-            return execute_select_grouped(stmt, combined_rows);
+            return execute_select_grouped(stmt, combined_rows, GroupByStrategy::Hash);
         }
 
         combined_rows = apply_order_by(combined_rows, &stmt.order_by)?;
@@ -2015,7 +2033,7 @@ fn execute_select_derived(
 
     // GROUP BY / aggregation.
     if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
-        return execute_select_grouped(stmt, combined_rows);
+        return execute_select_grouped(stmt, combined_rows, GroupByStrategy::Hash);
     }
 
     combined_rows = apply_order_by(combined_rows, &stmt.order_by)?;
@@ -2146,7 +2164,7 @@ fn execute_select_with_joins(
 
     // Branch: aggregation (GROUP BY / aggregate functions) or direct projection.
     if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
-        return execute_select_grouped(stmt, combined_rows);
+        return execute_select_grouped(stmt, combined_rows, GroupByStrategy::Hash);
     }
 
     // Sort source rows before projection.
@@ -3412,11 +3430,112 @@ fn eval_with_aggs(
 
 // ── execute_select_grouped ────────────────────────────────────────────────────
 
+// ── GROUP BY strategy ────────────────────────────────────────────────────────
+
+/// Controls which GROUP BY execution algorithm is used.
+#[derive(Debug, Clone, Copy)]
+enum GroupByStrategy {
+    /// Default: one-pass hash aggregation (always correct, no ordering required).
+    Hash,
+    /// Stream adjacent equal groups from an already-ordered input.
+    ///
+    /// `presorted = true`  → caller guarantees input is in group-key order.
+    /// `presorted = false` → executor sorts the input by group keys first.
+    Sorted { presorted: bool },
+}
+
+/// Returns `GroupByStrategy::Sorted { presorted: true }` when the chosen
+/// access method guarantees that rows arrive in an order compatible with the
+/// GROUP BY key prefix, and `GroupByStrategy::Hash` otherwise.
+///
+/// Compatibility rules (all must hold):
+/// 1. `group_by` is non-empty.
+/// 2. `access_method` is `IndexLookup`, `IndexRange`, or `IndexOnlyScan`.
+/// 3. Every element of `group_by` is a plain `Expr::Column` reference.
+/// 4. The `group_by` columns match the **leading prefix** of the index key in
+///    the same order (not reordered, not computed).
+fn choose_group_by_strategy_ctx(
+    group_by: &[Expr],
+    access_method: &crate::planner::AccessMethod,
+) -> GroupByStrategy {
+    if group_by.is_empty() {
+        return GroupByStrategy::Hash;
+    }
+
+    let index_def = match access_method {
+        crate::planner::AccessMethod::IndexLookup { index_def, .. }
+        | crate::planner::AccessMethod::IndexRange { index_def, .. }
+        | crate::planner::AccessMethod::IndexOnlyScan { index_def, .. } => index_def,
+        crate::planner::AccessMethod::Scan => return GroupByStrategy::Hash,
+    };
+
+    if group_by_matches_index_prefix(group_by, index_def) {
+        GroupByStrategy::Sorted { presorted: true }
+    } else {
+        GroupByStrategy::Hash
+    }
+}
+
+/// Returns `true` iff every element of `group_by` is a plain `Expr::Column`
+/// whose `col_idx` matches the corresponding leading column of `index_def`,
+/// in the same order, without gaps.
+fn group_by_matches_index_prefix(group_by: &[Expr], index_def: &IndexDef) -> bool {
+    if group_by.len() > index_def.columns.len() {
+        return false;
+    }
+    for (gb_expr, idx_col) in group_by.iter().zip(&index_def.columns) {
+        match gb_expr {
+            Expr::Column { col_idx, .. } => {
+                if *col_idx as u16 != idx_col.col_idx {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Compare two group-key value lists lexicographically, NULL last.
+fn compare_group_key_lists(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    for (x, y) in a.iter().zip(b.iter()) {
+        let ord = compare_values_null_last(x, y);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Returns `true` iff `a` and `b` are considered the same GROUP BY group.
+///
+/// NULL == NULL for grouping purposes (matches SQL GROUP BY semantics).
+fn group_keys_equal(a: &[Value], b: &[Value]) -> bool {
+    compare_group_key_lists(a, b) == std::cmp::Ordering::Equal
+}
+
+// ── Grouped executor entry point ─────────────────────────────────────────────
+
 /// Executes the GROUP BY + aggregation path.
 ///
 /// `combined_rows` are the post-scan, post-WHERE rows (not yet projected).
-/// They are the "source" rows for the GROUP BY grouping.
+/// `strategy` controls whether hash or sorted streaming aggregation is used.
 fn execute_select_grouped(
+    stmt: SelectStmt,
+    combined_rows: Vec<Row>,
+    strategy: GroupByStrategy,
+) -> Result<QueryResult, DbError> {
+    match strategy {
+        GroupByStrategy::Hash => execute_select_grouped_hash(stmt, combined_rows),
+        GroupByStrategy::Sorted { presorted } => {
+            execute_select_grouped_sorted(stmt, combined_rows, presorted)
+        }
+    }
+}
+
+// ── Hash aggregation (original 4.9a implementation) ──────────────────────────
+
+fn execute_select_grouped_hash(
     stmt: SelectStmt,
     combined_rows: Vec<Row>,
 ) -> Result<QueryResult, DbError> {
@@ -3467,14 +3586,12 @@ fn execute_select_grouped(
     // Finalize, HAVING filter, project.
     let mut rows: Vec<Row> = Vec::new();
     for (_, state) in groups {
-        // Finalize all accumulators.
         let agg_values: Vec<Value> = state
             .accumulators
             .into_iter()
             .map(|acc| acc.finalize())
             .collect::<Result<_, _>>()?;
 
-        // HAVING filter.
         if let Some(ref having) = stmt.having {
             let v = eval_with_aggs(having, &state.representative_row, &agg_values, &agg_exprs)?;
             if !is_truthy(&v) {
@@ -3482,7 +3599,6 @@ fn execute_select_grouped(
             }
         }
 
-        // Project SELECT list.
         let out_row = project_grouped_row(
             &stmt.columns,
             &state.representative_row,
@@ -3492,16 +3608,160 @@ fn execute_select_grouped(
         rows.push(out_row);
     }
 
-    // DISTINCT deduplication (after projection, before ORDER BY and LIMIT).
     if stmt.distinct {
         rows = apply_distinct(rows);
     }
-
-    // ORDER BY applied to projected output rows.
-    // For GROUP BY queries, ORDER BY evaluates against the output row.
     rows = apply_order_by(rows, &stmt.order_by)?;
+    rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 
-    // LIMIT/OFFSET.
+    Ok(QueryResult::Rows {
+        columns: out_cols,
+        rows,
+    })
+}
+
+// ── Sorted streaming aggregation (4.9b) ──────────────────────────────────────
+
+/// Sorted streaming GROUP BY.
+///
+/// When `presorted = true`, input rows are already in group-key order
+/// (guaranteed by the B-Tree access method). Groups are formed by streaming
+/// adjacent equal-key rows without building any hash table.
+///
+/// When `presorted = false`, the input is sorted by group keys first, then
+/// streamed. This path is not auto-selected in 4.9b but is available for
+/// testing and future use.
+fn execute_select_grouped_sorted(
+    stmt: SelectStmt,
+    mut combined_rows: Vec<Row>,
+    presorted: bool,
+) -> Result<QueryResult, DbError> {
+    let agg_exprs = collect_agg_exprs(&stmt.columns, &stmt.having);
+    let out_cols = build_grouped_column_meta(&stmt.columns, &agg_exprs)?;
+
+    // Evaluate GROUP BY expressions for every row up front.
+    // This avoids re-evaluating the same expressions during boundary detection.
+    struct KeyedRow {
+        row: Row,
+        key_values: Vec<Value>,
+    }
+    let mut keyed: Vec<KeyedRow> = combined_rows
+        .drain(..)
+        .map(|row| {
+            let key_values: Vec<Value> = stmt
+                .group_by
+                .iter()
+                .map(|e| eval(e, &row))
+                .collect::<Result<_, _>>()?;
+            Ok(KeyedRow { row, key_values })
+        })
+        .collect::<Result<Vec<_>, DbError>>()?;
+
+    if !presorted {
+        // Stable sort by group keys — NULL last, same as hash path output order.
+        keyed.sort_by(|a, b| compare_group_key_lists(&a.key_values, &b.key_values));
+    }
+
+    // Stream adjacent equal groups.
+    let mut output_rows: Vec<Row> = Vec::new();
+
+    if keyed.is_empty() {
+        // Ungrouped aggregate on empty input: emit one row (e.g., COUNT(*) → 0).
+        if stmt.group_by.is_empty() {
+            let accumulators: Vec<AggAccumulator> =
+                agg_exprs.iter().map(AggAccumulator::new).collect();
+            let agg_values: Vec<Value> = accumulators
+                .into_iter()
+                .map(|acc| acc.finalize())
+                .collect::<Result<_, _>>()?;
+            let out_row = project_grouped_row(&stmt.columns, &[], &agg_values, &agg_exprs)?;
+            output_rows.push(out_row);
+        }
+    } else {
+        // Initialize first group.
+        let first = &keyed[0];
+        let mut current_key = first.key_values.clone();
+        let mut representative_row = first.row.clone();
+        let mut accumulators: Vec<AggAccumulator> =
+            agg_exprs.iter().map(AggAccumulator::new).collect();
+        for (acc, agg) in accumulators.iter_mut().zip(&agg_exprs) {
+            acc.update(&first.row, agg)?;
+        }
+
+        for kr in &keyed[1..] {
+            if group_keys_equal(&current_key, &kr.key_values) {
+                // Same group — accumulate.
+                for (acc, agg) in accumulators.iter_mut().zip(&agg_exprs) {
+                    acc.update(&kr.row, agg)?;
+                }
+            } else {
+                // Group boundary — drain current accumulators by value, finalize, emit.
+                let finished: Vec<AggAccumulator> = std::mem::replace(
+                    &mut accumulators,
+                    agg_exprs.iter().map(AggAccumulator::new).collect(),
+                );
+                let agg_values: Vec<Value> = finished
+                    .into_iter()
+                    .map(|acc| acc.finalize())
+                    .collect::<Result<_, _>>()?;
+                if let Some(ref having) = stmt.having {
+                    let v = eval_with_aggs(having, &representative_row, &agg_values, &agg_exprs)?;
+                    if is_truthy(&v) {
+                        let out_row = project_grouped_row(
+                            &stmt.columns,
+                            &representative_row,
+                            &agg_values,
+                            &agg_exprs,
+                        )?;
+                        output_rows.push(out_row);
+                    }
+                } else {
+                    let out_row = project_grouped_row(
+                        &stmt.columns,
+                        &representative_row,
+                        &agg_values,
+                        &agg_exprs,
+                    )?;
+                    output_rows.push(out_row);
+                }
+
+                // Start next group (accumulators already reset by mem::replace above).
+                current_key = kr.key_values.clone();
+                representative_row = kr.row.clone();
+                for (acc, agg) in accumulators.iter_mut().zip(&agg_exprs) {
+                    acc.update(&kr.row, agg)?;
+                }
+            }
+        }
+
+        // Finalize the last group.
+        let agg_values: Vec<Value> = accumulators
+            .into_iter()
+            .map(|acc| acc.finalize())
+            .collect::<Result<_, _>>()?;
+        if let Some(ref having) = stmt.having {
+            let v = eval_with_aggs(having, &representative_row, &agg_values, &agg_exprs)?;
+            if is_truthy(&v) {
+                let out_row = project_grouped_row(
+                    &stmt.columns,
+                    &representative_row,
+                    &agg_values,
+                    &agg_exprs,
+                )?;
+                output_rows.push(out_row);
+            }
+        } else {
+            let out_row =
+                project_grouped_row(&stmt.columns, &representative_row, &agg_values, &agg_exprs)?;
+            output_rows.push(out_row);
+        }
+    }
+
+    let mut rows = output_rows;
+    if stmt.distinct {
+        rows = apply_distinct(rows);
+    }
+    rows = apply_order_by(rows, &stmt.order_by)?;
     rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 
     Ok(QueryResult::Rows {
@@ -6273,5 +6533,128 @@ mod tests {
     fn test_expr_column_name_other_expr_fallback() {
         let expr = Expr::Literal(Value::Int(1));
         assert_eq!(expr_column_name(&expr, None), "?column?");
+    }
+
+    // ── 4.9b: GROUP BY strategy helpers ──────────────────────────────────────
+
+    fn make_index_def(col_idxs: &[u16]) -> IndexDef {
+        use axiomdb_catalog::schema::{IndexColumnDef, SortOrder};
+        IndexDef {
+            index_id: 1,
+            table_id: 1,
+            name: "test_idx".into(),
+            root_page_id: 1,
+            is_unique: false,
+            is_primary: false,
+            columns: col_idxs
+                .iter()
+                .map(|&c| IndexColumnDef {
+                    col_idx: c,
+                    order: SortOrder::Asc,
+                })
+                .collect(),
+            predicate: None,
+            fillfactor: 90,
+            is_fk_index: false,
+            include_columns: vec![],
+        }
+    }
+
+    fn col_expr(idx: usize) -> Expr {
+        Expr::Column {
+            col_idx: idx,
+            name: format!("c{idx}"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_matches_index_prefix_single_col() {
+        let idx = make_index_def(&[2]);
+        assert!(group_by_matches_index_prefix(&[col_expr(2)], &idx));
+    }
+
+    #[test]
+    fn test_group_by_matches_index_prefix_composite_full() {
+        let idx = make_index_def(&[1, 3]);
+        assert!(group_by_matches_index_prefix(
+            &[col_expr(1), col_expr(3)],
+            &idx
+        ));
+    }
+
+    #[test]
+    fn test_group_by_matches_index_prefix_leading_only() {
+        // GROUP BY on only the first column of a (region, dept) index — valid prefix.
+        let idx = make_index_def(&[1, 3]);
+        assert!(group_by_matches_index_prefix(&[col_expr(1)], &idx));
+    }
+
+    #[test]
+    fn test_group_by_matches_index_prefix_reordered_fails() {
+        let idx = make_index_def(&[1, 3]);
+        assert!(!group_by_matches_index_prefix(
+            &[col_expr(3), col_expr(1)],
+            &idx
+        ));
+    }
+
+    #[test]
+    fn test_group_by_matches_index_prefix_non_column_expr_fails() {
+        let idx = make_index_def(&[2]);
+        let lower_expr = Expr::Function {
+            name: "lower".into(),
+            args: vec![col_expr(2)],
+        };
+        assert!(!group_by_matches_index_prefix(&[lower_expr], &idx));
+    }
+
+    #[test]
+    fn test_group_by_matches_index_prefix_empty_group_by() {
+        let idx = make_index_def(&[2]);
+        assert!(group_by_matches_index_prefix(&[], &idx));
+    }
+
+    #[test]
+    fn test_group_by_matches_index_prefix_longer_than_index_fails() {
+        let idx = make_index_def(&[1]);
+        assert!(!group_by_matches_index_prefix(
+            &[col_expr(1), col_expr(2)],
+            &idx
+        ));
+    }
+
+    #[test]
+    fn test_group_keys_equal_nulls() {
+        // NULL == NULL for GROUP BY grouping purposes.
+        assert!(group_keys_equal(&[Value::Null], &[Value::Null]));
+    }
+
+    #[test]
+    fn test_group_keys_equal_mixed() {
+        assert!(group_keys_equal(
+            &[Value::Int(1), Value::Text("a".into())],
+            &[Value::Int(1), Value::Text("a".into())]
+        ));
+        assert!(!group_keys_equal(
+            &[Value::Int(1), Value::Text("a".into())],
+            &[Value::Int(1), Value::Text("b".into())]
+        ));
+    }
+
+    #[test]
+    fn test_compare_group_key_lists_ordering() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            compare_group_key_lists(&[Value::Int(1)], &[Value::Int(2)]),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_group_key_lists(&[Value::Int(2)], &[Value::Int(1)]),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_group_key_lists(&[Value::Null], &[Value::Int(1)]),
+            Ordering::Greater // NULL last
+        );
     }
 }
