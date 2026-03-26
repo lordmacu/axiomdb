@@ -4,8 +4,15 @@
 
 A persistent B+ Tree that lives in pages of the `StorageEngine`, with support for
 variable-length binary keys (up to 64 bytes), full CRUD operations,
-range scan via leaf linked list, Copy-on-Write with atomic root, and prefix
+range scan via tree traversal, Copy-on-Write with atomic root, and prefix
 compression on internal nodes.
+
+> **As-built note (2026-03-26):** `RangeIter` traverses from root to find successive
+> leaves rather than following `next_leaf` pointers. CoW invalidates linked-list
+> pointers during splits — keeping them in sync requires CoW of the predecessor leaf,
+> which requires knowing its page_id at every insert. This was explicitly deferred to
+> Phase 7 (epoch-based reclamation). The `next_leaf` field exists on disk but is not
+> used by the iterator.
 
 ---
 
@@ -77,7 +84,8 @@ achieving 217 entries per leaf vs 211 — 3% more capacity, 17% less space per R
 - With merge/redistribution when node has < ORDER/2 keys
 
 ### `BTree::range(from: Bound<&[u8]>, to: Bound<&[u8]>) -> RangeIter`
-- Iterator that traverses the leaf linked list
+- Iterator that re-traverses from the root to find successive leaves (CoW-safe)
+- `next_leaf` pointer is on-disk metadata but not followed by the iterator
 - Supports `Bound::Included`, `Bound::Excluded`, `Bound::Unbounded`
 
 ### `BTree::root_page_id() -> u64`
@@ -91,7 +99,7 @@ achieving 217 entries per leaf vs 211 — 3% more capacity, 17% less space per R
 2. **Non-existent lookup**: key not in tree → `None`
 3. **Insert causing leaf split**: full leaf → split → new internal node
 4. **Insert propagating split to root**: full root → new root
-5. **Range scan `[10..=50]`**: traverses linked list, returns exactly the rows in range
+5. **Range scan `[10..=50]`**: re-traverses tree to successive leaves, returns exactly the rows in range
 6. **Delete with redistribution**: node has ORDER/2 - 1 keys → borrows from sibling
 7. **Delete with merge**: sibling is also at minimum → merge + update parent
 8. **Concurrent reads during CoW write**: readers see previous snapshot until root CAS
@@ -105,7 +113,7 @@ achieving 217 entries per leaf vs 211 — 3% more capacity, 17% less space per R
 - [ ] `size_of::<InternalNodePage>() <= PAGE_BODY_SIZE` (compile-time assert)
 - [ ] `size_of::<LeafNodePage>() <= PAGE_BODY_SIZE` (compile-time assert)
 - [ ] Zero-copy conversion: cast of `Page::body()` to `&InternalNodePage` without copy
-- [ ] Leaf linked list: `next_leaf` points to next leaf or `u64::MAX` if it is the last one
+- [x] `next_leaf` field exists on disk (points to next leaf or `u64::MAX` for last leaf); CoW-consistent maintenance deferred to Phase 7
 
 ### 2.2 — Lookup
 - [ ] Lookup of existing key returns correct `RecordId`

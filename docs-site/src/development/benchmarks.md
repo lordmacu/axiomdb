@@ -44,9 +44,13 @@ The speed advantage comes from two decisions:
 with `Acquire` and traverse 3–4 levels of 16 KB pages that are already in the OS page
 cache. No mutex, no RWLock.
 
-**Why range scan is very fast:** `RangeIter` follows `next_leaf` pointers after
-reaching the first qualifying leaf. Each subsequent leaf is a single mmap dereference.
-For 10K rows in order, this is typically 3–5 page accesses.
+**Why range scan is very fast:** `RangeIter` re-traverses from the root to locate
+each successive leaf after exhausting the current one. With CoW, `next_leaf` pointers
+cannot be maintained consistently (a split copies the leaf, leaving the previous leaf's
+pointer stale). Tree retraversal costs O(log n) per leaf boundary crossing — at 3–4
+levels deep this is 3–5 page reads, all already in the OS page cache for sequential
+workloads. The deferred `next_leaf` fast path (Phase 7) will reduce this to O(1) per
+boundary once epoch-based reclamation is available.
 
 ---
 
