@@ -347,6 +347,29 @@ impl StorageEngine for MmapStorage {
         if page_id >= count {
             return Err(DbError::PageNotFound { page_id });
         }
+        // Debug guard: catch any write that introduces corrupted key_lens in
+        // an internal B+tree node before the bad bytes hit the mmap.
+        #[cfg(debug_assertions)]
+        {
+            let body = page.body();
+            // PageHeader layout: magic(8) | page_type(1) | ...
+            // PageType::Index = 2, at byte offset 8 of the page.
+            // body starts at HEADER_SIZE = 64.
+            let hdr_page_type = page.as_bytes()[8];
+            if hdr_page_type == 2 && !body.is_empty() && body[0] == 0 {
+                // body[0]=0 → internal node. Layout: [8B header][223B key_lens][...]
+                // MAX_KEY_LEN=64, ORDER_INTERNAL=223.
+                let num_keys = u16::from_le_bytes([body[2], body[3]]) as usize;
+                let max_n = num_keys.min(223);
+                for i in 0..max_n {
+                    let len = body[8 + i];
+                    assert!(
+                        len as usize <= 64,
+                        "write_page({page_id}): corrupt internal node key_lens[{i}]={len}>64, num_keys={num_keys}"
+                    );
+                }
+            }
+        }
         let offset = page_id as usize * PAGE_SIZE;
         self.mmap[offset..offset + PAGE_SIZE].copy_from_slice(page.as_bytes());
         self.dirty.mark(page_id);

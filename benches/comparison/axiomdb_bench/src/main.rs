@@ -5,6 +5,10 @@
 //! Usage (from host via docker exec):
 //!   docker exec axiomdb_bench_axiomdb /bench/axiomdb_bench \
 //!     --scenario insert_batch --rows 10000
+//!
+//! Comparison mode (AxiomDB vs SQLite, same process, no network):
+//!   cargo run -p axiomdb-bench-comparison --release -- --compare --rows 5000
+//!   cargo run -p axiomdb-bench-comparison --release -- --compare --rows 5000 --sqlite-memory
 
 use std::path::Path;
 use std::time::Instant;
@@ -16,6 +20,7 @@ use axiomdb_sql::{
 };
 use axiomdb_storage::MmapStorage;
 use axiomdb_wal::TxnManager;
+use rusqlite::Connection;
 
 const WARMUP: usize = 2;
 const RUNS: usize = 5;
@@ -344,10 +349,426 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
     }
 }
 
+// ── SQLite wrapper ────────────────────────────────────────────────────────────
+
+struct SqliteDb {
+    conn: Connection,
+}
+
+impl SqliteDb {
+    fn open_file(path: &Path) -> Self {
+        let conn = Connection::open(path).expect("sqlite open");
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .expect("sqlite pragma");
+        Self { conn }
+    }
+
+    fn open_memory() -> Self {
+        let conn = Connection::open_in_memory().expect("sqlite memory");
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .expect("sqlite pragma");
+        Self { conn }
+    }
+
+    fn sql(&self, q: &str) {
+        self.conn
+            .execute_batch(q)
+            .unwrap_or_else(|e| panic!("sqlite({q}): {e}"));
+    }
+
+    fn sql_count(&self, q: &str) -> usize {
+        let mut stmt = self.conn.prepare_cached(q).expect("prepare");
+        let mut rows = stmt.query([]).expect("query");
+        let mut n = 0usize;
+        while rows.next().expect("next").is_some() {
+            n += 1;
+        }
+        n
+    }
+
+    fn reset(&self) {
+        self.sql("DROP TABLE IF EXISTS bench_users");
+        self.sql(
+            "CREATE TABLE bench_users (
+                id     INTEGER NOT NULL PRIMARY KEY,
+                name   TEXT    NOT NULL,
+                age    INTEGER NOT NULL,
+                active INTEGER NOT NULL,
+                score  REAL    NOT NULL,
+                email  TEXT    NOT NULL
+            )",
+        );
+    }
+}
+
+// ── SQLite scenarios ──────────────────────────────────────────────────────────
+
+fn sqlite_insert_batch(db: &SqliteDb, inserts: &[String]) {
+    db.sql("BEGIN");
+    for sql in inserts {
+        db.sql(sql);
+    }
+    db.sql("COMMIT");
+}
+
+fn sqlite_load(db: &SqliteDb, inserts: &[String]) {
+    db.reset();
+    sqlite_insert_batch(db, inserts);
+}
+
+fn gen_sqlite_inserts(n: usize) -> Vec<String> {
+    (1..=n)
+        .map(|i| {
+            format!(
+                "INSERT INTO bench_users VALUES ({i}, 'user_{i:06}', {age}, {active}, {score:.1}, 'u{i}@b.local')",
+                age    = 18 + (i % 62),
+                active = if i % 2 == 0 { 1 } else { 0 },
+                score  = 100.0 + (i % 1000) as f64 * 0.1,
+            )
+        })
+        .collect()
+}
+
+fn run_sqlite_scenario(scenario: &str, n_rows: usize, db: &SqliteDb) -> f64 {
+    let inserts = gen_sqlite_inserts(n_rows);
+    let ac_n = n_rows.min(300);
+    let ac_inserts = gen_sqlite_inserts(ac_n);
+    let step = (n_rows.max(100) / 100).max(1);
+    let start = n_rows / 4;
+    let end = start + n_rows / 10;
+
+    match scenario {
+        "insert_batch" => measure_timed(|| {
+            db.reset();
+            let t0 = Instant::now();
+            sqlite_insert_batch(db, &inserts);
+            t0.elapsed()
+        }),
+
+        "insert_autocommit" => measure_timed(|| {
+            db.reset();
+            let t0 = Instant::now();
+            for sql in &ac_inserts {
+                db.sql(&format!("BEGIN; {sql}; COMMIT"));
+            }
+            t0.elapsed()
+        }),
+
+        "crud_flow/insert" | "crud_flow/select" | "crud_flow/delete" => {
+            // Run full crud_flow and return only the requested phase
+            let mut ins_t = Vec::with_capacity(RUNS);
+            let mut sel_t = Vec::with_capacity(RUNS);
+            let mut del_t = Vec::with_capacity(RUNS);
+
+            for i in 0..(WARMUP + RUNS) {
+                db.reset();
+                let t0 = Instant::now();
+                sqlite_insert_batch(db, &inserts);
+                let t_ins = t0.elapsed().as_secs_f64();
+
+                let t0 = Instant::now();
+                db.sql_count("SELECT * FROM bench_users");
+                let t_sel = t0.elapsed().as_secs_f64();
+
+                let t0 = Instant::now();
+                db.sql("DELETE FROM bench_users");
+                let t_del = t0.elapsed().as_secs_f64();
+
+                if i >= WARMUP {
+                    ins_t.push(t_ins);
+                    sel_t.push(t_sel);
+                    del_t.push(t_del);
+                }
+            }
+            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+            match scenario {
+                "crud_flow/insert" => mean(&ins_t),
+                "crud_flow/select" => mean(&sel_t),
+                _ => mean(&del_t),
+            }
+        }
+
+        "full_scan" => {
+            sqlite_load(db, &inserts);
+            measure(|| {
+                db.sql_count("SELECT * FROM bench_users");
+            })
+        }
+
+        "select_where" => {
+            sqlite_load(db, &inserts);
+            measure(|| {
+                db.sql_count("SELECT * FROM bench_users WHERE active = 1");
+            })
+        }
+
+        "point_lookup" => {
+            sqlite_load(db, &inserts);
+            measure(|| {
+                for i in (1..=n_rows).step_by(step).take(100) {
+                    db.sql_count(&format!("SELECT * FROM bench_users WHERE id = {i}"));
+                }
+            })
+        }
+
+        "range_scan" => {
+            sqlite_load(db, &inserts);
+            measure(|| {
+                db.sql_count(&format!(
+                    "SELECT * FROM bench_users WHERE id >= {start} AND id < {end}"
+                ));
+            })
+        }
+
+        "count_star" => {
+            sqlite_load(db, &inserts);
+            measure(|| {
+                db.sql_count("SELECT COUNT(*) FROM bench_users");
+            })
+        }
+
+        "group_by" => {
+            sqlite_load(db, &inserts);
+            measure(|| {
+                db.sql_count("SELECT age, COUNT(*) FROM bench_users GROUP BY age");
+            })
+        }
+
+        other => panic!("unknown sqlite scenario: {other}"),
+    }
+}
+
+// ── Comparison report ─────────────────────────────────────────────────────────
+
+fn run_compare(n_rows: usize, sqlite_memory: bool) {
+    let sqlite_mode = if sqlite_memory {
+        "in-memory"
+    } else {
+        "WAL file"
+    };
+    println!("\n╔══════════════════════════════════════════════════════════════════════════════╗");
+    println!("║  AxiomDB vs SQLite ({sqlite_mode:<10}) — {n_rows} rows per scenario");
+    println!("║  Both engines: same process, same data, no network                         ║");
+    println!("╚══════════════════════════════════════════════════════════════════════════════╝\n");
+
+    let axiomdb_dir = tempfile::TempDir::new().expect("tempdir");
+    let sqlite_dir = tempfile::TempDir::new().expect("tempdir");
+
+    let mut ax_db = Db::open(axiomdb_dir.path());
+
+    let sq_db = if sqlite_memory {
+        SqliteDb::open_memory()
+    } else {
+        SqliteDb::open_file(&sqlite_dir.path().join("bench.db"))
+    };
+
+    let scenarios: &[(&str, usize)] = &[
+        ("insert_batch", n_rows),
+        ("insert_autocommit", n_rows.min(300)),
+        ("crud_flow/insert", n_rows),
+        ("crud_flow/select", n_rows),
+        ("crud_flow/delete", n_rows),
+        ("full_scan", n_rows),
+        ("select_where", n_rows),
+        ("point_lookup", 100),
+        ("range_scan", n_rows / 10),
+        ("count_star", 1),
+        ("group_by", 1),
+    ];
+
+    // Header
+    println!(
+        "{:<28} {:>14} {:>14} {:>8}  Verdict",
+        "Scenario", "AxiomDB", "SQLite", "Ratio"
+    );
+    println!("{}", "─".repeat(78));
+
+    let mut wins = 0usize;
+    let mut total = 0usize;
+
+    for &(scenario, n_ops) in scenarios {
+        // AxiomDB
+        let ax_s = run_scenario_timed(scenario, n_rows, axiomdb_dir.path(), &mut ax_db);
+        // SQLite
+        let sq_s = run_sqlite_scenario(scenario, n_rows, &sq_db);
+
+        let ratio = ax_s / sq_s.max(1e-12);
+        let verdict = if ratio <= 1.0 {
+            "✅ faster"
+        } else {
+            &format!("⚠️  {ratio:.1}x slower")
+        };
+        if ratio <= 1.0 {
+            wins += 1;
+        }
+        total += 1;
+
+        let ax_ops = fmt_ops_s(n_ops, ax_s);
+        let sq_ops = fmt_ops_s(n_ops, sq_s);
+
+        println!(
+            "{:<28} {:>14} {:>14} {:>7.2}x  {}",
+            scenario, ax_ops, sq_ops, ratio, verdict
+        );
+    }
+
+    println!("{}", "─".repeat(78));
+    println!("\nAxiomDB wins: {wins}/{total} scenarios");
+
+    if wins == total {
+        println!("🚀 AxiomDB beats SQLite on every scenario");
+    } else if wins >= total / 2 {
+        println!("⚡ AxiomDB leads on majority — investigate ⚠️ scenarios");
+    } else {
+        println!("🔍 SQLite leads on majority");
+        println!("   Tip: run with --diagnose (on AxiomDB side) to find the bottleneck");
+    }
+    println!();
+}
+
+fn run_scenario_timed(scenario: &str, n_rows: usize, _data_dir: &Path, db: &mut Db) -> f64 {
+    let inserts = gen_inserts(n_rows);
+    let ac_n = n_rows.min(300);
+    let ac = gen_inserts(ac_n);
+    let step = (n_rows.max(100) / 100).max(1);
+    let start = n_rows / 4;
+    let end = start + n_rows / 10;
+
+    match scenario {
+        "insert_batch" => measure_timed(|| {
+            reset(db);
+            let t0 = Instant::now();
+            insert_batch_pure(db, &inserts);
+            t0.elapsed()
+        }),
+
+        "insert_autocommit" => measure_timed(|| {
+            reset(db);
+            let t0 = Instant::now();
+            for sql in &ac {
+                db.sql(sql);
+            }
+            t0.elapsed()
+        }),
+
+        "crud_flow/insert" | "crud_flow/select" | "crud_flow/delete" => {
+            let mut ins_t = Vec::with_capacity(RUNS);
+            let mut sel_t = Vec::with_capacity(RUNS);
+            let mut del_t = Vec::with_capacity(RUNS);
+
+            for i in 0..(WARMUP + RUNS) {
+                reset(db);
+                let t0 = Instant::now();
+                insert_batch_pure(db, &inserts);
+                let t_ins = t0.elapsed().as_secs_f64();
+
+                let t0 = Instant::now();
+                db.sql_count("SELECT * FROM bench_users");
+                let t_sel = t0.elapsed().as_secs_f64();
+
+                let t0 = Instant::now();
+                db.sql("DELETE FROM bench_users");
+                let t_del = t0.elapsed().as_secs_f64();
+
+                if i >= WARMUP {
+                    ins_t.push(t_ins);
+                    sel_t.push(t_sel);
+                    del_t.push(t_del);
+                }
+            }
+            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+            match scenario {
+                "crud_flow/insert" => mean(&ins_t),
+                "crud_flow/select" => mean(&sel_t),
+                _ => mean(&del_t),
+            }
+        }
+
+        "full_scan" => {
+            load_batch(db, &inserts);
+            measure(|| {
+                db.sql_count("SELECT * FROM bench_users");
+            })
+        }
+
+        "select_where" => {
+            load_batch(db, &inserts);
+            measure(|| {
+                db.sql_count("SELECT * FROM bench_users WHERE active = TRUE");
+            })
+        }
+
+        "point_lookup" => {
+            load_batch(db, &inserts);
+            measure(|| {
+                for i in (1..=n_rows).step_by(step).take(100) {
+                    db.sql_count(&format!("SELECT * FROM bench_users WHERE id = {i}"));
+                }
+            })
+        }
+
+        "range_scan" => {
+            load_batch(db, &inserts);
+            measure(|| {
+                db.sql_count(&format!(
+                    "SELECT * FROM bench_users WHERE id >= {start} AND id < {end}"
+                ));
+            })
+        }
+
+        "count_star" => {
+            load_batch(db, &inserts);
+            measure(|| {
+                db.sql("SELECT COUNT(*) FROM bench_users");
+            })
+        }
+
+        "group_by" => {
+            load_batch(db, &inserts);
+            measure(|| {
+                db.sql("SELECT age, COUNT(*) FROM bench_users GROUP BY age");
+            })
+        }
+
+        other => {
+            eprintln!("unknown scenario: {other}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn fmt_ops_s(n: usize, s: f64) -> String {
+    if s <= 0.0 {
+        return "—".to_string();
+    }
+    let ops = n as f64 / s;
+    if ops >= 1_000_000.0 {
+        format!("{:.2}M ops/s", ops / 1_000_000.0)
+    } else if ops >= 1_000.0 {
+        format!("{:.1}K ops/s", ops / 1_000.0)
+    } else {
+        format!("{:.1} ops/s", ops)
+    }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    let n_rows: usize = args
+        .iter()
+        .skip_while(|a| *a != "--rows")
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+
+    // --compare mode: AxiomDB vs SQLite side-by-side
+    if args.contains(&"--compare".to_string()) {
+        let sqlite_memory = args.contains(&"--sqlite-memory".to_string());
+        run_compare(n_rows, sqlite_memory);
+        return;
+    }
 
     let scenario = args
         .iter()
@@ -356,13 +777,6 @@ fn main() {
         .expect("--scenario <name> required")
         .as_str()
         .to_owned();
-
-    let n_rows: usize = args
-        .iter()
-        .skip_while(|a| *a != "--rows")
-        .nth(1)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10_000);
 
     // Use /data inside container (or temp dir when testing locally)
     let data_dir = if Path::new("/data").exists() {

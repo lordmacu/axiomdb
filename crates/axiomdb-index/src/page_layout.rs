@@ -110,7 +110,13 @@ impl InternalNodePage {
     }
 
     pub fn key_at(&self, i: usize) -> &[u8] {
-        &self.keys[i][..self.key_lens[i] as usize]
+        let len = self.key_lens[i] as usize;
+        debug_assert!(
+            len <= MAX_KEY_LEN,
+            "corrupt InternalNodePage: key_lens[{i}]={len} > MAX_KEY_LEN={MAX_KEY_LEN}, num_keys={}",
+            self.num_keys()
+        );
+        &self.keys[i][..len]
     }
 
     pub fn set_key_at(&mut self, i: usize, k: &[u8]) {
@@ -134,6 +140,20 @@ impl InternalNodePage {
     ///
     /// Finds the first separator strictly greater than `key` using binary search.
     /// Keys are sorted by the B+ Tree invariant → O(log n) comparisons.
+    /// Validates that all key_lens[0..num_keys] are ≤ MAX_KEY_LEN.
+    /// Panics in debug builds when a corrupted node is detected.
+    #[cfg(debug_assertions)]
+    pub fn validate(&self) {
+        let n = self.num_keys();
+        for i in 0..n {
+            let len = self.key_lens[i] as usize;
+            assert!(
+                len <= MAX_KEY_LEN,
+                "corrupt InternalNodePage at validate: key_lens[{i}]={len} > MAX_KEY_LEN={MAX_KEY_LEN}, num_keys={n}"
+            );
+        }
+    }
+
     pub fn find_child_idx(&self, key: &[u8]) -> usize {
         let n = self.num_keys();
         let mut lo = 0usize;
