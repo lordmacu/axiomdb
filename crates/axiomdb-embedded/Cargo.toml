@@ -66,3 +66,6 @@ axiomdb-catalog = { workspace = true, optional = true }
 axiomdb-sql     = { path = "../axiomdb-sql", optional = true }
 tokio           = { workspace = true, optional = true }
 thiserror       = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

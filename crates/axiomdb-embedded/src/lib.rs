@@ -9,9 +9,17 @@
 //! use axiomdb_embedded::Db;
 //!
 //! let mut db = Db::open("./myapp.db").unwrap();
-//! db.execute("CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL, PRIMARY KEY(id))").unwrap();
+//! db.execute("CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL)").unwrap();
 //! db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+//!
 //! let rows = db.query("SELECT * FROM users").unwrap();
+//! for row in &rows {
+//!     println!("{:?}", row);
+//! }
+//!
+//! // With column names:
+//! let (columns, rows) = db.query_with_columns("SELECT id, name FROM users").unwrap();
+//! println!("columns: {:?}", columns); // ["id", "name"]
 //! ```
 //!
 //! ## Build profiles
@@ -22,13 +30,29 @@
 //! | `async-api` | + tokio | Async Rust services |
 //! | `wasm` | sync, no mmap | Browser (future) |
 //!
-//! ## C API (for non-Rust languages)
+//! ## C API (for C, C++, Python ctypes, Swift, Kotlin JNI)
 //!
 //! ```c
+//! #include "axiomdb.h"
+//!
 //! AxiomDb* db = axiomdb_open("./myapp.db");
 //! axiomdb_execute(db, "INSERT INTO users VALUES (1, 'Alice')");
-//! AxiomRows* rows = axiomdb_query(db, "SELECT * FROM users");
-//! axiomdb_rows_free(rows);
+//!
+//! AxiomRows* rows = axiomdb_query(db, "SELECT id, name FROM users");
+//! if (rows) {
+//!     int64_t n = axiomdb_rows_count(rows);
+//!     int32_t ncols = axiomdb_rows_columns(rows);
+//!     for (int64_t r = 0; r < n; r++) {
+//!         for (int32_t c = 0; c < ncols; c++) {
+//!             printf("%s = %s\n",
+//!                 axiomdb_rows_column_name(rows, c),
+//!                 axiomdb_rows_get_text(rows, r, c));
+//!         }
+//!     }
+//!     axiomdb_rows_free(rows);
+//! } else {
+//!     printf("error: %s\n", axiomdb_last_error(db));
+//! }
 //! axiomdb_close(db);
 //! ```
 
@@ -42,6 +66,7 @@ pub use db::Row;
 
 #[cfg(feature = "sync-api")]
 mod db {
+    use std::ffi::CString;
     use std::path::Path;
 
     use axiomdb_catalog::bootstrap::CatalogBootstrap;
@@ -75,6 +100,9 @@ mod db {
         /// all mutating operations are rejected immediately without touching
         /// WAL or storage again.
         degraded: bool,
+        /// Last error message. Cleared on success, set on any error.
+        /// Exposed via `last_error()` (Rust) and `axiomdb_last_error()` (C FFI).
+        pub(crate) error_msg: Option<CString>,
     }
 
     impl Db {
@@ -112,6 +140,7 @@ mod db {
                 schema_cache: SchemaCache::new(),
                 session: SessionContext::default(),
                 degraded: false,
+                error_msg: None,
             })
         }
 
@@ -150,10 +179,58 @@ mod db {
             })
         }
 
+        /// Executes a SQL SELECT and returns both column names and rows.
+        ///
+        /// Use this when you need to know column names at runtime (e.g. to build
+        /// a table display, serialize to JSON, or pass column headers to a UI).
+        ///
+        /// ```rust,no_run
+        /// # let mut db = axiomdb_embedded::Db::open("./test.db").unwrap();
+        /// let (columns, rows) = db.query_with_columns("SELECT id, name FROM users").unwrap();
+        /// println!("columns: {:?}", columns); // ["id", "name"]
+        /// for row in rows {
+        ///     for (col, val) in columns.iter().zip(row.iter()) {
+        ///         println!("{col} = {val}");
+        ///     }
+        /// }
+        /// ```
+        pub fn query_with_columns(
+            &mut self,
+            sql: &str,
+        ) -> Result<(Vec<String>, Vec<Row>), DbError> {
+            let result = self.run(sql)?;
+            Ok(match result {
+                QueryResult::Rows { columns, rows } => {
+                    let names = columns.into_iter().map(|c| c.name).collect();
+                    (names, rows)
+                }
+                _ => (vec![], vec![]),
+            })
+        }
+
         /// Executes a SQL statement and returns the full `QueryResult`.
         ///
         /// Useful when you need column metadata, last_insert_id, etc.
         pub fn run(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+            let result = self.run_inner(sql);
+            match &result {
+                Ok(_) => {
+                    self.error_msg = None;
+                }
+                Err(e) => {
+                    if matches!(e, DbError::DiskFull { .. }) {
+                        self.degraded = true;
+                    }
+                    self.error_msg = CString::new(e.to_string()).ok();
+                }
+            }
+            result
+        }
+
+        /// Inner implementation — all errors bubble up through `run()` which
+        /// captures them into `error_msg`. Using `?` here is safe because
+        /// `run()` wraps the whole call and always sets `error_msg` on error.
+        fn run_inner(&mut self, sql: &str) -> Result<QueryResult, DbError> {
             if self.degraded && sql_may_mutate(sql) {
                 return Err(DbError::DiskFull {
                     operation: "database is in read-only degraded mode",
@@ -165,19 +242,25 @@ mod db {
                 .active_snapshot()
                 .unwrap_or_else(|_| self.txn.snapshot());
             let analyzed = analyze_cached(stmt, &self.storage, snap, &mut self.schema_cache)?;
-            let result = execute_with_ctx(
+            execute_with_ctx(
                 analyzed,
                 &mut self.storage,
                 &mut self.txn,
                 &mut self.bloom,
                 &mut self.session,
-            );
-            if let Err(ref e) = result {
-                if matches!(e, DbError::DiskFull { .. }) {
-                    self.degraded = true;
-                }
-            }
-            result
+            )
+        }
+
+        /// Returns the last error message, or `None` if the last operation succeeded.
+        ///
+        /// ```rust,no_run
+        /// # let mut db = axiomdb_embedded::Db::open("./test.db").unwrap();
+        /// if db.query("SELECT * FROM missing").is_err() {
+        ///     println!("error: {:?}", db.last_error());
+        /// }
+        /// ```
+        pub fn last_error(&self) -> Option<&str> {
+            self.error_msg.as_deref().and_then(|s| s.to_str().ok())
         }
 
         /// Opens an explicit transaction. All subsequent `execute()`/`query()`
@@ -227,10 +310,92 @@ mod db {
 
 #[cfg(feature = "c-ffi")]
 mod ffi {
-    use std::ffi::CStr;
-    use std::os::raw::c_char;
+    use std::ffi::{CStr, CString};
+    use std::os::raw::{c_char, c_int};
+
+    use axiomdb_types::Value;
 
     use super::db::Db;
+
+    // ── Type codes (match SQLite conventions for easy porting) ────────────────
+
+    /// Cell type: SQL NULL.
+    pub const AXIOMDB_TYPE_NULL: c_int = 0;
+    /// Cell type: integer (Bool, Int, BigInt, Date days, Timestamp µs).
+    pub const AXIOMDB_TYPE_INTEGER: c_int = 1;
+    /// Cell type: floating-point (Real, Decimal).
+    pub const AXIOMDB_TYPE_REAL: c_int = 2;
+    /// Cell type: UTF-8 text (Text, UUID).
+    pub const AXIOMDB_TYPE_TEXT: c_int = 3;
+    /// Cell type: binary blob (Bytes).
+    pub const AXIOMDB_TYPE_BLOB: c_int = 4;
+
+    // ── Internal cell representation ──────────────────────────────────────────
+
+    enum CellValue {
+        Null,
+        Integer(i64),
+        Real(f64),
+        Text(CString),
+        Blob(Vec<u8>),
+    }
+
+    impl CellValue {
+        fn type_code(&self) -> c_int {
+            match self {
+                Self::Null => AXIOMDB_TYPE_NULL,
+                Self::Integer(_) => AXIOMDB_TYPE_INTEGER,
+                Self::Real(_) => AXIOMDB_TYPE_REAL,
+                Self::Text(_) => AXIOMDB_TYPE_TEXT,
+                Self::Blob(_) => AXIOMDB_TYPE_BLOB,
+            }
+        }
+    }
+
+    fn value_to_cell(v: Value) -> CellValue {
+        match v {
+            Value::Null => CellValue::Null,
+            Value::Bool(b) => CellValue::Integer(b as i64),
+            Value::Int(i) => CellValue::Integer(i as i64),
+            Value::BigInt(i) => CellValue::Integer(i),
+            Value::Real(f) => CellValue::Real(f),
+            Value::Decimal(m, s) => CellValue::Real(m as f64 / 10f64.powi(s as i32)),
+            Value::Date(d) => CellValue::Integer(d as i64),
+            Value::Timestamp(t) => CellValue::Integer(t),
+            Value::Text(s) => {
+                CellValue::Text(CString::new(s).unwrap_or_else(|_| CString::new("").unwrap()))
+            }
+            Value::Bytes(b) => CellValue::Blob(b),
+            Value::Uuid(u) => {
+                let s = format!(
+                    "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+                    u32::from_be_bytes([u[0], u[1], u[2], u[3]]),
+                    u16::from_be_bytes([u[4], u[5]]),
+                    u16::from_be_bytes([u[6], u[7]]),
+                    u16::from_be_bytes([u[8], u[9]]),
+                    {
+                        let mut buf = [0u8; 8];
+                        buf[2..].copy_from_slice(&u[10..16]);
+                        u64::from_be_bytes(buf)
+                    }
+                );
+                CellValue::Text(CString::new(s).unwrap_or_else(|_| CString::new("").unwrap()))
+            }
+        }
+    }
+
+    // ── AxiomRows — C-safe result set ─────────────────────────────────────────
+
+    /// A materialized query result set returned by `axiomdb_query`.
+    ///
+    /// All row data and column names are owned by this struct.
+    /// Must be freed with `axiomdb_rows_free` when no longer needed.
+    pub struct AxiomRows {
+        col_names: Vec<CString>,
+        cells: Vec<Vec<CellValue>>,
+    }
+
+    // ── Open / close ──────────────────────────────────────────────────────────
 
     /// Opens or creates a database at `path`.
     ///
@@ -254,9 +419,10 @@ mod ffi {
         }
     }
 
-    /// Executes a SQL statement (no result rows expected).
+    /// Executes a SQL statement (INSERT, UPDATE, DELETE, DDL — no result rows).
     ///
     /// Returns the number of rows affected, or -1 on error.
+    /// On error, `axiomdb_last_error(db)` returns the error message.
     ///
     /// # Safety
     /// `db` must be a valid pointer from `axiomdb_open`.
@@ -277,6 +443,47 @@ mod ffi {
         }
     }
 
+    /// Executes a SQL SELECT and returns a result set.
+    ///
+    /// Returns an `AxiomRows*` that must be freed with `axiomdb_rows_free`,
+    /// or NULL on error. On error, `axiomdb_last_error(db)` returns the message.
+    ///
+    /// # Safety
+    /// `db` must be a valid pointer from `axiomdb_open`.
+    /// `sql` must be a valid non-null null-terminated UTF-8 string.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_query(db: *mut Db, sql: *const c_char) -> *mut AxiomRows {
+        if db.is_null() || sql.is_null() {
+            return std::ptr::null_mut();
+        }
+        let db = &mut *db;
+        let sql = match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        match db.run(sql) {
+            Ok(axiomdb_sql::result::QueryResult::Rows { columns, rows }) => {
+                let col_names: Vec<CString> = columns
+                    .into_iter()
+                    .map(|c| CString::new(c.name).unwrap_or_else(|_| CString::new("").unwrap()))
+                    .collect();
+                let cells: Vec<Vec<CellValue>> = rows
+                    .into_iter()
+                    .map(|row| row.into_iter().map(value_to_cell).collect())
+                    .collect();
+                Box::into_raw(Box::new(AxiomRows { col_names, cells }))
+            }
+            Ok(_) => {
+                // DDL / DML with no rows: return an empty result set
+                Box::into_raw(Box::new(AxiomRows {
+                    col_names: vec![],
+                    cells: vec![],
+                }))
+            }
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
     /// Closes the database and frees all resources.
     ///
     /// # Safety
@@ -287,6 +494,220 @@ mod ffi {
         if !db.is_null() {
             drop(Box::from_raw(db));
         }
+    }
+
+    // ── Row result accessors ──────────────────────────────────────────────────
+
+    /// Returns the number of rows in the result set.
+    ///
+    /// # Safety
+    /// `rows` must be a valid pointer from `axiomdb_query`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_rows_count(rows: *const AxiomRows) -> i64 {
+        if rows.is_null() {
+            return 0;
+        }
+        (*rows).cells.len() as i64
+    }
+
+    /// Returns the number of columns in the result set.
+    ///
+    /// # Safety
+    /// `rows` must be a valid pointer from `axiomdb_query`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_rows_columns(rows: *const AxiomRows) -> i32 {
+        if rows.is_null() {
+            return 0;
+        }
+        (*rows).col_names.len() as i32
+    }
+
+    /// Returns the name of column `col` as a null-terminated UTF-8 string.
+    ///
+    /// Returns NULL if `col` is out of bounds.
+    /// The returned pointer is valid until `axiomdb_rows_free` is called.
+    ///
+    /// # Safety
+    /// `rows` must be a valid pointer from `axiomdb_query`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_rows_column_name(
+        rows: *const AxiomRows,
+        col: i32,
+    ) -> *const c_char {
+        if rows.is_null() || col < 0 {
+            return std::ptr::null();
+        }
+        let r = &*rows;
+        match r.col_names.get(col as usize) {
+            Some(name) => name.as_ptr(),
+            None => std::ptr::null(),
+        }
+    }
+
+    /// Returns the type code of cell `(row, col)`.
+    ///
+    /// Type codes: `AXIOMDB_TYPE_NULL=0`, `AXIOMDB_TYPE_INTEGER=1`,
+    /// `AXIOMDB_TYPE_REAL=2`, `AXIOMDB_TYPE_TEXT=3`, `AXIOMDB_TYPE_BLOB=4`.
+    ///
+    /// Returns `AXIOMDB_TYPE_NULL` if the indices are out of bounds.
+    ///
+    /// # Safety
+    /// `rows` must be a valid pointer from `axiomdb_query`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_rows_type(
+        rows: *const AxiomRows,
+        row: i64,
+        col: i32,
+    ) -> c_int {
+        cell(rows, row, col)
+            .map(|c| c.type_code())
+            .unwrap_or(AXIOMDB_TYPE_NULL)
+    }
+
+    /// Returns the integer value of cell `(row, col)`.
+    ///
+    /// Covers: `Bool` (0/1), `Int`, `BigInt`, `Date` (days since epoch),
+    /// `Timestamp` (microseconds since epoch).
+    ///
+    /// Returns 0 for NULL or non-integer cells.
+    ///
+    /// # Safety
+    /// `rows` must be a valid pointer from `axiomdb_query`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_rows_get_int(
+        rows: *const AxiomRows,
+        row: i64,
+        col: i32,
+    ) -> i64 {
+        match cell(rows, row, col) {
+            Some(CellValue::Integer(v)) => *v,
+            _ => 0,
+        }
+    }
+
+    /// Returns the floating-point value of cell `(row, col)`.
+    ///
+    /// Covers: `Real`, `Decimal`.
+    ///
+    /// Returns `0.0` for NULL or non-real cells.
+    ///
+    /// # Safety
+    /// `rows` must be a valid pointer from `axiomdb_query`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_rows_get_double(
+        rows: *const AxiomRows,
+        row: i64,
+        col: i32,
+    ) -> f64 {
+        match cell(rows, row, col) {
+            Some(CellValue::Real(v)) => *v,
+            _ => 0.0,
+        }
+    }
+
+    /// Returns the text value of cell `(row, col)` as a null-terminated UTF-8
+    /// string.
+    ///
+    /// Covers: `Text`, `UUID` (formatted as `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
+    ///
+    /// Returns NULL for NULL cells, non-text cells, or out-of-bounds indices.
+    /// The returned pointer is valid until `axiomdb_rows_free` is called.
+    ///
+    /// # Safety
+    /// `rows` must be a valid pointer from `axiomdb_query`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_rows_get_text(
+        rows: *const AxiomRows,
+        row: i64,
+        col: i32,
+    ) -> *const c_char {
+        match cell(rows, row, col) {
+            Some(CellValue::Text(s)) => s.as_ptr(),
+            _ => std::ptr::null(),
+        }
+    }
+
+    /// Returns the blob value of cell `(row, col)`.
+    ///
+    /// Sets `*len` to the number of bytes. Returns NULL for NULL cells,
+    /// non-blob cells, or out-of-bounds indices.
+    /// The returned pointer is valid until `axiomdb_rows_free` is called.
+    ///
+    /// # Safety
+    /// `rows` must be a valid pointer from `axiomdb_query`.
+    /// `len` must be a valid non-null pointer to a `size_t`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_rows_get_blob(
+        rows: *const AxiomRows,
+        row: i64,
+        col: i32,
+        len: *mut usize,
+    ) -> *const u8 {
+        match cell(rows, row, col) {
+            Some(CellValue::Blob(b)) => {
+                if !len.is_null() {
+                    *len = b.len();
+                }
+                b.as_ptr()
+            }
+            _ => {
+                if !len.is_null() {
+                    *len = 0;
+                }
+                std::ptr::null()
+            }
+        }
+    }
+
+    /// Frees a result set returned by `axiomdb_query`.
+    ///
+    /// After this call, all pointers returned by `axiomdb_rows_*` accessors
+    /// for this result set are invalid and must not be dereferenced.
+    ///
+    /// # Safety
+    /// `rows` must be a valid pointer from `axiomdb_query`, or NULL (no-op).
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_rows_free(rows: *mut AxiomRows) {
+        if !rows.is_null() {
+            drop(Box::from_raw(rows));
+        }
+    }
+
+    // ── Error reporting ───────────────────────────────────────────────────────
+
+    /// Returns the last error message for `db` as a null-terminated UTF-8 string.
+    ///
+    /// Returns NULL if the last operation succeeded.
+    /// The returned pointer is valid until the next call to any `axiomdb_*`
+    /// function on this handle.
+    ///
+    /// # Safety
+    /// `db` must be a valid pointer from `axiomdb_open`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_last_error(db: *const Db) -> *const c_char {
+        if db.is_null() {
+            return std::ptr::null();
+        }
+        match &(*db).error_msg {
+            Some(s) => s.as_ptr(),
+            None => std::ptr::null(),
+        }
+    }
+
+    // ── Internal helper ───────────────────────────────────────────────────────
+
+    /// Returns a reference to cell `(row, col)`, or `None` if out of bounds.
+    ///
+    /// # Safety
+    /// `rows` must be a valid pointer or null.
+    unsafe fn cell(rows: *const AxiomRows, row: i64, col: i32) -> Option<&'static CellValue> {
+        if rows.is_null() || row < 0 || col < 0 {
+            return None;
+        }
+        let r = &*rows;
+        r.cells
+            .get(row as usize)
+            .and_then(|row| row.get(col as usize))
     }
 }
 
@@ -305,7 +726,10 @@ pub mod async_db {
     //! #[tokio::main]
     //! async fn main() {
     //!     let db = AsyncDb::open("./myapp.db").await.unwrap();
-    //!     db.execute("CREATE TABLE t (id INT NOT NULL, PRIMARY KEY(id))").await.unwrap();
+    //!     db.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+    //!
+    //!     let (columns, rows) = db.query_with_columns("SELECT * FROM t").await.unwrap();
+    //!     println!("columns: {:?}", columns);
     //! }
     //! ```
     use std::path::PathBuf;
@@ -357,6 +781,23 @@ pub mod async_db {
             let sql = sql.into();
             let inner = Arc::clone(&self.inner);
             tokio::task::spawn_blocking(move || inner.lock().unwrap().query(&sql))
+                .await
+                .map_err(|e| {
+                    DbError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })?
+        }
+
+        /// Executes a SQL SELECT. Returns column names and rows.
+        pub async fn query_with_columns(
+            &self,
+            sql: impl Into<String>,
+        ) -> Result<(Vec<String>, Vec<Row>), DbError> {
+            let sql = sql.into();
+            let inner = Arc::clone(&self.inner);
+            tokio::task::spawn_blocking(move || inner.lock().unwrap().query_with_columns(&sql))
                 .await
                 .map_err(|e| {
                     DbError::Io(std::io::Error::new(

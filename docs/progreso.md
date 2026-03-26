@@ -126,6 +126,7 @@
 
 <!-- ── Group E — Core SQL (needs executor) ── -->
 - [x] 4.8 ✅ JOIN — INNER, LEFT, RIGHT, CROSS with nested loop; USING; multi-table; FULL → NotImplemented
+- [ ] 4.8b ⏳ FULL OUTER JOIN — complete the only unimplemented join type; parser already accepts it (returns NotImplemented); executor needs symmetric hash join or two-pass approach; no dependency on MVCC/SIMD — pure parser+executor work; natural extension of the already-complete 4.8 join infrastructure
 - [x] 4.9a ✅ GROUP BY hash-based — HashMap<key_bytes, GroupState>; value_to_key_bytes; NULL keys group correctly
 - [x] 4.9b ✅ GROUP BY sort-based — sorted streaming executor; auto-selects when access method is IndexLookup/IndexRange/IndexOnlyScan with matching GROUP BY prefix; hash path remains default fallback; 9 integration tests + 11 wire assertions
   - [x] ✅ ORDER BY + GROUP BY col_idx mismatch — fixed in 4.10e: remap_order_by_for_grouped rewrites column/aggregate expressions to output positions before apply_order_by
@@ -197,6 +198,7 @@
 - [x] 5.12 ✅ Multi-statement queries — split_sql_statements() handles `;` with quoted-string awareness; COM_QUERY loop executes each stmt; SERVER_MORE_RESULTS_EXISTS (0x0008) flag in intermediate EOF/OK; serialize_query_result_multi(); build_eof_with_status()/build_ok_with_status()
 - [x] 5.13 ✅ Prepared statement plan cache — schema_version Arc<AtomicU64> in Database; compiled_at_version in PreparedStatement; lock-free version check on COM_STMT_EXECUTE; re-analyze on DDL mismatch; LRU eviction with max_prepared_stmts_per_connection (default 1024); 6 unit tests
 - [x] 5.14 ✅ Throughput benchmarks + perf fix — SELECT 185 q/s (3.3× vs 56 q/s antes); INSERT 58 q/s (fsync necesario); root cause: read-only txns hacían fsync innecesario; fix: flush_no_sync para undo_ops.is_empty()
+- [ ] 5.15 ⏳ Connection string DSN — `axiomdb://user:pass@host:port/dbname?param=val`; `mysql://` as alias for MySQL driver compatibility; `postgres://` as alias for tools like pgcli/DBeaver; parse DSN in the client-facing API and server config; ORMs and connection pools (SQLAlchemy, Django, GORM) use DSN as their primary connection method — without this they require manual host/port/user parameters which breaks standard tooling
 
 ### Phase 6 — Secondary indexes + FK `🔄` week 31-39
 - [x] 6.1 ✅ `IndexColumnDef` + `IndexDef.columns` — catalog stores which columns each index covers; backward-compatible serialization
@@ -217,7 +219,7 @@
 - [x] 6.11 ✅ Auto-update statistics — StaleStatsTracker in SessionContext; marks stale after >20% row change
 - [x] 6.12 ✅ ANALYZE [TABLE name [(column)]] — exact NDV full scan; resets staleness
 - [x] 6.13 ✅ Index-only scans — `IndexOnlyScan` planner variant; `decode_index_key` inverse codec; `is_slot_visible` MVCC header-only check; `INCLUDE (cols)` DDL syntax + catalog storage; non-unique secondary indexes fixed to use `key||RecordId` format (InnoDB approach) — DuplicateKey on duplicate non-unique values fixed
-- [ ] 6.14 ⏳ MVCC on secondary indexes — each index entry includes `(key, RecordId, txn_id_visible_from)`; UPDATE of indexed column inserts new version without deleting the old one; vacuum cleans dead index versions
+- [ ] ⚠️ 6.14 DEFERRED to Phase 7 — MVCC on secondary indexes requires 7.1-7.3 (snapshot isolation) to be implemented first; moved to 7.3b
 - [ ] 6.15 ⏳ Index corruption detection — on DB open verify index checksums; detect index vs table divergence; automatic `REINDEX` if divergent (recovery mode)
 
 ### Phase 7 — Concurrency + MVCC `⏳` week 40-48
@@ -225,6 +227,7 @@
 - [ ] 7.1 ⏳ MVCC visibility rules — snapshot_id rules over RowHeader (struct defined in 3.4): which rows are visible; implement READ COMMITTED (snapshot per statement) and REPEATABLE READ (snapshot per transaction) explicitly
 - [ ] 7.2 ⏳ Transaction manager — global atomic txn_id counter
 - [ ] 7.3 ⏳ Snapshot isolation — visibility rules per snapshot_id
+- [ ] 7.3b ⏳ MVCC on secondary indexes — each index entry includes `(key, RecordId, txn_id_visible_from)`; UPDATE of indexed column inserts new version without deleting the old one; vacuum cleans dead index versions; requires 7.1-7.3 snapshot isolation (moved from 6.14)
 - [ ] 7.4 ⏳ Lock-free readers with CoW — verify that reads do not block writes
 - [ ] 7.5 ⏳ Writer serialization — only 1 writer at a time per table (improve later)
 - [ ] 7.6 ⏳ ROLLBACK — mark txn rows as deleted
@@ -237,17 +240,17 @@
 - [ ] 7.13 ⏳ Isolation tests — verify READ COMMITTED and REPEATABLE READ with concurrent transactions; test dirty reads, non-repeatable reads, phantom reads; use real concurrent transactions (not mocks)
 - [ ] 7.14 ⏳ Cascading rollback prevention — if txn A aborts and txn B read data from A (dirty read), B must also abort; verify that READ COMMITTED prevents this structurally
 - [ ] 7.15 ⏳ Basic transaction ID overflow prevention — `txn_id` is u64; log warning at 50% and 90% of capacity; plan for VACUUM FREEZE (complete in Phase 34) but detection must be early
-- [ ] 7.16 ⏳ Historical reads — `BEGIN READ ONLY AS OF TIMESTAMP '2023-12-31 23:59:59'` anchors the snapshot to a past point; MVCC already has the data, this adds the SQL syntax and executor support; critical for auditing financial data at a specific date without exporting first
-- [ ] 7.17 ⏳ Optimistic locking / Compare-And-Swap — `UPDATE t SET qty=qty-1, ver=ver+1 WHERE id=? AND ver=? AND qty>0` returns 0 rows if version changed; explicit `SELECT ... FOR UPDATE SKIP LOCKED` for job queues; gaming inventory, e-commerce checkout, concurrent reservations all depend on this pattern without full serializable isolation
-- [ ] 7.18 ⏳ Cancel / kill query — `SELECT axiom_cancel_query(pid)` sends a cancellation signal to a running query (like `pg_cancel_backend`); `axiom_terminate_session(pid)` forcibly closes a connection; without this, a long-running accidental `SELECT * FROM logs` (millions of rows) has no way to be stopped from another session without restarting the server
-- [ ] 7.19 ⏳ Lock contention visibility — `SELECT * FROM axiom_lock_waits` system view shows: waiting_pid, blocking_pid, waiting_query, lock_type, wait_duration; `SELECT * FROM axiom_locks` shows all currently held locks; essential for diagnosing deadlocks and performance problems in production without guessing
-- [ ] 7.20 ⏳ Autonomous transactions — `PRAGMA AUTONOMOUS_TRANSACTION` on a stored procedure (Phase 16.7) makes it run in an independent transaction; `COMMIT` inside the autonomous procedure commits only that procedure's changes, never the outer transaction; if the outer transaction does `ROLLBACK`, the autonomous transaction's changes are preserved; critical use case: audit logging that persists even when the main operation fails — `log_error()` that always records what was attempted even on rollback; no other open-source database has this built-in
+- [ ] ⚠️ 7.16 MOVED to Phase 13 (13.18b) — Historical reads; requires MVCC (done here) but the SQL syntax and use cases belong with the rest of the temporal features in Phase 13
+- [ ] ⚠️ 7.17 MOVED to Phase 13 (13.8b) — SELECT FOR UPDATE / SKIP LOCKED; belongs alongside row-level locking (13.7) which is its natural prerequisite
+- [ ] ⚠️ 7.18 MOVED to Phase 19 (19.7b) — Cancel/kill query; operational feature, belongs with pg_stat_activity (19.7) and query management observability
+- [ ] ⚠️ 7.19 MOVED to Phase 19 (19.21b) — Lock contention visibility; observability feature, belongs with the axiom_* monitoring views in Phase 19
+- [ ] ⚠️ 7.20 DEFERRED to Phase 16 — Autonomous transactions require stored procedures (16.7) to exist first; moved to 16.10b
 
 ---
 
 ## BLOCK 2 — Execution Optimizations (Phases 8-10)
 
-### Phase 8 — SIMD Optimizations `⏳` week 19-20
+### Phase 8 — SIMD Optimizations `⏳` week 49-52
 - [ ] 8.1 ⏳ Vectorized filter — evaluate predicates in chunks of 1024 rows
 - [ ] 8.2 ⏳ SIMD AVX2 with `wide` — compare 8-32 values per instruction
 - [ ] 8.3 ⏳ Improved query planner — selectivity, index vs scan with stats
@@ -258,7 +261,7 @@
 - [ ] 8.7 ⏳ Runtime CPU feature detection — detect AVX2/SSE4.2 on startup; select optimal implementation; scalar fallback on old CPUs (ARM, CI)
 - [ ] 8.8 ⏳ SIMD vs scalar vs MySQL benchmark — comparison table per operation (filter, sum, count); document real speedup in `docs/fase-8.md`
 
-### Phase 9 — DuckDB-inspired + Join Algorithms `⏳` week 21-23
+### Phase 9 — DuckDB-inspired + Join Algorithms `⏳` week 53-56
 - [ ] 9.1 ⏳ Morsel-driven parallelism — split into 100K chunks, Rayon
 - [ ] 9.2 ⏳ Operator fusion — scan+filter+project in a single lazy loop
 - [ ] 9.3 ⏳ Late materialization — cheap predicates first, read expensive columns at the end
@@ -272,7 +275,7 @@
 - [ ] 9.10 ⏳ Join algorithms benchmarks — compare 3 strategies with different sizes; confirm that hash join beats nested loop with >10K rows
 - [ ] 9.11 ⏳ Streaming result iterator — `execute_streaming()` returns `impl Iterator<Item=Row>` instead of materializing `Vec<Row>` before returning; wire protocol sends rows as they are produced (no full buffer required); SELECT without ORDER BY can terminate early when LIMIT is reached without scanning the rest of the table; eliminates per-query allocation proportional to result size; MySQL C API has `USE_RESULT` mode, PostgreSQL has server-side cursors — AxiomDB needs an equivalent for competing on large result sets without OOM; prerequisite for cursor-based pagination (Phase 13+); depends on operator fusion (9.2) being lazy internally
 
-### Phase 10 — Embedded mode + FFI `⏳` week 24-25
+### Phase 10 — Embedded mode + FFI `⏳` week 57-60
 - [ ] 10.1 ⏳ Refactor engine as reusable `lib.rs`
 - [ ] 10.2 ⏳ C FFI — `axiomdb_open`, `axiomdb_execute`, `axiomdb_close` with `#[no_mangle]`
 - [ ] 10.3 ⏳ Compile as `cdylib` — `.so` / `.dll` / `.dylib`
@@ -300,7 +303,7 @@
 
 ## BLOCK 3 — Advanced Features (Phases 11-15)
 
-### Phase 11 — Robustness and indexes `⏳` week 26-27
+### Phase 11 — Robustness and indexes `⏳` week 61-64
 - [ ] 11.1 ⏳ Sparse index — one entry every N rows for timestamps
 - [ ] 11.1b ⏳ BRIN indexes — Block Range INdex; stores only min/max per block range (128 pages default); `CREATE INDEX ON events USING brin(created_at)`; occupies ~100x less space than B-Tree; only useful for columns that are physically ordered on disk (timestamps, auto-increment IDs, IOT sensor readings in arrival order); O(1) build, near-zero maintenance; planner uses it for range scans when column correlation is high; benchmark vs B-Tree on 10M-row time-series table
 - [ ] 11.2 ⏳ TOAST — values >2KB to overflow pages with LZ4; small blobs (≤ threshold) stay inline
@@ -320,7 +323,7 @@
 - [ ] 11.9 ⏳ Page prefetching — when sequential scan is detected, prefetch N pages ahead with `madvise(MADV_SEQUENTIAL)` or own read-ahead
 - [ ] 11.10 ⏳ Write combining — group writes to hot pages in a single fsync per commit; reduces IOPS on write-heavy workloads
 
-### Phase 12 — Testing + JIT `⏳` week 28-29
+### Phase 12 — Testing + JIT `⏳` week 65-68
 - [ ] 12.1 ⏳ Deterministic simulation testing — `FaultInjector` with seed
 - [ ] 12.2 ⏳ EXPLAIN ANALYZE — real times per plan node; JSON output format compatible with PostgreSQL (`{"Plan":{"Node Type":..., "Actual Rows":..., "Actual Total Time":..., "Buffers":{}}}`) and indented text format for psql/CLI; metrics: actual rows, loops, shared/local buffers hit/read, planning time, execution time
 - [ ] 12.3 ⏳ Basic JIT with LLVM — compile simple predicates to native code
@@ -331,15 +334,16 @@
 - [ ] 12.8 ⏳ Unified axiom_* observability system — all system views use consistent naming, types, and join keys; `SELECT * FROM axiom_queries` shows running queries with pid, duration, state, sql_text, plan_hash; `SELECT * FROM axiom_bloat` shows table bloat (from 7.11); `SELECT * FROM axiom_slow_queries` is auto-populated when query exceeds `slow_query_threshold` (default 1s); `SELECT * FROM axiom_stats` shows database-wide metrics (cache hit rate, rows read/written, lock waits); `SELECT * FROM axiom_index_usage` shows which indexes are used/unused; unlike MySQL's inconsistent SHOW commands and PostgreSQL's complex pg_catalog joins, every axiom_* view is self-documented, joinable, and has the same timestamp/duration formats
 - [ ] 12.9 ⏳ Date/time validation strictness — `'0000-00-00'` is always rejected with a clear error (MySQL allows this invalid date); `TIMESTAMP WITH TIME ZONE` is the single timestamp type with explicit timezone; no silent timezone conversion based on column type; `'2024-02-30'` is always an error; `'2024-13-01'` is always an error; retrocompatible: `SET AXIOM_COMPAT='mysql'` re-enables MySQL's lenient date behavior for migration
 
-### Phase 13 — Advanced PostgreSQL `⏳` week 30-31
+### Phase 13 — Advanced PostgreSQL `⏳` week 69-72
 - [ ] 13.1 ⏳ Materialized views — `CREATE MATERIALIZED VIEW` + `REFRESH`
 - [ ] 13.2 ⏳ Window functions — `RANK`, `ROW_NUMBER`, `LAG`, `LEAD`, `SUM OVER`
 - [ ] 13.3 ⏳ Generated columns — `GENERATED ALWAYS AS ... STORED/VIRTUAL`
 - [ ] 13.4 ⏳ LISTEN / NOTIFY — native pub-sub with `DashMap` of channels
-- [ ] 13.5 ⏳ Covering indexes — `INCLUDE (col1, col2)` in B+ Tree leaves
+- [ ] 13.5 ⏳ Covering indexes — store INCLUDE column values in B+ Tree leaf nodes; 6.13 already has catalog storage + IndexOnlyScan for key columns only; this phase adds the actual value payload to the leaf layout so index-only scans can return non-key projected columns without touching the heap
 - [ ] 13.6 ⏳ Non-blocking ALTER TABLE — shadow table + WAL delta + atomic swap
 - [ ] 13.7 ⏳ Row-level locking — lock specific row during UPDATE/DELETE; reduces contention vs per-table lock from 7.5
 - [ ] 13.8 ⏳ Deadlock detection — DFS on wait graph when lock_timeout expires; kill the youngest transaction
+- [ ] 13.8b ⏳ SELECT FOR UPDATE / SKIP LOCKED — pessimistic row locking for job queues, inventory checkout, concurrent reservations; `SELECT ... FOR UPDATE` acquires row lock until COMMIT/ROLLBACK; `SKIP LOCKED` skips already-locked rows instead of blocking; requires row-level locking (13.7); also covers `UPDATE t SET qty=qty-1 WHERE id=? AND qty>0` optimistic CAS pattern returning 0 rows on conflict (moved from 7.17)
 - [ ] 13.9 ⏳ Immutable / append-only tables — `CREATE TABLE journal IMMUTABLE`; the engine physically rejects UPDATE and DELETE on that table at the storage layer (not just a trigger); WAL still accepts new inserts; errors on any modification attempt with SQLSTATE 42000; critical for accounting, compliance, and audit logs where data must never be altered — only corrected via compensating inserts
 - [ ] 13.10 ⏳ Gapless sequences — `CREATE SEQUENCE inv_num GAPLESS START 1`; unlike AUTO_INCREMENT (which skips numbers on rollback), a gapless sequence uses a dedicated lock + WAL entry to guarantee no gaps even across failures; `NEXTVAL('inv_num')` blocks until the sequence number is committed; required by tax law in most countries for invoice numbering; `LAST_VALUE`, `RESET TO n` for administration
 - [ ] 13.11 ⏳ Fiscal period locking — `LOCK FISCAL PERIOD '2023'`; after locking, INSERT/UPDATE/DELETE of rows with any date column falling within that period returns an error; `UNLOCK FISCAL PERIOD '2023'` for corrections; stored in a system table `axiom_locked_periods`; the executor checks against it for tables that have a designated date column (`CREATE TABLE t (..., WITH FISCAL_DATE = created_at)`)
@@ -363,6 +367,7 @@
 - [ ] 13.15 ⏳ Filtered LISTEN/NOTIFY — `SUBSCRIBE TO orders WHERE status = 'pending' AND total > 1000 ON CHANGE`; current LISTEN/NOTIFY (13.4) notifies any change to the entire table; real-time dashboards need selective subscriptions — "notify me only about high-value pending orders" — without this the client receives all changes and filters in application code, wasting network bandwidth
 - [ ] 13.16 ⏳ Transactional reservations with auto-release
 - [ ] 13.17 ⏳ Recycle Bin for DROP TABLE — `DROP TABLE clientes` moves the table to the recycle bin instead of deleting it immediately; `FLASHBACK TABLE clientes TO BEFORE DROP` restores it completely with all data, indexes, and constraints intact; `SELECT * FROM axiom_recyclebin` lists dropped objects; `PURGE TABLE clientes` permanently deletes from the bin; configurable `recyclebin_retention = '30 days'`; eliminates the most common DBA emergency ("someone accidentally dropped the wrong table in production") without requiring a full database restore; Oracle introduced this in 10g and it became one of the most appreciated features
+- [ ] 13.18b ⏳ Historical reads — `BEGIN READ ONLY AS OF TIMESTAMP '2023-12-31 23:59:59'` anchors the snapshot to a past point in time; MVCC already stores the data (Phase 7), this adds the SQL syntax and executor support; critical for auditing financial data at a specific date without exporting; precursor to the full bi-temporal model in 13.18 (moved from 7.16)
 - [ ] 13.18 ⏳ Bi-temporal tables (SQL:2011) — first-class DDL for two-time-dimension data: `PERIOD FOR validity (valid_from, valid_until)` (application time: when the fact was true in reality) + `PERIOD FOR system_time` (transaction time: when it was recorded); `SELECT * FROM salaries FOR PERIOD OF validity AS OF DATE '2023-01-01' AS OF SYSTEM TIME '2023-02-15'` answers "what salary did Alice have on Jan 1 according to the records as they existed on Feb 15?"; extends Phase 7.16 (read-only AS OF) to a full SQL:2011 bitemporal model with DDL support; critical for accounting, insurance, HR, legal — any domain where both "when it happened" and "when we knew about it" matter independently — `INSERT INTO reservations (resource_id, session_id) VALUES (42, 'sess_abc') ON CONFLICT DO NOTHING RETURNING CASE WHEN id IS NULL THEN 'unavailable' ELSE 'reserved' END`; plus automatic release when session expires or connection drops; hotel booking, concert tickets, parking spots, inventory hold — "hold this item for 15 minutes while the user checks out"
 
 ### Phase 14 — TimescaleDB + Redis + Content-addressed BLOB `⏳` week 32-33
@@ -407,7 +412,8 @@
 - [ ] 16.7 ⏳ Stored procedures — `CREATE PROCEDURE` with flow control (`IF`, `LOOP`, `WHILE`, `BEGIN/END`)
 - [ ] 16.8 ⏳ Exception handling in procedures — `DECLARE ... HANDLER FOR SQLSTATE`, re-raise, cleanup handlers
 - [ ] 16.9 ⏳ UDF and trigger tests — correctness, error handling, WHEN conditions, INSTEAD OF over views
-- [ ] 16.10 ⏳ Built-in connection pooler — Pgbouncer-equivalent implemented inside the engine; multiplexes N application connections into M database backend connections (N >> M); transaction-mode pooling (connection returned to pool after each COMMIT/ROLLBACK); session variables reset between borrows; eliminates the need for external Pgbouncer/Pgpool deployment; critical for any app with >100 concurrent users since creating one OS thread per TCP connection does not scale
+- [ ] 16.10 ⏳ Built-in connection pooler
+- [ ] 16.10b ⏳ Autonomous transactions — `PRAGMA AUTONOMOUS_TRANSACTION` on a stored procedure makes it run in an independent transaction; `COMMIT` inside commits only that procedure's changes; if outer transaction does `ROLLBACK`, the autonomous transaction's changes are preserved; critical for audit logging that persists even when the main operation fails; requires 16.7 (stored procedures) first (moved from 7.20) — Pgbouncer-equivalent implemented inside the engine; multiplexes N application connections into M database backend connections (N >> M); transaction-mode pooling (connection returned to pool after each COMMIT/ROLLBACK); session variables reset between borrows; eliminates the need for external Pgbouncer/Pgpool deployment; critical for any app with >100 concurrent users since creating one OS thread per TCP connection does not scale
 
 ### Phase 17 — Security `⏳` week 39-40
 - [ ] 17.1 ⏳ CREATE USER / CREATE ROLE — user and role model
@@ -459,6 +465,7 @@
 - [ ] 19.5 ⏳ Slow query log — JSON with execution plan
 - [ ] 19.6 ⏳ Connection pooling — Semaphore + built-in idle pool
 - [ ] 19.7 ⏳ pg_stat_activity — view and cancel running queries
+- [ ] 19.7b ⏳ Cancel / kill query — `SELECT axiom_cancel_query(pid)` sends cancellation signal to a running query (like `pg_cancel_backend`); `axiom_terminate_session(pid)` forcibly closes a connection; without this, a runaway `SELECT * FROM logs` (millions of rows) cannot be stopped without restarting the server; integrates with pg_stat_activity (19.7) to expose the pid (moved from 7.18)
 - [ ] 19.8 ⏳ pg_stat_progress_vacuum — real-time vacuum progress
 - [ ] 19.9 ⏳ lock_timeout — error if waiting for a lock more than N ms
 - [ ] 19.10 ⏳ deadlock_timeout — how long to wait before running deadlock detector
@@ -472,6 +479,7 @@
 - [ ] 19.18 ⏳ Health check endpoint — `/health` and `/ready` for load balancers; verify WAL, storage and replicas
 - [ ] 19.19 ⏳ pg_stat_wal — bytes written, syncs, sync time; detect WAL as bottleneck
 - [ ] 19.21 ⏳ performance_schema equivalent — `axiom_performance_schema` namespace with: `events_statements_current` (running queries with digest, timer, rows_examined), `events_statements_history` (last 10 per connection), `events_waits_current` (lock waits, I/O waits), `table_io_waits_summary_by_table` (read/write latency per table), `file_io_summary` (bytes read/written per file); activated via `SET axiom_performance_schema = ON`; zero overhead when off (unlike MySQL where it's always on); MySQL monitoring tools (PMM, Datadog, New Relic MySQL integration) query these tables — this makes those tools work with AxiomDB without a custom plugin
+- [ ] 19.21b ⏳ Lock contention visibility — `SELECT * FROM axiom_lock_waits` shows: waiting_pid, blocking_pid, waiting_query, lock_type, wait_duration; `SELECT * FROM axiom_locks` shows all currently held locks; essential for diagnosing deadlocks in production without guessing; sits alongside the rest of the axiom_* monitoring views (moved from 7.19)
 - [ ] 19.20 ⏳ Audit trail infrastructure — write audit logs async (circular buffer, without blocking writer); JSON format with: user, IP, SQL, bind params, rows_affected, duration, result; daily rotation; prerequisite for 17.7 (CREATE AUDIT POLICY)
 
 ---
@@ -781,15 +789,15 @@
 ## BLOCK 10 — Final Features and AI (Phases 31-34)
 
 ### Phase 31 — Final features `⏳` week 88-90
-- [ ] 31.1 ⏳ Encryption at rest — AES-256-GCM per page
-- [ ] 31.2 ⏳ Data masking — `MASK_EMAIL()`, `MASK_PHONE()`, policies per role
-- [ ] 31.3 ⏳ PREPARE / EXECUTE — compiled and reusable plan
-- [ ] 31.4 ⏳ Extended statistics — column correlations (`CREATE STATISTICS`)
-- [ ] 31.5 ⏳ FULL OUTER JOIN
-- [ ] 31.6 ⏳ Custom aggregates — `CREATE AGGREGATE MEDIAN(...)`
+- [ ] ⚠️ 31.1 duplicate of 17.22 — Encryption at rest (TDE AES-256-GCM) is tracked there; remove this item when 17.22 is implemented
+- [ ] ⚠️ 31.2 duplicate of 17.16 — Dynamic data masking + helper functions (`MASK_EMAIL`, `MASK_PHONE`) tracked there; remove this item when 17.16 is implemented
+- [ ] 31.3 ⏳ SQL-level PREPARE / EXECUTE — `PREPARE name AS SELECT ...` / `EXECUTE name(params)` syntax (PostgreSQL-style named prepared statements in SQL); distinct from 5.13 (wire plan cache) and 10.8 (Rust embedded API); targets interactive sessions and stored procedures
+- [ ] 31.4 ⏳ Extended statistics — column correlations (`CREATE STATISTICS`) for multi-column dependency awareness in the planner
+- [ ] 31.5 ⏳ FULL OUTER JOIN — ⚠️ consider moving earlier (could be Phase 4.8b — no dependency on MVCC/SIMD)
+- [ ] ⚠️ 31.6 duplicate of 13.14 — Custom aggregate functions tracked there; remove this item when 13.14 is implemented
 - [ ] 31.7 ⏳ Geospatial — `POINT`, `ST_DISTANCE_KM`, R-Tree index (`rstar`)
 - [ ] 31.8 ⏳ Query result cache — automatic invalidation by table
-- [ ] 31.9 ⏳ Strict mode — no silent coercion, errors on truncation
+- [x] 31.9 ✅ Strict mode — already implemented in 4.25c; no action needed
 - [ ] 31.10 ⏳ Logical replication — `CREATE PUBLICATION` + `CREATE SUBSCRIPTION`
 - [ ] 31.11 ⏳ mTLS + pg_hba.conf equivalent
 - [ ] 31.12 ⏳ Connection string DSN — `axiomdb://user:pass@host:port/dbname?param=val`; `postgres://` and `mysql://` as aliases
