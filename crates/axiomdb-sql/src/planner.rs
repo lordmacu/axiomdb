@@ -22,9 +22,11 @@
 use axiomdb_catalog::{ColumnDef, IndexDef, StatsDef};
 use axiomdb_types::Value;
 
+use axiomdb_catalog::ColumnType;
+
 use crate::{
     expr::{BinaryOp, Expr},
-    session::StaleStatsTracker,
+    session::{SessionCollation, StaleStatsTracker},
 };
 
 // ── Statistics cost constants (Phase 6.10) ───────────────────────────────────
@@ -488,6 +490,68 @@ fn extract_range_side(expr: &Expr) -> Option<(&str, Option<Value>)> {
         }
     }
     None
+}
+
+// ── Session-aware planner entry point ────────────────────────────────────────
+
+/// Session-collation-aware wrapper around [`plan_select`].
+///
+/// When `collation` is non-binary (e.g. `Es`), any candidate access method
+/// whose correctness depends on binary text ordering for a TEXT column is
+/// rejected and replaced with a full [`AccessMethod::Scan`].
+///
+/// This prevents silently missing rows when the session fold (`es`) does not
+/// match the binary key order stored in the index.
+///
+/// Non-text indexes and non-text predicates are unaffected.
+pub fn plan_select_ctx(
+    where_clause: Option<&Expr>,
+    indexes: &[IndexDef],
+    columns: &[ColumnDef],
+    table_id: u32,
+    table_stats: &[StatsDef],
+    stale_tracker: &mut StaleStatsTracker,
+    select_col_idxs: &[u16],
+    collation: SessionCollation,
+) -> AccessMethod {
+    let am = plan_select(
+        where_clause,
+        indexes,
+        columns,
+        table_id,
+        table_stats,
+        stale_tracker,
+        select_col_idxs,
+    );
+
+    if collation == SessionCollation::Binary {
+        return am;
+    }
+
+    // Reject any index access method that touches a TEXT column key.
+    // The check is conservative: if the leading index column is TEXT, fall back.
+    let text_col_idxs: std::collections::HashSet<u16> = columns
+        .iter()
+        .filter(|col| col.col_type == ColumnType::Text)
+        .map(|col| col.col_idx)
+        .collect();
+
+    let uses_text_index = match &am {
+        AccessMethod::IndexLookup { index_def, .. }
+        | AccessMethod::IndexRange { index_def, .. }
+        | AccessMethod::IndexOnlyScan { index_def, .. } => index_def
+            .columns
+            .first()
+            .map(|c| text_col_idxs.contains(&c.col_idx))
+            .unwrap_or(false),
+        AccessMethod::Scan => false,
+    };
+
+    if uses_text_index {
+        AccessMethod::Scan
+    } else {
+        am
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

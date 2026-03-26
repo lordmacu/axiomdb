@@ -54,14 +54,16 @@ use crate::{
         JoinCondition, JoinType, NullsOrder, OrderByItem, SelectItem, SelectStmt, SetStmt,
         SetValue, SortOrder, Stmt, UpdateStmt,
     },
-    eval::{eval, eval_with, is_truthy, SubqueryRunner},
+    eval::{eval, eval_with, eval_with_in_session, is_truthy, CollationGuard, SubqueryRunner},
     expr::{BinaryOp, Expr},
     result::{ColumnMeta, QueryResult, Row},
     session::{
-        normalize_sql_mode, parse_boolish_setting, parse_on_error_setting, sql_mode_is_strict,
-        OnErrorMode, SessionContext,
+        compat_mode_name, normalize_sql_mode, parse_boolish_setting, parse_compat_mode_setting,
+        parse_on_error_setting, parse_session_collation_setting, session_collation_name,
+        sql_mode_is_strict, CompatMode, OnErrorMode, SessionCollation, SessionContext,
     },
     table::TableEngine,
+    text_semantics::compare_text,
 };
 
 /// Inline FK spec collected during CREATE TABLE column processing.
@@ -719,6 +721,22 @@ fn execute_set_ctx(stmt: SetStmt, ctx: &mut SessionContext) -> Result<QueryResul
             };
             ctx.on_error = parse_on_error_setting(&raw)?;
         }
+        "axiom_compat" => {
+            let raw = match set_value_to_setting_string(&stmt.value)? {
+                None => "standard".to_string(), // DEFAULT
+                Some(s) => s,
+            };
+            // Validate and store compat mode. Does NOT clear an explicit
+            // collation override already chosen by the session.
+            ctx.compat_mode = parse_compat_mode_setting(&raw)?;
+        }
+        "collation" => {
+            let raw = match set_value_to_setting_string(&stmt.value)? {
+                None => "default".to_string(), // DEFAULT = clear override
+                Some(s) => s,
+            };
+            ctx.explicit_collation = parse_session_collation_setting(&raw)?;
+        }
         _ => {} // other variables: silently accepted
     }
     Ok(QueryResult::Empty)
@@ -753,6 +771,10 @@ fn execute_select_ctx(
     bloom: &mut crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    // Set the session collation for all eval() calls in this ctx execution.
+    // Cleared automatically when _coll_guard is dropped at function exit.
+    let _coll_guard = CollationGuard::new(ctx.effective_collation());
+
     // SELECT without FROM: no table resolution needed.
     if stmt.from.is_none() {
         return execute_select(stmt, storage, txn);
@@ -790,7 +812,9 @@ fn execute_select_ctx(
         // Returns empty slice for SELECT * (wildcard) → conservative, no index-only.
         let select_col_idxs: Vec<u16> = collect_select_col_idxs(&stmt);
 
-        let access_method = crate::planner::plan_select(
+        // Compute collation before the mutable borrow of ctx.stats below.
+        let effective_coll = ctx.effective_collation();
+        let access_method = crate::planner::plan_select_ctx(
             stmt.where_clause.as_ref(),
             &resolved.indexes,
             &resolved.columns,
@@ -798,6 +822,7 @@ fn execute_select_ctx(
             &table_stats,
             &mut ctx.stats,
             &select_col_idxs,
+            effective_coll,
         );
 
         // Fetch rows via the chosen access method.
@@ -973,7 +998,12 @@ fn execute_select_ctx(
         if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
             // Single-table path: choose sorted strategy when the access method
             // already delivers rows in group-key order (Phase 4.9b).
-            let strategy = choose_group_by_strategy_ctx(&stmt.group_by, &access_method);
+            let strategy = choose_group_by_strategy_ctx_with_collation(
+                &stmt.group_by,
+                &access_method,
+                effective_coll,
+                &resolved.columns,
+            );
             return execute_select_grouped(stmt, combined_rows, strategy);
         }
 
@@ -995,7 +1025,7 @@ fn execute_select_ctx(
             .collect::<Result<Vec<_>, _>>()?;
 
         if stmt.distinct {
-            rows = apply_distinct(rows);
+            rows = apply_distinct_with_session(rows);
         }
         rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 
@@ -1016,6 +1046,11 @@ fn execute_select_with_joins_ctx(
     txn: &mut TxnManager,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    // Session collation for eval()-based comparisons in join ON, WHERE, ORDER BY, etc.
+    // Guard propagates from execute_select_ctx when called via the join path, but
+    // we set it here too so this function can also be called independently.
+    let _coll_guard = CollationGuard::new(ctx.effective_collation());
+
     let mut all_resolved: Vec<axiomdb_catalog::ResolvedTable> = Vec::new();
     let mut col_offsets: Vec<usize> = Vec::new();
     let mut running_offset = 0usize;
@@ -1120,7 +1155,7 @@ fn execute_select_with_joins_ctx(
         .collect::<Result<Vec<_>, _>>()?;
 
     if stmt.distinct {
-        rows = apply_distinct(rows);
+        rows = apply_distinct_with_session(rows);
     }
     rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 
@@ -1923,7 +1958,7 @@ fn execute_select(
             }
         }
         let rows = if stmt.distinct {
-            apply_distinct(vec![out_row])
+            apply_distinct_with_session(vec![out_row])
         } else {
             vec![out_row]
         };
@@ -2067,7 +2102,7 @@ fn execute_select(
             .collect::<Result<Vec<_>, _>>()?;
 
         if stmt.distinct {
-            rows = apply_distinct(rows);
+            rows = apply_distinct_with_session(rows);
         }
         rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 
@@ -2144,7 +2179,7 @@ fn execute_select_derived(
         .collect::<Result<Vec<_>, _>>()?;
 
     if stmt.distinct {
-        rows = apply_distinct(rows);
+        rows = apply_distinct_with_session(rows);
     }
     rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 
@@ -2273,7 +2308,7 @@ fn execute_select_with_joins(
 
     // DISTINCT deduplication (after projection, before LIMIT).
     if stmt.distinct {
-        rows = apply_distinct(rows);
+        rows = apply_distinct_with_session(rows);
     }
     // LIMIT/OFFSET applied after deduplication.
     rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
@@ -3062,7 +3097,7 @@ impl AggAccumulator {
                         for (i, &asc) in order_by_dirs.iter().enumerate() {
                             let a = keys_a.get(i).unwrap_or(&Value::Null);
                             let b = keys_b.get(i).unwrap_or(&Value::Null);
-                            let cmp = compare_values_null_last(a, b);
+                            let cmp = compare_values_null_last_session(a, b);
                             let cmp = if asc { cmp } else { cmp.reverse() };
                             if cmp != std::cmp::Ordering::Equal {
                                 return cmp;
@@ -3073,10 +3108,16 @@ impl AggAccumulator {
                 }
 
                 // 2. Deduplicate if DISTINCT (preserves sorted order).
+                // Uses the session collation so that folded-equal strings
+                // (e.g. "José" == "jose" under Es) are treated as duplicates.
                 let values: Vec<&str> = if distinct {
-                    let mut seen = std::collections::HashSet::new();
+                    use crate::eval::current_eval_collation;
+                    use crate::text_semantics::canonical_text;
+                    let coll = current_eval_collation();
+                    let mut seen: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
                     rows.iter()
-                        .filter(|(v, _)| seen.insert(v.as_str()))
+                        .filter(|(v, _)| seen.insert(canonical_text(coll, v.as_str()).into_owned()))
                         .map(|(v, _)| v.as_str())
                         .collect()
                 } else {
@@ -3224,6 +3265,65 @@ fn compare_values_null_last(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
 }
 
+/// Session-aware version of [`compare_values_null_last`].
+///
+/// For `Text` values, uses the active thread-local session collation (set by
+/// [`CollationGuard`]) instead of binary ordering. Used in GROUP_CONCAT ORDER BY.
+fn compare_values_null_last_session(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use crate::eval::current_eval_collation;
+    match (a, b) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Greater,
+        (_, Value::Null) => std::cmp::Ordering::Less,
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::BigInt(x), Value::BigInt(y)) => x.cmp(y),
+        (Value::Int(x), Value::BigInt(y)) => (*x as i64).cmp(y),
+        (Value::BigInt(x), Value::Int(y)) => x.cmp(&(*y as i64)),
+        (Value::Real(x), Value::Real(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Text(x), Value::Text(y)) => compare_text(current_eval_collation(), x, y),
+        _ => value_to_key_bytes(a).cmp(&value_to_key_bytes(b)),
+    }
+}
+
+/// Session-aware serialization for GROUP BY hash keys and DISTINCT deduplication.
+///
+/// For `Text` values, uses the canonical fold from the active thread-local
+/// session collation so that `jose` and `José` map to the same group key under `Es`.
+/// All non-text types use the binary serialization unchanged.
+fn value_to_session_key_bytes(v: &Value) -> Vec<u8> {
+    use crate::eval::current_eval_collation;
+    use crate::text_semantics::canonical_text;
+    let coll = current_eval_collation();
+    if coll == SessionCollation::Binary {
+        return value_to_key_bytes(v);
+    }
+    let mut buf = Vec::new();
+    match v {
+        Value::Text(s) => {
+            let key = canonical_text(coll, s);
+            buf.push(0x06);
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+        }
+        other => return value_to_key_bytes(other),
+    }
+    buf
+}
+
+/// Session-aware DISTINCT deduplication.
+///
+/// Uses [`value_to_session_key_bytes`] so that folded-equal text strings are
+/// treated as duplicates under `Es` session collation.
+fn apply_distinct_with_session(rows: Vec<Row>) -> Vec<Row> {
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    rows.into_iter()
+        .filter(|row| {
+            let key: Vec<u8> = row.iter().flat_map(value_to_session_key_bytes).collect();
+            seen.insert(key)
+        })
+        .collect()
+}
+
 // ── GroupState ────────────────────────────────────────────────────────────────
 
 /// State for one GROUP BY group.
@@ -3300,8 +3400,22 @@ fn value_to_key_bytes(v: &Value) -> Vec<u8> {
 }
 
 /// Serializes a GROUP BY key (multiple values) to a single byte sequence.
+///
+/// Uses binary serialization. For session-aware GROUP BY (ctx path), use
+/// [`group_key_bytes_session`] instead.
 fn group_key_bytes(key_values: &[Value]) -> Vec<u8> {
     key_values.iter().flat_map(value_to_key_bytes).collect()
+}
+
+/// Session-aware GROUP BY key serialization.
+///
+/// Uses [`value_to_session_key_bytes`] so that text values are canonicalized
+/// according to the active session collation (e.g. `es` folds `José` = `jose`).
+fn group_key_bytes_session(key_values: &[Value]) -> Vec<u8> {
+    key_values
+        .iter()
+        .flat_map(value_to_session_key_bytes)
+        .collect()
 }
 
 // ── HAVING evaluator ──────────────────────────────────────────────────────────
@@ -3612,8 +3726,48 @@ fn choose_group_by_strategy_ctx(
     group_by: &[Expr],
     access_method: &crate::planner::AccessMethod,
 ) -> GroupByStrategy {
+    choose_group_by_strategy_ctx_with_collation(
+        group_by,
+        access_method,
+        crate::eval::current_eval_collation(),
+        &[],
+    )
+}
+
+/// Collation-aware GROUP BY strategy selection.
+///
+/// When the effective session collation is non-binary AND any GROUP BY expression
+/// references a TEXT column, the presorted strategy must be rejected because the
+/// index uses binary key order while the session uses a different text ordering.
+///
+/// `columns` should be the resolved columns of the FROM table; pass `&[]` when
+/// they are unavailable (conservative: binary GROUP BY path is still available).
+fn choose_group_by_strategy_ctx_with_collation(
+    group_by: &[Expr],
+    access_method: &crate::planner::AccessMethod,
+    collation: SessionCollation,
+    columns: &[axiomdb_catalog::schema::ColumnDef],
+) -> GroupByStrategy {
     if group_by.is_empty() {
         return GroupByStrategy::Hash;
+    }
+
+    // Safety gate: if collation is non-binary and any GROUP BY key is a TEXT
+    // column, the index-ordered GROUP BY would produce wrong groupings.
+    if collation != SessionCollation::Binary && !columns.is_empty() {
+        let has_text_key = group_by.iter().any(|expr| {
+            if let Expr::Column { col_idx, .. } = expr {
+                columns
+                    .get(*col_idx)
+                    .map(|col| col.col_type == axiomdb_catalog::schema::ColumnType::Text)
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        });
+        if has_text_key {
+            return GroupByStrategy::Hash;
+        }
     }
 
     let index_def = match access_method {
@@ -3707,7 +3861,8 @@ fn execute_select_grouped_hash(
             .map(|e| eval(e, row))
             .collect::<Result<_, _>>()?;
 
-        let key_bytes = group_key_bytes(&key_values);
+        // Session-aware: folds text under Es so "José" and "jose" share a group.
+        let key_bytes = group_key_bytes_session(&key_values);
 
         let state = groups.entry(key_bytes).or_insert_with(|| GroupState {
             key_values: key_values.clone(),
@@ -3763,7 +3918,7 @@ fn execute_select_grouped_hash(
     }
 
     if stmt.distinct {
-        rows = apply_distinct(rows);
+        rows = apply_distinct_with_session(rows);
     }
     let remapped_ob = remap_order_by_for_grouped(&stmt.order_by, &stmt.columns);
     rows = apply_order_by(rows, &remapped_ob)?;
@@ -3914,7 +4069,7 @@ fn execute_select_grouped_sorted(
 
     let mut rows = output_rows;
     if stmt.distinct {
-        rows = apply_distinct(rows);
+        rows = apply_distinct_with_session(rows);
     }
     let remapped_ob = remap_order_by_for_grouped(&stmt.order_by, &stmt.columns);
     rows = apply_order_by(rows, &remapped_ob)?;

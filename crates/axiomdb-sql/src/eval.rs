@@ -16,6 +16,8 @@
 //!
 //! Use [`is_truthy`] to convert a result to a Rust `bool` for row filtering.
 
+use std::cell::Cell;
+
 use axiomdb_core::error::DbError;
 use axiomdb_types::{
     coerce::{coerce, coerce_for_op, CoercionMode},
@@ -28,7 +30,57 @@ use crate::{
     ast::SelectStmt,
     expr::{BinaryOp, Expr, UnaryOp},
     result::QueryResult,
+    session::SessionCollation,
+    text_semantics::{compare_text, like_match_collated},
 };
+
+// ── Session-collation thread-local ────────────────────────────────────────────
+
+/// Active text-comparison collation for the current `eval` call stack.
+///
+/// Set to [`SessionCollation::Binary`] by default; overridden to `Es` for the
+/// duration of a ctx-path execution via [`CollationGuard`].
+///
+/// Thread-local guarantees correct isolation between concurrent sessions
+/// even though `eval` / `eval_with` are non-async functions called from a
+/// Tokio spawn_blocking context.
+thread_local! {
+    static EVAL_COLLATION: Cell<SessionCollation> = Cell::new(SessionCollation::Binary);
+}
+
+/// Returns the active session collation for the current thread.
+///
+/// Called by `compare_values` and the LIKE handler to dispatch between
+/// binary and folded text semantics.
+pub(crate) fn current_eval_collation() -> SessionCollation {
+    EVAL_COLLATION.with(|c| c.get())
+}
+
+/// RAII guard that sets the thread-local session collation on construction
+/// and restores the previous value on drop.
+///
+/// ```rust,ignore
+/// let _guard = CollationGuard::new(ctx.effective_collation());
+/// // All eval() / eval_with() calls here use the session collation.
+/// ```
+pub struct CollationGuard {
+    prev: SessionCollation,
+}
+
+impl CollationGuard {
+    /// Sets the active collation for the current thread.
+    pub fn new(coll: SessionCollation) -> Self {
+        let prev = EVAL_COLLATION.with(|c| c.get());
+        EVAL_COLLATION.with(|c| c.set(coll));
+        Self { prev }
+    }
+}
+
+impl Drop for CollationGuard {
+    fn drop(&mut self) {
+        EVAL_COLLATION.with(|c| c.set(self.prev));
+    }
+}
 
 // ── SubqueryRunner ────────────────────────────────────────────────────────────
 
@@ -153,7 +205,7 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             match (v, p) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Text(text), Value::Text(pat)) => {
-                    let matched = like_match(&text, &pat);
+                    let matched = like_match_collated(current_eval_collation(), &text, &pat);
                     Ok(Value::Bool(if *negated { !matched } else { matched }))
                 }
                 (v, p) => Err(DbError::TypeMismatch {
@@ -253,6 +305,37 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             reason: "GROUP_CONCAT can only be used as an aggregate function".into(),
         }),
     }
+}
+
+/// Evaluates `expr` against `row` using the given session collation for text
+/// comparisons.
+///
+/// This is the primary entry point for ctx-based execution paths. All text
+/// comparisons (`=`, `!=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `LIKE`) use
+/// `collation` instead of binary byte order.
+///
+/// The collation is propagated via a thread-local [`CollationGuard`] so that
+/// the entire recursive expression tree — including nested `eval` calls — sees
+/// the same semantics.
+pub fn eval_in_session(
+    expr: &Expr,
+    row: &[Value],
+    collation: SessionCollation,
+) -> Result<Value, DbError> {
+    let _guard = CollationGuard::new(collation);
+    eval(expr, row)
+}
+
+/// Evaluates `expr` against `row` using `sq` for subqueries, with the given
+/// session collation for text comparisons.
+pub fn eval_with_in_session<R: SubqueryRunner>(
+    expr: &Expr,
+    row: &[Value],
+    sq: &mut R,
+    collation: SessionCollation,
+) -> Result<Value, DbError> {
+    let _guard = CollationGuard::new(collation);
+    eval_with(expr, row, sq)
 }
 
 // ── eval_with — subquery-aware evaluator ──────────────────────────────────────
@@ -356,7 +439,7 @@ pub fn eval_with<R: SubqueryRunner>(
             match (v, p) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Text(text), Value::Text(pat)) => {
-                    let matched = like_match(&text, &pat);
+                    let matched = like_match_collated(current_eval_collation(), &text, &pat);
                     Ok(Value::Bool(if *negated { !matched } else { matched }))
                 }
                 (v, p) => Err(DbError::TypeMismatch {
@@ -2426,7 +2509,7 @@ fn compare_values(l: &Value, r: &Value) -> Result<std::cmp::Ordering, DbError> {
                 Ok(m1.saturating_mul(factor).cmp(m2))
             }
         }
-        (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
+        (Value::Text(a), Value::Text(b)) => Ok(compare_text(current_eval_collation(), a, b)),
         (Value::Bytes(a), Value::Bytes(b)) => Ok(a.cmp(b)),
         (Value::Date(a), Value::Date(b)) => Ok(a.cmp(b)),
         (Value::Timestamp(a), Value::Timestamp(b)) => Ok(a.cmp(b)),

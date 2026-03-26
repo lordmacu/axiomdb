@@ -334,8 +334,11 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                                 .as_deref()
                                 .unwrap_or("STRICT_TRANS_TABLES"),
                         );
-                        // Sync on_error so the executor and pipeline use the new mode.
+                        // Sync on_error, compat_mode, and explicit_collation so the executor
+                        // and pipeline use the new session semantics immediately.
                         session.on_error = conn_state.on_error();
+                        session.compat_mode = conn_state.compat_mode();
+                        session.explicit_collation = conn_state.explicit_collation();
                         // Sync decoder limit after SET max_allowed_packet.
                         reader.decoder_mut().set_max_payload_len(
                             conn_state
@@ -1081,7 +1084,10 @@ fn show_variables_result(lower: &str, conn_state: &ConnectionState) -> Vec<(u8, 
     let on_error_val = conn_state
         .get_variable("on_error")
         .unwrap_or_else(|| "rollback_statement".into());
+
     let all_vars: Vec<(&str, String)> = vec![
+        // Alphabetical order — matches MySQL SHOW VARIABLES output order.
+        ("axiom_compat", conn_state.compat_mode().to_string()),
         (
             "character_set_client",
             conn_state.character_set_client_name().into(),
@@ -1098,6 +1104,10 @@ fn show_variables_result(lower: &str, conn_state: &ConnectionState) -> Vec<(u8, 
         ("character_set_server", "utf8mb4".into()),
         ("character_set_system", "utf8mb3".into()),
         (
+            "collation",
+            conn_state.effective_collation_name().to_string(),
+        ),
+        (
             "collation_connection",
             conn_state.collation_connection_name().into(),
         ),
@@ -1108,13 +1118,14 @@ fn show_variables_result(lower: &str, conn_state: &ConnectionState) -> Vec<(u8, 
         ("strict_mode", strict_mode_val),
     ];
 
-    // Extract LIKE pattern if present
-    let like_pattern = if lower.contains("like") {
+    // Extract LIKE pattern if present.
+    // Use real SQL wildcard semantics (% and _) instead of substring matching.
+    let like_pattern: Option<String> = if lower.contains("like") {
         lower.split("like").nth(1).map(|s| {
             s.trim()
                 .trim_matches('\'')
                 .trim_matches('"')
-                .replace('%', "")
+                .to_ascii_lowercase()
         })
     } else {
         None
@@ -1124,7 +1135,8 @@ fn show_variables_result(lower: &str, conn_state: &ConnectionState) -> Vec<(u8, 
         .into_iter()
         .filter(|(name, _)| {
             if let Some(ref pat) = like_pattern {
-                name.contains(pat.as_str())
+                // Real SQL LIKE wildcards (% = any sequence, _ = any char).
+                axiomdb_sql::like_match(name, pat)
             } else {
                 true
             }

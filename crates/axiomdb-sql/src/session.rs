@@ -5,6 +5,103 @@ use std::collections::{HashMap, HashSet};
 use axiomdb_catalog::ResolvedTable;
 use axiomdb_core::error::DbError;
 
+// ── CompatMode ────────────────────────────────────────────────────────────────
+
+/// High-level compatibility mode for the session.
+///
+/// Controls the **default** session collation and other behavioral defaults.
+/// Set via `SET AXIOM_COMPAT = 'standard' | 'mysql' | 'postgresql' | DEFAULT`.
+/// Inspected via `SELECT @@axiom_compat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompatMode {
+    /// **Default.** Standard AxiomDB behavior — exact binary text semantics.
+    #[default]
+    Standard,
+    /// MySQL-compatible behavior — default collation becomes `es` (CI+AI fold).
+    MySql,
+    /// PostgreSQL-compatible behavior — exact binary text semantics (same as standard).
+    PostgreSql,
+}
+
+/// Parses a `SET AXIOM_COMPAT = ...` value.
+pub fn parse_compat_mode_setting(raw: &str) -> Result<CompatMode, DbError> {
+    let s = raw
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    match s.as_str() {
+        "standard" | "default" => Ok(CompatMode::Standard),
+        "mysql" => Ok(CompatMode::MySql),
+        "postgresql" | "postgres" => Ok(CompatMode::PostgreSql),
+        _ => Err(DbError::InvalidValue {
+            reason: format!(
+                "invalid axiom_compat value '{raw}'; expected standard | mysql | postgresql"
+            ),
+        }),
+    }
+}
+
+/// Returns the canonical lowercase name of a [`CompatMode`] for `@@axiom_compat`.
+pub fn compat_mode_name(mode: CompatMode) -> &'static str {
+    match mode {
+        CompatMode::Standard => "standard",
+        CompatMode::MySql => "mysql",
+        CompatMode::PostgreSql => "postgresql",
+    }
+}
+
+impl std::fmt::Display for CompatMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(compat_mode_name(*self))
+    }
+}
+
+// ── SessionCollation ──────────────────────────────────────────────────────────
+
+/// Executor-visible text-comparison behavior for the session.
+///
+/// Set via `SET collation = 'binary' | 'es' | DEFAULT`.
+/// Inspected via `SELECT @@collation`.
+///
+/// This is **distinct** from `@@collation_connection` (transport charset from 5.2a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionCollation {
+    /// **Default.** Exact byte-order comparison — current AxiomDB behavior.
+    #[default]
+    Binary,
+    /// CI+AI fold: NFC + lowercase + strip combining marks.
+    /// `Jose`, `JOSE`, `José` compare equal.
+    Es,
+}
+
+/// Parses a `SET collation = ...` value.
+///
+/// Returns `Ok(None)` for `DEFAULT` (resets to compat-derived default).
+pub fn parse_session_collation_setting(raw: &str) -> Result<Option<SessionCollation>, DbError> {
+    let s = raw
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    match s.as_str() {
+        "binary" => Ok(Some(SessionCollation::Binary)),
+        "es" => Ok(Some(SessionCollation::Es)),
+        "default" => Ok(None),
+        _ => Err(DbError::InvalidValue {
+            reason: format!("invalid collation value '{raw}'; expected binary | es | DEFAULT"),
+        }),
+    }
+}
+
+/// Returns the canonical lowercase name of a [`SessionCollation`] for `@@collation`.
+pub fn session_collation_name(c: SessionCollation) -> &'static str {
+    match c {
+        SessionCollation::Binary => "binary",
+        SessionCollation::Es => "es",
+    }
+}
+
 // ── OnErrorMode ───────────────────────────────────────────────────────────────
 
 /// Per-session policy that controls how a statement error affects the current
@@ -310,6 +407,16 @@ pub struct SessionContext {
     /// 'savepoint' | 'ignore'`. Applied by the executor and by the network
     /// pipeline (`database.rs`) to parse/analyze failures.
     pub on_error: OnErrorMode,
+    /// High-level compatibility mode (default: `Standard`).
+    ///
+    /// Set via `SET AXIOM_COMPAT = 'standard' | 'mysql' | 'postgresql' | DEFAULT`.
+    /// Controls the default session collation when no explicit override is active.
+    pub compat_mode: CompatMode,
+    /// Explicit session collation override. `None` means use the compat-derived default.
+    ///
+    /// Set via `SET collation = 'binary' | 'es' | DEFAULT`.
+    /// `SET AXIOM_COMPAT = ...` does NOT clear an explicit override already set.
+    pub explicit_collation: Option<SessionCollation>,
     /// Warnings accumulated during the last statement.
     ///
     /// Cleared automatically before each new statement execution (in
@@ -332,6 +439,8 @@ impl SessionContext {
             autocommit: true,
             strict_mode: true,
             on_error: OnErrorMode::RollbackStatement,
+            compat_mode: CompatMode::Standard,
+            explicit_collation: None,
             warnings: Vec::new(),
             stats: StaleStatsTracker::default(),
         }
@@ -355,6 +464,26 @@ impl SessionContext {
     /// Returns the number of warnings from the last statement.
     pub fn warning_count(&self) -> u16 {
         self.warnings.len().min(u16::MAX as usize) as u16
+    }
+
+    // ── Collation / compat ────────────────────────────────────────────────────
+
+    /// Returns the effective session collation for text comparisons.
+    ///
+    /// Priority: explicit override > compat-derived default > Binary.
+    pub fn effective_collation(&self) -> SessionCollation {
+        if let Some(c) = self.explicit_collation {
+            return c;
+        }
+        match self.compat_mode {
+            CompatMode::MySql => SessionCollation::Es,
+            _ => SessionCollation::Binary,
+        }
+    }
+
+    /// Returns the canonical name of the effective session collation (`"binary"` or `"es"`).
+    pub fn effective_collation_name(&self) -> &'static str {
+        session_collation_name(self.effective_collation())
     }
 
     // ── Schema cache ──────────────────────────────────────────────────────────
