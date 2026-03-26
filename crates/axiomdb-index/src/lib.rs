@@ -3,7 +3,7 @@
 //! Implements a persistent B+ Tree over the [`StorageEngine`] trait:
 //! - Variable binary keys up to 64 bytes
 //! - Copy-on-Write with atomic root (`AtomicU64`)
-//! - Lazy range scan via leaf linked list
+//! - Lazy range scan via tree traversal (CoW invalidates `next_leaf`; O(log n) per leaf boundary)
 //! - In-memory prefix compression for internal nodes
 
 pub mod page_layout;

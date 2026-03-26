@@ -28,8 +28,8 @@
 - [x] 2.7 ✅ Prefix compression — `CompressedNode` in memory for internal nodes
 - [x] 2.8 ✅ Tests + benchmarks — 37 tests, Criterion benchmarks vs std::BTreeMap
 - [ ] ⚠️ next_leaf linked list stale in CoW — range scan uses tree traversal instead → revisit in Phase 7 (MVCC + epoch reclamation)
-- [ ] ⚠️ rotate_right key shift bug FIXED (2026-03-26) — was leaving stale bytes in key_lens[cn] causing key_at panic at scale; fixed with explicit reverse loop in tree.rs
-- [ ] ⚠️ Stale root_page_id in SessionContext cache FIXED (2026-03-26) — after B+tree root split, cached IndexDef held freed page_id; fixed with ctx.invalidate_all() after index root change in execute_insert_ctx and execute_delete
+- [x] ✅ rotate_right key shift bug FIXED (2026-03-26) — was leaving stale bytes in key_lens[cn] causing key_at panic at scale; fixed with explicit reverse loop in tree.rs
+- [x] ✅ Stale root_page_id in SessionContext cache FIXED (2026-03-26) — after B+tree root split, cached IndexDef held freed page_id; fixed with ctx.invalidate_all() after index root change in execute_insert_ctx and execute_delete
 - [x] ✅ 2.5.1 — eliminar heap allocations del hot path de lookup (2026-03-22)
 - [x] ✅ 2.5.2 — binary search + in-place inserts; 4.46M lookup ops/s, 222K insert ops/s (2026-03-22)
 - [x] ✅ Phase 1 — `expect()` eliminados de código de producción: mmap.rs, freelist.rs, memory.rs (2026-03-22)

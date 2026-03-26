@@ -7,10 +7,9 @@ crates/axiomdb-index/
 ├── Cargo.toml                     — add deps: axiomdb-core, axiomdb-storage, bytemuck
 └── src/
     ├── lib.rs                     — public re-exports
-    ├── page_layout.rs             — InternalNodePage, LeafNodePage, RecordIdOnDisk (bytemuck)
-    ├── node.rs                    — BTreeNode (in-memory abstraction over page_layout)
+    ├── page_layout.rs             — InternalNodePage, LeafNodePage (bytemuck; no node.rs abstraction — direct page I/O)
     ├── tree.rs                    — BTree, CRUD operations, CoW
-    ├── iter.rs                    — RangeIter (lazy, leaf linked list)
+    ├── iter.rs                    — RangeIter (lazy, tree-traversal; next_leaf not followed — deferred to Phase 7)
     └── prefix.rs                  — CompressedNode, prefix compression
 
 crates/axiomdb-index/tests/
@@ -30,7 +29,7 @@ Cargo.toml (workspace root)        — verify that axiomdb-index is already in m
 // src/page_layout.rs
 pub const MAX_KEY_LEN: usize = 64;
 pub const ORDER_INTERNAL: usize = 223;
-pub const ORDER_LEAF: usize = 211;
+pub const ORDER_LEAF: usize = 217;  // as-built: RID is [u8;10] (page_id:8+slot_id:2), not 12 bytes
 pub const NULL_PAGE: u64 = u64::MAX;  // sentinel: "no next leaf" / "no child"
 
 // Compile-time assertions (in page_layout.rs)
@@ -45,11 +44,8 @@ const _: () = assert!(size_of::<LeafNodePage>() <= PAGE_BODY_SIZE);
 ```rust
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct RecordIdOnDisk {
-    pub page_id: u64,    // 8 bytes
-    pub slot_id: u16,    // 2 bytes
-    pub _pad:    u16,    // 2 bytes → total 12 bytes, aligned to 4
-}
+// As-built: RecordId is encoded as [u8; 10] (page_id: 8 bytes LE + slot_id: 2 bytes LE).
+// No padding — plain byte arrays, not a struct, to keep bytemuck simple.
 
 // ──── Internal Node ────────────────────────────────────────────────────
 // Layout in page body (16,320 bytes):
@@ -74,16 +70,15 @@ pub struct InternalNodePage {
     pub keys:      [[u8; MAX_KEY_LEN]; ORDER_INTERNAL],
 }
 
-// ──── Leaf Node ───────────────────────────────────────────────────────
+// ──── Leaf Node (as-built: ORDER_LEAF = 217) ──────────────────────────
 // Layout in page body (16,320 bytes):
 //   header:    8 B  (is_leaf + _pad + num_keys + _pad)
-//   next_leaf: 8 B  (u64, NULL_PAGE if this is the last leaf)
-//   key_lens: 211 B
-//   _align:    1 B  (pad to multiple of 4 for rids)
-//   rids:     2,532 B (211 * 12)
-//   keys:    13,504 B (211 * 64)
+//   next_leaf: 8 B  (u64, NULL_PAGE — field exists on disk; not followed by RangeIter)
+//   key_lens: 217 B
+//   rids:     2,170 B (217 * 10)  ← [u8;10] = page_id:8 + slot_id:2
+//   keys:    13,888 B (217 * 64)
 //   ─────────────────
-//   Total:   16,264 B ≤ 16,320 ✓
+//   Total:   16,291 B ≤ 16,320 ✓
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -92,10 +87,9 @@ pub struct LeafNodePage {
     pub _pad0:     u8,
     pub num_keys:  u16,
     pub _pad1:     [u8; 4],
-    pub next_leaf: u64,
+    pub next_leaf: u64,                          // on-disk, not followed by RangeIter
     pub key_lens:  [u8; ORDER_LEAF],
-    pub _align:    [u8; 1],
-    pub rids:      [RecordIdOnDisk; ORDER_LEAF],
+    pub rids:      [[u8; 10]; ORDER_LEAF],       // [page_id:8 LE][slot_id:2 LE]
     pub keys:      [[u8; MAX_KEY_LEN]; ORDER_LEAF],
 }
 ```
@@ -131,17 +125,21 @@ pub fn write_leaf(page: &mut Page, node: &LeafNodePage) {
 
 ---
 
-## In-memory abstraction (node.rs)
+## As-built: no node.rs in-memory abstraction
+
+> The as-built implementation does not have `node.rs`. The B+ Tree operates
+> directly on `InternalNodePage` / `LeafNodePage` page casts — no intermediate
+> in-memory `BTreeNode` enum. Operations read the page, perform in-place
+> mutations on the struct, then write the modified page back.
 
 ```rust
-// BTreeNode is the in-memory version, using Vec to facilitate operations.
-// Only converted to/from InternalNodePage/LeafNodePage on I/O.
+// This in-memory enum was NOT implemented — keeping here as historical sketch.
 pub enum BTreeNode {
     Internal {
         page_id:  u64,
         num_keys: usize,
-        keys:     Vec<Box<[u8]>>,     // keys[i]: separator between children[i] and children[i+1]
-        children: Vec<u64>,           // len = num_keys + 1
+        keys:     Vec<Box<[u8]>>,
+        children: Vec<u64>,
     },
     Leaf {
         page_id:   u64,
@@ -264,23 +262,28 @@ fn delete(key):
 
 ---
 
-## Lazy iterator (iter.rs)
+## Lazy iterator (iter.rs) — as-built: tree traversal, not next_leaf
 
 ```rust
+// As-built RangeIter traverses from root to find successive leaves.
+// next_leaf is NOT followed — it is stale after CoW splits.
+// Phase 7 (epoch-based reclamation) will enable safe next_leaf maintenance.
 pub struct RangeIter<'a> {
-    storage:      &'a dyn StorageEngine,
-    current_pid:  u64,         // current leaf page
-    slot_idx:     usize,       // position within the current leaf
-    end_bound:    Bound<Box<[u8]>>,
+    tree:      &'a BTree,
+    slot_idx:  usize,
+    // current leaf is re-loaded by re-traversing from root when slot_idx overflows
+    end_bound: Bound<Box<[u8]>>,
+    next_key:  Option<Box<[u8]>>,  // first key of next traversal range
 }
 
 impl Iterator for RangeIter<'_> {
     type Item = Result<(Box<[u8]>, RecordId), DbError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // 1. If slot_idx >= num_keys of current page → read next_leaf
+        // 1. If slot_idx >= num_keys of current leaf →
+        //      re-traverse from root using next_key as the new lower bound
         // 2. Check end bound → return None if we exceeded the limit
-        // 3. Return (key.clone(), rid) from current slot
+        // 3. Return (key, rid) from current slot
         // 4. Increment slot_idx
     }
 }
@@ -314,12 +317,11 @@ impl CompressedNode {
 
 ## Implementation phases
 
-### Phase 2.1 — page_layout.rs + node.rs
-1. Define `RecordIdOnDisk`, `InternalNodePage`, `LeafNodePage` with bytemuck
+### Phase 2.1 — page_layout.rs
+1. Define `InternalNodePage`, `LeafNodePage` with bytemuck (no `node.rs` — direct page I/O)
 2. Compile-time size asserts
 3. Functions `read_internal`, `read_leaf`, `write_internal`, `write_leaf`
-4. `BTreeNode::load` and `BTreeNode::flush`
-5. Unit tests: roundtrip serialize/deserialize of node
+4. Unit tests: roundtrip serialize/deserialize of node
 
 ### Phase 2.2 — Lookup (tree.rs)
 1. `BTree::new` — create empty root leaf
@@ -372,10 +374,6 @@ mod tests {
     fn test_internal_node_roundtrip()  // serialize → deserialize → same data
     fn test_leaf_node_roundtrip()
     fn test_size_constraints()         // size_of verified at runtime as well
-
-    // node.rs
-    fn test_load_flush_leaf()
-    fn test_load_flush_internal()
 
     // tree.rs
     fn test_lookup_empty_tree()
@@ -431,5 +429,5 @@ fn bench_insert_random_100k()          // with splits
 | `bytemuck::Pod` rejects the struct due to implicit padding | Verify with `assert_eq!(size_of::<InternalNodePage>(), N)` and adjust `_pad` |
 | Internal node split when parent is also full | Implement `propagate_split` iteratively (not recursively) to avoid stack overflow |
 | CoW frees pages still in use by readers | In Phase 2: single writer at a time (`&mut self`). Freeing is safe. In Phase 7 (MVCC): epoch-based reclamation |
-| Incorrect merge breaks the leaf linked list | Explicit test: after merge, traverse linked list and verify no gaps |
+| Incorrect merge corrupts `next_leaf` pointer | As-built: `next_leaf` exists on disk but is not tested at runtime (Phase 7 will validate it when CoW-consistent maintenance is added) |
 | `AtomicU64` CAS fails under high contention | In Phase 2: `&mut self` on writes guarantees no contention. CAS in Phase 7 |
