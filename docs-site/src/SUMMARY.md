@@ -16,6 +16,7 @@
   - [Transactions](user-guide/features/transactions.md)
   - [Catalog & Schema](user-guide/features/catalog.md)
   - [Indexes](user-guide/features/indexes.md)
+- [Embedded Mode](user-guide/embedded.md)
 - [Error Reference](user-guide/errors.md)
 - [Performance](user-guide/performance.md)
 
