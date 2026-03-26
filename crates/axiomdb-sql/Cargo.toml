@@ -22,6 +22,7 @@ chrono          = { version = "0.4", default-features = false, features = ["std"
 criterion    = { workspace = true }
 sqlparser    = "0.53"
 tempfile     = { workspace = true }
+rusqlite     = { version = "0.32", features = ["bundled"] }
 
 [[bench]]
 name    = "sql_components"
@@ -33,4 +34,8 @@ harness = false
 
 [[bench]]
 name    = "executor_e2e"
+harness = false
+
+[[bench]]
+name    = "sqlite_comparison"
 harness = false

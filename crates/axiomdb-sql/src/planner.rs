@@ -263,6 +263,12 @@ fn stats_cost_gate(
     // Register baseline for Phase 6.11 staleness tracking.
     stale_tracker.set_baseline(table_id, stats.row_count);
 
+    // No real data yet (stats bootstrapped on empty table, e.g. CREATE INDEX
+    // before any INSERTs) — treat as no stats and conservatively use the index.
+    if stats.row_count == 0 {
+        return true;
+    }
+
     // Small table: always scan (index overhead not worth it).
     if stats.row_count < SMALL_TABLE_THRESHOLD {
         return false;

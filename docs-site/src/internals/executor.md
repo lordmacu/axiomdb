@@ -90,6 +90,58 @@ All tables are scanned once before the nested-loop begins. This is the primary a
 
 ---
 
+## GROUP BY — Strategy Selection (Phase 4.9b)
+
+The executor selects between two GROUP BY execution strategies at runtime:
+
+| Strategy | When selected | Behavior |
+|---|---|---|
+| `Hash` | Default; JOINs; derived tables; plain scans | HashMap per group key; `O(k)` memory |
+| `Sorted { presorted: true }` | Single-table ctx path + compatible B-Tree index | Stream adjacent equal groups; `O(1)` memory |
+
+```rust
+enum GroupByStrategy {
+    Hash,
+    Sorted { presorted: bool },
+}
+```
+
+Strategy selection (`choose_group_by_strategy_ctx`) is only active on the
+**single-table ctx path** (`execute_with_ctx`). All JOIN, derived-table, and
+non-ctx paths use `Hash`.
+
+### Prefix Match Rule
+
+The sorted strategy is selected when all four conditions hold:
+
+1. Access method is `IndexLookup`, `IndexRange`, or `IndexOnlyScan`.
+2. Every `GROUP BY` expression is a plain `Expr::Column` (no function calls, no aliases).
+3. The column references match the **leading key prefix** of the chosen index in the **same order**.
+4. The prefix length ≤ number of index columns.
+
+Examples (index `(region, dept)`):
+
+| GROUP BY | Result |
+|---|---|
+| `region, dept` | ✅ Sorted |
+| `region` | ✅ Sorted (prefix) |
+| `dept, region` | ❌ Hash (wrong order) |
+| `LOWER(region)` | ❌ Hash (computed expression) |
+
+This is correct because `BTree::range_in` guarantees rows arrive in key order,
+and equal leading prefixes are contiguous even with extra suffix columns or RID
+suffixes on non-unique indexes.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Borrowed from PostgreSQL + DuckDB</span>
+PostgreSQL keeps <code>GroupAggregate</code> (sorted) and <code>HashAggregate</code> as separate strategies selected at planning time (<code>pathnodes.h</code>). DuckDB selects the aggregation strategy at physical plan time based on input guarantees. AxiomDB borrows the two-strategy concept but selects at execution time using the already-chosen access method — no separate planner pass needed.
+</div>
+</div>
+
+---
+
 ## GROUP BY — Hash Aggregation
 
 Group BY uses a single-pass hash aggregation strategy: one scan through the
@@ -158,6 +210,66 @@ SQL standard and every major database.
 <div class="callout-body">
 <span class="callout-label">Design Decision — representative_row</span>
 HAVING expressions reference source columns via `col_idx`, not output positions. The `representative_row` preserves one source row per group so that `HAVING salary > 50000` (where `salary` has `col_idx = 2` in the source) can be evaluated correctly, even after the output row has been projected down to just `(dept, COUNT(*))`.
+</div>
+</div>
+
+---
+
+## GROUP BY — Sorted Streaming Executor (Phase 4.9b)
+
+The sorted executor replaces the hash table with a single linear pass over
+pre-ordered rows, accumulating state for the current group and emitting it
+when the key changes.
+
+### Algorithm
+
+```
+rows_with_keys = [(row, eval(group_by exprs, row)) for row in combined_rows]
+
+if !presorted:
+    stable_sort rows_with_keys by compare_group_key_lists
+
+current_key   = rows_with_keys[0].key_values
+current_accumulators = AggAccumulator::new() for each aggregate
+update accumulators with rows_with_keys[0].row
+
+for next in rows_with_keys[1..]:
+    if group_keys_equal(current_key, next.key_values):
+        update accumulators with next.row
+    else:
+        finalize → apply HAVING → emit output row
+        reset: current_key = next.key_values, new accumulators, update
+
+finalize last group
+```
+
+### Key Comparison
+
+```rust
+fn compare_group_key_lists(a: &[Value], b: &[Value]) -> Ordering
+fn group_keys_equal(a: &[Value], b: &[Value]) -> bool
+```
+
+Uses `compare_values_null_last` so `NULL == NULL` for grouping (consistent with
+the hash path's serialization). Comparison is left-to-right: returns the first
+non-Equal ordering.
+
+### Shared Aggregate Machinery
+
+Both hash and sorted executors reuse the same:
+
+- `AggAccumulator` (state, update, finalize)
+- `eval_with_aggs` (HAVING evaluation)
+- `project_grouped_row` (output projection)
+- `build_grouped_column_meta` (column metadata)
+- GROUP_CONCAT handling
+- Post-group DISTINCT / ORDER BY / LIMIT
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Memory Advantage</span>
+When the index already orders rows by the GROUP BY key prefix, the sorted executor uses <code>O(1)</code> accumulator memory (one group at a time) instead of <code>O(k)</code> where <code>k = distinct groups</code>. For a high-cardinality column with many distinct values, this eliminates the entire hash table allocation.
 </div>
 </div>
 
@@ -705,6 +817,7 @@ the storage engine's address space.
 | Table scan | O(n) | HeapChain linear traversal |
 | Nested loop JOIN | O(n × m) | Both sides materialized before loop |
 | Hash GROUP BY | O(n) | One pass; O(k) memory where k = distinct groups |
+| Sorted GROUP BY | O(n) | One pass; O(1) accumulator memory per group |
 | Sort ORDER BY | O(n log n) | `sort_by` (stable, in-memory) |
 | DISTINCT | O(n) | One HashSet pass |
 | LIMIT/OFFSET | O(1) after sort | `skip(offset).take(limit)` |

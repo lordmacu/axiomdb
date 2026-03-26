@@ -341,6 +341,14 @@ AxiomDB implements the same three-valued logic for <code>IN (subquery)</code> as
 `GROUP BY` collapses rows with the same values in the specified columns into a single
 output row. Aggregate functions operate over each group.
 
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Automatic Sorted Grouping</span>
+When the query uses an indexed column as the GROUP BY key and the chosen B-Tree access method already delivers rows in key order, AxiomDB automatically switches to a streaming sorted executor — no hash table, <code>O(1)</code> memory per group. Unlike PostgreSQL, which requires a separate <code>GroupAggregate</code> plan node, AxiomDB selects the strategy transparently at execution time.
+</div>
+</div>
+
 ```sql
 -- Orders per user
 SELECT user_id, COUNT(*) AS order_count, SUM(total) AS revenue
