@@ -57,7 +57,10 @@ use crate::{
     eval::{eval, eval_with, is_truthy, SubqueryRunner},
     expr::{BinaryOp, Expr},
     result::{ColumnMeta, QueryResult, Row},
-    session::{normalize_sql_mode, parse_boolish_setting, sql_mode_is_strict, SessionContext},
+    session::{
+        normalize_sql_mode, on_error_mode_name, parse_boolish_setting, parse_on_error_setting,
+        sql_mode_is_strict, OnErrorMode, SessionContext,
+    },
     table::TableEngine,
 };
 
@@ -374,14 +377,38 @@ pub fn execute_with_ctx(
                 }
             };
         }
-        let sp: Savepoint = txn.savepoint();
+        // Apply on_error policy for DML inside an active transaction.
+        // RollbackTransaction skips the savepoint — it always rolls back the whole txn.
+        let sp_opt: Option<Savepoint> = if ctx.on_error == OnErrorMode::RollbackTransaction {
+            None
+        } else {
+            Some(txn.savepoint())
+        };
         match dispatch_ctx(stmt, storage, txn, bloom, ctx) {
             Ok(result) => Ok(result),
-            Err(e) => {
-                // Undo only this statement's writes; transaction stays active.
-                let _ = txn.rollback_to_savepoint(sp, storage);
-                Err(e)
-            }
+            Err(e) => match ctx.on_error {
+                OnErrorMode::RollbackTransaction => {
+                    // Eager whole-transaction rollback.
+                    let _ = txn.rollback(storage);
+                    Err(e)
+                }
+                OnErrorMode::Ignore if crate::session::is_ignorable_on_error(&e) => {
+                    // Ignorable error: undo statement, keep txn open, convert to warning.
+                    // database.rs will emit the warning; executor just rolls back the stmt.
+                    if let Some(sp) = sp_opt {
+                        let _ = txn.rollback_to_savepoint(sp, storage);
+                    }
+                    Err(e) // database.rs intercepts this and converts to QueryResult::Empty
+                }
+                _ => {
+                    // RollbackStatement / Savepoint / Ignore non-ignorable:
+                    // undo only this statement's writes, keep the transaction active.
+                    if let Some(sp) = sp_opt {
+                        let _ = txn.rollback_to_savepoint(sp, storage);
+                    }
+                    Err(e)
+                }
+            },
         }
 
     // ── No active transaction — autocommit=true (default) ─────────────────────
@@ -471,15 +498,31 @@ pub fn execute_with_ctx(
 
             // DML (INSERT, UPDATE, DELETE) — implicit BEGIN, no COMMIT.
             // Transaction stays open until the client sends explicit COMMIT/ROLLBACK.
+            //
+            // on_error = 'savepoint': create a savepoint right after BEGIN so that
+            // the first failing DML can be undone while keeping the implicit txn open.
+            // All other modes roll back the whole txn on first-DML failure.
             other => {
                 txn.begin()?;
+                let sp_opt: Option<Savepoint> = if ctx.on_error == OnErrorMode::Savepoint
+                    || ctx.on_error == OnErrorMode::Ignore
+                {
+                    Some(txn.savepoint())
+                } else {
+                    None
+                };
                 match dispatch_ctx(other, storage, txn, bloom, ctx) {
                     Ok(result) => Ok(result),
                     Err(e) => {
-                        // Statement failed before any partial writes, or the
-                        // savepoint is not available (no active txn yet).
-                        // Roll back the whole implicit transaction.
-                        let _ = txn.rollback(storage);
+                        if let Some(sp) = sp_opt {
+                            // savepoint / ignore: undo only the failing statement,
+                            // keep the implicit transaction open.
+                            let _ = txn.rollback_to_savepoint(sp, storage);
+                        } else {
+                            // rollback_statement / rollback_transaction:
+                            // roll back the entire implicit transaction.
+                            let _ = txn.rollback(storage);
+                        }
                         Err(e)
                     }
                 }
@@ -553,6 +596,42 @@ fn dispatch_ctx(
 /// - `sql_mode` — normalized string; strict tokens control `ctx.strict_mode`
 ///
 /// All other variables are accepted silently (existing stub behavior).
+/// Extracts the string value from a `SetValue` for settings that accept string
+/// literals or bare identifiers (e.g. `SET on_error = rollback_statement`).
+///
+/// Returns:
+/// - `Ok(None)` for `SetValue::Default`
+/// - `Ok(Some(s))` for string literals and bare identifiers
+/// - `Err` for any other expression
+fn set_value_to_setting_string(value: &SetValue) -> Result<Option<String>, DbError> {
+    match value {
+        SetValue::Default => Ok(None),
+        // String literal: SET on_error = 'rollback_statement'
+        SetValue::Expr(Expr::Literal(Value::Text(s))) => Ok(Some(s.clone())),
+        // Integer literal: SET x = 1
+        SetValue::Expr(Expr::Literal(Value::Int(n))) => Ok(Some(n.to_string())),
+        SetValue::Expr(Expr::Literal(Value::BigInt(n))) => Ok(Some(n.to_string())),
+        // Boolean literal: SET x = TRUE
+        SetValue::Expr(Expr::Literal(Value::Bool(b))) => {
+            Ok(Some(if *b { "1".to_string() } else { "0".to_string() }))
+        }
+        // Bare identifier: SET on_error = rollback_statement (no quotes).
+        // The analyzer resolves bare identifiers in SET expressions to Column
+        // nodes. Extracting the name avoids calling eval() with an empty row.
+        SetValue::Expr(Expr::Column { name, .. }) => Ok(Some(name.clone())),
+        // Constant expression fallback (e.g. CONCAT, arithmetic).
+        SetValue::Expr(other) => match eval(other, &[]) {
+            Ok(Value::Text(s)) => Ok(Some(s)),
+            Ok(Value::Int(n)) => Ok(Some(n.to_string())),
+            Ok(Value::BigInt(n)) => Ok(Some(n.to_string())),
+            Ok(Value::Bool(b)) => Ok(Some(if b { "1".to_string() } else { "0".to_string() })),
+            _ => Err(DbError::InvalidValue {
+                reason: "SET value must be a string literal or bare identifier".to_string(),
+            }),
+        },
+    }
+}
+
 fn execute_set_ctx(stmt: SetStmt, ctx: &mut SessionContext) -> Result<QueryResult, DbError> {
     match stmt.variable.to_ascii_lowercase().as_str() {
         "autocommit" => match stmt.value {
@@ -619,6 +698,13 @@ fn execute_set_ctx(stmt: SetStmt, ctx: &mut SessionContext) -> Result<QueryResul
                 ctx.strict_mode = sql_mode_is_strict(&normalized);
             }
         },
+        "on_error" => {
+            let raw = match set_value_to_setting_string(&stmt.value)? {
+                None => "rollback_statement".to_string(), // DEFAULT
+                Some(s) => s,
+            };
+            ctx.on_error = parse_on_error_setting(&raw)?;
+        }
         _ => {} // other variables: silently accepted
     }
     Ok(QueryResult::Empty)

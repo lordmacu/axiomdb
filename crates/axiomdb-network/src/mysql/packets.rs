@@ -115,14 +115,22 @@ pub fn build_auth_more_data(data: u8) -> Vec<u8> {
 
 // ── Parsed HandshakeResponse41 ────────────────────────────────────────────────
 
+/// Parsed HandshakeResponse41 packet — text fields remain raw bytes so that
+/// the handler can decode them with the negotiated charset after inspecting
+/// the `character_set` byte.
 pub struct HandshakeResponse {
     pub capability_flags: u32,
+    /// MySQL numeric collation/charset id chosen by the client.
     pub character_set: u8,
-    pub username: String,
+    /// Username bytes (null-terminated, stripped of the null).
+    /// Decoded by the handler using the negotiated client charset.
+    pub username: Vec<u8>,
     pub auth_response: Vec<u8>,
-    pub database: Option<String>,
+    /// Database name bytes, if present.
+    /// Decoded by the handler using the negotiated client charset.
+    pub database: Option<Vec<u8>>,
     /// Auth plugin name declared by the client (e.g. "caching_sha2_password").
-    /// `None` if the client did not include a plugin name.
+    /// Plugin names are always ASCII, so they are decoded as UTF-8 here.
     pub auth_plugin_name: Option<String>,
 }
 
@@ -130,6 +138,10 @@ pub struct HandshakeResponse {
 ///
 /// Returns a `HandshakeResponse` on success, or `None` if the packet is
 /// malformed (in which case the server should close the connection).
+///
+/// Text fields (`username`, `database`) are returned as raw bytes. The caller
+/// is responsible for decoding them with the session charset established from
+/// the `character_set` byte.
 pub fn parse_handshake_response(payload: &[u8]) -> Option<HandshakeResponse> {
     if payload.len() < 32 {
         return None;
@@ -141,9 +153,9 @@ pub fn parse_handshake_response(payload: &[u8]) -> Option<HandshakeResponse> {
     // bytes 9..32 are reserved (zeros)
     let mut pos = 32usize;
 
-    // username: null-terminated
+    // username: null-terminated, kept as raw bytes
     let username_end = payload[pos..].iter().position(|&b| b == 0)?;
-    let username = String::from_utf8(payload[pos..pos + username_end].to_vec()).ok()?;
+    let username = payload[pos..pos + username_end].to_vec();
     pos += username_end + 1;
 
     // auth_response: length-encoded string (CLIENT_SECURE_CONNECTION is always set)
@@ -159,24 +171,25 @@ pub fn parse_handshake_response(payload: &[u8]) -> Option<HandshakeResponse> {
     };
     pos += auth_len;
 
-    // database (optional, if CLIENT_CONNECT_WITH_DB)
+    // database (optional, if CLIENT_CONNECT_WITH_DB), kept as raw bytes
     let database = if capability_flags & CLIENT_CONNECT_WITH_DB != 0 && pos < payload.len() {
         let db_end = payload[pos..]
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(payload.len() - pos);
-        let db = String::from_utf8(payload[pos..pos + db_end].to_vec()).ok()?;
+        let db_bytes = payload[pos..pos + db_end].to_vec();
         pos += db_end + 1;
-        if db.is_empty() {
+        if db_bytes.is_empty() {
             None
         } else {
-            Some(db)
+            Some(db_bytes)
         }
     } else {
         None
     };
 
-    // auth_plugin_name (optional, if CLIENT_PLUGIN_AUTH)
+    // auth_plugin_name (optional, if CLIENT_PLUGIN_AUTH).
+    // Plugin names are always ASCII identifiers — safe to decode as UTF-8.
     let auth_plugin_name = if capability_flags & CLIENT_PLUGIN_AUTH != 0 && pos < payload.len() {
         let end = payload[pos..]
             .iter()

@@ -334,6 +334,8 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                                 .as_deref()
                                 .unwrap_or("STRICT_TRANS_TABLES"),
                         );
+                        // Sync on_error so the executor and pipeline use the new mode.
+                        session.on_error = conn_state.on_error();
                         // Sync decoder limit after SET max_allowed_packet.
                         reader.decoder_mut().set_max_payload_len(
                             conn_state

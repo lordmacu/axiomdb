@@ -158,6 +158,16 @@ pub fn dberror_to_mysql(e: &DbError, sql: Option<&str>) -> MysqlError {
     }
 }
 
+/// Converts a `DbError` into a MySQL warning code and message string for use
+/// with `on_error = 'ignore'`.
+///
+/// Reuses [`dberror_to_mysql`] so the warning carries the same code and message
+/// the client would have seen in an ERR packet.
+pub fn dberror_to_mysql_warning(e: &DbError, sql: Option<&str>) -> (u16, String) {
+    let me = dberror_to_mysql(e, sql);
+    (me.code, me.message)
+}
+
 // ── Unit tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

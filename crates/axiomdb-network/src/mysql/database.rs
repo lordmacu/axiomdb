@@ -40,6 +40,7 @@ use axiomdb_sql::{
     bloom::BloomRegistry,
     execute_with_ctx, parse,
     result::{ColumnMeta, QueryResult},
+    session::{is_ignorable_on_error, OnErrorMode},
     SchemaCache, SessionContext,
 };
 use axiomdb_storage::MmapStorage;
@@ -47,6 +48,7 @@ use axiomdb_types::{DataType, Value};
 use axiomdb_wal::TxnManager;
 
 use super::commit_coordinator::CommitCoordinator;
+use super::error::dberror_to_mysql_warning;
 use super::group_commit::spawn_group_commit_task;
 use super::status::StatusRegistry;
 
@@ -248,13 +250,24 @@ impl Database {
             });
         }
 
-        let stmt = parse(sql, None)?;
+        // ── parse ─────────────────────────────────────────────────────────────
+        let stmt = match parse(sql, None) {
+            Ok(s) => s,
+            Err(e) => return self.apply_on_error_pipeline_failure(sql, session, e),
+        };
         let is_ddl = is_schema_changing(&stmt);
+
+        // ── analyze ───────────────────────────────────────────────────────────
         let snap = self
             .txn
             .active_snapshot()
             .unwrap_or_else(|_| self.txn.snapshot());
-        let analyzed = analyze_cached(stmt, &self.storage, snap, schema_cache)?;
+        let analyzed = match analyze_cached(stmt, &self.storage, snap, schema_cache) {
+            Ok(a) => a,
+            Err(e) => return self.apply_on_error_pipeline_failure(sql, session, e),
+        };
+
+        // ── execute ───────────────────────────────────────────────────────────
         let result = execute_with_ctx(
             analyzed,
             &mut self.storage,
@@ -267,11 +280,54 @@ impl Database {
                 self.enter_degraded_mode();
             }
         }
-        let result = result?;
+        // For on_error = 'ignore', executor already rolled back the statement and
+        // returned Err — we intercept here to convert it to a warning + success.
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                return self.apply_on_error_pipeline_failure(sql, session, e);
+            }
+        };
         if is_ddl {
             self.schema_version.fetch_add(1, Ordering::Release);
         }
         Ok((result, self.take_commit_rx()))
+    }
+
+    /// Applies the session `on_error` policy to a pipeline failure from
+    /// parse, analyze, or execute.
+    ///
+    /// - `RollbackStatement` / `Savepoint`: keep any active txn open, return ERR.
+    /// - `RollbackTransaction`: roll back the whole active txn, return ERR.
+    /// - `Ignore` (ignorable error): add warning, return `QueryResult::Empty`.
+    /// - `Ignore` (non-ignorable): roll back active txn, return ERR.
+    fn apply_on_error_pipeline_failure(
+        &mut self,
+        sql: &str,
+        session: &mut SessionContext,
+        err: DbError,
+    ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
+        if matches!(err, DbError::DiskFull { .. }) {
+            self.enter_degraded_mode();
+        }
+        match session.on_error {
+            OnErrorMode::RollbackTransaction => {
+                if self.txn.active_txn_id().is_some() {
+                    let _ = self.txn.rollback(&mut self.storage);
+                }
+                Err(err)
+            }
+            OnErrorMode::Ignore if is_ignorable_on_error(&err) => {
+                let (code, message) = dberror_to_mysql_warning(&err, Some(sql));
+                session.warn(code, message);
+                Ok((QueryResult::Empty, None))
+            }
+            _ => {
+                // RollbackStatement / Savepoint / Ignore non-ignorable:
+                // executor already handled statement-level rollback where applicable.
+                Err(err)
+            }
+        }
     }
 
     /// Executes an already-analyzed `Stmt` — used by the prepared statement
