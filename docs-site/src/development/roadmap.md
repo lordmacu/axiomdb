@@ -173,9 +173,9 @@ This is the largest remaining item in Block 1.
 
 ### Phase 5 remaining — Wire protocol completeness
 
-- **5.13 Prepared statement plan cache** — eliminates parse+analyze (~5ms) on every
-  `COM_STMT_EXECUTE` by caching the compiled plan per statement ID.
-- **5.12 Multi-statement** — semicolon-separated queries in a single `COM_QUERY`.
+- **5.11c Explicit connection state machine** — formalize `CONNECTED → AUTH → IDLE → EXECUTING → CLOSING`, timeout handling, and abrupt socket close behavior.
+- **5.15 DSN parsing** — `axiomdb://`, `mysql://`, and `postgres://` style connection strings for tools and ORMs.
+- **5.17 In-place B+Tree write path** — reduce page churn on indexed INSERT/UPDATE/DELETE hot paths.
 
 ### Phase 6 remaining — Index completeness
 

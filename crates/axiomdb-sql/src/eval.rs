@@ -36,16 +36,16 @@ use crate::{
 
 // ── Session-collation thread-local ────────────────────────────────────────────
 
-/// Active text-comparison collation for the current `eval` call stack.
-///
-/// Set to [`SessionCollation::Binary`] by default; overridden to `Es` for the
-/// duration of a ctx-path execution via [`CollationGuard`].
-///
-/// Thread-local guarantees correct isolation between concurrent sessions
-/// even though `eval` / `eval_with` are non-async functions called from a
-/// Tokio spawn_blocking context.
+// Active text-comparison collation for the current `eval` call stack.
+//
+// Set to [`SessionCollation::Binary`] by default; overridden to `Es` for the
+// duration of a ctx-path execution via [`CollationGuard`].
+//
+// Thread-local guarantees correct isolation between concurrent sessions even
+// though `eval` / `eval_with` are non-async functions called from a Tokio
+// spawn_blocking context.
 thread_local! {
-    static EVAL_COLLATION: Cell<SessionCollation> = Cell::new(SessionCollation::Binary);
+    static EVAL_COLLATION: Cell<SessionCollation> = const { Cell::new(SessionCollation::Binary) };
 }
 
 /// Returns the active session collation for the current thread.

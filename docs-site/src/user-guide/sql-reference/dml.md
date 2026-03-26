@@ -1274,6 +1274,14 @@ packet, client libraries split it into multiple `COM_STMT_SEND_LONG_DATA`
 chunks before execute. AxiomDB buffers all chunks and assembles the final value
 at execute time.
 
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Chunk Boundaries Are Safe</span>
+AxiomDB buffers long-data chunks as raw bytes and decodes text only at execute time. A UTF-8 character may be split across packets without corrupting the final value.
+</div>
+</div>
+
 **Python (PyMySQL):**
 
 ```python

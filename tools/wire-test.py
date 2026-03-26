@@ -3,7 +3,7 @@
 AxiomDB wire protocol test.
 Updated at each subphase close — always overwrite this file, never create new ones.
 
-Last updated: subphase 5.2c (ON_ERROR session behavior)
+Last updated: subphase 5.11b (COM_STMT_SEND_LONG_DATA)
 """
 import os
 import signal
@@ -11,8 +11,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import struct as _struct
 
 import pymysql
+import pymysql.constants.COMMAND as _CMD
 
 PORT = 13306
 PASS = 0
@@ -129,6 +131,71 @@ def reset_connection(conn):
     """Send COM_RESET_CONNECTION (0x1f) using PyMySQL internals."""
     conn._execute_command(0x1F, b"")
     conn._read_ok_packet()
+
+
+def _packet_data(pkt):
+    return pkt._data if hasattr(pkt, "_data") else b""
+
+
+def _drain_prepare_metadata(conn, num_params, num_cols):
+    for _ in range(num_params):
+        conn._read_packet()
+    if num_params:
+        conn._read_packet()  # EOF after parameter defs
+    for _ in range(num_cols):
+        conn._read_packet()
+    if num_cols:
+        conn._read_packet()  # EOF after result column defs
+
+
+def raw_prepare(conn, sql):
+    conn._execute_command(_CMD.COM_STMT_PREPARE, sql.encode("utf-8"))
+    data = _packet_data(conn._read_packet())
+    stmt_id = _struct.unpack_from("<I", data, 1)[0]
+    num_cols = _struct.unpack_from("<H", data, 5)[0]
+    num_params = _struct.unpack_from("<H", data, 7)[0]
+    _drain_prepare_metadata(conn, num_params, num_cols)
+    return stmt_id, num_params, num_cols
+
+
+def raw_send_long_data(conn, stmt_id, param_idx, chunk):
+    payload = _struct.pack("<I", stmt_id) + _struct.pack("<H", param_idx) + chunk
+    conn._execute_command(_CMD.COM_STMT_SEND_LONG_DATA, payload)
+
+
+def raw_stmt_reset(conn, stmt_id):
+    conn._execute_command(_CMD.COM_STMT_RESET, _struct.pack("<I", stmt_id))
+    return _packet_data(conn._read_packet())
+
+
+def raw_stmt_close(conn, stmt_id):
+    conn._execute_command(_CMD.COM_STMT_CLOSE, _struct.pack("<I", stmt_id))
+
+
+def _null_bitmap(param_count, null_indices=()):
+    bitmap = bytearray((param_count + 7) // 8)
+    for idx in null_indices:
+        bitmap[idx // 8] |= 1 << (idx % 8)
+    return bytes(bitmap)
+
+
+def _lenenc_bytes(data):
+    if len(data) >= 251:
+        raise ValueError("wire-test helper only supports short lenenc payloads")
+    return bytes([len(data)]) + data
+
+
+def raw_execute(conn, stmt_id, param_types, inline_values=b"", null_indices=()):
+    payload = _struct.pack("<I", stmt_id)
+    payload += b"\x00"  # flags = CURSOR_TYPE_NO_CURSOR
+    payload += _struct.pack("<I", 1)  # iteration_count = 1
+    payload += _null_bitmap(len(param_types), null_indices)
+    payload += b"\x01"  # new_params_bound_flag
+    for type_code in param_types:
+        payload += bytes([type_code, 0x00])
+    payload += inline_values
+    conn._execute_command(_CMD.COM_STMT_EXECUTE, payload)
+    return _packet_data(conn._read_packet())
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -784,8 +851,8 @@ ok("SHOW STATUS LIKE 'unknown' returns empty (not error)", len(cur.fetchall()) =
 cur.execute("SHOW STATUS LIKE 'Com_%'")
 com_rows = cur.fetchall()
 com_names = sorted(r[0] for r in com_rows)
-ok("SHOW STATUS LIKE 'Com_%' returns Com_insert and Com_select",
-   com_names == ["Com_insert", "Com_select"], com_names)
+ok("SHOW STATUS LIKE 'Com_%' includes insert/select/stmt_send_long_data",
+   com_names == ["Com_insert", "Com_select", "Com_stmt_send_long_data"], com_names)
 
 # LIKE '_' single-char wildcard
 cur.execute("SHOW STATUS LIKE 'Com_inser_'")
@@ -901,8 +968,6 @@ ok("High-level: negative BIGINT round-trips correctly (-1)",
 
 # Low-level: parse the raw COM_STMT_EXECUTE row packet and prove it is binary.
 # We use PyMySQL's internal _execute_command to get the raw packet bytes.
-import struct as _struct
-import pymysql.constants.COMMAND as _CMD
 
 conn_raw = connect()
 try:
@@ -970,6 +1035,146 @@ finally:
 cb.execute("DROP TABLE IF EXISTS t_binary_test")
 conn_bin.commit()
 conn_bin.close()
+
+# ── 5.11b: COM_STMT_SEND_LONG_DATA ───────────────────────────────────────────
+
+print("\n[5.11b] COM_STMT_SEND_LONG_DATA")
+
+conn_ld = connect()
+cld = conn_ld.cursor()
+
+cld.execute("DROP TABLE IF EXISTS t_long_data")
+cld.execute("CREATE TABLE t_long_data (id INT, txt TEXT, blb BLOB)")
+conn_ld.commit()
+
+# Text long-data split across chunks, including a multibyte boundary.
+stmt_text, num_params_text, _ = raw_prepare(
+    conn_ld,
+    "INSERT INTO t_long_data (id, txt, blb) VALUES (?, ?, NULL)",
+)
+ok("prepare text statement reports 2 params", num_params_text == 2, num_params_text)
+raw_send_long_data(conn_ld, stmt_text, 1, b"ma\xc3")
+raw_send_long_data(conn_ld, stmt_text, 1, b"\xb1ana")
+s_ld = status_map(cld, "SHOW SESSION STATUS LIKE 'Com_stmt_send_long_data'")
+ok("session Com_stmt_send_long_data = 2 after two chunks",
+   int(s_ld.get("Com_stmt_send_long_data", -1)) == 2,
+   s_ld.get("Com_stmt_send_long_data"))
+
+pkt_text = raw_execute(
+    conn_ld,
+    stmt_text,
+    [0x03, 0xfd],  # INT, VAR_STRING
+    inline_values=_struct.pack("<i", 1),
+    null_indices=(1,),  # pending long data must win over NULL
+)
+ok("text long-data execute returns OK", pkt_text[:1] == b"\x00", pkt_text[:12])
+conn_ld.commit()
+cld.execute("SELECT txt FROM t_long_data WHERE id = 1")
+row_text = cld.fetchone()
+ok("multibyte text split across chunks reconstructs correctly",
+   row_text and row_text[0] == "mañana", row_text)
+raw_stmt_close(conn_ld, stmt_text)
+
+# COM_STMT_RESET clears pending long-data state but keeps the statement usable.
+stmt_reset, _, _ = raw_prepare(
+    conn_ld,
+    "INSERT INTO t_long_data (id, txt, blb) VALUES (?, ?, NULL)",
+)
+raw_send_long_data(conn_ld, stmt_reset, 1, b"should_be_cleared")
+pkt_reset = raw_stmt_reset(conn_ld, stmt_reset)
+ok("COM_STMT_RESET returns OK", pkt_reset[:1] == b"\x00", pkt_reset[:12])
+pkt_after_reset = raw_execute(
+    conn_ld,
+    stmt_reset,
+    [0x03, 0xfd],
+    inline_values=_struct.pack("<i", 2) + _lenenc_bytes(b"inline_text"),
+)
+ok("execute after COM_STMT_RESET returns OK",
+   pkt_after_reset[:1] == b"\x00", pkt_after_reset[:12])
+conn_ld.commit()
+cld.execute("SELECT txt FROM t_long_data WHERE id = 2")
+row_reset = cld.fetchone()
+ok("COM_STMT_RESET clears pending long-data state",
+   row_reset and row_reset[0] == "inline_text", row_reset)
+raw_stmt_close(conn_ld, stmt_reset)
+
+# Binary long data preserves raw bytes, including NUL.
+stmt_blob, _, _ = raw_prepare(
+    conn_ld,
+    "INSERT INTO t_long_data (id, txt, blb) VALUES (?, NULL, ?)",
+)
+raw_send_long_data(conn_ld, stmt_blob, 1, b"\x00\xff")
+raw_send_long_data(conn_ld, stmt_blob, 1, b"\x00\x42")
+pkt_blob = raw_execute(
+    conn_ld,
+    stmt_blob,
+    [0x03, 0xfc],  # INT, BLOB
+    inline_values=_struct.pack("<i", 3),
+    null_indices=(1,),
+)
+ok("binary long-data execute returns OK", pkt_blob[:1] == b"\x00", pkt_blob[:12])
+conn_ld.commit()
+cld.execute("SELECT blb FROM t_long_data WHERE id = 3")
+row_blob = cld.fetchone()
+ok("binary long data preserves raw bytes including NUL",
+   row_blob and row_blob[0] == b"\x00\xff\x00\x42", row_blob)
+raw_stmt_close(conn_ld, stmt_blob)
+
+# Deferred overflow error surfaces on EXECUTE and the connection remains usable.
+stmt_err, _, _ = raw_prepare(
+    conn_ld,
+    "INSERT INTO t_long_data (id, txt, blb) VALUES (4, ?, NULL)",
+)
+cld.execute("SET max_allowed_packet = 18")
+raw_send_long_data(conn_ld, stmt_err, 0, b"abcdefghij")
+raw_send_long_data(conn_ld, stmt_err, 0, b"klmnopqrs")  # 19 bytes total > 18
+try:
+    raw_execute(
+        conn_ld,
+        stmt_err,
+        [0xfd],
+    )
+    ok("oversized accumulated long data returns ERR on execute", False, "no error raised")
+    ok("oversized long-data error mentions max_allowed_packet", False, "no error raised")
+except pymysql.MySQLError as e:
+    err_msg = str(e)
+    ok("oversized accumulated long data returns ERR on execute", True)
+    ok("oversized long-data error mentions max_allowed_packet",
+       "max_allowed_packet" in err_msg, err_msg)
+
+# The deferred long-data overflow must not kill the connection.
+cld.execute("SELECT 1")
+row_alive = cld.fetchone()
+ok("connection remains usable after deferred long-data error",
+   row_alive == (1,), row_alive)
+
+# The same statement remains reusable under the same small packet limit.
+pkt_reuse = raw_execute(
+    conn_ld,
+    stmt_err,
+    [0xfd],
+    inline_values=_lenenc_bytes(b"ok"),
+)
+ok("deferred long-data state is cleared after failed execute",
+   pkt_reuse[:1] == b"\x00", pkt_reuse[:12])
+conn_ld.commit()
+
+raw_stmt_close(conn_ld, stmt_err)
+conn_ld.close()
+
+conn_ld_cleanup = connect()
+cur_ld_cleanup = conn_ld_cleanup.cursor()
+cur_ld_cleanup.execute("SELECT txt FROM t_long_data WHERE id = 4")
+row_reuse = cur_ld_cleanup.fetchone()
+ok("statement remains usable after deferred long-data error",
+   row_reuse and row_reuse[0] == "ok", row_reuse)
+g_ld = status_map(cur_ld_cleanup, "SHOW GLOBAL STATUS LIKE 'Com_stmt_send_long_data'")
+ok("global Com_stmt_send_long_data is at least 6 after smoke",
+   int(g_ld.get("Com_stmt_send_long_data", 0)) >= 6,
+   g_ld.get("Com_stmt_send_long_data"))
+cur_ld_cleanup.execute("DROP TABLE IF EXISTS t_long_data")
+conn_ld_cleanup.commit()
+conn_ld_cleanup.close()
 
 # ── 5.4a: max_allowed_packet enforcement ─────────────────────────────────────
 

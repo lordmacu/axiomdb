@@ -57,13 +57,13 @@ use crate::{
         JoinCondition, JoinType, NullsOrder, OrderByItem, SelectItem, SelectStmt, SetStmt,
         SetValue, SortOrder, Stmt, UpdateStmt,
     },
-    eval::{eval, eval_with, eval_with_in_session, is_truthy, CollationGuard, SubqueryRunner},
+    eval::{eval, eval_with, is_truthy, CollationGuard, SubqueryRunner},
     expr::{BinaryOp, Expr},
     result::{ColumnMeta, QueryResult, Row},
     session::{
-        compat_mode_name, normalize_sql_mode, parse_boolish_setting, parse_compat_mode_setting,
-        parse_on_error_setting, parse_session_collation_setting, session_collation_name,
-        sql_mode_is_strict, CompatMode, OnErrorMode, SessionCollation, SessionContext,
+        normalize_sql_mode, parse_boolish_setting, parse_compat_mode_setting,
+        parse_on_error_setting, parse_session_collation_setting, sql_mode_is_strict, OnErrorMode,
+        SessionCollation, SessionContext,
     },
     table::TableEngine,
     text_semantics::compare_text,
@@ -1685,7 +1685,7 @@ fn execute_delete_ctx(
         let plan = plan_bulk_empty_table(storage, &resolved.def, &all_indexes, snap)?;
         let count = plan.visible_row_count;
 
-        apply_bulk_empty_table(storage, txn, bloom, &resolved.def, &all_indexes, plan)?;
+        apply_bulk_empty_table(storage, txn, bloom, &resolved.def, plan)?;
 
         // Invalidate session schema cache so the next query reloads the new roots.
         ctx.invalidate_all();
@@ -1771,6 +1771,7 @@ fn execute_delete_ctx(
         let compiled_preds =
             crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;
         let mut any_root_changed = false;
+        let mut secondary_indexes = secondary_indexes; // shadow as mut for root sync
         for (rid, row_vals) in &to_delete {
             let updated = crate::index_maintenance::delete_from_indexes(
                 &secondary_indexes,
@@ -1782,12 +1783,18 @@ fn execute_delete_ctx(
             )?;
             for (index_id, new_root) in updated {
                 CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
+                // Keep the in-memory snapshot in sync so the next row's deletion
+                // starts from the correct (current) root — same fix as execute_delete.
+                for idx in secondary_indexes.iter_mut() {
+                    if idx.index_id == index_id {
+                        idx.root_page_id = new_root;
+                        break;
+                    }
+                }
                 any_root_changed = true;
             }
         }
-        // B-Tree CoW delete allocates a new root page and frees the old one.
-        // Invalidate the session cache so the next query reloads fresh root IDs
-        // from the catalog instead of using the stale freed page IDs.
+        // Invalidate the session cache so the next query reloads fresh root IDs.
         if any_root_changed {
             ctx.invalidate_all();
         }
@@ -3429,14 +3436,6 @@ fn value_to_key_bytes(v: &Value) -> Vec<u8> {
     buf
 }
 
-/// Serializes a GROUP BY key (multiple values) to a single byte sequence.
-///
-/// Uses binary serialization. For session-aware GROUP BY (ctx path), use
-/// [`group_key_bytes_session`] instead.
-fn group_key_bytes(key_values: &[Value]) -> Vec<u8> {
-    key_values.iter().flat_map(value_to_key_bytes).collect()
-}
-
 /// Session-aware GROUP BY key serialization.
 ///
 /// Uses [`value_to_session_key_bytes`] so that text values are canonicalized
@@ -3740,28 +3739,6 @@ enum GroupByStrategy {
     /// `presorted = true`  → caller guarantees input is in group-key order.
     /// `presorted = false` → executor sorts the input by group keys first.
     Sorted { presorted: bool },
-}
-
-/// Returns `GroupByStrategy::Sorted { presorted: true }` when the chosen
-/// access method guarantees that rows arrive in an order compatible with the
-/// GROUP BY key prefix, and `GroupByStrategy::Hash` otherwise.
-///
-/// Compatibility rules (all must hold):
-/// 1. `group_by` is non-empty.
-/// 2. `access_method` is `IndexLookup`, `IndexRange`, or `IndexOnlyScan`.
-/// 3. Every element of `group_by` is a plain `Expr::Column` reference.
-/// 4. The `group_by` columns match the **leading prefix** of the index key in
-///    the same order (not reordered, not computed).
-fn choose_group_by_strategy_ctx(
-    group_by: &[Expr],
-    access_method: &crate::planner::AccessMethod,
-) -> GroupByStrategy {
-    choose_group_by_strategy_ctx_with_collation(
-        group_by,
-        access_method,
-        crate::eval::current_eval_collation(),
-        &[],
-    )
 }
 
 /// Collation-aware GROUP BY strategy selection.
@@ -4645,14 +4622,7 @@ fn execute_delete(
     if stmt.where_clause.is_none() && !has_fk_references {
         let plan = plan_bulk_empty_table(storage, &resolved.def, &secondary_indexes, snap)?;
         let count = plan.visible_row_count;
-        apply_bulk_empty_table(
-            storage,
-            txn,
-            &mut noop_bloom,
-            &resolved.def,
-            &secondary_indexes,
-            plan,
-        )?;
+        apply_bulk_empty_table(storage, txn, &mut noop_bloom, &resolved.def, plan)?;
         return Ok(QueryResult::Affected {
             count,
             last_insert_id: None,
@@ -5601,7 +5571,7 @@ fn collect_heap_chain_pages(
     while pid != 0 {
         pages.push(pid);
         let page = storage.read_page(pid)?;
-        pid = chain_next_page(&page);
+        pid = chain_next_page(page);
     }
     Ok(pages)
 }
@@ -5681,7 +5651,6 @@ fn apply_bulk_empty_table(
     txn: &mut TxnManager,
     bloom: &mut crate::bloom::BloomRegistry,
     table_def: &axiomdb_catalog::TableDef,
-    indexes: &[axiomdb_catalog::IndexDef],
     plan: BulkEmptyPlan,
 ) -> Result<(), DbError> {
     // Rotate heap root in the catalog.
@@ -5850,14 +5819,7 @@ fn execute_truncate(
     // Bulk-empty via root rotation (Phase 5.16): correct for indexed tables.
     let mut noop_bloom = crate::bloom::BloomRegistry::new();
     let plan = plan_bulk_empty_table(storage, &resolved.def, &all_indexes, snap)?;
-    apply_bulk_empty_table(
-        storage,
-        txn,
-        &mut noop_bloom,
-        &resolved.def,
-        &all_indexes,
-        plan,
-    )?;
+    apply_bulk_empty_table(storage, txn, &mut noop_bloom, &resolved.def, plan)?;
 
     // Reset the AUTO_INCREMENT sequence so the next insert starts from 1.
     AUTO_INC_SEQ.with(|seq| {
@@ -7098,16 +7060,6 @@ fn rid_hi(prefix: &[u8]) -> Vec<u8> {
     let mut v = prefix.to_vec();
     v.extend_from_slice(&[0xFFu8; 10]);
     v
-}
-
-fn apply_distinct(rows: Vec<Row>) -> Vec<Row> {
-    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-    rows.into_iter()
-        .filter(|row| {
-            let key: Vec<u8> = row.iter().flat_map(value_to_key_bytes).collect();
-            seen.insert(key)
-        })
-        .collect()
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

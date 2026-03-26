@@ -47,3 +47,14 @@
   - inspiration from research
   - implementation limited by AxiomDB's current architecture
 - When possible, tie each external inspiration to the local verification path that will prove it in AxiomDB: unit test, integration test, wire test, or benchmark.
+
+## 2026-03-26 - Critical subphases require full research synthesis
+
+- When a subphase can affect correctness, durability, transactional rollback, index consistency, or crash recovery, treat it as research-critical by default.
+- For research-critical subphases, review the relevant AxiomDB files first and then read all relevant engines under `research/`, not only the most obvious reference system.
+- The spec and plan must include a clear synthesis of:
+  - what each engine contributed
+  - which ideas were rejected
+  - why the AxiomDB adaptation is safer or better for the current architecture
+- Do not optimize only for speed in a critical subphase. Preserve invariants first, then derive the fast path from a correctness-safe design.
+- If one approach is faster but weakens rollback, FK correctness, index consistency, or recovery guarantees, reject it unless the spec explicitly opens a follow-up phase to recover those guarantees.
