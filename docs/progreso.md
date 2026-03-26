@@ -128,7 +128,7 @@
 
 <!-- ── Group E — Core SQL (needs executor) ── -->
 - [x] 4.8 ✅ JOIN — INNER, LEFT, RIGHT, CROSS with nested loop; USING; multi-table; FULL → NotImplemented
-- [ ] 4.8b ⏳ FULL OUTER JOIN — complete the only unimplemented join type; parser already accepts it (returns NotImplemented); executor needs symmetric hash join or two-pass approach; no dependency on MVCC/SIMD — pure parser+executor work; natural extension of the already-complete 4.8 join infrastructure
+- [x] 4.8b ✅ FULL OUTER JOIN — matched-right bitmap nested-loop in apply_join; compute_outer_nullable replaces is_outer_nullable for chain-aware metadata; both NotImplemented guards removed; 6 integration tests: matched+unmatched, one-to-many, ON vs WHERE, USING, SELECT * nullability, join chain; AxiomDB SQL extension over MySQL wire protocol; docs added
 - [x] 4.9a ✅ GROUP BY hash-based — HashMap<key_bytes, GroupState>; value_to_key_bytes; NULL keys group correctly
 - [x] 4.9b ✅ GROUP BY sort-based — sorted streaming executor; auto-selects when access method is IndexLookup/IndexRange/IndexOnlyScan with matching GROUP BY prefix; hash path remains default fallback; 9 integration tests + 11 wire assertions
   - [x] ✅ ORDER BY + GROUP BY col_idx mismatch — fixed in 4.10e: remap_order_by_for_grouped rewrites column/aggregate expressions to output positions before apply_order_by
@@ -201,6 +201,8 @@
 - [x] 5.13 ✅ Prepared statement plan cache — schema_version Arc<AtomicU64> in Database; compiled_at_version in PreparedStatement; lock-free version check on COM_STMT_EXECUTE; re-analyze on DDL mismatch; LRU eviction with max_prepared_stmts_per_connection (default 1024); 6 unit tests
 - [x] 5.14 ✅ Throughput benchmarks + perf fix — SELECT 185 q/s (3.3× vs 56 q/s antes); INSERT 58 q/s (fsync necesario); root cause: read-only txns hacían fsync innecesario; fix: flush_no_sync para undo_ops.is_empty()
 - [ ] 5.15 ⏳ Connection string DSN — `axiomdb://user:pass@host:port/dbname?param=val`; `mysql://` as alias for MySQL driver compatibility; `postgres://` as alias for tools like pgcli/DBeaver; parse DSN in the client-facing API and server config; ORMs and connection pools (SQLAlchemy, Django, GORM) use DSN as their primary connection method — without this they require manual host/port/user parameters which breaks standard tooling
+- [ ] 5.16 ⏳ DELETE fast-path bulk truncate — `DELETE FROM t` (no WHERE) currently falls through to per-row path whenever any index exists (PRIMARY KEY included), causing 10000×+ slowdown vs MySQL; fix: detect full-table delete → batch-free heap pages + drop+rebuild index in one pass instead of deleting each row individually; identified by AxiomDB vs SQLite bench (2026-03-26), DELETE was 11000× slower than SQLite embedded for 500-row full-table delete
+- [ ] 5.17 ⏳ insert_leaf in-place update — `insert_leaf` (called on every INSERT, UPDATE, DELETE that modifies a leaf) always allocates a new page + frees the old one even when no split is needed; this doubles I/O per row write and inflates free-list churn; fix: in-place write when `num_keys < threshold` (no split, single writer, no concurrent readers in Phase 5); same fix applies to delete_leaf; identified by AxiomDB vs SQLite bench (2026-03-26), INSERT is 3× slower than MySQL via wire and UPDATE is catastrophically slow (9000× slower)
 
 ### Phase 6 — Secondary indexes + FK `🔄` week 31-39
 - [x] 6.1 ✅ `IndexColumnDef` + `IndexDef.columns` — catalog stores which columns each index covers; backward-compatible serialization
@@ -798,7 +800,7 @@
 - [ ] ⚠️ 31.2 duplicate of 17.16 — Dynamic data masking + helper functions (`MASK_EMAIL`, `MASK_PHONE`) tracked there; remove this item when 17.16 is implemented
 - [ ] 31.3 ⏳ SQL-level PREPARE / EXECUTE — `PREPARE name AS SELECT ...` / `EXECUTE name(params)` syntax (PostgreSQL-style named prepared statements in SQL); distinct from 5.13 (wire plan cache) and 10.8 (Rust embedded API); targets interactive sessions and stored procedures
 - [ ] 31.4 ⏳ Extended statistics — column correlations (`CREATE STATISTICS`) for multi-column dependency awareness in the planner
-- [ ] 31.5 ⏳ FULL OUTER JOIN — ⚠️ consider moving earlier (could be Phase 4.8b — no dependency on MVCC/SIMD)
+- [x] 31.5 ✅ FULL OUTER JOIN — implemented in Phase 4.8b (moved earlier as planned)
 - [ ] ⚠️ 31.6 duplicate of 13.14 — Custom aggregate functions tracked there; remove this item when 13.14 is implemented
 - [ ] 31.7 ⏳ Geospatial — `POINT`, `ST_DISTANCE_KM`, R-Tree index (`rstar`)
 - [ ] 31.8 ⏳ Query result cache — automatic invalidation by table

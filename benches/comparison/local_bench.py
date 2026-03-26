@@ -44,7 +44,7 @@ MYSQL_ENGINES = {
                            database="bench", autocommit=True),
     "MySQL 8.0":      dict(host="127.0.0.1", port=3310, user="root", password="bench",
                            database="bench", autocommit=True),
-    "AxiomDB (wire)": dict(host="127.0.0.1", port=3309, user="root", password="root",
+    "AxiomDB (wire)": dict(host="127.0.0.1", port=3309, user="root", password="",
                            autocommit=True),
 }
 

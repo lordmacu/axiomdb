@@ -108,6 +108,56 @@ RIGHT JOIN products p ON p.id = oi.product_id
 GROUP BY p.id, p.name;
 ```
 
+### FULL OUTER JOIN
+
+Returns **all rows from both tables**. Matched rows are joined normally.
+Unmatched rows from either side are padded with `NULL` on the missing side.
+
+> **AxiomDB extension over the MySQL wire protocol.** MySQL does not support
+> `FULL OUTER JOIN`. AxiomDB clients connecting via the MySQL wire protocol can
+> use it, but standard MySQL clients may not send it.
+
+```sql
+-- Audit: find users with no orders AND orders with no valid user
+SELECT
+    u.id   AS user_id,
+    u.name AS user_name,
+    o.id   AS order_id,
+    o.total
+FROM users u
+FULL OUTER JOIN orders o ON u.id = o.user_id
+ORDER BY u.id, o.id;
+```
+
+| user_id | user_name | order_id | total |
+|---------|-----------|----------|-------|
+| 1 | Alice | 10 | 100 |
+| 1 | Alice | 11 | 200 |
+| 2 | Bob | 12 | 50 |
+| 3 | Carol | NULL | NULL | ← user with no orders |
+| NULL | NULL | 13 | 300 | ← order with no valid user |
+
+Both `FULL JOIN` and `FULL OUTER JOIN` are accepted.
+
+**`ON` vs `WHERE` semantics:**
+
+- `ON` predicates are evaluated *before* null-extension.
+  Rows that do not satisfy `ON` are treated as unmatched and receive NULLs.
+- `WHERE` predicates run *after* the full join is materialized.
+  Adding `WHERE u.id IS NOT NULL` removes unmatched right rows from the result.
+
+```sql
+-- ON vs WHERE: only keep rows where the user side is not NULL
+SELECT u.id, o.id
+FROM users u
+FULL OUTER JOIN orders o ON u.id = o.user_id
+WHERE u.id IS NOT NULL;     -- removes the (NULL, 13) row
+```
+
+**Nullability:** In `SELECT *` over a `FULL OUTER JOIN`, all columns from both
+tables are marked nullable even if the catalog defines them as `NOT NULL`,
+because either side can be null-extended.
+
 ### CROSS JOIN
 
 Cartesian product — every row from the left table combined with every row from

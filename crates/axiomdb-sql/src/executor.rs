@@ -1073,12 +1073,6 @@ fn execute_select_with_joins_ctx(
         .collect();
 
     for (i, join) in stmt.joins.iter().enumerate() {
-        if join.join_type == JoinType::Full {
-            return Err(DbError::NotImplemented {
-                feature: "FULL OUTER JOIN — Phase 4.8+".into(),
-            });
-        }
-
         let right_idx = i + 1;
         let right_col_count = all_resolved[right_idx].columns.len();
         let right_col_offset = col_offsets[right_idx];
@@ -2226,12 +2220,6 @@ fn execute_select_with_joins(
         .collect();
 
     for (i, join) in stmt.joins.iter().enumerate() {
-        if join.join_type == JoinType::Full {
-            return Err(DbError::NotImplemented {
-                feature: "FULL OUTER JOIN — Phase 4.8+".into(),
-            });
-        }
-
         let right_idx = i + 1;
         let right_col_count = all_resolved[right_idx].columns.len();
         let right_col_offset = col_offsets[right_idx];
@@ -2389,9 +2377,48 @@ fn apply_join(
             Ok(result)
         }
 
-        JoinType::Full => Err(DbError::NotImplemented {
-            feature: "FULL OUTER JOIN — Phase 4.8+".into(),
-        }),
+        JoinType::Full => {
+            // FULL OUTER JOIN = matched pairs + unmatched left rows (NULL right)
+            //                 + unmatched right rows (NULL left).
+            //
+            // A matched-right bitmap tracks which right rows were joined so the
+            // second pass can emit the unmatched ones without duplicating them.
+            let null_left: Row = vec![Value::Null; left_col_count];
+            let null_right: Row = vec![Value::Null; right_col_count];
+            let mut matched_right = vec![false; right_rows.len()];
+            let mut result = Vec::new();
+
+            for left in &left_rows {
+                let mut matched = false;
+                for (i, right) in right_rows.iter().enumerate() {
+                    let combined = concat_rows(left, right);
+                    if eval_join_cond(
+                        condition,
+                        &combined,
+                        left_schema,
+                        right_col_offset,
+                        right_columns,
+                    )? {
+                        result.push(combined);
+                        matched = true;
+                        matched_right[i] = true;
+                    }
+                }
+                if !matched {
+                    // Left row had no match — emit with NULLs on the right side.
+                    result.push(concat_rows(left, &null_right));
+                }
+            }
+
+            // Emit right rows that were never matched with NULLs on the left side.
+            for (i, right) in right_rows.iter().enumerate() {
+                if !matched_right[i] {
+                    result.push(concat_rows(&null_left, right));
+                }
+            }
+
+            Ok(result)
+        }
     }
 }
 
@@ -2476,6 +2503,9 @@ fn build_join_column_meta(
     all_tables: &[axiomdb_catalog::ResolvedTable],
     joins: &[JoinClause],
 ) -> Result<Vec<ColumnMeta>, DbError> {
+    // Precompute outer-join nullability once for the whole chain.
+    // This correctly handles LEFT, RIGHT, FULL, and mixed chains.
+    let nullable_tables = compute_outer_nullable(all_tables.len(), joins);
     let mut out = Vec::new();
 
     for item in items {
@@ -2483,7 +2513,7 @@ fn build_join_column_meta(
             SelectItem::Wildcard => {
                 // Expand all columns from all tables in order.
                 for (t_idx, table) in all_tables.iter().enumerate() {
-                    let outer_nullable = is_outer_nullable(t_idx, joins);
+                    let outer_nullable = nullable_tables[t_idx];
                     for col in &table.columns {
                         out.push(ColumnMeta {
                             name: col.name.clone(),
@@ -2504,7 +2534,7 @@ fn build_join_column_meta(
                         name: qualifier.clone(),
                     })?;
                 let table = &all_tables[t_idx];
-                let outer_nullable = is_outer_nullable(t_idx, joins);
+                let outer_nullable = nullable_tables[t_idx];
                 for col in &table.columns {
                     out.push(ColumnMeta {
                         name: col.name.clone(),
@@ -2518,7 +2548,7 @@ fn build_join_column_meta(
             SelectItem::Expr { expr, alias } => {
                 let name = expr_column_name(expr, alias.as_deref());
                 // Infer type: plain column reference uses catalog type; others use Text fallback.
-                let (dt, nullable) = infer_expr_type_join(expr, all_tables, joins);
+                let (dt, nullable) = infer_expr_type_join(expr, all_tables, &nullable_tables);
                 out.push(ColumnMeta {
                     name,
                     data_type: dt,
@@ -2531,30 +2561,49 @@ fn build_join_column_meta(
     Ok(out)
 }
 
-/// Returns true if the table at `t_idx` can have NULLs due to its position
-/// in the join chain.
+/// Computes per-table outer-join nullability for a join chain.
 ///
-/// - Table 0 (FROM table): nullable if the first join is RIGHT.
-/// - Table `i` (i > 0, the i-th JOIN table): nullable if join[i-1] is LEFT.
-fn is_outer_nullable(t_idx: usize, joins: &[JoinClause]) -> bool {
-    if t_idx == 0 {
-        // FROM table is nullable if the first join is RIGHT.
-        joins
-            .first()
-            .is_some_and(|j| j.join_type == JoinType::Right)
-    } else {
-        // JOIN[t_idx-1] table is nullable if that join is LEFT.
-        joins
-            .get(t_idx - 1)
-            .is_some_and(|j| j.join_type == JoinType::Left)
+/// Returns a `Vec<bool>` of length `table_count` where `[i]` is `true` if
+/// table `i` can be null-extended by any join in the chain:
+///
+/// - `LEFT JOIN`: the right table becomes nullable.
+/// - `RIGHT JOIN`: all accumulated left tables (0..=join_idx) become nullable.
+/// - `FULL JOIN`: both sides become nullable.
+/// - `INNER` / `CROSS`: no side becomes nullable.
+///
+/// This replaces the old `is_outer_nullable(t_idx, joins)` helper which only
+/// looked at a single join and therefore produced wrong metadata for mixed
+/// outer-join chains and for `FULL JOIN`.
+fn compute_outer_nullable(table_count: usize, joins: &[JoinClause]) -> Vec<bool> {
+    let mut nullable = vec![false; table_count];
+    for (join_idx, join) in joins.iter().enumerate() {
+        let right_table = join_idx + 1;
+        match join.join_type {
+            JoinType::Inner | JoinType::Cross => {}
+            JoinType::Left => {
+                if right_table < table_count {
+                    nullable[right_table] = true;
+                }
+            }
+            JoinType::Right => {
+                nullable[..right_table.min(table_count)].fill(true);
+            }
+            JoinType::Full => {
+                nullable[..right_table.min(table_count)].fill(true);
+                if right_table < table_count {
+                    nullable[right_table] = true;
+                }
+            }
+        }
     }
+    nullable
 }
 
 /// Infers (DataType, nullable) for an expression in a JOIN context.
 fn infer_expr_type_join(
     expr: &Expr,
     all_tables: &[axiomdb_catalog::ResolvedTable],
-    joins: &[JoinClause],
+    nullable_tables: &[bool],
 ) -> (DataType, bool) {
     if let Expr::Column { col_idx, .. } = expr {
         // Find which table owns this col_idx and what the column type is.
@@ -2564,7 +2613,8 @@ fn infer_expr_type_join(
             if *col_idx < end {
                 let local_pos = col_idx - offset;
                 if let Some(col) = table.columns.get(local_pos) {
-                    let nullable = col.nullable || is_outer_nullable(t_idx, joins);
+                    let outer_nullable = nullable_tables.get(t_idx).copied().unwrap_or(false);
+                    let nullable = col.nullable || outer_nullable;
                     return (column_type_to_datatype(col.col_type), nullable);
                 }
             }

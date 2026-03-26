@@ -790,17 +790,169 @@ fn test_three_table_join() {
     assert_eq!(r[0][1], Value::Text("Widget".into()));
 }
 
+// ── FULL OUTER JOIN tests (Phase 4.8b) ───────────────────────────────────────
+
 #[test]
-fn test_full_outer_join_not_implemented() {
+fn test_full_outer_join_matched_and_unmatched_both_sides() {
+    // users: id=1,2,3;  orders: user_id=1,1,2,99
+    // FULL OUTER JOIN ON users.id = orders.user_id →
+    //   matched:   (1,10),(1,11),(2,12)
+    //   unmatched left:  (3, NULL)
+    //   unmatched right: (NULL, 13)
     let (mut storage, mut txn) = setup();
-    run("CREATE TABLE t (id INT)", &mut storage, &mut txn);
-    let err = run_result(
-        "SELECT * FROM t t1 FULL OUTER JOIN t t2 ON t1.id = t2.id",
+    setup_join_tables(&mut storage, &mut txn);
+
+    let result = rows(run(
+        "SELECT users.id, orders.id FROM users FULL OUTER JOIN orders ON users.id = orders.user_id ORDER BY users.id, orders.id",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(
+        result.len(),
+        5,
+        "3 matched + 1 unmatched left + 1 unmatched right"
+    );
+
+    // Row (NULL, 13) — unmatched right order
+    let unmatched_right: Vec<&Vec<Value>> = result.iter().filter(|r| r[0] == Value::Null).collect();
+    assert_eq!(unmatched_right.len(), 1);
+    assert_eq!(unmatched_right[0][1], Value::Int(13));
+
+    // Row (3, NULL) — unmatched left user Carol
+    let unmatched_left: Vec<&Vec<Value>> = result.iter().filter(|r| r[1] == Value::Null).collect();
+    assert_eq!(unmatched_left.len(), 1);
+    assert_eq!(unmatched_left[0][0], Value::Int(3));
+}
+
+#[test]
+fn test_full_outer_join_one_to_many_emits_all_matches() {
+    let (mut storage, mut txn) = setup();
+    setup_join_tables(&mut storage, &mut txn);
+
+    let result = rows(run(
+        "SELECT users.id, orders.id FROM users FULL OUTER JOIN orders ON users.id = orders.user_id WHERE users.id = 1 ORDER BY orders.id",
+        &mut storage,
+        &mut txn,
+    ));
+    // user 1 matches orders 10 and 11
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0][1], Value::Int(10));
+    assert_eq!(result[1][1], Value::Int(11));
+}
+
+#[test]
+fn test_full_outer_join_on_vs_where_semantics() {
+    // ON filters before null-extension; WHERE filters after.
+    // ON: users.id = orders.user_id → user 3 + order 99 remain unmatched
+    // WHERE users.id IS NOT NULL → drops the unmatched-right row (NULL, 13)
+    let (mut storage, mut txn) = setup();
+    setup_join_tables(&mut storage, &mut txn);
+
+    // With WHERE: only rows where users.id IS NOT NULL survive
+    let result = rows(run(
+        "SELECT users.id, orders.id FROM users FULL OUTER JOIN orders ON users.id = orders.user_id WHERE users.id IS NOT NULL ORDER BY users.id, orders.id",
+        &mut storage,
+        &mut txn,
+    ));
+    // matched: (1,10),(1,11),(2,12)  + unmatched-left: (3,NULL) → 4 rows
+    // the unmatched-right (NULL,13) is removed by WHERE
+    assert_eq!(result.len(), 4);
+    assert!(result.iter().all(|r| r[0] != Value::Null));
+}
+
+#[test]
+fn test_full_outer_join_using() {
+    // USING column must work via the executor-side USING path
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE a (id INT, val TEXT)", &mut storage, &mut txn);
+    run("CREATE TABLE b (id INT, score INT)", &mut storage, &mut txn);
+    run("INSERT INTO a VALUES (1, 'x')", &mut storage, &mut txn);
+    run("INSERT INTO a VALUES (2, 'y')", &mut storage, &mut txn);
+    run("INSERT INTO b VALUES (1, 10)", &mut storage, &mut txn);
+    run("INSERT INTO b VALUES (3, 30)", &mut storage, &mut txn);
+
+    let result = rows(run(
+        "SELECT a.id, b.id FROM a FULL OUTER JOIN b USING (id) ORDER BY a.id, b.id",
+        &mut storage,
+        &mut txn,
+    ));
+    // matched: (1, 1)
+    // unmatched left:  (2, NULL)
+    // unmatched right: (NULL, 3)
+    assert_eq!(result.len(), 3);
+    let matched: Vec<&Vec<Value>> = result
+        .iter()
+        .filter(|r| r[0] != Value::Null && r[1] != Value::Null)
+        .collect();
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0][0], Value::Int(1));
+}
+
+#[test]
+fn test_full_outer_join_select_star_nullability_metadata() {
+    // SELECT * over FULL JOIN must mark both sides as nullable.
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE l (id INT NOT NULL, v TEXT NOT NULL)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE TABLE r (id INT NOT NULL, w TEXT NOT NULL)",
+        &mut storage,
+        &mut txn,
+    );
+    run("INSERT INTO l VALUES (1, 'a')", &mut storage, &mut txn);
+    run("INSERT INTO r VALUES (2, 'b')", &mut storage, &mut txn);
+
+    let result = run_result(
+        "SELECT * FROM l FULL OUTER JOIN r ON l.id = r.id",
         &mut storage,
         &mut txn,
     )
-    .unwrap_err();
-    assert!(matches!(err, DbError::NotImplemented { .. }), "got {err:?}");
+    .unwrap();
+    if let QueryResult::Rows { columns, .. } = result {
+        // All 4 columns (l.id, l.v, r.id, r.w) must be nullable.
+        assert_eq!(columns.len(), 4);
+        for col in &columns {
+            assert!(
+                col.nullable,
+                "column '{}' must be nullable in FULL JOIN SELECT *",
+                col.name
+            );
+        }
+    } else {
+        panic!("expected Rows result");
+    }
+}
+
+#[test]
+fn test_full_outer_join_in_chain_with_left_join() {
+    // a FULL JOIN b ... LEFT JOIN c ... — chain must keep working.
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE a (id INT, v INT)", &mut storage, &mut txn);
+    run("CREATE TABLE b (id INT, v INT)", &mut storage, &mut txn);
+    run("CREATE TABLE c (id INT, v INT)", &mut storage, &mut txn);
+    run("INSERT INTO a VALUES (1, 10)", &mut storage, &mut txn);
+    run("INSERT INTO b VALUES (1, 20)", &mut storage, &mut txn);
+    run("INSERT INTO b VALUES (2, 30)", &mut storage, &mut txn);
+    run("INSERT INTO c VALUES (1, 40)", &mut storage, &mut txn);
+
+    let result = rows(run(
+        "SELECT a.id, b.id, c.id FROM a FULL OUTER JOIN b ON a.id = b.id LEFT JOIN c ON b.id = c.id ORDER BY a.id, b.id",
+        &mut storage,
+        &mut txn,
+    ));
+    // a(1) FULL b(1) → (1,1,_)  then LEFT c(1) → (1,1,1)
+    // a(NULL) FULL b(2) → (NULL,2,NULL)  then LEFT c → no match for id=2 → (NULL,2,NULL)
+    assert!(result.len() >= 2, "chain must produce multiple rows");
+    // The matched row must have all three IDs = 1
+    let fully_matched: Vec<&Vec<Value>> = result
+        .iter()
+        .filter(|r| r[0] != Value::Null && r[1] != Value::Null && r[2] != Value::Null)
+        .collect();
+    assert!(!fully_matched.is_empty());
+    assert_eq!(fully_matched[0][0], Value::Int(1));
 }
 
 // ── GROUP BY / Aggregate tests ────────────────────────────────────────────────
