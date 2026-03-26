@@ -648,6 +648,7 @@ SELECT @@transaction_isolation;  -- 'REPEATABLE-READ'
 |---|---|---|
 | `@@autocommit` | `1` | `1` = each statement auto-committed; `0` = explicit COMMIT required |
 | `@@in_transaction` | `0` | `1` when inside an active transaction, `0` otherwise |
+| `@@on_error` | `'rollback_statement'` | How statement errors affect the transaction (see [ON_ERROR](#on_error)) |
 | `@@version` | `'8.0.36-AxiomDB-0.1.0'` | Server version (MySQL 8 compatible format) |
 | `@@version_comment` | `'AxiomDB'` | Server variant |
 | `@@character_set_client` | `'utf8mb4'` | Client character set |
@@ -689,6 +690,111 @@ SELECT @@in_transaction;    -- 0 — transaction closed
 Use `@@in_transaction` to verify transaction state before issuing a `COMMIT` or
 `ROLLBACK`. This avoids the warning generated when `COMMIT` is called with no
 active transaction.
+
+### ON_ERROR
+
+`@@on_error` controls what happens to the current transaction when a statement
+fails. It applies to all pipeline stages: parse errors, semantic errors, and
+executor errors.
+
+```sql
+SET on_error = 'rollback_statement';    -- default
+SET on_error = 'rollback_transaction';
+SET on_error = 'savepoint';
+SET on_error = 'ignore';
+SET on_error = DEFAULT;                  -- reset to rollback_statement
+```
+
+Both quoted strings and bare identifiers are accepted:
+
+```sql
+SET on_error = rollback_statement;      -- same as 'rollback_statement'
+```
+
+#### Modes
+
+**`rollback_statement`** (default) — When a statement fails inside an active
+transaction, only that statement's writes are rolled back. The transaction stays
+open. This matches MySQL's statement-level rollback behavior.
+
+```sql
+BEGIN;
+INSERT INTO t VALUES (1);          -- ok
+INSERT INTO t VALUES (1);          -- ERROR: duplicate key
+-- transaction still active, id=1 is the only write that will commit
+INSERT INTO t VALUES (2);          -- ok
+COMMIT;                            -- commits id=1 and id=2
+```
+
+**`rollback_transaction`** — When any statement fails inside an active transaction,
+the entire transaction is rolled back immediately. `@@in_transaction` becomes 0.
+
+```sql
+SET on_error = 'rollback_transaction';
+
+BEGIN;
+INSERT INTO t VALUES (1);          -- ok
+INSERT INTO t VALUES (1);          -- ERROR: duplicate key → whole txn rolled back
+SELECT @@in_transaction;           -- 0 — transaction is gone
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Eager Rollback vs PostgreSQL Abort Latch</span>
+PostgreSQL keeps the transaction open after an error in a "aborted" state (SQLSTATE 25P02) where every subsequent statement returns <code>ERROR: current transaction is aborted</code> until the client sends ROLLBACK. AxiomDB's <code>rollback_transaction</code> uses eager rollback instead: the transaction is closed immediately on error, so the client starts fresh without needing an explicit ROLLBACK.
+</div>
+</div>
+
+**`savepoint`** — Same as `rollback_statement` when a transaction is already
+active. When `autocommit = 0`, the key difference appears on the **first** DML
+in an implicit transaction: `savepoint` preserves the implicit transaction after
+a failing first DML, while `rollback_statement` closes it.
+
+```sql
+SET autocommit = 0;
+SET on_error = 'savepoint';
+
+INSERT INTO t VALUES (999);        -- fails (dup key)
+SELECT @@in_transaction;           -- 1 — implicit txn stays open
+INSERT INTO t VALUES (1);          -- ok, continues in the same txn
+COMMIT;
+```
+
+**`ignore`** — Ignorable SQL errors (parse errors, semantic errors, constraint
+violations, type mismatches) are converted to session warnings and the statement
+is reported as success. Non-ignorable errors (I/O failures, WAL errors, storage
+corruption) still return ERR.
+
+```sql
+SET on_error = 'ignore';
+
+INSERT INTO t VALUES (1);          -- ok
+INSERT INTO t VALUES (1);          -- duplicate key → silently ignored
+SHOW WARNINGS;                     -- shows code 1062 + original message
+INSERT INTO t VALUES (2);          -- ok, continues
+COMMIT;                            -- commits id=1 and id=2
+```
+
+In a multi-statement `COM_QUERY`, `ignore` continues executing later statements
+after an ignored error.
+
+```sql
+-- Single COM_QUERY with three statements:
+INSERT INTO t VALUES (1); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2);
+-- First succeeds, second is ignored (dup), third succeeds.
+-- Only the ignored statement's OK packet carries warning_count > 0.
+```
+
+#### Inspecting the current mode
+
+```sql
+SELECT @@on_error;                  -- 'rollback_statement'
+SELECT @@session.on_error;          -- same
+SHOW VARIABLES LIKE 'on_error';     -- on_error | rollback_statement
+```
+
+`COM_RESET_CONNECTION` resets `@@on_error` to `rollback_statement`.
 
 ### Strict Mode
 

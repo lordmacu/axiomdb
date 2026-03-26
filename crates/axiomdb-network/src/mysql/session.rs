@@ -12,7 +12,8 @@ use std::collections::HashMap;
 
 use axiomdb_core::error::DbError;
 use axiomdb_sql::session::{
-    apply_strict_to_sql_mode, normalize_sql_mode, parse_boolish_setting, sql_mode_is_strict,
+    apply_strict_to_sql_mode, normalize_sql_mode, on_error_mode_name, parse_boolish_setting,
+    parse_on_error_setting, sql_mode_is_strict, OnErrorMode,
 };
 
 use super::charset::{self, CharsetDef, CollationDef, DEFAULT_SERVER_COLLATION};
@@ -89,6 +90,8 @@ pub struct ConnectionState {
     /// Collation used when encoding outbound result rows and metadata.
     /// Set at handshake time; changed by `SET NAMES` / `SET character_set_results`.
     results_collation: &'static CollationDef,
+    /// ON_ERROR mode for this connection (default: `RollbackStatement`).
+    on_error: OnErrorMode,
     /// Generic key=value session variables.
     pub variables: HashMap<String, String>,
     /// Prepared statements cached for this connection.
@@ -134,6 +137,7 @@ impl ConnectionState {
         variables.insert("time_zone".into(), "SYSTEM".into());
         variables.insert("sql_mode".into(), "STRICT_TRANS_TABLES".into());
         variables.insert("strict_mode".into(), "ON".into());
+        variables.insert("on_error".into(), "rollback_statement".into());
         variables.insert("transaction_isolation".into(), "REPEATABLE-READ".into());
         variables.insert("tx_isolation".into(), "REPEATABLE-READ".into());
         variables.insert("max_allowed_packet".into(), "67108864".into());
@@ -144,6 +148,7 @@ impl ConnectionState {
         Self {
             current_database: String::new(),
             autocommit: true,
+            on_error: OnErrorMode::RollbackStatement,
             client_charset: DEFAULT_SERVER_COLLATION.charset,
             connection_collation: DEFAULT_SERVER_COLLATION,
             results_collation: DEFAULT_SERVER_COLLATION,
@@ -351,6 +356,12 @@ impl ConnectionState {
                     self.variables
                         .insert("strict_mode".to_string(), strict_str.to_string());
                 }
+                "on_error" => {
+                    let mode = parse_on_error_setting(raw_val)?;
+                    self.on_error = mode;
+                    self.variables
+                        .insert("on_error".to_string(), on_error_mode_name(mode).to_string());
+                }
                 other => {
                     self.variables.insert(other.to_string(), value);
                 }
@@ -360,6 +371,11 @@ impl ConnectionState {
 
         // SET without '=' (e.g., SET TRANSACTION ...) — just accept
         Ok(true)
+    }
+
+    /// Returns the current `on_error` mode for this connection.
+    pub fn on_error(&self) -> OnErrorMode {
+        self.on_error
     }
 
     /// Returns the value of a session variable by name.

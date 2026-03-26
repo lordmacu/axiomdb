@@ -5,6 +5,136 @@ use std::collections::{HashMap, HashSet};
 use axiomdb_catalog::ResolvedTable;
 use axiomdb_core::error::DbError;
 
+// ── OnErrorMode ───────────────────────────────────────────────────────────────
+
+/// Per-session policy that controls how a statement error affects the current
+/// transaction and whether certain SQL errors are converted to warnings.
+///
+/// Set via `SET on_error = 'rollback_statement' | 'rollback_transaction' |
+/// 'savepoint' | 'ignore'`. Inspected via `SELECT @@on_error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnErrorMode {
+    /// **Default.** On statement error inside an active transaction, roll back
+    /// only that statement's writes and keep the transaction open. In
+    /// autocommit mode, the implicit single-statement transaction is rolled back.
+    #[default]
+    RollbackStatement,
+    /// On statement error inside an active transaction, roll back the entire
+    /// transaction eagerly. `@@in_transaction` becomes 0 after the error.
+    RollbackTransaction,
+    /// Like `RollbackStatement` when a transaction is already active.
+    /// When `autocommit = 0`, also preserves the implicit transaction after a
+    /// failing first DML — the key difference from `RollbackStatement`.
+    Savepoint,
+    /// Convert ignorable SQL/user errors into session warnings and return
+    /// success (OK packet with `warning_count > 0`). Non-ignorable errors
+    /// (I/O, WAL, corruption) still surface as ERR.
+    Ignore,
+}
+
+/// Parses a `SET on_error = ...` value into an [`OnErrorMode`].
+///
+/// Accepts quoted strings and bare identifiers in any case.
+/// `DEFAULT` resets to [`OnErrorMode::RollbackStatement`].
+pub fn parse_on_error_setting(raw: &str) -> Result<OnErrorMode, DbError> {
+    let s = raw
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    match s.as_str() {
+        "rollback_statement" | "default" => Ok(OnErrorMode::RollbackStatement),
+        "rollback_transaction" => Ok(OnErrorMode::RollbackTransaction),
+        "savepoint" => Ok(OnErrorMode::Savepoint),
+        "ignore" => Ok(OnErrorMode::Ignore),
+        _ => Err(DbError::InvalidValue {
+            reason: format!(
+                "invalid on_error value '{raw}'; expected \
+                 rollback_statement | rollback_transaction | savepoint | ignore"
+            ),
+        }),
+    }
+}
+
+/// Returns the canonical lowercase name of an [`OnErrorMode`] for `@@on_error`.
+pub fn on_error_mode_name(mode: OnErrorMode) -> &'static str {
+    match mode {
+        OnErrorMode::RollbackStatement => "rollback_statement",
+        OnErrorMode::RollbackTransaction => "rollback_transaction",
+        OnErrorMode::Savepoint => "savepoint",
+        OnErrorMode::Ignore => "ignore",
+    }
+}
+
+/// Returns `true` if `err` is a SQL/user-facing error that `on_error = 'ignore'`
+/// is allowed to suppress as a warning.
+///
+/// Non-ignorable errors (I/O, WAL, storage corruption, internal errors) are
+/// **always** returned as ERR even when `on_error = 'ignore'`.
+///
+/// This match is intentionally exhaustive so that new `DbError` variants force
+/// a conscious decision about their ignorability.
+pub fn is_ignorable_on_error(err: &DbError) -> bool {
+    match err {
+        // ── SQL / user-facing ─────────────────────────────────────────────────
+        DbError::ParseError { .. }
+        | DbError::TableNotFound { .. }
+        | DbError::ColumnNotFound { .. }
+        | DbError::AmbiguousColumn { .. }
+        | DbError::UniqueViolation { .. }
+        | DbError::DuplicateKey
+        | DbError::ForeignKeyViolation { .. }
+        | DbError::ForeignKeyParentViolation { .. }
+        | DbError::ForeignKeyCascadeDepth { .. }
+        | DbError::ForeignKeySetNullNotNullable { .. }
+        | DbError::ForeignKeyNoParentIndex { .. }
+        | DbError::NotNullViolation { .. }
+        | DbError::CheckViolation { .. }
+        | DbError::TypeMismatch { .. }
+        | DbError::InvalidValue { .. }
+        | DbError::InvalidCoercion { .. }
+        | DbError::DivisionByZero
+        | DbError::Overflow
+        | DbError::ValueTooLarge { .. }
+        | DbError::NoActiveTransaction
+        | DbError::TransactionAlreadyActive { .. }
+        | DbError::CardinalityViolation { .. }
+        | DbError::ColumnAlreadyExists { .. }
+        | DbError::TableAlreadyExists { .. }
+        | DbError::IndexAlreadyExists { .. }
+        | DbError::IndexKeyTooLong { .. }
+        | DbError::NotImplemented { .. } => true,
+
+        // ── Infrastructure / runtime — never ignorable ────────────────────────
+        DbError::PageNotFound { .. }
+        | DbError::ChecksumMismatch { .. }
+        | DbError::StorageFull
+        | DbError::DiskFull { .. }
+        | DbError::Io(_)
+        | DbError::FileLocked { .. }
+        | DbError::WalGroupCommitFailed { .. }
+        | DbError::WalChecksumMismatch { .. }
+        | DbError::WalEntryTruncated { .. }
+        | DbError::WalUnknownEntryType { .. }
+        | DbError::WalInvalidHeader { .. }
+        | DbError::DeadlockDetected
+        | DbError::TransactionExpired { .. }
+        | DbError::PermissionDenied { .. }
+        | DbError::HeapPageFull { .. }
+        | DbError::InvalidSlot { .. }
+        | DbError::AlreadyDeleted { .. }
+        | DbError::KeyTooLong { .. }
+        | DbError::BTreeCorrupted { .. }
+        | DbError::CatalogNotInitialized
+        | DbError::ColumnIndexOutOfBounds { .. }
+        | DbError::CatalogTableNotFound { .. }
+        | DbError::CatalogIndexNotFound { .. }
+        | DbError::SequenceOverflow
+        | DbError::Internal { .. }
+        | DbError::Other(_) => false,
+    }
+}
+
 // ── SqlWarning ────────────────────────────────────────────────────────────────
 
 /// A single SQL warning, surfaced via `SHOW WARNINGS`.
@@ -174,6 +304,12 @@ pub struct SessionContext {
     /// coercion, stores the result, and appends a SQL warning 1265 to the
     /// session. If permissive coercion also fails the error is returned.
     pub strict_mode: bool,
+    /// How statement errors affect the current transaction (default: `RollbackStatement`).
+    ///
+    /// Set via `SET on_error = 'rollback_statement' | 'rollback_transaction' |
+    /// 'savepoint' | 'ignore'`. Applied by the executor and by the network
+    /// pipeline (`database.rs`) to parse/analyze failures.
+    pub on_error: OnErrorMode,
     /// Warnings accumulated during the last statement.
     ///
     /// Cleared automatically before each new statement execution (in
@@ -195,6 +331,7 @@ impl SessionContext {
             cache: HashMap::new(),
             autocommit: true,
             strict_mode: true,
+            on_error: OnErrorMode::RollbackStatement,
             warnings: Vec::new(),
             stats: StaleStatsTracker::default(),
         }
@@ -257,6 +394,130 @@ mod tests {
     fn test_session_context_strict_mode_default_true() {
         let ctx = SessionContext::new();
         assert!(ctx.strict_mode, "strict_mode must default to true");
+    }
+
+    // ── on_error helpers ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_on_error_default() {
+        let ctx = SessionContext::new();
+        assert_eq!(ctx.on_error, OnErrorMode::RollbackStatement);
+    }
+
+    #[test]
+    fn test_parse_on_error_setting_all_variants() {
+        assert_eq!(
+            parse_on_error_setting("rollback_statement").unwrap(),
+            OnErrorMode::RollbackStatement
+        );
+        assert_eq!(
+            parse_on_error_setting("ROLLBACK_STATEMENT").unwrap(),
+            OnErrorMode::RollbackStatement
+        );
+        assert_eq!(
+            parse_on_error_setting("rollback_transaction").unwrap(),
+            OnErrorMode::RollbackTransaction
+        );
+        assert_eq!(
+            parse_on_error_setting("ROLLBACK_TRANSACTION").unwrap(),
+            OnErrorMode::RollbackTransaction
+        );
+        assert_eq!(
+            parse_on_error_setting("savepoint").unwrap(),
+            OnErrorMode::Savepoint
+        );
+        assert_eq!(
+            parse_on_error_setting("SAVEPOINT").unwrap(),
+            OnErrorMode::Savepoint
+        );
+        assert_eq!(
+            parse_on_error_setting("ignore").unwrap(),
+            OnErrorMode::Ignore
+        );
+        assert_eq!(
+            parse_on_error_setting("IGNORE").unwrap(),
+            OnErrorMode::Ignore
+        );
+    }
+
+    #[test]
+    fn test_parse_on_error_setting_default() {
+        assert_eq!(
+            parse_on_error_setting("DEFAULT").unwrap(),
+            OnErrorMode::RollbackStatement
+        );
+        assert_eq!(
+            parse_on_error_setting("default").unwrap(),
+            OnErrorMode::RollbackStatement
+        );
+    }
+
+    #[test]
+    fn test_parse_on_error_setting_quoted() {
+        assert_eq!(
+            parse_on_error_setting("'rollback_statement'").unwrap(),
+            OnErrorMode::RollbackStatement
+        );
+        assert_eq!(
+            parse_on_error_setting("\"savepoint\"").unwrap(),
+            OnErrorMode::Savepoint
+        );
+    }
+
+    #[test]
+    fn test_parse_on_error_setting_invalid() {
+        assert!(parse_on_error_setting("banana").is_err());
+        assert!(parse_on_error_setting("").is_err());
+        assert!(parse_on_error_setting("ignore_all").is_err());
+    }
+
+    #[test]
+    fn test_on_error_mode_name() {
+        assert_eq!(
+            on_error_mode_name(OnErrorMode::RollbackStatement),
+            "rollback_statement"
+        );
+        assert_eq!(
+            on_error_mode_name(OnErrorMode::RollbackTransaction),
+            "rollback_transaction"
+        );
+        assert_eq!(on_error_mode_name(OnErrorMode::Savepoint), "savepoint");
+        assert_eq!(on_error_mode_name(OnErrorMode::Ignore), "ignore");
+    }
+
+    #[test]
+    fn test_is_ignorable_on_error_sql_errors() {
+        use axiomdb_core::error::DbError;
+        assert!(is_ignorable_on_error(&DbError::ParseError {
+            message: "oops".into(),
+            position: None
+        }));
+        assert!(is_ignorable_on_error(&DbError::TableNotFound {
+            name: "t".into()
+        }));
+        assert!(is_ignorable_on_error(&DbError::UniqueViolation {
+            index_name: "idx".into(),
+            value: None
+        }));
+        assert!(is_ignorable_on_error(&DbError::DivisionByZero));
+        assert!(is_ignorable_on_error(&DbError::NotImplemented {
+            feature: "x".into()
+        }));
+    }
+
+    #[test]
+    fn test_is_ignorable_on_error_infrastructure_errors() {
+        use axiomdb_core::error::DbError;
+        assert!(!is_ignorable_on_error(&DbError::DiskFull {
+            operation: "write"
+        }));
+        assert!(!is_ignorable_on_error(&DbError::StorageFull));
+        assert!(!is_ignorable_on_error(&DbError::Internal {
+            message: "bad".into()
+        }));
+        assert!(!is_ignorable_on_error(&DbError::WalGroupCommitFailed {
+            message: "fsync failed".into()
+        }));
     }
 
     #[test]
