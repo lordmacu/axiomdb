@@ -7,6 +7,17 @@
 //!   3. Covered queries work for equality, range, and partial-index scenarios.
 //!   4. Non-covered queries still fall back to IndexLookup / Scan.
 //!   5. MVCC visibility is respected (deleted / uncommitted rows are hidden).
+//!
+//! ## Important: two test paths
+//!
+//! Tests using `execute` (non-ctx) pass `select_col_idxs = &[]` to the planner,
+//! which prevents `index_covers_query` from returning true → IndexOnlyScan is
+//! **never** selected on the non-ctx path. Those tests exercise IndexLookup /
+//! IndexRange / Scan fallback.
+//!
+//! Tests using `execute_with_ctx` (ctx path) supply the real `select_col_idxs`
+//! and **actually exercise IndexOnlyScan** when all SELECT columns are covered.
+//! The ctx-path section at the bottom of this file contains these real tests.
 
 use axiomdb_catalog::{CatalogBootstrap, CatalogReader};
 use axiomdb_core::error::DbError;
@@ -404,5 +415,493 @@ fn test_decode_index_key_float_roundtrip() {
     match decoded[0] {
         Value::Real(f) => assert!((f - 3.14).abs() < 1e-10),
         ref x => panic!("expected Float, got {x:?}"),
+    }
+}
+
+// ── Ctx-path tests: IndexOnlyScan actually exercised ─────────────────────────
+//
+// These tests use execute_with_ctx so the planner receives the real
+// select_col_idxs and selects AccessMethod::IndexOnlyScan when coverage holds.
+// The index is created BEFORE inserts so stats.row_count = 0 at creation time;
+// the stats_cost_gate treats 0 as "no reliable stats" and conservatively allows
+// the index — ensuring IndexOnlyScan is chosen even for small tables.
+
+use axiomdb_sql::{bloom::BloomRegistry, execute_with_ctx, session::SessionContext};
+
+fn setup_ctx() -> (MemoryStorage, TxnManager, BloomRegistry, SessionContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.into_path().join("test.wal");
+    let mut storage = MemoryStorage::new();
+    CatalogBootstrap::init(&mut storage).unwrap();
+    let txn = TxnManager::create(&wal_path).unwrap();
+    (storage, txn, BloomRegistry::new(), SessionContext::new())
+}
+
+fn rctx(
+    sql: &str,
+    storage: &mut MemoryStorage,
+    txn: &mut TxnManager,
+    bloom: &mut BloomRegistry,
+    ctx: &mut SessionContext,
+) -> QueryResult {
+    let stmt = parse(sql, None).unwrap_or_else(|e| panic!("parse failed: {sql}\n{e:?}"));
+    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let analyzed =
+        analyze(stmt, storage, snap).unwrap_or_else(|e| panic!("analyze failed: {sql}\n{e:?}"));
+    execute_with_ctx(analyzed, storage, txn, bloom, ctx)
+        .unwrap_or_else(|e| panic!("execute failed: {sql}\n{e:?}"))
+}
+
+/// Helper: collect rows from a QueryResult.
+fn rrows(r: QueryResult) -> Vec<Vec<Value>> {
+    match r {
+        QueryResult::Rows { rows, .. } => rows,
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
+// ── Single-column INT index, equality ────────────────────────────────────────
+
+#[test]
+fn test_ctx_index_only_equality_int() {
+    // Table: (id INT, age INT, name TEXT) — index on age (col_idx=1).
+    // SELECT age WHERE age = 25 → all projected cols in index → IndexOnlyScan.
+    // Row layout: col_idx 0=id, 1=age, 2=name.
+    // IndexOnlyScan must place age at row[1], not row[0].
+    let (mut st, mut tx, mut bl, mut ctx) = setup_ctx();
+    rctx(
+        "CREATE TABLE u1 (id INT, age INT, name TEXT)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "CREATE INDEX idx_age1 ON u1 (age)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO u1 VALUES (1, 25, 'alice')",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO u1 VALUES (2, 30, 'bob')",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO u1 VALUES (3, 25, 'carol')",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+
+    let r = rrows(rctx(
+        "SELECT age FROM u1 WHERE age = 25",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    ));
+    assert_eq!(r.len(), 2, "rows={r:?}");
+    // age is col_idx=1 in the table; IndexOnlyScan must return it at row[1].
+    // project_grouped_row / eval projects SELECT age → output row[0] = age value.
+    for row in &r {
+        assert_eq!(row[0], Value::Int(25), "rows={r:?}");
+    }
+}
+
+// ── Single-column TEXT index, equality ───────────────────────────────────────
+
+#[test]
+fn test_ctx_index_only_equality_text() {
+    // Table: (id INT, tag TEXT) — index on tag (col_idx=1).
+    // SELECT tag WHERE tag = 'rust' → IndexOnlyScan.
+    let (mut st, mut tx, mut bl, mut ctx) = setup_ctx();
+    rctx(
+        "CREATE TABLE t1 (id INT, tag TEXT)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "CREATE INDEX idx_tag1 ON t1 (tag)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO t1 VALUES (1, 'rust')",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO t1 VALUES (2, 'go')",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO t1 VALUES (3, 'rust')",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+
+    let r = rrows(rctx(
+        "SELECT tag FROM t1 WHERE tag = 'rust'",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    ));
+    assert_eq!(r.len(), 2, "rows={r:?}");
+    for row in &r {
+        assert_eq!(row[0], Value::Text("rust".into()), "rows={r:?}");
+    }
+}
+
+// ── Single-column index, range scan ──────────────────────────────────────────
+
+#[test]
+fn test_ctx_index_only_range() {
+    // Table: (id INT, score INT) — index on score (col_idx=1).
+    // SELECT score WHERE score >= 20 AND score <= 40 → IndexOnlyScan (range).
+    let (mut st, mut tx, mut bl, mut ctx) = setup_ctx();
+    rctx(
+        "CREATE TABLE sc1 (id INT, score INT)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "CREATE INDEX idx_score1 ON sc1 (score)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    for (i, s) in [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)] {
+        rctx(
+            &format!("INSERT INTO sc1 VALUES ({i}, {s})"),
+            &mut st,
+            &mut tx,
+            &mut bl,
+            &mut ctx,
+        );
+    }
+
+    let r = rrows(rctx(
+        "SELECT score FROM sc1 WHERE score >= 20 AND score <= 40",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    ));
+    assert_eq!(r.len(), 3, "rows={r:?}");
+    let mut vals: Vec<i32> = r
+        .iter()
+        .map(|row| match row[0] {
+            Value::Int(v) => v,
+            ref x => panic!("unexpected {x:?}"),
+        })
+        .collect();
+    vals.sort_unstable();
+    assert_eq!(vals, vec![20, 30, 40]);
+}
+
+// ── WHERE clause re-evaluation uses correct column ───────────────────────────
+
+#[test]
+fn test_ctx_index_only_where_col_idx_correct() {
+    // Regression: IndexOnlyScan used to return compressed rows at output
+    // positions (0,1,...) instead of table col_idx positions. This caused
+    // WHERE re-evaluation to access the wrong column.
+    //
+    // Table: (id INT, x INT) — col_idx 0=id, 1=x.
+    // SELECT x WHERE x = 42 → IndexOnlyScan on idx(x).
+    // WHERE x=42 uses Expr::Column{col_idx:1}; row must have x at row[1].
+    let (mut st, mut tx, mut bl, mut ctx) = setup_ctx();
+    rctx(
+        "CREATE TABLE t2 (id INT PRIMARY KEY, x INT)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "CREATE UNIQUE INDEX idx_x2 ON t2 (x)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    for i in 1..=10 {
+        rctx(
+            &format!("INSERT INTO t2 VALUES ({i}, {})", i * 10),
+            &mut st,
+            &mut tx,
+            &mut bl,
+            &mut ctx,
+        );
+    }
+
+    let r = rrows(rctx(
+        "SELECT x FROM t2 WHERE x = 42",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    ));
+    // x=42 doesn't exist (we inserted 10,20,...,100).
+    assert_eq!(r.len(), 0, "rows={r:?}");
+
+    let r2 = rrows(rctx(
+        "SELECT x FROM t2 WHERE x = 40",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    ));
+    assert_eq!(r2.len(), 1, "rows={r2:?}");
+    assert_eq!(r2[0][0], Value::Int(40));
+}
+
+// ── Composite index, equality — all key cols in SELECT ───────────────────────
+
+#[test]
+fn test_ctx_index_only_composite_equality() {
+    // Table: (id INT, region TEXT, dept TEXT) — composite index on (region, dept).
+    // SELECT region, dept WHERE region = 'east' AND dept = 'eng' → IndexOnlyScan.
+    // region=col_idx=1, dept=col_idx=2 in table.
+    let (mut st, mut tx, mut bl, mut ctx) = setup_ctx();
+    rctx(
+        "CREATE TABLE emp2 (id INT, region TEXT, dept TEXT)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "CREATE INDEX idx_rd ON emp2 (region, dept)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO emp2 VALUES (1, 'east', 'eng')",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO emp2 VALUES (2, 'east', 'hr')",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO emp2 VALUES (3, 'west', 'eng')",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+
+    let r = rrows(rctx(
+        "SELECT region, dept FROM emp2 WHERE region = 'east' AND dept = 'eng'",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    ));
+    assert_eq!(r.len(), 1, "rows={r:?}");
+    assert_eq!(r[0][0], Value::Text("east".into()), "rows={r:?}");
+    assert_eq!(r[0][1], Value::Text("eng".into()), "rows={r:?}");
+}
+
+// ── Non-covered SELECT falls back to heap ────────────────────────────────────
+
+#[test]
+fn test_ctx_non_covered_falls_back_to_heap() {
+    // SELECT id (not in index) → no IndexOnlyScan; full row from heap.
+    // Verifies coverage check rejects non-covered queries on ctx path too.
+    let (mut st, mut tx, mut bl, mut ctx) = setup_ctx();
+    rctx(
+        "CREATE TABLE emp3 (id INT, dept TEXT, salary INT)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "CREATE INDEX idx_dept3 ON emp3 (dept)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO emp3 VALUES (1, 'eng', 90000)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO emp3 VALUES (2, 'hr',  60000)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+
+    // salary is not in the index → full heap row needed.
+    let r = rrows(rctx(
+        "SELECT dept, salary FROM emp3 WHERE dept = 'eng'",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    ));
+    assert_eq!(r.len(), 1, "rows={r:?}");
+    assert_eq!(r[0][0], Value::Text("eng".into()));
+    assert_eq!(r[0][1], Value::Int(90000));
+}
+
+// ── MVCC: deleted rows are hidden ────────────────────────────────────────────
+
+#[test]
+fn test_ctx_index_only_mvcc_delete() {
+    // IndexOnlyScan checks slot visibility (is_slot_visible) without reading
+    // the full heap row. Deleted rows must not appear in results.
+    let (mut st, mut tx, mut bl, mut ctx) = setup_ctx();
+    rctx(
+        "CREATE TABLE ev2 (id INT, ts INT)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "CREATE INDEX idx_ts2 ON ev2 (ts)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO ev2 VALUES (1, 100)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO ev2 VALUES (2, 200)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO ev2 VALUES (3, 100)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    // Delete id=1 (ts=100).
+    rctx(
+        "DELETE FROM ev2 WHERE id = 1",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+
+    let r = rrows(rctx(
+        "SELECT ts FROM ev2 WHERE ts = 100",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    ));
+    assert_eq!(r.len(), 1, "deleted row must not appear; rows={r:?}");
+    assert_eq!(r[0][0], Value::Int(100));
+}
+
+// ── NULL values skipped in index, correct result ─────────────────────────────
+
+#[test]
+fn test_ctx_index_only_null_skipped() {
+    // NULL values are not inserted into the B-Tree index.
+    // An equality lookup for a non-NULL value must not return rows with NULL.
+    let (mut st, mut tx, mut bl, mut ctx) = setup_ctx();
+    rctx(
+        "CREATE TABLE t3 (id INT, val INT)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "CREATE INDEX idx_val3 ON t3 (val)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO t3 VALUES (1, 10)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO t3 VALUES (2, NULL)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO t3 VALUES (3, 10)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+
+    let r = rrows(rctx(
+        "SELECT val FROM t3 WHERE val = 10",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    ));
+    assert_eq!(r.len(), 2, "rows={r:?}");
+    for row in &r {
+        assert_eq!(row[0], Value::Int(10), "rows={r:?}");
     }
 }
