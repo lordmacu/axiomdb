@@ -1,10 +1,38 @@
-# B+ Tree (Copy-on-Write)
+# B+ Tree — Hybrid Write Model
 
 AxiomDB's indexing layer is a persistent B+ Tree implemented over the `StorageEngine`
-trait. Every index — including primary key and unique constraint indexes — is one
-such tree. The tree is Copy-on-Write: writes never modify existing pages in place.
-Instead, they create new pages for each node on the path from root to the modified
-leaf, then atomically swap the root.
+trait. Every index — including primary key and unique constraint indexes — is one such
+tree.
+
+## Write model (Phase 5)
+
+The tree uses a **hybrid write model** that minimizes page I/O on the hot path while
+keeping structural operations (splits, merges, rotations) on the safe allocate-new path:
+
+| Operation | Write path | Alloc/free |
+|-----------|-----------|-----------|
+| Insert, no leaf split | In-place: same leaf page ID | 0 alloc / 0 free |
+| Insert, child split absorbed by non-full parent | In-place: same parent page ID | 0 alloc / 0 free for the parent |
+| Insert, leaf or internal split | Structural: alloc 2 new pages, free 1 | 2 alloc / 1 free |
+| Delete, leaf stays ≥ MIN_KEYS_LEAF | In-place: same leaf page ID | 0 alloc / 0 free |
+| Delete, parent pointer unchanged after child delete | Skip parent rewrite entirely | 0 alloc / 0 free for the parent |
+| Delete, leaf underflows → rebalance | Structural: alloc new leaf | 1 alloc / 1 free |
+
+This is the Phase 5 model for a serialized single writer (`&mut self`). Phase 7 will
+reintroduce the full Copy-on-Write path to reconcile with lock-free readers and epoch
+reclamation.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Hybrid, Not Pure CoW</span>
+The original Phase 2 design was fully Copy-on-Write — every write allocated a new page
+and freed the old one. Phase 5.17 introduces in-place writes for non-structural operations
+because the Phase 5 runtime is single-writer (<code>&mut self</code> on all mutations).
+Lock-free readers and epoch-based reclamation (Phase 7) will determine how much of the
+in-place model can be retained under concurrent read traffic.
+</div>
+</div>
 
 ---
 

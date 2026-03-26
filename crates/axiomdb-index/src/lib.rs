@@ -13,4 +13,4 @@ mod iter;
 mod tree;
 
 pub use iter::RangeIter;
-pub use tree::BTree;
+pub use tree::{fill_threshold, BTree};
