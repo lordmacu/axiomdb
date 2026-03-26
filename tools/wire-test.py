@@ -3,7 +3,7 @@
 AxiomDB wire protocol test.
 Updated at each subphase close — always overwrite this file, never create new ones.
 
-Last updated: subphase 4.9b (sort-based GROUP BY: indexed sorted path + hash fallback regressions)
+Last updated: subphase 4.10e (ORDER BY + GROUP BY: remap col_idx to output position in grouped executors)
 """
 import os
 import signal
@@ -457,41 +457,43 @@ for i in range(16, 31):
 for i in range(31, 46):
     cur.execute("INSERT INTO sb_emp VALUES (%s, 'sales', %s)", (i, 70000 + i))
 
-# COUNT GROUP BY on indexed column — sort by dept in Python
+# COUNT GROUP BY on indexed column with ORDER BY
 cur.execute(
     "SELECT dept, COUNT(*) AS cnt "
     "FROM sb_emp "
-    "GROUP BY dept"
+    "GROUP BY dept "
+    "ORDER BY dept ASC"
 )
-rows_gb = sorted(cur.fetchall(), key=lambda r: r[0])
+rows_gb = cur.fetchall()
 ok("4.9b: GROUP BY indexed col row count", len(rows_gb) == 3, rows_gb)
 ok("4.9b: GROUP BY dept=eng count=15", rows_gb[0][1] == 15, rows_gb[0])
 ok("4.9b: GROUP BY dept=hr count=15", rows_gb[1][1] == 15, rows_gb[1])
 ok("4.9b: GROUP BY dept=sales count=15", rows_gb[2][1] == 15, rows_gb[2])
 
-# SUM GROUP BY on indexed column — sort by dept in Python (ORDER BY + GROUP BY
-# uses table col_idx which mismatches projected output order — pre-existing limitation).
+# SUM GROUP BY on indexed column with ORDER BY
 cur.execute(
     "SELECT dept, SUM(salary) "
     "FROM sb_emp "
-    "GROUP BY dept"
+    "GROUP BY dept "
+    "ORDER BY dept ASC"
 )
-rows_sum = sorted(cur.fetchall(), key=lambda r: r[0])
+rows_sum = cur.fetchall()
 ok("4.9b: GROUP BY SUM row count", len(rows_sum) == 3, rows_sum)
 # eng salaries: 80001..80015 → sum = 15*80000 + sum(1..15) = 1200000 + 120 = 1200120
 ok("4.9b: GROUP BY SUM eng correct", int(rows_sum[0][1]) == 1200120, rows_sum[0])
 
-# HAVING with sorted path
+# HAVING with sorted path + ORDER BY
 cur.execute(
     "SELECT dept, COUNT(*) AS cnt "
     "FROM sb_emp "
     "GROUP BY dept "
-    "HAVING COUNT(*) >= 15"
+    "HAVING COUNT(*) >= 15 "
+    "ORDER BY dept ASC"
 )
 rows_hav = cur.fetchall()
 ok("4.9b: HAVING with sorted GROUP BY returns 3 depts", len(rows_hav) == 3, rows_hav)
 
-# GROUP BY without usable index (plain scan / hash strategy) still correct
+# GROUP BY without usable index (plain scan / hash strategy) + ORDER BY
 cur.execute("DROP TABLE IF EXISTS sb_noindex")
 cur.execute("CREATE TABLE sb_noindex (id INT, cat TEXT, val INT)")
 for i in range(1, 11):
@@ -501,9 +503,10 @@ for i in range(11, 21):
 cur.execute(
     "SELECT cat, COUNT(*) "
     "FROM sb_noindex "
-    "GROUP BY cat"
+    "GROUP BY cat "
+    "ORDER BY cat ASC"
 )
-rows_noix = sorted(cur.fetchall(), key=lambda r: r[0])
+rows_noix = cur.fetchall()
 ok("4.9b: hash GROUP BY (no index) still correct count", len(rows_noix) == 2, rows_noix)
 ok("4.9b: hash GROUP BY cat=a count=10", rows_noix[0][1] == 10, rows_noix[0])
 ok("4.9b: hash GROUP BY cat=b count=10", rows_noix[1][1] == 10, rows_noix[1])
