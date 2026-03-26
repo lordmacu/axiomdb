@@ -390,11 +390,10 @@ mod tests {
         // A string that starts with NUL should sort AFTER Null (tag 0x08 > 0x00)
         // and the NUL byte should be escaped, not terminate early.
         let s_with_nul = Value::Text("\x00z".into());
-        let s_plain = Value::Text("a".into());
         // \x00z encodes as [0x08, 0xFF, 0x00, 'z', 0x00]
         // "a"   encodes as [0x08, 'a', 0x00]
         // 0xFF > 'a' so "\x00z" > "a"
-        assert_order(&[Value::Text("".into())], &[s_with_nul.clone()]);
+        assert_order(&[Value::Text("".into())], std::slice::from_ref(&s_with_nul));
         let encoded = enc(&[s_with_nul]);
         // Ensure no premature NUL terminator (byte at index 2 should be 0x00 not 0x00-as-terminator)
         assert_eq!(encoded[1], 0xFF, "NUL escape first byte should be 0xFF");

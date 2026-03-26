@@ -58,3 +58,10 @@
   - why the AxiomDB adaptation is safer or better for the current architecture
 - Do not optimize only for speed in a critical subphase. Preserve invariants first, then derive the fast path from a correctness-safe design.
 - If one approach is faster but weakens rollback, FK correctness, index consistency, or recovery guarantees, reject it unless the spec explicitly opens a follow-up phase to recover those guarantees.
+
+## 2026-03-26 - Large Rust module splits can be staged safely
+
+- When a monolithic Rust module has too many private cross-dependencies, a directory module plus `include!` can be a good first refactor step.
+- The goal of the first split is file-level responsibility and reviewability, not perfect visibility boundaries on day one.
+- Keep the public facade stable first (`mod.rs` with the old exported functions), then tighten internal visibility in later cleanup if needed.
+- This avoids mixing a readability refactor with accidental behavior changes.

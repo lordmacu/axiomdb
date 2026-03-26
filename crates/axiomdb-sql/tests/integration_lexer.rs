@@ -5,7 +5,7 @@ use axiomdb_sql::{tokenize, Token};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn tokens(input: &str) -> Vec<Token> {
+fn tokens(input: &str) -> Vec<Token<'_>> {
     tokenize(input, None)
         .unwrap()
         .into_iter()
@@ -180,7 +180,7 @@ fn test_integer_large() {
 
 #[test]
 fn test_float_decimal() {
-    assert_eq!(tokens("3.14")[0], Token::Float(3.14));
+    assert_eq!(tokens("3.14")[0], Token::Float(314_f64 / 100.0));
 }
 
 #[test]

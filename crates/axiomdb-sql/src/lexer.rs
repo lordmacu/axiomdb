@@ -522,7 +522,7 @@ pub fn tokenize<'src>(
 mod tests {
     use super::*;
 
-    fn tok(input: &str) -> Vec<Token> {
+    fn tok(input: &str) -> Vec<Token<'_>> {
         tokenize(input, None)
             .unwrap()
             .into_iter()
@@ -579,7 +579,10 @@ mod tests {
 
     #[test]
     fn test_float_dot() {
-        assert_eq!(tok("3.14")[0], Token::Float(3.14));
+        assert!(matches!(
+            tok("3.14")[0],
+            Token::Float(f) if (f - (314.0 / 100.0)).abs() < f64::EPSILON
+        ));
     }
 
     #[test]
