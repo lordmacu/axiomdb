@@ -809,6 +809,40 @@ metadata — the tag bytes carry all necessary type information. This is the
 same approach used by SQLite's record format and RocksDB's comparator-encoded
 keys.
 
+### Full-Width Row Layout in IndexOnlyScan Output
+
+IndexOnlyScan emits **full-width rows** — the same width as a heap row — with
+index key column values placed at their table `col_idx` positions and `NULL`
+everywhere else. This is required because downstream operators (WHERE
+re-evaluation, projection, expression evaluator) all address columns by their
+original table column index, not by SELECT output position.
+
+```
+table: (id INT [0], name TEXT [1], age INT [2], dept TEXT [3])
+index: ON (age, dept)  ← covers col_idx 2 and 3
+
+IndexOnlyScan emits: [NULL, NULL, <age_val>, <dept_val>]
+                      col0  col1    col2         col3
+```
+
+If the executor placed decoded values at positions `0, 1, ...` instead, a
+`WHERE age > 25` re-evaluation would read `col_idx=2` from a 2-element row and
+panic with `ColumnIndexOutOfBounds`. The full-width layout eliminates this class
+of error entirely.
+
+### `execute_with_ctx` — Required for IndexOnlyScan Selection
+
+The planner selects `IndexOnlyScan` only when `select_col_idxs` (the set of
+columns touched by the query) is a subset of the index's key columns. The
+`select_col_idxs` argument is supplied by `execute_with_ctx`; the simpler
+`execute` entry-point passes an empty slice, so IndexOnlyScan is never selected
+through it.
+
+Test coverage for this path lives in
+`crates/axiomdb-sql/tests/integration_index_only.rs` — functions prefixed
+`test_ctx_` use `execute_with_ctx` with real `select_col_idxs` and are the
+only tests that exercise the `IndexOnlyScan` access method end-to-end.
+
 ---
 
 ## Non-Unique Secondary Index Key Format
