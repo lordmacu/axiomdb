@@ -813,7 +813,6 @@ mod tests {
     fn test_int_column_def_uses_binary_collation_id() {
         let col = ColumnMeta::computed("n".to_string(), DataType::Int);
         let def = build_column_def(&col, DEFAULT_SERVER_COLLATION);
-        let charset_id = u16::from_le_bytes([def[17], def[18]]);
         // Position: catalog(4) + schema(1) + table(1) + org_table(1) + name(2) + org_name(2) + lenenc_0x0c(1) = 12 offset?
         // Let me just verify it's NOT 255 (text collation) and IS 63.
         // Actually let me compute: "def" → 0x03 0x64 0x65 0x66 (4 bytes)

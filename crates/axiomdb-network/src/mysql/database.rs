@@ -322,6 +322,12 @@ impl Database {
                 session.warn(code, message);
                 Ok((QueryResult::Empty, None))
             }
+            OnErrorMode::Ignore => {
+                if self.txn.active_txn_id().is_some() {
+                    let _ = self.txn.rollback(&mut self.storage);
+                }
+                Err(err)
+            }
             _ => {
                 // RollbackStatement / Savepoint / Ignore non-ignorable:
                 // executor already handled statement-level rollback where applicable.
@@ -450,4 +456,77 @@ fn stmt_may_mutate(stmt: &Stmt) -> bool {
         stmt,
         Stmt::Select(_) | Stmt::ShowTables(_) | Stmt::ShowColumns(_) | Stmt::Set(_)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use axiomdb_core::error::DbError;
+    use axiomdb_sql::{SchemaCache, SessionContext};
+
+    use super::{Database, OnErrorMode, QueryResult};
+
+    fn open_db() -> (tempfile::TempDir, Database) {
+        let dir = tempdir().expect("temp dir");
+        let db = Database::open(dir.path()).expect("open db");
+        (dir, db)
+    }
+
+    #[test]
+    fn test_ignore_parse_error_becomes_warning_and_keeps_txn_open() {
+        let (_dir, mut db) = open_db();
+        let mut session = SessionContext::new();
+        let mut cache = SchemaCache::default();
+
+        session.on_error = OnErrorMode::Ignore;
+        db.txn.begin().expect("begin txn");
+
+        let result = db
+            .execute_query("SELEC 1", &mut session, &mut cache)
+            .expect("ignore parse error returns success");
+
+        assert!(
+            matches!(result.0, QueryResult::Empty),
+            "ignored parse error must serialize as Empty/OK"
+        );
+        assert!(
+            db.txn.active_txn_id().is_some(),
+            "ignorable parse error must keep active txn open in ignore mode"
+        );
+        assert_eq!(session.warning_count(), 1);
+        assert_eq!(session.warnings[0].code, 1064);
+        assert!(
+            session.warnings[0]
+                .message
+                .to_ascii_lowercase()
+                .contains("error in your sql syntax"),
+            "warning should preserve original error text: {}",
+            session.warnings[0].message
+        );
+    }
+
+    #[test]
+    fn test_ignore_non_ignorable_error_rolls_back_active_txn() {
+        let (_dir, mut db) = open_db();
+        let mut session = SessionContext::new();
+
+        session.on_error = OnErrorMode::Ignore;
+        db.txn.begin().expect("begin txn");
+
+        let err = db
+            .apply_on_error_pipeline_failure(
+                "INSERT INTO t VALUES (1)",
+                &mut session,
+                DbError::DiskFull { operation: "test" },
+            )
+            .expect_err("disk full must still return ERR");
+
+        assert!(matches!(err, DbError::DiskFull { .. }));
+        assert!(
+            db.txn.active_txn_id().is_none(),
+            "non-ignorable ignore error must eagerly roll back the txn"
+        );
+        assert_eq!(session.warning_count(), 0);
+    }
 }

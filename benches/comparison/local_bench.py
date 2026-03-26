@@ -77,7 +77,7 @@ DDL_CREATE_PG = """CREATE TABLE bench_users (
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def connect_mysql(cfg):    return pymysql.connect(**cfg)
+def connect_mysql(cfg):    return pymysql.connect(connect_timeout=3, **cfg)
 def connect_pg(cfg):
     c = psycopg2.connect(**cfg)
     c.autocommit = True
