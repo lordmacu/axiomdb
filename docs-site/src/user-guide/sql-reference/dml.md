@@ -697,6 +697,8 @@ SELECT @@transaction_isolation;  -- 'REPEATABLE-READ'
 | Variable | Default | Description |
 |---|---|---|
 | `@@autocommit` | `1` | `1` = each statement auto-committed; `0` = explicit COMMIT required |
+| `@@axiom_compat` | `'standard'` | Compatibility mode — controls default session collation (see [AXIOM_COMPAT](#axiom_compat)) |
+| `@@collation` | `'binary'` | Executor-visible text semantics — `binary` or `es` (see [AXIOM_COMPAT](#axiom_compat)) |
 | `@@in_transaction` | `0` | `1` when inside an active transaction, `0` otherwise |
 | `@@on_error` | `'rollback_statement'` | How statement errors affect the transaction (see [ON_ERROR](#on_error)) |
 | `@@version` | `'8.0.36-AxiomDB-0.1.0'` | Server version (MySQL 8 compatible format) |
@@ -740,6 +742,67 @@ SELECT @@in_transaction;    -- 0 — transaction closed
 Use `@@in_transaction` to verify transaction state before issuing a `COMMIT` or
 `ROLLBACK`. This avoids the warning generated when `COMMIT` is called with no
 active transaction.
+
+### AXIOM_COMPAT and collation
+
+`@@axiom_compat` controls the high-level compatibility behavior of the session.
+`@@collation` controls how text values are compared, sorted, and grouped.
+
+```sql
+SET AXIOM_COMPAT = 'mysql';          -- CI+AI text semantics (default collation = 'es')
+SET AXIOM_COMPAT = 'postgresql';     -- exact binary text semantics
+SET AXIOM_COMPAT = 'standard';       -- default AxiomDB behavior (binary)
+SET AXIOM_COMPAT = DEFAULT;          -- reset to 'standard'
+
+SET collation = 'es';                -- explicit CI+AI fold for this session
+SET collation = 'binary';            -- explicit exact byte order
+SET collation = DEFAULT;             -- restore compat-derived default
+```
+
+#### `binary` collation (default)
+
+Exact byte-order string comparison — current AxiomDB default:
+
+- `'a' != 'A'`, `'a' != 'á'`
+- `LIKE` is case-sensitive and accent-sensitive
+- `GROUP BY`, `DISTINCT`, `ORDER BY`, `MIN/MAX(TEXT)` all use raw byte order
+
+#### `es` collation — CI+AI fold
+
+A lightweight session-level CI+AI fold: NFC normalize → lowercase → strip combining
+accent marks. No ICU / CLDR dependency.
+
+- `'Jose' = 'JOSE' = 'José'` compare equal
+- `LIKE 'jos%'` matches `José`
+- `GROUP BY`, `DISTINCT`, `COUNT(DISTINCT ...)` collapse accent/case variants into one group
+- `ORDER BY` sorts by folded text first, raw text as a tie-break for determinism
+- `MIN/MAX(TEXT)` and `GROUP_CONCAT(DISTINCT/ORDER BY ...)` respect the fold
+
+```sql
+-- Binary (default): José and jose are different rows
+SELECT name FROM users GROUP BY name;
+-- → 'José', 'jose', 'JOSE'
+
+-- Es: all three fold to "jose" — one group
+SET AXIOM_COMPAT = 'mysql';
+SELECT name FROM users GROUP BY name;
+-- → 'José'   (or whichever variant appears first)
+
+-- Explicit collation independent of compat mode:
+SET collation = 'es';
+SELECT * FROM products WHERE name = 'widget';  -- matches Widget, WIDGET, wídget
+```
+
+**Index safety:** When `@@collation = 'es'`, AxiomDB automatically falls back from text
+index lookups to full table scans for correctness. Binary-ordered B-Tree keys do not match
+`es`-folded predicates, so using the index would silently miss rows. Non-text indexes
+(INT, BIGINT, DATE, etc.) are unaffected.
+
+> **Note:** `@@collation` and `@@collation_connection` are separate variables.
+> `@@collation_connection` is the **transport charset** (set during handshake or via `SET NAMES`).
+> `@@collation` is the **executor-visible text-comparison behavior** added by `AXIOM_COMPAT`.
+
+Full layered collation (per-database, per-column, ICU locale) is planned for Phase 13.13.
 
 ### ON_ERROR
 

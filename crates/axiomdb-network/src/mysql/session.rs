@@ -12,8 +12,10 @@ use std::collections::HashMap;
 
 use axiomdb_core::error::DbError;
 use axiomdb_sql::session::{
-    apply_strict_to_sql_mode, normalize_sql_mode, on_error_mode_name, parse_boolish_setting,
-    parse_on_error_setting, sql_mode_is_strict, OnErrorMode,
+    apply_strict_to_sql_mode, compat_mode_name, normalize_sql_mode, on_error_mode_name,
+    parse_boolish_setting, parse_compat_mode_setting, parse_on_error_setting,
+    parse_session_collation_setting, session_collation_name, sql_mode_is_strict, CompatMode,
+    OnErrorMode, SessionCollation,
 };
 
 use super::charset::{self, CharsetDef, CollationDef, DEFAULT_SERVER_COLLATION};
@@ -146,6 +148,10 @@ pub struct ConnectionState {
     results_collation: &'static CollationDef,
     /// ON_ERROR mode for this connection (default: `RollbackStatement`).
     on_error: OnErrorMode,
+    /// Compatibility mode for this connection (default: `Standard`).
+    compat_mode: CompatMode,
+    /// Explicit session collation override (`None` = compat-derived default).
+    explicit_collation: Option<SessionCollation>,
     /// Generic key=value session variables.
     pub variables: HashMap<String, String>,
     /// Prepared statements cached for this connection.
@@ -192,6 +198,8 @@ impl ConnectionState {
         variables.insert("sql_mode".into(), "STRICT_TRANS_TABLES".into());
         variables.insert("strict_mode".into(), "ON".into());
         variables.insert("on_error".into(), "rollback_statement".into());
+        variables.insert("axiom_compat".into(), "standard".into());
+        variables.insert("collation".into(), "binary".into());
         variables.insert("transaction_isolation".into(), "REPEATABLE-READ".into());
         variables.insert("tx_isolation".into(), "REPEATABLE-READ".into());
         variables.insert("max_allowed_packet".into(), "67108864".into());
@@ -203,6 +211,8 @@ impl ConnectionState {
             current_database: String::new(),
             autocommit: true,
             on_error: OnErrorMode::RollbackStatement,
+            compat_mode: CompatMode::Standard,
+            explicit_collation: None,
             client_charset: DEFAULT_SERVER_COLLATION.charset,
             connection_collation: DEFAULT_SERVER_COLLATION,
             results_collation: DEFAULT_SERVER_COLLATION,
@@ -416,6 +426,41 @@ impl ConnectionState {
                     self.variables
                         .insert("on_error".to_string(), on_error_mode_name(mode).to_string());
                 }
+                "axiom_compat" => {
+                    let mode = parse_compat_mode_setting(raw_val)?;
+                    self.compat_mode = mode;
+                    self.variables.insert(
+                        "axiom_compat".to_string(),
+                        compat_mode_name(mode).to_string(),
+                    );
+                    // Also sync the derived collation into variables (not the typed field).
+                    if self.explicit_collation.is_none() {
+                        let derived = if mode == CompatMode::MySql {
+                            "es"
+                        } else {
+                            "binary"
+                        };
+                        self.variables
+                            .insert("collation".to_string(), derived.to_string());
+                    }
+                }
+                "collation" => {
+                    let coll = parse_session_collation_setting(raw_val)?;
+                    self.explicit_collation = coll;
+                    let name = match coll {
+                        Some(c) => session_collation_name(c),
+                        None => {
+                            // DEFAULT: restore compat-derived collation name
+                            if self.compat_mode == CompatMode::MySql {
+                                "es"
+                            } else {
+                                "binary"
+                            }
+                        }
+                    };
+                    self.variables
+                        .insert("collation".to_string(), name.to_string());
+                }
                 other => {
                     self.variables.insert(other.to_string(), value);
                 }
@@ -430,6 +475,32 @@ impl ConnectionState {
     /// Returns the current `on_error` mode for this connection.
     pub fn on_error(&self) -> OnErrorMode {
         self.on_error
+    }
+
+    /// Returns the current compatibility mode for this connection.
+    pub fn compat_mode(&self) -> CompatMode {
+        self.compat_mode
+    }
+
+    /// Returns the explicit session collation override, if set.
+    pub fn explicit_collation(&self) -> Option<SessionCollation> {
+        self.explicit_collation
+    }
+
+    /// Returns the effective session collation (explicit override > compat-derived > Binary).
+    pub fn effective_collation(&self) -> SessionCollation {
+        if let Some(c) = self.explicit_collation {
+            return c;
+        }
+        match self.compat_mode {
+            CompatMode::MySql => SessionCollation::Es,
+            _ => SessionCollation::Binary,
+        }
+    }
+
+    /// Returns the canonical name of the effective collation (`"binary"` or `"es"`).
+    pub fn effective_collation_name(&self) -> &'static str {
+        session_collation_name(self.effective_collation())
     }
 
     /// Returns the value of a session variable by name.
