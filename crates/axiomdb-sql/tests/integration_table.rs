@@ -7,7 +7,7 @@ use axiomdb_catalog::{
     schema::{ColumnDef, ColumnType, TableDef},
     CatalogBootstrap, CatalogWriter,
 };
-use axiomdb_core::{RecordId, TransactionSnapshot};
+use axiomdb_core::RecordId;
 use axiomdb_sql::TableEngine;
 use axiomdb_storage::MemoryStorage;
 use axiomdb_types::Value;

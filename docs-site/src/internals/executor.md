@@ -5,6 +5,35 @@ references resolved to `col_idx` by the semantic analyzer) and drives it to
 completion, returning a `QueryResult`. It is the highest-level component in the
 query pipeline.
 
+Since subphase `5.19a`, the executor no longer lives in a single source file.
+It is organized under `crates/axiomdb-sql/src/executor/` with `mod.rs` as the
+stable facade and responsibility-based source files behind it.
+
+## Source Layout
+
+| File | Responsibility |
+|---|---|
+| `executor/mod.rs` | public facade, statement dispatch, thread-local last-insert-id |
+| `executor/shared.rs` | helpers shared across multiple statement families |
+| `executor/select.rs` | SELECT entrypoints, projection, ORDER BY/LIMIT wiring |
+| `executor/joins.rs` | nested-loop join execution and join-specific metadata |
+| `executor/aggregate.rs` | GROUP BY, aggregates, DISTINCT/group-key helpers |
+| `executor/insert.rs` | INSERT and INSERT ... SELECT paths |
+| `executor/update.rs` | UPDATE execution |
+| `executor/delete.rs` | DELETE execution and candidate collection |
+| `executor/bulk_empty.rs` | shared bulk-empty helpers for DELETE/TRUNCATE |
+| `executor/ddl.rs` | DDL, SHOW, ANALYZE, TRUNCATE |
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — File-Level Split First</span>
+The first goal of `5.19a` was to make the executor readable and changeable without
+changing SQL behavior. The split preserves the existing facade and keeps later DML
+optimizations isolated from unrelated SELECT and DDL code.
+</div>
+</div>
+
 ---
 
 ## Entry Point

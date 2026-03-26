@@ -30,7 +30,7 @@ use axiomdb_wal::TxnManager;
 
 fn setup() -> (MemoryStorage, TxnManager) {
     let dir = tempfile::tempdir().unwrap();
-    let wal_path = dir.into_path().join("test.wal");
+    let wal_path = dir.keep().join("test.wal");
     let mut storage = MemoryStorage::new();
     CatalogBootstrap::init(&mut storage).unwrap();
     let txn = TxnManager::create(&wal_path).unwrap();
@@ -408,12 +408,13 @@ fn test_decode_index_key_float_roundtrip() {
     use axiomdb_sql::key_encoding::{decode_index_key, encode_index_key};
     use axiomdb_types::Value;
 
-    let values = vec![Value::Real(3.14)];
+    let expected = 314_f64 / 100.0;
+    let values = vec![Value::Real(expected)];
     let encoded = encode_index_key(&values).unwrap();
     let (decoded, _) = decode_index_key(&encoded, 1).unwrap();
     // Float comparison with small epsilon
     match decoded[0] {
-        Value::Real(f) => assert!((f - 3.14).abs() < 1e-10),
+        Value::Real(f) => assert!((f - expected).abs() < 1e-10),
         ref x => panic!("expected Float, got {x:?}"),
     }
 }
@@ -430,7 +431,7 @@ use axiomdb_sql::{bloom::BloomRegistry, execute_with_ctx, session::SessionContex
 
 fn setup_ctx() -> (MemoryStorage, TxnManager, BloomRegistry, SessionContext) {
     let dir = tempfile::tempdir().unwrap();
-    let wal_path = dir.into_path().join("test.wal");
+    let wal_path = dir.keep().join("test.wal");
     let mut storage = MemoryStorage::new();
     CatalogBootstrap::init(&mut storage).unwrap();
     let txn = TxnManager::create(&wal_path).unwrap();

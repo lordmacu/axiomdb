@@ -7,14 +7,13 @@ use axiomdb_sql::{
     analyze, bloom::BloomRegistry, execute_with_ctx, parse, result::QueryResult, SessionContext,
 };
 use axiomdb_storage::MemoryStorage;
-use axiomdb_types::Value;
 use axiomdb_wal::TxnManager;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn setup() -> (MemoryStorage, TxnManager) {
     let dir = tempfile::tempdir().unwrap();
-    let wal_path = dir.into_path().join("test.wal");
+    let wal_path = dir.keep().join("test.wal");
     let mut storage = MemoryStorage::new();
     CatalogBootstrap::init(&mut storage).unwrap();
     let txn = TxnManager::create(&wal_path).unwrap();
