@@ -45,6 +45,8 @@ pub struct StatusRegistry {
     pub bytes_sent: AtomicU64,
     pub com_select: AtomicU64,
     pub com_insert: AtomicU64,
+    /// Number of `COM_STMT_SEND_LONG_DATA` chunks received (per chunk, not per execute).
+    pub com_stmt_send_long_data: AtomicU64,
     /// Best-effort compatibility counter for logical page-read requests.
     /// AxiomDB uses `MmapStorage`, not an InnoDB buffer pool — this counter
     /// approximates storage access frequency until a dedicated storage metrics
@@ -65,6 +67,7 @@ impl StatusRegistry {
             bytes_sent: AtomicU64::new(0),
             com_select: AtomicU64::new(0),
             com_insert: AtomicU64::new(0),
+            com_stmt_send_long_data: AtomicU64::new(0),
             innodb_buffer_pool_read_requests: AtomicU64::new(0),
             innodb_buffer_pool_reads: AtomicU64::new(0),
         }
@@ -95,6 +98,7 @@ pub struct SessionStatus {
     pub bytes_sent: u64,
     pub com_select: u64,
     pub com_insert: u64,
+    pub com_stmt_send_long_data: u64,
 }
 
 // ── RAII guards ───────────────────────────────────────────────────────────────
@@ -235,6 +239,7 @@ const STATUS_VARS: &[&str] = &[
     "Bytes_sent",
     "Com_insert",
     "Com_select",
+    "Com_stmt_send_long_data",
     "Innodb_buffer_pool_read_requests",
     "Innodb_buffer_pool_reads",
     "Questions",
@@ -317,6 +322,16 @@ fn variable_value(
                 sess.com_select.to_string()
             } else {
                 registry.com_select.load(Ordering::Relaxed).to_string()
+            }
+        }
+        "Com_stmt_send_long_data" => {
+            if is_session {
+                sess.com_stmt_send_long_data.to_string()
+            } else {
+                registry
+                    .com_stmt_send_long_data
+                    .load(Ordering::Relaxed)
+                    .to_string()
             }
         }
         "Innodb_buffer_pool_read_requests" => registry
@@ -468,7 +483,15 @@ mod tests {
             .collect();
         assert!(names.contains(&"Com_insert"), "Com_insert must be present");
         assert!(names.contains(&"Com_select"), "Com_select must be present");
-        assert_eq!(names.len(), 2, "only Com_insert and Com_select");
+        assert!(
+            names.contains(&"Com_stmt_send_long_data"),
+            "Com_stmt_send_long_data must be present"
+        );
+        assert_eq!(
+            names.len(),
+            3,
+            "Com_insert, Com_select, Com_stmt_send_long_data"
+        );
     }
 
     #[test]
