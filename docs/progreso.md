@@ -28,6 +28,8 @@
 - [x] 2.7 ✅ Prefix compression — `CompressedNode` in memory for internal nodes
 - [x] 2.8 ✅ Tests + benchmarks — 37 tests, Criterion benchmarks vs std::BTreeMap
 - [ ] ⚠️ next_leaf linked list stale in CoW — range scan uses tree traversal instead → revisit in Phase 7 (MVCC + epoch reclamation)
+- [ ] ⚠️ rotate_right key shift bug FIXED (2026-03-26) — was leaving stale bytes in key_lens[cn] causing key_at panic at scale; fixed with explicit reverse loop in tree.rs
+- [ ] ⚠️ Stale root_page_id in SessionContext cache FIXED (2026-03-26) — after B+tree root split, cached IndexDef held freed page_id; fixed with ctx.invalidate_all() after index root change in execute_insert_ctx and execute_delete
 - [x] ✅ 2.5.1 — eliminar heap allocations del hot path de lookup (2026-03-22)
 - [x] ✅ 2.5.2 — binary search + in-place inserts; 4.46M lookup ops/s, 222K insert ops/s (2026-03-22)
 - [x] ✅ Phase 1 — `expect()` eliminados de código de producción: mmap.rs, freelist.rs, memory.rs (2026-03-22)
@@ -221,6 +223,9 @@
 - [x] 6.13 ✅ Index-only scans — `IndexOnlyScan` planner variant; `decode_index_key` inverse codec; `is_slot_visible` MVCC header-only check; `INCLUDE (cols)` DDL syntax + catalog storage; non-unique secondary indexes fixed to use `key||RecordId` format (InnoDB approach) — DuplicateKey on duplicate non-unique values fixed
 - [ ] ⚠️ 6.14 DEFERRED to Phase 7 — MVCC on secondary indexes requires 7.1-7.3 (snapshot isolation) to be implemented first; moved to 7.3b
 - [ ] 6.15 ⏳ Index corruption detection — on DB open verify index checksums; detect index vs table divergence; automatic `REINDEX` if divergent (recovery mode)
+- [ ] ⚠️ PERF: DELETE per-row always goes through slow path when any index exists — fast truncate path (`secondary_indexes.is_empty()`) never triggers for tables with PRIMARY KEY; need a bulk-delete + bulk-index-remove path; identified by AxiomDB vs SQLite bench (2026-03-26), DELETE is 11000x slower than SQLite for 500-row full-table delete
+- [ ] ⚠️ PERF: insert_leaf CoW always allocates new page — even for non-split inserts, a new leaf page is allocated and old one freed; this doubles I/O vs in-place update and inflates free list churn; identified by AxiomDB vs SQLite bench (2026-03-26), INSERT is 50x slower than SQLite embedded
+- [ ] ⚠️ PERF: point_lookup uses full heap scan — index scan not used for PK lookup in embedded path; each lookup is O(n) instead of O(log n); identified by AxiomDB vs SQLite bench (2026-03-26), point_lookup is 113x slower than SQLite
 
 ### Phase 7 — Concurrency + MVCC `⏳` week 40-48
 - [x] ✅ Non-unique secondary indexes composite key — Fixed in 6.13: all non-unique non-FK secondary indexes now use `key||RecordId` format (same as FK auto-indexes). DuplicateKey blocker for MVCC removed.
