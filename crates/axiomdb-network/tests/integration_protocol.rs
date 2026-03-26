@@ -367,3 +367,48 @@ fn test_session_transaction_isolation() {
         Some("REPEATABLE-READ".into())
     );
 }
+
+// ── 4.10d — COM_STMT_EXECUTE packet decoding for LIMIT/OFFSET params ─────────
+
+#[test]
+fn test_execute_packet_mysql_type_string_limit_param() {
+    // Verifies that parse_execute_packet correctly decodes a single
+    // MYSQL_TYPE_STRING (0xfd) parameter carrying the value "2".
+    // This is the MariaDB client compatibility case: some clients bind
+    // LIMIT ? as a string type rather than an integer type.
+    use axiomdb_network::mysql::{prepared::parse_execute_packet, session::PreparedStatement};
+
+    let mut stmt = PreparedStatement {
+        stmt_id: 1,
+        sql_template: "SELECT a FROM t LIMIT ?".into(),
+        param_count: 1,
+        param_types: vec![0xfd], // MYSQL_TYPE_STRING
+        analyzed_stmt: None,
+        compiled_at_version: 0,
+        last_used_seq: 0,
+    };
+
+    // Minimal COM_STMT_EXECUTE payload layout:
+    //   bytes 0..4   stmt_id (u32 LE) = 1
+    //   byte 4       flags = 0
+    //   bytes 5..9   iteration_count (u32 LE) = 1
+    //   byte 9       null_bitmap: 1 param, not null → 0x00
+    //   byte 10      new_params_bound_flag = 1
+    //   bytes 11..13 type list: 0xfd 0x00 (MYSQL_TYPE_STRING, unsigned=0)
+    //   byte 13      lenenc length = 1
+    //   byte 14      payload = b'2'
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u32.to_le_bytes()); // stmt_id
+    payload.push(0); // flags
+    payload.extend_from_slice(&1u32.to_le_bytes()); // iteration_count
+    payload.push(0x00); // null_bitmap (param 0 is not null)
+    payload.push(1); // new_params_bound_flag
+    payload.push(0xfd); // MYSQL_TYPE_STRING
+    payload.push(0x00); // unsigned flag
+    payload.push(1); // lenenc: length = 1
+    payload.push(b'2'); // the string "2"
+
+    let exec = parse_execute_packet(&payload, &mut stmt).unwrap();
+    assert_eq!(exec.params.len(), 1);
+    assert_eq!(exec.params[0], Value::Text("2".into()));
+}
