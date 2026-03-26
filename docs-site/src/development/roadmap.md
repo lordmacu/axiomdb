@@ -175,7 +175,11 @@ This is the largest remaining item in Block 1.
 
 - **5.11c Explicit connection state machine** — formalize `CONNECTED → AUTH → IDLE → EXECUTING → CLOSING`, timeout handling, and abrupt socket close behavior.
 - **5.15 DSN parsing** — `axiomdb://`, `mysql://`, and `postgres://` style connection strings for tools and ORMs.
-- **5.17 In-place B+Tree write path** — reduce page churn on indexed INSERT/UPDATE/DELETE hot paths.
+- **5.19 B+Tree batch delete** — replace per-row index-key deletion with sorted single-pass batch removal for DELETE/UPDATE hot paths.
+
+Phase 5 also closed an internal hygiene subphase, **5.19a Executor decomposition**:
+the SQL executor now lives in a responsibility-based `executor/` module tree instead
+of one monolithic file, which lowers the cost of later DML and planner work.
 
 ### Phase 6 remaining — Index completeness
 

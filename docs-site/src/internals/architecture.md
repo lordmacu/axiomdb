@@ -46,10 +46,10 @@ prevents circular dependencies and makes each component independently testable.
 │  │              CASE WHEN searched + simple form, short-circuit)    │
 │  ├── result    (QueryResult, ColumnMeta, Row — executor return type)│
 │  ├── table     (TableEngine — scan/insert/delete/update over heap)  │
-│  └── executor  (execute() — SELECT/INSERT/UPDATE/DELETE/DDL/txn;   │
-│                 GROUP BY + COUNT/SUM/MIN/MAX/AVG, HAVING,          │
-│                 ORDER BY multi-column + NULLS FIRST/LAST,          │
-│                 LIMIT/OFFSET, SELECT DISTINCT, INSERT … SELECT)    │
+│  └── executor/ (mod.rs facade + select/insert/update/delete/ddl/   │
+│                 join/aggregate/shared modules; same execute() API; │
+│                 GROUP BY + HAVING + ORDER BY + LIMIT/OFFSET +      │
+│                 INSERT … SELECT)                                   │
 │                                                                     │
 │  [query planner, optimizer — Phase 6]                               │
 └──────────────────────────────┬──────────────────────────────────────┘
@@ -189,13 +189,25 @@ The SQL processing pipeline:
 - `result` — `QueryResult` enum (`Rows` / `Affected` / `Empty`), `ColumnMeta`
   (name, data_type, nullable, table_name), `Row = Vec<Value>`; the contract
   between the executor and all callers (embedded API, wire protocol, CLI)
-- `executor` — interprets analyzed statements against live storage; Phase 4 Group E
-  capabilities: `GROUP BY` with hash-based aggregation (`COUNT(*)`, `COUNT(col)`,
-  `SUM`, `MIN`, `MAX`, `AVG` with proper NULL exclusion), `HAVING` post-filter,
-  `ORDER BY` with multi-column sort keys and per-column `NULLS FIRST/LAST` control,
-  `LIMIT n OFFSET m` for pagination, `SELECT DISTINCT` with NULL-equality dedup
-  (two NULL values are considered equal for deduplication), and `INSERT … SELECT`
-  for bulk copy and aggregate materialization
+- `executor/` — directory module rooted at `executor/mod.rs`; the facade still exports
+  `execute`, `execute_with_ctx`, and `last_insert_id_value`, but the implementation is
+  now split into `shared.rs`, `select.rs`, `joins.rs`, `aggregate.rs`, `insert.rs`,
+  `update.rs`, `delete.rs`, `bulk_empty.rs`, and `ddl.rs`. Capabilities remain the same:
+  `GROUP BY` with hash-based aggregation (`COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`,
+  `AVG` with proper NULL exclusion), `HAVING` post-filter, `ORDER BY` with multi-column
+  sort keys and per-column `NULLS FIRST/LAST` control, `LIMIT n OFFSET m` for pagination,
+  `SELECT DISTINCT` with NULL-equality dedup (two NULL values are considered equal for
+  deduplication), and `INSERT … SELECT` for bulk copy and aggregate materialization
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Split Without API Drift</span>
+PostgreSQL and SQLite both keep executor logic separated by statement family instead of
+one source file. AxiomDB now adopts the same responsibility split, but keeps the existing
+`crate::executor` facade intact so sibling modules and external callers do not pay a refactor tax.
+</div>
+</div>
 
 ### axiomdb-network
 
