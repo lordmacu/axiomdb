@@ -1705,49 +1705,31 @@ fn execute_delete_ctx(
         });
     }
 
-    // Full scan: needed for WHERE evaluation, secondary index maintenance, or FK enforcement.
-    // When secondary indexes or FK exist, skip column mask — all column values needed.
+    // Candidate discovery (Phase 6.3b): use index when predicate is sargable.
     let schema_cols = resolved.columns.clone();
-    let column_mask: Option<Vec<bool>> = if secondary_indexes.is_empty() && !has_fk_references {
-        // WHERE-only path: lazy-decode only referenced columns.
-        let n_cols = schema_cols.len();
-        stmt.where_clause
-            .as_ref()
-            .map(|wc| {
-                let mask = build_column_mask(n_cols, &[wc]);
-                if mask.iter().all(|&b| b) {
-                    vec![]
-                } else {
-                    mask
-                }
-            })
-            .filter(|m| !m.is_empty())
+    let to_delete: Vec<(RecordId, Vec<Value>)> = if let Some(ref wc) = stmt.where_clause {
+        let effective_coll = ctx.effective_collation();
+        let delete_access = crate::planner::plan_delete_candidates_ctx(
+            wc,
+            &secondary_indexes,
+            &schema_cols,
+            effective_coll,
+        );
+        collect_delete_candidates(
+            wc,
+            &secondary_indexes,
+            &schema_cols,
+            &delete_access,
+            storage,
+            snap,
+            &resolved.def,
+            bloom,
+        )?
     } else {
-        // Secondary indexes present: full decode required.
-        None
+        // No WHERE and has_fk_references=true (bulk-empty path already returned
+        // for the no-WHERE + no-FK case). Full scan: all rows qualify.
+        TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?
     };
-
-    let rows = TableEngine::scan_table(
-        storage,
-        &resolved.def,
-        &schema_cols,
-        snap,
-        column_mask.as_deref(),
-    )?;
-
-    // Collect all matching (rid, row_values) before deleting from the heap.
-    // Row values are needed for secondary index key extraction.
-    let to_delete: Vec<(RecordId, Vec<Value>)> = rows
-        .into_iter()
-        .filter_map(|(rid, values)| match &stmt.where_clause {
-            None => Some(Ok((rid, values))),
-            Some(wc) => match eval(wc, &values) {
-                Ok(v) if is_truthy(&v) => Some(Ok((rid, values))),
-                Ok(_) => None,
-                Err(e) => Some(Err(e)),
-            },
-        })
-        .collect::<Result<_, DbError>>()?;
 
     // FK parent enforcement: must run BEFORE heap delete so RESTRICT can abort
     // cleanly and CASCADE/SET NULL can still read/update child rows.
@@ -4585,6 +4567,108 @@ fn execute_update(
 
 // ── DELETE ────────────────────────────────────────────────────────────────────
 
+// ── DELETE candidate discovery (Phase 6.3b) ──────────────────────────────────
+
+/// Discovers and materializes `(RecordId, row_values)` pairs for a
+/// `DELETE ... WHERE` statement using the best available access method.
+///
+/// ## Guarantee
+///
+/// 1. B-Tree state is never mutated while candidates are being collected.
+/// 2. The full original `where_clause` is always rechecked on fetched row values
+///    before a row is included in the result set, regardless of which index path
+///    was used to find it.
+/// 3. Only rows visible to `snap` are returned.
+///
+/// ## Access path selection
+///
+/// - Indexed (`IndexLookup` / `IndexRange`): B-Tree lookup or range → RIDs →
+///   heap reads → full `WHERE` recheck.
+/// - `Scan`: full heap scan via `TableEngine::scan_table` + `WHERE` filter
+///   (existing behavior, unchanged).
+fn collect_delete_candidates(
+    where_clause: &Expr,
+    indexes: &[axiomdb_catalog::IndexDef],
+    schema_cols: &[axiomdb_catalog::schema::ColumnDef],
+    access: &crate::planner::AccessMethod,
+    storage: &mut dyn StorageEngine,
+    snap: axiomdb_core::TransactionSnapshot,
+    table_def: &axiomdb_catalog::TableDef,
+    bloom: &crate::bloom::BloomRegistry,
+) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+    use crate::planner::AccessMethod;
+
+    match access {
+        AccessMethod::Scan | AccessMethod::IndexOnlyScan { .. } => {
+            // Full heap scan — existing behavior.
+            let rows = TableEngine::scan_table(storage, table_def, schema_cols, snap, None)?;
+            rows.into_iter()
+                .filter_map(|(rid, values)| match eval(where_clause, &values) {
+                    Ok(v) if is_truthy(&v) => Some(Ok((rid, values))),
+                    Ok(_) => None,
+                    Err(e) => Some(Err(e)),
+                })
+                .collect::<Result<_, DbError>>()
+        }
+
+        AccessMethod::IndexLookup { index_def, key } => {
+            // Point lookup via B-Tree → heap read → WHERE recheck.
+            let candidate_rids: Vec<RecordId> = if index_def.is_unique {
+                if index_def.is_unique && !bloom.might_exist(index_def.index_id, key) {
+                    vec![]
+                } else {
+                    match BTree::lookup_in(storage, index_def.root_page_id, key)? {
+                        None => vec![],
+                        Some(rid) => vec![rid],
+                    }
+                }
+            } else {
+                // Non-unique: key||RID format — range [key||0..0, key||FF..FF].
+                let lo = rid_lo(key);
+                let hi = rid_hi(key);
+                BTree::range_in(storage, index_def.root_page_id, Some(&lo), Some(&hi))?
+                    .into_iter()
+                    .map(|(rid, _)| rid)
+                    .collect()
+            };
+
+            let mut result = Vec::with_capacity(candidate_rids.len());
+            for rid in candidate_rids {
+                if let Some(values) = TableEngine::read_row(storage, schema_cols, rid)? {
+                    // Recheck full WHERE — the index only narrowed candidates.
+                    if is_truthy(&eval(where_clause, &values)?) {
+                        result.push((rid, values));
+                    }
+                }
+            }
+            Ok(result)
+        }
+
+        AccessMethod::IndexRange { index_def, lo, hi } => {
+            // Range scan via B-Tree → heap reads → WHERE recheck.
+            let (lo_adj, hi_adj);
+            let (lo_ref, hi_ref) = if index_def.is_unique {
+                (lo.as_deref(), hi.as_deref())
+            } else {
+                lo_adj = lo.as_deref().map(rid_lo);
+                hi_adj = hi.as_deref().map(rid_hi);
+                (lo_adj.as_deref(), hi_adj.as_deref())
+            };
+            let pairs = BTree::range_in(storage, index_def.root_page_id, lo_ref, hi_ref)?;
+
+            let mut result = Vec::with_capacity(pairs.len());
+            for (rid, _key) in pairs {
+                if let Some(values) = TableEngine::read_row(storage, schema_cols, rid)? {
+                    if is_truthy(&eval(where_clause, &values)?) {
+                        result.push((rid, values));
+                    }
+                }
+            }
+            Ok(result)
+        }
+    }
+}
+
 fn execute_delete(
     stmt: DeleteStmt,
     storage: &mut dyn StorageEngine,
@@ -4629,21 +4713,25 @@ fn execute_delete(
         });
     }
 
+    // Candidate discovery (Phase 6.3b): index path when predicate is sargable.
     let schema_cols = resolved.columns.clone();
-    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?;
-
-    // Collect all matching (rid, row_values) BEFORE deleting any row.
-    let to_delete: Vec<(RecordId, Vec<Value>)> = rows
-        .into_iter()
-        .filter_map(|(rid, values)| match &stmt.where_clause {
-            None => Some(Ok((rid, values))),
-            Some(wc) => match eval(wc, &values) {
-                Ok(v) if is_truthy(&v) => Some(Ok((rid, values))),
-                Ok(_) => None,
-                Err(e) => Some(Err(e)),
-            },
-        })
-        .collect::<Result<_, DbError>>()?;
+    let to_delete: Vec<(RecordId, Vec<Value>)> = if let Some(ref wc) = stmt.where_clause {
+        let delete_access =
+            crate::planner::plan_delete_candidates(wc, &secondary_indexes, &schema_cols);
+        collect_delete_candidates(
+            wc,
+            &secondary_indexes,
+            &schema_cols,
+            &delete_access,
+            storage,
+            snap,
+            &resolved.def,
+            &noop_bloom,
+        )?
+    } else {
+        // No WHERE + has_fk_references=true — full scan, all rows qualify.
+        TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?
+    };
 
     // Batch-delete from heap: each page read+written once instead of 3× per row.
     let rids_only: Vec<RecordId> = to_delete.iter().map(|(rid, _)| *rid).collect();
