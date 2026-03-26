@@ -12,6 +12,7 @@ axiomdb-storage = { path = "../axiomdb-storage" }
 axiomdb-wal     = { path = "../axiomdb-wal" }
 axiomdb-catalog = { path = "../axiomdb-catalog" }
 axiomdb-sql     = { path = "../axiomdb-sql" }
+encoding_rs     = { workspace = true }
 thiserror       = { workspace = true }
 tokio           = { workspace = true }
 tokio-util      = { workspace = true }

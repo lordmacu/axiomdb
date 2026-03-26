@@ -77,6 +77,9 @@ toml = "1"
 # SQL lexer — DFA-based tokenizer
 logos = "0.14"
 
+# Character-set transcoding (MySQL transport layer)
+encoding_rs = "0.8"
+
 # Internal crates
 axiomdb-core    = { path = "crates/axiomdb-core" }
 axiomdb-types   = { path = "crates/axiomdb-types" }

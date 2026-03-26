@@ -27,6 +27,7 @@ use axiomdb_core::error::DbError;
 use axiomdb_sql::{ast::Stmt, result::ColumnMeta, SchemaCache, SessionContext};
 use axiomdb_types::DataType;
 
+use super::charset::DEFAULT_SERVER_COLLATION;
 use super::database::CommitRx;
 
 use super::result::serialize_query_result_multi_warn;
@@ -124,19 +125,37 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
         }
     };
 
+    // Build session from the negotiated collation id. Reject unsupported ids
+    // before auth so the client gets a clear error (ER_UNKNOWN_CHARACTER_SET 1115).
+    let mut conn_state = match ConnectionState::from_handshake_collation_id(response.character_set)
+    {
+        Ok(cs) => cs,
+        Err(e) => {
+            let me = super::error::dberror_to_mysql(&e, None);
+            let err = build_err_packet(me.code, &me.sql_state, &me.message);
+            let _ = writer.send((2u8, err.as_slice())).await;
+            return;
+        }
+    };
+
+    // Decode the username with the negotiated charset (usernames are ASCII in practice).
+    let username = conn_state
+        .decode_identifier_text(&response.username)
+        .unwrap_or_else(|_| String::from_utf8_lossy(&response.username).into_owned());
+
     let plugin = response
         .auth_plugin_name
         .as_deref()
         .unwrap_or("caching_sha2_password");
-    debug!(conn_id, username = %response.username, %plugin, "auth attempt");
+    debug!(conn_id, %username, %plugin, "auth attempt");
 
     // ── Phase 3: Authenticate ─────────────────────────────────────────────────
-    if !is_allowed_user(&response.username) {
-        warn!(conn_id, username = %response.username, "user not allowed");
+    if !is_allowed_user(&username) {
+        warn!(conn_id, %username, "user not allowed");
         let err = build_err_packet(
             1045,
             b"28000",
-            &format!("Access denied for user '{}'", response.username),
+            &format!("Access denied for user '{username}'"),
         );
         let _ = writer.send((2u8, err.as_slice())).await;
         return;
@@ -192,7 +211,7 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
         }
     }
 
-    info!(conn_id, username = %response.username, %plugin, "authenticated");
+    info!(conn_id, %username, %plugin, "authenticated");
 
     // ── Phase 4: Command loop ─────────────────────────────────────────────────
     let mut session = SessionContext::new();
@@ -212,11 +231,12 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
     // Placed after auth so only authenticated connections are counted.
     let _connected_guard = ConnectedGuard::new(Arc::clone(&status));
 
-    let mut conn_state = ConnectionState::new();
-
+    // conn_state already constructed from handshake collation id above.
     // Populate initial current_database from handshake (if client sent one).
-    if let Some(ref db) = response.database {
-        conn_state.current_database = db.clone();
+    if let Some(ref db_bytes) = response.database {
+        conn_state.current_database = conn_state
+            .decode_identifier_text(db_bytes)
+            .unwrap_or_else(|_| String::from_utf8_lossy(db_bytes).into_owned());
     }
 
     // Sync decoder limit to the session value after auth.  The session default
@@ -267,7 +287,15 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
 
             // COM_INIT_DB (USE database)
             0x02 => {
-                let db_name = String::from_utf8_lossy(body).trim().to_string();
+                let db_name = match conn_state.decode_identifier_text(body) {
+                    Ok(s) => s.trim().to_string(),
+                    Err(_) => {
+                        let err =
+                            build_err_packet(1064, b"42000", "Invalid charset in database name");
+                        let _ = writer.send((1u8, err.as_slice())).await;
+                        continue;
+                    }
+                };
                 debug!(conn_id, db = %db_name, "COM_INIT_DB");
                 conn_state.current_database = db_name;
                 let ok = build_ok_packet(0, 0, 0);
@@ -278,14 +306,19 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
 
             // COM_QUERY
             0x03 => {
-                let sql = match std::str::from_utf8(body) {
-                    Ok(s) => s.trim(),
+                let sql_owned = match conn_state.decode_client_text(body) {
+                    Ok(s) => s,
                     Err(_) => {
-                        let err = build_err_packet(1064, b"42000", "Query is not valid UTF-8");
+                        let err = build_err_packet(
+                            1064,
+                            b"42000",
+                            "Query is not valid in connection charset",
+                        );
                         let _ = writer.send((1u8, err.as_slice())).await;
                         continue;
                     }
                 };
+                let sql = sql_owned.trim();
                 debug!(conn_id, %sql, "COM_QUERY");
 
                 // Intercept queries that ORMs/clients send automatically on connect.
@@ -414,12 +447,27 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                                 }
                                 break 'stmts;
                             }
-                            let packets = serialize_query_result_multi_warn(
+                            let packets = match serialize_query_result_multi_warn(
                                 qr,
                                 seq,
                                 !is_last,
                                 session.warning_count(),
-                            );
+                                conn_state.results_collation(),
+                            ) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    let pkt = build_query_err_packet(&e, stmt_sql, &conn_state);
+                                    let err_bytes = pkt.len() as u64 + 4;
+                                    if writer.send((seq, pkt.as_slice())).await.is_ok() {
+                                        bump_bytes_sent(
+                                            err_bytes,
+                                            &status,
+                                            &mut conn_state.session_status,
+                                        );
+                                    }
+                                    break 'stmts;
+                                }
+                            };
                             seq = packets
                                 .last()
                                 .map(|(s, _)| s.wrapping_add(1))
@@ -476,10 +524,10 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
 
             // COM_STMT_PREPARE — parse+analyze once and cache the result.
             0x16 => {
-                let sql = match std::str::from_utf8(body) {
+                let sql = match conn_state.decode_client_text(body) {
                     Ok(s) => s.trim().to_string(),
                     Err(_) => {
-                        let e = build_err_packet(1064, b"42000", "Invalid UTF-8 in prepare");
+                        let e = build_err_packet(1064, b"42000", "Invalid charset in prepare");
                         let _ = writer.send((1u8, e.as_slice())).await;
                         continue;
                     }
@@ -513,7 +561,13 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     ps.analyzed_stmt = analyzed_stmt;
                     ps.compiled_at_version = current_version;
                 }
-                let packets = build_prepare_response(stmt_id, param_count, &result_cols, 1);
+                let packets = build_prepare_response(
+                    stmt_id,
+                    param_count,
+                    &result_cols,
+                    1,
+                    conn_state.results_collation(),
+                );
                 if send_packets(&mut writer, &packets).await.is_err() {
                     break;
                 }
@@ -539,12 +593,13 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     .map(|ps| SqlCommandClass::from_sql(&ps.sql_template))
                     .unwrap_or(SqlCommandClass::Other);
 
-                // Pre-compute next LRU seq before taking a mutable ref to the
-                // statement (borrow checker: &mut conn_state ends here).
+                // Pre-compute values that borrow conn_state immutably before the
+                // mutable borrow of prepared_statements below.
                 let next_seq = conn_state.next_execute_seq();
+                let client_charset = conn_state.client_charset();
 
                 let result = if let Some(stmt) = conn_state.prepared_statements.get_mut(&stmt_id) {
-                    match parse_execute_packet(body, stmt) {
+                    match parse_execute_packet(body, stmt, client_charset) {
                         Ok(exec) => {
                             // ── Plan cache version check (Phase 5.13) ─────────────
                             // If the schema changed since this plan was compiled, re-analyze
@@ -638,7 +693,26 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                             }
                             continue;
                         }
-                        let packets = serialize_query_result_binary(qr, 1);
+                        let packets = match serialize_query_result_binary(
+                            qr,
+                            1,
+                            conn_state.results_collation(),
+                        ) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let me = dberror_to_mysql(&e, None);
+                                let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
+                                let err_bytes = pkt.len() as u64 + 4;
+                                if writer.send((1u8, pkt.as_slice())).await.is_ok() {
+                                    bump_bytes_sent(
+                                        err_bytes,
+                                        &status,
+                                        &mut conn_state.session_status,
+                                    );
+                                }
+                                continue;
+                            }
+                        };
                         let nbytes = wire_size(&packets);
                         if send_packets(&mut writer, &packets).await.is_err() {
                             break;
@@ -863,7 +937,10 @@ fn intercept_special_query(
             columns: cols,
             rows,
         };
-        return Ok(Some(serialize_query_result(qr, 1)));
+        return Ok(Some(
+            serialize_query_result(qr, 1, DEFAULT_SERVER_COLLATION)
+                .expect("utf8mb4 encoding always valid for ASCII data"),
+        ));
     }
 
     // ── SHOW VARIABLES ────────────────────────────────────────────────────────
@@ -876,7 +953,10 @@ fn intercept_special_query(
         use super::status::{build_status_rows, parse_show_status};
         if let Some(query) = parse_show_status(&lower) {
             let qr = build_status_rows(&query, status, &conn_state.session_status);
-            return Ok(Some(serialize_query_result(qr, 1)));
+            return Ok(Some(
+                serialize_query_result(qr, 1, DEFAULT_SERVER_COLLATION)
+                    .expect("utf8mb4 encoding always valid for ASCII data"),
+            ));
         }
         // Unrecognised SHOW ... STATUS variant — return empty two-column rowset.
         let cols = vec![
@@ -887,7 +967,10 @@ fn intercept_special_query(
             columns: cols,
             rows: vec![],
         };
-        return Ok(Some(serialize_query_result(qr, 1)));
+        return Ok(Some(
+            serialize_query_result(qr, 1, DEFAULT_SERVER_COLLATION)
+                .expect("utf8mb4 encoding always valid for ASCII data"),
+        ));
     }
 
     // ── SHOW FULL PROCESSLIST ─────────────────────────────────────────────────
@@ -921,7 +1004,10 @@ fn intercept_special_query(
             columns: cols,
             rows,
         };
-        return Ok(Some(serialize_query_result(qr, 1)));
+        return Ok(Some(
+            serialize_query_result(qr, 1, DEFAULT_SERVER_COLLATION)
+                .expect("utf8mb4 encoding always valid for ASCII data"),
+        ));
     }
 
     Ok(None)
@@ -938,7 +1024,6 @@ fn show_variables_result(lower: &str, conn_state: &ConnectionState) -> Vec<(u8, 
         ColumnMeta::computed("Value".to_string(), DataType::Text),
     ];
 
-    let charset = conn_state.character_set_client.clone();
     let sql_mode_val = conn_state
         .get_variable("sql_mode")
         .unwrap_or_else(|| "STRICT_TRANS_TABLES".into());
@@ -946,13 +1031,25 @@ fn show_variables_result(lower: &str, conn_state: &ConnectionState) -> Vec<(u8, 
         .get_variable("strict_mode")
         .unwrap_or_else(|| "ON".into());
     let all_vars: Vec<(&str, String)> = vec![
-        ("character_set_client", charset.clone()),
-        ("character_set_connection", charset.clone()),
+        (
+            "character_set_client",
+            conn_state.character_set_client_name().into(),
+        ),
+        (
+            "character_set_connection",
+            conn_state.character_set_connection_name().into(),
+        ),
         ("character_set_database", "utf8mb4".into()),
-        ("character_set_results", charset.clone()),
+        (
+            "character_set_results",
+            conn_state.character_set_results_name().into(),
+        ),
         ("character_set_server", "utf8mb4".into()),
         ("character_set_system", "utf8mb3".into()),
-        ("collation_connection", "utf8mb4_0900_ai_ci".into()),
+        (
+            "collation_connection",
+            conn_state.collation_connection_name().into(),
+        ),
         ("collation_database", "utf8mb4_0900_ai_ci".into()),
         ("collation_server", "utf8mb4_0900_ai_ci".into()),
         ("sql_mode", sql_mode_val),
@@ -987,7 +1084,8 @@ fn show_variables_result(lower: &str, conn_state: &ConnectionState) -> Vec<(u8, 
         columns: cols,
         rows,
     };
-    serialize_query_result(qr, 1)
+    serialize_query_result(qr, 1, DEFAULT_SERVER_COLLATION)
+        .expect("utf8mb4 encoding always valid for ASCII data")
 }
 
 /// Builds a single-column, single-row text result set.
@@ -1002,7 +1100,8 @@ fn single_text_row(col_name: &str, value: &str) -> Vec<(u8, Vec<u8>)> {
         columns: cols,
         rows,
     };
-    serialize_query_result(qr, 1)
+    serialize_query_result(qr, 1, DEFAULT_SERVER_COLLATION)
+        .expect("utf8mb4 encoding always valid for ASCII data")
 }
 
 /// Builds a single-column, single-row result set with a NULL value.
@@ -1018,7 +1117,8 @@ fn single_null_row(col_name: &str) -> Vec<(u8, Vec<u8>)> {
         columns: cols,
         rows,
     };
-    serialize_query_result(qr, 1)
+    serialize_query_result(qr, 1, DEFAULT_SERVER_COLLATION)
+        .expect("utf8mb4 encoding always valid for ASCII data")
 }
 
 // ── Prepared statement helpers ────────────────────────────────────────────────

@@ -175,7 +175,7 @@
 ### Phase 5 — MySQL Wire Protocol `🔄` week 26-30
 - [x] 5.1 ✅ TCP listener with Tokio — accept connections on :3306; Arc<Mutex<Database>>; tokio::spawn per connection
 - [x] 5.2 ✅ MySQL handshake — HandshakeV10 (greeting) + HandshakeResponse41 (client response)
-- [ ] 5.2a ⏳ Charset/collation negotiation in handshake — `character_set_client`, `character_set_results`, `collation_connection` sent in Server Greeting; client chooses charset; without this modern MySQL clients cannot connect or display incorrect characters
+- [x] 5.2a ✅ Charset/collation negotiation in handshake — `character_set_client`, `character_set_results`, `collation_connection` sent in Server Greeting; client chooses charset; `ConnectionState` built from handshake collation id; inbound text decoded with client charset; outbound rows encoded with result charset; latin1 (cp1252), utf8mb3, utf8mb4, binary supported; `SET NAMES` and individual SET charset vars update typed session fields; `SHOW VARIABLES LIKE 'character_set%'` reflects live state; 8 new wire assertions + ~25 unit tests
 - [ ] 5.2c ⏳ ON_ERROR session behavior — `SET ON_ERROR = 'rollback_statement'` rolls back only the failing statement and continues the transaction (fixes the PostgreSQL silent-abort problem where developers lose all previous work); `SET ON_ERROR = 'rollback_transaction'` is PostgreSQL-standard behavior; `SET ON_ERROR = 'savepoint'` automatically creates a savepoint before each statement so errors can be recovered without losing the whole transaction; `SET ON_ERROR = 'ignore'` matches MySQL lenient behavior; solves the real production pain of `BEGIN ... multiple statements ... one fails ... COMMIT does ROLLBACK without warning`
 - [ ] 5.2b ⏳ Session-level collation and compat mode — `SET collation = 'es'` changes default sort for the session; `SET AXIOM_COMPAT = 'mysql'` makes the session behave like MySQL (CI+AI default); `SET AXIOM_COMPAT = 'postgresql'` for PG behavior; these settings propagate to all subsequent queries in the session and are reset on reconnect; foundation for the per-database compat mode in Phase 13
 - [x] 5.3 ✅ Authentication — mysql_native_password (SHA1-based); permissive mode (Phase 5); root/axiomdb accepted
@@ -251,6 +251,7 @@
 - [ ] 8.1 ⏳ Vectorized filter — evaluate predicates in chunks of 1024 rows
 - [ ] 8.2 ⏳ SIMD AVX2 with `wide` — compare 8-32 values per instruction
 - [ ] 8.3 ⏳ Improved query planner — selectivity, index vs scan with stats
+- [ ] 8.3b ⏳ Zone maps (per-page min/max) — store `min[col]`/`max[col]` in every heap page header for each column; heap scanner skips pages where `max < literal` or `min > literal` for equality/range predicates; zero separate index structure, always maintained on INSERT/UPDATE, ~8 bytes per column per page; distinct from BRIN (11.1b) which is opt-in and coarser (per-block-range, not per-page); MySQL 8 and PostgreSQL 15 have no equivalent built-in per-page skip — InnoDB relies entirely on B-Tree secondary indexes; primary fix for UPDATE/DELETE on unindexed columns (benchmark: 8-16x gap vs SQLite on `WHERE age = 30` without index)
 - [ ] 8.4 ⏳ Basic EXPLAIN — show chosen plan (join type, index or full scan, estimated cost)
 - [ ] 8.5 ⏳ SIMD vs MySQL benchmarks — point lookup, range scan, seq scan
 - [ ] 8.6 ⏳ SIMD correctness tests — verify that SIMD results are identical to row-by-row without SIMD
@@ -269,6 +270,7 @@
 - [ ] 9.8 ⏳ Spill to disk — when hash table or sort buffer exceeds `work_mem`, spill to temp files; no OOM on large joins
 - [ ] 9.9 ⏳ Adaptive join selection — query planner chooses nested loop / hash / sort-merge based on size and selectivity statistics
 - [ ] 9.10 ⏳ Join algorithms benchmarks — compare 3 strategies with different sizes; confirm that hash join beats nested loop with >10K rows
+- [ ] 9.11 ⏳ Streaming result iterator — `execute_streaming()` returns `impl Iterator<Item=Row>` instead of materializing `Vec<Row>` before returning; wire protocol sends rows as they are produced (no full buffer required); SELECT without ORDER BY can terminate early when LIMIT is reached without scanning the rest of the table; eliminates per-query allocation proportional to result size; MySQL C API has `USE_RESULT` mode, PostgreSQL has server-side cursors — AxiomDB needs an equivalent for competing on large result sets without OOM; prerequisite for cursor-based pagination (Phase 13+); depends on operator fusion (9.2) being lazy internally
 
 ### Phase 10 — Embedded mode + FFI `⏳` week 24-25
 - [ ] 10.1 ⏳ Refactor engine as reusable `lib.rs`
@@ -278,6 +280,7 @@
 - [ ] 10.5 ⏳ Embedded test — same DB used from server and from library
 - [ ] 10.6 ⏳ Node.js binding (Neon) — native `.node` module for Electron and Node apps; async/await API
 - [ ] 10.7 ⏳ Embedded vs server benchmark — compare in-process vs TCP loopback latency to demonstrate embedded advantage
+- [ ] 10.8 ⏳ PreparedStatement Rust API — `db.prepare(sql) -> PreparedStatement`; `stmt.execute(params: &[Value])` runs N times reusing the parsed + analyzed plan without calling parse/analyze again; separate from COM_STMT_PREPARE (5.10, wire-only) — this is for the embedded Rust API where there is no MySQL wire protocol; eliminates parse+analyze overhead in tight loops (primary cause of the 15-24x INSERT gap vs SQLite in embedded benchmarks); MySQL C API has `mysql_stmt_prepare()`, libpq has `PQprepare()`, SQLite has `sqlite3_prepare_v2()` — all three competitors require this for serious embedded performance; must invalidate the cached plan on DDL changes (reuse schema_version mechanism from 5.13); implement after 10.1 (lib.rs refactor) since the public API shape depends on it
 
 ---
 

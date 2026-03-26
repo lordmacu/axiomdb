@@ -286,6 +286,40 @@ foreach ($stmt as $row) {
 Point MySQL Workbench, DBeaver, or TablePlus to `127.0.0.1:3306`. No driver
 installation is required — the MySQL wire protocol is fully compatible.
 
+### Charset and collation
+
+AxiomDB negotiates charset and collation at the MySQL handshake boundary. The client
+sends its preferred collation id in the `HandshakeResponse41` packet; the server reads
+it and configures the session accordingly.
+
+**Supported charsets:**
+
+| Charset | Collation ids | Notes |
+|---------|--------------|-------|
+| `utf8mb4` | 45 (0900_ai_ci), 46 (0900_as_cs), 255 (0900_ai_ci) | Default for new connections |
+| `utf8` / `utf8mb3` | 33 (general_ci), 83 (bin) | BMP-only; 4-byte code points (emoji) rejected |
+| `latin1` | 8 (swedish_ci), 47 (bin) | MySQL latin1 = Windows-1252 (0x80 = '€', not ISO-8859-1) |
+| `binary` | 63 | Raw bytes, no transcoding |
+
+You can change the session charset at any time:
+
+```sql
+SET NAMES utf8mb4;                          -- sets client + connection + results
+SET NAMES latin1 COLLATE latin1_bin;        -- with explicit collation
+SET character_set_results = utf8mb4;        -- results charset only
+```
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Always use utf8mb4</span>
+Use <code>charset='utf8mb4'</code> in your client connection string. The AxiomDB engine
+stores everything as UTF-8; utf8mb4 requires zero transcoding overhead and supports
+the full Unicode range including emoji. Latin1 connections are supported for legacy
+PHP/MySQL applications.
+</div>
+</div>
+
 ### Authentication
 
 AxiomDB Phase 5 uses **permissive authentication**: the server accepts any password
