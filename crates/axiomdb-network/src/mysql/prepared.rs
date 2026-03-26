@@ -345,7 +345,7 @@ fn decode_binary_value(
         }
         // Binary-like (TINY_BLOB / MEDIUM_BLOB / LONG_BLOB / BLOB):
         // raw bytes, no charset decoding — preserves 0x00 bytes intact.
-        0xf9 | 0xfa | 0xfb | 0xfc => {
+        0xf9..=0xfc => {
             let (bytes, consumed) = read_lenenc_bytes(buf)?;
             Ok((Value::Bytes(bytes), consumed))
         }
@@ -446,7 +446,7 @@ pub fn decode_long_data_value(
             Ok(Value::Text(s))
         }
         // Binary-like: TINY_BLOB, MEDIUM_BLOB, LONG_BLOB, BLOB
-        0xf9 | 0xfa | 0xfb | 0xfc => Ok(Value::Bytes(raw.to_vec())),
+        0xf9..=0xfc => Ok(Value::Bytes(raw.to_vec())),
         other => Err(DbError::InvalidValue {
             reason: format!(
                 "COM_STMT_SEND_LONG_DATA is only valid for string/binary params, \
