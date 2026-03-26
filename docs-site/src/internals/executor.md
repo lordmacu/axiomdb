@@ -1204,6 +1204,12 @@ The fix: call `ctx.invalidate_all()` whenever any index root changes during
 INSERT or DELETE index maintenance. This forces re-resolution from the catalog
 (which always has the current `root_page_id`) on the next DML statement.
 
+The same fix applies to `execute_delete_ctx` (DELETE WHERE path): the
+`secondary_indexes` slice must be kept in sync within the per-row loop so
+that each subsequent row's deletion starts from the current root, not the
+stale freed one. Without this, a root collapse on row N causes row N+1 to
+start from a freed page, triggering a double-free in the B+tree freelist.
+
 ```
 // After each updated root in execute_insert_ctx / execute_delete:
 catalog.update_index_root(index_id, new_root)
