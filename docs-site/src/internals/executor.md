@@ -279,7 +279,49 @@ When the index already orders rows by the GROUP BY key prefix, the sorted execut
 
 ORDER BY is applied **after scan + filter + aggregation but before projection**
 for non-GROUP BY queries. For GROUP BY queries, it is applied to the projected
-output rows.
+output rows after `remap_order_by_for_grouped` rewrites column references.
+
+### ORDER BY in GROUP BY Context — Expression Remapping
+
+Grouped output rows are indexed by SELECT output position: position 0 = first
+SELECT item, position 1 = second, etc. ORDER BY expressions, however, are
+analyzed against the source schema where `Expr::Column { col_idx }` refers to
+the original table column.
+
+`remap_order_by_for_grouped` fixes this mismatch before calling `apply_order_by`:
+
+```
+remap_order_by_for_grouped(order_by, select_items):
+  for each ORDER BY item:
+    rewrite expr via remap_expr_for_grouped(expr, select_items)
+
+remap_expr_for_grouped(expr, select_items):
+  if expr == select_items[pos].expr (structural PartialEq):
+    return Column { col_idx: pos }   // output position
+  match expr:
+    BinaryOp → recurse into left, right
+    UnaryOp  → recurse into operand
+    IsNull   → recurse into inner
+    Between  → recurse into expr, low, high
+    Function → recurse into args
+    other    → return unchanged
+```
+
+This means `ORDER BY dept` (where `dept` is `Expr::Column{col_idx:1}` in the
+source) becomes `Expr::Column{col_idx:0}` when the SELECT is `SELECT dept, COUNT(*)`,
+correctly indexing into the projected output row.
+
+Aggregate expressions like `ORDER BY COUNT(*)` are matched structurally:
+if `Expr::Function{name:"count", args:[]}` appears in the SELECT at position 1,
+it is rewritten to `Expr::Column{col_idx:1}`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Expr PartialEq matching</span>
+Rather than maintaining a separate alias/position resolution table, AxiomDB uses structural <code>PartialEq</code> on <code>Expr</code> (which is derived) to identify ORDER BY expressions that match SELECT items. This is simpler than PostgreSQL's SortClause/TargetEntry reference system and correct for the common cases (column references, aggregates, compound expressions).
+</div>
+</div>
 
 ### NULL Ordering Defaults (PostgreSQL-compatible)
 

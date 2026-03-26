@@ -3611,7 +3611,8 @@ fn execute_select_grouped_hash(
     if stmt.distinct {
         rows = apply_distinct(rows);
     }
-    rows = apply_order_by(rows, &stmt.order_by)?;
+    let remapped_ob = remap_order_by_for_grouped(&stmt.order_by, &stmt.columns);
+    rows = apply_order_by(rows, &remapped_ob)?;
     rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 
     Ok(QueryResult::Rows {
@@ -3761,7 +3762,8 @@ fn execute_select_grouped_sorted(
     if stmt.distinct {
         rows = apply_distinct(rows);
     }
-    rows = apply_order_by(rows, &stmt.order_by)?;
+    let remapped_ob = remap_order_by_for_grouped(&stmt.order_by, &stmt.columns);
+    rows = apply_order_by(rows, &remapped_ob)?;
     rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 
     Ok(QueryResult::Rows {
@@ -6374,6 +6376,92 @@ fn apply_order_by(mut rows: Vec<Row>, order_items: &[OrderByItem]) -> Result<Vec
         return Err(e);
     }
     Ok(rows)
+}
+
+/// Remaps ORDER BY expressions so they can be evaluated against grouped output rows.
+///
+/// Grouped output rows are indexed by SELECT output position (0 = first SELECT item,
+/// 1 = second, ...).  ORDER BY expressions, however, reference the *source* schema:
+/// `Expr::Column { col_idx }` means "column col_idx in the original table row".
+///
+/// This function rewrites every sub-expression that structurally matches a SELECT
+/// item with `Expr::Column { col_idx: output_pos }`, so that `apply_order_by` can
+/// index into the projected output row correctly.  Handles both plain column
+/// references and aggregate expressions (COUNT(*), SUM(col), GROUP_CONCAT, …).
+///
+/// Expressions that match no SELECT item are left unchanged (they will produce
+/// errors or Null at evaluation time, which is the correct behavior for
+/// semantically invalid ORDER BY in GROUP BY context).
+fn remap_order_by_for_grouped(
+    order_by: &[crate::ast::OrderByItem],
+    select_items: &[SelectItem],
+) -> Vec<crate::ast::OrderByItem> {
+    order_by
+        .iter()
+        .map(|item| crate::ast::OrderByItem {
+            expr: remap_expr_for_grouped(&item.expr, select_items),
+            order: item.order,
+            nulls: item.nulls,
+        })
+        .collect()
+}
+
+/// Recursively rewrites `expr` for grouped output row evaluation.
+///
+/// - If `expr` structurally matches a SELECT item at output position `pos`,
+///   returns `Expr::Column { col_idx: pos, … }`.
+/// - Otherwise recurses into compound expressions (BinaryOp, UnaryOp, etc.)
+///   so that `ORDER BY col + 1` is also handled when `col` is in the SELECT.
+fn remap_expr_for_grouped(expr: &Expr, select_items: &[SelectItem]) -> Expr {
+    // Direct match against a SELECT item.
+    for (pos, item) in select_items.iter().enumerate() {
+        if let SelectItem::Expr { expr: sel_expr, .. } = item {
+            if expr == sel_expr {
+                return Expr::Column {
+                    col_idx: pos,
+                    name: format!("_out{pos}"),
+                };
+            }
+        }
+    }
+    // Recurse into compound expressions.
+    match expr.clone() {
+        Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+            op,
+            left: Box::new(remap_expr_for_grouped(&left, select_items)),
+            right: Box::new(remap_expr_for_grouped(&right, select_items)),
+        },
+        Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+            op,
+            operand: Box::new(remap_expr_for_grouped(&operand, select_items)),
+        },
+        Expr::IsNull {
+            expr: inner,
+            negated,
+        } => Expr::IsNull {
+            expr: Box::new(remap_expr_for_grouped(&inner, select_items)),
+            negated,
+        },
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(remap_expr_for_grouped(&inner, select_items)),
+            low: Box::new(remap_expr_for_grouped(&low, select_items)),
+            high: Box::new(remap_expr_for_grouped(&high, select_items)),
+            negated,
+        },
+        Expr::Function { name, args } => Expr::Function {
+            name,
+            args: args
+                .iter()
+                .map(|a| remap_expr_for_grouped(a, select_items))
+                .collect(),
+        },
+        other => other,
+    }
 }
 
 /// Evaluates a LIMIT or OFFSET expression as a non-negative integer.
