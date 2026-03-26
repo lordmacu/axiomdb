@@ -15,6 +15,7 @@ use axiomdb_sql::{
 use axiomdb_types::Value;
 
 use super::{
+    charset::{self, CharsetDef, CollationDef},
     packets::{build_eof_packet, write_lenenc_int, write_lenenc_str},
     result::build_column_def_pub,
     session::PreparedStatement,
@@ -28,11 +29,15 @@ use super::{
 /// - seq=1: Statement OK (stmt_id, num_cols, num_params)
 /// - seq=2..N: parameter column defs (stubs) + EOF, if num_params > 0
 /// - seq=N+1..: result column defs + EOF, if num_cols > 0
+///
+/// `results_collation` is used for result column definitions and parameter stub
+/// column definitions, so the client receives the correct charset id.
 pub fn build_prepare_response(
     stmt_id: u32,
     num_params: u16,
     result_cols: &[ColumnMeta],
     seq_start: u8,
+    results_collation: &'static CollationDef,
 ) -> Vec<(u8, Vec<u8>)> {
     let mut packets: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut seq = seq_start;
@@ -50,7 +55,7 @@ pub fn build_prepare_response(
 
     // Parameter column defs (stubs — type VAR_STRING)
     for _ in 0..num_params {
-        packets.push((seq, build_stub_column_def("?")));
+        packets.push((seq, build_stub_column_def("?", results_collation)));
         seq += 1;
     }
     if num_params > 0 {
@@ -70,7 +75,7 @@ pub fn build_prepare_response(
     packets
 }
 
-fn build_stub_column_def(name: &str) -> Vec<u8> {
+fn build_stub_column_def(name: &str, results_collation: &'static CollationDef) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     write_lenenc_str(&mut buf, b"def");
     write_lenenc_str(&mut buf, b"");
@@ -79,7 +84,7 @@ fn build_stub_column_def(name: &str) -> Vec<u8> {
     write_lenenc_str(&mut buf, name.as_bytes());
     write_lenenc_str(&mut buf, name.as_bytes());
     write_lenenc_int(&mut buf, 0x0c);
-    buf.extend_from_slice(&255u16.to_le_bytes()); // charset = utf8mb4
+    buf.extend_from_slice(&results_collation.id.to_le_bytes()); // charset = results_collation
     buf.extend_from_slice(&255u32.to_le_bytes()); // column_length
     buf.push(0xfd); // type = VAR_STRING
     buf.extend_from_slice(&0u16.to_le_bytes()); // flags
@@ -98,11 +103,15 @@ pub struct ExecutePacket {
 
 /// Parses a `COM_STMT_EXECUTE` payload (after the 0x17 command byte).
 ///
+/// `client_charset` is used to decode string-like binary parameters.
+/// Pass `conn_state.client_charset()` from the connection handler.
+///
 /// Updates `stmt.param_types` if the client sends a new type list
 /// (`new_params_bound_flag = 1`).
 pub fn parse_execute_packet(
     payload: &[u8],
     stmt: &mut PreparedStatement,
+    client_charset: &'static CharsetDef,
 ) -> Result<ExecutePacket, DbError> {
     if payload.len() < 9 {
         return Err(DbError::ParseError {
@@ -167,9 +176,9 @@ pub fn parse_execute_packet(
             continue;
         }
         let type_code = stmt.param_types.get(i).copied().unwrap_or(0xfd);
-        let (value, consumed) =
-            decode_binary_value(&payload[pos..], type_code).map_err(|msg| DbError::ParseError {
-                message: format!("param {i}: {msg}"),
+        let (value, consumed) = decode_binary_value(&payload[pos..], type_code, client_charset)
+            .map_err(|e| DbError::ParseError {
+                message: format!("param {i}: {e}"),
                 position: None,
             })?;
         params.push(value);
@@ -187,15 +196,24 @@ fn is_null(bitmap: &[u8], idx: usize) -> bool {
 
 /// Decodes one binary-encoded parameter value.
 /// Returns `(value, bytes_consumed)`.
-fn decode_binary_value(buf: &[u8], type_code: u16) -> Result<(Value, usize), &'static str> {
+fn decode_binary_value(
+    buf: &[u8],
+    type_code: u16,
+    client_charset: &'static CharsetDef,
+) -> Result<(Value, usize), DbError> {
     let type_base = (type_code & 0x00FF) as u8;
     let unsigned = (type_code >> 8) & 0x80 != 0; // unsigned flag in high byte
+
+    let trunc = |what: &str| DbError::ParseError {
+        message: format!("{what} truncated in COM_STMT_EXECUTE param"),
+        position: None,
+    };
 
     match type_base {
         0x01 => {
             // TINY (u8 or i8) — Python bool True/False comes as TINY(1)/TINY(0)
             if buf.is_empty() {
-                return Err("TINY truncated");
+                return Err(trunc("TINY"));
             }
             let n = buf[0];
             let v = if unsigned {
@@ -208,7 +226,7 @@ fn decode_binary_value(buf: &[u8], type_code: u16) -> Result<(Value, usize), &'s
         0x02 => {
             // SHORT
             if buf.len() < 2 {
-                return Err("SHORT truncated");
+                return Err(trunc("SHORT"));
             }
             let raw = i16::from_le_bytes([buf[0], buf[1]]);
             Ok((Value::Int(raw as i32), 2))
@@ -216,7 +234,7 @@ fn decode_binary_value(buf: &[u8], type_code: u16) -> Result<(Value, usize), &'s
         0x03 | 0x09 => {
             // LONG / INT24
             if buf.len() < 4 {
-                return Err("LONG truncated");
+                return Err(trunc("LONG"));
             }
             Ok((
                 Value::Int(i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])),
@@ -226,7 +244,7 @@ fn decode_binary_value(buf: &[u8], type_code: u16) -> Result<(Value, usize), &'s
         0x08 => {
             // LONGLONG
             if buf.len() < 8 {
-                return Err("LONGLONG truncated");
+                return Err(trunc("LONGLONG"));
             }
             Ok((
                 Value::BigInt(i64::from_le_bytes(buf[..8].try_into().unwrap())),
@@ -236,7 +254,7 @@ fn decode_binary_value(buf: &[u8], type_code: u16) -> Result<(Value, usize), &'s
         0x04 => {
             // FLOAT
             if buf.len() < 4 {
-                return Err("FLOAT truncated");
+                return Err(trunc("FLOAT"));
             }
             let f = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
             Ok((Value::Real(f as f64), 4))
@@ -244,7 +262,7 @@ fn decode_binary_value(buf: &[u8], type_code: u16) -> Result<(Value, usize), &'s
         0x05 => {
             // DOUBLE
             if buf.len() < 8 {
-                return Err("DOUBLE truncated");
+                return Err(trunc("DOUBLE"));
             }
             Ok((
                 Value::Real(f64::from_le_bytes(buf[..8].try_into().unwrap())),
@@ -258,11 +276,11 @@ fn decode_binary_value(buf: &[u8], type_code: u16) -> Result<(Value, usize), &'s
         0x0a => {
             // DATE: [len][year u16][month u8][day u8]
             if buf.is_empty() {
-                return Err("DATE truncated");
+                return Err(trunc("DATE"));
             }
             let len = buf[0] as usize;
             if buf.len() < 1 + len {
-                return Err("DATE data truncated");
+                return Err(trunc("DATE data"));
             }
             let data = &buf[1..1 + len];
             let val = if len >= 4 {
@@ -278,11 +296,11 @@ fn decode_binary_value(buf: &[u8], type_code: u16) -> Result<(Value, usize), &'s
         0x07 | 0x0c => {
             // TIMESTAMP / DATETIME: [len][year u16][month][day][hour][min][sec][microsec u32]
             if buf.is_empty() {
-                return Err("DATETIME truncated");
+                return Err(trunc("DATETIME"));
             }
             let len = buf[0] as usize;
             if buf.len() < 1 + len {
-                return Err("DATETIME data truncated");
+                return Err(trunc("DATETIME data"));
             }
             let data = &buf[1..1 + len];
             let val = if len >= 4 {
@@ -301,18 +319,18 @@ fn decode_binary_value(buf: &[u8], type_code: u16) -> Result<(Value, usize), &'s
             Ok((val, 1 + len))
         }
         0x00 | 0xf6 => {
-            // DECIMAL / NEWDECIMAL — lenenc string
-            let (s, consumed) = read_lenenc_str(buf)?;
+            // DECIMAL / NEWDECIMAL — lenenc string (always ASCII digits, charset irrelevant)
+            let (s, consumed) = read_lenenc_str(buf, client_charset)?;
             Ok((Value::Text(s), consumed))
         }
-        // All string/blob types: lenenc-prefixed bytes
+        // All string/blob types: lenenc-prefixed bytes decoded with client charset
         0x0f | 0xfc | 0xfd | 0xfe | 0xf5 | 0x10 | 0xf3 | 0xf4 => {
-            let (s, consumed) = read_lenenc_str(buf)?;
+            let (s, consumed) = read_lenenc_str(buf, client_charset)?;
             Ok((Value::Text(s), consumed))
         }
         _ => {
-            // Unknown type — read as lenenc string (best-effort)
-            let (s, consumed) = read_lenenc_str(buf)?;
+            // Unknown type — read as lenenc string with client charset
+            let (s, consumed) = read_lenenc_str(buf, client_charset)?;
             Ok((Value::Text(s), consumed))
         }
     }
@@ -348,13 +366,23 @@ fn read_lenenc_int(buf: &[u8]) -> Result<(u64, usize), &'static str> {
     }
 }
 
-fn read_lenenc_str(buf: &[u8]) -> Result<(String, usize), &'static str> {
-    let (len, llen) = read_lenenc_int(buf)?;
+fn read_lenenc_str(
+    buf: &[u8],
+    client_charset: &'static CharsetDef,
+) -> Result<(String, usize), DbError> {
+    let (len, llen) = read_lenenc_int(buf).map_err(|msg| DbError::ParseError {
+        message: format!("lenenc string: {msg}"),
+        position: None,
+    })?;
     let len = len as usize;
     if buf.len() < llen + len {
-        return Err("lenenc string data truncated");
+        return Err(DbError::ParseError {
+            message: "lenenc string data truncated in COM_STMT_EXECUTE".into(),
+            position: None,
+        });
     }
-    let s = String::from_utf8_lossy(&buf[llen..llen + len]).into_owned();
+    let s =
+        charset::decode_text(client_charset, &buf[llen..llen + len]).map(|cow| cow.into_owned())?;
     Ok((s, llen + len))
 }
 
@@ -633,6 +661,7 @@ fn subst_expr_param(expr: Expr, params: &[Value]) -> Expr {
 
 #[cfg(test)]
 mod tests {
+    use super::super::charset::{DEFAULT_SERVER_COLLATION, UTF8MB4_CHARSET};
     use super::*;
     use axiomdb_types::DataType;
 
@@ -692,7 +721,7 @@ mod tests {
     #[test]
     fn test_decode_tiny() {
         let buf = [42u8];
-        let (val, consumed) = decode_binary_value(&buf, 0x01).unwrap();
+        let (val, consumed) = decode_binary_value(&buf, 0x01, &UTF8MB4_CHARSET).unwrap();
         assert_eq!(val, Value::Int(42));
         assert_eq!(consumed, 1);
     }
@@ -701,7 +730,7 @@ mod tests {
     fn test_decode_longlong() {
         let n: i64 = 1_000_000_000_000;
         let buf = n.to_le_bytes();
-        let (val, consumed) = decode_binary_value(&buf, 0x08).unwrap();
+        let (val, consumed) = decode_binary_value(&buf, 0x08, &UTF8MB4_CHARSET).unwrap();
         assert_eq!(val, Value::BigInt(n));
         assert_eq!(consumed, 8);
     }
@@ -711,7 +740,7 @@ mod tests {
         let s = b"hello";
         let mut buf = vec![s.len() as u8];
         buf.extend_from_slice(s);
-        let (val, consumed) = decode_binary_value(&buf, 0xfd).unwrap();
+        let (val, consumed) = decode_binary_value(&buf, 0xfd, &UTF8MB4_CHARSET).unwrap();
         assert_eq!(val, Value::Text("hello".into()));
         assert_eq!(consumed, 6);
     }
@@ -726,7 +755,7 @@ mod tests {
     #[test]
     fn test_prepare_response_structure() {
         let cols = vec![ColumnMeta::computed("id".to_string(), DataType::Int)];
-        let packets = build_prepare_response(1, 2, &cols, 1);
+        let packets = build_prepare_response(1, 2, &cols, 1, DEFAULT_SERVER_COLLATION);
         // seq=1: OK, seq=2: param stub, seq=3: param stub, seq=4: EOF, seq=5: col def, seq=6: EOF
         assert_eq!(packets.len(), 6);
         assert_eq!(packets[0].0, 1); // OK at seq=1
@@ -794,7 +823,7 @@ mod tests {
         let s = b"1";
         let mut buf = vec![s.len() as u8]; // lenenc: 1 byte length prefix
         buf.extend_from_slice(s);
-        let (val, consumed) = decode_binary_value(&buf, 0xfd).unwrap();
+        let (val, consumed) = decode_binary_value(&buf, 0xfd, &UTF8MB4_CHARSET).unwrap();
         assert_eq!(val, Value::Text("1".into()));
         assert_eq!(consumed, 2); // 1 byte lenenc + 1 byte payload
     }
@@ -832,7 +861,7 @@ mod tests {
         payload.push(1); // lenenc: length = 1
         payload.push(b'2'); // the string "2"
 
-        let exec = parse_execute_packet(&payload, &mut stmt).unwrap();
+        let exec = parse_execute_packet(&payload, &mut stmt, &UTF8MB4_CHARSET).unwrap();
         assert_eq!(exec.params.len(), 1);
         assert_eq!(exec.params[0], Value::Text("2".into()));
     }

@@ -9,9 +9,11 @@
 //! - `Affected` → OK_Packet
 //! - `Empty`    → OK_Packet
 
+use axiomdb_core::error::DbError;
 use axiomdb_sql::result::{ColumnMeta, QueryResult, Row};
 use axiomdb_types::{DataType, Value};
 
+use super::charset::{self, CollationDef, BINARY_COLLATION_DEF};
 use super::packets::{
     build_eof_packet, build_eof_with_status, build_ok_with_status, write_lenenc_int,
     write_lenenc_str,
@@ -32,11 +34,18 @@ pub type PacketSeq = Vec<(u8, Vec<u8>)>;
 /// `seq_start` is the sequence_id for the first response packet
 /// (usually 1, since the client's COM_QUERY was seq=0).
 ///
-/// `more_results` sets `SERVER_MORE_RESULTS_EXISTS` in the final EOF/OK packet,
-/// telling the client that another result set follows (used by COM_QUERY
-/// multi-statement responses, Phase 5.12).
-pub fn serialize_query_result(result: QueryResult, seq_start: u8) -> PacketSeq {
-    serialize_query_result_multi(result, seq_start, false)
+/// `results_collation` controls both the charset id in column definitions and
+/// the byte encoding of outbound text/decimal/uuid values.  Pass
+/// `DEFAULT_SERVER_COLLATION` for UTF-8 clients.
+///
+/// Returns `Err` if a text value cannot be encoded in the selected result charset
+/// (e.g., an emoji in a `latin1` or `utf8mb3` result set).
+pub fn serialize_query_result(
+    result: QueryResult,
+    seq_start: u8,
+    results_collation: &'static CollationDef,
+) -> Result<PacketSeq, DbError> {
+    serialize_query_result_multi(result, seq_start, false, results_collation)
 }
 
 /// Like [`serialize_query_result`] but with explicit `more_results` flag.
@@ -44,8 +53,9 @@ pub fn serialize_query_result_multi(
     result: QueryResult,
     seq_start: u8,
     more_results: bool,
-) -> PacketSeq {
-    serialize_query_result_multi_warn(result, seq_start, more_results, 0)
+    results_collation: &'static CollationDef,
+) -> Result<PacketSeq, DbError> {
+    serialize_query_result_multi_warn(result, seq_start, more_results, 0, results_collation)
 }
 
 pub fn serialize_query_result_multi_warn(
@@ -53,7 +63,8 @@ pub fn serialize_query_result_multi_warn(
     seq_start: u8,
     more_results: bool,
     warning_count: u16,
-) -> PacketSeq {
+    results_collation: &'static CollationDef,
+) -> Result<PacketSeq, DbError> {
     let status = if more_results {
         SERVER_STATUS_AUTOCOMMIT | SERVER_MORE_RESULTS_EXISTS
     } else {
@@ -61,20 +72,23 @@ pub fn serialize_query_result_multi_warn(
     };
 
     match result {
-        QueryResult::Rows { columns, rows } => serialize_rows(&columns, &rows, seq_start, status),
+        QueryResult::Rows { columns, rows } => {
+            serialize_rows(&columns, &rows, seq_start, status, results_collation)
+        }
         QueryResult::Affected {
             count,
             last_insert_id,
         } => {
             let last_id = last_insert_id.unwrap_or(0);
-            vec![(
+            Ok(vec![(
                 seq_start,
                 build_ok_with_status(count, last_id, warning_count, status),
-            )]
+            )])
         }
-        QueryResult::Empty => {
-            vec![(seq_start, build_ok_with_status(0, 0, warning_count, status))]
-        }
+        QueryResult::Empty => Ok(vec![(
+            seq_start,
+            build_ok_with_status(0, 0, warning_count, status),
+        )]),
     }
 }
 
@@ -89,29 +103,38 @@ pub fn serialize_query_result_multi_warn(
 /// - Numeric types are fixed-width little-endian, not ASCII text
 /// - DATE / TIMESTAMP use compact binary payloads
 ///
+/// `results_collation` controls the charset id in column definitions and the
+/// byte encoding of outbound text-like values.
+///
 /// Non-row results (`Affected`, `Empty`) still use OK_Packets, identical to the
 /// text protocol.
-pub fn serialize_query_result_binary(result: QueryResult, seq_start: u8) -> PacketSeq {
+pub fn serialize_query_result_binary(
+    result: QueryResult,
+    seq_start: u8,
+    results_collation: &'static CollationDef,
+) -> Result<PacketSeq, DbError> {
     match result {
-        QueryResult::Rows { columns, rows } => {
-            serialize_rows_binary(&columns, &rows, seq_start, SERVER_STATUS_AUTOCOMMIT)
-        }
+        QueryResult::Rows { columns, rows } => serialize_rows_binary(
+            &columns,
+            &rows,
+            seq_start,
+            SERVER_STATUS_AUTOCOMMIT,
+            results_collation,
+        ),
         QueryResult::Affected {
             count,
             last_insert_id,
         } => {
             let last_id = last_insert_id.unwrap_or(0);
-            vec![(
+            Ok(vec![(
                 seq_start,
                 build_ok_with_status(count, last_id, 0, SERVER_STATUS_AUTOCOMMIT),
-            )]
+            )])
         }
-        QueryResult::Empty => {
-            vec![(
-                seq_start,
-                build_ok_with_status(0, 0, 0, SERVER_STATUS_AUTOCOMMIT),
-            )]
-        }
+        QueryResult::Empty => Ok(vec![(
+            seq_start,
+            build_ok_with_status(0, 0, 0, SERVER_STATUS_AUTOCOMMIT),
+        )]),
     }
 }
 
@@ -120,7 +143,8 @@ fn serialize_rows_binary(
     rows: &[Row],
     seq_start: u8,
     final_status: u16,
-) -> PacketSeq {
+    results_collation: &'static CollationDef,
+) -> Result<PacketSeq, DbError> {
     let mut packets = PacketSeq::new();
     let mut seq = seq_start;
 
@@ -132,7 +156,7 @@ fn serialize_rows_binary(
 
     // 2. Column definition packets (shared with text path)
     for col in cols {
-        packets.push((seq, build_column_def(col)));
+        packets.push((seq, build_column_def(col, results_collation)));
         seq += 1;
     }
 
@@ -142,14 +166,14 @@ fn serialize_rows_binary(
 
     // 4. Binary row packets
     for row in rows {
-        packets.push((seq, build_binary_row_packet(cols, row)));
+        packets.push((seq, build_binary_row_packet(cols, row, results_collation)?));
         seq += 1;
     }
 
     // 5. Final EOF
     packets.push((seq, build_eof_with_status(final_status)));
 
-    packets
+    Ok(packets)
 }
 
 /// Builds one binary row packet payload.
@@ -160,7 +184,11 @@ fn serialize_rows_binary(
 /// null_bitmap[bitmap_len]     (MySQL offset-2 null bitmap)
 /// value_1 ... value_n         (only non-null values, in column order)
 /// ```
-fn build_binary_row_packet(cols: &[ColumnMeta], row: &[Value]) -> Vec<u8> {
+fn build_binary_row_packet(
+    cols: &[ColumnMeta],
+    row: &[Value],
+    results_collation: &'static CollationDef,
+) -> Result<Vec<u8>, DbError> {
     debug_assert_eq!(cols.len(), row.len());
 
     let bitmap_len = (cols.len() + 7 + 2) / 8;
@@ -175,10 +203,10 @@ fn build_binary_row_packet(cols: &[ColumnMeta], row: &[Value]) -> Vec<u8> {
             set_binary_null_bit(&mut buf[bitmap_start..bitmap_start + bitmap_len], idx);
             continue;
         }
-        encode_binary_cell(&mut buf, col.data_type, value);
+        encode_binary_cell(&mut buf, col.data_type, value, results_collation)?;
     }
 
-    buf
+    Ok(buf)
 }
 
 /// Sets the null-bitmap bit for `field_index` using MySQL's prepared-row
@@ -191,23 +219,38 @@ fn set_binary_null_bit(bitmap: &mut [u8], field_index: usize) {
 }
 
 /// Encodes one non-null cell value using the MySQL binary row protocol.
-fn encode_binary_cell(buf: &mut Vec<u8>, data_type: DataType, value: &Value) {
+fn encode_binary_cell(
+    buf: &mut Vec<u8>,
+    data_type: DataType,
+    value: &Value,
+    results_collation: &'static CollationDef,
+) -> Result<(), DbError> {
     match (data_type, value) {
         (DataType::Bool, Value::Bool(v)) => buf.push(u8::from(*v)),
         (DataType::Int, Value::Int(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (DataType::BigInt, Value::BigInt(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (DataType::Real, Value::Real(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (DataType::Decimal, Value::Decimal(m, s)) => {
-            write_lenenc_str(buf, format_decimal(*m, *s).as_bytes())
+            let s_text = format_decimal(*m, *s);
+            let encoded = charset::encode_text(results_collation.charset, &s_text)?;
+            write_lenenc_str(buf, &encoded);
         }
-        (DataType::Text, Value::Text(s)) => write_lenenc_str(buf, s.as_bytes()),
-        (DataType::Bytes, Value::Bytes(b)) => write_lenenc_str(buf, b),
+        (DataType::Text, Value::Text(s)) => {
+            let encoded = charset::encode_text(results_collation.charset, s)?;
+            write_lenenc_str(buf, &encoded);
+        }
+        (DataType::Bytes, Value::Bytes(b)) => write_lenenc_str(buf, b), // raw bytes, no transcoding
         (DataType::Date, Value::Date(days)) => encode_binary_date(buf, *days),
         (DataType::Timestamp, Value::Timestamp(ts)) => encode_binary_timestamp(buf, *ts),
-        (DataType::Uuid, Value::Uuid(u)) => write_lenenc_str(buf, format_uuid(u).as_bytes()),
+        (DataType::Uuid, Value::Uuid(u)) => {
+            let s_text = format_uuid(u);
+            let encoded = charset::encode_text(results_collation.charset, &s_text)?;
+            write_lenenc_str(buf, &encoded);
+        }
         // Any mismatch is a QueryResult invariant violation — not a user-visible error.
         (_, other) => unreachable!("binary cell type/value mismatch: {other:?}"),
     }
+    Ok(())
 }
 
 /// Encodes a DATE value as the MySQL binary date payload.
@@ -258,7 +301,8 @@ fn serialize_rows(
     rows: &[Row],
     seq_start: u8,
     final_status: u16,
-) -> PacketSeq {
+    results_collation: &'static CollationDef,
+) -> Result<PacketSeq, DbError> {
     let mut packets = PacketSeq::new();
     let mut seq = seq_start;
 
@@ -270,7 +314,7 @@ fn serialize_rows(
 
     // 2. Column definition packets
     for col in cols {
-        packets.push((seq, build_column_def(col)));
+        packets.push((seq, build_column_def(col, results_collation)));
         seq += 1;
     }
 
@@ -280,21 +324,22 @@ fn serialize_rows(
 
     // 4. Row data packets
     for row in rows {
-        packets.push((seq, build_row_packet(row)));
+        packets.push((seq, build_row_packet(row, results_collation)?));
         seq += 1;
     }
 
     // 5. Final EOF — carries MORE_RESULTS flag when there are more statements
     packets.push((seq, build_eof_with_status(final_status)));
 
-    packets
+    Ok(packets)
 }
 
 pub(crate) fn build_column_def_pub(col: &ColumnMeta) -> Vec<u8> {
-    build_column_def(col)
+    use super::charset::DEFAULT_SERVER_COLLATION;
+    build_column_def(col, DEFAULT_SERVER_COLLATION)
 }
 
-fn build_column_def(col: &ColumnMeta) -> Vec<u8> {
+fn build_column_def(col: &ColumnMeta, results_collation: &'static CollationDef) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
 
     write_lenenc_str(&mut buf, b"def"); // catalog
@@ -306,8 +351,13 @@ fn build_column_def(col: &ColumnMeta) -> Vec<u8> {
 
     // Fixed-length section (12 bytes, introduced by lenenc_int = 0x0c)
     write_lenenc_int(&mut buf, 0x0c);
-    // character_set = 255 (utf8mb4_0900_ai_ci)
-    buf.extend_from_slice(&255u16.to_le_bytes());
+    // character_set — text-like columns use the result collation id;
+    //                 numeric / date / bytes use binary collation id (63).
+    let charset_id = match col.data_type {
+        DataType::Text | DataType::Decimal | DataType::Uuid => results_collation.id,
+        _ => BINARY_COLLATION_DEF.id, // 63
+    };
+    buf.extend_from_slice(&charset_id.to_le_bytes());
     // column_length (display width) — use type-dependent default
     let col_len = column_display_len(col.data_type);
     buf.extend_from_slice(&col_len.to_le_bytes());
@@ -323,18 +373,23 @@ fn build_column_def(col: &ColumnMeta) -> Vec<u8> {
     buf
 }
 
-fn build_row_packet(row: &[Value]) -> Vec<u8> {
+fn build_row_packet(
+    row: &[Value],
+    results_collation: &'static CollationDef,
+) -> Result<Vec<u8>, DbError> {
     let mut buf = Vec::new();
     for value in row {
         match value {
-            Value::Null => buf.push(0xfb), // NULL indicator
+            Value::Null => buf.push(0xfb),                    // NULL indicator
+            Value::Bytes(b) => write_lenenc_str(&mut buf, b), // raw bytes, no transcoding
             v => {
                 let s = value_to_text(v);
-                write_lenenc_str(&mut buf, s.as_bytes());
+                let encoded = charset::encode_text(results_collation.charset, &s)?;
+                write_lenenc_str(&mut buf, &encoded);
             }
         }
     }
-    buf
+    Ok(buf)
 }
 
 // ── Type mappings ─────────────────────────────────────────────────────────────
@@ -492,6 +547,7 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::charset::DEFAULT_SERVER_COLLATION;
     use super::*;
     use axiomdb_sql::result::ColumnMeta;
 
@@ -536,7 +592,7 @@ mod tests {
     fn test_binary_row_header_is_0x00() {
         let cols = vec![make_col("x", DataType::Int)];
         let row = vec![Value::Int(1)];
-        let pkt = build_binary_row_packet(&cols, &row);
+        let pkt = build_binary_row_packet(&cols, &row, DEFAULT_SERVER_COLLATION).unwrap();
         assert_eq!(pkt[0], 0x00, "binary row header must be 0x00");
     }
 
@@ -545,7 +601,7 @@ mod tests {
         // Column 0 NULL → bit position 2 in byte 0 (offset 2 means bit 2 of byte 0)
         let cols = vec![make_col("a", DataType::Int)];
         let row = vec![Value::Null];
-        let pkt = build_binary_row_packet(&cols, &row);
+        let pkt = build_binary_row_packet(&cols, &row, DEFAULT_SERVER_COLLATION).unwrap();
         // bitmap byte 0 = bit 2 set = 0x04
         assert_eq!(
             pkt[1], 0x04,
@@ -564,7 +620,7 @@ mod tests {
         // Column 1 NULL → bit position 3 in byte 0
         let cols = vec![make_col("a", DataType::Int), make_col("b", DataType::Int)];
         let row = vec![Value::Int(42), Value::Null];
-        let pkt = build_binary_row_packet(&cols, &row);
+        let pkt = build_binary_row_packet(&cols, &row, DEFAULT_SERVER_COLLATION).unwrap();
         // col 1 → shifted = 3 → byte 0 bit 3 = 0x08
         assert_eq!(
             pkt[1] & 0x08,
@@ -577,7 +633,7 @@ mod tests {
     fn test_binary_bigint_is_8_byte_le() {
         let cols = vec![make_col("n", DataType::BigInt)];
         let row = vec![Value::BigInt(0x0102030405060708_i64)];
-        let pkt = build_binary_row_packet(&cols, &row);
+        let pkt = build_binary_row_packet(&cols, &row, DEFAULT_SERVER_COLLATION).unwrap();
         // header(1) + bitmap(1) + value(8) = 10 bytes
         assert_eq!(pkt.len(), 10);
         let val = i64::from_le_bytes(pkt[2..10].try_into().unwrap());
@@ -588,7 +644,7 @@ mod tests {
     fn test_binary_int_is_4_byte_le() {
         let cols = vec![make_col("n", DataType::Int)];
         let row = vec![Value::Int(-1)];
-        let pkt = build_binary_row_packet(&cols, &row);
+        let pkt = build_binary_row_packet(&cols, &row, DEFAULT_SERVER_COLLATION).unwrap();
         assert_eq!(pkt.len(), 6); // 1 + 1 + 4
         let val = i32::from_le_bytes(pkt[2..6].try_into().unwrap());
         assert_eq!(val, -1);
@@ -599,8 +655,8 @@ mod tests {
         let cols = vec![make_col("b", DataType::Bool)];
         let row_t = vec![Value::Bool(true)];
         let row_f = vec![Value::Bool(false)];
-        let pkt_t = build_binary_row_packet(&cols, &row_t);
-        let pkt_f = build_binary_row_packet(&cols, &row_f);
+        let pkt_t = build_binary_row_packet(&cols, &row_t, DEFAULT_SERVER_COLLATION).unwrap();
+        let pkt_f = build_binary_row_packet(&cols, &row_f, DEFAULT_SERVER_COLLATION).unwrap();
         assert_eq!(pkt_t.len(), 3); // 1 + 1 + 1
         assert_eq!(pkt_t[2], 0x01);
         assert_eq!(pkt_f[2], 0x00);
@@ -610,7 +666,7 @@ mod tests {
     fn test_binary_decimal_is_lenenc_ascii() {
         let cols = vec![make_col("d", DataType::Decimal)];
         let row = vec![Value::Decimal(12345, 2)]; // 123.45
-        let pkt = build_binary_row_packet(&cols, &row);
+        let pkt = build_binary_row_packet(&cols, &row, DEFAULT_SERVER_COLLATION).unwrap();
         // After header(1) + bitmap(1): lenenc length byte + "123.45"
         assert_eq!(pkt[2], 6); // lenenc length = 6
         assert_eq!(&pkt[3..9], b"123.45");
@@ -621,7 +677,7 @@ mod tests {
         let cols = vec![make_col("b", DataType::Bytes)];
         let raw = vec![0x00, 0xff, 0x42]; // contains null byte
         let row = vec![Value::Bytes(raw.clone())];
-        let pkt = build_binary_row_packet(&cols, &row);
+        let pkt = build_binary_row_packet(&cols, &row, DEFAULT_SERVER_COLLATION).unwrap();
         assert_eq!(pkt[2], 3); // lenenc length = 3
         assert_eq!(&pkt[3..6], raw.as_slice());
     }
@@ -631,7 +687,7 @@ mod tests {
         // 2024-01-15: days since epoch = 19737
         let cols = vec![make_col("d", DataType::Date)];
         let row = vec![Value::Date(19737)];
-        let pkt = build_binary_row_packet(&cols, &row);
+        let pkt = build_binary_row_packet(&cols, &row, DEFAULT_SERVER_COLLATION).unwrap();
         // header(1) + bitmap(1) + length_byte(1) + year_u16(2) + month(1) + day(1) = 7
         assert_eq!(pkt.len(), 7);
         assert_eq!(pkt[2], 4); // length byte = 4
@@ -649,7 +705,7 @@ mod tests {
         let micros: i64 = 1_705_314_600 * 1_000_000;
         let cols = vec![make_col("ts", DataType::Timestamp)];
         let row = vec![Value::Timestamp(micros)];
-        let pkt = build_binary_row_packet(&cols, &row);
+        let pkt = build_binary_row_packet(&cols, &row, DEFAULT_SERVER_COLLATION).unwrap();
         // header(1) + bitmap(1) + len(1) + year(2) + month(1) + day(1) + h(1) + m(1) + s(1) = 10
         assert_eq!(pkt.len(), 10);
         assert_eq!(pkt[2], 7); // length byte = 7 (no micros)
@@ -667,7 +723,7 @@ mod tests {
         let micros: i64 = 1_705_314_600 * 1_000_000 + 123_456;
         let cols = vec![make_col("ts", DataType::Timestamp)];
         let row = vec![Value::Timestamp(micros)];
-        let pkt = build_binary_row_packet(&cols, &row);
+        let pkt = build_binary_row_packet(&cols, &row, DEFAULT_SERVER_COLLATION).unwrap();
         // header(1) + bitmap(1) + len(1) + year(2) + month(1) + day(1) + h(1) + m(1) + s(1) + micros(4) = 14
         assert_eq!(pkt.len(), 14);
         assert_eq!(pkt[2], 11); // length byte = 11
@@ -705,7 +761,7 @@ mod tests {
             columns: cols,
             rows,
         };
-        let packets = serialize_query_result(qr, 1);
+        let packets = serialize_query_result(qr, 1, DEFAULT_SERVER_COLLATION).unwrap();
         let row_pkt = packets.iter().find(|(seq, _)| *seq == 4).unwrap();
         assert_eq!(row_pkt.1[0], 0xfb, "text protocol NULL must remain 0xfb");
     }
@@ -719,8 +775,77 @@ mod tests {
             columns: cols,
             rows,
         };
-        let packets = serialize_query_result_binary(qr, 1);
+        let packets = serialize_query_result_binary(qr, 1, DEFAULT_SERVER_COLLATION).unwrap();
         let seqs: Vec<u8> = packets.iter().map(|(s, _)| *s).collect();
         assert_eq!(seqs, [1, 2, 3, 4, 5]);
+    }
+
+    // ── Charset-aware collation id in column definitions ─────────────────────
+
+    #[test]
+    fn test_text_column_def_uses_result_collation_id() {
+        use super::super::charset::LATIN1_SWEDISH_CI;
+        let col = ColumnMeta::computed("name".to_string(), DataType::Text);
+        let def = build_column_def(&col, &LATIN1_SWEDISH_CI);
+        // Fixed section starts at offset after catalog/schema/table/org_table/name/org_name lenenc fields.
+        // charset id is 2 bytes starting at position 13 (after lenenc_int 0x0c).
+        // We verify by reading the charset id from the known position.
+        // catalog "def" (1+3), schema "" (1), table "" (1), org_table "" (1),
+        // name "name" (1+4), org_name "name" (1+4) = 17 bytes prefix,
+        // then 0x0c (1 byte) = 18, then charset id (2 bytes).
+        let charset_id = u16::from_le_bytes([def[18], def[19]]);
+        assert_eq!(charset_id, 8, "latin1_swedish_ci id must be 8");
+    }
+
+    #[test]
+    fn test_bytes_column_def_uses_binary_collation_id() {
+        use super::super::charset::DEFAULT_SERVER_COLLATION;
+        let col = ColumnMeta::computed("data".to_string(), DataType::Bytes);
+        let def = build_column_def(&col, DEFAULT_SERVER_COLLATION);
+        let charset_id = u16::from_le_bytes([def[18], def[19]]);
+        assert_eq!(
+            charset_id, 63,
+            "Bytes column must use binary collation id 63"
+        );
+    }
+
+    #[test]
+    fn test_int_column_def_uses_binary_collation_id() {
+        let col = ColumnMeta::computed("n".to_string(), DataType::Int);
+        let def = build_column_def(&col, DEFAULT_SERVER_COLLATION);
+        let charset_id = u16::from_le_bytes([def[17], def[18]]);
+        // Position: catalog(4) + schema(1) + table(1) + org_table(1) + name(2) + org_name(2) + lenenc_0x0c(1) = 12 offset?
+        // Let me just verify it's NOT 255 (text collation) and IS 63.
+        // Actually let me compute: "def" → 0x03 0x64 0x65 0x66 (4 bytes)
+        // schema "" → 0x00 (1), table "" → 0x00 (1), org_table "" → 0x00 (1)
+        // name "n" → 0x01 0x6e (2), org_name "n" → 0x01 0x6e (2)
+        // Total: 4+1+1+1+2+2 = 11 bytes, then 0x0c (1 byte), then charset (2 bytes)
+        // offset 12 = charset bytes
+        let charset_id = u16::from_le_bytes([def[12], def[13]]);
+        assert_eq!(charset_id, 63, "Int column must use binary collation id 63");
+    }
+
+    // ── Latin1 result encoding ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_text_row_latin1_encodes_cafe() {
+        use super::super::charset::LATIN1_SWEDISH_CI;
+        let row = vec![Value::Text("café".into())];
+        let pkt = build_row_packet(&row, &LATIN1_SWEDISH_CI).unwrap();
+        // lenenc(4) + 0x63 0x61 0x66 0xE9 = 5 bytes
+        assert_eq!(pkt.len(), 5);
+        assert_eq!(pkt[0], 4); // lenenc: 4 bytes
+        assert_eq!(&pkt[1..5], b"caf\xE9");
+    }
+
+    #[test]
+    fn test_text_row_latin1_emoji_errors() {
+        use super::super::charset::LATIN1_SWEDISH_CI;
+        let row = vec![Value::Text("hello 🎉".into())];
+        let err = build_row_packet(&row, &LATIN1_SWEDISH_CI).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be encoded"),
+            "error: {err}"
+        );
     }
 }

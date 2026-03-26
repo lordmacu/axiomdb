@@ -20,6 +20,7 @@
 //! - [`database`] — database engine wrapper
 
 pub mod auth;
+pub mod charset;
 pub mod codec;
 pub mod commit_coordinator;
 pub mod database;

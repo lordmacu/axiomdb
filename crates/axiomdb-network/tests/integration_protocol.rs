@@ -8,6 +8,7 @@ use tokio_util::codec::{Decoder, Encoder};
 
 use axiomdb_network::mysql::{
     auth::{gen_challenge, is_allowed_user, verify_native_password},
+    charset::DEFAULT_SERVER_COLLATION,
     codec::MySqlCodec,
     packets::{
         build_auth_more_data, build_eof_packet, build_err_packet, build_ok_packet,
@@ -130,7 +131,7 @@ fn test_parse_handshake_response_minimal() {
                        // no database, no plugin name
 
     let response = parse_handshake_response(&payload).unwrap();
-    assert_eq!(response.username, "root");
+    assert_eq!(response.username, b"root");
     assert_eq!(response.auth_response, Vec::<u8>::new());
 }
 
@@ -232,7 +233,7 @@ fn test_result_set_row_null_is_0xfb() {
         columns: cols,
         rows,
     };
-    let packets = serialize_query_result(qr, 1);
+    let packets = serialize_query_result(qr, 1, DEFAULT_SERVER_COLLATION).unwrap();
 
     // Find the row packet (after col_count, col_def, EOF)
     // Sequence: seq=1 col_count, seq=2 col_def, seq=3 EOF, seq=4 row, seq=5 EOF
@@ -251,7 +252,7 @@ fn test_result_set_row_text_is_lenenc_string() {
         columns: cols,
         rows,
     };
-    let packets = serialize_query_result(qr, 1);
+    let packets = serialize_query_result(qr, 1, DEFAULT_SERVER_COLLATION).unwrap();
 
     let row_pkt = packets
         .iter()
@@ -269,7 +270,7 @@ fn test_result_set_sequence_ids_increment() {
         columns: cols,
         rows,
     };
-    let packets = serialize_query_result(qr, 1);
+    let packets = serialize_query_result(qr, 1, DEFAULT_SERVER_COLLATION).unwrap();
 
     // Verify sequence IDs are 1, 2, 3, 4, 5, 6 (col_count, col_def, EOF, row1, row2, EOF)
     let seqs: Vec<u8> = packets.iter().map(|(s, _)| *s).collect();
@@ -326,7 +327,7 @@ fn test_session_set_autocommit_back_to_true() {
 fn test_session_set_names() {
     let mut s = ConnectionState::new();
     s.apply_set("SET NAMES latin1").unwrap();
-    assert_eq!(s.character_set_client, "latin1");
+    assert_eq!(s.character_set_client_name(), "latin1");
 }
 
 #[test]
@@ -376,7 +377,9 @@ fn test_execute_packet_mysql_type_string_limit_param() {
     // MYSQL_TYPE_STRING (0xfd) parameter carrying the value "2".
     // This is the MariaDB client compatibility case: some clients bind
     // LIMIT ? as a string type rather than an integer type.
-    use axiomdb_network::mysql::{prepared::parse_execute_packet, session::PreparedStatement};
+    use axiomdb_network::mysql::{
+        charset::UTF8MB4_CHARSET, prepared::parse_execute_packet, session::PreparedStatement,
+    };
 
     let mut stmt = PreparedStatement {
         stmt_id: 1,
@@ -408,7 +411,7 @@ fn test_execute_packet_mysql_type_string_limit_param() {
     payload.push(1); // lenenc: length = 1
     payload.push(b'2'); // the string "2"
 
-    let exec = parse_execute_packet(&payload, &mut stmt).unwrap();
+    let exec = parse_execute_packet(&payload, &mut stmt, &UTF8MB4_CHARSET).unwrap();
     assert_eq!(exec.params.len(), 1);
     assert_eq!(exec.params[0], Value::Text("2".into()));
 }

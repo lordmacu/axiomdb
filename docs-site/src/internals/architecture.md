@@ -25,8 +25,11 @@ prevents circular dependencies and makes each component independently testable.
 │      ├── codec.rs    (MySqlCodec — 4-byte packet framing)           │
 │      ├── packets.rs  (HandshakeV10, HandshakeResponse41, OK, ERR)   │
 │      ├── auth.rs     (mysql_native_password SHA1 + caching_sha2_password)│
+│      ├── charset.rs  (charset/collation registry, encode_text/decode_text)│
+│      ├── session.rs  (ConnectionState — typed charset fields,       │
+│      │               SET NAMES, per-connection collation)           │
 │      ├── handler.rs  (handle_connection — async task per TCP conn)  │
-│      ├── result.rs   (QueryResult → result-set packets)             │
+│      ├── result.rs   (QueryResult → result-set packets, charset-aware)│
 │      ├── error.rs    (DbError → MySQL error code + SQLSTATE)        │
 │      └── database.rs (Arc<Mutex<Database>> wrapper)                 │
 └──────────────────────────────┬──────────────────────────────────────┘
@@ -203,8 +206,10 @@ The MySQL wire protocol implementation. Lives in `crates/axiomdb-network/src/mys
 | `codec.rs` | `MySqlCodec` — `tokio_util` framing codec; reads/writes the 4-byte header (`u24 LE` payload length + `u8` sequence ID) |
 | `packets.rs` | Builders for HandshakeV10, HandshakeResponse41, OK, ERR, EOF; length-encoded integer/string helpers |
 | `auth.rs` | `gen_challenge` (20-byte CSPRNG), `verify_native_password` (SHA1-XOR), `is_allowed_user` allowlist |
+| `charset.rs` | Static charset/collation registry; `decode_text`/`encode_text` using `encoding_rs`; supports utf8mb4, utf8mb3, latin1 (cp1252), binary |
+| `session.rs` | `ConnectionState` — typed `client_charset`, `connection_collation`, `results_collation` fields; `SET NAMES`; `decode_client_text`/`encode_result_text` |
 | `handler.rs` | `handle_connection` — async task per TCP connection; full handshake → auth → command loop |
-| `result.rs` | `serialize_query_result` — `QueryResult` → `column_count + column_defs + EOF + rows + EOF` packets |
+| `result.rs` | `serialize_query_result` — `QueryResult` → `column_count + column_defs + EOF + rows + EOF` packets; charset-aware row encoding |
 | `error.rs` | `dberror_to_mysql` — maps every `DbError` variant to a MySQL error code + SQLSTATE |
 | `database.rs` | `Database` wrapper — holds `Arc<Mutex<axiomdb_sql::Database>>`, exposes `execute_query` |
 
@@ -351,20 +356,52 @@ performance need arises.
 </div>
 </div>
 
-**`ConnectionState` — per-connection prepared statement cache:**
+**`ConnectionState` — per-connection session state:**
 
 ```rust
 pub struct ConnectionState {
-    pub current_database: Option<String>,
+    pub current_database: String,
+    pub autocommit: bool,
+    // Typed charset state — negotiated at handshake, updated by SET NAMES
+    client_charset: &'static CharsetDef,
+    connection_collation: &'static CollationDef,
+    results_collation: &'static CollationDef,
+    pub variables: HashMap<String, String>,
     pub prepared_statements: HashMap<u32, PreparedStatement>,
     pub next_stmt_id: u32,
 }
+```
 
+The three charset fields are typed references into the static `charset.rs` registry.
+`from_handshake_collation_id(id: u8)` initializes all three from the collation id the
+client sends in the `HandshakeResponse41` packet. Unsupported ids are rejected before
+auth with ERR 1115 (ER_UNKNOWN_CHARACTER_SET). `SET NAMES <charset>` updates all three;
+individual `SET character_set_client = …` updates only the relevant field.
+
+`decode_client_text(&[u8]) -> Result<String, DbError>` decodes inbound SQL/identifiers.
+`encode_result_text(&str) -> Result<Vec<u8>, DbError>` encodes outbound text columns.
+Both are non-lossy — they return `DbError::InvalidValue` rather than replacement characters.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision</span>
+The engine stays UTF-8 internally. Only the MySQL wire boundary gains transcoding — a
+clean transport-charset layer. This is the same approach PostgreSQL uses with its
+<code>client_encoding</code> / server-encoding split, but without the per-column collation
+complexity that PostgreSQL adds. All AxiomDB storage is UTF-8; charset negotiation is
+purely a wire-layer concern.
+</div>
+</div>
+
+```rust
 pub struct PreparedStatement {
-    pub id: u32,
-    pub sql: String,              // original SQL with ? placeholders
-    pub num_params: u16,
+    pub stmt_id: u32,
+    pub sql_template: String,         // original SQL with ? placeholders
+    pub param_count: u16,
     pub analyzed_stmt: Option<Stmt>,  // cached parse+analyze result (plan cache)
+    pub compiled_at_version: u64,
+    pub last_used_seq: u64,
 }
 ```
 

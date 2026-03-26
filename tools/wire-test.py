@@ -3,7 +3,7 @@
 AxiomDB wire protocol test.
 Updated at each subphase close — always overwrite this file, never create new ones.
 
-Last updated: subphase 4.10d (parameterized LIMIT/OFFSET in prepared statements)
+Last updated: subphase 5.2a (charset/collation negotiation at the wire boundary)
 """
 import os
 import signal
@@ -1045,6 +1045,74 @@ finally:
         pass
 
 cur.execute("DROP TABLE IF EXISTS t_param_limit")
+
+# ── [5.2a] Charset / collation negotiation ───────────────────────────────────
+
+print("\n[5.2a] charset/collation negotiation")
+
+# Default connection (utf8mb4) — SHOW VARIABLES LIKE 'character_set%' must reflect it.
+cur.execute("SHOW VARIABLES LIKE 'character_set_client'")
+rows_cs = cur.fetchall()
+ok("5.2a: default character_set_client is utf8mb4",
+   rows_cs and rows_cs[0][1] == "utf8mb4", rows_cs)
+
+cur.execute("SHOW VARIABLES LIKE 'collation_connection'")
+rows_col = cur.fetchall()
+ok("5.2a: default collation_connection is utf8mb4_0900_ai_ci",
+   rows_col and rows_col[0][1] == "utf8mb4_0900_ai_ci", rows_col)
+
+# SET NAMES latin1 — all three charset variables must update.
+conn_l1 = pymysql.connect(host="127.0.0.1", port=PORT, user="root",
+                          password="", charset="latin1")
+cl1 = conn_l1.cursor()
+cl1.execute("SHOW VARIABLES LIKE 'character_set_client'")
+row_l1 = cl1.fetchall()
+ok("5.2a: latin1 handshake → character_set_client = latin1",
+   row_l1 and row_l1[0][1] == "latin1", row_l1)
+
+cl1.execute("SHOW VARIABLES LIKE 'character_set_results'")
+row_res = cl1.fetchall()
+ok("5.2a: latin1 handshake → character_set_results = latin1",
+   row_res and row_res[0][1] == "latin1", row_res)
+
+# Insert and retrieve ASCII text over a latin1 connection.
+cl1.execute("CREATE TABLE IF NOT EXISTS t_cs_ascii (id INT, val TEXT)")
+cl1.execute("INSERT INTO t_cs_ascii VALUES (1, 'hello')")
+conn_l1.commit()
+cl1.execute("SELECT val FROM t_cs_ascii WHERE id = 1")
+row_ascii = cl1.fetchone()
+ok("5.2a: ASCII text round-trips over latin1 connection", row_ascii and row_ascii[0] == "hello",
+   row_ascii)
+cl1.execute("DROP TABLE IF EXISTS t_cs_ascii")
+conn_l1.commit()
+conn_l1.close()
+
+# SET NAMES utf8mb4 — resets all three charset fields.
+conn_set = pymysql.connect(host="127.0.0.1", port=PORT, user="root", password="")
+cs_set = conn_set.cursor()
+cs_set.execute("SET NAMES utf8mb4")
+cs_set.execute("SELECT @@character_set_client")
+ok("5.2a: SET NAMES utf8mb4 → @@character_set_client = utf8mb4",
+   cs_set.fetchone()[0] == "utf8mb4")
+cs_set.execute("SELECT @@character_set_results")
+ok("5.2a: SET NAMES utf8mb4 → @@character_set_results = utf8mb4",
+   cs_set.fetchone()[0] == "utf8mb4")
+conn_set.close()
+
+# UTF-8 multi-byte text round-trips correctly.
+conn_utf8 = pymysql.connect(host="127.0.0.1", port=PORT, user="root",
+                            password="", charset="utf8mb4")
+cu8 = conn_utf8.cursor()
+cu8.execute("CREATE TABLE IF NOT EXISTS t_cs_utf8 (id INT, val TEXT)")
+cu8.execute("INSERT INTO t_cs_utf8 VALUES (1, %s)", ("こんにちは",))
+conn_utf8.commit()
+cu8.execute("SELECT val FROM t_cs_utf8 WHERE id = 1")
+row_u8 = cu8.fetchone()
+ok("5.2a: UTF-8 multi-byte text round-trips (Japanese)",
+   row_u8 and row_u8[0] == "こんにちは", row_u8)
+cu8.execute("DROP TABLE IF EXISTS t_cs_utf8")
+conn_utf8.commit()
+conn_utf8.close()
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

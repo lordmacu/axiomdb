@@ -15,6 +15,7 @@ use axiomdb_sql::session::{
     apply_strict_to_sql_mode, normalize_sql_mode, parse_boolish_setting, sql_mode_is_strict,
 };
 
+use super::charset::{self, CharsetDef, CollationDef, DEFAULT_SERVER_COLLATION};
 use super::status::SessionStatus;
 
 // ── PreparedStatement ─────────────────────────────────────────────────────────
@@ -79,8 +80,15 @@ pub struct ConnectionState {
     pub current_database: String,
     /// Autocommit mode. MySQL default = true.
     pub autocommit: bool,
-    /// Client character set (from handshake or `SET NAMES`).
-    pub character_set_client: String,
+    /// Decode charset for inbound text from the client.
+    /// Set at handshake time; changed by `SET character_set_client`.
+    client_charset: &'static CharsetDef,
+    /// Collation for the logical connection (affects sort, compare).
+    /// Set at handshake time; changed by `SET NAMES` / `SET collation_connection`.
+    connection_collation: &'static CollationDef,
+    /// Collation used when encoding outbound result rows and metadata.
+    /// Set at handshake time; changed by `SET NAMES` / `SET character_set_results`.
+    results_collation: &'static CollationDef,
     /// Generic key=value session variables.
     pub variables: HashMap<String, String>,
     /// Prepared statements cached for this connection.
@@ -136,7 +144,9 @@ impl ConnectionState {
         Self {
             current_database: String::new(),
             autocommit: true,
-            character_set_client: "utf8mb4".into(),
+            client_charset: DEFAULT_SERVER_COLLATION.charset,
+            connection_collation: DEFAULT_SERVER_COLLATION,
+            results_collation: DEFAULT_SERVER_COLLATION,
             variables,
             prepared_statements: HashMap::new(),
             next_stmt_id: 1,
@@ -144,6 +154,27 @@ impl ConnectionState {
             execute_seq: 0,
             session_status: SessionStatus::default(),
         }
+    }
+
+    /// Initializes connection charset state from the client's handshake `character_set` byte.
+    ///
+    /// If the collation id is in the supported table, all three session charset fields
+    /// (`client_charset`, `connection_collation`, `results_collation`) are initialized
+    /// from the corresponding `CollationDef`.
+    ///
+    /// Returns `DbError::InvalidValue` for unsupported collation ids.  The handler
+    /// sends `ER_UNKNOWN_CHARACTER_SET` (1115 / SQLSTATE 42000) and closes the connection.
+    pub fn from_handshake_collation_id(id: u8) -> Result<Self, DbError> {
+        let collation = charset::lookup_collation_by_id(u16::from(id)).ok_or_else(|| {
+            DbError::InvalidValue {
+                reason: format!("Unsupported handshake character_set id: {id}"),
+            }
+        })?;
+        let mut s = Self::new();
+        s.client_charset = collation.charset;
+        s.connection_collation = collation;
+        s.results_collation = collation;
+        Ok(s)
     }
 
     /// Increments and returns the execute sequence counter.
@@ -192,14 +223,41 @@ impl ConnectionState {
         // SET NAMES charset [COLLATE collation]
         let rest_lower = rest.to_ascii_lowercase();
         if rest_lower.starts_with("names ") {
-            let charset = rest[6..]
-                .split_whitespace()
-                .next()
+            let after_names = rest[6..].trim();
+            let tokens: Vec<&str> = after_names.split_whitespace().collect();
+            let charset_str = tokens
+                .first()
+                .copied()
                 .unwrap_or("utf8mb4")
                 .trim_matches('\'')
-                .trim_matches('"')
-                .to_string();
-            self.character_set_client = charset;
+                .trim_matches('"');
+            let cs = charset::lookup_charset(charset_str).ok_or_else(|| DbError::InvalidValue {
+                reason: format!("Unknown character set: '{charset_str}'"),
+            })?;
+            // Optional: COLLATE collation_name
+            let collation: &'static CollationDef = if tokens.len() >= 3
+                && tokens[1].eq_ignore_ascii_case("collate")
+            {
+                let col_name = tokens[2].trim_matches('\'').trim_matches('"');
+                let col =
+                    charset::lookup_collation(col_name).ok_or_else(|| DbError::InvalidValue {
+                        reason: format!("Unknown collation: '{col_name}'"),
+                    })?;
+                if col.charset.canonical_name != cs.canonical_name {
+                    return Err(DbError::InvalidValue {
+                        reason: format!(
+                            "Collation '{}' is not valid for character set '{}'",
+                            col.name, cs.canonical_name
+                        ),
+                    });
+                }
+                col
+            } else {
+                cs.default_collation
+            };
+            self.client_charset = cs;
+            self.connection_collation = collation;
+            self.results_collation = collation;
             return Ok(true);
         }
 
@@ -218,8 +276,33 @@ impl ConnectionState {
                 "autocommit" => {
                     self.autocommit = matches!(value.as_str(), "1" | "true" | "on");
                 }
-                "character_set_client" | "character_set_connection" | "character_set_results" => {
-                    self.character_set_client = value;
+                "character_set_client" => {
+                    let cs =
+                        charset::lookup_charset(&value).ok_or_else(|| DbError::InvalidValue {
+                            reason: format!("Unknown character set: '{value}'"),
+                        })?;
+                    self.client_charset = cs;
+                }
+                "character_set_connection" => {
+                    let cs =
+                        charset::lookup_charset(&value).ok_or_else(|| DbError::InvalidValue {
+                            reason: format!("Unknown character set: '{value}'"),
+                        })?;
+                    self.connection_collation = cs.default_collation;
+                }
+                "character_set_results" => {
+                    let cs =
+                        charset::lookup_charset(&value).ok_or_else(|| DbError::InvalidValue {
+                            reason: format!("Unknown character set: '{value}'"),
+                        })?;
+                    self.results_collation = cs.default_collation;
+                }
+                "collation_connection" => {
+                    let col =
+                        charset::lookup_collation(&value).ok_or_else(|| DbError::InvalidValue {
+                            reason: format!("Unknown collation: '{value}'"),
+                        })?;
+                    self.connection_collation = col;
                 }
                 "max_allowed_packet" => {
                     // Validate before storing: must be a positive decimal integer.
@@ -296,14 +379,16 @@ impl ConnectionState {
             } else {
                 "0".into()
             }),
-            "character_set_client" => Some(self.character_set_client.clone()),
-            "character_set_connection" => Some(self.character_set_client.clone()),
-            "character_set_results" => Some(self.character_set_client.clone()),
+            "character_set_client" => Some(self.client_charset.canonical_name.into()),
+            "character_set_connection" => {
+                Some(self.connection_collation.charset.canonical_name.into())
+            }
+            "character_set_results" => Some(self.results_collation.charset.canonical_name.into()),
             "character_set_server" => Some("utf8mb4".into()),
             "character_set_database" => Some("utf8mb4".into()),
-            "collation_connection" => Some("utf8mb4_0900_ai_ci".into()),
-            "collation_server" => Some("utf8mb4_0900_ai_ci".into()),
-            "collation_database" => Some("utf8mb4_0900_ai_ci".into()),
+            "collation_connection" => Some(self.connection_collation.name.into()),
+            "collation_server" => Some(DEFAULT_SERVER_COLLATION.name.into()),
+            "collation_database" => Some(DEFAULT_SERVER_COLLATION.name.into()),
             "transaction_isolation" | "tx_isolation" => Some("REPEATABLE-READ".into()),
             "lower_case_table_names" => Some("0".into()),
             "version_comment" => Some("AxiomDB".into()),
@@ -316,6 +401,60 @@ impl ConnectionState {
             ),
             other => self.variables.get(other).cloned(),
         }
+    }
+
+    // ── Charset accessors ──────────────────────────────────────────────────────
+
+    /// Returns the client-side decode charset (set at handshake or by `SET NAMES`).
+    pub fn client_charset(&self) -> &'static CharsetDef {
+        self.client_charset
+    }
+
+    /// Returns the result collation used for outbound row and metadata encoding.
+    pub fn results_collation(&self) -> &'static CollationDef {
+        self.results_collation
+    }
+
+    /// Canonical name for `@@character_set_client`.
+    pub fn character_set_client_name(&self) -> &'static str {
+        self.client_charset.canonical_name
+    }
+
+    /// Canonical name for `@@character_set_connection`.
+    pub fn character_set_connection_name(&self) -> &'static str {
+        self.connection_collation.charset.canonical_name
+    }
+
+    /// Canonical name for `@@character_set_results`.
+    pub fn character_set_results_name(&self) -> &'static str {
+        self.results_collation.charset.canonical_name
+    }
+
+    /// Name for `@@collation_connection`.
+    pub fn collation_connection_name(&self) -> &'static str {
+        self.connection_collation.name
+    }
+
+    /// Decodes inbound query bytes using the negotiated client charset.
+    ///
+    /// Used for `COM_QUERY` and `COM_STMT_PREPARE` payloads.
+    pub fn decode_client_text(&self, bytes: &[u8]) -> Result<String, DbError> {
+        charset::decode_text(self.client_charset, bytes).map(|cow| cow.into_owned())
+    }
+
+    /// Decodes identifier bytes (database name, username) using the negotiated client charset.
+    ///
+    /// Used for handshake `username`/`database` and `COM_INIT_DB` payloads.
+    pub fn decode_identifier_text(&self, bytes: &[u8]) -> Result<String, DbError> {
+        charset::decode_text(self.client_charset, bytes).map(|cow| cow.into_owned())
+    }
+
+    /// Encodes a result string using the negotiated result charset.
+    ///
+    /// Returns `DbError::InvalidValue` if the string cannot be represented in
+    /// the selected charset (e.g., emoji in `latin1` or `utf8mb3`).
+    pub fn encode_result_text(&self, text: &str) -> Result<Vec<u8>, DbError> {
+        charset::encode_text(self.results_collation.charset, text).map(|cow| cow.into_owned())
     }
 
     /// Registers a new prepared statement and returns `(stmt_id, param_count)`.
@@ -385,10 +524,153 @@ mod tests {
     fn test_set_names() {
         let mut s = ConnectionState::new();
         assert!(s.apply_set("SET NAMES latin1").unwrap());
-        assert_eq!(s.character_set_client, "latin1");
+        assert_eq!(s.character_set_client_name(), "latin1");
         assert_eq!(
             s.get_variable("@@character_set_client"),
             Some("latin1".into())
+        );
+        // SET NAMES sets all three charset variables together
+        assert_eq!(
+            s.get_variable("@@character_set_connection"),
+            Some("latin1".into())
+        );
+        assert_eq!(
+            s.get_variable("@@character_set_results"),
+            Some("latin1".into())
+        );
+        assert_eq!(
+            s.get_variable("collation_connection"),
+            Some("latin1_swedish_ci".into())
+        );
+    }
+
+    #[test]
+    fn test_set_names_with_collate() {
+        let mut s = ConnectionState::new();
+        assert!(s.apply_set("SET NAMES latin1 COLLATE latin1_bin").unwrap());
+        assert_eq!(s.character_set_client_name(), "latin1");
+        assert_eq!(
+            s.get_variable("collation_connection"),
+            Some("latin1_bin".into())
+        );
+    }
+
+    #[test]
+    fn test_set_names_invalid_charset_errors() {
+        let mut s = ConnectionState::new();
+        let err = s.apply_set("SET NAMES cp1251").unwrap_err();
+        assert!(
+            err.to_string().contains("Unknown character set"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_set_names_incompatible_collation_errors() {
+        let mut s = ConnectionState::new();
+        let err = s
+            .apply_set("SET NAMES latin1 COLLATE utf8mb3_bin")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not valid"),
+            "error must mention incompatibility: {err}"
+        );
+    }
+
+    #[test]
+    fn test_set_character_set_client_only() {
+        let mut s = ConnectionState::new();
+        // Start with utf8mb4 results
+        assert_eq!(s.character_set_results_name(), "utf8mb4");
+        assert!(s.apply_set("SET character_set_client = latin1").unwrap());
+        assert_eq!(s.character_set_client_name(), "latin1");
+        // results_collation must NOT change
+        assert_eq!(s.character_set_results_name(), "utf8mb4");
+    }
+
+    #[test]
+    fn test_set_character_set_results_only() {
+        let mut s = ConnectionState::new();
+        assert!(s.apply_set("SET character_set_results = latin1").unwrap());
+        assert_eq!(s.character_set_results_name(), "latin1");
+        // client_charset must NOT change
+        assert_eq!(s.character_set_client_name(), "utf8mb4");
+    }
+
+    #[test]
+    fn test_set_collation_connection() {
+        let mut s = ConnectionState::new();
+        assert!(s
+            .apply_set("SET collation_connection = latin1_bin")
+            .unwrap());
+        assert_eq!(
+            s.get_variable("collation_connection"),
+            Some("latin1_bin".into())
+        );
+        // character_set_client must NOT change
+        assert_eq!(s.character_set_client_name(), "utf8mb4");
+    }
+
+    #[test]
+    fn test_from_handshake_collation_id_255() {
+        let s = ConnectionState::from_handshake_collation_id(255).unwrap();
+        assert_eq!(s.character_set_client_name(), "utf8mb4");
+        assert_eq!(
+            s.get_variable("collation_connection"),
+            Some("utf8mb4_0900_ai_ci".into())
+        );
+    }
+
+    #[test]
+    fn test_from_handshake_collation_id_8_latin1() {
+        let s = ConnectionState::from_handshake_collation_id(8).unwrap();
+        assert_eq!(s.character_set_client_name(), "latin1");
+        assert_eq!(s.character_set_results_name(), "latin1");
+        assert_eq!(
+            s.get_variable("collation_connection"),
+            Some("latin1_swedish_ci".into())
+        );
+    }
+
+    #[test]
+    fn test_from_handshake_collation_id_unknown_errors() {
+        let err = ConnectionState::from_handshake_collation_id(99).unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported handshake"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_decode_client_text_utf8mb4() {
+        let s = ConnectionState::new();
+        let decoded = s.decode_client_text("hello".as_bytes()).unwrap();
+        assert_eq!(decoded, "hello");
+    }
+
+    #[test]
+    fn test_decode_identifier_latin1_euro() {
+        let s = ConnectionState::from_handshake_collation_id(8).unwrap();
+        // 0x80 in cp1252 = '€'
+        let decoded = s.decode_identifier_text(&[0x80u8]).unwrap();
+        assert_eq!(decoded, "€");
+    }
+
+    #[test]
+    fn test_encode_result_text_latin1_cafe() {
+        let s = ConnectionState::from_handshake_collation_id(8).unwrap();
+        let encoded = s.encode_result_text("café").unwrap();
+        // 'é' encodes as 0xE9 in cp1252
+        assert_eq!(encoded, b"caf\xE9".to_vec());
+    }
+
+    #[test]
+    fn test_encode_result_text_emoji_latin1_errors() {
+        let s = ConnectionState::from_handshake_collation_id(8).unwrap();
+        let err = s.encode_result_text("hello 🎉").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be encoded"),
+            "error: {err}"
         );
     }
 
