@@ -1191,6 +1191,29 @@ This ensures that the next query against the altered table re-reads the catalog
 and sees the updated column list, rather than operating on a stale schema that
 may reference columns that no longer exist or omit newly added ones.
 
+#### Index root invalidation on B+tree split
+
+The `SchemaCache` also stores `IndexDef.root_page_id` for each index. When an
+INSERT causes the B+tree root to split, `insert_in` allocates a new root page
+and frees the old one. After this, the cached `root_page_id` points to a freed
+page. If the cache is not invalidated, the next `execute_insert_ctx` call reads
+`IndexDef.root_page_id` from the cache and passes it to `BTree::lookup_in`
+(uniqueness check), causing a stale-pointer read on a freed page.
+
+The fix: call `ctx.invalidate_all()` whenever any index root changes during
+INSERT or DELETE index maintenance. This forces re-resolution from the catalog
+(which always has the current `root_page_id`) on the next DML statement.
+
+```
+// After each updated root in execute_insert_ctx / execute_delete:
+catalog.update_index_root(index_id, new_root)
+secondary_indexes[i].root_page_id = new_root   // sync in-memory slice
+ctx.invalidate_all()                            // drop cached IndexDefs
+```
+
+This only fires O(log N) times per batch (once per root split), so the
+performance impact is limited to a single catalog re-read per split event.
+
 ---
 
 ## Strict Mode and Warning 1265

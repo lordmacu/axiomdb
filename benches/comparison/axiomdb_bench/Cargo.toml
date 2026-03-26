@@ -15,4 +15,5 @@ axiomdb-sql     = { path = "../../../crates/axiomdb-sql" }
 axiomdb-storage = { path = "../../../crates/axiomdb-storage" }
 axiomdb-types   = { path = "../../../crates/axiomdb-types" }
 axiomdb-wal     = { path = "../../../crates/axiomdb-wal" }
+rusqlite        = { version = "0.32", features = ["bundled"] }
 tempfile        = "3"

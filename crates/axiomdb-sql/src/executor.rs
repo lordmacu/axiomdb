@@ -1194,6 +1194,10 @@ fn execute_insert_ctx(
                         {
                             idx.root_page_id = new_root;
                         }
+                        // The schema cache stores the old root_page_id. Invalidate
+                        // so the next call re-reads from catalog rather than calling
+                        // lookup_in with a freed page id.
+                        ctx.invalidate_all();
                     }
                 }
                 count += 1;
@@ -4282,7 +4286,8 @@ fn execute_delete(
     let snap = txn.active_snapshot()?;
 
     // Use the already-loaded indexes from the resolved table (cached by SchemaCache).
-    let secondary_indexes: Vec<IndexDef> = resolved
+    // Must be `mut` so we can keep root_page_id in sync as rows are deleted.
+    let mut secondary_indexes: Vec<IndexDef> = resolved
         .indexes
         .iter()
         .filter(|i| !i.columns.is_empty())
@@ -4347,6 +4352,15 @@ fn execute_delete(
             )?;
             for (index_id, new_root) in updated {
                 CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
+                // Keep the in-memory snapshot in sync so the next row's deletion
+                // starts from the correct (current) root. Without this, a root
+                // collapse on row N causes row N+1 to start from a freed page.
+                for idx in secondary_indexes.iter_mut() {
+                    if idx.index_id == index_id {
+                        idx.root_page_id = new_root;
+                        break;
+                    }
+                }
             }
         }
     }

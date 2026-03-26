@@ -282,6 +282,29 @@ All nodes except the root must remain at least half full after any operation:
 Violations of this invariant during delete trigger rebalancing (redistribution
 from a sibling if possible, merge otherwise).
 
+#### `rotate_right` key-shift invariant
+
+When `rotate_right` borrows the last key of the left sibling and inserts it at
+position 0 of the underfull child (internal node case), all existing keys in the
+child must be shifted right by one position **before** inserting the new key.
+
+The shift must cover positions `0..cn` → `1..cn+1`, implemented with a reverse
+loop (same pattern as `insert_at`). Using `slice::rotate_right(1)` on `[..cn]`
+is incorrect: it moves `key[cn-1]` to position 0 where it is immediately
+overwritten, leaving position `cn` with stale data from a previous operation.
+The stale byte can exceed `MAX_KEY_LEN = 64`, causing a bounds panic on the next
+traversal of that node.
+
+```rust
+// Correct: explicit reverse loop
+for i in (0..cn).rev() {
+    child.key_lens[i + 1] = child.key_lens[i];
+    child.keys[i + 1]     = child.keys[i];
+}
+child.key_lens[0] = sep_len;
+child.keys[0]     = sep_key;
+```
+
 ---
 
 ## Prefix Compression — In-Memory Only

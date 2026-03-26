@@ -215,6 +215,8 @@ impl BTree {
 
                         if n < ORDER_INTERNAL {
                             node2.insert_at(child_idx, &sep, right_pid);
+                            #[cfg(debug_assertions)]
+                            node2.validate();
                             let new_pid = storage.alloc_page(PageType::Index)?;
                             let mut p = Page::new(PageType::Index, new_pid);
                             *cast_internal_mut(&mut p) = node2;
@@ -421,6 +423,8 @@ impl BTree {
     ) -> Result<u64, DbError> {
         // In-place: with &mut self there are no concurrent readers, CoW not needed.
         node.set_child_at(child_idx, new_child);
+        #[cfg(debug_assertions)]
+        node.validate();
         let mut p = Page::new(PageType::Index, old_pid);
         *cast_internal_mut(&mut p) = node;
         p.update_checksum();
@@ -650,8 +654,14 @@ impl BTree {
             let last_ch = left.child_at(lk + 1);
 
             let cn = child.num_keys();
-            child.key_lens[..cn].rotate_right(1);
-            child.keys[..cn].rotate_right(1);
+            // Shift existing keys right by 1 (positions 0..cn → 1..cn+1).
+            // rotate_right(1) on [..cn] would move key[cn-1] to position 0
+            // and lose it when sep_key overwrites position 0 — leaving position
+            // cn with stale data and causing key_lens[cn] > MAX_KEY_LEN panics.
+            for i in (0..cn).rev() {
+                child.key_lens[i + 1] = child.key_lens[i];
+                child.keys[i + 1] = child.keys[i];
+            }
             for i in (0..=cn).rev() {
                 let p = child.child_at(i);
                 child.set_child_at(i + 1, p);
@@ -674,12 +684,16 @@ impl BTree {
             *cast_internal_mut(&mut lp) = left;
             lp.update_checksum();
             storage.write_page(nl, &lp)?;
+            #[cfg(debug_assertions)]
+            child.validate();
             let mut cp = Page::new(PageType::Index, nc);
             *cast_internal_mut(&mut cp) = child;
             cp.update_checksum();
             storage.write_page(nc, &cp)?;
         }
 
+        #[cfg(debug_assertions)]
+        parent.validate();
         let mut pp = Page::new(PageType::Index, np);
         *cast_internal_mut(&mut pp) = parent;
         pp.update_checksum();
@@ -757,16 +771,22 @@ impl BTree {
             parent.set_child_at(child_idx + 1, nr);
             right.remove_at(0, 0);
 
+            #[cfg(debug_assertions)]
+            child.validate();
             let mut cp = Page::new(PageType::Index, nc);
             *cast_internal_mut(&mut cp) = child;
             cp.update_checksum();
             storage.write_page(nc, &cp)?;
+            #[cfg(debug_assertions)]
+            right.validate();
             let mut rp = Page::new(PageType::Index, nr);
             *cast_internal_mut(&mut rp) = right;
             rp.update_checksum();
             storage.write_page(nr, &rp)?;
         }
 
+        #[cfg(debug_assertions)]
+        parent.validate();
         let mut pp = Page::new(PageType::Index, np);
         *cast_internal_mut(&mut pp) = parent;
         pp.update_checksum();
@@ -833,6 +853,8 @@ impl BTree {
             }
             merged.set_num_keys(ln + 1 + rn);
 
+            #[cfg(debug_assertions)]
+            merged.validate();
             let mut pg = Page::new(PageType::Index, mp);
             *cast_internal_mut(&mut pg) = merged;
             pg.update_checksum();
@@ -842,6 +864,8 @@ impl BTree {
         parent.set_child_at(sep_idx, mp);
         parent.remove_at(sep_idx, sep_idx + 1);
 
+        #[cfg(debug_assertions)]
+        parent.validate();
         let mut pp = Page::new(PageType::Index, npp);
         *cast_internal_mut(&mut pp) = parent;
         pp.update_checksum();
