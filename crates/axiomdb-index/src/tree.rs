@@ -18,6 +18,7 @@ use crate::page_layout::{
     cast_internal, cast_internal_mut, cast_leaf, cast_leaf_mut, InternalNodePage, LeafNodePage,
     MAX_KEY_LEN, MIN_KEYS_INTERNAL, MIN_KEYS_LEAF, NULL_PAGE, ORDER_INTERNAL, ORDER_LEAF,
 };
+use bytemuck::Zeroable;
 
 // ── Fill factor ──────────────────────────────────────────────────────────────
 
@@ -1186,6 +1187,148 @@ impl BTree {
         fill_threshold(order, fillfactor)
     }
 
+    // ── Bulk load (Phase 5.21b) ──────────────────────────────────────────────
+
+    /// Builds a B-Tree from scratch given pre-sorted `(key, RecordId)` entries.
+    ///
+    /// This is a bottom-up bulk-load that fills leaf pages sequentially
+    /// (append-only, no binary search) and constructs internal nodes in a
+    /// single pass. For N entries the cost is ~ceil(N / threshold) page
+    /// writes — compared to N × O(log N) I/O for N individual `insert_in` calls.
+    ///
+    /// # Preconditions
+    /// - `entries` MUST be sorted ascending by key with no duplicates.
+    /// - The tree at `old_root_pid` MUST be empty (only valid for fresh indexes).
+    ///
+    /// # Returns
+    /// The page ID of the new root. The old root page is freed.
+    ///
+    /// # Errors
+    /// - `DbError::StorageFull` if page allocation fails.
+    pub fn bulk_load_sorted(
+        storage: &mut dyn StorageEngine,
+        old_root_pid: u64,
+        entries: &[(&[u8], RecordId)],
+        fillfactor: u8,
+    ) -> Result<u64, DbError> {
+        if entries.is_empty() {
+            return Ok(old_root_pid);
+        }
+
+        debug_assert!(
+            entries.windows(2).all(|w| w[0].0 < w[1].0),
+            "bulk_load_sorted: entries must be sorted ascending with no duplicates"
+        );
+
+        let threshold = fill_threshold(ORDER_LEAF, fillfactor);
+
+        // ── Phase 1: Build leaf pages ────────────────────────────────────────
+        //
+        // Strategy: buffer the current leaf in memory. When it reaches the
+        // threshold, allocate the NEXT leaf page, set next_leaf on the current
+        // leaf, write the current leaf, and start filling the next one.
+        // This avoids re-reading pages to patch next_leaf pointers.
+
+        let mut leaves: Vec<(u64, Vec<u8>)> = Vec::new(); // (page_id, first_key)
+
+        let mut cur_pid = storage.alloc_page(PageType::Index)?;
+        let mut cur_leaf = LeafNodePage::zeroed();
+        cur_leaf.is_leaf = 1;
+        let mut cur_first_key: Vec<u8> = Vec::new();
+
+        for (key, rid) in entries {
+            Self::check_key(key)?;
+
+            if cur_leaf.num_keys() >= threshold {
+                // Current leaf is full — allocate next, link, write current.
+                let next_pid = storage.alloc_page(PageType::Index)?;
+                cur_leaf.set_next_leaf(next_pid);
+
+                let mut page = Page::new(PageType::Index, cur_pid);
+                *cast_leaf_mut(&mut page) = cur_leaf;
+                page.update_checksum();
+                storage.write_page(cur_pid, &page)?;
+
+                leaves.push((cur_pid, cur_first_key));
+
+                // Reset for next leaf.
+                cur_pid = next_pid;
+                cur_leaf = LeafNodePage::zeroed();
+                cur_leaf.is_leaf = 1;
+                cur_first_key = Vec::new();
+            }
+
+            let pos = cur_leaf.num_keys();
+            cur_leaf.key_lens[pos] = key.len() as u8;
+            cur_leaf.keys[pos][..key.len()].copy_from_slice(key);
+            cur_leaf.rids[pos] = crate::page_layout::encode_rid(*rid);
+            cur_leaf.set_num_keys(pos + 1);
+
+            if cur_first_key.is_empty() {
+                cur_first_key = key.to_vec();
+            }
+        }
+
+        // Write the last (possibly partial) leaf. next_leaf = NULL_PAGE (0).
+        {
+            let mut page = Page::new(PageType::Index, cur_pid);
+            *cast_leaf_mut(&mut page) = cur_leaf;
+            page.update_checksum();
+            storage.write_page(cur_pid, &page)?;
+            leaves.push((cur_pid, cur_first_key));
+        }
+
+        // Free the old (empty) root page.
+        storage.free_page(old_root_pid)?;
+
+        if leaves.len() == 1 {
+            return Ok(leaves[0].0);
+        }
+
+        // ── Phase 2: Build internal nodes bottom-up ──────────────────────────
+        //
+        // Each iteration takes the current level's (page_id, separator)
+        // entries and groups them into internal pages of up to
+        // ORDER_INTERNAL children each.
+
+        let mut level = leaves;
+
+        while level.len() > 1 {
+            let mut next_level: Vec<(u64, Vec<u8>)> = Vec::new();
+
+            for chunk in level.chunks(ORDER_INTERNAL + 1) {
+                // An internal node with K keys has K+1 children.
+                // So a chunk of C entries → C-1 keys + C children.
+                let int_pid = storage.alloc_page(PageType::Index)?;
+                let mut node = InternalNodePage::zeroed();
+                // is_leaf = 0 (already zeroed)
+
+                // First child (no key — leftmost pointer).
+                node.set_child_at(0, chunk[0].0);
+
+                for (i, (child_pid, sep_key)) in chunk.iter().enumerate().skip(1) {
+                    let key_idx = i - 1;
+                    let klen = sep_key.len().min(MAX_KEY_LEN);
+                    node.key_lens[key_idx] = klen as u8;
+                    node.keys[key_idx][..klen].copy_from_slice(&sep_key[..klen]);
+                    node.set_child_at(i, *child_pid);
+                }
+                node.set_num_keys(chunk.len() - 1);
+
+                let mut page = Page::new(PageType::Index, int_pid);
+                *cast_internal_mut(&mut page) = node;
+                page.update_checksum();
+                storage.write_page(int_pid, &page)?;
+
+                next_level.push((int_pid, chunk[0].1.clone()));
+            }
+
+            level = next_level;
+        }
+
+        Ok(level[0].0)
+    }
+
     // ── Batch delete (Phase 5.19) ─────────────────────────────────────────────
 
     /// Removes all keys in `sorted_keys` from the B-Tree rooted at `root_pid`.
@@ -1516,5 +1659,123 @@ mod tests {
             };
             assert_eq!(tree.lookup(key.as_bytes()).unwrap(), expected, "key={key}");
         }
+    }
+
+    // ── Phase 5.21b: bulk_load_sorted ────────────────────────────────────────
+
+    fn make_entries(n: usize) -> Vec<(Vec<u8>, RecordId)> {
+        (0..n)
+            .map(|i| {
+                let key = format!("{:08}", i);
+                (key.into_bytes(), rid(i as u64))
+            })
+            .collect()
+    }
+
+    fn bulk_setup() -> MemoryStorage {
+        MemoryStorage::new()
+    }
+
+    fn alloc_empty_root(s: &mut MemoryStorage) -> u64 {
+        use axiomdb_storage::PageType;
+        let pid = s.alloc_page(PageType::Index).unwrap();
+        let mut p = Page::new(PageType::Index, pid);
+        let leaf = cast_leaf_mut(&mut p);
+        leaf.is_leaf = 1;
+        leaf.set_num_keys(0);
+        p.update_checksum();
+        s.write_page(pid, &p).unwrap();
+        pid
+    }
+
+    #[test]
+    fn test_bulk_load_empty_entries() {
+        let mut s = bulk_setup();
+        let root = alloc_empty_root(&mut s);
+        let new_root = BTree::bulk_load_sorted(&mut s, root, &[], 90).unwrap();
+        assert_eq!(new_root, root, "empty entries must return old root");
+    }
+
+    #[test]
+    fn test_bulk_load_single_entry() {
+        let mut s = bulk_setup();
+        let root = alloc_empty_root(&mut s);
+        let entries = make_entries(1);
+        let refs: Vec<(&[u8], RecordId)> =
+            entries.iter().map(|(k, r)| (k.as_slice(), *r)).collect();
+        let new_root = BTree::bulk_load_sorted(&mut s, root, &refs, 90).unwrap();
+        assert_ne!(new_root, root);
+        assert_eq!(
+            BTree::lookup_in(&mut s, new_root, entries[0].0.as_slice()).unwrap(),
+            Some(entries[0].1)
+        );
+    }
+
+    #[test]
+    fn test_bulk_load_full_leaf() {
+        let mut s = bulk_setup();
+        let root = alloc_empty_root(&mut s);
+        let threshold = fill_threshold(ORDER_LEAF, 90);
+        let entries = make_entries(threshold);
+        let refs: Vec<(&[u8], RecordId)> =
+            entries.iter().map(|(k, r)| (k.as_slice(), *r)).collect();
+        let new_root = BTree::bulk_load_sorted(&mut s, root, &refs, 90).unwrap();
+
+        // All keys findable.
+        for (key, rid) in &entries {
+            assert_eq!(
+                BTree::lookup_in(&mut s, new_root, key).unwrap(),
+                Some(*rid),
+                "key={}",
+                String::from_utf8_lossy(key)
+            );
+        }
+    }
+
+    #[test]
+    fn test_bulk_load_one_split() {
+        let mut s = bulk_setup();
+        let root = alloc_empty_root(&mut s);
+        let threshold = fill_threshold(ORDER_LEAF, 90);
+        let entries = make_entries(threshold + 1);
+        let refs: Vec<(&[u8], RecordId)> =
+            entries.iter().map(|(k, r)| (k.as_slice(), *r)).collect();
+        let new_root = BTree::bulk_load_sorted(&mut s, root, &refs, 90).unwrap();
+
+        for (key, rid) in &entries {
+            assert_eq!(
+                BTree::lookup_in(&mut s, new_root, key).unwrap(),
+                Some(*rid),
+                "key={}",
+                String::from_utf8_lossy(key)
+            );
+        }
+    }
+
+    #[test]
+    fn test_bulk_load_50k_entries() {
+        let mut s = bulk_setup();
+        let root = alloc_empty_root(&mut s);
+        let entries = make_entries(50_000);
+        let refs: Vec<(&[u8], RecordId)> =
+            entries.iter().map(|(k, r)| (k.as_slice(), *r)).collect();
+        let new_root = BTree::bulk_load_sorted(&mut s, root, &refs, 90).unwrap();
+
+        // Spot-check first, middle, last.
+        for &i in &[0, 25_000, 49_999] {
+            let (key, rid) = &entries[i];
+            assert_eq!(
+                BTree::lookup_in(&mut s, new_root, key).unwrap(),
+                Some(*rid),
+                "key={}",
+                String::from_utf8_lossy(key)
+            );
+        }
+
+        // Range scan returns all in order.
+        let all = BTree::range_in(&s, new_root, None, None).unwrap();
+        assert_eq!(all.len(), 50_000);
+        assert_eq!(all[0].1, entries[0].0);
+        assert_eq!(all[49_999].1, entries[49_999].0);
     }
 }

@@ -93,6 +93,23 @@ fn execute_insert_ctx(
 
             // Initialise the batch if this is the first INSERT for this table.
             if ctx.pending_inserts.is_none() {
+                // Detect which unique indexes have an empty committed BTree.
+                // For those, the enqueue-time UNIQUE precheck can skip the
+                // BTree::lookup_in (no committed keys can collide) and rely
+                // solely on the unique_seen HashSet — saving one page read
+                // per row per empty index.
+                let mut committed_empty = std::collections::HashSet::new();
+                for idx in &secondary_indexes {
+                    if idx.is_unique && !idx.is_fk_index {
+                        let page = storage.read_page(idx.root_page_id)?;
+                        let body = page.body();
+                        // BTree page body layout: [is_leaf:1][_pad:1][num_keys:2]...
+                        let num_keys = u16::from_le_bytes([body[2], body[3]]);
+                        if num_keys == 0 {
+                            committed_empty.insert(idx.index_id);
+                        }
+                    }
+                }
                 ctx.pending_inserts = Some(crate::session::PendingInsertBatch {
                     table_id: resolved.def.id,
                     table_def: resolved.def.clone(),
@@ -101,6 +118,7 @@ fn execute_insert_ctx(
                     compiled_preds: compiled_preds.clone(),
                     rows: Vec::new(),
                     unique_seen: std::collections::HashMap::new(),
+                    committed_empty,
                 });
             }
 
@@ -176,8 +194,11 @@ fn execute_insert_ctx(
                             continue; // NULL never violates UNIQUE
                         }
                         let key = crate::key_encoding::encode_index_key(&key_vals)?;
-                        // Check committed index.
-                        if BTree::lookup_in(storage, idx.root_page_id, &key)?.is_some() {
+                        // Check committed index — skip when we know the
+                        // committed BTree was empty at batch creation.
+                        if !batch.committed_empty.contains(&idx.index_id)
+                            && BTree::lookup_in(storage, idx.root_page_id, &key)?.is_some()
+                        {
                             return Err(DbError::UniqueViolation {
                                 index_name: idx.name.clone(),
                                 value: key_vals.first().map(|v| format!("{v}")),
