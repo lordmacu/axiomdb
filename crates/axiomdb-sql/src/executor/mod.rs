@@ -332,8 +332,17 @@ pub fn execute_with_ctx(
 ) -> Result<QueryResult, DbError> {
     if txn.active_txn_id().is_some() {
         match &stmt {
-            Stmt::Commit => return txn.commit().map(|_| QueryResult::Empty),
-            Stmt::Rollback => return txn.rollback(storage).map(|_| QueryResult::Empty),
+            Stmt::Commit => {
+                // Flush any staged rows before writing the Commit WAL entry.
+                flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
+                ctx.in_explicit_txn = false;
+                return txn.commit().map(|_| QueryResult::Empty);
+            }
+            Stmt::Rollback => {
+                // Discard staged rows without writing to heap or WAL.
+                ctx.discard_pending_inserts();
+                return txn.rollback(storage).map(|_| QueryResult::Empty);
+            }
             Stmt::Begin => {
                 let txn_id = txn.active_txn_id().unwrap_or(0);
                 return Err(DbError::TransactionAlreadyActive { txn_id });
@@ -341,6 +350,10 @@ pub fn execute_with_ctx(
             _ => {}
         }
         if is_ddl(&stmt) {
+            // DDL implicitly commits the current transaction — flush staged
+            // rows into the pre-DDL transaction before committing it.
+            flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
+            ctx.in_explicit_txn = false;
             let pre_tid = txn.active_txn_id();
             txn.commit()?;
             if let Some(t) = pre_tid {
@@ -362,6 +375,15 @@ pub fn execute_with_ctx(
                 }
             };
         }
+        // Flush staged inserts BEFORE taking the per-statement savepoint when
+        // the next statement cannot continue appending to the current batch.
+        // This ensures:
+        // (a) flush writes become part of the "pre-statement" state;
+        // (b) a later statement error does not roll back previously staged rows;
+        // (c) barrier semantics: the current statement sees flushed rows.
+        if should_flush_pending_inserts_before_stmt(&stmt, ctx) {
+            flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
+        }
         let sp_opt: Option<Savepoint> = if ctx.on_error == OnErrorMode::RollbackTransaction {
             None
         } else {
@@ -371,6 +393,7 @@ pub fn execute_with_ctx(
             Ok(result) => Ok(result),
             Err(e) => match ctx.on_error {
                 OnErrorMode::RollbackTransaction => {
+                    ctx.discard_pending_inserts();
                     let _ = txn.rollback(storage);
                     Err(e)
                 }
@@ -381,6 +404,7 @@ pub fn execute_with_ctx(
                     Err(e)
                 }
                 OnErrorMode::Ignore => {
+                    ctx.discard_pending_inserts();
                     let _ = txn.rollback(storage);
                     Err(e)
                 }
@@ -396,6 +420,7 @@ pub fn execute_with_ctx(
         match stmt {
             Stmt::Begin => {
                 txn.begin()?;
+                ctx.in_explicit_txn = true;
                 Ok(QueryResult::Empty)
             }
             Stmt::Commit => {
@@ -408,6 +433,9 @@ pub fn execute_with_ctx(
             }
             other => {
                 txn.begin()?;
+                // NOTE: `in_explicit_txn` is NOT set here — this is an implicit
+                // autocommit transaction. Single-statement INSERTs use the existing
+                // multi-row batch path inside execute_insert_ctx, not the staging buffer.
                 match dispatch_ctx(other, storage, txn, bloom, ctx) {
                     Ok(result) => {
                         let tid = txn.active_txn_id();
@@ -428,6 +456,7 @@ pub fn execute_with_ctx(
         match stmt {
             Stmt::Begin => {
                 txn.begin()?;
+                ctx.in_explicit_txn = true;
                 Ok(QueryResult::Empty)
             }
             Stmt::Commit => {
@@ -499,6 +528,26 @@ pub fn execute_with_ctx(
     }
 }
 
+fn should_flush_pending_inserts_before_stmt(stmt: &Stmt, ctx: &SessionContext) -> bool {
+    let pending = match ctx.pending_inserts.as_ref() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    !matches!(
+        stmt,
+        Stmt::Insert(insert)
+            if ctx.in_explicit_txn
+                && matches!(insert.source, InsertSource::Values(_))
+                && insert.table.name == pending.table_def.table_name
+                && insert
+                    .table
+                    .schema
+                    .as_deref()
+                    .is_none_or(|schema| schema == pending.table_def.schema_name)
+    )
+}
+
 /// Returns `true` for DDL statements that require their own autocommit transaction.
 fn is_ddl(stmt: &Stmt) -> bool {
     matches!(
@@ -520,6 +569,11 @@ fn dispatch_ctx(
     bloom: &mut crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    // Flush staged inserts before any non-INSERT barrier statement.
+    // INSERT statements handle same-table vs. different-table flush internally.
+    if !matches!(stmt, Stmt::Insert(_)) {
+        flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
+    }
     match stmt {
         Stmt::Select(s) => execute_select_ctx(s, storage, txn, bloom, ctx),
         Stmt::Insert(s) => execute_insert_ctx(s, storage, txn, bloom, ctx),
@@ -721,6 +775,7 @@ include!("update.rs");
 include!("bulk_empty.rs");
 include!("delete.rs");
 include!("ddl.rs");
+include!("staging.rs");
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 

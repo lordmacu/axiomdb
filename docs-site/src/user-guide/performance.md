@@ -109,6 +109,35 @@ skipping PK maintenance when only non-indexed columns change.
 
 The main remaining write-path bottleneck is now `INSERT`, not `UPDATE`.
 
+### INSERT in Explicit Transactions After `5.21`
+
+Phase `5.21` adds transactional INSERT staging for consecutive
+`INSERT ... VALUES` statements inside one explicit transaction. Instead of
+writing heap + WAL + index roots per statement, AxiomDB now buffers eligible
+rows and flushes them together on `COMMIT` or the next barrier statement.
+
+Measured with `python3 benches/comparison/local_bench.py --scenario insert --rows 50000 --table`
+on the same machine:
+
+| Operation | MariaDB 12.1 | MySQL 8.0 | AxiomDB |
+|---|---|---|---|
+| `50K` single-row `INSERT`s in `1` explicit txn | 28.0K rows/s | 26.7K rows/s | **23.9K rows/s** |
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Stage, Then Flush</span>
+PostgreSQL's <code>heap_multi_insert()</code> and DuckDB's appender both separate row
+production from physical write. AxiomDB adapts that idea to SQL-visible transactions:
+the connection keeps staged INSERT rows in memory, then flushes them in one grouped
+heap/index pass when SQL semantics require visibility.
+</div>
+</div>
+
+This path targets one specific workload: many separate INSERT statements inside
+`BEGIN ... COMMIT`. Autocommit throughput remains a different problem and stays
+deferred to follow-up tuning of actual server-side group commit.
+
 ### Prepared Statement Plan Cache (Phase 5.13)
 
 `COM_STMT_PREPARE` compiles the SQL once (parse + analyze). Every subsequent

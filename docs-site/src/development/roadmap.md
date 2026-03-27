@@ -175,7 +175,7 @@ This is the largest remaining item in Block 1.
 
 - **5.15 DSN parsing** — `axiomdb://`, `mysql://`, and `postgres://` style connection strings for tools and ORMs.
 
-Phase 5 also closed five recent subphases:
+Phase 5 also closed six recent subphases:
 
 - **5.11c Explicit connection state machine** — the MySQL server now has an explicit
   `CONNECTED → AUTH → IDLE → EXECUTING → CLOSING` transport lifecycle with fixed
@@ -194,6 +194,10 @@ Phase 5 also closed five recent subphases:
 - **5.20 Stable-RID UPDATE fast path** — UPDATE can now rewrite rows in the same
   heap slot when the new encoded row fits, preserve the `RecordId`, and skip
   unnecessary index maintenance for indexes whose logical key membership is unchanged.
+- **5.21 Transactional INSERT staging** — explicit transactions now buffer
+  consecutive `INSERT ... VALUES` statements per table and flush them together
+  on `COMMIT` or the next barrier statement, preserving savepoint semantics by
+  flushing before the next statement savepoint whenever the batch cannot continue.
 
 ### Phase 6 remaining — Index completeness
 

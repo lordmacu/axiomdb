@@ -75,6 +75,23 @@
   - the logical key / partial-index membership for that index did not change
 - This fixed the large UPDATE throughput gap without weakening rollback or recovery.
 
+## 2026-03-27 — Transactional INSERT staging
+
+- `axiomdb-sql/src/session.rs` now owns `PendingInsertBatch` in `SessionContext`.
+- The current staging design is session-scoped but transaction-gated:
+  - only explicit transactions (`BEGIN ... COMMIT`) can append to the batch
+  - autocommit-wrapped single statements do not use it
+- `axiomdb-sql/src/executor/staging.rs` flushes staged rows through:
+  - `TableEngine::insert_rows_batch_with_ctx(...)`
+  - `batch_insert_into_indexes(...)`
+  - one catalog root update per changed index
+- The critical ordering invariant is:
+  - if the next statement cannot continue the current INSERT batch, flush it
+    before taking that statement's savepoint
+- This invariant matters for `rollback_statement` / `savepoint` / `ignore`
+  modes: a later failing statement must not roll back staged rows that logically
+  belonged to earlier successful INSERT statements.
+
 ## 2026-03-26 — Explicit MySQL connection lifecycle
 
 - `axiomdb-network/src/mysql/lifecycle.rs` now owns transport-phase tracking for

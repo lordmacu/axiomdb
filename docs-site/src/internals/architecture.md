@@ -197,7 +197,7 @@ The SQL processing pipeline:
 - `executor/` — directory module rooted at `executor/mod.rs`; the facade still exports
   `execute`, `execute_with_ctx`, and `last_insert_id_value`, but the implementation is
   now split into `shared.rs`, `select.rs`, `joins.rs`, `aggregate.rs`, `insert.rs`,
-  `update.rs`, `delete.rs`, `bulk_empty.rs`, and `ddl.rs`. Capabilities remain the same:
+  `update.rs`, `delete.rs`, `bulk_empty.rs`, `ddl.rs`, and `staging.rs`. Capabilities remain the same:
   `GROUP BY` with hash-based aggregation (`COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`,
   `AVG` with proper NULL exclusion), `HAVING` post-filter, `ORDER BY` with multi-column
   sort keys and per-column `NULLS FIRST/LAST` control, `LIMIT n OFFSET m` for pagination,
@@ -205,6 +205,9 @@ The SQL processing pipeline:
   deduplication), and `INSERT … SELECT` for bulk copy and aggregate materialization
 - Stable-RID UPDATE fast path — same-slot heap rewrite that preserves `RecordId`
   when the new encoded row fits and makes untouched-index skipping safe
+- Transactional INSERT staging — explicit transactions can buffer consecutive
+  `INSERT ... VALUES` rows in `SessionContext`, then flush them through one
+  grouped heap/index pass at the next barrier statement or `COMMIT`
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>

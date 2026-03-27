@@ -476,11 +476,30 @@ fn test_savepoint_rollback_leaves_pre_savepoint_writes() {
         &mut ctx,
     );
 
-    // Capture savepoint after first INSERT.
+    // SELECT acts as a barrier that flushes any staged inserts (Phase 5.21),
+    // ensuring the row is physically written before the savepoint is captured.
+    let _flush = ok(
+        "SELECT COUNT(*) FROM t",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+
+    // Capture savepoint after first INSERT is physically committed to the heap.
     let sp = txn.savepoint();
 
     ok(
         "INSERT INTO t VALUES (2)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+
+    // Flush row 2 so it is in the undo log before rollback.
+    let _flush2 = ok(
+        "SELECT COUNT(*) FROM t",
         &mut storage,
         &mut txn,
         &mut bloom,

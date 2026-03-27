@@ -436,3 +436,131 @@ fn test_text_index_lookup() {
     assert_eq!(result[0][0], Value::Int(2));
     run("COMMIT", &mut storage, &mut txn);
 }
+
+// ── Phase 5.21 — staged flush preserves index correctness ─────────────────────
+
+use axiomdb_sql::{bloom::BloomRegistry, execute_with_ctx, SessionContext};
+
+fn run_ctx_idx(
+    sql: &str,
+    storage: &mut MemoryStorage,
+    txn: &mut TxnManager,
+    bloom: &mut BloomRegistry,
+    ctx: &mut SessionContext,
+) -> QueryResult {
+    let stmt = parse(sql, None).unwrap();
+    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let analyzed = analyze(stmt, storage, snap).unwrap();
+    execute_with_ctx(analyzed, storage, txn, bloom, ctx)
+        .unwrap_or_else(|e| panic!("SQL failed: {sql}\nError: {e:?}"))
+}
+
+fn setup_ctx_idx() -> (MemoryStorage, TxnManager, BloomRegistry, SessionContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.keep().join("test.wal");
+    let mut storage = MemoryStorage::new();
+    CatalogBootstrap::init(&mut storage).unwrap();
+    let txn = TxnManager::create(&wal_path).unwrap();
+    (storage, txn, BloomRegistry::new(), SessionContext::new())
+}
+
+/// Rows staged via the 5.21 path are findable through a secondary index after commit.
+#[test]
+fn test_5_21_staged_flush_secondary_index_correct() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx_idx();
+
+    run_ctx_idx(
+        "CREATE TABLE sidxt (id INT, name VARCHAR(64))",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+    run_ctx_idx(
+        "CREATE INDEX idx_name ON sidxt (name)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+
+    run_ctx_idx("BEGIN", &mut storage, &mut txn, &mut bloom, &mut ctx);
+    for i in 1..=50 {
+        run_ctx_idx(
+            &format!("INSERT INTO sidxt VALUES ({i}, 'name_{i}')"),
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        );
+    }
+    run_ctx_idx("COMMIT", &mut storage, &mut txn, &mut bloom, &mut ctx);
+
+    // Index lookup must find the row.
+    let r = run_ctx_idx(
+        "SELECT id FROM sidxt WHERE name = 'name_25'",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+    if let axiomdb_sql::QueryResult::Rows { rows, .. } = r {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int(25));
+    } else {
+        panic!("expected Rows");
+    }
+}
+
+/// PK (UNIQUE) index stays correct after a staged batch flush.
+#[test]
+fn test_5_21_staged_flush_pk_index_correct() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx_idx();
+
+    run_ctx_idx(
+        "CREATE TABLE pkt (id INT UNIQUE, v INT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+
+    run_ctx_idx("BEGIN", &mut storage, &mut txn, &mut bloom, &mut ctx);
+    for i in 1..=30 {
+        run_ctx_idx(
+            &format!("INSERT INTO pkt VALUES ({i}, {i})"),
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        );
+    }
+    run_ctx_idx("COMMIT", &mut storage, &mut txn, &mut bloom, &mut ctx);
+
+    // All 30 rows accessible; no phantom rows.
+    let r = run_ctx_idx(
+        "SELECT COUNT(*) FROM pkt",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+    if let QueryResult::Rows { rows, .. } = r {
+        assert_eq!(rows[0][0], Value::BigInt(30));
+    }
+
+    // Inserting a duplicate after commit correctly fails.
+    run_ctx_idx("BEGIN", &mut storage, &mut txn, &mut bloom, &mut ctx);
+    let e = {
+        let stmt = parse("INSERT INTO pkt VALUES (1, 999)", None).unwrap();
+        let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+        let analyzed = analyze(stmt, &storage, snap).unwrap();
+        execute_with_ctx(analyzed, &mut storage, &mut txn, &mut bloom, &mut ctx)
+            .expect_err("expected UniqueViolation")
+    };
+    assert!(
+        matches!(e, DbError::UniqueViolation { .. }),
+        "wrong error: {e:?}"
+    );
+    run_ctx_idx("ROLLBACK", &mut storage, &mut txn, &mut bloom, &mut ctx);
+}

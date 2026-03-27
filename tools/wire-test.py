@@ -4,7 +4,8 @@ AxiomDB wire protocol test.
 Updated at each subphase close — always overwrite this file, never create new ones.
 
 Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batch delete),
-             5.19a (executor decomposition — structural refactor, wire-invisible)
+             5.19a (executor decomposition — structural refactor, wire-invisible),
+             5.21 (transactional INSERT staging)
 """
 import os
 import signal
@@ -1610,6 +1611,102 @@ ok("5.19 INSERT after batch delete: tree usable, row found",
 cb19.execute("DROP TABLE bd_users")
 conn_bd.commit()
 conn_bd.close()
+
+# ── [5.21] Transactional INSERT staging — explicit transaction behavior ──────
+
+print("\n[5.21] Transactional INSERT staging — explicit transaction behavior")
+
+conn_i21 = connect()
+ci21 = conn_i21.cursor()
+
+ci21.execute(
+    """CREATE TABLE stage_users (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL
+)"""
+)
+ci21.execute("CREATE UNIQUE INDEX idx_stage_email ON stage_users (email)")
+conn_i21.commit()
+
+# COMMIT flushes staged rows even if no barrier statement ran before it.
+ci21.execute("BEGIN")
+ci21.execute("INSERT INTO stage_users (name, email) VALUES ('alice', 'alice@x.dev')")
+first_rowcount = ci21.rowcount
+first_insert_id = ci21.lastrowid
+ci21.execute("INSERT INTO stage_users (name, email) VALUES ('bob', 'bob@x.dev')")
+second_rowcount = ci21.rowcount
+second_insert_id = ci21.lastrowid
+ci21.execute("COMMIT")
+
+ok("5.21 COMMIT flush: first INSERT returns rowcount=1",
+   first_rowcount == 1, first_rowcount)
+ok("5.21 COMMIT flush: second INSERT returns rowcount=1",
+   second_rowcount == 1, second_rowcount)
+ok("5.21 LAST_INSERT_ID path: first generated id is visible to client",
+   first_insert_id == 1, first_insert_id)
+ok("5.21 LAST_INSERT_ID path: second generated id increments correctly",
+   second_insert_id == 2, second_insert_id)
+
+ci21.execute("SELECT id, name FROM stage_users ORDER BY id ASC")
+stage_rows = ci21.fetchall()
+ok("5.21 COMMIT flush: staged rows become durable on COMMIT",
+   list(stage_rows) == [(1, "alice"), (2, "bob")], stage_rows)
+
+# SELECT is a barrier, so read-your-own-writes still works before COMMIT.
+ci21.execute("BEGIN")
+ci21.execute("INSERT INTO stage_users (name, email) VALUES ('carol', 'carol@x.dev')")
+ci21.execute("SELECT name FROM stage_users WHERE email = 'carol@x.dev'")
+visible = ci21.fetchone()
+ok("5.21 barrier flush: SELECT sees prior staged INSERT in same txn",
+   visible == ("carol",), visible)
+ci21.execute("ROLLBACK")
+
+ci21.execute("SELECT COUNT(*) FROM stage_users WHERE email = 'carol@x.dev'")
+ok("5.21 ROLLBACK: uncommitted staged row is discarded",
+   ci21.fetchone()[0] == 0)
+
+# Table switch is also a barrier.
+ci21.execute("CREATE TABLE stage_logs (id INT, msg TEXT)")
+conn_i21.commit()
+ci21.execute("BEGIN")
+ci21.execute("INSERT INTO stage_users (name, email) VALUES ('dave', 'dave@x.dev')")
+ci21.execute("INSERT INTO stage_logs VALUES (1, 'log-entry')")
+ci21.execute("COMMIT")
+
+ci21.execute("SELECT COUNT(*) FROM stage_users WHERE email = 'dave@x.dev'")
+ok("5.21 table switch barrier: first table flushed before second INSERT target",
+   ci21.fetchone()[0] == 1)
+ci21.execute("SELECT COUNT(*) FROM stage_logs")
+ok("5.21 table switch barrier: second table row also commits correctly",
+   ci21.fetchone()[0] == 1)
+
+# Duplicate UNIQUE keys inside one explicit transaction fail immediately and
+# leave no committed rows behind after rollback.
+ci21.execute("BEGIN")
+ci21.execute("INSERT INTO stage_users (name, email) VALUES ('erin', 'dup@x.dev')")
+dup_failed = False
+try:
+    ci21.execute("INSERT INTO stage_users (name, email) VALUES ('erin-2', 'dup@x.dev')")
+except pymysql.err.IntegrityError:
+    dup_failed = True
+ok("5.21 UNIQUE precheck: duplicate buffered key raises IntegrityError immediately",
+   dup_failed)
+ci21.execute("ROLLBACK")
+
+ci21.execute("SELECT COUNT(*) FROM stage_users WHERE email = 'dup@x.dev'")
+ok("5.21 ROLLBACK after duplicate: no duplicate row leaks into committed state",
+   ci21.fetchone()[0] == 0)
+
+ci21.execute("SELECT id FROM stage_users WHERE email = 'alice@x.dev'")
+alice_lookup = ci21.fetchone()
+ok("5.21 secondary index correctness: committed row remains findable by UNIQUE index",
+   alice_lookup == (1,), alice_lookup)
+
+ci21.execute("DROP TABLE stage_logs")
+ci21.execute("DROP TABLE stage_users")
+conn_i21.commit()
+conn_i21.close()
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

@@ -414,6 +414,105 @@ pub fn delete_many_from_single_index(
     }
 }
 
+// ── Batch insert helpers (Phase 5.21) ─────────────────────────────────────────
+
+/// Inserts all rows in `rows` into every secondary index, persisting each
+/// changed root **once per index per flush** instead of once per row.
+///
+/// Per index, the function walks all `(row, rid)` pairs and accumulates root
+/// changes through splits. The final root is written to the catalog exactly
+/// once via `CatalogWriter::update_index_root`, which eliminates the N catalog
+/// writes that the per-row path would produce.
+///
+/// UNIQUE within the staged batch is pre-checked by the enqueue path
+/// (`unique_seen`), so no redundant uniqueness error can surface here for
+/// rows that were already validated. The B-Tree still enforces uniqueness
+/// against committed data for safety.
+///
+/// Returns `(index_id, new_root_page_id)` for every index whose root changed.
+/// The caller is responsible for updating the in-memory `IndexDef` slice.
+pub fn batch_insert_into_indexes(
+    indexes: &mut [IndexDef],
+    rows: &[Vec<Value>],
+    rids: &[RecordId],
+    storage: &mut dyn StorageEngine,
+    bloom: &mut crate::bloom::BloomRegistry,
+    compiled_preds: &[Option<Expr>],
+) -> Result<Vec<(u32, u64)>, DbError> {
+    debug_assert_eq!(
+        rows.len(),
+        rids.len(),
+        "batch_insert_into_indexes: rows and rids must be parallel"
+    );
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut updated_roots: Vec<(u32, u64)> = Vec::new();
+
+    for (i, idx) in indexes.iter_mut().enumerate() {
+        if idx.columns.is_empty() {
+            continue;
+        }
+
+        let pred = compiled_preds.get(i).and_then(|p| p.as_ref());
+        let original_root = idx.root_page_id;
+        let root_pid = AtomicU64::new(original_root);
+
+        for (row, rid) in rows.iter().zip(rids.iter()) {
+            // Partial index predicate check.
+            if let Some(p) = pred {
+                if !is_truthy(&eval(p, row)?) {
+                    continue;
+                }
+            }
+
+            let key_vals: Vec<Value> = idx
+                .columns
+                .iter()
+                .map(|c| row.get(c.col_idx as usize).cloned().unwrap_or(Value::Null))
+                .collect();
+
+            // Skip NULL key values.
+            if key_vals.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+
+            let key = if idx.is_fk_index || !idx.is_unique {
+                let mut k = encode_index_key(&key_vals)?;
+                k.extend_from_slice(&encode_rid(*rid));
+                k
+            } else {
+                encode_index_key(&key_vals)?
+            };
+
+            // Uniqueness check against committed data (intra-batch duplicates
+            // were already rejected by the enqueue path via `unique_seen`).
+            if idx.is_unique
+                && !idx.is_fk_index
+                && BTree::lookup_in(storage, root_pid.load(Ordering::Acquire), &key)?.is_some()
+            {
+                let dup_val = key_vals.first().map(|v| format!("{v}"));
+                return Err(DbError::UniqueViolation {
+                    index_name: idx.name.clone(),
+                    value: dup_val,
+                });
+            }
+
+            BTree::insert_in(storage, &root_pid, &key, *rid, idx.fillfactor)?;
+            bloom.add(idx.index_id, &key);
+        }
+
+        let new_root = root_pid.load(Ordering::Acquire);
+        if new_root != original_root {
+            idx.root_page_id = new_root;
+            updated_roots.push((idx.index_id, new_root));
+        }
+    }
+
+    Ok(updated_roots)
+}
+
 /// Inserts one row into a single index and returns the new root if it changed.
 pub fn insert_into_single_index(
     idx: &mut IndexDef,

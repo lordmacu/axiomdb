@@ -2,8 +2,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use axiomdb_catalog::ResolvedTable;
+use axiomdb_catalog::{
+    schema::{ColumnDef, TableDef},
+    IndexDef, ResolvedTable,
+};
 use axiomdb_core::error::DbError;
+use axiomdb_types::Value;
+
+use crate::expr::Expr;
 
 // ── CompatMode ────────────────────────────────────────────────────────────────
 
@@ -375,6 +381,32 @@ pub fn apply_strict_to_sql_mode(current: &str, enabled: bool) -> String {
     }
 }
 
+// ── PendingInsertBatch ────────────────────────────────────────────────────────
+
+/// Transaction-local staging buffer for consecutive `INSERT ... VALUES` statements.
+#[derive(Debug)]
+///
+/// Rows are enqueued here instead of being written to the heap immediately.
+/// The buffer is flushed (heap + WAL + index write) before any barrier statement
+/// (`SELECT`, `UPDATE`, `DELETE`, DDL, `COMMIT`, table switch, ineligible INSERT).
+/// On `ROLLBACK`, the buffer is discarded without touching heap or WAL.
+///
+/// Only active inside an explicit user transaction (`in_explicit_txn = true`).
+pub struct PendingInsertBatch {
+    pub table_id: u32,
+    pub table_def: TableDef,
+    pub columns: Vec<ColumnDef>,
+    /// Secondary indexes (non-primary, non-empty columns) for this table.
+    pub indexes: Vec<IndexDef>,
+    /// Pre-compiled partial-index predicates, parallel to `indexes`.
+    pub compiled_preds: Vec<Option<Expr>>,
+    /// Fully materialized rows ready to be written to the heap.
+    pub rows: Vec<Vec<Value>>,
+    /// For each unique (non-FK) index: set of encoded keys already staged.
+    /// Used to detect cross-row UNIQUE violations before heap mutation.
+    pub unique_seen: HashMap<u32, HashSet<Vec<u8>>>,
+}
+
 // ── SessionContext ────────────────────────────────────────────────────────────
 
 /// Per-connection state: schema cache + session variables visible to the executor.
@@ -428,6 +460,17 @@ pub struct SessionContext {
     /// `Database::execute_query`). The handler reads `warnings.len()` to set
     /// `warning_count` in the OK packet, and `SHOW WARNINGS` returns this list.
     pub warnings: Vec<SqlWarning>,
+    /// Staging buffer for consecutive `INSERT ... VALUES` inside an explicit transaction.
+    ///
+    /// `None` when no rows are pending. Flushed on any barrier statement or COMMIT.
+    /// Discarded (without heap/WAL writes) on ROLLBACK.
+    pub pending_inserts: Option<PendingInsertBatch>,
+    /// `true` while the connection is inside an explicit user transaction
+    /// (after `BEGIN`, before `COMMIT` / `ROLLBACK`).
+    ///
+    /// Used by the INSERT path to decide whether rows are eligible for staging.
+    /// Autocommit-wrapped single-statement transactions do NOT set this flag.
+    pub in_explicit_txn: bool,
 }
 
 impl Default for SessionContext {
@@ -449,12 +492,23 @@ impl SessionContext {
             explicit_collation: None,
             warnings: Vec::new(),
             stats: StaleStatsTracker::default(),
+            pending_inserts: None,
+            in_explicit_txn: false,
         }
     }
 
     /// Clears all accumulated warnings. Called before each statement.
     pub fn clear_warnings(&mut self) {
         self.warnings.clear();
+    }
+
+    /// Discards any staged INSERT rows without writing to heap or WAL.
+    ///
+    /// Called on `ROLLBACK` to cleanly drop buffered rows that were never
+    /// physically inserted. Also clears the explicit-transaction flag.
+    pub fn discard_pending_inserts(&mut self) {
+        self.pending_inserts = None;
+        self.in_explicit_txn = false;
     }
 
     /// Appends a warning. Called by the executor when a no-op or non-fatal

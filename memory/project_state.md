@@ -33,3 +33,26 @@
   - `tools/wire-test.py` is part of the loop only for MySQL wire-visible changes
 - Remaining notable Phase 5 items after this close:
   - `5.15` DSN parsing
+
+## 2026-03-27
+
+- Phase 5 subphase `5.21` is closed in code, tests, and docs.
+- Explicit transactions now stage consecutive `INSERT ... VALUES` rows in
+  `SessionContext::pending_inserts` and flush them together at `COMMIT` or the
+  next barrier statement.
+- The staging path performs enqueue-time logical validation:
+  - AUTO_INCREMENT assignment
+  - CHECK constraints
+  - FK child validation
+  - duplicate UNIQUE / PRIMARY KEY rejection against committed state and
+    in-batch `unique_seen`
+- A real bug surfaced during wire closure: table-switch flushes originally
+  happened after the next statement savepoint, which let a later duplicate-key
+  error roll back earlier staged rows. The final fix moved that flush decision
+  to the statement boundary.
+- Latest local benchmark snapshot for the targeted workload:
+  - `insert` (`50K` one-row INSERTs in `1` explicit txn, release server): `23.9K rows/s`
+  - MariaDB 12.1 on the same run: `28.0K rows/s`
+  - MySQL 8.0 on the same run: `26.7K rows/s`
+- Remaining notable Phase 5 item after this close:
+  - `5.15` DSN parsing
