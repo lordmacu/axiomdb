@@ -67,10 +67,10 @@ pub use db::Row;
 #[cfg(feature = "sync-api")]
 mod db {
     use std::ffi::CString;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use axiomdb_catalog::bootstrap::CatalogBootstrap;
-    use axiomdb_core::error::DbError;
+    use axiomdb_core::{error::DbError, parse_dsn, ParsedDsn};
     use axiomdb_sql::{
         analyze_cached, bloom::BloomRegistry, execute_with_ctx, parse, result::QueryResult,
         SchemaCache, SessionContext,
@@ -142,6 +142,20 @@ mod db {
                 degraded: false,
                 error_msg: None,
             })
+        }
+
+        /// Opens or creates a database from a local DSN.
+        ///
+        /// Accepted forms in `5.15`:
+        /// - plain paths
+        /// - `file:` URIs
+        /// - `axiomdb:///local/path`
+        ///
+        /// Remote wire DSNs parse successfully but are rejected for the
+        /// embedded API in this subphase.
+        pub fn open_dsn(dsn: impl AsRef<str>) -> Result<Self, DbError> {
+            let path = resolve_local_dsn_path(dsn.as_ref())?;
+            Self::open(path)
         }
 
         /// Executes a SQL statement that does not return rows
@@ -304,6 +318,26 @@ mod db {
             || lower.starts_with("savepoint")
             || lower.starts_with("release")
     }
+
+    fn resolve_local_dsn_path(dsn: &str) -> Result<PathBuf, DbError> {
+        let parsed = parse_dsn(dsn)?;
+        match parsed {
+            ParsedDsn::Local(local) => {
+                if !local.query.is_empty() {
+                    let params = local.query.keys().cloned().collect::<Vec<_>>().join(", ");
+                    return Err(DbError::InvalidDsn {
+                        reason: format!(
+                            "embedded DSN does not support query parameters in 5.15: {params}"
+                        ),
+                    });
+                }
+                Ok(local.path)
+            }
+            ParsedDsn::Wire(_) => Err(DbError::InvalidDsn {
+                reason: "embedded open_dsn only supports local-path DSNs in 5.15".into(),
+            }),
+        }
+    }
 }
 
 // ── C FFI ─────────────────────────────────────────────────────────────────────
@@ -414,6 +448,25 @@ mod ffi {
             Err(_) => return std::ptr::null_mut(),
         };
         match Db::open(path) {
+            Ok(db) => Box::into_raw(Box::new(db)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// Opens or creates a database from a local DSN.
+    ///
+    /// # Safety
+    /// `dsn` must be a valid non-null pointer to a UTF-8 null-terminated string.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_open_dsn(dsn: *const c_char) -> *mut Db {
+        if dsn.is_null() {
+            return std::ptr::null_mut();
+        }
+        let dsn = match CStr::from_ptr(dsn).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        match Db::open_dsn(dsn) {
             Ok(db) => Box::into_raw(Box::new(db)),
             Err(_) => std::ptr::null_mut(),
         }
@@ -751,12 +804,18 @@ pub mod async_db {
             let path = path.into();
             let db = tokio::task::spawn_blocking(move || Db::open(&path))
                 .await
-                .map_err(|e| {
-                    DbError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })??;
+                .map_err(|e| DbError::Io(std::io::Error::other(e.to_string())))??;
+            Ok(Self {
+                inner: Arc::new(Mutex::new(db)),
+            })
+        }
+
+        /// Opens or creates a database from a local DSN.
+        pub async fn open_dsn(dsn: impl Into<String>) -> Result<Self, DbError> {
+            let dsn = dsn.into();
+            let db = tokio::task::spawn_blocking(move || Db::open_dsn(&dsn))
+                .await
+                .map_err(|e| DbError::Io(std::io::Error::other(e.to_string())))??;
             Ok(Self {
                 inner: Arc::new(Mutex::new(db)),
             })
@@ -768,12 +827,7 @@ pub mod async_db {
             let inner = Arc::clone(&self.inner);
             tokio::task::spawn_blocking(move || inner.lock().unwrap().execute(&sql))
                 .await
-                .map_err(|e| {
-                    DbError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })?
+                .map_err(|e| DbError::Io(std::io::Error::other(e.to_string())))?
         }
 
         /// Executes a SQL SELECT. Returns rows.
@@ -782,12 +836,7 @@ pub mod async_db {
             let inner = Arc::clone(&self.inner);
             tokio::task::spawn_blocking(move || inner.lock().unwrap().query(&sql))
                 .await
-                .map_err(|e| {
-                    DbError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })?
+                .map_err(|e| DbError::Io(std::io::Error::other(e.to_string())))?
         }
 
         /// Executes a SQL SELECT. Returns column names and rows.
@@ -799,12 +848,7 @@ pub mod async_db {
             let inner = Arc::clone(&self.inner);
             tokio::task::spawn_blocking(move || inner.lock().unwrap().query_with_columns(&sql))
                 .await
-                .map_err(|e| {
-                    DbError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })?
+                .map_err(|e| DbError::Io(std::io::Error::other(e.to_string())))?
         }
     }
 }

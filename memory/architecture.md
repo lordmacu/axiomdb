@@ -108,3 +108,21 @@
 - Packet writes during command execution use `net_write_timeout`.
 - `COM_RESET_CONNECTION` recreates `ConnectionState` and resets timeout vars to
   defaults, but preserves lifecycle metadata such as interactive classification.
+
+## 2026-03-27 — Shared DSN parsing for server and embedded
+
+- `axiomdb-core/src/dsn.rs` now owns DSN normalization and classification.
+- The parser returns one of two typed shapes:
+  - `ParsedDsn::Wire(WireEndpointDsn)`
+  - `ParsedDsn::Local(LocalPathDsn)`
+- `mysql://`, `postgres://`, and `postgresql://` are parsing aliases only.
+- `axiomdb-server` consumes only the wire shape and currently uses only:
+  - bind host
+  - bind port
+  - `data_dir` query param
+- `axiomdb-embedded` consumes only the local shape and rejects query params in
+  `5.15`.
+- The architectural rule is:
+  - parse once in core
+  - validate per consumer
+  - do not silently invent semantics for unsupported DSN fields

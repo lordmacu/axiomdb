@@ -98,11 +98,23 @@ prevents circular dependencies and makes each component independently testable.
 The dependency-free foundation. Contains:
 
 - `DbError` — the single error enum used by all other crates, using `thiserror`
+- `dsn` — shared DSN parser and typed normalized output:
+  - `ParsedDsn`
+  - `WireEndpointDsn`
+  - `LocalPathDsn`
 - `RecordId` — physical location of a row: `(page_id: u64, slot_id: u16)`, 10 bytes
 - `TransactionSnapshot` — snapshot ID and visibility predicate for MVCC
 - `PageId`, `LsnId` — type aliases that document intent
 
 No crate in the workspace depends on a crate above `axiomdb-core`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Shared DSN Core</span>
+Borrowing PostgreSQL libpq's parsing boundary and SQLite's reusable URI-normalization idea, AxiomDB parses DSNs once in <code>axiomdb-core</code> and lets each consumer validate only the subset it actually supports. This avoids duplicating URI logic in both <code>axiomdb-server</code> and <code>axiomdb-embedded</code>.
+</div>
+</div>
 
 ### axiomdb-types
 

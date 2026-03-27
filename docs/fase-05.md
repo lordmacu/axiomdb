@@ -1,8 +1,56 @@
 # Phase 5 — MySQL Wire Protocol + executor/runtime cleanup
 
-## Subfases completed in this session: 5.11c, 5.19, 5.19a, 5.19b, 5.20, 5.21
+## Subfases completed in this session: 5.11c, 5.15, 5.19, 5.19a, 5.19b, 5.20, 5.21
 
 ## What was built
+
+Phase 5 is now fully closed. `5.15` was the last open subphase.
+
+### 5.15 — Connection string DSN
+
+AxiomDB now has a shared, typed DSN parser in `axiomdb-core` and uses it in the
+two AxiomDB-owned configuration surfaces that needed it in Phase 5: server
+bootstrap and embedded open APIs.
+
+What changed:
+
+- `crates/axiomdb-core/src/dsn.rs` now parses and classifies:
+  - `axiomdb://...`
+  - `mysql://...`
+  - `postgres://...`
+  - `postgresql://...`
+  - `file:...`
+  - plain local paths
+- The parser returns typed results instead of raw strings:
+  - `ParsedDsn::Wire(WireEndpointDsn)`
+  - `ParsedDsn::Local(LocalPathDsn)`
+- URI parsing now:
+  - percent-decodes username, password, path/database, and query params
+  - accepts bracketed IPv6
+  - preserves query params
+  - rejects duplicate query parameter keys
+- `crates/axiomdb-server/src/main.rs` now accepts `AXIOMDB_URL` and derives:
+  - bind host
+  - bind port
+  - `data_dir` from `?data_dir=...`
+  while still keeping the legacy `AXIOMDB_DATA` / `AXIOMDB_PORT` fallback path
+  unchanged when `AXIOMDB_URL` is absent
+- `crates/axiomdb-embedded/src/lib.rs` now exposes:
+  - `Db::open_dsn(...)`
+  - `AsyncDb::open_dsn(...)`
+  - `axiomdb_open_dsn(...)`
+- Embedded mode accepts only local-path DSNs in `5.15`; remote wire-endpoint
+  DSNs parse correctly but are rejected explicitly by the embedded consumer
+
+Why this matters:
+
+- AxiomDB-owned entrypoints now speak a standard DSN language instead of mixing
+  ad hoc env vars and path-only APIs
+- DSN syntax is parsed once in `axiomdb-core`, then validated per consumer,
+  which keeps server bootstrap and embedded open behavior consistent without
+  inventing semantics that do not exist yet
+- `mysql://` and `postgres://` are parse aliases only; Phase 5 does not pretend
+  to add a remote embedded connector or PostgreSQL wire support
 
 ### 5.11c — Explicit connection state machine
 
@@ -232,6 +280,14 @@ Measured with the local four-engine benchmark (`50K` rows, release server,
 
 ## Validation
 
+- `cargo test -p axiomdb-core`
+- `cargo test -p axiomdb-embedded`
+- `cargo test -p axiomdb-embedded --features async-api`
+- `cargo test -p axiomdb-server`
+- `cargo clippy -p axiomdb-core --tests -- -D warnings`
+- `cargo clippy -p axiomdb-embedded --tests -- -D warnings`
+- `cargo clippy -p axiomdb-embedded --features async-api --tests -- -D warnings`
+- `cargo clippy -p axiomdb-server --tests -- -D warnings`
 - `cargo test -p axiomdb-network`
 - `cargo clippy -p axiomdb-network -p axiomdb-server --tests -- -D warnings`
 - `cargo test -p axiomdb-storage --lib`
@@ -257,5 +313,7 @@ Measured with the local four-engine benchmark (`50K` rows, release server,
 - `python3 benches/comparison/local_bench.py --scenario insert --rows 50000 --table`
 
 ## Follow-up subfases still open in Phase 5
+
+- none — Phase 5 is complete
 
 - `5.15` — DSN parsing

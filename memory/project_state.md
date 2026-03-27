@@ -36,6 +36,7 @@
 
 ## 2026-03-27
 
+- Phase 5 subphase `5.15` is closed in code, tests, and docs.
 - Phase 5 subphase `5.21` is closed in code, tests, and docs.
 - Explicit transactions now stage consecutive `INSERT ... VALUES` rows in
   `SessionContext::pending_inserts` and flush them together at `COMMIT` or the
@@ -54,5 +55,13 @@
   - `insert` (`50K` one-row INSERTs in `1` explicit txn, release server): `23.9K rows/s`
   - MariaDB 12.1 on the same run: `28.0K rows/s`
   - MySQL 8.0 on the same run: `26.7K rows/s`
-- Remaining notable Phase 5 item after this close:
-  - `5.15` DSN parsing
+- A shared DSN parser now lives in `axiomdb-core/src/dsn.rs`.
+- `axiomdb-server` consumes it through `AXIOMDB_URL`, while preserving
+  `AXIOMDB_DATA` / `AXIOMDB_PORT` fallback behavior.
+- `axiomdb-embedded` now exposes:
+  - `Db::open_dsn`
+  - `AsyncDb::open_dsn`
+  - `axiomdb_open_dsn`
+- Embedded mode accepts only local-path DSNs in `5.15`; remote wire-endpoint
+  DSNs are rejected explicitly after parse.
+- Phase 5 is now complete.

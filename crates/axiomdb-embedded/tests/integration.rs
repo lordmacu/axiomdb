@@ -3,6 +3,7 @@
 //! Tests the full pipeline: open → DDL → DML → SELECT → close → reopen.
 //! Exercises the public Rust API and indirectly validates all C FFI logic.
 
+use axiomdb_core::DbError;
 use axiomdb_embedded::Db;
 use axiomdb_types::Value;
 
@@ -13,6 +14,10 @@ fn open_fresh() -> (Db, tempfile::TempDir) {
     let path = dir.path().join("test");
     let db = Db::open(&path).unwrap();
     (db, dir)
+}
+
+fn file_uri(path: &std::path::Path) -> String {
+    format!("file:{}", path.display())
 }
 
 // ── Open / DDL ────────────────────────────────────────────────────────────────
@@ -42,6 +47,74 @@ fn open_existing_database_recovers_data() {
     let mut db = Db::open(&path).unwrap();
     let rows = db.query("SELECT * FROM items").unwrap();
     assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn open_dsn_file_uri_recovers_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("persist.db");
+    let dsn = file_uri(&path);
+
+    {
+        let mut db = Db::open_dsn(&dsn).unwrap();
+        db.execute("CREATE TABLE items (id INT, label TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 'alpha')").unwrap();
+        db.execute("INSERT INTO items VALUES (2, 'beta')").unwrap();
+    }
+
+    let mut db = Db::open_dsn(&dsn).unwrap();
+    let rows = db.query("SELECT * FROM items ORDER BY id").unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1], Value::Text("alpha".into()));
+    assert_eq!(rows[1][1], Value::Text("beta".into()));
+}
+
+#[test]
+fn open_dsn_axiomdb_local_recovers_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("persist");
+    let dsn = format!("axiomdb://{}", path.display());
+
+    {
+        let mut db = Db::open_dsn(&dsn).unwrap();
+        db.execute("CREATE TABLE items (id INT, label TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (7, 'persisted')")
+            .unwrap();
+    }
+
+    let mut db = Db::open_dsn(&dsn).unwrap();
+    let rows = db.query("SELECT id, label FROM items").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Int(7));
+    assert_eq!(rows[0][1], Value::Text("persisted".into()));
+}
+
+#[test]
+fn open_dsn_rejects_remote_wire_endpoints() {
+    let err = Db::open_dsn("postgres://user@127.0.0.1:5432/app")
+        .err()
+        .expect("remote DSN should be rejected");
+    assert!(matches!(
+        err,
+        DbError::InvalidDsn { reason }
+            if reason.contains("embedded open_dsn only supports local-path DSNs")
+    ));
+}
+
+#[test]
+fn open_dsn_rejects_query_params_in_embedded_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("query.db");
+    let dsn = format!("{}?mode=rw", file_uri(&path));
+    let err = Db::open_dsn(&dsn)
+        .err()
+        .expect("embedded DSN query params should be rejected");
+    assert!(matches!(
+        err,
+        DbError::InvalidDsn { reason } if reason.contains("does not support query parameters")
+    ));
 }
 
 // ── INSERT / SELECT ───────────────────────────────────────────────────────────
@@ -228,6 +301,34 @@ fn select_without_from() {
 
 // ── C FFI — smoke test via #[no_mangle] symbols ───────────────────────────────
 
+#[cfg(feature = "async-api")]
+mod async_api {
+    use axiomdb_embedded::async_db::AsyncDb;
+    use axiomdb_types::Value;
+
+    use super::file_uri;
+
+    #[tokio::test]
+    async fn async_open_dsn_works_for_local_file_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("async.db");
+        let dsn = file_uri(&path);
+
+        let db = AsyncDb::open_dsn(&dsn).await.unwrap();
+        db.execute("CREATE TABLE t (id INT, name TEXT)")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'async')")
+            .await
+            .unwrap();
+
+        let rows = db.query("SELECT id, name FROM t").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int(1));
+        assert_eq!(rows[0][1], Value::Text("async".into()));
+    }
+}
+
 #[cfg(feature = "c-ffi")]
 mod c_ffi {
     use std::ffi::CString;
@@ -237,6 +338,7 @@ mod c_ffi {
     // tests link against. We forward-declare them here as extern "C".
     extern "C" {
         fn axiomdb_open(path: *const c_char) -> *mut std::ffi::c_void;
+        fn axiomdb_open_dsn(path: *const c_char) -> *mut std::ffi::c_void;
         fn axiomdb_execute(db: *mut std::ffi::c_void, sql: *const c_char) -> i64;
         fn axiomdb_query(db: *mut std::ffi::c_void, sql: *const c_char) -> *mut std::ffi::c_void;
         fn axiomdb_rows_count(rows: *const std::ffi::c_void) -> i64;
@@ -260,6 +362,10 @@ mod c_ffi {
 
     unsafe fn ptr_to_str(ptr: *const c_char) -> &'static str {
         std::ffi::CStr::from_ptr(ptr).to_str().unwrap()
+    }
+
+    fn file_uri(path: &std::path::Path) -> CString {
+        cstr(&format!("file:{}", path.display()))
     }
 
     #[test]
@@ -348,6 +454,24 @@ mod c_ffi {
 
             axiomdb_rows_free(std::ptr::null_mut()); // must not crash
             axiomdb_close(std::ptr::null_mut()); // must not crash
+        }
+    }
+
+    #[test]
+    fn c_ffi_open_dsn_accepts_local_file_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c_dsn.db");
+        let dsn = file_uri(&path);
+
+        unsafe {
+            let db = axiomdb_open_dsn(dsn.as_ptr());
+            assert!(
+                !db.is_null(),
+                "axiomdb_open_dsn should succeed for file URI"
+            );
+            let n = axiomdb_execute(db, cstr("CREATE TABLE t (id INT)").as_ptr());
+            assert_eq!(n, 0);
+            axiomdb_close(db);
         }
     }
 }
