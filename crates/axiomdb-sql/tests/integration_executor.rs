@@ -3346,6 +3346,41 @@ fn setup_ctx() -> (MemoryStorage, TxnManager, BloomRegistry, SessionContext) {
 }
 
 #[test]
+fn test_count_star_with_ctx_uses_masked_scan_without_hanging() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+
+    run_ctx(
+        "CREATE TABLE t (id INT, name TEXT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "INSERT INTO t VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let QueryResult::Rows { rows, .. } = run_ctx(
+        "SELECT COUNT(*) FROM t",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap() else {
+        panic!("COUNT(*) must return rows");
+    };
+
+    assert_eq!(rows, vec![vec![Value::BigInt(3)]]);
+}
+
+#[test]
 fn test_strict_mode_default_is_on() {
     let ctx = SessionContext::new();
     assert!(ctx.strict_mode, "strict_mode must default to true");

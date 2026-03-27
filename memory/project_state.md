@@ -36,6 +36,18 @@
 
 ## 2026-03-27
 
+- Phase 6 subphase `6.16` is closed in code, targeted tests, and docs.
+- Phase 6 subphase `6.17` is closed in code, targeted tests, and docs.
+- Phase 6 subphase `6.18` is closed in code, targeted tests, and docs.
+- Phase 6 subphase `6.19` is implemented but not closed.
+- The leader-based WAL fsync pipeline is live in the server path, but the closure benchmark still fails:
+  - `local_bench.py --scenario insert_autocommit --rows 1000 --table --engines axiomdb`
+  - result: `224 ops/s`
+  - spec target: `>= 5K ops/s`
+- The blocker is architectural, not a missing test:
+  - the MySQL wire handler still waits for durability before sending the OK packet
+  - with a single request/response client, the next statement cannot arrive while the fsync is in flight
+  - the MariaDB-style leader/follower piggyback therefore helps overlapping commits, but not the sequential single-connection benchmark the spec targeted
 - Phase 6 subphase `6.15` is closed in code, targeted tests, and docs.
 - Phase 5 subphase `5.15` is closed in code, tests, and docs.
 - Phase 5 subphase `5.21` is closed in code, tests, and docs.
@@ -73,3 +85,37 @@
 - The verifier runs in both:
   - `axiomdb-network/src/mysql/database.rs`
   - `axiomdb-embedded/src/lib.rs`
+- `6.16` removes the last planner-side blind spot for primary-key SELECT:
+  - PRIMARY KEY indexes are now eligible in `plan_select` / `plan_select_ctx`
+  - `WHERE pk = literal` bypasses the small-table / NDV scan bias and emits `IndexLookup`
+  - PK range predicates reuse the existing `IndexRange` path
+  - non-binary session collation still rejects text-key PK access
+- Targeted `select_pk` local bench after `6.16`:
+  - MariaDB `12.7K lookups/s`
+  - MySQL `13.4K lookups/s`
+  - AxiomDB `11.1K lookups/s`
+- The old debt was planner-side full scan; the remaining gap is now smaller and
+  sits after planning in row/materialization/wire overhead.
+- `6.17` removes planner-side full-scan discovery for indexed UPDATE:
+  - `plan_update_candidates` / `_ctx` now select PK or secondary index access
+  - `execute_update[_ctx]` materializes candidate RIDs before mutation and
+    rechecks the full `WHERE`
+  - the existing `5.20` stable-RID / fallback write path remains unchanged
+- Targeted `update_range` local bench after `6.17`:
+  - MariaDB `618K rows/s`
+  - MySQL `291K rows/s`
+  - AxiomDB `85.2K rows/s`
+- The remaining indexed UPDATE gap is no longer candidate discovery; it sits in
+  heap rewrite / index maintenance after candidates are found.
+- `6.18` removes the remaining immediate multi-row INSERT fallback on indexed
+  tables:
+  - shared apply helpers now serve both staged transactional INSERT flushes and
+    immediate `INSERT ... VALUES (...), (... )`
+  - PRIMARY KEY / secondary indexes no longer force per-row maintenance for the
+    statement
+  - immediate multi-row INSERT keeps strict same-statement UNIQUE checking and
+    therefore does not reuse the staged `committed_empty` shortcut
+- Targeted `insert_multi_values` local bench after `6.18` on the PK benchmark schema:
+  - MariaDB `160,581 rows/s`
+  - MySQL `259,854 rows/s`
+  - AxiomDB `321,002 rows/s`

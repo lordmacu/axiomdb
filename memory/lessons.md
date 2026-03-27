@@ -122,6 +122,19 @@
   - compare against the latest relevant local baseline or competitor numbers
   - avoid rerunning unrelated scenarios unless the blast radius justifies it
 
+## 2026-03-27 - Indexed UPDATE has two separate costs too
+
+- Fixing indexed `UPDATE ... WHERE` discovery does not automatically fix update
+  throughput end-to-end.
+- `6.17` removed the planner-side full scan for PK/range/equality predicates,
+  but the post-fix benchmark still showed a large gap.
+- That measurement is useful: it means the remaining cost sits in the apply
+  path after candidates are found, not in discovery anymore.
+- Keep future UPDATE performance work split the same way:
+  - candidate discovery
+  - heap rewrite / stable-RID hit rate
+  - index maintenance / root persistence
+
 ## 2026-03-27 - Parse shared config once, validate semantics at the edge
 
 - For URI/DSN-like inputs, keep one shared parser that preserves information and
@@ -147,3 +160,32 @@
   visible while the rebuilt pages were only ever resident in memory.
 - This applies to index rebuild / root-rotation paths in particular, not only to
   startup repair code.
+
+## 2026-03-27 - Shared batch apply helpers do not imply shared uniqueness shortcuts
+
+- If two INSERT paths both end in the same grouped heap/index write code, that
+  does not mean they can also share the same uniqueness fast path.
+- `5.21` staging can safely use a `committed_empty` shortcut only because it
+  prevalidates duplicate keys across the staged batch with `unique_seen`.
+- `6.18` exposed the boundary clearly: the immediate multi-row `VALUES` path can
+  reuse grouped physical apply, but must keep `skip_unique_check = false` and
+  reject same-statement duplicate PRIMARY KEY / UNIQUE values before any partial
+  batch becomes visible.
+
+## 2026-03-27 - Timer-based batching and leader-based piggybacking solve different fsync problems
+
+- The old timer-based group commit from `3.19` helps when many connections are
+  already waiting together.
+- It does **not** solve the common single-connection autocommit case, because
+  there is no overlap unless the next commit can piggyback on an in-flight fsync.
+- `6.19` therefore needed a different primitive: leader election plus
+  `flushed_lsn` / `pending_lsn` tracking, inspired by MariaDB
+  `group_commit_lock`.
+- The lesson is to benchmark the real arrival pattern, not just "concurrency" in
+  the abstract. A batching primitive that is perfect for many waiters can still
+  be the wrong primitive for pipelined single-client commits.
+- A second lesson from the closure attempt: a leader-based fsync pipeline still
+  does not improve a **sequential** MySQL wire client if the handler waits for
+  durability before it sends the OK packet.
+- Under request/response autocommit, the next statement never reaches the server
+  while the current fsync is in flight, so there is nothing to piggyback.

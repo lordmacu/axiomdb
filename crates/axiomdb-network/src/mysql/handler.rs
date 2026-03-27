@@ -875,7 +875,7 @@ pub async fn handle_connection_with_timeouts(
 
                 match result {
                     Ok((qr, commit_rx)) => {
-                        // Await fsync confirmation outside the lock (group commit).
+                        // Await fsync confirmation outside the lock (fsync pipeline).
                         if let Err(e) = await_commit_rx(commit_rx).await {
                             let me = dberror_to_mysql(&e, None);
                             let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
@@ -1132,11 +1132,11 @@ fn split_sql_statements(sql: &str) -> Vec<&str> {
 
 // ── Group commit helper ───────────────────────────────────────────────────────
 
-/// Awaits fsync confirmation from the `CommitCoordinator`.
+/// Awaits fsync confirmation from the WAL fsync pipeline.
 ///
-/// - `None` → group commit is disabled or the transaction was read-only;
-///   returns `Ok(())` immediately (no-op).
-/// - `Some(rx)` → waits for the background task to fsync and confirm;
+/// - `None` → the transaction was read-only or the current connection was the
+///   leader / expired follower; returns `Ok(())` immediately.
+/// - `Some(rx)` → waits for the leader to fsync and confirm;
 ///   returns `Ok(())` on success or `Err(WalGroupCommitFailed)` on failure.
 ///
 /// Must be called **after** the `Database` lock has been released so that
@@ -1146,7 +1146,7 @@ async fn await_commit_rx(rx: Option<CommitRx>) -> Result<(), DbError> {
         None => Ok(()),
         Some(rx) => rx.await.unwrap_or_else(|_| {
             Err(DbError::WalGroupCommitFailed {
-                message: "commit coordinator dropped before fsync".into(),
+                message: "fsync pipeline leader dropped before fsync".into(),
             })
         }),
     }

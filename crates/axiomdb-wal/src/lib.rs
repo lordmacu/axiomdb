@@ -8,6 +8,7 @@
 
 mod checkpoint;
 mod entry;
+pub mod fsync_pipeline;
 mod reader;
 mod recovery;
 mod rotation;
@@ -16,6 +17,7 @@ mod writer;
 
 pub use checkpoint::Checkpointer;
 pub use entry::{EntryType, WalEntry, MIN_ENTRY_LEN};
+pub use fsync_pipeline::{AcquireResult, CommitRx, FsyncPipeline};
 pub use reader::{BackwardIter, ForwardIter, WalReader};
 pub use recovery::{CrashRecovery, RecoveryOp, RecoveryResult, RecoveryState};
 pub use rotation::WalRotator;

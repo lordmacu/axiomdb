@@ -37,20 +37,35 @@ fn execute_update_ctx(
         .collect::<Result<_, DbError>>()?;
 
     let snap = txn.active_snapshot()?;
-    // UPDATE always needs all columns: unchanged columns carry over as-is to
-    // the new row. Lazy decode (column_mask) does not help here.
-    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?;
+    let candidate_rows: Vec<(RecordId, Vec<Value>)> = if let Some(ref wc) = stmt.where_clause {
+        let effective_coll = ctx.effective_collation();
+        let update_access = crate::planner::plan_update_candidates_ctx(
+            wc,
+            &secondary_indexes,
+            &schema_cols,
+            effective_coll,
+        );
+        collect_delete_candidates(
+            wc,
+            &secondary_indexes,
+            &schema_cols,
+            &update_access,
+            storage,
+            snap,
+            &resolved.def,
+            bloom,
+        )?
+    } else {
+        // UPDATE always needs all columns: unchanged columns carry over as-is to
+        // the new row. Lazy decode (column_mask) does not help here.
+        TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?
+    };
 
     // Collect all matching (rid, old_values, new_values) triples before touching
     // the heap. Old values are kept for secondary index maintenance (delete old
     // key before inserting new key into each B-Tree).
     let mut to_update: Vec<(RecordId, Vec<Value>, Vec<Value>)> = Vec::new();
-    for (rid, current_values) in rows {
-        if let Some(ref wc) = stmt.where_clause {
-            if !is_truthy(&eval(wc, &current_values)?) {
-                continue;
-            }
-        }
+    for (rid, current_values) in candidate_rows {
         let mut new_values = current_values.clone();
         for (col_pos, val_expr) in &assignments {
             new_values[*col_pos] = eval(val_expr, &current_values)?;
@@ -162,9 +177,6 @@ fn execute_update(
         })
         .collect::<Result<_, DbError>>()?;
 
-    let snap = txn.active_snapshot()?;
-    let rows = TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?;
-
     // Use the already-loaded indexes from the resolved table (cached by SchemaCache).
     let mut secondary_indexes: Vec<IndexDef> = resolved
         .indexes
@@ -176,16 +188,32 @@ fn execute_update(
     // No-op bloom for the non-ctx path (bloom is managed by execute_with_ctx callers).
     let mut noop_bloom = crate::bloom::BloomRegistry::new();
 
+    let snap = txn.active_snapshot()?;
+    let candidate_rows: Vec<(RecordId, Vec<Value>)> = if let Some(ref wc) = stmt.where_clause {
+        let update_access = crate::planner::plan_update_candidates(
+            wc,
+            &secondary_indexes,
+            &schema_cols,
+        );
+        collect_delete_candidates(
+            wc,
+            &secondary_indexes,
+            &schema_cols,
+            &update_access,
+            storage,
+            snap,
+            &resolved.def,
+            &noop_bloom,
+        )?
+    } else {
+        TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?
+    };
+
     let compiled_preds =
         crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;
 
     let mut to_update: Vec<(RecordId, Vec<Value>, Vec<Value>)> = Vec::new();
-    for (rid, current_values) in rows {
-        if let Some(ref wc) = stmt.where_clause {
-            if !is_truthy(&eval(wc, &current_values)?) {
-                continue;
-            }
-        }
+    for (rid, current_values) in candidate_rows {
         let mut new_values = current_values.clone();
         for (col_pos, val_expr) in &assignments {
             new_values[*col_pos] = eval(val_expr, &current_values)?;

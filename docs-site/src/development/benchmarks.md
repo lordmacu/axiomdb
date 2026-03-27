@@ -52,6 +52,27 @@ levels deep this is 3–5 page reads, all already in the OS page cache for seque
 workloads. The deferred `next_leaf` fast path (Phase 7) will reduce this to O(1) per
 boundary once epoch-based reclamation is available.
 
+## `SELECT ... WHERE pk = literal` After `6.16`
+
+Phase `6.16` fixes the planner gap that still prevented single-table `SELECT`
+from using the PRIMARY KEY B+Tree. The executor already supported `IndexLookup`
+and `IndexRange`; the missing piece was planner eligibility plus a forced path
+for PK equality.
+
+Measured with:
+
+```bash
+python3 benches/comparison/local_bench.py --scenario select_pk --rows 5000 --table
+```
+
+| Operation | MariaDB 12.1 | MySQL 8.0 | AxiomDB |
+|---|---|---|---|
+| `SELECT * FROM bench_users WHERE id = literal` | 12.7K lookups/s | 13.4K lookups/s | **11.1K lookups/s** |
+
+This closes the old "full scan on PK lookup" debt. The remaining gap is no
+longer planner-side; it is now in SQL/wire overhead after the PK B+Tree path is
+already active.
+
 ---
 
 ## Row Codec
@@ -252,9 +273,123 @@ flushing before the next statement savepoint whenever the batch cannot continue.
 This is deliberately **not** the same as autocommit group commit. The benchmark
 already uses one explicit transaction, so `5.21` attacks per-statement heap/WAL/index
 work rather than fsync batching across multiple commits.
-  At ~10–20 ms/fsync on NVMe this caps single-connection autocommit INSERT at ~50–100 q/s,
-  consistent with the observed 58 q/s. The Phase 8 batch API will coalesce multiple inserts
-  into one WAL append + one fsync, targeting the 180K ops/s budget.
+
+---
+
+## Phase 6.19 — WAL fsync pipeline (not closed yet)
+
+Measured with:
+
+```bash
+python3 benches/comparison/local_bench.py --scenario insert_autocommit --rows 1000 --table --engines axiomdb
+```
+
+Workload: **one INSERT per transaction over the MySQL wire**.
+
+| Benchmark | AxiomDB | Target | Status |
+|---|---|---|---|
+| `insert_autocommit` | **224 ops/s** | `>= 5,000 ops/s` | ❌ |
+
+What changed in `6.19`:
+
+- the old timer-based `CommitCoordinator` and its config knobs were removed
+- server DML commits now hand deferred durability to an always-on
+  leader-based `FsyncPipeline`
+- queued followers can piggyback on a leader fsync when their `commit_lsn`
+  is already covered
+
+What the benchmark taught us:
+
+- the implementation is correct and wire-visible semantics remain intact
+- but the target workload is **sequential request/response autocommit**
+- the handler still waits for durability before it sends `OK`
+- therefore the next statement cannot arrive while the current fsync is in
+  flight, so single-connection piggyback never materializes
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Borrowed Technique, Different Constraint</span>
+AxiomDB borrowed MariaDB's leader/follower fsync idea, but MariaDB's win depends on overlapping arrivals. The local benchmark uses a strictly sequential MySQL client, so the server never has the next autocommit statement in hand while the current fsync is still running.
+</div>
+</div>
+
+---
+
+## Phase 6.18 — Indexed multi-row INSERT batch path
+
+Measured with:
+
+```bash
+python3 benches/comparison/local_bench.py --scenario insert_multi_values --rows 5000 --table
+```
+
+Workload: **multi-row `INSERT ... VALUES (...), (... )` statements against the
+benchmark schema with `PRIMARY KEY (id)`**.
+
+| Operation | MariaDB 12.1 | MySQL 8.0 | AxiomDB |
+|---|---|---|---|
+| `insert_multi_values` on PK table | 160,581 rows/s | 259,854 rows/s | **321,002 rows/s** |
+
+What changed in `6.18`:
+
+- the immediate multi-row `VALUES` path no longer checks `secondary_indexes.is_empty()`
+  before using grouped heap writes
+- grouped heap/index apply was extracted into shared helpers reused by both:
+  - the transactional staging flush from `5.21`
+  - the immediate `INSERT ... VALUES (...), (... )` path
+- the immediate path keeps strict UNIQUE semantics by **not** reusing the staged
+  `committed_empty` shortcut, because same-statement duplicate keys must still
+  fail without leaking partial rows
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">2× Faster Than MariaDB</span>
+On the PK-only `insert_multi_values` benchmark, AxiomDB reaches <strong>321,002 rows/s</strong> vs MariaDB 12.1 at <strong>160,581 rows/s</strong>. The gain comes from one grouped heap/index apply per VALUES statement instead of falling back to one heap/index maintenance cycle per row.
+</div>
+</div>
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Share Apply, Keep UNIQUE Strict</span>
+PostgreSQL's <code>heap_multi_insert()</code> and DuckDB's appender both separate row staging from physical write. AxiomDB borrows the grouped physical apply idea, but rejects a blind bulk-load shortcut on the immediate path: duplicate keys inside one SQL statement must still be rejected before any partial batch becomes visible.
+</div>
+</div>
+
+---
+
+## Phase 6.17 — Indexed UPDATE candidate fast path
+
+Measured with `python3 benches/comparison/local_bench.py --scenario update_range --rows 5000 --table`
+against a release AxiomDB server and local MariaDB/MySQL instances on the same
+machine. Workload: `UPDATE bench_users SET score = score + 1 WHERE id BETWEEN ...`
+on a PK-indexed table.
+
+| Benchmark | MariaDB 12.1 | MySQL 8.0 | AxiomDB | Notes |
+|---|---|---|---|---|
+| `update_range` | 618K rows/s | 291K rows/s | **85.2K rows/s** | indexed candidate discovery now uses PK/index B+Tree access |
+
+What changed in `6.17`:
+
+- `plan_update_candidates(...)` / `_ctx(...)` now choose `IndexLookup` or
+  `IndexRange` for UPDATE candidate discovery
+- PRIMARY KEY, UNIQUE, secondary, and eligible partial indexes are allowed
+- candidate `RecordId`s are materialized before any mutation
+- the full original `WHERE` is rechecked on fetched rows
+- physical heap/index rewrite still reuses the `5.20` stable-RID / fallback path
+
+This closes the old planner-side O(n) discovery debt for indexed UPDATE. The
+remaining gap is now clearly in the apply path after rows are found.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Discovery Before Rewrite</span>
+PostgreSQL's <code>nodeModifyTable.c</code> and SQLite's <code>update.c</code> both split row discovery from physical mutation. AxiomDB now does the same for indexed UPDATE: `6.17` speeds up candidate discovery without changing the `5.20` rewrite semantics, which keeps rollback and index-correctness invariants local to the existing write path.
+</div>
+</div>
 
 ---
 

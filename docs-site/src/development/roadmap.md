@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 6.15 Index corruption detection — startup verifier compares each catalog index against heap-visible rows, rebuilds readable divergence, and fails open on unreadable trees before traffic starts
+**Last completed subphase:** 6.18 Indexed multi-row INSERT batch path — immediate multi-row VALUES statements now reuse grouped heap/index apply on indexed tables
 
-**Active development:** Phase 7 MVCC + concurrency design
+**Active development:** 6.19 WAL fsync pipeline tuning and closure
 
-**Next milestone:** Phase 7 — full MVCC + concurrent writers (removes global mutex)
+**Next milestone:** 6.19 — make `insert_autocommit` meet target throughput without weakening durability
 
 ---
 
@@ -75,6 +75,10 @@ functionality. The design is organized in three blocks:
 | 6.8 | Fill factor | ✅ | WITH (fillfactor=N) on CREATE INDEX; B-Tree leaf split at ⌈FF×ORDER_LEAF/100⌉ |
 | 6.9 | FK + Index improvements | ✅ | PK B-Tree population; FK composite key index; composite index planner |
 | 6.10–6.12 | Index statistics + ANALYZE | ✅ | Per-column NDV/row_count; planner cost gate (sel > 20% → Scan); ANALYZE command; staleness tracking |
+| 6.16 | PK SELECT planner parity | ✅ | PRIMARY KEY equality/range now participate in single-table SELECT planning; PK equality bypasses the scan-biased cost gate |
+| 6.17 | Indexed UPDATE candidate path | ✅ | UPDATE now discovers PK / indexed candidates through B-Tree access before entering the 5.20 write path |
+| 6.18 | Indexed multi-row INSERT batch path | ✅ | Immediate multi-row VALUES statements now reuse grouped heap/index apply on indexed tables while preserving strict same-statement UNIQUE semantics |
+| 6.19 | WAL fsync pipeline | 🔄 | Server commits now use an always-on leader-based fsync pipeline and the old timer-based `CommitCoordinator` path is gone, but the single-connection `insert_autocommit` benchmark still misses target throughput |
 | 5 | Executor (advanced) | ⚠️ Planned | JOIN, GROUP BY, ORDER BY, index lookup, aggregate |
 | 6.8+ | Index statistics, FK improvements | ⚠️ Planned | Fill factor, composite FKs, ON UPDATE CASCADE, ANALYZE, index-only scans |
 | 7 | Full MVCC | ⚠️ Planned | SSI, write-write conflicts, epoch reclamation |
@@ -214,6 +218,18 @@ Phase 6 now closes with startup index integrity verification:
 - unreadable index trees fail open with `IndexIntegrityFailure`
 
 SQL `REINDEX` remains deferred to the later diagnostics / administration phases.
+
+### Phase 6 closing note — Indexed multi-row INSERT on indexed tables
+
+Phase 6 also closes the remaining immediate multi-row VALUES debt on indexed
+tables:
+
+- shared batch-apply helpers are now reused by both `5.21` staging flushes and
+  the immediate `INSERT ... VALUES (...), (... )` path
+- PRIMARY KEY and secondary indexes no longer force a per-row fallback for
+  multi-row VALUES statements
+- same-statement UNIQUE detection remains strict because the immediate path does
+  not reuse the staged `committed_empty` shortcut
 3. **Index range scan** — range predicate via `RangeIter`.
 4. **Projection** — evaluate SELECT expressions over rows from the scan.
 5. **Filter** — apply WHERE expression using the evaluator from Phase 4.17.

@@ -57,24 +57,6 @@ pub struct DbConfig {
     #[serde(default = "default_max_prepared_stmts")]
     pub max_prepared_stmts_per_connection: usize,
 
-    /// WAL Group Commit interval in milliseconds.
-    ///
-    /// When > 0, DML commits are batched: instead of one `fsync` per transaction,
-    /// up to `group_commit_max_batch` concurrent transactions share a single `fsync`,
-    /// improving throughput under concurrent write load.
-    ///
-    /// `0` (default) disables group commit — every DML commit fsyncs immediately,
-    /// identical to pre-3.19 behavior. Recommended value for production: `1`.
-    #[serde(default)]
-    pub group_commit_interval_ms: u64,
-
-    /// Maximum number of transactions in a single group commit batch.
-    ///
-    /// When `group_commit_interval_ms > 0` and this many transactions are waiting
-    /// for fsync confirmation, a flush+fsync is triggered immediately without
-    /// waiting for the timer. Default: `64`.
-    #[serde(default = "default_group_commit_max_batch")]
-    pub group_commit_max_batch: usize,
 }
 
 fn default_max_wal_size_mb() -> u64 {
@@ -89,10 +71,6 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-fn default_group_commit_max_batch() -> usize {
-    64
-}
-
 fn default_max_prepared_stmts() -> usize {
     1024
 }
@@ -104,8 +82,6 @@ impl Default for DbConfig {
             max_wal_size_mb: default_max_wal_size_mb(),
             fsync: default_fsync(),
             log_level: default_log_level(),
-            group_commit_interval_ms: 0,
-            group_commit_max_batch: default_group_commit_max_batch(),
             max_prepared_stmts_per_connection: default_max_prepared_stmts(),
         }
     }
@@ -152,6 +128,7 @@ mod tests {
         assert!(cfg.fsync);
         assert_eq!(cfg.log_level, "info");
         assert!(cfg.data_dir.is_none());
+        assert_eq!(cfg.max_prepared_stmts_per_connection, 1024);
     }
 
     #[test]
@@ -159,6 +136,7 @@ mod tests {
         let cfg = DbConfig::load(None).unwrap();
         assert_eq!(cfg.max_wal_size_mb, 256);
         assert!(cfg.fsync);
+        assert_eq!(cfg.max_prepared_stmts_per_connection, 1024);
     }
 
     #[test]

@@ -4,18 +4,20 @@
 //! `Arc<tokio::sync::Mutex<Database>>` so connection handlers can lock it
 //! to execute queries (single-writer constraint, Phase 4).
 //!
-//! ## Group Commit (Phase 3.19)
+//! ## Fsync Pipeline (Phase 6.19)
 //!
-//! When `CommitCoordinator` is attached via `set_coordinator()`:
-//! - `execute_query` / `execute_stmt` use `TxnManager::commit()` in deferred
-//!   mode: DML commits write the Commit WAL entry to the `BufWriter` but do
-//!   not fsync. The txn_id is registered with the coordinator.
-//! - The caller receives `(QueryResult, Some(CommitRx))` and must **release
-//!   the Database lock** before awaiting the receiver.
-//! - A background task (see `group_commit.rs`) batches the fsync and notifies
-//!   all waiting connections.
-//! - Read-only transactions and disabled mode return `(result, None)` and
-//!   behave identically to pre-3.19 behavior.
+//! DML commits use a leader-based fsync pipeline (inspired by MariaDB's
+//! `group_commit_lock`). Instead of one `sync_all()` per transaction:
+//!
+//! 1. The executor writes the Commit WAL entry to the BufWriter (no fsync).
+//! 2. `take_commit_rx()` calls `pipeline.acquire(commit_lsn, txn_id)`:
+//!    - **Expired**: another leader already fsynced past this LSN → immediate return.
+//!    - **Acquired**: this connection becomes leader → flush+fsync+advance, return.
+//!    - **Queued**: another leader is active → return receiver; handler awaits it
+//!      after releasing the Database lock.
+//!
+//! This amortises fsyncs across pipelined commits (even single-connection) and
+//! supersedes the timer-based group commit from Phase 3.19.
 //!
 //! ## Prepared Statement Plan Cache (Phase 5.13)
 //!
@@ -30,8 +32,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::{oneshot, Mutex};
-
 use axiomdb_catalog::bootstrap::CatalogBootstrap;
 use axiomdb_core::error::DbError;
 use axiomdb_sql::{
@@ -45,18 +45,16 @@ use axiomdb_sql::{
 };
 use axiomdb_storage::MmapStorage;
 use axiomdb_types::{DataType, Value};
-use axiomdb_wal::TxnManager;
+use axiomdb_wal::{AcquireResult, FsyncPipeline, TxnManager};
 
-use super::commit_coordinator::CommitCoordinator;
 use super::error::dberror_to_mysql_warning;
-use super::group_commit::spawn_group_commit_task;
 use super::status::StatusRegistry;
 
-/// Receiver for group commit fsync confirmation.
+/// Receiver for fsync pipeline confirmation.
 ///
 /// Resolves to `Ok(())` when the fsync covering the DML commit completes,
 /// or `Err(WalGroupCommitFailed)` / `Err(DiskFull)` if the fsync fails.
-pub type CommitRx = oneshot::Receiver<Result<(), DbError>>;
+pub type CommitRx = axiomdb_wal::CommitRx;
 
 // ── RuntimeMode ───────────────────────────────────────────────────────────────
 
@@ -75,10 +73,9 @@ pub struct Database {
     pub txn: TxnManager,
     /// Bloom filter registry for secondary index lookups.
     pub bloom: BloomRegistry,
-    /// Group commit coordinator. `None` when group commit is disabled
-    /// (`group_commit_interval_ms = 0`), in which case every DML commit
-    /// fsyncs inline as in pre-3.19 behavior.
-    pub coordinator: Option<CommitCoordinator>,
+    /// Leader-based fsync pipeline (Phase 6.19). Always active — replaces the
+    /// timer-based group commit from Phase 3.19.
+    pub pipeline: FsyncPipeline,
     /// Global schema version. Incremented after every successful DDL
     /// (CREATE/DROP/ALTER TABLE, CREATE/DROP INDEX, TRUNCATE).
     ///
@@ -94,8 +91,7 @@ pub struct Database {
     /// Shared runtime mode (`RUNTIME_MODE_READ_WRITE` / `RUNTIME_MODE_DEGRADED`).
     ///
     /// Connections clone this `Arc` at connect time and poll it without
-    /// holding the `Database` lock. The group-commit background task also
-    /// holds a clone so it can flip the mode on a disk-full fsync failure.
+    /// holding the `Database` lock.
     pub runtime_mode: Arc<AtomicU8>,
 }
 
@@ -109,7 +105,7 @@ impl Database {
         let db_path = data_dir.join("axiomdb.db");
         let wal_path = data_dir.join("axiomdb.wal");
 
-        let (storage, txn) = if db_path.exists() {
+        let (storage, mut txn) = if db_path.exists() {
             let mut storage = MmapStorage::open(&db_path)?;
             let (mut txn, _recovery) = TxnManager::open_with_recovery(&mut storage, &wal_path)?;
             verify_and_repair_indexes_on_open(&mut storage, &mut txn)?;
@@ -121,41 +117,25 @@ impl Database {
             (storage, txn)
         };
 
+        // Enable pipeline commit mode so `TxnManager::commit()` writes the
+        // Commit WAL entry to the BufWriter without inline fsync. The fsync
+        // pipeline handles durability via leader-based coalescing.
+        txn.set_deferred_commit_mode(true);
+        let pipeline = FsyncPipeline::new(txn.wal_current_lsn());
+
         Ok(Self {
             storage,
             txn,
             bloom: BloomRegistry::new(),
-            coordinator: None,
+            pipeline,
             schema_version: Arc::new(AtomicU64::new(0)),
             status: Arc::new(StatusRegistry::new()),
             runtime_mode: Arc::new(AtomicU8::new(RUNTIME_MODE_READ_WRITE)),
         })
     }
 
-    /// Attaches a `CommitCoordinator` and enables deferred commit mode.
-    ///
-    /// Spawns the group commit background task using `db` (the `Arc` wrapping
-    /// this `Database`). Must be called once after `open()` when
-    /// `group_commit_interval_ms > 0`.
-    ///
-    /// Returns the `JoinHandle` of the background task. The caller is
-    /// responsible for aborting it on shutdown (or it exits on its own when
-    /// the `Arc<Mutex<Database>>` is dropped).
-    pub fn enable_group_commit(
-        db: Arc<Mutex<Database>>,
-        interval_ms: u64,
-        max_batch: usize,
-    ) -> tokio::task::JoinHandle<()> {
-        let coordinator = CommitCoordinator::new(max_batch);
-        {
-            // Brief synchronous lock to set coordinator + enable deferred mode.
-            // Safe: called at startup before any connections are accepted.
-            let mut guard = db.blocking_lock();
-            guard.txn.set_deferred_commit_mode(true);
-            guard.coordinator = Some(coordinator);
-        }
-        spawn_group_commit_task(db, interval_ms)
-    }
+    // NOTE: `enable_group_commit()` removed in Phase 6.19.
+    // The fsync pipeline is always active — initialized in `open()`.
 
     /// Executes a SQL string through the full pipeline:
     /// `parse → analyze_cached → execute_with_ctx`.
@@ -165,7 +145,7 @@ impl Database {
     /// Increments `schema_version` after any successful DDL statement so that
     /// connections can detect stale prepared statement plans (Phase 5.13).
     ///
-    /// When group commit is enabled and the statement was DML, `CommitRx`
+    /// For DML statements that queue behind an active fsync leader, `CommitRx`
     /// is `Some`. The caller **must release the Database lock** before
     /// awaiting the receiver to avoid blocking all other connections for
     /// the duration of the fsync.
@@ -373,7 +353,6 @@ impl Database {
 
     /// Releases deferred-free pages for the given committed transaction IDs.
     ///
-    /// Called by the group-commit background task after WAL fsync succeeds.
     /// Wraps `TxnManager::release_committed_frees` to avoid split-borrow issues
     /// when both `txn` and `storage` are fields of the same `Database`.
     pub fn release_deferred_frees(
@@ -404,13 +383,95 @@ impl Database {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    /// Checks if the last `commit()` left a pending deferred txn (group commit
-    /// mode + DML), and if so, registers it with the coordinator and returns
-    /// the confirmation receiver. Returns `None` in all other cases.
+    /// Drives the fsync pipeline for the last deferred DML commit.
+    ///
+    /// If the last `commit()` left a pending deferred txn_id, calls
+    /// `pipeline.acquire(commit_lsn, txn_id)`:
+    ///
+    /// - **Expired**: another leader already fsynced past this LSN.
+    ///   Advance `max_committed` and release deferred frees. Return `None`.
+    /// - **Acquired**: this connection is the leader. Perform flush+fsync,
+    ///   advance `max_committed` for this txn + all woken followers,
+    ///   release deferred frees. Return `None`.
+    /// - **Queued**: another leader is running. Return `Some(rx)` — the
+    ///   handler must release the Database lock before awaiting it.
+    ///
+    /// Returns `None` for read-only commits (no pending deferred txn).
     fn take_commit_rx(&mut self) -> Option<CommitRx> {
         let txn_id = self.txn.take_pending_deferred_commit()?;
-        let coordinator = self.coordinator.as_ref()?;
-        Some(coordinator.register_pending(txn_id))
+        let commit_lsn = self.txn.wal_current_lsn();
+
+        match self.pipeline.acquire(commit_lsn, txn_id) {
+            AcquireResult::Expired => {
+                // Another leader already fsynced past our LSN.
+                self.txn.advance_committed_single(txn_id);
+                let _ = self
+                    .txn
+                    .release_committed_frees(&mut self.storage, &[txn_id]);
+                None
+            }
+            AcquireResult::Acquired => {
+                // We are the leader — flush + fsync.
+                let fsync_result = self.txn.wal_flush_and_fsync();
+                match fsync_result {
+                    Ok(()) => {
+                        let flushed_lsn = self.txn.wal_current_lsn();
+                        // Advance our own txn.
+                        self.txn.advance_committed_single(txn_id);
+                        let _ = self
+                            .txn
+                            .release_committed_frees(&mut self.storage, &[txn_id]);
+                        // Wake followers and advance their txns.
+                        let woken_ids = self.pipeline.release_ok(flushed_lsn);
+                        if !woken_ids.is_empty() {
+                            self.txn.advance_committed(&woken_ids);
+                            let _ = self
+                                .txn
+                                .release_committed_frees(&mut self.storage, &woken_ids);
+                        }
+                        None
+                    }
+                    Err(ref e) => {
+                        let is_disk_full = matches!(e, DbError::DiskFull { .. });
+                        if is_disk_full {
+                            self.enter_degraded_mode();
+                        }
+                        let msg = e.to_string();
+                        self.pipeline.release_err(&msg, is_disk_full);
+                        // Return the error as a failed commit for this connection.
+                        // We create a oneshot and send the error immediately.
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        let err = if is_disk_full {
+                            DbError::DiskFull {
+                                operation: "wal pipeline fsync",
+                            }
+                        } else {
+                            DbError::WalGroupCommitFailed { message: msg }
+                        };
+                        let _ = tx.send(Err(err));
+                        Some(rx)
+                    }
+                }
+            }
+            AcquireResult::Queued(rx) => {
+                // Another leader is running — we must await the fsync.
+                // NOTE: max_committed for this txn will be advanced by the
+                // leader via release_ok → advance_committed on the woken_ids.
+                // However, the leader only knows about woken_ids from the
+                // pipeline, not from TxnManager. We need the leader to
+                // advance max_committed for queued followers.
+                //
+                // Problem: the leader calls self.txn.advance_committed(&woken_ids)
+                // but those woken_ids come from the pipeline's Waiter.txn_id.
+                // This works because we stored txn_id in the pipeline.
+                //
+                // Deferred frees: the handler will call release_deferred_frees
+                // after receiving Ok from the pipeline. But the handler doesn't
+                // have access to Database... Actually, the leader already calls
+                // release_committed_frees for the woken_ids. So we're covered.
+                Some(rx)
+            }
+        }
     }
 }
 

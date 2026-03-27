@@ -157,6 +157,33 @@ fn test_planner_index_lookup_no_match() {
 }
 
 #[test]
+fn test_primary_key_lookup_without_secondary_index() {
+    let (mut storage, mut txn) = setup();
+
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    run("BEGIN", &mut storage, &mut txn);
+    let result = rows(run(
+        "SELECT id, name FROM users WHERE id = 2",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(result, vec![vec![Value::Int(2), Value::Text("bob".into())]]);
+    run("COMMIT", &mut storage, &mut txn);
+}
+
+#[test]
 fn test_index_maintained_on_insert() {
     let (mut storage, mut txn) = setup();
 
@@ -196,6 +223,78 @@ fn test_index_maintained_on_insert() {
     ));
     assert_eq!(result.len(), 1);
     assert_eq!(result[0][0], Value::Int(100));
+    run("COMMIT", &mut storage, &mut txn);
+}
+
+#[test]
+fn test_multi_row_insert_with_primary_key_only_table() {
+    let (mut storage, mut txn) = setup();
+
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    run("BEGIN", &mut storage, &mut txn);
+    let result = rows(run(
+        "SELECT id, name FROM users ORDER BY id",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(
+        result,
+        vec![
+            vec![Value::Int(1), Value::Text("alice".into())],
+            vec![Value::Int(2), Value::Text("bob".into())],
+            vec![Value::Int(3), Value::Text("carol".into())],
+        ]
+    );
+    run("COMMIT", &mut storage, &mut txn);
+}
+
+#[test]
+fn test_multi_row_insert_unique_secondary_duplicate_in_same_statement_errors() {
+    let (mut storage, mut txn) = setup();
+
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "CREATE TABLE users (id INT PRIMARY KEY, email TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE UNIQUE INDEX users_email_idx ON users (email)",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    run("BEGIN", &mut storage, &mut txn);
+    let err = run_result(
+        "INSERT INTO users VALUES (1, 'alice@x.com'), (2, 'alice@x.com')",
+        &mut storage,
+        &mut txn,
+    );
+    assert!(
+        matches!(err, Err(DbError::UniqueViolation { .. })),
+        "expected UniqueViolation, got: {err:?}"
+    );
+    run("ROLLBACK", &mut storage, &mut txn);
+
+    run("BEGIN", &mut storage, &mut txn);
+    let result = rows(run("SELECT id FROM users", &mut storage, &mut txn));
+    assert!(
+        result.is_empty(),
+        "failing multi-row INSERT must not leak rows"
+    );
     run("COMMIT", &mut storage, &mut txn);
 }
 
@@ -286,6 +385,97 @@ fn test_index_maintained_on_update() {
     ));
     assert_eq!(result.len(), 1);
     assert_eq!(result[0][0], Value::Text("old".into()));
+    run("COMMIT", &mut storage, &mut txn);
+}
+
+#[test]
+fn test_update_primary_key_range_path_updates_only_matching_rows() {
+    let (mut storage, mut txn) = setup();
+
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "CREATE TABLE scores (id INT PRIMARY KEY, score INT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO scores VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "UPDATE scores SET score = score + 5 WHERE id >= 3 AND id < 6",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    run("BEGIN", &mut storage, &mut txn);
+    let result = rows(run(
+        "SELECT id, score FROM scores ORDER BY id",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(
+        result,
+        vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)],
+            vec![Value::Int(3), Value::Int(35)],
+            vec![Value::Int(4), Value::Int(45)],
+            vec![Value::Int(5), Value::Int(55)],
+            vec![Value::Int(6), Value::Int(60)],
+        ]
+    );
+    run("COMMIT", &mut storage, &mut txn);
+}
+
+#[test]
+fn test_update_secondary_index_candidate_path_updates_matching_rows() {
+    let (mut storage, mut txn) = setup();
+
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "CREATE TABLE users (id INT PRIMARY KEY, email TEXT, score INT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE UNIQUE INDEX users_email_idx ON users (email)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO users VALUES (1, 'alice@x.com', 10), (2, 'bob@x.com', 20)",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    run("BEGIN", &mut storage, &mut txn);
+    run(
+        "UPDATE users SET score = score + 7 WHERE email = 'alice@x.com'",
+        &mut storage,
+        &mut txn,
+    );
+    run("COMMIT", &mut storage, &mut txn);
+
+    run("BEGIN", &mut storage, &mut txn);
+    let result = rows(run(
+        "SELECT id, score FROM users ORDER BY id",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(
+        result,
+        vec![
+            vec![Value::Int(1), Value::Int(17)],
+            vec![Value::Int(2), Value::Int(20)],
+        ]
+    );
     run("COMMIT", &mut storage, &mut txn);
 }
 
