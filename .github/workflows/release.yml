@@ -9,27 +9,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Build server binary for each platform ─────────────────────────────────
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux — static musl (runs on any Linux, Docker FROM scratch)
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
-            artifact: axiomdb-server-linux-x86_64
-            use_zigbuild: true
-
-          # macOS builds disabled — re-enable when approaching stable release
-          # - target: aarch64-apple-darwin
-          #   runner: macos-latest
-          #   artifact: axiomdb-server-macos-aarch64
-          # - target: x86_64-apple-darwin
-          #   runner: macos-latest
-          #   artifact: axiomdb-server-macos-x86_64
+  # ── Build Linux server binary only ────────────────────────────────────────
+  build-linux:
+    name: Build Linux x86_64 musl
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -37,10 +20,9 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-musl
 
-      - name: Install cargo-zigbuild (Linux musl)
-        if: matrix.use_zigbuild
+      - name: Install cargo-zigbuild
         run: |
           pip3 install ziglang
           cargo install cargo-zigbuild
@@ -52,78 +34,28 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-x86_64-unknown-linux-musl-release-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build (zigbuild — musl)
-        if: matrix.use_zigbuild
-        run: cargo zigbuild -p axiomdb-server --target ${{ matrix.target }} --release
+      - name: Build Linux release
+        run: cargo zigbuild -p axiomdb-server --target x86_64-unknown-linux-musl --release
 
-      - name: Build (native)
-        if: "!matrix.use_zigbuild"
-        run: cargo build -p axiomdb-server --target ${{ matrix.target }} --release
-
-      - name: Strip binary (Linux/macOS)
-        run: strip target/${{ matrix.target }}/release/axiomdb-server || true
+      - name: Strip binary
+        run: strip target/x86_64-unknown-linux-musl/release/axiomdb-server || true
 
       - name: Rename binary
-        run: cp target/${{ matrix.target }}/release/axiomdb-server ${{ matrix.artifact }}
+        run: cp target/x86_64-unknown-linux-musl/release/axiomdb-server axiomdb-server-linux-x86_64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
-
-  # ── Build embedded library ─────────────────────────────────────────────────
-  build-embedded:
-    name: Build embedded (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            artifact: libaxiomdb_embedded-linux-x86_64
-            lib: target/release/libaxiomdb_embedded.a
-          # macOS disabled — re-enable when approaching stable release
-          # - os: macos-latest
-          #   artifact: libaxiomdb_embedded-macos
-          #   lib: target/release/libaxiomdb_embedded.a
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-embedded-release-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build embedded (static)
-        run: cargo build -p axiomdb-embedded --release
-        continue-on-error: true   # embedded crate may not exist yet in early phases
-
-      - name: Rename artifact
-        run: cp ${{ matrix.lib }} ${{ matrix.artifact }}.a 2>/dev/null || true
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.a
-          if-no-files-found: ignore
+          name: axiomdb-server-linux-x86_64
+          path: axiomdb-server-linux-x86_64
 
   # ── Create GitHub Release ──────────────────────────────────────────────────
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [build, build-embedded]
+    needs: [build-linux]
     permissions:
       contents: write
 
@@ -154,8 +86,6 @@ jobs:
           | Platform | File | Notes |
           |---|---|---|
           | Linux x86-64 | \`axiomdb-server-linux-x86_64\` | Static musl — runs on any Linux, Docker FROM scratch |
-          | macOS Apple Silicon | \`axiomdb-server-macos-aarch64\` | macOS 12+ arm64 |
-          | macOS Intel | \`axiomdb-server-macos-x86_64\` | macOS 12+ x86_64 |
 
           ### Quick start
 

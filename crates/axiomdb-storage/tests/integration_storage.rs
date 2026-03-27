@@ -340,9 +340,8 @@ fn test_verified_open_detects_data_page_corruption() {
             .write(true)
             .open(&db_path)
             .expect("open for corruption");
-        let offset = page_id as u64 * axiomdb_storage::PAGE_SIZE as u64
-            + axiomdb_storage::HEADER_SIZE as u64
-            + 42;
+        let offset =
+            page_id * axiomdb_storage::PAGE_SIZE as u64 + axiomdb_storage::HEADER_SIZE as u64 + 42;
         file.seek(SeekFrom::Start(offset)).expect("seek");
         file.write_all(&[0xFFu8]).expect("corrupt byte");
     }
@@ -407,9 +406,8 @@ fn test_verified_open_multiple_pages_any_corruption_detected() {
             .write(true)
             .open(&db_path)
             .expect("open");
-        let offset = last_id as u64 * axiomdb_storage::PAGE_SIZE as u64
-            + axiomdb_storage::HEADER_SIZE as u64
-            + 1;
+        let offset =
+            last_id * axiomdb_storage::PAGE_SIZE as u64 + axiomdb_storage::HEADER_SIZE as u64 + 1;
         file.seek(SeekFrom::Start(offset)).expect("seek");
         file.write_all(&[0x00u8]).expect("corrupt");
     }
@@ -444,9 +442,8 @@ fn test_corrupted_page_detected_on_read() {
             .write(true)
             .open(&db_path)
             .expect("open file");
-        let offset = page_id as u64 * axiomdb_storage::PAGE_SIZE as u64
-            + axiomdb_storage::HEADER_SIZE as u64
-            + 100;
+        let offset =
+            page_id * axiomdb_storage::PAGE_SIZE as u64 + axiomdb_storage::HEADER_SIZE as u64 + 100;
         file.seek(SeekFrom::Start(offset)).expect("seek");
         file.write_all(&[0xFFu8]).expect("write corruption");
     }

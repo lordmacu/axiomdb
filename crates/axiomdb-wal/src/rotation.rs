@@ -61,7 +61,7 @@ impl WalRotator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axiomdb_storage::{MemoryStorage, MmapStorage, PageType};
+    use axiomdb_storage::{MemoryStorage, MmapStorage};
 
     use crate::{reader::WalReader, EntryType, TxnManager, WalWriter};
 

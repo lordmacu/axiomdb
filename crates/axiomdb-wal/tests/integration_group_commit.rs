@@ -176,7 +176,7 @@ fn test_advance_committed_advances_max() {
         "advance_committed must increase max_committed"
     );
     assert!(
-        snap_after.snapshot_id >= max_id + 1,
+        snap_after.snapshot_id > max_id,
         "snapshot_id must be at least max_txn_id + 1"
     );
 }

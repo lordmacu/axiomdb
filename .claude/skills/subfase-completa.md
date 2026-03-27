@@ -18,17 +18,36 @@ Example: `/subfase-completa 1.3` marks subphase 1.3 as completed.
 ```bash
 cd /Users/cristian/nexusdb
 
-# Tests for the affected crate
+# Incremental tests for the touched crate
 cargo test -p axiomdb-CRATE --quiet 2>&1 | tail -5
 
-# Clippy with no warnings
+# Add directly affected dependent crates when the change is cross-crate or
+# touches a public API, on-disk format, WAL/recovery, SQL semantics, or wire-visible behavior
+cargo test -p axiomdb-RELATED --quiet 2>&1 | tail -5
+
+# Incremental clippy on the same scope
 cargo clippy -p axiomdb-CRATE -- -D warnings 2>&1 | head -10
 
 # Correct format
 cargo fmt --check 2>&1 | head -5
+
+# If SQL / protocol behavior changed, run the wire smoke test too
+python3 tools/wire-test.py
+
+# Final closing gate for the subphase
+cargo test --workspace
+cargo clippy --workspace -- -D warnings
 ```
 
 If any fails: **DO NOT mark as completed.** Fix it first.
+
+Selection rule:
+
+- Start with the crate you touched
+- Add reverse dependencies if you changed a public API or shared type
+- Add storage/index/catalog/sql/network dependents for on-disk or WAL changes
+- Add `axiomdb-network`, `axiomdb-embedded`, and `tools/wire-test.py` for user-visible SQL or protocol changes
+- Use the full workspace sweep only at the end of the subphase, not after every edit
 
 ### Step 2 — Mark in docs/progreso.md
 

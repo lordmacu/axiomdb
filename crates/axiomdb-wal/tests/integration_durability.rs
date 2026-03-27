@@ -16,13 +16,13 @@
 //! without circular dependencies.
 
 use std::fs::OpenOptions;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use axiomdb_core::error::DbError;
 use axiomdb_storage::{
     heap::insert_tuple, read_tuple, IntegrityChecker, MmapStorage, Page, PageType, StorageEngine,
 };
-use axiomdb_wal::{CrashRecovery, RecoveryResult, TxnManager};
+use axiomdb_wal::{RecoveryResult, TxnManager};
 use tempfile::TempDir;
 
 // ── TestEnv ───────────────────────────────────────────────────────────────────
@@ -225,7 +225,6 @@ fn test_truncated_wal_recovery_safe() {
     let wal_size = std::fs::metadata(&env.wal).unwrap().len();
     let truncate_at = (wal_size * 3) / 4;
     {
-        use std::io::Write;
         let file = OpenOptions::new().write(true).open(&env.wal).unwrap();
         file.set_len(truncate_at).unwrap();
     }

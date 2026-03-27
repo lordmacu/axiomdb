@@ -2,18 +2,22 @@
 
 Run this COMPLETE protocol when finishing each phase. No exceptions.
 
+Important: the commands below are the final gate. Do not run the full workspace
+suite after every edit during implementation; use targeted crate tests first and
+reserve the full sweep for this close step.
+
 ## Step 1 — Verify code quality
 
 ```bash
-# Tests
+# Final tests
 cargo test --workspace
 # If it fails: DO NOT continue until they pass
 
-# Linting
+# Final linting
 cargo clippy --workspace -- -D warnings
 # If there are warnings: DO NOT continue until resolved
 
-# Format
+# Final format check
 cargo fmt --check
 # If there are differences: run cargo fmt and add to the commit
 

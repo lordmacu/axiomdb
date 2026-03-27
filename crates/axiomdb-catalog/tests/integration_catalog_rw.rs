@@ -52,7 +52,7 @@ fn test_create_and_get_table() {
 
     // Post-commit snapshot sees the table.
     let snap = committed_snap(&txn);
-    let mut reader = CatalogReader::new(&mut storage, snap).unwrap();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
     let found = reader.get_table("public", "users").unwrap();
     assert!(found.is_some());
     let def = found.unwrap();
@@ -77,7 +77,7 @@ fn test_create_multiple_tables_distinct_ids() {
     assert_ne!(id1, id2, "each create_table must allocate a distinct ID");
 
     let snap = committed_snap(&txn);
-    let mut reader = CatalogReader::new(&mut storage, snap).unwrap();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
     assert!(reader.get_table("public", "orders").unwrap().is_some());
     assert!(reader.get_table("public", "products").unwrap().is_some());
 }
@@ -94,7 +94,7 @@ fn test_get_table_by_id() {
     txn.commit().unwrap();
 
     let snap = committed_snap(&txn);
-    let mut reader = CatalogReader::new(&mut storage, snap).unwrap();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
     let found = reader.get_table_by_id(table_id).unwrap();
     assert!(found.is_some());
     assert_eq!(found.unwrap().table_name, "items");
@@ -102,9 +102,9 @@ fn test_get_table_by_id() {
 
 #[test]
 fn test_get_table_not_found_returns_none() {
-    let (mut storage, txn) = setup();
+    let (storage, txn) = setup();
     let snap = committed_snap(&txn);
-    let mut reader = CatalogReader::new(&mut storage, snap).unwrap();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
     assert!(reader.get_table("public", "nonexistent").unwrap().is_none());
     assert!(reader.get_table_by_id(9999).unwrap().is_none());
 }
@@ -152,7 +152,7 @@ fn test_create_columns_list_ordered_by_col_idx() {
     txn.commit().unwrap();
 
     let snap = committed_snap(&txn);
-    let mut reader = CatalogReader::new(&mut storage, snap).unwrap();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
     let cols = reader.list_columns(table_id).unwrap();
 
     assert_eq!(cols.len(), 3);
@@ -168,9 +168,9 @@ fn test_create_columns_list_ordered_by_col_idx() {
 
 #[test]
 fn test_list_columns_empty_for_unknown_table() {
-    let (mut storage, txn) = setup();
+    let (storage, txn) = setup();
     let snap = committed_snap(&txn);
-    let mut reader = CatalogReader::new(&mut storage, snap).unwrap();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
     let cols = reader.list_columns(9999).unwrap();
     assert!(cols.is_empty());
 }
@@ -205,7 +205,7 @@ fn test_create_and_list_index() {
     txn.commit().unwrap();
 
     let snap = committed_snap(&txn);
-    let mut reader = CatalogReader::new(&mut storage, snap).unwrap();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
     let indexes = reader.list_indexes(table_id).unwrap();
     assert_eq!(indexes.len(), 1);
     assert_eq!(indexes[0].index_id, index_id);
@@ -292,7 +292,7 @@ fn test_delete_index() {
 
     // Verify index exists.
     let snap1 = committed_snap(&txn);
-    let mut reader1 = CatalogReader::new(&mut storage, snap1).unwrap();
+    let mut reader1 = CatalogReader::new(&storage, snap1).unwrap();
     assert_eq!(reader1.list_indexes(table_id).unwrap().len(), 1);
 
     // Delete the index.
@@ -305,7 +305,7 @@ fn test_delete_index() {
 
     // Post-delete snapshot sees no indexes.
     let snap2 = committed_snap(&txn);
-    let mut reader2 = CatalogReader::new(&mut storage, snap2).unwrap();
+    let mut reader2 = CatalogReader::new(&storage, snap2).unwrap();
     assert!(reader2.list_indexes(table_id).unwrap().is_empty());
 }
 
@@ -346,7 +346,7 @@ fn test_delete_table_cascades_columns_and_indexes() {
 
     // Confirm everything exists.
     let snap1 = committed_snap(&txn);
-    let mut r1 = CatalogReader::new(&mut storage, snap1).unwrap();
+    let mut r1 = CatalogReader::new(&storage, snap1).unwrap();
     assert!(r1.get_table_by_id(table_id).unwrap().is_some());
     assert_eq!(r1.list_columns(table_id).unwrap().len(), 1);
     assert_eq!(r1.list_indexes(table_id).unwrap().len(), 1);
@@ -361,7 +361,7 @@ fn test_delete_table_cascades_columns_and_indexes() {
 
     // Nothing visible after drop.
     let snap2 = committed_snap(&txn);
-    let mut r2 = CatalogReader::new(&mut storage, snap2).unwrap();
+    let mut r2 = CatalogReader::new(&storage, snap2).unwrap();
     assert!(r2.get_table_by_id(table_id).unwrap().is_none());
     assert!(r2.list_columns(table_id).unwrap().is_empty());
     assert!(r2.list_indexes(table_id).unwrap().is_empty());
@@ -402,7 +402,7 @@ fn test_snapshot_before_commit_does_not_see_new_table() {
     txn.commit().unwrap();
 
     // Old snapshot must not see it.
-    let mut reader_before = CatalogReader::new(&mut storage, snap_before).unwrap();
+    let mut reader_before = CatalogReader::new(&storage, snap_before).unwrap();
     assert!(reader_before
         .get_table("public", "invisible")
         .unwrap()
@@ -410,7 +410,7 @@ fn test_snapshot_before_commit_does_not_see_new_table() {
 
     // New snapshot sees it.
     let snap_after = committed_snap(&txn);
-    let mut reader_after = CatalogReader::new(&mut storage, snap_after).unwrap();
+    let mut reader_after = CatalogReader::new(&storage, snap_after).unwrap();
     assert!(reader_after
         .get_table("public", "invisible")
         .unwrap()
@@ -439,12 +439,12 @@ fn test_snapshot_before_delete_still_sees_row() {
     txn.commit().unwrap();
 
     // Old snapshot still sees the table.
-    let mut reader_old = CatalogReader::new(&mut storage, snap_before_delete).unwrap();
+    let mut reader_old = CatalogReader::new(&storage, snap_before_delete).unwrap();
     assert!(reader_old.get_table_by_id(table_id).unwrap().is_some());
 
     // New snapshot does not.
     let snap_after_delete = committed_snap(&txn);
-    let mut reader_new = CatalogReader::new(&mut storage, snap_after_delete).unwrap();
+    let mut reader_new = CatalogReader::new(&storage, snap_after_delete).unwrap();
     assert!(reader_new.get_table_by_id(table_id).unwrap().is_none());
 }
 
@@ -463,7 +463,7 @@ fn test_rollback_create_table_row_invisible() {
 
     // After rollback, the row must be invisible to any committed snapshot.
     let snap = committed_snap(&txn);
-    let mut reader = CatalogReader::new(&mut storage, snap).unwrap();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
     assert!(reader.get_table("public", "ghost").unwrap().is_none());
 }
 
@@ -493,7 +493,7 @@ fn test_rollback_create_does_not_consume_id_permanently() {
     assert_ne!(rolled_back_id, committed_id);
     // The committed one is visible.
     let snap = committed_snap(&txn);
-    let mut reader = CatalogReader::new(&mut storage, snap).unwrap();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
     assert!(reader.get_table("public", "real").unwrap().is_some());
 }
 
@@ -523,7 +523,7 @@ fn test_multi_page_chain_insert_and_scan() {
 
     // All rows must be visible.
     let snap = committed_snap(&txn);
-    let mut reader = CatalogReader::new(&mut storage, snap).unwrap();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
     let tables = reader.list_tables("stress").unwrap();
     assert_eq!(
         tables.len(),
@@ -583,10 +583,10 @@ fn test_sequence_persistence_across_reopen() {
 
     // Session 3: read both tables.
     {
-        let mut storage = MmapStorage::open(&db_path).unwrap();
+        let storage = MmapStorage::open(&db_path).unwrap();
         let txn = TxnManager::open(&wal_path).unwrap();
         let snap = txn.snapshot();
-        let mut reader = CatalogReader::new(&mut storage, snap).unwrap();
+        let mut reader = CatalogReader::new(&storage, snap).unwrap();
         assert!(reader
             .get_table("public", "session1_table")
             .unwrap()

@@ -124,6 +124,10 @@ impl fmt::Display for Value {
 mod tests {
     use super::*;
 
+    fn parse_real(s: &str) -> f64 {
+        s.parse().expect("valid test f64")
+    }
+
     #[test]
     fn test_display_null() {
         assert_eq!(Value::Null.to_string(), "NULL");
@@ -148,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_display_real() {
-        assert_eq!(Value::Real(3.14).to_string(), "3.14");
+        assert_eq!(Value::Real(parse_real("3.14")).to_string(), "3.14");
         assert_eq!(Value::Real(f64::INFINITY).to_string(), "inf");
     }
 

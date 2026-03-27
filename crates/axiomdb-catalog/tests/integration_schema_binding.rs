@@ -36,7 +36,7 @@ fn test_resolve_table_by_default_schema() {
     txn.commit().unwrap();
 
     let snap = txn.snapshot();
-    let mut resolver = SchemaResolver::new(&mut storage, snap, "public").unwrap();
+    let mut resolver = SchemaResolver::new(&storage, snap, "public").unwrap();
     let resolved = resolver.resolve_table(None, "users").unwrap();
 
     assert_eq!(resolved.def.id, table_id);
@@ -56,7 +56,7 @@ fn test_resolve_table_by_explicit_schema() {
     txn.commit().unwrap();
 
     let snap = txn.snapshot();
-    let mut resolver = SchemaResolver::new(&mut storage, snap, "public").unwrap();
+    let mut resolver = SchemaResolver::new(&storage, snap, "public").unwrap();
     let resolved = resolver.resolve_table(Some("analytics"), "events").unwrap();
     assert_eq!(resolved.def.table_name, "events");
     assert_eq!(resolved.def.schema_name, "analytics");
@@ -64,9 +64,9 @@ fn test_resolve_table_by_explicit_schema() {
 
 #[test]
 fn test_resolve_table_not_found_returns_table_not_found_error() {
-    let (mut storage, txn) = setup();
+    let (storage, txn) = setup();
     let snap = txn.snapshot();
-    let mut resolver = SchemaResolver::new(&mut storage, snap, "public").unwrap();
+    let mut resolver = SchemaResolver::new(&storage, snap, "public").unwrap();
 
     let err = resolver.resolve_table(None, "ghost").unwrap_err();
     assert!(
@@ -77,9 +77,9 @@ fn test_resolve_table_not_found_returns_table_not_found_error() {
 
 #[test]
 fn test_resolve_table_not_found_error_message_is_qualified() {
-    let (mut storage, txn) = setup();
+    let (storage, txn) = setup();
     let snap = txn.snapshot();
-    let mut resolver = SchemaResolver::new(&mut storage, snap, "myschema").unwrap();
+    let mut resolver = SchemaResolver::new(&storage, snap, "myschema").unwrap();
 
     let err = resolver.resolve_table(None, "t").unwrap_err();
     // Error message must contain the qualified name "myschema.t".
@@ -115,7 +115,7 @@ fn test_resolve_table_columns_sorted_by_col_idx() {
     txn.commit().unwrap();
 
     let snap = txn.snapshot();
-    let mut resolver = SchemaResolver::new(&mut storage, snap, "public").unwrap();
+    let mut resolver = SchemaResolver::new(&storage, snap, "public").unwrap();
     let resolved = resolver.resolve_table(None, "users").unwrap();
 
     assert_eq!(resolved.columns.len(), 3);
@@ -169,7 +169,7 @@ fn test_resolve_table_includes_indexes() {
     txn.commit().unwrap();
 
     let snap = txn.snapshot();
-    let mut resolver = SchemaResolver::new(&mut storage, snap, "public").unwrap();
+    let mut resolver = SchemaResolver::new(&storage, snap, "public").unwrap();
     let resolved = resolver.resolve_table(None, "orders").unwrap();
 
     assert_eq!(resolved.def.id, table_id);
@@ -212,7 +212,7 @@ fn test_resolve_column_found() {
     txn.commit().unwrap();
 
     let snap = txn.snapshot();
-    let mut resolver = SchemaResolver::new(&mut storage, snap, "public").unwrap();
+    let mut resolver = SchemaResolver::new(&storage, snap, "public").unwrap();
 
     let col = resolver.resolve_column(table_id, "email").unwrap();
     assert_eq!(col.col_idx, 1);
@@ -242,7 +242,7 @@ fn test_resolve_column_not_found_returns_column_not_found_error() {
     txn.commit().unwrap();
 
     let snap = txn.snapshot();
-    let mut resolver = SchemaResolver::new(&mut storage, snap, "public").unwrap();
+    let mut resolver = SchemaResolver::new(&storage, snap, "public").unwrap();
 
     let err = resolver
         .resolve_column(table_id, "nonexistent")
@@ -273,15 +273,15 @@ fn test_table_exists_returns_true_for_committed_table() {
     txn.commit().unwrap();
 
     let snap = txn.snapshot();
-    let mut resolver = SchemaResolver::new(&mut storage, snap, "public").unwrap();
+    let mut resolver = SchemaResolver::new(&storage, snap, "public").unwrap();
     assert!(resolver.table_exists(None, "products").unwrap());
 }
 
 #[test]
 fn test_table_exists_returns_false_for_nonexistent_table() {
-    let (mut storage, txn) = setup();
+    let (storage, txn) = setup();
     let snap = txn.snapshot();
-    let mut resolver = SchemaResolver::new(&mut storage, snap, "public").unwrap();
+    let mut resolver = SchemaResolver::new(&storage, snap, "public").unwrap();
     assert!(!resolver.table_exists(None, "ghost").unwrap());
 }
 
@@ -297,7 +297,7 @@ fn test_table_exists_respects_schema() {
     txn.commit().unwrap();
 
     let snap = txn.snapshot();
-    let mut resolver = SchemaResolver::new(&mut storage, snap, "public").unwrap();
+    let mut resolver = SchemaResolver::new(&storage, snap, "public").unwrap();
 
     // Exists in "analytics", not in "public".
     assert!(resolver.table_exists(Some("analytics"), "events").unwrap());
@@ -319,14 +319,14 @@ fn test_mvcc_resolver_does_not_see_uncommitted_table() {
         w.create_table("public", "invisible").unwrap();
     }
     // Not committed yet — old snapshot must not see it.
-    let mut resolver_old = SchemaResolver::new(&mut storage, snap_before, "public").unwrap();
+    let mut resolver_old = SchemaResolver::new(&storage, snap_before, "public").unwrap();
     assert!(!resolver_old.table_exists(None, "invisible").unwrap());
 
     txn.commit().unwrap();
 
     // New snapshot after commit sees it.
     let snap_after = txn.snapshot();
-    let mut resolver_new = SchemaResolver::new(&mut storage, snap_after, "public").unwrap();
+    let mut resolver_new = SchemaResolver::new(&storage, snap_after, "public").unwrap();
     assert!(resolver_new.table_exists(None, "invisible").unwrap());
 }
 
@@ -334,13 +334,13 @@ fn test_mvcc_resolver_does_not_see_uncommitted_table() {
 
 #[test]
 fn test_catalog_not_initialized_returns_error() {
-    let mut storage = MemoryStorage::new(); // no CatalogBootstrap::init
+    let storage = MemoryStorage::new(); // no CatalogBootstrap::init
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("test.wal");
     let txn = TxnManager::create(&wal_path).unwrap();
     let snap = txn.snapshot();
 
-    let err = SchemaResolver::new(&mut storage, snap, "public")
+    let err = SchemaResolver::new(&storage, snap, "public")
         .err()
         .expect("expected an error");
     assert!(

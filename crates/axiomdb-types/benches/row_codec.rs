@@ -36,7 +36,7 @@ fn all_types_row() -> (Vec<Value>, Vec<DataType>) {
         Value::Bool(true),
         Value::Int(42),
         Value::BigInt(i64::MAX),
-        Value::Real(3.14),
+        Value::Real(2.75),
         Value::Decimal(123456, 2),
         Value::Text("hello world".into()),
         Value::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]),

@@ -685,10 +685,7 @@ mod tests {
         let result = MmapStorage::flush_runs(&runs, |_, _| {
             call_count += 1;
             if call_count == 2 {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "injected failure",
-                ))
+                Err(std::io::Error::other("injected failure"))
             } else {
                 Ok(())
             }

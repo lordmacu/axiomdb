@@ -34,6 +34,42 @@ python3 bench_runner.py --rows 100000
 ./teardown.sh
 ```
 
+## Local Fair Benchmark
+
+For apples-to-apples local comparisons across MariaDB, MySQL, and AxiomDB use
+`local_bench.py`:
+
+```bash
+python3 benches/comparison/local_bench.py --scenario all --rows 50000 --table
+```
+
+Fairness rules in this harness:
+- Timed `INSERT` paths avoid `executemany()`, because Python drivers batch it differently.
+- The same table shape is created on every engine.
+- Optional secondary indexes are created identically via `--indexes active,age,score`.
+- Point lookups and range scans use deterministic key sets on all engines.
+- PostgreSQL is available later via `--engines mariadb,mysql,axiomdb,postgres`.
+
+Useful variants:
+
+```bash
+# Compare scan vs indexed filter under the same schema
+python3 benches/comparison/local_bench.py --scenario select_where --rows 50000 --table
+python3 benches/comparison/local_bench.py --scenario select_where --rows 50000 --indexes active --table
+
+# Compare three write paths fairly
+python3 benches/comparison/local_bench.py --scenario insert --rows 50000 --table
+python3 benches/comparison/local_bench.py --scenario insert_multi_values --rows 50000 --table
+python3 benches/comparison/local_bench.py --scenario insert_autocommit --rows 5000 --table
+
+# Stress indexed reads and range updates
+python3 benches/comparison/local_bench.py --scenario select_pk --rows 50000 --point-lookups 1000 --table
+python3 benches/comparison/local_bench.py --scenario update_range --rows 50000 --range-rows 5000 --table
+
+# Add PostgreSQL later when needed
+python3 benches/comparison/local_bench.py --scenario all --rows 50000 --engines mariadb,mysql,axiomdb,postgres --table
+```
+
 ## Including AxiomDB (Phase 8+)
 
 Once Phase 8 (MySQL wire protocol) is complete:
@@ -61,6 +97,35 @@ python3 bench_runner.py --all
 | `range_scan 10%` | Contiguous range by id |
 | `count(*)` | Aggregation: full scan + count |
 | `group by age + avg(score)` | Hash aggregation |
+
+### `local_bench.py` scenarios
+
+| Scenario | What it measures |
+|---|---|
+| `insert` | N single-row `INSERT`s inside one explicit transaction |
+| `insert_multi_values` | Bulk ingest using chunked `INSERT ... VALUES (...),(...)` |
+| `insert_autocommit` | One `INSERT` per transaction |
+| `select` | Full table scan |
+| `select_where` | Filtered scan or indexed filter, depending on `--indexes` |
+| `select_pk` | Primary-key point lookups |
+| `select_range` | Primary-key range scan |
+| `count` | Scalar aggregation |
+| `aggregate` | `GROUP BY age, AVG(score)` aggregation |
+| `update` | Batch update over `active = TRUE` |
+| `update_range` | Batch update over a primary-key range |
+| `delete` | Full-table delete |
+| `delete_where` | Large selective delete (`id > N/2`) |
+
+### `local_bench.py` knobs
+
+| Flag | Purpose |
+|---|---|
+| `--engines mariadb,mysql,axiomdb[,postgres]` | Choose which engines participate in the comparison |
+| `--indexes active,age,score` | Add identical secondary indexes to every engine |
+| `--point-lookups N` | Number of PK lookups in `select_pk` |
+| `--range-rows N` | Rows touched by `select_range` / `update_range` |
+| `--multi-values-chunk N` | Rows per multi-values `INSERT` statement |
+| `--autocommit-rows N` | Rows used by `insert_autocommit` |
 
 ## Configuration files
 
