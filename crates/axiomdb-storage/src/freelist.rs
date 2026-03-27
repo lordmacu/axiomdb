@@ -305,7 +305,7 @@ mod tests {
         fl.grow(128);
         // After grow, pages 64..128 are free.
         let id = fl.alloc().unwrap();
-        assert!(id >= 64 && id < 128);
+        assert!((64..128).contains(&id));
     }
 
     #[test]

@@ -48,9 +48,10 @@ git commit -m "checkpoint: pause at [brief description]"
 
 ```
 1. Read the most recent docs/checkpoint-DATE.md
-2. Run cargo test --workspace to see the current state
-3. Read the "Exact next step" and execute it
-4. Delete the checkpoint when the task is complete
+2. Run targeted tests for the touched crate(s) and related dependents to see the current state
+3. Reserve cargo test --workspace for the final close/review gate
+4. Read the "Exact next step" and execute it
+5. Delete the checkpoint when the task is complete
 ```
 
 ## When to create a checkpoint

@@ -607,6 +607,10 @@ mod tests {
     use super::*;
     use crate::{types::DataType, value::Value};
 
+    fn parse_real(s: &str) -> f64 {
+        s.parse().expect("valid test f64")
+    }
+
     // ── coerce() identity ────────────────────────────────────────────────────
 
     #[test]
@@ -870,7 +874,7 @@ mod tests {
                 CoercionMode::Strict
             )
             .unwrap(),
-            Value::Real(3.14)
+            Value::Real(parse_real("3.14"))
         );
     }
 
@@ -926,7 +930,7 @@ mod tests {
             CoercionMode::Permissive,
         )
         .unwrap();
-        assert_eq!(v, Value::Real(3.14));
+        assert_eq!(v, Value::Real(parse_real("3.14")));
     }
 
     // ── Text → Decimal ───────────────────────────────────────────────────────
@@ -1062,7 +1066,12 @@ mod tests {
     #[test]
     fn test_coerce_real_to_int_is_error() {
         // Narrowing Real→Int requires explicit CAST.
-        let err = coerce(Value::Real(3.14), DataType::Int, CoercionMode::Strict).unwrap_err();
+        let err = coerce(
+            Value::Real(parse_real("3.14")),
+            DataType::Int,
+            CoercionMode::Strict,
+        )
+        .unwrap_err();
         assert!(matches!(err, DbError::InvalidCoercion { .. }));
     }
 

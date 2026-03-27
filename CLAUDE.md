@@ -211,12 +211,38 @@ before writing a single line of implementation code.
 
 ---
 
+### Fast validation during implementation
+
+**Do NOT run `cargo test --workspace` after every edit.** Use an incremental test
+loop while implementing, and reserve the full workspace sweep for the closing
+gate of the subphase/phase.
+
+Minimum rule:
+
+1. Run tests for the crate you touched (`cargo test -p axiomdb-...`)
+2. Add directly affected dependents when the change crosses crate boundaries
+3. Run `tools/wire-test.py` only if the change is observable through the MySQL
+   wire protocol
+4. Run `cargo test --workspace` only when closing the subphase/phase
+
+Escalation heuristics — expand beyond the touched crate when any of these apply:
+
+- Public API or trait signature changed → run reverse dependencies too
+- On-disk layout, page format, WAL entry, recovery, or key encoding changed →
+  run all storage/index/catalog/sql/network dependents touched by that path
+- SQL parser/analyzer/executor semantics changed → run `axiomdb-sql` plus
+  `axiomdb-network`, `axiomdb-embedded`, and `tools/wire-test.py` if user-visible
+- Shared crates like `axiomdb-core`, `axiomdb-types`, or `axiomdb-storage`
+  changed → assume wider blast radius and include dependent crates
+- If unsure whether a related crate is affected, include it; bias toward a
+  slightly larger targeted set rather than jumping straight to the whole workspace
+
 One phase at a time. When finishing each phase — **mandatory closing protocol:**
 
 ```
-1. cargo test --workspace passes clean
-2. cargo clippy --workspace -- -D warnings with no errors
-3. cargo fmt --check with no differences
+1. Final gate: cargo test --workspace passes clean
+2. Final gate: cargo clippy --workspace -- -D warnings with no errors
+3. Final gate: cargo fmt --check with no differences
 4. Wire protocol smoke test — if the subphase touches anything observable
    from a MySQL client (SQL, transactions, session, errors, DDL, functions):
    overwrite tools/wire-test.py with:

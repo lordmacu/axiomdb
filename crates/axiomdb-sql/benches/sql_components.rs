@@ -4,7 +4,7 @@ use std::hint::black_box;
 
 use axiomdb_sql::{
     eval,
-    expr::{BinaryOp, Expr, UnaryOp},
+    expr::{BinaryOp, Expr},
     is_truthy, parse, tokenize,
 };
 use axiomdb_types::Value;

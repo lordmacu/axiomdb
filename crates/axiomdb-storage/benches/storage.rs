@@ -25,7 +25,7 @@ fn bench_memory_alloc(c: &mut Criterion) {
 
     group.bench_function("alloc_page", |b| {
         b.iter_batched(
-            || MemoryStorage::new(),
+            MemoryStorage::new,
             |mut s| s.alloc_page(PageType::Data).unwrap(),
             BatchSize::SmallInput,
         )

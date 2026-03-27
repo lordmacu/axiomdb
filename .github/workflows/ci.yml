@@ -38,14 +38,18 @@ jobs:
       - name: cargo check
         run: cargo check --workspace
 
-      - name: cargo test
-        run: cargo test --workspace
-
-      - name: cargo clippy
-        run: cargo clippy --workspace -- -D warnings
-
-      - name: cargo fmt
-        run: cargo fmt --check
+      # Disabled for now to avoid spending GitHub Actions minutes on checks
+      # that are already being run locally. Uncomment these steps to restore
+      # full CI validation later.
+      #
+      # - name: cargo test
+      #   run: cargo test --workspace
+      #
+      # - name: cargo clippy
+      #   run: cargo clippy --workspace -- -D warnings
+      #
+      # - name: cargo fmt
+      #   run: cargo fmt --check
 
   build-server:
     name: Build server (${{ matrix.os }})

@@ -346,7 +346,7 @@ mod tests {
     }
 
     fn generic_io_err() -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::Other, "generic error")
+        std::io::Error::other("generic error")
     }
 
     #[test]

@@ -82,7 +82,7 @@ impl Checkpointer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axiomdb_storage::{MemoryStorage, MmapStorage, PageType};
+    use axiomdb_storage::{MemoryStorage, MmapStorage};
 
     use crate::{reader::WalReader, EntryType as ET, TxnManager};
 
@@ -96,7 +96,6 @@ mod tests {
 
     #[test]
     fn test_fresh_db_last_checkpoint_lsn_is_zero() {
-        let (_dir, path) = temp_wal();
         let storage = MemoryStorage::new();
         assert_eq!(Checkpointer::last_checkpoint_lsn(&storage).unwrap(), 0);
     }

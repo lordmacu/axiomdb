@@ -56,7 +56,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd /Users/cristian/nexusdb && [ -f Cargo.toml ] && echo '\\n── Estado al parar ──' && cargo test --workspace --quiet 2>&1 | tail -5 || echo 'Cargo.toml no existe aún'; exit 0"
+            "command": "cd /Users/cristian/nexusdb && echo '\\n── Estado al parar ──' && git status --short || echo 'Repo no disponible'; exit 0"
           }
         ]
       }

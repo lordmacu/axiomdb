@@ -63,7 +63,7 @@ fn test_no_notifier_backward_compatible() {
     txn.commit().unwrap();
 
     let snap = txn.snapshot();
-    let mut reader = CatalogReader::new(&mut storage, snap).unwrap();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
     assert!(reader.get_table("public", "users").unwrap().is_some());
 }
 
@@ -435,7 +435,7 @@ fn test_spurious_notification_on_rollback() {
 
     // The table is not in the catalog after rollback.
     let snap = txn.snapshot();
-    let mut reader = CatalogReader::new(&mut storage, snap).unwrap();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
     assert!(
         reader.get_table("public", "ghost").unwrap().is_none(),
         "table must not be visible after rollback"

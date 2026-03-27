@@ -1032,7 +1032,7 @@ mod tests {
         };
         let bytes = def.to_bytes();
         let (back, _) = ColumnDef::from_bytes(&bytes).unwrap();
-        assert_eq!(back.nullable, false);
+        assert!(!back.nullable);
         assert_eq!(back.col_type, ColumnType::BigInt);
     }
 
@@ -1097,8 +1097,8 @@ mod tests {
         let bytes = def.to_bytes();
         let (back, _) = IndexDef::from_bytes(&bytes).unwrap();
         assert_eq!(back.index_id, 5);
-        assert_eq!(back.is_unique, false);
-        assert_eq!(back.is_primary, false);
+        assert!(!back.is_unique);
+        assert!(!back.is_primary);
         assert_eq!(back.columns.len(), 1);
         assert_eq!(back.columns[0].col_idx, 2);
     }

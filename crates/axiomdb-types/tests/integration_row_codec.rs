@@ -14,6 +14,10 @@ fn roundtrip(values: &[Value], schema: &[DataType]) -> Vec<Value> {
     decode_row(&encoded, schema).expect("decode failed")
 }
 
+fn parse_real(s: &str) -> f64 {
+    s.parse().expect("valid test f64")
+}
+
 // ── Single-type roundtrips ────────────────────────────────────────────────────
 
 #[test]
@@ -48,7 +52,14 @@ fn test_roundtrip_bigint() {
 
 #[test]
 fn test_roundtrip_real() {
-    for f in [0.0f64, 1.0, -1.0, 3.14159, f64::INFINITY, f64::NEG_INFINITY] {
+    for f in [
+        0.0f64,
+        1.0,
+        -1.0,
+        parse_real("3.14159"),
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ] {
         let v = vec![Value::Real(f)];
         assert_eq!(roundtrip(&v, &[DataType::Real]), v, "failed for Real({f})");
     }
@@ -178,7 +189,7 @@ fn test_roundtrip_empty_row() {
 
 #[test]
 fn test_roundtrip_9_cols_two_bitmap_bytes() {
-    let v: Vec<Value> = (0..9).map(|i| Value::Int(i as i32)).collect();
+    let v: Vec<Value> = (0..9).map(Value::Int).collect();
     let s: Vec<DataType> = vec![DataType::Int; 9];
     let encoded = encode_row(&v, &s).unwrap();
     // 2-byte bitmap (all zeros, no NULLs) + 9 × 4 bytes = 2 + 36 = 38
@@ -192,7 +203,7 @@ fn test_roundtrip_9_cols_two_bitmap_bytes() {
 #[test]
 fn test_null_bitmap_bit_positions_9_cols() {
     // col 0 and col 8 are NULL
-    let mut v: Vec<Value> = (0..9).map(|i| Value::Int(i as i32)).collect();
+    let mut v: Vec<Value> = (0..9).map(Value::Int).collect();
     v[0] = Value::Null;
     v[8] = Value::Null;
     let s = vec![DataType::Int; 9];
@@ -213,7 +224,7 @@ fn test_encoded_len_equals_actual_for_all_types() {
         Value::Bool(true),
         Value::Int(-7),
         Value::BigInt(i64::MIN),
-        Value::Real(2.718),
+        Value::Real(parse_real("2.718")),
         Value::Decimal(999, 3),
         Value::Text("axiomdb".into()),
         Value::Bytes(vec![1, 2, 3]),

@@ -401,10 +401,7 @@ impl IntegrityChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        heap::{insert_tuple, RowHeader},
-        MemoryStorage, PageType,
-    };
+    use crate::{heap::insert_tuple, MemoryStorage, PageType};
 
     fn fresh_heap_page(page_id: u64) -> Page {
         Page::new(PageType::Data, page_id)
@@ -576,9 +573,11 @@ mod tests {
 
     #[test]
     fn test_summary_clean_and_error() {
-        let mut clean = IntegrityReport::default();
-        clean.pages_checked = 5;
-        clean.slots_checked = 20;
+        let clean = IntegrityReport {
+            pages_checked: 5,
+            slots_checked: 20,
+            ..IntegrityReport::default()
+        };
         let s = clean.summary();
         assert!(
             s.starts_with("OK:"),

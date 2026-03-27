@@ -13,7 +13,7 @@ use axiomdb_storage::{
     heap::{insert_tuple, read_tuple},
     MmapStorage, Page, PageType, StorageEngine,
 };
-use axiomdb_wal::{CrashRecovery, EntryType, ForwardIter, TxnManager, WalEntry, WalReader};
+use axiomdb_wal::{CrashRecovery, EntryType, TxnManager, WalEntry, WalReader};
 use tempfile::TempDir;
 
 // ── TestEnv ───────────────────────────────────────────────────────────────────
@@ -228,9 +228,8 @@ fn test_committed_page_write_rows_visible_after_restart() {
 
     // Reopen — no recovery needed (clean commit).
     let txn2 = TxnManager::open(&env.wal).unwrap();
-    assert_eq!(
-        CrashRecovery::is_needed(&storage, &env.wal).unwrap(),
-        false,
+    assert!(
+        !CrashRecovery::is_needed(&storage, &env.wal).unwrap(),
         "recovery must not be needed after clean commit"
     );
 
