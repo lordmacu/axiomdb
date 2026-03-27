@@ -132,7 +132,7 @@ fn slot_abs_offset(i: u16) -> usize {
 
 /// Reads slot entry `i` from the page (zero-copy cast).
 #[inline]
-pub(crate) fn read_slot(page: &Page, i: u16) -> SlotEntry {
+pub fn read_slot(page: &Page, i: u16) -> SlotEntry {
     let off = slot_abs_offset(i);
     *bytemuck::from_bytes(&page.as_bytes()[off..off + size_of::<SlotEntry>()])
 }

@@ -48,9 +48,11 @@
 
 use axiomdb_catalog::schema::{ColumnDef, ColumnType, TableDef};
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
-use axiomdb_storage::{HeapAppendHint, HeapChain, RowHeader, StorageEngine};
+use axiomdb_storage::{
+    heap_chain, num_slots, read_slot, HeapAppendHint, HeapChain, Page, RowHeader, StorageEngine,
+};
 use axiomdb_types::{
-    codec::{decode_row, decode_row_masked, encode_row},
+    codec::{decode_row, encode_row},
     coerce::{coerce, CoercionMode},
     DataType, Value,
 };
@@ -98,23 +100,76 @@ impl TableEngine {
         snap: TransactionSnapshot,
         column_mask: Option<&[bool]>,
     ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
-        let col_types = column_data_types(columns);
-        let raw_rows = HeapChain::scan_visible(storage, table_def.data_root_page_id, snap)?;
+        Self::scan_table_direct(storage, table_def, columns, snap, column_mask)
+    }
 
-        let mut result = Vec::with_capacity(raw_rows.len());
-        for (page_id, slot_id, bytes) in raw_rows {
-            let values = match column_mask {
-                None => decode_row(&bytes, &col_types)?,
-                Some(mask) => {
-                    if mask.iter().all(|&b| b) {
-                        decode_row(&bytes, &col_types)?
-                    } else {
-                        decode_row_masked(&bytes, &col_types, mask)?
-                    }
-                }
-            };
-            result.push((RecordId { page_id, slot_id }, values));
+    /// Like [`scan_table`] but inlines the heap traversal and decodes rows
+    /// directly from page bytes — eliminating the intermediate `Vec<u8>`
+    /// allocation (`.to_vec()`) per row that `HeapChain::scan_visible` produces.
+    ///
+    /// On a 50K-row table this saves ~50 000 heap allocations, reducing
+    /// allocation pressure from the per-row copy. Page prefetching is
+    /// included: the next heap chain page is hinted before decoding the
+    /// current page's rows, overlapping I/O with decode on cold caches.
+    ///
+    /// Falls back to [`scan_table`] when `column_mask` is `Some` (masked
+    /// decode needs a separate code path that isn't worth duplicating here).
+    pub fn scan_table_direct(
+        storage: &mut dyn StorageEngine,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        snap: TransactionSnapshot,
+        column_mask: Option<&[bool]>,
+    ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+        // Masked decode falls back to the original two-phase path.
+        if let Some(mask) = column_mask {
+            if !mask.iter().all(|&b| b) {
+                return Self::scan_table(storage, table_def, columns, snap, column_mask);
+            }
         }
+
+        let col_types = column_data_types(columns);
+        let mut result = Vec::new();
+        let mut current = table_def.data_root_page_id;
+
+        while current != 0 {
+            let raw = *storage.read_page(current)?.as_bytes();
+            let page = Page::from_bytes(raw)?;
+            let next = heap_chain::chain_next_page(&page);
+
+            // Prefetch next page while processing current page's rows.
+            if next != 0 {
+                storage.prefetch_hint(next, 1);
+            }
+
+            let num = num_slots(&page);
+            for slot_id in 0..num {
+                let entry = read_slot(&page, slot_id);
+                if entry.is_dead() {
+                    continue;
+                }
+                let off = entry.offset as usize;
+                let len = entry.length as usize;
+                let bytes = &page.as_bytes()[off..off + len];
+                let header: &RowHeader = bytemuck::from_bytes(&bytes[..size_of::<RowHeader>()]);
+                if !header.is_visible(&snap) {
+                    continue;
+                }
+                // Decode directly from page bytes — no .to_vec().
+                let row_data = &bytes[size_of::<RowHeader>()..];
+                let values = decode_row(row_data, &col_types)?;
+                result.push((
+                    RecordId {
+                        page_id: current,
+                        slot_id,
+                    },
+                    values,
+                ));
+            }
+
+            current = next;
+        }
+
         Ok(result)
     }
 

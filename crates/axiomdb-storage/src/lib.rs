@@ -17,8 +17,8 @@ pub use dirty::PageDirtyTracker;
 pub use engine::StorageEngine;
 pub use freelist::FreeList;
 pub use heap::{
-    clear_deletion, delete_tuple, free_space, insert_tuple, mark_slot_dead, num_slots, read_tuple,
-    read_tuple_header, read_tuple_image, restore_tuple_image, rewrite_tuple_same_slot,
+    clear_deletion, delete_tuple, free_space, insert_tuple, mark_slot_dead, num_slots, read_slot,
+    read_tuple, read_tuple_header, read_tuple_image, restore_tuple_image, rewrite_tuple_same_slot,
     scan_visible, slot_capacity, update_tuple, RowHeader, SlotEntry, MAX_TUPLE_DATA,
     MIN_TUPLE_OVERHEAD,
 };
