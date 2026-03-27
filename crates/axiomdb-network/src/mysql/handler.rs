@@ -206,16 +206,14 @@ pub async fn handle_connection_with_timeouts(
         //   seq=4: Server → OK_Packet
         let _ = verify_sha256_password(&challenge, &response.auth_response);
 
-        // Send AuthMoreData(0x03) = fast_auth_success.
-        // Then send OK immediately at seq=3 — pymysql reads it directly
-        // without sending an ack first. The previous ack-read caused a
-        // deadlock: server waited for ack, pymysql waited for OK.
-        // caching_sha2_password fast-auth sequence:
+        // caching_sha2_password fast-auth:
         //   seq=0  Server → HandshakeV10
         //   seq=1  Client → HandshakeResponse41
-        //   seq=2  Server → AuthMoreData(0x03)  ← fast_auth_success
-        //   seq=3  Client → b"" (empty ack — pymysql _roundtrip sends this)
-        //   seq=4  Server → OK_Packet
+        //   seq=2  Server → AuthMoreData(0x03)
+        //
+        // Empty password: pymysql sends a _roundtrip(b"") at seq=3,
+        //   then reads OK at seq=4. We must read the ack before responding.
+        // Non-empty password: pymysql reads OK directly at seq=3 — no ack.
         let more_data = build_auth_more_data(0x03);
         if send_auth_packet(&mut writer, &lifecycle, 2u8, more_data.as_slice())
             .await
@@ -225,23 +223,23 @@ pub async fn handle_connection_with_timeouts(
             return;
         }
 
-        // Read the empty ack from the client (seq=3) before sending OK.
-        match read_auth_packet(&mut reader, &lifecycle).await {
-            Ok(_) => {}
-            Err(ConnectionIoError::Read(MySqlCodecError::PacketTooLarge { .. })) => {
-                let err = build_packet_too_large_err();
-                let _ = send_auth_packet(&mut writer, &lifecycle, 4u8, err.as_slice()).await;
-                lifecycle.close();
-                return;
+        let ok_seq = if response.auth_response.is_empty() {
+            // Empty password: read the client ack at seq=3 before OK at seq=4.
+            match read_auth_packet(&mut reader, &lifecycle).await {
+                Ok(_) => {}
+                Err(_) => {
+                    lifecycle.close();
+                    return;
+                }
             }
-            Err(_) => {
-                lifecycle.close();
-                return;
-            } // client disconnected / timeout
-        }
+            4u8
+        } else {
+            // Non-empty password: send OK directly at seq=3.
+            3u8
+        };
 
         let ok = build_ok_packet(0, 0, 0);
-        if send_auth_packet(&mut writer, &lifecycle, 4u8, ok.as_slice())
+        if send_auth_packet(&mut writer, &lifecycle, ok_seq, ok.as_slice())
             .await
             .is_err()
         {
