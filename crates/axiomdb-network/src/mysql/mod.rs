@@ -28,6 +28,7 @@ pub mod error;
 pub mod group_commit;
 pub mod handler;
 pub mod json_error;
+pub mod lifecycle;
 pub mod packets;
 pub mod prepared;
 pub mod result;
@@ -36,4 +37,5 @@ pub mod status;
 
 pub use database::Database;
 pub use handler::handle_connection;
+pub use lifecycle::configure_client_socket;
 pub use session::ConnectionState;

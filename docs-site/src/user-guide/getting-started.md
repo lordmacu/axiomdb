@@ -380,6 +380,49 @@ Session scope (`SHOW STATUS`, `SHOW SESSION STATUS`, `SHOW LOCAL STATUS`) return
 per-connection values. Global scope (`SHOW GLOBAL STATUS`) returns server-wide totals.
 Session counters reset when a connection is closed or `COM_RESET_CONNECTION` is issued.
 
+### Connection Timeout Variables
+
+AxiomDB exposes the same timeout variables that MySQL clients expect at the
+session level:
+
+```sql
+SET wait_timeout = 30;
+SET interactive_timeout = 300;
+SET net_read_timeout = 60;
+SET net_write_timeout = 60;
+
+SELECT @@wait_timeout;
+SELECT @@interactive_timeout;
+SELECT @@net_read_timeout;
+SELECT @@net_write_timeout;
+```
+
+Rules:
+
+- `wait_timeout` applies while a non-interactive connection is idle between commands.
+- `interactive_timeout` applies instead when the client connected with
+  `CLIENT_INTERACTIVE`.
+- `net_write_timeout` bounds packet writes once a command is already executing.
+- `net_read_timeout` is reserved for future in-flight protocol reads and is
+  already validated/stored as a real session variable.
+- `COM_RESET_CONNECTION` resets all four variables back to their defaults.
+
+Trying to set one of these variables to `0` or to a non-integer value returns an
+error:
+
+```sql
+SET wait_timeout = 0;
+-- ERROR ... wait_timeout must be a positive integer, got '0'
+```
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Interactive Clients</span>
+If a driver or tool connects with `CLIENT_INTERACTIVE`, AxiomDB keeps using that classification even after `COM_RESET_CONNECTION`. Resetting the session restores timeout values, but it does not turn an interactive connection into a non-interactive one.
+</div>
+</div>
+
 ---
 
 ## Embedded Mode — Rust API

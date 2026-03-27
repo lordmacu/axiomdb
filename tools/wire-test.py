@@ -3,7 +3,8 @@
 AxiomDB wire protocol test.
 Updated at each subphase close — always overwrite this file, never create new ones.
 
-Last updated: subphase 5.11b (COM_STMT_SEND_LONG_DATA)
+Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batch delete),
+             5.19a (executor decomposition — structural refactor, wire-invisible)
 """
 import os
 import signal
@@ -15,6 +16,7 @@ import struct as _struct
 
 import pymysql
 import pymysql.constants.COMMAND as _CMD
+import pymysql.constants.CLIENT as _CLIENT
 
 PORT = 13306
 PASS = 0
@@ -119,11 +121,18 @@ def connect():
 
 
 def connect_multi():
-    from pymysql.constants import CLIENT
     return pymysql.connect(
         host="127.0.0.1", port=PORT, user="root", password="",
         autocommit=False,
-        client_flag=CLIENT.MULTI_STATEMENTS,
+        client_flag=_CLIENT.MULTI_STATEMENTS,
+    )
+
+
+def connect_interactive():
+    return pymysql.connect(
+        host="127.0.0.1", port=PORT, user="root", password="",
+        autocommit=False,
+        client_flag=_CLIENT.INTERACTIVE,
     )
 
 
@@ -361,6 +370,76 @@ co.execute("SELECT @@on_error")
 ok("COM_RESET_CONNECTION resets @@on_error to rollback_statement",
    co.fetchone()[0] == "rollback_statement")
 conn_oe.close()
+
+# ── [5.11c] Explicit connection lifecycle / timeout vars ─────────────────────
+
+print("\n[5.11c] connection lifecycle / timeout vars")
+conn_lc = connect()
+cl = conn_lc.cursor()
+
+cl.execute("SET wait_timeout = 7")
+cl.execute("SET interactive_timeout = 8")
+cl.execute("SET net_read_timeout = 9")
+cl.execute("SET net_write_timeout = 10")
+cl.execute("SELECT @@wait_timeout")
+ok("SELECT @@wait_timeout returns live value", cl.fetchone()[0] == "7")
+cl.execute("SELECT @@interactive_timeout")
+ok("SELECT @@interactive_timeout returns live value", cl.fetchone()[0] == "8")
+cl.execute("SELECT @@net_read_timeout")
+ok("SELECT @@net_read_timeout returns live value", cl.fetchone()[0] == "9")
+cl.execute("SELECT @@net_write_timeout")
+ok("SELECT @@net_write_timeout returns live value", cl.fetchone()[0] == "10")
+
+try:
+    cl.execute("SET wait_timeout = 0")
+    ok("SET wait_timeout = 0 returns ERR", False, "no error raised")
+except pymysql.MySQLError:
+    ok("SET wait_timeout = 0 returns ERR", True)
+
+reset_connection(conn_lc)
+cl = conn_lc.cursor()
+cl.execute("SELECT @@wait_timeout")
+ok("COM_RESET_CONNECTION resets @@wait_timeout to default", cl.fetchone()[0] == "28800")
+cl.execute("SELECT @@interactive_timeout")
+ok("COM_RESET_CONNECTION resets @@interactive_timeout to default", cl.fetchone()[0] == "28800")
+cl.execute("SELECT @@net_read_timeout")
+ok("COM_RESET_CONNECTION resets @@net_read_timeout to default", cl.fetchone()[0] == "60")
+cl.execute("SELECT @@net_write_timeout")
+ok("COM_RESET_CONNECTION resets @@net_write_timeout to default", cl.fetchone()[0] == "60")
+conn_lc.close()
+
+conn_idle = connect()
+ci = conn_idle.cursor()
+ci.execute("SET wait_timeout = 1")
+time.sleep(1.2)
+try:
+    ci.execute("SELECT 1")
+    ok("non-interactive idle timeout closes the connection", False, "query unexpectedly succeeded")
+except pymysql.MySQLError:
+    ok("non-interactive idle timeout closes the connection", True)
+try:
+    conn_idle.close()
+except Exception:
+    pass
+
+conn_int = connect_interactive()
+cx = conn_int.cursor()
+cx.execute("SET wait_timeout = 1")
+reset_connection(conn_int)
+cx = conn_int.cursor()
+cx.execute("SET wait_timeout = 1")
+time.sleep(1.2)
+try:
+    cx.execute("SELECT 1")
+    row = cx.fetchone()
+    ok(
+        "interactive classification survives COM_RESET_CONNECTION",
+        row == (1,),
+        row,
+    )
+except pymysql.MySQLError as e:
+    ok("interactive classification survives COM_RESET_CONNECTION", False, e)
+conn_int.close()
 
 # ── [5.9b] @@in_transaction ────────────────────────────────────────────────────
 
@@ -1444,6 +1523,71 @@ ok("5.2a: UTF-8 multi-byte text round-trips (Japanese)",
 cu8.execute("DROP TABLE IF EXISTS t_cs_utf8")
 conn_utf8.commit()
 conn_utf8.close()
+
+# ── [5.19] B+tree batch delete — DELETE / UPDATE correctness ─────────────────
+
+print("\n[5.19] B+tree batch delete — DELETE WHERE and UPDATE correctness")
+
+conn_bd = connect()
+cb19 = conn_bd.cursor()
+
+cb19.execute("CREATE TABLE bd_users (id INT PRIMARY KEY, name TEXT, score INT)")
+cb19.execute("CREATE INDEX idx_bd_score ON bd_users (score)")
+for i in range(1, 21):
+    cb19.execute("INSERT INTO bd_users VALUES (%s, %s, %s)", (i, f"user{i}", i * 10))
+conn_bd.commit()
+
+# DELETE WHERE on indexed PK column — triggers batch delete path on PK index
+cb19.execute("DELETE FROM bd_users WHERE id > 10")
+conn_bd.commit()
+cb19.execute("SELECT COUNT(*) FROM bd_users")
+ok("5.19 DELETE WHERE PK: 10 rows remain after deleting id > 10",
+   cb19.fetchone()[0] == 10)
+
+cb19.execute("SELECT id FROM bd_users ORDER BY id ASC")
+ids = [r[0] for r in cb19.fetchall()]
+ok("5.19 DELETE WHERE PK: remaining ids are 1..10",
+   ids == list(range(1, 11)), ids)
+
+# Verify deleted rows are not visible via secondary index scan
+cb19.execute("SELECT score FROM bd_users WHERE score > 100")
+rows_deleted = cb19.fetchall()
+ok("5.19 DELETE WHERE PK: deleted rows absent from secondary index scan",
+   len(rows_deleted) == 0, rows_deleted)
+
+# UPDATE on multiple rows — batch-deletes old PK keys then reinserts
+cb19.execute("UPDATE bd_users SET score = score + 1 WHERE id <= 5")
+conn_bd.commit()
+cb19.execute("SELECT id, score FROM bd_users WHERE id <= 5 ORDER BY id ASC")
+updated = cb19.fetchall()
+ok("5.19 UPDATE batch: 5 rows updated",
+   len(updated) == 5, len(updated))
+ok("5.19 UPDATE batch: score values incremented correctly",
+   [r[1] for r in updated] == [11, 21, 31, 41, 51],
+   [r[1] for r in updated])
+
+# Rows not in WHERE clause are unchanged
+cb19.execute("SELECT score FROM bd_users WHERE id = 6")
+ok("5.19 UPDATE batch: row outside WHERE unchanged (score = 60)",
+   cb19.fetchone()[0] == 60)
+
+# DELETE all rows — exercises full-table batch delete on PK and secondary index
+cb19.execute("DELETE FROM bd_users WHERE id >= 1")
+conn_bd.commit()
+cb19.execute("SELECT COUNT(*) FROM bd_users")
+ok("5.19 DELETE all via batch path: table is empty",
+   cb19.fetchone()[0] == 0)
+
+# Insert after batch delete — tree is still usable
+cb19.execute("INSERT INTO bd_users VALUES (100, 'reborn', 999)")
+conn_bd.commit()
+cb19.execute("SELECT name FROM bd_users WHERE id = 100")
+ok("5.19 INSERT after batch delete: tree usable, row found",
+   cb19.fetchone()[0] == "reborn")
+
+cb19.execute("DROP TABLE bd_users")
+conn_bd.commit()
+conn_bd.close()
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

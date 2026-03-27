@@ -17,7 +17,6 @@ use std::sync::{
     Arc,
 };
 
-use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -29,6 +28,11 @@ use axiomdb_types::DataType;
 
 use super::charset::DEFAULT_SERVER_COLLATION;
 use super::database::CommitRx;
+use super::lifecycle::{
+    configure_client_socket, read_auth_packet, read_idle_packet, send_auth_packet,
+    send_execute_packet, send_packet_batch, ConnectionIoError, ConnectionLifecycle,
+    ConnectionPhase, LifecycleTimeouts,
+};
 
 use super::result::serialize_query_result_multi_warn;
 use super::status::{ConnectedGuard, RunningGuard, SqlCommandClass};
@@ -76,11 +80,28 @@ fn build_query_err_packet(e: &DbError, sql: &str, session: &ConnectionState) -> 
 
 /// Handles one MySQL connection from handshake to disconnection.
 pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn_id: u32) {
+    handle_connection_with_timeouts(stream, db, conn_id, LifecycleTimeouts::default()).await;
+}
+
+/// Handles one MySQL connection with injectable lifecycle timeouts.
+///
+/// Used by lifecycle tests so auth/idle deadlines can be exercised without
+/// sleeping for the production defaults.
+pub async fn handle_connection_with_timeouts(
+    stream: TcpStream,
+    db: Arc<Mutex<Database>>,
+    conn_id: u32,
+    timeouts: LifecycleTimeouts,
+) {
     let peer = stream
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "?".into());
     info!(conn_id, %peer, "connection accepted");
+
+    if let Err(e) = configure_client_socket(&stream) {
+        warn!(conn_id, err = %e, "socket configuration failed");
+    }
 
     let (reader, writer) = stream.into_split();
     // Decoder starts with the default 64 MiB limit; synced to the session
@@ -90,27 +111,36 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
         MySqlCodec::new(super::session::ConnectionState::DEFAULT_MAX_ALLOWED_PACKET),
     );
     let mut writer = FramedWrite::new(writer, MySqlCodec::default());
+    let mut lifecycle = ConnectionLifecycle::with_timeouts(timeouts);
 
     // ── Phase 1: Send Server Greeting ─────────────────────────────────────────
     // Advertise caching_sha2_password for MySQL 8.0+ client compatibility.
     // mysql_native_password clients also accepted (plugin negotiated per-connection).
     let challenge = gen_challenge();
     let greeting = build_server_greeting(conn_id, &challenge, "caching_sha2_password");
-    if writer.send((0u8, greeting.as_slice())).await.is_err() {
+    lifecycle.enter(ConnectionPhase::Connected);
+    if send_auth_packet(&mut writer, &lifecycle, 0u8, greeting.as_slice())
+        .await
+        .is_err()
+    {
+        lifecycle.close();
         return;
     }
 
     // ── Phase 2: Receive HandshakeResponse41 ──────────────────────────────────
-    let (_, payload) = match reader.next().await {
-        Some(Ok(p)) => p,
-        Some(Err(MySqlCodecError::PacketTooLarge { .. })) => {
+    lifecycle.enter(ConnectionPhase::Auth);
+    let (_, payload) = match read_auth_packet(&mut reader, &lifecycle).await {
+        Ok(p) => p,
+        Err(ConnectionIoError::Read(MySqlCodecError::PacketTooLarge { .. })) => {
             // Oversized handshake — send 1153 and close before attempting auth.
             let err = build_packet_too_large_err();
-            let _ = writer.send((2u8, err.as_slice())).await;
+            let _ = send_auth_packet(&mut writer, &lifecycle, 2u8, err.as_slice()).await;
+            lifecycle.close();
             return;
         }
-        _ => {
-            warn!(conn_id, "client disconnected during handshake");
+        Err(e) => {
+            warn!(conn_id, err = %e, "client disconnected during handshake");
+            lifecycle.close();
             return;
         }
     };
@@ -120,10 +150,12 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
         None => {
             warn!(conn_id, "malformed HandshakeResponse41");
             let err = build_err_packet(1045, b"28000", "Malformed handshake packet");
-            let _ = writer.send((2u8, err.as_slice())).await;
+            let _ = send_auth_packet(&mut writer, &lifecycle, 2u8, err.as_slice()).await;
+            lifecycle.close();
             return;
         }
     };
+    lifecycle.set_client_capability_flags(response.capability_flags);
 
     // Build session from the negotiated collation id. Reject unsupported ids
     // before auth so the client gets a clear error (ER_UNKNOWN_CHARACTER_SET 1115).
@@ -133,7 +165,8 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
         Err(e) => {
             let me = super::error::dberror_to_mysql(&e, None);
             let err = build_err_packet(me.code, &me.sql_state, &me.message);
-            let _ = writer.send((2u8, err.as_slice())).await;
+            let _ = send_auth_packet(&mut writer, &lifecycle, 2u8, err.as_slice()).await;
+            lifecycle.close();
             return;
         }
     };
@@ -157,7 +190,8 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
             b"28000",
             &format!("Access denied for user '{username}'"),
         );
-        let _ = writer.send((2u8, err.as_slice())).await;
+        let _ = send_auth_packet(&mut writer, &lifecycle, 2u8, err.as_slice()).await;
+        lifecycle.close();
         return;
     }
 
@@ -183,30 +217,46 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
         //   seq=3  Client → b"" (empty ack — pymysql _roundtrip sends this)
         //   seq=4  Server → OK_Packet
         let more_data = build_auth_more_data(0x03);
-        if writer.send((2u8, more_data.as_slice())).await.is_err() {
+        if send_auth_packet(&mut writer, &lifecycle, 2u8, more_data.as_slice())
+            .await
+            .is_err()
+        {
+            lifecycle.close();
             return;
         }
 
         // Read the empty ack from the client (seq=3) before sending OK.
-        match reader.next().await {
-            Some(Ok(_)) => {}
-            Some(Err(MySqlCodecError::PacketTooLarge { .. })) => {
+        match read_auth_packet(&mut reader, &lifecycle).await {
+            Ok(_) => {}
+            Err(ConnectionIoError::Read(MySqlCodecError::PacketTooLarge { .. })) => {
                 let err = build_packet_too_large_err();
-                let _ = writer.send((4u8, err.as_slice())).await;
+                let _ = send_auth_packet(&mut writer, &lifecycle, 4u8, err.as_slice()).await;
+                lifecycle.close();
                 return;
             }
-            _ => return, // client disconnected
+            Err(_) => {
+                lifecycle.close();
+                return;
+            } // client disconnected / timeout
         }
 
         let ok = build_ok_packet(0, 0, 0);
-        if writer.send((4u8, ok.as_slice())).await.is_err() {
+        if send_auth_packet(&mut writer, &lifecycle, 4u8, ok.as_slice())
+            .await
+            .is_err()
+        {
+            lifecycle.close();
             return;
         }
     } else {
         // mysql_native_password (or unknown plugin): send OK directly (seq=2).
         let _ = verify_native_password("", &challenge, &response.auth_response);
         let ok = build_ok_packet(0, 0, 0);
-        if writer.send((2u8, ok.as_slice())).await.is_err() {
+        if send_auth_packet(&mut writer, &lifecycle, 2u8, ok.as_slice())
+            .await
+            .is_err()
+        {
+            lifecycle.close();
             return;
         }
     }
@@ -246,27 +296,48 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
             .max_allowed_packet_bytes()
             .unwrap_or(ConnectionState::DEFAULT_MAX_ALLOWED_PACKET),
     );
+    lifecycle.enter(ConnectionPhase::Idle);
 
     loop {
-        let (_, payload) = match reader.next().await {
-            Some(Ok(p)) => p,
-            Some(Err(MySqlCodecError::PacketTooLarge { .. })) => {
+        let (_, payload) = match read_idle_packet(&mut reader, &lifecycle, &conn_state).await {
+            Ok(p) => p,
+            Err(ConnectionIoError::Read(MySqlCodecError::PacketTooLarge { .. })) => {
                 // Connection stream is unsalvageable — send error then close.
                 let err = build_packet_too_large_err();
-                let _ = writer.send((1u8, err.as_slice())).await;
+                let _ =
+                    send_execute_packet(&mut writer, &lifecycle, &conn_state, 1u8, err.as_slice())
+                        .await;
+                lifecycle.close();
                 break;
             }
-            Some(Err(e)) => {
+            Err(ConnectionIoError::Read(e)) => {
                 debug!(conn_id, err = %e, "read error");
+                lifecycle.close();
                 break;
             }
-            None => {
+            Err(ConnectionIoError::Timeout(phase)) => {
+                debug!(conn_id, ?phase, "connection timeout");
+                lifecycle.close();
+                break;
+            }
+            Err(ConnectionIoError::InvalidConfig(e)) => {
+                warn!(conn_id, err = %e, "invalid timeout config during idle read");
+                lifecycle.close();
+                break;
+            }
+            Err(ConnectionIoError::Closed) => {
                 debug!(conn_id, "client disconnected");
+                lifecycle.close();
+                break;
+            }
+            Err(ConnectionIoError::Write(_)) => {
+                lifecycle.close();
                 break;
             }
         };
 
         if payload.is_empty() {
+            lifecycle.close();
             break;
         }
 
@@ -277,11 +348,13 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
 
         let cmd = payload[0];
         let body = &payload[1..];
+        lifecycle.enter(ConnectionPhase::Executing);
 
         match cmd {
             // COM_QUIT
             0x01 => {
                 debug!(conn_id, "COM_QUIT");
+                lifecycle.close();
                 break;
             }
 
@@ -292,16 +365,29 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     Err(_) => {
                         let err =
                             build_err_packet(1064, b"42000", "Invalid charset in database name");
-                        let _ = writer.send((1u8, err.as_slice())).await;
+                        let _ = send_execute_packet(
+                            &mut writer,
+                            &lifecycle,
+                            &conn_state,
+                            1u8,
+                            err.as_slice(),
+                        )
+                        .await;
+                        lifecycle.enter(ConnectionPhase::Idle);
                         continue;
                     }
                 };
                 debug!(conn_id, db = %db_name, "COM_INIT_DB");
                 conn_state.current_database = db_name;
                 let ok = build_ok_packet(0, 0, 0);
-                if writer.send((1u8, ok.as_slice())).await.is_err() {
+                if send_execute_packet(&mut writer, &lifecycle, &conn_state, 1u8, ok.as_slice())
+                    .await
+                    .is_err()
+                {
+                    lifecycle.close();
                     break;
                 }
+                lifecycle.enter(ConnectionPhase::Idle);
             }
 
             // COM_QUERY
@@ -314,7 +400,15 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                             b"42000",
                             "Query is not valid in connection charset",
                         );
-                        let _ = writer.send((1u8, err.as_slice())).await;
+                        let _ = send_execute_packet(
+                            &mut writer,
+                            &lifecycle,
+                            &conn_state,
+                            1u8,
+                            err.as_slice(),
+                        )
+                        .await;
+                        lifecycle.enter(ConnectionPhase::Idle);
                         continue;
                     }
                 };
@@ -348,10 +442,15 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                         let class = SqlCommandClass::from_sql(sql);
                         bump_statement_counters(&status, &mut conn_state.session_status, class);
                         let nbytes = wire_size(&packets);
-                        if send_packets(&mut writer, &packets).await.is_err() {
+                        if send_packet_batch(&mut writer, &lifecycle, &conn_state, &packets)
+                            .await
+                            .is_err()
+                        {
+                            lifecycle.close();
                             break;
                         }
                         bump_bytes_sent(nbytes, &status, &mut conn_state.session_status);
+                        lifecycle.enter(ConnectionPhase::Idle);
                         continue;
                     }
                     Ok(None) => {} // fall through to engine
@@ -359,10 +458,21 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                         // Validation error (e.g., invalid SET max_allowed_packet value).
                         let pkt = build_query_err_packet(&e, sql, &conn_state);
                         let err_bytes = pkt.len() as u64 + 4;
-                        if writer.send((1u8, pkt.as_slice())).await.is_err() {
+                        if send_execute_packet(
+                            &mut writer,
+                            &lifecycle,
+                            &conn_state,
+                            1u8,
+                            pkt.as_slice(),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            lifecycle.close();
                             break;
                         }
                         bump_bytes_sent(err_bytes, &status, &mut conn_state.session_status);
+                        lifecycle.enter(ConnectionPhase::Idle);
                         continue;
                     }
                 }
@@ -401,7 +511,10 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                             );
                             bump_statement_counters(&status, &mut conn_state.session_status, class);
                             let nbytes = wire_size(&packets);
-                            if send_packets(&mut writer, &packets).await.is_err() {
+                            if send_packet_batch(&mut writer, &lifecycle, &conn_state, &packets)
+                                .await
+                                .is_err()
+                            {
                                 connection_broken = true;
                                 break 'stmts;
                             }
@@ -418,7 +531,16 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                         Err(e) => {
                             let pkt = build_query_err_packet(&e, stmt_sql, &conn_state);
                             let err_bytes = pkt.len() as u64 + 4;
-                            if writer.send((seq, pkt.as_slice())).await.is_err() {
+                            if send_execute_packet(
+                                &mut writer,
+                                &lifecycle,
+                                &conn_state,
+                                seq,
+                                pkt.as_slice(),
+                            )
+                            .await
+                            .is_err()
+                            {
                                 connection_broken = true;
                             } else {
                                 bump_bytes_sent(err_bytes, &status, &mut conn_state.session_status);
@@ -441,7 +563,16 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                                 debug!(conn_id, code = me.code, msg = %me.message, "commit error");
                                 let pkt = build_query_err_packet(&e, stmt_sql, &conn_state);
                                 let err_bytes = pkt.len() as u64 + 4;
-                                if writer.send((seq, pkt.as_slice())).await.is_err() {
+                                if send_execute_packet(
+                                    &mut writer,
+                                    &lifecycle,
+                                    &conn_state,
+                                    seq,
+                                    pkt.as_slice(),
+                                )
+                                .await
+                                .is_err()
+                                {
                                     connection_broken = true;
                                 } else {
                                     bump_bytes_sent(
@@ -463,7 +594,16 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                                 Err(e) => {
                                     let pkt = build_query_err_packet(&e, stmt_sql, &conn_state);
                                     let err_bytes = pkt.len() as u64 + 4;
-                                    if writer.send((seq, pkt.as_slice())).await.is_ok() {
+                                    if send_execute_packet(
+                                        &mut writer,
+                                        &lifecycle,
+                                        &conn_state,
+                                        seq,
+                                        pkt.as_slice(),
+                                    )
+                                    .await
+                                    .is_ok()
+                                    {
                                         bump_bytes_sent(
                                             err_bytes,
                                             &status,
@@ -478,7 +618,10 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                                 .map(|(s, _)| s.wrapping_add(1))
                                 .unwrap_or(seq);
                             let nbytes = wire_size(&packets);
-                            if send_packets(&mut writer, &packets).await.is_err() {
+                            if send_packet_batch(&mut writer, &lifecycle, &conn_state, &packets)
+                                .await
+                                .is_err()
+                            {
                                 connection_broken = true;
                                 break 'stmts;
                             }
@@ -489,7 +632,16 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                             debug!(conn_id, code = me.code, msg = %me.message, "query error");
                             let pkt = build_query_err_packet(&e, stmt_sql, &conn_state);
                             let err_bytes = pkt.len() as u64 + 4;
-                            if writer.send((seq, pkt.as_slice())).await.is_err() {
+                            if send_execute_packet(
+                                &mut writer,
+                                &lifecycle,
+                                &conn_state,
+                                seq,
+                                pkt.as_slice(),
+                            )
+                            .await
+                            .is_err()
+                            {
                                 connection_broken = true;
                             } else {
                                 bump_bytes_sent(err_bytes, &status, &mut conn_state.session_status);
@@ -501,16 +653,23 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                 // RunningGuard dropped here — threads_running decremented.
 
                 if connection_broken {
+                    lifecycle.close();
                     break;
                 }
+                lifecycle.enter(ConnectionPhase::Idle);
             }
 
             // COM_PING
             0x0e => {
                 let ok = build_ok_packet(0, 0, 0);
-                if writer.send((1u8, ok.as_slice())).await.is_err() {
+                if send_execute_packet(&mut writer, &lifecycle, &conn_state, 1u8, ok.as_slice())
+                    .await
+                    .is_err()
+                {
+                    lifecycle.close();
                     break;
                 }
+                lifecycle.enter(ConnectionPhase::Idle);
             }
 
             // COM_RESET_CONNECTION
@@ -522,9 +681,14 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     .decoder_mut()
                     .set_max_payload_len(ConnectionState::DEFAULT_MAX_ALLOWED_PACKET);
                 let ok = build_ok_packet(0, 0, 0);
-                if writer.send((1u8, ok.as_slice())).await.is_err() {
+                if send_execute_packet(&mut writer, &lifecycle, &conn_state, 1u8, ok.as_slice())
+                    .await
+                    .is_err()
+                {
+                    lifecycle.close();
                     break;
                 }
+                lifecycle.enter(ConnectionPhase::Idle);
             }
 
             // COM_STMT_PREPARE — parse+analyze once and cache the result.
@@ -533,7 +697,15 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     Ok(s) => s.trim().to_string(),
                     Err(_) => {
                         let e = build_err_packet(1064, b"42000", "Invalid charset in prepare");
-                        let _ = writer.send((1u8, e.as_slice())).await;
+                        let _ = send_execute_packet(
+                            &mut writer,
+                            &lifecycle,
+                            &conn_state,
+                            1u8,
+                            e.as_slice(),
+                        )
+                        .await;
+                        lifecycle.enter(ConnectionPhase::Idle);
                         continue;
                     }
                 };
@@ -573,16 +745,29 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     1,
                     conn_state.results_collation(),
                 );
-                if send_packets(&mut writer, &packets).await.is_err() {
+                if send_packet_batch(&mut writer, &lifecycle, &conn_state, &packets)
+                    .await
+                    .is_err()
+                {
+                    lifecycle.close();
                     break;
                 }
+                lifecycle.enter(ConnectionPhase::Idle);
             }
 
             // COM_STMT_EXECUTE — use cached plan, skip parse+analyze.
             0x17 => {
                 if body.len() < 4 {
                     let e = build_err_packet(1105, b"HY000", "Malformed COM_STMT_EXECUTE");
-                    let _ = writer.send((1u8, e.as_slice())).await;
+                    let _ = send_execute_packet(
+                        &mut writer,
+                        &lifecycle,
+                        &conn_state,
+                        1u8,
+                        e.as_slice(),
+                    )
+                    .await;
+                    lifecycle.enter(ConnectionPhase::Idle);
                     continue;
                 }
                 let stmt_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
@@ -697,9 +882,19 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                             let me = dberror_to_mysql(&e, None);
                             let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
                             let err_bytes = pkt.len() as u64 + 4;
-                            if writer.send((1u8, pkt.as_slice())).await.is_ok() {
+                            if send_execute_packet(
+                                &mut writer,
+                                &lifecycle,
+                                &conn_state,
+                                1u8,
+                                pkt.as_slice(),
+                            )
+                            .await
+                            .is_ok()
+                            {
                                 bump_bytes_sent(err_bytes, &status, &mut conn_state.session_status);
                             }
+                            lifecycle.enter(ConnectionPhase::Idle);
                             continue;
                         }
                         let packets = match serialize_query_result_binary(
@@ -712,18 +907,32 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                                 let me = dberror_to_mysql(&e, None);
                                 let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
                                 let err_bytes = pkt.len() as u64 + 4;
-                                if writer.send((1u8, pkt.as_slice())).await.is_ok() {
+                                if send_execute_packet(
+                                    &mut writer,
+                                    &lifecycle,
+                                    &conn_state,
+                                    1u8,
+                                    pkt.as_slice(),
+                                )
+                                .await
+                                .is_ok()
+                                {
                                     bump_bytes_sent(
                                         err_bytes,
                                         &status,
                                         &mut conn_state.session_status,
                                     );
                                 }
+                                lifecycle.enter(ConnectionPhase::Idle);
                                 continue;
                             }
                         };
                         let nbytes = wire_size(&packets);
-                        if send_packets(&mut writer, &packets).await.is_err() {
+                        if send_packet_batch(&mut writer, &lifecycle, &conn_state, &packets)
+                            .await
+                            .is_err()
+                        {
+                            lifecycle.close();
                             break;
                         }
                         bump_bytes_sent(nbytes, &status, &mut conn_state.session_status);
@@ -741,12 +950,22 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                         };
                         let pkt = build_err_packet(me.code, &me.sql_state, &me.message);
                         let err_bytes = pkt.len() as u64 + 4;
-                        if writer.send((1u8, pkt.as_slice())).await.is_ok() {
+                        if send_execute_packet(
+                            &mut writer,
+                            &lifecycle,
+                            &conn_state,
+                            1u8,
+                            pkt.as_slice(),
+                        )
+                        .await
+                        .is_ok()
+                        {
                             bump_bytes_sent(err_bytes, &status, &mut conn_state.session_status);
                         }
                     }
                 }
                 // RunningGuard dropped here.
+                lifecycle.enter(ConnectionPhase::Idle);
             }
 
             // COM_STMT_SEND_LONG_DATA — no response, no engine lock
@@ -759,6 +978,7 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
 
                 if body.len() < 6 {
                     // Malformed: ignore silently per MySQL wire contract
+                    lifecycle.enter(ConnectionPhase::Idle);
                     continue;
                 }
                 let stmt_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
@@ -772,6 +992,7 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     stmt.append_long_data(param_idx, chunk, limit);
                 }
                 // Unknown stmt_id: ignore silently (no response either way)
+                lifecycle.enter(ConnectionPhase::Idle);
                 continue; // never send an OK packet for this command
             }
 
@@ -783,36 +1004,65 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
                     debug!(conn_id, stmt_id, "COM_STMT_CLOSE");
                 }
                 // No response for COM_STMT_CLOSE
+                lifecycle.enter(ConnectionPhase::Idle);
             }
 
             // COM_STMT_RESET — clears pending long-data for the addressed statement
             0x1a => {
                 if body.len() < 4 {
                     let err = build_err_packet(1105, b"HY000", "Malformed COM_STMT_RESET");
-                    let _ = writer.send((1u8, err.as_slice())).await;
+                    let _ = send_execute_packet(
+                        &mut writer,
+                        &lifecycle,
+                        &conn_state,
+                        1u8,
+                        err.as_slice(),
+                    )
+                    .await;
+                    lifecycle.enter(ConnectionPhase::Idle);
                     continue;
                 }
                 let stmt_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
                 if let Some(stmt) = conn_state.prepared_statements.get_mut(&stmt_id) {
                     stmt.clear_long_data_state();
                     let ok = build_ok_packet(0, 0, 0);
-                    let _ = writer.send((1u8, ok.as_slice())).await;
+                    let _ = send_execute_packet(
+                        &mut writer,
+                        &lifecycle,
+                        &conn_state,
+                        1u8,
+                        ok.as_slice(),
+                    )
+                    .await;
                 } else {
                     let err = build_err_packet(
                         1243,
                         b"HY000",
                         &format!("Unknown prepared statement handler: stmt_id={stmt_id}"),
                     );
-                    let _ = writer.send((1u8, err.as_slice())).await;
+                    let _ = send_execute_packet(
+                        &mut writer,
+                        &lifecycle,
+                        &conn_state,
+                        1u8,
+                        err.as_slice(),
+                    )
+                    .await;
                 }
+                lifecycle.enter(ConnectionPhase::Idle);
             }
 
             other => {
                 warn!(conn_id, cmd = other, "unknown command");
                 let err = build_err_packet(1047, b"HY000", "Unknown command");
-                if writer.send((1u8, err.as_slice())).await.is_err() {
+                if send_execute_packet(&mut writer, &lifecycle, &conn_state, 1u8, err.as_slice())
+                    .await
+                    .is_err()
+                {
+                    lifecycle.close();
                     break;
                 }
+                lifecycle.enter(ConnectionPhase::Idle);
             }
         }
     }
@@ -1207,38 +1457,6 @@ fn extract_result_columns(stmt: &Stmt) -> Vec<ColumnMeta> {
             .collect(),
         _ => vec![],
     }
-}
-
-// ── Batched packet sending ────────────────────────────────────────────────────
-
-// ── Batched packet sending ────────────────────────────────────────────────────
-
-/// Sends multiple MySQL packets in a single TCP write.
-///
-/// Encodes all packets into one `Vec<u8>` buffer and calls `write_all` once.
-/// This is critical for multi-packet responses (result sets): sending 5
-/// packets individually causes 5 TCP writes with round-trip overhead each,
-/// turning a ~0.04ms response into ~17ms. One write → all packets arrive
-/// together → single syscall → one kernel context switch.
-async fn send_packets(
-    writer: &mut tokio_util::codec::FramedWrite<
-        tokio::net::tcp::OwnedWriteHalf,
-        super::codec::MySqlCodec,
-    >,
-    packets: &[(u8, Vec<u8>)],
-) -> std::io::Result<()> {
-    use futures::SinkExt;
-    // Use feed() for all but the last packet (no flush), send() for the last
-    // (which flushes once). This sends all packets in one TCP write.
-    let n = packets.len();
-    for (i, (seq, pkt)) in packets.iter().enumerate() {
-        if i + 1 < n {
-            writer.feed((*seq, pkt.as_slice())).await?;
-        } else {
-            writer.send((*seq, pkt.as_slice())).await?;
-        }
-    }
-    Ok(())
 }
 
 // ── Status counter helpers ─────────────────────────────────────────────────────

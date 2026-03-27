@@ -788,8 +788,8 @@ Every DML handler in the `execute_with_ctx` path updates the registry:
 | Handler | Bloom action |
 |---------|-------------|
 | `execute_insert_ctx` | `bloom.add(index_id, &key)` after each B-Tree insert |
-| `execute_update_ctx` | `mark_dirty()` for delete side; `add()` for insert side |
-| `execute_delete_ctx` | `mark_dirty(index_id)` per deleted row |
+| `execute_update_ctx` | `mark_dirty()` for delete side (batch); `add()` for insert side |
+| `execute_delete_ctx` | `mark_dirty(index_id)` once per index batch (5.19) |
 | `execute_create_index` | `create(index_id, n)` then `add()` for every existing key |
 | `execute_drop_index` | `remove(index_id)` |
 
@@ -1233,21 +1233,42 @@ The fix: call `ctx.invalidate_all()` whenever any index root changes during
 INSERT or DELETE index maintenance. This forces re-resolution from the catalog
 (which always has the current `root_page_id`) on the next DML statement.
 
-The same fix applies to `execute_delete_ctx` (DELETE WHERE path): the
-`secondary_indexes` slice must be kept in sync within the per-row loop so
-that each subsequent row's deletion starts from the current root, not the
-stale freed one. Without this, a root collapse on row N causes row N+1 to
-start from a freed page, triggering a double-free in the B+tree freelist.
+Since `5.19`, DELETE and the old-key half of UPDATE no longer mutate indexes in
+a per-row loop. They collect exact encoded keys per index, sort them, and call
+`delete_many_in(...)` once per affected tree. The cache-invalidation rule still
+matters, but the synchronization point moved:
 
-```
-// After each updated root in execute_insert_ctx / execute_delete:
-catalog.update_index_root(index_id, new_root)
-secondary_indexes[i].root_page_id = new_root   // sync in-memory slice
-ctx.invalidate_all()                            // drop cached IndexDefs
+1. batch-delete old keys per index
+2. persist the final root once for that index
+3. update the in-memory `current_indexes` slice
+4. invalidate the session cache once after the statement
+
+For UPDATE there is a second root-sync point: after the batch delete phase, the
+reinsertion half must start from the post-delete root, not from the stale root
+captured before the batch. Otherwise reinserting new keys after a root collapse
+would descend from a freed page.
+
+```rust
+// DELETE / UPDATE old-key batch
+let updated = delete_many_from_indexes(...)?;
+for (index_id, new_root) in updated {
+    catalog.update_index_root(index_id, new_root)?;
+    current_indexes[i].root_page_id = new_root;
+}
+
+// UPDATE new-key insert phase
+let ins_updated = insert_into_indexes(&current_indexes, ...)?;
 ```
 
-This only fires O(log N) times per batch (once per root split), so the
-performance impact is limited to a single catalog re-read per split event.
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Borrowed Bulk-Delete Principle</span>
+`5.19` follows the same high-level rule used by PostgreSQL's nbtree VACUUM path and
+InnoDB bulk helpers: when many exact keys from one index are already known, delete them
+page-locally in one ordered pass instead of re-entering the point-delete path N times.
+</div>
+</div>
 
 ---
 

@@ -65,3 +65,15 @@
 - The goal of the first split is file-level responsibility and reviewability, not perfect visibility boundaries on day one.
 - Keep the public facade stable first (`mod.rs` with the old exported functions), then tighten internal visibility in later cleanup if needed.
 - This avoids mixing a readability refactor with accidental behavior changes.
+
+## 2026-03-26 - Separate transport lifecycle from SQL session state
+
+- Connection timeout policy, keepalive, and transport phase transitions should not live inside the SQL session object.
+- Keep a dedicated runtime/lifecycle struct for wire-level state and let the session object stay focused on SQL variables, prepared statements, warnings, and counters.
+- `COM_RESET_CONNECTION` is a good boundary test: it should reset session state without erasing transport metadata that came from the handshake.
+
+## 2026-03-26 - DML performance needs two separate diagnoses
+
+- A slow `DELETE` or `UPDATE` can bottleneck in candidate discovery or in index maintenance; do not treat them as one problem by default.
+- `6.3b` fixed candidate discovery for `DELETE ... WHERE`; `5.19` only became obvious after re-measuring and isolating the remaining per-row `delete_in(...)` loop.
+- For DML optimizations, keep one test layer for planner/executor semantics and another for direct tree/storage primitives. One without the other leaves too much room for false confidence.

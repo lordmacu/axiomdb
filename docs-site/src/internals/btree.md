@@ -17,6 +17,7 @@ keeping structural operations (splits, merges, rotations) on the safe allocate-n
 | Delete, leaf stays ≥ MIN_KEYS_LEAF | In-place: same leaf page ID | 0 alloc / 0 free |
 | Delete, parent pointer unchanged after child delete | Skip parent rewrite entirely | 0 alloc / 0 free for the parent |
 | Delete, leaf underflows → rebalance | Structural: alloc new leaf | 1 alloc / 1 free |
+| Batch delete, sorted exact keys | Page-local merge delete + one parent normalization pass | 0 alloc / 0 free on non-underfull pages; structural only where underflow happens |
 
 This is the Phase 5 model for a serialized single writer (`&mut self`). Phase 7 will
 reintroduce the full Copy-on-Write path to reconcile with lock-free readers and epoch
@@ -31,6 +32,42 @@ and freed the old one. Phase 5.17 introduces in-place writes for non-structural 
 because the Phase 5 runtime is single-writer (<code>&mut self</code> on all mutations).
 Lock-free readers and epoch-based reclamation (Phase 7) will determine how much of the
 in-place model can be retained under concurrent read traffic.
+</div>
+</div>
+
+### Batch delete (`delete_many_in`) — sorted single-pass
+
+Phase `5.19` adds a second delete mode to the tree:
+
+```rust
+BTree::delete_many_in(storage, &root_pid, &sorted_keys)
+```
+
+The contract is deliberately narrow:
+
+- the caller already knows the exact encoded keys to delete
+- keys are already sorted ascending
+- the tree does no predicate evaluation and no SQL-layer reasoning
+
+The algorithm is page-local and ordered:
+
+1. **Leaf pages:** merge the leaf's sorted key array with the sorted delete
+   slice and write one compacted survivor image.
+2. **Internal pages:** partition the delete slice by child range, recurse once
+   per affected child, then normalize the parent once.
+3. **Root collapse:** run once at the very end of the batch.
+
+This avoids the old `N × delete_in(...)` pattern where every key started from
+the root and independently decided whether to rewrite or rebalance the same
+pages.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Ordered Bulk Path</span>
+The exact-key batch path borrows from PostgreSQL's nbtree bulk-deletion mindset and
+InnoDB's bulk helpers: once the caller has the full sorted delete set, one ordered walk
+through the touched pages is safer and cheaper than reusing the point-delete API in a loop.
 </div>
 </div>
 
@@ -394,6 +431,10 @@ BTree::insert_in(storage: &mut dyn StorageEngine, root_pid: &AtomicU64, key: &[u
 BTree::delete_in(storage: &mut dyn StorageEngine, root_pid: &AtomicU64, key: &[u8])
     -> Result<bool, DbError>
 
+// Batch delete — removes many pre-sorted keys in one left-to-right pass (5.19)
+BTree::delete_many_in(storage: &mut dyn StorageEngine, root_pid: &AtomicU64, keys: &[Vec<u8>])
+    -> Result<(), DbError>
+
 // Range scan — collects all (RecordId, key_bytes) in [lo, hi] into a Vec
 BTree::range_in(storage: &dyn StorageEngine, root_pid: u64, lo: Option<&[u8]>, hi: Option<&[u8]>)
     -> Result<Vec<(RecordId, Vec<u8>)>, DbError>
@@ -402,6 +443,48 @@ BTree::range_in(storage: &dyn StorageEngine, root_pid: u64, lo: Option<&[u8]>, h
 These delegate to the same private helpers as the owned API. The `insert_in` and
 `delete_in` variants use `AtomicU64::store(Release)` instead of `compare_exchange`
 (safe in Phase 6 — single writer).
+
+### Batch delete primitive (`delete_many_in`) — subphase 5.19
+
+`delete_many_in` accepts a slice of pre-sorted encoded keys and removes all of them
+from one index in a single left-to-right tree traversal. The caller is responsible
+for sorting keys ascending before the call; the primitive enforces this as a
+precondition.
+
+**Algorithm:**
+
+1. `batch_delete_subtree(root)` — dispatches on node type.
+2. **Leaf node**: binary-search the sorted keys against the leaf's key array.
+   Remove all matching slots in one pass, compact in-place, write the page once.
+   If the leaf becomes underfull, signal the parent for merge/redistribute.
+3. **Internal node**: binary-partition the key slice by separator keys so each
+   child subtree receives only the keys that fall within its range.
+   Recurse into each child that has at least one key to remove.
+   After all children return, rewrite the internal node once if any child pid
+   or separator changed; skip the rewrite otherwise.
+4. After the recursive pass, `root_pid` is updated atomically once via
+   `AtomicU64::store(Release)`.
+
+**Invariants preserved:**
+- Tree height stays balanced (leaf depth is uniform after the pass).
+- In-place fast path from 5.17 is reused: leaf and internal rewrites skip
+  page alloc/free when the node fits in the same page.
+- Root is persisted exactly once per `delete_many_in` call regardless of how
+  many keys were removed.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage</span>
+A `DELETE WHERE` touching N rows previously called `BTree::delete_in` N times,
+descending from the root on each call — O(N log N) page reads and writes total.
+`delete_many_in` descends the tree once, partitioning the sorted key set at each
+internal node, yielding O(N + H·B) work where H is tree height and B is the
+branching factor. At 5,000 rows this eliminates 5,000 separate root descents per
+index. InnoDB defers this cost via its change buffer; AxiomDB eliminates it
+upfront with a single sorted pass — no background merge worker required.
+</div>
+</div>
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>

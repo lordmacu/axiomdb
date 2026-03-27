@@ -13,6 +13,7 @@ use axiomdb_network::mysql::{
     packets::{
         build_auth_more_data, build_eof_packet, build_err_packet, build_ok_packet,
         build_server_greeting, parse_handshake_response, write_lenenc_int, write_lenenc_str,
+        CLIENT_INTERACTIVE, CLIENT_PLUGIN_AUTH,
     },
     result::serialize_query_result,
     session::ConnectionState,
@@ -135,6 +136,22 @@ fn test_parse_handshake_response_minimal() {
     assert_eq!(response.auth_response, Vec::<u8>::new());
 }
 
+#[test]
+fn test_parse_handshake_response_preserves_interactive_capability() {
+    let mut payload = Vec::new();
+    let caps: u32 = 0x0000_0200 | 0x0000_8000 | CLIENT_INTERACTIVE | CLIENT_PLUGIN_AUTH;
+    payload.extend_from_slice(&caps.to_le_bytes());
+    payload.extend_from_slice(&[0u8; 4]);
+    payload.push(255u8);
+    payload.extend_from_slice(&[0u8; 23]);
+    payload.extend_from_slice(b"root\0");
+    payload.push(0u8);
+    payload.extend_from_slice(b"caching_sha2_password\0");
+
+    let response = parse_handshake_response(&payload).unwrap();
+    assert_ne!(response.capability_flags & CLIENT_INTERACTIVE, 0);
+}
+
 // ── OK / ERR / EOF packet tests ───────────────────────────────────────────────
 
 #[test]
@@ -179,6 +196,33 @@ fn test_auth_more_data_packet() {
     let pkt = build_auth_more_data(0x03);
     assert_eq!(pkt[0], 0x01, "AUTH_MORE_DATA marker");
     assert_eq!(pkt[1], 0x03, "fast_auth_success");
+}
+
+#[test]
+fn test_apply_set_validates_timeout_session_variables() {
+    for name in [
+        "wait_timeout",
+        "interactive_timeout",
+        "net_read_timeout",
+        "net_write_timeout",
+    ] {
+        let mut conn = ConnectionState::new();
+        let err = conn
+            .apply_set(&format!("SET {name} = 0"))
+            .expect_err("timeout variable must reject zero");
+        assert!(
+            err.to_string().contains("positive integer"),
+            "unexpected error for {name}: {err}"
+        );
+
+        conn.apply_set(&format!("SET {name} = '7'"))
+            .expect("quoted timeout value should be accepted");
+        assert_eq!(
+            conn.get_variable(name).as_deref(),
+            Some("7"),
+            "{name} must be normalized back into the variables map"
+        );
+    }
 }
 
 // ── lenenc_int boundary tests ─────────────────────────────────────────────────

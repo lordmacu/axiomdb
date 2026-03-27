@@ -3,10 +3,11 @@
 //! Cover end-to-end correctness, crash recovery with MmapStorage, and concurrency.
 
 use std::ops::Bound;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axiomdb_core::RecordId;
-use axiomdb_index::BTree;
-use axiomdb_storage::{MemoryStorage, MmapStorage, StorageEngine};
+use axiomdb_index::{page_layout::NULL_PAGE, BTree};
+use axiomdb_storage::{MemoryStorage, MmapStorage, Page, PageType, StorageEngine};
 
 fn rid(n: u64) -> RecordId {
     RecordId {
@@ -24,6 +25,27 @@ fn build_memory_tree(count: usize) -> BTree {
         tree.insert(key.as_bytes(), rid(i as u64)).unwrap();
     }
     tree
+}
+
+fn init_raw_root(storage: &mut dyn StorageEngine) -> AtomicU64 {
+    let pid = storage.alloc_page(PageType::Index).unwrap();
+    let mut page = Page::new(PageType::Index, pid);
+    let leaf = axiomdb_index::page_layout::cast_leaf_mut(&mut page);
+    leaf.is_leaf = 1;
+    leaf.set_num_keys(0);
+    leaf.set_next_leaf(NULL_PAGE);
+    page.update_checksum();
+    storage.write_page(pid, &page).unwrap();
+    AtomicU64::new(pid)
+}
+
+fn build_raw_tree(storage: &mut dyn StorageEngine, count: usize) -> AtomicU64 {
+    let root_pid = init_raw_root(storage);
+    for i in 0..count {
+        let key = format!("{:016}", i);
+        BTree::insert_in(storage, &root_pid, key.as_bytes(), rid(i as u64), 90).unwrap();
+    }
+    root_pid
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -520,4 +542,97 @@ fn test_mixed_insert_delete_large_workload() {
         .unwrap()
         .count();
     assert_eq!(count, n / 2);
+}
+
+// ── Batch delete tests (Phase 5.19) ──────────────────────────────────────────
+
+#[test]
+fn test_delete_many_in_single_leaf_no_alloc_free() {
+    let allocs = Arc::new(AtomicUsize::new(0));
+    let frees = Arc::new(AtomicUsize::new(0));
+    let mut storage = CountingStorage {
+        inner: MemoryStorage::new(),
+        allocs: allocs.clone(),
+        frees: frees.clone(),
+    };
+    let root_pid = build_raw_tree(&mut storage, 150);
+
+    allocs.store(0, AOrdering::Relaxed);
+    frees.store(0, AOrdering::Relaxed);
+
+    let keys: Vec<Vec<u8>> = [10usize, 20, 30, 40, 50]
+        .into_iter()
+        .map(|i| format!("{:016}", i).into_bytes())
+        .collect();
+    let deleted = BTree::delete_many_in(&mut storage, &root_pid, &keys).unwrap();
+    assert_eq!(deleted, 5);
+    assert_eq!(allocs.load(AOrdering::Relaxed), 0);
+    assert_eq!(frees.load(AOrdering::Relaxed), 0);
+
+    for i in [10usize, 20, 30, 40, 50] {
+        assert_eq!(
+            BTree::lookup_in(
+                &storage,
+                root_pid.load(Ordering::Acquire),
+                format!("{:016}", i).as_bytes()
+            )
+            .unwrap(),
+            None,
+            "deleted key {i} should be absent",
+        );
+    }
+    for i in [0usize, 1, 2, 149] {
+        assert_eq!(
+            BTree::lookup_in(
+                &storage,
+                root_pid.load(Ordering::Acquire),
+                format!("{:016}", i).as_bytes()
+            )
+            .unwrap(),
+            Some(rid(i as u64)),
+            "surviving key {i} should still be present",
+        );
+    }
+}
+
+#[test]
+fn test_delete_many_in_cross_leaf_preserves_sorted_survivors() {
+    let mut storage = MemoryStorage::new();
+    let root_pid = build_raw_tree(&mut storage, 400);
+
+    let keys: Vec<Vec<u8>> = (90usize..=310)
+        .map(|i| format!("{:016}", i).into_bytes())
+        .collect();
+    let deleted = BTree::delete_many_in(&mut storage, &root_pid, &keys).unwrap();
+    assert_eq!(deleted, 221);
+
+    let rows = BTree::range_in(&storage, root_pid.load(Ordering::Acquire), None, None).unwrap();
+    let ids: Vec<u64> = rows.into_iter().map(|(rid, _)| rid.page_id).collect();
+
+    let expected: Vec<u64> = (0u64..90).chain(311u64..400).collect();
+    assert_eq!(ids, expected);
+}
+
+#[test]
+fn test_delete_many_in_can_collapse_root_to_leaf() {
+    let mut storage = MemoryStorage::new();
+    let root_pid = build_raw_tree(&mut storage, 260);
+
+    let keys: Vec<Vec<u8>> = (10usize..260)
+        .map(|i| format!("{:016}", i).into_bytes())
+        .collect();
+    let deleted = BTree::delete_many_in(&mut storage, &root_pid, &keys).unwrap();
+    assert_eq!(deleted, 250);
+
+    let final_root = root_pid.load(Ordering::Acquire);
+    let root_page = storage.read_page(final_root).unwrap();
+    assert_eq!(
+        root_page.body()[0],
+        1,
+        "root should collapse back to a leaf"
+    );
+
+    let rows = BTree::range_in(&storage, final_root, None, None).unwrap();
+    let ids: Vec<u64> = rows.into_iter().map(|(rid, _)| rid.page_id).collect();
+    assert_eq!(ids, (0u64..10).collect::<Vec<_>>());
 }
