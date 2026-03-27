@@ -218,6 +218,40 @@ consistency within the same process.
   is WAL transaction overhead per statement (BEGIN/COMMIT I/O); this will be addressed
   by Phase 6 indexed reads (eliminating full-table scans) and the Phase 8 batch API.
 - **INSERT 58 q/s:** one `fdatasync` per autocommit statement is required for durability.
+
+## Phase 5.21 — Transactional INSERT staging
+
+Measured with `python3 benches/comparison/local_bench.py --scenario insert --rows 50000 --table`
+against a release AxiomDB server and local MariaDB/MySQL instances on the same
+machine. Workload: **50,000 separate one-row INSERT statements inside one
+explicit transaction**.
+
+| Benchmark | MariaDB 12.1 | MySQL 8.0 | AxiomDB | Notes |
+|---|---|---|---|---|
+| `insert` (single-row INSERTs in 1 txn) | 28.0K rows/s | 26.7K rows/s | **23.9K rows/s** | one `BEGIN`, 50K INSERT statements, one `COMMIT` |
+
+What changed in `5.21`:
+
+- the session now buffers consecutive eligible `INSERT ... VALUES` rows for the
+  same table instead of writing heap/WAL immediately
+- barriers such as `SELECT`, `UPDATE`, `DELETE`, DDL, `COMMIT`, table switch,
+  or ineligible INSERT shapes force a flush
+- the flush uses `insert_rows_batch_with_ctx(...)` plus grouped post-heap index
+  maintenance, persisting each changed index root once per flush
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Borrowed Technique</span>
+AxiomDB borrows the “produce rows first, write them later” pattern from PostgreSQL
+<code>heap_multi_insert()</code> and DuckDB's appender, but keeps SQL semantics intact by
+flushing before the next statement savepoint whenever the batch cannot continue.
+</div>
+</div>
+
+This is deliberately **not** the same as autocommit group commit. The benchmark
+already uses one explicit transaction, so `5.21` attacks per-statement heap/WAL/index
+work rather than fsync batching across multiple commits.
   At ~10–20 ms/fsync on NVMe this caps single-connection autocommit INSERT at ~50–100 q/s,
   consistent with the observed 58 q/s. The Phase 8 batch API will coalesce multiple inserts
   into one WAL append + one fsync, targeting the 180K ops/s budget.

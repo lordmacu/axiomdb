@@ -79,6 +79,142 @@ fn execute_insert_ctx(
         crate::partial_index::compile_index_predicates(&secondary_indexes, schema_cols)?;
 
     match stmt.source {
+        // ── INSERT ... VALUES — staging path (explicit transaction) ───────────
+        InsertSource::Values(rows) if ctx.in_explicit_txn => {
+            // If there is already a staged batch for a different table, flush it first.
+            let needs_flush = ctx
+                .pending_inserts
+                .as_ref()
+                .map(|b| b.table_id != resolved.def.id)
+                .unwrap_or(false);
+            if needs_flush {
+                flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
+            }
+
+            // Initialise the batch if this is the first INSERT for this table.
+            if ctx.pending_inserts.is_none() {
+                ctx.pending_inserts = Some(crate::session::PendingInsertBatch {
+                    table_id: resolved.def.id,
+                    table_def: resolved.def.clone(),
+                    columns: resolved.columns.clone(),
+                    indexes: secondary_indexes.clone(),
+                    compiled_preds: compiled_preds.clone(),
+                    rows: Vec::new(),
+                    unique_seen: std::collections::HashMap::new(),
+                });
+            }
+
+            for value_exprs in rows {
+                let provided: Vec<Value> = value_exprs
+                    .iter()
+                    .map(|e| eval(e, &[]))
+                    .collect::<Result<_, _>>()?;
+
+                let mut full_values: Vec<Value> = col_positions
+                    .iter()
+                    .map(|&idx| {
+                        if idx == usize::MAX {
+                            Value::Null
+                        } else {
+                            provided.get(idx).cloned().unwrap_or(Value::Null)
+                        }
+                    })
+                    .collect();
+
+                // Assign AUTO_INCREMENT now (before staging).
+                if let Some(ai_col) = auto_inc_col {
+                    if matches!(full_values.get(ai_col), Some(Value::Null)) {
+                        let id =
+                            next_auto_inc_ctx(storage, txn, &resolved.def, schema_cols, ai_col)?;
+                        full_values[ai_col] = match schema_cols[ai_col].col_type {
+                            axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
+                            _ => Value::Int(id as i32),
+                        };
+                        if first_generated.is_none() {
+                            first_generated = Some(id);
+                        }
+                    }
+                }
+
+                // CHECK constraints evaluated at enqueue time.
+                check_row_constraints(
+                    &resolved.constraints,
+                    &full_values,
+                    &resolved.def.table_name,
+                )?;
+
+                // FK child validation at enqueue time.
+                if !resolved.foreign_keys.is_empty() {
+                    crate::fk_enforcement::check_fk_child_insert(
+                        &full_values,
+                        &resolved.foreign_keys,
+                        storage,
+                        txn,
+                        bloom,
+                    )?;
+                }
+
+                // UNIQUE / PK precheck against committed indexes and in-buffer keys.
+                // Detects duplicates before any heap mutation so errors surface immediately.
+                {
+                    let batch = ctx.pending_inserts.as_mut().expect("batch initialised above");
+                    for idx in batch.indexes.iter() {
+                        if !idx.is_unique || idx.is_fk_index {
+                            continue;
+                        }
+                        let key_vals: Vec<Value> = idx
+                            .columns
+                            .iter()
+                            .map(|c| {
+                                full_values
+                                    .get(c.col_idx as usize)
+                                    .cloned()
+                                    .unwrap_or(Value::Null)
+                            })
+                            .collect();
+                        if key_vals.iter().any(|v| matches!(v, Value::Null)) {
+                            continue; // NULL never violates UNIQUE
+                        }
+                        let key = crate::key_encoding::encode_index_key(&key_vals)?;
+                        // Check committed index.
+                        if BTree::lookup_in(storage, idx.root_page_id, &key)?.is_some() {
+                            return Err(DbError::UniqueViolation {
+                                index_name: idx.name.clone(),
+                                value: key_vals.first().map(|v| format!("{v}")),
+                            });
+                        }
+                        // Check in-buffer keys for this index.
+                        let seen = batch
+                            .unique_seen
+                            .entry(idx.index_id)
+                            .or_default();
+                        if !seen.insert(key) {
+                            return Err(DbError::UniqueViolation {
+                                index_name: idx.name.clone(),
+                                value: key_vals.first().map(|v| format!("{v}")),
+                            });
+                        }
+                    }
+
+                    // Enqueue the fully materialized row.
+                    batch.rows.push(full_values);
+                }
+
+                count += 1;
+            }
+
+            // Return per-statement result immediately (no heap write yet).
+            if let Some(id) = first_generated {
+                THREAD_LAST_INSERT_ID.with(|v| v.set(id));
+                return Ok(QueryResult::affected_with_id(count, id));
+            }
+            return Ok(QueryResult::Affected {
+                count,
+                last_insert_id: None,
+            });
+        }
+
+        // ── INSERT ... VALUES — immediate path (autocommit / ineligible) ──────
         InsertSource::Values(rows) => {
             for (row_idx, value_exprs) in rows.into_iter().enumerate() {
                 let provided: Vec<Value> = value_exprs

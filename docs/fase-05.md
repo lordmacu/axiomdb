@@ -1,6 +1,6 @@
 # Phase 5 — MySQL Wire Protocol + executor/runtime cleanup
 
-## Subfases completed in this session: 5.11c, 5.19, 5.19a, 5.19b, 5.20
+## Subfases completed in this session: 5.11c, 5.19, 5.19a, 5.19b, 5.20, 5.21
 
 ## What was built
 
@@ -184,6 +184,52 @@ This replaces the old Phase 5 picture where `UPDATE` was still stuck at
 **52.9K rows/s** after `5.19`. The stable-RID path turns UPDATE from the
 remaining DML hot spot into a MariaDB-class path on the benchmark schema.
 
+### 5.21 — Transactional INSERT staging
+
+AxiomDB now stages consecutive `INSERT ... VALUES` statements inside an explicit
+transaction and flushes them in one grouped heap/WAL/index pass only when it
+hits a barrier.
+
+What changed:
+
+- `crates/axiomdb-sql/src/session.rs` now stores `PendingInsertBatch` in
+  `SessionContext`, with:
+  - target table metadata
+  - staged row values
+  - compiled partial-index predicates
+  - in-batch UNIQUE tracking via `unique_seen`
+- `executor/insert.rs` now evaluates expressions, fills defaults, assigns
+  AUTO_INCREMENT values, runs CHECK/FK validation, and rejects duplicate
+  UNIQUE / PRIMARY KEY keys at enqueue time instead of mutating heap/WAL
+  immediately
+- `executor/staging.rs` flushes through:
+  - `TableEngine::insert_rows_batch_with_ctx(...)`
+  - `batch_insert_into_indexes(...)`
+  - one `CatalogWriter::update_index_root(...)` per changed index root
+- `executor/mod.rs` now flushes staged rows before:
+  - non-INSERT barrier statements
+  - table switches
+  - ineligible INSERT shapes
+  - the next statement savepoint when the batch cannot continue
+- `ROLLBACK` discards unflushed rows without touching heap/WAL, while `COMMIT`
+  flushes any remaining staged rows first
+
+Why this matters:
+
+- many single-row INSERT statements inside `BEGIN ... COMMIT` no longer pay
+  heap insert + WAL append + per-row index root persistence at statement time
+- `SELECT` inside the same transaction still sees prior INSERTs because it acts
+  as a flush barrier
+- savepoint semantics remain correct across table switches: if a later INSERT
+  fails, previously flushed staged rows survive the statement rollback
+
+Measured with the local four-engine benchmark (`50K` rows, release server,
+`python3 benches/comparison/local_bench.py --scenario insert --rows 50000 --table`):
+
+- MariaDB 12.1: **28.0K rows/s**
+- MySQL 8.0: **26.7K rows/s**
+- AxiomDB: **23.9K rows/s**
+
 ## Validation
 
 - `cargo test -p axiomdb-network`
@@ -198,13 +244,17 @@ remaining DML hot spot into a MariaDB-class path on the benchmark schema.
 - `cargo test -p axiomdb-sql --test integration_subqueries`
 - `cargo test -p axiomdb-index --test integration_btree`
 - `cargo test -p axiomdb-sql --test integration_executor`
+- `cargo test -p axiomdb-sql --test integration_executor test_5_21_ -- --nocapture`
+- `cargo test -p axiomdb-sql --test integration_indexes test_5_21_ -- --nocapture`
+- `cargo test -p axiomdb-sql --test integration_autocommit savepoint_ -- --nocapture`
 - `cargo fmt --check`
 - `cargo test --workspace`
 - `cargo clippy --workspace -- -D warnings`
-- `python3 tools/wire-test.py` → `212/212 passed`
+- `python3 tools/wire-test.py` → `226/226 passed`
 - `python3 benches/comparison/local_bench.py --scenario delete_where --rows 5000 --table`
 - `python3 benches/comparison/local_bench.py --scenario update --rows 5000 --table`
 - `python3 benches/comparison/local_bench.py --scenario all --rows 50000 --table`
+- `python3 benches/comparison/local_bench.py --scenario insert --rows 50000 --table`
 
 ## Follow-up subfases still open in Phase 5
 

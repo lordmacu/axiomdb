@@ -188,6 +188,17 @@ with conn.cursor() as cursor:
 conn.close()
 ```
 
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Tip — Batch Single-Row INSERTs</span>
+If your application emits many one-row <code>INSERT</code> statements, wrap them in
+an explicit <code>BEGIN ... COMMIT</code>. Phase <code>5.21</code> stages consecutive
+<code>INSERT ... VALUES</code> statements in one transaction and flushes them together,
+which is much faster than committing each row independently.
+</div>
+</div>
+
 ### Parameterized Queries and ORMs (Prepared Statements)
 
 When you pass parameters to `cursor.execute()`, PyMySQL (and any MySQL-compatible

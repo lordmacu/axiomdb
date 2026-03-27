@@ -23,6 +23,7 @@ stable facade and responsibility-based source files behind it.
 | `executor/delete.rs` | DELETE execution and candidate collection |
 | `executor/bulk_empty.rs` | shared bulk-empty helpers for DELETE/TRUNCATE |
 | `executor/ddl.rs` | DDL, SHOW, ANALYZE, TRUNCATE |
+| `executor/staging.rs` | transactional INSERT staging flushes and barrier handling |
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
@@ -52,6 +53,94 @@ When no transaction is active, `execute` wraps the statement in an implicit
 
 All reads use `txn.active_snapshot()?` — a snapshot fixed at `BEGIN` — so that
 writes made earlier in the same transaction are visible (read-your-own-writes).
+
+## Transactional INSERT staging (Phase 5.21)
+
+`5.21` adds a statement-boundary staging path for consecutive
+`INSERT ... VALUES` statements inside one explicit transaction.
+
+### Data structure
+
+`SessionContext` now owns:
+
+```rust
+PendingInsertBatch {
+    table_id: u32,
+    table_def: TableDef,
+    columns: Vec<ColumnDef>,
+    indexes: Vec<IndexDef>,
+    compiled_preds: Vec<Option<Expr>>,
+    rows: Vec<Vec<Value>>,
+    unique_seen: HashMap<u32, HashSet<Vec<u8>>>,
+}
+```
+
+The buffer exists only while the connection is inside an explicit transaction.
+Autocommit-wrapped single statements do not use it.
+
+### Enqueue path
+
+For every eligible INSERT row, `executor/insert.rs` does all logical work up
+front:
+
+1. evaluate expressions
+2. expand omitted columns
+3. assign AUTO_INCREMENT if needed
+4. run CHECK constraints
+5. run FK child validation
+6. reject duplicate UNIQUE / PK keys against:
+   - committed index state
+   - `unique_seen` inside the current batch
+7. append the fully materialized row to `PendingInsertBatch.rows`
+
+No heap write or WAL append happens yet.
+
+### Flush barriers
+
+The batch is flushed before:
+
+- `SELECT`
+- `UPDATE`
+- `DELETE`
+- DDL
+- `COMMIT`
+- table switch to another `INSERT` target
+- any ineligible INSERT shape
+
+`ROLLBACK` discards the batch without heap or WAL writes.
+
+### Savepoint ordering invariant
+
+When a transaction uses statement-level savepoints (`rollback_statement`,
+`savepoint`, `ignore`), the executor must flush staged rows **before** taking
+the next statement savepoint if the current statement cannot continue the batch.
+
+Without that ordering, a failing statement after a table switch could roll back
+rows that logically belonged to earlier successful INSERT statements.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Flush Before Savepoint</span>
+The first `5.21` implementation flushed a table-switch batch inside the next INSERT
+handler, which placed the flush after the statement savepoint and let a later
+duplicate-key error roll it back. The final design moves that decision to the
+statement boundary so savepoint semantics stay identical to pre-staging behavior.
+</div>
+</div>
+
+### Flush algorithm
+
+`executor/staging.rs` performs:
+
+1. `TableEngine::insert_rows_batch_with_ctx(...)`
+2. `batch_insert_into_indexes(...)`
+3. one `CatalogWriter::update_index_root(...)` per changed index
+4. stats update
+
+The current design still inserts index entries row-by-row inside the flush. That
+cost is explicit and remains the next insert-side optimization candidate if future
+profiling shows it dominates after staging.
 
 ---
 

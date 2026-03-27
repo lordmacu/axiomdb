@@ -94,3 +94,30 @@
 - Expand the validation scope when the change touches public APIs, shared crates, on-disk format, WAL/recovery, SQL semantics, or MySQL wire-visible behavior.
 - Run `tools/wire-test.py` only when the change is observable through the MySQL protocol.
 - Keep `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo fmt --check` as the final close/review gate, not the inner development loop.
+
+## 2026-03-27 - Barrier flushes must happen before the next statement savepoint
+
+- If a feature buffers writes across statements, the flush decision belongs at the
+  statement boundary, not deep inside the next statement handler.
+- `5.21` exposed the failure mode clearly: a table-switch flush performed inside
+  the next `INSERT` happened after the statement savepoint, so a duplicate-key
+  error rolled back rows that logically belonged to earlier successful INSERTs.
+- The safe rule is:
+  - determine whether the current statement can continue the batch
+  - if not, flush the batch
+  - only then capture the savepoint for the current statement
+- This is especially important for MySQL-visible modes like
+  `rollback_statement`, `savepoint`, and `ignore`, where statement boundaries are
+  part of the user-visible contract.
+
+## 2026-03-27 - Benchmarks should be targeted, not mandatory on every close
+
+- Do not run full benchmark suites by default for every subphase close.
+- Run benchmarks when the subphase is performance-facing, changes a hot path, or
+  could plausibly regress a previously measured critical workload.
+- For non-performance subphases, prefer targeted tests, clippy, fmt, and wire
+  smoke (if user-visible) instead of paying benchmark time with low signal.
+- When a benchmark is run, keep it narrow and workload-specific:
+  - use the scenario that motivated the subphase
+  - compare against the latest relevant local baseline or competitor numbers
+  - avoid rerunning unrelated scenarios unless the blast radius justifies it

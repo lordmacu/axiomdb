@@ -528,6 +528,17 @@ For multi-row INSERT, `LAST_INSERT_ID()` returns the ID generated for the
 **first** row of the batch (MySQL semantics). Subsequent rows receive
 consecutive IDs.
 
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Tip — Explicit Transaction Staging</span>
+When your client sends many one-row <code>INSERT ... VALUES</code> statements,
+wrap them in <code>BEGIN ... COMMIT</code>. AxiomDB stages consecutive INSERTs
+for the same table inside the transaction and flushes them together on
+<code>COMMIT</code> or the next barrier statement.
+</div>
+</div>
+
 ```sql
 INSERT INTO users (name) VALUES ('Bob'), ('Carol'), ('Dave');
 -- ids: 2, 3, 4
@@ -1356,4 +1367,3 @@ SHOW STATUS LIKE 'Com_stmt_send_long_data';
 -- Variable_name                | Value
 -- Com_stmt_send_long_data      | 3
 ```
-
