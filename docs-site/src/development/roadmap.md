@@ -175,7 +175,7 @@ This is the largest remaining item in Block 1.
 
 - **5.15 DSN parsing** — `axiomdb://`, `mysql://`, and `postgres://` style connection strings for tools and ORMs.
 
-Phase 5 also closed three structural/runtime subphases:
+Phase 5 also closed three recent subphases:
 
 - **5.11c Explicit connection state machine** — the MySQL server now has an explicit
   `CONNECTED → AUTH → IDLE → EXECUTING → CLOSING` transport lifecycle with fixed
