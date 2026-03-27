@@ -424,10 +424,11 @@ pub fn delete_many_from_single_index(
 /// once via `CatalogWriter::update_index_root`, which eliminates the N catalog
 /// writes that the per-row path would produce.
 ///
-/// UNIQUE within the staged batch is pre-checked by the enqueue path
-/// (`unique_seen`), so no redundant uniqueness error can surface here for
-/// rows that were already validated. The B-Tree still enforces uniqueness
-/// against committed data for safety.
+/// When `skip_unique_check` is `true`, the B-Tree uniqueness lookup is
+/// skipped entirely. This is safe when the caller has already verified
+/// uniqueness (against committed data AND intra-batch via `unique_seen`)
+/// at enqueue time — as the staged-insert path does. Eliminating the
+/// redundant N lookups at flush time halves total B-Tree operations.
 ///
 /// Returns `(index_id, new_root_page_id)` for every index whose root changed.
 /// The caller is responsible for updating the in-memory `IndexDef` slice.
@@ -438,6 +439,8 @@ pub fn batch_insert_into_indexes(
     storage: &mut dyn StorageEngine,
     bloom: &mut crate::bloom::BloomRegistry,
     compiled_preds: &[Option<Expr>],
+    skip_unique_check: bool,
+    committed_empty: &std::collections::HashSet<u32>,
 ) -> Result<Vec<(u32, u64)>, DbError> {
     debug_assert_eq!(
         rows.len(),
@@ -456,28 +459,23 @@ pub fn batch_insert_into_indexes(
         }
 
         let pred = compiled_preds.get(i).and_then(|p| p.as_ref());
-        let original_root = idx.root_page_id;
-        let root_pid = AtomicU64::new(original_root);
 
+        // ── Collect (encoded_key, rid) for this index ────────────────────────
+        let mut pairs: Vec<(Vec<u8>, RecordId)> = Vec::new();
         for (row, rid) in rows.iter().zip(rids.iter()) {
-            // Partial index predicate check.
             if let Some(p) = pred {
                 if !is_truthy(&eval(p, row)?) {
                     continue;
                 }
             }
-
             let key_vals: Vec<Value> = idx
                 .columns
                 .iter()
                 .map(|c| row.get(c.col_idx as usize).cloned().unwrap_or(Value::Null))
                 .collect();
-
-            // Skip NULL key values.
             if key_vals.iter().any(|v| matches!(v, Value::Null)) {
                 continue;
             }
-
             let key = if idx.is_fk_index || !idx.is_unique {
                 let mut k = encode_index_key(&key_vals)?;
                 k.extend_from_slice(&encode_rid(*rid));
@@ -485,22 +483,46 @@ pub fn batch_insert_into_indexes(
             } else {
                 encode_index_key(&key_vals)?
             };
+            pairs.push((key, *rid));
+        }
 
-            // Uniqueness check against committed data (intra-batch duplicates
-            // were already rejected by the enqueue path via `unique_seen`).
-            if idx.is_unique
+        if pairs.is_empty() {
+            continue;
+        }
+
+        // ── Bulk load path: empty committed index → build from scratch ───────
+        if committed_empty.contains(&idx.index_id) {
+            pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            let refs: Vec<(&[u8], RecordId)> =
+                pairs.iter().map(|(k, r)| (k.as_slice(), *r)).collect();
+            let new_root =
+                BTree::bulk_load_sorted(storage, idx.root_page_id, &refs, idx.fillfactor)?;
+            for (k, _) in &pairs {
+                bloom.add(idx.index_id, k);
+            }
+            idx.root_page_id = new_root;
+            updated_roots.push((idx.index_id, new_root));
+            continue;
+        }
+
+        // ── Per-row insert path: non-empty committed index ───────────────────
+        let original_root = idx.root_page_id;
+        let root_pid = AtomicU64::new(original_root);
+
+        for (key, rid) in &pairs {
+            if !skip_unique_check
+                && idx.is_unique
                 && !idx.is_fk_index
-                && BTree::lookup_in(storage, root_pid.load(Ordering::Acquire), &key)?.is_some()
+                && BTree::lookup_in(storage, root_pid.load(Ordering::Acquire), key)?.is_some()
             {
-                let dup_val = key_vals.first().map(|v| format!("{v}"));
+                let dup_val = Some(format!("(encoded)"));
                 return Err(DbError::UniqueViolation {
                     index_name: idx.name.clone(),
                     value: dup_val,
                 });
             }
-
-            BTree::insert_in(storage, &root_pid, &key, *rid, idx.fillfactor)?;
-            bloom.add(idx.index_id, &key);
+            BTree::insert_in(storage, &root_pid, key, *rid, idx.fillfactor)?;
+            bloom.add(idx.index_id, key);
         }
 
         let new_root = root_pid.load(Ordering::Acquire);

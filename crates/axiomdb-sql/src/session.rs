@@ -233,6 +233,7 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         | DbError::CatalogTableNotFound { .. }
         | DbError::CatalogIndexNotFound { .. }
         | DbError::SequenceOverflow
+        | DbError::InvalidDsn { .. }
         | DbError::Internal { .. }
         | DbError::Other(_) => false,
     }
@@ -405,6 +406,11 @@ pub struct PendingInsertBatch {
     /// For each unique (non-FK) index: set of encoded keys already staged.
     /// Used to detect cross-row UNIQUE violations before heap mutation.
     pub unique_seen: HashMap<u32, HashSet<Vec<u8>>>,
+    /// Set of index_ids whose committed BTree root was empty when the batch
+    /// was created. For these indexes, the enqueue-time UNIQUE precheck
+    /// skips the BTree::lookup_in against committed data (guaranteed no
+    /// committed keys exist) and only checks `unique_seen`.
+    pub committed_empty: HashSet<u32>,
 }
 
 // ── SessionContext ────────────────────────────────────────────────────────────

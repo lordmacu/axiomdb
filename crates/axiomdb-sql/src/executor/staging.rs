@@ -58,6 +58,8 @@ pub(super) fn flush_pending_inserts_ctx(
             storage,
             bloom,
             &batch.compiled_preds,
+            true, // skip_unique_check: pre-verified at enqueue time
+            &batch.committed_empty,
         )?;
         for (index_id, new_root) in updated {
             CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
