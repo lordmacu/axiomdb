@@ -121,7 +121,7 @@ behavior as the dominant bottleneck.
 - `cargo fmt --check`
 - `cargo test --workspace`
 - `cargo clippy --workspace -- -D warnings`
-- `python3 tools/wire-test.py` → `204/204 passed`
+- `python3 tools/wire-test.py` → `212/212 passed`
 - `python3 benches/comparison/local_bench.py --scenario delete_where --rows 5000 --table`
 - `python3 benches/comparison/local_bench.py --scenario update --rows 5000 --table`
 
