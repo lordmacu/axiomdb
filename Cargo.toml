@@ -79,6 +79,7 @@ logos = "0.14"
 
 # Character-set transcoding (MySQL transport layer)
 encoding_rs = "0.8"
+socket2 = "0.5"
 
 # Internal crates
 axiomdb-core    = { path = "crates/axiomdb-core" }

@@ -76,8 +76,8 @@ async fn main() {
     loop {
         match listener.accept().await {
             Ok((stream, _peer)) => {
-                if let Err(e) = stream.set_nodelay(true) {
-                    tracing::warn!(err = %e, "TCP_NODELAY failed");
+                if let Err(e) = axiomdb_network::mysql::configure_client_socket(&stream) {
+                    tracing::warn!(err = %e, "client socket configuration failed");
                 }
                 let db = Arc::clone(&db);
                 let id = conn_id;

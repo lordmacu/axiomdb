@@ -324,7 +324,7 @@ mod tests {
 
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&make_full_fragment(0));
-        buf.extend_from_slice(&encode_physical(1, &vec![0xCDu8; 10]));
+        buf.extend_from_slice(&encode_physical(1, &[0xCDu8; 10]));
 
         let (seq, data) = codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(seq, 0, "sequence_id taken from first fragment");
@@ -352,7 +352,7 @@ mod tests {
 
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&make_full_fragment(0));
-        buf.extend_from_slice(&encode_physical(1, &vec![0u8; 10]));
+        buf.extend_from_slice(&encode_physical(1, &[0u8; 10]));
 
         match codec.decode(&mut buf).unwrap_err() {
             MySqlCodecError::PacketTooLarge { actual, max } => {

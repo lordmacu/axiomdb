@@ -4914,6 +4914,125 @@ fn test_delete_where_secondary_index_maintains_all_indexes() {
 }
 
 #[test]
+fn test_update_batch_deletes_old_pk_and_secondary_keys() {
+    // Phase 5.19: UPDATE must batch-delete old keys from both the PRIMARY KEY
+    // and secondary indexes before reinserting new keys.
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE TABLE upd_batch (id INT NOT NULL, score INT, PRIMARY KEY (id))",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "CREATE INDEX idx_upd_score ON upd_batch (score)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    for i in 1..=10i32 {
+        run_ctx(
+            &format!("INSERT INTO upd_batch VALUES ({i}, {})", i * 10),
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap();
+    }
+
+    let result = run_ctx(
+        "UPDATE upd_batch SET id = id + 100, score = score + 1 WHERE id <= 5",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(affected_count(result), 5);
+
+    for i in 1..=5i32 {
+        let old_pk = rows(
+            run_ctx(
+                &format!("SELECT id FROM upd_batch WHERE id = {i}"),
+                &mut storage,
+                &mut txn,
+                &mut bloom,
+                &mut ctx,
+            )
+            .unwrap(),
+        );
+        assert!(old_pk.is_empty(), "old PK value {i} should be gone");
+
+        let new_id = i + 100;
+        let new_pk = rows(
+            run_ctx(
+                &format!("SELECT id, score FROM upd_batch WHERE id = {new_id}"),
+                &mut storage,
+                &mut txn,
+                &mut bloom,
+                &mut ctx,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            new_pk,
+            vec![vec![Value::Int(new_id), Value::Int(i * 10 + 1)]],
+            "new PK value {new_id} should exist with the updated score",
+        );
+
+        let old_score = i * 10;
+        let old_score_rows = rows(
+            run_ctx(
+                &format!("SELECT id FROM upd_batch WHERE score = {old_score}"),
+                &mut storage,
+                &mut txn,
+                &mut bloom,
+                &mut ctx,
+            )
+            .unwrap(),
+        );
+        assert!(
+            old_score_rows.is_empty(),
+            "old secondary-index key {old_score} should be gone",
+        );
+
+        let new_score = old_score + 1;
+        let new_score_rows = rows(
+            run_ctx(
+                &format!("SELECT id FROM upd_batch WHERE score = {new_score}"),
+                &mut storage,
+                &mut txn,
+                &mut bloom,
+                &mut ctx,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            new_score_rows,
+            vec![vec![Value::Int(new_id)]],
+            "new secondary-index key {new_score} should resolve to the new PK",
+        );
+    }
+
+    let untouched = rows(
+        run_ctx(
+            "SELECT id, score FROM upd_batch WHERE id = 6",
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap(),
+    );
+    assert_eq!(untouched, vec![vec![Value::Int(6), Value::Int(60)]]);
+}
+
+#[test]
 fn test_delete_where_non_sargable_falls_back_to_scan() {
     // DELETE with a non-indexable predicate must still delete the right rows.
     let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();

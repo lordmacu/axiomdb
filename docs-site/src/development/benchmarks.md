@@ -224,6 +224,35 @@ consistency within the same process.
 
 ---
 
+## Phase 5.19 — Batched B+Tree Delete
+
+Measured with `python3 benches/comparison/local_bench.py --scenario delete_where --rows 5000 --table`
+and `--scenario update` on the same Apple M2 Pro machine. The benchmark uses the
+wire protocol and a `bench_users` table with `PRIMARY KEY (id)`.
+
+| Operation | MariaDB 12.1 | MySQL 8.0 | AxiomDB | PostgreSQL 16 |
+|---|---|---|---|---|
+| `DELETE WHERE id > 2500` | 442K rows/s | 270K rows/s | **396K rows/s** | 3.26M rows/s |
+| `UPDATE ... WHERE active = TRUE` | 490K rows/s | 284K rows/s | **52.9K rows/s** | 377K rows/s |
+
+Before `5.19`, the local benchmark that opened the subphase recorded
+`DELETE WHERE` at roughly `4.6K rows/s` on AxiomDB. The new batch-delete path
+raises that to `396K rows/s`, which removes the old per-row `delete_in(...)`
+loop as the dominant cost.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Batch Old Keys First</span>
+`5.19` optimizes only the delete half of UPDATE. Old keys are batch-deleted per index,
+then new keys are reinserted on the existing point-insert path. This keeps correctness
+simple and makes the remaining bottleneck explicit: UPDATE is now mostly paying for
+reinsertion, not for deleting stale index entries.
+</div>
+</div>
+
+---
+
 ## Phase 5.13 — Prepared Statement Plan Cache {#phase-513-plan-cache}
 
 Phase 5.13 introduces an AST-level plan cache for prepared statements. The full parse +

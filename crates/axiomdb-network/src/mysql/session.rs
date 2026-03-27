@@ -275,6 +275,42 @@ impl ConnectionState {
             })
     }
 
+    fn positive_timeout_secs(&self, name: &str) -> Result<u64, DbError> {
+        let raw = self
+            .variables
+            .get(name)
+            .map(|s| s.as_str())
+            .unwrap_or(match name {
+                "net_write_timeout" | "net_read_timeout" => "60",
+                "wait_timeout" | "interactive_timeout" => "28800",
+                _ => "",
+            });
+        let stripped = raw.trim().trim_matches('\'').trim_matches('"');
+        stripped
+            .parse::<u64>()
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or_else(|| DbError::InvalidValue {
+                reason: format!("{name} must be a positive integer, got '{raw}'"),
+            })
+    }
+
+    pub fn net_read_timeout_secs(&self) -> Result<u64, DbError> {
+        self.positive_timeout_secs("net_read_timeout")
+    }
+
+    pub fn net_write_timeout_secs(&self) -> Result<u64, DbError> {
+        self.positive_timeout_secs("net_write_timeout")
+    }
+
+    pub fn wait_timeout_secs(&self) -> Result<u64, DbError> {
+        self.positive_timeout_secs("wait_timeout")
+    }
+
+    pub fn interactive_timeout_secs(&self) -> Result<u64, DbError> {
+        self.positive_timeout_secs("interactive_timeout")
+    }
+
     /// Applies a SET statement, updating the relevant session variable.
     ///
     /// Returns `Ok(true)` if the statement was recognized (caller should send OK).
@@ -385,6 +421,24 @@ impl ConnectionState {
                             return Err(DbError::InvalidValue {
                                 reason: format!(
                                     "max_allowed_packet must be a positive integer, got '{raw_val}'"
+                                ),
+                            });
+                        }
+                    }
+                }
+                "net_read_timeout"
+                | "net_write_timeout"
+                | "wait_timeout"
+                | "interactive_timeout" => {
+                    let candidate = raw_val.trim().trim_matches('\'').trim_matches('"');
+                    match candidate.parse::<u64>() {
+                        Ok(n) if n > 0 => {
+                            self.variables.insert(name.clone(), n.to_string());
+                        }
+                        _ => {
+                            return Err(DbError::InvalidValue {
+                                reason: format!(
+                                    "{name} must be a positive integer, got '{raw_val}'"
                                 ),
                             });
                         }

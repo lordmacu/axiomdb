@@ -171,15 +171,23 @@ Phase 7 removes this constraint with per-table record locks, snapshot isolation 
 COMMITTED and REPEATABLE READ), and epoch-based memory reclamation for CoW B+ Tree nodes.
 This is the largest remaining item in Block 1.
 
-### Phase 5 remaining — Wire protocol completeness
+### Phase 5 remaining
 
-- **5.11c Explicit connection state machine** — formalize `CONNECTED → AUTH → IDLE → EXECUTING → CLOSING`, timeout handling, and abrupt socket close behavior.
 - **5.15 DSN parsing** — `axiomdb://`, `mysql://`, and `postgres://` style connection strings for tools and ORMs.
-- **5.19 B+Tree batch delete** — replace per-row index-key deletion with sorted single-pass batch removal for DELETE/UPDATE hot paths.
 
-Phase 5 also closed an internal hygiene subphase, **5.19a Executor decomposition**:
-the SQL executor now lives in a responsibility-based `executor/` module tree instead
-of one monolithic file, which lowers the cost of later DML and planner work.
+Phase 5 also closed three structural/runtime subphases:
+
+- **5.11c Explicit connection state machine** — the MySQL server now has an explicit
+  `CONNECTED → AUTH → IDLE → EXECUTING → CLOSING` transport lifecycle with fixed
+  auth timeout, `wait_timeout` vs `interactive_timeout` behavior, `net_write_timeout`
+  for packet writes, and socket keepalive configured separately from SQL session state.
+- **5.19a Executor decomposition** — the SQL executor now lives in a responsibility-based
+  `executor/` module tree instead of one monolithic file, which lowers the cost of
+  later DML and planner work.
+- **5.19 B+Tree batch delete** — DELETE WHERE and the old-key half of UPDATE now
+  stage exact encoded keys per index and remove them with one ordered
+  `delete_many_in(...)` pass per tree instead of one `delete_in(...)` traversal
+  per row.
 
 ### Phase 6 remaining — Index completeness
 

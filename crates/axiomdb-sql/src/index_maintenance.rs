@@ -238,3 +238,93 @@ pub fn delete_from_indexes(
 
     Ok(updated_roots)
 }
+
+// ── Batch delete helpers (Phase 5.19) ─────────────────────────────────────────
+
+/// For each index in `indexes`, encode the delete key for every row in `rows`
+/// using the same rules as `delete_from_indexes` (NULL skip, partial predicate,
+/// unique/non-unique encoding). Returns one sorted `Vec<Vec<u8>>` per index.
+pub fn collect_delete_keys_by_index(
+    indexes: &[IndexDef],
+    rows: &[(RecordId, Vec<Value>)],
+    compiled_preds: &[Option<Expr>],
+) -> Result<Vec<Vec<Vec<u8>>>, DbError> {
+    let mut buckets: Vec<Vec<Vec<u8>>> = vec![Vec::new(); indexes.len()];
+
+    for (i, idx) in indexes
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| !i.columns.is_empty())
+    {
+        let pred = compiled_preds.get(i).and_then(|p| p.as_ref());
+        for (rid, row) in rows {
+            if let Some(p) = pred {
+                if !is_truthy(&eval(p, row)?) {
+                    continue;
+                }
+            }
+            let key_vals: Vec<Value> = idx
+                .columns
+                .iter()
+                .map(|c| row.get(c.col_idx as usize).cloned().unwrap_or(Value::Null))
+                .collect();
+            if key_vals.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+            let key = if idx.is_fk_index || !idx.is_unique {
+                let base = match encode_index_key(&key_vals) {
+                    Ok(k) => k,
+                    Err(DbError::IndexKeyTooLong { .. }) => continue,
+                    Err(e) => return Err(e),
+                };
+                let mut k = base;
+                k.extend_from_slice(&encode_rid(*rid));
+                k
+            } else {
+                match encode_index_key(&key_vals) {
+                    Ok(k) => k,
+                    Err(DbError::IndexKeyTooLong { .. }) => continue,
+                    Err(e) => return Err(e),
+                }
+            };
+            buckets[i].push(key);
+        }
+        buckets[i].sort_unstable();
+    }
+
+    Ok(buckets)
+}
+
+/// Removes all keys in `key_buckets[i]` from `indexes[i]` using one
+/// `BTree::delete_many_in` call per index. Updates `indexes[i].root_page_id`
+/// in place and returns `(index_id, new_root)` for every index whose root changed.
+///
+/// `key_buckets` must be parallel to `indexes` and each bucket pre-sorted ascending.
+pub fn delete_many_from_indexes(
+    indexes: &mut [IndexDef],
+    key_buckets: Vec<Vec<Vec<u8>>>,
+    storage: &mut dyn StorageEngine,
+    bloom: &mut crate::bloom::BloomRegistry,
+) -> Result<Vec<(u32, u64)>, DbError> {
+    let mut updated_roots: Vec<(u32, u64)> = Vec::new();
+
+    for (i, idx) in indexes.iter_mut().enumerate() {
+        if idx.columns.is_empty() {
+            continue;
+        }
+        let keys = match key_buckets.get(i) {
+            Some(k) if !k.is_empty() => k,
+            _ => continue,
+        };
+        let root_pid = AtomicU64::new(idx.root_page_id);
+        BTree::delete_many_in(storage, &root_pid, keys)?;
+        bloom.mark_dirty(idx.index_id);
+        let new_root = root_pid.load(Ordering::Acquire);
+        if new_root != idx.root_page_id {
+            idx.root_page_id = new_root;
+            updated_roots.push((idx.index_id, new_root));
+        }
+    }
+
+    Ok(updated_roots)
+}

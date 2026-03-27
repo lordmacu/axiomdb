@@ -967,8 +967,8 @@ mod tests {
         p.extend_from_slice(&1u32.to_le_bytes()); // iteration_count
         p.push(0x00); // null bitmap (neither is null at wire level)
         p.push(1); // new_params_bound_flag
-        p.extend_from_slice(&(param0_type as u16).to_le_bytes());
-        p.extend_from_slice(&(param1_type as u16).to_le_bytes());
+        p.extend_from_slice(&param0_type.to_le_bytes());
+        p.extend_from_slice(&param1_type.to_le_bytes());
         // param0 has long data — no inline bytes for it
         // param1: lenenc + value
         p.push(param1_value.len() as u8);

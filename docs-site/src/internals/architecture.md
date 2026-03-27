@@ -220,7 +220,7 @@ The MySQL wire protocol implementation. Lives in `crates/axiomdb-network/src/mys
 | `auth.rs` | `gen_challenge` (20-byte CSPRNG), `verify_native_password` (SHA1-XOR), `is_allowed_user` allowlist |
 | `charset.rs` | Static charset/collation registry; `decode_text`/`encode_text` using `encoding_rs`; supports utf8mb4, utf8mb3, latin1 (cp1252), binary |
 | `session.rs` | `ConnectionState` — typed `client_charset`, `connection_collation`, `results_collation` fields; `SET NAMES`; `decode_client_text`/`encode_result_text` |
-| `handler.rs` | `handle_connection` — async task per TCP connection; full handshake → auth → command loop |
+| `handler.rs` | `handle_connection` — async task per TCP connection; explicit `CONNECTED → AUTH → IDLE → EXECUTING → CLOSING` lifecycle |
 | `result.rs` | `serialize_query_result` — `QueryResult` → `column_count + column_defs + EOF + rows + EOF` packets; charset-aware row encoding |
 | `error.rs` | `dberror_to_mysql` — maps every `DbError` variant to a MySQL error code + SQLSTATE |
 | `database.rs` | `Database` wrapper — holds `Arc<Mutex<axiomdb_sql::Database>>`, exposes `execute_query` |
@@ -233,7 +233,7 @@ TCP accept
   ▼  (seq 0)
 Server → HandshakeV10
   │       20-byte random challenge, capabilities, server version
-  │       auth_plugin_name = "mysql_native_password"
+  │       auth_plugin_name = "caching_sha2_password"
   │
   ▼  (seq 1)
 Client → HandshakeResponse41
@@ -255,7 +255,7 @@ Client → HandshakeResponse41
   ├── COM_QUERY (0x03)        → parse SQL → intercept? → execute → result packets
   ├── COM_PING  (0x0e)        → OK
   ├── COM_INIT_DB (0x02)      → updates current_database in ConnectionState + OK
-  ├── COM_RESET_CONNECTION (0x1f) → resets ConnectionState + OK
+  ├── COM_RESET_CONNECTION (0x1f) → resets ConnectionState, preserves transport lifecycle metadata + OK
   ├── COM_STMT_PREPARE (0x16) → parse SQL with ? placeholders → stmt_ok packet
   ├── COM_STMT_SEND_LONG_DATA (0x18) → append raw bytes to stmt-local buffers, no reply
   ├── COM_STMT_EXECUTE (0x17) → merge long data + decode params → substitute → execute → result packets
@@ -263,6 +263,39 @@ Client → HandshakeResponse41
   ├── COM_STMT_CLOSE (0x19)   → remove from cache, no response
   └── COM_QUIT  (0x01)        → close
 ```
+
+#### Explicit lifecycle state machine (5.11c)
+
+`5.11c` moved transport/runtime concerns out of `ConnectionState` into
+`mysql/lifecycle.rs`. `ConnectionState` still owns SQL session variables,
+prepared statements, warnings, and session counters. `ConnectionLifecycle`
+owns only:
+
+- current transport phase
+- client capability flags relevant to lifecycle policy
+- timeout policy per phase
+- socket-level configuration (`TCP_NODELAY`, `SO_KEEPALIVE`)
+
+| Phase | Entered when | Timeout policy |
+|---|---|---|
+| `CONNECTED` | socket accepted, before first packet | no read yet; greeting write uses auth timeout |
+| `AUTH` | handshake/auth exchange starts | fixed 10s auth timeout for reads/writes |
+| `IDLE` | between commands | `interactive_timeout` if `CLIENT_INTERACTIVE`, otherwise `wait_timeout` |
+| `EXECUTING` | after a command packet is accepted | packet writes use `net_write_timeout`; any future in-flight reads use `net_read_timeout` |
+| `CLOSING` | `COM_QUIT`, EOF, timeout, or transport error | terminal state before handler return |
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Transport State Split</span>
+MariaDB and PostgreSQL both separate connection lifecycle from SQL session semantics. AxiomDB adopts the same boundary: timeout and socket policy live in `ConnectionLifecycle`, while `ConnectionState` remains purely SQL/session state.
+</div>
+</div>
+
+`COM_RESET_CONNECTION` recreates `ConnectionState::new()` and resets session timeout
+variables to their defaults, but it does not recreate `ConnectionLifecycle`. That
+means the connection remains interactive or non-interactive according to the
+original handshake, even after reset.
 
 #### Prepared statements (prepared.rs)
 
