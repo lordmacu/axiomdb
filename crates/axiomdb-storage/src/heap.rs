@@ -261,6 +261,75 @@ pub fn read_tuple(page: &Page, slot_id: u16) -> Result<Option<(&RowHeader, &[u8]
     Ok(Some((header, data)))
 }
 
+/// Returns the raw tuple image (`RowHeader || row bytes`) stored at `slot_id`.
+///
+/// Dead slots return `None`. The returned bytes are a copy of the exact logical
+/// tuple length recorded in the slot entry (no trailing alignment padding).
+///
+/// # Errors
+/// - [`DbError::InvalidSlot`] if `slot_id >= num_slots`.
+pub fn read_tuple_image(page: &Page, slot_id: u16) -> Result<Option<Vec<u8>>, DbError> {
+    let n = num_slots(page);
+    if slot_id >= n {
+        return Err(DbError::InvalidSlot {
+            page_id: page.header().page_id,
+            slot_id,
+            num_slots: n,
+        });
+    }
+    let entry = read_slot(page, slot_id);
+    if entry.is_dead() {
+        return Ok(None);
+    }
+    let off = entry.offset as usize;
+    let len = entry.length as usize;
+    Ok(Some(page.as_bytes()[off..off + len].to_vec()))
+}
+
+/// Returns the byte capacity currently reserved for the tuple at `slot_id`.
+///
+/// This may be larger than `SlotEntry.length` after earlier rewrites that shrank
+/// the tuple. Capacity is bounded by the next live tuple above this one (higher
+/// page offset) or `PAGE_SIZE` for the top-most tuple.
+///
+/// # Errors
+/// - [`DbError::InvalidSlot`] if `slot_id >= num_slots`.
+/// - [`DbError::AlreadyDeleted`] if the slot is physically dead.
+pub fn slot_capacity(page: &Page, slot_id: u16) -> Result<usize, DbError> {
+    let n = num_slots(page);
+    if slot_id >= n {
+        return Err(DbError::InvalidSlot {
+            page_id: page.header().page_id,
+            slot_id,
+            num_slots: n,
+        });
+    }
+    let entry = read_slot(page, slot_id);
+    if entry.is_dead() {
+        return Err(DbError::AlreadyDeleted {
+            page_id: page.header().page_id,
+            slot_id,
+        });
+    }
+
+    let start = entry.offset as usize;
+    let mut end = PAGE_SIZE;
+    for other_slot in 0..n {
+        if other_slot == slot_id {
+            continue;
+        }
+        let other = read_slot(page, other_slot);
+        if other.is_dead() {
+            continue;
+        }
+        let other_off = other.offset as usize;
+        if other_off > start && other_off < end {
+            end = other_off;
+        }
+    }
+    Ok(end - start)
+}
+
 /// Reads only the `txn_id_deleted` field from the [`RowHeader`] at `slot_id`.
 ///
 /// Returns `None` if the slot is physically dead (zeroed SlotEntry).
@@ -359,6 +428,34 @@ pub fn delete_tuple(page: &mut Page, slot_id: u16, txn_id: TxnId) -> Result<(), 
     Ok(())
 }
 
+/// Tries to rewrite the tuple at `slot_id` in place, preserving the same slot.
+///
+/// On success, updates the tuple bytes and slot length, keeps the tuple offset
+/// unchanged, and returns the previous tuple image so the caller can WAL-log or
+/// undo the rewrite. If the new tuple does not fit in the slot's reserved
+/// capacity, returns `Ok(None)` and leaves the page untouched.
+///
+/// This is the Phase 5.20 stable-RID update primitive. It intentionally
+/// overwrites the old tuple image because Phase 5 still runs under the current
+/// single-writer / no-concurrent-reader assumptions; rollback and crash recovery
+/// restore the old image from WAL/undo.
+///
+/// # Errors
+/// - [`DbError::InvalidSlot`] if `slot_id >= num_slots`.
+/// - [`DbError::AlreadyDeleted`] if the slot is physically dead.
+pub fn rewrite_tuple_same_slot(
+    page: &mut Page,
+    slot_id: u16,
+    new_data: &[u8],
+    txn_id: TxnId,
+) -> Result<Option<Vec<u8>>, DbError> {
+    let rewritten = try_rewrite_tuple_same_slot_no_checksum(page, slot_id, new_data, txn_id)?;
+    if rewritten.is_some() {
+        page.update_checksum();
+    }
+    Ok(rewritten)
+}
+
 /// Replaces the row at `slot_id` with `new_data` under transaction `txn_id`.
 ///
 /// Implemented as MVCC delete + insert:
@@ -404,6 +501,26 @@ pub fn mark_slot_dead(page: &mut Page, slot_id: u16) -> Result<(), DbError> {
             length: 0,
         },
     );
+    page.update_checksum();
+    Ok(())
+}
+
+/// Restores the exact tuple image previously stored at `slot_id`.
+///
+/// Used by rollback and crash recovery for stable-RID in-place updates.
+/// `tuple_image` must be a full logical tuple image (`RowHeader || row bytes`)
+/// that originally belonged to this slot.
+///
+/// # Errors
+/// - [`DbError::InvalidSlot`] if `slot_id >= num_slots`.
+/// - [`DbError::AlreadyDeleted`] if the slot is physically dead.
+/// - [`DbError::Internal`] if `tuple_image` no longer fits in the slot capacity.
+pub fn restore_tuple_image(
+    page: &mut Page,
+    slot_id: u16,
+    tuple_image: &[u8],
+) -> Result<(), DbError> {
+    restore_tuple_image_no_checksum(page, slot_id, tuple_image)?;
     page.update_checksum();
     Ok(())
 }
@@ -488,6 +605,111 @@ pub fn scan_visible<'p>(
     })
 }
 
+pub(crate) fn try_rewrite_tuple_same_slot_no_checksum(
+    page: &mut Page,
+    slot_id: u16,
+    new_data: &[u8],
+    txn_id: TxnId,
+) -> Result<Option<Vec<u8>>, DbError> {
+    page.clear_all_visible();
+
+    let n = num_slots(page);
+    if slot_id >= n {
+        return Err(DbError::InvalidSlot {
+            page_id: page.header().page_id,
+            slot_id,
+            num_slots: n,
+        });
+    }
+    let entry = read_slot(page, slot_id);
+    if entry.is_dead() {
+        return Err(DbError::AlreadyDeleted {
+            page_id: page.header().page_id,
+            slot_id,
+        });
+    }
+
+    let tuple_len_actual = size_of::<RowHeader>() + new_data.len();
+    let tuple_len_alloc = align8(tuple_len_actual);
+    let capacity = slot_capacity(page, slot_id)?;
+    if tuple_len_alloc > capacity {
+        return Ok(None);
+    }
+
+    let off = entry.offset as usize;
+    let old_image = page.as_bytes()[off..off + entry.length as usize].to_vec();
+    let old_header: RowHeader = *bytemuck::from_bytes(&old_image[..size_of::<RowHeader>()]);
+    let new_header = RowHeader {
+        txn_id_created: txn_id,
+        txn_id_deleted: 0,
+        row_version: old_header.row_version.saturating_add(1),
+        _flags: old_header._flags,
+    };
+
+    let raw = page.as_bytes_mut();
+    raw[off..off + size_of::<RowHeader>()].copy_from_slice(bytemuck::bytes_of(&new_header));
+    raw[off + size_of::<RowHeader>()..off + tuple_len_actual].copy_from_slice(new_data);
+    raw[off + tuple_len_actual..off + capacity].fill(0);
+    write_slot(
+        page,
+        slot_id,
+        SlotEntry {
+            offset: entry.offset,
+            length: tuple_len_actual as u16,
+        },
+    );
+
+    Ok(Some(old_image))
+}
+
+pub(crate) fn restore_tuple_image_no_checksum(
+    page: &mut Page,
+    slot_id: u16,
+    tuple_image: &[u8],
+) -> Result<(), DbError> {
+    let n = num_slots(page);
+    if slot_id >= n {
+        return Err(DbError::InvalidSlot {
+            page_id: page.header().page_id,
+            slot_id,
+            num_slots: n,
+        });
+    }
+    let entry = read_slot(page, slot_id);
+    if entry.is_dead() {
+        return Err(DbError::AlreadyDeleted {
+            page_id: page.header().page_id,
+            slot_id,
+        });
+    }
+    let capacity = slot_capacity(page, slot_id)?;
+    let needed = align8(tuple_image.len());
+    if needed > capacity {
+        return Err(DbError::Internal {
+            message: format!(
+                "restore_tuple_image: tuple image of {} bytes no longer fits in slot {} on page {} (capacity {})",
+                tuple_image.len(),
+                slot_id,
+                page.header().page_id,
+                capacity
+            ),
+        });
+    }
+    let off = entry.offset as usize;
+    let raw = page.as_bytes_mut();
+    raw[off..off + tuple_image.len()].copy_from_slice(tuple_image);
+    raw[off + tuple_image.len()..off + capacity].fill(0);
+    write_slot(
+        page,
+        slot_id,
+        SlotEntry {
+            offset: entry.offset,
+            length: tuple_image.len() as u16,
+        },
+    );
+    Ok(())
+}
+
 // ── Compile-time invariant checks ─────────────────────────────────────────────
 
 /// Minimum bytes consumed by a zero-length-data tuple:
@@ -510,10 +732,9 @@ mod tests {
     use crate::page::PageType;
 
     fn fresh_page() -> Page {
-        let mut p = Page::new(PageType::Data, 42);
         // Data pages: free_start and free_end initialized by Page::new
         // free_start = HEADER_SIZE (64), free_end = PAGE_SIZE (16384)
-        p
+        Page::new(PageType::Data, 42)
     }
 
     // ── insert + read ──────────────────────────────────────────────────────
@@ -634,6 +855,62 @@ mod tests {
         assert_eq!(new_hdr.txn_id_deleted, 0);
 
         assert_eq!(page.header().item_count, 2);
+    }
+
+    #[test]
+    fn test_rewrite_tuple_same_slot_preserves_slot_and_returns_old_image() {
+        let mut page = fresh_page();
+        let slot = insert_tuple(&mut page, b"old", 1).unwrap();
+
+        let old_image = rewrite_tuple_same_slot(&mut page, slot, b"new", 2)
+            .unwrap()
+            .unwrap();
+        let old_hdr: RowHeader = *bytemuck::from_bytes(&old_image[..size_of::<RowHeader>()]);
+        assert_eq!(old_hdr.txn_id_created, 1);
+        assert_eq!(&old_image[size_of::<RowHeader>()..], b"old");
+
+        let (hdr, data) = read_tuple(&page, slot).unwrap().unwrap();
+        assert_eq!(data, b"new");
+        assert_eq!(hdr.txn_id_created, 2);
+        assert_eq!(hdr.txn_id_deleted, 0);
+        assert_eq!(hdr.row_version, 1);
+    }
+
+    #[test]
+    fn test_rewrite_tuple_same_slot_returns_none_when_slot_cannot_grow() {
+        let mut page = fresh_page();
+        insert_tuple(&mut page, b"upper", 1).unwrap();
+        let slot = insert_tuple(&mut page, b"low", 1).unwrap();
+
+        let too_large = vec![0u8; 512];
+        let rewritten = rewrite_tuple_same_slot(&mut page, slot, &too_large, 2).unwrap();
+        assert!(
+            rewritten.is_none(),
+            "rewrite must fall back when slot cannot grow"
+        );
+
+        let (hdr, data) = read_tuple(&page, slot).unwrap().unwrap();
+        assert_eq!(data, b"low");
+        assert_eq!(hdr.txn_id_created, 1);
+        assert_eq!(hdr.txn_id_deleted, 0);
+    }
+
+    #[test]
+    fn test_restore_tuple_image_restores_original_header_and_data() {
+        let mut page = fresh_page();
+        let slot = insert_tuple(&mut page, b"before", 7).unwrap();
+        let old_image = read_tuple_image(&page, slot).unwrap().unwrap();
+
+        rewrite_tuple_same_slot(&mut page, slot, b"after", 9)
+            .unwrap()
+            .unwrap();
+        restore_tuple_image(&mut page, slot, &old_image).unwrap();
+
+        let (hdr, data) = read_tuple(&page, slot).unwrap().unwrap();
+        assert_eq!(data, b"before");
+        assert_eq!(hdr.txn_id_created, 7);
+        assert_eq!(hdr.txn_id_deleted, 0);
+        assert_eq!(hdr.row_version, 0);
     }
 
     // ── free space + page full ──────────────────────────────────────────────

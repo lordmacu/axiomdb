@@ -27,7 +27,10 @@
 use axiomdb_core::{error::DbError, TransactionSnapshot, TxnId};
 
 use crate::{
-    heap::{clear_deletion, insert_tuple, num_slots, read_slot, read_tuple_header, scan_visible},
+    heap::{
+        clear_deletion, insert_tuple, num_slots, read_slot, read_tuple_header, scan_visible,
+        try_rewrite_tuple_same_slot_no_checksum,
+    },
     page::{Page, PageType},
     StorageEngine,
 };
@@ -321,6 +324,64 @@ impl HeapChain {
             // ── One checksum + one write for all slots on this page ───────────
             page.update_checksum();
             storage.write_page(page_id, &page)?;
+        }
+
+        Ok(result)
+    }
+
+    /// Tries to rewrite multiple tuples in place, preserving their `(page_id, slot_id)`.
+    ///
+    /// Each input row provides the target `RecordId` and the new application payload
+    /// bytes (already row-codec encoded, excluding the 24-byte `RowHeader`).
+    ///
+    /// Returns a vector parallel to `updates`:
+    /// - `Some(old_tuple_image)` if the rewrite succeeded in place
+    /// - `None` if the new tuple did not fit in the slot capacity and the caller
+    ///   must fall back to delete+insert
+    ///
+    /// Pages are grouped by `page_id`, read once, mutated in memory for every
+    /// successful same-slot rewrite on that page, and written once at the end.
+    pub fn rewrite_batch_same_slot(
+        storage: &mut dyn StorageEngine,
+        root_page_id: u64,
+        updates: &[(axiomdb_core::RecordId, Vec<u8>)],
+        txn_id: TxnId,
+    ) -> Result<Vec<Option<Vec<u8>>>, DbError> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+        storage.prefetch_hint(root_page_id, 0);
+
+        let mut indexed: Vec<(usize, u64, u16, &[u8])> = updates
+            .iter()
+            .enumerate()
+            .map(|(i, (rid, new_row))| (i, rid.page_id, rid.slot_id, new_row.as_slice()))
+            .collect();
+        indexed.sort_unstable_by_key(|(_, page_id, slot_id, _)| (*page_id, *slot_id));
+
+        let mut result: Vec<Option<Vec<u8>>> = vec![None; updates.len()];
+        let mut i = 0;
+        while i < indexed.len() {
+            let page_id = indexed[i].1;
+            let raw = *storage.read_page(page_id)?.as_bytes();
+            let mut page = Page::from_bytes(raw)?;
+            let mut dirty = false;
+
+            while i < indexed.len() && indexed[i].1 == page_id {
+                let (orig_idx, _, slot_id, new_row) = indexed[i];
+                if let Some(old_image) =
+                    try_rewrite_tuple_same_slot_no_checksum(&mut page, slot_id, new_row, txn_id)?
+                {
+                    result[orig_idx] = Some(old_image);
+                    dirty = true;
+                }
+                i += 1;
+            }
+
+            if dirty {
+                page.update_checksum();
+                storage.write_page(page_id, &page)?;
+            }
         }
 
         Ok(result)
@@ -761,9 +822,48 @@ impl HeapChain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
     use axiomdb_core::TransactionSnapshot;
 
     use crate::MemoryStorage;
+
+    struct CountingStorage {
+        inner: MemoryStorage,
+        reads: Arc<AtomicUsize>,
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl crate::StorageEngine for CountingStorage {
+        fn read_page(&self, page_id: u64) -> Result<&Page, DbError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.read_page(page_id)
+        }
+
+        fn write_page(&mut self, page_id: u64, page: &Page) -> Result<(), DbError> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.inner.write_page(page_id, page)
+        }
+
+        fn alloc_page(&mut self, page_type: PageType) -> Result<u64, DbError> {
+            self.inner.alloc_page(page_type)
+        }
+
+        fn free_page(&mut self, page_id: u64) -> Result<(), DbError> {
+            self.inner.free_page(page_id)
+        }
+
+        fn flush(&mut self) -> Result<(), DbError> {
+            self.inner.flush()
+        }
+
+        fn page_count(&self) -> u64 {
+            self.inner.page_count()
+        }
+    }
 
     /// Creates a MemoryStorage with one root heap page allocated.
     fn storage_with_root() -> (MemoryStorage, u64) {
@@ -983,6 +1083,63 @@ mod tests {
             d1, d2,
             "batch and individual insert must produce identical heap contents"
         );
+    }
+
+    #[test]
+    fn test_rewrite_batch_same_slot_reads_and_writes_page_once_per_batch() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut storage = CountingStorage {
+            inner: MemoryStorage::new(),
+            reads: reads.clone(),
+            writes: writes.clone(),
+        };
+        let root = storage.alloc_page(PageType::Data).unwrap();
+        storage
+            .write_page(root, &Page::new(PageType::Data, root))
+            .unwrap();
+
+        let rid1 = HeapChain::insert(&mut storage, root, b"alpha", 1).unwrap();
+        let rid2 = HeapChain::insert(&mut storage, root, b"bravo", 1).unwrap();
+        assert_eq!(rid1.0, rid2.0, "test rows must share one page");
+        let rid1 = axiomdb_core::RecordId {
+            page_id: rid1.0,
+            slot_id: rid1.1,
+        };
+        let rid2 = axiomdb_core::RecordId {
+            page_id: rid2.0,
+            slot_id: rid2.1,
+        };
+
+        reads.store(0, Ordering::Relaxed);
+        writes.store(0, Ordering::Relaxed);
+
+        let rewritten = HeapChain::rewrite_batch_same_slot(
+            &mut storage,
+            root,
+            &[(rid1, b"ALPHA".to_vec()), (rid2, b"BRAVO".to_vec())],
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(rewritten.len(), 2);
+        assert!(rewritten.iter().all(Option::is_some));
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "same-page batch rewrite must read the page once"
+        );
+        assert_eq!(
+            writes.load(Ordering::Relaxed),
+            1,
+            "same-page batch rewrite must write the page once"
+        );
+
+        let rows =
+            HeapChain::scan_visible(&mut storage, root, TransactionSnapshot::committed(2)).unwrap();
+        let payloads: Vec<Vec<u8>> = rows.into_iter().map(|(_, _, d)| d).collect();
+        assert!(payloads.contains(&b"ALPHA".to_vec()));
+        assert!(payloads.contains(&b"BRAVO".to_vec()));
     }
 }
 

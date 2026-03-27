@@ -18,7 +18,8 @@ pub use engine::StorageEngine;
 pub use freelist::FreeList;
 pub use heap::{
     clear_deletion, delete_tuple, free_space, insert_tuple, mark_slot_dead, num_slots, read_tuple,
-    read_tuple_header, scan_visible, update_tuple, RowHeader, SlotEntry, MAX_TUPLE_DATA,
+    read_tuple_header, read_tuple_image, restore_tuple_image, rewrite_tuple_same_slot,
+    scan_visible, slot_capacity, update_tuple, RowHeader, SlotEntry, MAX_TUPLE_DATA,
     MIN_TUPLE_OVERHEAD,
 };
 pub use heap_chain::{chain_next_page, chain_set_next_page, HeapAppendHint, HeapChain};

@@ -48,13 +48,14 @@
 
 use axiomdb_catalog::schema::{ColumnDef, ColumnType, TableDef};
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
-use axiomdb_storage::{HeapAppendHint, HeapChain, StorageEngine};
+use axiomdb_storage::{HeapAppendHint, HeapChain, RowHeader, StorageEngine};
 use axiomdb_types::{
     codec::{decode_row, decode_row_masked, encode_row},
     coerce::{coerce, CoercionMode},
     DataType, Value,
 };
 use axiomdb_wal::TxnManager;
+use std::mem::size_of;
 
 use crate::session::SessionContext;
 
@@ -473,47 +474,10 @@ impl TableEngine {
             });
         }
 
-        // Read old bytes BEFORE any mutation (slot becomes dead after delete).
-        let old_bytes = HeapChain::read_row(storage, record_id.page_id, record_id.slot_id)?.ok_or(
-            DbError::AlreadyDeleted {
-                page_id: record_id.page_id,
-                slot_id: record_id.slot_id,
-            },
-        )?;
-
         let col_types = column_data_types(columns);
         let coerced = coerce_values(new_values, columns)?;
         let new_encoded = encode_row(&coerced, &col_types)?;
-
-        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
-
-        // Step 1: stamp deletion on the old row, WAL-log the delete.
-        HeapChain::delete(storage, record_id.page_id, record_id.slot_id, txn_id)?;
-        let old_key = encode_rid(record_id.page_id, record_id.slot_id);
-        txn.record_delete(
-            table_def.id,
-            &old_key,
-            &old_bytes,
-            record_id.page_id,
-            record_id.slot_id,
-        )?;
-
-        // Step 2: insert the new row into the chain, WAL-log the insert.
-        let (new_page_id, new_slot_id) =
-            HeapChain::insert(storage, table_def.data_root_page_id, &new_encoded, txn_id)?;
-        let new_key = encode_rid(new_page_id, new_slot_id);
-        txn.record_insert(
-            table_def.id,
-            &new_key,
-            &new_encoded,
-            new_page_id,
-            new_slot_id,
-        )?;
-
-        Ok(RecordId {
-            page_id: new_page_id,
-            slot_id: new_slot_id,
-        })
+        update_encoded_row_with_hint(storage, txn, table_def, record_id, &new_encoded, None)
     }
 
     /// Updates one row using a heap-tail hint for the insert half.
@@ -536,44 +500,10 @@ impl TableEngine {
                 got: format!("{} values", new_values.len()),
             });
         }
-        let old_bytes =
-            axiomdb_storage::HeapChain::read_row(storage, record_id.page_id, record_id.slot_id)?
-                .ok_or(DbError::AlreadyDeleted {
-                    page_id: record_id.page_id,
-                    slot_id: record_id.slot_id,
-                })?;
         let col_types = column_data_types(columns);
         let coerced = coerce_values(new_values, columns)?;
         let new_encoded = encode_row(&coerced, &col_types)?;
-        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
-        axiomdb_storage::HeapChain::delete(storage, record_id.page_id, record_id.slot_id, txn_id)?;
-        let old_key = encode_rid(record_id.page_id, record_id.slot_id);
-        txn.record_delete(
-            table_def.id,
-            &old_key,
-            &old_bytes,
-            record_id.page_id,
-            record_id.slot_id,
-        )?;
-        let (new_page_id, new_slot_id) = HeapChain::insert_with_hint(
-            storage,
-            table_def.data_root_page_id,
-            &new_encoded,
-            txn_id,
-            hint,
-        )?;
-        let new_key = encode_rid(new_page_id, new_slot_id);
-        txn.record_insert(
-            table_def.id,
-            &new_key,
-            &new_encoded,
-            new_page_id,
-            new_slot_id,
-        )?;
-        Ok(RecordId {
-            page_id: new_page_id,
-            slot_id: new_slot_id,
-        })
+        update_encoded_row_with_hint(storage, txn, table_def, record_id, &new_encoded, hint)
     }
 
     // ── ctx-aware write variants (session strict_mode + warning emission) ─────
@@ -699,51 +629,25 @@ impl TableEngine {
                 got: format!("{} values", new_values.len()),
             });
         }
-        let old_bytes = HeapChain::read_row(storage, record_id.page_id, record_id.slot_id)?.ok_or(
-            DbError::AlreadyDeleted {
-                page_id: record_id.page_id,
-                slot_id: record_id.slot_id,
-            },
-        )?;
         let col_types = column_data_types(columns);
         let coerced = coerce_values_with_ctx(new_values, columns, ctx, 1)?;
         let new_encoded = encode_row(&coerced, &col_types)?;
-        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
-        HeapChain::delete(storage, record_id.page_id, record_id.slot_id, txn_id)?;
-        let old_key = encode_rid(record_id.page_id, record_id.slot_id);
-        txn.record_delete(
-            table_def.id,
-            &old_key,
-            &old_bytes,
-            record_id.page_id,
-            record_id.slot_id,
-        )?;
         // Phase 5.18: use session heap-tail hint for the insert half of UPDATE.
         let mut hint_opt = ctx.get_heap_tail_hint(table_def.id, table_def.data_root_page_id);
-        let (new_page_id, new_slot_id) = HeapChain::insert_with_hint(
+        let new_rid = update_encoded_row_with_hint(
             storage,
-            table_def.data_root_page_id,
+            txn,
+            table_def,
+            record_id,
             &new_encoded,
-            txn_id,
             hint_opt.as_mut(),
         )?;
         if let Some(h) = hint_opt {
             ctx.set_heap_tail_hint(table_def.id, h.root_page_id, h.tail_page_id);
         } else {
-            ctx.set_heap_tail_hint(table_def.id, table_def.data_root_page_id, new_page_id);
+            ctx.set_heap_tail_hint(table_def.id, table_def.data_root_page_id, new_rid.page_id);
         }
-        let new_key = encode_rid(new_page_id, new_slot_id);
-        txn.record_insert(
-            table_def.id,
-            &new_key,
-            &new_encoded,
-            new_page_id,
-            new_slot_id,
-        )?;
-        Ok(RecordId {
-            page_id: new_page_id,
-            slot_id: new_slot_id,
-        })
+        Ok(new_rid)
     }
 
     /// Session-aware batch update: applies strict or permissive coercion per row
@@ -800,6 +704,102 @@ impl TableEngine {
 
         Ok(rids.len() as u64)
     }
+
+    /// Updates rows while attempting to preserve each row's `RecordId`.
+    ///
+    /// For every row, AxiomDB first tries a same-slot rewrite in the heap. If
+    /// the new encoded row fits in the existing slot capacity, the row keeps the
+    /// same `(page_id, slot_id)` and the WAL records an `UpdateInPlace`. If the
+    /// row does not fit, this falls back to the existing delete+insert path and
+    /// returns a new `RecordId`.
+    ///
+    /// The returned vector is parallel to `updates`.
+    pub fn update_rows_preserve_rid(
+        storage: &mut dyn StorageEngine,
+        txn: &mut TxnManager,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        updates: Vec<(RecordId, Vec<Value>)>,
+    ) -> Result<Vec<RecordId>, DbError> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let col_types = column_data_types(columns);
+        let prepared: Vec<(RecordId, Vec<u8>)> = updates
+            .into_iter()
+            .map(|(rid, values)| {
+                if values.len() != columns.len() {
+                    return Err(DbError::TypeMismatch {
+                        expected: format!("{} columns", columns.len()),
+                        got: format!("{} values", values.len()),
+                    });
+                }
+                let coerced = coerce_values(values, columns)?;
+                let encoded = encode_row(&coerced, &col_types)?;
+                Ok((rid, encoded))
+            })
+            .collect::<Result<_, _>>()?;
+
+        apply_prepared_updates_preserve_rid(storage, txn, table_def, prepared, None)
+    }
+
+    /// Session-aware stable-RID batch update.
+    ///
+    /// Uses the same preserve-RID fast path as [`update_rows_preserve_rid`], but
+    /// applies strict/permissive coercion with warning emission through `ctx`.
+    pub fn update_rows_preserve_rid_with_ctx(
+        storage: &mut dyn StorageEngine,
+        txn: &mut TxnManager,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        ctx: &mut SessionContext,
+        updates: Vec<(RecordId, Vec<Value>)>,
+    ) -> Result<Vec<RecordId>, DbError> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let col_types = column_data_types(columns);
+        let prepared: Vec<(RecordId, Vec<u8>)> = updates
+            .into_iter()
+            .enumerate()
+            .map(|(i, (rid, values))| {
+                if values.len() != columns.len() {
+                    return Err(DbError::TypeMismatch {
+                        expected: format!("{} columns", columns.len()),
+                        got: format!("{} values", values.len()),
+                    });
+                }
+                let coerced = coerce_values_with_ctx(values, columns, ctx, i + 1)?;
+                let encoded = encode_row(&coerced, &col_types)?;
+                Ok((rid, encoded))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let mut hint_opt = ctx.get_heap_tail_hint(table_def.id, table_def.data_root_page_id);
+        let original_rids: Vec<RecordId> = prepared.iter().map(|(rid, _)| *rid).collect();
+        let new_rids = apply_prepared_updates_preserve_rid(
+            storage,
+            txn,
+            table_def,
+            prepared,
+            hint_opt.as_mut(),
+        )?;
+        if let Some(h) = hint_opt {
+            ctx.set_heap_tail_hint(table_def.id, h.root_page_id, h.tail_page_id);
+        } else if let Some(last_fallback) = original_rids
+            .iter()
+            .zip(new_rids.iter())
+            .rev()
+            .find_map(|(old_rid, new_rid)| (old_rid != new_rid).then_some(*new_rid))
+        {
+            ctx.set_heap_tail_hint(
+                table_def.id,
+                table_def.data_root_page_id,
+                last_fallback.page_id,
+            );
+        }
+        Ok(new_rids)
+    }
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -839,6 +839,141 @@ fn encode_rid(page_id: u64, slot_id: u16) -> [u8; 10] {
     buf[..8].copy_from_slice(&page_id.to_le_bytes());
     buf[8..].copy_from_slice(&slot_id.to_le_bytes());
     buf
+}
+
+fn build_in_place_tuple_image(
+    old_tuple_image: &[u8],
+    new_encoded: &[u8],
+    txn_id: u64,
+) -> Result<Vec<u8>, DbError> {
+    if old_tuple_image.len() < size_of::<RowHeader>() {
+        return Err(DbError::Internal {
+            message: "stable-RID update: old tuple image shorter than RowHeader".into(),
+        });
+    }
+    let old_header = RowHeader {
+        txn_id_created: u64::from_le_bytes(old_tuple_image[0..8].try_into().unwrap()),
+        txn_id_deleted: u64::from_le_bytes(old_tuple_image[8..16].try_into().unwrap()),
+        row_version: u32::from_le_bytes(old_tuple_image[16..20].try_into().unwrap()),
+        _flags: u32::from_le_bytes(old_tuple_image[20..24].try_into().unwrap()),
+    };
+    let new_header = RowHeader {
+        txn_id_created: txn_id,
+        txn_id_deleted: 0,
+        row_version: old_header.row_version.saturating_add(1),
+        _flags: old_header._flags,
+    };
+    let mut image = Vec::with_capacity(size_of::<RowHeader>() + new_encoded.len());
+    image.extend_from_slice(&new_header.txn_id_created.to_le_bytes());
+    image.extend_from_slice(&new_header.txn_id_deleted.to_le_bytes());
+    image.extend_from_slice(&new_header.row_version.to_le_bytes());
+    image.extend_from_slice(&new_header._flags.to_le_bytes());
+    image.extend_from_slice(new_encoded);
+    Ok(image)
+}
+
+fn update_encoded_row_with_hint(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_def: &TableDef,
+    record_id: RecordId,
+    new_encoded: &[u8],
+    hint: Option<&mut HeapAppendHint>,
+) -> Result<RecordId, DbError> {
+    let old_bytes = HeapChain::read_row(storage, record_id.page_id, record_id.slot_id)?.ok_or(
+        DbError::AlreadyDeleted {
+            page_id: record_id.page_id,
+            slot_id: record_id.slot_id,
+        },
+    )?;
+
+    let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+    HeapChain::delete(storage, record_id.page_id, record_id.slot_id, txn_id)?;
+    let old_key = encode_rid(record_id.page_id, record_id.slot_id);
+    txn.record_delete(
+        table_def.id,
+        &old_key,
+        &old_bytes,
+        record_id.page_id,
+        record_id.slot_id,
+    )?;
+
+    let (new_page_id, new_slot_id) = match hint {
+        Some(h) => HeapChain::insert_with_hint(
+            storage,
+            table_def.data_root_page_id,
+            new_encoded,
+            txn_id,
+            Some(h),
+        )?,
+        None => HeapChain::insert(storage, table_def.data_root_page_id, new_encoded, txn_id)?,
+    };
+    let new_key = encode_rid(new_page_id, new_slot_id);
+    txn.record_insert(
+        table_def.id,
+        &new_key,
+        new_encoded,
+        new_page_id,
+        new_slot_id,
+    )?;
+
+    Ok(RecordId {
+        page_id: new_page_id,
+        slot_id: new_slot_id,
+    })
+}
+
+fn apply_prepared_updates_preserve_rid(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_def: &TableDef,
+    prepared: Vec<(RecordId, Vec<u8>)>,
+    mut hint: Option<&mut HeapAppendHint>,
+) -> Result<Vec<RecordId>, DbError> {
+    if prepared.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+    let rewrite_results = HeapChain::rewrite_batch_same_slot(
+        storage,
+        table_def.data_root_page_id,
+        &prepared,
+        txn_id,
+    )?;
+
+    let mut new_rids = Vec::with_capacity(prepared.len());
+    for ((rid, new_encoded), rewrite_result) in prepared.iter().zip(rewrite_results.into_iter()) {
+        match rewrite_result {
+            Some(old_tuple_image) => {
+                let key = encode_rid(rid.page_id, rid.slot_id);
+                let new_tuple_image =
+                    build_in_place_tuple_image(&old_tuple_image, new_encoded, txn_id)?;
+                txn.record_update_in_place(
+                    table_def.id,
+                    &key,
+                    &old_tuple_image,
+                    &new_tuple_image,
+                    rid.page_id,
+                    rid.slot_id,
+                )?;
+                new_rids.push(*rid);
+            }
+            None => {
+                let new_rid = update_encoded_row_with_hint(
+                    storage,
+                    txn,
+                    table_def,
+                    *rid,
+                    new_encoded,
+                    hint.as_deref_mut(),
+                )?;
+                new_rids.push(new_rid);
+            }
+        }
+    }
+
+    Ok(new_rids)
 }
 
 /// Applies strict-mode coercion to each value against its target column type.
@@ -924,6 +1059,17 @@ fn coerce_values_with_ctx(
 mod tests {
     use super::*;
     use axiomdb_catalog::schema::ColumnType;
+    use axiomdb_storage::{MemoryStorage, Page, PageType};
+    use axiomdb_wal::TxnManager;
+
+    fn test_table_def(root_page_id: u64) -> TableDef {
+        TableDef {
+            id: 1,
+            data_root_page_id: root_page_id,
+            schema_name: "public".into(),
+            table_name: "t".into(),
+        }
+    }
 
     fn make_col(name: &str, col_type: ColumnType) -> ColumnDef {
         ColumnDef {
@@ -976,5 +1122,61 @@ mod tests {
     fn test_encode_rid_zero() {
         let key = encode_rid(0, 0);
         assert_eq!(key, [0u8; 10]);
+    }
+
+    #[test]
+    fn test_update_rows_preserve_rid_keeps_same_record_id_when_row_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("table-test.wal");
+        let mut storage = MemoryStorage::new();
+        let root_page_id = storage.alloc_page(PageType::Data).unwrap();
+        let root = Page::new(PageType::Data, root_page_id);
+        storage.write_page(root_page_id, &root).unwrap();
+
+        let table = test_table_def(root_page_id);
+        let cols = vec![
+            ColumnDef {
+                table_id: 1,
+                col_idx: 0,
+                name: "id".into(),
+                col_type: ColumnType::Int,
+                nullable: false,
+                auto_increment: false,
+            },
+            ColumnDef {
+                table_id: 1,
+                col_idx: 1,
+                name: "score".into(),
+                col_type: ColumnType::Int,
+                nullable: false,
+                auto_increment: false,
+            },
+        ];
+
+        let mut txn = TxnManager::create(&wal).unwrap();
+        txn.begin().unwrap();
+        let rid = TableEngine::insert_row(
+            &mut storage,
+            &mut txn,
+            &table,
+            &cols,
+            vec![Value::Int(1), Value::Int(10)],
+        )
+        .unwrap();
+
+        let new_rids = TableEngine::update_rows_preserve_rid(
+            &mut storage,
+            &mut txn,
+            &table,
+            &cols,
+            vec![(rid, vec![Value::Int(1), Value::Int(11)])],
+        )
+        .unwrap();
+        assert_eq!(new_rids, vec![rid], "same-slot rewrite must preserve RID");
+
+        let row = TableEngine::read_row(&storage, &cols, rid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row, vec![Value::Int(1), Value::Int(11)]);
     }
 }

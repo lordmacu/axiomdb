@@ -493,11 +493,35 @@ pub enum Stmt {
 
 ---
 
-## Scalar Function Evaluator (`eval.rs`)
+## Scalar Function Evaluator (`eval/`)
 
-The expression evaluator (`crates/axiomdb-sql/src/eval.rs`) dispatches on
-function name (lowercased) in `eval_function`. The function registry is a
-single `match` arm — no hash map, no dynamic dispatch.
+The expression evaluator now lives under `crates/axiomdb-sql/src/eval/`, rooted
+at `eval/mod.rs`. The facade keeps the same exported surface (`eval`,
+`eval_with`, `eval_in_session`, `eval_with_in_session`, `is_truthy`,
+`like_match`, `CollationGuard`, `SubqueryRunner`), but the implementation is
+split by responsibility:
+
+- `context.rs` — thread-local session collation, `CollationGuard`, and
+  `SubqueryRunner`
+- `core.rs` — recursive `Expr` evaluation, CASE dispatch, and subquery-aware paths
+- `ops.rs` — boolean logic, comparisons, `IN`, `LIKE`, and truthiness helpers
+- `functions/` — built-ins grouped by family (`system`, `nulls`, `numeric`,
+  `string`, `datetime`, `binary`, `uuid`)
+
+Built-in function dispatch still happens by lowercased name inside
+`functions/mod.rs`. The registry remains a single `match` arm: no hash map and
+no dynamic dispatch.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Split Without Semantic Drift</span>
+Like PostgreSQL's separation between expression evaluation helpers and executor nodes,
+AxiomDB now splits evaluator internals by responsibility while keeping the same public
+entrypoints and static built-in dispatch. The payoff is lower maintenance cost without
+adding virtual dispatch or a mutable function registry.
+</div>
+</div>
 
 ### Date / Time Functions (4.19d)
 

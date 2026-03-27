@@ -25,7 +25,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use axiomdb_core::{error::DbError, TxnId};
-use axiomdb_storage::{clear_deletion, heap_chain::HeapChain, mark_slot_dead, Page, StorageEngine};
+use axiomdb_storage::{
+    clear_deletion, heap_chain::HeapChain, mark_slot_dead, restore_tuple_image, Page, StorageEngine,
+};
 
 use crate::{
     checkpoint::Checkpointer, entry::EntryType, reader::WalReader, txn::decode_physical_loc,
@@ -40,6 +42,12 @@ pub enum RecoveryOp {
     Insert { page_id: u64, slot_id: u16 },
     /// Undo a DELETE: clear `txn_id_deleted` in the RowHeader (restore the row).
     Delete { page_id: u64, slot_id: u16 },
+    /// Undo a stable-RID in-place update by restoring the old tuple image.
+    UpdateInPlace {
+        page_id: u64,
+        slot_id: u16,
+        old_image: Vec<u8>,
+    },
     /// Undo a full-table delete: clear txn_id_deleted for all slots deleted by
     /// this transaction in the heap chain starting at root_page_id.
     Truncate { root_page_id: u64, txn_id: TxnId },
@@ -99,6 +107,7 @@ impl CrashRecovery {
                     EntryType::Insert
                     | EntryType::Delete
                     | EntryType::Update
+                    | EntryType::UpdateInPlace
                     | EntryType::Truncate
                     | EntryType::PageWrite
                     | EntryType::Checkpoint => {}
@@ -189,6 +198,17 @@ impl CrashRecovery {
                         }
                     }
                 }
+                EntryType::UpdateInPlace => {
+                    if let Some(ops) = in_progress.get_mut(&entry.txn_id) {
+                        if let Some((page_id, slot_id)) = decode_physical_loc(&entry.old_value) {
+                            ops.push(RecoveryOp::UpdateInPlace {
+                                page_id,
+                                slot_id,
+                                old_image: entry.old_value[crate::txn::PHYSICAL_LOC_LEN..].to_vec(),
+                            });
+                        }
+                    }
+                }
                 EntryType::Checkpoint => {} // no heap changes to undo
                 EntryType::PageWrite => {
                     // Compact new_value layout (no page bytes stored):
@@ -265,6 +285,16 @@ impl CrashRecovery {
                         }
                         storage.write_page(page_id, &page)?;
                     }
+                    RecoveryOp::UpdateInPlace {
+                        page_id,
+                        slot_id,
+                        old_image,
+                    } => {
+                        let bytes = *storage.read_page(page_id)?.as_bytes();
+                        let mut page = Page::from_bytes(bytes)?;
+                        restore_tuple_image(&mut page, slot_id, &old_image)?;
+                        storage.write_page(page_id, &page)?;
+                    }
                     RecoveryOp::Truncate {
                         root_page_id,
                         txn_id,
@@ -293,7 +323,10 @@ impl CrashRecovery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axiomdb_storage::{insert_tuple, read_tuple, MemoryStorage, MmapStorage, Page, PageType};
+    use axiomdb_storage::{
+        insert_tuple, read_tuple, read_tuple_image, rewrite_tuple_same_slot, MemoryStorage,
+        MmapStorage, Page, PageType,
+    };
 
     use crate::{TxnManager, WalWriter};
 
@@ -492,6 +525,46 @@ mod tests {
             read_tuple(page, new_slot).unwrap().is_none(),
             "new slot from crashed UPDATE must be dead"
         );
+    }
+
+    #[test]
+    fn test_recover_undoes_crashed_update_in_place() {
+        let (_dir, wal) = temp_setup();
+        let mut storage = MemoryStorage::new();
+        let page_id = fresh_data_page(&mut storage);
+        let mut mgr = TxnManager::create(&wal).unwrap();
+
+        let txn1 = mgr.begin().unwrap();
+        let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
+        let mut page = Page::from_bytes(page_bytes).unwrap();
+        let slot_id = insert_tuple(&mut page, b"original", txn1).unwrap();
+        storage.write_page(page_id, &page).unwrap();
+        mgr.record_insert(1, b"k", b"original", page_id, slot_id)
+            .unwrap();
+        mgr.commit().unwrap();
+
+        let txn2 = mgr.begin().unwrap();
+        {
+            let bytes = *storage.read_page(page_id).unwrap().as_bytes();
+            let mut p = Page::from_bytes(bytes).unwrap();
+            let old_image = rewrite_tuple_same_slot(&mut p, slot_id, b"updated", txn2)
+                .unwrap()
+                .unwrap();
+            let new_image = read_tuple_image(&p, slot_id).unwrap().unwrap();
+            storage.write_page(page_id, &p).unwrap();
+            mgr.record_update_in_place(1, b"k", &old_image, &new_image, page_id, slot_id)
+                .unwrap();
+        }
+        drop(mgr);
+
+        CrashRecovery::recover(&mut storage, &wal).unwrap();
+
+        let page = storage.read_page(page_id).unwrap();
+        let (hdr, data) = read_tuple(page, slot_id).unwrap().unwrap();
+        assert_eq!(data, b"original");
+        assert_eq!(hdr.txn_id_created, 1);
+        assert_eq!(hdr.txn_id_deleted, 0);
+        assert_eq!(hdr.row_version, 0);
     }
 
     // ── recover: idempotency ──────────────────────────────────────────────────

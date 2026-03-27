@@ -77,3 +77,20 @@
 - A slow `DELETE` or `UPDATE` can bottleneck in candidate discovery or in index maintenance; do not treat them as one problem by default.
 - `6.3b` fixed candidate discovery for `DELETE ... WHERE`; `5.19` only became obvious after re-measuring and isolating the remaining per-row `delete_in(...)` loop.
 - For DML optimizations, keep one test layer for planner/executor semantics and another for direct tree/storage primitives. One without the other leaves too much room for false confidence.
+
+## 2026-03-26 - Changed columns are not enough to skip UPDATE index work
+
+- In AxiomDB, “the SET clause did not touch indexed columns” is not by itself a safe reason to skip index maintenance.
+- If the heap update changes the `RecordId`, every index entry that stores that RID is logically stale even when the key bytes are identical.
+- The safe rule is stronger:
+  - skip an index only if the RID stayed stable
+  - and the logical key / predicate membership for that index stayed the same
+- This is the same structural reason PostgreSQL HOT can skip index writes and the old AxiomDB path could not.
+
+## 2026-03-26 - Use incremental validation during implementation
+
+- Do not run `cargo test --workspace` after every edit or every short implementation cycle.
+- During implementation, start with `cargo test -p <touched-crate>` and expand only to directly affected dependent crates.
+- Expand the validation scope when the change touches public APIs, shared crates, on-disk format, WAL/recovery, SQL semantics, or MySQL wire-visible behavior.
+- Run `tools/wire-test.py` only when the change is observable through the MySQL protocol.
+- Keep `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo fmt --check` as the final close/review gate, not the inner development loop.

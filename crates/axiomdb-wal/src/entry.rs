@@ -78,6 +78,13 @@ pub enum EntryType {
     /// `slot_id` dead on the given page — identical to undoing N `Insert` entries.
     /// The `page_bytes` are preserved for future REDO support (Phase 3.8b).
     PageWrite = 9,
+    /// Stable-RID in-place update.
+    ///
+    /// `old_value` = `[page_id:8][slot_id:2][old tuple image...]`
+    /// `new_value` = `[page_id:8][slot_id:2][new tuple image...]`
+    ///
+    /// Undo restores the exact old tuple image at the same physical location.
+    UpdateInPlace = 10,
 }
 
 impl TryFrom<u8> for EntryType {
@@ -94,6 +101,7 @@ impl TryFrom<u8> for EntryType {
             7 => Ok(Self::Checkpoint),
             8 => Ok(Self::Truncate),
             9 => Ok(Self::PageWrite),
+            10 => Ok(Self::UpdateInPlace),
             _ => Err(DbError::WalUnknownEntryType { byte }),
         }
     }

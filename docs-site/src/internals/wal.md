@@ -99,12 +99,18 @@ pub enum EntryType {
     Update     = 6,  // UPDATE: both old_value and new_value are present
     Checkpoint = 7,  // CHECKPOINT: marks the LSN up to which pages are flushed to disk
     Truncate   = 8,  // Full-table delete (DELETE without WHERE, TRUNCATE TABLE)
+    PageWrite  = 9,  // Bulk insert page image + slot list
+    UpdateInPlace = 10, // Stable-RID same-slot update
 }
 ```
 
 Transaction entries (`Begin`, `Commit`, `Rollback`) carry no key or value payload —
 `key_len = 0`, `old_val_len = 0`, `new_val_len = 0`. The minimum entry size of 43 bytes
 applies to these records.
+
+`PageWrite` and `UpdateInPlace` are physical optimization records. They do not change
+SQL-visible semantics; they only change how AxiomDB amortizes I/O for common write
+patterns while preserving rollback and crash recovery guarantees.
 
 ---
 
@@ -192,6 +198,66 @@ found by `scan_rids_visible()` — re-applying the deletion to any pages that ma
 have been flushed before the crash. If the transaction was not committed (no matching
 `Commit` entry in the WAL), the entry is skipped: the heap still contains the
 pre-delete state because the crash occurred before the commit was durable.
+
+---
+
+## WalEntry::UpdateInPlace — Stable-RID UPDATE
+
+`WalEntry::UpdateInPlace` (entry type 10) records a same-slot heap rewrite. It is
+emitted when UPDATE can preserve the original `(page_id, slot_id)` because the new
+encoded row still fits in the existing heap slot.
+
+### Binary Format
+
+```text
+Field           Value
+─────────────── ───────────────────────────────────────────────────────────────
+entry_type      10 (UpdateInPlace)
+table_id        target table ID
+key             logical row key carried by the caller
+old_value       [page_id:8][slot_id:2][old tuple image...]
+new_value       [page_id:8][slot_id:2][new tuple image...]
+```
+
+The tuple image is the full logical row image stored in the slot:
+
+```text
+[RowHeader || encoded row bytes]
+```
+
+Undo and crash recovery decode the physical location from the first 10 bytes and then
+restore the old tuple image directly into the same slot.
+
+### Why a New Entry Type Instead of Reusing Update
+
+Classic `Update` in AxiomDB means logical delete+insert and therefore carries two
+different physical locations. `UpdateInPlace` means “same physical location, bytes
+changed in place”. Reusing `Update` would blur those two recovery contracts and make
+undo logic branch on payload shape instead of entry type.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Physical Contract Is Explicit</span>
+PostgreSQL HOT also distinguishes between “new tuple version elsewhere” and “same-page
+optimization” at the storage-contract level. AxiomDB keeps that distinction explicit in
+the WAL so recovery can restore the exact old tuple image without guessing which UPDATE
+shape was used.
+</div>
+</div>
+
+### Undo and Recovery
+
+Rollback and crash recovery treat `UpdateInPlace` as a direct restore:
+
+```text
+read page(page_id)
+restore old tuple image at slot_id
+write page(page_id)
+```
+
+If the transaction committed, recovery leaves the rewritten bytes in place. If the
+transaction did not commit, recovery restores `old_value` to the same slot.
 
 ---
 

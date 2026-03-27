@@ -41,6 +41,40 @@
 - `UPDATE` now batch-deletes old keys before reinserting new keys, which keeps
   PRIMARY KEY and secondary indexes correct even though heap `RecordId`s change.
 
+## 2026-03-26 — Eval decomposition
+
+- `crates/axiomdb-sql/src/eval.rs` was replaced by `crates/axiomdb-sql/src/eval/`.
+- `eval/mod.rs` keeps the old public facade:
+  - `eval`
+  - `eval_with`
+  - `eval_in_session`
+  - `eval_with_in_session`
+  - `is_truthy`
+  - `like_match`
+  - `CollationGuard`
+  - `ClosureRunner`
+  - `NoSubquery`
+  - `SubqueryRunner`
+- Internal responsibilities are now split into:
+  - `context.rs`
+  - `core.rs`
+  - `ops.rs`
+  - `functions/` by family
+- This is structural only. No SQL-visible evaluator behavior changed.
+
+## 2026-03-26 — Stable-RID UPDATE fast path
+
+- `axiomdb-storage/src/heap.rs` now exposes same-slot tuple rewrite/restore helpers.
+- `axiomdb-storage/src/heap_chain.rs` batches same-page stable-RID rewrites so a
+  page is read once and written once for the eligible rows in that batch.
+- `axiomdb-wal` adds `EntryType::UpdateInPlace` plus matching undo/recovery handling.
+- `axiomdb-sql/src/table.rs` now tries a preserve-RID branch before falling back to
+  heap delete+insert.
+- Index skipping in UPDATE is now keyed on two facts together:
+  - the RID stayed stable
+  - the logical key / partial-index membership for that index did not change
+- This fixed the large UPDATE throughput gap without weakening rollback or recovery.
+
 ## 2026-03-26 — Explicit MySQL connection lifecycle
 
 - `axiomdb-network/src/mysql/lifecycle.rs` now owns transport-phase tracking for
