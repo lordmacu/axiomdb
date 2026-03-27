@@ -232,9 +232,9 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         | DbError::ColumnIndexOutOfBounds { .. }
         | DbError::CatalogTableNotFound { .. }
         | DbError::CatalogIndexNotFound { .. }
+        | DbError::IndexIntegrityFailure { .. }
         | DbError::SequenceOverflow
         | DbError::InvalidDsn { .. }
-        | DbError::IndexIntegrityFailure { .. }
         | DbError::Internal { .. }
         | DbError::Other(_) => false,
     }

@@ -66,8 +66,8 @@ an exact full-table NDV count.
 AxiomDB computes exact distinct value counts using a HashSet of encoded key bytes.
 PostgreSQL uses Vitter's reservoir sampling algorithm (Duj1 estimator) for large
 tables to avoid the O(n) full scan. Exact counting is correct and simpler for the
-typical table sizes of an embedded database. Sampling is planned for Phase 6.15
-when tables exceed 1 M rows.
+typical table sizes of an embedded database. Sampling is planned for a future
+statistics phase when tables exceed 1 M rows.
 </div>
 </div>
 
@@ -255,8 +255,9 @@ in use, and the meta page records the root page IDs for each catalog B+ Tree.
 
 ## Catalog Invariants
 
-The following invariants must hold at all times. The post-recovery integrity checker
-(`axiomdb-embedded::integrity`) verifies them after crash recovery:
+The following invariants must hold at all times. The startup verifier in
+`axiomdb-sql::index_integrity` now re-checks the index-related ones after WAL
+recovery and before server or embedded mode starts serving traffic:
 
 1. Every table listed in `axiom_tables` has at least one row in `axiom_columns`.
 2. Every column in `axiom_columns` references a `table_id` that exists in `axiom_tables`.
@@ -266,5 +267,26 @@ The following invariants must hold at all times. The post-recovery integrity che
 6. No two tables in the same schema have the same name.
 7. No two indexes on the same table have the same name.
 
-If any invariant is violated after recovery, AxiomDB enters a read-only safe mode and
-requires manual intervention.
+### Startup index integrity verification
+
+For every catalog-visible index:
+
+1. enumerate the expected entries from heap-visible rows
+2. enumerate the actual B+ Tree entries from `root_page_id`
+3. compare them exactly
+4. if the tree is readable but divergent, rebuild a fresh root from heap
+5. rotate the catalog root in a WAL-protected transaction
+6. defer free of the old tree pages until commit durability is confirmed
+
+If the tree cannot be traversed safely, open fails with `IndexIntegrityFailure`.
+The database does **not** enter a best-effort serving mode with an untrusted index.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Heap As Source Of Truth</span>
+Like SQLite's <code>REINDEX</code>, AxiomDB rebuilds a readable divergent index from heap rows
+instead of trying to patch arbitrary leaf-level damage in place. This keeps recovery logic small
+and makes the catalog root swap the only logical state transition.
+</div>
+</div>

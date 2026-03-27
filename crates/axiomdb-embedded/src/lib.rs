@@ -73,7 +73,7 @@ mod db {
     use axiomdb_core::{error::DbError, parse_dsn, ParsedDsn};
     use axiomdb_sql::{
         analyze_cached, bloom::BloomRegistry, execute_with_ctx, parse, result::QueryResult,
-        SchemaCache, SessionContext,
+        verify_and_repair_indexes_on_open, SchemaCache, SessionContext,
     };
     use axiomdb_storage::MmapStorage;
     use axiomdb_wal::TxnManager;
@@ -124,7 +124,8 @@ mod db {
 
             let (storage, txn) = if db_path.exists() {
                 let mut storage = MmapStorage::open(&db_path)?;
-                let (txn, _recovery) = TxnManager::open_with_recovery(&mut storage, &wal_path)?;
+                let (mut txn, _recovery) = TxnManager::open_with_recovery(&mut storage, &wal_path)?;
+                verify_and_repair_indexes_on_open(&mut storage, &mut txn)?;
                 (storage, txn)
             } else {
                 let mut storage = MmapStorage::create(&db_path)?;

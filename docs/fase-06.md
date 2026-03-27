@@ -1,6 +1,6 @@
 # Phase 6 — Secondary Indexes + Query Planner
 
-## Subfases completed in this session: 6.1, 6.1b, 6.2, 6.2b, 6.3
+## Subfases completed in this session: 6.1, 6.1b, 6.2, 6.2b, 6.3, 6.15
 
 ## What was built
 
@@ -104,3 +104,79 @@ Total: 1135 tests pass (was 1124 before this phase).
 - `⚠️` Bloom filter per index — deferred to 6.4
 - `⚠️` MVCC on secondary indexes — deferred to 6.14
 - `⚠️` Index statistics (NDV, row counts) — deferred to 6.10
+
+## 6.15 — Index corruption detection
+
+`6.15` adds a startup-time logical integrity pass for secondary and primary
+indexes. The new verifier lives in
+`crates/axiomdb-sql/src/index_integrity.rs` and runs immediately after WAL
+recovery in both:
+
+- `crates/axiomdb-network/src/mysql/database.rs`
+- `crates/axiomdb-embedded/src/lib.rs`
+
+### What it does
+
+For every catalog-visible table and index:
+
+1. scan heap-visible rows under the committed snapshot
+2. derive the exact expected index entries using the same key encoding and
+   partial-index predicate semantics as normal DML maintenance
+3. enumerate the actual B+ Tree entries from the catalog root
+4. compare expected vs actual
+
+If the tree is readable but divergent, AxiomDB:
+
+- rebuilds a fresh index root from heap contents
+- flushes the rebuilt pages
+- rotates the catalog root inside a WAL-protected transaction
+- defers free of the old tree pages until commit durability is confirmed
+
+If the tree cannot be traversed safely, open fails with
+`DbError::IndexIntegrityFailure` and the database never starts serving traffic.
+
+### Code changes
+
+- `crates/axiomdb-sql/src/index_integrity.rs`
+  - `verify_and_repair_indexes_on_open(...)`
+  - `IndexIntegrityReport`
+  - `RebuiltIndex`
+- `crates/axiomdb-sql/src/executor/ddl.rs`
+  - `build_index_root_from_heap(...)`
+- `crates/axiomdb-sql/src/executor/bulk_empty.rs`
+  - `collect_btree_pages(...)`
+  - `free_btree_pages(...)`
+- `crates/axiomdb-core/src/error.rs`
+  - `DbError::IndexIntegrityFailure`
+- `crates/axiomdb-sql/src/lib.rs`
+  - exports the verifier API for server/embedded callers
+
+### Tests
+
+- `crates/axiomdb-sql/tests/integration_index_integrity.rs`
+  - rebuild missing unique-index entries
+  - rebuild partial-index divergence
+  - fail open for unreadable roots
+  - verify rebuilt indexes remain durable across reopen
+- `crates/axiomdb-network/tests/integration_open_integrity.rs`
+  - server open fails on unreadable index root
+- `crates/axiomdb-embedded/tests/integration.rs`
+  - embedded open fails on unreadable index root
+
+### Important invariant discovered during implementation
+
+The rebuilt B+ Tree pages are written directly into storage, not through WAL.
+That means the correct ordering is:
+
+1. build fresh tree pages
+2. `storage.flush()`
+3. commit catalog root swap
+
+Without that ordering, WAL recovery could make the new root visible before the
+rebuilt pages were durable.
+
+### Deferred
+
+- SQL `REINDEX` remains deferred to `19.15` / `37.44`
+- broader user-facing integrity surfaces (`CHECK TABLE`, `PRAGMA integrity_check`
+  style commands) remain deferred to later diagnostics phases

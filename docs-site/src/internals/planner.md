@@ -329,5 +329,5 @@ index absent-key path.
 | Statistics cost gate (NDV, selectivity threshold) | ✅ Done | 6.10 |
 | `EXPLAIN` statement | ⏳ Planned | 8.x |
 | Covering indexes (index-only scan, no heap read) | ✅ Done | 6.13 |
-| Partial index predicate matching (complex implication) | ⏳ Planned | 6.15 |
-| Join selectivity estimation | ⏳ Planned | 6.15 |
+| Partial index predicate matching (complex implication) | ⏳ Planned | future planner phases |
+| Join selectivity estimation | ⏳ Planned | future planner phases |

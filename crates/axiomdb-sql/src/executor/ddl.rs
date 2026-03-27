@@ -509,6 +509,63 @@ fn execute_drop_table(
 
 // ── CREATE INDEX ──────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IndexBuildResult {
+    pub root_page_id: u64,
+    pub skipped_key_too_long: usize,
+}
+
+pub(crate) fn build_index_root_from_heap(
+    storage: &mut dyn StorageEngine,
+    table_def: &TableDef,
+    col_defs: &[CatalogColumnDef],
+    idx: &IndexDef,
+    snap: TransactionSnapshot,
+) -> Result<IndexBuildResult, DbError> {
+    use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let root_page_id = storage.alloc_page(PageType::Index)?;
+    {
+        let mut page = Page::new(PageType::Index, root_page_id);
+        let leaf = cast_leaf_mut(&mut page);
+        leaf.is_leaf = 1;
+        leaf.set_num_keys(0);
+        leaf.set_next_leaf(NULL_PAGE);
+        page.update_checksum();
+        storage.write_page(root_page_id, &page)?;
+    }
+    let root_pid = AtomicU64::new(root_page_id);
+    let pred_expr = match &idx.predicate {
+        Some(sql) => Some(crate::partial_index::compile_predicate_sql(sql, col_defs)?),
+        None => None,
+    };
+    let rows = TableEngine::scan_table(storage, table_def, col_defs, snap, None)?;
+    let mut skipped_key_too_long = 0usize;
+
+    for (rid, row_vals) in &rows {
+        let Some(key_vals) = crate::index_maintenance::index_key_values_if_indexed(
+            idx,
+            row_vals,
+            pred_expr.as_ref(),
+        )?
+        else {
+            continue;
+        };
+
+        match crate::index_maintenance::encode_index_entry_key(idx, &key_vals, *rid) {
+            Ok(key) => BTree::insert_in(storage, &root_pid, &key, *rid, idx.fillfactor)?,
+            Err(DbError::IndexKeyTooLong { .. }) => skipped_key_too_long += 1,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(IndexBuildResult {
+        root_page_id: root_pid.load(Ordering::Acquire),
+        skipped_key_too_long,
+    })
+}
+
 fn execute_create_index(
     stmt: CreateIndexStmt,
     storage: &mut dyn StorageEngine,

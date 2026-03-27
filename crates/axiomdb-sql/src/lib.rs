@@ -15,6 +15,7 @@ pub mod eval;
 pub mod executor;
 pub mod expr;
 pub mod fk_enforcement;
+pub mod index_integrity;
 pub mod index_maintenance;
 pub mod key_encoding;
 pub mod lexer;
@@ -45,6 +46,7 @@ pub use lexer::{tokenize, Span, SpannedToken, Token};
 pub use session::{CompatMode, SessionCollation};
 // Note: Token<'src> and SpannedToken<'src> carry a lifetime tied to the input string.
 pub use analyzer::{analyze, analyze_cached};
+pub use index_integrity::{verify_and_repair_indexes_on_open, IndexIntegrityReport, RebuiltIndex};
 pub use parser::parse;
 pub use result::{ColumnMeta, QueryResult, Row};
 pub use schema_cache::SchemaCache;
