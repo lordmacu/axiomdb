@@ -224,6 +224,11 @@ The SQL processing pipeline:
 - Transactional INSERT staging — explicit transactions can buffer consecutive
   `INSERT ... VALUES` rows in `SessionContext`, then flush them through one
   grouped heap/index pass at the next barrier statement or `COMMIT`
+- Indexed multi-row INSERT batch path — the immediate `INSERT ... VALUES (...), (... )`
+  path now reuses the same grouped physical apply helpers as staged flushes even
+  when the table has PRIMARY KEY or secondary indexes; the immediate path keeps
+  strict same-statement UNIQUE checking and therefore does not reuse the staged
+  `committed_empty` shortcut
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
@@ -232,6 +237,14 @@ The SQL processing pipeline:
 PostgreSQL and SQLite both keep executor logic separated by statement family instead of
 one source file. AxiomDB now adopts the same responsibility split, but keeps the existing
 `crate::executor` facade intact so sibling modules and external callers do not pay a refactor tax.
+</div>
+</div>
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Share Batch Apply, Not Bulk-Load Semantics</span>
+PostgreSQL's <code>heap_multi_insert()</code> and DuckDB's appender both inspired the shared grouped-write layer. AxiomDB adapts that physical apply pattern, but rejects reusing the staged bulk-load shortcut on immediate multi-row INSERT because duplicate keys inside one SQL statement must still fail atomically and before any partial batch becomes visible.
 </div>
 </div>
 

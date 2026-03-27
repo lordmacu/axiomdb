@@ -150,6 +150,34 @@ AxiomDB automatically creates a unique B+ Tree index for:
 These indexes are created at `CREATE TABLE` time and cannot be dropped without
 dropping the corresponding constraint.
 
+## Multi-row INSERT on Indexed Tables
+
+Multi-row `INSERT ... VALUES (...), (... )` statements now stay on a grouped
+heap/index path even when the target table already has a `PRIMARY KEY` or
+secondary indexes.
+
+```sql
+INSERT INTO users VALUES
+  (1, 'a@example.com'),
+  (2, 'b@example.com'),
+  (3, 'c@example.com');
+```
+
+This matters because indexed tables used to fall back to per-row maintenance on
+this workload. The grouped path keeps the same SQL-visible behavior:
+
+- duplicate `PRIMARY KEY` / `UNIQUE` values inside the same statement still fail
+- a failed multi-row statement does not leak partial committed rows
+- partial indexes still include only rows whose predicate matches
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage</span>
+On the local PK-only benchmark, AxiomDB multi-row INSERT reaches <strong>321,002 rows/s</strong> vs MariaDB 12.1 at <strong>160,581 rows/s</strong>. The gain comes from grouped heap/index apply instead of per-row indexed maintenance for the statement.
+</div>
+</div>
+
 ## Startup Integrity Verification
 
 When a database opens, AxiomDB verifies every catalog-visible index against the
@@ -283,6 +311,9 @@ SELECT * FROM users WHERE email = 'alice@example.com';
 SELECT * FROM orders WHERE id = 42;
 ```
 
+This includes the PRIMARY KEY. A query like `WHERE id = 42` does not need a
+redundant secondary index on `id`.
+
 **Range scan** — upper and lower bound on the leading indexed column:
 ```sql
 -- Uses B-Tree range scan
@@ -303,7 +334,16 @@ SELECT * FROM orders WHERE status = 'paid' OR total > 1000;
 <span class="callout-label">Performance Advantage</span>
 A point lookup on a 1M-row table takes O(log n) ≈ 20 page reads vs O(n) = 1M reads
 for a full scan — roughly a 50,000× reduction in I/O. AxiomDB's planner applies this
-automatically when a matching secondary index exists, with zero configuration required.
+automatically when a matching index exists, including the PRIMARY KEY, with zero
+configuration required.
+</div>
+</div>
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">No Redundant PK Index</span>
+If `id` is already your PRIMARY KEY, do not also create `CREATE INDEX ... ON t(id)` just for point lookups. The planner already uses the primary-key B+Tree for `WHERE id = ...`.
 </div>
 </div>
 

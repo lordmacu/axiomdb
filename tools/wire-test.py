@@ -5,7 +5,7 @@ Updated at each subphase close — always overwrite this file, never create new 
 
 Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batch delete),
              5.19a (executor decomposition — structural refactor, wire-invisible),
-             5.21 (transactional INSERT staging)
+             5.21 (transactional INSERT staging), 6.19 (WAL fsync pipeline smoke)
 """
 import os
 import signal
@@ -1707,6 +1707,175 @@ ci21.execute("DROP TABLE stage_logs")
 ci21.execute("DROP TABLE stage_users")
 conn_i21.commit()
 conn_i21.close()
+
+# ── [6.16] PRIMARY KEY SELECT access path — PK-only table lookups ────────────
+
+print("\n[6.16] PRIMARY KEY SELECT access path — PK-only table lookups")
+
+conn_616 = connect()
+c616 = conn_616.cursor()
+c616.execute("CREATE TABLE pk_lookup_users (id INT PRIMARY KEY, name TEXT NOT NULL)")
+c616.executemany(
+    "INSERT INTO pk_lookup_users VALUES (%s, %s)",
+    [(1, "alice"), (2, "bob"), (3, "carol")],
+)
+conn_616.commit()
+
+c616.execute("SELECT id, name FROM pk_lookup_users WHERE id = 2")
+pk_rows = c616.fetchall()
+ok(
+    "6.16 PK SELECT: lookup on PRIMARY KEY works without secondary index",
+    pk_rows == ((2, "bob"),),
+    pk_rows,
+)
+
+c616.execute("SELECT id FROM pk_lookup_users WHERE id >= 2 AND id < 4 ORDER BY id ASC")
+pk_range_rows = c616.fetchall()
+ok(
+    "6.16 PK SELECT: PK range returns expected ids",
+    pk_range_rows == ((2,), (3,)),
+    pk_range_rows,
+)
+
+c616.execute("DROP TABLE pk_lookup_users")
+conn_616.commit()
+conn_616.close()
+
+# ── [6.17] Indexed UPDATE candidate fast path ────────────────────────────────
+
+print("\n[6.17] Indexed UPDATE candidate fast path")
+
+conn_617 = connect()
+c617 = conn_617.cursor()
+c617.execute("CREATE TABLE upd_range_users (id INT PRIMARY KEY, score INT NOT NULL)")
+c617.executemany(
+    "INSERT INTO upd_range_users VALUES (%s, %s)",
+    [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)],
+)
+conn_617.commit()
+
+c617.execute("UPDATE upd_range_users SET score = score + 5 WHERE id >= 3 AND id < 6")
+conn_617.commit()
+c617.execute("SELECT id, score FROM upd_range_users ORDER BY id ASC")
+range_updated = c617.fetchall()
+ok(
+    "6.17 UPDATE range: only PK-range rows are updated",
+    list(range_updated) == [(1, 10), (2, 20), (3, 35), (4, 45), (5, 55), (6, 60)],
+    range_updated,
+)
+
+c617.execute(
+    "CREATE TABLE upd_email_users (id INT PRIMARY KEY, email TEXT NOT NULL, score INT NOT NULL)"
+)
+c617.execute("CREATE UNIQUE INDEX upd_email_idx ON upd_email_users (email)")
+c617.executemany(
+    "INSERT INTO upd_email_users VALUES (%s, %s, %s)",
+    [(1, "alice@x.dev", 10), (2, "bob@x.dev", 20)],
+)
+conn_617.commit()
+
+c617.execute(
+    "UPDATE upd_email_users SET score = score + 7 WHERE email = 'alice@x.dev'"
+)
+conn_617.commit()
+c617.execute("SELECT id, score FROM upd_email_users ORDER BY id ASC")
+secondary_updated = c617.fetchall()
+ok(
+    "6.17 UPDATE equality: secondary-index candidate path updates only matching row",
+    list(secondary_updated) == [(1, 17), (2, 20)],
+    secondary_updated,
+)
+
+c617.execute("DROP TABLE upd_email_users")
+c617.execute("DROP TABLE upd_range_users")
+conn_617.commit()
+conn_617.close()
+
+# ── [6.18] Indexed multi-row INSERT batch path ───────────────────────────────
+
+print("\n[6.18] Indexed multi-row INSERT batch path")
+
+conn_618 = connect()
+c618 = conn_618.cursor()
+c618.execute("CREATE TABLE batch_pk_users (id INT PRIMARY KEY, name TEXT NOT NULL)")
+c618.execute(
+    "INSERT INTO batch_pk_users VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')"
+)
+conn_618.commit()
+
+c618.execute("SELECT id, name FROM batch_pk_users ORDER BY id ASC")
+batch_pk_rows = c618.fetchall()
+ok(
+    "6.18 INSERT multi-row: PK-only table stores all rows correctly",
+    list(batch_pk_rows) == [(1, "alice"), (2, "bob"), (3, "carol")],
+    batch_pk_rows,
+)
+
+c618.execute("CREATE TABLE batch_email_users (id INT PRIMARY KEY, email TEXT NOT NULL)")
+c618.execute("CREATE UNIQUE INDEX batch_email_idx ON batch_email_users (email)")
+try:
+    c618.execute(
+        "INSERT INTO batch_email_users VALUES "
+        "(1, 'alice@x.dev'), (2, 'alice@x.dev')"
+    )
+    conn_618.commit()
+    ok(
+        "6.18 INSERT multi-row: UNIQUE duplicate in same statement raises IntegrityError",
+        False,
+        "no error raised",
+    )
+except pymysql.err.IntegrityError:
+    conn_618.rollback()
+    ok(
+        "6.18 INSERT multi-row: UNIQUE duplicate in same statement raises IntegrityError",
+        True,
+    )
+
+c618.execute("SELECT id FROM batch_email_users ORDER BY id ASC")
+batch_unique_rows = c618.fetchall()
+ok(
+    "6.18 INSERT multi-row: failed UNIQUE batch does not leak committed rows",
+    batch_unique_rows == (),
+    batch_unique_rows,
+)
+
+c618.execute("DROP TABLE batch_email_users")
+c618.execute("DROP TABLE batch_pk_users")
+conn_618.commit()
+conn_618.close()
+
+# ── [6.19] WAL fsync pipeline — autocommit correctness smoke ─────────────────
+
+print("\n[6.19] WAL fsync pipeline — autocommit correctness smoke")
+
+conn_619a = pymysql.connect(host="127.0.0.1", port=PORT, user="root", password="",
+                            autocommit=True)
+conn_619b = pymysql.connect(host="127.0.0.1", port=PORT, user="root", password="",
+                            autocommit=True)
+c619a = conn_619a.cursor()
+c619b = conn_619b.cursor()
+
+c619a.execute("CREATE TABLE autocommit_pipe_users (id INT PRIMARY KEY, name TEXT NOT NULL)")
+c619a.execute("INSERT INTO autocommit_pipe_users VALUES (1, 'alice')")
+c619b.execute("INSERT INTO autocommit_pipe_users VALUES (2, 'bob')")
+
+c619a.execute("SELECT id, name FROM autocommit_pipe_users ORDER BY id ASC")
+pipe_rows = c619a.fetchall()
+ok(
+    "6.19 autocommit inserts remain immediately visible and durable per statement",
+    list(pipe_rows) == [(1, "alice"), (2, "bob")],
+    pipe_rows,
+)
+
+c619b.execute("SELECT COUNT(*) FROM autocommit_pipe_users")
+ok(
+    "6.19 second connection remains usable after autocommit fsync path",
+    c619b.fetchone() == (2,),
+)
+
+c619a.execute("DROP TABLE autocommit_pipe_users")
+conn_619a.close()
+conn_619b.close()
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

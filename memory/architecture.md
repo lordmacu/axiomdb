@@ -139,5 +139,67 @@
   - deferring free of old tree pages until commit durability is confirmed
 - Unreadable or non-enumerable index trees are not auto-healed; open fails with
   `DbError::IndexIntegrityFailure`.
+
+## 2026-03-27 — PRIMARY KEY SELECT planner parity
+
+- `axiomdb-sql/src/planner.rs` now treats PRIMARY KEY indexes as first-class
+  candidates for single-table `SELECT`.
+- The local architectural rule is now:
+  - PK equality uses `IndexLookup` unconditionally
+  - PK range can use `IndexRange` through the normal extraction path
+  - session collation can still veto text-key index access, even on PK
+- No executor redesign was needed:
+  - `executor/select.rs` already handled `IndexLookup` / `IndexRange`
+  - the gap was planner eligibility only
 - Both `axiomdb-network` and `axiomdb-embedded` now call the same verifier
   immediately after `open_with_recovery(...)` and before serving traffic.
+
+## 2026-03-27 — Indexed UPDATE candidate planning
+
+- `axiomdb-sql/src/planner.rs` now owns a second DML discovery entrypoint:
+  - `plan_update_candidates(...)`
+  - `plan_update_candidates_ctx(...)`
+- UPDATE candidate planning intentionally mirrors DELETE candidate planning:
+  - no `stats_cost_gate`
+  - no `IndexOnlyScan`
+  - PK, UNIQUE, secondary, and eligible partial indexes are allowed
+  - non-binary session collation can still veto text-key index access
+- `executor/update.rs` now separates candidate discovery from physical rewrite:
+  - planner selects an access path
+  - candidate `RecordId`s are materialized first
+  - fetched rows recheck the full `WHERE`
+  - surviving rows flow into the existing `5.20` stable-RID / fallback write path
+- The architectural boundary is now explicit:
+  - `6.17` owns indexed UPDATE discovery
+  - `5.20` remains the source of truth for heap/index rewrite semantics
+
+## 2026-03-27 — Indexed multi-row INSERT batch apply
+
+- `axiomdb-sql/src/executor/staging.rs` now owns shared physical apply helpers:
+  - `apply_insert_batch(...)`
+  - `apply_insert_batch_with_ctx(...)`
+- Those helpers are reused by two logically different producers:
+  - `5.21` transactional staging flushes
+  - `6.18` immediate `INSERT ... VALUES (...), (... )`
+- The architectural rule is:
+  - share grouped heap/index physical apply
+  - do not share staged bulk-load semantics blindly
+- In particular, the immediate multi-row path must not reuse the staged
+  `committed_empty` optimization because it lacks the staging path's
+  `unique_seen` prevalidation and still must reject duplicate PRIMARY KEY /
+  UNIQUE values inside a single SQL statement atomically.
+
+## 2026-03-27 — WAL fsync pipeline
+
+- `axiomdb-wal/src/fsync_pipeline.rs` now owns server-side fsync coalescing.
+- The server path no longer depends on the old timer-based `CommitCoordinator`
+  modules from `axiomdb-network/src/mysql/`.
+- The runtime contract is:
+  - `TxnManager::commit()` still writes the Commit record first
+  - the server then calls `pipeline.acquire(commit_lsn, txn_id)`
+  - `Expired` means a previous leader already covered this LSN
+  - `Acquired` means this connection must `flush+fsync`
+  - `Queued(rx)` means release the DB lock and await the leader
+- The old `deferred_commit_mode` hook still exists inside `TxnManager`, but it
+  is now just the internal handoff point from commit serialization to the
+  leader-based fsync pipeline.

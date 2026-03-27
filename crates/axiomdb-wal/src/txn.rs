@@ -117,10 +117,10 @@ pub struct TxnManager {
     /// retained across operations — inspired by LMDB's approach of reusing
     /// a single write buffer for all modifications in a batch.
     wal_scratch: Vec<u8>,
-    /// When `true`, DML `commit()` skips flush+fsync and stores the committed
-    /// `txn_id` in `pending_deferred_txn_id` for the caller to register with
-    /// the `CommitCoordinator`. Set once at startup by `Database` when group
-    /// commit is enabled. Read-only transactions always flush_no_sync regardless.
+    /// When `true`, DML `commit()` skips inline flush+fsync and stores the
+    /// committed `txn_id` in `pending_deferred_txn_id` for the caller to hand
+    /// off to the leader-based WAL fsync pipeline. Read-only transactions still
+    /// use the lightweight `flush_no_sync` path.
     deferred_commit_mode: bool,
     /// Set by `commit()` when `deferred_commit_mode` is true and the transaction
     /// contained DML. Cleared by `take_pending_deferred_commit()`.
@@ -204,15 +204,17 @@ impl TxnManager {
         Ok(txn_id)
     }
 
-    /// Commits the active transaction: writes the Commit WAL entry and fsyncs.
+    /// Commits the active transaction: writes the Commit WAL entry and either
+    /// fsyncs inline or hands the commit off to the WAL fsync pipeline.
     ///
     /// Advances `max_committed` to the committed TxnId, making the transaction's
     /// writes visible to future [`TransactionSnapshot`]s.
     ///
-    /// When `deferred_commit_mode` is enabled (group commit active), DML commits
-    /// skip the fsync and store the txn_id in `pending_deferred_txn_id`. The caller
-    /// must retrieve it with `take_pending_deferred_commit()` and register it with
-    /// the `CommitCoordinator`, which will fsync + advance `max_committed` later.
+    /// When `deferred_commit_mode` is enabled (used by the fsync pipeline in the
+    /// server path), DML commits skip the inline fsync and store the txn_id in
+    /// `pending_deferred_txn_id`. The caller retrieves it with
+    /// `take_pending_deferred_commit()` and drives the WAL fsync pipeline, which
+    /// advances `max_committed` only after durability is confirmed.
     ///
     /// # Errors
     /// - [`DbError::NoActiveTransaction`] if no transaction is open.
@@ -255,11 +257,11 @@ impl TxnManager {
         Ok(())
     }
 
-    /// Enables or disables deferred commit mode for group commit.
+    /// Enables or disables deferred commit mode for the server-side fsync pipeline.
     ///
-    /// When enabled, DML `commit()` skips flush+fsync and stores the txn_id
-    /// in `pending_deferred_txn_id`. Must be called once at startup by
-    /// `Database` when the `CommitCoordinator` is active.
+    /// When enabled, DML `commit()` skips inline flush+fsync and stores the
+    /// txn_id in `pending_deferred_txn_id` for the caller to hand off to the
+    /// leader-based pipeline.
     pub fn set_deferred_commit_mode(&mut self, enabled: bool) {
         self.deferred_commit_mode = enabled;
     }
@@ -270,17 +272,17 @@ impl TxnManager {
     /// deferred mode (the Commit entry is in the BufWriter but not fsynced).
     /// Returns `None` if the last commit was read-only or deferred mode is off.
     ///
-    /// Called by `Database::execute_query` to register the txn with the
-    /// `CommitCoordinator` after releasing the Database lock.
+    /// Called by `Database::execute_query` to hand the txn to the fsync
+    /// pipeline after statement execution.
     pub fn take_pending_deferred_commit(&mut self) -> Option<TxnId> {
         self.pending_deferred_txn_id.take()
     }
 
     /// Advances `max_committed` to the maximum of the given txn_ids.
     ///
-    /// Called by the `CommitCoordinator` background task **after** a successful
-    /// `wal_flush_and_fsync()`, while holding the Database lock. Makes all
-    /// transactions in the batch visible to future snapshots.
+    /// Called after a successful pipeline-driven `wal_flush_and_fsync()`, while
+    /// holding the Database lock. Makes all transactions in the batch visible
+    /// to future snapshots.
     ///
     /// Does not regress `max_committed` — if `max(txn_ids) < self.max_committed`,
     /// no change is made (safe for out-of-order batch notification, though in
@@ -291,6 +293,22 @@ impl TxnManager {
                 self.max_committed = max;
             }
         }
+    }
+
+    /// Advances `max_committed` to `txn_id` if it is greater than the current
+    /// value. Used by the fsync pipeline leader to make a single transaction
+    /// visible after confirming WAL durability.
+    pub fn advance_committed_single(&mut self, txn_id: TxnId) {
+        if txn_id > self.max_committed {
+            self.max_committed = txn_id;
+        }
+    }
+
+    /// Returns the WAL writer's current LSN (the last assigned LSN).
+    ///
+    /// Used by the fsync pipeline to track which LSN was last fsynced.
+    pub fn wal_current_lsn(&self) -> u64 {
+        self.wal.current_lsn()
     }
 
     /// Enqueues `pages` for deferred reclamation after the current transaction
@@ -317,7 +335,7 @@ impl TxnManager {
     /// Frees pages whose transactions have been durably committed.
     ///
     /// Called after WAL fsync succeeds (immediate mode: right after `commit()`;
-    /// group-commit mode: after `advance_committed(&ids)` in the background task).
+    /// pipeline mode: after `advance_committed(&ids)` in the fsync leader path).
     ///
     /// Pages are freed via `storage.free_page(pid)`. Any `txn_id` in `txn_ids`
     /// that has no pending batch is silently ignored.
@@ -351,8 +369,8 @@ impl TxnManager {
 
     /// Releases deferred-free pages for `txn_id` only in immediate-commit mode.
     ///
-    /// In group-commit mode this is a no-op — the `CommitCoordinator` background
-    /// task calls [`release_committed_frees`] after batch fsync confirms durability.
+    /// In pipeline mode this is a no-op — the fsync leader path calls
+    /// [`release_committed_frees`] after batch fsync confirms durability.
     ///
     /// Call this right after a successful `txn.commit()` in immediate-commit paths,
     /// passing the txn_id captured from `active_txn_id()` before the commit call.
@@ -371,8 +389,8 @@ impl TxnManager {
 
     /// Flushes the WAL BufWriter to the OS and fsyncs to disk.
     ///
-    /// Called by the `CommitCoordinator` background task while holding the
-    /// Database lock, covering all Commit entries written since the last fsync.
+    /// Called by the fsync pipeline leader while holding the Database lock,
+    /// covering all Commit entries written since the last fsync.
     ///
     /// # Errors
     /// - I/O errors from flush or fsync propagated to all batch waiters.

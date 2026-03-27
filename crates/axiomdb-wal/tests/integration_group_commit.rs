@@ -1,9 +1,9 @@
-//! Group Commit integration tests — Phase 3.19.
+//! Deferred-commit + fsync pipeline integration tests.
 //!
 //! Tests cover:
 //! - `commit_deferred_mode = false` (default): TxnManager behaves identically
 //!   to pre-3.19; `take_pending_deferred_commit()` always returns None.
-//! - `commit_deferred_mode = true` (group commit enabled):
+//! - `commit_deferred_mode = true` (used by the Phase 6.19 fsync pipeline):
 //!   - DML commit → `take_pending_deferred_commit()` returns `Some(txn_id)`.
 //!   - max_committed NOT advanced until `advance_committed()` is called.
 //!   - Read-only commit → flush_no_sync path; `take_pending_deferred_commit()` None.
@@ -54,7 +54,7 @@ fn insert_row(storage: &mut MmapStorage, txn: &mut TxnManager, page_id: u64, dat
     slot_id
 }
 
-// ── Tests — default mode (no group commit) ────────────────────────────────────
+// ── Tests — default mode (inline fsync) ───────────────────────────────────────
 
 #[test]
 fn test_default_mode_commit_advances_max_committed() {
@@ -83,7 +83,7 @@ fn test_default_mode_readonly_no_pending() {
     assert!(txn.take_pending_deferred_commit().is_none());
 }
 
-// ── Tests — deferred commit mode (group commit enabled) ──────────────────────
+// ── Tests — deferred commit mode (fsync pipeline hook) ───────────────────────
 
 #[test]
 fn test_deferred_mode_dml_does_not_advance_max_committed() {
@@ -238,9 +238,9 @@ fn test_wal_flush_and_fsync_succeeds() {
 /// Verifies the MVCC invariant: a row committed in deferred mode is invisible
 /// to snapshots taken before `advance_committed()` is called.
 ///
-/// This is the key correctness property of group commit: max_committed does
-/// not advance until the CommitCoordinator confirms the fsync, so no snapshot
-/// can observe the row before durability is guaranteed.
+/// This is the key correctness property of the fsync pipeline hook:
+/// `max_committed` does not advance until the leader confirms the fsync, so no
+/// snapshot can observe the row before durability is guaranteed.
 #[test]
 fn test_deferred_row_invisible_before_advance_committed() {
     let env = TestEnv::new();

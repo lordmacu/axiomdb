@@ -52,7 +52,7 @@ use axiomdb_storage::{
     heap_chain, num_slots, read_slot, HeapAppendHint, HeapChain, Page, RowHeader, StorageEngine,
 };
 use axiomdb_types::{
-    codec::{decode_row, encode_row},
+    codec::{decode_row, decode_row_masked, encode_row},
     coerce::{coerce, CoercionMode},
     DataType, Value,
 };
@@ -121,14 +121,8 @@ impl TableEngine {
         snap: TransactionSnapshot,
         column_mask: Option<&[bool]>,
     ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
-        // Masked decode falls back to the original two-phase path.
-        if let Some(mask) = column_mask {
-            if !mask.iter().all(|&b| b) {
-                return Self::scan_table(storage, table_def, columns, snap, column_mask);
-            }
-        }
-
         let col_types = column_data_types(columns);
+        let masked_decode = column_mask.filter(|mask| !mask.iter().all(|&b| b));
         let mut result = Vec::new();
         let mut current = table_def.data_root_page_id;
 
@@ -157,7 +151,11 @@ impl TableEngine {
                 }
                 // Decode directly from page bytes — no .to_vec().
                 let row_data = &bytes[size_of::<RowHeader>()..];
-                let values = decode_row(row_data, &col_types)?;
+                let values = if let Some(mask) = masked_decode {
+                    decode_row_masked(row_data, &col_types, mask)?
+                } else {
+                    decode_row(row_data, &col_types)?
+                };
                 result.push((
                     RecordId {
                         page_id: current,
@@ -1233,5 +1231,55 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row, vec![Value::Int(1), Value::Int(11)]);
+    }
+
+    #[test]
+    fn test_scan_table_direct_masked_decode_can_skip_all_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("table-mask-test.wal");
+        let mut storage = MemoryStorage::new();
+        let root_page_id = storage.alloc_page(PageType::Data).unwrap();
+        let root = Page::new(PageType::Data, root_page_id);
+        storage.write_page(root_page_id, &root).unwrap();
+
+        let table = test_table_def(root_page_id);
+        let cols = vec![
+            ColumnDef {
+                table_id: 1,
+                col_idx: 0,
+                name: "id".into(),
+                col_type: ColumnType::Int,
+                nullable: false,
+                auto_increment: false,
+            },
+            ColumnDef {
+                table_id: 1,
+                col_idx: 1,
+                name: "name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+                auto_increment: false,
+            },
+        ];
+
+        let mut txn = TxnManager::create(&wal).unwrap();
+        txn.begin().unwrap();
+        TableEngine::insert_row(
+            &mut storage,
+            &mut txn,
+            &table,
+            &cols,
+            vec![Value::Int(7), Value::Text("alice".into())],
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let snap = txn.snapshot();
+        let mask = [false, false];
+        let rows =
+            TableEngine::scan_table_direct(&mut storage, &table, &cols, snap, Some(&mask)).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, vec![Value::Null, Value::Null]);
     }
 }

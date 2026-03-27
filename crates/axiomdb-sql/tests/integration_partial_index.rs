@@ -190,6 +190,36 @@ fn test_partial_unique_one_active_one_deleted_ok() {
 }
 
 #[test]
+fn test_multi_row_insert_partial_unique_mixed_membership_ok() {
+    let mut db = Db::new();
+    setup!(
+        db,
+        "CREATE TABLE users (id INT PRIMARY KEY, email TEXT, deleted_at TEXT)",
+        "CREATE UNIQUE INDEX uq_email ON users(email) WHERE deleted_at IS NULL"
+    );
+    db.ok("INSERT INTO users VALUES \
+         (1, 'alice@x.com', NULL), \
+         (2, 'alice@x.com', '2025-01-01')");
+
+    let rows = db.rows("SELECT id, email, deleted_at FROM users ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Int(1),
+                Value::Text("alice@x.com".into()),
+                Value::Null,
+            ],
+            vec![
+                Value::Int(2),
+                Value::Text("alice@x.com".into()),
+                Value::Text("2025-01-01".into()),
+            ],
+        ]
+    );
+}
+
+#[test]
 fn test_null_indexed_col_not_indexed() {
     let mut db = Db::new();
     setup!(

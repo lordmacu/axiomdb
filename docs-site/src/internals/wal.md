@@ -380,48 +380,49 @@ WAL writes are serialized through a single `WalWriter` inside `TxnManager`. The
 executes DML at a time. This eliminates write–write conflicts without record-level
 locking (Phase 7 will lift this constraint).
 
-### Group Commit (Phase 3.19)
+### WAL Fsync Pipeline (Phase 6.19)
 
-Under the default single-fsync-per-commit model, N concurrent connections pay N
-sequential `fsync` calls. **Group Commit** batches those fsyncs: connections write
-their `Commit` WAL entries to the `BufWriter` (fast, RAM only) and register with the
-`CommitCoordinator` instead of fsyncing inline. A background Tokio task wakes every
-`group_commit_interval_ms` (or immediately when `group_commit_max_batch` connections
-are waiting), acquires the Database lock, executes a **single** `flush + fsync`, then
-notifies all waiting connections.
+The old timer-based `CommitCoordinator` from `3.19` is now superseded in the
+server path by an always-on **leader-based fsync pipeline** inspired by
+MariaDB's `group_commit_lock`.
+
+Connections still write `Commit` entries into the WAL `BufWriter`, but the
+handoff after that changed:
+
+1. the connection calls `pipeline.acquire(commit_lsn, txn_id)`
+2. if another leader already flushed past `commit_lsn` → `Expired`
+3. if no leader is active → `Acquired`, this connection performs `flush+fsync`
+4. if a leader is active → `Queued(rx)`, this connection releases the DB lock
+   and awaits confirmation
 
 ```
-Disabled (default):
-  Conn A → lock → DML → commit() [flush+fsync inline] → unlock → OK
-  Conn B →                        lock → DML → commit() [flush+fsync] → unlock → OK
-  Cost: 2 fsyncs
+Conn A → lock → DML → commit_deferred() → pipeline.acquire(42) → Acquired
+         flush+fsync → release_ok(42) → unlock → OK
 
-Enabled (group_commit_interval_ms = 1):
-  Conn A → lock → DML → commit_deferred() → unlock → await rx ──────┐
-  Conn B →         lock → DML → commit_deferred() → unlock → await ──┤
-  Background task:  lock → flush+fsync → advance_committed → unlock  │
-                    notify A ──────────────────────────────────────── ┘
-                    notify B
-  Cost: 1 fsync for both A and B
+Conn B →           lock → DML → commit_deferred() → pipeline.acquire(43) → Queued(rx)
+                   unlock → await rx ──────────────────────────────────────────────┐
+Leader A fsync completes → flushed_lsn = 43 → wake B ─────────────────────────────┘
+
+Conn C → lock → DML → commit_deferred() → pipeline.acquire(41) → Expired → OK
 ```
 
 #### Durability Guarantee
 
-A connection does **not** receive `Ok` until the fsync covering its `Commit` entry
-completes. `max_committed` advances only after `advance_committed()` is called — which
-happens only inside the background task, after a successful fsync. If the process
-crashes before the fsync, the transaction is lost and no client received `Ok`. The
-durability guarantee is identical to non-group-commit mode; only the throughput changes.
+A connection does **not** receive `Ok` until the fsync covering its `Commit`
+entry completes. `max_committed` advances only after the leader confirms
+durability. If the process crashes before that fsync, the transaction is lost
+and no client received `Ok`. The durability guarantee is therefore identical to
+inline fsync; only the scheduling changes.
 
 #### Key Structures
 
 | Component | Location | Role |
 |---|---|---|
-| `CommitCoordinator` | `axiomdb-network/src/mysql/commit_coordinator.rs` | Pending queue (`std::sync::Mutex<Vec<CommitTicket>>`), `Notify` trigger |
-| `CommitTicket` | same file | `txn_id + oneshot::Sender<Result<(), DbError>>` per waiting connection |
-| `TxnManager::deferred_commit_mode` | `axiomdb-wal/src/txn.rs` | When `true`, `commit()` skips fsync and sets `pending_deferred_txn_id` |
+| `FsyncPipeline` | `axiomdb-wal/src/fsync_pipeline.rs` | Shared state: `flushed_lsn`, `leader_active`, `pending_lsn`, waiter queue |
+| `AcquireResult` | same file | `Expired` / `Acquired` / `Queued(rx)` outcome for each commit |
+| `TxnManager::deferred_commit_mode` | `axiomdb-wal/src/txn.rs` | Internal hook used by the server path to defer inline fsync until the pipeline leader runs |
 | `TxnManager::advance_committed()` | same file | Advances `max_committed` to `max(batch_txn_ids)` after fsync |
-| `spawn_group_commit_task()` | `axiomdb-network/src/mysql/group_commit.rs` | Long-running Tokio task; `Weak<Mutex<Database>>` exits on DB drop |
+| `Database::take_commit_rx()` | `axiomdb-network/src/mysql/database.rs` | Bridges SQL execution to pipeline acquire / leader fsync / follower await |
 
 ### PageWrite Entry (Phase 3.18)
 
@@ -495,27 +496,19 @@ Combined with `HeapChain::insert_batch()` (O(P) page writes for P pages) and
 a single parse+analyze pass for multi-row VALUES, the full bulk INSERT pipeline
 is O(P) in both storage I/O and WAL I/O, where P = number of pages filled ≈ N/200.
 
-#### Configuration
-
-```toml
-# axiomdb.toml
-group_commit_interval_ms = 1   # 0 = disabled (default); 1ms recommended for production
-group_commit_max_batch   = 64  # trigger fsync immediately when 64 connections are waiting
-```
-
 <div class="callout callout-advantage">
 <span class="callout-icon">🚀</span>
 <div class="callout-body">
 <span class="callout-label">Performance Advantage</span>
-PostgreSQL uses group commit with <code>synchronous_commit=on</code> (the default) and still pays one fsync per transaction under low concurrency. AxiomDB's coordinator batches across all concurrent connections with a configurable interval, reducing fsync overhead from O(N connections) to O(1) per batch window — the same improvement PostgreSQL achieves only at high concurrency.
+MariaDB's `group_commit_lock` avoids waiting for a timer before piggybacking followers. AxiomDB now does the same: instead of batching only on a timeout window, queued commits can piggyback immediately on an in-flight leader fsync, which is exactly the case that matters for fast single-connection autocommit.
 </div>
 </div>
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
-<span class="callout-label">Design Decision — std::sync::Mutex for CommitCoordinator</span>
-The <code>CommitCoordinator::pending</code> queue uses <code>std::sync::Mutex</code> (not Tokio's async mutex) so that <code>register_pending()</code> can be called from synchronous code inside <code>Database::execute_query</code> without infecting the function signature with <code>async</code>. The lock is held only for an O(1) Vec push — never across an <code>.await</code> point, so no deadlock risk and no blocking of the Tokio runtime.
+<span class="callout-label">Design Decision — Keep the Lock, Remove the Timer</span>
+`FsyncPipeline` still uses a tiny synchronous mutex for the O(1) leader election state check, but AxiomDB rejects the old Tokio background task and configurable timer window. The lock is held only for state mutation; the actual <code>flush+fsync</code> still runs outside that mutex and under the existing database write lock.
 </div>
 </div>
 

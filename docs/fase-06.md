@@ -1,6 +1,6 @@
 # Phase 6 — Secondary Indexes + Query Planner
 
-## Subfases completed in this session: 6.1, 6.1b, 6.2, 6.2b, 6.3, 6.15
+## Subfases completed in this session: 6.1, 6.1b, 6.2, 6.2b, 6.3, 6.15, 6.16, 6.17, 6.18
 
 ## What was built
 
@@ -180,3 +180,179 @@ rebuilt pages were durable.
 - SQL `REINDEX` remains deferred to `19.15` / `37.44`
 - broader user-facing integrity surfaces (`CHECK TABLE`, `PRAGMA integrity_check`
   style commands) remain deferred to later diagnostics phases
+
+## 6.16 — Primary-key SELECT access path
+
+`6.16` closes the planner blind spot that still treated PRIMARY KEY lookups as
+heap scans for single-table `SELECT`.
+
+The change lives in `crates/axiomdb-sql/src/planner.rs`:
+
+- `find_index_on_col(...)` now accepts `allow_primary`
+- `plan_select(...)` and `plan_select_ctx(...)` enable PRIMARY KEY eligibility
+- `WHERE pk = literal` bypasses the small-table / NDV `stats_cost_gate`
+- PK ranges reuse the existing `IndexRange` path
+- the collation guard is preserved: non-binary session collation still rejects
+  text-key index access, even for PRIMARY KEY indexes
+
+### What this fixes
+
+The executor already knew how to run `IndexLookup` and `IndexRange`, and PK
+B+Trees were already populated on `INSERT` since `6.9`. The missing piece was
+planner-side: `idx.is_primary` was still excluded, so:
+
+```sql
+SELECT * FROM bench_users WHERE id = 42;
+```
+
+could not reach the PK B+Tree at all.
+
+### Validation
+
+- planner unit tests:
+  - PK equality → `IndexLookup`
+  - PK equality bypasses `stats_cost_gate`
+  - PK range → `IndexRange`
+  - non-binary collation still rejects text PK index access
+- SQL integration:
+  - `SELECT id, name FROM users WHERE id = 2` on a table with only
+    `PRIMARY KEY (id)`
+- MySQL wire smoke:
+  - PK equality lookup without any secondary index
+  - PK range lookup without any secondary index
+- targeted local benchmark:
+  - `python3 benches/comparison/local_bench.py --scenario select_pk --rows 5000 --table`
+  - MariaDB `12.7K lookups/s`
+  - MySQL `13.4K lookups/s`
+  - AxiomDB `11.1K lookups/s`
+
+### Deferred
+
+- composite PK/prefix planner work remains separate
+- wire/materialization overhead after the PK planner path is active remains
+  tracked separately in the performance debt list
+
+## 6.17 — Indexed UPDATE candidate fast path
+
+`6.17` fixes the row-discovery side of indexed `UPDATE`.
+
+Before this subphase, both `execute_update_ctx` and `execute_update` started by
+calling `TableEngine::scan_table(...)` and only then applied the `WHERE`
+filter. That meant `UPDATE ... WHERE id BETWEEN ...` still paid O(n) heap
+discovery even after `5.20` had already improved the physical rewrite path.
+
+### What changed
+
+In `crates/axiomdb-sql/src/planner.rs`:
+
+- `plan_update_candidates(...)`
+- `plan_update_candidates_ctx(...)`
+
+These mirror the indexed DELETE candidate planner:
+
+- no `stats_cost_gate`
+- no `IndexOnlyScan`
+- PRIMARY KEY, UNIQUE, secondary, and eligible partial indexes allowed
+- same non-binary text-collation guard as `DELETE`
+
+In `crates/axiomdb-sql/src/executor/update.rs`:
+
+- indexed predicates now go through planner-selected `IndexLookup` /
+  `IndexRange`
+- candidate `RecordId`s are materialized before any heap or index mutation
+- fetched rows still re-evaluate the full original `WHERE`
+- the surviving rows then flow into the unchanged `5.20` stable-RID / fallback
+  write path
+
+### Why this scope matters
+
+`6.17` does not redesign UPDATE writes. That remains owned by `5.20`.
+
+The separation is intentional:
+
+- `6.17` solves candidate discovery
+- `5.20` remains the source of truth for physical heap/index update semantics
+
+That keeps the indexed UPDATE speedup from weakening rollback, FK checks, or
+index-correctness invariants.
+
+### Validation
+
+- planner unit tests:
+  - PK equality → indexed UPDATE access
+  - PK range → indexed UPDATE access
+  - text-key PK rejected under non-binary collation
+- SQL integration:
+  - PK range update changes only the targeted rows
+  - secondary-index equality update changes only the targeted row
+- MySQL wire smoke:
+  - PK-range UPDATE on a PK-only table
+  - secondary-index equality UPDATE
+- targeted local benchmark:
+  - `python3 benches/comparison/local_bench.py --scenario update_range --rows 5000 --table`
+  - MariaDB `618K rows/s`
+  - MySQL `291K rows/s`
+  - AxiomDB `85.2K rows/s`
+
+### Deferred
+
+- the remaining `update_range` gap is no longer discovery-side; it now sits in
+  the apply path after rows are found
+
+## 6.18 — Indexed multi-row INSERT batch path
+
+`6.18` closes the immediate multi-row `INSERT ... VALUES (...), (... )`
+performance gap for indexed tables.
+
+Before this subphase, the executor only took the batch heap path when the table
+had no secondary indexes. A table with just `PRIMARY KEY (id)` still fell back
+to per-row heap + index maintenance for a multi-row VALUES statement.
+
+### What changed
+
+In `crates/axiomdb-sql/src/executor/staging.rs`:
+
+- extracted shared physical apply helpers:
+  - `apply_insert_batch(...)`
+  - `apply_insert_batch_with_ctx(...)`
+- staged transactional INSERT flush (`5.21`) now reuses the same grouped
+  heap/index apply layer as immediate multi-row INSERT
+
+In `crates/axiomdb-sql/src/executor/insert.rs`:
+
+- immediate `InsertSource::Values` now materializes a full batch when more than
+  one row is present
+- both ctx and non-ctx paths route that batch through the shared grouped apply
+  helper even when PRIMARY KEY or secondary indexes exist
+- single-row INSERT behavior remains unchanged
+
+### Important semantic boundary
+
+The new immediate path intentionally does **not** reuse the staged
+`committed_empty` bulk-load optimization from `5.21`.
+
+That optimization is only safe after enqueue-time uniqueness validation using
+the staging path's `unique_seen` set. Immediate multi-row INSERT must still
+detect duplicate PRIMARY KEY / UNIQUE values inside the same SQL statement
+without exposing partial writes.
+
+### Validation
+
+- SQL integration:
+  - multi-row INSERT on a PK-only table preserves all rows
+  - duplicate UNIQUE key inside one multi-row statement errors correctly
+  - partial UNIQUE index mixed-membership case remains correct
+- MySQL wire smoke:
+  - PK-only multi-row INSERT
+  - duplicate UNIQUE inside the same statement
+  - failed UNIQUE batch leaves no partial committed rows
+- targeted local benchmark:
+  - `python3 benches/comparison/local_bench.py --scenario insert_multi_values --rows 5000 --table`
+  - MariaDB `160,581 rows/s`
+  - MySQL `259,854 rows/s`
+  - AxiomDB `321,002 rows/s`
+
+### Deferred
+
+- autocommit INSERT throughput remains a separate problem from immediate
+  multi-row VALUES on indexed tables

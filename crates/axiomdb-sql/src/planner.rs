@@ -8,7 +8,7 @@
 //!
 //! - [`AccessMethod::Scan`] — full sequential scan (default).
 //! - [`AccessMethod::IndexLookup`] — point lookup via B-Tree; used when
-//!   `WHERE col = <literal>` and `col` is the first column of a non-primary index.
+//!   `WHERE col = <literal>` and `col` is the first column of a usable index.
 //! - [`AccessMethod::IndexRange`] — range scan via B-Tree; used when
 //!   `WHERE col > lo AND col < hi` (or `>=`, `<=`) on an indexed column.
 //!
@@ -151,10 +151,14 @@ pub fn plan_select(
 
     // ── Rule 1: col = literal ─────────────────────────────────────────────
     if let Some((col_name, value)) = extract_eq_col_literal(expr) {
-        if let Some(idx) = find_index_on_col(col_name, indexes, columns, Some(expr)) {
+        if let Some(idx) = find_index_on_col(col_name, indexes, columns, Some(expr), true) {
             if let Ok(key) = encode_index_key(&[value]) {
-                // Cost gate: skip index if selectivity too low (Phase 6.10).
-                if stats_cost_gate(idx, columns, table_id, table_stats, stale_tracker) {
+                // PK equality is always worth using for SELECT: the current
+                // small-table/NDV cost gate is the wrong trade-off for point
+                // lookups on the primary key.
+                let use_index = idx.is_primary
+                    || stats_cost_gate(idx, columns, table_id, table_stats, stale_tracker);
+                if use_index {
                     // Index-only scan upgrade (Phase 6.13): all SELECT cols in key.
                     if index_covers_query(idx, select_col_idxs) {
                         return AccessMethod::IndexOnlyScan {
@@ -185,7 +189,7 @@ pub fn plan_select(
     }
 
     // ── Rule 2: col > lo AND col < hi (or >=, <=) ─────────────────────────
-    if let Some((idx, lo_val, hi_val)) = extract_range(expr, indexes, columns, Some(expr)) {
+    if let Some((idx, lo_val, hi_val)) = extract_range(expr, indexes, columns, Some(expr), true) {
         // Cost gate: range scans are even less selective — apply same threshold.
         if stats_cost_gate(idx, columns, table_id, table_stats, stale_tracker) {
             let lo = lo_val.and_then(|v| encode_index_key(&[v]).ok());
@@ -383,8 +387,8 @@ fn extract_eq_col_literal(expr: &Expr) -> Option<(&str, Value)> {
     None
 }
 
-/// Returns the first non-primary index whose first column matches `col_name`
-/// and whose partial index predicate (if any) is implied by the query WHERE.
+/// Returns the first usable index whose first column matches `col_name` and
+/// whose partial index predicate (if any) is implied by the query WHERE.
 ///
 /// `query_where` is the full WHERE clause of the query, used for partial index
 /// predicate implication checking (Phase 6.7).
@@ -393,6 +397,7 @@ fn find_index_on_col<'a>(
     indexes: &'a [IndexDef],
     columns: &[ColumnDef],
     query_where: Option<&Expr>,
+    allow_primary: bool,
 ) -> Option<&'a IndexDef> {
     // Find the col_idx for this column name.
     let col_idx = columns.iter().find(|c| c.name == col_name)?.col_idx;
@@ -400,7 +405,7 @@ fn find_index_on_col<'a>(
     // Find a non-primary index whose first column is this col_idx AND whose
     // predicate (if any) is implied by the query WHERE clause.
     indexes.iter().find(|idx| {
-        if idx.is_primary {
+        if idx.is_primary && !allow_primary {
             return false;
         }
         // FK auto-indexes use composite keys (fk_val | RecordId) — never usable
@@ -429,6 +434,7 @@ fn extract_range<'a>(
     indexes: &'a [IndexDef],
     columns: &[ColumnDef],
     query_where: Option<&Expr>,
+    allow_primary: bool,
 ) -> Option<(&'a IndexDef, Option<Value>, Option<Value>)> {
     // expr must be `AND(left, right)`.
     let (lhs, rhs) = match expr {
@@ -449,7 +455,7 @@ fn extract_range<'a>(
         return None;
     }
 
-    let idx = find_index_on_col(col1, indexes, columns, query_where)?;
+    let idx = find_index_on_col(col1, indexes, columns, query_where, allow_primary)?;
     // bound1 = lo side, bound2 = hi side (order may be loose but correct for 6.3)
     Some((idx, bound1, bound2))
 }
@@ -590,7 +596,8 @@ pub fn plan_delete_candidates(
 
     // Rule 1: col = literal
     if let Some((col_name, value)) = extract_eq_col_literal(where_clause) {
-        if let Some(idx) = find_index_on_col(col_name, indexes, columns, Some(where_clause)) {
+        if let Some(idx) = find_index_on_col(col_name, indexes, columns, Some(where_clause), false)
+        {
             if let Ok(key) = encode_index_key(&[value]) {
                 // No cost gate for DELETE — always use the index.
                 if idx.columns.len() == 1 {
@@ -613,9 +620,72 @@ pub fn plan_delete_candidates(
 
     // Rule 2: col > lo AND col < hi (or >=, <=)
     if let Some((idx, lo_val, hi_val)) =
-        extract_range(where_clause, indexes, columns, Some(where_clause))
+        extract_range(where_clause, indexes, columns, Some(where_clause), false)
     {
         // No cost gate for DELETE.
+        let lo = lo_val.and_then(|v| encode_index_key(&[v]).ok());
+        let hi = hi_val.and_then(|v| encode_index_key(&[v]).ok());
+        return AccessMethod::IndexRange {
+            index_def: idx.clone(),
+            lo,
+            hi,
+        };
+    }
+
+    AccessMethod::Scan
+}
+
+/// Chooses the best index-access method for discovering UPDATE candidate rows.
+///
+/// UPDATE uses the same candidate-discovery rules as DELETE:
+/// - no `stats_cost_gate`
+/// - no `IndexOnlyScan`
+/// - full `WHERE` is rechecked later on fetched rows
+/// - PRIMARY KEY, UNIQUE, secondary, and eligible partial indexes are allowed
+pub fn plan_update_candidates(
+    where_clause: &Expr,
+    indexes: &[IndexDef],
+    columns: &[ColumnDef],
+) -> AccessMethod {
+    use crate::key_encoding::encode_index_key;
+
+    if let Some(am) = plan_composite_eq(where_clause, indexes, columns) {
+        return match am {
+            AccessMethod::IndexOnlyScan {
+                index_def, lo, hi, ..
+            } => AccessMethod::IndexRange {
+                index_def,
+                lo: Some(lo),
+                hi,
+            },
+            other => other,
+        };
+    }
+
+    if let Some((col_name, value)) = extract_eq_col_literal(where_clause) {
+        if let Some(idx) = find_index_on_col(col_name, indexes, columns, Some(where_clause), true) {
+            if let Ok(key) = encode_index_key(&[value]) {
+                if idx.columns.len() == 1 {
+                    return AccessMethod::IndexLookup {
+                        index_def: idx.clone(),
+                        key,
+                    };
+                } else {
+                    let mut hi = key.clone();
+                    hi.extend_from_slice(&[0xFF; crate::key_encoding::MAX_INDEX_KEY]);
+                    return AccessMethod::IndexRange {
+                        index_def: idx.clone(),
+                        lo: Some(key),
+                        hi: Some(hi),
+                    };
+                }
+            }
+        }
+    }
+
+    if let Some((idx, lo_val, hi_val)) =
+        extract_range(where_clause, indexes, columns, Some(where_clause), true)
+    {
         let lo = lo_val.and_then(|v| encode_index_key(&[v]).ok());
         let hi = hi_val.and_then(|v| encode_index_key(&[v]).ok());
         return AccessMethod::IndexRange {
@@ -670,6 +740,45 @@ pub fn plan_delete_candidates_ctx(
     }
 }
 
+/// Session-collation-aware UPDATE candidate planner.
+///
+/// Wraps [`plan_update_candidates`] and rejects any access method that depends
+/// on binary text ordering when the session collation is non-binary.
+pub fn plan_update_candidates_ctx(
+    where_clause: &Expr,
+    indexes: &[IndexDef],
+    columns: &[ColumnDef],
+    collation: SessionCollation,
+) -> AccessMethod {
+    let am = plan_update_candidates(where_clause, indexes, columns);
+
+    if collation == SessionCollation::Binary {
+        return am;
+    }
+
+    let text_col_idxs: std::collections::HashSet<u16> = columns
+        .iter()
+        .filter(|col| col.col_type == ColumnType::Text)
+        .map(|col| col.col_idx)
+        .collect();
+
+    let uses_text_index = match &am {
+        AccessMethod::IndexLookup { index_def, .. }
+        | AccessMethod::IndexRange { index_def, .. } => index_def
+            .columns
+            .first()
+            .map(|c| text_col_idxs.contains(&c.col_idx))
+            .unwrap_or(false),
+        AccessMethod::Scan | AccessMethod::IndexOnlyScan { .. } => false,
+    };
+
+    if uses_text_index {
+        AccessMethod::Scan
+    } else {
+        am
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -684,6 +793,17 @@ mod tests {
             col_idx,
             name: name.to_string(),
             col_type: ColumnType::Int,
+            nullable: false,
+            auto_increment: false,
+        }
+    }
+
+    fn make_text_col(name: &str, col_idx: u16) -> ColumnDef {
+        ColumnDef {
+            table_id: 1,
+            col_idx,
+            name: name.to_string(),
+            col_type: ColumnType::Text,
             nullable: false,
             auto_increment: false,
         }
@@ -713,6 +833,15 @@ mod tests {
         Expr::Column {
             col_idx: 0,
             name: name.to_string(),
+        }
+    }
+
+    fn make_stats(col_idx: u16, row_count: u64, ndv: i64) -> StatsDef {
+        StatsDef {
+            table_id: 1,
+            col_idx,
+            row_count,
+            ndv,
         }
     }
 
@@ -756,8 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eq_on_primary_key_returns_scan() {
-        // Primary key indexes are not used by the planner (Phase 6.3).
+    fn test_eq_on_primary_key_returns_lookup() {
         let cols = vec![make_col("id", 0)];
         let idxs = vec![make_index("pk", 0, true)];
         let expr = Expr::BinaryOp {
@@ -774,7 +902,32 @@ mod tests {
             &mut StaleStatsTracker::default(),
             &[],
         );
-        assert_eq!(am, AccessMethod::Scan);
+        assert!(matches!(am, AccessMethod::IndexLookup { .. }));
+    }
+
+    #[test]
+    fn test_eq_on_primary_key_bypasses_stats_cost_gate() {
+        let cols = vec![make_col("id", 0)];
+        let idxs = vec![make_index("pk", 0, true)];
+        let expr = Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left: Box::new(col_expr("id")),
+            right: Box::new(Expr::Literal(Value::Int(1))),
+        };
+        let stats = vec![make_stats(0, 50, 1)];
+        let am = plan_select(
+            Some(&expr),
+            &idxs,
+            &cols,
+            1,
+            &stats,
+            &mut StaleStatsTracker::default(),
+            &[],
+        );
+        assert!(
+            matches!(am, AccessMethod::IndexLookup { .. }),
+            "pk equality should ignore small-table/selectivity scan bias"
+        );
     }
 
     #[test]
@@ -878,5 +1031,125 @@ mod tests {
             &[],
         );
         assert!(matches!(am, AccessMethod::IndexRange { .. }));
+    }
+
+    #[test]
+    fn test_range_on_primary_key_returns_index_range_without_stats() {
+        let cols = vec![make_col("id", 0)];
+        let idxs = vec![make_index("pk", 0, true)];
+        let expr = Expr::BinaryOp {
+            op: BinaryOp::And,
+            left: Box::new(Expr::BinaryOp {
+                op: BinaryOp::GtEq,
+                left: Box::new(col_expr("id")),
+                right: Box::new(Expr::Literal(Value::Int(10))),
+            }),
+            right: Box::new(Expr::BinaryOp {
+                op: BinaryOp::Lt,
+                left: Box::new(col_expr("id")),
+                right: Box::new(Expr::Literal(Value::Int(20))),
+            }),
+        };
+        let am = plan_select(
+            Some(&expr),
+            &idxs,
+            &cols,
+            1,
+            &[],
+            &mut StaleStatsTracker::default(),
+            &[],
+        );
+        assert!(matches!(am, AccessMethod::IndexRange { .. }));
+    }
+
+    #[test]
+    fn test_plan_select_ctx_keeps_int_primary_key_lookup_under_non_binary_collation() {
+        let cols = vec![make_col("id", 0)];
+        let idxs = vec![make_index("pk", 0, true)];
+        let expr = Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left: Box::new(col_expr("id")),
+            right: Box::new(Expr::Literal(Value::Int(7))),
+        };
+        let am = plan_select_ctx(
+            Some(&expr),
+            &idxs,
+            &cols,
+            1,
+            &[],
+            &mut StaleStatsTracker::default(),
+            &[],
+            SessionCollation::Es,
+        );
+        assert!(matches!(am, AccessMethod::IndexLookup { .. }));
+    }
+
+    #[test]
+    fn test_plan_select_ctx_rejects_text_primary_key_under_non_binary_collation() {
+        let cols = vec![make_text_col("id", 0)];
+        let idxs = vec![make_index("pk", 0, true)];
+        let expr = Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left: Box::new(col_expr("id")),
+            right: Box::new(Expr::Literal(Value::Text("jose".into()))),
+        };
+        let am = plan_select_ctx(
+            Some(&expr),
+            &idxs,
+            &cols,
+            1,
+            &[],
+            &mut StaleStatsTracker::default(),
+            &[],
+            SessionCollation::Es,
+        );
+        assert_eq!(am, AccessMethod::Scan);
+    }
+
+    #[test]
+    fn test_plan_update_candidates_uses_primary_key_equality() {
+        let cols = vec![make_col("id", 0)];
+        let idxs = vec![make_index("pk", 0, true)];
+        let expr = Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left: Box::new(col_expr("id")),
+            right: Box::new(Expr::Literal(Value::Int(9))),
+        };
+        let am = plan_update_candidates(&expr, &idxs, &cols);
+        assert!(matches!(am, AccessMethod::IndexLookup { .. }));
+    }
+
+    #[test]
+    fn test_plan_update_candidates_uses_primary_key_range() {
+        let cols = vec![make_col("id", 0)];
+        let idxs = vec![make_index("pk", 0, true)];
+        let expr = Expr::BinaryOp {
+            op: BinaryOp::And,
+            left: Box::new(Expr::BinaryOp {
+                op: BinaryOp::GtEq,
+                left: Box::new(col_expr("id")),
+                right: Box::new(Expr::Literal(Value::Int(10))),
+            }),
+            right: Box::new(Expr::BinaryOp {
+                op: BinaryOp::Lt,
+                left: Box::new(col_expr("id")),
+                right: Box::new(Expr::Literal(Value::Int(20))),
+            }),
+        };
+        let am = plan_update_candidates(&expr, &idxs, &cols);
+        assert!(matches!(am, AccessMethod::IndexRange { .. }));
+    }
+
+    #[test]
+    fn test_plan_update_candidates_ctx_rejects_text_primary_key_under_non_binary_collation() {
+        let cols = vec![make_text_col("name", 0)];
+        let idxs = vec![make_index("pk_name", 0, true)];
+        let expr = Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left: Box::new(col_expr("name")),
+            right: Box::new(Expr::Literal(Value::Text("jose".into()))),
+        };
+        let am = plan_update_candidates_ctx(&expr, &idxs, &cols, SessionCollation::Es);
+        assert_eq!(am, AccessMethod::Scan);
     }
 }

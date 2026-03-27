@@ -66,6 +66,23 @@ the technical explanation.
 - INSERT (single connection): one `fdatasync` per autocommit statement; enable Group Commit
   for concurrent workloads (see below)
 
+### Primary-Key Lookups After `6.16`
+
+Phase `6.16` removes the planner blind spot that still treated `WHERE id = ...`
+as a scan on PK-only tables. The PRIMARY KEY B+Tree is now used for single-table
+equality and range lookups.
+
+Measured with `python3 benches/comparison/local_bench.py --scenario select_pk --rows 5000 --table`
+on the same machine:
+
+| Operation | MariaDB 12.1 | MySQL 8.0 | AxiomDB |
+|---|---|---|---|
+| `SELECT * FROM bench_users WHERE id = literal` | 12.7K lookups/s | 13.4K lookups/s | **11.1K lookups/s** |
+
+The old debt was "planner never reaches the PK B+Tree". That is now closed.
+The remaining gap is smaller and sits after planning: row materialization and
+MySQL packet serialization still cost more than MariaDB/MySQL on this path.
+
 ### DELETE WHERE / UPDATE After `5.20`
 
 Phase `5.19` removed the old-key delete bottleneck for `DELETE ... WHERE` and the
@@ -109,6 +126,33 @@ skipping PK maintenance when only non-indexed columns change.
 
 The main remaining write-path bottleneck is now `INSERT`, not `UPDATE`.
 
+### Indexed `UPDATE ... WHERE` After `6.17`
+
+Phase `6.17` removes the old full-scan candidate discovery path for indexed
+UPDATE predicates. If the `WHERE` clause is sargable by the PRIMARY KEY or a
+usable secondary index, AxiomDB now finds candidate rows through the B+Tree
+before handing them to the existing `5.20` update path.
+
+Measured with `python3 benches/comparison/local_bench.py --scenario update_range --rows 5000 --table`
+on the same machine:
+
+| Operation | MariaDB 12.1 | MySQL 8.0 | AxiomDB |
+|---|---|---|---|
+| `UPDATE bench_users SET score = score + 1 WHERE id BETWEEN ...` | 618K rows/s | 291K rows/s | **85.2K rows/s** |
+
+Compared to the old `70.2K rows/s` tracker baseline, the indexed candidate path
+does improve the benchmark, but it does not close the whole gap. That tells us
+the remaining bottleneck is no longer row discovery; it is the apply path after
+the candidates are already found.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Separate Discovery From Rewrite</span>
+`6.17` intentionally does not redesign `UPDATE` writes again. It only removes the O(n) discovery scan for indexed predicates, then reuses the existing `5.20` stable-RID/fallback path. This keeps correctness local: planner changes speed up candidate discovery without weakening rollback or index-maintenance semantics.
+</div>
+</div>
+
 ### INSERT in Explicit Transactions After `5.21`
 
 Phase `5.21` adds transactional INSERT staging for consecutive
@@ -135,8 +179,47 @@ heap/index pass when SQL semantics require visibility.
 </div>
 
 This path targets one specific workload: many separate INSERT statements inside
-`BEGIN ... COMMIT`. Autocommit throughput remains a different problem and stays
-deferred to follow-up tuning of actual server-side group commit.
+`BEGIN ... COMMIT`. Autocommit throughput remains a different problem and
+depends on the server-side fsync path.
+
+### Multi-row INSERT on Indexed Tables After `6.18`
+
+Phase `6.18` fixes the immediate multi-row VALUES path for indexed tables. A
+statement such as:
+
+```sql
+INSERT INTO bench_users VALUES
+  (1, 'u1', 18, TRUE, 100.0, 'u1@b.local'),
+  (2, 'u2', 19, FALSE, 100.1, 'u2@b.local'),
+  (3, 'u3', 20, TRUE, 100.2, 'u3@b.local');
+```
+
+now uses grouped heap/index apply even when the target table has a PRIMARY KEY
+or secondary indexes. Before `6.18`, that path still fell back to per-row
+maintenance on indexed tables.
+
+Measured with `python3 benches/comparison/local_bench.py --scenario insert_multi_values --rows 5000 --table`
+on the benchmark schema with `PRIMARY KEY (id)`:
+
+| Operation | MariaDB 12.1 | MySQL 8.0 | AxiomDB |
+|---|---|---|---|
+| `insert_multi_values` on PK table | 160,581 rows/s | 259,854 rows/s | **321,002 rows/s** |
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">2× Faster Than MariaDB</span>
+On the PK-only multi-row INSERT benchmark, AxiomDB reaches <strong>321,002 rows/s</strong> vs MariaDB 12.1 at <strong>160,581 rows/s</strong>. The speedup comes from one grouped heap/index apply per VALUES statement instead of per-row maintenance on the indexed table.
+</div>
+</div>
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Prefer Multi-row VALUES</span>
+If your application already knows several rows up front, send one <code>INSERT ... VALUES (...), (...)</code> statement instead of many one-row INSERTs. This now benefits indexed tables too, while still rejecting duplicate PRIMARY KEY / UNIQUE values inside the same statement.
+</div>
+</div>
 
 ### Prepared Statement Plan Cache (Phase 5.13)
 
@@ -158,25 +241,29 @@ connection polls it lock-free (`Arc<AtomicU64>`) before each execute.
 (default 1024) compiled plans. The least-recently-used plan is evicted silently when
 the limit is reached. Configurable in `axiomdb.toml`.
 
-### Group Commit — Concurrent Write Throughput (Phase 3.19)
+### WAL Fsync Pipeline (6.19, still below target)
 
-With `group_commit_interval_ms = 0` (default), every DML commit fsyncs individually.
-With Group Commit enabled, N concurrent connections share one fsync per batch window:
+Phase `6.19` replaced the old timer-based `CommitCoordinator` with an always-on
+leader-based WAL fsync pipeline. The runtime behavior changed, but the key
+single-connection autocommit benchmark is **not closed yet**.
 
-| Concurrency | group_commit disabled | group_commit_interval_ms=1 | Improvement |
+Measured with:
+
+```bash
+python3 benches/comparison/local_bench.py --scenario insert_autocommit --rows 1000 --table --engines axiomdb
+```
+
+Current result:
+
+| Benchmark | AxiomDB | Target | Status |
 |---|---|---|---|
-| 1 connection  | 58 q/s (baseline) | ~57 q/s (+1ms latency)  | ~1× (no gain) |
-| 4 connections | ~58 q/s (serialized) | ~200+ q/s (shared fsync) | ~4× |
-| 8 connections | ~58 q/s             | ~400+ q/s                | ~8× |
-| 16 connections| ~58 q/s             | ~800+ q/s                | ~16× |
+| `insert_autocommit` | **224 ops/s** | `>= 5,000 ops/s` | ❌ |
 
-*Theoretical upper bound — actual numbers depend on NVMe latency and connection overlap.*
-
-<div class="callout callout-advantage">
-<span class="callout-icon">🚀</span>
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
 <div class="callout-body">
-<span class="callout-label">Performance Advantage vs MySQL InnoDB</span>
-MySQL's <code>innodb_flush_log_at_trx_commit=1</code> (default, fully durable) also pays one fsync per transaction under low concurrency. MySQL's group commit kicks in automatically at high concurrency. AxiomDB's Group Commit is explicit and configurable, achieving the same batching effect without the InnoDB overhead of a separate undo tablespace write before each row mutation.
+<span class="callout-label">Design Decision — Good Primitive, Wrong Arrival Pattern</span>
+MariaDB's <code>group_commit_lock</code> inspired the leader-based pipeline and it does remove the old timer window. But under a strict MySQL request/response client, the server still waits for durability before sending <code>OK</code>, so the next statement cannot arrive while the fsync is in flight. The batching primitive is therefore correct, but it does not solve the sequential single-client benchmark by itself.
 </div>
 </div>
 
@@ -189,7 +276,7 @@ Full pipeline: parse → analyze → execute → WAL → MmapStorage. Measured w
 |-------------------------------------------------|-----------------|-------------|--------|
 | INSERT 10K rows / N separate SQL strings / 1 txn| 35K rows/s      | 140K rows/s | ⚠️     |
 | **INSERT 10K rows / 1 multi-row SQL string**    | **211K rows/s** | 140K rows/s | ✅ **1.5× faster** |
-| INSERT autocommit (1 fsync/stmt, wire protocol) | 58 q/s          | —           | — (Phase 5.14) |
+| INSERT autocommit (1 visible commit/stmt, wire protocol) | 224 q/s         | —           | ⚠️ (`6.19` still open) |
 
 <div class="callout callout-advantage">
 <span class="callout-icon">🚀</span>

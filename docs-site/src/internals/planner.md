@@ -2,7 +2,7 @@
 
 The query planner is a lightweight **pattern-matching rewrite** that runs before the
 executor for every `SELECT`. It detects whether the `WHERE` clause matches a predicate
-on a secondary indexed column and substitutes a B-Tree lookup for a full table scan.
+on a usable index key and substitutes a B-Tree lookup for a full table scan.
 
 ---
 
@@ -66,7 +66,11 @@ scan with `lo = hi = composite_key`.
 WHERE col = literal    OR    literal = col
 ```
 
-Condition: `col` is the **first column** of a non-primary secondary index.
+Condition: `col` is the **first column** of a usable index.
+
+- `PRIMARY KEY = literal` is forced to an indexed path even on tiny tables
+  or when NDV stats would normally prefer `Scan`
+- secondary-index equality still goes through the normal statistics gate
 
 - Single-column index → `AccessMethod::IndexLookup { key: encode(literal) }`
 - Composite index → `AccessMethod::IndexRange { lo: prefix, hi: prefix + [0xFF…] }`
@@ -81,13 +85,13 @@ WHERE col >= lo AND col <= hi
 ```
 
 Condition: both sides reference the same column, which is the first column of a
-non-primary secondary index.
+usable index.
 
 Result: `AccessMethod::IndexRange { index_def, lo: encode(lo_val), hi: encode(hi_val) }`
 
 ### Statistics cost gate (Phase 6.10)
 
-After any Rule 0–2 match, the planner applies a statistics-based cost gate before
+After any Rule 0–2 match, the planner usually applies a statistics-based cost gate before
 returning the index access method:
 
 ```
@@ -98,6 +102,9 @@ if row_count < 1,000: return Scan  // tiny table — index overhead not worth it
 if selectivity > 0.20: return Scan // low-cardinality — full scan is cheaper
 → return IndexLookup / IndexRange  // selective enough for an index scan
 ```
+
+`PRIMARY KEY = literal` is the deliberate exception: it bypasses this gate and
+returns `IndexLookup` directly.
 
 `DEFAULT_NUM_DISTINCT = 200` is used when no statistics exist (pre-Phase 6.10
 databases, or ANALYZE has not been run). This is conservative — always uses the
@@ -164,6 +171,14 @@ for Phase 6.14.
 </div>
 </div>
 
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — PK Equality Bypasses Cost Gate</span>
+SQLite's `where.c` and PostgreSQL's index-scan planning both treat primary-key equality as a first-class access path. AxiomDB now does the same: `WHERE pk = literal` ignores the small-table / NDV scan bias because the benchmarked point-lookup debt came from never reaching the PK B+Tree at all, not from a bad executor path.
+</div>
+</div>
+
 ---
 
 ## Executor Integration
@@ -189,13 +204,50 @@ The residual WHERE filter handles cases where the index returned a row that late
 fails a non-index condition (e.g., `WHERE indexed_col = 5 AND other_col = 'x'`). This
 is safe and correct — the index just reduces the candidate set.
 
+---
+
+## UPDATE / DELETE Candidate Planning
+
+The same planner module also feeds DML candidate discovery.
+
+### DELETE candidates (`6.3b`)
+
+- uses `plan_delete_candidates(...)`
+- never applies `stats_cost_gate`
+- never returns `IndexOnlyScan`
+- materializes candidate `RecordId`s before heap/index mutation
+
+### UPDATE candidates (`6.17`)
+
+- uses `plan_update_candidates(...)`
+- mirrors DELETE candidate eligibility:
+  - PK, UNIQUE, secondary, and eligible partial indexes are allowed
+  - no `stats_cost_gate`
+  - no `IndexOnlyScan`
+- `execute_update[_ctx]` fetches rows by RID, rechecks the full `WHERE`, and
+  only then hands them to the `5.20` stable-RID / fallback write path
+
+This separation matters: row discovery and physical row rewrite are different
+problems. PostgreSQL's `ModifyTable` and SQLite's `where.c`/`update.c` split
+them too; AxiomDB adopts the same boundary without copying those executor
+architectures wholesale.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Discover Then Mutate</span>
+PostgreSQL's <code>nodeModifyTable.c</code> and SQLite's <code>update.c</code> both rely on row identity produced by a planning step before mutation starts. AxiomDB now does the same for indexed UPDATE: it materializes candidate <code>RecordId</code>s first, then mutates later, so updating the same indexed column used by the predicate cannot interfere with discovery mid-statement.
+</div>
+</div>
+
 <div class="callout callout-advantage">
 <span class="callout-icon">🚀</span>
 <div class="callout-body">
 <span class="callout-label">Performance Advantage</span>
 A point lookup via B-Tree on a 1M-row table requires O(log 1M) ≈ 20 page reads,
 versus O(1M) for a full scan. The planner applies this automatically with no EXPLAIN
-or HINT syntax required — every `WHERE col = ?` on an indexed column is
+or HINT syntax required — every `WHERE col = ?` on a qualifying index, including
+the primary key, is
 accelerated transparently.
 </div>
 </div>

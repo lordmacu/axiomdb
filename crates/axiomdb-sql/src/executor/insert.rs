@@ -93,23 +93,8 @@ fn execute_insert_ctx(
 
             // Initialise the batch if this is the first INSERT for this table.
             if ctx.pending_inserts.is_none() {
-                // Detect which unique indexes have an empty committed BTree.
-                // For those, the enqueue-time UNIQUE precheck can skip the
-                // BTree::lookup_in (no committed keys can collide) and rely
-                // solely on the unique_seen HashSet — saving one page read
-                // per row per empty index.
-                let mut committed_empty = std::collections::HashSet::new();
-                for idx in &secondary_indexes {
-                    if idx.is_unique && !idx.is_fk_index {
-                        let page = storage.read_page(idx.root_page_id)?;
-                        let body = page.body();
-                        // BTree page body layout: [is_leaf:1][_pad:1][num_keys:2]...
-                        let num_keys = u16::from_le_bytes([body[2], body[3]]);
-                        if num_keys == 0 {
-                            committed_empty.insert(idx.index_id);
-                        }
-                    }
-                }
+                let committed_empty =
+                    detect_committed_empty_unique_indexes(storage, &secondary_indexes)?;
                 ctx.pending_inserts = Some(crate::session::PendingInsertBatch {
                     table_id: resolved.def.id,
                     table_def: resolved.def.clone(),
@@ -237,7 +222,9 @@ fn execute_insert_ctx(
 
         // ── INSERT ... VALUES — immediate path (autocommit / ineligible) ──────
         InsertSource::Values(rows) => {
-            for (row_idx, value_exprs) in rows.into_iter().enumerate() {
+            let mut full_batch: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+
+            for value_exprs in rows {
                 let provided: Vec<Value> = value_exprs
                     .iter()
                     .map(|e| eval(e, &[]))
@@ -286,7 +273,11 @@ fn execute_insert_ctx(
                     )?;
                 }
 
-                // Clone so full_values remains available for index maintenance.
+                full_batch.push(full_values);
+            }
+
+            if full_batch.len() == 1 {
+                let full_values = full_batch.remove(0);
                 let rid = TableEngine::insert_row_with_ctx(
                     storage,
                     txn,
@@ -294,7 +285,7 @@ fn execute_insert_ctx(
                     schema_cols,
                     ctx,
                     full_values.clone(),
-                    row_idx + 1,
+                    1,
                 )?;
                 if !secondary_indexes.is_empty() {
                     let updated = crate::index_maintenance::insert_into_indexes(
@@ -313,13 +304,29 @@ fn execute_insert_ctx(
                         {
                             idx.root_page_id = new_root;
                         }
-                        // The schema cache stores the old root_page_id. Invalidate
-                        // so the next call re-reads from catalog rather than calling
-                        // lookup_in with a freed page id.
                         ctx.invalidate_all();
                     }
                 }
-                count += 1;
+                count = 1;
+            } else {
+                let committed_empty = std::collections::HashSet::new();
+                let n = full_batch.len() as u64;
+                apply_insert_batch_with_ctx(
+                    storage,
+                    txn,
+                    bloom,
+                    ctx,
+                    InsertBatchApply {
+                        table_def: &resolved.def,
+                        columns: schema_cols,
+                        indexes: &mut secondary_indexes,
+                        rows: &full_batch,
+                        compiled_preds: &compiled_preds,
+                        skip_unique_check: false,
+                        committed_empty: &committed_empty,
+                    },
+                )?;
+                count = n;
             }
         }
         InsertSource::Select(select_stmt) => {
@@ -456,7 +463,7 @@ fn execute_insert(
 
     // Use the already-loaded indexes from the resolved table (cached by SchemaCache).
     // Avoids a second catalog heap scan per INSERT.
-    let secondary_indexes: Vec<IndexDef> = resolved
+    let mut secondary_indexes: Vec<IndexDef> = resolved
         .indexes
         .iter()
         .filter(|i| !i.columns.is_empty())
@@ -552,19 +559,11 @@ fn execute_insert(
                 full_batch.push(full_values);
             }
 
-            // ── Phase 2: insert into the heap ─────────────────────────────────
+            // ── Phase 2: insert into the heap / indexes ──────────────────────
             //
-            // Single-row path: use insert_row() directly — no Vec allocation
-            // overhead, same as before this optimization.
-            //
-            // Multi-row path (N > 1, no secondary indexes): use insert_rows_batch()
-            // which loads each heap page once for the entire batch (vs. once per row).
-            //
-            // Multi-row path (N > 1, with secondary indexes): fall back to the
-            // per-row loop so that secondary index maintenance has the Value vecs
-            // available for each row. This maintains correctness at a minor
-            // performance cost; optimizing secondary-index batch maintenance is
-            // deferred to a follow-up.
+            // Single-row path stays unchanged.
+            // Multi-row `VALUES` now uses the batch heap path even when indexes
+            // exist, then applies grouped index maintenance once per statement.
             if full_batch.len() == 1 {
                 // ── Single row — existing path, no overhead ────────────────────
                 let full_values = full_batch.remove(0);
@@ -589,41 +588,24 @@ fn execute_insert(
                     }
                 }
                 count = 1;
-            } else if secondary_indexes.is_empty() {
-                // ── Multi-row batch, no secondary indexes — fast path ──────────
-                // HeapChain::insert_batch() loads each page once, writes once.
+            } else {
                 let n = full_batch.len() as u64;
-                TableEngine::insert_rows_batch(
+                let committed_empty = std::collections::HashSet::new();
+                apply_insert_batch(
                     storage,
                     txn,
-                    &resolved.def,
-                    schema_cols,
-                    &full_batch,
+                    &mut noop_bloom,
+                    InsertBatchApply {
+                        table_def: &resolved.def,
+                        columns: schema_cols,
+                        indexes: &mut secondary_indexes,
+                        rows: &full_batch,
+                        compiled_preds: &compiled_preds,
+                        skip_unique_check: false,
+                        committed_empty: &committed_empty,
+                    },
                 )?;
                 count = n;
-            } else {
-                // ── Multi-row with secondary indexes — per-row fallback ────────
-                for full_values in full_batch {
-                    let rid = TableEngine::insert_row(
-                        storage,
-                        txn,
-                        &resolved.def,
-                        schema_cols,
-                        full_values.clone(),
-                    )?;
-                    let updated = crate::index_maintenance::insert_into_indexes(
-                        &secondary_indexes,
-                        &full_values,
-                        rid,
-                        storage,
-                        &mut noop_bloom,
-                        &compiled_preds,
-                    )?;
-                    for (index_id, new_root) in updated {
-                        CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
-                    }
-                    count += 1;
-                }
             }
         }
 
@@ -734,4 +716,3 @@ fn check_row_constraints(
 }
 
 // ── ALTER TABLE constraint helpers (Phase 4.22b) ──────────────────────────────
-
