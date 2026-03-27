@@ -94,101 +94,36 @@ fn execute_update_ctx(
     let compiled_preds =
         crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;
 
-    if secondary_indexes.is_empty() {
-        // Fast path: no secondary indexes — use batch heap update (O(P) page I/O).
-        let heap_updates: Vec<(RecordId, Vec<Value>)> = to_update
-            .into_iter()
-            .map(|(rid, _old, new)| (rid, new))
-            .collect();
-        match heap_updates.len() {
-            0 => {}
-            1 => {
-                let (rid, new_values) = heap_updates.into_iter().next().unwrap();
-                TableEngine::update_row_with_ctx(
-                    storage,
-                    txn,
-                    &resolved.def,
-                    &schema_cols,
-                    ctx,
-                    rid,
-                    new_values,
-                )?;
-            }
-            _ => {
-                // Multi-row batch: delete_batch + insert_batch — O(P) page I/O.
-                TableEngine::update_rows_batch_with_ctx(
-                    storage,
-                    txn,
-                    &resolved.def,
-                    &schema_cols,
-                    ctx,
-                    heap_updates,
-                )?;
-            }
-        }
-    } else {
-        // Secondary indexes present — Phase 5.19 batch approach:
-        // 1. Apply all heap updates, collecting (old_rid, old_vals, new_rid, new_vals).
-        // 2. Batch-delete all old index keys in one pass per index.
-        // 3. Insert new index keys per row (existing per-row path).
+    let heap_updates: Vec<(RecordId, Vec<Value>)> = to_update
+        .iter()
+        .map(|(rid, _old, new)| (*rid, new.clone()))
+        .collect();
+    let new_rids = TableEngine::update_rows_preserve_rid_with_ctx(
+        storage,
+        txn,
+        &resolved.def,
+        &schema_cols,
+        ctx,
+        heap_updates,
+    )?;
+
+    if !secondary_indexes.is_empty() {
         let mut current_indexes = secondary_indexes;
-
-        // Step 1: heap updates → collect old/new row pairs with their rids.
-        let mut update_pairs: Vec<(RecordId, Vec<Value>, RecordId, Vec<Value>)> =
-            Vec::with_capacity(to_update.len());
-        for (old_rid, old_values, new_values) in to_update {
-            let new_rid = TableEngine::update_row_with_ctx(
-                storage,
-                txn,
-                &resolved.def,
-                &schema_cols,
-                ctx,
-                old_rid,
-                new_values.clone(),
-            )?;
-            update_pairs.push((old_rid, old_values, new_rid, new_values));
-        }
-
-        // Step 2: batch-delete all old index keys.
-        // Build delete rows as (old_rid, old_values) for the collector.
-        let delete_rows: Vec<(RecordId, Vec<Value>)> = update_pairs
-            .iter()
-            .map(|(old_rid, old_vals, _, _)| (*old_rid, old_vals.clone()))
+        let update_pairs: Vec<(RecordId, Vec<Value>, RecordId, Vec<Value>)> = to_update
+            .into_iter()
+            .zip(new_rids)
+            .map(|((old_rid, old_values, new_values), new_rid)| {
+                (old_rid, old_values, new_rid, new_values)
+            })
             .collect();
-        let del_key_buckets = crate::index_maintenance::collect_delete_keys_by_index(
-            &current_indexes,
-            &delete_rows,
-            &compiled_preds,
-        )?;
-        let del_updated = crate::index_maintenance::delete_many_from_indexes(
+        apply_update_index_maintenance(
             &mut current_indexes,
-            del_key_buckets,
+            &compiled_preds,
+            &update_pairs,
             storage,
+            txn,
             bloom,
         )?;
-        for (index_id, new_root) in del_updated {
-            CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
-        }
-
-        // Step 3: insert new keys per row (indexes already have updated roots).
-        for (_, _, new_rid, new_values) in &update_pairs {
-            let ins_updated = crate::index_maintenance::insert_into_indexes(
-                &current_indexes,
-                new_values,
-                *new_rid,
-                storage,
-                bloom,
-                &compiled_preds,
-            )?;
-            for (index_id, new_root) in ins_updated {
-                CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
-                if let Some(idx) = current_indexes.iter_mut().find(|i| i.index_id == index_id) {
-                    idx.root_page_id = new_root;
-                }
-                ctx.invalidate_all();
-            }
-        }
-        // Invalidate once after all updates to drop any stale cached roots.
         ctx.invalidate_all();
     }
 
@@ -244,67 +179,117 @@ fn execute_update(
     let compiled_preds =
         crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;
 
-    let mut count = 0u64;
+    let mut to_update: Vec<(RecordId, Vec<Value>, Vec<Value>)> = Vec::new();
     for (rid, current_values) in rows {
-        // WHERE filter.
         if let Some(ref wc) = stmt.where_clause {
             if !is_truthy(&eval(wc, &current_values)?) {
                 continue;
             }
         }
-        // Apply SET assignments.
         let mut new_values = current_values.clone();
         for (col_pos, val_expr) in &assignments {
             new_values[*col_pos] = eval(val_expr, &current_values)?;
         }
-        let new_rid = TableEngine::update_row(
+        to_update.push((rid, current_values, new_values));
+    }
+
+    let count = to_update.len() as u64;
+    let heap_updates: Vec<(RecordId, Vec<Value>)> = to_update
+        .iter()
+        .map(|(rid, _old, new)| (*rid, new.clone()))
+        .collect();
+    let new_rids = TableEngine::update_rows_preserve_rid(
+        storage,
+        txn,
+        &resolved.def,
+        &schema_cols,
+        heap_updates,
+    )?;
+
+    if !secondary_indexes.is_empty() {
+        let update_pairs: Vec<(RecordId, Vec<Value>, RecordId, Vec<Value>)> = to_update
+            .into_iter()
+            .zip(new_rids)
+            .map(|((old_rid, old_values, new_values), new_rid)| {
+                (old_rid, old_values, new_rid, new_values)
+            })
+            .collect();
+        apply_update_index_maintenance(
+            &mut secondary_indexes,
+            &compiled_preds,
+            &update_pairs,
             storage,
             txn,
-            &resolved.def,
-            &schema_cols,
-            rid,
-            new_values.clone(),
+            &mut noop_bloom,
         )?;
-        // Index maintenance: delete old key, insert new key.
-        if !secondary_indexes.is_empty() {
-            let del_updated = crate::index_maintenance::delete_from_indexes(
-                &secondary_indexes,
-                &current_values,
-                rid,
-                storage,
-                &mut noop_bloom,
-                &compiled_preds,
-            )?;
-            for (index_id, new_root) in &del_updated {
-                CatalogWriter::new(storage, txn)?.update_index_root(*index_id, *new_root)?;
-            }
-            // Update in-memory root_page_ids before insert so insert uses the
-            // correct (post-delete) root page.
-            for (index_id, new_root) in del_updated {
-                if let Some(idx) = secondary_indexes
-                    .iter_mut()
-                    .find(|i| i.index_id == index_id)
-                {
-                    idx.root_page_id = new_root;
-                }
-            }
-            let ins_updated = crate::index_maintenance::insert_into_indexes(
-                &secondary_indexes,
-                &new_values,
-                new_rid,
-                storage,
-                &mut noop_bloom,
-                &compiled_preds,
-            )?;
-            for (index_id, new_root) in ins_updated {
-                CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
-            }
-        }
-        count += 1;
     }
 
     Ok(QueryResult::Affected {
         count,
         last_insert_id: None,
     })
+}
+
+fn apply_update_index_maintenance(
+    current_indexes: &mut [IndexDef],
+    compiled_preds: &[Option<Expr>],
+    update_pairs: &[(RecordId, Vec<Value>, RecordId, Vec<Value>)],
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
+) -> Result<(), DbError> {
+    for (idx_pos, idx) in current_indexes.iter_mut().enumerate() {
+        if idx.columns.is_empty() {
+            continue;
+        }
+        let pred = compiled_preds.get(idx_pos).and_then(|p| p.as_ref());
+
+        let mut delete_keys: Vec<Vec<u8>> = Vec::new();
+        let mut insert_rows: Vec<(RecordId, &Vec<Value>)> = Vec::new();
+        for (old_rid, old_values, new_rid, new_values) in update_pairs {
+            if crate::index_maintenance::update_affects_index(
+                idx,
+                pred,
+                old_values,
+                *old_rid,
+                new_values,
+                *new_rid,
+            )? {
+                if let Some(key_vals) =
+                    crate::index_maintenance::index_key_values_if_indexed(idx, old_values, pred)?
+                {
+                    delete_keys.push(crate::index_maintenance::encode_index_entry_key(
+                        idx, &key_vals, *old_rid,
+                    )?);
+                }
+                insert_rows.push((*new_rid, new_values));
+            }
+        }
+
+        if !delete_keys.is_empty() {
+            delete_keys.sort_unstable();
+            if let Some(new_root) = crate::index_maintenance::delete_many_from_single_index(
+                idx,
+                &delete_keys,
+                storage,
+                bloom,
+            )? {
+                CatalogWriter::new(storage, txn)?.update_index_root(idx.index_id, new_root)?;
+            }
+        }
+
+        for (new_rid, new_values) in insert_rows {
+            if let Some(new_root) = crate::index_maintenance::insert_into_single_index(
+                idx,
+                pred,
+                new_values,
+                new_rid,
+                storage,
+                bloom,
+            )? {
+                CatalogWriter::new(storage, txn)?.update_index_root(idx.index_id, new_root)?;
+            }
+        }
+    }
+    Ok(())
 }

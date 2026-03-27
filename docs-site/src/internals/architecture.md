@@ -128,6 +128,8 @@ The raw page I/O layer:
   free_start, free_end) and 16,320-byte body
 - Heap page format — slotted page with null bitmap and tuples growing from the end
   toward the beginning
+- Same-slot tuple rewrite helpers — used by the stable-RID UPDATE path to overwrite
+  a row in place when the new encoded row still fits inside the existing slot
 
 ### axiomdb-index
 
@@ -148,6 +150,8 @@ Append-only Write-Ahead Log:
   backward iteration (backward scan uses `entry_len_2` at the tail of each record)
 - `WalEntry` — binary-serializable record with LSN, txn_id, entry type, table_id,
   key, old_value, new_value, and checksum
+- `EntryType::UpdateInPlace` — stable-RID same-slot UPDATE record used by rollback
+  and crash recovery to restore the old tuple image at the same `(page_id, slot_id)`
 - Crash recovery state machine — `CRASHED → RECOVERING → REPLAYING_WAL → VERIFYING → READY`
 
 ### axiomdb-catalog
@@ -183,9 +187,10 @@ The SQL processing pipeline:
   parses `GROUP BY`, `HAVING`, `ORDER BY` with `NULLS FIRST/LAST`, `LIMIT/OFFSET`,
   `SELECT DISTINCT`, `INSERT … SELECT`, and both forms of `CASE WHEN`
 - `analyzer` — `BindContext` / `BoundTable`; resolves `col_idx` for JOINs
-- `eval` — expression evaluator with three-valued NULL logic; implements searched
-  CASE (arbitrary boolean conditions) and simple CASE (equality dispatch) with
-  short-circuit evaluation — unreachable branches are never evaluated
+- `eval/` — directory module rooted at `eval/mod.rs`; exports the same evaluator
+  API as before, but splits internals into `context.rs` (collation and subquery
+  runners), `core.rs` (recursive `Expr` evaluation), `ops.rs` (comparisons,
+  boolean logic, `IN`, `LIKE`), and `functions/` (scalar built-ins by family)
 - `result` — `QueryResult` enum (`Rows` / `Affected` / `Empty`), `ColumnMeta`
   (name, data_type, nullable, table_name), `Row = Vec<Value>`; the contract
   between the executor and all callers (embedded API, wire protocol, CLI)
@@ -198,6 +203,8 @@ The SQL processing pipeline:
   sort keys and per-column `NULLS FIRST/LAST` control, `LIMIT n OFFSET m` for pagination,
   `SELECT DISTINCT` with NULL-equality dedup (two NULL values are considered equal for
   deduplication), and `INSERT … SELECT` for bulk copy and aggregate materialization
+- Stable-RID UPDATE fast path — same-slot heap rewrite that preserves `RecordId`
+  when the new encoded row fits and makes untouched-index skipping safe
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>

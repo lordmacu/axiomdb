@@ -23,7 +23,9 @@
 use std::path::Path;
 
 use axiomdb_core::{error::DbError, TransactionSnapshot, TxnId};
-use axiomdb_storage::{clear_deletion, heap_chain::HeapChain, mark_slot_dead, Page, StorageEngine};
+use axiomdb_storage::{
+    clear_deletion, heap_chain::HeapChain, mark_slot_dead, restore_tuple_image, Page, StorageEngine,
+};
 
 use crate::{
     checkpoint::Checkpointer,
@@ -68,6 +70,12 @@ pub enum UndoOp {
     UndoInsert { page_id: u64, slot_id: u16 },
     /// Undo a DELETE: clear `txn_id_deleted` in the RowHeader (row is live again).
     UndoDelete { page_id: u64, slot_id: u16 },
+    /// Undo a stable-RID in-place update by restoring the previous tuple image.
+    UndoUpdateInPlace {
+        page_id: u64,
+        slot_id: u16,
+        old_image: Vec<u8>,
+    },
     // UPDATE is recorded as UndoInsert(new_slot) + UndoDelete(old_slot).
     // Reversed: UndoDelete(old_slot) runs first (restores old), then
     // UndoInsert(new_slot) (kills the replacement). Correct MVCC undo.
@@ -445,6 +453,16 @@ impl TxnManager {
                     clear_deletion(&mut page, slot_id)?;
                     storage.write_page(page_id, &page)?;
                 }
+                UndoOp::UndoUpdateInPlace {
+                    page_id,
+                    slot_id,
+                    old_image,
+                } => {
+                    let bytes = *storage.read_page(page_id)?.as_bytes();
+                    let mut page = Page::from_bytes(bytes)?;
+                    restore_tuple_image(&mut page, slot_id, &old_image)?;
+                    storage.write_page(page_id, &page)?;
+                }
                 UndoOp::UndoTruncate { root_page_id } => {
                     HeapChain::clear_deletions_by_txn(storage, root_page_id, txn_id)?;
                 }
@@ -487,6 +505,16 @@ impl TxnManager {
                     let bytes = *storage.read_page(page_id)?.as_bytes();
                     let mut page = Page::from_bytes(bytes)?;
                     clear_deletion(&mut page, slot_id)?;
+                    storage.write_page(page_id, &page)?;
+                }
+                UndoOp::UndoUpdateInPlace {
+                    page_id,
+                    slot_id,
+                    old_image,
+                } => {
+                    let bytes = *storage.read_page(page_id)?.as_bytes();
+                    let mut page = Page::from_bytes(bytes)?;
+                    restore_tuple_image(&mut page, slot_id, &old_image)?;
                     storage.write_page(page_id, &page)?;
                 }
                 UndoOp::UndoTruncate { root_page_id } => {
@@ -780,6 +808,52 @@ impl TxnManager {
         Ok(())
     }
 
+    /// Records a stable-RID in-place UPDATE into the WAL and enqueues tuple-image undo.
+    ///
+    /// Both `old_tuple_image` and `new_tuple_image` are full logical tuple images:
+    /// `[RowHeader || row bytes]`, without alignment padding.
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] if called outside a transaction.
+    pub fn record_update_in_place(
+        &mut self,
+        table_id: u32,
+        key: &[u8],
+        old_tuple_image: &[u8],
+        new_tuple_image: &[u8],
+        page_id: u64,
+        slot_id: u16,
+    ) -> Result<(), DbError> {
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = active.txn_id;
+
+        let mut ov = Vec::with_capacity(PHYSICAL_LOC_LEN + old_tuple_image.len());
+        ov.extend_from_slice(&encode_physical_loc(page_id, slot_id));
+        ov.extend_from_slice(old_tuple_image);
+
+        let mut nv = Vec::with_capacity(PHYSICAL_LOC_LEN + new_tuple_image.len());
+        nv.extend_from_slice(&encode_physical_loc(page_id, slot_id));
+        nv.extend_from_slice(new_tuple_image);
+
+        let mut entry = WalEntry::new(
+            0,
+            txn_id,
+            EntryType::UpdateInPlace,
+            table_id,
+            key.to_vec(),
+            ov,
+            nv,
+        );
+        self.wal
+            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
+        active.undo_ops.push(UndoOp::UndoUpdateInPlace {
+            page_id,
+            slot_id,
+            old_image: old_tuple_image.to_vec(),
+        });
+        Ok(())
+    }
+
     /// Records a full-table delete (DELETE without WHERE / TRUNCATE) as a
     /// single WAL entry instead of N per-row entries.
     ///
@@ -1019,16 +1093,15 @@ fn scan_max_committed(wal_path: &Path) -> Result<TxnId, DbError> {
 mod tests {
     use super::*;
     use axiomdb_storage::Page;
-    use axiomdb_storage::{insert_tuple, read_tuple, MemoryStorage, PageType};
+    use axiomdb_storage::{
+        insert_tuple, read_tuple, read_tuple_image, rewrite_tuple_same_slot, MemoryStorage,
+        PageType,
+    };
 
     fn temp_wal() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
         (dir, path)
-    }
-
-    fn fresh_data_page() -> Page {
-        Page::new(PageType::Data, 10)
     }
 
     // ── begin / commit ────────────────────────────────────────────────────────
@@ -1187,6 +1260,48 @@ mod tests {
             read_tuple(page, new_slot).unwrap().is_none(),
             "new slot must be dead after update rollback"
         );
+    }
+
+    #[test]
+    fn test_rollback_undo_update_in_place_restores_old_tuple_image() {
+        let (_dir, path) = temp_wal();
+        let mut mgr = TxnManager::create(&path).unwrap();
+        let mut storage = MemoryStorage::new();
+
+        let page_id = storage.alloc_page(PageType::Data).unwrap();
+
+        let txn1 = mgr.begin().unwrap();
+        let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
+        let mut page = Page::from_bytes(page_bytes).unwrap();
+        let slot_id = insert_tuple(&mut page, b"original", txn1).unwrap();
+        storage.write_page(page_id, &page).unwrap();
+        mgr.record_insert(1, b"k", b"original", page_id, slot_id)
+            .unwrap();
+        mgr.commit().unwrap();
+
+        let txn2 = mgr.begin().unwrap();
+        let old_image = {
+            let bytes = *storage.read_page(page_id).unwrap().as_bytes();
+            let mut p = Page::from_bytes(bytes).unwrap();
+            let old_image = rewrite_tuple_same_slot(&mut p, slot_id, b"updated", txn2)
+                .unwrap()
+                .unwrap();
+            let new_image = read_tuple_image(&p, slot_id).unwrap().unwrap();
+            storage.write_page(page_id, &p).unwrap();
+            mgr.record_update_in_place(1, b"k", &old_image, &new_image, page_id, slot_id)
+                .unwrap();
+            old_image
+        };
+
+        mgr.rollback(&mut storage).unwrap();
+
+        let page = storage.read_page(page_id).unwrap();
+        let (hdr, data) = read_tuple(page, slot_id).unwrap().unwrap();
+        assert_eq!(data, b"original");
+        assert_eq!(hdr.txn_id_created, 1);
+        assert_eq!(hdr.txn_id_deleted, 0);
+        assert_eq!(hdr.row_version, 0);
+        assert_eq!(read_tuple_image(page, slot_id).unwrap().unwrap(), old_image);
     }
 
     // ── snapshots ─────────────────────────────────────────────────────────────
@@ -1404,7 +1519,11 @@ mod tests {
             .filter(|e| {
                 matches!(
                     e.entry_type,
-                    EntryType::Insert | EntryType::Delete | EntryType::Update | EntryType::Truncate
+                    EntryType::Insert
+                        | EntryType::Delete
+                        | EntryType::Update
+                        | EntryType::UpdateInPlace
+                        | EntryType::Truncate
                 )
             })
             .collect();

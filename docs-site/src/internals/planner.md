@@ -238,16 +238,34 @@ For each deleted row:
 For each matched row:
 1. Capture old_values
 2. Apply SET assignments → new_values
-3. TableEngine::update_row → new_rid (heap delete + insert)
-4. delete_from_indexes(old_values)   — removes old key
-5. Update in-memory root_page_ids (root may have changed after delete)
-6. insert_into_indexes(new_values, new_rid) — inserts new key
-7. Persist root_page_id updates for both operations
+3. Try TableEngine::update_rows_preserve_rid[...] → either:
+   a. stable-RID same-slot rewrite (row still fits in the old slot), or
+   b. fallback delete + insert (RID changes)
+4. If RID changed:
+   a. batch-delete old keys per affected index
+   b. sync post-delete roots in memory
+   c. insert new keys with the new RID
+5. If RID stayed stable:
+   a. skip indexes whose key bytes and predicate membership did not change
+   b. only delete + reinsert the indexes whose logical membership changed
+6. Persist root_page_id updates after the batch delete phase and after any reinsertion phase
 ```
 
-The in-memory root_page_id update between steps 5 and 6 is critical: if the B-Tree
-root changed during delete (page freed and replaced), the insert must use the new
-root, not the stale catalog value.
+The root synchronization between the delete and insert halves is still critical: if
+the B-Tree root changed during old-key deletion (root collapse or same-page rebalance),
+reinsertion must start from the new root, not the stale catalog value captured before
+the batch.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Stable RID Before Index Skips</span>
+PostgreSQL HOT can skip index maintenance only because the tuple keeps a stable row
+identity. AxiomDB now follows the same rule in a Phase 5-friendly form: unchanged
+indexes are skipped only when the heap update preserves the same <code>RecordId</code>.
+If the RID changes, every index that stores the RID must still be treated as changed.
+</div>
+</div>
 
 ---
 

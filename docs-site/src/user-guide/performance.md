@@ -66,38 +66,48 @@ the technical explanation.
 - INSERT (single connection): one `fdatasync` per autocommit statement; enable Group Commit
   for concurrent workloads (see below)
 
-### DELETE WHERE / UPDATE After `5.19`
+### DELETE WHERE / UPDATE After `5.20`
 
-Phase `5.19` removes the worst remaining index-maintenance bottleneck in DML:
-old index keys are no longer deleted one row at a time. Instead, AxiomDB stages
-exact encoded keys per index and removes them with one ordered batch-delete pass
-per tree.
+Phase `5.19` removed the old-key delete bottleneck for `DELETE ... WHERE` and the
+old-key half of `UPDATE`. Phase `5.20` finishes the real `UPDATE` fix for the
+benchmark schema by preserving the heap `RecordId` when the new row fits in the
+same slot, which makes selective index skipping correct.
 
-Measured with `python3 benches/comparison/local_bench.py --rows 5000` on the
-same machine:
+Measured with `python3 benches/comparison/local_bench.py --scenario all --rows 50000 --table`
+on the same machine:
 
 | Operation | MariaDB 12.1 | MySQL 8.0 | AxiomDB | PostgreSQL 16 |
 |---|---|---|---|---|
-| `DELETE WHERE id > 2500` | 442K rows/s | 270K rows/s | **396K rows/s** | 3.26M rows/s |
-| `UPDATE ... WHERE active = TRUE` | 490K rows/s | 284K rows/s | **52.9K rows/s** | 377K rows/s |
+| `DELETE WHERE id > 25000` | 652K rows/s | 662K rows/s | **1.13M rows/s** | 3.76M rows/s |
+| `UPDATE ... WHERE active = TRUE` | 662K rows/s | 404K rows/s | **648K rows/s** | 270K rows/s |
 
 Compared to the `4.6K rows/s` pre-`5.19` DELETE-WHERE baseline that originally
 triggered this work, AxiomDB now stays in the same order of magnitude as MySQL
-and MariaDB on the same local benchmark.
+and MariaDB on the same local benchmark. More importantly, compared to the
+`52.9K rows/s` post-`5.19` / pre-`5.20` UPDATE baseline, the stable-RID path
+raises AxiomDB UPDATE throughput to `648K rows/s` on the same 50K-row benchmark.
 
 <div class="callout callout-advantage">
 <span class="callout-icon">🚀</span>
 <div class="callout-body">
 <span class="callout-label">Faster Than MySQL On DELETE WHERE</span>
-At 5K rows, AxiomDB `DELETE WHERE id > 2500` reaches <strong>396K rows/s</strong> vs
-MySQL 8.0 at <strong>270K rows/s</strong>. The gain comes from eliminating the old
+At 50K rows, AxiomDB `DELETE WHERE id > 25000` reaches <strong>1.13M rows/s</strong> vs
+MySQL 8.0 at <strong>662K rows/s</strong>. The gain comes from eliminating the old
 one-`delete_in(...)`-per-row loop and replacing it with one ordered batch delete per index.
 </div>
 </div>
 
-`UPDATE` is still slower than the other engines here because `5.19` only batch-optimizes
-the old-key delete half. Reinserting new keys still uses the existing per-row insert path,
-which is now the next obvious DML hot spot.
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">12× UPDATE Gain</span>
+`5.20` lifts AxiomDB `UPDATE ... WHERE active = TRUE` from <strong>52.9K rows/s</strong>
+to <strong>648K rows/s</strong> by preserving heap `RecordId`s on same-slot rewrites and
+skipping PK maintenance when only non-indexed columns change.
+</div>
+</div>
+
+The main remaining write-path bottleneck is now `INSERT`, not `UPDATE`.
 
 ### Prepared Statement Plan Cache (Phase 5.13)
 

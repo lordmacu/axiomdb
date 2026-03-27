@@ -1270,6 +1270,47 @@ page-locally in one ordered pass instead of re-entering the point-delete path N 
 </div>
 </div>
 
+### Stable-RID UPDATE Fast Path (`5.20`)
+
+`5.19` removed the old-key delete bottleneck, but UPDATE still paid the full
+heap delete+insert path even when the new row could fit in the existing slot.
+`5.20` adds a second branch:
+
+```
+for each matched row:
+  old_row = ...
+  new_row = apply_set_assignments(old_row)
+
+  if encoded(new_row) fits in old slot:
+      rewrite tuple in place
+      rid stays identical
+      only maintain indexes whose logical key/predicate membership changed
+  else:
+      fallback to delete + insert
+      rid changes
+      treat affected indexes as before
+```
+
+The heap rewrite path is page-grouped. Rows that share a heap page are batched so
+the executor reads the page once, rewrites all eligible slots, then writes the page
+once. WAL records this branch as `EntryType::UpdateInPlace`, storing the old and new
+tuple images for the same `(page_id, slot_id)`.
+
+This does **not** implement PostgreSQL HOT chains or forwarding pointers. The Phase 5
+rule is narrower and cheaper to reason about: same-slot rewrite only, otherwise fall
+back to the existing delete+insert path.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Borrowed HOT-Lite Rule</span>
+PostgreSQL HOT and DuckDB's in-place updates both rely on preserving row identity
+whenever the storage layout allows it. AxiomDB adapts the same idea without adding
+version chains: if the new encoded row still fits in the old slot, keep the RID and
+skip untouched indexes safely.
+</div>
+</div>
+
 ---
 
 ## Strict Mode and Warning 1265

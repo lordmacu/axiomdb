@@ -328,3 +328,222 @@ pub fn delete_many_from_indexes(
 
     Ok(updated_roots)
 }
+
+pub(crate) fn index_key_values_if_indexed(
+    idx: &IndexDef,
+    row: &[Value],
+    compiled_pred: Option<&Expr>,
+) -> Result<Option<Vec<Value>>, DbError> {
+    if let Some(pred) = compiled_pred {
+        if !is_truthy(&eval(pred, row)?) {
+            return Ok(None);
+        }
+    }
+
+    let key_vals: Vec<Value> = idx
+        .columns
+        .iter()
+        .map(|c| row.get(c.col_idx as usize).cloned().unwrap_or(Value::Null))
+        .collect();
+    if key_vals.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(None);
+    }
+    Ok(Some(key_vals))
+}
+
+pub(crate) fn encode_index_entry_key(
+    idx: &IndexDef,
+    key_vals: &[Value],
+    rid: RecordId,
+) -> Result<Vec<u8>, DbError> {
+    if idx.is_fk_index || !idx.is_unique {
+        let mut key = encode_index_key(key_vals)?;
+        key.extend_from_slice(&encode_rid(rid));
+        Ok(key)
+    } else {
+        encode_index_key(key_vals)
+    }
+}
+
+/// Returns `true` if updating `(old_row, old_rid)` to `(new_row, new_rid)` requires
+/// maintenance for `idx`.
+///
+/// If the RID changes, the index is always affected. When the RID is stable, the
+/// index is affected only if its membership or logical key changes.
+pub fn update_affects_index(
+    idx: &IndexDef,
+    compiled_pred: Option<&Expr>,
+    old_row: &[Value],
+    old_rid: RecordId,
+    new_row: &[Value],
+    new_rid: RecordId,
+) -> Result<bool, DbError> {
+    if old_rid != new_rid {
+        return Ok(true);
+    }
+
+    let old_key_vals = index_key_values_if_indexed(idx, old_row, compiled_pred)?;
+    let new_key_vals = index_key_values_if_indexed(idx, new_row, compiled_pred)?;
+    Ok(match (old_key_vals, new_key_vals) {
+        (None, None) => false,
+        (Some(old_vals), Some(new_vals)) => old_vals != new_vals,
+        _ => true,
+    })
+}
+
+/// Removes all `keys` from a single index with one `delete_many_in` call.
+pub fn delete_many_from_single_index(
+    idx: &mut IndexDef,
+    keys: &[Vec<u8>],
+    storage: &mut dyn StorageEngine,
+    bloom: &mut crate::bloom::BloomRegistry,
+) -> Result<Option<u64>, DbError> {
+    if idx.columns.is_empty() || keys.is_empty() {
+        return Ok(None);
+    }
+
+    let root_pid = AtomicU64::new(idx.root_page_id);
+    BTree::delete_many_in(storage, &root_pid, keys)?;
+    bloom.mark_dirty(idx.index_id);
+    let new_root = root_pid.load(Ordering::Acquire);
+    if new_root != idx.root_page_id {
+        idx.root_page_id = new_root;
+        Ok(Some(new_root))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Inserts one row into a single index and returns the new root if it changed.
+pub fn insert_into_single_index(
+    idx: &mut IndexDef,
+    compiled_pred: Option<&Expr>,
+    row: &[Value],
+    rid: RecordId,
+    storage: &mut dyn StorageEngine,
+    bloom: &mut crate::bloom::BloomRegistry,
+) -> Result<Option<u64>, DbError> {
+    if idx.columns.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(key_vals) = index_key_values_if_indexed(idx, row, compiled_pred)? else {
+        return Ok(None);
+    };
+    let key = encode_index_entry_key(idx, &key_vals, rid)?;
+
+    if idx.is_unique
+        && !idx.is_fk_index
+        && BTree::lookup_in(storage, idx.root_page_id, &key)?.is_some()
+    {
+        let dup_val = key_vals.first().map(|v| format!("{v}"));
+        return Err(DbError::UniqueViolation {
+            index_name: idx.name.clone(),
+            value: dup_val,
+        });
+    }
+
+    let root_pid = AtomicU64::new(idx.root_page_id);
+    BTree::insert_in(storage, &root_pid, &key, rid, idx.fillfactor)?;
+    bloom.add(idx.index_id, &key);
+    let new_root = root_pid.load(Ordering::Acquire);
+    if new_root != idx.root_page_id {
+        idx.root_page_id = new_root;
+        Ok(Some(new_root))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axiomdb_catalog::{IndexColumnDef, SortOrder};
+
+    fn make_index(col_idx: u16) -> IndexDef {
+        IndexDef {
+            index_id: 1,
+            table_id: 1,
+            name: "idx_test".to_string(),
+            root_page_id: 10,
+            is_unique: false,
+            is_primary: false,
+            columns: vec![IndexColumnDef {
+                col_idx,
+                order: SortOrder::Asc,
+            }],
+            predicate: None,
+            fillfactor: 90,
+            is_fk_index: false,
+            include_columns: vec![],
+        }
+    }
+
+    #[test]
+    fn test_update_affects_index_false_when_rid_and_key_stay_stable() {
+        let idx = make_index(0);
+        let old_rid = RecordId {
+            page_id: 42,
+            slot_id: 3,
+        };
+        let new_rid = old_rid;
+        let old_row = vec![Value::Int(7), Value::Int(10)];
+        let new_row = vec![Value::Int(7), Value::Int(99)];
+
+        assert!(
+            !update_affects_index(&idx, None, &old_row, old_rid, &new_row, new_rid).unwrap(),
+            "non-indexed column change must not affect index when RID stays stable"
+        );
+    }
+
+    #[test]
+    fn test_update_affects_index_true_when_rid_changes_even_if_key_does_not() {
+        let idx = make_index(0);
+        let old_row = vec![Value::Int(7), Value::Int(10)];
+        let new_row = vec![Value::Int(7), Value::Int(99)];
+
+        assert!(
+            update_affects_index(
+                &idx,
+                None,
+                &old_row,
+                RecordId {
+                    page_id: 42,
+                    slot_id: 3,
+                },
+                &new_row,
+                RecordId {
+                    page_id: 84,
+                    slot_id: 1,
+                },
+            )
+            .unwrap(),
+            "fallback delete+insert rows must still treat the index as affected"
+        );
+    }
+
+    #[test]
+    fn test_update_affects_index_true_when_partial_predicate_membership_changes() {
+        let mut idx = make_index(0);
+        idx.predicate = Some("active = true".to_string());
+        let predicate = Expr::BinaryOp {
+            op: crate::expr::BinaryOp::Eq,
+            left: Box::new(Expr::Column {
+                col_idx: 1,
+                name: "active".to_string(),
+            }),
+            right: Box::new(Expr::Literal(Value::Bool(true))),
+        };
+        let rid = RecordId {
+            page_id: 42,
+            slot_id: 3,
+        };
+        let old_row = vec![Value::Int(7), Value::Bool(true)];
+        let new_row = vec![Value::Int(7), Value::Bool(false)];
+
+        assert!(
+            update_affects_index(&idx, Some(&predicate), &old_row, rid, &new_row, rid).unwrap(),
+            "partial index membership changes must force maintenance even with stable RID"
+        );
+    }
+}

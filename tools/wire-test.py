@@ -1571,6 +1571,28 @@ cb19.execute("SELECT score FROM bd_users WHERE id = 6")
 ok("5.19 UPDATE batch: row outside WHERE unchanged (score = 60)",
    cb19.fetchone()[0] == 60)
 
+# UPDATE on PK-only table, touching a non-indexed column — exercises the
+# stable-RID fast path from 5.20 when the rewritten row fits in place.
+cb19.execute("CREATE TABLE bu20_users (id INT PRIMARY KEY, active BOOL, score INT)")
+for i in range(1, 11):
+    cb19.execute("INSERT INTO bu20_users VALUES (%s, %s, %s)", (i, i % 2 == 0, i * 100))
+conn_bd.commit()
+
+cb19.execute("UPDATE bu20_users SET score = score + 7 WHERE active = TRUE")
+conn_bd.commit()
+cb19.execute("SELECT id, score FROM bu20_users WHERE active = TRUE ORDER BY id ASC")
+pk_only_updated = cb19.fetchall()
+ok("5.20 UPDATE stable-RID: rows matching WHERE are updated on PK-only table",
+   list(pk_only_updated) == [(2, 207), (4, 407), (6, 607), (8, 807), (10, 1007)],
+   pk_only_updated)
+
+cb19.execute("SELECT score FROM bu20_users WHERE id = 1")
+ok("5.20 UPDATE stable-RID: row outside WHERE remains unchanged",
+   cb19.fetchone()[0] == 100)
+
+cb19.execute("DROP TABLE bu20_users")
+conn_bd.commit()
+
 # DELETE all rows — exercises full-table batch delete on PK and secondary index
 cb19.execute("DELETE FROM bd_users WHERE id >= 1")
 conn_bd.commit()

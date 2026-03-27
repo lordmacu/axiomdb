@@ -175,7 +175,7 @@ This is the largest remaining item in Block 1.
 
 - **5.15 DSN parsing** — `axiomdb://`, `mysql://`, and `postgres://` style connection strings for tools and ORMs.
 
-Phase 5 also closed three recent subphases:
+Phase 5 also closed five recent subphases:
 
 - **5.11c Explicit connection state machine** — the MySQL server now has an explicit
   `CONNECTED → AUTH → IDLE → EXECUTING → CLOSING` transport lifecycle with fixed
@@ -188,6 +188,12 @@ Phase 5 also closed three recent subphases:
   stage exact encoded keys per index and remove them with one ordered
   `delete_many_in(...)` pass per tree instead of one `delete_in(...)` traversal
   per row.
+- **5.19b Eval decomposition** — the expression evaluator now lives under a
+  responsibility-based `eval/` module tree with the same public API, which lowers
+  the cost of future built-in and collation work without changing SQL behavior.
+- **5.20 Stable-RID UPDATE fast path** — UPDATE can now rewrite rows in the same
+  heap slot when the new encoded row fits, preserve the `RecordId`, and skip
+  unnecessary index maintenance for indexes whose logical key membership is unchanged.
 
 ### Phase 6 remaining — Index completeness
 

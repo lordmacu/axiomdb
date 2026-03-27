@@ -1,6 +1,6 @@
 # Phase 5 — MySQL Wire Protocol + executor/runtime cleanup
 
-## Subfases completed in this session: 5.11c, 5.19, 5.19a
+## Subfases completed in this session: 5.11c, 5.19, 5.19a, 5.19b, 5.20
 
 ## What was built
 
@@ -67,7 +67,7 @@ What changed:
   - `delete.rs`
   - `bulk_empty.rs`
   - `ddl.rs`
-- Existing callers in `lib.rs`, `eval.rs`, and integration tests keep the same import paths.
+- Existing callers in `lib.rs`, `crate::eval`, and integration tests keep the same import paths.
 - This subphase is structural only: it changes source layout, not SQL semantics.
 
 Why this matters:
@@ -109,13 +109,93 @@ Compared to the `4.6K rows/s` pre-`5.19` DELETE-WHERE baseline that opened the
 subphase, the batched delete path removes the old O(N log N) index-delete
 behavior as the dominant bottleneck.
 
+### 5.19b — Eval decomposition
+
+AxiomDB's expression evaluator is no longer a single monolithic source file.
+The old `crates/axiomdb-sql/src/eval.rs` implementation now lives under
+`crates/axiomdb-sql/src/eval/` with a stable facade in `mod.rs`.
+
+What changed:
+
+- `mod.rs` preserves the existing `crate::eval` surface:
+  - `eval(...)`
+  - `eval_with(...)`
+  - `eval_in_session(...)`
+  - `eval_with_in_session(...)`
+  - `is_truthy(...)`
+  - `like_match(...)`
+  - `ClosureRunner`, `CollationGuard`, `NoSubquery`, `SubqueryRunner`
+- evaluator internals are now split by responsibility:
+  - `context.rs`
+  - `core.rs`
+  - `ops.rs`
+  - `functions/` (`system`, `nulls`, `numeric`, `string`, `datetime`, `binary`, `uuid`)
+  - `tests.rs`
+- `current_eval_collation()` remains exported as `pub(crate)` so executor modules
+  that depend on evaluator collation state kept the same import path.
+
+Why this matters:
+
+- future function work no longer has to edit one multi-thousand-line file
+- scalar built-ins, value operations, collation context, and recursive traversal
+  are now separable review units
+- the split stayed structural only: evaluator semantics did not change
+
+### 5.20 — Stable-RID UPDATE fast path
+
+AxiomDB no longer forces every `UPDATE` row through heap delete+insert. When the
+new encoded row fits in the same heap slot, the engine now rewrites the tuple in
+place, keeps the `RecordId` stable, and skips index maintenance for indexes whose
+logical key membership is unchanged.
+
+What changed:
+
+- `crates/axiomdb-storage/src/heap.rs` now exposes a same-slot rewrite primitive
+  that updates the tuple in place and returns the old tuple image for undo.
+- `crates/axiomdb-storage/src/heap_chain.rs` now batches same-page stable-RID
+  rewrites so multiple rows on one page cost one read + one write for that page.
+- `crates/axiomdb-wal/src/entry.rs`, `txn.rs`, and `recovery.rs` now handle
+  `EntryType::UpdateInPlace`, with rollback/savepoint/crash recovery restoring the
+  old tuple bytes into the same slot.
+- `TableEngine::update_rows_preserve_rid[_with_ctx](...)` in
+  `crates/axiomdb-sql/src/table.rs` chooses stable-RID rewrite when the row fits,
+  and falls back to the old delete+insert path when it does not.
+- `crates/axiomdb-sql/src/index_maintenance.rs` now decides index impact from the
+  actual `(old_rid, new_rid)` pair plus logical key/predicate membership:
+  unchanged indexes are skipped only when the RID stayed stable.
+- `executor/update.rs` now batches stable-RID rows and only maintains the indexes
+  truly affected by each row.
+
+Why this matters:
+
+- UPDATE on PK-only tables no longer pays unnecessary PK delete+insert work when
+  only non-indexed columns change
+- the old tracker idea "skip indexes if the SET list doesn't touch them" became
+  correct only after row identity stopped changing for the fast path
+- rollback and crash recovery remain correct because the same-slot path has its
+  own WAL/undo contract instead of pretending to be delete+insert
+
+Measured with the local four-engine benchmark (`50K` rows, wire protocol):
+
+- `UPDATE ... WHERE active = TRUE` → **647K rows/s**
+- `DELETE WHERE id > 25000` → **1.13M rows/s**
+
+This replaces the old Phase 5 picture where `UPDATE` was still stuck at
+**52.9K rows/s** after `5.19`. The stable-RID path turns UPDATE from the
+remaining DML hot spot into a MariaDB-class path on the benchmark schema.
+
 ## Validation
 
 - `cargo test -p axiomdb-network`
 - `cargo clippy -p axiomdb-network -p axiomdb-server --tests -- -D warnings`
+- `cargo test -p axiomdb-storage --lib`
+- `cargo test -p axiomdb-wal --lib`
 - `cargo test -p axiomdb-sql`
 - `cargo clippy -p axiomdb-sql --lib -- -D warnings`
 - `cargo clippy -p axiomdb-sql --tests -- -D warnings`
+- `cargo test -p axiomdb-sql --test integration_eval`
+- `cargo test -p axiomdb-sql --test integration_date_functions`
+- `cargo test -p axiomdb-sql --test integration_subqueries`
 - `cargo test -p axiomdb-index --test integration_btree`
 - `cargo test -p axiomdb-sql --test integration_executor`
 - `cargo fmt --check`
@@ -124,6 +204,7 @@ behavior as the dominant bottleneck.
 - `python3 tools/wire-test.py` → `212/212 passed`
 - `python3 benches/comparison/local_bench.py --scenario delete_where --rows 5000 --table`
 - `python3 benches/comparison/local_bench.py --scenario update --rows 5000 --table`
+- `python3 benches/comparison/local_bench.py --scenario all --rows 50000 --table`
 
 ## Follow-up subfases still open in Phase 5
 
