@@ -55,8 +55,8 @@ This prevents stale statistics from causing poor query plans.
 AxiomDB computes exact distinct value counts (no sampling). PostgreSQL uses
 Vitter's reservoir sampling algorithm for large tables. Exact counting is
 simpler and correct for the typical table sizes of an embedded database.
-Reservoir sampling (Duj1 estimator) is planned for Phase 6.15 when tables
-exceed 1M rows.
+Reservoir sampling (Duj1 estimator) is planned for a future statistics phase
+when tables exceed 1M rows.
 </div>
 </div>
 
@@ -149,6 +149,29 @@ AxiomDB automatically creates a unique B+ Tree index for:
 
 These indexes are created at `CREATE TABLE` time and cannot be dropped without
 dropping the corresponding constraint.
+
+## Startup Integrity Verification
+
+When a database opens, AxiomDB verifies every catalog-visible index against the
+heap-visible rows reconstructed after WAL recovery.
+
+- If the tree is readable but its contents diverge from the heap, AxiomDB
+  rebuilds the index automatically from table contents before serving traffic.
+- If the tree cannot be traversed safely, open fails with
+  `IndexIntegrityFailure` instead of guessing.
+
+This check applies to both embedded mode and server mode because both call the
+same startup verifier.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Auto-Rebuild Only When Safe</span>
+AxiomDB combines PostgreSQL <code>amcheck</code>'s “never trust an unreadable B-Tree” rule
+with SQLite's <code>REINDEX</code>-style rebuild-from-table approach. Readable divergence is
+healed automatically from heap data; unreadable trees still block open.
+</div>
+</div>
 
 ---
 
@@ -552,7 +575,7 @@ CREATE INDEX idx_name_dept ON employees (name) INCLUDE (department, salary);
 
 `INCLUDE` columns are recorded in the catalog metadata so the planner knows
 the index covers those columns. **Note:** physical storage of INCLUDE column
-values in B-Tree leaf nodes is deferred to Phase 6.15. Until then, the planner
+values in B-Tree leaf nodes is deferred to a future covering-index phase. Until then, the planner
 uses `INCLUDE` to correctly identify `IndexOnlyScan` opportunities, but the
 values are read from the key portion of the B-Tree entry.
 

@@ -3,9 +3,12 @@
 //! Tests the full pipeline: open → DDL → DML → SELECT → close → reopen.
 //! Exercises the public Rust API and indirectly validates all C FFI logic.
 
+use axiomdb_catalog::CatalogReader;
 use axiomdb_core::DbError;
 use axiomdb_embedded::Db;
+use axiomdb_storage::{MmapStorage, StorageEngine};
 use axiomdb_types::Value;
+use axiomdb_wal::TxnManager;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -18,6 +21,39 @@ fn open_fresh() -> (Db, tempfile::TempDir) {
 
 fn file_uri(path: &std::path::Path) -> String {
     format!("file:{}", path.display())
+}
+
+fn rewrite_embedded_index_root(
+    path: &std::path::Path,
+    table_name: &str,
+    target_index_name: &str,
+    new_root: u64,
+) {
+    let db_path = path.with_extension("db");
+    let wal_path = path.with_extension("wal");
+    let mut storage = MmapStorage::open(&db_path).expect("open db");
+    let mut txn = TxnManager::open(&wal_path).expect("open wal");
+    let mut reader = CatalogReader::new(&storage, txn.snapshot()).expect("catalog reader");
+    let table = reader
+        .get_table("public", table_name)
+        .expect("catalog read")
+        .expect("table exists");
+    let target = reader
+        .list_indexes(table.id)
+        .expect("list indexes")
+        .into_iter()
+        .find(|idx| idx.name == target_index_name)
+        .unwrap_or_else(|| panic!("index {target_index_name} missing on {table_name}"));
+    txn.begin().expect("begin catalog txn");
+    {
+        let mut writer =
+            axiomdb_catalog::CatalogWriter::new(&mut storage, &mut txn).expect("catalog writer");
+        writer
+            .update_index_root(target.index_id, new_root)
+            .expect("rewrite root");
+    }
+    txn.commit().expect("commit catalog txn");
+    storage.flush().expect("flush corrupted index");
 }
 
 // ── Open / DDL ────────────────────────────────────────────────────────────────
@@ -47,6 +83,41 @@ fn open_existing_database_recovers_data() {
     let mut db = Db::open(&path).unwrap();
     let rows = db.query("SELECT * FROM items").unwrap();
     assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn open_existing_database_fails_for_unreadable_unique_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("repair");
+
+    {
+        let mut db = Db::open(&path).unwrap();
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY, email TEXT)")
+            .unwrap();
+        db.execute("CREATE UNIQUE INDEX uq_email ON users(email)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice@x.com')")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'bob@x.com')")
+            .unwrap();
+    }
+
+    rewrite_embedded_index_root(&path, "users", "uq_email", 9_999_999);
+
+    let err = match Db::open(&path) {
+        Ok(_) => panic!("embedded open must fail on unreadable index"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        DbError::IndexIntegrityFailure {
+            table,
+            index,
+            reason,
+        } if table == "public.users"
+            && index == "uq_email"
+            && (reason.contains("page") || reason.contains("B+ tree"))
+    ));
 }
 
 #[test]

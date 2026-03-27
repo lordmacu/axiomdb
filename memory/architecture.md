@@ -126,3 +126,18 @@
   - parse once in core
   - validate per consumer
   - do not silently invent semantics for unsupported DSN fields
+
+## 2026-03-27 — Startup index integrity verification
+
+- `axiomdb-sql/src/index_integrity.rs` owns the startup verifier.
+- The verifier treats heap-visible rows as source of truth and compares them
+  against every catalog-visible index.
+- Readable divergence is repaired by:
+  - rebuilding a fresh index root from heap rows
+  - flushing the rebuilt pages
+  - rotating the catalog root in a WAL-protected txn
+  - deferring free of old tree pages until commit durability is confirmed
+- Unreadable or non-enumerable index trees are not auto-healed; open fails with
+  `DbError::IndexIntegrityFailure`.
+- Both `axiomdb-network` and `axiomdb-embedded` now call the same verifier
+  immediately after `open_with_recovery(...)` and before serving traffic.

@@ -214,6 +214,44 @@ INSERT INTO products (name, price) VALUES ('Widget', -5.00);
 
 ---
 
+## Startup / Open Errors
+
+These errors happen before a SQL statement runs. They are returned by
+`Db::open(...)`, `Db::open_dsn(...)`, `AsyncDb::open(...)`, or server startup,
+so there is no SQLSTATE-bearing result set yet.
+
+### `IndexIntegrityFailure` — open refused because an index is not trustworthy
+
+On every open, AxiomDB now verifies each catalog-visible index against the
+heap-visible rows reconstructed after WAL recovery.
+
+- If an index is readable but missing entries or contains extra entries, AxiomDB
+  rebuilds it automatically before accepting traffic.
+- If the index tree cannot be traversed safely, open fails with
+  `DbError::IndexIntegrityFailure`.
+
+Example Rust handling:
+
+```rust
+match axiomdb_embedded::Db::open("./data.db") {
+    Ok(db) => { /* ready */ }
+    Err(axiomdb_core::DbError::IndexIntegrityFailure { table, index, reason }) => {
+        eprintln!("database refused to open: {table}.{index}: {reason}");
+    }
+    Err(other) => return Err(other),
+}
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Repair What Is Readable</span>
+AxiomDB borrows PostgreSQL <code>amcheck</code>'s “fail if the tree is not safely readable”
+discipline, but borrows SQLite's “rebuild from table contents” recovery idea for readable
+divergence. A readable-but-wrong index is rebuilt automatically; an unreadable tree blocks open.
+</div>
+</div>
+
 ## Cardinality Errors (Class 21)
 
 ### 21000 — cardinality_violation

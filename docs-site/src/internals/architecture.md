@@ -46,6 +46,7 @@ prevents circular dependencies and makes each component independently testable.
 │  │              CASE WHEN searched + simple form, short-circuit)    │
 │  ├── result    (QueryResult, ColumnMeta, Row — executor return type)│
 │  ├── table     (TableEngine — scan/insert/delete/update over heap)  │
+│  ├── index_integrity (startup index-vs-heap verifier + rebuild)     │
 │  └── executor/ (mod.rs facade + select/insert/update/delete/ddl/   │
 │                 join/aggregate/shared modules; same execute() API; │
 │                 GROUP BY + HAVING + ORDER BY + LIMIT/OFFSET +      │
@@ -206,6 +207,9 @@ The SQL processing pipeline:
 - `result` — `QueryResult` enum (`Rows` / `Affected` / `Empty`), `ColumnMeta`
   (name, data_type, nullable, table_name), `Row = Vec<Value>`; the contract
   between the executor and all callers (embedded API, wire protocol, CLI)
+- `index_integrity` — startup-time verification that compares every
+  catalog-visible index against heap-visible rows after WAL recovery and
+  rebuilds readable divergent indexes before open returns
 - `executor/` — directory module rooted at `executor/mod.rs`; the facade still exports
   `execute`, `execute_with_ctx`, and `last_insert_id_value`, but the implementation is
   now split into `shared.rs`, `select.rs`, `joins.rs`, `aggregate.rs`, `insert.rs`,
@@ -245,7 +249,7 @@ The MySQL wire protocol implementation. Lives in `crates/axiomdb-network/src/mys
 | `handler.rs` | `handle_connection` — async task per TCP connection; explicit `CONNECTED → AUTH → IDLE → EXECUTING → CLOSING` lifecycle |
 | `result.rs` | `serialize_query_result` — `QueryResult` → `column_count + column_defs + EOF + rows + EOF` packets; charset-aware row encoding |
 | `error.rs` | `dberror_to_mysql` — maps every `DbError` variant to a MySQL error code + SQLSTATE |
-| `database.rs` | `Database` wrapper — holds `Arc<Mutex<axiomdb_sql::Database>>`, exposes `execute_query` |
+| `database.rs` | `Database` wrapper — owns storage + txn, runs WAL recovery and startup index verification, exposes `execute_query` |
 
 #### Connection lifecycle
 

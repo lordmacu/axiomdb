@@ -515,7 +515,7 @@ pub fn batch_insert_into_indexes(
                 && !idx.is_fk_index
                 && BTree::lookup_in(storage, root_pid.load(Ordering::Acquire), key)?.is_some()
             {
-                let dup_val = Some(format!("(encoded)"));
+                let dup_val = Some("(encoded)".to_string());
                 return Err(DbError::UniqueViolation {
                     index_name: idx.name.clone(),
                     value: dup_val,

@@ -53,7 +53,7 @@ fn collect_heap_chain_pages(
 /// Collects all page_ids in a B-Tree rooted at `root_pid` (BFS walk).
 ///
 /// The result includes internal nodes and leaf nodes but excludes `0` sentinels.
-fn collect_btree_pages(
+pub(crate) fn collect_btree_pages(
     storage: &mut dyn StorageEngine,
     root_pid: u64,
 ) -> Result<Vec<u64>, DbError> {
@@ -147,7 +147,10 @@ fn apply_bulk_empty_table(
 ///
 /// Iteratively walks the tree (BFS via a stack) and calls `free_page` on each
 /// node — both internal and leaf pages.
-fn free_btree_pages(storage: &mut dyn StorageEngine, root_pid: u64) -> Result<(), DbError> {
+pub(crate) fn free_btree_pages(
+    storage: &mut dyn StorageEngine,
+    root_pid: u64,
+) -> Result<(), DbError> {
     use axiomdb_index::page_layout::{cast_internal, cast_leaf};
 
     let mut stack = vec![root_pid];

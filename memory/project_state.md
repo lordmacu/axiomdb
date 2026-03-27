@@ -36,6 +36,7 @@
 
 ## 2026-03-27
 
+- Phase 6 subphase `6.15` is closed in code, targeted tests, and docs.
 - Phase 5 subphase `5.15` is closed in code, tests, and docs.
 - Phase 5 subphase `5.21` is closed in code, tests, and docs.
 - Explicit transactions now stage consecutive `INSERT ... VALUES` rows in
@@ -65,3 +66,10 @@
 - Embedded mode accepts only local-path DSNs in `5.15`; remote wire-endpoint
   DSNs are rejected explicitly after parse.
 - Phase 5 is now complete.
+- `6.15` adds startup index integrity verification:
+  - compare each catalog-visible index against heap-visible rows after WAL recovery
+  - rebuild readable divergence automatically from heap contents
+  - fail open with `DbError::IndexIntegrityFailure` if the tree cannot be read safely
+- The verifier runs in both:
+  - `axiomdb-network/src/mysql/database.rs`
+  - `axiomdb-embedded/src/lib.rs`

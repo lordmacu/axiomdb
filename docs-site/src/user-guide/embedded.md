@@ -54,6 +54,7 @@ use axiomdb_embedded::Db;
 
 // Creates ./myapp.db and ./myapp.wal if they don't exist.
 // Runs crash recovery automatically if the WAL has uncommitted entries.
+// Also verifies every catalog-visible index before returning the handle.
 let mut db = Db::open("./myapp.db")?;
 let mut db2 = Db::open_dsn("file:/tmp/myapp.db")?;
 let mut db3 = Db::open_dsn("axiomdb:///tmp/myapp")?;
@@ -61,6 +62,16 @@ let mut db3 = Db::open_dsn("axiomdb:///tmp/myapp")?;
 
 Remote DSNs such as `postgres://user@127.0.0.1:5432/app` are not supported by
 embedded mode in Phase `5.15` and return `DbError::InvalidDsn`.
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Open Can Repair Or Refuse</span>
+Embedded open now performs startup index verification. A readable-but-divergent
+index is rebuilt automatically; an unreadable tree returns
+<code>DbError::IndexIntegrityFailure</code> and the handle is never created.
+</div>
+</div>
 
 ### DDL and DML
 

@@ -133,3 +133,17 @@
 - This is especially important when aliases exist:
   - `mysql://` and `postgres://` can be valid parse aliases
   - but that must not silently imply protocol support the product does not have
+
+## 2026-03-27 - Direct storage rebuilds need a durability barrier before root rotation
+
+- If a repair path writes new storage pages outside WAL and then swaps a catalog
+  root to point at them, the new pages must be durable before the root swap is
+  committed.
+- The safe ordering is:
+  - build new pages
+  - `storage.flush()`
+  - commit the catalog/root metadata change
+- Otherwise recovery can replay the metadata/root change and make the new root
+  visible while the rebuilt pages were only ever resident in memory.
+- This applies to index rebuild / root-rotation paths in particular, not only to
+  startup repair code.

@@ -14,9 +14,9 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed phase:** Phase 3 WAL (100%) — Group Commit, WAL batch append, PageWrite; Phases 4–6 in active development
+**Last completed subphase:** 6.15 Index corruption detection — startup verifier compares each catalog index against heap-visible rows, rebuilds readable divergence, and fails open on unreadable trees before traffic starts
 
-**Active development:** Phase 6 Indexes (6.8 fill factor, 6.9 FK composite index + ON UPDATE CASCADE, 6.10–6.15 planned)
+**Active development:** Phase 7 MVCC + concurrency design
 
 **Next milestone:** Phase 7 — full MVCC + concurrent writers (removes global mutex)
 
@@ -205,12 +205,15 @@ Phase 5 also closed the recent runtime/perf subphases:
   on `COMMIT` or the next barrier statement, preserving savepoint semantics by
   flushing before the next statement savepoint whenever the batch cannot continue.
 
-### Phase 6 remaining — Index completeness
+### Phase 6 closing note — Integrity and recovery
 
-- **6.4 Bloom filter** — per-index probabilistic filter to skip B+ Tree traversal for
-  non-existent keys. Relevant for sparse lookups.
-- **6.5/6.6 Foreign keys** — `REFERENCES` constraint enforcement + `ON DELETE CASCADE /
-  RESTRICT / SET NULL`. Required for ORM schema migrations (Rails, Django, Prisma).
+Phase 6 now closes with startup index integrity verification:
+
+- every catalog-visible index is compared against heap-visible rows after WAL recovery
+- readable divergence is repaired automatically from heap contents
+- unreadable index trees fail open with `IndexIntegrityFailure`
+
+SQL `REINDEX` remains deferred to the later diagnostics / administration phases.
 3. **Index range scan** — range predicate via `RangeIter`.
 4. **Projection** — evaluate SELECT expressions over rows from the scan.
 5. **Filter** — apply WHERE expression using the evaluator from Phase 4.17.

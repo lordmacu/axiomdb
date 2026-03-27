@@ -95,6 +95,16 @@ pub enum DbError {
     #[error("CHECK constraint violation on {table}.{constraint}")]
     CheckViolation { table: String, constraint: String },
 
+    /// Startup-time index integrity verification found an unrecoverable index problem.
+    ///
+    /// Raised during open/recovery before the database starts serving traffic.
+    #[error("index integrity failure on {table}.{index}: {reason}")]
+    IndexIntegrityFailure {
+        table: String,
+        index: String,
+        reason: String,
+    },
+
     // ── WAL ──────────────────────────────────────────────────────
     #[error("WAL group commit fsync failed: {message}")]
     WalGroupCommitFailed { message: String },
