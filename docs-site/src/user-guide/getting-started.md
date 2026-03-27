@@ -131,11 +131,11 @@ Bye.
 # Default: stores data in ./data, listens on port 3306
 axiomdb-server
 
-# Custom data directory and port
-axiomdb-server --data-dir /var/lib/axiomdb --port 3306
+# Legacy env vars
+AXIOMDB_DATA=/var/lib/axiomdb AXIOMDB_PORT=3307 axiomdb-server
 
-# Override port via environment variable
-AXIOMDB_PORT=3307 axiomdb-server
+# DSN bootstrap (Phase 5.15)
+AXIOMDB_URL='axiomdb://0.0.0.0:3307/axiomdb?data_dir=/var/lib/axiomdb' axiomdb-server
 ```
 
 The server is ready when you see:
@@ -143,6 +143,25 @@ The server is ready when you see:
 ```
 INFO axiomdb_server: listening on 0.0.0.0:3306
 ```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Parse Once</span>
+AxiomDB borrows PostgreSQL libpq's split between URI parsing and consumer-specific validation: <code>AXIOMDB_URL</code> is normalized in shared core code first, then the server accepts only the fields it actually supports in Phase <code>5.15</code> instead of silently inventing meanings for extra options.
+</div>
+</div>
+
+In Phase `5.15`, `AXIOMDB_URL` supports `axiomdb://`, `mysql://`,
+`postgres://`, and `postgresql://` URI syntax. The alias schemes are parse
+aliases only: `axiomdb-server` still speaks the MySQL wire protocol only.
+
+Supported server DSN fields:
+
+- host and port from the URI authority
+- `data_dir` from the query string
+
+Unsupported query params are rejected explicitly instead of being ignored.
 
 ### Connecting with the mysql CLI
 
@@ -448,50 +467,41 @@ axiomdb-embedded = { path = "../axiomdb/crates/axiomdb-embedded" }
 ### Open a Database
 
 ```rust
-use axiomdb_embedded::{Database, QueryResult};
+use axiomdb_embedded::Db;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Open (or create) a database file on disk.
-    let db = Database::open("./axiomdb.db")?;
+    let mut db = Db::open("./axiomdb.db")?;
+    let mut db2 = Db::open_dsn("file:/tmp/axiomdb.db")?;
+    let mut db3 = Db::open_dsn("axiomdb:///tmp/axiomdb")?;
 
-    // Or open an in-memory database for tests / temporary use.
-    // let db = Database::open_in_memory()?;
+    db.execute("CREATE TABLE users (id INT, name TEXT, age INT)")?;
+    db.execute("INSERT INTO users VALUES (1, 'Alice', 30)")?;
+    db.execute("INSERT INTO users VALUES (2, 'Bob', 25)")?;
 
-    // Execute DDL
-    db.execute("
-        CREATE TABLE users (
-            id    BIGINT PRIMARY KEY AUTO_INCREMENT,
-            name  TEXT    NOT NULL,
-            email TEXT    NOT NULL UNIQUE,
-            age   INT
-        )
-    ")?;
-
-    // Insert rows
-    db.execute("INSERT INTO users (name, email, age) VALUES ('Alice', 'alice@example.com', 30)")?;
-    db.execute("INSERT INTO users (name, email, age) VALUES ('Bob',   'bob@example.com',   25)")?;
-
-    // Query
-    let result = db.execute("SELECT id, name, age FROM users WHERE age > 20 ORDER BY name")?;
-    for row in result.rows() {
-        println!("{:?}", row);
+    let (columns, rows) = db.query_with_columns(
+        "SELECT id, name, age FROM users WHERE age > 20 ORDER BY name"
+    )?;
+    println!("{columns:?}");
+    for row in rows {
+        println!("{row:?}");
     }
 
     Ok(())
 }
 ```
 
+`Db::open_dsn(...)` accepts only local DSNs in Phase `5.15`. Remote
+wire-endpoint DSNs such as `postgres://...` parse successfully in the shared
+parser but are rejected by the embedded API.
+
 ### Explicit Transactions
 
 ```rust
-let db = Database::open("./axiomdb.db")?;
-
-db.transaction(|txn| {
-    txn.execute("INSERT INTO accounts (owner, balance) VALUES ('Alice', 1000.00)")?;
-    txn.execute("INSERT INTO accounts (owner, balance) VALUES ('Bob',     500.00)")?;
-    // Both rows are committed atomically, or neither is if an error occurs.
-    Ok(())
-})?;
+let mut db = axiomdb_embedded::Db::open("./axiomdb.db")?;
+db.begin()?;
+db.execute("INSERT INTO accounts VALUES (1, 'Alice', 1000.0)")?;
+db.execute("INSERT INTO accounts VALUES (2, 'Bob', 500.0)")?;
+db.commit()?;
 ```
 
 ---
@@ -505,16 +515,13 @@ For C, C++, Qt, or Java (JNI):
 
 int main(void) {
     AxiomDb* db = axiomdb_open("./axiomdb.db");
+    AxiomDb* db2 = axiomdb_open_dsn("file:/tmp/axiomdb.db");
     if (!db) { fprintf(stderr, "failed to open\n"); return 1; }
 
-    char* result = NULL;
-    int rc = axiomdb_execute(db, "SELECT id, name FROM users", &result);
-    if (rc == 0) {
-        printf("%s\n", result);   // result is JSON
-        axiomdb_free_string(result);
-    }
-
+    axiomdb_execute(db, "CREATE TABLE users (id INT, name TEXT)");
+    axiomdb_execute(db, "INSERT INTO users VALUES (1, 'Alice')");
     axiomdb_close(db);
+    axiomdb_close(db2);
     return 0;
 }
 ```
@@ -522,18 +529,19 @@ int main(void) {
 ### Python via ctypes
 
 ```python
-import ctypes, json
+import ctypes
 
 lib = ctypes.CDLL("./libaxiomdb.dylib")
 lib.axiomdb_open.restype  = ctypes.c_void_p
+lib.axiomdb_open_dsn.restype = ctypes.c_void_p
 lib.axiomdb_close.argtypes = [ctypes.c_void_p]
-lib.axiomdb_execute.restype = ctypes.c_int
+lib.axiomdb_execute.restype = ctypes.c_longlong
 
 db = lib.axiomdb_open(b"./axiomdb.db")
-result_ptr = ctypes.c_char_p()
-lib.axiomdb_execute(db, b"SELECT * FROM users", ctypes.byref(result_ptr))
-rows = json.loads(result_ptr.value)
+db2 = lib.axiomdb_open_dsn(b"file:/tmp/axiomdb.db")
+lib.axiomdb_execute(db, b"CREATE TABLE t (id INT)")
 lib.axiomdb_close(db)
+lib.axiomdb_close(db2)
 ```
 
 ---

@@ -171,11 +171,17 @@ Phase 7 removes this constraint with per-table record locks, snapshot isolation 
 COMMITTED and REPEATABLE READ), and epoch-based memory reclamation for CoW B+ Tree nodes.
 This is the largest remaining item in Block 1.
 
-### Phase 5 remaining
+### Phase 5
 
-- **5.15 DSN parsing** — `axiomdb://`, `mysql://`, and `postgres://` style connection strings for tools and ORMs.
+Phase 5 is now complete. The last close was:
 
-Phase 5 also closed six recent subphases:
+- **5.15 DSN parsing** — AxiomDB-owned surfaces now accept typed DSNs:
+  `AXIOMDB_URL` for server bootstrap plus `Db::open_dsn`, `AsyncDb::open_dsn`,
+  and `axiomdb_open_dsn` for embedded mode. `mysql://` and `postgres://` are
+  parse aliases only; the server still speaks MySQL wire only and embedded mode
+  still accepts only local-path DSNs.
+
+Phase 5 also closed the recent runtime/perf subphases:
 
 - **5.11c Explicit connection state machine** — the MySQL server now has an explicit
   `CONNECTED → AUTH → IDLE → EXECUTING → CLOSING` transport lifecycle with fixed

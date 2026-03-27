@@ -10,6 +10,14 @@ The embedded crate ships two APIs:
 | `axiomdb_open` / `axiomdb_query` / … | C | C, C++, Python (`ctypes`), Swift, Kotlin JNI, Unity |
 | `AsyncDb` | Rust + Tokio | Async Rust services |
 
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Local DSN Only</span>
+Like SQLite's split between URI parsing and VFS-specific validation, AxiomDB now parses DSNs centrally but keeps embedded mode local-only. In Phase <code>5.15</code>, <code>Db::open_dsn</code> and <code>axiomdb_open_dsn</code> accept filesystem DSNs and reject remote wire endpoints explicitly.
+</div>
+</div>
+
 <div class="callout callout-advantage">
 <span class="callout-icon">🚀</span>
 <div class="callout-body">
@@ -47,7 +55,12 @@ use axiomdb_embedded::Db;
 // Creates ./myapp.db and ./myapp.wal if they don't exist.
 // Runs crash recovery automatically if the WAL has uncommitted entries.
 let mut db = Db::open("./myapp.db")?;
+let mut db2 = Db::open_dsn("file:/tmp/myapp.db")?;
+let mut db3 = Db::open_dsn("axiomdb:///tmp/myapp")?;
 ```
+
+Remote DSNs such as `postgres://user@127.0.0.1:5432/app` are not supported by
+embedded mode in Phase `5.15` and return `DbError::InvalidDsn`.
 
 ### DDL and DML
 
@@ -141,6 +154,7 @@ use axiomdb_embedded::async_db::AsyncDb;
 #[tokio::main]
 async fn main() {
     let db = AsyncDb::open("./myapp.db").await?;
+    let db2 = AsyncDb::open_dsn("file:/tmp/myapp.db").await?;
     db.execute("CREATE TABLE t (id INT)").await?;
 
     let (columns, rows) = db.query_with_columns("SELECT * FROM t").await?;
@@ -199,6 +213,7 @@ typedef struct AxiomRows  AxiomRows;
 
 /* Open / close */
 AxiomDb*    axiomdb_open        (const char* path);
+AxiomDb*    axiomdb_open_dsn    (const char* dsn);
 void        axiomdb_close       (AxiomDb* db);
 
 /* Execute DML/DDL — returns rows affected, or -1 on error */
@@ -231,6 +246,7 @@ const char* axiomdb_last_error  (const AxiomDb* db);
 
 int main(void) {
     AxiomDb* db = axiomdb_open("./app.db");
+    AxiomDb* db2 = axiomdb_open_dsn("file:/tmp/app.db");
     if (!db) { fprintf(stderr, "failed to open db\n"); return 1; }
 
     axiomdb_execute(db,
@@ -284,6 +300,7 @@ int main(void) {
 
     axiomdb_rows_free(rows);
     axiomdb_close(db);
+    axiomdb_close(db2);
     return 0;
 }
 ```

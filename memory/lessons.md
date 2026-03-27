@@ -121,3 +121,15 @@
   - use the scenario that motivated the subphase
   - compare against the latest relevant local baseline or competitor numbers
   - avoid rerunning unrelated scenarios unless the blast radius justifies it
+
+## 2026-03-27 - Parse shared config once, validate semantics at the edge
+
+- For URI/DSN-like inputs, keep one shared parser that preserves information and
+  returns a typed normalized shape.
+- Do not let each consumer re-parse strings differently; that creates drift.
+- The parser should own syntax and ambiguity rejection.
+- Each consumer should own only semantic validation of the subset it actually
+  supports.
+- This is especially important when aliases exist:
+  - `mysql://` and `postgres://` can be valid parse aliases
+  - but that must not silently imply protocol support the product does not have

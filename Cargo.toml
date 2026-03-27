@@ -73,6 +73,8 @@ bytemuck = { version = "1", features = ["derive"] }
 
 # Configuration file parsing
 toml = "1"
+url = "2"
+percent-encoding = "2"
 
 # SQL lexer — DFA-based tokenizer
 logos = "0.14"
