@@ -61,6 +61,8 @@ use std::mem::size_of;
 
 use crate::session::SessionContext;
 
+type StableUpdateBatchRef<'a> = (&'a [u8], &'a [u8], &'a [u8], u64, u16);
+
 // ── TableEngine ───────────────────────────────────────────────────────────────
 
 /// Stateless row storage interface for user tables.
@@ -191,6 +193,34 @@ impl TableEngine {
                 Ok(Some(values))
             }
         }
+    }
+
+    /// Reads multiple rows by `RecordId` in a single pass over the heap,
+    /// grouping reads by page for I/O locality.
+    ///
+    /// Returns a vector parallel to `rids`:
+    /// - `Some(values)` if the slot is alive
+    /// - `None` if the slot is dead
+    ///
+    /// For N rows across P pages this is O(P) page reads instead of O(N).
+    pub fn read_rows_batch(
+        storage: &dyn StorageEngine,
+        columns: &[ColumnDef],
+        rids: &[RecordId],
+    ) -> Result<Vec<Option<Vec<Value>>>, DbError> {
+        if rids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let raw_rids: Vec<(u64, u16)> = rids.iter().map(|r| (r.page_id, r.slot_id)).collect();
+        let raw_results = HeapChain::read_rows_batch(storage, &raw_rids)?;
+        let col_types = column_data_types(columns);
+        raw_results
+            .into_iter()
+            .map(|raw| match raw {
+                None => Ok(None),
+                Some(bytes) => Ok(Some(decode_row(&bytes, &col_types)?)),
+            })
+            .collect()
     }
 
     /// Encodes and inserts a row into the table heap, WAL-logging the insert.
@@ -899,24 +929,20 @@ fn build_in_place_tuple_image(
     new_encoded: &[u8],
     txn_id: u64,
 ) -> Result<Vec<u8>, DbError> {
-    if old_tuple_image.len() < size_of::<RowHeader>() {
+    let header_len = size_of::<RowHeader>();
+    if old_tuple_image.len() < header_len {
         return Err(DbError::Internal {
             message: "stable-RID update: old tuple image shorter than RowHeader".into(),
         });
     }
-    let old_header = RowHeader {
-        txn_id_created: u64::from_le_bytes(old_tuple_image[0..8].try_into().unwrap()),
-        txn_id_deleted: u64::from_le_bytes(old_tuple_image[8..16].try_into().unwrap()),
-        row_version: u32::from_le_bytes(old_tuple_image[16..20].try_into().unwrap()),
-        _flags: u32::from_le_bytes(old_tuple_image[20..24].try_into().unwrap()),
-    };
+    let old_header: RowHeader = *bytemuck::from_bytes(&old_tuple_image[..header_len]);
     let new_header = RowHeader {
         txn_id_created: txn_id,
         txn_id_deleted: 0,
         row_version: old_header.row_version.saturating_add(1),
         _flags: old_header._flags,
     };
-    let mut image = Vec::with_capacity(size_of::<RowHeader>() + new_encoded.len());
+    let mut image = Vec::with_capacity(header_len + new_encoded.len());
     image.extend_from_slice(&new_header.txn_id_created.to_le_bytes());
     image.extend_from_slice(&new_header.txn_id_deleted.to_le_bytes());
     image.extend_from_slice(&new_header.row_version.to_le_bytes());
@@ -995,24 +1021,54 @@ fn apply_prepared_updates_preserve_rid(
         txn_id,
     )?;
 
+    // Separate stable-RID successes from fallback rows.
+    // Stable-RID rows are WAL-logged in one batch call; fallback rows use
+    // the per-row delete+insert path.
+    struct StableImage {
+        key: [u8; 10],
+        old_tuple_image: Vec<u8>,
+        new_tuple_image: Vec<u8>,
+        page_id: u64,
+        slot_id: u16,
+    }
+
     let mut new_rids = Vec::with_capacity(prepared.len());
+    let mut stable_images: Vec<StableImage> = Vec::new();
+
     for ((rid, new_encoded), rewrite_result) in prepared.iter().zip(rewrite_results.into_iter()) {
         match rewrite_result {
             Some(old_tuple_image) => {
                 let key = encode_rid(rid.page_id, rid.slot_id);
                 let new_tuple_image =
                     build_in_place_tuple_image(&old_tuple_image, new_encoded, txn_id)?;
-                txn.record_update_in_place(
-                    table_def.id,
-                    &key,
-                    &old_tuple_image,
-                    &new_tuple_image,
-                    rid.page_id,
-                    rid.slot_id,
-                )?;
+                stable_images.push(StableImage {
+                    key,
+                    old_tuple_image,
+                    new_tuple_image,
+                    page_id: rid.page_id,
+                    slot_id: rid.slot_id,
+                });
                 new_rids.push(*rid);
             }
             None => {
+                // Flush any accumulated stable images before the fallback path,
+                // which will call record_delete + record_insert (WAL ordering).
+                if !stable_images.is_empty() {
+                    let batch_refs: Vec<StableUpdateBatchRef<'_>> = stable_images
+                        .iter()
+                        .map(|img| {
+                            (
+                                img.key.as_slice(),
+                                img.old_tuple_image.as_slice(),
+                                img.new_tuple_image.as_slice(),
+                                img.page_id,
+                                img.slot_id,
+                            )
+                        })
+                        .collect();
+                    txn.record_update_in_place_batch(table_def.id, &batch_refs)?;
+                    stable_images.clear();
+                }
                 let new_rid = update_encoded_row_with_hint(
                     storage,
                     txn,
@@ -1024,6 +1080,23 @@ fn apply_prepared_updates_preserve_rid(
                 new_rids.push(new_rid);
             }
         }
+    }
+
+    // Flush remaining stable images.
+    if !stable_images.is_empty() {
+        let batch_refs: Vec<StableUpdateBatchRef<'_>> = stable_images
+            .iter()
+            .map(|img| {
+                (
+                    img.key.as_slice(),
+                    img.old_tuple_image.as_slice(),
+                    img.new_tuple_image.as_slice(),
+                    img.page_id,
+                    img.slot_id,
+                )
+            })
+            .collect();
+        txn.record_update_in_place_batch(table_def.id, &batch_refs)?;
     }
 
     Ok(new_rids)

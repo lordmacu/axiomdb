@@ -535,6 +535,55 @@ pub fn batch_insert_into_indexes(
     Ok(updated_roots)
 }
 
+/// Inserts multiple rows into a single index in one pass, persisting the root
+/// once after all insertions. Returns the new root if it changed.
+///
+/// Mirrors `batch_insert_into_indexes` but operates on a single index and
+/// does not use the bulk-load path (UPDATE rows go into an existing non-empty index).
+pub fn insert_many_into_single_index(
+    idx: &mut IndexDef,
+    compiled_pred: Option<&Expr>,
+    rows: &[(&[Value], RecordId)],
+    storage: &mut dyn StorageEngine,
+    bloom: &mut crate::bloom::BloomRegistry,
+) -> Result<Option<u64>, DbError> {
+    if idx.columns.is_empty() || rows.is_empty() {
+        return Ok(None);
+    }
+
+    let original_root = idx.root_page_id;
+    let root_pid = AtomicU64::new(original_root);
+
+    for (row, rid) in rows {
+        let Some(key_vals) = index_key_values_if_indexed(idx, row, compiled_pred)? else {
+            continue;
+        };
+        let key = encode_index_entry_key(idx, &key_vals, *rid)?;
+
+        if idx.is_unique
+            && !idx.is_fk_index
+            && BTree::lookup_in(storage, root_pid.load(Ordering::Acquire), &key)?.is_some()
+        {
+            let dup_val = key_vals.first().map(|v| format!("{v}"));
+            return Err(DbError::UniqueViolation {
+                index_name: idx.name.clone(),
+                value: dup_val,
+            });
+        }
+
+        BTree::insert_in(storage, &root_pid, &key, *rid, idx.fillfactor)?;
+        bloom.add(idx.index_id, &key);
+    }
+
+    let new_root = root_pid.load(Ordering::Acquire);
+    if new_root != original_root {
+        idx.root_page_id = new_root;
+        Ok(Some(new_root))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Inserts one row into a single index and returns the new root if it changed.
 pub fn insert_into_single_index(
     idx: &mut IndexDef,

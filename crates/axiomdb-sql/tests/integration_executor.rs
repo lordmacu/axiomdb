@@ -5156,6 +5156,57 @@ fn test_delete_where_indexed_then_reinsert_same_pk() {
     }
 }
 
+
+#[test]
+fn test_update_noop_counts_matched_rows_but_leaves_data_unchanged() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE TABLE noop_upd (id INT NOT NULL, score INT, PRIMARY KEY (id))",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "INSERT INTO noop_upd VALUES (1, 10), (2, 20), (3, 30)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let result = run_ctx(
+        "UPDATE noop_upd SET score = score WHERE id <= 2",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(affected_count(result), 2);
+
+    let rows = rows(
+        run_ctx(
+            "SELECT id, score FROM noop_upd ORDER BY id",
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)],
+            vec![Value::Int(3), Value::Int(30)],
+        ]
+    );
+}
+
 // ── Phase 5.21 — transactional INSERT staging ──────────────────────────────
 
 fn run_ctx_5_21(

@@ -607,6 +607,54 @@ impl HeapChain {
         Ok(result)
     }
 
+    /// Reads multiple rows by `(page_id, slot_id)`, grouping reads by page for
+    /// I/O locality. Each heap page is read **exactly once** regardless of how
+    /// many rows are requested from it.
+    ///
+    /// Returns a vector parallel to `rids`:
+    /// - `Some(data_bytes)` if the slot is alive
+    /// - `None` if the slot is dead (already deleted)
+    ///
+    /// ## Performance
+    ///
+    /// For N rows across P pages this is **O(P)** page reads instead of the
+    /// **O(N)** of N individual [`read_row`] calls. The original RID order is
+    /// preserved in the output via position tracking.
+    pub fn read_rows_batch(
+        storage: &dyn StorageEngine,
+        rids: &[(u64, u16)],
+    ) -> Result<Vec<Option<Vec<u8>>>, DbError> {
+        if rids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut indexed: Vec<(usize, u64, u16)> = rids
+            .iter()
+            .enumerate()
+            .map(|(i, &(page_id, slot_id))| (i, page_id, slot_id))
+            .collect();
+        indexed.sort_unstable_by_key(|(_, page_id, slot_id)| (*page_id, *slot_id));
+
+        let mut result: Vec<Option<Vec<u8>>> = vec![None; rids.len()];
+        let mut i = 0;
+
+        while i < indexed.len() {
+            let page_id = indexed[i].1;
+            let raw = *storage.read_page(page_id)?.as_bytes();
+            let page = Page::from_bytes(raw)?;
+
+            while i < indexed.len() && indexed[i].1 == page_id {
+                let (orig_idx, _, slot_id) = indexed[i];
+                if let Some((_header, data)) = crate::heap::read_tuple(&page, slot_id)? {
+                    result[orig_idx] = Some(data.to_vec());
+                }
+                i += 1;
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Reads the application payload of the tuple at `(page_id, slot_id)`.
     ///
     /// Returns `None` if the slot is dead (already deleted). The returned bytes
@@ -1082,6 +1130,50 @@ mod tests {
         assert_eq!(
             d1, d2,
             "batch and individual insert must produce identical heap contents"
+        );
+    }
+
+    #[test]
+    fn test_read_rows_batch_preserves_order_and_reads_page_once() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut storage = CountingStorage {
+            inner: MemoryStorage::new(),
+            reads: reads.clone(),
+            writes,
+        };
+        let root = storage.alloc_page(PageType::Data).unwrap();
+        storage
+            .write_page(root, &Page::new(PageType::Data, root))
+            .unwrap();
+
+        let rid1 = HeapChain::insert(&mut storage, root, b"alpha", 1).unwrap();
+        let rid2 = HeapChain::insert(&mut storage, root, b"bravo", 1).unwrap();
+        let rid3 = HeapChain::insert(&mut storage, root, b"charlie", 1).unwrap();
+        assert_eq!(rid1.0, rid2.0);
+        assert_eq!(rid2.0, rid3.0);
+
+        reads.store(0, Ordering::Relaxed);
+
+        let rows = HeapChain::read_rows_batch(
+            &storage,
+            &[(rid3.0, rid3.1), (rid1.0, rid1.1), (rid2.0, rid2.1)],
+        )
+        .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                Some(b"charlie".to_vec()),
+                Some(b"alpha".to_vec()),
+                Some(b"bravo".to_vec()),
+            ],
+            "batch read must preserve caller-visible RID order",
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "same-page batch read must read the page once",
         );
     }
 
