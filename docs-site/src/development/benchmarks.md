@@ -276,7 +276,7 @@ work rather than fsync batching across multiple commits.
 
 ---
 
-## Phase 6.19 — WAL fsync pipeline (not closed yet)
+## Phase 6.19 — WAL fsync pipeline
 
 Measured with:
 
@@ -305,6 +305,9 @@ What the benchmark taught us:
 - the handler still waits for durability before it sends `OK`
 - therefore the next statement cannot arrive while the current fsync is in
   flight, so single-connection piggyback never materializes
+
+`6.19` is closed as an implementation subphase, but this benchmark remains a
+documented performance gap rather than a solved target.
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
@@ -360,7 +363,7 @@ PostgreSQL's <code>heap_multi_insert()</code> and DuckDB's appender both separat
 
 ---
 
-## Phase 6.17 — Indexed UPDATE candidate fast path
+## Phase 6.20 — UPDATE apply fast path
 
 Measured with `python3 benches/comparison/local_bench.py --scenario update_range --rows 5000 --table`
 against a release AxiomDB server and local MariaDB/MySQL instances on the same
@@ -369,25 +372,36 @@ on a PK-indexed table.
 
 | Benchmark | MariaDB 12.1 | MySQL 8.0 | AxiomDB | Notes |
 |---|---|---|---|---|
-| `update_range` | 618K rows/s | 291K rows/s | **85.2K rows/s** | indexed candidate discovery now uses PK/index B+Tree access |
+| `update_range` | 618K rows/s | 291K rows/s | **369.9K rows/s** | PK range UPDATE now stays on a batched read/apply path end-to-end |
 
-What changed in `6.17`:
+What changed in `6.20`:
 
-- `plan_update_candidates(...)` / `_ctx(...)` now choose `IndexLookup` or
-  `IndexRange` for UPDATE candidate discovery
-- PRIMARY KEY, UNIQUE, secondary, and eligible partial indexes are allowed
-- candidate `RecordId`s are materialized before any mutation
-- the full original `WHERE` is rechecked on fetched rows
-- physical heap/index rewrite still reuses the `5.20` stable-RID / fallback path
+- `IndexLookup` / `IndexRange` candidate rows are fetched through
+  `read_rows_batch(...)` instead of one heap read per RID
+- no-op UPDATE rows are filtered before heap/index mutation
+- stable-RID rows batch `UpdateInPlace` WAL append with
+  `reserve_lsns(...) + write_batch(...)`
+- UPDATE index maintenance now uses grouped delete+insert with one root
+  persistence write per affected index
+- both ctx and non-ctx UPDATE paths share a statement-level index bailout
 
-This closes the old planner-side O(n) discovery debt for indexed UPDATE. The
-remaining gap is now clearly in the apply path after rows are found.
+This closes the dominant apply-side debt left behind after `6.17`. The benchmark
+improves by `4.3x` over the `6.17` result (`85.2K rows/s`) and now beats the
+documented local MySQL result on the same workload.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage</span>
+AxiomDB improves `update_range` from <strong>85.2K</strong> to <strong>369.9K rows/s</strong> after `6.20`, a <strong>4.3x</strong> gain, and overtakes MySQL 8.0 (<strong>291K rows/s</strong>) by keeping PK-range UPDATE inside one batched heap/WAL apply path.
+</div>
+</div>
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
-<span class="callout-label">Design Decision — Discovery Before Rewrite</span>
-PostgreSQL's <code>nodeModifyTable.c</code> and SQLite's <code>update.c</code> both split row discovery from physical mutation. AxiomDB now does the same for indexed UPDATE: `6.17` speeds up candidate discovery without changing the `5.20` rewrite semantics, which keeps rollback and index-correctness invariants local to the existing write path.
+<span class="callout-label">Design Decision — Batch Without New WAL Type</span>
+MariaDB's `row0upd.cc` and PostgreSQL's heap update path optimize clustered-row UPDATE primarily by reducing repeated heap/index work, not by inventing a new redo format first. AxiomDB follows that trade-off in `6.20`: it reuses `UpdateInPlace` for recovery compatibility and attacks the per-row apply overhead around it.
 </div>
 </div>
 
