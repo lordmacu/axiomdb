@@ -100,6 +100,14 @@ impl Database {
     ///
     /// Creates the directory and initializes the catalog if not already present.
     pub fn open(data_dir: &Path) -> Result<Self, DbError> {
+        Self::open_with_config(data_dir, &DbConfig::default())
+    }
+
+    /// Opens or creates a database at `data_dir` with explicit configuration.
+    ///
+    /// The resolved `WalDurabilityPolicy` controls whether the fsync pipeline
+    /// is used (`Strict`) or bypassed (`Normal` / `Off`).
+    pub fn open_with_config(data_dir: &Path, config: &DbConfig) -> Result<Self, DbError> {
         std::fs::create_dir_all(data_dir).map_err(DbError::Io)?;
 
         let db_path = data_dir.join("axiomdb.db");
@@ -117,10 +125,18 @@ impl Database {
             (storage, txn)
         };
 
-        // Enable pipeline commit mode so `TxnManager::commit()` writes the
-        // Commit WAL entry to the BufWriter without inline fsync. The fsync
+        let durability = config.resolved_wal_durability();
+        txn.set_durability_policy(durability);
+
+        // Strict mode: enable pipeline commit so `TxnManager::commit()` writes
+        // the Commit WAL entry to the BufWriter without inline fsync. The fsync
         // pipeline handles durability via leader-based coalescing.
-        txn.set_deferred_commit_mode(true);
+        //
+        // Normal / Off: bypass the pipeline — relaxed modes flush or skip
+        // inline and advance max_committed immediately in `commit()`.
+        if durability == WalDurabilityPolicy::Strict {
+            txn.set_deferred_commit_mode(true);
+        }
         let pipeline = FsyncPipeline::new(txn.wal_current_lsn());
 
         Ok(Self {
