@@ -45,7 +45,10 @@ use axiomdb_wal::TxnManager;
 use crate::{
     bootstrap::{CatalogBootstrap, CatalogPageIds},
     notifier::{CatalogChangeNotifier, SchemaChangeEvent, SchemaChangeKind},
-    schema::{ColumnDef, ConstraintDef, FkDef, IndexDef, StatsDef, TableDef, TableId},
+    schema::{
+        ColumnDef, ConstraintDef, DatabaseDef, FkDef, IndexDef, StatsDef, TableDatabaseDef,
+        TableDef, TableId,
+    },
 };
 
 // ── WAL table_id constants for system tables ──────────────────────────────────
@@ -62,6 +65,10 @@ pub const SYSTEM_TABLE_CONSTRAINTS: u32 = u32::MAX - 3;
 pub const SYSTEM_TABLE_FOREIGN_KEYS: u32 = u32::MAX - 4;
 /// WAL `table_id` used for inserts/deletes into `axiom_stats` (Phase 6.10).
 pub const SYSTEM_TABLE_STATS: u32 = u32::MAX - 5;
+/// WAL `table_id` used for inserts/deletes into `axiom_databases` (Phase 22b.3a).
+pub const SYSTEM_TABLE_DATABASES: u32 = u32::MAX - 6;
+/// WAL `table_id` used for inserts/deletes into `axiom_table_databases` (Phase 22b.3a).
+pub const SYSTEM_TABLE_TABLE_DATABASES: u32 = u32::MAX - 7;
 
 // ── CatalogWriter ─────────────────────────────────────────────────────────────
 
@@ -92,7 +99,7 @@ impl<'a> CatalogWriter<'a> {
         storage: &'a mut dyn StorageEngine,
         txn: &'a mut TxnManager,
     ) -> Result<Self, DbError> {
-        let page_ids = CatalogBootstrap::page_ids(storage)?;
+        let page_ids = CatalogBootstrap::ensure_database_roots(storage)?;
         Ok(Self {
             storage,
             txn,
@@ -130,6 +137,153 @@ impl<'a> CatalogWriter<'a> {
             let txn_id = self.txn.active_txn_id().unwrap_or(0);
             n.notify(&SchemaChangeEvent { kind, txn_id });
         }
+    }
+
+    // ── Database operations ──────────────────────────────────────────────────
+
+    /// Inserts a database definition row into `axiom_databases`.
+    pub fn create_database(&mut self, name: &str) -> Result<(), DbError> {
+        let data = DatabaseDef {
+            name: name.to_string(),
+        }
+        .to_bytes();
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+        let (page_id, slot_id) =
+            HeapChain::insert(self.storage, self.page_ids.databases, &data, txn_id)?;
+        self.txn.record_insert(
+            SYSTEM_TABLE_DATABASES,
+            name.as_bytes(),
+            &data,
+            page_id,
+            slot_id,
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a database definition row from `axiom_databases`.
+    ///
+    /// Returns `Ok(false)` when no visible row exists.
+    pub fn drop_database(&mut self, name: &str) -> Result<bool, DbError> {
+        let snap = self.txn.active_snapshot()?;
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+        let rows = crate::reader::CatalogReader::scan_databases_root(
+            self.storage,
+            self.page_ids.databases,
+            snap,
+        )?;
+        for (rid, data) in rows {
+            let (def, _) = DatabaseDef::from_bytes(&data)?;
+            if def.name == name {
+                HeapChain::delete(self.storage, rid.page_id, rid.slot_id, txn_id)?;
+                self.txn.record_delete(
+                    SYSTEM_TABLE_DATABASES,
+                    name.as_bytes(),
+                    &data,
+                    rid.page_id,
+                    rid.slot_id,
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Inserts or replaces the table → database ownership binding.
+    pub fn bind_table_to_database(
+        &mut self,
+        table_id: TableId,
+        database_name: &str,
+    ) -> Result<(), DbError> {
+        self.drop_table_database_binding(table_id)?;
+        let data = TableDatabaseDef {
+            table_id,
+            database_name: database_name.to_string(),
+        }
+        .to_bytes();
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+        let (page_id, slot_id) =
+            HeapChain::insert(self.storage, self.page_ids.table_databases, &data, txn_id)?;
+        self.txn.record_insert(
+            SYSTEM_TABLE_TABLE_DATABASES,
+            &table_id.to_le_bytes(),
+            &data,
+            page_id,
+            slot_id,
+        )?;
+        Ok(())
+    }
+
+    /// Deletes the explicit table → database ownership binding, if present.
+    pub fn drop_table_database_binding(&mut self, table_id: TableId) -> Result<(), DbError> {
+        let snap = self.txn.active_snapshot()?;
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+        let rows = crate::reader::CatalogReader::scan_table_databases_root(
+            self.storage,
+            self.page_ids.table_databases,
+            snap,
+        )?;
+        for (rid, data) in rows {
+            let (def, _) = TableDatabaseDef::from_bytes(&data)?;
+            if def.table_id == table_id {
+                HeapChain::delete(self.storage, rid.page_id, rid.slot_id, txn_id)?;
+                self.txn.record_delete(
+                    SYSTEM_TABLE_TABLE_DATABASES,
+                    &table_id.to_le_bytes(),
+                    &data,
+                    rid.page_id,
+                    rid.slot_id,
+                )?;
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Deletes all explicit table ownership bindings that point at `database_name`.
+    ///
+    /// Returns the affected table ids.
+    pub fn drop_table_database_bindings_for_database(
+        &mut self,
+        database_name: &str,
+    ) -> Result<Vec<TableId>, DbError> {
+        let snap = self.txn.active_snapshot()?;
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+        let rows = crate::reader::CatalogReader::scan_table_databases_root(
+            self.storage,
+            self.page_ids.table_databases,
+            snap,
+        )?;
+        let mut dropped = Vec::new();
+        for (rid, data) in rows {
+            let (def, _) = TableDatabaseDef::from_bytes(&data)?;
+            if def.database_name == database_name {
+                HeapChain::delete(self.storage, rid.page_id, rid.slot_id, txn_id)?;
+                self.txn.record_delete(
+                    SYSTEM_TABLE_TABLE_DATABASES,
+                    &def.table_id.to_le_bytes(),
+                    &data,
+                    rid.page_id,
+                    rid.slot_id,
+                )?;
+                dropped.push(def.table_id);
+            }
+        }
+        Ok(dropped)
     }
 
     // ── Table operations ──────────────────────────────────────────────────────
@@ -306,6 +460,9 @@ impl<'a> CatalogWriter<'a> {
         for index_id in dropped_index_ids {
             self.fire(SchemaChangeKind::IndexDropped { index_id, table_id });
         }
+
+        // Remove any explicit database ownership binding for this table.
+        self.drop_table_database_binding(table_id)?;
 
         Ok(())
     }
@@ -748,6 +905,41 @@ impl<'a> CatalogWriter<'a> {
         let (page_id, slot_id) = HeapChain::insert(self.storage, stats_root, &data, txn_id)?;
         self.txn
             .record_insert(SYSTEM_TABLE_STATS, &key, &data, page_id, slot_id)?;
+        Ok(())
+    }
+
+    /// Deletes all stats rows for `table_id`.
+    pub fn delete_stats_for_table(&mut self, table_id: TableId) -> Result<(), DbError> {
+        let stats_root = match CatalogBootstrap::page_ids(self.storage) {
+            Ok(ids) if ids.stats != 0 => ids.stats,
+            _ => return Ok(()),
+        };
+        let snap = self.txn.active_snapshot()?;
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+        let existing =
+            crate::reader::CatalogReader::scan_stats_root(self.storage, stats_root, snap)?;
+        for (rid, old_data) in existing {
+            if let Ok((old_def, _)) = StatsDef::from_bytes(&old_data) {
+                if old_def.table_id == table_id {
+                    let key = [
+                        old_def.table_id.to_le_bytes(),
+                        [old_def.col_idx as u8, (old_def.col_idx >> 8) as u8, 0, 0],
+                    ]
+                    .concat();
+                    HeapChain::delete(self.storage, rid.page_id, rid.slot_id, txn_id)?;
+                    self.txn.record_delete(
+                        SYSTEM_TABLE_STATS,
+                        &key,
+                        &old_data,
+                        rid.page_id,
+                        rid.slot_id,
+                    )?;
+                }
+            }
+        }
         Ok(())
     }
 }

@@ -22,7 +22,10 @@
 //! ```
 //! `col_idx = table.col_offset + column_position_within_table`
 
-use axiomdb_catalog::{schema::ColumnDef, CatalogReader};
+use axiomdb_catalog::{
+    schema::{ColumnDef, DEFAULT_DATABASE_NAME},
+    CatalogReader,
+};
 use axiomdb_core::{error::DbError, TransactionSnapshot};
 use axiomdb_storage::StorageEngine;
 
@@ -53,8 +56,7 @@ pub fn analyze(
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
 ) -> Result<Stmt, DbError> {
-    let default_schema = "public";
-    analyze_stmt(stmt, storage, snapshot, default_schema)
+    analyze_with_defaults(stmt, storage, snapshot, DEFAULT_DATABASE_NAME, "public")
 }
 
 /// Cached variant of [`analyze`] — skips catalog heap scans for tables already
@@ -72,8 +74,42 @@ pub fn analyze_cached(
     snapshot: TransactionSnapshot,
     cache: &mut SchemaCache,
 ) -> Result<Stmt, DbError> {
-    let default_schema = "public";
-    analyze_stmt_cached(stmt, storage, snapshot, default_schema, cache)
+    analyze_cached_with_defaults(
+        stmt,
+        storage,
+        snapshot,
+        DEFAULT_DATABASE_NAME,
+        "public",
+        cache,
+    )
+}
+
+pub fn analyze_with_defaults(
+    stmt: Stmt,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_database: &str,
+    default_schema: &str,
+) -> Result<Stmt, DbError> {
+    analyze_stmt(stmt, storage, snapshot, default_database, default_schema)
+}
+
+pub fn analyze_cached_with_defaults(
+    stmt: Stmt,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_database: &str,
+    default_schema: &str,
+    cache: &mut SchemaCache,
+) -> Result<Stmt, DbError> {
+    analyze_stmt_cached(
+        stmt,
+        storage,
+        snapshot,
+        default_database,
+        default_schema,
+        cache,
+    )
 }
 
 // ── BindContext ───────────────────────────────────────────────────────────────
@@ -233,6 +269,7 @@ fn build_context(
     joins: &[crate::ast::JoinClause],
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &str,
     default_schema: &str,
 ) -> Result<BindContext, DbError> {
     let mut ctx = BindContext::empty();
@@ -243,6 +280,7 @@ fn build_context(
             from_clause,
             storage,
             snapshot,
+            default_database,
             default_schema,
             &mut col_offset,
         )?;
@@ -254,6 +292,7 @@ fn build_context(
             &join.table,
             storage,
             snapshot,
+            default_database,
             default_schema,
             &mut col_offset,
         )?;
@@ -267,18 +306,32 @@ fn bound_from_clause(
     from: &FromClause,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &str,
     default_schema: &str,
     col_offset: &mut usize,
 ) -> Result<Vec<BoundTable>, DbError> {
     match from {
         FromClause::Table(table_ref) => {
-            let bound = bound_table_ref(table_ref, storage, snapshot, default_schema, col_offset)?;
+            let bound = bound_table_ref(
+                table_ref,
+                storage,
+                snapshot,
+                default_database,
+                default_schema,
+                col_offset,
+            )?;
             Ok(vec![bound])
         }
         FromClause::Subquery { query, alias } => {
             // Analyze the inner SELECT recursively.
             // The virtual table's columns = the SELECT list items.
-            let analyzed_query = analyze_select(*query.clone(), storage, snapshot, default_schema)?;
+            let analyzed_query = analyze_select(
+                *query.clone(),
+                storage,
+                snapshot,
+                default_database,
+                default_schema,
+            )?;
             let virtual_cols = virtual_columns_from_select(&analyzed_query);
             let n = virtual_cols.len();
             let bound = BoundTable {
@@ -297,18 +350,18 @@ fn bound_table_ref(
     table_ref: &TableRef,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &str,
     default_schema: &str,
     col_offset: &mut usize,
 ) -> Result<BoundTable, DbError> {
     let schema = table_ref.schema.as_deref().unwrap_or(default_schema);
     let mut reader = CatalogReader::new(storage, snapshot)?;
 
-    let table_def =
-        reader
-            .get_table(schema, &table_ref.name)?
-            .ok_or_else(|| DbError::TableNotFound {
-                name: format!("{}.{}", schema, table_ref.name),
-            })?;
+    let table_def = reader
+        .get_table_in_database(default_database, schema, &table_ref.name)?
+        .ok_or_else(|| DbError::TableNotFound {
+            name: format!("{}.{}", schema, table_ref.name),
+        })?;
 
     let columns = reader.list_columns(table_def.id)?;
     let n = columns.len();
@@ -365,6 +418,7 @@ fn virtual_columns_from_select(select: &SelectStmt) -> Vec<ColumnDef> {
 struct AnalyzeState<'a> {
     storage: &'a dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &'a str,
     default_schema: &'a str,
 }
 
@@ -560,6 +614,7 @@ fn resolve_expr_full(
                 *inner,
                 st.storage,
                 st.snapshot,
+                st.default_database,
                 st.default_schema,
                 &extended,
             )?;
@@ -581,6 +636,7 @@ fn resolve_expr_full(
                 *query,
                 st.storage,
                 st.snapshot,
+                st.default_database,
                 st.default_schema,
                 &extended,
             )?;
@@ -601,6 +657,7 @@ fn resolve_expr_full(
                 *query,
                 st.storage,
                 st.snapshot,
+                st.default_database,
                 st.default_schema,
                 &extended,
             )?;
@@ -634,24 +691,37 @@ fn analyze_stmt(
     stmt: Stmt,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &str,
     default_schema: &str,
 ) -> Result<Stmt, DbError> {
     match stmt {
-        Stmt::Select(s) => analyze_select(s, storage, snapshot, default_schema).map(Stmt::Select),
-        Stmt::Insert(s) => analyze_insert(s, storage, snapshot, default_schema).map(Stmt::Insert),
-        Stmt::Update(s) => analyze_update(s, storage, snapshot, default_schema).map(Stmt::Update),
-        Stmt::Delete(s) => analyze_delete(s, storage, snapshot, default_schema).map(Stmt::Delete),
+        Stmt::Select(s) => {
+            analyze_select(s, storage, snapshot, default_database, default_schema).map(Stmt::Select)
+        }
+        Stmt::Insert(s) => {
+            analyze_insert(s, storage, snapshot, default_database, default_schema).map(Stmt::Insert)
+        }
+        Stmt::Update(s) => {
+            analyze_update(s, storage, snapshot, default_database, default_schema).map(Stmt::Update)
+        }
+        Stmt::Delete(s) => {
+            analyze_delete(s, storage, snapshot, default_database, default_schema).map(Stmt::Delete)
+        }
         Stmt::CreateTable(s) => {
-            analyze_create_table(s, storage, snapshot, default_schema).map(Stmt::CreateTable)
+            analyze_create_table(s, storage, snapshot, default_database, default_schema)
+                .map(Stmt::CreateTable)
         }
         Stmt::DropTable(s) => {
-            analyze_drop_table(s, storage, snapshot, default_schema).map(Stmt::DropTable)
+            analyze_drop_table(s, storage, snapshot, default_database, default_schema)
+                .map(Stmt::DropTable)
         }
         Stmt::CreateIndex(s) => {
-            analyze_create_index(s, storage, snapshot, default_schema).map(Stmt::CreateIndex)
+            analyze_create_index(s, storage, snapshot, default_database, default_schema)
+                .map(Stmt::CreateIndex)
         }
         Stmt::AlterTable(s) => {
-            analyze_alter_table(s, storage, snapshot, default_schema).map(Stmt::AlterTable)
+            analyze_alter_table(s, storage, snapshot, default_database, default_schema)
+                .map(Stmt::AlterTable)
         }
         // Statements that need no semantic analysis for Phase 4.18:
         other => Ok(other),
@@ -664,21 +734,28 @@ fn analyze_stmt_cached(
     stmt: Stmt,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &str,
     default_schema: &str,
     cache: &mut SchemaCache,
 ) -> Result<Stmt, DbError> {
     match stmt {
         // INSERT is the hot path — use the cached variant
-        Stmt::Insert(s) => {
-            analyze_insert_cached(s, storage, snapshot, default_schema, cache).map(Stmt::Insert)
-        }
+        Stmt::Insert(s) => analyze_insert_cached(
+            s,
+            storage,
+            snapshot,
+            default_database,
+            default_schema,
+            cache,
+        )
+        .map(Stmt::Insert),
         // DDL invalidates the cache
         Stmt::CreateTable(_) | Stmt::DropTable(_) | Stmt::AlterTable(_) => {
             cache.invalidate();
-            analyze_stmt(stmt, storage, snapshot, default_schema)
+            analyze_stmt(stmt, storage, snapshot, default_database, default_schema)
         }
         // Everything else: fall back to uncached
-        other => analyze_stmt(other, storage, snapshot, default_schema),
+        other => analyze_stmt(other, storage, snapshot, default_database, default_schema),
     }
 }
 
@@ -686,28 +763,35 @@ fn analyze_insert_cached(
     mut s: InsertStmt,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &str,
     default_schema: &str,
     cache: &mut SchemaCache,
 ) -> Result<InsertStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
 
     // Try cache first — avoids HeapChain::scan_visible × 2 on repeated inserts
-    let (table_def, columns) = if let Some(td) = cache.get_table(schema, &s.table.name) {
-        let cols = cache.get_columns(td.id).cloned().unwrap_or_default();
-        (td.clone(), cols)
-    } else {
-        // Cache miss: normal catalog lookup
-        let mut reader = CatalogReader::new(storage, snapshot)?;
-        let td =
-            reader
-                .get_table(schema, &s.table.name)?
+    let (table_def, columns) =
+        if let Some(td) = cache.get_table(default_database, schema, &s.table.name) {
+            let cols = cache.get_columns(td.id).cloned().unwrap_or_default();
+            (td.clone(), cols)
+        } else {
+            // Cache miss: normal catalog lookup
+            let mut reader = CatalogReader::new(storage, snapshot)?;
+            let td = reader
+                .get_table_in_database(default_database, schema, &s.table.name)?
                 .ok_or_else(|| DbError::TableNotFound {
                     name: s.table.name.clone(),
                 })?;
-        let cols = reader.list_columns(td.id)?;
-        cache.insert(schema, &s.table.name, td.clone(), cols.clone());
-        (td, cols)
-    };
+            let cols = reader.list_columns(td.id)?;
+            cache.insert(
+                default_database,
+                schema,
+                &s.table.name,
+                td.clone(),
+                cols.clone(),
+            );
+            (td, cols)
+        };
     let _ = table_def; // used only to populate cache; executor reads from catalog directly
 
     // Validate named column list if provided
@@ -729,7 +813,13 @@ fn analyze_insert_cached(
 
     // Analyze SELECT source if present
     if let InsertSource::Select(ref select) = s.source {
-        let analyzed = analyze_select(*select.clone(), storage, snapshot, default_schema)?;
+        let analyzed = analyze_select(
+            *select.clone(),
+            storage,
+            snapshot,
+            default_database,
+            default_schema,
+        )?;
         s.source = InsertSource::Select(Box::new(analyzed));
     }
 
@@ -745,9 +835,10 @@ fn analyze_select(
     s: SelectStmt,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &str,
     default_schema: &str,
 ) -> Result<SelectStmt, DbError> {
-    analyze_select_with_outer(s, storage, snapshot, default_schema, &[])
+    analyze_select_with_outer(s, storage, snapshot, default_database, default_schema, &[])
 }
 
 /// Analyze a SELECT statement, threading `outer_scopes` through every expression
@@ -760,19 +851,33 @@ fn analyze_select_with_outer(
     mut s: SelectStmt,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &str,
     default_schema: &str,
     outer_scopes: &[&BindContext],
 ) -> Result<SelectStmt, DbError> {
     // Build resolution context from FROM and JOINs.
-    let ctx = build_context(&s.from, &s.joins, storage, snapshot, default_schema)?;
+    let ctx = build_context(
+        &s.from,
+        &s.joins,
+        storage,
+        snapshot,
+        default_database,
+        default_schema,
+    )?;
 
     // If FROM is a derived table (subquery in FROM), `build_context` analyzed
     // the inner query to extract virtual column names, but did NOT store the
     // analyzed version back into `s.from`. Fix that here so the executor
     // receives the analyzed inner query with correct `col_idx` values.
     if let Some(FromClause::Subquery { query, alias }) = s.from {
-        let analyzed_inner =
-            analyze_select_with_outer(*query, storage, snapshot, default_schema, outer_scopes)?;
+        let analyzed_inner = analyze_select_with_outer(
+            *query,
+            storage,
+            snapshot,
+            default_database,
+            default_schema,
+            outer_scopes,
+        )?;
         s.from = Some(FromClause::Subquery {
             query: Box::new(analyzed_inner),
             alias,
@@ -784,6 +889,7 @@ fn analyze_select_with_outer(
     let state = AnalyzeState {
         storage,
         snapshot,
+        default_database,
         default_schema,
     };
 
@@ -855,17 +961,17 @@ fn analyze_insert(
     mut s: InsertStmt,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &str,
     default_schema: &str,
 ) -> Result<InsertStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
     let mut reader = CatalogReader::new(storage, snapshot)?;
 
-    let table_def =
-        reader
-            .get_table(schema, &s.table.name)?
-            .ok_or_else(|| DbError::TableNotFound {
-                name: s.table.name.clone(),
-            })?;
+    let table_def = reader
+        .get_table_in_database(default_database, schema, &s.table.name)?
+        .ok_or_else(|| DbError::TableNotFound {
+            name: s.table.name.clone(),
+        })?;
 
     let columns = reader.list_columns(table_def.id)?;
 
@@ -888,7 +994,13 @@ fn analyze_insert(
 
     // Analyze SELECT source if present.
     if let InsertSource::Select(ref select) = s.source {
-        let analyzed = analyze_select(*select.clone(), storage, snapshot, default_schema)?;
+        let analyzed = analyze_select(
+            *select.clone(),
+            storage,
+            snapshot,
+            default_database,
+            default_schema,
+        )?;
         s.source = InsertSource::Select(Box::new(analyzed));
     }
 
@@ -901,17 +1013,17 @@ fn analyze_update(
     mut s: UpdateStmt,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &str,
     default_schema: &str,
 ) -> Result<UpdateStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
     let mut reader = CatalogReader::new(storage, snapshot)?;
 
-    let table_def =
-        reader
-            .get_table(schema, &s.table.name)?
-            .ok_or_else(|| DbError::TableNotFound {
-                name: s.table.name.clone(),
-            })?;
+    let table_def = reader
+        .get_table_in_database(default_database, schema, &s.table.name)?
+        .ok_or_else(|| DbError::TableNotFound {
+            name: s.table.name.clone(),
+        })?;
 
     let columns = reader.list_columns(table_def.id)?;
 
@@ -955,17 +1067,17 @@ fn analyze_delete(
     mut s: DeleteStmt,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &str,
     default_schema: &str,
 ) -> Result<DeleteStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
     let mut reader = CatalogReader::new(storage, snapshot)?;
 
-    let table_def =
-        reader
-            .get_table(schema, &s.table.name)?
-            .ok_or_else(|| DbError::TableNotFound {
-                name: s.table.name.clone(),
-            })?;
+    let table_def = reader
+        .get_table_in_database(default_database, schema, &s.table.name)?
+        .ok_or_else(|| DbError::TableNotFound {
+            name: s.table.name.clone(),
+        })?;
 
     let columns = reader.list_columns(table_def.id)?;
     let bound = BoundTable {
@@ -988,6 +1100,7 @@ fn analyze_create_table(
     s: CreateTableStmt,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &str,
     default_schema: &str,
 ) -> Result<CreateTableStmt, DbError> {
     let mut reader = CatalogReader::new(storage, snapshot)?;
@@ -1002,8 +1115,12 @@ fn analyze_create_table(
             } = constraint
             {
                 let schema = default_schema;
-                let exists = reader.get_table(schema, ref_table)?.is_some()
-                    || reader.get_table("public", ref_table)?.is_some();
+                let exists = reader
+                    .get_table_in_database(default_database, schema, ref_table)?
+                    .is_some()
+                    || reader
+                        .get_table_in_database(default_database, "public", ref_table)?
+                        .is_some();
                 if !exists {
                     return Err(DbError::TableNotFound {
                         name: ref_table.clone(),
@@ -1012,8 +1129,13 @@ fn analyze_create_table(
                 // If a specific column is referenced, validate it exists.
                 if let Some(col_name) = ref_col {
                     let ref_table_def = reader
-                        .get_table(default_schema, ref_table)?
-                        .or_else(|| reader.get_table("public", ref_table).ok().flatten());
+                        .get_table_in_database(default_database, default_schema, ref_table)?
+                        .or_else(|| {
+                            reader
+                                .get_table_in_database(default_database, "public", ref_table)
+                                .ok()
+                                .flatten()
+                        });
                     if let Some(ref_def) = ref_table_def {
                         let ref_cols = reader.list_columns(ref_def.id)?;
                         if !ref_cols.iter().any(|c| &c.name == col_name) {
@@ -1037,6 +1159,7 @@ fn analyze_drop_table(
     s: DropTableStmt,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &str,
     default_schema: &str,
 ) -> Result<DropTableStmt, DbError> {
     if s.if_exists {
@@ -1046,7 +1169,9 @@ fn analyze_drop_table(
     let mut reader = CatalogReader::new(storage, snapshot)?;
     for table_ref in &s.tables {
         let schema = table_ref.schema.as_deref().unwrap_or(default_schema);
-        let exists = reader.get_table(schema, &table_ref.name)?.is_some();
+        let exists = reader
+            .get_table_in_database(default_database, schema, &table_ref.name)?
+            .is_some();
         if !exists {
             return Err(DbError::TableNotFound {
                 name: table_ref.name.clone(),
@@ -1063,17 +1188,17 @@ fn analyze_create_index(
     s: CreateIndexStmt,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &str,
     default_schema: &str,
 ) -> Result<CreateIndexStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
     let mut reader = CatalogReader::new(storage, snapshot)?;
 
-    let table_def =
-        reader
-            .get_table(schema, &s.table.name)?
-            .ok_or_else(|| DbError::TableNotFound {
-                name: s.table.name.clone(),
-            })?;
+    let table_def = reader
+        .get_table_in_database(default_database, schema, &s.table.name)?
+        .ok_or_else(|| DbError::TableNotFound {
+            name: s.table.name.clone(),
+        })?;
 
     let columns = reader.list_columns(table_def.id)?;
 
@@ -1100,6 +1225,7 @@ fn analyze_alter_table(
     s: AlterTableStmt,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
+    default_database: &str,
     default_schema: &str,
 ) -> Result<AlterTableStmt, DbError> {
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
@@ -1107,7 +1233,7 @@ fn analyze_alter_table(
 
     // Validate the target table exists.
     reader
-        .get_table(schema, &s.table.name)?
+        .get_table_in_database(default_database, schema, &s.table.name)?
         .ok_or_else(|| DbError::TableNotFound {
             name: s.table.name.clone(),
         })?;

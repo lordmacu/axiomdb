@@ -189,3 +189,30 @@
   durability before it sends the OK packet.
 - Under request/response autocommit, the next statement never reaches the server
   while the current fsync is in flight, so there is nothing to piggyback.
+
+## 2026-03-27 - `USE` is not real multi-database support unless the catalog owns it
+
+- A wire-level `USE db` implementation is not enough by itself.
+- Before `22b.3a`, the server could remember a selected database name in session
+  state, but that name did not change table ownership, `SHOW DATABASES`, or DDL.
+- The correct boundary is:
+  - databases must exist in the catalog
+  - table ownership must be persisted separately from the session
+  - analyzer resolution must use the selected database when binding names
+- Keeping database ownership outside `TableDef.schema_name` avoided a noisier
+  on-disk migration and kept room for future schema support inside each
+  database.
+
+## 2026-03-27 - Handshake validation must fail before the final OK packet
+
+- MySQL clients that connect with `CLIENT_CONNECT_WITH_DB` expect unknown
+  databases to fail the handshake itself, not to succeed auth and then fail on
+  the first command.
+- `22b.3a` exposed a subtle wire bug: validating the catalog after sending auth
+  success produced the wrong observable protocol behavior.
+- The safe rule is:
+  - authenticate credentials
+  - validate the requested default database
+  - only then send the final OK packet
+- This is a good reminder that wire-visible state transitions are part of the
+  contract, not just internal implementation detail.

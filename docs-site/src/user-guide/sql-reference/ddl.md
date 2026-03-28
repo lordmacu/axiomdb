@@ -6,6 +6,78 @@ DDL statement is automatically rolled back.
 
 ---
 
+## CREATE DATABASE
+
+Creates a new logical database in the persisted catalog.
+
+### Syntax
+
+```sql
+CREATE DATABASE database_name;
+```
+
+### Example
+
+```sql
+CREATE DATABASE analytics;
+SHOW DATABASES;
+```
+
+Expected output includes:
+
+| Database |
+|----------|
+| analytics |
+| axiomdb |
+
+`CREATE DATABASE` fails if the name already exists:
+
+```sql
+CREATE DATABASE analytics;
+-- ERROR 1007 (HY000): Can't create database 'analytics'; database exists
+```
+
+## DROP DATABASE
+
+Removes a logical database from the catalog.
+
+### Syntax
+
+```sql
+DROP DATABASE database_name;
+DROP DATABASE IF EXISTS database_name;
+```
+
+### Behavior
+
+- Removing a database also removes the tables it owns from SQL/catalog lookup.
+- `IF EXISTS` suppresses the error for a missing database.
+- The current connection cannot drop the database it has selected with `USE`.
+
+```sql
+DROP DATABASE analytics;
+```
+
+```sql
+DROP DATABASE IF EXISTS scratch;
+```
+
+```sql
+USE analytics;
+DROP DATABASE analytics;
+-- ERROR 1105 (HY000): Can't drop database 'analytics'; database is currently selected
+```
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Current Scope</span>
+<code>CREATE DATABASE</code> and <code>DROP DATABASE</code> are catalog-backed today, but
+cross-database queries such as <code>other_db.public.users</code> are still deferred to the
+next multi-database subphase.
+</div>
+</div>
+
 ## CREATE TABLE
 
 ### Basic Syntax

@@ -371,6 +371,10 @@ pub struct ShowTablesStmt {
     pub schema: Option<String>,
 }
 
+/// `SHOW DATABASES`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowDatabasesStmt;
+
 /// `SHOW COLUMNS FROM table` / `DESCRIBE table` / `DESC table`
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShowColumnsStmt {
@@ -391,6 +395,25 @@ pub struct SetStmt {
     pub value: SetValue,
 }
 
+/// `CREATE DATABASE name`
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateDatabaseStmt {
+    pub name: String,
+}
+
+/// `DROP DATABASE [IF EXISTS] name`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropDatabaseStmt {
+    pub if_exists: bool,
+    pub name: String,
+}
+
+/// `USE name`
+#[derive(Debug, Clone, PartialEq)]
+pub struct UseDatabaseStmt {
+    pub name: String,
+}
+
 // ── Stmt ──────────────────────────────────────────────────────────────────────
 
 /// A complete SQL statement as produced by the parser.
@@ -409,8 +432,10 @@ pub enum Stmt {
     Delete(DeleteStmt),
     // DDL
     CreateTable(CreateTableStmt),
+    CreateDatabase(CreateDatabaseStmt),
     CreateIndex(CreateIndexStmt),
     DropTable(DropTableStmt),
+    DropDatabase(DropDatabaseStmt),
     DropIndex(DropIndexStmt),
     TruncateTable(TruncateTableStmt),
     AlterTable(AlterTableStmt),
@@ -418,6 +443,7 @@ pub enum Stmt {
     Analyze(AnalyzeStmt),
     // Introspection
     ShowTables(ShowTablesStmt),
+    ShowDatabases(ShowDatabasesStmt),
     ShowColumns(ShowColumnsStmt),
     // Transaction control
     Begin,
@@ -425,6 +451,7 @@ pub enum Stmt {
     Rollback,
     // Session
     Set(SetStmt),
+    UseDatabase(UseDatabaseStmt),
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

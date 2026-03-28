@@ -10,10 +10,12 @@ use axiomdb_network::mysql::{
     handler::handle_connection_with_timeouts,
     lifecycle::LifecycleTimeouts,
     packets::{
-        CLIENT_INTERACTIVE, CLIENT_PLUGIN_AUTH, CLIENT_PROTOCOL_41, CLIENT_SECURE_CONNECTION,
+        CLIENT_CONNECT_WITH_DB, CLIENT_INTERACTIVE, CLIENT_PLUGIN_AUTH, CLIENT_PROTOCOL_41,
+        CLIENT_SECURE_CONNECTION,
     },
     Database,
 };
+use axiomdb_sql::{SchemaCache, SessionContext};
 
 struct TestServer {
     addr: std::net::SocketAddr,
@@ -26,6 +28,31 @@ async fn spawn_server(timeouts: LifecycleTimeouts) -> TestServer {
     let db = Arc::new(Mutex::new(
         Database::open(dir.path()).expect("open test db"),
     ));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("local addr");
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        handle_connection_with_timeouts(stream, db, 1, timeouts).await;
+    });
+    TestServer {
+        addr,
+        task,
+        _dir: dir,
+    }
+}
+
+async fn spawn_server_with_setup(timeouts: LifecycleTimeouts, setup_sql: &[&str]) -> TestServer {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open test db");
+    let mut session = SessionContext::new();
+    let mut cache = SchemaCache::new();
+    for sql in setup_sql {
+        db.execute_query(sql, &mut session, &mut cache)
+            .unwrap_or_else(|e| panic!("setup SQL failed: {sql}\nError: {e:?}"));
+    }
+    let db = Arc::new(Mutex::new(db));
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
@@ -64,6 +91,47 @@ async fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) -> std::i
     Ok(())
 }
 
+async fn authenticate_with_database(
+    stream: &mut TcpStream,
+    interactive: bool,
+    database: Option<&str>,
+) -> std::io::Result<Vec<u8>> {
+    let (_seq, greeting) = read_packet(stream).await?;
+    assert_eq!(greeting[0], 10, "server must start with HandshakeV10");
+
+    let mut payload = Vec::new();
+    let mut caps = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
+    if interactive {
+        caps |= CLIENT_INTERACTIVE;
+    }
+    if database.is_some() {
+        caps |= CLIENT_CONNECT_WITH_DB;
+    }
+    payload.extend_from_slice(&caps.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes()); // max_packet_size
+    payload.push(255u8); // utf8mb4 collation id
+    payload.extend_from_slice(&[0u8; 23]);
+    payload.extend_from_slice(b"root\0");
+    payload.push(0u8); // empty auth response
+    if let Some(db) = database {
+        payload.extend_from_slice(db.as_bytes());
+        payload.push(0u8);
+    }
+    payload.extend_from_slice(b"caching_sha2_password\0");
+    write_packet(stream, 1, &payload).await?;
+
+    let (_seq, auth_more) = read_packet(stream).await?;
+    assert_eq!(
+        auth_more.as_slice(),
+        &[0x01, 0x03],
+        "expected fast auth success"
+    );
+
+    write_packet(stream, 3, &[]).await?;
+    let (_seq, final_packet) = read_packet(stream).await?;
+    Ok(final_packet)
+}
+
 async fn authenticate(stream: &mut TcpStream, interactive: bool) -> std::io::Result<()> {
     let (_seq, greeting) = read_packet(stream).await?;
     assert_eq!(greeting[0], 10, "server must start with HandshakeV10");
@@ -99,6 +167,39 @@ async fn com_query(stream: &mut TcpStream, sql: &str) -> std::io::Result<Vec<u8>
     let mut payload = Vec::with_capacity(1 + sql.len());
     payload.push(0x03);
     payload.extend_from_slice(sql.as_bytes());
+    write_packet(stream, 0, &payload).await?;
+    let (_seq, response) = read_packet(stream).await?;
+    Ok(response)
+}
+
+async fn com_query_single_text(
+    stream: &mut TcpStream,
+    sql: &str,
+) -> std::io::Result<Option<String>> {
+    let mut payload = Vec::with_capacity(1 + sql.len());
+    payload.push(0x03);
+    payload.extend_from_slice(sql.as_bytes());
+    write_packet(stream, 0, &payload).await?;
+
+    let (_seq, col_count) = read_packet(stream).await?;
+    assert_eq!(col_count[0], 1, "expected a single-column result set");
+
+    let _ = read_packet(stream).await?; // column definition
+    let _ = read_packet(stream).await?; // EOF after columns
+    let (_seq, row) = read_packet(stream).await?;
+    let _ = read_packet(stream).await?; // EOF after rows
+
+    if row[0] == 0xfb {
+        return Ok(None);
+    }
+    let len = row[0] as usize;
+    Ok(Some(String::from_utf8_lossy(&row[1..1 + len]).into_owned()))
+}
+
+async fn com_init_db(stream: &mut TcpStream, db_name: &str) -> std::io::Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(1 + db_name.len());
+    payload.push(0x02);
+    payload.extend_from_slice(db_name.as_bytes());
     write_packet(stream, 0, &payload).await?;
     let (_seq, response) = read_packet(stream).await?;
     Ok(response)
@@ -199,6 +300,75 @@ async fn test_reset_connection_preserves_interactive_classification() {
     assert_eq!(
         ok[0], 0x00,
         "interactive connection must still answer COM_PING"
+    );
+
+    com_quit(&mut stream).await.expect("COM_QUIT");
+    server.task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn test_handshake_database_sets_current_database_visible_to_database_function() {
+    let server = spawn_server_with_setup(
+        LifecycleTimeouts {
+            auth_timeout: Duration::from_millis(200),
+        },
+        &["CREATE DATABASE analytics"],
+    )
+    .await;
+    let mut stream = TcpStream::connect(server.addr).await.expect("connect");
+
+    let ok = authenticate_with_database(&mut stream, false, Some("analytics"))
+        .await
+        .expect("auth with initial database");
+    assert_eq!(ok[0], 0x00, "auth must finish with OK");
+
+    let db = com_query_single_text(&mut stream, "SELECT DATABASE()")
+        .await
+        .expect("SELECT DATABASE()");
+    assert_eq!(db.as_deref(), Some("analytics"));
+
+    com_quit(&mut stream).await.expect("COM_QUIT");
+    server.task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn test_handshake_unknown_database_returns_1049() {
+    let server = spawn_server(LifecycleTimeouts {
+        auth_timeout: Duration::from_millis(200),
+    })
+    .await;
+    let mut stream = TcpStream::connect(server.addr).await.expect("connect");
+
+    let err = authenticate_with_database(&mut stream, false, Some("missing_db"))
+        .await
+        .expect("auth with unknown database");
+    assert_eq!(err[0], 0xff, "unknown database must return ERR");
+    assert_eq!(
+        u16::from_le_bytes([err[1], err[2]]),
+        1049,
+        "expected ER_BAD_DB_ERROR"
+    );
+
+    server.task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn test_com_init_db_unknown_database_returns_1049() {
+    let server = spawn_server(LifecycleTimeouts {
+        auth_timeout: Duration::from_millis(200),
+    })
+    .await;
+    let mut stream = TcpStream::connect(server.addr).await.expect("connect");
+    authenticate(&mut stream, false).await.expect("auth");
+
+    let err = com_init_db(&mut stream, "missing_db")
+        .await
+        .expect("COM_INIT_DB response");
+    assert_eq!(err[0], 0xff, "unknown database must return ERR");
+    assert_eq!(
+        u16::from_le_bytes([err[1], err[2]]),
+        1049,
+        "expected ER_BAD_DB_ERROR"
     );
 
     com_quit(&mut stream).await.expect("COM_QUIT");

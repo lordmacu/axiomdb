@@ -49,6 +49,8 @@ pub struct PreparedStatement {
     /// If `compiled_at_version != current_schema_version`, the plan is stale
     /// and must be re-analyzed before the next `COM_STMT_EXECUTE` (Phase 5.13).
     pub compiled_at_version: u64,
+    /// Selected database at the last successful parse+analyze.
+    pub compiled_database: String,
     /// Logical clock for LRU eviction. Updated to `ConnectionState::execute_seq`
     /// on every `COM_STMT_EXECUTE`. The statement with the lowest value is
     /// evicted when the per-connection cache reaches its limit.
@@ -660,7 +662,12 @@ impl ConnectionState {
     ///
     /// If the cache is at `max_prepared_stmts` capacity, the least-recently-used
     /// statement (lowest `last_used_seq`) is evicted before inserting the new one.
-    pub fn prepare_statement(&mut self, sql: String, schema_version: u64) -> (u32, u16) {
+    pub fn prepare_statement(
+        &mut self,
+        sql: String,
+        schema_version: u64,
+        current_database: &str,
+    ) -> (u32, u16) {
         // LRU eviction when at capacity.
         if self.prepared_statements.len() >= self.max_prepared_stmts {
             if let Some(&lru_id) = self
@@ -689,6 +696,7 @@ impl ConnectionState {
                 param_types: vec![],
                 analyzed_stmt: None, // populated by handler after parse+analyze
                 compiled_at_version: schema_version,
+                compiled_database: current_database.to_string(),
                 last_used_seq: 0,
                 pending_long_data: vec![None; param_count as usize],
                 pending_long_data_error: None,
@@ -936,7 +944,7 @@ mod tests {
     #[test]
     fn test_prepare_statement_sets_compiled_at_version() {
         let mut s = ConnectionState::new();
-        let (id, _) = s.prepare_statement("SELECT 1".into(), 42);
+        let (id, _) = s.prepare_statement("SELECT 1".into(), 42, "axiomdb");
         assert_eq!(s.prepared_statements[&id].compiled_at_version, 42);
         assert_eq!(s.prepared_statements[&id].last_used_seq, 0);
     }
@@ -953,9 +961,9 @@ mod tests {
     fn test_lru_eviction_at_limit() {
         let mut s = ConnectionState::new_with_limit(3);
 
-        let (id1, _) = s.prepare_statement("SELECT 1".into(), 0);
-        let (id2, _) = s.prepare_statement("SELECT 2".into(), 0);
-        let (id3, _) = s.prepare_statement("SELECT 3".into(), 0);
+        let (id1, _) = s.prepare_statement("SELECT 1".into(), 0, "axiomdb");
+        let (id2, _) = s.prepare_statement("SELECT 2".into(), 0, "axiomdb");
+        let (id3, _) = s.prepare_statement("SELECT 3".into(), 0, "axiomdb");
 
         // Mark id2 as recently used (higher seq)
         s.prepared_statements.get_mut(&id1).unwrap().last_used_seq = 1;
@@ -963,7 +971,7 @@ mod tests {
         s.prepared_statements.get_mut(&id3).unwrap().last_used_seq = 2;
 
         // Prepare a 4th statement — should evict id1 (seq=1, the lowest)
-        let (id4, _) = s.prepare_statement("SELECT 4".into(), 0);
+        let (id4, _) = s.prepare_statement("SELECT 4".into(), 0, "axiomdb");
 
         assert!(
             !s.prepared_statements.contains_key(&id1),
@@ -982,7 +990,7 @@ mod tests {
     fn test_lru_no_eviction_below_limit() {
         let mut s = ConnectionState::new_with_limit(5);
         for i in 0..4 {
-            s.prepare_statement(format!("SELECT {i}"), 0);
+            s.prepare_statement(format!("SELECT {i}"), 0, "axiomdb");
         }
         assert_eq!(s.prepared_statements.len(), 4, "no eviction below limit");
     }
@@ -1100,7 +1108,7 @@ mod tests {
     #[test]
     fn test_prepare_statement_new_fields_have_defaults() {
         let mut s = ConnectionState::new();
-        let (id, _) = s.prepare_statement("SELECT ?".into(), 7);
+        let (id, _) = s.prepare_statement("SELECT ?".into(), 7, "axiomdb");
         let ps = &s.prepared_statements[&id];
         assert_eq!(ps.compiled_at_version, 7);
         assert_eq!(ps.last_used_seq, 0);

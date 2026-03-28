@@ -39,7 +39,7 @@ use std::collections::HashMap as StdHashMap;
 use axiomdb_catalog::{
     schema::{
         ColumnDef as CatalogColumnDef, ColumnType, IndexColumnDef, IndexDef,
-        SortOrder as CatalogSortOrder, TableDef,
+        SortOrder as CatalogSortOrder, TableDef, DEFAULT_DATABASE_NAME,
     },
     CatalogReader, CatalogWriter, ResolvedTable, SchemaResolver,
 };
@@ -54,10 +54,11 @@ use axiomdb_wal::{Savepoint, TxnManager};
 
 use crate::{
     ast::{
-        AlterTableOp, AlterTableStmt, ColumnConstraint, CreateIndexStmt, CreateTableStmt,
-        DeleteStmt, DropIndexStmt, DropTableStmt, FromClause, InsertSource, InsertStmt, JoinClause,
-        JoinCondition, JoinType, NullsOrder, OrderByItem, SelectItem, SelectStmt, SetStmt,
-        SetValue, SortOrder, Stmt, UpdateStmt,
+        AlterTableOp, AlterTableStmt, ColumnConstraint, CreateDatabaseStmt, CreateIndexStmt,
+        CreateTableStmt, DeleteStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, FromClause,
+        InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType, NullsOrder, OrderByItem,
+        SelectItem, SelectStmt, SetStmt, SetValue, ShowDatabasesStmt, SortOrder, Stmt, UpdateStmt,
+        UseDatabaseStmt,
     },
     eval::{eval, eval_with, is_truthy, CollationGuard, SubqueryRunner},
     expr::{BinaryOp, Expr},
@@ -553,7 +554,9 @@ fn is_ddl(stmt: &Stmt) -> bool {
     matches!(
         stmt,
         Stmt::CreateTable(_)
+            | Stmt::CreateDatabase(_)
             | Stmt::DropTable(_)
+            | Stmt::DropDatabase(_)
             | Stmt::CreateIndex(_)
             | Stmt::DropIndex(_)
             | Stmt::AlterTable(_)
@@ -581,26 +584,39 @@ fn dispatch_ctx(
         Stmt::Delete(s) => execute_delete_ctx(s, storage, txn, bloom, ctx),
         Stmt::CreateTable(s) => {
             ctx.invalidate_all();
-            execute_create_table(s, storage, txn)
+            execute_create_table(s, storage, txn, ctx.effective_database())
+        }
+        Stmt::CreateDatabase(s) => {
+            ctx.invalidate_all();
+            execute_create_database(s, storage, txn)
         }
         Stmt::DropTable(s) => {
             ctx.invalidate_all();
-            execute_drop_table(s, storage, txn)
+            execute_drop_table(s, storage, txn, ctx.effective_database())
+        }
+        Stmt::DropDatabase(s) => {
+            ctx.invalidate_all();
+            execute_drop_database(s, storage, txn, ctx)
         }
         Stmt::CreateIndex(s) => {
             ctx.invalidate_all();
-            execute_create_index(s, storage, txn, bloom)
+            execute_create_index(s, storage, txn, bloom, ctx.effective_database())
         }
         Stmt::DropIndex(s) => {
             ctx.invalidate_all();
-            execute_drop_index(s, storage, txn, bloom)
+            execute_drop_index(s, storage, txn, bloom, ctx.effective_database())
         }
         Stmt::AlterTable(s) => {
             ctx.invalidate_all();
-            execute_alter_table(s, storage, txn)
+            execute_alter_table(s, storage, txn, ctx.effective_database())
         }
         Stmt::Analyze(s) => execute_analyze(s, storage, txn, ctx),
         Stmt::Set(s) => execute_set_ctx(s, ctx),
+        Stmt::UseDatabase(s) => execute_use_database(s, storage, txn, ctx),
+        Stmt::ShowDatabases(s) => execute_show_databases(s, storage, txn),
+        Stmt::ShowTables(s) => execute_show_tables(s, storage, txn, ctx.effective_database()),
+        Stmt::ShowColumns(s) => execute_show_columns(s, storage, txn, ctx.effective_database()),
+        Stmt::TruncateTable(s) => execute_truncate(s, storage, txn, ctx.effective_database()),
         other => dispatch(other, storage, txn),
     }
 }
@@ -734,15 +750,19 @@ fn dispatch(
         Stmt::Insert(s) => execute_insert(s, storage, txn),
         Stmt::Update(s) => execute_update(s, storage, txn),
         Stmt::Delete(s) => execute_delete(s, storage, txn),
-        Stmt::CreateTable(s) => execute_create_table(s, storage, txn),
-        Stmt::DropTable(s) => execute_drop_table(s, storage, txn),
+        Stmt::CreateTable(s) => execute_create_table(s, storage, txn, DEFAULT_DATABASE_NAME),
+        Stmt::CreateDatabase(s) => execute_create_database(s, storage, txn),
+        Stmt::DropTable(s) => execute_drop_table(s, storage, txn, DEFAULT_DATABASE_NAME),
+        Stmt::DropDatabase(_) => Err(DbError::NotImplemented {
+            feature: "DROP DATABASE requires session context".into(),
+        }),
         Stmt::CreateIndex(s) => {
             let mut noop_bloom = crate::bloom::BloomRegistry::new();
-            execute_create_index(s, storage, txn, &mut noop_bloom)
+            execute_create_index(s, storage, txn, &mut noop_bloom, DEFAULT_DATABASE_NAME)
         }
         Stmt::DropIndex(s) => {
             let mut noop_bloom = crate::bloom::BloomRegistry::new();
-            execute_drop_index(s, storage, txn, &mut noop_bloom)
+            execute_drop_index(s, storage, txn, &mut noop_bloom, DEFAULT_DATABASE_NAME)
         }
         Stmt::Begin => Err(DbError::TransactionAlreadyActive {
             txn_id: txn.active_txn_id().unwrap_or(0),
@@ -756,10 +776,14 @@ fn dispatch(
             Ok(QueryResult::Empty)
         }
         Stmt::Set(_) => Ok(QueryResult::Empty),
-        Stmt::TruncateTable(s) => execute_truncate(s, storage, txn),
-        Stmt::AlterTable(s) => execute_alter_table(s, storage, txn),
-        Stmt::ShowTables(s) => execute_show_tables(s, storage, txn),
-        Stmt::ShowColumns(s) => execute_show_columns(s, storage, txn),
+        Stmt::UseDatabase(_) => Err(DbError::NotImplemented {
+            feature: "USE requires session context".into(),
+        }),
+        Stmt::TruncateTable(s) => execute_truncate(s, storage, txn, DEFAULT_DATABASE_NAME),
+        Stmt::AlterTable(s) => execute_alter_table(s, storage, txn, DEFAULT_DATABASE_NAME),
+        Stmt::ShowDatabases(s) => execute_show_databases(s, storage, txn),
+        Stmt::ShowTables(s) => execute_show_tables(s, storage, txn, DEFAULT_DATABASE_NAME),
+        Stmt::ShowColumns(s) => execute_show_columns(s, storage, txn, DEFAULT_DATABASE_NAME),
         Stmt::Analyze(_) => Err(DbError::NotImplemented {
             feature: "ANALYZE requires session context — use execute_with_ctx".into(),
         }),

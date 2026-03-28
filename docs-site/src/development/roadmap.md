@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 6.18 Indexed multi-row INSERT batch path — immediate multi-row VALUES statements now reuse grouped heap/index apply on indexed tables
+**Last completed subphase:** 22b.3a Database catalog + `CREATE/DROP DATABASE` — persisted database metadata, catalog-backed `SHOW DATABASES`, validated `USE` / `COM_INIT_DB`, and legacy fallback to `axiomdb`
 
-**Active development:** 6.19 WAL fsync pipeline tuning and closure
+**Active development:** 22b.3b cross-database name resolution and queries
 
-**Next milestone:** 6.19 — make `insert_autocommit` meet target throughput without weakening durability
+**Next milestone:** 22b.3b — `database.schema.table` and cross-database SELECT / JOIN / DML
 
 ---
 
@@ -79,6 +79,7 @@ functionality. The design is organized in three blocks:
 | 6.17 | Indexed UPDATE candidate path | ✅ | UPDATE now discovers PK / indexed candidates through B-Tree access before entering the 5.20 write path |
 | 6.18 | Indexed multi-row INSERT batch path | ✅ | Immediate multi-row VALUES statements now reuse grouped heap/index apply on indexed tables while preserving strict same-statement UNIQUE semantics |
 | 6.19 | WAL fsync pipeline | 🔄 | Server commits now use an always-on leader-based fsync pipeline and the old timer-based `CommitCoordinator` path is gone, but the single-connection `insert_autocommit` benchmark still misses target throughput |
+| 6.20 | UPDATE apply fast path | ✅ | PK-range UPDATE now batches candidate heap reads, skips no-op rows, batches `UpdateInPlace` WAL writes, and groups per-index delete+insert/root persistence |
 | 5 | Executor (advanced) | ⚠️ Planned | JOIN, GROUP BY, ORDER BY, index lookup, aggregate |
 | 6.8+ | Index statistics, FK improvements | ⚠️ Planned | Fill factor, composite FKs, ON UPDATE CASCADE, ANALYZE, index-only scans |
 | 7 | Full MVCC | ⚠️ Planned | SSI, write-write conflicts, epoch reclamation |

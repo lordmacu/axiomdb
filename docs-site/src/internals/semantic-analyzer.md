@@ -8,8 +8,22 @@ an AST where every column reference has `col_idx = 0` as a placeholder. The anal
    by the FROM and JOIN clauses.
 3. Reports structured errors for unknown tables, unknown columns, and ambiguous
    unqualified column names.
+4. Applies the current database + schema defaults before unqualified table
+   resolution.
 
-The entry point is `analyze(stmt, storage, snapshot) -> Result<Stmt, DbError>`.
+The public compatibility entry point is:
+
+```rust
+analyze(stmt, storage, snapshot) -> Result<Stmt, DbError>
+```
+
+Internally, the multi-database-aware entry point is:
+
+```rust
+analyze_with_defaults(stmt, storage, snapshot, default_database, default_schema)
+```
+
+The compatibility wrapper currently uses `("axiomdb", "public")`.
 
 ---
 
@@ -52,6 +66,49 @@ Combined row layout:
   col 6  o.total
   col 7  o.status
 ```
+
+---
+
+## Database-Scoped Resolution
+
+Table lookup is now keyed by:
+
+```text
+(database, schema, table)
+```
+
+The analyzer threads `default_database` into every catalog lookup and recursive
+subquery analysis. For session-driven execution, that default comes from
+`SessionContext::effective_database()`.
+
+Legacy compatibility rule:
+
+```text
+if a table has no explicit database binding:
+    it belongs to axiomdb
+```
+
+So identical SQL text can resolve differently depending on the selected database:
+
+```sql
+USE analytics;
+SELECT * FROM users;
+
+USE axiomdb;
+SELECT * FROM users;
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Selected vs Effective DB</span>
+MySQL allows <code>DATABASE()</code> to be <code>NULL</code> before any explicit
+selection, but AxiomDB still had to keep legacy unqualified table names working.
+The analyzer therefore resolves against an <em>effective</em> database with fallback
+<code>axiomdb</code>, while the session separately tracks whether the user explicitly
+selected a database.
+</div>
+</div>
 
 ---
 
@@ -164,6 +221,14 @@ then treats this virtual table exactly like a real catalog table.
 - Target table exists in the catalog.
 - Every indexed column exists in the table.
 - No index with the same name already exists (unless `IF NOT EXISTS`).
+
+### CREATE DATABASE / DROP DATABASE / USE / SHOW DATABASES
+
+These statements are mostly pass-through at the analyzer layer:
+
+- `CREATE DATABASE` and `DROP DATABASE` carry names but no column bindings
+- `USE` is validated against the database catalog at execution/wire time
+- `SHOW DATABASES` produces a computed rowset and needs no name resolution
 
 ---
 

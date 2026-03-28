@@ -463,6 +463,7 @@ fn test_execute_packet_mysql_type_string_limit_param() {
         param_count: 1,
         param_types: vec![0xfd], // MYSQL_TYPE_STRING
         analyzed_stmt: None,
+        compiled_database: "axiomdb".into(),
         compiled_at_version: 0,
         last_used_seq: 0,
         pending_long_data: vec![None; 1],
@@ -501,7 +502,8 @@ fn test_prepare_statement_initializes_long_data_state() {
     use axiomdb_network::mysql::session::ConnectionState;
 
     let mut s = ConnectionState::new();
-    let (stmt_id, param_count) = s.prepare_statement("INSERT INTO t VALUES (?, ?, ?)".into(), 7);
+    let (stmt_id, param_count) =
+        s.prepare_statement("INSERT INTO t VALUES (?, ?, ?)".into(), 7, "axiomdb");
 
     assert_eq!(param_count, 3);
     let stmt = s.prepared_statements.get(&stmt_id).unwrap();
@@ -522,6 +524,7 @@ fn test_execute_packet_long_data_text_wins_over_null_and_inline() {
         param_count: 1,
         param_types: vec![0xfd], // MYSQL_TYPE_VAR_STRING
         analyzed_stmt: None,
+        compiled_database: "axiomdb".into(),
         compiled_at_version: 0,
         last_used_seq: 0,
         pending_long_data: vec![Some("mañana".as_bytes().to_vec())],
@@ -556,6 +559,7 @@ fn test_execute_packet_long_data_blob_decodes_as_bytes() {
         param_count: 1,
         param_types: vec![0xfc], // MYSQL_TYPE_BLOB
         analyzed_stmt: None,
+        compiled_database: "axiomdb".into(),
         compiled_at_version: 0,
         last_used_seq: 0,
         pending_long_data: vec![Some(raw.clone())],
