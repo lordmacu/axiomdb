@@ -129,7 +129,23 @@ async fn main() {
         "AxiomDB starting"
     );
 
-    let db = match axiomdb_network::mysql::Database::open(&config.data_dir) {
+    let db_config =
+        match axiomdb_network::DbConfig::load(Some(&config.data_dir.join("axiomdb.toml"))) {
+            Ok(c) => {
+                let dur = c.resolved_wal_durability();
+                if dur != axiomdb_network::WalDurabilityPolicy::Strict {
+                    info!(?dur, "WAL durability policy (non-default)");
+                }
+                c
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "failed to load axiomdb.toml");
+                std::process::exit(1);
+            }
+        };
+
+    let db = match axiomdb_network::mysql::Database::open_with_config(&config.data_dir, &db_config)
+    {
         Ok(db) => {
             info!("database opened successfully");
             Arc::new(Mutex::new(db))

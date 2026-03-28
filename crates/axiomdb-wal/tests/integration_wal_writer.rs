@@ -46,10 +46,9 @@ fn test_create_writes_correct_header() {
     WalWriter::create(&path).unwrap();
 
     let data = fs::read(&path).unwrap();
-    assert_eq!(
-        data.len(),
-        WAL_HEADER_SIZE,
-        "newly created WAL should contain only the header"
+    assert!(
+        data.len() >= WAL_HEADER_SIZE,
+        "newly created WAL must contain the header inside the reserved region"
     );
 
     let magic = u64::from_le_bytes([

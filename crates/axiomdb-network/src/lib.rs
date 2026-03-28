@@ -27,3 +27,5 @@
 //! ```
 
 pub mod mysql;
+
+pub use axiomdb_storage::{DbConfig, WalDurabilityPolicy};
