@@ -221,6 +221,9 @@ The SQL processing pipeline:
   deduplication), and `INSERT … SELECT` for bulk copy and aggregate materialization
 - Stable-RID UPDATE fast path — same-slot heap rewrite that preserves `RecordId`
   when the new encoded row fits and makes untouched-index skipping safe
+- UPDATE apply fast path — indexed UPDATE now batches candidate heap reads,
+  filters no-op rows before heap mutation, batches `UpdateInPlace` WAL append,
+  and groups per-index delete+insert/root persistence on the remaining rows
 - Transactional INSERT staging — explicit transactions can buffer consecutive
   `INSERT ... VALUES` rows in `SessionContext`, then flush them through one
   grouped heap/index pass at the next barrier statement or `COMMIT`

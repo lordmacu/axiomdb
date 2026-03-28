@@ -35,6 +35,51 @@ optimizations isolated from unrelated SELECT and DDL code.
 </div>
 </div>
 
+### UPDATE Apply Fast Path (`6.20`)
+
+`6.17` fixed indexed UPDATE discovery, but the default `update_range` benchmark
+was still paying most of its cost after rows had already been found. `6.20`
+removes that apply-side overhead in four steps:
+
+1. `IndexLookup` / `IndexRange` candidates are decoded through
+   `TableEngine::read_rows_batch(...)`, which groups `RecordId`s by `page_id`
+   and restores the original RID order after each page is read once.
+2. UPDATE evaluates the new row image before touching the heap and drops rows
+   whose `new_values == old_values`.
+3. Stable-RID rewrites accumulate `(key, old_tuple_image, new_tuple_image, page_id, slot_id)`
+   and emit their normal `UpdateInPlace` WAL records through one
+   `record_update_in_place_batch(...)` call.
+4. If any index really is affected, UPDATE now does one grouped delete pass,
+   one grouped insert pass, and one final root persistence write per index.
+
+The coarse executor bailout is statement-level:
+
+```text
+if all physically changed rows keep the same RID
+   and no SET column overlaps any index key column
+   and no SET column overlaps any partial-index predicate dependency:
+    skip index maintenance for the statement
+```
+
+This is the common PK-only `UPDATE score WHERE id BETWEEN ...` case in
+`local_bench.py`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Borrowed Modified-Attrs Rule</span>
+PostgreSQL HOT, SQLite's <code>indexColumnIsBeingUpdated()</code>, and MariaDB's clustered-vs-secondary UPDATE split all ask the same question: did any index-relevant attribute actually change? `6.20` adapts that rule directly, without adding HOT chains or change buffering.
+</div>
+</div>
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage</span>
+On the release `update_range` benchmark, `6.20` raises AxiomDB from <strong>85.2K</strong> to <strong>369.9K rows/s</strong> by removing per-row heap reads, per-row no-op rewrites, and per-row `UpdateInPlace` append overhead from the default PK-only path.
+</div>
+</div>
+
 ---
 
 ## Entry Point
