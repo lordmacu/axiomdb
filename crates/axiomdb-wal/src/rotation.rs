@@ -109,9 +109,18 @@ mod tests {
         mgr.commit().unwrap();
         mgr.rotate_wal(&mut storage, &wal_path).unwrap();
 
-        // After rotation, WAL file = 24 bytes (header only).
+        // After rotation, the logical WAL contains only the header, but the
+        // physical file may still have reserved tail capacity for the durable
+        // fast path.
         let size = std::fs::metadata(&wal_path).unwrap().len();
-        assert_eq!(size, crate::WAL_HEADER_SIZE as u64);
+        assert!(size >= crate::WAL_HEADER_SIZE as u64);
+
+        let reader = WalReader::open(&wal_path).unwrap();
+        let entries: Vec<_> = reader.scan_forward(0).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "rotated WAL must expose no entries beyond the header"
+        );
     }
 
     #[test]

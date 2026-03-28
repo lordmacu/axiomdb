@@ -12,7 +12,7 @@ pub mod meta;
 pub mod mmap;
 pub mod page;
 
-pub use config::DbConfig;
+pub use config::{DbConfig, WalDurabilityPolicy};
 pub use dirty::PageDirtyTracker;
 pub use engine::StorageEngine;
 pub use freelist::FreeList;

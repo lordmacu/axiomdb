@@ -207,6 +207,12 @@ pre-delete state because the crash occurred before the commit was durable.
 emitted when UPDATE can preserve the original `(page_id, slot_id)` because the new
 encoded row still fits in the existing heap slot.
 
+Since `6.20`, the executor may emit many `UpdateInPlace` records through one
+`record_update_in_place_batch(...)` call. The on-disk format does not change:
+the optimization is only in how normal entries are serialized and appended
+(`reserve_lsns(...) + write_batch(...)` once per statement instead of one append
+call per row).
+
 ### Binary Format
 
 ```text

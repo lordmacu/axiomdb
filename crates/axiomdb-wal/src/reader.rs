@@ -23,13 +23,14 @@ use std::path::{Path, PathBuf};
 use axiomdb_core::error::DbError;
 
 use crate::entry::WalEntry;
-use crate::writer::{WAL_HEADER_SIZE, WAL_MAGIC, WAL_VERSION};
+use crate::writer::{scan_valid_tail, WAL_HEADER_SIZE, WAL_MAGIC, WAL_VERSION};
 
 // ── WalReader ─────────────────────────────────────────────────────────────────
 
 /// WAL file reader. Stateless — opens a `File` per scan.
 pub struct WalReader {
     path: PathBuf,
+    logical_end: u64,
 }
 
 impl WalReader {
@@ -43,8 +44,11 @@ impl WalReader {
     /// - [`DbError::Io`] if the file does not exist or cannot be read
     pub fn open(path: &Path) -> Result<Self, DbError> {
         verify_header(path)?;
+        let mut file = File::open(path)?;
+        let tail = scan_valid_tail(&mut file)?;
         Ok(Self {
             path: path.to_path_buf(),
+            logical_end: tail.logical_end,
         })
     }
 
@@ -63,6 +67,8 @@ impl WalReader {
         Ok(ForwardIter {
             reader,
             from_lsn,
+            logical_end: self.logical_end,
+            cursor: WAL_HEADER_SIZE as u64,
             done: false,
         })
     }
@@ -72,11 +78,10 @@ impl WalReader {
     /// Returns entries in **decreasing** LSN order — most recent first.
     /// Useful for ROLLBACK (undoing operations from most recent to oldest).
     pub fn scan_backward(&self) -> Result<BackwardIter, DbError> {
-        let mut file = File::open(&self.path)?;
-        let file_len = file.seek(SeekFrom::End(0))?;
+        let file = File::open(&self.path)?;
         Ok(BackwardIter {
             file,
-            cursor: file_len,
+            cursor: self.logical_end,
             done: false,
         })
     }
@@ -88,6 +93,8 @@ impl WalReader {
 pub struct ForwardIter {
     reader: BufReader<File>,
     from_lsn: u64,
+    logical_end: u64,
+    cursor: u64,
     done: bool,
 }
 
@@ -98,8 +105,18 @@ impl Iterator for ForwardIter {
         if self.done {
             return None;
         }
+        if self.cursor >= self.logical_end {
+            return None;
+        }
 
         loop {
+            if self.cursor >= self.logical_end {
+                return None;
+            }
+            if self.cursor + 4 > self.logical_end {
+                self.done = true;
+                return None;
+            }
             // ── Read entry_len (4 bytes) ──────────────────────────────────────
             let mut len_buf = [0u8; 4];
             match self.reader.read_exact(&mut len_buf) {
@@ -115,6 +132,10 @@ impl Iterator for ForwardIter {
             }
 
             let entry_len = u32::from_le_bytes(len_buf) as usize;
+            if self.cursor + entry_len as u64 > self.logical_end {
+                self.done = true;
+                return Some(Err(DbError::WalEntryTruncated { lsn: 0 }));
+            }
 
             if entry_len < crate::entry::MIN_ENTRY_LEN {
                 self.done = true;
@@ -139,6 +160,7 @@ impl Iterator for ForwardIter {
             // ── Parse and verify CRC ──────────────────────────────────────────
             match WalEntry::from_bytes(&buf) {
                 Ok((entry, _consumed)) => {
+                    self.cursor += entry_len as u64;
                     if entry.lsn < self.from_lsn {
                         // Skip this entry and continue to the next
                         continue;
@@ -422,5 +444,51 @@ mod tests {
             assert_eq!(f.lsn, b.lsn);
             assert_eq!(f.key, b.key);
         }
+    }
+
+    #[test]
+    fn test_forward_ignores_reserved_zero_tail() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("reserved-tail.wal");
+        write_entries(&path, 3);
+
+        let original_len = std::fs::metadata(&path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(original_len + 4096)
+            .unwrap();
+
+        let reader = WalReader::open(&path).unwrap();
+        let lsns: Vec<u64> = reader
+            .scan_forward(0)
+            .unwrap()
+            .map(|r| r.unwrap().lsn)
+            .collect();
+        assert_eq!(lsns, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_backward_starts_at_logical_end_not_physical_eof() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("reserved-tail-backward.wal");
+        write_entries(&path, 4);
+
+        let original_len = std::fs::metadata(&path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(original_len + 8192)
+            .unwrap();
+
+        let reader = WalReader::open(&path).unwrap();
+        let lsns: Vec<u64> = reader
+            .scan_backward()
+            .unwrap()
+            .map(|r| r.unwrap().lsn)
+            .collect();
+        assert_eq!(lsns, vec![4, 3, 2, 1]);
     }
 }

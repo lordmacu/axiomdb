@@ -24,7 +24,8 @@ use std::path::Path;
 
 use axiomdb_core::{error::DbError, TransactionSnapshot, TxnId};
 use axiomdb_storage::{
-    clear_deletion, heap_chain::HeapChain, mark_slot_dead, restore_tuple_image, Page, StorageEngine,
+    clear_deletion, heap_chain::HeapChain, mark_slot_dead, restore_tuple_image, Page,
+    StorageEngine, WalDurabilityPolicy,
 };
 
 use crate::{
@@ -131,6 +132,14 @@ pub struct TxnManager {
     /// `ActiveTxn::deferred_free_pages`. Released by `release_committed_frees(...)`
     /// after WAL fsync confirms durability, in both immediate and group-commit modes.
     committed_free_batches: Vec<(TxnId, Vec<u64>)>,
+    /// WAL durability policy for committed DML.
+    ///
+    /// - `Strict` (default): full flush+sync before OK.
+    /// - `Normal`: flush to OS page cache, no durable sync per commit.
+    /// - `Off`: no per-commit barrier; benchmark/dev only.
+    ///
+    /// Set via [`set_durability_policy`]. Orthogonal to `deferred_commit_mode`.
+    durability_policy: WalDurabilityPolicy,
 }
 
 impl TxnManager {
@@ -150,6 +159,7 @@ impl TxnManager {
             deferred_commit_mode: false,
             pending_deferred_txn_id: None,
             committed_free_batches: Vec::new(),
+            durability_policy: WalDurabilityPolicy::Strict,
         })
     }
 
@@ -170,6 +180,7 @@ impl TxnManager {
             deferred_commit_mode: false,
             pending_deferred_txn_id: None,
             committed_free_batches: Vec::new(),
+            durability_policy: WalDurabilityPolicy::Strict,
         })
     }
 
@@ -234,17 +245,33 @@ impl TxnManager {
             // No heap data was modified, so OS-level durability is sufficient.
             self.wal.flush_no_sync()?;
             self.max_committed = txn_id;
-        } else if self.deferred_commit_mode {
-            // Group commit mode: Commit entry is in the BufWriter but NOT
-            // flushed or fsynced. max_committed does NOT advance here — it
-            // advances only after the CommitCoordinator confirms fsync.
-            // INVARIANT: pending_deferred_txn_id is always None here because
-            // the single-writer constraint ensures one commit at a time.
-            self.pending_deferred_txn_id = Some(txn_id);
         } else {
-            // Immediate mode: full flush + fsync to guarantee durability.
-            self.wal.commit()?;
-            self.max_committed = txn_id;
+            match self.durability_policy {
+                WalDurabilityPolicy::Strict => {
+                    if self.deferred_commit_mode {
+                        // Pipeline mode: Commit entry is in the BufWriter but NOT
+                        // flushed or fsynced. max_committed does NOT advance here —
+                        // it advances only after the pipeline leader confirms fsync.
+                        self.pending_deferred_txn_id = Some(txn_id);
+                    } else {
+                        // Immediate mode: full flush + fsync for durability.
+                        self.wal.commit_data_sync()?;
+                        self.max_committed = txn_id;
+                    }
+                }
+                WalDurabilityPolicy::Normal => {
+                    // Flush WAL bytes to OS page cache — visible to readers and
+                    // crash recovery, but NOT durable across power loss.
+                    self.wal.flush_no_sync()?;
+                    self.max_committed = txn_id;
+                }
+                WalDurabilityPolicy::Off => {
+                    // No per-commit barrier. The BufWriter holds the data in
+                    // user-space; it will reach the OS on the next flush or when
+                    // the buffer fills. Benchmark/dev only.
+                    self.max_committed = txn_id;
+                }
+            }
         }
 
         // Register deferred-free pages (if any) for post-commit reclamation.
@@ -264,6 +291,19 @@ impl TxnManager {
     /// leader-based pipeline.
     pub fn set_deferred_commit_mode(&mut self, enabled: bool) {
         self.deferred_commit_mode = enabled;
+    }
+
+    /// Sets the WAL durability policy for committed DML.
+    ///
+    /// Call this once during database open, before any transactions.
+    /// The policy is orthogonal to `deferred_commit_mode`.
+    pub fn set_durability_policy(&mut self, policy: WalDurabilityPolicy) {
+        self.durability_policy = policy;
+    }
+
+    /// Returns the current WAL durability policy.
+    pub fn durability_policy(&self) -> WalDurabilityPolicy {
+        self.durability_policy
     }
 
     /// Takes the pending deferred commit txn_id, if any.
@@ -387,15 +427,16 @@ impl TxnManager {
         Ok(())
     }
 
-    /// Flushes the WAL BufWriter to the OS and fsyncs to disk.
+    /// Flushes the WAL BufWriter to the OS and performs the steady-state
+    /// durable data sync.
     ///
     /// Called by the fsync pipeline leader while holding the Database lock,
     /// covering all Commit entries written since the last fsync.
     ///
     /// # Errors
-    /// - I/O errors from flush or fsync propagated to all batch waiters.
+    /// - I/O errors from flush or durable sync propagated to all batch waiters.
     pub fn wal_flush_and_fsync(&mut self) -> Result<(), DbError> {
-        self.wal.commit()
+        self.wal.commit_data_sync()
     }
 
     /// Rolls back the active transaction: undoes heap changes and writes a
@@ -872,6 +913,71 @@ impl TxnManager {
         Ok(())
     }
 
+    /// Records N stable-RID in-place UPDATEs in a **single `write_all` call**.
+    ///
+    /// Equivalent to calling [`record_update_in_place`] N times but uses
+    /// `reserve_lsns + write_batch` to emit all entries in one shot, reducing
+    /// BufWriter call overhead from O(N) to O(1).
+    ///
+    /// Each element of `images` is `(key, old_tuple_image, new_tuple_image, page_id, slot_id)`.
+    /// The WAL entries are byte-for-byte identical to those produced by N calls
+    /// to `record_update_in_place` — crash recovery is unchanged.
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] if called outside a transaction.
+    #[allow(clippy::type_complexity)]
+    pub fn record_update_in_place_batch(
+        &mut self,
+        table_id: u32,
+        images: &[(&[u8], &[u8], &[u8], u64, u16)], // (key, old_tuple_image, new_tuple_image, page_id, slot_id)
+    ) -> Result<(), DbError> {
+        let n = images.len();
+        if n == 0 {
+            return Ok(());
+        }
+
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = active.txn_id;
+
+        let lsn_base = self.wal.reserve_lsns(n);
+        self.wal_scratch.clear();
+
+        for (i, (key, old_tuple_image, new_tuple_image, page_id, slot_id)) in
+            images.iter().enumerate()
+        {
+            let mut ov = Vec::with_capacity(PHYSICAL_LOC_LEN + old_tuple_image.len());
+            ov.extend_from_slice(&encode_physical_loc(*page_id, *slot_id));
+            ov.extend_from_slice(old_tuple_image);
+
+            let mut nv = Vec::with_capacity(PHYSICAL_LOC_LEN + new_tuple_image.len());
+            nv.extend_from_slice(&encode_physical_loc(*page_id, *slot_id));
+            nv.extend_from_slice(new_tuple_image);
+
+            let entry = WalEntry::new(
+                lsn_base + i as u64,
+                txn_id,
+                EntryType::UpdateInPlace,
+                table_id,
+                key.to_vec(),
+                ov,
+                nv,
+            );
+            entry.serialize_into(&mut self.wal_scratch);
+        }
+
+        self.wal.write_batch(&self.wal_scratch)?;
+
+        for (_, old_tuple_image, _, page_id, slot_id) in images {
+            active.undo_ops.push(UndoOp::UndoUpdateInPlace {
+                page_id: *page_id,
+                slot_id: *slot_id,
+                old_image: old_tuple_image.to_vec(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Records a full-table delete (DELETE without WHERE / TRUNCATE) as a
     /// single WAL entry instead of N per-row entries.
     ///
@@ -1040,6 +1146,7 @@ impl TxnManager {
             deferred_commit_mode: false,
             pending_deferred_txn_id: None,
             committed_free_batches: Vec::new(),
+            durability_policy: WalDurabilityPolicy::Strict,
         };
         Ok((mgr, result))
     }
@@ -1461,6 +1568,65 @@ mod tests {
             vec![EntryType::Begin, EntryType::Insert, EntryType::Commit]
         );
         let _ = txn;
+    }
+
+    #[test]
+    fn test_record_update_in_place_batch_writes_parseable_entries() {
+        let (_dir, path) = temp_wal();
+        let mut mgr = TxnManager::create(&path).unwrap();
+
+        let txn = mgr.begin().unwrap();
+        let key1 = encode_physical_loc(42, 1);
+        let key2 = encode_physical_loc(42, 2);
+        let old1 = b"old-row-1".to_vec();
+        let new1 = b"new-row-1".to_vec();
+        let old2 = b"old-row-2".to_vec();
+        let new2 = b"new-row-2".to_vec();
+
+        let batch = vec![
+            (
+                key1.as_slice(),
+                old1.as_slice(),
+                new1.as_slice(),
+                42_u64,
+                1_u16,
+            ),
+            (
+                key2.as_slice(),
+                old2.as_slice(),
+                new2.as_slice(),
+                42_u64,
+                2_u16,
+            ),
+        ];
+        mgr.record_update_in_place_batch(7, &batch).unwrap();
+        mgr.commit().unwrap();
+
+        let reader = WalReader::open(&path).unwrap();
+        let txn_entries: Vec<_> = reader
+            .scan_forward(0)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .filter(|e| e.txn_id == txn)
+            .collect();
+
+        assert_eq!(txn_entries.len(), 4);
+        assert_eq!(txn_entries[0].entry_type, EntryType::Begin);
+        assert_eq!(txn_entries[1].entry_type, EntryType::UpdateInPlace);
+        assert_eq!(txn_entries[2].entry_type, EntryType::UpdateInPlace);
+        assert_eq!(txn_entries[3].entry_type, EntryType::Commit);
+        assert_eq!(txn_entries[1].table_id, 7);
+        assert_eq!(txn_entries[2].table_id, 7);
+        assert_eq!(
+            decode_physical_loc(&txn_entries[1].old_value),
+            Some((42, 1)),
+            "old_value must carry the physical location prefix",
+        );
+        assert_eq!(
+            decode_physical_loc(&txn_entries[2].new_value),
+            Some((42, 2)),
+            "new_value must carry the physical location prefix",
+        );
     }
 
     // ── autocommit ────────────────────────────────────────────────────────────

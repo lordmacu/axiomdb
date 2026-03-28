@@ -43,7 +43,7 @@ use axiomdb_sql::{
     session::{is_ignorable_on_error, OnErrorMode},
     verify_and_repair_indexes_on_open, SchemaCache, SessionContext,
 };
-use axiomdb_storage::MmapStorage;
+use axiomdb_storage::{DbConfig, MmapStorage, WalDurabilityPolicy};
 use axiomdb_types::{DataType, Value};
 use axiomdb_wal::{AcquireResult, FsyncPipeline, TxnManager};
 

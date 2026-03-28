@@ -299,6 +299,78 @@ index-correctness invariants.
 - the remaining `update_range` gap is no longer discovery-side; it now sits in
   the apply path after rows are found
 
+## 6.20 — UPDATE apply fast path
+
+`6.20` closes the apply-side debt left open after `6.17`.
+
+The benchmark that was still behind is narrower than it first looked:
+
+- `local_bench.py --scenario update_range` uses only `PRIMARY KEY (id)` by default
+- the workload updates `score`, not `id`
+- the statement runs inside one explicit transaction
+
+So the remaining gap was not planner discovery anymore. It was the write path
+after candidate rows had already been found.
+
+### What changed
+
+In `crates/axiomdb-sql/src/executor/delete.rs` and `crates/axiomdb-sql/src/table.rs`:
+
+- `IndexLookup` / `IndexRange` candidate materialization now uses
+  `TableEngine::read_rows_batch(...)` instead of one `read_row(...)` per RID
+- batched heap reads preserve candidate order while reading each page once
+
+In `crates/axiomdb-sql/src/executor/update.rs`:
+
+- UPDATE now partitions matched rows into:
+  - matched but no-op rows
+  - physically changed rows
+- no-op rows keep current affected-row semantics but skip heap and index work
+- both ctx and non-ctx UPDATE paths now share the same statement-level
+  "can any index be affected at all?" bailout
+
+In `crates/axiomdb-sql/src/table.rs` and `crates/axiomdb-wal/src/txn.rs`:
+
+- stable-RID rewrites now accumulate `UpdateInPlace` images per statement
+- WAL emission uses `reserve_lsns(...) + write_batch(...)` through
+  `record_update_in_place_batch(...)`
+- undo / rollback / recovery semantics stay byte-for-byte compatible with the
+  existing `UpdateInPlace` format
+
+In `crates/axiomdb-sql/src/index_maintenance.rs`:
+
+- UPDATE no longer reinserts new index keys row-by-row
+- each affected index now does:
+  - grouped delete pass
+  - grouped insert pass
+  - one final root persistence write
+
+### Validation
+
+- storage unit tests:
+  - batch row reads preserve RID order and read same-page batches once
+- WAL unit tests:
+  - batched `UpdateInPlace` entries remain parseable and recovery-compatible
+- SQL integration:
+  - no-op UPDATE keeps matched-row count while leaving data unchanged
+  - PK-range candidate path still updates only matching rows
+  - secondary-index candidate path still updates only matching rows
+  - grouped UPDATE index maintenance still removes old PK/secondary keys correctly
+- MySQL wire smoke:
+  - no-op PK-range UPDATE preserves matched-row count
+  - PK-range UPDATE changes only targeted rows
+- targeted local benchmark:
+  - `python3 benches/comparison/local_bench.py --scenario update_range --rows 50000 --range-rows 5000 --table --engines axiomdb`
+  - MariaDB `618K rows/s`
+  - MySQL `291K rows/s`
+  - AxiomDB `369.9K rows/s`
+
+### Result
+
+`6.20` moves `update_range` from an apply-path bottleneck to a remaining
+MariaDB-vs-AxiomDB gap. AxiomDB now beats the documented MySQL local result on
+the default PK-only benchmark without changing SQL-visible UPDATE semantics.
+
 ## 6.18 — Indexed multi-row INSERT batch path
 
 `6.18` closes the immediate multi-row `INSERT ... VALUES (...), (... )`
@@ -356,3 +428,43 @@ without exposing partial writes.
 
 - autocommit INSERT throughput remains a separate problem from immediate
   multi-row VALUES on indexed tables
+
+
+### 6.19 WAL Fsync Pipeline
+
+Leader-based fsync coalescing inspired by MariaDB's `group_commit_lock`.
+
+#### What was built
+
+- `FsyncPipeline` (`axiomdb-wal/src/fsync_pipeline.rs`): shared state machine
+  tracking `flushed_lsn`, `leader_active`, `pending_lsn`, and a waiter queue.
+  Three outcomes from `acquire(lsn, txn_id)`: `Expired` (already fsynced),
+  `Acquired` (become leader), `Queued(rx)` (await leader's confirmation).
+- `WalSyncMethod` + `WalDurabilityPolicy` (`axiomdb-storage/src/config.rs`):
+  configurable sync strategy and per-commit durability contract.
+- `TxnManager::deferred_commit_mode`: DML `commit()` appends to BufWriter
+  without inline fsync; `take_pending_deferred_commit()` hands the txn_id to
+  the pipeline leader.
+- `Database::take_commit_rx()` (`axiomdb-network/src/mysql/database.rs`):
+  bridges SQL execution to pipeline acquire / leader fsync / follower await.
+- Handler `await_commit_rx`: awaits the oneshot after releasing the DB lock.
+- Old `CommitCoordinator` and timer-based group commit (`3.19`) removed.
+
+#### Tests
+
+- 9 unit tests in `fsync_pipeline.rs` (Expired, Acquired, Queued, release_ok,
+  release_err, disk_full, monotonic flushed_lsn, leader release/re-acquire).
+- 6 integration tests in `tests/integration_fsync_pipeline.rs`:
+  single commit visibility, two sequential leaders, follower piggyback,
+  crash recovery, batch wakeup (3 followers), MVCC visibility invariant.
+- Wire smoke in `tools/wire-test.py` [6.19]: two-connection autocommit
+  correctness, visibility, and usability after pipeline fsync path.
+
+#### Known gap
+
+Single-connection request-response throughput on macOS APFS is ~224 ops/s —
+identical to the pre-pipeline baseline. The pipelining benefit (piggyback on
+an in-flight fsync) requires the next INSERT to arrive while the previous
+fsync is still running. In the current MySQL handler model the OK packet is
+sent only after fsync, so sequential clients cannot overlap. Multi-connection
+concurrent batching works correctly. Linux `fdatasync` would yield ~5–10K ops/s.
