@@ -5,7 +5,8 @@ Updated at each subphase close — always overwrite this file, never create new 
 
 Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batch delete),
              5.19a (executor decomposition — structural refactor, wire-invisible),
-             5.21 (transactional INSERT staging), 6.19 (WAL fsync pipeline smoke)
+             5.21 (transactional INSERT staging), 6.19 (WAL fsync pipeline smoke),
+             6.20 (UPDATE apply fast path smoke), 22b.3a (database catalog wire smoke)
 """
 import os
 import signal
@@ -121,6 +122,13 @@ def connect():
     )
 
 
+def connect_db(database):
+    return pymysql.connect(
+        host="127.0.0.1", port=PORT, user="root", password="",
+        database=database, autocommit=False,
+    )
+
+
 def connect_multi():
     return pymysql.connect(
         host="127.0.0.1", port=PORT, user="root", password="",
@@ -216,6 +224,106 @@ print("Server ready\n")
 
 conn = connect()
 cur = conn.cursor()
+
+# ── [22b.3a] Database catalog + session namespace smoke ─────────────────────
+
+print("\n[22b.3a] Database catalog + session namespace")
+cur.execute("SHOW DATABASES")
+dbs = sorted(row[0] for row in cur.fetchall())
+ok("SHOW DATABASES includes default axiomdb", dbs == ["axiomdb"], dbs)
+
+cur.execute("CREATE DATABASE analytics")
+conn.commit()
+cur.execute("SHOW DATABASES")
+dbs = sorted(row[0] for row in cur.fetchall())
+ok(
+    "SHOW DATABASES includes created database",
+    dbs == ["analytics", "axiomdb"],
+    dbs,
+)
+
+analytics_conn = connect_db("analytics")
+analytics_cur = analytics_conn.cursor()
+analytics_cur.execute("SELECT DATABASE()")
+analytics_db = analytics_cur.fetchone()[0]
+ok(
+    "Handshake database is visible through DATABASE()",
+    analytics_db == "analytics",
+    analytics_db,
+)
+analytics_cur.execute("CREATE TABLE db_scope (id INT)")
+analytics_cur.execute("INSERT INTO db_scope VALUES (10)")
+analytics_conn.commit()
+analytics_cur.execute("SHOW TABLES")
+ok(
+    "SHOW TABLES is scoped to selected database",
+    [row[0] for row in analytics_cur.fetchall()] == ["db_scope"],
+)
+
+conn.select_db("axiomdb")
+cur.execute("SELECT DATABASE()")
+ok("COM_INIT_DB switches selected database", cur.fetchone()[0] == "axiomdb")
+cur.execute("CREATE TABLE db_scope (id INT)")
+cur.execute("INSERT INTO db_scope VALUES (1)")
+conn.commit()
+cur.execute("SELECT COUNT(*) FROM db_scope")
+ok("axiomdb namespace resolves its own unqualified table", cur.fetchone()[0] == 1)
+
+conn.select_db("analytics")
+analytics_cur.execute("SELECT COUNT(*) FROM db_scope")
+ok(
+    "analytics namespace resolves its own unqualified table",
+    analytics_cur.fetchone()[0] == 1,
+)
+try:
+    analytics_cur.execute("DROP DATABASE analytics")
+    analytics_conn.commit()
+    ok("DROP DATABASE rejects active selected database", False)
+except pymysql.MySQLError as e:
+    ok(
+        "DROP DATABASE rejects active selected database",
+        e.args and e.args[0] == 1105,
+        e.args,
+    )
+
+conn.select_db("axiomdb")
+try:
+    conn.select_db("missing_db")
+    ok("COM_INIT_DB rejects unknown database", False)
+except pymysql.MySQLError as e:
+    ok(
+        "COM_INIT_DB rejects unknown database",
+        e.args and e.args[0] == 1049,
+        e.args,
+    )
+
+try:
+    bad_conn = connect_db("missing_db")
+    bad_conn.close()
+    ok("Handshake rejects unknown database", False)
+except pymysql.MySQLError as e:
+    ok(
+        "Handshake rejects unknown database",
+        e.args and e.args[0] == 1049,
+        e.args,
+    )
+
+cur.execute("DROP DATABASE analytics")
+conn.commit()
+cur.execute("SHOW DATABASES")
+dbs = sorted(row[0] for row in cur.fetchall())
+ok(
+    "DROP DATABASE removes database from catalog",
+    dbs == ["axiomdb"],
+    dbs,
+)
+try:
+    cur.execute("SELECT COUNT(*) FROM db_scope")
+    ok("axiomdb table survives analytics drop", cur.fetchone()[0] == 1)
+except pymysql.MySQLError as e:
+    ok("axiomdb table survives analytics drop", False, e.args)
+
+analytics_conn.close()
 
 cur.execute("CREATE TABLE wt_accounts (id INT UNIQUE, name TEXT, balance INT)")
 cur.execute("CREATE TABLE wt_items    (id INT UNIQUE, val TEXT)")
@@ -1346,7 +1454,7 @@ ok("SHOW VARIABLES LIKE 'sql_mode' returns row with STRICT_TRANS_TABLES",
 
 print("\n[SET strict_mode = OFF → permissive INSERT warns]")
 conn_strict = pymysql.connect(host="127.0.0.1", port=PORT, user="root", password="",
-                               database="test", charset="utf8mb4")
+                               database="axiomdb", charset="utf8mb4")
 cs = conn_strict.cursor()
 cs.execute("CREATE TABLE IF NOT EXISTS t_wire_strict (age INT)")
 cs.execute("DELETE FROM t_wire_strict")
@@ -1876,6 +1984,64 @@ ok(
 c619a.execute("DROP TABLE autocommit_pipe_users")
 conn_619a.close()
 conn_619b.close()
+
+# ── [6.20] UPDATE apply fast path — no-op + batched range apply ──────────────
+
+print("\n[6.20] UPDATE apply fast path")
+
+conn_620 = connect()
+c620 = conn_620.cursor()
+c620.execute(
+    "CREATE TABLE upd_apply_users (id INT PRIMARY KEY, active BOOL NOT NULL, score INT NOT NULL)"
+)
+c620.executemany(
+    "INSERT INTO upd_apply_users VALUES (%s, %s, %s)",
+    [
+        (1, False, 10),
+        (2, True, 20),
+        (3, True, 30),
+        (4, True, 40),
+        (5, True, 50),
+        (6, False, 60),
+    ],
+)
+conn_620.commit()
+
+c620.execute("UPDATE upd_apply_users SET score = score WHERE id >= 2 AND id < 6")
+noop_count = c620.rowcount
+conn_620.commit()
+c620.execute("SELECT id, score FROM upd_apply_users ORDER BY id ASC")
+noop_rows = c620.fetchall()
+ok(
+    "6.20 UPDATE no-op: matched-row count is preserved on PK range",
+    noop_count == 4,
+    noop_count,
+)
+ok(
+    "6.20 UPDATE no-op: unchanged rows skip physical mutation without changing results",
+    list(noop_rows) == [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)],
+    noop_rows,
+)
+
+c620.execute("UPDATE upd_apply_users SET score = score + 9 WHERE id >= 2 AND id < 6")
+range_count = c620.rowcount
+conn_620.commit()
+c620.execute("SELECT id, score FROM upd_apply_users ORDER BY id ASC")
+range_rows = c620.fetchall()
+ok(
+    "6.20 UPDATE range: PK-only apply path updates only targeted rows",
+    list(range_rows) == [(1, 10), (2, 29), (3, 39), (4, 49), (5, 59), (6, 60)],
+    range_rows,
+)
+ok(
+    "6.20 UPDATE range: affected-row count stays aligned with matched PK range",
+    range_count == 4,
+    range_count,
+)
+
+c620.execute("DROP TABLE upd_apply_users")
+conn_620.commit()
+conn_620.close()
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

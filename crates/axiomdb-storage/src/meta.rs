@@ -13,6 +13,8 @@
 //! body[48..56] catalog_indexes_root: u64 LE — axiom_indexes heap root page (0 = uninit)
 //! body[56..60] catalog_schema_ver: u32 LE   — 0 = uninitialized, 1 = v1
 //! body[60..64] _catalog_pad: u32
+//! body[104..112] catalog_databases_root: u64 LE — axiom_databases heap root
+//! body[112..120] catalog_table_databases_root: u64 LE — axiom_table_databases heap root
 //! ```
 
 use axiomdb_core::error::DbError;
@@ -117,6 +119,16 @@ pub const NEXT_FK_ID_BODY_OFFSET: usize = 92;
 /// without error and use conservative planner defaults).
 pub const CATALOG_STATS_ROOT_BODY_OFFSET: usize = 96;
 
+/// body offset of `catalog_databases_root: u64` — root heap page for
+/// `axiom_databases` (Phase 22b.3a). Value 0 = not yet allocated on legacy
+/// databases; lazily initialized by the catalog bootstrap upgrade path.
+pub const CATALOG_DATABASES_ROOT_BODY_OFFSET: usize = 104;
+
+/// body offset of `catalog_table_databases_root: u64` — root heap page for
+/// `axiom_table_databases` (Phase 22b.3a). Value 0 = not yet allocated on
+/// legacy databases; missing rows imply ownership by the default database.
+pub const CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET: usize = 112;
+
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMA_VER_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "catalog header must fit within page 0"
@@ -130,6 +142,11 @@ const _: () = assert!(
 const _: () = assert!(
     HEADER_SIZE + NEXT_FK_ID_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "FK sequence field must fit within page 0"
+);
+
+const _: () = assert!(
+    HEADER_SIZE + CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET + 8 <= crate::page::PAGE_SIZE,
+    "database catalog roots must fit within page 0"
 );
 
 /// Reads a single `u64` from the meta page at `body_offset`.

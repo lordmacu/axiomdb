@@ -36,10 +36,30 @@
 
 ## 2026-03-27
 
+- Phase 22 subphase `22b.3a` is closed in code, tests, wire smoke, and docs.
+- AxiomDB now has a persisted logical database catalog:
+  - `axiom_databases` stores database definitions
+  - `axiom_table_databases` maps tables to owning databases
+  - legacy tables with no explicit mapping resolve to the default database `axiomdb`
+- SQL surface added in this subphase:
+  - `CREATE DATABASE`
+  - `DROP DATABASE [IF EXISTS]`
+  - `USE`
+  - catalog-backed `SHOW DATABASES`
+- Session resolution is now database-aware:
+  - unqualified table names resolve inside the selected database when one is active
+  - otherwise they resolve against the effective default database `axiomdb`
+- `DROP DATABASE` now performs catalog-driven cascade deletion of owned tables and
+  rejects dropping the currently selected database for the same connection.
+- MySQL wire behavior now matches the catalog:
+  - handshake `database=...` validates before auth success is finalized
+  - `COM_INIT_DB` rejects unknown databases with `1049`
+  - `SHOW DATABASES` is no longer hardcoded
 - Phase 6 subphase `6.16` is closed in code, targeted tests, and docs.
 - Phase 6 subphase `6.17` is closed in code, targeted tests, and docs.
 - Phase 6 subphase `6.18` is closed in code, targeted tests, and docs.
-- Phase 6 subphase `6.19` is implemented but not closed.
+- Phase 6 subphase `6.19` is closed in code, tests, and docs, with a documented
+  remaining single-connection performance gap.
 - The leader-based WAL fsync pipeline is live in the server path, but the closure benchmark still fails:
   - `local_bench.py --scenario insert_autocommit --rows 1000 --table --engines axiomdb`
   - result: `224 ops/s`

@@ -29,11 +29,12 @@ pub mod table;
 pub mod text_semantics;
 
 pub use ast::{
-    AlterTableOp, AlterTableStmt, Assignment, ColumnConstraint, ColumnDef, CreateIndexStmt,
-    CreateTableStmt, DeleteStmt, DropIndexStmt, DropTableStmt, ForeignKeyAction, FromClause,
-    IndexColumn, InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType, NullsOrder,
-    OrderByItem, SelectItem, SelectStmt, SetStmt, SetValue, ShowColumnsStmt, ShowTablesStmt,
-    SortOrder, Stmt, TableConstraint, TableRef, TruncateTableStmt, UpdateStmt,
+    AlterTableOp, AlterTableStmt, Assignment, ColumnConstraint, ColumnDef, CreateDatabaseStmt,
+    CreateIndexStmt, CreateTableStmt, DeleteStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt,
+    ForeignKeyAction, FromClause, IndexColumn, InsertSource, InsertStmt, JoinClause, JoinCondition,
+    JoinType, NullsOrder, OrderByItem, SelectItem, SelectStmt, SetStmt, SetValue, ShowColumnsStmt,
+    ShowDatabasesStmt, ShowTablesStmt, SortOrder, Stmt, TableConstraint, TableRef,
+    TruncateTableStmt, UpdateStmt, UseDatabaseStmt,
 };
 pub use bloom::BloomRegistry;
 pub use eval::{
@@ -45,7 +46,7 @@ pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lexer::{tokenize, Span, SpannedToken, Token};
 pub use session::{CompatMode, SessionCollation};
 // Note: Token<'src> and SpannedToken<'src> carry a lifetime tied to the input string.
-pub use analyzer::{analyze, analyze_cached};
+pub use analyzer::{analyze, analyze_cached, analyze_cached_with_defaults, analyze_with_defaults};
 pub use index_integrity::{verify_and_repair_indexes_on_open, IndexIntegrityReport, RebuiltIndex};
 pub use parser::parse;
 pub use result::{ColumnMeta, QueryResult, Row};

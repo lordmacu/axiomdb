@@ -16,7 +16,10 @@ use axiomdb_core::RecordId;
 
 use crate::{
     bootstrap::{CatalogBootstrap, CatalogPageIds},
-    schema::{ColumnDef, ConstraintDef, FkDef, IndexDef, StatsDef, TableDef, TableId},
+    schema::{
+        ColumnDef, ConstraintDef, DatabaseDef, FkDef, IndexDef, StatsDef, TableDatabaseDef,
+        TableDef, TableId, DEFAULT_DATABASE_NAME,
+    },
 };
 
 // ── CatalogReader ─────────────────────────────────────────────────────────────
@@ -51,14 +54,28 @@ impl<'a> CatalogReader<'a> {
 
     // ── Table lookups ─────────────────────────────────────────────────────────
 
-    /// Returns the first visible table matching `(schema_name, table_name)`.
+    /// Returns the first visible table matching `(schema_name, table_name)` in
+    /// the default database namespace.
     ///
     /// Returns `None` if no such table is visible to the current snapshot.
     pub fn get_table(&mut self, schema: &str, name: &str) -> Result<Option<TableDef>, DbError> {
+        self.get_table_in_database(DEFAULT_DATABASE_NAME, schema, name)
+    }
+
+    /// Returns the first visible table matching `(database, schema, table)`.
+    pub fn get_table_in_database(
+        &mut self,
+        database: &str,
+        schema: &str,
+        name: &str,
+    ) -> Result<Option<TableDef>, DbError> {
         let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot)?;
         for (_, _, data) in rows {
             let (def, _) = TableDef::from_bytes(&data)?;
-            if def.schema_name == schema && def.table_name == name {
+            if def.schema_name == schema
+                && def.table_name == name
+                && self.table_belongs_to_database(def.id, database)?
+            {
                 return Ok(Some(def));
             }
         }
@@ -79,17 +96,123 @@ impl<'a> CatalogReader<'a> {
         Ok(None)
     }
 
-    /// Returns all visible tables in the given schema.
+    /// Returns all visible tables in the given schema in the default database.
     pub fn list_tables(&mut self, schema: &str) -> Result<Vec<TableDef>, DbError> {
+        self.list_tables_in_database(DEFAULT_DATABASE_NAME, schema)
+    }
+
+    /// Returns all visible tables in the given `(database, schema)`.
+    pub fn list_tables_in_database(
+        &mut self,
+        database: &str,
+        schema: &str,
+    ) -> Result<Vec<TableDef>, DbError> {
         let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot)?;
         let mut result = Vec::new();
         for (_, _, data) in rows {
             let (def, _) = TableDef::from_bytes(&data)?;
-            if def.schema_name == schema {
+            if def.schema_name == schema && self.table_belongs_to_database(def.id, database)? {
                 result.push(def);
             }
         }
         Ok(result)
+    }
+
+    /// Returns `true` if the logical database exists.
+    pub fn database_exists(&mut self, name: &str) -> Result<bool, DbError> {
+        Ok(self.get_database(name)?.is_some())
+    }
+
+    /// Returns the visible database definition if present.
+    pub fn get_database(&mut self, name: &str) -> Result<Option<DatabaseDef>, DbError> {
+        let root = self.page_ids.databases;
+        if root == 0 {
+            return if name == DEFAULT_DATABASE_NAME {
+                Ok(Some(DatabaseDef {
+                    name: DEFAULT_DATABASE_NAME.to_string(),
+                }))
+            } else {
+                Ok(None)
+            };
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        for (_, _, data) in rows {
+            let (def, _) = DatabaseDef::from_bytes(&data)?;
+            if def.name == name {
+                return Ok(Some(def));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns all visible database definitions.
+    pub fn list_databases(&mut self) -> Result<Vec<DatabaseDef>, DbError> {
+        let root = self.page_ids.databases;
+        if root == 0 {
+            return Ok(vec![DatabaseDef {
+                name: DEFAULT_DATABASE_NAME.to_string(),
+            }]);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        let mut out = Vec::new();
+        for (_, _, data) in rows {
+            let (def, _) = DatabaseDef::from_bytes(&data)?;
+            out.push(def);
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// Returns the explicit database binding for `table_id`, if present.
+    pub fn get_table_database_binding(
+        &mut self,
+        table_id: TableId,
+    ) -> Result<Option<TableDatabaseDef>, DbError> {
+        let root = self.page_ids.table_databases;
+        if root == 0 {
+            return Ok(None);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        for (_, _, data) in rows {
+            let (def, _) = TableDatabaseDef::from_bytes(&data)?;
+            if def.table_id == table_id {
+                return Ok(Some(def));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns the effective owning database for `table_id`, applying the
+    /// legacy fallback to [`DEFAULT_DATABASE_NAME`] when no binding exists.
+    pub fn effective_table_database(&mut self, table_id: TableId) -> Result<String, DbError> {
+        Ok(self
+            .get_table_database_binding(table_id)?
+            .map(|b| b.database_name)
+            .unwrap_or_else(|| DEFAULT_DATABASE_NAME.to_string()))
+    }
+
+    /// Returns all visible tables owned by `database` across every schema.
+    pub fn list_tables_owned_by_database(
+        &mut self,
+        database: &str,
+    ) -> Result<Vec<TableDef>, DbError> {
+        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot)?;
+        let mut result = Vec::new();
+        for (_, _, data) in rows {
+            let (def, _) = TableDef::from_bytes(&data)?;
+            if self.table_belongs_to_database(def.id, database)? {
+                result.push(def);
+            }
+        }
+        Ok(result)
+    }
+
+    fn table_belongs_to_database(
+        &mut self,
+        table_id: TableId,
+        database: &str,
+    ) -> Result<bool, DbError> {
+        Ok(self.effective_table_database(table_id)? == database)
     }
 
     // ── Column lookups ────────────────────────────────────────────────────────
@@ -298,6 +421,38 @@ impl<'a> CatalogReader<'a> {
     ) -> Result<Vec<(RecordId, Vec<u8>)>, DbError> {
         if root == 0 {
             return Ok(vec![]);
+        }
+        let rows = HeapChain::scan_visible_ro(storage, root, snapshot)?;
+        Ok(rows
+            .into_iter()
+            .map(|(page_id, slot_id, data)| (RecordId { page_id, slot_id }, data))
+            .collect())
+    }
+
+    /// Scans the raw databases heap returning (RecordId, row_bytes) pairs.
+    pub(crate) fn scan_databases_root(
+        storage: &dyn StorageEngine,
+        root: u64,
+        snapshot: TransactionSnapshot,
+    ) -> Result<Vec<(RecordId, Vec<u8>)>, DbError> {
+        if root == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = HeapChain::scan_visible_ro(storage, root, snapshot)?;
+        Ok(rows
+            .into_iter()
+            .map(|(page_id, slot_id, data)| (RecordId { page_id, slot_id }, data))
+            .collect())
+    }
+
+    /// Scans the raw table-database binding heap returning (RecordId, row_bytes) pairs.
+    pub(crate) fn scan_table_databases_root(
+        storage: &dyn StorageEngine,
+        root: u64,
+        snapshot: TransactionSnapshot,
+    ) -> Result<Vec<(RecordId, Vec<u8>)>, DbError> {
+        if root == 0 {
+            return Ok(Vec::new());
         }
         let rows = HeapChain::scan_visible_ro(storage, root, snapshot)?;
         Ok(rows

@@ -5,13 +5,14 @@ fn resolve_table_cached(
     schema: Option<&str>,
     table_name: &str,
 ) -> Result<ResolvedTable, DbError> {
+    let database = ctx.effective_database().to_string();
     let schema_str = schema.unwrap_or("public");
-    if let Some(cached) = ctx.get_table(schema_str, table_name) {
+    if let Some(cached) = ctx.get_table(&database, schema_str, table_name) {
         return Ok(cached.clone());
     }
-    let mut resolver = make_resolver(storage, txn)?;
+    let mut resolver = make_resolver_with_database(storage, txn, &database)?;
     let resolved = resolver.resolve_table(schema, table_name)?;
-    ctx.cache_table(schema_str, table_name, resolved.clone());
+    ctx.cache_table(&database, schema_str, table_name, resolved.clone());
     Ok(resolved)
 }
 
@@ -107,8 +108,16 @@ fn make_resolver<'a>(
     storage: &'a mut dyn StorageEngine,
     txn: &TxnManager,
 ) -> Result<SchemaResolver<'a>, DbError> {
+    make_resolver_with_database(storage, txn, DEFAULT_DATABASE_NAME)
+}
+
+fn make_resolver_with_database<'a>(
+    storage: &'a mut dyn StorageEngine,
+    txn: &TxnManager,
+    database: &'a str,
+) -> Result<SchemaResolver<'a>, DbError> {
     let snap: TransactionSnapshot = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
-    SchemaResolver::new(storage, snap, "public")
+    SchemaResolver::new(storage, snap, database, "public")
 }
 
 /// Converts a SQL [`DataType`] (from the AST) to the compact [`ColumnType`] stored

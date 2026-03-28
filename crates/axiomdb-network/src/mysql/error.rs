@@ -65,6 +65,9 @@ pub fn dberror_to_mysql(e: &DbError, sql: Option<&str>) -> MysqlError {
         DbError::TableNotFound { name } => {
             (1146, b"42S02", format!("Table '{name}' doesn't exist"))
         }
+        DbError::DatabaseNotFound { name } => {
+            (1049, b"42000", format!("Unknown database '{name}'"))
+        }
         DbError::ColumnNotFound { name, table } => (
             1054,
             b"42S22",
@@ -79,6 +82,11 @@ pub fn dberror_to_mysql(e: &DbError, sql: Option<&str>) -> MysqlError {
             1050,
             b"42S01",
             format!("Table '{schema}.{name}' already exists"),
+        ),
+        DbError::DatabaseAlreadyExists { name } => (
+            1007,
+            b"HY000",
+            format!("Can't create database '{name}'; database exists"),
         ),
         DbError::UniqueViolation { index_name, value } => (
             1062,
@@ -140,6 +148,11 @@ pub fn dberror_to_mysql(e: &DbError, sql: Option<&str>) -> MysqlError {
             1467,
             b"HY000",
             "Sequence overflow: no more IDs available".into(),
+        ),
+        DbError::ActiveDatabaseDrop { name } => (
+            1105,
+            b"HY000",
+            format!("Can't drop database '{name}'; database is currently selected"),
         ),
         DbError::ColumnIndexOutOfBounds { idx, len } => (
             1105,

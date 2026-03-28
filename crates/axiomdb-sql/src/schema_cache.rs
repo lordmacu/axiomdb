@@ -10,9 +10,9 @@
 //! ## Solution
 //!
 //! `SchemaCache` stores `(TableDef, Vec<ColumnDef>)` keyed by
-//! `(schema_name, table_name)`. The caller creates one cache per "session" or
-//! "batch" and passes it to `analyze_cached()`. Cache misses fall back to the
-//! normal catalog scan and populate the cache for subsequent calls.
+//! `(database_name, schema_name, table_name)`. The caller creates one cache per
+//! "session" or "batch" and passes it to `analyze_cached()`. Cache misses fall
+//! back to the normal catalog scan and populate the cache for subsequent calls.
 //!
 //! ## Invalidation
 //!
@@ -29,8 +29,8 @@ use std::collections::HashMap;
 
 use axiomdb_catalog::schema::{ColumnDef, TableDef, TableId};
 
-/// Cache key: (schema_name, table_name).
-type TableKey = (String, String);
+/// Cache key: (database_name, schema_name, table_name).
+type TableKey = (String, String, String);
 
 /// In-memory cache of catalog metadata valid for one session or batch.
 ///
@@ -38,7 +38,7 @@ type TableKey = (String, String);
 /// [`SchemaCache::invalidate`] after DDL.
 #[derive(Default)]
 pub struct SchemaCache {
-    /// `(schema, table_name)` → `TableDef`
+    /// `(database, schema, table_name)` → `TableDef`
     tables: HashMap<TableKey, TableDef>,
     /// `table_id` → ordered `Vec<ColumnDef>`
     columns: HashMap<TableId, Vec<ColumnDef>>,
@@ -51,8 +51,9 @@ impl SchemaCache {
     }
 
     /// Look up a cached table definition.
-    pub fn get_table(&self, schema: &str, name: &str) -> Option<&TableDef> {
-        self.tables.get(&(schema.to_string(), name.to_string()))
+    pub fn get_table(&self, database: &str, schema: &str, name: &str) -> Option<&TableDef> {
+        self.tables
+            .get(&(database.to_string(), schema.to_string(), name.to_string()))
     }
 
     /// Look up cached columns for a table.
@@ -63,14 +64,17 @@ impl SchemaCache {
     /// Store a table definition and its columns.
     pub fn insert(
         &mut self,
+        database: &str,
         schema: &str,
         name: &str,
         table_def: TableDef,
         columns: Vec<ColumnDef>,
     ) {
         let id = table_def.id;
-        self.tables
-            .insert((schema.to_string(), name.to_string()), table_def);
+        self.tables.insert(
+            (database.to_string(), schema.to_string(), name.to_string()),
+            table_def,
+        );
         self.columns.insert(id, columns);
     }
 

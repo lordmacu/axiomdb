@@ -1,4 +1,4 @@
-//! DDL statement parsers — CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX.
+//! DDL statement parsers — CREATE/DROP DATABASE, CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX.
 
 use axiomdb_core::error::DbError;
 use axiomdb_types::DataType;
@@ -15,6 +15,13 @@ use crate::{
 use super::{expr::parse_expr, Parser};
 
 // ── CREATE TABLE ──────────────────────────────────────────────────────────────
+
+pub(crate) fn parse_create_database(p: &mut Parser) -> Result<Stmt, DbError> {
+    let name = p.parse_identifier()?;
+    Ok(Stmt::CreateDatabase(crate::ast::CreateDatabaseStmt {
+        name,
+    }))
+}
 
 /// Parses everything after `CREATE TABLE` has been consumed.
 pub(crate) fn parse_create_table(p: &mut Parser) -> Result<Stmt, DbError> {
@@ -524,6 +531,15 @@ fn parse_index_column(p: &mut Parser) -> Result<IndexColumn, DbError> {
 }
 
 // ── DROP TABLE ────────────────────────────────────────────────────────────────
+
+pub(crate) fn parse_drop_database(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_exists = eat_if_exists(p)?;
+    let name = p.parse_identifier()?;
+    Ok(Stmt::DropDatabase(crate::ast::DropDatabaseStmt {
+        if_exists,
+        name,
+    }))
+}
 
 pub(crate) fn parse_drop_table(p: &mut Parser) -> Result<Stmt, DbError> {
     let if_exists = eat_if_exists(p)?;

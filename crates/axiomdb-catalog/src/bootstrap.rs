@@ -13,14 +13,18 @@
 //! the roots of the three system-table heaps.
 
 use axiomdb_core::error::DbError;
+use axiomdb_storage::HeapChain;
 use axiomdb_storage::{
     read_meta_u32, read_meta_u64, write_catalog_header, write_meta_u32, write_meta_u64, Page,
     PageType, StorageEngine, CATALOG_COLUMNS_ROOT_BODY_OFFSET,
-    CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET,
-    CATALOG_INDEXES_ROOT_BODY_OFFSET, CATALOG_SCHEMA_VER_BODY_OFFSET,
-    CATALOG_STATS_ROOT_BODY_OFFSET, CATALOG_TABLES_ROOT_BODY_OFFSET, NEXT_INDEX_ID_BODY_OFFSET,
-    NEXT_TABLE_ID_BODY_OFFSET,
+    CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, CATALOG_DATABASES_ROOT_BODY_OFFSET,
+    CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET, CATALOG_INDEXES_ROOT_BODY_OFFSET,
+    CATALOG_SCHEMA_VER_BODY_OFFSET, CATALOG_STATS_ROOT_BODY_OFFSET,
+    CATALOG_TABLES_ROOT_BODY_OFFSET, CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET,
+    NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
 };
+
+use crate::schema::{DatabaseDef, DEFAULT_DATABASE_NAME};
 
 // ── CatalogPageIds ────────────────────────────────────────────────────────────
 
@@ -49,6 +53,12 @@ pub struct CatalogPageIds {
     /// Zero on pre-6.10 databases; lazily initialized on first write.
     /// `list_stats` returns empty vec when zero (no stats yet).
     pub stats: u64,
+    /// Root page of the `axiom_databases` heap (Phase 22b.3a).
+    /// Zero on legacy databases before upgrade initialization.
+    pub databases: u64,
+    /// Root page of the `axiom_table_databases` heap (Phase 22b.3a).
+    /// Zero on legacy databases before upgrade initialization.
+    pub table_databases: u64,
 }
 
 // ── CatalogBootstrap ─────────────────────────────────────────────────────────
@@ -75,7 +85,7 @@ impl CatalogBootstrap {
     /// Flushes storage after writing to guarantee durability.
     pub fn init(storage: &mut dyn StorageEngine) -> Result<CatalogPageIds, DbError> {
         if Self::is_initialized(storage)? {
-            return Self::page_ids(storage);
+            return Self::ensure_database_roots(storage);
         }
 
         // Allocate one empty heap root page per system table.
@@ -119,6 +129,29 @@ impl CatalogBootstrap {
         storage.write_page(stats_root, &stats_page)?;
         write_meta_u64(storage, CATALOG_STATS_ROOT_BODY_OFFSET, stats_root)?;
 
+        // Allocate the databases root (Phase 22b.3a).
+        let databases_root = storage.alloc_page(PageType::Data)?;
+        let databases_page = Page::new(PageType::Data, databases_root);
+        storage.write_page(databases_root, &databases_page)?;
+        write_meta_u64(storage, CATALOG_DATABASES_ROOT_BODY_OFFSET, databases_root)?;
+
+        // Allocate the table-database bindings root (Phase 22b.3a).
+        let table_databases_root = storage.alloc_page(PageType::Data)?;
+        let table_databases_page = Page::new(PageType::Data, table_databases_root);
+        storage.write_page(table_databases_root, &table_databases_page)?;
+        write_meta_u64(
+            storage,
+            CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET,
+            table_databases_root,
+        )?;
+
+        // Seed the default logical database so fresh databases and upgraded
+        // ones share the same catalog shape.
+        let default_db = DatabaseDef {
+            name: DEFAULT_DATABASE_NAME.to_string(),
+        };
+        let _ = HeapChain::insert(storage, databases_root, &default_db.to_bytes(), 0)?;
+
         storage.flush()?;
 
         Ok(CatalogPageIds {
@@ -128,6 +161,8 @@ impl CatalogBootstrap {
             constraints: constraints_root,
             foreign_keys: fk_root,
             stats: stats_root,
+            databases: databases_root,
+            table_databases: table_databases_root,
         })
     }
 
@@ -150,6 +185,8 @@ impl CatalogBootstrap {
         let constraints = read_meta_u64(storage, CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET)?;
         let foreign_keys = read_meta_u64(storage, CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET)?;
         let stats = read_meta_u64(storage, CATALOG_STATS_ROOT_BODY_OFFSET)?;
+        let databases = read_meta_u64(storage, CATALOG_DATABASES_ROOT_BODY_OFFSET)?;
+        let table_databases = read_meta_u64(storage, CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET)?;
         Ok(CatalogPageIds {
             tables,
             columns,
@@ -157,7 +194,49 @@ impl CatalogBootstrap {
             constraints,
             foreign_keys,
             stats,
+            databases,
+            table_databases,
         })
+    }
+
+    /// Ensures the Phase 22b.3a database catalog roots exist.
+    ///
+    /// Used when opening a legacy database created before databases became
+    /// first-class catalog objects. Idempotent.
+    pub fn ensure_database_roots(
+        storage: &mut dyn StorageEngine,
+    ) -> Result<CatalogPageIds, DbError> {
+        let mut ids = Self::page_ids(storage)?;
+
+        if ids.databases == 0 {
+            let root = storage.alloc_page(PageType::Data)?;
+            let page = Page::new(PageType::Data, root);
+            storage.write_page(root, &page)?;
+            write_meta_u64(storage, CATALOG_DATABASES_ROOT_BODY_OFFSET, root)?;
+
+            let default_db = DatabaseDef {
+                name: DEFAULT_DATABASE_NAME.to_string(),
+            };
+            let _ = HeapChain::insert(storage, root, &default_db.to_bytes(), 0)?;
+            ids.databases = root;
+        }
+
+        if ids.table_databases == 0 {
+            let root = storage.alloc_page(PageType::Data)?;
+            let page = Page::new(PageType::Data, root);
+            storage.write_page(root, &page)?;
+            write_meta_u64(storage, CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET, root)?;
+            ids.table_databases = root;
+        }
+
+        if ids.databases == 0 || ids.table_databases == 0 {
+            return Err(DbError::Internal {
+                message: "database catalog roots not initialized".into(),
+            });
+        }
+
+        storage.flush()?;
+        Ok(ids)
     }
 
     /// Ensures the `axiom_constraints` root page exists.

@@ -44,6 +44,9 @@ pub enum DbError {
     #[error("table '{name}' not found")]
     TableNotFound { name: String },
 
+    #[error("database '{name}' not found")]
+    DatabaseNotFound { name: String },
+
     #[error("column '{name}' not found in table '{table}'")]
     ColumnNotFound { name: String, table: String },
 
@@ -219,6 +222,9 @@ pub enum DbError {
     #[error("table '{schema}.{name}' already exists")]
     TableAlreadyExists { schema: String, name: String },
 
+    #[error("database '{name}' already exists")]
+    DatabaseAlreadyExists { name: String },
+
     #[error("table with id {table_id} not found in catalog")]
     CatalogTableNotFound { table_id: u32 },
 
@@ -249,6 +255,10 @@ pub enum DbError {
     /// SQLSTATE 54000 — program_limit_exceeded
     #[error("index key length {key_len} exceeds maximum {max} bytes")]
     IndexKeyTooLong { key_len: usize, max: usize },
+
+    /// Attempted to drop the database currently selected by the same session.
+    #[error("cannot drop database '{name}' because it is currently selected by this session")]
+    ActiveDatabaseDrop { name: String },
 
     // ── General ──────────────────────────────────────────────────
     #[error("not implemented: {feature}")]

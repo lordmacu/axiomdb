@@ -203,3 +203,37 @@
 - The old `deferred_commit_mode` hook still exists inside `TxnManager`, but it
   is now just the internal handoff point from commit serialization to the
   leader-based fsync pipeline.
+
+## 2026-03-27 — Database catalog and session-scoped default database
+
+- `axiomdb-catalog` now persists logical databases explicitly instead of treating
+  `SHOW DATABASES` and `USE` as wire-only session sugar.
+- Two catalog relations own that state:
+  - `axiom_databases` stores database definitions
+  - `axiom_table_databases` stores database ownership per table id
+- The architectural compatibility rule is:
+  - tables created before `22b.3a` remain readable without migration
+  - missing ownership rows resolve to the implicit default database `axiomdb`
+- `axiomdb-sql/src/analyzer.rs` now applies database defaults in addition to
+  schema defaults:
+  - selected database from `SessionContext` wins
+  - otherwise `axiomdb` is the effective default
+- The current namespace model is intentionally two-level:
+  - database ownership decides which table set is visible
+  - `schema_name` inside `TableDef` remains available for future schema work
+- Cross-database qualification is intentionally still deferred:
+  - the parser/analyzer continue to accept only the current one-part or
+    `schema.table` forms
+  - `database.schema.table` belongs to the next subphase, not this one
+- `DROP DATABASE` is executed as catalog-driven cascade DDL:
+  - enumerate owned tables in the target database
+  - drop each table and its dependent catalog rows
+  - finally delete the database row itself
+- `axiomdb-network/src/mysql/handler.rs` now validates the requested database in
+  both places where MySQL clients can select it:
+  - handshake connect-with-db
+  - `COM_INIT_DB`
+- The wire invariant is now explicit:
+  - unknown databases must fail before the server sends the final auth OK
+  - otherwise clients can observe a spurious successful connect followed by a
+    late catalog error

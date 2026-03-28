@@ -68,9 +68,11 @@ pub enum Token<'src> {
     // DML keywords (case-insensitive)
     Select, From, Where, Insert, Into, Values, Update, Set, Delete,
     // DDL keywords
-    Create, Table, Index, Drop, Alter, Add, Column, Constraint,
+    Create, Database, Databases, Table, Index, Drop, Alter, Add, Column, Constraint,
     // Transaction keywords
     Begin, Commit, Rollback, Savepoint, Release,
+    // Session / introspection
+    Use,
     // Data types
     Bool, Boolean, TinyInt, SmallInt, Int, Integer, BigInt, HugeInt,
     Real, Float, Double, Decimal, Numeric, Char, VarChar, Text, Bytea, Blob,
@@ -195,11 +197,21 @@ left-to-right associativity and the correct precedence hierarchy.
 
 ```
 stmt → select_stmt | insert_stmt | update_stmt | delete_stmt
+     | create_database_stmt | drop_database_stmt | use_stmt
      | create_table_stmt | create_index_stmt
      | drop_table_stmt | drop_index_stmt
      | alter_table_stmt | truncate_stmt
-     | show_tables_stmt | show_columns_stmt
+     | show_tables_stmt | show_databases_stmt | show_columns_stmt
      | begin_stmt | commit_stmt | rollback_stmt | savepoint_stmt
+
+create_database_stmt →
+  CREATE DATABASE ident
+
+drop_database_stmt →
+  DROP DATABASE [IF EXISTS] ident
+
+use_stmt →
+  USE ident
 
 create_table_stmt →
   CREATE TABLE [IF NOT EXISTS] ident
@@ -230,11 +242,26 @@ truncate_stmt →
 show_tables_stmt →
   SHOW TABLES [FROM ident]
 
+show_databases_stmt →
+  SHOW DATABASES
+
 show_columns_stmt →
   SHOW COLUMNS FROM ident
   | DESCRIBE ident
   | DESC ident
 ```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — No Half Grammar</span>
+AxiomDB now parses <code>CREATE/DROP DATABASE</code>, <code>USE</code>, and
+<code>SHOW DATABASES</code>, but it still rejects <code>database.schema.table</code>.
+MySQL allows a database qualifier directly in table references; AxiomDB intentionally
+deferred that grammar until the analyzer and executor can honor it end-to-end instead
+of shipping a misleading parser-only approximation.
+</div>
+</div>
 
 ### SHOW / DESCRIBE Parsing
 
@@ -244,6 +271,9 @@ peeks at the next token to dispatch:
 ```
 parse_show():
   consume Show
+  if peek = Databases:
+    advance
+    return Stmt::ShowDatabases(ShowDatabasesStmt)
   if peek = Ident("TABLES") | Ident("tables"):   // COLUMNS is not a reserved keyword
     advance
     schema = if eat(From): parse_ident() else "public"
@@ -252,7 +282,7 @@ parse_show():
     advance; expect(From); table = parse_ident()
     return Stmt::ShowColumns(ShowColumnsStmt { table_name: table })
   else:
-    return Err(ParseError { "expected TABLES or COLUMNS after SHOW" })
+    return Err(ParseError { "expected TABLES, DATABASES, or COLUMNS after SHOW" })
 ```
 
 `DESCRIBE` and `DESC` are both tokenized as `Token::Describe` (the lexer

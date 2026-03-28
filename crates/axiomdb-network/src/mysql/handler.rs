@@ -197,7 +197,7 @@ pub async fn handle_connection_with_timeouts(
 
     // Phase 5 permissive: accept all allowed users regardless of password.
     // Real auth in Phase 13.
-    if plugin.contains("caching_sha2") {
+    let final_auth_seq = if plugin.contains("caching_sha2") {
         // caching_sha2_password fast-auth sequence (4 packets total):
         //   seq=0: Server → HandshakeV10
         //   seq=1: Client → HandshakeResponse41
@@ -237,32 +237,60 @@ pub async fn handle_connection_with_timeouts(
             // Non-empty password: send OK directly at seq=3.
             3u8
         };
-
-        let ok = build_ok_packet(0, 0, 0);
-        if send_auth_packet(&mut writer, &lifecycle, ok_seq, ok.as_slice())
-            .await
-            .is_err()
-        {
-            lifecycle.close();
-            return;
-        }
+        ok_seq
     } else {
         // mysql_native_password (or unknown plugin): send OK directly (seq=2).
         let _ = verify_native_password("", &challenge, &response.auth_response);
-        let ok = build_ok_packet(0, 0, 0);
-        if send_auth_packet(&mut writer, &lifecycle, 2u8, ok.as_slice())
-            .await
-            .is_err()
-        {
-            lifecycle.close();
-            return;
+        2u8
+    };
+
+    let initial_database = if let Some(ref db_bytes) = response.database {
+        let db_name = conn_state
+            .decode_identifier_text(db_bytes)
+            .unwrap_or_else(|_| String::from_utf8_lossy(db_bytes).into_owned());
+        let exists = {
+            let guard = db.lock().await;
+            guard.database_exists(&db_name)
+        };
+        match exists {
+            Ok(true) => Some(db_name),
+            Ok(false) => {
+                let err =
+                    build_err_packet(1049, b"42000", &format!("Unknown database '{db_name}'"));
+                let _ =
+                    send_auth_packet(&mut writer, &lifecycle, final_auth_seq, err.as_slice()).await;
+                lifecycle.close();
+                return;
+            }
+            Err(e) => {
+                let pkt = build_query_err_packet(&e, "", &conn_state);
+                let _ =
+                    send_auth_packet(&mut writer, &lifecycle, final_auth_seq, pkt.as_slice()).await;
+                lifecycle.close();
+                return;
+            }
         }
+    } else {
+        None
+    };
+
+    let ok = build_ok_packet(0, 0, 0);
+    if send_auth_packet(&mut writer, &lifecycle, final_auth_seq, ok.as_slice())
+        .await
+        .is_err()
+    {
+        lifecycle.close();
+        return;
     }
 
     info!(conn_id, %username, %plugin, "authenticated");
 
     // ── Phase 4: Command loop ─────────────────────────────────────────────────
     let mut session = SessionContext::new();
+    if let Some(db_name) = initial_database {
+        conn_state.current_database = db_name.clone();
+        session.set_current_database(db_name);
+    }
     // Per-connection schema cache — avoids repeated catalog heap scans for the
     // same table across queries. Warm on second query to the same table.
     // Automatically invalidated by analyze_cached() on DDL statements.
@@ -278,14 +306,6 @@ pub async fn handle_connection_with_timeouts(
     // RAII guard: increments `threads_connected` now, decrements on drop.
     // Placed after auth so only authenticated connections are counted.
     let _connected_guard = ConnectedGuard::new(Arc::clone(&status));
-
-    // conn_state already constructed from handshake collation id above.
-    // Populate initial current_database from handshake (if client sent one).
-    if let Some(ref db_bytes) = response.database {
-        conn_state.current_database = conn_state
-            .decode_identifier_text(db_bytes)
-            .unwrap_or_else(|_| String::from_utf8_lossy(db_bytes).into_owned());
-    }
 
     // Sync decoder limit to the session value after auth.  The session default
     // matches the codec default (67 108 864), but a future SET may change it.
@@ -376,7 +396,46 @@ pub async fn handle_connection_with_timeouts(
                     }
                 };
                 debug!(conn_id, db = %db_name, "COM_INIT_DB");
-                conn_state.current_database = db_name;
+                let exists = {
+                    let guard = db.lock().await;
+                    guard.database_exists(&db_name)
+                };
+                match exists {
+                    Ok(true) => {
+                        conn_state.current_database = db_name.clone();
+                        session.set_current_database(db_name);
+                    }
+                    Ok(false) => {
+                        let err = build_err_packet(
+                            1049,
+                            b"42000",
+                            &format!("Unknown database '{}'", db_name),
+                        );
+                        let _ = send_execute_packet(
+                            &mut writer,
+                            &lifecycle,
+                            &conn_state,
+                            1u8,
+                            err.as_slice(),
+                        )
+                        .await;
+                        lifecycle.enter(ConnectionPhase::Idle);
+                        continue;
+                    }
+                    Err(e) => {
+                        let pkt = build_query_err_packet(&e, "", &conn_state);
+                        let _ = send_execute_packet(
+                            &mut writer,
+                            &lifecycle,
+                            &conn_state,
+                            1u8,
+                            pkt.as_slice(),
+                        )
+                        .await;
+                        lifecycle.enter(ConnectionPhase::Idle);
+                        continue;
+                    }
+                }
                 let ok = build_ok_packet(0, 0, 0);
                 if send_execute_packet(&mut writer, &lifecycle, &conn_state, 1u8, ok.as_slice())
                     .await
@@ -556,6 +615,8 @@ pub async fn handle_connection_with_timeouts(
 
                     match exec_result {
                         Ok((qr, commit_rx)) => {
+                            conn_state.current_database =
+                                session.selected_database().unwrap_or("").to_string();
                             if let Err(e) = await_commit_rx(commit_rx).await {
                                 let me = dberror_to_mysql(&e, Some(stmt_sql));
                                 debug!(conn_id, code = me.code, msg = %me.message, "commit error");
@@ -718,9 +779,15 @@ pub async fn handle_connection_with_timeouts(
                         .txn
                         .active_snapshot()
                         .unwrap_or_else(|_| guard.txn.snapshot());
-                    match axiomdb_sql::parse(&sql, None)
-                        .and_then(|s| axiomdb_sql::analyze(s, &guard.storage, snap))
-                    {
+                    match axiomdb_sql::parse(&sql, None).and_then(|s| {
+                        axiomdb_sql::analyze_with_defaults(
+                            s,
+                            &guard.storage,
+                            snap,
+                            session.effective_database(),
+                            "public",
+                        )
+                    }) {
                         Ok(analyzed) => {
                             let cols = extract_result_columns(&analyzed);
                             (Some(analyzed), cols)
@@ -730,11 +797,16 @@ pub async fn handle_connection_with_timeouts(
                 };
 
                 let current_version = schema_version.load(Ordering::Acquire);
-                let (stmt_id, param_count) = conn_state.prepare_statement(sql, current_version);
+                let (stmt_id, param_count) = conn_state.prepare_statement(
+                    sql,
+                    current_version,
+                    session.effective_database(),
+                );
                 // Store the cached analyzed statement and its schema version.
                 if let Some(ps) = conn_state.prepared_statements.get_mut(&stmt_id) {
                     ps.analyzed_stmt = analyzed_stmt;
                     ps.compiled_at_version = current_version;
+                    ps.compiled_database = session.effective_database().to_string();
                 }
                 let packets = build_prepare_response(
                     stmt_id,
@@ -798,6 +870,7 @@ pub async fn handle_connection_with_timeouts(
                             // before using the cached plan. Lock is held only for analysis.
                             let current_version = schema_version.load(Ordering::Acquire);
                             if stmt.compiled_at_version != current_version
+                                || stmt.compiled_database != session.effective_database()
                                 || stmt.analyzed_stmt.is_none()
                             {
                                 debug!(
@@ -813,9 +886,17 @@ pub async fn handle_connection_with_timeouts(
                                         .txn
                                         .active_snapshot()
                                         .unwrap_or_else(|_| guard.txn.snapshot());
-                                    match axiomdb_sql::parse(&stmt.sql_template, None)
-                                        .and_then(|s| axiomdb_sql::analyze(s, &guard.storage, snap))
-                                    {
+                                    match axiomdb_sql::parse(&stmt.sql_template, None).and_then(
+                                        |s| {
+                                            axiomdb_sql::analyze_with_defaults(
+                                                s,
+                                                &guard.storage,
+                                                snap,
+                                                session.effective_database(),
+                                                "public",
+                                            )
+                                        },
+                                    ) {
                                         Ok(analyzed) => {
                                             let cols = extract_result_columns(&analyzed);
                                             (Some(analyzed), cols)
@@ -826,6 +907,7 @@ pub async fn handle_connection_with_timeouts(
                                 stmt.analyzed_stmt = new_plan;
                                 // Update version even on failure — prevents infinite re-analysis.
                                 stmt.compiled_at_version = current_version;
+                                stmt.compiled_database = session.effective_database().to_string();
                             }
 
                             // Update LRU sequence (pre-computed above the borrow).
@@ -875,6 +957,8 @@ pub async fn handle_connection_with_timeouts(
 
                 match result {
                     Ok((qr, commit_rx)) => {
+                        conn_state.current_database =
+                            session.selected_database().unwrap_or("").to_string();
                         // Await fsync confirmation outside the lock (fsync pipeline).
                         if let Err(e) = await_commit_rx(commit_rx).await {
                             let me = dberror_to_mysql(&e, None);
@@ -1227,20 +1311,6 @@ fn intercept_special_query(
 
     // SHOW WARNINGS / SHOW ERRORS are handled in database.execute_query()
     // where session.warnings is accessible. Do NOT intercept here.
-
-    // ── SHOW DATABASES ────────────────────────────────────────────────────────
-    if lower.starts_with("show databases") {
-        let cols = vec![ColumnMeta::computed("Database".to_string(), DataType::Text)];
-        let rows = vec![vec![Value::Text("axiomdb".into())]];
-        let qr = QueryResult::Rows {
-            columns: cols,
-            rows,
-        };
-        return Ok(Some(
-            serialize_query_result(qr, 1, DEFAULT_SERVER_COLLATION)
-                .expect("utf8mb4 encoding always valid for ASCII data"),
-        ));
-    }
 
     // ── SHOW VARIABLES ────────────────────────────────────────────────────────
     if lower.starts_with("show") && lower.contains("variables") {
