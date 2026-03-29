@@ -206,6 +206,8 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         | DbError::ColumnAlreadyExists { .. }
         | DbError::TableAlreadyExists { .. }
         | DbError::DatabaseAlreadyExists { .. }
+        | DbError::SchemaAlreadyExists { .. }
+        | DbError::SchemaNotFound { .. }
         | DbError::IndexAlreadyExists { .. }
         | DbError::IndexKeyTooLong { .. }
         | DbError::ActiveDatabaseDrop { .. }
@@ -487,6 +489,9 @@ pub struct SessionContext {
     /// to [`DEFAULT_DATABASE_NAME`] so legacy single-database behavior remains
     /// intact, while `DATABASE()` can still return NULL on the wire.
     pub current_database: String,
+    /// Schema search path for unqualified name resolution (PostgreSQL-style).
+    /// Default: `["public"]`. Reset to `["public"]` on every `USE db`.
+    pub search_path: Vec<String>,
 }
 
 impl Default for SessionContext {
@@ -511,6 +516,7 @@ impl SessionContext {
             pending_inserts: None,
             in_explicit_txn: false,
             current_database: String::new(),
+            search_path: vec!["public".to_string()],
         }
     }
 
@@ -649,9 +655,20 @@ impl SessionContext {
     }
 
     /// Updates the selected database for the session and invalidates cached table metadata.
+    /// Also resets the search path to `["public"]` since schema names are per-database.
     pub fn set_current_database(&mut self, database: impl Into<String>) {
         self.current_database = database.into();
+        self.search_path = vec!["public".to_string()];
         self.invalidate_all();
+    }
+
+    /// Returns the first schema in the search path (used for `current_schema()`
+    /// and as the default creation schema).
+    pub fn current_schema(&self) -> &str {
+        self.search_path
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("public")
     }
 }
 

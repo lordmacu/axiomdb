@@ -173,6 +173,72 @@ impl TableDatabaseDef {
     }
 }
 
+// ── SchemaDef ─────────────────────────────────────────────────────────────────
+
+/// Metadata for a logical schema — one row in `axiom_schemas` (Phase 22b.4).
+///
+/// Schemas are scoped to a logical database.
+///
+/// ## On-disk format
+/// `[db_len:1][db UTF-8][name_len:1][name UTF-8]`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaDef {
+    pub database_name: String,
+    pub name: String,
+}
+
+impl SchemaDef {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let db = self.database_name.as_bytes();
+        let name = self.name.as_bytes();
+        debug_assert!(db.len() <= 255, "database name too long");
+        debug_assert!(name.len() <= 255, "schema name too long");
+        let mut buf = Vec::with_capacity(2 + db.len() + name.len());
+        buf.push(db.len() as u8);
+        buf.extend_from_slice(db);
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(name);
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), DbError> {
+        let err = || DbError::ParseError {
+            message: "truncated SchemaDef bytes".into(),
+            position: None,
+        };
+        if bytes.is_empty() {
+            return Err(err());
+        }
+        let db_len = bytes[0] as usize;
+        if bytes.len() < 1 + db_len + 1 {
+            return Err(err());
+        }
+        let database_name = std::str::from_utf8(&bytes[1..1 + db_len])
+            .map_err(|_| DbError::ParseError {
+                message: "invalid UTF-8 in schema database name".into(),
+                position: None,
+            })?
+            .to_string();
+        let name_len = bytes[1 + db_len] as usize;
+        if bytes.len() < 2 + db_len + name_len {
+            return Err(err());
+        }
+        let name = std::str::from_utf8(&bytes[2 + db_len..2 + db_len + name_len])
+            .map_err(|_| DbError::ParseError {
+                message: "invalid UTF-8 in schema name".into(),
+                position: None,
+            })?
+            .to_string();
+        Ok((
+            Self {
+                database_name,
+                name,
+            },
+            2 + db_len + name_len,
+        ))
+    }
+}
+
 // ── ColumnType ────────────────────────────────────────────────────────────────
 
 /// SQL column type stored in the catalog.

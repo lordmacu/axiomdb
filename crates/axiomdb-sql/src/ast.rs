@@ -421,6 +421,13 @@ pub struct UseDatabaseStmt {
     pub name: String,
 }
 
+/// `CREATE SCHEMA [IF NOT EXISTS] name` (Phase 22b.4)
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateSchemaStmt {
+    pub name: String,
+    pub if_not_exists: bool,
+}
+
 // ── Stmt ──────────────────────────────────────────────────────────────────────
 
 /// A complete SQL statement as produced by the parser.
@@ -440,6 +447,7 @@ pub enum Stmt {
     // DDL
     CreateTable(CreateTableStmt),
     CreateDatabase(CreateDatabaseStmt),
+    CreateSchema(CreateSchemaStmt),
     CreateIndex(CreateIndexStmt),
     DropTable(DropTableStmt),
     DropDatabase(DropDatabaseStmt),

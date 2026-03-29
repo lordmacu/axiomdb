@@ -591,6 +591,10 @@ fn dispatch_ctx(
             ctx.invalidate_all();
             execute_create_database(s, storage, txn)
         }
+        Stmt::CreateSchema(s) => {
+            ctx.invalidate_all();
+            execute_create_schema(s, storage, txn, ctx.effective_database())
+        }
         Stmt::DropTable(s) => {
             ctx.invalidate_all();
             let db = s
@@ -762,6 +766,27 @@ fn execute_set_ctx(stmt: SetStmt, ctx: &mut SessionContext) -> Result<QueryResul
             };
             ctx.explicit_collation = parse_session_collation_setting(&raw)?;
         }
+        "search_path" => {
+            let raw = match set_value_to_setting_string(&stmt.value)? {
+                None => {
+                    // RESET search_path → restore default
+                    ctx.search_path = vec!["public".to_string()];
+                    return Ok(QueryResult::Empty);
+                }
+                Some(s) => s,
+            };
+            let schemas: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if schemas.is_empty() {
+                return Err(DbError::InvalidValue {
+                    reason: "search_path cannot be empty".into(),
+                });
+            }
+            ctx.search_path = schemas;
+        }
         _ => {}
     }
     Ok(QueryResult::Empty)
@@ -783,6 +808,7 @@ fn dispatch(
         Stmt::Delete(s) => execute_delete(s, storage, txn),
         Stmt::CreateTable(s) => execute_create_table(s, storage, txn, DEFAULT_DATABASE_NAME),
         Stmt::CreateDatabase(s) => execute_create_database(s, storage, txn),
+        Stmt::CreateSchema(s) => execute_create_schema(s, storage, txn, DEFAULT_DATABASE_NAME),
         Stmt::DropTable(s) => execute_drop_table(s, storage, txn, DEFAULT_DATABASE_NAME),
         Stmt::DropDatabase(_) => Err(DbError::NotImplemented {
             feature: "DROP DATABASE requires session context".into(),

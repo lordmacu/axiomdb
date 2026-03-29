@@ -19,10 +19,10 @@ pub use reader::CatalogReader;
 pub use resolver::{ResolvedTable, SchemaResolver};
 pub use schema::{
     ColumnDef, ColumnType, ConstraintDef, DatabaseDef, FkAction, FkDef, IndexColumnDef, IndexDef,
-    SortOrder, StatsDef, TableDatabaseDef, TableDef, TableId, DEFAULT_DATABASE_NAME,
+    SchemaDef, SortOrder, StatsDef, TableDatabaseDef, TableDef, TableId, DEFAULT_DATABASE_NAME,
 };
 pub use writer::{
     CatalogWriter, SYSTEM_TABLE_COLUMNS, SYSTEM_TABLE_CONSTRAINTS, SYSTEM_TABLE_DATABASES,
-    SYSTEM_TABLE_FOREIGN_KEYS, SYSTEM_TABLE_INDEXES, SYSTEM_TABLE_STATS, SYSTEM_TABLE_TABLES,
-    SYSTEM_TABLE_TABLE_DATABASES,
+    SYSTEM_TABLE_FOREIGN_KEYS, SYSTEM_TABLE_INDEXES, SYSTEM_TABLE_SCHEMAS, SYSTEM_TABLE_STATS,
+    SYSTEM_TABLE_TABLES, SYSTEM_TABLE_TABLE_DATABASES,
 };

@@ -19,12 +19,12 @@ use axiomdb_storage::{
     PageType, StorageEngine, CATALOG_COLUMNS_ROOT_BODY_OFFSET,
     CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, CATALOG_DATABASES_ROOT_BODY_OFFSET,
     CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET, CATALOG_INDEXES_ROOT_BODY_OFFSET,
-    CATALOG_SCHEMA_VER_BODY_OFFSET, CATALOG_STATS_ROOT_BODY_OFFSET,
-    CATALOG_TABLES_ROOT_BODY_OFFSET, CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET,
-    NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
+    CATALOG_SCHEMAS_ROOT_BODY_OFFSET, CATALOG_SCHEMA_VER_BODY_OFFSET,
+    CATALOG_STATS_ROOT_BODY_OFFSET, CATALOG_TABLES_ROOT_BODY_OFFSET,
+    CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET, NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
 };
 
-use crate::schema::{DatabaseDef, DEFAULT_DATABASE_NAME};
+use crate::schema::{DatabaseDef, SchemaDef, DEFAULT_DATABASE_NAME};
 
 // ── CatalogPageIds ────────────────────────────────────────────────────────────
 
@@ -59,6 +59,9 @@ pub struct CatalogPageIds {
     /// Root page of the `axiom_table_databases` heap (Phase 22b.3a).
     /// Zero on legacy databases before upgrade initialization.
     pub table_databases: u64,
+    /// Root page of the `axiom_schemas` heap (Phase 22b.4).
+    /// Zero on legacy databases; lazily initialized on first `CREATE SCHEMA`.
+    pub schemas: u64,
 }
 
 // ── CatalogBootstrap ─────────────────────────────────────────────────────────
@@ -145,12 +148,25 @@ impl CatalogBootstrap {
             table_databases_root,
         )?;
 
+        // Allocate the schemas root (Phase 22b.4).
+        let schemas_root = storage.alloc_page(PageType::Data)?;
+        let schemas_page = Page::new(PageType::Data, schemas_root);
+        storage.write_page(schemas_root, &schemas_page)?;
+        write_meta_u64(storage, CATALOG_SCHEMAS_ROOT_BODY_OFFSET, schemas_root)?;
+
         // Seed the default logical database so fresh databases and upgraded
         // ones share the same catalog shape.
         let default_db = DatabaseDef {
             name: DEFAULT_DATABASE_NAME.to_string(),
         };
         let _ = HeapChain::insert(storage, databases_root, &default_db.to_bytes(), 0)?;
+
+        // Seed the default `public` schema for the default database.
+        let public_schema = SchemaDef {
+            database_name: DEFAULT_DATABASE_NAME.to_string(),
+            name: "public".to_string(),
+        };
+        let _ = HeapChain::insert(storage, schemas_root, &public_schema.to_bytes(), 0)?;
 
         storage.flush()?;
 
@@ -163,6 +179,7 @@ impl CatalogBootstrap {
             stats: stats_root,
             databases: databases_root,
             table_databases: table_databases_root,
+            schemas: schemas_root,
         })
     }
 
@@ -187,6 +204,7 @@ impl CatalogBootstrap {
         let stats = read_meta_u64(storage, CATALOG_STATS_ROOT_BODY_OFFSET)?;
         let databases = read_meta_u64(storage, CATALOG_DATABASES_ROOT_BODY_OFFSET)?;
         let table_databases = read_meta_u64(storage, CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET)?;
+        let schemas = read_meta_u64(storage, CATALOG_SCHEMAS_ROOT_BODY_OFFSET)?;
         Ok(CatalogPageIds {
             tables,
             columns,
@@ -196,6 +214,7 @@ impl CatalogBootstrap {
             stats,
             databases,
             table_databases,
+            schemas,
         })
     }
 
@@ -227,6 +246,21 @@ impl CatalogBootstrap {
             storage.write_page(root, &page)?;
             write_meta_u64(storage, CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET, root)?;
             ids.table_databases = root;
+        }
+
+        if ids.schemas == 0 {
+            let root = storage.alloc_page(PageType::Data)?;
+            let page = Page::new(PageType::Data, root);
+            storage.write_page(root, &page)?;
+            write_meta_u64(storage, CATALOG_SCHEMAS_ROOT_BODY_OFFSET, root)?;
+
+            // Seed the `public` schema for the default database.
+            let public_schema = SchemaDef {
+                database_name: DEFAULT_DATABASE_NAME.to_string(),
+                name: "public".to_string(),
+            };
+            let _ = HeapChain::insert(storage, root, &public_schema.to_bytes(), 0)?;
+            ids.schemas = root;
         }
 
         if ids.databases == 0 || ids.table_databases == 0 {

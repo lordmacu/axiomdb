@@ -357,6 +357,10 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_create_database(self)
             }
+            Token::Schema => {
+                self.advance();
+                ddl::parse_create_schema(self)
+            }
             Token::Table => {
                 self.advance();
                 ddl::parse_create_table(self)
