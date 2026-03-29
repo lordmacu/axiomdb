@@ -262,7 +262,7 @@ impl Database {
             &self.storage,
             snap,
             session.effective_database(),
-            "public",
+            session.current_schema(),
             schema_cache,
         ) {
             Ok(a) => a,

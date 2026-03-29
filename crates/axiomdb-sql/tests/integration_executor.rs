@@ -3330,7 +3330,13 @@ fn run_ctx(
 ) -> Result<QueryResult, DbError> {
     let stmt = parse(sql, None)?;
     let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
-    let analyzed = analyze_with_defaults(stmt, storage, snap, ctx.effective_database(), "public")?;
+    let analyzed = analyze_with_defaults(
+        stmt,
+        storage,
+        snap,
+        ctx.effective_database(),
+        ctx.current_schema(),
+    )?;
     execute_with_ctx(analyzed, storage, txn, bloom, ctx)
 }
 

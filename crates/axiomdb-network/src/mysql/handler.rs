@@ -785,7 +785,7 @@ pub async fn handle_connection_with_timeouts(
                             &guard.storage,
                             snap,
                             session.effective_database(),
-                            "public",
+                            session.current_schema(),
                         )
                     }) {
                         Ok(analyzed) => {
@@ -893,7 +893,7 @@ pub async fn handle_connection_with_timeouts(
                                                 &guard.storage,
                                                 snap,
                                                 session.effective_database(),
-                                                "public",
+                                                session.current_schema(),
                                             )
                                         },
                                     ) {
