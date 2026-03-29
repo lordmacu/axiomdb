@@ -582,9 +582,13 @@ fn dispatch_ctx(
         Stmt::Insert(s) => execute_insert_ctx(s, storage, txn, bloom, ctx),
         Stmt::Update(s) => execute_update_ctx(s, storage, txn, bloom, ctx),
         Stmt::Delete(s) => execute_delete_ctx(s, storage, txn, bloom, ctx),
-        Stmt::CreateTable(s) => {
+        Stmt::CreateTable(mut s) => {
             ctx.invalidate_all();
             let db = ddl_database(&s.table.database, ctx);
+            // Unqualified CREATE TABLE uses the first schema in search_path.
+            if s.table.schema.is_none() {
+                s.table.schema = Some(ctx.current_schema().to_string());
+            }
             execute_create_table(s, storage, txn, &db)
         }
         Stmt::CreateDatabase(s) => {

@@ -5,14 +5,8 @@ fn resolve_table_cached(
     tref: &crate::ast::TableRef,
 ) -> Result<ResolvedTable, DbError> {
     let database = effective_database_for_ref(tref, ctx);
-    let schema_str = tref.schema.as_deref().unwrap_or("public");
-    let table_name = &tref.name;
-    if let Some(cached) = ctx.get_table(&database, schema_str, table_name) {
-        return Ok(cached.clone());
-    }
-    // If the user explicitly specified a database, verify it exists before
-    // attempting table resolution — otherwise we'd return TableNotFound for a
-    // database that doesn't exist at all.
+
+    // If the user explicitly specified a database, verify it exists first.
     if tref.database.is_some() {
         let snap = txn.active_snapshot()?;
         let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
@@ -22,10 +16,34 @@ fn resolve_table_cached(
             });
         }
     }
-    let mut resolver = make_resolver_with_database(storage, txn, &database)?;
-    let resolved = resolver.resolve_table(tref.schema.as_deref(), table_name)?;
-    ctx.cache_table(&database, schema_str, table_name, resolved.clone());
-    Ok(resolved)
+
+    // If the user specified an explicit schema, resolve directly.
+    if let Some(schema) = tref.schema.as_deref() {
+        if let Some(cached) = ctx.get_table(&database, schema, &tref.name) {
+            return Ok(cached.clone());
+        }
+        let mut resolver = make_resolver_with_database(storage, txn, &database)?;
+        let resolved = resolver.resolve_table(Some(schema), &tref.name)?;
+        ctx.cache_table(&database, schema, &tref.name, resolved.clone());
+        return Ok(resolved);
+    }
+
+    // Unqualified name: scan search_path in order until a match is found.
+    let search_path: Vec<String> = ctx.search_path.clone();
+    for schema in &search_path {
+        if let Some(cached) = ctx.get_table(&database, schema, &tref.name) {
+            return Ok(cached.clone());
+        }
+        let mut resolver = make_resolver_with_database(storage, txn, &database)?;
+        if let Ok(resolved) = resolver.resolve_table(Some(schema), &tref.name) {
+            ctx.cache_table(&database, schema, &tref.name, resolved.clone());
+            return Ok(resolved);
+        }
+    }
+    // None of the search_path schemas had the table.
+    Err(DbError::TableNotFound {
+        name: tref.name.clone(),
+    })
 }
 
 /// Compute the effective database for a `TableRef`: if the ref has an explicit
