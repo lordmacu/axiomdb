@@ -3,54 +3,14 @@
 //! Covers: CREATE/DROP DATABASE, USE, SHOW DATABASES, cross-database 3-part
 //! names, CREATE SCHEMA, SET search_path, and search-path-aware resolution.
 
-use axiomdb_catalog::{CatalogBootstrap, CatalogReader};
+mod common;
+
+use axiomdb_catalog::CatalogReader;
 use axiomdb_core::error::DbError;
-use axiomdb_sql::{
-    analyze_with_defaults, bloom::BloomRegistry, execute_with_ctx, parse, QueryResult,
-    SessionContext,
-};
-use axiomdb_storage::MemoryStorage;
+use axiomdb_sql::QueryResult;
 use axiomdb_types::Value;
-use axiomdb_wal::TxnManager;
 
-// ── Test helpers ──────────────────────────────────────────────────────────────
-
-fn run_ctx(
-    sql: &str,
-    storage: &mut MemoryStorage,
-    txn: &mut TxnManager,
-    bloom: &mut BloomRegistry,
-    ctx: &mut SessionContext,
-) -> Result<QueryResult, DbError> {
-    let stmt = parse(sql, None)?;
-    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
-    let analyzed = analyze_with_defaults(
-        stmt,
-        storage,
-        snap,
-        ctx.effective_database(),
-        ctx.current_schema(),
-    )?;
-    execute_with_ctx(analyzed, storage, txn, bloom, ctx)
-}
-
-fn setup_ctx() -> (MemoryStorage, TxnManager, BloomRegistry, SessionContext) {
-    let dir = tempfile::tempdir().unwrap();
-    let wal_path = dir.keep().join("test.wal");
-    let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
-    let txn = TxnManager::create(&wal_path).unwrap();
-    let bloom = BloomRegistry::new();
-    let ctx = SessionContext::new();
-    (storage, txn, bloom, ctx)
-}
-
-fn affected_count(result: QueryResult) -> u64 {
-    match result {
-        QueryResult::Affected { count, .. } => count,
-        other => panic!("expected Affected, got {other:?}"),
-    }
-}
+use common::*;
 
 // ── Phase 22b.3a: database catalog ───────────────────────────────────────────
 

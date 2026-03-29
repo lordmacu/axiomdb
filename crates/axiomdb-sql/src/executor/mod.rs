@@ -420,7 +420,8 @@ pub fn execute_with_ctx(
     } else if ctx.autocommit {
         match stmt {
             Stmt::Begin => {
-                txn.begin()?;
+                let level = ctx.effective_isolation();
+                txn.begin_with_isolation(level)?;
                 ctx.in_explicit_txn = true;
                 Ok(QueryResult::Empty)
             }
@@ -796,6 +797,27 @@ fn execute_set_ctx(stmt: SetStmt, ctx: &mut SessionContext) -> Result<QueryResul
                 });
             }
             ctx.search_path = schemas;
+        }
+        "transaction_isolation" | "tx_isolation" => {
+            let raw = match set_value_to_setting_string(&stmt.value)? {
+                None => {
+                    ctx.transaction_isolation = axiomdb_core::IsolationLevel::default();
+                    return Ok(QueryResult::Empty);
+                }
+                Some(s) => s,
+            };
+            let level =
+                axiomdb_core::IsolationLevel::parse(&raw).ok_or_else(|| DbError::InvalidValue {
+                    reason: format!("unknown isolation level: '{raw}'"),
+                })?;
+            // Cannot change isolation level inside an active transaction.
+            if ctx.in_explicit_txn {
+                return Err(DbError::InvalidValue {
+                    reason: "cannot change transaction_isolation inside an active transaction"
+                        .into(),
+                });
+            }
+            ctx.transaction_isolation = level;
         }
         _ => {}
     }

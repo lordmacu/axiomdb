@@ -50,6 +50,65 @@ impl TransactionSnapshot {
     }
 }
 
+// ── Isolation Level ──────────────────────────────────────────────────────────
+
+/// Transaction isolation level (Phase 7.1).
+///
+/// Controls the snapshot lifetime policy:
+/// - `ReadCommitted`: fresh snapshot per statement (sees latest committed data).
+/// - `RepeatableRead`: frozen snapshot at `BEGIN` (sees only what was committed
+///   before the transaction started).
+/// - `Serializable`: accepted and stored, but uses the same snapshot policy as
+///   `RepeatableRead` because single-writer already prevents write skew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+impl IsolationLevel {
+    /// Returns the MySQL-compatible wire string for `@@transaction_isolation`.
+    pub fn as_mysql_str(&self) -> &'static str {
+        match self {
+            Self::ReadCommitted => "READ-COMMITTED",
+            Self::RepeatableRead => "REPEATABLE-READ",
+            Self::Serializable => "SERIALIZABLE",
+        }
+    }
+
+    /// Parses a MySQL-compatible isolation level string.
+    ///
+    /// `READ UNCOMMITTED` is silently upgraded to `READ COMMITTED` (MySQL behavior).
+    pub fn parse(s: &str) -> Option<Self> {
+        let normalized = s.trim().replace(['-', '_'], " ").to_ascii_uppercase();
+        match normalized.as_str() {
+            "READ UNCOMMITTED" | "READ COMMITTED" => Some(Self::ReadCommitted),
+            "REPEATABLE READ" => Some(Self::RepeatableRead),
+            "SERIALIZABLE" => Some(Self::Serializable),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if this level uses a frozen snapshot (taken at BEGIN).
+    pub fn uses_frozen_snapshot(&self) -> bool {
+        matches!(self, Self::RepeatableRead | Self::Serializable)
+    }
+}
+
+impl Default for IsolationLevel {
+    /// MySQL default is REPEATABLE READ.
+    fn default() -> Self {
+        Self::RepeatableRead
+    }
+}
+
+impl std::fmt::Display for IsolationLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_mysql_str())
+    }
+}
+
 /// Index trait — implementations: BTreeIndex, HashIndex, HnswIndex, FtsIndex.
 /// Note: StorageEngine lives in axiomdb-storage (uses Page/PageType, avoids dep cycle).
 pub trait Index: Send + Sync {

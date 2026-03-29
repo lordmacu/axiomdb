@@ -492,6 +492,12 @@ pub struct SessionContext {
     /// Schema search path for unqualified name resolution (PostgreSQL-style).
     /// Default: `["public"]`. Reset to `["public"]` on every `USE db`.
     pub search_path: Vec<String>,
+    /// Session default isolation level for new explicit transactions.
+    /// Default: `RepeatableRead` (MySQL default).
+    pub transaction_isolation: axiomdb_core::IsolationLevel,
+    /// Per-transaction isolation level override set by
+    /// `SET TRANSACTION ISOLATION LEVEL`. Consumed by the next `BEGIN`.
+    pub next_txn_isolation: Option<axiomdb_core::IsolationLevel>,
 }
 
 impl Default for SessionContext {
@@ -517,6 +523,8 @@ impl SessionContext {
             in_explicit_txn: false,
             current_database: String::new(),
             search_path: vec!["public".to_string()],
+            transaction_isolation: axiomdb_core::IsolationLevel::default(),
+            next_txn_isolation: None,
         }
     }
 
@@ -669,6 +677,14 @@ impl SessionContext {
             .first()
             .map(|s| s.as_str())
             .unwrap_or("public")
+    }
+
+    /// Returns the isolation level for the next `BEGIN`, consuming any per-txn
+    /// override set by `SET TRANSACTION ISOLATION LEVEL`.
+    pub fn effective_isolation(&mut self) -> axiomdb_core::IsolationLevel {
+        self.next_txn_isolation
+            .take()
+            .unwrap_or(self.transaction_isolation)
     }
 }
 
