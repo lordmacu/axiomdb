@@ -2,18 +2,39 @@ fn resolve_table_cached(
     storage: &mut dyn StorageEngine,
     txn: &TxnManager,
     ctx: &mut SessionContext,
-    schema: Option<&str>,
-    table_name: &str,
+    tref: &crate::ast::TableRef,
 ) -> Result<ResolvedTable, DbError> {
-    let database = ctx.effective_database().to_string();
-    let schema_str = schema.unwrap_or("public");
+    let database = effective_database_for_ref(tref, ctx);
+    let schema_str = tref.schema.as_deref().unwrap_or("public");
+    let table_name = &tref.name;
     if let Some(cached) = ctx.get_table(&database, schema_str, table_name) {
         return Ok(cached.clone());
     }
+    // If the user explicitly specified a database, verify it exists before
+    // attempting table resolution — otherwise we'd return TableNotFound for a
+    // database that doesn't exist at all.
+    if tref.database.is_some() {
+        let snap = txn.active_snapshot()?;
+        let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
+        if !reader.database_exists(&database)? {
+            return Err(DbError::DatabaseNotFound {
+                name: database,
+            });
+        }
+    }
     let mut resolver = make_resolver_with_database(storage, txn, &database)?;
-    let resolved = resolver.resolve_table(schema, table_name)?;
+    let resolved = resolver.resolve_table(tref.schema.as_deref(), table_name)?;
     ctx.cache_table(&database, schema_str, table_name, resolved.clone());
     Ok(resolved)
+}
+
+/// Compute the effective database for a `TableRef`: if the ref has an explicit
+/// `database` component, use it; otherwise fall back to the session default.
+fn effective_database_for_ref(tref: &crate::ast::TableRef, ctx: &SessionContext) -> String {
+    tref.database
+        .as_deref()
+        .unwrap_or(ctx.effective_database())
+        .to_string()
 }
 
 // ── ctx-aware DML handlers ────────────────────────────────────────────────────

@@ -584,7 +584,8 @@ fn dispatch_ctx(
         Stmt::Delete(s) => execute_delete_ctx(s, storage, txn, bloom, ctx),
         Stmt::CreateTable(s) => {
             ctx.invalidate_all();
-            execute_create_table(s, storage, txn, ctx.effective_database())
+            let db = ddl_database(&s.table.database, ctx);
+            execute_create_table(s, storage, txn, &db)
         }
         Stmt::CreateDatabase(s) => {
             ctx.invalidate_all();
@@ -592,7 +593,13 @@ fn dispatch_ctx(
         }
         Stmt::DropTable(s) => {
             ctx.invalidate_all();
-            execute_drop_table(s, storage, txn, ctx.effective_database())
+            let db = s
+                .tables
+                .first()
+                .and_then(|t| t.database.as_deref())
+                .unwrap_or(ctx.effective_database())
+                .to_string();
+            execute_drop_table(s, storage, txn, &db)
         }
         Stmt::DropDatabase(s) => {
             ctx.invalidate_all();
@@ -600,25 +607,49 @@ fn dispatch_ctx(
         }
         Stmt::CreateIndex(s) => {
             ctx.invalidate_all();
-            execute_create_index(s, storage, txn, bloom, ctx.effective_database())
+            let db = ddl_database(&s.table.database, ctx);
+            execute_create_index(s, storage, txn, bloom, &db)
         }
         Stmt::DropIndex(s) => {
             ctx.invalidate_all();
-            execute_drop_index(s, storage, txn, bloom, ctx.effective_database())
+            let db = s
+                .table
+                .as_ref()
+                .and_then(|t| t.database.as_deref())
+                .unwrap_or(ctx.effective_database())
+                .to_string();
+            execute_drop_index(s, storage, txn, bloom, &db)
         }
         Stmt::AlterTable(s) => {
             ctx.invalidate_all();
-            execute_alter_table(s, storage, txn, ctx.effective_database())
+            let db = ddl_database(&s.table.database, ctx);
+            execute_alter_table(s, storage, txn, &db)
         }
         Stmt::Analyze(s) => execute_analyze(s, storage, txn, ctx),
         Stmt::Set(s) => execute_set_ctx(s, ctx),
         Stmt::UseDatabase(s) => execute_use_database(s, storage, txn, ctx),
         Stmt::ShowDatabases(s) => execute_show_databases(s, storage, txn),
         Stmt::ShowTables(s) => execute_show_tables(s, storage, txn, ctx.effective_database()),
-        Stmt::ShowColumns(s) => execute_show_columns(s, storage, txn, ctx.effective_database()),
-        Stmt::TruncateTable(s) => execute_truncate(s, storage, txn, ctx.effective_database()),
+        Stmt::ShowColumns(s) => {
+            let db = ddl_database(&s.table.database, ctx);
+            execute_show_columns(s, storage, txn, &db)
+        }
+        Stmt::TruncateTable(s) => {
+            let db = ddl_database(&s.table.database, ctx);
+            execute_truncate(s, storage, txn, &db)
+        }
         other => dispatch(other, storage, txn),
     }
+}
+
+/// Compute the effective database for a DDL statement: if the `TableRef` has
+/// an explicit `database` component, use it; otherwise fall back to the session
+/// default. Returns an owned `String` so the original statement can be moved.
+fn ddl_database(explicit: &Option<String>, ctx: &SessionContext) -> String {
+    explicit
+        .as_deref()
+        .unwrap_or(ctx.effective_database())
+        .to_string()
 }
 
 /// Extracts a normalized string value from a `SetValue`.

@@ -9,8 +9,7 @@ fn execute_delete_ctx(
         storage,
         txn,
         ctx,
-        stmt.table.schema.as_deref(),
-        &stmt.table.name,
+        &stmt.table,
     )?;
 
     let secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved

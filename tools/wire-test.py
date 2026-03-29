@@ -2043,6 +2043,86 @@ c620.execute("DROP TABLE upd_apply_users")
 conn_620.commit()
 conn_620.close()
 
+# ── 22b.3b: cross-database name resolution ────────────────────────────────────
+
+print("\n[22b.3b cross-database resolution]")
+conn_xdb = connect()
+cx = conn_xdb.cursor()
+
+# Setup: create analytics database with a table
+cx.execute("CREATE DATABASE analytics")
+conn_xdb.commit()
+cx.execute("USE analytics")
+cx.execute("CREATE TABLE events (id INT, name TEXT)")
+cx.execute("INSERT INTO events VALUES (1, 'click'), (2, 'view')")
+conn_xdb.commit()
+
+# Switch back to default db
+cx.execute("USE axiomdb")
+
+# 1. SELECT via 3-part name
+cx.execute("SELECT id, name FROM analytics.public.events")
+xdb_rows = cx.fetchall()
+ok("22b.3b SELECT analytics.public.events from axiomdb",
+   xdb_rows == ((1, "click"), (2, "view")),
+   xdb_rows)
+
+# 2. CREATE TABLE via 3-part name
+cx.execute("CREATE TABLE analytics.public.scores (id INT, val INT)")
+conn_xdb.commit()
+cx.execute("USE analytics")
+cx.execute("INSERT INTO scores VALUES (10, 100)")
+conn_xdb.commit()
+cx.execute("SELECT val FROM scores")
+ok("22b.3b CREATE TABLE via 3-part name works",
+   cx.fetchone() == (100,))
+
+# 3. INSERT cross-database
+cx.execute("USE axiomdb")
+cx.execute("CREATE TABLE local_copy (id INT, val INT)")
+conn_xdb.commit()
+cx.execute("INSERT INTO local_copy SELECT * FROM analytics.public.scores")
+conn_xdb.commit()
+cx.execute("SELECT COUNT(*) FROM local_copy")
+ok("22b.3b INSERT ... SELECT cross-database",
+   cx.fetchone() == (1,))
+
+# 4. UPDATE via 3-part name
+cx.execute("UPDATE analytics.public.scores SET val = 999")
+conn_xdb.commit()
+cx.execute("SELECT val FROM analytics.public.scores")
+ok("22b.3b UPDATE via 3-part name",
+   cx.fetchone() == (999,))
+
+# 5. DELETE via 3-part name
+cx.execute("DELETE FROM analytics.public.events WHERE id = 1")
+conn_xdb.commit()
+cx.execute("SELECT COUNT(*) FROM analytics.public.events")
+ok("22b.3b DELETE via 3-part name",
+   cx.fetchone() == (1,))
+
+# 6. DatabaseNotFound
+try:
+    cx.execute("SELECT * FROM ghost.public.t")
+    ok("22b.3b ghost database returns error", False)
+except Exception as e:
+    ok("22b.3b ghost database returns error",
+       "ghost" in str(e).lower() or "database" in str(e).lower(),
+       str(e))
+
+# 7. Unqualified still resolves to current db
+cx.execute("USE axiomdb")
+cx.execute("SELECT COUNT(*) FROM local_copy")
+ok("22b.3b unqualified still resolves to current db",
+   cx.fetchone() == (1,))
+
+# Cleanup
+cx.execute("DROP DATABASE analytics")
+conn_xdb.commit()
+cx.execute("DROP TABLE local_copy")
+conn_xdb.commit()
+conn_xdb.close()
+
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 
 print("\n[Connectivity]")

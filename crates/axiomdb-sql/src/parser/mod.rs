@@ -192,14 +192,29 @@ impl<'src> Parser<'src> {
     pub(crate) fn parse_table_ref(&mut self) -> Result<TableRef, DbError> {
         let first = self.parse_identifier()?;
         if self.eat(&Token::Dot) {
-            let table = self.parse_identifier()?;
-            Ok(TableRef {
-                schema: Some(first),
-                name: table,
-                alias: None,
-            })
+            let second = self.parse_identifier()?;
+            if self.eat(&Token::Dot) {
+                // database.schema.table
+                let third = self.parse_identifier()?;
+                Ok(TableRef {
+                    database: Some(first),
+                    schema: Some(second),
+                    name: third,
+                    alias: None,
+                })
+            } else {
+                // schema.table
+                Ok(TableRef {
+                    database: None,
+                    schema: Some(first),
+                    name: second,
+                    alias: None,
+                })
+            }
         } else {
+            // table
             Ok(TableRef {
+                database: None,
                 schema: None,
                 name: first,
                 alias: None,
