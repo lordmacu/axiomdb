@@ -6278,3 +6278,149 @@ fn test_cross_db_create_table_three_part() {
     };
     assert_eq!(rows[0][0], Value::Text("test".into()));
 }
+
+// ── Phase 22b.4: schema namespacing ──────────────────────────────────────────
+
+#[test]
+fn test_create_schema_basic() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+
+    run_ctx(
+        "CREATE SCHEMA inventory",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // Creating again without IF NOT EXISTS should fail
+    let err = run_ctx(
+        "CREATE SCHEMA inventory",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, DbError::SchemaAlreadyExists { .. }),
+        "got {err:?}"
+    );
+
+    // IF NOT EXISTS should succeed silently
+    run_ctx(
+        "CREATE SCHEMA IF NOT EXISTS inventory",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_set_search_path() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+
+    // Default search_path is ["public"]
+    assert_eq!(ctx.current_schema(), "public");
+
+    // Create a schema and set search_path
+    run_ctx(
+        "CREATE SCHEMA inventory",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "SET search_path = 'inventory, public'",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(ctx.search_path, vec!["inventory", "public"]);
+    assert_eq!(ctx.current_schema(), "inventory");
+}
+
+#[test]
+fn test_search_path_reset_on_use_db() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+
+    run_ctx(
+        "CREATE SCHEMA custom",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "SET search_path = 'custom'",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(ctx.current_schema(), "custom");
+
+    // USE db resets search_path to public
+    run_ctx(
+        "CREATE DATABASE other",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx("USE other", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
+    assert_eq!(ctx.current_schema(), "public");
+}
+
+#[test]
+fn test_create_schema_per_database() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+
+    run_ctx(
+        "CREATE SCHEMA myschema",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // Create another database — myschema should NOT exist there
+    run_ctx(
+        "CREATE DATABASE analytics",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "USE analytics",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // This should fail — myschema doesn't exist in analytics
+    let err = run_ctx(
+        "CREATE SCHEMA IF NOT EXISTS myschema",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+    // IF NOT EXISTS should succeed since it doesn't exist — it creates it
+    assert!(err.is_ok());
+}

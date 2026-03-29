@@ -1092,7 +1092,33 @@ fn execute_create_database(
     if reader.database_exists(&stmt.name)? {
         return Err(DbError::DatabaseAlreadyExists { name: stmt.name });
     }
-    CatalogWriter::new(storage, txn)?.create_database(&stmt.name)?;
+    let mut writer = CatalogWriter::new(storage, txn)?;
+    writer.create_database(&stmt.name)?;
+    // Every new database gets a `public` schema.
+    writer.create_schema(&stmt.name, "public")?;
+    Ok(QueryResult::Affected {
+        count: 0,
+        last_insert_id: None,
+    })
+}
+
+fn execute_create_schema(
+    stmt: crate::ast::CreateSchemaStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    database: &str,
+) -> Result<QueryResult, DbError> {
+    let snap = txn.active_snapshot()?;
+    let mut reader = CatalogReader::new(storage, snap)?;
+    if reader.schema_exists(database, &stmt.name)? {
+        if stmt.if_not_exists {
+            return Ok(QueryResult::Empty);
+        }
+        return Err(DbError::SchemaAlreadyExists {
+            name: stmt.name,
+        });
+    }
+    CatalogWriter::new(storage, txn)?.create_schema(database, &stmt.name)?;
     Ok(QueryResult::Affected {
         count: 0,
         last_insert_id: None,

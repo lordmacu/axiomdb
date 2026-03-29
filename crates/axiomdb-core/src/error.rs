@@ -225,6 +225,12 @@ pub enum DbError {
     #[error("database '{name}' already exists")]
     DatabaseAlreadyExists { name: String },
 
+    #[error("schema '{name}' already exists")]
+    SchemaAlreadyExists { name: String },
+
+    #[error("schema '{name}' not found")]
+    SchemaNotFound { name: String },
+
     #[error("table with id {table_id} not found in catalog")]
     CatalogTableNotFound { table_id: u32 },
 
@@ -328,6 +334,8 @@ impl DbError {
             DbError::TableNotFound { .. } => "42P01",
             DbError::TableAlreadyExists { .. } => "42P07",
             DbError::IndexAlreadyExists { .. } => "42P07",
+            DbError::SchemaAlreadyExists { .. } => "42P06",
+            DbError::SchemaNotFound { .. } => "3F000",
             DbError::ColumnNotFound { .. } => "42703",
             DbError::AmbiguousColumn { .. } => "42702",
             DbError::PermissionDenied { .. } => "42501",

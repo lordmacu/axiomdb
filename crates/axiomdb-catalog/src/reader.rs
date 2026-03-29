@@ -17,8 +17,8 @@ use axiomdb_core::RecordId;
 use crate::{
     bootstrap::{CatalogBootstrap, CatalogPageIds},
     schema::{
-        ColumnDef, ConstraintDef, DatabaseDef, FkDef, IndexDef, StatsDef, TableDatabaseDef,
-        TableDef, TableId, DEFAULT_DATABASE_NAME,
+        ColumnDef, ConstraintDef, DatabaseDef, FkDef, IndexDef, SchemaDef, StatsDef,
+        TableDatabaseDef, TableDef, TableId, DEFAULT_DATABASE_NAME,
     },
 };
 
@@ -158,6 +158,70 @@ impl<'a> CatalogReader<'a> {
         for (_, _, data) in rows {
             let (def, _) = DatabaseDef::from_bytes(&data)?;
             out.push(def);
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    // ── Schema operations (Phase 22b.4) ──────────────────────────────────────
+
+    /// Returns `true` if a schema exists in a database.
+    ///
+    /// Checks explicit `axiom_schemas` rows first. If the schemas root is
+    /// uninitialized (legacy database), falls back to `"public"` for the
+    /// default implicit schema.
+    pub fn schema_exists(&mut self, database: &str, schema: &str) -> Result<bool, DbError> {
+        // `public` always exists implicitly for any database.
+        if schema == "public" {
+            return Ok(true);
+        }
+        let root = self.page_ids.schemas;
+        if root == 0 {
+            // Legacy database: only `public` exists.
+            return Ok(false);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        for (_, _, data) in rows {
+            let (def, _) = SchemaDef::from_bytes(&data)?;
+            if def.database_name == database && def.name == schema {
+                return Ok(true);
+            }
+        }
+        // Legacy fallback: check if any visible table uses this schema name.
+        let table_rows =
+            HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot)?;
+        for (_, _, data) in table_rows {
+            let (td, _) = TableDef::from_bytes(&data)?;
+            if td.schema_name == schema {
+                // Check that this table belongs to the requested database.
+                let db = self.effective_table_database(td.id)?;
+                if db == database {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Returns all visible schemas in a database.
+    pub fn list_schemas(&mut self, database: &str) -> Result<Vec<SchemaDef>, DbError> {
+        let root = self.page_ids.schemas;
+        let mut out = Vec::new();
+        if root != 0 {
+            let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+            for (_, _, data) in rows {
+                let (def, _) = SchemaDef::from_bytes(&data)?;
+                if def.database_name == database {
+                    out.push(def);
+                }
+            }
+        }
+        // Ensure `public` is always in the list.
+        if !out.iter().any(|s| s.name == "public") {
+            out.push(SchemaDef {
+                database_name: database.to_string(),
+                name: "public".to_string(),
+            });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)

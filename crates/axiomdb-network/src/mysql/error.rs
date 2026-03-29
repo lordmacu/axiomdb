@@ -68,6 +68,10 @@ pub fn dberror_to_mysql(e: &DbError, sql: Option<&str>) -> MysqlError {
         DbError::DatabaseNotFound { name } => {
             (1049, b"42000", format!("Unknown database '{name}'"))
         }
+        DbError::SchemaAlreadyExists { name } => {
+            (1007, b"42P06", format!("Schema '{name}' already exists"))
+        }
+        DbError::SchemaNotFound { name } => (1049, b"3F000", format!("Unknown schema '{name}'")),
         DbError::ColumnNotFound { name, table } => (
             1054,
             b"42S22",

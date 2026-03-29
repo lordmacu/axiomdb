@@ -129,6 +129,11 @@ pub const CATALOG_DATABASES_ROOT_BODY_OFFSET: usize = 104;
 /// legacy databases; missing rows imply ownership by the default database.
 pub const CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET: usize = 112;
 
+/// body offset of `catalog_schemas_root: u64` — root heap page for
+/// `axiom_schemas` (Phase 22b.4). Value 0 = not yet allocated on
+/// legacy databases; lazily initialized on first `CREATE SCHEMA`.
+pub const CATALOG_SCHEMAS_ROOT_BODY_OFFSET: usize = 120;
+
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMA_VER_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "catalog header must fit within page 0"
@@ -145,8 +150,8 @@ const _: () = assert!(
 );
 
 const _: () = assert!(
-    HEADER_SIZE + CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET + 8 <= crate::page::PAGE_SIZE,
-    "database catalog roots must fit within page 0"
+    HEADER_SIZE + CATALOG_SCHEMAS_ROOT_BODY_OFFSET + 8 <= crate::page::PAGE_SIZE,
+    "schema catalog root must fit within page 0"
 );
 
 /// Reads a single `u64` from the meta page at `body_offset`.

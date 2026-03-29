@@ -23,6 +23,15 @@ pub(crate) fn parse_create_database(p: &mut Parser) -> Result<Stmt, DbError> {
     }))
 }
 
+pub(crate) fn parse_create_schema(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_not_exists = eat_if_not_exists(p)?;
+    let name = p.parse_identifier()?;
+    Ok(Stmt::CreateSchema(crate::ast::CreateSchemaStmt {
+        name,
+        if_not_exists,
+    }))
+}
+
 /// Parses everything after `CREATE TABLE` has been consumed.
 pub(crate) fn parse_create_table(p: &mut Parser) -> Result<Stmt, DbError> {
     let if_not_exists = eat_if_not_exists(p)?;

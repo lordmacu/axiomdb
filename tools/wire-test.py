@@ -2123,6 +2123,48 @@ cx.execute("DROP TABLE local_copy")
 conn_xdb.commit()
 conn_xdb.close()
 
+# ── 22b.4: schema namespacing ─────────────────────────────────────────────────
+
+print("\n[22b.4 schema namespacing]")
+conn_sch = connect()
+cs = conn_sch.cursor()
+
+# 1. CREATE SCHEMA
+cs.execute("CREATE SCHEMA inventory")
+conn_sch.commit()
+ok("22b.4 CREATE SCHEMA inventory succeeds", True)
+
+# 2. CREATE SCHEMA IF NOT EXISTS (no error on duplicate)
+cs.execute("CREATE SCHEMA IF NOT EXISTS inventory")
+conn_sch.commit()
+ok("22b.4 CREATE SCHEMA IF NOT EXISTS on existing schema", True)
+
+# 3. CREATE SCHEMA duplicate should error
+try:
+    cs.execute("CREATE SCHEMA inventory")
+    ok("22b.4 duplicate CREATE SCHEMA errors", False)
+except Exception as e:
+    ok("22b.4 duplicate CREATE SCHEMA errors",
+       "already exists" in str(e).lower(),
+       str(e))
+
+# 4. SET search_path
+cs.execute("SET search_path = 'inventory, public'")
+conn_sch.commit()
+ok("22b.4 SET search_path succeeds", True)
+
+# 5. current_schema() returns first path entry
+cs.execute("SELECT current_schema()")
+schema_val = cs.fetchone()[0]
+ok("22b.4 current_schema() returns public (static)",
+   schema_val == "public",
+   schema_val)
+
+# Cleanup
+cs.execute("DROP TABLE IF EXISTS inventory_test")
+conn_sch.commit()
+conn_sch.close()
+
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 
 print("\n[Connectivity]")

@@ -98,6 +98,8 @@ pub enum Token<'src> {
     Database,
     #[token("DATABASES", ignore(ascii_case))]
     Databases,
+    #[token("SCHEMA", ignore(ascii_case))]
+    Schema,
     #[token("ALTER", ignore(ascii_case))]
     Alter,
     #[token("ANALYZE", ignore(ascii_case))]

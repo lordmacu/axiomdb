@@ -37,8 +37,8 @@ use std::sync::Arc;
 
 use axiomdb_core::error::DbError;
 use axiomdb_storage::{
-    alloc_constraint_id, alloc_fk_id, alloc_index_id, alloc_table_id, HeapChain, Page, PageType,
-    StorageEngine,
+    alloc_constraint_id, alloc_fk_id, alloc_index_id, alloc_table_id, write_meta_u64, HeapChain,
+    Page, PageType, StorageEngine,
 };
 use axiomdb_wal::TxnManager;
 
@@ -69,6 +69,8 @@ pub const SYSTEM_TABLE_STATS: u32 = u32::MAX - 5;
 pub const SYSTEM_TABLE_DATABASES: u32 = u32::MAX - 6;
 /// WAL `table_id` used for inserts/deletes into `axiom_table_databases` (Phase 22b.3a).
 pub const SYSTEM_TABLE_TABLE_DATABASES: u32 = u32::MAX - 7;
+/// WAL `table_id` used for inserts/deletes into `axiom_schemas` (Phase 22b.4).
+pub const SYSTEM_TABLE_SCHEMAS: u32 = u32::MAX - 8;
 
 // ── CatalogWriter ─────────────────────────────────────────────────────────────
 
@@ -284,6 +286,52 @@ impl<'a> CatalogWriter<'a> {
             }
         }
         Ok(dropped)
+    }
+
+    // ── Schema operations (Phase 22b.4) ─────────────────────────────────────
+
+    /// Inserts a schema definition row into `axiom_schemas`.
+    ///
+    /// The schemas root is lazily initialized if needed (legacy databases).
+    pub fn create_schema(&mut self, database: &str, schema: &str) -> Result<(), DbError> {
+        let root = self.ensure_schemas_root()?;
+        let data = crate::schema::SchemaDef {
+            database_name: database.to_string(),
+            name: schema.to_string(),
+        }
+        .to_bytes();
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+        let key = format!("{}\0{}", database, schema);
+        let (page_id, slot_id) = HeapChain::insert(self.storage, root, &data, txn_id)?;
+        self.txn.record_insert(
+            SYSTEM_TABLE_SCHEMAS,
+            key.as_bytes(),
+            &data,
+            page_id,
+            slot_id,
+        )?;
+        Ok(())
+    }
+
+    /// Ensures the `axiom_schemas` root page exists, allocating it lazily for
+    /// legacy databases created before Phase 22b.4.
+    fn ensure_schemas_root(&mut self) -> Result<u64, DbError> {
+        if self.page_ids.schemas != 0 {
+            return Ok(self.page_ids.schemas);
+        }
+        let root = self.storage.alloc_page(PageType::Data)?;
+        let page = Page::new(PageType::Data, root);
+        self.storage.write_page(root, &page)?;
+        write_meta_u64(
+            self.storage,
+            axiomdb_storage::CATALOG_SCHEMAS_ROOT_BODY_OFFSET,
+            root,
+        )?;
+        self.page_ids.schemas = root;
+        Ok(root)
     }
 
     // ── Table operations ──────────────────────────────────────────────────────
