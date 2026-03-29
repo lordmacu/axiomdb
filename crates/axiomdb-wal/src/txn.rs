@@ -91,6 +91,11 @@ struct ActiveTxn {
     txn_id: TxnId,
     /// Snapshot id captured at BEGIN: used for read-your-own-writes during the txn.
     snapshot_id_at_begin: u64,
+    /// Isolation level for this transaction (Phase 7.1).
+    /// Controls whether `active_snapshot()` returns the frozen BEGIN snapshot
+    /// (REPEATABLE READ / SERIALIZABLE) or a fresh per-statement snapshot
+    /// (READ COMMITTED).
+    isolation_level: axiomdb_core::IsolationLevel,
     /// Undo ops in chronological order; applied last-to-first on rollback.
     undo_ops: Vec<UndoOp>,
     /// Pages to free **after** this transaction is durably committed.
@@ -189,11 +194,23 @@ impl TxnManager {
     /// Starts a new explicit transaction.
     ///
     /// Assigns the next monotonic [`TxnId`], writes a buffered Begin WAL entry,
-    /// and initialises the undo log.
+    /// and initialises the undo log. Uses `RepeatableRead` isolation by default.
     ///
     /// # Errors
     /// - [`DbError::TransactionAlreadyActive`] if a transaction is already open.
     pub fn begin(&mut self) -> Result<TxnId, DbError> {
+        self.begin_with_isolation(axiomdb_core::IsolationLevel::RepeatableRead)
+    }
+
+    /// Like [`begin`] but with an explicit isolation level (Phase 7.1).
+    ///
+    /// - `ReadCommitted`: `active_snapshot()` returns a fresh snapshot per call.
+    /// - `RepeatableRead` / `Serializable`: `active_snapshot()` returns the
+    ///   snapshot frozen at BEGIN.
+    pub fn begin_with_isolation(
+        &mut self,
+        isolation_level: axiomdb_core::IsolationLevel,
+    ) -> Result<TxnId, DbError> {
         if let Some(ref active) = self.active {
             return Err(DbError::TransactionAlreadyActive {
                 txn_id: active.txn_id,
@@ -209,6 +226,7 @@ impl TxnManager {
         self.active = Some(ActiveTxn {
             txn_id,
             snapshot_id_at_begin: self.max_committed + 1,
+            isolation_level,
             undo_ops: Vec::new(),
             deferred_free_pages: Vec::new(),
         });
@@ -1048,14 +1066,25 @@ impl TxnManager {
         TransactionSnapshot::committed(self.max_committed)
     }
 
-    /// Returns a snapshot for the active transaction (reads committed data + own writes).
+    /// Returns a snapshot for the active transaction.
+    ///
+    /// - **REPEATABLE READ / SERIALIZABLE**: returns the frozen snapshot captured
+    ///   at `BEGIN` (same `snapshot_id` for every call within the txn).
+    /// - **READ COMMITTED**: returns a fresh snapshot reflecting everything
+    ///   committed right now, plus the transaction's own writes.
     ///
     /// # Errors
     /// - [`DbError::NoActiveTransaction`] if no transaction is open.
     pub fn active_snapshot(&self) -> Result<TransactionSnapshot, DbError> {
         let active = self.active.as_ref().ok_or(DbError::NoActiveTransaction)?;
+        let snapshot_id = if active.isolation_level.uses_frozen_snapshot() {
+            active.snapshot_id_at_begin
+        } else {
+            // READ COMMITTED: fresh snapshot per statement
+            self.max_committed + 1
+        };
         Ok(TransactionSnapshot {
-            snapshot_id: active.snapshot_id_at_begin,
+            snapshot_id,
             current_txn_id: active.txn_id,
         })
     }

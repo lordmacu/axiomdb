@@ -586,7 +586,12 @@ impl ConnectionState {
             "collation_connection" => Some(self.connection_collation.name.into()),
             "collation_server" => Some(DEFAULT_SERVER_COLLATION.name.into()),
             "collation_database" => Some(DEFAULT_SERVER_COLLATION.name.into()),
-            "transaction_isolation" | "tx_isolation" => Some("REPEATABLE-READ".into()),
+            "transaction_isolation" | "tx_isolation" => Some(
+                self.variables
+                    .get("transaction_isolation")
+                    .cloned()
+                    .unwrap_or_else(|| "REPEATABLE-READ".into()),
+            ),
             "lower_case_table_names" => Some("0".into()),
             "version_comment" => Some("AxiomDB".into()),
             "version" => Some("8.0.36-AxiomDB-0.1.0".into()),
