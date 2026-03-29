@@ -4,146 +4,170 @@
 
 - `db.md`
 - `docs/progreso.md`
-- `crates/axiomdb-network/src/mysql/database.rs` — `Arc<Mutex<Database>>`, `execute_query`
-- `crates/axiomdb-network/src/mysql/handler.rs` — per-connection handler, lock acquisition
-- `crates/axiomdb-storage/src/mmap.rs` — `MmapStorage`, `read_page(&self)`, `write_page(&mut self)`
-- `crates/axiomdb-storage/src/memory.rs` — `MemoryStorage`
-- `crates/axiomdb-storage/src/engine.rs` — `StorageEngine` trait
-- `crates/axiomdb-wal/src/txn.rs` — `TxnManager`, `snapshot(&self)`, `begin(&mut self)`
-- `crates/axiomdb-sql/src/executor/mod.rs` — `execute_with_ctx`
-- `research/postgres/src/backend/storage/lmgr/lwlock.c` — wait-free shared lock via atomic CAS
-- `research/mariadb-server/storage/innobase/include/rw_lock.h` — per-page atomic RwLock
-- `research/duckdb/src/include/duckdb/transaction/duck_transaction_manager.hpp` — MVCC-only, no per-page locks
+- `crates/axiomdb-storage/src/engine.rs` — `StorageEngine` trait: `read_page(&self)`, `write_page(&mut self)`
+- `crates/axiomdb-storage/src/mmap.rs` — `MmapStorage::read_page` is pure pointer arithmetic on mmap, no mutable state
+- `crates/axiomdb-wal/src/txn.rs` — `snapshot(&self)`, `active_snapshot(&self)` vs `begin/commit/rollback(&mut self)`
+- `crates/axiomdb-catalog/src/reader.rs` — `CatalogReader::new(&dyn StorageEngine)` — takes shared ref
+- `crates/axiomdb-sql/src/executor/mod.rs` — `execute(&mut dyn StorageEngine, &mut TxnManager)` — takes mutable even for SELECT
+- `crates/axiomdb-network/src/mysql/database.rs` — `Database::execute_query(&mut self)` — exclusive for everything
+- `crates/axiomdb-network/src/mysql/handler.rs` — `Arc<Mutex<Database>>` — global exclusive lock
+- `research/postgres/src/backend/storage/lmgr/lwlock.c` — wait-free shared lock via atomic CAS on per-page LWLocks
+- `research/mariadb-server/storage/innobase/include/rw_lock.h` — per-page atomic RwLock with shared counter + writer sentinel bit
+- `research/duckdb/src/include/duckdb/transaction/duck_transaction_manager.hpp` — no per-page locks, MVCC-only visibility, separate undo buffer
 
 ## Research synthesis
 
 ### PostgreSQL
 
 Uses **per-page lightweight locks** (LWLock) with **wait-free shared lock
-acquisition** via atomic compare-exchange. Readers hold shared buffer pins
-during visibility checks. Writers acquire exclusive page locks. This provides
-fine-grained concurrency but requires complex buffer pool management and
-pin tracking per backend.
+acquisition** via atomic compare-exchange. Each backend pins pages locally
+and holds shared buffer locks only during tuple visibility checks. Writers
+acquire exclusive page locks but never force readers to release. The
+per-page granularity means a writer modifying page 42 does not block a
+reader scanning page 100.
+
+Key design from `lwlock.c:30-45`: replaced spinlock-protected counters with
+a single atomic variable to eliminate contention on frequently-shared locks.
 
 ### InnoDB
 
-Uses **per-page RwLocks** (`rw_lock` in `rw_lock.h`) with atomic counters:
-readers increment a shared counter, writers set a sentinel bit. Wrapped in
-**mini-transactions** (MTR) that batch page accesses. Similar granularity to
-PostgreSQL.
+Uses **per-page RwLocks** (`rw_lock` in `rw_lock.h`) wrapped in
+**mini-transactions** (MTR). Readers increment a shared counter atomically;
+writers set a sentinel bit (`WRITER = 1U << 31`). The shared counter allows
+wait-free reader acquisition when no writer holds the lock. Mini-transactions
+scope lock lifetime to individual page accesses, not entire queries.
 
 ### DuckDB
 
-Uses **no per-page locks at all**. Readers and writers access pages concurrently.
-Correctness is guaranteed by MVCC timestamps — readers see old versions via
-undo buffers, not via locking. Only table-level locks exist for checkpoints
-and vacuum. This is the simplest model and works because DuckDB's MVCC
-ensures readers always see a consistent snapshot without coordination.
+Uses **no per-page locks**. Correctness handled entirely by MVCC timestamps
+and undo buffers. Writers store old versions; readers access old versions
+via `start_time` comparison. Only table-level locks exist for checkpoints
+and vacuum. The transaction manager uses a `mutex` for `begin`/`commit` but
+readers need no coordination at all.
 
 ### AxiomDB-first decision
 
-AxiomDB should follow the **DuckDB model**: MVCC for correctness, minimal
-locking for coordination. The reasons:
+AxiomDB should follow a **DuckDB-inspired architecture** with one
+AxiomDB-specific optimization: because `MmapStorage::read_page(&self)` is
+already lock-free (pure pointer arithmetic on the mmap), readers don't even
+need an undo buffer to see old versions — the mmap and B-Tree CoW already
+provide this.
 
-1. AxiomDB already has DuckDB-style timestamp MVCC (O(1) visibility checks,
-   no active txn ID arrays).
-2. `MmapStorage.read_page()` is `&self` — mmap is inherently concurrent-read-safe
-   via the OS page cache.
-3. B-Tree Copy-on-Write means old tree roots remain valid for old snapshots.
-4. HeapChain reads use `RowHeader::is_visible()` which is a pure function of
-   the snapshot — no locking needed.
+The architecture splits `Database` into:
 
-The concrete change: replace `Arc<tokio::sync::Mutex<Database>>` with
-`Arc<tokio::sync::RwLock<Database>>`. Read-only queries acquire the read lock
-(multiple concurrent), write queries acquire the write lock (exclusive).
+- **`SharedState`** (`Arc`, no lock): read-only infrastructure accessible by
+  any number of concurrent readers without coordination.
+- **`WriterState`** (`Mutex`, one writer): mutable infrastructure for WAL,
+  heap writes, index maintenance.
 
-This avoids the complexity of PostgreSQL/InnoDB per-page locks while
-delivering the same result: readers never block writers, multiple readers
-can execute concurrently.
+Readers create a snapshot from an `AtomicU64` (max_committed), read pages
+via mmap (`&self`), and resolve visibility via `RowHeader::is_visible()`.
+No lock of any kind is ever taken by a reader.
+
+This is strictly better than PostgreSQL/InnoDB (no per-page locks needed)
+and equivalent to DuckDB's MVCC-only model, but simpler because AxiomDB's
+B-Tree CoW eliminates the need for undo buffers on index pages.
 
 ## What to build (not how)
 
-Replace the global exclusive mutex on `Database` with a read-write lock so
-that:
+Split the server's `Database` into shared (read) and exclusive (write)
+components so that:
 
-- **Read-only SQL statements** (SELECT without side effects) execute under a
-  **shared read lock**. Multiple readers can proceed concurrently.
-- **Write SQL statements** (INSERT, UPDATE, DELETE, DDL) execute under an
-  **exclusive write lock**, serializing writes as before.
-- **Snapshot creation** (`TxnManager::snapshot()`) works under the read lock
-  because it only reads `max_committed`.
-- **Transaction state** for explicit transactions is owned by the connection,
-  not shared. Each connection's `BEGIN`/`COMMIT`/`ROLLBACK` still acquires
-  the write lock for the duration of each statement, then releases it.
+- **Read-only operations** (SELECT, SHOW, system variable queries) execute
+  without acquiring any lock. They read `max_committed` from an atomic,
+  create a snapshot, and scan pages via `&self` on `MmapStorage`.
 
-The MVCC visibility rules from Phase 7.1 guarantee correctness: readers see a
-consistent snapshot regardless of concurrent writes because old row versions
-remain accessible until vacuum.
+- **Write operations** (INSERT, UPDATE, DELETE, DDL, BEGIN/COMMIT/ROLLBACK)
+  acquire an exclusive `Mutex` on the writer state. Only one writer at a time.
+
+- **Readers never wait for writers.** A SELECT that starts before an INSERT
+  completes sees the pre-INSERT snapshot. A SELECT that starts after the
+  INSERT commits sees the post-INSERT data.
+
+- **Writers wait only for the writer mutex**, not for readers. Because mmap
+  pages are CoW and MVCC visibility is snapshot-based, a writer can modify
+  pages while readers are still scanning them — the readers see the old
+  page versions via their snapshot.
+
+The SQL executor gains a read-only entry point that takes `&dyn StorageEngine`
+(shared ref) instead of `&mut dyn StorageEngine`. The existing write path
+remains unchanged.
 
 ## Inputs / Outputs
 
 - Input: concurrent MySQL client connections issuing SELECT and DML queries
 - Output:
-  - Multiple SELECT queries execute simultaneously without blocking each other
-  - SELECT does not block INSERT/UPDATE/DELETE
-  - INSERT/UPDATE/DELETE blocks other writes (single-writer serialization)
-  - INSERT/UPDATE/DELETE waits for in-flight readers to finish (write lock
-    waits for read lock holders to release)
+  - Multiple SELECT queries execute simultaneously with zero coordination
+  - SELECT never blocks INSERT/UPDATE/DELETE
+  - INSERT/UPDATE/DELETE never blocks SELECT
+  - INSERT/UPDATE/DELETE blocks other writes (single-writer via Mutex)
+  - Snapshot consistency: each query sees a consistent point-in-time view
 - Errors:
-  - No new error types. Existing transaction and lock errors remain.
+  - No new error types
 
 ## Use cases
 
-1. Two concurrent SELECT queries on the same table:
-   - Connection A: `SELECT * FROM users WHERE active = 1`
-   - Connection B: `SELECT COUNT(*) FROM users`
-   - Both execute simultaneously, neither blocks the other.
+1. Lock-free concurrent reads:
+   - 16 connections each run `SELECT * FROM users` simultaneously
+   - All 16 execute without any lock, using the same mmap pages
+   - Throughput scales linearly with connection count
 
-2. SELECT during INSERT:
-   - Connection A: starts `SELECT * FROM large_table` (slow scan)
-   - Connection B: `INSERT INTO large_table VALUES (...)`
-   - Connection B waits for A's read lock to release, then inserts.
-   - Connection A sees a consistent snapshot (pre-insert data).
+2. Reader unblocked by writer:
+   - Connection A: starts slow `SELECT * FROM large_table` (takes 500ms)
+   - Connection B: `INSERT INTO large_table VALUES (...)` (takes 1ms)
+   - B acquires writer Mutex, inserts, commits, releases Mutex — **without
+     waiting for A** to finish its SELECT
+   - A sees pre-insert data (its snapshot was taken before the insert)
 
-3. Multiple readers, one writer:
-   - 16 connections reading simultaneously.
-   - 1 connection writing.
-   - Writer waits for current readers to finish, then writes.
-   - New readers queue behind the writer until it finishes.
+3. Writer unblocked by reader:
+   - Connection A: starts slow `SELECT * FROM large_table`
+   - Connection B: `INSERT INTO other_table VALUES (...)`
+   - B does NOT wait for A — there is no shared lock to contend
 
-4. Autocommit writes release lock between statements:
-   - Connection A: `INSERT INTO t VALUES (1)` — acquires write lock, inserts,
-     commits, releases write lock.
-   - Between A's statements, readers can proceed.
+4. Autocommit write path:
+   - `INSERT INTO t VALUES (1)` → acquire writer Mutex → begin → insert →
+     commit → advance `max_committed` atomic → release Mutex
+   - Between statements, readers can create snapshots freely
+
+5. Explicit transaction:
+   - `BEGIN` → acquire writer Mutex → begin txn → release Mutex
+   - `SELECT ...` → read lock-free (uses active_snapshot)
+   - `INSERT ...` → acquire writer Mutex → insert → release Mutex
+   - `COMMIT` → acquire writer Mutex → commit → release Mutex
+   - Each statement in the txn acquires/releases the Mutex independently
 
 ## Acceptance criteria
 
-- [ ] `Database` is wrapped in `Arc<tokio::sync::RwLock<Database>>` instead of `Arc<tokio::sync::Mutex<Database>>`.
-- [ ] Read-only queries acquire read lock (`RwLock::read()`).
-- [ ] Write queries acquire write lock (`RwLock::write()`).
-- [ ] Multiple concurrent SELECT queries do not block each other (verified by test).
-- [ ] SELECT does not block concurrent INSERT (verified by test).
-- [ ] INSERT blocks concurrent INSERT (single-writer preserved).
-- [ ] `TxnManager::snapshot()` works correctly under read lock.
-- [ ] Existing single-connection tests pass without regression.
-- [ ] Wire protocol tests pass without regression.
+- [ ] `Database` split into `SharedState` (Arc, no lock) + `WriterState` (Mutex).
+- [ ] `max_committed` is `AtomicU64` in `SharedState`, readable without lock.
+- [ ] `MmapStorage` accessible via `Arc` in `SharedState` for concurrent reads.
+- [ ] Read-only executor path takes `&dyn StorageEngine` (shared ref).
+- [ ] Multiple concurrent SELECT queries execute without any lock (verified by test).
+- [ ] SELECT does not block INSERT and INSERT does not block SELECT (verified by test).
+- [ ] Writer Mutex only contended between writers, never by readers.
+- [ ] `schema_version` remains `Arc<AtomicU64>` (already lock-free).
+- [ ] Explicit transactions acquire writer Mutex per-statement, not for entire txn.
+- [ ] Existing tests pass without regression.
 
 ## Out of scope
 
-- Per-table or per-page locking (PostgreSQL/InnoDB model)
-- Lock-free writes (multi-writer — Phase 7.5+ will refine writer serialization)
+- Per-page locking (PostgreSQL/InnoDB model — unnecessary with mmap CoW)
+- Multi-writer concurrency (Phase 7.5 refines writer serialization)
+- `MemoryStorage` thread safety (test-only; real server uses MmapStorage)
 - Row-level locking (`SELECT FOR UPDATE` — Phase 13)
-- Deadlock detection (Phase 7.10)
-- Reader starvation prevention (writers waiting indefinitely for readers)
+- Undo buffers for index pages (B-Tree CoW already provides this)
 
 ## Dependencies
 
-- Phase 7.1: MVCC visibility rules (already implemented)
-- Phase 3.4: `RowHeader::is_visible()` (already implemented)
-- Phase 2.6: B-Tree Copy-on-Write (already implemented)
+- Phase 7.1: MVCC visibility rules (implemented)
+- Phase 2.6: B-Tree Copy-on-Write (implemented)
+- Phase 3.4: `RowHeader::is_visible()` (implemented)
 
 ## ⚠️ DEFERRED
 
-- `MemoryStorage` thread safety — currently uses `HashMap`, not safe for concurrent access. Tests use single-threaded execution. Real concurrent tests require `MmapStorage` or a thread-safe memory storage.
-- Writer starvation: if readers continuously hold the read lock, a writer may wait indefinitely. Tokio's `RwLock` is writer-preferring by default, which mitigates this.
-- Per-connection transaction state isolation: explicit transactions (`BEGIN`/`COMMIT`) currently store state in `TxnManager` which is inside `Database`. For true per-connection transactions, `TxnManager` would need to be per-connection or the active transaction state would need to move out.
+- True per-statement writer Mutex release inside explicit transactions requires
+  careful handling of `ActiveTxn` state ownership. Initial implementation may
+  hold writer Mutex for the entire explicit transaction duration, upgrading to
+  per-statement release in a follow-up.
+- Reader starvation of writers: unlikely with Tokio Mutex (FIFO fairness) but
+  not formally prevented.
