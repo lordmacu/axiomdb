@@ -637,7 +637,13 @@ fn dispatch_ctx(
         Stmt::Set(s) => execute_set_ctx(s, ctx),
         Stmt::UseDatabase(s) => execute_use_database(s, storage, txn, ctx),
         Stmt::ShowDatabases(s) => execute_show_databases(s, storage, txn),
-        Stmt::ShowTables(s) => execute_show_tables(s, storage, txn, ctx.effective_database()),
+        Stmt::ShowTables(mut s) => {
+            // Default to current schema from search_path if not explicit.
+            if s.schema.is_none() {
+                s.schema = Some(ctx.current_schema().to_string());
+            }
+            execute_show_tables(s, storage, txn, ctx.effective_database())
+        }
         Stmt::ShowColumns(s) => {
             let db = ddl_database(&s.table.database, ctx);
             execute_show_columns(s, storage, txn, &db)
