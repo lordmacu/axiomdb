@@ -18,10 +18,16 @@ use crate::expr::Expr;
 
 /// A qualified table reference with an optional alias.
 ///
-/// `schema` is `None` when the query omits the schema prefix; the executor
-/// substitutes the session's default schema (typically `"public"`).
+/// Supports 1-part (`table`), 2-part (`schema.table`), and 3-part
+/// (`database.schema.table`) names.
+///
+/// - `database` is `None` when the query omits the database prefix; the
+///   executor substitutes the session's effective database.
+/// - `schema` is `None` when the query omits the schema prefix; the executor
+///   substitutes the session's default schema (typically `"public"`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableRef {
+    pub database: Option<String>,
     pub schema: Option<String>,
     pub name: String,
     pub alias: Option<String>,
@@ -31,6 +37,7 @@ impl TableRef {
     /// Shorthand constructor for unqualified, unaliased table references.
     pub fn simple(name: impl Into<String>) -> Self {
         Self {
+            database: None,
             schema: None,
             name: name.into(),
             alias: None,
@@ -521,6 +528,7 @@ mod tests {
         let stmt = Stmt::CreateTable(CreateTableStmt {
             if_not_exists: true,
             table: TableRef {
+                database: None,
                 schema: Some("public".into()),
                 name: "users".into(),
                 alias: None,
@@ -646,6 +654,7 @@ mod tests {
         let join = JoinClause {
             join_type: JoinType::Left,
             table: FromClause::Table(TableRef {
+                database: None,
                 schema: None,
                 name: "orders".into(),
                 alias: Some("o".into()),

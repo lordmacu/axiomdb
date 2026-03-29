@@ -354,11 +354,19 @@ fn bound_table_ref(
     default_schema: &str,
     col_offset: &mut usize,
 ) -> Result<BoundTable, DbError> {
+    let database = table_ref.database.as_deref().unwrap_or(default_database);
     let schema = table_ref.schema.as_deref().unwrap_or(default_schema);
     let mut reader = CatalogReader::new(storage, snapshot)?;
 
+    // If the user explicitly specified a database, verify it exists first.
+    if table_ref.database.is_some() && !reader.database_exists(database)? {
+        return Err(DbError::DatabaseNotFound {
+            name: database.to_string(),
+        });
+    }
+
     let table_def = reader
-        .get_table_in_database(default_database, schema, &table_ref.name)?
+        .get_table_in_database(database, schema, &table_ref.name)?
         .ok_or_else(|| DbError::TableNotFound {
             name: format!("{}.{}", schema, table_ref.name),
         })?;
@@ -767,31 +775,25 @@ fn analyze_insert_cached(
     default_schema: &str,
     cache: &mut SchemaCache,
 ) -> Result<InsertStmt, DbError> {
+    let database = s.table.database.as_deref().unwrap_or(default_database);
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
 
     // Try cache first — avoids HeapChain::scan_visible × 2 on repeated inserts
-    let (table_def, columns) =
-        if let Some(td) = cache.get_table(default_database, schema, &s.table.name) {
-            let cols = cache.get_columns(td.id).cloned().unwrap_or_default();
-            (td.clone(), cols)
-        } else {
-            // Cache miss: normal catalog lookup
-            let mut reader = CatalogReader::new(storage, snapshot)?;
-            let td = reader
-                .get_table_in_database(default_database, schema, &s.table.name)?
-                .ok_or_else(|| DbError::TableNotFound {
-                    name: s.table.name.clone(),
-                })?;
-            let cols = reader.list_columns(td.id)?;
-            cache.insert(
-                default_database,
-                schema,
-                &s.table.name,
-                td.clone(),
-                cols.clone(),
-            );
-            (td, cols)
-        };
+    let (table_def, columns) = if let Some(td) = cache.get_table(database, schema, &s.table.name) {
+        let cols = cache.get_columns(td.id).cloned().unwrap_or_default();
+        (td.clone(), cols)
+    } else {
+        // Cache miss: normal catalog lookup
+        let mut reader = CatalogReader::new(storage, snapshot)?;
+        let td = reader
+            .get_table_in_database(database, schema, &s.table.name)?
+            .ok_or_else(|| DbError::TableNotFound {
+                name: s.table.name.clone(),
+            })?;
+        let cols = reader.list_columns(td.id)?;
+        cache.insert(database, schema, &s.table.name, td.clone(), cols.clone());
+        (td, cols)
+    };
     let _ = table_def; // used only to populate cache; executor reads from catalog directly
 
     // Validate named column list if provided
@@ -964,11 +966,12 @@ fn analyze_insert(
     default_database: &str,
     default_schema: &str,
 ) -> Result<InsertStmt, DbError> {
+    let database = s.table.database.as_deref().unwrap_or(default_database);
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
     let mut reader = CatalogReader::new(storage, snapshot)?;
 
     let table_def = reader
-        .get_table_in_database(default_database, schema, &s.table.name)?
+        .get_table_in_database(database, schema, &s.table.name)?
         .ok_or_else(|| DbError::TableNotFound {
             name: s.table.name.clone(),
         })?;
@@ -1016,11 +1019,12 @@ fn analyze_update(
     default_database: &str,
     default_schema: &str,
 ) -> Result<UpdateStmt, DbError> {
+    let database = s.table.database.as_deref().unwrap_or(default_database);
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
     let mut reader = CatalogReader::new(storage, snapshot)?;
 
     let table_def = reader
-        .get_table_in_database(default_database, schema, &s.table.name)?
+        .get_table_in_database(database, schema, &s.table.name)?
         .ok_or_else(|| DbError::TableNotFound {
             name: s.table.name.clone(),
         })?;
@@ -1070,11 +1074,12 @@ fn analyze_delete(
     default_database: &str,
     default_schema: &str,
 ) -> Result<DeleteStmt, DbError> {
+    let database = s.table.database.as_deref().unwrap_or(default_database);
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
     let mut reader = CatalogReader::new(storage, snapshot)?;
 
     let table_def = reader
-        .get_table_in_database(default_database, schema, &s.table.name)?
+        .get_table_in_database(database, schema, &s.table.name)?
         .ok_or_else(|| DbError::TableNotFound {
             name: s.table.name.clone(),
         })?;
@@ -1168,9 +1173,15 @@ fn analyze_drop_table(
 
     let mut reader = CatalogReader::new(storage, snapshot)?;
     for table_ref in &s.tables {
+        let database = table_ref.database.as_deref().unwrap_or(default_database);
         let schema = table_ref.schema.as_deref().unwrap_or(default_schema);
+        if table_ref.database.is_some() && !reader.database_exists(database)? {
+            return Err(DbError::DatabaseNotFound {
+                name: database.to_string(),
+            });
+        }
         let exists = reader
-            .get_table_in_database(default_database, schema, &table_ref.name)?
+            .get_table_in_database(database, schema, &table_ref.name)?
             .is_some();
         if !exists {
             return Err(DbError::TableNotFound {

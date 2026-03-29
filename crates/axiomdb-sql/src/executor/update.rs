@@ -9,8 +9,7 @@ fn execute_update_ctx(
         storage,
         txn,
         ctx,
-        stmt.table.schema.as_deref(),
-        &stmt.table.name,
+        &stmt.table,
     )?;
 
     let schema_cols = resolved.columns.clone();

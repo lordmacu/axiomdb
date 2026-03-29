@@ -1535,6 +1535,7 @@ fn alter_add_constraint(
             let stmt = crate::ast::CreateIndexStmt {
                 name: idx_name,
                 table: crate::ast::TableRef {
+                    database: None,
                     schema: Some(schema.to_string()),
                     name: table_def.def.table_name.clone(),
                     alias: None,

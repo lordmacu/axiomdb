@@ -30,8 +30,7 @@ fn execute_select_ctx(
             storage,
             txn,
             ctx,
-            from_table_ref.schema.as_deref(),
-            &from_table_ref.name,
+            &from_table_ref,
         )?;
 
         let snap = txn.active_snapshot()?;
@@ -294,8 +293,7 @@ fn execute_select_with_joins_ctx(
             storage,
             txn,
             ctx,
-            from_ref.schema.as_deref(),
-            &from_ref.name,
+            &from_ref,
         )?;
         col_offsets.push(running_offset);
         running_offset += from_t.columns.len();
@@ -308,8 +306,7 @@ fn execute_select_with_joins_ctx(
                         storage,
                         txn,
                         ctx,
-                        tref.schema.as_deref(),
-                        &tref.name,
+                        tref,
                     )?;
                     col_offsets.push(running_offset);
                     running_offset += jt.columns.len();
