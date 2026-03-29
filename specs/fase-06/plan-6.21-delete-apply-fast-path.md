@@ -125,6 +125,33 @@ This keeps the physical mutation layer unchanged and localizes the work to:
 - executor wiring
 - regression coverage
 
+## Closed decisions from research
+
+These decisions are now fixed for `6.21`:
+
+1. Keep the current two-phase DELETE shape.
+   - Borrowed from SQLite/MariaDB.
+   - Candidate discovery remains separate from physical delete apply.
+   - We do **not** introduce "delete while scanning" for AxiomDB in this subphase.
+
+2. Push the required-column set before materialization.
+   - Borrowed from DuckDB's delete scan pass-through and SQLite's OLD-column mask.
+   - The mask is computed before fetching candidate rows.
+   - The executor carries sparse rows with `Value::Null` in skipped columns.
+
+3. Leave heap and B-Tree delete primitives unchanged.
+   - Confirmed by PostgreSQL's split between tuple identification and `heap_delete()`.
+   - `delete_rows_batch(...)` and `delete_many_from_indexes(...)` remain the only
+     physical mutation primitives used by `6.21`.
+
+4. Optimize only single-table DELETE.
+   - Matches current AxiomDB scope and avoids entangling multi-table syntax or
+     RETURNING work from later phases.
+
+5. Do not introduce a new row container.
+   - The executor continues using `Vec<(RecordId, Vec<Value>)>`.
+   - This keeps FK enforcement and index maintenance contracts stable.
+
 ## Algorithm / Data structure
 
 ### 1. Compute a DELETE-required column mask
@@ -238,6 +265,59 @@ when parent FKs exist:
 This keeps correctness while shrinking row materialization cost on large parent
 table deletes that cannot use bulk-empty.
 
+### 6. Exact implementation cut
+
+The subphase will be implemented in this exact cut order:
+
+#### Cut A — reusable masking infrastructure
+
+- expose `build_column_mask(...)` from `executor/shared.rs`
+- add a small DELETE-specific mask builder in `executor/delete.rs`
+- no behavior change yet
+
+Exit criterion:
+
+- new unit coverage for DELETE mask composition passes
+
+#### Cut B — masked batch row read
+
+- add `TableEngine::read_rows_batch_masked(...)`
+- use `decode_row_masked(...)`
+- preserve caller RID order and `None` semantics for dead rows
+
+Exit criterion:
+
+- unit tests prove order preservation and skipped-column null-fill behavior
+
+#### Cut C — indexed candidate path
+
+- change `AccessMethod::IndexLookup` and `AccessMethod::IndexRange` branches in
+  `collect_delete_candidates(...)` to use the DELETE mask
+- keep the full `WHERE` recheck
+
+Exit criterion:
+
+- indexed DELETE regressions pass unchanged functionally
+
+#### Cut D — scan path + parent-FK no-WHERE path
+
+- change scan-based candidate discovery to pass `Some(mask)` when possible
+- use the same path for no-WHERE deletes blocked from bulk-empty by parent FKs
+
+Exit criterion:
+
+- parent-FK no-WHERE regressions pass
+
+#### Cut E — performance validation and tracker cleanup
+
+- run `delete` / `delete_where` benchmarks
+- document the measured gain
+- update stale Phase 6 warnings to reflect what was actually fixed vs. what remains
+
+Exit criterion:
+
+- benchmark delta recorded and remaining gap explicitly documented
+
 ## Implementation phases
 
 1. Extract or expose reusable mask-building helpers from `executor/shared.rs`.
@@ -253,6 +333,13 @@ table deletes that cannot use bulk-empty.
    - no-WHERE parent-FK DELETE path
    - partial-index delete correctness under masked rows
 6. Run targeted benches and compare against the pre-6.21 DELETE baseline.
+
+## Acceptance mapping
+
+- Spec criteria 1-4 map to Cuts A-C.
+- Spec criteria 5-6 map to Cut D.
+- Spec criteria 7-10 are regression gates during Cuts C-D.
+- Spec criterion 11 maps to Cut E.
 
 ## Tests to write
 

@@ -3386,42 +3386,11 @@ fn test_count_star_with_ctx_uses_masked_scan_without_hanging() {
     assert_eq!(rows, vec![vec![Value::BigInt(3)]]);
 }
 
-#[test]
-fn test_show_databases_lists_default_and_created_database() {
-    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
-
-    run_ctx(
-        "CREATE DATABASE analytics",
-        &mut storage,
-        &mut txn,
-        &mut bloom,
-        &mut ctx,
-    )
-    .unwrap();
-
-    let QueryResult::Rows { rows, .. } = run_ctx(
-        "SHOW DATABASES",
-        &mut storage,
-        &mut txn,
-        &mut bloom,
-        &mut ctx,
-    )
-    .unwrap() else {
-        panic!("SHOW DATABASES must return rows");
-    };
-
-    let names: Vec<String> = rows
-        .into_iter()
-        .map(|row| match &row[0] {
-            Value::Text(name) => name.clone(),
-            other => panic!("expected database name text, got {other:?}"),
-        })
-        .collect();
-    assert_eq!(names, vec!["analytics".to_string(), "axiomdb".to_string()]);
-}
+// Database/schema namespacing tests moved to integration_namespacing.rs
+// (22b.3a, 22b.3b, 22b.4)
 
 #[test]
-fn test_use_database_switches_unqualified_resolution_namespace() {
+fn test_use_database_switches_unqualified_resolution_namespace_moved() {
     let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
 
     run_ctx(
@@ -6429,4 +6398,260 @@ fn test_create_schema_per_database() {
     );
     // IF NOT EXISTS should succeed since it doesn't exist — it creates it
     assert!(err.is_ok());
+}
+
+#[test]
+fn test_search_path_resolves_unqualified_in_non_public_schema() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+
+    // Create schema and set search_path
+    run_ctx(
+        "CREATE SCHEMA inventory",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "SET search_path = 'inventory'",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // Create table — should go into inventory (first in search_path)
+    run_ctx(
+        "CREATE TABLE products (id INT, name TEXT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "INSERT INTO products VALUES (1, 'widget')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // Unqualified SELECT should find it via search_path
+    let QueryResult::Rows { rows, .. } = run_ctx(
+        "SELECT name FROM products",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap() else {
+        panic!("expected rows")
+    };
+    assert_eq!(rows[0][0], Value::Text("widget".into()));
+
+    // Explicit schema.table also works
+    let QueryResult::Rows { rows, .. } = run_ctx(
+        "SELECT name FROM inventory.products",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap() else {
+        panic!("expected rows")
+    };
+    assert_eq!(rows[0][0], Value::Text("widget".into()));
+}
+
+#[test]
+fn test_search_path_fallback_to_second_schema() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+
+    // Create table in default public schema
+    run_ctx(
+        "CREATE TABLE shared (id INT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "INSERT INTO shared VALUES (42)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // Create a custom schema and set search_path to custom first, then public
+    run_ctx(
+        "CREATE SCHEMA custom",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "SET search_path = 'custom, public'",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // `shared` doesn't exist in `custom`, but search_path falls back to `public`
+    let QueryResult::Rows { rows, .. } = run_ctx(
+        "SELECT id FROM shared",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap() else {
+        panic!("expected rows")
+    };
+    assert_eq!(rows[0][0], Value::Int(42));
+}
+
+#[test]
+fn test_show_tables_uses_current_schema() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+
+    // Create tables in public
+    run_ctx(
+        "CREATE TABLE pub_table (id INT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // Create schema + table in inventory
+    run_ctx(
+        "CREATE SCHEMA inventory",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "SET search_path = 'inventory'",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "CREATE TABLE inv_table (id INT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // SHOW TABLES should show only inventory tables (current schema)
+    let QueryResult::Rows { rows, .. } =
+        run_ctx("SHOW TABLES", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap()
+    else {
+        panic!("expected rows")
+    };
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.as_str(),
+            _ => panic!("expected text"),
+        })
+        .collect();
+    assert!(
+        names.contains(&"inv_table"),
+        "SHOW TABLES should list inv_table, got {names:?}"
+    );
+    assert!(
+        !names.contains(&"pub_table"),
+        "SHOW TABLES should NOT list pub_table, got {names:?}"
+    );
+
+    // SHOW TABLES FROM public should show pub_table
+    let QueryResult::Rows { rows, .. } = run_ctx(
+        "SHOW TABLES FROM public",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap() else {
+        panic!("expected rows")
+    };
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.as_str(),
+            _ => panic!("expected text"),
+        })
+        .collect();
+    assert!(
+        names.contains(&"pub_table"),
+        "SHOW TABLES FROM public should list pub_table, got {names:?}"
+    );
+}
+
+#[test]
+fn test_set_search_path_empty_rejected() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+
+    let err = run_ctx(
+        "SET search_path = ''",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap_err();
+    assert!(matches!(err, DbError::InvalidValue { .. }), "got {err:?}");
+}
+
+#[test]
+fn test_reset_search_path_via_default() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+
+    run_ctx(
+        "CREATE SCHEMA custom",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "SET search_path = 'custom'",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(ctx.current_schema(), "custom");
+
+    // SET search_path = DEFAULT resets to public
+    run_ctx(
+        "SET search_path = DEFAULT",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(ctx.current_schema(), "public");
 }

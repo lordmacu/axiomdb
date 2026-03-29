@@ -365,11 +365,20 @@ fn bound_table_ref(
         });
     }
 
-    let table_def = reader
-        .get_table_in_database(database, schema, &table_ref.name)?
-        .ok_or_else(|| DbError::TableNotFound {
-            name: format!("{}.{}", schema, table_ref.name),
-        })?;
+    // When the user didn't specify an explicit schema, try the default schema
+    // first, then fall back to "public" if different (search_path fallback).
+    let table_def = if table_ref.schema.is_none() {
+        let mut found = reader.get_table_in_database(database, schema, &table_ref.name)?;
+        if found.is_none() && schema != "public" {
+            found = reader.get_table_in_database(database, "public", &table_ref.name)?;
+        }
+        found
+    } else {
+        reader.get_table_in_database(database, schema, &table_ref.name)?
+    }
+    .ok_or_else(|| DbError::TableNotFound {
+        name: table_ref.name.clone(),
+    })?;
 
     let columns = reader.list_columns(table_def.id)?;
     let n = columns.len();
@@ -381,6 +390,40 @@ fn bound_table_ref(
     };
     *col_offset += n;
     Ok(bound)
+}
+
+/// Resolves a table for DML statements, trying the default schema first and
+/// falling back to "public" for unqualified names when the search path has
+/// a non-public first entry.
+fn resolve_dml_table(
+    reader: &mut CatalogReader,
+    table_ref: &TableRef,
+    default_database: &str,
+    default_schema: &str,
+) -> Result<axiomdb_catalog::TableDef, DbError> {
+    let database = table_ref.database.as_deref().unwrap_or(default_database);
+    let schema = table_ref.schema.as_deref().unwrap_or(default_schema);
+
+    if table_ref.schema.is_none() {
+        // Unqualified: try search_path order (default_schema, then public fallback)
+        if let Some(td) = reader.get_table_in_database(database, schema, &table_ref.name)? {
+            return Ok(td);
+        }
+        if schema != "public" {
+            if let Some(td) = reader.get_table_in_database(database, "public", &table_ref.name)? {
+                return Ok(td);
+            }
+        }
+        Err(DbError::TableNotFound {
+            name: table_ref.name.clone(),
+        })
+    } else {
+        reader
+            .get_table_in_database(database, schema, &table_ref.name)?
+            .ok_or_else(|| DbError::TableNotFound {
+                name: table_ref.name.clone(),
+            })
+    }
 }
 
 /// Build virtual ColumnDef list from the SELECT list of an analyzed subquery.
@@ -779,21 +822,18 @@ fn analyze_insert_cached(
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
 
     // Try cache first — avoids HeapChain::scan_visible × 2 on repeated inserts
-    let (table_def, columns) = if let Some(td) = cache.get_table(database, schema, &s.table.name) {
-        let cols = cache.get_columns(td.id).cloned().unwrap_or_default();
-        (td.clone(), cols)
-    } else {
-        // Cache miss: normal catalog lookup
-        let mut reader = CatalogReader::new(storage, snapshot)?;
-        let td = reader
-            .get_table_in_database(database, schema, &s.table.name)?
-            .ok_or_else(|| DbError::TableNotFound {
-                name: s.table.name.clone(),
-            })?;
-        let cols = reader.list_columns(td.id)?;
-        cache.insert(database, schema, &s.table.name, td.clone(), cols.clone());
-        (td, cols)
-    };
+    let (table_def, columns): (axiomdb_catalog::TableDef, Vec<axiomdb_catalog::ColumnDef>) =
+        if let Some(td) = cache.get_table(database, schema, &s.table.name) {
+            let cols = cache.get_columns(td.id).cloned().unwrap_or_default();
+            (td.clone(), cols)
+        } else {
+            // Cache miss: resolve with search_path fallback
+            let mut reader = CatalogReader::new(storage, snapshot)?;
+            let td = resolve_dml_table(&mut reader, &s.table, default_database, default_schema)?;
+            let cols = reader.list_columns(td.id)?;
+            cache.insert(database, schema, &s.table.name, td.clone(), cols.clone());
+            (td, cols)
+        };
     let _ = table_def; // used only to populate cache; executor reads from catalog directly
 
     // Validate named column list if provided
@@ -966,16 +1006,8 @@ fn analyze_insert(
     default_database: &str,
     default_schema: &str,
 ) -> Result<InsertStmt, DbError> {
-    let database = s.table.database.as_deref().unwrap_or(default_database);
-    let schema = s.table.schema.as_deref().unwrap_or(default_schema);
     let mut reader = CatalogReader::new(storage, snapshot)?;
-
-    let table_def = reader
-        .get_table_in_database(database, schema, &s.table.name)?
-        .ok_or_else(|| DbError::TableNotFound {
-            name: s.table.name.clone(),
-        })?;
-
+    let table_def = resolve_dml_table(&mut reader, &s.table, default_database, default_schema)?;
     let columns = reader.list_columns(table_def.id)?;
 
     // Validate named column list if provided.
@@ -1019,16 +1051,8 @@ fn analyze_update(
     default_database: &str,
     default_schema: &str,
 ) -> Result<UpdateStmt, DbError> {
-    let database = s.table.database.as_deref().unwrap_or(default_database);
-    let schema = s.table.schema.as_deref().unwrap_or(default_schema);
     let mut reader = CatalogReader::new(storage, snapshot)?;
-
-    let table_def = reader
-        .get_table_in_database(database, schema, &s.table.name)?
-        .ok_or_else(|| DbError::TableNotFound {
-            name: s.table.name.clone(),
-        })?;
-
+    let table_def = resolve_dml_table(&mut reader, &s.table, default_database, default_schema)?;
     let columns = reader.list_columns(table_def.id)?;
 
     // Build single-table context.
@@ -1074,16 +1098,8 @@ fn analyze_delete(
     default_database: &str,
     default_schema: &str,
 ) -> Result<DeleteStmt, DbError> {
-    let database = s.table.database.as_deref().unwrap_or(default_database);
-    let schema = s.table.schema.as_deref().unwrap_or(default_schema);
     let mut reader = CatalogReader::new(storage, snapshot)?;
-
-    let table_def = reader
-        .get_table_in_database(database, schema, &s.table.name)?
-        .ok_or_else(|| DbError::TableNotFound {
-            name: s.table.name.clone(),
-        })?;
-
+    let table_def = resolve_dml_table(&mut reader, &s.table, default_database, default_schema)?;
     let columns = reader.list_columns(table_def.id)?;
     let bound = BoundTable {
         alias: s.table.alias.clone(),
