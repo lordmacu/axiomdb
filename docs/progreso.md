@@ -219,12 +219,12 @@
 - [x] 6.2b ✅ Index maintenance on INSERT/UPDATE/DELETE — secondary indexes kept in sync with heap; UNIQUE violation detection
 - [x] 6.3 ✅ Basic query planner — detects `WHERE col = literal` and `WHERE col > lo AND col < hi` on indexed columns; replaces full scan with B-Tree lookup/range
 - [x] 6.3b ✅ Indexed DELETE WHERE fast path — `plan_delete_candidates` / `plan_delete_candidates_ctx` skip stats_cost_gate (always use index for DELETE); `collect_delete_candidates` helper: IndexLookup/IndexRange → materialize RIDs → heap read → full WHERE recheck before deletion; wired into execute_delete_ctx and execute_delete; FK enforcement, index maintenance, partial-index predicates, collation guard all preserved; 5 integration tests
-- [ ] ⚠️ Composite index planner (> 1 column) — encoding supports it, planner deferred to 6.8
+- [x] ⚠️ Composite index planner (> 1 column) — implemented in 6.9 (Rule 0 composite planner)
 - [x] 6.4 ✅ Bloom filter per index — `BloomRegistry` per-DB; CREATE INDEX populates filter; INSERT adds keys; DELETE/UPDATE marks dirty; SELECT IndexLookup skips B-Tree on definite absence (1% FPR)
 - [x] 6.5 ✅ Foreign key checker — `axiom_foreign_keys` catalog; DDL (CREATE TABLE REFERENCES, ALTER TABLE ADD/DROP CONSTRAINT FK); INSERT/UPDATE child validates parent; DELETE/UPDATE parent enforces RESTRICT
 - [x] 6.6 ✅ ON DELETE CASCADE / SET NULL — recursive cascade (depth ≤ 10); SET NULL with nullable check; ON UPDATE RESTRICT; ON UPDATE CASCADE/SET NULL deferred to 6.9
-- [ ] ⚠️ FK auto-index (non-unique B-Tree duplicate keys) — deferred to 6.9; FK enforcement uses full scan (correct, O(n))
-- [ ] ⚠️ PK B-Tree index population on INSERT — PK indexes created empty; FK uses full scan for parent lookup → deferred to 6.9
+- [x] ⚠️ FK auto-index (non-unique B-Tree duplicate keys) — implemented in 6.9 (fk_val|RecordId composite key)
+- [x] ⚠️ PK B-Tree index population on INSERT — implemented in 6.9
 - [x] 6.7 ✅ Partial UNIQUE index — `CREATE [UNIQUE] INDEX ... WHERE predicate`; predicate stored as SQL string in IndexDef; build/INSERT/UPDATE/DELETE filter by predicate; planner uses index only when query WHERE implies predicate; session cache invalidated after CoW B-Tree root change
 - [x] 6.8 ✅ Fill factor — `CREATE INDEX ... WITH (fillfactor=N)`; persisted in IndexDef (u8, default 90); BTree::insert_in threads fillfactor → split threshold = ceil(FF×ORDER_LEAF/100); backward-compat
 - [x] 6.9 ✅ PK B-Tree population on INSERT; FK composite key index (fk_val|RecordId); composite index planner Rule 0; B-Tree range scan for FK enforcement
@@ -232,7 +232,7 @@
 - [x] 6.11 ✅ Auto-update statistics — StaleStatsTracker in SessionContext; marks stale after >20% row change
 - [x] 6.12 ✅ ANALYZE [TABLE name [(column)]] — exact NDV full scan; resets staleness
 - [x] 6.13 ✅ Index-only scans — `IndexOnlyScan` planner variant; `decode_index_key` inverse codec; `is_slot_visible` MVCC header-only check; `INCLUDE (cols)` DDL syntax + catalog storage; non-unique secondary indexes fixed to use `key||RecordId` format (InnoDB approach) — DuplicateKey on duplicate non-unique values fixed
-- [ ] ⚠️ 6.14 DEFERRED to Phase 7 — MVCC on secondary indexes requires 7.1-7.3 (snapshot isolation) to be implemented first; moved to 7.3b
+- [x] ⚠️ 6.14 — MVCC on secondary indexes implemented in 7.3b (lazy delete + heap visibility)
 - [x] 6.15 ✅ Index corruption detection — startup verifier compares every catalog index against heap-visible rows after WAL recovery; readable-but-divergent indexes are rebuilt from heap and their catalog roots rotated before traffic starts; unreadable / structurally broken trees fail open with `IndexIntegrityFailure`; shared by server and embedded open paths; SQL `REINDEX` remains deferred to 19.15 / 37.44
 - [x] 6.16 ✅ Primary-key SELECT access path — `plan_select` / `plan_select_ctx` now allow PRIMARY KEY indexes as first-class single-table SELECT candidates; `WHERE pk = literal` bypasses the small-table / NDV cost gate and emits `IndexLookup` directly, while PK ranges reuse the existing `IndexRange` machinery; collation guard still rejects text PK index access under non-binary session collation; planner unit tests, SQL integration coverage, and wire smoke added
 - [x] 6.17 ✅ Indexed UPDATE candidate fast path — `plan_update_candidates` / `plan_update_candidates_ctx` now choose `IndexLookup` or `IndexRange` for UPDATE discovery using PK, UNIQUE, secondary, and eligible partial indexes without a stats gate; `execute_update[_ctx]` materializes candidate RIDs before any mutation, fetches rows, rechecks the full `WHERE`, and then hands the survivors to the existing `5.20` stable-RID / fallback write path unchanged; planner unit tests, integration regressions, wire smoke, and `update_range` benchmark added
