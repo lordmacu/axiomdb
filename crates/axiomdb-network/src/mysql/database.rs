@@ -93,6 +93,11 @@ pub struct Database {
     /// Connections clone this `Arc` at connect time and poll it without
     /// holding the `Database` lock.
     pub runtime_mode: Arc<AtomicU8>,
+    /// Snapshot registry for epoch-based page reclamation (Phase 7.8).
+    ///
+    /// Tracks active snapshot IDs across all connections. Used by `flush()`
+    /// to determine which deferred-free pages are safe to release.
+    pub snapshot_registry: Arc<super::snapshot_registry::SnapshotRegistry>,
 }
 
 impl Database {
@@ -148,6 +153,9 @@ impl Database {
             schema_version: Arc::new(AtomicU64::new(0)),
             status: Arc::new(StatusRegistry::new()),
             runtime_mode: Arc::new(AtomicU8::new(RUNTIME_MODE_READ_WRITE)),
+            snapshot_registry: Arc::new(super::snapshot_registry::SnapshotRegistry::new(
+                super::snapshot_registry::DEFAULT_MAX_CONNECTIONS,
+            )),
         })
     }
 
