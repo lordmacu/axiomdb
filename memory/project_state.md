@@ -1,5 +1,34 @@
 # Project State
 
+## 2026-03-29
+
+- `crates/axiomdb-sql/tests/integration_executor.rs` was split into targeted
+  binaries so executor work can run in narrower loops:
+  - `integration_executor`
+  - `integration_executor_joins`
+  - `integration_executor_query`
+  - `integration_executor_ddl`
+  - `integration_executor_ctx`
+  - `integration_executor_ctx_group`
+  - `integration_executor_ctx_limit`
+  - `integration_executor_ctx_on_error`
+  - `integration_executor_sql`
+  - `integration_delete_apply`
+  - `integration_insert_staging`
+  - `integration_namespacing`
+  - `integration_namespacing_cross_db`
+  - `integration_namespacing_schema`
+- Shared integration-test harness code now lives in
+  `crates/axiomdb-sql/tests/common/mod.rs`.
+- Current testing policy for local development:
+  - run the smallest relevant test binary first
+  - add only directly related binaries when shared helpers or adjacent paths changed
+  - keep `cargo test -p axiomdb-sql --tests` as the crate-level gate
+  - keep `cargo test --workspace` for phase/subphase close only
+- Current next split candidates are empty for `axiomdb-sql/tests/`; the remaining large bins are still cohesive enough to keep as one binary for now:
+  - `crates/axiomdb-sql/tests/integration_executor_query.rs`
+  - `crates/axiomdb-sql/tests/integration_index_only.rs`
+
 ## 2026-03-26
 
 - Phase 5 subphase `5.11b` is closed in code, tests, and docs.

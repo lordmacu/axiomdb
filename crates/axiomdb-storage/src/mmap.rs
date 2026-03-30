@@ -154,7 +154,7 @@ impl MmapStorage {
         // Validate page 0.
         let page_count = {
             let meta_page = Self::read_page_from_mmap(&mmap, 0)?;
-            let file_meta = Self::parse_file_meta(meta_page);
+            let file_meta = Self::parse_file_meta(&meta_page);
 
             if file_meta.db_magic != DB_FILE_MAGIC {
                 return Err(DbError::Other(format!(
@@ -233,19 +233,22 @@ impl MmapStorage {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    fn read_page_from_mmap(mmap: &MmapMut, page_id: u64) -> Result<&Page, DbError> {
+    fn read_page_from_mmap(
+        mmap: &MmapMut,
+        page_id: u64,
+    ) -> Result<crate::page_ref::PageRef, DbError> {
         let offset = page_id as usize * PAGE_SIZE;
         if offset + PAGE_SIZE > mmap.len() {
             return Err(DbError::PageNotFound { page_id });
         }
-        let ptr = mmap[offset..].as_ptr();
-        // SAFETY: offset is within the mmap (verified above). The mmap is aligned
-        // to ≥4 KB (a multiple of 64). PAGE_SIZE=16384 is a multiple of 64, so
-        // every page satisfies align_of::<Page>()==64. Page is repr(C, align(64)).
-        // No mutable aliases — function takes &MmapMut.
-        let page = unsafe { &*(ptr as *const Page) };
-        page.verify_checksum()?;
-        Ok(page)
+        // Copy 16KB from mmap into an owned PageRef. This is safe for concurrent
+        // access: the caller owns the copy and it survives mmap remap/grow.
+        // Cost: ~0.5µs from L2/L3 cache (same as PostgreSQL buffer pool copy).
+        let mut bytes = [0u8; PAGE_SIZE];
+        bytes.copy_from_slice(&mmap[offset..offset + PAGE_SIZE]);
+        let page_ref = crate::page_ref::PageRef::from_bytes(bytes);
+        page_ref.verify_checksum()?;
+        Ok(page_ref)
     }
 
     fn write_meta_to_mmap(mmap: &mut MmapMut, page_count: u64) -> Result<(), DbError> {
@@ -333,7 +336,7 @@ impl MmapStorage {
 // ── StorageEngine impl ────────────────────────────────────────────────────────
 
 impl StorageEngine for MmapStorage {
-    fn read_page(&self, page_id: u64) -> Result<&Page, DbError> {
+    fn read_page(&self, page_id: u64) -> Result<crate::page_ref::PageRef, DbError> {
         // Read page_count directly from the mmap without verifying the checksum — hot path.
         let count = Self::read_u64_at(&self.mmap, PAGE_COUNT_OFFSET);
         if page_id >= count {

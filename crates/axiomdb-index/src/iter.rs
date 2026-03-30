@@ -87,7 +87,7 @@ impl<'a> RangeIter<'a> {
                 // We reached a leaf. Exit and search for the next sibling.
                 break;
             }
-            let node = cast_internal(page);
+            let node = cast_internal(&page);
             let n = node.num_keys();
 
             // Use prefix compression to compare only suffixes in nodes
@@ -111,7 +111,7 @@ impl<'a> RangeIter<'a> {
             };
 
             let page = self.storage.read_page(parent_pid)?;
-            let node = cast_internal(page);
+            let node = cast_internal(&page);
             if next_idx <= node.num_keys() {
                 // There is a child at next_idx → descend to the leftmost leaf
                 let subtree_root = node.child_at(next_idx);
@@ -129,7 +129,7 @@ impl<'a> RangeIter<'a> {
             if page.body()[0] == 1 {
                 return Ok(pid);
             }
-            pid = cast_internal(page).child_at(0);
+            pid = cast_internal(&page).child_at(0);
         }
     }
 }
@@ -162,7 +162,7 @@ impl<'a> Iterator for RangeIter<'a> {
                     Ok(p) => p,
                     Err(e) => return Some(Err(e)),
                 };
-                let node = cast_leaf(page);
+                let node = cast_leaf(&page);
                 let num = node.num_keys();
 
                 if self.slot_idx >= num {

@@ -213,7 +213,7 @@ impl HeapChain {
                 // PageNotFound or a non-zero next_page_id both mean the hint is stale.
                 let valid = storage
                     .read_page(h.tail_page_id)
-                    .map(|p| chain_next_page(p) == 0)
+                    .map(|p| chain_next_page(&p) == 0)
                     .unwrap_or(false);
                 if valid {
                     return Ok(h.tail_page_id);
@@ -493,8 +493,8 @@ impl HeapChain {
 
         while current != 0 {
             let page = storage.read_page(current)?;
-            let next = chain_next_page(page);
-            for (slot_id, data) in scan_visible(page, &snap) {
+            let next = chain_next_page(&page);
+            for (slot_id, data) in scan_visible(&page, &snap) {
                 result.push((current, slot_id, data.to_vec()));
             }
             current = next;
@@ -856,7 +856,7 @@ impl HeapChain {
         let mut current = root_page_id;
         loop {
             let page = storage.read_page(current)?;
-            let next = chain_next_page(page);
+            let next = chain_next_page(&page);
             if next == 0 {
                 return Ok(current);
             }

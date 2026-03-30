@@ -1,5 +1,31 @@
 # Architecture Notes
 
+## 2026-03-29 — Thematic integration test binaries for `axiomdb-sql`
+
+- `crates/axiomdb-sql/tests/common/mod.rs` now owns the shared executor-test
+  harness (`setup`, `run`, `run_ctx`, staging helpers, row extractors).
+- Integration tests are now grouped by execution path rather than by one giant
+  catch-all file:
+  - `integration_executor` for base CRUD
+  - `integration_executor_joins` for joins and aggregates
+  - `integration_executor_query` for query-shaping features
+  - `integration_executor_ddl` for `SHOW` / `DESCRIBE` / `TRUNCATE` / `ALTER`
+  - `integration_executor_ctx` for base `SessionContext` and `strict_mode`
+  - `integration_executor_ctx_group` for ctx-path sorted group-by
+  - `integration_executor_ctx_limit` for ctx-path `LIMIT` / `OFFSET` coercion
+  - `integration_executor_ctx_on_error` for ctx-path `on_error`
+  - `integration_executor_sql` for broader SQL semantics
+  - `integration_delete_apply` for DELETE fast paths
+  - `integration_insert_staging` for transactional INSERT staging
+  - `integration_namespacing` for database catalog behavior
+  - `integration_namespacing_cross_db` for explicit cross-database resolution
+  - `integration_namespacing_schema` for schema namespacing and `search_path`
+- The structural rule is:
+  - keep one binary per cohesive execution path
+  - prefer adding related tests to an existing themed binary
+  - split only when a binary starts mixing unrelated paths or grows beyond a practical review/run size
+- Current watch list for future split is empty inside `axiomdb-sql/tests/`; the larger remaining bins are still responsibility-cohesive.
+
 ## 2026-03-26 — Prepared long data over MySQL wire
 
 - `COM_STMT_SEND_LONG_DATA` is handled entirely in `axiomdb-network/src/mysql/handler.rs`.

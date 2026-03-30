@@ -11,6 +11,7 @@ pub mod memory;
 pub mod meta;
 pub mod mmap;
 pub mod page;
+pub mod page_ref;
 
 pub use config::{DbConfig, WalDurabilityPolicy};
 pub use dirty::PageDirtyTracker;
@@ -38,3 +39,4 @@ pub use meta::{
 };
 pub use mmap::MmapStorage;
 pub use page::{Page, PageType, HEADER_SIZE, PAGE_FLAG_ALL_VISIBLE, PAGE_MAGIC, PAGE_SIZE};
+pub use page_ref::PageRef;

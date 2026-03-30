@@ -1,5 +1,19 @@
 # Lessons Learned
 
+## 2026-03-29 - Split integration tests by execution path, not by raw size alone
+
+- The right reason to split a large integration test file is mixed responsibility, not just line count.
+- A good binary groups one coherent execution path so it can be run alone with high signal.
+- If a new behavior already belongs to an existing themed binary, add the test there instead of creating a new file.
+- Prefer this validation ladder:
+  - single relevant test
+  - single relevant binary
+  - directly related binaries when helpers or adjacent paths changed
+  - whole crate only when the blast radius is broad or as a pre-close gate
+- Files around `~1000` lines are a watch signal, not an automatic split trigger.
+- Large but cohesive binaries are acceptable; large and mixed binaries are the ones that become expensive to maintain and run.
+- When a large binary already mirrors roadmap subphases, split along those subphase boundaries first; that usually produces the cleanest ownership and the most useful targeted commands.
+
 ## 2026-03-25 - Spec workflow discipline
 
 - Read the relevant codebase files before writing a single line of the spec, not after. Good reasoning after the fact does not repair a spec as cleanly as reading first.

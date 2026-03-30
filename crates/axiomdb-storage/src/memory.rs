@@ -3,7 +3,7 @@ use axiomdb_core::error::DbError;
 use crate::{
     engine::StorageEngine,
     freelist::FreeList,
-    page::{Page, PageType},
+    page::{Page, PageType, PAGE_SIZE},
 };
 
 /// In-RAM storage engine — no I/O, ideal for unit tests and benchmarks.
@@ -65,19 +65,18 @@ impl Default for MemoryStorage {
 }
 
 impl StorageEngine for MemoryStorage {
-    fn read_page(&self, page_id: u64) -> Result<&Page, DbError> {
+    fn read_page(&self, page_id: u64) -> Result<crate::page_ref::PageRef, DbError> {
         let idx = page_id as usize;
         if idx >= self.pages.len() || !self.allocated[idx] {
             return Err(DbError::PageNotFound { page_id });
         }
-        // In MemoryStorage pages never experience disk corruption.
-        // Checksum validated on write; re-verifying on every read costs ~300ns
-        // per lookup level. Debug builds still verify to catch logic bugs.
         debug_assert!(
             self.pages[idx].verify_checksum().is_ok(),
             "checksum mismatch in MemoryStorage — logic bug in write path"
         );
-        Ok(&self.pages[idx])
+        let mut bytes = [0u8; PAGE_SIZE];
+        bytes.copy_from_slice(self.pages[idx].as_bytes());
+        Ok(crate::page_ref::PageRef::from_bytes(bytes))
     }
 
     fn write_page(&mut self, page_id: u64, page: &Page) -> Result<(), DbError> {
