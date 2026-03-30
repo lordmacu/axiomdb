@@ -394,6 +394,42 @@ separate enhancement.
 
 ---
 
+## Epoch-Based Page Reclamation (Phase 7.8)
+
+When a writer performs Copy-on-Write on a B-Tree node, old pages are deferred
+(not immediately freed) because a concurrent reader might still reference them.
+The `SnapshotRegistry` tracks which snapshots are active across all connections:
+
+```rust
+pub struct SnapshotRegistry {
+    slots: Vec<AtomicU64>,  // slot[conn_id] = snapshot_id or 0
+}
+```
+
+- **Register:** connection sets its slot before executing a read query
+- **Unregister:** connection clears its slot after the query completes
+- **oldest_active():** returns the minimum non-zero slot, or `u64::MAX` if idle
+
+On `flush()`, the storage layer calls `release_deferred_frees(oldest_active())`
+to return only pages freed before the oldest active snapshot to the freelist.
+Pages freed after the oldest snapshot remain queued until all readers advance.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Atomic Slot Array (DuckDB Model)</span>
+DuckDB tracks <code>lowest_active_start</code> via an active transaction list.
+InnoDB uses <code>clone_oldest_view()</code> to merge all active ReadViews.
+AxiomDB uses a fixed-size atomic slot array (1024 slots) — O(N) scan without
+locking. Under the current RwLock model all slots are 0 during flush (writer
+has exclusive access), so the behavior is identical to the previous
+<code>u64::MAX</code> sentinel. The infrastructure is forward-compatible with
+future concurrent reader+writer models.
+</div>
+</div>
+
+---
+
 ## ⚠️ Planned: Serializable Snapshot Isolation (Phase 7)
 
 SSI detects read-write dependencies between concurrent transactions and aborts
