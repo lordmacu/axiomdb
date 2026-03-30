@@ -46,6 +46,7 @@ fn persist_batch_insert_indexes(
         return Ok(false);
     }
 
+    let snap = txn.active_snapshot()?;
     let updated = crate::index_maintenance::batch_insert_into_indexes(
         plan.indexes,
         plan.rows,
@@ -55,6 +56,7 @@ fn persist_batch_insert_indexes(
         plan.compiled_preds,
         plan.skip_unique_check,
         plan.committed_empty,
+        snap,
     )?;
     for (index_id, new_root) in &updated {
         CatalogWriter::new(storage, txn)?.update_index_root(*index_id, *new_root)?;

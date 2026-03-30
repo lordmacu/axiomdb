@@ -249,11 +249,11 @@
 ### Phase 7 — Concurrency + MVCC `🔄` week 40-48
 - [x] ✅ Non-unique secondary indexes composite key — Fixed in 6.13: all non-unique non-FK secondary indexes now use `key||RecordId` format (same as FK auto-indexes). DuplicateKey blocker for MVCC removed.
 - [x] 7.1 ✅ MVCC visibility rules — `IsolationLevel` + `SessionContext` now expose `READ COMMITTED`, `REPEATABLE READ`, and `SERIALIZABLE` (aliased to RR snapshot policy); `TxnManager::active_snapshot()` returns fresh snapshots for RC and frozen snapshots for RR/SERIALIZABLE; covered by `integration_isolation`
-- [ ] 7.2 ⏳ Transaction manager — global atomic txn_id counter
+- [x] 7.2 ✅ Transaction manager — `TxnManager` with monotonic `next_txn_id` counter, `max_committed` tracking, `begin()/commit()` lifecycle, WAL-integrated; atomicity guaranteed by `&mut self` under `Arc<RwLock<Database>>`; implemented across 7.1-7.4
 - [x] 7.3 ✅ Snapshot isolation — `TransactionSnapshot { snapshot_id, current_txn_id }` + `RowHeader::is_visible()` already enforce committed-before-snapshot visibility, read-your-own-writes, and committed-vs-uncommitted delete semantics; covered by heap visibility tests and `integration_table`
-- [ ] 7.3b ⏳ MVCC on secondary indexes — each index entry includes `(key, RecordId, txn_id_visible_from)`; UPDATE of indexed column inserts new version without deleting the old one; vacuum cleans dead index versions; requires 7.1-7.3 snapshot isolation (moved from 6.14)
+- [x] 7.3b ✅ MVCC on secondary indexes — InnoDB-style lazy index deletion: non-unique secondary index entries NOT removed on DELETE (heap visibility filters dead entries); unique/FK/PK indexes still deleted immediately (B-Tree enforces uniqueness); UPDATE of indexed col keeps old entry + inserts new (lazy delete for non-unique, immediate for unique/FK); heap-aware uniqueness check (`has_visible_duplicate`); `UndoOp::UndoIndexInsert` for ROLLBACK; HOT optimization in UPDATE skips index when no indexed col changed; visibility filtering added to all IndexLookup/IndexRange/IndexOnlyScan paths
 - [x] 7.4 ✅ Lock-free readers with CoW — `Arc<RwLock<Database>>`; SELECT uses `db.read()` (concurrent, no blocking), DML uses `db.write()` (exclusive); `execute_read_only_with_ctx` takes `&dyn StorageEngine` shared ref; 7.4a production-safe storage: pwrite for writes, read-only Mmap, owned PageRef, deferred free queue
-- [ ] 7.5 ⏳ Writer serialization — only 1 writer at a time per table (improve later)
+- [x] 7.5 ✅ Writer serialization — `Arc<RwLock<Database>>` guarantees exclusive writer access via `db.write()`; only 1 writer at a time (whole-database granularity); per-table locking deferred to Phase 13.7 (row-level locking)
 - [ ] 7.6 ⏳ ROLLBACK — mark txn rows as deleted
 - [ ] 7.7 ⏳ Concurrency tests — N simultaneous readers + N writers
 - [ ] 7.8 ⏳ Epoch-based reclamation — free CoW pages when no active snapshot references them

@@ -266,6 +266,83 @@ throughout the entire INSERT operation.
 
 ---
 
+## MVCC on Secondary Indexes (Phase 7.3b)
+
+Secondary indexes store `(key, RecordId)` pairs — they do **not** contain transaction
+IDs or version information. Visibility is always determined at the heap via the row's
+`txn_id_created` / `txn_id_deleted` fields.
+
+### Lazy Index Deletion
+
+When a row is DELETEd, non-unique secondary index entries are **not** removed. The
+heap row is marked deleted (`txn_id_deleted = T`), and the index entry becomes a
+"dead" entry. Readers filter dead entries via `is_slot_visible()` during index scans.
+
+Unique, primary key, and FK auto-indexes still have their entries deleted immediately
+because the B-Tree enforces key uniqueness internally.
+
+### UPDATE and Dead Entries
+
+When an UPDATE changes an indexed column:
+
+- **Unique/PK/FK indexes:** old entry deleted, new entry inserted (immediate)
+- **Non-unique indexes:** old entry left in place (lazy), new entry inserted
+
+Both old and new entries coexist in the B-Tree. The old entry points to a heap row
+whose values no longer match the index key; `is_slot_visible()` filters it out.
+
+### Heap-Aware Uniqueness
+
+When inserting into a unique index, if the key already exists, AxiomDB checks heap
+visibility before raising a `UniqueViolation`. If the existing entry points to a dead
+row (deleted or uncommitted), the insert proceeds — dead entries don't block re-use
+of the same key value.
+
+### HOT Optimization
+
+If an UPDATE does not change any column that participates in any secondary index,
+all index maintenance is skipped for that row — no B-Tree reads or writes. This is
+inspired by PostgreSQL's Heap-Only Tuple (HOT) optimization.
+
+### ROLLBACK Support
+
+Every new index entry (from INSERT or UPDATE) is recorded as
+`UndoOp::UndoIndexInsert` in the transaction's undo log. On ROLLBACK, these entries
+are physically removed from the B-Tree. Old entries (from lazy delete) were never
+removed, so they're naturally restored.
+
+### Vacuum
+
+Dead index entries accumulate until vacuum removes them. A dead entry is one where
+`is_slot_visible(entry.rid, oldest_active_snapshot)` returns false — the pointed-to
+heap row is deleted and no active snapshot can see it.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — No txn_id in Index Entries (InnoDB Model)</span>
+InnoDB, PostgreSQL, DuckDB, and SQLite all keep secondary indexes free of version
+information. AxiomDB follows this industry consensus: the heap is the source of truth
+for row visibility, and indexes are simple key-to-RecordId mappings. This avoids 8
+bytes of overhead per index entry (which would reduce ORDER_LEAF from 217 to ~190)
+and simplifies the B-Tree implementation.
+</div>
+</div>
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Zero-Cost DELETE for Non-Unique Indexes</span>
+DELETE operations on tables with non-unique secondary indexes require zero index I/O
+— only the heap row is modified. InnoDB must write a delete-mark to each secondary
+index entry; AxiomDB skips the index entirely. For DELETE-heavy workloads with many
+non-unique indexes, this eliminates O(K × log N) B-Tree operations per deleted row
+(where K is the number of indexes).
+</div>
+</div>
+
+---
+
 ## ⚠️ Planned: Serializable Snapshot Isolation (Phase 7)
 
 SSI detects read-write dependencies between concurrent transactions and aborts
