@@ -6,7 +6,7 @@ use std::{
 use axiomdb_core::error::{classify_io, DbError};
 use fs2::FileExt;
 use libc;
-use memmap2::MmapMut;
+use memmap2::Mmap;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -62,7 +62,9 @@ const _: () = assert!(
 /// The `.db` file is locked with `flock(LOCK_EX)` on open and released on
 /// drop, preventing corruption from two processes opening the same file.
 pub struct MmapStorage {
-    mmap: MmapMut,
+    /// Read-only memory mapping of the database file.
+    /// All reads go through this mapping; all writes go through `pwrite()` on `file`.
+    mmap: Mmap,
     /// File descriptor kept open for `set_len` in `grow` and to hold the
     /// exclusive file lock for the lifetime of this struct.
     file: File,
@@ -111,19 +113,33 @@ impl MmapStorage {
         file.set_len(initial_size)
             .map_err(|e| classify_io(e, "storage create"))?;
 
-        // SAFETY: freshly created file with the correct size. No other mappings.
-        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-
-        // Write page 0 (Meta).
-        Self::write_meta_to_mmap(&mut mmap, GROW_PAGES)?;
+        // Write page 0 (Meta) via pwrite.
+        {
+            let meta_page = Self::build_meta_page(GROW_PAGES);
+            use std::os::unix::fs::FileExt;
+            file.write_all_at(meta_page.as_bytes(), 0)
+                .map_err(|e| classify_io(e, "create meta pwrite"))?;
+        }
 
         // Initialize FreeList: pages 0 and 1 reserved (meta + bitmap).
         let freelist = FreeList::new(GROW_PAGES, &[0, 1]);
 
-        // Write page 1 (bitmap).
-        Self::write_freelist_to_mmap(&mut mmap, &freelist)?;
+        // Write page 1 (bitmap) via pwrite.
+        {
+            let mut bitmap_page = Page::new(PageType::Free, 1);
+            freelist.to_bytes(bitmap_page.body_mut());
+            bitmap_page.update_checksum();
+            use std::os::unix::fs::FileExt;
+            file.write_all_at(bitmap_page.as_bytes(), PAGE_SIZE as u64)
+                .map_err(|e| classify_io(e, "create freelist pwrite"))?;
+        }
 
-        mmap.flush()?;
+        file.sync_all()
+            .map_err(|e| classify_io(e, "create fsync"))?;
+
+        // Open a READ-ONLY mmap for the read path.
+        // SAFETY: file fully written and synced. No mutable aliases.
+        let mmap = unsafe { Mmap::map(&file)? };
 
         debug!(path = %path.display(), "database initialized and ready");
         Ok(MmapStorage {
@@ -148,8 +164,8 @@ impl MmapStorage {
 
         info!(path = %path.display(), "opening database");
 
-        // SAFETY: existing file, exclusive lock held — no other mutable mappings active.
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        // SAFETY: existing file, exclusive lock held. Read-only mapping.
+        let mmap = unsafe { Mmap::map(&file)? };
 
         // Validate page 0.
         let page_count = {
@@ -217,9 +233,9 @@ impl MmapStorage {
             .set_len(new_size)
             .map_err(|e| classify_io(e, "storage grow"))?;
 
-        // SAFETY: file extended to `new_size` bytes. No external references to
-        // the previous mapping (we hold `&mut self`).
-        self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
+        // SAFETY: file extended to `new_size` bytes. Read-only remap.
+        // Old mmap is dropped; all readers hold PageRef copies, not &Page refs.
+        self.mmap = unsafe { Mmap::map(&self.file)? };
 
         // Update page_count in meta and its CRC32c.
         self.update_page_count_in_mmap(new_count);
@@ -256,10 +272,7 @@ impl MmapStorage {
         self.pwrite_bytes(offset, page.as_bytes())
     }
 
-    fn read_page_from_mmap(
-        mmap: &MmapMut,
-        page_id: u64,
-    ) -> Result<crate::page_ref::PageRef, DbError> {
+    fn read_page_from_mmap(mmap: &Mmap, page_id: u64) -> Result<crate::page_ref::PageRef, DbError> {
         let offset = page_id as usize * PAGE_SIZE;
         if offset + PAGE_SIZE > mmap.len() {
             return Err(DbError::PageNotFound { page_id });
@@ -274,7 +287,8 @@ impl MmapStorage {
         Ok(page_ref)
     }
 
-    fn write_meta_to_mmap(mmap: &mut MmapMut, page_count: u64) -> Result<(), DbError> {
+    /// Builds a meta page (page 0) with the given page count.
+    fn build_meta_page(page_count: u64) -> Page {
         let mut meta_page = Page::new(PageType::Meta, 0);
         let file_meta = DbFileMeta {
             db_magic: DB_FILE_MAGIC,
@@ -284,7 +298,6 @@ impl MmapStorage {
             _reserved: [0u8; PAGE_SIZE - HEADER_SIZE - 24],
         };
         // SAFETY: body and DbFileMeta have the same size (const assert).
-        // Writing to the exclusive memory of meta_page.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 &file_meta as *const DbFileMeta as *const u8,
@@ -293,17 +306,7 @@ impl MmapStorage {
             );
         }
         meta_page.update_checksum();
-        mmap[..PAGE_SIZE].copy_from_slice(meta_page.as_bytes());
-        Ok(())
-    }
-
-    fn write_freelist_to_mmap(mmap: &mut MmapMut, freelist: &FreeList) -> Result<(), DbError> {
-        let mut bitmap_page = Page::new(PageType::Free, 1);
-        freelist.to_bytes(bitmap_page.body_mut());
-        bitmap_page.update_checksum();
-        let offset = PAGE_SIZE; // page 1
-        mmap[offset..offset + PAGE_SIZE].copy_from_slice(bitmap_page.as_bytes());
-        Ok(())
+        meta_page
     }
 
     /// Writes the freelist bitmap to page 1 via `pwrite()`.
@@ -487,7 +490,7 @@ impl StorageEngine for MmapStorage {
         };
         let requested_len = (effective_count as usize).saturating_mul(PAGE_SIZE);
         let clamped_len = requested_len.min(mmap_len - offset);
-        // SAFETY: `ptr` is derived from a live `MmapMut` via checked offset arithmetic.
+        // SAFETY: `ptr` is derived from a live `Mmap` via checked offset arithmetic.
         // `offset < mmap_len` is verified above; `clamped_len <= mmap_len - offset`
         // ensures [ptr, ptr + clamped_len) lies entirely within the mapping.
         // `madvise` is a pure hint — it does not dereference the pointer or mutate
