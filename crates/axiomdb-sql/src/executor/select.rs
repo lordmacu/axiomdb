@@ -1,8 +1,8 @@
 fn execute_select_ctx(
     mut stmt: SelectStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
-    bloom: &mut crate::bloom::BloomRegistry,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    bloom: &crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     // Set the session collation for all eval() calls in this ctx execution.
@@ -275,8 +275,8 @@ fn execute_select_ctx(
 fn execute_select_with_joins_ctx(
     stmt: SelectStmt,
     from_ref: crate::ast::TableRef,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     // Session collation for eval()-based comparisons in join ON, WHERE, ORDER BY, etc.
@@ -399,8 +399,8 @@ fn execute_select_with_joins_ctx(
 
 fn execute_select(
     mut stmt: SelectStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
 ) -> Result<QueryResult, DbError> {
     // Dispatch based on FROM clause type and whether JOINs are present.
     if stmt.from.is_none() {
@@ -408,11 +408,11 @@ fn execute_select(
         // Subqueries in the SELECT list (EXISTS, IN subquery, scalar subquery)
         // require a runner; we use a temporary SessionContext and a temporary bloom.
         let mut temp_ctx = SessionContext::new();
-        let mut temp_bloom = crate::bloom::BloomRegistry::new();
+        let temp_bloom = crate::bloom::BloomRegistry::new();
         let mut runner = ExecSubqueryRunner {
             storage,
             txn,
-            bloom: &mut temp_bloom,
+            bloom: &temp_bloom,
             ctx: &mut temp_ctx,
             outer_row: &[],
         };
@@ -542,11 +542,11 @@ fn execute_select(
         for (_rid, values) in raw_rows {
             if let Some(ref wc) = stmt.where_clause {
                 let mut temp_ctx = SessionContext::new();
-                let mut temp_bloom = crate::bloom::BloomRegistry::new();
+                let temp_bloom = crate::bloom::BloomRegistry::new();
                 let mut runner = ExecSubqueryRunner {
                     storage,
                     txn,
-                    bloom: &mut temp_bloom,
+                    bloom: &temp_bloom,
                     ctx: &mut temp_ctx,
                     outer_row: &values,
                 };
@@ -568,11 +568,11 @@ fn execute_select(
             .iter()
             .map(|v| {
                 let mut temp_ctx = SessionContext::new();
-                let mut temp_bloom = crate::bloom::BloomRegistry::new();
+                let temp_bloom = crate::bloom::BloomRegistry::new();
                 let mut runner = ExecSubqueryRunner {
                     storage,
                     txn,
-                    bloom: &mut temp_bloom,
+                    bloom: &temp_bloom,
                     ctx: &mut temp_ctx,
                     outer_row: v,
                 };
@@ -601,8 +601,8 @@ fn execute_select(
 /// then treated as a virtual table for the outer query's WHERE / GROUP BY / ORDER BY.
 fn execute_select_derived(
     mut stmt: SelectStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
 ) -> Result<QueryResult, DbError> {
     let (inner_query, _alias) = match stmt.from.take() {
         Some(FromClause::Subquery { query, alias }) => (*query, alias),
@@ -611,9 +611,9 @@ fn execute_select_derived(
 
     // Execute the inner query to materialize the derived table.
     let mut temp_ctx = SessionContext::new();
-    let mut temp_bloom = crate::bloom::BloomRegistry::new();
+    let temp_bloom = crate::bloom::BloomRegistry::new();
     let inner_result =
-        execute_select_ctx(inner_query, storage, txn, &mut temp_bloom, &mut temp_ctx)?;
+        execute_select_ctx(inner_query, storage, txn, &temp_bloom, &mut temp_ctx)?;
     let (derived_cols, derived_rows) = match inner_result {
         QueryResult::Rows { columns, rows } => (columns, rows),
         _ => {
@@ -628,11 +628,11 @@ fn execute_select_derived(
     for values in derived_rows {
         if let Some(ref wc) = stmt.where_clause {
             let mut temp_ctx2 = SessionContext::new();
-            let mut temp_bloom2 = crate::bloom::BloomRegistry::new();
+            let temp_bloom2 = crate::bloom::BloomRegistry::new();
             let mut runner = ExecSubqueryRunner {
                 storage,
                 txn,
-                bloom: &mut temp_bloom2,
+                bloom: &temp_bloom2,
                 ctx: &mut temp_ctx2,
                 outer_row: &values,
             };
@@ -680,8 +680,8 @@ fn execute_select_derived(
 fn execute_select_with_joins(
     stmt: SelectStmt,
     from_ref: crate::ast::TableRef,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
 ) -> Result<QueryResult, DbError> {
     // Resolve all tables (FROM + each JOIN table) and compute col_offsets.
     let mut all_resolved: Vec<axiomdb_catalog::ResolvedTable> = Vec::new();
