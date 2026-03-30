@@ -1,5 +1,5 @@
 fn resolve_table_cached(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     txn: &TxnManager,
     ctx: &mut SessionContext,
     tref: &crate::ast::TableRef,
@@ -144,14 +144,14 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
 /// Routes a statement to its handler. Called both inside `autocommit` and
 /// directly when an explicit transaction is already active.
 fn make_resolver<'a>(
-    storage: &'a mut dyn StorageEngine,
+    storage: &'a dyn StorageEngine,
     txn: &TxnManager,
 ) -> Result<SchemaResolver<'a>, DbError> {
     make_resolver_with_database(storage, txn, DEFAULT_DATABASE_NAME)
 }
 
 fn make_resolver_with_database<'a>(
-    storage: &'a mut dyn StorageEngine,
+    storage: &'a dyn StorageEngine,
     txn: &TxnManager,
     database: &'a str,
 ) -> Result<SchemaResolver<'a>, DbError> {

@@ -257,12 +257,12 @@ fn subst_expr(expr: Expr, outer_row: &[Value]) -> Expr {
 /// [`SubqueryRunner`] that executes inner queries through the executor,
 /// substituting outer-row references before running.
 ///
-/// Holds mutable refs to `storage`, `txn`, and `ctx`, plus the current
-/// outer row for `substitute_outer`. Created fresh for each outer row.
+/// Holds shared refs to `storage`, `txn`, and `bloom`, a mutable ref to `ctx`,
+/// plus the current outer row for `substitute_outer`. Created fresh for each outer row.
 struct ExecSubqueryRunner<'a> {
-    storage: &'a mut dyn StorageEngine,
-    txn: &'a mut TxnManager,
-    bloom: &'a mut crate::bloom::BloomRegistry,
+    storage: &'a dyn StorageEngine,
+    txn: &'a TxnManager,
+    bloom: &'a crate::bloom::BloomRegistry,
     ctx: &'a mut SessionContext,
     outer_row: &'a [Value],
 }

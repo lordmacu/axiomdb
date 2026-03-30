@@ -96,7 +96,7 @@ impl TableEngine {
     /// When `mask` is all-`true`, [`decode_row`] is used directly so there is no
     /// overhead compared to passing `None`.
     pub fn scan_table(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         table_def: &TableDef,
         columns: &[ColumnDef],
         snap: TransactionSnapshot,
@@ -117,7 +117,7 @@ impl TableEngine {
     /// Falls back to [`scan_table`] when `column_mask` is `Some` (masked
     /// decode needs a separate code path that isn't worth duplicating here).
     pub fn scan_table_direct(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         table_def: &TableDef,
         columns: &[ColumnDef],
         snap: TransactionSnapshot,
