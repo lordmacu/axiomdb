@@ -41,7 +41,7 @@ pub use eval::{
     eval, eval_in_session, eval_with, eval_with_in_session, is_truthy, like_match, ClosureRunner,
     CollationGuard, NoSubquery, SubqueryRunner,
 };
-pub use executor::{execute, execute_with_ctx};
+pub use executor::{execute, execute_read_only_with_ctx, execute_with_ctx};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lexer::{tokenize, Span, SpannedToken, Token};
 pub use session::{CompatMode, SessionCollation};

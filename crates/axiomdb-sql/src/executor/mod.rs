@@ -287,6 +287,62 @@ impl<'a> SubqueryRunner for ExecSubqueryRunner<'a> {
 ///
 /// Transaction control statements (`BEGIN`, `COMMIT`, `ROLLBACK`) operate directly
 /// on `txn` regardless of autocommit state.
+/// Executes a read-only statement with shared references only (Phase 7.4).
+///
+/// Safe to call without any exclusive lock. Handles SELECT, SHOW TABLES,
+/// SHOW COLUMNS, SHOW DATABASES. Returns `NotImplemented` for write statements.
+///
+/// Uses `txn` as `&TxnManager` (shared ref) — only calls `snapshot()` and
+/// `active_snapshot()`, never `begin/commit/rollback`.
+pub fn execute_read_only_with_ctx(
+    stmt: Stmt,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    bloom: &crate::bloom::BloomRegistry,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    match stmt {
+        Stmt::Select(s) => execute_select_ctx(s, storage, txn, bloom, ctx),
+        Stmt::ShowTables(mut s) => {
+            if s.schema.is_none() {
+                s.schema = Some(ctx.current_schema().to_string());
+            }
+            let db = ctx.effective_database();
+            let schema = s.schema.as_deref().unwrap_or("public");
+            let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+            let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
+            let tables = reader.list_tables_in_database(db, schema)?;
+            let col_name = format!("Tables_in_{schema}");
+            let out_cols = vec![ColumnMeta::computed(col_name, DataType::Text)];
+            let rows: Vec<Row> = tables
+                .into_iter()
+                .map(|t| vec![Value::Text(t.table_name)])
+                .collect();
+            Ok(QueryResult::Rows {
+                columns: out_cols,
+                rows,
+            })
+        }
+        Stmt::ShowDatabases(_) => {
+            let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+            let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
+            let dbs = reader.list_databases()?;
+            let out_cols = vec![ColumnMeta::computed(
+                String::from("Database"),
+                DataType::Text,
+            )];
+            let rows: Vec<Row> = dbs.into_iter().map(|d| vec![Value::Text(d.name)]).collect();
+            Ok(QueryResult::Rows {
+                columns: out_cols,
+                rows,
+            })
+        }
+        _ => Err(DbError::NotImplemented {
+            feature: "read-only executor does not handle this statement type".into(),
+        }),
+    }
+}
+
 pub fn execute(
     stmt: Stmt,
     storage: &mut dyn StorageEngine,
