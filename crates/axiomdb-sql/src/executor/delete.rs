@@ -108,20 +108,34 @@ fn execute_delete_ctx(
     let rids_only: Vec<RecordId> = to_delete.iter().map(|(rid, _)| *rid).collect();
     let count = TableEngine::delete_rows_batch(storage, txn, &resolved.def, &rids_only)?;
 
-    // Index maintenance: batch B-Tree delete per index (Phase 5.19).
-    // Collect all delete keys per index in one pass, sort them, then call
-    // delete_many_in once per index — O(N + height) instead of O(N log N).
-    if !secondary_indexes.is_empty() {
-        let compiled_preds =
-            crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;
-        let mut secondary_indexes = secondary_indexes; // shadow as mut for root sync
+    // Phase 7.3b — MVCC lazy index deletion: non-unique secondary index entries
+    // are NOT removed on DELETE. The heap row is marked deleted (txn_id_deleted),
+    // and index entries become "dead" — filtered by heap visibility checks on read.
+    // Vacuum (Phase 7.11) will clean dead entries later.
+    //
+    // These index types MUST still be deleted immediately:
+    // - PRIMARY KEY / UNIQUE: B-Tree enforces key uniqueness internally
+    //   (BTree::insert_in returns DuplicateKey). Dead entries block re-insert.
+    // - FK auto-indexes: FK checker uses reverse-lookup to find child rows.
+    //   Dead entries cause false positives during parent-side FK enforcement.
+    let immediate_delete_indexes: Vec<axiomdb_catalog::IndexDef> = secondary_indexes
+        .iter()
+        .filter(|i| i.is_unique || i.is_fk_index)
+        .cloned()
+        .collect();
+    if !immediate_delete_indexes.is_empty() {
+        let compiled_preds = crate::partial_index::compile_index_predicates(
+            &immediate_delete_indexes,
+            &schema_cols,
+        )?;
+        let mut immediate_delete_indexes = immediate_delete_indexes;
         let key_buckets = crate::index_maintenance::collect_delete_keys_by_index(
-            &secondary_indexes,
+            &immediate_delete_indexes,
             &to_delete,
             &compiled_preds,
         )?;
         let updated = crate::index_maintenance::delete_many_from_indexes(
-            &mut secondary_indexes,
+            &mut immediate_delete_indexes,
             key_buckets,
             storage,
             bloom,
@@ -258,7 +272,7 @@ fn execute_delete(
 
     // Use the already-loaded indexes from the resolved table (cached by SchemaCache).
     // Must be `mut` so we can keep root_page_id in sync as rows are deleted.
-    let mut secondary_indexes: Vec<IndexDef> = resolved
+    let secondary_indexes: Vec<IndexDef> = resolved
         .indexes
         .iter()
         .filter(|i| !i.columns.is_empty())
@@ -312,17 +326,25 @@ fn execute_delete(
     let rids_only: Vec<RecordId> = to_delete.iter().map(|(rid, _)| *rid).collect();
     let count = TableEngine::delete_rows_batch(storage, txn, &resolved.def, &rids_only)?;
 
-    // Index maintenance: batch B-Tree delete per index (Phase 5.19).
-    if !secondary_indexes.is_empty() {
-        let compiled_preds =
-            crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;
+    // Phase 7.3b — MVCC lazy index deletion (same logic as execute_delete_ctx).
+    let immediate_delete_indexes: Vec<IndexDef> = secondary_indexes
+        .iter()
+        .filter(|i| i.is_unique || i.is_fk_index)
+        .cloned()
+        .collect();
+    if !immediate_delete_indexes.is_empty() {
+        let compiled_preds = crate::partial_index::compile_index_predicates(
+            &immediate_delete_indexes,
+            &schema_cols,
+        )?;
+        let mut immediate_delete_indexes = immediate_delete_indexes;
         let key_buckets = crate::index_maintenance::collect_delete_keys_by_index(
-            &secondary_indexes,
+            &immediate_delete_indexes,
             &to_delete,
             &compiled_preds,
         )?;
         let updated = crate::index_maintenance::delete_many_from_indexes(
-            &mut secondary_indexes,
+            &mut immediate_delete_indexes,
             key_buckets,
             storage,
             &mut noop_bloom,

@@ -497,6 +497,7 @@ pub fn enforce_fk_on_parent_delete(
                                     &batch_refs,
                                     storage,
                                     bloom,
+                                    snap,
                                 )?
                             {
                                 CatalogWriter::new(storage, txn)?

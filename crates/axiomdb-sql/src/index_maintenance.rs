@@ -26,7 +26,31 @@ use axiomdb_types::Value;
 
 use axiomdb_index::page_layout::encode_rid;
 
+use axiomdb_storage::heap_chain::HeapChain;
+
 use crate::{eval::eval, eval::is_truthy, expr::Expr, key_encoding::encode_index_key};
+
+/// Phase 7.3b — Check if a duplicate key in a unique index points to a VISIBLE row.
+///
+/// With MVCC lazy index deletion, dead entries (deleted or rolled-back rows) remain
+/// in the index. A uniqueness violation only occurs if the existing entry points to
+/// a row that is visible under the current snapshot.
+///
+/// Returns `true` if a visible duplicate exists (should raise UniqueViolation).
+fn has_visible_duplicate(
+    storage: &dyn StorageEngine,
+    root_page_id: u64,
+    key: &[u8],
+    snap: TransactionSnapshot,
+) -> Result<bool, DbError> {
+    match BTree::lookup_in(storage, root_page_id, key)? {
+        None => Ok(false),
+        Some(existing_rid) => {
+            // Check heap visibility — only visible rows cause a violation.
+            HeapChain::is_slot_visible(storage, existing_rid.page_id, existing_rid.slot_id, snap)
+        }
+    }
+}
 
 // ── FK composite key helpers ──────────────────────────────────────────────────
 
@@ -95,6 +119,7 @@ pub fn insert_into_indexes(
     storage: &mut dyn StorageEngine,
     bloom: &mut crate::bloom::BloomRegistry,
     compiled_preds: &[Option<Expr>],
+    snap: TransactionSnapshot,
 ) -> Result<Vec<(u32, u64)>, DbError> {
     let mut updated_roots = Vec::new();
 
@@ -139,9 +164,11 @@ pub fn insert_into_indexes(
         };
 
         // Uniqueness check — skip for FK auto-indexes (never unique by FK semantics).
+        // Phase 7.3b: check heap visibility for existing entry — dead entries don't
+        // count as duplicates (they'll be cleaned by vacuum).
         if idx.is_unique
             && !idx.is_fk_index
-            && BTree::lookup_in(storage, idx.root_page_id, &key)?.is_some()
+            && has_visible_duplicate(storage, idx.root_page_id, &key, snap)?
         {
             let dup_val = key_vals.first().map(|v| format!("{v}"));
             return Err(DbError::UniqueViolation {
@@ -432,6 +459,7 @@ pub fn delete_many_from_single_index(
 ///
 /// Returns `(index_id, new_root_page_id)` for every index whose root changed.
 /// The caller is responsible for updating the in-memory `IndexDef` slice.
+#[allow(clippy::too_many_arguments)]
 pub fn batch_insert_into_indexes(
     indexes: &mut [IndexDef],
     rows: &[Vec<Value>],
@@ -441,6 +469,7 @@ pub fn batch_insert_into_indexes(
     compiled_preds: &[Option<Expr>],
     skip_unique_check: bool,
     committed_empty: &std::collections::HashSet<u32>,
+    snap: TransactionSnapshot,
 ) -> Result<Vec<(u32, u64)>, DbError> {
     debug_assert_eq!(
         rows.len(),
@@ -513,7 +542,7 @@ pub fn batch_insert_into_indexes(
             if !skip_unique_check
                 && idx.is_unique
                 && !idx.is_fk_index
-                && BTree::lookup_in(storage, root_pid.load(Ordering::Acquire), key)?.is_some()
+                && has_visible_duplicate(storage, root_pid.load(Ordering::Acquire), key, snap)?
             {
                 let dup_val = Some("(encoded)".to_string());
                 return Err(DbError::UniqueViolation {
@@ -546,6 +575,7 @@ pub fn insert_many_into_single_index(
     rows: &[(&[Value], RecordId)],
     storage: &mut dyn StorageEngine,
     bloom: &mut crate::bloom::BloomRegistry,
+    snap: TransactionSnapshot,
 ) -> Result<Option<u64>, DbError> {
     if idx.columns.is_empty() || rows.is_empty() {
         return Ok(None);
@@ -562,7 +592,7 @@ pub fn insert_many_into_single_index(
 
         if idx.is_unique
             && !idx.is_fk_index
-            && BTree::lookup_in(storage, root_pid.load(Ordering::Acquire), &key)?.is_some()
+            && has_visible_duplicate(storage, root_pid.load(Ordering::Acquire), &key, snap)?
         {
             let dup_val = key_vals.first().map(|v| format!("{v}"));
             return Err(DbError::UniqueViolation {
@@ -592,6 +622,7 @@ pub fn insert_into_single_index(
     rid: RecordId,
     storage: &mut dyn StorageEngine,
     bloom: &mut crate::bloom::BloomRegistry,
+    snap: TransactionSnapshot,
 ) -> Result<Option<u64>, DbError> {
     if idx.columns.is_empty() {
         return Ok(None);
@@ -604,7 +635,7 @@ pub fn insert_into_single_index(
 
     if idx.is_unique
         && !idx.is_fk_index
-        && BTree::lookup_in(storage, idx.root_page_id, &key)?.is_some()
+        && has_visible_duplicate(storage, idx.root_page_id, &key, snap)?
     {
         let dup_val = key_vals.first().map(|v| format!("{v}"));
         return Err(DbError::UniqueViolation {
