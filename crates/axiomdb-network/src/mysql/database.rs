@@ -578,10 +578,16 @@ fn is_schema_changing(stmt: &Stmt) -> bool {
 /// and anything else goes through the exclusive write path.
 pub fn is_read_only_sql(sql: &str) -> bool {
     let lower = sql.trim_start().to_ascii_lowercase();
-    lower.starts_with("select")
-        || lower.starts_with("show")
-        || lower.starts_with("describe")
-        || lower.starts_with("desc ")
+    if lower.starts_with("select") {
+        // SELECT FOR UPDATE / FOR SHARE require exclusive write lock.
+        // SELECT INTO OUTFILE / INTO DUMPFILE perform filesystem writes.
+        // These are NOT read-only — must go through the write path.
+        return !lower.contains(" for update")
+            && !lower.contains(" for share")
+            && !lower.contains(" into outfile")
+            && !lower.contains(" into dumpfile");
+    }
+    lower.starts_with("show") || lower.starts_with("describe") || lower.starts_with("desc ")
 }
 
 pub fn sql_may_mutate(sql: &str) -> bool {
@@ -627,7 +633,7 @@ mod tests {
     use axiomdb_core::error::DbError;
     use axiomdb_sql::{SchemaCache, SessionContext};
 
-    use super::{Database, OnErrorMode, QueryResult};
+    use super::{is_read_only_sql, Database, OnErrorMode, QueryResult};
 
     fn open_db() -> (tempfile::TempDir, Database) {
         let dir = tempdir().expect("temp dir");
@@ -690,5 +696,48 @@ mod tests {
             "non-ignorable ignore error must eagerly roll back the txn"
         );
         assert_eq!(session.warning_count(), 0);
+    }
+
+    // ── is_read_only_sql classification tests ────────────────────────────
+
+    #[test]
+    fn test_is_read_only_plain_select() {
+        assert!(is_read_only_sql("SELECT * FROM users"));
+        assert!(is_read_only_sql("select 1"));
+        assert!(is_read_only_sql("  SELECT id FROM t WHERE x = 1"));
+    }
+
+    #[test]
+    fn test_is_read_only_show_describe() {
+        assert!(is_read_only_sql("SHOW TABLES"));
+        assert!(is_read_only_sql("DESCRIBE users"));
+        assert!(is_read_only_sql("DESC users"));
+    }
+
+    #[test]
+    fn test_is_read_only_select_for_update_is_not_read_only() {
+        assert!(!is_read_only_sql("SELECT * FROM users FOR UPDATE"));
+        assert!(!is_read_only_sql("select id from t where x = 1 for update"));
+        assert!(!is_read_only_sql("SELECT * FROM users FOR SHARE"));
+    }
+
+    #[test]
+    fn test_is_read_only_select_into_is_not_read_only() {
+        assert!(!is_read_only_sql(
+            "SELECT * INTO OUTFILE '/tmp/data.csv' FROM t"
+        ));
+        assert!(!is_read_only_sql(
+            "SELECT * INTO DUMPFILE '/tmp/data.bin' FROM t"
+        ));
+    }
+
+    #[test]
+    fn test_is_read_only_dml_is_not_read_only() {
+        assert!(!is_read_only_sql("INSERT INTO t VALUES (1)"));
+        assert!(!is_read_only_sql("UPDATE t SET x = 1"));
+        assert!(!is_read_only_sql("DELETE FROM t"));
+        assert!(!is_read_only_sql("BEGIN"));
+        assert!(!is_read_only_sql("COMMIT"));
+        assert!(!is_read_only_sql("SET autocommit = 0"));
     }
 }

@@ -25,6 +25,11 @@ const GROW_PAGES: u64 = 64;
 /// Number of pages to prefetch when the caller passes `count = 0`.
 /// 64 × 16 KB = 1 MB — matches one `GROW_PAGES` growth unit.
 const PREFETCH_DEFAULT_PAGES: u64 = 64;
+/// Log a warning if the deferred-free queue exceeds this many entries.
+/// Under normal RwLock operation the queue drains on every flush; sustained
+/// growth above this threshold indicates a snapshot leak or a missing
+/// `release_deferred_frees` call.
+const DEFERRED_FREE_WARN_THRESHOLD: usize = 4096;
 
 // Fixed offsets for in-place updates without re-parsing the full meta page.
 // PageHeader(64) + db_magic(8) + version(4) + _pad(4) = 80
@@ -76,15 +81,27 @@ pub struct MmapStorage {
     dirty: PageDirtyTracker,
     /// Pages that have been freed but are not yet safe to reuse (Phase 7.4a).
     ///
-    /// When `free_page` is called, the page_id goes here instead of the freelist.
-    /// Pages are released to the freelist only when `release_deferred_frees` is
-    /// called (typically after all readers with old snapshots have finished).
+    /// When `free_page` is called, the page_id goes here instead of the freelist
+    /// tagged with the `snapshot_id` at which it was freed. Pages are released
+    /// to the freelist only when `release_deferred_frees(oldest_active_snapshot)`
+    /// confirms no reader holds a snapshot older than the free epoch.
     ///
     /// This prevents a writer from reusing a freed page while a concurrent
     /// reader might still resolve it via an old B-Tree root or heap chain.
     /// With `PageRef` (owned copies), the primary risk is already mitigated,
     /// but deferred frees add defense-in-depth for Phase 7.4 concurrent readers.
-    deferred_frees: Vec<u64>,
+    ///
+    /// ## Capacity
+    ///
+    /// The queue is capped at `DEFERRED_FREE_WARN_THRESHOLD` entries. If the cap
+    /// is exceeded, a warning is logged. Under normal operation with RwLock, the
+    /// writer holds exclusive access during flush, so the queue drains every commit.
+    /// Sustained growth indicates a bug (readers not releasing snapshots).
+    deferred_frees: Vec<(u64, u64)>,
+    /// Current snapshot_id set by `set_current_snapshot()`. Used to tag
+    /// deferred frees with the epoch at which the page became unreachable.
+    /// Defaults to 0 (meaning "release immediately on flush").
+    current_snapshot_id: u64,
 }
 
 impl Drop for MmapStorage {
@@ -160,6 +177,7 @@ impl MmapStorage {
             freelist_dirty: false,
             dirty: PageDirtyTracker::new(),
             deferred_frees: Vec::new(),
+            current_snapshot_id: 0,
         })
     }
 
@@ -230,12 +248,25 @@ impl MmapStorage {
             freelist_dirty: false,
             dirty: PageDirtyTracker::new(),
             deferred_frees: Vec::new(),
+            current_snapshot_id: 0,
         })
     }
 
     /// Extends the file by `extra_pages` pages, remaps, and updates metadata.
     ///
     /// Returns the `page_id` of the first new page.
+    ///
+    /// ## Concurrency safety (Phase 7.4)
+    ///
+    /// `grow()` takes `&mut self`, which means it requires exclusive access.
+    /// Under the server's `Arc<RwLock<Database>>` architecture, `grow()` is
+    /// only reachable through `write_page → alloc_page → grow`, which holds
+    /// `db.write()` — no concurrent `read_page` calls can be in progress.
+    ///
+    /// If future architecture changes allow concurrent reads during grow,
+    /// a read guard (similar to SQLite's `nFetchOut` counter) must be added
+    /// to prevent the mmap remap from invalidating in-flight `read_page_from_mmap`
+    /// calls. Currently this is structurally prevented by the RwLock.
     pub fn grow(&mut self, extra_pages: u64) -> Result<u64, DbError> {
         let old_count = self.page_count();
         let new_count = old_count + extra_pages;
@@ -248,6 +279,7 @@ impl MmapStorage {
 
         // SAFETY: file extended to `new_size` bytes. Read-only remap.
         // Old mmap is dropped; all readers hold PageRef copies, not &Page refs.
+        // No concurrent read_page() is possible — `&mut self` + RwLock guarantee.
         self.mmap = unsafe { Mmap::map(&self.file)? };
 
         // Update page_count in meta and its CRC32c.
@@ -260,22 +292,30 @@ impl MmapStorage {
         Ok(old_count)
     }
 
-    /// Releases all deferred-free pages back to the freelist.
+    /// Releases deferred-free pages back to the freelist, but only those freed
+    /// at or before `oldest_active_snapshot`.
     ///
-    /// Call this when it is safe to reuse freed pages — i.e., when no reader
-    /// holds a snapshot older than the moment the pages were freed.
+    /// A page freed at snapshot S is safe to reuse only when no reader holds a
+    /// snapshot ≤ S. Pass `u64::MAX` to release all pages unconditionally (safe
+    /// when the caller holds an exclusive write lock and no readers are active).
     ///
-    /// In single-writer mode (current), this is safe to call after each commit.
-    /// In concurrent-reader mode (Phase 7.4), this should be gated on
-    /// `min_active_snapshot > freed_at_snapshot` (epoch-based reclamation).
-    pub fn release_deferred_frees(&mut self) -> Result<(), DbError> {
+    /// Pages freed at a snapshot > `oldest_active_snapshot` remain in the queue
+    /// and will be released in a future call.
+    pub fn release_deferred_frees(&mut self, oldest_active_snapshot: u64) -> Result<(), DbError> {
         if self.deferred_frees.is_empty() {
             return Ok(());
         }
-        for page_id in self.deferred_frees.drain(..) {
-            self.freelist.free(page_id)?;
+        // Partition: release pages freed at snapshot ≤ oldest_active_snapshot.
+        let mut retained = Vec::new();
+        for (page_id, freed_at) in self.deferred_frees.drain(..) {
+            if freed_at <= oldest_active_snapshot {
+                self.freelist.free(page_id)?;
+                self.freelist_dirty = true;
+            } else {
+                retained.push((page_id, freed_at));
+            }
         }
-        self.freelist_dirty = true;
+        self.deferred_frees = retained;
         Ok(())
     }
 
@@ -291,6 +331,21 @@ impl MmapStorage {
     /// - PostgreSQL, InnoDB, DuckDB, SQLite all use pwrite for page writes
     /// - 16KB mmap writes are NOT atomic — concurrent readers see torn pages
     /// - pwrite to a file-backed mmap is coherent: the kernel unifies the page cache
+    /// ## EINTR safety
+    ///
+    /// `write_all_at()` (from `std::os::unix::fs::FileExt`) internally retries
+    /// on `EINTR`, guaranteeing all bytes are written or an error is returned.
+    /// Do NOT replace this with a raw `pwrite()` syscall wrapper — it would
+    /// silently lose data on signal interruption.
+    ///
+    /// ## Crash atomicity
+    ///
+    /// A 16 KB `pwrite()` is NOT guaranteed to be atomic on any filesystem.
+    /// APFS, ext4, XFS, and ZFS all use 4 KB blocks internally — a crash
+    /// mid-write leaves a torn page (e.g., first 8 KB new, last 8 KB stale).
+    /// AxiomDB relies on per-page CRC32c checksums to detect torn pages on
+    /// recovery. Full committed-page WAL redo (3.8c) will provide the repair
+    /// path; until then, a torn page results in a startup checksum error.
     fn pwrite_bytes(&self, offset: u64, data: &[u8]) -> Result<(), DbError> {
         use std::os::unix::fs::FileExt;
         self.file
@@ -479,7 +534,7 @@ impl StorageEngine for MmapStorage {
             )));
         }
         // Check for double-free: page already in deferred queue or freelist.
-        if self.deferred_frees.contains(&page_id) {
+        if self.deferred_frees.iter().any(|(pid, _)| *pid == page_id) {
             return Err(DbError::Other(format!(
                 "double free: page {page_id} already in deferred free queue"
             )));
@@ -489,19 +544,27 @@ impl StorageEngine for MmapStorage {
                 "double free: page {page_id} already free"
             )));
         }
-        // Defer the free: page goes to a holding queue instead of the
-        // freelist. This prevents a concurrent reader from seeing a
-        // freed+reallocated page with unrelated content.
-        self.deferred_frees.push(page_id);
+        // Defer the free: page goes to a holding queue tagged with the
+        // current snapshot epoch. This prevents a concurrent reader from
+        // seeing a freed+reallocated page with unrelated content.
+        self.deferred_frees
+            .push((page_id, self.current_snapshot_id));
+        if self.deferred_frees.len() > DEFERRED_FREE_WARN_THRESHOLD {
+            warn!(
+                count = self.deferred_frees.len(),
+                "deferred free queue exceeds warning threshold — possible snapshot leak"
+            );
+        }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), DbError> {
         // Release deferred-free pages back to the freelist.
-        // In single-writer mode this is safe at flush time because no
-        // concurrent readers exist. In Phase 7.4 (concurrent readers),
-        // this will be gated on min_active_snapshot.
-        self.release_deferred_frees()?;
+        // Under RwLock (Phase 7.4), the writer holds exclusive access during
+        // flush, so no readers are active → u64::MAX releases all pages.
+        // When snapshot slot tracking is added (Phase 7.8), pass the actual
+        // oldest_active_snapshot instead.
+        self.release_deferred_frees(u64::MAX)?;
 
         // Serialize the freelist via pwrite if modified.
         if self.freelist_dirty {
@@ -550,6 +613,14 @@ impl StorageEngine for MmapStorage {
         let ptr = unsafe { self.mmap.as_ptr().add(offset) };
         let _ =
             unsafe { libc::madvise(ptr as *mut libc::c_void, clamped_len, libc::MADV_SEQUENTIAL) };
+    }
+
+    fn set_current_snapshot(&mut self, snapshot_id: u64) {
+        self.current_snapshot_id = snapshot_id;
+    }
+
+    fn deferred_free_count(&self) -> usize {
+        self.deferred_frees.len()
     }
 }
 
