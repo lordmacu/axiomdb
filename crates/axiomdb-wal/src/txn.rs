@@ -1310,7 +1310,8 @@ mod tests {
         // Rollback should kill the slot.
         mgr.rollback(&mut storage).unwrap();
 
-        let result = read_tuple(storage.read_page(page_id).unwrap(), slot_id).unwrap();
+        let page = storage.read_page(page_id).unwrap();
+        let result = read_tuple(&page, slot_id).unwrap();
         assert!(
             result.is_none(),
             "slot must be dead after rollback of insert"
@@ -1351,7 +1352,7 @@ mod tests {
 
         // After rollback, txn_id_deleted must be 0 (row is live again).
         let page = storage.read_page(page_id).unwrap();
-        let (hdr, _) = read_tuple(page, slot_id).unwrap().unwrap();
+        let (hdr, _) = read_tuple(&page, slot_id).unwrap().unwrap();
         assert_eq!(
             hdr.txn_id_deleted, 0,
             "txn_id_deleted must be cleared after rollback"
@@ -1401,7 +1402,7 @@ mod tests {
 
         let page = storage.read_page(page_id).unwrap();
         // Old slot must be live again.
-        let (old_hdr, old_data) = read_tuple(page, old_slot).unwrap().unwrap();
+        let (old_hdr, old_data) = read_tuple(&page, old_slot).unwrap().unwrap();
         assert_eq!(old_data, b"original");
         assert_eq!(
             old_hdr.txn_id_deleted, 0,
@@ -1411,7 +1412,7 @@ mod tests {
         // new_slot = old_slot + 1 (inserted right after old in the page)
         let new_slot = old_slot + 1;
         assert!(
-            read_tuple(page, new_slot).unwrap().is_none(),
+            read_tuple(&page, new_slot).unwrap().is_none(),
             "new slot must be dead after update rollback"
         );
     }
@@ -1450,12 +1451,15 @@ mod tests {
         mgr.rollback(&mut storage).unwrap();
 
         let page = storage.read_page(page_id).unwrap();
-        let (hdr, data) = read_tuple(page, slot_id).unwrap().unwrap();
+        let (hdr, data) = read_tuple(&page, slot_id).unwrap().unwrap();
         assert_eq!(data, b"original");
         assert_eq!(hdr.txn_id_created, 1);
         assert_eq!(hdr.txn_id_deleted, 0);
         assert_eq!(hdr.row_version, 0);
-        assert_eq!(read_tuple_image(page, slot_id).unwrap().unwrap(), old_image);
+        assert_eq!(
+            read_tuple_image(&page, slot_id).unwrap().unwrap(),
+            old_image
+        );
     }
 
     // ── snapshots ─────────────────────────────────────────────────────────────
@@ -1506,7 +1510,7 @@ mod tests {
         // A committed snapshot (max_committed=0) should NOT see txn_id=1's row.
         let snap = mgr.snapshot();
         let page = storage.read_page(page_id).unwrap();
-        let (hdr, _) = read_tuple(page, slot_id).unwrap().unwrap();
+        let (hdr, _) = read_tuple(&page, slot_id).unwrap().unwrap();
         assert!(
             !hdr.is_visible(&snap),
             "uncommitted row must not be visible"

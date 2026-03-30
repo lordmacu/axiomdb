@@ -347,7 +347,7 @@ impl axiomdb_storage::StorageEngine for CountingStorage {
         self.frees.fetch_add(1, AOrdering::Relaxed);
         self.inner.free_page(id)
     }
-    fn read_page(&self, id: u64) -> Result<&axiomdb_storage::Page, axiomdb_core::error::DbError> {
+    fn read_page(&self, id: u64) -> Result<axiomdb_storage::PageRef, axiomdb_core::error::DbError> {
         self.inner.read_page(id)
     }
     fn write_page(

@@ -10,7 +10,7 @@ use memmap2::MmapMut;
 use tracing::{debug, info, warn};
 
 use crate::{
-    dirty::{coalesce_page_ids, PageDirtyTracker},
+    dirty::PageDirtyTracker,
     engine::StorageEngine,
     freelist::FreeList,
     page::{Page, PageType, HEADER_SIZE, PAGE_SIZE},
@@ -226,12 +226,35 @@ impl MmapStorage {
 
         // Extend the freelist to cover the new pages.
         self.freelist.grow(new_count);
-        Self::write_freelist_to_mmap(&mut self.mmap, &self.freelist)?;
+        self.pwrite_freelist()?;
 
         Ok(old_count)
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Writes raw bytes at `offset` in the file via `pwrite()`.
+    ///
+    /// This is the production-safe write path (Phase 7.4a). All page writes go
+    /// through the file descriptor, NOT the mmap. The mmap (MAP_SHARED) reflects
+    /// the change automatically via the kernel page cache.
+    ///
+    /// ## Why pwrite instead of mmap writes?
+    /// - PostgreSQL, InnoDB, DuckDB, SQLite all use pwrite for page writes
+    /// - 16KB mmap writes are NOT atomic — concurrent readers see torn pages
+    /// - pwrite to a file-backed mmap is coherent: the kernel unifies the page cache
+    fn pwrite_bytes(&self, offset: u64, data: &[u8]) -> Result<(), DbError> {
+        use std::os::unix::fs::FileExt;
+        self.file
+            .write_all_at(data, offset)
+            .map_err(|e| classify_io(e, "pwrite"))
+    }
+
+    /// Writes a full page via `pwrite()` at the correct file offset.
+    fn pwrite_page(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
+        let offset = page_id as u64 * PAGE_SIZE as u64;
+        self.pwrite_bytes(offset, page.as_bytes())
+    }
 
     fn read_page_from_mmap(
         mmap: &MmapMut,
@@ -283,6 +306,14 @@ impl MmapStorage {
         Ok(())
     }
 
+    /// Writes the freelist bitmap to page 1 via `pwrite()`.
+    fn pwrite_freelist(&self) -> Result<(), DbError> {
+        let mut bitmap_page = Page::new(PageType::Free, 1);
+        self.freelist.to_bytes(bitmap_page.body_mut());
+        bitmap_page.update_checksum();
+        self.pwrite_page(1, &bitmap_page)
+    }
+
     fn parse_file_meta(page: &Page) -> &DbFileMeta {
         // SAFETY: body has PAGE_SIZE-HEADER_SIZE bytes = size_of::<DbFileMeta>()
         // (const assert). Page is align(64), body[0] is at offset 64 → align 64.
@@ -325,11 +356,15 @@ impl MmapStorage {
         ])
     }
 
-    /// Updates page_count and the CRC32c of the meta page directly in the mmap.
+    /// Updates page_count and the CRC32c of the meta page via pwrite.
     fn update_page_count_in_mmap(&mut self, count: u64) {
-        self.mmap[PAGE_COUNT_OFFSET..PAGE_COUNT_OFFSET + 8].copy_from_slice(&count.to_le_bytes());
-        let checksum = crc32c::crc32c(&self.mmap[HEADER_SIZE..PAGE_SIZE]);
-        self.mmap[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
+        // Read current meta page, update page_count, recompute checksum, pwrite back.
+        let mut bytes = [0u8; PAGE_SIZE];
+        bytes.copy_from_slice(&self.mmap[0..PAGE_SIZE]);
+        bytes[PAGE_COUNT_OFFSET..PAGE_COUNT_OFFSET + 8].copy_from_slice(&count.to_le_bytes());
+        let checksum = crc32c::crc32c(&bytes[HEADER_SIZE..PAGE_SIZE]);
+        bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
+        let _ = self.pwrite_bytes(0, &bytes);
     }
 }
 
@@ -373,8 +408,7 @@ impl StorageEngine for MmapStorage {
                 }
             }
         }
-        let offset = page_id as usize * PAGE_SIZE;
-        self.mmap[offset..offset + PAGE_SIZE].copy_from_slice(page.as_bytes());
+        self.pwrite_page(page_id, page)?;
         self.dirty.mark(page_id);
         Ok(())
     }
@@ -383,8 +417,7 @@ impl StorageEngine for MmapStorage {
         // Try to allocate from the current freelist.
         if let Some(page_id) = self.freelist.alloc() {
             let new_page = Page::new(page_type, page_id);
-            let offset = page_id as usize * PAGE_SIZE;
-            self.mmap[offset..offset + PAGE_SIZE].copy_from_slice(new_page.as_bytes());
+            self.pwrite_page(page_id, &new_page)?;
             self.freelist_dirty = true;
             self.dirty.mark(page_id);
             return Ok(page_id);
@@ -397,8 +430,7 @@ impl StorageEngine for MmapStorage {
         debug_assert_eq!(page_id, first_new);
 
         let new_page = Page::new(page_type, page_id);
-        let offset = page_id as usize * PAGE_SIZE;
-        self.mmap[offset..offset + PAGE_SIZE].copy_from_slice(new_page.as_bytes());
+        self.pwrite_page(page_id, &new_page)?;
         self.freelist_dirty = true;
         self.dirty.mark(page_id);
         Ok(page_id)
@@ -416,36 +448,20 @@ impl StorageEngine for MmapStorage {
     }
 
     fn flush(&mut self) -> Result<(), DbError> {
-        // Serialize the freelist into the mmap if modified.
-        // Do NOT clear freelist_dirty here — it is cleared only after the flush
-        // succeeds so that a failure leaves dirty state fully intact.
+        // Serialize the freelist via pwrite if modified.
         if self.freelist_dirty {
-            Self::write_freelist_to_mmap(&mut self.mmap, &self.freelist)?;
+            self.pwrite_freelist()?;
         }
 
-        // Build the effective set of page IDs to flush.
-        let mut page_ids = self.dirty.sorted_ids();
-        if self.freelist_dirty {
-            // Page 1 (freelist bitmap) must be flushed; insert it if absent.
-            let pos = page_ids.partition_point(|&id| id < 1);
-            if page_ids.get(pos) != Some(&1) {
-                page_ids.insert(pos, 1);
-            }
-        }
+        // fsync the file descriptor to ensure all pwrite() data is durable.
+        // This replaces the old mmap.flush_range() approach.
+        // fsync is correct for pwrite: it forces the kernel to flush the
+        // file's page cache to disk. All production DBs use this pattern.
+        self.file
+            .sync_all()
+            .map_err(|e| classify_io(e, "storage fsync"))?;
 
-        if !page_ids.is_empty() {
-            // Coalesce page IDs into contiguous runs, then convert to byte ranges.
-            let byte_runs: Vec<(usize, usize)> = coalesce_page_ids(&page_ids)
-                .into_iter()
-                .map(|(start, len)| (start as usize * PAGE_SIZE, len as usize * PAGE_SIZE))
-                .collect();
-
-            // Flush only those ranges. On any failure the dirty state is preserved.
-            Self::flush_runs(&byte_runs, |off, len| self.mmap.flush_range(off, len))
-                .map_err(|e| classify_io(e, "storage flush"))?;
-        }
-
-        // All targeted flushes succeeded — clear dirty tracking.
+        // All writes are durable — clear dirty tracking.
         self.freelist_dirty = false;
         self.dirty.clear();
         Ok(())
