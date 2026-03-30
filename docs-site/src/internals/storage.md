@@ -104,15 +104,20 @@ copying a buffer pool page into backend-local memory.
 
 `write_page(page_id, page)` calls `pwrite()` on the underlying file descriptor at
 offset `page_id * 16384`. The mmap (MAP_SHARED) automatically reflects the change
-on subsequent reads. `pwrite()` of a 16 KB aligned page is atomic on all modern
-journaling filesystems (ext4, XFS, APFS, ZFS), eliminating torn pages for concurrent
-readers.
+on subsequent reads. Note that a 16 KB `pwrite()` is **not** crash-atomic on 4 KB-block
+filesystems — the [Doublewrite Buffer](#doublewrite-buffer) protects against torn pages.
 
-### Flush: fsync on file descriptor
+### Flush: doublewrite + fsync
 
-`flush()` calls `file.sync_all()` (which maps to `fsync()`) on the file descriptor.
-This ensures all `pwrite()` data is durable. No `msync` is needed since writes do not
-go through the mmap.
+`flush()` follows a two-phase write protocol:
+
+1. **Doublewrite phase:** all dirty pages (plus pages 0 and 1) are serialized to a
+   `.dw` file and fsynced. This creates a durable copy of the committed state.
+2. **Main fsync:** the freelist is pwritten (if modified) and the main `.db` file is
+   fsynced. If this fsync is interrupted by a crash, the `.dw` file provides repair
+   data on the next startup.
+3. **Cleanup:** the `.dw` file is deleted. If deletion fails, the next `open()` finds
+   all pages valid and removes it.
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
@@ -121,10 +126,10 @@ go through the mmap.
 No production database uses mmap for writes. PostgreSQL uses pwrite + buffer pool,
 InnoDB uses pwrite + doublewrite buffer, DuckDB uses pwrite exclusively, and SQLite
 uses mmap for reads + pwrite for writes. AxiomDB follows the SQLite model: mmap gives
-zero-copy reads from the OS page cache, while pwrite provides coherent page writes visible through the mmap. Note that a
-16 KB pwrite is NOT crash-atomic on 4 KB-block filesystems (ext4, APFS, XFS) — a
-crash mid-write leaves a torn page. AxiomDB detects torn pages via CRC32c checksums
-on recovery; full WAL page-image redo (3.8c) will provide the repair path.
+zero-copy reads from the OS page cache, while pwrite provides coherent page writes
+visible through the mmap. A 16 KB pwrite is NOT crash-atomic on 4 KB-block filesystems
+(ext4, APFS, XFS) — a crash mid-write leaves a torn page. AxiomDB detects torn pages
+via CRC32c checksums and repairs them from the doublewrite buffer on startup.
 </div>
 </div>
 
@@ -169,6 +174,90 @@ PostgreSQL uses buffer pins to prevent eviction while a backend reads a page. Du
 uses block reference counts. AxiomDB's deferred free queue achieves the same safety
 with less complexity: freed pages are quarantined until all concurrent readers that
 could reference them have completed.
+</div>
+</div>
+
+---
+
+## Doublewrite Buffer
+
+A 16 KB `pwrite()` is **not** crash-atomic on any modern filesystem with 4 KB
+internal blocks (APFS, ext4, XFS, ZFS). A power failure mid-write leaves a **torn
+page**: the first N×4 KB contain new data, the remainder holds the previous state.
+CRC32c detects this corruption on startup, but without a repair source the database
+cannot open.
+
+The **doublewrite (DW) buffer** solves this. Before every `flush()`, all dirty pages
+are serialized to a `.dw` file alongside the main `.db` file:
+
+```text
+database.db      ← main data file
+database.db.dw   ← doublewrite buffer (transient, exists only during flush)
+```
+
+### DW File Format
+
+```text
+[Header: 16 bytes]
+  magic:       "AXMDBLWR"  (8 bytes)
+  version:     u32 LE = 1
+  slot_count:  u32 LE
+
+[Slots: slot_count × 16,392 bytes each]
+  page_id:     u64 LE
+  page_data:   [u8; 16384]
+
+[Footer: 8 bytes]
+  file_crc:    CRC32c(header || all slots)
+  sentinel:    0xDEAD_BEEF
+```
+
+### Flush Protocol
+
+```text
+1. Collect dirty pages + pages 0 and 1 from the mmap
+2. Write all to .dw file → single sequential write
+3. fsync .dw file                    ← committed copy durable
+4. pwrite freelist to main file
+5. fsync main file                   ← main data durable
+6. Delete .dw file                   ← cleanup (non-fatal on failure)
+```
+
+### Startup Recovery
+
+On `MmapStorage::open()`, if a `.dw` file exists:
+
+1. Validate the DW file (magic, version, size, CRC, sentinel)
+2. For each slot: read the corresponding page from the main file
+3. If CRC is invalid (torn page) → restore from DW copy
+4. fsync the main file → repairs durable
+5. Delete the `.dw` file
+
+Recovery is **idempotent**: if interrupted, the DW file is still valid and the next
+startup reruns recovery. Pages already repaired have valid CRCs and are skipped.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Separate DW File (MySQL 8.0.20+ Model)</span>
+InnoDB originally embedded the doublewrite buffer inside the system tablespace (2 × 64
+pages = 2 MB). MySQL 8.0.20 moved it to a separate <code>#ib_*.dblwr</code> file for
+better sequential I/O and zero impact on the tablespace format. AxiomDB follows this
+newer approach: the DW file is sequential-write-only, does not change the main file
+format, and requires no migration for existing databases.
+</div>
+</div>
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Orthogonal to WAL — Protects All Pages</span>
+PostgreSQL's full-page writes (FPW) only protect WAL-logged pages and inflate the WAL
+by up to 16 KB per page per checkpoint cycle. AxiomDB's doublewrite buffer protects
+<strong>all</strong> pages — data, index, meta, and freelist — without changing the WAL
+format or increasing WAL size. The extra cost is one additional fsync per flush plus 2×
+write amplification for dirty pages, the same trade-off InnoDB has made since its
+inception.
 </div>
 </div>
 
