@@ -444,15 +444,19 @@ impl BTree {
     /// Never allocates or frees pages. Returns `pid` unchanged so callers
     /// can propagate `InsertResult::Ok(pid)` / `DeleteResult::Deleted { new_pid: pid }`.
     #[inline]
+    /// Persists a leaf node back to the **same** page `pid`.
+    ///
+    /// Reads the existing page, overwrites the body, writes back — avoids
+    /// allocating a 16KB zeroed `Page::new` + 16KB struct copy.
     fn write_leaf_same_pid(
         storage: &mut dyn StorageEngine,
         pid: u64,
         node: LeafNodePage,
     ) -> Result<u64, DbError> {
-        let mut p = Page::new(PageType::Index, pid);
-        *cast_leaf_mut(&mut p) = node;
-        p.update_checksum();
-        storage.write_page(pid, &p)?;
+        let mut page = storage.read_page(pid)?.into_page();
+        *cast_leaf_mut(&mut page) = node;
+        page.update_checksum();
+        storage.write_page(pid, &page)?;
         Ok(pid)
     }
 
@@ -460,6 +464,10 @@ impl BTree {
     ///
     /// Never allocates or frees pages. Returns `pid` unchanged.
     #[inline]
+    /// Persists an internal node back to the **same** page `pid`.
+    ///
+    /// Reads the existing page, overwrites the body, writes back — avoids
+    /// allocating a 16KB zeroed `Page::new` + 16KB struct copy.
     fn write_internal_same_pid(
         storage: &mut dyn StorageEngine,
         pid: u64,
@@ -467,10 +475,10 @@ impl BTree {
     ) -> Result<u64, DbError> {
         #[cfg(debug_assertions)]
         node.validate();
-        let mut p = Page::new(PageType::Index, pid);
-        *cast_internal_mut(&mut p) = node;
-        p.update_checksum();
-        storage.write_page(pid, &p)?;
+        let mut page = storage.read_page(pid)?.into_page();
+        *cast_internal_mut(&mut page) = node;
+        page.update_checksum();
+        storage.write_page(pid, &page)?;
         Ok(pid)
     }
 
