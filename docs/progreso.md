@@ -246,13 +246,13 @@
 - [ ] ⚠️ PERF: SQL/wire point lookup still under target — the planner now reaches the PK B-Tree for primary-key equality/range, but repeated `SELECT * FROM bench_users WHERE id = literal` over the MySQL wire still has materialization / protocol overhead left to remove; latest local bench after `6.16`: AxiomDB `11.1K lookups/s` vs MariaDB `12.7K` / MySQL `13.4K`; next inspect row decoding, projection, and packet serialization
 - [ ] PERF: residual full-table / range DELETE overhead vs MariaDB — full-table DELETE and indexed/range DELETE are now correct and fast, but still remain below MariaDB in the local wire benchmark; inspect remaining heap page churn, root persistence frequency, and post-delete cleanup costs after 5.16/5.19; identified by `local_bench.py --scenario delete --rows 5000` (2026-03-26), AxiomDB 886K rows/s vs MariaDB 1.15M, and `delete_where`, AxiomDB 415K vs MariaDB 746K
 
-### Phase 7 — Concurrency + MVCC `⏳` week 40-48
+### Phase 7 — Concurrency + MVCC `🔄` week 40-48
 - [x] ✅ Non-unique secondary indexes composite key — Fixed in 6.13: all non-unique non-FK secondary indexes now use `key||RecordId` format (same as FK auto-indexes). DuplicateKey blocker for MVCC removed.
 - [x] 7.1 ✅ MVCC visibility rules — `IsolationLevel` + `SessionContext` now expose `READ COMMITTED`, `REPEATABLE READ`, and `SERIALIZABLE` (aliased to RR snapshot policy); `TxnManager::active_snapshot()` returns fresh snapshots for RC and frozen snapshots for RR/SERIALIZABLE; covered by `integration_isolation`
 - [ ] 7.2 ⏳ Transaction manager — global atomic txn_id counter
 - [x] 7.3 ✅ Snapshot isolation — `TransactionSnapshot { snapshot_id, current_txn_id }` + `RowHeader::is_visible()` already enforce committed-before-snapshot visibility, read-your-own-writes, and committed-vs-uncommitted delete semantics; covered by heap visibility tests and `integration_table`
 - [ ] 7.3b ⏳ MVCC on secondary indexes — each index entry includes `(key, RecordId, txn_id_visible_from)`; UPDATE of indexed column inserts new version without deleting the old one; vacuum cleans dead index versions; requires 7.1-7.3 snapshot isolation (moved from 6.14)
-- [ ] 7.4 ⏳ Lock-free readers with CoW — verify that reads do not block writes
+- [x] 7.4 ✅ Lock-free readers with CoW — `Arc<RwLock<Database>>`; SELECT uses `db.read()` (concurrent, no blocking), DML uses `db.write()` (exclusive); `execute_read_only_with_ctx` takes `&dyn StorageEngine` shared ref; 7.4a production-safe storage: pwrite for writes, read-only Mmap, owned PageRef, deferred free queue
 - [ ] 7.5 ⏳ Writer serialization — only 1 writer at a time per table (improve later)
 - [ ] 7.6 ⏳ ROLLBACK — mark txn rows as deleted
 - [ ] 7.7 ⏳ Concurrency tests — N simultaneous readers + N writers

@@ -300,7 +300,7 @@ impl MmapStorage {
 
     /// Writes a full page via `pwrite()` at the correct file offset.
     fn pwrite_page(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
-        let offset = page_id as u64 * PAGE_SIZE as u64;
+        let offset = page_id * PAGE_SIZE as u64;
         self.pwrite_bytes(offset, page.as_bytes())
     }
 
@@ -360,6 +360,7 @@ impl MmapStorage {
     ///
     /// Returns on the first error without calling the remaining entries.
     /// This makes the failure path testable: pass an injected flusher in tests.
+    #[cfg(test)]
     fn flush_runs<F>(runs: &[(usize, usize)], mut flusher: F) -> std::io::Result<()>
     where
         F: FnMut(usize, usize) -> std::io::Result<()>,

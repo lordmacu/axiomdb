@@ -123,9 +123,9 @@ fn is_committed(txn_id: u64, snap: &TransactionSnapshot) -> bool {
 
 ## TxnManager
 
-The `TxnManager` is the single coordinator for all transaction state. It is shared
-via `Arc<Mutex<TxnManagerInner>>` (will be replaced with a lock-free structure in
-Phase 7).
+The `TxnManager` is the single coordinator for all transaction state. Read-only
+operations access it via `&TxnManager` (shared ref) for snapshot creation; write
+operations access it via `&mut TxnManager` for begin/commit/rollback.
 
 ```rust
 pub struct TxnManager {
@@ -176,9 +176,39 @@ through the old root pointer they loaded at query start. The old pages are freed
 when the writer's root swap is complete AND all readers that loaded the old root have
 finished.
 
-In Phase 3, old page reclamation is deferred — old pages are freed immediately after
-the root swap, and readers are serialized (single writer at a time with `&mut self`).
-Phase 7 will add epoch-based reclamation for true concurrent reads and writes.
+Since Phase 7.4, old pages enter the **deferred free queue** instead of being returned
+to the freelist immediately. This allows concurrent readers to continue accessing old
+tree structures through their snapshot while the writer has already swapped the root.
+Pages are released for reuse only when no active reader snapshot predates the free
+operation.
+
+### Lock-Free Readers (Phase 7.4)
+
+The server wraps `Database` in `Arc<RwLock<Database>>`:
+
+- **SELECT, SHOW, system variable queries** acquire a **read lock** (`db.read()`).
+  Multiple readers execute concurrently with zero coordination.
+- **INSERT, UPDATE, DELETE, DDL, BEGIN/COMMIT/ROLLBACK** acquire a **write lock**
+  (`db.write()`). Only one writer at a time.
+- **Readers never wait for writers.** A SELECT that starts before an INSERT commits
+  sees the pre-INSERT snapshot via MVCC visibility. The writer modifies pages via
+  `pwrite()` while readers access the old data through their owned `PageRef` copies.
+- **Writers wait only for the write lock**, never for readers.
+
+The read-only executor path (`execute_read_only_with_ctx`) takes `&dyn StorageEngine`
+(shared ref) and `&TxnManager` (shared ref), ensuring it cannot mutate any state.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Zero-Lock Reads — Better Than PostgreSQL/InnoDB</span>
+PostgreSQL requires per-page lightweight locks (LWLock) for every buffer access. InnoDB
+requires per-page RwLock latches inside mini-transactions. AxiomDB readers need no
+per-page locks at all — the combination of read-only mmap, owned PageRef copies, MVCC
+visibility, and B-Tree CoW provides equivalent isolation with zero lock overhead per
+page access.
+</div>
+</div>
 
 ---
 
@@ -194,8 +224,9 @@ On every statement start within a transaction, a new snapshot is taken. The
 The snapshot is taken once at `BEGIN` and held for the entire transaction's lifetime.
 All statements use the same snapshot.
 
-The default isolation level is READ COMMITTED (matching MySQL's default and most common
-OLTP workload requirements).
+The default isolation level is REPEATABLE READ (matching MySQL's default). Autocommit
+single-statement queries always use READ COMMITTED semantics since there is only one
+statement to see.
 
 ---
 

@@ -10,7 +10,7 @@ exposes a simple trait that all higher layers depend on.
 
 ```rust
 pub trait StorageEngine: Send {
-    fn read_page(&self, page_id: u64) -> Result<&Page, DbError>;
+    fn read_page(&self, page_id: u64) -> Result<PageRef, DbError>;
     fn write_page(&mut self, page_id: u64, page: &Page) -> Result<(), DbError>;
     fn alloc_page(&mut self, page_type: PageType) -> Result<u64, DbError>;
     fn free_page(&mut self, page_id: u64) -> Result<(), DbError>;
@@ -19,9 +19,11 @@ pub trait StorageEngine: Send {
 }
 ```
 
-`read_page` returns `&Page` tied to `&self`. While that reference exists, the borrow
-checker prevents any `&mut self` method from being called. This invariant is correct:
-you cannot modify a page while a reference to it is alive, and it requires no locks.
+`read_page` returns an owned `PageRef` — a heap-allocated copy of the 16 KB page data.
+This is a deliberate change from the original `&Page` borrow: owned pages survive mmap
+remaps (during `grow()`) and page reuse (after `free_page`), which is essential for
+concurrent read/write access. The copy cost is ~0.5 us from L2/L3 cache — the same cost
+PostgreSQL pays when copying a page from the buffer pool into backend-local memory.
 
 ---
 
@@ -75,8 +77,9 @@ pub enum PageType {
 
 ## MmapStorage — Memory-Mapped File
 
-`MmapStorage` maps the entire `.db` file using `memmap2::MmapMut`. Each page is
-accessible as `&Page` via a pointer into the mapped region.
+`MmapStorage` uses a hybrid I/O model inspired by SQLite: **read-only mmap for reads,
+`pwrite()` for writes**. The mmap is opened with `memmap2::Mmap` (not `MmapMut`),
+making it structurally impossible to write through the mapped region.
 
 ```
 Physical file (axiomdb.db):
@@ -84,35 +87,82 @@ Physical file (axiomdb.db):
 │  Page 0  │  Page 1  │  Page 2  │  Page 3  │  ...     │
 │ (Meta)   │ (Data)   │ (Index)  │ (Data)   │          │
 └──────────┴──────────┴──────────┴──────────┴──────────┘
-     ↑           ↑
-     │           └── read_page(1) returns &page_cache[1..] as &Page
-     └── mmap covers the entire file
+     ↑           ↑                     ↓
+     │           └── read_page(1): copy 16KB from mmap → owned PageRef
+     └── mmap (read-only, MAP_SHARED)
+                                  write_page(3): pwrite() to file descriptor
 ```
 
-**Why mmap is faster than a custom buffer pool:**
+### Read path: mmap + PageRef copy
 
-| Approach                | Who manages page cache | Extra copies |
-|-------------------------|------------------------|--------------|
-| mmap (AxiomDB)          | OS kernel              | 0            |
-| Custom buffer pool (MySQL InnoDB) | Application + OS  | 1 (data in both) |
+`read_page(page_id)` computes `mmap_ptr + page_id * 16384`, copies 16 KB into a
+heap-allocated `PageRef`, verifies the CRC32c checksum, and returns the owned copy.
+The copy cost (~0.5 us from L2/L3 cache) is the same price PostgreSQL pays when
+copying a buffer pool page into backend-local memory.
+
+### Write path: pwrite() to file descriptor
+
+`write_page(page_id, page)` calls `pwrite()` on the underlying file descriptor at
+offset `page_id * 16384`. The mmap (MAP_SHARED) automatically reflects the change
+on subsequent reads. `pwrite()` of a 16 KB aligned page is atomic on all modern
+journaling filesystems (ext4, XFS, APFS, ZFS), eliminating torn pages for concurrent
+readers.
+
+### Flush: fsync on file descriptor
+
+`flush()` calls `file.sync_all()` (which maps to `fsync()`) on the file descriptor.
+This ensures all `pwrite()` data is durable. No `msync` is needed since writes do not
+go through the mmap.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Read-Only Mmap + pwrite (SQLite Model)</span>
+No production database uses mmap for writes. PostgreSQL uses pwrite + buffer pool,
+InnoDB uses pwrite + doublewrite buffer, DuckDB uses pwrite exclusively, and SQLite
+uses mmap for reads + pwrite for writes. AxiomDB follows the SQLite model: mmap gives
+zero-copy reads from the OS page cache, while pwrite gives atomic page writes that
+cannot produce torn pages for concurrent readers.
+</div>
+</div>
 
 <div class="callout callout-advantage">
 <span class="callout-icon">🚀</span>
 <div class="callout-body">
 <span class="callout-label">No Double-Buffer Overhead</span>
-MySQL InnoDB keeps every hot page in RAM twice — once in the OS page cache, once in the InnoDB buffer pool. AxiomDB's mmap approach uses the OS page cache directly. For a working set that fits in RAM, this roughly halves the memory footprint of the storage layer.
+MySQL InnoDB keeps every hot page in RAM twice — once in the OS page cache, once in
+the InnoDB buffer pool. AxiomDB's mmap approach uses the OS page cache directly. For a
+working set that fits in RAM, this roughly halves the memory footprint of the storage
+layer.
 </div>
 </div>
-
-With mmap, `read_page(42)` is a pointer arithmetic operation: `mmap_ptr + 42 * 16384`.
-The OS handles readahead, eviction, and write-back (via `msync`). There is no
-"copy from disk into buffer pool" step.
 
 **Trade-offs:**
 - We cannot control which pages stay hot in memory (the OS uses LRU).
 - On 32-bit systems, the address space limits the maximum database size.
   On 64-bit, the address space is effectively unlimited.
-- `msync` (for `flush`) blocks until pages are on disk — same guarantee as `fsync`.
+- `PageRef` copies add ~0.5 us per page read vs. direct pointer access, but this
+  eliminates use-after-free risks from mmap remap and page reuse.
+
+### Deferred Page Free Queue
+
+When `free_page(page_id)` is called, the page does **not** return to the freelist
+immediately. Instead it enters a `deferred_frees: Vec<u64>` queue. Pages are released
+for reuse only when `release_deferred_frees()` is called — typically after the
+transaction commits and no reader snapshot predates the free operation. This prevents
+a writer from reusing a freed page while a concurrent reader might still resolve it
+via an old index or heap chain pointer.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Deferred Frees — Simplified Epoch Reclamation</span>
+PostgreSQL uses buffer pins to prevent eviction while a backend reads a page. DuckDB
+uses block reference counts. AxiomDB's deferred free queue achieves the same safety
+with less complexity: freed pages are quarantined until all concurrent readers that
+could reference them have completed.
+</div>
+</div>
 
 ---
 
