@@ -74,6 +74,17 @@ pub struct MmapStorage {
     freelist_dirty: bool,
     /// Tracks pages written since the last flush. Cleared on `flush()`.
     dirty: PageDirtyTracker,
+    /// Pages that have been freed but are not yet safe to reuse (Phase 7.4a).
+    ///
+    /// When `free_page` is called, the page_id goes here instead of the freelist.
+    /// Pages are released to the freelist only when `release_deferred_frees` is
+    /// called (typically after all readers with old snapshots have finished).
+    ///
+    /// This prevents a writer from reusing a freed page while a concurrent
+    /// reader might still resolve it via an old B-Tree root or heap chain.
+    /// With `PageRef` (owned copies), the primary risk is already mitigated,
+    /// but deferred frees add defense-in-depth for Phase 7.4 concurrent readers.
+    deferred_frees: Vec<u64>,
 }
 
 impl Drop for MmapStorage {
@@ -148,6 +159,7 @@ impl MmapStorage {
             freelist,
             freelist_dirty: false,
             dirty: PageDirtyTracker::new(),
+            deferred_frees: Vec::new(),
         })
     }
 
@@ -217,6 +229,7 @@ impl MmapStorage {
             freelist,
             freelist_dirty: false,
             dirty: PageDirtyTracker::new(),
+            deferred_frees: Vec::new(),
         })
     }
 
@@ -245,6 +258,25 @@ impl MmapStorage {
         self.pwrite_freelist()?;
 
         Ok(old_count)
+    }
+
+    /// Releases all deferred-free pages back to the freelist.
+    ///
+    /// Call this when it is safe to reuse freed pages — i.e., when no reader
+    /// holds a snapshot older than the moment the pages were freed.
+    ///
+    /// In single-writer mode (current), this is safe to call after each commit.
+    /// In concurrent-reader mode (Phase 7.4), this should be gated on
+    /// `min_active_snapshot > freed_at_snapshot` (epoch-based reclamation).
+    pub fn release_deferred_frees(&mut self) -> Result<(), DbError> {
+        if self.deferred_frees.is_empty() {
+            return Ok(());
+        }
+        for page_id in self.deferred_frees.drain(..) {
+            self.freelist.free(page_id)?;
+        }
+        self.freelist_dirty = true;
+        Ok(())
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -445,12 +477,31 @@ impl StorageEngine for MmapStorage {
                 "cannot free reserved page {page_id}"
             )));
         }
-        self.freelist.free(page_id)?;
-        self.freelist_dirty = true;
+        // Check for double-free: page already in deferred queue or freelist.
+        if self.deferred_frees.contains(&page_id) {
+            return Err(DbError::Other(format!(
+                "double free: page {page_id} already in deferred free queue"
+            )));
+        }
+        if self.freelist.is_free(page_id) {
+            return Err(DbError::Other(format!(
+                "double free: page {page_id} already free"
+            )));
+        }
+        // Defer the free: page goes to a holding queue instead of the
+        // freelist. This prevents a concurrent reader from seeing a
+        // freed+reallocated page with unrelated content.
+        self.deferred_frees.push(page_id);
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), DbError> {
+        // Release deferred-free pages back to the freelist.
+        // In single-writer mode this is safe at flush time because no
+        // concurrent readers exist. In Phase 7.4 (concurrent readers),
+        // this will be gated on min_active_snapshot.
+        self.release_deferred_frees()?;
+
         // Serialize the freelist via pwrite if modified.
         if self.freelist_dirty {
             self.pwrite_freelist()?;
@@ -589,6 +640,7 @@ mod tests {
         let mut storage = MmapStorage::create(&path).unwrap();
         let id = storage.alloc_page(PageType::Data).unwrap();
         storage.free_page(id).unwrap();
+        storage.flush().unwrap(); // release deferred frees
         let id2 = storage.alloc_page(PageType::Data).unwrap();
         assert_eq!(id, id2);
     }

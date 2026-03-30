@@ -132,12 +132,13 @@ fn run_equivalence_test(engine: &mut dyn StorageEngine) {
     write_pattern(engine, id2, 0xDD);
     assert_pattern(engine, id2, 0xDD);
 
-    // free + realloc reuses.
+    // free + flush (releases deferred frees) + realloc reuses.
     engine.free_page(id1).expect("free");
+    engine.flush().expect("flush deferred frees");
     let id_reused = engine.alloc_page(PageType::Data).expect("realloc");
     assert_eq!(id_reused, id1);
 
-    // double-free: free id2 (still in use) and then free it again.
+    // double-free: free id2 and then free it again — should fail.
     engine.free_page(id2).expect("first free of id2");
     assert!(
         engine.free_page(id2).is_err(),
