@@ -2,12 +2,13 @@ fn execute_create_table(
     stmt: CreateTableStmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    database: &str,
 ) -> Result<QueryResult, DbError> {
     let schema = stmt.table.schema.as_deref().unwrap_or("public");
 
     // Check existence before constructing CatalogWriter (avoids double mutable borrow).
     {
-        let mut resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver_with_database(storage, txn, database)?;
         if resolver.table_exists(Some(schema), &stmt.table.name)? {
             if stmt.if_not_exists {
                 return Ok(QueryResult::Empty);
@@ -21,6 +22,9 @@ fn execute_create_table(
 
     let mut writer = CatalogWriter::new(storage, txn)?;
     let table_id = writer.create_table(schema, &stmt.table.name)?;
+    if database != DEFAULT_DATABASE_NAME {
+        writer.bind_table_to_database(table_id, database)?;
+    }
 
     // Collect inline REFERENCES constraints for processing after all columns are created.
     // We must create all columns first so col_idx values are stable.
@@ -188,12 +192,13 @@ fn execute_create_table(
     for (child_col_idx, child_col_name, (ref_table, ref_col, on_delete, on_update)) in
         inline_fk_specs
     {
-        persist_fk_constraint(
-            table_id,
-            &stmt.table.name,
-            child_col_idx,
-            &child_col_name,
-            &ref_table,
+            persist_fk_constraint(
+                table_id,
+                &stmt.table.name,
+                database,
+                child_col_idx,
+                &child_col_name,
+                &ref_table,
             ref_col.as_deref(),
             ast_fk_action_to_catalog(on_delete),
             ast_fk_action_to_catalog(on_update),
@@ -237,6 +242,7 @@ fn execute_create_table(
             persist_fk_constraint(
                 table_id,
                 &stmt.table.name,
+                database,
                 child_col_idx,
                 child_col_name,
                 ref_table,
@@ -284,6 +290,7 @@ fn ast_fk_action_to_catalog(action: crate::ast::ForeignKeyAction) -> axiomdb_cat
 fn persist_fk_constraint(
     child_table_id: u32,
     child_table_name: &str,
+    database: &str,
     child_col_idx: u16,
     child_col_name: &str,
     ref_table: &str,
@@ -302,7 +309,7 @@ fn persist_fk_constraint(
     let parent_def = {
         let mut reader = CatalogReader::new(storage, snap)?;
         reader
-            .get_table("public", ref_table)?
+            .get_table_in_database(database, "public", ref_table)?
             .ok_or_else(|| DbError::TableNotFound {
                 name: ref_table.to_string(),
             })?
@@ -483,6 +490,7 @@ fn execute_drop_table(
     stmt: DropTableStmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    database: &str,
 ) -> Result<QueryResult, DbError> {
     for table_ref in stmt.tables {
         let schema = table_ref.schema.as_deref().unwrap_or("public");
@@ -490,7 +498,7 @@ fn execute_drop_table(
 
         let table_id = {
             let mut reader = CatalogReader::new(storage, snap)?;
-            match reader.get_table(schema, &table_ref.name)? {
+            match reader.get_table_in_database(database, schema, &table_ref.name)? {
                 Some(def) => def.id,
                 None if stmt.if_exists => continue,
                 None => {
@@ -501,10 +509,47 @@ fn execute_drop_table(
             }
         }; // reader dropped — immutable borrow released
 
-        CatalogWriter::new(storage, txn)?.delete_table(table_id)?;
+        drop_table_fully(storage, txn, table_id)?;
     }
 
     Ok(QueryResult::Empty)
+}
+
+fn drop_table_fully(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_id: u32,
+) -> Result<(), DbError> {
+    use std::collections::HashSet;
+
+    let snap = txn.active_snapshot()?;
+    let (constraints, child_fks, parent_fks) = {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        (
+            reader.list_constraints(table_id)?,
+            reader.list_fk_constraints(table_id)?,
+            reader.list_fk_constraints_referencing(table_id)?,
+        )
+    };
+
+    let mut seen_fk_ids = HashSet::new();
+    let mut noop_bloom = crate::bloom::BloomRegistry::new();
+    for fk in child_fks.into_iter().chain(parent_fks.into_iter()) {
+        if !seen_fk_ids.insert(fk.fk_id) {
+            continue;
+        }
+        CatalogWriter::new(storage, txn)?.drop_foreign_key(fk.fk_id)?;
+        if fk.fk_index_id != 0 {
+            let _ = execute_drop_index_by_id(fk.fk_index_id, storage, txn, &mut noop_bloom);
+        }
+    }
+
+    for constraint in constraints {
+        CatalogWriter::new(storage, txn)?.drop_constraint(constraint.constraint_id)?;
+    }
+    CatalogWriter::new(storage, txn)?.delete_stats_for_table(table_id)?;
+    CatalogWriter::new(storage, txn)?.delete_table(table_id)?;
+    Ok(())
 }
 
 // ── CREATE INDEX ──────────────────────────────────────────────────────────────
@@ -571,6 +616,7 @@ fn execute_create_index(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
     bloom: &mut crate::bloom::BloomRegistry,
+    database: &str,
 ) -> Result<QueryResult, DbError> {
     use crate::key_encoding::{encode_index_key, MAX_INDEX_KEY};
     use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
@@ -581,7 +627,7 @@ fn execute_create_index(
 
     // 1. Resolve table definition + column list.
     let (table_def, col_defs) = {
-        let mut resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver_with_database(storage, txn, database)?;
         let resolved = resolver.resolve_table(Some(schema), &stmt.table.name)?;
         (resolved.def.clone(), resolved.columns.clone())
     };
@@ -770,6 +816,7 @@ fn execute_drop_index(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
     bloom: &mut crate::bloom::BloomRegistry,
+    database: &str,
 ) -> Result<QueryResult, DbError> {
     let snap = txn.active_snapshot()?;
 
@@ -784,7 +831,7 @@ fn execute_drop_index(
     // Capture both index_id and root_page_id for catalog deletion + B-Tree page reclamation.
     let (index_id, root_page_id) = {
         let mut reader = CatalogReader::new(storage, snap)?;
-        let table_def = match reader.get_table(schema, &table_ref.name)? {
+        let table_def = match reader.get_table_in_database(database, schema, &table_ref.name)? {
             Some(d) => d,
             None if stmt.if_exists => return Ok(QueryResult::Empty),
             None => {
@@ -873,6 +920,7 @@ fn execute_analyze(
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     let schema = "public";
+    let database = ctx.effective_database().to_string();
     let snap = txn.active_snapshot()?;
 
     // Collect target tables.
@@ -882,7 +930,7 @@ fn execute_analyze(
         // ANALYZE without TABLE — all tables in schema.
         let mut reader = CatalogReader::new(storage, snap)?;
         reader
-            .list_tables(schema)?
+            .list_tables_in_database(&database, schema)?
             .into_iter()
             .map(|t| t.table_name)
             .collect()
@@ -890,7 +938,7 @@ fn execute_analyze(
 
     for table_name in target_tables {
         let resolved = {
-            let mut resolver = make_resolver(storage, txn)?;
+            let mut resolver = make_resolver_with_database(storage, txn, &database)?;
             match resolver.resolve_table(Some(schema), &table_name) {
                 Ok(r) => r,
                 Err(_) => continue, // table may not exist — skip
@@ -934,7 +982,7 @@ fn execute_analyze(
         // Clear staleness so the planner uses fresh stats immediately.
         ctx.stats.mark_fresh(resolved.def.id);
         // Invalidate schema cache so next query gets fresh resolved table.
-        ctx.invalidate_table(schema, &table_name);
+        ctx.invalidate_table(&database, schema, &table_name);
     }
 
     Ok(QueryResult::Empty)
@@ -946,9 +994,10 @@ fn execute_truncate(
     stmt: crate::ast::TruncateTableStmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    database: &str,
 ) -> Result<QueryResult, DbError> {
     let resolved = {
-        let mut resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver_with_database(storage, txn, database)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
 
@@ -997,15 +1046,131 @@ fn execute_truncate(
 
 // ── SHOW TABLES / SHOW COLUMNS / DESCRIBE (4.20) ─────────────────────────────
 
+fn execute_show_databases(
+    _stmt: ShowDatabasesStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+) -> Result<QueryResult, DbError> {
+    let snap = txn.active_snapshot()?;
+    let mut reader = CatalogReader::new(storage, snap)?;
+    let databases = reader.list_databases()?;
+    let rows: Vec<Row> = databases
+        .into_iter()
+        .map(|db| vec![Value::Text(db.name)])
+        .collect();
+    Ok(QueryResult::Rows {
+        columns: vec![ColumnMeta::computed("Database", DataType::Text)],
+        rows,
+    })
+}
+
+fn execute_use_database(
+    stmt: UseDatabaseStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let snap = txn.active_snapshot()?;
+    let mut reader = CatalogReader::new(storage, snap)?;
+    if !reader.database_exists(&stmt.name)? {
+        return Err(DbError::DatabaseNotFound { name: stmt.name });
+    }
+    ctx.set_current_database(stmt.name);
+    Ok(QueryResult::Affected {
+        count: 0,
+        last_insert_id: None,
+    })
+}
+
+fn execute_create_database(
+    stmt: CreateDatabaseStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+) -> Result<QueryResult, DbError> {
+    let snap = txn.active_snapshot()?;
+    let mut reader = CatalogReader::new(storage, snap)?;
+    if reader.database_exists(&stmt.name)? {
+        return Err(DbError::DatabaseAlreadyExists { name: stmt.name });
+    }
+    let mut writer = CatalogWriter::new(storage, txn)?;
+    writer.create_database(&stmt.name)?;
+    // Every new database gets a `public` schema.
+    writer.create_schema(&stmt.name, "public")?;
+    Ok(QueryResult::Affected {
+        count: 0,
+        last_insert_id: None,
+    })
+}
+
+fn execute_create_schema(
+    stmt: crate::ast::CreateSchemaStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    database: &str,
+) -> Result<QueryResult, DbError> {
+    let snap = txn.active_snapshot()?;
+    let mut reader = CatalogReader::new(storage, snap)?;
+    if reader.schema_exists(database, &stmt.name)? {
+        if stmt.if_not_exists {
+            return Ok(QueryResult::Empty);
+        }
+        return Err(DbError::SchemaAlreadyExists {
+            name: stmt.name,
+        });
+    }
+    CatalogWriter::new(storage, txn)?.create_schema(database, &stmt.name)?;
+    Ok(QueryResult::Affected {
+        count: 0,
+        last_insert_id: None,
+    })
+}
+
+fn execute_drop_database(
+    stmt: DropDatabaseStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    if ctx.selected_database() == Some(stmt.name.as_str()) {
+        return Err(DbError::ActiveDatabaseDrop { name: stmt.name });
+    }
+
+    let snap = txn.active_snapshot()?;
+    let tables = {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        if !reader.database_exists(&stmt.name)? {
+            if stmt.if_exists {
+                return Ok(QueryResult::Affected {
+                    count: 0,
+                    last_insert_id: None,
+                });
+            }
+            return Err(DbError::DatabaseNotFound { name: stmt.name });
+        }
+        reader.list_tables_owned_by_database(&stmt.name)?
+    };
+
+    for table in tables {
+        drop_table_fully(storage, txn, table.id)?;
+    }
+    CatalogWriter::new(storage, txn)?.drop_table_database_bindings_for_database(&stmt.name)?;
+    let _ = CatalogWriter::new(storage, txn)?.drop_database(&stmt.name)?;
+    Ok(QueryResult::Affected {
+        count: 0,
+        last_insert_id: None,
+    })
+}
+
 fn execute_show_tables(
     stmt: crate::ast::ShowTablesStmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    database: &str,
 ) -> Result<QueryResult, DbError> {
     let schema = stmt.schema.as_deref().unwrap_or("public");
     let snap = txn.active_snapshot()?;
     let mut reader = CatalogReader::new(storage, snap)?;
-    let tables = reader.list_tables(schema)?;
+    let tables = reader.list_tables_in_database(database, schema)?;
 
     let col_name = format!("Tables_in_{schema}");
     let out_cols = vec![ColumnMeta::computed(col_name, DataType::Text)];
@@ -1024,6 +1189,7 @@ fn execute_show_columns(
     stmt: crate::ast::ShowColumnsStmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    database: &str,
 ) -> Result<QueryResult, DbError> {
     let schema = stmt.table.schema.as_deref().unwrap_or("public");
     let snap = txn.active_snapshot()?;
@@ -1031,7 +1197,7 @@ fn execute_show_columns(
 
     let table_def =
         reader
-            .get_table(schema, &stmt.table.name)?
+            .get_table_in_database(database, schema, &stmt.table.name)?
             .ok_or_else(|| DbError::TableNotFound {
                 name: stmt.table.name.clone(),
             })?;
@@ -1120,12 +1286,13 @@ fn execute_alter_table(
     stmt: AlterTableStmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    database: &str,
 ) -> Result<QueryResult, DbError> {
     let schema = stmt.table.schema.as_deref().unwrap_or("public");
 
     // Resolve the table once upfront.
     let table_def = {
-        let mut resolver = make_resolver(storage, txn)?;
+        let mut resolver = make_resolver_with_database(storage, txn, database)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
     // Keep the current column list; update it as we apply operations.
@@ -1154,13 +1321,13 @@ fn execute_alter_table(
                 columns = CatalogReader::new(storage, snap2)?.list_columns(table_def.def.id)?;
             }
             AlterTableOp::RenameTable(new_name) => {
-                alter_rename_table(storage, txn, &table_def.def, &new_name, schema)?;
+                alter_rename_table(storage, txn, &table_def.def, &new_name, database, schema)?;
                 // After RENAME TABLE further operations would need the new table_def;
                 // for simplicity, only one op per statement is expected for RENAME TO.
                 break;
             }
             AlterTableOp::AddConstraint(tc) => {
-                alter_add_constraint(storage, txn, &table_def, &columns, tc, schema)?;
+                alter_add_constraint(storage, txn, &table_def, &columns, tc, database, schema)?;
             }
             AlterTableOp::DropConstraint { name, if_exists } => {
                 alter_drop_constraint(storage, txn, &table_def, &name, if_exists)?;
@@ -1346,12 +1513,13 @@ fn alter_rename_table(
     txn: &mut TxnManager,
     table_def: &axiomdb_catalog::schema::TableDef,
     new_name: &str,
+    database: &str,
     schema: &str,
 ) -> Result<(), DbError> {
     // Check new name not already in use.
     let snap = txn.active_snapshot()?;
     let mut reader = CatalogReader::new(storage, snap)?;
-    if reader.get_table(schema, new_name)?.is_some() {
+    if reader.get_table_in_database(database, schema, new_name)?.is_some() {
         return Err(DbError::TableAlreadyExists {
             schema: schema.to_string(),
             name: new_name.to_string(),
@@ -1371,6 +1539,7 @@ fn alter_add_constraint(
     table_def: &axiomdb_catalog::ResolvedTable,
     columns_arg: &[axiomdb_catalog::schema::ColumnDef],
     tc: crate::ast::TableConstraint,
+    database: &str,
     schema: &str,
 ) -> Result<(), DbError> {
     use crate::ast::TableConstraint;
@@ -1392,6 +1561,7 @@ fn alter_add_constraint(
             let stmt = crate::ast::CreateIndexStmt {
                 name: idx_name,
                 table: crate::ast::TableRef {
+                    database: None,
                     schema: Some(schema.to_string()),
                     name: table_def.def.table_name.clone(),
                     alias: None,
@@ -1410,7 +1580,7 @@ fn alter_add_constraint(
                 include_columns: vec![], // UNIQUE constraints have no included columns
             };
             let mut noop_bloom = crate::bloom::BloomRegistry::new();
-            execute_create_index(stmt, storage, txn, &mut noop_bloom)?;
+            execute_create_index(stmt, storage, txn, &mut noop_bloom, database)?;
             Ok(())
         }
 
@@ -1489,6 +1659,7 @@ fn alter_add_constraint(
             persist_fk_constraint(
                 table_def.def.id,
                 &table_def.def.table_name,
+                database,
                 child_col_idx,
                 child_col_name,
                 &ref_table,

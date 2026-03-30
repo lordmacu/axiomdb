@@ -35,6 +35,96 @@ optimizations isolated from unrelated SELECT and DDL code.
 </div>
 </div>
 
+## Integration Test Layout
+
+The executor integration coverage no longer sits in one giant test binary. The
+current `axiomdb-sql/tests/` layout is responsibility-based, mirroring the
+module split in `src/executor/`.
+
+| Binary | Main responsibility |
+|---|---|
+| `integration_executor` | CRUD base and simple transaction behavior |
+| `integration_executor_joins` | JOINs and aggregate execution |
+| `integration_executor_query` | `ORDER BY`, `LIMIT`, `DISTINCT`, `CASE`, `INSERT ... SELECT`, `AUTO_INCREMENT` |
+| `integration_executor_ddl` | `SHOW`, `DESCRIBE`, `TRUNCATE`, `ALTER TABLE` |
+| `integration_executor_ctx` | base `SessionContext` execution and `strict_mode` |
+| `integration_executor_ctx_group` | ctx-path sorted group-by |
+| `integration_executor_ctx_limit` | ctx-path `LIMIT` / `OFFSET` coercion |
+| `integration_executor_ctx_on_error` | ctx-path `on_error` behavior |
+| `integration_executor_sql` | broader SQL semantics outside the ctx path |
+| `integration_delete_apply` | bulk and indexed DELETE apply paths |
+| `integration_insert_staging` | transactional INSERT staging |
+| `integration_namespacing` | database catalog behavior: `CREATE/DROP DATABASE`, `USE`, `SHOW DATABASES` |
+| `integration_namespacing_cross_db` | explicit `database.schema.table` resolution and cross-db DML/DDL |
+| `integration_namespacing_schema` | schema namespacing, `search_path`, and schema-aware `SHOW TABLES` |
+
+Shared helpers live in `crates/axiomdb-sql/tests/common/mod.rs`.
+
+The day-to-day workflow is intentionally narrow:
+
+- start with the smallest binary that matches the code path you changed
+- add directly related binaries only when the change touches shared helpers or a nearby execution path
+- use `cargo test -p axiomdb-sql --tests` as the crate-level confidence gate, not as the default inner-loop command
+- if a new behavior belongs to an existing themed binary, add the test there instead of creating a new binary immediately
+
+```bash
+cargo test -p axiomdb-sql --test integration_executor_query
+cargo test -p axiomdb-sql --test integration_executor_query test_insert_select_aggregation -- --exact
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Smallest Relevant Test First</span>
+The test split follows the same idea as the executor source split: isolate one execution path per binary so everyday validation can run only the code that actually changed, while still keeping closely related behavior together in the same harness.
+</div>
+</div>
+
+### UPDATE Apply Fast Path (`6.20`)
+
+`6.17` fixed indexed UPDATE discovery, but the default `update_range` benchmark
+was still paying most of its cost after rows had already been found. `6.20`
+removes that apply-side overhead in four steps:
+
+1. `IndexLookup` / `IndexRange` candidates are decoded through
+   `TableEngine::read_rows_batch(...)`, which groups `RecordId`s by `page_id`
+   and restores the original RID order after each page is read once.
+2. UPDATE evaluates the new row image before touching the heap and drops rows
+   whose `new_values == old_values`.
+3. Stable-RID rewrites accumulate `(key, old_tuple_image, new_tuple_image, page_id, slot_id)`
+   and emit their normal `UpdateInPlace` WAL records through one
+   `record_update_in_place_batch(...)` call.
+4. If any index really is affected, UPDATE now does one grouped delete pass,
+   one grouped insert pass, and one final root persistence write per index.
+
+The coarse executor bailout is statement-level:
+
+```text
+if all physically changed rows keep the same RID
+   and no SET column overlaps any index key column
+   and no SET column overlaps any partial-index predicate dependency:
+    skip index maintenance for the statement
+```
+
+This is the common PK-only `UPDATE score WHERE id BETWEEN ...` case in
+`local_bench.py`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Borrowed Modified-Attrs Rule</span>
+PostgreSQL HOT, SQLite's <code>indexColumnIsBeingUpdated()</code>, and MariaDB's clustered-vs-secondary UPDATE split all ask the same question: did any index-relevant attribute actually change? `6.20` adapts that rule directly, without adding HOT chains or change buffering.
+</div>
+</div>
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage</span>
+On the release `update_range` benchmark, `6.20` raises AxiomDB from <strong>85.2K</strong> to <strong>369.9K rows/s</strong> by removing per-row heap reads, per-row no-op rewrites, and per-row `UpdateInPlace` append overhead from the default PK-only path.
+</div>
+</div>
+
 ---
 
 ## Entry Point

@@ -32,10 +32,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-use axiomdb_catalog::bootstrap::CatalogBootstrap;
+use axiomdb_catalog::{bootstrap::CatalogBootstrap, CatalogReader, DEFAULT_DATABASE_NAME};
 use axiomdb_core::error::DbError;
 use axiomdb_sql::{
-    analyze_cached,
+    analyze_cached_with_defaults,
     ast::Stmt,
     bloom::BloomRegistry,
     execute_with_ctx, parse,
@@ -43,7 +43,7 @@ use axiomdb_sql::{
     session::{is_ignorable_on_error, OnErrorMode},
     verify_and_repair_indexes_on_open, SchemaCache, SessionContext,
 };
-use axiomdb_storage::MmapStorage;
+use axiomdb_storage::{DbConfig, MmapStorage, WalDurabilityPolicy};
 use axiomdb_types::{DataType, Value};
 use axiomdb_wal::{AcquireResult, FsyncPipeline, TxnManager};
 
@@ -96,10 +96,18 @@ pub struct Database {
 }
 
 impl Database {
-    /// Opens or creates a database at `data_dir`.
+    /// Opens or creates a database at `data_dir` with default configuration.
     ///
     /// Creates the directory and initializes the catalog if not already present.
     pub fn open(data_dir: &Path) -> Result<Self, DbError> {
+        Self::open_with_config(data_dir, &DbConfig::default())
+    }
+
+    /// Opens or creates a database at `data_dir` with explicit configuration.
+    ///
+    /// The resolved `WalDurabilityPolicy` controls whether the fsync pipeline
+    /// is used (`Strict`) or bypassed (`Normal` / `Off`).
+    pub fn open_with_config(data_dir: &Path, config: &DbConfig) -> Result<Self, DbError> {
         std::fs::create_dir_all(data_dir).map_err(DbError::Io)?;
 
         let db_path = data_dir.join("axiomdb.db");
@@ -107,6 +115,7 @@ impl Database {
 
         let (storage, mut txn) = if db_path.exists() {
             let mut storage = MmapStorage::open(&db_path)?;
+            CatalogBootstrap::ensure_database_roots(&mut storage)?;
             let (mut txn, _recovery) = TxnManager::open_with_recovery(&mut storage, &wal_path)?;
             verify_and_repair_indexes_on_open(&mut storage, &mut txn)?;
             (storage, txn)
@@ -117,10 +126,18 @@ impl Database {
             (storage, txn)
         };
 
-        // Enable pipeline commit mode so `TxnManager::commit()` writes the
-        // Commit WAL entry to the BufWriter without inline fsync. The fsync
+        let durability = config.resolved_wal_durability();
+        txn.set_durability_policy(durability);
+
+        // Strict mode: enable pipeline commit so `TxnManager::commit()` writes
+        // the Commit WAL entry to the BufWriter without inline fsync. The fsync
         // pipeline handles durability via leader-based coalescing.
-        txn.set_deferred_commit_mode(true);
+        //
+        // Normal / Off: bypass the pipeline — relaxed modes flush or skip
+        // inline and advance max_committed immediately in `commit()`.
+        if durability == WalDurabilityPolicy::Strict {
+            txn.set_deferred_commit_mode(true);
+        }
         let pipeline = FsyncPipeline::new(txn.wal_current_lsn());
 
         Ok(Self {
@@ -133,9 +150,6 @@ impl Database {
             runtime_mode: Arc::new(AtomicU8::new(RUNTIME_MODE_READ_WRITE)),
         })
     }
-
-    // NOTE: `enable_group_commit()` removed in Phase 6.19.
-    // The fsync pipeline is always active — initialized in `open()`.
 
     /// Executes a SQL string through the full pipeline:
     /// `parse → analyze_cached → execute_with_ctx`.
@@ -243,7 +257,14 @@ impl Database {
             .txn
             .active_snapshot()
             .unwrap_or_else(|_| self.txn.snapshot());
-        let analyzed = match analyze_cached(stmt, &self.storage, snap, schema_cache) {
+        let analyzed = match analyze_cached_with_defaults(
+            stmt,
+            &self.storage,
+            snap,
+            session.effective_database(),
+            session.current_schema(),
+            schema_cache,
+        ) {
             Ok(a) => a,
             Err(e) => return self.apply_on_error_pipeline_failure(sql, session, e),
         };
@@ -378,7 +399,17 @@ impl Database {
 
     /// Returns the current database name (always "axiomdb" for Phase 5).
     pub fn current_database(&self) -> &str {
-        "axiomdb"
+        DEFAULT_DATABASE_NAME
+    }
+
+    /// Returns `true` if a logical database exists in the catalog.
+    pub fn database_exists(&self, name: &str) -> Result<bool, DbError> {
+        let snap = self
+            .txn
+            .active_snapshot()
+            .unwrap_or_else(|_| self.txn.snapshot());
+        let mut reader = CatalogReader::new(&self.storage, snap)?;
+        reader.database_exists(name)
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -484,7 +515,9 @@ fn is_schema_changing(stmt: &Stmt) -> bool {
     matches!(
         stmt,
         Stmt::CreateTable(_)
+            | Stmt::CreateDatabase(_)
             | Stmt::DropTable(_)
+            | Stmt::DropDatabase(_)
             | Stmt::AlterTable(_)
             | Stmt::CreateIndex(_)
             | Stmt::DropIndex(_)
@@ -528,7 +561,12 @@ pub fn sql_may_mutate(sql: &str) -> bool {
 fn stmt_may_mutate(stmt: &Stmt) -> bool {
     !matches!(
         stmt,
-        Stmt::Select(_) | Stmt::ShowTables(_) | Stmt::ShowColumns(_) | Stmt::Set(_)
+        Stmt::Select(_)
+            | Stmt::ShowTables(_)
+            | Stmt::ShowDatabases(_)
+            | Stmt::ShowColumns(_)
+            | Stmt::Set(_)
+            | Stmt::UseDatabase(_)
     )
 }
 

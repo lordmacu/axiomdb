@@ -192,14 +192,29 @@ impl<'src> Parser<'src> {
     pub(crate) fn parse_table_ref(&mut self) -> Result<TableRef, DbError> {
         let first = self.parse_identifier()?;
         if self.eat(&Token::Dot) {
-            let table = self.parse_identifier()?;
-            Ok(TableRef {
-                schema: Some(first),
-                name: table,
-                alias: None,
-            })
+            let second = self.parse_identifier()?;
+            if self.eat(&Token::Dot) {
+                // database.schema.table
+                let third = self.parse_identifier()?;
+                Ok(TableRef {
+                    database: Some(first),
+                    schema: Some(second),
+                    name: third,
+                    alias: None,
+                })
+            } else {
+                // schema.table
+                Ok(TableRef {
+                    database: None,
+                    schema: Some(first),
+                    name: second,
+                    alias: None,
+                })
+            }
         } else {
+            // table
             Ok(TableRef {
+                database: None,
                 schema: None,
                 name: first,
                 alias: None,
@@ -251,6 +266,10 @@ impl<'src> Parser<'src> {
             Token::Show => {
                 self.advance();
                 match self.peek().clone() {
+                    Token::Databases => {
+                        self.advance();
+                        Ok(Stmt::ShowDatabases(crate::ast::ShowDatabasesStmt))
+                    }
                     Token::Tables => {
                         self.advance();
                         let schema = if self.eat(&Token::From) {
@@ -269,7 +288,7 @@ impl<'src> Parser<'src> {
                     }
                     other => Err(DbError::ParseError {
                         message: format!(
-                            "expected TABLES or COLUMNS after SHOW, found {:?}",
+                            "expected DATABASES, TABLES or COLUMNS after SHOW, found {:?}",
                             other,
                         ),
                         position: Some(self.current_pos()),
@@ -313,6 +332,11 @@ impl<'src> Parser<'src> {
                 let value = self.parse_set_value()?;
                 Ok(Stmt::Set(SetStmt { variable, value }))
             }
+            Token::Use => {
+                self.advance();
+                let name = self.parse_identifier()?;
+                Ok(Stmt::UseDatabase(crate::ast::UseDatabaseStmt { name }))
+            }
             Token::Eof => Err(DbError::ParseError {
                 message: "empty input: no SQL statement found".into(),
                 position: Some(self.current_pos()),
@@ -329,6 +353,14 @@ impl<'src> Parser<'src> {
 
     fn parse_create(&mut self) -> Result<Stmt, DbError> {
         match self.peek() {
+            Token::Database => {
+                self.advance();
+                ddl::parse_create_database(self)
+            }
+            Token::Schema => {
+                self.advance();
+                ddl::parse_create_schema(self)
+            }
             Token::Table => {
                 self.advance();
                 ddl::parse_create_table(self)
@@ -343,7 +375,10 @@ impl<'src> Parser<'src> {
                 ddl::parse_create_index(self, false)
             }
             other => Err(DbError::ParseError {
-                message: format!("expected TABLE or INDEX after CREATE, found {:?}", other,),
+                message: format!(
+                    "expected DATABASE, TABLE or INDEX after CREATE, found {:?}",
+                    other,
+                ),
                 position: Some(self.current_pos()),
             }),
         }
@@ -351,6 +386,10 @@ impl<'src> Parser<'src> {
 
     fn parse_drop(&mut self) -> Result<Stmt, DbError> {
         match self.peek() {
+            Token::Database => {
+                self.advance();
+                ddl::parse_drop_database(self)
+            }
             Token::Table => {
                 self.advance();
                 ddl::parse_drop_table(self)
@@ -360,7 +399,10 @@ impl<'src> Parser<'src> {
                 ddl::parse_drop_index(self)
             }
             other => Err(DbError::ParseError {
-                message: format!("expected TABLE or INDEX after DROP, found {:?}", other,),
+                message: format!(
+                    "expected DATABASE, TABLE or INDEX after DROP, found {:?}",
+                    other,
+                ),
                 position: Some(self.current_pos()),
             }),
         }

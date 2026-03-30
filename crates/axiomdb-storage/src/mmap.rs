@@ -6,11 +6,11 @@ use std::{
 use axiomdb_core::error::{classify_io, DbError};
 use fs2::FileExt;
 use libc;
-use memmap2::MmapMut;
+use memmap2::Mmap;
 use tracing::{debug, info, warn};
 
 use crate::{
-    dirty::{coalesce_page_ids, PageDirtyTracker},
+    dirty::PageDirtyTracker,
     engine::StorageEngine,
     freelist::FreeList,
     page::{Page, PageType, HEADER_SIZE, PAGE_SIZE},
@@ -62,7 +62,9 @@ const _: () = assert!(
 /// The `.db` file is locked with `flock(LOCK_EX)` on open and released on
 /// drop, preventing corruption from two processes opening the same file.
 pub struct MmapStorage {
-    mmap: MmapMut,
+    /// Read-only memory mapping of the database file.
+    /// All reads go through this mapping; all writes go through `pwrite()` on `file`.
+    mmap: Mmap,
     /// File descriptor kept open for `set_len` in `grow` and to hold the
     /// exclusive file lock for the lifetime of this struct.
     file: File,
@@ -111,19 +113,33 @@ impl MmapStorage {
         file.set_len(initial_size)
             .map_err(|e| classify_io(e, "storage create"))?;
 
-        // SAFETY: freshly created file with the correct size. No other mappings.
-        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-
-        // Write page 0 (Meta).
-        Self::write_meta_to_mmap(&mut mmap, GROW_PAGES)?;
+        // Write page 0 (Meta) via pwrite.
+        {
+            let meta_page = Self::build_meta_page(GROW_PAGES);
+            use std::os::unix::fs::FileExt;
+            file.write_all_at(meta_page.as_bytes(), 0)
+                .map_err(|e| classify_io(e, "create meta pwrite"))?;
+        }
 
         // Initialize FreeList: pages 0 and 1 reserved (meta + bitmap).
         let freelist = FreeList::new(GROW_PAGES, &[0, 1]);
 
-        // Write page 1 (bitmap).
-        Self::write_freelist_to_mmap(&mut mmap, &freelist)?;
+        // Write page 1 (bitmap) via pwrite.
+        {
+            let mut bitmap_page = Page::new(PageType::Free, 1);
+            freelist.to_bytes(bitmap_page.body_mut());
+            bitmap_page.update_checksum();
+            use std::os::unix::fs::FileExt;
+            file.write_all_at(bitmap_page.as_bytes(), PAGE_SIZE as u64)
+                .map_err(|e| classify_io(e, "create freelist pwrite"))?;
+        }
 
-        mmap.flush()?;
+        file.sync_all()
+            .map_err(|e| classify_io(e, "create fsync"))?;
+
+        // Open a READ-ONLY mmap for the read path.
+        // SAFETY: file fully written and synced. No mutable aliases.
+        let mmap = unsafe { Mmap::map(&file)? };
 
         debug!(path = %path.display(), "database initialized and ready");
         Ok(MmapStorage {
@@ -148,13 +164,13 @@ impl MmapStorage {
 
         info!(path = %path.display(), "opening database");
 
-        // SAFETY: existing file, exclusive lock held — no other mutable mappings active.
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        // SAFETY: existing file, exclusive lock held. Read-only mapping.
+        let mmap = unsafe { Mmap::map(&file)? };
 
         // Validate page 0.
         let page_count = {
             let meta_page = Self::read_page_from_mmap(&mmap, 0)?;
-            let file_meta = Self::parse_file_meta(meta_page);
+            let file_meta = Self::parse_file_meta(&meta_page);
 
             if file_meta.db_magic != DB_FILE_MAGIC {
                 return Err(DbError::Other(format!(
@@ -217,38 +233,62 @@ impl MmapStorage {
             .set_len(new_size)
             .map_err(|e| classify_io(e, "storage grow"))?;
 
-        // SAFETY: file extended to `new_size` bytes. No external references to
-        // the previous mapping (we hold `&mut self`).
-        self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
+        // SAFETY: file extended to `new_size` bytes. Read-only remap.
+        // Old mmap is dropped; all readers hold PageRef copies, not &Page refs.
+        self.mmap = unsafe { Mmap::map(&self.file)? };
 
         // Update page_count in meta and its CRC32c.
         self.update_page_count_in_mmap(new_count);
 
         // Extend the freelist to cover the new pages.
         self.freelist.grow(new_count);
-        Self::write_freelist_to_mmap(&mut self.mmap, &self.freelist)?;
+        self.pwrite_freelist()?;
 
         Ok(old_count)
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    fn read_page_from_mmap(mmap: &MmapMut, page_id: u64) -> Result<&Page, DbError> {
+    /// Writes raw bytes at `offset` in the file via `pwrite()`.
+    ///
+    /// This is the production-safe write path (Phase 7.4a). All page writes go
+    /// through the file descriptor, NOT the mmap. The mmap (MAP_SHARED) reflects
+    /// the change automatically via the kernel page cache.
+    ///
+    /// ## Why pwrite instead of mmap writes?
+    /// - PostgreSQL, InnoDB, DuckDB, SQLite all use pwrite for page writes
+    /// - 16KB mmap writes are NOT atomic — concurrent readers see torn pages
+    /// - pwrite to a file-backed mmap is coherent: the kernel unifies the page cache
+    fn pwrite_bytes(&self, offset: u64, data: &[u8]) -> Result<(), DbError> {
+        use std::os::unix::fs::FileExt;
+        self.file
+            .write_all_at(data, offset)
+            .map_err(|e| classify_io(e, "pwrite"))
+    }
+
+    /// Writes a full page via `pwrite()` at the correct file offset.
+    fn pwrite_page(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
+        let offset = page_id as u64 * PAGE_SIZE as u64;
+        self.pwrite_bytes(offset, page.as_bytes())
+    }
+
+    fn read_page_from_mmap(mmap: &Mmap, page_id: u64) -> Result<crate::page_ref::PageRef, DbError> {
         let offset = page_id as usize * PAGE_SIZE;
         if offset + PAGE_SIZE > mmap.len() {
             return Err(DbError::PageNotFound { page_id });
         }
-        let ptr = mmap[offset..].as_ptr();
-        // SAFETY: offset is within the mmap (verified above). The mmap is aligned
-        // to ≥4 KB (a multiple of 64). PAGE_SIZE=16384 is a multiple of 64, so
-        // every page satisfies align_of::<Page>()==64. Page is repr(C, align(64)).
-        // No mutable aliases — function takes &MmapMut.
-        let page = unsafe { &*(ptr as *const Page) };
-        page.verify_checksum()?;
-        Ok(page)
+        // Copy 16KB from mmap into an owned PageRef. This is safe for concurrent
+        // access: the caller owns the copy and it survives mmap remap/grow.
+        // Cost: ~0.5µs from L2/L3 cache (same as PostgreSQL buffer pool copy).
+        let mut bytes = [0u8; PAGE_SIZE];
+        bytes.copy_from_slice(&mmap[offset..offset + PAGE_SIZE]);
+        let page_ref = crate::page_ref::PageRef::from_bytes(bytes);
+        page_ref.verify_checksum()?;
+        Ok(page_ref)
     }
 
-    fn write_meta_to_mmap(mmap: &mut MmapMut, page_count: u64) -> Result<(), DbError> {
+    /// Builds a meta page (page 0) with the given page count.
+    fn build_meta_page(page_count: u64) -> Page {
         let mut meta_page = Page::new(PageType::Meta, 0);
         let file_meta = DbFileMeta {
             db_magic: DB_FILE_MAGIC,
@@ -258,7 +298,6 @@ impl MmapStorage {
             _reserved: [0u8; PAGE_SIZE - HEADER_SIZE - 24],
         };
         // SAFETY: body and DbFileMeta have the same size (const assert).
-        // Writing to the exclusive memory of meta_page.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 &file_meta as *const DbFileMeta as *const u8,
@@ -267,17 +306,15 @@ impl MmapStorage {
             );
         }
         meta_page.update_checksum();
-        mmap[..PAGE_SIZE].copy_from_slice(meta_page.as_bytes());
-        Ok(())
+        meta_page
     }
 
-    fn write_freelist_to_mmap(mmap: &mut MmapMut, freelist: &FreeList) -> Result<(), DbError> {
+    /// Writes the freelist bitmap to page 1 via `pwrite()`.
+    fn pwrite_freelist(&self) -> Result<(), DbError> {
         let mut bitmap_page = Page::new(PageType::Free, 1);
-        freelist.to_bytes(bitmap_page.body_mut());
+        self.freelist.to_bytes(bitmap_page.body_mut());
         bitmap_page.update_checksum();
-        let offset = PAGE_SIZE; // page 1
-        mmap[offset..offset + PAGE_SIZE].copy_from_slice(bitmap_page.as_bytes());
-        Ok(())
+        self.pwrite_page(1, &bitmap_page)
     }
 
     fn parse_file_meta(page: &Page) -> &DbFileMeta {
@@ -322,18 +359,22 @@ impl MmapStorage {
         ])
     }
 
-    /// Updates page_count and the CRC32c of the meta page directly in the mmap.
+    /// Updates page_count and the CRC32c of the meta page via pwrite.
     fn update_page_count_in_mmap(&mut self, count: u64) {
-        self.mmap[PAGE_COUNT_OFFSET..PAGE_COUNT_OFFSET + 8].copy_from_slice(&count.to_le_bytes());
-        let checksum = crc32c::crc32c(&self.mmap[HEADER_SIZE..PAGE_SIZE]);
-        self.mmap[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
+        // Read current meta page, update page_count, recompute checksum, pwrite back.
+        let mut bytes = [0u8; PAGE_SIZE];
+        bytes.copy_from_slice(&self.mmap[0..PAGE_SIZE]);
+        bytes[PAGE_COUNT_OFFSET..PAGE_COUNT_OFFSET + 8].copy_from_slice(&count.to_le_bytes());
+        let checksum = crc32c::crc32c(&bytes[HEADER_SIZE..PAGE_SIZE]);
+        bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
+        let _ = self.pwrite_bytes(0, &bytes);
     }
 }
 
 // ── StorageEngine impl ────────────────────────────────────────────────────────
 
 impl StorageEngine for MmapStorage {
-    fn read_page(&self, page_id: u64) -> Result<&Page, DbError> {
+    fn read_page(&self, page_id: u64) -> Result<crate::page_ref::PageRef, DbError> {
         // Read page_count directly from the mmap without verifying the checksum — hot path.
         let count = Self::read_u64_at(&self.mmap, PAGE_COUNT_OFFSET);
         if page_id >= count {
@@ -370,8 +411,7 @@ impl StorageEngine for MmapStorage {
                 }
             }
         }
-        let offset = page_id as usize * PAGE_SIZE;
-        self.mmap[offset..offset + PAGE_SIZE].copy_from_slice(page.as_bytes());
+        self.pwrite_page(page_id, page)?;
         self.dirty.mark(page_id);
         Ok(())
     }
@@ -380,8 +420,7 @@ impl StorageEngine for MmapStorage {
         // Try to allocate from the current freelist.
         if let Some(page_id) = self.freelist.alloc() {
             let new_page = Page::new(page_type, page_id);
-            let offset = page_id as usize * PAGE_SIZE;
-            self.mmap[offset..offset + PAGE_SIZE].copy_from_slice(new_page.as_bytes());
+            self.pwrite_page(page_id, &new_page)?;
             self.freelist_dirty = true;
             self.dirty.mark(page_id);
             return Ok(page_id);
@@ -394,8 +433,7 @@ impl StorageEngine for MmapStorage {
         debug_assert_eq!(page_id, first_new);
 
         let new_page = Page::new(page_type, page_id);
-        let offset = page_id as usize * PAGE_SIZE;
-        self.mmap[offset..offset + PAGE_SIZE].copy_from_slice(new_page.as_bytes());
+        self.pwrite_page(page_id, &new_page)?;
         self.freelist_dirty = true;
         self.dirty.mark(page_id);
         Ok(page_id)
@@ -413,36 +451,20 @@ impl StorageEngine for MmapStorage {
     }
 
     fn flush(&mut self) -> Result<(), DbError> {
-        // Serialize the freelist into the mmap if modified.
-        // Do NOT clear freelist_dirty here — it is cleared only after the flush
-        // succeeds so that a failure leaves dirty state fully intact.
+        // Serialize the freelist via pwrite if modified.
         if self.freelist_dirty {
-            Self::write_freelist_to_mmap(&mut self.mmap, &self.freelist)?;
+            self.pwrite_freelist()?;
         }
 
-        // Build the effective set of page IDs to flush.
-        let mut page_ids = self.dirty.sorted_ids();
-        if self.freelist_dirty {
-            // Page 1 (freelist bitmap) must be flushed; insert it if absent.
-            let pos = page_ids.partition_point(|&id| id < 1);
-            if page_ids.get(pos) != Some(&1) {
-                page_ids.insert(pos, 1);
-            }
-        }
+        // fsync the file descriptor to ensure all pwrite() data is durable.
+        // This replaces the old mmap.flush_range() approach.
+        // fsync is correct for pwrite: it forces the kernel to flush the
+        // file's page cache to disk. All production DBs use this pattern.
+        self.file
+            .sync_all()
+            .map_err(|e| classify_io(e, "storage fsync"))?;
 
-        if !page_ids.is_empty() {
-            // Coalesce page IDs into contiguous runs, then convert to byte ranges.
-            let byte_runs: Vec<(usize, usize)> = coalesce_page_ids(&page_ids)
-                .into_iter()
-                .map(|(start, len)| (start as usize * PAGE_SIZE, len as usize * PAGE_SIZE))
-                .collect();
-
-            // Flush only those ranges. On any failure the dirty state is preserved.
-            Self::flush_runs(&byte_runs, |off, len| self.mmap.flush_range(off, len))
-                .map_err(|e| classify_io(e, "storage flush"))?;
-        }
-
-        // All targeted flushes succeeded — clear dirty tracking.
+        // All writes are durable — clear dirty tracking.
         self.freelist_dirty = false;
         self.dirty.clear();
         Ok(())
@@ -468,7 +490,7 @@ impl StorageEngine for MmapStorage {
         };
         let requested_len = (effective_count as usize).saturating_mul(PAGE_SIZE);
         let clamped_len = requested_len.min(mmap_len - offset);
-        // SAFETY: `ptr` is derived from a live `MmapMut` via checked offset arithmetic.
+        // SAFETY: `ptr` is derived from a live `Mmap` via checked offset arithmetic.
         // `offset < mmap_len` is verified above; `clamped_len <= mmap_len - offset`
         // ensures [ptr, ptr + clamped_len) lies entirely within the mapping.
         // `madvise` is a pure hint — it does not dereference the pointer or mutate

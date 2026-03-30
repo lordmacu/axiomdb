@@ -1,5 +1,31 @@
 # Architecture Notes
 
+## 2026-03-29 — Thematic integration test binaries for `axiomdb-sql`
+
+- `crates/axiomdb-sql/tests/common/mod.rs` now owns the shared executor-test
+  harness (`setup`, `run`, `run_ctx`, staging helpers, row extractors).
+- Integration tests are now grouped by execution path rather than by one giant
+  catch-all file:
+  - `integration_executor` for base CRUD
+  - `integration_executor_joins` for joins and aggregates
+  - `integration_executor_query` for query-shaping features
+  - `integration_executor_ddl` for `SHOW` / `DESCRIBE` / `TRUNCATE` / `ALTER`
+  - `integration_executor_ctx` for base `SessionContext` and `strict_mode`
+  - `integration_executor_ctx_group` for ctx-path sorted group-by
+  - `integration_executor_ctx_limit` for ctx-path `LIMIT` / `OFFSET` coercion
+  - `integration_executor_ctx_on_error` for ctx-path `on_error`
+  - `integration_executor_sql` for broader SQL semantics
+  - `integration_delete_apply` for DELETE fast paths
+  - `integration_insert_staging` for transactional INSERT staging
+  - `integration_namespacing` for database catalog behavior
+  - `integration_namespacing_cross_db` for explicit cross-database resolution
+  - `integration_namespacing_schema` for schema namespacing and `search_path`
+- The structural rule is:
+  - keep one binary per cohesive execution path
+  - prefer adding related tests to an existing themed binary
+  - split only when a binary starts mixing unrelated paths or grows beyond a practical review/run size
+- Current watch list for future split is empty inside `axiomdb-sql/tests/`; the larger remaining bins are still responsibility-cohesive.
+
 ## 2026-03-26 — Prepared long data over MySQL wire
 
 - `COM_STMT_SEND_LONG_DATA` is handled entirely in `axiomdb-network/src/mysql/handler.rs`.
@@ -203,3 +229,37 @@
 - The old `deferred_commit_mode` hook still exists inside `TxnManager`, but it
   is now just the internal handoff point from commit serialization to the
   leader-based fsync pipeline.
+
+## 2026-03-27 — Database catalog and session-scoped default database
+
+- `axiomdb-catalog` now persists logical databases explicitly instead of treating
+  `SHOW DATABASES` and `USE` as wire-only session sugar.
+- Two catalog relations own that state:
+  - `axiom_databases` stores database definitions
+  - `axiom_table_databases` stores database ownership per table id
+- The architectural compatibility rule is:
+  - tables created before `22b.3a` remain readable without migration
+  - missing ownership rows resolve to the implicit default database `axiomdb`
+- `axiomdb-sql/src/analyzer.rs` now applies database defaults in addition to
+  schema defaults:
+  - selected database from `SessionContext` wins
+  - otherwise `axiomdb` is the effective default
+- The current namespace model is intentionally two-level:
+  - database ownership decides which table set is visible
+  - `schema_name` inside `TableDef` remains available for future schema work
+- Cross-database qualification is intentionally still deferred:
+  - the parser/analyzer continue to accept only the current one-part or
+    `schema.table` forms
+  - `database.schema.table` belongs to the next subphase, not this one
+- `DROP DATABASE` is executed as catalog-driven cascade DDL:
+  - enumerate owned tables in the target database
+  - drop each table and its dependent catalog rows
+  - finally delete the database row itself
+- `axiomdb-network/src/mysql/handler.rs` now validates the requested database in
+  both places where MySQL clients can select it:
+  - handshake connect-with-db
+  - `COM_INIT_DB`
+- The wire invariant is now explicit:
+  - unknown databases must fail before the server sends the final auth OK
+  - otherwise clients can observe a spurious successful connect followed by a
+    late catalog error

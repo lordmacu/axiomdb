@@ -1,5 +1,19 @@
 # Lessons Learned
 
+## 2026-03-29 - Split integration tests by execution path, not by raw size alone
+
+- The right reason to split a large integration test file is mixed responsibility, not just line count.
+- A good binary groups one coherent execution path so it can be run alone with high signal.
+- If a new behavior already belongs to an existing themed binary, add the test there instead of creating a new file.
+- Prefer this validation ladder:
+  - single relevant test
+  - single relevant binary
+  - directly related binaries when helpers or adjacent paths changed
+  - whole crate only when the blast radius is broad or as a pre-close gate
+- Files around `~1000` lines are a watch signal, not an automatic split trigger.
+- Large but cohesive binaries are acceptable; large and mixed binaries are the ones that become expensive to maintain and run.
+- When a large binary already mirrors roadmap subphases, split along those subphase boundaries first; that usually produces the cleanest ownership and the most useful targeted commands.
+
 ## 2026-03-25 - Spec workflow discipline
 
 - Read the relevant codebase files before writing a single line of the spec, not after. Good reasoning after the fact does not repair a spec as cleanly as reading first.
@@ -189,3 +203,30 @@
   durability before it sends the OK packet.
 - Under request/response autocommit, the next statement never reaches the server
   while the current fsync is in flight, so there is nothing to piggyback.
+
+## 2026-03-27 - `USE` is not real multi-database support unless the catalog owns it
+
+- A wire-level `USE db` implementation is not enough by itself.
+- Before `22b.3a`, the server could remember a selected database name in session
+  state, but that name did not change table ownership, `SHOW DATABASES`, or DDL.
+- The correct boundary is:
+  - databases must exist in the catalog
+  - table ownership must be persisted separately from the session
+  - analyzer resolution must use the selected database when binding names
+- Keeping database ownership outside `TableDef.schema_name` avoided a noisier
+  on-disk migration and kept room for future schema support inside each
+  database.
+
+## 2026-03-27 - Handshake validation must fail before the final OK packet
+
+- MySQL clients that connect with `CLIENT_CONNECT_WITH_DB` expect unknown
+  databases to fail the handshake itself, not to succeed auth and then fail on
+  the first command.
+- `22b.3a` exposed a subtle wire bug: validating the catalog after sending auth
+  success produced the wrong observable protocol behavior.
+- The safe rule is:
+  - authenticate credentials
+  - validate the requested default database
+  - only then send the final OK packet
+- This is a good reminder that wire-visible state transitions are part of the
+  contract, not just internal implementation detail.

@@ -1,29 +1,31 @@
 # Catalog System
 
-The catalog is AxiomDB's schema repository. It stores the definition of every table,
-column, and index, and makes that information available to the SQL analyzer and
+The catalog is AxiomDB's schema repository. It stores the definition of logical
+databases, tables, columns, indexes, constraints, foreign keys, and planner
+statistics, then makes that information available to the SQL analyzer and
 executor through a consistent, MVCC-aware reader interface.
 
 ---
 
 ## Design Goals
 
-- **Self-describing:** The catalog tables are themselves stored as regular heap pages
-  indexed by a B+ Tree. The engine needs no external schema file.
+- **Self-describing:** The catalog tables are themselves stored as regular heap pages.
+  The engine needs no external schema file.
 - **Persistent:** Catalog data survives crashes. The WAL treats catalog mutations like
   any other transaction.
 - **MVCC-visible:** A DDL statement that creates a table is visible to subsequent
   statements in the same transaction but invisible to concurrent transactions until
   committed.
 - **Bootstrappable:** An empty database file contains no catalog rows. The first
-  `open()` runs a special bootstrap transaction that creates the five system tables.
+  `open()` runs a special bootstrap path that allocates the catalog roots and inserts
+  the default logical database `axiomdb`.
 
 ---
 
 ## System Tables
 
-The catalog consists of five tables stored in the `axiom` internal schema.
-Their structure is described in [Catalog & Schema](../user-guide/features/catalog.md).
+The catalog consists of eight logical heaps rooted from the meta page. User-facing
+introspection is documented in [Catalog & Schema](../user-guide/features/catalog.md).
 
 | Table                   | Meta offset | Contents                                         |
 |-------------------------|-------------|--------------------------------------------------|
@@ -33,10 +35,48 @@ Their structure is described in [Catalog & Schema](../user-guide/features/catalo
 | `axiom_constraints`     | 72          | Named CHECK constraints (Phase 4.22b)            |
 | `axiom_foreign_keys`    | 84          | One row per FK constraint (Phase 6.5)            |
 | `axiom_stats`           | 96          | Per-column NDV and row_count for planner (Phase 6.10) |
+| `axiom_databases`       | 104         | One row per logical database                     |
+| `axiom_table_databases` | 112         | Optional table ownership binding by database     |
 
-Each table root page is stored at the corresponding u64 body offset in the meta
-page (page 0). Offsets 84 and 92 are lazily initialized (value = 0 on pre-Phase
-6.5 databases; allocated on first use).
+Each root page is stored at the corresponding u64 body offset in the meta page
+(page 0). Older database files may have `0` in the new database offsets; the
+open path upgrades them lazily by allocating the roots and inserting
+`axiomdb`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Separate DB Ownership</span>
+AxiomDB deliberately does <strong>not</strong> overload <code>schema_name</code> inside
+<code>TableDef</code> to fake a database namespace. Keeping database ownership in
+<code>axiom_table_databases</code> preserves on-disk compatibility now and leaves
+real <code>CREATE SCHEMA</code> room later, unlike a shortcut that would collapse two
+separate namespaces into one field.
+</div>
+</div>
+
+### `axiom_databases` row format (`DatabaseDef`)
+
+```text
+[name_len: 1 byte u8]
+[name:     name_len UTF-8 bytes]
+```
+
+Fresh databases always contain:
+
+```text
+axiomdb
+```
+
+### `axiom_table_databases` row format (`TableDatabaseDef`)
+
+```text
+[table_id:        4 bytes LE u32]
+[name_len:        1 byte  u8]
+[database_name:   name_len UTF-8 bytes]
+```
+
+Missing binding row means: this is a legacy table owned by `axiomdb`.
 
 ### `axiom_stats` row format (`StatsDef`)
 
@@ -110,8 +150,8 @@ the predicate section.
 
 ## CatalogBootstrap
 
-`CatalogBootstrap` is a one-time procedure that runs when `open()` encounters an empty
-database file (or a file with the meta page uninitialized).
+`CatalogBootstrap` is a one-time procedure that runs when `open()` encounters an
+empty database file (or a file with the meta page uninitialized).
 
 ### Bootstrap Sequence
 
@@ -123,25 +163,20 @@ database file (or a file with the meta page uninitialized).
    Initialize the bitmap (all pages allocated so far are marked used).
    Write freelist_root_page into the meta page.
 
-3. Allocate B+ Tree pages for axiom_tables.
-   Insert the row describing axiom_tables into axiom_tables itself.
-   Write catalog_root_page into the meta page.
+3. Allocate heap roots for catalog tables and aux heaps:
+   `axiom_tables`, `axiom_columns`, `axiom_indexes`, `axiom_constraints`,
+   `axiom_foreign_keys`, `axiom_stats`, `axiom_databases`, `axiom_table_databases`.
 
-4. Allocate B+ Tree pages for axiom_columns.
-   Insert the column definitions for axiom_tables, axiom_columns, axiom_indexes.
+4. Insert the default database row `axiomdb` into `axiom_databases`.
 
-5. Allocate B+ Tree pages for axiom_indexes.
-   Insert the index definitions for the three system tables' own indexes.
+5. Persist every root page id into the meta page.
 
-6. Write a COMMIT WAL entry with LSN 1.
-   Flush pages and WAL.
-   Mark the meta page as bootstrapped.
+6. Flush pages and WAL.
 ```
 
-The bootstrap uses txn_id = 0 and LSN 1. These special values are never reused. If
-a crash occurs during bootstrap, the meta page checksum is invalid (step 6 has not
-completed), so the next `open()` detects an uninitialized meta page and re-runs
-the bootstrap from scratch. The re-bootstrap is safe: no data has been committed.
+Fresh bootstrap uses `txn_id = 0` for the default database row because no user
+transaction exists yet. If a pre-22b.3a database is reopened, `ensure_database_roots`
+upgrades it in-place and inserts `axiomdb` exactly once.
 
 ---
 
@@ -158,21 +193,50 @@ pub struct CatalogReader<'a> {
 
 impl<'a> CatalogReader<'a> {
     /// List all user tables visible to this snapshot.
-    pub fn list_tables(&self, schema: &str) -> Result<Vec<TableDef>, DbError>;
+    pub fn list_tables(&mut self, schema: &str) -> Result<Vec<TableDef>, DbError>;
+
+    /// List all logical databases visible to this snapshot.
+    pub fn list_databases(&mut self) -> Result<Vec<DatabaseDef>, DbError>;
 
     /// Find a specific table by schema + name.
-    pub fn find_table(&self, schema: &str, name: &str) -> Result<Option<TableDef>, DbError>;
+    pub fn get_table(&mut self, schema: &str, name: &str) -> Result<Option<TableDef>, DbError>;
+
+    /// Find a specific table by database + schema + name.
+    pub fn get_table_in_database(
+        &mut self,
+        database: &str,
+        schema: &str,
+        name: &str,
+    ) -> Result<Option<TableDef>, DbError>;
 
     /// List columns for a table in declaration order.
-    pub fn list_columns(&self, table_id: u64) -> Result<Vec<ColumnDef>, DbError>;
+    pub fn list_columns(&mut self, table_id: u64) -> Result<Vec<ColumnDef>, DbError>;
 
     /// List indexes for a table.
-    pub fn list_indexes(&self, table_id: u64) -> Result<Vec<IndexDef>, DbError>;
+    pub fn list_indexes(&mut self, table_id: u64) -> Result<Vec<IndexDef>, DbError>;
 }
 ```
 
 The `snapshot` parameter ensures catalog reads are MVCC-consistent. A DDL statement
 that has not yet committed is invisible to other transactions' `CatalogReader`.
+
+### Effective database resolution
+
+Catalog lookup is now two-dimensional:
+
+```text
+(database, schema, table)
+```
+
+The resolver applies one legacy rule:
+
+```text
+if no explicit table->database binding exists:
+    effective database = "axiomdb"
+```
+
+That rule is what lets old databases keep working without rewriting existing
+`TableDef` rows.
 
 ---
 

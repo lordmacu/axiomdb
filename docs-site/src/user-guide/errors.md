@@ -352,6 +352,53 @@ SELECT users.id FROM users JOIN orders ON orders.user_id = users.id;
 
 ---
 
+## Database Catalog Errors
+
+These errors are surfaced primarily through the MySQL wire protocol when a
+client uses `CREATE DATABASE`, `DROP DATABASE`, `USE`, the handshake database,
+or `COM_INIT_DB`.
+
+### 1049 (42000) — Unknown database
+
+The requested database does not exist in the persisted catalog.
+
+```sql
+USE missing_db;
+-- ERROR 1049 (42000): Unknown database 'missing_db'
+```
+
+This same error is returned if a client connects with `database=missing_db` in
+the initial MySQL handshake.
+
+**Fix:** create the database first with `CREATE DATABASE missing_db`, or switch
+to an existing one from `SHOW DATABASES`.
+
+### 1007 (HY000) — Database already exists
+
+`CREATE DATABASE` was called for a name already present in the catalog.
+
+```sql
+CREATE DATABASE analytics;
+CREATE DATABASE analytics;
+-- ERROR 1007 (HY000): Can't create database 'analytics'; database exists
+```
+
+**Fix:** choose a different name, or treat the existing database as reusable.
+
+### 1105 (HY000) — Active database cannot be dropped
+
+The current connection attempted to drop the database it has selected.
+
+```sql
+USE analytics;
+DROP DATABASE analytics;
+-- ERROR 1105 (HY000): Can't drop database 'analytics'; database is currently selected
+```
+
+**Fix:** switch to another database such as `axiomdb`, then run `DROP DATABASE`.
+
+---
+
 ## Transaction Errors (Class 40)
 
 ### 40001 — serialization_failure

@@ -126,30 +126,40 @@ skipping PK maintenance when only non-indexed columns change.
 
 The main remaining write-path bottleneck is now `INSERT`, not `UPDATE`.
 
-### Indexed `UPDATE ... WHERE` After `6.17`
+### Indexed `UPDATE ... WHERE` After `6.20`
 
-Phase `6.17` removes the old full-scan candidate discovery path for indexed
-UPDATE predicates. If the `WHERE` clause is sargable by the PRIMARY KEY or a
-usable secondary index, AxiomDB now finds candidate rows through the B+Tree
-before handing them to the existing `5.20` update path.
+Phase `6.17` removed the old full-scan candidate discovery path for indexed
+UPDATE predicates. Phase `6.20` then removed the dominant apply-side costs on
+the default PK-range benchmark: candidate heap reads are batched by page,
+no-op rows skip physical mutation, stable-RID rewrites batch their WAL append,
+and index maintenance only runs when a key, predicate membership, or RID really
+changes.
 
 Measured with `python3 benches/comparison/local_bench.py --scenario update_range --rows 5000 --table`
 on the same machine:
 
 | Operation | MariaDB 12.1 | MySQL 8.0 | AxiomDB |
 |---|---|---|---|
-| `UPDATE bench_users SET score = score + 1 WHERE id BETWEEN ...` | 618K rows/s | 291K rows/s | **85.2K rows/s** |
+| `UPDATE bench_users SET score = score + 1 WHERE id BETWEEN ...` | 618K rows/s | 291K rows/s | **369.9K rows/s** |
 
-Compared to the old `70.2K rows/s` tracker baseline, the indexed candidate path
-does improve the benchmark, but it does not close the whole gap. That tells us
-the remaining bottleneck is no longer row discovery; it is the apply path after
-the candidates are already found.
+Compared to the `6.17` result (`85.2K rows/s`), the `6.20` apply fast path is a
+`4.3x` improvement on the same benchmark and now exceeds the documented local
+MySQL result. The remaining gap is specifically MariaDB's tighter clustered-row
+update path, not AxiomDB's old discovery-side O(n) scan.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage</span>
+On the default PK-only `update_range` benchmark, AxiomDB now reaches <strong>369.9K rows/s</strong> vs MySQL 8.0 at <strong>291K rows/s</strong> because `6.20` keeps the whole statement inside a batched heap/WAL apply path instead of paying per-row reads and per-row `UpdateInPlace` appends.
+</div>
+</div>
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
-<span class="callout-label">Design Decision — Separate Discovery From Rewrite</span>
-`6.17` intentionally does not redesign `UPDATE` writes again. It only removes the O(n) discovery scan for indexed predicates, then reuses the existing `5.20` stable-RID/fallback path. This keeps correctness local: planner changes speed up candidate discovery without weakening rollback or index-maintenance semantics.
+<span class="callout-label">Design Decision — Reuse WAL Format</span>
+MariaDB and PostgreSQL both optimize UPDATE by changing how batches are applied before inventing a new log record type. AxiomDB follows that rule here: `6.20` keeps the existing `UpdateInPlace` WAL format for rollback and recovery, but batches normal entries through one `reserve_lsns + write_batch` call per statement.
 </div>
 </div>
 
@@ -241,11 +251,11 @@ connection polls it lock-free (`Arc<AtomicU64>`) before each execute.
 (default 1024) compiled plans. The least-recently-used plan is evicted silently when
 the limit is reached. Configurable in `axiomdb.toml`.
 
-### WAL Fsync Pipeline (6.19, still below target)
+### WAL Fsync Pipeline (6.19, closed with a documented gap)
 
 Phase `6.19` replaced the old timer-based `CommitCoordinator` with an always-on
 leader-based WAL fsync pipeline. The runtime behavior changed, but the key
-single-connection autocommit benchmark is **not closed yet**.
+single-connection autocommit benchmark remains a documented gap.
 
 Measured with:
 
@@ -276,7 +286,7 @@ Full pipeline: parse → analyze → execute → WAL → MmapStorage. Measured w
 |-------------------------------------------------|-----------------|-------------|--------|
 | INSERT 10K rows / N separate SQL strings / 1 txn| 35K rows/s      | 140K rows/s | ⚠️     |
 | **INSERT 10K rows / 1 multi-row SQL string**    | **211K rows/s** | 140K rows/s | ✅ **1.5× faster** |
-| INSERT autocommit (1 visible commit/stmt, wire protocol) | 224 q/s         | —           | ⚠️ (`6.19` still open) |
+| INSERT autocommit (1 visible commit/stmt, wire protocol) | 224 q/s         | —           | ⚠️ (closed subphase, open perf gap) |
 
 <div class="callout callout-advantage">
 <span class="callout-icon">🚀</span>

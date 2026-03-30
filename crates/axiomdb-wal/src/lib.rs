@@ -12,6 +12,7 @@ pub mod fsync_pipeline;
 mod reader;
 mod recovery;
 mod rotation;
+mod sync;
 mod txn;
 mod writer;
 

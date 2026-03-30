@@ -94,6 +94,12 @@ pub enum Token<'src> {
     Index,
     #[token("DROP", ignore(ascii_case))]
     Drop,
+    #[token("DATABASE", ignore(ascii_case))]
+    Database,
+    #[token("DATABASES", ignore(ascii_case))]
+    Databases,
+    #[token("SCHEMA", ignore(ascii_case))]
+    Schema,
     #[token("ALTER", ignore(ascii_case))]
     Alter,
     #[token("ANALYZE", ignore(ascii_case))]
@@ -186,6 +192,8 @@ pub enum Token<'src> {
     Limit,
     #[token("OFFSET", ignore(ascii_case))]
     Offset,
+    #[token("USE", ignore(ascii_case))]
+    Use,
     #[token("ASC", ignore(ascii_case))]
     Asc,
     #[token("DESC", ignore(ascii_case))]

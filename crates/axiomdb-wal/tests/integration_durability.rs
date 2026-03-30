@@ -22,7 +22,7 @@ use axiomdb_core::error::DbError;
 use axiomdb_storage::{
     heap::insert_tuple, read_tuple, IntegrityChecker, MmapStorage, Page, PageType, StorageEngine,
 };
-use axiomdb_wal::{RecoveryResult, TxnManager};
+use axiomdb_wal::{RecoveryResult, TxnManager, WalReader};
 use tempfile::TempDir;
 
 // ── TestEnv ───────────────────────────────────────────────────────────────────
@@ -83,7 +83,7 @@ fn assert_slot_alive(storage: &dyn StorageEngine, page_id: u64, slot_id: u16) {
     let page = storage
         .read_page(page_id)
         .expect("read page for slot check");
-    let result = read_tuple(page, slot_id).expect("read_tuple");
+    let result = read_tuple(&page, slot_id).expect("read_tuple");
     assert!(
         result.is_some(),
         "slot ({page_id}, {slot_id}) must be alive but is dead"
@@ -94,7 +94,7 @@ fn assert_slot_dead(storage: &dyn StorageEngine, page_id: u64, slot_id: u16) {
     let page = storage
         .read_page(page_id)
         .expect("read page for slot check");
-    let result = read_tuple(page, slot_id).expect("read_tuple");
+    let result = read_tuple(&page, slot_id).expect("read_tuple");
     assert!(
         result.is_none(),
         "slot ({page_id}, {slot_id}) must be dead but is alive"
@@ -328,6 +328,61 @@ fn test_multiple_crash_recovery_cycles_idempotent() {
 // ── Scenario 7: integrity check confirms clean after each scenario ────────────
 // (Covered inline in scenarios 1-6 via post_recovery_check assertions.)
 
+// ── Scenario 7b: reserved-capacity growth remains recoverable ─────────────────
+
+#[test]
+fn test_reserved_capacity_growth_survives_crash_reopen() {
+    let env = TestEnv::new();
+    let mut committed_slots = Vec::new();
+    let initial_wal_len;
+    let mut crossed_reservation_boundary = false;
+
+    {
+        let (mut storage, mut mgr) = env.create();
+        initial_wal_len = std::fs::metadata(&env.wal).unwrap().len();
+
+        for i in 0u64..5000 {
+            mgr.begin().unwrap();
+            let payload = vec![(i & 0xFF) as u8; 512];
+            let (pid, sid) = do_insert(&mut storage, &mut mgr, &payload);
+            mgr.commit().unwrap();
+            committed_slots.push((pid, sid));
+
+            let wal_len = std::fs::metadata(&env.wal).unwrap().len();
+            if wal_len > initial_wal_len {
+                crossed_reservation_boundary = true;
+                break;
+            }
+        }
+
+        assert!(
+            crossed_reservation_boundary,
+            "test must cross at least one WAL reservation boundary"
+        );
+
+        storage.flush().unwrap();
+    }
+
+    let (storage, _, result) = env.open_with_recovery();
+    assert_eq!(result.undone_txns, 0, "all transactions were committed");
+
+    for (pid, sid) in &committed_slots {
+        assert_slot_alive(&storage, *pid, *sid);
+    }
+
+    let wal_reader = WalReader::open(&env.wal).unwrap();
+    let wal_entries: Vec<_> = wal_reader
+        .scan_forward(0)
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        wal_entries.len(),
+        committed_slots.len() * 3,
+        "begin/insert/commit entries must stop at the logical tail, not physical EOF"
+    );
+}
+
 // ── Scenario 8: corrupt checkpoint_lsn — documented failure mode ─────────────
 
 #[test]
@@ -408,4 +463,145 @@ fn test_partial_page_write_detected_as_checksum_mismatch() {
         result.err()
     );
     // Documents: full recovery from partial page write requires WAL redo (Phase 3.8b).
+}
+
+// ── Durability policy tests (Phase 3.19d) ──────────────────────────────────
+
+use axiomdb_storage::WalDurabilityPolicy;
+
+/// Strict policy: committed data survives crash (same as default behavior).
+#[test]
+fn test_strict_policy_committed_data_survives_crash() {
+    let env = TestEnv::new();
+
+    {
+        let (mut storage, mut mgr) = env.create();
+        // Strict is the default — no set_durability_policy needed.
+        assert_eq!(mgr.durability_policy(), WalDurabilityPolicy::Strict);
+
+        mgr.begin().unwrap();
+        do_insert(&mut storage, &mut mgr, b"strict-row");
+        mgr.commit().unwrap();
+
+        storage.flush().unwrap();
+    }
+
+    let (_storage, _, result) = env.open_with_recovery();
+    assert_eq!(result.undone_txns, 0);
+}
+
+/// Normal policy: commit flushes to OS but skips durable sync.
+/// After normal shutdown + reopen, data is present.
+#[test]
+fn test_normal_policy_data_present_after_clean_reopen() {
+    let env = TestEnv::new();
+    let (page_id, slot_id);
+
+    {
+        let (mut storage, mut mgr) = env.create();
+        mgr.set_durability_policy(WalDurabilityPolicy::Normal);
+
+        mgr.begin().unwrap();
+        (page_id, slot_id) = do_insert(&mut storage, &mut mgr, b"normal-row");
+        mgr.commit().unwrap();
+
+        // max_committed must advance immediately (not deferred).
+        assert_eq!(mgr.max_committed(), 1);
+
+        mgr.wal_mut().flush_buffer().unwrap();
+        storage.flush().unwrap();
+    }
+
+    let (storage, _, result) = env.open_with_recovery();
+    assert_eq!(result.undone_txns, 0);
+    assert_slot_alive(&storage, page_id, slot_id);
+}
+
+/// Off policy: commit advances max_committed without any flush/sync.
+/// After flush + reopen, data is present.
+#[test]
+fn test_off_policy_data_present_after_flush_and_reopen() {
+    let env = TestEnv::new();
+    let (page_id, slot_id);
+
+    {
+        let (mut storage, mut mgr) = env.create();
+        mgr.set_durability_policy(WalDurabilityPolicy::Off);
+
+        mgr.begin().unwrap();
+        (page_id, slot_id) = do_insert(&mut storage, &mut mgr, b"off-row");
+        mgr.commit().unwrap();
+
+        // max_committed must advance immediately.
+        assert_eq!(mgr.max_committed(), 1);
+
+        // Explicitly flush to make data recoverable.
+        mgr.wal_mut().flush_buffer().unwrap();
+        storage.flush().unwrap();
+    }
+
+    let (storage, _, result) = env.open_with_recovery();
+    assert_eq!(result.undone_txns, 0);
+    assert_slot_alive(&storage, page_id, slot_id);
+}
+
+/// Read-only transactions use flush_no_sync regardless of durability policy.
+#[test]
+fn test_read_only_txn_uses_flush_no_sync_regardless_of_policy() {
+    let env = TestEnv::new();
+
+    for policy in [
+        WalDurabilityPolicy::Strict,
+        WalDurabilityPolicy::Normal,
+        WalDurabilityPolicy::Off,
+    ] {
+        let (mut storage, mut mgr) = env.create();
+        mgr.set_durability_policy(policy);
+
+        // Insert one committed row first (DML so WAL is non-empty).
+        mgr.begin().unwrap();
+        do_insert(&mut storage, &mut mgr, b"data");
+        mgr.commit().unwrap();
+
+        // Read-only transaction: begin + commit without any DML.
+        mgr.begin().unwrap();
+        mgr.commit().unwrap();
+
+        assert_eq!(mgr.max_committed(), 2);
+
+        // Clean up for next iteration.
+        drop(mgr);
+        drop(storage);
+        let _ = std::fs::remove_file(&env.db);
+        let _ = std::fs::remove_file(&env.wal);
+    }
+}
+
+/// Multiple transactions under Normal policy all commit and are recoverable.
+#[test]
+fn test_normal_policy_multiple_txns_recoverable() {
+    let env = TestEnv::new();
+    let mut slots = Vec::new();
+
+    {
+        let (mut storage, mut mgr) = env.create();
+        mgr.set_durability_policy(WalDurabilityPolicy::Normal);
+
+        for i in 0u64..10 {
+            mgr.begin().unwrap();
+            let (pid, sid) = do_insert(&mut storage, &mut mgr, &i.to_le_bytes());
+            mgr.commit().unwrap();
+            slots.push((pid, sid));
+        }
+        assert_eq!(mgr.max_committed(), 10);
+
+        mgr.wal_mut().flush_buffer().unwrap();
+        storage.flush().unwrap();
+    }
+
+    let (storage, _, result) = env.open_with_recovery();
+    assert_eq!(result.undone_txns, 0);
+    for (pid, sid) in &slots {
+        assert_slot_alive(&storage, *pid, *sid);
+    }
 }

@@ -311,7 +311,8 @@ fn test_planner_uses_scan_for_low_cardinality() {
         .unwrap();
     db.txn.commit().unwrap();
     // Invalidate session cache so the planner reloads fresh stats.
-    db.ctx.invalidate_table("public", "t");
+    db.ctx
+        .invalidate_table(axiomdb_catalog::DEFAULT_DATABASE_NAME, "public", "t");
 
     // After stats override: ndv(code)=3, row_count=1200 → sel=0.33 > 0.20 → Scan.
     // The query must still return the correct row via a full table scan.

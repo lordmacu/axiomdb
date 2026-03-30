@@ -907,6 +907,7 @@ mod tests {
             param_count: 1,
             param_types: vec![0xfd], // MYSQL_TYPE_STRING
             analyzed_stmt: None,
+            compiled_database: "axiomdb".into(),
             compiled_at_version: 0,
             last_used_seq: 0,
             pending_long_data: vec![None; 1],
@@ -947,6 +948,7 @@ mod tests {
             param_count,
             param_types: vec![0xfd; param_count as usize], // VAR_STRING by default
             analyzed_stmt: None,
+            compiled_database: "axiomdb".into(),
             compiled_at_version: 0,
             last_used_seq: 0,
             pending_long_data: vec![None; param_count as usize],

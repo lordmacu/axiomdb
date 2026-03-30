@@ -5,7 +5,8 @@ Updated at each subphase close — always overwrite this file, never create new 
 
 Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batch delete),
              5.19a (executor decomposition — structural refactor, wire-invisible),
-             5.21 (transactional INSERT staging), 6.19 (WAL fsync pipeline smoke)
+             5.21 (transactional INSERT staging), 6.19 (WAL fsync pipeline smoke),
+             6.20 (UPDATE apply fast path smoke), 22b.3a (database catalog wire smoke)
 """
 import os
 import signal
@@ -121,6 +122,13 @@ def connect():
     )
 
 
+def connect_db(database):
+    return pymysql.connect(
+        host="127.0.0.1", port=PORT, user="root", password="",
+        database=database, autocommit=False,
+    )
+
+
 def connect_multi():
     return pymysql.connect(
         host="127.0.0.1", port=PORT, user="root", password="",
@@ -216,6 +224,106 @@ print("Server ready\n")
 
 conn = connect()
 cur = conn.cursor()
+
+# ── [22b.3a] Database catalog + session namespace smoke ─────────────────────
+
+print("\n[22b.3a] Database catalog + session namespace")
+cur.execute("SHOW DATABASES")
+dbs = sorted(row[0] for row in cur.fetchall())
+ok("SHOW DATABASES includes default axiomdb", dbs == ["axiomdb"], dbs)
+
+cur.execute("CREATE DATABASE analytics")
+conn.commit()
+cur.execute("SHOW DATABASES")
+dbs = sorted(row[0] for row in cur.fetchall())
+ok(
+    "SHOW DATABASES includes created database",
+    dbs == ["analytics", "axiomdb"],
+    dbs,
+)
+
+analytics_conn = connect_db("analytics")
+analytics_cur = analytics_conn.cursor()
+analytics_cur.execute("SELECT DATABASE()")
+analytics_db = analytics_cur.fetchone()[0]
+ok(
+    "Handshake database is visible through DATABASE()",
+    analytics_db == "analytics",
+    analytics_db,
+)
+analytics_cur.execute("CREATE TABLE db_scope (id INT)")
+analytics_cur.execute("INSERT INTO db_scope VALUES (10)")
+analytics_conn.commit()
+analytics_cur.execute("SHOW TABLES")
+ok(
+    "SHOW TABLES is scoped to selected database",
+    [row[0] for row in analytics_cur.fetchall()] == ["db_scope"],
+)
+
+conn.select_db("axiomdb")
+cur.execute("SELECT DATABASE()")
+ok("COM_INIT_DB switches selected database", cur.fetchone()[0] == "axiomdb")
+cur.execute("CREATE TABLE db_scope (id INT)")
+cur.execute("INSERT INTO db_scope VALUES (1)")
+conn.commit()
+cur.execute("SELECT COUNT(*) FROM db_scope")
+ok("axiomdb namespace resolves its own unqualified table", cur.fetchone()[0] == 1)
+
+conn.select_db("analytics")
+analytics_cur.execute("SELECT COUNT(*) FROM db_scope")
+ok(
+    "analytics namespace resolves its own unqualified table",
+    analytics_cur.fetchone()[0] == 1,
+)
+try:
+    analytics_cur.execute("DROP DATABASE analytics")
+    analytics_conn.commit()
+    ok("DROP DATABASE rejects active selected database", False)
+except pymysql.MySQLError as e:
+    ok(
+        "DROP DATABASE rejects active selected database",
+        e.args and e.args[0] == 1105,
+        e.args,
+    )
+
+conn.select_db("axiomdb")
+try:
+    conn.select_db("missing_db")
+    ok("COM_INIT_DB rejects unknown database", False)
+except pymysql.MySQLError as e:
+    ok(
+        "COM_INIT_DB rejects unknown database",
+        e.args and e.args[0] == 1049,
+        e.args,
+    )
+
+try:
+    bad_conn = connect_db("missing_db")
+    bad_conn.close()
+    ok("Handshake rejects unknown database", False)
+except pymysql.MySQLError as e:
+    ok(
+        "Handshake rejects unknown database",
+        e.args and e.args[0] == 1049,
+        e.args,
+    )
+
+cur.execute("DROP DATABASE analytics")
+conn.commit()
+cur.execute("SHOW DATABASES")
+dbs = sorted(row[0] for row in cur.fetchall())
+ok(
+    "DROP DATABASE removes database from catalog",
+    dbs == ["axiomdb"],
+    dbs,
+)
+try:
+    cur.execute("SELECT COUNT(*) FROM db_scope")
+    ok("axiomdb table survives analytics drop", cur.fetchone()[0] == 1)
+except pymysql.MySQLError as e:
+    ok("axiomdb table survives analytics drop", False, e.args)
+
+analytics_conn.close()
 
 cur.execute("CREATE TABLE wt_accounts (id INT UNIQUE, name TEXT, balance INT)")
 cur.execute("CREATE TABLE wt_items    (id INT UNIQUE, val TEXT)")
@@ -1346,7 +1454,7 @@ ok("SHOW VARIABLES LIKE 'sql_mode' returns row with STRICT_TRANS_TABLES",
 
 print("\n[SET strict_mode = OFF → permissive INSERT warns]")
 conn_strict = pymysql.connect(host="127.0.0.1", port=PORT, user="root", password="",
-                               database="test", charset="utf8mb4")
+                               database="axiomdb", charset="utf8mb4")
 cs = conn_strict.cursor()
 cs.execute("CREATE TABLE IF NOT EXISTS t_wire_strict (age INT)")
 cs.execute("DELETE FROM t_wire_strict")
@@ -1876,6 +1984,186 @@ ok(
 c619a.execute("DROP TABLE autocommit_pipe_users")
 conn_619a.close()
 conn_619b.close()
+
+# ── [6.20] UPDATE apply fast path — no-op + batched range apply ──────────────
+
+print("\n[6.20] UPDATE apply fast path")
+
+conn_620 = connect()
+c620 = conn_620.cursor()
+c620.execute(
+    "CREATE TABLE upd_apply_users (id INT PRIMARY KEY, active BOOL NOT NULL, score INT NOT NULL)"
+)
+c620.executemany(
+    "INSERT INTO upd_apply_users VALUES (%s, %s, %s)",
+    [
+        (1, False, 10),
+        (2, True, 20),
+        (3, True, 30),
+        (4, True, 40),
+        (5, True, 50),
+        (6, False, 60),
+    ],
+)
+conn_620.commit()
+
+c620.execute("UPDATE upd_apply_users SET score = score WHERE id >= 2 AND id < 6")
+noop_count = c620.rowcount
+conn_620.commit()
+c620.execute("SELECT id, score FROM upd_apply_users ORDER BY id ASC")
+noop_rows = c620.fetchall()
+ok(
+    "6.20 UPDATE no-op: matched-row count is preserved on PK range",
+    noop_count == 4,
+    noop_count,
+)
+ok(
+    "6.20 UPDATE no-op: unchanged rows skip physical mutation without changing results",
+    list(noop_rows) == [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)],
+    noop_rows,
+)
+
+c620.execute("UPDATE upd_apply_users SET score = score + 9 WHERE id >= 2 AND id < 6")
+range_count = c620.rowcount
+conn_620.commit()
+c620.execute("SELECT id, score FROM upd_apply_users ORDER BY id ASC")
+range_rows = c620.fetchall()
+ok(
+    "6.20 UPDATE range: PK-only apply path updates only targeted rows",
+    list(range_rows) == [(1, 10), (2, 29), (3, 39), (4, 49), (5, 59), (6, 60)],
+    range_rows,
+)
+ok(
+    "6.20 UPDATE range: affected-row count stays aligned with matched PK range",
+    range_count == 4,
+    range_count,
+)
+
+c620.execute("DROP TABLE upd_apply_users")
+conn_620.commit()
+conn_620.close()
+
+# ── 22b.3b: cross-database name resolution ────────────────────────────────────
+
+print("\n[22b.3b cross-database resolution]")
+conn_xdb = connect()
+cx = conn_xdb.cursor()
+
+# Setup: create analytics database with a table
+cx.execute("CREATE DATABASE analytics")
+conn_xdb.commit()
+cx.execute("USE analytics")
+cx.execute("CREATE TABLE events (id INT, name TEXT)")
+cx.execute("INSERT INTO events VALUES (1, 'click'), (2, 'view')")
+conn_xdb.commit()
+
+# Switch back to default db
+cx.execute("USE axiomdb")
+
+# 1. SELECT via 3-part name
+cx.execute("SELECT id, name FROM analytics.public.events")
+xdb_rows = cx.fetchall()
+ok("22b.3b SELECT analytics.public.events from axiomdb",
+   xdb_rows == ((1, "click"), (2, "view")),
+   xdb_rows)
+
+# 2. CREATE TABLE via 3-part name
+cx.execute("CREATE TABLE analytics.public.scores (id INT, val INT)")
+conn_xdb.commit()
+cx.execute("USE analytics")
+cx.execute("INSERT INTO scores VALUES (10, 100)")
+conn_xdb.commit()
+cx.execute("SELECT val FROM scores")
+ok("22b.3b CREATE TABLE via 3-part name works",
+   cx.fetchone() == (100,))
+
+# 3. INSERT cross-database
+cx.execute("USE axiomdb")
+cx.execute("CREATE TABLE local_copy (id INT, val INT)")
+conn_xdb.commit()
+cx.execute("INSERT INTO local_copy SELECT * FROM analytics.public.scores")
+conn_xdb.commit()
+cx.execute("SELECT COUNT(*) FROM local_copy")
+ok("22b.3b INSERT ... SELECT cross-database",
+   cx.fetchone() == (1,))
+
+# 4. UPDATE via 3-part name
+cx.execute("UPDATE analytics.public.scores SET val = 999")
+conn_xdb.commit()
+cx.execute("SELECT val FROM analytics.public.scores")
+ok("22b.3b UPDATE via 3-part name",
+   cx.fetchone() == (999,))
+
+# 5. DELETE via 3-part name
+cx.execute("DELETE FROM analytics.public.events WHERE id = 1")
+conn_xdb.commit()
+cx.execute("SELECT COUNT(*) FROM analytics.public.events")
+ok("22b.3b DELETE via 3-part name",
+   cx.fetchone() == (1,))
+
+# 6. DatabaseNotFound
+try:
+    cx.execute("SELECT * FROM ghost.public.t")
+    ok("22b.3b ghost database returns error", False)
+except Exception as e:
+    ok("22b.3b ghost database returns error",
+       "ghost" in str(e).lower() or "database" in str(e).lower(),
+       str(e))
+
+# 7. Unqualified still resolves to current db
+cx.execute("USE axiomdb")
+cx.execute("SELECT COUNT(*) FROM local_copy")
+ok("22b.3b unqualified still resolves to current db",
+   cx.fetchone() == (1,))
+
+# Cleanup
+cx.execute("DROP DATABASE analytics")
+conn_xdb.commit()
+cx.execute("DROP TABLE local_copy")
+conn_xdb.commit()
+conn_xdb.close()
+
+# ── 22b.4: schema namespacing ─────────────────────────────────────────────────
+
+print("\n[22b.4 schema namespacing]")
+conn_sch = connect()
+cs = conn_sch.cursor()
+
+# 1. CREATE SCHEMA
+cs.execute("CREATE SCHEMA inventory")
+conn_sch.commit()
+ok("22b.4 CREATE SCHEMA inventory succeeds", True)
+
+# 2. CREATE SCHEMA IF NOT EXISTS (no error on duplicate)
+cs.execute("CREATE SCHEMA IF NOT EXISTS inventory")
+conn_sch.commit()
+ok("22b.4 CREATE SCHEMA IF NOT EXISTS on existing schema", True)
+
+# 3. CREATE SCHEMA duplicate should error
+try:
+    cs.execute("CREATE SCHEMA inventory")
+    ok("22b.4 duplicate CREATE SCHEMA errors", False)
+except Exception as e:
+    ok("22b.4 duplicate CREATE SCHEMA errors",
+       "already exists" in str(e).lower(),
+       str(e))
+
+# 4. SET search_path
+cs.execute("SET search_path = 'inventory, public'")
+conn_sch.commit()
+ok("22b.4 SET search_path succeeds", True)
+
+# 5. current_schema() returns first path entry
+cs.execute("SELECT current_schema()")
+schema_val = cs.fetchone()[0]
+ok("22b.4 current_schema() returns public (static)",
+   schema_val == "public",
+   schema_val)
+
+# Cleanup
+cs.execute("DROP TABLE IF EXISTS inventory_test")
+conn_sch.commit()
+conn_sch.close()
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

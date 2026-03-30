@@ -299,3 +299,76 @@ fn exprs_same_col(a: &Expr, b: &Expr) -> bool {
 fn exprs_same_literal(a: &Expr, b: &Expr) -> bool {
     matches!((a, b), (Expr::Literal(va), Expr::Literal(vb)) if va == vb)
 }
+
+/// Collects all `col_idx` values referenced by `Expr::Column` nodes in the tree.
+///
+/// Used by Phase 6.20 (UPDATE index bailout) to determine whether any assigned
+/// column overlaps with a partial-index predicate's referenced columns.
+pub fn collect_column_indices(expr: &Expr) -> Vec<usize> {
+    let mut out = Vec::new();
+    collect_column_indices_inner(expr, &mut out);
+    out
+}
+
+fn collect_column_indices_inner(expr: &Expr, out: &mut Vec<usize>) {
+    match expr {
+        Expr::Column { col_idx, .. } => out.push(*col_idx),
+        Expr::Literal(_) => {}
+        Expr::IsNull { expr: inner, .. } => collect_column_indices_inner(inner, out),
+        Expr::UnaryOp { operand, .. } => collect_column_indices_inner(operand, out),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_column_indices_inner(left, out);
+            collect_column_indices_inner(right, out);
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_column_indices_inner(inner, out);
+            collect_column_indices_inner(low, out);
+            collect_column_indices_inner(high, out);
+        }
+        Expr::In {
+            expr: inner, list, ..
+        } => {
+            collect_column_indices_inner(inner, out);
+            for e in list {
+                collect_column_indices_inner(e, out);
+            }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            ..
+        } => {
+            collect_column_indices_inner(inner, out);
+            collect_column_indices_inner(pattern, out);
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_column_indices_inner(a, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_column_indices_inner(op, out);
+            }
+            for (cond, result) in when_thens {
+                collect_column_indices_inner(cond, out);
+                collect_column_indices_inner(result, out);
+            }
+            if let Some(el) = else_result {
+                collect_column_indices_inner(el, out);
+            }
+        }
+        Expr::Cast { expr: inner, .. } => collect_column_indices_inner(inner, out),
+        _ => {} // Subquery, Param, etc. — no column refs to collect
+    }
+}
