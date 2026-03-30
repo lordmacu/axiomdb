@@ -231,6 +231,23 @@ impl TxnManager {
         let txn_id = self.next_txn_id;
         self.next_txn_id += 1;
 
+        // Phase 7.15: transaction ID overflow prevention.
+        // u64 gives ~1.8×10^19 IDs — at 1M txn/s this lasts 584,942 years.
+        // Still, detect pathological usage early and warn before overflow.
+        const TXN_ID_WARN_90: u64 = u64::MAX / 10 * 9; // 90% capacity
+        const TXN_ID_WARN_50: u64 = u64::MAX / 2; // 50% capacity
+        if txn_id >= TXN_ID_WARN_90 {
+            tracing::error!(
+                txn_id,
+                "CRITICAL: transaction ID at 90% of u64 capacity — VACUUM FREEZE required"
+            );
+        } else if txn_id >= TXN_ID_WARN_50 {
+            tracing::warn!(
+                txn_id,
+                "transaction ID at 50% of u64 capacity — plan VACUUM FREEZE"
+            );
+        }
+
         let mut entry = WalEntry::new(0, txn_id, EntryType::Begin, 0, vec![], vec![], vec![]);
         self.wal.append(&mut entry)?;
 
