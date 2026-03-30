@@ -101,7 +101,7 @@ impl ServerBootstrapConfig {
 async fn main() {
     use std::sync::Arc;
     use tokio::net::TcpListener;
-    use tokio::sync::Mutex;
+    use tokio::sync::RwLock;
     use tracing::info;
     use tracing_subscriber::EnvFilter;
 
@@ -148,7 +148,7 @@ async fn main() {
     {
         Ok(db) => {
             info!("database opened successfully");
-            Arc::new(Mutex::new(db))
+            Arc::new(RwLock::new(db))
         }
         Err(e) => {
             tracing::error!(err = %e, "failed to open database");
