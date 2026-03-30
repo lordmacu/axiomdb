@@ -255,7 +255,7 @@
 - [x] 7.4 ✅ Lock-free readers with CoW — `Arc<RwLock<Database>>`; SELECT uses `db.read()` (concurrent, no blocking), DML uses `db.write()` (exclusive); `execute_read_only_with_ctx` takes `&dyn StorageEngine` shared ref; 7.4a production-safe storage: pwrite for writes, read-only Mmap, owned PageRef, deferred free queue
 - [x] 7.5 ✅ Writer serialization — `Arc<RwLock<Database>>` guarantees exclusive writer access via `db.write()`; only 1 writer at a time (whole-database granularity); per-table locking deferred to Phase 13.7 (row-level locking)
 - [x] 7.6 ✅ ROLLBACK — `TxnManager::rollback()` applies UndoOps in reverse: UndoInsert (mark_slot_dead), UndoDelete (clear_deletion), UndoUpdateInPlace (restore_tuple_image), UndoTruncate (clear_deletions_by_txn), UndoIndexInsert (BTree::delete_in); SQL `ROLLBACK` dispatched in executor; `discard_pending_inserts` for staged rows; implemented across Phase 3+7.3b
-- [ ] 7.7 ⏳ Concurrency tests — N simultaneous readers + N writers
+- [x] 7.7 ✅ Concurrency tests — 9 tokio integration tests: concurrent readers (8 parallel SELECTs), exclusive writer, sequential write consistency, interleaved read/write, delete visibility, index scan with dead entries (7.3b), vacuum cleanup, savepoint within transaction, concurrent insert+select monotonicity
 - [ ] 7.8 ⏳ Epoch-based reclamation — free CoW pages when no active snapshot references them
 - [ ] 7.9 ⏳ Resolve next_leaf CoW gap — linked list between leaves in Copy-on-Write (DEFERRED from 2.8)
 - [ ] 7.10 ⏳ Lock timeout — wait for lock with configurable timeout (`lock_timeout`); `LockTimeoutError` if expired; avoids simple deadlocks without a detector
