@@ -78,9 +78,9 @@ impl NodeCopy {
     fn read(storage: &dyn StorageEngine, pid: u64) -> Result<Self, DbError> {
         let page = storage.read_page(pid)?;
         if page.body()[0] == 1 {
-            Ok(Self::Leaf(*cast_leaf(page)))
+            Ok(Self::Leaf(*cast_leaf(&page)))
         } else {
-            Ok(Self::Internal(*cast_internal(page)))
+            Ok(Self::Internal(*cast_internal(&page)))
         }
     }
 }
@@ -133,10 +133,10 @@ impl BTree {
             // The borrow ends at the bottom of each branch before the next read_page call.
             let page = self.storage.read_page(pid)?;
             if page.body()[0] == 1 {
-                let node = cast_leaf(page);
+                let node = cast_leaf(&page);
                 return Ok(node.search(key).ok().map(|i| node.rid_at(i)));
             } else {
-                let node = cast_internal(page);
+                let node = cast_internal(&page);
                 let idx = node.find_child_idx(key);
                 pid = node.child_at(idx);
                 // `page` and `node` drop here — borrow released before next iteration
@@ -934,7 +934,7 @@ impl BTree {
         let (is_empty_internal, only_child) = {
             let page = storage.read_page(root_pid)?;
             if page.body()[0] == 0 {
-                let node = cast_internal(page);
+                let node = cast_internal(&page);
                 if node.num_keys() == 0 {
                     (true, node.child_at(0))
                 } else {
@@ -1004,7 +1004,7 @@ impl BTree {
             if page.body()[0] == 1 {
                 return Ok(pid);
             } else {
-                let node = cast_internal(page);
+                let node = cast_internal(&page);
                 pid = node.child_at(node.find_child_idx(key));
             }
         }
@@ -1019,7 +1019,7 @@ impl BTree {
 
     fn internal_underfull(storage: &dyn StorageEngine, pid: u64) -> Result<bool, DbError> {
         let page = storage.read_page(pid)?;
-        Ok(cast_internal(page).num_keys() < MIN_KEYS_INTERNAL)
+        Ok(cast_internal(&page).num_keys() < MIN_KEYS_INTERNAL)
     }
 
     // ── Static API (shared storage) ──────────────────────────────────────────
@@ -1042,10 +1042,10 @@ impl BTree {
         loop {
             let page = storage.read_page(pid)?;
             if page.body()[0] == 1 {
-                let node = cast_leaf(page);
+                let node = cast_leaf(&page);
                 return Ok(node.search(key).ok().map(|i| node.rid_at(i)));
             } else {
-                let node = cast_internal(page);
+                let node = cast_internal(&page);
                 pid = node.child_at(node.find_child_idx(key));
             }
         }
@@ -1168,7 +1168,7 @@ impl BTree {
             if page.body()[0] == 1 {
                 return Ok(pid);
             } else {
-                let node = cast_internal(page);
+                let node = cast_internal(&page);
                 pid = node.child_at(node.find_child_idx(key));
             }
         }
