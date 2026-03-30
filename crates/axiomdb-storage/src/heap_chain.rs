@@ -886,7 +886,7 @@ mod tests {
     }
 
     impl crate::StorageEngine for CountingStorage {
-        fn read_page(&self, page_id: u64) -> Result<&Page, DbError> {
+        fn read_page(&self, page_id: u64) -> Result<crate::page_ref::PageRef, DbError> {
             self.reads.fetch_add(1, Ordering::Relaxed);
             self.inner.read_page(page_id)
         }
@@ -1008,7 +1008,7 @@ mod tests {
 
         // At least one page must have been chained.
         let page = storage.read_page(root).unwrap();
-        let next = chain_next_page(page);
+        let next = chain_next_page(&page);
         assert_ne!(next, 0, "chain must have grown beyond root page");
 
         // All inserted rows must be visible.
@@ -1042,7 +1042,7 @@ mod tests {
 
         // Read back and verify chain pointer is preserved.
         let read_back = storage.read_page(p1).unwrap();
-        assert_eq!(chain_next_page(read_back), p2);
+        assert_eq!(chain_next_page(&read_back), p2);
     }
 
     // ── HeapChain::insert_batch tests ─────────────────────────────────────────

@@ -429,7 +429,7 @@ mod tests {
         // The slot must be dead after recovery.
         let page = storage.read_page(page_id).unwrap();
         assert!(
-            read_tuple(page, slot_id).unwrap().is_none(),
+            read_tuple(&page, slot_id).unwrap().is_none(),
             "crashed INSERT slot must be dead after recovery"
         );
     }
@@ -469,7 +469,7 @@ mod tests {
 
         // txn_id_deleted must be cleared — row is live again.
         let page = storage.read_page(page_id).unwrap();
-        let (hdr, _) = read_tuple(page, slot_id).unwrap().unwrap();
+        let (hdr, _) = read_tuple(&page, slot_id).unwrap().unwrap();
         assert_eq!(hdr.txn_id_deleted, 0, "crashed DELETE must be undone");
     }
 
@@ -517,12 +517,12 @@ mod tests {
 
         let page = storage.read_page(page_id).unwrap();
         // Old slot: live again (txn_id_deleted cleared).
-        let (old_hdr, _) = read_tuple(page, old_slot).unwrap().unwrap();
+        let (old_hdr, _) = read_tuple(&page, old_slot).unwrap().unwrap();
         assert_eq!(old_hdr.txn_id_deleted, 0, "old row must be restored");
         // New slot: dead.
         let new_slot = old_slot + 1;
         assert!(
-            read_tuple(page, new_slot).unwrap().is_none(),
+            read_tuple(&page, new_slot).unwrap().is_none(),
             "new slot from crashed UPDATE must be dead"
         );
     }
@@ -560,7 +560,7 @@ mod tests {
         CrashRecovery::recover(&mut storage, &wal).unwrap();
 
         let page = storage.read_page(page_id).unwrap();
-        let (hdr, data) = read_tuple(page, slot_id).unwrap().unwrap();
+        let (hdr, data) = read_tuple(&page, slot_id).unwrap().unwrap();
         assert_eq!(data, b"original");
         assert_eq!(hdr.txn_id_created, 1);
         assert_eq!(hdr.txn_id_deleted, 0);
@@ -631,11 +631,11 @@ mod tests {
 
         let page = storage.read_page(page_id).unwrap();
         // del_slot must be live again (undo of Delete).
-        let (hdr, _) = read_tuple(page, del_slot).unwrap().unwrap();
+        let (hdr, _) = read_tuple(&page, del_slot).unwrap().unwrap();
         assert_eq!(hdr.txn_id_deleted, 0);
         // ins_slot (= del_slot + 1) must be dead (undo of Insert).
         let ins_slot = del_slot + 1;
-        assert!(read_tuple(page, ins_slot).unwrap().is_none());
+        assert!(read_tuple(&page, ins_slot).unwrap().is_none());
     }
 
     // ── recover: respects checkpoint_lsn ─────────────────────────────────────
@@ -722,7 +722,7 @@ mod tests {
             // The slot must be dead (insert was rolled back by recovery).
             let page = storage.read_page(page_id).unwrap();
             assert!(
-                read_tuple(page, slot_id).unwrap().is_none(),
+                read_tuple(&page, slot_id).unwrap().is_none(),
                 "crashed insert must be dead after mmap recovery"
             );
         }

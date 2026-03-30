@@ -83,7 +83,7 @@ fn assert_slot_alive(storage: &dyn StorageEngine, page_id: u64, slot_id: u16) {
     let page = storage
         .read_page(page_id)
         .expect("read page for slot check");
-    let result = read_tuple(page, slot_id).expect("read_tuple");
+    let result = read_tuple(&page, slot_id).expect("read_tuple");
     assert!(
         result.is_some(),
         "slot ({page_id}, {slot_id}) must be alive but is dead"
@@ -94,7 +94,7 @@ fn assert_slot_dead(storage: &dyn StorageEngine, page_id: u64, slot_id: u16) {
     let page = storage
         .read_page(page_id)
         .expect("read page for slot check");
-    let result = read_tuple(page, slot_id).expect("read_tuple");
+    let result = read_tuple(&page, slot_id).expect("read_tuple");
     assert!(
         result.is_none(),
         "slot ({page_id}, {slot_id}) must be dead but is alive"
