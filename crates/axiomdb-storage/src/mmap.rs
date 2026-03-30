@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     dirty::PageDirtyTracker,
+    doublewrite::DoublewriteBuffer,
     engine::StorageEngine,
     freelist::FreeList,
     page::{Page, PageType, HEADER_SIZE, PAGE_SIZE},
@@ -102,6 +103,9 @@ pub struct MmapStorage {
     /// deferred frees with the epoch at which the page became unreachable.
     /// Defaults to 0 (meaning "release immediately on flush").
     current_snapshot_id: u64,
+    /// Doublewrite buffer for torn page repair (Phase 3.8c).
+    /// Holds the path to the `.dw` file alongside the main `.db` file.
+    dw_buffer: DoublewriteBuffer,
 }
 
 impl Drop for MmapStorage {
@@ -170,6 +174,7 @@ impl MmapStorage {
         let mmap = unsafe { Mmap::map(&file)? };
 
         debug!(path = %path.display(), "database initialized and ready");
+        let dw_buffer = DoublewriteBuffer::for_db(path);
         Ok(MmapStorage {
             mmap,
             file,
@@ -178,6 +183,7 @@ impl MmapStorage {
             dirty: PageDirtyTracker::new(),
             deferred_frees: Vec::new(),
             current_snapshot_id: 0,
+            dw_buffer,
         })
     }
 
@@ -193,6 +199,28 @@ impl MmapStorage {
         })?;
 
         info!(path = %path.display(), "opening database");
+
+        // ── Doublewrite recovery (Phase 3.8c) ───────────────────────────
+        // If a `.dw` file exists, a previous flush was interrupted by a crash.
+        // Repair any torn pages BEFORE creating the mmap — the mmap must see
+        // a consistent file to pass the checksum scan below.
+        let dw_buffer = DoublewriteBuffer::for_db(path);
+        if dw_buffer.exists() {
+            match dw_buffer.recover(&file) {
+                Ok(n) if n > 0 => {
+                    info!(repaired = n, "doublewrite recovery completed");
+                }
+                Ok(_) => {
+                    debug!("doublewrite file found but no repairs needed");
+                }
+                Err(e) => {
+                    warn!(error = %e, "doublewrite recovery failed, continuing");
+                }
+            }
+            if let Err(e) = dw_buffer.cleanup() {
+                warn!(error = %e, "failed to remove doublewrite file after recovery");
+            }
+        }
 
         // SAFETY: existing file, exclusive lock held. Read-only mapping.
         let mmap = unsafe { Mmap::map(&file)? };
@@ -249,6 +277,7 @@ impl MmapStorage {
             dirty: PageDirtyTracker::new(),
             deferred_frees: Vec::new(),
             current_snapshot_id: 0,
+            dw_buffer,
         })
     }
 
@@ -394,6 +423,33 @@ impl MmapStorage {
         }
         meta_page.update_checksum();
         meta_page
+    }
+
+    /// Copies raw page bytes from the mmap without CRC verification.
+    ///
+    /// Used by `flush()` to collect pages for the doublewrite buffer.
+    /// At flush time all `pwrite()` calls have completed and the mmap
+    /// (MAP_SHARED) reflects the committed state — no CRC check needed.
+    fn copy_raw_page_from_mmap(&self, page_id: u64) -> Result<[u8; PAGE_SIZE], DbError> {
+        let offset = page_id as usize * PAGE_SIZE;
+        if offset + PAGE_SIZE > self.mmap.len() {
+            return Err(DbError::PageNotFound { page_id });
+        }
+        let mut bytes = [0u8; PAGE_SIZE];
+        bytes.copy_from_slice(&self.mmap[offset..offset + PAGE_SIZE]);
+        Ok(bytes)
+    }
+
+    /// Builds the freelist bitmap page (page 1) from the current in-memory
+    /// `FreeList` without writing it to disk.
+    ///
+    /// Used by `flush()` to include the freelist in the doublewrite buffer
+    /// BEFORE the main `pwrite_freelist()` call.
+    fn build_freelist_page(&self) -> Page {
+        let mut page = Page::new(PageType::Free, 1);
+        self.freelist.to_bytes(page.body_mut());
+        page.update_checksum();
+        page
     }
 
     /// Writes the freelist bitmap to page 1 via `pwrite()`.
@@ -559,27 +615,69 @@ impl StorageEngine for MmapStorage {
     }
 
     fn flush(&mut self) -> Result<(), DbError> {
-        // Release deferred-free pages back to the freelist.
+        // Step 1: release deferred-free pages back to the freelist.
         // Under RwLock (Phase 7.4), the writer holds exclusive access during
         // flush, so no readers are active → u64::MAX releases all pages.
         // When snapshot slot tracking is added (Phase 7.8), pass the actual
         // oldest_active_snapshot instead.
         self.release_deferred_frees(u64::MAX)?;
 
-        // Serialize the freelist via pwrite if modified.
+        // Step 2: collect pages for the doublewrite buffer.
+        //
+        // We include pages 0 (meta) and 1 (freelist) unconditionally because
+        // grow() modifies them via pwrite without adding them to the dirty
+        // tracker. All other dirty pages are already in the main file (via
+        // pwrite) but not yet fsynced — the mmap (MAP_SHARED) reflects their
+        // committed state via the kernel page cache.
+        let has_changes = !self.dirty.is_empty() || self.freelist_dirty;
+
+        if has_changes {
+            let mut dw_pages: Vec<(u64, Vec<u8>)> = Vec::new();
+
+            // 2a: page 0 (meta) — may have been modified by grow().
+            let meta_bytes = self.copy_raw_page_from_mmap(0)?;
+            dw_pages.push((0, meta_bytes.to_vec()));
+
+            // 2b: page 1 (freelist) — build from in-memory state so the DW
+            //     has the freelist that WILL be written, not the stale on-disk one.
+            let freelist_page = self.build_freelist_page();
+            dw_pages.push((1, freelist_page.as_bytes().to_vec()));
+
+            // 2c: dirty data/index/overflow pages.
+            for page_id in self.dirty.sorted_ids() {
+                if page_id <= 1 {
+                    continue; // already included above
+                }
+                let bytes = self.copy_raw_page_from_mmap(page_id)?;
+                dw_pages.push((page_id, bytes.to_vec()));
+            }
+
+            // Step 3: write DW file and fsync — committed copy on disk.
+            let dw_refs: Vec<(u64, &[u8])> =
+                dw_pages.iter().map(|(id, b)| (*id, b.as_slice())).collect();
+            self.dw_buffer.write_and_sync(&dw_refs)?;
+        }
+
+        // Step 4: serialize the freelist via pwrite if modified.
         if self.freelist_dirty {
             self.pwrite_freelist()?;
         }
 
-        // fsync the file descriptor to ensure all pwrite() data is durable.
-        // This replaces the old mmap.flush_range() approach.
-        // fsync is correct for pwrite: it forces the kernel to flush the
-        // file's page cache to disk. All production DBs use this pattern.
+        // Step 5: fsync the main file — all pwrite() data becomes durable.
         self.file
             .sync_all()
             .map_err(|e| classify_io(e, "storage fsync"))?;
 
-        // All writes are durable — clear dirty tracking.
+        // Step 6: remove the DW file (non-fatal on failure).
+        // After the main fsync, the DW file is no longer needed. If removal
+        // fails, the next open() will find all pages valid and delete it.
+        if has_changes {
+            if let Err(e) = self.dw_buffer.cleanup() {
+                warn!(error = %e, "failed to remove doublewrite file");
+            }
+        }
+
+        // Step 7: clear tracking.
         self.freelist_dirty = false;
         self.dirty.clear();
         Ok(())
