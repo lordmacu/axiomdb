@@ -498,6 +498,12 @@ pub struct SessionContext {
     /// Per-transaction isolation level override set by
     /// `SET TRANSACTION ISOLATION LEVEL`. Consumed by the next `BEGIN`.
     pub next_txn_isolation: Option<axiomdb_core::IsolationLevel>,
+    /// Named savepoint stack for `SAVEPOINT / ROLLBACK TO / RELEASE` (Phase 7.12).
+    ///
+    /// Pushed by `SAVEPOINT name`, searched by name on `ROLLBACK TO` / `RELEASE`.
+    /// Stack is truncated on rollback/release (later savepoints destroyed).
+    /// Cleared entirely on `COMMIT` / `ROLLBACK`.
+    pub savepoints: Vec<(String, axiomdb_wal::Savepoint)>,
 }
 
 impl Default for SessionContext {
@@ -525,6 +531,7 @@ impl SessionContext {
             search_path: vec!["public".to_string()],
             transaction_isolation: axiomdb_core::IsolationLevel::default(),
             next_txn_isolation: None,
+            savepoints: Vec::new(),
         }
     }
 
