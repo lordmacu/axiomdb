@@ -245,6 +245,28 @@ impl<'src> Parser<'src> {
                 // Consume optional alias (some clients send it)
                 Ok(Stmt::TruncateTable(crate::ast::TruncateTableStmt { table }))
             }
+            Token::SavepointKw => {
+                self.advance();
+                let name = self.parse_identifier()?;
+                Ok(Stmt::Savepoint(name))
+            }
+            Token::Release => {
+                self.advance();
+                // RELEASE [SAVEPOINT] name
+                self.eat(&Token::SavepointKw); // optional SAVEPOINT keyword
+                let name = self.parse_identifier()?;
+                Ok(Stmt::ReleaseSavepoint(name))
+            }
+            Token::Vacuum => {
+                self.advance();
+                // VACUUM [table_name]
+                let table = if matches!(self.peek(), Token::Eof | Token::Semicolon) {
+                    None
+                } else {
+                    Some(self.parse_table_ref()?)
+                };
+                Ok(Stmt::Vacuum(crate::ast::VacuumStmt { table }))
+            }
             Token::Analyze => {
                 self.advance();
                 // ANALYZE [TABLE name [(column)]]
@@ -323,7 +345,14 @@ impl<'src> Parser<'src> {
             }
             Token::Rollback => {
                 self.advance();
-                Ok(Stmt::Rollback)
+                // ROLLBACK TO [SAVEPOINT] name — rollback to named savepoint
+                if self.eat(&Token::To) {
+                    self.eat(&Token::SavepointKw); // optional SAVEPOINT keyword
+                    let name = self.parse_identifier()?;
+                    Ok(Stmt::RollbackToSavepoint(name))
+                } else {
+                    Ok(Stmt::Rollback)
+                }
             }
             Token::Set => {
                 self.advance(); // consume SET

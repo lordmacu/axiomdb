@@ -83,6 +83,17 @@ pub enum UndoOp {
     /// Undo a full-table delete: scan the heap chain and clear txn_id_deleted
     /// for every slot deleted by this transaction.
     UndoTruncate { root_page_id: u64 },
+    /// Undo an index INSERT: remove the entry from the B-Tree (Phase 7.3b).
+    ///
+    /// Recorded when INSERT or UPDATE adds a new secondary index entry.
+    /// On ROLLBACK, the entry is deleted from the B-Tree so the index
+    /// returns to its pre-transaction state. The `root_page_id` is captured
+    /// at recording time to avoid catalog lookups during undo.
+    UndoIndexInsert {
+        index_id: u32,
+        root_page_id: u64,
+        key: Vec<u8>,
+    },
 }
 
 // ── ActiveTxn ────────────────────────────────────────────────────────────────
@@ -219,6 +230,23 @@ impl TxnManager {
 
         let txn_id = self.next_txn_id;
         self.next_txn_id += 1;
+
+        // Phase 7.15: transaction ID overflow prevention.
+        // u64 gives ~1.8×10^19 IDs — at 1M txn/s this lasts 584,942 years.
+        // Still, detect pathological usage early and warn before overflow.
+        const TXN_ID_WARN_90: u64 = u64::MAX / 10 * 9; // 90% capacity
+        const TXN_ID_WARN_50: u64 = u64::MAX / 2; // 50% capacity
+        if txn_id >= TXN_ID_WARN_90 {
+            tracing::error!(
+                txn_id,
+                "CRITICAL: transaction ID at 90% of u64 capacity — VACUUM FREEZE required"
+            );
+        } else if txn_id >= TXN_ID_WARN_50 {
+            tracing::warn!(
+                txn_id,
+                "transaction ID at 50% of u64 capacity — plan VACUUM FREEZE"
+            );
+        }
 
         let mut entry = WalEntry::new(0, txn_id, EntryType::Begin, 0, vec![], vec![], vec![]);
         self.wal.append(&mut entry)?;
@@ -543,6 +571,10 @@ impl TxnManager {
                 UndoOp::UndoTruncate { root_page_id } => {
                     HeapChain::clear_deletions_by_txn(storage, root_page_id, txn_id)?;
                 }
+                UndoOp::UndoIndexInsert { .. } => {
+                    // Handled by caller via pending_index_undos().
+                    // TxnManager cannot depend on axiomdb-index.
+                }
             }
         }
         Ok(())
@@ -596,6 +628,9 @@ impl TxnManager {
                 }
                 UndoOp::UndoTruncate { root_page_id } => {
                     HeapChain::clear_deletions_by_txn(storage, root_page_id, txn_id)?;
+                }
+                UndoOp::UndoIndexInsert { .. } => {
+                    // Handled by caller via pending_index_undos().
                 }
             }
         }
@@ -1022,6 +1057,78 @@ impl TxnManager {
             .append_with_buf(&mut entry, &mut self.wal_scratch)?;
         txn.undo_ops.push(UndoOp::UndoTruncate { root_page_id });
         Ok(())
+    }
+
+    // ── Index undo (Phase 7.3b) ────────────────────────────────────────────
+
+    /// Records an index INSERT undo operation so that ROLLBACK can remove the
+    /// entry from the B-Tree. Called by the executor after inserting a new
+    /// secondary index entry (INSERT or UPDATE of an indexed column).
+    ///
+    /// No WAL entry is written — index operations are derived from heap state
+    /// on crash recovery. This is purely for in-memory ROLLBACK.
+    pub fn record_index_insert(
+        &mut self,
+        index_id: u32,
+        root_page_id: u64,
+        key: Vec<u8>,
+    ) -> Result<(), DbError> {
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        active.undo_ops.push(UndoOp::UndoIndexInsert {
+            index_id,
+            root_page_id,
+            key,
+        });
+        Ok(())
+    }
+
+    /// Returns all `UndoIndexInsert` operations from the active transaction's
+    /// undo log, in reverse chronological order (last insert first).
+    ///
+    /// Called by the executor before `rollback()` or `rollback_to_savepoint()`
+    /// to handle B-Tree deletes at the executor layer (TxnManager cannot depend
+    /// on `axiomdb-index`).
+    ///
+    /// Returns `(index_id, root_page_id, key)` tuples.
+    pub fn collect_index_undos(&self) -> Vec<(u32, u64, Vec<u8>)> {
+        let Some(active) = &self.active else {
+            return Vec::new();
+        };
+        active
+            .undo_ops
+            .iter()
+            .rev()
+            .filter_map(|op| match op {
+                UndoOp::UndoIndexInsert {
+                    index_id,
+                    root_page_id,
+                    key,
+                } => Some((*index_id, *root_page_id, key.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Like [`collect_index_undos`] but only returns ops recorded after the
+    /// given savepoint.
+    pub fn collect_index_undos_since(&self, sp: &Savepoint) -> Vec<(u32, u64, Vec<u8>)> {
+        let Some(active) = &self.active else {
+            return Vec::new();
+        };
+        active
+            .undo_ops
+            .iter()
+            .skip(sp.undo_len)
+            .rev()
+            .filter_map(|op| match op {
+                UndoOp::UndoIndexInsert {
+                    index_id,
+                    root_page_id,
+                    key,
+                } => Some((*index_id, *root_page_id, key.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
     // ── Autocommit ───────────────────────────────────────────────────────────

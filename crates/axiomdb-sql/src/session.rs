@@ -240,6 +240,7 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         | DbError::IndexIntegrityFailure { .. }
         | DbError::SequenceOverflow
         | DbError::InvalidDsn { .. }
+        | DbError::LockTimeout
         | DbError::Internal { .. }
         | DbError::Other(_) => false,
     }
@@ -498,6 +499,18 @@ pub struct SessionContext {
     /// Per-transaction isolation level override set by
     /// `SET TRANSACTION ISOLATION LEVEL`. Consumed by the next `BEGIN`.
     pub next_txn_isolation: Option<axiomdb_core::IsolationLevel>,
+    /// Lock wait timeout in seconds (Phase 7.10).
+    ///
+    /// Maximum time a statement waits for a write lock before returning
+    /// `LockTimeout`. Default: 30 seconds (matches MySQL `innodb_lock_wait_timeout`).
+    /// Set via `SET lock_timeout = N`.
+    pub lock_timeout_secs: u64,
+    /// Named savepoint stack for `SAVEPOINT / ROLLBACK TO / RELEASE` (Phase 7.12).
+    ///
+    /// Pushed by `SAVEPOINT name`, searched by name on `ROLLBACK TO` / `RELEASE`.
+    /// Stack is truncated on rollback/release (later savepoints destroyed).
+    /// Cleared entirely on `COMMIT` / `ROLLBACK`.
+    pub savepoints: Vec<(String, axiomdb_wal::Savepoint)>,
 }
 
 impl Default for SessionContext {
@@ -525,6 +538,8 @@ impl SessionContext {
             search_path: vec!["public".to_string()],
             transaction_isolation: axiomdb_core::IsolationLevel::default(),
             next_txn_isolation: None,
+            lock_timeout_secs: 30,
+            savepoints: Vec::new(),
         }
     }
 

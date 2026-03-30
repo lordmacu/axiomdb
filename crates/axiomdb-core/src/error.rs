@@ -266,6 +266,12 @@ pub enum DbError {
     #[error("cannot drop database '{name}' because it is currently selected by this session")]
     ActiveDatabaseDrop { name: String },
 
+    // ── Locking ──────────────────────────────────────────────────
+    /// Lock wait timeout exceeded (Phase 7.10).
+    /// SQLSTATE 40001 (MySQL: ER_LOCK_WAIT_TIMEOUT = 1205)
+    #[error("lock wait timeout exceeded; try restarting transaction")]
+    LockTimeout,
+
     // ── General ──────────────────────────────────────────────────
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
@@ -353,6 +359,7 @@ impl DbError {
             // ── DDL ───────────────────────────────────────────────────────
             DbError::ColumnAlreadyExists { .. } => "42701",
             // ── Features ─────────────────────────────────────────────────
+            DbError::LockTimeout => "40001",
             DbError::NotImplemented { .. } => "0A000",
             // ── System / I/O ──────────────────────────────────────────────
             DbError::Io(_) => "58030",

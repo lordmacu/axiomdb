@@ -1,22 +1,20 @@
 //! Lazy range scan iterator over the B+ Tree.
 //!
-//! ## Why we do not use `next_leaf`
+//! ## Leaf chain traversal via `next_leaf` (Phase 7.9)
 //!
-//! With Copy-on-Write, each write to a leaf creates a new page_id. The left
-//! leaf that pointed to `old_leaf_pid` via `next_leaf` is left with a pointer
-//! to an already-freed page. To avoid this problem, the iterator traverses
-//! the tree from the root whenever it needs to advance to the next leaf.
+//! Each leaf stores a `next_leaf` pointer to the next leaf in ascending key
+//! order. Split operations update the predecessor leaf's `next_leaf` to
+//! maintain a correct chain under Copy-on-Write.
 //!
-//! **Cost**: O(log n) per leaf boundary crossing — acceptable for
-//! range scans where most time is spent in the leaves.
+//! The iterator follows `next_leaf` pointers at O(1) per leaf boundary,
+//! instead of re-descending the tree at O(log n).
 
 use std::ops::Bound;
 
 use axiomdb_core::{error::DbError, RecordId};
 use axiomdb_storage::StorageEngine;
 
-use crate::page_layout::{cast_internal, cast_leaf, NULL_PAGE};
-use crate::prefix::CompressedNode;
+use crate::page_layout::{cast_leaf, NULL_PAGE};
 
 /// Lazy range scan iterator.
 ///
@@ -24,31 +22,27 @@ use crate::prefix::CompressedNode;
 /// When a leaf is exhausted, it traverses the tree to find the next one.
 pub struct RangeIter<'a> {
     storage: &'a dyn StorageEngine,
-    root_pid: u64,
     current_pid: u64,
     slot_idx: usize,
     from: Bound<Vec<u8>>,
     to: Bound<Vec<u8>>,
-    last_key: Option<Vec<u8>>, // last key returned (to find the next leaf)
     done: bool,
 }
 
 impl<'a> RangeIter<'a> {
     pub(crate) fn new(
         storage: &'a dyn StorageEngine,
-        root_pid: u64,
+        _root_pid: u64,
         start_pid: u64,
         from: Bound<Vec<u8>>,
         to: Bound<Vec<u8>>,
     ) -> Self {
         Self {
             storage,
-            root_pid,
             current_pid: start_pid,
             slot_idx: 0,
             from,
             to,
-            last_key: None,
             done: false,
         }
     }
@@ -68,68 +62,6 @@ impl<'a> RangeIter<'a> {
             Bound::Unbounded => true,
             Bound::Included(hi) => key <= hi.as_slice(),
             Bound::Excluded(hi) => key < hi.as_slice(),
-        }
-    }
-
-    /// Finds the next leaf after `after_key`.
-    ///
-    /// Traverses the tree from the root, descending to the node that would contain
-    /// `after_key`, then climbs searching for the first right sibling, and
-    /// finally descends to the leftmost leaf of that subtree.
-    fn find_next_leaf(&self, after_key: &[u8]) -> Result<Option<u64>, DbError> {
-        // 1. Descend and save the stack with (page_id, next_sibling_idx)
-        let mut stack: Vec<(u64, usize)> = Vec::new();
-        let mut pid = self.root_pid;
-
-        loop {
-            let page = self.storage.read_page(pid)?;
-            if page.body()[0] == 1 {
-                // We reached a leaf. Exit and search for the next sibling.
-                break;
-            }
-            let node = cast_internal(&page);
-            let n = node.num_keys();
-
-            // Use prefix compression to compare only suffixes in nodes
-            // with keys sharing a common prefix (e.g., UUIDs, namespaced keys).
-            let keys: Vec<Box<[u8]>> = (0..n)
-                .map(|i| node.key_at(i).to_vec().into_boxed_slice())
-                .collect();
-            let children: Vec<u64> = (0..=n).map(|i| node.child_at(i)).collect();
-            let compressed = CompressedNode::from_keys(&keys, children);
-            let idx = compressed.find_child_idx(after_key);
-
-            // Save this node with the index of the NEXT sibling (idx+1)
-            stack.push((pid, idx + 1));
-            pid = compressed.children[idx];
-        }
-
-        // 2. Climb until we find a right sibling
-        loop {
-            let Some((parent_pid, next_idx)) = stack.pop() else {
-                return Ok(None); // No more leaves
-            };
-
-            let page = self.storage.read_page(parent_pid)?;
-            let node = cast_internal(&page);
-            if next_idx <= node.num_keys() {
-                // There is a child at next_idx → descend to the leftmost leaf
-                let subtree_root = node.child_at(next_idx);
-                return Ok(Some(Self::leftmost_leaf(self.storage, subtree_root)?));
-            }
-            // This node also has no more children → keep climbing
-        }
-    }
-
-    /// Returns the page_id of the leftmost leaf of the subtree.
-    fn leftmost_leaf(storage: &dyn StorageEngine, pid: u64) -> Result<u64, DbError> {
-        let mut pid = pid;
-        loop {
-            let page = storage.read_page(pid)?;
-            if page.body()[0] == 1 {
-                return Ok(pid);
-            }
-            pid = cast_internal(&page).child_at(0);
         }
     }
 }
@@ -192,35 +124,31 @@ impl<'a> Iterator for RangeIter<'a> {
                     return None;
                 }
                 SlotResult::Found(key, rid) => {
-                    self.last_key = Some(key.clone());
                     return Some(Ok((key, rid)));
                 }
                 SlotResult::Exhausted => {
-                    // Leaf exhausted: find the next one via tree traversal
-                    let after_key = match self.last_key.take() {
-                        Some(k) => k,
-                        None => {
-                            // Empty leaf or all entries were Before, no more
-                            self.done = true;
-                            return None;
-                        }
+                    // Phase 7.9: follow next_leaf pointer (O(1)) instead of
+                    // re-descending the tree from root (O(log n)).
+                    // Split operations maintain correct next_leaf under CoW.
+                    let next_pid = {
+                        let page = match self.storage.read_page(self.current_pid) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                self.done = true;
+                                return Some(Err(e));
+                            }
+                        };
+                        let node = cast_leaf(&page);
+                        node.next_leaf_val()
                     };
 
-                    match self.find_next_leaf(&after_key) {
-                        Err(e) => {
-                            self.done = true;
-                            return Some(Err(e));
-                        }
-                        Ok(None) => {
-                            self.done = true;
-                            return None;
-                        }
-                        Ok(Some(next_pid)) => {
-                            self.current_pid = next_pid;
-                            self.slot_idx = 0;
-                            self.last_key = Some(after_key);
-                        }
+                    if next_pid == NULL_PAGE {
+                        self.done = true;
+                        return None;
                     }
+
+                    self.current_pid = next_pid;
+                    self.slot_idx = 0;
                 }
             }
         }

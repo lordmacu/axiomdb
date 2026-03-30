@@ -31,6 +31,7 @@ pub mod packets;
 pub mod prepared;
 pub mod result;
 pub mod session;
+pub mod snapshot_registry;
 pub mod status;
 
 pub use database::Database;

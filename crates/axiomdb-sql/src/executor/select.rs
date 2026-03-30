@@ -121,9 +121,15 @@ fn execute_select_ctx(
                     match BTree::lookup_in(storage, index_def.root_page_id, key)? {
                         None => vec![],
                         Some(rid) => {
-                            match TableEngine::read_row(storage, &resolved.columns, rid)? {
-                                None => vec![], // row was deleted
-                                Some(values) => vec![(rid, values)],
+                            if !HeapChain::is_slot_visible(
+                                storage, rid.page_id, rid.slot_id, snap,
+                            )? {
+                                vec![]
+                            } else {
+                                match TableEngine::read_row(storage, &resolved.columns, rid)? {
+                                    None => vec![],
+                                    Some(values) => vec![(rid, values)],
+                                }
                             }
                         }
                     }
@@ -136,6 +142,11 @@ fn execute_select_ctx(
                         BTree::range_in(storage, index_def.root_page_id, Some(&lo), Some(&hi))?;
                     let mut result = Vec::with_capacity(pairs.len());
                     for (rid, _k) in pairs {
+                        if !HeapChain::is_slot_visible(
+                            storage, rid.page_id, rid.slot_id, snap,
+                        )? {
+                            continue;
+                        }
                         if let Some(values) =
                             TableEngine::read_row(storage, &resolved.columns, rid)?
                         {
@@ -159,6 +170,10 @@ fn execute_select_ctx(
                 let pairs = BTree::range_in(storage, index_def.root_page_id, lo_ref, hi_ref)?;
                 let mut result = Vec::with_capacity(pairs.len());
                 for (rid, _key) in pairs {
+                    // Phase 7.3b: filter dead index entries by heap visibility.
+                    if !HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap)? {
+                        continue;
+                    }
                     if let Some(values) = TableEngine::read_row(storage, &resolved.columns, rid)? {
                         result.push((rid, values));
                     }
@@ -491,9 +506,16 @@ fn execute_select(
                     match BTree::lookup_in(storage, index_def.root_page_id, key)? {
                         None => vec![],
                         Some(rid) => {
-                            match TableEngine::read_row(storage, &resolved.columns, rid)? {
-                                None => vec![], // row was deleted
-                                Some(values) => vec![(rid, values)],
+                            // Phase 7.3b: visibility check for dead index entries.
+                            if !axiomdb_storage::heap_chain::HeapChain::is_slot_visible(
+                                storage, rid.page_id, rid.slot_id, snap,
+                            )? {
+                                vec![]
+                            } else {
+                                match TableEngine::read_row(storage, &resolved.columns, rid)? {
+                                    None => vec![],
+                                    Some(values) => vec![(rid, values)],
+                                }
                             }
                         }
                     }
@@ -504,6 +526,12 @@ fn execute_select(
                         BTree::range_in(storage, index_def.root_page_id, Some(&lo), Some(&hi))?;
                     let mut result = Vec::with_capacity(pairs.len());
                     for (rid, _k) in pairs {
+                        // Phase 7.3b: filter dead index entries by heap visibility.
+                        if !axiomdb_storage::heap_chain::HeapChain::is_slot_visible(
+                            storage, rid.page_id, rid.slot_id, snap,
+                        )? {
+                            continue;
+                        }
                         if let Some(values) =
                             TableEngine::read_row(storage, &resolved.columns, rid)?
                         {
@@ -526,6 +554,13 @@ fn execute_select(
                 let pairs = BTree::range_in(storage, index_def.root_page_id, lo_ref, hi_ref)?;
                 let mut result = Vec::with_capacity(pairs.len());
                 for (rid, _key) in pairs {
+                    // Phase 7.3b: dead index entries (from MVCC lazy delete) must
+                    // be filtered by heap visibility before returning rows.
+                    if !axiomdb_storage::heap_chain::HeapChain::is_slot_visible(
+                        storage, rid.page_id, rid.slot_id, snap,
+                    )? {
+                        continue;
+                    }
                     if let Some(values) = TableEngine::read_row(storage, &resolved.columns, rid)? {
                         result.push((rid, values));
                     }

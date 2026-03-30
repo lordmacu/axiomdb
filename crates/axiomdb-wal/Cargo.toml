@@ -9,6 +9,7 @@ license.workspace = true
 axiomdb-core    = { workspace = true }
 axiomdb-storage = { workspace = true }
 thiserror       = { workspace = true }
+tracing         = { workspace = true }
 crc32c          = "0.6"
 tokio           = { workspace = true, features = ["sync"] }
 libc            = "0.2"

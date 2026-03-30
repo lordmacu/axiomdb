@@ -298,9 +298,17 @@ pub async fn handle_connection_with_timeouts(
 
     // Clone Arc<AtomicU64> and Arc<StatusRegistry> once per connection — no lock
     // needed after this point for either. (Phase 5.13 + 5.9c)
-    let (schema_version, status): (Arc<AtomicU64>, Arc<StatusRegistry>) = {
+    let (schema_version, status, snapshot_registry): (
+        Arc<AtomicU64>,
+        Arc<StatusRegistry>,
+        Arc<super::snapshot_registry::SnapshotRegistry>,
+    ) = {
         let guard = db.write().await;
-        (Arc::clone(&guard.schema_version), Arc::clone(&guard.status))
+        (
+            Arc::clone(&guard.schema_version),
+            Arc::clone(&guard.status),
+            Arc::clone(&guard.snapshot_registry),
+        )
     };
 
     // RAII guard: increments `threads_connected` now, decrements on drop.
@@ -617,12 +625,23 @@ pub async fn handle_connection_with_timeouts(
 
                     let exec_result = if is_read_only {
                         let guard = db.read().await;
-                        guard
+                        // Phase 7.8: register snapshot for epoch tracking.
+                        let snap_id = guard.txn.max_committed() + 1;
+                        snapshot_registry.register(conn_id, snap_id);
+                        let r = guard
                             .execute_read_query(stmt_sql, &mut session, &mut schema_cache)
-                            .map(|qr| (qr, None))
+                            .map(|qr| (qr, None));
+                        snapshot_registry.unregister(conn_id);
+                        r
                     } else {
-                        let mut guard = db.write().await;
-                        guard.execute_query(stmt_sql, &mut session, &mut schema_cache)
+                        // Phase 7.10: lock timeout — avoid indefinite waits.
+                        let timeout_dur = std::time::Duration::from_secs(session.lock_timeout_secs);
+                        match tokio::time::timeout(timeout_dur, db.write()).await {
+                            Err(_elapsed) => Err(DbError::LockTimeout),
+                            Ok(mut guard) => {
+                                guard.execute_query(stmt_sql, &mut session, &mut schema_cache)
+                            }
+                        }
                     };
 
                     match exec_result {
