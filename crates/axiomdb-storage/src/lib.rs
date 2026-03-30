@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod dirty;
+pub mod doublewrite;
 pub mod engine;
 pub mod freelist;
 pub mod heap;
@@ -15,6 +16,7 @@ pub mod page_ref;
 
 pub use config::{DbConfig, WalDurabilityPolicy};
 pub use dirty::PageDirtyTracker;
+pub use doublewrite::DoublewriteBuffer;
 pub use engine::StorageEngine;
 pub use freelist::FreeList;
 pub use heap::{
