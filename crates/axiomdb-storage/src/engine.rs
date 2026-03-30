@@ -92,15 +92,17 @@ pub mod tests {
         assert_eq!(read.body()[0], 0xAB);
         assert_eq!(read.body()[1], 0xCD);
 
-        // free + realloc reuses the page_id.
+        // free + flush (releases deferred frees) + realloc reuses the page_id.
         engine.free_page(id1).unwrap();
+        engine.flush().unwrap(); // release deferred frees to freelist
         let id_reused = engine.alloc_page(PageType::Data).unwrap();
         assert_eq!(id_reused, id1);
 
         // double-free: freeing id1 without re-allocating it → error.
         // id1 is USED (we just re-allocated it), so freeing it once
         // is correct; freeing it twice in a row is a double-free.
-        engine.free_page(id1).unwrap(); // first free — valid
+        engine.free_page(id1).unwrap(); // first free — deferred
+        engine.flush().unwrap(); // release to freelist
         assert!(engine.free_page(id1).is_err()); // second — double-free
 
         // read on non-existent page is an error.
