@@ -60,6 +60,9 @@ enum InsertResult {
         left_pid: u64,
         right_pid: u64,
         sep: Vec<u8>,
+        /// `true` when the split was a leaf split (Phase 7.9: predecessor
+        /// next_leaf must be updated).
+        leaf_split: bool,
     },
 }
 
@@ -164,7 +167,9 @@ impl BTree {
                 left_pid,
                 right_pid,
                 sep,
+                ..
             } => {
+                // Root split: no predecessor to update (left_pid is the leftmost leaf).
                 let new_root = Self::alloc_root(self.storage.as_mut(), &sep, left_pid, right_pid)?;
                 self.root_pid
                     .compare_exchange(root, new_root, Ordering::AcqRel, Ordering::Acquire)
@@ -210,7 +215,16 @@ impl BTree {
                         left_pid,
                         right_pid,
                         sep,
+                        leaf_split,
                     } => {
+                        // Phase 7.9: update predecessor leaf's next_leaf pointer
+                        // so the leaf chain stays correct under CoW.
+                        if leaf_split && child_idx > 0 {
+                            Self::update_predecessor_next_leaf(
+                                storage, &node, child_idx, left_pid,
+                            )?;
+                        }
+
                         let mut node2 = node;
                         node2.set_child_at(child_idx, left_pid);
 
@@ -312,6 +326,7 @@ impl BTree {
             left_pid,
             right_pid,
             sep,
+            leaf_split: true,
         })
     }
 
@@ -387,6 +402,7 @@ impl BTree {
             left_pid,
             right_pid,
             sep: new_sep,
+            leaf_split: false,
         })
     }
 
@@ -977,6 +993,46 @@ impl BTree {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
+    /// Phase 7.9: after a leaf split at `child_idx` in `parent`, update the
+    /// predecessor leaf's `next_leaf` to point to `new_left_pid`.
+    ///
+    /// The predecessor is the rightmost leaf of the subtree rooted at
+    /// `parent.child(child_idx - 1)`. Cost: O(height) descent — acceptable
+    /// because splits are rare (~1 per ORDER_LEAF inserts).
+    fn update_predecessor_next_leaf(
+        storage: &mut dyn StorageEngine,
+        parent: &InternalNodePage,
+        child_idx: usize,
+        new_left_pid: u64,
+    ) -> Result<(), DbError> {
+        debug_assert!(child_idx > 0, "child_idx must be > 0 for predecessor");
+        let left_sibling_pid = parent.child_at(child_idx - 1);
+        let pred_pid = Self::descend_rightmost_leaf(storage, left_sibling_pid)?;
+
+        let raw = *storage.read_page(pred_pid)?.as_bytes();
+        let mut page = Page::from_bytes(raw)?;
+        let leaf = cast_leaf_mut(&mut page);
+        leaf.set_next_leaf(new_left_pid);
+        page.update_checksum();
+        storage.write_page(pred_pid, &page)?;
+        Ok(())
+    }
+
+    /// Descends from `pid` to the rightmost leaf in its subtree.
+    fn descend_rightmost_leaf(storage: &dyn StorageEngine, mut pid: u64) -> Result<u64, DbError> {
+        loop {
+            let page = storage.read_page(pid)?;
+            if page.body()[0] == 1 {
+                // Leaf node — this is the rightmost leaf.
+                return Ok(pid);
+            }
+            let node = cast_internal(&page);
+            let n = node.num_keys();
+            // Rightmost child is at index n (n keys → n+1 children).
+            pid = node.child_at(n);
+        }
+    }
+
     fn check_key(key: &[u8]) -> Result<(), DbError> {
         if key.is_empty() || key.len() > MAX_KEY_LEN {
             return Err(DbError::KeyTooLong {
@@ -1078,6 +1134,7 @@ impl BTree {
                 left_pid,
                 right_pid,
                 sep,
+                ..
             } => {
                 let new_root = Self::alloc_root(storage, &sep, left_pid, right_pid)?;
                 root_pid.store(new_root, Ordering::Release);
