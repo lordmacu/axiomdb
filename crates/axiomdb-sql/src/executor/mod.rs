@@ -393,16 +393,61 @@ pub fn execute_with_ctx(
                 // Flush any staged rows before writing the Commit WAL entry.
                 flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
                 ctx.in_explicit_txn = false;
+                ctx.savepoints.clear(); // all savepoints destroyed on COMMIT
                 return txn.commit().map(|_| QueryResult::Empty);
             }
             Stmt::Rollback => {
                 // Discard staged rows without writing to heap or WAL.
                 ctx.discard_pending_inserts();
+                ctx.savepoints.clear(); // all savepoints destroyed on ROLLBACK
                 return txn.rollback(storage).map(|_| QueryResult::Empty);
             }
             Stmt::Begin => {
                 let txn_id = txn.active_txn_id().unwrap_or(0);
                 return Err(DbError::TransactionAlreadyActive { txn_id });
+            }
+            Stmt::Savepoint(ref name) => {
+                flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
+                let sp = txn.savepoint();
+                ctx.savepoints.push((name.clone(), sp));
+                return Ok(QueryResult::Empty);
+            }
+            Stmt::RollbackToSavepoint(ref name) => {
+                // Find savepoint by name (most recent match).
+                let pos = ctx.savepoints.iter().rposition(|(n, _)| n == name);
+                match pos {
+                    None => {
+                        return Err(DbError::Other(format!("SAVEPOINT '{name}' does not exist")));
+                    }
+                    Some(idx) => {
+                        // Discard staged rows.
+                        ctx.discard_pending_inserts();
+                        // Apply index undo ops for entries after this savepoint.
+                        let index_undos = txn.collect_index_undos_since(&ctx.savepoints[idx].1);
+                        for (_index_id, root_page_id, key) in index_undos {
+                            let root_pid = std::sync::atomic::AtomicU64::new(root_page_id);
+                            let _ = axiomdb_index::BTree::delete_in(storage, &root_pid, &key);
+                        }
+                        let sp = ctx.savepoints[idx].1;
+                        txn.rollback_to_savepoint(sp, storage)?;
+                        // Destroy all savepoints after the target (MySQL behavior).
+                        ctx.savepoints.truncate(idx + 1);
+                        return Ok(QueryResult::Empty);
+                    }
+                }
+            }
+            Stmt::ReleaseSavepoint(ref name) => {
+                let pos = ctx.savepoints.iter().rposition(|(n, _)| n == name);
+                match pos {
+                    None => {
+                        return Err(DbError::Other(format!("SAVEPOINT '{name}' does not exist")));
+                    }
+                    Some(idx) => {
+                        // Destroy target savepoint and all later ones.
+                        ctx.savepoints.truncate(idx);
+                        return Ok(QueryResult::Empty);
+                    }
+                }
             }
             _ => {}
         }
@@ -488,6 +533,9 @@ pub fn execute_with_ctx(
             Stmt::Rollback => {
                 ctx.warn(1592, "There is no active transaction");
                 Ok(QueryResult::Empty)
+            }
+            Stmt::Savepoint(_) | Stmt::RollbackToSavepoint(_) | Stmt::ReleaseSavepoint(_) => {
+                Err(DbError::NoActiveTransaction)
             }
             other => {
                 txn.begin()?;
@@ -691,6 +739,7 @@ fn dispatch_ctx(
             execute_alter_table(s, storage, txn, &db)
         }
         Stmt::Analyze(s) => execute_analyze(s, storage, txn, ctx),
+        Stmt::Vacuum(s) => crate::vacuum::execute_vacuum(s, storage, txn, bloom, ctx),
         Stmt::Set(s) => execute_set_ctx(s, ctx),
         Stmt::UseDatabase(s) => execute_use_database(s, storage, txn, ctx),
         Stmt::ShowDatabases(s) => execute_show_databases(s, storage, txn),
@@ -875,6 +924,19 @@ fn execute_set_ctx(stmt: SetStmt, ctx: &mut SessionContext) -> Result<QueryResul
             }
             ctx.transaction_isolation = level;
         }
+        "lock_timeout" | "lock_wait_timeout" | "innodb_lock_wait_timeout" => {
+            let raw = match set_value_to_setting_string(&stmt.value)? {
+                None => {
+                    ctx.lock_timeout_secs = 30; // default
+                    return Ok(QueryResult::Empty);
+                }
+                Some(s) => s,
+            };
+            let secs: u64 = raw.parse().map_err(|_| DbError::InvalidValue {
+                reason: format!("lock_timeout: expected integer seconds, got '{raw}'"),
+            })?;
+            ctx.lock_timeout_secs = secs;
+        }
         _ => {}
     }
     Ok(QueryResult::Empty)
@@ -932,6 +994,14 @@ fn dispatch(
         Stmt::Analyze(_) => Err(DbError::NotImplemented {
             feature: "ANALYZE requires session context — use execute_with_ctx".into(),
         }),
+        Stmt::Vacuum(_) => Err(DbError::NotImplemented {
+            feature: "VACUUM requires session context — use execute_with_ctx".into(),
+        }),
+        Stmt::Savepoint(_) | Stmt::RollbackToSavepoint(_) | Stmt::ReleaseSavepoint(_) => {
+            Err(DbError::NotImplemented {
+                feature: "SAVEPOINT requires session context — use execute_with_ctx".into(),
+            })
+        }
     }
 }
 

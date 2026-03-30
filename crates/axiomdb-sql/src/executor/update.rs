@@ -152,6 +152,7 @@ fn execute_update_ctx(
                 storage,
                 txn,
                 bloom,
+                snap,
             )?;
             ctx.invalidate_all();
         }
@@ -269,6 +270,7 @@ fn execute_update(
                     (old_rid, old_values, new_rid, new_values)
                 })
                 .collect();
+            let snap = txn.active_snapshot()?;
             apply_update_index_maintenance(
                 &mut secondary_indexes,
                 &compiled_preds,
@@ -276,6 +278,7 @@ fn execute_update(
                 storage,
                 txn,
                 &mut noop_bloom,
+                snap,
             )?;
         }
     }
@@ -319,6 +322,7 @@ fn apply_update_index_maintenance(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
     bloom: &mut crate::bloom::BloomRegistry,
+    snap: TransactionSnapshot,
 ) -> Result<(), DbError> {
     for (idx_pos, idx) in current_indexes.iter_mut().enumerate() {
         if idx.columns.is_empty() {
@@ -326,6 +330,8 @@ fn apply_update_index_maintenance(
         }
         let pred = compiled_preds.get(idx_pos).and_then(|p| p.as_ref());
 
+        // Phase 7.3b — HOT optimization: per-index check.
+        // If no key column changed for any row in this batch, skip this index entirely.
         let mut delete_keys: Vec<Vec<u8>> = Vec::new();
         let mut insert_rows: Vec<(RecordId, &Vec<Value>)> = Vec::new();
         for (old_rid, old_values, new_rid, new_values) in update_pairs {
@@ -337,17 +343,26 @@ fn apply_update_index_maintenance(
                 new_values,
                 *new_rid,
             )? {
-                if let Some(key_vals) =
-                    crate::index_maintenance::index_key_values_if_indexed(idx, old_values, pred)?
-                {
-                    delete_keys.push(crate::index_maintenance::encode_index_entry_key(
-                        idx, &key_vals, *old_rid,
-                    )?);
+                // Phase 7.3b — Lazy delete: only unique/FK indexes have their old
+                // entries removed immediately. Unique: B-Tree enforces uniqueness
+                // internally (DuplicateKey). FK: reverse-lookup for child rows.
+                // Non-unique secondary indexes leave old entries in place.
+                if idx.is_unique || idx.is_fk_index {
+                    if let Some(key_vals) =
+                        crate::index_maintenance::index_key_values_if_indexed(
+                            idx, old_values, pred,
+                        )?
+                    {
+                        delete_keys.push(crate::index_maintenance::encode_index_entry_key(
+                            idx, &key_vals, *old_rid,
+                        )?);
+                    }
                 }
                 insert_rows.push((*new_rid, new_values));
             }
         }
 
+        // Delete old keys for unique/FK indexes (B-Tree enforces uniqueness).
         if !delete_keys.is_empty() {
             delete_keys.sort_unstable();
             if let Some(new_root) = crate::index_maintenance::delete_many_from_single_index(
@@ -365,12 +380,26 @@ fn apply_update_index_maintenance(
                 .iter()
                 .map(|(rid, vals)| (vals.as_slice(), *rid))
                 .collect();
+
+            // Record index undo BEFORE inserting so ROLLBACK can reverse them.
+            // We encode each new key and record it in the undo log.
+            for &(vals, rid) in &batch_refs {
+                if let Some(key_vals) =
+                    crate::index_maintenance::index_key_values_if_indexed(idx, vals, pred)?
+                {
+                    let key =
+                        crate::index_maintenance::encode_index_entry_key(idx, &key_vals, rid)?;
+                    let _ = txn.record_index_insert(idx.index_id, idx.root_page_id, key);
+                }
+            }
+
             if let Some(new_root) = crate::index_maintenance::insert_many_into_single_index(
                 idx,
                 pred,
                 &batch_refs,
                 storage,
                 bloom,
+                snap,
             )? {
                 CatalogWriter::new(storage, txn)?.update_index_root(idx.index_id, new_root)?;
             }

@@ -164,6 +164,11 @@ pub fn dberror_to_mysql(e: &DbError, sql: Option<&str>) -> MysqlError {
             format!("Internal: column index {idx} out of bounds (row has {len} columns)"),
         ),
         DbError::Internal { message } => (1105, b"HY000", format!("Internal error: {message}")),
+        DbError::LockTimeout => (
+            1205,
+            b"HY000",
+            "Lock wait timeout exceeded; try restarting transaction".into(),
+        ),
         // Fallback for storage, WAL, and other internal errors
         other => (1105, b"HY000", other.to_string()),
     };

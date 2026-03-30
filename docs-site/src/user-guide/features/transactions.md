@@ -59,8 +59,9 @@ To group multiple statements atomically, always use explicit `BEGIN ... COMMIT`.
 
 ## SAVEPOINT — Partial Rollback
 
-A savepoint marks a point within a transaction to which you can roll back without
-aborting the entire transaction.
+Savepoints mark a point within a transaction to which you can roll back without
+aborting the entire transaction. ORMs (Django, Rails, Sequelize) use savepoints
+internally for partial error recovery.
 
 ```sql
 BEGIN;
