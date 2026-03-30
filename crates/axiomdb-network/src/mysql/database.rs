@@ -571,6 +571,19 @@ fn is_schema_changing(stmt: &Stmt) -> bool {
 /// INSERT to slip through).
 ///
 /// Not a substitute for the parser — only used as a fast pre-check.
+/// Returns true if the SQL is a read-only query that can be executed with
+/// only a shared read lock (Phase 7.4).
+///
+/// Conservative: only SELECT, SHOW, and DESCRIBE qualify. SET, USE, BEGIN,
+/// and anything else goes through the exclusive write path.
+pub fn is_read_only_sql(sql: &str) -> bool {
+    let lower = sql.trim_start().to_ascii_lowercase();
+    lower.starts_with("select")
+        || lower.starts_with("show")
+        || lower.starts_with("describe")
+        || lower.starts_with("desc ")
+}
+
 pub fn sql_may_mutate(sql: &str) -> bool {
     let lower = sql.trim_start().to_ascii_lowercase();
     // DML

@@ -27,7 +27,7 @@ use axiomdb_sql::{ast::Stmt, result::ColumnMeta, SchemaCache, SessionContext};
 use axiomdb_types::DataType;
 
 use super::charset::DEFAULT_SERVER_COLLATION;
-use super::database::CommitRx;
+use super::database::{is_read_only_sql, CommitRx};
 use super::lifecycle::{
     configure_client_socket, read_auth_packet, read_idle_packet, send_auth_packet,
     send_execute_packet, send_packet_batch, ConnectionIoError, ConnectionLifecycle,
@@ -608,7 +608,19 @@ pub async fn handle_connection_with_timeouts(
 
                     bump_statement_counters(&status, &mut conn_state.session_status, class);
 
-                    let exec_result = {
+                    // Phase 7.4: classify read-only queries for lock-free execution.
+                    // Read-only queries use db.read() (concurrent, no blocking).
+                    // Write queries use db.write() (exclusive, single writer).
+                    // Connections inside an explicit transaction always use write
+                    // (they may issue writes at any point).
+                    let is_read_only = !session.in_explicit_txn && is_read_only_sql(stmt_sql);
+
+                    let exec_result = if is_read_only {
+                        let guard = db.read().await;
+                        guard
+                            .execute_read_query(stmt_sql, &mut session, &mut schema_cache)
+                            .map(|qr| (qr, None))
+                    } else {
                         let mut guard = db.write().await;
                         guard.execute_query(stmt_sql, &mut session, &mut schema_cache)
                     };
