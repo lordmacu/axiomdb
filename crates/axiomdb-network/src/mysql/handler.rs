@@ -634,8 +634,14 @@ pub async fn handle_connection_with_timeouts(
                         snapshot_registry.unregister(conn_id);
                         r
                     } else {
-                        let mut guard = db.write().await;
-                        guard.execute_query(stmt_sql, &mut session, &mut schema_cache)
+                        // Phase 7.10: lock timeout — avoid indefinite waits.
+                        let timeout_dur = std::time::Duration::from_secs(session.lock_timeout_secs);
+                        match tokio::time::timeout(timeout_dur, db.write()).await {
+                            Err(_elapsed) => Err(DbError::LockTimeout),
+                            Ok(mut guard) => {
+                                guard.execute_query(stmt_sql, &mut session, &mut schema_cache)
+                            }
+                        }
                     };
 
                     match exec_result {

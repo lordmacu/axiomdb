@@ -924,6 +924,19 @@ fn execute_set_ctx(stmt: SetStmt, ctx: &mut SessionContext) -> Result<QueryResul
             }
             ctx.transaction_isolation = level;
         }
+        "lock_timeout" | "lock_wait_timeout" | "innodb_lock_wait_timeout" => {
+            let raw = match set_value_to_setting_string(&stmt.value)? {
+                None => {
+                    ctx.lock_timeout_secs = 30; // default
+                    return Ok(QueryResult::Empty);
+                }
+                Some(s) => s,
+            };
+            let secs: u64 = raw.parse().map_err(|_| DbError::InvalidValue {
+                reason: format!("lock_timeout: expected integer seconds, got '{raw}'"),
+            })?;
+            ctx.lock_timeout_secs = secs;
+        }
         _ => {}
     }
     Ok(QueryResult::Empty)
