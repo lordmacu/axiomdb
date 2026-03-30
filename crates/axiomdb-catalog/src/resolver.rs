@@ -7,9 +7,9 @@
 //!
 //! ## Default schema
 //!
-//! The resolver is constructed with a `default_schema` string (typically
-//! `"public"`). Callers may pass `None` as the schema argument to any method
-//! and the resolver will substitute the default automatically.
+//! The resolver is constructed with a `default_database` and `default_schema`
+//! string. Callers may pass `None` as the schema argument to any method and the
+//! resolver will substitute the default automatically.
 //!
 //! ## Case sensitivity
 //!
@@ -54,6 +54,7 @@ pub struct ResolvedTable {
 /// resolve unqualified names like `"users"` without always passing `"public"`.
 pub struct SchemaResolver<'a> {
     reader: CatalogReader<'a>,
+    default_database: &'a str,
     default_schema: &'a str,
 }
 
@@ -68,11 +69,13 @@ impl<'a> SchemaResolver<'a> {
     pub fn new(
         storage: &'a dyn StorageEngine,
         snapshot: TransactionSnapshot,
+        default_database: &'a str,
         default_schema: &'a str,
     ) -> Result<Self, DbError> {
         let reader = CatalogReader::new(storage, snapshot)?;
         Ok(Self {
             reader,
+            default_database,
             default_schema,
         })
     }
@@ -95,12 +98,12 @@ impl<'a> SchemaResolver<'a> {
     ) -> Result<ResolvedTable, DbError> {
         let schema = schema.unwrap_or(self.default_schema);
 
-        let def =
-            self.reader
-                .get_table(schema, table_name)?
-                .ok_or_else(|| DbError::TableNotFound {
-                    name: format!("{schema}.{table_name}"),
-                })?;
+        let def = self
+            .reader
+            .get_table_in_database(self.default_database, schema, table_name)?
+            .ok_or_else(|| DbError::TableNotFound {
+                name: format!("{schema}.{table_name}"),
+            })?;
 
         let columns = self.reader.list_columns(def.id)?;
         let indexes = self.reader.list_indexes(def.id)?;
@@ -130,7 +133,10 @@ impl<'a> SchemaResolver<'a> {
         table_name: &str,
     ) -> Result<bool, DbError> {
         let schema = schema.unwrap_or(self.default_schema);
-        Ok(self.reader.get_table(schema, table_name)?.is_some())
+        Ok(self
+            .reader
+            .get_table_in_database(self.default_database, schema, table_name)?
+            .is_some())
     }
 
     // ── Column resolution ─────────────────────────────────────────────────────

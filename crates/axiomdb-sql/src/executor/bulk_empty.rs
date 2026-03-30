@@ -45,7 +45,7 @@ fn collect_heap_chain_pages(
     while pid != 0 {
         pages.push(pid);
         let page = storage.read_page(pid)?;
-        pid = chain_next_page(page);
+        pid = chain_next_page(&page);
     }
     Ok(pages)
 }
@@ -66,7 +66,7 @@ pub(crate) fn collect_btree_pages(
         let page = storage.read_page(pid)?;
         if page.body()[0] != 1 {
             // Internal node — push all children.
-            let node = cast_internal(page);
+            let node = cast_internal(&page);
             let n = node.num_keys();
             for i in 0..=n {
                 stack.push(node.child_at(i));
@@ -158,14 +158,14 @@ pub(crate) fn free_btree_pages(
         let page = storage.read_page(pid)?;
         if page.body()[0] != 1 {
             // Internal node — push all children before freeing.
-            let node = cast_internal(page);
+            let node = cast_internal(&page);
             let n = node.num_keys();
             for i in 0..=n {
                 stack.push(node.child_at(i));
             }
         } else {
             // Leaf node — no children to push.
-            let _leaf = cast_leaf(page); // just validate it reads correctly
+            let _leaf = cast_leaf(&page); // just validate it reads correctly
         }
         storage.free_page(pid)?;
     }

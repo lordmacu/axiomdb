@@ -412,57 +412,97 @@ pub fn enforce_fk_on_parent_delete(
                         continue;
                     }
 
-                    let mut current_secondary_sn = {
+                    let mut current_indexes = {
                         let mut reader = CatalogReader::new(storage, snap)?;
                         let all = reader.list_indexes(fk.child_table_id)?;
                         all.into_iter()
                             .filter(|i| !i.columns.is_empty())
                             .collect::<Vec<_>>()
                     };
+                    let compiled_preds = crate::partial_index::compile_index_predicates(
+                        &current_indexes,
+                        &child_cols,
+                    )?;
+                    let mut update_pairs: Vec<(RecordId, Vec<Value>, RecordId, Vec<Value>)> =
+                        Vec::with_capacity(child_rows.len());
 
                     for (child_rid, child_row) in &child_rows {
-                        // Delete old FK key from secondary indexes before update.
-                        // Update current_secondary_sn in-memory to avoid stale CoW roots.
-                        if !current_secondary_sn.is_empty() {
-                            let del_updated = crate::index_maintenance::delete_from_indexes(
-                                &current_secondary_sn,
-                                child_row,
-                                *child_rid,
-                                storage,
-                                bloom,
-                                &[],
-                            )?;
-                            for (index_id, new_root) in del_updated {
-                                CatalogWriter::new(storage, txn)?
-                                    .update_index_root(index_id, new_root)?;
-                                if let Some(idx) = current_secondary_sn
-                                    .iter_mut()
-                                    .find(|i| i.index_id == index_id)
-                                {
-                                    idx.root_page_id = new_root;
-                                }
-                            }
-                        }
-
                         // Set FK column to NULL in child row.
                         let mut new_child_row = child_row.clone();
                         new_child_row[fk.child_col_idx as usize] = Value::Null;
 
-                        TableEngine::update_row(
+                        let new_rid = TableEngine::update_row(
                             storage,
                             txn,
                             &child_table_def,
                             &child_cols,
                             *child_rid,
-                            new_child_row,
+                            new_child_row.clone(),
                         )?;
-                        // NULL is not inserted into the FK index — no bloom.add() needed.
-                        // The FK index entry for the old value still exists in the BTree
-                        // (pointing to the old RecordId which is now dead). This is OK:
-                        // dead RecordIds are never returned by scan_visible. The FK index
-                        // is non-unique so the BTree entry becomes a stale pointer that
-                        // will be cleaned up by VACUUM (Phase 9).
-                        bloom.mark_dirty(fk.fk_index_id);
+                        update_pairs.push((*child_rid, child_row.clone(), new_rid, new_child_row));
+                    }
+
+                    for (idx_pos, idx) in current_indexes.iter_mut().enumerate() {
+                        if idx.columns.is_empty() {
+                            continue;
+                        }
+
+                        let pred = compiled_preds.get(idx_pos).and_then(|p| p.as_ref());
+                        let mut delete_keys: Vec<Vec<u8>> = Vec::new();
+                        let mut insert_rows: Vec<(RecordId, &Vec<Value>)> = Vec::new();
+
+                        for (old_rid, old_values, new_rid, new_values) in &update_pairs {
+                            if crate::index_maintenance::update_affects_index(
+                                idx, pred, old_values, *old_rid, new_values, *new_rid,
+                            )? {
+                                if let Some(key_vals) =
+                                    crate::index_maintenance::index_key_values_if_indexed(
+                                        idx, old_values, pred,
+                                    )?
+                                {
+                                    delete_keys.push(
+                                        crate::index_maintenance::encode_index_entry_key(
+                                            idx, &key_vals, *old_rid,
+                                        )?,
+                                    );
+                                }
+                                insert_rows.push((*new_rid, new_values));
+                            }
+                        }
+
+                        if !delete_keys.is_empty() {
+                            delete_keys.sort_unstable();
+                            if let Some(new_root) =
+                                crate::index_maintenance::delete_many_from_single_index(
+                                    idx,
+                                    &delete_keys,
+                                    storage,
+                                    bloom,
+                                )?
+                            {
+                                CatalogWriter::new(storage, txn)?
+                                    .update_index_root(idx.index_id, new_root)?;
+                            }
+                        }
+
+                        if !insert_rows.is_empty() {
+                            let batch_refs: Vec<(&[Value], RecordId)> = insert_rows
+                                .iter()
+                                .map(|(rid, vals)| (vals.as_slice(), *rid))
+                                .collect();
+                            if let Some(new_root) =
+                                crate::index_maintenance::insert_many_into_single_index(
+                                    idx,
+                                    pred,
+                                    &batch_refs,
+                                    storage,
+                                    bloom,
+                                )?
+                            {
+                                CatalogWriter::new(storage, txn)?
+                                    .update_index_root(idx.index_id, new_root)?;
+                            }
+                        }
                     }
                 }
 

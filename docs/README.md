@@ -12,3 +12,10 @@ The file describes what was built, decisions made, and how to continue.
 | 5 — MySQL wire protocol | [fase-05.md](fase-05.md) | 🔄 in progress |
 
 See `db.md` for the complete 34-phase plan.
+
+## Development guides
+
+| Guide | File |
+|------|------|
+| Targeted test execution | [testing-guide.md](testing-guide.md) |
+| Benchmarks by phase | [benchmark-guide.md](benchmark-guide.md) |

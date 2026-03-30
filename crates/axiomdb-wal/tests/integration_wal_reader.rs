@@ -3,7 +3,6 @@
 //! Verify forward scan, backward scan, skip by LSN, stopping on corruption/truncation,
 //! and that backward is the exact reverse of forward.
 
-use axiomdb_core::error::DbError;
 use axiomdb_wal::{EntryType, WalEntry, WalReader, WalWriter};
 use tempfile::tempdir;
 
@@ -23,6 +22,10 @@ fn make_insert(txn_id: u64, key: &[u8], value: &[u8]) -> WalEntry {
 
 /// Writes `count` entries to the WAL and commits. Returns the entries with assigned LSNs.
 fn write_n(path: &std::path::Path, count: u64) -> Vec<WalEntry> {
+    write_n_with_logical_end(path, count).0
+}
+
+fn write_n_with_logical_end(path: &std::path::Path, count: u64) -> (Vec<WalEntry>, u64) {
     let mut writer = WalWriter::create(path).unwrap();
     let mut result = Vec::new();
     for i in 0..count {
@@ -32,8 +35,9 @@ fn write_n(path: &std::path::Path, count: u64) -> Vec<WalEntry> {
         writer.append(&mut e).unwrap();
         result.push(e);
     }
+    let logical_end = writer.file_offset();
     writer.commit().unwrap();
-    result
+    (result, logical_end)
 }
 
 // ── Forward — happy path ─────────────────────────────────────────────────────
@@ -178,72 +182,54 @@ fn test_forward_from_lsn_zero_same_as_all() {
 // ── Forward — corruption and truncation ──────────────────────────────────────
 
 #[test]
-fn test_forward_stops_on_truncated_tail() {
+fn test_forward_stops_before_truncated_last_entry() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.wal");
-    write_n(&path, 5);
+    let (written, logical_end) = write_n_with_logical_end(&path, 5);
 
-    // Truncate the file — remove the last 10 bytes (half of the last entry)
-    let original_size = std::fs::metadata(&path).unwrap().len();
-    let truncated_size = original_size - 10;
+    // Truncate inside the final valid entry, not just inside the reserved tail.
+    let truncated_size = logical_end - 10;
     let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
     f.set_len(truncated_size).unwrap();
 
     let reader = WalReader::open(&path).unwrap();
-    let results: Vec<Result<WalEntry, DbError>> = reader.scan_forward(0).unwrap().collect();
-
-    // The first 4 entries must be Ok, the 5th must be Err
-    let ok_count = results.iter().filter(|r| r.is_ok()).count();
-    let err_count = results.iter().filter(|r| r.is_err()).count();
+    let results: Vec<WalEntry> = reader
+        .scan_forward(0)
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
     assert_eq!(
-        ok_count, 4,
-        "4 valid entries must be read before the truncated one"
+        results.len(),
+        written.len() - 1,
+        "open() must clamp logical_end before the truncated tail entry"
     );
-    assert_eq!(
-        err_count, 1,
-        "exactly 1 error must be returned for the truncated entry"
-    );
-
-    // After the error, the iterator returns no more items
-    let last = results.last().unwrap();
-    assert!(last.is_err(), "the last item must be the truncation error");
 }
 
 #[test]
-fn test_forward_stops_on_crc_corruption() {
+fn test_forward_stops_before_corrupt_last_entry() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.wal");
-    write_n(&path, 5);
+    let (written, logical_end) = write_n_with_logical_end(&path, 5);
 
-    // Corrupt one byte in the payload of entry 3 (approximately in the middle)
+    let last_len = written.last().unwrap().to_bytes().len() as u64;
+    let last_start = logical_end - last_len;
     let mut data = std::fs::read(&path).unwrap();
-    // Flip one bit somewhere in the data area (not the 16-byte header)
-    // Corrupt at an arbitrary position in the second half of the file
-    let corrupt_pos = data.len() / 2;
+    // Flip one bit inside the final valid entry. Open should stop the logical
+    // tail before that entry and expose only the earlier valid prefix.
+    let corrupt_pos = (last_start + last_len / 2) as usize;
     data[corrupt_pos] ^= 0xFF;
     std::fs::write(&path, &data).unwrap();
 
     let reader = WalReader::open(&path).unwrap();
-    let results: Vec<Result<WalEntry, DbError>> = reader.scan_forward(0).unwrap().collect();
-
-    // There must be at least 1 error (the corrupt entry)
-    let has_err = results.iter().any(|r| r.is_err());
-    assert!(has_err, "corruption must produce at least one error");
-
-    // The error must be CRC or truncation — not a panic
-    let err = results
-        .iter()
-        .find(|r| r.is_err())
+    let results: Vec<WalEntry> = reader
+        .scan_forward(0)
         .unwrap()
-        .as_ref()
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            DbError::WalChecksumMismatch { .. } | DbError::WalEntryTruncated { .. }
-        ),
-        "error must be WalChecksumMismatch or WalEntryTruncated, got: {:?}",
-        err
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        results.len(),
+        written.len() - 1,
+        "open() must clamp logical_end before the corrupt tail entry"
     );
 }
 

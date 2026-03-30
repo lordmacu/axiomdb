@@ -11,6 +11,7 @@ axiomdb-storage = { workspace = true }
 thiserror       = { workspace = true }
 crc32c          = "0.6"
 tokio           = { workspace = true, features = ["sync"] }
+libc            = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

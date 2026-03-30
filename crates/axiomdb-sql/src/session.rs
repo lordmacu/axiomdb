@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use axiomdb_catalog::{
-    schema::{ColumnDef, TableDef},
+    schema::{ColumnDef, TableDef, DEFAULT_DATABASE_NAME},
     IndexDef, ResolvedTable,
 };
 use axiomdb_core::error::DbError;
@@ -182,6 +182,7 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         // ── SQL / user-facing ─────────────────────────────────────────────────
         DbError::ParseError { .. }
         | DbError::TableNotFound { .. }
+        | DbError::DatabaseNotFound { .. }
         | DbError::ColumnNotFound { .. }
         | DbError::AmbiguousColumn { .. }
         | DbError::UniqueViolation { .. }
@@ -204,8 +205,12 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         | DbError::CardinalityViolation { .. }
         | DbError::ColumnAlreadyExists { .. }
         | DbError::TableAlreadyExists { .. }
+        | DbError::DatabaseAlreadyExists { .. }
+        | DbError::SchemaAlreadyExists { .. }
+        | DbError::SchemaNotFound { .. }
         | DbError::IndexAlreadyExists { .. }
         | DbError::IndexKeyTooLong { .. }
+        | DbError::ActiveDatabaseDrop { .. }
         | DbError::NotImplemented { .. } => true,
 
         // ── Infrastructure / runtime — never ignorable ────────────────────────
@@ -419,7 +424,7 @@ pub struct PendingInsertBatch {
 /// Per-connection state: schema cache + session variables visible to the executor.
 #[derive(Debug)]
 pub struct SessionContext {
-    /// Cached table schemas keyed by `"schema_name.table_name"`.
+    /// Cached table schemas keyed by `"database.schema.table"`.
     cache: HashMap<String, ResolvedTable>,
     /// Per-table heap-tail hint cache (Phase 5.18).
     ///
@@ -478,6 +483,21 @@ pub struct SessionContext {
     /// Used by the INSERT path to decide whether rows are eligible for staging.
     /// Autocommit-wrapped single-statement transactions do NOT set this flag.
     pub in_explicit_txn: bool,
+    /// Currently selected database for this session.
+    ///
+    /// Empty string means "no explicit USE yet". Resolution still falls back
+    /// to [`DEFAULT_DATABASE_NAME`] so legacy single-database behavior remains
+    /// intact, while `DATABASE()` can still return NULL on the wire.
+    pub current_database: String,
+    /// Schema search path for unqualified name resolution (PostgreSQL-style).
+    /// Default: `["public"]`. Reset to `["public"]` on every `USE db`.
+    pub search_path: Vec<String>,
+    /// Session default isolation level for new explicit transactions.
+    /// Default: `RepeatableRead` (MySQL default).
+    pub transaction_isolation: axiomdb_core::IsolationLevel,
+    /// Per-transaction isolation level override set by
+    /// `SET TRANSACTION ISOLATION LEVEL`. Consumed by the next `BEGIN`.
+    pub next_txn_isolation: Option<axiomdb_core::IsolationLevel>,
 }
 
 impl Default for SessionContext {
@@ -501,6 +521,10 @@ impl SessionContext {
             stats: StaleStatsTracker::default(),
             pending_inserts: None,
             in_explicit_txn: false,
+            current_database: String::new(),
+            search_path: vec!["public".to_string()],
+            transaction_isolation: axiomdb_core::IsolationLevel::default(),
+            next_txn_isolation: None,
         }
     }
 
@@ -555,25 +579,32 @@ impl SessionContext {
 
     // ── Schema cache ──────────────────────────────────────────────────────────
 
-    fn key(schema: &str, table: &str) -> String {
-        format!("{schema}.{table}")
+    fn key(database: &str, schema: &str, table: &str) -> String {
+        format!("{database}.{schema}.{table}")
     }
 
-    pub fn get_table(&self, schema: &str, table: &str) -> Option<&ResolvedTable> {
-        self.cache.get(&Self::key(schema, table))
+    pub fn get_table(&self, database: &str, schema: &str, table: &str) -> Option<&ResolvedTable> {
+        self.cache.get(&Self::key(database, schema, table))
     }
 
-    pub fn cache_table(&mut self, schema: &str, table: &str, resolved: ResolvedTable) {
-        self.cache.insert(Self::key(schema, table), resolved);
+    pub fn cache_table(
+        &mut self,
+        database: &str,
+        schema: &str,
+        table: &str,
+        resolved: ResolvedTable,
+    ) {
+        self.cache
+            .insert(Self::key(database, schema, table), resolved);
     }
 
-    pub fn invalidate_table(&mut self, schema: &str, table: &str) {
+    pub fn invalidate_table(&mut self, database: &str, schema: &str, table: &str) {
         // Also clear any heap-tail hint for this table so a stale tail is not
         // reused after a DDL change or root rotation.
-        if let Some(resolved) = self.cache.get(&Self::key(schema, table)) {
+        if let Some(resolved) = self.cache.get(&Self::key(database, schema, table)) {
             self.heap_tail.remove(&resolved.def.id);
         }
-        self.cache.remove(&Self::key(schema, table));
+        self.cache.remove(&Self::key(database, schema, table));
     }
 
     pub fn invalidate_all(&mut self) {
@@ -615,6 +646,45 @@ impl SessionContext {
 
     pub fn cached_count(&self) -> usize {
         self.cache.len()
+    }
+
+    /// Returns the selected database if `USE db` ran in this session.
+    pub fn selected_database(&self) -> Option<&str> {
+        if self.current_database.is_empty() {
+            None
+        } else {
+            Some(&self.current_database)
+        }
+    }
+
+    /// Returns the database used for name resolution.
+    pub fn effective_database(&self) -> &str {
+        self.selected_database().unwrap_or(DEFAULT_DATABASE_NAME)
+    }
+
+    /// Updates the selected database for the session and invalidates cached table metadata.
+    /// Also resets the search path to `["public"]` since schema names are per-database.
+    pub fn set_current_database(&mut self, database: impl Into<String>) {
+        self.current_database = database.into();
+        self.search_path = vec!["public".to_string()];
+        self.invalidate_all();
+    }
+
+    /// Returns the first schema in the search path (used for `current_schema()`
+    /// and as the default creation schema).
+    pub fn current_schema(&self) -> &str {
+        self.search_path
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("public")
+    }
+
+    /// Returns the isolation level for the next `BEGIN`, consuming any per-txn
+    /// override set by `SET TRANSACTION ISOLATION LEVEL`.
+    pub fn effective_isolation(&mut self) -> axiomdb_core::IsolationLevel {
+        self.next_txn_isolation
+            .take()
+            .unwrap_or(self.transaction_isolation)
     }
 }
 

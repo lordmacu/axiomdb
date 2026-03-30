@@ -18,6 +18,48 @@ use std::path::{Path, PathBuf};
 use axiomdb_core::error::DbError;
 use serde::Deserialize;
 
+// ── WalDurabilityPolicy ─────────────────────────────────────────────────────
+
+/// WAL durability contract for committed DML transactions.
+///
+/// Orthogonal to `WalSyncMethod` (which syscall to use when syncing).
+/// This enum controls **whether** a commit waits for durable sync at all.
+///
+/// Modelled after PostgreSQL `synchronous_commit` and InnoDB
+/// `innodb_flush_log_at_trx_commit`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WalDurabilityPolicy {
+    /// Default. No `OK` before durable WAL sync.
+    /// Equivalent to `innodb_flush_log_at_trx_commit = 1` / `synchronous_commit = on`.
+    #[default]
+    Strict,
+    /// WAL bytes are flushed to the OS page cache before `OK`, but no durable
+    /// sync on every commit. Acknowledged commits may be lost after crash or
+    /// power loss.
+    /// Equivalent to `innodb_flush_log_at_trx_commit = 2` / `synchronous_commit = off`.
+    Normal,
+    /// No per-commit durability barrier. Benchmark/dev only.
+    /// Equivalent to `innodb_flush_log_at_trx_commit = 0`.
+    Off,
+}
+
+impl<'de> Deserialize<'de> for WalDurabilityPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "strict" => Ok(Self::Strict),
+            "normal" => Ok(Self::Normal),
+            "off" => Ok(Self::Off),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid wal_durability value '{other}': expected 'strict', 'normal', or 'off'"
+            ))),
+        }
+    }
+}
+
 // ── DbConfig ──────────────────────────────────────────────────────────────────
 
 /// Engine-wide configuration.
@@ -36,11 +78,24 @@ pub struct DbConfig {
     #[serde(default = "default_max_wal_size_mb")]
     pub max_wal_size_mb: u64,
 
-    /// Whether to `fsync` on WAL commit. Set `false` only in tests or
-    /// when durability is not required (e.g., in-memory workloads).
-    /// Default: `true`.
+    /// Legacy toggle — superseded by `wal_durability`.
+    ///
+    /// When `wal_durability` is absent and `fsync = false`, the resolved
+    /// durability policy is `Off`. When both are present, `wal_durability`
+    /// takes precedence and `fsync` is ignored.
     #[serde(default = "default_fsync")]
     pub fsync: bool,
+
+    /// Explicit WAL durability policy for committed DML.
+    ///
+    /// - `"strict"` (default) — no OK before durable WAL sync.
+    /// - `"normal"` — flush to OS page cache, no durable sync per commit.
+    /// - `"off"` — no per-commit barrier; benchmark/dev only.
+    ///
+    /// When absent, falls back to legacy `fsync` field:
+    /// `fsync = true` → `Strict`, `fsync = false` → `Off`.
+    #[serde(default)]
+    pub wal_durability: Option<WalDurabilityPolicy>,
 
     /// Minimum log level passed to `tracing_subscriber`.
     /// Accepted values: `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"`.
@@ -56,7 +111,6 @@ pub struct DbConfig {
     /// Default: `1024`.
     #[serde(default = "default_max_prepared_stmts")]
     pub max_prepared_stmts_per_connection: usize,
-
 }
 
 fn default_max_wal_size_mb() -> u64 {
@@ -81,6 +135,7 @@ impl Default for DbConfig {
             data_dir: None,
             max_wal_size_mb: default_max_wal_size_mb(),
             fsync: default_fsync(),
+            wal_durability: None,
             log_level: default_log_level(),
             max_prepared_stmts_per_connection: default_max_prepared_stmts(),
         }
@@ -88,6 +143,24 @@ impl Default for DbConfig {
 }
 
 impl DbConfig {
+    /// Resolves the effective WAL durability policy.
+    ///
+    /// Precedence:
+    /// 1. Explicit `wal_durability` field if present.
+    /// 2. Legacy `fsync` field: `true` → `Strict`, `false` → `Off`.
+    pub fn resolved_wal_durability(&self) -> WalDurabilityPolicy {
+        match self.wal_durability {
+            Some(policy) => policy,
+            None => {
+                if self.fsync {
+                    WalDurabilityPolicy::Strict
+                } else {
+                    WalDurabilityPolicy::Off
+                }
+            }
+        }
+    }
+
     /// Loads configuration from `path`.
     ///
     /// - `None` → returns [`DbConfig::default()`] immediately.
@@ -129,6 +202,8 @@ mod tests {
         assert_eq!(cfg.log_level, "info");
         assert!(cfg.data_dir.is_none());
         assert_eq!(cfg.max_prepared_stmts_per_connection, 1024);
+        assert!(cfg.wal_durability.is_none());
+        assert_eq!(cfg.resolved_wal_durability(), WalDurabilityPolicy::Strict);
     }
 
     #[test]
@@ -204,5 +279,90 @@ data_dir        = "/var/lib/axiomdb"
         assert_eq!(cfg.max_wal_size_mb, 256);
         assert!(cfg.fsync);
         assert_eq!(cfg.log_level, "info");
+    }
+
+    // ── WalDurabilityPolicy tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_wal_durability_strict_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("axiomdb.toml");
+        std::fs::write(&path, "wal_durability = \"strict\"\n").unwrap();
+
+        let cfg = DbConfig::load(Some(&path)).unwrap();
+        assert_eq!(cfg.resolved_wal_durability(), WalDurabilityPolicy::Strict);
+    }
+
+    #[test]
+    fn test_wal_durability_normal_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("axiomdb.toml");
+        std::fs::write(&path, "wal_durability = \"normal\"\n").unwrap();
+
+        let cfg = DbConfig::load(Some(&path)).unwrap();
+        assert_eq!(cfg.resolved_wal_durability(), WalDurabilityPolicy::Normal);
+    }
+
+    #[test]
+    fn test_wal_durability_off_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("axiomdb.toml");
+        std::fs::write(&path, "wal_durability = \"off\"\n").unwrap();
+
+        let cfg = DbConfig::load(Some(&path)).unwrap();
+        assert_eq!(cfg.resolved_wal_durability(), WalDurabilityPolicy::Off);
+    }
+
+    #[test]
+    fn test_wal_durability_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("axiomdb.toml");
+        std::fs::write(&path, "wal_durability = \"NORMAL\"\n").unwrap();
+
+        let cfg = DbConfig::load(Some(&path)).unwrap();
+        assert_eq!(cfg.resolved_wal_durability(), WalDurabilityPolicy::Normal);
+    }
+
+    #[test]
+    fn test_wal_durability_invalid_value_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("axiomdb.toml");
+        std::fs::write(&path, "wal_durability = \"turbo\"\n").unwrap();
+
+        let err = DbConfig::load(Some(&path)).unwrap_err();
+        assert!(
+            matches!(err, DbError::ParseError { .. }),
+            "expected ParseError, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_legacy_fsync_false_maps_to_off() {
+        let cfg = DbConfig {
+            fsync: false,
+            wal_durability: None,
+            ..DbConfig::default()
+        };
+        assert_eq!(cfg.resolved_wal_durability(), WalDurabilityPolicy::Off);
+    }
+
+    #[test]
+    fn test_explicit_durability_overrides_legacy_fsync() {
+        let cfg = DbConfig {
+            fsync: false,
+            wal_durability: Some(WalDurabilityPolicy::Strict),
+            ..DbConfig::default()
+        };
+        assert_eq!(cfg.resolved_wal_durability(), WalDurabilityPolicy::Strict);
+    }
+
+    #[test]
+    fn test_wal_durability_overrides_fsync_in_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("axiomdb.toml");
+        std::fs::write(&path, "fsync = false\nwal_durability = \"strict\"\n").unwrap();
+
+        let cfg = DbConfig::load(Some(&path)).unwrap();
+        assert_eq!(cfg.resolved_wal_durability(), WalDurabilityPolicy::Strict);
     }
 }

@@ -18,10 +18,16 @@ use crate::expr::Expr;
 
 /// A qualified table reference with an optional alias.
 ///
-/// `schema` is `None` when the query omits the schema prefix; the executor
-/// substitutes the session's default schema (typically `"public"`).
+/// Supports 1-part (`table`), 2-part (`schema.table`), and 3-part
+/// (`database.schema.table`) names.
+///
+/// - `database` is `None` when the query omits the database prefix; the
+///   executor substitutes the session's effective database.
+/// - `schema` is `None` when the query omits the schema prefix; the executor
+///   substitutes the session's default schema (typically `"public"`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableRef {
+    pub database: Option<String>,
     pub schema: Option<String>,
     pub name: String,
     pub alias: Option<String>,
@@ -31,6 +37,7 @@ impl TableRef {
     /// Shorthand constructor for unqualified, unaliased table references.
     pub fn simple(name: impl Into<String>) -> Self {
         Self {
+            database: None,
             schema: None,
             name: name.into(),
             alias: None,
@@ -371,6 +378,10 @@ pub struct ShowTablesStmt {
     pub schema: Option<String>,
 }
 
+/// `SHOW DATABASES`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowDatabasesStmt;
+
 /// `SHOW COLUMNS FROM table` / `DESCRIBE table` / `DESC table`
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShowColumnsStmt {
@@ -391,6 +402,32 @@ pub struct SetStmt {
     pub value: SetValue,
 }
 
+/// `CREATE DATABASE name`
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateDatabaseStmt {
+    pub name: String,
+}
+
+/// `DROP DATABASE [IF EXISTS] name`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropDatabaseStmt {
+    pub if_exists: bool,
+    pub name: String,
+}
+
+/// `USE name`
+#[derive(Debug, Clone, PartialEq)]
+pub struct UseDatabaseStmt {
+    pub name: String,
+}
+
+/// `CREATE SCHEMA [IF NOT EXISTS] name` (Phase 22b.4)
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateSchemaStmt {
+    pub name: String,
+    pub if_not_exists: bool,
+}
+
 // ── Stmt ──────────────────────────────────────────────────────────────────────
 
 /// A complete SQL statement as produced by the parser.
@@ -409,8 +446,11 @@ pub enum Stmt {
     Delete(DeleteStmt),
     // DDL
     CreateTable(CreateTableStmt),
+    CreateDatabase(CreateDatabaseStmt),
+    CreateSchema(CreateSchemaStmt),
     CreateIndex(CreateIndexStmt),
     DropTable(DropTableStmt),
+    DropDatabase(DropDatabaseStmt),
     DropIndex(DropIndexStmt),
     TruncateTable(TruncateTableStmt),
     AlterTable(AlterTableStmt),
@@ -418,6 +458,7 @@ pub enum Stmt {
     Analyze(AnalyzeStmt),
     // Introspection
     ShowTables(ShowTablesStmt),
+    ShowDatabases(ShowDatabasesStmt),
     ShowColumns(ShowColumnsStmt),
     // Transaction control
     Begin,
@@ -425,6 +466,7 @@ pub enum Stmt {
     Rollback,
     // Session
     Set(SetStmt),
+    UseDatabase(UseDatabaseStmt),
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -494,6 +536,7 @@ mod tests {
         let stmt = Stmt::CreateTable(CreateTableStmt {
             if_not_exists: true,
             table: TableRef {
+                database: None,
                 schema: Some("public".into()),
                 name: "users".into(),
                 alias: None,
@@ -619,6 +662,7 @@ mod tests {
         let join = JoinClause {
             join_type: JoinType::Left,
             table: FromClause::Table(TableRef {
+                database: None,
                 schema: None,
                 name: "orders".into(),
                 alias: Some("o".into()),

@@ -9,8 +9,7 @@ fn execute_update_ctx(
         storage,
         txn,
         ctx,
-        stmt.table.schema.as_deref(),
-        &stmt.table.name,
+        &stmt.table,
     )?;
 
     let schema_cols = resolved.columns.clone();
@@ -64,16 +63,23 @@ fn execute_update_ctx(
     // Collect all matching (rid, old_values, new_values) triples before touching
     // the heap. Old values are kept for secondary index maintenance (delete old
     // key before inserting new key into each B-Tree).
+    //
+    // No-op partition (Phase 6.20): rows whose evaluated new_values == old_values
+    // skip heap and index mutation. `count` remains the matched-row count (MySQL
+    // semantics) — physical no-ops still count as "affected".
     let mut to_update: Vec<(RecordId, Vec<Value>, Vec<Value>)> = Vec::new();
+    let mut matched_count: u64 = 0;
     for (rid, current_values) in candidate_rows {
         let mut new_values = current_values.clone();
         for (col_pos, val_expr) in &assignments {
             new_values[*col_pos] = eval(val_expr, &current_values)?;
         }
+        matched_count += 1;
+        if new_values == current_values {
+            continue; // no-op: skip heap/index work
+        }
         to_update.push((rid, current_values, new_values));
     }
-
-    let count = to_update.len() as u64;
 
     // FK child validation: check new FK values before applying any updates.
     if !resolved.foreign_keys.is_empty() {
@@ -122,28 +128,37 @@ fn execute_update_ctx(
         heap_updates,
     )?;
 
-    if !secondary_indexes.is_empty() {
-        let mut current_indexes = secondary_indexes;
-        let update_pairs: Vec<(RecordId, Vec<Value>, RecordId, Vec<Value>)> = to_update
-            .into_iter()
-            .zip(new_rids)
-            .map(|((old_rid, old_values, new_values), new_rid)| {
-                (old_rid, old_values, new_rid, new_values)
-            })
-            .collect();
-        apply_update_index_maintenance(
-            &mut current_indexes,
-            &compiled_preds,
-            &update_pairs,
-            storage,
-            txn,
-            bloom,
-        )?;
-        ctx.invalidate_all();
+    if !secondary_indexes.is_empty() && !to_update.is_empty() {
+        let all_rids_stable = to_update
+            .iter()
+            .zip(new_rids.iter())
+            .all(|((old_rid, _, _), new_rid)| old_rid == new_rid);
+        let any_index_affected =
+            statement_might_affect_indexes(&secondary_indexes, &compiled_preds, &assignments);
+
+        if any_index_affected || !all_rids_stable {
+            let mut current_indexes = secondary_indexes;
+            let update_pairs: Vec<(RecordId, Vec<Value>, RecordId, Vec<Value>)> = to_update
+                .into_iter()
+                .zip(new_rids)
+                .map(|((old_rid, old_values, new_values), new_rid)| {
+                    (old_rid, old_values, new_rid, new_values)
+                })
+                .collect();
+            apply_update_index_maintenance(
+                &mut current_indexes,
+                &compiled_preds,
+                &update_pairs,
+                storage,
+                txn,
+                bloom,
+            )?;
+            ctx.invalidate_all();
+        }
     }
 
     Ok(QueryResult::Affected {
-        count,
+        count: matched_count,
         last_insert_id: None,
     })
 }
@@ -213,15 +228,19 @@ fn execute_update(
         crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;
 
     let mut to_update: Vec<(RecordId, Vec<Value>, Vec<Value>)> = Vec::new();
+    let mut matched_count: u64 = 0;
     for (rid, current_values) in candidate_rows {
         let mut new_values = current_values.clone();
         for (col_pos, val_expr) in &assignments {
             new_values[*col_pos] = eval(val_expr, &current_values)?;
         }
+        matched_count += 1;
+        if new_values == current_values {
+            continue; // no-op: skip heap/index work
+        }
         to_update.push((rid, current_values, new_values));
     }
 
-    let count = to_update.len() as u64;
     let heap_updates: Vec<(RecordId, Vec<Value>)> = to_update
         .iter()
         .map(|(rid, _old, new)| (*rid, new.clone()))
@@ -234,27 +253,62 @@ fn execute_update(
         heap_updates,
     )?;
 
-    if !secondary_indexes.is_empty() {
-        let update_pairs: Vec<(RecordId, Vec<Value>, RecordId, Vec<Value>)> = to_update
-            .into_iter()
-            .zip(new_rids)
-            .map(|((old_rid, old_values, new_values), new_rid)| {
-                (old_rid, old_values, new_rid, new_values)
-            })
-            .collect();
-        apply_update_index_maintenance(
-            &mut secondary_indexes,
-            &compiled_preds,
-            &update_pairs,
-            storage,
-            txn,
-            &mut noop_bloom,
-        )?;
+    if !secondary_indexes.is_empty() && !to_update.is_empty() {
+        let all_rids_stable = to_update
+            .iter()
+            .zip(new_rids.iter())
+            .all(|((old_rid, _, _), new_rid)| old_rid == new_rid);
+        let any_index_affected =
+            statement_might_affect_indexes(&secondary_indexes, &compiled_preds, &assignments);
+
+        if any_index_affected || !all_rids_stable {
+            let update_pairs: Vec<(RecordId, Vec<Value>, RecordId, Vec<Value>)> = to_update
+                .into_iter()
+                .zip(new_rids)
+                .map(|((old_rid, old_values, new_values), new_rid)| {
+                    (old_rid, old_values, new_rid, new_values)
+                })
+                .collect();
+            apply_update_index_maintenance(
+                &mut secondary_indexes,
+                &compiled_preds,
+                &update_pairs,
+                storage,
+                txn,
+                &mut noop_bloom,
+            )?;
+        }
     }
 
     Ok(QueryResult::Affected {
-        count,
+        count: matched_count,
         last_insert_id: None,
+    })
+}
+
+fn statement_might_affect_indexes(
+    indexes: &[IndexDef],
+    compiled_preds: &[Option<Expr>],
+    assignments: &[(usize, Expr)],
+) -> bool {
+    let assigned_cols: std::collections::HashSet<usize> =
+        assignments.iter().map(|(pos, _)| *pos).collect();
+    indexes.iter().enumerate().any(|(idx_pos, idx)| {
+        let pred = compiled_preds.get(idx_pos).and_then(|p| p.as_ref());
+        let key_overlap = idx
+            .columns
+            .iter()
+            .any(|c| assigned_cols.contains(&(c.col_idx as usize)));
+        if key_overlap {
+            return true;
+        }
+        if let Some(pred_expr) = pred {
+            let pred_cols = crate::partial_index::collect_column_indices(pred_expr);
+            if pred_cols.iter().any(|c| assigned_cols.contains(c)) {
+                return true;
+            }
+        }
+        false
     })
 }
 
@@ -306,12 +360,15 @@ fn apply_update_index_maintenance(
             }
         }
 
-        for (new_rid, new_values) in insert_rows {
-            if let Some(new_root) = crate::index_maintenance::insert_into_single_index(
+        if !insert_rows.is_empty() {
+            let batch_refs: Vec<(&[Value], RecordId)> = insert_rows
+                .iter()
+                .map(|(rid, vals)| (vals.as_slice(), *rid))
+                .collect();
+            if let Some(new_root) = crate::index_maintenance::insert_many_into_single_index(
                 idx,
                 pred,
-                new_values,
-                new_rid,
+                &batch_refs,
                 storage,
                 bloom,
             )? {

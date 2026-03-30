@@ -39,7 +39,7 @@ use std::collections::HashMap as StdHashMap;
 use axiomdb_catalog::{
     schema::{
         ColumnDef as CatalogColumnDef, ColumnType, IndexColumnDef, IndexDef,
-        SortOrder as CatalogSortOrder, TableDef,
+        SortOrder as CatalogSortOrder, TableDef, DEFAULT_DATABASE_NAME,
     },
     CatalogReader, CatalogWriter, ResolvedTable, SchemaResolver,
 };
@@ -54,10 +54,11 @@ use axiomdb_wal::{Savepoint, TxnManager};
 
 use crate::{
     ast::{
-        AlterTableOp, AlterTableStmt, ColumnConstraint, CreateIndexStmt, CreateTableStmt,
-        DeleteStmt, DropIndexStmt, DropTableStmt, FromClause, InsertSource, InsertStmt, JoinClause,
-        JoinCondition, JoinType, NullsOrder, OrderByItem, SelectItem, SelectStmt, SetStmt,
-        SetValue, SortOrder, Stmt, UpdateStmt,
+        AlterTableOp, AlterTableStmt, ColumnConstraint, CreateDatabaseStmt, CreateIndexStmt,
+        CreateTableStmt, DeleteStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, FromClause,
+        InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType, NullsOrder, OrderByItem,
+        SelectItem, SelectStmt, SetStmt, SetValue, ShowDatabasesStmt, SortOrder, Stmt, UpdateStmt,
+        UseDatabaseStmt,
     },
     eval::{eval, eval_with, is_truthy, CollationGuard, SubqueryRunner},
     expr::{BinaryOp, Expr},
@@ -419,7 +420,8 @@ pub fn execute_with_ctx(
     } else if ctx.autocommit {
         match stmt {
             Stmt::Begin => {
-                txn.begin()?;
+                let level = ctx.effective_isolation();
+                txn.begin_with_isolation(level)?;
                 ctx.in_explicit_txn = true;
                 Ok(QueryResult::Empty)
             }
@@ -553,7 +555,9 @@ fn is_ddl(stmt: &Stmt) -> bool {
     matches!(
         stmt,
         Stmt::CreateTable(_)
+            | Stmt::CreateDatabase(_)
             | Stmt::DropTable(_)
+            | Stmt::DropDatabase(_)
             | Stmt::CreateIndex(_)
             | Stmt::DropIndex(_)
             | Stmt::AlterTable(_)
@@ -579,30 +583,88 @@ fn dispatch_ctx(
         Stmt::Insert(s) => execute_insert_ctx(s, storage, txn, bloom, ctx),
         Stmt::Update(s) => execute_update_ctx(s, storage, txn, bloom, ctx),
         Stmt::Delete(s) => execute_delete_ctx(s, storage, txn, bloom, ctx),
-        Stmt::CreateTable(s) => {
+        Stmt::CreateTable(mut s) => {
             ctx.invalidate_all();
-            execute_create_table(s, storage, txn)
+            let db = ddl_database(&s.table.database, ctx);
+            // Unqualified CREATE TABLE uses the first schema in search_path.
+            if s.table.schema.is_none() {
+                s.table.schema = Some(ctx.current_schema().to_string());
+            }
+            execute_create_table(s, storage, txn, &db)
+        }
+        Stmt::CreateDatabase(s) => {
+            ctx.invalidate_all();
+            execute_create_database(s, storage, txn)
+        }
+        Stmt::CreateSchema(s) => {
+            ctx.invalidate_all();
+            execute_create_schema(s, storage, txn, ctx.effective_database())
         }
         Stmt::DropTable(s) => {
             ctx.invalidate_all();
-            execute_drop_table(s, storage, txn)
+            let db = s
+                .tables
+                .first()
+                .and_then(|t| t.database.as_deref())
+                .unwrap_or(ctx.effective_database())
+                .to_string();
+            execute_drop_table(s, storage, txn, &db)
+        }
+        Stmt::DropDatabase(s) => {
+            ctx.invalidate_all();
+            execute_drop_database(s, storage, txn, ctx)
         }
         Stmt::CreateIndex(s) => {
             ctx.invalidate_all();
-            execute_create_index(s, storage, txn, bloom)
+            let db = ddl_database(&s.table.database, ctx);
+            execute_create_index(s, storage, txn, bloom, &db)
         }
         Stmt::DropIndex(s) => {
             ctx.invalidate_all();
-            execute_drop_index(s, storage, txn, bloom)
+            let db = s
+                .table
+                .as_ref()
+                .and_then(|t| t.database.as_deref())
+                .unwrap_or(ctx.effective_database())
+                .to_string();
+            execute_drop_index(s, storage, txn, bloom, &db)
         }
         Stmt::AlterTable(s) => {
             ctx.invalidate_all();
-            execute_alter_table(s, storage, txn)
+            let db = ddl_database(&s.table.database, ctx);
+            execute_alter_table(s, storage, txn, &db)
         }
         Stmt::Analyze(s) => execute_analyze(s, storage, txn, ctx),
         Stmt::Set(s) => execute_set_ctx(s, ctx),
+        Stmt::UseDatabase(s) => execute_use_database(s, storage, txn, ctx),
+        Stmt::ShowDatabases(s) => execute_show_databases(s, storage, txn),
+        Stmt::ShowTables(mut s) => {
+            // Default to current schema from search_path if not explicit.
+            if s.schema.is_none() {
+                s.schema = Some(ctx.current_schema().to_string());
+            }
+            execute_show_tables(s, storage, txn, ctx.effective_database())
+        }
+        Stmt::ShowColumns(s) => {
+            let db = ddl_database(&s.table.database, ctx);
+            execute_show_columns(s, storage, txn, &db)
+        }
+        Stmt::TruncateTable(s) => {
+            let db = ddl_database(&s.table.database, ctx);
+            execute_truncate(s, storage, txn, &db)
+        }
         other => dispatch(other, storage, txn),
     }
+}
+
+/// Compute the effective database for a DDL statement: if the `TableRef` has
+/// an explicit `database` component, use it; otherwise fall back to the session
+/// default. Returns an owned `String` so the original statement can be moved.
+fn ddl_database(explicit: &Option<String>, ctx: &SessionContext) -> String {
+    explicit
+        .as_deref()
+        .unwrap_or(ctx.effective_database())
+        .to_string()
 }
 
 /// Extracts a normalized string value from a `SetValue`.
@@ -715,6 +777,48 @@ fn execute_set_ctx(stmt: SetStmt, ctx: &mut SessionContext) -> Result<QueryResul
             };
             ctx.explicit_collation = parse_session_collation_setting(&raw)?;
         }
+        "search_path" => {
+            let raw = match set_value_to_setting_string(&stmt.value)? {
+                None => {
+                    // RESET search_path → restore default
+                    ctx.search_path = vec!["public".to_string()];
+                    return Ok(QueryResult::Empty);
+                }
+                Some(s) => s,
+            };
+            let schemas: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if schemas.is_empty() {
+                return Err(DbError::InvalidValue {
+                    reason: "search_path cannot be empty".into(),
+                });
+            }
+            ctx.search_path = schemas;
+        }
+        "transaction_isolation" | "tx_isolation" => {
+            let raw = match set_value_to_setting_string(&stmt.value)? {
+                None => {
+                    ctx.transaction_isolation = axiomdb_core::IsolationLevel::default();
+                    return Ok(QueryResult::Empty);
+                }
+                Some(s) => s,
+            };
+            let level =
+                axiomdb_core::IsolationLevel::parse(&raw).ok_or_else(|| DbError::InvalidValue {
+                    reason: format!("unknown isolation level: '{raw}'"),
+                })?;
+            // Cannot change isolation level inside an active transaction.
+            if ctx.in_explicit_txn {
+                return Err(DbError::InvalidValue {
+                    reason: "cannot change transaction_isolation inside an active transaction"
+                        .into(),
+                });
+            }
+            ctx.transaction_isolation = level;
+        }
         _ => {}
     }
     Ok(QueryResult::Empty)
@@ -734,15 +838,20 @@ fn dispatch(
         Stmt::Insert(s) => execute_insert(s, storage, txn),
         Stmt::Update(s) => execute_update(s, storage, txn),
         Stmt::Delete(s) => execute_delete(s, storage, txn),
-        Stmt::CreateTable(s) => execute_create_table(s, storage, txn),
-        Stmt::DropTable(s) => execute_drop_table(s, storage, txn),
+        Stmt::CreateTable(s) => execute_create_table(s, storage, txn, DEFAULT_DATABASE_NAME),
+        Stmt::CreateDatabase(s) => execute_create_database(s, storage, txn),
+        Stmt::CreateSchema(s) => execute_create_schema(s, storage, txn, DEFAULT_DATABASE_NAME),
+        Stmt::DropTable(s) => execute_drop_table(s, storage, txn, DEFAULT_DATABASE_NAME),
+        Stmt::DropDatabase(_) => Err(DbError::NotImplemented {
+            feature: "DROP DATABASE requires session context".into(),
+        }),
         Stmt::CreateIndex(s) => {
             let mut noop_bloom = crate::bloom::BloomRegistry::new();
-            execute_create_index(s, storage, txn, &mut noop_bloom)
+            execute_create_index(s, storage, txn, &mut noop_bloom, DEFAULT_DATABASE_NAME)
         }
         Stmt::DropIndex(s) => {
             let mut noop_bloom = crate::bloom::BloomRegistry::new();
-            execute_drop_index(s, storage, txn, &mut noop_bloom)
+            execute_drop_index(s, storage, txn, &mut noop_bloom, DEFAULT_DATABASE_NAME)
         }
         Stmt::Begin => Err(DbError::TransactionAlreadyActive {
             txn_id: txn.active_txn_id().unwrap_or(0),
@@ -756,10 +865,14 @@ fn dispatch(
             Ok(QueryResult::Empty)
         }
         Stmt::Set(_) => Ok(QueryResult::Empty),
-        Stmt::TruncateTable(s) => execute_truncate(s, storage, txn),
-        Stmt::AlterTable(s) => execute_alter_table(s, storage, txn),
-        Stmt::ShowTables(s) => execute_show_tables(s, storage, txn),
-        Stmt::ShowColumns(s) => execute_show_columns(s, storage, txn),
+        Stmt::UseDatabase(_) => Err(DbError::NotImplemented {
+            feature: "USE requires session context".into(),
+        }),
+        Stmt::TruncateTable(s) => execute_truncate(s, storage, txn, DEFAULT_DATABASE_NAME),
+        Stmt::AlterTable(s) => execute_alter_table(s, storage, txn, DEFAULT_DATABASE_NAME),
+        Stmt::ShowDatabases(s) => execute_show_databases(s, storage, txn),
+        Stmt::ShowTables(s) => execute_show_tables(s, storage, txn, DEFAULT_DATABASE_NAME),
+        Stmt::ShowColumns(s) => execute_show_columns(s, storage, txn, DEFAULT_DATABASE_NAME),
         Stmt::Analyze(_) => Err(DbError::NotImplemented {
             feature: "ANALYZE requires session context — use execute_with_ctx".into(),
         }),

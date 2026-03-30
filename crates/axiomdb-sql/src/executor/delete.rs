@@ -9,8 +9,7 @@ fn execute_delete_ctx(
         storage,
         txn,
         ctx,
-        stmt.table.schema.as_deref(),
-        &stmt.table.name,
+        &stmt.table,
     )?;
 
     let secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
@@ -184,7 +183,7 @@ fn collect_delete_candidates(
         }
 
         AccessMethod::IndexLookup { index_def, key } => {
-            // Point lookup via B-Tree → heap read → WHERE recheck.
+            // Point lookup via B-Tree → batch heap read → WHERE recheck.
             let candidate_rids: Vec<RecordId> = if index_def.is_unique {
                 if index_def.is_unique && !bloom.might_exist(index_def.index_id, key) {
                     vec![]
@@ -204,10 +203,11 @@ fn collect_delete_candidates(
                     .collect()
             };
 
+            let batch_rows =
+                TableEngine::read_rows_batch(storage, schema_cols, &candidate_rids)?;
             let mut result = Vec::with_capacity(candidate_rids.len());
-            for rid in candidate_rids {
-                if let Some(values) = TableEngine::read_row(storage, schema_cols, rid)? {
-                    // Recheck full WHERE — the index only narrowed candidates.
+            for (rid, maybe_values) in candidate_rids.into_iter().zip(batch_rows) {
+                if let Some(values) = maybe_values {
                     if is_truthy(&eval(where_clause, &values)?) {
                         result.push((rid, values));
                     }
@@ -217,7 +217,7 @@ fn collect_delete_candidates(
         }
 
         AccessMethod::IndexRange { index_def, lo, hi } => {
-            // Range scan via B-Tree → heap reads → WHERE recheck.
+            // Range scan via B-Tree → batch heap read → WHERE recheck.
             let (lo_adj, hi_adj);
             let (lo_ref, hi_ref) = if index_def.is_unique {
                 (lo.as_deref(), hi.as_deref())
@@ -228,9 +228,12 @@ fn collect_delete_candidates(
             };
             let pairs = BTree::range_in(storage, index_def.root_page_id, lo_ref, hi_ref)?;
 
-            let mut result = Vec::with_capacity(pairs.len());
-            for (rid, _key) in pairs {
-                if let Some(values) = TableEngine::read_row(storage, schema_cols, rid)? {
+            let candidate_rids: Vec<RecordId> = pairs.into_iter().map(|(rid, _)| rid).collect();
+            let batch_rows =
+                TableEngine::read_rows_batch(storage, schema_cols, &candidate_rids)?;
+            let mut result = Vec::with_capacity(candidate_rids.len());
+            for (rid, maybe_values) in candidate_rids.into_iter().zip(batch_rows) {
+                if let Some(values) = maybe_values {
                     if is_truthy(&eval(where_clause, &values)?) {
                         result.push((rid, values));
                     }

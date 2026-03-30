@@ -377,7 +377,7 @@ impl IntegrityChecker {
             report.pages_checked += 1;
             report.slots_checked += page.header().item_count as u64;
 
-            for v in Self::check_page(page, max_committed) {
+            for v in Self::check_page(&page, max_committed) {
                 report.push(v);
             }
         }

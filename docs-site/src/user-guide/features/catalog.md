@@ -1,10 +1,50 @@
 # Catalog and Schema Introspection
 
-AxiomDB maintains an internal catalog that records all tables, columns, and indexes.
-The catalog is persisted on the first page of the database file (the meta page) and is
-accessible through system tables, convenience commands, and direct SQL queries.
+AxiomDB maintains an internal catalog that records logical databases, tables,
+columns, and indexes. The catalog is persisted in system heaps rooted from the
+meta page and is exposed through convenience commands plus catalog-backed SQL
+resolution.
 
 ---
+
+## Databases
+
+Fresh databases always bootstrap a default logical database named `axiomdb`.
+Existing databases created before multi-database support are upgraded lazily on
+open and their legacy tables remain owned by `axiomdb`.
+
+```sql
+SHOW DATABASES;
+```
+
+Example output:
+
+| Database |
+|----------|
+| axiomdb  |
+| analytics |
+
+```sql
+CREATE DATABASE analytics;
+USE analytics;
+SELECT DATABASE();
+```
+
+Expected result:
+
+| DATABASE() |
+|------------|
+| analytics  |
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Legacy Compatibility</span>
+Old tables created before <code>CREATE DATABASE</code> existed remain visible under
+the default database <code>axiomdb</code>. You do not need to rewrite old table names
+just to adopt <code>SHOW DATABASES</code> and <code>USE</code>.
+</div>
+</div>
 
 ## System Tables
 
@@ -87,6 +127,31 @@ ORDER BY is_primary DESC, index_name;
 ---
 
 ## Convenience Commands
+
+### SHOW DATABASES
+
+Lists all logical databases persisted in the catalog.
+
+```sql
+SHOW DATABASES;
+```
+
+### USE
+
+Changes the selected database for the current connection. Unqualified table
+names are resolved inside that database.
+
+```sql
+USE analytics;
+SHOW TABLES;
+```
+
+If the database does not exist, AxiomDB returns MySQL error `1049`:
+
+```sql
+USE missing_db;
+-- ERROR 1049 (42000): Unknown database 'missing_db'
+```
 
 ### SHOW TABLES
 
@@ -192,10 +257,10 @@ ORDER BY column_count DESC;
 
 ## Catalog Bootstrap
 
-The catalog is bootstrapped on the very first `open()` call. AxiomDB writes the three
-system tables (`axiom_tables`, `axiom_columns`, `axiom_indexes`) into the meta page
-using a special bootstrap transaction with LSN 0. Subsequent opens detect the
-bootstrapped meta page and skip the initialization step.
+The catalog is bootstrapped on the very first `open()` call. AxiomDB allocates the
+catalog roots, inserts the default database `axiomdb`, and makes the catalog durable
+before the database accepts traffic. Subsequent opens detect the initialized roots
+and skip the bootstrap path.
 
 The bootstrap is idempotent: if AxiomDB crashes during bootstrap, the incomplete
 transaction has no COMMIT record in the WAL, so crash recovery discards it and

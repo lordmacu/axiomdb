@@ -2,17 +2,57 @@ fn resolve_table_cached(
     storage: &mut dyn StorageEngine,
     txn: &TxnManager,
     ctx: &mut SessionContext,
-    schema: Option<&str>,
-    table_name: &str,
+    tref: &crate::ast::TableRef,
 ) -> Result<ResolvedTable, DbError> {
-    let schema_str = schema.unwrap_or("public");
-    if let Some(cached) = ctx.get_table(schema_str, table_name) {
-        return Ok(cached.clone());
+    let database = effective_database_for_ref(tref, ctx);
+
+    // If the user explicitly specified a database, verify it exists first.
+    if tref.database.is_some() {
+        let snap = txn.active_snapshot()?;
+        let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
+        if !reader.database_exists(&database)? {
+            return Err(DbError::DatabaseNotFound {
+                name: database,
+            });
+        }
     }
-    let mut resolver = make_resolver(storage, txn)?;
-    let resolved = resolver.resolve_table(schema, table_name)?;
-    ctx.cache_table(schema_str, table_name, resolved.clone());
-    Ok(resolved)
+
+    // If the user specified an explicit schema, resolve directly.
+    if let Some(schema) = tref.schema.as_deref() {
+        if let Some(cached) = ctx.get_table(&database, schema, &tref.name) {
+            return Ok(cached.clone());
+        }
+        let mut resolver = make_resolver_with_database(storage, txn, &database)?;
+        let resolved = resolver.resolve_table(Some(schema), &tref.name)?;
+        ctx.cache_table(&database, schema, &tref.name, resolved.clone());
+        return Ok(resolved);
+    }
+
+    // Unqualified name: scan search_path in order until a match is found.
+    let search_path: Vec<String> = ctx.search_path.clone();
+    for schema in &search_path {
+        if let Some(cached) = ctx.get_table(&database, schema, &tref.name) {
+            return Ok(cached.clone());
+        }
+        let mut resolver = make_resolver_with_database(storage, txn, &database)?;
+        if let Ok(resolved) = resolver.resolve_table(Some(schema), &tref.name) {
+            ctx.cache_table(&database, schema, &tref.name, resolved.clone());
+            return Ok(resolved);
+        }
+    }
+    // None of the search_path schemas had the table.
+    Err(DbError::TableNotFound {
+        name: tref.name.clone(),
+    })
+}
+
+/// Compute the effective database for a `TableRef`: if the ref has an explicit
+/// `database` component, use it; otherwise fall back to the session default.
+fn effective_database_for_ref(tref: &crate::ast::TableRef, ctx: &SessionContext) -> String {
+    tref.database
+        .as_deref()
+        .unwrap_or(ctx.effective_database())
+        .to_string()
 }
 
 // ── ctx-aware DML handlers ────────────────────────────────────────────────────
@@ -107,8 +147,16 @@ fn make_resolver<'a>(
     storage: &'a mut dyn StorageEngine,
     txn: &TxnManager,
 ) -> Result<SchemaResolver<'a>, DbError> {
+    make_resolver_with_database(storage, txn, DEFAULT_DATABASE_NAME)
+}
+
+fn make_resolver_with_database<'a>(
+    storage: &'a mut dyn StorageEngine,
+    txn: &TxnManager,
+    database: &'a str,
+) -> Result<SchemaResolver<'a>, DbError> {
     let snap: TransactionSnapshot = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
-    SchemaResolver::new(storage, snap, "public")
+    SchemaResolver::new(storage, snap, database, "public")
 }
 
 /// Converts a SQL [`DataType`] (from the AST) to the compact [`ColumnType`] stored

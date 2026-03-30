@@ -1,10 +1,12 @@
 //! Catalog schema types and their binary serialization.
 //!
-//! These types represent rows in the four system tables:
+//! These types represent rows in the system tables:
 //! - `axiom_tables`      → [`TableDef`]
 //! - `axiom_columns`     → [`ColumnDef`]
 //! - `axiom_indexes`     → [`IndexDef`]
 //! - `axiom_constraints` → [`ConstraintDef`] (Phase 4.22b)
+//! - `axiom_databases`   → [`DatabaseDef`] (Phase 22b.3a)
+//! - `axiom_table_databases` → [`TableDatabaseDef`] (Phase 22b.3a)
 //!
 //! ## Binary row format
 //!
@@ -70,6 +72,172 @@ pub struct IndexColumnDef {
 
 /// Unique identifier for a table in the catalog. `0` is reserved (invalid).
 pub type TableId = u32;
+
+/// Default logical database used for pre-22b.3a catalogs and unbound tables.
+pub const DEFAULT_DATABASE_NAME: &str = "axiomdb";
+
+// ── DatabaseDef ──────────────────────────────────────────────────────────────
+
+/// Metadata for a logical database — one row in `axiom_databases`.
+///
+/// ## On-disk format
+/// `[name_len:1][name UTF-8]`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseDef {
+    pub name: String,
+}
+
+impl DatabaseDef {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let name = self.name.as_bytes();
+        debug_assert!(name.len() <= 255, "database name too long");
+        let mut buf = Vec::with_capacity(1 + name.len());
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(name);
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), DbError> {
+        let err = || DbError::ParseError {
+            message: "truncated DatabaseRow bytes".into(),
+            position: None,
+        };
+        if bytes.is_empty() {
+            return Err(err());
+        }
+        let len = bytes[0] as usize;
+        if bytes.len() < 1 + len {
+            return Err(err());
+        }
+        let name = std::str::from_utf8(&bytes[1..1 + len])
+            .map_err(|_| DbError::ParseError {
+                message: "invalid UTF-8 in database name".into(),
+                position: None,
+            })?
+            .to_string();
+        Ok((Self { name }, 1 + len))
+    }
+}
+
+// ── TableDatabaseDef ─────────────────────────────────────────────────────────
+
+/// Ownership binding from a table to its logical database.
+///
+/// Missing rows imply legacy ownership by [`DEFAULT_DATABASE_NAME`].
+///
+/// ## On-disk format
+/// `[table_id:4 LE][name_len:1][name UTF-8]`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableDatabaseDef {
+    pub table_id: TableId,
+    pub database_name: String,
+}
+
+impl TableDatabaseDef {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let name = self.database_name.as_bytes();
+        debug_assert!(name.len() <= 255, "database name too long");
+        let mut buf = Vec::with_capacity(4 + 1 + name.len());
+        buf.extend_from_slice(&self.table_id.to_le_bytes());
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(name);
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), DbError> {
+        let err = || DbError::ParseError {
+            message: "truncated TableDatabaseRow bytes".into(),
+            position: None,
+        };
+        if bytes.len() < 5 {
+            return Err(err());
+        }
+        let table_id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let len = bytes[4] as usize;
+        if bytes.len() < 5 + len {
+            return Err(err());
+        }
+        let database_name = std::str::from_utf8(&bytes[5..5 + len])
+            .map_err(|_| DbError::ParseError {
+                message: "invalid UTF-8 in table database name".into(),
+                position: None,
+            })?
+            .to_string();
+        Ok((
+            Self {
+                table_id,
+                database_name,
+            },
+            5 + len,
+        ))
+    }
+}
+
+// ── SchemaDef ─────────────────────────────────────────────────────────────────
+
+/// Metadata for a logical schema — one row in `axiom_schemas` (Phase 22b.4).
+///
+/// Schemas are scoped to a logical database.
+///
+/// ## On-disk format
+/// `[db_len:1][db UTF-8][name_len:1][name UTF-8]`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaDef {
+    pub database_name: String,
+    pub name: String,
+}
+
+impl SchemaDef {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let db = self.database_name.as_bytes();
+        let name = self.name.as_bytes();
+        debug_assert!(db.len() <= 255, "database name too long");
+        debug_assert!(name.len() <= 255, "schema name too long");
+        let mut buf = Vec::with_capacity(2 + db.len() + name.len());
+        buf.push(db.len() as u8);
+        buf.extend_from_slice(db);
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(name);
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), DbError> {
+        let err = || DbError::ParseError {
+            message: "truncated SchemaDef bytes".into(),
+            position: None,
+        };
+        if bytes.is_empty() {
+            return Err(err());
+        }
+        let db_len = bytes[0] as usize;
+        if bytes.len() < 1 + db_len + 1 {
+            return Err(err());
+        }
+        let database_name = std::str::from_utf8(&bytes[1..1 + db_len])
+            .map_err(|_| DbError::ParseError {
+                message: "invalid UTF-8 in schema database name".into(),
+                position: None,
+            })?
+            .to_string();
+        let name_len = bytes[1 + db_len] as usize;
+        if bytes.len() < 2 + db_len + name_len {
+            return Err(err());
+        }
+        let name = std::str::from_utf8(&bytes[2 + db_len..2 + db_len + name_len])
+            .map_err(|_| DbError::ParseError {
+                message: "invalid UTF-8 in schema name".into(),
+                position: None,
+            })?
+            .to_string();
+        Ok((
+            Self {
+                database_name,
+                name,
+            },
+            2 + db_len + name_len,
+        ))
+    }
+}
 
 // ── ColumnType ────────────────────────────────────────────────────────────────
 
@@ -941,6 +1109,31 @@ mod tests {
         assert!(ColumnType::try_from(0).is_err());
         assert!(ColumnType::try_from(9).is_err());
         assert!(ColumnType::try_from(255).is_err());
+    }
+
+    // ── DatabaseDef ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_database_def_roundtrip() {
+        let def = DatabaseDef {
+            name: "ventas".into(),
+        };
+        let bytes = def.to_bytes();
+        let (back, consumed) = DatabaseDef::from_bytes(&bytes).unwrap();
+        assert_eq!(back, def);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn test_table_database_def_roundtrip() {
+        let def = TableDatabaseDef {
+            table_id: 42,
+            database_name: "analytics".into(),
+        };
+        let bytes = def.to_bytes();
+        let (back, consumed) = TableDatabaseDef::from_bytes(&bytes).unwrap();
+        assert_eq!(back, def);
+        assert_eq!(consumed, bytes.len());
     }
 
     // ── TableDef ──────────────────────────────────────────────────────────────
