@@ -38,7 +38,7 @@ use axiomdb_sql::{
     analyze_cached_with_defaults,
     ast::Stmt,
     bloom::BloomRegistry,
-    execute_with_ctx, parse,
+    execute_read_only_with_ctx, execute_with_ctx, parse,
     result::{ColumnMeta, QueryResult},
     session::{is_ignorable_on_error, OnErrorMode},
     verify_and_repair_indexes_on_open, SchemaCache, SessionContext,
@@ -294,6 +294,43 @@ impl Database {
             self.schema_version.fetch_add(1, Ordering::Release);
         }
         Ok((result, self.take_commit_rx()))
+    }
+
+    /// Executes a read-only query using only shared references (Phase 7.4).
+    ///
+    /// Takes `&self` instead of `&mut self` — safe to call from multiple
+    /// connections simultaneously without any lock. Only handles SELECT,
+    /// SHOW TABLES, SHOW DATABASES. Returns error for write statements.
+    pub fn execute_read_query(
+        &self,
+        sql: &str,
+        session: &mut SessionContext,
+        schema_cache: &mut SchemaCache,
+    ) -> Result<QueryResult, DbError> {
+        let lower_trim = sql.trim().to_ascii_lowercase();
+        if !lower_trim.starts_with("show warnings") {
+            session.clear_warnings();
+        }
+
+        // Parse
+        let stmt = parse(sql, None)?;
+
+        // Analyze (uses &self.storage, &self.txn — shared refs)
+        let snap = self
+            .txn
+            .active_snapshot()
+            .unwrap_or_else(|_| self.txn.snapshot());
+        let analyzed = analyze_cached_with_defaults(
+            stmt,
+            &self.storage,
+            snap,
+            session.effective_database(),
+            session.current_schema(),
+            schema_cache,
+        )?;
+
+        // Execute read-only path
+        execute_read_only_with_ctx(analyzed, &self.storage, &self.txn, &self.bloom, session)
     }
 
     /// Applies the session `on_error` policy to a pipeline failure from
