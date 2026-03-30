@@ -53,6 +53,17 @@ pub trait StorageEngine: Send {
     fn prefetch_hint(&self, start_page_id: u64, count: u64) {
         let _ = (start_page_id, count);
     }
+
+    /// Tells the storage the current transaction's snapshot_id so that
+    /// `free_page` can tag deferred frees with the epoch at which they became
+    /// unreachable. Implementations that do not defer frees may ignore this.
+    fn set_current_snapshot(&mut self, _snapshot_id: u64) {}
+
+    /// Returns the number of pages currently waiting in the deferred-free queue.
+    /// Useful for diagnostics and tests. Default: 0.
+    fn deferred_free_count(&self) -> usize {
+        0
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

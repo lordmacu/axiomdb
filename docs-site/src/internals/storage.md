@@ -121,8 +121,10 @@ go through the mmap.
 No production database uses mmap for writes. PostgreSQL uses pwrite + buffer pool,
 InnoDB uses pwrite + doublewrite buffer, DuckDB uses pwrite exclusively, and SQLite
 uses mmap for reads + pwrite for writes. AxiomDB follows the SQLite model: mmap gives
-zero-copy reads from the OS page cache, while pwrite gives atomic page writes that
-cannot produce torn pages for concurrent readers.
+zero-copy reads from the OS page cache, while pwrite provides coherent page writes visible through the mmap. Note that a
+16 KB pwrite is NOT crash-atomic on 4 KB-block filesystems (ext4, APFS, XFS) — a
+crash mid-write leaves a torn page. AxiomDB detects torn pages via CRC32c checksums
+on recovery; full WAL page-image redo (3.8c) will provide the repair path.
 </div>
 </div>
 
@@ -147,11 +149,17 @@ layer.
 ### Deferred Page Free Queue
 
 When `free_page(page_id)` is called, the page does **not** return to the freelist
-immediately. Instead it enters a `deferred_frees: Vec<u64>` queue. Pages are released
-for reuse only when `release_deferred_frees()` is called — typically after the
-transaction commits and no reader snapshot predates the free operation. This prevents
-a writer from reusing a freed page while a concurrent reader might still resolve it
-via an old index or heap chain pointer.
+immediately. Instead it enters an epoch-tagged queue: `deferred_frees: Vec<(page_id,
+freed_at_snapshot)>`. Each entry records the snapshot epoch at which the page became
+unreachable. `release_deferred_frees(oldest_active_snapshot)` only releases pages
+whose `freed_at_snapshot <= oldest_active_snapshot` — pages freed more recently remain
+queued because a concurrent reader might still hold a snapshot that references them.
+
+Under the current `Arc<RwLock<Database>>` architecture, `flush()` passes `u64::MAX`
+(release all) because the writer holds exclusive access and no readers are active.
+When snapshot slot tracking is added (Phase 7.8), the actual oldest active snapshot
+will be used instead. The queue is capped at 4096 entries with a tracing warning
+to detect snapshot leaks.
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
