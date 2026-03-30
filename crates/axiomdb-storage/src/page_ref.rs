@@ -30,6 +30,14 @@ impl PageRef {
         Self { inner: page }
     }
 
+    /// Consumes the `PageRef` and returns the owned `Page` for mutation.
+    ///
+    /// This avoids a 16KB copy when the caller needs to modify the page
+    /// and write it back (e.g., in-place B-Tree insert without CoW).
+    pub fn into_page(self) -> Page {
+        *self.inner
+    }
+
     /// Creates a `PageRef` by copying raw page bytes.
     ///
     /// # Safety
