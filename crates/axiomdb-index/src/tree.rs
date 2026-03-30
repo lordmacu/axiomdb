@@ -188,6 +188,31 @@ impl BTree {
         rid: RecordId,
         fillfactor: u8,
     ) -> Result<InsertResult, DbError> {
+        // Fast path: for leaf non-split inserts, avoid copying the entire
+        // LeafNodePage struct (16KB). Read the page, check if it needs
+        // splitting, and if not, modify the body directly via into_page().
+        {
+            let page_ref = storage.read_page(pid)?;
+            if page_ref.body()[0] == 1 {
+                let leaf = cast_leaf(&page_ref);
+                let ins_pos = match leaf.search(key) {
+                    Ok(_) => return Err(DbError::DuplicateKey),
+                    Err(pos) => pos,
+                };
+                let threshold = fill_threshold(ORDER_LEAF, fillfactor);
+                if leaf.num_keys() < threshold {
+                    // Non-split: convert PageRef to owned Page, modify, write back.
+                    // One read + one write, no intermediate alloc or struct copy.
+                    let mut page = page_ref.into_page();
+                    cast_leaf_mut(&mut page).insert_at(ins_pos, key, rid);
+                    page.update_checksum();
+                    storage.write_page(pid, &page)?;
+                    return Ok(InsertResult::Ok(pid));
+                }
+                // Fall through to split path (needs the full node copy).
+            }
+        }
+
         match NodeCopy::read(storage, pid)? {
             NodeCopy::Leaf(node) => Self::insert_leaf(storage, pid, node, key, rid, fillfactor),
             NodeCopy::Internal(node) => {
@@ -243,36 +268,24 @@ impl BTree {
         }
     }
 
+    /// Splits a full leaf page into left and right halves.
+    ///
+    /// Called only when `node.num_keys() >= threshold` (non-split path is
+    /// handled directly in `insert_subtree` via the fast path).
     fn insert_leaf(
         storage: &mut dyn StorageEngine,
         old_pid: u64,
         node: LeafNodePage,
         key: &[u8],
         rid: RecordId,
-        fillfactor: u8,
+        _fillfactor: u8,
     ) -> Result<InsertResult, DbError> {
         let ins_pos = match node.search(key) {
             Ok(_) => return Err(DbError::DuplicateKey),
             Err(pos) => pos,
         };
 
-        // Split threshold: max keys before splitting.
-        // fillfactor=100 → ORDER_LEAF (current behavior, no regression).
-        // fillfactor=90  → ⌈0.90 × 217⌉ = 196 (default).
-        // Internal pages always split at ORDER_INTERNAL (not fillfactor-controlled).
-        let threshold = fill_threshold(ORDER_LEAF, fillfactor);
-        if node.num_keys() < threshold {
-            // In-place: with &mut self there are no concurrent readers, CoW not needed.
-            let mut p = Page::new(PageType::Index, old_pid);
-            let n = cast_leaf_mut(&mut p);
-            *n = node;
-            n.insert_at(ins_pos, key, rid);
-            p.update_checksum();
-            storage.write_page(old_pid, &p)?;
-            return Ok(InsertResult::Ok(old_pid));
-        }
-
-        // Split
+        // Split (non-split case already handled by fast path in insert_subtree)
         let count = node.num_keys();
         let mut kl = [0u8; ORDER_LEAF + 1];
         let mut ks = [[0u8; MAX_KEY_LEN]; ORDER_LEAF + 1];
