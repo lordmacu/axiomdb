@@ -343,6 +343,57 @@ non-unique indexes, this eliminates O(K × log N) B-Tree operations per deleted 
 
 ---
 
+## VACUUM — Dead Row and Index Cleanup (Phase 7.11)
+
+The `VACUUM` command physically removes dead rows and dead index entries:
+
+```sql
+VACUUM orders;     -- vacuum a specific table
+VACUUM;            -- vacuum all tables
+```
+
+### Heap Vacuum
+
+For each page in the heap chain, VACUUM finds slots where `txn_id_deleted != 0`
+and `txn_id_deleted < oldest_safe_txn` (the deletion is committed and no active
+snapshot can see it). These slots are zeroed via `mark_slot_dead()`, making them
+invisible to `read_tuple()` without even reading the RowHeader.
+
+Under the current `Arc<RwLock<Database>>` architecture, `oldest_safe_txn =
+max_committed + 1` — all committed deletions are safe because no reader holds an
+older snapshot.
+
+### Index Vacuum
+
+For each non-unique, non-FK secondary index, VACUUM performs a full B-Tree scan
+and checks heap visibility for each entry. Dead entries (pointing to vacuumed or
+deleted heap slots) are batch-deleted from the B-Tree.
+
+Unique, PK, and FK index entries are skipped — they were already deleted
+immediately during DML (Phase 7.3b).
+
+### What VACUUM Does Not Do (Yet)
+
+- **Page compaction:** dead slots are zeroed but the physical space is not
+  reclaimed for new inserts. A future `VACUUM FULL` will defragment pages.
+- **Automatic triggering:** VACUUM must be invoked manually via SQL. Autovacuum
+  with threshold-based triggering is planned.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Slot-Level Vacuum Without Compaction</span>
+PostgreSQL's lazy vacuum marks dead line pointers as <code>LP_UNUSED</code> and
+updates a free space map (FSM) so the space can be reused. AxiomDB takes the
+simpler first step: dead slots are zeroed (making scans faster) but the physical
+space is not yet reusable. This avoids the complexity of a free space map and
+RecordId stability during compaction. Full space reclamation is planned as a
+separate enhancement.
+</div>
+</div>
+
+---
+
 ## ⚠️ Planned: Serializable Snapshot Isolation (Phase 7)
 
 SSI detects read-write dependencies between concurrent transactions and aborts

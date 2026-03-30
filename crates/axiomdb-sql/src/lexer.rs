@@ -122,6 +122,8 @@ pub enum Token<'src> {
     Exists,
     #[token("TRUNCATE", ignore(ascii_case))]
     Truncate,
+    #[token("VACUUM", ignore(ascii_case))]
+    Vacuum,
 
     // ── Constraints ───────────────────────────────────────────────────────────
     #[token("PRIMARY", ignore(ascii_case))]

@@ -691,6 +691,7 @@ fn dispatch_ctx(
             execute_alter_table(s, storage, txn, &db)
         }
         Stmt::Analyze(s) => execute_analyze(s, storage, txn, ctx),
+        Stmt::Vacuum(s) => crate::vacuum::execute_vacuum(s, storage, txn, bloom, ctx),
         Stmt::Set(s) => execute_set_ctx(s, ctx),
         Stmt::UseDatabase(s) => execute_use_database(s, storage, txn, ctx),
         Stmt::ShowDatabases(s) => execute_show_databases(s, storage, txn),
@@ -931,6 +932,9 @@ fn dispatch(
         Stmt::ShowColumns(s) => execute_show_columns(s, storage, txn, DEFAULT_DATABASE_NAME),
         Stmt::Analyze(_) => Err(DbError::NotImplemented {
             feature: "ANALYZE requires session context — use execute_with_ctx".into(),
+        }),
+        Stmt::Vacuum(_) => Err(DbError::NotImplemented {
+            feature: "VACUUM requires session context — use execute_with_ctx".into(),
         }),
     }
 }

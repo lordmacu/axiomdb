@@ -340,6 +340,13 @@ pub struct AnalyzeStmt {
     pub column: Option<String>,
 }
 
+/// `VACUUM [table_name]` — remove dead rows and dead index entries (Phase 7.11).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VacuumStmt {
+    /// `None` = vacuum all tables in the current database.
+    pub table: Option<TableRef>,
+}
+
 /// `ALTER TABLE` operation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterTableOp {
@@ -464,6 +471,9 @@ pub enum Stmt {
     Begin,
     Commit,
     Rollback,
+    // Maintenance
+    /// `VACUUM [table_name]` — remove dead rows and dead index entries (Phase 7.11).
+    Vacuum(VacuumStmt),
     // Session
     Set(SetStmt),
     UseDatabase(UseDatabaseStmt),
