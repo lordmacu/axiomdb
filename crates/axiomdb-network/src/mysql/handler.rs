@@ -18,7 +18,7 @@ use std::sync::{
 };
 
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, info, warn};
 
@@ -79,7 +79,7 @@ fn build_query_err_packet(e: &DbError, sql: &str, session: &ConnectionState) -> 
 }
 
 /// Handles one MySQL connection from handshake to disconnection.
-pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn_id: u32) {
+pub async fn handle_connection(stream: TcpStream, db: Arc<RwLock<Database>>, conn_id: u32) {
     handle_connection_with_timeouts(stream, db, conn_id, LifecycleTimeouts::default()).await;
 }
 
@@ -89,7 +89,7 @@ pub async fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>, conn
 /// sleeping for the production defaults.
 pub async fn handle_connection_with_timeouts(
     stream: TcpStream,
-    db: Arc<Mutex<Database>>,
+    db: Arc<RwLock<Database>>,
     conn_id: u32,
     timeouts: LifecycleTimeouts,
 ) {
@@ -249,7 +249,7 @@ pub async fn handle_connection_with_timeouts(
             .decode_identifier_text(db_bytes)
             .unwrap_or_else(|_| String::from_utf8_lossy(db_bytes).into_owned());
         let exists = {
-            let guard = db.lock().await;
+            let guard = db.write().await;
             guard.database_exists(&db_name)
         };
         match exists {
@@ -299,7 +299,7 @@ pub async fn handle_connection_with_timeouts(
     // Clone Arc<AtomicU64> and Arc<StatusRegistry> once per connection — no lock
     // needed after this point for either. (Phase 5.13 + 5.9c)
     let (schema_version, status): (Arc<AtomicU64>, Arc<StatusRegistry>) = {
-        let guard = db.lock().await;
+        let guard = db.write().await;
         (Arc::clone(&guard.schema_version), Arc::clone(&guard.status))
     };
 
@@ -397,7 +397,7 @@ pub async fn handle_connection_with_timeouts(
                 };
                 debug!(conn_id, db = %db_name, "COM_INIT_DB");
                 let exists = {
-                    let guard = db.lock().await;
+                    let guard = db.write().await;
                     guard.database_exists(&db_name)
                 };
                 match exists {
@@ -609,7 +609,7 @@ pub async fn handle_connection_with_timeouts(
                     bump_statement_counters(&status, &mut conn_state.session_status, class);
 
                     let exec_result = {
-                        let mut guard = db.lock().await;
+                        let mut guard = db.write().await;
                         guard.execute_query(stmt_sql, &mut session, &mut schema_cache)
                     };
 
@@ -774,7 +774,7 @@ pub async fn handle_connection_with_timeouts(
                 // is cached in PreparedStatement.analyzed_stmt for reuse on every
                 // COM_STMT_EXECUTE without re-parsing or re-analyzing.
                 let (analyzed_stmt, result_cols) = {
-                    let guard = db.lock().await;
+                    let guard = db.write().await;
                     let snap = guard
                         .txn
                         .active_snapshot()
@@ -881,7 +881,7 @@ pub async fn handle_connection_with_timeouts(
                                     "plan stale: re-analyzing"
                                 );
                                 let (new_plan, _) = {
-                                    let guard = db.lock().await;
+                                    let guard = db.write().await;
                                     let snap = guard
                                         .txn
                                         .active_snapshot()
@@ -920,7 +920,7 @@ pub async fn handle_connection_with_timeouts(
                                 debug!(conn_id, stmt_id, "COM_STMT_EXECUTE (plan cache hit)");
                                 match substitute_params_in_ast(cached, &exec.params) {
                                     Ok(ready_stmt) => {
-                                        let mut guard = db.lock().await;
+                                        let mut guard = db.write().await;
                                         guard.execute_stmt(ready_stmt, &mut session)
                                         // lock released here, before await below
                                     }
@@ -932,7 +932,7 @@ pub async fn handle_connection_with_timeouts(
                                 match substitute_params(&sql_template, &exec.params) {
                                     Ok(final_sql) => {
                                         debug!(conn_id, sql = %final_sql, "COM_STMT_EXECUTE (no cache)");
-                                        let mut guard = db.lock().await;
+                                        let mut guard = db.write().await;
                                         guard.execute_query(
                                             &final_sql,
                                             &mut session,

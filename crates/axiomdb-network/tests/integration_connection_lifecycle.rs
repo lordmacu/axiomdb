@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Mutex,
+    sync::RwLock,
 };
 
 use axiomdb_network::mysql::{
@@ -25,7 +25,7 @@ struct TestServer {
 
 async fn spawn_server(timeouts: LifecycleTimeouts) -> TestServer {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = Arc::new(Mutex::new(
+    let db = Arc::new(RwLock::new(
         Database::open(dir.path()).expect("open test db"),
     ));
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -52,7 +52,7 @@ async fn spawn_server_with_setup(timeouts: LifecycleTimeouts, setup_sql: &[&str]
         db.execute_query(sql, &mut session, &mut cache)
             .unwrap_or_else(|e| panic!("setup SQL failed: {sql}\nError: {e:?}"));
     }
-    let db = Arc::new(Mutex::new(db));
+    let db = Arc::new(RwLock::new(db));
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");

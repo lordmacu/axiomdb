@@ -248,9 +248,9 @@
 
 ### Phase 7 — Concurrency + MVCC `⏳` week 40-48
 - [x] ✅ Non-unique secondary indexes composite key — Fixed in 6.13: all non-unique non-FK secondary indexes now use `key||RecordId` format (same as FK auto-indexes). DuplicateKey blocker for MVCC removed.
-- [ ] 7.1 ⏳ MVCC visibility rules — snapshot_id rules over RowHeader (struct defined in 3.4): which rows are visible; implement READ COMMITTED (snapshot per statement) and REPEATABLE READ (snapshot per transaction) explicitly
+- [x] 7.1 ✅ MVCC visibility rules — `IsolationLevel` + `SessionContext` now expose `READ COMMITTED`, `REPEATABLE READ`, and `SERIALIZABLE` (aliased to RR snapshot policy); `TxnManager::active_snapshot()` returns fresh snapshots for RC and frozen snapshots for RR/SERIALIZABLE; covered by `integration_isolation`
 - [ ] 7.2 ⏳ Transaction manager — global atomic txn_id counter
-- [ ] 7.3 ⏳ Snapshot isolation — visibility rules per snapshot_id
+- [x] 7.3 ✅ Snapshot isolation — `TransactionSnapshot { snapshot_id, current_txn_id }` + `RowHeader::is_visible()` already enforce committed-before-snapshot visibility, read-your-own-writes, and committed-vs-uncommitted delete semantics; covered by heap visibility tests and `integration_table`
 - [ ] 7.3b ⏳ MVCC on secondary indexes — each index entry includes `(key, RecordId, txn_id_visible_from)`; UPDATE of indexed column inserts new version without deleting the old one; vacuum cleans dead index versions; requires 7.1-7.3 snapshot isolation (moved from 6.14)
 - [ ] 7.4 ⏳ Lock-free readers with CoW — verify that reads do not block writes
 - [ ] 7.5 ⏳ Writer serialization — only 1 writer at a time per table (improve later)
