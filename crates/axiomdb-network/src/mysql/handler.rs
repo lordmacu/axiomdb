@@ -644,33 +644,51 @@ pub async fn handle_connection_with_timeouts(
                             Err(_elapsed) => Err(DbError::LockTimeout),
                             Ok(mut guard) => {
                                 // Phase 27.8b: literal-normalized plan cache.
-                                // Check if we have a cached plan for this query structure.
-                                let sv = guard
-                                    .schema_version
-                                    .load(std::sync::atomic::Ordering::Acquire);
-                                if let Some((cached_stmt, _params)) =
-                                    plan_cache.lookup(stmt_sql, sv)
-                                {
-                                    guard.execute_stmt(cached_stmt, &mut session)
-                                } else {
-                                    let result = guard.execute_query(
-                                        stmt_sql,
-                                        &mut session,
-                                        &mut schema_cache,
-                                    );
-                                    // On success, store the NORMALIZED plan (with ? placeholders)
-                                    // for future reuse. The normalized SQL has literals replaced
-                                    // so substitute_params_in_ast can inject new values on cache hit.
-                                    if result.is_ok() {
-                                        let (norm_sql, _) =
-                                            super::plan_cache::normalize_sql(stmt_sql);
-                                        if let Ok(stmt) =
-                                            axiomdb_sql::parser::parse(&norm_sql, None)
-                                        {
-                                            plan_cache.store(stmt_sql, &stmt, sv);
+                                // Only cache DML with literals (SELECT/INSERT/UPDATE/DELETE).
+                                // Transaction control (BEGIN/COMMIT/ROLLBACK), DDL, SET, etc.
+                                // always go through the full execute_query pipeline.
+                                let lower = stmt_sql.trim_start().to_ascii_lowercase();
+                                let is_cacheable = lower.starts_with("select")
+                                    || lower.starts_with("insert")
+                                    || lower.starts_with("update")
+                                    || lower.starts_with("delete");
+
+                                if is_cacheable {
+                                    let sv = guard
+                                        .schema_version
+                                        .load(std::sync::atomic::Ordering::Acquire);
+                                    if let Some((cached_stmt, _params)) =
+                                        plan_cache.lookup(stmt_sql, sv)
+                                    {
+                                        // Cache hit: skip parse, but run full pipeline
+                                        // (snapshot + analyze + execute). Like PostgreSQL,
+                                        // every execution gets a fresh snapshot.
+                                        guard.execute_cached_stmt(
+                                            stmt_sql,
+                                            cached_stmt,
+                                            &mut session,
+                                            &mut schema_cache,
+                                        )
+                                    } else {
+                                        let result = guard.execute_query(
+                                            stmt_sql,
+                                            &mut session,
+                                            &mut schema_cache,
+                                        );
+                                        if result.is_ok() {
+                                            let (norm_sql, _) =
+                                                super::plan_cache::normalize_sql(stmt_sql);
+                                            if let Ok(norm_stmt) =
+                                                axiomdb_sql::parser::parse(&norm_sql, None)
+                                            {
+                                                plan_cache.store(stmt_sql, &norm_stmt, sv);
+                                            }
                                         }
+                                        result
                                     }
-                                    result
+                                } else {
+                                    // Non-cacheable: always full pipeline.
+                                    guard.execute_query(stmt_sql, &mut session, &mut schema_cache)
                                 }
                             }
                         }
