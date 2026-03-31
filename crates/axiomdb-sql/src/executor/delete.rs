@@ -108,47 +108,16 @@ fn execute_delete_ctx(
     let rids_only: Vec<RecordId> = to_delete.iter().map(|(rid, _)| *rid).collect();
     let count = TableEngine::delete_rows_batch(storage, txn, &resolved.def, &rids_only)?;
 
-    // Phase 7.3b — MVCC lazy index deletion: non-unique secondary index entries
-    // are NOT removed on DELETE. The heap row is marked deleted (txn_id_deleted),
-    // and index entries become "dead" — filtered by heap visibility checks on read.
-    // Vacuum (Phase 7.11) will clean dead entries later.
+    // MVCC deferred index deletion (PostgreSQL model): ALL index entries are left
+    // in place during DELETE — PK, UNIQUE, FK auto-indexes, and non-unique alike.
+    // Dead entries are filtered by heap visibility checks on read (7.3b).
+    // VACUUM (7.11) cleans dead entries from all index types.
     //
-    // These index types MUST still be deleted immediately:
-    // - PRIMARY KEY / UNIQUE: B-Tree enforces key uniqueness internally
-    //   (BTree::insert_in returns DuplicateKey). Dead entries block re-insert.
-    // - FK auto-indexes: FK checker uses reverse-lookup to find child rows.
-    //   Dead entries cause false positives during parent-side FK enforcement.
-    let immediate_delete_indexes: Vec<axiomdb_catalog::IndexDef> = secondary_indexes
-        .iter()
-        .filter(|i| i.is_unique || i.is_fk_index)
-        .cloned()
-        .collect();
-    if !immediate_delete_indexes.is_empty() {
-        let compiled_preds = crate::partial_index::compile_index_predicates(
-            &immediate_delete_indexes,
-            &schema_cols,
-        )?;
-        let mut immediate_delete_indexes = immediate_delete_indexes;
-        let key_buckets = crate::index_maintenance::collect_delete_keys_by_index(
-            &immediate_delete_indexes,
-            &to_delete,
-            &compiled_preds,
-        )?;
-        let updated = crate::index_maintenance::delete_many_from_indexes(
-            &mut immediate_delete_indexes,
-            key_buckets,
-            storage,
-            bloom,
-        )?;
-        let mut any_root_changed = false;
-        for (index_id, new_root) in updated {
-            CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
-            any_root_changed = true;
-        }
-        if any_root_changed {
-            ctx.invalidate_all();
-        }
-    }
+    // Why safe for PK/UNIQUE: has_visible_duplicate() checks heap visibility
+    // before raising UniqueViolation, so INSERT after DELETE of same key works.
+    //
+    // Why safe for FK auto-indexes: FK enforcement now checks heap visibility
+    // (is_slot_visible) before raising ForeignKeyParentViolation.
 
     // Track row changes for stats staleness (Phase 6.11).
     if count > 0 {
@@ -326,33 +295,8 @@ fn execute_delete(
     let rids_only: Vec<RecordId> = to_delete.iter().map(|(rid, _)| *rid).collect();
     let count = TableEngine::delete_rows_batch(storage, txn, &resolved.def, &rids_only)?;
 
-    // Phase 7.3b — MVCC lazy index deletion (same logic as execute_delete_ctx).
-    let immediate_delete_indexes: Vec<IndexDef> = secondary_indexes
-        .iter()
-        .filter(|i| i.is_unique || i.is_fk_index)
-        .cloned()
-        .collect();
-    if !immediate_delete_indexes.is_empty() {
-        let compiled_preds = crate::partial_index::compile_index_predicates(
-            &immediate_delete_indexes,
-            &schema_cols,
-        )?;
-        let mut immediate_delete_indexes = immediate_delete_indexes;
-        let key_buckets = crate::index_maintenance::collect_delete_keys_by_index(
-            &immediate_delete_indexes,
-            &to_delete,
-            &compiled_preds,
-        )?;
-        let updated = crate::index_maintenance::delete_many_from_indexes(
-            &mut immediate_delete_indexes,
-            key_buckets,
-            storage,
-            &mut noop_bloom,
-        )?;
-        for (index_id, new_root) in updated {
-            CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
-        }
-    }
+    // MVCC deferred index deletion (PostgreSQL model): all index entries left in
+    // place. Dead entries filtered by heap visibility. VACUUM cleans later.
 
     Ok(QueryResult::Affected {
         count,

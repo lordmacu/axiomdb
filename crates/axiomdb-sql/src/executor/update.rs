@@ -356,7 +356,6 @@ fn apply_update_index_maintenance(
 
         // Phase 7.3b — HOT optimization: per-index check.
         // If no key column changed for any row in this batch, skip this index entirely.
-        let mut delete_keys: Vec<Vec<u8>> = Vec::new();
         let mut insert_rows: Vec<(RecordId, &Vec<Value>)> = Vec::new();
         for (old_rid, old_values, new_rid, new_values) in update_pairs {
             if crate::index_maintenance::update_affects_index(
@@ -367,35 +366,33 @@ fn apply_update_index_maintenance(
                 new_values,
                 *new_rid,
             )? {
-                // Phase 7.3b — Lazy delete: only unique/FK indexes have their old
-                // entries removed immediately. Unique: B-Tree enforces uniqueness
-                // internally (DuplicateKey). FK: reverse-lookup for child rows.
-                // Non-unique secondary indexes leave old entries in place.
+                // For UPDATE: delete old key for unique/PK indexes to avoid
+                // stale entries that would confuse index lookups returning
+                // the wrong row values. Non-unique indexes use lazy deletion.
                 if idx.is_unique || idx.is_fk_index {
                     if let Some(key_vals) =
                         crate::index_maintenance::index_key_values_if_indexed(
                             idx, old_values, pred,
                         )?
                     {
-                        delete_keys.push(crate::index_maintenance::encode_index_entry_key(
-                            idx, &key_vals, *old_rid,
-                        )?);
+                        let delete_keys_for_idx =
+                            vec![crate::index_maintenance::encode_index_entry_key(
+                                idx, &key_vals, *old_rid,
+                            )?];
+                        if let Some(new_root) =
+                            crate::index_maintenance::delete_many_from_single_index(
+                                idx,
+                                &delete_keys_for_idx,
+                                storage,
+                                bloom,
+                            )?
+                        {
+                            CatalogWriter::new(storage, txn)?
+                                .update_index_root(idx.index_id, new_root)?;
+                        }
                     }
                 }
                 insert_rows.push((*new_rid, new_values));
-            }
-        }
-
-        // Delete old keys for unique/FK indexes (B-Tree enforces uniqueness).
-        if !delete_keys.is_empty() {
-            delete_keys.sort_unstable();
-            if let Some(new_root) = crate::index_maintenance::delete_many_from_single_index(
-                idx,
-                &delete_keys,
-                storage,
-                bloom,
-            )? {
-                CatalogWriter::new(storage, txn)?.update_index_root(idx.index_id, new_root)?;
             }
         }
 
