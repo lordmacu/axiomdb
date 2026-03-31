@@ -751,25 +751,50 @@ impl TableEngine {
         }
         let col_types = column_data_types(columns);
 
-        let encoded_rows: Vec<Vec<u8>> = batch
-            .iter()
-            .enumerate()
-            .map(|(i, values)| {
-                let values = values.clone();
-                if values.len() != columns.len() {
-                    return Err(DbError::TypeMismatch {
-                        expected: format!("{} columns", columns.len()),
-                        got: format!("{} values", values.len()),
-                    });
-                }
-                let coerced = coerce_values_with_ctx(values, columns, ctx, i + 1)?;
-                encode_row(&coerced, &col_types)
-            })
-            .collect::<Result<_, _>>()?;
+        // Phase 8.3b: find first non-PK integer column for zone map tracking.
+        let zm_col_idx = columns.iter().position(|c| {
+            matches!(
+                c.col_type,
+                ColumnType::Int | ColumnType::BigInt | ColumnType::Bool
+            )
+        });
+
+        let mut encoded_rows: Vec<Vec<u8>> = Vec::with_capacity(batch.len());
+        let mut zm_values: Vec<Option<(u8, i64)>> = Vec::with_capacity(batch.len());
+
+        for (i, values) in batch.iter().enumerate() {
+            let values = values.clone();
+            if values.len() != columns.len() {
+                return Err(DbError::TypeMismatch {
+                    expected: format!("{} columns", columns.len()),
+                    got: format!("{} values", values.len()),
+                });
+            }
+            let coerced = coerce_values_with_ctx(values, columns, ctx, i + 1)?;
+
+            // Extract zone map value from the tracked column.
+            let zm_val = zm_col_idx.and_then(|ci| {
+                let val = match &coerced[ci] {
+                    Value::Int(n) => Some(*n as i64),
+                    Value::BigInt(n) => Some(*n),
+                    Value::Bool(b) => Some(if *b { 1i64 } else { 0 }),
+                    _ => None,
+                };
+                val.map(|v| (ci as u8, v))
+            });
+            zm_values.push(zm_val);
+
+            encoded_rows.push(encode_row(&coerced, &col_types)?);
+        }
 
         let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
-        let phys_locs =
-            HeapChain::insert_batch(storage, table_def.data_root_page_id, &encoded_rows, txn_id)?;
+        let phys_locs = HeapChain::insert_batch_with_zm(
+            storage,
+            table_def.data_root_page_id,
+            &encoded_rows,
+            txn_id,
+            &zm_values,
+        )?;
 
         let mut page_slot_map: std::collections::HashMap<u64, Vec<u16>> =
             std::collections::HashMap::new();
