@@ -739,6 +739,7 @@ fn dispatch_ctx(
             execute_alter_table(s, storage, txn, &db)
         }
         Stmt::Analyze(s) => execute_analyze(s, storage, txn, ctx),
+        Stmt::Explain(inner) => execute_explain(*inner, storage, txn, bloom, ctx),
         Stmt::Vacuum(s) => crate::vacuum::execute_vacuum(s, storage, txn, bloom, ctx),
         Stmt::Set(s) => execute_set_ctx(s, ctx),
         Stmt::UseDatabase(s) => execute_use_database(s, storage, txn, ctx),
@@ -997,12 +998,229 @@ fn dispatch(
         Stmt::Vacuum(_) => Err(DbError::NotImplemented {
             feature: "VACUUM requires session context — use execute_with_ctx".into(),
         }),
+        Stmt::Explain(_) => Err(DbError::NotImplemented {
+            feature: "EXPLAIN requires session context — use execute_with_ctx".into(),
+        }),
         Stmt::Savepoint(_) | Stmt::RollbackToSavepoint(_) | Stmt::ReleaseSavepoint(_) => {
             Err(DbError::NotImplemented {
                 feature: "SAVEPOINT requires session context — use execute_with_ctx".into(),
             })
         }
     }
+}
+
+// ── EXPLAIN ─────────────────────────────────────────────────────────────────
+
+/// Executes EXPLAIN: runs the planner on the inner SELECT but does NOT
+/// execute the query. Returns the query plan as a result set in MySQL format.
+fn execute_explain(
+    inner: Stmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    match inner {
+        Stmt::Select(s) => explain_select(s, storage, txn, bloom, ctx),
+        other => {
+            // For non-SELECT, just show the statement type.
+            let type_name = match &other {
+                Stmt::Insert(_) => "INSERT",
+                Stmt::Update(_) => "UPDATE",
+                Stmt::Delete(_) => "DELETE",
+                _ => "OTHER",
+            };
+            let columns = explain_columns();
+            let rows = vec![vec![
+                Value::Int(1),
+                Value::Text("SIMPLE".into()),
+                Value::Text("-".into()),
+                Value::Text(type_name.into()),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]];
+            Ok(QueryResult::Rows { columns, rows })
+        }
+    }
+}
+
+fn explain_select(
+    stmt: SelectStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    _bloom: &mut crate::bloom::BloomRegistry,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let columns = explain_columns();
+
+    // Resolve table (same as execute_select_ctx).
+    let from = stmt
+        .from
+        .as_ref()
+        .ok_or(DbError::Other("EXPLAIN requires a FROM clause".into()))?;
+    let from_table_ref = match from {
+        crate::ast::FromClause::Table(t) => t,
+        crate::ast::FromClause::Subquery { .. } => {
+            return Err(DbError::Other(
+                "EXPLAIN for subquery FROM not yet supported".into(),
+            ))
+        }
+    };
+
+    let resolved = resolve_table_cached(storage, txn, ctx, from_table_ref)?;
+    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+
+    // Load stats + run planner (same as execute_select_ctx).
+    let secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
+        .indexes
+        .iter()
+        .filter(|i| !i.columns.is_empty())
+        .cloned()
+        .collect();
+
+    let table_stats: Vec<axiomdb_catalog::StatsDef> = {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        reader.list_stats(resolved.def.id).unwrap_or_default()
+    };
+
+    let select_col_idxs: Vec<usize> = stmt
+        .columns
+        .iter()
+        .filter_map(|item| match item {
+            crate::ast::SelectItem::Expr {
+                expr: crate::expr::Expr::Column { col_idx, .. },
+                ..
+            } => Some(*col_idx),
+            _ => None,
+        })
+        .collect();
+
+    let effective_coll = ctx.effective_collation();
+    let select_col_idxs_u16: Vec<u16> = select_col_idxs.iter().map(|&i| i as u16).collect();
+    let access_method = crate::planner::plan_select_ctx(
+        stmt.where_clause.as_ref(),
+        &secondary_indexes,
+        &resolved.columns,
+        resolved.def.id,
+        &table_stats,
+        &mut ctx.stats,
+        &select_col_idxs_u16,
+        effective_coll,
+    );
+
+    // Format the plan as MySQL EXPLAIN row.
+    let table_name = &resolved.def.table_name;
+    let row_count = table_stats.first().map(|s| s.row_count).unwrap_or(0);
+
+    let (access_type, key_name, key_len, ref_val, est_rows, extra) = match &access_method {
+        crate::planner::AccessMethod::Scan => (
+            "ALL",
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Int(row_count as i32),
+            if stmt.where_clause.is_some() {
+                "Using where"
+            } else {
+                ""
+            },
+        ),
+        crate::planner::AccessMethod::IndexLookup { index_def, .. } => (
+            if index_def.is_unique || index_def.is_primary {
+                "const"
+            } else {
+                "ref"
+            },
+            Value::Text(index_def.name.clone()),
+            Value::Int(index_def.columns.len() as i32),
+            Value::Text("const".into()),
+            Value::Int(1),
+            if stmt.where_clause.is_some() {
+                "Using where"
+            } else {
+                ""
+            },
+        ),
+        crate::planner::AccessMethod::IndexRange { index_def, .. } => {
+            let ndv = table_stats
+                .iter()
+                .find(|s| s.col_idx == index_def.columns[0].col_idx)
+                .map(|s| s.ndv.max(1) as u64)
+                .unwrap_or(200);
+            let est = (row_count / ndv).max(1);
+            (
+                "range",
+                Value::Text(index_def.name.clone()),
+                Value::Int(index_def.columns.len() as i32),
+                Value::Null,
+                Value::Int(est as i32),
+                "Using where; Using index condition",
+            )
+        }
+        crate::planner::AccessMethod::IndexOnlyScan { index_def, .. } => {
+            let ndv = table_stats
+                .iter()
+                .find(|s| s.col_idx == index_def.columns[0].col_idx)
+                .map(|s| s.ndv.max(1) as u64)
+                .unwrap_or(200);
+            let est = (row_count / ndv).max(1);
+            (
+                "index",
+                Value::Text(index_def.name.clone()),
+                Value::Int(index_def.columns.len() as i32),
+                Value::Null,
+                Value::Int(est as i32),
+                "Using index",
+            )
+        }
+    };
+
+    // Possible keys: all indexes on the table.
+    let possible_keys = if secondary_indexes.is_empty() {
+        Value::Null
+    } else {
+        Value::Text(
+            secondary_indexes
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    };
+
+    let rows = vec![vec![
+        Value::Int(1),                   // id
+        Value::Text("SIMPLE".into()),    // select_type
+        Value::Text(table_name.clone()), // table
+        Value::Text(access_type.into()), // type
+        possible_keys,                   // possible_keys
+        key_name,                        // key
+        key_len,                         // key_len
+        ref_val,                         // ref
+        est_rows,                        // rows
+        Value::Text(extra.into()),       // Extra
+    ]];
+
+    Ok(QueryResult::Rows { columns, rows })
+}
+
+fn explain_columns() -> Vec<ColumnMeta> {
+    vec![
+        ColumnMeta::computed("id", DataType::Int),
+        ColumnMeta::computed("select_type", DataType::Text),
+        ColumnMeta::computed("table", DataType::Text),
+        ColumnMeta::computed("type", DataType::Text),
+        ColumnMeta::computed("possible_keys", DataType::Text),
+        ColumnMeta::computed("key", DataType::Text),
+        ColumnMeta::computed("key_len", DataType::Int),
+        ColumnMeta::computed("ref", DataType::Text),
+        ColumnMeta::computed("rows", DataType::Int),
+        ColumnMeta::computed("Extra", DataType::Text),
+    ]
 }
 
 include!("shared.rs");
