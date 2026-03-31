@@ -1145,6 +1145,98 @@
 
 ---
 
+## BLOCK 12 — Browser Engine (Phase 38)
+
+> **Design decision (2026-03-30):** AxiomDB already has a clean separation between
+> engine logic (parser, executor, B+ Tree, buffer pool, MVCC) and I/O (storage backend).
+> By compiling the engine crates to `wasm32-wasi` and providing an OPFS-backed
+> StorageEngine implementation, the full database runs inside a Web Worker — no POSIX
+> emulation layer, no SQLite port. This is not a toy: it's the same engine, same SQL,
+> same MVCC, compiled to a different target.
+>
+> **Key differentiator vs existing solutions (sql.js, PGlite, wa-sqlite):** Those are
+> ports of C/C++ engines that emulate POSIX over browser APIs, adding overhead.
+> AxiomDB-Wasm is the engine itself compiled natively — no emulation layer, smaller
+> binary (~200KB vs 800KB-3MB), and features designed for browser from day one
+> (reactive queries, CRDT sync, tab coordination).
+
+### Phase 38 — AxiomDB-Wasm: Browser Database Engine `⏳` week 122-130
+
+#### 38.A — Wasm compilation target
+- [ ] 38.1 ⏳ Compile axiomdb-core, axiomdb-sql, axiomdb-storage to wasm32-wasi — verify all pure-Rust crates compile clean without std::fs / std::net
+- [ ] 38.2 ⏳ Feature-gate all OS-dependent code (`#[cfg(not(target_arch = "wasm32"))]`) — mmap, tokio, TCP, file I/O
+- [ ] 38.3 ⏳ Wasm-compatible allocator — wee_alloc or dlmalloc for smaller binary size
+- [ ] 38.4 ⏳ Binary size budget: ≤200KB gzipped for core engine (parser + executor + B+ Tree + buffer pool)
+- [ ] 38.5 ⏳ `cargo build --target wasm32-unknown-unknown` passes clean for engine crates
+
+#### 38.B — OPFS storage backend
+- [ ] 38.6 ⏳ `OpfsStorageEngine` — implements StorageEngine trait over Origin Private File System
+- [ ] 38.7 ⏳ Synchronous access via `FileSystemSyncAccessHandle` inside Web Worker (read/write/flush at byte offsets)
+- [ ] 38.8 ⏳ Page-level I/O: 16KB pages read/written directly to OPFS — same page format as native engine
+- [ ] 38.9 ⏳ WAL on OPFS — append-only log file, same format as native WAL, crash recovery on page reload
+- [ ] 38.10 ⏳ Storage quota detection — `navigator.storage.estimate()` to warn before hitting browser limits
+- [ ] 38.11 ⏳ Fallback to IndexedDB for browsers without OPFS sync access (Safari, older Firefox)
+
+#### 38.C — JavaScript bindings
+- [ ] 38.12 ⏳ `wasm-bindgen` API: `AxiomDB.open(name)`, `.execute(sql)`, `.query(sql)` — returns JS objects
+- [ ] 38.13 ⏳ Web Worker wrapper — all DB operations run off main thread, communicate via `postMessage`
+- [ ] 38.14 ⏳ Promise-based async API: `const rows = await db.query("SELECT * FROM users WHERE id = ?", [42])`
+- [ ] 38.15 ⏳ Prepared statements: `const stmt = db.prepare(sql)` — reuse parsed plan, bind params per execution
+- [ ] 38.16 ⏳ TypeScript type definitions — full `.d.ts` with generics for query results
+- [ ] 38.17 ⏳ npm package: `@axiomdb/browser` — zero dependencies, ESM + CJS, tree-shakeable
+
+#### 38.D — Reactive queries (browser-native)
+- [ ] 38.18 ⏳ Live queries: `db.watch("SELECT * FROM todos WHERE done = false", callback)` — callback fires on every INSERT/UPDATE/DELETE that changes the result set
+- [ ] 38.19 ⏳ Efficient invalidation — WAL-based change tracking per table, only re-execute watched queries on affected tables
+- [ ] 38.20 ⏳ React hook: `useAxiomQuery(sql, params)` — returns reactive state, auto-subscribes/unsubscribes
+- [ ] 38.21 ⏳ Vue composable: `useAxiomQuery(sql, params)` — same semantics, Vue reactivity system
+- [ ] 38.22 ⏳ Svelte store: `axiomQuery(sql, params)` — Svelte writable store with auto-subscription
+
+#### 38.E — Multi-tab coordination
+- [ ] 38.23 ⏳ SharedWorker or BroadcastChannel — single writer across all tabs, prevent OPFS lock conflicts
+- [ ] 38.24 ⏳ Tab-aware connection pool — tabs share one DB instance, queries routed to the shared worker
+- [ ] 38.25 ⏳ Cross-tab live query notifications — change in tab A triggers reactive update in tab B
+
+#### 38.F — Sync engine (offline-first)
+- [ ] 38.26 ⏳ CRDT-based merge — last-write-wins per column with Hybrid Logical Clocks (HLC)
+- [ ] 38.27 ⏳ Sync protocol: browser ↔ AxiomDB server — delta sync over WebSocket, only changed rows since last sync
+- [ ] 38.28 ⏳ Conflict resolution strategies: LWW (default), server-wins, client-wins, custom merge function
+- [ ] 38.29 ⏳ Offline queue — mutations while offline are queued and replayed on reconnect in order
+- [ ] 38.30 ⏳ Sync status API: `db.sync.status` → `{ state: 'syncing' | 'synced' | 'offline', pending: 12 }`
+
+#### 38.G — Performance and limits
+- [ ] 38.31 ⏳ Benchmark: point lookup latency in Wasm vs native (target: ≤3× native)
+- [ ] 38.32 ⏳ Benchmark: INSERT throughput in Wasm+OPFS (target: ≥50K rows/s)
+- [ ] 38.33 ⏳ Benchmark: binary size vs sql.js, PGlite, wa-sqlite, DuckDB-Wasm
+- [ ] 38.34 ⏳ Benchmark: cold start time (Wasm instantiation + OPFS open, target: <100ms)
+- [ ] 38.35 ⏳ Memory pressure handling — graceful eviction when browser signals memory pressure (`performance.measureUserAgentSpecificMemory()`)
+
+#### 38.H — Developer experience
+- [ ] 38.36 ⏳ `axiomdb-browser` DevTools extension — inspect tables, run queries, see WAL, monitor sync status
+- [ ] 38.37 ⏳ Migration support: `db.migrate(version, upSQL, downSQL)` — versioned schema migrations stored in OPFS
+- [ ] 38.38 ⏳ Seed data: `db.seed(sql)` — run initial data script only on first open
+- [ ] 38.39 ⏳ Export/import: `db.export()` → ArrayBuffer (full DB file), `AxiomDB.import(buffer)` — portable backups
+- [ ] 38.40 ⏳ Encryption at rest: `AxiomDB.open(name, { encryption: key })` — AES-256-GCM per page, key never touches disk
+
+#### 38.I — Quality
+- [ ] 38.41 ⏳ Integration tests in Playwright — real browser (Chrome, Firefox, Safari), real OPFS
+- [ ] 38.42 ⏳ Stress test: 100K rows INSERT + SELECT + live query in single tab
+- [ ] 38.43 ⏳ Multi-tab stress test: 4 tabs writing concurrently, verify consistency
+- [ ] 38.44 ⏳ Sync integration test: browser ↔ AxiomDB server, network interruption, reconnect, verify convergence
+- [ ] 38.45 ⏳ Documentation — user guide: getting started, React/Vue/Svelte integration, sync setup, migration guide
+- [ ] 38.46 ⏳ Documentation — internals: OPFS storage engine, Wasm compilation, sync protocol, CRDT implementation
+
+---
+
+> **🏁 FULL PLATFORM CHECKPOINT — week ~130**
+> On completing Phase 38, AxiomDB runs everywhere:
+> - Server: Linux/macOS/Windows via TCP (MySQL wire protocol)
+> - Embedded: desktop (Tauri, Electron), mobile (Flutter, React Native)
+> - Browser: Wasm + OPFS, offline-first, reactive queries, multi-tab, sync
+> - Same engine, same SQL, same MVCC — every target
+
+---
+
 ## USE CASE PROFILES
 
 Each profile maps a target workload to the minimum set of subfases needed to make
