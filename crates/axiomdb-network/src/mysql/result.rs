@@ -379,22 +379,46 @@ fn build_row_packet(
 ) -> Result<Vec<u8>, DbError> {
     // Pre-allocate: ~32 bytes per column is a reasonable estimate for text protocol.
     let mut buf = Vec::with_capacity(row.len() * 32);
+    // Stack buffer for integer-to-ASCII conversion — avoids per-value String alloc.
+    // Max i64 = 20 digits + sign = 21 bytes; f64 = ~24 chars max.
+    let mut num_buf = [0u8; 32];
     for value in row {
         match value {
             Value::Null => buf.push(0xfb),
             Value::Bytes(b) => write_lenenc_str(&mut buf, b),
-            // Fast path for integers: write ASCII bytes directly — skip charset
-            // encoding (integers are always ASCII, no transcoding needed).
+            // Fast path: write integer digits to stack buffer, no heap alloc.
             Value::Int(n) => {
-                let s = n.to_string();
-                write_lenenc_str(&mut buf, s.as_bytes());
+                let len = write_i32_to_buf(*n, &mut num_buf);
+                write_lenenc_str(&mut buf, &num_buf[..len]);
             }
             Value::BigInt(n) => {
-                let s = n.to_string();
-                write_lenenc_str(&mut buf, s.as_bytes());
+                let len = write_i64_to_buf(*n, &mut num_buf);
+                write_lenenc_str(&mut buf, &num_buf[..len]);
             }
             Value::Bool(b) => {
                 write_lenenc_str(&mut buf, if *b { b"1" } else { b"0" });
+            }
+            Value::Real(f) => {
+                // Format to stack buffer when possible.
+                let s = if f.abs() < 1e15 && (f.abs() > 1e-4 || *f == 0.0) {
+                    use std::io::Write;
+                    let len = write!(&mut num_buf[..], "{f}").ok().map(|_| {
+                        num_buf
+                            .iter()
+                            .position(|&b| b == 0)
+                            .unwrap_or(num_buf.len())
+                    });
+                    if let Some(l) = len {
+                        write_lenenc_str(&mut buf, &num_buf[..l]);
+                        // Reset buf for next use.
+                        num_buf = [0u8; 32];
+                        continue;
+                    }
+                    format!("{f}")
+                } else {
+                    format!("{f:e}")
+                };
+                write_lenenc_str(&mut buf, s.as_bytes());
             }
             // Text + other types: charset encoding required.
             v => {
@@ -454,6 +478,38 @@ fn column_decimals(dt: DataType) -> u8 {
         DataType::Decimal => 10,
         _ => 0,
     }
+}
+
+// ── Stack-based integer formatting (zero heap allocation) ────────────────────
+
+/// Writes an i32 as ASCII decimal to `buf`, returns the number of bytes written.
+fn write_i32_to_buf(n: i32, buf: &mut [u8; 32]) -> usize {
+    write_i64_to_buf(n as i64, buf)
+}
+
+/// Writes an i64 as ASCII decimal to `buf`, returns the number of bytes written.
+fn write_i64_to_buf(mut n: i64, buf: &mut [u8; 32]) -> usize {
+    if n == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let negative = n < 0;
+    if negative {
+        n = -n;
+    }
+    let mut pos = 32;
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    if negative {
+        pos -= 1;
+        buf[pos] = b'-';
+    }
+    let len = 32 - pos;
+    buf.copy_within(pos..32, 0);
+    len
 }
 
 // ── Value → text encoding ─────────────────────────────────────────────────────
