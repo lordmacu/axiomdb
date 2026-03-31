@@ -61,52 +61,35 @@ fn execute_select_ctx(
         // Fetch rows via the chosen access method.
         let raw_rows: Vec<(RecordId, Vec<Value>)> = match &access_method {
             crate::planner::AccessMethod::Scan => {
-                // Build column mask for lazy decode: only decode columns referenced in
-                // SELECT list, WHERE, ORDER BY, GROUP BY, HAVING. SELECT * passes None.
-                let n_cols = resolved.columns.len();
-                let has_wildcard = stmt.columns.iter().any(|item| {
-                    matches!(
-                        item,
-                        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_)
-                    )
-                });
-                let column_mask: Option<Vec<bool>> = if has_wildcard || n_cols == 0 {
-                    None
+                // Phase 8.1: inline WHERE filter during scan — skip result push
+                // for non-matching rows, reducing allocation pressure by the
+                // selectivity factor (e.g., 50% fewer allocs at 50% selectivity).
+                if let Some(ref wc) = stmt.where_clause {
+                    let wc_clone = wc.clone();
+                    TableEngine::scan_table_filtered(
+                        storage,
+                        &resolved.def,
+                        &resolved.columns,
+                        snap,
+                        |values| {
+                            // Simple eval without subquery support (fast path).
+                            // Subqueries in WHERE fall through to the slow path below.
+                            match eval(&wc_clone, values) {
+                                Ok(v) => is_truthy(&v),
+                                Err(_) => true, // on error, keep row for later recheck
+                            }
+                        },
+                    )?
                 } else {
-                    let mut expr_ptrs: Vec<&Expr> = Vec::new();
-                    for item in &stmt.columns {
-                        if let SelectItem::Expr { expr, .. } = item {
-                            expr_ptrs.push(expr);
-                        }
-                    }
-                    if let Some(ref wc) = stmt.where_clause {
-                        expr_ptrs.push(wc);
-                    }
-                    for ob in &stmt.order_by {
-                        expr_ptrs.push(&ob.expr);
-                    }
-                    for gb in &stmt.group_by {
-                        expr_ptrs.push(gb);
-                    }
-                    if let Some(ref hav) = stmt.having {
-                        expr_ptrs.push(hav);
-                    }
-                    let mask = build_column_mask(n_cols, &expr_ptrs);
-                    if mask.iter().all(|&b| b) {
-                        None
-                    } else {
-                        Some(mask)
-                    }
-                };
-
-                // scan_table returns owned Vec — storage is free after this call.
-                TableEngine::scan_table(
-                    storage,
-                    &resolved.def,
-                    &resolved.columns,
-                    snap,
-                    column_mask.as_deref(),
-                )?
+                    // No WHERE clause — scan all rows.
+                    TableEngine::scan_table(
+                        storage,
+                        &resolved.def,
+                        &resolved.columns,
+                        snap,
+                        None,
+                    )?
+                }
             }
             crate::planner::AccessMethod::IndexLookup { index_def, key } => {
                 // Bloom filter: skip B-Tree read if key is definitely absent.
