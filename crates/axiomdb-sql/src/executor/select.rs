@@ -33,7 +33,7 @@ fn execute_select_ctx(
             &from_table_ref,
         )?;
 
-        let snap = txn.active_snapshot()?;
+        let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
 
         // ── Query planner: pick the best access method ────────────────────
         // Load per-column statistics for cost-based index selection (Phase 6.10).
@@ -480,7 +480,7 @@ fn execute_select(
             resolver.resolve_table(from_table_ref.schema.as_deref(), &from_table_ref.name)?
         };
 
-        let snap = txn.active_snapshot()?;
+        let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
 
         // ── Query planner: pick the best access method (non-ctx path) ────
         // No session context available — use conservative defaults (no stats).
