@@ -976,7 +976,7 @@ impl TableEngine {
 ///
 /// `ColumnType` (compact catalog representation) maps to `DataType`
 /// (full in-memory type used by the row codec and expression evaluator).
-fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
+pub fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
     columns
         .iter()
         .map(|c| match c.col_type {

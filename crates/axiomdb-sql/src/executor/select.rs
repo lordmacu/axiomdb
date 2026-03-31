@@ -140,8 +140,9 @@ fn execute_select_ctx(
                 }
             }
             crate::planner::AccessMethod::IndexRange { index_def, lo, hi } => {
-                // Range scan: iterate B-Tree entries → heap reads.
-                // Non-unique: append RID suffix to bounds so the range covers all RIDs.
+                // Range scan: B-Tree entries → batch heap reads by page.
+                // Inspired by PostgreSQL's BitmapHeapScan: collect RIDs, group by
+                // page_id, read each heap page ONCE, extract all matching rows.
                 let (lo_adjusted, hi_adjusted);
                 let (lo_ref, hi_ref) = if index_def.is_unique {
                     (lo.as_deref(), hi.as_deref())
@@ -150,15 +151,37 @@ fn execute_select_ctx(
                     hi_adjusted = hi.as_deref().map(rid_hi);
                     (lo_adjusted.as_deref(), hi_adjusted.as_deref())
                 };
+                // Collect only RecordIds from B-Tree (skip key cloning).
                 let pairs = BTree::range_in(storage, index_def.root_page_id, lo_ref, hi_ref)?;
-                let mut result = Vec::with_capacity(pairs.len());
-                for (rid, _key) in pairs {
-                    // Phase 7.3b: filter dead index entries by heap visibility.
-                    if !HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap)? {
-                        continue;
-                    }
-                    if let Some(values) = TableEngine::read_row(storage, &resolved.columns, rid)? {
-                        result.push((rid, values));
+                let rids: Vec<RecordId> = pairs.into_iter().map(|(rid, _key)| rid).collect();
+
+                // Batch read: group by page_id, read each page once, extract
+                // visibility + row data in a single pass (eliminates the
+                // is_slot_visible + read_row double-read pattern).
+                let col_types = crate::table::column_data_types(&resolved.columns);
+                let mut result = Vec::with_capacity(rids.len());
+                let mut i = 0;
+                while i < rids.len() {
+                    let page_id = rids[i].page_id;
+                    // Read page once.
+                    let page = storage.read_page(page_id)?.into_page();
+                    // Process all RIDs on this page.
+                    while i < rids.len() && rids[i].page_id == page_id {
+                        let rid = rids[i];
+                        i += 1;
+                        let slot_id = rid.slot_id;
+                        // Combined visibility + data extraction from same page.
+                        match axiomdb_storage::heap::read_tuple(&page, slot_id)? {
+                            None => continue,
+                            Some((header, data)) => {
+                                if !header.is_visible(&snap) {
+                                    continue;
+                                }
+                                let values =
+                                    axiomdb_types::codec::decode_row(data, &col_types)?;
+                                result.push((rid, values));
+                            }
+                        }
                     }
                 }
                 result
@@ -535,17 +558,27 @@ fn execute_select(
                     (lo_adjusted.as_deref(), hi_adjusted.as_deref())
                 };
                 let pairs = BTree::range_in(storage, index_def.root_page_id, lo_ref, hi_ref)?;
-                let mut result = Vec::with_capacity(pairs.len());
-                for (rid, _key) in pairs {
-                    // Phase 7.3b: dead index entries (from MVCC lazy delete) must
-                    // be filtered by heap visibility before returning rows.
-                    if !axiomdb_storage::heap_chain::HeapChain::is_slot_visible(
-                        storage, rid.page_id, rid.slot_id, snap,
-                    )? {
-                        continue;
-                    }
-                    if let Some(values) = TableEngine::read_row(storage, &resolved.columns, rid)? {
-                        result.push((rid, values));
+                let rids: Vec<RecordId> = pairs.into_iter().map(|(rid, _)| rid).collect();
+                let col_types = crate::table::column_data_types(&resolved.columns);
+                let mut result = Vec::with_capacity(rids.len());
+                let mut i = 0;
+                while i < rids.len() {
+                    let page_id = rids[i].page_id;
+                    let page = storage.read_page(page_id)?.into_page();
+                    while i < rids.len() && rids[i].page_id == page_id {
+                        let rid = rids[i];
+                        i += 1;
+                        match axiomdb_storage::heap::read_tuple(&page, rid.slot_id)? {
+                            None => continue,
+                            Some((header, data)) => {
+                                if !header.is_visible(&snap) {
+                                    continue;
+                                }
+                                let values =
+                                    axiomdb_types::codec::decode_row(data, &col_types)?;
+                                result.push((rid, values));
+                            }
+                        }
                     }
                 }
                 result
