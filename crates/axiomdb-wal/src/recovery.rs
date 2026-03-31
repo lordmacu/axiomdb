@@ -110,6 +110,7 @@ impl CrashRecovery {
                     | EntryType::UpdateInPlace
                     | EntryType::Truncate
                     | EntryType::PageWrite
+                    | EntryType::PageDelete
                     | EntryType::Checkpoint => {}
                 },
                 // Truncated or corrupt entry at the end of WAL (e.g. process crashed
@@ -240,6 +241,32 @@ impl CrashRecovery {
                             let slot_id =
                                 u16::from_le_bytes([slots_bytes[off], slots_bytes[off + 1]]);
                             ops.push(RecoveryOp::Insert { page_id, slot_id });
+                        }
+                    }
+                }
+                EntryType::PageDelete => {
+                    // Same layout as PageWrite: key=page_id, new_value=[count, slot_ids...]
+                    // Undo: clear_deletion for each slot (same as undoing N Delete entries).
+                    if let Some(ops) = in_progress.get_mut(&entry.txn_id) {
+                        if entry.key.len() < 8 {
+                            continue;
+                        }
+                        let page_id =
+                            u64::from_le_bytes(entry.key[..8].try_into().unwrap_or([0u8; 8]));
+                        let nv = &entry.new_value;
+                        if nv.len() < 2 {
+                            continue;
+                        }
+                        let num_slots = u16::from_le_bytes([nv[0], nv[1]]) as usize;
+                        let slots_bytes = &nv[2..];
+                        for i in 0..num_slots {
+                            let off = i * 2;
+                            if off + 2 > slots_bytes.len() {
+                                break;
+                            }
+                            let slot_id =
+                                u16::from_le_bytes([slots_bytes[off], slots_bytes[off + 1]]);
+                            ops.push(RecoveryOp::Delete { page_id, slot_id });
                         }
                     }
                 }
