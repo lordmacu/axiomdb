@@ -173,6 +173,82 @@ impl TableEngine {
         Ok(result)
     }
 
+    /// Scan with inline WHERE filter (Phase 8.1 — vectorized filter).
+    ///
+    /// Like `scan_table_direct` but evaluates the WHERE predicate INSIDE the
+    /// page loop, skipping full row decode for non-matching rows. This is the
+    /// "two-phase decode" approach inspired by DuckDB's vectorized filter:
+    ///
+    /// 1. For each visible slot: decode ALL columns (needed for WHERE + SELECT)
+    /// 2. Evaluate WHERE predicate immediately
+    /// 3. Only push passing rows to the result
+    ///
+    /// Why this helps: the `result.push()` + downstream `combined_rows.push()`
+    /// are skipped for filtered-out rows, eliminating ~50% of Vec operations
+    /// at 50% selectivity. The decode cost is the same, but allocation pressure
+    /// is halved.
+    ///
+    /// Future: Phase 8.1b will decode WHERE columns separately from SELECT
+    /// columns (true two-phase decode).
+    pub fn scan_table_filtered<F>(
+        storage: &dyn StorageEngine,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        snap: TransactionSnapshot,
+        mut predicate: F,
+    ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError>
+    where
+        F: FnMut(&[Value]) -> bool,
+    {
+        let col_types = column_data_types(columns);
+        let mut result = Vec::new();
+        let mut current = table_def.data_root_page_id;
+
+        while current != 0 {
+            let raw = *storage.read_page(current)?.as_bytes();
+            let page = Page::from_bytes(raw)?;
+            let next = heap_chain::chain_next_page(&page);
+
+            if next != 0 {
+                storage.prefetch_hint(next, 1);
+            }
+
+            let num = num_slots(&page);
+            for slot_id in 0..num {
+                let entry = read_slot(&page, slot_id);
+                if entry.is_dead() {
+                    continue;
+                }
+                let off = entry.offset as usize;
+                let len = entry.length as usize;
+                let bytes = &page.as_bytes()[off..off + len];
+                let header: &RowHeader = bytemuck::from_bytes(&bytes[..size_of::<RowHeader>()]);
+                if !header.is_visible(&snap) {
+                    continue;
+                }
+                let row_data = &bytes[size_of::<RowHeader>()..];
+                let values = decode_row(row_data, &col_types)?;
+
+                // Inline WHERE evaluation — skip result push for non-matching rows.
+                if !predicate(&values) {
+                    continue;
+                }
+
+                result.push((
+                    RecordId {
+                        page_id: current,
+                        slot_id,
+                    },
+                    values,
+                ));
+            }
+
+            current = next;
+        }
+
+        Ok(result)
+    }
+
     /// Reads a single row by `RecordId` and decodes it into `Vec<Value>`.
     ///
     /// Returns `None` if the slot has been deleted (tombstone).

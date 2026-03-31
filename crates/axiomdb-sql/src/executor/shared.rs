@@ -58,6 +58,7 @@ fn effective_database_for_ref(tref: &crate::ast::TableRef, ctx: &SessionContext)
 // ── ctx-aware DML handlers ────────────────────────────────────────────────────
 
 
+#[allow(dead_code)]
 fn build_column_mask(n_cols: usize, exprs: &[&Expr]) -> Vec<bool> {
     let mut mask = vec![false; n_cols];
     for expr in exprs {
@@ -71,6 +72,7 @@ fn build_column_mask(n_cols: usize, exprs: &[&Expr]) -> Vec<bool> {
 /// Does **not** recurse into subquery bodies (`Subquery`, `InSubquery`,
 /// `Exists`) — those reference an inner scope with a different row layout.
 /// [`OuterColumn`] references point to an enclosing scope, not this row.
+#[allow(dead_code)]
 fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
     match expr {
         Expr::Column { col_idx, .. } => {
