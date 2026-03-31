@@ -70,12 +70,24 @@ fn execute_update_ctx(
     let mut to_update: Vec<(RecordId, Vec<Value>, Vec<Value>)> = Vec::new();
     let mut matched_count: u64 = 0;
     for (rid, current_values) in candidate_rows {
-        let mut new_values = current_values.clone();
-        for (col_pos, val_expr) in &assignments {
-            new_values[*col_pos] = eval(val_expr, &current_values)?;
+        // Evaluate assigned columns without cloning the full row.
+        // Build new_values by iterating columns once, cloning only non-assigned
+        // values and evaluating expressions for assigned ones.
+        let mut changed = false;
+        let mut new_values = Vec::with_capacity(current_values.len());
+        for (ci, cv) in current_values.iter().enumerate() {
+            if let Some((_, val_expr)) = assignments.iter().find(|(pos, _)| *pos == ci) {
+                let nv = eval(val_expr, &current_values)?;
+                if nv != *cv {
+                    changed = true;
+                }
+                new_values.push(nv);
+            } else {
+                new_values.push(cv.clone());
+            }
         }
         matched_count += 1;
-        if new_values == current_values {
+        if !changed {
             continue; // no-op: skip heap/index work
         }
         to_update.push((rid, current_values, new_values));
@@ -231,12 +243,24 @@ fn execute_update(
     let mut to_update: Vec<(RecordId, Vec<Value>, Vec<Value>)> = Vec::new();
     let mut matched_count: u64 = 0;
     for (rid, current_values) in candidate_rows {
-        let mut new_values = current_values.clone();
-        for (col_pos, val_expr) in &assignments {
-            new_values[*col_pos] = eval(val_expr, &current_values)?;
+        // Evaluate assigned columns without cloning the full row.
+        // Build new_values by iterating columns once, cloning only non-assigned
+        // values and evaluating expressions for assigned ones.
+        let mut changed = false;
+        let mut new_values = Vec::with_capacity(current_values.len());
+        for (ci, cv) in current_values.iter().enumerate() {
+            if let Some((_, val_expr)) = assignments.iter().find(|(pos, _)| *pos == ci) {
+                let nv = eval(val_expr, &current_values)?;
+                if nv != *cv {
+                    changed = true;
+                }
+                new_values.push(nv);
+            } else {
+                new_values.push(cv.clone());
+            }
         }
         matched_count += 1;
-        if new_values == current_values {
+        if !changed {
             continue; // no-op: skip heap/index work
         }
         to_update.push((rid, current_values, new_values));

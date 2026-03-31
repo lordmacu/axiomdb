@@ -363,8 +363,8 @@ impl HeapChain {
         let mut i = 0;
         while i < indexed.len() {
             let page_id = indexed[i].1;
-            let raw = *storage.read_page(page_id)?.as_bytes();
-            let mut page = Page::from_bytes(raw)?;
+            // Use into_page() to avoid 16KB copy from PageRef.
+            let mut page = storage.read_page(page_id)?.into_page();
             let mut dirty = false;
 
             while i < indexed.len() && indexed[i].1 == page_id {
