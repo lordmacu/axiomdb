@@ -28,7 +28,7 @@
 use axiomdb_catalog::{schema::FkAction, CatalogReader, CatalogWriter, FkDef};
 use axiomdb_core::{error::DbError, RecordId};
 use axiomdb_index::BTree;
-use axiomdb_storage::StorageEngine;
+use axiomdb_storage::{heap_chain::HeapChain, StorageEngine};
 use axiomdb_types::Value;
 use axiomdb_wal::TxnManager;
 
@@ -262,7 +262,13 @@ pub fn enforce_fk_on_parent_delete(
                     // Phase 6.9: use FK composite index for O(log n) existence check.
                     let has_child = if let Some(root) = fk_index_root {
                         let (lo, hi) = crate::index_maintenance::fk_key_range(parent_key_val)?;
-                        !BTree::range_in(storage, root, Some(&lo), Some(&hi))?.is_empty()
+                        let entries = BTree::range_in(storage, root, Some(&lo), Some(&hi))?;
+                        // Check heap visibility: dead FK index entries (from deferred
+                        // deletion) must not cause false RESTRICT violations.
+                        entries.iter().any(|(rid, _)| {
+                            HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap)
+                                .unwrap_or(false)
+                        })
                     } else {
                         // Pre-6.9 FK or user index: fall back to full scan.
                         children_exist_via_scan(
@@ -290,9 +296,18 @@ pub fn enforce_fk_on_parent_delete(
                     let child_rows = if let Some(root) = fk_index_root {
                         let (lo, hi) = crate::index_maintenance::fk_key_range(parent_key_val)?;
                         let entries = BTree::range_in(storage, root, Some(&lo), Some(&hi))?;
-                        // Read full row values for each child (needed for index maintenance).
+                        // Read full row values for each visible child.
+                        // Filter dead FK index entries by heap visibility.
                         let mut rows = Vec::with_capacity(entries.len());
                         for (child_rid, _) in entries {
+                            if !HeapChain::is_slot_visible(
+                                storage,
+                                child_rid.page_id,
+                                child_rid.slot_id,
+                                snap,
+                            )? {
+                                continue; // dead entry — skip
+                            }
                             let row_bytes = axiomdb_storage::heap_chain::HeapChain::read_row(
                                 storage,
                                 child_rid.page_id,
@@ -380,11 +395,20 @@ pub fn enforce_fk_on_parent_delete(
 
                 FkAction::SetNull => {
                     // Phase 6.9: same range-scan approach as CASCADE.
+                    // Filter dead FK index entries by heap visibility.
                     let child_rows = if let Some(root) = fk_index_root {
                         let (lo, hi) = crate::index_maintenance::fk_key_range(parent_key_val)?;
                         let entries = BTree::range_in(storage, root, Some(&lo), Some(&hi))?;
                         let mut rows = Vec::with_capacity(entries.len());
                         for (child_rid, _) in entries {
+                            if !HeapChain::is_slot_visible(
+                                storage,
+                                child_rid.page_id,
+                                child_rid.slot_id,
+                                snap,
+                            )? {
+                                continue;
+                            }
                             let row_bytes = axiomdb_storage::heap_chain::HeapChain::read_row(
                                 storage,
                                 child_rid.page_id,
