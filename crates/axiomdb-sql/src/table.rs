@@ -190,6 +190,19 @@ impl TableEngine {
     ///
     /// Future: Phase 8.1b will decode WHERE columns separately from SELECT
     /// columns (true two-phase decode).
+    /// Scan with inline WHERE filter + two-phase decode + selection mask.
+    ///
+    /// **Phase 1 (selection mask per page):** iterate all slots, collect
+    /// visible slot offsets into a Vec without decoding any row data.
+    ///
+    /// **Phase 2 (two-phase decode):** for each visible slot:
+    ///   a) If `where_col_mask` provided: decode only WHERE columns
+    ///      (`decode_row_masked`), evaluate predicate. If fails → skip.
+    ///   b) For passing rows: full `decode_row` to get all columns.
+    ///
+    /// This avoids full row decode + String allocations for filtered-out rows.
+    /// Research: DuckDB SelectionVector + adaptive filter; PostgreSQL
+    /// attcacheoff for selective column access; SQLite OP_Column lazy decode.
     pub fn scan_table_filtered<F>(
         storage: &dyn StorageEngine,
         table_def: &TableDef,
@@ -197,11 +210,15 @@ impl TableEngine {
         snap: TransactionSnapshot,
         mut predicate: F,
         zone_map_pred: Option<&axiomdb_storage::zone_map::ZoneMapPredicate>,
+        where_col_mask: Option<&[bool]>,
     ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError>
     where
         F: FnMut(&[Value]) -> bool,
     {
         let col_types = column_data_types(columns);
+        let has_two_phase = where_col_mask
+            .filter(|m| !m.iter().all(|&b| b)) // only if mask is selective
+            .is_some();
         let mut result = Vec::new();
         let mut current = table_def.data_root_page_id;
 
@@ -214,19 +231,20 @@ impl TableEngine {
                 storage.prefetch_hint(next, 1);
             }
 
-            // Phase 8.3b: zone map skip — if the page's min/max for the
-            // predicate column is entirely outside the predicate range,
-            // skip every row on this page without decoding.
+            // Zone map skip (Phase 8.3b).
             if let Some(zmp) = zone_map_pred {
                 if let Some(zm) = axiomdb_storage::zone_map::read_zone_map(&page) {
                     if !axiomdb_storage::zone_map::zone_map_might_match(&zm, zmp) {
                         current = next;
-                        continue; // SKIP entire page
+                        continue;
                     }
                 }
             }
 
+            // ── Phase 1: Selection mask — collect visible slot offsets ────
+            // Single pass over slot array: only RowHeader check, no decode.
             let num = num_slots(&page);
+            let mut visible_slots: Vec<(u16, usize, usize)> = Vec::new(); // (slot_id, off, len)
             for slot_id in 0..num {
                 let entry = read_slot(&page, slot_id);
                 if entry.is_dead() {
@@ -239,21 +257,42 @@ impl TableEngine {
                 if !header.is_visible(&snap) {
                     continue;
                 }
-                let row_data = &bytes[size_of::<RowHeader>()..];
-                let values = decode_row(row_data, &col_types)?;
+                visible_slots.push((slot_id, off, len));
+            }
 
-                // Inline WHERE evaluation — skip result push for non-matching rows.
-                if !predicate(&values) {
-                    continue;
+            // ── Phase 2: Two-phase decode for visible slots ──────────────
+            for &(slot_id, off, len) in &visible_slots {
+                let row_data = &page.as_bytes()[off + size_of::<RowHeader>()..off + len];
+
+                if has_two_phase {
+                    // Phase 2a: decode only WHERE columns.
+                    let partial = decode_row_masked(row_data, &col_types, where_col_mask.unwrap())?;
+                    if !predicate(&partial) {
+                        continue; // Skip full decode — saves String/Text allocs.
+                    }
+                    // Phase 2b: full decode for passing rows.
+                    let values = decode_row(row_data, &col_types)?;
+                    result.push((
+                        RecordId {
+                            page_id: current,
+                            slot_id,
+                        },
+                        values,
+                    ));
+                } else {
+                    // No mask: single-pass full decode + predicate.
+                    let values = decode_row(row_data, &col_types)?;
+                    if !predicate(&values) {
+                        continue;
+                    }
+                    result.push((
+                        RecordId {
+                            page_id: current,
+                            slot_id,
+                        },
+                        values,
+                    ));
                 }
-
-                result.push((
-                    RecordId {
-                        page_id: current,
-                        slot_id,
-                    },
-                    values,
-                ));
             }
 
             current = next;

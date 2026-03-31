@@ -58,6 +58,30 @@ fn execute_select_ctx(
             effective_coll,
         );
 
+        /// Collects column indices referenced by an expression into a mask.
+        fn collect_expr_columns(e: &crate::expr::Expr, mask: &mut [bool]) {
+            match e {
+                crate::expr::Expr::Column { col_idx, .. } => {
+                    if *col_idx < mask.len() {
+                        mask[*col_idx] = true;
+                    }
+                }
+                crate::expr::Expr::BinaryOp { left, right, .. } => {
+                    collect_expr_columns(left, mask);
+                    collect_expr_columns(right, mask);
+                }
+                crate::expr::Expr::UnaryOp { operand, .. } => {
+                    collect_expr_columns(operand, mask);
+                }
+                crate::expr::Expr::Function { args, .. } => {
+                    for arg in args {
+                        collect_expr_columns(arg, mask);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         /// Returns true if the expression contains a subquery node.
         fn expr_has_subquery(e: &crate::expr::Expr) -> bool {
             match e {
@@ -92,6 +116,19 @@ fn execute_select_ctx(
                     if !expr_has_subquery(&wc_clone) {
                         where_already_applied = true;
                     }
+                    // Build WHERE column mask for two-phase decode:
+                    // only decode columns referenced in WHERE first.
+                    let n_cols = resolved.columns.len();
+                    let where_mask = {
+                        let mut mask = vec![false; n_cols];
+                        collect_expr_columns(&wc_clone, &mut mask);
+                        // Only use two-phase if mask is selective (not all cols)
+                        if mask.iter().filter(|&&b| b).count() < n_cols {
+                            Some(mask)
+                        } else {
+                            None
+                        }
+                    };
                     TableEngine::scan_table_filtered(
                         storage,
                         &resolved.def,
@@ -104,6 +141,7 @@ fn execute_select_ctx(
                             }
                         },
                         zm_pred.as_ref(),
+                        where_mask.as_deref(),
                     )?
                 } else {
                     // No WHERE clause — scan all rows.
