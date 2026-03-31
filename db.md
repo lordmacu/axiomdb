@@ -4632,6 +4632,37 @@ Fase 22 — Features de producto      (semana 40-42)
   ✓ REST upsert: POST con Prefer: resolution=merge-duplicates
   ✓ OpenAPI spec autogenerada: GET /rest/ retorna swagger.json del schema actual
 
+Fase 38 — AxiomDB-Wasm: Browser Database Engine  (semana 122-130)
+  ✓ Compilar crates core a wasm32-unknown-unknown (parser, executor, B+ Tree, buffer pool, MVCC)
+  ✓ Feature-gate código OS-dependiente (#[cfg(not(target_arch = "wasm32"))]) — mmap, tokio, TCP, file I/O
+  ✓ Allocator Wasm (wee_alloc/dlmalloc) — binario ≤200KB gzipped
+  ✓ OpfsStorageEngine — implementa StorageEngine trait sobre Origin Private File System (OPFS)
+  ✓ Acceso síncrono vía FileSystemSyncAccessHandle en Web Worker — pages de 16KB, mismo formato que nativo
+  ✓ WAL sobre OPFS — mismo formato, crash recovery al recargar página
+  ✓ Fallback a IndexedDB para browsers sin OPFS sync access
+  ✓ wasm-bindgen API: AxiomDB.open(), .execute(), .query() — retorna objetos JS
+  ✓ Web Worker wrapper — todas las operaciones off-main-thread vía postMessage
+  ✓ API async basada en Promises: await db.query("SELECT ...", [params])
+  ✓ Prepared statements reutilizables en Wasm
+  ✓ TypeScript definitions (.d.ts) con generics para resultados
+  ✓ npm package @axiomdb/browser — ESM + CJS, zero dependencies
+  ✓ Live queries: db.watch(sql, callback) — re-ejecuta cuando cambian las tablas afectadas
+  ✓ Invalidación eficiente via WAL change tracking por tabla
+  ✓ React hook: useAxiomQuery(sql, params) — estado reactivo
+  ✓ Vue composable: useAxiomQuery(sql, params)
+  ✓ Svelte store: axiomQuery(sql, params)
+  ✓ Multi-tab: SharedWorker/BroadcastChannel — single writer, sin conflictos de lock OPFS
+  ✓ Cross-tab live query notifications
+  ✓ Sync engine offline-first: CRDT (LWW por columna con HLC), delta sync vía WebSocket
+  ✓ Estrategias de conflicto: LWW, server-wins, client-wins, custom merge
+  ✓ Offline queue con replay ordenado al reconectar
+  ✓ Encryption at rest: AES-256-GCM por página, clave nunca toca disco
+  ✓ DevTools extension: inspeccionar tablas, queries, WAL, sync status
+  ✓ Export/import: db.export() → ArrayBuffer, AxiomDB.import(buffer)
+  ✓ Tests en Playwright: Chrome, Firefox, Safari reales con OPFS real
+  ✓ Benchmarks: latency vs native (≤3×), INSERT ≥50K/s, binary size vs sql.js/PGlite, cold start <100ms
+```
+
 ---
 
 ## OData v4 API Nativa
