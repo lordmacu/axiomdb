@@ -30,28 +30,6 @@ use axiomdb_storage::heap_chain::HeapChain;
 
 use crate::{eval::eval, eval::is_truthy, expr::Expr, key_encoding::encode_index_key};
 
-/// Phase 7.3b — Check if a duplicate key in a unique index points to a VISIBLE row.
-///
-/// With MVCC lazy index deletion, dead entries (deleted or rolled-back rows) remain
-/// in the index. A uniqueness violation only occurs if the existing entry points to
-/// a row that is visible under the current snapshot.
-///
-/// Returns `true` if a visible duplicate exists (should raise UniqueViolation).
-fn has_visible_duplicate(
-    storage: &dyn StorageEngine,
-    root_page_id: u64,
-    key: &[u8],
-    snap: TransactionSnapshot,
-) -> Result<bool, DbError> {
-    match BTree::lookup_in(storage, root_page_id, key)? {
-        None => Ok(false),
-        Some(existing_rid) => {
-            // Check heap visibility — only visible rows cause a violation.
-            HeapChain::is_slot_visible(storage, existing_rid.page_id, existing_rid.slot_id, snap)
-        }
-    }
-}
-
 // ── FK composite key helpers ──────────────────────────────────────────────────
 
 /// Builds the B-Tree key for an FK auto-index entry (Phase 6.9).
@@ -166,15 +144,31 @@ pub fn insert_into_indexes(
         // Uniqueness check — skip for FK auto-indexes (never unique by FK semantics).
         // Phase 7.3b: check heap visibility for existing entry — dead entries don't
         // count as duplicates (they'll be cleaned by vacuum).
-        if idx.is_unique
-            && !idx.is_fk_index
-            && has_visible_duplicate(storage, idx.root_page_id, &key, snap)?
-        {
-            let dup_val = key_vals.first().map(|v| format!("{v}"));
-            return Err(DbError::UniqueViolation {
-                index_name: idx.name.clone(),
-                value: dup_val,
-            });
+        if idx.is_unique && !idx.is_fk_index {
+            // Check if a duplicate key exists in the B-Tree.
+            if let Some(existing_rid) = BTree::lookup_in(storage, idx.root_page_id, &key)? {
+                // If the existing row is visible → real violation.
+                if HeapChain::is_slot_visible(
+                    storage,
+                    existing_rid.page_id,
+                    existing_rid.slot_id,
+                    snap,
+                )? {
+                    let dup_val = key_vals.first().map(|v| format!("{v}"));
+                    return Err(DbError::UniqueViolation {
+                        index_name: idx.name.clone(),
+                        value: dup_val,
+                    });
+                }
+                // Dead entry: remove it from B-Tree so insert_in won't reject.
+                let root_pid = AtomicU64::new(idx.root_page_id);
+                let _ = BTree::delete_in(storage, &root_pid, &key);
+                let new_root = root_pid.load(Ordering::Acquire);
+                if new_root != idx.root_page_id {
+                    updated_roots.push((idx.index_id, new_root));
+                    // Update in-place for subsequent iterations.
+                }
+            }
         }
 
         let root_pid = AtomicU64::new(idx.root_page_id);
@@ -539,16 +533,29 @@ pub fn batch_insert_into_indexes(
         let root_pid = AtomicU64::new(original_root);
 
         for (key, rid) in &pairs {
-            if !skip_unique_check
-                && idx.is_unique
-                && !idx.is_fk_index
-                && has_visible_duplicate(storage, root_pid.load(Ordering::Acquire), key, snap)?
-            {
-                let dup_val = Some("(encoded)".to_string());
-                return Err(DbError::UniqueViolation {
-                    index_name: idx.name.clone(),
-                    value: dup_val,
-                });
+            if !skip_unique_check && idx.is_unique && !idx.is_fk_index {
+                let cur_root = root_pid.load(Ordering::Acquire);
+                if let Some(existing_rid) = BTree::lookup_in(storage, cur_root, key)? {
+                    if HeapChain::is_slot_visible(
+                        storage,
+                        existing_rid.page_id,
+                        existing_rid.slot_id,
+                        snap,
+                    )? {
+                        let dup_val = Some("(encoded)".to_string());
+                        return Err(DbError::UniqueViolation {
+                            index_name: idx.name.clone(),
+                            value: dup_val,
+                        });
+                    }
+                    // Dead entry: remove from B-Tree so insert_in won't reject.
+                    let del_pid = AtomicU64::new(cur_root);
+                    let _ = BTree::delete_in(storage, &del_pid, key);
+                    let del_root = del_pid.load(Ordering::Acquire);
+                    if del_root != cur_root {
+                        root_pid.store(del_root, Ordering::Release);
+                    }
+                }
             }
             BTree::insert_in(storage, &root_pid, key, *rid, idx.fillfactor)?;
             bloom.add(idx.index_id, key);
@@ -590,15 +597,29 @@ pub fn insert_many_into_single_index(
         };
         let key = encode_index_entry_key(idx, &key_vals, *rid)?;
 
-        if idx.is_unique
-            && !idx.is_fk_index
-            && has_visible_duplicate(storage, root_pid.load(Ordering::Acquire), &key, snap)?
-        {
-            let dup_val = key_vals.first().map(|v| format!("{v}"));
-            return Err(DbError::UniqueViolation {
-                index_name: idx.name.clone(),
-                value: dup_val,
-            });
+        if idx.is_unique && !idx.is_fk_index {
+            let cur_root = root_pid.load(Ordering::Acquire);
+            if let Some(existing_rid) = BTree::lookup_in(storage, cur_root, &key)? {
+                if HeapChain::is_slot_visible(
+                    storage,
+                    existing_rid.page_id,
+                    existing_rid.slot_id,
+                    snap,
+                )? {
+                    let dup_val = key_vals.first().map(|v| format!("{v}"));
+                    return Err(DbError::UniqueViolation {
+                        index_name: idx.name.clone(),
+                        value: dup_val,
+                    });
+                }
+                // Dead entry: remove from B-Tree so insert_in won't reject.
+                let del_pid = AtomicU64::new(cur_root);
+                let _ = BTree::delete_in(storage, &del_pid, &key);
+                let del_root = del_pid.load(Ordering::Acquire);
+                if del_root != cur_root {
+                    root_pid.store(del_root, Ordering::Release);
+                }
+            }
         }
 
         BTree::insert_in(storage, &root_pid, &key, *rid, idx.fillfactor)?;
@@ -633,15 +654,28 @@ pub fn insert_into_single_index(
     };
     let key = encode_index_entry_key(idx, &key_vals, rid)?;
 
-    if idx.is_unique
-        && !idx.is_fk_index
-        && has_visible_duplicate(storage, idx.root_page_id, &key, snap)?
-    {
-        let dup_val = key_vals.first().map(|v| format!("{v}"));
-        return Err(DbError::UniqueViolation {
-            index_name: idx.name.clone(),
-            value: dup_val,
-        });
+    if idx.is_unique && !idx.is_fk_index {
+        if let Some(existing_rid) = BTree::lookup_in(storage, idx.root_page_id, &key)? {
+            if HeapChain::is_slot_visible(
+                storage,
+                existing_rid.page_id,
+                existing_rid.slot_id,
+                snap,
+            )? {
+                let dup_val = key_vals.first().map(|v| format!("{v}"));
+                return Err(DbError::UniqueViolation {
+                    index_name: idx.name.clone(),
+                    value: dup_val,
+                });
+            }
+            // Dead entry: remove from B-Tree so insert_in won't reject.
+            let del_pid = AtomicU64::new(idx.root_page_id);
+            let _ = BTree::delete_in(storage, &del_pid, &key);
+            let del_root = del_pid.load(Ordering::Acquire);
+            if del_root != idx.root_page_id {
+                idx.root_page_id = del_root;
+            }
+        }
     }
 
     let root_pid = AtomicU64::new(idx.root_page_id);

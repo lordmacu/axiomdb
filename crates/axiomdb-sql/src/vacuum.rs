@@ -133,11 +133,13 @@ fn vacuum_one_table(
     // 1. Heap vacuum: walk the heap chain, mark dead slots.
     let dead_rows = vacuum_heap_chain(storage, table_def.data_root_page_id, oldest_safe_txn)?;
 
-    // 2. Index vacuum: clean dead entries from non-unique, non-FK secondary indexes.
+    // 2. Index vacuum: clean dead entries from ALL indexes (PostgreSQL model).
+    // Since DELETE/UPDATE no longer remove index entries for any index type,
+    // VACUUM must clean dead entries from PK, UNIQUE, FK, and non-unique alike.
     let mut dead_index_entries = 0u64;
     for idx in indexes {
-        if idx.columns.is_empty() || idx.is_unique || idx.is_fk_index {
-            continue; // unique/PK/FK entries already deleted in DML (Phase 7.3b)
+        if idx.columns.is_empty() {
+            continue;
         }
         dead_index_entries += vacuum_index(storage, idx, snap, bloom)?;
     }
