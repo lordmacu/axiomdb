@@ -85,6 +85,15 @@ pub enum EntryType {
     ///
     /// Undo restores the exact old tuple image at the same physical location.
     UpdateInPlace = 10,
+    /// Bulk-delete page image — replaces N `Delete` entries with one per page.
+    ///
+    /// `key`       = `page_id` as u64 LE (8 bytes).
+    /// `old_value` = empty.
+    /// `new_value` = `[num_slots: u16 LE][slot_id × N: u16 LE]`.
+    ///
+    /// Crash recovery undoes an uncommitted `PageDelete` by clearing
+    /// `txn_id_deleted` for each slot — identical to undoing N `Delete` entries.
+    PageDelete = 11,
 }
 
 impl TryFrom<u8> for EntryType {
@@ -102,6 +111,7 @@ impl TryFrom<u8> for EntryType {
             8 => Ok(Self::Truncate),
             9 => Ok(Self::PageWrite),
             10 => Ok(Self::UpdateInPlace),
+            11 => Ok(Self::PageDelete),
             _ => Err(DbError::WalUnknownEntryType { byte }),
         }
     }

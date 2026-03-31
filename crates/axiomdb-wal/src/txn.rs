@@ -836,6 +836,67 @@ impl TxnManager {
         Ok(())
     }
 
+    /// Batch-records DELETEs into the WAL: one `PageDelete` entry per affected
+    /// page listing the slot_ids deleted on that page.
+    ///
+    /// Mirrors [`record_page_writes`] for INSERT. Reduces WAL size from
+    /// O(N × 150 bytes) to O(P × 50 bytes) where P = pages touched.
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] if called outside a transaction.
+    pub fn record_delete_batch(
+        &mut self,
+        table_id: u32,
+        page_deletes: &[(u64, Vec<u16>)], // (page_id, slot_ids)
+    ) -> Result<(), DbError> {
+        if page_deletes.is_empty() {
+            return Ok(());
+        }
+
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = active.txn_id;
+        let n = page_deletes.len();
+
+        let lsn_base = self.wal.reserve_lsns(n);
+        self.wal_scratch.clear();
+
+        for (i, (page_id, slot_ids)) in page_deletes.iter().enumerate() {
+            let key = page_id.to_le_bytes();
+
+            // Compact value: [num_slots: u16 LE][slot_id × N: u16 LE]
+            let mut new_value = Vec::with_capacity(2 + slot_ids.len() * 2);
+            new_value.extend_from_slice(&(slot_ids.len() as u16).to_le_bytes());
+            for &slot_id in slot_ids {
+                new_value.extend_from_slice(&slot_id.to_le_bytes());
+            }
+
+            let entry = WalEntry::new(
+                lsn_base + i as u64,
+                txn_id,
+                EntryType::PageDelete,
+                table_id,
+                key.to_vec(),
+                vec![], // no old_value needed — undo clears txn_id_deleted
+                new_value,
+            );
+            entry.serialize_into(&mut self.wal_scratch);
+        }
+
+        self.wal.write_batch(&self.wal_scratch)?;
+
+        // Enqueue undo ops: UndoDelete clears txn_id_deleted on ROLLBACK.
+        for (page_id, slot_ids) in page_deletes {
+            for &slot_id in slot_ids {
+                active.undo_ops.push(UndoOp::UndoDelete {
+                    page_id: *page_id,
+                    slot_id,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     /// Records a DELETE into the WAL and enqueues an undo operation.
     ///
     /// Must be called **after** `txn_id_deleted` has been stamped in the RowHeader.

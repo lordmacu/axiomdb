@@ -465,11 +465,20 @@ impl TableEngine {
         let deleted =
             HeapChain::delete_batch(storage, table_def.data_root_page_id, &raw_rids, txn_id)?;
 
-        // WAL entries: one per row, after all page writes (ordering invariant).
-        for (page_id, slot_id, old_bytes) in &deleted {
-            let key = encode_rid(*page_id, *slot_id);
-            txn.record_delete(table_def.id, &key, old_bytes, *page_id, *slot_id)?;
+        // Batch WAL: one PageDelete entry per affected page (instead of one
+        // Delete entry per row). Reduces WAL from O(N × 150 bytes) to O(P × 50 bytes).
+        let mut page_deletes: Vec<(u64, Vec<u16>)> = Vec::new();
+        for (page_id, slot_id, _old_bytes) in &deleted {
+            match page_deletes.last_mut() {
+                Some((last_pid, slots)) if *last_pid == *page_id => {
+                    slots.push(*slot_id);
+                }
+                _ => {
+                    page_deletes.push((*page_id, vec![*slot_id]));
+                }
+            }
         }
+        txn.record_delete_batch(table_def.id, &page_deletes)?;
 
         Ok(deleted.len() as u64)
     }
