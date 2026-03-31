@@ -257,6 +257,12 @@ impl<'src> Parser<'src> {
                 let name = self.parse_identifier()?;
                 Ok(Stmt::ReleaseSavepoint(name))
             }
+            Token::Explain => {
+                self.advance();
+                // EXPLAIN <any statement> — wraps the inner statement.
+                let inner = self.parse_stmt()?;
+                Ok(Stmt::Explain(Box::new(inner)))
+            }
             Token::Vacuum => {
                 self.advance();
                 // VACUUM [table_name]
