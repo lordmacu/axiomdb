@@ -295,6 +295,10 @@ pub async fn handle_connection_with_timeouts(
     // same table across queries. Warm on second query to the same table.
     // Automatically invalidated by analyze_cached() on DDL statements.
     let mut schema_cache = SchemaCache::new();
+    // Per-connection plan cache — normalizes literals in COM_QUERY and reuses
+    // parsed+analyzed ASTs for repeated queries with different literal values.
+    // Invalidated on DDL via schema_version comparison.
+    let mut plan_cache = super::plan_cache::PlanCache::new(256);
 
     // Clone Arc<AtomicU64> and Arc<StatusRegistry> once per connection — no lock
     // needed after this point for either. (Phase 5.13 + 5.9c)
@@ -639,7 +643,30 @@ pub async fn handle_connection_with_timeouts(
                         match tokio::time::timeout(timeout_dur, db.write()).await {
                             Err(_elapsed) => Err(DbError::LockTimeout),
                             Ok(mut guard) => {
-                                guard.execute_query(stmt_sql, &mut session, &mut schema_cache)
+                                // Phase 27.8b: literal-normalized plan cache.
+                                // Check if we have a cached plan for this query structure.
+                                let sv = guard
+                                    .schema_version
+                                    .load(std::sync::atomic::Ordering::Acquire);
+                                if let Some((cached_stmt, _params)) =
+                                    plan_cache.lookup(stmt_sql, sv)
+                                {
+                                    guard.execute_stmt(cached_stmt, &mut session)
+                                } else {
+                                    let result = guard.execute_query(
+                                        stmt_sql,
+                                        &mut session,
+                                        &mut schema_cache,
+                                    );
+                                    // On success, store the normalized plan for future reuse.
+                                    if result.is_ok() {
+                                        if let Ok(stmt) = axiomdb_sql::parser::parse(stmt_sql, None)
+                                        {
+                                            plan_cache.store(stmt_sql, &stmt, sv);
+                                        }
+                                    }
+                                    result
+                                }
                             }
                         }
                     };
