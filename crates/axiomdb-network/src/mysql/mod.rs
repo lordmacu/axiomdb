@@ -28,6 +28,7 @@ pub mod handler;
 pub mod json_error;
 pub mod lifecycle;
 pub mod packets;
+pub mod plan_cache;
 pub mod prepared;
 pub mod result;
 pub mod session;

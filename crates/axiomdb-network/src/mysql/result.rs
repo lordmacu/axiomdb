@@ -377,11 +377,26 @@ fn build_row_packet(
     row: &[Value],
     results_collation: &'static CollationDef,
 ) -> Result<Vec<u8>, DbError> {
-    let mut buf = Vec::new();
+    // Pre-allocate: ~32 bytes per column is a reasonable estimate for text protocol.
+    let mut buf = Vec::with_capacity(row.len() * 32);
     for value in row {
         match value {
-            Value::Null => buf.push(0xfb),                    // NULL indicator
-            Value::Bytes(b) => write_lenenc_str(&mut buf, b), // raw bytes, no transcoding
+            Value::Null => buf.push(0xfb),
+            Value::Bytes(b) => write_lenenc_str(&mut buf, b),
+            // Fast path for integers: write ASCII bytes directly — skip charset
+            // encoding (integers are always ASCII, no transcoding needed).
+            Value::Int(n) => {
+                let s = n.to_string();
+                write_lenenc_str(&mut buf, s.as_bytes());
+            }
+            Value::BigInt(n) => {
+                let s = n.to_string();
+                write_lenenc_str(&mut buf, s.as_bytes());
+            }
+            Value::Bool(b) => {
+                write_lenenc_str(&mut buf, if *b { b"1" } else { b"0" });
+            }
+            // Text + other types: charset encoding required.
             v => {
                 let s = value_to_text(v);
                 let encoded = charset::encode_text(results_collation.charset, &s)?;
