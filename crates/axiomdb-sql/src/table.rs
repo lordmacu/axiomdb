@@ -196,6 +196,7 @@ impl TableEngine {
         columns: &[ColumnDef],
         snap: TransactionSnapshot,
         mut predicate: F,
+        zone_map_pred: Option<&axiomdb_storage::zone_map::ZoneMapPredicate>,
     ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError>
     where
         F: FnMut(&[Value]) -> bool,
@@ -211,6 +212,18 @@ impl TableEngine {
 
             if next != 0 {
                 storage.prefetch_hint(next, 1);
+            }
+
+            // Phase 8.3b: zone map skip — if the page's min/max for the
+            // predicate column is entirely outside the predicate range,
+            // skip every row on this page without decoding.
+            if let Some(zmp) = zone_map_pred {
+                if let Some(zm) = axiomdb_storage::zone_map::read_zone_map(&page) {
+                    if !axiomdb_storage::zone_map::zone_map_might_match(&zm, zmp) {
+                        current = next;
+                        continue; // SKIP entire page
+                    }
+                }
             }
 
             let num = num_slots(&page);

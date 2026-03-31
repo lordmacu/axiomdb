@@ -66,19 +66,22 @@ fn execute_select_ctx(
                 // selectivity factor (e.g., 50% fewer allocs at 50% selectivity).
                 if let Some(ref wc) = stmt.where_clause {
                     let wc_clone = wc.clone();
+                    // Phase 8.3b: extract zone map predicate from WHERE clause
+                    // for page-level skip during scan.
+                    let zm_pred =
+                        crate::planner::extract_zone_map_predicate(&wc_clone, &resolved.columns);
                     TableEngine::scan_table_filtered(
                         storage,
                         &resolved.def,
                         &resolved.columns,
                         snap,
                         |values| {
-                            // Simple eval without subquery support (fast path).
-                            // Subqueries in WHERE fall through to the slow path below.
                             match eval(&wc_clone, values) {
                                 Ok(v) => is_truthy(&v),
-                                Err(_) => true, // on error, keep row for later recheck
+                                Err(_) => true,
                             }
                         },
+                        zm_pred.as_ref(),
                     )?
                 } else {
                     // No WHERE clause — scan all rows.
