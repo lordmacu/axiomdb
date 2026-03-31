@@ -191,7 +191,9 @@ pub fn plan_select(
     // ── Rule 2: col > lo AND col < hi (or >=, <=) ─────────────────────────
     if let Some((idx, lo_val, hi_val)) = extract_range(expr, indexes, columns, Some(expr), true) {
         // Cost gate: range scans are even less selective — apply same threshold.
-        if stats_cost_gate(idx, columns, table_id, table_stats, stale_tracker) {
+        let use_index =
+            idx.is_primary || stats_cost_gate(idx, columns, table_id, table_stats, stale_tracker);
+        if use_index {
             let lo = lo_val.and_then(|v| encode_index_key(&[v]).ok());
             let hi = hi_val.and_then(|v| encode_index_key(&[v]).ok());
             return AccessMethod::IndexRange {
@@ -199,6 +201,36 @@ pub fn plan_select(
                 lo,
                 hi,
             };
+        }
+    }
+
+    // ── Rule 2b: single-sided range (col > val, col < val, col >= val, col <= val)
+    // Handles predicates like `WHERE id > 50` that are NOT wrapped in AND.
+    if let Some((col_name, bound)) = extract_range_side(expr) {
+        if let Some(idx) = find_index_on_col(col_name, indexes, columns, Some(expr), true) {
+            let use_index = idx.is_primary
+                || stats_cost_gate(idx, columns, table_id, table_stats, stale_tracker);
+            if use_index {
+                // Determine if this is a lower or upper bound.
+                let is_lower = matches!(
+                    expr,
+                    Expr::BinaryOp {
+                        op: BinaryOp::Gt | BinaryOp::GtEq,
+                        ..
+                    }
+                );
+                let encoded = bound.and_then(|v| encode_index_key(&[v]).ok());
+                let (lo, hi) = if is_lower {
+                    (encoded, None) // open upper bound
+                } else {
+                    (None, encoded) // open lower bound
+                };
+                return AccessMethod::IndexRange {
+                    index_def: idx.clone(),
+                    lo,
+                    hi,
+                };
+            }
         }
     }
 

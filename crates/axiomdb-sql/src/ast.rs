@@ -480,6 +480,8 @@ pub enum Stmt {
     // Maintenance
     /// `VACUUM [table_name]` — remove dead rows and dead index entries (Phase 7.11).
     Vacuum(VacuumStmt),
+    /// `EXPLAIN SELECT ...` — show the chosen query plan (Phase 8.4).
+    Explain(Box<Stmt>),
     // Session
     Set(SetStmt),
     UseDatabase(UseDatabaseStmt),
