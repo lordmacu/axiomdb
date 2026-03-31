@@ -58,6 +58,25 @@ fn execute_select_ctx(
             effective_coll,
         );
 
+        /// Returns true if the expression contains a subquery node.
+        fn expr_has_subquery(e: &crate::expr::Expr) -> bool {
+            match e {
+                crate::expr::Expr::Subquery(_)
+                | crate::expr::Expr::InSubquery { .. }
+                | crate::expr::Expr::Exists { .. } => true,
+                crate::expr::Expr::BinaryOp { left, right, .. } => {
+                    expr_has_subquery(left) || expr_has_subquery(right)
+                }
+                crate::expr::Expr::UnaryOp { operand, .. } => expr_has_subquery(operand),
+                _ => false,
+            }
+        }
+
+        // Tracks whether the WHERE clause was already evaluated inline during
+        // scan (Phase 8.1). If true, skip the redundant re-evaluation in
+        // combined_rows below — saves ~2500 eval calls at 50% selectivity.
+        let mut where_already_applied = false;
+
         // Fetch rows via the chosen access method.
         let raw_rows: Vec<(RecordId, Vec<Value>)> = match &access_method {
             crate::planner::AccessMethod::Scan => {
@@ -66,10 +85,13 @@ fn execute_select_ctx(
                 // selectivity factor (e.g., 50% fewer allocs at 50% selectivity).
                 if let Some(ref wc) = stmt.where_clause {
                     let wc_clone = wc.clone();
-                    // Phase 8.3b: extract zone map predicate from WHERE clause
-                    // for page-level skip during scan.
                     let zm_pred =
                         crate::planner::extract_zone_map_predicate(&wc_clone, &resolved.columns);
+                    // Only skip re-eval if the WHERE has no subqueries.
+                    // Subqueries need eval_with() which isn't available in the scan closure.
+                    if !expr_has_subquery(&wc_clone) {
+                        where_already_applied = true;
+                    }
                     TableEngine::scan_table_filtered(
                         storage,
                         &resolved.def,
@@ -237,16 +259,20 @@ fn execute_select_ctx(
 
         let mut combined_rows: Vec<Row> = Vec::new();
         for (_rid, values) in raw_rows {
-            if let Some(ref wc) = stmt.where_clause {
-                let mut runner = ExecSubqueryRunner {
-                    storage,
-                    txn,
-                    bloom,
-                    ctx,
-                    outer_row: &values,
-                };
-                if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
-                    continue;
+            // Skip redundant WHERE re-evaluation when scan_table_filtered
+            // already applied the predicate (Phase 8.1 optimization).
+            if !where_already_applied {
+                if let Some(ref wc) = stmt.where_clause {
+                    let mut runner = ExecSubqueryRunner {
+                        storage,
+                        txn,
+                        bloom,
+                        ctx,
+                        outer_row: &values,
+                    };
+                    if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
+                        continue;
+                    }
                 }
             }
             combined_rows.push(values);
