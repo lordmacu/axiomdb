@@ -658,9 +658,14 @@ pub async fn handle_connection_with_timeouts(
                                         &mut session,
                                         &mut schema_cache,
                                     );
-                                    // On success, store the normalized plan for future reuse.
+                                    // On success, store the NORMALIZED plan (with ? placeholders)
+                                    // for future reuse. The normalized SQL has literals replaced
+                                    // so substitute_params_in_ast can inject new values on cache hit.
                                     if result.is_ok() {
-                                        if let Ok(stmt) = axiomdb_sql::parser::parse(stmt_sql, None)
+                                        let (norm_sql, _) =
+                                            super::plan_cache::normalize_sql(stmt_sql);
+                                        if let Ok(stmt) =
+                                            axiomdb_sql::parser::parse(&norm_sql, None)
                                         {
                                             plan_cache.store(stmt_sql, &stmt, sv);
                                         }
