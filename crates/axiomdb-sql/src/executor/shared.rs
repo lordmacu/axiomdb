@@ -8,7 +8,7 @@ fn resolve_table_cached(
 
     // If the user explicitly specified a database, verify it exists first.
     if tref.database.is_some() {
-        let snap = txn.active_snapshot()?;
+        let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
         let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
         if !reader.database_exists(&database)? {
             return Err(DbError::DatabaseNotFound {

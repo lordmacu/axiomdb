@@ -383,6 +383,69 @@ impl Database {
         }
     }
 
+    /// Executes a pre-parsed `Stmt` — skips `parse()` but runs snapshot +
+    /// analyze + execute (full pipeline minus parse).
+    ///
+    /// Used by the literal-normalized plan cache (Phase 27.8b). Like
+    /// PostgreSQL, every execution gets a fresh snapshot even with a cached
+    /// plan — only the parse step is skipped.
+    pub fn execute_cached_stmt(
+        &mut self,
+        sql: &str,
+        stmt: Stmt,
+        session: &mut SessionContext,
+        schema_cache: &mut SchemaCache,
+    ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
+        if !sql.trim().starts_with("show warnings") {
+            session.clear_warnings();
+        }
+
+        if self.is_degraded() && stmt_may_mutate(&stmt) {
+            return Err(DbError::DiskFull {
+                operation: "database is in read-only degraded mode",
+            });
+        }
+        let is_ddl = is_schema_changing(&stmt);
+
+        // Fresh snapshot (same as execute_query — PostgreSQL model).
+        let snap = self
+            .txn
+            .active_snapshot()
+            .unwrap_or_else(|_| self.txn.snapshot());
+
+        // Analyze (resolve columns, type check).
+        let analyzed = match analyze_cached_with_defaults(
+            stmt,
+            &self.storage,
+            snap,
+            session.effective_database(),
+            session.current_schema(),
+            schema_cache,
+        ) {
+            Ok(a) => a,
+            Err(e) => return self.apply_on_error_pipeline_failure(sql, session, e),
+        };
+
+        // Execute.
+        let result = execute_with_ctx(
+            analyzed,
+            &mut self.storage,
+            &mut self.txn,
+            &mut self.bloom,
+            session,
+        );
+        if let Err(ref e) = result {
+            if matches!(e, DbError::DiskFull { .. }) {
+                self.enter_degraded_mode();
+            }
+        }
+        let result = result?;
+        if is_ddl {
+            self.schema_version.fetch_add(1, Ordering::Release);
+        }
+        Ok((result, self.take_commit_rx()))
+    }
+
     /// Executes an already-analyzed `Stmt` — used by the prepared statement
     /// plan cache path to skip `parse()` + `analyze()` entirely.
     ///
