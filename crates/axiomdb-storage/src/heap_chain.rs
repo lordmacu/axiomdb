@@ -725,11 +725,27 @@ impl HeapChain {
     ///
     /// One `(page_id, slot_id)` per input row, in the same order as `rows`.
     /// Empty `rows` returns `Ok(vec![])` immediately.
+    /// Batch insert with optional zone map updates (Phase 8.3b).
+    ///
+    /// `zm_values` is parallel to `rows`: `zm_values[i]` is `Some((col_idx, val))`
+    /// if the i-th row has a zone-mappable numeric value. The zone map is updated
+    /// in the page header BEFORE the checksum is computed.
     pub fn insert_batch(
         storage: &mut dyn StorageEngine,
         root_page_id: u64,
         rows: &[Vec<u8>],
         txn_id: TxnId,
+    ) -> Result<Vec<(u64, u16)>, DbError> {
+        Self::insert_batch_with_zm(storage, root_page_id, rows, txn_id, &[])
+    }
+
+    /// Core batch insert implementation with zone map support.
+    pub fn insert_batch_with_zm(
+        storage: &mut dyn StorageEngine,
+        root_page_id: u64,
+        rows: &[Vec<u8>],
+        txn_id: TxnId,
+        zm_values: &[Option<(u8, i64)>],
     ) -> Result<Vec<(u64, u16)>, DbError> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -744,11 +760,15 @@ impl HeapChain {
         let mut dirty = false;
         let mut result = Vec::with_capacity(rows.len());
 
-        for data in rows {
+        for (row_idx, data) in rows.iter().enumerate() {
             match insert_tuple(&mut page, data, txn_id) {
                 // ── Row fits on current page ───────────────────────────────────
                 Ok(slot_id) => {
                     result.push((last_id, slot_id));
+                    // Phase 8.3b: update zone map with this row's value.
+                    if let Some(Some((col_idx, val))) = zm_values.get(row_idx) {
+                        crate::zone_map::update_zone_map(&mut page, *col_idx, *val);
+                    }
                     dirty = true;
                 }
 
@@ -778,6 +798,9 @@ impl HeapChain {
                     // Step 5: retry insert on the empty new page (guaranteed fit).
                     let slot_id = insert_tuple(&mut page, data, txn_id)?;
                     result.push((last_id, slot_id));
+                    if let Some(Some((col_idx, val))) = zm_values.get(row_idx) {
+                        crate::zone_map::update_zone_map(&mut page, *col_idx, *val);
+                    }
                     dirty = true;
                 }
 
