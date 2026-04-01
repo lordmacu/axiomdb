@@ -33,7 +33,33 @@ fn apply_join(
                         right_col_count,
                     ));
                 }
-                _ => {} // RIGHT, FULL, CROSS: fall through to nested loop
+                JoinType::Right => {
+                    // RIGHT JOIN = LEFT JOIN with sides swapped.
+                    // Hash the left side, probe with right, then swap columns back.
+                    let swapped = hash_join_left(
+                        right_rows,
+                        &left_rows,
+                        r_idx,
+                        l_idx,
+                        left_col_count,
+                    );
+                    // Swap columns back: each row is [right_cols, left_cols],
+                    // needs to be [left_cols, right_cols].
+                    let right_count = right_col_count;
+                    let left_count = left_col_count;
+                    return Ok(swapped
+                        .into_iter()
+                        .map(|row| {
+                            let mut fixed = Vec::with_capacity(row.len());
+                            // Left cols are at the END (positions right_count..)
+                            fixed.extend_from_slice(&row[right_count..right_count + left_count]);
+                            // Right cols are at the START (positions 0..right_count)
+                            fixed.extend_from_slice(&row[..right_count]);
+                            fixed
+                        })
+                        .collect());
+                }
+                _ => {} // FULL, CROSS: fall through to nested loop
             }
         }
     }
@@ -256,8 +282,10 @@ fn detect_equijoin(cond: &JoinCondition, left_col_count: usize) -> Option<(usize
 
 /// Hash join for INNER JOIN with equijoin condition: O(n + m) instead of O(n × m).
 ///
-/// **Build phase**: hash the right (smaller) table by the join key into a HashMap.
-/// **Probe phase**: for each left row, look up matching right rows by hash.
+/// **Build side selection** (PostgreSQL pattern): always hash the SMALLER table
+/// to minimize memory usage and hash table size. The larger table becomes the
+/// probe side. For INNER JOIN the result is commutative — row order in output
+/// may differ but the set of matched pairs is identical.
 ///
 /// Inspired by DuckDB's `PhysicalHashJoin` and PostgreSQL's `nodeHashjoin.c`.
 fn hash_join_inner(
@@ -268,28 +296,40 @@ fn hash_join_inner(
 ) -> Vec<Row> {
     use std::collections::HashMap;
 
-    // Build phase: hash right table by join key.
-    let mut ht: HashMap<HashableValue, Vec<usize>> = HashMap::with_capacity(right_rows.len());
-    for (i, row) in right_rows.iter().enumerate() {
-        if let Some(key) = row.get(right_key_idx) {
+    // PostgreSQL optimization: build on smaller side, probe on larger.
+    // Reduces hash table memory and improves cache locality.
+    let (build_rows, build_key, probe_rows, probe_key, build_is_left) =
+        if left_rows.len() <= right_rows.len() {
+            (left_rows, left_key_idx, right_rows, right_key_idx, true)
+        } else {
+            (right_rows, right_key_idx, left_rows, left_key_idx, false)
+        };
+
+    // Build phase: hash smaller table by join key.
+    let mut ht: HashMap<HashableValue, Vec<usize>> = HashMap::with_capacity(build_rows.len());
+    for (i, row) in build_rows.iter().enumerate() {
+        if let Some(key) = row.get(build_key) {
             if !matches!(key, Value::Null) {
-                let hk = HashableValue(key.clone());
-                ht.entry(hk).or_default().push(i);
+                ht.entry(HashableValue(key.clone())).or_default().push(i);
             }
         }
     }
 
-    // Probe phase: look up each left row's key in the hash table.
+    // Probe phase: look up each larger-table row's key in the hash table.
     let mut result = Vec::new();
-    for left in left_rows {
-        if let Some(key) = left.get(left_key_idx) {
+    for probe in probe_rows {
+        if let Some(key) = probe.get(probe_key) {
             if matches!(key, Value::Null) {
-                continue; // NULL never matches in equijoin
+                continue;
             }
-            let hk = HashableValue(key.clone());
-            if let Some(indices) = ht.get(&hk) {
-                for &ri in indices {
-                    result.push(concat_rows(left, &right_rows[ri]));
+            if let Some(indices) = ht.get(&HashableValue(key.clone())) {
+                for &bi in indices {
+                    // Maintain left-right column order regardless of build side.
+                    if build_is_left {
+                        result.push(concat_rows(&build_rows[bi], probe));
+                    } else {
+                        result.push(concat_rows(probe, &build_rows[bi]));
+                    }
                 }
             }
         }
