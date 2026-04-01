@@ -7,6 +7,7 @@
 
 pub mod codec;
 pub mod coerce;
+pub mod field_patch;
 pub mod types;
 pub mod value;
 
