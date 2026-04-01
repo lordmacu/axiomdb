@@ -1,7 +1,23 @@
-/// Minimum row count to trigger hash join. Below this, nested loop is faster.
+/// Minimum row count to trigger hash join. Below this, nested loop is faster
+/// (HashMap construction overhead > n×m comparisons for small n,m).
 const HASH_JOIN_MIN_ROWS: usize = 32;
 
-#[allow(clippy::too_many_arguments)] // 9 params needed: join context has inherent complexity
+// ── Adaptive Join Selection (Phase 9.9) ─────────────────────────────────────
+//
+// Cost-based selection inspired by PostgreSQL joinpath.c:
+//
+//   1. CROSS JOIN / non-equijoin → always nested loop (no alternative)
+//   2. Equijoin + both sides < 32 rows → nested loop (hash overhead not worth it)
+//   3. Equijoin + INNER/LEFT/RIGHT → hash join (O(n+m), build smaller side)
+//   4. Equijoin + FULL OUTER → hash join with matched-bitmap tracking
+//   5. Sort-merge: available but not auto-selected yet (requires presorted detection)
+//
+// The selection happens at the top of apply_join based on:
+//   - Join type (INNER/LEFT/RIGHT/FULL/CROSS)
+//   - Condition type (equijoin detected by detect_equijoin)
+//   - Table sizes (left_rows.len(), right_rows.len())
+
+#[allow(clippy::too_many_arguments)]
 fn apply_join(
     left_rows: Vec<Row>,
     right_rows: &[Row],
@@ -9,16 +25,15 @@ fn apply_join(
     right_col_count: usize,
     join_type: JoinType,
     condition: &JoinCondition,
-    left_schema: &[(String, usize)], // for USING: (col_name, global_col_idx) for left side
+    left_schema: &[(String, usize)],
     right_col_offset: usize,
     right_columns: &[axiomdb_catalog::schema::ColumnDef],
 ) -> Result<Vec<Row>, DbError> {
-    // Phase 9.6: Hash join for equijoin conditions on large tables.
-    // O(n + m) instead of O(n × m). Falls back to nested loop for
-    // non-equijoin, CROSS, RIGHT, FULL, or small tables.
-    let use_hash = left_rows.len() >= HASH_JOIN_MIN_ROWS
+    // Phase 9.9: Adaptive join selection.
+    let is_large = left_rows.len() >= HASH_JOIN_MIN_ROWS
         || right_rows.len() >= HASH_JOIN_MIN_ROWS;
-    if use_hash {
+
+    if is_large {
         if let Some((l_idx, r_idx)) = detect_equijoin(condition, left_col_count) {
             match join_type {
                 JoinType::Inner => {
@@ -26,40 +41,23 @@ fn apply_join(
                 }
                 JoinType::Left => {
                     return Ok(hash_join_left(
-                        &left_rows,
-                        right_rows,
-                        l_idx,
-                        r_idx,
-                        right_col_count,
+                        &left_rows, right_rows, l_idx, r_idx, right_col_count,
                     ));
                 }
                 JoinType::Right => {
-                    // RIGHT JOIN = LEFT JOIN with sides swapped.
-                    // Hash the left side, probe with right, then swap columns back.
+                    // RIGHT = LEFT with swapped sides + column reorder.
                     let swapped = hash_join_left(
-                        right_rows,
-                        &left_rows,
-                        r_idx,
-                        l_idx,
-                        left_col_count,
+                        right_rows, &left_rows, r_idx, l_idx, left_col_count,
                     );
-                    // Swap columns back: each row is [right_cols, left_cols],
-                    // needs to be [left_cols, right_cols].
-                    let right_count = right_col_count;
-                    let left_count = left_col_count;
-                    return Ok(swapped
-                        .into_iter()
-                        .map(|row| {
-                            let mut fixed = Vec::with_capacity(row.len());
-                            // Left cols are at the END (positions right_count..)
-                            fixed.extend_from_slice(&row[right_count..right_count + left_count]);
-                            // Right cols are at the START (positions 0..right_count)
-                            fixed.extend_from_slice(&row[..right_count]);
-                            fixed
-                        })
-                        .collect());
+                    return Ok(swap_columns(swapped, right_col_count, left_col_count));
                 }
-                _ => {} // FULL, CROSS: fall through to nested loop
+                JoinType::Full => {
+                    return Ok(hash_join_full(
+                        &left_rows, right_rows, l_idx, r_idx,
+                        left_col_count, right_col_count,
+                    ));
+                }
+                JoinType::Cross => {} // no equijoin for CROSS
             }
         }
     }
@@ -296,10 +294,10 @@ fn hash_join_inner(
 ) -> Vec<Row> {
     use std::collections::HashMap;
 
-    // PostgreSQL optimization: build on smaller side, probe on larger.
-    // Reduces hash table memory and improves cache locality.
+    // PostgreSQL optimization: build on STRICTLY smaller side, probe on larger.
+    // Equal sizes → build right (deterministic, matches query order).
     let (build_rows, build_key, probe_rows, probe_key, build_is_left) =
-        if left_rows.len() <= right_rows.len() {
+        if left_rows.len() < right_rows.len() {
             (left_rows, left_key_idx, right_rows, right_key_idx, true)
         } else {
             (right_rows, right_key_idx, left_rows, left_key_idx, false)
@@ -338,6 +336,11 @@ fn hash_join_inner(
 }
 
 /// Hash join for LEFT JOIN: all left rows appear; unmatched get NULL right side.
+///
+/// PostgreSQL optimization: build hash table on the RIGHT side (which may be
+/// smaller), probe with LEFT. For LEFT JOIN we cannot swap sides freely —
+/// every left row must appear in the output. So we always probe with left
+/// and build on right.
 fn hash_join_left(
     left_rows: &[Row],
     right_rows: &[Row],
@@ -347,6 +350,7 @@ fn hash_join_left(
 ) -> Vec<Row> {
     use std::collections::HashMap;
 
+    // Build on right side (LEFT JOIN semantics require probing every left row).
     let mut ht: HashMap<HashableValue, Vec<usize>> = HashMap::with_capacity(right_rows.len());
     for (i, row) in right_rows.iter().enumerate() {
         if let Some(key) = row.get(right_key_idx) {
@@ -359,19 +363,90 @@ fn hash_join_left(
     let null_right: Row = vec![Value::Null; right_col_count];
     let mut result = Vec::new();
     for left in left_rows {
+        let key = match left.get(left_key_idx) {
+            Some(k) if !matches!(k, Value::Null) => k,
+            _ => {
+                // NULL key or missing → never matches, emit with NULL right.
+                result.push(concat_rows(left, &null_right));
+                continue;
+            }
+        };
+        if let Some(indices) = ht.get(&HashableValue(key.clone())) {
+            for &ri in indices {
+                result.push(concat_rows(left, &right_rows[ri]));
+            }
+        } else {
+            result.push(concat_rows(left, &null_right));
+        }
+    }
+    result
+}
+
+/// Hash join for FULL OUTER JOIN: matched pairs + unmatched left (NULL right)
+/// + unmatched right (NULL left). Uses a matched-right bitmap like PostgreSQL.
+fn hash_join_full(
+    left_rows: &[Row],
+    right_rows: &[Row],
+    left_key_idx: usize,
+    right_key_idx: usize,
+    left_col_count: usize,
+    right_col_count: usize,
+) -> Vec<Row> {
+    use std::collections::HashMap;
+
+    // Build on right side (need matched bitmap for unmatched-right emission).
+    let mut ht: HashMap<HashableValue, Vec<usize>> = HashMap::with_capacity(right_rows.len());
+    for (i, row) in right_rows.iter().enumerate() {
+        if let Some(key) = row.get(right_key_idx) {
+            if !matches!(key, Value::Null) {
+                ht.entry(HashableValue(key.clone())).or_default().push(i);
+            }
+        }
+    }
+
+    let null_left: Row = vec![Value::Null; left_col_count];
+    let null_right: Row = vec![Value::Null; right_col_count];
+    let mut matched_right = vec![false; right_rows.len()];
+    let mut result = Vec::new();
+
+    // Probe: emit matched pairs + unmatched left rows.
+    for left in left_rows {
         if let Some(key) = left.get(left_key_idx) {
             if !matches!(key, Value::Null) {
                 if let Some(indices) = ht.get(&HashableValue(key.clone())) {
                     for &ri in indices {
                         result.push(concat_rows(left, &right_rows[ri]));
+                        matched_right[ri] = true;
                     }
                     continue;
                 }
             }
         }
+        // Unmatched left → NULL right side.
         result.push(concat_rows(left, &null_right));
     }
+
+    // Emit unmatched right rows → NULL left side.
+    for (i, right) in right_rows.iter().enumerate() {
+        if !matched_right[i] {
+            result.push(concat_rows(&null_left, right));
+        }
+    }
+
     result
+}
+
+/// Reorders columns in rows from [right_cols, left_cols] to [left_cols, right_cols].
+/// Used by RIGHT JOIN hash path (swap sides then fix column order).
+fn swap_columns(rows: Vec<Row>, right_count: usize, left_count: usize) -> Vec<Row> {
+    rows.into_iter()
+        .map(|row| {
+            let mut fixed = Vec::with_capacity(row.len());
+            fixed.extend_from_slice(&row[right_count..right_count + left_count]);
+            fixed.extend_from_slice(&row[..right_count]);
+            fixed
+        })
+        .collect()
 }
 
 /// Wrapper for `Value` that implements `Hash + Eq` for use as HashMap key.
@@ -516,7 +591,11 @@ fn sort_merge_join_left(
             matched = true;
             ri += 1;
         }
-        ri = mark;
+        // PostgreSQL optimization: only restore to mark if we matched something.
+        // If no match, ri is already past the non-equal region — advancing is correct.
+        if matched {
+            ri = mark;
+        }
 
         if !matched {
             result.push(concat_rows(left, &null_right));
