@@ -211,6 +211,7 @@ impl TableEngine {
         mut predicate: F,
         zone_map_pred: Option<(usize, &axiomdb_storage::zone_map::ZoneMapPredicate)>,
         where_col_mask: Option<&[bool]>,
+        batch_pred: Option<&crate::eval::batch::BatchPredicate>,
     ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError>
     where
         F: FnMut(&[Value]) -> bool,
@@ -263,15 +264,30 @@ impl TableEngine {
                 visible_slots.push((slot_id, off, len));
             }
 
-            // ── Phase 2: Two-phase decode for visible slots ──────────────
+            // ── Phase 2: Predicate evaluation + decode for visible slots ──
             for &(slot_id, off, len) in &visible_slots {
                 let row_data = &page.as_bytes()[off + size_of::<RowHeader>()..off + len];
 
-                if has_two_phase {
+                // Fast path (Phase 8.1): BatchPredicate evaluates on raw bytes —
+                // zero allocation, no Value construction, no Expr tree walk.
+                // ~6× faster than decode+eval for simple col-op-literal predicates.
+                if let Some(bp) = batch_pred {
+                    if !bp.eval_on_raw(row_data) {
+                        continue;
+                    }
+                    let values = decode_row(row_data, &col_types)?;
+                    result.push((
+                        RecordId {
+                            page_id: current,
+                            slot_id,
+                        },
+                        values,
+                    ));
+                } else if has_two_phase {
                     // Phase 2a: decode only WHERE columns.
                     let partial = decode_row_masked(row_data, &col_types, where_col_mask.unwrap())?;
                     if !predicate(&partial) {
-                        continue; // Skip full decode — saves String/Text allocs.
+                        continue;
                     }
                     // Phase 2b: full decode for passing rows.
                     let values = decode_row(row_data, &col_types)?;

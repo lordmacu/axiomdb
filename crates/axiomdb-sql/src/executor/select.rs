@@ -161,6 +161,16 @@ fn execute_select_ctx(
                             None
                         }
                     };
+                    // Phase 8.1: try to compile a BatchPredicate for zero-alloc
+                    // raw-byte evaluation. Falls back to eval() for complex
+                    // expressions (OR, LIKE, IN, subqueries, Text/Bytes, etc.).
+                    let col_types: Vec<axiomdb_types::DataType> = resolved
+                        .columns
+                        .iter()
+                        .map(|c| crate::table::column_type_to_data_type(c.col_type))
+                        .collect();
+                    let batch_pred =
+                        crate::eval::batch::try_compile(&wc_clone, &col_types);
                     TableEngine::scan_table_filtered(
                         storage,
                         &resolved.def,
@@ -174,6 +184,7 @@ fn execute_select_ctx(
                         },
                         zm_pred.as_ref().map(|(ci, p)| (*ci, p)),
                         where_mask.as_deref(),
+                        batch_pred.as_ref(),
                     )?
                 } else {
                     // No WHERE clause — scan all rows.
