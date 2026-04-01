@@ -1051,6 +1051,20 @@ impl TableEngine {
 
 /// Extracts `DataType` from each `ColumnDef` in declaration order.
 ///
+/// Maps a single `ColumnType` → `DataType`.
+pub fn column_type_to_data_type(ct: ColumnType) -> DataType {
+    match ct {
+        ColumnType::Bool => DataType::Bool,
+        ColumnType::Int => DataType::Int,
+        ColumnType::BigInt => DataType::BigInt,
+        ColumnType::Float => DataType::Real,
+        ColumnType::Text => DataType::Text,
+        ColumnType::Bytes => DataType::Bytes,
+        ColumnType::Timestamp => DataType::Timestamp,
+        ColumnType::Uuid => DataType::Uuid,
+    }
+}
+
 /// `ColumnType` (compact catalog representation) maps to `DataType`
 /// (full in-memory type used by the row codec and expression evaluator).
 pub fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
