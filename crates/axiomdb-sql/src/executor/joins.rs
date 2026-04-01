@@ -1,3 +1,6 @@
+/// Minimum row count to trigger hash join. Below this, nested loop is faster.
+const HASH_JOIN_MIN_ROWS: usize = 32;
+
 #[allow(clippy::too_many_arguments)] // 9 params needed: join context has inherent complexity
 fn apply_join(
     left_rows: Vec<Row>,
@@ -10,6 +13,31 @@ fn apply_join(
     right_col_offset: usize,
     right_columns: &[axiomdb_catalog::schema::ColumnDef],
 ) -> Result<Vec<Row>, DbError> {
+    // Phase 9.6: Hash join for equijoin conditions on large tables.
+    // O(n + m) instead of O(n × m). Falls back to nested loop for
+    // non-equijoin, CROSS, RIGHT, FULL, or small tables.
+    let use_hash = left_rows.len() >= HASH_JOIN_MIN_ROWS
+        || right_rows.len() >= HASH_JOIN_MIN_ROWS;
+    if use_hash {
+        if let Some((l_idx, r_idx)) = detect_equijoin(condition, left_col_count) {
+            match join_type {
+                JoinType::Inner => {
+                    return Ok(hash_join_inner(&left_rows, right_rows, l_idx, r_idx));
+                }
+                JoinType::Left => {
+                    return Ok(hash_join_left(
+                        &left_rows,
+                        right_rows,
+                        l_idx,
+                        r_idx,
+                        right_col_count,
+                    ));
+                }
+                _ => {} // RIGHT, FULL, CROSS: fall through to nested loop
+            }
+        }
+    }
+
     match join_type {
         JoinType::Inner | JoinType::Cross => {
             let mut result = Vec::new();
@@ -194,6 +222,153 @@ fn eval_join_cond(
         }
     }
 }
+
+// ── Hash Join (Phase 9.6) ───────────────────────────────────────────────────
+
+/// Attempts to detect an equijoin condition and extract the left/right column
+/// indices. Returns `None` for non-equijoin conditions (OR, complex exprs, etc.).
+///
+/// Supports: `ON a.col = b.col` where both sides are simple column references.
+/// The analyzer resolves these to `Expr::Column { col_idx }` in the combined row.
+fn detect_equijoin(cond: &JoinCondition, left_col_count: usize) -> Option<(usize, usize)> {
+    match cond {
+        JoinCondition::On(Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        }) => {
+            let (l_idx, r_idx) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Column { col_idx: l, .. }, Expr::Column { col_idx: r, .. }) => (*l, *r),
+                _ => return None,
+            };
+            // Left column must be from left table, right from right table.
+            if l_idx < left_col_count && r_idx >= left_col_count {
+                Some((l_idx, r_idx))
+            } else if r_idx < left_col_count && l_idx >= left_col_count {
+                Some((r_idx, l_idx)) // swapped
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Hash join for INNER JOIN with equijoin condition: O(n + m) instead of O(n × m).
+///
+/// **Build phase**: hash the right (smaller) table by the join key into a HashMap.
+/// **Probe phase**: for each left row, look up matching right rows by hash.
+///
+/// Inspired by DuckDB's `PhysicalHashJoin` and PostgreSQL's `nodeHashjoin.c`.
+fn hash_join_inner(
+    left_rows: &[Row],
+    right_rows: &[Row],
+    left_key_idx: usize,
+    right_key_idx: usize,
+) -> Vec<Row> {
+    use std::collections::HashMap;
+
+    // Build phase: hash right table by join key.
+    let mut ht: HashMap<HashableValue, Vec<usize>> = HashMap::with_capacity(right_rows.len());
+    for (i, row) in right_rows.iter().enumerate() {
+        if let Some(key) = row.get(right_key_idx) {
+            if !matches!(key, Value::Null) {
+                let hk = HashableValue(key.clone());
+                ht.entry(hk).or_default().push(i);
+            }
+        }
+    }
+
+    // Probe phase: look up each left row's key in the hash table.
+    let mut result = Vec::new();
+    for left in left_rows {
+        if let Some(key) = left.get(left_key_idx) {
+            if matches!(key, Value::Null) {
+                continue; // NULL never matches in equijoin
+            }
+            let hk = HashableValue(key.clone());
+            if let Some(indices) = ht.get(&hk) {
+                for &ri in indices {
+                    result.push(concat_rows(left, &right_rows[ri]));
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Hash join for LEFT JOIN: all left rows appear; unmatched get NULL right side.
+fn hash_join_left(
+    left_rows: &[Row],
+    right_rows: &[Row],
+    left_key_idx: usize,
+    right_key_idx: usize,
+    right_col_count: usize,
+) -> Vec<Row> {
+    use std::collections::HashMap;
+
+    let mut ht: HashMap<HashableValue, Vec<usize>> = HashMap::with_capacity(right_rows.len());
+    for (i, row) in right_rows.iter().enumerate() {
+        if let Some(key) = row.get(right_key_idx) {
+            if !matches!(key, Value::Null) {
+                ht.entry(HashableValue(key.clone())).or_default().push(i);
+            }
+        }
+    }
+
+    let null_right: Row = vec![Value::Null; right_col_count];
+    let mut result = Vec::new();
+    for left in left_rows {
+        if let Some(key) = left.get(left_key_idx) {
+            if !matches!(key, Value::Null) {
+                if let Some(indices) = ht.get(&HashableValue(key.clone())) {
+                    for &ri in indices {
+                        result.push(concat_rows(left, &right_rows[ri]));
+                    }
+                    continue;
+                }
+            }
+        }
+        result.push(concat_rows(left, &null_right));
+    }
+    result
+}
+
+/// Wrapper for `Value` that implements `Hash + Eq` for use as HashMap key.
+/// NaN handling: f64 NaN is treated as equal to itself (not IEEE-compliant,
+/// but correct for SQL grouping semantics where NaN = NaN within a group).
+#[derive(Clone)]
+struct HashableValue(Value);
+
+impl std::hash::Hash for HashableValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(&self.0).hash(state);
+        match &self.0 {
+            Value::Null => {}
+            Value::Bool(b) => b.hash(state),
+            Value::Int(n) => n.hash(state),
+            Value::BigInt(n) => n.hash(state),
+            Value::Real(f) => f.to_bits().hash(state),
+            Value::Text(s) => s.hash(state),
+            Value::Bytes(b) => b.hash(state),
+            Value::Decimal(m, s) => {
+                m.hash(state);
+                s.hash(state);
+            }
+            Value::Date(d) => d.hash(state),
+            Value::Timestamp(t) => t.hash(state),
+            Value::Uuid(u) => u.hash(state),
+        }
+    }
+}
+
+impl PartialEq for HashableValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for HashableValue {}
 
 /// Concatenates two row slices into a new combined row.
 #[inline]
