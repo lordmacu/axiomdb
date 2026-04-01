@@ -1198,24 +1198,25 @@ mod tests {
 /// Returns `None` if the WHERE clause is too complex or involves non-numeric types.
 /// The returned predicate is used by `scan_table_filtered` to skip entire pages
 /// whose zone map (min/max) is outside the predicate range.
+/// Returns `(col_idx, predicate)` so the scan can verify the zone map's
+/// tracked column matches the predicate column.
 pub fn extract_zone_map_predicate(
     expr: &Expr,
     _columns: &[axiomdb_catalog::ColumnDef],
-) -> Option<axiomdb_storage::zone_map::ZoneMapPredicate> {
+) -> Option<(usize, axiomdb_storage::zone_map::ZoneMapPredicate)> {
     use axiomdb_storage::zone_map::ZoneMapPredicate;
 
     match expr {
         Expr::BinaryOp { op, left, right } => {
-            // AND: try to extract from both sides (first that works).
             if *op == BinaryOp::And {
                 return extract_zone_map_predicate(left, _columns)
                     .or_else(|| extract_zone_map_predicate(right, _columns));
             }
 
-            // Try col OP literal
-            let (val, is_reversed) = match (left.as_ref(), right.as_ref()) {
-                (Expr::Column { .. }, Expr::Literal(v)) => (v, false),
-                (Expr::Literal(v), Expr::Column { .. }) => (v, true),
+            // Extract col_idx from the Column expr.
+            let (col_idx, val, is_reversed) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Column { col_idx, .. }, Expr::Literal(v)) => (*col_idx, v, false),
+                (Expr::Literal(v), Expr::Column { col_idx, .. }) => (*col_idx, v, true),
                 _ => return None,
             };
 
@@ -1232,7 +1233,7 @@ pub fn extract_zone_map_predicate(
                 _ => return None,
             };
 
-            match (op, is_reversed) {
+            let pred = match (op, is_reversed) {
                 (BinaryOp::Eq, _) => Some(ZoneMapPredicate::Eq(int_val)),
                 (BinaryOp::Gt, false) | (BinaryOp::Lt, true) => Some(ZoneMapPredicate::Gt(int_val)),
                 (BinaryOp::GtEq, false) | (BinaryOp::LtEq, true) => {
@@ -1243,7 +1244,8 @@ pub fn extract_zone_map_predicate(
                     Some(ZoneMapPredicate::LtEq(int_val))
                 }
                 _ => None,
-            }
+            };
+            pred.map(|p| (col_idx, p))
         }
         _ => None,
     }
