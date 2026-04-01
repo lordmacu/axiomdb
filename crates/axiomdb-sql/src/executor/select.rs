@@ -35,6 +35,38 @@ fn execute_select_ctx(
 
         let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
 
+        // ── COUNT(*) fast path (Phase 8) ─────────────────────────────────
+        // Detect `SELECT COUNT(*) FROM table` with no WHERE, no GROUP BY,
+        // no HAVING, no JOIN. Use HeapChain::count_visible() which only
+        // checks RowHeader visibility — zero column decode, zero allocs.
+        // Inspired by InnoDB's stat_n_rows and SQLite's sqlite3BtreeCount.
+        if stmt.where_clause.is_none()
+            && stmt.group_by.is_empty()
+            && stmt.having.is_none()
+            && stmt.columns.len() == 1
+        {
+            if let Some(crate::ast::SelectItem::Expr {
+                expr:
+                    crate::expr::Expr::Function {
+                        ref name,
+                        ref args,
+                    },
+                ..
+            }) = stmt.columns.first()
+            {
+                if name.eq_ignore_ascii_case("count") && args.is_empty() {
+                    let count = HeapChain::count_visible(
+                        storage,
+                        resolved.def.data_root_page_id,
+                        snap,
+                    )?;
+                    let columns = vec![ColumnMeta::computed("count(*)", DataType::BigInt)];
+                    let rows = vec![vec![Value::BigInt(count as i64)]];
+                    return Ok(QueryResult::Rows { columns, rows });
+                }
+            }
+        }
+
         // ── Query planner: pick the best access method ────────────────────
         // Load per-column statistics for cost-based index selection (Phase 6.10).
         let table_stats: Vec<axiomdb_catalog::StatsDef> = {
