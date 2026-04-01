@@ -497,7 +497,7 @@ fn execute_select_with_joins_ctx(
         }
     }
 
-    let snap = txn.active_snapshot()?;
+    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
     let mut scanned: Vec<Vec<Row>> = Vec::with_capacity(all_resolved.len());
     for t in &all_resolved {
         let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap, None)?;
@@ -919,7 +919,7 @@ fn execute_select_with_joins(
     } // resolver dropped — storage immutable borrow released
 
     // Pre-scan all tables once (consistent snapshot for all).
-    let snap = txn.active_snapshot()?;
+    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
     let mut scanned: Vec<Vec<Row>> = Vec::with_capacity(all_resolved.len());
     for t in &all_resolved {
         let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap, None)?;
