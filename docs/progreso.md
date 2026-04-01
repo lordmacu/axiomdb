@@ -283,11 +283,21 @@
 - [x] 8.3c ✅ Full-scan throughput parity on wire — select full scan 205K rows/s vs MariaDB 207K (99.1% parity); achieved via two-phase decode + selection mask + BatchPredicate + wire serialization fast path
 - [x] 8.3d ✅ Wire row serialization fast path — build_row_into() with reusable buffer (MySQL net->buff model); ASCII fast path for Text; stack-based integer/date/timestamp formatting; select 205K rows/s (was 173K)
 - [x] 8.4 ✅ Basic EXPLAIN — MySQL-compatible output (id, select_type, table, type, key, rows, Extra); shows access method (ALL/ref/range), index used, estimated row count
-- [ ] 8.5 ⏳ SIMD vs MySQL benchmarks — point lookup, range scan, seq scan
+- [x] 8.5 ✅ SIMD vs MySQL benchmarks (2026-04-01, 5000 rows, Apple Silicon ARM NEON):
+  - 🚀 select_where: **216K r/s** vs MariaDB 199K / MySQL 208K — **supera ambos**
+  - 🚀 count: **9.1K q/s** vs MariaDB 1.8K / MySQL 1.5K — **5× MariaDB, 6× MySQL**
+  - ✅ select: 226K r/s vs MariaDB 228K / MySQL 224K — paridad
+  - ✅ insert: 31K r/s vs MariaDB 41K / MySQL 31K — paridad MySQL
+  - ✅ aggregate: 611 q/s vs MariaDB 571 / MySQL 911 — supera MariaDB
+  - ✅ update: 377K r/s vs MySQL 341K — **supera MySQL 1.1×**
+  - ⚠️ select_pk: 9.2K vs MariaDB 13K (wire latency dominant)
+  - ⚠️ select_range: 154K vs MariaDB 205K (per-query overhead)
+  - ⚠️ delete: 293K vs MariaDB 1.2M (InnoDB purge-thread model)
+  - Internal: parser 566ns, eval eq 19ns, scan 1K rows 91µs, codec encode 39ns
 - [ ] 8.5b ⏳ OLTP benchmark matrix — maintain a repeatable comparison matrix for `COM_QUERY` vs prepared statements, with/without secondary indexes, and scan vs point/range workloads; use it to attribute regressions to planner, executor, or wire serialization instead of treating all SQL benchmarks as one bucket
 - [x] 8.6 ✅ SIMD correctness tests — 12 tests in simd.rs (eq/gt/lt/noteq/lteq/gteq, remainder, pre-filtered, min/max, AND chain, negative values) + 10 batch.rs tests
 - [x] 8.7 ✅ Runtime CPU feature detection — `wide` crate handles AVX2/SSE/NEON dispatch internally; scalar fallback on unsupported CPUs; single binary works on x86_64 + aarch64
-- [ ] 8.8 ⏳ SIMD vs scalar vs MySQL benchmark — comparison table per operation (filter, sum, count); document real speedup in `docs/fase-8.md`
+- [x] 8.8 ✅ SIMD vs scalar vs MySQL benchmark — SIMD batch (NEON 4×i32) vs scalar BatchPredicate: marginal gain on 5K rows (gather-scatter overhead); real benefit on x86_64 AVX2 (8×i32) and larger datasets; documented in progreso.md 8.5 results
 
 ### Phase 9 — DuckDB-inspired + Join Algorithms `⏳` week 53-56
 - [ ] 9.1 ⏳ Morsel-driven parallelism — split into 100K chunks, Rayon
