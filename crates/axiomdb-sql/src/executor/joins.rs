@@ -34,7 +34,10 @@ fn apply_join(
         || right_rows.len() >= HASH_JOIN_MIN_ROWS;
 
     if is_large {
-        if let Some((l_idx, r_idx)) = detect_equijoin(condition, left_col_count) {
+        if let Some((l_idx, r_combined_idx)) = detect_equijoin(condition, left_col_count) {
+            // detect_equijoin returns indices in combined-row space.
+            // Convert right index to right-table-local space.
+            let r_idx = r_combined_idx - left_col_count;
             match join_type {
                 JoinType::Inner => {
                     return Ok(hash_join_inner(&left_rows, right_rows, l_idx, r_idx));
