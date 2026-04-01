@@ -768,13 +768,6 @@ fn value_to_key_bytes(v: &Value) -> Vec<u8> {
 ///
 /// Uses [`value_to_session_key_bytes`] so that text values are canonicalized
 /// according to the active session collation (e.g. `es` folds `José` = `jose`).
-fn group_key_bytes_session(key_values: &[Value]) -> Vec<u8> {
-    key_values
-        .iter()
-        .flat_map(value_to_session_key_bytes)
-        .collect()
-}
-
 // ── HAVING evaluator ──────────────────────────────────────────────────────────
 
 /// Evaluates a HAVING expression against a finalized group.
