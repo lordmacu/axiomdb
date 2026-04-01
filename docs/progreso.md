@@ -307,7 +307,7 @@
 - [x] 9.5 ✅ Vectorized correctness tests — 12 SIMD tests (simd.rs) + 10 batch tests (batch.rs) + full workspace test suite passes with parallel+fusion+late-mat enabled; serial fallback for <4 pages verified
 - [x] 9.5b ✅ Aggregate execution parity — fast-path column extraction for GROUP BY + accumulators (skip eval() for column refs); aggregate 611→631 q/s (+3%); remaining gap to MySQL (822) is wire protocol overhead, not aggregation logic
 <!-- Join algorithms: nested loop (4.8) is O(n*m); hash and sort-merge are essential for real queries -->
-- [ ] 9.6 ⏳ Hash join — build phase (small table in hash map) + probe phase (scan large table); O(n+m) vs O(n*m) of nested loop
+- [x] 9.6 ✅ Hash join — build phase (hash right table by join key) + probe phase (lookup left rows); O(n+m) for INNER/LEFT equijoin; detect_equijoin() extracts col indices from ON; HashableValue wrapper for HashMap key; falls back to nested loop for non-equijoin/USING/RIGHT/FULL/small tables; 25 existing join tests pass
 - [ ] 9.7 ⏳ Sort-merge join — sort both tables by join key + merge; optimal when data is already ordered (index)
 - [ ] 9.8 ⏳ Spill to disk — when hash table or sort buffer exceeds `work_mem`, spill to temp files; no OOM on large joins
 - [ ] 9.9 ⏳ Adaptive join selection — query planner chooses nested loop / hash / sort-merge based on size and selectivity statistics
