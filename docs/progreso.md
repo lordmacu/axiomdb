@@ -301,7 +301,7 @@
 
 ### Phase 9 — DuckDB-inspired + Join Algorithms `🔄` week 53-56
 - [x] 9.1 ✅ Morsel-driven parallelism — Rayon par_iter over heap pages; StorageEngine: Send+Sync; two-phase (serial page-ID collection + parallel decode+filter); BatchPredicate SIMD works across threads; falls back to serial for <4 pages; select_where 228K r/s maintained
-- [ ] 9.2 ⏳ Operator fusion — scan+filter+project in a single lazy loop
+- [x] 9.2 ✅ Operator fusion — unified decode mask (SELECT∪WHERE∪ORDER BY∪GROUP BY); scan+filter+project fused: decode_row_masked skips non-referenced columns, saving String/Text allocation for wide tables; wildcard SELECT * decodes all (correct fallback)
 - [ ] 9.3 ⏳ Late materialization — cheap predicates first, read expensive columns at the end
 - [ ] 9.4 ⏳ Benchmarks with parallelism — measure scaling with N cores
 - [ ] 9.5 ⏳ Vectorized correctness tests — verify that fusion/morsel/late-mat produce identical results to the basic executor
