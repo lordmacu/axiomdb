@@ -151,7 +151,7 @@ fn execute_select_ctx(
                     // Build WHERE column mask for two-phase decode:
                     // only decode columns referenced in WHERE first.
                     let n_cols = resolved.columns.len();
-                    let where_mask = {
+                    let _where_mask = {
                         let mut mask = vec![false; n_cols];
                         collect_expr_columns(&wc_clone, &mut mask);
                         // Only use two-phase if mask is selective (not all cols)
@@ -171,7 +171,10 @@ fn execute_select_ctx(
                         .collect();
                     let batch_pred =
                         crate::eval::batch::try_compile(&wc_clone, &col_types);
-                    TableEngine::scan_table_filtered(
+                    // Phase 9.1: parallel scan for large tables — distributes
+                    // per-page decode+filter across Rayon thread pool.
+                    // Falls back to serial for small tables (< 4 pages).
+                    TableEngine::scan_table_filtered_parallel(
                         storage,
                         &resolved.def,
                         &resolved.columns,
@@ -183,7 +186,6 @@ fn execute_select_ctx(
                             }
                         },
                         zm_pred.as_ref().map(|(ci, p)| (*ci, p)),
-                        where_mask.as_deref(),
                         batch_pred.as_ref(),
                     )?
                 } else {

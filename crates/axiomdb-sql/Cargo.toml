@@ -18,6 +18,7 @@ rand            = { workspace = true }
 bloomfilter     = { workspace = true }
 bytemuck        = { workspace = true }
 wide            = { workspace = true }
+rayon           = { workspace = true }
 chrono                = { version = "0.4", default-features = false, features = ["std"] }
 unicode-normalization = "0.1"
 
