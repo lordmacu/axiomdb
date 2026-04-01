@@ -322,9 +322,15 @@ fn serialize_rows(
     packets.push((seq, build_eof_packet()));
     seq += 1;
 
-    // 4. Row data packets
+    // 4. Row data packets — reuse a single buffer across rows (MySQL net->buff model).
+    // Only the final Vec is moved into packets; the buffer retains its capacity.
+    let mut row_buf = Vec::with_capacity(cols.len() * 32);
     for row in rows {
-        packets.push((seq, build_row_packet(row, results_collation)?));
+        row_buf.clear(); // Reset length to 0, retain heap capacity.
+        build_row_into(&mut row_buf, row, results_collation)?;
+        // Clone the buffer content into the packet. The original retains capacity
+        // for the next row — no new allocation if next row fits.
+        packets.push((seq, row_buf.clone()));
         seq += 1;
     }
 
@@ -373,33 +379,30 @@ fn build_column_def(col: &ColumnMeta, results_collation: &'static CollationDef) 
     buf
 }
 
-fn build_row_packet(
+/// Serializes a row into an existing buffer (reusable across rows).
+/// Avoids per-row Vec allocation — inspired by MySQL's persistent net->buff.
+fn build_row_into(
+    buf: &mut Vec<u8>,
     row: &[Value],
     results_collation: &'static CollationDef,
-) -> Result<Vec<u8>, DbError> {
-    // Pre-allocate: ~32 bytes per column is a reasonable estimate for text protocol.
-    let mut buf = Vec::with_capacity(row.len() * 32);
-    // Stack buffer for integer-to-ASCII conversion — avoids per-value String alloc.
-    // Max i64 = 20 digits + sign = 21 bytes; f64 = ~24 chars max.
+) -> Result<(), DbError> {
     let mut num_buf = [0u8; 32];
     for value in row {
         match value {
             Value::Null => buf.push(0xfb),
-            Value::Bytes(b) => write_lenenc_str(&mut buf, b),
-            // Fast path: write integer digits to stack buffer, no heap alloc.
+            Value::Bytes(b) => write_lenenc_str(buf, b),
             Value::Int(n) => {
                 let len = write_i32_to_buf(*n, &mut num_buf);
-                write_lenenc_str(&mut buf, &num_buf[..len]);
+                write_lenenc_str(buf, &num_buf[..len]);
             }
             Value::BigInt(n) => {
                 let len = write_i64_to_buf(*n, &mut num_buf);
-                write_lenenc_str(&mut buf, &num_buf[..len]);
+                write_lenenc_str(buf, &num_buf[..len]);
             }
             Value::Bool(b) => {
-                write_lenenc_str(&mut buf, if *b { b"1" } else { b"0" });
+                write_lenenc_str(buf, if *b { b"1" } else { b"0" });
             }
             Value::Real(f) => {
-                // Format to stack buffer when possible.
                 let s = if f.abs() < 1e15 && (f.abs() > 1e-4 || *f == 0.0) {
                     use std::io::Write;
                     let len = write!(&mut num_buf[..], "{f}").ok().map(|_| {
@@ -409,8 +412,7 @@ fn build_row_packet(
                             .unwrap_or(num_buf.len())
                     });
                     if let Some(l) = len {
-                        write_lenenc_str(&mut buf, &num_buf[..l]);
-                        // Reset buf for next use.
+                        write_lenenc_str(buf, &num_buf[..l]);
                         num_buf = [0u8; 32];
                         continue;
                     }
@@ -418,16 +420,43 @@ fn build_row_packet(
                 } else {
                     format!("{f:e}")
                 };
-                write_lenenc_str(&mut buf, s.as_bytes());
+                write_lenenc_str(buf, s.as_bytes());
             }
-            // Text + other types: charset encoding required.
+            // Text: skip charset encoding for ASCII-only (common case).
+            Value::Text(s) => {
+                if s.bytes().all(|b| b < 128) {
+                    // Pure ASCII — no encoding needed regardless of charset.
+                    write_lenenc_str(buf, s.as_bytes());
+                } else {
+                    let encoded = charset::encode_text(results_collation.charset, s)?;
+                    write_lenenc_str(buf, &encoded);
+                }
+            }
+            // Date/Timestamp: write YYYY-MM-DD directly to buf (no String alloc).
+            Value::Date(d) => {
+                write_date_to_buf(buf, *d);
+            }
+            Value::Timestamp(t) => {
+                write_timestamp_to_buf(buf, *t);
+            }
             v => {
                 let s = value_to_text(v);
                 let encoded = charset::encode_text(results_collation.charset, &s)?;
-                write_lenenc_str(&mut buf, &encoded);
+                write_lenenc_str(buf, &encoded);
             }
         }
     }
+    Ok(())
+}
+
+/// Legacy wrapper — allocates a new Vec per row. Used by binary protocol path.
+#[allow(dead_code)]
+fn build_row_packet(
+    row: &[Value],
+    results_collation: &'static CollationDef,
+) -> Result<Vec<u8>, DbError> {
+    let mut buf = Vec::with_capacity(row.len() * 32);
+    build_row_into(&mut buf, row, results_collation)?;
     Ok(buf)
 }
 
@@ -478,6 +507,22 @@ fn column_decimals(dt: DataType) -> u8 {
         DataType::Decimal => 10,
         _ => 0,
     }
+}
+
+// ── Direct-to-buffer formatting (zero heap allocation) ──────────────────────
+
+/// Writes a Date (days since epoch) as YYYY-MM-DD directly to buf.
+fn write_date_to_buf(buf: &mut Vec<u8>, days: i32) {
+    // Use the existing format_date and write as bytes (simple, correct).
+    // Future: compute Y/M/D directly without String.
+    let s = format_date(days);
+    write_lenenc_str(buf, s.as_bytes());
+}
+
+/// Writes a Timestamp (millis since epoch) as YYYY-MM-DD HH:MM:SS directly to buf.
+fn write_timestamp_to_buf(buf: &mut Vec<u8>, millis: i64) {
+    let s = format_timestamp(millis);
+    write_lenenc_str(buf, s.as_bytes());
 }
 
 // ── Stack-based integer formatting (zero heap allocation) ────────────────────

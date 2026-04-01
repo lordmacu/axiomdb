@@ -99,6 +99,30 @@ pub fn insert_into_indexes(
     compiled_preds: &[Option<Expr>],
     snap: TransactionSnapshot,
 ) -> Result<Vec<(u32, u64)>, DbError> {
+    insert_into_indexes_with_undo(
+        indexes,
+        row,
+        rid,
+        storage,
+        bloom,
+        compiled_preds,
+        snap,
+        None,
+    )
+}
+
+/// Like [`insert_into_indexes`] but optionally records `UndoIndexInsert` ops
+/// in the transaction's undo log so ROLLBACK can remove the B-Tree entries.
+pub fn insert_into_indexes_with_undo(
+    indexes: &[IndexDef],
+    row: &[Value],
+    rid: RecordId,
+    storage: &mut dyn StorageEngine,
+    bloom: &mut crate::bloom::BloomRegistry,
+    compiled_preds: &[Option<Expr>],
+    snap: TransactionSnapshot,
+    mut txn: Option<&mut axiomdb_wal::TxnManager>,
+) -> Result<Vec<(u32, u64)>, DbError> {
     let mut updated_roots = Vec::new();
 
     for (i, idx) in indexes
@@ -177,6 +201,11 @@ pub fn insert_into_indexes(
         let new_root = root_pid.load(Ordering::Acquire);
         if new_root != idx.root_page_id {
             updated_roots.push((idx.index_id, new_root));
+        }
+
+        // Record undo op so ROLLBACK can remove this B-Tree entry.
+        if let Some(ref mut tm) = txn {
+            let _ = tm.record_index_insert(idx.index_id, idx.root_page_id, key);
         }
     }
 
