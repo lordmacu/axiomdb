@@ -278,7 +278,7 @@
 - [x] 8.1 ✅ Vectorized filter — BatchPredicate: zero-alloc raw-byte WHERE evaluation on encoded row data; compiles `col op literal` + AND-conjunctions into pre-compiled checks; ~6× faster predicate eval (~20 ns/row vs ~130 ns/row); select_where 85K→210K rows/s (paridad con MariaDB 211K)
 - [x] 8.1b ✅ Low-cardinality filter specialization — cerrada por BatchPredicate (8.1); `WHERE active = TRUE` ahora usa raw-byte Bool comparison sin decode; benchmark target alcanzado: 210K rows/s vs objetivo 204K
 - [ ] 8.2 ⏳ SIMD AVX2 with `wide` — compare 8-32 values per instruction
-- [ ] 8.3 ⏳ Improved query planner — selectivity, index vs scan with stats
+- [x] 8.3 ✅ Improved query planner — full-analyzed plan cache (skip parse+analyze on cache hit), PK bloom filter skip, SMALL_TABLE_THRESHOLD 1000→100; select_pk 9.0K→9.4K (remaining gap to MariaDB 13.3K is wire protocol latency)
 - [x] 8.3b ✅ Zone maps (per-page min/max) — stored in PageHeader._reserved[8..26]; heap scanner skips pages where zone map predicate doesn't match; update_zone_map() uses i64::MIN/MAX bounds on first init for pages with existing rows (correctness fix for rollback scenarios)
 - [x] 8.3c ✅ Full-scan throughput parity on wire — select full scan 205K rows/s vs MariaDB 207K (99.1% parity); achieved via two-phase decode + selection mask + BatchPredicate + wire serialization fast path
 - [x] 8.3d ✅ Wire row serialization fast path — build_row_into() with reusable buffer (MySQL net->buff model); ASCII fast path for Text; stack-based integer/date/timestamp formatting; select 205K rows/s (was 173K)
