@@ -41,7 +41,7 @@ const DEFAULT_NUM_DISTINCT: i64 = 200;
 
 /// Tables with fewer than this many rows always use a full scan.
 /// Index overhead dominates for very small tables.
-const SMALL_TABLE_THRESHOLD: u64 = 1_000;
+const SMALL_TABLE_THRESHOLD: u64 = 100;
 
 // ── AccessMethod ─────────────────────────────────────────────────────────────
 

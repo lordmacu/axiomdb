@@ -203,7 +203,12 @@ fn execute_select_ctx(
                 // the bloom (one entry per row), but the lookup key here is the bare value.
                 // Checking a bare value key against a bloom populated with key||RID entries
                 // produces false negatives, so we skip the bloom check for non-unique indexes.
-                if index_def.is_unique && !bloom.might_exist(index_def.index_id, key) {
+                // Skip bloom for primary key: deferred deletion model guarantees the
+                // key is in the B-Tree after INSERT, so the bloom check is wasted cycles.
+                if index_def.is_unique
+                    && !index_def.is_primary
+                    && !bloom.might_exist(index_def.index_id, key)
+                {
                     vec![]
                 } else if index_def.is_unique {
                     // Unique index: exact key lookup → at most one RecordId.

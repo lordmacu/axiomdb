@@ -660,28 +660,42 @@ pub async fn handle_connection_with_timeouts(
                                     if let Some((cached_stmt, _params)) =
                                         plan_cache.lookup(stmt_sql, sv)
                                     {
-                                        // Cache hit: skip parse, but run full pipeline
-                                        // (snapshot + analyze + execute). Like PostgreSQL,
-                                        // every execution gets a fresh snapshot.
-                                        guard.execute_cached_stmt(
-                                            stmt_sql,
-                                            cached_stmt,
-                                            &mut session,
-                                            &mut schema_cache,
-                                        )
+                                        // Cache hit: skip parse AND analyze — the cached
+                                        // Stmt is fully analyzed (col_idx resolved, types
+                                        // checked). substitute_params already replaced
+                                        // Param nodes with Literal values. Execute directly.
+                                        guard.execute_stmt(cached_stmt, &mut session)
                                     } else {
                                         let result = guard.execute_query(
                                             stmt_sql,
                                             &mut session,
                                             &mut schema_cache,
                                         );
+                                        // On success, cache the ANALYZED Stmt (not just parsed).
+                                        // Parse the normalized SQL → analyze → store analyzed.
+                                        // The extra analyze (~1 µs) runs once per unique query
+                                        // pattern; all subsequent hits skip both parse AND analyze.
                                         if result.is_ok() {
                                             let (norm_sql, _) =
                                                 super::plan_cache::normalize_sql(stmt_sql);
                                             if let Ok(norm_stmt) =
                                                 axiomdb_sql::parser::parse(&norm_sql, None)
                                             {
-                                                plan_cache.store(stmt_sql, &norm_stmt, sv);
+                                                // Analyze the normalized Stmt so the cache
+                                                // stores resolved col_idx + type info.
+                                                let snap = guard.txn_snapshot_for_cache();
+                                                if let Ok(analyzed) =
+                                                    axiomdb_sql::analyze_cached_with_defaults(
+                                                        norm_stmt,
+                                                        guard.storage_ref(),
+                                                        snap,
+                                                        session.effective_database(),
+                                                        session.current_schema(),
+                                                        &mut schema_cache,
+                                                    )
+                                                {
+                                                    plan_cache.store(stmt_sql, &analyzed, sv);
+                                                }
                                             }
                                         }
                                         result
