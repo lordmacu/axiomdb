@@ -209,7 +209,7 @@ impl TableEngine {
         columns: &[ColumnDef],
         snap: TransactionSnapshot,
         mut predicate: F,
-        zone_map_pred: Option<&axiomdb_storage::zone_map::ZoneMapPredicate>,
+        zone_map_pred: Option<(usize, &axiomdb_storage::zone_map::ZoneMapPredicate)>,
         where_col_mask: Option<&[bool]>,
     ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError>
     where
@@ -232,9 +232,12 @@ impl TableEngine {
             }
 
             // Zone map skip (Phase 8.3b).
-            if let Some(zmp) = zone_map_pred {
+            // Only skip if the zone map's tracked column matches the predicate column.
+            if let Some((pred_col_idx, zmp)) = zone_map_pred {
                 if let Some(zm) = axiomdb_storage::zone_map::read_zone_map(&page) {
-                    if !axiomdb_storage::zone_map::zone_map_might_match(&zm, zmp) {
+                    if zm.col_idx as usize == pred_col_idx
+                        && !axiomdb_storage::zone_map::zone_map_might_match(&zm, zmp)
+                    {
                         current = next;
                         continue;
                     }

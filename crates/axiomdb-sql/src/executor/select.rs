@@ -172,7 +172,7 @@ fn execute_select_ctx(
                                 Err(_) => true,
                             }
                         },
-                        zm_pred.as_ref(),
+                        zm_pred.as_ref().map(|(ci, p)| (*ci, p)),
                         where_mask.as_deref(),
                     )?
                 } else {
