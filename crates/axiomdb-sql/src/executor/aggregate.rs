@@ -764,10 +764,6 @@ fn value_to_key_bytes(v: &Value) -> Vec<u8> {
     buf
 }
 
-/// Session-aware GROUP BY key serialization.
-///
-/// Uses [`value_to_session_key_bytes`] so that text values are canonicalized
-/// according to the active session collation (e.g. `es` folds `José` = `jose`).
 // ── HAVING evaluator ──────────────────────────────────────────────────────────
 
 /// Evaluates a HAVING expression against a finalized group.
