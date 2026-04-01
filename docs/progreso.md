@@ -274,15 +274,15 @@
 
 ## BLOCK 2 — Execution Optimizations (Phases 8-10)
 
-### Phase 8 — SIMD Optimizations `⏳` week 49-52
-- [ ] 8.1 ⏳ Vectorized filter — evaluate predicates in chunks of 1024 rows
-- [ ] 8.1b ⏳ Low-cardinality filter specialization — add a fast vectorized path for `BOOL` / low-cardinality predicates such as `WHERE active = TRUE`; benchmark target: close the current scan-filter gap seen in `local_bench.py --scenario select_where --rows 5000` (AxiomDB 85.1K rows/s vs MariaDB 204K / MySQL 189K) when no secondary index exists
+### Phase 8 — SIMD Optimizations `🔄` week 49-52
+- [x] 8.1 ✅ Vectorized filter — BatchPredicate: zero-alloc raw-byte WHERE evaluation on encoded row data; compiles `col op literal` + AND-conjunctions into pre-compiled checks; ~6× faster predicate eval (~20 ns/row vs ~130 ns/row); select_where 85K→210K rows/s (paridad con MariaDB 211K)
+- [x] 8.1b ✅ Low-cardinality filter specialization — cerrada por BatchPredicate (8.1); `WHERE active = TRUE` ahora usa raw-byte Bool comparison sin decode; benchmark target alcanzado: 210K rows/s vs objetivo 204K
 - [ ] 8.2 ⏳ SIMD AVX2 with `wide` — compare 8-32 values per instruction
 - [ ] 8.3 ⏳ Improved query planner — selectivity, index vs scan with stats
-- [ ] 8.3b ⏳ Zone maps (per-page min/max) — store `min[col]`/`max[col]` in every heap page header for each column; heap scanner skips pages where `max < literal` or `min > literal` for equality/range predicates; zero separate index structure, always maintained on INSERT/UPDATE, ~8 bytes per column per page; distinct from BRIN (11.1b) which is opt-in and coarser (per-block-range, not per-page); MySQL 8 and PostgreSQL 15 have no equivalent built-in per-page skip — InnoDB relies entirely on B-Tree secondary indexes; primary fix for UPDATE/DELETE on unindexed columns (benchmark: 8-16x gap vs SQLite on `WHERE age = 30` without index)
-- [ ] 8.3c ⏳ Full-scan throughput parity on wire — close the remaining 15-20% gap on `SELECT *` full scans over the MySQL protocol by combining vectorized scan, less row materialization, and cheaper wire serialization; identified by `local_bench.py --scenario select --rows 5000` (2026-03-26), AxiomDB 173K rows/s vs MariaDB 216K / MySQL 212K
-- [ ] 8.3d ⏳ Wire row serialization fast path — specialize row/result encoding for simple fixed-schema result sets (`SELECT *`, PK lookups) to reduce per-row `Value` materialization and MySQL packet assembly overhead; target benchmarks: `local_bench.py --scenario select --rows 5000` and `select_pk`, where executor/storage is not the only remaining gap
-- [ ] 8.4 ⏳ Basic EXPLAIN — show chosen plan (join type, index or full scan, estimated cost)
+- [x] 8.3b ✅ Zone maps (per-page min/max) — stored in PageHeader._reserved[8..26]; heap scanner skips pages where zone map predicate doesn't match; update_zone_map() uses i64::MIN/MAX bounds on first init for pages with existing rows (correctness fix for rollback scenarios)
+- [x] 8.3c ✅ Full-scan throughput parity on wire — select full scan 205K rows/s vs MariaDB 207K (99.1% parity); achieved via two-phase decode + selection mask + BatchPredicate + wire serialization fast path
+- [x] 8.3d ✅ Wire row serialization fast path — build_row_into() with reusable buffer (MySQL net->buff model); ASCII fast path for Text; stack-based integer/date/timestamp formatting; select 205K rows/s (was 173K)
+- [x] 8.4 ✅ Basic EXPLAIN — MySQL-compatible output (id, select_type, table, type, key, rows, Extra); shows access method (ALL/ref/range), index used, estimated row count
 - [ ] 8.5 ⏳ SIMD vs MySQL benchmarks — point lookup, range scan, seq scan
 - [ ] 8.5b ⏳ OLTP benchmark matrix — maintain a repeatable comparison matrix for `COM_QUERY` vs prepared statements, with/without secondary indexes, and scan vs point/range workloads; use it to attribute regressions to planner, executor, or wire serialization instead of treating all SQL benchmarks as one bucket
 - [ ] 8.6 ⏳ SIMD correctness tests — verify that SIMD results are identical to row-by-row without SIMD
