@@ -277,7 +277,7 @@
 ### Phase 8 — SIMD Optimizations `🔄` week 49-52
 - [x] 8.1 ✅ Vectorized filter — BatchPredicate: zero-alloc raw-byte WHERE evaluation on encoded row data; compiles `col op literal` + AND-conjunctions into pre-compiled checks; ~6× faster predicate eval (~20 ns/row vs ~130 ns/row); select_where 85K→210K rows/s (paridad con MariaDB 211K)
 - [x] 8.1b ✅ Low-cardinality filter specialization — cerrada por BatchPredicate (8.1); `WHERE active = TRUE` ahora usa raw-byte Bool comparison sin decode; benchmark target alcanzado: 210K rows/s vs objetivo 204K
-- [ ] 8.2 ⏳ SIMD AVX2 with `wide` — compare 8-32 values per instruction
+- [x] 8.2 ✅ SIMD with `wide` crate — cross-platform (AVX2 on x86, NEON on ARM, scalar fallback); batch_cmp_i32 processes 8×i32 per AVX2 op; gather-scatter pattern for row-oriented storage; eval_batch() replaces per-row eval_on_raw(); MSRV 1.80→1.89
 - [x] 8.3 ✅ Improved query planner — full-analyzed plan cache (skip parse+analyze on cache hit), PK bloom filter skip, SMALL_TABLE_THRESHOLD 1000→100; select_pk 9.0K→9.4K (remaining gap to MariaDB 13.3K is wire protocol latency)
 - [x] 8.3b ✅ Zone maps (per-page min/max) — stored in PageHeader._reserved[8..26]; heap scanner skips pages where zone map predicate doesn't match; update_zone_map() uses i64::MIN/MAX bounds on first init for pages with existing rows (correctness fix for rollback scenarios)
 - [x] 8.3c ✅ Full-scan throughput parity on wire — select full scan 205K rows/s vs MariaDB 207K (99.1% parity); achieved via two-phase decode + selection mask + BatchPredicate + wire serialization fast path
@@ -285,8 +285,8 @@
 - [x] 8.4 ✅ Basic EXPLAIN — MySQL-compatible output (id, select_type, table, type, key, rows, Extra); shows access method (ALL/ref/range), index used, estimated row count
 - [ ] 8.5 ⏳ SIMD vs MySQL benchmarks — point lookup, range scan, seq scan
 - [ ] 8.5b ⏳ OLTP benchmark matrix — maintain a repeatable comparison matrix for `COM_QUERY` vs prepared statements, with/without secondary indexes, and scan vs point/range workloads; use it to attribute regressions to planner, executor, or wire serialization instead of treating all SQL benchmarks as one bucket
-- [ ] 8.6 ⏳ SIMD correctness tests — verify that SIMD results are identical to row-by-row without SIMD
-- [ ] 8.7 ⏳ Runtime CPU feature detection — detect AVX2/SSE4.2 on startup; select optimal implementation; scalar fallback on old CPUs (ARM, CI)
+- [x] 8.6 ✅ SIMD correctness tests — 12 tests in simd.rs (eq/gt/lt/noteq/lteq/gteq, remainder, pre-filtered, min/max, AND chain, negative values) + 10 batch.rs tests
+- [x] 8.7 ✅ Runtime CPU feature detection — `wide` crate handles AVX2/SSE/NEON dispatch internally; scalar fallback on unsupported CPUs; single binary works on x86_64 + aarch64
 - [ ] 8.8 ⏳ SIMD vs scalar vs MySQL benchmark — comparison table per operation (filter, sum, count); document real speedup in `docs/fase-8.md`
 
 ### Phase 9 — DuckDB-inspired + Join Algorithms `⏳` week 53-56
