@@ -1199,32 +1199,50 @@ fn execute_select_grouped_hash(
     // One-pass hash aggregation.
     let mut groups: HashMap<Vec<u8>, GroupState> = HashMap::new();
 
+    // Gap Closure Opt 3: reuse key_buf across iterations to eliminate
+    // per-row Vec allocation for GROUP BY key serialization.
+    // DuckDB uses arena allocators; PostgreSQL uses memory contexts.
+    // We reuse a single Vec<u8> — clear + extend on each row,
+    // clone only when inserting a NEW group into the HashMap.
+    let mut key_buf: Vec<u8> = Vec::with_capacity(64);
+    let mut key_values_buf: Vec<Value> = Vec::with_capacity(stmt.group_by.len());
+
     for row in &combined_rows {
-        // Evaluate GROUP BY expressions → key values.
-        // Fast path: direct column access (no eval overhead).
-        let key_values: Vec<Value> = if let Some(ref idxs) = group_by_col_idxs {
-            idxs.iter()
-                .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
-                .collect()
+        // Evaluate GROUP BY expressions → key values (reuse buffer).
+        key_values_buf.clear();
+        if let Some(ref idxs) = group_by_col_idxs {
+            for &i in idxs {
+                key_values_buf.push(row.get(i).cloned().unwrap_or(Value::Null));
+            }
         } else {
-            stmt.group_by
-                .iter()
-                .map(|e| eval(e, row))
-                .collect::<Result<_, _>>()?
-        };
+            for e in &stmt.group_by {
+                key_values_buf.push(eval(e, row)?);
+            }
+        }
 
-        // Session-aware: folds text under Es so "José" and "jose" share a group.
-        let key_bytes = group_key_bytes_session(&key_values);
+        // Serialize key into reused buffer (no allocation if capacity sufficient).
+        key_buf.clear();
+        for v in &key_values_buf {
+            key_buf.extend_from_slice(&value_to_session_key_bytes(v));
+        }
 
-        let state = groups.entry(key_bytes).or_insert_with(|| GroupState {
-            key_values: key_values.clone(),
-            representative_row: row.clone(),
-            accumulators: agg_exprs.iter().map(AggAccumulator::new).collect(),
-        });
-
-        // Update each accumulator.
-        for (acc, agg) in state.accumulators.iter_mut().zip(&agg_exprs) {
-            acc.update(row, agg)?;
+        // HashMap lookup with borrowed key. Only clone on NEW group insertion.
+        if let Some(state) = groups.get_mut(key_buf.as_slice()) {
+            // Existing group — update accumulators, zero allocation.
+            for (acc, agg) in state.accumulators.iter_mut().zip(&agg_exprs) {
+                acc.update(row, agg)?;
+            }
+        } else {
+            // New group — must clone key and values for HashMap ownership.
+            let mut state = GroupState {
+                key_values: key_values_buf.clone(),
+                representative_row: row.clone(),
+                accumulators: agg_exprs.iter().map(AggAccumulator::new).collect(),
+            };
+            for (acc, agg) in state.accumulators.iter_mut().zip(&agg_exprs) {
+                acc.update(row, agg)?;
+            }
+            groups.insert(key_buf.clone(), state);
         }
     }
 
