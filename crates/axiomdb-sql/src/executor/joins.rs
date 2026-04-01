@@ -370,6 +370,143 @@ impl PartialEq for HashableValue {
 
 impl Eq for HashableValue {}
 
+// ── Sort-Merge Join (Phase 9.7) ─────────────────────────────────────────────
+
+/// Sort-merge join for INNER JOIN: sort both sides by join key, then merge.
+/// O(n log n + m log m) — optimal when data is already sorted (e.g., from index).
+///
+/// PostgreSQL uses this when both sides can deliver sorted output
+/// (nodeMergejoin.c). For AxiomDB, this is a fallback when hash join is
+/// not preferred (e.g., very large tables that don't fit in memory).
+#[allow(dead_code)] // Available for Phase 9.9 (adaptive join selection)
+fn sort_merge_join_inner(
+    left_rows: &mut [Row],
+    right_rows: &mut [Row],
+    left_key_idx: usize,
+    right_key_idx: usize,
+) -> Vec<Row> {
+    // Sort both sides by join key.
+    left_rows.sort_by(|a, b| cmp_values_for_join(&a[left_key_idx], &b[left_key_idx]));
+    right_rows.sort_by(|a, b| cmp_values_for_join(&a[right_key_idx], &b[right_key_idx]));
+
+    let mut result = Vec::new();
+    let mut ri = 0;
+
+    for left in left_rows.iter() {
+        let lk = &left[left_key_idx];
+        if matches!(lk, Value::Null) {
+            continue;
+        }
+
+        // Advance right pointer past smaller keys.
+        while ri < right_rows.len() {
+            let rk = &right_rows[ri][right_key_idx];
+            if matches!(rk, Value::Null) {
+                ri += 1;
+                continue;
+            }
+            if cmp_values_for_join(rk, lk) == std::cmp::Ordering::Less {
+                ri += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Emit all right rows with equal key (handle duplicates — mark and restore).
+        let mark = ri;
+        while ri < right_rows.len() {
+            let rk = &right_rows[ri][right_key_idx];
+            if cmp_values_for_join(rk, lk) != std::cmp::Ordering::Equal {
+                break;
+            }
+            result.push(concat_rows(left, &right_rows[ri]));
+            ri += 1;
+        }
+        // Restore to mark for next left row with same key (PostgreSQL mark/restore pattern).
+        ri = mark;
+    }
+
+    result
+}
+
+/// Sort-merge join for LEFT JOIN: all left rows appear, unmatched get NULLs.
+#[allow(dead_code)] // Available for Phase 9.9 (adaptive join selection)
+fn sort_merge_join_left(
+    left_rows: &mut [Row],
+    right_rows: &mut [Row],
+    left_key_idx: usize,
+    right_key_idx: usize,
+    right_col_count: usize,
+) -> Vec<Row> {
+    left_rows.sort_by(|a, b| cmp_values_for_join(&a[left_key_idx], &b[left_key_idx]));
+    right_rows.sort_by(|a, b| cmp_values_for_join(&a[right_key_idx], &b[right_key_idx]));
+
+    let null_right: Row = vec![Value::Null; right_col_count];
+    let mut result = Vec::new();
+    let mut ri = 0;
+
+    for left in left_rows.iter() {
+        let lk = &left[left_key_idx];
+        if matches!(lk, Value::Null) {
+            result.push(concat_rows(left, &null_right));
+            continue;
+        }
+
+        while ri < right_rows.len() {
+            let rk = &right_rows[ri][right_key_idx];
+            if matches!(rk, Value::Null) {
+                ri += 1;
+                continue;
+            }
+            if cmp_values_for_join(rk, lk) == std::cmp::Ordering::Less {
+                ri += 1;
+            } else {
+                break;
+            }
+        }
+
+        let mark = ri;
+        let mut matched = false;
+        while ri < right_rows.len() {
+            let rk = &right_rows[ri][right_key_idx];
+            if cmp_values_for_join(rk, lk) != std::cmp::Ordering::Equal {
+                break;
+            }
+            result.push(concat_rows(left, &right_rows[ri]));
+            matched = true;
+            ri += 1;
+        }
+        ri = mark;
+
+        if !matched {
+            result.push(concat_rows(left, &null_right));
+        }
+    }
+
+    result
+}
+
+/// Compares two Values for sort-merge join ordering.
+/// NULL is ordered last (greatest) to match SQL semantics.
+#[allow(dead_code)]
+fn cmp_values_for_join(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        (Value::Int(a), Value::Int(b)) => a.cmp(b),
+        (Value::BigInt(a), Value::BigInt(b)) => a.cmp(b),
+        (Value::Real(a), Value::Real(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+        (Value::Text(a), Value::Text(b)) => a.cmp(b),
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (Value::Date(a), Value::Date(b)) => a.cmp(b),
+        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+        (Value::Decimal(am, _as), Value::Decimal(bm, _bs)) => am.cmp(bm),
+        _ => Ordering::Equal, // mixed types: treat as equal (shouldn't happen in well-typed SQL)
+    }
+}
+
 /// Concatenates two row slices into a new combined row.
 #[inline]
 fn concat_rows(left: &[Value], right: &[Value]) -> Row {
