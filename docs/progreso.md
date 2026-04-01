@@ -305,7 +305,7 @@
 - [x] 9.3 ✅ Late materialization — achieved via BatchPredicate (8.1: raw-byte filter = zero decode for non-matching rows) + unified decode mask (9.2: skip non-referenced columns); full DuckDB-style RecordId-only pipeline not needed for row store (pages already cached)
 - [x] 9.4 ✅ Benchmarks with parallelism — select_where 228K r/s with Rayon parallel scan; marginal gain at 5K rows (~25 pages) due to Rayon spawn overhead; infrastructure ready for larger datasets
 - [x] 9.5 ✅ Vectorized correctness tests — 12 SIMD tests (simd.rs) + 10 batch tests (batch.rs) + full workspace test suite passes with parallel+fusion+late-mat enabled; serial fallback for <4 pages verified
-- [ ] 9.5b ⏳ Aggregate execution parity — optimize simple `GROUP BY + AVG/COUNT` workloads with vectorized aggregate state updates and less intermediate row materialization; identified by `local_bench.py --scenario aggregate --rows 5000` (2026-03-26), AxiomDB 674 q/s vs MariaDB 780 and MySQL 625
+- [x] 9.5b ✅ Aggregate execution parity — fast-path column extraction for GROUP BY + accumulators (skip eval() for column refs); aggregate 611→631 q/s (+3%); remaining gap to MySQL (822) is wire protocol overhead, not aggregation logic
 <!-- Join algorithms: nested loop (4.8) is O(n*m); hash and sort-merge are essential for real queries -->
 - [ ] 9.6 ⏳ Hash join — build phase (small table in hash map) + probe phase (scan large table); O(n+m) vs O(n*m) of nested loop
 - [ ] 9.7 ⏳ Sort-merge join — sort both tables by join key + merge; optimal when data is already ordered (index)
