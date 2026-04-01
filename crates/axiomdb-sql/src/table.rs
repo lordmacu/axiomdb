@@ -265,52 +265,67 @@ impl TableEngine {
             }
 
             // ── Phase 2: Predicate evaluation + decode for visible slots ──
-            for &(slot_id, off, len) in &visible_slots {
-                let row_data = &page.as_bytes()[off + size_of::<RowHeader>()..off + len];
+            // ── Phase 2: Predicate evaluation + decode ────────────────────
+            //
+            // Phase 8.2 SIMD batch path: gather column values from all visible
+            // rows into contiguous arrays, SIMD-compare (8×i32 on AVX2, 4×i32
+            // on NEON), decode only passing rows. Falls back to per-row scalar
+            // when batch_pred is None.
+            if let Some(bp) = batch_pred {
+                let page_bytes = page.as_bytes();
+                let hdr = size_of::<RowHeader>();
+                let row_slices: Vec<&[u8]> = visible_slots
+                    .iter()
+                    .map(|&(_, off, len)| &page_bytes[off + hdr..off + len])
+                    .collect();
+                let mut passed = vec![true; row_slices.len()];
+                bp.eval_batch(&row_slices, &mut passed);
 
-                // Fast path (Phase 8.1): BatchPredicate evaluates on raw bytes —
-                // zero allocation, no Value construction, no Expr tree walk.
-                // ~6× faster than decode+eval for simple col-op-literal predicates.
-                if let Some(bp) = batch_pred {
-                    if !bp.eval_on_raw(row_data) {
-                        continue;
+                for (i, &(slot_id, off, len)) in visible_slots.iter().enumerate() {
+                    if passed[i] {
+                        let row_data = &page_bytes[off + hdr..off + len];
+                        let values = decode_row(row_data, &col_types)?;
+                        result.push((
+                            RecordId {
+                                page_id: current,
+                                slot_id,
+                            },
+                            values,
+                        ));
                     }
-                    let values = decode_row(row_data, &col_types)?;
-                    result.push((
-                        RecordId {
-                            page_id: current,
-                            slot_id,
-                        },
-                        values,
-                    ));
-                } else if has_two_phase {
-                    // Phase 2a: decode only WHERE columns.
-                    let partial = decode_row_masked(row_data, &col_types, where_col_mask.unwrap())?;
-                    if !predicate(&partial) {
-                        continue;
+                }
+            } else {
+                // Scalar fallback: per-row decode + predicate evaluation.
+                for &(slot_id, off, len) in &visible_slots {
+                    let row_data = &page.as_bytes()[off + size_of::<RowHeader>()..off + len];
+
+                    if has_two_phase {
+                        let partial =
+                            decode_row_masked(row_data, &col_types, where_col_mask.unwrap())?;
+                        if !predicate(&partial) {
+                            continue;
+                        }
+                        let values = decode_row(row_data, &col_types)?;
+                        result.push((
+                            RecordId {
+                                page_id: current,
+                                slot_id,
+                            },
+                            values,
+                        ));
+                    } else {
+                        let values = decode_row(row_data, &col_types)?;
+                        if !predicate(&values) {
+                            continue;
+                        }
+                        result.push((
+                            RecordId {
+                                page_id: current,
+                                slot_id,
+                            },
+                            values,
+                        ));
                     }
-                    // Phase 2b: full decode for passing rows.
-                    let values = decode_row(row_data, &col_types)?;
-                    result.push((
-                        RecordId {
-                            page_id: current,
-                            slot_id,
-                        },
-                        values,
-                    ));
-                } else {
-                    // No mask: single-pass full decode + predicate.
-                    let values = decode_row(row_data, &col_types)?;
-                    if !predicate(&values) {
-                        continue;
-                    }
-                    result.push((
-                        RecordId {
-                            page_id: current,
-                            slot_id,
-                        },
-                        values,
-                    ));
                 }
             }
 

@@ -23,7 +23,7 @@ use crate::expr::{BinaryOp, Expr};
 
 /// Comparison operator for raw-byte evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CmpOp {
+pub enum CmpOp {
     Eq,
     NotEq,
     Lt,
@@ -159,6 +159,140 @@ impl BatchPredicate {
             }
             _ => false, // unsupported type — should not happen (try_compile rejects)
         }
+    }
+
+    /// Evaluates the predicate on multiple rows simultaneously using SIMD.
+    ///
+    /// **Gather-scatter pattern** (DuckDB-inspired, adapted for row store):
+    /// 1. Gather: extract target column values from all rows into a contiguous array
+    /// 2. SIMD compare: batch-compare the array against the literal (8 values per op on AVX2)
+    /// 3. Scatter: write boolean results back to the output mask
+    ///
+    /// `row_slices[i]` is the raw row data (after RowHeader) for the i-th visible slot.
+    /// `output[i]` is set to `false` for rows that fail the predicate.
+    /// Must be initialized to `true` for all elements before calling.
+    pub fn eval_batch(&self, row_slices: &[&[u8]], output: &mut [bool]) {
+        debug_assert_eq!(row_slices.len(), output.len());
+        let n = row_slices.len();
+        if n == 0 {
+            return;
+        }
+
+        for check in &self.checks {
+            self.eval_check_batch(row_slices, check, output);
+        }
+    }
+
+    fn eval_check_batch(&self, rows: &[&[u8]], check: &SingleCheck, output: &mut [bool]) {
+        let n = rows.len();
+
+        // Phase 1: Gather — extract column values + null checks.
+        match check.data_type {
+            DataType::Bool => {
+                let mut vals = vec![0u8; n];
+                for (i, row) in rows.iter().enumerate() {
+                    if !output[i] {
+                        continue;
+                    }
+                    if is_null_bit(&row[..self.bitmap_len], check.col_idx) {
+                        output[i] = false;
+                        continue;
+                    }
+                    if let Some(off) = self.col_offset(row, check) {
+                        if off < row.len() {
+                            vals[i] = row[off];
+                        } else {
+                            output[i] = false;
+                        }
+                    } else {
+                        output[i] = false;
+                    }
+                }
+                let lit = check.literal_bytes[0] != 0;
+                super::simd::batch_cmp_bool(&vals, lit, check.op, output);
+            }
+            DataType::Int | DataType::Date => {
+                let mut vals = vec![0i32; n];
+                for (i, row) in rows.iter().enumerate() {
+                    if !output[i] {
+                        continue;
+                    }
+                    if is_null_bit(&row[..self.bitmap_len], check.col_idx) {
+                        output[i] = false;
+                        continue;
+                    }
+                    if let Some(off) = self.col_offset(row, check) {
+                        if off + 4 <= row.len() {
+                            vals[i] = i32::from_le_bytes(row[off..off + 4].try_into().unwrap());
+                        } else {
+                            output[i] = false;
+                        }
+                    } else {
+                        output[i] = false;
+                    }
+                }
+                let lit = i32::from_le_bytes(check.literal_bytes[..4].try_into().unwrap());
+                super::simd::batch_cmp_i32(&vals, lit, check.op, output);
+            }
+            DataType::BigInt | DataType::Timestamp => {
+                let mut vals = vec![0i64; n];
+                for (i, row) in rows.iter().enumerate() {
+                    if !output[i] {
+                        continue;
+                    }
+                    if is_null_bit(&row[..self.bitmap_len], check.col_idx) {
+                        output[i] = false;
+                        continue;
+                    }
+                    if let Some(off) = self.col_offset(row, check) {
+                        if off + 8 <= row.len() {
+                            vals[i] = i64::from_le_bytes(row[off..off + 8].try_into().unwrap());
+                        } else {
+                            output[i] = false;
+                        }
+                    } else {
+                        output[i] = false;
+                    }
+                }
+                let lit = i64::from_le_bytes(check.literal_bytes[..8].try_into().unwrap());
+                super::simd::batch_cmp_i64(&vals, lit, check.op, output);
+            }
+            DataType::Real => {
+                let mut vals = vec![0.0f64; n];
+                for (i, row) in rows.iter().enumerate() {
+                    if !output[i] {
+                        continue;
+                    }
+                    if is_null_bit(&row[..self.bitmap_len], check.col_idx) {
+                        output[i] = false;
+                        continue;
+                    }
+                    if let Some(off) = self.col_offset(row, check) {
+                        if off + 8 <= row.len() {
+                            vals[i] = f64::from_le_bytes(row[off..off + 8].try_into().unwrap());
+                        } else {
+                            output[i] = false;
+                        }
+                    } else {
+                        output[i] = false;
+                    }
+                }
+                let lit = f64::from_le_bytes(check.literal_bytes[..8].try_into().unwrap());
+                super::simd::batch_cmp_f64(&vals, lit, check.op, output);
+            }
+            _ => {
+                // Unsupported type — mark all as failed (shouldn't happen).
+                output.iter_mut().for_each(|o| *o = false);
+            }
+        }
+    }
+
+    /// Returns the byte offset of the check's column in a row.
+    #[inline]
+    fn col_offset(&self, row: &[u8], check: &SingleCheck) -> Option<usize> {
+        check
+            .fixed_offset
+            .or_else(|| self.locate_column_runtime(row, check.col_idx))
     }
 
     /// Scans preceding columns to find the byte offset of `target_col`.
