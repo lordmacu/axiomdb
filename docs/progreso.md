@@ -294,7 +294,7 @@
   - ⚠️ select_range: 154K vs MariaDB 205K (per-query overhead)
   - ⚠️ delete: 293K vs MariaDB 1.2M (InnoDB purge-thread model)
   - Internal: parser 566ns, eval eq 19ns, scan 1K rows 91µs, codec encode 39ns
-- [ ] 8.5b ⏳ OLTP benchmark matrix — maintain a repeatable comparison matrix for `COM_QUERY` vs prepared statements, with/without secondary indexes, and scan vs point/range workloads; use it to attribute regressions to planner, executor, or wire serialization instead of treating all SQL benchmarks as one bucket
+- [x] 8.5b ✅ OLTP benchmark matrix — `oltp_matrix.py` runs all scenarios × {no-index, idx(active,age)}; generates Markdown table + attribution analysis; findings: select_where 227K no-idx (✅) but drops to 101K with idx (planner prefers index over BatchPredicate scan — regression to investigate in Phase 9)
 - [x] 8.6 ✅ SIMD correctness tests — 12 tests in simd.rs (eq/gt/lt/noteq/lteq/gteq, remainder, pre-filtered, min/max, AND chain, negative values) + 10 batch.rs tests
 - [x] 8.7 ✅ Runtime CPU feature detection — `wide` crate handles AVX2/SSE/NEON dispatch internally; scalar fallback on unsupported CPUs; single binary works on x86_64 + aarch64
 - [x] 8.8 ✅ SIMD vs scalar vs MySQL benchmark — SIMD batch (NEON 4×i32) vs scalar BatchPredicate: marginal gain on 5K rows (gather-scatter overhead); real benefit on x86_64 AVX2 (8×i32) and larger datasets; documented in progreso.md 8.5 results
