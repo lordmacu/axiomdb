@@ -29,7 +29,7 @@ use axiomdb_core::{error::DbError, TransactionSnapshot, TxnId};
 use crate::{
     heap::{
         clear_deletion, insert_tuple, num_slots, read_slot, read_tuple_header, scan_visible,
-        try_rewrite_tuple_same_slot_no_checksum,
+        try_rewrite_tuple_same_slot_no_checksum, RowHeader,
     },
     page::{Page, PageType},
     StorageEngine,
@@ -698,6 +698,56 @@ impl HeapChain {
             None => Ok(false),
             Some((header, _data)) => Ok(header.is_visible(&snap)),
         }
+    }
+
+    /// Counts MVCC-visible rows without decoding any row data (Phase 8 COUNT(*) fast path).
+    ///
+    /// Iterates all heap pages, checks visibility of each slot via RowHeader
+    /// only (24 bytes), and increments a counter. Zero column decode, zero
+    /// Value allocations. For 5000 rows this is ~25 page reads + 5000
+    /// header checks vs the current path of 25 page reads + 5000 full decodes.
+    ///
+    /// Inspired by SQLite's `sqlite3BtreeCount()` which counts B-Tree cells
+    /// without reading payloads, and InnoDB's `stat_n_rows` metadata cache.
+    pub fn count_visible(
+        storage: &dyn StorageEngine,
+        root_page_id: u64,
+        snap: axiomdb_core::TransactionSnapshot,
+    ) -> Result<u64, DbError> {
+        let mut count = 0u64;
+        let mut current = root_page_id;
+
+        while current != 0 {
+            let page = storage.read_page(current)?.into_page();
+            let next = chain_next_page(&page);
+
+            if next != 0 {
+                storage.prefetch_hint(next, 1);
+            }
+
+            let num = crate::heap::num_slots(&page);
+            for slot_id in 0..num {
+                let entry = crate::heap::read_slot(&page, slot_id);
+                if entry.is_dead() {
+                    continue;
+                }
+                let off = entry.offset as usize;
+                let len = entry.length as usize;
+                if len < std::mem::size_of::<RowHeader>() {
+                    continue;
+                }
+                let bytes = &page.as_bytes()[off..off + len];
+                let header: &RowHeader =
+                    bytemuck::from_bytes(&bytes[..std::mem::size_of::<RowHeader>()]);
+                if header.is_visible(&snap) {
+                    count += 1;
+                }
+            }
+
+            current = next;
+        }
+
+        Ok(count)
     }
 
     /// Inserts multiple pre-encoded row payloads into the chain rooted at
