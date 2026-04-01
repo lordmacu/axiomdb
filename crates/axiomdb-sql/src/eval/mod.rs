@@ -21,6 +21,7 @@ mod context;
 mod core;
 mod functions;
 mod ops;
+pub mod simd;
 
 #[cfg(test)]
 mod tests;
