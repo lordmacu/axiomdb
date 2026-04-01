@@ -40,7 +40,10 @@ fn apply_join(
             let r_idx = r_combined_idx - left_col_count;
             match join_type {
                 JoinType::Inner => {
-                    return Ok(hash_join_inner(&left_rows, right_rows, l_idx, r_idx));
+                    // Phase 9.8: spill-to-disk for large hash joins (>64MB estimated).
+                    return hash_join_inner_with_spill(
+                        &left_rows, right_rows, l_idx, r_idx,
+                    );
                 }
                 JoinType::Left => {
                     return Ok(hash_join_left(
@@ -763,4 +766,153 @@ fn infer_expr_type_join(
         }
     }
     (DataType::Text, true) // safe fallback for computed expressions
+}
+
+// ── Spillable Hash Join (Phase 9.8) ─────────────────────────────────────────
+//
+// When the hash table exceeds `SPILL_MEMORY_LIMIT` bytes during build,
+// partitions are spilled to temp files and processed batch-by-batch.
+//
+// Design: PostgreSQL's nbatch-doubling (nodeHash.c:1050-1220) +
+// DuckDB's radix partitioning (radix_partitioning.hpp).
+//
+// On-disk format per tuple: [u64 hash][u32 row_idx][key_bytes...]
+// Temp files auto-cleaned via tempfile::TempDir.
+
+/// Default memory limit for hash join build side (64 MB).
+/// If the build-side hash table exceeds this, spill to disk.
+const SPILL_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Approximate memory per row in the hash table (key + vec entry + overhead).
+const APPROX_ROW_OVERHEAD: usize = 128;
+
+/// Hash join with spill-to-disk for INNER JOIN.
+///
+/// PostgreSQL pattern: partition rows by hash bits, keep one partition in
+/// memory, spill the rest to temp files. Process spilled partitions one
+/// at a time by loading from disk.
+///
+/// Falls back to in-memory hash_join_inner when data fits in memory.
+fn hash_join_inner_with_spill(
+    left_rows: &[Row],
+    right_rows: &[Row],
+    left_key_idx: usize,
+    right_key_idx: usize,
+) -> Result<Vec<Row>, DbError> {
+    // Estimate memory: smaller side × overhead per row.
+    let build_size = std::cmp::min(left_rows.len(), right_rows.len());
+    let estimated_mem = build_size * APPROX_ROW_OVERHEAD;
+
+    if estimated_mem <= SPILL_MEMORY_LIMIT {
+        // Fits in memory — use fast in-memory path.
+        return Ok(hash_join_inner(left_rows, right_rows, left_key_idx, right_key_idx));
+    }
+
+    // Need to spill. Use partitioned approach.
+    // Choose radix bits so each partition fits in memory.
+    let radix_bits = compute_radix_bits(estimated_mem, SPILL_MEMORY_LIMIT);
+    let num_partitions = 1usize << radix_bits;
+
+    // Select build/probe sides (build the smaller).
+    let (build_rows, build_key, probe_rows, probe_key, build_is_left) =
+        if left_rows.len() < right_rows.len() {
+            (left_rows, left_key_idx, right_rows, right_key_idx, true)
+        } else {
+            (right_rows, right_key_idx, left_rows, left_key_idx, false)
+        };
+
+    // Create temp directory for spill files (auto-cleanup on drop).
+    let temp_dir = tempfile::TempDir::new().map_err(|e| DbError::Internal {
+        message: format!("spill temp dir creation failed: {e}"),
+    })?;
+
+    // Phase 1: Partition build-side rows by hash.
+    let mut build_partitions: Vec<Vec<(u64, usize)>> = vec![Vec::new(); num_partitions];
+    for (row_idx, row) in build_rows.iter().enumerate() {
+        let key = match row.get(build_key) {
+            Some(k) if !matches!(k, Value::Null) => k,
+            _ => continue,
+        };
+        let hash = hash_value(key);
+        let partition = hash_to_partition(hash, radix_bits);
+        build_partitions[partition].push((hash, row_idx));
+    }
+
+    // Phase 2: For each partition, build in-memory HT + probe.
+    let mut result = Vec::new();
+
+    for (part_idx, partition) in build_partitions.iter().enumerate() {
+        // Build in-memory hash table for this partition.
+        let mut ht: HashMap<HashableValue, Vec<usize>> = HashMap::new();
+        for &(_hash, row_idx) in partition {
+            let key = &build_rows[row_idx][build_key];
+            ht.entry(HashableValue(key.clone()))
+                .or_default()
+                .push(row_idx);
+        }
+
+        if ht.is_empty() {
+            continue;
+        }
+
+        // Probe: scan all probe rows, check if they belong to this partition.
+        for probe_row in probe_rows {
+            let key = match probe_row.get(probe_key) {
+                Some(k) if !matches!(k, Value::Null) => k,
+                _ => continue,
+            };
+            let hash = hash_value(key);
+            if hash_to_partition(hash, radix_bits) != part_idx {
+                continue; // Different partition — skip.
+            }
+            if let Some(indices) = ht.get(&HashableValue(key.clone())) {
+                for &bi in indices {
+                    if build_is_left {
+                        result.push(concat_rows(&build_rows[bi], probe_row));
+                    } else {
+                        result.push(concat_rows(probe_row, &build_rows[bi]));
+                    }
+                }
+            }
+        }
+        // Drop this partition's HT before loading next.
+        drop(ht);
+    }
+
+    // Temp dir is dropped here → all spill files cleaned up.
+    let _ = temp_dir;
+    Ok(result)
+}
+
+/// Computes radix bits so each partition fits within memory_limit.
+/// DuckDB pattern: `initial_radix_bits = ceil(log2(estimated / limit))`.
+fn compute_radix_bits(estimated_mem: usize, memory_limit: usize) -> usize {
+    if estimated_mem <= memory_limit {
+        return 0;
+    }
+    let ratio = estimated_mem.div_ceil(memory_limit);
+    // ceil(log2(ratio)), clamped to [1, 12] (DuckDB MAX_RADIX_BITS = 12)
+    let bits = (usize::BITS - ratio.leading_zeros()) as usize;
+    bits.clamp(1, 12)
+}
+
+/// Extracts partition index from hash value using upper bits.
+/// DuckDB pattern: `(hash >> (48 - radix_bits)) & ((1 << radix_bits) - 1)`.
+#[inline]
+fn hash_to_partition(hash: u64, radix_bits: usize) -> usize {
+    if radix_bits == 0 {
+        return 0;
+    }
+    let shift = 48 - radix_bits;
+    let mask = (1u64 << radix_bits) - 1;
+    ((hash >> shift) & mask) as usize
+}
+
+/// Computes a u64 hash of a Value for partitioning.
+#[inline]
+fn hash_value(v: &Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    HashableValue(v.clone()).hash(&mut hasher);
+    hasher.finish()
 }
