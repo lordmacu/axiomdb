@@ -20,9 +20,17 @@ use crate::page_layout::{cast_leaf, NULL_PAGE};
 ///
 /// Each `next()` loads an entry from the current leaf.
 /// When a leaf is exhausted, it traverses the tree to find the next one.
+/// Prefetch depth for sequential leaf access (MariaDB uses 64, PostgreSQL 4-256).
+/// We use 4 as a conservative default — sufficient for most range scans
+/// without polluting the OS page cache.
+const PREFETCH_DEPTH: u64 = 4;
+
 pub struct RangeIter<'a> {
     storage: &'a dyn StorageEngine,
     current_pid: u64,
+    /// Cached next_leaf pointer — avoids double-reading the current page
+    /// when the leaf is exhausted. Set to `NULL_PAGE` when unknown.
+    next_leaf_cache: u64,
     slot_idx: usize,
     from: Bound<Vec<u8>>,
     to: Bound<Vec<u8>>,
@@ -40,6 +48,7 @@ impl<'a> RangeIter<'a> {
         Self {
             storage,
             current_pid: start_pid,
+            next_leaf_cache: NULL_PAGE,
             slot_idx: 0,
             from,
             to,
@@ -97,6 +106,13 @@ impl<'a> Iterator for RangeIter<'a> {
                 let node = cast_leaf(&page);
                 let num = node.num_keys();
 
+                // Cache next_leaf on first access to this page — avoids
+                // double-reading when the leaf is exhausted (was the #1
+                // redundant I/O in the old iterator).
+                if self.next_leaf_cache == NULL_PAGE && self.slot_idx == 0 {
+                    self.next_leaf_cache = node.next_leaf_val();
+                }
+
                 if self.slot_idx >= num {
                     SlotResult::Exhausted
                 } else {
@@ -115,10 +131,7 @@ impl<'a> Iterator for RangeIter<'a> {
             };
 
             match result {
-                SlotResult::Before => {
-                    // Before the range: continue to the next slot
-                    continue;
-                }
+                SlotResult::Before => continue,
                 SlotResult::After => {
                     self.done = true;
                     return None;
@@ -127,27 +140,22 @@ impl<'a> Iterator for RangeIter<'a> {
                     return Some(Ok((key, rid)));
                 }
                 SlotResult::Exhausted => {
-                    // Phase 7.9: follow next_leaf pointer (O(1)) instead of
-                    // re-descending the tree from root (O(log n)).
-                    // Split operations maintain correct next_leaf under CoW.
-                    let next_pid = {
-                        let page = match self.storage.read_page(self.current_pid) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                self.done = true;
-                                return Some(Err(e));
-                            }
-                        };
-                        let node = cast_leaf(&page);
-                        node.next_leaf_val()
-                    };
+                    // Phase 7.9: follow cached next_leaf pointer (O(1)).
+                    let next_pid = self.next_leaf_cache;
 
                     if next_pid == NULL_PAGE {
                         self.done = true;
                         return None;
                     }
 
+                    // Phase 9.8 gap closure: prefetch next PREFETCH_DEPTH
+                    // leaves ahead (MariaDB buf_read_ahead_linear pattern).
+                    // Hints the OS/mmap to fault-in pages while we process
+                    // the current one — overlaps I/O with computation.
+                    self.storage.prefetch_hint(next_pid, PREFETCH_DEPTH);
+
                     self.current_pid = next_pid;
+                    self.next_leaf_cache = NULL_PAGE; // reset for next page
                     self.slot_idx = 0;
                 }
             }
