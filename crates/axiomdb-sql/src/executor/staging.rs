@@ -61,6 +61,32 @@ fn persist_batch_insert_indexes(
     for (index_id, new_root) in &updated {
         CatalogWriter::new(storage, txn)?.update_index_root(*index_id, *new_root)?;
     }
+
+    // Record UndoIndexInsert for each (row, index) so ROLLBACK can clean B-Trees.
+    for idx in plan.indexes.iter() {
+        if idx.columns.is_empty() {
+            continue;
+        }
+        for (row, rid) in plan.rows.iter().zip(rids.iter()) {
+            let key_vals: Vec<axiomdb_types::Value> = idx
+                .columns
+                .iter()
+                .map(|c| row.get(c.col_idx as usize).cloned().unwrap_or(axiomdb_types::Value::Null))
+                .collect();
+            if key_vals.iter().any(|v| matches!(v, axiomdb_types::Value::Null)) {
+                continue;
+            }
+            let key = if idx.is_fk_index || !idx.is_unique {
+                let mut k = crate::key_encoding::encode_index_key(&key_vals)?;
+                k.extend_from_slice(&axiomdb_index::page_layout::encode_rid(*rid));
+                k
+            } else {
+                crate::key_encoding::encode_index_key(&key_vals)?
+            };
+            let _ = txn.record_index_insert(idx.index_id, idx.root_page_id, key);
+        }
+    }
+
     Ok(!updated.is_empty())
 }
 
