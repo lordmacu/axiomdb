@@ -299,8 +299,8 @@
 - [x] 8.7 ✅ Runtime CPU feature detection — `wide` crate handles AVX2/SSE/NEON dispatch internally; scalar fallback on unsupported CPUs; single binary works on x86_64 + aarch64
 - [x] 8.8 ✅ SIMD vs scalar vs MySQL benchmark — SIMD batch (NEON 4×i32) vs scalar BatchPredicate: marginal gain on 5K rows (gather-scatter overhead); real benefit on x86_64 AVX2 (8×i32) and larger datasets; documented in progreso.md 8.5 results
 
-### Phase 9 — DuckDB-inspired + Join Algorithms `⏳` week 53-56
-- [ ] 9.1 ⏳ Morsel-driven parallelism — split into 100K chunks, Rayon
+### Phase 9 — DuckDB-inspired + Join Algorithms `🔄` week 53-56
+- [x] 9.1 ✅ Morsel-driven parallelism — Rayon par_iter over heap pages; StorageEngine: Send+Sync; two-phase (serial page-ID collection + parallel decode+filter); BatchPredicate SIMD works across threads; falls back to serial for <4 pages; select_where 228K r/s maintained
 - [ ] 9.2 ⏳ Operator fusion — scan+filter+project in a single lazy loop
 - [ ] 9.3 ⏳ Late materialization — cheap predicates first, read expensive columns at the end
 - [ ] 9.4 ⏳ Benchmarks with parallelism — measure scaling with N cores
