@@ -210,7 +210,23 @@ fn execute_select_ctx(
                         }
                     };
 
-                    // Phase 9.1: parallel scan for large tables.
+                    // Phase 9.11: early-exit scan for LIMIT without ORDER BY.
+                    // PostgreSQL's ExecutePlan(count) pattern — stop scanning
+                    // after limit rows are collected. Only safe when no ORDER BY
+                    // (sorting requires all rows first) and no GROUP BY.
+                    let scan_limit = if stmt.order_by.is_empty()
+                        && stmt.group_by.is_empty()
+                        && stmt.having.is_none()
+                    {
+                        stmt.limit.as_ref().and_then(|expr| match expr {
+                            Expr::Literal(Value::Int(n)) => Some(*n as usize),
+                            Expr::Literal(Value::BigInt(n)) => Some(*n as usize),
+                            _ => None,
+                        })
+                    } else {
+                        None
+                    };
+
                     TableEngine::scan_table_filtered_parallel(
                         storage,
                         &resolved.def,
@@ -225,6 +241,7 @@ fn execute_select_ctx(
                         zm_pred.as_ref().map(|(ci, p)| (*ci, p)),
                         batch_pred.as_ref(),
                         decode_mask.as_deref(),
+                        scan_limit,
                     )?
                 } else {
                     // No WHERE clause — scan all rows.

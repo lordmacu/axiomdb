@@ -354,6 +354,11 @@ impl TableEngine {
     ///
     /// Results may be in different order than single-threaded scan — callers
     /// needing ORDER BY must sort after this call.
+    /// Phase 9.11: `scan_limit` enables early-exit scanning (PostgreSQL's
+    /// `ExecutorRun(count)` pattern). When `Some(n)`, the scan stops after
+    /// collecting n passing rows — avoids scanning the full table for
+    /// `SELECT ... LIMIT n` without ORDER BY. `None` means scan all rows.
+    #[allow(clippy::too_many_arguments)]
     pub fn scan_table_filtered_parallel<F>(
         storage: &dyn StorageEngine,
         table_def: &TableDef,
@@ -363,6 +368,7 @@ impl TableEngine {
         zone_map_pred: Option<(usize, &axiomdb_storage::zone_map::ZoneMapPredicate)>,
         batch_pred: Option<&crate::eval::batch::BatchPredicate>,
         decode_mask: Option<&[bool]>,
+        scan_limit: Option<usize>,
     ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError>
     where
         F: Fn(&[Value]) -> bool + Send + Sync,
@@ -406,8 +412,13 @@ impl TableEngine {
             })
             .collect();
 
-        // Phase 3: flatten per-thread results.
-        Ok(results?.into_iter().flatten().collect())
+        // Phase 3: flatten per-thread results + apply scan limit.
+        // PostgreSQL's ExecutePlan uses `numberTuples` to stop after limit rows.
+        let flat: Vec<_> = results?.into_iter().flatten().collect();
+        match scan_limit {
+            Some(limit) if flat.len() > limit => Ok(flat.into_iter().take(limit).collect()),
+            _ => Ok(flat),
+        }
     }
 
     /// Collects all heap chain page IDs starting from `root`.
