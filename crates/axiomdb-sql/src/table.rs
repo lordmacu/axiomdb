@@ -362,6 +362,7 @@ impl TableEngine {
         predicate: F,
         zone_map_pred: Option<(usize, &axiomdb_storage::zone_map::ZoneMapPredicate)>,
         batch_pred: Option<&crate::eval::batch::BatchPredicate>,
+        decode_mask: Option<&[bool]>,
     ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError>
     where
         F: Fn(&[Value]) -> bool + Send + Sync,
@@ -400,6 +401,7 @@ impl TableEngine {
                     &predicate,
                     zone_map_pred,
                     batch_pred,
+                    decode_mask,
                 )
             })
             .collect();
@@ -431,6 +433,7 @@ impl TableEngine {
         predicate: &F,
         zone_map_pred: Option<(usize, &axiomdb_storage::zone_map::ZoneMapPredicate)>,
         batch_pred: Option<&crate::eval::batch::BatchPredicate>,
+        decode_mask: Option<&[bool]>,
     ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError>
     where
         F: Fn(&[Value]) -> bool,
@@ -487,7 +490,14 @@ impl TableEngine {
             for (i, &(slot_id, off, len)) in visible_slots.iter().enumerate() {
                 if passed[i] {
                     let row_data = &page_bytes[off + hdr..off + len];
-                    let values = decode_row(row_data, col_types)?;
+                    // Phase 9.2: decode only columns in the unified mask
+                    // (SELECT ∪ WHERE ∪ ORDER BY ∪ GROUP BY). Non-masked
+                    // columns get Value::Null — saves String/Text allocation.
+                    let values = if let Some(mask) = decode_mask {
+                        decode_row_masked(row_data, col_types, mask)?
+                    } else {
+                        decode_row(row_data, col_types)?
+                    };
                     result.push((RecordId { page_id, slot_id }, values));
                 }
             }

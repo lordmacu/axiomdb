@@ -171,9 +171,46 @@ fn execute_select_ctx(
                         .collect();
                     let batch_pred =
                         crate::eval::batch::try_compile(&wc_clone, &col_types);
-                    // Phase 9.1: parallel scan for large tables — distributes
-                    // per-page decode+filter across Rayon thread pool.
-                    // Falls back to serial for small tables (< 4 pages).
+
+                    // Phase 9.2: Operator fusion — build unified decode mask
+                    // (SELECT ∪ WHERE ∪ ORDER BY ∪ GROUP BY columns).
+                    // Only decode columns that are actually referenced anywhere
+                    // in the query. Non-referenced columns get Value::Null,
+                    // saving String/Text allocation for wide tables.
+                    let decode_mask = {
+                        let mut mask = vec![false; n_cols];
+                        // WHERE columns
+                        collect_expr_columns(&wc_clone, &mut mask);
+                        // SELECT columns
+                        for item in &stmt.columns {
+                            if let crate::ast::SelectItem::Expr { expr, .. } = item {
+                                collect_expr_columns(expr, &mut mask);
+                            } else {
+                                // Wildcard — need all columns
+                                mask.iter_mut().for_each(|m| *m = true);
+                            }
+                        }
+                        // ORDER BY columns
+                        for ob in &stmt.order_by {
+                            collect_expr_columns(&ob.expr, &mut mask);
+                        }
+                        // GROUP BY columns
+                        for gb in &stmt.group_by {
+                            collect_expr_columns(gb, &mut mask);
+                        }
+                        // HAVING columns
+                        if let Some(ref having) = stmt.having {
+                            collect_expr_columns(having, &mut mask);
+                        }
+                        // Only use mask if it's selective (not all cols needed)
+                        if mask.iter().all(|&b| b) {
+                            None
+                        } else {
+                            Some(mask)
+                        }
+                    };
+
+                    // Phase 9.1: parallel scan for large tables.
                     TableEngine::scan_table_filtered_parallel(
                         storage,
                         &resolved.def,
@@ -187,6 +224,7 @@ fn execute_select_ctx(
                         },
                         zm_pred.as_ref().map(|(ci, p)| (*ci, p)),
                         batch_pred.as_ref(),
+                        decode_mask.as_deref(),
                     )?
                 } else {
                     // No WHERE clause — scan all rows.
