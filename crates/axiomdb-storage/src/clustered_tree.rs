@@ -9,7 +9,7 @@ use std::ops::Bound;
 use axiomdb_core::{error::DbError, TransactionSnapshot};
 
 use crate::{
-    clustered_internal, clustered_leaf,
+    clustered_internal, clustered_leaf, clustered_overflow,
     heap::RowHeader,
     page::{Page, PageType},
     StorageEngine,
@@ -19,7 +19,9 @@ use crate::{
 struct OwnedLeafCell {
     key: Vec<u8>,
     row_header: RowHeader,
-    row_data: Vec<u8>,
+    total_row_len: usize,
+    local_row_data: Vec<u8>,
+    overflow_first_page: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +75,7 @@ pub fn insert(
     row_header: &RowHeader,
     row_data: &[u8],
 ) -> Result<u64, DbError> {
-    validate_inline_row(key, row_data)?;
+    validate_row_payload(key, row_data)?;
 
     match root_pid {
         Some(pid) => match insert_subtree(storage, pid, key, row_header, row_data)? {
@@ -88,10 +90,19 @@ pub fn insert(
             }
         },
         None => {
+            let cell = materialize_leaf_cell(storage, key, row_header, row_data)?;
             let root_pid = storage.alloc_page(PageType::ClusteredLeaf)?;
             let mut root = Page::new(PageType::ClusteredLeaf, root_pid);
             clustered_leaf::init_clustered_leaf(&mut root);
-            clustered_leaf::insert_cell(&mut root, 0, key, row_header, row_data)?;
+            clustered_leaf::insert_cell_with_overflow(
+                &mut root,
+                0,
+                &cell.key,
+                &cell.row_header,
+                cell.total_row_len,
+                &cell.local_row_data,
+                cell.overflow_first_page,
+            )?;
             write_page(storage, root_pid, &mut root)?;
             Ok(root_pid)
         }
@@ -121,10 +132,12 @@ pub fn lookup(
         return Ok(None);
     }
 
+    let row_data = reconstruct_row_data(storage, &cell)?;
+
     Ok(Some(ClusteredRow {
         key: cell.key.to_vec(),
         row_header: cell.row_header,
-        row_data: cell.row_data.to_vec(),
+        row_data,
     }))
 }
 
@@ -168,7 +181,7 @@ pub fn update_in_place(
     txn_id: u64,
     snapshot: &TransactionSnapshot,
 ) -> Result<bool, DbError> {
-    validate_inline_row(key, new_row_data)?;
+    validate_row_payload(key, new_row_data)?;
 
     let Some(root_pid) = root_pid else {
         return Ok(false);
@@ -180,36 +193,58 @@ pub fn update_in_place(
         Err(_) => return Ok(false),
     };
 
-    let (old_header, old_row_len) = {
+    let (old_header, old_total_row_len, old_overflow_first_page) = {
         let cell = clustered_leaf::read_cell(&leaf_ref, pos as u16)?;
         if !cell.row_header.is_visible(snapshot) {
             return Ok(false);
         }
-        (cell.row_header, cell.row_data.len())
+        (
+            cell.row_header,
+            cell.total_row_len,
+            cell.overflow_first_page,
+        )
     };
 
-    let mut page = leaf_ref.into_page();
-    let page_id = page.header().page_id;
-    let available =
-        clustered_leaf::free_space(&page) + clustered_leaf::cell_footprint(key.len(), old_row_len);
-    let needed = clustered_leaf::cell_footprint(key.len(), new_row_data.len());
     let new_header = RowHeader {
         txn_id_created: txn_id,
         txn_id_deleted: 0,
         row_version: old_header.row_version.saturating_add(1),
         _flags: old_header._flags,
     };
+    let new_cell = materialize_leaf_cell(storage, key, &new_header, new_row_data)?;
 
-    match clustered_leaf::rewrite_cell_same_key(&mut page, pos, key, &new_header, new_row_data)? {
+    let mut page = leaf_ref.into_page();
+    let page_id = page.header().page_id;
+    let available = clustered_leaf::free_space(&page)
+        + clustered_leaf::cell_footprint(key.len(), old_total_row_len);
+    let needed = clustered_leaf::cell_footprint(key.len(), new_row_data.len());
+
+    match clustered_leaf::rewrite_cell_same_key_with_overflow(
+        &mut page,
+        pos,
+        key,
+        &new_header,
+        new_cell.total_row_len,
+        &new_cell.local_row_data,
+        new_cell.overflow_first_page,
+    )? {
         Some(_) => {
             write_page(storage, page_id, &mut page)?;
+            if let Some(first_page) = old_overflow_first_page {
+                clustered_overflow::free_chain(storage, first_page)?;
+            }
             Ok(true)
         }
-        None => Err(DbError::HeapPageFull {
-            page_id,
-            needed,
-            available,
-        }),
+        None => {
+            if let Some(first_page) = new_cell.overflow_first_page {
+                clustered_overflow::free_chain(storage, first_page)?;
+            }
+            Err(DbError::HeapPageFull {
+                page_id,
+                needed,
+                available,
+            })
+        }
     }
 }
 
@@ -232,12 +267,17 @@ pub fn delete_mark(
         Err(_) => return Ok(false),
     };
 
-    let (old_header, old_row_data) = {
+    let (old_header, old_total_row_len, old_local_row_data, old_overflow_first_page) = {
         let cell = clustered_leaf::read_cell(&leaf_ref, pos as u16)?;
         if !cell.row_header.is_visible(snapshot) {
             return Ok(false);
         }
-        (cell.row_header, cell.row_data.to_vec())
+        (
+            cell.row_header,
+            cell.total_row_len,
+            cell.row_data.to_vec(),
+            cell.overflow_first_page,
+        )
     };
 
     let mut page = leaf_ref.into_page();
@@ -249,7 +289,15 @@ pub fn delete_mark(
         _flags: old_header._flags,
     };
 
-    match clustered_leaf::rewrite_cell_same_key(&mut page, pos, key, &new_header, &old_row_data)? {
+    match clustered_leaf::rewrite_cell_same_key_with_overflow(
+        &mut page,
+        pos,
+        key,
+        &new_header,
+        old_total_row_len,
+        &old_local_row_data,
+        old_overflow_first_page,
+    )? {
         Some(_) => {
             write_page(storage, page_id, &mut page)?;
             Ok(true)
@@ -272,7 +320,7 @@ pub fn update_with_relocation(
     txn_id: u64,
     snapshot: &TransactionSnapshot,
 ) -> Result<Option<u64>, DbError> {
-    validate_inline_row(key, new_row_data)?;
+    validate_row_payload(key, new_row_data)?;
 
     let Some(root_pid) = root_pid else {
         return Ok(None);
@@ -356,9 +404,13 @@ fn delete_physical_from_leaf(
         Err(_) => return Ok(DeletePhysicalResult::NotFound),
     };
 
+    let overflow_first_page = clustered_leaf::read_cell(&page, pos as u16)?.overflow_first_page;
     let min_changed = pos == 0;
     clustered_leaf::remove_cell(&mut page, pos)?;
     write_page(storage, pid, &mut page)?;
+    if let Some(first_page) = overflow_first_page {
+        clustered_overflow::free_chain(storage, first_page)?;
+    }
 
     Ok(DeletePhysicalResult::Deleted {
         underfull: !is_root && leaf_underfull(&page),
@@ -679,20 +731,38 @@ fn insert_into_leaf(
         Err(pos) => pos,
     };
 
-    match clustered_leaf::insert_cell(&mut page, insert_pos, key, row_header, row_data) {
+    let cell = materialize_leaf_cell(storage, key, row_header, row_data)?;
+
+    match clustered_leaf::insert_cell_with_overflow(
+        &mut page,
+        insert_pos,
+        &cell.key,
+        &cell.row_header,
+        cell.total_row_len,
+        &cell.local_row_data,
+        cell.overflow_first_page,
+    ) {
         Ok(()) => {
             write_page(storage, pid, &mut page)?;
             Ok(InsertResult::Inserted)
         }
         Err(DbError::HeapPageFull { .. }) => {
             clustered_leaf::defragment(&mut page);
-            match clustered_leaf::insert_cell(&mut page, insert_pos, key, row_header, row_data) {
+            match clustered_leaf::insert_cell_with_overflow(
+                &mut page,
+                insert_pos,
+                &cell.key,
+                &cell.row_header,
+                cell.total_row_len,
+                &cell.local_row_data,
+                cell.overflow_first_page,
+            ) {
                 Ok(()) => {
                     write_page(storage, pid, &mut page)?;
                     Ok(InsertResult::Inserted)
                 }
                 Err(DbError::HeapPageFull { .. }) => {
-                    split_leaf(storage, pid, &page, insert_pos, key, row_header, row_data)
+                    split_leaf(storage, pid, &page, insert_pos, cell)
                 }
                 Err(err) => Err(err),
             }
@@ -706,19 +776,10 @@ fn split_leaf(
     pid: u64,
     page: &Page,
     insert_pos: usize,
-    key: &[u8],
-    row_header: &RowHeader,
-    row_data: &[u8],
+    cell: OwnedLeafCell,
 ) -> Result<InsertResult, DbError> {
     let mut cells = collect_leaf_cells(page)?;
-    cells.insert(
-        insert_pos,
-        OwnedLeafCell {
-            key: key.to_vec(),
-            row_header: *row_header,
-            row_data: row_data.to_vec(),
-        },
-    );
+    cells.insert(insert_pos, cell);
 
     let split_at = choose_leaf_split_idx(&cells);
     let old_next_leaf = clustered_leaf::next_leaf(page);
@@ -825,7 +886,9 @@ fn collect_leaf_cells(page: &Page) -> Result<Vec<OwnedLeafCell>, DbError> {
         cells.push(OwnedLeafCell {
             key: cell.key.to_vec(),
             row_header: cell.row_header,
-            row_data: cell.row_data.to_vec(),
+            total_row_len: cell.total_row_len,
+            local_row_data: cell.row_data.to_vec(),
+            overflow_first_page: cell.overflow_first_page,
         });
     }
     Ok(cells)
@@ -921,7 +984,15 @@ fn rebuild_leaf_page(
     clustered_leaf::init_clustered_leaf(page);
     clustered_leaf::set_next_leaf(page, next_leaf_pid);
     for (idx, cell) in cells.iter().enumerate() {
-        clustered_leaf::insert_cell(page, idx, &cell.key, &cell.row_header, &cell.row_data)?;
+        clustered_leaf::insert_cell_with_overflow(
+            page,
+            idx,
+            &cell.key,
+            &cell.row_header,
+            cell.total_row_len,
+            &cell.local_row_data,
+            cell.overflow_first_page,
+        )?;
     }
     Ok(())
 }
@@ -942,7 +1013,7 @@ fn rebuild_internal_page(
 fn leaf_footprint(cells: &[OwnedLeafCell]) -> usize {
     cells
         .iter()
-        .map(|cell| clustered_leaf::cell_footprint(cell.key.len(), cell.row_data.len()))
+        .map(|cell| clustered_leaf::cell_footprint(cell.key.len(), cell.total_row_len))
         .sum()
 }
 
@@ -985,7 +1056,7 @@ fn choose_leaf_split_idx(cells: &[OwnedLeafCell]) -> usize {
     debug_assert!(cells.len() >= 2);
     let footprints: Vec<usize> = cells
         .iter()
-        .map(|cell| clustered_leaf::cell_footprint(cell.key.len(), cell.row_data.len()))
+        .map(|cell| clustered_leaf::cell_footprint(cell.key.len(), cell.total_row_len))
         .collect();
     choose_balanced_boundary(&footprints)
 }
@@ -995,7 +1066,7 @@ fn choose_leaf_rebalance_idx(cells: &[OwnedLeafCell]) -> Result<usize, DbError> 
     let cap = clustered_leaf::page_capacity_bytes();
     let footprints: Vec<usize> = cells
         .iter()
-        .map(|cell| clustered_leaf::cell_footprint(cell.key.len(), cell.row_data.len()))
+        .map(|cell| clustered_leaf::cell_footprint(cell.key.len(), cell.total_row_len))
         .collect();
     let total: usize = footprints.iter().sum();
     let mut left = 0usize;
@@ -1114,25 +1185,85 @@ fn choose_balanced_boundary(footprints: &[usize]) -> usize {
     best_idx
 }
 
-fn validate_inline_row(key: &[u8], row_data: &[u8]) -> Result<(), DbError> {
-    if key.len() > clustered_leaf::max_inline_key_bytes() {
-        return Err(DbError::KeyTooLong {
-            len: key.len(),
-            max: clustered_leaf::max_inline_key_bytes(),
+fn materialize_leaf_cell(
+    storage: &mut dyn StorageEngine,
+    key: &[u8],
+    row_header: &RowHeader,
+    row_data: &[u8],
+) -> Result<OwnedLeafCell, DbError> {
+    validate_row_payload(key, row_data)?;
+
+    let total_row_len = row_data.len();
+    let local_len = clustered_leaf::local_row_len(key.len(), total_row_len);
+    let local_row_data = row_data[..local_len].to_vec();
+    let overflow_first_page = if total_row_len > local_len {
+        clustered_overflow::write_chain(storage, &row_data[local_len..])?
+    } else {
+        None
+    };
+
+    Ok(OwnedLeafCell {
+        key: key.to_vec(),
+        row_header: *row_header,
+        total_row_len,
+        local_row_data,
+        overflow_first_page,
+    })
+}
+
+fn reconstruct_row_data(
+    storage: &dyn StorageEngine,
+    cell: &clustered_leaf::CellRef<'_>,
+) -> Result<Vec<u8>, DbError> {
+    let mut row_data = Vec::with_capacity(cell.total_row_len);
+    row_data.extend_from_slice(cell.row_data);
+
+    let tail_len = cell.total_row_len.saturating_sub(cell.row_data.len());
+    match (tail_len, cell.overflow_first_page) {
+        (0, None) => {}
+        (tail_len, Some(first_page)) => {
+            row_data.extend_from_slice(&clustered_overflow::read_chain(
+                storage, first_page, tail_len,
+            )?);
+        }
+        _ => {
+            return Err(DbError::BTreeCorrupted {
+                msg: format!(
+                    "clustered row at key {:?} has inconsistent local/overflow layout",
+                    cell.key
+                ),
+            });
+        }
+    }
+
+    Ok(row_data)
+}
+
+fn validate_row_payload(key: &[u8], row_data: &[u8]) -> Result<(), DbError> {
+    if row_data.len() > u32::MAX as usize {
+        return Err(DbError::ValueTooLarge {
+            len: row_data.len(),
+            max: u32::MAX as usize,
         });
     }
 
-    let Some(max_row_len) = clustered_leaf::max_inline_row_bytes(key.len()) else {
+    let needs_overflow = clustered_leaf::requires_overflow(key.len(), row_data.len());
+    let max_key_len = if needs_overflow {
+        clustered_leaf::max_overflow_key_bytes()
+    } else {
+        clustered_leaf::max_inline_key_bytes()
+    };
+    if key.len() > max_key_len {
+        return Err(DbError::KeyTooLong {
+            len: key.len(),
+            max: max_key_len,
+        });
+    }
+
+    if !clustered_leaf::fits_inline(key.len(), row_data.len()) {
         return Err(DbError::KeyTooLong {
             len: key.len(),
             max: clustered_leaf::max_inline_key_bytes(),
-        });
-    };
-
-    if row_data.len() > max_row_len {
-        return Err(DbError::ValueTooLarge {
-            len: row_data.len(),
-            max: max_row_len,
         });
     }
 
@@ -1270,10 +1401,15 @@ impl Iterator for ClusteredRangeIter<'_> {
                     continue;
                 }
 
+                let row_data = match reconstruct_row_data(self.storage, &cell) {
+                    Ok(row_data) => row_data,
+                    Err(err) => return Some(Err(err)),
+                };
+
                 return Some(Ok(ClusteredRow {
                     key: cell.key.to_vec(),
                     row_header: cell.row_header,
-                    row_data: cell.row_data.to_vec(),
+                    row_data,
                 }));
             }
 
@@ -1614,12 +1750,27 @@ mod tests {
     }
 
     #[test]
-    fn rows_that_need_overflow_are_rejected() {
+    fn rows_that_need_overflow_are_materialized_and_reconstructed() {
         let mut storage = MemoryStorage::new();
         let key = b"overflow-pk";
-        let max = clustered_leaf::max_inline_row_bytes(key.len()).unwrap();
-        let err = insert(&mut storage, None, key, &row_header(1), &vec![0u8; max + 1]).unwrap_err();
-        assert!(matches!(err, DbError::ValueTooLarge { .. }));
+        let total_len = clustered_leaf::max_inline_row_bytes(key.len()).unwrap() + 257;
+        let payload = vec![0x6D; total_len];
+
+        let root = insert(&mut storage, None, key, &row_header(1), &payload).unwrap();
+        let page = storage.read_page(root).unwrap();
+        let cell = clustered_leaf::read_cell(&page, 0).unwrap();
+
+        assert_eq!(cell.total_row_len, total_len);
+        assert_eq!(
+            cell.row_data.len(),
+            clustered_leaf::local_row_len(key.len(), total_len)
+        );
+        assert!(cell.overflow_first_page.is_some());
+
+        let row = lookup(&storage, Some(root), key, &committed_snapshot(10))
+            .unwrap()
+            .expect("overflow-backed row must be reachable");
+        assert_eq!(row.row_data, payload);
     }
 
     #[test]
@@ -2196,6 +2347,31 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn delete_physical_frees_overflow_chain_of_removed_row() {
+        let mut storage = MemoryStorage::new();
+        let key = b"overflow-delete";
+        let total_len = clustered_leaf::max_inline_row_bytes(key.len()).unwrap() + 321;
+        let payload = vec![0x4E; total_len];
+        let root = insert(&mut storage, None, key, &row_header(1), &payload).unwrap();
+
+        let page = storage.read_page(root).unwrap();
+        let overflow_first_page = clustered_leaf::read_cell(&page, 0)
+            .unwrap()
+            .overflow_first_page
+            .expect("row must be overflow-backed");
+
+        let (deleted, root_after) = delete_physical(&mut storage, root, key).unwrap();
+        assert!(deleted);
+        assert_eq!(root_after, root);
+        assert!(
+            lookup(&storage, Some(root_after), key, &committed_snapshot(10))
+                .unwrap()
+                .is_none()
+        );
+        assert!(storage.read_page(overflow_first_page).is_err());
     }
 
     #[test]

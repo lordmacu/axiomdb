@@ -1,11 +1,13 @@
 # Architecture Notes
 
-## 2026-04-02 — Clustered internal page primitive, clustered insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, and clustered secondary bookmarks
+## 2026-04-02 — Clustered internal page primitive, clustered insert/read/update/delete/rebalance, clustered secondary bookmarks, and clustered overflow pages
 
 - `crates/axiomdb-storage/src/clustered_internal.rs` owns the clustered
   internal page format for Phase `39.2`.
 - `crates/axiomdb-storage/src/clustered_tree.rs` now owns the first clustered
-  tree controller for Phases `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, and `39.8`.
+  tree controller for Phases `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, and `39.10`.
+- `crates/axiomdb-storage/src/clustered_overflow.rs` now owns the overflow-page
+  chain primitive for large clustered rows in Phase `39.10`.
 - `crates/axiomdb-sql/src/clustered_secondary.rs` now owns the clustered-first
   secondary bookmark layout for Phase `39.9`.
 - The architecture still keeps storage and tree responsibilities separate:
@@ -27,6 +29,15 @@
   - missing key → `None`
   - invisible current inline row → `None`
   - no undo/version-chain reconstruction until later clustered MVCC phases
+- The clustered leaf-cell contract is now split into physical and logical views:
+  - physical leaf descriptor = `key + RowHeader + total_row_len + local_row_prefix + overflow_first_page?`
+  - logical row bytes are reconstructed only when a read or update path needs them
+  - split / merge / rebalance move physical descriptors and do not rewrite overflow payload
+- The clustered overflow contract is now explicit:
+  - only clustered rows may spill payload to overflow pages in Phase 39
+  - overflow pages form a singly linked list of payload chunks
+  - delete-mark keeps the chain reachable
+  - physical delete and shrink-to-inline update free the obsolete chain
 - The clustered range-scan contract mirrors that same boundary:
   - descend once to the first relevant leaf for the lower bound
   - then iterate through the `next_leaf` chain in key order

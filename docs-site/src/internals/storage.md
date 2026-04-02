@@ -139,11 +139,14 @@ The controller is still storage-first:
 
 1. Bootstrap an empty tree into a `ClusteredLeaf` root when `root_pid` is `None`.
 2. Descend through `ClusteredInternal` pages with `find_child_idx()`.
-3. Insert inline into the target leaf in sorted key order.
-4. If the row does not fit, defragment once and retry before splitting.
-5. Split leaves by cumulative cell byte volume, not by cell count.
-6. Propagate `(separator_key, right_child_pid)` upward.
-7. Split internal pages by cumulative separator byte volume and create a new
+3. Materialize a clustered leaf descriptor:
+   - small rows stay fully inline
+   - large rows keep a local prefix inline and spill the tail bytes to overflow pages
+4. Insert that descriptor into the target leaf in sorted key order.
+5. If the descriptor does not fit, defragment once and retry before splitting.
+6. Split leaves by cumulative cell byte volume, not by cell count.
+7. Propagate `(separator_key, right_child_pid)` upward.
+8. Split internal pages by cumulative separator byte volume and create a new
    root if the old root overflows.
 
 Split behavior deliberately keeps the old page ID as the left half and
@@ -151,8 +154,10 @@ allocates only the new right sibling. That matches the current no-concurrent-
 clustered-writer reality and keeps parent maintenance minimal until the later
 MVCC/WAL phases wire clustered pages into the full engine.
 
-Rows that do not fit inline on an otherwise empty clustered leaf are rejected
-explicitly in `39.3`; overflow-page support remains deferred to `39.10`.
+Since `39.10`, rows above the local inline budget are no longer rejected. The
+leaf keeps the primary key and `RowHeader` inline, stores only a bounded local
+row prefix on-page, and spills the remaining tail bytes to a dedicated
+`PageType::Overflow` chain.
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
@@ -181,9 +186,11 @@ Lookup flow:
 1. Return `None` immediately when the tree has no root.
 2. Descend clustered internal pages with `find_child_idx()` and `child_at()`.
 3. Run exact-key binary search on the target clustered leaf.
-4. Read the inline `(key, RowHeader, row_data)` cell.
+4. Read the leaf descriptor `(key, RowHeader, total_row_len, local_prefix, overflow_ptr?)`.
 5. Apply `RowHeader::is_visible(snapshot)`.
-6. Return an owned `ClusteredRow` on a visible hit.
+6. If the row is overflow-backed, reconstruct the logical row bytes by reading
+   the overflow-page chain.
+7. Return an owned `ClusteredRow` on a visible hit.
 
 In `39.4`, lookup is intentionally conservative about invisible rows: when the
 current inline version fails MVCC visibility, it returns `None` instead of
@@ -255,6 +262,47 @@ Like `39.4`, this subphase is still honest about missing undo support. If a row'
 current inline version is invisible, `39.5` skips it; it does not reconstruct an
 older visible version yet.
 
+### Clustered Overflow Pages (Phase 39.10)
+
+Phase `39.10` adds the first overflow-page primitive dedicated to clustered
+rows:
+
+```text
+Leaf cell:
+  [key_len: u16]
+  [total_row_len: u32]
+  [RowHeader: 24B]
+  [key bytes]
+  [local row prefix]
+  [overflow_first_page?: u64]
+
+Overflow page body:
+  [next_overflow_page: u64]
+  [payload bytes...]
+```
+
+The contract is intentionally physical:
+
+1. Keep the primary key and `RowHeader` inline in the clustered leaf.
+2. Keep only a bounded local row prefix inline.
+3. Spill the remaining logical row tail to `PageType::Overflow` pages.
+4. Reconstruct the full logical row only on read paths (`lookup`, `range`) or
+   update paths that need the logical bytes.
+5. Let split / merge / rebalance move the physical descriptor without rewriting
+   the overflow payload.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — SQLite Tail Spill, InnoDB Scope</span>
+SQLite's B-tree format keeps a local payload prefix inline and spills only the surplus to overflow pages, while InnoDB restricts off-page storage to clustered records rather than secondary entries. AxiomDB adapts both ideas directly in 39.10: keep clustered row identity and MVCC header inline, spill only the row tail, and keep secondary indexes bookmark-only.
+</div>
+</div>
+
+This subphase intentionally does **not** introduce generic TOAST references,
+compression, WAL logging, or crash recovery for overflow chains yet. Those stay
+in later phases.
+
 ### Clustered Update In Place (Phase 39.6)
 
 `axiomdb-storage::clustered_tree::update_in_place(...)` is now the first
@@ -280,9 +328,13 @@ Update flow:
    - `txn_id_created = txn_id`
    - `txn_id_deleted = 0`
    - `row_version = old.row_version + 1`
-4. Ask the leaf primitive to rewrite that exact cell while preserving key order.
-5. Persist the leaf if the rewrite stays inside the same page.
-6. Return `HeapPageFull` when the replacement row would require leaving the
+4. Materialize a replacement descriptor:
+   - inline row
+   - or local-prefix + overflow chain
+5. Ask the leaf primitive to rewrite that exact cell while preserving key order.
+6. Persist the leaf if the rewrite stays inside the same page.
+7. Free the obsolete overflow chain only after a successful physical rewrite.
+8. Return `HeapPageFull` when the replacement row would require leaving the
    current leaf.
 
 The leaf primitive has two rewrite modes:

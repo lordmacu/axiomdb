@@ -16,13 +16,16 @@ user-visible table option that stores full rows inside PRIMARY KEY leaves. For
 now, all user-visible tables still behave as heap-backed tables.
 
 Internally, the storage rewrite already has clustered insert, point lookup,
-range scan, same-leaf update, delete-mark, and structural rebalance / relocate-update
-primitives, but they are not wired into SQL yet.
+range scan, same-leaf update, delete-mark, structural rebalance / relocate-update,
+secondary PK bookmarks, and overflow-backed clustered rows for large payloads,
+but they are not wired into SQL yet.
 
 That internal rewrite is still honest about its current boundary:
 
 - relocate-update rewrites only the current inline version
 - clustered delete is still delete-mark first, not purge
+- large clustered rows can already spill to overflow pages internally, but SQL
+  tables still expose only the classic heap-backed layout
 - clustered-first secondary bookmarks now exist internally, but the SQL-visible
   executor still uses heap `RecordId` secondary indexes
 

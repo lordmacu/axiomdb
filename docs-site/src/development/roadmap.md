@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 39.9 Secondary indexes with PK bookmarks — dedicated clustered-first secondary layout, bookmark-bearing physical keys, prefix scans without fixed RID suffixes, and relocate-stable maintenance
+**Last completed subphase:** 39.10 Overflow pages for large clustered rows — clustered leaf local-prefix + overflow-pointer format, dedicated overflow-page chains, transparent lookup/range reconstruction, and overflow-aware update/delete cleanup
 
-**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, and clustered-first secondary bookmarks now exist, but the SQL executor still uses the classic heap + secondary-index execution path
+**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, overflow-backed large rows, insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, and clustered-first secondary bookmarks now exist, but the SQL executor still uses the classic heap + secondary-index execution path
 
-**Next milestone:** 39.10 — overflow pages for large clustered rows, followed by clustered WAL/recovery wiring
+**Next milestone:** 39.11 — WAL support for clustered operations, followed by clustered crash recovery wiring
 
 **Concurrency note:** the current server already supports concurrent read-only
 queries, but mutating statements are still serialized through a database-wide
