@@ -43,6 +43,18 @@ const MIN_FREEBLOCK: usize = 4;
 /// valid child pointer assigned.
 pub const NULL_PAGE: u64 = u64::MAX;
 
+/// Maximum separator-key bytes that can fit on an otherwise empty clustered
+/// internal page.
+pub fn max_inline_key_bytes() -> usize {
+    BODY_SIZE - CI_HEADER_SIZE - CELL_PTR_SIZE - CELL_META_SIZE
+}
+
+/// Total on-page footprint of a clustered internal separator entry, including
+/// its 2-byte pointer-array slot.
+pub fn separator_footprint(key_len: usize) -> usize {
+    CELL_PTR_SIZE + CELL_META_SIZE + key_len
+}
+
 pub struct CellRef<'a> {
     pub key: &'a [u8],
     pub right_child: u64,

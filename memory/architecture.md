@@ -1,20 +1,28 @@
 # Architecture Notes
 
-## 2026-04-02 — Clustered internal page primitive
+## 2026-04-02 — Clustered internal page primitive and first tree write path
 
-- `crates/axiomdb-storage/src/clustered_internal.rs` now owns the clustered
+- `crates/axiomdb-storage/src/clustered_internal.rs` owns the clustered
   internal page format for Phase `39.2`.
-- The architecture keeps storage and tree responsibilities separate:
+- `crates/axiomdb-storage/src/clustered_tree.rs` now owns the first clustered
+  tree controller for Phase `39.3`.
+- The architecture still keeps storage and tree responsibilities separate:
   - storage owns page layout, free-space accounting, binary search, and page-local mutation
-  - the future clustered tree path (`39.3+`) will own parent propagation, splits, merges, and traversal integration
-- The child mapping rule is explicit:
+  - `clustered_tree` owns descent, split planning, separator propagation, and root growth
+  - the executor is still not wired to clustered tables
+- The child mapping rule remains explicit:
   - `leftmost_child` lives in the 16-byte page-local header
   - every separator cell stores only its `right_child`
   - logical child `i` is:
     - `0` → `leftmost_child`
     - `i > 0` → `right_child` of cell `i - 1`
-- This preserves the current internal-node traversal semantics without keeping a
-  fixed-width child array parallel to a variable-size key area.
+- The clustered split policy is intentionally in-place for the left half:
+  - old page ID stays as the left page
+  - only the new right sibling is allocated
+  - parent propagation inserts only `(separator_key, right_child_pid)`
+- Variable-size occupancy is measured in encoded bytes, not key count:
+  - clustered leaves split by cumulative cell footprint
+  - clustered internals split by cumulative separator footprint
 - `remove_at(key_pos, child_pos)` intentionally supports only the two adjacent
   child removals (`child_pos == key_pos` or `child_pos == key_pos + 1`), which
   matches real B-tree merge / redistribution semantics and avoids an overly

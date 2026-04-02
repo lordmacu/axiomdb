@@ -2,24 +2,26 @@
 
 ## 2026-04-02
 
-- Phase 39 subphase `39.2` is closed in code, targeted validation, and docs.
-- `axiomdb-storage` now has a clustered internal page primitive:
+- Phase 39 subphases `39.2` and `39.3` are closed in code, targeted validation,
+  and docs.
+- `axiomdb-storage` now has the first complete clustered-tree write path:
   - `PageType::ClusteredInternal = 6`
   - storage module `crates/axiomdb-storage/src/clustered_internal.rs`
-  - slotted variable-size separator keys
-  - `leftmost_child` in the page header
-  - `right_child` stored per separator cell
-- The new page-local API covers:
-  - initialization
-  - key and child access
-  - child updates
-  - binary-search child selection
-  - insert / remove
-  - free-space accounting
-  - defragmentation
+  - storage module `crates/axiomdb-storage/src/clustered_tree.rs`
+  - `clustered_tree::insert(storage, root_opt, key, row_header, row_data) -> Result<u64, DbError>`
+- Clustered tree behavior now includes:
+  - empty-tree root bootstrap into `ClusteredLeaf`
+  - descent over `ClusteredInternal` via `find_child_idx()`
+  - sorted inline row inserts into clustered leaves
+  - one defragmentation retry before split
+  - leaf split by cumulative cell byte volume
+  - internal split by cumulative separator byte volume
+  - root split into a new clustered internal page
+  - explicit rejection of rows that require overflow pages
 - The clustered rewrite remains storage-first:
   - current `axiomdb-index::BTree` still uses fixed-slot `InternalNodePage` / `LeafNodePage`
-  - `39.3+` will wire clustered pages into the actual tree and executor paths
+  - no SQL path creates or writes clustered tables yet
+  - `39.4` / `39.5` will add lookup and range-scan traversal over the new leaf chain
 - `39.1` is still not fully closed:
   - clustered leaf groundwork exists
   - large-row overflow remains deferred to `39.10`

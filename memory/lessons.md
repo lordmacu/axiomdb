@@ -1,5 +1,16 @@
 # Lessons Learned
 
+## 2026-04-02 - Variable-size clustered trees must split by byte volume and keep the left page stable
+
+- A clustered B-tree cannot reuse fixed-layout split intuition where “half the keys” is close to “half the page”.
+- For variable-size inline rows, the split unit must be encoded bytes on page, not cell count.
+- The simplest storage-first split policy is:
+  - keep the old page ID as the left half
+  - allocate only the new right sibling
+  - propagate only the separator key plus the new right child upward
+- That keeps parent maintenance small and makes root growth easier to reason about before WAL and crash recovery are wired in.
+- Rejecting overlarge rows explicitly is better than pretending clustered insert is complete before overflow pages exist.
+
 ## 2026-04-02 - Variable-size internal pages should preserve the old child-selection contract
 
 - When replacing a fixed-layout internal B-tree page with a slotted variable-size format, keep the navigation contract identical if later phases still depend on it.
