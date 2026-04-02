@@ -1,5 +1,6 @@
 //! # axiomdb-storage — storage engine: pages, mmap, free list, heap, meta, integrity
 
+pub mod clustered_internal;
 pub mod clustered_leaf;
 pub mod config;
 pub mod dirty;

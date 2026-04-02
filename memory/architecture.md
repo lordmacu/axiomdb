@@ -1,5 +1,25 @@
 # Architecture Notes
 
+## 2026-04-02 — Clustered internal page primitive
+
+- `crates/axiomdb-storage/src/clustered_internal.rs` now owns the clustered
+  internal page format for Phase `39.2`.
+- The architecture keeps storage and tree responsibilities separate:
+  - storage owns page layout, free-space accounting, binary search, and page-local mutation
+  - the future clustered tree path (`39.3+`) will own parent propagation, splits, merges, and traversal integration
+- The child mapping rule is explicit:
+  - `leftmost_child` lives in the 16-byte page-local header
+  - every separator cell stores only its `right_child`
+  - logical child `i` is:
+    - `0` → `leftmost_child`
+    - `i > 0` → `right_child` of cell `i - 1`
+- This preserves the current internal-node traversal semantics without keeping a
+  fixed-width child array parallel to a variable-size key area.
+- `remove_at(key_pos, child_pos)` intentionally supports only the two adjacent
+  child removals (`child_pos == key_pos` or `child_pos == key_pos + 1`), which
+  matches real B-tree merge / redistribution semantics and avoids an overly
+  permissive page-local API.
+
 ## 2026-03-29 — Thematic integration test binaries for `axiomdb-sql`
 
 - `crates/axiomdb-sql/tests/common/mod.rs` now owns the shared executor-test

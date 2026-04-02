@@ -1,5 +1,15 @@
 # Lessons Learned
 
+## 2026-04-02 - Variable-size internal pages should preserve the old child-selection contract
+
+- When replacing a fixed-layout internal B-tree page with a slotted variable-size format, keep the navigation contract identical if later phases still depend on it.
+- The simplest safe mapping is:
+  - store `leftmost_child` in the page header
+  - store only `right_child` in each separator cell
+- This preserves `n keys -> n + 1 children` and keeps `find_child_idx()` semantics unchanged.
+- A parallel variable-size child array looks tempting, but it creates more page-local mutation surface without buying simpler traversal.
+- If the page primitive preserves the old search contract, later tree/executor rewrites can happen incrementally instead of forcing a simultaneous redesign of traversal and storage.
+
 ## 2026-03-29 - Split integration tests by execution path, not by raw size alone
 
 - The right reason to split a large integration test file is mixed responsibility, not just line count.
