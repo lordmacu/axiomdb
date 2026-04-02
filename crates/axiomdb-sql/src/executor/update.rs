@@ -36,7 +36,26 @@ fn execute_update_ctx(
         .collect::<Result<_, DbError>>()?;
 
     let snap = txn.active_snapshot()?;
-    let candidate_rows: Vec<(RecordId, Vec<Value>)> = if let Some(ref wc) = stmt.where_clause {
+
+    // Pre-compute field-patch eligibility early — needed for both the fused
+    // index-range path and the standard candidate loop optimization.
+    let col_types: Vec<axiomdb_types::DataType> = schema_cols
+        .iter()
+        .map(|c| crate::table::column_type_to_data_type(c.col_type))
+        .collect();
+    let field_patch_eligible = ctx.strict_mode
+        && resolved.foreign_keys.is_empty()
+        && assignments.iter().all(|(col_pos, _)| {
+            axiomdb_types::field_patch::fixed_encoded_size(col_types[*col_pos]).is_some()
+        });
+
+    // ── Fused index-range patch (InnoDB-inspired) ────────────────────────
+    // When ALL of these hold, skip candidate collection entirely and patch
+    // fields directly on heap pages from B-tree RIDs in a single pass:
+    //   1. WHERE uses IndexRange on PRIMARY KEY
+    //   2. field_patch eligible (all SET cols fixed-size, no FKs)
+    //   3. No secondary indexes affected
+    if let Some(ref wc) = stmt.where_clause {
         let effective_coll = ctx.effective_collation();
         let update_access = crate::planner::plan_update_candidates_ctx(
             wc,
@@ -44,7 +63,27 @@ fn execute_update_ctx(
             &schema_cols,
             effective_coll,
         );
-        collect_delete_candidates(
+
+        if let crate::planner::AccessMethod::IndexRange { ref index_def, ref lo, ref hi } = update_access {
+            let has_affected_secondary = secondary_indexes.iter().any(|i| !i.is_primary);
+            if index_def.is_primary && field_patch_eligible && !has_affected_secondary {
+                return fused_index_range_patch(
+                    index_def,
+                    lo.as_deref(),
+                    hi.as_deref(),
+                    &assignments,
+                    &col_types,
+                    storage,
+                    txn,
+                    snap,
+                    &resolved,
+                    ctx,
+                );
+            }
+        }
+
+        // Fall through to standard candidate collection.
+        let candidate_rows: Vec<(RecordId, Vec<Value>)> = collect_delete_candidates(
             wc,
             &secondary_indexes,
             &schema_cols,
@@ -53,12 +92,226 @@ fn execute_update_ctx(
             snap,
             &resolved.def,
             bloom,
-        )?
-    } else {
-        // UPDATE always needs all columns: unchanged columns carry over as-is to
-        // the new row. Lazy decode (column_mask) does not help here.
-        TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?
-    };
+        )?;
+
+        return execute_update_with_candidates(
+            candidate_rows,
+            assignments,
+            &schema_cols,
+            &secondary_indexes,
+            &col_types,
+            field_patch_eligible,
+            storage,
+            txn,
+            snap,
+            &resolved,
+            ctx,
+            bloom,
+        );
+    }
+
+    // No WHERE clause — full table scan.
+    let candidate_rows: Vec<(RecordId, Vec<Value>)> =
+        TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?;
+
+    execute_update_with_candidates(
+        candidate_rows,
+        assignments,
+        &schema_cols,
+        &secondary_indexes,
+        &col_types,
+        field_patch_eligible,
+        storage,
+        txn,
+        snap,
+        &resolved,
+        ctx,
+        bloom,
+    )
+}
+
+/// Fused index-range patch: B-tree range scan → group by page → patch fields
+/// directly on heap pages without decoding rows. Eliminates:
+/// - Full row decode (5000× for typical range)
+/// - WHERE recheck (redundant, index already filtered)
+/// - Double heap page read (candidate collection + patch phase)
+fn fused_index_range_patch(
+    index_def: &axiomdb_catalog::IndexDef,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+    assignments: &[(usize, Expr)],
+    col_types: &[axiomdb_types::DataType],
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    snap: axiomdb_core::TransactionSnapshot,
+    resolved: &axiomdb_catalog::ResolvedTable,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let _txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+
+    // 1. B-tree range scan → collect RecordIds only.
+    let pairs = BTree::range_in(storage, index_def.root_page_id, lo, hi)?;
+    let rids: Vec<RecordId> = pairs.into_iter().map(|(rid, _)| rid).collect();
+
+    if rids.is_empty() {
+        return Ok(QueryResult::Affected {
+            count: 0,
+            last_insert_id: None,
+        });
+    }
+
+    // 2. Group RIDs by page_id for sequential page access.
+    let mut page_groups: std::collections::BTreeMap<u64, Vec<u16>> =
+        std::collections::BTreeMap::new();
+    for rid in &rids {
+        page_groups
+            .entry(rid.page_id)
+            .or_default()
+            .push(rid.slot_id);
+    }
+
+    // 3. For each page: read → patch visible matching slots → write.
+    let hdr_size = std::mem::size_of::<axiomdb_storage::RowHeader>();
+    let bitmap_len = col_types.len().div_ceil(8);
+    let n_cols = col_types.len();
+
+    #[allow(clippy::type_complexity)]
+    let mut wal_images: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, u64, u16)> = Vec::new();
+    let mut matched = 0u64;
+    let mut patched = 0u64;
+
+    // Reusable sparse row for eval(): only populated at assigned column positions.
+    let mut sparse_row: Vec<Value> = vec![Value::Null; n_cols];
+
+    for (page_id, slot_ids) in &page_groups {
+        let mut page = storage.read_page(*page_id)?.into_page();
+        let mut page_dirty = false;
+
+        for &slot_id in slot_ids {
+            let entry = axiomdb_storage::heap::read_slot(&page, slot_id);
+            if entry.is_dead() {
+                continue;
+            }
+            let off = entry.offset as usize;
+            let len = entry.length as usize;
+
+            // MVCC visibility check (O(1): just txn_id comparisons).
+            // Copy header fields to avoid holding an immutable borrow across mutations.
+            let (hdr_visible, hdr_txn_created, hdr_version, hdr_flags) = {
+                let hdr: &axiomdb_storage::RowHeader =
+                    bytemuck::from_bytes(&page.as_bytes()[off..off + hdr_size]);
+                (
+                    hdr.is_visible(&snap),
+                    hdr.txn_id_created,
+                    hdr.row_version,
+                    hdr._flags,
+                )
+            };
+            if !hdr_visible {
+                continue;
+            }
+            matched += 1;
+
+            // Capture old tuple image BEFORE patching.
+            let old_image = page.as_bytes()[off..off + len].to_vec();
+
+            let row_start = off + hdr_size;
+            let row_len = len - hdr_size;
+            let bitmap = page.as_bytes()[row_start..row_start + bitmap_len].to_vec();
+
+            // For each assignment: read field → eval → write field.
+            let mut changed = false;
+            for &(col_pos, ref val_expr) in assignments {
+                let row_data = &page.as_bytes()[row_start..row_start + row_len];
+                if let Some(loc) =
+                    axiomdb_types::field_patch::compute_field_location_runtime(
+                        col_types,
+                        col_pos,
+                        &bitmap,
+                        Some(row_data),
+                    )
+                {
+                    let current_val =
+                        axiomdb_types::field_patch::read_field(row_data, &loc)?;
+                    // Populate sparse row for eval, then reset after.
+                    sparse_row[col_pos] = current_val.clone();
+                    let new_val = eval(val_expr, &sparse_row)?;
+                    sparse_row[col_pos] = Value::Null;
+
+                    if new_val != current_val {
+                        changed = true;
+                        let row_mut =
+                            &mut page.as_bytes_mut()[row_start..row_start + row_len];
+                        let _ = axiomdb_types::field_patch::write_field(
+                            row_mut, &loc, &new_val,
+                        );
+                    }
+                }
+            }
+
+            if changed {
+                // Increment row version, preserve txn_id_created.
+                let new_hdr = axiomdb_storage::RowHeader {
+                    txn_id_created: hdr_txn_created,
+                    txn_id_deleted: 0,
+                    row_version: hdr_version.wrapping_add(1),
+                    _flags: hdr_flags,
+                };
+                page.as_bytes_mut()[off..off + hdr_size]
+                    .copy_from_slice(bytemuck::bytes_of(&new_hdr));
+
+                let new_image = page.as_bytes()[off..off + len].to_vec();
+                wal_images.push((vec![], old_image, new_image, *page_id, slot_id));
+                page.clear_all_visible();
+                page_dirty = true;
+                patched += 1;
+            }
+        }
+
+        if page_dirty {
+            page.update_checksum();
+            storage.write_page(*page_id, &page)?;
+        }
+    }
+
+    // WAL: batch UpdateInPlace with old+new tuple images.
+    if !wal_images.is_empty() {
+        let batch_refs: Vec<(&[u8], &[u8], &[u8], u64, u16)> = wal_images
+            .iter()
+            .map(|(k, old, new, pid, sid)| {
+                (k.as_slice(), old.as_slice(), new.as_slice(), *pid, *sid)
+            })
+            .collect();
+        txn.record_update_in_place_batch(resolved.def.id, &batch_refs)?;
+    }
+
+    if patched > 0 {
+        ctx.stats.on_rows_changed(resolved.def.id, patched);
+    }
+    ctx.invalidate_all();
+
+    Ok(QueryResult::Affected {
+        count: matched,
+        last_insert_id: None,
+    })
+}
+
+/// Standard UPDATE path: processes pre-collected candidate rows through
+/// expression evaluation, FK validation, and field-patch or full-encode paths.
+fn execute_update_with_candidates(
+    candidate_rows: Vec<(RecordId, Vec<Value>)>,
+    assignments: Vec<(usize, Expr)>,
+    schema_cols: &[axiomdb_catalog::schema::ColumnDef],
+    secondary_indexes: &[axiomdb_catalog::IndexDef],
+    col_types: &[axiomdb_types::DataType],
+    field_patch_eligible: bool,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    snap: axiomdb_core::TransactionSnapshot,
+    resolved: &axiomdb_catalog::ResolvedTable,
+    ctx: &mut SessionContext,
+    bloom: &mut crate::bloom::BloomRegistry,
+) -> Result<QueryResult, DbError> {
 
     // Collect all matching (rid, old_values, new_values) triples before touching
     // the heap. Old values are kept for secondary index maintenance (delete old
@@ -67,30 +320,55 @@ fn execute_update_ctx(
     // No-op partition (Phase 6.20): rows whose evaluated new_values == old_values
     // skip heap and index mutation. `count` remains the matched-row count (MySQL
     // semantics) — physical no-ops still count as "affected".
+    //
+    // When the field-patch fast path is eligible AND no secondary indexes need
+    // maintenance, we store only the sparse assigned-column values instead of
+    // cloning the full row — eliminating String clones for unchanged columns.
+    let needs_full_row = !field_patch_eligible || !secondary_indexes.is_empty();
+
     let mut to_update: Vec<(RecordId, Vec<Value>, Vec<Value>)> = Vec::new();
+    // Sparse path: (rid, [(col_pos, new_value)])
+    let mut to_update_sparse: Vec<(RecordId, Vec<(usize, Value)>)> = Vec::new();
     let mut matched_count: u64 = 0;
+
     for (rid, current_values) in candidate_rows {
-        // Evaluate assigned columns without cloning the full row.
-        // Build new_values by iterating columns once, cloning only non-assigned
-        // values and evaluating expressions for assigned ones.
-        let mut changed = false;
-        let mut new_values = Vec::with_capacity(current_values.len());
-        for (ci, cv) in current_values.iter().enumerate() {
-            if let Some((_, val_expr)) = assignments.iter().find(|(pos, _)| *pos == ci) {
+        matched_count += 1;
+        if needs_full_row {
+            // Full-row path: build complete new_values (normal path / FK / index maintenance).
+            let mut changed = false;
+            let mut new_values = Vec::with_capacity(current_values.len());
+            for (ci, cv) in current_values.iter().enumerate() {
+                if let Some((_, val_expr)) = assignments.iter().find(|(pos, _)| *pos == ci) {
+                    let nv = eval(val_expr, &current_values)?;
+                    if nv != *cv {
+                        changed = true;
+                    }
+                    new_values.push(nv);
+                } else {
+                    new_values.push(cv.clone());
+                }
+            }
+            if !changed {
+                continue;
+            }
+            to_update.push((rid, current_values, new_values));
+        } else {
+            // Sparse path: only evaluate and store assigned columns.
+            // Avoids cloning unchanged columns (e.g., String fields like name/email).
+            let mut sparse = Vec::with_capacity(assignments.len());
+            let mut changed = false;
+            for &(col_pos, ref val_expr) in &assignments {
                 let nv = eval(val_expr, &current_values)?;
-                if nv != *cv {
+                if nv != current_values[col_pos] {
                     changed = true;
                 }
-                new_values.push(nv);
-            } else {
-                new_values.push(cv.clone());
+                sparse.push((col_pos, nv));
             }
+            if !changed {
+                continue;
+            }
+            to_update_sparse.push((rid, sparse));
         }
-        matched_count += 1;
-        if !changed {
-            continue; // no-op: skip heap/index work
-        }
-        to_update.push((rid, current_values, new_values));
     }
 
     // FK child validation: check new FK values before applying any updates.
@@ -132,30 +410,47 @@ fn execute_update_ctx(
     // Timestamp) and no variable-length columns precede them, patch the
     // encoded bytes directly in the heap page — skip full decode + encode.
     // Reduces per-row work from ~469 bytes to ~28 bytes (16.75× less).
-    let col_types: Vec<axiomdb_types::DataType> = schema_cols
-        .iter()
-        .map(|c| crate::table::column_type_to_data_type(c.col_type))
-        .collect();
-    let field_patch_eligible = !to_update.is_empty()
-        && ctx.strict_mode
-        && assignments.iter().all(|(col_pos, _)| {
-            // Check target column is fixed-size (patchable).
-            axiomdb_types::field_patch::fixed_encoded_size(col_types[*col_pos]).is_some()
-        });
+    //
+    // The sparse path (to_update_sparse) avoids cloning unchanged columns,
+    // eliminating String allocations for non-assigned fields.
 
-    if field_patch_eligible && resolved.foreign_keys.is_empty() {
+    let use_sparse_fast_path = field_patch_eligible
+        && !to_update_sparse.is_empty()
+        && resolved.foreign_keys.is_empty();
+    let use_full_fast_path = !use_sparse_fast_path
+        && !to_update.is_empty()
+        && field_patch_eligible
+        && resolved.foreign_keys.is_empty();
+
+    if use_sparse_fast_path || use_full_fast_path {
         // Fast path: patch fields in-place on heap pages.
         let _txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
         let mut patched = 0u64;
 
-        // Group updates by page_id for batch page processing.
-        let mut page_groups: std::collections::BTreeMap<u64, Vec<(u16, &Vec<Value>)>> =
+        // Build page groups from either sparse or full data.
+        // Sparse: (slot_id, &[(col_pos, Value)])
+        // Full:   (slot_id, &Vec<Value>)
+        enum SlotData<'a> {
+            Sparse(&'a [(usize, Value)]),
+            Full(&'a Vec<Value>),
+        }
+
+        let mut page_groups: std::collections::BTreeMap<u64, Vec<(u16, SlotData<'_>)>> =
             std::collections::BTreeMap::new();
-        for (rid, _old, new_vals) in &to_update {
-            page_groups
-                .entry(rid.page_id)
-                .or_default()
-                .push((rid.slot_id, new_vals));
+        if use_sparse_fast_path {
+            for (rid, sparse_vals) in &to_update_sparse {
+                page_groups
+                    .entry(rid.page_id)
+                    .or_default()
+                    .push((rid.slot_id, SlotData::Sparse(sparse_vals)));
+            }
+        } else {
+            for (rid, _old, new_vals) in &to_update {
+                page_groups
+                    .entry(rid.page_id)
+                    .or_default()
+                    .push((rid.slot_id, SlotData::Full(new_vals)));
+            }
         }
 
         // Collect WAL images: (key, old_tuple_image, new_tuple_image, page_id, slot_id).
@@ -167,7 +462,7 @@ fn execute_update_ctx(
             let mut page = storage.read_page(*page_id)?.into_page();
             let mut page_dirty = false;
 
-            for &(slot_id, new_vals) in slots {
+            for &(slot_id, ref slot_data) in slots {
                 let entry = axiomdb_storage::heap::read_slot(&page, slot_id);
                 if entry.is_dead() {
                     continue;
@@ -204,22 +499,46 @@ fn execute_update_ctx(
 
                 // Patch each changed field directly.
                 let row_len = len - hdr_size;
-                for &(col_pos, _) in &assignments {
-                    let row_data_slice =
-                        &page.as_bytes()[row_start..row_start + row_len];
-                    if let Some(loc) =
-                        axiomdb_types::field_patch::compute_field_location_runtime(
-                            &col_types,
-                            col_pos,
-                            &bitmap,
-                            Some(row_data_slice),
-                        )
-                    {
-                        let row_data_mut =
-                            &mut page.as_bytes_mut()[row_start..row_start + row_len];
-                        let _ = axiomdb_types::field_patch::write_field(
-                            row_data_mut, &loc, &new_vals[col_pos],
-                        );
+                match slot_data {
+                    SlotData::Sparse(sparse_vals) => {
+                        for (col_pos, new_val) in *sparse_vals {
+                            let row_data_slice =
+                                &page.as_bytes()[row_start..row_start + row_len];
+                            if let Some(loc) =
+                                axiomdb_types::field_patch::compute_field_location_runtime(
+                                    &col_types,
+                                    *col_pos,
+                                    &bitmap,
+                                    Some(row_data_slice),
+                                )
+                            {
+                                let row_data_mut =
+                                    &mut page.as_bytes_mut()[row_start..row_start + row_len];
+                                let _ = axiomdb_types::field_patch::write_field(
+                                    row_data_mut, &loc, new_val,
+                                );
+                            }
+                        }
+                    }
+                    SlotData::Full(new_vals) => {
+                        for &(col_pos, _) in &assignments {
+                            let row_data_slice =
+                                &page.as_bytes()[row_start..row_start + row_len];
+                            if let Some(loc) =
+                                axiomdb_types::field_patch::compute_field_location_runtime(
+                                    &col_types,
+                                    col_pos,
+                                    &bitmap,
+                                    Some(row_data_slice),
+                                )
+                            {
+                                let row_data_mut =
+                                    &mut page.as_bytes_mut()[row_start..row_start + row_len];
+                                let _ = axiomdb_types::field_patch::write_field(
+                                    row_data_mut, &loc, &new_vals[col_pos],
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -304,7 +623,7 @@ fn execute_update_ctx(
             statement_might_affect_indexes(&secondary_indexes, &compiled_preds, &assignments);
 
         if any_index_affected || !all_rids_stable {
-            let mut current_indexes = secondary_indexes;
+            let mut current_indexes = secondary_indexes.to_vec();
             let update_pairs: Vec<(RecordId, Vec<Value>, RecordId, Vec<Value>)> = to_update
                 .into_iter()
                 .zip(new_rids)

@@ -140,6 +140,31 @@ fn execute_delete_ctx(
 /// in the query's SELECT list will cause the caller to pass `None` instead (full
 /// decode), so this function is only called when the select list is fully
 /// resolved to column expressions.
+/// Collect column indices referenced in an expression into a boolean mask.
+/// Used to build the two-phase decode mask: only decode WHERE columns first.
+fn collect_where_columns(e: &Expr, mask: &mut [bool]) {
+    match e {
+        Expr::Column { col_idx, .. } => {
+            if *col_idx < mask.len() {
+                mask[*col_idx] = true;
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_where_columns(left, mask);
+            collect_where_columns(right, mask);
+        }
+        Expr::UnaryOp { operand, .. } => {
+            collect_where_columns(operand, mask);
+        }
+        Expr::Function { args, .. } => {
+            for arg in args {
+                collect_where_columns(arg, mask);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_delete_candidates(
     where_clause: &Expr,
     _indexes: &[axiomdb_catalog::IndexDef],
@@ -154,15 +179,44 @@ fn collect_delete_candidates(
 
     match access {
         AccessMethod::Scan | AccessMethod::IndexOnlyScan { .. } => {
-            // Full heap scan — existing behavior.
-            let rows = TableEngine::scan_table(storage, table_def, schema_cols, snap, None)?;
-            rows.into_iter()
-                .filter_map(|(rid, values)| match eval(where_clause, &values) {
-                    Ok(v) if is_truthy(&v) => Some(Ok((rid, values))),
-                    Ok(_) => None,
-                    Err(e) => Some(Err(e)),
-                })
-                .collect::<Result<_, DbError>>()
+            // Optimized scan: compile a BatchPredicate for zero-alloc raw-byte
+            // predicate evaluation, zone map page skipping, and two-phase decode
+            // (only decode WHERE columns first, full decode only for matching rows).
+            // Mirrors the SELECT path in select.rs for parity.
+            let col_types: Vec<axiomdb_types::DataType> = schema_cols
+                .iter()
+                .map(|c| crate::table::column_type_to_data_type(c.col_type))
+                .collect();
+            let batch_pred = crate::eval::batch::try_compile(where_clause, &col_types);
+            let zm_pred =
+                crate::planner::extract_zone_map_predicate(where_clause, schema_cols);
+
+            // Build WHERE column mask for two-phase decode: only decode columns
+            // referenced in the WHERE clause first, skip full decode for non-matching rows.
+            let n_cols = schema_cols.len();
+            let where_col_mask = {
+                let mut mask = vec![false; n_cols];
+                collect_where_columns(where_clause, &mut mask);
+                if mask.iter().filter(|&&b| b).count() < n_cols {
+                    Some(mask)
+                } else {
+                    None
+                }
+            };
+
+            TableEngine::scan_table_filtered(
+                storage,
+                table_def,
+                schema_cols,
+                snap,
+                |values| match eval(where_clause, values) {
+                    Ok(v) => is_truthy(&v),
+                    Err(_) => true, // include on error, let caller handle
+                },
+                zm_pred.as_ref().map(|(ci, p)| (*ci, p)),
+                where_col_mask.as_deref(),
+                batch_pred.as_ref(),
+            )
         }
 
         AccessMethod::IndexLookup { index_def, key } => {
