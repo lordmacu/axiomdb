@@ -154,6 +154,8 @@ fn test_resolve_table_includes_indexes() {
             fillfactor: 90,
             is_fk_index: false,
             include_columns: vec![],
+            index_type: 0,
+            pages_per_range: 128,
         })
         .unwrap();
         w.create_index(IndexDef {
@@ -168,6 +170,8 @@ fn test_resolve_table_includes_indexes() {
             fillfactor: 90,
             is_fk_index: false,
             include_columns: vec![],
+            index_type: 0,
+            pages_per_range: 128,
         })
         .unwrap();
         tid
