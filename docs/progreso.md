@@ -320,7 +320,7 @@
 - [x] 10.3 ✅ Compile as `cdylib` — `crate-type = ["rlib", "cdylib", "staticlib"]`; libaxiomdb_embedded.dylib (1.9MB), .a (34MB)
 - [x] 10.4 ✅ Python binding — `bindings/python/axiomdb.py` ctypes wrapper; AxiomDB class with context manager; query() returns List[Dict]; auto-discovers library; demo: DDL+DML+SELECT+WHERE+COUNT
 - [x] 10.5 ✅ Embedded test — 22 integration tests in crates/axiomdb-embedded/tests/integration.rs (open, query, DDL, WHERE, transactions, error handling)
-- [ ] 10.6 ⏳ Node.js binding (Neon) — native `.node` module for Electron and Node apps; async/await API
+- [x] 10.6 ✅ Node.js binding — `bindings/nodejs/axiomdb.mjs` using koffi FFI (no node-gyp); AxiomDB class with execute/query/close; query returns Array<Object>; tested Node v24.14.1 macOS ARM
 - [ ] 10.7 ⏳ Embedded vs server benchmark — compare in-process vs TCP loopback latency to demonstrate embedded advantage
 - [ ] 10.8 ⏳ PreparedStatement Rust API — `db.prepare(sql) -> PreparedStatement`; `stmt.execute(params: &[Value])` runs N times reusing the parsed + analyzed plan without calling parse/analyze again; separate from COM_STMT_PREPARE (5.10, wire-only) — this is for the embedded Rust API where there is no MySQL wire protocol; eliminates parse+analyze overhead in tight loops (primary cause of the 15-24x INSERT gap vs SQLite in embedded benchmarks); MySQL C API has `mysql_stmt_prepare()`, libpq has `PQprepare()`, SQLite has `sqlite3_prepare_v2()` — all three competitors require this for serious embedded performance; must invalidate the cached plan on DDL changes (reuse schema_version mechanism from 5.13); implement after 10.1 (lib.rs refactor) since the public API shape depends on it
 
