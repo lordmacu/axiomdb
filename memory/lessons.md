@@ -1,5 +1,20 @@
 # Lessons Learned
 
+## 2026-04-02 - Clustered update should be same-leaf or explicit failure before undo and split/merge exist
+
+- A storage-first clustered update should not silently turn into delete+insert across the tree.
+- The right intermediate contract is:
+  - find the exact owning leaf
+  - rewrite the current inline version there
+  - preserve key order and `next_leaf`
+  - fail explicitly when the row no longer fits in that same leaf
+- `research/sqlite/src/btree.c` contributed the overwrite optimization idea for
+  unchanged cell budgets.
+- The AxiomDB adaptation is narrower on purpose: overwrite when possible, rebuild
+  the same leaf when growth still fits, and return `HeapPageFull` otherwise.
+- That keeps `39.6` from stealing work from clustered delete, split/merge,
+  overflow, undo, and secondary-index phases.
+
 ## 2026-04-02 - Storage-first clustered range scan should seek once, then walk the leaf chain
 
 - A clustered range scan should not re-descend the tree for every next row.

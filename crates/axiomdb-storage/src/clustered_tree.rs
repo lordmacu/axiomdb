@@ -153,6 +153,61 @@ pub fn range<'a>(
     })
 }
 
+/// Rewrites the current inline version of one clustered row in the owning leaf
+/// page without changing the primary key or tree structure.
+pub fn update_in_place(
+    storage: &mut dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    new_row_data: &[u8],
+    txn_id: u64,
+    snapshot: &TransactionSnapshot,
+) -> Result<bool, DbError> {
+    validate_inline_row(key, new_row_data)?;
+
+    let Some(root_pid) = root_pid else {
+        return Ok(false);
+    };
+
+    let leaf_ref = descend_to_leaf(storage, root_pid, key)?;
+    let pos = match leaf_search_checked(&leaf_ref, key)? {
+        Ok(pos) => pos,
+        Err(_) => return Ok(false),
+    };
+
+    let (old_header, old_row_len) = {
+        let cell = clustered_leaf::read_cell(&leaf_ref, pos as u16)?;
+        if !cell.row_header.is_visible(snapshot) {
+            return Ok(false);
+        }
+        (cell.row_header, cell.row_data.len())
+    };
+
+    let mut page = leaf_ref.into_page();
+    let page_id = page.header().page_id;
+    let available =
+        clustered_leaf::free_space(&page) + clustered_leaf::cell_footprint(key.len(), old_row_len);
+    let needed = clustered_leaf::cell_footprint(key.len(), new_row_data.len());
+    let new_header = RowHeader {
+        txn_id_created: txn_id,
+        txn_id_deleted: 0,
+        row_version: old_header.row_version.saturating_add(1),
+        _flags: old_header._flags,
+    };
+
+    match clustered_leaf::rewrite_cell_same_key(&mut page, pos, key, &new_header, new_row_data)? {
+        Some(_) => {
+            write_page(storage, page_id, &mut page)?;
+            Ok(true)
+        }
+        None => Err(DbError::HeapPageFull {
+            page_id,
+            needed,
+            available,
+        }),
+    }
+}
+
 fn insert_subtree(
     storage: &mut dyn StorageEngine,
     pid: u64,
@@ -1111,6 +1166,229 @@ mod tests {
 
         assert_eq!(got.key, 93u32.to_be_bytes());
         assert_eq!(got.row_data, row_bytes(93, 3_000));
+    }
+
+    #[test]
+    fn update_in_place_empty_tree_returns_false() {
+        let mut storage = MemoryStorage::new();
+        let changed = update_in_place(
+            &mut storage,
+            None,
+            b"missing",
+            b"new-row",
+            9,
+            &committed_snapshot(4),
+        )
+        .unwrap();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn update_in_place_missing_key_returns_false() {
+        let mut storage = MemoryStorage::new();
+        let mut root = None;
+        for key in [b"alpha".as_slice(), b"bravo", b"charlie"] {
+            root = Some(insert(&mut storage, root, key, &row_header(1), b"row").unwrap());
+        }
+
+        let changed = update_in_place(
+            &mut storage,
+            root,
+            b"delta",
+            b"updated",
+            9,
+            &committed_snapshot(4),
+        )
+        .unwrap();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn update_in_place_invisible_current_version_returns_false() {
+        let mut storage = MemoryStorage::new();
+        let root = insert(
+            &mut storage,
+            None,
+            b"future",
+            &row_header(9),
+            b"not-committed-yet",
+        )
+        .unwrap();
+
+        let changed = update_in_place(
+            &mut storage,
+            Some(root),
+            b"future",
+            b"replacement",
+            12,
+            &committed_snapshot(4),
+        )
+        .unwrap();
+        assert!(!changed);
+
+        let still_old = lookup(&storage, Some(root), b"future", &active_snapshot(9, 4))
+            .unwrap()
+            .expect("original row must stay unchanged");
+        assert_eq!(still_old.row_data, b"not-committed-yet");
+        assert_eq!(still_old.row_header.txn_id_created, 9);
+    }
+
+    #[test]
+    fn update_in_place_root_leaf_growth_rewrites_row_and_bumps_version() {
+        let mut storage = MemoryStorage::new();
+        let mut root = None;
+
+        for key in 0u32..4 {
+            root = Some(
+                insert(
+                    &mut storage,
+                    root,
+                    &key.to_be_bytes(),
+                    &row_header(1),
+                    &vec![key as u8; 400],
+                )
+                .unwrap(),
+            );
+        }
+
+        let root = root.unwrap();
+        let changed = update_in_place(
+            &mut storage,
+            Some(root),
+            &2u32.to_be_bytes(),
+            &vec![7u8; 2_000],
+            9,
+            &active_snapshot(9, 1),
+        )
+        .unwrap();
+        assert!(changed);
+
+        let row = lookup(
+            &storage,
+            Some(root),
+            &2u32.to_be_bytes(),
+            &active_snapshot(9, 1),
+        )
+        .unwrap()
+        .expect("updated row must be visible to updater");
+        assert_eq!(row.key, 2u32.to_be_bytes());
+        assert_eq!(row.row_data, vec![7u8; 2_000]);
+        assert_eq!(row.row_header.txn_id_created, 9);
+        assert_eq!(row.row_header.row_version, 1);
+
+        let old_snapshot = lookup(
+            &storage,
+            Some(root),
+            &2u32.to_be_bytes(),
+            &committed_snapshot(1),
+        )
+        .unwrap();
+        assert!(old_snapshot.is_none());
+    }
+
+    #[test]
+    fn update_in_place_on_split_tree_preserves_leaf_identity_and_next_link() {
+        let mut storage = MemoryStorage::new();
+        let mut root = None;
+
+        for key in 0u32..128 {
+            root = Some(
+                insert(
+                    &mut storage,
+                    root,
+                    &key.to_be_bytes(),
+                    &row_header(1),
+                    &vec![key as u8; 300],
+                )
+                .unwrap(),
+            );
+        }
+
+        let root = root.unwrap();
+        let before_leaf = descend_to_leaf(&storage, root, &63u32.to_be_bytes())
+            .unwrap()
+            .header()
+            .page_id;
+        let before_next = {
+            let page = storage.read_page(before_leaf).unwrap();
+            clustered_leaf::next_leaf(&page)
+        };
+
+        let changed = update_in_place(
+            &mut storage,
+            Some(root),
+            &63u32.to_be_bytes(),
+            &vec![9u8; 700],
+            11,
+            &active_snapshot(11, 1),
+        )
+        .unwrap();
+        assert!(changed);
+
+        let after_leaf = descend_to_leaf(&storage, root, &63u32.to_be_bytes())
+            .unwrap()
+            .header()
+            .page_id;
+        let after_next = {
+            let page = storage.read_page(after_leaf).unwrap();
+            clustered_leaf::next_leaf(&page)
+        };
+
+        assert_eq!(after_leaf, before_leaf);
+        assert_eq!(after_next, before_next);
+
+        let row = lookup(
+            &storage,
+            Some(root),
+            &63u32.to_be_bytes(),
+            &active_snapshot(11, 1),
+        )
+        .unwrap()
+        .expect("updated row must remain reachable");
+        assert_eq!(row.row_data, vec![9u8; 700]);
+        assert_eq!(row.row_header.row_version, 1);
+    }
+
+    #[test]
+    fn update_in_place_returns_heap_page_full_when_growth_cannot_stay_in_leaf() {
+        let mut storage = MemoryStorage::new();
+        let mut root = None;
+
+        for key in 0u32..7 {
+            root = Some(
+                insert(
+                    &mut storage,
+                    root,
+                    &key.to_be_bytes(),
+                    &row_header(1),
+                    &vec![key as u8; 2_100],
+                )
+                .unwrap(),
+            );
+        }
+
+        let root = root.unwrap();
+        let err = update_in_place(
+            &mut storage,
+            Some(root),
+            &0u32.to_be_bytes(),
+            &vec![9u8; 8_000],
+            8,
+            &active_snapshot(8, 1),
+        )
+        .unwrap_err();
+        assert!(matches!(err, DbError::HeapPageFull { .. }));
+
+        let row = lookup(
+            &storage,
+            Some(root),
+            &0u32.to_be_bytes(),
+            &committed_snapshot(1),
+        )
+        .unwrap()
+        .expect("failed update must leave old row intact");
+        assert_eq!(row.row_data, vec![0u8; 2_100]);
+        assert_eq!(row.row_header.txn_id_created, 1);
     }
 
     #[test]

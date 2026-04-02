@@ -203,6 +203,13 @@ pub struct CellRef<'a> {
     pub row_data: &'a [u8],
 }
 
+#[derive(Debug, Clone)]
+struct OwnedCell {
+    key: Vec<u8>,
+    row_header: RowHeader,
+    row_data: Vec<u8>,
+}
+
 /// Read cell at logical index `idx` (0-based, sorted by key).
 pub fn read_cell(page: &Page, idx: u16) -> Result<CellRef<'_>, DbError> {
     let n = num_cells(page);
@@ -306,6 +313,22 @@ pub fn free_space(page: &Page) -> usize {
     let gap = gap_space(page);
     let fb = total_freeblock_space(page);
     gap + fb
+}
+
+fn add_freeblock(page: &mut Page, body_off: u16, size: usize) {
+    if size < MIN_FREEBLOCK {
+        return;
+    }
+
+    let old_head = freeblock_offset(page);
+    let abs = HEADER_SIZE + body_off as usize;
+    let b = page.as_bytes_mut();
+    b[abs..abs + 2].copy_from_slice(&old_head.to_le_bytes());
+    b[abs + 2..abs + 4].copy_from_slice(&(size as u16).to_le_bytes());
+    if size > MIN_FREEBLOCK {
+        b[abs + MIN_FREEBLOCK..abs + size].fill(0);
+    }
+    set_freeblock_offset(page, body_off);
 }
 
 /// Gap space only (contiguous, between pointer array and cell content).
@@ -462,6 +485,84 @@ pub fn insert_cell(
     Ok(())
 }
 
+/// Rewrites the cell at logical index `pos` while preserving its key and slot.
+///
+/// Returns the previous encoded cell image on success. If the replacement row
+/// does not fit in the same leaf page even after rebuilding the leaf contents
+/// compactly, returns `Ok(None)` and leaves the page unchanged.
+pub fn rewrite_cell_same_key(
+    page: &mut Page,
+    pos: usize,
+    expected_key: &[u8],
+    new_row_header: &RowHeader,
+    new_row_data: &[u8],
+) -> Result<Option<Vec<u8>>, DbError> {
+    let n = num_cells(page) as usize;
+    if pos >= n {
+        return Err(DbError::Other(format!(
+            "clustered_leaf: rewrite pos {pos} >= num_cells {n}"
+        )));
+    }
+
+    let body_off = cell_ptr_at(page, pos as u16);
+    let old_size = cell_size_at(page, body_off);
+    let old_cell = read_cell(page, pos as u16)?;
+    if old_cell.key != expected_key {
+        return Err(DbError::BTreeCorrupted {
+            msg: format!(
+                "clustered_leaf rewrite key mismatch at pos {pos}: expected {:?}, found {:?}",
+                expected_key, old_cell.key
+            ),
+        });
+    }
+
+    let old_image = cell_image_at(page, body_off)?;
+    let new_image = encode_cell_image(expected_key, new_row_header, new_row_data);
+    let new_size = new_image.len();
+
+    if new_size <= old_size {
+        write_cell_image(page, body_off, &new_image);
+        if new_size < old_size {
+            let free_off = body_off + new_size as u16;
+            page.as_bytes_mut()
+                [HEADER_SIZE + free_off as usize..HEADER_SIZE + body_off as usize + old_size]
+                .fill(0);
+            add_freeblock(page, free_off, old_size - new_size);
+        }
+        return Ok(Some(old_image));
+    }
+
+    let mut cells = collect_cells(page)?;
+    cells[pos] = OwnedCell {
+        key: expected_key.to_vec(),
+        row_header: *new_row_header,
+        row_data: new_row_data.to_vec(),
+    };
+
+    let next = next_leaf(page);
+    let pid = page.header().page_id;
+    let mut rebuilt = Page::new(PageType::ClusteredLeaf, pid);
+    init_clustered_leaf(&mut rebuilt);
+    set_next_leaf(&mut rebuilt, next);
+
+    for (idx, cell) in cells.iter().enumerate() {
+        match insert_cell(
+            &mut rebuilt,
+            idx,
+            &cell.key,
+            &cell.row_header,
+            &cell.row_data,
+        ) {
+            Ok(()) => {}
+            Err(DbError::HeapPageFull { .. }) => return Ok(None),
+            Err(err) => return Err(err),
+        }
+    }
+
+    *page = rebuilt;
+    Ok(Some(old_image))
+}
+
 // ── Remove ───────────────────────────────────────────────────────────────────
 
 /// Remove the cell at logical index `pos`. Adds the freed space to the
@@ -478,14 +579,7 @@ pub fn remove_cell(page: &mut Page, pos: usize) -> Result<(), DbError> {
     let csize = cell_size_at(page, body_off);
 
     // Add freed space to freeblock chain (if large enough).
-    if csize >= MIN_FREEBLOCK {
-        let old_head = freeblock_offset(page);
-        let abs = HEADER_SIZE + body_off as usize;
-        let b = page.as_bytes_mut();
-        b[abs..abs + 2].copy_from_slice(&old_head.to_le_bytes());
-        b[abs + 2..abs + 4].copy_from_slice(&(csize as u16).to_le_bytes());
-        set_freeblock_offset(page, body_off);
-    }
+    add_freeblock(page, body_off, csize);
     // Fragments < MIN_FREEBLOCK are lost until defragmentation.
 
     // Shift cell pointers left by 2 bytes to close the gap.
@@ -542,6 +636,47 @@ pub fn defragment(page: &mut Page) {
 
     set_cell_content_start(page, write_pos as u16);
     set_freeblock_offset(page, 0);
+}
+
+fn cell_image_at(page: &Page, body_off: u16) -> Result<Vec<u8>, DbError> {
+    let size = cell_size_at(page, body_off);
+    let abs = HEADER_SIZE + body_off as usize;
+    if abs + size > PAGE_SIZE {
+        return Err(DbError::Other(
+            "clustered_leaf: cell image extends beyond page boundary".into(),
+        ));
+    }
+    Ok(page.as_bytes()[abs..abs + size].to_vec())
+}
+
+fn write_cell_image(page: &mut Page, body_off: u16, image: &[u8]) {
+    let abs = HEADER_SIZE + body_off as usize;
+    page.as_bytes_mut()[abs..abs + image.len()].copy_from_slice(image);
+}
+
+fn encode_cell_image(key: &[u8], row_header: &RowHeader, row_data: &[u8]) -> Vec<u8> {
+    let mut image = vec![0u8; CELL_META_SIZE + ROW_HEADER_SIZE + key.len() + row_data.len()];
+    image[..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+    image[2..4].copy_from_slice(&(row_data.len() as u16).to_le_bytes());
+    image[4..4 + ROW_HEADER_SIZE].copy_from_slice(bytemuck::bytes_of(row_header));
+    let key_start = CELL_META_SIZE + ROW_HEADER_SIZE;
+    image[key_start..key_start + key.len()].copy_from_slice(key);
+    image[key_start + key.len()..].copy_from_slice(row_data);
+    image
+}
+
+fn collect_cells(page: &Page) -> Result<Vec<OwnedCell>, DbError> {
+    let n = num_cells(page) as usize;
+    let mut cells = Vec::with_capacity(n);
+    for idx in 0..n {
+        let cell = read_cell(page, idx as u16)?;
+        cells.push(OwnedCell {
+            key: cell.key.to_vec(),
+            row_header: cell.row_header,
+            row_data: cell.row_data.to_vec(),
+        });
+    }
+    Ok(cells)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -620,6 +755,112 @@ mod tests {
         assert_eq!(c0.key, b"alpha");
         assert_eq!(c1.key, b"bravo");
         assert_eq!(c2.key, b"charlie");
+    }
+
+    #[test]
+    fn test_rewrite_same_key_same_size_overwrites_in_place() {
+        let mut page = make_page();
+        let old_hdr = make_row_header(3);
+        let new_hdr = make_row_header(9);
+        insert_cell(&mut page, 0, b"alpha", &old_hdr, b"hello").unwrap();
+
+        let old_ptr = cell_ptr_at(&page, 0);
+        let old_image = rewrite_cell_same_key(&mut page, 0, b"alpha", &new_hdr, b"world").unwrap();
+
+        assert!(old_image.is_some());
+        assert_eq!(cell_ptr_at(&page, 0), old_ptr);
+
+        let cell = read_cell(&page, 0).unwrap();
+        assert_eq!(cell.key, b"alpha");
+        assert_eq!(cell.row_data, b"world");
+        assert_eq!(cell.row_header.txn_id_created, 9);
+    }
+
+    #[test]
+    fn test_rewrite_same_key_growth_rebuilds_same_leaf() {
+        let mut page = make_page();
+        let hdr = make_row_header(1);
+        let new_hdr = make_row_header(7);
+        set_next_leaf(&mut page, 777);
+
+        for key in [1u32, 2, 3, 4] {
+            let pos = search(&page, &key.to_be_bytes()).unwrap_err();
+            insert_cell(
+                &mut page,
+                pos,
+                &key.to_be_bytes(),
+                &hdr,
+                &vec![key as u8; 400],
+            )
+            .unwrap();
+        }
+
+        let before_free = free_space(&page);
+        let old_next = next_leaf(&page);
+        let old_num = num_cells(&page);
+
+        let old_image = rewrite_cell_same_key(
+            &mut page,
+            2,
+            &3u32.to_be_bytes(),
+            &new_hdr,
+            &vec![3u8; 2_000],
+        )
+        .unwrap();
+
+        assert!(old_image.is_some());
+        assert_eq!(next_leaf(&page), old_next);
+        assert_eq!(num_cells(&page), old_num);
+        assert!(free_space(&page) < before_free);
+
+        let keys: Vec<Vec<u8>> = (0..num_cells(&page))
+            .map(|idx| read_cell(&page, idx).unwrap().key.to_vec())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                1u32.to_be_bytes().to_vec(),
+                2u32.to_be_bytes().to_vec(),
+                3u32.to_be_bytes().to_vec(),
+                4u32.to_be_bytes().to_vec(),
+            ]
+        );
+
+        let cell = read_cell(&page, 2).unwrap();
+        assert_eq!(cell.row_header.txn_id_created, 7);
+        assert_eq!(cell.row_data.len(), 2_000);
+    }
+
+    #[test]
+    fn test_rewrite_same_key_returns_none_when_growth_no_longer_fits() {
+        let mut page = make_page();
+        let hdr = make_row_header(1);
+        let new_hdr = make_row_header(8);
+
+        for key in 0u32..7 {
+            let pos = search(&page, &key.to_be_bytes()).unwrap_err();
+            insert_cell(
+                &mut page,
+                pos,
+                &key.to_be_bytes(),
+                &hdr,
+                &vec![key as u8; 2_100],
+            )
+            .unwrap();
+        }
+
+        let before = *page.as_bytes();
+        let rewritten = rewrite_cell_same_key(
+            &mut page,
+            0,
+            &0u32.to_be_bytes(),
+            &new_hdr,
+            &vec![9u8; 8_000],
+        )
+        .unwrap();
+
+        assert!(rewritten.is_none());
+        assert_eq!(page.as_bytes(), &before);
     }
 
     #[test]
