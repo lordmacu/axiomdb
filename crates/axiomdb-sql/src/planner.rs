@@ -857,6 +857,8 @@ mod tests {
             fillfactor: 90,
             is_fk_index: false,
             include_columns: vec![],
+            index_type: 0,
+            pages_per_range: 128,
         }
     }
 
@@ -1018,6 +1020,8 @@ mod tests {
             fillfactor: 90,
             is_fk_index: false,
             include_columns: vec![],
+            index_type: 0,
+            pages_per_range: 128,
         };
         let expr = Expr::BinaryOp {
             op: BinaryOp::Eq,
