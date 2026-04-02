@@ -1,6 +1,6 @@
 # Phase 39 — Clustered Index Storage Engine
 
-## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5
+## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6
 
 ## What was built
 
@@ -166,6 +166,46 @@ This range path is deliberately storage-first:
 - `crates/axiomdb-storage/tests/integration_clustered_tree.rs`
   - adds 10K-row full-scan and bounded-scan clustered range integration coverage
 
+### 39.6 — Clustered B-tree update in place
+
+`crates/axiomdb-storage/src/clustered_tree.rs` now implements the first
+clustered-row mutation path.
+
+The new API is:
+
+- `update_in_place(storage, root_opt, key, new_row_data, txn_id, snapshot) -> Result<bool, DbError>`
+
+Behavior:
+
+- `false` when the clustered tree is empty
+- `false` when the key is absent
+- `false` when the current inline version is not visible to the supplied snapshot
+- `true` when the row is rewritten in the same clustered leaf page
+- `HeapPageFull` when the replacement row would require leaving the current leaf
+
+This update path is still deliberately storage-first:
+
+- it keeps the primary key unchanged
+- it rewrites only the owning clustered leaf page
+- it preserves parent separators and `next_leaf`
+- it bumps `row_version` and rewrites `txn_id_created`
+- it does **not** do delete+insert tree surgery yet
+- it does **not** reconstruct older visible versions after update yet
+- it is not wired into the SQL executor yet
+
+### Supporting changes for 39.6
+
+- `crates/axiomdb-storage/src/clustered_leaf.rs`
+  - adds `rewrite_cell_same_key(...)`
+  - adds same-size overwrite fast path
+  - adds same-leaf rebuild fallback when growth still fits after compaction
+- `crates/axiomdb-storage/src/clustered_tree.rs`
+  - adds `update_in_place(...)`
+  - adds same-leaf `HeapPageFull` failure mapping
+  - adds unit coverage for empty-tree, missing-key, invisible-row, growth-success, and no-fit cases
+- `crates/axiomdb-storage/tests/integration_clustered_tree.rs`
+  - adds integration coverage for split-tree clustered updates and explicit same-leaf growth failure
+
 ## Validation
 
 Targeted validation passed:
@@ -245,20 +285,43 @@ New clustered range coverage now includes:
 - prefetch hints on leaf-chain advance
 - 10K-row full and bounded range integration probes across many leaves
 
+Targeted validation for `39.6` also passed:
+
+- `cargo test -p axiomdb-storage clustered_leaf --lib -j1`
+- `cargo test -p axiomdb-storage clustered_tree --lib -j1`
+- `cargo test -p axiomdb-storage --test integration_clustered_tree -j1`
+- `cargo test -p axiomdb-storage -j1`
+- `cargo clippy -p axiomdb-storage -- -D warnings`
+- `cargo fmt --check`
+- `cargo check -p axiomdb-index -j1`
+- `cargo check -p axiomdb-sql --lib -j1`
+- `mdbook build docs-site`
+
+New clustered update coverage now includes:
+
+- empty-tree update
+- missing-key update
+- invisible current-version update rejection
+- same-leaf growth rewrite with `row_version` bump
+- split-tree update preserving leaf identity and `next_leaf`
+- explicit `HeapPageFull` on no-fit same-leaf growth
+- integration validation through both clustered lookup and clustered range scan after update
+
 ## Review notes
 
 - All `39.3` acceptance criteria from the spec are implemented.
 - All `39.4` acceptance criteria from the spec are implemented.
 - All `39.5` acceptance criteria from the spec are implemented.
+- All `39.6` acceptance criteria from the spec are implemented.
 - No `unsafe` was introduced in the clustered tree path.
 - No production `unwrap()` remains in the touched clustered files.
 - Benchmarking remains intentionally deferred: `39.5` finishes the storage-level
-  clustered read slice, but end-to-end clustered read benchmarks still wait for
-  later SQL-visible integration.
+  clustered read slice, and `39.6` adds the first clustered mutation slice, but
+  end-to-end clustered DML benchmarks still wait for later SQL-visible integration.
 
 ## Deferred
 
-- `39.6` / `39.7` — clustered update/delete plus undo-aware visibility
+- `39.7` — clustered delete-mark semantics
 - `39.8` — parent maintenance during split / merge
 - `39.11+` — WAL and crash recovery for clustered operations
 - `39.13+` — executor integration for clustered tables
@@ -273,5 +336,7 @@ New clustered range coverage now includes:
   storage, but no SQL `SELECT` path uses it yet.
 - `39.5` extends that same boundary to ordered reads: clustered range scan now
   exists in storage, but it is still not reachable from SQL.
+- `39.6` extends the storage rewrite to mutation: clustered same-leaf update now
+  exists in storage, but no SQL `UPDATE` path uses it yet.
 - `39.1` remains open because large-row overflow cells are still deferred to
   `39.10`, even though the clustered leaf groundwork already exists in storage.

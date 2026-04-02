@@ -255,6 +255,76 @@ Like `39.4`, this subphase is still honest about missing undo support. If a row'
 current inline version is invisible, `39.5` skips it; it does not reconstruct an
 older visible version yet.
 
+### Clustered Update In Place (Phase 39.6)
+
+`axiomdb-storage::clustered_tree::update_in_place(...)` is now the first
+clustered-row write path after insert:
+
+```rust
+pub fn update_in_place(
+    storage: &mut dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    new_row_data: &[u8],
+    txn_id: u64,
+    snapshot: &TransactionSnapshot,
+) -> Result<bool, DbError>
+```
+
+Update flow:
+
+1. Return `false` when the tree is empty, the key is absent, or the current inline
+   version is not visible to the supplied snapshot.
+2. Descend to the owning clustered leaf by primary key.
+3. Build a new inline `RowHeader` with:
+   - `txn_id_created = txn_id`
+   - `txn_id_deleted = 0`
+   - `row_version = old.row_version + 1`
+4. Ask the leaf primitive to rewrite that exact cell while preserving key order.
+5. Persist the leaf if the rewrite stays inside the same page.
+6. Return `HeapPageFull` when the replacement row would require leaving the
+   current leaf.
+
+The leaf primitive has two rewrite modes:
+
+- **overwrite fast path** when the replacement encoded cell fits the existing
+  cell budget
+- **same-leaf rebuild fallback** when the row grows, but the leaf can still be
+  rebuilt compactly with the replacement row in place
+
+Neither path changes the primary key, pointer-array order, parent separators, or
+`next_leaf`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Same Leaf Or Explicit Failure</span>
+SQLite has an overwrite optimization for unchanged entry budgets, but AxiomDB stops short of full delete+insert tree surgery in 39.6. If the new row no longer fits in the owning clustered leaf, the engine returns `HeapPageFull` explicitly and leaves structural relocation for later clustered split/overflow phases.
+</div>
+</div>
+
+This keeps the subphase honest about what now exists:
+
+- clustered insert
+- clustered point lookup
+- clustered range scan
+- clustered same-leaf update
+
+And what still does not:
+
+- clustered delete-mark semantics
+- clustered undo/version chains
+- clustered WAL/recovery
+- clustered SQL executor integration
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — No Fake Old Versions</span>
+PostgreSQL HOT chains and InnoDB undo can make an updated row visible to older snapshots. AxiomDB still cannot do that in 39.6, so updating a row rewrites the current inline version only and leaves older-version visibility for the later undo/WAL phases.
+</div>
+</div>
+
 ---
 
 ## MmapStorage — Memory-Mapped File

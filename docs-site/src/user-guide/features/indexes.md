@@ -15,8 +15,8 @@ Phase 39 is building clustered storage internally, but there is not yet a
 user-visible table option that stores full rows inside PRIMARY KEY leaves. For
 now, all user-visible tables still behave as heap-backed tables.
 
-Internally, the storage rewrite already has clustered insert, point lookup, and
-range-scan primitives, but they are not wired into SQL yet.
+Internally, the storage rewrite already has clustered insert, point lookup,
+range-scan, and same-leaf update primitives, but they are not wired into SQL yet.
 
 <div class="callout callout-tip">
 <span class="callout-icon">💡</span>

@@ -1257,7 +1257,8 @@
 - [ ] ⚠️ 39.4 invisible current versions still return `None` because clustered undo/version chains remain deferred — revisit in 39.6 / 39.7 / 39.11 / 39.12
 - [x] 39.5 ✅ Clustered B-Tree range scan — dedicated `axiomdb-storage::clustered_tree::range(...)`, bound-aware start-leaf descent, `next_leaf` traversal, MVCC visibility filtering, and prefetch hints across clustered leaves
 - [ ] ⚠️ 39.5 invisible current versions are skipped because clustered undo/version chains remain deferred — revisit in 39.6 / 39.7 / 39.11 / 39.12
-- [ ] 39.6 ⏳ Clustered B-Tree update in place — patch non-key columns directly on clustered cells
+- [x] 39.6 ✅ Clustered B-Tree update in place — dedicated `axiomdb-storage::clustered_tree::update_in_place(...)`, same-leaf row rewrite, `row_version` bump, MVCC gating, and explicit `HeapPageFull` when growth cannot stay in the owning clustered leaf
+- [ ] ⚠️ 39.6 same-leaf only: updates that require relocation or old-version reconstruction remain deferred — revisit in 39.8 / 39.10 / 39.11 / 39.12
 - [ ] 39.7 ⏳ Clustered B-Tree delete — MVCC delete-mark on clustered cells
 - [ ] 39.8 ⏳ Clustered B-Tree split and merge — volume-based split and underflow merge for variable-size cells
 - [ ] 39.9 ⏳ Secondary indexes with PK bookmarks — store PK values instead of RecordIds

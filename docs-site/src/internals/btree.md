@@ -294,6 +294,43 @@ The semantic boundary remains the same as in `39.4`: the range iterator can
 return or skip only the current inline version. Undo-aware older-version
 reconstruction is still future work.
 
+### Clustered Update Controller (Phase 39.6)
+
+Phase `39.6` adds the first mutation path that rewrites an existing clustered
+row in place:
+
+1. descend to the owning leaf by exact primary key
+2. check visibility of the current inline version
+3. build the replacement inline header with a bumped `row_version`
+4. rewrite the exact leaf cell without changing the key
+5. keep the row in the same leaf or fail explicitly
+
+This controller is intentionally narrower than a full B-tree update:
+
+- it does not move the row to another leaf
+- it does not split or merge the tree
+- it does not touch parent separators
+- it does not maintain secondary indexes yet
+
+That makes `39.6` a true clustered-storage step, not a disguised merge of
+`39.6`, `39.7`, `39.8`, and `39.9`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Update Is Not Delete Plus Insert</span>
+The easiest generic implementation would be delete+insert through the whole tree, but that would blur clustered update, delete, split/merge, and secondary-index bookmark work into one phase. AxiomDB keeps 39.6 strict: same-leaf rewrite only, with explicit failure when structural relocation would be needed.
+</div>
+</div>
+
+The page-local rewrite itself has two modes:
+
+- overwrite the existing cell directly when the replacement encoded payload
+  fits the current cell budget
+- rebuild the same leaf compactly when the row grows but still fits on that page
+
+If neither is possible, the controller returns `HeapPageFull`.
+
 ### Leaf Node (`LeafNodePage`)
 
 ```text
