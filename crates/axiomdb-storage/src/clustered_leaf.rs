@@ -69,6 +69,12 @@ pub fn cell_footprint(key_len: usize, row_len: usize) -> usize {
     CELL_PTR_SIZE + CELL_META_SIZE + ROW_HEADER_SIZE + key_len + row_len
 }
 
+/// Total bytes available in the body for clustered leaf cells and their
+/// pointer-array entries, excluding the fixed page-local header.
+pub fn page_capacity_bytes() -> usize {
+    BODY_SIZE - CL_HEADER_SIZE
+}
+
 /// Returns whether a `(key, row_data)` pair fits on an otherwise empty
 /// clustered leaf page without overflow support.
 pub fn fits_inline(key_len: usize, row_len: usize) -> bool {

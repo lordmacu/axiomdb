@@ -2,7 +2,7 @@
 
 ## 2026-04-02
 
-- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, and `39.7` are closed in code, targeted validation,
+- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, and `39.8` are closed in code, targeted validation,
   and docs.
 - `axiomdb-storage` now has the first complete clustered-tree write path:
   - `PageType::ClusteredInternal = 6`
@@ -13,6 +13,7 @@
   - `clustered_tree::lookup(storage, root_opt, key, snapshot) -> Result<Option<ClusteredRow>, DbError>`
   - `clustered_tree::range(storage, root_opt, from, to, snapshot) -> Result<ClusteredRangeIter<'_>, DbError>`
   - `clustered_tree::update_in_place(storage, root_opt, key, new_row_data, txn_id, snapshot) -> Result<bool, DbError>`
+  - `clustered_tree::update_with_relocation(storage, root_opt, key, new_row_data, txn_id, snapshot) -> Result<Option<u64>, DbError>`
   - `clustered_tree::delete_mark(storage, root_opt, key, txn_id, snapshot) -> Result<bool, DbError>`
   - exact root-to-leaf descent over clustered internal pages
   - exact leaf search returning inline row bytes
@@ -21,6 +22,7 @@
   - MVCC filtering via `RowHeader::is_visible(&TransactionSnapshot)`
   - same-leaf clustered row rewrite with `row_version` bump
   - same-leaf clustered delete-mark with old-snapshot visibility preserved inline
+  - private structural delete + rebalance path for relocate-update fallback
 - Clustered tree behavior now includes:
   - empty-tree root bootstrap into `ClusteredLeaf`
   - descent over `ClusteredInternal` via `find_child_idx()`
@@ -41,12 +43,15 @@
   - if the current inline version is invisible to the snapshot, `lookup()` returns `None`
   - older-version reconstruction remains deferred to clustered undo/version-chain work
 - Current clustered update limitation:
-  - updates are same-leaf only in `39.6`
-  - if growth cannot stay in the owning leaf, `update_in_place()` returns `HeapPageFull`
-  - old-version visibility after update still depends on future clustered undo/WAL phases
+  - `update_in_place()` remains same-leaf only in `39.6`
+  - `update_with_relocation()` now handles same-page failure by physical delete + reinsert + rebalance
+  - old-version visibility after relocate-update still depends on future clustered undo/WAL phases
+  - relocated rows still do not maintain secondary-index bookmarks
+  - parent separator repair still assumes the repaired separator fits on the current internal page
 - Current clustered delete limitation:
   - delete-mark keeps the physical cell inline in `39.7`
-  - clustered purge / merge after delete still depend on later phases
+  - `39.8` adds private structural rebalance helpers, but public clustered delete still does not purge dead rows
+  - clustered purge after delete still depends on later phases
   - rollback / WAL / recovery for clustered delete still depend on future clustered WAL phases
 - `39.1` is still not fully closed:
   - clustered leaf groundwork exists

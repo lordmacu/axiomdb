@@ -40,6 +40,11 @@ enum InsertResult {
     Split { sep_key: Vec<u8>, right_pid: u64 },
 }
 
+enum DeletePhysicalResult {
+    NotFound,
+    Deleted { underfull: bool, min_changed: bool },
+}
+
 #[derive(Debug, Clone)]
 pub struct ClusteredRow {
     pub key: Vec<u8>,
@@ -254,6 +259,377 @@ pub fn delete_mark(
                 "clustered delete-mark unexpectedly required a page rebuild failure at page {page_id}"
             ),
         }),
+    }
+}
+
+/// Rewrites one clustered row, falling back to structural delete+insert when
+/// same-leaf growth no longer fits in the owning page.
+pub fn update_with_relocation(
+    storage: &mut dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    new_row_data: &[u8],
+    txn_id: u64,
+    snapshot: &TransactionSnapshot,
+) -> Result<Option<u64>, DbError> {
+    validate_inline_row(key, new_row_data)?;
+
+    let Some(root_pid) = root_pid else {
+        return Ok(None);
+    };
+
+    match update_in_place(storage, Some(root_pid), key, new_row_data, txn_id, snapshot) {
+        Ok(true) => return Ok(Some(root_pid)),
+        Ok(false) => return Ok(None),
+        Err(DbError::HeapPageFull { .. }) => {}
+        Err(err) => return Err(err),
+    }
+
+    let Some(old_row) = lookup(storage, Some(root_pid), key, snapshot)? else {
+        return Ok(None);
+    };
+
+    let (deleted, root_after_delete) = delete_physical(storage, root_pid, key)?;
+    if !deleted {
+        return Ok(None);
+    }
+
+    let new_header = RowHeader {
+        txn_id_created: txn_id,
+        txn_id_deleted: 0,
+        row_version: old_row.row_header.row_version.saturating_add(1),
+        _flags: old_row.row_header._flags,
+    };
+    let new_root = insert(
+        storage,
+        Some(root_after_delete),
+        key,
+        &new_header,
+        new_row_data,
+    )?;
+    Ok(Some(new_root))
+}
+
+fn delete_physical(
+    storage: &mut dyn StorageEngine,
+    root_pid: u64,
+    key: &[u8],
+) -> Result<(bool, u64), DbError> {
+    match delete_physical_subtree(storage, root_pid, key, true)? {
+        DeletePhysicalResult::NotFound => Ok((false, root_pid)),
+        DeletePhysicalResult::Deleted { .. } => {
+            let new_root = collapse_root(storage, root_pid)?;
+            Ok((true, new_root))
+        }
+    }
+}
+
+fn delete_physical_subtree(
+    storage: &mut dyn StorageEngine,
+    pid: u64,
+    key: &[u8],
+    is_root: bool,
+) -> Result<DeletePhysicalResult, DbError> {
+    let page_ref = storage.read_page(pid)?;
+    match clustered_page_type(&page_ref)? {
+        PageType::ClusteredLeaf => {
+            delete_physical_from_leaf(storage, pid, page_ref.into_page(), key, is_root)
+        }
+        PageType::ClusteredInternal => {
+            delete_physical_from_internal(storage, pid, page_ref.into_page(), key, is_root)
+        }
+        other => Err(DbError::BTreeCorrupted {
+            msg: format!("clustered physical delete encountered unsupported page type {other:?}"),
+        }),
+    }
+}
+
+fn delete_physical_from_leaf(
+    storage: &mut dyn StorageEngine,
+    pid: u64,
+    mut page: Page,
+    key: &[u8],
+    is_root: bool,
+) -> Result<DeletePhysicalResult, DbError> {
+    let pos = match leaf_search_checked(&page, key)? {
+        Ok(pos) => pos,
+        Err(_) => return Ok(DeletePhysicalResult::NotFound),
+    };
+
+    let min_changed = pos == 0;
+    clustered_leaf::remove_cell(&mut page, pos)?;
+    write_page(storage, pid, &mut page)?;
+
+    Ok(DeletePhysicalResult::Deleted {
+        underfull: !is_root && leaf_underfull(&page),
+        min_changed,
+    })
+}
+
+fn delete_physical_from_internal(
+    storage: &mut dyn StorageEngine,
+    pid: u64,
+    page: Page,
+    key: &[u8],
+    is_root: bool,
+) -> Result<DeletePhysicalResult, DbError> {
+    let child_idx = clustered_internal::find_child_idx(&page, key)?;
+    let child_pid = clustered_internal::child_at(&page, child_idx as u16)?;
+
+    match delete_physical_subtree(storage, child_pid, key, false)? {
+        DeletePhysicalResult::NotFound => Ok(DeletePhysicalResult::NotFound),
+        DeletePhysicalResult::Deleted {
+            underfull,
+            min_changed,
+        } => {
+            let mut page = storage.read_page(pid)?.into_page();
+
+            if underfull {
+                rebalance_child(storage, &mut page, child_idx)?;
+            } else if min_changed && child_idx > 0 {
+                repair_separator_for_child(storage, &mut page, child_idx)?;
+            }
+
+            let min_changed_self = child_idx == 0 && min_changed;
+            let underfull_self = !is_root && internal_underfull(&page);
+            write_page(storage, pid, &mut page)?;
+
+            Ok(DeletePhysicalResult::Deleted {
+                underfull: underfull_self,
+                min_changed: min_changed_self,
+            })
+        }
+    }
+}
+
+fn rebalance_child(
+    storage: &mut dyn StorageEngine,
+    parent: &mut Page,
+    child_idx: usize,
+) -> Result<(), DbError> {
+    let child_pid = clustered_internal::child_at(parent, child_idx as u16)?;
+    let child = storage.read_page(child_pid)?;
+    match clustered_page_type(&child)? {
+        PageType::ClusteredLeaf => rebalance_leaf_child(storage, parent, child_idx),
+        PageType::ClusteredInternal => rebalance_internal_child(storage, parent, child_idx),
+        other => Err(DbError::BTreeCorrupted {
+            msg: format!("clustered rebalance expected clustered child, found {other:?}"),
+        }),
+    }
+}
+
+fn rebalance_leaf_child(
+    storage: &mut dyn StorageEngine,
+    parent: &mut Page,
+    child_idx: usize,
+) -> Result<(), DbError> {
+    if child_idx > 0 {
+        let left_pid = clustered_internal::child_at(parent, (child_idx - 1) as u16)?;
+        let child_pid = clustered_internal::child_at(parent, child_idx as u16)?;
+        return rebalance_leaf_pair(storage, parent, child_idx - 1, left_pid, child_pid);
+    }
+
+    let right_pid = clustered_internal::child_at(parent, (child_idx + 1) as u16)?;
+    let child_pid = clustered_internal::child_at(parent, child_idx as u16)?;
+    rebalance_leaf_pair(storage, parent, child_idx, child_pid, right_pid)
+}
+
+fn rebalance_leaf_pair(
+    storage: &mut dyn StorageEngine,
+    parent: &mut Page,
+    sep_idx: usize,
+    left_pid: u64,
+    right_pid: u64,
+) -> Result<(), DbError> {
+    let left = storage.read_page(left_pid)?;
+    let right = storage.read_page(right_pid)?;
+
+    if clustered_page_type(&left)? != PageType::ClusteredLeaf
+        || clustered_page_type(&right)? != PageType::ClusteredLeaf
+    {
+        return Err(DbError::BTreeCorrupted {
+            msg: format!(
+                "clustered leaf rebalance expected leaf siblings at {left_pid} and {right_pid}"
+            ),
+        });
+    }
+
+    let mut cells = collect_leaf_cells(&left)?;
+    cells.extend(collect_leaf_cells(&right)?);
+    let right_next = clustered_leaf::next_leaf(&right);
+
+    if leaf_footprint(&cells) <= clustered_leaf::page_capacity_bytes() {
+        let mut left_page = Page::new(PageType::ClusteredLeaf, left_pid);
+        rebuild_leaf_page(&mut left_page, &cells, right_next)?;
+        write_page(storage, left_pid, &mut left_page)?;
+        storage.free_page(right_pid)?;
+        clustered_internal::remove_at(parent, sep_idx, sep_idx + 1)?;
+        return Ok(());
+    }
+
+    let split_at = choose_leaf_rebalance_idx(&cells)?;
+    let mut left_page = Page::new(PageType::ClusteredLeaf, left_pid);
+    rebuild_leaf_page(&mut left_page, &cells[..split_at], right_pid)?;
+    let mut right_page = Page::new(PageType::ClusteredLeaf, right_pid);
+    rebuild_leaf_page(&mut right_page, &cells[split_at..], right_next)?;
+
+    write_page(storage, left_pid, &mut left_page)?;
+    write_page(storage, right_pid, &mut right_page)?;
+    rewrite_separator_at(parent, sep_idx, &cells[split_at].key)?;
+    Ok(())
+}
+
+fn rebalance_internal_child(
+    storage: &mut dyn StorageEngine,
+    parent: &mut Page,
+    child_idx: usize,
+) -> Result<(), DbError> {
+    if child_idx > 0 {
+        let left_pid = clustered_internal::child_at(parent, (child_idx - 1) as u16)?;
+        let child_pid = clustered_internal::child_at(parent, child_idx as u16)?;
+        return rebalance_internal_pair(storage, parent, child_idx - 1, left_pid, child_pid);
+    }
+
+    let right_pid = clustered_internal::child_at(parent, (child_idx + 1) as u16)?;
+    let child_pid = clustered_internal::child_at(parent, child_idx as u16)?;
+    rebalance_internal_pair(storage, parent, child_idx, child_pid, right_pid)
+}
+
+fn rebalance_internal_pair(
+    storage: &mut dyn StorageEngine,
+    parent: &mut Page,
+    sep_idx: usize,
+    left_pid: u64,
+    right_pid: u64,
+) -> Result<(), DbError> {
+    let left = storage.read_page(left_pid)?;
+    let right = storage.read_page(right_pid)?;
+
+    if clustered_page_type(&left)? != PageType::ClusteredInternal
+        || clustered_page_type(&right)? != PageType::ClusteredInternal
+    {
+        return Err(DbError::BTreeCorrupted {
+            msg: format!(
+                "clustered internal rebalance expected internal siblings at {left_pid} and {right_pid}"
+            ),
+        });
+    }
+
+    let bridge_key = clustered_internal::key_at(parent, sep_idx as u16)?.to_vec();
+    let leftmost_child = clustered_internal::leftmost_child(&left);
+    let mut separators = collect_internal_cells(&left)?;
+    separators.push(OwnedInternalCell {
+        key: bridge_key,
+        right_child: clustered_internal::leftmost_child(&right),
+    });
+    separators.extend(collect_internal_cells(&right)?);
+
+    if internal_footprint(&separators) <= clustered_internal::page_capacity_bytes() {
+        let mut left_page = Page::new(PageType::ClusteredInternal, left_pid);
+        rebuild_internal_page(&mut left_page, leftmost_child, &separators)?;
+        write_page(storage, left_pid, &mut left_page)?;
+        storage.free_page(right_pid)?;
+        clustered_internal::remove_at(parent, sep_idx, sep_idx + 1)?;
+        return Ok(());
+    }
+
+    let promoted_idx = choose_internal_rebalance_promotion_idx(&separators)?;
+    let promoted = separators[promoted_idx].clone();
+
+    let mut left_page = Page::new(PageType::ClusteredInternal, left_pid);
+    rebuild_internal_page(&mut left_page, leftmost_child, &separators[..promoted_idx])?;
+    let mut right_page = Page::new(PageType::ClusteredInternal, right_pid);
+    rebuild_internal_page(
+        &mut right_page,
+        promoted.right_child,
+        &separators[promoted_idx + 1..],
+    )?;
+
+    write_page(storage, left_pid, &mut left_page)?;
+    write_page(storage, right_pid, &mut right_page)?;
+    rewrite_separator_at(parent, sep_idx, &promoted.key)?;
+    Ok(())
+}
+
+fn repair_separator_for_child(
+    storage: &dyn StorageEngine,
+    parent: &mut Page,
+    child_idx: usize,
+) -> Result<(), DbError> {
+    debug_assert!(child_idx > 0);
+
+    let right_child_pid = clustered_internal::child_at(parent, child_idx as u16)?;
+    let Some(new_key) = subtree_min_key(storage, right_child_pid)? else {
+        return Err(DbError::BTreeCorrupted {
+            msg: format!(
+                "clustered separator repair found empty right subtree at child index {child_idx}"
+            ),
+        });
+    };
+    rewrite_separator_at(parent, child_idx - 1, &new_key)
+}
+
+fn rewrite_separator_at(parent: &mut Page, sep_idx: usize, new_key: &[u8]) -> Result<(), DbError> {
+    let current = clustered_internal::key_at(parent, sep_idx as u16)?;
+    if current == new_key {
+        return Ok(());
+    }
+
+    let leftmost_child = clustered_internal::leftmost_child(parent);
+    let mut separators = collect_internal_cells(parent)?;
+    separators[sep_idx].key = new_key.to_vec();
+
+    let mut rebuilt = Page::new(PageType::ClusteredInternal, parent.header().page_id);
+    rebuild_internal_page(&mut rebuilt, leftmost_child, &separators)?;
+    *parent = rebuilt;
+    Ok(())
+}
+
+fn subtree_min_key(storage: &dyn StorageEngine, mut pid: u64) -> Result<Option<Vec<u8>>, DbError> {
+    loop {
+        let page = storage.read_page(pid)?;
+        match clustered_page_type(&page)? {
+            PageType::ClusteredLeaf => {
+                if clustered_leaf::num_cells(&page) == 0 {
+                    return Ok(None);
+                }
+                return Ok(Some(clustered_leaf::read_cell(&page, 0)?.key.to_vec()));
+            }
+            PageType::ClusteredInternal => {
+                pid = clustered_internal::child_at(&page, 0)?;
+            }
+            other => {
+                return Err(DbError::BTreeCorrupted {
+                    msg: format!(
+                        "clustered subtree_min_key expected clustered page, found {other:?}"
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn collapse_root(storage: &mut dyn StorageEngine, mut root_pid: u64) -> Result<u64, DbError> {
+    loop {
+        let page = storage.read_page(root_pid)?;
+        match clustered_page_type(&page)? {
+            PageType::ClusteredLeaf => return Ok(root_pid),
+            PageType::ClusteredInternal => {
+                if clustered_internal::num_cells(&page) > 0 {
+                    return Ok(root_pid);
+                }
+                let child = clustered_internal::child_at(&page, 0)?;
+                storage.free_page(root_pid)?;
+                root_pid = child;
+            }
+            other => {
+                return Err(DbError::BTreeCorrupted {
+                    msg: format!(
+                        "clustered collapse_root expected clustered page, found {other:?}"
+                    ),
+                });
+            }
+        }
     }
 }
 
@@ -563,6 +939,32 @@ fn rebuild_internal_page(
     Ok(())
 }
 
+fn leaf_footprint(cells: &[OwnedLeafCell]) -> usize {
+    cells
+        .iter()
+        .map(|cell| clustered_leaf::cell_footprint(cell.key.len(), cell.row_data.len()))
+        .sum()
+}
+
+fn internal_footprint(separators: &[OwnedInternalCell]) -> usize {
+    separators
+        .iter()
+        .map(|cell| clustered_internal::separator_footprint(cell.key.len()))
+        .sum()
+}
+
+fn leaf_underfull(page: &Page) -> bool {
+    let used =
+        clustered_leaf::page_capacity_bytes().saturating_sub(clustered_leaf::free_space(page));
+    used * 4 < clustered_leaf::page_capacity_bytes()
+}
+
+fn internal_underfull(page: &Page) -> bool {
+    let used = clustered_internal::page_capacity_bytes()
+        .saturating_sub(clustered_internal::free_space(page));
+    used * 4 < clustered_internal::page_capacity_bytes()
+}
+
 fn leaf_search_checked(page: &Page, key: &[u8]) -> Result<Result<usize, usize>, DbError> {
     let n = clustered_leaf::num_cells(page) as usize;
     let mut lo = 0usize;
@@ -586,6 +988,37 @@ fn choose_leaf_split_idx(cells: &[OwnedLeafCell]) -> usize {
         .map(|cell| clustered_leaf::cell_footprint(cell.key.len(), cell.row_data.len()))
         .collect();
     choose_balanced_boundary(&footprints)
+}
+
+fn choose_leaf_rebalance_idx(cells: &[OwnedLeafCell]) -> Result<usize, DbError> {
+    debug_assert!(cells.len() >= 2);
+    let cap = clustered_leaf::page_capacity_bytes();
+    let footprints: Vec<usize> = cells
+        .iter()
+        .map(|cell| clustered_leaf::cell_footprint(cell.key.len(), cell.row_data.len()))
+        .collect();
+    let total: usize = footprints.iter().sum();
+    let mut left = 0usize;
+    let mut best_idx = None;
+    let mut best_diff = usize::MAX;
+
+    for split_at in 1..footprints.len() {
+        left += footprints[split_at - 1];
+        let right = total - left;
+        if left > cap || right > cap {
+            continue;
+        }
+
+        let diff = left.abs_diff(right);
+        if diff < best_diff {
+            best_diff = diff;
+            best_idx = Some(split_at);
+        }
+    }
+
+    best_idx.ok_or_else(|| DbError::BTreeCorrupted {
+        msg: "clustered leaf rebalance found no byte-balanced split boundary".into(),
+    })
 }
 
 fn choose_internal_promotion_idx(separators: &[OwnedInternalCell]) -> usize {
@@ -622,6 +1055,42 @@ fn choose_internal_promotion_idx(separators: &[OwnedInternalCell]) -> usize {
     }
 
     best_idx
+}
+
+fn choose_internal_rebalance_promotion_idx(
+    separators: &[OwnedInternalCell],
+) -> Result<usize, DbError> {
+    debug_assert!(!separators.is_empty());
+
+    let cap = clustered_internal::page_capacity_bytes();
+    let footprints: Vec<usize> = separators
+        .iter()
+        .map(|cell| clustered_internal::separator_footprint(cell.key.len()))
+        .collect();
+    let total: usize = footprints.iter().sum();
+    let mut prefix = 0usize;
+    let mut best_idx = None;
+    let mut best_diff = usize::MAX;
+
+    for (mid, footprint) in footprints.iter().copied().enumerate() {
+        let left = prefix;
+        let right = total - prefix - footprint;
+        prefix += footprint;
+
+        if left > cap || right > cap {
+            continue;
+        }
+
+        let diff = left.abs_diff(right);
+        if diff < best_diff {
+            best_diff = diff;
+            best_idx = Some(mid);
+        }
+    }
+
+    best_idx.ok_or_else(|| DbError::BTreeCorrupted {
+        msg: "clustered internal rebalance found no valid promotion boundary".into(),
+    })
 }
 
 fn choose_balanced_boundary(footprints: &[usize]) -> usize {
@@ -900,6 +1369,28 @@ mod tests {
         }
 
         Ok(keys)
+    }
+
+    fn collect_leaf_chain_pids(
+        storage: &dyn StorageEngine,
+        root_pid: u64,
+    ) -> Result<Vec<u64>, DbError> {
+        let mut leaf_pid = leftmost_leaf_pid(storage, root_pid)?;
+        let mut pids = Vec::new();
+
+        loop {
+            let page = storage.read_page(leaf_pid)?;
+            assert_eq!(clustered_page_type(&page)?, PageType::ClusteredLeaf);
+            pids.push(leaf_pid);
+
+            let next = clustered_leaf::next_leaf(&page);
+            if next == clustered_leaf::NULL_PAGE {
+                break;
+            }
+            leaf_pid = next;
+        }
+
+        Ok(pids)
     }
 
     fn collect_range_rows(iter: ClusteredRangeIter<'_>) -> Result<Vec<ClusteredRow>, DbError> {
@@ -1647,6 +2138,330 @@ mod tests {
         )
         .unwrap();
         assert!(new_snapshot.is_none());
+    }
+
+    #[test]
+    fn delete_physical_repairs_separator_for_non_leftmost_leaf() {
+        let mut storage = MemoryStorage::new();
+        let mut root = None;
+
+        for key in 0u32..64 {
+            root = Some(
+                insert(
+                    &mut storage,
+                    root,
+                    &key.to_be_bytes(),
+                    &row_header(1),
+                    &vec![key as u8; 700],
+                )
+                .unwrap(),
+            );
+        }
+
+        let root = root.unwrap();
+        let root_page = storage.read_page(root).unwrap();
+        assert_eq!(
+            clustered_page_type(&root_page).unwrap(),
+            PageType::ClusteredInternal
+        );
+        let target_leaf_pid = clustered_internal::child_at(&root_page, 1).unwrap();
+        let target_leaf = storage.read_page(target_leaf_pid).unwrap();
+        let old_first = clustered_leaf::read_cell(&target_leaf, 0)
+            .unwrap()
+            .key
+            .to_vec();
+        let new_first = clustered_leaf::read_cell(&target_leaf, 1)
+            .unwrap()
+            .key
+            .to_vec();
+        assert_eq!(
+            clustered_internal::key_at(&root_page, 0).unwrap(),
+            old_first.as_slice()
+        );
+
+        let (deleted, root_after) = delete_physical(&mut storage, root, &old_first).unwrap();
+        assert!(deleted);
+        assert_eq!(root_after, root);
+
+        let root_after_page = storage.read_page(root_after).unwrap();
+        assert_eq!(
+            clustered_internal::key_at(&root_after_page, 0).unwrap(),
+            new_first.as_slice()
+        );
+        assert!(lookup(
+            &storage,
+            Some(root_after),
+            &old_first,
+            &committed_snapshot(10)
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn rebalance_leaf_pair_merge_preserves_next_leaf_chain() {
+        let mut storage = MemoryStorage::new();
+        let left_pid = storage.alloc_page(PageType::ClusteredLeaf).unwrap();
+        let right_pid = storage.alloc_page(PageType::ClusteredLeaf).unwrap();
+        let tail_pid = storage.alloc_page(PageType::ClusteredLeaf).unwrap();
+
+        let mut left = Page::new(PageType::ClusteredLeaf, left_pid);
+        clustered_leaf::init_clustered_leaf(&mut left);
+        clustered_leaf::insert_cell(
+            &mut left,
+            0,
+            &1u32.to_be_bytes(),
+            &row_header(1),
+            &vec![1u8; 3_000],
+        )
+        .unwrap();
+        clustered_leaf::insert_cell(
+            &mut left,
+            1,
+            &2u32.to_be_bytes(),
+            &row_header(1),
+            &vec![2u8; 3_000],
+        )
+        .unwrap();
+        clustered_leaf::set_next_leaf(&mut left, right_pid);
+        write_page(&mut storage, left_pid, &mut left).unwrap();
+
+        let mut right = Page::new(PageType::ClusteredLeaf, right_pid);
+        clustered_leaf::init_clustered_leaf(&mut right);
+        clustered_leaf::insert_cell(
+            &mut right,
+            0,
+            &3u32.to_be_bytes(),
+            &row_header(1),
+            &vec![3u8; 3_000],
+        )
+        .unwrap();
+        clustered_leaf::set_next_leaf(&mut right, tail_pid);
+        write_page(&mut storage, right_pid, &mut right).unwrap();
+
+        let mut parent = Page::new(PageType::ClusteredInternal, 99);
+        clustered_internal::init_clustered_internal(&mut parent, left_pid);
+        clustered_internal::insert_at(&mut parent, 0, &3u32.to_be_bytes(), right_pid).unwrap();
+
+        rebalance_leaf_pair(&mut storage, &mut parent, 0, left_pid, right_pid).unwrap();
+
+        assert_eq!(clustered_internal::num_cells(&parent), 0);
+        let merged = storage.read_page(left_pid).unwrap();
+        assert_eq!(clustered_leaf::num_cells(&merged), 3);
+        assert_eq!(clustered_leaf::next_leaf(&merged), tail_pid);
+
+        let keys: Vec<Vec<u8>> = (0..clustered_leaf::num_cells(&merged))
+            .map(|idx| {
+                clustered_leaf::read_cell(&merged, idx)
+                    .unwrap()
+                    .key
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                1u32.to_be_bytes().to_vec(),
+                2u32.to_be_bytes().to_vec(),
+                3u32.to_be_bytes().to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rebalance_internal_pair_redistributes_and_preserves_children() {
+        let mut storage = MemoryStorage::new();
+        let left_pid = storage.alloc_page(PageType::ClusteredInternal).unwrap();
+        let right_pid = storage.alloc_page(PageType::ClusteredInternal).unwrap();
+
+        let make_sep = |byte: u8, child: u64| OwnedInternalCell {
+            key: vec![byte; 4_000],
+            right_child: child,
+        };
+
+        let mut left = Page::new(PageType::ClusteredInternal, left_pid);
+        rebuild_internal_page(&mut left, 10, &[make_sep(10, 11), make_sep(20, 12)]).unwrap();
+        write_page(&mut storage, left_pid, &mut left).unwrap();
+
+        let mut right = Page::new(PageType::ClusteredInternal, right_pid);
+        rebuild_internal_page(&mut right, 20, &[make_sep(40, 21), make_sep(50, 22)]).unwrap();
+        write_page(&mut storage, right_pid, &mut right).unwrap();
+
+        let mut parent = Page::new(PageType::ClusteredInternal, 199);
+        clustered_internal::init_clustered_internal(&mut parent, left_pid);
+        clustered_internal::insert_at(&mut parent, 0, &vec![30u8; 4_000], right_pid).unwrap();
+
+        rebalance_internal_pair(&mut storage, &mut parent, 0, left_pid, right_pid).unwrap();
+
+        assert_eq!(clustered_internal::num_cells(&parent), 1);
+        let left_after = storage.read_page(left_pid).unwrap();
+        let right_after = storage.read_page(right_pid).unwrap();
+        assert_eq!(
+            clustered_page_type(&left_after).unwrap(),
+            PageType::ClusteredInternal
+        );
+        assert_eq!(
+            clustered_page_type(&right_after).unwrap(),
+            PageType::ClusteredInternal
+        );
+
+        for page in [&left_after, &right_after] {
+            let num = clustered_internal::num_cells(page);
+            for idx in 1..num {
+                let prev = clustered_internal::key_at(page, idx - 1).unwrap();
+                let next = clustered_internal::key_at(page, idx).unwrap();
+                assert!(prev < next);
+            }
+            for child_idx in 0..=num {
+                clustered_internal::child_at(page, child_idx).unwrap();
+            }
+        }
+
+        let total = clustered_internal::num_cells(&left_after)
+            + clustered_internal::num_cells(&right_after)
+            + 1;
+        assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn delete_physical_collapses_root_after_leaf_merge() {
+        let mut storage = MemoryStorage::new();
+        let left_pid = storage.alloc_page(PageType::ClusteredLeaf).unwrap();
+        let right_pid = storage.alloc_page(PageType::ClusteredLeaf).unwrap();
+        let root = storage.alloc_page(PageType::ClusteredInternal).unwrap();
+
+        let mut left = Page::new(PageType::ClusteredLeaf, left_pid);
+        clustered_leaf::init_clustered_leaf(&mut left);
+        clustered_leaf::insert_cell(
+            &mut left,
+            0,
+            &0u32.to_be_bytes(),
+            &row_header(1),
+            &vec![0u8; 3_000],
+        )
+        .unwrap();
+        clustered_leaf::insert_cell(
+            &mut left,
+            1,
+            &1u32.to_be_bytes(),
+            &row_header(1),
+            &vec![1u8; 3_000],
+        )
+        .unwrap();
+        clustered_leaf::set_next_leaf(&mut left, right_pid);
+        write_page(&mut storage, left_pid, &mut left).unwrap();
+
+        let mut right = Page::new(PageType::ClusteredLeaf, right_pid);
+        clustered_leaf::init_clustered_leaf(&mut right);
+        clustered_leaf::insert_cell(
+            &mut right,
+            0,
+            &2u32.to_be_bytes(),
+            &row_header(1),
+            &vec![2u8; 3_000],
+        )
+        .unwrap();
+        clustered_leaf::insert_cell(
+            &mut right,
+            1,
+            &3u32.to_be_bytes(),
+            &row_header(1),
+            &vec![3u8; 3_000],
+        )
+        .unwrap();
+        write_page(&mut storage, right_pid, &mut right).unwrap();
+
+        let mut root_page = Page::new(PageType::ClusteredInternal, root);
+        clustered_internal::init_clustered_internal(&mut root_page, left_pid);
+        clustered_internal::insert_at(&mut root_page, 0, &2u32.to_be_bytes(), right_pid).unwrap();
+        write_page(&mut storage, root, &mut root_page).unwrap();
+
+        let (deleted, root_after) =
+            delete_physical(&mut storage, root, &0u32.to_be_bytes()).unwrap();
+        assert!(deleted);
+        assert_ne!(root_after, root);
+
+        let new_root_page = storage.read_page(root_after).unwrap();
+        assert_eq!(
+            clustered_page_type(&new_root_page).unwrap(),
+            PageType::ClusteredLeaf
+        );
+        let keys = collect_leaf_chain_keys(&storage, root_after).unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                1u32.to_be_bytes().to_vec(),
+                2u32.to_be_bytes().to_vec(),
+                3u32.to_be_bytes().to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn update_with_relocation_reinserts_row_after_same_leaf_failure() {
+        let mut storage = MemoryStorage::new();
+        let mut root = None;
+
+        for key in 0u32..7 {
+            root = Some(
+                insert(
+                    &mut storage,
+                    root,
+                    &key.to_be_bytes(),
+                    &row_header(1),
+                    &vec![key as u8; 2_100],
+                )
+                .unwrap(),
+            );
+        }
+
+        let root = root.unwrap();
+        let before_pids = collect_leaf_chain_pids(&storage, root).unwrap();
+
+        let root_after = update_with_relocation(
+            &mut storage,
+            Some(root),
+            &3u32.to_be_bytes(),
+            &vec![9u8; 8_000],
+            10,
+            &active_snapshot(10, 1),
+        )
+        .unwrap()
+        .expect("row must be updated via relocation");
+
+        let row = lookup(
+            &storage,
+            Some(root_after),
+            &3u32.to_be_bytes(),
+            &active_snapshot(10, 1),
+        )
+        .unwrap()
+        .expect("relocated row must be visible");
+        assert_eq!(row.row_data, vec![9u8; 8_000]);
+        assert_eq!(row.row_header.txn_id_created, 10);
+        assert_eq!(row.row_header.row_version, 1);
+
+        let old_snapshot = lookup(
+            &storage,
+            Some(root_after),
+            &3u32.to_be_bytes(),
+            &committed_snapshot(1),
+        )
+        .unwrap();
+        assert!(
+            old_snapshot.is_none(),
+            "39.8 relocation still does not reconstruct older visible versions"
+        );
+
+        let keys = collect_leaf_chain_keys(&storage, root_after).unwrap();
+        let expected: Vec<Vec<u8>> = (0u32..7).map(|key| key.to_be_bytes().to_vec()).collect();
+        assert_eq!(keys, expected);
+
+        let after_pids = collect_leaf_chain_pids(&storage, root_after).unwrap();
+        assert!(
+            after_pids.len() >= before_pids.len().saturating_sub(1),
+            "relocation may rebalance the source path but must keep a valid leaf chain"
+        );
     }
 
     #[test]

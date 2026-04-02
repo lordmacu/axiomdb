@@ -1,6 +1,6 @@
 # Phase 39 — Clustered Index Storage Engine
 
-## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7
+## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7, 39.8
 
 ## What was built
 
@@ -242,6 +242,64 @@ This delete path is still deliberately storage-first:
 - `crates/axiomdb-storage/tests/integration_clustered_tree.rs`
   - adds integration coverage for split-tree delete-mark visibility under old and new snapshots
 
+### 39.8 — Clustered B-tree structural rebalance
+
+`crates/axiomdb-storage/src/clustered_tree.rs` now also implements the first
+clustered structural-maintenance layer for variable-size pages.
+
+The new public API is:
+
+- `update_with_relocation(storage, root_opt, key, new_row_data, txn_id, snapshot) -> Result<Option<u64>, DbError>`
+
+Behavior:
+
+- `None` when the clustered tree is empty
+- `None` when the key is absent
+- `None` when the current inline version is not visible to the supplied snapshot
+- `Some(root_pid)` when the row is updated in place
+- `Some(root_pid)` when same-leaf rewrite fails and the controller falls back to physical delete + reinsert with structural rebalance
+
+This subphase adds the first private structural delete/rebalance path:
+
+- exact physical cell removal from clustered leaves
+- parent separator repair when the minimum key of a non-leftmost child changes
+- leaf redistribute / merge by encoded byte volume
+- internal redistribute / merge while preserving `n keys -> n + 1 children`
+- `next_leaf` preservation across leaf merge
+- empty internal root collapse to the only remaining child
+
+`update_with_relocation(...)` is intentionally layered on top of `39.6`:
+
+- fast path = `update_in_place(...)`
+- fallback path = exact physical delete + clustered insert
+- replacement row bumps `row_version`
+- replacement row rewrites `txn_id_created = txn_id`
+- old-version reconstruction still does **not** exist
+
+Important boundary for this subphase:
+
+- public clustered delete is still `delete_mark(...)`, not purge
+- structural physical delete is private helper logic used by relocate-update
+- delete-mark cleanup remains deferred to clustered purge
+- relocate-update still rewrites only the current inline version
+- secondary-index bookmark maintenance is still deferred
+- parent separator repair still assumes the repaired separator fits on the current internal page
+
+### Supporting changes for 39.8
+
+- `crates/axiomdb-storage/src/clustered_tree.rs`
+  - adds private physical delete result propagation
+  - adds byte-volume leaf/internal rebalance helpers
+  - adds parent-separator repair and root-collapse helpers
+  - adds `update_with_relocation(...)`
+  - adds unit coverage for separator repair, leaf merge, internal redistribution, root collapse, and relocate-update
+- `crates/axiomdb-storage/src/clustered_leaf.rs`
+  - adds `page_capacity_bytes()` for byte-volume rebalance planning
+- `crates/axiomdb-storage/src/clustered_internal.rs`
+  - adds `page_capacity_bytes()` for byte-volume rebalance planning
+- `crates/axiomdb-storage/tests/integration_clustered_tree.rs`
+  - adds split-tree integration coverage for relocate-update through lookup and range scan
+
 ## Validation
 
 Targeted validation passed:
@@ -364,6 +422,26 @@ New clustered delete coverage now includes:
 - split-tree delete preserving leaf identity and `next_leaf`
 - integration validation through both clustered lookup and clustered range scan after delete-mark
 
+Targeted validation for `39.8` also passed:
+
+- `cargo test -p axiomdb-storage clustered_tree --lib -j1`
+- `cargo test -p axiomdb-storage --test integration_clustered_tree -j1`
+- `cargo test -p axiomdb-storage -j1`
+- `cargo clippy -p axiomdb-storage -- -D warnings`
+- `cargo fmt --check`
+- `cargo check -p axiomdb-index -j1`
+- `cargo check -p axiomdb-sql --lib -j1`
+- `mdbook build docs-site`
+
+New clustered structural coverage now includes:
+
+- parent separator repair after deleting the first key of a non-leftmost leaf
+- leaf merge preserving `next_leaf`
+- internal redistribution preserving `n keys -> n + 1 children`
+- root collapse after structural shrink
+- relocate-update fallback after same-leaf `HeapPageFull`
+- integration validation through lookup and range scan after relocate-update
+
 ## Review notes
 
 - All `39.3` acceptance criteria from the spec are implemented.
@@ -371,15 +449,16 @@ New clustered delete coverage now includes:
 - All `39.5` acceptance criteria from the spec are implemented.
 - All `39.6` acceptance criteria from the spec are implemented.
 - All `39.7` acceptance criteria from the spec are implemented.
+- All `39.8` acceptance criteria from the spec are implemented.
 - No `unsafe` was introduced in the clustered tree path.
 - No production `unwrap()` remains in the touched clustered files.
 - Benchmarking remains intentionally deferred: `39.5` finishes the storage-level
-  clustered read slice, and `39.6` / `39.7` add the first clustered mutation slices,
+  clustered read slice, and `39.6` / `39.7` / `39.8` add the first clustered mutation and rebalance slices,
   but end-to-end clustered DML benchmarks still wait for later SQL-visible integration.
 
 ## Deferred
 
-- `39.8` — parent maintenance during split / merge
+- `39.9` — secondary-index bookmark maintenance for clustered relocation
 - `39.18` — physical purge of dead clustered cells
 - `39.11+` — WAL and crash recovery for clustered operations
 - `39.13+` — executor integration for clustered tables
@@ -398,5 +477,8 @@ New clustered delete coverage now includes:
   exists in storage, but no SQL `UPDATE` path uses it yet.
 - `39.7` extends that same storage rewrite to logical delete: clustered
   delete-mark now exists in storage, but no SQL `DELETE` path uses it yet.
+- `39.8` extends that same storage rewrite to structural maintenance:
+  clustered rebalance and relocate-update now exist in storage, but no SQL
+  `UPDATE` / `DELETE` path uses them yet.
 - `39.1` remains open because large-row overflow cells are still deferred to
   `39.10`, even though the clustered leaf groundwork already exists in storage.

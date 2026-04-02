@@ -55,6 +55,12 @@ pub fn separator_footprint(key_len: usize) -> usize {
     CELL_PTR_SIZE + CELL_META_SIZE + key_len
 }
 
+/// Total bytes available in the body for clustered internal separator cells
+/// and their pointer-array entries, excluding the fixed page-local header.
+pub fn page_capacity_bytes() -> usize {
+    BODY_SIZE - CI_HEADER_SIZE
+}
+
 pub struct CellRef<'a> {
     pub key: &'a [u8],
     pub right_child: u64,

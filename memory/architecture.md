@@ -1,11 +1,11 @@
 # Architecture Notes
 
-## 2026-04-02 — Clustered internal page primitive, clustered insert, point lookup, range scan, same-leaf update, and delete-mark
+## 2026-04-02 — Clustered internal page primitive, clustered insert, point lookup, range scan, same-leaf update, delete-mark, and structural rebalance
 
 - `crates/axiomdb-storage/src/clustered_internal.rs` owns the clustered
   internal page format for Phase `39.2`.
 - `crates/axiomdb-storage/src/clustered_tree.rs` now owns the first clustered
-  tree controller for Phases `39.3`, `39.4`, `39.5`, `39.6`, and `39.7`.
+  tree controller for Phases `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, and `39.8`.
 - The architecture still keeps storage and tree responsibilities separate:
   - storage owns page layout, free-space accounting, binary search, and page-local mutation
   - `clustered_tree` owns descent, exact leaf search, split planning, separator propagation, and root growth
@@ -43,9 +43,18 @@
   - preserve key bytes, row payload bytes, `txn_id_created`, `row_version`, and `next_leaf`
   - keep the physical cell inline so older snapshots can still observe it
   - defer purge, merge, undo, and WAL to later clustered phases
+- The clustered structural-maintenance contract is now also explicit:
+  - `update_with_relocation(...)` uses `update_in_place(...)` as the fast path
+  - physical delete is private helper logic, not the public delete API
+  - underfull and minimum-key-change signals propagate upward separately
+  - sibling rebalance uses encoded-byte occupancy, not fixed key counts
+  - leaf merge preserves `next_leaf`
+  - an empty internal root collapses to its only child
+  - current separator repair assumes the repaired key still fits on the parent page
 - Variable-size occupancy is measured in encoded bytes, not key count:
   - clustered leaves split by cumulative cell footprint
   - clustered internals split by cumulative separator footprint
+  - clustered underflow rebalance also uses cumulative encoded bytes
 - `remove_at(key_pos, child_pos)` intentionally supports only the two adjacent
   child removals (`child_pos == key_pos` or `child_pos == key_pos + 1`), which
   matches real B-tree merge / redistribution semantics and avoids an overly

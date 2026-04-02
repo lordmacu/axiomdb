@@ -16,7 +16,14 @@ user-visible table option that stores full rows inside PRIMARY KEY leaves. For
 now, all user-visible tables still behave as heap-backed tables.
 
 Internally, the storage rewrite already has clustered insert, point lookup,
-range-scan, same-leaf update, and delete-mark primitives, but they are not wired into SQL yet.
+range scan, same-leaf update, delete-mark, and structural rebalance / relocate-update
+primitives, but they are not wired into SQL yet.
+
+That internal rewrite is still honest about its current boundary:
+
+- relocate-update rewrites only the current inline version
+- clustered delete is still delete-mark first, not purge
+- secondary-index bookmark maintenance for relocated rows does not exist yet
 
 <div class="callout callout-tip">
 <span class="callout-icon">💡</span>
