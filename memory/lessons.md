@@ -1,5 +1,22 @@
 # Lessons Learned
 
+## 2026-04-02 - Clustered delete should be logical first and physical later
+
+- A storage-first clustered delete should not physically remove the row before
+  the engine has clustered purge, undo, and snapshot-safe cleanup.
+- The right intermediate contract is:
+  - find the exact owning leaf
+  - stamp `txn_id_deleted`
+  - keep the physical cell inline
+  - let older snapshots continue to observe it through MVCC visibility
+- `research/mariadb-server/storage/innobase/btr/btr0cur.cc` contributed the
+  delete-mark-in-place idea for clustered records.
+- `research/mariadb-server/storage/innobase/read/read0read.cc` contributed the
+  purge constraint: do not physically remove a delete-marked row while any
+  snapshot can still see it.
+- The AxiomDB adaptation is intentionally narrower: 39.7 adds header-state
+  delete only, while purge, merge, undo, and WAL stay in later clustered phases.
+
 ## 2026-04-02 - Clustered update should be same-leaf or explicit failure before undo and split/merge exist
 
 - A storage-first clustered update should not silently turn into delete+insert across the tree.

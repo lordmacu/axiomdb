@@ -208,6 +208,55 @@ pub fn update_in_place(
     }
 }
 
+/// Applies an MVCC delete-mark to the current inline version of one clustered
+/// row without removing the physical cell from the owning leaf page.
+pub fn delete_mark(
+    storage: &mut dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    txn_id: u64,
+    snapshot: &TransactionSnapshot,
+) -> Result<bool, DbError> {
+    let Some(root_pid) = root_pid else {
+        return Ok(false);
+    };
+
+    let leaf_ref = descend_to_leaf(storage, root_pid, key)?;
+    let pos = match leaf_search_checked(&leaf_ref, key)? {
+        Ok(pos) => pos,
+        Err(_) => return Ok(false),
+    };
+
+    let (old_header, old_row_data) = {
+        let cell = clustered_leaf::read_cell(&leaf_ref, pos as u16)?;
+        if !cell.row_header.is_visible(snapshot) {
+            return Ok(false);
+        }
+        (cell.row_header, cell.row_data.to_vec())
+    };
+
+    let mut page = leaf_ref.into_page();
+    let page_id = page.header().page_id;
+    let new_header = RowHeader {
+        txn_id_created: old_header.txn_id_created,
+        txn_id_deleted: txn_id,
+        row_version: old_header.row_version,
+        _flags: old_header._flags,
+    };
+
+    match clustered_leaf::rewrite_cell_same_key(&mut page, pos, key, &new_header, &old_row_data)? {
+        Some(_) => {
+            write_page(storage, page_id, &mut page)?;
+            Ok(true)
+        }
+        None => Err(DbError::BTreeCorrupted {
+            msg: format!(
+                "clustered delete-mark unexpectedly required a page rebuild failure at page {page_id}"
+            ),
+        }),
+    }
+}
+
 fn insert_subtree(
     storage: &mut dyn StorageEngine,
     pid: u64,
@@ -1389,6 +1438,215 @@ mod tests {
         .expect("failed update must leave old row intact");
         assert_eq!(row.row_data, vec![0u8; 2_100]);
         assert_eq!(row.row_header.txn_id_created, 1);
+    }
+
+    #[test]
+    fn delete_mark_empty_tree_returns_false() {
+        let mut storage = MemoryStorage::new();
+        let changed =
+            delete_mark(&mut storage, None, b"missing", 9, &committed_snapshot(4)).unwrap();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn delete_mark_missing_key_returns_false() {
+        let mut storage = MemoryStorage::new();
+        let mut root = None;
+        for key in [b"alpha".as_slice(), b"bravo", b"charlie"] {
+            root = Some(insert(&mut storage, root, key, &row_header(1), b"row").unwrap());
+        }
+
+        let changed = delete_mark(&mut storage, root, b"delta", 9, &committed_snapshot(4)).unwrap();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn delete_mark_invisible_current_version_returns_false() {
+        let mut storage = MemoryStorage::new();
+        let root = insert(
+            &mut storage,
+            None,
+            b"future",
+            &row_header(9),
+            b"not-committed-yet",
+        )
+        .unwrap();
+
+        let changed = delete_mark(
+            &mut storage,
+            Some(root),
+            b"future",
+            12,
+            &committed_snapshot(4),
+        )
+        .unwrap();
+        assert!(!changed);
+
+        let still_visible = lookup(&storage, Some(root), b"future", &active_snapshot(9, 4))
+            .unwrap()
+            .expect("original row must stay unchanged");
+        assert_eq!(still_visible.row_data, b"not-committed-yet");
+        assert_eq!(still_visible.row_header.txn_id_deleted, 0);
+    }
+
+    #[test]
+    fn delete_mark_root_leaf_hides_row_from_newer_snapshots_but_preserves_old_visibility() {
+        let mut storage = MemoryStorage::new();
+        let mut root = None;
+
+        for key in 0u32..4 {
+            root = Some(
+                insert(
+                    &mut storage,
+                    root,
+                    &key.to_be_bytes(),
+                    &row_header(1),
+                    &vec![key as u8; 400],
+                )
+                .unwrap(),
+            );
+        }
+
+        let root = root.unwrap();
+        let deleted = delete_mark(
+            &mut storage,
+            Some(root),
+            &2u32.to_be_bytes(),
+            9,
+            &active_snapshot(9, 1),
+        )
+        .unwrap();
+        assert!(deleted);
+
+        let hidden_from_deleter = lookup(
+            &storage,
+            Some(root),
+            &2u32.to_be_bytes(),
+            &active_snapshot(9, 1),
+        )
+        .unwrap();
+        assert!(hidden_from_deleter.is_none());
+
+        let hidden_from_new_snapshot = lookup(
+            &storage,
+            Some(root),
+            &2u32.to_be_bytes(),
+            &committed_snapshot(9),
+        )
+        .unwrap();
+        assert!(hidden_from_new_snapshot.is_none());
+
+        let old_snapshot = lookup(
+            &storage,
+            Some(root),
+            &2u32.to_be_bytes(),
+            &committed_snapshot(1),
+        )
+        .unwrap()
+        .expect("older snapshot must still see delete-marked row");
+        assert_eq!(old_snapshot.key, 2u32.to_be_bytes());
+        assert_eq!(old_snapshot.row_data, vec![2u8; 400]);
+        assert_eq!(old_snapshot.row_header.txn_id_created, 1);
+        assert_eq!(old_snapshot.row_header.txn_id_deleted, 9);
+        assert_eq!(old_snapshot.row_header.row_version, 0);
+
+        let current_rows = collect_range_rows(
+            range(
+                &storage,
+                Some(root),
+                Bound::Unbounded,
+                Bound::Unbounded,
+                &active_snapshot(9, 1),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(current_rows.len(), 3);
+        assert!(!current_rows.iter().any(|row| row.key == 2u32.to_be_bytes()));
+
+        let old_rows = collect_range_rows(
+            range(
+                &storage,
+                Some(root),
+                Bound::Unbounded,
+                Bound::Unbounded,
+                &committed_snapshot(1),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(old_rows.len(), 4);
+        assert!(old_rows.iter().any(|row| row.key == 2u32.to_be_bytes()));
+    }
+
+    #[test]
+    fn delete_mark_on_split_tree_preserves_leaf_identity_and_next_link() {
+        let mut storage = MemoryStorage::new();
+        let mut root = None;
+
+        for key in 0u32..128 {
+            root = Some(
+                insert(
+                    &mut storage,
+                    root,
+                    &key.to_be_bytes(),
+                    &row_header(1),
+                    &vec![key as u8; 300],
+                )
+                .unwrap(),
+            );
+        }
+
+        let root = root.unwrap();
+        let before_leaf = descend_to_leaf(&storage, root, &63u32.to_be_bytes())
+            .unwrap()
+            .header()
+            .page_id;
+        let before_next = {
+            let page = storage.read_page(before_leaf).unwrap();
+            clustered_leaf::next_leaf(&page)
+        };
+
+        let deleted = delete_mark(
+            &mut storage,
+            Some(root),
+            &63u32.to_be_bytes(),
+            11,
+            &active_snapshot(11, 1),
+        )
+        .unwrap();
+        assert!(deleted);
+
+        let after_leaf = descend_to_leaf(&storage, root, &63u32.to_be_bytes())
+            .unwrap()
+            .header()
+            .page_id;
+        let after_next = {
+            let page = storage.read_page(after_leaf).unwrap();
+            clustered_leaf::next_leaf(&page)
+        };
+
+        assert_eq!(after_leaf, before_leaf);
+        assert_eq!(after_next, before_next);
+
+        let old_snapshot = lookup(
+            &storage,
+            Some(root),
+            &63u32.to_be_bytes(),
+            &committed_snapshot(1),
+        )
+        .unwrap()
+        .expect("older snapshot must still see delete-marked row");
+        assert_eq!(old_snapshot.row_header.txn_id_deleted, 11);
+
+        let new_snapshot = lookup(
+            &storage,
+            Some(root),
+            &63u32.to_be_bytes(),
+            &committed_snapshot(11),
+        )
+        .unwrap();
+        assert!(new_snapshot.is_none());
     }
 
     #[test]

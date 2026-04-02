@@ -309,12 +309,13 @@ This keeps the subphase honest about what now exists:
 - clustered point lookup
 - clustered range scan
 - clustered same-leaf update
+- clustered delete-mark
 
 And what still does not:
 
-- clustered delete-mark semantics
 - clustered undo/version chains
 - clustered WAL/recovery
+- clustered physical purge
 - clustered SQL executor integration
 
 <div class="callout callout-design">
@@ -322,6 +323,48 @@ And what still does not:
 <div class="callout-body">
 <span class="callout-label">Design Decision — No Fake Old Versions</span>
 PostgreSQL HOT chains and InnoDB undo can make an updated row visible to older snapshots. AxiomDB still cannot do that in 39.6, so updating a row rewrites the current inline version only and leaves older-version visibility for the later undo/WAL phases.
+</div>
+</div>
+
+### Clustered Delete Mark (Phase 39.7)
+
+`axiomdb-storage::clustered_tree::delete_mark(...)` now adds the first logical
+delete path over clustered pages:
+
+```rust
+pub fn delete_mark(
+    storage: &mut dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    txn_id: u64,
+    snapshot: &TransactionSnapshot,
+) -> Result<bool, DbError>
+```
+
+Delete flow:
+
+1. Return `false` when the tree is empty, the key is absent, or the current
+   inline version is not visible to the supplied snapshot.
+2. Descend to the owning clustered leaf by primary key.
+3. Build a replacement `RowHeader` that preserves:
+   - `txn_id_created`
+   - `row_version`
+   - `_flags`
+   and stamps `txn_id_deleted = txn_id`.
+4. Rewrite the exact clustered cell in place while preserving key bytes and row
+   payload bytes.
+5. Persist the leaf page without changing `next_leaf` or parent separators.
+
+The important semantic boundary is that clustered delete is currently a
+**header-state transition**, not space reclamation. The physical cell stays on
+the leaf page so snapshots older than the delete can still observe it through
+the existing `RowHeader::is_visible(...)` rule.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Delete Mark Before Purge</span>
+InnoDB delete-marks clustered records first and purges them later; PostgreSQL also separates tuple visibility from later vacuum cleanup. AxiomDB follows that same separation in 39.7: stamp `txn_id_deleted` now, defer physical removal to the future clustered purge phase.
 </div>
 </div>
 

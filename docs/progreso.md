@@ -1254,12 +1254,13 @@
 - [x] 39.3 ✅ Clustered B-Tree insert — dedicated `axiomdb-storage::clustered_tree::insert(...)`, root bootstrap, defrag-before-split, byte-volume leaf/internal splits, separator propagation, root split handling, overflow-row rejection, and unit/integration coverage
 - [ ] ⚠️ 39.3 clustered insert still has no WAL/undo semantics — revisit in 39.11 / 39.12
 - [x] 39.4 ✅ Clustered B-Tree point lookup — dedicated `axiomdb-storage::clustered_tree::lookup(...)`, root-to-leaf descent, exact leaf search, inline row return, and MVCC visibility on the current inline version
-- [ ] ⚠️ 39.4 invisible current versions still return `None` because clustered undo/version chains remain deferred — revisit in 39.6 / 39.7 / 39.11 / 39.12
+- [ ] ⚠️ 39.4 invisible current versions still return `None` because clustered undo/version chains remain deferred — revisit in 39.11 / 39.12
 - [x] 39.5 ✅ Clustered B-Tree range scan — dedicated `axiomdb-storage::clustered_tree::range(...)`, bound-aware start-leaf descent, `next_leaf` traversal, MVCC visibility filtering, and prefetch hints across clustered leaves
-- [ ] ⚠️ 39.5 invisible current versions are skipped because clustered undo/version chains remain deferred — revisit in 39.6 / 39.7 / 39.11 / 39.12
+- [ ] ⚠️ 39.5 invisible current versions are skipped because clustered undo/version chains remain deferred — revisit in 39.11 / 39.12
 - [x] 39.6 ✅ Clustered B-Tree update in place — dedicated `axiomdb-storage::clustered_tree::update_in_place(...)`, same-leaf row rewrite, `row_version` bump, MVCC gating, and explicit `HeapPageFull` when growth cannot stay in the owning clustered leaf
 - [ ] ⚠️ 39.6 same-leaf only: updates that require relocation or old-version reconstruction remain deferred — revisit in 39.8 / 39.10 / 39.11 / 39.12
-- [ ] 39.7 ⏳ Clustered B-Tree delete — MVCC delete-mark on clustered cells
+- [x] 39.7 ✅ Clustered B-Tree delete — dedicated `axiomdb-storage::clustered_tree::delete_mark(...)`, exact-leaf delete-mark, MVCC gating, old-snapshot visibility over inline deleted rows, and unit/integration coverage
+- [ ] ⚠️ 39.7 delete-mark keeps dead clustered cells inline; purge, merge, undo, and WAL remain deferred — revisit in 39.8 / 39.11 / 39.12 / 39.18
 - [ ] 39.8 ⏳ Clustered B-Tree split and merge — volume-based split and underflow merge for variable-size cells
 - [ ] 39.9 ⏳ Secondary indexes with PK bookmarks — store PK values instead of RecordIds
 - [ ] 39.10 ⏳ Overflow pages for large rows — spill large clustered rows out of leaf pages

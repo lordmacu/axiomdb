@@ -1,11 +1,11 @@
 # Architecture Notes
 
-## 2026-04-02 — Clustered internal page primitive, clustered insert, point lookup, range scan, and same-leaf update
+## 2026-04-02 — Clustered internal page primitive, clustered insert, point lookup, range scan, same-leaf update, and delete-mark
 
 - `crates/axiomdb-storage/src/clustered_internal.rs` owns the clustered
   internal page format for Phase `39.2`.
 - `crates/axiomdb-storage/src/clustered_tree.rs` now owns the first clustered
-  tree controller for Phases `39.3`, `39.4`, `39.5`, and `39.6`.
+  tree controller for Phases `39.3`, `39.4`, `39.5`, `39.6`, and `39.7`.
 - The architecture still keeps storage and tree responsibilities separate:
   - storage owns page layout, free-space accounting, binary search, and page-local mutation
   - `clustered_tree` owns descent, exact leaf search, split planning, separator propagation, and root growth
@@ -37,6 +37,12 @@
   - keep key order, parent separators, and `next_leaf` unchanged
   - allow overwrite or same-leaf rebuild, but never structural relocation in `39.6`
   - report `HeapPageFull` when the row no longer fits in the same leaf
+- The clustered delete contract is now also explicit:
+  - descend to the owning leaf by exact primary key
+  - stamp `txn_id_deleted` on the current inline version only when it is visible
+  - preserve key bytes, row payload bytes, `txn_id_created`, `row_version`, and `next_leaf`
+  - keep the physical cell inline so older snapshots can still observe it
+  - defer purge, merge, undo, and WAL to later clustered phases
 - Variable-size occupancy is measured in encoded bytes, not key count:
   - clustered leaves split by cumulative cell footprint
   - clustered internals split by cumulative separator footprint

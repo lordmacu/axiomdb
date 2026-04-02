@@ -331,6 +331,34 @@ The page-local rewrite itself has two modes:
 
 If neither is possible, the controller returns `HeapPageFull`.
 
+### Clustered Delete Controller (Phase 39.7)
+
+Phase `39.7` adds the first logical delete path over clustered rows:
+
+1. descend to the owning leaf by exact primary key
+2. check visibility of the current inline version
+3. preserve the existing key, row payload, `txn_id_created`, and `row_version`
+4. stamp `txn_id_deleted = delete_txn_id`
+5. persist the same leaf page without structural tree change
+
+This controller is intentionally narrower than a full B-tree delete:
+
+- it does not remove the physical cell
+- it does not merge or rebalance leaves
+- it does not change parent separators
+- it does not maintain secondary indexes yet
+
+That makes `39.7` the logical-delete companion to `39.6`, not a disguised
+merge of `39.7`, `39.8`, `39.11`, and `39.18`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Delete Is Header State First</span>
+InnoDB's clustered records are delete-marked before purge, and PostgreSQL tuples stay on page until vacuum cleanup. AxiomDB adopts the same sequencing in 39.7: logical delete mutates row state now, while structural cleanup waits for later phases that can prove no snapshot still needs the row.
+</div>
+</div>
+
 ### Leaf Node (`LeafNodePage`)
 
 ```text
