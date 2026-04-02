@@ -9,6 +9,7 @@ license.workspace = true
 axiomdb-core    = { workspace = true }
 axiomdb-storage = { workspace = true }
 bytemuck        = { workspace = true }
+crc32c          = "0.6"
 thiserror       = { workspace = true }
 
 [dev-dependencies]
