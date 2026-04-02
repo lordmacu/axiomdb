@@ -2,7 +2,7 @@
 
 ## 2026-04-02
 
-- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, and `39.9` are closed in code, targeted validation,
+- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.9`, and `39.10` are closed in code, targeted validation,
   and docs.
 - `axiomdb-storage` now has the first complete clustered-tree write path:
   - `PageType::ClusteredInternal = 6`
@@ -16,7 +16,7 @@
   - `clustered_tree::update_with_relocation(storage, root_opt, key, new_row_data, txn_id, snapshot) -> Result<Option<u64>, DbError>`
   - `clustered_tree::delete_mark(storage, root_opt, key, txn_id, snapshot) -> Result<bool, DbError>`
   - exact root-to-leaf descent over clustered internal pages
-  - exact leaf search returning inline row bytes
+  - exact leaf search returning full logical row bytes reconstructed from the clustered leaf descriptor
   - bound-aware start-leaf descent for ordered range scans
   - `next_leaf` traversal with `StorageEngine::prefetch_hint(...)`
   - MVCC filtering via `RowHeader::is_visible(&TransactionSnapshot)`
@@ -26,12 +26,15 @@
 - Clustered tree behavior now includes:
   - empty-tree root bootstrap into `ClusteredLeaf`
   - descent over `ClusteredInternal` via `find_child_idx()`
-  - sorted inline row inserts into clustered leaves
+  - sorted clustered-row descriptor inserts into clustered leaves
   - one defragmentation retry before split
   - leaf split by cumulative cell byte volume
   - internal split by cumulative separator byte volume
   - root split into a new clustered internal page
-  - explicit rejection of rows that require overflow pages
+  - local-prefix + overflow-page storage for large clustered rows
+  - transparent logical-row reconstruction in clustered lookup and range scan
+  - overflow-aware same-leaf update transitions (`inline -> overflow -> inline`)
+  - physical delete freeing obsolete clustered overflow chains
 - The clustered rewrite remains storage-first:
   - current `axiomdb-index::BTree` still uses fixed-slot `InternalNodePage` / `LeafNodePage`
   - no SQL path creates or writes clustered tables yet
@@ -43,7 +46,7 @@
   - if the current inline version is invisible to the snapshot, `lookup()` returns `None`
   - older-version reconstruction remains deferred to clustered undo/version-chain work
 - Current clustered update limitation:
-  - `update_in_place()` remains same-leaf only in `39.6`
+  - `update_in_place()` remains same-leaf only in `39.6`, but same-leaf growth can now use overflow pages in `39.10`
   - `update_with_relocation()` now handles same-page failure by physical delete + reinsert + rebalance
   - old-version visibility after relocate-update still depends on future clustered undo/WAL phases
   - clustered-first secondary bookmark maintenance now exists in `crates/axiomdb-sql/src/clustered_secondary.rs`
@@ -54,9 +57,10 @@
   - `39.8` adds private structural rebalance helpers, but public clustered delete still does not purge dead rows
   - clustered purge after delete still depends on later phases
   - rollback / WAL / recovery for clustered delete still depend on future clustered WAL phases
-- `39.1` is still not fully closed:
-  - clustered leaf groundwork exists
-  - large-row overflow remains deferred to `39.10`
+- `39.1` is now effectively closed by `39.10`:
+  - clustered leaves support both inline rows and overflow-backed rows
+  - primary key bytes and `RowHeader` remain inline in the leaf
+  - generic TOAST/compression/WAL/recovery still belong to later phases
 
 ## 2026-03-29
 

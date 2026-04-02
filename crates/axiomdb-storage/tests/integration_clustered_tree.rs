@@ -68,6 +68,24 @@ fn collect_leaf_chain_keys(
     Ok(keys)
 }
 
+fn leaf_pid_for_key(storage: &dyn StorageEngine, mut pid: u64, key: &[u8]) -> Result<u64, DbError> {
+    loop {
+        let page = storage.read_page(pid)?;
+        match clustered_page_type(page.header().page_type)? {
+            PageType::ClusteredLeaf => return Ok(pid),
+            PageType::ClusteredInternal => {
+                let child_idx = clustered_internal::find_child_idx(&page, key)?;
+                pid = clustered_internal::child_at(&page, child_idx as u16)?;
+            }
+            other => {
+                return Err(DbError::BTreeCorrupted {
+                    msg: format!("expected clustered tree page, found {other:?} at {pid}"),
+                });
+            }
+        }
+    }
+}
+
 #[test]
 fn clustered_insert_keeps_ten_thousand_rows_sorted_across_root_splits() {
     let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
@@ -232,6 +250,83 @@ fn clustered_range_scan_respects_bounds_across_leaf_splits() {
 }
 
 #[test]
+fn clustered_mixed_inline_and_overflow_rows_roundtrip_through_lookup_and_range() {
+    let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
+    let mut root = None;
+    let overflow_threshold = clustered_leaf::max_inline_row_bytes(4).unwrap();
+
+    for key in 0u32..512 {
+        let row_len = if key % 3 == 0 {
+            overflow_threshold + 700 + (key as usize % 5) * 17
+        } else {
+            120 + (key as usize % 7) * 31
+        };
+        root = Some(
+            clustered_tree::insert(
+                storage.as_mut(),
+                root,
+                &key.to_be_bytes(),
+                &row_header((key % 11) as u64 + 1),
+                &row_bytes(key, row_len),
+            )
+            .unwrap(),
+        );
+    }
+
+    let root = root.unwrap();
+    let snapshot = TransactionSnapshot::committed(10_000);
+
+    for probe in [0u32, 3, 7, 42, 255, 511] {
+        let expected_len = if probe % 3 == 0 {
+            overflow_threshold + 700 + (probe as usize % 5) * 17
+        } else {
+            120 + (probe as usize % 7) * 31
+        };
+        let row = clustered_tree::lookup(
+            storage.as_ref(),
+            Some(root),
+            &probe.to_be_bytes(),
+            &snapshot,
+        )
+        .unwrap()
+        .expect("probe key must exist");
+        assert_eq!(row.row_data, row_bytes(probe, expected_len));
+    }
+
+    let overflow_leaf = leaf_pid_for_key(storage.as_ref(), root, &3u32.to_be_bytes()).unwrap();
+    let overflow_page = storage.read_page(overflow_leaf).unwrap();
+    let overflow_slot = clustered_leaf::search(&overflow_page, &3u32.to_be_bytes()).unwrap();
+    let overflow_cell = clustered_leaf::read_cell(&overflow_page, overflow_slot as u16).unwrap();
+    assert!(overflow_cell.overflow_first_page.is_some());
+    assert_eq!(
+        overflow_cell.total_row_len,
+        overflow_threshold + 700 + (3usize % 5) * 17
+    );
+
+    let rows: Vec<_> = clustered_tree::range(
+        storage.as_ref(),
+        Some(root),
+        Bound::Unbounded,
+        Bound::Unbounded,
+        &snapshot,
+    )
+    .unwrap()
+    .map(|row| row.unwrap())
+    .collect();
+    assert_eq!(rows.len(), 512);
+    for (idx, row) in rows.iter().enumerate() {
+        let key = idx as u32;
+        let expected_len = if key % 3 == 0 {
+            overflow_threshold + 700 + (key as usize % 5) * 17
+        } else {
+            120 + (key as usize % 7) * 31
+        };
+        assert_eq!(row.key, key.to_be_bytes());
+        assert_eq!(row.row_data, row_bytes(key, expected_len));
+    }
+}
+
+#[test]
 fn clustered_update_in_place_is_visible_to_lookup_and_range_on_split_tree() {
     let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
     let mut root = None;
@@ -291,6 +386,87 @@ fn clustered_update_in_place_is_visible_to_lookup_and_range_on_split_tree() {
 }
 
 #[test]
+fn clustered_update_in_place_transitions_inline_and_overflow_and_frees_old_chain() {
+    let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
+    let mut root = None;
+
+    for key in 0u32..256 {
+        root = Some(
+            clustered_tree::insert(
+                storage.as_mut(),
+                root,
+                &key.to_be_bytes(),
+                &row_header(1),
+                &row_bytes(key, 160),
+            )
+            .unwrap(),
+        );
+    }
+
+    let root = root.unwrap();
+    let overflow_len = clustered_leaf::max_inline_row_bytes(4).unwrap() + 900;
+    let grown = clustered_tree::update_in_place(
+        storage.as_mut(),
+        Some(root),
+        &42u32.to_be_bytes(),
+        &row_bytes(42, overflow_len),
+        9,
+        &TransactionSnapshot::active(9, 1),
+    )
+    .unwrap();
+    assert!(grown);
+
+    let leaf_pid = leaf_pid_for_key(storage.as_ref(), root, &42u32.to_be_bytes()).unwrap();
+    let leaf_page = storage.read_page(leaf_pid).unwrap();
+    let slot = clustered_leaf::search(&leaf_page, &42u32.to_be_bytes()).unwrap();
+    let overflow_cell = clustered_leaf::read_cell(&leaf_page, slot as u16).unwrap();
+    let old_overflow_page = overflow_cell
+        .overflow_first_page
+        .expect("updated row must be overflow-backed");
+    assert_eq!(overflow_cell.total_row_len, overflow_len);
+
+    let row = clustered_tree::lookup(
+        storage.as_ref(),
+        Some(root),
+        &42u32.to_be_bytes(),
+        &TransactionSnapshot::active(9, 1),
+    )
+    .unwrap()
+    .expect("grown row must remain visible");
+    assert_eq!(row.row_data, row_bytes(42, overflow_len));
+    assert_eq!(row.row_header.row_version, 1);
+
+    let shrunk = clustered_tree::update_in_place(
+        storage.as_mut(),
+        Some(root),
+        &42u32.to_be_bytes(),
+        &row_bytes(42, 64),
+        10,
+        &TransactionSnapshot::active(10, 9),
+    )
+    .unwrap();
+    assert!(shrunk);
+
+    let leaf_page = storage.read_page(leaf_pid).unwrap();
+    let slot = clustered_leaf::search(&leaf_page, &42u32.to_be_bytes()).unwrap();
+    let inline_cell = clustered_leaf::read_cell(&leaf_page, slot as u16).unwrap();
+    assert!(inline_cell.overflow_first_page.is_none());
+    assert_eq!(inline_cell.total_row_len, 64);
+    assert!(storage.read_page(old_overflow_page).is_err());
+
+    let row = clustered_tree::lookup(
+        storage.as_ref(),
+        Some(root),
+        &42u32.to_be_bytes(),
+        &TransactionSnapshot::active(10, 9),
+    )
+    .unwrap()
+    .expect("shrunk row must remain visible");
+    assert_eq!(row.row_data, row_bytes(42, 64));
+    assert_eq!(row.row_header.row_version, 2);
+}
+
+#[test]
 fn clustered_update_in_place_reports_heap_page_full_when_same_leaf_growth_fails() {
     let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
     let mut root = None;
@@ -330,6 +506,60 @@ fn clustered_update_in_place_reports_heap_page_full_when_same_leaf_growth_fails(
     .expect("failed update must keep original row");
     assert_eq!(row.row_data, vec![3u8; 2_100]);
     assert_eq!(row.row_header.txn_id_created, 1);
+}
+
+#[test]
+fn clustered_delete_mark_keeps_overflow_chain_until_later_purge() {
+    let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
+    let key = 77u32;
+    let overflow_len = clustered_leaf::max_inline_row_bytes(4).unwrap() + 333;
+    let payload = row_bytes(key, overflow_len);
+    let root = clustered_tree::insert(
+        storage.as_mut(),
+        None,
+        &key.to_be_bytes(),
+        &row_header(1),
+        &payload,
+    )
+    .unwrap();
+
+    let leaf_pid = leaf_pid_for_key(storage.as_ref(), root, &key.to_be_bytes()).unwrap();
+    let leaf_page = storage.read_page(leaf_pid).unwrap();
+    let slot = clustered_leaf::search(&leaf_page, &key.to_be_bytes()).unwrap();
+    let overflow_first_page = clustered_leaf::read_cell(&leaf_page, slot as u16)
+        .unwrap()
+        .overflow_first_page
+        .expect("row must be overflow-backed");
+
+    let deleted = clustered_tree::delete_mark(
+        storage.as_mut(),
+        Some(root),
+        &key.to_be_bytes(),
+        9,
+        &TransactionSnapshot::active(9, 1),
+    )
+    .unwrap();
+    assert!(deleted);
+    assert!(storage.read_page(overflow_first_page).is_ok());
+
+    let old_snapshot = clustered_tree::lookup(
+        storage.as_ref(),
+        Some(root),
+        &key.to_be_bytes(),
+        &TransactionSnapshot::committed(1),
+    )
+    .unwrap()
+    .expect("old snapshot must still see delete-marked overflow row");
+    assert_eq!(old_snapshot.row_data, payload);
+
+    let new_snapshot = clustered_tree::lookup(
+        storage.as_ref(),
+        Some(root),
+        &key.to_be_bytes(),
+        &TransactionSnapshot::committed(9),
+    )
+    .unwrap();
+    assert!(new_snapshot.is_none());
 }
 
 #[test]

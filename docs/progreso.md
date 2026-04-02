@@ -1248,8 +1248,8 @@
 ---
 
 ### Phase 39 — Clustered index storage engine `🔄` week 131-135
-- [ ] 39.1 ⏳ Clustered leaf page format — variable-size slotted leaf pages storing full rows inline; closure still pending large-row overflow support and final acceptance
-- [ ] ⚠️ 39.1 large-row overflow cells remain open — revisit in 39.10
+- [x] 39.1 ✅ Clustered leaf page format — variable-size slotted leaf pages storing full rows inline or as local-prefix + overflow-backed cells, with primary key and `RowHeader` kept inline in clustered leaves
+- [x] ✅ 39.1 large-row overflow cells resolved in `39.10`
 - [x] 39.2 ✅ Clustered internal page format — `PageType::ClusteredInternal`, slotted variable-size separator keys, `leftmost_child` header slot, right-child-per-cell mapping, binary search, insert/remove/defragment, and unit coverage in `axiomdb-storage`
 - [x] 39.3 ✅ Clustered B-Tree insert — dedicated `axiomdb-storage::clustered_tree::insert(...)`, root bootstrap, defrag-before-split, byte-volume leaf/internal splits, separator propagation, root split handling, overflow-row rejection, and unit/integration coverage
 - [ ] ⚠️ 39.3 clustered insert still has no WAL/undo semantics — revisit in 39.11 / 39.12
@@ -1258,15 +1258,16 @@
 - [x] 39.5 ✅ Clustered B-Tree range scan — dedicated `axiomdb-storage::clustered_tree::range(...)`, bound-aware start-leaf descent, `next_leaf` traversal, MVCC visibility filtering, and prefetch hints across clustered leaves
 - [ ] ⚠️ 39.5 invisible current versions are skipped because clustered undo/version chains remain deferred — revisit in 39.11 / 39.12
 - [x] 39.6 ✅ Clustered B-Tree update in place — dedicated `axiomdb-storage::clustered_tree::update_in_place(...)`, same-leaf row rewrite, `row_version` bump, MVCC gating, and explicit `HeapPageFull` when growth cannot stay in the owning clustered leaf
-- [ ] ⚠️ 39.6 older-version reconstruction and overflow-backed growth remain deferred even though relocate-update now exists — revisit in 39.10 / 39.11 / 39.12
+- [ ] ⚠️ 39.6 older-version reconstruction for overflow-backed clustered rows remains deferred even though overflow growth now exists — revisit in 39.11 / 39.12
 - [x] 39.7 ✅ Clustered B-Tree delete — dedicated `axiomdb-storage::clustered_tree::delete_mark(...)`, exact-leaf delete-mark, MVCC gating, old-snapshot visibility over inline deleted rows, and unit/integration coverage
 - [ ] ⚠️ 39.7 delete-mark keeps dead clustered cells inline; snapshot-safe purge, undo, and WAL remain deferred — revisit in 39.11 / 39.12 / 39.18
 - [x] 39.8 ✅ Clustered B-Tree split and merge — byte-volume leaf/internal rebalance, parent separator repair, root collapse, and relocate-update fallback when same-leaf growth fails
 - [ ] ⚠️ 39.8 relocate-update still rewrites only the current inline version, and delete-mark cleanup remains deferred — revisit in 39.11 / 39.12 / 39.18
-- [ ] ⚠️ 39.8 parent separator repair still assumes the repaired separator fits in the current internal page budget — revisit in 39.10
+- [ ] ⚠️ 39.8 parent separator repair still assumes the repaired separator fits in the current internal page budget — gap remains after 39.10, revisit in 39.20
 - [x] 39.9 ✅ Secondary indexes with PK bookmarks — dedicated clustered-first secondary layout in `axiomdb-sql::clustered_secondary`, physical keys encoded as `secondary_key ++ missing_primary_key_columns`, decoded bookmark recovery from scanned keys, prefix scans without fixed 10-byte RID suffixes, and relocate-stable maintenance over the existing `BTree`
 - [ ] ⚠️ 39.9 clustered PK bookmarks exist as a dedicated path, but the SQL-visible heap executor / FK / index-integrity flows still use RecordId-based secondary indexes until clustered executor integration — revisit in 39.13 / 39.14 / 39.15 / 39.16 / 39.17
-- [ ] 39.10 ⏳ Overflow pages for large rows — spill large clustered rows out of leaf pages
+- [x] 39.10 ✅ Overflow pages for large rows — new `clustered_overflow` page chains, clustered-leaf local-prefix + optional overflow pointer format, transparent logical-row reconstruction in lookup/range, overflow-aware update transitions, physical-delete free of obsolete chains, and mixed inline/overflow coverage
+- [ ] ⚠️ 39.10 clustered overflow stays storage-first: no compression, WAL, undo, crash recovery, or snapshot-safe purge yet — revisit in 11.2 / 39.11 / 39.12 / 39.18
 - [ ] 39.11 ⏳ WAL support for clustered operations — redo/undo entries for clustered inserts, deletes, updates, and splits
 - [ ] 39.12 ⏳ Crash recovery for clustered index — clustered-tree integrity after crash and repair
 - [ ] 39.13 ⏳ Executor integration: CREATE TABLE with clustered index
@@ -1277,6 +1278,20 @@
 - [ ] 39.18 ⏳ VACUUM for clustered index — reclaim dead cells and overflow pages
 - [ ] 39.19 ⏳ Table rebuild: heap to clustered migration
 - [ ] 39.20 ⏳ Integration tests and benchmarks for clustered tables
+
+### Phase 40 — Concurrent Writers (Multi-Writer Engine) `⏳`
+- [ ] 40.1 ⏳ Atomic transaction ID and snapshot — make next_txn_id and max_committed AtomicU64; lock-free snapshot creation
+- [ ] 40.2 ⏳ Per-connection transaction state — move ActiveTxn out of global TxnManager into per-connection SessionContext; TxnCoordinator tracks active set
+- [ ] 40.3 ⏳ StorageEngine interior mutability — change write_page(&mut self) to write_page(&self) with page-level locks; update 184 call sites
+- [ ] 40.4 ⏳ Concurrent WAL writer — atomic LSN assignment, per-writer scratch buffers, serialized I/O with group commit
+- [ ] 40.5 ⏳ Lock Manager: row-level locks — sharded hash table of (page_id, slot_id) → lock; S/X/IS/IX modes; FIFO wait queues
+- [ ] 40.6 ⏳ Deadlock detection — Brent's cycle detection on wait-for graph; victim selection by least work; automatic rollback
+- [ ] 40.7 ⏳ HeapChain concurrent access — per-page X-lock for writes, S-lock for reads; atomic chain growth
+- [ ] 40.8 ⏳ B-Tree latch coupling — top-down S-lock coupling for reads, optimistic S→X upgrade at leaf for writes; pessimistic re-traverse for splits
+- [ ] 40.9 ⏳ FreeList thread-safety — lock-free bitmap with AtomicU64 words for concurrent page alloc/free
+- [ ] 40.10 ⏳ Database lock redesign — replace Arc<RwLock<Database>> with SharedDatabase (interior mutability) + per-connection ConnectionState
+- [ ] 40.11 ⏳ Executor refactoring — update 184 signatures from &mut dyn StorageEngine to &dyn StorageEngine; lock acquisition at executor level
+- [ ] 40.12 ⏳ Integration tests and benchmarks — concurrent writer stress tests; 8-thread throughput; deadlock scenarios; crash recovery under concurrency
 
 ---
 

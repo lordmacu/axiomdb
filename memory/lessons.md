@@ -1,5 +1,17 @@
 # Lessons Learned
 
+## 2026-04-02 - Clustered overflow should spill only the row tail, never the key or MVCC header
+
+- The first safe large-row cut for clustered storage is not a generic TOAST subsystem and not a pointer-only row stub.
+- The right intermediate contract is:
+  - keep the primary key inline
+  - keep `RowHeader` inline
+  - keep a bounded local row prefix inline
+  - spill only the remaining tail bytes to overflow pages
+- `research/sqlite/src/btreeInt.h` reinforced the local-payload-plus-overflow-chain layout.
+- `research/mariadb-server/storage/innobase/handler/ha_innodb.cc` reinforced that off-page storage belongs to clustered records, not secondary entries.
+- The AxiomDB adaptation is narrower on purpose: no compression, no generic BLOB references, and no WAL/recovery yet, but the clustered tree can now store large rows without faking a complete Phase 11 TOAST layer.
+
 ## 2026-04-02 - Clustered secondary bookmarks must live in the physical key, not in the old RID payload
 
 - A clustered secondary entry cannot keep depending on a heap `RecordId` once row relocation becomes valid.

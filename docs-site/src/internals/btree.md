@@ -212,11 +212,12 @@ Algorithm shape:
 
 1. `insert(storage, root_opt, ...)` bootstraps a clustered leaf root if needed.
 2. Recursive descent chooses child pointers from `ClusteredInternal`.
-3. Leaf inserts stay in-place when the row fits.
-4. Fragmented leaves/internal pages call `defragment()` once before split.
-5. Leaf splits rebuild left/right pages by cumulative cell footprint.
-6. Internal splits rebuild left/right separator sets and promote one separator.
-7. Root overflow creates a fresh `ClusteredInternal` root.
+3. Leaf inserts stay in-place when the physical clustered-row descriptor fits.
+4. Large logical rows use local-prefix + overflow-page descriptors instead of an inline-only reject path.
+5. Fragmented leaves/internal pages call `defragment()` once before split.
+6. Leaf splits rebuild left/right pages by cumulative cell footprint.
+7. Internal splits rebuild left/right separator sets and promote one separator.
+8. Root overflow creates a fresh `ClusteredInternal` root.
 
 Unlike the old structural Copy-on-Write tree, clustered `39.3` keeps the old
 page ID as the left half on split and allocates only the new right sibling.
@@ -238,7 +239,7 @@ lookup:
 
 1. descend internal pages by separator key
 2. search the target leaf by exact key
-3. return the inline row payload directly
+3. reconstruct the full logical row from the local leaf payload plus any overflow-page tail
 4. filter the hit through `RowHeader::is_visible(snapshot)`
 
 The important scope cut is semantic rather than structural: the controller can
@@ -269,7 +270,7 @@ pages:
 
 1. determine the first relevant leaf for the lower bound
 2. determine the first relevant slot inside that leaf
-3. yield visible inline rows in ascending primary-key order
+3. reconstruct and yield visible logical rows in ascending primary-key order
 4. follow `next_leaf` across the leaf chain
 5. stop as soon as the upper bound is exceeded
 
@@ -278,7 +279,7 @@ The controller is intentionally separate from the old fixed-layout
 and different row payload semantics:
 
 - classic B+ Tree leaf: `(key, RecordId)`
-- clustered leaf: `(key, RowHeader, row_data)`
+- clustered leaf: `(key, RowHeader, total_row_len, local_prefix, overflow_ptr?)`
 
 So the right reuse point is the iterator *shape*, not the implementation.
 
@@ -302,8 +303,9 @@ row in place:
 1. descend to the owning leaf by exact primary key
 2. check visibility of the current inline version
 3. build the replacement inline header with a bumped `row_version`
-4. rewrite the exact leaf cell without changing the key
-5. keep the row in the same leaf or fail explicitly
+4. materialize either an inline or overflow-backed replacement descriptor
+5. rewrite the exact leaf cell without changing the key
+6. keep the row in the same leaf or fail explicitly
 
 This controller is intentionally narrower than a full B-tree update:
 
@@ -433,6 +435,49 @@ This subphase is intentionally narrower than full executor integration:
   planner/executor yet
 - unique clustered secondaries check logical-key conflicts before insert, even
   though the physical key contains a PK suffix for stable row identity
+
+### Clustered Overflow Pages (Phase 39.10)
+
+Phase `39.10` adds the first large-row storage layer for clustered leaves.
+
+The physical clustered leaf cell is now:
+
+```text
+[key_len: u16]
+[total_row_len: u32]
+[RowHeader: 24B]
+[key bytes]
+[local row prefix]
+[overflow_first_page?: u64]
+```
+
+And the overflow-page chain is:
+
+```text
+[next_overflow_page: u64]
+[payload bytes]
+```
+
+Important invariant:
+
+- split / merge / rebalance reason about the **physical** leaf footprint
+- lookup / range reconstruct the **logical** row bytes only when returning rows
+- the primary key and `RowHeader` never leave the clustered leaf page
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Keep MVCC Inline</span>
+PostgreSQL TOAST and InnoDB off-page columns both move large values away from the main record, but AxiomDB cannot move the clustered `RowHeader` off-page in 39.10 because Phase 39 still performs MVCC visibility checks directly at the leaf. The adaptation is narrower on purpose: spill only the row tail, never the key or header.
+</div>
+</div>
+
+This is still narrower than full large-value support:
+
+- no generic TOAST/BLOB reference layer yet
+- no compression yet
+- no WAL / recovery for overflow chains yet
+- delete-mark keeps the overflow chain reachable until later purge
 
 ### Leaf Node (`LeafNodePage`)
 

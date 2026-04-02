@@ -13,7 +13,8 @@
 //!
 //! Each cell:
 //! ```text
-//! [key_len: u16 LE][row_len: u16 LE][RowHeader: 24B][key_data][row_data]
+//! [key_len: u16 LE][total_row_len: u32 LE][RowHeader: 24B][key_data]
+//! [local_row_prefix][overflow_first_page?: u64 LE]
 //! ```
 //!
 //! The cell pointer array is kept sorted by key, enabling binary search.
@@ -39,11 +40,14 @@ const CELL_PTR_START: usize = CL_HEADER_SIZE;
 /// Size of one cell pointer (body-relative u16 LE offset).
 const CELL_PTR_SIZE: usize = 2;
 
-/// Size of the cell metadata (key_len u16 + row_len u16).
-const CELL_META_SIZE: usize = 4;
+/// Size of the cell metadata (key_len u16 + total_row_len u32).
+const CELL_META_SIZE: usize = 6;
 
 /// Size of the RowHeader embedded in each cell.
 const ROW_HEADER_SIZE: usize = std::mem::size_of::<RowHeader>();
+
+/// Optional overflow pointer stored at the end of an overflow-backed cell.
+const OVERFLOW_PTR_SIZE: usize = std::mem::size_of::<u64>();
 
 /// Minimum freeblock size (next_offset u16 + block_size u16).
 const MIN_FREEBLOCK: usize = 4;
@@ -57,16 +61,47 @@ pub fn max_inline_key_bytes() -> usize {
     BODY_SIZE - CL_HEADER_SIZE - CELL_PTR_SIZE - CELL_META_SIZE - ROW_HEADER_SIZE
 }
 
-/// Maximum row payload bytes that can fit inline on an otherwise empty
-/// clustered leaf page for a given key length.
+/// Maximum primary-key bytes that still leave room for an overflow pointer on a
+/// clustered leaf page.
+pub fn max_overflow_key_bytes() -> usize {
+    max_inline_key_bytes().saturating_sub(OVERFLOW_PTR_SIZE)
+}
+
+/// Maximum local row-prefix bytes kept inline for an overflow-backed row with
+/// the given primary-key length.
+///
+/// The budget targets roughly one quarter of the clustered leaf payload area so
+/// that large rows still leave room for multiple cells per page.
 pub fn max_inline_row_bytes(key_len: usize) -> Option<usize> {
-    max_inline_key_bytes().checked_sub(key_len)
+    let overflow_fixed =
+        CELL_PTR_SIZE + CELL_META_SIZE + ROW_HEADER_SIZE + key_len + OVERFLOW_PTR_SIZE;
+    let quarter_target = page_capacity_bytes() / 4;
+    let local_budget = quarter_target.saturating_sub(overflow_fixed);
+    if overflow_fixed > page_capacity_bytes() {
+        None
+    } else {
+        Some(local_budget)
+    }
+}
+
+/// Local row-prefix bytes stored inline for a row with the given logical length.
+pub fn local_row_len(key_len: usize, total_row_len: usize) -> usize {
+    max_inline_row_bytes(key_len)
+        .map(|budget| total_row_len.min(budget))
+        .unwrap_or(0)
+}
+
+/// Returns whether the logical row requires an overflow-page chain.
+pub fn requires_overflow(key_len: usize, total_row_len: usize) -> bool {
+    local_row_len(key_len, total_row_len) < total_row_len
 }
 
 /// Total on-page footprint of a clustered leaf entry, including its 2-byte
 /// pointer-array slot.
-pub fn cell_footprint(key_len: usize, row_len: usize) -> usize {
-    CELL_PTR_SIZE + CELL_META_SIZE + ROW_HEADER_SIZE + key_len + row_len
+pub fn cell_footprint(key_len: usize, total_row_len: usize) -> usize {
+    let local_len = local_row_len(key_len, total_row_len);
+    let overflow = usize::from(total_row_len > local_len) * OVERFLOW_PTR_SIZE;
+    CELL_PTR_SIZE + CELL_META_SIZE + ROW_HEADER_SIZE + key_len + local_len + overflow
 }
 
 /// Total bytes available in the body for clustered leaf cells and their
@@ -76,9 +111,9 @@ pub fn page_capacity_bytes() -> usize {
 }
 
 /// Returns whether a `(key, row_data)` pair fits on an otherwise empty
-/// clustered leaf page without overflow support.
+/// clustered leaf page.
 pub fn fits_inline(key_len: usize, row_len: usize) -> bool {
-    max_inline_row_bytes(key_len).is_some_and(|max| row_len <= max)
+    cell_footprint(key_len, row_len) <= page_capacity_bytes()
 }
 
 // ── Header access ────────────────────────────────────────────────────────────
@@ -187,8 +222,11 @@ fn cell_size_at(page: &Page, body_off: u16) -> usize {
     let abs = HEADER_SIZE + body_off as usize;
     let b = page.as_bytes();
     let key_len = u16::from_le_bytes([b[abs], b[abs + 1]]) as usize;
-    let row_len = u16::from_le_bytes([b[abs + 2], b[abs + 3]]) as usize;
-    CELL_META_SIZE + ROW_HEADER_SIZE + key_len + row_len
+    let total_row_len =
+        u32::from_le_bytes([b[abs + 2], b[abs + 3], b[abs + 4], b[abs + 5]]) as usize;
+    let local_len = local_row_len(key_len, total_row_len);
+    let overflow = usize::from(total_row_len > local_len) * OVERFLOW_PTR_SIZE;
+    CELL_META_SIZE + ROW_HEADER_SIZE + key_len + local_len + overflow
 }
 
 /// Read the key bytes from a cell at body-relative offset.
@@ -206,14 +244,18 @@ pub struct CellRef<'a> {
     pub key: &'a [u8],
     /// Copied from the page (cells may not be 8-byte aligned for bytemuck cast).
     pub row_header: RowHeader,
+    pub total_row_len: usize,
     pub row_data: &'a [u8],
+    pub overflow_first_page: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 struct OwnedCell {
     key: Vec<u8>,
     row_header: RowHeader,
+    total_row_len: usize,
     row_data: Vec<u8>,
+    overflow_first_page: Option<u64>,
 }
 
 /// Read cell at logical index `idx` (0-based, sorted by key).
@@ -241,14 +283,17 @@ fn read_cell_at_offset(page: &Page, body_off: u16) -> Result<CellRef<'_>, DbErro
         ));
     }
     let key_len = u16::from_le_bytes([b[abs], b[abs + 1]]) as usize;
-    let row_len = u16::from_le_bytes([b[abs + 2], b[abs + 3]]) as usize;
+    let total_row_len =
+        u32::from_le_bytes([b[abs + 2], b[abs + 3], b[abs + 4], b[abs + 5]]) as usize;
 
     let hdr_start = abs + CELL_META_SIZE;
     let key_start = hdr_start + ROW_HEADER_SIZE;
     let row_start = key_start + key_len;
-    let cell_end = row_start + row_len;
+    let local_len = local_row_len(key_len, total_row_len);
+    let row_end = row_start + local_len;
+    let overflow_end = row_end + usize::from(total_row_len > local_len) * OVERFLOW_PTR_SIZE;
 
-    if cell_end > PAGE_SIZE {
+    if overflow_end > PAGE_SIZE {
         return Err(DbError::Other("clustered_leaf: cell data truncated".into()));
     }
 
@@ -260,7 +305,17 @@ fn read_cell_at_offset(page: &Page, body_off: u16) -> Result<CellRef<'_>, DbErro
     Ok(CellRef {
         key: &b[key_start..key_start + key_len],
         row_header,
-        row_data: &b[row_start..cell_end],
+        total_row_len,
+        row_data: &b[row_start..row_end],
+        overflow_first_page: if total_row_len > local_len {
+            Some(u64::from_le_bytes(
+                b[row_end..overflow_end].try_into().map_err(|_| {
+                    DbError::Other("clustered_leaf: overflow pointer truncated".into())
+                })?,
+            ))
+        } else {
+            None
+        },
     })
 }
 
@@ -425,7 +480,33 @@ pub fn insert_cell(
     row_header: &RowHeader,
     row_data: &[u8],
 ) -> Result<(), DbError> {
-    let cell_size = CELL_META_SIZE + ROW_HEADER_SIZE + key.len() + row_data.len();
+    if requires_overflow(key.len(), row_data.len()) {
+        return Err(DbError::ValueTooLarge {
+            len: row_data.len(),
+            max: max_inline_row_bytes(key.len()).unwrap_or(0),
+        });
+    }
+
+    insert_cell_with_overflow(page, pos, key, row_header, row_data.len(), row_data, None)
+}
+
+/// Insert a clustered leaf cell from a pre-materialized physical descriptor.
+pub fn insert_cell_with_overflow(
+    page: &mut Page,
+    pos: usize,
+    key: &[u8],
+    row_header: &RowHeader,
+    total_row_len: usize,
+    local_row_data: &[u8],
+    overflow_first_page: Option<u64>,
+) -> Result<(), DbError> {
+    validate_cell_descriptor(key, total_row_len, local_row_data, overflow_first_page)?;
+
+    let cell_size = CELL_META_SIZE
+        + ROW_HEADER_SIZE
+        + key.len()
+        + local_row_data.len()
+        + usize::from(overflow_first_page.is_some()) * OVERFLOW_PTR_SIZE;
     let need_gap = CELL_PTR_SIZE; // 2 bytes for the new pointer
     let n = num_cells(page) as usize;
 
@@ -468,12 +549,18 @@ pub fn insert_cell(
     let abs = HEADER_SIZE + cell_offset as usize;
     let b = page.as_bytes_mut();
     b[abs..abs + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    b[abs + 2..abs + 4].copy_from_slice(&(row_data.len() as u16).to_le_bytes());
-    b[abs + 4..abs + 4 + ROW_HEADER_SIZE].copy_from_slice(bytemuck::bytes_of(row_header));
+    b[abs + 2..abs + 6].copy_from_slice(&(total_row_len as u32).to_le_bytes());
+    b[abs + CELL_META_SIZE..abs + CELL_META_SIZE + ROW_HEADER_SIZE]
+        .copy_from_slice(bytemuck::bytes_of(row_header));
     let key_start = abs + CELL_META_SIZE + ROW_HEADER_SIZE;
     b[key_start..key_start + key.len()].copy_from_slice(key);
     let row_start = key_start + key.len();
-    b[row_start..row_start + row_data.len()].copy_from_slice(row_data);
+    b[row_start..row_start + local_row_data.len()].copy_from_slice(local_row_data);
+    if let Some(first_page) = overflow_first_page {
+        let overflow_start = row_start + local_row_data.len();
+        b[overflow_start..overflow_start + OVERFLOW_PTR_SIZE]
+            .copy_from_slice(&first_page.to_le_bytes());
+    }
 
     // Shift cell pointers right by 2 bytes to make room at `pos`.
     let ptr_base = HEADER_SIZE + CELL_PTR_START;
@@ -503,6 +590,42 @@ pub fn rewrite_cell_same_key(
     new_row_header: &RowHeader,
     new_row_data: &[u8],
 ) -> Result<Option<Vec<u8>>, DbError> {
+    if requires_overflow(expected_key.len(), new_row_data.len()) {
+        return Err(DbError::ValueTooLarge {
+            len: new_row_data.len(),
+            max: max_inline_row_bytes(expected_key.len()).unwrap_or(0),
+        });
+    }
+
+    rewrite_cell_same_key_with_overflow(
+        page,
+        pos,
+        expected_key,
+        new_row_header,
+        new_row_data.len(),
+        new_row_data,
+        None,
+    )
+}
+
+/// Rewrites the cell at logical index `pos` from a pre-materialized physical
+/// descriptor while preserving its key and slot.
+pub fn rewrite_cell_same_key_with_overflow(
+    page: &mut Page,
+    pos: usize,
+    expected_key: &[u8],
+    new_row_header: &RowHeader,
+    total_row_len: usize,
+    local_row_data: &[u8],
+    overflow_first_page: Option<u64>,
+) -> Result<Option<Vec<u8>>, DbError> {
+    validate_cell_descriptor(
+        expected_key,
+        total_row_len,
+        local_row_data,
+        overflow_first_page,
+    )?;
+
     let n = num_cells(page) as usize;
     if pos >= n {
         return Err(DbError::Other(format!(
@@ -523,7 +646,13 @@ pub fn rewrite_cell_same_key(
     }
 
     let old_image = cell_image_at(page, body_off)?;
-    let new_image = encode_cell_image(expected_key, new_row_header, new_row_data);
+    let new_image = encode_cell_image(
+        expected_key,
+        new_row_header,
+        total_row_len,
+        local_row_data,
+        overflow_first_page,
+    )?;
     let new_size = new_image.len();
 
     if new_size <= old_size {
@@ -542,7 +671,9 @@ pub fn rewrite_cell_same_key(
     cells[pos] = OwnedCell {
         key: expected_key.to_vec(),
         row_header: *new_row_header,
-        row_data: new_row_data.to_vec(),
+        total_row_len,
+        row_data: local_row_data.to_vec(),
+        overflow_first_page,
     };
 
     let next = next_leaf(page);
@@ -552,12 +683,14 @@ pub fn rewrite_cell_same_key(
     set_next_leaf(&mut rebuilt, next);
 
     for (idx, cell) in cells.iter().enumerate() {
-        match insert_cell(
+        match insert_cell_with_overflow(
             &mut rebuilt,
             idx,
             &cell.key,
             &cell.row_header,
+            cell.total_row_len,
             &cell.row_data,
+            cell.overflow_first_page,
         ) {
             Ok(()) => {}
             Err(DbError::HeapPageFull { .. }) => return Ok(None),
@@ -660,15 +793,37 @@ fn write_cell_image(page: &mut Page, body_off: u16, image: &[u8]) {
     page.as_bytes_mut()[abs..abs + image.len()].copy_from_slice(image);
 }
 
-fn encode_cell_image(key: &[u8], row_header: &RowHeader, row_data: &[u8]) -> Vec<u8> {
-    let mut image = vec![0u8; CELL_META_SIZE + ROW_HEADER_SIZE + key.len() + row_data.len()];
+fn encode_cell_image(
+    key: &[u8],
+    row_header: &RowHeader,
+    total_row_len: usize,
+    local_row_data: &[u8],
+    overflow_first_page: Option<u64>,
+) -> Result<Vec<u8>, DbError> {
+    validate_cell_descriptor(key, total_row_len, local_row_data, overflow_first_page)?;
+
+    let mut image = vec![
+        0u8;
+        CELL_META_SIZE
+            + ROW_HEADER_SIZE
+            + key.len()
+            + local_row_data.len()
+            + usize::from(overflow_first_page.is_some()) * OVERFLOW_PTR_SIZE
+    ];
     image[..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    image[2..4].copy_from_slice(&(row_data.len() as u16).to_le_bytes());
-    image[4..4 + ROW_HEADER_SIZE].copy_from_slice(bytemuck::bytes_of(row_header));
+    image[2..6].copy_from_slice(&(total_row_len as u32).to_le_bytes());
+    image[CELL_META_SIZE..CELL_META_SIZE + ROW_HEADER_SIZE]
+        .copy_from_slice(bytemuck::bytes_of(row_header));
     let key_start = CELL_META_SIZE + ROW_HEADER_SIZE;
     image[key_start..key_start + key.len()].copy_from_slice(key);
-    image[key_start + key.len()..].copy_from_slice(row_data);
-    image
+    let row_start = key_start + key.len();
+    image[row_start..row_start + local_row_data.len()].copy_from_slice(local_row_data);
+    if let Some(first_page) = overflow_first_page {
+        let overflow_start = row_start + local_row_data.len();
+        image[overflow_start..overflow_start + OVERFLOW_PTR_SIZE]
+            .copy_from_slice(&first_page.to_le_bytes());
+    }
+    Ok(image)
 }
 
 fn collect_cells(page: &Page) -> Result<Vec<OwnedCell>, DbError> {
@@ -679,10 +834,59 @@ fn collect_cells(page: &Page) -> Result<Vec<OwnedCell>, DbError> {
         cells.push(OwnedCell {
             key: cell.key.to_vec(),
             row_header: cell.row_header,
+            total_row_len: cell.total_row_len,
             row_data: cell.row_data.to_vec(),
+            overflow_first_page: cell.overflow_first_page,
         });
     }
     Ok(cells)
+}
+
+fn validate_cell_descriptor(
+    key: &[u8],
+    total_row_len: usize,
+    local_row_data: &[u8],
+    overflow_first_page: Option<u64>,
+) -> Result<(), DbError> {
+    if key.len() > u16::MAX as usize {
+        return Err(DbError::KeyTooLong {
+            len: key.len(),
+            max: u16::MAX as usize,
+        });
+    }
+    if total_row_len > u32::MAX as usize {
+        return Err(DbError::ValueTooLarge {
+            len: total_row_len,
+            max: u32::MAX as usize,
+        });
+    }
+
+    let expected_local_len = local_row_len(key.len(), total_row_len);
+    if local_row_data.len() != expected_local_len {
+        return Err(DbError::Other(format!(
+            "clustered_leaf: descriptor local length mismatch for key_len={} total_row_len={total_row_len}: expected {expected_local_len}, got {}",
+            key.len(),
+            local_row_data.len()
+        )));
+    }
+
+    let needs_overflow = total_row_len > expected_local_len;
+    if needs_overflow != overflow_first_page.is_some() {
+        return Err(DbError::Other(format!(
+            "clustered_leaf: descriptor overflow mismatch for key_len={} total_row_len={total_row_len}",
+            key.len()
+        )));
+    }
+
+    if cell_footprint(key.len(), total_row_len) > page_capacity_bytes() {
+        return Err(DbError::HeapPageFull {
+            page_id: 0,
+            needed: cell_footprint(key.len(), total_row_len),
+            available: page_capacity_bytes(),
+        });
+    }
+
+    Ok(())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -861,12 +1065,40 @@ mod tests {
             0,
             &0u32.to_be_bytes(),
             &new_hdr,
-            &vec![9u8; 8_000],
+            &vec![9u8; max_inline_row_bytes(4).unwrap()],
         )
         .unwrap();
 
         assert!(rewritten.is_none());
         assert_eq!(page.as_bytes(), &before);
+    }
+
+    #[test]
+    fn test_insert_overflow_backed_descriptor_roundtrips() {
+        let mut page = make_page();
+        let hdr = make_row_header(4);
+        let key = b"overflowed";
+        let local_len = max_inline_row_bytes(key.len()).unwrap();
+        let total_row_len = local_len + 123;
+        let local_row = vec![0x2A; local_len];
+
+        insert_cell_with_overflow(
+            &mut page,
+            0,
+            key,
+            &hdr,
+            total_row_len,
+            &local_row,
+            Some(777),
+        )
+        .unwrap();
+
+        let cell = read_cell(&page, 0).unwrap();
+        assert_eq!(cell.key, key);
+        assert_eq!(cell.row_header.txn_id_created, 4);
+        assert_eq!(cell.total_row_len, total_row_len);
+        assert_eq!(cell.row_data, local_row);
+        assert_eq!(cell.overflow_first_page, Some(777));
     }
 
     #[test]

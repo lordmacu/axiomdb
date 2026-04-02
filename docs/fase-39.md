@@ -1,6 +1,6 @@
 # Phase 39 — Clustered Index Storage Engine
 
-## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7, 39.8, 39.9
+## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7, 39.8, 39.9, 39.10
 
 ## What was built
 
@@ -347,6 +347,60 @@ Important boundary for this subphase:
 - `crates/axiomdb-sql/tests/integration_clustered_secondary.rs`
   - adds integration coverage for duplicate logical keys, bookmark decode, delete, and relocate-stable maintenance
 
+### 39.10 — Overflow pages for large rows
+
+`crates/axiomdb-storage/src/clustered_overflow.rs` now implements clustered-row
+overflow-page chains, and `clustered_leaf.rs` / `clustered_tree.rs` now use
+that format for large logical rows.
+
+The clustered leaf cell format is no longer inline-only:
+
+- `key_len: u16`
+- `total_row_len: u32`
+- inline `RowHeader`
+- inline primary-key bytes
+- inline local row prefix
+- optional `overflow_first_page: u64`
+
+Behavior:
+
+- rows below the local inline budget stay fully inline
+- rows above that budget spill only their tail bytes to `PageType::Overflow`
+  pages
+- clustered lookup and range scan reconstruct full logical row bytes
+  transparently
+- `update_in_place(...)` now supports inline → overflow, overflow → overflow,
+  and overflow → inline transitions
+- `delete_mark(...)` keeps the overflow chain reachable because clustered purge
+  still belongs to later phases
+- physical clustered delete frees the removed row's obsolete overflow chain
+- leaf split / rebalance / merge now move physical leaf descriptors without
+  reallocating overflow payload
+
+This subphase also closes the original `39.1` acceptance gap: clustered leaf
+pages now support large-row overflow instead of rejecting those rows outright.
+
+### Supporting changes for 39.10
+
+- `crates/axiomdb-storage/src/clustered_overflow.rs`
+  - adds chained overflow-page write/read/free helpers over `PageType::Overflow`
+  - validates page type, early chain termination, trailing pages, and cycle-like
+    corruption
+- `crates/axiomdb-storage/src/clustered_leaf.rs`
+  - changes clustered leaf cells from inline-only `row_len: u16` to
+    `total_row_len: u32` + local prefix + optional overflow pointer
+  - adds local-row budgeting and physical-footprint helpers for overflow-backed rows
+  - adds direct encode/decode support for overflow-backed cell descriptors
+- `crates/axiomdb-storage/src/clustered_tree.rs`
+  - materializes overflow chains on clustered insert and update
+  - reconstructs logical row bytes on clustered lookup and range scan
+  - keeps split / rebalance / merge descriptor-oriented instead of logical-row-oriented
+  - frees obsolete overflow chains on physical remove and shrink-to-inline update
+- `crates/axiomdb-storage/tests/integration_clustered_tree.rs`
+  - adds mixed inline/overflow lookup + range coverage
+  - adds update transition coverage across overflow boundaries
+  - adds delete-mark coverage proving the overflow chain survives until later purge
+
 ## Validation
 
 Targeted validation passed:
@@ -507,6 +561,25 @@ New clustered secondary bookmark coverage now includes:
 - relocate-only update becoming a no-op when logical secondary key and PK remain stable
 - unique-logical-key rejection for bookmark-bearing secondaries
 
+Targeted validation for `39.10` also passed:
+
+- `cargo test -p axiomdb-storage clustered_leaf --lib -j1`
+- `cargo test -p axiomdb-storage clustered_tree --lib -j1`
+- `cargo test -p axiomdb-storage --test integration_clustered_tree -j1`
+- `cargo test -p axiomdb-storage -j1`
+- `cargo check -p axiomdb-index -j1`
+- `cargo check -p axiomdb-sql --lib -j1`
+
+New clustered overflow coverage now includes:
+
+- overflow-page write/read roundtrip across one page and multiple pages
+- freeing the full overflow chain after physical removal
+- leaf encode/decode roundtrip for overflow-backed descriptors
+- clustered insert of rows above the old inline-only limit
+- mixed inline/overflow lookup and full range scan reconstruction
+- update transitions inline → overflow and overflow → inline
+- delete-mark preserving the overflow chain until later purge
+
 ## Review notes
 
 - All `39.3` acceptance criteria from the spec are implemented.
@@ -516,12 +589,14 @@ New clustered secondary bookmark coverage now includes:
 - All `39.7` acceptance criteria from the spec are implemented.
 - All `39.8` acceptance criteria from the spec are implemented.
 - All `39.9` acceptance criteria from the spec are implemented.
+- All `39.10` acceptance criteria from the spec are implemented.
 - No `unsafe` was introduced in the clustered tree path.
 - No production `unwrap()` remains in the touched clustered files.
 - No production `unwrap()` was introduced in the new clustered-secondary path.
+- No production `unwrap()` was introduced in the new clustered-overflow path.
 - Benchmarking remains intentionally deferred: `39.5` finishes the storage-level
   clustered read slice, and `39.6` / `39.7` / `39.8` / `39.9` add the first clustered mutation, rebalance, and bookmark slices,
-  but end-to-end clustered DML benchmarks still wait for later SQL-visible integration.
+  `39.10` adds overflow-backed row storage, but end-to-end clustered DML benchmarks still wait for later SQL-visible integration.
 
 ## Deferred
 
@@ -550,5 +625,7 @@ New clustered secondary bookmark coverage now includes:
   bookmark-bearing secondary keys now exist as a dedicated path, but the SQL
   executor, FK enforcement, and index-integrity rebuilds still use the classic
   heap `RecordId` secondary model.
-- `39.1` remains open because large-row overflow cells are still deferred to
-  `39.10`, even though the clustered leaf groundwork already exists in storage.
+- `39.10` closes the old clustered-leaf gap:
+  large logical rows no longer stop at an explicit reject path; they now spill
+  their tail bytes to dedicated overflow pages while keeping PK bytes and
+  `RowHeader` inline in the clustered leaf.
