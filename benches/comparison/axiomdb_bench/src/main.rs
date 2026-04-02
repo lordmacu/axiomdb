@@ -1,10 +1,7 @@
-//! AxiomDB internal benchmark — runs INSIDE the AxiomDB container.
-//! Uses real MmapStorage + WAL (no network overhead).
+//! AxiomDB internal benchmark — in-process, no network overhead.
+//! Uses axiomdb-embedded::Db which keeps SchemaCache + SessionContext
+//! alive across queries — same behavior as the wire server.
 //! Outputs one JSON line per scenario to stdout.
-//!
-//! Usage (from host via docker exec):
-//!   docker exec axiomdb_bench_axiomdb /bench/axiomdb_bench \
-//!     --scenario insert_batch --rows 10000
 //!
 //! Comparison mode (AxiomDB vs SQLite, same process, no network):
 //!   cargo run -p axiomdb-bench-comparison --release -- --compare --rows 5000
@@ -13,104 +10,27 @@
 use std::path::Path;
 use std::time::Instant;
 
-use axiomdb_catalog::CatalogBootstrap;
-use axiomdb_sql::{
-    analyze, analyze_cached, bloom::BloomRegistry, execute, execute_with_ctx, parse, QueryResult,
-    SchemaCache, SessionContext,
-};
-use axiomdb_storage::MmapStorage;
-use axiomdb_wal::TxnManager;
+use axiomdb_embedded::Db;
+use axiomdb_sql::QueryResult;
 use rusqlite::Connection;
 
 const WARMUP: usize = 2;
 const RUNS: usize = 5;
 
-// ── Engine ────────────────────────────────────────────────────────────────────
+// ── Engine helpers ────────────────────────────────────────────────────────────
 
-struct Db {
-    storage: MmapStorage,
-    txn: TxnManager,
-    bloom: BloomRegistry,
+fn db_open(dir: &Path) -> Db {
+    Db::open(dir.join("bench.db")).expect("open db")
 }
 
-impl Db {
-    fn open(dir: &Path) -> Self {
-        let db_path = dir.join("bench.db");
-        let wal_path = dir.join("bench.wal");
+fn db_sql(db: &mut Db, q: &str) -> QueryResult {
+    db.run(q).unwrap_or_else(|e| panic!("sql({q}): {e}"))
+}
 
-        // Open existing or create fresh
-        let mut storage = if db_path.exists() {
-            MmapStorage::open(&db_path).expect("open storage")
-        } else {
-            let mut s = MmapStorage::create(&db_path).expect("create storage");
-            CatalogBootstrap::init(&mut s).expect("bootstrap");
-            s
-        };
-
-        // Bootstrap catalog if not yet initialized (fresh DB)
-        let txn = if wal_path.exists() {
-            TxnManager::open(&wal_path).expect("open WAL")
-        } else {
-            let t = TxnManager::create(&wal_path).expect("create WAL");
-            // Ensure catalog is bootstrapped
-            let _ = CatalogBootstrap::init(&mut storage);
-            t
-        };
-
-        Self {
-            storage,
-            txn,
-            bloom: BloomRegistry::new(),
-        }
-    }
-
-    fn sql(&mut self, q: &str) -> QueryResult {
-        let stmt = parse(q, None).unwrap_or_else(|e| panic!("parse({q}): {e}"));
-        let snap = self
-            .txn
-            .active_snapshot()
-            .unwrap_or_else(|_| self.txn.snapshot());
-        let analyzed =
-            analyze(stmt, &self.storage, snap).unwrap_or_else(|e| panic!("analyze({q}): {e}"));
-        execute(analyzed, &mut self.storage, &mut self.txn)
-            .unwrap_or_else(|e| panic!("execute({q}): {e}"))
-    }
-
-    /// Like `sql()` but uses both schema caches:
-    ///
-    /// - `SchemaCache` in analyze() → skips catalog scan for repeated tables
-    /// - `SessionContext` in execute_with_ctx() → skips executor-side catalog scan
-    ///
-    /// Pass the same `schema_cache` and `ctx` for the whole batch.
-    fn sql_cached(
-        &mut self,
-        q: &str,
-        schema_cache: &mut SchemaCache,
-        ctx: &mut SessionContext,
-    ) -> QueryResult {
-        let stmt = parse(q, None).unwrap_or_else(|e| panic!("parse({q}): {e}"));
-        let snap = self
-            .txn
-            .active_snapshot()
-            .unwrap_or_else(|_| self.txn.snapshot());
-        let analyzed = analyze_cached(stmt, &self.storage, snap, schema_cache)
-            .unwrap_or_else(|e| panic!("analyze_cached({q}): {e}"));
-        execute_with_ctx(
-            analyzed,
-            &mut self.storage,
-            &mut self.txn,
-            &mut self.bloom,
-            ctx,
-        )
-        .unwrap_or_else(|e| panic!("execute_with_ctx({q}): {e}"))
-    }
-
-    fn sql_count(&mut self, q: &str) -> usize {
-        match self.sql(q) {
-            QueryResult::Rows { rows, .. } => rows.len(),
-            _ => 0,
-        }
-    }
+fn db_sql_count(db: &mut Db, q: &str) -> usize {
+    db.query(q)
+        .unwrap_or_else(|e| panic!("query({q}): {e}"))
+        .len()
 }
 
 // ── Data ──────────────────────────────────────────────────────────────────────
@@ -127,8 +47,9 @@ fn gen_inserts(n: usize) -> Vec<String> {
 }
 
 fn reset(db: &mut Db) {
-    db.sql("DROP TABLE IF EXISTS bench_users");
-    db.sql(
+    db_sql(db, "DROP TABLE IF EXISTS bench_users");
+    db_sql(
+        db,
         "CREATE TABLE bench_users (
         id     INT  NOT NULL,
         name   TEXT NOT NULL,
@@ -141,23 +62,17 @@ fn reset(db: &mut Db) {
     );
 }
 
-/// Full load: reset then INSERT. Used for pre-loading data before read benchmarks
-/// and for the diagnose helper. NOT used in timed INSERT scenarios.
 fn load_batch(db: &mut Db, inserts: &[String]) {
     reset(db);
     insert_batch_pure(db, inserts);
 }
 
-/// INSERT only — reset happens outside timing via measure_with_setup.
-/// Dual schema cache eliminates catalog heap scans (4×N → 2 total per batch).
 fn insert_batch_pure(db: &mut Db, inserts: &[String]) {
-    let mut schema_cache = SchemaCache::new();
-    let mut ctx = SessionContext::default();
-    db.sql("BEGIN");
+    db_sql(db, "BEGIN");
     for sql in inserts {
-        db.sql_cached(sql, &mut schema_cache, &mut ctx);
+        db_sql(db, sql);
     }
-    db.sql("COMMIT");
+    db_sql(db, "COMMIT");
 }
 
 // ── Measurement ───────────────────────────────────────────────────────────────
@@ -212,14 +127,13 @@ fn out(scenario: &str, n_rows: usize, mean_s: f64, note: &str) {
 // ── Scenarios ─────────────────────────────────────────────────────────────────
 
 fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
-    let mut db = Db::open(data_dir);
+    let mut db = db_open(data_dir);
     let inserts = gen_inserts(n_rows);
     let ac_n = n_rows.min(300);
     let ac = gen_inserts(ac_n);
 
     match scenario {
         "insert_batch" => {
-            // reset (DROP+CREATE) outside timing — measures INSERT only (fair comparison)
             let mean = measure_timed(|| {
                 reset(&mut db);
                 let t0 = Instant::now();
@@ -230,8 +144,6 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
         }
 
         "crud_flow" => {
-            // Full cycle: INSERT → SELECT * → DELETE, measured separately per phase.
-            // Reset (DROP+CREATE) is outside timing for each iteration.
             let mut ins_t = Vec::with_capacity(RUNS);
             let mut sel_t = Vec::with_capacity(RUNS);
             let mut del_t = Vec::with_capacity(RUNS);
@@ -239,19 +151,16 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
             for i in 0..(WARMUP + RUNS) {
                 reset(&mut db);
 
-                // INSERT
                 let t0 = Instant::now();
                 insert_batch_pure(&mut db, &inserts);
                 let t_ins = t0.elapsed().as_secs_f64();
 
-                // SELECT *
                 let t0 = Instant::now();
-                db.sql_count("SELECT * FROM bench_users");
+                db_sql_count(&mut db, "SELECT * FROM bench_users");
                 let t_sel = t0.elapsed().as_secs_f64();
 
-                // DELETE all rows
                 let t0 = Instant::now();
-                db.sql("DELETE FROM bench_users");
+                db_sql(&mut db, "DELETE FROM bench_users");
                 let t_del = t0.elapsed().as_secs_f64();
 
                 if i >= WARMUP {
@@ -264,12 +173,7 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
             let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
             out("crud_flow/insert", n_rows, mean(&ins_t), "");
             out("crud_flow/select", n_rows, mean(&sel_t), "full scan");
-            out(
-                "crud_flow/delete",
-                n_rows,
-                mean(&del_t),
-                "full scan — index in Phase 5",
-            );
+            out("crud_flow/delete", n_rows, mean(&del_t), "");
         }
 
         "insert_autocommit" => {
@@ -277,7 +181,7 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
                 reset(&mut db);
                 let t0 = Instant::now();
                 for sql in &ac {
-                    db.sql(sql);
+                    db_sql(&mut db, sql);
                 }
                 t0.elapsed()
             });
@@ -285,7 +189,6 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
         }
 
         _ => {
-            // Pre-load data for read benchmarks
             load_batch(&mut db, &inserts);
             let step = (n_rows.max(100) / 100).max(1);
             let start = n_rows / 4;
@@ -294,14 +197,14 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
             let (mean, n_ops, note) = match scenario {
                 "full_scan" => (
                     measure(|| {
-                        db.sql_count("SELECT * FROM bench_users");
+                        db_sql_count(&mut db, "SELECT * FROM bench_users");
                     }),
                     n_rows,
                     "",
                 ),
                 "select_where" => (
                     measure(|| {
-                        db.sql_count("SELECT * FROM bench_users WHERE active = TRUE");
+                        db_sql_count(&mut db, "SELECT * FROM bench_users WHERE active = TRUE");
                     }),
                     n_rows / 2,
                     "",
@@ -309,31 +212,40 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
                 "point_lookup" => (
                     measure(|| {
                         for i in (1..=n_rows).step_by(step).take(100) {
-                            db.sql_count(&format!("SELECT * FROM bench_users WHERE id = {i}"));
+                            db_sql_count(
+                                &mut db,
+                                &format!("SELECT * FROM bench_users WHERE id = {i}"),
+                            );
                         }
                     }),
                     100,
-                    "full scan — index scan in Phase 5",
+                    "",
                 ),
                 "range_scan" => (
                     measure(|| {
-                        db.sql_count(&format!(
-                            "SELECT * FROM bench_users WHERE id >= {start} AND id < {end}"
-                        ));
+                        db_sql_count(
+                            &mut db,
+                            &format!(
+                                "SELECT * FROM bench_users WHERE id >= {start} AND id < {end}"
+                            ),
+                        );
                     }),
                     n_rows / 10,
-                    "full scan — index scan in Phase 5",
+                    "",
                 ),
                 "count_star" => (
                     measure(|| {
-                        db.sql("SELECT COUNT(*) FROM bench_users");
+                        db_sql(&mut db, "SELECT COUNT(*) FROM bench_users");
                     }),
                     1,
-                    "full scan — index in Phase 5",
+                    "",
                 ),
                 "group_by" => (
                     measure(|| {
-                        db.sql("SELECT age, COUNT(*) FROM bench_users GROUP BY age");
+                        db_sql(
+                            &mut db,
+                            "SELECT age, COUNT(*) FROM bench_users GROUP BY age",
+                        );
                     }),
                     1,
                     "",
@@ -554,7 +466,7 @@ fn run_compare(n_rows: usize, sqlite_memory: bool) {
     let axiomdb_dir = tempfile::TempDir::new().expect("tempdir");
     let sqlite_dir = tempfile::TempDir::new().expect("tempdir");
 
-    let mut ax_db = Db::open(axiomdb_dir.path());
+    let mut ax_db = db_open(axiomdb_dir.path());
 
     let sq_db = if sqlite_memory {
         SqliteDb::open_memory()
@@ -646,7 +558,7 @@ fn run_scenario_timed(scenario: &str, n_rows: usize, _data_dir: &Path, db: &mut 
             reset(db);
             let t0 = Instant::now();
             for sql in &ac {
-                db.sql(sql);
+                db_sql(db, sql);
             }
             t0.elapsed()
         }),
@@ -663,11 +575,11 @@ fn run_scenario_timed(scenario: &str, n_rows: usize, _data_dir: &Path, db: &mut 
                 let t_ins = t0.elapsed().as_secs_f64();
 
                 let t0 = Instant::now();
-                db.sql_count("SELECT * FROM bench_users");
+                db_sql_count(db, "SELECT * FROM bench_users");
                 let t_sel = t0.elapsed().as_secs_f64();
 
                 let t0 = Instant::now();
-                db.sql("DELETE FROM bench_users");
+                db_sql(db, "DELETE FROM bench_users");
                 let t_del = t0.elapsed().as_secs_f64();
 
                 if i >= WARMUP {
@@ -687,14 +599,14 @@ fn run_scenario_timed(scenario: &str, n_rows: usize, _data_dir: &Path, db: &mut 
         "full_scan" => {
             load_batch(db, &inserts);
             measure(|| {
-                db.sql_count("SELECT * FROM bench_users");
+                db_sql_count(db, "SELECT * FROM bench_users");
             })
         }
 
         "select_where" => {
             load_batch(db, &inserts);
             measure(|| {
-                db.sql_count("SELECT * FROM bench_users WHERE active = TRUE");
+                db_sql_count(db, "SELECT * FROM bench_users WHERE active = TRUE");
             })
         }
 
@@ -702,7 +614,7 @@ fn run_scenario_timed(scenario: &str, n_rows: usize, _data_dir: &Path, db: &mut 
             load_batch(db, &inserts);
             measure(|| {
                 for i in (1..=n_rows).step_by(step).take(100) {
-                    db.sql_count(&format!("SELECT * FROM bench_users WHERE id = {i}"));
+                    db_sql_count(db, &format!("SELECT * FROM bench_users WHERE id = {i}"));
                 }
             })
         }
@@ -710,23 +622,24 @@ fn run_scenario_timed(scenario: &str, n_rows: usize, _data_dir: &Path, db: &mut 
         "range_scan" => {
             load_batch(db, &inserts);
             measure(|| {
-                db.sql_count(&format!(
-                    "SELECT * FROM bench_users WHERE id >= {start} AND id < {end}"
-                ));
+                db_sql_count(
+                    db,
+                    &format!("SELECT * FROM bench_users WHERE id >= {start} AND id < {end}"),
+                );
             })
         }
 
         "count_star" => {
             load_batch(db, &inserts);
             measure(|| {
-                db.sql("SELECT COUNT(*) FROM bench_users");
+                db_sql(db, "SELECT COUNT(*) FROM bench_users");
             })
         }
 
         "group_by" => {
             load_batch(db, &inserts);
             measure(|| {
-                db.sql("SELECT age, COUNT(*) FROM bench_users GROUP BY age");
+                db_sql(db, "SELECT age, COUNT(*) FROM bench_users GROUP BY age");
             })
         }
 
@@ -796,7 +709,7 @@ fn main() {
 // ── Diagnostic: timing breakdown per phase ────────────────────────────────────
 
 fn diagnose(data_dir: &Path, n_rows: usize) {
-    let mut db = Db::open(data_dir);
+    let mut db = db_open(data_dir);
     let inserts = gen_inserts(n_rows);
     load_batch(&mut db, &inserts);
 
@@ -806,56 +719,45 @@ fn diagnose(data_dir: &Path, n_rows: usize) {
     let q_count = "SELECT COUNT(*) FROM bench_users";
     let q_group = "SELECT age, COUNT(*) FROM bench_users GROUP BY age";
 
-    // ── 1. Parse overhead ─────────────────────────────────────────────────────
+    // ── 1. Parse overhead (parse only, no catalog access) ─────────────────────
     let t0 = Instant::now();
     for _ in 0..iters {
-        parse(q_scan, None).unwrap();
+        axiomdb_sql::parse(q_scan, None).unwrap();
     }
     let parse_ns = t0.elapsed().as_nanos() as usize / iters;
 
-    // ── 2. Analyze overhead (catalog lookup) ──────────────────────────────────
+    // ── 2. Full run — full scan (parse + analyze_cached + execute) ────────────
     let t0 = Instant::now();
     for _ in 0..iters {
-        let stmt = parse(q_scan, None).unwrap();
-        let snap = db
-            .txn
-            .active_snapshot()
-            .unwrap_or_else(|_| db.txn.snapshot());
-        analyze(stmt, &db.storage, snap).unwrap();
-    }
-    let analyze_ns = t0.elapsed().as_nanos() as usize / iters;
-
-    // ── 3. Execute — full scan ────────────────────────────────────────────────
-    let t0 = Instant::now();
-    for _ in 0..iters {
-        db.sql_count(q_scan);
+        db_sql_count(&mut db, q_scan);
     }
     let scan_ns = t0.elapsed().as_nanos() as usize / iters;
 
-    // ── 4. Execute — scan with WHERE filter ──────────────────────────────────
+    // ── 3. Full run — scan with WHERE filter ──────────────────────────────────
     let t0 = Instant::now();
     for _ in 0..iters {
-        db.sql_count(q_where);
+        db_sql_count(&mut db, q_where);
     }
     let where_ns = t0.elapsed().as_nanos() as usize / iters;
 
-    // ── 5. Execute — COUNT(*) ─────────────────────────────────────────────────
+    // ── 4. Full run — COUNT(*) ────────────────────────────────────────────────
     let t0 = Instant::now();
     for _ in 0..iters {
-        db.sql(q_count);
+        db_sql(&mut db, q_count);
     }
     let count_ns = t0.elapsed().as_nanos() as usize / iters;
 
-    // ── 6. Execute — GROUP BY ─────────────────────────────────────────────────
+    // ── 5. Full run — GROUP BY ────────────────────────────────────────────────
     let t0 = Instant::now();
     for _ in 0..iters {
-        db.sql(q_group);
+        db_sql(&mut db, q_group);
     }
     let group_ns = t0.elapsed().as_nanos() as usize / iters;
 
     // ── Output ────────────────────────────────────────────────────────────────
-    let exec_ns = scan_ns.saturating_sub(analyze_ns);
-    let analyze_overhead_ns = analyze_ns.saturating_sub(parse_ns);
+    // With SchemaCache active, analyze_cached is near-zero after first call.
+    // overhead = scan_ns - parse_ns ≈ analyze_cached (cache hit) + execute
+    let overhead_ns = scan_ns.saturating_sub(parse_ns);
 
     fn fmt_us(ns: usize) -> String {
         format!("{:.1} µs", ns as f64 / 1000.0)
@@ -874,21 +776,17 @@ fn diagnose(data_dir: &Path, n_rows: usize) {
         n_rows, iters
     );
     eprintln!("╠══════════════════════════════════════════════════════════╣");
-    eprintln!("║  Phase breakdown per query call:                        ║");
+    eprintln!("║  Phase breakdown per query call (SchemaCache active):   ║");
     eprintln!("║                                                          ║");
     eprintln!(
-        "║  parse()         {:>10}                            ║",
-        fmt_us(parse_ns)
+        "║  parse()         {:>10}  ({} of scan total)      ║",
+        fmt_us(parse_ns),
+        pct(parse_ns, scan_ns)
     );
     eprintln!(
-        "║  analyze()       {:>10}  ({} of scan total)      ║",
-        fmt_us(analyze_overhead_ns),
-        pct(analyze_overhead_ns, scan_ns)
-    );
-    eprintln!(
-        "║  execute-scan    {:>10}  ({} of scan total)      ║",
-        fmt_us(exec_ns),
-        pct(exec_ns, scan_ns)
+        "║  analyze+execute {:>10}  ({} of scan total)      ║",
+        fmt_us(overhead_ns),
+        pct(overhead_ns, scan_ns)
     );
     eprintln!("║  ─────────────────────────────────────────────────────  ║");
     eprintln!(
@@ -912,16 +810,14 @@ fn diagnose(data_dir: &Path, n_rows: usize) {
     eprintln!("║                                                          ║");
     eprintln!(
         "║  Heap scan rate: {:.0} rows/s                          ║",
-        n_rows as f64 / (exec_ns as f64 / 1e9)
+        n_rows as f64 / (scan_ns as f64 / 1e9)
     );
     eprintln!("╠══════════════════════════════════════════════════════════╣");
     eprintln!("║  Verdict:                                                ║");
-    if analyze_overhead_ns > exec_ns {
-        eprintln!("║  ⚠️  ANALYZE > EXECUTE — catalog lookup is the bottleneck║");
-        eprintln!("║     Fix: schema cache in analyzer (avoids heap scan)    ║");
+    if parse_ns > overhead_ns / 2 {
+        eprintln!("║  ⚠️  PARSE dominates — consider query plan cache        ║");
     } else {
         eprintln!("║  ✅ EXECUTE dominates — bottleneck is the heap scan     ║");
-        eprintln!("║     Fix: Phase 5 index scan + vectorized execution       ║");
     }
     eprintln!("╚══════════════════════════════════════════════════════════╝");
     eprintln!();
