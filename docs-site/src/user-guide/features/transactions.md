@@ -98,9 +98,30 @@ COMMIT;
 
 ## MVCC — Multi-Version Concurrency Control
 
-AxiomDB uses MVCC to allow readers and writers to proceed concurrently without
-blocking each other. The key insight is that **readers never block writers, and
-writers never block readers**.
+AxiomDB uses MVCC plus a server-side `Arc<RwLock<Database>>`.
+
+Today that means:
+
+- read-only statements (`SELECT`, `SHOW`, metadata queries) run concurrently
+- mutating statements (`INSERT`, `UPDATE`, `DELETE`, DDL, `BEGIN`/`COMMIT`/`ROLLBACK`)
+  are serialized at whole-database granularity
+- a read that is already running keeps its snapshot while another session commits
+- row-level locking, deadlock detection, and `SELECT ... FOR UPDATE` are planned
+  for Phases 13.7, 13.8, and 13.8b
+
+This is good for read-heavy workloads, but it is still below MySQL/InnoDB and
+PostgreSQL for write concurrency because they already lock at row granularity.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Current Concurrency Cut</span>
+MySQL InnoDB and PostgreSQL allow multiple writers to proceed concurrently when
+they touch different rows. AxiomDB's current runtime intentionally keeps a
+database-wide write guard while Phase 13.7 introduces row-level locking, then
+adds deadlock detection and `FOR UPDATE` syntax in follow-up subphases.
+</div>
+</div>
 
 ### How It Works
 
@@ -124,43 +145,44 @@ creates a new copy rather than overwriting the original. Txn A holds a pointer t
 the old root and continues reading the old version. When Txn A commits, the old
 pages become eligible for reclamation.
 
-### No Read Locks
+### No Per-Page Read Latches
 
-Because readers access immutable snapshots, they require no locks. A long-running
-`SELECT` never blocks `INSERT`, `UPDATE`, or `DELETE` operations.
+Readers access immutable snapshots and owned page copies, so they do not take
+per-page latches in the storage layer. The current server runtime still uses a
+database-wide `RwLock`, so the real guarantee today is:
 
-### Write Conflicts
+- many reads can run together
+- writes do not run in parallel with other writes
 
-Two concurrent writers can conflict if they both attempt to modify the same row.
-AxiomDB uses first-writer-wins: the second writer's transaction is aborted with
-error `40001 serialization_failure`. The application should retry the transaction.
+### Current Write Behavior
 
-```python
-import time, random
+Two sessions do **not** currently mutate different rows in parallel. Instead,
+the server queues mutating statements behind the database-wide write guard.
+`lock_timeout` applies to that wait today.
 
-def transfer_with_retry(db, from_id, to_id, amount, max_retries=5):
-    for attempt in range(max_retries):
-        try:
-            db.execute("BEGIN")
-            db.execute(f"UPDATE accounts SET balance = balance - {amount} WHERE id = {from_id}")
-            db.execute(f"UPDATE accounts SET balance = balance + {amount} WHERE id = {to_id}")
-            db.execute("COMMIT")
-            return  # success
-        except Exception as e:
-            db.execute("ROLLBACK")
-            if '40001' in str(e) and attempt < max_retries - 1:
-                time.sleep(0.01 * (2 ** attempt) + random.random() * 0.01)
-            else:
-                raise
-```
+This means you should not yet build on assumptions such as:
+
+- row-level deadlock detection
+- `40001 serialization_failure` retries for ordinary write-write conflicts
+- `SELECT ... FOR UPDATE` / `SKIP LOCKED` job-queue patterns
+
+Those behaviors are planned, but not implemented yet.
 
 ---
 
 ## Isolation Levels
 
-AxiomDB supports two isolation levels. The level is set per-transaction.
+AxiomDB currently accepts three wire-visible isolation names:
 
-### READ COMMITTED (default)
+- `READ COMMITTED`
+- `REPEATABLE READ` (session default)
+- `SERIALIZABLE`
+
+`READ COMMITTED` and `REPEATABLE READ` have distinct snapshot behavior today.
+`SERIALIZABLE` is accepted and stored, but currently uses the same frozen-snapshot
+policy as `REPEATABLE READ`; true SSI is still planned.
+
+### READ COMMITTED
 
 Each statement within the transaction sees data committed before that statement
 began. A second SELECT within the same transaction may see different data if
@@ -182,7 +204,7 @@ COMMIT;
 - Each statement needing the freshest possible data is acceptable
 - You are running analytics that can tolerate non-repeatable reads
 
-### REPEATABLE READ
+### REPEATABLE READ (default)
 
 The entire transaction sees the snapshot from the moment `BEGIN` was executed.
 No matter how many other transactions commit, your reads return the same data.
@@ -209,46 +231,53 @@ COMMIT;
 |---------------------|----------------|-----------------|
 | Dirty reads         | Never          | Never           |
 | Non-repeatable reads| Possible       | Never           |
-| Phantom reads       | Possible       | Never (MVCC)    |
-| Write conflicts     | Detected       | Detected        |
+| Phantom reads       | Possible       | Prevented by current single-writer runtime |
+| Concurrent writes   | Serialized globally | Serialized globally |
+
+### SERIALIZABLE
+
+`SERIALIZABLE` is accepted for MySQL/PostgreSQL compatibility, but today it
+uses the same frozen snapshot as `REPEATABLE READ`. The engine does **not** yet
+run Serializable Snapshot Isolation conflict tracking.
 
 ---
 
-## E-commerce Checkout — Full Example
+## E-commerce Checkout — Current Safe Pattern
 
-This example shows a complete checkout flow with stock validation, order creation,
-and stock decrement, all atomically.
+Until row-level locking lands, the supported stock-reservation pattern is a
+guarded `UPDATE ... WHERE stock >= ?` plus affected-row checks.
 
 ```sql
 BEGIN;
 
--- 1. Lock the product rows for update (prevent concurrent stock changes)
-SELECT id, stock, price FROM products
-WHERE id IN (1, 3)
-FOR UPDATE;
+-- Reserve stock atomically; application checks that each UPDATE affects 1 row.
+UPDATE products SET stock = stock - 2 WHERE id = 1 AND stock >= 2;
+UPDATE products SET stock = stock - 1 WHERE id = 3 AND stock >= 1;
 
--- 2. Validate stock
--- Application checks result: if product 1 stock < 2, ROLLBACK
--- Application checks result: if product 3 stock < 1, ROLLBACK
-
--- 3. Create the order header
+-- Create the order header
 INSERT INTO orders (user_id, total, status)
 VALUES (99, 149.97, 'paid');
 
--- 4. Create order items
+-- Create order items
 INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES
     (LAST_INSERT_ID(), 1, 2, 49.99),
     (LAST_INSERT_ID(), 3, 1, 49.99);
-
--- 5. Decrement stock
-UPDATE products SET stock = stock - 2 WHERE id = 1;
-UPDATE products SET stock = stock - 1 WHERE id = 3;
 
 COMMIT;
 ```
 
 If any step fails (constraint violation, connection drop, server crash), the WAL
 ensures the entire transaction is rolled back on recovery.
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">`FOR UPDATE` Not Yet Available</span>
+`SELECT ... FOR UPDATE`, `FOR SHARE`, `NOWAIT`, and `SKIP LOCKED` are planned
+for the row-locking phases and are not implemented in the current runtime. Use
+guarded `UPDATE ... WHERE ...` statements plus affected-row checks today.
+</div>
+</div>
 
 ---
 

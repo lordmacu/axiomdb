@@ -1583,8 +1583,17 @@ Una fila es visible para transacción T si:
     O txn_id_deleted > T.snapshot_id (fue eliminada después del snapshot)
 ```
 
-**Resultado:** Readers nunca bloquean writers. Writers nunca bloquean readers.
-Solo writer vs writer se serializa.
+**Estado actual de implementación:** múltiples readers pueden ejecutar
+concurrentemente, pero los writers se serializan globalmente con
+`Arc<RwLock<Database>>`.
+
+Un `SELECT` ya en curso conserva su snapshot MVCC mientras otro cliente hace
+`COMMIT`, pero el runtime del servidor todavía no tiene row-level locking: los
+writers no corren en paralelo y un writer activo puede retrasar nuevas
+operaciones hasta liberar `db.write()`.
+
+**Objetivo de diseño posterior (13.7+):** serializar solo writer-vs-writer en la
+misma fila, con deadlock detection y `SELECT ... FOR UPDATE`.
 
 ---
 
@@ -4394,7 +4403,7 @@ Fase 6 — Índices secundarios + FK   (semana 9)
 Fase 7 — Concurrencia + MVCC        (semana 10)
   ✓ Copy-on-Write en B+ Tree
   ✓ Snapshot isolation para reads
-  ✓ Múltiples writers con serialización
+  ✓ Readers concurrentes + writer global serializado
 
 Fase 8 — Optimizaciones SIMD        (semana 11-12)
   ✓ Vectorized execution en table scans
@@ -5136,9 +5145,9 @@ Fase 27 — Query Optimizer real      (semana 55-57)
 
 Fase 28 — Completitud SQL           (semana 58-60)
   ✓ Niveles de aislamiento: READ COMMITTED, REPEATABLE READ, SERIALIZABLE (SSI)
-  ✓ SELECT FOR UPDATE / FOR SHARE / SKIP LOCKED / NOWAIT
-  ✓ LOCK TABLE con modos (ACCESS SHARE, ROW EXCLUSIVE, ACCESS EXCLUSIVE)
-  ✓ Advisory locks: pg_advisory_lock / pg_try_advisory_lock
+  ⏳ SELECT FOR UPDATE / FOR SHARE / SKIP LOCKED / NOWAIT
+  ⏳ LOCK TABLE con modos (ACCESS SHARE, ROW EXCLUSIVE, ACCESS EXCLUSIVE)
+  ⏳ Advisory locks: pg_advisory_lock / pg_try_advisory_lock
   ✓ UNION / UNION ALL / INTERSECT / EXCEPT
   ✓ EXISTS / NOT EXISTS / IN subquery / subqueries correlacionados
   ✓ CASE simple y buscado en SELECT, WHERE, ORDER BY
@@ -6053,7 +6062,11 @@ impl SsiTracker {
 
 ---
 
-### SELECT FOR UPDATE / FOR SHARE — Bloqueos Explícitos
+### SELECT FOR UPDATE / FOR SHARE — Bloqueos Explícitos (planificado)
+
+Depende de `13.7` (row-level locking), `13.8` (deadlock detection) y `13.8b` /
+`28.2` (sintaxis explícita). Lo siguiente describe el comportamiento objetivo,
+no una funcionalidad ya implementada:
 
 ```sql
 -- Bloquear filas para escritura (nadie más puede modificarlas)
@@ -9727,7 +9740,7 @@ axiomdb-bench compare \
 | Áreas de overflow separadas | WAL + versiones en el árbol (CoW) |
 | Acceso secuencial + por índice | Igual + range scans + SIMD |
 | Sin transacciones | MVCC completo |
-| Sin concurrencia real | Readers lockless, writers serializados |
+| Sin concurrencia real | Reads concurrentes, writes serializados globalmente |
 | Sin FK | FK con índice inverso |
 
 ---
