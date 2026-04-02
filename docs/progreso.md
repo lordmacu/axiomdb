@@ -64,7 +64,7 @@
 - [x] 3.19c ✅ WAL sync policy — `axiomdb-wal/src/sync.rs` now selects the DML durability syscall explicitly (`fsync`, `fdatasync`, `F_FULLFSYNC`, `sync_all` fallback) instead of hiding the hot path behind `File::sync_data()`; metadata-changing WAL operations remain on the metadata-sync path
 - [x] 3.19d ✅ Configurable WAL durability policy — `WalDurabilityPolicy::{Strict, Normal, Off}` is now parsed from config with backward-compatible `fsync` fallback; `TxnManager` routes commit acknowledgement by policy and the server uses the fsync pipeline only in `Strict`
 
-### Phase 4 — SQL Parser + Executor `🔄` week 11-25
+### Phase 4 — SQL Parser + Executor `✅` week 11-25
 <!--
   DEPENDENCY ORDER (must be respected when planning subfases):
 
@@ -177,7 +177,7 @@
 - [x] 4.16c ✅ Multi-row INSERT optimization — insert_rows_batch() uses record_insert_batch() (3.17); bench_insert_multi_row/10K: 211K rows/s (1 SQL string) vs 35K rows/s (N strings) = 6× faster; AxiomDB 211K/s vs MariaDB ~140K/s = 1.5× faster in bulk INSERT
 - [x] 4.16d ✅ WAL record per page — implemented in Phase 3.18 (EntryType::PageWrite=9); insert_rows_batch() emits 1 PageWrite per affected page; 238× fewer WAL entries for 10K-row insert; 30% smaller WAL; crash recovery parses slot_ids for undo
 
-### Phase 5 — MySQL Wire Protocol `🔄` week 26-30
+### Phase 5 — MySQL Wire Protocol `✅` week 26-30
 - [x] 5.1 ✅ TCP listener with Tokio — accept connections on :3306; Arc<Mutex<Database>>; tokio::spawn per connection
 - [x] 5.2 ✅ MySQL handshake — HandshakeV10 (greeting) + HandshakeResponse41 (client response)
 - [x] 5.2a ✅ Charset/collation negotiation in handshake — `character_set_client`, `character_set_results`, `collation_connection` sent in Server Greeting; client chooses charset; `ConnectionState` built from handshake collation id; inbound text decoded with client charset; outbound rows encoded with result charset; latin1 (cp1252), utf8mb3, utf8mb4, binary supported; `SET NAMES` and individual SET charset vars update typed session fields; `SHOW VARIABLES LIKE 'character_set%'` reflects live state; 8 new wire assertions + ~25 unit tests
@@ -212,7 +212,7 @@
 - [x] 5.20 ✅ Stable-RID UPDATE fast path — heap same-slot rewrite path (`rewrite_tuple_same_slot` / `rewrite_batch_same_slot`) preserves `(page_id, slot_id)` when the new encoded row fits in the existing slot; dedicated WAL entry `UpdateInPlace=10` plus rollback/savepoint/crash-recovery restore by old tuple image; `TableEngine::update_rows_preserve_rid[_with_ctx]` batches stable-RID candidates and falls back row-by-row to delete+insert when the row no longer fits; selective index maintenance now uses real `(old_rid,new_rid)` + logical key/predicate membership comparison, so unchanged PK/secondary/FK indexes are skipped only when RID is stable; new regression coverage for same-page heap rewrite I/O and index-affected decisions; local bench at 50K rows: `UPDATE ... WHERE active=TRUE` = 647K rows/s vs 52.9K rows/s before `5.20`, while `DELETE WHERE id > 25000` remains 1.13M rows/s
 - [x] 5.21 ✅ Transactional INSERT staging — explicit transactions now stage consecutive `INSERT ... VALUES` rows in `SessionContext::pending_inserts`; same-table INSERTs keep appending, while `SELECT`/`UPDATE`/`DELETE`/DDL/`COMMIT`/table switch/ineligible INSERT flush via `executor/staging.rs`; `ROLLBACK` discards unflushed rows; `batch_insert_into_indexes` persists each changed index root once per flush; savepoint ordering fixed so table-switch flushes happen before the next statement savepoint; SQL tests + wire smoke + `local_bench.py --scenario insert --rows 50000 --table` verified. Latest local benchmark (release server, 2026-03-27): MariaDB `28.0K r/s`, MySQL `26.7K r/s`, AxiomDB `23.9K r/s` for `single-row INSERTs in 1 txn`
 
-### Phase 6 — Secondary indexes + FK `🔄` week 31-39
+### Phase 6 — Secondary indexes + FK `✅` week 31-39
 - [x] 6.1 ✅ `IndexColumnDef` + `IndexDef.columns` — catalog stores which columns each index covers; backward-compatible serialization
 - [x] 6.1b ✅ Key encoding — order-preserving `Value` → `[u8]` for all SQL types (NULL sorts first, sign-flip for ints, NUL-escaped text)
 - [x] 6.2 ✅ CREATE INDEX executor — scans table, builds B-Tree from existing data; `columns` persisted in catalog
@@ -246,7 +246,7 @@
 - [x] ⚠️ PERF: point lookup wire optimization — row packet pre-allocation (`Vec::with_capacity(cols × 32)`); Int/BigInt/Bool fast path skips charset encoding (ASCII-only); UPDATE executor eliminates per-row `clone()` via incremental new_values build; research: InnoDB uses AHI hash bypass, PG uses plan cache after 5x, SQLite uses ONEPASS rowid seek; remaining: literal-normalized plan cache (27.8b) would eliminate 52% parse+analyze overhead
 - [x] PERF: DELETE deferred index deletion (PostgreSQL model) — DELETE no longer touches ANY secondary index B-Tree (PK, unique, FK, non-unique); all entries left in place, filtered by heap visibility on read; dead entries cleaned by VACUUM; FK enforcement made heap-visibility-aware (RESTRICT, CASCADE, SET NULL all filter dead FK entries); uniqueness on INSERT handles dead PK entries via lookup+delete+reinsert; UPDATE still deletes old unique/PK keys (needed for correct index-based lookups after key change); eliminates ~120 B-Tree page ops + 10,000 allocs for 5000-row DELETE with 2 indexes
 
-### Phase 7 — Concurrency + MVCC `🔄` week 40-48
+### Phase 7 — Concurrency + MVCC `✅` week 40-48
 - [x] ✅ Non-unique secondary indexes composite key — Fixed in 6.13: all non-unique non-FK secondary indexes now use `key||RecordId` format (same as FK auto-indexes). DuplicateKey blocker for MVCC removed.
 - [x] 7.1 ✅ MVCC visibility rules — `IsolationLevel` + `SessionContext` now expose `READ COMMITTED`, `REPEATABLE READ`, and `SERIALIZABLE` (aliased to RR snapshot policy); `TxnManager::active_snapshot()` returns fresh snapshots for RC and frozen snapshots for RR/SERIALIZABLE; covered by `integration_isolation`
 - [x] 7.2 ✅ Transaction manager — `TxnManager` with monotonic `next_txn_id` counter, `max_committed` tracking, `begin()/commit()` lifecycle, WAL-integrated; atomicity guaranteed by `&mut self` under `Arc<RwLock<Database>>`; implemented across 7.1-7.4
@@ -274,7 +274,7 @@
 
 ## BLOCK 2 — Execution Optimizations (Phases 8-10)
 
-### Phase 8 — SIMD Optimizations `🔄` week 49-52
+### Phase 8 — SIMD Optimizations `✅` week 49-52
 - [x] 8.1 ✅ Vectorized filter — BatchPredicate: zero-alloc raw-byte WHERE evaluation on encoded row data; compiles `col op literal` + AND-conjunctions into pre-compiled checks; ~6× faster predicate eval (~20 ns/row vs ~130 ns/row); select_where 85K→210K rows/s (paridad con MariaDB 211K)
 - [x] 8.1b ✅ Low-cardinality filter specialization — cerrada por BatchPredicate (8.1); `WHERE active = TRUE` ahora usa raw-byte Bool comparison sin decode; benchmark target alcanzado: 210K rows/s vs objetivo 204K
 - [x] 8.2 ✅ SIMD with `wide` crate — cross-platform (AVX2 on x86, NEON on ARM, scalar fallback); batch_cmp_i32 processes 8×i32 per AVX2 op; gather-scatter pattern for row-oriented storage; eval_batch() replaces per-row eval_on_raw(); MSRV 1.80→1.89
@@ -299,7 +299,7 @@
 - [x] 8.7 ✅ Runtime CPU feature detection — `wide` crate handles AVX2/SSE/NEON dispatch internally; scalar fallback on unsupported CPUs; single binary works on x86_64 + aarch64
 - [x] 8.8 ✅ SIMD vs scalar vs MySQL benchmark — SIMD batch (NEON 4×i32) vs scalar BatchPredicate: marginal gain on 5K rows (gather-scatter overhead); real benefit on x86_64 AVX2 (8×i32) and larger datasets; documented in progreso.md 8.5 results
 
-### Phase 9 — DuckDB-inspired + Join Algorithms `🔄` week 53-56
+### Phase 9 — DuckDB-inspired + Join Algorithms `✅` week 53-56
 - [x] 9.1 ✅ Morsel-driven parallelism — Rayon par_iter over heap pages; StorageEngine: Send+Sync; two-phase (serial page-ID collection + parallel decode+filter); BatchPredicate SIMD works across threads; falls back to serial for <4 pages; select_where 228K r/s maintained
 - [x] 9.2 ✅ Operator fusion — unified decode mask (SELECT∪WHERE∪ORDER BY∪GROUP BY); scan+filter+project fused: decode_row_masked skips non-referenced columns, saving String/Text allocation for wide tables; wildcard SELECT * decodes all (correct fallback)
 - [x] 9.3 ✅ Late materialization — achieved via BatchPredicate (8.1: raw-byte filter = zero decode for non-matching rows) + unified decode mask (9.2: skip non-referenced columns); full DuckDB-style RecordId-only pipeline not needed for row store (pages already cached)
