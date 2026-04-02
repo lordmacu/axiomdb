@@ -31,7 +31,7 @@ prevents circular dependencies and makes each component independently testable.
 │      ├── handler.rs  (handle_connection — async task per TCP conn)  │
 │      ├── result.rs   (QueryResult → result-set packets, charset-aware)│
 │      ├── error.rs    (DbError → MySQL error code + SQLSTATE)        │
-│      └── database.rs (Arc<Mutex<Database>> wrapper)                 │
+│      └── database.rs (Arc<RwLock<Database>> wrapper)                │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
 ┌──────────────────────────────▼──────────────────────────────────────┐
@@ -805,10 +805,28 @@ query execution at any load level.
 
 #### DB lock strategy
 
-The `Database` struct wraps `Arc<Mutex<axiomdb_sql::Database>>`. Each `COM_QUERY`
-acquires the mutex for the duration of the query, releases it before writing the
-response packets. This is a single-writer model suitable for Phase 5; concurrent
-query execution is planned for Phase 8 (Connection Pool + MVCC).
+The MySQL handler stores the opened engine in `Arc<tokio::sync::RwLock<Database>>`.
+
+- read-only statements acquire `db.read()`
+- mutating statements and transaction control acquire `db.write()`
+- multiple reads run concurrently
+- all writes are still serialized at whole-database granularity
+
+This is the current runtime model. It is more advanced than the old Phase 5
+`Mutex<Database>` design because read-only queries can now overlap, but it is
+still below MySQL/InnoDB and PostgreSQL for write concurrency because row-level
+locking is not implemented yet.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Next Concurrency Milestone</span>
+MySQL/InnoDB and PostgreSQL both lock at row granularity for ordinary UPDATE and
+DELETE statements. AxiomDB's next concurrency step is Phase 13.7 (row-level
+locking), followed by 13.8 (deadlock detection) and 13.8b (`FOR UPDATE`,
+`SKIP LOCKED`, `NOWAIT`).
+</div>
+</div>
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
@@ -864,7 +882,7 @@ writing OK.
 Entry point for server mode. Parses CLI flags (`--data-dir`, `--port`), opens the
 `axiomdb-network::Database`, starts a Tokio TCP listener, and spawns one
 `handle_connection` task per accepted connection, passing each task a clone of the
-`Arc<Mutex<Database>>`.
+`Arc<RwLock<Database>>`.
 
 ### axiomdb-embedded
 

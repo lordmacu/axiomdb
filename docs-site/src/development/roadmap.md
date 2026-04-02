@@ -20,6 +20,12 @@ functionality. The design is organized in three blocks:
 
 **Next milestone:** 22b.3b — `database.schema.table` and cross-database SELECT / JOIN / DML
 
+**Concurrency note:** the current server already supports concurrent read-only
+queries, but mutating statements are still serialized through a database-wide
+`Arc<RwLock<Database>>` write guard. The next concurrency milestone is
+Phase 13.7 row-level locking, followed by deadlock detection and explicit
+locking clauses.
+
 ---
 
 ## Phase Progress
@@ -169,12 +175,13 @@ O(n) `encoded_len()`.
 
 ## Near-Term Priorities
 
-### Phase 7 — Full MVCC + Concurrent Writers
+### Phase 13 — Row-Level Writer Concurrency
 
-The current implementation serializes all DML through a global `Arc<tokio::sync::Mutex<Database>>`.
-Phase 7 removes this constraint with per-table record locks, snapshot isolation (READ
-COMMITTED and REPEATABLE READ), and epoch-based memory reclamation for CoW B+ Tree nodes.
-This is the largest remaining item in Block 1.
+The current implementation uses `Arc<tokio::sync::RwLock<Database>>`: reads can
+overlap, but mutating statements are still serialized at whole-database scope.
+Phase 13.7 removes that bottleneck with row-level locking. Phase 13.8 adds
+deadlock detection, and 13.8b adds `SELECT ... FOR UPDATE`, `NOWAIT`, and
+`SKIP LOCKED`.
 
 ### Phase 5
 

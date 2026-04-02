@@ -1,14 +1,16 @@
 # MVCC and Transactions
 
-Multi-Version Concurrency Control (MVCC) is AxiomDB's mechanism for allowing
-concurrent readers and writers to operate without blocking each other. This page
-documents the MVCC model, the RowHeader format, the visibility function, and the
-TxnManager that coordinates transaction IDs and snapshots.
+Multi-Version Concurrency Control (MVCC) is AxiomDB's mechanism for deciding which
+row versions are visible to a given statement or transaction. This page documents
+the **current** implementation: the `RowHeader` format, the actual
+`TransactionSnapshot` type, the single-active-transaction `TxnManager`, and the
+server's `Arc<RwLock<Database>>` concurrency model.
 
-> **Implementation status:** The `axiomdb-mvcc` crate contains the TxnManager and
-> snapshot logic implemented in Phase 3. Full SSI (Serializable Snapshot Isolation)
-> and write-write conflict detection are planned for Phase 7. The documentation below
-> describes the target design; sections marked ⚠️ indicate planned features.
+> **Implementation status:** current code implements snapshot visibility,
+> READ COMMITTED and REPEATABLE READ semantics, rollback/savepoints, deferred
+> page reclamation, and concurrent read-only queries. It does **not** yet
+> implement row-level writer concurrency, deadlock detection, `SELECT ... FOR UPDATE`,
+> or full SSI. Those are planned in Phases 13.7, 13.8, and 13.8b.
 
 ---
 
@@ -16,26 +18,32 @@ TxnManager that coordinates transaction IDs and snapshots.
 
 ### Transaction ID (TxnId)
 
-Every transaction receives a unique, monotonically increasing `u64` identifier.
-The value `0` is reserved for autocommit (single-statement transactions).
+Every explicit transaction receives a unique, monotonically increasing `u64`
+identifier. The value `0` means "no active write transaction" and is used by
+autocommit reads.
 
 ### Transaction Snapshot
 
-A snapshot represents the set of transactions that were committed at the moment
-`BEGIN` (or the first statement, in autocommit) was executed.
+A snapshot is the compact visibility token used by the current runtime.
 
 ```rust
 pub struct TransactionSnapshot {
-    pub xmin: u64,    // All txn_ids < xmin are definitely committed
-    pub xmax: u64,    // All txn_ids >= xmax are definitely not yet committed
-    pub in_progress: Vec<u64>,  // txn_ids in [xmin, xmax) that are still active
+    pub snapshot_id: u64,
+    pub current_txn_id: u64,
 }
 ```
 
-A row version is visible to a snapshot if:
-- The inserting transaction (`xmin`) is committed relative to the snapshot, AND
-- The deleting transaction (`xmax`) is either `0` (the row is live) or is NOT
-  committed relative to the snapshot.
+Meaning:
+
+- `snapshot_id = max_committed + 1` at the moment the snapshot is taken
+- `current_txn_id = txn_id` of the active transaction, or `0` for read-only /
+  autocommit reads
+
+A row version is visible when:
+
+- `txn_id_created == current_txn_id` or `txn_id_created < snapshot_id`
+- and `txn_id_deleted == 0`, or `txn_id_deleted >= snapshot_id` and the delete
+  was not performed by `current_txn_id`
 
 ---
 
@@ -44,12 +52,12 @@ A row version is visible to a snapshot if:
 Every heap tuple begins with a `RowHeader`:
 
 ```text
-Offset  Size  Field    Description
-──────── ────── ──────── ─────────────────────────────────────────────────────
-     0      8  xmin     txn_id of the transaction that inserted this row version
-     8      8  xmax     txn_id of the transaction that deleted this row (0 = live)
-    16      1  deleted  1 = this row has been logically deleted; 0 = live
-    17      7  _pad     alignment padding to 24 bytes
+Offset  Size  Field            Description
+──────── ────── ─────────────── ───────────────────────────────────────────────
+     0      8  txn_id_created   transaction that inserted this row version
+     8      8  txn_id_deleted   transaction that deleted this row (0 = live)
+    16      4  row_version      incremented on UPDATE
+    20      4  _flags           reserved for future use
 Total: 24 bytes
 ```
 
@@ -57,14 +65,14 @@ The full lifecycle of a row version:
 
 ```
 INSERT in txn T1:
-    RowHeader { xmin: T1, xmax: 0, deleted: 0 }
+    RowHeader { txn_id_created: T1, txn_id_deleted: 0, row_version: 0 }
 
 DELETE in txn T2:
-    RowHeader { xmin: T1, xmax: T2, deleted: 1 }
+    RowHeader { txn_id_created: T1, txn_id_deleted: T2, row_version: 0 }
 
 UPDATE in txn T2 (implemented as DELETE + INSERT):
-    Old version: RowHeader { xmin: T1, xmax: T2, deleted: 1 }
-    New version: RowHeader { xmin: T2, xmax: 0,  deleted: 0 }
+    Old version: RowHeader { txn_id_created: T1, txn_id_deleted: T2, row_version: N }
+    New version: RowHeader { txn_id_created: T2, txn_id_deleted: 0,  row_version: N+1 }
 ```
 
 ### Batch DELETE and Full-Table DELETE
@@ -96,26 +104,13 @@ the delete — standard snapshot isolation.
 
 ```rust
 fn is_visible(row: &RowHeader, snap: &TransactionSnapshot, self_txn_id: u64) -> bool {
-    // Rule 1: The inserting txn must be committed in our snapshot.
-    if !is_committed(row.xmin, snap) && row.xmin != self_txn_id {
-        return false;
-    }
-
-    // Rule 2: The deleting txn must NOT be committed in our snapshot
-    // (or xmax must be 0, meaning the row is live).
-    if row.xmax != 0 {
-        if is_committed(row.xmax, snap) || row.xmax == self_txn_id {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn is_committed(txn_id: u64, snap: &TransactionSnapshot) -> bool {
-    if txn_id < snap.xmin { return true; }  // definitely committed before snapshot
-    if txn_id >= snap.xmax { return false; } // definitely not committed yet
-    !snap.in_progress.contains(&txn_id)      // check the in-progress set
+    let created_visible =
+        row.txn_id_created == self_txn_id || row.txn_id_created < snap.snapshot_id;
+    let not_deleted =
+        row.txn_id_deleted == 0
+        || (row.txn_id_deleted >= snap.snapshot_id
+            && row.txn_id_deleted != self_txn_id);
+    created_visible && not_deleted
 }
 ```
 
@@ -123,47 +118,48 @@ fn is_committed(txn_id: u64, snap: &TransactionSnapshot) -> bool {
 
 ## TxnManager
 
-The `TxnManager` is the single coordinator for all transaction state. Read-only
-operations access it via `&TxnManager` (shared ref) for snapshot creation; write
-operations access it via `&mut TxnManager` for begin/commit/rollback.
+The current `TxnManager` is a **single-active-transaction coordinator**. Read-only
+operations access it via shared refs for snapshot creation; mutating operations
+access it via `&mut TxnManager` for `begin/commit/rollback`.
 
 ```rust
 pub struct TxnManager {
-    next_txn_id:   AtomicU64,
-    active_txns:   Mutex<HashSet<u64>>,   // set of currently running txn_ids
-    committed_txns: Mutex<BTreeSet<u64>>, // set of committed txn_ids (pruned periodically)
-    wal_writer:    WalWriter,
+    wal: WalWriter,
+    next_txn_id: u64,
+    max_committed: u64,
+    active: Option<ActiveTxn>,
 }
 ```
+
+This is the main reason the current server runtime is still single-writer for
+mutating statements: there is only one `ActiveTxn` slot for the whole opened
+database, not one write transaction owner per connection.
 
 ### BEGIN
 
 ```
-1. Increment next_txn_id atomically → new txn_id
-2. Insert txn_id into active_txns
-3. Append WalEntry { type: Begin, txn_id, ... }
-4. Build TransactionSnapshot:
-     xmin = min of active_txns ∪ {txn_id}
-     xmax = next_txn_id (snapshot taken after incrementing)
-     in_progress = active_txns - {txn_id}
-5. Return (txn_id, snapshot)
+1. Verify `active.is_none()`
+2. Assign `txn_id = next_txn_id`
+3. Append `Begin` to the WAL
+4. Set `active = Some(ActiveTxn { txn_id, snapshot_id_at_begin, ... })`
+5. Increment `next_txn_id`
 ```
 
 ### COMMIT
 
 ```
-1. Append WalEntry { type: Commit, txn_id, ... }
-2. Flush WAL (fsync or group commit)
-3. Remove txn_id from active_txns
-4. Insert txn_id into committed_txns
+1. Append `Commit` to the WAL
+2. Flush/fsync via the current durability policy or fsync pipeline
+3. Advance `max_committed`
+4. Clear `active`
 ```
 
 ### ROLLBACK
 
 ```
-1. Append WalEntry { type: Rollback, txn_id, ... }
-2. Remove txn_id from active_txns
-3. Undo all mutations made by txn_id (undo pass, Phase 7)
+1. Replay undo ops in reverse order
+2. Append `Rollback` to the WAL
+3. Clear `active`
 ```
 
 ---
@@ -182,7 +178,7 @@ tree structures through their snapshot while the writer has already swapped the 
 Pages are released for reuse only when no active reader snapshot predates the free
 operation.
 
-### Lock-Free Readers (Phase 7.4)
+### Current Server Lock Model (Phase 7.4 / 7.5)
 
 The server wraps `Database` in `Arc<RwLock<Database>>`:
 
@@ -190,23 +186,22 @@ The server wraps `Database` in `Arc<RwLock<Database>>`:
   Multiple readers execute concurrently with zero coordination.
 - **INSERT, UPDATE, DELETE, DDL, BEGIN/COMMIT/ROLLBACK** acquire a **write lock**
   (`db.write()`). Only one writer at a time.
-- **Readers never wait for writers.** A SELECT that starts before an INSERT commits
-  sees the pre-INSERT snapshot via MVCC visibility. The writer modifies pages via
-  `pwrite()` while readers access the old data through their owned `PageRef` copies.
-- **Writers wait only for the write lock**, never for readers.
+- A read that already started keeps its snapshot while a writer commits.
+- New mutating statements queue behind the write lock at whole-database granularity.
+- Row-level locking is **not** implemented yet. That work starts in Phase 13.7.
 
 The read-only executor path (`execute_read_only_with_ctx`) takes `&dyn StorageEngine`
 (shared ref) and `&TxnManager` (shared ref), ensuring it cannot mutate any state.
 
-<div class="callout callout-advantage">
-<span class="callout-icon">🚀</span>
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
 <div class="callout-body">
-<span class="callout-label">Zero-Lock Reads — Better Than PostgreSQL/InnoDB</span>
+<span class="callout-label">Deliberate Interim Model</span>
 PostgreSQL requires per-page lightweight locks (LWLock) for every buffer access. InnoDB
 requires per-page RwLock latches inside mini-transactions. AxiomDB readers need no
-per-page locks at all — the combination of read-only mmap, owned PageRef copies, MVCC
-visibility, and B-Tree CoW provides equivalent isolation with zero lock overhead per
-page access.
+per-page locks at all, but the current server still serializes all writes through a
+database-wide `RwLock`. This is an intentional intermediate step before Phase 13.7
+adds row-level writer concurrency comparable to MySQL/InnoDB and PostgreSQL.
 </div>
 </div>
 

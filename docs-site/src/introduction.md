@@ -41,7 +41,10 @@ AxiomDB is under active development. Phases 1–6 are substantially complete:
 - ✅ **Secondary indexes** — CREATE INDEX, UNIQUE, query planner (index lookup + range)
 - ✅ **MySQL wire protocol** — port 3306, COM_QUERY, prepared statements, pymysql compatible
 
-**Active development:** Phase 7 (full MVCC + concurrent writers) · Phase 5 remaining (plan cache) · Phase 6 remaining (FK, bloom filter)
+**Current concurrency model:** read-only queries run concurrently, but mutating
+statements are still serialized through a database-wide `Arc<RwLock<Database>>`
+write guard. Row-level locking and true concurrent writers are planned for
+Phase 13.7+.
 
 ### Performance highlights
 
@@ -67,15 +70,22 @@ MySQL InnoDB performs <strong>2× the disk writes</strong> for every page flush 
 </div>
 </div>
 
-### 2. Lock-free reads
+### 2. Lock-free read path
 
-The B+ Tree uses **Copy-on-Write semantics** with an atomic root pointer. Readers never block writers and writers never block readers — there are no read locks at the storage layer.
+The B+ Tree uses **Copy-on-Write semantics** with an atomic root pointer, so the
+storage layer itself does not need per-page read latches. In the current server
+runtime, read-only queries execute concurrently, while mutating statements are
+still serialized by a database-wide `RwLock` write guard. Row-level write
+concurrency is the next planned step.
 
 <div class="callout callout-advantage">
 <span class="callout-icon">🚀</span>
 <div class="callout-body">
-<span class="callout-label">Concurrency Advantage</span>
-MySQL InnoDB requires shared read locks for consistent B+ Tree traversal. AxiomDB readers load an atomic root pointer and traverse without acquiring any lock — read throughput scales linearly with CPU cores even under concurrent writes.
+<span class="callout-label">Read-Path Advantage</span>
+MySQL InnoDB and PostgreSQL both pay per-page latch overhead during B+ Tree or
+buffer traversal. AxiomDB readers load an atomic root pointer and read owned
+`PageRef` copies instead, so read-only workloads avoid that page-latch cost even
+though write-side row locking is still a future phase.
 </div>
 </div>
 
