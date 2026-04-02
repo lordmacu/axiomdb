@@ -145,7 +145,7 @@ fn execute_update_ctx(
 
     if field_patch_eligible && resolved.foreign_keys.is_empty() {
         // Fast path: patch fields in-place on heap pages.
-        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+        let _txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
         let mut patched = 0u64;
 
         // Group updates by page_id for batch page processing.
@@ -158,6 +158,11 @@ fn execute_update_ctx(
                 .push((rid.slot_id, new_vals));
         }
 
+        // Collect WAL images: (key, old_tuple_image, new_tuple_image, page_id, slot_id).
+        #[allow(clippy::type_complexity)]
+        let mut wal_images: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, u64, u16)> = Vec::new();
+        let hdr_size = std::mem::size_of::<axiomdb_storage::RowHeader>();
+
         for (page_id, slots) in &page_groups {
             let mut page = storage.read_page(*page_id)?.into_page();
             let mut page_dirty = false;
@@ -169,20 +174,25 @@ fn execute_update_ctx(
                 }
                 let off = entry.offset as usize;
                 let len = entry.length as usize;
-                let hdr_size = std::mem::size_of::<axiomdb_storage::RowHeader>();
+
+                // Capture old tuple image BEFORE patching (RowHeader + row data).
+                let old_image = page.as_bytes()[off..off + len].to_vec();
 
                 // Read null bitmap from row data.
                 let row_start = off + hdr_size;
                 let bitmap_len = col_types.len().div_ceil(8);
                 let bitmap = page.as_bytes()[row_start..row_start + bitmap_len].to_vec();
 
-                // Update RowHeader (new txn_id, increment version).
+                // Update RowHeader: keep original txn_id_created (MVCC visibility),
+                // only increment version. Do NOT change txn_id_created — the row
+                // was created by another transaction and must remain visible to
+                // snapshots that already see it.
                 {
                     let hdr_bytes = &page.as_bytes()[off..off + hdr_size];
                     let old_hdr: &axiomdb_storage::RowHeader =
                         bytemuck::from_bytes(hdr_bytes);
                     let new_hdr = axiomdb_storage::RowHeader {
-                        txn_id_created: txn_id,
+                        txn_id_created: old_hdr.txn_id_created,
                         txn_id_deleted: 0,
                         row_version: old_hdr.row_version.wrapping_add(1),
                         _flags: old_hdr._flags,
@@ -193,7 +203,6 @@ fn execute_update_ctx(
                 }
 
                 // Patch each changed field directly.
-                // Use runtime scanning to handle variable-length cols before target.
                 let row_len = len - hdr_size;
                 for &(col_pos, _) in &assignments {
                     let row_data_slice =
@@ -214,6 +223,11 @@ fn execute_update_ctx(
                     }
                 }
 
+                // Capture new tuple image AFTER patching.
+                let new_image = page.as_bytes()[off..off + len].to_vec();
+
+                wal_images.push((vec![], old_image, new_image, *page_id, slot_id));
+
                 // Clear all-visible flag.
                 page.clear_all_visible();
                 page_dirty = true;
@@ -226,25 +240,17 @@ fn execute_update_ctx(
             }
         }
 
-        // WAL: record as batch UpdateInPlace with old+new tuples.
-        // For simplicity, use the existing batch path (reads pages again
-        // for old images — acceptable overhead vs the patching savings).
-        // Future: field-delta WAL entries would be even more compact.
-        // For now, just record the undo ops.
-        for (rid, _old, _new) in &to_update {
-            let entry = axiomdb_storage::heap::read_slot(
-                &storage.read_page(rid.page_id)?.into_page(),
-                rid.slot_id,
-            );
-            if !entry.is_dead() {
-                txn.record_delete(
-                    resolved.def.id,
-                    &[],
-                    &[],
-                    rid.page_id,
-                    rid.slot_id,
-                )?;
-            }
+        // WAL: record as batch UpdateInPlace with old+new tuple images.
+        // On ROLLBACK, UndoUpdateInPlace restores the old tuple image byte-for-byte.
+        {
+            #[allow(clippy::type_complexity)]
+            let batch_refs: Vec<(&[u8], &[u8], &[u8], u64, u16)> = wal_images
+                .iter()
+                .map(|(k, old, new, pid, sid)| {
+                    (k.as_slice(), old.as_slice(), new.as_slice(), *pid, *sid)
+                })
+                .collect();
+            txn.record_update_in_place_batch(resolved.def.id, &batch_refs)?;
         }
 
         // Index maintenance (same as normal path).

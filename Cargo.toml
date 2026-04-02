@@ -27,7 +27,7 @@ members = [
 [workspace.package]
 version     = "0.1.0"
 edition     = "2021"
-rust-version = "1.80"
+rust-version = "1.89"
 authors     = ["lordmacu"]
 license     = "MIT"
 repository  = "https://github.com/lordmacu/axiomdb"
@@ -36,6 +36,12 @@ repository  = "https://github.com/lordmacu/axiomdb"
 # Error handling
 thiserror = "1"
 anyhow    = "1"
+
+# SIMD — cross-platform (AVX2/SSE on x86, NEON on ARM, scalar fallback)
+wide = "1.2"
+
+# Parallel execution — morsel-driven scan (Phase 9.1)
+rayon = "1.10"
 
 # Async runtime
 tokio      = { version = "1", features = ["full"] }

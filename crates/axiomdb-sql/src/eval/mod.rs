@@ -16,10 +16,12 @@
 //!
 //! Use [`is_truthy`] to convert a result to a Rust `bool` for row filtering.
 
+pub mod batch;
 mod context;
 mod core;
 mod functions;
 mod ops;
+pub mod simd;
 
 #[cfg(test)]
 mod tests;

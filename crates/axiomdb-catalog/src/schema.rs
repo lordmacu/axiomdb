@@ -549,6 +549,15 @@ pub struct IndexDef {
     /// Stored after `is_fk_index`: `[include_len: 1 byte][col_idx: u16 LE] × len`.
     /// Absent in pre-6.13 rows → `include_columns = vec![]`.
     pub include_columns: Vec<u16>,
+    /// Index type (Phase 11.1b): 0 = BTree (default), 1 = Brin.
+    ///
+    /// Stored as 1 byte after include_columns. Pre-11.1b rows default to 0 (BTree).
+    pub index_type: u8,
+    /// BRIN: heap pages per summary range (Phase 11.1b).
+    ///
+    /// Default 128. Only meaningful when `index_type == 1`.
+    /// Stored as 4 bytes LE after index_type, only when `index_type != 0`.
+    pub pages_per_range: u32,
 }
 
 impl IndexDef {
@@ -611,10 +620,15 @@ impl IndexDef {
         // Pre-6.8 readers stop before this byte and use the default of 90.
         buf.push(self.fillfactor);
         // Include columns (Phase 6.13) — after fillfactor, always written.
-        // Pre-6.13 readers stop at fillfactor and never see this section.
         buf.push(self.include_columns.len() as u8);
         for &col_idx in &self.include_columns {
             buf.extend_from_slice(&col_idx.to_le_bytes());
+        }
+        // Index type (Phase 11.1b) — 1 byte: 0=BTree, 1=Brin.
+        buf.push(self.index_type);
+        // BRIN pages_per_range — 4 bytes LE, only when index_type != 0.
+        if self.index_type != 0 {
+            buf.extend_from_slice(&self.pages_per_range.to_le_bytes());
         }
         buf
     }
@@ -733,6 +747,29 @@ impl IndexDef {
             vec![] // pre-6.13 row
         };
 
+        // Index type (Phase 11.1b) — 1 byte. Pre-11.1b rows default to 0 (BTree).
+        let index_type = if bytes.len() > consumed {
+            let it = bytes[consumed];
+            consumed += 1;
+            it
+        } else {
+            0 // BTree default
+        };
+
+        // BRIN pages_per_range — 4 bytes LE, only when index_type != 0.
+        let pages_per_range = if index_type != 0 && bytes.len() >= consumed + 4 {
+            let ppr = u32::from_le_bytes([
+                bytes[consumed],
+                bytes[consumed + 1],
+                bytes[consumed + 2],
+                bytes[consumed + 3],
+            ]);
+            consumed += 4;
+            ppr
+        } else {
+            128 // default
+        };
+
         Ok((
             Self {
                 index_id,
@@ -746,6 +783,8 @@ impl IndexDef {
                 fillfactor,
                 is_fk_index,
                 include_columns,
+                index_type,
+                pages_per_range,
             },
             consumed,
         ))
@@ -1262,6 +1301,8 @@ mod tests {
             fillfactor: 90,
             is_fk_index: false,
             include_columns: vec![],
+            index_type: 0,
+            pages_per_range: 128,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = IndexDef::from_bytes(&bytes).unwrap();
@@ -1286,6 +1327,8 @@ mod tests {
             fillfactor: 90,
             is_fk_index: false,
             include_columns: vec![],
+            index_type: 0,
+            pages_per_range: 128,
         };
         let bytes = def.to_bytes();
         let (back, _) = IndexDef::from_bytes(&bytes).unwrap();
@@ -1310,6 +1353,8 @@ mod tests {
             fillfactor: 90,
             is_fk_index: false,
             include_columns: vec![],
+            index_type: 0,
+            pages_per_range: 128,
         };
         let bytes = def.to_bytes();
         assert!(IndexDef::from_bytes(&bytes[..10]).is_err());
@@ -1338,6 +1383,8 @@ mod tests {
             fillfactor: 90,
             is_fk_index: false,
             include_columns: vec![],
+            index_type: 0,
+            pages_per_range: 128,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = IndexDef::from_bytes(&bytes).unwrap();
@@ -1360,6 +1407,8 @@ mod tests {
             fillfactor: 90,
             is_fk_index: false,
             include_columns: vec![],
+            index_type: 0,
+            pages_per_range: 128,
         };
         let full_bytes = def.to_bytes();
         // Truncate the columns section (last byte is ncols=0, remove it).

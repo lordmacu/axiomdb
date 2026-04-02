@@ -151,7 +151,7 @@ fn execute_select_ctx(
                     // Build WHERE column mask for two-phase decode:
                     // only decode columns referenced in WHERE first.
                     let n_cols = resolved.columns.len();
-                    let where_mask = {
+                    let _where_mask = {
                         let mut mask = vec![false; n_cols];
                         collect_expr_columns(&wc_clone, &mut mask);
                         // Only use two-phase if mask is selective (not all cols)
@@ -161,7 +161,73 @@ fn execute_select_ctx(
                             None
                         }
                     };
-                    TableEngine::scan_table_filtered(
+                    // Phase 8.1: try to compile a BatchPredicate for zero-alloc
+                    // raw-byte evaluation. Falls back to eval() for complex
+                    // expressions (OR, LIKE, IN, subqueries, Text/Bytes, etc.).
+                    let col_types: Vec<axiomdb_types::DataType> = resolved
+                        .columns
+                        .iter()
+                        .map(|c| crate::table::column_type_to_data_type(c.col_type))
+                        .collect();
+                    let batch_pred =
+                        crate::eval::batch::try_compile(&wc_clone, &col_types);
+
+                    // Phase 9.2: Operator fusion — build unified decode mask
+                    // (SELECT ∪ WHERE ∪ ORDER BY ∪ GROUP BY columns).
+                    // Only decode columns that are actually referenced anywhere
+                    // in the query. Non-referenced columns get Value::Null,
+                    // saving String/Text allocation for wide tables.
+                    let decode_mask = {
+                        let mut mask = vec![false; n_cols];
+                        // WHERE columns
+                        collect_expr_columns(&wc_clone, &mut mask);
+                        // SELECT columns
+                        for item in &stmt.columns {
+                            if let crate::ast::SelectItem::Expr { expr, .. } = item {
+                                collect_expr_columns(expr, &mut mask);
+                            } else {
+                                // Wildcard — need all columns
+                                mask.iter_mut().for_each(|m| *m = true);
+                            }
+                        }
+                        // ORDER BY columns
+                        for ob in &stmt.order_by {
+                            collect_expr_columns(&ob.expr, &mut mask);
+                        }
+                        // GROUP BY columns
+                        for gb in &stmt.group_by {
+                            collect_expr_columns(gb, &mut mask);
+                        }
+                        // HAVING columns
+                        if let Some(ref having) = stmt.having {
+                            collect_expr_columns(having, &mut mask);
+                        }
+                        // Only use mask if it's selective (not all cols needed)
+                        if mask.iter().all(|&b| b) {
+                            None
+                        } else {
+                            Some(mask)
+                        }
+                    };
+
+                    // Phase 9.11: early-exit scan for LIMIT without ORDER BY.
+                    // PostgreSQL's ExecutePlan(count) pattern — stop scanning
+                    // after limit rows are collected. Only safe when no ORDER BY
+                    // (sorting requires all rows first) and no GROUP BY.
+                    let scan_limit = if stmt.order_by.is_empty()
+                        && stmt.group_by.is_empty()
+                        && stmt.having.is_none()
+                    {
+                        stmt.limit.as_ref().and_then(|expr| match expr {
+                            Expr::Literal(Value::Int(n)) => Some(*n as usize),
+                            Expr::Literal(Value::BigInt(n)) => Some(*n as usize),
+                            _ => None,
+                        })
+                    } else {
+                        None
+                    };
+
+                    TableEngine::scan_table_filtered_parallel(
                         storage,
                         &resolved.def,
                         &resolved.columns,
@@ -173,7 +239,9 @@ fn execute_select_ctx(
                             }
                         },
                         zm_pred.as_ref().map(|(ci, p)| (*ci, p)),
-                        where_mask.as_deref(),
+                        batch_pred.as_ref(),
+                        decode_mask.as_deref(),
+                        scan_limit,
                     )?
                 } else {
                     // No WHERE clause — scan all rows.
@@ -192,7 +260,12 @@ fn execute_select_ctx(
                 // the bloom (one entry per row), but the lookup key here is the bare value.
                 // Checking a bare value key against a bloom populated with key||RID entries
                 // produces false negatives, so we skip the bloom check for non-unique indexes.
-                if index_def.is_unique && !bloom.might_exist(index_def.index_id, key) {
+                // Skip bloom for primary key: deferred deletion model guarantees the
+                // key is in the B-Tree after INSERT, so the bloom check is wasted cycles.
+                if index_def.is_unique
+                    && !index_def.is_primary
+                    && !bloom.might_exist(index_def.index_id, key)
+                {
                     vec![]
                 } else if index_def.is_unique {
                     // Unique index: exact key lookup → at most one RecordId.
@@ -441,7 +514,7 @@ fn execute_select_with_joins_ctx(
         }
     }
 
-    let snap = txn.active_snapshot()?;
+    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
     let mut scanned: Vec<Vec<Row>> = Vec::with_capacity(all_resolved.len());
     for t in &all_resolved {
         let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap, None)?;
@@ -863,7 +936,7 @@ fn execute_select_with_joins(
     } // resolver dropped — storage immutable borrow released
 
     // Pre-scan all tables once (consistent snapshot for all).
-    let snap = txn.active_snapshot()?;
+    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
     let mut scanned: Vec<Vec<Row>> = Vec::with_capacity(all_resolved.len());
     for t in &all_resolved {
         let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap, None)?;

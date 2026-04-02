@@ -198,6 +198,8 @@ fn test_create_and_list_index() {
                 fillfactor: 90,
                 is_fk_index: false,
                 include_columns: vec![],
+                index_type: 0,
+                pages_per_range: 128,
             })
             .unwrap();
         (tid, iid)
@@ -237,6 +239,8 @@ fn test_index_ids_are_unique_across_tables() {
                 fillfactor: 90,
                 is_fk_index: false,
                 include_columns: vec![],
+                index_type: 0,
+                pages_per_range: 128,
             })
             .unwrap();
         let i2 = w
@@ -252,6 +256,8 @@ fn test_index_ids_are_unique_across_tables() {
                 fillfactor: 90,
                 is_fk_index: false,
                 include_columns: vec![],
+                index_type: 0,
+                pages_per_range: 128,
             })
             .unwrap();
         (i1, i2)
@@ -284,6 +290,8 @@ fn test_delete_index() {
                 fillfactor: 90,
                 is_fk_index: false,
                 include_columns: vec![],
+                index_type: 0,
+                pages_per_range: 128,
             })
             .unwrap();
         (tid, iid)
@@ -338,6 +346,8 @@ fn test_delete_table_cascades_columns_and_indexes() {
             fillfactor: 90,
             is_fk_index: false,
             include_columns: vec![],
+            index_type: 0,
+            pages_per_range: 128,
         })
         .unwrap();
         tid

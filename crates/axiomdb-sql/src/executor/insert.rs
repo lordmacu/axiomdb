@@ -288,7 +288,7 @@ fn execute_insert_ctx(
                 )?;
                 if !secondary_indexes.is_empty() {
                     let snap = txn.active_snapshot()?;
-                    let updated = crate::index_maintenance::insert_into_indexes(
+                    let updated = crate::index_maintenance::insert_into_indexes_with_undo(
                         &secondary_indexes,
                         &full_values,
                         rid,
@@ -296,6 +296,7 @@ fn execute_insert_ctx(
                         bloom,
                         &compiled_preds,
                         snap,
+                        Some(txn),
                     )?;
                     for (index_id, new_root) in updated {
                         CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -385,7 +386,7 @@ fn execute_insert_ctx(
                 )?;
                 if !secondary_indexes.is_empty() {
                     let snap = txn.active_snapshot()?;
-                    let updated = crate::index_maintenance::insert_into_indexes(
+                    let updated = crate::index_maintenance::insert_into_indexes_with_undo(
                         &secondary_indexes,
                         &full_values,
                         rid,
@@ -393,6 +394,7 @@ fn execute_insert_ctx(
                         bloom,
                         &compiled_preds,
                         snap,
+                        Some(txn),
                     )?;
                     for (index_id, new_root) in updated {
                         CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -579,7 +581,7 @@ fn execute_insert(
                 )?;
                 if !secondary_indexes.is_empty() {
                     let snap = txn.active_snapshot()?;
-                    let updated = crate::index_maintenance::insert_into_indexes(
+                    let updated = crate::index_maintenance::insert_into_indexes_with_undo(
                         &secondary_indexes,
                         &full_values,
                         rid,
@@ -587,6 +589,7 @@ fn execute_insert(
                         &mut noop_bloom,
                         &compiled_preds,
                         snap,
+                        Some(txn),
                     )?;
                     for (index_id, new_root) in updated {
                         CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
@@ -659,7 +662,7 @@ fn execute_insert(
                 )?;
                 if !secondary_indexes.is_empty() {
                     let snap = txn.active_snapshot()?;
-                    let updated = crate::index_maintenance::insert_into_indexes(
+                    let updated = crate::index_maintenance::insert_into_indexes_with_undo(
                         &secondary_indexes,
                         &full_values,
                         rid,
@@ -667,6 +670,7 @@ fn execute_insert(
                         &mut noop_bloom,
                         &compiled_preds,
                         snap,
+                        Some(txn),
                     )?;
                     for (index_id, new_root) in updated {
                         CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;

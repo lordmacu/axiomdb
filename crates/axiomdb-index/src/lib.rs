@@ -6,6 +6,7 @@
 //! - Lazy range scan via tree traversal (CoW invalidates `next_leaf`; O(log n) per leaf boundary)
 //! - In-memory prefix compression for internal nodes
 
+pub mod ahi;
 pub mod page_layout;
 pub mod prefix;
 

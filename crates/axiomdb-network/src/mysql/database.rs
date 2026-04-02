@@ -480,6 +480,18 @@ impl Database {
         Ok((result, self.take_commit_rx()))
     }
 
+    /// Returns a snapshot for plan cache analysis (outside a transaction).
+    pub fn txn_snapshot_for_cache(&self) -> axiomdb_core::TransactionSnapshot {
+        self.txn
+            .active_snapshot()
+            .unwrap_or_else(|_| self.txn.snapshot())
+    }
+
+    /// Returns a shared reference to the storage engine for read-only operations.
+    pub fn storage_ref(&self) -> &dyn axiomdb_storage::StorageEngine {
+        &self.storage
+    }
+
     /// Releases deferred-free pages for the given committed transaction IDs.
     ///
     /// Wraps `TxnManager::release_committed_frees` to avoid split-borrow issues

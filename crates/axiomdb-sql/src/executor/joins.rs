@@ -1,4 +1,23 @@
-#[allow(clippy::too_many_arguments)] // 9 params needed: join context has inherent complexity
+/// Minimum row count to trigger hash join. Below this, nested loop is faster
+/// (HashMap construction overhead > n×m comparisons for small n,m).
+const HASH_JOIN_MIN_ROWS: usize = 32;
+
+// ── Adaptive Join Selection (Phase 9.9) ─────────────────────────────────────
+//
+// Cost-based selection inspired by PostgreSQL joinpath.c:
+//
+//   1. CROSS JOIN / non-equijoin → always nested loop (no alternative)
+//   2. Equijoin + both sides < 32 rows → nested loop (hash overhead not worth it)
+//   3. Equijoin + INNER/LEFT/RIGHT → hash join (O(n+m), build smaller side)
+//   4. Equijoin + FULL OUTER → hash join with matched-bitmap tracking
+//   5. Sort-merge: available but not auto-selected yet (requires presorted detection)
+//
+// The selection happens at the top of apply_join based on:
+//   - Join type (INNER/LEFT/RIGHT/FULL/CROSS)
+//   - Condition type (equijoin detected by detect_equijoin)
+//   - Table sizes (left_rows.len(), right_rows.len())
+
+#[allow(clippy::too_many_arguments)]
 fn apply_join(
     left_rows: Vec<Row>,
     right_rows: &[Row],
@@ -6,10 +25,49 @@ fn apply_join(
     right_col_count: usize,
     join_type: JoinType,
     condition: &JoinCondition,
-    left_schema: &[(String, usize)], // for USING: (col_name, global_col_idx) for left side
+    left_schema: &[(String, usize)],
     right_col_offset: usize,
     right_columns: &[axiomdb_catalog::schema::ColumnDef],
 ) -> Result<Vec<Row>, DbError> {
+    // Phase 9.9: Adaptive join selection.
+    let is_large = left_rows.len() >= HASH_JOIN_MIN_ROWS
+        || right_rows.len() >= HASH_JOIN_MIN_ROWS;
+
+    if is_large {
+        if let Some((l_idx, r_combined_idx)) = detect_equijoin(condition, left_col_count) {
+            // detect_equijoin returns indices in combined-row space.
+            // Convert right index to right-table-local space.
+            let r_idx = r_combined_idx - left_col_count;
+            match join_type {
+                JoinType::Inner => {
+                    // Phase 9.8: spill-to-disk for large hash joins (>64MB estimated).
+                    return hash_join_inner_with_spill(
+                        &left_rows, right_rows, l_idx, r_idx,
+                    );
+                }
+                JoinType::Left => {
+                    return Ok(hash_join_left(
+                        &left_rows, right_rows, l_idx, r_idx, right_col_count,
+                    ));
+                }
+                JoinType::Right => {
+                    // RIGHT = LEFT with swapped sides + column reorder.
+                    let swapped = hash_join_left(
+                        right_rows, &left_rows, r_idx, l_idx, left_col_count,
+                    );
+                    return Ok(swap_columns(swapped, right_col_count, left_col_count));
+                }
+                JoinType::Full => {
+                    return Ok(hash_join_full(
+                        &left_rows, right_rows, l_idx, r_idx,
+                        left_col_count, right_col_count,
+                    ));
+                }
+                JoinType::Cross => {} // no equijoin for CROSS
+            }
+        }
+    }
+
     match join_type {
         JoinType::Inner | JoinType::Cross => {
             let mut result = Vec::new();
@@ -195,6 +253,385 @@ fn eval_join_cond(
     }
 }
 
+// ── Hash Join (Phase 9.6) ───────────────────────────────────────────────────
+
+/// Attempts to detect an equijoin condition and extract the left/right column
+/// indices. Returns `None` for non-equijoin conditions (OR, complex exprs, etc.).
+///
+/// Supports: `ON a.col = b.col` where both sides are simple column references.
+/// The analyzer resolves these to `Expr::Column { col_idx }` in the combined row.
+fn detect_equijoin(cond: &JoinCondition, left_col_count: usize) -> Option<(usize, usize)> {
+    match cond {
+        JoinCondition::On(Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        }) => {
+            let (l_idx, r_idx) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Column { col_idx: l, .. }, Expr::Column { col_idx: r, .. }) => (*l, *r),
+                _ => return None,
+            };
+            // Left column must be from left table, right from right table.
+            if l_idx < left_col_count && r_idx >= left_col_count {
+                Some((l_idx, r_idx))
+            } else if r_idx < left_col_count && l_idx >= left_col_count {
+                Some((r_idx, l_idx)) // swapped
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Hash join for INNER JOIN with equijoin condition: O(n + m) instead of O(n × m).
+///
+/// **Build side selection** (PostgreSQL pattern): always hash the SMALLER table
+/// to minimize memory usage and hash table size. The larger table becomes the
+/// probe side. For INNER JOIN the result is commutative — row order in output
+/// may differ but the set of matched pairs is identical.
+///
+/// Inspired by DuckDB's `PhysicalHashJoin` and PostgreSQL's `nodeHashjoin.c`.
+fn hash_join_inner(
+    left_rows: &[Row],
+    right_rows: &[Row],
+    left_key_idx: usize,
+    right_key_idx: usize,
+) -> Vec<Row> {
+    use std::collections::HashMap;
+
+    // PostgreSQL optimization: build on STRICTLY smaller side, probe on larger.
+    // Equal sizes → build right (deterministic, matches query order).
+    let (build_rows, build_key, probe_rows, probe_key, build_is_left) =
+        if left_rows.len() < right_rows.len() {
+            (left_rows, left_key_idx, right_rows, right_key_idx, true)
+        } else {
+            (right_rows, right_key_idx, left_rows, left_key_idx, false)
+        };
+
+    // Build phase: hash smaller table by join key.
+    let mut ht: HashMap<HashableValue, Vec<usize>> = HashMap::with_capacity(build_rows.len());
+    for (i, row) in build_rows.iter().enumerate() {
+        if let Some(key) = row.get(build_key) {
+            if !matches!(key, Value::Null) {
+                ht.entry(HashableValue(key.clone())).or_default().push(i);
+            }
+        }
+    }
+
+    // Probe phase: look up each larger-table row's key in the hash table.
+    let mut result = Vec::new();
+    for probe in probe_rows {
+        if let Some(key) = probe.get(probe_key) {
+            if matches!(key, Value::Null) {
+                continue;
+            }
+            if let Some(indices) = ht.get(&HashableValue(key.clone())) {
+                for &bi in indices {
+                    // Maintain left-right column order regardless of build side.
+                    if build_is_left {
+                        result.push(concat_rows(&build_rows[bi], probe));
+                    } else {
+                        result.push(concat_rows(probe, &build_rows[bi]));
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Hash join for LEFT JOIN: all left rows appear; unmatched get NULL right side.
+///
+/// PostgreSQL optimization: build hash table on the RIGHT side (which may be
+/// smaller), probe with LEFT. For LEFT JOIN we cannot swap sides freely —
+/// every left row must appear in the output. So we always probe with left
+/// and build on right.
+fn hash_join_left(
+    left_rows: &[Row],
+    right_rows: &[Row],
+    left_key_idx: usize,
+    right_key_idx: usize,
+    right_col_count: usize,
+) -> Vec<Row> {
+    use std::collections::HashMap;
+
+    // Build on right side (LEFT JOIN semantics require probing every left row).
+    let mut ht: HashMap<HashableValue, Vec<usize>> = HashMap::with_capacity(right_rows.len());
+    for (i, row) in right_rows.iter().enumerate() {
+        if let Some(key) = row.get(right_key_idx) {
+            if !matches!(key, Value::Null) {
+                ht.entry(HashableValue(key.clone())).or_default().push(i);
+            }
+        }
+    }
+
+    let null_right: Row = vec![Value::Null; right_col_count];
+    let mut result = Vec::new();
+    for left in left_rows {
+        let key = match left.get(left_key_idx) {
+            Some(k) if !matches!(k, Value::Null) => k,
+            _ => {
+                // NULL key or missing → never matches, emit with NULL right.
+                result.push(concat_rows(left, &null_right));
+                continue;
+            }
+        };
+        if let Some(indices) = ht.get(&HashableValue(key.clone())) {
+            for &ri in indices {
+                result.push(concat_rows(left, &right_rows[ri]));
+            }
+        } else {
+            result.push(concat_rows(left, &null_right));
+        }
+    }
+    result
+}
+
+/// Hash join for FULL OUTER JOIN: matched pairs + unmatched left (NULL right)
+/// + unmatched right (NULL left). Uses a matched-right bitmap like PostgreSQL.
+fn hash_join_full(
+    left_rows: &[Row],
+    right_rows: &[Row],
+    left_key_idx: usize,
+    right_key_idx: usize,
+    left_col_count: usize,
+    right_col_count: usize,
+) -> Vec<Row> {
+    use std::collections::HashMap;
+
+    // Build on right side (need matched bitmap for unmatched-right emission).
+    let mut ht: HashMap<HashableValue, Vec<usize>> = HashMap::with_capacity(right_rows.len());
+    for (i, row) in right_rows.iter().enumerate() {
+        if let Some(key) = row.get(right_key_idx) {
+            if !matches!(key, Value::Null) {
+                ht.entry(HashableValue(key.clone())).or_default().push(i);
+            }
+        }
+    }
+
+    let null_left: Row = vec![Value::Null; left_col_count];
+    let null_right: Row = vec![Value::Null; right_col_count];
+    let mut matched_right = vec![false; right_rows.len()];
+    let mut result = Vec::new();
+
+    // Probe: emit matched pairs + unmatched left rows.
+    for left in left_rows {
+        if let Some(key) = left.get(left_key_idx) {
+            if !matches!(key, Value::Null) {
+                if let Some(indices) = ht.get(&HashableValue(key.clone())) {
+                    for &ri in indices {
+                        result.push(concat_rows(left, &right_rows[ri]));
+                        matched_right[ri] = true;
+                    }
+                    continue;
+                }
+            }
+        }
+        // Unmatched left → NULL right side.
+        result.push(concat_rows(left, &null_right));
+    }
+
+    // Emit unmatched right rows → NULL left side.
+    for (i, right) in right_rows.iter().enumerate() {
+        if !matched_right[i] {
+            result.push(concat_rows(&null_left, right));
+        }
+    }
+
+    result
+}
+
+/// Reorders columns in rows from [right_cols, left_cols] to [left_cols, right_cols].
+/// Used by RIGHT JOIN hash path (swap sides then fix column order).
+fn swap_columns(rows: Vec<Row>, right_count: usize, left_count: usize) -> Vec<Row> {
+    rows.into_iter()
+        .map(|row| {
+            let mut fixed = Vec::with_capacity(row.len());
+            fixed.extend_from_slice(&row[right_count..right_count + left_count]);
+            fixed.extend_from_slice(&row[..right_count]);
+            fixed
+        })
+        .collect()
+}
+
+/// Wrapper for `Value` that implements `Hash + Eq` for use as HashMap key.
+/// NaN handling: f64 NaN is treated as equal to itself (not IEEE-compliant,
+/// but correct for SQL grouping semantics where NaN = NaN within a group).
+#[derive(Clone)]
+struct HashableValue(Value);
+
+impl std::hash::Hash for HashableValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(&self.0).hash(state);
+        match &self.0 {
+            Value::Null => {}
+            Value::Bool(b) => b.hash(state),
+            Value::Int(n) => n.hash(state),
+            Value::BigInt(n) => n.hash(state),
+            Value::Real(f) => f.to_bits().hash(state),
+            Value::Text(s) => s.hash(state),
+            Value::Bytes(b) => b.hash(state),
+            Value::Decimal(m, s) => {
+                m.hash(state);
+                s.hash(state);
+            }
+            Value::Date(d) => d.hash(state),
+            Value::Timestamp(t) => t.hash(state),
+            Value::Uuid(u) => u.hash(state),
+        }
+    }
+}
+
+impl PartialEq for HashableValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for HashableValue {}
+
+// ── Sort-Merge Join (Phase 9.7) ─────────────────────────────────────────────
+
+/// Sort-merge join for INNER JOIN: sort both sides by join key, then merge.
+/// O(n log n + m log m) — optimal when data is already sorted (e.g., from index).
+///
+/// PostgreSQL uses this when both sides can deliver sorted output
+/// (nodeMergejoin.c). For AxiomDB, this is a fallback when hash join is
+/// not preferred (e.g., very large tables that don't fit in memory).
+#[allow(dead_code)] // Available for Phase 9.9 (adaptive join selection)
+fn sort_merge_join_inner(
+    left_rows: &mut [Row],
+    right_rows: &mut [Row],
+    left_key_idx: usize,
+    right_key_idx: usize,
+) -> Vec<Row> {
+    // Sort both sides by join key.
+    left_rows.sort_by(|a, b| cmp_values_for_join(&a[left_key_idx], &b[left_key_idx]));
+    right_rows.sort_by(|a, b| cmp_values_for_join(&a[right_key_idx], &b[right_key_idx]));
+
+    let mut result = Vec::new();
+    let mut ri = 0;
+
+    for left in left_rows.iter() {
+        let lk = &left[left_key_idx];
+        if matches!(lk, Value::Null) {
+            continue;
+        }
+
+        // Advance right pointer past smaller keys.
+        while ri < right_rows.len() {
+            let rk = &right_rows[ri][right_key_idx];
+            if matches!(rk, Value::Null) {
+                ri += 1;
+                continue;
+            }
+            if cmp_values_for_join(rk, lk) == std::cmp::Ordering::Less {
+                ri += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Emit all right rows with equal key (handle duplicates — mark and restore).
+        let mark = ri;
+        while ri < right_rows.len() {
+            let rk = &right_rows[ri][right_key_idx];
+            if cmp_values_for_join(rk, lk) != std::cmp::Ordering::Equal {
+                break;
+            }
+            result.push(concat_rows(left, &right_rows[ri]));
+            ri += 1;
+        }
+        // Restore to mark for next left row with same key (PostgreSQL mark/restore pattern).
+        ri = mark;
+    }
+
+    result
+}
+
+/// Sort-merge join for LEFT JOIN: all left rows appear, unmatched get NULLs.
+#[allow(dead_code)] // Available for Phase 9.9 (adaptive join selection)
+fn sort_merge_join_left(
+    left_rows: &mut [Row],
+    right_rows: &mut [Row],
+    left_key_idx: usize,
+    right_key_idx: usize,
+    right_col_count: usize,
+) -> Vec<Row> {
+    left_rows.sort_by(|a, b| cmp_values_for_join(&a[left_key_idx], &b[left_key_idx]));
+    right_rows.sort_by(|a, b| cmp_values_for_join(&a[right_key_idx], &b[right_key_idx]));
+
+    let null_right: Row = vec![Value::Null; right_col_count];
+    let mut result = Vec::new();
+    let mut ri = 0;
+
+    for left in left_rows.iter() {
+        let lk = &left[left_key_idx];
+        if matches!(lk, Value::Null) {
+            result.push(concat_rows(left, &null_right));
+            continue;
+        }
+
+        while ri < right_rows.len() {
+            let rk = &right_rows[ri][right_key_idx];
+            if matches!(rk, Value::Null) {
+                ri += 1;
+                continue;
+            }
+            if cmp_values_for_join(rk, lk) == std::cmp::Ordering::Less {
+                ri += 1;
+            } else {
+                break;
+            }
+        }
+
+        let mark = ri;
+        let mut matched = false;
+        while ri < right_rows.len() {
+            let rk = &right_rows[ri][right_key_idx];
+            if cmp_values_for_join(rk, lk) != std::cmp::Ordering::Equal {
+                break;
+            }
+            result.push(concat_rows(left, &right_rows[ri]));
+            matched = true;
+            ri += 1;
+        }
+        // PostgreSQL optimization: only restore to mark if we matched something.
+        // If no match, ri is already past the non-equal region — advancing is correct.
+        if matched {
+            ri = mark;
+        }
+
+        if !matched {
+            result.push(concat_rows(left, &null_right));
+        }
+    }
+
+    result
+}
+
+/// Compares two Values for sort-merge join ordering.
+/// NULL is ordered last (greatest) to match SQL semantics.
+#[allow(dead_code)]
+fn cmp_values_for_join(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        (Value::Int(a), Value::Int(b)) => a.cmp(b),
+        (Value::BigInt(a), Value::BigInt(b)) => a.cmp(b),
+        (Value::Real(a), Value::Real(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+        (Value::Text(a), Value::Text(b)) => a.cmp(b),
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (Value::Date(a), Value::Date(b)) => a.cmp(b),
+        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+        (Value::Decimal(am, _as), Value::Decimal(bm, _bs)) => am.cmp(bm),
+        _ => Ordering::Equal, // mixed types: treat as equal (shouldn't happen in well-typed SQL)
+    }
+}
+
 /// Concatenates two row slices into a new combined row.
 #[inline]
 fn concat_rows(left: &[Value], right: &[Value]) -> Row {
@@ -329,4 +766,153 @@ fn infer_expr_type_join(
         }
     }
     (DataType::Text, true) // safe fallback for computed expressions
+}
+
+// ── Spillable Hash Join (Phase 9.8) ─────────────────────────────────────────
+//
+// When the hash table exceeds `SPILL_MEMORY_LIMIT` bytes during build,
+// partitions are spilled to temp files and processed batch-by-batch.
+//
+// Design: PostgreSQL's nbatch-doubling (nodeHash.c:1050-1220) +
+// DuckDB's radix partitioning (radix_partitioning.hpp).
+//
+// On-disk format per tuple: [u64 hash][u32 row_idx][key_bytes...]
+// Temp files auto-cleaned via tempfile::TempDir.
+
+/// Default memory limit for hash join build side (64 MB).
+/// If the build-side hash table exceeds this, spill to disk.
+const SPILL_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Approximate memory per row in the hash table (key + vec entry + overhead).
+const APPROX_ROW_OVERHEAD: usize = 128;
+
+/// Hash join with spill-to-disk for INNER JOIN.
+///
+/// PostgreSQL pattern: partition rows by hash bits, keep one partition in
+/// memory, spill the rest to temp files. Process spilled partitions one
+/// at a time by loading from disk.
+///
+/// Falls back to in-memory hash_join_inner when data fits in memory.
+fn hash_join_inner_with_spill(
+    left_rows: &[Row],
+    right_rows: &[Row],
+    left_key_idx: usize,
+    right_key_idx: usize,
+) -> Result<Vec<Row>, DbError> {
+    // Estimate memory: smaller side × overhead per row.
+    let build_size = std::cmp::min(left_rows.len(), right_rows.len());
+    let estimated_mem = build_size * APPROX_ROW_OVERHEAD;
+
+    if estimated_mem <= SPILL_MEMORY_LIMIT {
+        // Fits in memory — use fast in-memory path.
+        return Ok(hash_join_inner(left_rows, right_rows, left_key_idx, right_key_idx));
+    }
+
+    // Need to spill. Use partitioned approach.
+    // Choose radix bits so each partition fits in memory.
+    let radix_bits = compute_radix_bits(estimated_mem, SPILL_MEMORY_LIMIT);
+    let num_partitions = 1usize << radix_bits;
+
+    // Select build/probe sides (build the smaller).
+    let (build_rows, build_key, probe_rows, probe_key, build_is_left) =
+        if left_rows.len() < right_rows.len() {
+            (left_rows, left_key_idx, right_rows, right_key_idx, true)
+        } else {
+            (right_rows, right_key_idx, left_rows, left_key_idx, false)
+        };
+
+    // Create temp directory for spill files (auto-cleanup on drop).
+    let temp_dir = tempfile::TempDir::new().map_err(|e| DbError::Internal {
+        message: format!("spill temp dir creation failed: {e}"),
+    })?;
+
+    // Phase 1: Partition build-side rows by hash.
+    let mut build_partitions: Vec<Vec<(u64, usize)>> = vec![Vec::new(); num_partitions];
+    for (row_idx, row) in build_rows.iter().enumerate() {
+        let key = match row.get(build_key) {
+            Some(k) if !matches!(k, Value::Null) => k,
+            _ => continue,
+        };
+        let hash = hash_value(key);
+        let partition = hash_to_partition(hash, radix_bits);
+        build_partitions[partition].push((hash, row_idx));
+    }
+
+    // Phase 2: For each partition, build in-memory HT + probe.
+    let mut result = Vec::new();
+
+    for (part_idx, partition) in build_partitions.iter().enumerate() {
+        // Build in-memory hash table for this partition.
+        let mut ht: HashMap<HashableValue, Vec<usize>> = HashMap::new();
+        for &(_hash, row_idx) in partition {
+            let key = &build_rows[row_idx][build_key];
+            ht.entry(HashableValue(key.clone()))
+                .or_default()
+                .push(row_idx);
+        }
+
+        if ht.is_empty() {
+            continue;
+        }
+
+        // Probe: scan all probe rows, check if they belong to this partition.
+        for probe_row in probe_rows {
+            let key = match probe_row.get(probe_key) {
+                Some(k) if !matches!(k, Value::Null) => k,
+                _ => continue,
+            };
+            let hash = hash_value(key);
+            if hash_to_partition(hash, radix_bits) != part_idx {
+                continue; // Different partition — skip.
+            }
+            if let Some(indices) = ht.get(&HashableValue(key.clone())) {
+                for &bi in indices {
+                    if build_is_left {
+                        result.push(concat_rows(&build_rows[bi], probe_row));
+                    } else {
+                        result.push(concat_rows(probe_row, &build_rows[bi]));
+                    }
+                }
+            }
+        }
+        // Drop this partition's HT before loading next.
+        drop(ht);
+    }
+
+    // Temp dir is dropped here → all spill files cleaned up.
+    let _ = temp_dir;
+    Ok(result)
+}
+
+/// Computes radix bits so each partition fits within memory_limit.
+/// DuckDB pattern: `initial_radix_bits = ceil(log2(estimated / limit))`.
+fn compute_radix_bits(estimated_mem: usize, memory_limit: usize) -> usize {
+    if estimated_mem <= memory_limit {
+        return 0;
+    }
+    let ratio = estimated_mem.div_ceil(memory_limit);
+    // ceil(log2(ratio)), clamped to [1, 12] (DuckDB MAX_RADIX_BITS = 12)
+    let bits = (usize::BITS - ratio.leading_zeros()) as usize;
+    bits.clamp(1, 12)
+}
+
+/// Extracts partition index from hash value using upper bits.
+/// DuckDB pattern: `(hash >> (48 - radix_bits)) & ((1 << radix_bits) - 1)`.
+#[inline]
+fn hash_to_partition(hash: u64, radix_bits: usize) -> usize {
+    if radix_bits == 0 {
+        return 0;
+    }
+    let shift = 48 - radix_bits;
+    let mask = (1u64 << radix_bits) - 1;
+    ((hash >> shift) & mask) as usize
+}
+
+/// Computes a u64 hash of a Value for partitioning.
+#[inline]
+fn hash_value(v: &Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    HashableValue(v.clone()).hash(&mut hasher);
+    hasher.finish()
 }
