@@ -1,5 +1,20 @@
 # Lessons Learned
 
+## 2026-04-02 - Clustered secondary bookmarks must live in the physical key, not in the old RID payload
+
+- A clustered secondary entry cannot keep depending on a heap `RecordId` once row relocation becomes valid.
+- The right intermediate contract is:
+  - encode the logical secondary key first
+  - append only the missing PRIMARY KEY columns as the stable bookmark suffix
+  - decode the bookmark back from the physical key on scan
+  - treat the old fixed-size `RecordId` payload as a compatibility artifact only
+- `research/mariadb-server/storage/innobase/row/row0row.cc` reinforced the
+  secondary-to-clustered-row bridge through the clustered key.
+- `research/sqlite/src/build.c` reinforced the same shape for `WITHOUT ROWID`:
+  append the table key to the index entry instead of depending on a hidden row slot.
+- The AxiomDB adaptation is intentionally narrower in 39.9: the bookmark path
+  exists now, but executor/FK/index-integrity wiring stays in later clustered phases.
+
 ## 2026-04-02 - Variable-size clustered rebalance must propagate occupancy and minimum-key change separately
 
 - A clustered delete/rewrite path needs two independent upward signals:

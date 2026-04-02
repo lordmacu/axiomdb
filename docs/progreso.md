@@ -1262,9 +1262,10 @@
 - [x] 39.7 ✅ Clustered B-Tree delete — dedicated `axiomdb-storage::clustered_tree::delete_mark(...)`, exact-leaf delete-mark, MVCC gating, old-snapshot visibility over inline deleted rows, and unit/integration coverage
 - [ ] ⚠️ 39.7 delete-mark keeps dead clustered cells inline; snapshot-safe purge, undo, and WAL remain deferred — revisit in 39.11 / 39.12 / 39.18
 - [x] 39.8 ✅ Clustered B-Tree split and merge — byte-volume leaf/internal rebalance, parent separator repair, root collapse, and relocate-update fallback when same-leaf growth fails
-- [ ] ⚠️ 39.8 relocate-update still rewrites only the current inline version, and delete-mark cleanup / secondary-index bookmark maintenance remain deferred — revisit in 39.9 / 39.11 / 39.12 / 39.18
+- [ ] ⚠️ 39.8 relocate-update still rewrites only the current inline version, and delete-mark cleanup remains deferred — revisit in 39.11 / 39.12 / 39.18
 - [ ] ⚠️ 39.8 parent separator repair still assumes the repaired separator fits in the current internal page budget — revisit in 39.10
-- [ ] 39.9 ⏳ Secondary indexes with PK bookmarks — store PK values instead of RecordIds
+- [x] 39.9 ✅ Secondary indexes with PK bookmarks — dedicated clustered-first secondary layout in `axiomdb-sql::clustered_secondary`, physical keys encoded as `secondary_key ++ missing_primary_key_columns`, decoded bookmark recovery from scanned keys, prefix scans without fixed 10-byte RID suffixes, and relocate-stable maintenance over the existing `BTree`
+- [ ] ⚠️ 39.9 clustered PK bookmarks exist as a dedicated path, but the SQL-visible heap executor / FK / index-integrity flows still use RecordId-based secondary indexes until clustered executor integration — revisit in 39.13 / 39.14 / 39.15 / 39.16 / 39.17
 - [ ] 39.10 ⏳ Overflow pages for large rows — spill large clustered rows out of leaf pages
 - [ ] 39.11 ⏳ WAL support for clustered operations — redo/undo entries for clustered inserts, deletes, updates, and splits
 - [ ] 39.12 ⏳ Crash recovery for clustered index — clustered-tree integrity after crash and repair

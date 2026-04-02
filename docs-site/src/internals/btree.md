@@ -397,8 +397,42 @@ Current 39.8 limits remain explicit:
 
 - relocate-update still rewrites only the current inline version
 - public delete still does not purge dead clustered cells
-- relocated rows still do not maintain secondary-index bookmarks
 - parent separator repair does not yet split the parent if the repaired key itself overflows the page budget
+
+### Clustered Secondary Bookmarks (Phase 39.9)
+
+Phase `39.9` adds a dedicated bookmark-bearing secondary-key layout in
+`axiomdb-sql::clustered_secondary`.
+
+Instead of treating the `BTree` payload `RecordId` as the row locator, the
+clustered path now encodes the physical secondary key as:
+
+```text
+secondary_logical_key ++ missing_primary_key_columns
+```
+
+That gives the future clustered executor the exact `secondary -> primary key`
+bridge it needs:
+
+1. scan the secondary B-tree by logical key prefix
+2. decode the appended PK bookmark from the physical secondary key
+3. probe the clustered tree by that primary key
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Do Not Trust RID Payload</span>
+MySQL InnoDB and SQLite `WITHOUT ROWID` both treat the table key, not a heap slot, as the durable secondary bookmark. AxiomDB now follows that rule in the clustered path: the old fixed-size `RecordId` payload is kept only because the existing B-tree page format still requires it, not because clustered identity depends on it.
+</div>
+</div>
+
+This subphase is intentionally narrower than full executor integration:
+
+- heap-visible SQL still uses `RecordId`-based secondaries
+- clustered bookmark scans are a dedicated path, not a replacement for the old
+  planner/executor yet
+- unique clustered secondaries check logical-key conflicts before insert, even
+  though the physical key contains a PK suffix for stable row identity
 
 ### Leaf Node (`LeafNodePage`)
 
