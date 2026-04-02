@@ -1575,9 +1575,11 @@ fn alter_add_constraint(
                     .collect(),
                 unique: true,
                 if_not_exists: false,
-                predicate: None,         // UNIQUE constraints are always full indexes
-                fillfactor: None,        // use default 90
-                include_columns: vec![], // UNIQUE constraints have no included columns
+                predicate: None,
+                fillfactor: None,
+                include_columns: vec![],
+                index_type: crate::ast::IndexType::BTree,
+                pages_per_range: None,
             };
             let mut noop_bloom = crate::bloom::BloomRegistry::new();
             execute_create_index(stmt, storage, txn, &mut noop_bloom, database)?;
