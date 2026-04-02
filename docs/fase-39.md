@@ -1,6 +1,6 @@
 # Phase 39 — Clustered Index Storage Engine
 
-## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6
+## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7
 
 ## What was built
 
@@ -206,6 +206,42 @@ This update path is still deliberately storage-first:
 - `crates/axiomdb-storage/tests/integration_clustered_tree.rs`
   - adds integration coverage for split-tree clustered updates and explicit same-leaf growth failure
 
+### 39.7 — Clustered B-tree delete
+
+`crates/axiomdb-storage/src/clustered_tree.rs` now also implements the first
+clustered-row delete path.
+
+The new API is:
+
+- `delete_mark(storage, root_opt, key, txn_id, snapshot) -> Result<bool, DbError>`
+
+Behavior:
+
+- `false` when the clustered tree is empty
+- `false` when the key is absent
+- `false` when the current inline version is not visible to the supplied snapshot
+- `true` when the row is delete-marked in the owning clustered leaf page
+
+This delete path is still deliberately storage-first:
+
+- it stamps only `txn_id_deleted`
+- it preserves `txn_id_created`, `row_version`, key bytes, and row payload bytes
+- it preserves parent separators and `next_leaf`
+- it keeps the physical cell inline so older snapshots can still observe it
+- it does **not** purge dead clustered cells yet
+- it does **not** merge or rebalance the tree after delete yet
+- it does **not** add WAL / undo / recovery semantics yet
+- it is not wired into the SQL executor yet
+
+### Supporting changes for 39.7
+
+- `crates/axiomdb-storage/src/clustered_tree.rs`
+  - adds `delete_mark(...)`
+  - reuses exact-leaf descent and same-key rewrite for header-only delete-mark
+  - adds unit coverage for empty-tree, missing-key, invisible-row, old-snapshot visibility, and split-tree invariants
+- `crates/axiomdb-storage/tests/integration_clustered_tree.rs`
+  - adds integration coverage for split-tree delete-mark visibility under old and new snapshots
+
 ## Validation
 
 Targeted validation passed:
@@ -307,22 +343,44 @@ New clustered update coverage now includes:
 - explicit `HeapPageFull` on no-fit same-leaf growth
 - integration validation through both clustered lookup and clustered range scan after update
 
+Targeted validation for `39.7` also passed:
+
+- `cargo test -p axiomdb-storage clustered_tree --lib -j1`
+- `cargo test -p axiomdb-storage --test integration_clustered_tree -j1`
+- `cargo test -p axiomdb-storage -j1`
+- `cargo clippy -p axiomdb-storage -- -D warnings`
+- `cargo fmt --check`
+- `cargo check -p axiomdb-index -j1`
+- `cargo check -p axiomdb-sql --lib -j1`
+- `mdbook build docs-site`
+
+New clustered delete coverage now includes:
+
+- empty-tree delete
+- missing-key delete
+- invisible current-version delete rejection
+- delete-mark hiding the row from the deleting transaction and newer snapshots
+- old-snapshot visibility over a delete-marked inline row
+- split-tree delete preserving leaf identity and `next_leaf`
+- integration validation through both clustered lookup and clustered range scan after delete-mark
+
 ## Review notes
 
 - All `39.3` acceptance criteria from the spec are implemented.
 - All `39.4` acceptance criteria from the spec are implemented.
 - All `39.5` acceptance criteria from the spec are implemented.
 - All `39.6` acceptance criteria from the spec are implemented.
+- All `39.7` acceptance criteria from the spec are implemented.
 - No `unsafe` was introduced in the clustered tree path.
 - No production `unwrap()` remains in the touched clustered files.
 - Benchmarking remains intentionally deferred: `39.5` finishes the storage-level
-  clustered read slice, and `39.6` adds the first clustered mutation slice, but
-  end-to-end clustered DML benchmarks still wait for later SQL-visible integration.
+  clustered read slice, and `39.6` / `39.7` add the first clustered mutation slices,
+  but end-to-end clustered DML benchmarks still wait for later SQL-visible integration.
 
 ## Deferred
 
-- `39.7` — clustered delete-mark semantics
 - `39.8` — parent maintenance during split / merge
+- `39.18` — physical purge of dead clustered cells
 - `39.11+` — WAL and crash recovery for clustered operations
 - `39.13+` — executor integration for clustered tables
 
@@ -338,5 +396,7 @@ New clustered update coverage now includes:
   exists in storage, but it is still not reachable from SQL.
 - `39.6` extends the storage rewrite to mutation: clustered same-leaf update now
   exists in storage, but no SQL `UPDATE` path uses it yet.
+- `39.7` extends that same storage rewrite to logical delete: clustered
+  delete-mark now exists in storage, but no SQL `DELETE` path uses it yet.
 - `39.1` remains open because large-row overflow cells are still deferred to
   `39.10`, even though the clustered leaf groundwork already exists in storage.

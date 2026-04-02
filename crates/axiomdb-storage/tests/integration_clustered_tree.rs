@@ -331,3 +331,93 @@ fn clustered_update_in_place_reports_heap_page_full_when_same_leaf_growth_fails(
     assert_eq!(row.row_data, vec![3u8; 2_100]);
     assert_eq!(row.row_header.txn_id_created, 1);
 }
+
+#[test]
+fn clustered_delete_mark_respects_old_and_new_snapshots_on_split_tree() {
+    let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
+    let mut root = None;
+
+    for key in 0u32..2_000 {
+        let row_len = 180 + (key as usize % 5) * 121;
+        root = Some(
+            clustered_tree::insert(
+                storage.as_mut(),
+                root,
+                &key.to_be_bytes(),
+                &row_header(1),
+                &row_bytes(key, row_len),
+            )
+            .unwrap(),
+        );
+    }
+
+    let root = root.unwrap();
+    let deleted = clustered_tree::delete_mark(
+        storage.as_mut(),
+        Some(root),
+        &1_111u32.to_be_bytes(),
+        9,
+        &TransactionSnapshot::active(9, 1),
+    )
+    .unwrap();
+    assert!(deleted);
+
+    let current = clustered_tree::lookup(
+        storage.as_ref(),
+        Some(root),
+        &1_111u32.to_be_bytes(),
+        &TransactionSnapshot::active(9, 1),
+    )
+    .unwrap();
+    assert!(current.is_none());
+
+    let new_snapshot = clustered_tree::lookup(
+        storage.as_ref(),
+        Some(root),
+        &1_111u32.to_be_bytes(),
+        &TransactionSnapshot::committed(9),
+    )
+    .unwrap();
+    assert!(new_snapshot.is_none());
+
+    let old_snapshot = clustered_tree::lookup(
+        storage.as_ref(),
+        Some(root),
+        &1_111u32.to_be_bytes(),
+        &TransactionSnapshot::committed(1),
+    )
+    .unwrap()
+    .expect("older snapshot must still see delete-marked row");
+    assert_eq!(old_snapshot.row_data, row_bytes(1_111, 301));
+    assert_eq!(old_snapshot.row_header.txn_id_created, 1);
+    assert_eq!(old_snapshot.row_header.txn_id_deleted, 9);
+    assert_eq!(old_snapshot.row_header.row_version, 0);
+
+    let current_rows: Vec<_> = clustered_tree::range(
+        storage.as_ref(),
+        Some(root),
+        Bound::Included(1_110u32.to_be_bytes().to_vec()),
+        Bound::Included(1_112u32.to_be_bytes().to_vec()),
+        &TransactionSnapshot::active(9, 1),
+    )
+    .unwrap()
+    .map(|row| row.unwrap())
+    .collect();
+    assert_eq!(current_rows.len(), 2);
+    assert_eq!(current_rows[0].key, 1_110u32.to_be_bytes());
+    assert_eq!(current_rows[1].key, 1_112u32.to_be_bytes());
+
+    let old_rows: Vec<_> = clustered_tree::range(
+        storage.as_ref(),
+        Some(root),
+        Bound::Included(1_110u32.to_be_bytes().to_vec()),
+        Bound::Included(1_112u32.to_be_bytes().to_vec()),
+        &TransactionSnapshot::committed(1),
+    )
+    .unwrap()
+    .map(|row| row.unwrap())
+    .collect();
+    assert_eq!(old_rows.len(), 3);
+    assert_eq!(old_rows[1].key, 1_111u32.to_be_bytes());
+    assert_eq!(old_rows[1].row_header.txn_id_deleted, 9);
+}
