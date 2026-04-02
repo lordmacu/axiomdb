@@ -166,6 +166,8 @@ fn execute_create_table(
                 predicate: None,
                 is_fk_index: false,
                 include_columns: vec![],
+                index_type: 0,
+                pages_per_range: 128,
             })?;
             Ok(idx_id)
         };
@@ -463,6 +465,8 @@ fn persist_fk_constraint(
                 predicate: None,
                 fillfactor: 90,
                 include_columns: vec![],
+                index_type: 0,
+                pages_per_range: 128,
             })?;
             new_idx_id
         }
@@ -762,6 +766,11 @@ fn execute_create_index(
         fillfactor: stmt.fillfactor.unwrap_or(90),
         is_fk_index: false, // user-created indexes are never FK auto-indexes
         include_columns: include_col_idxs,
+        index_type: match stmt.index_type {
+            crate::ast::IndexType::BTree => 0,
+            crate::ast::IndexType::Brin => 1,
+        },
+        pages_per_range: stmt.pages_per_range.unwrap_or(128),
     })?;
 
     // 7. Populate bloom filter for the newly created index.
@@ -1575,9 +1584,11 @@ fn alter_add_constraint(
                     .collect(),
                 unique: true,
                 if_not_exists: false,
-                predicate: None,         // UNIQUE constraints are always full indexes
-                fillfactor: None,        // use default 90
-                include_columns: vec![], // UNIQUE constraints have no included columns
+                predicate: None,
+                fillfactor: None,
+                include_columns: vec![],
+                index_type: crate::ast::IndexType::BTree,
+                pages_per_range: None,
             };
             let mut noop_bloom = crate::bloom::BloomRegistry::new();
             execute_create_index(stmt, storage, txn, &mut noop_bloom, database)?;

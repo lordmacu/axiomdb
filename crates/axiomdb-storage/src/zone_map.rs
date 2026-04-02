@@ -81,13 +81,26 @@ pub fn clear_zone_map(page: &mut Page) {
 /// Updates the zone map with a new value. If no zone map exists, initializes it.
 /// If the value extends min or max, updates accordingly.
 pub fn update_zone_map(page: &mut Page, col_idx: u8, value: i64) {
+    // Check existing slot count BEFORE taking the mutable borrow on header.
+    let existing_slots = crate::heap::num_slots(page);
     let reserved = &mut page.header_mut()._reserved;
     if reserved[ZM_VERSION_OFFSET] != ZM_VERSION_1 || reserved[ZM_COL_OFFSET] != col_idx {
         // Initialize new zone map for this column.
         reserved[ZM_VERSION_OFFSET] = ZM_VERSION_1;
         reserved[ZM_COL_OFFSET] = col_idx;
-        reserved[ZM_MIN_OFFSET..ZM_MIN_OFFSET + 8].copy_from_slice(&value.to_le_bytes());
-        reserved[ZM_MAX_OFFSET..ZM_MAX_OFFSET + 8].copy_from_slice(&value.to_le_bytes());
+        // The page may already contain rows from non-zone-map inserts.
+        // If so, use the widest possible bounds to avoid falsely skipping.
+        // For a fresh/empty page, use the exact value.
+        //
+        // Note: existing_slots counts ALL slots including the one just inserted
+        // (insert_tuple runs before update_zone_map). So >1 means pre-existing rows.
+        if existing_slots > 1 {
+            reserved[ZM_MIN_OFFSET..ZM_MIN_OFFSET + 8].copy_from_slice(&i64::MIN.to_le_bytes());
+            reserved[ZM_MAX_OFFSET..ZM_MAX_OFFSET + 8].copy_from_slice(&i64::MAX.to_le_bytes());
+        } else {
+            reserved[ZM_MIN_OFFSET..ZM_MIN_OFFSET + 8].copy_from_slice(&value.to_le_bytes());
+            reserved[ZM_MAX_OFFSET..ZM_MAX_OFFSET + 8].copy_from_slice(&value.to_le_bytes());
+        }
         return;
     }
     // Update existing zone map.

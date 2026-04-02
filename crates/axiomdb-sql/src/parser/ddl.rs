@@ -444,6 +444,23 @@ pub(crate) fn parse_create_index(p: &mut Parser, unique: bool) -> Result<Stmt, D
     p.expect(&Token::On)?;
     let table = p.parse_table_ref()?;
 
+    // Optional USING method (Phase 11.1b): btree (default) or brin.
+    let index_type = if p.eat(&Token::Using) {
+        let method = p.parse_identifier()?.to_lowercase();
+        match method.as_str() {
+            "btree" => crate::ast::IndexType::BTree,
+            "brin" => crate::ast::IndexType::Brin,
+            other => {
+                return Err(DbError::ParseError {
+                    message: format!("unknown index method: {other}; supported: btree, brin"),
+                    position: Some(p.current_pos()),
+                });
+            }
+        }
+    } else {
+        crate::ast::IndexType::BTree
+    };
+
     p.expect(&Token::LParen)?;
     let mut columns = vec![parse_index_column(p)?];
     while p.eat(&Token::Comma) {
@@ -471,49 +488,60 @@ pub(crate) fn parse_create_index(p: &mut Parser, unique: bool) -> Result<Stmt, D
         None
     };
 
-    // Optional WITH (key = value, ...) storage options (Phase 6.8).
-    // Only `fillfactor` is supported; other keys return ParseError.
-    let fillfactor: Option<u8> = if p.eat(&Token::With) {
+    // Optional WITH (key = value, ...) storage options (Phase 6.8 + 11.1b).
+    // Supported: `fillfactor` (B-Tree), `pages_per_range` (BRIN).
+    let mut fillfactor: Option<u8> = None;
+    let mut pages_per_range: Option<u32> = None;
+    if p.eat(&Token::With) {
         p.expect(&Token::LParen)?;
-        let key = p.parse_identifier()?;
-        p.expect(&Token::Eq)?;
-        let ff = match key.to_lowercase().as_str() {
-            "fillfactor" => {
-                let val = match p.peek() {
-                    Token::Integer(n) => {
-                        let n = *n;
-                        p.advance();
-                        n
-                    }
-                    other => {
-                        return Err(DbError::ParseError {
-                            message: format!("fillfactor must be an integer, found {:?}", other),
-                            position: Some(p.current_pos()),
-                        });
-                    }
-                };
-                if !(10..=100).contains(&val) {
+        loop {
+            let key = p.parse_identifier()?.to_lowercase();
+            p.expect(&Token::Eq)?;
+            let val = match p.peek() {
+                Token::Integer(n) => {
+                    let n = *n;
+                    p.advance();
+                    n
+                }
+                other => {
                     return Err(DbError::ParseError {
-                        message: "fillfactor must be between 10 and 100".into(),
+                        message: format!("{key} must be an integer, found {other:?}"),
                         position: Some(p.current_pos()),
                     });
                 }
-                val as u8
+            };
+            match key.as_str() {
+                "fillfactor" => {
+                    if !(10..=100).contains(&val) {
+                        return Err(DbError::ParseError {
+                            message: "fillfactor must be between 10 and 100".into(),
+                            position: Some(p.current_pos()),
+                        });
+                    }
+                    fillfactor = Some(val as u8);
+                }
+                "pages_per_range" => {
+                    if !(1..=65536).contains(&val) {
+                        return Err(DbError::ParseError {
+                            message: "pages_per_range must be between 1 and 65536".into(),
+                            position: Some(p.current_pos()),
+                        });
+                    }
+                    pages_per_range = Some(val as u32);
+                }
+                other => {
+                    return Err(DbError::ParseError {
+                        message: format!("unknown index option: {other}"),
+                        position: Some(p.current_pos()),
+                    });
+                }
             }
-            other => {
-                return Err(DbError::ParseError {
-                    message: format!("unknown index option: {other}"),
-                    position: Some(p.current_pos()),
-                });
+            if !p.eat(&Token::Comma) {
+                break;
             }
-        };
-        // Allow trailing comma before closing paren.
-        p.eat(&Token::Comma);
+        }
         p.expect(&Token::RParen)?;
-        Some(ff)
-    } else {
-        None
-    };
+    }
 
     Ok(Stmt::CreateIndex(CreateIndexStmt {
         if_not_exists,
@@ -524,6 +552,8 @@ pub(crate) fn parse_create_index(p: &mut Parser, unique: bool) -> Result<Stmt, D
         include_columns,
         predicate,
         fillfactor,
+        index_type,
+        pages_per_range,
     }))
 }
 

@@ -320,18 +320,37 @@ impl AggAccumulator {
             AggExpr::GroupConcat { .. } => None,
         };
 
+        // Phase 9.5b: fast-path for simple column refs — avoids eval() overhead.
+        #[inline]
+        fn fast_eval<'a>(expr: Option<&Expr>, row: &'a [Value]) -> Option<&'a Value> {
+            match expr {
+                Some(Expr::Column { col_idx, .. }) => row.get(*col_idx),
+                _ => None,
+            }
+        }
+
         match self {
             Self::CountStar { n } => *n += 1,
 
             Self::CountCol { n } => {
-                let v = eval(simple_arg.unwrap(), row)?;
-                if !matches!(v, Value::Null) {
-                    *n += 1;
+                if let Some(v) = fast_eval(simple_arg, row) {
+                    if !matches!(v, Value::Null) {
+                        *n += 1;
+                    }
+                } else {
+                    let v = eval(simple_arg.unwrap(), row)?;
+                    if !matches!(v, Value::Null) {
+                        *n += 1;
+                    }
                 }
             }
 
             Self::Sum { acc } => {
-                let v = eval(simple_arg.unwrap(), row)?;
+                let v = if let Some(v) = fast_eval(simple_arg, row) {
+                    v.clone()
+                } else {
+                    eval(simple_arg.unwrap(), row)?
+                };
                 if !matches!(v, Value::Null) {
                     *acc = Some(match acc.take() {
                         None => v,
@@ -341,10 +360,14 @@ impl AggAccumulator {
             }
 
             Self::Min { acc } => {
-                let v = eval(simple_arg.unwrap(), row)?;
+                let v = if let Some(v) = fast_eval(simple_arg, row) {
+                    v.clone()
+                } else {
+                    eval(simple_arg.unwrap(), row)?
+                };
                 if !matches!(v, Value::Null) {
                     *acc = Some(match acc.take() {
-                        None => v.clone(),
+                        None => v,
                         Some(a) => {
                             if agg_compare(&v, &a)? == std::cmp::Ordering::Less {
                                 v
@@ -357,10 +380,14 @@ impl AggAccumulator {
             }
 
             Self::Max { acc } => {
-                let v = eval(simple_arg.unwrap(), row)?;
+                let v = if let Some(v) = fast_eval(simple_arg, row) {
+                    v.clone()
+                } else {
+                    eval(simple_arg.unwrap(), row)?
+                };
                 if !matches!(v, Value::Null) {
                     *acc = Some(match acc.take() {
-                        None => v.clone(),
+                        None => v,
                         Some(a) => {
                             if agg_compare(&v, &a)? == std::cmp::Ordering::Greater {
                                 v
@@ -373,7 +400,11 @@ impl AggAccumulator {
             }
 
             Self::Avg { sum, count } => {
-                let v = eval(simple_arg.unwrap(), row)?;
+                let v = if let Some(v) = fast_eval(simple_arg, row) {
+                    v.clone()
+                } else {
+                    eval(simple_arg.unwrap(), row)?
+                };
                 if !matches!(v, Value::Null) {
                     *sum = agg_add(sum.clone(), v)?;
                     *count += 1;
@@ -731,17 +762,6 @@ fn value_to_key_bytes(v: &Value) -> Vec<u8> {
         }
     }
     buf
-}
-
-/// Session-aware GROUP BY key serialization.
-///
-/// Uses [`value_to_session_key_bytes`] so that text values are canonicalized
-/// according to the active session collation (e.g. `es` folds `José` = `jose`).
-fn group_key_bytes_session(key_values: &[Value]) -> Vec<u8> {
-    key_values
-        .iter()
-        .flat_map(value_to_session_key_bytes)
-        .collect()
 }
 
 // ── HAVING evaluator ──────────────────────────────────────────────────────────
@@ -1154,29 +1174,64 @@ fn execute_select_grouped_hash(
     // Build aggregate registry.
     let agg_exprs = collect_agg_exprs(&stmt.columns, &stmt.having);
 
+    // Phase 9.5b: Pre-analyze GROUP BY — fast path when all exprs are
+    // simple column refs (avoids eval() per row in the hot loop).
+    let group_by_col_idxs: Option<Vec<usize>> = stmt
+        .group_by
+        .iter()
+        .map(|e| match e {
+            Expr::Column { col_idx, .. } => Some(*col_idx),
+            _ => None,
+        })
+        .collect();
+
     // One-pass hash aggregation.
     let mut groups: HashMap<Vec<u8>, GroupState> = HashMap::new();
 
+    // Gap Closure Opt 3: reuse key_buf across iterations to eliminate
+    // per-row Vec allocation for GROUP BY key serialization.
+    // DuckDB uses arena allocators; PostgreSQL uses memory contexts.
+    // We reuse a single Vec<u8> — clear + extend on each row,
+    // clone only when inserting a NEW group into the HashMap.
+    let mut key_buf: Vec<u8> = Vec::with_capacity(64);
+    let mut key_values_buf: Vec<Value> = Vec::with_capacity(stmt.group_by.len());
+
     for row in &combined_rows {
-        // Evaluate GROUP BY expressions → key values.
-        let key_values: Vec<Value> = stmt
-            .group_by
-            .iter()
-            .map(|e| eval(e, row))
-            .collect::<Result<_, _>>()?;
+        // Evaluate GROUP BY expressions → key values (reuse buffer).
+        key_values_buf.clear();
+        if let Some(ref idxs) = group_by_col_idxs {
+            for &i in idxs {
+                key_values_buf.push(row.get(i).cloned().unwrap_or(Value::Null));
+            }
+        } else {
+            for e in &stmt.group_by {
+                key_values_buf.push(eval(e, row)?);
+            }
+        }
 
-        // Session-aware: folds text under Es so "José" and "jose" share a group.
-        let key_bytes = group_key_bytes_session(&key_values);
+        // Serialize key into reused buffer (no allocation if capacity sufficient).
+        key_buf.clear();
+        for v in &key_values_buf {
+            key_buf.extend_from_slice(&value_to_session_key_bytes(v));
+        }
 
-        let state = groups.entry(key_bytes).or_insert_with(|| GroupState {
-            key_values: key_values.clone(),
-            representative_row: row.clone(),
-            accumulators: agg_exprs.iter().map(AggAccumulator::new).collect(),
-        });
-
-        // Update each accumulator.
-        for (acc, agg) in state.accumulators.iter_mut().zip(&agg_exprs) {
-            acc.update(row, agg)?;
+        // HashMap lookup with borrowed key. Only clone on NEW group insertion.
+        if let Some(state) = groups.get_mut(key_buf.as_slice()) {
+            // Existing group — update accumulators, zero allocation.
+            for (acc, agg) in state.accumulators.iter_mut().zip(&agg_exprs) {
+                acc.update(row, agg)?;
+            }
+        } else {
+            // New group — must clone key and values for HashMap ownership.
+            let mut state = GroupState {
+                key_values: key_values_buf.clone(),
+                representative_row: row.clone(),
+                accumulators: agg_exprs.iter().map(AggAccumulator::new).collect(),
+            };
+            for (acc, agg) in state.accumulators.iter_mut().zip(&agg_exprs) {
+                acc.update(row, agg)?;
+            }
+            groups.insert(key_buf.clone(), state);
         }
     }
 

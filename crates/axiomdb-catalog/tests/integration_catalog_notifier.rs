@@ -178,6 +178,8 @@ fn test_create_index_fires_index_created() {
                 fillfactor: 90,
                 is_fk_index: false,
                 include_columns: vec![],
+                index_type: 0,
+                pages_per_range: 128,
             })
             .unwrap();
         (tid, iid)
@@ -256,6 +258,8 @@ fn test_delete_table_with_indexes_fires_index_dropped_per_index() {
                 fillfactor: 90,
                 is_fk_index: false,
                 include_columns: vec![],
+                index_type: 0,
+                pages_per_range: 128,
             })
             .unwrap();
         let i2 = w
@@ -271,6 +275,8 @@ fn test_delete_table_with_indexes_fires_index_dropped_per_index() {
                 fillfactor: 90,
                 is_fk_index: false,
                 include_columns: vec![],
+                index_type: 0,
+                pages_per_range: 128,
             })
             .unwrap();
         (tid, i1, i2)
@@ -342,6 +348,8 @@ fn test_delete_index_fires_index_dropped() {
                 fillfactor: 90,
                 is_fk_index: false,
                 include_columns: vec![],
+                index_type: 0,
+                pages_per_range: 128,
             })
             .unwrap();
         (tid, iid)

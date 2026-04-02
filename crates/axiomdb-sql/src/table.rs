@@ -211,6 +211,7 @@ impl TableEngine {
         mut predicate: F,
         zone_map_pred: Option<(usize, &axiomdb_storage::zone_map::ZoneMapPredicate)>,
         where_col_mask: Option<&[bool]>,
+        batch_pred: Option<&crate::eval::batch::BatchPredicate>,
     ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError>
     where
         F: FnMut(&[Value]) -> bool,
@@ -263,44 +264,266 @@ impl TableEngine {
                 visible_slots.push((slot_id, off, len));
             }
 
-            // ── Phase 2: Two-phase decode for visible slots ──────────────
-            for &(slot_id, off, len) in &visible_slots {
-                let row_data = &page.as_bytes()[off + size_of::<RowHeader>()..off + len];
+            // ── Phase 2: Predicate evaluation + decode for visible slots ──
+            // ── Phase 2: Predicate evaluation + decode ────────────────────
+            //
+            // Phase 8.2 SIMD batch path: gather column values from all visible
+            // rows into contiguous arrays, SIMD-compare (8×i32 on AVX2, 4×i32
+            // on NEON), decode only passing rows. Falls back to per-row scalar
+            // when batch_pred is None.
+            if let Some(bp) = batch_pred {
+                let page_bytes = page.as_bytes();
+                let hdr = size_of::<RowHeader>();
+                let row_slices: Vec<&[u8]> = visible_slots
+                    .iter()
+                    .map(|&(_, off, len)| &page_bytes[off + hdr..off + len])
+                    .collect();
+                let mut passed = vec![true; row_slices.len()];
+                bp.eval_batch(&row_slices, &mut passed);
 
-                if has_two_phase {
-                    // Phase 2a: decode only WHERE columns.
-                    let partial = decode_row_masked(row_data, &col_types, where_col_mask.unwrap())?;
-                    if !predicate(&partial) {
-                        continue; // Skip full decode — saves String/Text allocs.
+                for (i, &(slot_id, off, len)) in visible_slots.iter().enumerate() {
+                    if passed[i] {
+                        let row_data = &page_bytes[off + hdr..off + len];
+                        let values = decode_row(row_data, &col_types)?;
+                        result.push((
+                            RecordId {
+                                page_id: current,
+                                slot_id,
+                            },
+                            values,
+                        ));
                     }
-                    // Phase 2b: full decode for passing rows.
-                    let values = decode_row(row_data, &col_types)?;
-                    result.push((
-                        RecordId {
-                            page_id: current,
-                            slot_id,
-                        },
-                        values,
-                    ));
-                } else {
-                    // No mask: single-pass full decode + predicate.
-                    let values = decode_row(row_data, &col_types)?;
-                    if !predicate(&values) {
-                        continue;
+                }
+            } else {
+                // Scalar fallback: per-row decode + predicate evaluation.
+                for &(slot_id, off, len) in &visible_slots {
+                    let row_data = &page.as_bytes()[off + size_of::<RowHeader>()..off + len];
+
+                    if has_two_phase {
+                        let partial =
+                            decode_row_masked(row_data, &col_types, where_col_mask.unwrap())?;
+                        if !predicate(&partial) {
+                            continue;
+                        }
+                        let values = decode_row(row_data, &col_types)?;
+                        result.push((
+                            RecordId {
+                                page_id: current,
+                                slot_id,
+                            },
+                            values,
+                        ));
+                    } else {
+                        let values = decode_row(row_data, &col_types)?;
+                        if !predicate(&values) {
+                            continue;
+                        }
+                        result.push((
+                            RecordId {
+                                page_id: current,
+                                slot_id,
+                            },
+                            values,
+                        ));
                     }
-                    result.push((
-                        RecordId {
-                            page_id: current,
-                            slot_id,
-                        },
-                        values,
-                    ));
                 }
             }
 
             current = next;
         }
 
+        Ok(result)
+    }
+
+    // ── Parallel scan (Phase 9.1) ──────────────────────────────────────────
+
+    /// Minimum pages before engaging Rayon parallelism. Below this threshold,
+    /// thread spawn overhead exceeds the per-page decode savings.
+    const PARALLEL_MIN_PAGES: usize = 4;
+
+    /// Parallel filtered scan — distributes per-page decode+filter across
+    /// Rayon's thread pool (morsel-driven, DuckDB-inspired).
+    ///
+    /// **Phase 1** (serial): walk heap chain to collect page IDs.
+    /// **Phase 2** (parallel): `par_iter()` over pages — each thread reads,
+    /// applies zone map skip + BatchPredicate, decodes passing rows.
+    /// **Phase 3** (serial): flatten per-thread results.
+    ///
+    /// Falls back to single-threaded `scan_table_filtered` when the table
+    /// has fewer than `PARALLEL_MIN_PAGES` pages.
+    ///
+    /// Results may be in different order than single-threaded scan — callers
+    /// needing ORDER BY must sort after this call.
+    /// Phase 9.11: `scan_limit` enables early-exit scanning (PostgreSQL's
+    /// `ExecutorRun(count)` pattern). When `Some(n)`, the scan stops after
+    /// collecting n passing rows — avoids scanning the full table for
+    /// `SELECT ... LIMIT n` without ORDER BY. `None` means scan all rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_table_filtered_parallel<F>(
+        storage: &dyn StorageEngine,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        snap: TransactionSnapshot,
+        predicate: F,
+        zone_map_pred: Option<(usize, &axiomdb_storage::zone_map::ZoneMapPredicate)>,
+        batch_pred: Option<&crate::eval::batch::BatchPredicate>,
+        decode_mask: Option<&[bool]>,
+        scan_limit: Option<usize>,
+    ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError>
+    where
+        F: Fn(&[Value]) -> bool + Send + Sync,
+    {
+        use rayon::prelude::*;
+
+        let col_types = column_data_types(columns);
+
+        // Phase 1: serial — collect all page IDs by walking the heap chain.
+        let page_ids = Self::collect_page_ids(storage, table_def.data_root_page_id)?;
+
+        if page_ids.len() < Self::PARALLEL_MIN_PAGES {
+            // Small table: serial path (avoid Rayon overhead).
+            return Self::scan_table_filtered(
+                storage,
+                table_def,
+                columns,
+                snap,
+                predicate,
+                zone_map_pred,
+                None, // where_col_mask not needed with batch_pred
+                batch_pred,
+            );
+        }
+
+        // Phase 2: parallel — process each page independently.
+        #[allow(clippy::type_complexity)]
+        let results: Result<Vec<Vec<(RecordId, Vec<Value>)>>, DbError> = page_ids
+            .par_iter()
+            .map(|&page_id| {
+                Self::process_page_filtered(
+                    storage,
+                    page_id,
+                    snap,
+                    &col_types,
+                    &predicate,
+                    zone_map_pred,
+                    batch_pred,
+                    decode_mask,
+                )
+            })
+            .collect();
+
+        // Phase 3: flatten per-thread results + apply scan limit.
+        // PostgreSQL's ExecutePlan uses `numberTuples` to stop after limit rows.
+        let flat: Vec<_> = results?.into_iter().flatten().collect();
+        match scan_limit {
+            Some(limit) if flat.len() > limit => Ok(flat.into_iter().take(limit).collect()),
+            _ => Ok(flat),
+        }
+    }
+
+    /// Collects all heap chain page IDs starting from `root`.
+    fn collect_page_ids(storage: &dyn StorageEngine, root: u64) -> Result<Vec<u64>, DbError> {
+        let mut ids = Vec::new();
+        let mut current = root;
+        while current != 0 {
+            ids.push(current);
+            let raw = *storage.read_page(current)?.as_bytes();
+            let page = Page::from_bytes(raw)?;
+            current = heap_chain::chain_next_page(&page);
+        }
+        Ok(ids)
+    }
+
+    /// Processes a single heap page: visibility check → zone map → batch
+    /// predicate → decode passing rows. Called from parallel scan.
+    fn process_page_filtered<F>(
+        storage: &dyn StorageEngine,
+        page_id: u64,
+        snap: TransactionSnapshot,
+        col_types: &[DataType],
+        predicate: &F,
+        zone_map_pred: Option<(usize, &axiomdb_storage::zone_map::ZoneMapPredicate)>,
+        batch_pred: Option<&crate::eval::batch::BatchPredicate>,
+        decode_mask: Option<&[bool]>,
+    ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError>
+    where
+        F: Fn(&[Value]) -> bool,
+    {
+        let raw = *storage.read_page(page_id)?.as_bytes();
+        let page = Page::from_bytes(raw)?;
+
+        // Zone map skip.
+        if let Some((pred_col_idx, zmp)) = zone_map_pred {
+            if let Some(zm) = axiomdb_storage::zone_map::read_zone_map(&page) {
+                if zm.col_idx as usize == pred_col_idx
+                    && !axiomdb_storage::zone_map::zone_map_might_match(&zm, zmp)
+                {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+
+        // Selection mask: collect visible slots.
+        let num = num_slots(&page);
+        let mut visible_slots: Vec<(u16, usize, usize)> = Vec::new();
+        for slot_id in 0..num {
+            let entry = read_slot(&page, slot_id);
+            if entry.is_dead() {
+                continue;
+            }
+            let off = entry.offset as usize;
+            let len = entry.length as usize;
+            let bytes = &page.as_bytes()[off..off + len];
+            let header: &RowHeader = bytemuck::from_bytes(&bytes[..size_of::<RowHeader>()]);
+            if !header.is_visible(&snap) {
+                continue;
+            }
+            visible_slots.push((slot_id, off, len));
+        }
+
+        if visible_slots.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let hdr = size_of::<RowHeader>();
+        let page_bytes = page.as_bytes();
+
+        // BatchPredicate SIMD batch path.
+        if let Some(bp) = batch_pred {
+            let row_slices: Vec<&[u8]> = visible_slots
+                .iter()
+                .map(|&(_, off, len)| &page_bytes[off + hdr..off + len])
+                .collect();
+            let mut passed = vec![true; row_slices.len()];
+            bp.eval_batch(&row_slices, &mut passed);
+
+            let mut result = Vec::new();
+            for (i, &(slot_id, off, len)) in visible_slots.iter().enumerate() {
+                if passed[i] {
+                    let row_data = &page_bytes[off + hdr..off + len];
+                    // Phase 9.2: decode only columns in the unified mask
+                    // (SELECT ∪ WHERE ∪ ORDER BY ∪ GROUP BY). Non-masked
+                    // columns get Value::Null — saves String/Text allocation.
+                    let values = if let Some(mask) = decode_mask {
+                        decode_row_masked(row_data, col_types, mask)?
+                    } else {
+                        decode_row(row_data, col_types)?
+                    };
+                    result.push((RecordId { page_id, slot_id }, values));
+                }
+            }
+            return Ok(result);
+        }
+
+        // Scalar fallback: per-row decode + predicate.
+        let mut result = Vec::new();
+        for &(slot_id, off, len) in &visible_slots {
+            let row_data = &page_bytes[off + hdr..off + len];
+            let values = decode_row(row_data, col_types)?;
+            if predicate(&values) {
+                result.push((RecordId { page_id, slot_id }, values));
+            }
+        }
         Ok(result)
     }
 

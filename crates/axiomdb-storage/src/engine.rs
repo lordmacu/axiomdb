@@ -25,7 +25,7 @@ use crate::page_ref::PageRef;
 ///
 /// [`MmapStorage`]: crate::MmapStorage
 /// [`MemoryStorage`]: crate::MemoryStorage
-pub trait StorageEngine: Send {
+pub trait StorageEngine: Send + Sync {
     /// Returns an owned copy of page `page_id`.
     /// Verifies the checksum before returning.
     fn read_page(&self, page_id: u64) -> Result<PageRef, DbError>;

@@ -272,6 +272,8 @@ fn test_index_def_fillfactor_roundtrip() {
         fillfactor: 70,
         is_fk_index: false,
         include_columns: vec![],
+        index_type: 0,
+        pages_per_range: 128,
     };
 
     let bytes = def.to_bytes();
@@ -302,6 +304,8 @@ fn test_pre_68_index_row_reads_fillfactor_as_90() {
         fillfactor: 90,
         is_fk_index: false,
         include_columns: vec![],
+        index_type: 0,
+        pages_per_range: 128,
     };
 
     let full_bytes = def.to_bytes();

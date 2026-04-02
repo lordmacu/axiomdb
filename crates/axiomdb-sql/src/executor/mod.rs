@@ -380,6 +380,58 @@ pub fn execute(
 }
 
 /// Like [`execute`] but uses a persistent [`SessionContext`] for schema caching.
+/// Undoes index inserts accumulated in the transaction's undo log, then
+/// performs the heap-level rollback via `TxnManager::rollback()`.
+///
+/// `TxnManager` cannot depend on `axiomdb-index`, so index B-Tree deletes
+/// are handled at the executor layer. This function must be called instead
+/// of bare `txn.rollback(storage)` whenever the transaction may have
+/// performed INSERT or UPDATE operations that added B-Tree entries.
+fn rollback_with_index_undo(
+    txn: &mut TxnManager,
+    storage: &mut dyn StorageEngine,
+    bloom: &mut crate::bloom::BloomRegistry,
+) -> Result<(), DbError> {
+    // Collect index insert undos BEFORE rollback (rollback consumes the undo log).
+    let index_undos = txn.collect_index_undos();
+    for (index_id, root_page_id, key) in &index_undos {
+        let root = std::sync::atomic::AtomicU64::new(*root_page_id);
+        // Best-effort: if the key is already absent (idempotent), ignore the error.
+        let _ = BTree::delete_in(storage, &root, key);
+        bloom.mark_dirty(*index_id);
+        // If the root changed, update the catalog.
+        let new_root = root.load(std::sync::atomic::Ordering::Acquire);
+        if new_root != *root_page_id {
+            if let Ok(mut cw) = CatalogWriter::new(storage, txn) {
+                let _ = cw.update_index_root(*index_id, new_root);
+            }
+        }
+    }
+    txn.rollback(storage)
+}
+
+/// Like [`rollback_with_index_undo`] but for savepoint rollback.
+fn rollback_to_savepoint_with_index_undo(
+    txn: &mut TxnManager,
+    sp: Savepoint,
+    storage: &mut dyn StorageEngine,
+    bloom: &mut crate::bloom::BloomRegistry,
+) -> Result<(), DbError> {
+    let index_undos = txn.collect_index_undos_since(&sp);
+    for (index_id, root_page_id, key) in &index_undos {
+        let root = std::sync::atomic::AtomicU64::new(*root_page_id);
+        let _ = BTree::delete_in(storage, &root, key);
+        bloom.mark_dirty(*index_id);
+        let new_root = root.load(std::sync::atomic::Ordering::Acquire);
+        if new_root != *root_page_id {
+            if let Ok(mut cw) = CatalogWriter::new(storage, txn) {
+                let _ = cw.update_index_root(*index_id, new_root);
+            }
+        }
+    }
+    txn.rollback_to_savepoint(sp, storage)
+}
+
 pub fn execute_with_ctx(
     stmt: Stmt,
     storage: &mut dyn StorageEngine,
@@ -400,7 +452,7 @@ pub fn execute_with_ctx(
                 // Discard staged rows without writing to heap or WAL.
                 ctx.discard_pending_inserts();
                 ctx.savepoints.clear(); // all savepoints destroyed on ROLLBACK
-                return txn.rollback(storage).map(|_| QueryResult::Empty);
+                return rollback_with_index_undo(txn, storage, bloom).map(|_| QueryResult::Empty);
             }
             Stmt::Begin => {
                 let txn_id = txn.active_txn_id().unwrap_or(0);
@@ -422,14 +474,8 @@ pub fn execute_with_ctx(
                     Some(idx) => {
                         // Discard staged rows.
                         ctx.discard_pending_inserts();
-                        // Apply index undo ops for entries after this savepoint.
-                        let index_undos = txn.collect_index_undos_since(&ctx.savepoints[idx].1);
-                        for (_index_id, root_page_id, key) in index_undos {
-                            let root_pid = std::sync::atomic::AtomicU64::new(root_page_id);
-                            let _ = axiomdb_index::BTree::delete_in(storage, &root_pid, &key);
-                        }
                         let sp = ctx.savepoints[idx].1;
-                        txn.rollback_to_savepoint(sp, storage)?;
+                        rollback_to_savepoint_with_index_undo(txn, sp, storage, bloom)?;
                         // Destroy all savepoints after the target (MySQL behavior).
                         ctx.savepoints.truncate(idx + 1);
                         return Ok(QueryResult::Empty);
@@ -472,7 +518,7 @@ pub fn execute_with_ctx(
                     Ok(result)
                 }
                 Err(e) => {
-                    let _ = txn.rollback(storage);
+                    let _ = rollback_with_index_undo(txn, storage, bloom);
                     Err(e)
                 }
             };
@@ -496,23 +542,23 @@ pub fn execute_with_ctx(
             Err(e) => match ctx.on_error {
                 OnErrorMode::RollbackTransaction => {
                     ctx.discard_pending_inserts();
-                    let _ = txn.rollback(storage);
+                    let _ = rollback_with_index_undo(txn, storage, bloom);
                     Err(e)
                 }
                 OnErrorMode::Ignore if crate::session::is_ignorable_on_error(&e) => {
                     if let Some(sp) = sp_opt {
-                        let _ = txn.rollback_to_savepoint(sp, storage);
+                        let _ = rollback_to_savepoint_with_index_undo(txn, sp, storage, bloom);
                     }
                     Err(e)
                 }
                 OnErrorMode::Ignore => {
                     ctx.discard_pending_inserts();
-                    let _ = txn.rollback(storage);
+                    let _ = rollback_with_index_undo(txn, storage, bloom);
                     Err(e)
                 }
                 _ => {
                     if let Some(sp) = sp_opt {
-                        let _ = txn.rollback_to_savepoint(sp, storage);
+                        let _ = rollback_to_savepoint_with_index_undo(txn, sp, storage, bloom);
                     }
                     Err(e)
                 }
@@ -552,7 +598,7 @@ pub fn execute_with_ctx(
                         Ok(result)
                     }
                     Err(e) => {
-                        let _ = txn.rollback(storage);
+                        let _ = rollback_with_index_undo(txn, storage, bloom);
                         Err(e)
                     }
                 }
@@ -581,7 +627,7 @@ pub fn execute_with_ctx(
                         Ok(result)
                     }
                     Err(e) => {
-                        let _ = txn.rollback(storage);
+                        let _ = rollback_with_index_undo(txn, storage, bloom);
                         Err(e)
                     }
                 }
@@ -594,7 +640,7 @@ pub fn execute_with_ctx(
                         Ok(result)
                     }
                     Err(e) => {
-                        let _ = txn.rollback(storage);
+                        let _ = rollback_with_index_undo(txn, storage, bloom);
                         Err(e)
                     }
                 }
@@ -613,18 +659,20 @@ pub fn execute_with_ctx(
                     Err(e) => match ctx.on_error {
                         OnErrorMode::Ignore if crate::session::is_ignorable_on_error(&e) => {
                             if let Some(sp) = sp_opt {
-                                let _ = txn.rollback_to_savepoint(sp, storage);
+                                let _ =
+                                    rollback_to_savepoint_with_index_undo(txn, sp, storage, bloom);
                             }
                             Err(e)
                         }
                         OnErrorMode::Savepoint => {
                             if let Some(sp) = sp_opt {
-                                let _ = txn.rollback_to_savepoint(sp, storage);
+                                let _ =
+                                    rollback_to_savepoint_with_index_undo(txn, sp, storage, bloom);
                             }
                             Err(e)
                         }
                         _ => {
-                            let _ = txn.rollback(storage);
+                            let _ = rollback_with_index_undo(txn, storage, bloom);
                             Err(e)
                         }
                     },
@@ -1346,6 +1394,8 @@ mod tests {
             fillfactor: 90,
             is_fk_index: false,
             include_columns: vec![],
+            index_type: 0,
+            pages_per_range: 128,
         }
     }
 

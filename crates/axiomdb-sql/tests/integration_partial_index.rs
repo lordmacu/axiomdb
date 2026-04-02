@@ -361,6 +361,8 @@ fn test_index_def_roundtrip_with_predicate() {
         fillfactor: 90,
         is_fk_index: false,
         include_columns: vec![],
+        index_type: 0,
+        pages_per_range: 128,
     };
 
     let bytes = def.to_bytes();
@@ -389,6 +391,8 @@ fn test_index_def_roundtrip_no_predicate_backward_compat() {
         fillfactor: 90,
         is_fk_index: false,
         include_columns: vec![],
+        index_type: 0,
+        pages_per_range: 128,
     };
 
     let bytes = def.to_bytes();
@@ -419,6 +423,8 @@ fn test_pre_67_index_row_reads_predicate_as_none() {
         fillfactor: 90,
         is_fk_index: false,
         include_columns: vec![],
+        index_type: 0,
+        pages_per_range: 128,
     };
 
     let old_bytes = old_def.to_bytes();
