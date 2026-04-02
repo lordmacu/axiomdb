@@ -1,5 +1,20 @@
 # Lessons Learned
 
+## 2026-04-02 - Clustered undo must key by primary key plus exact row image, not by `(page_id, slot_id)`
+
+- A clustered row rewrite cannot reuse the heap undo contract because slotted
+  clustered pages freely defragment, split, merge, and relocate rows.
+- The right intermediate contract is:
+  - WAL `key` = exact primary-key bytes
+  - WAL payload = exact logical row image plus the latest clustered `root_pid`
+  - rollback deletes or restores by primary key, not by physical slot
+  - rollback guarantees logical row restoration, not exact page-topology reversal
+- `research/mariadb-server/storage/innobase/row/row0uins.cc`,
+  `row0umod.cc`, and `row0upd.cc` reinforced the clustered-key-first undo mindset.
+- `research/postgres/src/backend/access/nbtree/nbtxlog.c` remained a useful contrast:
+  PostgreSQL's B-tree WAL is page/topology-oriented, which is the wrong first cut
+  for AxiomDB's storage-first clustered rewrite.
+
 ## 2026-04-02 - Clustered overflow should spill only the row tail, never the key or MVCC header
 
 - The first safe large-row cut for clustered storage is not a generic TOAST subsystem and not a pointer-only row stub.

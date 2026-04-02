@@ -20,16 +20,18 @@
 //! Use [`TxnManager::autocommit`] to wrap a single operation in an implicit
 //! BEGIN / COMMIT (with automatic ROLLBACK on error).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use axiomdb_core::{error::DbError, TransactionSnapshot, TxnId};
 use axiomdb_storage::{
-    clear_deletion, heap_chain::HeapChain, mark_slot_dead, restore_tuple_image, Page,
-    StorageEngine, WalDurabilityPolicy,
+    clear_deletion, clustered_tree, heap_chain::HeapChain, mark_slot_dead, restore_tuple_image,
+    Page, StorageEngine, WalDurabilityPolicy,
 };
 
 use crate::{
     checkpoint::Checkpointer,
+    clustered::ClusteredRowImage,
     entry::{EntryType, WalEntry},
     reader::WalReader,
     recovery::{CrashRecovery, RecoveryResult},
@@ -94,6 +96,14 @@ pub enum UndoOp {
         root_page_id: u64,
         key: Vec<u8>,
     },
+    /// Undo a clustered insert by removing the inserted row by primary key.
+    UndoClusteredInsert { table_id: u32, key: Vec<u8> },
+    /// Restore the exact previous clustered row image by primary key.
+    UndoClusteredRestore {
+        table_id: u32,
+        key: Vec<u8>,
+        old_row: ClusteredRowImage,
+    },
 }
 
 // ── ActiveTxn ────────────────────────────────────────────────────────────────
@@ -117,6 +127,11 @@ struct ActiveTxn {
     /// On `commit`, this list moves to `TxnManager::committed_free_batches` keyed
     /// by `txn_id` and is freed only after `release_committed_frees(...)` is called.
     deferred_free_pages: Vec<u64>,
+    /// Latest clustered root per table touched by this transaction.
+    ///
+    /// Used by clustered rollback so undo follows the current tree shape after
+    /// earlier inserts, splits, merges, and root changes in the same txn.
+    clustered_roots: HashMap<u32, u64>,
 }
 
 // ── TxnManager ───────────────────────────────────────────────────────────────
@@ -156,6 +171,9 @@ pub struct TxnManager {
     ///
     /// Set via [`set_durability_policy`]. Orthogonal to `deferred_commit_mode`.
     durability_policy: WalDurabilityPolicy,
+    /// Last known clustered root per table after the most recent commit or
+    /// rollback. Also used to seed a new ActiveTxn.
+    last_clustered_roots: HashMap<u32, u64>,
 }
 
 impl TxnManager {
@@ -176,6 +194,7 @@ impl TxnManager {
             pending_deferred_txn_id: None,
             committed_free_batches: Vec::new(),
             durability_policy: WalDurabilityPolicy::Strict,
+            last_clustered_roots: HashMap::new(),
         })
     }
 
@@ -197,6 +216,7 @@ impl TxnManager {
             pending_deferred_txn_id: None,
             committed_free_batches: Vec::new(),
             durability_policy: WalDurabilityPolicy::Strict,
+            last_clustered_roots: HashMap::new(),
         })
     }
 
@@ -257,6 +277,7 @@ impl TxnManager {
             isolation_level,
             undo_ops: Vec::new(),
             deferred_free_pages: Vec::new(),
+            clustered_roots: self.last_clustered_roots.clone(),
         });
         Ok(txn_id)
     }
@@ -280,6 +301,7 @@ impl TxnManager {
         let active = self.active.take().ok_or(DbError::NoActiveTransaction)?;
         let txn_id = active.txn_id;
         let deferred_pages = active.deferred_free_pages;
+        self.last_clustered_roots = active.clustered_roots.clone();
 
         let mut entry = WalEntry::new(0, txn_id, EntryType::Commit, 0, vec![], vec![], vec![]);
         self.wal
@@ -575,6 +597,34 @@ impl TxnManager {
                     // Handled by caller via pending_index_undos().
                     // TxnManager cannot depend on axiomdb-index.
                 }
+                UndoOp::UndoClusteredInsert { table_id, key } => {
+                    let root_pid =
+                        clustered_root_for_undo(&active.clustered_roots, table_id, "savepoint")?;
+                    let new_root = clustered_tree::delete_physical_by_key(storage, root_pid, &key)?
+                        .ok_or_else(|| DbError::BTreeCorrupted {
+                            msg: format!(
+                                "clustered savepoint rollback could not find inserted key {:?} in table {table_id}",
+                                String::from_utf8_lossy(&key)
+                            ),
+                        })?;
+                    active.clustered_roots.insert(table_id, new_root);
+                }
+                UndoOp::UndoClusteredRestore {
+                    table_id,
+                    key,
+                    old_row,
+                } => {
+                    let root_pid =
+                        clustered_root_for_undo(&active.clustered_roots, table_id, "savepoint")?;
+                    let new_root = clustered_tree::restore_exact_row_image(
+                        storage,
+                        root_pid,
+                        &key,
+                        &old_row.row_header,
+                        &old_row.row_data,
+                    )?;
+                    active.clustered_roots.insert(table_id, new_root);
+                }
             }
         }
         Ok(())
@@ -590,7 +640,7 @@ impl TxnManager {
     /// - [`DbError::NoActiveTransaction`] if no transaction is open.
     /// - I/O errors from undo writes or WAL append.
     pub fn rollback(&mut self, storage: &mut dyn StorageEngine) -> Result<(), DbError> {
-        let active = self.active.take().ok_or(DbError::NoActiveTransaction)?;
+        let mut active = self.active.take().ok_or(DbError::NoActiveTransaction)?;
         let txn_id = active.txn_id;
 
         // Write Rollback entry — informational for crash recovery. No fsync.
@@ -632,8 +682,37 @@ impl TxnManager {
                 UndoOp::UndoIndexInsert { .. } => {
                     // Handled by caller via pending_index_undos().
                 }
+                UndoOp::UndoClusteredInsert { table_id, key } => {
+                    let root_pid =
+                        clustered_root_for_undo(&active.clustered_roots, table_id, "rollback")?;
+                    let new_root = clustered_tree::delete_physical_by_key(storage, root_pid, &key)?
+                        .ok_or_else(|| DbError::BTreeCorrupted {
+                            msg: format!(
+                                "clustered rollback could not find inserted key {:?} in table {table_id}",
+                                String::from_utf8_lossy(&key)
+                            ),
+                        })?;
+                    active.clustered_roots.insert(table_id, new_root);
+                }
+                UndoOp::UndoClusteredRestore {
+                    table_id,
+                    key,
+                    old_row,
+                } => {
+                    let root_pid =
+                        clustered_root_for_undo(&active.clustered_roots, table_id, "rollback")?;
+                    let new_root = clustered_tree::restore_exact_row_image(
+                        storage,
+                        root_pid,
+                        &key,
+                        &old_row.row_header,
+                        &old_row.row_data,
+                    )?;
+                    active.clustered_roots.insert(table_id, new_root);
+                }
             }
         }
+        self.last_clustered_roots = active.clustered_roots;
         // max_committed is unchanged — the rolled-back txn's inserts are invisible
         // to all future snapshots (txn_id_created >= snapshot_id for every future reader).
         Ok(())
@@ -1120,6 +1199,94 @@ impl TxnManager {
         Ok(())
     }
 
+    /// Records a clustered insert and tracks the latest clustered root for the
+    /// touched table.
+    pub fn record_clustered_insert(
+        &mut self,
+        table_id: u32,
+        key: &[u8],
+        new_row: &ClusteredRowImage,
+    ) -> Result<(), DbError> {
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        let mut entry = WalEntry::new(
+            0,
+            active.txn_id,
+            EntryType::ClusteredInsert,
+            table_id,
+            key.to_vec(),
+            vec![],
+            new_row.to_bytes()?,
+        );
+        self.wal
+            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
+        active.clustered_roots.insert(table_id, new_row.root_pid);
+        active.undo_ops.push(UndoOp::UndoClusteredInsert {
+            table_id,
+            key: key.to_vec(),
+        });
+        Ok(())
+    }
+
+    /// Records a clustered delete-mark and stores the exact previous row image
+    /// for rollback.
+    pub fn record_clustered_delete_mark(
+        &mut self,
+        table_id: u32,
+        key: &[u8],
+        old_row: &ClusteredRowImage,
+        new_row: &ClusteredRowImage,
+    ) -> Result<(), DbError> {
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        let mut entry = WalEntry::new(
+            0,
+            active.txn_id,
+            EntryType::ClusteredDeleteMark,
+            table_id,
+            key.to_vec(),
+            old_row.to_bytes()?,
+            new_row.to_bytes()?,
+        );
+        self.wal
+            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
+        active.clustered_roots.insert(table_id, new_row.root_pid);
+        active.undo_ops.push(UndoOp::UndoClusteredRestore {
+            table_id,
+            key: key.to_vec(),
+            old_row: old_row.clone(),
+        });
+        Ok(())
+    }
+
+    /// Records a clustered update and stores the exact previous row image for
+    /// rollback.
+    pub fn record_clustered_update(
+        &mut self,
+        table_id: u32,
+        key: &[u8],
+        old_row: &ClusteredRowImage,
+        new_row: &ClusteredRowImage,
+    ) -> Result<(), DbError> {
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        let mut entry = WalEntry::new(
+            0,
+            active.txn_id,
+            EntryType::ClusteredUpdate,
+            table_id,
+            key.to_vec(),
+            old_row.to_bytes()?,
+            new_row.to_bytes()?,
+        );
+        self.wal
+            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
+        active.clustered_roots.insert(table_id, new_row.root_pid);
+        active.undo_ops.push(UndoOp::UndoClusteredRestore {
+            table_id,
+            key: key.to_vec(),
+            old_row: old_row.clone(),
+        });
+        Ok(())
+    }
+
     // ── Index undo (Phase 7.3b) ────────────────────────────────────────────
 
     /// Records an index INSERT undo operation so that ROLLBACK can remove the
@@ -1274,6 +1441,18 @@ impl TxnManager {
         self.active.as_ref().map(|a| a.txn_id)
     }
 
+    /// Latest known clustered root for `table_id`.
+    ///
+    /// During an active transaction this returns the transaction-local root
+    /// after all clustered writes recorded so far. Otherwise it returns the
+    /// last root observed on commit or rollback.
+    pub fn clustered_root(&self, table_id: u32) -> Option<u64> {
+        self.active
+            .as_ref()
+            .and_then(|active| active.clustered_roots.get(&table_id).copied())
+            .or_else(|| self.last_clustered_roots.get(&table_id).copied())
+    }
+
     /// Mutable access to the underlying [`WalWriter`].
     ///
     /// Used by [`Checkpointer`] to append the Checkpoint entry and fsync the WAL.
@@ -1344,6 +1523,7 @@ impl TxnManager {
             pending_deferred_txn_id: None,
             committed_free_batches: Vec::new(),
             durability_policy: WalDurabilityPolicy::Strict,
+            last_clustered_roots: HashMap::new(),
         };
         Ok((mgr, result))
     }
@@ -1395,6 +1575,19 @@ pub fn decode_physical_loc(bytes: &[u8]) -> Option<(u64, u16)> {
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
+
+fn clustered_root_for_undo(
+    roots: &HashMap<u32, u64>,
+    table_id: u32,
+    stage: &str,
+) -> Result<u64, DbError> {
+    roots
+        .get(&table_id)
+        .copied()
+        .ok_or_else(|| DbError::BTreeCorrupted {
+            msg: format!("clustered {stage} missing current root for table {table_id}"),
+        })
+}
 
 /// Scans the WAL forward and returns the highest TxnId with a Commit entry.
 fn scan_max_committed(wal_path: &Path) -> Result<TxnId, DbError> {

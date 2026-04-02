@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 39.10 Overflow pages for large clustered rows — clustered leaf local-prefix + overflow-pointer format, dedicated overflow-page chains, transparent lookup/range reconstruction, and overflow-aware update/delete cleanup
+**Last completed subphase:** 39.11 WAL support for clustered operations — logical clustered WAL row images, new clustered entry types, `TxnManager` clustered root tracking, rollback/savepoint restore by primary key, and explicit crash-recovery deferral to 39.12
 
-**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, overflow-backed large rows, insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, and clustered-first secondary bookmarks now exist, but the SQL executor still uses the classic heap + secondary-index execution path
+**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, overflow-backed large rows, insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, clustered-first secondary bookmarks, and internal WAL/rollback now exist, but the SQL executor still uses the classic heap + secondary-index execution path and clustered crash recovery is still pending
 
-**Next milestone:** 39.11 — WAL support for clustered operations, followed by clustered crash recovery wiring
+**Next milestone:** 39.12 — clustered crash recovery wiring for the new logical row-image WAL path
 
 **Concurrency note:** the current server already supports concurrent read-only
 queries, but mutating statements are still serialized through a database-wide
@@ -123,7 +123,7 @@ locking clauses.
 | 36 | AxiomQL Core | ⚠️ Planned | Alternative read query language over the same AST/executor |
 | 37 | AxiomQL Write + DDL + Control | ⚠️ Planned | AxiomQL DML, DDL, control flow, maintenance |
 | 38 | AxiomDB-Wasm | ⚠️ Planned | Browser runtime, OPFS backend, sync, live queries |
-| 39 | Clustered index storage engine | 🔄 In progress | Inline PK rows, clustered internal/leaf pages, PK bookmarks in secondary indexes |
+| 39 | Clustered index storage engine | 🔄 In progress | Inline PK rows, clustered internal/leaf pages, PK bookmarks in secondary indexes, logical clustered WAL/rollback |
 
 ---
 

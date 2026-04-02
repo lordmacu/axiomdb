@@ -1,6 +1,6 @@
 # Phase 39 — Clustered Index Storage Engine
 
-## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7, 39.8, 39.9, 39.10
+## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7, 39.8, 39.9, 39.10, 39.11
 
 ## What was built
 
@@ -401,6 +401,65 @@ pages now support large-row overflow instead of rejecting those rows outright.
   - adds update transition coverage across overflow boundaries
   - adds delete-mark coverage proving the overflow chain survives until later purge
 
+### 39.11 — WAL support for clustered operations
+
+`crates/axiomdb-wal` now has the first clustered-row WAL contract, and
+`TxnManager` can now undo clustered writes inside a running transaction or
+savepoint.
+
+The clustered WAL path is intentionally logical rather than slot-addressed:
+
+- `EntryType::ClusteredInsert = 12`
+- `EntryType::ClusteredDeleteMark = 13`
+- `EntryType::ClusteredUpdate = 14`
+- the WAL `key` stores primary-key bytes, not `(page_id, slot_id)`
+- `old_value` / `new_value` store a `ClusteredRowImage`:
+  - `root_pid`
+  - exact `RowHeader`
+  - exact logical row bytes
+
+Behavior:
+
+- clustered insert appends a `ClusteredInsert` record and pushes clustered undo
+  as `delete_physical_by_key(...)`
+- clustered delete-mark and clustered update append row-image WAL and push
+  clustered undo as `restore_exact_row_image(...)`
+- `TxnManager` now tracks the latest clustered `root_pid` per `table_id`
+  inside the active transaction, so rollback follows the current tree shape even
+  after split / merge / relocate-update
+- rollback and `ROLLBACK TO SAVEPOINT` now restore logical clustered row state
+  by primary key and exact row image, including overflow-backed rows
+- clustered recovery now recognizes the new entry types and rejects unresolved
+  in-progress clustered transactions explicitly until `39.12` adds replay
+
+The rollback invariant is logical row restoration, not exact page-topology
+reversal. A relocate-update may still leave the tree physically shaped
+differently after rollback as long as the owning primary key, `RowHeader`, and
+row bytes match the pre-change state.
+
+### Supporting changes for 39.11
+
+- `crates/axiomdb-wal/src/clustered.rs`
+  - adds `ClusteredRowImage` with exact row-image codec for clustered WAL
+- `crates/axiomdb-wal/src/entry.rs`
+  - adds `EntryType::{ClusteredInsert, ClusteredDeleteMark, ClusteredUpdate}`
+  - extends entry-type roundtrip coverage for the clustered payloads
+- `crates/axiomdb-wal/src/txn.rs`
+  - adds clustered undo variants and clustered `root_pid` tracking per `table_id`
+  - adds `record_clustered_insert(...)`, `record_clustered_delete_mark(...)`,
+    and `record_clustered_update(...)`
+  - wires clustered rollback and savepoint undo through the clustered tree helpers
+- `crates/axiomdb-wal/src/recovery.rs`
+  - recognizes clustered entry types during WAL scans
+  - fails explicitly when recovery would need to replay an unresolved in-progress
+    clustered transaction before `39.12`
+- `crates/axiomdb-storage/src/clustered_tree.rs`
+  - adds `delete_physical_by_key(...)` for rollback of clustered inserts
+  - adds `restore_exact_row_image(...)` for rollback of clustered delete/update
+- `crates/axiomdb-wal/tests/integration_clustered_wal.rs`
+  - adds rollback/savepoint coverage for insert, delete-mark, update, relocate-update,
+    and overflow-backed rows
+
 ## Validation
 
 Targeted validation passed:
@@ -580,6 +639,24 @@ New clustered overflow coverage now includes:
 - update transitions inline → overflow and overflow → inline
 - delete-mark preserving the overflow chain until later purge
 
+Targeted validation for `39.11` also passed:
+
+- `cargo test -p axiomdb-wal -j1`
+- `cargo test -p axiomdb-storage clustered_tree --lib -j1`
+- `cargo clippy -p axiomdb-wal --tests -- -D warnings`
+- `cargo clippy -p axiomdb-storage --lib -- -D warnings`
+- `cargo fmt --check`
+- `mdbook build docs-site`
+
+New clustered WAL coverage now includes:
+
+- WAL-entry roundtrip for `ClusteredInsert`, `ClusteredDeleteMark`, and `ClusteredUpdate`
+- rollback of clustered insert after root changes across many inserts
+- rollback of clustered delete-mark restoring the old `RowHeader` and row bytes
+- rollback of overflow-backed clustered update restoring the old large row image
+- rollback of relocate-update restoring the old logical row even after structural rewrite
+- `ROLLBACK TO SAVEPOINT` undoing only the later clustered writes
+
 ## Review notes
 
 - All `39.3` acceptance criteria from the spec are implemented.
@@ -590,18 +667,21 @@ New clustered overflow coverage now includes:
 - All `39.8` acceptance criteria from the spec are implemented.
 - All `39.9` acceptance criteria from the spec are implemented.
 - All `39.10` acceptance criteria from the spec are implemented.
+- All `39.11` acceptance criteria from the spec are implemented.
 - No `unsafe` was introduced in the clustered tree path.
 - No production `unwrap()` remains in the touched clustered files.
 - No production `unwrap()` was introduced in the new clustered-secondary path.
 - No production `unwrap()` was introduced in the new clustered-overflow path.
+- No production `unwrap()` was introduced in the new clustered WAL / rollback path.
 - Benchmarking remains intentionally deferred: `39.5` finishes the storage-level
   clustered read slice, and `39.6` / `39.7` / `39.8` / `39.9` add the first clustered mutation, rebalance, and bookmark slices,
-  `39.10` adds overflow-backed row storage, but end-to-end clustered DML benchmarks still wait for later SQL-visible integration.
+  `39.10` adds overflow-backed row storage, `39.11` adds internal WAL/rollback support,
+  but end-to-end clustered DML benchmarks still wait for later SQL-visible integration.
 
 ## Deferred
 
 - `39.18` — physical purge of dead clustered cells
-- `39.11+` — WAL and crash recovery for clustered operations
+- `39.12+` — crash recovery and replay for clustered WAL operations
 - `39.13+` — executor integration for clustered tables
 
 ## Notes
@@ -629,3 +709,7 @@ New clustered overflow coverage now includes:
   large logical rows no longer stop at an explicit reject path; they now spill
   their tail bytes to dedicated overflow pages while keeping PK bytes and
   `RowHeader` inline in the clustered leaf.
+- `39.11` keeps the same storage-first boundary:
+  clustered rollback and savepoint undo now exist inside `axiomdb-wal`, but the
+  SQL executor still does not expose clustered tables and crash recovery replay
+  for clustered entries still belongs to `39.12`.

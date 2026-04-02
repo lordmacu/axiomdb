@@ -358,6 +358,44 @@ pub fn update_with_relocation(
     Ok(Some(new_root))
 }
 
+/// Physically removes the current clustered row for `key`, if present.
+///
+/// This helper is intended for rollback/undo paths that must remove the current
+/// version regardless of MVCC visibility rules.
+pub fn delete_physical_by_key(
+    storage: &mut dyn StorageEngine,
+    root_pid: u64,
+    key: &[u8],
+) -> Result<Option<u64>, DbError> {
+    let (deleted, new_root) = delete_physical(storage, root_pid, key)?;
+    if deleted {
+        Ok(Some(new_root))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Restores the exact clustered row image for `key`.
+///
+/// If a current version of `key` exists, it is physically removed first. The
+/// replacement row is then inserted with the provided `RowHeader` and logical
+/// row bytes, allocating a fresh overflow chain when needed.
+pub fn restore_exact_row_image(
+    storage: &mut dyn StorageEngine,
+    root_pid: u64,
+    key: &[u8],
+    row_header: &RowHeader,
+    row_data: &[u8],
+) -> Result<u64, DbError> {
+    validate_row_payload(key, row_data)?;
+
+    let root_after_delete = match delete_physical_by_key(storage, root_pid, key)? {
+        Some(new_root) => new_root,
+        None => root_pid,
+    };
+    insert(storage, Some(root_after_delete), key, row_header, row_data)
+}
+
 fn delete_physical(
     storage: &mut dyn StorageEngine,
     root_pid: u64,

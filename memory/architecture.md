@@ -1,13 +1,15 @@
 # Architecture Notes
 
-## 2026-04-02 — Clustered internal page primitive, clustered insert/read/update/delete/rebalance, clustered secondary bookmarks, and clustered overflow pages
+## 2026-04-02 — Clustered internal page primitive, clustered insert/read/update/delete/rebalance, clustered secondary bookmarks, clustered overflow pages, and clustered WAL support
 
 - `crates/axiomdb-storage/src/clustered_internal.rs` owns the clustered
   internal page format for Phase `39.2`.
 - `crates/axiomdb-storage/src/clustered_tree.rs` now owns the first clustered
-  tree controller for Phases `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, and `39.10`.
+  tree controller for Phases `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.10`, and `39.11`.
 - `crates/axiomdb-storage/src/clustered_overflow.rs` now owns the overflow-page
   chain primitive for large clustered rows in Phase `39.10`.
+- `crates/axiomdb-wal/src/clustered.rs` now owns the logical row-image codec for
+  clustered WAL in Phase `39.11`.
 - `crates/axiomdb-sql/src/clustered_secondary.rs` now owns the clustered-first
   secondary bookmark layout for Phase `39.9`.
 - The architecture still keeps storage and tree responsibilities separate:
@@ -55,7 +57,7 @@
   - stamp `txn_id_deleted` on the current inline version only when it is visible
   - preserve key bytes, row payload bytes, `txn_id_created`, `row_version`, and `next_leaf`
   - keep the physical cell inline so older snapshots can still observe it
-  - defer purge, merge, undo, and WAL to later clustered phases
+  - defer purge and crash recovery replay to later clustered phases
 - The clustered structural-maintenance contract is now also explicit:
   - `update_with_relocation(...)` uses `update_in_place(...)` as the fast path
   - physical delete is private helper logic, not the public delete API
@@ -70,6 +72,12 @@
   - scanned secondary entries decode into a logical secondary key plus a full PK bookmark
   - relocate-only updates are secondary no-ops when both the logical secondary key and PK stay stable
   - the old `RecordId` payload in `axiomdb-index::BTree` is retained only for compatibility with the fixed page format
+- The clustered WAL contract is now also explicit:
+  - clustered WAL keys use primary-key bytes, not `(page_id, slot_id)`
+  - clustered undo payloads store exact logical row images plus the latest clustered `root_pid`
+  - `TxnManager` tracks clustered roots per `table_id` during the active transaction
+  - rollback restores logical row state, not exact pre-change page topology
+  - clustered crash-recovery replay remains a separate `39.12` concern
 - Variable-size occupancy is measured in encoded bytes, not key count:
   - clustered leaves split by cumulative cell footprint
   - clustered internals split by cumulative separator footprint

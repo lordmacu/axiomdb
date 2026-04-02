@@ -94,6 +94,24 @@ pub enum EntryType {
     /// Crash recovery undoes an uncommitted `PageDelete` by clearing
     /// `txn_id_deleted` for each slot — identical to undoing N `Delete` entries.
     PageDelete = 11,
+    /// Insert of a clustered row keyed by primary key.
+    ///
+    /// `key`       = primary key bytes.
+    /// `old_value` = empty.
+    /// `new_value` = encoded clustered row image.
+    ClusteredInsert = 12,
+    /// Delete-mark of a clustered row keyed by primary key.
+    ///
+    /// `key`       = primary key bytes.
+    /// `old_value` = encoded clustered row image before delete-mark.
+    /// `new_value` = encoded clustered row image after delete-mark.
+    ClusteredDeleteMark = 13,
+    /// Update of a clustered row keyed by primary key.
+    ///
+    /// `key`       = primary key bytes.
+    /// `old_value` = encoded clustered row image before update.
+    /// `new_value` = encoded clustered row image after update.
+    ClusteredUpdate = 14,
 }
 
 impl TryFrom<u8> for EntryType {
@@ -112,6 +130,9 @@ impl TryFrom<u8> for EntryType {
             9 => Ok(Self::PageWrite),
             10 => Ok(Self::UpdateInPlace),
             11 => Ok(Self::PageDelete),
+            12 => Ok(Self::ClusteredInsert),
+            13 => Ok(Self::ClusteredDeleteMark),
+            14 => Ok(Self::ClusteredUpdate),
             _ => Err(DbError::WalUnknownEntryType { byte }),
         }
     }
@@ -375,6 +396,8 @@ impl WalEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ClusteredRowImage;
+    use axiomdb_storage::RowHeader;
 
     fn make_insert(lsn: u64) -> WalEntry {
         WalEntry::new(
@@ -390,10 +413,37 @@ mod tests {
 
     #[test]
     fn test_entry_type_roundtrip() {
-        for byte in [1u8, 2, 3, 4, 5, 6, 7, 8] {
+        for byte in [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] {
             let et = EntryType::try_from(byte).unwrap();
             assert_eq!(et as u8, byte);
         }
+    }
+
+    #[test]
+    fn test_roundtrip_clustered_insert() {
+        let image = ClusteredRowImage::new(
+            77,
+            RowHeader {
+                txn_id_created: 9,
+                txn_id_deleted: 0,
+                row_version: 2,
+                _flags: 5,
+            },
+            b"clustered-row",
+        );
+        let entry = WalEntry::new(
+            100,
+            42,
+            EntryType::ClusteredInsert,
+            7,
+            b"pk:1".to_vec(),
+            vec![],
+            image.to_bytes().unwrap(),
+        );
+
+        let (parsed, consumed) = WalEntry::from_bytes(&entry.to_bytes()).unwrap();
+        assert_eq!(consumed, entry.serialized_len());
+        assert_eq!(parsed, entry);
     }
 
     #[test]
