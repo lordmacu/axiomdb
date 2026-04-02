@@ -1,14 +1,14 @@
 # Architecture Notes
 
-## 2026-04-02 — Clustered internal page primitive and first tree write path
+## 2026-04-02 — Clustered internal page primitive, clustered insert, and clustered point lookup
 
 - `crates/axiomdb-storage/src/clustered_internal.rs` owns the clustered
   internal page format for Phase `39.2`.
 - `crates/axiomdb-storage/src/clustered_tree.rs` now owns the first clustered
-  tree controller for Phase `39.3`.
+  tree controller for Phases `39.3` and `39.4`.
 - The architecture still keeps storage and tree responsibilities separate:
   - storage owns page layout, free-space accounting, binary search, and page-local mutation
-  - `clustered_tree` owns descent, split planning, separator propagation, and root growth
+  - `clustered_tree` owns descent, exact leaf search, split planning, separator propagation, and root growth
   - the executor is still not wired to clustered tables
 - The child mapping rule remains explicit:
   - `leftmost_child` lives in the 16-byte page-local header
@@ -20,6 +20,11 @@
   - old page ID stays as the left page
   - only the new right sibling is allocated
   - parent propagation inserts only `(separator_key, right_child_pid)`
+- The clustered point-lookup contract is currently one-version only:
+  - visible current inline row → return it
+  - missing key → `None`
+  - invisible current inline row → `None`
+  - no undo/version-chain reconstruction until later clustered MVCC phases
 - Variable-size occupancy is measured in encoded bytes, not key count:
   - clustered leaves split by cumulative cell footprint
   - clustered internals split by cumulative separator footprint

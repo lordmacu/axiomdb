@@ -1,5 +1,15 @@
 # Lessons Learned
 
+## 2026-04-02 - When clustered lookup exists before undo, treat invisible current versions explicitly
+
+- A storage-first clustered point lookup can safely return the current inline version only if it is visible to the supplied snapshot.
+- If clustered undo/version chains do not exist yet, do not guess how to reconstruct an older version.
+- The honest intermediate contract is:
+  - visible current version → return row
+  - key absent → `None`
+  - current version invisible → `None`
+- Writing that down in the spec avoids quietly baking “invisible means deleted” into later phases when it actually means “older-version lookup not implemented yet”.
+
 ## 2026-04-02 - Variable-size clustered trees must split by byte volume and keep the left page stable
 
 - A clustered B-tree cannot reuse fixed-layout split intuition where “half the keys” is close to “half the page”.

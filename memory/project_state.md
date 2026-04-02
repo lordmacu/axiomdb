@@ -2,13 +2,18 @@
 
 ## 2026-04-02
 
-- Phase 39 subphases `39.2` and `39.3` are closed in code, targeted validation,
+- Phase 39 subphases `39.2`, `39.3`, and `39.4` are closed in code, targeted validation,
   and docs.
 - `axiomdb-storage` now has the first complete clustered-tree write path:
   - `PageType::ClusteredInternal = 6`
   - storage module `crates/axiomdb-storage/src/clustered_internal.rs`
   - storage module `crates/axiomdb-storage/src/clustered_tree.rs`
   - `clustered_tree::insert(storage, root_opt, key, row_header, row_data) -> Result<u64, DbError>`
+- `axiomdb-storage` now also has the first clustered-tree read path:
+  - `clustered_tree::lookup(storage, root_opt, key, snapshot) -> Result<Option<ClusteredRow>, DbError>`
+  - exact root-to-leaf descent over clustered internal pages
+  - exact leaf search returning inline row bytes
+  - MVCC filtering via `RowHeader::is_visible(&TransactionSnapshot)`
 - Clustered tree behavior now includes:
   - empty-tree root bootstrap into `ClusteredLeaf`
   - descent over `ClusteredInternal` via `find_child_idx()`
@@ -21,7 +26,11 @@
 - The clustered rewrite remains storage-first:
   - current `axiomdb-index::BTree` still uses fixed-slot `InternalNodePage` / `LeafNodePage`
   - no SQL path creates or writes clustered tables yet
-  - `39.4` / `39.5` will add lookup and range-scan traversal over the new leaf chain
+  - no SQL path reads clustered tables yet either
+  - `39.5` will add leaf-chain range scan traversal over the new clustered pages
+- Current clustered lookup limitation:
+  - if the current inline version is invisible to the snapshot, `lookup()` returns `None`
+  - older-version reconstruction remains deferred to clustered undo/version-chain work
 - `39.1` is still not fully closed:
   - clustered leaf groundwork exists
   - large-row overflow remains deferred to `39.10`

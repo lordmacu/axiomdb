@@ -1,4 +1,4 @@
-use axiomdb_core::error::DbError;
+use axiomdb_core::{error::DbError, TransactionSnapshot};
 use axiomdb_storage::{
     clustered_internal, clustered_leaf, clustered_tree, MemoryStorage, PageType, RowHeader,
     StorageEngine,
@@ -98,4 +98,52 @@ fn clustered_insert_keeps_ten_thousand_rows_sorted_across_root_splits() {
         let expected = (idx as u32).to_be_bytes();
         assert_eq!(key.as_slice(), expected.as_slice());
     }
+}
+
+#[test]
+fn clustered_lookup_returns_inline_rows_after_many_splits() {
+    let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
+    let mut root = None;
+
+    for key in 0u32..10_000 {
+        let row_len = 128 + (key as usize % 6) * 173;
+        root = Some(
+            clustered_tree::insert(
+                storage.as_mut(),
+                root,
+                &key.to_be_bytes(),
+                &row_header((key % 23) as u64 + 1),
+                &row_bytes(key, row_len),
+            )
+            .unwrap(),
+        );
+    }
+
+    let root_pid = root.unwrap();
+    let snapshot = TransactionSnapshot::committed(10_000);
+
+    for probe in [0u32, 7, 63, 511, 4096, 9999] {
+        let row = clustered_tree::lookup(
+            storage.as_ref(),
+            Some(root_pid),
+            &probe.to_be_bytes(),
+            &snapshot,
+        )
+        .unwrap()
+        .expect("probe key must exist");
+
+        let expected_len = 128 + (probe as usize % 6) * 173;
+        assert_eq!(row.key, probe.to_be_bytes());
+        assert_eq!(row.row_data, row_bytes(probe, expected_len));
+        assert_eq!(row.row_header.txn_id_created, (probe % 23) as u64 + 1);
+    }
+
+    let missing = clustered_tree::lookup(
+        storage.as_ref(),
+        Some(root_pid),
+        &10_001u32.to_be_bytes(),
+        &snapshot,
+    )
+    .unwrap();
+    assert!(missing.is_none());
 }

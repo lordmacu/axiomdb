@@ -4,7 +4,7 @@
 //! tree controller for clustered pages without yet replacing the heap+index
 //! executor path.
 
-use axiomdb_core::error::DbError;
+use axiomdb_core::{error::DbError, TransactionSnapshot};
 
 use crate::{
     clustered_internal, clustered_leaf,
@@ -29,6 +29,13 @@ struct OwnedInternalCell {
 enum InsertResult {
     Inserted,
     Split { sep_key: Vec<u8>, right_pid: u64 },
+}
+
+#[derive(Debug, Clone)]
+pub struct ClusteredRow {
+    pub key: Vec<u8>,
+    pub row_header: RowHeader,
+    pub row_data: Vec<u8>,
 }
 
 /// Inserts one full row into a clustered B-tree and returns the effective root
@@ -63,6 +70,36 @@ pub fn insert(
             Ok(root_pid)
         }
     }
+}
+
+/// Looks up one full row by primary key in a clustered B-tree and returns the
+/// current inline version when it is visible to `snapshot`.
+pub fn lookup(
+    storage: &dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    snapshot: &TransactionSnapshot,
+) -> Result<Option<ClusteredRow>, DbError> {
+    let Some(root_pid) = root_pid else {
+        return Ok(None);
+    };
+
+    let leaf = descend_to_leaf(storage, root_pid, key)?;
+    let pos = match leaf_search_checked(&leaf, key)? {
+        Ok(pos) => pos,
+        Err(_) => return Ok(None),
+    };
+
+    let cell = clustered_leaf::read_cell(&leaf, pos as u16)?;
+    if !cell.row_header.is_visible(snapshot) {
+        return Ok(None);
+    }
+
+    Ok(Some(ClusteredRow {
+        key: cell.key.to_vec(),
+        row_header: cell.row_header,
+        row_data: cell.row_data.to_vec(),
+    }))
 }
 
 fn insert_subtree(
@@ -263,6 +300,30 @@ fn collect_leaf_cells(page: &Page) -> Result<Vec<OwnedLeafCell>, DbError> {
     Ok(cells)
 }
 
+fn descend_to_leaf(
+    storage: &dyn StorageEngine,
+    mut pid: u64,
+    key: &[u8],
+) -> Result<crate::PageRef, DbError> {
+    loop {
+        let page = storage.read_page(pid)?;
+        match clustered_page_type(&page)? {
+            PageType::ClusteredLeaf => return Ok(page),
+            PageType::ClusteredInternal => {
+                let child_idx = clustered_internal::find_child_idx(&page, key)?;
+                pid = clustered_internal::child_at(&page, child_idx as u16)?;
+            }
+            other => {
+                return Err(DbError::BTreeCorrupted {
+                    msg: format!(
+                        "clustered tree encountered unsupported page type {other:?} at page {pid}"
+                    ),
+                });
+            }
+        }
+    }
+}
+
 fn collect_internal_cells(page: &Page) -> Result<Vec<OwnedInternalCell>, DbError> {
     let num_cells = clustered_internal::num_cells(page);
     let mut cells = Vec::with_capacity(num_cells as usize);
@@ -434,6 +495,7 @@ fn write_page(storage: &mut dyn StorageEngine, pid: u64, page: &mut Page) -> Res
 mod tests {
     use super::*;
     use crate::{clustered_internal, clustered_leaf, MemoryStorage};
+    use axiomdb_core::TransactionSnapshot;
 
     fn row_header(txn_id: u64) -> RowHeader {
         RowHeader {
@@ -448,6 +510,14 @@ mod tests {
         (0..len)
             .map(|idx| ((seed as usize + idx) % 251) as u8)
             .collect()
+    }
+
+    fn committed_snapshot(max_committed: u64) -> TransactionSnapshot {
+        TransactionSnapshot::committed(max_committed)
+    }
+
+    fn active_snapshot(txn_id: u64, max_committed: u64) -> TransactionSnapshot {
+        TransactionSnapshot::active(txn_id, max_committed)
     }
 
     fn leftmost_leaf_pid(storage: &dyn StorageEngine, mut pid: u64) -> Result<u64, DbError> {
@@ -683,6 +753,92 @@ mod tests {
         let max = clustered_leaf::max_inline_row_bytes(key.len()).unwrap();
         let err = insert(&mut storage, None, key, &row_header(1), &vec![0u8; max + 1]).unwrap_err();
         assert!(matches!(err, DbError::ValueTooLarge { .. }));
+    }
+
+    #[test]
+    fn lookup_empty_tree_returns_none() {
+        let storage = MemoryStorage::new();
+        let got = lookup(&storage, None, b"missing", &committed_snapshot(100)).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn lookup_root_leaf_hit_returns_inline_row() {
+        let mut storage = MemoryStorage::new();
+        let root = insert(&mut storage, None, b"pk-1", &row_header(3), b"row-inline").unwrap();
+
+        let got = lookup(&storage, Some(root), b"pk-1", &committed_snapshot(10))
+            .unwrap()
+            .expect("row must exist");
+
+        assert_eq!(got.key, b"pk-1");
+        assert_eq!(got.row_data, b"row-inline");
+        assert_eq!(got.row_header.txn_id_created, 3);
+    }
+
+    #[test]
+    fn lookup_missing_key_returns_none() {
+        let mut storage = MemoryStorage::new();
+        let mut root = None;
+        for key in [b"alpha".as_slice(), b"bravo", b"charlie"] {
+            root = Some(insert(&mut storage, root, key, &row_header(1), b"row").unwrap());
+        }
+
+        let got = lookup(&storage, root, b"delta", &committed_snapshot(10)).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn lookup_invisible_current_version_returns_none() {
+        let mut storage = MemoryStorage::new();
+        let root = insert(
+            &mut storage,
+            None,
+            b"future",
+            &row_header(9),
+            b"not-committed-yet",
+        )
+        .unwrap();
+
+        let invisible = lookup(&storage, Some(root), b"future", &committed_snapshot(4)).unwrap();
+        assert!(invisible.is_none());
+
+        let visible_to_self = lookup(&storage, Some(root), b"future", &active_snapshot(9, 4))
+            .unwrap()
+            .expect("own write must be visible");
+        assert_eq!(visible_to_self.row_data, b"not-committed-yet");
+    }
+
+    #[test]
+    fn lookup_after_internal_splits_finds_exact_row() {
+        let mut storage = MemoryStorage::new();
+        let mut root = None;
+
+        for key in 0u32..128 {
+            root = Some(
+                insert(
+                    &mut storage,
+                    root,
+                    &key.to_be_bytes(),
+                    &row_header(1),
+                    &row_bytes(key, 3_000 + (key as usize % 3) * 97),
+                )
+                .unwrap(),
+            );
+        }
+
+        let root = root.unwrap();
+        let got = lookup(
+            &storage,
+            Some(root),
+            &93u32.to_be_bytes(),
+            &committed_snapshot(10),
+        )
+        .unwrap()
+        .expect("row must exist after splits");
+
+        assert_eq!(got.key, 93u32.to_be_bytes());
+        assert_eq!(got.row_data, row_bytes(93, 3_000));
     }
 
     #[test]
