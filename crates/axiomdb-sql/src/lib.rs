@@ -11,6 +11,7 @@
 pub mod analyzer;
 pub mod ast;
 pub mod bloom;
+pub mod clustered_secondary;
 pub mod eval;
 pub mod executor;
 pub mod expr;

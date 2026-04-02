@@ -423,9 +423,54 @@ Current limitations:
 
 - `delete_mark(...)` still keeps dead clustered cells inline; `39.8` does not
   expose purge to SQL or storage callers yet.
-- secondary-index bookmark maintenance for relocated rows is still deferred to `39.9`.
+- relocate-update still rewrites only the current inline version.
 - parent separator repair currently assumes the repaired separator still fits in
   the existing internal page budget; split-on-separator-repair is deferred.
+
+### Clustered Secondary Bookmarks (Phase 39.9)
+
+Phase `39.9` adds the first clustered-first secondary-index layout in
+`axiomdb-sql/src/clustered_secondary.rs`.
+
+The physical key is:
+
+```text
+secondary_logical_key ++ missing_primary_key_columns
+```
+
+Where:
+
+1. `secondary_logical_key` is the ordered value vector of the secondary index columns.
+2. `missing_primary_key_columns` are only the PK columns that are not already
+   present in the secondary key.
+
+That means the physical secondary entry now carries enough information to
+recover the owning clustered row by primary key without depending on a heap
+`RecordId`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Bookmark In The Key</span>
+InnoDB secondary records carry clustered-key fields, and SQLite `WITHOUT ROWID` appends the table key to secondary indexes. AxiomDB adapts that same idea in 39.9 by embedding the missing PK columns in the physical secondary key instead of inventing a clustered-only side payload.
+</div>
+</div>
+
+The dedicated helpers now provide:
+
+- layout derivation from `(secondary_idx, primary_idx)`
+- encode/decode of bookmark-bearing secondary keys
+- logical-prefix bounds without a fixed 10-byte RID suffix
+- insert/delete/update maintenance where relocate-only updates become no-ops if
+  the logical secondary key and primary key stay stable
+
+Current boundary:
+
+- this path is **not** wired into the heap-backed SQL executor yet
+- FK enforcement and index-integrity rebuilds still use the old
+  `RecordId`-based secondary path
+- the legacy `RecordId` payload in `axiomdb-index::BTree` remains only a
+  compatibility artifact for this path
 
 ---
 

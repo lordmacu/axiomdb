@@ -1,11 +1,13 @@
 # Architecture Notes
 
-## 2026-04-02 — Clustered internal page primitive, clustered insert, point lookup, range scan, same-leaf update, delete-mark, and structural rebalance
+## 2026-04-02 — Clustered internal page primitive, clustered insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, and clustered secondary bookmarks
 
 - `crates/axiomdb-storage/src/clustered_internal.rs` owns the clustered
   internal page format for Phase `39.2`.
 - `crates/axiomdb-storage/src/clustered_tree.rs` now owns the first clustered
   tree controller for Phases `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, and `39.8`.
+- `crates/axiomdb-sql/src/clustered_secondary.rs` now owns the clustered-first
+  secondary bookmark layout for Phase `39.9`.
 - The architecture still keeps storage and tree responsibilities separate:
   - storage owns page layout, free-space accounting, binary search, and page-local mutation
   - `clustered_tree` owns descent, exact leaf search, split planning, separator propagation, and root growth
@@ -51,6 +53,12 @@
   - leaf merge preserves `next_leaf`
   - an empty internal root collapses to its only child
   - current separator repair assumes the repaired key still fits on the parent page
+- The clustered secondary-bookmark contract is now explicit:
+  - physical secondary key = `secondary_logical_key ++ missing_primary_key_columns`
+  - missing PK columns are derived from the primary index definition, not hard-coded in catalog
+  - scanned secondary entries decode into a logical secondary key plus a full PK bookmark
+  - relocate-only updates are secondary no-ops when both the logical secondary key and PK stay stable
+  - the old `RecordId` payload in `axiomdb-index::BTree` is retained only for compatibility with the fixed page format
 - Variable-size occupancy is measured in encoded bytes, not key count:
   - clustered leaves split by cumulative cell footprint
   - clustered internals split by cumulative separator footprint

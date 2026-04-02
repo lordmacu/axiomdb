@@ -2,7 +2,7 @@
 
 ## 2026-04-02
 
-- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, and `39.8` are closed in code, targeted validation,
+- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, and `39.9` are closed in code, targeted validation,
   and docs.
 - `axiomdb-storage` now has the first complete clustered-tree write path:
   - `PageType::ClusteredInternal = 6`
@@ -46,7 +46,8 @@
   - `update_in_place()` remains same-leaf only in `39.6`
   - `update_with_relocation()` now handles same-page failure by physical delete + reinsert + rebalance
   - old-version visibility after relocate-update still depends on future clustered undo/WAL phases
-  - relocated rows still do not maintain secondary-index bookmarks
+  - clustered-first secondary bookmark maintenance now exists in `crates/axiomdb-sql/src/clustered_secondary.rs`
+  - the SQL-visible heap executor, FK enforcement, and index-integrity rebuild path still use `RecordId`-based secondaries
   - parent separator repair still assumes the repaired separator fits on the current internal page
 - Current clustered delete limitation:
   - delete-mark keeps the physical cell inline in `39.7`

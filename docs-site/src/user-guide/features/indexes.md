@@ -23,7 +23,8 @@ That internal rewrite is still honest about its current boundary:
 
 - relocate-update rewrites only the current inline version
 - clustered delete is still delete-mark first, not purge
-- secondary-index bookmark maintenance for relocated rows does not exist yet
+- clustered-first secondary bookmarks now exist internally, but the SQL-visible
+  executor still uses heap `RecordId` secondary indexes
 
 <div class="callout callout-tip">
 <span class="callout-icon">💡</span>
@@ -701,6 +702,11 @@ separate primary key column, keeping the suffix at a fixed 10 bytes regardless
 of the table's key type.
 </div>
 </div>
+
+Phase `39.9` adds a second, internal-only secondary-key path for the clustered
+rewrite: there the physical entry is `secondary_key ++ missing_primary_key_columns`
+so a future clustered executor can jump from a secondary entry to the owning
+PRIMARY KEY row without depending on a heap slot. That path is not SQL-visible yet.
 
 ---
 

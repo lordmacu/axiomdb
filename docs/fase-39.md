@@ -1,6 +1,6 @@
 # Phase 39 — Clustered Index Storage Engine
 
-## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7, 39.8
+## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7, 39.8, 39.9
 
 ## What was built
 
@@ -300,6 +300,53 @@ Important boundary for this subphase:
 - `crates/axiomdb-storage/tests/integration_clustered_tree.rs`
   - adds split-tree integration coverage for relocate-update through lookup and range scan
 
+### 39.9 — Secondary indexes with PK bookmarks
+
+`crates/axiomdb-sql/src/clustered_secondary.rs` now implements the first
+clustered-first secondary-index path.
+
+The new API is intentionally separate from the current heap-backed
+`index_maintenance` path:
+
+- `ClusteredSecondaryLayout::derive(secondary_idx, primary_idx) -> Result<..., DbError>`
+- `entry_from_row(row) -> Result<Option<ClusteredSecondaryEntry>, DbError>`
+- `decode_entry_key(physical_key) -> Result<ClusteredSecondaryEntry, DbError>`
+- `logical_prefix_bounds(logical_prefix) -> Result<(Vec<u8>, Vec<u8>), DbError>`
+- `scan_prefix(storage, root_page_id, logical_prefix) -> Result<Vec<...>, DbError>`
+- `insert_row(...)`, `delete_row(...)`, `update_row(...)`
+
+Behavior:
+
+- the physical secondary key is `secondary_logical_key ++ missing_primary_key_columns`
+- scanned secondary entries decode back into both the logical secondary key and
+  the full primary-key bookmark
+- duplicate logical secondary keys remain ordered by appended PK values
+- relocate-only updates become secondary no-ops when the logical secondary key
+  and primary key stay stable
+- the legacy fixed-size `RecordId` payload in `axiomdb-index::BTree` is treated
+  only as a compatibility artifact for this path, not as row identity
+
+Important boundary for this subphase:
+
+- the current SQL-visible heap executor still uses `RecordId`-based secondary indexes
+- FK enforcement, planner/index scans, and index-integrity rebuilds are not yet
+  switched to the clustered bookmark path
+- the clustered bookmark path exists so future clustered executor work can probe
+  `secondary -> primary key -> clustered row` without depending on physical row location
+
+### Supporting changes for 39.9
+
+- `crates/axiomdb-sql/src/clustered_secondary.rs`
+  - adds layout derivation from secondary + primary `IndexDef`
+  - adds physical-key encode/decode helpers for `secondary ++ missing_pk_suffix`
+  - adds logical-prefix scan bounds without fixed 10-byte RID assumptions
+  - adds insert/delete/update maintenance helpers over the existing `BTree`
+  - adds unique-logical-key checks for bookmark-bearing secondaries
+- `crates/axiomdb-sql/src/lib.rs`
+  - exports `clustered_secondary`
+- `crates/axiomdb-sql/tests/integration_clustered_secondary.rs`
+  - adds integration coverage for duplicate logical keys, bookmark decode, delete, and relocate-stable maintenance
+
 ## Validation
 
 Targeted validation passed:
@@ -442,6 +489,24 @@ New clustered structural coverage now includes:
 - relocate-update fallback after same-leaf `HeapPageFull`
 - integration validation through lookup and range scan after relocate-update
 
+Targeted validation for `39.9` also passed:
+
+- `cargo test -p axiomdb-sql clustered_secondary --lib -j1`
+- `cargo test -p axiomdb-sql --test integration_clustered_secondary -j1`
+- `cargo check -p axiomdb-sql --lib -j1`
+- `cargo fmt --check`
+- `cargo clippy -p axiomdb-sql --lib -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity -A clippy::needless_borrow`
+- `mdbook build docs-site`
+
+New clustered secondary bookmark coverage now includes:
+
+- layout derivation when the secondary key already contains part of the primary key
+- physical-key encode/decode roundtrip into logical-key + primary-key bookmark values
+- duplicate logical keys ordered by appended PK bookmark values
+- delete of one bookmark-bearing secondary entry without touching sibling bookmarks
+- relocate-only update becoming a no-op when logical secondary key and PK remain stable
+- unique-logical-key rejection for bookmark-bearing secondaries
+
 ## Review notes
 
 - All `39.3` acceptance criteria from the spec are implemented.
@@ -450,15 +515,16 @@ New clustered structural coverage now includes:
 - All `39.6` acceptance criteria from the spec are implemented.
 - All `39.7` acceptance criteria from the spec are implemented.
 - All `39.8` acceptance criteria from the spec are implemented.
+- All `39.9` acceptance criteria from the spec are implemented.
 - No `unsafe` was introduced in the clustered tree path.
 - No production `unwrap()` remains in the touched clustered files.
+- No production `unwrap()` was introduced in the new clustered-secondary path.
 - Benchmarking remains intentionally deferred: `39.5` finishes the storage-level
-  clustered read slice, and `39.6` / `39.7` / `39.8` add the first clustered mutation and rebalance slices,
+  clustered read slice, and `39.6` / `39.7` / `39.8` / `39.9` add the first clustered mutation, rebalance, and bookmark slices,
   but end-to-end clustered DML benchmarks still wait for later SQL-visible integration.
 
 ## Deferred
 
-- `39.9` — secondary-index bookmark maintenance for clustered relocation
 - `39.18` — physical purge of dead clustered cells
 - `39.11+` — WAL and crash recovery for clustered operations
 - `39.13+` — executor integration for clustered tables
@@ -480,5 +546,9 @@ New clustered structural coverage now includes:
 - `39.8` extends that same storage rewrite to structural maintenance:
   clustered rebalance and relocate-update now exist in storage, but no SQL
   `UPDATE` / `DELETE` path uses them yet.
+- `39.9` extends that same clustered rewrite to secondary identity:
+  bookmark-bearing secondary keys now exist as a dedicated path, but the SQL
+  executor, FK enforcement, and index-integrity rebuilds still use the classic
+  heap `RecordId` secondary model.
 - `39.1` remains open because large-row overflow cells are still deferred to
   `39.10`, even though the clustered leaf groundwork already exists in storage.
