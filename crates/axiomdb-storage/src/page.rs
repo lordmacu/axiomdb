@@ -26,6 +26,9 @@ pub enum PageType {
     /// Clustered index leaf page — stores full row data inline in B-tree leaves.
     /// Uses SQLite-style cell pointer array for variable-size cells.
     ClusteredLeaf = 5,
+    /// Clustered index internal page — variable-size separator keys plus child
+    /// pointers stored in a slotted-page layout.
+    ClusteredInternal = 6,
 }
 
 impl TryFrom<u8> for PageType {
@@ -39,6 +42,7 @@ impl TryFrom<u8> for PageType {
             3 => Ok(PageType::Overflow),
             4 => Ok(PageType::Free),
             5 => Ok(PageType::ClusteredLeaf),
+            6 => Ok(PageType::ClusteredInternal),
             _ => Err(DbError::ParseError {
                 message: format!("unknown page_type: {v}"),
                 position: None,
@@ -289,6 +293,8 @@ mod tests {
             (2, PageType::Index),
             (3, PageType::Overflow),
             (4, PageType::Free),
+            (5, PageType::ClusteredLeaf),
+            (6, PageType::ClusteredInternal),
         ] {
             assert_eq!(PageType::try_from(byte).unwrap(), expected);
         }

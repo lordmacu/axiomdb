@@ -37,27 +37,28 @@ bytes are the page header; the remaining `PAGE_BODY_SIZE = 16,320` bytes are the
 ```text
 Offset   Size   Field            Description
 ──────── ────── ──────────────── ──────────────────────────────────────
-     0      4   magic            0xAXIOM_DB — identifies valid pages
-     4      1   page_type        PageType enum (see below)
-     5      3   _pad             alignment padding
-     8      4   checksum         CRC32c of bytes [12..PAGE_SIZE)
-    12      8   page_id          This page's own ID (self-identifying)
-    20      8   lsn              Log Sequence Number of last write
-    28      2   free_start       First free byte offset in the body (for heap pages)
-    30      2   free_end         Last free byte offset in the body (for heap pages)
-    32     32   _reserved        Future use (flags, epoch, etc.)
+     0      8   magic            `PAGE_MAGIC` — identifies valid pages
+     8      1   page_type        PageType enum (see below)
+     9      1   flags            page flags (`PAGE_FLAG_ALL_VISIBLE`, future bits)
+    10      2   item_count       item/slot count for the page-local format
+    12      4   checksum         CRC32c of body bytes `[HEADER_SIZE..PAGE_SIZE]`
+    16      8   page_id          This page's own ID (self-identifying)
+    24      8   lsn              Log Sequence Number of last write
+    32      2   free_start       First free byte offset in the body (format-specific)
+    34      2   free_end         Last free byte offset in the body (format-specific)
+    36     28   _reserved        Future use
 Total:    64 bytes
 ```
 
-The CRC32c checksum covers all bytes from offset 12 to the end of the page (4 bytes
-for the checksum field itself are excluded). On every `read_page`, AxiomDB verifies
-the checksum and returns `DbError::ChecksumMismatch` if it fails.
+The CRC32c checksum covers only the page body `[HEADER_SIZE..PAGE_SIZE]`, not the
+header itself. On every `read_page`, AxiomDB verifies the checksum and returns
+`DbError::ChecksumMismatch` if it fails.
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
-<span class="callout-label">Design Decision — CRC32c Instead of Double-Write Buffer</span>
-Traditional engines (InnoDB) use a double-write buffer to detect partial page writes caused by a crash mid-flush. AxiomDB instead uses per-page CRC32c checksums: if a page's checksum fails on read, the WAL is replayed to reconstruct the correct state. Same crash-safety guarantee — zero write amplification.
+<span class="callout-label">Design Decision — CRC32c Plus Separate Doublewrite</span>
+InnoDB historically coupled torn-page repair to an internal doublewrite area in the system tablespace. AxiomDB keeps the page format simpler: per-page CRC32c detects corruption, and the repair copy lives in a separate `.dw` file instead of inside the main database file.
 </div>
 </div>
 
@@ -65,13 +66,59 @@ Traditional engines (InnoDB) use a double-write buffer to detect partial page wr
 
 ```rust
 pub enum PageType {
-    Meta     = 1,  // page 0: database header + catalog root
-    Data     = 2,  // heap pages holding table rows
-    Index    = 3,  // B+ Tree internal and leaf nodes
-    Overflow = 4,  // continuation pages for large values (TOAST)
-    Free     = 5,  // pages in the freelist (tracked but unused)
+    Meta              = 0,  // page 0: database header + catalog roots
+    Data              = 1,  // heap pages holding table rows
+    Index             = 2,  // current fixed-slot B+ Tree internal and leaf nodes
+    Overflow          = 3,  // continuation pages for large values
+    Free              = 4,  // freelist / unused pages
+    ClusteredLeaf     = 5,  // slotted clustered leaf: full PK row inline
+    ClusteredInternal = 6,  // slotted clustered internal: varlen separators
 }
 ```
+
+### Clustered Page Primitives (Phase 39.1 / 39.2)
+
+The clustered index rewrite is landing in the storage layer first. Two new page
+types now exist even though the SQL executor still uses the classic heap +
+secondary-index path:
+
+- `ClusteredLeaf` — slotted page with variable-size cells storing:
+  - `key_len`
+  - `row_len`
+  - inline `RowHeader`
+  - primary-key bytes
+  - row payload bytes
+- `ClusteredInternal` — slotted page with variable-size separator cells storing:
+  - `right_child`
+  - `key_len`
+  - separator key bytes
+
+`ClusteredInternal` keeps one extra child pointer in the header as
+`leftmost_child`, so logical child access still follows the classical B-tree
+rule `n keys -> n + 1 children`.
+
+```text
+ClusteredInternal body:
+  [16B header: is_leaf | num_cells | cell_content_start | freeblock_offset | leftmost_child]
+  [cell pointer array]
+  [free gap]
+  [cells: right_child | key_len | key_bytes]
+```
+
+That design keeps the storage primitive compatible with the current traversal
+contract:
+
+- `find_child_idx(search_key)` returns the first separator strictly greater than the key
+- `child_at(0)` reads `leftmost_child`
+- `child_at(i > 0)` reads the `right_child` of separator cell `i - 1`
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — SQLite-Style Slots, B-Tree Semantics</span>
+SQLite-style slotted pages solve variable-size key storage cleanly, but clustered internal pages still need classic B-tree child semantics. AxiomDB adapts the pattern by storing `leftmost_child` in the header and the remaining children inside separator cells, avoiding the fixed 64-byte key cap of the old `InternalNodePage`.
+</div>
+</div>
 
 ---
 

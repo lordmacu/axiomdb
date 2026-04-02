@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 22b.3a Database catalog + `CREATE/DROP DATABASE` — persisted database metadata, catalog-backed `SHOW DATABASES`, validated `USE` / `COM_INIT_DB`, and legacy fallback to `axiomdb`
+**Last completed subphase:** 39.2 Clustered internal page format — storage-layer slotted internal pages with variable-size separator keys, `leftmost_child` in the header, right-child-per-cell mapping, binary search, insert/remove, and defragmentation
 
-**Active development:** 22b.3b cross-database name resolution and queries
+**Active development:** Phase 39 clustered index storage rewrite — the new clustered page primitives are being built in storage first, before replacing the current heap + secondary-index execution path
 
-**Next milestone:** 22b.3b — `database.schema.table` and cross-database SELECT / JOIN / DML
+**Next milestone:** 39.3 — clustered insert path over the new page primitives, followed by clustered lookup and scan
 
 **Concurrency note:** the current server already supports concurrent read-only
 queries, but mutating statements are still serialized through a database-wide
@@ -114,6 +114,16 @@ locking clauses.
 | 20 | Column store (HTAP) | ⚠️ Planned |
 | 21 | VECTOR index (ANN) | ⚠️ Planned |
 | 22–34 | Distributed, cloud-native, AI/ML | ⚠️ Future |
+
+### Block 4 — Platform Surfaces and Storage Evolution
+
+| Phase | Name | Status | Key deliverables |
+|-------|------|--------|-----------------|
+| 35 | Deployment and DevEx | ⚠️ Planned | Docker, config tooling, release UX |
+| 36 | AxiomQL Core | ⚠️ Planned | Alternative read query language over the same AST/executor |
+| 37 | AxiomQL Write + DDL + Control | ⚠️ Planned | AxiomQL DML, DDL, control flow, maintenance |
+| 38 | AxiomDB-Wasm | ⚠️ Planned | Browser runtime, OPFS backend, sync, live queries |
+| 39 | Clustered index storage engine | 🔄 In progress | Inline PK rows, clustered internal/leaf pages, PK bookmarks in secondary indexes |
 
 ---
 

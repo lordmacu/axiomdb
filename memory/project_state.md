@@ -1,5 +1,29 @@
 # Project State
 
+## 2026-04-02
+
+- Phase 39 subphase `39.2` is closed in code, targeted validation, and docs.
+- `axiomdb-storage` now has a clustered internal page primitive:
+  - `PageType::ClusteredInternal = 6`
+  - storage module `crates/axiomdb-storage/src/clustered_internal.rs`
+  - slotted variable-size separator keys
+  - `leftmost_child` in the page header
+  - `right_child` stored per separator cell
+- The new page-local API covers:
+  - initialization
+  - key and child access
+  - child updates
+  - binary-search child selection
+  - insert / remove
+  - free-space accounting
+  - defragmentation
+- The clustered rewrite remains storage-first:
+  - current `axiomdb-index::BTree` still uses fixed-slot `InternalNodePage` / `LeafNodePage`
+  - `39.3+` will wire clustered pages into the actual tree and executor paths
+- `39.1` is still not fully closed:
+  - clustered leaf groundwork exists
+  - large-row overflow remains deferred to `39.10`
+
 ## 2026-03-29
 
 - `crates/axiomdb-sql/tests/integration_executor.rs` was split into targeted

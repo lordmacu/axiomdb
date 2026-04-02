@@ -1247,6 +1247,31 @@
 
 ---
 
+### Phase 39 — Clustered index storage engine `🔄` week 131-135
+- [ ] 39.1 ⏳ Clustered leaf page format — variable-size slotted leaf pages storing full rows inline; closure still pending large-row overflow support and final acceptance
+- [ ] ⚠️ 39.1 large-row overflow cells remain open — revisit in 39.10
+- [x] 39.2 ✅ Clustered internal page format — `PageType::ClusteredInternal`, slotted variable-size separator keys, `leftmost_child` header slot, right-child-per-cell mapping, binary search, insert/remove/defragment, and unit coverage in `axiomdb-storage`
+- [ ] 39.3 ⏳ Clustered B-Tree insert — insert full rows into clustered leaves and propagate separators upward
+- [ ] 39.4 ⏳ Clustered B-Tree point lookup — return row data directly from clustered leaf pages
+- [ ] 39.5 ⏳ Clustered B-Tree range scan — leaf-chain traversal over clustered pages
+- [ ] 39.6 ⏳ Clustered B-Tree update in place — patch non-key columns directly on clustered cells
+- [ ] 39.7 ⏳ Clustered B-Tree delete — MVCC delete-mark on clustered cells
+- [ ] 39.8 ⏳ Clustered B-Tree split and merge — volume-based split and underflow merge for variable-size cells
+- [ ] 39.9 ⏳ Secondary indexes with PK bookmarks — store PK values instead of RecordIds
+- [ ] 39.10 ⏳ Overflow pages for large rows — spill large clustered rows out of leaf pages
+- [ ] 39.11 ⏳ WAL support for clustered operations — redo/undo entries for clustered inserts, deletes, updates, and splits
+- [ ] 39.12 ⏳ Crash recovery for clustered index — clustered-tree integrity after crash and repair
+- [ ] 39.13 ⏳ Executor integration: CREATE TABLE with clustered index
+- [ ] 39.14 ⏳ Executor integration: INSERT into clustered table
+- [ ] 39.15 ⏳ Executor integration: SELECT from clustered table
+- [ ] 39.16 ⏳ Executor integration: UPDATE on clustered table
+- [ ] 39.17 ⏳ Executor integration: DELETE from clustered table
+- [ ] 39.18 ⏳ VACUUM for clustered index — reclaim dead cells and overflow pages
+- [ ] 39.19 ⏳ Table rebuild: heap to clustered migration
+- [ ] 39.20 ⏳ Integration tests and benchmarks for clustered tables
+
+---
+
 ## USE CASE PROFILES
 
 Each profile maps a target workload to the minimum set of subfases needed to make

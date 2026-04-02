@@ -190,7 +190,9 @@ fn read_cell_at_offset(page: &Page, body_off: u16) -> Result<CellRef<'_>, DbErro
     let abs = HEADER_SIZE + body_off as usize;
     let b = page.as_bytes();
     if abs + CELL_META_SIZE + ROW_HEADER_SIZE > PAGE_SIZE {
-        return Err(DbError::Other("clustered_leaf: cell header truncated".into()));
+        return Err(DbError::Other(
+            "clustered_leaf: cell header truncated".into(),
+        ));
     }
     let key_len = u16::from_le_bytes([b[abs], b[abs + 1]]) as usize;
     let row_len = u16::from_le_bytes([b[abs + 2], b[abs + 3]]) as usize;
@@ -321,8 +323,7 @@ fn allocate_from_freeblocks(page: &mut Page, size: usize) -> Option<u16> {
                 let b = page.as_bytes_mut();
                 let new_abs = HEADER_SIZE + new_fb_off as usize;
                 b[new_abs..new_abs + 2].copy_from_slice(&next.to_le_bytes());
-                b[new_abs + 2..new_abs + 4]
-                    .copy_from_slice(&(remainder as u16).to_le_bytes());
+                b[new_abs + 2..new_abs + 4].copy_from_slice(&(remainder as u16).to_le_bytes());
                 // Update previous pointer to new freeblock.
                 if let Some(prev) = prev_off {
                     let prev_abs = HEADER_SIZE + prev as usize;
@@ -651,7 +652,10 @@ mod tests {
         remove_cell(&mut page, 5).unwrap();
         assert_eq!(num_cells(&page), 9);
         let space_after = free_space(&page);
-        assert!(space_after > space_before, "free space should increase after remove");
+        assert!(
+            space_after > space_before,
+            "free space should increase after remove"
+        );
 
         // Insert a new cell — should reuse freed space.
         let new_key = 5u32.to_be_bytes();
@@ -698,7 +702,10 @@ mod tests {
         for i in 0..10u16 {
             let cell = read_cell(&page, i).unwrap();
             let expected_key = ((i as u32) * 2 + 1).to_be_bytes();
-            assert_eq!(cell.key, &expected_key, "cell {i} key mismatch after defrag");
+            assert_eq!(
+                cell.key, &expected_key,
+                "cell {i} key mismatch after defrag"
+            );
             assert_eq!(cell.row_data, b"test_data_here!!");
         }
     }

@@ -160,6 +160,46 @@ Offset   Size   Field       Description
 Total:  16,295 bytes ≤ PAGE_BODY_SIZE ✓
 ```
 
+This fixed-layout page is still the format used by the current production
+`axiomdb-index::BTree`. Phase 39 does **not** mutate this structure in place.
+Instead, the clustered rewrite is introducing separate storage-layer page
+primitives for clustered leaves and clustered internal nodes.
+
+### Clustered Internal Primitive (Phase 39.2)
+
+The new clustered internal page lives in `axiomdb-storage`, not in the current
+`axiomdb-index` tree code. It uses a slotted variable-size layout:
+
+```text
+[ClusteredInternalHeader: 16B]
+  is_leaf = 0
+  num_cells
+  cell_content_start
+  freeblock_offset
+  leftmost_child
+[CellPtr array]
+[Free gap]
+[Cells: right_child | key_len | key_bytes]
+```
+
+The important compatibility rule is semantic, not structural:
+
+- separator keys stay sorted
+- `find_child_idx(search_key)` still returns the first separator strictly greater than the search key
+- logical child `0` comes from `leftmost_child`
+- logical child `i > 0` comes from separator cell `i - 1`
+
+That lets the clustered storage rewrite preserve B-tree navigation behavior
+without reusing the old fixed-size `MAX_KEY_LEN = 64` layout.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Preserve Traversal Contract</span>
+The clustered rewrite rejects the simpler "just keep a second variable-size child array" approach. Encoding `leftmost_child` in the header and `right_child` in each separator cell keeps page-local mutation simple while preserving the exact traversal semantics the current tree already depends on.
+</div>
+</div>
+
 ### Leaf Node (`LeafNodePage`)
 
 ```text
@@ -490,7 +530,7 @@ upfront with a single sorted pass — no background merge worker required.
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
 <span class="callout-label">Design Decision</span>
-`range_in` returns `Vec<(RecordId, Vec<u8>)>` rather than an iterator to avoid
+<code>range_in</code> returns <code>Vec&lt;(RecordId, Vec&lt;u8&gt;)&gt;</code> rather than an iterator to avoid
 lifetime conflicts between the borrow of storage needed to drive the iterator and the
 caller's existing `&mut storage` borrow. The heap reads happen after the range scan
 completes, which requires full ownership of the results.
