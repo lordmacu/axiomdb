@@ -7,6 +7,7 @@
 //! - 3.6: Checkpoint (`Checkpointer`)
 
 mod checkpoint;
+mod clustered;
 mod entry;
 pub mod fsync_pipeline;
 mod reader;
@@ -17,6 +18,7 @@ mod txn;
 mod writer;
 
 pub use checkpoint::Checkpointer;
+pub use clustered::ClusteredRowImage;
 pub use entry::{EntryType, WalEntry, MIN_ENTRY_LEN};
 pub use fsync_pipeline::{AcquireResult, CommitRx, FsyncPipeline};
 pub use reader::{BackwardIter, ForwardIter, WalReader};

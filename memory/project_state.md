@@ -2,7 +2,7 @@
 
 ## 2026-04-02
 
-- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.9`, and `39.10` are closed in code, targeted validation,
+- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.9`, `39.10`, and `39.11` are closed in code, targeted validation,
   and docs.
 - `axiomdb-storage` now has the first complete clustered-tree write path:
   - `PageType::ClusteredInternal = 6`
@@ -35,6 +35,13 @@
   - transparent logical-row reconstruction in clustered lookup and range scan
   - overflow-aware same-leaf update transitions (`inline -> overflow -> inline`)
   - physical delete freeing obsolete clustered overflow chains
+- `axiomdb-wal` now has the first clustered WAL / rollback path:
+  - `crates/axiomdb-wal/src/clustered.rs`
+  - `ClusteredRowImage { root_pid, row_header, row_data }`
+  - `EntryType::{ClusteredInsert, ClusteredDeleteMark, ClusteredUpdate}`
+  - `TxnManager` clustered root tracking per `table_id`
+  - rollback / savepoint restore by primary key and exact row image
+  - rollback helpers `delete_physical_by_key(...)` and `restore_exact_row_image(...)`
 - The clustered rewrite remains storage-first:
   - current `axiomdb-index::BTree` still uses fixed-slot `InternalNodePage` / `LeafNodePage`
   - no SQL path creates or writes clustered tables yet
@@ -44,11 +51,11 @@
   - clustered delete-mark now exists internally, but no SQL path uses it yet
 - Current clustered lookup limitation:
   - if the current inline version is invisible to the snapshot, `lookup()` returns `None`
-  - older-version reconstruction remains deferred to clustered undo/version-chain work
+  - older-version reconstruction remains deferred beyond the new rollback-only clustered WAL path
 - Current clustered update limitation:
   - `update_in_place()` remains same-leaf only in `39.6`, but same-leaf growth can now use overflow pages in `39.10`
   - `update_with_relocation()` now handles same-page failure by physical delete + reinsert + rebalance
-  - old-version visibility after relocate-update still depends on future clustered undo/WAL phases
+  - old-version visibility after relocate-update still depends on future clustered version-chain work
   - clustered-first secondary bookmark maintenance now exists in `crates/axiomdb-sql/src/clustered_secondary.rs`
   - the SQL-visible heap executor, FK enforcement, and index-integrity rebuild path still use `RecordId`-based secondaries
   - parent separator repair still assumes the repaired separator fits on the current internal page
@@ -56,11 +63,15 @@
   - delete-mark keeps the physical cell inline in `39.7`
   - `39.8` adds private structural rebalance helpers, but public clustered delete still does not purge dead rows
   - clustered purge after delete still depends on later phases
-  - rollback / WAL / recovery for clustered delete still depend on future clustered WAL phases
+  - clustered crash recovery replay still depends on `39.12`
 - `39.1` is now effectively closed by `39.10`:
   - clustered leaves support both inline rows and overflow-backed rows
   - primary key bytes and `RowHeader` remain inline in the leaf
   - generic TOAST/compression/WAL/recovery still belong to later phases
+- Current clustered WAL limitation:
+  - rollback and `ROLLBACK TO SAVEPOINT` are implemented for clustered rows
+  - `open_with_recovery()` recognizes clustered entries but still rejects unresolved in-progress clustered transactions explicitly
+  - clustered crash-recovery replay remains deferred to `39.12`
 
 ## 2026-03-29
 

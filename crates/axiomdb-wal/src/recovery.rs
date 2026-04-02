@@ -111,6 +111,9 @@ impl CrashRecovery {
                     | EntryType::Truncate
                     | EntryType::PageWrite
                     | EntryType::PageDelete
+                    | EntryType::ClusteredInsert
+                    | EntryType::ClusteredDeleteMark
+                    | EntryType::ClusteredUpdate
                     | EntryType::Checkpoint => {}
                 },
                 // Truncated or corrupt entry at the end of WAL (e.g. process crashed
@@ -142,6 +145,7 @@ impl CrashRecovery {
         let mut committed: HashSet<u64> = HashSet::new();
         // in_progress: txn_id → ops in chronological order (will be reversed on undo)
         let mut in_progress: HashMap<u64, Vec<RecoveryOp>> = HashMap::new();
+        let mut unsupported_clustered_txns: HashSet<u64> = HashSet::new();
 
         for result in reader.scan_forward(checkpoint_lsn)? {
             let entry = match result {
@@ -159,10 +163,12 @@ impl CrashRecovery {
                 EntryType::Commit => {
                     committed.insert(entry.txn_id);
                     in_progress.remove(&entry.txn_id);
+                    unsupported_clustered_txns.remove(&entry.txn_id);
                 }
                 EntryType::Rollback => {
                     // Already rolled back — no undo needed.
                     in_progress.remove(&entry.txn_id);
+                    unsupported_clustered_txns.remove(&entry.txn_id);
                 }
                 EntryType::Insert => {
                     if let Some(ops) = in_progress.get_mut(&entry.txn_id) {
@@ -274,8 +280,16 @@ impl CrashRecovery {
                     if let Some(ops) = in_progress.get_mut(&entry.txn_id) {
                         // key = root_page_id as 8 bytes LE
                         if entry.key.len() >= 8 {
-                            let root_page_id =
-                                u64::from_le_bytes(entry.key[..8].try_into().unwrap());
+                            let root_page_id = u64::from_le_bytes([
+                                entry.key[0],
+                                entry.key[1],
+                                entry.key[2],
+                                entry.key[3],
+                                entry.key[4],
+                                entry.key[5],
+                                entry.key[6],
+                                entry.key[7],
+                            ]);
                             ops.push(RecoveryOp::Truncate {
                                 root_page_id,
                                 txn_id: entry.txn_id,
@@ -283,7 +297,22 @@ impl CrashRecovery {
                         }
                     }
                 }
+                EntryType::ClusteredInsert
+                | EntryType::ClusteredDeleteMark
+                | EntryType::ClusteredUpdate => {
+                    if in_progress.contains_key(&entry.txn_id) {
+                        unsupported_clustered_txns.insert(entry.txn_id);
+                    }
+                }
             }
+        }
+
+        if let Some(txn_id) = unsupported_clustered_txns.iter().copied().min() {
+            return Err(DbError::NotImplemented {
+                feature: format!(
+                    "clustered crash recovery for in-progress txn {txn_id} (Phase 39.12)"
+                ),
+            });
         }
 
         // ── Phase: UndoingInProgress ──────────────────────────────────────────

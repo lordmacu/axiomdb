@@ -195,13 +195,14 @@ Lookup flow:
 In `39.4`, lookup is intentionally conservative about invisible rows: when the
 current inline version fails MVCC visibility, it returns `None` instead of
 trying to synthesize an older version. Clustered undo/version-chain traversal
-does not exist yet; it arrives later with clustered update/delete/WAL work.
+for arbitrary snapshots still does not exist; `39.11` adds rollback/savepoint
+restore for clustered writes, but not older-version reconstruction on reads.
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
 <span class="callout-label">Design Decision — Invisible Means Absent For Now</span>
-PostgreSQL and InnoDB can reconstruct older visible versions because they already have undo/version-chain machinery. AxiomDB deliberately does not fake that in 39.4: until clustered undo exists, an invisible current inline version is reported as `None` instead of inventing semantics the engine cannot prove.
+PostgreSQL and InnoDB can reconstruct older visible versions because they already have undo/version-chain machinery. AxiomDB deliberately does not fake that in 39.4: even after 39.11 adds rollback-only clustered WAL, an invisible current inline version is still reported as `None` until true older-version reconstruction exists.
 </div>
 </div>
 
@@ -258,9 +259,9 @@ PostgreSQL uses bounded prefetch windows instead of reading arbitrarily far ahea
 </div>
 </div>
 
-Like `39.4`, this subphase is still honest about missing undo support. If a row's
-current inline version is invisible, `39.5` skips it; it does not reconstruct an
-older visible version yet.
+Like `39.4`, this subphase is still honest about missing older-version
+reconstruction. If a row's current inline version is invisible, `39.5` skips
+it; the new `39.11` rollback support does not change read semantics yet.
 
 ### Clustered Overflow Pages (Phase 39.10)
 
@@ -299,9 +300,50 @@ SQLite's B-tree format keeps a local payload prefix inline and spills only the s
 </div>
 </div>
 
-This subphase intentionally does **not** introduce generic TOAST references,
-compression, WAL logging, or crash recovery for overflow chains yet. Those stay
-in later phases.
+Phase `39.10` itself intentionally did **not** introduce generic TOAST
+references, compression, or crash recovery for overflow chains. `39.11` now
+adds in-process clustered WAL/rollback over those row images, but clustered
+crash recovery still stays in later phases.
+
+### Clustered WAL and Rollback (Phase 39.11)
+
+Phase `39.11` adds the first WAL contract that understands clustered rows:
+
+```text
+key       = primary-key bytes
+old_value = ClusteredRowImage?   // exact old row image
+new_value = ClusteredRowImage?   // exact new row image
+```
+
+Where `ClusteredRowImage` carries:
+
+- the latest clustered `root_pid`
+- the exact inline `RowHeader`
+- the exact logical row bytes, regardless of whether the row is inline or
+  overflow-backed on page
+
+`TxnManager` now tracks the latest clustered root per `table_id` during the
+active transaction. Rollback and savepoint undo use that root plus two storage
+helpers:
+
+- `delete_physical_by_key(...)` to undo a clustered insert
+- `restore_exact_row_image(...)` to undo clustered delete-mark or update
+
+The restore invariant is logical row state, not exact page topology. Split,
+merge, or relocate-update may still leave a different physical tree shape after
+rollback as long as the old primary key, `RowHeader`, and row bytes are back.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — WAL Follows PK Identity</span>
+InnoDB clustered undo also follows clustered-row identity rather than a heap slot. AxiomDB adopts that same constraint in 39.11: clustered pages can defragment and relocate rows, so rollback keys by primary key plus exact row image instead of pretending `(page_id, slot_id)` stays stable.
+</div>
+</div>
+
+This still stops short of clustered crash recovery. `open_with_recovery()`
+recognizes clustered entry types, but replay of unresolved clustered
+transactions remains deferred to `39.12`.
 
 ### Clustered Update In Place (Phase 39.6)
 
@@ -365,8 +407,8 @@ This keeps the subphase honest about what now exists:
 
 And what still does not:
 
-- clustered undo/version chains
-- clustered WAL/recovery
+- clustered older-version reconstruction/version chains
+- clustered crash recovery
 - clustered physical purge
 - clustered SQL executor integration
 
@@ -374,7 +416,7 @@ And what still does not:
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
 <span class="callout-label">Design Decision — No Fake Old Versions</span>
-PostgreSQL HOT chains and InnoDB undo can make an updated row visible to older snapshots. AxiomDB still cannot do that in 39.6, so updating a row rewrites the current inline version only and leaves older-version visibility for the later undo/WAL phases.
+PostgreSQL HOT chains and InnoDB undo can make an updated row visible to older snapshots. AxiomDB still cannot do that in 39.6, so updating a row rewrites the current inline version only and leaves older-version visibility for later clustered MVCC/version-chain work.
 </div>
 </div>
 
@@ -467,7 +509,7 @@ SQLite triggers rebalance from page occupancy, not from a fixed `MIN_KEYS` rule,
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
 <span class="callout-label">Design Decision — Relocation Still Is Not Undo</span>
-PostgreSQL and InnoDB can preserve older visible versions through undo/version chains. AxiomDB still cannot do that in 39.8, so relocate-update rewrites only the current inline version and leaves old-version reconstruction for clustered WAL/undo phases.
+PostgreSQL and InnoDB can preserve older visible versions through undo/version chains. AxiomDB still cannot do that in 39.8, so relocate-update rewrites only the current inline version and leaves old-version reconstruction for later clustered MVCC/version-chain work.
 </div>
 </div>
 

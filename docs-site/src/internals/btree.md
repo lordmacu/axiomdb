@@ -244,7 +244,9 @@ lookup:
 
 The important scope cut is semantic rather than structural: the controller can
 read the current inline row version, but it cannot yet chase older versions
-because clustered undo chains are still future work.
+because clustered older-version reconstruction is still future work. `39.11`
+adds rollback/savepoint restore for clustered writes, but not undo-aware read
+traversal for arbitrary snapshots.
 
 That means the current `lookup(...)` contract is:
 
@@ -476,8 +478,38 @@ This is still narrower than full large-value support:
 
 - no generic TOAST/BLOB reference layer yet
 - no compression yet
-- no WAL / recovery for overflow chains yet
+- `39.11` adds internal WAL / rollback for clustered row images
+- no clustered crash recovery for overflow chains yet
 - delete-mark keeps the overflow chain reachable until later purge
+
+### Clustered WAL and Rollback (Phase 39.11)
+
+Phase `39.11` adds the first clustered durability contract on top of the new
+page formats:
+
+1. clustered inserts append `EntryType::ClusteredInsert`
+2. clustered delete-marks append `EntryType::ClusteredDeleteMark`
+3. clustered updates append `EntryType::ClusteredUpdate`
+4. each WAL `key` is the primary key, not a physical slot identifier
+5. each payload stores an exact `ClusteredRowImage`
+6. `TxnManager` tracks the latest clustered root per `table_id`
+7. rollback restores logical row state by primary key and exact row image
+
+That controller is intentionally not a full clustered crash-recovery story yet.
+It closes rollback/savepoint correctness first and leaves clustered redo/replay
+to `39.12`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — B-Tree WAL Is Logical First</span>
+PostgreSQL's B-tree WAL is page-topology-oriented because page identity is the recovery primitive. AxiomDB rejects that as the first clustered cut: once slotted clustered pages can defragment and relocate rows, the stable identity is the primary key and exact row image, not the old leaf slot.
+</div>
+</div>
+
+Rollback therefore promises logical row restoration, not exact physical
+topology restoration. A relocate-update may leave a different split/merge shape
+after rollback as long as the old primary-key row is back.
 
 ### Leaf Node (`LeafNodePage`)
 

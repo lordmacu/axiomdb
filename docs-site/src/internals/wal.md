@@ -40,7 +40,7 @@ Offset       Size         Field
     20           1   entry_type    u8     — EntryType (see below)
     21           4   table_id      u32 LE — table identifier (0 = system operations)
     25           2   key_len       u16 LE — key length in bytes (0 for BEGIN/COMMIT/ROLLBACK)
-    27     key_len   key           [u8]   — key bytes (physical location: page_id:8 + slot_id:2)
+    27     key_len   key           [u8]   — mutation key bytes (heap RID or clustered PK)
      ?           4   old_val_len   u32 LE — old value length (0 for INSERT, BEGIN, COMMIT, ROLLBACK)
      ?   old_len    old_value      [u8]   — old encoded row (empty on INSERT)
      ?           4   new_val_len   u32 LE — new value length (0 for DELETE, BEGIN, COMMIT, ROLLBACK)
@@ -71,19 +71,34 @@ Storing <code>entry_len</code> at both ends of every entry enables backward scan
 </div>
 </div>
 
-### Physical Key Encoding
+### Mutation Key Encoding
 
-The key field encodes the physical row location for data mutations:
+Heap and clustered mutations do not use the same key contract:
 
 ```text
-key_len = 10 bytes (always for INSERT/UPDATE/DELETE)
-key[0..8]  = page_id as u64 LE
-key[8..10] = slot_id as u16 LE
+Heap INSERT / UPDATE / DELETE / UpdateInPlace:
+  key_len = 10
+  key[0..8]  = page_id as u64 LE
+  key[8..10] = slot_id as u16 LE
+
+ClusteredInsert / ClusteredDeleteMark / ClusteredUpdate (Phase 39.11):
+  key_len = primary_key_bytes.len()
+  key     = encoded primary-key bytes
 ```
 
-This means the WAL records the exact page and slot where the row was written —
-recovery can replay the write to the exact same physical location without rebuilding
-any in-memory state. The executor and B+ Tree need no memory during WAL replay.
+Heap mutations still record the exact page and slot where the row was written,
+so redo can target the same physical location directly. Clustered mutations do
+not: clustered pages defragment, split, merge, and relocate rows, so `(page_id,
+slot_id)` is not a stable undo key. Their payloads instead store the exact
+logical row image and the latest clustered `root_pid`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — PK Undo, Not Slot Undo</span>
+InnoDB's clustered-row undo is keyed by clustered identity rather than a heap-style slot address. AxiomDB adopts the same constraint in 39.11: once clustered rows can relocate inside slotted pages, the only stable rollback key is the primary key plus the exact old row image.
+</div>
+</div>
 
 ---
 
@@ -101,6 +116,9 @@ pub enum EntryType {
     Truncate   = 8,  // Full-table delete (DELETE without WHERE, TRUNCATE TABLE)
     PageWrite  = 9,  // Bulk insert page image + slot list
     UpdateInPlace = 10, // Stable-RID same-slot update
+    ClusteredInsert = 12, // Clustered insert keyed by PK + exact new row image
+    ClusteredDeleteMark = 13, // Clustered delete-mark keyed by PK + old/new row image
+    ClusteredUpdate = 14, // Clustered update keyed by PK + old/new row image
 }
 ```
 
@@ -267,6 +285,49 @@ transaction did not commit, recovery restores `old_value` to the same slot.
 
 ---
 
+## Clustered Mutation Entries (Phase 39.11)
+
+Phase `39.11` adds the first WAL contract for clustered rows:
+
+```text
+key       = encoded primary-key bytes
+old_value = ClusteredRowImage?   // absent on insert
+new_value = ClusteredRowImage?   // absent on pure delete undo payload
+
+ClusteredRowImage:
+  [root_pid: u64]
+  [RowHeader: 24B]
+  [row_len: u32]
+  [row_data bytes]
+```
+
+`TxnManager` now tracks the latest clustered `root_pid` per `table_id` inside the
+active transaction. Rollback and `ROLLBACK TO SAVEPOINT` use that tracked root
+and clustered-tree helpers:
+
+- undo clustered insert → `delete_physical_by_key(...)`
+- undo clustered delete-mark / update → `restore_exact_row_image(...)`
+
+The invariant is intentionally logical: rollback restores the old primary-key
+row state, not the exact pre-change page topology. A relocate-update may split
+or merge the tree on the forward path, and rollback may restore the old row into
+a different physical leaf as long as the visible row state matches the original.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Restore State, Not Topology</span>
+PostgreSQL's B-tree WAL is page-topology-oriented, but that is the wrong first cut for AxiomDB's clustered rewrite because clustered slots are not stable across defragment, split, and merge. 39.11 therefore restores exact row state by PK and row image, while exact clustered crash replay waits for 39.12.
+</div>
+</div>
+
+This subphase intentionally stops at in-process rollback. `open_with_recovery()`
+already recognizes the clustered entry types, but it still rejects unresolved
+in-progress clustered transactions explicitly until Phase `39.12` defines their
+redo / recovery contract.
+
+---
+
 ## Checkpoint Protocol — 5 Steps
 
 A checkpoint ensures that all dirty pages below a given LSN are written to the `.db`
@@ -336,12 +397,13 @@ READY
 
 ### Why no UNDO pass
 
-AxiomDB's WAL replay is **redo-only**. Uncommitted transactions are simply ignored
-during the forward scan. Because the WAL records physical locations (page_id, slot_id),
-the page that contained the uncommitted write is overwritten with the committed state
-from the WAL. If the page has no committed mutations after the checkpoint, it retains
-its pre-crash state (which was correct, because the checkpoint flushed all committed
-changes up to `checkpoint_lsn`).
+AxiomDB's replay path is **redo-only** for the classic heap WAL entries that are
+already replayable. Uncommitted transactions are simply ignored during the
+forward scan. Because that heap WAL records physical locations `(page_id,
+slot_id)`, the page that contained the uncommitted write is overwritten with the
+committed state from the WAL. If the page has no committed mutations after the
+checkpoint, it retains its pre-crash state (which was correct, because the
+checkpoint flushed all committed changes up to `checkpoint_lsn`).
 
 This avoids the UNDO pass required by logical WALs (like PostgreSQL's pg_wal), which
 must undo changes to B+ Tree pages in reverse order. Physical WAL with redo-only
@@ -351,9 +413,14 @@ recovery is simpler and faster.
 <span class="callout-icon">🚀</span>
 <div class="callout-body">
 <span class="callout-label">Faster Recovery — Single Forward Scan</span>
-PostgreSQL's logical WAL requires two passes on recovery: a forward redo pass, then a backward undo pass to reverse uncommitted changes in B+ Tree pages. AxiomDB's physical WAL (recording exact <code>page_id + slot_id</code>) requires only one forward pass — uncommitted writes are simply overwritten by committed redo entries.
+PostgreSQL's logical WAL requires two passes on recovery: a forward redo pass, then a backward undo pass to reverse uncommitted changes in B+ Tree pages. AxiomDB's classic heap WAL (recording exact <code>page_id + slot_id</code>) requires only one forward pass — uncommitted writes are simply overwritten by committed redo entries.
 </div>
 </div>
+
+Phase `39.11` deliberately does not change that recovery contract yet for
+clustered entries. Clustered row-image WAL is already used for rollback and
+savepoints in-process, but crash replay of unresolved clustered transactions is
+explicitly deferred to `39.12`.
 
 ---
 
@@ -382,9 +449,10 @@ and stops. The caller decides whether to propagate or recover gracefully.
 ### Single-Writer Model
 
 WAL writes are serialized through a single `WalWriter` inside `TxnManager`. The
-`Database` is wrapped in `Arc<tokio::sync::Mutex<Database>>` — only one connection
-executes DML at a time. This eliminates write–write conflicts without record-level
-locking (Phase 7 will lift this constraint).
+server runtime uses `Arc<tokio::sync::RwLock<Database>>`: readers may overlap,
+but mutating statements still serialize behind the write guard. This eliminates
+write-write conflicts without record-level locking (Phase 13.7 will lift this
+constraint).
 
 ### WAL Fsync Pipeline (Phase 6.19)
 

@@ -4,7 +4,8 @@
 //! detection, chained entries, and backward scan.
 
 use axiomdb_core::error::DbError;
-use axiomdb_wal::{EntryType, WalEntry, MIN_ENTRY_LEN};
+use axiomdb_storage::RowHeader;
+use axiomdb_wal::{ClusteredRowImage, EntryType, WalEntry, MIN_ENTRY_LEN};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -19,7 +20,28 @@ fn rid_bytes(page: u64, slot: u16) -> Vec<u8> {
     b
 }
 
-// ── Roundtrip — all 7 types ───────────────────────────────────────────────────
+fn clustered_row_bytes(
+    root_pid: u64,
+    created: u64,
+    deleted: u64,
+    version: u32,
+    row: &[u8],
+) -> Vec<u8> {
+    ClusteredRowImage::new(
+        root_pid,
+        RowHeader {
+            txn_id_created: created,
+            txn_id_deleted: deleted,
+            row_version: version,
+            _flags: 0,
+        },
+        row,
+    )
+    .to_bytes()
+    .unwrap()
+}
+
+// ── Roundtrip — representative entry types ───────────────────────────────────
 
 #[test]
 fn test_roundtrip_all_entry_types() {
@@ -33,6 +55,27 @@ fn test_roundtrip_all_entry_types() {
         make_entry(5, EntryType::Delete, b"key:001", &rid, &[]),
         make_entry(6, EntryType::Update, b"key:001", &rid, &rid_bytes(6, 0)),
         make_entry(7, EntryType::Checkpoint, &[], &[], &[]),
+        make_entry(
+            8,
+            EntryType::ClusteredInsert,
+            b"pk:clustered",
+            &[],
+            &clustered_row_bytes(12, 9, 0, 1, b"row-inline"),
+        ),
+        make_entry(
+            9,
+            EntryType::ClusteredDeleteMark,
+            b"pk:clustered",
+            &clustered_row_bytes(12, 9, 0, 1, b"row-inline"),
+            &clustered_row_bytes(12, 9, 15, 1, b"row-inline"),
+        ),
+        make_entry(
+            10,
+            EntryType::ClusteredUpdate,
+            b"pk:clustered",
+            &clustered_row_bytes(19, 9, 0, 1, b"row-old"),
+            &clustered_row_bytes(19, 15, 0, 2, b"row-new"),
+        ),
     ];
 
     for original in &entries {
@@ -278,6 +321,13 @@ fn test_serialized_len_equals_to_bytes_len_all_types() {
         make_entry(3, EntryType::Delete, b"k", &rid, &[]),
         make_entry(4, EntryType::Update, b"abc", &rid, &rid_bytes(2, 1)),
         make_entry(5, EntryType::Checkpoint, &[], &[], &[]),
+        make_entry(
+            6,
+            EntryType::ClusteredInsert,
+            b"pk:clustered",
+            &[],
+            &clustered_row_bytes(88, 21, 0, 3, b"row-data"),
+        ),
     ];
     for entry in &cases {
         assert_eq!(
