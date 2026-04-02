@@ -26,11 +26,13 @@ use std::path::Path;
 
 use axiomdb_core::{error::DbError, TxnId};
 use axiomdb_storage::{
-    clear_deletion, heap_chain::HeapChain, mark_slot_dead, restore_tuple_image, Page, StorageEngine,
+    clear_deletion, clustered_tree, heap_chain::HeapChain, mark_slot_dead, restore_tuple_image,
+    Page, StorageEngine,
 };
 
 use crate::{
-    checkpoint::Checkpointer, entry::EntryType, reader::WalReader, txn::decode_physical_loc,
+    checkpoint::Checkpointer, clustered::ClusteredRowImage, entry::EntryType, reader::WalReader,
+    txn::decode_physical_loc,
 };
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -51,6 +53,16 @@ pub enum RecoveryOp {
     /// Undo a full-table delete: clear txn_id_deleted for all slots deleted by
     /// this transaction in the heap chain starting at root_page_id.
     Truncate { root_page_id: u64, txn_id: TxnId },
+    /// Undo a clustered insert by deleting the inserted primary key from the
+    /// current clustered tree shape.
+    ClusteredInsert { table_id: u32, key: Vec<u8> },
+    /// Undo a clustered delete-mark or update by restoring the exact old row
+    /// image by primary key.
+    ClusteredRestore {
+        table_id: u32,
+        key: Vec<u8>,
+        old_row: ClusteredRowImage,
+    },
 }
 
 /// Observable phase of a crash recovery run (informational).
@@ -72,6 +84,8 @@ pub struct RecoveryResult {
     pub undone_txns: u32,
     /// The checkpoint LSN used as the scan start point (`0` = scanned from beginning).
     pub checkpoint_lsn: u64,
+    /// Final clustered root per table after crash recovery finishes.
+    pub clustered_roots: HashMap<u32, u64>,
 }
 
 // ── CrashRecovery ─────────────────────────────────────────────────────────────
@@ -142,10 +156,12 @@ impl CrashRecovery {
 
         // ── Phase: ScanningWal ────────────────────────────────────────────────
 
-        let mut committed: HashSet<u64> = HashSet::new();
-        // in_progress: txn_id → ops in chronological order (will be reversed on undo)
-        let mut in_progress: HashMap<u64, Vec<RecoveryOp>> = HashMap::new();
-        let mut unsupported_clustered_txns: HashSet<u64> = HashSet::new();
+        let mut max_committed = 0u64;
+        let mut active_txns: HashSet<u64> = HashSet::new();
+        let mut recovery_timeline: Vec<(TxnId, RecoveryOp)> = Vec::new();
+        let mut clustered_root_timeline: Vec<(TxnId, u32, u64)> = Vec::new();
+        let mut active_clustered_roots: HashMap<u64, HashMap<u32, u64>> = HashMap::new();
+        let mut committed_clustered_roots: HashMap<u32, u64> = HashMap::new();
 
         for result in reader.scan_forward(checkpoint_lsn)? {
             let entry = match result {
@@ -158,61 +174,78 @@ impl CrashRecovery {
             };
             match entry.entry_type {
                 EntryType::Begin => {
-                    in_progress.entry(entry.txn_id).or_default();
+                    active_txns.insert(entry.txn_id);
+                    active_clustered_roots.entry(entry.txn_id).or_default();
                 }
                 EntryType::Commit => {
-                    committed.insert(entry.txn_id);
-                    in_progress.remove(&entry.txn_id);
-                    unsupported_clustered_txns.remove(&entry.txn_id);
+                    max_committed = max_committed.max(entry.txn_id);
+                    active_txns.remove(&entry.txn_id);
+                    if let Some(roots) = active_clustered_roots.remove(&entry.txn_id) {
+                        for (table_id, root_pid) in roots {
+                            committed_clustered_roots.insert(table_id, root_pid);
+                        }
+                    }
                 }
                 EntryType::Rollback => {
                     // Already rolled back — no undo needed.
-                    in_progress.remove(&entry.txn_id);
-                    unsupported_clustered_txns.remove(&entry.txn_id);
+                    active_txns.remove(&entry.txn_id);
+                    active_clustered_roots.remove(&entry.txn_id);
                 }
                 EntryType::Insert => {
-                    if let Some(ops) = in_progress.get_mut(&entry.txn_id) {
+                    if active_txns.contains(&entry.txn_id) {
                         // new_value = [page_id:8][slot_id:2][row data...]
                         if let Some((page_id, slot_id)) = decode_physical_loc(&entry.new_value) {
-                            ops.push(RecoveryOp::Insert { page_id, slot_id });
+                            recovery_timeline
+                                .push((entry.txn_id, RecoveryOp::Insert { page_id, slot_id }));
                         }
                         // If decode fails (legacy entry), skip gracefully.
                     }
                 }
                 EntryType::Delete => {
-                    if let Some(ops) = in_progress.get_mut(&entry.txn_id) {
+                    if active_txns.contains(&entry.txn_id) {
                         // old_value = [page_id:8][slot_id:2][original row data...]
                         if let Some((page_id, slot_id)) = decode_physical_loc(&entry.old_value) {
-                            ops.push(RecoveryOp::Delete { page_id, slot_id });
+                            recovery_timeline
+                                .push((entry.txn_id, RecoveryOp::Delete { page_id, slot_id }));
                         }
                     }
                 }
                 EntryType::Update => {
                     // Update = delete(old) + insert(new).
                     // Undo order (reversed): UndoInsert(new_slot) then UndoDelete(old_slot).
-                    if let Some(ops) = in_progress.get_mut(&entry.txn_id) {
+                    if active_txns.contains(&entry.txn_id) {
                         if let Some((new_pid, new_slot)) = decode_physical_loc(&entry.new_value) {
-                            ops.push(RecoveryOp::Insert {
-                                page_id: new_pid,
-                                slot_id: new_slot,
-                            });
+                            recovery_timeline.push((
+                                entry.txn_id,
+                                RecoveryOp::Insert {
+                                    page_id: new_pid,
+                                    slot_id: new_slot,
+                                },
+                            ));
                         }
                         if let Some((old_pid, old_slot)) = decode_physical_loc(&entry.old_value) {
-                            ops.push(RecoveryOp::Delete {
-                                page_id: old_pid,
-                                slot_id: old_slot,
-                            });
+                            recovery_timeline.push((
+                                entry.txn_id,
+                                RecoveryOp::Delete {
+                                    page_id: old_pid,
+                                    slot_id: old_slot,
+                                },
+                            ));
                         }
                     }
                 }
                 EntryType::UpdateInPlace => {
-                    if let Some(ops) = in_progress.get_mut(&entry.txn_id) {
+                    if active_txns.contains(&entry.txn_id) {
                         if let Some((page_id, slot_id)) = decode_physical_loc(&entry.old_value) {
-                            ops.push(RecoveryOp::UpdateInPlace {
-                                page_id,
-                                slot_id,
-                                old_image: entry.old_value[crate::txn::PHYSICAL_LOC_LEN..].to_vec(),
-                            });
+                            recovery_timeline.push((
+                                entry.txn_id,
+                                RecoveryOp::UpdateInPlace {
+                                    page_id,
+                                    slot_id,
+                                    old_image: entry.old_value[crate::txn::PHYSICAL_LOC_LEN..]
+                                        .to_vec(),
+                                },
+                            ));
                         }
                     }
                 }
@@ -224,7 +257,7 @@ impl CrashRecovery {
                     //
                     // For an uncommitted PageWrite we undo at slot granularity:
                     // mark each embedded slot dead, identical to undoing N Insert entries.
-                    if let Some(ops) = in_progress.get_mut(&entry.txn_id) {
+                    if active_txns.contains(&entry.txn_id) {
                         // key = page_id as 8 bytes LE
                         if entry.key.len() < 8 {
                             continue; // malformed entry — skip gracefully
@@ -246,14 +279,15 @@ impl CrashRecovery {
                             }
                             let slot_id =
                                 u16::from_le_bytes([slots_bytes[off], slots_bytes[off + 1]]);
-                            ops.push(RecoveryOp::Insert { page_id, slot_id });
+                            recovery_timeline
+                                .push((entry.txn_id, RecoveryOp::Insert { page_id, slot_id }));
                         }
                     }
                 }
                 EntryType::PageDelete => {
                     // Same layout as PageWrite: key=page_id, new_value=[count, slot_ids...]
                     // Undo: clear_deletion for each slot (same as undoing N Delete entries).
-                    if let Some(ops) = in_progress.get_mut(&entry.txn_id) {
+                    if active_txns.contains(&entry.txn_id) {
                         if entry.key.len() < 8 {
                             continue;
                         }
@@ -272,12 +306,13 @@ impl CrashRecovery {
                             }
                             let slot_id =
                                 u16::from_le_bytes([slots_bytes[off], slots_bytes[off + 1]]);
-                            ops.push(RecoveryOp::Delete { page_id, slot_id });
+                            recovery_timeline
+                                .push((entry.txn_id, RecoveryOp::Delete { page_id, slot_id }));
                         }
                     }
                 }
                 EntryType::Truncate => {
-                    if let Some(ops) = in_progress.get_mut(&entry.txn_id) {
+                    if active_txns.contains(&entry.txn_id) {
                         // key = root_page_id as 8 bytes LE
                         if entry.key.len() >= 8 {
                             let root_page_id = u64::from_le_bytes([
@@ -290,73 +325,149 @@ impl CrashRecovery {
                                 entry.key[6],
                                 entry.key[7],
                             ]);
-                            ops.push(RecoveryOp::Truncate {
-                                root_page_id,
-                                txn_id: entry.txn_id,
-                            });
+                            recovery_timeline.push((
+                                entry.txn_id,
+                                RecoveryOp::Truncate {
+                                    root_page_id,
+                                    txn_id: entry.txn_id,
+                                },
+                            ));
                         }
                     }
                 }
-                EntryType::ClusteredInsert
-                | EntryType::ClusteredDeleteMark
-                | EntryType::ClusteredUpdate => {
-                    if in_progress.contains_key(&entry.txn_id) {
-                        unsupported_clustered_txns.insert(entry.txn_id);
+                EntryType::ClusteredInsert => {
+                    let new_row = ClusteredRowImage::from_bytes(&entry.new_value)?;
+                    if active_txns.contains(&entry.txn_id) {
+                        active_clustered_roots
+                            .entry(entry.txn_id)
+                            .or_default()
+                            .insert(entry.table_id, new_row.root_pid);
+                        clustered_root_timeline.push((
+                            entry.txn_id,
+                            entry.table_id,
+                            new_row.root_pid,
+                        ));
+                        recovery_timeline.push((
+                            entry.txn_id,
+                            RecoveryOp::ClusteredInsert {
+                                table_id: entry.table_id,
+                                key: entry.key,
+                            },
+                        ));
+                    }
+                }
+                EntryType::ClusteredDeleteMark | EntryType::ClusteredUpdate => {
+                    let old_row = ClusteredRowImage::from_bytes(&entry.old_value)?;
+                    let new_row = ClusteredRowImage::from_bytes(&entry.new_value)?;
+                    if active_txns.contains(&entry.txn_id) {
+                        active_clustered_roots
+                            .entry(entry.txn_id)
+                            .or_default()
+                            .insert(entry.table_id, new_row.root_pid);
+                        clustered_root_timeline.push((
+                            entry.txn_id,
+                            entry.table_id,
+                            new_row.root_pid,
+                        ));
+                        recovery_timeline.push((
+                            entry.txn_id,
+                            RecoveryOp::ClusteredRestore {
+                                table_id: entry.table_id,
+                                key: entry.key,
+                                old_row,
+                            },
+                        ));
                     }
                 }
             }
         }
 
-        if let Some(txn_id) = unsupported_clustered_txns.iter().copied().min() {
-            return Err(DbError::NotImplemented {
-                feature: format!(
-                    "clustered crash recovery for in-progress txn {txn_id} (Phase 39.12)"
-                ),
-            });
-        }
-
         // ── Phase: UndoingInProgress ──────────────────────────────────────────
 
-        let undone_txns = in_progress.len() as u32;
+        let undone_txns = active_txns.len() as u32;
+        let mut current_clustered_roots = committed_clustered_roots.clone();
 
-        for (_txn_id, ops) in in_progress {
-            // Apply undo in reverse: last op first.
-            for op in ops.into_iter().rev() {
-                match op {
-                    RecoveryOp::Insert { page_id, slot_id } => {
-                        let bytes = *storage.read_page(page_id)?.as_bytes();
-                        let mut page = Page::from_bytes(bytes)?;
-                        match mark_slot_dead(&mut page, slot_id) {
-                            Ok(()) | Err(DbError::AlreadyDeleted { .. }) => {}
-                            Err(e) => return Err(e),
-                        }
-                        storage.write_page(page_id, &page)?;
+        for (txn_id, table_id, root_pid) in clustered_root_timeline {
+            if active_txns.contains(&txn_id) {
+                current_clustered_roots.insert(table_id, root_pid);
+            }
+        }
+
+        for (txn_id, op) in recovery_timeline.into_iter().rev() {
+            if !active_txns.contains(&txn_id) {
+                continue;
+            }
+            match op {
+                RecoveryOp::Insert { page_id, slot_id } => {
+                    let bytes = *storage.read_page(page_id)?.as_bytes();
+                    let mut page = Page::from_bytes(bytes)?;
+                    match mark_slot_dead(&mut page, slot_id) {
+                        Ok(()) | Err(DbError::AlreadyDeleted { .. }) => {}
+                        Err(e) => return Err(e),
                     }
-                    RecoveryOp::Delete { page_id, slot_id } => {
-                        let bytes = *storage.read_page(page_id)?.as_bytes();
-                        let mut page = Page::from_bytes(bytes)?;
-                        match clear_deletion(&mut page, slot_id) {
-                            Ok(()) | Err(DbError::AlreadyDeleted { .. }) => {}
-                            Err(e) => return Err(e),
-                        }
-                        storage.write_page(page_id, &page)?;
+                    storage.write_page(page_id, &page)?;
+                }
+                RecoveryOp::Delete { page_id, slot_id } => {
+                    let bytes = *storage.read_page(page_id)?.as_bytes();
+                    let mut page = Page::from_bytes(bytes)?;
+                    match clear_deletion(&mut page, slot_id) {
+                        Ok(()) | Err(DbError::AlreadyDeleted { .. }) => {}
+                        Err(e) => return Err(e),
                     }
-                    RecoveryOp::UpdateInPlace {
-                        page_id,
-                        slot_id,
-                        old_image,
-                    } => {
-                        let bytes = *storage.read_page(page_id)?.as_bytes();
-                        let mut page = Page::from_bytes(bytes)?;
-                        restore_tuple_image(&mut page, slot_id, &old_image)?;
-                        storage.write_page(page_id, &page)?;
-                    }
-                    RecoveryOp::Truncate {
-                        root_page_id,
-                        txn_id,
-                    } => {
-                        HeapChain::clear_deletions_by_txn(storage, root_page_id, txn_id)?;
-                    }
+                    storage.write_page(page_id, &page)?;
+                }
+                RecoveryOp::UpdateInPlace {
+                    page_id,
+                    slot_id,
+                    old_image,
+                } => {
+                    let bytes = *storage.read_page(page_id)?.as_bytes();
+                    let mut page = Page::from_bytes(bytes)?;
+                    restore_tuple_image(&mut page, slot_id, &old_image)?;
+                    storage.write_page(page_id, &page)?;
+                }
+                RecoveryOp::Truncate {
+                    root_page_id,
+                    txn_id,
+                } => {
+                    HeapChain::clear_deletions_by_txn(storage, root_page_id, txn_id)?;
+                }
+                RecoveryOp::ClusteredInsert { table_id, key } => {
+                    let root_pid =
+                        current_clustered_roots
+                            .get(&table_id)
+                            .copied()
+                            .ok_or_else(|| DbError::BTreeCorrupted {
+                                msg: format!(
+                                    "clustered recovery missing current root for table {table_id}"
+                                ),
+                            })?;
+                    let new_root = clustered_tree::delete_physical_by_key(storage, root_pid, &key)?
+                        .unwrap_or(root_pid);
+                    current_clustered_roots.insert(table_id, new_root);
+                }
+                RecoveryOp::ClusteredRestore {
+                    table_id,
+                    key,
+                    old_row,
+                } => {
+                    let root_pid =
+                        current_clustered_roots
+                            .get(&table_id)
+                            .copied()
+                            .ok_or_else(|| DbError::BTreeCorrupted {
+                                msg: format!(
+                                    "clustered recovery missing current root for table {table_id}"
+                                ),
+                            })?;
+                    let new_root = clustered_tree::restore_exact_row_image(
+                        storage,
+                        root_pid,
+                        &key,
+                        &old_row.row_header,
+                        &old_row.row_data,
+                    )?;
+                    current_clustered_roots.insert(table_id, new_root);
                 }
             }
         }
@@ -364,12 +475,11 @@ impl CrashRecovery {
         // Flush all corrected pages to disk — makes recovery durable.
         storage.flush()?;
 
-        let max_committed = committed.into_iter().max().unwrap_or(0);
-
         Ok(RecoveryResult {
             max_committed,
             undone_txns,
             checkpoint_lsn,
+            clustered_roots: current_clustered_roots,
         })
     }
 }

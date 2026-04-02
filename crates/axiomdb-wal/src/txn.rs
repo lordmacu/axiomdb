@@ -198,13 +198,14 @@ impl TxnManager {
         })
     }
 
-    /// Opens an existing WAL file, scanning it to recover `max_committed`.
+    /// Opens an existing WAL file, scanning it to recover `max_committed` and
+    /// the latest committed clustered root per table.
     ///
     /// Does not replay DML entries — full crash recovery is handled in Phase 3.8.
     /// Only the highest committed TxnId is restored so that new transactions
     /// receive monotonically increasing IDs and snapshots are correct.
     pub fn open(wal_path: &Path) -> Result<Self, DbError> {
-        let max_committed = scan_max_committed(wal_path)?;
+        let (max_committed, clustered_roots) = scan_committed_state(wal_path)?;
         let wal = WalWriter::open(wal_path)?;
         Ok(Self {
             wal,
@@ -216,7 +217,7 @@ impl TxnManager {
             pending_deferred_txn_id: None,
             committed_free_batches: Vec::new(),
             durability_policy: WalDurabilityPolicy::Strict,
-            last_clustered_roots: HashMap::new(),
+            last_clustered_roots: clustered_roots,
         })
     }
 
@@ -1523,7 +1524,7 @@ impl TxnManager {
             pending_deferred_txn_id: None,
             committed_free_batches: Vec::new(),
             durability_policy: WalDurabilityPolicy::Strict,
-            last_clustered_roots: HashMap::new(),
+            last_clustered_roots: result.clustered_roots.clone(),
         };
         Ok((mgr, result))
     }
@@ -1589,17 +1590,50 @@ fn clustered_root_for_undo(
         })
 }
 
-/// Scans the WAL forward and returns the highest TxnId with a Commit entry.
-fn scan_max_committed(wal_path: &Path) -> Result<TxnId, DbError> {
+/// Scans the WAL forward and returns the highest committed TxnId plus the
+/// latest committed clustered root per table that still exists in the WAL.
+fn scan_committed_state(wal_path: &Path) -> Result<(TxnId, HashMap<u32, u64>), DbError> {
     let reader = WalReader::open(wal_path)?;
     let mut max = 0u64;
+    let mut active_clustered_roots: HashMap<u64, HashMap<u32, u64>> = HashMap::new();
+    let mut committed_clustered_roots: HashMap<u32, u64> = HashMap::new();
+
     for result in reader.scan_forward(0)? {
-        let entry = result?;
-        if entry.entry_type == EntryType::Commit && entry.txn_id > max {
-            max = entry.txn_id;
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(DbError::WalEntryTruncated { .. } | DbError::WalChecksumMismatch { .. }) => break,
+            Err(e) => return Err(e),
+        };
+        match entry.entry_type {
+            EntryType::Begin => {
+                active_clustered_roots.entry(entry.txn_id).or_default();
+            }
+            EntryType::Commit => {
+                if entry.txn_id > max {
+                    max = entry.txn_id;
+                }
+                if let Some(roots) = active_clustered_roots.remove(&entry.txn_id) {
+                    for (table_id, root_pid) in roots {
+                        committed_clustered_roots.insert(table_id, root_pid);
+                    }
+                }
+            }
+            EntryType::Rollback => {
+                active_clustered_roots.remove(&entry.txn_id);
+            }
+            EntryType::ClusteredInsert
+            | EntryType::ClusteredDeleteMark
+            | EntryType::ClusteredUpdate => {
+                if let Some(roots) = active_clustered_roots.get_mut(&entry.txn_id) {
+                    let new_row = ClusteredRowImage::from_bytes(&entry.new_value)?;
+                    roots.insert(entry.table_id, new_row.root_pid);
+                }
+            }
+            _ => {}
         }
     }
-    Ok(max)
+
+    Ok((max, committed_clustered_roots))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

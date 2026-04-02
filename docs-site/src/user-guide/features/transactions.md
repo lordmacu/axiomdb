@@ -40,10 +40,11 @@ both the transaction start and the mutation. During crash recovery, AxiomDB sees
 COMMIT record for this transaction and discards the partial change. Account 1 keeps
 its original balance.
 
-Phase `39.11` extends that internal durability model to the clustered-index
-storage rewrite: clustered rows now have WAL-backed rollback/savepoint support by
-primary key and exact row image. This is still an internal storage milestone,
-not a SQL-visible clustered-table feature yet.
+Phases `39.11` and `39.12` extend that internal durability model to the
+clustered-index storage rewrite: clustered rows now have WAL-backed
+rollback/savepoint support and crash recovery by primary key plus exact row
+image. This is still an internal storage milestone, not a SQL-visible
+clustered-table feature yet.
 
 ---
 

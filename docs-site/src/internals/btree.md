@@ -479,13 +479,13 @@ This is still narrower than full large-value support:
 - no generic TOAST/BLOB reference layer yet
 - no compression yet
 - `39.11` adds internal WAL / rollback for clustered row images
-- no clustered crash recovery for overflow chains yet
+- `39.12` adds clustered crash recovery for those row images
 - delete-mark keeps the overflow chain reachable until later purge
 
-### Clustered WAL and Rollback (Phase 39.11)
+### Clustered WAL and Recovery (Phases 39.11 / 39.12)
 
-Phase `39.11` adds the first clustered durability contract on top of the new
-page formats:
+Phases `39.11` and `39.12` add the first clustered durability contract on top
+of the new page formats:
 
 1. clustered inserts append `EntryType::ClusteredInsert`
 2. clustered delete-marks append `EntryType::ClusteredDeleteMark`
@@ -493,11 +493,12 @@ page formats:
 4. each WAL `key` is the primary key, not a physical slot identifier
 5. each payload stores an exact `ClusteredRowImage`
 6. `TxnManager` tracks the latest clustered root per `table_id`
-7. rollback restores logical row state by primary key and exact row image
+7. rollback and crash recovery restore logical row state by primary key and exact row image
 
-That controller is intentionally not a full clustered crash-recovery story yet.
-It closes rollback/savepoint correctness first and leaves clustered redo/replay
-to `39.12`.
+This controller is still intentionally narrower than a full topology-physical
+recovery story. `39.12` closes clustered crash recovery by reusing the same
+PK + row-image semantics, while exact root persistence beyond WAL
+checkpoint/rotation remains future work.
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
