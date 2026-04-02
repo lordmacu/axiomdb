@@ -287,6 +287,18 @@ pub struct CreateTableStmt {
     pub table_constraints: Vec<TableConstraint>,
 }
 
+/// Index access method (Phase 11.1b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexType {
+    /// B-Tree (default) — point lookups, range scans, uniqueness enforcement.
+    #[default]
+    BTree,
+    /// BRIN (Block Range INdex) — per-block-range min/max summaries.
+    /// 100× smaller than B-Tree for naturally ordered columns (timestamps, IDs).
+    /// PostgreSQL-compatible: `CREATE INDEX ... USING brin`.
+    Brin,
+}
+
 /// `CREATE [UNIQUE] INDEX`
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateIndexStmt {
@@ -303,6 +315,10 @@ pub struct CreateIndexStmt {
     pub fillfactor: Option<u8>,
     /// INCLUDE columns for covering indexes (Phase 6.13). `vec![]` = no included cols.
     pub include_columns: Vec<String>,
+    /// Index access method (Phase 11.1b). Default: BTree.
+    pub index_type: IndexType,
+    /// BRIN: heap pages per range. Default 128. Ignored for B-Tree.
+    pub pages_per_range: Option<u32>,
 }
 
 /// `DROP TABLE`
@@ -777,6 +793,8 @@ mod tests {
             predicate: None,
             fillfactor: None,
             include_columns: vec![],
+            index_type: IndexType::BTree,
+            pages_per_range: None,
         });
         assert!(matches!(stmt, Stmt::CreateIndex(_)));
     }
