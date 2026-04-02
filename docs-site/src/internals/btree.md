@@ -359,6 +359,47 @@ InnoDB's clustered records are delete-marked before purge, and PostgreSQL tuples
 </div>
 </div>
 
+### Clustered Structural Controller (Phase 39.8)
+
+Phase `39.8` adds the first controller that can structurally shrink and
+rebalance the clustered tree:
+
+1. call `update_in_place(...)` as the fast path
+2. on `HeapPageFull`, load the visible current row
+3. physically delete the exact clustered cell through a private tree path
+4. propagate two signals upward:
+   - `underfull` — the child now needs sibling redistribute/merge
+   - `min_changed` — the child's minimum key changed and the parent separator must be repaired
+5. rebalance clustered leaf and internal siblings by encoded byte volume
+6. collapse an empty internal root
+7. reinsert the replacement row through the clustered insert controller
+
+That makes `39.8` the structural companion to `39.6` and `39.7`, not a
+shortcut around later purge / undo / secondary-index phases.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — No Fixed MIN_KEYS</span>
+The old `axiomdb-index::BTree` can rebalance with fixed `MIN_KEYS_*` thresholds because every slot costs the same. Clustered pages cannot: 39.8 rebalances variable-size siblings by encoded byte volume, following SQLite-style occupancy logic instead of fixed-key-count heuristics.
+</div>
+</div>
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Keep Delete Mark Separate</span>
+MariaDB InnoDB separates delete-mark from later purge/compression work. AxiomDB keeps that same split in 39.8: physical delete exists only as a private helper for relocate-update, while public clustered delete remains logical until snapshot-safe purge exists.
+</div>
+</div>
+
+Current 39.8 limits remain explicit:
+
+- relocate-update still rewrites only the current inline version
+- public delete still does not purge dead clustered cells
+- relocated rows still do not maintain secondary-index bookmarks
+- parent separator repair does not yet split the parent if the repaired key itself overflows the page budget
+
 ### Leaf Node (`LeafNodePage`)
 
 ```text

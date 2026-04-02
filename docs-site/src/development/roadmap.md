@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 39.7 Clustered B-tree delete — dedicated storage-layer clustered delete-mark path with exact-leaf descent, MVCC gating, inline `txn_id_deleted` stamping, and old-snapshot visibility over delete-marked clustered rows
+**Last completed subphase:** 39.8 Clustered B-tree split and merge — byte-volume leaf/internal rebalance, parent separator repair, root collapse, and relocate-update fallback after same-leaf `HeapPageFull`
 
-**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, insert, point lookup, range scan, same-leaf update, and delete-mark now exist in storage, but the SQL executor still uses the classic heap + secondary-index execution path
+**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, insert, point lookup, range scan, same-leaf update, delete-mark, and structural rebalance now exist in storage, but the SQL executor still uses the classic heap + secondary-index execution path
 
-**Next milestone:** 39.8 — clustered split/merge semantics, followed by PK bookmarks and overflow work
+**Next milestone:** 39.9 — secondary indexes with PK bookmarks, followed by overflow work
 
 **Concurrency note:** the current server already supports concurrent read-only
 queries, but mutating statements are still serialized through a database-wide

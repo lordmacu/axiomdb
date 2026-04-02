@@ -1,5 +1,19 @@
 # Lessons Learned
 
+## 2026-04-02 - Variable-size clustered rebalance must propagate occupancy and minimum-key change separately
+
+- A clustered delete/rewrite path needs two independent upward signals:
+  - whether the child became underfull
+  - whether the child's minimum key changed
+- Treating those as one thing either misses separator repair or over-triggers structural work.
+- The right intermediate contract is:
+  - repair the parent separator when a non-leftmost child's first key changes
+  - rebalance siblings only when byte occupancy drops below the chosen threshold
+  - keep root collapse as a separate final step
+- `research/sqlite/src/btree.c` reinforced the occupancy-first rebalance trigger.
+- `crates/axiomdb-index/src/tree.rs` remained useful for sequencing, but not for
+  fixed-key-count heuristics.
+
 ## 2026-04-02 - Clustered delete should be logical first and physical later
 
 - A storage-first clustered delete should not physically remove the row before

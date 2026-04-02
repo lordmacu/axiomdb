@@ -368,6 +368,65 @@ InnoDB delete-marks clustered records first and purges them later; PostgreSQL al
 </div>
 </div>
 
+### Clustered Structural Rebalance (Phase 39.8)
+
+`axiomdb-storage::clustered_tree::update_with_relocation(...)` adds the first
+clustered structural-maintenance path:
+
+```rust
+pub fn update_with_relocation(
+    storage: &mut dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    new_row_data: &[u8],
+    txn_id: u64,
+    snapshot: &TransactionSnapshot,
+) -> Result<Option<u64>, DbError>
+```
+
+Control flow:
+
+1. Validate that the replacement row still fits inline on a clustered leaf.
+2. Try `update_in_place(...)` first.
+3. If the same-leaf rewrite returns `HeapPageFull`, reload the visible current
+   row and enter the structural path.
+4. Physically remove the exact clustered cell from the tree.
+5. Bubble `underfull` and `min_changed` upward:
+   - repair the parent separator when a non-leftmost child changes its minimum key
+   - redistribute or merge clustered leaf siblings by encoded byte volume
+   - redistribute or merge clustered internal siblings while preserving
+     `n keys -> n + 1 children`
+6. Collapse an empty internal root to its only child.
+7. Reinsert the replacement row with bumped `row_version`.
+
+The key design boundary is that `39.8` introduces **private structural delete**
+only for relocate-update. Public clustered delete is still `delete_mark(...)`,
+so snapshot-safe purge remains a later concern.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Rebalance By Bytes</span>
+SQLite triggers rebalance from page occupancy, not from a fixed `MIN_KEYS` rule, and InnoDB also reasons about merge feasibility in bytes after page reorganization. AxiomDB adopts that same rule in 39.8: variable-size clustered siblings redistribute and merge by encoded byte volume, not by raw key count.
+</div>
+</div>
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Relocation Still Is Not Undo</span>
+PostgreSQL and InnoDB can preserve older visible versions through undo/version chains. AxiomDB still cannot do that in 39.8, so relocate-update rewrites only the current inline version and leaves old-version reconstruction for clustered WAL/undo phases.
+</div>
+</div>
+
+Current limitations:
+
+- `delete_mark(...)` still keeps dead clustered cells inline; `39.8` does not
+  expose purge to SQL or storage callers yet.
+- secondary-index bookmark maintenance for relocated rows is still deferred to `39.9`.
+- parent separator repair currently assumes the repaired separator still fits in
+  the existing internal page budget; split-on-separator-repair is deferred.
+
 ---
 
 ## MmapStorage — Memory-Mapped File

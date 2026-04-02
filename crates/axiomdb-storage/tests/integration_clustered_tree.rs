@@ -421,3 +421,78 @@ fn clustered_delete_mark_respects_old_and_new_snapshots_on_split_tree() {
     assert_eq!(old_rows[1].key, 1_111u32.to_be_bytes());
     assert_eq!(old_rows[1].row_header.txn_id_deleted, 9);
 }
+
+#[test]
+fn clustered_update_with_relocation_preserves_order_on_split_tree() {
+    let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
+    let mut root = None;
+
+    for key in 0u32..2_000 {
+        let row_len = 180 + (key as usize % 5) * 121;
+        root = Some(
+            clustered_tree::insert(
+                storage.as_mut(),
+                root,
+                &key.to_be_bytes(),
+                &row_header(1),
+                &row_bytes(key, row_len),
+            )
+            .unwrap(),
+        );
+    }
+
+    let root_after = clustered_tree::update_with_relocation(
+        storage.as_mut(),
+        root,
+        &1_111u32.to_be_bytes(),
+        &vec![7u8; 8_000],
+        9,
+        &TransactionSnapshot::active(9, 1),
+    )
+    .unwrap()
+    .expect("relocation update must succeed");
+
+    let row = clustered_tree::lookup(
+        storage.as_ref(),
+        Some(root_after),
+        &1_111u32.to_be_bytes(),
+        &TransactionSnapshot::active(9, 1),
+    )
+    .unwrap()
+    .expect("updated row must exist");
+    assert_eq!(row.row_data, vec![7u8; 8_000]);
+    assert_eq!(row.row_header.txn_id_created, 9);
+    assert_eq!(row.row_header.row_version, 1);
+
+    let old_snapshot = clustered_tree::lookup(
+        storage.as_ref(),
+        Some(root_after),
+        &1_111u32.to_be_bytes(),
+        &TransactionSnapshot::committed(1),
+    )
+    .unwrap();
+    assert!(
+        old_snapshot.is_none(),
+        "39.8 relocation still rewrites the current inline version only"
+    );
+
+    let keys = collect_leaf_chain_keys(storage.as_ref(), root_after).unwrap();
+    assert_eq!(keys.len(), 2_000);
+    for (idx, key) in keys.iter().enumerate() {
+        assert_eq!(key.as_slice(), &(idx as u32).to_be_bytes());
+    }
+
+    let rows: Vec<_> = clustered_tree::range(
+        storage.as_ref(),
+        Some(root_after),
+        Bound::Included(1_110u32.to_be_bytes().to_vec()),
+        Bound::Included(1_112u32.to_be_bytes().to_vec()),
+        &TransactionSnapshot::active(9, 1),
+    )
+    .unwrap()
+    .map(|row| row.unwrap())
+    .collect();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[1].key, 1_111u32.to_be_bytes());
+    assert_eq!(rows[1].row_data, vec![7u8; 8_000]);
+}
