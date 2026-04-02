@@ -1,6 +1,6 @@
 # Phase 39 — Clustered Index Storage Engine
 
-## Subfases completed in this session: 39.2, 39.3, 39.4
+## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5
 
 ## What was built
 
@@ -129,6 +129,43 @@ Important boundary for this subphase:
 - `crates/axiomdb-storage/tests/integration_clustered_tree.rs`
   - adds clustered point lookup integration probes after many inserts and splits
 
+### 39.5 — Clustered B-tree range scan
+
+`crates/axiomdb-storage/src/clustered_tree.rs` now also implements the first
+ordered multi-row scan path over clustered storage.
+
+The new API is:
+
+- `range(storage, root_opt, from, to, snapshot) -> Result<ClusteredRangeIter<'_>, DbError>`
+
+Behavior:
+
+- empty-tree scan yields no rows
+- full scan yields all visible current inline rows in primary-key order
+- bounded scan respects inclusive and exclusive lower / upper bounds
+- bounded scan descends directly to the first relevant leaf instead of always
+  starting from the leftmost leaf
+- multi-leaf scan follows `next_leaf` in `O(1)` per leaf boundary
+- invisible current inline versions are skipped
+
+This range path is deliberately storage-first:
+
+- it returns owned `ClusteredRow` values directly from clustered leaves
+- it uses `RowHeader::is_visible(...)` for MVCC filtering
+- it issues `StorageEngine::prefetch_hint(...)` when advancing to the next leaf
+- it does **not** reconstruct older visible versions yet
+- it is not wired into the SQL executor yet
+
+### Supporting changes for 39.5
+
+- `crates/axiomdb-storage/src/clustered_tree.rs`
+  - adds `ClusteredRangeIter`
+  - adds `range(...)`
+  - adds bound-aware start-leaf descent helpers
+  - adds `next_leaf` traversal with prefetch hints
+- `crates/axiomdb-storage/tests/integration_clustered_tree.rs`
+  - adds 10K-row full-scan and bounded-scan clustered range integration coverage
+
 ## Validation
 
 Targeted validation passed:
@@ -187,18 +224,41 @@ New clustered lookup coverage now includes:
 - lookup after internal/root splits
 - 10K-row integration probes over a split tree
 
+Targeted validation for `39.5` also passed:
+
+- `cargo test -p axiomdb-storage clustered_tree --lib -j1`
+- `cargo test -p axiomdb-storage --test integration_clustered_tree -j1`
+- `cargo test -p axiomdb-storage -j1`
+- `cargo clippy -p axiomdb-storage -- -D warnings`
+- `cargo fmt --check`
+- `cargo check -p axiomdb-index -j1`
+- `cargo check -p axiomdb-sql --lib -j1`
+- `mdbook build docs-site`
+
+New clustered range coverage now includes:
+
+- empty-tree range
+- full scan in primary-key order
+- inclusive / exclusive bound behavior
+- bounded start from a non-leftmost leaf
+- invisible current-version skip behavior
+- prefetch hints on leaf-chain advance
+- 10K-row full and bounded range integration probes across many leaves
+
 ## Review notes
 
 - All `39.3` acceptance criteria from the spec are implemented.
 - All `39.4` acceptance criteria from the spec are implemented.
+- All `39.5` acceptance criteria from the spec are implemented.
 - No `unsafe` was introduced in the clustered tree path.
 - No production `unwrap()` remains in the touched clustered files.
-- Benchmarking is intentionally deferred: `39.4` adds point lookup, but the
-  clustered read benchmark gate starts after `39.5` adds the range-scan path too.
+- Benchmarking remains intentionally deferred: `39.5` finishes the storage-level
+  clustered read slice, but end-to-end clustered read benchmarks still wait for
+  later SQL-visible integration.
 
 ## Deferred
 
-- `39.5` — range scan over clustered pages
+- `39.6` / `39.7` — clustered update/delete plus undo-aware visibility
 - `39.8` — parent maintenance during split / merge
 - `39.11+` — WAL and crash recovery for clustered operations
 - `39.13+` — executor integration for clustered tables
@@ -211,5 +271,7 @@ New clustered lookup coverage now includes:
   SQL path creates or writes clustered tables yet.
 - `39.4` keeps the same boundary on reads: clustered point lookup exists in
   storage, but no SQL `SELECT` path uses it yet.
+- `39.5` extends that same boundary to ordered reads: clustered range scan now
+  exists in storage, but it is still not reachable from SQL.
 - `39.1` remains open because large-row overflow cells are still deferred to
   `39.10`, even though the clustered leaf groundwork already exists in storage.

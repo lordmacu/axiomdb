@@ -1255,7 +1255,8 @@
 - [ ] ⚠️ 39.3 clustered insert still has no WAL/undo semantics — revisit in 39.11 / 39.12
 - [x] 39.4 ✅ Clustered B-Tree point lookup — dedicated `axiomdb-storage::clustered_tree::lookup(...)`, root-to-leaf descent, exact leaf search, inline row return, and MVCC visibility on the current inline version
 - [ ] ⚠️ 39.4 invisible current versions still return `None` because clustered undo/version chains remain deferred — revisit in 39.6 / 39.7 / 39.11 / 39.12
-- [ ] 39.5 ⏳ Clustered B-Tree range scan — leaf-chain traversal over clustered pages
+- [x] 39.5 ✅ Clustered B-Tree range scan — dedicated `axiomdb-storage::clustered_tree::range(...)`, bound-aware start-leaf descent, `next_leaf` traversal, MVCC visibility filtering, and prefetch hints across clustered leaves
+- [ ] ⚠️ 39.5 invisible current versions are skipped because clustered undo/version chains remain deferred — revisit in 39.6 / 39.7 / 39.11 / 39.12
 - [ ] 39.6 ⏳ Clustered B-Tree update in place — patch non-key columns directly on clustered cells
 - [ ] 39.7 ⏳ Clustered B-Tree delete — MVCC delete-mark on clustered cells
 - [ ] 39.8 ⏳ Clustered B-Tree split and merge — volume-based split and underflow merge for variable-size cells

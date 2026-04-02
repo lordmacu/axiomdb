@@ -4,6 +4,8 @@
 //! tree controller for clustered pages without yet replacing the heap+index
 //! executor path.
 
+use std::ops::Bound;
+
 use axiomdb_core::{error::DbError, TransactionSnapshot};
 
 use crate::{
@@ -26,6 +28,13 @@ struct OwnedInternalCell {
     right_child: u64,
 }
 
+/// Prefetch depth for sequential clustered leaf scans.
+///
+/// MariaDB and PostgreSQL both keep a bounded read-ahead window on sequential
+/// scans instead of prefetching the whole relation. We use a conservative depth
+/// of 4 pages for the clustered leaf chain.
+const PREFETCH_DEPTH: u64 = 4;
+
 enum InsertResult {
     Inserted,
     Split { sep_key: Vec<u8>, right_pid: u64 },
@@ -36,6 +45,18 @@ pub struct ClusteredRow {
     pub key: Vec<u8>,
     pub row_header: RowHeader,
     pub row_data: Vec<u8>,
+}
+
+/// Lazy iterator over a primary-key range stored directly in clustered leaves.
+pub struct ClusteredRangeIter<'a> {
+    storage: &'a dyn StorageEngine,
+    current_pid: u64,
+    next_leaf_cache: u64,
+    slot_idx: usize,
+    from: Bound<Vec<u8>>,
+    to: Bound<Vec<u8>>,
+    snapshot: TransactionSnapshot,
+    done: bool,
 }
 
 /// Inserts one full row into a clustered B-tree and returns the effective root
@@ -100,6 +121,36 @@ pub fn lookup(
         row_header: cell.row_header,
         row_data: cell.row_data.to_vec(),
     }))
+}
+
+/// Builds a lazy range iterator over clustered leaf pages.
+pub fn range<'a>(
+    storage: &'a dyn StorageEngine,
+    root_pid: Option<u64>,
+    from: Bound<Vec<u8>>,
+    to: Bound<Vec<u8>>,
+    snapshot: &TransactionSnapshot,
+) -> Result<ClusteredRangeIter<'a>, DbError> {
+    if bounds_empty(&from, &to) {
+        return Ok(ClusteredRangeIter::empty(storage, from, to, *snapshot));
+    }
+
+    let Some(root_pid) = root_pid else {
+        return Ok(ClusteredRangeIter::empty(storage, from, to, *snapshot));
+    };
+
+    let (current_pid, slot_idx) = find_start_position(storage, root_pid, &from)?;
+
+    Ok(ClusteredRangeIter {
+        storage,
+        current_pid,
+        next_leaf_cache: clustered_leaf::NULL_PAGE,
+        slot_idx,
+        from,
+        to,
+        snapshot: *snapshot,
+        done: false,
+    })
 }
 
 fn insert_subtree(
@@ -324,6 +375,50 @@ fn descend_to_leaf(
     }
 }
 
+fn leftmost_leaf_pid(storage: &dyn StorageEngine, mut pid: u64) -> Result<u64, DbError> {
+    loop {
+        let page = storage.read_page(pid)?;
+        match clustered_page_type(&page)? {
+            PageType::ClusteredLeaf => return Ok(pid),
+            PageType::ClusteredInternal => {
+                pid = clustered_internal::child_at(&page, 0)?;
+            }
+            other => {
+                return Err(DbError::BTreeCorrupted {
+                    msg: format!(
+                        "clustered tree encountered unsupported page type {other:?} at page {pid}"
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn find_start_position(
+    storage: &dyn StorageEngine,
+    root_pid: u64,
+    from: &Bound<Vec<u8>>,
+) -> Result<(u64, usize), DbError> {
+    match from {
+        Bound::Unbounded => Ok((leftmost_leaf_pid(storage, root_pid)?, 0)),
+        Bound::Included(key) => {
+            let leaf = descend_to_leaf(storage, root_pid, key)?;
+            let slot_idx = match leaf_search_checked(&leaf, key)? {
+                Ok(pos) | Err(pos) => pos,
+            };
+            Ok((leaf.header().page_id, slot_idx))
+        }
+        Bound::Excluded(key) => {
+            let leaf = descend_to_leaf(storage, root_pid, key)?;
+            let slot_idx = match leaf_search_checked(&leaf, key)? {
+                Ok(pos) => pos + 1,
+                Err(pos) => pos,
+            };
+            Ok((leaf.header().page_id, slot_idx))
+        }
+    }
+}
+
 fn collect_internal_cells(page: &Page) -> Result<Vec<OwnedInternalCell>, DbError> {
     let num_cells = clustered_internal::num_cells(page);
     let mut cells = Vec::with_capacity(num_cells as usize);
@@ -471,6 +566,24 @@ fn validate_inline_row(key: &[u8], row_data: &[u8]) -> Result<(), DbError> {
     Ok(())
 }
 
+fn bounds_empty(from: &Bound<Vec<u8>>, to: &Bound<Vec<u8>>) -> bool {
+    let (lower, upper) = match (from, to) {
+        (Bound::Included(lo), Bound::Included(hi))
+        | (Bound::Included(lo), Bound::Excluded(hi))
+        | (Bound::Excluded(lo), Bound::Included(hi))
+        | (Bound::Excluded(lo), Bound::Excluded(hi)) => (lo, hi),
+        _ => return false,
+    };
+
+    match lower.cmp(upper) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => {
+            !matches!(from, Bound::Included(_)) || !matches!(to, Bound::Included(_))
+        }
+        std::cmp::Ordering::Less => false,
+    }
+}
+
 fn clustered_page_type(page: &Page) -> Result<PageType, DbError> {
     let pid = page.header().page_id;
     let page_type =
@@ -491,10 +604,129 @@ fn write_page(storage: &mut dyn StorageEngine, pid: u64, page: &mut Page) -> Res
     storage.write_page(pid, page)
 }
 
+impl<'a> ClusteredRangeIter<'a> {
+    fn empty(
+        storage: &'a dyn StorageEngine,
+        from: Bound<Vec<u8>>,
+        to: Bound<Vec<u8>>,
+        snapshot: TransactionSnapshot,
+    ) -> Self {
+        Self {
+            storage,
+            current_pid: clustered_leaf::NULL_PAGE,
+            next_leaf_cache: clustered_leaf::NULL_PAGE,
+            slot_idx: 0,
+            from,
+            to,
+            snapshot,
+            done: true,
+        }
+    }
+
+    fn above_lower(&self, key: &[u8]) -> bool {
+        match &self.from {
+            Bound::Unbounded => true,
+            Bound::Included(lo) => key >= lo.as_slice(),
+            Bound::Excluded(lo) => key > lo.as_slice(),
+        }
+    }
+
+    fn below_upper(&self, key: &[u8]) -> bool {
+        match &self.to {
+            Bound::Unbounded => true,
+            Bound::Included(hi) => key <= hi.as_slice(),
+            Bound::Excluded(hi) => key < hi.as_slice(),
+        }
+    }
+}
+
+impl Iterator for ClusteredRangeIter<'_> {
+    type Item = Result<ClusteredRow, DbError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+
+        loop {
+            if self.current_pid == clustered_leaf::NULL_PAGE {
+                self.done = true;
+                return None;
+            }
+
+            let page = match self.storage.read_page(self.current_pid) {
+                Ok(page) => page,
+                Err(err) => return Some(Err(err)),
+            };
+
+            match clustered_page_type(&page) {
+                Ok(PageType::ClusteredLeaf) => {}
+                Ok(other) => {
+                    return Some(Err(DbError::BTreeCorrupted {
+                        msg: format!(
+                            "clustered range scan expected leaf at page {}, found {other:?}",
+                            self.current_pid
+                        ),
+                    }));
+                }
+                Err(err) => return Some(Err(err)),
+            }
+
+            if self.next_leaf_cache == clustered_leaf::NULL_PAGE {
+                self.next_leaf_cache = clustered_leaf::next_leaf(&page);
+            }
+
+            let num_cells = clustered_leaf::num_cells(&page) as usize;
+            while self.slot_idx < num_cells {
+                let idx = self.slot_idx as u16;
+                self.slot_idx += 1;
+
+                let cell = match clustered_leaf::read_cell(&page, idx) {
+                    Ok(cell) => cell,
+                    Err(err) => return Some(Err(err)),
+                };
+
+                if !self.above_lower(cell.key) {
+                    continue;
+                }
+                if !self.below_upper(cell.key) {
+                    self.done = true;
+                    return None;
+                }
+                if !cell.row_header.is_visible(&self.snapshot) {
+                    continue;
+                }
+
+                return Some(Ok(ClusteredRow {
+                    key: cell.key.to_vec(),
+                    row_header: cell.row_header,
+                    row_data: cell.row_data.to_vec(),
+                }));
+            }
+
+            let next_pid = self.next_leaf_cache;
+            if next_pid == clustered_leaf::NULL_PAGE {
+                self.done = true;
+                return None;
+            }
+
+            self.storage.prefetch_hint(next_pid, PREFETCH_DEPTH);
+            self.current_pid = next_pid;
+            self.next_leaf_cache = clustered_leaf::NULL_PAGE;
+            self.slot_idx = 0;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{clustered_internal, clustered_leaf, MemoryStorage};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use crate::{clustered_internal, clustered_leaf, MemoryStorage, PageRef};
     use axiomdb_core::TransactionSnapshot;
 
     fn row_header(txn_id: u64) -> RowHeader {
@@ -564,6 +796,46 @@ mod tests {
         }
 
         Ok(keys)
+    }
+
+    fn collect_range_rows(iter: ClusteredRangeIter<'_>) -> Result<Vec<ClusteredRow>, DbError> {
+        iter.collect()
+    }
+
+    struct CountingPrefetchStorage {
+        inner: MemoryStorage,
+        prefetches: Arc<AtomicUsize>,
+    }
+
+    impl StorageEngine for CountingPrefetchStorage {
+        fn read_page(&self, page_id: u64) -> Result<PageRef, DbError> {
+            self.inner.read_page(page_id)
+        }
+
+        fn write_page(&mut self, page_id: u64, page: &Page) -> Result<(), DbError> {
+            self.inner.write_page(page_id, page)
+        }
+
+        fn alloc_page(&mut self, page_type: PageType) -> Result<u64, DbError> {
+            self.inner.alloc_page(page_type)
+        }
+
+        fn free_page(&mut self, page_id: u64) -> Result<(), DbError> {
+            self.inner.free_page(page_id)
+        }
+
+        fn flush(&mut self) -> Result<(), DbError> {
+            self.inner.flush()
+        }
+
+        fn page_count(&self) -> u64 {
+            self.inner.page_count()
+        }
+
+        fn prefetch_hint(&self, start_page_id: u64, count: u64) {
+            self.prefetches.fetch_add(1, Ordering::Relaxed);
+            self.inner.prefetch_hint(start_page_id, count);
+        }
     }
 
     #[test]
@@ -839,6 +1111,225 @@ mod tests {
 
         assert_eq!(got.key, 93u32.to_be_bytes());
         assert_eq!(got.row_data, row_bytes(93, 3_000));
+    }
+
+    #[test]
+    fn range_empty_tree_returns_no_rows() {
+        let storage = MemoryStorage::new();
+        let rows = collect_range_rows(
+            range(
+                &storage,
+                None,
+                Bound::Unbounded,
+                Bound::Unbounded,
+                &committed_snapshot(100),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn range_full_scan_returns_rows_in_primary_key_order() {
+        let mut storage = MemoryStorage::new();
+        let mut root = None;
+
+        for key in 0u32..128 {
+            root = Some(
+                insert(
+                    &mut storage,
+                    root,
+                    &key.to_be_bytes(),
+                    &row_header((key % 17) as u64 + 1),
+                    &row_bytes(key, 512 + (key as usize % 5) * 71),
+                )
+                .unwrap(),
+            );
+        }
+
+        let rows = collect_range_rows(
+            range(
+                &storage,
+                root,
+                Bound::Unbounded,
+                Bound::Unbounded,
+                &committed_snapshot(10_000),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 128);
+        for (idx, row) in rows.iter().enumerate() {
+            assert_eq!(row.key, (idx as u32).to_be_bytes());
+        }
+    }
+
+    #[test]
+    fn range_included_and_excluded_bounds_are_respected() {
+        let mut storage = MemoryStorage::new();
+        let mut root = None;
+
+        for key in 0u32..32 {
+            root = Some(
+                insert(
+                    &mut storage,
+                    root,
+                    &key.to_be_bytes(),
+                    &row_header(1),
+                    &row_bytes(key, 64),
+                )
+                .unwrap(),
+            );
+        }
+
+        let inclusive = collect_range_rows(
+            range(
+                &storage,
+                root,
+                Bound::Included(10u32.to_be_bytes().to_vec()),
+                Bound::Included(15u32.to_be_bytes().to_vec()),
+                &committed_snapshot(10),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inclusive.len(), 6);
+        assert_eq!(inclusive.first().unwrap().key, 10u32.to_be_bytes());
+        assert_eq!(inclusive.last().unwrap().key, 15u32.to_be_bytes());
+
+        let exclusive = collect_range_rows(
+            range(
+                &storage,
+                root,
+                Bound::Excluded(10u32.to_be_bytes().to_vec()),
+                Bound::Excluded(15u32.to_be_bytes().to_vec()),
+                &committed_snapshot(10),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(exclusive.len(), 4);
+        assert_eq!(exclusive.first().unwrap().key, 11u32.to_be_bytes());
+        assert_eq!(exclusive.last().unwrap().key, 14u32.to_be_bytes());
+    }
+
+    #[test]
+    fn range_skips_invisible_current_versions() {
+        let mut storage = MemoryStorage::new();
+        let mut root = None;
+
+        for key in 0u32..8 {
+            let created_by = if key % 2 == 0 { 9 } else { 2 };
+            root = Some(
+                insert(
+                    &mut storage,
+                    root,
+                    &key.to_be_bytes(),
+                    &row_header(created_by),
+                    &row_bytes(key, 96),
+                )
+                .unwrap(),
+            );
+        }
+
+        let rows = collect_range_rows(
+            range(
+                &storage,
+                root,
+                Bound::Unbounded,
+                Bound::Unbounded,
+                &committed_snapshot(4),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let keys: Vec<Vec<u8>> = rows.into_iter().map(|row| row.key).collect();
+        let expected: Vec<Vec<u8>> = [1u32, 3, 5, 7]
+            .into_iter()
+            .map(|key| key.to_be_bytes().to_vec())
+            .collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn bounded_range_starts_from_non_leftmost_leaf_when_possible() {
+        let mut storage = MemoryStorage::new();
+        let mut root = None;
+
+        for key in 0u32..256 {
+            root = Some(
+                insert(
+                    &mut storage,
+                    root,
+                    &key.to_be_bytes(),
+                    &row_header(1),
+                    &vec![key as u8; 2_400],
+                )
+                .unwrap(),
+            );
+        }
+
+        let root = root.unwrap();
+        let leftmost = leftmost_leaf_pid(&storage, root).unwrap();
+        let (start_pid, slot_idx) = find_start_position(
+            &storage,
+            root,
+            &Bound::Included(200u32.to_be_bytes().to_vec()),
+        )
+        .unwrap();
+
+        assert_ne!(
+            start_pid, leftmost,
+            "bounded range should descend to the first relevant leaf"
+        );
+
+        let page = storage.read_page(start_pid).unwrap();
+        let cell = clustered_leaf::read_cell(&page, slot_idx as u16).unwrap();
+        assert_eq!(cell.key, 200u32.to_be_bytes());
+    }
+
+    #[test]
+    fn range_prefetches_when_advancing_to_next_leaf() {
+        let prefetches = Arc::new(AtomicUsize::new(0));
+        let mut storage = CountingPrefetchStorage {
+            inner: MemoryStorage::new(),
+            prefetches: Arc::clone(&prefetches),
+        };
+        let mut root = None;
+
+        for key in 0u32..64 {
+            root = Some(
+                insert(
+                    &mut storage,
+                    root,
+                    &key.to_be_bytes(),
+                    &row_header(1),
+                    &vec![key as u8; 3_000],
+                )
+                .unwrap(),
+            );
+        }
+
+        let rows = collect_range_rows(
+            range(
+                &storage,
+                root,
+                Bound::Unbounded,
+                Bound::Unbounded,
+                &committed_snapshot(10),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 64);
+        assert!(
+            prefetches.load(Ordering::Relaxed) > 0,
+            "cross-leaf scans must issue prefetch hints"
+        );
     }
 
     #[test]
