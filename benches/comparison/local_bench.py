@@ -604,6 +604,23 @@ def run_scenario(scenario, workload, indexes, selected_engines):
             )
 
 
+def traffic_light(axiom_ops, best_other_ops):
+    """Return a traffic-light emoji comparing AxiomDB against the best competitor.
+
+    Green:  AxiomDB >= best competitor (ratio >= 1.0)
+    Yellow: AxiomDB within 25% of best (ratio >= 0.75)
+    Red:    AxiomDB more than 25% behind (ratio < 0.75)
+    """
+    if best_other_ops <= 0:
+        return "\U0001f7e2"  # green if competitor has no data
+    ratio = axiom_ops / best_other_ops
+    if ratio >= 1.0:
+        return "\U0001f7e2"  # green
+    if ratio >= 0.75:
+        return "\U0001f7e1"  # yellow
+    return "\U0001f534"      # red
+
+
 def print_table(results, selected_engines):
     from collections import defaultdict
 
@@ -616,8 +633,14 @@ def print_table(results, selected_engines):
             by_scenario[scenario][result["engine"]] = (result["mean_ms"], result["ops_per_s"])
 
     all_engines = [ENGINE_CONFIGS[key][0] for key in selected_engines]
+    axiom_label = ENGINE_CONFIGS["axiomdb"][0]
+    has_axiom = axiom_label in all_engines
+    other_engines = [e for e in all_engines if e != axiom_label]
+
     print()
     header = f"{'Scenario':<22}" + "".join(f"  {engine:>24}" for engine in all_engines)
+    if has_axiom:
+        header += "   vs"
     print(header)
     print("-" * len(header))
     for scenario in PRINT_ORDER:
@@ -632,7 +655,32 @@ def print_table(results, selected_engines):
                 row += f"  {value[0]:>8.1f}ms  {value[1]:>10,} r/s"
             else:
                 row += f"  {str(value):>24}"
+
+        if has_axiom:
+            axiom_val = by_scenario[scenario].get(axiom_label)
+            if axiom_val and isinstance(axiom_val, tuple):
+                axiom_ops = axiom_val[1]
+                best_other = 0
+                for oe in other_engines:
+                    ov = by_scenario[scenario].get(oe)
+                    if ov and isinstance(ov, tuple):
+                        best_other = max(best_other, ov[1])
+                light = traffic_light(axiom_ops, best_other)
+                ratio = axiom_ops / best_other if best_other > 0 else 0
+                if ratio >= 1.0:
+                    row += f"  {light} {ratio:.2f}x"
+                else:
+                    row += f"  {light} {ratio:.2f}x"
+            else:
+                row += "      "
+
         print(row)
+
+    if has_axiom:
+        print()
+        print("  \U0001f7e2 AxiomDB >= best competitor  "
+              "\U0001f7e1 within 25%  "
+              "\U0001f534 >25% behind")
     print()
 
 
