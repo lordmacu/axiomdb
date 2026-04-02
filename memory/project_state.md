@@ -2,7 +2,7 @@
 
 ## 2026-04-02
 
-- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.9`, `39.10`, and `39.11` are closed in code, targeted validation,
+- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.9`, `39.10`, `39.11`, and `39.12` are closed in code, targeted validation,
   and docs.
 - `axiomdb-storage` now has the first complete clustered-tree write path:
   - `PageType::ClusteredInternal = 6`
@@ -42,6 +42,11 @@
   - `TxnManager` clustered root tracking per `table_id`
   - rollback / savepoint restore by primary key and exact row image
   - rollback helpers `delete_physical_by_key(...)` and `restore_exact_row_image(...)`
+- `axiomdb-wal` now also has the first clustered crash-recovery path:
+  - `CrashRecovery` undoes in-progress clustered rows by PK + exact row image
+  - recovery tracks current clustered roots per `table_id`
+  - `TxnManager::open_with_recovery(...)` seeds clustered roots from recovery
+  - `TxnManager::open(...)` rebuilds committed clustered roots from surviving WAL history
 - The clustered rewrite remains storage-first:
   - current `axiomdb-index::BTree` still uses fixed-slot `InternalNodePage` / `LeafNodePage`
   - no SQL path creates or writes clustered tables yet
@@ -63,15 +68,15 @@
   - delete-mark keeps the physical cell inline in `39.7`
   - `39.8` adds private structural rebalance helpers, but public clustered delete still does not purge dead rows
   - clustered purge after delete still depends on later phases
-  - clustered crash recovery replay still depends on `39.12`
+  - snapshot-safe purge still depends on later phases
 - `39.1` is now effectively closed by `39.10`:
   - clustered leaves support both inline rows and overflow-backed rows
   - primary key bytes and `RowHeader` remain inline in the leaf
   - generic TOAST/compression/WAL/recovery still belong to later phases
-- Current clustered WAL limitation:
-  - rollback and `ROLLBACK TO SAVEPOINT` are implemented for clustered rows
-  - `open_with_recovery()` recognizes clustered entries but still rejects unresolved in-progress clustered transactions explicitly
-  - clustered crash-recovery replay remains deferred to `39.12`
+- Current clustered WAL / recovery limitation:
+  - rollback, `ROLLBACK TO SAVEPOINT`, and crash recovery are implemented for clustered rows
+  - clustered roots are still reconstructed from surviving WAL history
+  - checkpoint/rotation-safe clustered root persistence remains deferred
 
 ## 2026-03-29
 

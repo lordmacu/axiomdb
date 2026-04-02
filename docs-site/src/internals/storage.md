@@ -341,9 +341,10 @@ InnoDB clustered undo also follows clustered-row identity rather than a heap slo
 </div>
 </div>
 
-This still stops short of clustered crash recovery. `open_with_recovery()`
-recognizes clustered entry types, but replay of unresolved clustered
-transactions remains deferred to `39.12`.
+Phase `39.12` now extends that same contract into clustered crash recovery:
+`open_with_recovery()` undoes in-progress clustered writes by PK + exact row
+image, and `open()` rebuilds committed clustered roots from surviving WAL
+history on a clean reopen.
 
 ### Clustered Update In Place (Phase 39.6)
 
@@ -408,7 +409,7 @@ This keeps the subphase honest about what now exists:
 And what still does not:
 
 - clustered older-version reconstruction/version chains
-- clustered crash recovery
+- clustered root persistence beyond WAL checkpoint/rotation
 - clustered physical purge
 - clustered SQL executor integration
 

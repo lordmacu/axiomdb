@@ -1252,25 +1252,24 @@
 - [x] ✅ 39.1 large-row overflow cells resolved in `39.10`
 - [x] 39.2 ✅ Clustered internal page format — `PageType::ClusteredInternal`, slotted variable-size separator keys, `leftmost_child` header slot, right-child-per-cell mapping, binary search, insert/remove/defragment, and unit coverage in `axiomdb-storage`
 - [x] 39.3 ✅ Clustered B-Tree insert — dedicated `axiomdb-storage::clustered_tree::insert(...)`, root bootstrap, defrag-before-split, byte-volume leaf/internal splits, separator propagation, root split handling, overflow-row rejection, and unit/integration coverage
-- [ ] ⚠️ 39.3 clustered insert now has in-process WAL/rollback semantics, but clustered crash recovery replay remains deferred — revisit in 39.12
 - [x] 39.4 ✅ Clustered B-Tree point lookup — dedicated `axiomdb-storage::clustered_tree::lookup(...)`, root-to-leaf descent, exact leaf search, inline row return, and MVCC visibility on the current inline version
-- [ ] ⚠️ 39.4 invisible current versions still return `None` because clustered older-version reconstruction remains deferred — revisit in 39.12+
+- [ ] ⚠️ 39.4 invisible current versions still return `None` because clustered older-version reconstruction remains deferred — revisit in 39.13+ / later MVCC work
 - [x] 39.5 ✅ Clustered B-Tree range scan — dedicated `axiomdb-storage::clustered_tree::range(...)`, bound-aware start-leaf descent, `next_leaf` traversal, MVCC visibility filtering, and prefetch hints across clustered leaves
-- [ ] ⚠️ 39.5 invisible current versions are skipped because clustered older-version reconstruction remains deferred — revisit in 39.12+
+- [ ] ⚠️ 39.5 invisible current versions are skipped because clustered older-version reconstruction remains deferred — revisit in 39.13+ / later MVCC work
 - [x] 39.6 ✅ Clustered B-Tree update in place — dedicated `axiomdb-storage::clustered_tree::update_in_place(...)`, same-leaf row rewrite, `row_version` bump, MVCC gating, and explicit `HeapPageFull` when growth cannot stay in the owning clustered leaf
-- [ ] ⚠️ 39.6 older-version reconstruction for overflow-backed clustered rows remains deferred even though rollback/WAL now exists — revisit in 39.12+
+- [ ] ⚠️ 39.6 older-version reconstruction for overflow-backed clustered rows remains deferred even though rollback/WAL/recovery now exist — revisit in 39.13+ / later MVCC work
 - [x] 39.7 ✅ Clustered B-Tree delete — dedicated `axiomdb-storage::clustered_tree::delete_mark(...)`, exact-leaf delete-mark, MVCC gating, old-snapshot visibility over inline deleted rows, and unit/integration coverage
-- [ ] ⚠️ 39.7 delete-mark keeps dead clustered cells inline; snapshot-safe purge and clustered crash recovery remain deferred — revisit in 39.12 / 39.18
+- [ ] ⚠️ 39.7 delete-mark keeps dead clustered cells inline; snapshot-safe purge remains deferred — revisit in 39.18
 - [x] 39.8 ✅ Clustered B-Tree split and merge — byte-volume leaf/internal rebalance, parent separator repair, root collapse, and relocate-update fallback when same-leaf growth fails
-- [ ] ⚠️ 39.8 relocate-update still rewrites only the current inline version, and delete-mark cleanup remains deferred — revisit in 39.12+ / 39.18
+- [ ] ⚠️ 39.8 relocate-update still rewrites only the current inline version, and delete-mark cleanup remains deferred — revisit in 39.13+ / 39.18
 - [ ] ⚠️ 39.8 parent separator repair still assumes the repaired separator fits in the current internal page budget — gap remains after 39.10, revisit in 39.20
 - [x] 39.9 ✅ Secondary indexes with PK bookmarks — dedicated clustered-first secondary layout in `axiomdb-sql::clustered_secondary`, physical keys encoded as `secondary_key ++ missing_primary_key_columns`, decoded bookmark recovery from scanned keys, prefix scans without fixed 10-byte RID suffixes, and relocate-stable maintenance over the existing `BTree`
 - [ ] ⚠️ 39.9 clustered PK bookmarks exist as a dedicated path, but the SQL-visible heap executor / FK / index-integrity flows still use RecordId-based secondary indexes until clustered executor integration — revisit in 39.13 / 39.14 / 39.15 / 39.16 / 39.17
 - [x] 39.10 ✅ Overflow pages for large rows — new `clustered_overflow` page chains, clustered-leaf local-prefix + optional overflow pointer format, transparent logical-row reconstruction in lookup/range, overflow-aware update transitions, physical-delete free of obsolete chains, and mixed inline/overflow coverage
-- [ ] ⚠️ 39.10 clustered overflow stays storage-first: no compression, clustered crash recovery, or snapshot-safe purge yet — revisit in 11.2 / 39.12 / 39.18
+- [ ] ⚠️ 39.10 clustered overflow stays storage-first: no compression or snapshot-safe purge yet — revisit in 11.2 / 39.18
 - [x] 39.11 ✅ WAL support for clustered operations — `ClusteredRowImage`, `EntryType::{ClusteredInsert, ClusteredDeleteMark, ClusteredUpdate}`, `TxnManager` clustered root tracking, rollback/savepoint restore by PK + exact row image, and overflow-backed clustered-row coverage
-- [ ] ⚠️ 39.11 clustered WAL/rollback is in-process only; crash recovery replay of in-progress clustered transactions remains deferred — revisit in 39.12
-- [ ] 39.12 ⏳ Crash recovery for clustered index — clustered-tree integrity after crash and repair
+- [x] 39.12 ✅ Crash recovery for clustered index — clustered recovery undo for in-progress `ClusteredInsert` / `ClusteredDeleteMark` / `ClusteredUpdate`, recovery-time root tracking per table, logical recovery over overflow-backed and relocate-update rows, and clean-open reconstruction of committed clustered roots from WAL
+- [ ] ⚠️ 39.12 clustered roots are still reconstructed from surviving WAL history; root persistence across checkpoint/rotation remains deferred — revisit in later clustered root/catalog persistence work
 - [ ] 39.13 ⏳ Executor integration: CREATE TABLE with clustered index
 - [ ] 39.14 ⏳ Executor integration: INSERT into clustered table
 - [ ] 39.15 ⏳ Executor integration: SELECT from clustered table

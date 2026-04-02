@@ -1,15 +1,15 @@
 # Architecture Notes
 
-## 2026-04-02 — Clustered internal page primitive, clustered insert/read/update/delete/rebalance, clustered secondary bookmarks, clustered overflow pages, and clustered WAL support
+## 2026-04-02 — Clustered internal page primitive, clustered insert/read/update/delete/rebalance, clustered secondary bookmarks, clustered overflow pages, clustered WAL support, and clustered crash recovery
 
 - `crates/axiomdb-storage/src/clustered_internal.rs` owns the clustered
   internal page format for Phase `39.2`.
 - `crates/axiomdb-storage/src/clustered_tree.rs` now owns the first clustered
-  tree controller for Phases `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.10`, and `39.11`.
+  tree controller for Phases `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.10`, `39.11`, and `39.12`.
 - `crates/axiomdb-storage/src/clustered_overflow.rs` now owns the overflow-page
   chain primitive for large clustered rows in Phase `39.10`.
 - `crates/axiomdb-wal/src/clustered.rs` now owns the logical row-image codec for
-  clustered WAL in Phase `39.11`.
+  clustered WAL in Phases `39.11` and `39.12`.
 - `crates/axiomdb-sql/src/clustered_secondary.rs` now owns the clustered-first
   secondary bookmark layout for Phase `39.9`.
 - The architecture still keeps storage and tree responsibilities separate:
@@ -57,7 +57,7 @@
   - stamp `txn_id_deleted` on the current inline version only when it is visible
   - preserve key bytes, row payload bytes, `txn_id_created`, `row_version`, and `next_leaf`
   - keep the physical cell inline so older snapshots can still observe it
-  - defer purge and crash recovery replay to later clustered phases
+  - defer purge to later clustered phases
 - The clustered structural-maintenance contract is now also explicit:
   - `update_with_relocation(...)` uses `update_in_place(...)` as the fast path
   - physical delete is private helper logic, not the public delete API
@@ -76,8 +76,9 @@
   - clustered WAL keys use primary-key bytes, not `(page_id, slot_id)`
   - clustered undo payloads store exact logical row images plus the latest clustered `root_pid`
   - `TxnManager` tracks clustered roots per `table_id` during the active transaction
-  - rollback restores logical row state, not exact pre-change page topology
-  - clustered crash-recovery replay remains a separate `39.12` concern
+  - rollback and crash recovery restore logical row state, not exact pre-change page topology
+  - `open()` / `open_with_recovery()` rebuild clustered roots from WAL history today
+  - checkpoint/rotation-stable clustered root persistence remains future work
 - Variable-size occupancy is measured in encoded bytes, not key count:
   - clustered leaves split by cumulative cell footprint
   - clustered internals split by cumulative separator footprint

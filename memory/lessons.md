@@ -1,5 +1,16 @@
 # Lessons Learned
 
+## 2026-04-02 - Clustered crash recovery must rebuild current roots from committed history plus active timeline, not from every seen WAL root
+
+- A clean `ROLLBACK` already restores storage state before crash recovery ever runs.
+- The right recovery contract is:
+  - keep committed clustered roots separately
+  - replay only still-active clustered WAL roots to derive the current root map at crash time
+  - undo in reverse WAL order from that current map
+- If we naively keep the last seen clustered root from every WAL entry, a rolled-back
+  transaction can poison the reopened clustered root map even though its storage
+  changes are already gone.
+
 ## 2026-04-02 - Clustered undo must key by primary key plus exact row image, not by `(page_id, slot_id)`
 
 - A clustered row rewrite cannot reuse the heap undo contract because slotted

@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 39.11 WAL support for clustered operations — logical clustered WAL row images, new clustered entry types, `TxnManager` clustered root tracking, rollback/savepoint restore by primary key, and explicit crash-recovery deferral to 39.12
+**Last completed subphase:** 39.12 Crash recovery for clustered index — clustered reverse undo on reopen, recovery-time clustered root tracking, logical restore of overflow-backed and relocate-update rows, and clean-open reconstruction of committed clustered roots from WAL
 
-**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, overflow-backed large rows, insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, clustered-first secondary bookmarks, and internal WAL/rollback now exist, but the SQL executor still uses the classic heap + secondary-index execution path and clustered crash recovery is still pending
+**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, overflow-backed large rows, insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, clustered-first secondary bookmarks, internal WAL/rollback, and clustered crash recovery now exist, but the SQL executor still uses the classic heap + secondary-index execution path
 
-**Next milestone:** 39.12 — clustered crash recovery wiring for the new logical row-image WAL path
+**Next milestone:** 39.13 — start executor integration with CREATE TABLE over clustered storage
 
 **Concurrency note:** the current server already supports concurrent read-only
 queries, but mutating statements are still serialized through a database-wide
@@ -123,7 +123,7 @@ locking clauses.
 | 36 | AxiomQL Core | ⚠️ Planned | Alternative read query language over the same AST/executor |
 | 37 | AxiomQL Write + DDL + Control | ⚠️ Planned | AxiomQL DML, DDL, control flow, maintenance |
 | 38 | AxiomDB-Wasm | ⚠️ Planned | Browser runtime, OPFS backend, sync, live queries |
-| 39 | Clustered index storage engine | 🔄 In progress | Inline PK rows, clustered internal/leaf pages, PK bookmarks in secondary indexes, logical clustered WAL/rollback |
+| 39 | Clustered index storage engine | 🔄 In progress | Inline PK rows, clustered internal/leaf pages, PK bookmarks in secondary indexes, logical clustered WAL/rollback, clustered crash recovery |
 
 ---
 

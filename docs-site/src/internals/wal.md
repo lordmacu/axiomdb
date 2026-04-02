@@ -81,7 +81,7 @@ Heap INSERT / UPDATE / DELETE / UpdateInPlace:
   key[0..8]  = page_id as u64 LE
   key[8..10] = slot_id as u16 LE
 
-ClusteredInsert / ClusteredDeleteMark / ClusteredUpdate (Phase 39.11):
+ClusteredInsert / ClusteredDeleteMark / ClusteredUpdate (Phases 39.11 / 39.12):
   key_len = primary_key_bytes.len()
   key     = encoded primary-key bytes
 ```
@@ -285,9 +285,10 @@ transaction did not commit, recovery restores `old_value` to the same slot.
 
 ---
 
-## Clustered Mutation Entries (Phase 39.11)
+## Clustered Mutation Entries (Phases 39.11 / 39.12)
 
-Phase `39.11` adds the first WAL contract for clustered rows:
+Phase `39.11` adds the first WAL contract for clustered rows, and Phase `39.12`
+extends it into clustered crash recovery:
 
 ```text
 key       = encoded primary-key bytes
@@ -317,14 +318,19 @@ a different physical leaf as long as the visible row state matches the original.
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
 <span class="callout-label">Design Decision — Restore State, Not Topology</span>
-PostgreSQL's B-tree WAL is page-topology-oriented, but that is the wrong first cut for AxiomDB's clustered rewrite because clustered slots are not stable across defragment, split, and merge. 39.11 therefore restores exact row state by PK and row image, while exact clustered crash replay waits for 39.12.
+PostgreSQL's B-tree WAL is page-topology-oriented, but that is the wrong first cut for AxiomDB's clustered rewrite because clustered slots are not stable across defragment, split, and merge. 39.11/39.12 therefore restore exact row state by PK and row image instead of trying to replay clustered page topology physically.
 </div>
 </div>
 
-This subphase intentionally stops at in-process rollback. `open_with_recovery()`
-already recognizes the clustered entry types, but it still rejects unresolved
-in-progress clustered transactions explicitly until Phase `39.12` defines their
-redo / recovery contract.
+`39.12` now uses the same payloads during crash recovery:
+
+- reverse-undo in-progress clustered inserts by `delete_physical_by_key(...)`
+- reverse-undo in-progress clustered delete-mark/update by `restore_exact_row_image(...)`
+- track the current clustered root per table while recovery undoes those writes
+- seed `TxnManager::open_with_recovery(...)` with the final recovered root map
+
+`TxnManager::open(...)` also reconstructs the latest committed clustered root
+per table from surviving WAL history on a clean reopen.
 
 ---
 
@@ -417,10 +423,11 @@ PostgreSQL's logical WAL requires two passes on recovery: a forward redo pass, t
 </div>
 </div>
 
-Phase `39.11` deliberately does not change that recovery contract yet for
-clustered entries. Clustered row-image WAL is already used for rollback and
-savepoints in-process, but crash replay of unresolved clustered transactions is
-explicitly deferred to `39.12`.
+For clustered entries, `39.12` adds the first recovery extension on top of that
+model: unresolved clustered transactions are now undone by primary key and exact
+row image instead of returning `NotImplemented`. The remaining gap is narrower:
+clustered root persistence still depends on surviving WAL history and is not yet
+checkpoint/rotation-stable.
 
 ---
 
