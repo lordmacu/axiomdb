@@ -23,6 +23,9 @@ pub enum PageType {
     Index = 2,
     Overflow = 3,
     Free = 4,
+    /// Clustered index leaf page — stores full row data inline in B-tree leaves.
+    /// Uses SQLite-style cell pointer array for variable-size cells.
+    ClusteredLeaf = 5,
 }
 
 impl TryFrom<u8> for PageType {
@@ -35,6 +38,7 @@ impl TryFrom<u8> for PageType {
             2 => Ok(PageType::Index),
             3 => Ok(PageType::Overflow),
             4 => Ok(PageType::Free),
+            5 => Ok(PageType::ClusteredLeaf),
             _ => Err(DbError::ParseError {
                 message: format!("unknown page_type: {v}"),
                 position: None,
