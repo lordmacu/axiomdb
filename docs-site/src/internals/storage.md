@@ -198,6 +198,63 @@ PostgreSQL and InnoDB can reconstruct older visible versions because they alread
 </div>
 </div>
 
+### Clustered Range Scan (Phase 39.5)
+
+`axiomdb-storage::clustered_tree::range(...)` is now the first ordered multi-row
+read path over clustered pages:
+
+```rust
+pub fn range<'a>(
+    storage: &'a dyn StorageEngine,
+    root_pid: Option<u64>,
+    from: Bound<Vec<u8>>,
+    to: Bound<Vec<u8>>,
+    snapshot: &TransactionSnapshot,
+) -> Result<ClusteredRangeIter<'a>, DbError>
+```
+
+Range flow:
+
+1. Return an empty iterator when the tree is empty or the bound interval is empty.
+2. For bounded scans, descend to the first relevant leaf with the same clustered
+   internal-page search path used by point lookup.
+3. For unbounded scans, descend to the leftmost leaf.
+4. Start at the first in-range slot within that leaf.
+5. Yield owned `ClusteredRow` values in primary-key order.
+6. Skip current inline versions that are invisible to the supplied snapshot.
+7. Follow `next_leaf` to continue the scan across leaves.
+8. Stop immediately when the first key above the upper bound is seen.
+
+The iterator stays lazy: it keeps only the current leaf page id, slot index,
+bound copies, and snapshot. It does not materialize the whole range into a
+temporary vector.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Seek Once, Then Advance</span>
+MariaDB's `read_range_first()` / `read_range_next()` and SQLite's `sqlite3BtreeFirst()` / `sqlite3BtreeNext()` both separate “find the first row” from “advance the cursor”. AxiomDB adapts that same shape to clustered storage: one tree descent to the start leaf, then O(1) `next_leaf` traversal per leaf boundary.
+</div>
+</div>
+
+When the iterator advances to another leaf, it calls
+`StorageEngine::prefetch_hint(next_leaf_pid, 4)`. The 4-page window is
+intentionally conservative: large enough to overlap sequential leaf reads, but
+small enough not to flood the page cache while clustered scans are still an
+internal storage primitive.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Small Prefetch Window</span>
+PostgreSQL uses bounded prefetch windows instead of reading arbitrarily far ahead. AxiomDB keeps clustered scan read-ahead at 4 leaves for now: enough to overlap I/O on sequential scans without turning an internal storage walk into a cache-pollution policy.
+</div>
+</div>
+
+Like `39.4`, this subphase is still honest about missing undo support. If a row's
+current inline version is invisible, `39.5` skips it; it does not reconstruct an
+older visible version yet.
+
 ---
 
 ## MmapStorage — Memory-Mapped File

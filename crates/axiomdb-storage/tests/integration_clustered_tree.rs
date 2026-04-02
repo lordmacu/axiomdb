@@ -1,3 +1,5 @@
+use std::ops::Bound;
+
 use axiomdb_core::{error::DbError, TransactionSnapshot};
 use axiomdb_storage::{
     clustered_internal, clustered_leaf, clustered_tree, MemoryStorage, PageType, RowHeader,
@@ -146,4 +148,85 @@ fn clustered_lookup_returns_inline_rows_after_many_splits() {
     )
     .unwrap();
     assert!(missing.is_none());
+}
+
+#[test]
+fn clustered_range_scan_returns_rows_in_order_across_many_leaves() {
+    let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
+    let mut root = None;
+
+    for key in 0u32..10_000 {
+        let row_len = 96 + (key as usize % 7) * 157;
+        root = Some(
+            clustered_tree::insert(
+                storage.as_mut(),
+                root,
+                &key.to_be_bytes(),
+                &row_header((key % 29) as u64 + 1),
+                &row_bytes(key, row_len),
+            )
+            .unwrap(),
+        );
+    }
+
+    let rows: Vec<_> = clustered_tree::range(
+        storage.as_ref(),
+        root,
+        Bound::Unbounded,
+        Bound::Unbounded,
+        &TransactionSnapshot::committed(20_000),
+    )
+    .unwrap()
+    .map(|row| row.unwrap())
+    .collect();
+
+    assert_eq!(rows.len(), 10_000);
+    for (idx, row) in rows.iter().enumerate() {
+        let key = idx as u32;
+        let expected_len = 96 + (key as usize % 7) * 157;
+        assert_eq!(row.key, key.to_be_bytes());
+        assert_eq!(row.row_data, row_bytes(key, expected_len));
+    }
+}
+
+#[test]
+fn clustered_range_scan_respects_bounds_across_leaf_splits() {
+    let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
+    let mut root = None;
+
+    for key in 0u32..10_000 {
+        let row_len = 160 + (key as usize % 5) * 181;
+        root = Some(
+            clustered_tree::insert(
+                storage.as_mut(),
+                root,
+                &key.to_be_bytes(),
+                &row_header((key % 13) as u64 + 1),
+                &row_bytes(key, row_len),
+            )
+            .unwrap(),
+        );
+    }
+
+    let rows: Vec<_> = clustered_tree::range(
+        storage.as_ref(),
+        root,
+        Bound::Included(1_234u32.to_be_bytes().to_vec()),
+        Bound::Excluded(4_321u32.to_be_bytes().to_vec()),
+        &TransactionSnapshot::committed(20_000),
+    )
+    .unwrap()
+    .map(|row| row.unwrap())
+    .collect();
+
+    assert_eq!(rows.len(), 4_321 - 1_234);
+    assert_eq!(rows.first().unwrap().key, 1_234u32.to_be_bytes());
+    assert_eq!(rows.last().unwrap().key, 4_320u32.to_be_bytes());
+
+    for (offset, row) in rows.iter().enumerate() {
+        let key = 1_234u32 + offset as u32;
+        let expected_len = 160 + (key as usize % 5) * 181;
+        assert_eq!(row.key, key.to_be_bytes());
+        assert_eq!(row.row_data, row_bytes(key, expected_len));
+    }
 }

@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 39.4 Clustered B-tree point lookup — dedicated storage-layer clustered read path with root-to-leaf descent, exact leaf search, inline row return, and MVCC filtering of the current inline version
+**Last completed subphase:** 39.5 Clustered B-tree range scan — dedicated storage-layer clustered ordered-read path with bound-aware start descent, `next_leaf` traversal, MVCC filtering, and prefetch hints across clustered leaves
 
-**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, insert, and point lookup now exist in storage, but the SQL executor still uses the classic heap + secondary-index execution path
+**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, insert, point lookup, and range scan now exist in storage, but the SQL executor still uses the classic heap + secondary-index execution path
 
-**Next milestone:** 39.5 — clustered range scan over the leaf chain, followed by clustered update/delete semantics
+**Next milestone:** 39.6 — clustered update in place, followed by clustered delete and undo-aware visibility work
 
 **Concurrency note:** the current server already supports concurrent read-only
 queries, but mutating statements are still serialized through a database-wide

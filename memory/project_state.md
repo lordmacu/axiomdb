@@ -2,7 +2,7 @@
 
 ## 2026-04-02
 
-- Phase 39 subphases `39.2`, `39.3`, and `39.4` are closed in code, targeted validation,
+- Phase 39 subphases `39.2`, `39.3`, `39.4`, and `39.5` are closed in code, targeted validation,
   and docs.
 - `axiomdb-storage` now has the first complete clustered-tree write path:
   - `PageType::ClusteredInternal = 6`
@@ -11,8 +11,11 @@
   - `clustered_tree::insert(storage, root_opt, key, row_header, row_data) -> Result<u64, DbError>`
 - `axiomdb-storage` now also has the first clustered-tree read path:
   - `clustered_tree::lookup(storage, root_opt, key, snapshot) -> Result<Option<ClusteredRow>, DbError>`
+  - `clustered_tree::range(storage, root_opt, from, to, snapshot) -> Result<ClusteredRangeIter<'_>, DbError>`
   - exact root-to-leaf descent over clustered internal pages
   - exact leaf search returning inline row bytes
+  - bound-aware start-leaf descent for ordered range scans
+  - `next_leaf` traversal with `StorageEngine::prefetch_hint(...)`
   - MVCC filtering via `RowHeader::is_visible(&TransactionSnapshot)`
 - Clustered tree behavior now includes:
   - empty-tree root bootstrap into `ClusteredLeaf`
@@ -27,7 +30,7 @@
   - current `axiomdb-index::BTree` still uses fixed-slot `InternalNodePage` / `LeafNodePage`
   - no SQL path creates or writes clustered tables yet
   - no SQL path reads clustered tables yet either
-  - `39.5` will add leaf-chain range scan traversal over the new clustered pages
+  - clustered range scan now exists internally, but no SQL path uses it yet
 - Current clustered lookup limitation:
   - if the current inline version is invisible to the snapshot, `lookup()` returns `None`
   - older-version reconstruction remains deferred to clustered undo/version-chain work

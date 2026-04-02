@@ -1,5 +1,21 @@
 # Lessons Learned
 
+## 2026-04-02 - Storage-first clustered range scan should seek once, then walk the leaf chain
+
+- A clustered range scan should not re-descend the tree for every next row.
+- The right intermediate contract is:
+  - descend once to the first relevant leaf for the lower bound
+  - iterate lazily slot-by-slot
+  - follow `next_leaf` across page boundaries
+  - stop immediately when the upper bound is exceeded
+- `research/mariadb-server/sql/handler.cc` contributed the `read_range_first()` /
+  `read_range_next()` control-flow split.
+- `research/sqlite/src/btree.c` contributed the cursor mindset behind
+  `sqlite3BtreeFirst()` / `sqlite3BtreeNext()`.
+- The AxiomDB adaptation is smaller on purpose: no SQL cursor layer, no row-lock
+  lifecycle, and no executor integration yet, only a storage-level iterator over
+  clustered leaves plus bounded prefetch hints.
+
 ## 2026-04-02 - When clustered lookup exists before undo, treat invisible current versions explicitly
 
 - A storage-first clustered point lookup can safely return the current inline version only if it is visible to the supplied snapshot.

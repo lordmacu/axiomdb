@@ -262,6 +262,38 @@ SQLite-style leaf chains are useful for range scans, but point lookup still belo
 </div>
 </div>
 
+### Clustered Range Scan Controller (Phase 39.5)
+
+Phase `39.5` adds the first ordered scan controller on top of the clustered
+pages:
+
+1. determine the first relevant leaf for the lower bound
+2. determine the first relevant slot inside that leaf
+3. yield visible inline rows in ascending primary-key order
+4. follow `next_leaf` across the leaf chain
+5. stop as soon as the upper bound is exceeded
+
+The controller is intentionally separate from the old fixed-layout
+`axiomdb-index::RangeIter`. The two trees now have different physical layouts
+and different row payload semantics:
+
+- classic B+ Tree leaf: `(key, RecordId)`
+- clustered leaf: `(key, RowHeader, row_data)`
+
+So the right reuse point is the iterator *shape*, not the implementation.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Borrow Cursor Shape, Not Code</span>
+SQLite's `sqlite3BtreeFirst()` / `sqlite3BtreeNext()` and MariaDB's `read_range_first()` / `read_range_next()` both use a “seek once, then iterate” cursor model. AxiomDB borrows that control flow, but keeps a dedicated clustered iterator instead of forcing the fixed-layout B+ Tree range code to pretend clustered leaves still carry `RecordId`s.
+</div>
+</div>
+
+The semantic boundary remains the same as in `39.4`: the range iterator can
+return or skip only the current inline version. Undo-aware older-version
+reconstruction is still future work.
+
 ### Leaf Node (`LeafNodePage`)
 
 ```text
