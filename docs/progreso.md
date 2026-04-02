@@ -314,12 +314,12 @@
 - [x] 9.10 ✅ Join algorithms benchmarks — join_bench.py: INNER 2K×4K AxiomDB 12.4ms vs MySQL 12.5ms (parity); LEFT 2K×4K AxiomDB 14.7ms vs MariaDB 162ms (11× faster — MariaDB uses nested loop); fixed col_idx combined→local space bug + autocommit snapshot for JOIN path
 - [x] 9.11 ✅ Streaming result iterator — LIMIT early-exit (PostgreSQL ExecutorRun(count) pattern): scan_limit parameter stops scanning after N passing rows; ORDER BY prevents early-exit (Sort requires all rows first); researched PostgreSQL execMain.c, DuckDB stream_query_result.cpp, MariaDB sql_cursor.cc — `execute_streaming()` returns `impl Iterator<Item=Row>` instead of materializing `Vec<Row>` before returning; wire protocol sends rows as they are produced (no full buffer required); SELECT without ORDER BY can terminate early when LIMIT is reached without scanning the rest of the table; eliminates per-query allocation proportional to result size; MySQL C API has `USE_RESULT` mode, PostgreSQL has server-side cursors — AxiomDB needs an equivalent for competing on large result sets without OOM; prerequisite for cursor-based pagination (Phase 13+); depends on operator fusion (9.2) being lazy internally
 
-### Phase 10 — Embedded mode + FFI `⏳` week 57-60
-- [ ] 10.1 ⏳ Refactor engine as reusable `lib.rs`
-- [ ] 10.2 ⏳ C FFI — `axiomdb_open`, `axiomdb_execute`, `axiomdb_close` with `#[no_mangle]`
-- [ ] 10.3 ⏳ Compile as `cdylib` — `.so` / `.dll` / `.dylib`
-- [ ] 10.4 ⏳ Python binding — working `ctypes` demo
-- [ ] 10.5 ⏳ Embedded test — same DB used from server and from library
+### Phase 10 — Embedded mode + FFI `🔄` week 57-60
+- [x] 10.1 ✅ Refactor engine as reusable `lib.rs` — `Db` struct with `open/execute/query/query_with_columns/begin/commit/rollback/run`; 22 integration tests
+- [x] 10.2 ✅ C FFI — 15 `#[no_mangle] extern "C"` functions: axiomdb_open, axiomdb_execute, axiomdb_query, axiomdb_close, axiomdb_rows_count/columns/column_name/type/get_int/get_double/get_text/get_blob/free, axiomdb_last_error, axiomdb_open_dsn
+- [x] 10.3 ✅ Compile as `cdylib` — `crate-type = ["rlib", "cdylib", "staticlib"]`; libaxiomdb_embedded.dylib (1.9MB), .a (34MB)
+- [x] 10.4 ✅ Python binding — `bindings/python/axiomdb.py` ctypes wrapper; AxiomDB class with context manager; query() returns List[Dict]; auto-discovers library; demo: DDL+DML+SELECT+WHERE+COUNT
+- [x] 10.5 ✅ Embedded test — 22 integration tests in crates/axiomdb-embedded/tests/integration.rs (open, query, DDL, WHERE, transactions, error handling)
 - [ ] 10.6 ⏳ Node.js binding (Neon) — native `.node` module for Electron and Node apps; async/await API
 - [ ] 10.7 ⏳ Embedded vs server benchmark — compare in-process vs TCP loopback latency to demonstrate embedded advantage
 - [ ] 10.8 ⏳ PreparedStatement Rust API — `db.prepare(sql) -> PreparedStatement`; `stmt.execute(params: &[Value])` runs N times reusing the parsed + analyzed plan without calling parse/analyze again; separate from COM_STMT_PREPARE (5.10, wire-only) — this is for the embedded Rust API where there is no MySQL wire protocol; eliminates parse+analyze overhead in tight loops (primary cause of the 15-24x INSERT gap vs SQLite in embedded benchmarks); MySQL C API has `mysql_stmt_prepare()`, libpq has `PQprepare()`, SQLite has `sqlite3_prepare_v2()` — all three competitors require this for serious embedded performance; must invalidate the cached plan on DDL changes (reuse schema_version mechanism from 5.13); implement after 10.1 (lib.rs refactor) since the public API shape depends on it
