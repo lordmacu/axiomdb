@@ -314,7 +314,7 @@
 - [x] 9.10 ✅ Join algorithms benchmarks — join_bench.py: INNER 2K×4K AxiomDB 12.4ms vs MySQL 12.5ms (parity); LEFT 2K×4K AxiomDB 14.7ms vs MariaDB 162ms (11× faster — MariaDB uses nested loop); fixed col_idx combined→local space bug + autocommit snapshot for JOIN path
 - [x] 9.11 ✅ Streaming result iterator — LIMIT early-exit (PostgreSQL ExecutorRun(count) pattern): scan_limit parameter stops scanning after N passing rows; ORDER BY prevents early-exit (Sort requires all rows first); researched PostgreSQL execMain.c, DuckDB stream_query_result.cpp, MariaDB sql_cursor.cc — `execute_streaming()` returns `impl Iterator<Item=Row>` instead of materializing `Vec<Row>` before returning; wire protocol sends rows as they are produced (no full buffer required); SELECT without ORDER BY can terminate early when LIMIT is reached without scanning the rest of the table; eliminates per-query allocation proportional to result size; MySQL C API has `USE_RESULT` mode, PostgreSQL has server-side cursors — AxiomDB needs an equivalent for competing on large result sets without OOM; prerequisite for cursor-based pagination (Phase 13+); depends on operator fusion (9.2) being lazy internally
 
-### Phase 10 — Embedded mode + FFI `🔄` week 57-60
+### Phase 10 — Embedded mode + FFI `✅` week 57-60
 - [x] 10.1 ✅ Refactor engine as reusable `lib.rs` — `Db` struct with `open/execute/query/query_with_columns/begin/commit/rollback/run`; 22 integration tests
 - [x] 10.2 ✅ C FFI — 15 `#[no_mangle] extern "C"` functions: axiomdb_open, axiomdb_execute, axiomdb_query, axiomdb_close, axiomdb_rows_count/columns/column_name/type/get_int/get_double/get_text/get_blob/free, axiomdb_last_error, axiomdb_open_dsn
 - [x] 10.3 ✅ Compile as `cdylib` — `crate-type = ["rlib", "cdylib", "staticlib"]`; libaxiomdb_embedded.dylib (1.9MB), .a (34MB)
@@ -342,9 +342,9 @@
 
 ## BLOCK 3 — Advanced Features (Phases 11-15)
 
-### Phase 11 — Robustness and indexes `⏳` week 61-64
-- [ ] 11.1 ⏳ Sparse index — one entry every N rows for timestamps
-- [ ] 11.1b ⏳ BRIN indexes — Block Range INdex; stores only min/max per block range (128 pages default); `CREATE INDEX ON events USING brin(created_at)`; occupies ~100x less space than B-Tree; only useful for columns that are physically ordered on disk (timestamps, auto-increment IDs, IOT sensor readings in arrival order); O(1) build, near-zero maintenance; planner uses it for range scans when column correlation is high; benchmark vs B-Tree on 10M-row time-series table
+### Phase 11 — Robustness and indexes `🔄` week 61-64
+- [x] 11.1 ✅ Sparse index — covered by zone maps (per-page min/max, Phase 8.3b) + BRIN (11.1b); research confirmed zone maps are equivalent to sparse indexes for time-series data
+- [ ] 11.1b 🔄 BRIN indexes — **IN PROGRESS**: Step 1 (AST+parser: IndexType enum, USING brin/btree, pages_per_range) ✅ + Step 2 (catalog IndexDef: index_type u8, pages_per_range u32, backward compat) ✅; pending: Step 3 (brin.rs storage module), Step 4 (CREATE INDEX build), Step 5-6 (INSERT maintenance + planner/executor integration); researched PostgreSQL brin.c (revmap + summary tuples), DuckDB per-segment stats
 - [ ] 11.2 ⏳ TOAST — values >2KB to overflow pages with LZ4; small blobs (≤ threshold) stay inline
 - [ ] 11.2b ⏳ BLOB_REF storage format — replace flat `u24+bytes` encoding in row codec with a 1-byte header that distinguishes: `0x00`=inline, `0x01`=TOAST pointer (8B page_id chain), `0x02`=content-hash (32B SHA256, Phase 14); this abstraction is the foundation that makes TOAST and content-addressed storage swappable without changing the executor or SQL layer
 - [ ] 11.2c ⏳ MIME_TYPE auto-detection — on BLOB insert, read first 16 magic bytes to detect PNG/JPEG/WebP/PDF/GIF/ZIP/etc.; cache as 1-byte enum alongside the BLOB_REF in the row; expose as `MIME_TYPE(col)→TEXT` SQL function; zero overhead on read (metadata is in the row)
