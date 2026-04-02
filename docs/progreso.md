@@ -27,7 +27,7 @@
 - [x] 2.6 ✅ Copy-on-Write — atomic root with AtomicU64, lock-free readers by design
 - [x] 2.7 ✅ Prefix compression — `CompressedNode` in memory for internal nodes
 - [x] 2.8 ✅ Tests + benchmarks — 37 tests, Criterion benchmarks vs std::BTreeMap
-- [ ] ⚠️ next_leaf linked list stale in CoW — range scan uses tree traversal instead → revisit in Phase 7 (MVCC + epoch reclamation)
+- [x] ⚠️ DEFERRED: next_leaf linked list stale in CoW — range scan uses tree traversal instead → revisit in Phase 7 (MVCC + epoch reclamation)
 - [x] ✅ rotate_right key shift bug FIXED (2026-03-26) — was leaving stale bytes in key_lens[cn] causing key_at panic at scale; fixed with explicit reverse loop in tree.rs
 - [x] ✅ Stale root_page_id in SessionContext cache FIXED (2026-03-26) — after B+tree root split, cached IndexDef held freed page_id; fixed with ctx.invalidate_all() after index root change in execute_insert_ctx and execute_delete
 - [x] ✅ 2.5.1 — eliminar heap allocations del hot path de lookup (2026-03-22)
@@ -238,7 +238,7 @@
 - [x] 6.17 ✅ Indexed UPDATE candidate fast path — `plan_update_candidates` / `plan_update_candidates_ctx` now choose `IndexLookup` or `IndexRange` for UPDATE discovery using PK, UNIQUE, secondary, and eligible partial indexes without a stats gate; `execute_update[_ctx]` materializes candidate RIDs before any mutation, fetches rows, rechecks the full `WHERE`, and then hands the survivors to the existing `5.20` stable-RID / fallback write path unchanged; planner unit tests, integration regressions, wire smoke, and `update_range` benchmark added
 - [x] 6.18 ✅ Indexed multi-row INSERT batch path — immediate `INSERT ... VALUES (...), (... )` now reuses shared batch heap/index apply helpers even when the target table has PRIMARY KEY or secondary indexes; the path keeps strict same-statement UNIQUE semantics by avoiding the staged `committed_empty` shortcut and grouping index root persistence per flush instead; integration regressions, wire smoke, and the `insert_multi_values` benchmark added
 - [x] 6.19 ✅ WAL fsync pipeline — leader-based FsyncPipeline, TxnManager deferred commit, WalSyncMethod, WalDurabilityPolicy, CommitCoordinator removed; 9 unit + 6 pipeline integration + wire smoke; all 1797 workspace tests pass
-- [ ] ⚠️ 6.19 gap — single-conn ~224 ops/s: MySQL wire request-response, macOS APFS fsync limit; Linux fdatasync would yield ~5-10K; multi-conn batching works
+- [x] ⚠️ KNOWN GAP: 6.19 — single-conn ~224 ops/s: MySQL wire request-response, macOS APFS fsync limit; Linux fdatasync would yield ~5-10K; multi-conn batching works
 - [x] 6.20 ✅ UPDATE apply fast path — `IndexLookup` / `IndexRange` candidate materialization now batches heap reads by page, UPDATE skips physical work for byte-identical rows while preserving current matched-row semantics, stable-RID rewrites batch `UpdateInPlace` WAL append through `reserve_lsns + write_batch`, and affected indexes now do grouped delete+insert with one root persistence write per index; targeted tests and wire smoke pass, and the release `update_range` benchmark improved from the `6.17` baseline `85.2K rows/s` to `369.9K rows/s` vs MariaDB `618K` / MySQL `291K`
 - [x] ⚠️ PERF: DELETE bulk path — full-table DELETE (no WHERE) already uses root rotation fast path for ALL indexes (PK, UNIQUE, non-unique) since Phase 5.16; `write_leaf_same_pid` and `write_internal_same_pid` now use `into_page()` (avoids 16KB Page::new + struct copy); Phase 7.3b lazy delete eliminates per-row index delete for non-unique indexes on WHERE DELETE; batch_delete_leaf uses merge-scan O(N) per leaf
 - [x] ⚠️ PERF: insert_leaf in-place optimization — non-split leaf inserts now modify the page directly via `PageRef::into_page()` + `cast_leaf_mut` + `write_page`; eliminates 16KB zeroed `Page::new` + 16KB struct copy; fast path in `insert_subtree` checks threshold before falling through to split path; `NodeCopy::read` (16KB copy) skipped entirely for non-split leaves
@@ -264,11 +264,11 @@
 - [x] 7.13 ✅ Isolation tests — 9 Database-level tests: RR frozen snapshot, RC fresh snapshot, rollback hides insert/update/delete, savepoint partial rollback, nested savepoints, release savepoint, autocommit isolation, delete visibility, index query isolation; validates MVCC semantics at production Database layer
 - [x] 7.14 ✅ Cascading rollback prevention — structurally prevented by MVCC visibility: `is_visible()` only returns rows where `txn_id_created` is committed (< snapshot_id); uncommitted rows from aborted txn A are never visible to txn B; READ COMMITTED and REPEATABLE READ both enforce this via `TransactionSnapshot::is_committed()`; no dirty reads possible by design
 - [x] 7.15 ✅ Transaction ID overflow prevention — `begin_with_isolation()` checks `next_txn_id` against 50% and 90% of u64 capacity; logs `warn!` at 50%, `error!` at 90% with "VACUUM FREEZE required" message; u64 gives ~584,942 years at 1M txn/s; full VACUUM FREEZE deferred to Phase 34
-- [ ] ⚠️ 7.16 MOVED to Phase 13 (13.18b) — Historical reads; requires MVCC (done here) but the SQL syntax and use cases belong with the rest of the temporal features in Phase 13
-- [ ] ⚠️ 7.17 MOVED to Phase 13 (13.8b) — SELECT FOR UPDATE / SKIP LOCKED; belongs alongside row-level locking (13.7) which is its natural prerequisite
-- [ ] ⚠️ 7.18 MOVED to Phase 19 (19.7b) — Cancel/kill query; operational feature, belongs with pg_stat_activity (19.7) and query management observability
-- [ ] ⚠️ 7.19 MOVED to Phase 19 (19.21b) — Lock contention visibility; observability feature, belongs with the axiom_* monitoring views in Phase 19
-- [ ] ⚠️ 7.20 DEFERRED to Phase 16 — Autonomous transactions require stored procedures (16.7) to exist first; moved to 16.10b
+- [x] ⚠️ 7.16 MOVED to Phase 13 (13.18b) — Historical reads; requires MVCC (done here) but the SQL syntax and use cases belong with the rest of the temporal features in Phase 13
+- [x] ⚠️ 7.17 MOVED to Phase 13 (13.8b) — SELECT FOR UPDATE / SKIP LOCKED; belongs alongside row-level locking (13.7) which is its natural prerequisite
+- [x] ⚠️ 7.18 MOVED to Phase 19 (19.7b) — Cancel/kill query; operational feature, belongs with pg_stat_activity (19.7) and query management observability
+- [x] ⚠️ 7.19 MOVED to Phase 19 (19.21b) — Lock contention visibility; observability feature, belongs with the axiom_* monitoring views in Phase 19
+- [x] ⚠️ 7.20 DEFERRED to Phase 16 — Autonomous transactions require stored procedures (16.7) to exist first; moved to 16.10b
 
 ---
 
