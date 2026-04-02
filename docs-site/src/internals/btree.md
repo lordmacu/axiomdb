@@ -231,6 +231,37 @@ The simpler “allocate two fresh pages on every clustered split” option would
 </div>
 </div>
 
+### Clustered Point Lookup Controller (Phase 39.4)
+
+Phase `39.4` extends that dedicated clustered controller with exact point
+lookup:
+
+1. descend internal pages by separator key
+2. search the target leaf by exact key
+3. return the inline row payload directly
+4. filter the hit through `RowHeader::is_visible(snapshot)`
+
+The important scope cut is semantic rather than structural: the controller can
+read the current inline row version, but it cannot yet chase older versions
+because clustered undo chains are still future work.
+
+That means the current `lookup(...)` contract is:
+
+- visible hit → `Some(ClusteredRow)`
+- key absent → `None`
+- current inline version invisible → `None`
+
+This is a deliberate intermediate contract for the storage rewrite, not the
+final SQL-visible clustered read semantics.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Exact Tree Search, No Leaf Walk</span>
+SQLite-style leaf chains are useful for range scans, but point lookup still belongs on the tree path. AxiomDB keeps clustered point reads as true root-to-leaf binary search instead of falling back to a leaf-chain probe that would blur the boundary with Phase 39.5.
+</div>
+</div>
+
 ### Leaf Node (`LeafNodePage`)
 
 ```text

@@ -15,11 +15,14 @@ Phase 39 is building clustered storage internally, but there is not yet a
 user-visible table option that stores full rows inside PRIMARY KEY leaves. For
 now, all user-visible tables still behave as heap-backed tables.
 
+Internally, the storage rewrite already has clustered insert and clustered point
+lookup primitives, but they are not wired into SQL yet.
+
 <div class="callout callout-tip">
 <span class="callout-icon">💡</span>
 <div class="callout-body">
 <span class="callout-label">Current Behavior</span>
-If you compare AxiomDB with InnoDB or MariaDB today, remember that PRIMARY KEY lookups still use an index lookup followed by a heap fetch. The clustered-table rewrite is in progress internally, not exposed at the SQL surface yet.
+If you compare AxiomDB with InnoDB or MariaDB today, remember that SQL-visible PRIMARY KEY lookups still use an index lookup followed by a heap fetch. The clustered-table rewrite is in progress internally, not exposed at the SQL surface yet.
 </div>
 </div>
 

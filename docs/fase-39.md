@@ -1,6 +1,6 @@
 # Phase 39 — Clustered Index Storage Engine
 
-## Subfases completed in this session: 39.2, 39.3
+## Subfases completed in this session: 39.2, 39.3, 39.4
 
 ## What was built
 
@@ -89,6 +89,46 @@ The split policy is storage-first and in-place:
 - `crates/axiomdb-storage/tests/integration_clustered_tree.rs`
   - adds clustered insert integration coverage over 10K rows
 
+### 39.4 — Clustered B-tree point lookup
+
+`crates/axiomdb-storage/src/clustered_tree.rs` now also implements the first
+tree-level read path for clustered storage.
+
+The new API is:
+
+- `lookup(storage, root_opt, key, snapshot) -> Result<Option<ClusteredRow>, DbError>`
+
+Behavior:
+
+- `None` when the clustered tree is empty
+- `None` when the key is absent
+- `Some(ClusteredRow)` when the key exists and the current inline version is
+  visible to the supplied `TransactionSnapshot`
+- `None` when the key exists but the current inline version is not visible
+
+This lookup path:
+
+- descends clustered internal pages with binary search
+- performs exact-key search on the clustered leaf cell pointer array
+- returns owned `key`, `RowHeader`, and `row_data` directly from the clustered
+  leaf page
+- uses `RowHeader::is_visible(...)` for MVCC filtering
+
+Important boundary for this subphase:
+
+- 39.4 does **not** reconstruct older visible versions yet
+- if the current inline version is invisible, lookup returns `None`
+- undo/version-chain behavior stays deferred to later clustered MVCC / WAL phases
+
+### Supporting changes for 39.4
+
+- `crates/axiomdb-storage/src/clustered_tree.rs`
+  - adds `ClusteredRow`
+  - adds root-to-leaf lookup descent helper
+  - adds snapshot-filtered exact point lookup
+- `crates/axiomdb-storage/tests/integration_clustered_tree.rs`
+  - adds clustered point lookup integration probes after many inserts and splits
+
 ## Validation
 
 Targeted validation passed:
@@ -127,17 +167,38 @@ New clustered insert coverage now includes:
 - internal split and root split
 - 10K-row sorted verification in both unit and integration tests
 
+Targeted validation for `39.4` also passed:
+
+- `cargo test -p axiomdb-storage clustered_tree --lib -j1`
+- `cargo test -p axiomdb-storage --test integration_clustered_tree -j1`
+- `cargo test -p axiomdb-storage -j1`
+- `cargo clippy -p axiomdb-storage -- -D warnings`
+- `cargo fmt --check`
+- `cargo check -p axiomdb-index -j1`
+- `cargo check -p axiomdb-sql --lib -j1`
+- `mdbook build docs-site`
+
+New clustered lookup coverage now includes:
+
+- empty-tree lookup
+- root-as-leaf hit
+- missing-key lookup
+- invisible current-version behavior
+- lookup after internal/root splits
+- 10K-row integration probes over a split tree
+
 ## Review notes
 
 - All `39.3` acceptance criteria from the spec are implemented.
+- All `39.4` acceptance criteria from the spec are implemented.
 - No `unsafe` was introduced in the clustered tree path.
 - No production `unwrap()` remains in the touched clustered files.
-- Benchmarking is intentionally deferred: `39.3` does not expose lookup/scan yet,
-  so the benchmark gate starts after `39.4` / `39.5`.
+- Benchmarking is intentionally deferred: `39.4` adds point lookup, but the
+  clustered read benchmark gate starts after `39.5` adds the range-scan path too.
 
 ## Deferred
 
-- `39.4` / `39.5` — lookup and range scan over clustered pages
+- `39.5` — range scan over clustered pages
 - `39.8` — parent maintenance during split / merge
 - `39.11+` — WAL and crash recovery for clustered operations
 - `39.13+` — executor integration for clustered tables
@@ -148,5 +209,7 @@ New clustered insert coverage now includes:
   `axiomdb-index::BTree` yet.
 - `39.3` keeps that same boundary: clustered inserts now work in storage, but no
   SQL path creates or writes clustered tables yet.
+- `39.4` keeps the same boundary on reads: clustered point lookup exists in
+  storage, but no SQL `SELECT` path uses it yet.
 - `39.1` remains open because large-row overflow cells are still deferred to
   `39.10`, even though the clustered leaf groundwork already exists in storage.

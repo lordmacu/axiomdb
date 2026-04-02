@@ -162,6 +162,42 @@ InnoDB and SQLite both have to reason about variable-size leaf contents during p
 </div>
 </div>
 
+### Clustered Point Lookup (Phase 39.4)
+
+`axiomdb-storage::clustered_tree::lookup(...)` is now the first read path over
+the clustered tree:
+
+```rust
+pub fn lookup(
+    storage: &dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    snapshot: &TransactionSnapshot,
+) -> Result<Option<ClusteredRow>, DbError>
+```
+
+Lookup flow:
+
+1. Return `None` immediately when the tree has no root.
+2. Descend clustered internal pages with `find_child_idx()` and `child_at()`.
+3. Run exact-key binary search on the target clustered leaf.
+4. Read the inline `(key, RowHeader, row_data)` cell.
+5. Apply `RowHeader::is_visible(snapshot)`.
+6. Return an owned `ClusteredRow` on a visible hit.
+
+In `39.4`, lookup is intentionally conservative about invisible rows: when the
+current inline version fails MVCC visibility, it returns `None` instead of
+trying to synthesize an older version. Clustered undo/version-chain traversal
+does not exist yet; it arrives later with clustered update/delete/WAL work.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Invisible Means Absent For Now</span>
+PostgreSQL and InnoDB can reconstruct older visible versions because they already have undo/version-chain machinery. AxiomDB deliberately does not fake that in 39.4: until clustered undo exists, an invisible current inline version is reported as `None` instead of inventing semantics the engine cannot prove.
+</div>
+</div>
+
 ---
 
 ## MmapStorage — Memory-Mapped File
