@@ -4,6 +4,25 @@ Indexes are B+ Tree data structures that allow AxiomDB to find rows matching a
 condition without scanning the entire table. Every index is a Copy-on-Write B+ Tree
 stored in the same `.db` file as the table data.
 
+## Current Storage Model
+
+Today, SQL tables still use the classic **heap + index** layout:
+
+- the PRIMARY KEY B+ Tree finds a row location
+- the engine then reads the heap row itself
+
+Phase 39 is building clustered storage internally, but there is not yet a
+user-visible table option that stores full rows inside PRIMARY KEY leaves. For
+now, all user-visible tables still behave as heap-backed tables.
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Current Behavior</span>
+If you compare AxiomDB with InnoDB or MariaDB today, remember that PRIMARY KEY lookups still use an index lookup followed by a heap fetch. The clustered-table rewrite is in progress internally, not exposed at the SQL surface yet.
+</div>
+</div>
+
 ---
 
 ## Index Statistics and Query Planner

@@ -76,7 +76,7 @@ pub enum PageType {
 }
 ```
 
-### Clustered Page Primitives (Phase 39.1 / 39.2)
+### Clustered Page Primitives (Phase 39.1 / 39.2 / 39.3)
 
 The clustered index rewrite is landing in the storage layer first. Two new page
 types now exist even though the SQL executor still uses the classic heap +
@@ -117,6 +117,48 @@ contract:
 <div class="callout-body">
 <span class="callout-label">Design Decision — SQLite-Style Slots, B-Tree Semantics</span>
 SQLite-style slotted pages solve variable-size key storage cleanly, but clustered internal pages still need classic B-tree child semantics. AxiomDB adapts the pattern by storing `leftmost_child` in the header and the remaining children inside separator cells, avoiding the fixed 64-byte key cap of the old `InternalNodePage`.
+</div>
+</div>
+
+### Clustered Tree Insert Controller (Phase 39.3)
+
+`axiomdb-storage::clustered_tree` now builds the first tree-level write path on
+top of these page primitives. The public entry point is:
+
+```rust
+pub fn insert(
+    storage: &mut dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    row_header: &RowHeader,
+    row_data: &[u8],
+) -> Result<u64, DbError>
+```
+
+The controller is still storage-first:
+
+1. Bootstrap an empty tree into a `ClusteredLeaf` root when `root_pid` is `None`.
+2. Descend through `ClusteredInternal` pages with `find_child_idx()`.
+3. Insert inline into the target leaf in sorted key order.
+4. If the row does not fit, defragment once and retry before splitting.
+5. Split leaves by cumulative cell byte volume, not by cell count.
+6. Propagate `(separator_key, right_child_pid)` upward.
+7. Split internal pages by cumulative separator byte volume and create a new
+   root if the old root overflows.
+
+Split behavior deliberately keeps the old page ID as the left half and
+allocates only the new right sibling. That matches the current no-concurrent-
+clustered-writer reality and keeps parent maintenance minimal until the later
+MVCC/WAL phases wire clustered pages into the full engine.
+
+Rows that do not fit inline on an otherwise empty clustered leaf are rejected
+explicitly in `39.3`; overflow-page support remains deferred to `39.10`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Split By Bytes, Not Count</span>
+InnoDB and SQLite both have to reason about variable-size leaf contents during page split. AxiomDB follows that constraint directly: clustered leaves and internals split by cumulative encoded bytes, because a 3 KB row and a 40-byte row are not equivalent occupancy units.
 </div>
 </div>
 

@@ -51,6 +51,30 @@ const MIN_FREEBLOCK: usize = 4;
 /// Sentinel page ID meaning "no next leaf".
 pub const NULL_PAGE: u64 = u64::MAX;
 
+/// Maximum primary-key bytes that can fit inline on an otherwise empty
+/// clustered leaf page when `row_data` is empty.
+pub fn max_inline_key_bytes() -> usize {
+    BODY_SIZE - CL_HEADER_SIZE - CELL_PTR_SIZE - CELL_META_SIZE - ROW_HEADER_SIZE
+}
+
+/// Maximum row payload bytes that can fit inline on an otherwise empty
+/// clustered leaf page for a given key length.
+pub fn max_inline_row_bytes(key_len: usize) -> Option<usize> {
+    max_inline_key_bytes().checked_sub(key_len)
+}
+
+/// Total on-page footprint of a clustered leaf entry, including its 2-byte
+/// pointer-array slot.
+pub fn cell_footprint(key_len: usize, row_len: usize) -> usize {
+    CELL_PTR_SIZE + CELL_META_SIZE + ROW_HEADER_SIZE + key_len + row_len
+}
+
+/// Returns whether a `(key, row_data)` pair fits on an otherwise empty
+/// clustered leaf page without overflow support.
+pub fn fits_inline(key_len: usize, row_len: usize) -> bool {
+    max_inline_row_bytes(key_len).is_some_and(|max| row_len <= max)
+}
+
 // ── Header access ────────────────────────────────────────────────────────────
 
 /// Read `num_cells` from the clustered leaf header.
@@ -103,7 +127,16 @@ fn set_freeblock_offset(page: &mut Page, v: u16) {
 pub fn next_leaf(page: &Page) -> u64 {
     let b = page.as_bytes();
     let off = HEADER_SIZE + 8;
-    u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
+    u64::from_le_bytes([
+        b[off],
+        b[off + 1],
+        b[off + 2],
+        b[off + 3],
+        b[off + 4],
+        b[off + 5],
+        b[off + 6],
+        b[off + 7],
+    ])
 }
 
 /// Set the next leaf page ID.

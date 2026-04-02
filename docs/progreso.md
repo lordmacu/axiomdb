@@ -1251,7 +1251,8 @@
 - [ ] 39.1 ⏳ Clustered leaf page format — variable-size slotted leaf pages storing full rows inline; closure still pending large-row overflow support and final acceptance
 - [ ] ⚠️ 39.1 large-row overflow cells remain open — revisit in 39.10
 - [x] 39.2 ✅ Clustered internal page format — `PageType::ClusteredInternal`, slotted variable-size separator keys, `leftmost_child` header slot, right-child-per-cell mapping, binary search, insert/remove/defragment, and unit coverage in `axiomdb-storage`
-- [ ] 39.3 ⏳ Clustered B-Tree insert — insert full rows into clustered leaves and propagate separators upward
+- [x] 39.3 ✅ Clustered B-Tree insert — dedicated `axiomdb-storage::clustered_tree::insert(...)`, root bootstrap, defrag-before-split, byte-volume leaf/internal splits, separator propagation, root split handling, overflow-row rejection, and unit/integration coverage
+- [ ] ⚠️ 39.3 clustered insert still has no WAL/undo semantics — revisit in 39.11 / 39.12
 - [ ] 39.4 ⏳ Clustered B-Tree point lookup — return row data directly from clustered leaf pages
 - [ ] 39.5 ⏳ Clustered B-Tree range scan — leaf-chain traversal over clustered pages
 - [ ] 39.6 ⏳ Clustered B-Tree update in place — patch non-key columns directly on clustered cells

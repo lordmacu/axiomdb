@@ -200,6 +200,37 @@ The clustered rewrite rejects the simpler "just keep a second variable-size chil
 </div>
 </div>
 
+### Clustered Insert Controller (Phase 39.3)
+
+Phase `39.3` does **not** retrofit the current `axiomdb-index::BTree` into a
+generic tree over fixed and clustered pages. Instead, `axiomdb-storage`
+contains a dedicated controller in `clustered_tree.rs` that proves the first
+full write path for clustered pages while the SQL executor still uses the
+classic heap + index engine.
+
+Algorithm shape:
+
+1. `insert(storage, root_opt, ...)` bootstraps a clustered leaf root if needed.
+2. Recursive descent chooses child pointers from `ClusteredInternal`.
+3. Leaf inserts stay in-place when the row fits.
+4. Fragmented leaves/internal pages call `defragment()` once before split.
+5. Leaf splits rebuild left/right pages by cumulative cell footprint.
+6. Internal splits rebuild left/right separator sets and promote one separator.
+7. Root overflow creates a fresh `ClusteredInternal` root.
+
+Unlike the old structural Copy-on-Write tree, clustered `39.3` keeps the old
+page ID as the left half on split and allocates only the new right sibling.
+That is a conscious storage-first choice for the current single-writer runtime,
+not the final concurrency model.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Stable Left Page ID</span>
+The simpler “allocate two fresh pages on every clustered split” option would mimic the old CoW tree, but it would also force needless parent pointer churn. AxiomDB keeps the left page stable and allocates only the new right sibling until Phase 39 reaches WAL, recovery, and executor integration.
+</div>
+</div>
+
 ### Leaf Node (`LeafNodePage`)
 
 ```text

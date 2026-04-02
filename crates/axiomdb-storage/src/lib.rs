@@ -2,6 +2,7 @@
 
 pub mod clustered_internal;
 pub mod clustered_leaf;
+pub mod clustered_tree;
 pub mod config;
 pub mod dirty;
 pub mod doublewrite;
