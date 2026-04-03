@@ -57,13 +57,14 @@ pub fn verify_and_repair_indexes_on_open(
 ) -> Result<IndexIntegrityReport, DbError> {
     let snapshot = txn.snapshot();
     let tables = list_visible_tables(storage, snapshot)?;
-    let mut report = IndexIntegrityReport {
-        tables_checked: tables.len(),
-        ..IndexIntegrityReport::default()
-    };
+    let mut report = IndexIntegrityReport::default();
     let mut pending = Vec::new();
 
     for table_def in &tables {
+        if table_def.is_clustered() {
+            continue;
+        }
+        report.tables_checked += 1;
         let (col_defs, indexes) = {
             let mut reader = CatalogReader::new(storage, snapshot)?;
             (

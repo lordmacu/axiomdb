@@ -43,8 +43,16 @@ its original balance.
 Phases `39.11` and `39.12` extend that internal durability model to the
 clustered-index storage rewrite: clustered rows now have WAL-backed
 rollback/savepoint support and crash recovery by primary key plus exact row
-image. This is still an internal storage milestone, not a SQL-visible
-clustered-table feature yet.
+image. Phase `39.13` makes the first SQL-visible clustered cut: `CREATE TABLE`
+with an explicit `PRIMARY KEY` now creates clustered metadata and a clustered
+table root, but clustered DML still returns `0A000` / `NotImplemented` until
+`39.14`–`39.17`.
+
+```sql
+CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
+INSERT INTO users VALUES (1, 'alice');
+-- ERROR 0A000: feature not implemented: INSERT into clustered table — Phase 39.14
+```
 
 ---
 

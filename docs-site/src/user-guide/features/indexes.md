@@ -6,26 +6,30 @@ stored in the same `.db` file as the table data.
 
 ## Current Storage Model
 
-Today, SQL tables still use the classic **heap + index** layout:
+Today AxiomDB exposes **two** SQL-visible table layouts:
 
-- the PRIMARY KEY B+ Tree finds a row location
-- the engine then reads the heap row itself
+- tables **without** an explicit `PRIMARY KEY` still use the classic heap + index path
+- tables **with** an explicit `PRIMARY KEY` now bootstrap clustered storage at `CREATE TABLE` time
 
-Phase 39 is building clustered storage internally, but there is not yet a
-user-visible table option that stores full rows inside PRIMARY KEY leaves. For
-now, all user-visible tables still behave as heap-backed tables.
+That new clustered DDL boundary is intentionally narrow in `39.13`:
+
+- the table root is clustered from day one
+- PRIMARY KEY catalog metadata points at that clustered root
+- `INSERT`, `SELECT`, `UPDATE`, and `DELETE` on clustered tables still return `0A000` / `NotImplemented` until `39.14`–`39.17`
 
 Internally, the storage rewrite already has clustered insert, point lookup,
 range scan, same-leaf update, delete-mark, structural rebalance / relocate-update,
 secondary PK bookmarks, and overflow-backed clustered rows for large payloads,
-but they are not wired into SQL yet.
+and explicit-PK `CREATE TABLE` now records that layout in SQL metadata, but the
+generic SQL DML executor is not wired to clustered rows yet.
 
 That internal rewrite is still honest about its current boundary:
 
 - relocate-update rewrites only the current inline version
 - clustered delete is still delete-mark first, not purge
 - large clustered rows can already spill to overflow pages internally, but SQL
-  tables still expose only the classic heap-backed layout
+  only explicit-PK tables expose clustered layout at DDL time; runnable SQL DML
+  still needs heap-backed tables today
 - clustered-first secondary bookmarks now exist internally, but the SQL-visible
   executor still uses heap `RecordId` secondary indexes
 
@@ -33,7 +37,7 @@ That internal rewrite is still honest about its current boundary:
 <span class="callout-icon">💡</span>
 <div class="callout-body">
 <span class="callout-label">Current Behavior</span>
-If you compare AxiomDB with InnoDB or MariaDB today, remember that SQL-visible PRIMARY KEY lookups still use an index lookup followed by a heap fetch. The clustered-table rewrite is in progress internally, not exposed at the SQL surface yet.
+`CREATE TABLE users (id INT PRIMARY KEY, ...)` now succeeds and creates clustered metadata, but `INSERT INTO users ...` still fails with SQLSTATE `0A000` until Phase `39.14`. Keep heap-backed tables for runnable SQL workloads until clustered DML lands.
 </div>
 </div>
 
@@ -180,8 +184,17 @@ AxiomDB automatically creates a unique B+ Tree index for:
 - Every `PRIMARY KEY` declaration
 - Every `UNIQUE` column constraint or `UNIQUE` table constraint
 
-These indexes are created at `CREATE TABLE` time and cannot be dropped without
-dropping the corresponding constraint.
+For clustered tables, the automatically created PRIMARY KEY metadata row reuses
+the clustered table root instead of allocating a second heap-era PK tree.
+`UNIQUE` secondary indexes still allocate ordinary B+ Tree roots.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Real PK Root</span>
+AxiomDB does not create a fake heap-side PRIMARY KEY index for clustered tables just to preserve old executor assumptions. That keeps the catalog aligned with the real physical layout and avoids the hidden-compatibility detour that engines like InnoDB can afford only because they already support a fallback clustered key path.
+</div>
+</div>
 
 ## Multi-row INSERT on Indexed Tables
 

@@ -11,11 +11,11 @@
 use axiomdb_catalog::{
     bootstrap::CatalogBootstrap,
     reader::CatalogReader,
-    schema::{ColumnDef, ColumnType, IndexDef},
+    schema::{ColumnDef, ColumnType, IndexDef, TableStorageLayout},
     writer::CatalogWriter,
 };
 use axiomdb_core::TransactionSnapshot;
-use axiomdb_storage::{MemoryStorage, MmapStorage, StorageEngine};
+use axiomdb_storage::{MemoryStorage, MmapStorage, PageType, StorageEngine};
 use axiomdb_wal::TxnManager;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -98,6 +98,31 @@ fn test_get_table_by_id() {
     let found = reader.get_table_by_id(table_id).unwrap();
     assert!(found.is_some());
     assert_eq!(found.unwrap().table_name, "items");
+}
+
+#[test]
+fn test_create_table_with_clustered_layout_allocates_clustered_leaf_root() {
+    let (mut storage, mut txn) = setup();
+
+    txn.begin().unwrap();
+    let table = {
+        let mut w = CatalogWriter::new(&mut storage, &mut txn).unwrap();
+        w.create_table_with_layout("public", "events", TableStorageLayout::Clustered)
+            .unwrap()
+    };
+    txn.commit().unwrap();
+
+    let snap = committed_snap(&txn);
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
+    let found = reader.get_table("public", "events").unwrap().unwrap();
+    assert_eq!(found.storage_layout, TableStorageLayout::Clustered);
+    assert_eq!(found.root_page_id, table.root_page_id);
+
+    let root = storage.read_page(found.root_page_id).unwrap();
+    assert_eq!(
+        PageType::try_from(root.header().page_type).unwrap(),
+        PageType::ClusteredLeaf
+    );
 }
 
 #[test]

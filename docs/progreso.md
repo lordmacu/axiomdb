@@ -1270,7 +1270,8 @@
 - [x] 39.11 ✅ WAL support for clustered operations — `ClusteredRowImage`, `EntryType::{ClusteredInsert, ClusteredDeleteMark, ClusteredUpdate}`, `TxnManager` clustered root tracking, rollback/savepoint restore by PK + exact row image, and overflow-backed clustered-row coverage
 - [x] 39.12 ✅ Crash recovery for clustered index — clustered recovery undo for in-progress `ClusteredInsert` / `ClusteredDeleteMark` / `ClusteredUpdate`, recovery-time root tracking per table, logical recovery over overflow-backed and relocate-update rows, and clean-open reconstruction of committed clustered roots from WAL
 - [ ] ⚠️ 39.12 clustered roots are still reconstructed from surviving WAL history; root persistence across checkpoint/rotation remains deferred — revisit in later clustered root/catalog persistence work
-- [ ] 39.13 ⏳ Executor integration: CREATE TABLE with clustered index
+- [x] 39.13 ✅ Executor integration: CREATE TABLE with clustered index — explicit `PRIMARY KEY` tables now persist `TableStorageLayout::Clustered` plus a generic `root_page_id`, bootstrap a clustered-leaf table root, persist logical PK metadata on that same root, and reject heap-only runtime paths with phase-scoped `NotImplemented` errors
+- [ ] ⚠️ 39.13 clustered DML is still intentionally blocked behind explicit guard rails (`INSERT` / `SELECT` / `UPDATE` / `DELETE`) and standalone clustered maintenance helpers such as `CREATE INDEX` / `ANALYZE` / `VACUUM` are still deferred — revisit in `39.14` / `39.15` / `39.16` / `39.17` / `39.18`
 - [ ] 39.14 ⏳ Executor integration: INSERT into clustered table
 - [ ] 39.15 ⏳ Executor integration: SELECT from clustered table
 - [ ] 39.16 ⏳ Executor integration: UPDATE on clustered table

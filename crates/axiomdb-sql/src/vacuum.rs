@@ -130,8 +130,9 @@ fn vacuum_one_table(
     oldest_safe_txn: u64,
     bloom: &mut crate::bloom::BloomRegistry,
 ) -> Result<VacuumTableResult, DbError> {
+    table_def.ensure_heap_runtime("VACUUM on clustered table — Phase 39.18")?;
     // 1. Heap vacuum: walk the heap chain, mark dead slots.
-    let dead_rows = vacuum_heap_chain(storage, table_def.data_root_page_id, oldest_safe_txn)?;
+    let dead_rows = vacuum_heap_chain(storage, table_def.root_page_id, oldest_safe_txn)?;
 
     // 2. Index vacuum: clean dead entries from ALL indexes (PostgreSQL model).
     // Since DELETE/UPDATE no longer remove index entries for any index type,

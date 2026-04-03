@@ -285,6 +285,41 @@ impl From<ColumnType> for u8 {
     }
 }
 
+// ── TableStorageLayout ────────────────────────────────────────────────────────
+
+/// Physical storage layout for a table's primary row store.
+///
+/// `Heap` is the legacy heap-chain layout.
+/// `Clustered` means the table rows live directly in the clustered primary-key tree.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TableStorageLayout {
+    #[default]
+    Heap = 0,
+    Clustered = 1,
+}
+
+impl TryFrom<u8> for TableStorageLayout {
+    type Error = DbError;
+
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            0 => Ok(Self::Heap),
+            1 => Ok(Self::Clustered),
+            _ => Err(DbError::ParseError {
+                message: format!("unknown TableStorageLayout discriminant: {v}"),
+                position: None,
+            }),
+        }
+    }
+}
+
+impl From<TableStorageLayout> for u8 {
+    fn from(layout: TableStorageLayout) -> u8 {
+        layout as u8
+    }
+}
+
 // ── TableDef ──────────────────────────────────────────────────────────────────
 
 /// Metadata for a user table — one row in `axiom_tables`.
@@ -292,28 +327,50 @@ impl From<ColumnType> for u8 {
 /// ## On-disk format (`to_bytes` / `from_bytes`)
 ///
 /// ```text
-/// [table_id:4 LE][data_root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8]
+/// legacy:
+///   [table_id:4 LE][root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8]
+///
+/// current:
+///   [table_id:4 LE][root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8][layout:1]
 /// ```
 ///
-/// `data_root_page_id` is the root page of the `HeapChain` that stores this
-/// table's user rows. It is allocated by `CatalogWriter::create_table` and
-/// never changes for the lifetime of the table.
+/// Legacy rows without the trailing `layout` byte decode as [`TableStorageLayout::Heap`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableDef {
     pub id: TableId,
-    /// Root page of the heap chain holding this table's user row data.
+    /// Root page of the table's primary row store.
     ///
-    /// Used by `TableEngine` to locate the data heap without an extra lookup.
+    /// For heap tables this points to the `HeapChain` root.
+    /// For clustered tables this points to the clustered leaf/internal root.
     /// Must never be 0 (page 0 is the meta page).
-    pub data_root_page_id: u64,
+    pub root_page_id: u64,
+    pub storage_layout: TableStorageLayout,
     pub schema_name: String,
     pub table_name: String,
 }
 
 impl TableDef {
+    pub fn is_heap(&self) -> bool {
+        self.storage_layout == TableStorageLayout::Heap
+    }
+
+    pub fn is_clustered(&self) -> bool {
+        self.storage_layout == TableStorageLayout::Clustered
+    }
+
+    pub fn ensure_heap_runtime(&self, feature: &str) -> Result<(), DbError> {
+        if self.is_clustered() {
+            return Err(DbError::NotImplemented {
+                feature: feature.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Serializes to binary row format.
     ///
-    /// Format: `[table_id:4][data_root_page_id:8][schema_len:1][schema bytes][name_len:1][name bytes]`
+    /// Format:
+    /// `[table_id:4][root_page_id:8][schema_len:1][schema bytes][name_len:1][name bytes][layout:1]`
     ///
     /// # Panics (debug only)
     /// If `schema_name` or `table_name` exceeds 255 bytes.
@@ -323,13 +380,14 @@ impl TableDef {
         debug_assert!(schema.len() <= 255, "schema_name too long");
         debug_assert!(name.len() <= 255, "table_name too long");
 
-        let mut buf = Vec::with_capacity(4 + 8 + 1 + schema.len() + 1 + name.len());
+        let mut buf = Vec::with_capacity(4 + 8 + 1 + schema.len() + 1 + name.len() + 1);
         buf.extend_from_slice(&self.id.to_le_bytes());
-        buf.extend_from_slice(&self.data_root_page_id.to_le_bytes());
+        buf.extend_from_slice(&self.root_page_id.to_le_bytes());
         buf.push(schema.len() as u8);
         buf.extend_from_slice(schema);
         buf.push(name.len() as u8);
         buf.extend_from_slice(name);
+        buf.push(self.storage_layout.into());
         buf
     }
 
@@ -351,7 +409,7 @@ impl TableDef {
         }
 
         let id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let data_root_page_id = u64::from_le_bytes([
+        let root_page_id = u64::from_le_bytes([
             bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
         ]);
         let schema_len = bytes[12] as usize;
@@ -379,12 +437,27 @@ impl TableDef {
                 position: None,
             })?
             .to_string();
-        let consumed = pos + name_len;
+        let mut consumed = pos + name_len;
+        let storage_layout = match bytes.len() {
+            len if len == consumed => TableStorageLayout::Heap,
+            len if len == consumed + 1 => {
+                let layout = TableStorageLayout::try_from(bytes[consumed])?;
+                consumed += 1;
+                layout
+            }
+            _ => {
+                return Err(DbError::ParseError {
+                    message: "unexpected trailing bytes in TableRow".into(),
+                    position: None,
+                })
+            }
+        };
 
         Ok((
             Self {
                 id,
-                data_root_page_id,
+                root_page_id,
+                storage_layout,
                 schema_name,
                 table_name,
             },
@@ -1181,7 +1254,8 @@ mod tests {
     fn test_table_def_roundtrip() {
         let def = TableDef {
             id: 42,
-            data_root_page_id: 7,
+            root_page_id: 7,
+            storage_layout: TableStorageLayout::Heap,
             schema_name: "public".to_string(),
             table_name: "users".to_string(),
         };
@@ -1193,16 +1267,17 @@ mod tests {
 
     #[test]
     fn test_table_def_roundtrip_with_root_page() {
-        // Verify that data_root_page_id round-trips correctly for various values.
+        // Verify that root_page_id round-trips correctly for various values.
         for &root in &[1u64, 100, u64::MAX / 2, u64::MAX - 1] {
             let def = TableDef {
                 id: 1,
-                data_root_page_id: root,
+                root_page_id: root,
+                storage_layout: TableStorageLayout::Heap,
                 schema_name: "public".into(),
                 table_name: "t".into(),
             };
             let (back, _) = TableDef::from_bytes(&def.to_bytes()).unwrap();
-            assert_eq!(back.data_root_page_id, root);
+            assert_eq!(back.root_page_id, root);
         }
     }
 
@@ -1210,7 +1285,8 @@ mod tests {
     fn test_table_def_empty_strings() {
         let def = TableDef {
             id: 1,
-            data_root_page_id: 5,
+            root_page_id: 5,
+            storage_layout: TableStorageLayout::Heap,
             schema_name: String::new(),
             table_name: String::new(),
         };
@@ -1223,7 +1299,8 @@ mod tests {
     fn test_table_def_truncated_input_error() {
         let def = TableDef {
             id: 1,
-            data_root_page_id: 3,
+            root_page_id: 3,
+            storage_layout: TableStorageLayout::Heap,
             schema_name: "s".into(),
             table_name: "t".into(),
         };
@@ -1232,6 +1309,40 @@ mod tests {
         assert!(TableDef::from_bytes(&bytes[..10]).is_err());
         // Old 3-byte truncation still fails.
         assert!(TableDef::from_bytes(&bytes[..3]).is_err());
+    }
+
+    #[test]
+    fn test_table_def_roundtrip_clustered_layout() {
+        let def = TableDef {
+            id: 9,
+            root_page_id: 77,
+            storage_layout: TableStorageLayout::Clustered,
+            schema_name: "public".into(),
+            table_name: "orders".into(),
+        };
+        let bytes = def.to_bytes();
+        let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();
+        assert_eq!(back, def);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn test_table_def_legacy_bytes_decode_as_heap() {
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&42u32.to_le_bytes());
+        legacy.extend_from_slice(&99u64.to_le_bytes());
+        legacy.push(6);
+        legacy.extend_from_slice(b"public");
+        legacy.push(5);
+        legacy.extend_from_slice(b"users");
+
+        let (back, consumed) = TableDef::from_bytes(&legacy).unwrap();
+        assert_eq!(back.id, 42);
+        assert_eq!(back.root_page_id, 99);
+        assert_eq!(back.storage_layout, TableStorageLayout::Heap);
+        assert_eq!(back.schema_name, "public");
+        assert_eq!(back.table_name, "users");
+        assert_eq!(consumed, legacy.len());
     }
 
     // ── ColumnDef ─────────────────────────────────────────────────────────────

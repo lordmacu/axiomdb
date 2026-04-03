@@ -55,7 +55,7 @@ without any special privileges.
 |-------|---------|
 | `axiom_tables` | One row per user table |
 | `axiom_columns` | One row per column |
-| `axiom_indexes` | One row per index (B-Tree metadata) |
+| `axiom_indexes` | One row per index (logical metadata; clustered PK rows may reuse the table root) |
 | `axiom_constraints` | Named CHECK constraints |
 | `axiom_foreign_keys` | FK constraint definitions |
 | `axiom_stats` | Per-column NDV and row_count for the query planner |
@@ -63,6 +63,14 @@ without any special privileges.
 ### axiom_tables
 
 Contains one row per user-visible table.
+
+Phase `39.13` adds physical-layout metadata to these rows even though the
+introspection surface is still being expanded. The important rule today is:
+
+- explicit `PRIMARY KEY` table → clustered table root
+- no explicit `PRIMARY KEY` → heap table root
+
+The catalog now keeps that distinction even before clustered DML is exposed.
 
 | Column         | Type   | Description                                |
 |----------------|--------|--------------------------------------------|
@@ -114,7 +122,7 @@ Contains one row per index (including automatically generated PK and UNIQUE inde
 | `is_unique`     | BOOL   | TRUE for UNIQUE and PRIMARY KEY indexes                 |
 | `is_primary`    | BOOL   | TRUE for the PRIMARY KEY index                          |
 | `columns`       | TEXT   | Comma-separated list of indexed column names            |
-| `root_page_id`  | BIGINT | Page ID of the B+ Tree root for this index              |
+| `root_page_id`  | BIGINT | Page ID of the index root; clustered PRIMARY KEY metadata reuses the table root |
 
 ```sql
 -- All indexes on the products table
@@ -123,6 +131,14 @@ FROM axiom_indexes
 WHERE table_name = 'products'
 ORDER BY is_primary DESC, index_name;
 ```
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Clustered PK Metadata</span>
+On clustered tables, the PRIMARY KEY row in `axiom_indexes` is logical metadata, not a second heap-era tree. Its `root_page_id` matches the table root and may point to clustered pages instead of classic B+ Tree pages.
+</div>
+</div>
 
 ---
 

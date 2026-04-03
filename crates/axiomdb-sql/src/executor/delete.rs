@@ -11,6 +11,9 @@ fn execute_delete_ctx(
         ctx,
         &stmt.table,
     )?;
+    resolved
+        .def
+        .ensure_heap_runtime("DELETE from clustered table — Phase 39.17")?;
 
     let secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
         .indexes
@@ -290,6 +293,9 @@ fn execute_delete(
         let mut resolver = make_resolver(storage, txn)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
+    resolved
+        .def
+        .ensure_heap_runtime("DELETE from clustered table — Phase 39.17")?;
 
     let snap = txn.active_snapshot()?;
 

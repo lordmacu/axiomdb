@@ -11,6 +11,9 @@ fn execute_insert_ctx(
         ctx,
         &stmt.table,
     )?;
+    resolved
+        .def
+        .ensure_heap_runtime("INSERT into clustered table — Phase 39.14")?;
 
     let schema_cols = &resolved.columns;
     let mut secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
@@ -442,6 +445,9 @@ fn execute_insert(
         let mut resolver = make_resolver(storage, txn)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
+    resolved
+        .def
+        .ensure_heap_runtime("INSERT into clustered table — Phase 39.14")?;
 
     let schema_cols = &resolved.columns;
 

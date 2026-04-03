@@ -63,6 +63,10 @@ use crate::session::SessionContext;
 
 type StableUpdateBatchRef<'a> = (&'a [u8], &'a [u8], &'a [u8], u64, u16);
 
+fn ensure_heap_table(table_def: &TableDef, feature: &str) -> Result<(), DbError> {
+    table_def.ensure_heap_runtime(feature)
+}
+
 // ── TableEngine ───────────────────────────────────────────────────────────────
 
 /// Stateless row storage interface for user tables.
@@ -123,10 +127,11 @@ impl TableEngine {
         snap: TransactionSnapshot,
         column_mask: Option<&[bool]>,
     ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+        ensure_heap_table(table_def, "SELECT from clustered table — Phase 39.15")?;
         let col_types = column_data_types(columns);
         let masked_decode = column_mask.filter(|mask| !mask.iter().all(|&b| b));
         let mut result = Vec::new();
-        let mut current = table_def.data_root_page_id;
+        let mut current = table_def.root_page_id;
 
         while current != 0 {
             let raw = *storage.read_page(current)?.as_bytes();
@@ -216,12 +221,13 @@ impl TableEngine {
     where
         F: FnMut(&[Value]) -> bool,
     {
+        ensure_heap_table(table_def, "SELECT from clustered table — Phase 39.15")?;
         let col_types = column_data_types(columns);
         let has_two_phase = where_col_mask
             .filter(|m| !m.iter().all(|&b| b)) // only if mask is selective
             .is_some();
         let mut result = Vec::new();
-        let mut current = table_def.data_root_page_id;
+        let mut current = table_def.root_page_id;
 
         while current != 0 {
             let raw = *storage.read_page(current)?.as_bytes();
@@ -373,12 +379,13 @@ impl TableEngine {
     where
         F: Fn(&[Value]) -> bool + Send + Sync,
     {
+        ensure_heap_table(table_def, "SELECT from clustered table — Phase 39.15")?;
         use rayon::prelude::*;
 
         let col_types = column_data_types(columns);
 
         // Phase 1: serial — collect all page IDs by walking the heap chain.
-        let page_ids = Self::collect_page_ids(storage, table_def.data_root_page_id)?;
+        let page_ids = Self::collect_page_ids(storage, table_def.root_page_id)?;
 
         if page_ids.len() < Self::PARALLEL_MIN_PAGES {
             // Small table: serial path (avoid Rayon overhead).
@@ -597,6 +604,7 @@ impl TableEngine {
         columns: &[ColumnDef],
         values: Vec<Value>,
     ) -> Result<RecordId, DbError> {
+        ensure_heap_table(table_def, "INSERT into clustered table — Phase 39.14")?;
         if values.len() != columns.len() {
             return Err(DbError::TypeMismatch {
                 expected: format!("{} columns", columns.len()),
@@ -610,7 +618,7 @@ impl TableEngine {
 
         let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
         let (page_id, slot_id) =
-            HeapChain::insert(storage, table_def.data_root_page_id, &encoded, txn_id)?;
+            HeapChain::insert(storage, table_def.root_page_id, &encoded, txn_id)?;
 
         let key = encode_rid(page_id, slot_id);
         txn.record_insert(table_def.id, &key, &encoded, page_id, slot_id)?;
@@ -634,6 +642,7 @@ impl TableEngine {
         values: Vec<Value>,
         hint: Option<&mut HeapAppendHint>,
     ) -> Result<RecordId, DbError> {
+        ensure_heap_table(table_def, "INSERT into clustered table — Phase 39.14")?;
         if values.len() != columns.len() {
             return Err(DbError::TypeMismatch {
                 expected: format!("{} columns", columns.len()),
@@ -644,13 +653,8 @@ impl TableEngine {
         let coerced = coerce_values(values, columns)?;
         let encoded = encode_row(&coerced, &col_types)?;
         let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
-        let (page_id, slot_id) = HeapChain::insert_with_hint(
-            storage,
-            table_def.data_root_page_id,
-            &encoded,
-            txn_id,
-            hint,
-        )?;
+        let (page_id, slot_id) =
+            HeapChain::insert_with_hint(storage, table_def.root_page_id, &encoded, txn_id, hint)?;
         let key = encode_rid(page_id, slot_id);
         txn.record_insert(table_def.id, &key, &encoded, page_id, slot_id)?;
         Ok(RecordId { page_id, slot_id })
@@ -691,6 +695,7 @@ impl TableEngine {
         columns: &[ColumnDef],
         batch: &[Vec<Value>],
     ) -> Result<Vec<RecordId>, DbError> {
+        ensure_heap_table(table_def, "INSERT into clustered table — Phase 39.14")?;
         if batch.is_empty() {
             return Ok(Vec::new());
         }
@@ -716,7 +721,7 @@ impl TableEngine {
         // ── Insert all rows into the heap in one batch pass ───────────────────
         let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
         let phys_locs =
-            HeapChain::insert_batch(storage, table_def.data_root_page_id, &encoded_rows, txn_id)?;
+            HeapChain::insert_batch(storage, table_def.root_page_id, &encoded_rows, txn_id)?;
 
         // ── WAL: one compact PageWrite entry per affected page ───────────────
         // Group slot_ids by page_id. Each PageWrite entry carries only the
@@ -769,6 +774,7 @@ impl TableEngine {
         table_def: &TableDef,
         record_id: RecordId,
     ) -> Result<(), DbError> {
+        ensure_heap_table(table_def, "DELETE from clustered table — Phase 39.17")?;
         // Read old bytes BEFORE deletion — read_tuple returns None on dead slots.
         let old_bytes = HeapChain::read_row(storage, record_id.page_id, record_id.slot_id)?.ok_or(
             DbError::AlreadyDeleted {
@@ -808,6 +814,7 @@ impl TableEngine {
         table_def: &TableDef,
         rids: &[RecordId],
     ) -> Result<u64, DbError> {
+        ensure_heap_table(table_def, "DELETE from clustered table — Phase 39.17")?;
         if rids.is_empty() {
             return Ok(0);
         }
@@ -816,8 +823,7 @@ impl TableEngine {
         let raw_rids: Vec<(u64, u16)> = rids.iter().map(|r| (r.page_id, r.slot_id)).collect();
 
         // Batch-delete on the heap: each page read+written once.
-        let deleted =
-            HeapChain::delete_batch(storage, table_def.data_root_page_id, &raw_rids, txn_id)?;
+        let deleted = HeapChain::delete_batch(storage, table_def.root_page_id, &raw_rids, txn_id)?;
 
         // Batch WAL: one PageDelete entry per affected page (instead of one
         // Delete entry per row). Reduces WAL from O(N × 150 bytes) to O(P × 50 bytes).
@@ -872,6 +878,7 @@ impl TableEngine {
         columns: &[ColumnDef],
         updates: Vec<(RecordId, Vec<Value>)>,
     ) -> Result<u64, DbError> {
+        ensure_heap_table(table_def, "UPDATE on clustered table — Phase 39.16")?;
         if updates.is_empty() {
             return Ok(0);
         }
@@ -913,6 +920,7 @@ impl TableEngine {
         record_id: RecordId,
         new_values: Vec<Value>,
     ) -> Result<RecordId, DbError> {
+        ensure_heap_table(table_def, "UPDATE on clustered table — Phase 39.16")?;
         if new_values.len() != columns.len() {
             return Err(DbError::TypeMismatch {
                 expected: format!("{} columns", columns.len()),
@@ -940,6 +948,7 @@ impl TableEngine {
         new_values: Vec<Value>,
         hint: Option<&mut HeapAppendHint>,
     ) -> Result<RecordId, DbError> {
+        ensure_heap_table(table_def, "UPDATE on clustered table — Phase 39.16")?;
         if new_values.len() != columns.len() {
             return Err(DbError::TypeMismatch {
                 expected: format!("{} columns", columns.len()),
@@ -968,6 +977,7 @@ impl TableEngine {
         values: Vec<Value>,
         row_num: usize,
     ) -> Result<RecordId, DbError> {
+        ensure_heap_table(table_def, "INSERT into clustered table — Phase 39.14")?;
         if values.len() != columns.len() {
             return Err(DbError::TypeMismatch {
                 expected: format!("{} columns", columns.len()),
@@ -981,10 +991,10 @@ impl TableEngine {
 
         // Phase 5.18: pull heap-tail hint from the session cache, use it for O(1)
         // tail lookup, and write the updated hint back after the insert.
-        let mut hint_opt = ctx.get_heap_tail_hint(table_def.id, table_def.data_root_page_id);
+        let mut hint_opt = ctx.get_heap_tail_hint(table_def.id, table_def.root_page_id);
         let (page_id, slot_id) = HeapChain::insert_with_hint(
             storage,
-            table_def.data_root_page_id,
+            table_def.root_page_id,
             &encoded,
             txn_id,
             hint_opt.as_mut(),
@@ -993,7 +1003,7 @@ impl TableEngine {
             ctx.set_heap_tail_hint(table_def.id, h.root_page_id, h.tail_page_id);
         } else {
             // No existing hint — seed one for the next call.
-            ctx.set_heap_tail_hint(table_def.id, table_def.data_root_page_id, page_id);
+            ctx.set_heap_tail_hint(table_def.id, table_def.root_page_id, page_id);
         }
 
         let key = encode_rid(page_id, slot_id);
@@ -1011,6 +1021,7 @@ impl TableEngine {
         ctx: &mut SessionContext,
         batch: &[Vec<Value>],
     ) -> Result<Vec<RecordId>, DbError> {
+        ensure_heap_table(table_def, "INSERT into clustered table — Phase 39.14")?;
         if batch.is_empty() {
             return Ok(Vec::new());
         }
@@ -1055,7 +1066,7 @@ impl TableEngine {
         let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
         let phys_locs = HeapChain::insert_batch_with_zm(
             storage,
-            table_def.data_root_page_id,
+            table_def.root_page_id,
             &encoded_rows,
             txn_id,
             &zm_values,
@@ -1094,6 +1105,7 @@ impl TableEngine {
         record_id: RecordId,
         new_values: Vec<Value>,
     ) -> Result<RecordId, DbError> {
+        ensure_heap_table(table_def, "UPDATE on clustered table — Phase 39.16")?;
         if new_values.len() != columns.len() {
             return Err(DbError::TypeMismatch {
                 expected: format!("{} columns", columns.len()),
@@ -1104,7 +1116,7 @@ impl TableEngine {
         let coerced = coerce_values_with_ctx(new_values, columns, ctx, 1)?;
         let new_encoded = encode_row(&coerced, &col_types)?;
         // Phase 5.18: use session heap-tail hint for the insert half of UPDATE.
-        let mut hint_opt = ctx.get_heap_tail_hint(table_def.id, table_def.data_root_page_id);
+        let mut hint_opt = ctx.get_heap_tail_hint(table_def.id, table_def.root_page_id);
         let new_rid = update_encoded_row_with_hint(
             storage,
             txn,
@@ -1116,7 +1128,7 @@ impl TableEngine {
         if let Some(h) = hint_opt {
             ctx.set_heap_tail_hint(table_def.id, h.root_page_id, h.tail_page_id);
         } else {
-            ctx.set_heap_tail_hint(table_def.id, table_def.data_root_page_id, new_rid.page_id);
+            ctx.set_heap_tail_hint(table_def.id, table_def.root_page_id, new_rid.page_id);
         }
         Ok(new_rid)
     }
@@ -1131,6 +1143,7 @@ impl TableEngine {
         ctx: &mut SessionContext,
         updates: Vec<(RecordId, Vec<Value>)>,
     ) -> Result<u64, DbError> {
+        ensure_heap_table(table_def, "UPDATE on clustered table — Phase 39.16")?;
         if updates.is_empty() {
             return Ok(0);
         }
@@ -1158,7 +1171,7 @@ impl TableEngine {
 
         let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
         let phys_locs =
-            HeapChain::insert_batch(storage, table_def.data_root_page_id, &encoded_rows, txn_id)?;
+            HeapChain::insert_batch(storage, table_def.root_page_id, &encoded_rows, txn_id)?;
 
         let mut page_slot_map: std::collections::HashMap<u64, Vec<u16>> =
             std::collections::HashMap::new();
@@ -1192,6 +1205,7 @@ impl TableEngine {
         columns: &[ColumnDef],
         updates: Vec<(RecordId, Vec<Value>)>,
     ) -> Result<Vec<RecordId>, DbError> {
+        ensure_heap_table(table_def, "UPDATE on clustered table — Phase 39.16")?;
         if updates.is_empty() {
             return Ok(Vec::new());
         }
@@ -1226,6 +1240,7 @@ impl TableEngine {
         ctx: &mut SessionContext,
         updates: Vec<(RecordId, Vec<Value>)>,
     ) -> Result<Vec<RecordId>, DbError> {
+        ensure_heap_table(table_def, "UPDATE on clustered table — Phase 39.16")?;
         if updates.is_empty() {
             return Ok(Vec::new());
         }
@@ -1246,7 +1261,7 @@ impl TableEngine {
             })
             .collect::<Result<_, _>>()?;
 
-        let mut hint_opt = ctx.get_heap_tail_hint(table_def.id, table_def.data_root_page_id);
+        let mut hint_opt = ctx.get_heap_tail_hint(table_def.id, table_def.root_page_id);
         let original_rids: Vec<RecordId> = prepared.iter().map(|(rid, _)| *rid).collect();
         let new_rids = apply_prepared_updates_preserve_rid(
             storage,
@@ -1263,11 +1278,7 @@ impl TableEngine {
             .rev()
             .find_map(|(old_rid, new_rid)| (old_rid != new_rid).then_some(*new_rid))
         {
-            ctx.set_heap_tail_hint(
-                table_def.id,
-                table_def.data_root_page_id,
-                last_fallback.page_id,
-            );
+            ctx.set_heap_tail_hint(table_def.id, table_def.root_page_id, last_fallback.page_id);
         }
         Ok(new_rids)
     }
@@ -1382,12 +1393,12 @@ fn update_encoded_row_with_hint(
     let (new_page_id, new_slot_id) = match hint {
         Some(h) => HeapChain::insert_with_hint(
             storage,
-            table_def.data_root_page_id,
+            table_def.root_page_id,
             new_encoded,
             txn_id,
             Some(h),
         )?,
-        None => HeapChain::insert(storage, table_def.data_root_page_id, new_encoded, txn_id)?,
+        None => HeapChain::insert(storage, table_def.root_page_id, new_encoded, txn_id)?,
     };
     let new_key = encode_rid(new_page_id, new_slot_id);
     txn.record_insert(
@@ -1416,12 +1427,8 @@ fn apply_prepared_updates_preserve_rid(
     }
 
     let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
-    let rewrite_results = HeapChain::rewrite_batch_same_slot(
-        storage,
-        table_def.data_root_page_id,
-        &prepared,
-        txn_id,
-    )?;
+    let rewrite_results =
+        HeapChain::rewrite_batch_same_slot(storage, table_def.root_page_id, &prepared, txn_id)?;
 
     // Separate stable-RID successes from fallback rows.
     // Stable-RID rows are WAL-logged in one batch call; fallback rows use
@@ -1593,7 +1600,8 @@ mod tests {
     fn test_table_def(root_page_id: u64) -> TableDef {
         TableDef {
             id: 1,
-            data_root_page_id: root_page_id,
+            root_page_id,
+            storage_layout: axiomdb_catalog::schema::TableStorageLayout::Heap,
             schema_name: "public".into(),
             table_name: "t".into(),
         }
