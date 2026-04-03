@@ -1,6 +1,6 @@
 # Phase 39 — Clustered Index Storage Engine
 
-## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7, 39.8, 39.9, 39.10, 39.11, 39.12, 39.13, 39.14
+## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7, 39.8, 39.9, 39.10, 39.11, 39.12, 39.13, 39.14, 39.15
 
 ## What was built
 
@@ -781,6 +781,103 @@ Targeted validation for `39.14` passed on the clustered executor surface:
 - `cargo fmt --check`
 - `mdbook build docs-site`
 
+### 39.15 — Executor integration: SELECT from clustered table
+
+`crates/axiomdb-sql/src/executor/select.rs` now exposes the first SQL-visible
+clustered read path.
+
+Behavior now exposed through SQL:
+
+- `SELECT` on explicit-`PRIMARY KEY` clustered tables no longer fails with the
+  old `39.15` guard rail
+- clustered full scans now route through `clustered_tree::range(...)`
+- clustered PK equality lookups now route through `clustered_tree::lookup(...)`
+- clustered PK range scans now route through `clustered_tree::range(...)`
+- clustered secondary lookups now use `secondary key -> PK bookmark -> clustered row`
+  instead of `secondary key -> heap RecordId`
+- ctx-path covering plans that the planner labels as `IndexOnlyScan` are now
+  normalized back to clustered-aware lookup/range plans instead of trying to
+  read clustered tables through heap-era index-only semantics
+- JOIN pre-scan paths now accept clustered tables through the same
+  `scan_table_any_layout(...)` boundary used by heap tables
+
+Current boundary after `39.15`:
+
+- clustered `SELECT` is now SQL-visible on clustered tables
+- clustered covering reads still fetch the clustered row body; a true clustered
+  index-only optimization remains future work
+- clustered `UPDATE` and `DELETE` remain deferred to `39.16` and `39.17`
+- standalone clustered maintenance such as `CREATE INDEX`, `ANALYZE`, and
+  `VACUUM` still remains deferred
+
+Supporting changes for `39.15`:
+
+- `crates/axiomdb-sql/src/executor/select.rs`
+  - normalizes clustered `IndexOnlyScan` plans into clustered-aware lookup/range
+  - routes clustered secondary access methods through PK-bookmark lookups
+- `crates/axiomdb-sql/src/table.rs`
+  - adds clustered secondary lookup/range helpers that decode PK bookmarks and
+    fetch clustered rows by primary key
+- `crates/axiomdb-sql/tests/integration_clustered_select.rs`
+  - adds executor coverage for clustered secondary lookup, clustered secondary
+    range, ctx-path covering scans, and MVCC visibility against an older snapshot
+
+Targeted validation for `39.15` passed on the clustered read surface:
+
+- `cargo test -p axiomdb-sql --test integration_clustered_select -j1`
+- `cargo test -p axiomdb-sql --test integration_clustered_create_table -j1`
+- `cargo test -p axiomdb-sql --test integration_clustered_insert -j1`
+- `cargo check -p axiomdb-sql --lib -j1`
+
+### 39.16 — Executor integration: UPDATE on clustered table
+
+`crates/axiomdb-sql/src/executor/update.rs` now exposes the first SQL-visible
+clustered rewrite path.
+
+Behavior now exposed through SQL:
+
+- `UPDATE` on explicit-`PRIMARY KEY` clustered tables no longer fails with the
+  old `39.16` guard rail
+- clustered candidate discovery now uses the clustered planner boundary:
+  PK lookup, PK range, secondary bookmark probe, or full clustered scan
+- non-key updates now stay on `clustered_tree::update_in_place(...)` when the
+  row still fits in its owning leaf and fall back to
+  `clustered_tree::update_with_relocation(...)` when it must be rewritten
+- PK-changing updates now delete-mark the old clustered row, insert the new PK
+  row, and rewrite bookmark-bearing secondary indexes
+- rollback and savepoint undo now restore both the clustered base row and any
+  rewritten secondary bookmark entries
+- the non-ctx executor path now supports clustered `UPDATE` too; it no longer
+  returns `NotImplemented`
+
+Supporting changes for `39.16`:
+
+- `crates/axiomdb-sql/src/executor/update.rs`
+  - collects clustered candidates through clustered-aware access methods instead
+    of forcing a whole-tree scan
+  - records exact clustered row images in WAL for in-place, relocate, and
+    PK-change updates
+  - rewrites clustered secondary bookmark entries with undo-safe index
+    insert/delete tracking
+- `crates/axiomdb-wal/src/txn.rs`
+  - adds index-delete undo records so rollback can reinsert old secondary
+    bookmark entries after clustered UPDATE rewrites them
+- `crates/axiomdb-sql/src/executor/mod.rs`
+  - extends rollback/savepoint index undo handling to both delete newly inserted
+    keys and restore deleted clustered-secondary bookmark keys
+- `crates/axiomdb-sql/tests/integration_clustered_update.rs`
+  - adds coverage for rollback, PK change, secondary-key rewrite, relocation,
+    and non-ctx clustered UPDATE
+
+Targeted validation for `39.16` passed on the clustered update surface:
+
+- `cargo test -p axiomdb-sql --test integration_clustered_update -j1`
+- `cargo test -p axiomdb-sql --test integration_clustered_insert -j1`
+- `cargo test -p axiomdb-sql --test integration_clustered_select -j1`
+- `cargo test -p axiomdb-wal -j1`
+- `cargo clippy -p axiomdb-wal --tests -- -D warnings`
+- `cargo clippy -p axiomdb-sql --lib --test integration_clustered_update --test integration_clustered_insert --test integration_clustered_select -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity -A clippy::needless_borrow`
+
 ## Review notes
 
 - All `39.3` acceptance criteria from the spec are implemented.
@@ -795,6 +892,9 @@ Targeted validation for `39.14` passed on the clustered executor surface:
 - All `39.12` acceptance criteria from the spec are implemented.
 - All `39.13` acceptance criteria from the spec are implemented.
 - All `39.14` acceptance criteria from the spec are implemented.
+- All `39.15` acceptance criteria from the spec are implemented except the
+  intentionally deferred clustered index-only optimization.
+- All `39.16` acceptance criteria from the spec are implemented.
 - No `unsafe` was introduced in the clustered tree path.
 - No production `unwrap()` remains in the touched clustered files.
 - No production `unwrap()` was introduced in the new clustered-secondary path.
@@ -805,15 +905,17 @@ Targeted validation for `39.14` passed on the clustered executor surface:
 - Benchmarking remains intentionally deferred: `39.5` finishes the storage-level
   clustered read slice, and `39.6` / `39.7` / `39.8` / `39.9` add the first clustered mutation, rebalance, and bookmark slices,
   `39.10` adds overflow-backed row storage, `39.11` adds internal WAL/rollback support, `39.12` adds internal clustered crash recovery,
-  `39.13` exposes the first SQL-visible clustered DDL boundary, and `39.14`
-  exposes the first SQL-visible clustered DML write,
-  but end-to-end clustered read/update/delete benchmarks still wait for later clustered `SELECT` / `UPDATE` / `DELETE` integration.
+  `39.13` exposes the first SQL-visible clustered DDL boundary, `39.14`
+  exposes the first SQL-visible clustered INSERT path, `39.15` exposes the
+  first SQL-visible clustered read path, and `39.16` exposes clustered UPDATE,
+  but end-to-end clustered delete / maintenance benchmarks still wait for
+  `39.17+`.
 
 ## Deferred
 
 - `39.18` — physical purge of dead clustered cells
 - later clustered root persistence — today `39.12` still rebuilds roots from surviving WAL history, so checkpoint/rotation persistence is not solved yet
-- `39.15+` — remaining executor-visible clustered DML and maintenance paths
+- `39.16+` — remaining executor-visible clustered mutator and maintenance paths
 
 ## Notes
 

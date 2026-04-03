@@ -2,7 +2,7 @@
 
 ## 2026-04-02
 
-- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.9`, `39.10`, `39.11`, `39.12`, `39.13`, and `39.14` are closed in code, targeted validation,
+- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.9`, `39.10`, `39.11`, `39.12`, `39.13`, `39.14`, `39.15`, and `39.16` are closed in code, targeted validation,
   and docs.
 - `axiomdb-catalog` / `axiomdb-sql` now expose the first SQL-visible clustered-table boundary:
   - `TableDef` now stores `root_page_id` plus `TableStorageLayout::{Heap, Clustered}`
@@ -12,6 +12,8 @@
   - `CREATE TABLE` without an explicit `PRIMARY KEY` stays on the heap path
   - heap-only runtime paths now fail explicitly on clustered tables with phase-scoped `NotImplemented` errors
   - `INSERT` on clustered tables now routes directly through the clustered tree in both ctx and non-ctx executor paths
+  - `SELECT` on clustered tables now routes through clustered full scans, clustered PK lookups/ranges, and clustered secondary bookmark probes
+  - `UPDATE` on clustered tables now routes through clustered candidate discovery, exact-row-image WAL, same-leaf rewrite / relocate-update / PK-change rewrite, and undo-safe clustered secondary bookmark maintenance
   - clustered PK bytes are derived from logical primary-index metadata order, not raw table-column order
   - clustered `AUTO_INCREMENT` bootstraps from clustered rows, not heap scans
   - non-primary clustered indexes are now maintained through PK bookmarks instead of heap `RecordId` payloads
@@ -63,8 +65,7 @@
   - current `axiomdb-index::BTree` still uses fixed-slot `InternalNodePage` / `LeafNodePage`
   - SQL DDL can now create clustered tables for explicit primary keys
   - SQL clustered `INSERT` now writes clustered rows
-  - no SQL clustered `SELECT` path reads clustered rows yet
-  - clustered range scan now exists internally, but no SQL path uses it yet
+  - SQL clustered `SELECT` now reads clustered rows
   - clustered same-leaf update now exists internally, but no SQL path uses it yet
   - clustered delete-mark now exists internally, but no SQL path uses it yet
 - Current clustered lookup limitation:
@@ -75,7 +76,7 @@
   - `update_with_relocation()` now handles same-page failure by physical delete + reinsert + rebalance
   - old-version visibility after relocate-update still depends on future clustered version-chain work
   - clustered-first secondary bookmark maintenance now exists in `crates/axiomdb-sql/src/clustered_secondary.rs`
-  - the SQL-visible heap executor, FK enforcement, and index-integrity rebuild path still use `RecordId`-based secondaries
+  - clustered SQL `INSERT` / `SELECT` now use PK-bookmark secondaries, but FK enforcement and index-integrity rebuild still use `RecordId`-based secondaries
   - parent separator repair still assumes the repaired separator fits on the current internal page
 - Current clustered delete limitation:
   - delete-mark keeps the physical cell inline in `39.7`
@@ -90,6 +91,7 @@
   - rollback, `ROLLBACK TO SAVEPOINT`, and crash recovery are implemented for clustered rows
   - clustered roots are still reconstructed from surviving WAL history
   - checkpoint/rotation-safe clustered root persistence remains deferred
+  - clustered covering reads still degrade to clustered row fetches instead of a true clustered index-only path
   - standalone clustered `CREATE INDEX` / `ANALYZE` / `VACUUM` remain explicitly deferred
   - reusing a delete-marked clustered PK during SQL `INSERT` rewrites only the current physical version; older-snapshot reconstruction of the superseded tombstone remains future MVCC work
 

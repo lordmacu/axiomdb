@@ -184,31 +184,13 @@ impl Database {
             session.clear_warnings();
         }
 
-        let lower = sql.trim().to_ascii_lowercase();
-
-        // ── @@in_transaction ──────────────────────────────────────────────────
-        // Returns 1 when inside an active transaction, 0 otherwise.
-        // Handled here (not in the executor) because it requires txn state.
-        if lower.contains("@@in_transaction") && lower.starts_with("select") {
-            let val = if self.txn.active_txn_id().is_some() {
-                Value::Int(1)
-            } else {
-                Value::Int(0)
-            };
-            let result = QueryResult::Rows {
-                columns: vec![ColumnMeta {
-                    name: "@@in_transaction".into(),
-                    data_type: DataType::Int,
-                    nullable: false,
-                    table_name: None,
-                }],
-                rows: vec![vec![val]],
-            };
+        if let Some(result) = self.try_execute_special_read_query(sql, session) {
             return Ok((result, None));
         }
 
         // ── SHOW WARNINGS ─────────────────────────────────────────────────────
         // Returns the warnings accumulated by the previous statement.
+        let lower = sql.trim().to_ascii_lowercase();
         if lower == "show warnings" || lower == "show warnings;" {
             let rows = session
                 .warnings
@@ -320,6 +302,10 @@ impl Database {
             session.clear_warnings();
         }
 
+        if let Some(result) = self.try_execute_special_read_query(sql, session) {
+            return Ok(result);
+        }
+
         // Parse
         let stmt = parse(sql, None)?;
 
@@ -339,6 +325,75 @@ impl Database {
 
         // Execute read-only path
         execute_read_only_with_ctx(analyzed, &self.storage, &self.txn, &self.bloom, session)
+    }
+
+    /// Handles lightweight read-only queries that depend on live transaction or
+    /// session state and should not go through SQL parse/analyze.
+    fn try_execute_special_read_query(
+        &self,
+        sql: &str,
+        session: &SessionContext,
+    ) -> Option<QueryResult> {
+        let lower = sql.trim().to_ascii_lowercase();
+
+        // ── @@in_transaction ──────────────────────────────────────────────────
+        // Returns 1 when inside an active transaction, 0 otherwise.
+        if lower.contains("@@in_transaction") && lower.starts_with("select") {
+            let val = if self.txn.active_txn_id().is_some() {
+                Value::Int(1)
+            } else {
+                Value::Int(0)
+            };
+            return Some(QueryResult::Rows {
+                columns: vec![ColumnMeta {
+                    name: "@@in_transaction".into(),
+                    data_type: DataType::Int,
+                    nullable: false,
+                    table_name: None,
+                }],
+                rows: vec![vec![val]],
+            });
+        }
+
+        // ── SHOW WARNINGS ─────────────────────────────────────────────────────
+        if lower == "show warnings" || lower == "show warnings;" {
+            let rows = session
+                .warnings
+                .iter()
+                .map(|w| {
+                    vec![
+                        Value::Text(w.level.to_string()),
+                        Value::Int(w.code as i32),
+                        Value::Text(w.message.clone()),
+                    ]
+                })
+                .collect();
+            return Some(QueryResult::Rows {
+                columns: vec![
+                    ColumnMeta {
+                        name: "Level".into(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        table_name: None,
+                    },
+                    ColumnMeta {
+                        name: "Code".into(),
+                        data_type: DataType::Int,
+                        nullable: false,
+                        table_name: None,
+                    },
+                    ColumnMeta {
+                        name: "Message".into(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        table_name: None,
+                    },
+                ],
+                rows,
+            });
+        }
+
+        None
     }
 
     /// Applies the session `on_error` policy to a pipeline failure from
@@ -396,7 +451,7 @@ impl Database {
         session: &mut SessionContext,
         schema_cache: &mut SchemaCache,
     ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
-        if !sql.trim().starts_with("show warnings") {
+        if !sql.trim().to_ascii_lowercase().starts_with("show warnings") {
             session.clear_warnings();
         }
 
@@ -439,7 +494,10 @@ impl Database {
                 self.enter_degraded_mode();
             }
         }
-        let result = result?;
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => return self.apply_on_error_pipeline_failure(sql, session, e),
+        };
         if is_ddl {
             self.schema_version.fetch_add(1, Ordering::Release);
         }
@@ -455,6 +513,8 @@ impl Database {
         stmt: Stmt,
         session: &mut SessionContext,
     ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
+        session.clear_warnings();
+
         if self.is_degraded() && stmt_may_mutate(&stmt) {
             return Err(DbError::DiskFull {
                 operation: "database is in read-only degraded mode",
@@ -473,7 +533,10 @@ impl Database {
                 self.enter_degraded_mode();
             }
         }
-        let result = result?;
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => return self.apply_on_error_pipeline_failure("", session, e),
+        };
         if is_ddl {
             self.schema_version.fetch_add(1, Ordering::Release);
         }
@@ -714,7 +777,8 @@ mod tests {
     use tempfile::tempdir;
 
     use axiomdb_core::error::DbError;
-    use axiomdb_sql::{SchemaCache, SessionContext};
+    use axiomdb_sql::{analyze_cached_with_defaults, parse, SchemaCache, SessionContext};
+    use axiomdb_types::Value;
 
     use super::{is_read_only_sql, Database, OnErrorMode, QueryResult};
 
@@ -758,6 +822,96 @@ mod tests {
     }
 
     #[test]
+    fn test_ignore_duplicate_key_becomes_warning_and_keeps_txn_open() {
+        let (_dir, mut db) = open_db();
+        let mut session = SessionContext::new();
+        let mut cache = SchemaCache::default();
+
+        db.execute_query(
+            "CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE)",
+            &mut session,
+            &mut cache,
+        )
+        .expect("create table");
+
+        session.on_error = OnErrorMode::Ignore;
+        db.txn.begin().expect("begin txn");
+
+        db.execute_query(
+            "INSERT INTO t VALUES (1, 'alice@example.com')",
+            &mut session,
+            &mut cache,
+        )
+        .expect("first insert");
+
+        let result = db
+            .execute_query(
+                "INSERT INTO t VALUES (1, 'alice@example.com')",
+                &mut session,
+                &mut cache,
+            )
+            .expect("ignore duplicate returns success");
+
+        assert!(
+            matches!(result.0, QueryResult::Empty),
+            "ignored duplicate must serialize as Empty/OK"
+        );
+        assert!(
+            db.txn.active_txn_id().is_some(),
+            "ignorable duplicate must keep active txn open in ignore mode"
+        );
+        assert_eq!(session.warning_count(), 1);
+        assert_eq!(session.warnings[0].code, 1062);
+    }
+
+    #[test]
+    fn test_ignore_duplicate_execute_stmt_cache_hit_becomes_warning_and_keeps_txn_open() {
+        let (_dir, mut db) = open_db();
+        let mut session = SessionContext::new();
+        let mut cache = SchemaCache::default();
+
+        db.execute_query(
+            "CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE)",
+            &mut session,
+            &mut cache,
+        )
+        .expect("create table");
+
+        session.on_error = OnErrorMode::Ignore;
+        db.txn.begin().expect("begin txn");
+
+        let analyzed = analyze_cached_with_defaults(
+            parse("INSERT INTO t VALUES (1, 'alice@example.com')", None).expect("parse insert"),
+            &db.storage,
+            db.txn
+                .active_snapshot()
+                .unwrap_or_else(|_| db.txn.snapshot()),
+            session.effective_database(),
+            session.current_schema(),
+            &mut cache,
+        )
+        .expect("analyze insert");
+
+        db.execute_stmt(analyzed.clone(), &mut session)
+            .expect("first insert");
+
+        let result = db
+            .execute_stmt(analyzed, &mut session)
+            .expect("ignore duplicate returns success on execute_stmt");
+
+        assert!(
+            matches!(result.0, QueryResult::Empty),
+            "ignored duplicate must serialize as Empty/OK"
+        );
+        assert!(
+            db.txn.active_txn_id().is_some(),
+            "ignorable duplicate must keep active txn open in ignore mode"
+        );
+        assert_eq!(session.warning_count(), 1);
+        assert_eq!(session.warnings[0].code, 1062);
+    }
+
+    #[test]
     fn test_ignore_non_ignorable_error_rolls_back_active_txn() {
         let (_dir, mut db) = open_db();
         let mut session = SessionContext::new();
@@ -779,6 +933,30 @@ mod tests {
             "non-ignorable ignore error must eagerly roll back the txn"
         );
         assert_eq!(session.warning_count(), 0);
+    }
+
+    #[test]
+    fn test_execute_read_query_intercepts_in_transaction() {
+        let (_dir, mut db) = open_db();
+        let mut session = SessionContext::new();
+        let mut cache = SchemaCache::default();
+
+        let result = db
+            .execute_read_query("SELECT @@in_transaction", &mut session, &mut cache)
+            .expect("read-only @@in_transaction should be intercepted");
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected row result for @@in_transaction");
+        };
+        assert_eq!(rows, vec![vec![Value::Int(0)]]);
+
+        db.txn.begin().expect("begin txn");
+        let result = db
+            .execute_read_query("SELECT @@in_transaction", &mut session, &mut cache)
+            .expect("read-only @@in_transaction should see active txn");
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected row result for @@in_transaction");
+        };
+        assert_eq!(rows, vec![vec![Value::Int(1)]]);
     }
 
     // ── is_read_only_sql classification tests ────────────────────────────

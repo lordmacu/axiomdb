@@ -232,7 +232,9 @@ The SQL processing pipeline:
   deduplication), and `INSERT … SELECT` for bulk copy and aggregate materialization
 - clustered tables now enter the catalog through `CREATE TABLE ... PRIMARY KEY ...`
 - `39.14` adds a dedicated clustered `INSERT` branch in `executor/insert.rs`
-- clustered `SELECT` / `UPDATE` / `DELETE` still reject explicitly until `39.15`–`39.17`
+- `39.15` adds a dedicated clustered `SELECT` branch in `executor/select.rs`
+- `39.16` adds a dedicated clustered `UPDATE` branch in `executor/update.rs`
+- clustered `DELETE` still rejects explicitly until `39.17`
 - Stable-RID UPDATE fast path — same-slot heap rewrite that preserves `RecordId`
   when the new encoded row fits and makes untouched-index skipping safe
 - UPDATE apply fast path — indexed UPDATE now batches candidate heap reads,

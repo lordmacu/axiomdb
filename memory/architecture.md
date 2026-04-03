@@ -1,6 +1,6 @@
 # Architecture Notes
 
-## 2026-04-02 — Clustered internal page primitive, clustered insert/read/update/delete/rebalance, clustered secondary bookmarks, clustered overflow pages, clustered WAL support, clustered crash recovery, clustered CREATE TABLE, and clustered SQL INSERT
+## 2026-04-02 — Clustered internal page primitive, clustered insert/read/update/delete/rebalance, clustered secondary bookmarks, clustered overflow pages, clustered WAL support, clustered crash recovery, clustered CREATE TABLE, and clustered SQL INSERT/SELECT/UPDATE
 
 - `crates/axiomdb-storage/src/clustered_internal.rs` owns the clustered
   internal page format for Phase `39.2`.
@@ -18,11 +18,15 @@
   creation from the presence of an explicit primary key.
 - `crates/axiomdb-sql/src/clustered_table.rs` now owns executor-facing clustered
   row preparation for Phase `39.14`.
+- `crates/axiomdb-sql/src/executor/select.rs` now owns the clustered executor
+  read bridge for Phase `39.15`.
+- `crates/axiomdb-sql/src/executor/update.rs` now owns the clustered executor
+  rewrite bridge for Phase `39.16`.
 - The architecture still keeps storage and tree responsibilities separate:
   - storage owns page layout, free-space accounting, binary search, and page-local mutation
   - `clustered_tree` owns descent, exact leaf search, split planning, separator propagation, and root growth
-  - the executor is still not wired to clustered clustered-row DML paths
-  - only the DDL/catalog boundary is clustered-aware in `39.13`
+  - the executor now exposes clustered `INSERT`, `SELECT`, and `UPDATE`
+  - clustered `DELETE` and maintenance paths remain the next executor-visible cuts
 - The catalog/root contract is now generic instead of heap-specific:
   - `TableDef.root_page_id` points to the primary row-store root for the table
   - `TableDef.storage_layout` tells the executor whether that root is a heap chain or a clustered tree
@@ -63,6 +67,10 @@
   - keep key order, parent separators, and `next_leaf` unchanged
   - allow overwrite or same-leaf rebuild, but never structural relocation in `39.6`
   - report `HeapPageFull` when the row no longer fits in the same leaf
+- The clustered SQL update contract is now executor-visible:
+  - candidate discovery may start from PK lookup, PK range, clustered secondary bookmark probe, or full clustered scan
+  - WAL records the exact old clustered row image captured from storage, not a reconstructed executor-side header guess
+  - clustered secondary bookmark rewrites now register both index-insert and index-delete undo so rollback can restore the old bookmark set
 - The clustered delete contract is now also explicit:
   - descend to the owning leaf by exact primary key
   - stamp `txn_id_deleted` on the current inline version only when it is visible
@@ -94,7 +102,10 @@
   - clustered tables are created only when the SQL definition has an explicit `PRIMARY KEY`
   - tables without explicit PK remain heap-backed for now
   - clustered `INSERT` now has a dedicated executor branch and writes directly into the clustered tree
-  - heap-only executor helpers still reject clustered `SELECT` / `UPDATE` / `DELETE` instead of touching the wrong page format
+  - clustered `SELECT` now has a dedicated executor branch and reads directly from the clustered tree
+  - clustered secondary access methods resolve `secondary key -> PK bookmark -> clustered row`
+  - covering plans emitted as `IndexOnlyScan` are normalized away from heap-era semantics on clustered tables
+  - heap-only executor helpers still reject clustered `UPDATE` / `DELETE` instead of touching the wrong page format
   - startup index-integrity repair skips clustered tables until clustered executor/index rebuild work exists
   - pending heap INSERT batches flush before a clustered INSERT statement so clustered writes do not inherit heap staging semantics accidentally
   - reusing a delete-marked clustered PK is logged as clustered update undo, not clustered insert undo, so rollback can restore the superseded tombstone image

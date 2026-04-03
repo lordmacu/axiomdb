@@ -138,12 +138,13 @@ The first SQL-visible clustered write path now exists too:
 - clustered `AUTO_INCREMENT` bootstraps from clustered rows instead of heap scans
 - non-primary clustered indexes are maintained as PK bookmarks through
   `axiomdb-sql::clustered_secondary`
+- `SELECT` on clustered tables now routes through `clustered_tree::lookup(...)`
+  / `range(...)` and decodes clustered secondary bookmarks back into PK probes
 - pending heap batches flush before the clustered statement boundary so the new
   clustered branch does not inherit heap staging semantics accidentally
 
-SQL-visible clustered reads and later mutators are still deferred:
+SQL-visible clustered mutators still deferred:
 
-- clustered `SELECT` → Phase `39.15`
 - clustered `UPDATE` → Phase `39.16`
 - clustered `DELETE` → Phase `39.17`
 

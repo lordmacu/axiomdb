@@ -46,9 +46,10 @@ rollback/savepoint support and crash recovery by primary key plus exact row
 image. Phase `39.13` makes the first SQL-visible clustered cut: `CREATE TABLE`
 with an explicit `PRIMARY KEY` now creates clustered metadata and a clustered
 table root. Phase `39.14` extends that cut to clustered `INSERT`: SQL writes
-now record clustered WAL/undo directly against the clustered PK tree, while
-clustered `SELECT` / `UPDATE` / `DELETE` still remain deferred until
-`39.15`–`39.17`.
+now record clustered WAL/undo directly against the clustered PK tree, and
+Phase `39.15` opens clustered `SELECT` over that same storage, and Phase
+`39.16` extends the same transaction contract to clustered `UPDATE`. Clustered
+`DELETE` remains deferred until `39.17`.
 
 ```sql
 CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE);
@@ -58,9 +59,9 @@ INSERT INTO users VALUES (1, 'alice@example.com');
 ROLLBACK;
 ```
 
-That rollback now removes both the clustered base row and its bookmark-bearing
-secondary entries. The SQL-visible read path for clustered tables is still not
-open yet, so verification of those rows still waits for Phase `39.15`.
+That rollback now restores clustered INSERT and clustered UPDATE state: the
+clustered base row goes back to its exact previous row image, and any
+bookmark-bearing secondary entries are deleted or reinserted to match.
 
 ---
 

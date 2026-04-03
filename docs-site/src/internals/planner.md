@@ -157,6 +157,13 @@ Coverage only triggers when `select_col_idxs` is **non-empty**. A bare
 `SELECT *` always produces an empty `select_col_idxs` (all columns requested)
 and falls back to `Scan` or a regular `IndexLookup`/`IndexRange`.
 
+For clustered tables, that coverage detection still runs, but `39.15` adds a
+normalization step before execution: clustered `IndexOnlyScan` plans are
+degraded back to clustered-aware `IndexLookup` / `IndexRange`, because the
+current covering-read implementation still assumes heap slot visibility and a
+heap `RecordId` payload. The clustered executor instead reads visibility from
+the inline clustered row header and follows secondary hits through PK bookmarks.
+
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
@@ -190,12 +197,15 @@ rows:
 1. Load indexes from catalog: CatalogReader::list_indexes(table_id)
 2. plan_select(where_clause, indexes, columns) → access_method
 3. Fetch rows:
-   Scan            → TableEngine::scan_table (full heap scan)
-   IndexLookup     → BTree::lookup_in → TableEngine::read_row (at most 1 row)
-   IndexRange      → BTree::range_in → TableEngine::read_row (per B-Tree hit)
-   IndexOnlyScan   → BTree::range_in → HeapChain::is_slot_visible (24-byte header read)
-                     → decode_index_key(key_bytes, n_key_cols)
-                     → project needed_key_positions from decoded key (no heap decode)
+   Heap Scan        → TableEngine::scan_table (full heap scan)
+   Heap IndexLookup → BTree::lookup_in → TableEngine::read_row (at most 1 row)
+   Heap IndexRange  → BTree::range_in → TableEngine::read_row (per B-Tree hit)
+   Heap IndexOnly   → BTree::range_in → HeapChain::is_slot_visible (24-byte header read)
+                      → decode_index_key(key_bytes, n_key_cols)
+                      → project needed_key_positions from decoded key (no heap decode)
+   Clustered Scan   → clustered_tree::range(full table)
+   Clustered PK     → clustered_tree::lookup / clustered_tree::range
+   Clustered Sec    → secondary BTree → decode PK bookmark → clustered_tree lookup/range
 4. Apply residual WHERE filter on fetched rows (for conditions not consumed by index)
 5. Continue with ORDER BY / LIMIT / projection as before
 ```
@@ -203,6 +213,18 @@ rows:
 The residual WHERE filter handles cases where the index returned a row that later
 fails a non-index condition (e.g., `WHERE indexed_col = 5 AND other_col = 'x'`). This
 is safe and correct — the index just reduces the candidate set.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — No Fake Clustered Index-Only</span>
+MySQL InnoDB reads visibility from the clustered record itself; PostgreSQL's
+index-only scans rely on heap visibility infrastructure. AxiomDB follows the
+clustered-record route for clustered tables, so `39.15` intentionally
+normalizes clustered covering plans away from heap-era <code>IndexOnlyScan</code>
+instead of pretending that a heap slot still exists.
+</div>
+</div>
 
 ---
 

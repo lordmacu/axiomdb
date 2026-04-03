@@ -828,7 +828,7 @@ print("\n[4.9b] Sort-Based GROUP BY (indexed sorted path)")
 # then insert rows. The row_count=0 stats path skips the small-table guard
 # and uses the index → sorted GROUP BY strategy is selected.
 cur.execute("DROP TABLE IF EXISTS sb_emp")
-cur.execute("CREATE TABLE sb_emp (id INT PRIMARY KEY, dept TEXT, salary INT)")
+cur.execute("CREATE TABLE sb_emp (id INT, dept TEXT, salary INT)")
 cur.execute("CREATE INDEX idx_sb_dept ON sb_emp (dept)")  # stats.row_count = 0 here
 
 for i in range(1, 16):
@@ -1640,31 +1640,32 @@ print("\n[5.19] B+tree batch delete — DELETE WHERE and UPDATE correctness")
 conn_bd = connect()
 cb19 = conn_bd.cursor()
 
-cb19.execute("CREATE TABLE bd_users (id INT PRIMARY KEY, name TEXT, score INT)")
+cb19.execute("CREATE TABLE bd_users (id INT, name TEXT, score INT)")
+cb19.execute("CREATE INDEX idx_bd_id ON bd_users (id)")
 cb19.execute("CREATE INDEX idx_bd_score ON bd_users (score)")
 for i in range(1, 21):
     cb19.execute("INSERT INTO bd_users VALUES (%s, %s, %s)", (i, f"user{i}", i * 10))
 conn_bd.commit()
 
-# DELETE WHERE on indexed PK column — triggers batch delete path on PK index
+# DELETE WHERE on indexed id column — exercises batch delete with an indexed predicate
 cb19.execute("DELETE FROM bd_users WHERE id > 10")
 conn_bd.commit()
 cb19.execute("SELECT COUNT(*) FROM bd_users")
-ok("5.19 DELETE WHERE PK: 10 rows remain after deleting id > 10",
+ok("5.19 DELETE WHERE indexed id: 10 rows remain after deleting id > 10",
    cb19.fetchone()[0] == 10)
 
 cb19.execute("SELECT id FROM bd_users ORDER BY id ASC")
 ids = [r[0] for r in cb19.fetchall()]
-ok("5.19 DELETE WHERE PK: remaining ids are 1..10",
+ok("5.19 DELETE WHERE indexed id: remaining ids are 1..10",
    ids == list(range(1, 11)), ids)
 
 # Verify deleted rows are not visible via secondary index scan
 cb19.execute("SELECT score FROM bd_users WHERE score > 100")
 rows_deleted = cb19.fetchall()
-ok("5.19 DELETE WHERE PK: deleted rows absent from secondary index scan",
+ok("5.19 DELETE WHERE indexed id: deleted rows absent from secondary index scan",
    len(rows_deleted) == 0, rows_deleted)
 
-# UPDATE on multiple rows — batch-deletes old PK keys then reinserts
+# UPDATE on multiple rows — batch-rewrites rows selected through the indexed id path
 cb19.execute("UPDATE bd_users SET score = score + 1 WHERE id <= 5")
 conn_bd.commit()
 cb19.execute("SELECT id, score FROM bd_users WHERE id <= 5 ORDER BY id ASC")
@@ -1729,7 +1730,7 @@ ci21 = conn_i21.cursor()
 
 ci21.execute(
     """CREATE TABLE stage_users (
-    id INT PRIMARY KEY AUTO_INCREMENT,
+    id INT AUTO_INCREMENT,
     name TEXT NOT NULL,
     email TEXT NOT NULL
 )"""
@@ -1873,7 +1874,7 @@ ok(
 )
 
 c617.execute(
-    "CREATE TABLE upd_email_users (id INT PRIMARY KEY, email TEXT NOT NULL, score INT NOT NULL)"
+    "CREATE TABLE upd_email_users (id INT, email TEXT NOT NULL, score INT NOT NULL)"
 )
 c617.execute("CREATE UNIQUE INDEX upd_email_idx ON upd_email_users (email)")
 c617.executemany(
@@ -1919,7 +1920,7 @@ ok(
     batch_pk_rows,
 )
 
-c618.execute("CREATE TABLE batch_email_users (id INT PRIMARY KEY, email TEXT NOT NULL)")
+c618.execute("CREATE TABLE batch_email_users (id INT, email TEXT NOT NULL)")
 c618.execute("CREATE UNIQUE INDEX batch_email_idx ON batch_email_users (email)")
 try:
     c618.execute(
@@ -2164,6 +2165,104 @@ ok("22b.4 current_schema() returns public (static)",
 cs.execute("DROP TABLE IF EXISTS inventory_test")
 conn_sch.commit()
 conn_sch.close()
+
+# ── 39.15: clustered SELECT over MySQL wire ──────────────────────────────────
+
+print("\n[39.15 clustered SELECT]")
+conn_cl = connect()
+cc = conn_cl.cursor()
+
+cc.execute(
+    "CREATE TABLE cl_users (id INT PRIMARY KEY, email TEXT UNIQUE, name TEXT)"
+)
+cc.execute(
+    "INSERT INTO cl_users VALUES "
+    "(1, 'alice@example.com', 'Alice'), "
+    "(2, 'bob@example.com', 'Bob'), "
+    "(3, 'carol@example.com', 'Carol')"
+)
+conn_cl.commit()
+
+cc.execute("SELECT name FROM cl_users WHERE id = 2")
+row = cc.fetchone()
+ok(
+    "39.15 clustered PK lookup returns clustered row",
+    row == ("Bob",),
+    row,
+)
+
+cc.execute("SELECT email FROM cl_users WHERE email = 'alice@example.com'")
+row = cc.fetchone()
+ok(
+    "39.15 clustered secondary lookup returns clustered row",
+    row == ("alice@example.com",),
+    row,
+)
+
+cc.execute("SELECT COUNT(*) FROM cl_users")
+row = cc.fetchone()
+ok(
+    "39.15 clustered full scan/count sees all rows",
+    row == (3,),
+    row,
+)
+
+# ── 39.16: clustered UPDATE over MySQL wire ──────────────────────────────────
+
+print("\n[39.16 clustered UPDATE]")
+
+cc.execute("UPDATE cl_users SET name = 'Bobby' WHERE id = 2")
+conn_cl.commit()
+cc.execute("SELECT name FROM cl_users WHERE id = 2")
+row = cc.fetchone()
+ok(
+    "39.16 clustered PK update rewrites row in clustered storage",
+    row == ("Bobby",),
+    row,
+)
+
+cc.execute(
+    "UPDATE cl_users SET email = 'carol+new@example.com' "
+    "WHERE email = 'carol@example.com'"
+)
+conn_cl.commit()
+cc.execute("SELECT name FROM cl_users WHERE email = 'carol+new@example.com'")
+row = cc.fetchone()
+ok(
+    "39.16 clustered secondary-key update rewrites secondary bookmark path",
+    row == ("Carol",),
+    row,
+)
+cc.execute("SELECT COUNT(*) FROM cl_users WHERE email = 'carol@example.com'")
+row = cc.fetchone()
+ok(
+    "39.16 clustered secondary-key update removes old visible key",
+    row == (0,),
+    row,
+)
+
+cc.execute("UPDATE cl_users SET id = 7 WHERE email = 'bob@example.com'")
+conn_cl.commit()
+cc.execute("SELECT name FROM cl_users WHERE id = 7")
+row = cc.fetchone()
+ok(
+    "39.16 clustered PK change rewrites clustered primary key",
+    row == ("Bobby",),
+    row,
+)
+
+cc.execute("BEGIN")
+cc.execute("UPDATE cl_users SET name = 'Alice Rolled Back' WHERE id = 1")
+cc.execute("ROLLBACK")
+cc.execute("SELECT name FROM cl_users WHERE id = 1")
+row = cc.fetchone()
+ok(
+    "39.16 clustered UPDATE rollback restores original row",
+    row == ("Alice",),
+    row,
+)
+
+conn_cl.close()
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

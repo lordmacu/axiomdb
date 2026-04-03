@@ -46,8 +46,9 @@
 //! new slots are on the same page, which is not guaranteed when the old page is
 //! full and the chain must grow.
 
-use axiomdb_catalog::schema::{ColumnDef, ColumnType, TableDef};
+use axiomdb_catalog::schema::{ColumnDef, ColumnType, IndexDef, TableDef};
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
+use axiomdb_index::BTree;
 use axiomdb_storage::{
     heap_chain, num_slots, read_slot, HeapAppendHint, HeapChain, Page, RowHeader, StorageEngine,
 };
@@ -58,6 +59,8 @@ use axiomdb_types::{
 };
 use axiomdb_wal::TxnManager;
 use std::mem::size_of;
+
+use crate::{clustered_secondary::ClusteredSecondaryLayout, key_encoding::encode_index_key};
 
 use crate::session::SessionContext;
 
@@ -1327,6 +1330,210 @@ pub fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
 pub fn decode_row_from_bytes(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<Value>, DbError> {
     let col_types = column_data_types(columns);
     decode_row(bytes, &col_types)
+}
+
+// ── Clustered table scan helpers (Phase 39.15) ──────────────────────────────
+
+/// Dummy RecordId for clustered rows (no heap slot).  The downstream pipeline
+/// (WHERE recheck, ORDER BY, GROUP BY, projection) only uses the `Vec<Value>`;
+/// the RecordId is carried for type compatibility and is never used as a
+/// heap address for clustered tables.
+const CLUSTERED_DUMMY_RID: RecordId = RecordId {
+    page_id: 0,
+    slot_id: 0,
+};
+
+/// Full-table scan of a clustered B-tree, returning visible rows decoded as
+/// `Vec<Value>`.  Equivalent to `scan_table` for heap tables.
+pub fn scan_clustered_table(
+    storage: &dyn StorageEngine,
+    table_def: &TableDef,
+    columns: &[ColumnDef],
+    snap: TransactionSnapshot,
+) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+    use std::ops::Bound;
+    let col_types = column_data_types(columns);
+    let iter = axiomdb_storage::clustered_tree::range(
+        storage,
+        Some(table_def.root_page_id),
+        Bound::Unbounded,
+        Bound::Unbounded,
+        &snap,
+    )?;
+    let mut result = Vec::new();
+    for row_result in iter {
+        let row = row_result?;
+        let values = decode_row(&row.row_data, &col_types)?;
+        result.push((CLUSTERED_DUMMY_RID, values));
+    }
+    Ok(result)
+}
+
+/// Point lookup on a clustered B-tree by primary key bytes.
+pub fn lookup_clustered_row(
+    storage: &dyn StorageEngine,
+    table_def: &TableDef,
+    columns: &[ColumnDef],
+    pk_key: &[u8],
+    snap: TransactionSnapshot,
+) -> Result<Option<(RecordId, Vec<Value>)>, DbError> {
+    let col_types = column_data_types(columns);
+    match axiomdb_storage::clustered_tree::lookup(
+        storage,
+        Some(table_def.root_page_id),
+        pk_key,
+        &snap,
+    )? {
+        Some(row) => {
+            let values = decode_row(&row.row_data, &col_types)?;
+            Ok(Some((CLUSTERED_DUMMY_RID, values)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Range scan on a clustered B-tree by primary key bounds.
+pub fn range_clustered_table(
+    storage: &dyn StorageEngine,
+    table_def: &TableDef,
+    columns: &[ColumnDef],
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+    snap: TransactionSnapshot,
+) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+    use std::ops::Bound;
+    let col_types = column_data_types(columns);
+    let from = match lo {
+        Some(k) => Bound::Included(k.to_vec()),
+        None => Bound::Unbounded,
+    };
+    let to = match hi {
+        Some(k) => Bound::Included(k.to_vec()),
+        None => Bound::Unbounded,
+    };
+    let iter = axiomdb_storage::clustered_tree::range(
+        storage,
+        Some(table_def.root_page_id),
+        from,
+        to,
+        &snap,
+    )?;
+    let mut result = Vec::new();
+    for row_result in iter {
+        let row = row_result?;
+        let values = decode_row(&row.row_data, &col_types)?;
+        result.push((CLUSTERED_DUMMY_RID, values));
+    }
+    Ok(result)
+}
+
+/// Scans a table using the appropriate storage layout (heap or clustered).
+/// Unified entry point for JOIN paths and other multi-table contexts.
+pub fn scan_table_any_layout(
+    storage: &dyn StorageEngine,
+    table_def: &TableDef,
+    columns: &[ColumnDef],
+    snap: TransactionSnapshot,
+) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+    if table_def.is_clustered() {
+        scan_clustered_table(storage, table_def, columns, snap)
+    } else {
+        TableEngine::scan_table(storage, table_def, columns, snap, None)
+    }
+}
+
+/// Point lookup through a clustered secondary index:
+/// `secondary key prefix -> PK bookmark -> clustered PK lookup`.
+pub fn lookup_clustered_secondary_rows(
+    storage: &dyn StorageEngine,
+    table_def: &TableDef,
+    columns: &[ColumnDef],
+    primary_idx: &IndexDef,
+    secondary_idx: &IndexDef,
+    logical_prefix_key: &[u8],
+    snap: TransactionSnapshot,
+) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+    let hi = clustered_secondary_high_bound(logical_prefix_key);
+    let pairs = BTree::range_in(
+        storage,
+        secondary_idx.root_page_id,
+        Some(logical_prefix_key),
+        Some(&hi),
+    )?;
+    decode_clustered_secondary_pairs(
+        storage,
+        table_def,
+        columns,
+        primary_idx,
+        secondary_idx,
+        pairs,
+        snap,
+    )
+}
+
+/// Range scan through a clustered secondary index:
+/// `secondary range -> PK bookmark(s) -> clustered PK lookup(s)`.
+pub fn range_clustered_secondary_rows(
+    storage: &dyn StorageEngine,
+    table_def: &TableDef,
+    columns: &[ColumnDef],
+    primary_idx: &IndexDef,
+    secondary_idx: &IndexDef,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+    snap: TransactionSnapshot,
+) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+    let hi_owned = hi.map(clustered_secondary_high_bound);
+    let pairs = BTree::range_in(storage, secondary_idx.root_page_id, lo, hi_owned.as_deref())?;
+    decode_clustered_secondary_pairs(
+        storage,
+        table_def,
+        columns,
+        primary_idx,
+        secondary_idx,
+        pairs,
+        snap,
+    )
+}
+
+fn decode_clustered_secondary_pairs(
+    storage: &dyn StorageEngine,
+    table_def: &TableDef,
+    columns: &[ColumnDef],
+    primary_idx: &IndexDef,
+    secondary_idx: &IndexDef,
+    pairs: Vec<(RecordId, Vec<u8>)>,
+    snap: TransactionSnapshot,
+) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+    let layout = ClusteredSecondaryLayout::derive(secondary_idx, primary_idx)?;
+    let col_types = column_data_types(columns);
+    let mut result = Vec::with_capacity(pairs.len());
+
+    for (_rid, key_bytes) in pairs {
+        let entry = layout.decode_entry_key(&key_bytes)?;
+        let pk_key = encode_index_key(&entry.primary_key)?;
+        let Some(row) = axiomdb_storage::clustered_tree::lookup(
+            storage,
+            Some(table_def.root_page_id),
+            &pk_key,
+            &snap,
+        )?
+        else {
+            continue;
+        };
+        let values = decode_row(&row.row_data, &col_types)?;
+        result.push((CLUSTERED_DUMMY_RID, values));
+    }
+
+    Ok(result)
+}
+
+fn clustered_secondary_high_bound(logical_key: &[u8]) -> Vec<u8> {
+    let mut hi = logical_key.to_vec();
+    if hi.len() < crate::key_encoding::MAX_INDEX_KEY {
+        hi.resize(crate::key_encoding::MAX_INDEX_KEY, 0xFF);
+    }
+    hi
 }
 
 /// Encodes a `RecordId` as a 10-byte WAL key: `[page_id:8 LE][slot_id:2 LE]`.

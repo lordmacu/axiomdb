@@ -11,10 +11,6 @@ fn execute_update_ctx(
         ctx,
         &stmt.table,
     )?;
-    resolved
-        .def
-        .ensure_heap_runtime("UPDATE on clustered table — Phase 39.16")?;
-
     let schema_cols = resolved.columns.clone();
     let secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
         .indexes
@@ -39,6 +35,22 @@ fn execute_update_ctx(
         .collect::<Result<_, DbError>>()?;
 
     let snap = txn.active_snapshot()?;
+
+    // ── Clustered table UPDATE dispatch (Phase 39.16) ────────────────────
+    if resolved.def.is_clustered() {
+        return execute_clustered_update(
+            stmt.where_clause,
+            assignments,
+            &schema_cols,
+            &secondary_indexes,
+            storage,
+            txn,
+            snap,
+            &resolved,
+            bloom,
+            ctx,
+        );
+    }
 
     // Pre-compute field-patch eligibility early — needed for both the fused
     // index-range path and the standard candidate loop optimization.
@@ -295,6 +307,530 @@ fn fused_index_range_patch(
 
     Ok(QueryResult::Affected {
         count: matched,
+        last_insert_id: None,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ClusteredUpdateCandidate {
+    pk_key: Vec<u8>,
+    row_header: axiomdb_storage::heap::RowHeader,
+    row_data: Vec<u8>,
+    values: Vec<Value>,
+}
+
+fn normalize_clustered_update_access_method(
+    access_method: crate::planner::AccessMethod,
+) -> crate::planner::AccessMethod {
+    match access_method {
+        crate::planner::AccessMethod::IndexOnlyScan {
+            index_def, lo, hi, ..
+        } => {
+            let is_single_key_point = index_def.columns.len() == 1
+                && hi
+                    .as_ref()
+                    .map(|bound| bound.as_slice() == lo.as_slice())
+                    .unwrap_or(false);
+
+            if is_single_key_point {
+                crate::planner::AccessMethod::IndexLookup { index_def, key: lo }
+            } else {
+                crate::planner::AccessMethod::IndexRange {
+                    index_def,
+                    lo: Some(lo),
+                    hi,
+                }
+            }
+        }
+        other => other,
+    }
+}
+
+fn clustered_update_primary_index(
+    resolved: &axiomdb_catalog::ResolvedTable,
+) -> Result<&axiomdb_catalog::IndexDef, DbError> {
+    resolved
+        .indexes
+        .iter()
+        .find(|idx| idx.is_primary && !idx.columns.is_empty())
+        .ok_or_else(|| DbError::Internal {
+            message: format!(
+                "clustered table {}.{} is missing primary-index metadata",
+                resolved.def.schema_name, resolved.def.table_name
+            ),
+        })
+}
+
+fn clustered_secondary_high_bound(logical_key: &[u8]) -> Vec<u8> {
+    let mut hi = logical_key.to_vec();
+    if hi.len() < crate::key_encoding::MAX_INDEX_KEY {
+        hi.resize(crate::key_encoding::MAX_INDEX_KEY, 0xFF);
+    }
+    hi
+}
+
+fn clustered_rows_for_secondary_access(
+    storage: &dyn StorageEngine,
+    root_pid: u64,
+    resolved: &axiomdb_catalog::ResolvedTable,
+    index_def: &axiomdb_catalog::IndexDef,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+    snap: axiomdb_core::TransactionSnapshot,
+) -> Result<Vec<axiomdb_storage::clustered_tree::ClusteredRow>, DbError> {
+    let primary_idx = clustered_update_primary_index(resolved)?;
+    let layout = crate::clustered_secondary::ClusteredSecondaryLayout::derive(index_def, primary_idx)?;
+    let hi_owned = hi.map(clustered_secondary_high_bound);
+    let pairs = BTree::range_in(storage, index_def.root_page_id, lo, hi_owned.as_deref())?;
+    let mut rows = Vec::with_capacity(pairs.len());
+
+    for (_rid, key_bytes) in pairs {
+        let entry = layout.decode_entry_key(&key_bytes)?;
+        let pk_key = crate::key_encoding::encode_index_key(&entry.primary_key)?;
+        if let Some(row) =
+            axiomdb_storage::clustered_tree::lookup(storage, Some(root_pid), &pk_key, &snap)?
+        {
+            rows.push(row);
+        }
+    }
+
+    Ok(rows)
+}
+
+fn collect_clustered_update_candidates(
+    where_clause: Option<&Expr>,
+    schema_cols: &[axiomdb_catalog::schema::ColumnDef],
+    secondary_indexes: &[axiomdb_catalog::IndexDef],
+    storage: &dyn StorageEngine,
+    snap: axiomdb_core::TransactionSnapshot,
+    resolved: &axiomdb_catalog::ResolvedTable,
+    root_pid: u64,
+    effective_collation: crate::session::SessionCollation,
+) -> Result<Vec<ClusteredUpdateCandidate>, DbError> {
+    use std::ops::Bound;
+
+    let col_types: Vec<axiomdb_types::DataType> = schema_cols
+        .iter()
+        .map(|c| crate::table::column_type_to_data_type(c.col_type))
+        .collect();
+
+    let access_method = where_clause
+        .map(|wc| {
+            normalize_clustered_update_access_method(crate::planner::plan_update_candidates_ctx(
+                wc,
+                secondary_indexes,
+                schema_cols,
+                effective_collation,
+            ))
+        })
+        .unwrap_or(crate::planner::AccessMethod::Scan);
+
+    let mut raw_rows = Vec::new();
+    match access_method {
+        crate::planner::AccessMethod::Scan => {
+            let iter = axiomdb_storage::clustered_tree::range(
+                storage,
+                Some(root_pid),
+                Bound::Unbounded,
+                Bound::Unbounded,
+                &snap,
+            )?;
+            for row in iter {
+                raw_rows.push(row?);
+            }
+        }
+        crate::planner::AccessMethod::IndexLookup { index_def, key } if index_def.is_primary => {
+            if let Some(row) =
+                axiomdb_storage::clustered_tree::lookup(storage, Some(root_pid), &key, &snap)?
+            {
+                raw_rows.push(row);
+            }
+        }
+        crate::planner::AccessMethod::IndexLookup { index_def, key } => {
+            let hi = clustered_secondary_high_bound(&key);
+            raw_rows.extend(clustered_rows_for_secondary_access(
+                storage,
+                root_pid,
+                resolved,
+                &index_def,
+                Some(&key),
+                Some(&hi),
+                snap,
+            )?);
+        }
+        crate::planner::AccessMethod::IndexRange { index_def, lo, hi } if index_def.is_primary => {
+            let iter = axiomdb_storage::clustered_tree::range(
+                storage,
+                Some(root_pid),
+                lo.map_or(Bound::Unbounded, Bound::Included),
+                hi.map_or(Bound::Unbounded, Bound::Included),
+                &snap,
+            )?;
+            for row in iter {
+                raw_rows.push(row?);
+            }
+        }
+        crate::planner::AccessMethod::IndexRange { index_def, lo, hi } => {
+            raw_rows.extend(clustered_rows_for_secondary_access(
+                storage,
+                root_pid,
+                resolved,
+                &index_def,
+                lo.as_deref(),
+                hi.as_deref(),
+                snap,
+            )?);
+        }
+        crate::planner::AccessMethod::IndexOnlyScan { .. } => unreachable!(),
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut candidates = Vec::with_capacity(raw_rows.len());
+    for row in raw_rows {
+        if !seen.insert(row.key.clone()) {
+            continue;
+        }
+        let values = axiomdb_types::codec::decode_row(&row.row_data, &col_types)?;
+        if let Some(wc) = where_clause {
+            if !is_truthy(&eval(wc, &values)?) {
+                continue;
+            }
+        }
+        candidates.push(ClusteredUpdateCandidate {
+            pk_key: row.key,
+            row_header: row.row_header,
+            row_data: row.row_data,
+            values,
+        });
+    }
+
+    Ok(candidates)
+}
+
+fn apply_clustered_secondary_update(
+    idx: &axiomdb_catalog::IndexDef,
+    layout: &crate::clustered_secondary::ClusteredSecondaryLayout,
+    sec_root: &std::sync::atomic::AtomicU64,
+    old_values: &[Value],
+    new_values: &[Value],
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
+) -> Result<(), DbError> {
+    let old_entry = layout.entry_from_row(old_values)?;
+    let new_entry = layout.entry_from_row(new_values)?;
+    let outcome = layout.update_row(storage, sec_root, old_values, new_values)?;
+    let current_root = sec_root.load(std::sync::atomic::Ordering::Acquire);
+
+    match outcome {
+        crate::clustered_secondary::ClusteredSecondaryUpdateOutcome::Unchanged => {}
+        crate::clustered_secondary::ClusteredSecondaryUpdateOutcome::Inserted => {
+            if let Some(new_entry) = new_entry {
+                bloom.add(idx.index_id, &new_entry.physical_key);
+                txn.record_index_insert(idx.index_id, current_root, new_entry.physical_key)?;
+            }
+        }
+        crate::clustered_secondary::ClusteredSecondaryUpdateOutcome::Deleted => {
+            if let Some(old_entry) = old_entry {
+                txn.record_index_delete(
+                    idx.index_id,
+                    current_root,
+                    old_entry.physical_key,
+                    RecordId {
+                        page_id: 0,
+                        slot_id: 0,
+                    },
+                    idx.fillfactor,
+                )?;
+            }
+        }
+        crate::clustered_secondary::ClusteredSecondaryUpdateOutcome::Replaced => {
+            if let Some(old_entry) = old_entry {
+                txn.record_index_delete(
+                    idx.index_id,
+                    current_root,
+                    old_entry.physical_key,
+                    RecordId {
+                        page_id: 0,
+                        slot_id: 0,
+                    },
+                    idx.fillfactor,
+                )?;
+            }
+            if let Some(new_entry) = new_entry {
+                bloom.add(idx.index_id, &new_entry.physical_key);
+                txn.record_index_insert(idx.index_id, current_root, new_entry.physical_key)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Clustered table UPDATE: collects candidates from the clustered B-tree,
+/// evaluates assignments, then applies updates via the clustered storage layer.
+///
+/// Three update paths:
+/// 1. Non-key in-place: `update_in_place()` when PK and index keys unchanged
+/// 2. Non-key relocation: `update_with_relocation()` when row grows beyond leaf
+/// 3. Key change: `delete_mark()` + `insert()` when PK changes
+fn execute_clustered_update(
+    where_clause: Option<Expr>,
+    assignments: Vec<(usize, Expr)>,
+    schema_cols: &[axiomdb_catalog::schema::ColumnDef],
+    secondary_indexes: &[axiomdb_catalog::IndexDef],
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    snap: axiomdb_core::TransactionSnapshot,
+    resolved: &axiomdb_catalog::ResolvedTable,
+    bloom: &mut crate::bloom::BloomRegistry,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let col_types: Vec<axiomdb_types::DataType> = schema_cols
+        .iter()
+        .map(|c| crate::table::column_type_to_data_type(c.col_type))
+        .collect();
+
+    let pk_col_positions: Vec<usize> = clustered_update_primary_index(resolved)?
+        .columns
+        .iter()
+        .map(|c| c.col_idx as usize)
+        .collect();
+
+    let mut root_pid = txn
+        .clustered_root(resolved.def.id)
+        .unwrap_or(resolved.def.root_page_id);
+    let candidates = collect_clustered_update_candidates(
+        where_clause.as_ref(),
+        schema_cols,
+        secondary_indexes,
+        storage,
+        snap,
+        resolved,
+        root_pid,
+        ctx.effective_collation(),
+    )?;
+
+    if candidates.is_empty() {
+        return Ok(QueryResult::Affected {
+            count: 0,
+            last_insert_id: None,
+        });
+    }
+
+    let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+    let mut matched_count = 0u64;
+    let mut changed_count = 0u64;
+
+    let primary_idx = clustered_update_primary_index(resolved)?;
+    let secondary_layouts: Vec<(
+        &axiomdb_catalog::IndexDef,
+        crate::clustered_secondary::ClusteredSecondaryLayout,
+        std::sync::atomic::AtomicU64,
+    )> = secondary_indexes
+        .iter()
+        .filter(|idx| !idx.is_primary && !idx.columns.is_empty())
+        .filter_map(|idx| {
+            crate::clustered_secondary::ClusteredSecondaryLayout::derive(idx, primary_idx)
+                .ok()
+                .map(|layout| {
+                    (
+                        idx,
+                        layout,
+                        std::sync::atomic::AtomicU64::new(idx.root_page_id),
+                    )
+                })
+        })
+        .collect();
+
+    for candidate in &candidates {
+        matched_count += 1;
+
+        let mut new_values = candidate.values.clone();
+        let mut changed = false;
+        for &(col_pos, ref val_expr) in &assignments {
+            let nv = eval(val_expr, &candidate.values)?;
+            if nv != candidate.values[col_pos] {
+                changed = true;
+            }
+            new_values[col_pos] = nv;
+        }
+        if !changed {
+            continue;
+        }
+
+        let pk_changed = pk_col_positions
+            .iter()
+            .any(|&pos| candidate.values[pos] != new_values[pos]);
+        let new_row_data = axiomdb_types::codec::encode_row(&new_values, &col_types)?;
+        let old_image =
+            axiomdb_wal::ClusteredRowImage::new(root_pid, candidate.row_header, &candidate.row_data);
+
+        if pk_changed {
+            let new_pk_key = crate::key_encoding::encode_index_key(
+                &pk_col_positions
+                    .iter()
+                    .map(|&pos| new_values[pos].clone())
+                    .collect::<Vec<_>>(),
+            )?;
+
+            if !axiomdb_storage::clustered_tree::delete_mark(
+                storage,
+                Some(root_pid),
+                &candidate.pk_key,
+                txn_id,
+                &snap,
+            )? {
+                continue;
+            }
+
+            let delete_marked_header = axiomdb_storage::heap::RowHeader {
+                txn_id_created: candidate.row_header.txn_id_created,
+                txn_id_deleted: txn_id,
+                row_version: candidate.row_header.row_version,
+                _flags: candidate.row_header._flags,
+            };
+            let delete_mark_image = axiomdb_wal::ClusteredRowImage::new(
+                root_pid,
+                delete_marked_header,
+                &candidate.row_data,
+            );
+            txn.record_clustered_delete_mark(
+                resolved.def.id,
+                &candidate.pk_key,
+                &old_image,
+                &delete_mark_image,
+            )?;
+
+            let new_header = axiomdb_storage::heap::RowHeader {
+                txn_id_created: txn_id,
+                txn_id_deleted: 0,
+                row_version: 0,
+                _flags: candidate.row_header._flags,
+            };
+            root_pid = axiomdb_storage::clustered_tree::insert(
+                storage,
+                Some(root_pid),
+                &new_pk_key,
+                &new_header,
+                &new_row_data,
+            )?;
+            let inserted_image =
+                axiomdb_wal::ClusteredRowImage::new(root_pid, new_header, &new_row_data);
+            txn.record_clustered_insert(resolved.def.id, &new_pk_key, &inserted_image)?;
+
+            for (idx, layout, sec_root) in &secondary_layouts {
+                apply_clustered_secondary_update(
+                    idx,
+                    layout,
+                    sec_root,
+                    &candidate.values,
+                    &new_values,
+                    storage,
+                    txn,
+                    bloom,
+                )?;
+            }
+        } else {
+            let new_header = axiomdb_storage::heap::RowHeader {
+                txn_id_created: txn_id,
+                txn_id_deleted: 0,
+                row_version: candidate.row_header.row_version.saturating_add(1),
+                _flags: candidate.row_header._flags,
+            };
+
+            match axiomdb_storage::clustered_tree::update_in_place(
+                storage,
+                Some(root_pid),
+                &candidate.pk_key,
+                &new_row_data,
+                txn_id,
+                &snap,
+            ) {
+                Ok(true) => {
+                    let new_image =
+                        axiomdb_wal::ClusteredRowImage::new(root_pid, new_header, &new_row_data);
+                    txn.record_clustered_update(
+                        resolved.def.id,
+                        &candidate.pk_key,
+                        &old_image,
+                        &new_image,
+                    )?;
+                }
+                Ok(false) => continue,
+                Err(DbError::HeapPageFull { .. }) => {
+                    if let Some(new_root) = axiomdb_storage::clustered_tree::update_with_relocation(
+                        storage,
+                        Some(root_pid),
+                        &candidate.pk_key,
+                        &new_row_data,
+                        txn_id,
+                        &snap,
+                    )? {
+                        let new_image = axiomdb_wal::ClusteredRowImage::new(
+                            new_root,
+                            new_header,
+                            &new_row_data,
+                        );
+                        txn.record_clustered_update(
+                            resolved.def.id,
+                            &candidate.pk_key,
+                            &old_image,
+                            &new_image,
+                        )?;
+                        root_pid = new_root;
+                    } else {
+                        continue;
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+
+            let any_sec_col_changed = secondary_layouts.iter().any(|(idx, _, _)| {
+                idx.columns.iter().any(|c| {
+                    let pos = c.col_idx as usize;
+                    candidate.values.get(pos) != new_values.get(pos)
+                })
+            });
+            if any_sec_col_changed {
+                for (idx, layout, sec_root) in &secondary_layouts {
+                    apply_clustered_secondary_update(
+                        idx,
+                        layout,
+                        sec_root,
+                        &candidate.values,
+                        &new_values,
+                        storage,
+                        txn,
+                        bloom,
+                    )?;
+                }
+            }
+        }
+
+        changed_count += 1;
+    }
+
+    if root_pid != resolved.def.root_page_id {
+        axiomdb_catalog::CatalogWriter::new(storage, txn)?
+            .update_table_root(resolved.def.id, root_pid)?;
+    }
+
+    for (idx, _, sec_root) in &secondary_layouts {
+        let current = sec_root.load(std::sync::atomic::Ordering::Acquire);
+        if current != idx.root_page_id {
+            axiomdb_catalog::CatalogWriter::new(storage, txn)?
+                .update_index_root(idx.index_id, current)?;
+        }
+    }
+
+    if changed_count > 0 {
+        ctx.stats.on_rows_changed(resolved.def.id, changed_count);
+    }
+    ctx.invalidate_all();
+
+    Ok(QueryResult::Affected {
+        count: matched_count,
         last_insert_id: None,
     })
 }
@@ -663,10 +1199,6 @@ fn execute_update(
         let mut resolver = make_resolver(storage, txn)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
-    resolved
-        .def
-        .ensure_heap_runtime("UPDATE on clustered table — Phase 39.16")?;
-
     let schema_cols = resolved.columns.clone();
 
     // Resolve assignment column positions once, before the scan.
@@ -697,6 +1229,22 @@ fn execute_update(
     let mut noop_bloom = crate::bloom::BloomRegistry::new();
 
     let snap = txn.active_snapshot()?;
+    if resolved.def.is_clustered() {
+        let mut temp_ctx = SessionContext::new();
+        return execute_clustered_update(
+            stmt.where_clause,
+            assignments,
+            &schema_cols,
+            &secondary_indexes,
+            storage,
+            txn,
+            snap,
+            &resolved,
+            &mut noop_bloom,
+            &mut temp_ctx,
+        );
+    }
+
     let candidate_rows: Vec<(RecordId, Vec<Value>)> = if let Some(ref wc) = stmt.where_clause {
         let update_access = crate::planner::plan_update_candidates(
             wc,

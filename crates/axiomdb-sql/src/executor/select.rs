@@ -26,43 +26,27 @@ fn execute_select_ctx(
 
     if stmt.joins.is_empty() {
         // Single-table path — use cache.
-        let resolved = resolve_table_cached(
-            storage,
-            txn,
-            ctx,
-            &from_table_ref,
-        )?;
-        resolved
-            .def
-            .ensure_heap_runtime("SELECT from clustered table — Phase 39.15")?;
-
+        let resolved = resolve_table_cached(storage, txn, ctx, &from_table_ref)?;
         let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
 
         // ── COUNT(*) fast path (Phase 8) ─────────────────────────────────
         // Detect `SELECT COUNT(*) FROM table` with no WHERE, no GROUP BY,
-        // no HAVING, no JOIN. Use HeapChain::count_visible() which only
-        // checks RowHeader visibility — zero column decode, zero allocs.
-        // Inspired by InnoDB's stat_n_rows and SQLite's sqlite3BtreeCount.
-        if stmt.where_clause.is_none()
+        // no HAVING, no JOIN. For heap tables use HeapChain::count_visible()
+        // (zero column decode). For clustered tables, fall through to the
+        // full scan path (clustered_tree::range already does MVCC filtering).
+        if !resolved.def.is_clustered()
+            && stmt.where_clause.is_none()
             && stmt.group_by.is_empty()
             && stmt.having.is_none()
             && stmt.columns.len() == 1
         {
             if let Some(crate::ast::SelectItem::Expr {
-                expr:
-                    crate::expr::Expr::Function {
-                        ref name,
-                        ref args,
-                    },
+                expr: crate::expr::Expr::Function { ref name, ref args },
                 ..
             }) = stmt.columns.first()
             {
                 if name.eq_ignore_ascii_case("count") && args.is_empty() {
-                    let count = HeapChain::count_visible(
-                        storage,
-                        resolved.def.root_page_id,
-                        snap,
-                    )?;
+                    let count = HeapChain::count_visible(storage, resolved.def.root_page_id, snap)?;
                     let columns = vec![ColumnMeta::computed("count(*)", DataType::BigInt)];
                     let rows = vec![vec![Value::BigInt(count as i64)]];
                     return Ok(QueryResult::Rows { columns, rows });
@@ -82,15 +66,18 @@ fn execute_select_ctx(
 
         // Compute collation before the mutable borrow of ctx.stats below.
         let effective_coll = ctx.effective_collation();
-        let access_method = crate::planner::plan_select_ctx(
-            stmt.where_clause.as_ref(),
-            &resolved.indexes,
-            &resolved.columns,
-            resolved.def.id,
-            &table_stats,
-            &mut ctx.stats,
-            &select_col_idxs,
-            effective_coll,
+        let access_method = normalize_clustered_access_method(
+            crate::planner::plan_select_ctx(
+                stmt.where_clause.as_ref(),
+                &resolved.indexes,
+                &resolved.columns,
+                resolved.def.id,
+                &table_stats,
+                &mut ctx.stats,
+                &select_col_idxs,
+                effective_coll,
+            ),
+            resolved.def.is_clustered(),
         );
 
         /// Collects column indices referenced by an expression into a mask.
@@ -138,6 +125,29 @@ fn execute_select_ctx(
 
         // Fetch rows via the chosen access method.
         let raw_rows: Vec<(RecordId, Vec<Value>)> = match &access_method {
+            crate::planner::AccessMethod::Scan if resolved.def.is_clustered() => {
+                // ── Clustered full scan (Phase 39.15) ────────────────────────
+                // Iterate all clustered B-tree leaves. MVCC visibility is handled
+                // inside ClusteredRangeIter. WHERE evaluated on decoded values.
+                let mut rows = crate::table::scan_clustered_table(
+                    storage,
+                    &resolved.def,
+                    &resolved.columns,
+                    snap,
+                )?;
+                // Apply WHERE filter on decoded values (clustered scan doesn't
+                // support inline BatchPredicate yet — Phase 39.20 optimization).
+                if let Some(ref wc) = stmt.where_clause {
+                    if !expr_has_subquery(wc) {
+                        where_already_applied = true;
+                    }
+                    rows.retain(|(_, values)| match eval(wc, values) {
+                        Ok(v) => is_truthy(&v),
+                        Err(_) => true,
+                    });
+                }
+                rows
+            }
             crate::planner::AccessMethod::Scan => {
                 // Phase 8.1: inline WHERE filter during scan — skip result push
                 // for non-matching rows, reducing allocation pressure by the
@@ -172,8 +182,7 @@ fn execute_select_ctx(
                         .iter()
                         .map(|c| crate::table::column_type_to_data_type(c.col_type))
                         .collect();
-                    let batch_pred =
-                        crate::eval::batch::try_compile(&wc_clone, &col_types);
+                    let batch_pred = crate::eval::batch::try_compile(&wc_clone, &col_types);
 
                     // Phase 9.2: Operator fusion — build unified decode mask
                     // (SELECT ∪ WHERE ∪ ORDER BY ∪ GROUP BY columns).
@@ -235,11 +244,9 @@ fn execute_select_ctx(
                         &resolved.def,
                         &resolved.columns,
                         snap,
-                        |values| {
-                            match eval(&wc_clone, values) {
-                                Ok(v) => is_truthy(&v),
-                                Err(_) => true,
-                            }
+                        |values| match eval(&wc_clone, values) {
+                            Ok(v) => is_truthy(&v),
+                            Err(_) => true,
                         },
                         zm_pred.as_ref().map(|(ci, p)| (*ci, p)),
                         batch_pred.as_ref(),
@@ -248,14 +255,29 @@ fn execute_select_ctx(
                     )?
                 } else {
                     // No WHERE clause — scan all rows.
-                    TableEngine::scan_table(
-                        storage,
-                        &resolved.def,
-                        &resolved.columns,
-                        snap,
-                        None,
-                    )?
+                    TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap, None)?
                 }
+            }
+            crate::planner::AccessMethod::IndexLookup { index_def, key }
+                if resolved.def.is_clustered() && index_def.is_primary =>
+            {
+                // ── Clustered PK point lookup (Phase 39.15) ──────────────────
+                // Direct B-tree search returns full row inline — no heap fetch.
+                match crate::table::lookup_clustered_row(
+                    storage,
+                    &resolved.def,
+                    &resolved.columns,
+                    key,
+                    snap,
+                )? {
+                    Some(pair) => vec![pair],
+                    None => vec![],
+                }
+            }
+            crate::planner::AccessMethod::IndexLookup { index_def, key }
+                if resolved.def.is_clustered() =>
+            {
+                clustered_secondary_rows_for_lookup(storage, &resolved, index_def, key, snap)?
             }
             crate::planner::AccessMethod::IndexLookup { index_def, key } => {
                 // Bloom filter: skip B-Tree read if key is definitely absent.
@@ -275,9 +297,8 @@ fn execute_select_ctx(
                     match BTree::lookup_in(storage, index_def.root_page_id, key)? {
                         None => vec![],
                         Some(rid) => {
-                            if !HeapChain::is_slot_visible(
-                                storage, rid.page_id, rid.slot_id, snap,
-                            )? {
+                            if !HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap)?
+                            {
                                 vec![]
                             } else {
                                 match TableEngine::read_row(storage, &resolved.columns, rid)? {
@@ -296,9 +317,7 @@ fn execute_select_ctx(
                         BTree::range_in(storage, index_def.root_page_id, Some(&lo), Some(&hi))?;
                     let mut result = Vec::with_capacity(pairs.len());
                     for (rid, _k) in pairs {
-                        if !HeapChain::is_slot_visible(
-                            storage, rid.page_id, rid.slot_id, snap,
-                        )? {
+                        if !HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap)? {
                             continue;
                         }
                         if let Some(values) =
@@ -309,6 +328,32 @@ fn execute_select_ctx(
                     }
                     result
                 }
+            }
+            crate::planner::AccessMethod::IndexRange { index_def, lo, hi }
+                if resolved.def.is_clustered() && index_def.is_primary =>
+            {
+                // ── Clustered PK range scan (Phase 39.15) ────────────────────
+                // Single pass through clustered leaves. No heap indirection.
+                crate::table::range_clustered_table(
+                    storage,
+                    &resolved.def,
+                    &resolved.columns,
+                    lo.as_deref(),
+                    hi.as_deref(),
+                    snap,
+                )?
+            }
+            crate::planner::AccessMethod::IndexRange { index_def, lo, hi }
+                if resolved.def.is_clustered() =>
+            {
+                clustered_secondary_rows_for_range(
+                    storage,
+                    &resolved,
+                    index_def,
+                    lo.as_deref(),
+                    hi.as_deref(),
+                    snap,
+                )?
             }
             crate::planner::AccessMethod::IndexRange { index_def, lo, hi } => {
                 // Range scan: B-Tree entries → batch heap reads by page.
@@ -348,8 +393,7 @@ fn execute_select_ctx(
                                 if !header.is_visible(&snap) {
                                     continue;
                                 }
-                                let values =
-                                    axiomdb_types::codec::decode_row(data, &col_types)?;
+                                let values = axiomdb_types::codec::decode_row(data, &col_types)?;
                                 result.push((rid, values));
                             }
                         }
@@ -485,12 +529,7 @@ fn execute_select_with_joins_ctx(
     let mut running_offset = 0usize;
 
     {
-        let from_t = resolve_table_cached(
-            storage,
-            txn,
-            ctx,
-            &from_ref,
-        )?;
+        let from_t = resolve_table_cached(storage, txn, ctx, &from_ref)?;
         col_offsets.push(running_offset);
         running_offset += from_t.columns.len();
         all_resolved.push(from_t);
@@ -498,12 +537,7 @@ fn execute_select_with_joins_ctx(
         for join in &stmt.joins {
             match &join.table {
                 FromClause::Table(tref) => {
-                    let jt = resolve_table_cached(
-                        storage,
-                        txn,
-                        ctx,
-                        tref,
-                    )?;
+                    let jt = resolve_table_cached(storage, txn, ctx, tref)?;
                     col_offsets.push(running_offset);
                     running_offset += jt.columns.len();
                     all_resolved.push(jt);
@@ -520,9 +554,7 @@ fn execute_select_with_joins_ctx(
     let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
     let mut scanned: Vec<Vec<Row>> = Vec::with_capacity(all_resolved.len());
     for t in &all_resolved {
-        t.def
-            .ensure_heap_runtime("SELECT from clustered table — Phase 39.15")?;
-        let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap, None)?;
+        let rows = crate::table::scan_table_any_layout(storage, &t.def, &t.columns, snap)?;
         scanned.push(rows.into_iter().map(|(_, r)| r).collect());
     }
 
@@ -594,7 +626,6 @@ fn execute_select_with_joins_ctx(
     })
 }
 
-
 fn execute_select(
     mut stmt: SelectStmt,
     storage: &dyn StorageEngine,
@@ -662,29 +693,51 @@ fn execute_select(
             let mut resolver = make_resolver(storage, txn)?;
             resolver.resolve_table(from_table_ref.schema.as_deref(), &from_table_ref.name)?
         };
-        resolved
-            .def
-            .ensure_heap_runtime("SELECT from clustered table — Phase 39.15")?;
-
         let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
 
         // ── Query planner: pick the best access method (non-ctx path) ────
         // No session context available — use conservative defaults (no stats).
-        let access_method = crate::planner::plan_select(
-            stmt.where_clause.as_ref(),
-            &resolved.indexes,
-            &resolved.columns,
-            resolved.def.id,
-            &[], // no stats in non-ctx path — always use index (conservative)
-            &mut crate::session::StaleStatsTracker::default(),
-            &[], // no select_col_idxs in non-ctx path — no index-only scan
+        let access_method = normalize_clustered_access_method(
+            crate::planner::plan_select(
+                stmt.where_clause.as_ref(),
+                &resolved.indexes,
+                &resolved.columns,
+                resolved.def.id,
+                &[], // no stats in non-ctx path — always use index (conservative)
+                &mut crate::session::StaleStatsTracker::default(),
+                &[], // no select_col_idxs in non-ctx path — no index-only scan
+            ),
+            resolved.def.is_clustered(),
         );
 
         // ── Fetch rows via the chosen access method ───────────────────────
         let raw_rows: Vec<(RecordId, Vec<Value>)> = match &access_method {
+            crate::planner::AccessMethod::Scan if resolved.def.is_clustered() => {
+                crate::table::scan_clustered_table(storage, &resolved.def, &resolved.columns, snap)?
+            }
             crate::planner::AccessMethod::Scan => {
                 // Full sequential scan — existing behavior.
                 TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap, None)?
+            }
+            crate::planner::AccessMethod::IndexLookup { index_def, key }
+                if resolved.def.is_clustered() && index_def.is_primary =>
+            {
+                // Clustered PK point lookup (non-ctx path).
+                match crate::table::lookup_clustered_row(
+                    storage,
+                    &resolved.def,
+                    &resolved.columns,
+                    key,
+                    snap,
+                )? {
+                    Some(pair) => vec![pair],
+                    None => vec![],
+                }
+            }
+            crate::planner::AccessMethod::IndexLookup { index_def, key }
+                if resolved.def.is_clustered() =>
+            {
+                clustered_secondary_rows_for_lookup(storage, &resolved, index_def, key, snap)?
             }
             crate::planner::AccessMethod::IndexLookup { index_def, key } => {
                 // Point lookup: unique → exact match; non-unique → range with RID suffix.
@@ -694,7 +747,10 @@ fn execute_select(
                         Some(rid) => {
                             // Phase 7.3b: visibility check for dead index entries.
                             if !axiomdb_storage::heap_chain::HeapChain::is_slot_visible(
-                                storage, rid.page_id, rid.slot_id, snap,
+                                storage,
+                                rid.page_id,
+                                rid.slot_id,
+                                snap,
                             )? {
                                 vec![]
                             } else {
@@ -714,7 +770,10 @@ fn execute_select(
                     for (rid, _k) in pairs {
                         // Phase 7.3b: filter dead index entries by heap visibility.
                         if !axiomdb_storage::heap_chain::HeapChain::is_slot_visible(
-                            storage, rid.page_id, rid.slot_id, snap,
+                            storage,
+                            rid.page_id,
+                            rid.slot_id,
+                            snap,
                         )? {
                             continue;
                         }
@@ -726,6 +785,31 @@ fn execute_select(
                     }
                     result
                 }
+            }
+            crate::planner::AccessMethod::IndexRange { index_def, lo, hi }
+                if resolved.def.is_clustered() && index_def.is_primary =>
+            {
+                // Clustered PK range scan (non-ctx path).
+                crate::table::range_clustered_table(
+                    storage,
+                    &resolved.def,
+                    &resolved.columns,
+                    lo.as_deref(),
+                    hi.as_deref(),
+                    snap,
+                )?
+            }
+            crate::planner::AccessMethod::IndexRange { index_def, lo, hi }
+                if resolved.def.is_clustered() =>
+            {
+                clustered_secondary_rows_for_range(
+                    storage,
+                    &resolved,
+                    index_def,
+                    lo.as_deref(),
+                    hi.as_deref(),
+                    snap,
+                )?
             }
             crate::planner::AccessMethod::IndexRange { index_def, lo, hi } => {
                 // Range scan: iterate B-Tree entries → heap reads.
@@ -754,8 +838,7 @@ fn execute_select(
                                 if !header.is_visible(&snap) {
                                     continue;
                                 }
-                                let values =
-                                    axiomdb_types::codec::decode_row(data, &col_types)?;
+                                let values = axiomdb_types::codec::decode_row(data, &col_types)?;
                                 result.push((rid, values));
                             }
                         }
@@ -843,8 +926,7 @@ fn execute_select_derived(
     // Execute the inner query to materialize the derived table.
     let mut temp_ctx = SessionContext::new();
     let temp_bloom = crate::bloom::BloomRegistry::new();
-    let inner_result =
-        execute_select_ctx(inner_query, storage, txn, &temp_bloom, &mut temp_ctx)?;
+    let inner_result = execute_select_ctx(inner_query, storage, txn, &temp_bloom, &mut temp_ctx)?;
     let (derived_cols, derived_rows) = match inner_result {
         QueryResult::Rows { columns, rows } => (columns, rows),
         _ => {
@@ -947,9 +1029,7 @@ fn execute_select_with_joins(
     let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
     let mut scanned: Vec<Vec<Row>> = Vec::with_capacity(all_resolved.len());
     for t in &all_resolved {
-        t.def
-            .ensure_heap_runtime("SELECT from clustered table — Phase 39.15")?;
-        let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap, None)?;
+        let rows = crate::table::scan_table_any_layout(storage, &t.def, &t.columns, snap)?;
         scanned.push(rows.into_iter().map(|(_, r)| r).collect());
     }
 
@@ -1049,4 +1129,91 @@ fn collect_select_col_idxs(stmt: &SelectStmt) -> Vec<u16> {
         }
     }
     col_idxs
+}
+
+fn normalize_clustered_access_method(
+    access_method: crate::planner::AccessMethod,
+    is_clustered: bool,
+) -> crate::planner::AccessMethod {
+    if !is_clustered {
+        return access_method;
+    }
+
+    match access_method {
+        crate::planner::AccessMethod::IndexOnlyScan {
+            index_def, lo, hi, ..
+        } => {
+            let is_single_key_point = index_def.columns.len() == 1
+                && hi
+                    .as_ref()
+                    .map(|bound| bound.as_slice() == lo.as_slice())
+                    .unwrap_or(false);
+
+            if is_single_key_point {
+                crate::planner::AccessMethod::IndexLookup { index_def, key: lo }
+            } else {
+                crate::planner::AccessMethod::IndexRange {
+                    index_def,
+                    lo: Some(lo),
+                    hi,
+                }
+            }
+        }
+        other => other,
+    }
+}
+
+fn clustered_secondary_rows_for_lookup(
+    storage: &dyn StorageEngine,
+    resolved: &axiomdb_catalog::ResolvedTable,
+    index_def: &axiomdb_catalog::IndexDef,
+    key: &[u8],
+    snap: TransactionSnapshot,
+) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+    let primary_idx = clustered_primary_index(resolved)?;
+    crate::table::lookup_clustered_secondary_rows(
+        storage,
+        &resolved.def,
+        &resolved.columns,
+        primary_idx,
+        index_def,
+        key,
+        snap,
+    )
+}
+
+fn clustered_secondary_rows_for_range(
+    storage: &dyn StorageEngine,
+    resolved: &axiomdb_catalog::ResolvedTable,
+    index_def: &axiomdb_catalog::IndexDef,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+    snap: TransactionSnapshot,
+) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+    let primary_idx = clustered_primary_index(resolved)?;
+    crate::table::range_clustered_secondary_rows(
+        storage,
+        &resolved.def,
+        &resolved.columns,
+        primary_idx,
+        index_def,
+        lo,
+        hi,
+        snap,
+    )
+}
+
+fn clustered_primary_index(
+    resolved: &axiomdb_catalog::ResolvedTable,
+) -> Result<&axiomdb_catalog::IndexDef, DbError> {
+    resolved
+        .indexes
+        .iter()
+        .find(|idx| idx.is_primary && !idx.columns.is_empty())
+        .ok_or_else(|| DbError::Internal {
+            message: format!(
+                "clustered table {}.{} is missing primary-index metadata",
+                resolved.def.schema_name, resolved.def.table_name
+            ),
+        })
 }

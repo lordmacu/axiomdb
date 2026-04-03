@@ -1,5 +1,15 @@
 # Lessons Learned
 
+## 2026-04-02 - Clustered covering plans must degrade to clustered row fetch until a true clustered index-only path exists
+
+- The planner can legitimately emit `IndexOnlyScan` for a clustered table when the projected columns are covered by the key, but the old executor implementation still assumes `BTree key -> heap RecordId -> heap visibility`.
+- The right intermediate contract is:
+  - keep planner-side covering detection unchanged for heap tables
+  - normalize clustered `IndexOnlyScan` plans back to clustered-aware lookup/range access methods
+  - read visibility from the clustered row header, not from a heap slot that does not exist
+  - keep the optimization itself deferred until clustered storage has its own real covering-read path
+- The same rule applies to secondaries: a clustered secondary hit is `secondary key -> PK bookmark -> clustered row`, never `secondary key -> RecordId -> heap row`.
+
 ## 2026-04-02 - Reusing a delete-marked clustered PK during SQL INSERT must log clustered update undo, not clustered insert undo
 
 - A fresh clustered insert and a tombstone-reuse insert are not the same rollback case.
@@ -76,6 +86,17 @@
   append the table key to the index entry instead of depending on a hidden row slot.
 - The AxiomDB adaptation is intentionally narrower in 39.9: the bookmark path
   exists now, but executor/FK/index-integrity wiring stays in later clustered phases.
+
+## 2026-04-02 - Clustered SQL UPDATE must capture the exact old row image and both halves of secondary undo
+
+- The executor cannot synthesize clustered WAL headers during UPDATE and expect rollback to stay correct.
+- The right intermediate contract is:
+  - capture `RowHeader + full logical row bytes` from clustered storage before mutation
+  - record clustered UPDATE / delete-mark WAL with that exact old image
+  - when a clustered secondary key is rewritten, record undo for both sides:
+    delete the newly inserted bookmark key and reinsert the deleted old bookmark key
+- `research/mariadb-server/storage/innobase/row/row0upd.cc` reinforced the branching rule: clustered in-place vs. delete+insert depends on index-order changes.
+- The AxiomDB adaptation needs the extra secondary-undo rule because bookmark entries live in a separate B+ Tree instead of sharing heap-slot identity.
 
 ## 2026-04-02 - Variable-size clustered rebalance must propagate occupancy and minimum-key change separately
 
