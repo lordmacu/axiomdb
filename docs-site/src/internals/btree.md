@@ -512,6 +512,42 @@ Rollback therefore promises logical row restoration, not exact physical
 topology restoration. A relocate-update may leave a different split/merge shape
 after rollback as long as the old primary-key row is back.
 
+### SQL-Visible Clustered INSERT (Phase 39.14)
+
+Phase `39.14` is the first point where the SQL executor writes into the
+clustered tree instead of only the storage tests doing so.
+
+The executor branch now does this:
+
+1. resolve the clustered table plus its logical primary index metadata
+2. derive PK bytes from that primary-index column order
+3. check for a visible existing PK through clustered lookup
+4. insert the new row through `clustered_tree::insert(...)`, or reuse a
+   snapshot-invisible delete-marked physical key through
+   `restore_exact_row_image(...)`
+5. maintain non-primary indexes as `secondary_key ++ pk_suffix` bookmarks
+6. persist the final clustered table root and any changed secondary roots
+
+Fresh clustered keys emit `EntryType::ClusteredInsert`. Reused delete-marked
+physical keys emit `EntryType::ClusteredUpdate` so rollback can restore the old
+tombstone image instead of merely deleting the newly-inserted row.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Reuse Tombstone Via Update Undo</span>
+InnoDB can reuse a delete-marked clustered record because undo restores the older image. AxiomDB adopts that clustered-key reuse rule in `39.14`, but logs the reuse as a clustered update rather than a clustered insert so rollback preserves the superseded tombstone image exactly.
+</div>
+</div>
+
+This is still narrower than final clustered SQL behavior:
+
+- clustered `SELECT` stays deferred to `39.15`
+- clustered `UPDATE` stays deferred to `39.16`
+- clustered `DELETE` stays deferred to `39.17`
+- older-snapshot reconstruction after reusing a tombstoned PK still depends on
+  later clustered version-chain work
+
 ### Leaf Node (`LeafNodePage`)
 
 ```text

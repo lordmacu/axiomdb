@@ -120,7 +120,7 @@ SQLite-style slotted pages solve variable-size key storage cleanly, but clustere
 </div>
 </div>
 
-### SQL-Visible Clustered DDL Boundary (Phase 39.13)
+### SQL-Visible Clustered DDL + INSERT Boundary (Phases 39.13 / 39.14)
 
 The storage rewrite is no longer purely internal. `CREATE TABLE` now uses the
 clustered root when the SQL definition contains an explicit `PRIMARY KEY`:
@@ -131,15 +131,35 @@ clustered root when the SQL definition contains an explicit `PRIMARY KEY`:
 - clustered tables now allocate `PageType::ClusteredLeaf`
 - logical PRIMARY KEY metadata on clustered tables points at that same clustered root
 
-The executor still does **not** read or write clustered rows through SQL in
-`39.13`; heap-only runtime paths fail explicitly instead of treating a
-clustered root page as heap storage.
+The first SQL-visible clustered write path now exists too:
+
+- `INSERT` on explicit-`PRIMARY KEY` tables routes directly into
+  `clustered_tree::insert(...)` or `restore_exact_row_image(...)`
+- clustered `AUTO_INCREMENT` bootstraps from clustered rows instead of heap scans
+- non-primary clustered indexes are maintained as PK bookmarks through
+  `axiomdb-sql::clustered_secondary`
+- pending heap batches flush before the clustered statement boundary so the new
+  clustered branch does not inherit heap staging semantics accidentally
+
+SQL-visible clustered reads and later mutators are still deferred:
+
+- clustered `SELECT` → Phase `39.15`
+- clustered `UPDATE` → Phase `39.16`
+- clustered `DELETE` → Phase `39.17`
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
 <span class="callout-label">Design Decision — No Hidden Clustered Key</span>
 AxiomDB only creates clustered SQL tables when the schema has an explicit `PRIMARY KEY`. That mirrors SQLite `WITHOUT ROWID` more closely than InnoDB's fallback `GEN_CLUST_INDEX` path and avoids baking a hidden-key compromise into the first clustered executor boundary.
+</div>
+</div>
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — No Heap Fallback Writes</span>
+SQLite <code>WITHOUT ROWID</code> inserts target the PK B-tree directly, and InnoDB treats the clustered key as the row identity. AxiomDB now does the same for SQL-visible clustered INSERT instead of manufacturing a heap row plus compatibility index entry.
 </div>
 </div>
 

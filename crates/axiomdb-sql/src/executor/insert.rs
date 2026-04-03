@@ -11,6 +11,12 @@ fn execute_insert_ctx(
         ctx,
         &stmt.table,
     )?;
+    if resolved.def.is_clustered() {
+        if ctx.pending_inserts.is_some() {
+            flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
+        }
+        return execute_clustered_insert_ctx(stmt, storage, txn, bloom, ctx, resolved);
+    }
     resolved
         .def
         .ensure_heap_runtime("INSERT into clustered table — Phase 39.14")?;
@@ -445,6 +451,9 @@ fn execute_insert(
         let mut resolver = make_resolver(storage, txn)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
+    if resolved.def.is_clustered() {
+        return execute_clustered_insert(stmt, storage, txn, resolved);
+    }
     resolved
         .def
         .ensure_heap_runtime("INSERT into clustered table — Phase 39.14")?;
@@ -703,6 +712,497 @@ fn execute_insert(
         count,
         last_insert_id: None,
     })
+}
+
+fn execute_clustered_insert_ctx(
+    stmt: InsertStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
+    ctx: &mut SessionContext,
+    resolved: ResolvedTable,
+) -> Result<QueryResult, DbError> {
+    let schema_cols = &resolved.columns;
+    let primary_idx =
+        crate::clustered_table::primary_index(&resolved.indexes, &resolved.def.table_name)?.clone();
+    let mut secondary_indexes: Vec<IndexDef> = resolved
+        .indexes
+        .iter()
+        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .cloned()
+        .collect();
+    let secondary_layouts: Vec<crate::clustered_secondary::ClusteredSecondaryLayout> =
+        secondary_indexes
+            .iter()
+            .map(|idx| crate::clustered_secondary::ClusteredSecondaryLayout::derive(idx, &primary_idx))
+            .collect::<Result<_, _>>()?;
+    let compiled_preds =
+        crate::partial_index::compile_index_predicates(&secondary_indexes, schema_cols)?;
+    let col_positions =
+        build_insert_column_positions(schema_cols, &stmt.columns, &resolved.def.table_name)?;
+
+    let mut prepared_rows = Vec::new();
+    let mut first_generated = None;
+
+    match stmt.source {
+        InsertSource::Values(rows) => {
+            for (row_idx, value_exprs) in rows.into_iter().enumerate() {
+                let provided: Vec<Value> = value_exprs
+                    .iter()
+                    .map(|e| eval(e, &[]))
+                    .collect::<Result<_, _>>()?;
+                let mut full_values = materialize_insert_row(&col_positions, &provided);
+                assign_auto_increment(
+                    storage,
+                    txn,
+                    &resolved.def,
+                    schema_cols,
+                    full_values.as_mut_slice(),
+                    &mut first_generated,
+                )?;
+                check_row_constraints(
+                    &resolved.constraints,
+                    &full_values,
+                    &resolved.def.table_name,
+                )?;
+                if !resolved.foreign_keys.is_empty() {
+                    crate::fk_enforcement::check_fk_child_insert(
+                        &full_values,
+                        &resolved.foreign_keys,
+                        storage,
+                        txn,
+                        bloom,
+                    )?;
+                }
+                prepared_rows.push(crate::clustered_table::prepare_row_with_ctx(
+                    full_values,
+                    schema_cols,
+                    &primary_idx,
+                    &resolved.def.table_name,
+                    ctx,
+                    row_idx + 1,
+                )?);
+            }
+        }
+        InsertSource::Select(select_stmt) => {
+            let select_rows = match execute_select_ctx(*select_stmt, storage, txn, bloom, ctx)? {
+                QueryResult::Rows { rows, .. } => rows,
+                other => {
+                    return Err(DbError::Other(format!(
+                        "INSERT SELECT: expected Rows from SELECT, got {other:?}"
+                    )))
+                }
+            };
+
+            for (row_idx, row_values) in select_rows.into_iter().enumerate() {
+                let mut full_values = materialize_insert_row(&col_positions, &row_values);
+                assign_auto_increment(
+                    storage,
+                    txn,
+                    &resolved.def,
+                    schema_cols,
+                    full_values.as_mut_slice(),
+                    &mut first_generated,
+                )?;
+                check_row_constraints(
+                    &resolved.constraints,
+                    &full_values,
+                    &resolved.def.table_name,
+                )?;
+                if !resolved.foreign_keys.is_empty() {
+                    crate::fk_enforcement::check_fk_child_insert(
+                        &full_values,
+                        &resolved.foreign_keys,
+                        storage,
+                        txn,
+                        bloom,
+                    )?;
+                }
+                prepared_rows.push(crate::clustered_table::prepare_row_with_ctx(
+                    full_values,
+                    schema_cols,
+                    &primary_idx,
+                    &resolved.def.table_name,
+                    ctx,
+                    row_idx + 1,
+                )?);
+            }
+        }
+        InsertSource::DefaultValues => {
+            return Err(DbError::NotImplemented {
+                feature: "DEFAULT VALUES — Phase 4.3c".into(),
+            })
+        }
+    }
+
+    let count = apply_clustered_insert_rows(
+        storage,
+        txn,
+        bloom,
+        &resolved.def,
+        &primary_idx,
+        &mut secondary_indexes,
+        &secondary_layouts,
+        &compiled_preds,
+        &prepared_rows,
+    )?;
+    ctx.stats.on_rows_changed(resolved.def.id, count);
+    ctx.invalidate_all();
+
+    if let Some(id) = first_generated {
+        THREAD_LAST_INSERT_ID.with(|v| v.set(id));
+        return Ok(QueryResult::affected_with_id(count, id));
+    }
+
+    Ok(QueryResult::Affected {
+        count,
+        last_insert_id: None,
+    })
+}
+
+fn execute_clustered_insert(
+    stmt: InsertStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    resolved: ResolvedTable,
+) -> Result<QueryResult, DbError> {
+    let schema_cols = &resolved.columns;
+    let primary_idx =
+        crate::clustered_table::primary_index(&resolved.indexes, &resolved.def.table_name)?.clone();
+    let mut secondary_indexes: Vec<IndexDef> = resolved
+        .indexes
+        .iter()
+        .filter(|i| !i.is_primary && !i.columns.is_empty())
+        .cloned()
+        .collect();
+    let secondary_layouts: Vec<crate::clustered_secondary::ClusteredSecondaryLayout> =
+        secondary_indexes
+            .iter()
+            .map(|idx| crate::clustered_secondary::ClusteredSecondaryLayout::derive(idx, &primary_idx))
+            .collect::<Result<_, _>>()?;
+    let compiled_preds =
+        crate::partial_index::compile_index_predicates(&secondary_indexes, schema_cols)?;
+    let col_positions =
+        build_insert_column_positions(schema_cols, &stmt.columns, &resolved.def.table_name)?;
+
+    let mut prepared_rows = Vec::new();
+    let mut first_generated = None;
+    let mut noop_bloom = crate::bloom::BloomRegistry::new();
+
+    match stmt.source {
+        InsertSource::Values(rows) => {
+            for value_exprs in rows {
+                let provided: Vec<Value> = value_exprs
+                    .iter()
+                    .map(|e| eval(e, &[]))
+                    .collect::<Result<_, _>>()?;
+                let mut full_values = materialize_insert_row(&col_positions, &provided);
+                assign_auto_increment(
+                    storage,
+                    txn,
+                    &resolved.def,
+                    schema_cols,
+                    full_values.as_mut_slice(),
+                    &mut first_generated,
+                )?;
+                check_row_constraints(
+                    &resolved.constraints,
+                    &full_values,
+                    &resolved.def.table_name,
+                )?;
+                if !resolved.foreign_keys.is_empty() {
+                    crate::fk_enforcement::check_fk_child_insert(
+                        &full_values,
+                        &resolved.foreign_keys,
+                        storage,
+                        txn,
+                        &mut noop_bloom,
+                    )?;
+                }
+                prepared_rows.push(crate::clustered_table::prepare_row(
+                    full_values,
+                    schema_cols,
+                    &primary_idx,
+                    &resolved.def.table_name,
+                )?);
+            }
+        }
+        InsertSource::Select(select_stmt) => {
+            let select_rows = match execute_select(*select_stmt, storage, txn)? {
+                QueryResult::Rows { rows, .. } => rows,
+                other => {
+                    return Err(DbError::Other(format!(
+                        "INSERT SELECT: expected Rows from SELECT, got {other:?}"
+                    )))
+                }
+            };
+
+            for row_values in select_rows {
+                let mut full_values = materialize_insert_row(&col_positions, &row_values);
+                assign_auto_increment(
+                    storage,
+                    txn,
+                    &resolved.def,
+                    schema_cols,
+                    full_values.as_mut_slice(),
+                    &mut first_generated,
+                )?;
+                check_row_constraints(
+                    &resolved.constraints,
+                    &full_values,
+                    &resolved.def.table_name,
+                )?;
+                if !resolved.foreign_keys.is_empty() {
+                    crate::fk_enforcement::check_fk_child_insert(
+                        &full_values,
+                        &resolved.foreign_keys,
+                        storage,
+                        txn,
+                        &mut noop_bloom,
+                    )?;
+                }
+                prepared_rows.push(crate::clustered_table::prepare_row(
+                    full_values,
+                    schema_cols,
+                    &primary_idx,
+                    &resolved.def.table_name,
+                )?);
+            }
+        }
+        InsertSource::DefaultValues => {
+            return Err(DbError::NotImplemented {
+                feature: "DEFAULT VALUES — Phase 4.3c".into(),
+            })
+        }
+    }
+
+    let count = apply_clustered_insert_rows(
+        storage,
+        txn,
+        &mut noop_bloom,
+        &resolved.def,
+        &primary_idx,
+        &mut secondary_indexes,
+        &secondary_layouts,
+        &compiled_preds,
+        &prepared_rows,
+    )?;
+
+    if let Some(id) = first_generated {
+        THREAD_LAST_INSERT_ID.with(|v| v.set(id));
+        return Ok(QueryResult::affected_with_id(count, id));
+    }
+
+    Ok(QueryResult::Affected {
+        count,
+        last_insert_id: None,
+    })
+}
+
+fn apply_clustered_insert_rows(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
+    table_def: &TableDef,
+    primary_idx: &IndexDef,
+    secondary_indexes: &mut [IndexDef],
+    secondary_layouts: &[crate::clustered_secondary::ClusteredSecondaryLayout],
+    compiled_preds: &[Option<Expr>],
+    rows: &[crate::clustered_table::PreparedClusteredInsertRow],
+) -> Result<u64, DbError> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+    let snapshot = txn.active_snapshot()?;
+    let mut current_root = txn
+        .clustered_root(table_def.id)
+        .unwrap_or(table_def.root_page_id);
+
+    for row in rows {
+        let visible_existing = axiomdb_storage::clustered_tree::lookup(
+            storage,
+            Some(current_root),
+            &row.primary_key_bytes,
+            &snapshot,
+        )?;
+        if visible_existing.is_some() {
+            return Err(DbError::UniqueViolation {
+                index_name: primary_idx.name.clone(),
+                value: row.primary_key_values.first().map(|v| format!("{v}")),
+            });
+        }
+
+        let new_header = axiomdb_storage::RowHeader {
+            txn_id_created: txn_id,
+            txn_id_deleted: 0,
+            row_version: 0,
+            _flags: 0,
+        };
+
+        let physical_existing = axiomdb_storage::clustered_tree::lookup_physical(
+            storage,
+            Some(current_root),
+            &row.primary_key_bytes,
+        )?;
+
+        let new_root = if let Some(old_row) = physical_existing {
+            let new_root = axiomdb_storage::clustered_tree::restore_exact_row_image(
+                storage,
+                current_root,
+                &row.primary_key_bytes,
+                &new_header,
+                &row.encoded_row,
+            )?;
+            let old_image = axiomdb_wal::ClusteredRowImage::new(
+                current_root,
+                old_row.row_header,
+                &old_row.row_data,
+            );
+            let new_image =
+                axiomdb_wal::ClusteredRowImage::new(new_root, new_header, &row.encoded_row);
+            txn.record_clustered_update(table_def.id, &row.primary_key_bytes, &old_image, &new_image)?;
+            new_root
+        } else {
+            let new_root = axiomdb_storage::clustered_tree::insert(
+                storage,
+                Some(current_root),
+                &row.primary_key_bytes,
+                &new_header,
+                &row.encoded_row,
+            )?;
+            let new_image =
+                axiomdb_wal::ClusteredRowImage::new(new_root, new_header, &row.encoded_row);
+            txn.record_clustered_insert(table_def.id, &row.primary_key_bytes, &new_image)?;
+            new_root
+        };
+        current_root = new_root;
+
+        for ((idx, layout), compiled_pred) in secondary_indexes
+            .iter_mut()
+            .zip(secondary_layouts.iter())
+            .zip(compiled_preds.iter())
+        {
+            if let Some(pred) = compiled_pred {
+                if !is_truthy(&eval(pred, &row.values)?) {
+                    continue;
+                }
+            }
+
+            let Some(entry) = layout.entry_from_row(&row.values)? else {
+                continue;
+            };
+
+            let root_pid = std::sync::atomic::AtomicU64::new(idx.root_page_id);
+            layout.insert_row(storage, &root_pid, &row.values)?;
+            bloom.add(idx.index_id, &entry.physical_key);
+            let new_index_root = root_pid.load(std::sync::atomic::Ordering::Acquire);
+            txn.record_index_insert(idx.index_id, new_index_root, entry.physical_key)?;
+            if new_index_root != idx.root_page_id {
+                CatalogWriter::new(storage, txn)?.update_index_root(idx.index_id, new_index_root)?;
+                idx.root_page_id = new_index_root;
+            }
+        }
+    }
+
+    if current_root != table_def.root_page_id {
+        CatalogWriter::new(storage, txn)?.update_table_root(table_def.id, current_root)?;
+    }
+
+    Ok(rows.len() as u64)
+}
+
+fn build_insert_column_positions(
+    schema_cols: &[axiomdb_catalog::schema::ColumnDef],
+    insert_columns: &Option<Vec<String>>,
+    table_name: &str,
+) -> Result<Vec<usize>, DbError> {
+    match insert_columns {
+        None => Ok((0..schema_cols.len()).collect()),
+        Some(named_cols) => {
+            let mut map = vec![usize::MAX; schema_cols.len()];
+            for (val_pos, col_name) in named_cols.iter().enumerate() {
+                let schema_pos = schema_cols
+                    .iter()
+                    .position(|c| &c.name == col_name)
+                    .ok_or_else(|| DbError::ColumnNotFound {
+                        name: col_name.clone(),
+                        table: table_name.to_string(),
+                    })?;
+                map[schema_pos] = val_pos;
+            }
+            Ok(map)
+        }
+    }
+}
+
+fn materialize_insert_row(col_positions: &[usize], provided: &[Value]) -> Vec<Value> {
+    col_positions
+        .iter()
+        .map(|&idx| {
+            if idx == usize::MAX {
+                Value::Null
+            } else {
+                provided.get(idx).cloned().unwrap_or(Value::Null)
+            }
+        })
+        .collect()
+}
+
+fn assign_auto_increment(
+    storage: &mut dyn StorageEngine,
+    txn: &TxnManager,
+    table_def: &axiomdb_catalog::schema::TableDef,
+    schema_cols: &[axiomdb_catalog::schema::ColumnDef],
+    values: &mut [Value],
+    first_generated: &mut Option<u64>,
+) -> Result<(), DbError> {
+    let Some(ai_col) = schema_cols.iter().position(|c| c.auto_increment) else {
+        return Ok(());
+    };
+    if !matches!(values.get(ai_col), Some(Value::Null)) {
+        return Ok(());
+    }
+
+    let table_id = table_def.id;
+    let cached = AUTO_INC_SEQ.with(|seq| seq.borrow().get(&table_id).copied());
+    let next = if let Some(next) = cached {
+        next
+    } else {
+        let snap = txn.active_snapshot()?;
+        let max_existing = if table_def.is_clustered() {
+            crate::clustered_table::scan_max_numeric_column(
+                storage,
+                txn.clustered_root(table_id).or(Some(table_def.root_page_id)),
+                schema_cols,
+                ai_col,
+                &snap,
+            )?
+        } else {
+            let rows = TableEngine::scan_table(storage, table_def, schema_cols, snap, None)?;
+            rows.iter()
+                .filter_map(|(_, vals)| vals.get(ai_col))
+                .filter_map(|v| match v {
+                    Value::Int(n) => Some(*n as u64),
+                    Value::BigInt(n) => Some(*n as u64),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        max_existing + 1
+    };
+
+    AUTO_INC_SEQ.with(|seq| seq.borrow_mut().insert(table_id, next + 1));
+    values[ai_col] = match schema_cols[ai_col].col_type {
+        axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(next as i64),
+        _ => Value::Int(next as i32),
+    };
+    if first_generated.is_none() {
+        *first_generated = Some(next);
+    }
+    Ok(())
 }
 
 // ── UPDATE ────────────────────────────────────────────────────────────────────

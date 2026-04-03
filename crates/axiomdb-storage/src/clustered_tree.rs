@@ -117,6 +117,21 @@ pub fn lookup(
     key: &[u8],
     snapshot: &TransactionSnapshot,
 ) -> Result<Option<ClusteredRow>, DbError> {
+    let Some(row) = lookup_physical(storage, root_pid, key)? else {
+        return Ok(None);
+    };
+    if !row.row_header.is_visible(snapshot) {
+        return Ok(None);
+    }
+    Ok(Some(row))
+}
+
+/// Looks up the current physical row for `key` regardless of MVCC visibility.
+pub fn lookup_physical(
+    storage: &dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+) -> Result<Option<ClusteredRow>, DbError> {
     let Some(root_pid) = root_pid else {
         return Ok(None);
     };
@@ -128,9 +143,6 @@ pub fn lookup(
     };
 
     let cell = clustered_leaf::read_cell(&leaf, pos as u16)?;
-    if !cell.row_header.is_visible(snapshot) {
-        return Ok(None);
-    }
 
     let row_data = reconstruct_row_data(storage, &cell)?;
 

@@ -58,7 +58,7 @@ fn test_delete_leaves_index_entry() {
     let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
 
     ok(
-        "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(100))",
+        "CREATE TABLE t (id INT NOT NULL UNIQUE, name VARCHAR(100))",
         &mut storage,
         &mut txn,
         &mut bloom,
@@ -159,7 +159,7 @@ fn test_delete_then_reinsert_unique() {
         &mut ctx,
     );
     assert_eq!(result.len(), 1);
-    assert_eq!(result[0][0], Value::from("New Name"));
+    assert_eq!(result[0][0], Value::Text("New Name".into()));
 }
 
 // ── Test 3: INSERT duplicate of live unique key still fails ───────────────────
@@ -203,7 +203,7 @@ fn test_insert_rollback_removes_index_entry() {
     let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
 
     ok(
-        "CREATE TABLE t (id INT PRIMARY KEY, val VARCHAR(100) UNIQUE)",
+        "CREATE TABLE t (id INT NOT NULL UNIQUE, val VARCHAR(100) UNIQUE)",
         &mut storage,
         &mut txn,
         &mut bloom,
@@ -254,7 +254,7 @@ fn test_delete_rollback_restores_row() {
     let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
 
     ok(
-        "CREATE TABLE t (id INT PRIMARY KEY, val VARCHAR(100) UNIQUE)",
+        "CREATE TABLE t (id INT NOT NULL UNIQUE, val VARCHAR(100) UNIQUE)",
         &mut storage,
         &mut txn,
         &mut bloom,
@@ -313,7 +313,7 @@ fn test_update_indexed_col_rollback() {
     let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
 
     ok(
-        "CREATE TABLE t (id INT PRIMARY KEY, email VARCHAR(100) UNIQUE)",
+        "CREATE TABLE t (id INT NOT NULL UNIQUE, email VARCHAR(100) UNIQUE)",
         &mut storage,
         &mut txn,
         &mut bloom,
@@ -367,7 +367,7 @@ fn test_update_non_indexed_col_hot() {
     let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
 
     ok(
-        "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(100), notes VARCHAR(200))",
+        "CREATE TABLE t (id INT NOT NULL UNIQUE, name VARCHAR(100), notes VARCHAR(200))",
         &mut storage,
         &mut txn,
         &mut bloom,
@@ -405,7 +405,7 @@ fn test_update_non_indexed_col_hot() {
         &mut ctx,
     );
     assert_eq!(result.len(), 1);
-    assert_eq!(result[0][0], Value::from("updated"));
+    assert_eq!(result[0][0], Value::Text("updated".into()));
 }
 
 // ── Test 8: Unique index check with dead duplicate ────────────────────────────
@@ -461,7 +461,7 @@ fn test_range_scan_filters_dead_entries() {
     let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
 
     ok(
-        "CREATE TABLE t (id INT PRIMARY KEY, status VARCHAR(20))",
+        "CREATE TABLE t (id INT NOT NULL UNIQUE, status VARCHAR(20))",
         &mut storage,
         &mut txn,
         &mut bloom,
@@ -487,7 +487,14 @@ fn test_range_scan_filters_dead_entries() {
 
     // Delete 2 rows — their non-unique index entries become dead.
     ok(
-        "DELETE FROM t WHERE id IN (2, 4)",
+        "DELETE FROM t WHERE id = 2",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+    ok(
+        "DELETE FROM t WHERE id = 4",
         &mut storage,
         &mut txn,
         &mut bloom,

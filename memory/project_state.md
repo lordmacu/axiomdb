@@ -2,7 +2,7 @@
 
 ## 2026-04-02
 
-- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.9`, `39.10`, `39.11`, `39.12`, and `39.13` are closed in code, targeted validation,
+- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.9`, `39.10`, `39.11`, `39.12`, `39.13`, and `39.14` are closed in code, targeted validation,
   and docs.
 - `axiomdb-catalog` / `axiomdb-sql` now expose the first SQL-visible clustered-table boundary:
   - `TableDef` now stores `root_page_id` plus `TableStorageLayout::{Heap, Clustered}`
@@ -11,6 +11,11 @@
   - `CREATE TABLE ... PRIMARY KEY ...` now creates clustered tables and persists logical PK index metadata on that same clustered root
   - `CREATE TABLE` without an explicit `PRIMARY KEY` stays on the heap path
   - heap-only runtime paths now fail explicitly on clustered tables with phase-scoped `NotImplemented` errors
+  - `INSERT` on clustered tables now routes directly through the clustered tree in both ctx and non-ctx executor paths
+  - clustered PK bytes are derived from logical primary-index metadata order, not raw table-column order
+  - clustered `AUTO_INCREMENT` bootstraps from clustered rows, not heap scans
+  - non-primary clustered indexes are now maintained through PK bookmarks instead of heap `RecordId` payloads
+  - explicit-transaction clustered inserts bypass `SessionContext::pending_inserts` and stay rollback/savepoint-safe
 - `axiomdb-storage` now has the first complete clustered-tree write path:
   - `PageType::ClusteredInternal = 6`
   - storage module `crates/axiomdb-storage/src/clustered_internal.rs`
@@ -57,8 +62,8 @@
 - The clustered rewrite remains storage-first:
   - current `axiomdb-index::BTree` still uses fixed-slot `InternalNodePage` / `LeafNodePage`
   - SQL DDL can now create clustered tables for explicit primary keys
-  - no SQL clustered DML path writes clustered rows yet
-  - no SQL clustered `SELECT` path reads clustered rows yet either
+  - SQL clustered `INSERT` now writes clustered rows
+  - no SQL clustered `SELECT` path reads clustered rows yet
   - clustered range scan now exists internally, but no SQL path uses it yet
   - clustered same-leaf update now exists internally, but no SQL path uses it yet
   - clustered delete-mark now exists internally, but no SQL path uses it yet
@@ -86,6 +91,7 @@
   - clustered roots are still reconstructed from surviving WAL history
   - checkpoint/rotation-safe clustered root persistence remains deferred
   - standalone clustered `CREATE INDEX` / `ANALYZE` / `VACUUM` remain explicitly deferred
+  - reusing a delete-marked clustered PK during SQL `INSERT` rewrites only the current physical version; older-snapshot reconstruction of the superseded tombstone remains future MVCC work
 
 ## 2026-03-29
 

@@ -15,13 +15,16 @@ That new clustered DDL boundary is intentionally narrow in `39.13`:
 
 - the table root is clustered from day one
 - PRIMARY KEY catalog metadata points at that clustered root
-- `INSERT`, `SELECT`, `UPDATE`, and `DELETE` on clustered tables still return `0A000` / `NotImplemented` until `39.14`–`39.17`
+- `INSERT` on clustered tables now works through the clustered PK tree
+- `SELECT`, `UPDATE`, and `DELETE` on clustered tables still return `0A000` / `NotImplemented` until `39.15`–`39.17`
 
 Internally, the storage rewrite already has clustered insert, point lookup,
 range scan, same-leaf update, delete-mark, structural rebalance / relocate-update,
 secondary PK bookmarks, and overflow-backed clustered rows for large payloads,
-and explicit-PK `CREATE TABLE` now records that layout in SQL metadata, but the
-generic SQL DML executor is not wired to clustered rows yet.
+and explicit-PK `CREATE TABLE` now records that layout in SQL metadata.
+Phase `39.14` makes the first executor-visible clustered DML cut: `INSERT`
+writes go straight to the clustered PK tree and maintain bookmark-bearing
+secondary indexes, while clustered reads and later mutators still stay deferred.
 
 That internal rewrite is still honest about its current boundary:
 
@@ -37,7 +40,15 @@ That internal rewrite is still honest about its current boundary:
 <span class="callout-icon">💡</span>
 <div class="callout-body">
 <span class="callout-label">Current Behavior</span>
-`CREATE TABLE users (id INT PRIMARY KEY, ...)` now succeeds and creates clustered metadata, but `INSERT INTO users ...` still fails with SQLSTATE `0A000` until Phase `39.14`. Keep heap-backed tables for runnable SQL workloads until clustered DML lands.
+`CREATE TABLE users (id INT PRIMARY KEY, ...)` now creates clustered storage and `INSERT INTO users ...` works immediately. The remaining limitation is reads and later mutators: clustered `SELECT`, `UPDATE`, and `DELETE` still return SQLSTATE `0A000` until Phases `39.15`–`39.17`.
+</div>
+</div>
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Direct PK Tree Writes</span>
+SQLite <code>WITHOUT ROWID</code> and InnoDB both treat the clustered key as the row-storage identity. AxiomDB now does the same for SQL-visible clustered INSERT: no heap fallback row is created, and non-primary indexes store PK bookmarks instead of heap-era <code>RecordId</code> payloads.
 </div>
 </div>
 
@@ -186,7 +197,9 @@ AxiomDB automatically creates a unique B+ Tree index for:
 
 For clustered tables, the automatically created PRIMARY KEY metadata row reuses
 the clustered table root instead of allocating a second heap-era PK tree.
-`UNIQUE` secondary indexes still allocate ordinary B+ Tree roots.
+`UNIQUE` secondary indexes still allocate ordinary B+ Tree roots, but `39.14`
+now maintains their entries as `secondary_key ++ pk_suffix` bookmarks during
+SQL-visible clustered INSERT.
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>

@@ -1,6 +1,6 @@
 # Architecture Notes
 
-## 2026-04-02 — Clustered internal page primitive, clustered insert/read/update/delete/rebalance, clustered secondary bookmarks, clustered overflow pages, clustered WAL support, clustered crash recovery, and clustered CREATE TABLE
+## 2026-04-02 — Clustered internal page primitive, clustered insert/read/update/delete/rebalance, clustered secondary bookmarks, clustered overflow pages, clustered WAL support, clustered crash recovery, clustered CREATE TABLE, and clustered SQL INSERT
 
 - `crates/axiomdb-storage/src/clustered_internal.rs` owns the clustered
   internal page format for Phase `39.2`.
@@ -16,6 +16,8 @@
   now own the dual-mode table-root contract for Phase `39.13`.
 - `crates/axiomdb-sql/src/executor/ddl.rs` now decides heap vs clustered table
   creation from the presence of an explicit primary key.
+- `crates/axiomdb-sql/src/clustered_table.rs` now owns executor-facing clustered
+  row preparation for Phase `39.14`.
 - The architecture still keeps storage and tree responsibilities separate:
   - storage owns page layout, free-space accounting, binary search, and page-local mutation
   - `clustered_tree` owns descent, exact leaf search, split planning, separator propagation, and root growth
@@ -91,8 +93,11 @@
 - The clustered executor boundary is now explicit:
   - clustered tables are created only when the SQL definition has an explicit `PRIMARY KEY`
   - tables without explicit PK remain heap-backed for now
-  - heap-only executor helpers reject clustered tables instead of touching the wrong page format
+  - clustered `INSERT` now has a dedicated executor branch and writes directly into the clustered tree
+  - heap-only executor helpers still reject clustered `SELECT` / `UPDATE` / `DELETE` instead of touching the wrong page format
   - startup index-integrity repair skips clustered tables until clustered executor/index rebuild work exists
+  - pending heap INSERT batches flush before a clustered INSERT statement so clustered writes do not inherit heap staging semantics accidentally
+  - reusing a delete-marked clustered PK is logged as clustered update undo, not clustered insert undo, so rollback can restore the superseded tombstone image
 - Variable-size occupancy is measured in encoded bytes, not key count:
   - clustered leaves split by cumulative cell footprint
   - clustered internals split by cumulative separator footprint

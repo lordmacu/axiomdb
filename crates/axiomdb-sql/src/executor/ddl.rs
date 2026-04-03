@@ -7,6 +7,10 @@ fn execute_create_table(
     let schema = stmt.table.schema.as_deref().unwrap_or("public");
     let primary_key = collect_create_table_primary_key(&stmt)?;
     let unique_indexes = collect_create_table_unique_indexes(&stmt)?;
+    let primary_key_cols: std::collections::HashSet<u16> = primary_key
+        .as_ref()
+        .map(|pk| pk.columns.iter().map(|c| c.col_idx).collect())
+        .unwrap_or_default();
     let storage_layout = if primary_key.is_some() {
         axiomdb_catalog::schema::TableStorageLayout::Clustered
     } else {
@@ -43,7 +47,8 @@ fn execute_create_table(
         let nullable = !col_def
             .constraints
             .iter()
-            .any(|c| matches!(c, ColumnConstraint::NotNull));
+            .any(|c| matches!(c, ColumnConstraint::NotNull))
+            && !primary_key_cols.contains(&(i as u16));
         let auto_increment = col_def
             .constraints
             .iter()

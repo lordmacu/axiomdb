@@ -130,6 +130,9 @@ pub fn insert_into_indexes_with_undo(
         .enumerate()
         .filter(|(_, i)| !i.columns.is_empty())
     {
+        let original_root = idx.root_page_id;
+        let mut current_root = original_root;
+
         // Partial index predicate check (Phase 6.7).
         // compiled_preds[i] is None for full indexes OR when caller passes &[].
         if let Some(Some(pred)) = compiled_preds.get(i) {
@@ -170,7 +173,7 @@ pub fn insert_into_indexes_with_undo(
         // count as duplicates (they'll be cleaned by vacuum).
         if idx.is_unique && !idx.is_fk_index {
             // Check if a duplicate key exists in the B-Tree.
-            if let Some(existing_rid) = BTree::lookup_in(storage, idx.root_page_id, &key)? {
+            if let Some(existing_rid) = BTree::lookup_in(storage, current_root, &key)? {
                 // If the existing row is visible → real violation.
                 if HeapChain::is_slot_visible(
                     storage,
@@ -185,27 +188,23 @@ pub fn insert_into_indexes_with_undo(
                     });
                 }
                 // Dead entry: remove it from B-Tree so insert_in won't reject.
-                let root_pid = AtomicU64::new(idx.root_page_id);
+                let root_pid = AtomicU64::new(current_root);
                 let _ = BTree::delete_in(storage, &root_pid, &key);
-                let new_root = root_pid.load(Ordering::Acquire);
-                if new_root != idx.root_page_id {
-                    updated_roots.push((idx.index_id, new_root));
-                    // Update in-place for subsequent iterations.
-                }
+                current_root = root_pid.load(Ordering::Acquire);
             }
         }
 
-        let root_pid = AtomicU64::new(idx.root_page_id);
+        let root_pid = AtomicU64::new(current_root);
         BTree::insert_in(storage, &root_pid, &key, rid, idx.fillfactor)?;
         bloom.add(idx.index_id, &key);
-        let new_root = root_pid.load(Ordering::Acquire);
-        if new_root != idx.root_page_id {
-            updated_roots.push((idx.index_id, new_root));
+        current_root = root_pid.load(Ordering::Acquire);
+        if current_root != original_root {
+            updated_roots.push((idx.index_id, current_root));
         }
 
         // Record undo op so ROLLBACK can remove this B-Tree entry.
         if let Some(ref mut tm) = txn {
-            let _ = tm.record_index_insert(idx.index_id, idx.root_page_id, key);
+            let _ = tm.record_index_insert(idx.index_id, current_root, key);
         }
     }
 

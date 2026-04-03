@@ -1,5 +1,18 @@
 # Lessons Learned
 
+## 2026-04-02 - Reusing a delete-marked clustered PK during SQL INSERT must log clustered update undo, not clustered insert undo
+
+- A fresh clustered insert and a tombstone-reuse insert are not the same rollback case.
+- The right intermediate contract is:
+  - fresh clustered key → `record_clustered_insert(...)`
+  - reuse of a snapshot-invisible delete-marked physical key →
+    `record_clustered_update(...)`
+  - rollback of that reuse restores the old tombstone image exactly instead of
+    only deleting the newly-inserted row
+- `research/mariadb-server/storage/innobase/row/row0ins.cc` reinforced the
+  clustered-key reuse idea, but the AxiomDB adaptation needs the WAL distinction
+  because clustered undo is PK + row-image based rather than slot-based.
+
 ## 2026-04-02 - The first SQL-visible clustered cut must reuse the real PK root, not synthesize a fake heap-era primary index
 
 - Once clustered storage exists, `CREATE TABLE ... PRIMARY KEY ...` should not keep creating a second heap-era primary B-Tree just to preserve old executor assumptions.
