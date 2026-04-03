@@ -2262,6 +2262,39 @@ ok(
     row,
 )
 
+# ── 39.17: clustered DELETE over MySQL wire ──────────────────────────────────
+
+print("\n[39.17 clustered DELETE]")
+
+cc.execute("DELETE FROM cl_users WHERE email = 'carol+new@example.com'")
+conn_cl.commit()
+cc.execute("SELECT COUNT(*) FROM cl_users WHERE id = 3")
+row = cc.fetchone()
+ok(
+    "39.17 clustered secondary delete hides deleted row",
+    row == (0,),
+    row,
+)
+
+cc.execute("SELECT COUNT(*) FROM cl_users")
+row = cc.fetchone()
+ok(
+    "39.17 clustered DELETE updates visible row count",
+    row == (2,),
+    row,
+)
+
+cc.execute("BEGIN")
+cc.execute("DELETE FROM cl_users WHERE id = 1")
+cc.execute("ROLLBACK")
+cc.execute("SELECT name FROM cl_users WHERE id = 1")
+row = cc.fetchone()
+ok(
+    "39.17 clustered DELETE rollback restores original row",
+    row == ("Alice",),
+    row,
+)
+
 conn_cl.close()
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────

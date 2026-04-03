@@ -542,8 +542,8 @@ InnoDB can reuse a delete-marked clustered record because undo restores the olde
 
 This is still narrower than final clustered SQL behavior:
 
-- clustered `UPDATE` stays deferred to `39.16`
-- clustered `DELETE` stays deferred to `39.17`
+- clustered `UPDATE` is now SQL-visible in `39.16`
+- clustered `DELETE` is now SQL-visible as logical delete-mark in `39.17`
 - clustered secondary covering reads still normalize back to clustered row fetches
   until a true clustered index-only optimization exists
 - older-snapshot reconstruction after reusing a tombstoned PK still depends on

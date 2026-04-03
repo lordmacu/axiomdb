@@ -1,5 +1,14 @@
 # Lessons Learned
 
+## 2026-04-02 - Clustered parent DELETE can reuse parent-side FK enforcement as long as it passes row values, not heap identity
+
+- Parent-side FK enforcement on DELETE only needs the parent row values to probe referencing child rows; it does not need a stable heap slot identity for the parent row.
+- The right intermediate contract is:
+  - collect clustered delete candidates as `pk_key + RowHeader + row_data + decoded values`
+  - pass those decoded parent values into the existing FK parent checker
+  - use a dummy `RecordId` only as a compatibility shell while clustered child-table FK support is still deferred
+- That lets clustered parent DELETE become SQL-visible in `39.17` without faking a heap row or weakening `RESTRICT` semantics.
+
 ## 2026-04-02 - Clustered covering plans must degrade to clustered row fetch until a true clustered index-only path exists
 
 - The planner can legitimately emit `IndexOnlyScan` for a clustered table when the projected columns are covered by the key, but the old executor implementation still assumes `BTree key -> heap RecordId -> heap visibility`.

@@ -131,7 +131,7 @@ clustered root when the SQL definition contains an explicit `PRIMARY KEY`:
 - clustered tables now allocate `PageType::ClusteredLeaf`
 - logical PRIMARY KEY metadata on clustered tables points at that same clustered root
 
-The first SQL-visible clustered write path now exists too:
+The first SQL-visible clustered write paths now exist too:
 
 - `INSERT` on explicit-`PRIMARY KEY` tables routes directly into
   `clustered_tree::insert(...)` or `restore_exact_row_image(...)`
@@ -140,13 +140,17 @@ The first SQL-visible clustered write path now exists too:
   `axiomdb-sql::clustered_secondary`
 - `SELECT` on clustered tables now routes through `clustered_tree::lookup(...)`
   / `range(...)` and decodes clustered secondary bookmarks back into PK probes
+- `UPDATE` on clustered tables now routes through clustered candidate discovery
+  plus `update_in_place(...)` / `update_with_relocation(...)`
+- `DELETE` on clustered tables now routes through clustered candidate discovery
+  plus `delete_mark(...)` and exact-row-image WAL
 - pending heap batches flush before the clustered statement boundary so the new
   clustered branch does not inherit heap staging semantics accidentally
 
-SQL-visible clustered mutators still deferred:
+SQL-visible clustered maintenance still deferred:
 
-- clustered `UPDATE` → Phase `39.16`
-- clustered `DELETE` → Phase `39.17`
+- clustered physical purge / VACUUM → Phase `39.18`
+- clustered standalone `CREATE INDEX` / `ANALYZE` → later Phase 39 work
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
