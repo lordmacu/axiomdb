@@ -147,10 +147,32 @@ The first SQL-visible clustered write paths now exist too:
 - pending heap batches flush before the clustered statement boundary so the new
   clustered branch does not inherit heap staging semantics accidentally
 
-SQL-visible clustered maintenance still deferred:
+SQL-visible clustered maintenance is now partially live:
 
-- clustered physical purge / VACUUM → Phase `39.18`
-- clustered standalone `CREATE INDEX` / `ANALYZE` → later Phase 39 work
+- clustered `VACUUM` now physically purges safe dead rows and overflow chains
+- `ALTER TABLE ... REBUILD` now migrates legacy heap+PRIMARY KEY tables into a
+  fresh clustered root and rebuilt clustered-secondary bookmark roots
+- clustered standalone `CREATE INDEX` / `ANALYZE` remain later Phase 39 work
+
+Clustered maintenance now includes the first purge path:
+
+- `VACUUM` walks the clustered leaf chain from the leftmost leaf
+- safe delete-marked cells are physically removed from clustered leaves
+- overflow chains are freed during that purge
+- secondary bookmark cleanup uses clustered **physical existence** after leaf
+  purge, not caller-snapshot visibility
+- any secondary root rotation caused by `delete_many_in(...)` is persisted back
+  to the catalog in the same transaction
+- clustered rebuild flushes the newly built clustered / secondary roots before
+  the catalog swap and defers old heap/index page reclamation until commit
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Purge by Physical Existence</span>
+InnoDB purge and PostgreSQL lazy vacuum both separate “row is not visible” from “row is safe to remove”. AxiomDB now applies the same rule to clustered secondaries: cleanup runs only after leaf purge and checks clustered physical existence, so an uncommitted delete cannot orphan a secondary bookmark.
+</div>
+</div>
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
@@ -310,6 +332,45 @@ PostgreSQL uses bounded prefetch windows instead of reading arbitrarily far ahea
 Like `39.4`, this subphase is still honest about missing older-version
 reconstruction. If a row's current inline version is invisible, `39.5` skips
 it; the new `39.11` rollback support does not change read semantics yet.
+
+### Zero-Allocation Full Scan (`scan_all_callback`, Phase 39.21)
+
+`ClusteredRangeIter::next()` allocates two heap buffers per row:
+`cell.key.to_vec()` (primary key copy) and `reconstruct_row_data` (row bytes
+copy). For a full-table scan that only needs to decode the row bytes into
+`Vec<Value>`, both allocations are unnecessary.
+
+`scan_all_callback` bypasses the iterator entirely:
+
+```rust
+pub fn scan_all_callback<F>(
+    storage: &dyn StorageEngine,
+    root_pid: Option<u64>,
+    snapshot: &TransactionSnapshot,
+    mut f: F,
+) -> Result<(), DbError>
+where
+    F: FnMut(&[u8], Option<(u64, usize)>) -> Result<(), DbError>,
+```
+
+The callback receives `(inline_data: &[u8], overflow)`:
+
+- **`inline_data`**: a borrow of `cell.row_data` directly from the leaf page
+  memory — no copy.
+- **`overflow`**: `Some((first_overflow_page, tail_len))` for rows that spill to
+  overflow pages; `None` for rows that fit inline (the common case for most tables).
+
+For inline rows the callback can decode `inline_data` in place. The caller
+allocates only one `Vec<Value>` per visible row — the decoded output — compared
+to three allocations with the iterator path.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage — 14× faster than iterator path for aggregate scans</span>
+A <code>GROUP BY age, AVG(score)</code> query on 50K rows of a clustered table dropped from 57 ms to 4.0 ms (14.25× improvement) after switching from <code>ClusteredRangeIter</code> to <code>scan_all_callback</code>. The bottleneck was ~150K heap allocations per scan (key copy + row copy + Vec&lt;Value&gt;). The callback path eliminates the first two, leaving only the <code>Vec&lt;Value&gt;</code> per row. AxiomDB now runs this query 1.6× faster than MariaDB (6.5 ms) and 2.2× faster than MySQL (8.9 ms) on the same hardware.
+</div>
+</div>
 
 ### Clustered Overflow Pages (Phase 39.10)
 

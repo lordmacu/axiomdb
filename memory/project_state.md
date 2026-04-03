@@ -1,5 +1,59 @@
 # Project State
 
+## 2026-04-03
+
+- Phase 39 subphase `39.21` is closed in code, targeted validation, wire smoke, and docs.
+- `crates/axiomdb-sql/src/executor/aggregate.rs` now exposes a complete hash
+  aggregate engine:
+  - `GroupTablePrimitive` for INT/BIGINT single-column GROUP BY (hashbrown `i64` key, no serialization)
+  - `GroupTableGeneric` for multi-column / TEXT / mixed-type GROUP BY (reused key buffer, hashbrown `Box<[u8]>` key)
+  - fast-path `value_agg_add` arithmetic for SUM/MIN/MAX/COUNT bypassing `eval()`
+  - `finalize_avg` returning `Value::Null` for all-NULL input
+  - `non_agg_col_values` replacing `representative_row` for HAVING column resolution
+- `crates/axiomdb-storage/src/clustered_tree.rs` now exports `scan_all_callback<F>`:
+  - zero-allocation full scan providing inline row bytes directly to a callback
+  - avoids `ClusteredRow` struct, `key.to_vec()`, and `reconstruct_row_data` per row
+  - reduces per-row allocations from ~3 to ~1 for clustered table aggregate scans
+- `crates/axiomdb-sql/src/table.rs` now exports `scan_clustered_table_masked`:
+  - accepts `Option<&[bool]>` column decode mask
+  - backed by `scan_all_callback` for inline rows (zero extra allocation)
+- `crates/axiomdb-sql/src/executor/select.rs` now builds a column decode mask via
+  `collect_expr_columns` before clustered full scans and passes it as `Option<&[bool]>`
+  to `scan_clustered_table_masked`
+- Key bug fixed: `collect_expr_columns` now handles `Expr::GroupConcat` (was falling
+  through to `_ => {}`, causing GROUP_CONCAT columns to decode as Null when mask was active)
+- Performance: GROUP BY age + AVG(score) on 50K clustered rows: 57ms → 4.0ms (14.25×)
+  - 1.6× faster than MariaDB (6.5ms), 2.2× faster than MySQL (8.9ms)
+- 11 new integration tests in `crates/axiomdb-sql/tests/integration_aggregate_hash.rs`
+- 9 new wire-protocol assertions in `tools/wire-test.py` (section `[39.21]`)
+- Total wire tests: 288/288 passing
+
+- Phase 39 subphase `39.19` is closed in code, targeted validation, and docs.
+- `axiomdb-sql/src/executor/ddl.rs` now exposes clustered table rebuild for
+  legacy heap+PRIMARY KEY tables:
+  - scans the old PK tree in logical order and batch-reads heap rows
+  - rebuilds a new clustered root plus fresh clustered secondary bookmark roots
+  - flushes those new roots before the catalog swap
+  - updates table root/layout and PK/secondary index roots in one DDL transaction
+  - defers free of the old heap/index pages until the DDL commit path completes
+- `crates/axiomdb-sql/tests/integration_clustered_rebuild.rs` now seeds real
+  legacy heap+PK fixtures instead of testing only parser/guard rails.
+- `tools/wire-test.py` now covers `ALTER TABLE ... REBUILD` syntax/guard rails
+  over the MySQL wire, while the real heap→clustered migration remains covered
+  by Rust integration tests because new SQL tables with explicit `PRIMARY KEY`
+  already start clustered after `39.13`.
+- Phase 39 subphase `39.18` is closed in code, targeted validation, wire smoke,
+  and docs.
+- `axiomdb-sql/src/vacuum.rs` now exposes clustered `VACUUM`:
+  - clustered tables descend to the leftmost leaf and purge safe delete-marked cells
+  - purged overflow-backed rows now free their overflow-page chains
+  - clustered secondary bookmark cleanup now uses clustered physical existence after purge
+  - any root rotation caused by clustered/shared bulk-delete vacuum is now persisted back to the catalog
+  - uncommitted clustered deletes remain untouched by `VACUUM`
+- `tools/wire-test.py` now covers clustered `VACUUM` over the MySQL wire:
+  - committed clustered delete + `VACUUM` removes one row and one bookmark
+  - uncommitted clustered delete + `VACUUM` removes nothing and preserves rollback
+
 ## 2026-04-02
 
 - Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.9`, `39.10`, `39.11`, `39.12`, `39.13`, `39.14`, `39.15`, `39.16`, and `39.17` are closed in code, targeted validation,
@@ -80,10 +134,8 @@
   - clustered SQL `INSERT` / `SELECT` now use PK-bookmark secondaries, but FK enforcement and index-integrity rebuild still use `RecordId`-based secondaries
   - parent separator repair still assumes the repaired separator fits on the current internal page
 - Current clustered delete limitation:
-  - delete-mark keeps the physical cell inline in `39.7`
-  - `39.17` makes that delete-mark SQL-visible, but public clustered delete still does not purge dead rows
-  - clustered purge after delete still depends on later phases
-  - snapshot-safe purge still depends on later phases
+  - delete-mark keeps the physical cell inline until later clustered `VACUUM`
+  - `39.18` now purges physically safe clustered dead rows and overflow chains
   - parent-side FK enforcement works for clustered parent tables, but clustered child-table FK enforcement remains deferred
 - `39.1` is now effectively closed by `39.10`:
   - clustered leaves support both inline rows and overflow-backed rows
@@ -94,7 +146,7 @@
   - clustered roots are still reconstructed from surviving WAL history
   - checkpoint/rotation-safe clustered root persistence remains deferred
   - clustered covering reads still degrade to clustered row fetches instead of a true clustered index-only path
-  - standalone clustered `CREATE INDEX` / `ANALYZE` / `VACUUM` remain explicitly deferred
+  - standalone clustered `CREATE INDEX` / `ANALYZE` remain explicitly deferred
   - reusing a delete-marked clustered PK during SQL `INSERT` rewrites only the current physical version; older-snapshot reconstruction of the superseded tombstone remains future MVCC work
 
 ## 2026-03-29

@@ -273,6 +273,30 @@ fn bench_select_count_aggregate(c: &mut Criterion) {
         });
     });
 
+    // ── Clustered table aggregate (PRIMARY KEY → clustered B-tree) ────────────
+    // Mirrors the wire benchmark: bench_users has id INT PK, name TEXT, age INT,
+    // active BOOL, score DOUBLE, email TEXT — only age+score needed for aggregate.
+    group.bench_function("group_by_age_avg_score_clustered_50k", |b| {
+        let db = std::sync::Mutex::new({
+            let mut d = Db::open();
+            d.run("CREATE TABLE bench_c (id INT NOT NULL PRIMARY KEY, name TEXT NOT NULL, age INT NOT NULL, active BOOL NOT NULL, score DOUBLE NOT NULL, email TEXT NOT NULL)");
+            for i in 1u32..=50_000 {
+                d.run(&format!(
+                    "INSERT INTO bench_c VALUES ({i}, 'User_{i:05}', {}, {}, {:.1}, 'u{i}@x.com')",
+                    20 + (i % 62),
+                    if i % 2 == 0 { "TRUE" } else { "FALSE" },
+                    (i % 100) as f64,
+                ));
+            }
+            d
+        });
+        b.iter(|| {
+            db.lock().unwrap().run(
+                "SELECT age, COUNT(*) AS c, AVG(score) AS a FROM bench_c GROUP BY age ORDER BY age",
+            );
+        });
+    });
+
     group.finish();
 }
 

@@ -6,7 +6,9 @@ Updated at each subphase close — always overwrite this file, never create new 
 Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batch delete),
              5.19a (executor decomposition — structural refactor, wire-invisible),
              5.21 (transactional INSERT staging), 6.19 (WAL fsync pipeline smoke),
-             6.20 (UPDATE apply fast path smoke), 22b.3a (database catalog wire smoke)
+             6.20 (UPDATE apply fast path smoke), 22b.3a (database catalog wire smoke),
+             39.18 (clustered VACUUM smoke), 39.19 (clustered REBUILD guard rails),
+             39.21 (aggregate hash execution — zero-alloc clustered scan)
 """
 import os
 import signal
@@ -2295,7 +2297,161 @@ ok(
     row,
 )
 
+# ── 39.18: clustered VACUUM over MySQL wire ──────────────────────────────────
+
+print("\n[39.18 clustered VACUUM]")
+
+cc.execute(
+    "CREATE TABLE cl_vacuum_users (id INT PRIMARY KEY, email TEXT UNIQUE, name TEXT)"
+)
+cc.execute(
+    "INSERT INTO cl_vacuum_users VALUES "
+    "(1, 'vac_a@example.com', 'Vac A'), "
+    "(2, 'vac_b@example.com', 'Vac B')"
+)
+conn_cl.commit()
+
+cc.execute("DELETE FROM cl_vacuum_users WHERE id = 1")
+conn_cl.commit()
+cc.execute("VACUUM cl_vacuum_users")
+row = cc.fetchone()
+ok(
+    "39.18 clustered VACUUM removes committed dead row and secondary bookmark",
+    row == ("cl_vacuum_users", 1, 1),
+    row,
+)
+conn_cl.commit()
+
+cc.execute("BEGIN")
+cc.execute("DELETE FROM cl_vacuum_users WHERE id = 2")
+cc.execute("VACUUM cl_vacuum_users")
+row = cc.fetchone()
+ok(
+    "39.18 clustered VACUUM skips uncommitted clustered delete",
+    row == ("cl_vacuum_users", 0, 0),
+    row,
+)
+cc.execute("ROLLBACK")
+cc.execute("SELECT name FROM cl_vacuum_users WHERE email = 'vac_b@example.com'")
+row = cc.fetchone()
+ok(
+    "39.18 clustered VACUUM preserves rollback path for uncommitted delete",
+    row == ("Vac B",),
+    row,
+)
+
 conn_cl.close()
+
+# ── 39.19: clustered REBUILD over MySQL wire ─────────────────────────────────
+
+print("\n[39.19 clustered REBUILD]")
+conn_rebuild = connect()
+cr = conn_rebuild.cursor()
+
+cr.execute("CREATE TABLE cl_rebuild_heap (id INT NOT NULL, name TEXT)")
+conn_rebuild.commit()
+try:
+    cr.execute("ALTER TABLE cl_rebuild_heap REBUILD")
+    ok("39.19 REBUILD rejects heap table without PRIMARY KEY", False, "no error raised")
+except pymysql.MySQLError as e:
+    ok(
+        "39.19 REBUILD rejects heap table without PRIMARY KEY",
+        len(e.args) >= 2 and "PRIMARY KEY" in str(e.args[1]),
+        e.args,
+    )
+
+cr.execute("CREATE TABLE cl_rebuild_clustered (id INT PRIMARY KEY, name TEXT)")
+conn_rebuild.commit()
+try:
+    cr.execute("ALTER TABLE cl_rebuild_clustered REBUILD")
+    ok("39.19 REBUILD rejects already clustered table", False, "no error raised")
+except pymysql.MySQLError as e:
+    ok(
+        "39.19 REBUILD rejects already clustered table",
+        len(e.args) >= 2 and "already clustered" in str(e.args[1]),
+        e.args,
+    )
+
+conn_rebuild.close()
+
+# ── 39.21: aggregate hash execution ──────────────────────────────────────────
+
+print("\n[39.21 aggregate hash execution]")
+conn_agg = connect()
+ca = conn_agg.cursor()
+
+# Setup: clustered table with age groups and scores
+ca.execute(
+    "CREATE TABLE agg_bench ("
+    "  id    INT NOT NULL PRIMARY KEY,"
+    "  age   INT NOT NULL,"
+    "  score DOUBLE NOT NULL"
+    ")"
+)
+# Insert 60 rows across 3 age groups (20 rows per group)
+for i in range(1, 61):
+    age = 20 + (i % 3)  # ages 20, 21, 22
+    score = float(i)
+    ca.execute(f"INSERT INTO agg_bench VALUES ({i}, {age}, {score})")
+conn_agg.commit()
+
+# GROUP BY + COUNT correctness
+ca.execute("SELECT age, COUNT(*) FROM agg_bench GROUP BY age ORDER BY age")
+rows_agg = ca.fetchall()
+ok("39.21 GROUP BY produces 3 distinct groups", len(rows_agg) == 3, rows_agg)
+total_count = sum(r[1] for r in rows_agg)
+ok("39.21 GROUP BY COUNT sums to 60", total_count == 60, total_count)
+
+# GROUP BY + AVG correctness: sum of (COUNT*AVG) must equal SUM of all scores
+ca.execute("SELECT age, COUNT(*), AVG(score) FROM agg_bench GROUP BY age ORDER BY age")
+rows_avg = ca.fetchall()
+reconstructed_sum = sum(int(r[1]) * float(r[2]) for r in rows_avg)
+ca.execute("SELECT SUM(score) FROM agg_bench")
+direct_sum = float(ca.fetchone()[0])
+ok(
+    "39.21 GROUP BY AVG reconstructed sum matches direct SUM",
+    abs(reconstructed_sum - direct_sum) < 0.001,
+    f"reconstructed={reconstructed_sum} direct={direct_sum}",
+)
+
+# COUNT(*) on empty table returns one row with 0
+ca.execute("CREATE TABLE agg_empty (id INT NOT NULL)")
+conn_agg.commit()
+ca.execute("SELECT COUNT(*) FROM agg_empty")
+empty_count = ca.fetchone()[0]
+ok("39.21 COUNT(*) on empty table returns 0", empty_count == 0, empty_count)
+
+# NULL GROUP BY — NULL values form their own group
+ca.execute("CREATE TABLE agg_nulls (v INT)")
+conn_agg.commit()
+ca.execute("INSERT INTO agg_nulls VALUES (NULL)")
+ca.execute("INSERT INTO agg_nulls VALUES (NULL)")
+ca.execute("INSERT INTO agg_nulls VALUES (5)")
+conn_agg.commit()
+ca.execute("SELECT v, COUNT(*) FROM agg_nulls GROUP BY v ORDER BY v")
+null_rows = ca.fetchall()
+ok("39.21 NULL GROUP BY produces 2 groups", len(null_rows) == 2, null_rows)
+null_total = sum(r[1] for r in null_rows)
+ok("39.21 NULL GROUP BY total count = 3", null_total == 3, null_total)
+
+# HAVING filter
+ca.execute(
+    "SELECT age, SUM(score) FROM agg_bench GROUP BY age HAVING SUM(score) > 400 ORDER BY age"
+)
+having_rows = ca.fetchall()
+ok(
+    "39.21 HAVING SUM > 400 filters correctly (all 3 groups have sum > 400)",
+    len(having_rows) == 3,
+    having_rows,
+)
+
+# MIN / MAX — no GROUP BY
+ca.execute("SELECT MIN(score), MAX(score) FROM agg_bench")
+min_max = ca.fetchone()
+ok("39.21 MIN(score) = 1.0", abs(float(min_max[0]) - 1.0) < 0.001, min_max[0])
+ok("39.21 MAX(score) = 60.0", abs(float(min_max[1]) - 60.0) < 0.001, min_max[1])
+
+conn_agg.close()
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

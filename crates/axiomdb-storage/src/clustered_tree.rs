@@ -54,6 +54,12 @@ pub struct ClusteredRow {
     pub row_data: Vec<u8>,
 }
 
+pub struct RightmostAppendRow<'a> {
+    pub key: &'a [u8],
+    pub row_header: &'a RowHeader,
+    pub row_data: &'a [u8],
+}
+
 /// Lazy iterator over a primary-key range stored directly in clustered leaves.
 pub struct ClusteredRangeIter<'a> {
     storage: &'a dyn StorageEngine,
@@ -109,6 +115,210 @@ pub fn insert(
     }
 }
 
+/// Tries the append-only fast path on a caller-provided rightmost leaf hint.
+///
+/// This follows the same idea as PostgreSQL/SQLite append bias: only bypass
+/// the normal tree descent when the hinted page is still the rightmost leaf
+/// and `key` is strictly greater than the last key already stored there.
+///
+/// Returns `Ok(true)` when the row was inserted directly into the leaf without
+/// changing the root. Returns `Ok(false)` when the hint is not usable or the
+/// leaf would need a structural split, so the caller must fall back to the
+/// normal `insert()` path.
+pub fn try_insert_rightmost_leaf(
+    storage: &mut dyn StorageEngine,
+    hinted_leaf_pid: u64,
+    key: &[u8],
+    row_header: &RowHeader,
+    row_data: &[u8],
+) -> Result<bool, DbError> {
+    validate_row_payload(key, row_data)?;
+
+    let page_ref = storage.read_page(hinted_leaf_pid)?;
+    if clustered_page_type(&page_ref)? != PageType::ClusteredLeaf {
+        return Ok(false);
+    }
+
+    let mut page = page_ref.into_page();
+    if clustered_leaf::next_leaf(&page) != clustered_leaf::NULL_PAGE {
+        return Ok(false);
+    }
+
+    let num_cells = clustered_leaf::num_cells(&page) as usize;
+    if num_cells == 0 {
+        return Ok(false);
+    }
+
+    let last_cell = clustered_leaf::read_cell(&page, (num_cells - 1) as u16)?;
+    if key <= last_cell.key {
+        return Ok(false);
+    }
+
+    let cell = materialize_leaf_cell(storage, key, row_header, row_data)?;
+    let cleanup_overflow =
+        |storage: &mut dyn StorageEngine, first_page: Option<u64>| -> Result<(), DbError> {
+            if let Some(first_page) = first_page {
+                clustered_overflow::free_chain(storage, first_page)?;
+            }
+            Ok(())
+        };
+
+    match clustered_leaf::insert_cell_with_overflow(
+        &mut page,
+        num_cells,
+        &cell.key,
+        &cell.row_header,
+        cell.total_row_len,
+        &cell.local_row_data,
+        cell.overflow_first_page,
+    ) {
+        Ok(()) => {
+            write_page(storage, hinted_leaf_pid, &mut page)?;
+            Ok(true)
+        }
+        Err(DbError::HeapPageFull { .. }) => {
+            clustered_leaf::defragment(&mut page);
+            match clustered_leaf::insert_cell_with_overflow(
+                &mut page,
+                num_cells,
+                &cell.key,
+                &cell.row_header,
+                cell.total_row_len,
+                &cell.local_row_data,
+                cell.overflow_first_page,
+            ) {
+                Ok(()) => {
+                    write_page(storage, hinted_leaf_pid, &mut page)?;
+                    Ok(true)
+                }
+                Err(DbError::HeapPageFull { .. }) => {
+                    cleanup_overflow(storage, cell.overflow_first_page)?;
+                    Ok(false)
+                }
+                Err(err) => {
+                    cleanup_overflow(storage, cell.overflow_first_page)?;
+                    Err(err)
+                }
+            }
+        }
+        Err(err) => {
+            cleanup_overflow(storage, cell.overflow_first_page)?;
+            Err(err)
+        }
+    }
+}
+
+/// Appends as many strictly increasing rows as possible into a hinted
+/// rightmost leaf, writing the page once after the batch.
+///
+/// Returns the number of rows that were appended directly. A return of `0`
+/// means the caller must fall back to the normal insert path for the first row.
+pub fn try_insert_rightmost_leaf_batch(
+    storage: &mut dyn StorageEngine,
+    hinted_leaf_pid: u64,
+    rows: &[RightmostAppendRow<'_>],
+) -> Result<usize, DbError> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let page_ref = storage.read_page(hinted_leaf_pid)?;
+    if clustered_page_type(&page_ref)? != PageType::ClusteredLeaf {
+        return Ok(0);
+    }
+
+    let mut page = page_ref.into_page();
+    if clustered_leaf::next_leaf(&page) != clustered_leaf::NULL_PAGE {
+        return Ok(0);
+    }
+
+    let num_cells = clustered_leaf::num_cells(&page) as usize;
+    if num_cells == 0 {
+        return Ok(0);
+    }
+
+    let mut prev_key = clustered_leaf::read_cell(&page, (num_cells - 1) as u16)?
+        .key
+        .to_vec();
+    let mut inserted = 0usize;
+    let mut defragmented = false;
+
+    for row in rows {
+        validate_row_payload(row.key, row.row_data)?;
+        if row.key <= prev_key.as_slice() {
+            break;
+        }
+
+        let cell = materialize_leaf_cell(storage, row.key, row.row_header, row.row_data)?;
+        let insert_pos = clustered_leaf::num_cells(&page) as usize;
+
+        match clustered_leaf::insert_cell_with_overflow(
+            &mut page,
+            insert_pos,
+            &cell.key,
+            &cell.row_header,
+            cell.total_row_len,
+            &cell.local_row_data,
+            cell.overflow_first_page,
+        ) {
+            Ok(()) => {
+                inserted += 1;
+                prev_key.clear();
+                prev_key.extend_from_slice(row.key);
+            }
+            Err(DbError::HeapPageFull { .. }) if !defragmented => {
+                clustered_leaf::defragment(&mut page);
+                defragmented = true;
+                match clustered_leaf::insert_cell_with_overflow(
+                    &mut page,
+                    insert_pos,
+                    &cell.key,
+                    &cell.row_header,
+                    cell.total_row_len,
+                    &cell.local_row_data,
+                    cell.overflow_first_page,
+                ) {
+                    Ok(()) => {
+                        inserted += 1;
+                        prev_key.clear();
+                        prev_key.extend_from_slice(row.key);
+                    }
+                    Err(DbError::HeapPageFull { .. }) => {
+                        if let Some(first_page) = cell.overflow_first_page {
+                            clustered_overflow::free_chain(storage, first_page)?;
+                        }
+                        break;
+                    }
+                    Err(err) => {
+                        if let Some(first_page) = cell.overflow_first_page {
+                            clustered_overflow::free_chain(storage, first_page)?;
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            Err(DbError::HeapPageFull { .. }) => {
+                if let Some(first_page) = cell.overflow_first_page {
+                    clustered_overflow::free_chain(storage, first_page)?;
+                }
+                break;
+            }
+            Err(err) => {
+                if let Some(first_page) = cell.overflow_first_page {
+                    clustered_overflow::free_chain(storage, first_page)?;
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    if inserted > 0 {
+        write_page(storage, hinted_leaf_pid, &mut page)?;
+    }
+
+    Ok(inserted)
+}
+
 /// Looks up one full row by primary key in a clustered B-tree and returns the
 /// current inline version when it is visible to `snapshot`.
 pub fn lookup(
@@ -153,6 +363,18 @@ pub fn lookup_physical(
     }))
 }
 
+/// Descends from `root_pid` to the owning clustered leaf for `key`.
+///
+/// This is exposed for executor-side batching that wants to process multiple
+/// clustered keys per leaf without re-running a full row lookup each time.
+pub fn descend_to_leaf_pub(
+    storage: &dyn StorageEngine,
+    root_pid: u64,
+    key: &[u8],
+) -> Result<crate::PageRef, DbError> {
+    descend_to_leaf(storage, root_pid, key)
+}
+
 /// Builds a lazy range iterator over clustered leaf pages.
 pub fn range<'a>(
     storage: &'a dyn StorageEngine,
@@ -181,6 +403,82 @@ pub fn range<'a>(
         snapshot: *snapshot,
         done: false,
     })
+}
+
+/// Callback-based full scan over all visible clustered rows — zero-allocation hot path.
+///
+/// For each visible row, the callback receives:
+/// - `inline_data: &[u8]`  — the portion of row_data stored inline in the leaf.
+///   For rows without overflow this is the complete row_data. When `overflow` is
+///   `None` the caller can decode directly from this slice without any copy.
+/// - `overflow: Option<(u64, usize)>` — `Some((first_page, tail_len))` when the row
+///   spills to an overflow chain. The caller must call
+///   `clustered_overflow::read_chain(storage, first_page, tail_len)` and prepend
+///   `inline_data` to reconstruct the full row bytes.
+///
+/// Unlike [`range`], this path never calls `reconstruct_row_data` and never
+/// allocates `cell.key.to_vec()`, saving 2 heap allocations per row on full scans.
+pub fn scan_all_callback<F>(
+    storage: &dyn StorageEngine,
+    root_pid: Option<u64>,
+    snapshot: &TransactionSnapshot,
+    mut f: F,
+) -> Result<(), DbError>
+where
+    F: FnMut(&[u8], Option<(u64, usize)>) -> Result<(), DbError>,
+{
+    let Some(root_pid) = root_pid else {
+        return Ok(());
+    };
+
+    let mut current_pid = leftmost_leaf_pid(storage, root_pid)?;
+    let mut next_leaf_cache = clustered_leaf::NULL_PAGE;
+
+    while current_pid != clustered_leaf::NULL_PAGE {
+        let page = storage.read_page(current_pid)?;
+
+        match clustered_page_type(&page)? {
+            PageType::ClusteredLeaf => {}
+            other => {
+                return Err(DbError::BTreeCorrupted {
+                    msg: format!(
+                        "scan_all_callback expected leaf at page {current_pid}, found {other:?}"
+                    ),
+                });
+            }
+        }
+
+        if next_leaf_cache == clustered_leaf::NULL_PAGE {
+            next_leaf_cache = clustered_leaf::next_leaf(&page);
+        }
+
+        let num_cells = clustered_leaf::num_cells(&page) as usize;
+        for idx in 0..num_cells {
+            let cell = clustered_leaf::read_cell(&page, idx as u16)?;
+            if !cell.row_header.is_visible(snapshot) {
+                continue;
+            }
+            let overflow = match (
+                cell.total_row_len.cmp(&cell.row_data.len()),
+                cell.overflow_first_page,
+            ) {
+                (std::cmp::Ordering::Greater, Some(fp)) => {
+                    Some((fp, cell.total_row_len - cell.row_data.len()))
+                }
+                _ => None,
+            };
+            f(cell.row_data, overflow)?;
+        }
+
+        let next_pid = next_leaf_cache;
+        if next_pid != clustered_leaf::NULL_PAGE {
+            storage.prefetch_hint(next_pid, PREFETCH_DEPTH);
+        }
+        current_pid = next_pid;
+        next_leaf_cache = clustered_leaf::NULL_PAGE;
+    }
+
+    Ok(())
 }
 
 /// Rewrites the current inline version of one clustered row in the owning leaf
@@ -489,7 +787,24 @@ fn delete_physical_from_internal(
             if underfull {
                 rebalance_child(storage, &mut page, child_idx)?;
             } else if min_changed && child_idx > 0 {
-                repair_separator_for_child(storage, &mut page, child_idx)?;
+                match repair_separator_for_child(storage, &mut page, child_idx) {
+                    Ok(()) => {}
+                    Err(DbError::HeapPageFull { .. }) => {
+                        // The new separator is longer than the old one and the
+                        // internal page cannot accommodate it.  Force a
+                        // rebalance of this internal page at the next level up
+                        // by reporting it as underfull.  This is extremely rare
+                        // (near-full internal page + key growth during delete
+                        // rebalance).
+                        let min_changed_self = child_idx == 0 && min_changed;
+                        write_page(storage, pid, &mut page)?;
+                        return Ok(DeletePhysicalResult::Deleted {
+                            underfull: true, // force parent rebalance
+                            min_changed: min_changed_self,
+                        });
+                    }
+                    Err(err) => return Err(err),
+                }
             }
 
             let min_changed_self = child_idx == 0 && min_changed;
@@ -570,6 +885,39 @@ fn rebalance_leaf_pair(
     }
 
     let split_at = choose_leaf_rebalance_idx(&cells)?;
+
+    // Pre-check: verify the new separator fits in the parent page before
+    // committing any leaf page writes.  If it doesn't fit, fall back to
+    // merge — even if slightly overfull — to avoid leaving the parent in an
+    // inconsistent state.
+    let new_sep_key = &cells[split_at].key;
+    let sep_fits = {
+        let current_sep = clustered_internal::key_at(parent, sep_idx as u16)?;
+        if new_sep_key.len() <= current_sep.len() {
+            true // new sep is same size or smaller — always fits
+        } else {
+            let growth = new_sep_key.len() - current_sep.len();
+            clustered_internal::free_space(parent) >= growth || {
+                // Try defrag to reclaim space.
+                clustered_internal::defragment(parent);
+                clustered_internal::free_space(parent) >= growth
+            }
+        }
+    };
+
+    if !sep_fits {
+        // Separator growth exceeds parent budget.  Force merge instead:
+        // combine all cells into the left page, free right, remove separator.
+        // The left page may be slightly fuller than ideal, but structurally
+        // correct.  The next insert or rebalance pass will split it if needed.
+        let mut left_page = Page::new(PageType::ClusteredLeaf, left_pid);
+        rebuild_leaf_page(&mut left_page, &cells, right_next)?;
+        write_page(storage, left_pid, &mut left_page)?;
+        storage.free_page(right_pid)?;
+        clustered_internal::remove_at(parent, sep_idx, sep_idx + 1)?;
+        return Ok(());
+    }
+
     let mut left_page = Page::new(PageType::ClusteredLeaf, left_pid);
     rebuild_leaf_page(&mut left_page, &cells[..split_at], right_pid)?;
     let mut right_page = Page::new(PageType::ClusteredLeaf, right_pid);
@@ -577,7 +925,7 @@ fn rebalance_leaf_pair(
 
     write_page(storage, left_pid, &mut left_page)?;
     write_page(storage, right_pid, &mut right_page)?;
-    rewrite_separator_at(parent, sep_idx, &cells[split_at].key)?;
+    rewrite_separator_at(parent, sep_idx, new_sep_key)?;
     Ok(())
 }
 
@@ -638,6 +986,32 @@ fn rebalance_internal_pair(
     let promoted_idx = choose_internal_rebalance_promotion_idx(&separators)?;
     let promoted = separators[promoted_idx].clone();
 
+    // Pre-check: verify promoted separator fits in parent before committing
+    // child page writes.  If it doesn't fit, force merge to avoid leaving
+    // parent in inconsistent state (same strategy as rebalance_leaf_pair).
+    let promoted_fits = {
+        let current_sep = clustered_internal::key_at(parent, sep_idx as u16)?;
+        if promoted.key.len() <= current_sep.len() {
+            true
+        } else {
+            let growth = promoted.key.len() - current_sep.len();
+            clustered_internal::free_space(parent) >= growth || {
+                clustered_internal::defragment(parent);
+                clustered_internal::free_space(parent) >= growth
+            }
+        }
+    };
+
+    if !promoted_fits {
+        // Promoted separator exceeds parent budget.  Force merge instead.
+        let mut left_page = Page::new(PageType::ClusteredInternal, left_pid);
+        rebuild_internal_page(&mut left_page, leftmost_child, &separators)?;
+        write_page(storage, left_pid, &mut left_page)?;
+        storage.free_page(right_pid)?;
+        clustered_internal::remove_at(parent, sep_idx, sep_idx + 1)?;
+        return Ok(());
+    }
+
     let mut left_page = Page::new(PageType::ClusteredInternal, left_pid);
     rebuild_internal_page(&mut left_page, leftmost_child, &separators[..promoted_idx])?;
     let mut right_page = Page::new(PageType::ClusteredInternal, right_pid);
@@ -680,6 +1054,37 @@ fn rewrite_separator_at(parent: &mut Page, sep_idx: usize, new_key: &[u8]) -> Re
     let leftmost_child = clustered_internal::leftmost_child(parent);
     let mut separators = collect_internal_cells(parent)?;
     separators[sep_idx].key = new_key.to_vec();
+
+    // Verify the updated separators fit on a single clean page.
+    // A rebuild creates a fresh page, so fragmentation is not the issue —
+    // only genuine overflow (total separator footprint > capacity) can fail.
+    let total_footprint: usize = separators
+        .iter()
+        .map(|cell| clustered_internal::separator_footprint(cell.key.len()))
+        .sum();
+    if total_footprint > clustered_internal::page_capacity_bytes() {
+        // The new separator is too large for the current page budget.
+        // Remove the old separator and re-insert with the new key via the
+        // standard defrag→split path that insert_into_internal already handles.
+        // This is extremely rare (requires near-full internal page + key growth).
+        let right_child = separators[sep_idx].right_child;
+        clustered_internal::remove_at(parent, sep_idx, sep_idx + 1)?;
+        clustered_internal::defragment(parent);
+        match clustered_internal::insert_at(parent, sep_idx, new_key, right_child) {
+            Ok(()) => return Ok(()),
+            Err(DbError::HeapPageFull { .. }) => {
+                // Even after defrag the separator doesn't fit — this means the
+                // internal page genuinely needs a split.  Signal the caller so
+                // it can propagate the split upward.
+                return Err(DbError::HeapPageFull {
+                    page_id: parent.header().page_id,
+                    needed: clustered_internal::separator_footprint(new_key.len()),
+                    available: clustered_internal::free_space(parent),
+                });
+            }
+            Err(err) => return Err(err),
+        }
+    }
 
     let mut rebuilt = Page::new(PageType::ClusteredInternal, parent.header().page_id);
     rebuild_internal_page(&mut rebuilt, leftmost_child, &separators)?;
