@@ -309,6 +309,16 @@ and clustered-tree helpers:
 - undo clustered insert → `delete_physical_by_key(...)`
 - undo clustered delete-mark / update → `restore_exact_row_image(...)`
 
+Phase `39.14` is the first SQL-visible executor user of that contract:
+
+- a fresh clustered SQL insert records `ClusteredInsert`
+- reusing a snapshot-invisible delete-marked clustered PK records
+  `ClusteredUpdate`, because rollback must restore the old tombstone image, not
+  simply delete the new row
+- clustered secondary bookmark entries still use the ordinary B+ Tree undo path,
+  but root lookup on rollback now reloads the current root from catalog
+  metadata before deleting the undo key
+
 The invariant is intentionally logical: rollback restores the old primary-key
 row state, not the exact pre-change page topology. A relocate-update may split
 or merge the tree on the forward path, and rollback may restore the old row into

@@ -1,6 +1,6 @@
 # Phase 39 — Clustered Index Storage Engine
 
-## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7, 39.8, 39.9, 39.10, 39.11, 39.12
+## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7, 39.8, 39.9, 39.10, 39.11, 39.12, 39.13, 39.14
 
 ## What was built
 
@@ -715,6 +715,72 @@ New clustered crash-recovery coverage now includes:
 - logical recovery of relocate-update after crash
 - clean reopen reconstruction of the last committed clustered root from WAL history
 
+### 39.14 — Executor integration: INSERT into clustered table
+
+`crates/axiomdb-sql/src/executor/insert.rs` now has the first SQL-visible
+clustered DML branch.
+
+Behavior now exposed through SQL:
+
+- `INSERT` on explicit-`PRIMARY KEY` clustered tables no longer fails with the
+  Phase `39.14` guard rail
+- both ctx and non-ctx executor paths route clustered tables directly through
+  `axiomdb-storage::clustered_tree`
+- clustered PK bytes are derived from primary-index metadata order, not raw
+  table-column order
+- clustered `AUTO_INCREMENT` bootstraps from the current clustered rows instead
+  of scanning the heap path
+- non-primary indexes on clustered tables are maintained through clustered PK
+  bookmarks from `clustered_secondary`, not heap `RecordId` payloads
+- explicit-transaction clustered inserts bypass `SessionContext::pending_inserts`
+  and remain rollback/savepoint-safe
+- pending heap batches are flushed before the clustered statement boundary so a
+  later clustered statement failure does not accidentally undo prior staged heap writes
+
+Important executor/WAL detail:
+
+- a fresh clustered key records `ClusteredInsert`
+- reusing a snapshot-invisible delete-marked physical clustered key records
+  `ClusteredUpdate` instead, so rollback can restore the old tombstone image
+  exactly
+
+Current boundary after `39.14`:
+
+- `INSERT` is now SQL-visible on clustered tables
+- `SELECT`, `UPDATE`, and `DELETE` on clustered tables are still deferred to
+  `39.15`, `39.16`, and `39.17`
+- reusing a delete-marked clustered PK still rewrites only the current physical
+  version; older-snapshot reconstruction of the superseded tombstone remains
+  future clustered MVCC work
+
+Supporting changes for `39.14`:
+
+- `crates/axiomdb-sql/src/clustered_table.rs`
+  - clustered row coercion/encoding helpers
+  - clustered PK extraction and null validation
+  - clustered `AUTO_INCREMENT` bootstrap scan
+- `crates/axiomdb-sql/src/executor/insert.rs`
+  - clustered ctx/non-ctx insert branches
+  - clustered root tracking during statement execution
+  - clustered secondary maintenance through bookmark-aware layouts
+- `crates/axiomdb-catalog/src/reader.rs`
+  - `get_index_by_id(...)` for rollback-time root reloading
+- `crates/axiomdb-sql/src/executor/mod.rs`
+  - rollback/savepoint index undo now reloads current roots from live catalog metadata
+- `crates/axiomdb-sql/tests/integration_clustered_insert.rs`
+  - adds SQL-visible clustered insert coverage
+
+Targeted validation for `39.14` passed on the clustered executor surface:
+
+- `cargo test -p axiomdb-sql --test integration_clustered_create_table -j1`
+- `cargo test -p axiomdb-sql --test integration_clustered_insert -j1`
+- `cargo test -p axiomdb-sql --test integration_autocommit -j1`
+- `cargo test -p axiomdb-sql --test integration_mvcc_indexes test_insert_rollback_removes_index_entry -j1`
+- `cargo check -p axiomdb-sql --lib -j1`
+- `cargo clippy -p axiomdb-sql --lib --tests -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity -A clippy::needless_borrow`
+- `cargo fmt --check`
+- `mdbook build docs-site`
+
 ## Review notes
 
 - All `39.3` acceptance criteria from the spec are implemented.
@@ -728,6 +794,7 @@ New clustered crash-recovery coverage now includes:
 - All `39.11` acceptance criteria from the spec are implemented.
 - All `39.12` acceptance criteria from the spec are implemented.
 - All `39.13` acceptance criteria from the spec are implemented.
+- All `39.14` acceptance criteria from the spec are implemented.
 - No `unsafe` was introduced in the clustered tree path.
 - No production `unwrap()` remains in the touched clustered files.
 - No production `unwrap()` was introduced in the new clustered-secondary path.
@@ -738,14 +805,15 @@ New clustered crash-recovery coverage now includes:
 - Benchmarking remains intentionally deferred: `39.5` finishes the storage-level
   clustered read slice, and `39.6` / `39.7` / `39.8` / `39.9` add the first clustered mutation, rebalance, and bookmark slices,
   `39.10` adds overflow-backed row storage, `39.11` adds internal WAL/rollback support, `39.12` adds internal clustered crash recovery,
-  and `39.13` exposes the first SQL-visible clustered DDL boundary,
-  but end-to-end clustered DML benchmarks still wait for later clustered `INSERT` / `SELECT` / `UPDATE` / `DELETE` integration.
+  `39.13` exposes the first SQL-visible clustered DDL boundary, and `39.14`
+  exposes the first SQL-visible clustered DML write,
+  but end-to-end clustered read/update/delete benchmarks still wait for later clustered `SELECT` / `UPDATE` / `DELETE` integration.
 
 ## Deferred
 
 - `39.18` — physical purge of dead clustered cells
 - later clustered root persistence — today `39.12` still rebuilds roots from surviving WAL history, so checkpoint/rotation persistence is not solved yet
-- `39.14+` — executor-visible clustered DML and maintenance paths
+- `39.15+` — remaining executor-visible clustered DML and maintenance paths
 
 ## Notes
 
@@ -783,3 +851,7 @@ New clustered crash-recovery coverage now includes:
   `CREATE TABLE` with an explicit `PRIMARY KEY` now creates a clustered table
   root plus logical PK metadata, but heap-only executor paths still fail
   explicitly on clustered tables until `39.14` through `39.17`.
+- `39.14` opens the first clustered DML write path:
+  `INSERT` now works on clustered tables and writes directly through the
+  clustered tree plus clustered secondary bookmarks, but clustered SQL reads and
+  later mutators still remain deferred.

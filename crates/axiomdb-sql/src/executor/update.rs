@@ -869,6 +869,7 @@ fn apply_update_index_maintenance(
                         {
                             CatalogWriter::new(storage, txn)?
                                 .update_index_root(idx.index_id, new_root)?;
+                            idx.root_page_id = new_root;
                         }
                     }
                 }
@@ -903,6 +904,7 @@ fn apply_update_index_maintenance(
                 snap,
             )? {
                 CatalogWriter::new(storage, txn)?.update_index_root(idx.index_id, new_root)?;
+                idx.root_page_id = new_root;
             }
         }
     }

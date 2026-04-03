@@ -310,6 +310,18 @@ impl<'a> CatalogReader<'a> {
         Ok(result)
     }
 
+    /// Returns the first visible index with the given `index_id`.
+    pub fn get_index_by_id(&mut self, index_id: u32) -> Result<Option<IndexDef>, DbError> {
+        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.indexes, self.snapshot)?;
+        for (_, _, data) in rows {
+            let (def, _) = IndexDef::from_bytes(&data)?;
+            if def.index_id == index_id {
+                return Ok(Some(def));
+            }
+        }
+        Ok(None)
+    }
+
     // ── Constraint lookups (Phase 4.22b) ─────────────────────────────────────
 
     /// Returns all visible constraints for `table_id`.

@@ -5,7 +5,7 @@ use axiomdb_core::error::DbError;
 use axiomdb_sql::verify_and_repair_indexes_on_open;
 use axiomdb_storage::{PageType, StorageEngine};
 
-use common::{run, run_ctx, run_result, setup, setup_ctx};
+use common::{run, run_ctx, setup, setup_ctx};
 
 fn page_type(storage: &impl StorageEngine, page_id: u64) -> PageType {
     let page = storage.read_page(page_id).unwrap();
@@ -83,24 +83,22 @@ fn create_table_without_primary_key_stays_heap() {
 }
 
 #[test]
-fn insert_into_clustered_table_is_rejected_in_non_ctx_path() {
+fn create_table_marks_clustered_primary_key_columns_not_null_in_catalog() {
     let (mut storage, mut txn) = setup();
     run(
-        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)",
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT)",
         &mut storage,
         &mut txn,
     );
 
-    let err = run_result(
-        "INSERT INTO users VALUES (1, 'alice')",
-        &mut storage,
-        &mut txn,
-    )
-    .unwrap_err();
-    assert!(
-        matches!(err, DbError::NotImplemented { ref feature } if feature.contains("Phase 39.14")),
-        "got {err:?}"
-    );
+    let snap = txn.snapshot();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
+    let table = reader.get_table("public", "users").unwrap().unwrap();
+    let columns = reader.list_columns(table.id).unwrap();
+
+    assert!(!columns[0].nullable, "PRIMARY KEY column must be NOT NULL");
+    assert!(columns[1].nullable);
+    assert!(columns[2].nullable);
 }
 
 #[test]

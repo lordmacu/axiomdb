@@ -45,14 +45,22 @@ clustered-index storage rewrite: clustered rows now have WAL-backed
 rollback/savepoint support and crash recovery by primary key plus exact row
 image. Phase `39.13` makes the first SQL-visible clustered cut: `CREATE TABLE`
 with an explicit `PRIMARY KEY` now creates clustered metadata and a clustered
-table root, but clustered DML still returns `0A000` / `NotImplemented` until
-`39.14`–`39.17`.
+table root. Phase `39.14` extends that cut to clustered `INSERT`: SQL writes
+now record clustered WAL/undo directly against the clustered PK tree, while
+clustered `SELECT` / `UPDATE` / `DELETE` still remain deferred until
+`39.15`–`39.17`.
 
 ```sql
-CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
-INSERT INTO users VALUES (1, 'alice');
--- ERROR 0A000: feature not implemented: INSERT into clustered table — Phase 39.14
+CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE);
+
+BEGIN;
+INSERT INTO users VALUES (1, 'alice@example.com');
+ROLLBACK;
 ```
+
+That rollback now removes both the clustered base row and its bookmark-bearing
+secondary entries. The SQL-visible read path for clustered tables is still not
+open yet, so verification of those rows still waits for Phase `39.15`.
 
 ---
 

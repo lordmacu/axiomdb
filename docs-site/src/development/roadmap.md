@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 39.13 Executor integration: CREATE TABLE with clustered index — explicit-PK tables now persist clustered layout metadata plus clustered table roots, while heap-only runtime paths fail explicitly on clustered tables
+**Last completed subphase:** 39.14 Executor integration: INSERT into clustered table — explicit-PK tables now accept SQL INSERT through the clustered PK tree, maintain bookmark-bearing secondary indexes, and stay rollback/savepoint-safe without heap staging
 
-**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, overflow-backed large rows, insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, clustered-first secondary bookmarks, internal WAL/rollback, clustered crash recovery, and clustered-aware `CREATE TABLE` now exist, but clustered SQL DML still starts in `39.14`
+**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, overflow-backed large rows, insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, clustered-first secondary bookmarks, internal WAL/rollback, clustered crash recovery, clustered-aware `CREATE TABLE`, and clustered SQL `INSERT` now exist; clustered reads and later mutators are next
 
-**Next milestone:** 39.14 — INSERT into clustered table
+**Next milestone:** 39.15 — SELECT from clustered table
 
 **Concurrency note:** the current server already supports concurrent read-only
 queries, but mutating statements are still serialized through a database-wide

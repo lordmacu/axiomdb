@@ -1512,7 +1512,10 @@ fn apply_prepared_updates_preserve_rid(
 }
 
 /// Applies strict-mode coercion to each value against its target column type.
-fn coerce_values(values: Vec<Value>, columns: &[ColumnDef]) -> Result<Vec<Value>, DbError> {
+pub(crate) fn coerce_values(
+    values: Vec<Value>,
+    columns: &[ColumnDef],
+) -> Result<Vec<Value>, DbError> {
     values
         .into_iter()
         .zip(columns.iter())
@@ -1543,7 +1546,7 @@ fn coerce_values(values: Vec<Value>, columns: &[ColumnDef]) -> Result<Vec<Value>
 /// - If permissive also fails, returns the permissive error (no warning emitted).
 ///
 /// `row_num` is 1-based and statement-local (used in the warning message).
-fn coerce_values_with_ctx(
+pub(crate) fn coerce_values_with_ctx(
     values: Vec<Value>,
     columns: &[ColumnDef],
     ctx: &mut SessionContext,

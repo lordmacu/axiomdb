@@ -230,8 +230,9 @@ The SQL processing pipeline:
   sort keys and per-column `NULLS FIRST/LAST` control, `LIMIT n OFFSET m` for pagination,
   `SELECT DISTINCT` with NULL-equality dedup (two NULL values are considered equal for
   deduplication), and `INSERT … SELECT` for bulk copy and aggregate materialization
-- clustered tables now enter the catalog through `CREATE TABLE ... PRIMARY KEY ...`, but
-  `INSERT` / `SELECT` / `UPDATE` / `DELETE` still reject them explicitly until `39.14`–`39.17`
+- clustered tables now enter the catalog through `CREATE TABLE ... PRIMARY KEY ...`
+- `39.14` adds a dedicated clustered `INSERT` branch in `executor/insert.rs`
+- clustered `SELECT` / `UPDATE` / `DELETE` still reject explicitly until `39.15`–`39.17`
 - Stable-RID UPDATE fast path — same-slot heap rewrite that preserves `RecordId`
   when the new encoded row fits and makes untouched-index skipping safe
 - UPDATE apply fast path — indexed UPDATE now batches candidate heap reads,
@@ -245,6 +246,11 @@ The SQL processing pipeline:
   when the table has PRIMARY KEY or secondary indexes; the immediate path keeps
   strict same-statement UNIQUE checking and therefore does not reuse the staged
   `committed_empty` shortcut
+- clustered INSERT branch — explicit-PK tables now bypass heap staging entirely,
+  derive PK bytes from clustered primary-index metadata, write directly through
+  `clustered_tree`, maintain clustered secondary bookmarks, and make rollback
+  delete undo keys from the current catalog root instead of trusting stale
+  pre-split roots
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>

@@ -506,6 +506,27 @@ rows in a single session.
 
 ### INSERT ... VALUES
 
+Tables whose schema has an explicit `PRIMARY KEY` now use clustered storage for
+SQL-visible `INSERT`. That clustered insert path supports:
+
+- single-row `VALUES`
+- multi-row `VALUES`
+- `INSERT ... SELECT`
+- `AUTO_INCREMENT`
+- explicit transactions and savepoints
+
+Clustered reads and later mutators are still not fully wired into SQL:
+`SELECT`, `UPDATE`, and `DELETE` on clustered tables remain deferred to
+Phases `39.15`–`39.17`.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Insert Uses Clustered Identity</span>
+On an explicit-PK table, AxiomDB now inserts straight into the clustered PK tree and derives secondary entries from the PRIMARY KEY bookmark. That mirrors SQLite <code>WITHOUT ROWID</code> more closely than a heap-first compatibility layer would.
+</div>
+</div>
+
 When a table has an `AUTO_INCREMENT` column, omit it from the column list and
 AxiomDB generates the next sequential ID automatically. Use `LAST_INSERT_ID()`
 (or the PostgreSQL alias `lastval()`) immediately after the INSERT to retrieve
@@ -552,6 +573,10 @@ sequence and does not advance it.
 INSERT INTO users (id, name) VALUES (100, 'Eve');
 -- id=100; sequence not advanced; next LAST_INSERT_ID() still returns 2
 ```
+
+The same `AUTO_INCREMENT` contract now applies to clustered explicit-PK tables:
+AxiomDB bootstraps the next value by scanning the clustered rows for the
+current maximum instead of falling back to heap metadata.
 
 See [Expressions — Session Functions](expressions.md#session-functions) for
 full `LAST_INSERT_ID()` / `lastval()` semantics.
