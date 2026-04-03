@@ -1379,3 +1379,88 @@ When all mask bits are `true`, `scan_table` also uses `decode_row()` directly.
 
 - `execute_select_ctx` (single-table SELECT): mask covers SELECT list + WHERE + ORDER BY + GROUP BY + HAVING
 - `execute_delete_ctx` (DELETE with WHERE): mask covers the WHERE clause only (no-WHERE path uses `scan_rids_visible` — no decode at all)
+
+---
+
+## Clustered Leaf Page-Buffer Mutation Primitives (Phase 39.22)
+
+Three public primitives in `crates/axiomdb-storage/src/clustered_leaf.rs` enable
+zero-allocation in-place UPDATE for fixed-size columns.
+
+### `cell_row_data_abs_off`
+
+```rust
+pub fn cell_row_data_abs_off(page: &Page, cell_idx: usize) -> Result<(usize, usize), DbError>
+```
+
+Computes the absolute byte offset of `row_data` within the page buffer for a
+given cell index without decoding the cell. Returns `(row_data_abs_off, key_len)`.
+
+Formula:
+```
+row_data_abs_off = HEADER_SIZE + body_off + CELL_META_SIZE + ROW_HEADER_SIZE + key_len
+```
+
+Used by the UPDATE fast path to locate field bytes directly in the page buffer —
+no `cell.row_data.to_vec()` required.
+
+### `patch_field_in_place`
+
+```rust
+pub fn patch_field_in_place(page: &mut Page, field_abs_off: usize, new_bytes: &[u8]) -> Result<(), DbError>
+```
+
+Overwrites `new_bytes.len()` bytes at `field_abs_off` within the page buffer.
+Validates that `field_abs_off + new_bytes.len() <= PAGE_SIZE`. This is the
+AxiomDB equivalent of InnoDB's `btr_cur_upd_rec_in_place()`.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage vs InnoDB / MariaDB</span>
+InnoDB's <code>btr_cur_upd_rec_in_place</code> writes only changed bytes within the B-tree page buffer. AxiomDB implements the same technique with a pure-Rust zero-unsafe byte-write primitive. For <code>UPDATE t SET score = score + 1</code> on a 25K-row clustered table, this reduces per-row work from ~469 bytes (full decode + encode + heap alloc) to ~28 bytes (read field + write field), cutting allocations from 5 per row to zero.
+</div>
+</div>
+
+### `update_row_header_in_place`
+
+```rust
+pub fn update_row_header_in_place(page: &mut Page, cell_idx: usize, new_header: &RowHeader) -> Result<(), DbError>
+```
+
+Overwrites the 24-byte `RowHeader` at the exact page offset for a given cell.
+Used after `patch_field_in_place` to stamp the new `txn_id_created` and
+incremented `row_version` without re-encoding the full cell.
+
+### Split-Phase Pattern (Rust Borrow Checker Compatibility)
+
+The UPDATE fast path uses a split-phase read/write pattern to satisfy the Rust
+borrow checker — the immutable page borrow (read phase) must be fully dropped
+before the mutable borrow (write phase) begins:
+
+```rust
+// Read phase: immutable borrow — compute field locations, capture old bytes
+let (row_data_abs_off, _) = cell_row_data_abs_off(&page, idx)?;
+let (field_writes, any_change) = {
+    let b = page.as_bytes();
+    // ... compute loc, capture old_buf: [u8;8], encode new_buf: [u8;8]
+    // MAYBE_NOP: if old_buf[..loc.size] == new_buf[..loc.size] { skip }
+    (field_writes_vec, changed)
+}; // immutable borrow dropped here
+
+if !any_change { continue; }
+
+// Write phase: mutable borrow — patch page buffer directly
+for (field_abs, size, _, new_buf) in &field_writes {
+    patch_field_in_place(&mut page, *field_abs, &new_buf[..*size])?;
+}
+update_row_header_in_place(&mut page, idx, &new_header)?;
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Split Read/Write Borrow</span>
+Rust's ownership model requires releasing the immutable borrow before taking a mutable one. The split-phase pattern avoids <code>row_data.to_vec()</code> (heap allocation) by keeping field locations in a stack-allocated <code>Vec&lt;(usize, usize, [u8;8], [u8;8])&gt;</code> computed during the immutable phase and consumed during the mutable phase. This is the same invariant InnoDB enforces manually with pointer arithmetic.
+</div>
+</div>

@@ -31,7 +31,10 @@ use axiomdb_storage::{
 };
 
 use crate::{
-    checkpoint::Checkpointer, clustered::ClusteredRowImage, entry::EntryType, reader::WalReader,
+    checkpoint::Checkpointer,
+    clustered::{ClusteredFieldPatchEntry, ClusteredRowImage},
+    entry::EntryType,
+    reader::WalReader,
     txn::decode_physical_loc,
 };
 
@@ -62,6 +65,12 @@ pub enum RecoveryOp {
         table_id: u32,
         key: Vec<u8>,
         old_row: ClusteredRowImage,
+    },
+    /// Undo a clustered field-patch update by reconstructing the old row bytes
+    /// from the current physical row and the WAL field deltas.
+    ClusteredFieldPatchRestore {
+        table_id: u32,
+        patch: ClusteredFieldPatchEntry,
     },
 }
 
@@ -128,6 +137,7 @@ impl CrashRecovery {
                     | EntryType::ClusteredInsert
                     | EntryType::ClusteredDeleteMark
                     | EntryType::ClusteredUpdate
+                    | EntryType::ClusteredFieldPatch
                     | EntryType::Checkpoint => {}
                 },
                 // Truncated or corrupt entry at the end of WAL (e.g. process crashed
@@ -379,6 +389,22 @@ impl CrashRecovery {
                         ));
                     }
                 }
+                EntryType::ClusteredFieldPatch => {
+                    let patch = ClusteredFieldPatchEntry::from_wal_values(
+                        &entry.key,
+                        &entry.old_value,
+                        &entry.new_value,
+                    )?;
+                    if active_txns.contains(&entry.txn_id) {
+                        recovery_timeline.push((
+                            entry.txn_id,
+                            RecoveryOp::ClusteredFieldPatchRestore {
+                                table_id: entry.table_id,
+                                patch,
+                            },
+                        ));
+                    }
+                }
             }
         }
 
@@ -466,6 +492,49 @@ impl CrashRecovery {
                         &key,
                         &old_row.row_header,
                         &old_row.row_data,
+                    )?;
+                    current_clustered_roots.insert(table_id, new_root);
+                }
+                RecoveryOp::ClusteredFieldPatchRestore { table_id, patch } => {
+                    let root_pid =
+                        current_clustered_roots
+                            .get(&table_id)
+                            .copied()
+                            .ok_or_else(|| DbError::BTreeCorrupted {
+                                msg: format!(
+                                    "clustered recovery missing current root for table {table_id}"
+                                ),
+                            })?;
+
+                    let Some(current_row) =
+                        clustered_tree::lookup_physical(storage, Some(root_pid), &patch.key)?
+                    else {
+                        continue;
+                    };
+
+                    let mut restored_row_data = current_row.row_data;
+                    for delta in &patch.field_deltas {
+                        let start = delta.offset as usize;
+                        let end = start + delta.size as usize;
+                        if end > restored_row_data.len() {
+                            return Err(DbError::BTreeCorrupted {
+                                msg: format!(
+                                    "clustered field patch undo for table {table_id} key {:?} exceeds row length: delta [{start}..{end}) on row len {}",
+                                    patch.key,
+                                    restored_row_data.len()
+                                ),
+                            });
+                        }
+                        restored_row_data[start..end]
+                            .copy_from_slice(&delta.old_bytes[..delta.size as usize]);
+                    }
+
+                    let new_root = clustered_tree::restore_exact_row_image(
+                        storage,
+                        root_pid,
+                        &patch.key,
+                        &patch.old_header,
+                        &restored_row_data,
                     )?;
                     current_clustered_roots.insert(table_id, new_root);
                 }

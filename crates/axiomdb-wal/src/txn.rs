@@ -31,7 +31,7 @@ use axiomdb_storage::{
 
 use crate::{
     checkpoint::Checkpointer,
-    clustered::ClusteredRowImage,
+    clustered::{ClusteredFieldPatchEntry, ClusteredRowImage, FieldDelta},
     entry::{EntryType, WalEntry},
     reader::WalReader,
     recovery::{CrashRecovery, RecoveryResult},
@@ -114,6 +114,20 @@ pub enum UndoOp {
         table_id: u32,
         key: Vec<u8>,
         old_row: ClusteredRowImage,
+    },
+    /// Lightweight undo for clustered delete-mark: clear txn_id_deleted to 0.
+    /// InnoDB-inspired: only stores PK key, no full row image.
+    /// On rollback: descend to leaf, find cell by key, patch txn_id_deleted = 0.
+    UndoClusteredUndelete { table_id: u32, key: Vec<u8> },
+    /// Undo a zero-alloc in-place field patch by reversing each field delta.
+    /// InnoDB-inspired: writes back only the changed bytes (old_bytes per delta)
+    /// instead of restoring a full row image. O(fields_changed) not O(row_size).
+    UndoClusteredFieldPatch {
+        table_id: u32,
+        key: Vec<u8>,
+        old_header: axiomdb_storage::RowHeader,
+        /// Each delta carries the offset within row_data and the original bytes.
+        field_deltas: Vec<FieldDelta>,
     },
 }
 
@@ -653,6 +667,55 @@ impl TxnManager {
                     )?;
                     active.clustered_roots.insert(table_id, new_root);
                 }
+                UndoOp::UndoClusteredUndelete { table_id, key } => {
+                    // Lightweight: just clear txn_id_deleted to 0 (un-delete).
+                    let root_pid =
+                        clustered_root_for_undo(&active.clustered_roots, table_id, "savepoint")?;
+                    let leaf = clustered_tree::descend_to_leaf_pub(storage, root_pid, &key)?;
+                    let pos = match axiomdb_storage::clustered_leaf::search(&leaf, &key) {
+                        Ok(pos) => pos,
+                        Err(_) => continue, // Row not found — already undone.
+                    };
+                    let mut page = leaf.into_page();
+                    let _ =
+                        axiomdb_storage::clustered_leaf::patch_txn_id_deleted(&mut page, pos, 0);
+                    page.update_checksum();
+                    storage.write_page(page.header().page_id, &page)?;
+                }
+                UndoOp::UndoClusteredFieldPatch {
+                    table_id,
+                    key,
+                    old_header,
+                    field_deltas,
+                } => {
+                    // Zero-alloc undo: reverse each field delta by writing old_bytes
+                    // back to the exact page offset, then restore the RowHeader.
+                    let root_pid =
+                        clustered_root_for_undo(&active.clustered_roots, table_id, "savepoint")?;
+                    let leaf = clustered_tree::descend_to_leaf_pub(storage, root_pid, &key)?;
+                    let pos = match axiomdb_storage::clustered_leaf::search(&leaf, &key) {
+                        Ok(pos) => pos,
+                        Err(_) => continue, // Row not found — already undone.
+                    };
+                    let (row_data_abs_off, _) =
+                        axiomdb_storage::clustered_leaf::cell_row_data_abs_off(&leaf, pos)?;
+                    let mut page = leaf.into_page();
+                    for delta in &field_deltas {
+                        let field_abs_off = row_data_abs_off + delta.offset as usize;
+                        axiomdb_storage::clustered_leaf::patch_field_in_place(
+                            &mut page,
+                            field_abs_off,
+                            &delta.old_bytes[..delta.size as usize],
+                        )?;
+                    }
+                    axiomdb_storage::clustered_leaf::update_row_header_in_place(
+                        &mut page,
+                        pos,
+                        &old_header,
+                    )?;
+                    page.update_checksum();
+                    storage.write_page(page.header().page_id, &page)?;
+                }
             }
         }
         Ok(())
@@ -737,6 +800,51 @@ impl TxnManager {
                         &old_row.row_data,
                     )?;
                     active.clustered_roots.insert(table_id, new_root);
+                }
+                UndoOp::UndoClusteredUndelete { table_id, key } => {
+                    let root_pid =
+                        clustered_root_for_undo(&active.clustered_roots, table_id, "rollback")?;
+                    let leaf = clustered_tree::descend_to_leaf_pub(storage, root_pid, &key)?;
+                    if let Ok(pos) = axiomdb_storage::clustered_leaf::search(&leaf, &key) {
+                        let mut page = leaf.into_page();
+                        let _ = axiomdb_storage::clustered_leaf::patch_txn_id_deleted(
+                            &mut page, pos, 0,
+                        );
+                        page.update_checksum();
+                        storage.write_page(page.header().page_id, &page)?;
+                    }
+                }
+                UndoOp::UndoClusteredFieldPatch {
+                    table_id,
+                    key,
+                    old_header,
+                    field_deltas,
+                } => {
+                    // Zero-alloc undo: reverse each field delta by writing old_bytes
+                    // back to the exact page offset, then restore the RowHeader.
+                    let root_pid =
+                        clustered_root_for_undo(&active.clustered_roots, table_id, "rollback")?;
+                    let leaf = clustered_tree::descend_to_leaf_pub(storage, root_pid, &key)?;
+                    if let Ok(pos) = axiomdb_storage::clustered_leaf::search(&leaf, &key) {
+                        let (row_data_abs_off, _) =
+                            axiomdb_storage::clustered_leaf::cell_row_data_abs_off(&leaf, pos)?;
+                        let mut page = leaf.into_page();
+                        for delta in &field_deltas {
+                            let field_abs_off = row_data_abs_off + delta.offset as usize;
+                            axiomdb_storage::clustered_leaf::patch_field_in_place(
+                                &mut page,
+                                field_abs_off,
+                                &delta.old_bytes[..delta.size as usize],
+                            )?;
+                        }
+                        axiomdb_storage::clustered_leaf::update_row_header_in_place(
+                            &mut page,
+                            pos,
+                            &old_header,
+                        )?;
+                        page.update_checksum();
+                        storage.write_page(page.header().page_id, &page)?;
+                    }
                 }
             }
         }
@@ -1285,6 +1393,224 @@ impl TxnManager {
         Ok(())
     }
 
+    /// Lightweight batch field-patch WAL for clustered updates where only
+    /// fixed-size fields changed. Uses `ClusteredFieldPatch` entry type with
+    /// compact field-delta format instead of full row images.
+    ///
+    /// Format per entry:
+    /// - `old_value` = `[RowHeader:24][num_fields:1][field_offset:2][field_size:1][old_bytes:N]...`
+    /// - `new_value` = `[RowHeader:24][num_fields:1][field_offset:2][field_size:1][new_bytes:N]...`
+    ///
+    /// Recovery: reads field offsets + sizes, patches bytes back to restore old state.
+    pub fn record_clustered_field_patch_batch(
+        &mut self,
+        table_id: u32,
+        root_pid: u64,
+        patches: &[ClusteredFieldPatchEntry],
+    ) -> Result<(), DbError> {
+        let n = patches.len();
+        if n == 0 {
+            return Ok(());
+        }
+
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = active.txn_id;
+
+        let lsn_base = self.wal.reserve_lsns(n);
+        self.wal_scratch.clear();
+
+        for (i, patch) in patches.iter().enumerate() {
+            let entry = WalEntry::new(
+                lsn_base + i as u64,
+                txn_id,
+                EntryType::ClusteredFieldPatch,
+                table_id,
+                patch.key.clone(),
+                patch.encode_old_value(),
+                patch.encode_new_value(),
+            );
+            entry.serialize_into(&mut self.wal_scratch);
+        }
+
+        self.wal.write_batch(&self.wal_scratch)?;
+
+        // Undo: zero-alloc field-delta undo — write back only old_bytes per field.
+        // Avoids the ClusteredRestore path which needs a full row image to be
+        // present in the patch entry. Each FieldDelta carries its own [u8;8]
+        // old_bytes (stack-allocated), so no heap allocation per field per row.
+        for patch in patches {
+            active.clustered_roots.insert(table_id, root_pid);
+            active.undo_ops.push(UndoOp::UndoClusteredFieldPatch {
+                table_id,
+                key: patch.key.clone(),
+                old_header: patch.old_header,
+                field_deltas: patch.field_deltas.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Batch version of `record_clustered_update` — accumulates N entries into
+    /// a single `write_batch()` call. WAL entries are byte-identical to N
+    /// individual calls; crash recovery is unchanged.
+    ///
+    /// Each element: `(key, old_row, new_row)`.
+    pub fn record_clustered_update_batch(
+        &mut self,
+        table_id: u32,
+        updates: &[(&[u8], &ClusteredRowImage, &ClusteredRowImage)],
+    ) -> Result<(), DbError> {
+        let n = updates.len();
+        if n == 0 {
+            return Ok(());
+        }
+
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = active.txn_id;
+
+        let lsn_base = self.wal.reserve_lsns(n);
+        self.wal_scratch.clear();
+
+        for (i, (key, old_row, new_row)) in updates.iter().enumerate() {
+            let entry = WalEntry::new(
+                lsn_base + i as u64,
+                txn_id,
+                EntryType::ClusteredUpdate,
+                table_id,
+                key.to_vec(),
+                old_row.to_bytes()?,
+                new_row.to_bytes()?,
+            );
+            entry.serialize_into(&mut self.wal_scratch);
+        }
+
+        self.wal.write_batch(&self.wal_scratch)?;
+
+        for (key, old_row, new_row) in updates {
+            active.clustered_roots.insert(table_id, new_row.root_pid);
+            active.undo_ops.push(UndoOp::UndoClusteredRestore {
+                table_id,
+                key: key.to_vec(),
+                old_row: (*old_row).clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Lightweight batch delete-mark for clustered tables. InnoDB-inspired:
+    /// stores ONLY PK keys for undo (no full row images). Uses minimal WAL
+    /// entries with empty row_data. Undo uses `UndoClusteredUndelete` which
+    /// just clears txn_id_deleted to 0 (no full row restore needed).
+    ///
+    /// ~10× less allocation than `record_clustered_delete_mark_batch`.
+    pub fn record_clustered_delete_mark_lightweight(
+        &mut self,
+        table_id: u32,
+        root_pid: u64,
+        pk_keys: &[Vec<u8>],
+    ) -> Result<(), DbError> {
+        let n = pk_keys.len();
+        if n == 0 {
+            return Ok(());
+        }
+
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = active.txn_id;
+
+        let lsn_base = self.wal.reserve_lsns(n);
+        self.wal_scratch.clear();
+
+        // Minimal WAL entries: header-only images (empty row_data).
+        let empty_hdr = axiomdb_storage::heap::RowHeader {
+            txn_id_created: 0,
+            txn_id_deleted: 0,
+            row_version: 0,
+            _flags: 0,
+        };
+        let del_hdr = axiomdb_storage::heap::RowHeader {
+            txn_id_created: 0,
+            txn_id_deleted: txn_id,
+            row_version: 0,
+            _flags: 0,
+        };
+        let old_image = ClusteredRowImage::new(root_pid, empty_hdr, &[]);
+        let new_image = ClusteredRowImage::new(root_pid, del_hdr, &[]);
+        let old_bytes = old_image.to_bytes()?;
+        let new_bytes = new_image.to_bytes()?;
+
+        for (i, pk_key) in pk_keys.iter().enumerate() {
+            let entry = WalEntry::new(
+                lsn_base + i as u64,
+                txn_id,
+                EntryType::ClusteredDeleteMark,
+                table_id,
+                pk_key.clone(),
+                old_bytes.clone(),
+                new_bytes.clone(),
+            );
+            entry.serialize_into(&mut self.wal_scratch);
+        }
+
+        self.wal.write_batch(&self.wal_scratch)?;
+
+        // Lightweight undo: only PK key needed to un-delete.
+        for pk_key in pk_keys {
+            active.clustered_roots.insert(table_id, root_pid);
+            active.undo_ops.push(UndoOp::UndoClusteredUndelete {
+                table_id,
+                key: pk_key.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Batch version of `record_clustered_delete_mark`.
+    pub fn record_clustered_delete_mark_batch(
+        &mut self,
+        table_id: u32,
+        deletes: &[(&[u8], &ClusteredRowImage, &ClusteredRowImage)],
+    ) -> Result<(), DbError> {
+        let n = deletes.len();
+        if n == 0 {
+            return Ok(());
+        }
+
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = active.txn_id;
+
+        let lsn_base = self.wal.reserve_lsns(n);
+        self.wal_scratch.clear();
+
+        for (i, (key, old_row, new_row)) in deletes.iter().enumerate() {
+            let entry = WalEntry::new(
+                lsn_base + i as u64,
+                txn_id,
+                EntryType::ClusteredDeleteMark,
+                table_id,
+                key.to_vec(),
+                old_row.to_bytes()?,
+                new_row.to_bytes()?,
+            );
+            entry.serialize_into(&mut self.wal_scratch);
+        }
+
+        self.wal.write_batch(&self.wal_scratch)?;
+
+        for (key, old_row, _new_row) in deletes {
+            active.clustered_roots.insert(table_id, old_row.root_pid);
+            active.undo_ops.push(UndoOp::UndoClusteredRestore {
+                table_id,
+                key: key.to_vec(),
+                old_row: (*old_row).clone(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Records a clustered update and stores the exact previous row image for
     /// rollback.
     pub fn record_clustered_update(
@@ -1710,6 +2036,10 @@ fn scan_committed_state(wal_path: &Path) -> Result<(TxnId, HashMap<u32, u64>), D
                     let new_row = ClusteredRowImage::from_bytes(&entry.new_value)?;
                     roots.insert(entry.table_id, new_row.root_pid);
                 }
+            }
+            EntryType::ClusteredFieldPatch => {
+                // Field-patch updates rewrite bytes in the current clustered row
+                // in place; they never change the tree shape or root page.
             }
             _ => {}
         }

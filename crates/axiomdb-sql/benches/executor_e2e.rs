@@ -318,6 +318,73 @@ fn bench_update_where(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_clustered_update(c: &mut Criterion) {
+    let mut group = c.benchmark_group("clustered_update");
+
+    // Single-row point UPDATE by PK — zero-alloc fast path (all fixed-size SET cols).
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("point_update_pk_fixed", |b| {
+        b.iter_batched(
+            || {
+                let mut db = Db::open();
+                db.run(
+                    "CREATE TABLE players (id INT PRIMARY KEY, level INT, points INT, active BOOL)",
+                );
+                for i in 1..=1000_u32 {
+                    db.run(&format!("INSERT INTO players VALUES ({i}, 1, 0, TRUE)"));
+                }
+                db
+            },
+            |mut db| {
+                db.run("UPDATE players SET level = level + 1, points = points + 10 WHERE id = 500");
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    // Batch UPDATE — 100 rows by range scan (fixed-size SET cols, zero-alloc path).
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("batch_update_100_fixed", |b| {
+        b.iter_batched(
+            || {
+                let mut db = Db::open();
+                db.run(
+                    "CREATE TABLE players (id INT PRIMARY KEY, level INT, points INT, active BOOL)",
+                );
+                for i in 1..=1000_u32 {
+                    db.run(&format!("INSERT INTO players VALUES ({i}, 1, 0, TRUE)"));
+                }
+                db
+            },
+            |mut db| {
+                // id 1..=100
+                db.run("UPDATE players SET level = level + 1 WHERE id >= 1 AND id <= 100");
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    // Steady-state UPDATE — reuse same db (no setup alloc amortised into setup).
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("steady_state_point_update", |b| {
+        let mut db = Db::open();
+        db.run("CREATE TABLE players (id INT PRIMARY KEY, level INT, points INT, active BOOL)");
+        for i in 1..=1000_u32 {
+            db.run(&format!("INSERT INTO players VALUES ({i}, 1, 0, TRUE)"));
+        }
+        let mut counter = 0i32;
+        b.iter(|| {
+            counter += 1;
+            let id = ((counter - 1) % 1000) + 1;
+            db.run(&format!(
+                "UPDATE players SET level = {counter} WHERE id = {id}"
+            ));
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_full_pipeline(c: &mut Criterion) {
     // Measures parse + analyze + execute as a single unit for INSERT.
     // Shows per-statement overhead of the executor above the storage layer.
@@ -518,6 +585,7 @@ criterion_group!(
     bench_select_where_filter,
     bench_select_count_aggregate,
     bench_update_where,
+    bench_clustered_update,
     bench_full_pipeline,
     bench_insert_serial_fsync_baseline,
 );

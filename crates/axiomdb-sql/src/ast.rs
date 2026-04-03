@@ -384,6 +384,8 @@ pub enum AlterTableOp {
     },
     /// MySQL `MODIFY COLUMN col new_type [constraints]`
     ModifyColumn(ColumnDef),
+    /// `REBUILD` — convert heap table to clustered format (Phase 39.19).
+    Rebuild,
 }
 
 /// `ALTER TABLE`

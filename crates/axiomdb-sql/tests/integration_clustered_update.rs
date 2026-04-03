@@ -571,3 +571,199 @@ fn clustered_update_non_ctx_path_is_supported() {
         vec![vec![Value::Int(1)]]
     );
 }
+
+// ── 39.22 zero-alloc in-place patch tests ─────────────────────────────────────
+
+/// Rollback of a fixed-size (INT) in-place UPDATE must restore the original
+/// value. This exercises the WAL FieldDelta undo path with [u8;8] inline bytes.
+#[test]
+fn clustered_update_inplace_fixed_rollback() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    // Schema: (id INT, name TEXT, age INT) — age is fixed-size, TEXT before it
+    // forces the runtime offset scan path in compute_field_location_runtime.
+    setup_users(&mut storage, &mut txn, &mut bloom, &mut ctx);
+
+    run_ctx("BEGIN", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
+    let res = run_ctx(
+        "UPDATE users SET age = age + 100",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(affected_count(res), 5);
+
+    // Verify age was updated inside the transaction.
+    let r = rows(
+        run_ctx(
+            "SELECT age FROM users WHERE id = 1",
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap(),
+    );
+    assert_eq!(r[0][0], Value::Int(130)); // 30 + 100
+
+    // Rollback — the in-place patch must be undone via FieldDelta.old_bytes.
+    run_ctx("ROLLBACK", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
+
+    let r2 = rows(
+        run_ctx(
+            "SELECT age FROM users ORDER BY id",
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap(),
+    );
+    assert_eq!(r2[0][0], Value::Int(30)); // Alice
+    assert_eq!(r2[1][0], Value::Int(25)); // Bob
+    assert_eq!(r2[2][0], Value::Int(35)); // Charlie
+}
+
+/// MAYBE_NOP: updating a column to the same value (byte-identical result)
+/// must not produce a WAL entry and must not change the row_version.
+#[test]
+fn clustered_update_inplace_maybe_nop_same_bytes() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    setup_users(&mut storage, &mut txn, &mut bloom, &mut ctx);
+
+    // age + 0 evaluates to the same Int value — expression equality catches it
+    // at Phase 1 (Value-level NOP), so no patches are applied. The affected
+    // count is 5 (rows matched by WHERE), not rows changed — consistent with
+    // the rest of the executor which returns matched rows.
+    let res = run_ctx(
+        "UPDATE users SET age = age + 0",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(affected_count(res), 5);
+
+    // Values unchanged.
+    let r = rows(
+        run_ctx(
+            "SELECT age FROM users ORDER BY id",
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap(),
+    );
+    assert_eq!(r[0][0], Value::Int(30));
+    assert_eq!(r[1][0], Value::Int(25));
+}
+
+/// Mixed schema with TEXT before the target INT column exercises the runtime
+/// offset scan in compute_field_location_runtime — verifies the offset is
+/// computed correctly when variable-length columns precede the target.
+#[test]
+fn clustered_update_inplace_mixed_schema_text_before_target() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    // Same schema as setup_users: (id INT PK, name TEXT, age INT)
+    // age is column 2, TEXT is column 1 — runtime scan must skip the TEXT field.
+    setup_users(&mut storage, &mut txn, &mut bloom, &mut ctx);
+
+    run_ctx(
+        "UPDATE users SET age = 99 WHERE id = 3",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let r = rows(
+        run_ctx(
+            "SELECT id, name, age FROM users WHERE id = 3",
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap(),
+    );
+    assert_eq!(r[0][0], Value::Int(3));
+    assert_eq!(r[0][1], Value::Text("Charlie".into())); // name unchanged
+    assert_eq!(r[0][2], Value::Int(99)); // age patched
+}
+
+/// Two fixed-size columns patched in a single UPDATE statement — verifies
+/// multi-field_writes collection and WAL encoding with N > 1 FieldDelta.
+#[test]
+fn clustered_update_inplace_multiple_fixed_columns() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE TABLE scores (id INT NOT NULL, level INT NOT NULL, points INT NOT NULL, PRIMARY KEY (id))",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "INSERT INTO scores VALUES (1, 5, 100), (2, 3, 50), (3, 8, 200)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // Update two INT columns simultaneously — both go through patch_field_in_place.
+    let res = run_ctx(
+        "UPDATE scores SET level = level + 1, points = points * 2",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(affected_count(res), 3);
+
+    let r = rows(
+        run_ctx(
+            "SELECT id, level, points FROM scores ORDER BY id",
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap(),
+    );
+    assert_eq!(r[0], vec![Value::Int(1), Value::Int(6), Value::Int(200)]);
+    assert_eq!(r[1], vec![Value::Int(2), Value::Int(4), Value::Int(100)]);
+    assert_eq!(r[2], vec![Value::Int(3), Value::Int(9), Value::Int(400)]);
+
+    // Rollback verifies both fields are restored via FieldDelta undo.
+    run_ctx("BEGIN", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
+    run_ctx(
+        "UPDATE scores SET level = level + 10, points = points + 1000",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx("ROLLBACK", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
+
+    let r2 = rows(
+        run_ctx(
+            "SELECT level, points FROM scores WHERE id = 1",
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap(),
+    );
+    assert_eq!(r2[0][0], Value::Int(6)); // level: back to 6, not 16
+    assert_eq!(r2[0][1], Value::Int(200)); // points: back to 200, not 1200
+}

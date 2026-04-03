@@ -1,8 +1,7 @@
 mod common;
 
 use axiomdb_catalog::{CatalogReader, TableStorageLayout};
-use axiomdb_core::error::DbError;
-use axiomdb_sql::verify_and_repair_indexes_on_open;
+use axiomdb_sql::{verify_and_repair_indexes_on_open, QueryResult};
 use axiomdb_storage::{PageType, StorageEngine};
 
 use common::{run, run_ctx, setup, setup_ctx};
@@ -102,7 +101,7 @@ fn create_table_marks_clustered_primary_key_columns_not_null_in_catalog() {
 }
 
 #[test]
-fn select_from_clustered_table_is_rejected_in_ctx_path() {
+fn select_from_empty_clustered_table_returns_zero_rows() {
     let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
     run_ctx(
         "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)",
@@ -113,17 +112,21 @@ fn select_from_clustered_table_is_rejected_in_ctx_path() {
     )
     .unwrap();
 
-    let err = run_ctx(
+    let result = run_ctx(
         "SELECT * FROM users",
         &mut storage,
         &mut txn,
         &mut bloom,
         &mut ctx,
     )
-    .unwrap_err();
+    .unwrap();
+    let rows = match result {
+        QueryResult::Rows { rows, .. } => rows,
+        other => panic!("expected Rows, got {other:?}"),
+    };
     assert!(
-        matches!(err, DbError::NotImplemented { ref feature } if feature.contains("Phase 39.15")),
-        "got {err:?}"
+        rows.is_empty(),
+        "empty clustered table should return 0 rows"
     );
 }
 

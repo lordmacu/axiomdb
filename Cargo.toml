@@ -65,6 +65,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Concurrent data structures
 dashmap = "5"
 
+# High-performance hash map (SIMD-accelerated Robin Hood probing)
+hashbrown = "0.15"
+
 # Probabilistic data structures
 bloomfilter = "3"
 

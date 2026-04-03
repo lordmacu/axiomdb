@@ -401,7 +401,9 @@ fn gap_space(page: &Page) -> usize {
 }
 
 /// Sum of all freeblock sizes.
-fn total_freeblock_space(page: &Page) -> usize {
+/// Sum of all freeblock sizes on this page. Used by VACUUM to decide
+/// whether defragmentation is worthwhile.
+pub fn total_freeblock_space(page: &Page) -> usize {
     let mut total = 0usize;
     let mut fb_off = freeblock_offset(page);
     while fb_off != 0 {
@@ -731,6 +733,157 @@ pub fn remove_cell(page: &mut Page, pos: usize) -> Result<(), DbError> {
     }
 
     set_num_cells(page, (n - 1) as u16);
+    Ok(())
+}
+
+// ── Direct header patch (InnoDB-inspired) ────────────────────────────────────
+
+/// Patches `txn_id_deleted` in the RowHeader of cell at logical index `idx`
+/// directly on the page buffer. Only modifies 8 bytes — no cell copy, no
+/// rewrite, no allocation. InnoDB equivalent: `mtr->write<1>()` for delete flag.
+///
+/// Also returns the old txn_id_deleted value for WAL undo.
+pub fn patch_txn_id_deleted(
+    page: &mut Page,
+    idx: usize,
+    new_txn_id_deleted: u64,
+) -> Result<u64, DbError> {
+    let n = num_cells(page) as usize;
+    if idx >= n {
+        return Err(DbError::Other(format!(
+            "clustered_leaf: patch idx {idx} >= num_cells {n}"
+        )));
+    }
+    let body_off = cell_ptr_at(page, idx as u16) as usize;
+    // txn_id_deleted is at: cell_start + CELL_META_SIZE(6) + 8 (after txn_id_created)
+    let txn_deleted_off = HEADER_SIZE + body_off + CELL_META_SIZE + 8;
+
+    let b = page.as_bytes();
+    let old_val = u64::from_le_bytes([
+        b[txn_deleted_off],
+        b[txn_deleted_off + 1],
+        b[txn_deleted_off + 2],
+        b[txn_deleted_off + 3],
+        b[txn_deleted_off + 4],
+        b[txn_deleted_off + 5],
+        b[txn_deleted_off + 6],
+        b[txn_deleted_off + 7],
+    ]);
+
+    page.as_bytes_mut()[txn_deleted_off..txn_deleted_off + 8]
+        .copy_from_slice(&new_txn_id_deleted.to_le_bytes());
+
+    Ok(old_val)
+}
+
+/// Returns the absolute byte offset within `page.as_bytes()` where the
+/// `row_data` region begins for the cell at logical index `cell_idx`, plus
+/// the `key_len` stored in the cell header.
+///
+/// Formula:
+/// ```text
+/// row_data_abs_off = HEADER_SIZE + body_off + CELL_META_SIZE + ROW_HEADER_SIZE + key_len
+///                  = HEADER_SIZE + body_off + 6 + 24 + key_len
+/// ```
+///
+/// Used by `patch_field_in_place` and `update_row_header_in_place` to locate
+/// the exact page-buffer position of a field without cloning row data.
+pub fn cell_row_data_abs_off(page: &Page, cell_idx: usize) -> Result<(usize, usize), DbError> {
+    let n = num_cells(page) as usize;
+    if cell_idx >= n {
+        return Err(DbError::Other(format!(
+            "clustered_leaf: cell_row_data_abs_off idx {cell_idx} >= num_cells {n}"
+        )));
+    }
+    let body_off = cell_ptr_at(page, cell_idx as u16) as usize;
+    let abs = HEADER_SIZE + body_off;
+    if abs + CELL_META_SIZE > PAGE_SIZE {
+        return Err(DbError::Other(
+            "clustered_leaf: cell header truncated in cell_row_data_abs_off".into(),
+        ));
+    }
+    let b = page.as_bytes();
+    let key_len = u16::from_le_bytes([b[abs], b[abs + 1]]) as usize;
+    let row_data_abs = abs + CELL_META_SIZE + ROW_HEADER_SIZE + key_len;
+    if row_data_abs > PAGE_SIZE {
+        return Err(DbError::Other(
+            "clustered_leaf: row_data_abs_off exceeds PAGE_SIZE".into(),
+        ));
+    }
+    Ok((row_data_abs, key_len))
+}
+
+/// Writes `new_bytes` directly at absolute page offset `field_abs_off`.
+///
+/// This is the AxiomDB equivalent of InnoDB's
+/// `mtr->memcpy(block, rec + off, buf, len)` from `btr_cur_upd_rec_in_place`:
+/// only the changed bytes are touched — no cell re-encode, no allocation.
+///
+/// # Preconditions (caller's responsibility)
+///
+/// - `field_abs_off` must lie within the `row_data` region of an **inline**
+///   (non-overflow) cell. Overflow cells keep part of their data in the
+///   overflow chain; patching them through this function would corrupt the row.
+/// - `new_bytes.len()` must equal the fixed encoded size of the column type
+///   being updated (1 for Bool, 4 for Int/Date, 8 for BigInt/Real/Timestamp).
+/// - The caller must call `page.update_checksum()` before writing the page to
+///   storage (typically once per leaf after all patches on that leaf).
+pub fn patch_field_in_place(
+    page: &mut Page,
+    field_abs_off: usize,
+    new_bytes: &[u8],
+) -> Result<(), DbError> {
+    let end = field_abs_off
+        .checked_add(new_bytes.len())
+        .ok_or_else(|| DbError::Other("patch_field_in_place: offset overflow".into()))?;
+    if end > PAGE_SIZE {
+        return Err(DbError::Other(format!(
+            "patch_field_in_place: field [{field_abs_off}..{end}) exceeds PAGE_SIZE {PAGE_SIZE}"
+        )));
+    }
+    page.as_bytes_mut()[field_abs_off..end].copy_from_slice(new_bytes);
+    Ok(())
+}
+
+/// Writes a new `RowHeader` at the header slot of the cell at logical index
+/// `cell_idx`.
+///
+/// Serializes to a `[u8; ROW_HEADER_SIZE]` stack buffer before writing because
+/// cells are not guaranteed to be 8-byte aligned in the page body — a direct
+/// `bytemuck::bytes_of` on a misaligned destination pointer would be UB.
+/// This mirrors the read path in `read_cell_at_offset`, which copies to a
+/// stack buffer before `bytemuck::from_bytes` for the same reason.
+///
+/// Only the four RowHeader fields are touched:
+/// `txn_id_created`, `txn_id_deleted`, `row_version`, `_flags`.
+/// Key and row_data bytes are left completely unchanged.
+pub fn update_row_header_in_place(
+    page: &mut Page,
+    cell_idx: usize,
+    new_header: &RowHeader,
+) -> Result<(), DbError> {
+    let n = num_cells(page) as usize;
+    if cell_idx >= n {
+        return Err(DbError::Other(format!(
+            "update_row_header_in_place: cell_idx {cell_idx} >= num_cells {n}"
+        )));
+    }
+    let body_off = cell_ptr_at(page, cell_idx as u16) as usize;
+    let hdr_abs = HEADER_SIZE + body_off + CELL_META_SIZE;
+    let hdr_end = hdr_abs + ROW_HEADER_SIZE;
+    if hdr_end > PAGE_SIZE {
+        return Err(DbError::Other(
+            "update_row_header_in_place: header slot exceeds PAGE_SIZE".into(),
+        ));
+    }
+    // Serialize to an aligned stack buffer before writing to the (potentially
+    // unaligned) page position. Always little-endian, matching the codec.
+    let mut buf = [0u8; ROW_HEADER_SIZE];
+    buf[0..8].copy_from_slice(&new_header.txn_id_created.to_le_bytes());
+    buf[8..16].copy_from_slice(&new_header.txn_id_deleted.to_le_bytes());
+    buf[16..20].copy_from_slice(&new_header.row_version.to_le_bytes());
+    buf[20..24].copy_from_slice(&new_header._flags.to_le_bytes());
+    page.as_bytes_mut()[hdr_abs..hdr_end].copy_from_slice(&buf);
     Ok(())
 }
 
@@ -1301,5 +1454,208 @@ mod tests {
             let c2 = read_cell(&page, i + 1).unwrap();
             assert!(c1.key < c2.key, "cells not sorted at {i}");
         }
+    }
+
+    #[test]
+    fn test_rewrite_cell_key_mismatch_returns_error() {
+        let mut page = make_page();
+        let hdr = make_row_header(1);
+        insert_cell(&mut page, 0, b"alpha", &hdr, b"data").unwrap();
+
+        let err = rewrite_cell_same_key(&mut page, 0, b"bravo", &hdr, b"new_data").unwrap_err();
+        assert!(
+            matches!(err, DbError::BTreeCorrupted { ref msg } if msg.contains("key mismatch")),
+            "expected BTreeCorrupted key mismatch, got {err:?}"
+        );
+
+        // Page unchanged.
+        let cell = read_cell(&page, 0).unwrap();
+        assert_eq!(cell.key, b"alpha");
+        assert_eq!(cell.row_data, b"data");
+    }
+
+    #[test]
+    fn test_freeblock_reuse_after_remove_larger_cell() {
+        let mut page = make_page();
+        let hdr = make_row_header(1);
+
+        // Insert a large cell then a small cell.
+        let pos = search(&page, b"aaa").unwrap_err();
+        insert_cell(&mut page, pos, b"aaa", &hdr, &[0xAA; 500]).unwrap();
+        let pos = search(&page, b"zzz").unwrap_err();
+        insert_cell(&mut page, pos, b"zzz", &hdr, b"tiny").unwrap();
+
+        let space_before_remove = free_space(&page);
+
+        // Remove the large cell — creates a freeblock.
+        remove_cell(&mut page, 0).unwrap(); // "aaa" is at index 0
+        assert_eq!(num_cells(&page), 1);
+
+        let space_after_remove = free_space(&page);
+        assert!(space_after_remove > space_before_remove);
+
+        // Insert a new cell that is smaller than the freeblock — should split
+        // the freeblock and reuse part of it.
+        let pos = search(&page, b"bbb").unwrap_err();
+        insert_cell(&mut page, pos, b"bbb", &hdr, b"reused").unwrap();
+        assert_eq!(num_cells(&page), 2);
+
+        // Verify both cells readable.
+        let c0 = read_cell(&page, 0).unwrap();
+        let c1 = read_cell(&page, 1).unwrap();
+        assert_eq!(c0.key, b"bbb");
+        assert_eq!(c0.row_data, b"reused");
+        assert_eq!(c1.key, b"zzz");
+        assert_eq!(c1.row_data, b"tiny");
+    }
+
+    #[test]
+    fn test_read_cell_out_of_bounds_returns_error() {
+        let page = make_page();
+        match read_cell(&page, 0) {
+            Err(DbError::Other(msg)) => {
+                assert!(msg.contains("out of range"), "unexpected message: {msg}");
+            }
+            Err(other) => panic!("expected Other error, got {other:?}"),
+            Ok(_) => panic!("expected error for empty page read_cell(0)"),
+        }
+    }
+
+    // ── In-place patch primitives ─────────────────────────────────────────────
+
+    #[test]
+    fn test_patch_field_in_place_basic() {
+        let mut page = make_page();
+        let hdr = make_row_header(1);
+        // row_data: [null_bitmap:1][i32:4][i64:8] — 13 bytes for schema (Int, BigInt)
+        // null_bitmap=0, int_val=42, bigint_val=1000
+        let mut row_data = [0u8; 13];
+        row_data[1..5].copy_from_slice(&42i32.to_le_bytes());
+        row_data[5..13].copy_from_slice(&1000i64.to_le_bytes());
+
+        insert_cell(&mut page, 0, b"key1", &hdr, &row_data).unwrap();
+
+        // Find where row_data starts (abs offset).
+        let (row_data_abs, _key_len) = cell_row_data_abs_off(&page, 0).unwrap();
+
+        // Patch the Int field (at row_data offset 1, size 4) to value 99.
+        let new_int: [u8; 4] = 99i32.to_le_bytes();
+        let field_abs = row_data_abs + 1; // bitmap(1) then int
+        patch_field_in_place(&mut page, field_abs, &new_int).unwrap();
+
+        // Verify via read_cell.
+        let cell = read_cell(&page, 0).unwrap();
+        let int_bytes = &cell.row_data[1..5];
+        assert_eq!(i32::from_le_bytes(int_bytes.try_into().unwrap()), 99);
+
+        // Surrounding bytes unchanged.
+        assert_eq!(cell.row_data[0], 0); // null bitmap
+        let bigint_bytes = &cell.row_data[5..13];
+        assert_eq!(i64::from_le_bytes(bigint_bytes.try_into().unwrap()), 1000);
+    }
+
+    #[test]
+    fn test_patch_field_in_place_out_of_bounds() {
+        let mut page = make_page();
+        let result = patch_field_in_place(&mut page, PAGE_SIZE - 2, &[1u8, 2, 3, 4]);
+        assert!(result.is_err(), "expected error for out-of-bounds patch");
+    }
+
+    #[test]
+    fn test_update_row_header_in_place_roundtrip() {
+        let mut page = make_page();
+        let old_hdr = RowHeader {
+            txn_id_created: 7,
+            txn_id_deleted: 0,
+            row_version: 3,
+            _flags: 5,
+        };
+        insert_cell(&mut page, 0, b"pk", &old_hdr, b"rowdata").unwrap();
+
+        let new_hdr = RowHeader {
+            txn_id_created: 42,
+            txn_id_deleted: 0,
+            row_version: 4,
+            _flags: 5,
+        };
+        update_row_header_in_place(&mut page, 0, &new_hdr).unwrap();
+
+        // Verify via read_cell.
+        let cell = read_cell(&page, 0).unwrap();
+        assert_eq!(cell.row_header.txn_id_created, 42);
+        assert_eq!(cell.row_header.txn_id_deleted, 0);
+        assert_eq!(cell.row_header.row_version, 4);
+        assert_eq!(cell.row_header._flags, 5);
+
+        // Key and row_data must be untouched.
+        assert_eq!(cell.key, b"pk");
+        assert_eq!(cell.row_data, b"rowdata");
+    }
+
+    #[test]
+    fn test_update_row_header_in_place_out_of_bounds_idx() {
+        let mut page = make_page();
+        let new_hdr = make_row_header(1);
+        let result = update_row_header_in_place(&mut page, 0, &new_hdr);
+        assert!(result.is_err(), "expected error for cell_idx >= num_cells");
+    }
+
+    #[test]
+    fn test_cell_row_data_abs_off_correct() {
+        let mut page = make_page();
+        let hdr = make_row_header(1);
+        let row_data = b"hello_row";
+        insert_cell(&mut page, 0, b"mykey", &hdr, row_data).unwrap();
+
+        let (abs_off, key_len) = cell_row_data_abs_off(&page, 0).unwrap();
+        assert_eq!(key_len, b"mykey".len());
+
+        // Verify the bytes at abs_off match row_data.
+        let b = page.as_bytes();
+        assert_eq!(&b[abs_off..abs_off + row_data.len()], row_data);
+    }
+
+    #[test]
+    fn test_patch_and_header_together() {
+        // Simulate a full UPDATE in-place: patch a field + bump txn_id/row_version.
+        let mut page = make_page();
+        let old_hdr = RowHeader {
+            txn_id_created: 10,
+            txn_id_deleted: 0,
+            row_version: 0,
+            _flags: 0,
+        };
+        // row_data: [bitmap:1][real:8] = 9 bytes, Real value = 1.0
+        let mut row_data = [0u8; 9];
+        row_data[1..9].copy_from_slice(&1.0f64.to_le_bytes());
+        insert_cell(&mut page, 0, b"k", &old_hdr, &row_data).unwrap();
+
+        let (rda, _) = cell_row_data_abs_off(&page, 0).unwrap();
+        let field_abs = rda + 1; // skip bitmap byte
+
+        // Read old Real value.
+        let old_bytes = &page.as_bytes()[field_abs..field_abs + 8];
+        assert_eq!(f64::from_le_bytes(old_bytes.try_into().unwrap()), 1.0);
+
+        // Patch to 2.0.
+        patch_field_in_place(&mut page, field_abs, &2.0f64.to_le_bytes()).unwrap();
+
+        // Update header: txn_id_created=20, row_version=1.
+        let new_hdr = RowHeader {
+            txn_id_created: 20,
+            txn_id_deleted: 0,
+            row_version: 1,
+            _flags: 0,
+        };
+        update_row_header_in_place(&mut page, 0, &new_hdr).unwrap();
+
+        // Verify.
+        let cell = read_cell(&page, 0).unwrap();
+        assert_eq!(cell.row_header.txn_id_created, 20);
+        assert_eq!(cell.row_header.row_version, 1);
+        let real_bytes = &cell.row_data[1..9];
+        assert_eq!(f64::from_le_bytes(real_bytes.try_into().unwrap()), 2.0);
+        // Key unchanged.
+        assert_eq!(cell.key, b"k");
     }
 }

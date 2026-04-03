@@ -556,6 +556,50 @@ ALTER TABLE user_profiles RENAME TO profiles;
 ALTER TABLE orders_import RENAME TO orders;
 ```
 
+### Rebuild To Clustered
+
+Migrates a **legacy heap table that already has PRIMARY KEY metadata** into
+clustered storage.
+
+```sql
+ALTER TABLE table_name REBUILD;
+```
+
+Example:
+
+```sql
+-- After opening an older AxiomDB database where `users` is still heap-backed
+ALTER TABLE users REBUILD;
+```
+
+Behavior:
+
+- walks the existing PRIMARY KEY index in logical key order
+- rebuilds the table into a clustered PRIMARY KEY tree
+- rebuilds every non-primary index so it stores clustered PK bookmarks instead
+  of heap `RecordId`s
+- swaps the catalog metadata atomically at the end of the statement
+
+Common errors:
+
+```sql
+ALTER TABLE logs REBUILD;
+-- ERROR 1105 (HY000): ALTER TABLE REBUILD requires a PRIMARY KEY on 'logs'
+```
+
+```sql
+ALTER TABLE users REBUILD;
+-- ERROR 1105 (HY000): table 'users' is already clustered
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision</span>
+The rebuild path follows PostgreSQL <code>CLUSTER</code> and InnoDB sorted-rebuild ideas: build the new clustered roots first, then swap catalog metadata. AxiomDB adds deferred free of the old heap/index pages so the metadata swap never races with page reclamation.
+</div>
+</div>
+
 ### Not Yet Supported
 
 The following ALTER TABLE forms are planned for Phase 4.22b and later:

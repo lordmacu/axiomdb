@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 39.17 Executor integration: DELETE from clustered table — explicit-PK tables now delete through clustered candidate discovery, parent-side FK enforcement before delete-mark, exact-row-image WAL, rollback-safe clustered delete-mark undo, and ctx/non-ctx executor support
+**Last completed subphase:** 39.19 Table rebuild: heap to clustered migration — `ALTER TABLE ... REBUILD` now migrates legacy heap+PRIMARY KEY tables into clustered storage through a PK-ordered rebuild plus deferred free of old heap/index pages after commit
 
-**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, overflow-backed large rows, insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, clustered-first secondary bookmarks, internal WAL/rollback, clustered crash recovery, clustered-aware `CREATE TABLE`, clustered SQL `INSERT`, clustered SQL `SELECT`, clustered SQL `UPDATE`, and clustered SQL `DELETE` now exist; clustered maintenance is next
+**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, overflow-backed large rows, insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, clustered-first secondary bookmarks, internal WAL/rollback, clustered crash recovery, clustered-aware `CREATE TABLE`, clustered SQL `INSERT`, clustered SQL `SELECT`, clustered SQL `UPDATE`, clustered SQL `DELETE`, clustered `VACUUM`, and legacy heap→clustered rebuild now exist; phase closeout and benchmarks are next
 
-**Next milestone:** 39.18 — VACUUM for clustered index
+**Next milestone:** 39.20 — Integration tests and benchmarks for clustered tables
 
 **Concurrency note:** the current server already supports concurrent read-only
 queries, but mutating statements are still serialized through a database-wide

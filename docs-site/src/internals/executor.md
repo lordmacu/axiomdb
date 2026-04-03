@@ -1626,6 +1626,63 @@ skip untouched indexes safely.
 
 ---
 
+## Clustered UPDATE In-Place Zero-Alloc Fast Path (Phase 39.22)
+
+`fused_clustered_scan_patch` in `executor/update.rs` implements a zero-allocation
+UPDATE fast path for clustered tables when all SET columns are fixed-size.
+
+### Allocation audit
+
+| Allocation | Before 39.22 | After 39.22 |
+|---|---|---|
+| `cell.row_data.to_vec()` (phase-1 offset scan) | 1× per matched row | ❌ eliminated |
+| `patched_data = ...clone()` (phase-2 mutation) | 1× per matched row | ❌ eliminated |
+| `encode_cell_image()` in overflow path | 1× per matched row | ✅ overflow-only |
+| `FieldDelta.old_bytes: Vec<u8>` | 1× per changed field | ❌ → `[u8;8]` inline |
+| `FieldDelta.new_bytes: Vec<u8>` | 1× per changed field | ❌ → `[u8;8]` inline |
+
+For 25K rows with 1 changed column each: ~125K heap allocations → 0.
+
+### Two-phase borrow pattern
+
+The Rust borrow checker requires releasing the immutable page borrow before
+taking a mutable one. The fast path uses a split-phase approach:
+
+```
+Read phase (immutable borrow on page):
+  1. cell_row_data_abs_off(&page, idx) → (row_data_abs_off, key_len)
+  2. compute_field_location_runtime(row_slice, bitmap) → FieldLocation
+  3. MAYBE_NOP: if page_bytes[field_abs..][..size] == new_encoded[..size] { skip }
+  4. Capture old_buf: [u8;8] and new_encoded: [u8;8] on the stack
+
+Write phase (mutable borrow after immutable dropped):
+  5. patch_field_in_place(&mut page, field_abs, new_buf[..size])
+  6. update_row_header_in_place(&mut page, idx, &new_header)
+```
+
+### MAYBE_NOP (byte-identity check)
+
+If the new encoded bytes are byte-identical to the existing page bytes
+(e.g., `SET score = score * 1` after integer multiplication), the field is
+skipped entirely — no WAL delta, no header bump, no page write for that field.
+This is an O(size) byte comparison (~4–8 bytes) before any mutation.
+
+### Overflow fallback
+
+Cells with `overflow_first_page.is_some()` are rare (<1% of typical workloads)
+and fall back to the existing `rewrite_cell_same_key_with_overflow` path
+(full cell re-encode). The fast path only applies to inline cells.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage — 5 Allocations → 0 Per Row</span>
+MariaDB's InnoDB in-place UPDATE (<code>btr_cur_upd_rec_in_place</code>) still allocates an undo record per row for ROLLBACK support. AxiomDB's <code>UndoClusteredFieldPatch</code> stores undo data as inline <code>[u8;8]</code> arrays in the undo log entry — zero heap allocation per row even for ROLLBACK support. For a 25K-row <code>UPDATE t SET score = score + 1</code>, this reduces allocator pressure from ~125K allocs to zero.
+</div>
+</div>
+
+---
+
 ## Strict Mode and Warning 1265
 
 `SessionContext.strict_mode` is a `bool` flag (default `true`) that controls

@@ -1,5 +1,30 @@
 # Lessons Learned
 
+## 2026-04-03 - Clustered rebuild must flush new roots before the catalog swap and defer old-page free until commit
+
+- A heap→clustered migration is not just “copy rows, update metadata, free old pages”.
+- The right intermediate contract is:
+  - build the new clustered root and rebuilt secondary roots first
+  - flush them before any catalog row points at them
+  - swap metadata inside the active DDL transaction
+  - queue old heap/index pages through deferred free instead of freeing them inline
+- `research/postgres/src/backend/commands/cluster.c` reinforced the copy/swap
+  shape, and `research/mariadb-server/storage/innobase/row/row0merge.cc`
+  reinforced the sorted-rebuild mindset.
+
+## 2026-04-03 - Clustered VACUUM must clean secondary bookmarks by physical row existence, not snapshot visibility
+
+- Snapshot visibility is the wrong predicate for clustered purge.
+- The right maintenance contract is:
+  - purge clustered leaf cells first when `txn_id_deleted < oldest_safe_txn`
+  - only then scan clustered secondaries
+  - keep a bookmark while its clustered row still exists physically, even if the
+    current snapshot would treat that row as invisible
+  - persist any bulk-delete root rotation back into the catalog in the same transaction
+- `research/mariadb-server/storage/innobase/row/row0purge.cc` reinforced the
+  purge mindset, and `research/postgres/src/backend/access/heap/vacuumlazy.c`
+  reinforced the “identify dead, then clean indexes” split.
+
 ## 2026-04-02 - Clustered parent DELETE can reuse parent-side FK enforcement as long as it passes row values, not heap identity
 
 - Parent-side FK enforcement on DELETE only needs the parent row values to probe referencing child rows; it does not need a stable heap slot identity for the parent row.

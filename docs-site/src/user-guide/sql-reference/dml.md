@@ -523,10 +523,11 @@ SQL-visible `INSERT`, `SELECT`, `UPDATE`, and `DELETE`. The clustered SQL path n
 - `DELETE` through PK predicates, PK ranges, secondary bookmark probes, or full clustered scans
 - `DELETE` rollback/savepoint restore through exact clustered row images in WAL
 
-Current clustered boundary after `39.17`:
+Current clustered boundary after `39.18`:
 
-- clustered `DELETE` is logical delete-mark, not physical purge
-- clustered secondary bookmark entries stay in place until clustered `VACUUM`
+- clustered `DELETE` is still delete-mark first, and clustered `VACUUM table`
+  performs the later physical purge
+- clustered `VACUUM table` now frees overflow chains and dead secondary bookmark entries
 - clustered child-table foreign-key enforcement still remains future work
 
 <div class="callout callout-design">
