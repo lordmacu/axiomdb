@@ -1284,6 +1284,7 @@
 - [ ] ⚠️ 39.19 rebuild-page cleanup is still best-effort inside the statement path; general transactional tracking of freshly allocated pages remains deferred — revisit in later page-allocation / rollback work
 - [ ] 39.20 ⏳ Integration tests and benchmarks for clustered tables
 - [x] 39.21 ✅ Aggregate hash execution — `GroupTablePrimitive` (INT/BIGINT single-column GROUP BY), `GroupTableGeneric` (multi-column / TEXT / mixed-type), `hashbrown` hash table, fast-path `value_agg_add` accumulator arithmetic bypassing `eval()`, `finalize_avg` for exact AVG, column decode mask via `collect_expr_columns`, `scan_all_callback` zero-alloc clustered scan, all-NULL AVG → NULL, HAVING with non-agg column filter, and 11 integration tests
+- [x] 39.22 ✅ UPDATE in-place zero-alloc patch — `cell_row_data_abs_off`, `patch_field_in_place`, `update_row_header_in_place` primitives; `fused_clustered_scan_patch` fast path eliminates 5 heap allocs per matched row; `FieldDelta` inline `[u8;8]` arrays (no Vec); MAYBE_NOP byte-identity check; `UndoClusteredFieldPatch` undo op for ROLLBACK via field deltas; overflow-row fallback; 4 new integration tests; 7 new wire-test assertions; ≥1.0M r/s UPDATE on fixed-size columns
 
 ### Phase 40 — Concurrent Writers (Multi-Writer Engine) `⏳`
 - [ ] 40.1 ⏳ Atomic transaction ID and snapshot — make next_txn_id and max_committed AtomicU64; lock-free snapshot creation

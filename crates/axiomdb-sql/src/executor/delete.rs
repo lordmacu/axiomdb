@@ -147,6 +147,7 @@ fn execute_delete_ctx(
 /// Clustered table DELETE: collects candidates from the clustered B-tree,
 /// then applies MVCC delete-mark to each via `clustered_tree::delete_mark()`.
 /// Physical cell removal deferred to VACUUM (39.18).
+#[allow(clippy::too_many_arguments)]
 fn execute_clustered_delete(
     where_clause: Option<Expr>,
     schema_cols: &[axiomdb_catalog::schema::ColumnDef],
@@ -161,6 +162,30 @@ fn execute_clustered_delete(
     let root_pid = txn
         .clustered_root(resolved.def.id)
         .unwrap_or(resolved.def.root_page_id);
+
+    let has_fk_references = {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        !reader
+            .list_fk_constraints_referencing(resolved.def.id)?
+            .is_empty()
+    };
+
+    // ── Fast path: DELETE without WHERE on clustered table ────────────────
+    // Walk leaf chain directly, mark ALL visible cells as deleted.
+    // Zero row decode — only reads RowHeader (24 bytes per cell).
+    if where_clause.is_none() && !has_fk_references {
+        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+        let count = delete_mark_all_clustered_leaves(storage, txn, resolved.def.id, root_pid, txn_id, snap)?;
+        if count > 0 {
+            ctx.stats.on_rows_changed(resolved.def.id, count);
+        }
+        ctx.invalidate_all();
+        return Ok(QueryResult::Affected {
+            count,
+            last_insert_id: None,
+        });
+    }
+
     let candidates = collect_clustered_delete_candidates(
         where_clause.as_ref(),
         schema_cols,
@@ -178,13 +203,6 @@ fn execute_clustered_delete(
             last_insert_id: None,
         });
     }
-
-    let has_fk_references = {
-        let mut reader = CatalogReader::new(storage, snap)?;
-        !reader
-            .list_fk_constraints_referencing(resolved.def.id)?
-            .is_empty()
-    };
 
     if has_fk_references {
         let parent_rows: Vec<(RecordId, Vec<Value>)> = candidates
@@ -211,38 +229,63 @@ fn execute_clustered_delete(
 
     let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
     let mut count = 0u64;
-    for candidate in &candidates {
-        let old_image = axiomdb_wal::ClusteredRowImage::new(
-            root_pid,
-            candidate.row_header,
-            &candidate.row_data,
-        );
-        let delete_marked_header = axiomdb_storage::heap::RowHeader {
-            txn_id_created: candidate.row_header.txn_id_created,
-            txn_id_deleted: txn_id,
-            row_version: candidate.row_header.row_version,
-            _flags: candidate.row_header._flags,
-        };
 
-        if axiomdb_storage::clustered_tree::delete_mark(
-            storage,
-            Some(root_pid),
-            &candidate.pk_key,
-            txn_id,
-            &snap,
-        )? {
-            let new_image = axiomdb_wal::ClusteredRowImage::new(
-                root_pid,
-                delete_marked_header,
-                &candidate.row_data,
-            );
-            txn.record_clustered_delete_mark(
-                resolved.def.id,
-                &candidate.pk_key,
-                &old_image,
-                &new_image,
+    // InnoDB-inspired batch delete: candidates arrive in PK order from the
+    // clustered scan. Group consecutive candidates on the same leaf page.
+    // Uses patch_txn_id_deleted (8-byte direct write) instead of full cell rewrite,
+    // and lightweight WAL (no row_data images) + UndoClusteredUndelete.
+    let mut i = 0;
+    while i < candidates.len() {
+        let candidate = &candidates[i];
+
+        // Descend to the leaf page for this candidate's key.
+        let leaf_ref =
+            axiomdb_storage::clustered_tree::descend_to_leaf_pub(storage, root_pid, &candidate.pk_key)?;
+        let page_id = leaf_ref.header().page_id;
+        let mut page = leaf_ref.into_page();
+        let mut page_dirty = false;
+        let mut patched_keys: Vec<Vec<u8>> = Vec::new();
+
+        // Process all consecutive candidates that live on this same leaf page.
+        while i < candidates.len() {
+            let c = &candidates[i];
+            let pos = match axiomdb_storage::clustered_leaf::search(&page, &c.pk_key) {
+                Ok(pos) => pos,
+                Err(_) => {
+                    // Key not on this page — candidate is on a different leaf.
+                    break;
+                }
+            };
+
+            // Verify the cell is still visible (not already deleted by another op).
+            // Only read header — no row_data allocation needed for delete-mark.
+            let cell = axiomdb_storage::clustered_leaf::read_cell(&page, pos as u16)?;
+            if !cell.row_header.is_visible(&snap) {
+                i += 1;
+                continue;
+            }
+
+            // Direct 8-byte patch: modify ONLY txn_id_deleted in the cell header.
+            // InnoDB uses a single-byte delete flag; we patch 8 bytes (txn_id).
+            // No full cell rewrite, no row_data copy.
+            let _old_deleted = axiomdb_storage::clustered_leaf::patch_txn_id_deleted(
+                &mut page, pos, txn_id,
             )?;
+            page_dirty = true;
             count += 1;
+            patched_keys.push(c.pk_key.clone());
+            i += 1;
+        }
+
+        // Single page write for all marks on this leaf.
+        if page_dirty {
+            page.update_checksum();
+            storage.write_page(page_id, &page)?;
+        }
+
+        // Lightweight batch WAL + undo for all patched cells on this leaf.
+        if !patched_keys.is_empty() {
+            txn.record_clustered_delete_mark_lightweight(resolved.def.id, root_pid, &patched_keys)?;
         }
     }
 
@@ -264,8 +307,8 @@ fn execute_clustered_delete(
 #[derive(Debug, Clone)]
 struct ClusteredDeleteCandidate {
     pk_key: Vec<u8>,
-    row_header: axiomdb_storage::heap::RowHeader,
-    row_data: Vec<u8>,
+    /// Decoded row values — needed only for FK enforcement (parent-key checks).
+    /// Not used for the actual delete-mark path (which patches 8 bytes directly).
     values: Vec<Value>,
 }
 
@@ -346,6 +389,96 @@ fn clustered_rows_for_secondary_delete_access(
     }
 
     Ok(rows)
+}
+
+/// Fast-path DELETE without WHERE: walks the clustered leaf chain and marks
+/// ALL visible cells as deleted. Zero row decode — only modifies RowHeader.
+/// One page read+write per leaf page (batch).
+fn delete_mark_all_clustered_leaves(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_id: u32,
+    root_pid: u64,
+    txn_id: u64,
+    snap: axiomdb_core::TransactionSnapshot,
+) -> Result<u64, DbError> {
+    use axiomdb_storage::{clustered_internal, clustered_leaf, page::PageType};
+
+    // Descend to leftmost leaf.
+    let mut pid = root_pid;
+    loop {
+        let page = storage.read_page(pid)?;
+        let pt = PageType::try_from(page.header().page_type)
+            .map_err(|e| DbError::Other(format!("{e}")))?;
+        match pt {
+            PageType::ClusteredLeaf => break,
+            PageType::ClusteredInternal => {
+                pid = clustered_internal::child_at(&page, 0)?;
+            }
+            _ => {
+                return Err(DbError::BTreeCorrupted {
+                    msg: format!("delete_mark_all: unexpected page type {pt:?} at {pid}"),
+                });
+            }
+        }
+    }
+
+    let mut count = 0u64;
+    let mut current = pid;
+
+    while current != clustered_leaf::NULL_PAGE {
+        let mut page = storage.read_page(current)?.into_page();
+        let next = clustered_leaf::next_leaf(&page);
+        let n = clustered_leaf::num_cells(&page) as usize;
+        let mut page_dirty = false;
+
+        // Phase 1: Identify cells to mark (indices only — minimal allocation).
+        let mut mark_indices: Vec<usize> = Vec::new();
+        for idx in 0..n {
+            let cell = clustered_leaf::read_cell(&page, idx as u16)?;
+            if !cell.row_header.is_visible(&snap) {
+                continue;
+            }
+            if cell.row_header.txn_id_deleted != 0 {
+                continue;
+            }
+            mark_indices.push(idx);
+        }
+
+        // Phase 2: Direct header patch — InnoDB-inspired: modify ONLY 8 bytes
+        // (txn_id_deleted) per cell. No cell copy, no full row image allocation.
+        // Undo uses lightweight UndoClusteredUndelete (only PK key, no row_data).
+        let mut patched_keys: Vec<Vec<u8>> = Vec::new();
+
+        for &idx in &mark_indices {
+            // Read key BEFORE patch (need it for WAL + undo).
+            let cell = clustered_leaf::read_cell(&page, idx as u16)?;
+            let pk_key = cell.key.to_vec(); // Only allocation: PK key (~8 bytes)
+
+            // Patch txn_id_deleted directly on page buffer (8 bytes).
+            let _old_deleted = clustered_leaf::patch_txn_id_deleted(
+                &mut page, idx, txn_id,
+            )?;
+            page_dirty = true;
+            count += 1;
+            patched_keys.push(pk_key);
+        }
+
+        if page_dirty {
+            page.update_checksum();
+            storage.write_page(current, &page)?;
+        }
+
+        // Lightweight WAL + undo: minimal images (empty row_data) + UndoClusteredUndelete.
+        // This reduces per-row WAL from ~150 bytes to ~70 bytes (header-only images)
+        // and undo from ~100 bytes (full row clone) to ~16 bytes (PK key only).
+        if !patched_keys.is_empty() {
+            txn.record_clustered_delete_mark_lightweight(table_id, root_pid, &patched_keys)?;
+        }
+        current = next;
+    }
+
+    Ok(count)
 }
 
 fn collect_clustered_delete_candidates(
@@ -449,8 +582,6 @@ fn collect_clustered_delete_candidates(
         }
         candidates.push(ClusteredDeleteCandidate {
             pk_key: row.key,
-            row_header: row.row_header,
-            row_data: row.row_data,
             values,
         });
     }

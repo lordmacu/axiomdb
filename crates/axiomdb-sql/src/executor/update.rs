@@ -150,6 +150,7 @@ fn execute_update_ctx(
 /// - Full row decode (5000× for typical range)
 /// - WHERE recheck (redundant, index already filtered)
 /// - Double heap page read (candidate collection + patch phase)
+#[allow(clippy::too_many_arguments)]
 fn fused_index_range_patch(
     index_def: &axiomdb_catalog::IndexDef,
     lo: Option<&[u8]>,
@@ -291,7 +292,8 @@ fn fused_index_range_patch(
 
     // WAL: batch UpdateInPlace with old+new tuple images.
     if !wal_images.is_empty() {
-        let batch_refs: Vec<(&[u8], &[u8], &[u8], u64, u16)> = wal_images
+        type WalImageRef<'a> = (&'a [u8], &'a [u8], &'a [u8], u64, u16);
+        let batch_refs: Vec<WalImageRef<'_>> = wal_images
             .iter()
             .map(|(k, old, new, pid, sid)| {
                 (k.as_slice(), old.as_slice(), new.as_slice(), *pid, *sid)
@@ -400,12 +402,12 @@ fn clustered_rows_for_secondary_access(
 fn collect_clustered_update_candidates(
     where_clause: Option<&Expr>,
     schema_cols: &[axiomdb_catalog::schema::ColumnDef],
-    secondary_indexes: &[axiomdb_catalog::IndexDef],
+    _secondary_indexes: &[axiomdb_catalog::IndexDef],
+    access_method: &crate::planner::AccessMethod,
     storage: &dyn StorageEngine,
     snap: axiomdb_core::TransactionSnapshot,
     resolved: &axiomdb_catalog::ResolvedTable,
     root_pid: u64,
-    effective_collation: crate::session::SessionCollation,
 ) -> Result<Vec<ClusteredUpdateCandidate>, DbError> {
     use std::ops::Bound;
 
@@ -413,17 +415,6 @@ fn collect_clustered_update_candidates(
         .iter()
         .map(|c| crate::table::column_type_to_data_type(c.col_type))
         .collect();
-
-    let access_method = where_clause
-        .map(|wc| {
-            normalize_clustered_update_access_method(crate::planner::plan_update_candidates_ctx(
-                wc,
-                secondary_indexes,
-                schema_cols,
-                effective_collation,
-            ))
-        })
-        .unwrap_or(crate::planner::AccessMethod::Scan);
 
     let mut raw_rows = Vec::new();
     match access_method {
@@ -441,20 +432,20 @@ fn collect_clustered_update_candidates(
         }
         crate::planner::AccessMethod::IndexLookup { index_def, key } if index_def.is_primary => {
             if let Some(row) =
-                axiomdb_storage::clustered_tree::lookup(storage, Some(root_pid), &key, &snap)?
+                axiomdb_storage::clustered_tree::lookup(storage, Some(root_pid), &key[..], &snap)?
             {
                 raw_rows.push(row);
             }
         }
         crate::planner::AccessMethod::IndexLookup { index_def, key } => {
-            let hi = clustered_secondary_high_bound(&key);
+            let hi = clustered_secondary_high_bound(&key[..]);
             raw_rows.extend(clustered_rows_for_secondary_access(
                 storage,
                 root_pid,
                 resolved,
-                &index_def,
-                Some(&key),
-                Some(&hi),
+                index_def,
+                Some(key.as_slice()),
+                Some(hi.as_slice()),
                 snap,
             )?);
         }
@@ -462,8 +453,8 @@ fn collect_clustered_update_candidates(
             let iter = axiomdb_storage::clustered_tree::range(
                 storage,
                 Some(root_pid),
-                lo.map_or(Bound::Unbounded, Bound::Included),
-                hi.map_or(Bound::Unbounded, Bound::Included),
+                lo.clone().map_or(Bound::Unbounded, Bound::Included),
+                hi.clone().map_or(Bound::Unbounded, Bound::Included),
                 &snap,
             )?;
             for row in iter {
@@ -475,7 +466,7 @@ fn collect_clustered_update_candidates(
                 storage,
                 root_pid,
                 resolved,
-                &index_def,
+                index_def,
                 lo.as_deref(),
                 hi.as_deref(),
                 snap,
@@ -570,10 +561,396 @@ fn apply_clustered_secondary_update(
 /// Clustered table UPDATE: collects candidates from the clustered B-tree,
 /// evaluates assignments, then applies updates via the clustered storage layer.
 ///
+/// Fused clustered scan-patch: walks the leaf chain once, evaluates WHERE per
+/// cell, patches fixed-size fields in-place. One page read+write per leaf.
+/// Eliminates: candidate Vec, per-row tree descent, per-row page I/O.
+#[allow(clippy::too_many_arguments)]
+fn fused_clustered_scan_patch(
+    where_clause: Option<&Expr>,
+    assignments: &[(usize, Expr)],
+    col_types: &[axiomdb_types::DataType],
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    snap: axiomdb_core::TransactionSnapshot,
+    resolved: &axiomdb_catalog::ResolvedTable,
+    root_pid: u64,
+    ctx: &mut SessionContext,
+    from: std::ops::Bound<Vec<u8>>,
+    to: std::ops::Bound<Vec<u8>>,
+) -> Result<QueryResult, DbError> {
+    use std::ops::Bound;
+
+    use axiomdb_storage::{clustered_internal, clustered_leaf, page::PageType};
+
+    let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+    let n_cols = col_types.len();
+
+    let (mut current, mut slot_idx) = match &from {
+        Bound::Unbounded => {
+            let mut pid = root_pid;
+            loop {
+                let page = storage.read_page(pid)?;
+                let pt = PageType::try_from(page.header().page_type)
+                    .map_err(|e| DbError::Other(format!("{e}")))?;
+                match pt {
+                    PageType::ClusteredLeaf => break (pid, 0usize),
+                    PageType::ClusteredInternal => {
+                        pid = clustered_internal::child_at(&page, 0)?;
+                    }
+                    _ => {
+                        return Err(DbError::BTreeCorrupted {
+                            msg: format!(
+                                "fused_clustered_scan_patch: unexpected page type {pt:?}"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Bound::Included(key) => {
+            let leaf =
+                axiomdb_storage::clustered_tree::descend_to_leaf_pub(storage, root_pid, key)?;
+            let slot = match clustered_leaf::search(&leaf, key) {
+                Ok(pos) | Err(pos) => pos,
+            };
+            (leaf.header().page_id, slot)
+        }
+        Bound::Excluded(key) => {
+            let leaf =
+                axiomdb_storage::clustered_tree::descend_to_leaf_pub(storage, root_pid, key)?;
+            let slot = match clustered_leaf::search(&leaf, key) {
+                Ok(pos) => pos + 1,
+                Err(pos) => pos,
+            };
+            (leaf.header().page_id, slot)
+        }
+    };
+
+    // Compile BatchPredicate for zero-alloc raw-byte WHERE evaluation.
+    // Falls back to eval() for unsupported patterns (OR, LIKE, Text comparisons).
+    let batch_pred = where_clause
+        .and_then(|wc| crate::eval::batch::try_compile(wc, col_types));
+
+    let mut matched = 0u64;
+    let mut patched = 0u64;
+    let mut sparse_row: Vec<Value> = vec![Value::Null; n_cols];
+
+    while current != clustered_leaf::NULL_PAGE {
+        let mut page = storage.read_page(current)?.into_page();
+        let next = clustered_leaf::next_leaf(&page);
+        let page_id = page.header().page_id;
+        let num = clustered_leaf::num_cells(&page) as usize;
+        let mut page_dirty = false;
+
+        // Phase 1: Collect cells to patch on this page (to avoid borrow conflicts).
+        //
+        // `local_row_data` is intentionally NOT stored here (was the root cause of the
+        // 2× full-row clone per matched row). Phase 2 reads row bytes directly from
+        // the page buffer via `cell_row_data_abs_off` — zero allocation for inline cells.
+        // Overflow cells re-read the cell on demand (rare, < 1% of typical workloads).
+        struct PatchInfo {
+            idx: usize,
+            old_header: axiomdb_storage::heap::RowHeader,
+            total_row_len: usize,
+            overflow_first_page: Option<u64>,
+            key: Vec<u8>,
+            changed_fields: Vec<(usize, Value)>, // (col_pos, new_value)
+        }
+        let mut patches: Vec<PatchInfo> = Vec::new();
+
+        // BatchPredicate fast-reject: evaluate WHERE on raw cell bytes
+        // BEFORE decoding. Cells that fail the predicate are skipped entirely
+        // (no decode, no eval, no allocation). ~20ns/row vs ~130ns/row.
+        let mut bp_passed = vec![true; num];
+        if let Some(ref bp) = batch_pred {
+            for (idx, slot) in bp_passed.iter_mut().enumerate() {
+                if let Ok(cell) = clustered_leaf::read_cell(&page, idx as u16) {
+                    *slot = cell.row_header.is_visible(&snap) && bp.eval_on_raw(cell.row_data);
+                } else {
+                    *slot = false;
+                }
+            }
+        }
+
+        while slot_idx < num {
+            let idx = slot_idx;
+            slot_idx += 1;
+
+            // BatchPredicate pre-filter: skip cells that failed raw-byte eval.
+            if !bp_passed[idx] {
+                continue;
+            }
+
+            let cell = clustered_leaf::read_cell(&page, idx as u16)?;
+            let above_lower = match &from {
+                Bound::Unbounded => true,
+                Bound::Included(lo) => cell.key >= lo.as_slice(),
+                Bound::Excluded(lo) => cell.key > lo.as_slice(),
+            };
+            if !above_lower {
+                continue;
+            }
+            let below_upper = match &to {
+                Bound::Unbounded => true,
+                Bound::Included(hi) => cell.key <= hi.as_slice(),
+                Bound::Excluded(hi) => cell.key < hi.as_slice(),
+            };
+            if !below_upper {
+                current = clustered_leaf::NULL_PAGE;
+                break;
+            }
+            if !cell.row_header.is_visible(&snap) {
+                continue;
+            }
+
+            // Decode row_data for assignment evaluation (field-patch only needs
+            // the assigned columns, but eval() needs full row context).
+            let values = axiomdb_types::codec::decode_row(cell.row_data, col_types)?;
+
+            if let Some(wc) = where_clause {
+                if !is_truthy(&eval(wc, &values)?) {
+                    continue;
+                }
+            }
+            matched += 1;
+
+            // Evaluate assignments — collect only changed fields.
+            let mut changed_fields = Vec::new();
+            for &(col_pos, ref val_expr) in assignments {
+                // Use sparse_row for eval context.
+                sparse_row[col_pos] = values[col_pos].clone();
+                let new_val = eval(val_expr, &values)?;
+                sparse_row[col_pos] = Value::Null;
+                if new_val != values[col_pos] {
+                    changed_fields.push((col_pos, new_val));
+                }
+            }
+
+            if changed_fields.is_empty() {
+                continue;
+            }
+
+            patches.push(PatchInfo {
+                idx,
+                old_header: cell.row_header,
+                total_row_len: cell.total_row_len,
+                overflow_first_page: cell.overflow_first_page,
+                key: cell.key.to_vec(),
+                changed_fields,
+            });
+        }
+
+        // Phase 2: Apply patches + collect compact field deltas for WAL.
+        //
+        // Two sub-paths based on whether the cell is inline or overflow-backed:
+        //
+        //   • Inline cells (fast path, InnoDB btr_cur_upd_rec_in_place model):
+        //     1. Read phase  — immutable page borrow: compute field locations from
+        //        the page bytes directly (no row_data clone), capture old bytes into
+        //        [u8;8] stack buffers, encode new values.
+        //     2. Write phase — mutable page borrow: call patch_field_in_place() and
+        //        update_row_header_in_place() for direct page-buffer mutation.
+        //     Result: zero heap allocations per row for the fixed-size hot path.
+        //
+        //   • Overflow cells (fallback, unchanged): re-read the cell on demand and
+        //     call rewrite_cell_same_key_with_overflow as before. These are rare
+        //     (<1% of typical workloads).
+        let mut wal_patches: Vec<axiomdb_wal::ClusteredFieldPatchEntry> = Vec::new();
+        let bitmap_len = col_types.len().div_ceil(8);
+
+        for patch in &patches {
+            if patch.overflow_first_page.is_some() {
+                // ── Overflow fallback: re-read row_data, apply via full cell rewrite ──
+                let cell = clustered_leaf::read_cell(&page, patch.idx as u16)?;
+                let mut patched_data = cell.row_data.to_vec();
+                let bitmap = patched_data[..bitmap_len.min(patched_data.len())].to_vec();
+
+                let mut field_deltas: Vec<axiomdb_wal::FieldDelta> = Vec::new();
+                for (col_pos, new_val) in &patch.changed_fields {
+                    if let Some(loc) = axiomdb_types::field_patch::compute_field_location_runtime(
+                        col_types,
+                        *col_pos,
+                        &bitmap,
+                        Some(&patched_data),
+                    ) {
+                        let mut old_buf = [0u8; 8];
+                        old_buf[..loc.size]
+                            .copy_from_slice(&patched_data[loc.offset..loc.offset + loc.size]);
+                        let new_encoded =
+                            axiomdb_types::field_patch::encode_value_fixed(new_val, loc.data_type)?;
+                        patched_data[loc.offset..loc.offset + loc.size]
+                            .copy_from_slice(&new_encoded[..loc.size]);
+                        field_deltas.push(axiomdb_wal::FieldDelta {
+                            offset: loc.offset as u16,
+                            size: loc.size as u8,
+                            old_bytes: old_buf,
+                            new_bytes: new_encoded,
+                        });
+                    }
+                }
+
+                let new_header = axiomdb_storage::heap::RowHeader {
+                    txn_id_created: txn_id,
+                    txn_id_deleted: 0,
+                    row_version: patch.old_header.row_version.wrapping_add(1),
+                    _flags: patch.old_header._flags,
+                };
+
+                if clustered_leaf::rewrite_cell_same_key_with_overflow(
+                    &mut page,
+                    patch.idx,
+                    &patch.key,
+                    &new_header,
+                    patch.total_row_len,
+                    &patched_data,
+                    patch.overflow_first_page,
+                )?
+                .is_some()
+                {
+                    page_dirty = true;
+                    patched += 1;
+                    wal_patches.push(axiomdb_wal::ClusteredFieldPatchEntry {
+                        key: patch.key.clone(),
+                        old_header: patch.old_header,
+                        new_header,
+                        old_row_data: Vec::new(),
+                        field_deltas,
+                    });
+                }
+                continue;
+            }
+
+            // ── Inline fast path: direct page-buffer mutation ─────────────────
+            //
+            // Read phase: hold an immutable borrow on the page to compute field
+            // locations and capture old bytes — no clone of row_data.
+            let (row_data_abs_off, _key_len_in_page) =
+                clustered_leaf::cell_row_data_abs_off(&page, patch.idx)?;
+
+            // field_writes: (field_abs_off, size, old_bytes:[u8;8], new_bytes:[u8;8])
+            // Built entirely from stack-allocated data — zero heap per entry.
+            let (field_writes, any_real_change) = {
+                let b = page.as_bytes();
+                let row_slice = &b[row_data_abs_off..];
+                let bitmap = &row_slice[..bitmap_len.min(row_slice.len())];
+
+                let mut fw: Vec<(usize, usize, [u8; 8], [u8; 8])> =
+                    Vec::with_capacity(patch.changed_fields.len());
+                let mut changed = false;
+
+                for (col_pos, new_val) in &patch.changed_fields {
+                    let Some(loc) = axiomdb_types::field_patch::compute_field_location_runtime(
+                        col_types,
+                        *col_pos,
+                        bitmap,
+                        Some(row_slice),
+                    ) else {
+                        continue;
+                    };
+
+                    let new_encoded = axiomdb_types::field_patch::encode_value_fixed(
+                        new_val, loc.data_type,
+                    )?;
+                    let field_abs = row_data_abs_off + loc.offset;
+
+                    // Capture old bytes from the page (no clone of full row).
+                    let mut old_buf = [0u8; 8];
+                    old_buf[..loc.size].copy_from_slice(&b[field_abs..field_abs + loc.size]);
+
+                    // MAYBE_NOP: if the new bytes are byte-identical to the old
+                    // (e.g. SET score = score + 0.0), skip this field entirely.
+                    if old_buf[..loc.size] == new_encoded[..loc.size] {
+                        continue;
+                    }
+
+                    fw.push((field_abs, loc.size, old_buf, new_encoded));
+                    changed = true;
+                }
+                (fw, changed)
+            }; // immutable borrow on page dropped here
+
+            if !any_real_change {
+                continue;
+            }
+
+            let new_header = axiomdb_storage::heap::RowHeader {
+                txn_id_created: txn_id,
+                txn_id_deleted: 0,
+                row_version: patch.old_header.row_version.wrapping_add(1),
+                _flags: patch.old_header._flags,
+            };
+
+            // Write phase: mutable borrow — patch changed bytes directly in the
+            // page buffer (InnoDB btr_cur_upd_rec_in_place equivalent).
+            for (field_abs, size, _, new_buf) in &field_writes {
+                clustered_leaf::patch_field_in_place(&mut page, *field_abs, &new_buf[..*size])?;
+            }
+            clustered_leaf::update_row_header_in_place(&mut page, patch.idx, &new_header)?;
+
+            page_dirty = true;
+            patched += 1;
+
+            // Build WAL delta. FieldDelta.old_bytes/new_bytes are [u8;8] inline —
+            // no Vec<u8> heap allocation per field.
+            let field_deltas: Vec<axiomdb_wal::FieldDelta> = field_writes
+                .iter()
+                .map(|(field_abs, size, old_buf, new_buf)| axiomdb_wal::FieldDelta {
+                    offset: (field_abs - row_data_abs_off) as u16,
+                    size: *size as u8,
+                    old_bytes: *old_buf,
+                    new_bytes: *new_buf,
+                })
+                .collect();
+
+            wal_patches.push(axiomdb_wal::ClusteredFieldPatchEntry {
+                key: patch.key.clone(),
+                old_header: patch.old_header,
+                new_header,
+                old_row_data: Vec::new(),
+                field_deltas,
+            });
+        }
+
+        if page_dirty {
+            page.update_checksum();
+            storage.write_page(page_id, &page)?;
+        }
+
+        // Batch WAL with compact field deltas (not full row images).
+        if !wal_patches.is_empty() {
+            txn.record_clustered_field_patch_batch(
+                resolved.def.id,
+                root_pid,
+                &wal_patches,
+            )?;
+        }
+
+        if current == clustered_leaf::NULL_PAGE {
+            break;
+        }
+        if next != clustered_leaf::NULL_PAGE {
+            storage.prefetch_hint(next, 4);
+        }
+        current = next;
+        slot_idx = 0;
+    }
+
+    if patched > 0 {
+        ctx.stats.on_rows_changed(resolved.def.id, patched);
+    }
+    ctx.invalidate_all();
+
+    Ok(QueryResult::Affected {
+        count: matched,
+        last_insert_id: None,
+    })
+}
+
 /// Three update paths:
 /// 1. Non-key in-place: `update_in_place()` when PK and index keys unchanged
 /// 2. Non-key relocation: `update_with_relocation()` when row grows beyond leaf
 /// 3. Key change: `delete_mark()` + `insert()` when PK changes
+#[allow(clippy::too_many_arguments)]
 fn execute_clustered_update(
     where_clause: Option<Expr>,
     assignments: Vec<(usize, Expr)>,
@@ -586,6 +963,8 @@ fn execute_clustered_update(
     bloom: &mut crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    use std::ops::Bound;
+
     let col_types: Vec<axiomdb_types::DataType> = schema_cols
         .iter()
         .map(|c| crate::table::column_type_to_data_type(c.col_type))
@@ -600,15 +979,81 @@ fn execute_clustered_update(
     let mut root_pid = txn
         .clustered_root(resolved.def.id)
         .unwrap_or(resolved.def.root_page_id);
+
+    // ── Fused clustered scan-patch fast path ─────────────────────────────
+    // When ALL of these hold, skip candidate collection entirely and patch
+    // fields directly on clustered leaf pages in a single pass:
+    //   1. All SET cols fixed-size (field_patch eligible)
+    //   2. No FK constraints
+    //   3. No secondary indexes with changed key columns
+    //   4. PK columns not changed
+    let field_patch_ok = resolved.foreign_keys.is_empty()
+        && assignments.iter().all(|(col_pos, _)| {
+            axiomdb_types::field_patch::fixed_encoded_size(col_types[*col_pos]).is_some()
+        });
+    let pk_might_change = assignments.iter().any(|(col_pos, _)| pk_col_positions.contains(col_pos));
+    let has_affected_secondary = secondary_indexes.iter().any(|idx| {
+        !idx.is_primary
+            && idx.columns.iter().any(|c| {
+                assignments.iter().any(|(a_pos, _)| *a_pos == c.col_idx as usize)
+            })
+    });
+
+    let access_method = where_clause
+        .as_ref()
+        .map(|wc| {
+            normalize_clustered_update_access_method(crate::planner::plan_update_candidates_ctx(
+                wc,
+                secondary_indexes,
+                schema_cols,
+                ctx.effective_collation(),
+            ))
+        })
+        .unwrap_or(crate::planner::AccessMethod::Scan);
+
+    if field_patch_ok && !pk_might_change && !has_affected_secondary {
+        let bounds = match &access_method {
+            crate::planner::AccessMethod::Scan => {
+                Some((Bound::Unbounded, Bound::Unbounded))
+            }
+            crate::planner::AccessMethod::IndexLookup { index_def, key } if index_def.is_primary => {
+                Some((Bound::Included(key.clone()), Bound::Included(key.clone())))
+            }
+            crate::planner::AccessMethod::IndexRange { index_def, lo, hi } if index_def.is_primary => {
+                Some((
+                    lo.clone().map_or(Bound::Unbounded, Bound::Included),
+                    hi.clone().map_or(Bound::Unbounded, Bound::Included),
+                ))
+            }
+            _ => None,
+        };
+
+        if let Some((from, to)) = bounds {
+            return fused_clustered_scan_patch(
+                where_clause.as_ref(),
+                &assignments,
+                &col_types,
+                storage,
+                txn,
+                snap,
+                resolved,
+                root_pid,
+                ctx,
+                from,
+                to,
+            );
+        }
+    }
+
     let candidates = collect_clustered_update_candidates(
         where_clause.as_ref(),
         schema_cols,
         secondary_indexes,
+        &access_method,
         storage,
         snap,
         resolved,
         root_pid,
-        ctx.effective_collation(),
     )?;
 
     if candidates.is_empty() {
@@ -662,7 +1107,44 @@ fn execute_clustered_update(
         let pk_changed = pk_col_positions
             .iter()
             .any(|&pos| candidate.values[pos] != new_values[pos]);
-        let new_row_data = axiomdb_types::codec::encode_row(&new_values, &col_types)?;
+
+        // Field-patch optimization: when all changed columns are fixed-size
+        // and PK is unchanged, patch bytes directly in the existing row_data
+        // instead of full encode_row(). Saves ~16× per row.
+        let field_patch_ok = !pk_changed
+            && assignments.iter().all(|(col_pos, _)| {
+                axiomdb_types::field_patch::fixed_encoded_size(col_types[*col_pos]).is_some()
+            });
+
+        let new_row_data = if field_patch_ok {
+            // Patch only changed fields in a copy of the existing row_data.
+            let mut patched = candidate.row_data.clone();
+            let bitmap_len = col_types.len().div_ceil(8);
+            let bitmap = patched[..bitmap_len].to_vec();
+            for &(col_pos, _) in &assignments {
+                if candidate.values[col_pos] == new_values[col_pos] {
+                    continue;
+                }
+                if let Some(loc) =
+                    axiomdb_types::field_patch::compute_field_location_runtime(
+                        &col_types,
+                        col_pos,
+                        &bitmap,
+                        Some(&patched),
+                    )
+                {
+                    let _ = axiomdb_types::field_patch::write_field(
+                        &mut patched,
+                        &loc,
+                        &new_values[col_pos],
+                    );
+                }
+            }
+            patched
+        } else {
+            axiomdb_types::codec::encode_row(&new_values, &col_types)?
+        };
+
         let old_image =
             axiomdb_wal::ClusteredRowImage::new(root_pid, candidate.row_header, &candidate.row_data);
 
@@ -837,6 +1319,7 @@ fn execute_clustered_update(
 
 /// Standard UPDATE path: processes pre-collected candidate rows through
 /// expression evaluation, FK validation, and field-patch or full-encode paths.
+#[allow(clippy::too_many_arguments)]
 fn execute_update_with_candidates(
     candidate_rows: Vec<(RecordId, Vec<Value>)>,
     assignments: Vec<(usize, Expr)>,
@@ -942,7 +1425,7 @@ fn execute_update_with_candidates(
     }
 
     let compiled_preds =
-        crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;
+        crate::partial_index::compile_index_predicates(secondary_indexes, schema_cols)?;
 
     // ── Field-level patch fast path (InnoDB-inspired) ────────────────────
     // If ALL changed columns are fixed-size (Int, BigInt, Real, Bool, Date,
@@ -1045,7 +1528,7 @@ fn execute_update_with_candidates(
                                 &page.as_bytes()[row_start..row_start + row_len];
                             if let Some(loc) =
                                 axiomdb_types::field_patch::compute_field_location_runtime(
-                                    &col_types,
+                                    col_types,
                                     *col_pos,
                                     &bitmap,
                                     Some(row_data_slice),
@@ -1065,7 +1548,7 @@ fn execute_update_with_candidates(
                                 &page.as_bytes()[row_start..row_start + row_len];
                             if let Some(loc) =
                                 axiomdb_types::field_patch::compute_field_location_runtime(
-                                    &col_types,
+                                    col_types,
                                     col_pos,
                                     &bitmap,
                                     Some(row_data_slice),
@@ -1148,7 +1631,7 @@ fn execute_update_with_candidates(
         storage,
         txn,
         &resolved.def,
-        &schema_cols,
+        schema_cols,
         ctx,
         heap_updates,
     )?;
@@ -1159,7 +1642,7 @@ fn execute_update_with_candidates(
             .zip(new_rids.iter())
             .all(|((old_rid, _, _), new_rid)| old_rid == new_rid);
         let any_index_affected =
-            statement_might_affect_indexes(&secondary_indexes, &compiled_preds, &assignments);
+            statement_might_affect_indexes(secondary_indexes, &compiled_preds, &assignments);
 
         if any_index_affected || !all_rids_stable {
             let mut current_indexes = secondary_indexes.to_vec();

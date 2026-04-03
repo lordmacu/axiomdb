@@ -1,10 +1,11 @@
 use std::ops::Bound;
 
 use axiomdb_storage::{
+    clustered_leaf,
     clustered_tree::{self, ClusteredRow},
-    MemoryStorage, RowHeader,
+    MemoryStorage, RowHeader, StorageEngine,
 };
-use axiomdb_wal::{ClusteredRowImage, TxnManager};
+use axiomdb_wal::{ClusteredFieldPatchEntry, ClusteredRowImage, FieldDelta, TxnManager};
 use tempfile::TempDir;
 
 const TABLE_ID: u32 = 39;
@@ -26,6 +27,85 @@ fn row_header(txn_id: u64) -> RowHeader {
 
 fn row_image(root_pid: u64, row: &ClusteredRow) -> ClusteredRowImage {
     ClusteredRowImage::new(root_pid, row.row_header, &row.row_data)
+}
+
+fn apply_clustered_field_patch(
+    storage: &mut MemoryStorage,
+    mgr: &mut TxnManager,
+    root_pid: u64,
+    txn_id: u64,
+    key: &[u8],
+    offset: usize,
+    old_bytes: &[u8],
+    new_bytes: &[u8],
+) {
+    let leaf = clustered_tree::descend_to_leaf_pub(storage, root_pid, key)
+        .expect("descend to clustered leaf");
+    let pos = clustered_leaf::search(&leaf, key).expect("find clustered row");
+    let cell = clustered_leaf::read_cell(&leaf, pos as u16).expect("read clustered cell");
+    let old_header = cell.row_header;
+    let total_row_len = cell.total_row_len;
+    let old_row_data = cell.row_data.to_vec();
+    let overflow_first_page = cell.overflow_first_page;
+
+    assert_eq!(
+        &old_row_data[offset..offset + old_bytes.len()],
+        old_bytes,
+        "field patch test must patch the expected bytes"
+    );
+
+    let mut patched_row_data = old_row_data.clone();
+    patched_row_data[offset..offset + new_bytes.len()].copy_from_slice(new_bytes);
+
+    let new_header = RowHeader {
+        txn_id_created: txn_id,
+        txn_id_deleted: 0,
+        row_version: old_header.row_version + 1,
+        _flags: old_header._flags,
+    };
+
+    let mut page = leaf.into_page();
+    clustered_leaf::rewrite_cell_same_key_with_overflow(
+        &mut page,
+        pos,
+        key,
+        &new_header,
+        total_row_len,
+        &patched_row_data,
+        overflow_first_page,
+    )
+    .expect("rewrite clustered row for field patch")
+    .expect("field patch rewrite must stay on the same leaf");
+    page.update_checksum();
+    storage
+        .write_page(page.header().page_id, &page)
+        .expect("write patched clustered leaf");
+
+    mgr.record_clustered_field_patch_batch(
+        TABLE_ID,
+        root_pid,
+        &[ClusteredFieldPatchEntry {
+            key: key.to_vec(),
+            old_header,
+            new_header,
+            old_row_data,
+            field_deltas: vec![FieldDelta {
+                offset: offset as u16,
+                size: old_bytes.len() as u8,
+                old_bytes: {
+                    let mut arr = [0u8; 8];
+                    arr[..old_bytes.len()].copy_from_slice(old_bytes);
+                    arr
+                },
+                new_bytes: {
+                    let mut arr = [0u8; 8];
+                    arr[..new_bytes.len()].copy_from_slice(new_bytes);
+                    arr
+                },
+            }],
+        }],
+    )
+    .expect("record clustered field patch");
 }
 
 fn collect_rows(
@@ -299,6 +379,88 @@ fn crash_recovery_restores_relocate_update_logically() {
 
     let rows = collect_rows(&storage, recovered_root, &mgr2.snapshot());
     assert_eq!(rows.len(), 7);
+}
+
+#[test]
+fn crash_recovery_undoes_uncommitted_clustered_field_patch() {
+    let (_dir, wal_path) = temp_wal();
+    let mut storage = MemoryStorage::new();
+    let mut mgr = TxnManager::create(&wal_path).expect("create wal");
+
+    let txn1 = mgr.begin().expect("begin seed txn");
+    let key = b"pk-field-patch";
+    let original = b"abcdefghijklmnop".to_vec();
+    let root = clustered_tree::insert(&mut storage, None, key, &row_header(txn1), &original)
+        .expect("seed clustered row");
+    let image = ClusteredRowImage::new(root, row_header(txn1), &original);
+    mgr.record_clustered_insert(TABLE_ID, key, &image)
+        .expect("record seed insert");
+    mgr.commit().expect("commit seed txn");
+
+    let root = mgr
+        .clustered_root(TABLE_ID)
+        .expect("clustered root after seed");
+    let txn2 = mgr.begin().expect("begin field patch txn");
+    apply_clustered_field_patch(&mut storage, &mut mgr, root, txn2, key, 4, b"efgh", b"WXYZ");
+    drop(mgr);
+
+    let (mgr2, result) = TxnManager::open_with_recovery(&mut storage, &wal_path)
+        .expect("recover clustered field patch");
+    let recovered_root = result
+        .clustered_roots
+        .get(&TABLE_ID)
+        .copied()
+        .expect("recovered clustered root");
+
+    let restored = clustered_tree::lookup(&storage, Some(recovered_root), key, &mgr2.snapshot())
+        .expect("lookup restored row")
+        .expect("row restored after clustered field patch recovery");
+    assert_eq!(restored.row_data, original);
+    assert_eq!(restored.row_header.txn_id_created, txn1);
+    assert_eq!(restored.row_header.txn_id_deleted, 0);
+    assert_eq!(restored.row_header.row_version, 0);
+}
+
+#[test]
+fn clean_reopen_handles_committed_clustered_field_patch_entries() {
+    let (_dir, wal_path) = temp_wal();
+    let mut storage = MemoryStorage::new();
+    let mut mgr = TxnManager::create(&wal_path).expect("create wal");
+
+    let txn1 = mgr.begin().expect("begin seed txn");
+    let key = b"pk-field-patch";
+    let original = b"abcdefghijklmnop".to_vec();
+    let root = clustered_tree::insert(&mut storage, None, key, &row_header(txn1), &original)
+        .expect("seed clustered row");
+    let image = ClusteredRowImage::new(root, row_header(txn1), &original);
+    mgr.record_clustered_insert(TABLE_ID, key, &image)
+        .expect("record seed insert");
+    mgr.commit().expect("commit seed txn");
+
+    let root = mgr
+        .clustered_root(TABLE_ID)
+        .expect("clustered root after seed");
+    let txn2 = mgr.begin().expect("begin field patch txn");
+    apply_clustered_field_patch(&mut storage, &mut mgr, root, txn2, key, 4, b"efgh", b"WXYZ");
+    mgr.commit().expect("commit field patch txn");
+    drop(mgr);
+
+    let (mgr2, result) = TxnManager::open_with_recovery(&mut storage, &wal_path)
+        .expect("clean reopen with recovery");
+    assert_eq!(result.undone_txns, 0);
+
+    let recovered_root = result
+        .clustered_roots
+        .get(&TABLE_ID)
+        .copied()
+        .expect("recovered clustered root");
+    let patched = clustered_tree::lookup(&storage, Some(recovered_root), key, &mgr2.snapshot())
+        .expect("lookup patched row")
+        .expect("patched row survives clean reopen");
+    assert_eq!(patched.row_data, b"abcdWXYZijklmnop".to_vec());
+    assert_eq!(patched.row_header.txn_id_created, txn2);
+    assert_eq!(patched.row_header.txn_id_deleted, 0);
+    assert_eq!(patched.row_header.row_version, 1);
 }
 
 #[test]

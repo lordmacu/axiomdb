@@ -704,6 +704,11 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                     feature: "ALTER TABLE MODIFY COLUMN — Phase N".into(),
                 });
             }
+            // REBUILD — convert heap table to clustered format (Phase 39.19)
+            Token::Ident(s) if s.eq_ignore_ascii_case("rebuild") => {
+                p.advance();
+                AlterTableOp::Rebuild
+            }
             _ => break,
         };
         operations.push(op);

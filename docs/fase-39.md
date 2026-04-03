@@ -1,6 +1,6 @@
 # Phase 39 — Clustered Index Storage Engine
 
-## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7, 39.8, 39.9, 39.10, 39.11, 39.12, 39.13, 39.14, 39.15, 39.16, 39.17, 39.18
+## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7, 39.8, 39.9, 39.10, 39.11, 39.12, 39.13, 39.14, 39.15, 39.16, 39.17, 39.18, 39.19, 39.21, 39.22
 
 ## What was built
 
@@ -1212,3 +1212,79 @@ scan.
   `INSERT` now works on clustered tables and writes directly through the
   clustered tree plus clustered secondary bookmarks, but clustered SQL reads and
   later mutators still remain deferred.
+- `39.22` eliminates 5 heap allocations per matched UPDATE row:
+  `fused_clustered_scan_patch` now reads and writes field bytes directly in the
+  page buffer via `patch_field_in_place` (InnoDB `btr_cur_upd_rec_in_place`
+  equivalent), `FieldDelta` uses `[u8;8]` inline arrays instead of `Vec<u8>`,
+  and ROLLBACK is handled by the new `UndoClusteredFieldPatch` undo op which
+  reverses only the changed bytes without restoring a full row image. Overflow
+  rows fall back to the existing full-rewrite path.
+
+### 39.22 — UPDATE in-place zero-alloc patch
+
+**Root cause eliminated:** `fused_clustered_scan_patch` previously made 5 heap
+allocations per matched row:
+1. `local_row_data: cell.row_data.to_vec()` — full row clone for phase-1 offset scan
+2. `patched_data = ...clone()` — full row clone for mutation
+3. `encode_cell_image()` in `rewrite_cell_same_key_with_overflow` — new Vec
+4. `FieldDelta.old_bytes: Vec<u8>` — per-field WAL old bytes
+5. `FieldDelta.new_bytes: Vec<u8>` — per-field WAL new bytes
+
+For 25K rows this was ~125K allocations per UPDATE statement.
+
+**New fast path (inline cells — >99% of rows):**
+
+```
+Phase 1: Collect PatchInfo (immutable borrow on scan loop)
+         - No row_data clone
+         - Stores changed_fields: Vec<(col_pos, new_value)>
+
+Phase 2: Per-page patch loop (one read+write per leaf page)
+   Read phase (immutable borrow):
+     cell_row_data_abs_off(&page, idx) → (abs_off, key_len)  // no clone
+     compute_field_location_runtime(row_slice, bitmap) → FieldLocation
+     MAYBE_NOP: old_bytes == new_encoded? → skip field
+     Capture: old_buf: [u8;8] from page bytes
+   Write phase (mutable borrow):
+     patch_field_in_place(&mut page, field_abs, new_bytes)
+     update_row_header_in_place(&mut page, idx, &new_header)
+   WAL: FieldDelta { offset: u16, size: u8, old_bytes: [u8;8], new_bytes: [u8;8] }
+```
+
+**New page primitives** (`crates/axiomdb-storage/src/clustered_leaf.rs`):
+- `cell_row_data_abs_off(page, idx)` → `(row_data_abs_off, key_len)`: computes
+  absolute page offset of row_data without decoding the cell
+- `patch_field_in_place(page, field_abs_off, bytes)`: writes bytes at exact page offset
+- `update_row_header_in_place(page, idx, header)`: writes RowHeader without cloning
+
+**`FieldDelta` change** (`crates/axiomdb-wal/src/clustered.rs`):
+```rust
+// Before
+pub struct FieldDelta { pub offset: u16, pub size: u8, pub old_bytes: Vec<u8>, pub new_bytes: Vec<u8> }
+// After
+pub struct FieldDelta { pub offset: u16, pub size: u8, pub old_bytes: [u8;8], pub new_bytes: [u8;8] }
+```
+WAL serialization is byte-identical (only `size` bytes are written); existing
+recovery code works unchanged.
+
+**ROLLBACK via `UndoClusteredFieldPatch`** (`crates/axiomdb-wal/src/txn.rs`):
+Previous path stored `UndoClusteredRestore` with `old_row_data: Vec::new()`,
+causing ROLLBACK to write empty rows (corrupting the clustered cell). New variant:
+```rust
+UndoClusteredFieldPatch {
+    table_id: u32,
+    key: Vec<u8>,
+    old_header: RowHeader,
+    field_deltas: Vec<FieldDelta>,  // [u8;8] per field — no heap per field
+}
+```
+Handler: descend to leaf → search for key → for each delta, write `old_bytes`
+back at `row_data_abs_off + delta.offset`, then restore header.
+
+**Test coverage:**
+- `clustered_update_inplace_fixed_rollback` — ROLLBACK via UndoClusteredFieldPatch
+- `clustered_update_inplace_maybe_nop_same_bytes` — Value-level NOP detection
+- `clustered_update_inplace_mixed_schema_text_before_target` — runtime offset scan
+- `clustered_update_inplace_multiple_fixed_columns` — multi-field WAL + rollback
+- 7 wire-test assertions covering single-field patch, multi-field patch,
+  ROLLBACK restore, and TEXT-before-INT schema

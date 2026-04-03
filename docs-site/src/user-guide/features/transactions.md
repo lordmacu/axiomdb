@@ -47,10 +47,17 @@ image. Phase `39.13` makes the first SQL-visible clustered cut: `CREATE TABLE`
 with an explicit `PRIMARY KEY` now creates clustered metadata and a clustered
 table root. Phase `39.14` extends that cut to clustered `INSERT`: SQL writes
 now record clustered WAL/undo directly against the clustered PK tree, and
-Phase `39.15` opens clustered `SELECT` over that same storage, and Phase
+Phase `39.15` opens clustered `SELECT` over that same storage, Phase
 `39.16` extends the same transaction contract to clustered `UPDATE`, and
 `39.17` now extends it to clustered `DELETE` as delete-mark plus exact
-row-image undo.
+row-image undo. `39.18` adds clustered `VACUUM`: once a clustered delete-mark
+is old enough to be physically safe, `VACUUM table_name` purges the dead row,
+frees any overflow chain it owned, and cleans dead bookmark entries from
+clustered secondary indexes. `39.22` adds zero-allocation in-place UPDATE: when
+all SET columns are fixed-size (INT, BIGINT, REAL, BOOL, DATE, TIMESTAMP),
+field bytes are patched directly in the page buffer without decoding the row,
+and ROLLBACK reverses only the changed bytes via `UndoClusteredFieldPatch` —
+no full row image stored in the undo log.
 
 ```sql
 CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE);

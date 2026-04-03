@@ -520,10 +520,10 @@ impl AggAccumulator {
 /// model and DataFusion's type-specialized accumulator updates.
 ///
 /// Widening rules (same as SQL standard):
-///   Int  + Int    → Int  (checked; Overflow on wrap)
-///   Int  + BigInt → BigInt (checked)
-///   *    + Real   → Real  (lossless widening for aggregation purposes)
-///   Decimal + Decimal → Decimal (same scale required)
+/// - `Int  + Int`    → `Int`  (checked; Overflow on wrap)
+/// - `Int  + BigInt` → `BigInt` (checked)
+/// - `*    + Real`   → `Real`  (lossless widening for aggregation purposes)
+/// - `Decimal + Decimal` → `Decimal` (same scale required)
 fn value_agg_add(a: Value, b: Value) -> Result<Value, DbError> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x

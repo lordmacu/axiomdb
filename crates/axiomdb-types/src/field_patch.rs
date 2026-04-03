@@ -148,6 +148,16 @@ pub fn write_field(
     Ok(old_bytes)
 }
 
+/// Encodes a single `Value` to its fixed-size byte representation as `[u8; 8]`.
+///
+/// Only `size` bytes (from `fixed_encoded_size`) are meaningful; the rest are
+/// zeroed. Used by the zero-alloc UPDATE fast path to build WAL `FieldDelta`
+/// entries and to supply `new_bytes` to `patch_field_in_place` without
+/// allocating a `Vec<u8>`.
+pub fn encode_value_fixed(value: &Value, dt: DataType) -> Result<[u8; 8], DbError> {
+    encode_field_value(value, dt)
+}
+
 /// Encodes a single Value to its fixed-size byte representation.
 fn encode_field_value(value: &Value, dt: DataType) -> Result<[u8; 8], DbError> {
     let mut buf = [0u8; 8];

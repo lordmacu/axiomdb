@@ -8,7 +8,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              5.21 (transactional INSERT staging), 6.19 (WAL fsync pipeline smoke),
              6.20 (UPDATE apply fast path smoke), 22b.3a (database catalog wire smoke),
              39.18 (clustered VACUUM smoke), 39.19 (clustered REBUILD guard rails),
-             39.21 (aggregate hash execution — zero-alloc clustered scan)
+             39.21 (aggregate hash execution — zero-alloc clustered scan),
+             39.22 (UPDATE in-place zero-alloc: single/multi field patch, rollback, TEXT-before-INT)
 """
 import os
 import signal
@@ -2452,6 +2453,60 @@ ok("39.21 MIN(score) = 1.0", abs(float(min_max[0]) - 1.0) < 0.001, min_max[0])
 ok("39.21 MAX(score) = 60.0", abs(float(min_max[1]) - 60.0) < 0.001, min_max[1])
 
 conn_agg.close()
+
+# ── 39.22 UPDATE in-place zero-alloc patch ────────────────────────────────────
+
+print("\n[39.22 clustered UPDATE in-place zero-alloc]")
+conn_upd = pymysql.connect(host="127.0.0.1", port=PORT, user="root",
+                           password="root",
+                           charset="utf8mb4", autocommit=True)
+cu = conn_upd.cursor()
+
+# Setup: all-fixed schema (no TEXT columns before targets) — exercises fast path
+cu.execute("DROP TABLE IF EXISTS upd22_scores")
+cu.execute(
+    "CREATE TABLE upd22_scores (id INT NOT NULL, level INT NOT NULL, "
+    "points INT NOT NULL, PRIMARY KEY (id))"
+)
+cu.execute("INSERT INTO upd22_scores VALUES (1, 5, 100), (2, 3, 50), (3, 8, 200)")
+
+# Single fixed-size column patch
+cu.execute("UPDATE upd22_scores SET level = level + 1 WHERE id = 1")
+cu.execute("SELECT level FROM upd22_scores WHERE id = 1")
+ok("39.22 single INT patch level=6", cu.fetchone() == (6,))
+
+# Two fixed-size columns patched in one statement
+cu.execute("UPDATE upd22_scores SET level = level + 10, points = points * 2")
+cu.execute("SELECT level, points FROM upd22_scores WHERE id = 1")
+row = cu.fetchone()
+ok("39.22 multi-field patch id=1 level=16", row[0] == 16, row)
+ok("39.22 multi-field patch id=1 points=200", row[1] == 200, row)
+
+# ROLLBACK restores both fields via UndoClusteredFieldPatch
+conn_upd.autocommit(False)
+cu.execute("BEGIN")
+cu.execute("UPDATE upd22_scores SET level = level + 100, points = points + 1000")
+cu.execute("ROLLBACK")
+conn_upd.autocommit(True)
+cu.execute("SELECT level, points FROM upd22_scores WHERE id = 1")
+row = cu.fetchone()
+ok("39.22 rollback restores level to 16", row[0] == 16, row)
+ok("39.22 rollback restores points to 200", row[1] == 200, row)
+
+# Mixed schema: TEXT column before target INT — exercises runtime offset scan
+cu.execute("DROP TABLE IF EXISTS upd22_users")
+cu.execute(
+    "CREATE TABLE upd22_users (id INT NOT NULL, name TEXT, age INT NOT NULL, "
+    "PRIMARY KEY (id))"
+)
+cu.execute("INSERT INTO upd22_users VALUES (1, 'Alice', 30), (2, 'Bob', 25)")
+cu.execute("UPDATE upd22_users SET age = age + 5 WHERE id = 2")
+cu.execute("SELECT name, age FROM upd22_users WHERE id = 2")
+row = cu.fetchone()
+ok("39.22 TEXT-before-INT: name unchanged", row[0] == "Bob", row)
+ok("39.22 TEXT-before-INT: age patched to 30", row[1] == 30, row)
+
+conn_upd.close()
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

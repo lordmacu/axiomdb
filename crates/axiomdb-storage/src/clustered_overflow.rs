@@ -171,7 +171,13 @@ fn ensure_overflow_page(page: &Page, page_id: u64) -> Result<(), DbError> {
 
 fn next_page(page: &Page) -> u64 {
     let body = page.body();
-    u64::from_le_bytes(body[..NEXT_PAGE_SIZE].try_into().expect("slice is 8 bytes"))
+    // body() is always PAGE_BODY_SIZE (16,320 bytes) so the first 8 bytes are
+    // guaranteed to exist.  Use a fixed-size array reference instead of
+    // try_into() to avoid the need for expect/unwrap.
+    let bytes: [u8; 8] = [
+        body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
+    ];
+    u64::from_le_bytes(bytes)
 }
 
 fn set_next_page(page: &mut Page, next: u64) {

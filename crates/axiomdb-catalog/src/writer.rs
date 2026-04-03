@@ -698,6 +698,46 @@ impl<'a> CatalogWriter<'a> {
         })
     }
 
+    /// Updates the storage layout of a table (e.g., Heap → Clustered during REBUILD).
+    pub fn update_storage_layout(
+        &mut self,
+        table_id: TableId,
+        new_layout: TableStorageLayout,
+    ) -> Result<(), DbError> {
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+        let snap = self.txn.active_snapshot()?;
+        let rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = TableDef::from_bytes(&data)?;
+            if def.id == table_id {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = table_id.to_le_bytes();
+                self.txn
+                    .record_delete(SYSTEM_TABLE_TABLES, &key, &data, page_id, slot_id)?;
+
+                let new_def = TableDef {
+                    storage_layout: new_layout,
+                    ..def
+                };
+                let new_data = new_def.to_bytes();
+                let (pg2, sl2) =
+                    HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id)?;
+                self.txn
+                    .record_insert(SYSTEM_TABLE_TABLES, &key, &new_data, pg2, sl2)?;
+                return Ok(());
+            }
+        }
+        Err(DbError::Internal {
+            message: format!(
+                "update_storage_layout: table_id={table_id} not found in axiom_tables"
+            ),
+        })
+    }
+
     /// Marks the index row with `index_id` as deleted in `axiom_indexes`.
     ///
     /// # Errors

@@ -234,7 +234,9 @@ The SQL processing pipeline:
 - `39.14` adds a dedicated clustered `INSERT` branch in `executor/insert.rs`
 - `39.15` adds a dedicated clustered `SELECT` branch in `executor/select.rs`
 - `39.16` adds a dedicated clustered `UPDATE` branch in `executor/update.rs`
-- clustered `DELETE` still rejects explicitly until `39.17`
+- `39.17` adds a dedicated clustered `DELETE` branch in `executor/delete.rs`
+- `39.18` adds clustered `VACUUM` maintenance in `axiomdb-sql/src/vacuum.rs`
+- `39.19` adds legacy heap→clustered rebuild in `executor/ddl.rs`
 - Stable-RID UPDATE fast path — same-slot heap rewrite that preserves `RecordId`
   when the new encoded row fits and makes untouched-index skipping safe
 - UPDATE apply fast path — indexed UPDATE now batches candidate heap reads,
@@ -253,6 +255,9 @@ The SQL processing pipeline:
   `clustered_tree`, maintain clustered secondary bookmarks, and make rollback
   delete undo keys from the current catalog root instead of trusting stale
   pre-split roots
+- clustered rebuild branch — legacy heap+PRIMARY KEY tables now rebuild into a
+  fresh clustered root, rebuild secondaries as PK-bookmark indexes, flush those
+  new roots, then swap catalog metadata and defer old-page free until commit
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>

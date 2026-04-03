@@ -112,6 +112,16 @@ pub enum EntryType {
     /// `old_value` = encoded clustered row image before update.
     /// `new_value` = encoded clustered row image after update.
     ClusteredUpdate = 14,
+    /// Lightweight field-level patch of a clustered row.
+    ///
+    /// `key`       = primary key bytes.
+    /// `old_value` = `[RowHeader:24][num_fields:1][field_offset:2 + old_bytes:N]...`
+    /// `new_value` = `[RowHeader:24][num_fields:1][field_offset:2 + new_bytes:N]...`
+    ///
+    /// Only stores changed field bytes instead of full row images.
+    /// Used by the fused clustered scan-patch for fixed-size field updates.
+    /// Undo restores old field bytes at the given offsets.
+    ClusteredFieldPatch = 15,
 }
 
 impl TryFrom<u8> for EntryType {
@@ -133,6 +143,7 @@ impl TryFrom<u8> for EntryType {
             12 => Ok(Self::ClusteredInsert),
             13 => Ok(Self::ClusteredDeleteMark),
             14 => Ok(Self::ClusteredUpdate),
+            15 => Ok(Self::ClusteredFieldPatch),
             _ => Err(DbError::WalUnknownEntryType { byte }),
         }
     }

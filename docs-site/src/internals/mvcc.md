@@ -360,30 +360,44 @@ older snapshot.
 
 ### Index Vacuum
 
-For each non-unique, non-FK secondary index, VACUUM performs a full B-Tree scan
-and checks heap visibility for each entry. Dead entries (pointing to vacuumed or
-deleted heap slots) are batch-deleted from the B-Tree.
+For each catalog-visible B-Tree index, VACUUM performs a full B-Tree scan and
+checks heap visibility for each entry. Dead entries (pointing to vacuumed or
+deleted heap slots) are batch-deleted from the B-Tree. If bulk delete rotates
+the root, the updated root page ID is persisted back to the catalog in the same
+transaction.
 
-Unique, PK, and FK index entries are skipped — they were already deleted
-immediately during DML (Phase 7.3b).
+### Clustered Vacuum
+
+Clustered tables now use a different purge path:
+
+- descend to the leftmost clustered leaf, then walk `next_leaf`
+- purge leaf cells whose `txn_id_deleted != 0 && txn_id_deleted < oldest_safe_txn`
+- free any overflow chain owned by the purged row
+- conditionally defragment clustered leaves with high freeblock waste
+- scan clustered secondary indexes and delete only entries whose PK bookmark no
+  longer resolves to a physically present clustered row
+
+This last rule is important: clustered secondary cleanup uses **physical
+existence after purge**, not snapshot visibility. An uncommitted clustered
+delete is invisible to the writer snapshot, but it is not safe to purge.
 
 ### What VACUUM Does Not Do (Yet)
 
-- **Page compaction:** dead slots are zeroed but the physical space is not
-  reclaimed for new inserts. A future `VACUUM FULL` will defragment pages.
+- **VACUUM FULL / table rewrite:** heap pages still do slot-level cleanup only,
+  while clustered pages only do local defragmentation; there is no full-table
+  rewrite pass yet.
 - **Automatic triggering:** VACUUM must be invoked manually via SQL. Autovacuum
   with threshold-based triggering is planned.
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
-<span class="callout-label">Design Decision — Slot-Level Vacuum Without Compaction</span>
+<span class="callout-label">Design Decision — Heap Vacuum Without FSM</span>
 PostgreSQL's lazy vacuum marks dead line pointers as <code>LP_UNUSED</code> and
-updates a free space map (FSM) so the space can be reused. AxiomDB takes the
-simpler first step: dead slots are zeroed (making scans faster) but the physical
-space is not yet reusable. This avoids the complexity of a free space map and
-RecordId stability during compaction. Full space reclamation is planned as a
-separate enhancement.
+updates a free space map (FSM) so the space can be reused. AxiomDB keeps the
+heap path simpler: dead slots are zeroed but heap pages are not compacted or
+tracked through an FSM yet. Clustered VACUUM now does local leaf defragmentation
+instead, while full-table rewrite remains a separate enhancement.
 </div>
 </div>
 
@@ -420,6 +434,60 @@ locking. Under the current RwLock model all slots are 0 during flush (writer
 has exclusive access), so the behavior is identical to the previous
 <code>u64::MAX</code> sentinel. The infrastructure is forward-compatible with
 future concurrent reader+writer models.
+</div>
+</div>
+
+---
+
+## Clustered UPDATE In-Place Undo (Phase 39.22)
+
+### UndoClusteredFieldPatch
+
+When `fused_clustered_scan_patch` applies zero-allocation in-place UPDATE
+(writing only the changed field bytes directly into the page buffer), the WAL
+undo log records a `UndoClusteredFieldPatch` entry instead of the full-row-image
+`UndoClusteredRestore`:
+
+```rust
+UndoClusteredFieldPatch {
+    table_id: u32,
+    key: Vec<u8>,            // PK bytes for leaf descent
+    old_header: RowHeader,   // txn_id_created, row_version to restore
+    field_deltas: Vec<FieldDelta>,  // each carries [u8;8] old_bytes
+}
+```
+
+On ROLLBACK, the handler:
+1. Looks up the clustered root via `clustered_roots`
+2. Descends to the owning leaf via `clustered_tree::descend_to_leaf_pub`
+3. Searches for the cell by PK key via `clustered_leaf::search`
+4. For each `FieldDelta`, computes `field_abs_off = row_data_abs_off + delta.offset` and calls `patch_field_in_place` with `delta.old_bytes[..delta.size]`
+5. Restores the `RowHeader` via `update_row_header_in_place`
+
+This is O(fields_changed × 1) per row, vs O(row_size) for a full `UndoClusteredRestore`.
+
+### FieldDelta Inline Arrays
+
+`FieldDelta` stores field bytes as fixed-size `[u8;8]` arrays (InnoDB field
+values for fixed-size types are at most 8 bytes for BIGINT/REAL):
+
+```rust
+// Before Phase 39.22
+pub struct FieldDelta { pub offset: u16, pub size: u8, pub old_bytes: Vec<u8>, pub new_bytes: Vec<u8> }
+
+// After Phase 39.22
+pub struct FieldDelta { pub offset: u16, pub size: u8, pub old_bytes: [u8;8], pub new_bytes: [u8;8] }
+```
+
+WAL serialization writes only `size` bytes, so the on-disk format is identical.
+Recovery code reads back `(u16, u8, &[u8])` tuples and copies them into `[u8;8]`
+arrays — no heap allocation during recovery either.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Zero Heap Per Field vs InnoDB / MariaDB</span>
+InnoDB's undo records for in-place UPDATE store old field bytes in dynamically allocated undo page segments. AxiomDB's <code>UndoClusteredFieldPatch</code> stores them as inline <code>[u8;8]</code> arrays in the undo log entry — no heap allocation per field per row. For <code>UPDATE t SET score = score + 1</code> across 25K rows, this eliminates ~50K allocations vs the old <code>Vec&lt;u8&gt;</code>-per-delta approach.
 </div>
 </div>
 
