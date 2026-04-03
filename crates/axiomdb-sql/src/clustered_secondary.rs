@@ -518,4 +518,132 @@ mod tests {
             DbError::UniqueViolation { ref index_name, .. } if index_name == "uq_email"
         ));
     }
+
+    #[test]
+    fn entry_from_row_with_null_secondary_returns_none() {
+        let layout = ClusteredSecondaryLayout::derive(
+            &secondary_idx("idx_status", false, &[2]),
+            &primary_idx(&[0]),
+        )
+        .unwrap();
+        // Column 2 (secondary key) is NULL → no index entry.
+        let row = vec![Value::Int(1), Value::Text("payload".into()), Value::Null];
+        assert!(layout.entry_from_row(&row).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_row_removes_entry_from_index() {
+        let mut storage = MemoryStorage::new();
+        let root = AtomicU64::new(alloc_index_root(&mut storage));
+        let layout = ClusteredSecondaryLayout::derive(
+            &secondary_idx("idx_status", false, &[2]),
+            &primary_idx(&[0]),
+        )
+        .unwrap();
+
+        let row = vec![
+            Value::Int(5),
+            Value::Text("payload".into()),
+            Value::Text("active".into()),
+        ];
+        assert!(layout.insert_row(&mut storage, &root, &row).unwrap());
+
+        // Verify entry exists.
+        let before = layout
+            .scan_prefix(
+                &storage,
+                root.load(Ordering::Acquire),
+                &[Value::Text("active".into())],
+            )
+            .unwrap();
+        assert_eq!(before.len(), 1);
+
+        // Delete it.
+        assert!(layout.delete_row(&mut storage, &root, &row).unwrap());
+
+        // Verify entry gone.
+        let after = layout
+            .scan_prefix(
+                &storage,
+                root.load(Ordering::Acquire),
+                &[Value::Text("active".into())],
+            )
+            .unwrap();
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn update_row_replace_deletes_old_and_inserts_new() {
+        let mut storage = MemoryStorage::new();
+        let root = AtomicU64::new(alloc_index_root(&mut storage));
+        let layout = ClusteredSecondaryLayout::derive(
+            &secondary_idx("idx_status", false, &[2]),
+            &primary_idx(&[0]),
+        )
+        .unwrap();
+
+        let old_row = vec![
+            Value::Int(1),
+            Value::Text("payload".into()),
+            Value::Text("active".into()),
+        ];
+        layout.insert_row(&mut storage, &root, &old_row).unwrap();
+
+        let new_row = vec![
+            Value::Int(1),
+            Value::Text("payload".into()),
+            Value::Text("inactive".into()),
+        ];
+        let outcome = layout
+            .update_row(&mut storage, &root, &old_row, &new_row)
+            .unwrap();
+        assert_eq!(outcome, ClusteredSecondaryUpdateOutcome::Replaced);
+
+        // Old key gone.
+        let old_entries = layout
+            .scan_prefix(
+                &storage,
+                root.load(Ordering::Acquire),
+                &[Value::Text("active".into())],
+            )
+            .unwrap();
+        assert!(old_entries.is_empty());
+
+        // New key present.
+        let new_entries = layout
+            .scan_prefix(
+                &storage,
+                root.load(Ordering::Acquire),
+                &[Value::Text("inactive".into())],
+            )
+            .unwrap();
+        assert_eq!(new_entries.len(), 1);
+        assert_eq!(new_entries[0].primary_key, vec![Value::Int(1)]);
+    }
+
+    #[test]
+    fn composite_secondary_key_encodes_and_decodes_correctly() {
+        let layout = ClusteredSecondaryLayout::derive(
+            &secondary_idx("idx_status_name", false, &[2, 1]),
+            &primary_idx(&[0]),
+        )
+        .unwrap();
+        assert_eq!(layout.secondary_cols, vec![2, 1]);
+        assert_eq!(layout.suffix_cols, vec![0]); // PK col 0 not in secondary
+        assert_eq!(layout.physical_value_count(), 3); // 2 sec + 1 suffix
+
+        let row = vec![
+            Value::Int(42),
+            Value::Text("Alice".into()),
+            Value::Text("active".into()),
+        ];
+        let entry = layout.entry_from_row(&row).unwrap().unwrap();
+        let decoded = layout.decode_entry_key(&entry.physical_key).unwrap();
+
+        assert_eq!(
+            decoded.logical_key,
+            vec![Value::Text("active".into()), Value::Text("Alice".into())]
+        );
+        assert_eq!(decoded.primary_key, vec![Value::Int(42)]);
+    }
 }

@@ -573,6 +573,9 @@ pub async fn handle_connection_with_timeouts(
                                     .as_deref()
                                     .unwrap_or("STRICT_TRANS_TABLES"),
                             );
+                            session.on_error = conn_state.on_error();
+                            session.compat_mode = conn_state.compat_mode();
+                            session.explicit_collation = conn_state.explicit_collation();
                             reader.decoder_mut().set_max_payload_len(
                                 conn_state
                                     .max_allowed_packet_bytes()

@@ -50,7 +50,7 @@ use axiomdb_storage::{
     Page, PageType, StorageEngine,
 };
 use axiomdb_types::{DataType, Value};
-use axiomdb_wal::{Savepoint, TxnManager};
+use axiomdb_wal::{IndexUndoRecord, Savepoint, TxnManager};
 
 use crate::{
     ast::{
@@ -395,21 +395,47 @@ fn rollback_with_index_undo(
     // Collect index insert undos BEFORE rollback (rollback consumes the undo log).
     let index_undos = txn.collect_index_undos();
     let mut current_roots = load_current_index_roots(txn, storage, &index_undos)?;
-    for (index_id, root_page_id, key) in &index_undos {
+    for undo in &index_undos {
+        let (index_id, fallback_root) = match undo {
+            IndexUndoRecord::DeleteInserted {
+                index_id,
+                root_page_id,
+                ..
+            }
+            | IndexUndoRecord::RestoreDeleted {
+                index_id,
+                root_page_id,
+                ..
+            } => (*index_id, *root_page_id),
+        };
         let current_root = current_roots
-            .get(index_id)
+            .get(&index_id)
             .copied()
-            .unwrap_or(*root_page_id);
+            .unwrap_or(fallback_root);
         let root = std::sync::atomic::AtomicU64::new(current_root);
-        // Best-effort: if the key is already absent (idempotent), ignore the error.
-        let _ = BTree::delete_in(storage, &root, key);
-        bloom.mark_dirty(*index_id);
-        // If the root changed, update the catalog.
+
+        match undo {
+            IndexUndoRecord::DeleteInserted { key, .. } => {
+                // Best-effort: if the key is already absent (idempotent), ignore the error.
+                let _ = BTree::delete_in(storage, &root, key);
+                bloom.mark_dirty(index_id);
+            }
+            IndexUndoRecord::RestoreDeleted {
+                key,
+                rid,
+                fillfactor,
+                ..
+            } => {
+                BTree::insert_in(storage, &root, key, *rid, *fillfactor)?;
+                bloom.add(index_id, key);
+            }
+        }
+
         let new_root = root.load(std::sync::atomic::Ordering::Acquire);
-        current_roots.insert(*index_id, new_root);
+        current_roots.insert(index_id, new_root);
         if new_root != current_root {
             if let Ok(mut cw) = CatalogWriter::new(storage, txn) {
-                let _ = cw.update_index_root(*index_id, new_root);
+                let _ = cw.update_index_root(index_id, new_root);
             }
         }
     }
@@ -425,19 +451,46 @@ fn rollback_to_savepoint_with_index_undo(
 ) -> Result<(), DbError> {
     let index_undos = txn.collect_index_undos_since(&sp);
     let mut current_roots = load_current_index_roots(txn, storage, &index_undos)?;
-    for (index_id, root_page_id, key) in &index_undos {
+    for undo in &index_undos {
+        let (index_id, fallback_root) = match undo {
+            IndexUndoRecord::DeleteInserted {
+                index_id,
+                root_page_id,
+                ..
+            }
+            | IndexUndoRecord::RestoreDeleted {
+                index_id,
+                root_page_id,
+                ..
+            } => (*index_id, *root_page_id),
+        };
         let current_root = current_roots
-            .get(index_id)
+            .get(&index_id)
             .copied()
-            .unwrap_or(*root_page_id);
+            .unwrap_or(fallback_root);
         let root = std::sync::atomic::AtomicU64::new(current_root);
-        let _ = BTree::delete_in(storage, &root, key);
-        bloom.mark_dirty(*index_id);
+
+        match undo {
+            IndexUndoRecord::DeleteInserted { key, .. } => {
+                let _ = BTree::delete_in(storage, &root, key);
+                bloom.mark_dirty(index_id);
+            }
+            IndexUndoRecord::RestoreDeleted {
+                key,
+                rid,
+                fillfactor,
+                ..
+            } => {
+                BTree::insert_in(storage, &root, key, *rid, *fillfactor)?;
+                bloom.add(index_id, key);
+            }
+        }
+
         let new_root = root.load(std::sync::atomic::Ordering::Acquire);
-        current_roots.insert(*index_id, new_root);
+        current_roots.insert(index_id, new_root);
         if new_root != current_root {
             if let Ok(mut cw) = CatalogWriter::new(storage, txn) {
-                let _ = cw.update_index_root(*index_id, new_root);
+                let _ = cw.update_index_root(index_id, new_root);
             }
         }
     }
@@ -447,7 +500,7 @@ fn rollback_to_savepoint_with_index_undo(
 fn load_current_index_roots(
     txn: &TxnManager,
     storage: &dyn StorageEngine,
-    index_undos: &[(u32, u64, Vec<u8>)],
+    index_undos: &[IndexUndoRecord],
 ) -> Result<std::collections::HashMap<u32, u64>, DbError> {
     let mut roots = std::collections::HashMap::new();
     if index_undos.is_empty() {
@@ -456,15 +509,27 @@ fn load_current_index_roots(
 
     let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
     let mut reader = CatalogReader::new(storage, snap)?;
-    for (index_id, fallback_root, _) in index_undos {
-        if roots.contains_key(index_id) {
+    for undo in index_undos {
+        let (index_id, fallback_root) = match undo {
+            IndexUndoRecord::DeleteInserted {
+                index_id,
+                root_page_id,
+                ..
+            }
+            | IndexUndoRecord::RestoreDeleted {
+                index_id,
+                root_page_id,
+                ..
+            } => (*index_id, *root_page_id),
+        };
+        if roots.contains_key(&index_id) {
             continue;
         }
         let root = reader
-            .get_index_by_id(*index_id)?
+            .get_index_by_id(index_id)?
             .map(|idx| idx.root_page_id)
-            .unwrap_or(*fallback_root);
-        roots.insert(*index_id, root);
+            .unwrap_or(fallback_root);
+        roots.insert(index_id, root);
     }
     Ok(roots)
 }

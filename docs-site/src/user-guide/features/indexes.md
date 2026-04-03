@@ -11,36 +11,39 @@ Today AxiomDB exposes **two** SQL-visible table layouts:
 - tables **without** an explicit `PRIMARY KEY` still use the classic heap + index path
 - tables **with** an explicit `PRIMARY KEY` now bootstrap clustered storage at `CREATE TABLE` time
 
-That new clustered DDL boundary is intentionally narrow in `39.13`:
+That new clustered SQL boundary is now wider through `39.16`:
 
 - the table root is clustered from day one
 - PRIMARY KEY catalog metadata points at that clustered root
 - `INSERT` on clustered tables now works through the clustered PK tree
-- `SELECT`, `UPDATE`, and `DELETE` on clustered tables still return `0A000` / `NotImplemented` until `39.15`–`39.17`
+- `SELECT` on clustered tables now works through the clustered PK tree and clustered secondary bookmarks
+- `UPDATE` on clustered tables now rewrites rows directly in the clustered PK tree
+- `DELETE` on clustered tables still returns `0A000` / `NotImplemented` until `39.17`
 
 Internally, the storage rewrite already has clustered insert, point lookup,
 range scan, same-leaf update, delete-mark, structural rebalance / relocate-update,
 secondary PK bookmarks, and overflow-backed clustered rows for large payloads,
 and explicit-PK `CREATE TABLE` now records that layout in SQL metadata.
-Phase `39.14` makes the first executor-visible clustered DML cut: `INSERT`
-writes go straight to the clustered PK tree and maintain bookmark-bearing
-secondary indexes, while clustered reads and later mutators still stay deferred.
+Phase `39.14` made the first executor-visible clustered write cut, `39.15`
+opened the read side, and `39.16` now brings `UPDATE` onto that same clustered
+path: PK lookups/ranges, clustered secondary bookmark probes, in-place rewrite,
+relocation fallback, and PK-changing rewrite all stay on clustered storage.
 
 That internal rewrite is still honest about its current boundary:
 
 - relocate-update rewrites only the current inline version
 - clustered delete is still delete-mark first, not purge
 - large clustered rows can already spill to overflow pages internally, but SQL
-  only explicit-PK tables expose clustered layout at DDL time; runnable SQL DML
-  still needs heap-backed tables today
-- clustered-first secondary bookmarks now exist internally, but the SQL-visible
-  executor still uses heap `RecordId` secondary indexes
+  only explicit-PK tables expose clustered layout at DDL time
+- clustered covering reads still degrade to fetching the clustered row body; a
+  true clustered index-only optimization is still future work
+- standalone clustered `CREATE INDEX` / `ANALYZE` / `VACUUM` remain deferred
 
 <div class="callout callout-tip">
 <span class="callout-icon">💡</span>
 <div class="callout-body">
 <span class="callout-label">Current Behavior</span>
-`CREATE TABLE users (id INT PRIMARY KEY, ...)` now creates clustered storage and `INSERT INTO users ...` works immediately. The remaining limitation is reads and later mutators: clustered `SELECT`, `UPDATE`, and `DELETE` still return SQLSTATE `0A000` until Phases `39.15`–`39.17`.
+`CREATE TABLE users (id INT PRIMARY KEY, ...)` now creates clustered storage, `INSERT INTO users ...` writes through the clustered PK tree, `SELECT ...` reads directly from clustered storage, and `UPDATE ...` rewrites the clustered row plus any bookmark-bearing secondary entries. `DELETE` remains deferred to Phase `39.17`.
 </div>
 </div>
 

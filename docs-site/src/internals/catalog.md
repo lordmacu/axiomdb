@@ -316,8 +316,9 @@ When the executor processes `CREATE TABLE`, it:
 
 The `root_page_id` stored in `axiom_tables` is now the single entry point for the
 table's primary row store. Heap DML still uses it as the heap-chain root today;
-clustered DML is deferred, so heap-only executor paths explicitly reject
-`TableStorageLayout::Clustered` instead of touching the wrong page format.
+clustered `INSERT` / `SELECT` now use it as the clustered row-store root, while
+heap-only executor paths still reject clustered `UPDATE` / `DELETE` instead of
+touching the wrong page format.
 
 Because the catalog is stored in heap pages and indexed like any other table, all
 crash recovery mechanisms apply automatically: WAL replay will reconstruct the catalog

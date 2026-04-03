@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use axiomdb_core::{error::DbError, TransactionSnapshot, TxnId};
+use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot, TxnId};
 use axiomdb_storage::{
     clear_deletion, clustered_tree, heap_chain::HeapChain, mark_slot_dead, restore_tuple_image,
     Page, StorageEngine, WalDurabilityPolicy,
@@ -96,6 +96,17 @@ pub enum UndoOp {
         root_page_id: u64,
         key: Vec<u8>,
     },
+    /// Undo an index DELETE by restoring the removed entry to the B-Tree.
+    ///
+    /// Recorded when UPDATE rewrites a secondary key and must remove the
+    /// previous physical entry immediately.
+    UndoIndexDelete {
+        index_id: u32,
+        root_page_id: u64,
+        key: Vec<u8>,
+        rid: RecordId,
+        fillfactor: u8,
+    },
     /// Undo a clustered insert by removing the inserted row by primary key.
     UndoClusteredInsert { table_id: u32, key: Vec<u8> },
     /// Restore the exact previous clustered row image by primary key.
@@ -103,6 +114,22 @@ pub enum UndoOp {
         table_id: u32,
         key: Vec<u8>,
         old_row: ClusteredRowImage,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexUndoRecord {
+    DeleteInserted {
+        index_id: u32,
+        root_page_id: u64,
+        key: Vec<u8>,
+    },
+    RestoreDeleted {
+        index_id: u32,
+        root_page_id: u64,
+        key: Vec<u8>,
+        rid: RecordId,
+        fillfactor: u8,
     },
 }
 
@@ -594,7 +621,7 @@ impl TxnManager {
                 UndoOp::UndoTruncate { root_page_id } => {
                     HeapChain::clear_deletions_by_txn(storage, root_page_id, txn_id)?;
                 }
-                UndoOp::UndoIndexInsert { .. } => {
+                UndoOp::UndoIndexInsert { .. } | UndoOp::UndoIndexDelete { .. } => {
                     // Handled by caller via pending_index_undos().
                     // TxnManager cannot depend on axiomdb-index.
                 }
@@ -680,7 +707,7 @@ impl TxnManager {
                 UndoOp::UndoTruncate { root_page_id } => {
                     HeapChain::clear_deletions_by_txn(storage, root_page_id, txn_id)?;
                 }
-                UndoOp::UndoIndexInsert { .. } => {
+                UndoOp::UndoIndexInsert { .. } | UndoOp::UndoIndexDelete { .. } => {
                     // Handled by caller via pending_index_undos().
                 }
                 UndoOp::UndoClusteredInsert { table_id, key } => {
@@ -1311,6 +1338,27 @@ impl TxnManager {
         Ok(())
     }
 
+    /// Records an index DELETE undo operation so that ROLLBACK can restore the
+    /// removed entry to the B-Tree.
+    pub fn record_index_delete(
+        &mut self,
+        index_id: u32,
+        root_page_id: u64,
+        key: Vec<u8>,
+        rid: RecordId,
+        fillfactor: u8,
+    ) -> Result<(), DbError> {
+        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
+        active.undo_ops.push(UndoOp::UndoIndexDelete {
+            index_id,
+            root_page_id,
+            key,
+            rid,
+            fillfactor,
+        });
+        Ok(())
+    }
+
     /// Returns all `UndoIndexInsert` operations from the active transaction's
     /// undo log, in reverse chronological order (last insert first).
     ///
@@ -1318,8 +1366,8 @@ impl TxnManager {
     /// to handle B-Tree deletes at the executor layer (TxnManager cannot depend
     /// on `axiomdb-index`).
     ///
-    /// Returns `(index_id, root_page_id, key)` tuples.
-    pub fn collect_index_undos(&self) -> Vec<(u32, u64, Vec<u8>)> {
+    /// Returns a reverse-chronological list of index undo records.
+    pub fn collect_index_undos(&self) -> Vec<IndexUndoRecord> {
         let Some(active) = &self.active else {
             return Vec::new();
         };
@@ -1332,7 +1380,24 @@ impl TxnManager {
                     index_id,
                     root_page_id,
                     key,
-                } => Some((*index_id, *root_page_id, key.clone())),
+                } => Some(IndexUndoRecord::DeleteInserted {
+                    index_id: *index_id,
+                    root_page_id: *root_page_id,
+                    key: key.clone(),
+                }),
+                UndoOp::UndoIndexDelete {
+                    index_id,
+                    root_page_id,
+                    key,
+                    rid,
+                    fillfactor,
+                } => Some(IndexUndoRecord::RestoreDeleted {
+                    index_id: *index_id,
+                    root_page_id: *root_page_id,
+                    key: key.clone(),
+                    rid: *rid,
+                    fillfactor: *fillfactor,
+                }),
                 _ => None,
             })
             .collect()
@@ -1340,7 +1405,7 @@ impl TxnManager {
 
     /// Like [`collect_index_undos`] but only returns ops recorded after the
     /// given savepoint.
-    pub fn collect_index_undos_since(&self, sp: &Savepoint) -> Vec<(u32, u64, Vec<u8>)> {
+    pub fn collect_index_undos_since(&self, sp: &Savepoint) -> Vec<IndexUndoRecord> {
         let Some(active) = &self.active else {
             return Vec::new();
         };
@@ -1354,7 +1419,24 @@ impl TxnManager {
                     index_id,
                     root_page_id,
                     key,
-                } => Some((*index_id, *root_page_id, key.clone())),
+                } => Some(IndexUndoRecord::DeleteInserted {
+                    index_id: *index_id,
+                    root_page_id: *root_page_id,
+                    key: key.clone(),
+                }),
+                UndoOp::UndoIndexDelete {
+                    index_id,
+                    root_page_id,
+                    key,
+                    rid,
+                    fillfactor,
+                } => Some(IndexUndoRecord::RestoreDeleted {
+                    index_id: *index_id,
+                    root_page_id: *root_page_id,
+                    key: key.clone(),
+                    rid: *rid,
+                    fillfactor: *fillfactor,
+                }),
                 _ => None,
             })
             .collect()

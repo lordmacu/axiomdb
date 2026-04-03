@@ -247,12 +247,12 @@ mod tests {
 
     #[test]
     fn test_normalize_multiple_literals() {
-        let (norm, params) = normalize_sql("INSERT INTO t VALUES (1, 'hello', 3.14)");
+        let (norm, params) = normalize_sql("INSERT INTO t VALUES (1, 'hello', 2.5)");
         assert_eq!(norm, "INSERT INTO t VALUES (?, ?, ?)");
         assert_eq!(params.len(), 3);
         assert_eq!(params[0], Value::Int(1));
         assert_eq!(params[1], Value::Text("hello".into()));
-        assert!(matches!(params[2], Value::Real(f) if (f - 3.14).abs() < 0.001));
+        assert!(matches!(params[2], Value::Real(f) if (f - 2.5).abs() < 0.001));
     }
 
     #[test]

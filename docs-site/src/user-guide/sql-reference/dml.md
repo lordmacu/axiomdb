@@ -507,17 +507,23 @@ rows in a single session.
 ### INSERT ... VALUES
 
 Tables whose schema has an explicit `PRIMARY KEY` now use clustered storage for
-SQL-visible `INSERT`. That clustered insert path supports:
+SQL-visible `INSERT`, `SELECT`, and `UPDATE`. The clustered SQL path now supports:
 
 - single-row `VALUES`
 - multi-row `VALUES`
 - `INSERT ... SELECT`
 - `AUTO_INCREMENT`
 - explicit transactions and savepoints
+- `SELECT` full scans over clustered leaves
+- `SELECT` PK point lookups and PK range scans
+- `SELECT` secondary lookups through PK bookmarks stored in the secondary key
+- `UPDATE` in-place rewrite when the row still fits in the owning leaf
+- `UPDATE` relocation fallback when the row grows and must be rewritten structurally
+- `UPDATE` through PK predicates or secondary bookmark probes with transaction rollback/savepoint safety
 
-Clustered reads and later mutators are still not fully wired into SQL:
-`SELECT`, `UPDATE`, and `DELETE` on clustered tables remain deferred to
-Phases `39.15`–`39.17`.
+Clustered mutators are still not fully wired into SQL:
+`DELETE` on clustered tables remains deferred to
+Phase `39.17`.
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>

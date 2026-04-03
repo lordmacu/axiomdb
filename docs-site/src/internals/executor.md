@@ -1000,6 +1000,49 @@ When `plan_select` returns `AccessMethod::IndexOnlyScan`, the executor reads
 all result values directly from the B-Tree key bytes, with only a lightweight
 MVCC visibility check against the heap slot header.
 
+This section applies to the heap executor path. Since `39.15`, clustered tables
+do **not** execute this path directly even if the planner initially detects a
+covering opportunity. Clustered covering plans are normalized back to
+clustered-aware lookup/range access, because clustered visibility lives in the
+inline row header and clustered secondary indexes carry PK bookmarks instead of
+stable heap `RecordId`s.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Heap-Only IndexOnlyScan</span>
+PostgreSQL can keep one logical access method because every index probe still
+lands on a heap TID. Clustered storage breaks that assumption. AxiomDB keeps
+`IndexOnlyScan` as a heap optimization and routes clustered reads through the
+clustered tree until a real clustered covering-read path exists.
+</div>
+</div>
+
+### Clustered UPDATE (`39.16`)
+
+Clustered tables no longer fall back to heap-era UPDATE logic. The executor now
+routes explicit-`PRIMARY KEY` tables through clustered candidate discovery and
+clustered rewrite primitives:
+
+1. discover candidates through the clustered access planner:
+   PK lookup, PK range, secondary bookmark probe, or full clustered scan
+2. capture the exact old clustered row image (`RowHeader` + full logical row
+   bytes) before any mutation
+3. choose one of three clustered write paths:
+   - same-key in-place rewrite via `clustered_tree::update_in_place(...)`
+   - same-key relocation via `clustered_tree::update_with_relocation(...)`
+   - PK change via `delete_mark(old_pk)` + `insert(new_pk, ...)`
+4. rewrite clustered secondary bookmark entries and register both index-insert
+   and index-delete undo records so rollback can restore the old bookmark state
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — InnoDB-Style Branching</span>
+MariaDB/InnoDB splits UPDATE into clustered in-place vs. delete+insert depending on whether index-ordering columns change. AxiomDB now applies the same decision tree to clustered SQL UPDATE, but stores rollback state as exact row images keyed by primary key instead of heap-era slot addresses.
+</div>
+</div>
+
 ### Execution Path
 
 ```

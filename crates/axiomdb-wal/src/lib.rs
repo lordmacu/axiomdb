@@ -24,5 +24,7 @@ pub use fsync_pipeline::{AcquireResult, CommitRx, FsyncPipeline};
 pub use reader::{BackwardIter, ForwardIter, WalReader};
 pub use recovery::{CrashRecovery, RecoveryOp, RecoveryResult, RecoveryState};
 pub use rotation::WalRotator;
-pub use txn::{decode_physical_loc, Savepoint, TxnManager, UndoOp, PHYSICAL_LOC_LEN};
+pub use txn::{
+    decode_physical_loc, IndexUndoRecord, Savepoint, TxnManager, UndoOp, PHYSICAL_LOC_LEN,
+};
 pub use writer::{WalWriter, WAL_HEADER_SIZE, WAL_MAGIC, WAL_VERSION};
