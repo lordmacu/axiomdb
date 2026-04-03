@@ -1043,6 +1043,30 @@ MariaDB/InnoDB splits UPDATE into clustered in-place vs. delete+insert depending
 </div>
 </div>
 
+### Clustered DELETE (`39.17`)
+
+Clustered tables no longer fall back to heap-era DELETE logic either. The
+executor now routes explicit-`PRIMARY KEY` tables through clustered candidate
+discovery and clustered delete-mark primitives:
+
+1. discover candidates through the clustered access planner:
+   PK lookup, PK range, secondary bookmark probe, or full clustered scan
+2. decode the exact current clustered row image before any mutation
+3. enforce parent-side foreign-key restrictions before the first delete-mark
+4. call `clustered_tree::delete_mark(...)` for each matched primary key
+5. record `EntryType::ClusteredDeleteMark` with the exact old and new row
+   images so rollback/savepoints restore the original header and payload bytes
+6. leave clustered secondary bookmark entries in place for deferred cleanup
+   during later clustered VACUUM work
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Delete Mark Before Purge</span>
+InnoDB delete-marks clustered rows and purges them later; PostgreSQL also leaves tuple cleanup to VACUUM. AxiomDB now exposes the same split at SQL level: clustered DELETE changes visibility now, while physical removal and secondary cleanup stay in Phase 39.18.
+</div>
+</div>
+
 ### Execution Path
 
 ```

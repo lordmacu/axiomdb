@@ -2,7 +2,7 @@
 
 ## 2026-04-02
 
-- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.9`, `39.10`, `39.11`, `39.12`, `39.13`, `39.14`, `39.15`, and `39.16` are closed in code, targeted validation,
+- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.9`, `39.10`, `39.11`, `39.12`, `39.13`, `39.14`, `39.15`, `39.16`, and `39.17` are closed in code, targeted validation,
   and docs.
 - `axiomdb-catalog` / `axiomdb-sql` now expose the first SQL-visible clustered-table boundary:
   - `TableDef` now stores `root_page_id` plus `TableStorageLayout::{Heap, Clustered}`
@@ -14,6 +14,7 @@
   - `INSERT` on clustered tables now routes directly through the clustered tree in both ctx and non-ctx executor paths
   - `SELECT` on clustered tables now routes through clustered full scans, clustered PK lookups/ranges, and clustered secondary bookmark probes
   - `UPDATE` on clustered tables now routes through clustered candidate discovery, exact-row-image WAL, same-leaf rewrite / relocate-update / PK-change rewrite, and undo-safe clustered secondary bookmark maintenance
+  - `DELETE` on clustered tables now routes through clustered candidate discovery, parent-side FK enforcement before delete-mark, exact-row-image clustered WAL, and ctx/non-ctx executor paths
   - clustered PK bytes are derived from logical primary-index metadata order, not raw table-column order
   - clustered `AUTO_INCREMENT` bootstraps from clustered rows, not heap scans
   - non-primary clustered indexes are now maintained through PK bookmarks instead of heap `RecordId` payloads
@@ -66,8 +67,8 @@
   - SQL DDL can now create clustered tables for explicit primary keys
   - SQL clustered `INSERT` now writes clustered rows
   - SQL clustered `SELECT` now reads clustered rows
-  - clustered same-leaf update now exists internally, but no SQL path uses it yet
-  - clustered delete-mark now exists internally, but no SQL path uses it yet
+  - SQL clustered `UPDATE` now rewrites clustered rows
+  - SQL clustered `DELETE` now exposes clustered delete-mark
 - Current clustered lookup limitation:
   - if the current inline version is invisible to the snapshot, `lookup()` returns `None`
   - older-version reconstruction remains deferred beyond the new rollback-only clustered WAL path
@@ -80,9 +81,10 @@
   - parent separator repair still assumes the repaired separator fits on the current internal page
 - Current clustered delete limitation:
   - delete-mark keeps the physical cell inline in `39.7`
-  - `39.8` adds private structural rebalance helpers, but public clustered delete still does not purge dead rows
+  - `39.17` makes that delete-mark SQL-visible, but public clustered delete still does not purge dead rows
   - clustered purge after delete still depends on later phases
   - snapshot-safe purge still depends on later phases
+  - parent-side FK enforcement works for clustered parent tables, but clustered child-table FK enforcement remains deferred
 - `39.1` is now effectively closed by `39.10`:
   - clustered leaves support both inline rows and overflow-backed rows
   - primary key bytes and `RowHeader` remain inline in the leaf

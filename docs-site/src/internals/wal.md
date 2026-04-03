@@ -309,7 +309,7 @@ and clustered-tree helpers:
 - undo clustered insert → `delete_physical_by_key(...)`
 - undo clustered delete-mark / update → `restore_exact_row_image(...)`
 
-Phases `39.14` and `39.16` are the first SQL-visible executor users of that contract:
+Phases `39.14`, `39.16`, and `39.17` are the first SQL-visible executor users of that contract:
 
 - a fresh clustered SQL insert records `ClusteredInsert`
 - reusing a snapshot-invisible delete-marked clustered PK records
@@ -317,6 +317,9 @@ Phases `39.14` and `39.16` are the first SQL-visible executor users of that cont
   simply delete the new row
 - clustered SQL update now records the exact old clustered row image before the
   rewrite, even for same-leaf in-place updates and relocate-updates
+- clustered SQL delete now records the exact old clustered row image before the
+  delete-mark so rollback/savepoints can restore the prior `txn_id_deleted = 0`
+  state exactly
 - clustered secondary bookmark entries still use the ordinary B+ Tree undo path,
   but `39.16` extends that undo to both halves of a rewritten secondary key:
   rollback can delete newly inserted bookmark entries and reinsert the old

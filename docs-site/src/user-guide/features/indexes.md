@@ -11,23 +11,24 @@ Today AxiomDB exposes **two** SQL-visible table layouts:
 - tables **without** an explicit `PRIMARY KEY` still use the classic heap + index path
 - tables **with** an explicit `PRIMARY KEY` now bootstrap clustered storage at `CREATE TABLE` time
 
-That new clustered SQL boundary is now wider through `39.16`:
+That new clustered SQL boundary is now wider through `39.17`:
 
 - the table root is clustered from day one
 - PRIMARY KEY catalog metadata points at that clustered root
 - `INSERT` on clustered tables now works through the clustered PK tree
 - `SELECT` on clustered tables now works through the clustered PK tree and clustered secondary bookmarks
 - `UPDATE` on clustered tables now rewrites rows directly in the clustered PK tree
-- `DELETE` on clustered tables still returns `0A000` / `NotImplemented` until `39.17`
+- `DELETE` on clustered tables now applies clustered delete-mark through the clustered PK tree
 
 Internally, the storage rewrite already has clustered insert, point lookup,
 range scan, same-leaf update, delete-mark, structural rebalance / relocate-update,
 secondary PK bookmarks, and overflow-backed clustered rows for large payloads,
 and explicit-PK `CREATE TABLE` now records that layout in SQL metadata.
 Phase `39.14` made the first executor-visible clustered write cut, `39.15`
-opened the read side, and `39.16` now brings `UPDATE` onto that same clustered
-path: PK lookups/ranges, clustered secondary bookmark probes, in-place rewrite,
-relocation fallback, and PK-changing rewrite all stay on clustered storage.
+opened the read side, `39.16` brought `UPDATE` onto that same clustered path,
+and `39.17` now does the same for logical clustered `DELETE`: PK lookups/ranges,
+clustered secondary bookmark probes, in-place delete-mark, and rollback-safe
+WAL all stay on clustered storage.
 
 That internal rewrite is still honest about its current boundary:
 
@@ -43,7 +44,7 @@ That internal rewrite is still honest about its current boundary:
 <span class="callout-icon">💡</span>
 <div class="callout-body">
 <span class="callout-label">Current Behavior</span>
-`CREATE TABLE users (id INT PRIMARY KEY, ...)` now creates clustered storage, `INSERT INTO users ...` writes through the clustered PK tree, `SELECT ...` reads directly from clustered storage, and `UPDATE ...` rewrites the clustered row plus any bookmark-bearing secondary entries. `DELETE` remains deferred to Phase `39.17`.
+`CREATE TABLE users (id INT PRIMARY KEY, ...)` now creates clustered storage, `INSERT INTO users ...` writes through the clustered PK tree, `SELECT ...` reads directly from clustered storage, `UPDATE ...` rewrites the clustered row plus any bookmark-bearing secondary entries, and `DELETE ...` applies a clustered delete-mark. Physical cleanup stays deferred to clustered `VACUUM`.
 </div>
 </div>
 

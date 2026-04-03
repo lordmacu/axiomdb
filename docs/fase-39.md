@@ -878,6 +878,59 @@ Targeted validation for `39.16` passed on the clustered update surface:
 - `cargo clippy -p axiomdb-wal --tests -- -D warnings`
 - `cargo clippy -p axiomdb-sql --lib --test integration_clustered_update --test integration_clustered_insert --test integration_clustered_select -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity -A clippy::needless_borrow`
 
+### 39.17 — Executor integration: DELETE from clustered table
+
+`crates/axiomdb-sql/src/executor/delete.rs` now exposes the first SQL-visible
+clustered delete path.
+
+Behavior now exposed through SQL:
+
+- `DELETE` on explicit-`PRIMARY KEY` clustered tables no longer fails with the
+  old `39.17` guard rail
+- clustered candidate discovery now uses the clustered planner boundary:
+  PK lookup, PK range, secondary bookmark probe, or full clustered scan
+- parent-side FK enforcement now runs before the first clustered delete-mark so
+  `RESTRICT` can abort cleanly without partially mutating the clustered tree
+- clustered delete now records exact old/new clustered row images in WAL via
+  `EntryType::ClusteredDeleteMark`, so `ROLLBACK` and savepoints restore the
+  prior row header and payload bytes exactly
+- the non-ctx executor path now supports clustered `DELETE` too; it no longer
+  returns `NotImplemented`
+- clustered secondary bookmark entries remain physically present after delete;
+  reads hide them through clustered-row visibility and `39.18` will handle
+  physical cleanup
+
+Current boundary after `39.17`:
+
+- clustered `DELETE` is now SQL-visible on clustered tables
+- clustered delete is still logical delete-mark, not purge
+- FK enforcement on clustered **child** tables remains deferred
+- standalone clustered maintenance such as `CREATE INDEX`, `ANALYZE`, and
+  `VACUUM` still remains deferred
+
+Supporting changes for `39.17`:
+
+- `crates/axiomdb-sql/src/executor/delete.rs`
+  - collects clustered delete candidates through clustered-aware access methods
+    instead of forcing a whole-tree scan
+  - records exact clustered row images in WAL for delete-mark undo/recovery
+  - reuses parent-side FK enforcement before applying the first clustered
+    delete-mark
+- `crates/axiomdb-sql/tests/integration_clustered_delete.rs`
+  - adds executor coverage for secondary-predicate delete, rollback restore,
+    parent-side FK `RESTRICT`, deferred secondary bookmark retention, and the
+    non-ctx delete path
+- `tools/wire-test.py`
+  - adds MySQL wire smoke coverage for clustered delete, clustered secondary
+    delete, and clustered delete rollback
+
+Targeted validation for `39.17` passed on the clustered delete surface:
+
+- `cargo test -p axiomdb-sql --test integration_clustered_delete -j1`
+- `cargo test -p axiomdb-sql --test integration_clustered_select -j1`
+- `cargo test -p axiomdb-sql --test integration_clustered_update -j1`
+- `cargo check -p axiomdb-sql --lib -j1`
+
 ## Review notes
 
 - All `39.3` acceptance criteria from the spec are implemented.
@@ -895,6 +948,7 @@ Targeted validation for `39.16` passed on the clustered update surface:
 - All `39.15` acceptance criteria from the spec are implemented except the
   intentionally deferred clustered index-only optimization.
 - All `39.16` acceptance criteria from the spec are implemented.
+- All `39.17` acceptance criteria from the spec are implemented.
 - No `unsafe` was introduced in the clustered tree path.
 - No production `unwrap()` remains in the touched clustered files.
 - No production `unwrap()` was introduced in the new clustered-secondary path.
@@ -907,15 +961,16 @@ Targeted validation for `39.16` passed on the clustered update surface:
   `39.10` adds overflow-backed row storage, `39.11` adds internal WAL/rollback support, `39.12` adds internal clustered crash recovery,
   `39.13` exposes the first SQL-visible clustered DDL boundary, `39.14`
   exposes the first SQL-visible clustered INSERT path, `39.15` exposes the
-  first SQL-visible clustered read path, and `39.16` exposes clustered UPDATE,
-  but end-to-end clustered delete / maintenance benchmarks still wait for
-  `39.17+`.
+  first SQL-visible clustered read path, `39.16` exposes clustered UPDATE, and
+  `39.17` exposes clustered DELETE, but end-to-end clustered maintenance
+  benchmarks still wait for `39.18+`.
 
 ## Deferred
 
 - `39.18` — physical purge of dead clustered cells
 - later clustered root persistence — today `39.12` still rebuilds roots from surviving WAL history, so checkpoint/rotation persistence is not solved yet
-- `39.16+` — remaining executor-visible clustered mutator and maintenance paths
+- later clustered FK work — child-side FK enforcement still rejects clustered child tables
+- `39.18+` — remaining executor-visible clustered maintenance paths
 
 ## Notes
 

@@ -507,7 +507,7 @@ rows in a single session.
 ### INSERT ... VALUES
 
 Tables whose schema has an explicit `PRIMARY KEY` now use clustered storage for
-SQL-visible `INSERT`, `SELECT`, and `UPDATE`. The clustered SQL path now supports:
+SQL-visible `INSERT`, `SELECT`, `UPDATE`, and `DELETE`. The clustered SQL path now supports:
 
 - single-row `VALUES`
 - multi-row `VALUES`
@@ -520,10 +520,14 @@ SQL-visible `INSERT`, `SELECT`, and `UPDATE`. The clustered SQL path now support
 - `UPDATE` in-place rewrite when the row still fits in the owning leaf
 - `UPDATE` relocation fallback when the row grows and must be rewritten structurally
 - `UPDATE` through PK predicates or secondary bookmark probes with transaction rollback/savepoint safety
+- `DELETE` through PK predicates, PK ranges, secondary bookmark probes, or full clustered scans
+- `DELETE` rollback/savepoint restore through exact clustered row images in WAL
 
-Clustered mutators are still not fully wired into SQL:
-`DELETE` on clustered tables remains deferred to
-Phase `39.17`.
+Current clustered boundary after `39.17`:
+
+- clustered `DELETE` is logical delete-mark, not physical purge
+- clustered secondary bookmark entries stay in place until clustered `VACUUM`
+- clustered child-table foreign-key enforcement still remains future work
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>

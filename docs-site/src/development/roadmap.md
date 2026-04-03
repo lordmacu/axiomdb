@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 39.16 Executor integration: UPDATE on clustered table — explicit-PK tables now update through clustered candidate discovery, exact-row-image WAL, same-leaf rewrite / relocate-update / PK-change rewrite, and undo-safe clustered secondary bookmark maintenance
+**Last completed subphase:** 39.17 Executor integration: DELETE from clustered table — explicit-PK tables now delete through clustered candidate discovery, parent-side FK enforcement before delete-mark, exact-row-image WAL, rollback-safe clustered delete-mark undo, and ctx/non-ctx executor support
 
-**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, overflow-backed large rows, insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, clustered-first secondary bookmarks, internal WAL/rollback, clustered crash recovery, clustered-aware `CREATE TABLE`, clustered SQL `INSERT`, clustered SQL `SELECT`, and clustered SQL `UPDATE` now exist; clustered delete / maintenance are next
+**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, overflow-backed large rows, insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, clustered-first secondary bookmarks, internal WAL/rollback, clustered crash recovery, clustered-aware `CREATE TABLE`, clustered SQL `INSERT`, clustered SQL `SELECT`, clustered SQL `UPDATE`, and clustered SQL `DELETE` now exist; clustered maintenance is next
 
-**Next milestone:** 39.17 — DELETE from clustered table
+**Next milestone:** 39.18 — VACUUM for clustered index
 
 **Concurrency note:** the current server already supports concurrent read-only
 queries, but mutating statements are still serialized through a database-wide
