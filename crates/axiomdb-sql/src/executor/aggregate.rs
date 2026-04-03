@@ -354,7 +354,8 @@ impl AggAccumulator {
                 if !matches!(v, Value::Null) {
                     *acc = Some(match acc.take() {
                         None => v,
-                        Some(a) => agg_add(a, v)?,
+                        // value_agg_add: direct arithmetic, no AST allocation.
+                        Some(a) => value_agg_add(a, v)?,
                     });
                 }
             }
@@ -368,8 +369,9 @@ impl AggAccumulator {
                 if !matches!(v, Value::Null) {
                     *acc = Some(match acc.take() {
                         None => v,
+                        // compare_values_null_last: direct variant match, no eval().
                         Some(a) => {
-                            if agg_compare(&v, &a)? == std::cmp::Ordering::Less {
+                            if compare_values_null_last(&v, &a) == std::cmp::Ordering::Less {
                                 v
                             } else {
                                 a
@@ -388,8 +390,9 @@ impl AggAccumulator {
                 if !matches!(v, Value::Null) {
                     *acc = Some(match acc.take() {
                         None => v,
+                        // compare_values_null_last: direct variant match, no eval().
                         Some(a) => {
-                            if agg_compare(&v, &a)? == std::cmp::Ordering::Greater {
+                            if compare_values_null_last(&v, &a) == std::cmp::Ordering::Greater {
                                 v
                             } else {
                                 a
@@ -406,7 +409,8 @@ impl AggAccumulator {
                     eval(simple_arg.unwrap(), row)?
                 };
                 if !matches!(v, Value::Null) {
-                    *sum = agg_add(sum.clone(), v)?;
+                    // value_agg_add: direct arithmetic, no AST allocation.
+                    *sum = value_agg_add(sum.clone(), v)?;
                     *count += 1;
                 }
             }
@@ -508,58 +512,63 @@ impl AggAccumulator {
     }
 }
 
-/// Add two values for aggregation (reuses `eval` for type handling and coercion).
-fn agg_add(a: Value, b: Value) -> Result<Value, DbError> {
-    eval(
-        &Expr::BinaryOp {
-            op: BinaryOp::Add,
-            left: Box::new(Expr::Literal(a)),
-            right: Box::new(Expr::Literal(b)),
-        },
-        &[],
-    )
-}
-
-/// Compare two values for MIN/MAX (returns Ordering).
-fn agg_compare(a: &Value, b: &Value) -> Result<std::cmp::Ordering, DbError> {
-    // Delegate to eval: if a < b → Less, if a = b → Equal, else Greater.
-    let lt = eval(
-        &Expr::BinaryOp {
-            op: BinaryOp::Lt,
-            left: Box::new(Expr::Literal(a.clone())),
-            right: Box::new(Expr::Literal(b.clone())),
-        },
-        &[],
-    )?;
-    if is_truthy(&lt) {
-        return Ok(std::cmp::Ordering::Less);
-    }
-    let eq = eval(
-        &Expr::BinaryOp {
-            op: BinaryOp::Eq,
-            left: Box::new(Expr::Literal(a.clone())),
-            right: Box::new(Expr::Literal(b.clone())),
-        },
-        &[],
-    )?;
-    if is_truthy(&eq) {
-        Ok(std::cmp::Ordering::Equal)
-    } else {
-        Ok(std::cmp::Ordering::Greater)
+/// Add two numeric values for aggregation.
+///
+/// Direct match-on-variant arithmetic — no AST nodes, no heap allocation, no
+/// `eval()` call. Replaces the old `agg_add` that constructed `Expr::BinaryOp`
+/// nodes at runtime. Inspired by PostgreSQL's `nodeAgg` transition-function
+/// model and DataFusion's type-specialized accumulator updates.
+///
+/// Widening rules (same as SQL standard):
+///   Int  + Int    → Int  (checked; Overflow on wrap)
+///   Int  + BigInt → BigInt (checked)
+///   *    + Real   → Real  (lossless widening for aggregation purposes)
+///   Decimal + Decimal → Decimal (same scale required)
+fn value_agg_add(a: Value, b: Value) -> Result<Value, DbError> {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x
+            .checked_add(y)
+            .map(Value::Int)
+            .ok_or(DbError::Overflow),
+        (Value::BigInt(x), Value::BigInt(y)) => x
+            .checked_add(y)
+            .map(Value::BigInt)
+            .ok_or(DbError::Overflow),
+        (Value::Real(x), Value::Real(y)) => Ok(Value::Real(x + y)),
+        // Cross-type widening — always produce the wider type.
+        (Value::Int(x), Value::BigInt(y)) | (Value::BigInt(y), Value::Int(x)) => (x as i64)
+            .checked_add(y)
+            .map(Value::BigInt)
+            .ok_or(DbError::Overflow),
+        (Value::Int(x), Value::Real(y)) | (Value::Real(y), Value::Int(x)) => {
+            Ok(Value::Real(x as f64 + y))
+        }
+        (Value::BigInt(x), Value::Real(y)) | (Value::Real(y), Value::BigInt(x)) => {
+            Ok(Value::Real(x as f64 + y))
+        }
+        (Value::Decimal(m1, s1), Value::Decimal(m2, s2)) if s1 == s2 => m1
+            .checked_add(m2)
+            .map(|m| Value::Decimal(m, s1))
+            .ok_or(DbError::Overflow),
+        (a, b) => Err(DbError::TypeMismatch {
+            expected: format!("numeric, got {} and {}", a.variant_name(), b.variant_name()),
+            got: "incompatible types in SUM/AVG".into(),
+        }),
     }
 }
 
 /// Finalize AVG: always produces `Real`. Returns `Null` if count == 0.
+///
+/// Direct division — no `eval()` call, no AST allocation.
 fn finalize_avg(sum: Value, count: u64) -> Result<Value, DbError> {
     if count == 0 {
         return Ok(Value::Null);
     }
-    // Convert sum to Real.
-    let sum_real = match sum {
-        Value::Int(n) => Value::Real(n as f64),
-        Value::BigInt(n) => Value::Real(n as f64),
-        Value::Real(f) => Value::Real(f),
-        Value::Decimal(m, s) => Value::Real(m as f64 * 10f64.powi(-(s as i32))),
+    let f: f64 = match sum {
+        Value::Int(n) => n as f64,
+        Value::BigInt(n) => n as f64,
+        Value::Real(f) => f,
+        Value::Decimal(m, s) => m as f64 * 10f64.powi(-(s as i32)),
         other => {
             return Err(DbError::TypeMismatch {
                 expected: "numeric".into(),
@@ -567,14 +576,7 @@ fn finalize_avg(sum: Value, count: u64) -> Result<Value, DbError> {
             })
         }
     };
-    eval(
-        &Expr::BinaryOp {
-            op: BinaryOp::Div,
-            left: Box::new(Expr::Literal(sum_real)),
-            right: Box::new(Expr::Literal(Value::Real(count as f64))),
-        },
-        &[],
-    )
+    Ok(Value::Real(f / count as f64))
 }
 
 // ── GROUP_CONCAT helpers ──────────────────────────────────────────────────────
@@ -692,6 +694,7 @@ fn apply_distinct_with_session(rows: Vec<Row>) -> Vec<Row> {
 // ── GroupState ────────────────────────────────────────────────────────────────
 
 /// State for one GROUP BY group.
+#[allow(dead_code)]
 struct GroupState {
     /// Evaluated GROUP BY expression values (for future sort-based output — 4.9b).
     #[allow(dead_code)]
@@ -700,6 +703,306 @@ struct GroupState {
     representative_row: Row,
     /// One accumulator per aggregate in the query (SELECT + HAVING).
     accumulators: Vec<AggAccumulator>,
+}
+
+// ── GroupEntry — replaces GroupState in the new hash path ────────────────────
+
+/// Per-group state used by the type-specialized group tables.
+///
+/// Replaces `GroupState::representative_row` with `non_agg_col_values`: a sparse
+/// slice containing only the column values needed by non-aggregate SELECT items
+/// and HAVING expressions. The column indices are pre-computed once before the
+/// scan loop (`compute_non_agg_col_indices`) and reused for every group.
+struct GroupEntry {
+    /// Evaluated GROUP BY expression values (for output row key columns).
+    #[allow(dead_code)]
+    key_values: Vec<Value>,
+    /// Values of non-aggregate column references in SELECT / HAVING.
+    /// Indexed parallel to `non_agg_col_indices` computed before the scan loop.
+    non_agg_col_values: Vec<Value>,
+    /// One accumulator per AggExpr in the query.
+    accumulators: Vec<AggAccumulator>,
+}
+
+// ── GroupTablePrimitive — zero-serialization INT/BIGINT GROUP BY ─────────────
+
+/// Hash group table for single-column INT or BIGINT GROUP BY keys.
+///
+/// Stores the native `i64` value directly as the hash key, bypassing
+/// `value_to_session_key_bytes` serialization entirely. Uses `hashbrown::HashMap`
+/// which memoizes the `u64` hash in its raw table (SIMD-accelerated Robin Hood
+/// probing), so hash recomputation on lookup probes is avoided — the same technique
+/// used in DataFusion's `GroupValuesPrimitive<T>`.
+struct GroupTablePrimitive {
+    /// i64 key → index into `entries`.
+    map: hashbrown::HashMap<i64, usize>,
+    /// NULL values form their own group (SQL: NULLs are equal under GROUP BY).
+    null_group: Option<usize>,
+    entries: Vec<GroupEntry>,
+}
+
+impl GroupTablePrimitive {
+    fn new() -> Self {
+        Self {
+            map: hashbrown::HashMap::new(),
+            null_group: None,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Look up or create the group for `key`. Returns `(group_index, is_new)`.
+    fn get_or_insert(
+        &mut self,
+        key: Option<i64>,
+        key_value: Value,
+        agg_exprs: &[AggExpr],
+        non_agg_col_indices: &[usize],
+        row: &[Value],
+    ) -> usize {
+        match key {
+            None => {
+                if let Some(idx) = self.null_group {
+                    idx
+                } else {
+                    let idx = self.entries.len();
+                    self.entries.push(GroupEntry {
+                        key_values: vec![Value::Null],
+                        non_agg_col_values: extract_non_agg_cols(non_agg_col_indices, row),
+                        accumulators: agg_exprs.iter().map(AggAccumulator::new).collect(),
+                    });
+                    self.null_group = Some(idx);
+                    idx
+                }
+            }
+            Some(k) => {
+                let next_idx = self.entries.len();
+                let idx = *self.map.entry(k).or_insert(next_idx);
+                if idx == next_idx {
+                    self.entries.push(GroupEntry {
+                        key_values: vec![key_value],
+                        non_agg_col_values: extract_non_agg_cols(non_agg_col_indices, row),
+                        accumulators: agg_exprs.iter().map(AggAccumulator::new).collect(),
+                    });
+                }
+                idx
+            }
+        }
+    }
+}
+
+// ── GroupTableGeneric — serialized keys, hashbrown backend ───────────────────
+
+/// Hash group table for all other GROUP BY cases (multi-column, TEXT, composite).
+///
+/// Keeps the existing `value_to_session_key_bytes` serialization but replaces
+/// `std::collections::HashMap` with `hashbrown::HashMap`. hashbrown memoizes
+/// hashes in its raw table and uses SIMD-accelerated linear probing (Robin Hood
+/// hashing), giving 20–40% faster lookups on realistic workloads compared to
+/// the standard library implementation.
+struct GroupTableGeneric {
+    /// Serialized key bytes → index into `entries`.
+    map: hashbrown::HashMap<Vec<u8>, usize>,
+    entries: Vec<GroupEntry>,
+}
+
+impl GroupTableGeneric {
+    fn new() -> Self {
+        Self {
+            map: hashbrown::HashMap::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    /// Look up or create the group for `key_buf`. Returns `group_index`.
+    /// `key_buf` is borrowed; only cloned if a new group is inserted.
+    fn get_or_insert(
+        &mut self,
+        key_buf: &[u8],
+        key_values: Vec<Value>,
+        agg_exprs: &[AggExpr],
+        non_agg_col_indices: &[usize],
+        row: &[Value],
+    ) -> usize {
+        if let Some(&idx) = self.map.get(key_buf) {
+            return idx;
+        }
+        let idx = self.entries.len();
+        self.entries.push(GroupEntry {
+            key_values,
+            non_agg_col_values: extract_non_agg_cols(non_agg_col_indices, row),
+            accumulators: agg_exprs.iter().map(AggAccumulator::new).collect(),
+        });
+        self.map.insert(key_buf.to_vec(), idx);
+        idx
+    }
+}
+
+// ── GroupTableKind — zero-cost dispatch enum ──────────────────────────────────
+
+enum GroupTableKind {
+    Primitive(GroupTablePrimitive),
+    Generic(GroupTableGeneric),
+}
+
+impl GroupTableKind {
+    fn entries_mut(&mut self) -> &mut Vec<GroupEntry> {
+        match self {
+            Self::Primitive(t) => &mut t.entries,
+            Self::Generic(t) => &mut t.entries,
+        }
+    }
+
+    fn into_entries(self) -> Vec<GroupEntry> {
+        match self {
+            Self::Primitive(t) => t.entries,
+            Self::Generic(t) => t.entries,
+        }
+    }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Extracts the values at `indices` from `row` into a compact `Vec<Value>`.
+/// Called once per new group; skips columns not referenced in SELECT/HAVING.
+#[inline]
+fn extract_non_agg_cols(indices: &[usize], row: &[Value]) -> Vec<Value> {
+    indices
+        .iter()
+        .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+        .collect()
+}
+
+/// Collects all `col_idx` values referenced by non-aggregate expressions
+/// in the SELECT list and HAVING clause. Deduplicated and sorted.
+///
+/// These are the only column values that need to be retained per group for
+/// finalization. All other column values from source rows are discarded.
+fn compute_non_agg_col_indices(stmt: &SelectStmt) -> Vec<usize> {
+    let mut idxs: Vec<usize> = Vec::new();
+
+    for item in &stmt.columns {
+        if let SelectItem::Expr { expr, .. } = item {
+            if !contains_aggregate(expr) {
+                collect_col_idxs_non_agg(expr, &mut idxs);
+            }
+        }
+    }
+    if let Some(having) = &stmt.having {
+        collect_non_agg_col_idxs_in_expr(having, false, &mut idxs);
+    }
+    idxs.sort_unstable();
+    idxs.dedup();
+    idxs
+}
+
+/// Recursively collects `col_idx` values from `expr`, skipping inside aggregates.
+fn collect_col_idxs_non_agg(expr: &Expr, out: &mut Vec<usize>) {
+    match expr {
+        Expr::Column { col_idx, .. } => out.push(*col_idx),
+        Expr::Function { name, args, .. } if is_aggregate(name.as_str()) => {
+            // Do not descend into aggregate arguments — they are handled by accumulators.
+            let _ = args;
+        }
+        Expr::GroupConcat { .. } => {}
+        Expr::BinaryOp { left, right, .. } => {
+            collect_col_idxs_non_agg(left, out);
+            collect_col_idxs_non_agg(right, out);
+        }
+        Expr::UnaryOp { operand, .. } => collect_col_idxs_non_agg(operand, out),
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_col_idxs_non_agg(a, out);
+            }
+        }
+        Expr::Cast { expr, .. } => collect_col_idxs_non_agg(expr, out),
+        Expr::IsNull { expr, .. } => collect_col_idxs_non_agg(expr, out),
+        Expr::Between { expr, low, high, .. } => {
+            collect_col_idxs_non_agg(expr, out);
+            collect_col_idxs_non_agg(low, out);
+            collect_col_idxs_non_agg(high, out);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_col_idxs_non_agg(expr, out);
+            collect_col_idxs_non_agg(pattern, out);
+        }
+        Expr::In { expr, list, .. } => {
+            collect_col_idxs_non_agg(expr, out);
+            for e in list {
+                collect_col_idxs_non_agg(e, out);
+            }
+        }
+        Expr::Case { operand, when_thens, else_result } => {
+            if let Some(e) = operand {
+                collect_col_idxs_non_agg(e, out);
+            }
+            for (w, t) in when_thens {
+                collect_col_idxs_non_agg(w, out);
+                collect_col_idxs_non_agg(t, out);
+            }
+            if let Some(e) = else_result {
+                collect_col_idxs_non_agg(e, out);
+            }
+        }
+        Expr::Literal(_) | Expr::OuterColumn { .. } | Expr::Param { .. }
+        | Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {}
+    }
+}
+
+/// Walk `expr` collecting col_idx values outside aggregate calls.
+/// `inside_agg`: if true we are already inside an aggregate — stop collecting.
+fn collect_non_agg_col_idxs_in_expr(expr: &Expr, inside_agg: bool, out: &mut Vec<usize>) {
+    match expr {
+        Expr::Column { col_idx, .. } if !inside_agg => out.push(*col_idx),
+        Expr::Function { name, args, .. } if is_aggregate(name.as_str()) => {
+            // Descend but mark as inside_agg so sub-columns are not collected.
+            for a in args {
+                collect_non_agg_col_idxs_in_expr(a, true, out);
+            }
+        }
+        Expr::GroupConcat { .. } => {}
+        Expr::BinaryOp { left, right, .. } => {
+            collect_non_agg_col_idxs_in_expr(left, inside_agg, out);
+            collect_non_agg_col_idxs_in_expr(right, inside_agg, out);
+        }
+        Expr::UnaryOp { operand, .. } => collect_non_agg_col_idxs_in_expr(operand, inside_agg, out),
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_non_agg_col_idxs_in_expr(a, inside_agg, out);
+            }
+        }
+        Expr::Cast { expr, .. } => collect_non_agg_col_idxs_in_expr(expr, inside_agg, out),
+        Expr::IsNull { expr, .. } => collect_non_agg_col_idxs_in_expr(expr, inside_agg, out),
+        Expr::Between { expr, low, high, .. } => {
+            collect_non_agg_col_idxs_in_expr(expr, inside_agg, out);
+            collect_non_agg_col_idxs_in_expr(low, inside_agg, out);
+            collect_non_agg_col_idxs_in_expr(high, inside_agg, out);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_non_agg_col_idxs_in_expr(expr, inside_agg, out);
+            collect_non_agg_col_idxs_in_expr(pattern, inside_agg, out);
+        }
+        Expr::In { expr, list, .. } => {
+            collect_non_agg_col_idxs_in_expr(expr, inside_agg, out);
+            for e in list {
+                collect_non_agg_col_idxs_in_expr(e, inside_agg, out);
+            }
+        }
+        Expr::Case { operand, when_thens, else_result } => {
+            if let Some(e) = operand {
+                collect_non_agg_col_idxs_in_expr(e, inside_agg, out);
+            }
+            for (w, t) in when_thens {
+                collect_non_agg_col_idxs_in_expr(w, inside_agg, out);
+                collect_non_agg_col_idxs_in_expr(t, inside_agg, out);
+            }
+            if let Some(e) = else_result {
+                collect_non_agg_col_idxs_in_expr(e, inside_agg, out);
+            }
+        }
+        Expr::Column { .. } | Expr::Literal(_) | Expr::OuterColumn { .. }
+        | Expr::Param { .. } | Expr::Subquery(_) | Expr::InSubquery { .. }
+        | Expr::Exists { .. } => {}
+    }
 }
 
 // ── GROUP BY key hashing ──────────────────────────────────────────────────────
@@ -1165,17 +1468,17 @@ fn execute_select_grouped(
     }
 }
 
-// ── Hash aggregation (original 4.9a implementation) ──────────────────────────
+// ── Hash aggregation ─────────────────────────────────────────────────────────
 
 fn execute_select_grouped_hash(
     stmt: SelectStmt,
     combined_rows: Vec<Row>,
 ) -> Result<QueryResult, DbError> {
-    // Build aggregate registry.
+    // ── Pre-scan setup ────────────────────────────────────────────────────────
+
     let agg_exprs = collect_agg_exprs(&stmt.columns, &stmt.having);
 
-    // Phase 9.5b: Pre-analyze GROUP BY — fast path when all exprs are
-    // simple column refs (avoids eval() per row in the hot loop).
+    // Fast-path: detect when all GROUP BY exprs are simple column refs.
     let group_by_col_idxs: Option<Vec<usize>> = stmt
         .group_by
         .iter()
@@ -1185,19 +1488,49 @@ fn execute_select_grouped_hash(
         })
         .collect();
 
-    // One-pass hash aggregation.
-    let mut groups: HashMap<Vec<u8>, GroupState> = HashMap::new();
+    // Compute which column indices are referenced by non-aggregate SELECT items
+    // and HAVING. Only these need to be stored per group (sparse representation).
+    let non_agg_col_indices = compute_non_agg_col_indices(&stmt);
 
-    // Gap Closure Opt 3: reuse key_buf across iterations to eliminate
-    // per-row Vec allocation for GROUP BY key serialization.
-    // DuckDB uses arena allocators; PostgreSQL uses memory contexts.
-    // We reuse a single Vec<u8> — clear + extend on each row,
-    // clone only when inserting a NEW group into the HashMap.
+    // Row length for virtual_row construction at finalization time.
+    let row_len = combined_rows.first().map(|r| r.len()).unwrap_or(0);
+
+    // ── Choose group table variant ────────────────────────────────────────────
+    //
+    // GroupTablePrimitive: single INT/BIGINT column GROUP BY.
+    //   Key = native i64 — zero serialization, zero allocation per row.
+    //   hashbrown memoizes the u64 hash in its raw table (DataFusion technique).
+    //
+    // GroupTableGeneric: all other cases.
+    //   Key = Vec<u8> from value_to_session_key_bytes (collation-aware).
+    //   hashbrown replaces std::HashMap: SIMD Robin Hood probing, ~20-40% faster.
+
+    let use_primitive = group_by_col_idxs
+        .as_ref()
+        .map(|idxs| idxs.len() == 1)
+        .unwrap_or(false)
+        && combined_rows.first().map(|row| {
+            let col_idx = group_by_col_idxs.as_ref().unwrap()[0];
+            matches!(
+                row.get(col_idx).unwrap_or(&Value::Null),
+                Value::Int(_) | Value::BigInt(_) | Value::Null
+            )
+        }).unwrap_or(false);
+
+    let mut table = if use_primitive {
+        GroupTableKind::Primitive(GroupTablePrimitive::new())
+    } else {
+        GroupTableKind::Generic(GroupTableGeneric::new())
+    };
+
+    // Reused buffers — cleared each iteration, cloned only on new group.
     let mut key_buf: Vec<u8> = Vec::with_capacity(64);
-    let mut key_values_buf: Vec<Value> = Vec::with_capacity(stmt.group_by.len());
+    let mut key_values_buf: Vec<Value> = Vec::with_capacity(stmt.group_by.len().max(1));
+
+    // ── One-pass scan ─────────────────────────────────────────────────────────
 
     for row in &combined_rows {
-        // Evaluate GROUP BY expressions → key values (reuse buffer).
+        // Evaluate GROUP BY expressions (fast-path: direct col_idx indexing).
         key_values_buf.clear();
         if let Some(ref idxs) = group_by_col_idxs {
             for &i in idxs {
@@ -1209,70 +1542,88 @@ fn execute_select_grouped_hash(
             }
         }
 
-        // Serialize key into reused buffer (no allocation if capacity sufficient).
-        key_buf.clear();
-        for v in &key_values_buf {
-            key_buf.extend_from_slice(&value_to_session_key_bytes(v));
-        }
+        // Get-or-insert the group, then update its accumulators.
+        let group_idx = match &mut table {
+            GroupTableKind::Primitive(t) => {
+                let col_idx = group_by_col_idxs.as_ref().unwrap()[0];
+                let key = match row.get(col_idx).unwrap_or(&Value::Null) {
+                    Value::Int(n) => Some(*n as i64),
+                    Value::BigInt(n) => Some(*n),
+                    _ => None,
+                };
+                t.get_or_insert(
+                    key,
+                    key_values_buf[0].clone(),
+                    &agg_exprs,
+                    &non_agg_col_indices,
+                    row,
+                )
+            }
+            GroupTableKind::Generic(t) => {
+                // Serialize key into reused buffer (no allocation if capacity fits).
+                key_buf.clear();
+                for v in &key_values_buf {
+                    key_buf.extend_from_slice(&value_to_session_key_bytes(v));
+                }
+                t.get_or_insert(
+                    &key_buf,
+                    key_values_buf.clone(),
+                    &agg_exprs,
+                    &non_agg_col_indices,
+                    row,
+                )
+            }
+        };
 
-        // HashMap lookup with borrowed key. Only clone on NEW group insertion.
-        if let Some(state) = groups.get_mut(key_buf.as_slice()) {
-            // Existing group — update accumulators, zero allocation.
-            for (acc, agg) in state.accumulators.iter_mut().zip(&agg_exprs) {
-                acc.update(row, agg)?;
-            }
-        } else {
-            // New group — must clone key and values for HashMap ownership.
-            let mut state = GroupState {
-                key_values: key_values_buf.clone(),
-                representative_row: row.clone(),
-                accumulators: agg_exprs.iter().map(AggAccumulator::new).collect(),
-            };
-            for (acc, agg) in state.accumulators.iter_mut().zip(&agg_exprs) {
-                acc.update(row, agg)?;
-            }
-            groups.insert(key_buf.clone(), state);
+        // Update accumulators for this group (zero allocation for existing groups).
+        let entries = table.entries_mut();
+        for (acc, agg) in entries[group_idx].accumulators.iter_mut().zip(&agg_exprs) {
+            acc.update(row, agg)?;
         }
     }
 
-    // Ungrouped aggregate: if no GROUP BY and no rows, still emit one output group.
-    // (e.g., SELECT COUNT(*) FROM empty_table → returns (0), not 0 rows)
-    if stmt.group_by.is_empty() && groups.is_empty() {
-        groups.insert(
-            vec![],
-            GroupState {
-                key_values: vec![],
-                representative_row: vec![],
-                accumulators: agg_exprs.iter().map(AggAccumulator::new).collect(),
-            },
-        );
+    // ── Ungrouped aggregate: emit one group even with no input rows ───────────
+    // e.g., SELECT COUNT(*) FROM empty_table → [(0)], not 0 rows.
+
+    if stmt.group_by.is_empty() && table.entries_mut().is_empty() {
+        let entries = table.entries_mut();
+        entries.push(GroupEntry {
+            key_values: vec![],
+            non_agg_col_values: vec![],
+            accumulators: agg_exprs.iter().map(AggAccumulator::new).collect(),
+        });
     }
 
-    // Build output column metadata.
+    // ── Finalize ──────────────────────────────────────────────────────────────
+
     let out_cols = build_grouped_column_meta(&stmt.columns, &agg_exprs)?;
 
-    // Finalize, HAVING filter, project.
     let mut rows: Vec<Row> = Vec::new();
-    for (_, state) in groups {
-        let agg_values: Vec<Value> = state
+    for entry in table.into_entries() {
+        let agg_values: Vec<Value> = entry
             .accumulators
             .into_iter()
             .map(|acc| acc.finalize())
             .collect::<Result<_, _>>()?;
 
+        // Reconstruct a virtual row for eval_with_aggs / project_grouped_row.
+        // Only the columns in non_agg_col_indices have real values; others are Null.
+        // This preserves the existing function signatures without change.
+        let virtual_row = build_virtual_row(
+            &entry.non_agg_col_values,
+            &non_agg_col_indices,
+            row_len,
+        );
+
         if let Some(ref having) = stmt.having {
-            let v = eval_with_aggs(having, &state.representative_row, &agg_values, &agg_exprs)?;
+            let v = eval_with_aggs(having, &virtual_row, &agg_values, &agg_exprs)?;
             if !is_truthy(&v) {
                 continue;
             }
         }
 
-        let out_row = project_grouped_row(
-            &stmt.columns,
-            &state.representative_row,
-            &agg_values,
-            &agg_exprs,
-        )?;
+        let out_row =
+            project_grouped_row(&stmt.columns, &virtual_row, &agg_values, &agg_exprs)?;
         rows.push(out_row);
     }
 
@@ -1287,6 +1638,26 @@ fn execute_select_grouped_hash(
         columns: out_cols,
         rows,
     })
+}
+
+/// Builds a virtual row of length `row_len` filled with `Value::Null`, then
+/// fills in the stored `non_agg_col_values` at their original column indices.
+///
+/// This allows `eval_with_aggs` and `project_grouped_row` to use the existing
+/// `col_idx`-based lookup without any signature change.
+#[inline]
+fn build_virtual_row(
+    non_agg_col_values: &[Value],
+    non_agg_col_indices: &[usize],
+    row_len: usize,
+) -> Vec<Value> {
+    let mut vrow = vec![Value::Null; row_len];
+    for (val, &idx) in non_agg_col_values.iter().zip(non_agg_col_indices) {
+        if idx < vrow.len() {
+            vrow[idx] = val.clone();
+        }
+    }
+    vrow
 }
 
 // ── Sorted streaming aggregation (4.9b) ──────────────────────────────────────

@@ -31,11 +31,10 @@ fn execute_select_ctx(
 
         // ── COUNT(*) fast path (Phase 8) ─────────────────────────────────
         // Detect `SELECT COUNT(*) FROM table` with no WHERE, no GROUP BY,
-        // no HAVING, no JOIN. For heap tables use HeapChain::count_visible()
-        // (zero column decode). For clustered tables, fall through to the
-        // full scan path (clustered_tree::range already does MVCC filtering).
-        if !resolved.def.is_clustered()
-            && stmt.where_clause.is_none()
+        // no HAVING, no JOIN. For heap tables use HeapChain::count_visible().
+        // For clustered tables use count_clustered_visible() (header-only scan).
+        // Both paths: zero column decode, zero allocs.
+        if stmt.where_clause.is_none()
             && stmt.group_by.is_empty()
             && stmt.having.is_none()
             && stmt.columns.len() == 1
@@ -46,7 +45,15 @@ fn execute_select_ctx(
             }) = stmt.columns.first()
             {
                 if name.eq_ignore_ascii_case("count") && args.is_empty() {
-                    let count = HeapChain::count_visible(storage, resolved.def.root_page_id, snap)?;
+                    let count = if resolved.def.is_clustered() {
+                        crate::table::count_clustered_visible(
+                            storage,
+                            resolved.def.root_page_id,
+                            snap,
+                        )?
+                    } else {
+                        HeapChain::count_visible(storage, resolved.def.root_page_id, snap)?
+                    };
                     let columns = vec![ColumnMeta::computed("count(*)", DataType::BigInt)];
                     let rows = vec![vec![Value::BigInt(count as i64)]];
                     return Ok(QueryResult::Rows { columns, rows });
@@ -100,7 +107,56 @@ fn execute_select_ctx(
                         collect_expr_columns(arg, mask);
                     }
                 }
-                _ => {}
+                // GROUP_CONCAT has its own expression + ORDER BY expressions inside it.
+                // These must be included in the mask so the referenced columns are decoded.
+                crate::expr::Expr::GroupConcat { expr, order_by, .. } => {
+                    collect_expr_columns(expr, mask);
+                    for (ob_expr, _) in order_by {
+                        collect_expr_columns(ob_expr, mask);
+                    }
+                }
+                crate::expr::Expr::Cast { expr, .. } => collect_expr_columns(expr, mask),
+                crate::expr::Expr::IsNull { expr, .. } => collect_expr_columns(expr, mask),
+                crate::expr::Expr::Between {
+                    expr, low, high, ..
+                } => {
+                    collect_expr_columns(expr, mask);
+                    collect_expr_columns(low, mask);
+                    collect_expr_columns(high, mask);
+                }
+                crate::expr::Expr::Like { expr, pattern, .. } => {
+                    collect_expr_columns(expr, mask);
+                    collect_expr_columns(pattern, mask);
+                }
+                crate::expr::Expr::In { expr, list, .. } => {
+                    collect_expr_columns(expr, mask);
+                    for item in list {
+                        collect_expr_columns(item, mask);
+                    }
+                }
+                crate::expr::Expr::Case {
+                    operand,
+                    when_thens,
+                    else_result,
+                } => {
+                    if let Some(op) = operand {
+                        collect_expr_columns(op, mask);
+                    }
+                    for (w, t) in when_thens {
+                        collect_expr_columns(w, mask);
+                        collect_expr_columns(t, mask);
+                    }
+                    if let Some(el) = else_result {
+                        collect_expr_columns(el, mask);
+                    }
+                }
+                // Subquery internals are not scanned — they run as separate queries.
+                crate::expr::Expr::Literal(_)
+                | crate::expr::Expr::Param { .. }
+                | crate::expr::Expr::OuterColumn { .. }
+                | crate::expr::Expr::Subquery(_)
+                | crate::expr::Expr::InSubquery { .. }
+                | crate::expr::Expr::Exists { .. } => {}
             }
         }
 
@@ -129,11 +185,40 @@ fn execute_select_ctx(
                 // ── Clustered full scan (Phase 39.15) ────────────────────────
                 // Iterate all clustered B-tree leaves. MVCC visibility is handled
                 // inside ClusteredRangeIter. WHERE evaluated on decoded values.
-                let mut rows = crate::table::scan_clustered_table(
+                //
+                // Phase 9.2 column projection: only decode columns referenced in
+                // SELECT, WHERE, ORDER BY, GROUP BY, HAVING. For aggregate queries
+                // on wide tables this avoids decoding TEXT columns not needed by
+                // the query (e.g. name, email when aggregating over age, score).
+                let n_cols = resolved.columns.len();
+                let clustered_decode_mask: Option<Vec<bool>> = {
+                    let mut mask = vec![false; n_cols];
+                    // WHERE columns
+                    if let Some(ref wc) = stmt.where_clause {
+                        collect_expr_columns(wc, &mut mask);
+                    }
+                    // SELECT columns
+                    for item in &stmt.columns {
+                        if let crate::ast::SelectItem::Expr { expr, .. } = item {
+                            collect_expr_columns(expr, &mut mask);
+                        } else {
+                            mask.iter_mut().for_each(|m| *m = true);
+                        }
+                    }
+                    // ORDER BY, GROUP BY, HAVING
+                    for ob in &stmt.order_by { collect_expr_columns(&ob.expr, &mut mask); }
+                    for gb in &stmt.group_by { collect_expr_columns(gb, &mut mask); }
+                    if let Some(ref having) = stmt.having {
+                        collect_expr_columns(having, &mut mask);
+                    }
+                    if mask.iter().all(|&b| b) { None } else { Some(mask) }
+                };
+                let mut rows = crate::table::scan_clustered_table_masked(
                     storage,
                     &resolved.def,
                     &resolved.columns,
                     snap,
+                    clustered_decode_mask.as_deref(),
                 )?;
                 // Apply WHERE filter on decoded values (clustered scan doesn't
                 // support inline BatchPredicate yet — Phase 39.20 optimization).
@@ -254,8 +339,44 @@ fn execute_select_ctx(
                         scan_limit,
                     )?
                 } else {
-                    // No WHERE clause — scan all rows.
-                    TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap, None)?
+                    // No WHERE clause — scan all rows with column projection mask.
+                    // Phase 9.2 applies here too: only decode columns referenced in
+                    // SELECT, ORDER BY, GROUP BY, HAVING. Skipping unreferenced TEXT/Bytes
+                    // columns (e.g. name, email in aggregate queries) saves ~2 string
+                    // allocations per row, reducing pressure for aggregate workloads that
+                    // only need a small subset of a wide table's columns.
+                    let n_cols = resolved.columns.len();
+                    let decode_mask_no_where: Option<Vec<bool>> = {
+                        let mut mask = vec![false; n_cols];
+                        for item in &stmt.columns {
+                            if let crate::ast::SelectItem::Expr { expr, .. } = item {
+                                collect_expr_columns(expr, &mut mask);
+                            } else {
+                                mask.iter_mut().for_each(|m| *m = true);
+                            }
+                        }
+                        for ob in &stmt.order_by {
+                            collect_expr_columns(&ob.expr, &mut mask);
+                        }
+                        for gb in &stmt.group_by {
+                            collect_expr_columns(gb, &mut mask);
+                        }
+                        if let Some(ref having) = stmt.having {
+                            collect_expr_columns(having, &mut mask);
+                        }
+                        if mask.iter().all(|&b| b) {
+                            None
+                        } else {
+                            Some(mask)
+                        }
+                    };
+                    TableEngine::scan_table(
+                        storage,
+                        &resolved.def,
+                        &resolved.columns,
+                        snap,
+                        decode_mask_no_where.as_deref(),
+                    )?
                 }
             }
             crate::planner::AccessMethod::IndexLookup { index_def, key }

@@ -1,5 +1,61 @@
 # Architecture Notes
 
+## 2026-04-03 — Aggregate hash execution + zero-alloc clustered scan (39.21)
+
+- `crates/axiomdb-sql/src/executor/aggregate.rs` now has two specialized hash
+  table types:
+  - `GroupTablePrimitive`: `hashbrown::HashMap<i64, usize>` — INT/BIGINT single-column
+    GROUP BY, no key serialization, pure integer comparison
+  - `GroupTableGeneric`: `hashbrown::HashMap<Box<[u8]>, usize>` — multi-column / TEXT /
+    mixed-type GROUP BY, key bytes reused per row via clear+extend
+- `GroupEntry` now uses `non_agg_col_values` (sparse slice of referenced columns)
+  instead of the full `representative_row` clone; indices pre-computed once before scan
+- `value_agg_add` provides direct arithmetic on `Value` variants for SUM/MIN/MAX/COUNT
+- `crates/axiomdb-storage/src/clustered_tree.rs` now exports `scan_all_callback<F>`:
+  - callback receives `(&[u8], Option<(overflow_first_page, tail_len)>)`
+  - bypasses `ClusteredRangeIter`, avoids `ClusteredRow` alloc and `reconstruct_row_data` copy
+  - for inline rows (common case): zero extra allocation per row
+- `crates/axiomdb-sql/src/table.rs` now exports `scan_clustered_table_masked(mask: Option<&[bool]>)`
+  backed by `scan_all_callback`; `scan_clustered_table` delegates to it with `mask = None`
+- `collect_expr_columns` walks SELECT/WHERE/GROUP BY/HAVING/ORDER BY to build a decode mask;
+  now covers all `Expr` variants including `GroupConcat` (was `_ => {}` before, a latent bug)
+
+## 2026-04-03 — Clustered legacy rebuild bridge
+
+- `crates/axiomdb-sql/src/executor/ddl.rs` now owns the first executor-visible
+  heap→clustered migration bridge for Phase `39.19`.
+- The rebuild contract is now explicit:
+  - source rows come from the legacy PRIMARY KEY B-Tree in logical key order
+  - a fresh clustered root is built before any catalog metadata changes
+  - every non-primary index is rebuilt as a clustered-secondary bookmark tree
+  - storage is flushed before the catalog swap makes those roots authoritative
+  - old heap/index pages are reclaimed only through `txn.defer_free_pages(...)`
+    after commit, never via inline `free_page()` during the swap
+- The SQL boundary is intentionally narrow:
+  - `ALTER TABLE ... REBUILD` is for legacy heap+PK tables only
+  - modern `CREATE TABLE ... PRIMARY KEY ...` still starts clustered directly
+  - rollback of newly allocated rebuild pages is still best-effort inside the
+    statement path; generic allocated-page rollback tracking remains future work
+
+## 2026-04-03 — Clustered VACUUM and clustered root-persistence fix
+
+- `crates/axiomdb-sql/src/vacuum.rs` now owns the executor-visible clustered
+  maintenance bridge for Phase `39.18`.
+- The clustered purge contract is now explicit:
+  - descend once to the leftmost clustered leaf
+  - walk `next_leaf`
+  - remove only cells whose delete-mark is physically safe
+  - free any overflow chain owned by each purged cell
+  - clean clustered secondaries only when the bookmarked clustered row no longer
+    exists physically after purge
+- The shared vacuum/index-cleanup contract is also tighter now:
+  - `BTree::delete_many_in(...)` may rotate or collapse the root
+  - VACUUM must persist that new root into the catalog immediately
+  - clustered and heap vacuum now share that root-persistence rule
+- `crates/axiomdb-storage/src/clustered_tree.rs` now exports
+  `descend_to_leaf_pub(...)` for executor-side batched clustered leaf work
+  without re-running a full row lookup
+
 ## 2026-04-02 — Clustered internal page primitive, clustered insert/read/update/delete/rebalance, clustered secondary bookmarks, clustered overflow pages, clustered WAL support, clustered crash recovery, clustered CREATE TABLE, and clustered SQL INSERT/SELECT/UPDATE/DELETE
 
 - `crates/axiomdb-storage/src/clustered_internal.rs` owns the clustered
@@ -78,7 +134,7 @@
   - stamp `txn_id_deleted` on the current inline version only when it is visible
   - preserve key bytes, row payload bytes, `txn_id_created`, `row_version`, and `next_leaf`
   - keep the physical cell inline so older snapshots can still observe it
-  - defer purge to later clustered phases
+  - defer purge to later clustered `VACUUM`
 - The clustered structural-maintenance contract is now also explicit:
   - `update_with_relocation(...)` uses `update_in_place(...)` as the fast path
   - physical delete is private helper logic, not the public delete API

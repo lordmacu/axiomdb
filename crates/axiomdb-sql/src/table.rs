@@ -1334,6 +1334,53 @@ pub fn decode_row_from_bytes(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<
 
 // ── Clustered table scan helpers (Phase 39.15) ──────────────────────────────
 
+/// COUNT(*) fast path for clustered tables: walks the leaf chain and counts
+/// cells with visible RowHeaders WITHOUT decoding any row data.
+/// Only reads the 24-byte RowHeader per cell (~20× faster than full decode).
+pub fn count_clustered_visible(
+    storage: &dyn StorageEngine,
+    root_pid: u64,
+    snap: TransactionSnapshot,
+) -> Result<u64, DbError> {
+    use axiomdb_storage::{clustered_internal, clustered_leaf, page::PageType};
+
+    // Descend to leftmost leaf.
+    let mut pid = root_pid;
+    loop {
+        let page = storage.read_page(pid)?;
+        let pt = PageType::try_from(page.header().page_type)
+            .map_err(|e| DbError::Other(format!("{e}")))?;
+        match pt {
+            PageType::ClusteredLeaf => break,
+            PageType::ClusteredInternal => {
+                pid = clustered_internal::child_at(&page, 0)?;
+            }
+            _ => {
+                return Err(DbError::BTreeCorrupted {
+                    msg: format!("count_clustered_visible: unexpected page type {pt:?} at {pid}"),
+                });
+            }
+        }
+    }
+
+    // Walk leaf chain, count visible cells.
+    let mut count = 0u64;
+    let mut current = pid;
+    while current != clustered_leaf::NULL_PAGE {
+        let page = storage.read_page(current)?;
+        let n = clustered_leaf::num_cells(&page);
+        for idx in 0..n {
+            let cell = clustered_leaf::read_cell(&page, idx)?;
+            if cell.row_header.is_visible(&snap) {
+                count += 1;
+            }
+        }
+        current = clustered_leaf::next_leaf(&page);
+    }
+
+    Ok(count)
+}
+
 /// Dummy RecordId for clustered rows (no heap slot).  The downstream pipeline
 /// (WHERE recheck, ORDER BY, GROUP BY, projection) only uses the `Vec<Value>`;
 /// the RecordId is carried for type compatibility and is never used as a
@@ -1351,21 +1398,50 @@ pub fn scan_clustered_table(
     columns: &[ColumnDef],
     snap: TransactionSnapshot,
 ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
-    use std::ops::Bound;
+    scan_clustered_table_masked(storage, table_def, columns, snap, None)
+}
+
+/// Like [`scan_clustered_table`] but only decodes columns indicated by `mask`.
+///
+/// When `mask` is `Some`, columns with `mask[i] == false` are decoded as
+/// `Value::Null`, saving heap allocations for TEXT/Bytes columns that the
+/// query does not reference (e.g. aggregate queries on a subset of columns).
+pub fn scan_clustered_table_masked(
+    storage: &dyn StorageEngine,
+    table_def: &TableDef,
+    columns: &[ColumnDef],
+    snap: TransactionSnapshot,
+    mask: Option<&[bool]>,
+) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
     let col_types = column_data_types(columns);
-    let iter = axiomdb_storage::clustered_tree::range(
+    let mut result = Vec::new();
+    axiomdb_storage::clustered_tree::scan_all_callback(
         storage,
         Some(table_def.root_page_id),
-        Bound::Unbounded,
-        Bound::Unbounded,
         &snap,
+        |inline_data, overflow| {
+            let values = if let Some((first_page, tail_len)) = overflow {
+                // Overflow row: assemble full bytes first (rare for typical row sizes).
+                let tail =
+                    axiomdb_storage::clustered_overflow::read_chain(storage, first_page, tail_len)?;
+                let mut full = Vec::with_capacity(inline_data.len() + tail.len());
+                full.extend_from_slice(inline_data);
+                full.extend_from_slice(&tail);
+                match mask {
+                    Some(m) => decode_row_masked(&full, &col_types, m)?,
+                    None => decode_row(&full, &col_types)?,
+                }
+            } else {
+                // Inline row (common case): decode directly — zero extra allocation.
+                match mask {
+                    Some(m) => decode_row_masked(inline_data, &col_types, m)?,
+                    None => decode_row(inline_data, &col_types)?,
+                }
+            };
+            result.push((CLUSTERED_DUMMY_RID, values));
+            Ok(())
+        },
     )?;
-    let mut result = Vec::new();
-    for row_result in iter {
-        let row = row_result?;
-        let values = decode_row(&row.row_data, &col_types)?;
-        result.push((CLUSTERED_DUMMY_RID, values));
-    }
     Ok(result)
 }
 

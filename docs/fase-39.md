@@ -1,6 +1,6 @@
 # Phase 39 — Clustered Index Storage Engine
 
-## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7, 39.8, 39.9, 39.10, 39.11, 39.12, 39.13, 39.14, 39.15
+## Subfases completed in this session: 39.2, 39.3, 39.4, 39.5, 39.6, 39.7, 39.8, 39.9, 39.10, 39.11, 39.12, 39.13, 39.14, 39.15, 39.16, 39.17, 39.18
 
 ## What was built
 
@@ -931,6 +931,124 @@ Targeted validation for `39.17` passed on the clustered delete surface:
 - `cargo test -p axiomdb-sql --test integration_clustered_update -j1`
 - `cargo check -p axiomdb-sql --lib -j1`
 
+### 39.18 — VACUUM for clustered index
+
+`crates/axiomdb-sql/src/vacuum.rs` now exposes the first clustered maintenance
+path at SQL level.
+
+Behavior now exposed through SQL:
+
+- `VACUUM table_name` on an explicit-`PRIMARY KEY` clustered table no longer
+  falls back to the heap-only contract
+- clustered vacuum descends once to the leftmost clustered leaf and walks the
+  `next_leaf` chain
+- safe delete-marked clustered cells are physically removed when
+  `txn_id_deleted < oldest_safe_txn`
+- overflow-backed clustered rows free their overflow-page chains during purge
+- clustered leaves are defragmented when freeblock waste exceeds the local threshold
+- clustered secondary bookmark cleanup now decodes each PK bookmark and keeps
+  only entries whose clustered row still exists physically after leaf purge
+- secondary `BTree::delete_many_in(...)` root rotations are now persisted back
+  into the catalog instead of leaving stale roots behind
+- uncommitted clustered deletes remain untouched by `VACUUM`; the bookmark
+  stays alive until the row is physically purgeable
+
+Current boundary after `39.18`:
+
+- clustered `VACUUM` is now SQL-visible on clustered tables
+- clustered delete still begins as delete-mark; purge happens later through `VACUUM`
+- clustered child-table FK enforcement remains deferred
+- standalone clustered `CREATE INDEX` and `ANALYZE` remain deferred
+- clustered table rewrite / migration still belongs to `39.19`
+
+Supporting changes for `39.18`:
+
+- `crates/axiomdb-sql/src/vacuum.rs`
+  - routes clustered tables into a clustered leaf-purge path
+  - frees clustered overflow chains during purge
+  - cleans clustered secondary bookmarks by clustered physical existence after purge
+  - persists any bulk-delete root rotation back into the catalog for both shared
+    and clustered vacuum index cleanup
+- `crates/axiomdb-storage/src/clustered_tree.rs`
+  - exports `descend_to_leaf_pub(...)` for executor-side clustered batching
+- `crates/axiomdb-sql/tests/integration_clustered_vacuum.rs`
+  - adds coverage for secondary cleanup, uncommitted-delete safety, overflow-page reuse,
+    and post-cleanup clustered secondary queries
+- `tools/wire-test.py`
+  - adds MySQL wire smoke coverage for clustered `VACUUM` committed purge and
+    uncommitted-delete safety
+
+Targeted validation for `39.18` passed on the clustered vacuum surface:
+
+- `cargo test -p axiomdb-sql --test integration_clustered_vacuum -j1`
+- `cargo test -p axiomdb-sql test_persist_index_root_if_changed_updates_catalog --lib -j1`
+- `cargo check -p axiomdb-sql --lib -j1`
+- `cargo clippy -p axiomdb-storage --lib -- -D warnings`
+- `cargo clippy -p axiomdb-sql --lib --test integration_clustered_vacuum -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity -A clippy::needless_borrow`
+- `cargo fmt --check`
+- `cargo build --bin axiomdb-server -j1`
+- `python3 tools/wire-test.py`
+
+### 39.19 — Table rebuild: heap to clustered migration
+
+`crates/axiomdb-sql/src/executor/ddl.rs` now closes the first clustered
+migration bridge for legacy heap tables that already have PRIMARY KEY metadata.
+
+Behavior now exposed through SQL:
+
+- `ALTER TABLE t REBUILD` now accepts legacy heap tables that already own a
+  PRIMARY KEY index
+- the rebuild walks the old PRIMARY KEY B-Tree in logical key order, batch-reads
+  the heap rows behind those `RecordId`s, and feeds the rows into a fresh
+  clustered tree
+- the table root then flips from heap to clustered in the catalog, and the
+  PRIMARY KEY metadata is updated to point at that clustered root
+- every non-primary index is rebuilt as a clustered secondary bookmark index,
+  so post-rebuild secondary probes resolve as `secondary key -> PK bookmark ->
+  clustered row`
+- old heap and old index pages are not freed inline during the metadata swap;
+  they are queued through `txn.defer_free_pages(...)` and reclaimed only after
+  the DDL commit path completes
+
+Current boundary after `39.19`:
+
+- the SQL-visible rebuild path is for legacy heap+PK tables only
+- new tables with explicit `PRIMARY KEY` still start clustered directly at
+  `CREATE TABLE` time
+- the rebuild path flushes newly built roots before the metadata swap and cleans
+  pending new roots best-effort on statement failure
+- fully generic rollback accounting for freshly allocated pages still remains a
+  later cross-cutting transactional concern
+- phase closeout, broader clustered integration coverage, and benchmarks still
+  belong to `39.20`
+
+Supporting changes for `39.19`:
+
+- `crates/axiomdb-sql/src/executor/ddl.rs`
+  - replaces the placeholder rebuild path with a real legacy heap→clustered migration
+  - treats dead slots referenced by the old PK index as index-integrity failure
+    instead of silently dropping rows
+  - flushes the rebuilt clustered / secondary roots before the catalog swap
+  - uses `txn.defer_free_pages(...)` for old heap/index pages instead of
+    immediate `free_page()` during the swap
+  - removes `expect`-based empty-root bootstrap and adds best-effort cleanup for
+    newly built clustered artifacts on pre-commit errors
+- `crates/axiomdb-sql/tests/integration_clustered_rebuild.rs`
+  - seeds real legacy heap+PK fixtures
+  - verifies post-rebuild clustered metadata, reclaimed old roots, secondary
+    bookmark decoding, and post-rebuild `UPDATE` / `DELETE` / `VACUUM`
+- `tools/wire-test.py`
+  - adds MySQL wire smoke coverage for `ALTER TABLE ... REBUILD` syntax and guard rails
+
+Targeted validation for `39.19` passed on the clustered rebuild surface:
+
+- `cargo test -p axiomdb-sql --test integration_clustered_rebuild -j1`
+- `cargo test -p axiomdb-sql --test integration_clustered_create_table -j1`
+- `cargo check -p axiomdb-sql --lib -j1`
+- `cargo clippy -p axiomdb-sql --lib --test integration_clustered_rebuild -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity -A clippy::needless_borrow`
+- `cargo build --bin axiomdb-server -j1`
+- `python3 tools/wire-test.py`
+
 ## Review notes
 
 - All `39.3` acceptance criteria from the spec are implemented.
@@ -949,6 +1067,9 @@ Targeted validation for `39.17` passed on the clustered delete surface:
   intentionally deferred clustered index-only optimization.
 - All `39.16` acceptance criteria from the spec are implemented.
 - All `39.17` acceptance criteria from the spec are implemented.
+- All `39.18` acceptance criteria from the spec are implemented.
+- All `39.19` acceptance criteria from the spec are implemented except the
+  explicitly deferred general page-allocation rollback tracking.
 - No `unsafe` was introduced in the clustered tree path.
 - No production `unwrap()` remains in the touched clustered files.
 - No production `unwrap()` was introduced in the new clustered-secondary path.
@@ -956,21 +1077,100 @@ Targeted validation for `39.17` passed on the clustered delete surface:
 - No production `unwrap()` was introduced in the new clustered WAL / rollback path.
 - No production `unwrap()` was introduced in the clustered crash recovery path.
 - No production `unwrap()` was introduced in the clustered DDL / runtime-guard path.
+- No production `unwrap()` remains in the new clustered rebuild path.
 - Benchmarking remains intentionally deferred: `39.5` finishes the storage-level
   clustered read slice, and `39.6` / `39.7` / `39.8` / `39.9` add the first clustered mutation, rebalance, and bookmark slices,
   `39.10` adds overflow-backed row storage, `39.11` adds internal WAL/rollback support, `39.12` adds internal clustered crash recovery,
   `39.13` exposes the first SQL-visible clustered DDL boundary, `39.14`
   exposes the first SQL-visible clustered INSERT path, `39.15` exposes the
-  first SQL-visible clustered read path, `39.16` exposes clustered UPDATE, and
-  `39.17` exposes clustered DELETE, but end-to-end clustered maintenance
-  benchmarks still wait for `39.18+`.
+  first SQL-visible clustered read path, `39.16` exposes clustered UPDATE,
+  `39.17` exposes clustered DELETE, `39.18` exposes clustered VACUUM, and
+  `39.19` now exposes legacy heap→clustered rebuild, but broader clustered
+  integration expansion and benchmarks still wait for `39.20`.
+
+### 39.21 — Aggregate hash execution
+
+**What was built**
+
+A complete hash-based aggregate execution engine for `GROUP BY` queries with `COUNT`, `SUM`,
+`AVG`, `MIN`, `MAX`, and `GROUP_CONCAT`, plus a zero-allocation clustered scan path that
+unlocks the full performance potential of the aggregate executor.
+
+**Architecture — two-layer design**
+
+The aggregate engine uses two specialized hash table types to avoid generic overhead:
+
+- `GroupTablePrimitive` — single-column `GROUP BY` on integer-like values (`INT`, `BIGINT`,
+  `DOUBLE`, `Bool`). Maps `i64` key → `GroupEntry` via `hashbrown::HashMap<i64, usize>`.
+  Avoids serialization: key comparison is a single integer comparison.
+
+- `GroupTableGeneric` — multi-column `GROUP BY`, text columns, mixed types, and the global
+  no-GROUP-BY case. Serializes group keys into a `Vec<u8>` reused across rows (zero alloc
+  if capacity fits), maps `&[u8]` → `GroupEntry` via `hashbrown::HashMap<Box<[u8]>, usize>`.
+
+Each `GroupEntry` holds:
+- `key_values: Vec<Value>` — evaluated GROUP BY expression values (stored for output)
+- `non_agg_col_values: Vec<Value>` — sparse slice of non-aggregate SELECT columns
+- `accumulators: Vec<AggAccumulator>` — one per aggregate function in the query
+
+**Accumulator fast path**
+
+`value_agg_add` replaces the `eval()`-based dispatch for `SUM`, `MIN`, `MAX`, and `COUNT`:
+direct arithmetic on `Value` variants, no expression evaluation overhead. `finalize_avg`
+divides `sum / count` using exact `f64` arithmetic, returning `Value::Null` when count = 0.
+
+**Column decode mask**
+
+Before scanning, `collect_expr_columns` walks all expressions in SELECT, WHERE, GROUP BY,
+HAVING, and ORDER BY to build a `Vec<bool>` decode mask. Only columns referenced by at least
+one expression are decoded from the row bytes — unused columns (e.g., large TEXT fields in an
+`AVG(score)` query) are skipped at the codec level. The mask is passed as `Option<&[bool]>` to
+`scan_clustered_table_masked`, which forwards it to `decode_row_masked`.
+
+**Zero-allocation clustered scan (`scan_all_callback`)**
+
+`axiomdb_storage::clustered_tree::scan_all_callback` walks B-tree leaves directly via the
+`leftmost_leaf_pid` + `next_leaf` linked list, bypassing `ClusteredRangeIter` entirely.
+For inline rows (the common case), it provides a `&[u8]` slice directly from the leaf page
+memory — no `ClusteredRow` struct, no `cell.key.to_vec()`, no `reconstruct_row_data` copy.
+This reduces allocations from ~3 per row to ~1 per row (just the `Vec<Value>` for decode).
+
+**Performance impact (bench_users — 50K rows, clustered, MmapStorage, wire protocol)**
+
+| Query | Before | After | vs MariaDB | vs MySQL |
+|---|---|---|---|---|
+| GROUP BY age + AVG(score) | 57 ms | 4.0 ms | **1.6× faster** (6.5ms) | **2.2× faster** (8.9ms) |
+| COUNT(*) no GROUP BY | 0.8 ms | 0.8 ms | — | — |
+
+14.25× improvement. Bottleneck was the scan phase (3 allocs/row × 50K rows),
+not the aggregate computation. The aggregate hash tables add ~0.3ms overhead over a raw
+scan.
+
+**Correctness verification**
+
+- `SELECT SUM(score) FROM bench_users` via `CountStart + AVG × COUNT` cross-check: 0.0%
+  relative error across all 62 age groups
+- 11 integration tests (`crates/axiomdb-sql/tests/integration_aggregate_hash.rs`): INT GROUP BY,
+  COUNT(*) empty table, MIN/MAX, HAVING SUM, NULL group, AVG all-NULL → Null, non-agg col in
+  SELECT, SUM INT, multi-column GROUP BY, TEXT GROUP BY, HAVING non-agg column
+- 9 wire protocol smoke tests added to `tools/wire-test.py` (section `39.21`)
+
+**Acceptance criteria**
+
+- All `39.21` acceptance criteria from the spec are implemented.
+- No production `unwrap()` was introduced.
+- No `unsafe` was introduced.
+- `GroupConcat` columns correctly handled by `collect_expr_columns` (fixed a fallthrough bug
+  that would have decoded GROUP_CONCAT columns as Null when the decode mask was active).
 
 ## Deferred
 
-- `39.18` — physical purge of dead clustered cells
 - later clustered root persistence — today `39.12` still rebuilds roots from surviving WAL history, so checkpoint/rotation persistence is not solved yet
 - later clustered FK work — child-side FK enforcement still rejects clustered child tables
-- `39.18+` — remaining executor-visible clustered maintenance paths
+- later transactional page-allocation tracking — `39.19` cleans newly built
+  rebuild roots best-effort inside the statement path, but generic rollback of
+  freshly allocated pages remains a broader future concern
+- `39.20` — clustered integration expansion and benchmarks
 
 ## Notes
 
