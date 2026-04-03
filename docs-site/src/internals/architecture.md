@@ -45,8 +45,8 @@ prevents circular dependencies and makes each component independently testable.
 │  ├── eval      (expression evaluator, three-valued NULL logic,      │
 │  │              CASE WHEN searched + simple form, short-circuit)    │
 │  ├── result    (QueryResult, ColumnMeta, Row — executor return type)│
-│  ├── table     (TableEngine — scan/insert/delete/update over heap)  │
-│  ├── index_integrity (startup index-vs-heap verifier + rebuild)     │
+│  ├── table     (TableEngine — heap DML; clustered guard rails today)│
+│  ├── index_integrity (startup index-vs-heap verifier; skips clustered)│
 │  └── executor/ (mod.rs facade + select/insert/update/delete/ddl/   │
 │                 join/aggregate/shared modules; same execute() API; │
 │                 GROUP BY + HAVING + ORDER BY + LIMIT/OFFSET +      │
@@ -176,6 +176,16 @@ Schema persistence and lookup:
 - `CatalogReader` — reads schema from the system tables for use by the analyzer
   and executor; uses a `TransactionSnapshot` for MVCC-consistent reads
 - Schema types: `TableDef`, `ColumnDef`, `IndexDef`
+- `TableDef` now carries `root_page_id` plus `TableStorageLayout::{Heap, Clustered}`
+- `CatalogWriter::create_table_with_layout(...)` allocates either a heap or clustered table root
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — DDL First, DML Later</span>
+Phase 39.13 makes the catalog and `CREATE TABLE` clustered-aware before touching generic executor DML. That keeps the storage rewrite honest: the engine now records the real physical table layout, and old heap code is forced to fail fast instead of silently operating on the wrong root type.
+</div>
+</div>
 
 ### axiomdb-mvcc
 
@@ -209,7 +219,8 @@ The SQL processing pipeline:
   between the executor and all callers (embedded API, wire protocol, CLI)
 - `index_integrity` — startup-time verification that compares every
   catalog-visible index against heap-visible rows after WAL recovery and
-  rebuilds readable divergent indexes before open returns
+  rebuilds readable divergent indexes before open returns; clustered tables are
+  currently skipped because their PRIMARY KEY metadata reuses the clustered root
 - `executor/` — directory module rooted at `executor/mod.rs`; the facade still exports
   `execute`, `execute_with_ctx`, and `last_insert_id_value`, but the implementation is
   now split into `shared.rs`, `select.rs`, `joins.rs`, `aggregate.rs`, `insert.rs`,
@@ -219,6 +230,8 @@ The SQL processing pipeline:
   sort keys and per-column `NULLS FIRST/LAST` control, `LIMIT n OFFSET m` for pagination,
   `SELECT DISTINCT` with NULL-equality dedup (two NULL values are considered equal for
   deduplication), and `INSERT … SELECT` for bulk copy and aggregate materialization
+- clustered tables now enter the catalog through `CREATE TABLE ... PRIMARY KEY ...`, but
+  `INSERT` / `SELECT` / `UPDATE` / `DELETE` still reject them explicitly until `39.14`–`39.17`
 - Stable-RID UPDATE fast path — same-slot heap rewrite that preserves `RecordId`
   when the new encoded row fits and makes untouched-index skipping safe
 - UPDATE apply fast path — indexed UPDATE now batches candidate heap reads,

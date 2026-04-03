@@ -75,8 +75,13 @@ pub fn check_fk_child_insert(
         // Find the parent's PRIMARY KEY or UNIQUE index covering parent_col_idx.
         // We use a block scope so the reader (which holds &storage) is dropped
         // before any call that needs &mut storage.
-        let (parent_index_id, parent_index_root) = {
+        let (parent_index_id, parent_index_root, parent_clustered_primary) = {
             let mut reader = CatalogReader::new(storage, snap)?;
+            let parent_def = reader.get_table_by_id(fk.parent_table_id)?.ok_or(
+                DbError::CatalogTableNotFound {
+                    table_id: fk.parent_table_id,
+                },
+            )?;
             let parent_indexes = reader.list_indexes(fk.parent_table_id)?;
             let parent_idx = parent_indexes
                 .iter()
@@ -93,7 +98,11 @@ pub fn check_fk_child_insert(
                         column: cname,
                     }
                 })?;
-            (parent_idx.index_id, parent_idx.root_page_id)
+            (
+                parent_idx.index_id,
+                parent_idx.root_page_id,
+                parent_def.is_clustered() && parent_idx.is_primary,
+            )
         }; // reader dropped here → &storage released
 
         // Phase 6.9: PK B-Trees are now populated via insert_into_indexes
@@ -109,7 +118,12 @@ pub fn check_fk_child_insert(
             });
         }
 
-        let parent_exists = BTree::lookup_in(storage, parent_index_root, &key)?.is_some();
+        let parent_exists = if parent_clustered_primary {
+            axiomdb_storage::clustered_tree::lookup(storage, Some(parent_index_root), &key, &snap)?
+                .is_some()
+        } else {
+            BTree::lookup_in(storage, parent_index_root, &key)?.is_some()
+        };
 
         if !parent_exists {
             let (tname, cname) = resolve_names(storage, snap, fk.child_table_id, fk.child_col_idx);
@@ -207,6 +221,9 @@ pub fn enforce_fk_on_parent_delete(
                     table_id: fk.child_table_id,
                 })?
         };
+        child_table_def.ensure_heap_runtime(
+            "foreign key enforcement on clustered child table — Phase 39.17+",
+        )?;
         let child_cols = {
             let mut reader = CatalogReader::new(storage, snap)?;
             reader.list_columns(fk.child_table_id)?
@@ -576,6 +593,9 @@ pub fn enforce_fk_on_parent_update(
                     table_id: fk.child_table_id,
                 })?
         };
+        child_table_def.ensure_heap_runtime(
+            "foreign key enforcement on clustered child table — Phase 39.17+",
+        )?;
         let child_cols = {
             let mut reader = CatalogReader::new(storage, snap)?;
             reader.list_columns(fk.child_table_id)?
@@ -660,6 +680,8 @@ fn children_exist_via_scan(
     fk_val: &Value,
     snap: axiomdb_core::TransactionSnapshot,
 ) -> Result<bool, DbError> {
+    child_table_def
+        .ensure_heap_runtime("foreign key enforcement on clustered child table — Phase 39.17+")?;
     let rows = TableEngine::scan_table(storage, child_table_def, child_cols, snap, None)?;
     Ok(rows.iter().any(|(_, row)| {
         row.get(child_col_idx as usize)
@@ -682,6 +704,8 @@ fn find_children_via_scan(
     fk_val: &Value,
     snap: axiomdb_core::TransactionSnapshot,
 ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+    child_table_def
+        .ensure_heap_runtime("foreign key enforcement on clustered child table — Phase 39.17+")?;
     let rows = TableEngine::scan_table(storage, child_table_def, child_cols, snap, None)?;
     Ok(rows
         .into_iter()

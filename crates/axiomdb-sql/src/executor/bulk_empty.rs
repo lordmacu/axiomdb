@@ -87,12 +87,13 @@ fn plan_bulk_empty_table(
     indexes: &[axiomdb_catalog::IndexDef],
     snap: axiomdb_core::TransactionSnapshot,
 ) -> Result<BulkEmptyPlan, DbError> {
+    table_def.ensure_heap_runtime("DELETE from clustered table — Phase 39.17")?;
     // Count rows visible to this statement for DELETE row-count semantics.
-    let rids = HeapChain::scan_rids_visible(storage, table_def.data_root_page_id, snap)?;
+    let rids = HeapChain::scan_rids_visible(storage, table_def.root_page_id, snap)?;
     let visible_row_count = rids.len() as u64;
 
     // Collect old page IDs before allocating new ones (avoids any overlap).
-    let mut old_pages = collect_heap_chain_pages(storage, table_def.data_root_page_id)?;
+    let mut old_pages = collect_heap_chain_pages(storage, table_def.root_page_id)?;
     for idx in indexes {
         old_pages.extend(collect_btree_pages(storage, idx.root_page_id)?);
     }
@@ -127,8 +128,9 @@ fn apply_bulk_empty_table(
     table_def: &axiomdb_catalog::TableDef,
     plan: BulkEmptyPlan,
 ) -> Result<(), DbError> {
+    table_def.ensure_heap_runtime("DELETE from clustered table — Phase 39.17")?;
     // Rotate heap root in the catalog.
-    CatalogWriter::new(storage, txn)?.update_table_data_root(table_def.id, plan.new_data_root)?;
+    CatalogWriter::new(storage, txn)?.update_table_root(table_def.id, plan.new_data_root)?;
 
     // Rotate each index root in the catalog + reset its Bloom filter.
     for (index_id, new_root) in &plan.new_index_roots {

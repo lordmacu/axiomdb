@@ -11,6 +11,9 @@ fn execute_update_ctx(
         ctx,
         &stmt.table,
     )?;
+    resolved
+        .def
+        .ensure_heap_runtime("UPDATE on clustered table — Phase 39.16")?;
 
     let schema_cols = resolved.columns.clone();
     let secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
@@ -660,6 +663,9 @@ fn execute_update(
         let mut resolver = make_resolver(storage, txn)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
+    resolved
+        .def
+        .ensure_heap_runtime("UPDATE on clustered table — Phase 39.16")?;
 
     let schema_cols = resolved.columns.clone();
 

@@ -120,6 +120,29 @@ SQLite-style slotted pages solve variable-size key storage cleanly, but clustere
 </div>
 </div>
 
+### SQL-Visible Clustered DDL Boundary (Phase 39.13)
+
+The storage rewrite is no longer purely internal. `CREATE TABLE` now uses the
+clustered root when the SQL definition contains an explicit `PRIMARY KEY`:
+
+- `TableDef.root_page_id` is the generic primary row-store root
+- `TableDef.storage_layout` tells higher layers whether that root is heap or clustered
+- heap tables still allocate `PageType::Data`
+- clustered tables now allocate `PageType::ClusteredLeaf`
+- logical PRIMARY KEY metadata on clustered tables points at that same clustered root
+
+The executor still does **not** read or write clustered rows through SQL in
+`39.13`; heap-only runtime paths fail explicitly instead of treating a
+clustered root page as heap storage.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — No Hidden Clustered Key</span>
+AxiomDB only creates clustered SQL tables when the schema has an explicit `PRIMARY KEY`. That mirrors SQLite `WITHOUT ROWID` more closely than InnoDB's fallback `GEN_CLUST_INDEX` path and avoids baking a hidden-key compromise into the first clustered executor boundary.
+</div>
+</div>
+
 ### Clustered Tree Insert Controller (Phase 39.3)
 
 `axiomdb-storage::clustered_tree` now builds the first tree-level write path on

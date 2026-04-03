@@ -1,6 +1,6 @@
 # Architecture Notes
 
-## 2026-04-02 — Clustered internal page primitive, clustered insert/read/update/delete/rebalance, clustered secondary bookmarks, clustered overflow pages, clustered WAL support, and clustered crash recovery
+## 2026-04-02 — Clustered internal page primitive, clustered insert/read/update/delete/rebalance, clustered secondary bookmarks, clustered overflow pages, clustered WAL support, clustered crash recovery, and clustered CREATE TABLE
 
 - `crates/axiomdb-storage/src/clustered_internal.rs` owns the clustered
   internal page format for Phase `39.2`.
@@ -12,10 +12,19 @@
   clustered WAL in Phases `39.11` and `39.12`.
 - `crates/axiomdb-sql/src/clustered_secondary.rs` now owns the clustered-first
   secondary bookmark layout for Phase `39.9`.
+- `crates/axiomdb-catalog/src/schema.rs` and `crates/axiomdb-catalog/src/writer.rs`
+  now own the dual-mode table-root contract for Phase `39.13`.
+- `crates/axiomdb-sql/src/executor/ddl.rs` now decides heap vs clustered table
+  creation from the presence of an explicit primary key.
 - The architecture still keeps storage and tree responsibilities separate:
   - storage owns page layout, free-space accounting, binary search, and page-local mutation
   - `clustered_tree` owns descent, exact leaf search, split planning, separator propagation, and root growth
-  - the executor is still not wired to clustered tables
+  - the executor is still not wired to clustered clustered-row DML paths
+  - only the DDL/catalog boundary is clustered-aware in `39.13`
+- The catalog/root contract is now generic instead of heap-specific:
+  - `TableDef.root_page_id` points to the primary row-store root for the table
+  - `TableDef.storage_layout` tells the executor whether that root is a heap chain or a clustered tree
+  - logical primary-index metadata on clustered tables reuses the same `root_page_id`
 - The child mapping rule remains explicit:
   - `leftmost_child` lives in the 16-byte page-local header
   - every separator cell stores only its `right_child`
@@ -79,6 +88,11 @@
   - rollback and crash recovery restore logical row state, not exact pre-change page topology
   - `open()` / `open_with_recovery()` rebuild clustered roots from WAL history today
   - checkpoint/rotation-stable clustered root persistence remains future work
+- The clustered executor boundary is now explicit:
+  - clustered tables are created only when the SQL definition has an explicit `PRIMARY KEY`
+  - tables without explicit PK remain heap-backed for now
+  - heap-only executor helpers reject clustered tables instead of touching the wrong page format
+  - startup index-integrity repair skips clustered tables until clustered executor/index rebuild work exists
 - Variable-size occupancy is measured in encoded bytes, not key count:
   - clustered leaves split by cumulative cell footprint
   - clustered internals split by cumulative separator footprint

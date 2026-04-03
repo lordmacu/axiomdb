@@ -5,6 +5,13 @@ fn execute_create_table(
     database: &str,
 ) -> Result<QueryResult, DbError> {
     let schema = stmt.table.schema.as_deref().unwrap_or("public");
+    let primary_key = collect_create_table_primary_key(&stmt)?;
+    let unique_indexes = collect_create_table_unique_indexes(&stmt)?;
+    let storage_layout = if primary_key.is_some() {
+        axiomdb_catalog::schema::TableStorageLayout::Clustered
+    } else {
+        axiomdb_catalog::schema::TableStorageLayout::Heap
+    };
 
     // Check existence before constructing CatalogWriter (avoids double mutable borrow).
     {
@@ -21,7 +28,8 @@ fn execute_create_table(
     } // resolver dropped here — releases immutable borrow on storage
 
     let mut writer = CatalogWriter::new(storage, txn)?;
-    let table_id = writer.create_table(schema, &stmt.table.name)?;
+    let table_def = writer.create_table_with_layout(schema, &stmt.table.name, storage_layout)?;
+    let table_id = table_def.id;
     if database != DEFAULT_DATABASE_NAME {
         writer.bind_table_to_database(table_id, database)?;
     }
@@ -40,7 +48,6 @@ fn execute_create_table(
             .constraints
             .iter()
             .any(|c| matches!(c, ColumnConstraint::AutoIncrement));
-        // Also detect inline REFERENCES constraints — collect for processing below.
         if let Some(refs) = col_def.constraints.iter().find_map(|c| {
             if let ColumnConstraint::References {
                 table,
@@ -67,150 +74,95 @@ fn execute_create_table(
         })?;
     }
 
-    // Create B-Tree indexes for PRIMARY KEY and UNIQUE column constraints.
-    //
-    // `CREATE TABLE t (id INT PRIMARY KEY)` must create a unique B-Tree index on
-    // `id` so that:
-    // (a) the planner can use it for O(log n) point lookups, and
-    // (b) FK validation in `persist_fk_constraint` can verify parent key existence.
-    //
-    // Since the table was just created (empty heap), index build is trivial.
     {
         use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
-        use std::sync::atomic::{AtomicU64, Ordering};
 
-        let mut pk_col: Option<(u16, String)> = None; // (col_idx, col_name) for PK
-        let mut unique_cols: Vec<(u16, String)> = Vec::new(); // (col_idx, col_name) for UNIQUE
-
-        for (i, col_def) in stmt.columns.iter().enumerate() {
-            for constraint in &col_def.constraints {
-                match constraint {
-                    ColumnConstraint::PrimaryKey => {
-                        pk_col = Some((i as u16, col_def.name.clone()));
-                    }
-                    crate::ast::ColumnConstraint::Unique => {
-                        unique_cols.push((i as u16, col_def.name.clone()));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        // Also check table-level PRIMARY KEY and UNIQUE constraints.
-        for tc in &stmt.table_constraints {
-            match tc {
-                crate::ast::TableConstraint::PrimaryKey { columns, .. } => {
-                    if columns.len() == 1 {
-                        let snap = txn.active_snapshot()?;
-                        let col_idx = {
-                            let mut reader = CatalogReader::new(storage, snap)?;
-                            let cols = reader.list_columns(table_id)?;
-                            cols.iter()
-                                .find(|c| c.name == columns[0])
-                                .map(|c| c.col_idx)
-                        };
-                        if let Some(idx) = col_idx {
-                            pk_col = Some((idx, columns[0].clone()));
-                        }
-                    }
-                }
-                crate::ast::TableConstraint::Unique { columns, .. } => {
-                    if columns.len() == 1 {
-                        let snap = txn.active_snapshot()?;
-                        let col_idx = {
-                            let mut reader = CatalogReader::new(storage, snap)?;
-                            let cols = reader.list_columns(table_id)?;
-                            cols.iter()
-                                .find(|c| c.name == columns[0])
-                                .map(|c| c.col_idx)
-                        };
-                        if let Some(idx) = col_idx {
-                            unique_cols.push((idx, columns[0].clone()));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Helper: create a single-column B-Tree index on an empty table.
-        let create_empty_index = |col_idx: u16,
-                                  index_name: String,
+        let create_empty_index = |index_name: String,
+                                  columns: Vec<IndexColumnDef>,
                                   is_unique: bool,
                                   is_primary: bool,
+                                  root_override: Option<u64>,
                                   storage: &mut dyn StorageEngine,
                                   txn: &mut TxnManager|
          -> Result<u32, DbError> {
-            let root_page_id = storage.alloc_page(PageType::Index)?;
-            {
-                let mut page = Page::new(PageType::Index, root_page_id);
-                let leaf = cast_leaf_mut(&mut page);
-                leaf.is_leaf = 1;
-                leaf.set_num_keys(0);
-                leaf.set_next_leaf(NULL_PAGE);
-                page.update_checksum();
-                storage.write_page(root_page_id, &page)?;
-            }
-            let final_root = AtomicU64::new(root_page_id).load(Ordering::Acquire);
-            let idx_id = CatalogWriter::new(storage, txn)?.create_index(IndexDef {
+            let root_page_id = match root_override {
+                Some(root_page_id) => root_page_id,
+                None => {
+                    let root_page_id = storage.alloc_page(PageType::Index)?;
+                    let mut page = Page::new(PageType::Index, root_page_id);
+                    let leaf = cast_leaf_mut(&mut page);
+                    leaf.is_leaf = 1;
+                    leaf.set_num_keys(0);
+                    leaf.set_next_leaf(NULL_PAGE);
+                    page.update_checksum();
+                    storage.write_page(root_page_id, &page)?;
+                    root_page_id
+                }
+            };
+
+            CatalogWriter::new(storage, txn)?.create_index(IndexDef {
                 index_id: 0,
                 table_id,
                 name: index_name,
-                root_page_id: final_root,
+                root_page_id,
                 is_unique,
-                fillfactor: 90, // auto-created indexes use default
+                fillfactor: 90,
                 is_primary,
-                columns: vec![IndexColumnDef {
-                    col_idx,
-                    order: CatalogSortOrder::Asc,
-                }],
+                columns,
                 predicate: None,
                 is_fk_index: false,
                 include_columns: vec![],
                 index_type: 0,
                 pages_per_range: 128,
-            })?;
-            Ok(idx_id)
+            })
         };
 
-        // Create PRIMARY KEY index.
-        if let Some((col_idx, col_name)) = pk_col {
-            let idx_name = format!("{}_pkey", stmt.table.name);
-            let idx_id = create_empty_index(col_idx, idx_name, true, true, storage, txn)?;
-            // Populate bloom for the new PK index (table is empty, so no keys to add).
-            // bloom is not available here (non-ctx path), handled lazily.
+        if let Some(pk_spec) = primary_key {
+            let idx_id = create_empty_index(
+                pk_spec.name,
+                pk_spec.columns,
+                true,
+                true,
+                Some(table_def.root_page_id),
+                storage,
+                txn,
+            )?;
             let _ = idx_id;
-            let _ = col_name;
         }
 
-        // Create UNIQUE indexes.
-        for (col_idx, col_name) in unique_cols {
-            let idx_name = format!("{}_{}_unique", stmt.table.name, col_name);
-            let idx_id = create_empty_index(col_idx, idx_name, true, false, storage, txn)?;
+        for unique_spec in unique_indexes {
+            let idx_id = create_empty_index(
+                unique_spec.name,
+                unique_spec.columns,
+                true,
+                false,
+                None,
+                storage,
+                txn,
+            )?;
             let _ = idx_id;
         }
     }
 
-    // Process FK constraints collected from inline column definitions.
     for (child_col_idx, child_col_name, (ref_table, ref_col, on_delete, on_update)) in
         inline_fk_specs
     {
-            persist_fk_constraint(
-                table_id,
-                &stmt.table.name,
-                database,
-                child_col_idx,
-                &child_col_name,
-                &ref_table,
+        persist_fk_constraint(
+            table_id,
+            &stmt.table.name,
+            database,
+            child_col_idx,
+            &child_col_name,
+            &ref_table,
             ref_col.as_deref(),
             ast_fk_action_to_catalog(on_delete),
             ast_fk_action_to_catalog(on_update),
-            None, // auto-name
+            None,
             storage,
             txn,
         )?;
     }
 
-    // Process FK constraints from table-level FOREIGN KEY declarations.
     for tc in &stmt.table_constraints {
         if let crate::ast::TableConstraint::ForeignKey {
             name,
@@ -227,7 +179,6 @@ fn execute_create_table(
                 });
             }
             let child_col_name = &columns[0];
-            // Find col_idx for the FK column.
             let snap = txn.active_snapshot()?;
             let child_col_idx = {
                 let mut reader = CatalogReader::new(storage, snap)?;
@@ -259,6 +210,132 @@ fn execute_create_table(
     }
 
     Ok(QueryResult::Empty)
+}
+
+#[derive(Debug, Clone)]
+struct CreateTableIndexSpec {
+    name: String,
+    columns: Vec<IndexColumnDef>,
+}
+
+fn resolve_create_table_index_columns(
+    stmt: &CreateTableStmt,
+    columns: &[String],
+) -> Result<Vec<IndexColumnDef>, DbError> {
+    if columns.is_empty() {
+        return Err(DbError::InvalidValue {
+            reason: "PRIMARY KEY / UNIQUE requires at least one column".into(),
+        });
+    }
+
+    columns
+        .iter()
+        .map(|col_name| {
+            let (col_idx, _) = stmt
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.name == *col_name)
+                .ok_or_else(|| DbError::ColumnNotFound {
+                    name: col_name.clone(),
+                    table: stmt.table.name.clone(),
+                })?;
+            Ok(IndexColumnDef {
+                col_idx: col_idx as u16,
+                order: CatalogSortOrder::Asc,
+            })
+        })
+        .collect()
+}
+
+fn collect_create_table_primary_key(
+    stmt: &CreateTableStmt,
+) -> Result<Option<CreateTableIndexSpec>, DbError> {
+    let inline_pk_cols: Vec<(u16, String)> = stmt
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, col_def)| {
+            col_def
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraint::PrimaryKey))
+        })
+        .map(|(idx, col_def)| (idx as u16, col_def.name.clone()))
+        .collect();
+
+    let mut table_pk = None;
+    for tc in &stmt.table_constraints {
+        if let crate::ast::TableConstraint::PrimaryKey { name, columns } = tc {
+            if table_pk.is_some() || !inline_pk_cols.is_empty() {
+                return Err(DbError::InvalidValue {
+                    reason: "multiple PRIMARY KEY constraints are not allowed".into(),
+                });
+            }
+            table_pk = Some(CreateTableIndexSpec {
+                name: name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_pkey", stmt.table.name)),
+                columns: resolve_create_table_index_columns(stmt, columns)?,
+            });
+        }
+    }
+
+    if !inline_pk_cols.is_empty() {
+        if inline_pk_cols.len() > 1 {
+            return Err(DbError::InvalidValue {
+                reason: "multiple inline PRIMARY KEY columns are not allowed; use PRIMARY KEY (...)"
+                    .into(),
+            });
+        }
+        return Ok(Some(CreateTableIndexSpec {
+            name: format!("{}_pkey", stmt.table.name),
+            columns: vec![IndexColumnDef {
+                col_idx: inline_pk_cols[0].0,
+                order: CatalogSortOrder::Asc,
+            }],
+        }));
+    }
+
+    Ok(table_pk)
+}
+
+fn collect_create_table_unique_indexes(
+    stmt: &CreateTableStmt,
+) -> Result<Vec<CreateTableIndexSpec>, DbError> {
+    let mut unique_indexes = Vec::new();
+
+    for (idx, col_def) in stmt.columns.iter().enumerate() {
+        if col_def
+            .constraints
+            .iter()
+            .any(|c| matches!(c, crate::ast::ColumnConstraint::Unique))
+        {
+            unique_indexes.push(CreateTableIndexSpec {
+                name: format!("{}_{}_unique", stmt.table.name, col_def.name),
+                columns: vec![IndexColumnDef {
+                    col_idx: idx as u16,
+                    order: CatalogSortOrder::Asc,
+                }],
+            });
+        }
+    }
+
+    for tc in &stmt.table_constraints {
+        if let crate::ast::TableConstraint::Unique { name, columns } = tc {
+            let generated_name = if columns.len() == 1 {
+                format!("{}_{}_unique", stmt.table.name, columns[0])
+            } else {
+                format!("{}_{}_unique", stmt.table.name, columns.join("_"))
+            };
+            unique_indexes.push(CreateTableIndexSpec {
+                name: name.clone().unwrap_or(generated_name),
+                columns: resolve_create_table_index_columns(stmt, columns)?,
+            });
+        }
+    }
+
+    Ok(unique_indexes)
 }
 
 // ── FK helpers ────────────────────────────────────────────────────────────────
@@ -432,6 +509,9 @@ fn persist_fk_constraint(
                         table_id: child_table_id,
                     })?
             };
+            child_table_def.ensure_heap_runtime(
+                "foreign key constraints on clustered child table — Phase 39.17+",
+            )?;
             let child_cols = {
                 let mut reader = CatalogReader::new(storage, snap)?;
                 reader.list_columns(child_table_id)?
@@ -571,6 +651,7 @@ pub(crate) fn build_index_root_from_heap(
     idx: &IndexDef,
     snap: TransactionSnapshot,
 ) -> Result<IndexBuildResult, DbError> {
+    table_def.ensure_heap_runtime("CREATE INDEX / heap rebuild on clustered table — Phase 39.13+")?;
     use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -635,6 +716,7 @@ fn execute_create_index(
         let resolved = resolver.resolve_table(Some(schema), &stmt.table.name)?;
         (resolved.def.clone(), resolved.columns.clone())
     };
+    table_def.ensure_heap_runtime("CREATE INDEX on clustered table — Phase 39.13+")?;
 
     // 2. Check for a duplicate index name on this table.
     {
@@ -838,7 +920,7 @@ fn execute_drop_index(
     let schema = table_ref.schema.as_deref().unwrap_or("public");
 
     // Capture both index_id and root_page_id for catalog deletion + B-Tree page reclamation.
-    let (index_id, root_page_id) = {
+    let (index_id, root_page_id, clustered_primary) = {
         let mut reader = CatalogReader::new(storage, snap)?;
         let table_def = match reader.get_table_in_database(database, schema, &table_ref.name)? {
             Some(d) => d,
@@ -851,10 +933,20 @@ fn execute_drop_index(
         };
         let indexes = reader.list_indexes(table_def.id)?;
         match indexes.into_iter().find(|i| i.name == stmt.name) {
-            Some(i) => (Some(i.index_id), Some(i.root_page_id)),
-            None => (None, None),
+            Some(i) => (
+                Some(i.index_id),
+                Some(i.root_page_id),
+                table_def.is_clustered() && i.is_primary,
+            ),
+            None => (None, None, false),
         }
     }; // reader dropped
+
+    if clustered_primary {
+        return Err(DbError::NotImplemented {
+            feature: "DROP PRIMARY KEY on clustered table — Phase 39.19".into(),
+        });
+    }
 
     match index_id {
         None if stmt.if_exists => Ok(QueryResult::Empty),
@@ -953,6 +1045,9 @@ fn execute_analyze(
                 Err(_) => continue, // table may not exist — skip
             }
         };
+        resolved
+            .def
+            .ensure_heap_runtime("ANALYZE on clustered table — Phase 39.13+")?;
 
         // Scan the full table once.
         let rows = TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap, None)?;

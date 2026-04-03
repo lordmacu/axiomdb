@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 39.12 Crash recovery for clustered index — clustered reverse undo on reopen, recovery-time clustered root tracking, logical restore of overflow-backed and relocate-update rows, and clean-open reconstruction of committed clustered roots from WAL
+**Last completed subphase:** 39.13 Executor integration: CREATE TABLE with clustered index — explicit-PK tables now persist clustered layout metadata plus clustered table roots, while heap-only runtime paths fail explicitly on clustered tables
 
-**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, overflow-backed large rows, insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, clustered-first secondary bookmarks, internal WAL/rollback, and clustered crash recovery now exist, but the SQL executor still uses the classic heap + secondary-index execution path
+**Active development:** Phase 39 clustered index storage rewrite — clustered page primitives, overflow-backed large rows, insert, point lookup, range scan, same-leaf update, delete-mark, structural rebalance, clustered-first secondary bookmarks, internal WAL/rollback, clustered crash recovery, and clustered-aware `CREATE TABLE` now exist, but clustered SQL DML still starts in `39.14`
 
-**Next milestone:** 39.13 — start executor integration with CREATE TABLE over clustered storage
+**Next milestone:** 39.14 — INSERT into clustered table
 
 **Concurrency note:** the current server already supports concurrent read-only
 queries, but mutating statements are still serialized through a database-wide
@@ -65,7 +65,7 @@ locking clauses.
 | 4.18 | Semantic analyzer | ✅ | BindContext, col_idx resolution |
 | 4.18b | Type coercion matrix | ✅ | coerce(), coerce_for_op(), CoercionMode strict/permissive |
 | 4.23 | QueryResult type | ✅ | Row, ColumnMeta, QueryResult (Rows/Affected/Empty) |
-| 4.5b | Table engine | ✅ | TableEngine scan/insert/delete/update; TableDef.data_root_page_id |
+| 4.5b | Table engine | ✅ | TableEngine scan/insert/delete/update over heap; later generalized by Phase 39 table-root metadata |
 | 4.5 + 4.5a | Basic executor | ✅ | SELECT/INSERT/UPDATE/DELETE, DDL, txn control, SELECT without FROM |
 | 4.25 + 4.7 | Error handling framework | ✅ | Complete SQLSTATE mapping; ErrorResponse{sqlstate,message,detail,hint} |
 | 4.8 | JOIN (nested loop) | ✅ | INNER/LEFT/RIGHT/CROSS; USING; multi-table; FULL→NotImplemented |
@@ -123,7 +123,7 @@ locking clauses.
 | 36 | AxiomQL Core | ⚠️ Planned | Alternative read query language over the same AST/executor |
 | 37 | AxiomQL Write + DDL + Control | ⚠️ Planned | AxiomQL DML, DDL, control flow, maintenance |
 | 38 | AxiomDB-Wasm | ⚠️ Planned | Browser runtime, OPFS backend, sync, live queries |
-| 39 | Clustered index storage engine | 🔄 In progress | Inline PK rows, clustered internal/leaf pages, PK bookmarks in secondary indexes, logical clustered WAL/rollback, clustered crash recovery |
+| 39 | Clustered index storage engine | 🔄 In progress | Inline PK rows, clustered internal/leaf pages, PK bookmarks in secondary indexes, logical clustered WAL/rollback, clustered crash recovery, clustered-aware CREATE TABLE |
 
 ---
 

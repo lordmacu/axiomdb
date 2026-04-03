@@ -727,22 +727,25 @@ New clustered crash-recovery coverage now includes:
 - All `39.10` acceptance criteria from the spec are implemented.
 - All `39.11` acceptance criteria from the spec are implemented.
 - All `39.12` acceptance criteria from the spec are implemented.
+- All `39.13` acceptance criteria from the spec are implemented.
 - No `unsafe` was introduced in the clustered tree path.
 - No production `unwrap()` remains in the touched clustered files.
 - No production `unwrap()` was introduced in the new clustered-secondary path.
 - No production `unwrap()` was introduced in the new clustered-overflow path.
 - No production `unwrap()` was introduced in the new clustered WAL / rollback path.
 - No production `unwrap()` was introduced in the clustered crash recovery path.
+- No production `unwrap()` was introduced in the clustered DDL / runtime-guard path.
 - Benchmarking remains intentionally deferred: `39.5` finishes the storage-level
   clustered read slice, and `39.6` / `39.7` / `39.8` / `39.9` add the first clustered mutation, rebalance, and bookmark slices,
   `39.10` adds overflow-backed row storage, `39.11` adds internal WAL/rollback support, `39.12` adds internal clustered crash recovery,
-  but end-to-end clustered DML benchmarks still wait for later SQL-visible integration.
+  and `39.13` exposes the first SQL-visible clustered DDL boundary,
+  but end-to-end clustered DML benchmarks still wait for later clustered `INSERT` / `SELECT` / `UPDATE` / `DELETE` integration.
 
 ## Deferred
 
 - `39.18` — physical purge of dead clustered cells
 - later clustered root persistence — today `39.12` still rebuilds roots from surviving WAL history, so checkpoint/rotation persistence is not solved yet
-- `39.13+` — executor integration for clustered tables
+- `39.14+` — executor-visible clustered DML and maintenance paths
 
 ## Notes
 
@@ -776,3 +779,7 @@ New clustered crash-recovery coverage now includes:
   clustered WAL entries now recover correctly on reopen, but clustered roots are
   still reconstructed from WAL history rather than a catalog/meta-page source,
   so checkpoint/rotation persistence remains future work.
+- `39.13` is the first SQL-visible clustered cut:
+  `CREATE TABLE` with an explicit `PRIMARY KEY` now creates a clustered table
+  root plus logical PK metadata, but heap-only executor paths still fail
+  explicitly on clustered tables until `39.14` through `39.17`.

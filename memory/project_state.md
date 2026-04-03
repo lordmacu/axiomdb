@@ -2,8 +2,15 @@
 
 ## 2026-04-02
 
-- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.9`, `39.10`, `39.11`, and `39.12` are closed in code, targeted validation,
+- Phase 39 subphases `39.2`, `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.9`, `39.10`, `39.11`, `39.12`, and `39.13` are closed in code, targeted validation,
   and docs.
+- `axiomdb-catalog` / `axiomdb-sql` now expose the first SQL-visible clustered-table boundary:
+  - `TableDef` now stores `root_page_id` plus `TableStorageLayout::{Heap, Clustered}`
+  - legacy catalog rows without the trailing layout byte still decode as heap tables
+  - `CatalogWriter::create_table_with_layout(...)` can bootstrap either a heap `Data` root or a clustered `ClusteredLeaf` root
+  - `CREATE TABLE ... PRIMARY KEY ...` now creates clustered tables and persists logical PK index metadata on that same clustered root
+  - `CREATE TABLE` without an explicit `PRIMARY KEY` stays on the heap path
+  - heap-only runtime paths now fail explicitly on clustered tables with phase-scoped `NotImplemented` errors
 - `axiomdb-storage` now has the first complete clustered-tree write path:
   - `PageType::ClusteredInternal = 6`
   - storage module `crates/axiomdb-storage/src/clustered_internal.rs`
@@ -49,8 +56,9 @@
   - `TxnManager::open(...)` rebuilds committed clustered roots from surviving WAL history
 - The clustered rewrite remains storage-first:
   - current `axiomdb-index::BTree` still uses fixed-slot `InternalNodePage` / `LeafNodePage`
-  - no SQL path creates or writes clustered tables yet
-  - no SQL path reads clustered tables yet either
+  - SQL DDL can now create clustered tables for explicit primary keys
+  - no SQL clustered DML path writes clustered rows yet
+  - no SQL clustered `SELECT` path reads clustered rows yet either
   - clustered range scan now exists internally, but no SQL path uses it yet
   - clustered same-leaf update now exists internally, but no SQL path uses it yet
   - clustered delete-mark now exists internally, but no SQL path uses it yet
@@ -77,6 +85,7 @@
   - rollback, `ROLLBACK TO SAVEPOINT`, and crash recovery are implemented for clustered rows
   - clustered roots are still reconstructed from surviving WAL history
   - checkpoint/rotation-safe clustered root persistence remains deferred
+  - standalone clustered `CREATE INDEX` / `ANALYZE` / `VACUUM` remain explicitly deferred
 
 ## 2026-03-29
 

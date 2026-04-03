@@ -32,6 +32,9 @@ fn execute_select_ctx(
             ctx,
             &from_table_ref,
         )?;
+        resolved
+            .def
+            .ensure_heap_runtime("SELECT from clustered table — Phase 39.15")?;
 
         let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
 
@@ -57,7 +60,7 @@ fn execute_select_ctx(
                 if name.eq_ignore_ascii_case("count") && args.is_empty() {
                     let count = HeapChain::count_visible(
                         storage,
-                        resolved.def.data_root_page_id,
+                        resolved.def.root_page_id,
                         snap,
                     )?;
                     let columns = vec![ColumnMeta::computed("count(*)", DataType::BigInt)];
@@ -517,6 +520,8 @@ fn execute_select_with_joins_ctx(
     let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
     let mut scanned: Vec<Vec<Row>> = Vec::with_capacity(all_resolved.len());
     for t in &all_resolved {
+        t.def
+            .ensure_heap_runtime("SELECT from clustered table — Phase 39.15")?;
         let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap, None)?;
         scanned.push(rows.into_iter().map(|(_, r)| r).collect());
     }
@@ -657,6 +662,9 @@ fn execute_select(
             let mut resolver = make_resolver(storage, txn)?;
             resolver.resolve_table(from_table_ref.schema.as_deref(), &from_table_ref.name)?
         };
+        resolved
+            .def
+            .ensure_heap_runtime("SELECT from clustered table — Phase 39.15")?;
 
         let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
 
@@ -939,6 +947,8 @@ fn execute_select_with_joins(
     let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
     let mut scanned: Vec<Vec<Row>> = Vec::with_capacity(all_resolved.len());
     for t in &all_resolved {
+        t.def
+            .ensure_heap_runtime("SELECT from clustered table — Phase 39.15")?;
         let rows = TableEngine::scan_table(storage, &t.def, &t.columns, snap, None)?;
         scanned.push(rows.into_iter().map(|(_, r)| r).collect());
     }

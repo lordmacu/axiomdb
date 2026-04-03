@@ -37,8 +37,8 @@ use std::sync::Arc;
 
 use axiomdb_core::error::DbError;
 use axiomdb_storage::{
-    alloc_constraint_id, alloc_fk_id, alloc_index_id, alloc_table_id, write_meta_u64, HeapChain,
-    Page, PageType, StorageEngine,
+    alloc_constraint_id, alloc_fk_id, alloc_index_id, alloc_table_id, clustered_leaf,
+    write_meta_u64, HeapChain, Page, PageType, StorageEngine,
 };
 use axiomdb_wal::TxnManager;
 
@@ -47,7 +47,7 @@ use crate::{
     notifier::{CatalogChangeNotifier, SchemaChangeEvent, SchemaChangeKind},
     schema::{
         ColumnDef, ConstraintDef, DatabaseDef, FkDef, IndexDef, StatsDef, TableDatabaseDef,
-        TableDef, TableId,
+        TableDef, TableId, TableStorageLayout,
     },
 };
 
@@ -336,8 +336,8 @@ impl<'a> CatalogWriter<'a> {
 
     // ── Table operations ──────────────────────────────────────────────────────
 
-    /// Allocates a new `TableId`, initializes a heap root page for user row data,
-    /// and inserts a row into `axiom_tables`.
+    /// Allocates a new `TableId`, initializes a table root page for user row
+    /// data, and inserts a row into `axiom_tables`.
     ///
     /// The row is WAL-logged as an Insert entry with
     /// `table_id = SYSTEM_TABLE_TABLES` and key = `allocated_table_id` as LE bytes.
@@ -347,17 +347,25 @@ impl<'a> CatalogWriter<'a> {
     /// - [`DbError::CatalogNotInitialized`] if sequences have not been seeded.
     /// - [`DbError::SequenceOverflow`] if the table ID space is exhausted.
     pub fn create_table(&mut self, schema: &str, name: &str) -> Result<TableId, DbError> {
-        let table_id = alloc_table_id(self.storage)?;
+        Ok(self
+            .create_table_with_layout(schema, name, TableStorageLayout::Heap)?
+            .id)
+    }
 
-        // Allocate and initialize the heap root page for this table's user data.
-        // This page becomes the root of the HeapChain used by TableEngine.
-        let data_root_page_id = self.storage.alloc_page(PageType::Data)?;
-        let root_page = Page::new(PageType::Data, data_root_page_id);
-        self.storage.write_page(data_root_page_id, &root_page)?;
+    /// Allocates a new table using the requested storage layout.
+    pub fn create_table_with_layout(
+        &mut self,
+        schema: &str,
+        name: &str,
+        storage_layout: TableStorageLayout,
+    ) -> Result<TableDef, DbError> {
+        let table_id = alloc_table_id(self.storage)?;
+        let root_page_id = self.allocate_table_root(storage_layout)?;
 
         let def = TableDef {
             id: table_id,
-            data_root_page_id,
+            root_page_id,
+            storage_layout,
             schema_name: schema.to_string(),
             table_name: name.to_string(),
         };
@@ -375,7 +383,23 @@ impl<'a> CatalogWriter<'a> {
             .record_insert(SYSTEM_TABLE_TABLES, &key, &data, page_id, slot_id)?;
 
         self.fire(SchemaChangeKind::TableCreated { table_id });
-        Ok(table_id)
+        Ok(def)
+    }
+
+    fn allocate_table_root(&mut self, storage_layout: TableStorageLayout) -> Result<u64, DbError> {
+        let (page_type, clustered) = match storage_layout {
+            TableStorageLayout::Heap => (PageType::Data, false),
+            TableStorageLayout::Clustered => (PageType::ClusteredLeaf, true),
+        };
+
+        let root_page_id = self.storage.alloc_page(page_type)?;
+        let mut root_page = Page::new(page_type, root_page_id);
+        if clustered {
+            clustered_leaf::init_clustered_leaf(&mut root_page);
+            root_page.update_checksum();
+        }
+        self.storage.write_page(root_page_id, &root_page)?;
+        Ok(root_page_id)
     }
 
     // ── Column operations ─────────────────────────────────────────────────────
@@ -585,7 +609,7 @@ impl<'a> CatalogWriter<'a> {
 
     /// Renames a table by replacing its `TableDef` row in the catalog.
     ///
-    /// The `table_id` and `data_root_page_id` are preserved.
+    /// The `table_id`, `root_page_id`, and `storage_layout` are preserved.
     pub fn rename_table(
         &mut self,
         table_id: TableId,
@@ -627,7 +651,7 @@ impl<'a> CatalogWriter<'a> {
         })
     }
 
-    /// Replaces the `data_root_page_id` of a table in `axiom_tables`.
+    /// Replaces the `root_page_id` of a table in `axiom_tables`.
     ///
     /// Used by the bulk-empty fast path (Phase 5.16) to rotate the heap root
     /// to a freshly-allocated empty page. All other `TableDef` fields are preserved.
@@ -635,7 +659,7 @@ impl<'a> CatalogWriter<'a> {
     /// # Errors
     /// - [`DbError::NoActiveTransaction`] if no transaction is active.
     /// - [`DbError::Internal`] if `table_id` is not found in `axiom_tables`.
-    pub fn update_table_data_root(
+    pub fn update_table_root(
         &mut self,
         table_id: TableId,
         new_root_page_id: u64,
@@ -656,9 +680,9 @@ impl<'a> CatalogWriter<'a> {
                 self.txn
                     .record_delete(SYSTEM_TABLE_TABLES, &key, &data, page_id, slot_id)?;
 
-                // Insert new row with updated data_root_page_id.
+                // Insert new row with updated root_page_id.
                 let new_def = TableDef {
-                    data_root_page_id: new_root_page_id,
+                    root_page_id: new_root_page_id,
                     ..def
                 };
                 let new_data = new_def.to_bytes();
@@ -670,9 +694,7 @@ impl<'a> CatalogWriter<'a> {
             }
         }
         Err(DbError::Internal {
-            message: format!(
-                "update_table_data_root: table_id={table_id} not found in axiom_tables"
-            ),
+            message: format!("update_table_root: table_id={table_id} not found in axiom_tables"),
         })
     }
 

@@ -244,14 +244,25 @@ That rule is what lets old databases keep working without rewriting existing
 
 ```rust
 pub struct TableDef {
-    pub id:                 u32,
-    pub data_root_page_id:  u64,    // heap chain root for user row data
-    pub schema_name:        String,
-    pub table_name:         String,
+    pub id:             u32,
+    pub root_page_id:   u64,    // heap root or clustered-tree root
+    pub storage_layout: TableStorageLayout,
+    pub schema_name:    String,
+    pub table_name:     String,
 }
 
-// On-disk binary format for axiom_tables rows:
-// [table_id:4 LE][data_root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8]
+pub enum TableStorageLayout {
+    Heap = 0,
+    Clustered = 1,
+}
+
+// Legacy on-disk format for axiom_tables rows:
+// [table_id:4 LE][root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8]
+//
+// Current on-disk format:
+// [table_id:4 LE][root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8][layout:1]
+//
+// If the trailing layout byte is absent, the row decodes as Heap.
 
 pub struct ColumnDef {
     pub table_id:      u64,
@@ -269,9 +280,17 @@ pub struct IndexDef {
     pub is_unique:    bool,
     pub is_primary:   bool,
     pub columns:      Vec<String>,  // indexed column names in key order
-    pub root_page_id: u64,          // B+ Tree root for this index
+    pub root_page_id: u64,          // B+ Tree root, or clustered table root for PRIMARY KEY metadata
 }
 ```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Generic Table Roots</span>
+`TableDef` no longer hard-codes a heap root because Phase 39.13 makes explicit-`PRIMARY KEY` tables clustered from day one. This follows SQLite `WITHOUT ROWID` more closely than the easier InnoDB-style hidden-key shortcut, which would have preserved the old heap assumption at the cost of reopening the storage rewrite later.
+</div>
+</div>
 
 ---
 
@@ -281,16 +300,24 @@ When the executor processes `CREATE TABLE`, it:
 
 1. Opens a write transaction (or participates in the current one).
 2. Allocates a new `TableId` from the meta page sequence.
-3. Allocates a `Data` page as the heap root for user row data (`data_root_page_id`).
-4. Inserts a row into `axiom_tables` with `{id, data_root_page_id, schema_name, table_name}`.
-5. Inserts one row per column into `axiom_columns`.
-6. Creates B+ Tree pages for the new table's primary key (or first UNIQUE column).
-7. Inserts the index definition into `axiom_indexes`.
+3. Chooses the table layout:
+   - no explicit `PRIMARY KEY` → `Heap`
+   - explicit `PRIMARY KEY` → `Clustered`
+4. Allocates the primary row-store root page:
+   - `Heap` → `PageType::Data`
+   - `Clustered` → `PageType::ClusteredLeaf`
+5. Inserts a row into `axiom_tables` with `{id, root_page_id, storage_layout, schema_name, table_name}`.
+6. Inserts one row per column into `axiom_columns`.
+7. Persists index metadata:
+   - clustered tables reuse `table.root_page_id` for the logical PRIMARY KEY index row
+   - `UNIQUE` secondary indexes still allocate ordinary `PageType::Index` roots
 8. Appends all these mutations to the WAL.
 9. Commits (or defers the commit to the surrounding transaction).
 
-The `data_root_page_id` stored in `axiom_tables` is used by `TableEngine` (Phase 4.5b)
-to locate the heap chain for all DML on that table — no extra lookup required.
+The `root_page_id` stored in `axiom_tables` is now the single entry point for the
+table's primary row store. Heap DML still uses it as the heap-chain root today;
+clustered DML is deferred, so heap-only executor paths explicitly reject
+`TableStorageLayout::Clustered` instead of touching the wrong page format.
 
 Because the catalog is stored in heap pages and indexed like any other table, all
 crash recovery mechanisms apply automatically: WAL replay will reconstruct the catalog
@@ -326,14 +353,15 @@ recovery and before server or embedded mode starts serving traffic:
 1. Every table listed in `axiom_tables` has at least one row in `axiom_columns`.
 2. Every column in `axiom_columns` references a `table_id` that exists in `axiom_tables`.
 3. Every index in `axiom_indexes` references a `table_id` that exists in `axiom_tables`.
-4. Every `root_page_id` in `axiom_indexes` points to a page of type `Index`.
-5. Every column listed in an index definition exists in the referenced table.
-6. No two tables in the same schema have the same name.
-7. No two indexes on the same table have the same name.
+4. Every non-clustered `root_page_id` in `axiom_indexes` points to a page of type `Index`.
+5. A clustered table's PRIMARY KEY metadata row in `axiom_indexes` reuses the table `root_page_id` and therefore may point to `ClusteredLeaf` / `ClusteredInternal`.
+6. Every column listed in an index definition exists in the referenced table.
+7. No two tables in the same schema have the same name.
+8. No two indexes on the same table have the same name.
 
 ### Startup index integrity verification
 
-For every catalog-visible index:
+For every catalog-visible heap table:
 
 1. enumerate the expected entries from heap-visible rows
 2. enumerate the actual B+ Tree entries from `root_page_id`
@@ -342,8 +370,10 @@ For every catalog-visible index:
 5. rotate the catalog root in a WAL-protected transaction
 6. defer free of the old tree pages until commit durability is confirmed
 
-If the tree cannot be traversed safely, open fails with `IndexIntegrityFailure`.
-The database does **not** enter a best-effort serving mode with an untrusted index.
+Clustered tables are skipped for now because their logical PRIMARY KEY metadata
+no longer points at a classic B+ Tree root. If a heap-side tree cannot be
+traversed safely, open fails with `IndexIntegrityFailure`. The database does
+**not** enter a best-effort serving mode with an untrusted index.
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>

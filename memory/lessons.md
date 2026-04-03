@@ -1,5 +1,16 @@
 # Lessons Learned
 
+## 2026-04-02 - The first SQL-visible clustered cut must reuse the real PK root, not synthesize a fake heap-era primary index
+
+- Once clustered storage exists, `CREATE TABLE ... PRIMARY KEY ...` should not keep creating a second heap-era primary B-Tree just to preserve old executor assumptions.
+- The right intermediate contract is:
+  - explicit primary key → clustered table root
+  - logical PK metadata points at that same clustered root
+  - tables without explicit PK stay heap-backed until hidden-key design is justified explicitly
+  - heap-only runtime paths fail fast instead of treating a clustered root as heap storage
+- `research/sqlite/src/build.c` reinforced the explicit-PK-only `WITHOUT ROWID` boundary.
+- `research/mariadb-server/storage/innobase/include/dict0dict.inl` reinforced that hidden clustered keys (`GEN_CLUST_INDEX`-style behavior) are a last resort, not the right first cut.
+
 ## 2026-04-02 - Clustered crash recovery must rebuild current roots from committed history plus active timeline, not from every seen WAL root
 
 - A clean `ROLLBACK` already restores storage state before crash recovery ever runs.
