@@ -481,79 +481,85 @@ fn persist_fk_constraint(
         use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
         use std::sync::atomic::{AtomicU64, Ordering};
 
-        // Check if child already has a suitable covering index on child_col_idx
-        // (user-provided, not an FK auto-index).
-        let existing_covers = {
+        // Read child table def once to check if it is clustered.
+        let child_table_def_for_fk = {
             let mut reader = CatalogReader::new(storage, snap)?;
-            reader.list_indexes(child_table_id)?.into_iter().any(|i| {
-                !i.is_fk_index && !i.columns.is_empty() && i.columns[0].col_idx == child_col_idx
-            })
+            reader
+                .get_table_by_id(child_table_id)?
+                .ok_or(DbError::CatalogTableNotFound {
+                    table_id: child_table_id,
+                })?
         };
 
-        if existing_covers {
-            0 // reuse existing user-provided index; will not be dropped with FK
+        if child_table_def_for_fk.is_clustered() {
+            // Clustered child table: FK auto-index (composite heap RID key) is
+            // incompatible with the clustered layout. Enforcement always falls back
+            // to a full scan via scan_clustered_table (fk_index_id = 0 path).
+            0
         } else {
-            // Build FK auto-index with composite keys from existing child rows.
-            let root_page_id = storage.alloc_page(PageType::Index)?;
-            {
-                let mut page = Page::new(PageType::Index, root_page_id);
-                let leaf = cast_leaf_mut(&mut page);
-                leaf.is_leaf = 1;
-                leaf.set_num_keys(0);
-                leaf.set_next_leaf(NULL_PAGE);
-                page.update_checksum();
-                storage.write_page(root_page_id, &page)?;
-            }
-            let root_pid = AtomicU64::new(root_page_id);
-
-            let child_table_def = {
+            // Check if child already has a suitable covering index on child_col_idx
+            // (user-provided, not an FK auto-index).
+            let existing_covers = {
                 let mut reader = CatalogReader::new(storage, snap)?;
-                reader
-                    .get_table_by_id(child_table_id)?
-                    .ok_or(DbError::CatalogTableNotFound {
-                        table_id: child_table_id,
-                    })?
-            };
-            child_table_def.ensure_heap_runtime(
-                "foreign key constraints on clustered child table — Phase 39.17+",
-            )?;
-            let child_cols = {
-                let mut reader = CatalogReader::new(storage, snap)?;
-                reader.list_columns(child_table_id)?
+                reader.list_indexes(child_table_id)?.into_iter().any(|i| {
+                    !i.is_fk_index && !i.columns.is_empty() && i.columns[0].col_idx == child_col_idx
+                })
             };
 
-            // Insert composite key entry for every existing child row.
-            let rows = TableEngine::scan_table(storage, &child_table_def, &child_cols, snap, None)?;
-            for (rid, row_vals) in rows {
-                let fk_val = row_vals.get(child_col_idx as usize).unwrap_or(&Value::Null);
-                if matches!(fk_val, Value::Null) {
-                    continue;
+            if existing_covers {
+                0 // reuse existing user-provided index; will not be dropped with FK
+            } else {
+                // Build FK auto-index with composite keys from existing child rows.
+                let root_page_id = storage.alloc_page(PageType::Index)?;
+                {
+                    let mut page = Page::new(PageType::Index, root_page_id);
+                    let leaf = cast_leaf_mut(&mut page);
+                    leaf.is_leaf = 1;
+                    leaf.set_num_keys(0);
+                    leaf.set_next_leaf(NULL_PAGE);
+                    page.update_checksum();
+                    storage.write_page(root_page_id, &page)?;
                 }
-                if let Ok(key) = crate::index_maintenance::fk_composite_key(fk_val, rid) {
-                    BTree::insert_in(storage, &root_pid, &key, rid, 90)?;
-                }
-            }
+                let root_pid = AtomicU64::new(root_page_id);
 
-            let final_root = root_pid.load(Ordering::Acquire);
-            let new_idx_id = CatalogWriter::new(storage, txn)?.create_index(IndexDef {
-                index_id: 0,
-                table_id: child_table_id,
-                name: format!("_fk_{constraint_name}"),
-                root_page_id: final_root,
-                is_unique: false,
-                is_primary: false,
-                is_fk_index: true, // marks composite-key FK auto-index
-                columns: vec![CatIndexColumnDef {
-                    col_idx: child_col_idx,
-                    order: CatSortOrder::Asc,
-                }],
-                predicate: None,
-                fillfactor: 90,
-                include_columns: vec![],
-                index_type: 0,
-                pages_per_range: 128,
-            })?;
-            new_idx_id
+                let child_cols = {
+                    let mut reader = CatalogReader::new(storage, snap)?;
+                    reader.list_columns(child_table_id)?
+                };
+
+                // Insert composite key entry for every existing child row.
+                let rows = TableEngine::scan_table(storage, &child_table_def_for_fk, &child_cols, snap, None)?;
+                for (rid, row_vals) in rows {
+                    let fk_val = row_vals.get(child_col_idx as usize).unwrap_or(&Value::Null);
+                    if matches!(fk_val, Value::Null) {
+                        continue;
+                    }
+                    if let Ok(key) = crate::index_maintenance::fk_composite_key(fk_val, rid) {
+                        BTree::insert_in(storage, &root_pid, &key, rid, 90)?;
+                    }
+                }
+
+                let final_root = root_pid.load(Ordering::Acquire);
+                let new_idx_id = CatalogWriter::new(storage, txn)?.create_index(IndexDef {
+                    index_id: 0,
+                    table_id: child_table_id,
+                    name: format!("_fk_{constraint_name}"),
+                    root_page_id: final_root,
+                    is_unique: false,
+                    is_primary: false,
+                    is_fk_index: true, // marks composite-key FK auto-index
+                    columns: vec![CatIndexColumnDef {
+                        col_idx: child_col_idx,
+                        order: CatSortOrder::Asc,
+                    }],
+                    predicate: None,
+                    fillfactor: 90,
+                    include_columns: vec![],
+                    index_type: 0,
+                    pages_per_range: 128,
+                })?;
+                new_idx_id
+            }
         }
     };
 
@@ -597,6 +603,12 @@ fn execute_drop_table(
                 }
             }
         }; // reader dropped — immutable borrow released
+
+        // Bump schema_version before dropping so cross-connection plan caches
+        // that hold a dep on this table_id see a version mismatch on next lookup
+        // (belt-and-suspenders: `is_stale()` also detects the table being gone).
+        // Ignore errors — bump is advisory; the drop itself is authoritative.
+        let _ = CatalogWriter::new(storage, txn)?.bump_table_schema_version(table_id);
 
         drop_table_fully(storage, txn, table_id)?;
     }
@@ -942,6 +954,10 @@ fn execute_create_index(
         });
     }
 
+    // 9. Bump per-table schema_version so plan caches referencing this table
+    //    detect staleness on next lookup (OID-based invalidation, Phase 40.2).
+    let _ = CatalogWriter::new(storage, txn)?.bump_table_schema_version(table_def.id);
+
     Ok(QueryResult::Empty)
 }
 
@@ -987,8 +1003,8 @@ fn execute_drop_index(
 
     let schema = table_ref.schema.as_deref().unwrap_or("public");
 
-    // Capture both index_id and root_page_id for catalog deletion + B-Tree page reclamation.
-    let (index_id, root_page_id, clustered_primary) = {
+    // Capture index_id, root_page_id, clustered flag, and table_id for bump.
+    let (index_id, root_page_id, clustered_primary, table_id_for_bump) = {
         let mut reader = CatalogReader::new(storage, snap)?;
         let table_def = match reader.get_table_in_database(database, schema, &table_ref.name)? {
             Some(d) => d,
@@ -1005,8 +1021,9 @@ fn execute_drop_index(
                 Some(i.index_id),
                 Some(i.root_page_id),
                 table_def.is_clustered() && i.is_primary,
+                table_def.id,
             ),
-            None => (None, None, false),
+            None => (None, None, false, table_def.id),
         }
     }; // reader dropped
 
@@ -1029,6 +1046,9 @@ fn execute_drop_index(
             if let Some(root) = root_page_id {
                 free_btree_pages(storage, root)?;
             }
+            // Bump per-table schema_version for OID-based plan cache invalidation
+            // (Phase 40.2). Cached plans that chose this index must be recompiled.
+            let _ = CatalogWriter::new(storage, txn)?.bump_table_schema_version(table_id_for_bump);
             Ok(QueryResult::Empty)
         }
     }
@@ -1113,12 +1133,12 @@ fn execute_analyze(
                 Err(_) => continue, // table may not exist — skip
             }
         };
-        resolved
-            .def
-            .ensure_heap_runtime("ANALYZE on clustered table — Phase 39.13+")?;
-
-        // Scan the full table once.
-        let rows = TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap, None)?;
+        // Scan the full table once (clustered or heap).
+        let rows = if resolved.def.is_clustered() {
+            crate::table::scan_clustered_table(storage, &resolved.def, &resolved.columns, snap)?
+        } else {
+            TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap, None)?
+        };
         let row_count = rows.len() as u64;
 
         // Determine target columns: all indexed columns OR a specific one.
@@ -1201,7 +1221,11 @@ fn execute_truncate(
 
     // Bulk-empty via root rotation (Phase 5.16): correct for indexed tables.
     let mut noop_bloom = crate::bloom::BloomRegistry::new();
-    let plan = plan_bulk_empty_table(storage, &resolved.def, &all_indexes, snap)?;
+    let plan = if resolved.def.is_clustered() {
+        plan_bulk_empty_clustered_table(storage, &resolved.def, &all_indexes, snap)?
+    } else {
+        plan_bulk_empty_table(storage, &resolved.def, &all_indexes, snap)?
+    };
     apply_bulk_empty_table(storage, txn, &mut noop_bloom, &resolved.def, plan)?;
 
     // Reset the AUTO_INCREMENT sequence so the next insert starts from 1.
@@ -1505,6 +1529,9 @@ fn execute_alter_table(
                 alter_drop_constraint(storage, txn, &table_def, &name, if_exists)?;
             }
             AlterTableOp::Rebuild => {
+                // Bump before returning so the plan cache detects the schema change.
+                let _ = CatalogWriter::new(storage, txn)?
+                    .bump_table_schema_version(table_def.def.id);
                 return alter_rebuild_to_clustered(
                     storage,
                     txn,
@@ -1520,6 +1547,10 @@ fn execute_alter_table(
             }
         }
     }
+
+    // Bump per-table schema_version so plan caches referencing this table
+    // detect staleness on next lookup (Phase 40.2 OID-based invalidation).
+    let _ = CatalogWriter::new(storage, txn)?.bump_table_schema_version(table_def.def.id);
 
     Ok(QueryResult::Empty)
 }
