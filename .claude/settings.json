@@ -1,11 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cargo build:*)",
-      "Bash(cargo test:*)",
-      "Bash(cargo clippy:*)",
-      "Bash(cargo fmt:*)",
-      "Bash(cargo bench:*)",
+      "Bash(rtk cargo build:*)",
+      "Bash(rtk cargo test:*)",
+      "Bash(rtk cargo clippy:*)",
+      "Bash(rtk cargo fmt:*)",
+      "Bash(rtk cargo bench:*)",
       "Bash(cargo fuzz:*)",
       "Bash(cargo new:*)",
       "Bash(cargo add:*)",
@@ -13,18 +13,19 @@
       "Bash(cargo flamegraph:*)",
       "Bash(cargo install:*)",
       "Bash(cargo run:*)",
-      "Bash(cargo check:*)",
+      "Bash(rtk cargo check:*)",
       "Bash(git init:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
       "Bash(git checkout:*)",
       "Bash(git branch:*)",
-      "Bash(git log:*)",
-      "Bash(git diff:*)",
-      "Bash(git status:*)",
+      "Bash(rtk git log:*)",
+      "Bash(rtk git diff:*)",
+      "Bash(rtk git status:*)",
       "Bash(mkdir -p:*)",
       "Bash(cat > docs/*)",
-      "Bash(cat > specs/*)"
+      "Bash(cat > specs/*)",
+      "Bash(rtk:*)"
     ]
   },
   "hooks": {
@@ -56,7 +57,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd /Users/cristian/nexusdb && echo '\\n── Estado al parar ──' && git status --short || echo 'Repo no disponible'; exit 0"
+            "command": "cd /Users/cristian/nexusdb && echo '\n── Estado al parar ──' && git status --short || echo 'Repo no disponible'; exit 0"
           }
         ]
       }

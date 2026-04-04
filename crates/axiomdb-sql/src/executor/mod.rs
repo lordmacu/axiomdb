@@ -546,6 +546,7 @@ pub fn execute_with_ctx(
             Stmt::Commit => {
                 // Flush any staged rows before writing the Commit WAL entry.
                 flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
+                flush_clustered_insert_batch(storage, txn, bloom, ctx)?;
                 ctx.in_explicit_txn = false;
                 ctx.savepoints.clear(); // all savepoints destroyed on COMMIT
                 return txn.commit().map(|_| QueryResult::Empty);
@@ -553,6 +554,7 @@ pub fn execute_with_ctx(
             Stmt::Rollback => {
                 // Discard staged rows without writing to heap or WAL.
                 ctx.discard_pending_inserts();
+                ctx.discard_clustered_insert_batch();
                 ctx.savepoints.clear(); // all savepoints destroyed on ROLLBACK
                 return rollback_with_index_undo(txn, storage, bloom).map(|_| QueryResult::Empty);
             }
@@ -562,6 +564,7 @@ pub fn execute_with_ctx(
             }
             Stmt::Savepoint(ref name) => {
                 flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
+                flush_clustered_insert_batch(storage, txn, bloom, ctx)?;
                 let sp = txn.savepoint();
                 ctx.savepoints.push((name.clone(), sp));
                 return Ok(QueryResult::Empty);
@@ -576,6 +579,7 @@ pub fn execute_with_ctx(
                     Some(idx) => {
                         // Discard staged rows.
                         ctx.discard_pending_inserts();
+                        ctx.discard_clustered_insert_batch();
                         let sp = ctx.savepoints[idx].1;
                         rollback_to_savepoint_with_index_undo(txn, sp, storage, bloom)?;
                         // Destroy all savepoints after the target (MySQL behavior).
@@ -603,6 +607,7 @@ pub fn execute_with_ctx(
             // DDL implicitly commits the current transaction — flush staged
             // rows into the pre-DDL transaction before committing it.
             flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
+            flush_clustered_insert_batch(storage, txn, bloom, ctx)?;
             ctx.in_explicit_txn = false;
             let pre_tid = txn.active_txn_id();
             txn.commit()?;
@@ -634,6 +639,9 @@ pub fn execute_with_ctx(
         if should_flush_pending_inserts_before_stmt(&stmt, ctx) {
             flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
         }
+        if should_flush_clustered_batch_before_stmt(&stmt, ctx) {
+            flush_clustered_insert_batch(storage, txn, bloom, ctx)?;
+        }
         let sp_opt: Option<Savepoint> = if ctx.on_error == OnErrorMode::RollbackTransaction {
             None
         } else {
@@ -644,6 +652,7 @@ pub fn execute_with_ctx(
             Err(e) => match ctx.on_error {
                 OnErrorMode::RollbackTransaction => {
                     ctx.discard_pending_inserts();
+                    ctx.discard_clustered_insert_batch();
                     let _ = rollback_with_index_undo(txn, storage, bloom);
                     Err(e)
                 }
@@ -655,6 +664,7 @@ pub fn execute_with_ctx(
                 }
                 OnErrorMode::Ignore => {
                     ctx.discard_pending_inserts();
+                    ctx.discard_clustered_insert_batch();
                     let _ = rollback_with_index_undo(txn, storage, bloom);
                     Err(e)
                 }
@@ -801,6 +811,28 @@ fn should_flush_pending_inserts_before_stmt(stmt: &Stmt, ctx: &SessionContext) -
                     .schema
                     .as_deref()
                     .is_none_or(|schema| schema == pending.table_def.schema_name)
+    )
+}
+
+fn should_flush_clustered_batch_before_stmt(stmt: &Stmt, ctx: &SessionContext) -> bool {
+    let batch = match ctx.clustered_insert_batch.as_ref() {
+        Some(b) => b,
+        None => return false,
+    };
+
+    // Do NOT flush when the next statement is a VALUES INSERT into the same
+    // clustered table — those rows will be appended to the existing batch.
+    !matches!(
+        stmt,
+        Stmt::Insert(insert)
+            if ctx.in_explicit_txn
+                && matches!(insert.source, InsertSource::Values(_))
+                && insert.table.name == batch.table_def.table_name
+                && insert
+                    .table
+                    .schema
+                    .as_deref()
+                    .is_none_or(|schema| schema == batch.table_def.schema_name)
     )
 }
 

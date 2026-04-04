@@ -234,6 +234,104 @@ profiling shows it dominates after staging.
 
 ---
 
+## ClusteredInsertBatch (Phase 40.1)
+
+Phase 40.1 extends the `PendingInsertBatch` pattern to clustered (primary-key
+ordered) tables, eliminating the per-row CoW B-tree overhead that made clustered
+inserts 2× slower than heap inserts inside explicit transactions.
+
+### Root cause of the pre-40.1 gap
+
+Before 40.1, every clustered `INSERT` inside an explicit transaction called
+`apply_clustered_insert_rows` immediately, which performs:
+
+1. `storage.read_page(root)` — 16 KB page read
+2. `storage.write_page(new_root, page)` — 16 KB CoW page write
+3. WAL append
+4. Secondary index write
+
+For N = 50 000 rows that is 100 000 storage operations just for the base tree.
+
+### Data structures
+
+```rust
+// session.rs
+pub struct StagedClusteredRow {
+    pub values: Vec<Value>,
+    pub encoded_row: Vec<u8>,
+    pub primary_key_values: Vec<Value>,
+    pub primary_key_bytes: Vec<u8>,
+}
+
+pub struct ClusteredInsertBatch {
+    pub table_id: u32,
+    pub table_def: TableDef,
+    pub primary_idx: IndexDef,
+    pub secondary_indexes: Vec<IndexDef>,
+    pub secondary_layouts: Vec<ClusteredSecondaryLayout>,
+    pub compiled_preds: Vec<Option<Expr>>,
+    pub rows: Vec<StagedClusteredRow>,
+    pub staged_pks: HashSet<Vec<u8>>,   // O(1) intra-batch PK dedup
+}
+```
+
+`StagedClusteredRow` is structurally identical to `PreparedClusteredInsertRow`
+(defined in `clustered_table.rs`) but lives in `session.rs` to avoid a circular
+dependency: `clustered_table.rs` imports `SessionContext`.
+
+### Enqueue path (`enqueue_clustered_insert_ctx`)
+
+For each row in the VALUES list:
+1. Evaluate expressions, expand columns, assign AUTO_INCREMENT.
+2. Validate CHECK constraints and FK child references.
+3. Encode via `prepare_row_with_ctx` (coerce + PK extract + row codec).
+4. Check `staged_pks` — return `UniqueViolation` and discard batch on intra-batch
+   PK duplicate.
+5. Push `StagedClusteredRow` and insert PK bytes into `staged_pks`.
+
+Committed-data PK duplicates are caught at flush time by `lookup_physical` inside
+`apply_clustered_insert_rows` (same as the pre-40.1 single-statement path).
+
+### Flush path (`flush_clustered_insert_batch`)
+
+```
+1. Sort staged rows ascending by pk_bytes
+   → enables append-biased detection in apply_clustered_insert_rows
+2. Convert StagedClusteredRow → PreparedClusteredInsertRow (field move)
+3. Call apply_clustered_insert_rows (existing function):
+     a. detect append-biased pattern (all PKs increasing)
+     b. loop: try_insert_rightmost_leaf_batch → fast O(leaf_capacity) write
+        fallback: single-row clustered_tree::insert
+     c. WAL record_clustered_insert per row
+     d. maintain_clustered_secondary_inserts per row
+     e. persist changed roots
+4. ctx.stats.on_rows_changed + ctx.invalidate_all
+```
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">55.9K rows/s vs MySQL 8.0 InnoDB 35K rows/s</span>
+For 50K sequential PK rows in one explicit transaction, AxiomDB 40.1 delivers
+55.9K rows/s — +59% faster than MySQL 8.0 InnoDB's ~35K rows/s. MySQL's buffer
+pool amortizes page writes across multiple connections; AxiomDB's batch achieves
+the same effect for a single connection by deferring all writes to flush time and
+using <code>try_insert_rightmost_leaf_batch</code> to fill each leaf page once.
+</div>
+</div>
+
+### Barrier detection
+
+`should_flush_clustered_batch_before_stmt` returns `false` only when the next
+statement is a VALUES INSERT into the same clustered table (batch continues).
+For all other statements, the batch is flushed before dispatch. This mirrors the
+existing `should_flush_pending_inserts_before_stmt` logic for heap tables.
+
+ROLLBACK discards the batch via `discard_clustered_insert_batch()` — no storage
+writes, no WAL entries, no undo needed.
+
+---
+
 ## Query Pipeline
 
 ```

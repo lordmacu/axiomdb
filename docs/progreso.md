@@ -1286,19 +1286,11 @@
 - [x] 39.21 ✅ Aggregate hash execution — `GroupTablePrimitive` (INT/BIGINT single-column GROUP BY), `GroupTableGeneric` (multi-column / TEXT / mixed-type), `hashbrown` hash table, fast-path `value_agg_add` accumulator arithmetic bypassing `eval()`, `finalize_avg` for exact AVG, column decode mask via `collect_expr_columns`, `scan_all_callback` zero-alloc clustered scan, all-NULL AVG → NULL, HAVING with non-agg column filter, and 11 integration tests
 - [x] 39.22 ✅ UPDATE in-place zero-alloc patch — `cell_row_data_abs_off`, `patch_field_in_place`, `update_row_header_in_place` primitives; `fused_clustered_scan_patch` fast path eliminates 5 heap allocs per matched row; `FieldDelta` inline `[u8;8]` arrays (no Vec); MAYBE_NOP byte-identity check; `UndoClusteredFieldPatch` undo op for ROLLBACK via field deltas; overflow-row fallback; 4 new integration tests; 7 new wire-test assertions; ≥1.0M r/s UPDATE on fixed-size columns
 
-### Phase 40 — Concurrent Writers (Multi-Writer Engine) `⏳`
-- [ ] 40.1 ⏳ Atomic transaction ID and snapshot — make next_txn_id and max_committed AtomicU64; lock-free snapshot creation
-- [ ] 40.2 ⏳ Per-connection transaction state — move ActiveTxn out of global TxnManager into per-connection SessionContext; TxnCoordinator tracks active set
-- [ ] 40.3 ⏳ StorageEngine interior mutability — change write_page(&mut self) to write_page(&self) with page-level locks; update 184 call sites
-- [ ] 40.4 ⏳ Concurrent WAL writer — atomic LSN assignment, per-writer scratch buffers, serialized I/O with group commit
-- [ ] 40.5 ⏳ Lock Manager: row-level locks — sharded hash table of (page_id, slot_id) → lock; S/X/IS/IX modes; FIFO wait queues
-- [ ] 40.6 ⏳ Deadlock detection — Brent's cycle detection on wait-for graph; victim selection by least work; automatic rollback
-- [ ] 40.7 ⏳ HeapChain concurrent access — per-page X-lock for writes, S-lock for reads; atomic chain growth
-- [ ] 40.8 ⏳ B-Tree latch coupling — top-down S-lock coupling for reads, optimistic S→X upgrade at leaf for writes; pessimistic re-traverse for splits
-- [ ] 40.9 ⏳ FreeList thread-safety — lock-free bitmap with AtomicU64 words for concurrent page alloc/free
-- [ ] 40.10 ⏳ Database lock redesign — replace Arc<RwLock<Database>> with SharedDatabase (interior mutability) + per-connection ConnectionState
-- [ ] 40.11 ⏳ Executor refactoring — update 184 signatures from &mut dyn StorageEngine to &dyn StorageEngine; lock acquisition at executor level
-- [ ] 40.12 ⏳ Integration tests and benchmarks — concurrent writer stress tests; 8-thread throughput; deadlock scenarios; crash recovery under concurrency
+### Phase 40 — Clustered Engine Performance Optimizations `🔄`
+- [x] 40.1 ✅ ClusteredInsertBatch — staging buffer for consecutive `INSERT ... VALUES` inside explicit transactions; rows encoded at enqueue time, sorted by PK and flushed at COMMIT via `try_insert_rightmost_leaf_batch`; intra-batch PK dedup via `HashSet<Vec<u8>>`; SELECT/UPDATE/DELETE/DDL/SAVEPOINT/table-switch barrier flush; ROLLBACK discards without storage writes; 10 integration tests; 9 wire-test assertions; **55.9K rows/s for 50K sequential PK rows** (MySQL 8.0 reference: ~35K r/s, **+59%**)
+- [ ] 40.2 ⏳ Statement plan cache — per-session `CachedPlanSource` with OID-based invalidation
+- [ ] 40.3 ⏳ Transaction Write Set — page-level CoW coalescing for multi-row UPDATE/DELETE
+- [ ] 40.4 ⏳ Vectorized scan primitives — SIMD-accelerated predicate evaluation for clustered scans
 
 ---
 
