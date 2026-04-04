@@ -2508,6 +2508,85 @@ ok("39.22 TEXT-before-INT: age patched to 30", row[1] == 30, row)
 
 conn_upd.close()
 
+# ── 40.1 ClusteredInsertBatch ─────────────────────────────────────────────────
+
+print("\n[40.1 clustered INSERT batch]")
+conn40 = pymysql.connect(host="127.0.0.1", port=PORT, user="root",
+                         password="root",
+                         charset="utf8mb4", autocommit=False)
+c40 = conn40.cursor()
+
+# Setup: fresh table for batch tests
+c40.execute("DROP TABLE IF EXISTS batch40")
+c40.execute("CREATE TABLE batch40 (id INT NOT NULL PRIMARY KEY, val INT NOT NULL)")
+conn40.commit()
+
+# 1. Sequential PK bulk insert — 100 rows in one explicit txn, all visible after COMMIT.
+for i in range(1, 101):
+    c40.execute(f"INSERT INTO batch40 VALUES ({i}, {i * 10})")
+conn40.commit()
+c40.execute("SELECT COUNT(*) FROM batch40")
+ok("40.1 batch 100 rows visible after COMMIT", c40.fetchone() == (100,))
+
+# 2. SELECT barrier — staged rows visible inside the transaction.
+c40.execute("DELETE FROM batch40")
+conn40.commit()
+c40.execute("INSERT INTO batch40 VALUES (1, 11)")
+c40.execute("INSERT INTO batch40 VALUES (2, 22)")
+# SELECT triggers flush so rows are visible in the same txn.
+c40.execute("SELECT COUNT(*) FROM batch40")
+ok("40.1 SELECT barrier flushes batch — 2 rows visible", c40.fetchone() == (2,))
+c40.execute("INSERT INTO batch40 VALUES (3, 33)")
+conn40.commit()
+c40.execute("SELECT COUNT(*) FROM batch40")
+ok("40.1 row after barrier also committed", c40.fetchone() == (3,))
+
+# 3. ROLLBACK discards staged rows — table empty after rollback.
+c40.execute("DELETE FROM batch40")
+conn40.commit()
+c40.execute("INSERT INTO batch40 VALUES (10, 100)")
+c40.execute("INSERT INTO batch40 VALUES (20, 200)")
+conn40.rollback()
+c40.execute("SELECT COUNT(*) FROM batch40")
+ok("40.1 ROLLBACK discards staged rows — table empty", c40.fetchone() == (0,))
+
+# 4. Non-monotonic PK order produces correct sorted result.
+for pk in [500, 1, 250, 999, 42]:
+    c40.execute(f"INSERT INTO batch40 VALUES ({pk}, {pk})")
+conn40.commit()
+c40.execute("SELECT id FROM batch40 ORDER BY id")
+ids = [r[0] for r in c40.fetchall()]
+ok("40.1 non-monotonic PK batch yields sorted rows", ids == [1, 42, 250, 500, 999], ids)
+
+# 5. PK duplicate within batch returns an error — no rows committed.
+c40.execute("DELETE FROM batch40")
+conn40.commit()
+try:
+    c40.execute("INSERT INTO batch40 VALUES (7, 1)")
+    c40.execute("INSERT INTO batch40 VALUES (7, 2)")   # duplicate PK
+    conn40.commit()
+    ok("40.1 intra-batch PK duplicate raises error", False, "no error raised")
+except Exception as e:
+    conn40.rollback()
+    ok("40.1 intra-batch PK duplicate raises error", True, str(e))
+c40.execute("SELECT COUNT(*) FROM batch40")
+ok("40.1 no rows after duplicate-PK rollback", c40.fetchone() == (0,))
+
+# 6. Table switch flushes first batch — both tables correct after COMMIT.
+c40.execute("DROP TABLE IF EXISTS batch40b")
+c40.execute("CREATE TABLE batch40b (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)")
+conn40.commit()
+c40.execute("INSERT INTO batch40 VALUES (100, 1000)")
+c40.execute("INSERT INTO batch40 VALUES (200, 2000)")
+c40.execute("INSERT INTO batch40b VALUES (1, 99)")   # different table → flushes batch40
+conn40.commit()
+c40.execute("SELECT COUNT(*) FROM batch40")
+ok("40.1 table switch: batch40 rows flushed", c40.fetchone() == (2,))
+c40.execute("SELECT COUNT(*) FROM batch40b")
+ok("40.1 table switch: batch40b row present", c40.fetchone() == (1,))
+
+conn40.close()
+
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 
 print("\n[Connectivity]")

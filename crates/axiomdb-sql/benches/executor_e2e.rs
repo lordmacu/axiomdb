@@ -573,6 +573,44 @@ fn bench_insert_serial_fsync_baseline(c: &mut Criterion) {
     group.finish();
 }
 
+/// Clustered INSERT batch: 50 K sequential PK rows in one explicit transaction.
+///
+/// This is the primary Phase 40.1 benchmark. `ClusteredInsertBatch` stages all
+/// rows in memory and flushes at COMMIT using `try_insert_rightmost_leaf_batch`,
+/// reducing O(N) page CoW clones to O(N / leaf_capacity) page writes.
+///
+/// Target: ≥ 35 K rows/s (must beat MySQL 8.0 InnoDB reference ≈ 35 K r/s for
+/// the same sequential PK load with WAL on local SSD).
+fn bench_clustered_insert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("clustered_insert");
+    group.sample_size(10); // 50 K rows/iter is slow; 10 samples is enough
+
+    group.throughput(Throughput::Elements(50_000));
+    group.bench_function("batch_50k_sequential_pk", |b| {
+        b.iter_batched(
+            || {
+                let mut db = Db::open();
+                db.run("CREATE TABLE insert_bench (id INT NOT NULL PRIMARY KEY, val INT NOT NULL)");
+                db
+            },
+            |mut db| {
+                let mut ctx = SessionContext::new();
+                db.run_ctx("BEGIN", &mut ctx);
+                for i in 1u32..=50_000 {
+                    db.run_ctx(
+                        &format!("INSERT INTO insert_bench VALUES ({i}, {i})"),
+                        &mut ctx,
+                    );
+                }
+                db.run_ctx("COMMIT", &mut ctx);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert_single,
@@ -586,6 +624,7 @@ criterion_group!(
     bench_select_count_aggregate,
     bench_update_where,
     bench_clustered_update,
+    bench_clustered_insert,
     bench_full_pipeline,
     bench_insert_serial_fsync_baseline,
 );

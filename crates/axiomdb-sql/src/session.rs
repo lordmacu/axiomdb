@@ -9,6 +9,7 @@ use axiomdb_catalog::{
 use axiomdb_core::error::DbError;
 use axiomdb_types::Value;
 
+use crate::clustered_secondary::ClusteredSecondaryLayout;
 use crate::expr::Expr;
 
 // ── CompatMode ────────────────────────────────────────────────────────────────
@@ -420,6 +421,42 @@ pub struct PendingInsertBatch {
     pub committed_empty: HashSet<u32>,
 }
 
+/// Pre-encoded row staged inside a `ClusteredInsertBatch`.
+///
+/// Mirrors `PreparedClusteredInsertRow` (defined in `clustered_table.rs`) but
+/// lives here to avoid a circular dependency: `clustered_table.rs` imports
+/// `SessionContext` from this module, so `session.rs` cannot import from
+/// `clustered_table.rs`.
+#[derive(Debug, Clone)]
+pub struct StagedClusteredRow {
+    pub values: Vec<Value>,
+    pub encoded_row: Vec<u8>,
+    pub primary_key_values: Vec<Value>,
+    pub primary_key_bytes: Vec<u8>,
+}
+
+/// Transaction-local staging buffer for consecutive `INSERT ... VALUES` into a clustered table.
+///
+/// Mirrors `PendingInsertBatch` for heap tables, but stores pre-encoded
+/// `StagedClusteredRow`s. Flushed (via `flush_clustered_insert_batch`) before
+/// any barrier statement: SELECT, UPDATE, DELETE, DDL, COMMIT, SAVEPOINT, or
+/// INSERT into a different table. On ROLLBACK, discarded without storage writes.
+///
+/// Only active inside an explicit user transaction (`in_explicit_txn = true`).
+#[derive(Debug)]
+pub struct ClusteredInsertBatch {
+    pub table_id: u32,
+    pub table_def: TableDef,
+    pub columns: Vec<ColumnDef>,
+    pub primary_idx: IndexDef,
+    pub secondary_indexes: Vec<IndexDef>,
+    pub secondary_layouts: Vec<ClusteredSecondaryLayout>,
+    pub compiled_preds: Vec<Option<Expr>>,
+    pub rows: Vec<StagedClusteredRow>,
+    /// O(1) intra-batch PK duplicate detection (encoded key bytes).
+    pub staged_pks: HashSet<Vec<u8>>,
+}
+
 // ── SessionContext ────────────────────────────────────────────────────────────
 
 /// Per-connection state: schema cache + session variables visible to the executor.
@@ -478,6 +515,12 @@ pub struct SessionContext {
     /// `None` when no rows are pending. Flushed on any barrier statement or COMMIT.
     /// Discarded (without heap/WAL writes) on ROLLBACK.
     pub pending_inserts: Option<PendingInsertBatch>,
+    /// Staging buffer for consecutive `INSERT ... VALUES` into a clustered table
+    /// inside an explicit transaction. Mirrors `pending_inserts` for clustered storage.
+    ///
+    /// `None` when no rows are pending. Flushed on any barrier statement or COMMIT.
+    /// Discarded (without storage writes) on ROLLBACK.
+    pub clustered_insert_batch: Option<ClusteredInsertBatch>,
     /// `true` while the connection is inside an explicit user transaction
     /// (after `BEGIN`, before `COMMIT` / `ROLLBACK`).
     ///
@@ -533,6 +576,7 @@ impl SessionContext {
             warnings: Vec::new(),
             stats: StaleStatsTracker::default(),
             pending_inserts: None,
+            clustered_insert_batch: None,
             in_explicit_txn: false,
             current_database: String::new(),
             search_path: vec!["public".to_string()],
@@ -555,6 +599,14 @@ impl SessionContext {
     pub fn discard_pending_inserts(&mut self) {
         self.pending_inserts = None;
         self.in_explicit_txn = false;
+    }
+
+    /// Discards any staged clustered INSERT rows without writing to storage or WAL.
+    ///
+    /// Called on ROLLBACK and on error paths that abort the current transaction.
+    /// Does NOT clear `in_explicit_txn` — the caller is responsible for that.
+    pub fn discard_clustered_insert_batch(&mut self) {
+        self.clustered_insert_batch = None;
     }
 
     /// Appends a warning. Called by the executor when a no-op or non-fatal

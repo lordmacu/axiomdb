@@ -171,3 +171,70 @@ pub(super) fn flush_pending_inserts_ctx(
 
     Ok(())
 }
+
+// ── Clustered INSERT batch flush (Phase 40.1) ─────────────────────────────────
+
+/// Flushes the staged clustered INSERT buffer to the B-tree, WAL, and secondary
+/// indexes in one sorted batch call.
+///
+/// No-op if there is no pending clustered batch. On return
+/// `ctx.clustered_insert_batch` is `None`.
+///
+/// ## Flush sequence
+/// 1. Sort staged rows ascending by primary-key bytes (enables rightmost-leaf
+///    fast path inside `apply_clustered_insert_rows`).
+/// 2. Convert `StagedClusteredRow` → `PreparedClusteredInsertRow` (zero-copy
+///    field move; the two types are structurally identical).
+/// 3. Delegate to `apply_clustered_insert_rows` which handles the
+///    `try_insert_rightmost_leaf_batch` fast path, fallback single inserts, WAL
+///    recording, secondary-index maintenance, and root persistence.
+/// 4. Update the stats tracker and invalidate the schema cache.
+pub(super) fn flush_clustered_insert_batch(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
+    ctx: &mut SessionContext,
+) -> Result<(), DbError> {
+    let batch = match ctx.clustered_insert_batch.take() {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+
+    if batch.rows.is_empty() {
+        return Ok(());
+    }
+
+    // Sort ascending by PK so `apply_clustered_insert_rows` detects the
+    // append-biased pattern and uses `try_insert_rightmost_leaf_batch`.
+    let mut rows = batch.rows;
+    rows.sort_unstable_by(|a, b| a.primary_key_bytes.cmp(&b.primary_key_bytes));
+
+    // Convert StagedClusteredRow → PreparedClusteredInsertRow (same fields).
+    let prepared: Vec<crate::clustered_table::PreparedClusteredInsertRow> = rows
+        .into_iter()
+        .map(|r| crate::clustered_table::PreparedClusteredInsertRow {
+            values: r.values,
+            encoded_row: r.encoded_row,
+            primary_key_values: r.primary_key_values,
+            primary_key_bytes: r.primary_key_bytes,
+        })
+        .collect();
+
+    let mut secondary_indexes = batch.secondary_indexes;
+    let count = apply_clustered_insert_rows(
+        storage,
+        txn,
+        bloom,
+        &batch.table_def,
+        &batch.primary_idx,
+        &mut secondary_indexes,
+        &batch.secondary_layouts,
+        &batch.compiled_preds,
+        &prepared,
+    )?;
+
+    ctx.stats.on_rows_changed(batch.table_id, count);
+    ctx.invalidate_all();
+
+    Ok(())
+}
