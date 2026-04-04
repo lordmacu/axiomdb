@@ -89,3 +89,53 @@ Crash scenarios:
 - Crash after flush but before COMMIT WAL record: recovery undoes via existing
   `UndoClusteredInsert` path. ✓
 - Crash after COMMIT WAL record: recovery replays normally. ✓
+
+## Subfase 40.1b — CREATE INDEX on clustered tables
+
+### What was implemented
+
+Removed the `ensure_heap_runtime` guard in `execute_create_index` (ddl.rs) that was
+blocking `CREATE INDEX` on clustered tables with `NotImplemented`. Now `CREATE INDEX`
+works identically on both heap and clustered tables.
+
+### Key change
+
+**`crates/axiomdb-sql/src/executor/ddl.rs`** — `execute_create_index`:
+- Removed: `table_def.ensure_heap_runtime("CREATE INDEX on clustered table — Phase 39.13+")?;`
+- Added clustered scan + insert branch before the existing heap branch:
+  - Fetches the primary `IndexDef` from the catalog.
+  - Builds a `preview_index_def` (no index_id yet) for `ClusteredSecondaryLayout::derive`.
+  - Scans via `TableEngine::scan_clustered_table` (same `Vec<(RecordId, Vec<Value>)>` type as heap scan).
+  - For each row: calls `layout.entry_from_row` to get the physical key for bloom, then `layout.insert_row` for the B-Tree write + uniqueness check.
+  - Partial index predicates and NULL secondary values are handled identically to the heap path.
+  - Stats bootstrap at step 8 reuses the same `rows` Vec — no extra I/O.
+
+### Behavioral parity with heap indexes
+
+| Feature | Heap | Clustered 40.1b |
+|---|---|---|
+| Non-unique index | ✅ | ✅ |
+| UNIQUE index — build-time dedup check | ✅ | ✅ |
+| UNIQUE index — runtime INSERT enforcement | ✅ | ✅ |
+| Partial index (WHERE predicate) | ✅ | ✅ |
+| NULL values not indexed | ✅ | ✅ |
+| Bloom filter populated | ✅ | ✅ |
+| Per-column NDV stats | ✅ | ✅ |
+| Duplicate name check | ✅ | ✅ |
+
+### Tests
+
+- `crates/axiomdb-sql/tests/integration_clustered_create_index.rs` — 9 tests:
+  - Empty table: catalog entry created
+  - Populated table: existing rows indexed and scannable via layout.scan_prefix
+  - Unique index rejects existing duplicates
+  - Unique index succeeds with distinct values
+  - INSERT after CREATE INDEX maintains secondary index
+  - SELECT uses secondary index after CREATE INDEX
+  - NULL secondary values not indexed
+  - Unique index enforces on subsequent INSERTs
+  - Duplicate index name returns IndexAlreadyExists
+  - Partial index: only matching rows indexed
+  - Heap table CREATE INDEX unchanged (regression)
+
+- `tools/wire-test.py` — 7 new wire-test assertions (section 40.2)

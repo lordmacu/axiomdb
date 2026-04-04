@@ -9,7 +9,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              6.20 (UPDATE apply fast path smoke), 22b.3a (database catalog wire smoke),
              39.18 (clustered VACUUM smoke), 39.19 (clustered REBUILD guard rails),
              39.21 (aggregate hash execution — zero-alloc clustered scan),
-             39.22 (UPDATE in-place zero-alloc: single/multi field patch, rollback, TEXT-before-INT)
+             39.22 (UPDATE in-place zero-alloc: single/multi field patch, rollback, TEXT-before-INT),
+             40.1b (CREATE INDEX on clustered tables)
 """
 import os
 import signal
@@ -2586,6 +2587,60 @@ c40.execute("SELECT COUNT(*) FROM batch40b")
 ok("40.1 table switch: batch40b row present", c40.fetchone() == (1,))
 
 conn40.close()
+
+# ── 40.2 CREATE INDEX on clustered tables ─────────────────────────────────────
+
+print("\n[40.2 CREATE INDEX on clustered tables]")
+conn_ci = pymysql.connect(host="127.0.0.1", port=PORT, user="root", password="root",
+                          charset="utf8mb4", autocommit=True)
+c_ci = conn_ci.cursor()
+
+# Setup: clustered table + rows
+c_ci.execute("DROP TABLE IF EXISTS ci_users")
+c_ci.execute("CREATE TABLE ci_users (id INT PRIMARY KEY, email TEXT, age INT)")
+c_ci.execute("INSERT INTO ci_users VALUES (1, 'alice@example.com', 30)")
+c_ci.execute("INSERT INTO ci_users VALUES (2, 'bob@example.com', 25)")
+c_ci.execute("INSERT INTO ci_users VALUES (3, 'carol@example.com', 35)")
+
+# 1. CREATE INDEX succeeds
+c_ci.execute("CREATE INDEX idx_ci_age ON ci_users (age)")
+ok("40.2 CREATE INDEX on clustered table succeeds", True)
+
+# 2. SELECT via secondary index returns correct row
+c_ci.execute("SELECT id FROM ci_users WHERE age = 25")
+ok("40.2 SELECT via secondary index returns correct row", c_ci.fetchone() == (2,))
+
+# 3. CREATE UNIQUE INDEX succeeds on distinct values
+c_ci.execute("CREATE UNIQUE INDEX uq_ci_email ON ci_users (email)")
+ok("40.2 CREATE UNIQUE INDEX on distinct values succeeds", True)
+
+# 4. INSERT with duplicate unique value raises error
+try:
+    c_ci.execute("INSERT INTO ci_users VALUES (4, 'alice@example.com', 28)")
+    c_ci.fetchall()
+    ok("40.2 unique index rejects duplicate after CREATE UNIQUE INDEX", False, "no error raised")
+except Exception as e:
+    ok("40.2 unique index rejects duplicate after CREATE UNIQUE INDEX", True, str(e))
+
+# 5. Row count unchanged after failed insert
+c_ci.execute("SELECT COUNT(*) FROM ci_users")
+ok("40.2 row count unchanged after failed duplicate insert", c_ci.fetchone() == (3,))
+
+# 6. CREATE INDEX on empty clustered table succeeds
+c_ci.execute("DROP TABLE IF EXISTS ci_empty")
+c_ci.execute("CREATE TABLE ci_empty (id INT PRIMARY KEY, tag TEXT)")
+c_ci.execute("CREATE INDEX idx_ci_tag ON ci_empty (tag)")
+ok("40.2 CREATE INDEX on empty clustered table succeeds", True)
+
+# 7. Duplicate index name raises error
+try:
+    c_ci.execute("CREATE INDEX idx_ci_age ON ci_users (age)")
+    c_ci.fetchall()
+    ok("40.2 duplicate index name raises error", False, "no error raised")
+except Exception as e:
+    ok("40.2 duplicate index name raises error", True, str(e))
+
+conn_ci.close()
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

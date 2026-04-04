@@ -1288,6 +1288,7 @@
 
 ### Phase 40 — Clustered Engine Performance Optimizations `🔄`
 - [x] 40.1 ✅ ClusteredInsertBatch — staging buffer for consecutive `INSERT ... VALUES` inside explicit transactions; rows encoded at enqueue time, sorted by PK and flushed at COMMIT via `try_insert_rightmost_leaf_batch`; intra-batch PK dedup via `HashSet<Vec<u8>>`; SELECT/UPDATE/DELETE/DDL/SAVEPOINT/table-switch barrier flush; ROLLBACK discards without storage writes; 10 integration tests; 9 wire-test assertions; **55.9K rows/s for 50K sequential PK rows** (MySQL 8.0 reference: ~35K r/s, **+59%**)
+- [x] 40.1b ✅ CREATE INDEX on clustered tables — removed `ensure_heap_runtime` guard; clustered branch uses `scan_clustered_table` + `ClusteredSecondaryLayout::derive` + `insert_row`; partial index predicates honored; NULL secondary values skipped; uniqueness enforced during index build; bloom filter populated via `entry_from_row`; stats bootstrap reuses same scan; 9 integration tests; 7 wire-test assertions
 - [ ] 40.2 ⏳ Statement plan cache — per-session `CachedPlanSource` with OID-based invalidation
 - [ ] 40.3 ⏳ Transaction Write Set — page-level CoW coalescing for multi-row UPDATE/DELETE
 - [ ] 40.4 ⏳ Vectorized scan primitives — SIMD-accelerated predicate evaluation for clustered scans
