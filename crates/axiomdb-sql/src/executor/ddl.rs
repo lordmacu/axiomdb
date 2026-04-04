@@ -721,8 +721,6 @@ fn execute_create_index(
         let resolved = resolver.resolve_table(Some(schema), &stmt.table.name)?;
         (resolved.def.clone(), resolved.columns.clone())
     };
-    table_def.ensure_heap_runtime("CREATE INDEX on clustered table — Phase 39.13+")?;
-
     // 2. Check for a duplicate index name on this table.
     {
         let mut reader = CatalogReader::new(storage, snap)?;
@@ -780,44 +778,109 @@ fn execute_create_index(
         None => None,
     };
 
-    let rows = TableEngine::scan_table(storage, &table_def, &col_defs, snap, None)?;
-    let mut skipped = 0usize;
     let mut bloom_keys: Vec<Vec<u8>> = Vec::new();
-    for (rid, row_vals) in &rows {
-        let (rid, row_vals) = (*rid, row_vals);
-        // Partial index: skip rows that don't satisfy the predicate.
-        if let Some(pred) = &pred_expr {
-            if !crate::eval::is_truthy(&crate::eval::eval(pred, row_vals)?) {
+    let mut skipped = 0usize;
+
+    // Scan existing rows — same Vec<(RecordId, Vec<Value>)> format for both paths,
+    // reused by stats bootstrap at step 8 without extra I/O.
+    let rows = if table_def.is_clustered() {
+        crate::table::scan_clustered_table(storage, &table_def, &col_defs, snap)?
+    } else {
+        TableEngine::scan_table(storage, &table_def, &col_defs, snap, None)?
+    };
+
+    if table_def.is_clustered() {
+        // ── Clustered secondary index build ──────────────────────────────
+        // Derive the physical key layout from the primary index so that every
+        // secondary entry encodes as: secondary_cols ++ suffix_primary_cols.
+        // This is identical to what execute_clustered_insert uses for runtime inserts.
+        let primary_idx = {
+            let mut reader = CatalogReader::new(storage, snap)?;
+            reader
+                .list_indexes(table_def.id)?
+                .into_iter()
+                .find(|i| i.is_primary)
+                .ok_or_else(|| {
+                    DbError::Other(format!(
+                        "clustered table '{}' has no primary index — catalog inconsistency",
+                        table_def.table_name
+                    ))
+                })?
+        };
+        // Build a preview IndexDef for ClusteredSecondaryLayout::derive.
+        // Only name, is_unique, columns, fillfactor, and root_page_id are used.
+        let preview_index_def = IndexDef {
+            index_id: 0,
+            table_id: table_def.id,
+            name: stmt.name.clone(),
+            root_page_id,
+            is_unique: stmt.unique,
+            is_primary: false,
+            columns: index_columns.clone(),
+            predicate: None,
+            fillfactor: index_fillfactor,
+            is_fk_index: false,
+            include_columns: vec![],
+            index_type: 0,
+            pages_per_range: 128,
+        };
+        let layout = crate::clustered_secondary::ClusteredSecondaryLayout::derive(
+            &preview_index_def,
+            &primary_idx,
+        )?;
+
+        for (_rid, row_vals) in &rows {
+            // Partial index: skip rows that don't satisfy the predicate.
+            if let Some(pred) = &pred_expr {
+                if !crate::eval::is_truthy(&crate::eval::eval(pred, row_vals)?) {
+                    continue;
+                }
+            }
+            // Collect physical key for bloom (None → secondary column is NULL → skip).
+            if let Some(entry) = layout.entry_from_row(row_vals)? {
+                bloom_keys.push(entry.physical_key);
+            }
+            // insert_row enforces uniqueness + writes the physical key to the B-Tree.
+            layout.insert_row(storage, &root_pid, row_vals)?;
+        }
+    } else {
+        // ── Heap secondary index build (original path) ───────────────────
+        for (rid, row_vals) in &rows {
+            let (rid, row_vals) = (*rid, row_vals);
+            // Partial index: skip rows that don't satisfy the predicate.
+            if let Some(pred) = &pred_expr {
+                if !crate::eval::is_truthy(&crate::eval::eval(pred, row_vals)?) {
+                    continue;
+                }
+            }
+
+            let key_vals: Vec<Value> = index_columns
+                .iter()
+                .map(|ic| row_vals[ic.col_idx as usize].clone())
+                .collect();
+            // Skip rows with NULL key values — NULLs are not indexed.
+            if key_vals.iter().any(|v| matches!(v, Value::Null)) {
                 continue;
             }
-        }
-
-        let key_vals: Vec<Value> = index_columns
-            .iter()
-            .map(|ic| row_vals[ic.col_idx as usize].clone())
-            .collect();
-        // Skip rows with NULL key values — NULLs are not indexed.
-        if key_vals.iter().any(|v| matches!(v, Value::Null)) {
-            continue;
-        }
-        match encode_index_key(&key_vals) {
-            Ok(base_key) => {
-                // Non-unique indexes append the RecordId so that multiple rows with
-                // the same indexed value each get a unique B-Tree key (InnoDB approach).
-                let key = if !stmt.unique {
-                    let mut k = base_key;
-                    k.extend_from_slice(&encode_rid(rid));
-                    k
-                } else {
-                    base_key
-                };
-                BTree::insert_in(storage, &root_pid, &key, rid, index_fillfactor)?;
-                bloom_keys.push(key);
+            match encode_index_key(&key_vals) {
+                Ok(base_key) => {
+                    // Non-unique indexes append the RecordId so that multiple rows with
+                    // the same indexed value each get a unique B-Tree key (InnoDB approach).
+                    let key = if !stmt.unique {
+                        let mut k = base_key;
+                        k.extend_from_slice(&encode_rid(rid));
+                        k
+                    } else {
+                        base_key
+                    };
+                    BTree::insert_in(storage, &root_pid, &key, rid, index_fillfactor)?;
+                    bloom_keys.push(key);
+                }
+                Err(DbError::IndexKeyTooLong { .. }) => {
+                    skipped += 1;
+                }
+                Err(e) => return Err(e),
             }
-            Err(DbError::IndexKeyTooLong { .. }) => {
-                skipped += 1;
-            }
-            Err(e) => return Err(e),
         }
     }
     if skipped > 0 {

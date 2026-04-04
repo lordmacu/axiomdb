@@ -45,14 +45,13 @@ That internal rewrite is still honest about its current boundary:
   only explicit-PK tables expose clustered layout at DDL time
 - clustered covering reads still degrade to fetching the clustered row body; a
   true clustered index-only optimization is still future work
-- standalone clustered `CREATE INDEX` / `ANALYZE` remain deferred
 - clustered child-table foreign-key enforcement still remains future work
 
 <div class="callout callout-tip">
 <span class="callout-icon">💡</span>
 <div class="callout-body">
 <span class="callout-label">Current Behavior</span>
-`CREATE TABLE users (id INT PRIMARY KEY, ...)` now creates clustered storage, `INSERT INTO users ...` writes through the clustered PK tree, `SELECT ...` reads directly from clustered storage, `UPDATE ...` rewrites the clustered row plus any bookmark-bearing secondary entries, `DELETE ...` applies a clustered delete-mark, `VACUUM users` now physically reclaims clustered dead rows plus overflow/secondary garbage that is safe to purge, and `ALTER TABLE users REBUILD` migrates older heap+PK tables into that same layout.
+`CREATE TABLE users (id INT PRIMARY KEY, ...)` now creates clustered storage, `INSERT INTO users ...` writes through the clustered PK tree, `SELECT ...` reads directly from clustered storage, `UPDATE ...` rewrites the clustered row plus any bookmark-bearing secondary entries, `DELETE ...` applies a clustered delete-mark, `VACUUM users` now physically reclaims clustered dead rows plus overflow/secondary garbage that is safe to purge, `ALTER TABLE users REBUILD` migrates older heap+PK tables into that same layout, and `CREATE INDEX` / `CREATE UNIQUE INDEX` now works on clustered tables exactly as on heap tables.
 </div>
 </div>
 

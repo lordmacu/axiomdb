@@ -332,6 +332,51 @@ writes, no WAL entries, no undo needed.
 
 ---
 
+## CREATE INDEX on clustered tables (Phase 40.1b)
+
+`execute_create_index` (ddl.rs) now handles both heap and clustered tables with a
+single function. The dispatch happens after the B-Tree root page is allocated:
+
+```
+if table_def.is_clustered() {
+    primary_idx  ← CatalogReader::list_indexes → find(is_primary)
+    preview_def  ← IndexDef { columns, is_unique, fillfactor, root_page_id, … }
+    layout       ← ClusteredSecondaryLayout::derive(&preview_def, &primary_idx)
+    rows         ← scan_clustered_table(storage, &table_def, &col_defs, snap)
+    for row in rows:
+        if partial predicate → skip non-matching rows
+        entry = layout.entry_from_row(row)  → physical_key for bloom
+        layout.insert_row(storage, &root_pid, row)  → uniqueness + B-Tree insert
+} else {
+    rows ← scan_table(…)
+    for row in rows: encode_index_key + BTree::insert_in
+}
+// step 8: stats bootstrap uses same `rows` Vec — no extra I/O
+```
+
+The `ClusteredSecondaryLayout` encodes the physical key as
+`secondary_cols ++ suffix_primary_cols` — exactly the format used by runtime
+`INSERT`/`UPDATE`/`DELETE`, so a clustered secondary index built by `CREATE INDEX`
+is byte-for-byte compatible with those written by the DML executors.
+
+`entry_from_row` is called once per row to collect the physical key for the bloom
+filter, and `insert_row` calls it again internally for the B-Tree write. This is
+acceptable overhead during a DDL operation (O(n) with constant factor ≈2).
+
+### NULL handling
+
+`ClusteredSecondaryLayout::entry_from_row` returns `None` when any secondary column
+is NULL. Both the bloom key collection and the B-Tree insert are skipped in that case,
+consistent with the runtime INSERT path and SQL standard NULL semantics for indexes.
+
+### Uniqueness enforcement
+
+`insert_row` delegates uniqueness to `ensure_unique_logical_key_absent`, the same
+function used at runtime. If an existing row already carries that logical key, the
+build fails with `DbError::UniqueViolation` before the catalog entry is written.
+
+---
+
 ## Query Pipeline
 
 ```

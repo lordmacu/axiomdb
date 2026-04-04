@@ -358,7 +358,7 @@ CREATE TABLE order_items (
 
 Indexes accelerate lookups and range scans. AxiomDB automatically creates a unique B+
 Tree index for every PRIMARY KEY and UNIQUE constraint. Additional indexes are created
-explicitly.
+explicitly. `CREATE INDEX` works on both heap tables and clustered (PRIMARY KEY) tables.
 
 ### Basic Syntax
 

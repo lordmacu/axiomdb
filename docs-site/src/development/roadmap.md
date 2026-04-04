@@ -14,9 +14,9 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 40.1 ClusteredInsertBatch — staging buffer for consecutive `INSERT ... VALUES` into clustered tables inside explicit transactions. Rows encoded at enqueue, sorted by PK and flushed at COMMIT via `try_insert_rightmost_leaf_batch`. Result: **55.9K rows/s** for 50K sequential PK rows, +59% vs MySQL 8.0 InnoDB (~35K rows/s).
+**Last completed subphase:** 40.1b CREATE INDEX on clustered tables — removed `ensure_heap_runtime` guard; `CREATE INDEX` / `CREATE UNIQUE INDEX` now work on clustered (PRIMARY KEY) tables using `ClusteredSecondaryLayout`-based index build with partial index, NULL-skipping, and uniqueness enforcement at build time.
 
-**Active development:** Phase 40 — Clustered engine performance optimizations (ClusteredInsertBatch done; statement plan cache, transaction write set, vectorized scan next)
+**Active development:** Phase 40 — Clustered engine performance optimizations (40.1 ClusteredInsertBatch done; 40.1b CREATE INDEX on clustered tables done; statement plan cache, transaction write set, vectorized scan next)
 
 **Next milestone:** 40.2 — Statement plan cache (per-session `CachedPlanSource` with OID-based invalidation)
 
