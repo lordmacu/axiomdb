@@ -544,10 +544,12 @@ purely a wire-layer concern.
 ```rust
 pub struct PreparedStatement {
     pub stmt_id: u32,
-    pub sql_template: String,         // original SQL with ? placeholders
+    pub sql_template: String,            // original SQL with ? placeholders
     pub param_count: u16,
-    pub analyzed_stmt: Option<Stmt>,  // cached parse+analyze result (plan cache)
-    pub compiled_at_version: u64,
+    pub analyzed_stmt: Option<Stmt>,     // cached parse+analyze result (plan cache)
+    pub compiled_at_version: u64,        // global schema_version at compile time
+    pub deps: PlanDeps,                  // per-table OID dependencies (Phase 40.2)
+    pub generation: u32,                 // incremented on each re-analysis
     pub last_used_seq: u64,
     pub pending_long_data: Vec<Option<Vec<u8>>>,
     pub pending_long_data_error: Option<String>,
@@ -559,6 +561,21 @@ pub struct PreparedStatement {
 `substitute_params_in_ast` on the cached `Stmt` and invokes `execute_stmt()` directly,
 skipping the parse and analyze steps entirely. If `analyzed_stmt` is `None` (should not
 occur in normal operation), the handler falls back to the full parse + analyze path.
+
+**OID-based staleness check (Phase 40.2):**
+
+`COM_STMT_EXECUTE` uses a two-level check:
+
+1. **Fast** (`O(1)` atomic compare): if `compiled_at_version == current_global_schema_version`,
+   no DDL has occurred since compile → skip catalog scan entirely (zero I/O).
+2. **Slow** (`O(t)` catalog reads, `t = tables in deps`): only when the global version
+   has advanced. `PlanDeps::is_stale()` reads each table's current `schema_version` from
+   the catalog heap and compares to the cached snapshot. If all match → the DDL was on a
+   *different* table → stamp the new global version and skip re-analysis.
+
+This avoids re-analyzing prepared statements when `CREATE INDEX ON other_table` runs —
+only statements that actually reference the DDL-modified table are re-compiled. PostgreSQL
+uses the same approach via `RelationOids` in `CachedPlanSource`.
 
 Each connection maintains its own `HashMap<u32, PreparedStatement>`. Statement IDs are
 assigned by incrementing `next_stmt_id` (starting at 1) and are local to the connection
@@ -696,6 +713,71 @@ byte in column metadata always agrees with the wire encoding of the row values.
 A divergence (e.g., advertising <code>LONGLONG</code> but sending ASCII digits) would
 cause silent data corruption on the client — a class of bug that is impossible when
 there is only one mapping.
+</div>
+</div>
+
+#### COM_QUERY OID-based plan cache (plan_cache.rs — Phase 40.2)
+
+Repeated ad-hoc queries like `SELECT * FROM users WHERE id = 42` arrive with different
+literal values on each call. The plan cache normalizes literals to `?` placeholders,
+hashes the result, and caches the fully analyzed AST. Subsequent queries with the same
+structure (e.g., `id = 99`) skip parse + analyze (~5 µs) and reuse the cached `Stmt`.
+
+**Entry structure (`CachedPlanSource`):**
+
+```rust
+struct CachedPlanSource {
+    stmt: Stmt,                             // fully analyzed AST
+    deps: PlanDeps,                         // (table_id, schema_version) per referenced table
+    param_count: usize,                     // expected literal count for structural match
+    generation: u32,                        // incremented on each re-store after stale eviction
+    exec_count: u64,                        // lifetime hit counter
+    last_used_seq: u64,                     // LRU clock value
+    last_validated_global_version: u64,     // fast pre-check stamp
+}
+```
+
+**Two-level staleness check:**
+
+1. **Fast** (`O(1)`): if `global_schema_version == last_validated_global_version`, no DDL
+   has occurred since last validation → cache hit with zero catalog I/O.
+2. **Slow** (`O(t)` catalog reads): called only when the global version advanced.
+   `PlanDeps::is_stale()` reads each table's current `schema_version` from the catalog
+   heap and compares to the cached snapshot. If any dep mismatches → evict. If all match
+   → stamp the new global version (future lookups hit the fast path again).
+
+**Belt-and-suspenders invalidation:**
+
+- **Lazy** (primary): `is_stale()` at lookup time catches cross-connection DDL.
+- **Eager** (secondary): `invalidate_table(table_id)` called immediately after same-connection
+  DDL removes all entries whose `deps` include `table_id`. DDL functions in `executor/ddl.rs`
+  also call `bump_table_schema_version(table_id)` via `CatalogWriter` so the per-table
+  counter advances regardless of which connection holds the plan.
+
+**OID dependency extraction (`plan_deps.rs`):**
+
+`extract_table_deps(stmt, catalog_reader, database)` walks the analyzed `Stmt` and
+resolves every table reference to its `(TableId, schema_version)` at compile time:
+
+- `SELECT` — FROM, JOINs, scalar subqueries in WHERE/HAVING/columns/ORDER BY/GROUP BY
+- `INSERT … SELECT` — target table + all tables in the SELECT
+- `UPDATE`, `DELETE` — target table + subqueries in WHERE
+- `EXPLAIN` — recursive into the wrapped statement
+- DDL statements — return empty `PlanDeps` (never cached)
+
+**LRU eviction:** when `max_entries` (512) is reached, the entry with the lowest
+`last_used_seq` is evicted. O(n) scan over ≤512 entries — called only on capacity overflow,
+never on the hot lookup path.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Fine-grained invalidation vs MySQL/PostgreSQL</span>
+MySQL 8 invalidates its entire prepared-statement cache on any DDL. PostgreSQL's
+<code>plancache.c</code> uses per-entry <code>RelationOids</code> to limit invalidation
+to plans that reference the modified table. AxiomDB mirrors PostgreSQL's approach:
+a <code>CREATE INDEX ON users(email)</code> evicts only plans that reference <code>users</code>
+— plans on <code>orders</code>, <code>products</code>, and other tables survive untouched.
 </div>
 </div>
 

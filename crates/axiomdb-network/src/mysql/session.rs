@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 
 use axiomdb_core::error::DbError;
+use axiomdb_sql::plan_deps::PlanDeps;
 use axiomdb_sql::session::{
     apply_strict_to_sql_mode, compat_mode_name, normalize_sql_mode, on_error_mode_name,
     parse_boolish_setting, parse_compat_mode_setting, parse_on_error_setting,
@@ -44,11 +45,28 @@ pub struct PreparedStatement {
     ///
     /// Set to `None` when re-analysis fails after a schema change.
     pub analyzed_stmt: Option<axiomdb_sql::ast::Stmt>,
-    /// `Database::schema_version` snapshot at the last successful parse+analyze.
+    /// Global `Database::schema_version` snapshot at the last successful parse+analyze.
     ///
-    /// If `compiled_at_version != current_schema_version`, the plan is stale
-    /// and must be re-analyzed before the next `COM_STMT_EXECUTE` (Phase 5.13).
+    /// **Fast pre-check**: if `compiled_at_version == current_global_schema_version`,
+    /// no DDL has occurred since compile → skip the per-table OID staleness check
+    /// entirely (zero catalog I/O on the common path).
+    ///
+    /// When the global version advances, `deps.is_stale()` performs the fine-grained
+    /// per-table check to determine whether THIS statement's referenced tables changed.
     pub compiled_at_version: u64,
+    /// Per-table OID-based catalog dependencies (Phase 40.2).
+    ///
+    /// Snapshotted at `COM_STMT_PREPARE` time (or after each re-analysis).
+    /// Each entry is `(table_id, schema_version_at_compile)`. A stale check
+    /// reads each table's current `schema_version` from the catalog; a mismatch
+    /// or a missing table triggers re-analysis.
+    ///
+    /// Empty for DDL statements (which are never cached) and until the first
+    /// successful analysis populates them.
+    pub deps: PlanDeps,
+    /// Incremented each time this statement is re-analyzed after stale detection.
+    /// Mirrors PostgreSQL's `CachedPlanSource.generation`.
+    pub generation: u32,
     /// Selected database at the last successful parse+analyze.
     pub compiled_database: String,
     /// Logical clock for LRU eviction. Updated to `ConnectionState::execute_seq`
@@ -701,6 +719,8 @@ impl ConnectionState {
                 param_types: vec![],
                 analyzed_stmt: None, // populated by handler after parse+analyze
                 compiled_at_version: schema_version,
+                deps: PlanDeps::default(), // populated by handler after extract_table_deps
+                generation: 0,
                 compiled_database: current_database.to_string(),
                 last_used_seq: 0,
                 pending_long_data: vec![None; param_count as usize],

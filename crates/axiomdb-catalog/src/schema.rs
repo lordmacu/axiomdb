@@ -327,14 +327,18 @@ impl From<TableStorageLayout> for u8 {
 /// ## On-disk format (`to_bytes` / `from_bytes`)
 ///
 /// ```text
-/// legacy:
+/// legacy (v0):
 ///   [table_id:4 LE][root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8]
 ///
-/// current:
+/// v1:
 ///   [table_id:4 LE][root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8][layout:1]
+///
+/// v2 (current):
+///   [table_id:4 LE][root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8][layout:1][schema_version:8 LE]
 /// ```
 ///
-/// Legacy rows without the trailing `layout` byte decode as [`TableStorageLayout::Heap`].
+/// v0 rows decode as `storage_layout = Heap, schema_version = 1`.
+/// v1 rows decode as `schema_version = 1`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableDef {
     pub id: TableId,
@@ -347,6 +351,15 @@ pub struct TableDef {
     pub storage_layout: TableStorageLayout,
     pub schema_name: String,
     pub table_name: String,
+    /// Monotonically increasing version counter for this table's schema.
+    ///
+    /// Initialized to `1` when the table is created. Bumped by every DDL
+    /// operation that modifies this specific table (CREATE INDEX, DROP INDEX,
+    /// DROP TABLE, TRUNCATE TABLE). Used by the plan cache to detect stale
+    /// cached plans without invalidating the entire cache on any DDL event.
+    ///
+    /// Mirrors PostgreSQL's per-relation version tracking in `relcache`.
+    pub schema_version: u64,
 }
 
 impl TableDef {
@@ -367,10 +380,10 @@ impl TableDef {
         Ok(())
     }
 
-    /// Serializes to binary row format.
+    /// Serializes to binary row format (v2).
     ///
     /// Format:
-    /// `[table_id:4][root_page_id:8][schema_len:1][schema bytes][name_len:1][name bytes][layout:1]`
+    /// `[table_id:4][root_page_id:8][schema_len:1][schema bytes][name_len:1][name bytes][layout:1][schema_version:8 LE]`
     ///
     /// # Panics (debug only)
     /// If `schema_name` or `table_name` exceeds 255 bytes.
@@ -380,7 +393,7 @@ impl TableDef {
         debug_assert!(schema.len() <= 255, "schema_name too long");
         debug_assert!(name.len() <= 255, "table_name too long");
 
-        let mut buf = Vec::with_capacity(4 + 8 + 1 + schema.len() + 1 + name.len() + 1);
+        let mut buf = Vec::with_capacity(4 + 8 + 1 + schema.len() + 1 + name.len() + 1 + 8);
         buf.extend_from_slice(&self.id.to_le_bytes());
         buf.extend_from_slice(&self.root_page_id.to_le_bytes());
         buf.push(schema.len() as u8);
@@ -388,6 +401,7 @@ impl TableDef {
         buf.push(name.len() as u8);
         buf.extend_from_slice(name);
         buf.push(self.storage_layout.into());
+        buf.extend_from_slice(&self.schema_version.to_le_bytes());
         buf
     }
 
@@ -438,12 +452,27 @@ impl TableDef {
             })?
             .to_string();
         let mut consumed = pos + name_len;
-        let storage_layout = match bytes.len() {
-            len if len == consumed => TableStorageLayout::Heap,
-            len if len == consumed + 1 => {
+        // Three on-disk formats — decode trailing bytes by total remaining size:
+        //   v0 (0 trailing):  storage_layout = Heap, schema_version = 1
+        //   v1 (1 trailing):  storage_layout from byte, schema_version = 1
+        //   v2 (9 trailing):  storage_layout from byte, schema_version from 8 LE bytes
+        let (storage_layout, schema_version) = match bytes.len() - consumed {
+            0 => (TableStorageLayout::Heap, 1u64),
+            1 => {
                 let layout = TableStorageLayout::try_from(bytes[consumed])?;
                 consumed += 1;
-                layout
+                (layout, 1u64)
+            }
+            9 => {
+                let layout = TableStorageLayout::try_from(bytes[consumed])?;
+                consumed += 1;
+                let v = u64::from_le_bytes(
+                    bytes[consumed..consumed + 8]
+                        .try_into()
+                        .expect("slice is exactly 8 bytes"),
+                );
+                consumed += 8;
+                (layout, v)
             }
             _ => {
                 return Err(DbError::ParseError {
@@ -460,6 +489,7 @@ impl TableDef {
                 storage_layout,
                 schema_name,
                 table_name,
+                schema_version,
             },
             consumed,
         ))
@@ -1258,6 +1288,7 @@ mod tests {
             storage_layout: TableStorageLayout::Heap,
             schema_name: "public".to_string(),
             table_name: "users".to_string(),
+            schema_version: 1,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();
@@ -1275,6 +1306,7 @@ mod tests {
                 storage_layout: TableStorageLayout::Heap,
                 schema_name: "public".into(),
                 table_name: "t".into(),
+                schema_version: 1,
             };
             let (back, _) = TableDef::from_bytes(&def.to_bytes()).unwrap();
             assert_eq!(back.root_page_id, root);
@@ -1289,6 +1321,7 @@ mod tests {
             storage_layout: TableStorageLayout::Heap,
             schema_name: String::new(),
             table_name: String::new(),
+            schema_version: 1,
         };
         let bytes = def.to_bytes();
         let (back, _) = TableDef::from_bytes(&bytes).unwrap();
@@ -1303,6 +1336,7 @@ mod tests {
             storage_layout: TableStorageLayout::Heap,
             schema_name: "s".into(),
             table_name: "t".into(),
+            schema_version: 1,
         };
         let bytes = def.to_bytes();
         // Minimum is 14 bytes; truncate to 10 (has id+root but no schema_len).
@@ -1319,6 +1353,7 @@ mod tests {
             storage_layout: TableStorageLayout::Clustered,
             schema_name: "public".into(),
             table_name: "orders".into(),
+            schema_version: 1,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();

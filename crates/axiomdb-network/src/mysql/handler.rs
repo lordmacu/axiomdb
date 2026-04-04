@@ -22,8 +22,11 @@ use tokio::sync::RwLock;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, info, warn};
 
+use axiomdb_catalog::CatalogReader;
 use axiomdb_core::error::DbError;
-use axiomdb_sql::{ast::Stmt, result::ColumnMeta, SchemaCache, SessionContext};
+use axiomdb_sql::{
+    ast::Stmt, plan_deps::extract_table_deps, result::ColumnMeta, SchemaCache, SessionContext,
+};
 use axiomdb_types::DataType;
 
 use super::charset::DEFAULT_SERVER_COLLATION;
@@ -660,9 +663,22 @@ pub async fn handle_connection_with_timeouts(
                                     let sv = guard
                                         .schema_version
                                         .load(std::sync::atomic::Ordering::Acquire);
-                                    if let Some((cached_stmt, _params)) =
-                                        plan_cache.lookup(stmt_sql, sv)
-                                    {
+
+                                    // OID-based lookup (Phase 40.2): two-level staleness check.
+                                    // Fast path: if global sv unchanged since last validation,
+                                    // skip per-table catalog scan (zero catalog I/O).
+                                    // Slow path: only when DDL happened, scan per-table deps.
+                                    let cached_result = {
+                                        let snap = guard.txn_snapshot_for_cache();
+                                        match CatalogReader::new(&guard.storage, snap) {
+                                            Ok(mut reader) => plan_cache
+                                                .lookup(stmt_sql, sv, &mut reader)
+                                                .unwrap_or(None),
+                                            Err(_) => None,
+                                        }
+                                    }; // reader + immutable borrow of guard.storage dropped here
+
+                                    if let Some((cached_stmt, _params)) = cached_result {
                                         // Cache hit: skip parse AND analyze — the cached
                                         // Stmt is fully analyzed (col_idx resolved, types
                                         // checked). substitute_params already replaced
@@ -697,15 +713,57 @@ pub async fn handle_connection_with_timeouts(
                                                         &mut schema_cache,
                                                     )
                                                 {
-                                                    plan_cache.store(stmt_sql, &analyzed, sv);
+                                                    // Extract OID deps and store with them
+                                                    // (Phase 40.2). Scoped block ensures
+                                                    // reader is dropped before any subsequent
+                                                    // mutable borrow of guard.storage.
+                                                    let snap2 = guard.txn_snapshot_for_cache();
+                                                    if let Ok(mut reader) =
+                                                        CatalogReader::new(&guard.storage, snap2)
+                                                    {
+                                                        if let Ok(deps) = extract_table_deps(
+                                                            &analyzed,
+                                                            &mut reader,
+                                                            session.effective_database(),
+                                                        ) {
+                                                            drop(reader);
+                                                            plan_cache.store(
+                                                                stmt_sql, &analyzed, deps, sv,
+                                                            );
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
                                         result
                                     }
                                 } else {
-                                    // Non-cacheable: always full pipeline.
-                                    guard.execute_query(stmt_sql, &mut session, &mut schema_cache)
+                                    // Non-cacheable (DDL, SET, txn control, etc.): always full
+                                    // pipeline.
+                                    // Phase 40.2: pre-resolve the affected table_id before
+                                    // execution so we can call plan_cache.invalidate_table()
+                                    // after DDL succeeds (eager belt-and-suspenders; the lazy
+                                    // is_stale() check is the primary cross-connection path).
+                                    let ddl_table_id = axiomdb_sql::parse(stmt_sql, None)
+                                        .ok()
+                                        .and_then(|ref parsed| {
+                                            guard.ddl_affected_table_id(
+                                                parsed,
+                                                session.effective_database(),
+                                            )
+                                        });
+                                    let result = guard.execute_query(
+                                        stmt_sql,
+                                        &mut session,
+                                        &mut schema_cache,
+                                    );
+                                    // Eagerly evict plan cache entries for the modified table.
+                                    if result.is_ok() {
+                                        if let Some(tid) = ddl_table_id {
+                                            plan_cache.invalidate_table(tid);
+                                        }
+                                    }
+                                    result
                                 }
                             }
                         }
@@ -871,7 +929,8 @@ pub async fn handle_connection_with_timeouts(
                 // Parse+analyze once. The analyzed Stmt (with Expr::Param nodes)
                 // is cached in PreparedStatement.analyzed_stmt for reuse on every
                 // COM_STMT_EXECUTE without re-parsing or re-analyzing.
-                let (analyzed_stmt, result_cols) = {
+                // Also extract OID deps at this point (Phase 40.2).
+                let (analyzed_stmt, result_cols, prepared_deps) = {
                     let guard = db.write().await;
                     let snap = guard
                         .txn
@@ -888,9 +947,25 @@ pub async fn handle_connection_with_timeouts(
                     }) {
                         Ok(analyzed) => {
                             let cols = extract_result_columns(&analyzed);
-                            (Some(analyzed), cols)
+                            // Extract OID deps while guard is still held (catalog readable).
+                            let snap2 = guard
+                                .txn
+                                .active_snapshot()
+                                .unwrap_or_else(|_| guard.txn.snapshot());
+                            let deps = CatalogReader::new(&guard.storage, snap2)
+                                .ok()
+                                .and_then(|mut r| {
+                                    extract_table_deps(
+                                        &analyzed,
+                                        &mut r,
+                                        session.effective_database(),
+                                    )
+                                    .ok()
+                                })
+                                .unwrap_or_default();
+                            (Some(analyzed), cols, deps)
                         }
-                        Err(_) => (None, vec![]),
+                        Err(_) => (None, vec![], axiomdb_sql::plan_deps::PlanDeps::default()),
                     }
                 };
 
@@ -900,10 +975,11 @@ pub async fn handle_connection_with_timeouts(
                     current_version,
                     session.effective_database(),
                 );
-                // Store the cached analyzed statement and its schema version.
+                // Store the cached analyzed statement, schema version, and OID deps.
                 if let Some(ps) = conn_state.prepared_statements.get_mut(&stmt_id) {
                     ps.analyzed_stmt = analyzed_stmt;
                     ps.compiled_at_version = current_version;
+                    ps.deps = prepared_deps;
                     ps.compiled_database = session.effective_database().to_string();
                 }
                 let packets = build_prepare_response(
@@ -963,14 +1039,37 @@ pub async fn handle_connection_with_timeouts(
                     stmt.clear_long_data_state();
                     match parse_result {
                         Ok(exec) => {
-                            // ── Plan cache version check (Phase 5.13) ─────────────
-                            // If the schema changed since this plan was compiled, re-analyze
-                            // before using the cached plan. Lock is held only for analysis.
+                            // ── OID-based staleness check (Phase 40.2) ────────────
+                            // Two-level check: fast global-version pre-check (zero
+                            // catalog I/O when no DDL), then per-table OID check only
+                            // when the global version has advanced.
                             let current_version = schema_version.load(Ordering::Acquire);
-                            if stmt.compiled_at_version != current_version
-                                || stmt.compiled_database != session.effective_database()
-                                || stmt.analyzed_stmt.is_none()
-                            {
+                            let db_changed = stmt.compiled_database != session.effective_database();
+                            let needs_reanalyze = stmt.analyzed_stmt.is_none()
+                                || db_changed
+                                || if stmt.compiled_at_version != current_version {
+                                    // Global version changed — do per-table OID check.
+                                    // Empty deps (DDL stmt or first prepare) → assume stale.
+                                    if stmt.deps.is_empty() {
+                                        true
+                                    } else {
+                                        // Read lock suffices for the catalog scan.
+                                        let guard = db.read().await;
+                                        let snap = guard
+                                            .txn
+                                            .active_snapshot()
+                                            .unwrap_or_else(|_| guard.txn.snapshot());
+                                        CatalogReader::new(&guard.storage, snap)
+                                            .and_then(|mut r| stmt.deps.is_stale(&mut r))
+                                            .unwrap_or(true)
+                                        // read guard dropped here
+                                    }
+                                } else {
+                                    // Global version unchanged → definitely fresh.
+                                    false
+                                };
+
+                            if needs_reanalyze {
                                 debug!(
                                     conn_id,
                                     stmt_id,
@@ -978,7 +1077,7 @@ pub async fn handle_connection_with_timeouts(
                                     new_ver = current_version,
                                     "plan stale: re-analyzing"
                                 );
-                                let (new_plan, _) = {
+                                let (new_plan, new_deps) = {
                                     let guard = db.write().await;
                                     let snap = guard
                                         .txn
@@ -996,16 +1095,39 @@ pub async fn handle_connection_with_timeouts(
                                         },
                                     ) {
                                         Ok(analyzed) => {
-                                            let cols = extract_result_columns(&analyzed);
-                                            (Some(analyzed), cols)
+                                            let _cols = extract_result_columns(&analyzed);
+                                            let snap2 = guard
+                                                .txn
+                                                .active_snapshot()
+                                                .unwrap_or_else(|_| guard.txn.snapshot());
+                                            let deps = CatalogReader::new(&guard.storage, snap2)
+                                                .ok()
+                                                .and_then(|mut r| {
+                                                    extract_table_deps(
+                                                        &analyzed,
+                                                        &mut r,
+                                                        session.effective_database(),
+                                                    )
+                                                    .ok()
+                                                })
+                                                .unwrap_or_default();
+                                            (Some(analyzed), deps)
                                         }
-                                        Err(_) => (None, vec![]),
+                                        Err(_) => {
+                                            (None, axiomdb_sql::plan_deps::PlanDeps::default())
+                                        }
                                     }
                                 };
                                 stmt.analyzed_stmt = new_plan;
                                 // Update version even on failure — prevents infinite re-analysis.
                                 stmt.compiled_at_version = current_version;
+                                stmt.deps = new_deps;
+                                stmt.generation = stmt.generation.saturating_add(1);
                                 stmt.compiled_database = session.effective_database().to_string();
+                            } else if stmt.compiled_at_version != current_version {
+                                // Not stale but global version advanced (DDL on a different
+                                // table). Stamp the new version so the fast path hits next time.
+                                stmt.compiled_at_version = current_version;
                             }
 
                             // Update LRU sequence (pre-computed above the borrow).

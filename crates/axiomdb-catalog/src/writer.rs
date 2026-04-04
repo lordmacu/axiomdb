@@ -368,6 +368,7 @@ impl<'a> CatalogWriter<'a> {
             storage_layout,
             schema_name: schema.to_string(),
             table_name: name.to_string(),
+            schema_version: 1,
         };
         let data = def.to_bytes();
 
@@ -734,6 +735,54 @@ impl<'a> CatalogWriter<'a> {
         Err(DbError::Internal {
             message: format!(
                 "update_storage_layout: table_id={table_id} not found in axiom_tables"
+            ),
+        })
+    }
+
+    /// Increments the per-table `schema_version` counter in `axiom_tables`.
+    ///
+    /// Called by every DDL operation that structurally modifies a specific table
+    /// (CREATE INDEX, DROP INDEX, DROP TABLE, TRUNCATE TABLE) so that the plan
+    /// cache can detect stale entries without clearing the entire cache.
+    ///
+    /// Returns the new version value. Mirrors PostgreSQL's per-relation
+    /// invalidation tracking in `relcache`.
+    ///
+    /// # Errors
+    /// - [`DbError::NoActiveTransaction`] if no transaction is active.
+    /// - [`DbError::Internal`] if `table_id` is not found in `axiom_tables`.
+    pub fn bump_table_schema_version(&mut self, table_id: TableId) -> Result<u64, DbError> {
+        let txn_id = self
+            .txn
+            .active_txn_id()
+            .ok_or(DbError::NoActiveTransaction)?;
+        let snap = self.txn.active_snapshot()?;
+        let rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = TableDef::from_bytes(&data)?;
+            if def.id == table_id {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = table_id.to_le_bytes();
+                self.txn
+                    .record_delete(SYSTEM_TABLE_TABLES, &key, &data, page_id, slot_id)?;
+
+                let new_version = def.schema_version + 1;
+                let new_def = TableDef {
+                    schema_version: new_version,
+                    ..def
+                };
+                let new_data = new_def.to_bytes();
+                let (pg2, sl2) =
+                    HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id)?;
+                self.txn
+                    .record_insert(SYSTEM_TABLE_TABLES, &key, &new_data, pg2, sl2)?;
+                return Ok(new_version);
+            }
+        }
+        Err(DbError::Internal {
+            message: format!(
+                "bump_table_schema_version: table_id={table_id} not found in axiom_tables"
             ),
         })
     }

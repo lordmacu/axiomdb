@@ -585,6 +585,35 @@ impl Database {
         DEFAULT_DATABASE_NAME
     }
 
+    /// Resolves the `TableId` affected by a DDL statement.
+    ///
+    /// Used by the connection handler to call `PlanCache::invalidate_table()`
+    /// immediately after DDL succeeds (eager belt-and-suspenders invalidation,
+    /// Phase 40.2). Returns `None` for DDL without a specific table target
+    /// (e.g., `CREATE TABLE`, `CREATE DATABASE`, `DROP DATABASE`).
+    ///
+    /// Does NOT take a write lock — called while the write guard is already held.
+    pub fn ddl_affected_table_id(&self, stmt: &Stmt, database: &str) -> Option<u32> {
+        let table_ref = match stmt {
+            Stmt::DropTable(s) => s.tables.first()?,
+            Stmt::CreateIndex(s) => &s.table,
+            Stmt::DropIndex(s) => s.table.as_ref()?,
+            Stmt::TruncateTable(s) => &s.table,
+            Stmt::AlterTable(s) => &s.table,
+            _ => return None,
+        };
+        let schema = table_ref.schema.as_deref().unwrap_or(DEFAULT_DATABASE_NAME);
+        let snap = self
+            .txn
+            .active_snapshot()
+            .unwrap_or_else(|_| self.txn.snapshot());
+        CatalogReader::new(&self.storage, snap)
+            .ok()?
+            .get_table_in_database(database, schema, &table_ref.name)
+            .ok()?
+            .map(|d| d.id)
+    }
+
     /// Returns `true` if a logical database exists in the catalog.
     pub fn database_exists(&self, name: &str) -> Result<bool, DbError> {
         let snap = self

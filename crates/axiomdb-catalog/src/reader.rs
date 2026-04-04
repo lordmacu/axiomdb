@@ -96,6 +96,22 @@ impl<'a> CatalogReader<'a> {
         Ok(None)
     }
 
+    /// Returns the current `schema_version` for a table by its `table_id`.
+    ///
+    /// Returns `None` if the table does not exist (e.g., was dropped).
+    /// Used by the plan cache's dependency staleness check — cheaper than a
+    /// full `get_table_by_id` when only the version counter is needed.
+    pub fn get_table_schema_version(&mut self, table_id: TableId) -> Result<Option<u64>, DbError> {
+        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot)?;
+        for (_, _, data) in rows {
+            let (def, _) = TableDef::from_bytes(&data)?;
+            if def.id == table_id {
+                return Ok(Some(def.schema_version));
+            }
+        }
+        Ok(None)
+    }
+
     /// Returns all visible tables in the given schema in the default database.
     pub fn list_tables(&mut self, schema: &str) -> Result<Vec<TableDef>, DbError> {
         self.list_tables_in_database(DEFAULT_DATABASE_NAME, schema)

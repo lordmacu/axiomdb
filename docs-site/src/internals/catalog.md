@@ -249,6 +249,7 @@ pub struct TableDef {
     pub storage_layout: TableStorageLayout,
     pub schema_name:    String,
     pub table_name:     String,
+    pub schema_version: u64,    // monotonic counter for plan cache invalidation (Phase 40.2)
 }
 
 pub enum TableStorageLayout {
@@ -256,13 +257,24 @@ pub enum TableStorageLayout {
     Clustered = 1,
 }
 
-// Legacy on-disk format for axiom_tables rows:
-// [table_id:4 LE][root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8]
+// On-disk format for axiom_tables rows (3 generations, all backward-compatible):
 //
-// Current on-disk format:
-// [table_id:4 LE][root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8][layout:1]
+// v0 (legacy, no trailing bytes):
+//   [table_id:4 LE][root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8]
+//   → storage_layout = Heap, schema_version = 1
 //
-// If the trailing layout byte is absent, the row decodes as Heap.
+// v1 (1 trailing byte):
+//   ... [layout:1]
+//   → layout from byte, schema_version = 1
+//
+// v2 (9 trailing bytes, current):
+//   ... [layout:1][schema_version:8 LE]
+//   → layout and schema_version from bytes
+//
+// `schema_version` is initialized to 1 at table creation. It is bumped by:
+// CREATE INDEX, DROP INDEX, ALTER TABLE (any op), DROP TABLE, TRUNCATE TABLE.
+// Plans whose deps include (table_id, old_version) detect staleness on next
+// lookup without scanning the entire plan cache (Phase 40.2 OID invalidation).
 
 pub struct ColumnDef {
     pub table_id:      u64,

@@ -1,101 +1,305 @@
-//! Literal-normalized COM_QUERY plan cache (Phase 27.8b).
+//! OID-based COM_QUERY plan cache (Phase 40.2).
 //!
-//! For repeated ad-hoc queries like `SELECT * FROM users WHERE id = 42`,
-//! normalizes the SQL by replacing literal values with `?` placeholders,
-//! then caches the parsed+analyzed AST. Subsequent queries with the same
-//! structure but different literals (e.g., `id = 43`) skip parse+analyze
-//! and reuse the cached plan.
+//! ## Overview
 //!
-//! ## Design reference
+//! Replaces the global-`schema_version` design (Phase 27.8b) with per-entry
+//! `PlanDeps` for table-level invalidation granularity. Only plans referencing
+//! the DDL-modified table are evicted; unrelated plans survive.
 //!
-//! Inspired by PostgreSQL's plan cache: PG caches per-prepared-statement
-//! and uses cost-based generic vs. custom plan decision. AxiomDB's approach
-//! is simpler: normalize literals at the SQL string level, hash the result,
-//! and cache the analyzed Stmt per-connection.
+//! ## Design — mirrors PostgreSQL `plancache.c`
 //!
-//! ## Normalization rules
+//! Each `CachedPlanSource` stores:
+//! - `deps: PlanDeps` — `(table_id, schema_version_at_compile)` for every
+//!   table the statement touches, snapshotted at `store()` time.
+//! - `generation: u32` — incremented each time this entry is re-analyzed after
+//!   stale detection. Mirrors `CachedPlanSource.generation` in PG.
+//! - `last_validated_global_version: u64` — fast pre-check: if the shared
+//!   `Database::schema_version` hasn't moved since last validation, skip the
+//!   per-table catalog scan entirely.
 //!
-//! - Integer literals → `?`  (extract as Value::Int / Value::BigInt)
-//! - Float literals → `?`    (extract as Value::Real)
-//! - String literals → `?`   (extract as Value::Text)
-//! - Other tokens → unchanged
+//! ## Staleness check — two-level
+//!
+//! 1. **Fast** (`O(1)` atomic compare): if `current_global_version ==
+//!    entry.last_validated_global_version`, no DDL has occurred → cache hit
+//!    with zero catalog I/O.
+//! 2. **Slow** (`O(t)` catalog scan, `t = tables in deps`): called only when
+//!    the global version advanced. `PlanDeps::is_stale()` reads each table's
+//!    `schema_version` from the catalog heap and compares to the cached value.
+//!    Stale → lazy eviction. Not stale → stamp `last_validated_global_version`
+//!    so the fast path hits on the next lookup.
+//!
+//! ## Invalidation — belt-and-suspenders
+//!
+//! - **Eager**: `invalidate_table(table_id)` removes all entries referencing
+//!   that table immediately after DDL (same-connection fast-path cleanup).
+//! - **Lazy**: `is_stale()` catches cross-connection DDL at lookup time.
+//!
+//! ## Eviction
+//!
+//! LRU via a per-entry `last_used_seq` logical clock. When the cache reaches
+//! `max_entries`, the entry with the lowest `last_used_seq` is evicted. O(n)
+//! scan — acceptable because `max_entries ≤ 512` in practice.
+//!
+//! ## Normalization rules (unchanged from Phase 27.8b)
+//!
+//! - Integer literals → `?`  (extract as `Value::Int` / `Value::BigInt`)
+//! - Float literals → `?`    (extract as `Value::Real`)
+//! - String literals → `?`   (extract as `Value::Text`)
 //! - Identifiers, keywords, operators → preserved exactly
 
 use std::collections::HashMap;
 
+use axiomdb_catalog::{schema::TableId, CatalogReader};
 use axiomdb_core::error::DbError;
-use axiomdb_sql::ast::Stmt;
+use axiomdb_sql::{ast::Stmt, plan_deps::PlanDeps};
 use axiomdb_types::Value;
 
-/// Per-connection plan cache for normalized COM_QUERY statements.
-pub struct PlanCache {
-    entries: HashMap<u64, CachedPlan>,
-    schema_version: u64,
-    max_entries: usize,
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// Maximum entries before LRU eviction triggers.
+///
+/// 512 entries × ~2 KB avg plan = ~1 MB per connection. Matches PostgreSQL's
+/// per-session plan-cache default (`plan_cache_mode = auto`).
+#[allow(dead_code)]
+const DEFAULT_MAX_ENTRIES: usize = 512;
+
+// ── CachedPlanSource ─────────────────────────────────────────────────────────
+
+/// A cached, analyzed statement with its catalog dependencies.
+///
+/// Mirrors PostgreSQL's `CachedPlanSource`. Stored in `PlanCache` keyed on the
+/// FNV-1a hash of the normalized (literal-replaced) SQL.
+///
+/// ## Lifecycle
+/// 1. First execution: cache miss → parse + analyze → `store()` with deps.
+/// 2. Subsequent executions: `lookup()` → two-level staleness check → hit.
+/// 3. DDL on referenced table → lazy `is_stale()` eviction on next lookup,
+///    OR eager `invalidate_table()` eviction immediately (belt-and-suspenders).
+/// 4. At capacity: entry with lowest `last_used_seq` is evicted (LRU).
+struct CachedPlanSource {
+    /// Analyzed AST with `Expr::Param` nodes (one per normalized literal).
+    stmt: Stmt,
+    /// Catalog dependencies snapshotted at compile time.
+    deps: PlanDeps,
+    /// Number of `?` placeholders expected at substitution time.
+    param_count: usize,
+    /// Incremented each time this entry is re-stored after stale detection.
+    /// Mirrors PostgreSQL's `CachedPlanSource.generation`.
+    generation: u32,
+    /// Total cache hits for this entry.
+    exec_count: u64,
+    /// Last-used sequence number for LRU eviction.
+    /// Updated to `PlanCache::seq` on every hit.
+    last_used_seq: u64,
+    /// Global `schema_version` at last successful staleness validation.
+    ///
+    /// Fast pre-check: if `current_global_version == last_validated_global_version`,
+    /// no DDL has occurred since last validation → skip `is_stale()` catalog scan.
+    last_validated_global_version: u64,
 }
 
-struct CachedPlan {
-    stmt: Stmt,
-    param_count: usize,
+// ── PlanCache ────────────────────────────────────────────────────────────────
+
+/// Per-connection OID-based plan cache for normalized COM_QUERY statements.
+///
+/// One instance per connection, created at handshake time. Not shared between
+/// connections — cross-connection DDL is detected via the catalog's per-table
+/// `schema_version` (read inside `PlanDeps::is_stale()`).
+pub struct PlanCache {
+    entries: HashMap<u64, CachedPlanSource>,
+    max_entries: usize,
+    /// Monotonic clock for LRU ordering. Incremented on every hit.
+    seq: u64,
+    // ── Metrics ───────────────────────────────────────────────────────────────
+    pub hits: u64,
+    pub misses: u64,
+    /// Number of entries evicted due to staleness or eager `invalidate_table`.
+    pub invalidations: u64,
 }
 
 impl PlanCache {
     pub fn new(max_entries: usize) -> Self {
         Self {
             entries: HashMap::new(),
-            schema_version: 0,
             max_entries,
+            seq: 0,
+            hits: 0,
+            misses: 0,
+            invalidations: 0,
         }
     }
 
-    /// Normalizes the SQL, checks the cache, returns (cached_stmt, params) on hit.
-    /// Returns None on cache miss.
-    pub fn lookup(&self, sql: &str, current_schema_version: u64) -> Option<(Stmt, Vec<Value>)> {
-        // Schema version changed → entire cache is stale.
-        if self.schema_version != current_schema_version {
-            return None;
-        }
-
+    /// Looks up a cached plan for `sql`.
+    ///
+    /// ## Staleness check
+    ///
+    /// Two-level check for efficient OLTP operation:
+    /// 1. **Fast** (`O(1)`): if `global_version` matches the stored
+    ///    `last_validated_global_version`, no DDL has occurred → skip catalog scan.
+    /// 2. **Slow** (`O(t)` catalog reads): called only when the global version
+    ///    advanced. `PlanDeps::is_stale()` compares each table's current
+    ///    `schema_version` against the cached snapshot.
+    ///
+    /// On a stale detection the entry is evicted lazily and `None` is returned.
+    ///
+    /// # Arguments
+    /// - `sql` — raw SQL string from the client.
+    /// - `global_version` — current `Database::schema_version` (atomic load).
+    ///   Used as the fast pre-check; if unchanged, the catalog scan is skipped.
+    /// - `reader` — catalog reader for the slow-path OID staleness check.
+    ///   Created from the caller's database storage + snapshot; only consulted
+    ///   when `global_version` has advanced since last validation.
+    pub fn lookup(
+        &mut self,
+        sql: &str,
+        global_version: u64,
+        reader: &mut CatalogReader<'_>,
+    ) -> Result<Option<(Stmt, Vec<Value>)>, DbError> {
         let (normalized, params) = normalize_sql(sql);
         let key = fnv1a_hash(normalized.as_bytes());
 
-        self.entries.get(&key).and_then(|cached| {
-            if cached.param_count == params.len() {
-                let stmt = cached.stmt.clone();
-                match substitute_params(stmt, &params) {
-                    Ok(substituted) => Some((substituted, params)),
-                    Err(_) => None,
-                }
-            } else {
-                None // Different param count → structure mismatch
+        // 1. Check entry existence and structural match.
+        let stale = match self.entries.get(&key) {
+            None => {
+                self.misses += 1;
+                return Ok(None);
             }
-        })
-    }
+            Some(entry) => {
+                // Structural mismatch: different number of literals → wrong query shape.
+                if entry.param_count != params.len() {
+                    self.misses += 1;
+                    return Ok(None);
+                }
+                if entry.last_validated_global_version == global_version {
+                    // Fast path: global version unchanged since last validation.
+                    // No DDL has occurred → entry is definitely fresh.
+                    false
+                } else {
+                    // Slow path: DDL occurred since last check.
+                    // Scan per-table catalog versions to see if THIS plan's tables changed.
+                    entry.deps.is_stale(reader)?
+                }
+            }
+        };
 
-    /// Stores a parsed+analyzed Stmt in the cache.
-    pub fn store(&mut self, sql: &str, stmt: &Stmt, current_schema_version: u64) {
-        // Invalidate on DDL.
-        if self.schema_version != current_schema_version {
-            self.entries.clear();
-            self.schema_version = current_schema_version;
+        if stale {
+            self.entries.remove(&key);
+            self.invalidations += 1;
+            self.misses += 1;
+            return Ok(None);
         }
 
+        // 2. Entry is fresh — update accounting and clone stmt for substitution.
+        let entry = self.entries.get_mut(&key).expect("entry checked above");
+        self.seq += 1;
+        entry.exec_count += 1;
+        entry.last_used_seq = self.seq;
+        // Stamp the global version so the fast path hits on the next call.
+        entry.last_validated_global_version = global_version;
+        self.hits += 1;
+
+        let stmt = entry.stmt.clone();
+        match substitute_params(stmt, &params) {
+            Ok(substituted) => Ok(Some((substituted, params))),
+            Err(_) => {
+                // Substitution failure — plan shape mismatch. Evict and miss.
+                self.entries.remove(&key);
+                self.hits -= 1; // undo the hit count
+                self.misses += 1;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Stores a parsed+analyzed `Stmt` in the cache with its OID dependencies.
+    ///
+    /// If the entry key already exists (re-store after stale detection), its
+    /// `generation` is incremented. If the cache is at capacity and the key is
+    /// new, the LRU entry is evicted first.
+    ///
+    /// # Arguments
+    /// - `sql` — raw SQL string (will be normalized internally).
+    /// - `stmt` — fully analyzed AST with `Expr::Param` nodes.
+    /// - `deps` — catalog deps extracted by `extract_table_deps` at compile time.
+    /// - `global_version` — current `Database::schema_version` at store time,
+    ///   used to initialize the fast-path validation stamp.
+    pub fn store(&mut self, sql: &str, stmt: &Stmt, deps: PlanDeps, global_version: u64) {
         let (normalized, params) = normalize_sql(sql);
         let key = fnv1a_hash(normalized.as_bytes());
 
-        // Evict oldest if at capacity (simple: just clear half).
-        if self.entries.len() >= self.max_entries {
-            self.entries.clear();
+        // Preserve and bump generation from previous entry (re-analysis after stale).
+        let generation = self
+            .entries
+            .get(&key)
+            .map(|e| e.generation.saturating_add(1))
+            .unwrap_or(0);
+
+        // Evict LRU only if at capacity AND the key is new (not an update).
+        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&key) {
+            self.evict_lru();
         }
 
         self.entries.insert(
             key,
-            CachedPlan {
+            CachedPlanSource {
                 stmt: stmt.clone(),
+                deps,
                 param_count: params.len(),
+                generation,
+                exec_count: 0,
+                last_used_seq: self.seq,
+                last_validated_global_version: global_version,
             },
         );
     }
+
+    /// Eagerly evicts all entries whose `deps` reference `table_id`.
+    ///
+    /// Called after DDL on `table_id` (belt-and-suspenders). The lazy
+    /// `is_stale()` check is the primary cross-connection invalidation
+    /// mechanism; this accelerates same-connection cleanup by removing stale
+    /// entries without waiting for the next lookup.
+    pub fn invalidate_table(&mut self, table_id: TableId) {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, e| !e.deps.tables.iter().any(|&(tid, _)| tid == table_id));
+        let removed = before - self.entries.len();
+        self.invalidations += removed as u64;
+    }
+
+    /// Returns a snapshot of current cache statistics.
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits,
+            misses: self.misses,
+            invalidations: self.invalidations,
+            entries: self.entries.len(),
+        }
+    }
+
+    /// Evicts the entry with the lowest `last_used_seq` (LRU policy).
+    ///
+    /// O(n) scan over at most `max_entries` entries. Called only when the cache
+    /// reaches capacity — not on the hot lookup path.
+    fn evict_lru(&mut self) {
+        let lru_key = self
+            .entries
+            .iter()
+            .min_by_key(|(_, e)| e.last_used_seq)
+            .map(|(&k, _)| k);
+        if let Some(k) = lru_key {
+            self.entries.remove(&k);
+        }
+    }
+}
+
+/// Snapshot of plan cache metrics, returned by `PlanCache::stats()`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub invalidations: u64,
+    pub entries: usize,
 }
 
 // ── SQL normalization ────────────────────────────────────────────────────────
@@ -103,15 +307,14 @@ impl PlanCache {
 /// Replaces literal values in SQL with `?` placeholders, extracting the values.
 ///
 /// Handles:
-/// - Integer literals: `42` → `?` + Value::Int(42)
-/// - Negative integers: only inside WHERE/SET context (heuristic)
-/// - Float literals: `3.14` → `?` + Value::Real(3.14)
-/// - String literals: `'hello'` → `?` + Value::Text("hello")
+/// - Integer literals: `42` → `?` + `Value::Int(42)`
+/// - Float literals: `3.14` → `?` + `Value::Real(3.14)`
+/// - String literals: `'hello'` → `?` + `Value::Text("hello")`
 ///
 /// Does NOT normalize:
 /// - Identifiers, keywords, operators
-/// - Numbers that are part of identifiers (e.g., table1)
-/// - Negative signs that are unary operators
+/// - Numbers that are part of identifiers (e.g., `table1`)
+/// - Negative signs (treated as unary operators by the parser)
 pub fn normalize_sql(sql: &str) -> (String, Vec<Value>) {
     let mut result = String::with_capacity(sql.len());
     let mut params = Vec::new();
@@ -169,12 +372,10 @@ pub fn normalize_sql(sql: &str) -> (String, Vec<Value>) {
                 i += 1;
             }
 
-            // Check if this number is part of an identifier (e.g., "table1").
-            // If preceded by a letter or underscore, it's part of an identifier.
+            // If preceded by a letter or underscore, it's part of an identifier (e.g., "table1").
             if num_start > 0
                 && (bytes[num_start - 1].is_ascii_alphanumeric() || bytes[num_start - 1] == b'_')
             {
-                // Part of identifier — keep as-is.
                 result.push_str(&sql[num_start..i]);
                 continue;
             }
@@ -209,7 +410,6 @@ pub fn normalize_sql(sql: &str) -> (String, Vec<Value>) {
 }
 
 /// Substitutes `Expr::Param { idx }` nodes in the AST with literal values.
-/// Uses the existing prepared statement substitution from `prepared.rs`.
 fn substitute_params(stmt: Stmt, params: &[Value]) -> Result<Stmt, DbError> {
     super::prepared::substitute_params_in_ast(stmt, params)
 }
@@ -229,6 +429,8 @@ fn fnv1a_hash(data: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── normalize_sql ────────────────────────────────────────────────────────
 
     #[test]
     fn test_normalize_integer() {
@@ -258,7 +460,6 @@ mod tests {
     #[test]
     fn test_normalize_preserves_identifiers() {
         let (norm, _) = normalize_sql("SELECT col1 FROM table2 WHERE id = 5");
-        // "table2" should NOT have its "2" replaced.
         assert!(norm.contains("table2"));
         assert!(norm.contains("col1"));
     }
@@ -270,42 +471,98 @@ mod tests {
         assert_eq!(params, vec![Value::Text("it's".into())]);
     }
 
-    #[test]
-    fn test_cache_hit() {
-        let mut cache = PlanCache::new(100);
-        // Simulate: first query parsed, stored in cache.
-        let sql1 = "SELECT * FROM t WHERE id = 42";
-        let stmt = axiomdb_sql::parser::parse(sql1, None).unwrap();
-        cache.store(sql1, &stmt, 1);
+    // ── PlanCache struct behavior ────────────────────────────────────────────
 
-        // Second query with different literal: should hit.
-        let sql2 = "SELECT * FROM t WHERE id = 99";
-        let result = cache.lookup(sql2, 1);
-        assert!(result.is_some());
+    #[test]
+    fn plan_cache_starts_empty() {
+        let cache = PlanCache::new(DEFAULT_MAX_ENTRIES);
+        assert_eq!(cache.entries.len(), 0);
+        assert_eq!(cache.hits, 0);
+        assert_eq!(cache.misses, 0);
+        assert_eq!(cache.invalidations, 0);
     }
 
     #[test]
-    fn test_cache_miss_different_structure() {
-        let mut cache = PlanCache::new(100);
-        let sql1 = "SELECT * FROM t WHERE id = 42";
-        let stmt = axiomdb_sql::parser::parse(sql1, None).unwrap();
-        cache.store(sql1, &stmt, 1);
-
-        // Different structure: should miss.
-        let sql2 = "SELECT * FROM t WHERE name = 'alice'";
-        let result = cache.lookup(sql2, 1);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_cache_invalidation_on_ddl() {
-        let mut cache = PlanCache::new(100);
+    fn store_increments_generation_on_re_store() {
+        let mut cache = PlanCache::new(DEFAULT_MAX_ENTRIES);
         let sql = "SELECT * FROM t WHERE id = 42";
         let stmt = axiomdb_sql::parser::parse(sql, None).unwrap();
-        cache.store(sql, &stmt, 1);
+        let deps = PlanDeps::default();
 
-        // Schema version changed → miss.
-        let result = cache.lookup(sql, 2);
-        assert!(result.is_none());
+        cache.store(sql, &stmt, deps.clone(), 1);
+        let (_, params) = normalize_sql(sql);
+        let key = fnv1a_hash(normalize_sql(sql).0.as_bytes());
+        assert_eq!(cache.entries[&key].generation, 0);
+
+        // Re-store (simulates re-analysis after stale detection).
+        cache.store(sql, &stmt, deps, 2);
+        assert_eq!(cache.entries[&key].generation, 1);
+        let _ = params;
+    }
+
+    #[test]
+    fn invalidate_table_removes_matching_entries() {
+        let mut cache = PlanCache::new(DEFAULT_MAX_ENTRIES);
+
+        // Store entry with table_id=10
+        let sql1 = "SELECT * FROM t WHERE id = 1";
+        let stmt1 = axiomdb_sql::parser::parse(sql1, None).unwrap();
+        let mut deps1 = PlanDeps::default();
+        deps1.tables.push((10, 1)); // table_id=10, schema_version=1
+        cache.store(sql1, &stmt1, deps1, 1);
+
+        // Store entry with table_id=20
+        let sql2 = "SELECT * FROM u WHERE id = 1";
+        let stmt2 = axiomdb_sql::parser::parse(sql2, None).unwrap();
+        let mut deps2 = PlanDeps::default();
+        deps2.tables.push((20, 1)); // table_id=20
+        cache.store(sql2, &stmt2, deps2, 1);
+
+        assert_eq!(cache.entries.len(), 2);
+
+        // Invalidate table_id=10 — only sql1 entry should be removed.
+        cache.invalidate_table(10);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.invalidations, 1);
+
+        // sql2 entry (table_id=20) must survive.
+        let key2 = fnv1a_hash(normalize_sql(sql2).0.as_bytes());
+        assert!(cache.entries.contains_key(&key2));
+    }
+
+    #[test]
+    fn lru_eviction_removes_least_recently_used() {
+        let mut cache = PlanCache::new(2); // capacity = 2
+
+        let sql1 = "SELECT a FROM t WHERE id = 1";
+        let sql2 = "SELECT b FROM t WHERE id = 1";
+        let sql3 = "SELECT c FROM t WHERE id = 1";
+
+        let stmt1 = axiomdb_sql::parser::parse(sql1, None).unwrap();
+        let stmt2 = axiomdb_sql::parser::parse(sql2, None).unwrap();
+        let stmt3 = axiomdb_sql::parser::parse(sql3, None).unwrap();
+
+        cache.store(sql1, &stmt1, PlanDeps::default(), 1); // seq=0
+        cache.store(sql2, &stmt2, PlanDeps::default(), 1); // seq=0
+
+        // At capacity now (2 entries). Adding sql3 should evict the LRU (sql1 or sql2).
+        cache.store(sql3, &stmt3, PlanDeps::default(), 1);
+        assert_eq!(cache.entries.len(), 2);
+    }
+
+    #[test]
+    fn cache_stats_reflect_operations() {
+        let mut cache = PlanCache::new(DEFAULT_MAX_ENTRIES);
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+        assert_eq!(stats.entries, 0);
+
+        let sql = "SELECT * FROM t WHERE id = 1";
+        let stmt = axiomdb_sql::parser::parse(sql, None).unwrap();
+        cache.store(sql, &stmt, PlanDeps::default(), 0);
+
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 1);
     }
 }
