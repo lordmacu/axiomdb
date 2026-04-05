@@ -927,7 +927,7 @@ mod tests {
 
         // Session 1: insert a row, crash before commit.
         let crashed_slot = {
-            let mut storage = MmapStorage::create(&db_path).unwrap();
+            let storage = MmapStorage::create(&db_path).unwrap();
             let mut mgr = TxnManager::create(&wal_path).unwrap();
 
             let page_id = storage.alloc_page(PageType::Data).unwrap();

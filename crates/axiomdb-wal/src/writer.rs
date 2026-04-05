@@ -62,7 +62,7 @@ pub const WAL_VERSION: u16 = 2;
 pub const WAL_HEADER_SIZE: usize = 24;
 
 /// Byte offset of `start_lsn` within the WAL file header.
-const START_LSN_OFFSET: usize = 14;
+pub(crate) const START_LSN_OFFSET: usize = 14;
 
 const _: () = assert!(
     START_LSN_OFFSET + 8 <= WAL_HEADER_SIZE,
@@ -70,14 +70,14 @@ const _: () = assert!(
 );
 
 /// Internal BufWriter capacity — 64 KB amortizes syscalls without excessive memory use.
-const BUF_CAPACITY: usize = 64 * 1024;
+pub(crate) const BUF_CAPACITY: usize = 64 * 1024;
 
 /// Reserved WAL growth quantum.
 ///
 /// The WAL file is preallocated in chunks so steady-state DML commits can stay
 /// inside already-sized file capacity and avoid syncing file-length metadata on
 /// every commit.
-const PREALLOC_CHUNK: u64 = 256 * 1024;
+pub(crate) const PREALLOC_CHUNK: u64 = 256 * 1024;
 
 // ── WalWriter ─────────────────────────────────────────────────────────────────
 
@@ -384,7 +384,7 @@ impl WalWriter {
 ///
 /// `start_lsn` is stored at bytes [14..22]. For fresh WALs pass 0;
 /// for rotated WALs pass the checkpoint LSN.
-fn write_header(file: &mut File, start_lsn: u64) -> Result<(), DbError> {
+pub(crate) fn write_header(file: &mut File, start_lsn: u64) -> Result<(), DbError> {
     let mut header = [0u8; WAL_HEADER_SIZE];
     header[0..8].copy_from_slice(&WAL_MAGIC.to_le_bytes());
     header[8..10].copy_from_slice(&WAL_VERSION.to_le_bytes());
@@ -482,7 +482,7 @@ pub(crate) fn scan_valid_tail(file: &mut File) -> Result<WalTailInfo, DbError> {
     })
 }
 
-fn round_up(value: u64, quantum: u64) -> u64 {
+pub(crate) fn round_up(value: u64, quantum: u64) -> u64 {
     if value == 0 {
         0
     } else {

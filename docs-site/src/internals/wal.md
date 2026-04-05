@@ -469,10 +469,71 @@ and stops. The caller decides whether to propagate or recover gracefully.
 
 ## WAL and Concurrency
 
-### Single-Writer Model
+### ConcurrentWalWriter (Phase 40.4)
 
-WAL writes are serialized through a single `WalWriter` inside `TxnManager`. The
-server runtime uses `Arc<tokio::sync::RwLock<Database>>`: readers may overlap,
+`ConcurrentWalWriter` replaces the single-threaded `WalWriter` inside `TxnManager`.
+All public methods take `&self` — multiple transactions submit WAL entries without
+serializing on a single exclusive lock.
+
+```
+                 Thread A                Thread B
+                    │                      │
+       reserve_lsn()│ fetch_add(1,Relaxed) │reserve_lsn()   ← lock-free ~2 ns
+                    │  serialize entries   │serialize entries ← fully parallel
+                    │                      │
+                Mutex<WriteQueue>::push()  │           ← ~1 µs each
+                                           Mutex<WriteQueue>::push()
+                    │                      │
+             commit()                      │commit()
+                    │                      │
+               ┌────▼──────────────────────▼────┐
+               │  Mutex<WriterState> (leader)    │  ← one leader per fsync batch
+               │  drain_sorted() from queue      │
+               │  write_entries() → BufWriter   │
+               │  flush() → OS page cache       │
+               │  fdatasync() → durable on disk │  ← one fsync covers all pending
+               │  flushed_lsn.fetch_max(...)    │
+               └────────────────────────────────┘
+```
+
+**Lock ordering (no deadlock):**
+- `submit_entry`: acquires `queue_mutex` only.
+- `flush_and_sync`: acquires `writer_mutex` first, then `queue_mutex` briefly for drain.
+- No function holds `queue_mutex` while waiting for `writer_mutex`.
+
+**`Drop` behavior:** `ConcurrentWalWriter::drop()` calls `flush_no_sync()` — drains
+the queue and flushes the `BufWriter` to the OS page cache without fsync. This
+mirrors `BufWriter<File>::drop` and preserves crash-simulation semantics (durability
+tests call `drop(mgr)` to simulate a process exit with OS cache flushed).
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Group Commit Advantage</span>
+InnoDB's group commit amortizes fsync latency (~3–5 ms) across N concurrent transactions.
+AxiomDB's `ConcurrentWalWriter` applies the same model: 8 simultaneous autocommit INSERTs
+share one fsync instead of paying 8 × 5 ms = 40 ms. LSN reservation costs ~2 ns
+(uncontended `AtomicU64::fetch_add`) vs ~200 ns for PostgreSQL's spinlock-based insertion lock.
+</div>
+</div>
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Queue-Based vs Shared Log Buffer</span>
+InnoDB uses a shared 16 MB circular log buffer where threads copy entries at reserved
+offsets. AxiomDB uses a `Vec`-based write queue instead — simpler to implement correctly
+and equally effective for group commit. Each transaction serializes into its own scratch
+buffer (`TxnManager::wal_scratch`) then submits the pre-serialized bytes. The leader sorts
+by `base_lsn` before writing, ensuring on-disk LSN order even when threads submit
+out of order.
+</div>
+</div>
+
+### Single-Writer Model (pre-40.4)
+
+Before Phase 40.4, WAL writes serialized through a single `WalWriter` inside `TxnManager`.
+The server runtime uses `Arc<tokio::sync::RwLock<Database>>`: readers may overlap,
 but mutating statements still serialize behind the write guard. This eliminates
 write-write conflicts without record-level locking (Phase 13.7 will lift this
 constraint).

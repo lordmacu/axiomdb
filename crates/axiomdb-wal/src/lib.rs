@@ -8,6 +8,7 @@
 
 mod checkpoint;
 mod clustered;
+mod concurrent_writer;
 mod entry;
 pub mod fsync_pipeline;
 mod reader;
@@ -19,6 +20,7 @@ mod writer;
 
 pub use checkpoint::Checkpointer;
 pub use clustered::{ClusteredFieldPatchEntry, ClusteredRowImage, FieldDelta};
+pub use concurrent_writer::ConcurrentWalWriter;
 pub use entry::{EntryType, WalEntry, MIN_ENTRY_LEN};
 pub use fsync_pipeline::{AcquireResult, CommitRx, FsyncPipeline};
 pub use reader::{BackwardIter, ForwardIter, WalReader};

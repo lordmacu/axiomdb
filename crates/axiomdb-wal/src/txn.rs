@@ -32,10 +32,10 @@ use axiomdb_storage::{
 use crate::{
     checkpoint::Checkpointer,
     clustered::{ClusteredFieldPatchEntry, ClusteredRowImage, FieldDelta},
+    concurrent_writer::ConcurrentWalWriter,
     entry::{EntryType, WalEntry},
     reader::WalReader,
     recovery::{CrashRecovery, RecoveryResult},
-    writer::WalWriter,
 };
 
 // ── Savepoint ─────────────────────────────────────────────────────────────────
@@ -179,7 +179,7 @@ struct ActiveTxn {
 
 /// Coordinates the transaction lifecycle over the WAL and heap pages.
 pub struct TxnManager {
-    wal: WalWriter,
+    wal: ConcurrentWalWriter,
     next_txn_id: u64,
     max_committed: u64,
     active: Option<ActiveTxn>,
@@ -224,7 +224,7 @@ impl TxnManager {
     ///
     /// Fails if the WAL file already exists.
     pub fn create(wal_path: &Path) -> Result<Self, DbError> {
-        let wal = WalWriter::create(wal_path)?;
+        let wal = ConcurrentWalWriter::create(wal_path)?;
         Ok(Self {
             wal,
             next_txn_id: 1,
@@ -247,7 +247,7 @@ impl TxnManager {
     /// receive monotonically increasing IDs and snapshots are correct.
     pub fn open(wal_path: &Path) -> Result<Self, DbError> {
         let (max_committed, clustered_roots) = scan_committed_state(wal_path)?;
-        let wal = WalWriter::open(wal_path)?;
+        let wal = ConcurrentWalWriter::open(wal_path)?;
         Ok(Self {
             wal,
             next_txn_id: max_committed + 1,
@@ -961,7 +961,7 @@ impl TxnManager {
         }
 
         // Single write_all for all N entries.
-        self.wal.write_batch(&self.wal_scratch)?;
+        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
 
         // Enqueue undo ops after the WAL write succeeds.
         for (page_id, slot_id) in phys_locs {
@@ -1036,7 +1036,7 @@ impl TxnManager {
             entry.serialize_into(&mut self.wal_scratch);
         }
 
-        self.wal.write_batch(&self.wal_scratch)?;
+        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
 
         // Enqueue in-memory undo ops (used by ROLLBACK and group commit mode).
         for (page_id, slot_ids) in page_writes {
@@ -1097,7 +1097,7 @@ impl TxnManager {
             entry.serialize_into(&mut self.wal_scratch);
         }
 
-        self.wal.write_batch(&self.wal_scratch)?;
+        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
 
         // Enqueue undo ops: UndoDelete clears txn_id_deleted on ROLLBACK.
         for (page_id, slot_ids) in page_deletes {
@@ -1294,7 +1294,7 @@ impl TxnManager {
             entry.serialize_into(&mut self.wal_scratch);
         }
 
-        self.wal.write_batch(&self.wal_scratch)?;
+        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
 
         for (_, old_tuple_image, _, page_id, slot_id) in images {
             active.undo_ops.push(UndoOp::UndoUpdateInPlace {
@@ -1432,7 +1432,7 @@ impl TxnManager {
             entry.serialize_into(&mut self.wal_scratch);
         }
 
-        self.wal.write_batch(&self.wal_scratch)?;
+        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
 
         // Undo: zero-alloc field-delta undo — write back only old_bytes per field.
         // Avoids the ClusteredRestore path which needs a full row image to be
@@ -1485,7 +1485,7 @@ impl TxnManager {
             entry.serialize_into(&mut self.wal_scratch);
         }
 
-        self.wal.write_batch(&self.wal_scratch)?;
+        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
 
         for (key, old_row, new_row) in updates {
             active.clustered_roots.insert(table_id, new_row.root_pid);
@@ -1553,7 +1553,7 @@ impl TxnManager {
             entry.serialize_into(&mut self.wal_scratch);
         }
 
-        self.wal.write_batch(&self.wal_scratch)?;
+        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
 
         // Lightweight undo: only PK key needed to un-delete.
         for pk_key in pk_keys {
@@ -1597,7 +1597,7 @@ impl TxnManager {
             entry.serialize_into(&mut self.wal_scratch);
         }
 
-        self.wal.write_batch(&self.wal_scratch)?;
+        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
 
         for (key, old_row, _new_row) in deletes {
             active.clustered_roots.insert(table_id, old_row.root_pid);
@@ -1866,8 +1866,8 @@ impl TxnManager {
     ///
     /// Used by [`Checkpointer`] to append the Checkpoint entry and fsync the WAL.
     /// Callers must not write arbitrary entries through this — only Checkpointer uses it.
-    pub fn wal_mut(&mut self) -> &mut WalWriter {
-        &mut self.wal
+    pub fn wal_mut(&mut self) -> &ConcurrentWalWriter {
+        &self.wal
     }
 
     // ── WAL Rotation ──────────────────────────────────────────────────────────
@@ -1898,13 +1898,13 @@ impl TxnManager {
         }
 
         // 1. Checkpoint: flush pages + write Checkpoint WAL entry + fsync.
-        let checkpoint_lsn = Checkpointer::checkpoint(storage, &mut self.wal)?;
+        let checkpoint_lsn = Checkpointer::checkpoint(storage, &self.wal)?;
 
         // 2. Truncate the WAL file to just the header with start_lsn.
-        WalWriter::rotate_file(wal_path, checkpoint_lsn)?;
+        ConcurrentWalWriter::rotate_file(wal_path, checkpoint_lsn)?;
 
         // 3. Reopen the WAL: next_lsn = checkpoint_lsn + 1.
-        self.wal = WalWriter::open(wal_path)?;
+        self.wal = ConcurrentWalWriter::open(wal_path)?;
 
         Ok(checkpoint_lsn)
     }
@@ -1921,7 +1921,7 @@ impl TxnManager {
         wal_path: &Path,
     ) -> Result<(Self, RecoveryResult), DbError> {
         let result = CrashRecovery::recover(storage, wal_path)?;
-        let wal = WalWriter::open(wal_path)?;
+        let wal = ConcurrentWalWriter::open(wal_path)?;
         let mgr = Self {
             wal,
             next_txn_id: result.max_committed + 1,
