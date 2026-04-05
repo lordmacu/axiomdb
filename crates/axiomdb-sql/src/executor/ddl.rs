@@ -1466,15 +1466,107 @@ fn rewrite_rows(
     table_def: &axiomdb_catalog::schema::TableDef,
     old_columns: &[axiomdb_catalog::schema::ColumnDef],
     new_columns: &[axiomdb_catalog::schema::ColumnDef],
-    transform: &dyn Fn(Row) -> Row,
+    transform: &dyn Fn(Row) -> Result<Row, DbError>,
 ) -> Result<(), DbError> {
+    if table_def.is_clustered() {
+        return rewrite_rows_clustered(storage, txn, table_def, old_columns, new_columns, transform);
+    }
     let snap = txn.active_snapshot()?;
     let rows = TableEngine::scan_table(storage, table_def, old_columns, snap, None)?;
     for (rid, old_values) in rows {
-        let new_values = transform(old_values);
+        let new_values = transform(old_values)?;
         TableEngine::delete_row(storage, txn, table_def, rid)?;
         TableEngine::insert_row(storage, txn, table_def, new_columns, new_values)?;
     }
+    Ok(())
+}
+
+/// Rewrites all rows in a clustered table by applying `transform` to each row.
+///
+/// Uses `clustered_tree::update_with_relocation` (in-place rewrite; falls back to
+/// physical delete+reinsert when the new row doesn't fit in the current leaf page).
+/// The PK never changes — ADD COLUMN and DROP COLUMN only affect non-key columns.
+/// Secondary indexes whose columns are not affected remain valid after the rewrite.
+fn rewrite_rows_clustered(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_def: &axiomdb_catalog::schema::TableDef,
+    old_columns: &[axiomdb_catalog::schema::ColumnDef],
+    new_columns: &[axiomdb_catalog::schema::ColumnDef],
+    transform: &dyn Fn(Row) -> Result<Row, DbError>,
+) -> Result<(), DbError> {
+    use std::ops::Bound;
+
+    use axiomdb_storage::clustered_tree;
+    use axiomdb_types::codec::{decode_row, encode_row};
+
+    let snap = txn.active_snapshot()?;
+    let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+    let mut root_pid = txn
+        .clustered_root(table_def.id)
+        .unwrap_or(table_def.root_page_id);
+
+    let old_col_types = crate::table::column_data_types(old_columns);
+    let new_col_types = crate::table::column_data_types(new_columns);
+
+    // Collect all visible rows before modifying — range iterator borrows storage.
+    let all_rows: Vec<axiomdb_storage::clustered_tree::ClusteredRow> = {
+        let iter = clustered_tree::range(
+            storage,
+            Some(root_pid),
+            Bound::Unbounded,
+            Bound::Unbounded,
+            &snap,
+        )?;
+        iter.collect::<Result<_, _>>()?
+    };
+
+    for row in all_rows {
+        // Decode old values from raw row bytes.
+        let old_values =
+            decode_row(&row.row_data, &old_col_types).map_err(|e| {
+                DbError::Other(format!(
+                    "ALTER TABLE rewrite: failed to decode row in '{}': {e}",
+                    table_def.table_name
+                ))
+            })?;
+
+        // Apply schema transform (may fail for MODIFY COLUMN type coercions).
+        let new_values = transform(old_values)?;
+        let new_row_data = encode_row(&new_values, &new_col_types).map_err(|e| {
+            DbError::Other(format!(
+                "ALTER TABLE rewrite: failed to encode new row in '{}': {e}",
+                table_def.table_name
+            ))
+        })?;
+
+        // Build WAL images before modifying storage.
+        let old_image =
+            axiomdb_wal::ClusteredRowImage::new(root_pid, row.row_header, &row.row_data);
+        let new_header = axiomdb_storage::heap::RowHeader {
+            txn_id_created: txn_id,
+            txn_id_deleted: 0,
+            row_version: row.row_header.row_version.saturating_add(1),
+            _flags: row.row_header._flags,
+        };
+
+        // In-place rewrite; falls back to physical relocate when page is full.
+        if let Some(new_root) = clustered_tree::update_with_relocation(
+            storage,
+            Some(root_pid),
+            &row.key,
+            &new_row_data,
+            txn_id,
+            &snap,
+        )? {
+            let new_image =
+                axiomdb_wal::ClusteredRowImage::new(new_root, new_header, &new_row_data);
+            txn.record_clustered_update(table_def.id, &row.key, &old_image, &new_image)?;
+            root_pid = new_root;
+        }
+        // None = row not found or no longer visible — skip.
+    }
+
     Ok(())
 }
 
@@ -1540,10 +1632,8 @@ fn execute_alter_table(
                     schema,
                 );
             }
-            _ => {
-                return Err(DbError::NotImplemented {
-                    feature: "ALTER TABLE MODIFY COLUMN — Phase N".into(),
-                })
+            AlterTableOp::ModifyColumn(col_def) => {
+                alter_modify_column(storage, txn, &table_def.def, &mut columns, col_def, schema)?;
             }
         }
     }
@@ -1627,7 +1717,7 @@ fn alter_add_column(
         &new_columns,
         &|mut row| {
             row.push(dv.clone());
-            row
+            Ok(row)
         },
     )?;
 
@@ -1657,6 +1747,27 @@ fn alter_drop_column(
     };
 
     let dropped_col_idx = columns[drop_pos].col_idx;
+
+    // Reject if the column is referenced by any secondary index — dropping it
+    // would leave the index pointing at a non-existent column.
+    {
+        let snap = txn.active_snapshot()?;
+        let mut reader = CatalogReader::new(storage, snap)?;
+        let indexes = reader.list_indexes(table_def.id)?;
+        for idx in &indexes {
+            if idx.is_primary {
+                continue;
+            }
+            if idx.columns.iter().any(|c| c.col_idx == dropped_col_idx) {
+                return Err(DbError::NotImplemented {
+                    feature: format!(
+                        "Cannot drop column '{}': it is part of index '{}'. Drop the index first.",
+                        name, idx.name
+                    ),
+                });
+            }
+        }
+    }
     let old_columns = columns.clone();
 
     // Build new column list (without the dropped column).
@@ -1674,12 +1785,131 @@ fn alter_drop_column(
             if drop_pos < row.len() {
                 row.remove(drop_pos);
             }
-            row
+            Ok(row)
         },
     )?;
 
     // 2. Delete column from catalog.
     CatalogWriter::new(storage, txn)?.delete_column(table_def.id, dropped_col_idx)?;
+
+    *columns = new_columns;
+    Ok(())
+}
+
+/// `MODIFY [COLUMN] col_name new_type [NOT NULL | NULL]`
+///
+/// Rewrites all rows in the table to coerce the target column to the new type.
+/// If the column type changes and the column is part of any secondary index the
+/// operation is rejected — the caller must `DROP INDEX`, `MODIFY`, then
+/// `CREATE INDEX` to avoid stale index key encodings.
+fn alter_modify_column(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_def: &axiomdb_catalog::schema::TableDef,
+    columns: &mut Vec<axiomdb_catalog::schema::ColumnDef>,
+    col_def: crate::ast::ColumnDef,
+    _schema: &str,
+) -> Result<(), DbError> {
+    use axiomdb_types::coerce::{coerce, CoercionMode};
+
+    // Find the column to modify.
+    let col_pos = columns
+        .iter()
+        .position(|c| c.name == col_def.name)
+        .ok_or_else(|| DbError::ColumnNotFound {
+            name: col_def.name.clone(),
+            table: table_def.table_name.clone(),
+        })?;
+
+    let new_col_type = datatype_to_column_type(&col_def.data_type)?;
+    let new_nullable = !col_def
+        .constraints
+        .iter()
+        .any(|c| matches!(c, crate::ast::ColumnConstraint::NotNull));
+
+    let old_col = &columns[col_pos];
+    let old_col_type = old_col.col_type;
+    let col_idx = old_col.col_idx;
+    let type_changed = old_col_type != new_col_type;
+
+    // Reject PK column nullability change — PK columns must be NOT NULL.
+    {
+        let snap = txn.active_snapshot()?;
+        let mut reader = CatalogReader::new(storage, snap)?;
+        let indexes = reader.list_indexes(table_def.id)?;
+
+        // If the type changes and the column is in a secondary index, reject.
+        if type_changed {
+            for idx in &indexes {
+                if idx.is_primary {
+                    continue;
+                }
+                if idx.columns.iter().any(|c| c.col_idx == col_idx) {
+                    return Err(DbError::NotImplemented {
+                        feature: format!(
+                            "Cannot change type of column '{}': it is part of index '{}'. \
+                             Drop the index first.",
+                            col_def.name, idx.name
+                        ),
+                    });
+                }
+            }
+        }
+
+        // PK column must stay NOT NULL.
+        let is_pk_col = indexes
+            .iter()
+            .find(|i| i.is_primary)
+            .map(|pk| pk.columns.iter().any(|c| c.col_idx == col_idx))
+            .unwrap_or(false);
+        if is_pk_col && new_nullable {
+            return Err(DbError::InvalidValue {
+                reason: format!(
+                    "PRIMARY KEY column '{}' cannot be changed to NULL",
+                    col_def.name
+                ),
+            });
+        }
+    }
+
+    // Build old and new column lists for rewrite_rows.
+    let old_columns = columns.clone();
+    let mut new_columns = columns.clone();
+    new_columns[col_pos].col_type = new_col_type;
+    new_columns[col_pos].nullable = new_nullable;
+
+    let new_data_type = crate::table::column_type_to_data_type(new_col_type);
+
+    // Rewrite rows: coerce the target column to the new type.
+    // The coercion uses Strict mode — any value that cannot be converted fails
+    // the entire statement atomically (no partial writes).
+    rewrite_rows(
+        storage,
+        txn,
+        table_def,
+        &old_columns,
+        &new_columns,
+        &move |mut row| {
+            if let Some(val) = row.get_mut(col_pos) {
+                // Strict coercion: propagate error on conversion failure.
+                // The whole statement rolls back atomically.
+                *val = coerce(val.clone(), new_data_type, CoercionMode::Strict)?;
+            }
+            Ok(row)
+        },
+    )?;
+
+    // Update catalog: replace the column definition with the new type/nullability.
+    CatalogWriter::new(storage, txn)?.delete_column(table_def.id, col_idx)?;
+    let new_catalog_col = axiomdb_catalog::ColumnDef {
+        table_id: table_def.id,
+        col_idx,
+        name: col_def.name.clone(),
+        col_type: new_col_type,
+        nullable: new_nullable,
+        auto_increment: old_columns[col_pos].auto_increment,
+    };
+    CatalogWriter::new(storage, txn)?.create_column(new_catalog_col.clone())?;
 
     *columns = new_columns;
     Ok(())

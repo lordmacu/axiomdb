@@ -1556,9 +1556,10 @@ expression. Full metadata exposure is planned for a later catalog enhancement.
 
 ## ALTER TABLE Execution
 
-ALTER TABLE dispatches to one of four handlers depending on the operation.
-Two of them (ADD COLUMN and DROP COLUMN) require rewriting every row in the
-table. The other two (RENAME COLUMN and RENAME TO) touch only the catalog.
+ALTER TABLE dispatches to one of five handlers depending on the operation.
+Three of them (ADD COLUMN, DROP COLUMN, and MODIFY COLUMN) require rewriting
+every row in the table. The other two (RENAME COLUMN and RENAME TO) touch
+only the catalog.
 
 ### Why Row Rewriting Is Needed
 
@@ -1587,7 +1588,10 @@ Neither operation touches row data.
 
 ### `rewrite_rows` Helper
 
-Both ADD COLUMN and DROP COLUMN use a shared `rewrite_rows` path:
+ADD COLUMN, DROP COLUMN, and MODIFY COLUMN all use a shared `rewrite_rows`
+dispatch. The implementation branches on storage format:
+
+**Heap tables:**
 
 ```
 rewrite_rows(table_name, old_schema, new_schema, transform_fn):
@@ -1595,17 +1599,46 @@ rewrite_rows(table_name, old_schema, new_schema, transform_fn):
   old_rows = HeapChain::scan_visible(table_name, snapshot)
 
   for (record_id, old_row) in old_rows:
-    new_row = transform_fn(old_row)   // apply per-operation transformation
+    new_row = transform_fn(old_row)?   // apply per-operation transformation
     storage.delete_row(record_id, txn_id)
     storage.insert_row(table_name, encode_row(new_row, new_schema), txn_id)
 ```
 
-The `transform_fn` is operation-specific:
+**Clustered tables (`rewrite_rows_clustered`):**
+
+Clustered tables cannot use heap delete+reinsert because `clustered_tree::insert`
+rejects duplicate primary keys even when the previous row is delete-marked. Instead,
+each row is rewritten in place using `update_with_relocation`:
+
+```
+rewrite_rows_clustered(table_id, old_schema, new_schema, transform_fn):
+  snapshot = txn.active_snapshot()
+  rows = clustered_tree::range(table_id, Unbounded, Unbounded, snapshot)
+
+  for ClusteredRow { key, row_header, row_data } in rows:
+    old_row = decode_row(row_data, old_schema)
+    new_row = transform_fn(old_row)?
+    new_data = encode_row(new_row, new_schema)
+    txn.record_clustered_update(table_id, key, row_header+row_data, new_data)
+    new_root = clustered_tree::update_with_relocation(key, new_data)
+    if let Some(new_root_pid) = new_root {
+        catalog.set_root_page(table_id, new_root_pid)
+    }
+```
+
+`update_with_relocation` tries an in-place rewrite of the leaf slot. If the new
+row is larger and the leaf page is full, it falls back to physical delete + reinsert
+at the correct leaf position (no duplicate-key issue because the old entry is
+physically removed before the new one is inserted).
+
+The `transform_fn` is operation-specific and returns `Result<Row, DbError>` so
+coercion failures abort the entire statement:
 
 | Operation | transform_fn |
 |---|---|
 | ADD COLUMN | Append `DEFAULT` value (or `NULL` if no default) to the end of the row |
 | DROP COLUMN | Remove the value at `col_idx` from the row vector |
+| MODIFY COLUMN | Replace value at `col_idx` with `coerce(value, new_type, Strict)?` |
 
 ### Ordering Constraint — Catalog Before vs. After Rewrite
 
@@ -1639,6 +1672,20 @@ been written in the new (narrower) layout but the catalog still shows the old
 schema. Recovery rolls back the uncommitted row rewrites and the catalog is
 never touched — the table is fully consistent under the old schema.
 
+**MODIFY COLUMN — rewrite rows FIRST (with strict coercion), then update catalog:**
+
+```
+1. Guard: column not in secondary index (type change would break key encoding)
+2. Guard: PK column cannot become nullable on clustered table
+3. rewrite_rows(old_schema → new_schema, coerce(val, new_type, Strict)?)
+4. catalog.delete_column(table_id, col_idx)
+5. catalog.create_column(new_ColumnDef)  // same col_idx, new type/nullable
+```
+
+If coercion fails for any row (e.g. `TEXT → INT` on a non-numeric value), the
+error is returned immediately and no rows are changed. The statement is atomic:
+either all rows are coerced successfully or none are.
+
 The invariant is: **the catalog always describes rows that can be decoded.**
 Swapping the order for either operation would create a window where the catalog
 describes a schema that does not match the on-disk rows.
@@ -1647,16 +1694,25 @@ describes a schema that does not match the on-disk rows.
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
 <span class="callout-label">Design Decision — Asymmetric Catalog Ordering</span>
-ADD COLUMN updates the catalog before rewriting rows; DROP COLUMN rewrites rows
-before updating the catalog. The direction is chosen so that a mid-operation
-crash always leaves the catalog consistent with whatever rows are on disk. For
-ADD, a rolled-back partial rewrite leaves rows under the old (narrower) schema —
-but the catalog already shows the new column, which is a problem. The solution
-is that partial rewrites are uncommitted transactions and are invisible to crash
-recovery, which only replays committed WAL entries. For DROP, partial rewrites
-under the new (narrower) layout are also rolled back, and the catalog still
-describes the old (wider) schema — fully decodable. This mirrors the ordering
-used in PostgreSQL's heap rewrite path for ALTER TABLE operations.
+ADD COLUMN updates the catalog before rewriting rows; DROP COLUMN and MODIFY
+COLUMN rewrite rows before updating the catalog. The direction is chosen so that
+a mid-operation crash always leaves the catalog consistent with whatever rows are
+on disk — partial rewrites are uncommitted transactions invisible to crash recovery.
+This mirrors the ordering used in PostgreSQL's heap rewrite path for ALTER TABLE.
+</div>
+</div>
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Clustered DDL Uses update_with_relocation</span>
+Clustered tables cannot use heap-style delete+reinsert during row rewrites because
+<code>clustered_tree::insert</code> rejects duplicate primary keys even when the previous
+entry is delete-marked. Instead, <code>rewrite_rows_clustered</code> uses
+<code>update_with_relocation</code>: it rewrites the leaf slot in place, falling back to
+physical relocate-and-reinsert only when the new row is larger and the leaf has
+no room. This avoids the duplicate-key restriction entirely and keeps the PK-keyed
+B+ tree consistent throughout the rewrite.
 </div>
 </div>
 
