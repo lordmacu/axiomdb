@@ -34,7 +34,7 @@ impl TestEnv {
 }
 
 fn make_storage_with_page(env: &TestEnv) -> (MmapStorage, u64) {
-    let mut storage = MmapStorage::create(&env.db).unwrap();
+    let storage = MmapStorage::create(&env.db).unwrap();
     let page_id = storage.alloc_page(PageType::Data).unwrap();
     let page = Page::new(PageType::Data, page_id);
     storage.write_page(page_id, &page).unwrap();

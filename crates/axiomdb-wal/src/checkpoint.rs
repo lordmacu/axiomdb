@@ -22,8 +22,8 @@ use axiomdb_core::error::DbError;
 use axiomdb_storage::{read_checkpoint_lsn, write_checkpoint_lsn, StorageEngine};
 
 use crate::{
+    concurrent_writer::ConcurrentWalWriter,
     entry::{EntryType, WalEntry},
-    writer::WalWriter,
 };
 
 /// Stateless checkpoint executor.
@@ -46,7 +46,7 @@ impl Checkpointer {
     /// meta page, so the database remains consistent with the previous checkpoint.
     pub fn checkpoint(
         storage: &mut dyn StorageEngine,
-        wal: &mut WalWriter,
+        wal: &ConcurrentWalWriter,
     ) -> Result<u64, DbError> {
         // Step 1: flush all pages to disk BEFORE writing the Checkpoint WAL entry.
         // This is the critical ordering constraint — see module doc.
@@ -84,7 +84,7 @@ mod tests {
     use super::*;
     use axiomdb_storage::{MemoryStorage, MmapStorage};
 
-    use crate::{reader::WalReader, EntryType as ET, TxnManager};
+    use crate::{reader::WalReader, ConcurrentWalWriter, EntryType as ET, TxnManager};
 
     fn temp_wal() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -104,9 +104,9 @@ mod tests {
     fn test_checkpoint_stores_lsn_in_meta_page() {
         let (_dir, path) = temp_wal();
         let mut storage = MemoryStorage::new();
-        let mut wal = WalWriter::create(&path).unwrap();
+        let wal = ConcurrentWalWriter::create(&path).unwrap();
 
-        let lsn = Checkpointer::checkpoint(&mut storage, &mut wal).unwrap();
+        let lsn = Checkpointer::checkpoint(&mut storage, &wal).unwrap();
         assert!(lsn > 0);
         assert_eq!(Checkpointer::last_checkpoint_lsn(&storage).unwrap(), lsn);
     }
@@ -115,11 +115,11 @@ mod tests {
     fn test_multiple_checkpoints_monotonically_increasing() {
         let (_dir, path) = temp_wal();
         let mut storage = MemoryStorage::new();
-        let mut wal = WalWriter::create(&path).unwrap();
+        let wal = ConcurrentWalWriter::create(&path).unwrap();
 
-        let lsn1 = Checkpointer::checkpoint(&mut storage, &mut wal).unwrap();
-        let lsn2 = Checkpointer::checkpoint(&mut storage, &mut wal).unwrap();
-        let lsn3 = Checkpointer::checkpoint(&mut storage, &mut wal).unwrap();
+        let lsn1 = Checkpointer::checkpoint(&mut storage, &wal).unwrap();
+        let lsn2 = Checkpointer::checkpoint(&mut storage, &wal).unwrap();
+        let lsn3 = Checkpointer::checkpoint(&mut storage, &wal).unwrap();
 
         assert!(lsn1 < lsn2 && lsn2 < lsn3);
         assert_eq!(Checkpointer::last_checkpoint_lsn(&storage).unwrap(), lsn3);
@@ -129,9 +129,9 @@ mod tests {
     fn test_checkpoint_entry_readable_via_wal_reader() {
         let (_dir, path) = temp_wal();
         let mut storage = MemoryStorage::new();
-        let mut wal = WalWriter::create(&path).unwrap();
+        let wal = ConcurrentWalWriter::create(&path).unwrap();
 
-        let ckpt_lsn = Checkpointer::checkpoint(&mut storage, &mut wal).unwrap();
+        let ckpt_lsn = Checkpointer::checkpoint(&mut storage, &wal).unwrap();
 
         let reader = WalReader::open(&path).unwrap();
         let entries: Vec<_> = reader
@@ -150,9 +150,9 @@ mod tests {
         // MemoryStorage::flush() is a no-op — checkpoint must still complete.
         let (_dir, path) = temp_wal();
         let mut storage = MemoryStorage::new();
-        let mut wal = WalWriter::create(&path).unwrap();
+        let wal = ConcurrentWalWriter::create(&path).unwrap();
 
-        let result = Checkpointer::checkpoint(&mut storage, &mut wal);
+        let result = Checkpointer::checkpoint(&mut storage, &wal);
         assert!(result.is_ok());
     }
 
@@ -191,10 +191,10 @@ mod tests {
         // WAL has only the file header, no entries yet.
         let (_dir, path) = temp_wal();
         let mut storage = MemoryStorage::new();
-        let mut wal = WalWriter::create(&path).unwrap();
+        let wal = ConcurrentWalWriter::create(&path).unwrap();
 
         assert_eq!(wal.current_lsn(), 0); // no entries yet
-        let lsn = Checkpointer::checkpoint(&mut storage, &mut wal).unwrap();
+        let lsn = Checkpointer::checkpoint(&mut storage, &wal).unwrap();
         assert_eq!(lsn, 1); // first entry gets LSN 1
     }
 
@@ -209,8 +209,8 @@ mod tests {
         // Session 1: checkpoint.
         let checkpoint_lsn = {
             let mut storage = MmapStorage::create(&db_path).unwrap();
-            let mut wal = WalWriter::create(&wal_path).unwrap();
-            Checkpointer::checkpoint(&mut storage, &mut wal).unwrap()
+            let wal = ConcurrentWalWriter::create(&wal_path).unwrap();
+            Checkpointer::checkpoint(&mut storage, &wal).unwrap()
         };
 
         // Session 2: reopen — checkpoint_lsn must persist.
@@ -228,9 +228,9 @@ mod tests {
         // Session 1: two checkpoints.
         let lsn2 = {
             let mut storage = MmapStorage::create(&db_path).unwrap();
-            let mut wal = WalWriter::create(&wal_path).unwrap();
-            Checkpointer::checkpoint(&mut storage, &mut wal).unwrap(); // lsn=1
-            Checkpointer::checkpoint(&mut storage, &mut wal).unwrap() // lsn=2
+            let wal = ConcurrentWalWriter::create(&wal_path).unwrap();
+            Checkpointer::checkpoint(&mut storage, &wal).unwrap(); // lsn=1
+            Checkpointer::checkpoint(&mut storage, &wal).unwrap() // lsn=2
         };
 
         // Session 2: last checkpoint LSN = 2.

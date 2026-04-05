@@ -15,4 +15,9 @@ tokio           = { workspace = true, features = ["sync"] }
 libc            = "0.2"
 
 [dev-dependencies]
-tempfile = { workspace = true }
+tempfile  = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name    = "wal_writer"
+harness = false
