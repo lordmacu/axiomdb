@@ -2,13 +2,22 @@
 
 ## What to build (not how)
 
-Make page allocation and deallocation thread-safe for concurrent transactions.
-The current FreeList uses `&mut self` — every allocation serializes on a global lock.
-Under 10 concurrent writers, this becomes a 10× bottleneck. Under 100, it's 100×.
+Reduce page allocation contention for concurrent transactions via a two-tier
+allocation system.
+
+> **Status after 40.3 (done):** Tier 2 — the global `Mutex<FreeList>` — is already
+> implemented in MmapStorage: `freelist: Mutex<FreeList>`, `grow_lock: Mutex<()>`,
+> `freelist_dirty: AtomicBool`. Every allocation now serializes on a brief Mutex
+> acquisition rather than requiring `&mut StorageEngine`.
+>
+> **What remains for 40.9:** Tier 1 — the per-transaction `LocalPageBatch` that
+> eliminates the global Mutex for 99% of allocations by batching 64 pages per refill.
+> This subfase adds `LocalPageBatch` to `ConnectionTxn` (40.4b) and wires the fast
+> path through the executor.
 
 The solution is a **two-tier allocation system** (DuckDB-inspired): per-transaction
-local batch + global lock-free replenishment. Most allocations happen with zero
-contention; global lock acquired only every N allocations.
+local batch + global lock-free replenishment. Tier 2 (global Mutex<FreeList>) is
+already done in 40.3. This spec covers Tier 1 only.
 
 ## Research findings
 
@@ -222,5 +231,5 @@ to zero-fill or extend the file.
 
 ## Dependencies
 
-- 40.2 (Per-connection txn) — LocalPageBatch lives in ConnectionTxn
-- 40.3 (StorageEngine interior mutability) — GlobalPageAllocator replaces Mutex<FreeList>
+- 40.3 (StorageEngine interior mutability) — ✅ DONE: `Mutex<FreeList>` + `grow_lock` in MmapStorage
+- 40.4b (Per-connection TxnState) — `LocalPageBatch` lives in `ConnectionTxn`

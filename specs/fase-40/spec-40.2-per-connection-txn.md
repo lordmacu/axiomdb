@@ -59,7 +59,7 @@ pub struct ConnectionTxn {
 ```rust
 /// Lightweight coordinator — no per-transaction state, only shared counters and WAL.
 pub struct TxnCoordinator {
-    pub wal: WalWriter,                              // WAL writer (still single for now, 40.4 makes concurrent)
+    pub wal: ConcurrentWalWriter,                     // WAL writer — thread-safe (implemented in 40.4)
     pub next_txn_id: AtomicU64,                      // from 40.1
     pub max_committed: AtomicU64,                    // from 40.1
     pub active_set: RwLock<HashSet<TxnId>>,          // for snapshot visibility
@@ -155,6 +155,16 @@ AFTER:  TxnCoordinator.snapshot() → reads max_committed atomically (no lock ne
 - Deadlock detection (that's 40.6)
 - The `Arc<RwLock<Database>>` still serializes DML execution (removed in 40.10)
 
+## Notes on renumbering
+
+This spec was originally numbered 40.2. In practice, 40.2 was used for the Plan Cache
+(OID-based statement plan cache). This per-connection txn work is now tracked as **40.4b**
+in progreso.md, and must be completed before 40.5 (LockManager) can be wired end-to-end.
+
 ## Dependencies
 
-- 40.1 (Atomic TxnId) — next_txn_id and max_committed must be AtomicU64
+- 40.3 (StorageEngine interior mutability) — `&dyn StorageEngine` + PageLockTable already done
+- 40.4 (ConcurrentWalWriter) — `ConcurrentWalWriter` already done; TxnCoordinator uses it
+- NOTE: "40.1 (Atomic TxnId)" was never implemented as a separate subfase. The
+  `next_txn_id: AtomicU64` and `max_committed: AtomicU64` will be introduced inline
+  as part of this subfase (40.4b) when TxnCoordinator is built.

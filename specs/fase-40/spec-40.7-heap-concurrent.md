@@ -54,12 +54,16 @@ serialize correctly when targeting the same page.
 
 ### HeapChain today
 ```rust
-// All methods take &mut dyn StorageEngine — single writer assumed
-pub fn insert(storage: &mut dyn StorageEngine, root_page_id: u64,
+// After 40.3: all methods already take &dyn StorageEngine (interior mutability)
+pub fn insert(storage: &dyn StorageEngine, root_page_id: u64,
               data: &[u8], txn_id: TxnId) -> Result<(u64, u16), DbError>
 ```
 
-**Insert algorithm today:**
+> **Note (40.3 done):** The `&mut dyn StorageEngine` → `&dyn StorageEngine` migration
+> was completed in subfase 40.3. PageLockTable (64-shard per-page RwLock) is already
+> available. This spec focuses on integrating that infrastructure into HeapChain logic.
+
+**Insert algorithm today (after 40.3):**
 1. Start at `root_page_id`
 2. Walk chain via `chain_next_page()` until finding page with space
 3. If no page has space → allocate new page, link to chain
@@ -70,7 +74,7 @@ pub fn insert(storage: &mut dyn StorageEngine, root_page_id: u64,
 - Walking the chain is a linear scan — all threads start at root
 - No free space tracking — every thread scans from root every time
 - Chain growth (allocating new page) is not atomic
-- Two threads inserting on same page would corrupt slot directory
+- Two threads inserting on same page would corrupt slot directory (no page latch)
 
 ### HeapChain after 40.7
 
@@ -269,6 +273,6 @@ entry written) but the row is not yet visible (txn not committed). The existing
 
 ## Dependencies
 
-- 40.3 (StorageEngine interior mutability) — PageLockTable provides per-page RwLocks
-- 40.5 (Lock Manager) — row-level S/X locks for DML operations
-- 40.2 (Per-connection txn) — each connection holds its own lock list and undo log
+- 40.3 (StorageEngine interior mutability) — ✅ DONE: PageLockTable (64-shard per-page RwLock) available
+- 40.5 (Lock Manager) — row-level S/X locks for DML operations (pending)
+- 40.4b (Per-connection TxnState) — each connection holds its own lock list and undo log (pending)
