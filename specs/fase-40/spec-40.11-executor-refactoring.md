@@ -3,10 +3,13 @@
 ## What to build (not how)
 
 Update all SQL executor code to:
-1. Use `&dyn StorageEngine` instead of `&mut dyn StorageEngine` (184 signatures)
-2. Integrate row-level lock acquisition at the correct points in each DML operation
-3. Accept `ConnectionTxn` and shared subsystems instead of `&mut TxnManager`
-4. Handle deadlock errors from the lock manager
+1. Integrate row-level lock acquisition at the correct points in each DML operation
+2. Accept `ConnectionTxn` and shared subsystems instead of `&mut TxnManager`
+3. Handle deadlock errors from the lock manager
+
+> **Note (40.3 done):** The `&mut dyn StorageEngine` → `&dyn StorageEngine` migration
+> (originally item 1, ~184 signatures) was completed in subfase 40.3. This subfase
+> focuses on the logic changes: lock integration, ConnectionTxn plumbing, and deadlock handling.
 
 ## Research findings
 
@@ -41,28 +44,28 @@ Thread B: reads row → modifies row → tries to lock (both corrupted)
 
 ## Current executor signatures (what changes)
 
-### Pattern today (190 signatures)
+### Pattern today (after 40.3)
 ```rust
 fn execute_insert_ctx(
     stmt: InsertStmt,
-    storage: &mut dyn StorageEngine,    // ← becomes &dyn
+    storage: &dyn StorageEngine,         // ✅ already done in 40.3
     txn: &mut TxnManager,               // ← becomes &mut ConnectionTxn + &TxnCoordinator
-    bloom: &mut BloomRegistry,           // ← becomes &RwLock<BloomRegistry>
+    bloom: &BloomRegistry,              // ✅ already done in 40.3
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError>
 ```
 
-### Pattern after
+### Pattern after (40.11 target)
 ```rust
 fn execute_insert_ctx(
     stmt: InsertStmt,
-    storage: &dyn StorageEngine,         // ← &self (interior mutability from 40.3)
-    txn: &mut ConnectionTxn,             // ← per-connection txn (from 40.2)
-    coord: &TxnCoordinator,             // ← shared coordinator (from 40.2)
+    storage: &dyn StorageEngine,         // ✅ no change (40.3 done)
+    txn: &mut ConnectionTxn,             // ← per-connection txn (from 40.4b)
+    coord: &TxnCoordinator,             // ← shared coordinator (from 40.4b)
     lock_mgr: &LockManager,             // ← shared lock manager (from 40.5)
-    wal: &ConcurrentWalWriter,          // ← shared WAL (from 40.4)
+    wal: &ConcurrentWalWriter,          // ✅ no change (40.4 done)
     page_batch: &mut LocalPageBatch,    // ← per-txn page allocator (from 40.9)
-    bloom: &BloomRegistry,              // ← read-only ref (write via RwLock elsewhere)
+    bloom: &BloomRegistry,              // ✅ no change (40.3 done)
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError>
 ```
@@ -200,25 +203,14 @@ by the transaction that previously held the lock. We MUST re-read the row and re
 InnoDB calls this **"pessimistic re-check"**. PostgreSQL calls it **"EvalPlanQual"**
 (re-evaluate the query plan on the locked tuple).
 
-## Scope of 184 signature changes
+## Scope of changes in 40.11
 
-### By crate
-| Crate | Files | Signatures | Change |
-|---|---|---|---|
-| axiomdb-sql/executor/ | 8 files | ~100 | `&mut dyn StorageEngine` → `&dyn StorageEngine` + add lock_mgr param |
-| axiomdb-sql/ | 5 files | ~30 | table.rs, index_maintenance.rs, fk_enforcement.rs, vacuum.rs |
-| axiomdb-storage/ | 3 files | ~43 | heap_chain.rs, heap.rs, clustered_tree.rs |
-| axiomdb-index/ | 1 file | ~25 | tree.rs |
-| axiomdb-wal/ | 3 files | ~11 | txn.rs, checkpoint.rs, recovery.rs |
-| axiomdb-catalog/ | 1 file | ~5 | bootstrap.rs |
-| Tests | ~10 files | ~20 | Integration tests |
+### Mechanical change (already done in 40.3)
+The `&mut dyn StorageEngine` → `&dyn StorageEngine` migration (~184 signatures across
+all crates) was completed in subfase 40.3. No mechanical signature work remains.
 
-### Mechanical change (no logic change)
-Most of the 184 changes are purely `&mut` → `&`. No logic changes needed for these.
-The storage layer already has interior mutability (40.3).
-
-### Logic changes (lock integration)
-Only ~10 functions need actual logic changes (adding lock_mgr.acquire() calls):
+### Logic changes (lock integration — this subfase)
+~10 functions need actual logic changes (adding lock_mgr.acquire() calls):
 - `execute_insert_ctx()`
 - `execute_update_ctx()`
 - `execute_delete_ctx()`
@@ -228,9 +220,15 @@ Only ~10 functions need actual logic changes (adding lock_mgr.acquire() calls):
 - `TableEngine::insert_row()`
 - `TableEngine::update_rows_preserve_rid()`
 
+### API plumbing changes (this subfase)
+- Replace `&mut TxnManager` with `(&mut ConnectionTxn, &TxnCoordinator)` across all DML paths
+- Add `lock_mgr: &LockManager` parameter (from 40.5)
+- Add `page_batch: &mut LocalPageBatch` parameter (from 40.9)
+- Introduce `ExecutionContext` struct to bundle shared subsystems
+
 ## Acceptance criteria
 
-- [ ] Zero `&mut dyn StorageEngine` in production code
+- [x] Zero `&mut dyn StorageEngine` in production code — ✅ done in 40.3
 - [ ] Zero `&mut TxnManager` in production code (uses ConnectionTxn or TxnCoordinator)
 - [ ] INSERT: acquires IX(table) before insertion
 - [ ] UPDATE: acquires IX(table) + X(row) BEFORE modification per row
@@ -253,7 +251,9 @@ Only ~10 functions need actual logic changes (adding lock_mgr.acquire() calls):
 
 ## Dependencies
 
-- 40.3 (StorageEngine interior mutability) — &dyn StorageEngine with &self
-- 40.5 (Lock Manager) — lock_mgr.acquire_table(), lock_mgr.acquire_row()
-- 40.6 (Deadlock Detection) — DbError::Deadlock handling
-- 40.10 (Database lock redesign) — SharedDatabase provides subsystems
+- 40.3 (StorageEngine interior mutability) — ✅ DONE: `&dyn StorageEngine` throughout
+- 40.4b (Per-connection TxnState) — `ConnectionTxn` + `TxnCoordinator` structs
+- 40.5 (Lock Manager) — `lock_mgr.acquire_table()`, `lock_mgr.acquire_row()`
+- 40.6 (Deadlock Detection) — `DbError::Deadlock` handling
+- 40.9 (FreeList thread-safe) — `LocalPageBatch` per connection
+- 40.10 (Database lock redesign) — `SharedDatabase` provides subsystems
