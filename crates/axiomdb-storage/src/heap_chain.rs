@@ -964,20 +964,20 @@ mod tests {
             self.inner.read_page(page_id)
         }
 
-        fn write_page(&mut self, page_id: u64, page: &Page) -> Result<(), DbError> {
+        fn write_page(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
             self.writes.fetch_add(1, Ordering::Relaxed);
             self.inner.write_page(page_id, page)
         }
 
-        fn alloc_page(&mut self, page_type: PageType) -> Result<u64, DbError> {
+        fn alloc_page(&self, page_type: PageType) -> Result<u64, DbError> {
             self.inner.alloc_page(page_type)
         }
 
-        fn free_page(&mut self, page_id: u64) -> Result<(), DbError> {
+        fn free_page(&self, page_id: u64) -> Result<(), DbError> {
             self.inner.free_page(page_id)
         }
 
-        fn flush(&mut self) -> Result<(), DbError> {
+        fn flush(&self) -> Result<(), DbError> {
             self.inner.flush()
         }
 

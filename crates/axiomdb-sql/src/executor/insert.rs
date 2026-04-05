@@ -896,7 +896,7 @@ fn enqueue_clustered_insert_ctx(
     if ctx
         .clustered_insert_batch
         .as_ref()
-        .map_or(false, |b| b.table_id != table_id)
+        .is_some_and(|b| b.table_id != table_id)
     {
         flush_clustered_insert_batch(storage, txn, bloom, ctx)?;
     }
@@ -1031,7 +1031,7 @@ fn enqueue_clustered_insert_ctx(
     if ctx
         .clustered_insert_batch
         .as_ref()
-        .map_or(false, |b| b.rows.len() >= CLUSTERED_BATCH_MAX_ROWS)
+        .is_some_and(|b| b.rows.len() >= CLUSTERED_BATCH_MAX_ROWS)
     {
         flush_clustered_insert_batch(storage, txn, bloom, ctx)?;
     }

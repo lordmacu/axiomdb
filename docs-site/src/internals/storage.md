@@ -9,15 +9,45 @@ exposes a simple trait that all higher layers depend on.
 ## The StorageEngine Trait
 
 ```rust
-pub trait StorageEngine: Send {
+pub trait StorageEngine: Send + Sync {
     fn read_page(&self, page_id: u64) -> Result<PageRef, DbError>;
-    fn write_page(&mut self, page_id: u64, page: &Page) -> Result<(), DbError>;
-    fn alloc_page(&mut self, page_type: PageType) -> Result<u64, DbError>;
-    fn free_page(&mut self, page_id: u64) -> Result<(), DbError>;
-    fn flush(&mut self) -> Result<(), DbError>;
+    fn write_page(&self, page_id: u64, page: &Page) -> Result<(), DbError>;
+    fn alloc_page(&self, page_type: PageType) -> Result<u64, DbError>;
+    fn free_page(&self, page_id: u64) -> Result<(), DbError>;
+    fn flush(&self) -> Result<(), DbError>;
     fn page_count(&self) -> u64;
+    fn prefetch_hint(&self, start_page_id: u64, count: u64) { ... }
+    fn set_current_snapshot(&self, snapshot_id: u64) { ... }
+    fn deferred_free_count(&self) -> usize { ... }
 }
 ```
+
+All methods take `&self` — there is no `&mut self` anywhere in the trait. Mutable state
+is managed entirely through interior mutability:
+
+- **`write_page`**: acquires a per-page exclusive `RwLock` (from `PageLockTable`) for the
+  duration of the `pwrite(2)` call. Two transactions writing **different** pages proceed
+  in full parallelism with zero contention.
+- **`alloc_page`**: acquires `Mutex<FreeList>` only during the bitmap scan (microseconds),
+  then acquires the page lock to initialise the new page.
+- **`free_page`**: acquires `Mutex<FreeList>` briefly to add the page to the free bitmap.
+- **`flush`**: acquires `Mutex<FreeList>` to persist the freelist, then calls `fdatasync`.
+
+This design mirrors InnoDB (`buf_page_get_gen` with per-page `block_lock`, no `&mut` on
+the buffer pool) and PostgreSQL (per-buffer atomic `state` field, `MarkBufferDirty` is
+`&self`-equivalent).
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Interior Mutability (Phase 40.3)</span>
+Both InnoDB and PostgreSQL use a <code>&self</code>-equivalent buffer pool with per-page locks.
+AxiomDB follows the same pattern: a sharded <code>PageLockTable</code> (64 shards, one
+<code>RwLock&lt;HashMap&lt;u64, Arc&lt;RwLock&lt;()&gt;&gt;&gt;&gt;</code> per shard) eliminates the global
+<code>&amp;mut self</code> bottleneck and is the architectural unlock for concurrent writer support
+in phases 40.4–40.12.
+</div>
+</div>
 
 `read_page` returns an owned `PageRef` — a heap-allocated copy of the 16 KB page data.
 This is a deliberate change from the original `&Page` borrow: owned pages survive mmap

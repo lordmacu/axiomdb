@@ -1,3 +1,5 @@
+use std::sync::RwLock;
+
 use axiomdb_core::error::DbError;
 
 use crate::{
@@ -6,34 +8,34 @@ use crate::{
     page::{Page, PageType, PAGE_SIZE},
 };
 
-/// In-RAM storage engine — no I/O, ideal for unit tests and benchmarks.
+/// Inner state, protected by a single `RwLock`.
 ///
-/// ## Performance design
-///
-/// Previous implementation used `Vec<Option<Box<Page>>>`, which caused:
-/// - One heap allocation per `alloc_page` (`Box::new`)
-/// - One heap allocation per `write_page` (`Box::new(owned)`)
-/// - Two 16 KB copies per `write_page` (stack copy for `from_bytes` + `Box::new`)
-/// - Pointer indirection on every `read_page`
-///
-/// Current implementation uses a **flat `Vec<Page>`**:
-/// - `alloc_page` → zero-init one slot in the flat array (no heap alloc)
-/// - `write_page` → validate checksum + one 16 KB copy directly into the array
-/// - `read_page` → direct array reference, no pointer dereference
-///
-/// This cuts per-insert overhead by ~50-70% on the storage layer, which is
-/// critical for B+Tree benchmarks where each insert copies 2-3 pages (O(log n)
-/// CoW path).
-///
-/// `allocated` is a parallel `Vec<bool>` tracking which slots are live.
-/// The `FreeList` manages page ID assignment; `allocated` guards `read_page`
-/// against accessing uninitialized slots.
-pub struct MemoryStorage {
+/// Using one lock keeps `MemoryStorage` simple — it is used exclusively for
+/// unit tests and benchmarks where single-threaded access dominates.
+struct MemoryStorageInner {
     /// Flat page array. Slot `i` holds page `i`'s bytes directly — no Box, no Option.
     pages: Vec<Page>,
     /// `true` if slot `i` has been allocated and not yet freed.
     allocated: Vec<bool>,
     freelist: FreeList,
+}
+
+/// In-RAM storage engine — no I/O, ideal for unit tests and benchmarks.
+///
+/// ## Interior mutability (Phase 40.3)
+///
+/// All `StorageEngine` methods now take `&self`. State is protected by a single
+/// `RwLock<MemoryStorageInner>`. For the single-threaded test use case the lock
+/// adds minimal overhead (no contention → uncontended fast path).
+///
+/// ## Performance design
+///
+/// The inner `pages: Vec<Page>` is a flat array:
+/// - `alloc_page` → zero-init one slot in place (no heap alloc)
+/// - `write_page` → one 16 KB copy directly into the slot
+/// - `read_page` → direct array index, no pointer indirection
+pub struct MemoryStorage {
+    inner: RwLock<MemoryStorageInner>,
 }
 
 impl MemoryStorage {
@@ -46,14 +48,15 @@ impl MemoryStorage {
         pages[0] = Page::new(PageType::Meta, 0);
 
         let mut allocated = vec![false; INITIAL_PAGES as usize];
-        allocated[0] = true; // meta page is always live
+        allocated[0] = true;
 
-        // Pages 0 and 1 reserved (meta + bitmap slot), consistent with MmapStorage.
         let freelist = FreeList::new(INITIAL_PAGES, &[0, 1]);
         MemoryStorage {
-            pages,
-            allocated,
-            freelist,
+            inner: RwLock::new(MemoryStorageInner {
+                pages,
+                allocated,
+                freelist,
+            }),
         }
     }
 }
@@ -66,103 +69,105 @@ impl Default for MemoryStorage {
 
 impl StorageEngine for MemoryStorage {
     fn read_page(&self, page_id: u64) -> Result<crate::page_ref::PageRef, DbError> {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let idx = page_id as usize;
-        if idx >= self.pages.len() || !self.allocated[idx] {
+        if idx >= inner.pages.len() || !inner.allocated[idx] {
             return Err(DbError::PageNotFound { page_id });
         }
         debug_assert!(
-            self.pages[idx].verify_checksum().is_ok(),
+            inner.pages[idx].verify_checksum().is_ok(),
             "checksum mismatch in MemoryStorage — logic bug in write path"
         );
         let mut bytes = [0u8; PAGE_SIZE];
-        bytes.copy_from_slice(self.pages[idx].as_bytes());
+        bytes.copy_from_slice(inner.pages[idx].as_bytes());
         Ok(crate::page_ref::PageRef::from_bytes(bytes))
     }
 
-    fn write_page(&mut self, page_id: u64, page: &Page) -> Result<(), DbError> {
-        // Validate checksum before storing — one check, no redundant copy.
+    fn write_page(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
         page.verify_checksum()?;
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let idx = page_id as usize;
-        if idx >= self.pages.len() {
+        if idx >= inner.pages.len() {
             return Err(DbError::PageNotFound { page_id });
         }
         // Direct 16 KB copy into the flat array slot — no heap allocation.
-        // SAFETY: both src and dst are valid, aligned Page slots. The copy is
-        // equivalent to a 16 KB memcpy and does not violate any invariants.
-        // NOALIAS: idx is within bounds (checked above), so src != dst as long as
-        // the caller does not pass a reference into our own array. Since write_page
-        // takes &Page from the caller (not &self.pages[idx]), this is guaranteed.
+        // SAFETY: both src and dst are valid Page slots. src (page) is passed
+        // by the caller and does not alias inner.pages[idx] because write_page
+        // takes &Page from outside, not &self.pages[idx].
         unsafe {
             std::ptr::copy_nonoverlapping(
                 page as *const Page,
-                &mut self.pages[idx] as *mut Page,
+                &mut inner.pages[idx] as *mut Page,
                 1,
             );
         }
-        self.allocated[idx] = true;
+        inner.allocated[idx] = true;
         Ok(())
     }
 
-    fn alloc_page(&mut self, page_type: PageType) -> Result<u64, DbError> {
-        if let Some(page_id) = self.freelist.alloc() {
-            self.ensure_capacity(page_id);
+    fn alloc_page(&self, page_type: PageType) -> Result<u64, DbError> {
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(page_id) = inner.freelist.alloc() {
+            ensure_capacity(&mut inner, page_id);
             let idx = page_id as usize;
-            // Initialize slot in place — no heap allocation.
-            self.pages[idx] = Page::new(page_type, page_id);
-            self.allocated[idx] = true;
+            inner.pages[idx] = Page::new(page_type, page_id);
+            inner.allocated[idx] = true;
             return Ok(page_id);
         }
-        // Grow by 64 pages and retry.
-        let new_total = self.freelist.total_pages() + 64;
-        self.freelist.grow(new_total);
-        self.grow_arrays(new_total as usize);
-        let page_id = self.freelist.alloc().ok_or(DbError::Other(
+        let new_total = inner.freelist.total_pages() + 64;
+        inner.freelist.grow(new_total);
+        grow_arrays(&mut inner, new_total as usize);
+        let page_id = inner.freelist.alloc().ok_or(DbError::Other(
             "freelist empty after grow — internal invariant violated".into(),
         ))?;
         let idx = page_id as usize;
-        self.pages[idx] = Page::new(page_type, page_id);
-        self.allocated[idx] = true;
+        inner.pages[idx] = Page::new(page_type, page_id);
+        inner.allocated[idx] = true;
         Ok(page_id)
     }
 
-    fn free_page(&mut self, page_id: u64) -> Result<(), DbError> {
+    fn free_page(&self, page_id: u64) -> Result<(), DbError> {
         if page_id == 0 || page_id == 1 {
             return Err(DbError::Other(format!(
                 "cannot free reserved page {page_id}"
             )));
         }
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let idx = page_id as usize;
-        if idx < self.allocated.len() {
-            self.allocated[idx] = false;
+        if idx < inner.allocated.len() {
+            inner.allocated[idx] = false;
         }
-        self.freelist.free(page_id)
+        inner.freelist.free(page_id)
     }
 
-    fn flush(&mut self) -> Result<(), DbError> {
+    fn flush(&self) -> Result<(), DbError> {
         Ok(())
     }
 
     fn page_count(&self) -> u64 {
-        self.freelist.total_pages()
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .freelist
+            .total_pages()
     }
 }
 
-impl MemoryStorage {
-    /// Ensures `pages` and `allocated` have capacity for `page_id`.
-    fn ensure_capacity(&mut self, page_id: u64) {
-        let idx = page_id as usize;
-        if idx >= self.pages.len() {
-            self.grow_arrays(idx + 1);
-        }
-    }
+// ── Private helpers ───────────────────────────────────────────────────────────
 
-    /// Grows both `pages` and `allocated` to `new_len`.
-    fn grow_arrays(&mut self, new_len: usize) {
-        if new_len > self.pages.len() {
-            self.pages
-                .resize_with(new_len, || Page::new(PageType::Free, 0));
-            self.allocated.resize(new_len, false);
-        }
+fn ensure_capacity(inner: &mut MemoryStorageInner, page_id: u64) {
+    let idx = page_id as usize;
+    if idx >= inner.pages.len() {
+        grow_arrays(inner, idx + 1);
+    }
+}
+
+fn grow_arrays(inner: &mut MemoryStorageInner, new_len: usize) {
+    if new_len > inner.pages.len() {
+        inner
+            .pages
+            .resize_with(new_len, || Page::new(PageType::Free, 0));
+        inner.allocated.resize(new_len, false);
     }
 }
 
@@ -175,8 +180,8 @@ mod tests {
 
     #[test]
     fn test_storage_engine_suite() {
-        let mut storage = MemoryStorage::new();
-        run_storage_engine_suite(&mut storage);
+        let storage = MemoryStorage::new();
+        run_storage_engine_suite(&storage);
     }
 
     #[test]
@@ -188,14 +193,14 @@ mod tests {
 
     #[test]
     fn test_alloc_starts_from_2() {
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         assert_eq!(storage.alloc_page(PageType::Data).unwrap(), 2);
         assert_eq!(storage.alloc_page(PageType::Data).unwrap(), 3);
     }
 
     #[test]
     fn test_free_and_realloc() {
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let id = storage.alloc_page(PageType::Data).unwrap();
         storage.free_page(id).unwrap();
         assert_eq!(storage.alloc_page(PageType::Data).unwrap(), id);
@@ -203,7 +208,7 @@ mod tests {
 
     #[test]
     fn test_double_free_is_error() {
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let id = storage.alloc_page(PageType::Data).unwrap();
         storage.free_page(id).unwrap();
         assert!(storage.free_page(id).is_err());
@@ -211,14 +216,14 @@ mod tests {
 
     #[test]
     fn test_free_reserved_is_error() {
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         assert!(storage.free_page(0).is_err());
         assert!(storage.free_page(1).is_err());
     }
 
     #[test]
     fn test_alloc_grows_automatically() {
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let initial = storage.page_count();
         for _ in 0..(initial - 2) {
             storage.alloc_page(PageType::Data).unwrap();
@@ -229,7 +234,7 @@ mod tests {
 
     #[test]
     fn test_read_write_roundtrip() {
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let id = storage.alloc_page(PageType::Data).unwrap();
         let mut page = Page::new(PageType::Data, id);
         page.body_mut()[0] = 0xDE;
@@ -243,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_write_invalid_checksum_rejected() {
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let id = storage.alloc_page(PageType::Data).unwrap();
         let mut page = Page::new(PageType::Data, id);
         page.body_mut()[0] = 0xFF; // without update_checksum
@@ -252,8 +257,7 @@ mod tests {
 
     #[test]
     fn test_box_dyn_storage_engine() {
-        // Verify that Box<dyn StorageEngine> compiles and works.
-        let mut engine: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
+        let engine: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
         let id = engine.alloc_page(PageType::Data).unwrap();
         assert!(id >= 2);
         engine.flush().unwrap();

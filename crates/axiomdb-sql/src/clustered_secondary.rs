@@ -227,6 +227,15 @@ impl ClusteredSecondaryLayout {
             )?;
         }
 
+        // Remove any stale secondary entry left behind by a previous MVCC delete.
+        // On DELETE, clustered secondary entries are intentionally not physically
+        // removed (comment in delete.rs: "MVCC deferred cleanup"). When the same
+        // row is re-inserted the physical_key is identical — for non-unique indexes
+        // it encodes both the indexed column and the PK suffix, so it uniquely
+        // identifies this exact row. Deleting it first (no-op if absent) prevents
+        // DuplicateKey from BTree::insert_in.
+        let _ = BTree::delete_in(storage, root_page_id, &entry.physical_key);
+
         BTree::insert_in(
             storage,
             root_page_id,

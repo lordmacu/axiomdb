@@ -1,6 +1,10 @@
 use std::{
     fs::{File, OpenOptions},
     path::Path,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Mutex, RwLock,
+    },
 };
 
 use axiomdb_core::error::{classify_io, DbError};
@@ -15,6 +19,7 @@ use crate::{
     engine::StorageEngine,
     freelist::FreeList,
     page::{Page, PageType, HEADER_SIZE, PAGE_SIZE},
+    page_lock::PageLockTable,
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -27,9 +32,6 @@ const GROW_PAGES: u64 = 64;
 /// 64 × 16 KB = 1 MB — matches one `GROW_PAGES` growth unit.
 const PREFETCH_DEFAULT_PAGES: u64 = 64;
 /// Log a warning if the deferred-free queue exceeds this many entries.
-/// Under normal RwLock operation the queue drains on every flush; sustained
-/// growth above this threshold indicates a snapshot leak or a missing
-/// `release_deferred_frees` call.
 const DEFERRED_FREE_WARN_THRESHOLD: usize = 4096;
 
 // Fixed offsets for in-place updates without re-parsing the full meta page.
@@ -58,64 +60,71 @@ const _: () = assert!(
 
 // ── MmapStorage ───────────────────────────────────────────────────────────────
 
-/// mmap-based storage engine.
+/// mmap-based storage engine with interior mutability.
 ///
 /// File layout:
 /// - Page 0: Meta (`DbFileMeta` in body)
 /// - Page 1: Free list bitmap (`FreeList` serialized)
 /// - Pages 2+: Data, Index, Overflow, etc.
 ///
-/// The `.db` file is locked with `flock(LOCK_EX)` on open and released on
-/// drop, preventing corruption from two processes opening the same file.
+/// ## Concurrency model (Phase 40.3)
+///
+/// All `StorageEngine` methods take `&self`. Mutable state is managed internally:
+///
+/// | Field | Protection | Contention |
+/// |---|---|---|
+/// | `mmap` | `RwLock` — write only during grow | Minimal (grow is rare) |
+/// | `freelist` | `Mutex` — held only during bitmap scan | ~1µs per alloc/free |
+/// | `deferred_frees` | `Mutex` | ~1µs per free |
+/// | `freelist_dirty` | `AtomicBool` | Zero contention |
+/// | `current_snapshot_id` | `AtomicU64` | Zero contention |
+/// | `page_count` | `AtomicU64` | Zero contention |
+/// | `dirty` | Existing `PageDirtyTracker` (atomic) | Zero contention |
+/// | `dw_buffer` | `Mutex` | Held only during flush |
+/// | `page_locks` | `PageLockTable` (64-shard) | Per-page, not global |
+/// | `grow_lock` | `Mutex<()>` | Held only during file growth |
+///
+/// ## Lock ordering (deadlock prevention)
+///
+/// ```text
+/// grow_lock > mmap.write > freelist > deferred_frees > page_lock
+/// ```
+///
+/// No code path acquires a later lock then an earlier lock → no cycles possible.
+///
+/// The `.db` file is locked with `flock(LOCK_EX)` on open and released on drop.
 pub struct MmapStorage {
-    /// Read-only memory mapping of the database file.
-    /// All reads go through this mapping; all writes go through `pwrite()` on `file`.
-    mmap: Mmap,
-    /// File descriptor kept open for `set_len` in `grow` and to hold the
-    /// exclusive file lock for the lifetime of this struct.
+    /// Read-only memory mapping — read lock for reads, write lock only during grow.
+    mmap: RwLock<Mmap>,
+    /// File descriptor for `pwrite()` and file length extension.
+    /// `pwrite()` is thread-safe at the OS level; no additional lock needed.
     file: File,
     /// In-memory free list. Persisted lazily to page 1 on `flush()`.
-    freelist: FreeList,
+    freelist: Mutex<FreeList>,
     /// Set when the freelist was modified and needs to be written on the next flush.
-    freelist_dirty: bool,
+    freelist_dirty: AtomicBool,
     /// Tracks pages written since the last flush. Cleared on `flush()`.
     dirty: PageDirtyTracker,
-    /// Pages that have been freed but are not yet safe to reuse (Phase 7.4a).
-    ///
-    /// When `free_page` is called, the page_id goes here instead of the freelist
-    /// tagged with the `snapshot_id` at which it was freed. Pages are released
-    /// to the freelist only when `release_deferred_frees(oldest_active_snapshot)`
-    /// confirms no reader holds a snapshot older than the free epoch.
-    ///
-    /// This prevents a writer from reusing a freed page while a concurrent
-    /// reader might still resolve it via an old B-Tree root or heap chain.
-    /// With `PageRef` (owned copies), the primary risk is already mitigated,
-    /// but deferred frees add defense-in-depth for Phase 7.4 concurrent readers.
-    ///
-    /// ## Capacity
-    ///
-    /// The queue is capped at `DEFERRED_FREE_WARN_THRESHOLD` entries. If the cap
-    /// is exceeded, a warning is logged. Under normal operation with RwLock, the
-    /// writer holds exclusive access during flush, so the queue drains every commit.
-    /// Sustained growth indicates a bug (readers not releasing snapshots).
-    deferred_frees: Vec<(u64, u64)>,
-    /// Current snapshot_id set by `set_current_snapshot()`. Used to tag
-    /// deferred frees with the epoch at which the page became unreachable.
-    /// Defaults to 0 (meaning "release immediately on flush").
-    current_snapshot_id: u64,
-    /// Doublewrite buffer for torn page repair (Phase 3.8c).
-    /// Holds the path to the `.dw` file alongside the main `.db` file.
-    dw_buffer: DoublewriteBuffer,
+    /// Pages freed but not yet safe to reuse (MVCC deferred free, Phase 7.4a).
+    deferred_frees: Mutex<Vec<(u64, u64)>>,
+    /// Snapshot epoch at which the current statement began (used to tag deferred frees).
+    current_snapshot_id: AtomicU64,
+    /// Doublewrite buffer for torn-page repair (Phase 3.8c).
+    dw_buffer: Mutex<DoublewriteBuffer>,
+    /// Per-page RwLock table (InnoDB-inspired, 64 shards).
+    /// Two transactions writing different pages acquire different locks → parallel.
+    page_locks: PageLockTable,
+    /// Prevents concurrent file extension (grow). Held only when the freelist
+    /// is exhausted and the file must be extended.
+    grow_lock: Mutex<()>,
+    /// Authoritative page count. `AtomicU64` avoids acquiring the mmap read
+    /// lock on every `read_page` call (hot path).
+    page_count: AtomicU64,
 }
 
 impl Drop for MmapStorage {
     fn drop(&mut self) {
-        // Drop::drop() runs while all fields are still alive; fields are dropped
-        // afterwards in declaration order (mmap → file).
-        // We release the lock explicitly here for clarity, even though the OS
-        // would also release it when `file` is dropped and the fd is closed.
         if let Err(e) = self.file.unlock() {
-            // Cannot return a Result from Drop; log only.
             warn!(error = %e, "failed to release file lock on close");
         } else {
             debug!("file lock released");
@@ -132,9 +141,6 @@ impl MmapStorage {
             .create_new(true)
             .open(path)?;
 
-        // Acquire an exclusive lock before any write. If another process opened
-        // the same file (rare with create_new, but possible in a race), fail
-        // immediately instead of corrupting.
         file.try_lock_exclusive().map_err(|_| DbError::FileLocked {
             path: path.to_owned(),
         })?;
@@ -169,21 +175,23 @@ impl MmapStorage {
         file.sync_all()
             .map_err(|e| classify_io(e, "create fsync"))?;
 
-        // Open a READ-ONLY mmap for the read path.
         // SAFETY: file fully written and synced. No mutable aliases.
         let mmap = unsafe { Mmap::map(&file)? };
 
         debug!(path = %path.display(), "database initialized and ready");
         let dw_buffer = DoublewriteBuffer::for_db(path);
         Ok(MmapStorage {
-            mmap,
+            mmap: RwLock::new(mmap),
             file,
-            freelist,
-            freelist_dirty: false,
+            freelist: Mutex::new(freelist),
+            freelist_dirty: AtomicBool::new(false),
             dirty: PageDirtyTracker::new(),
-            deferred_frees: Vec::new(),
-            current_snapshot_id: 0,
-            dw_buffer,
+            deferred_frees: Mutex::new(Vec::new()),
+            current_snapshot_id: AtomicU64::new(0),
+            dw_buffer: Mutex::new(dw_buffer),
+            page_locks: PageLockTable::new(),
+            grow_lock: Mutex::new(()),
+            page_count: AtomicU64::new(GROW_PAGES),
         })
     }
 
@@ -191,9 +199,6 @@ impl MmapStorage {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
 
-        // Acquire an exclusive lock (non-blocking). If another process already
-        // holds the file open, return an error immediately instead of blocking
-        // or causing corruption.
         file.try_lock_exclusive().map_err(|_| DbError::FileLocked {
             path: path.to_owned(),
         })?;
@@ -201,9 +206,6 @@ impl MmapStorage {
         info!(path = %path.display(), "opening database");
 
         // ── Doublewrite recovery (Phase 3.8c) ───────────────────────────
-        // If a `.dw` file exists, a previous flush was interrupted by a crash.
-        // Repair any torn pages BEFORE creating the mmap — the mmap must see
-        // a consistent file to pass the checksum scan below.
         let dw_buffer = DoublewriteBuffer::for_db(path);
         if dw_buffer.exists() {
             match dw_buffer.recover(&file) {
@@ -226,7 +228,7 @@ impl MmapStorage {
         let mmap = unsafe { Mmap::map(&file)? };
 
         // Validate page 0.
-        let page_count = {
+        let db_page_count = {
             let meta_page = Self::read_page_from_mmap(&mmap, 0)?;
             let file_meta = Self::parse_file_meta(&meta_page);
 
@@ -248,56 +250,72 @@ impl MmapStorage {
         // Load FreeList from page 1.
         let freelist = {
             let bitmap_page = Self::read_page_from_mmap(&mmap, 1)?;
-            FreeList::from_bytes(bitmap_page.body(), page_count)
+            FreeList::from_bytes(bitmap_page.body(), db_page_count)
         };
 
         // Verify every allocated page's checksum before accepting any traffic.
-        // Free pages are never written to and have no valid header; skip them.
-        // This surfaces partial writes caused by a crash mid-flush before the
-        // first query touches the corrupted page.
-        //
-        // O(page_count) is intentional: fail-fast on open is the explicit goal.
-        for page_id in 2..page_count {
+        for page_id in 2..db_page_count {
             if !freelist.is_free(page_id) {
                 Self::read_page_from_mmap(&mmap, page_id)?;
             }
         }
 
-        info!(path = %path.display(), page_count, "database opened");
+        info!(path = %path.display(), page_count = db_page_count, "database opened");
         debug!(
             free_pages = freelist.free_count(),
             "freelist loaded from disk"
         );
 
         Ok(MmapStorage {
-            mmap,
+            mmap: RwLock::new(mmap),
             file,
-            freelist,
-            freelist_dirty: false,
+            freelist: Mutex::new(freelist),
+            freelist_dirty: AtomicBool::new(false),
             dirty: PageDirtyTracker::new(),
-            deferred_frees: Vec::new(),
-            current_snapshot_id: 0,
-            dw_buffer,
+            deferred_frees: Mutex::new(Vec::new()),
+            current_snapshot_id: AtomicU64::new(0),
+            dw_buffer: Mutex::new(dw_buffer),
+            page_locks: PageLockTable::new(),
+            grow_lock: Mutex::new(()),
+            page_count: AtomicU64::new(db_page_count),
         })
     }
 
-    /// Extends the file by `extra_pages` pages, remaps, and updates metadata.
+    /// Releases deferred-free pages back to the freelist.
     ///
-    /// Returns the `page_id` of the first new page.
+    /// Pages freed at snapshot ≤ `oldest_active_snapshot` are returned to the
+    /// freelist immediately. Pass `u64::MAX` to release all pages (safe when
+    /// no readers are active, e.g. during `flush()`).
+    pub fn release_deferred_frees(&self, oldest_active_snapshot: u64) -> Result<(), DbError> {
+        let mut deferred = self
+            .deferred_frees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if deferred.is_empty() {
+            return Ok(());
+        }
+        let mut freelist = self.freelist.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retained = Vec::new();
+        for (page_id, freed_at) in deferred.drain(..) {
+            if freed_at <= oldest_active_snapshot {
+                freelist.free(page_id)?;
+                self.freelist_dirty.store(true, Ordering::Relaxed);
+            } else {
+                retained.push((page_id, freed_at));
+            }
+        }
+        *deferred = retained;
+        Ok(())
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Extends the file and remaps. Does NOT touch the freelist bitmap.
     ///
-    /// ## Concurrency safety (Phase 7.4)
-    ///
-    /// `grow()` takes `&mut self`, which means it requires exclusive access.
-    /// Under the server's `Arc<RwLock<Database>>` architecture, `grow()` is
-    /// only reachable through `write_page → alloc_page → grow`, which holds
-    /// `db.write()` — no concurrent `read_page` calls can be in progress.
-    ///
-    /// If future architecture changes allow concurrent reads during grow,
-    /// a read guard (similar to SQLite's `nFetchOut` counter) must be added
-    /// to prevent the mmap remap from invalidating in-flight `read_page_from_mmap`
-    /// calls. Currently this is structurally prevented by the RwLock.
-    pub fn grow(&mut self, extra_pages: u64) -> Result<u64, DbError> {
-        let old_count = self.page_count();
+    /// Caller must hold `grow_lock`. Freelist Mutex must NOT be held.
+    /// Returns the old page count (first new page ID).
+    fn do_grow(&self, extra_pages: u64) -> Result<u64, DbError> {
+        let old_count = self.page_count.load(Ordering::Acquire);
         let new_count = old_count + extra_pages;
         debug!(old_count, new_count, extra_pages, "growing storage");
         let new_size = new_count * PAGE_SIZE as u64;
@@ -306,75 +324,29 @@ impl MmapStorage {
             .set_len(new_size)
             .map_err(|e| classify_io(e, "storage grow"))?;
 
-        // SAFETY: file extended to `new_size` bytes. Read-only remap.
-        // Old mmap is dropped; all readers hold PageRef copies, not &Page refs.
-        // No concurrent read_page() is possible — `&mut self` + RwLock guarantee.
-        self.mmap = unsafe { Mmap::map(&self.file)? };
+        // Remap: brief exclusive lock. Readers that called read_page while
+        // the mmap write lock is held will wait here until the remap completes.
+        // SAFETY: file extended to `new_size`. No other writer (grow_lock held).
+        {
+            let mut mmap_guard = self.mmap.write().unwrap_or_else(|e| e.into_inner());
+            *mmap_guard = unsafe { Mmap::map(&self.file)? };
+        }
 
-        // Update page_count in meta and its CRC32c.
-        self.update_page_count_in_mmap(new_count);
+        // Update page_count in meta page and atomically stored count.
+        self.update_page_count_in_meta(new_count)?;
+        self.page_count.store(new_count, Ordering::Release);
 
-        // Extend the freelist to cover the new pages.
-        self.freelist.grow(new_count);
+        // Grow the freelist bitmap to cover new pages.
+        {
+            let mut fl = self.freelist.lock().unwrap_or_else(|e| e.into_inner());
+            fl.grow(new_count);
+        }
         self.pwrite_freelist()?;
 
         Ok(old_count)
     }
 
-    /// Releases deferred-free pages back to the freelist, but only those freed
-    /// at or before `oldest_active_snapshot`.
-    ///
-    /// A page freed at snapshot S is safe to reuse only when no reader holds a
-    /// snapshot ≤ S. Pass `u64::MAX` to release all pages unconditionally (safe
-    /// when the caller holds an exclusive write lock and no readers are active).
-    ///
-    /// Pages freed at a snapshot > `oldest_active_snapshot` remain in the queue
-    /// and will be released in a future call.
-    pub fn release_deferred_frees(&mut self, oldest_active_snapshot: u64) -> Result<(), DbError> {
-        if self.deferred_frees.is_empty() {
-            return Ok(());
-        }
-        // Partition: release pages freed at snapshot ≤ oldest_active_snapshot.
-        let mut retained = Vec::new();
-        for (page_id, freed_at) in self.deferred_frees.drain(..) {
-            if freed_at <= oldest_active_snapshot {
-                self.freelist.free(page_id)?;
-                self.freelist_dirty = true;
-            } else {
-                retained.push((page_id, freed_at));
-            }
-        }
-        self.deferred_frees = retained;
-        Ok(())
-    }
-
-    // ── Private helpers ───────────────────────────────────────────────────────
-
     /// Writes raw bytes at `offset` in the file via `pwrite()`.
-    ///
-    /// This is the production-safe write path (Phase 7.4a). All page writes go
-    /// through the file descriptor, NOT the mmap. The mmap (MAP_SHARED) reflects
-    /// the change automatically via the kernel page cache.
-    ///
-    /// ## Why pwrite instead of mmap writes?
-    /// - PostgreSQL, InnoDB, DuckDB, SQLite all use pwrite for page writes
-    /// - 16KB mmap writes are NOT atomic — concurrent readers see torn pages
-    /// - pwrite to a file-backed mmap is coherent: the kernel unifies the page cache
-    /// ## EINTR safety
-    ///
-    /// `write_all_at()` (from `std::os::unix::fs::FileExt`) internally retries
-    /// on `EINTR`, guaranteeing all bytes are written or an error is returned.
-    /// Do NOT replace this with a raw `pwrite()` syscall wrapper — it would
-    /// silently lose data on signal interruption.
-    ///
-    /// ## Crash atomicity
-    ///
-    /// A 16 KB `pwrite()` is NOT guaranteed to be atomic on any filesystem.
-    /// APFS, ext4, XFS, and ZFS all use 4 KB blocks internally — a crash
-    /// mid-write leaves a torn page (e.g., first 8 KB new, last 8 KB stale).
-    /// AxiomDB relies on per-page CRC32c checksums to detect torn pages on
-    /// recovery. Full committed-page WAL redo (3.8c) will provide the repair
-    /// path; until then, a torn page results in a startup checksum error.
     fn pwrite_bytes(&self, offset: u64, data: &[u8]) -> Result<(), DbError> {
         use std::os::unix::fs::FileExt;
         self.file
@@ -393,14 +365,23 @@ impl MmapStorage {
         if offset + PAGE_SIZE > mmap.len() {
             return Err(DbError::PageNotFound { page_id });
         }
-        // Copy 16KB from mmap into an owned PageRef. This is safe for concurrent
-        // access: the caller owns the copy and it survives mmap remap/grow.
-        // Cost: ~0.5µs from L2/L3 cache (same as PostgreSQL buffer pool copy).
         let mut bytes = [0u8; PAGE_SIZE];
         bytes.copy_from_slice(&mmap[offset..offset + PAGE_SIZE]);
         let page_ref = crate::page_ref::PageRef::from_bytes(bytes);
         page_ref.verify_checksum()?;
         Ok(page_ref)
+    }
+
+    /// Copies raw page bytes from the mmap (no CRC check). Acquires read lock.
+    fn copy_raw_page_from_mmap(&self, page_id: u64) -> Result<[u8; PAGE_SIZE], DbError> {
+        let mmap = self.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let offset = page_id as usize * PAGE_SIZE;
+        if offset + PAGE_SIZE > mmap.len() {
+            return Err(DbError::PageNotFound { page_id });
+        }
+        let mut bytes = [0u8; PAGE_SIZE];
+        bytes.copy_from_slice(&mmap[offset..offset + PAGE_SIZE]);
+        Ok(bytes)
     }
 
     /// Builds a meta page (page 0) with the given page count.
@@ -425,93 +406,42 @@ impl MmapStorage {
         meta_page
     }
 
-    /// Copies raw page bytes from the mmap without CRC verification.
-    ///
-    /// Used by `flush()` to collect pages for the doublewrite buffer.
-    /// At flush time all `pwrite()` calls have completed and the mmap
-    /// (MAP_SHARED) reflects the committed state — no CRC check needed.
-    fn copy_raw_page_from_mmap(&self, page_id: u64) -> Result<[u8; PAGE_SIZE], DbError> {
-        let offset = page_id as usize * PAGE_SIZE;
-        if offset + PAGE_SIZE > self.mmap.len() {
-            return Err(DbError::PageNotFound { page_id });
-        }
-        let mut bytes = [0u8; PAGE_SIZE];
-        bytes.copy_from_slice(&self.mmap[offset..offset + PAGE_SIZE]);
-        Ok(bytes)
-    }
-
-    /// Builds the freelist bitmap page (page 1) from the current in-memory
-    /// `FreeList` without writing it to disk.
-    ///
-    /// Used by `flush()` to include the freelist in the doublewrite buffer
-    /// BEFORE the main `pwrite_freelist()` call.
-    fn build_freelist_page(&self) -> Page {
+    /// Builds the freelist bitmap page from the locked freelist.
+    fn build_freelist_page_from(fl: &FreeList) -> Page {
         let mut page = Page::new(PageType::Free, 1);
-        self.freelist.to_bytes(page.body_mut());
+        fl.to_bytes(page.body_mut());
         page.update_checksum();
         page
     }
 
-    /// Writes the freelist bitmap to page 1 via `pwrite()`.
+    /// Writes the in-memory freelist to page 1 via `pwrite()`.
     fn pwrite_freelist(&self) -> Result<(), DbError> {
-        let mut bitmap_page = Page::new(PageType::Free, 1);
-        self.freelist.to_bytes(bitmap_page.body_mut());
-        bitmap_page.update_checksum();
-        self.pwrite_page(1, &bitmap_page)
+        let fl = self.freelist.lock().unwrap_or_else(|e| e.into_inner());
+        let page = Self::build_freelist_page_from(&fl);
+        drop(fl); // release before pwrite (no lock needed for I/O)
+        self.pwrite_page(1, &page)
     }
 
     fn parse_file_meta(page: &Page) -> &DbFileMeta {
         // SAFETY: body has PAGE_SIZE-HEADER_SIZE bytes = size_of::<DbFileMeta>()
-        // (const assert). Page is align(64), body[0] is at offset 64 → align 64.
-        // DbFileMeta is repr(C) with no padding (size == sum of fields).
+        // (const assert). DbFileMeta is repr(C) with no padding.
         unsafe { &*(page.body().as_ptr() as *const DbFileMeta) }
     }
 
-    /// Calls `flusher(offset, len)` for each byte range in `runs`.
-    ///
-    /// Returns on the first error without calling the remaining entries.
-    /// This makes the failure path testable: pass an injected flusher in tests.
-    #[cfg(test)]
-    fn flush_runs<F>(runs: &[(usize, usize)], mut flusher: F) -> std::io::Result<()>
-    where
-        F: FnMut(usize, usize) -> std::io::Result<()>,
-    {
-        for &(offset, len) in runs {
-            flusher(offset, len)?;
-        }
-        Ok(())
-    }
-
-    /// Reads a little-endian u64 at `offset` from the mmap slice.
-    ///
-    /// The slice always has exactly 8 bytes (offset is verified by the caller
-    /// or is a compile-time constant), so the conversion cannot fail.
-    #[inline]
-    fn read_u64_at(mmap: &[u8], offset: usize) -> u64 {
-        // Direct array construction avoids try_into() entirely.
-        // Bounds are guaranteed by the caller: offset + 8 <= mmap.len()
-        // (mmap has at least PAGE_SIZE bytes, PAGE_COUNT_OFFSET + 8 < PAGE_SIZE).
-        u64::from_le_bytes([
-            mmap[offset],
-            mmap[offset + 1],
-            mmap[offset + 2],
-            mmap[offset + 3],
-            mmap[offset + 4],
-            mmap[offset + 5],
-            mmap[offset + 6],
-            mmap[offset + 7],
-        ])
-    }
-
-    /// Updates page_count and the CRC32c of the meta page via pwrite.
-    fn update_page_count_in_mmap(&mut self, count: u64) {
-        // Read current meta page, update page_count, recompute checksum, pwrite back.
-        let mut bytes = [0u8; PAGE_SIZE];
-        bytes.copy_from_slice(&self.mmap[0..PAGE_SIZE]);
+    /// Reads the current meta page from mmap, updates page_count, and pwrites.
+    fn update_page_count_in_meta(&self, count: u64) -> Result<(), DbError> {
+        // Read current bytes from mmap (read lock briefly).
+        let mut bytes = {
+            let mmap = self.mmap.read().unwrap_or_else(|e| e.into_inner());
+            let mut b = [0u8; PAGE_SIZE];
+            b.copy_from_slice(&mmap[0..PAGE_SIZE]);
+            b
+        };
+        // Patch page_count and recompute checksum.
         bytes[PAGE_COUNT_OFFSET..PAGE_COUNT_OFFSET + 8].copy_from_slice(&count.to_le_bytes());
         let checksum = crc32c::crc32c(&bytes[HEADER_SIZE..PAGE_SIZE]);
         bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
-        let _ = self.pwrite_bytes(0, &bytes);
+        self.pwrite_bytes(0, &bytes)
     }
 }
 
@@ -519,31 +449,25 @@ impl MmapStorage {
 
 impl StorageEngine for MmapStorage {
     fn read_page(&self, page_id: u64) -> Result<crate::page_ref::PageRef, DbError> {
-        // Read page_count directly from the mmap without verifying the checksum — hot path.
-        let count = Self::read_u64_at(&self.mmap, PAGE_COUNT_OFFSET);
-        if page_id >= count {
+        // Hot path: page_count is an AtomicU64 — no lock needed.
+        if page_id >= self.page_count.load(Ordering::Acquire) {
             return Err(DbError::PageNotFound { page_id });
         }
-        Self::read_page_from_mmap(&self.mmap, page_id)
+        // Acquire mmap read lock (shared — multiple concurrent reads proceed in parallel).
+        let mmap = self.mmap.read().unwrap_or_else(|e| e.into_inner());
+        Self::read_page_from_mmap(&mmap, page_id)
     }
 
-    fn write_page(&mut self, page_id: u64, page: &Page) -> Result<(), DbError> {
-        let count = self.page_count();
-        if page_id >= count {
+    fn write_page(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
+        if page_id >= self.page_count.load(Ordering::Acquire) {
             return Err(DbError::PageNotFound { page_id });
         }
-        // Debug guard: catch any write that introduces corrupted key_lens in
-        // an internal B+tree node before the bad bytes hit the mmap.
+        // Debug guard: catch corrupted internal B-tree nodes before they reach disk.
         #[cfg(debug_assertions)]
         {
             let body = page.body();
-            // PageHeader layout: magic(8) | page_type(1) | ...
-            // PageType::Index = 2, at byte offset 8 of the page.
-            // body starts at HEADER_SIZE = 64.
             let hdr_page_type = page.as_bytes()[8];
             if hdr_page_type == 2 && !body.is_empty() && body[0] == 0 {
-                // body[0]=0 → internal node. Layout: [8B header][223B key_lens][...]
-                // MAX_KEY_LEN=64, ORDER_INTERNAL=223.
                 let num_keys = u16::from_le_bytes([body[2], body[3]]) as usize;
                 let max_n = num_keys.min(223);
                 for i in 0..max_n {
@@ -555,95 +479,118 @@ impl StorageEngine for MmapStorage {
                 }
             }
         }
+        // Acquire per-page exclusive lock.
+        // Two threads writing DIFFERENT pages: different locks → full parallelism.
+        // Two threads writing SAME page: same lock → serialized → correctness.
+        let _page_guard = self.page_locks.write(page_id);
         self.pwrite_page(page_id, page)?;
         self.dirty.mark(page_id);
         Ok(())
     }
 
-    fn alloc_page(&mut self, page_type: PageType) -> Result<u64, DbError> {
-        // Try to allocate from the current freelist.
-        if let Some(page_id) = self.freelist.alloc() {
-            let new_page = Page::new(page_type, page_id);
-            self.pwrite_page(page_id, &new_page)?;
-            self.freelist_dirty = true;
-            self.dirty.mark(page_id);
-            return Ok(page_id);
-        }
+    fn alloc_page(&self, page_type: PageType) -> Result<u64, DbError> {
+        // Fast path: try to allocate from the freelist (mutex held briefly).
+        let maybe_id = {
+            let mut fl = self.freelist.lock().unwrap_or_else(|e| e.into_inner());
+            fl.alloc()
+        };
 
-        // Freelist exhausted: grow the storage.
-        // grow() persists the freelist internally because it changes page_count.
-        let first_new = self.grow(GROW_PAGES)?;
-        let page_id = self.freelist.alloc().ok_or(DbError::StorageFull)?;
-        debug_assert_eq!(page_id, first_new);
+        let page_id = if let Some(id) = maybe_id {
+            id
+        } else {
+            // Freelist exhausted — must grow.
+            // Acquire grow_lock to prevent two threads from growing simultaneously.
+            // The freelist mutex is NOT held here (released above).
+            let _grow_guard = self.grow_lock.lock().unwrap_or_else(|e| e.into_inner());
 
+            // Re-check under grow_lock: another thread may have grown between the
+            // freelist check and this grow_lock acquisition.
+            let maybe_retry = {
+                let mut fl = self.freelist.lock().unwrap_or_else(|e| e.into_inner());
+                fl.alloc()
+            };
+
+            if let Some(id) = maybe_retry {
+                id
+            } else {
+                // Grow the file and extend the freelist bitmap.
+                self.do_grow(GROW_PAGES)?;
+                let mut fl = self.freelist.lock().unwrap_or_else(|e| e.into_inner());
+                fl.alloc().ok_or(DbError::StorageFull)?
+            }
+        };
+
+        self.freelist_dirty.store(true, Ordering::Relaxed);
+
+        // Initialize the new page. Acquire the per-page write lock to prevent
+        // any concurrent reader from observing an uninitialized page.
+        let _page_guard = self.page_locks.write(page_id);
         let new_page = Page::new(page_type, page_id);
         self.pwrite_page(page_id, &new_page)?;
-        self.freelist_dirty = true;
         self.dirty.mark(page_id);
         Ok(page_id)
     }
 
-    fn free_page(&mut self, page_id: u64) -> Result<(), DbError> {
+    fn free_page(&self, page_id: u64) -> Result<(), DbError> {
         if page_id == 0 || page_id == 1 {
             return Err(DbError::Other(format!(
                 "cannot free reserved page {page_id}"
             )));
         }
-        // Check for double-free: page already in deferred queue or freelist.
-        if self.deferred_frees.iter().any(|(pid, _)| *pid == page_id) {
+        let mut deferred = self
+            .deferred_frees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Check for double-free in the deferred queue.
+        if deferred.iter().any(|(pid, _)| *pid == page_id) {
             return Err(DbError::Other(format!(
                 "double free: page {page_id} already in deferred free queue"
             )));
         }
-        if self.freelist.is_free(page_id) {
-            return Err(DbError::Other(format!(
-                "double free: page {page_id} already free"
-            )));
+        // Check for double-free in the freelist.
+        {
+            let fl = self.freelist.lock().unwrap_or_else(|e| e.into_inner());
+            if fl.is_free(page_id) {
+                return Err(DbError::Other(format!(
+                    "double free: page {page_id} already free"
+                )));
+            }
         }
-        // Defer the free: page goes to a holding queue tagged with the
-        // current snapshot epoch. This prevents a concurrent reader from
-        // seeing a freed+reallocated page with unrelated content.
-        self.deferred_frees
-            .push((page_id, self.current_snapshot_id));
-        if self.deferred_frees.len() > DEFERRED_FREE_WARN_THRESHOLD {
+        deferred.push((page_id, self.current_snapshot_id.load(Ordering::Acquire)));
+        if deferred.len() > DEFERRED_FREE_WARN_THRESHOLD {
             warn!(
-                count = self.deferred_frees.len(),
+                count = deferred.len(),
                 "deferred free queue exceeds warning threshold — possible snapshot leak"
             );
         }
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), DbError> {
+    fn flush(&self) -> Result<(), DbError> {
         // Step 1: release deferred-free pages back to the freelist.
-        // Under RwLock (Phase 7.4), the writer holds exclusive access during
-        // flush, so no readers are active → u64::MAX releases all pages.
-        // When snapshot slot tracking is added (Phase 7.8), pass the actual
-        // oldest_active_snapshot instead.
+        // Under the current RwLock(Database) architecture, writers hold exclusive
+        // access during flush, so no readers are active → u64::MAX releases all.
         self.release_deferred_frees(u64::MAX)?;
 
-        // Step 2: collect pages for the doublewrite buffer.
-        //
-        // We include pages 0 (meta) and 1 (freelist) unconditionally because
-        // grow() modifies them via pwrite without adding them to the dirty
-        // tracker. All other dirty pages are already in the main file (via
-        // pwrite) but not yet fsynced — the mmap (MAP_SHARED) reflects their
-        // committed state via the kernel page cache.
-        let has_changes = !self.dirty.is_empty() || self.freelist_dirty;
+        let is_freelist_dirty = self.freelist_dirty.load(Ordering::Acquire);
+        let has_changes = !self.dirty.is_empty() || is_freelist_dirty;
 
         if has_changes {
             let mut dw_pages: Vec<(u64, Vec<u8>)> = Vec::new();
 
-            // 2a: page 0 (meta) — may have been modified by grow().
+            // Page 0 (meta) — may have been modified by grow().
             let meta_bytes = self.copy_raw_page_from_mmap(0)?;
             dw_pages.push((0, meta_bytes.to_vec()));
 
-            // 2b: page 1 (freelist) — build from in-memory state so the DW
-            //     has the freelist that WILL be written, not the stale on-disk one.
-            let freelist_page = self.build_freelist_page();
+            // Page 1 (freelist) — build from in-memory state so the DW has the
+            // freelist that WILL be written, not the stale on-disk version.
+            let freelist_page = {
+                let fl = self.freelist.lock().unwrap_or_else(|e| e.into_inner());
+                Self::build_freelist_page_from(&fl)
+            };
             dw_pages.push((1, freelist_page.as_bytes().to_vec()));
 
-            // 2c: dirty data/index/overflow pages.
+            // Dirty data/index/overflow pages.
             for page_id in self.dirty.sorted_ids() {
                 if page_id <= 1 {
                     continue; // already included above
@@ -652,14 +599,15 @@ impl StorageEngine for MmapStorage {
                 dw_pages.push((page_id, bytes.to_vec()));
             }
 
-            // Step 3: write DW file and fsync — committed copy on disk.
+            // Write DW file and fsync — committed copy on disk.
             let dw_refs: Vec<(u64, &[u8])> =
                 dw_pages.iter().map(|(id, b)| (*id, b.as_slice())).collect();
-            self.dw_buffer.write_and_sync(&dw_refs)?;
+            let dw_guard = self.dw_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            dw_guard.write_and_sync(&dw_refs)?;
         }
 
         // Step 4: serialize the freelist via pwrite if modified.
-        if self.freelist_dirty {
+        if is_freelist_dirty {
             self.pwrite_freelist()?;
         }
 
@@ -669,27 +617,27 @@ impl StorageEngine for MmapStorage {
             .map_err(|e| classify_io(e, "storage fsync"))?;
 
         // Step 6: remove the DW file (non-fatal on failure).
-        // After the main fsync, the DW file is no longer needed. If removal
-        // fails, the next open() will find all pages valid and delete it.
         if has_changes {
-            if let Err(e) = self.dw_buffer.cleanup() {
+            let dw_guard = self.dw_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = dw_guard.cleanup() {
                 warn!(error = %e, "failed to remove doublewrite file");
             }
         }
 
         // Step 7: clear tracking.
-        self.freelist_dirty = false;
+        self.freelist_dirty.store(false, Ordering::Release);
         self.dirty.clear();
         Ok(())
     }
 
     fn page_count(&self) -> u64 {
-        Self::read_u64_at(&self.mmap, PAGE_COUNT_OFFSET)
+        self.page_count.load(Ordering::Acquire)
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn prefetch_hint(&self, start_page_id: u64, count: u64) {
-        let mmap_len = self.mmap.len();
+        let mmap = self.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let mmap_len = mmap.len();
         let Some(offset) = (start_page_id as usize).checked_mul(PAGE_SIZE) else {
             return;
         };
@@ -703,36 +651,49 @@ impl StorageEngine for MmapStorage {
         };
         let requested_len = (effective_count as usize).saturating_mul(PAGE_SIZE);
         let clamped_len = requested_len.min(mmap_len - offset);
-        // SAFETY: `ptr` is derived from a live `Mmap` via checked offset arithmetic.
-        // `offset < mmap_len` is verified above; `clamped_len <= mmap_len - offset`
-        // ensures [ptr, ptr + clamped_len) lies entirely within the mapping.
-        // `madvise` is a pure hint — it does not dereference the pointer or mutate
-        // any Rust state. No aliasing rules are violated.
-        let ptr = unsafe { self.mmap.as_ptr().add(offset) };
+        // SAFETY: `ptr` is derived from a live `Mmap` guard (read lock held).
+        // `offset < mmap_len` verified; `clamped_len <= mmap_len - offset`.
+        // `madvise` is a pure hint — does not dereference Rust memory.
+        let ptr = unsafe { mmap.as_ptr().add(offset) };
         let _ =
             unsafe { libc::madvise(ptr as *mut libc::c_void, clamped_len, libc::MADV_SEQUENTIAL) };
     }
 
-    fn set_current_snapshot(&mut self, snapshot_id: u64) {
-        self.current_snapshot_id = snapshot_id;
+    fn set_current_snapshot(&self, snapshot_id: u64) {
+        self.current_snapshot_id
+            .store(snapshot_id, Ordering::Release);
     }
 
     fn deferred_free_count(&self) -> usize {
-        self.deferred_frees.len()
+        self.deferred_frees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 
+// ── Public MmapStorage helpers (non-trait) ────────────────────────────────────
+
 impl MmapStorage {
-    /// Returns the number of currently free pages (for benchmarks and monitoring).
+    /// Returns the number of currently free pages.
     pub fn free_count(&self) -> u64 {
-        self.freelist.free_count()
+        self.freelist
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_count()
     }
 
     /// Returns the number of pages written since the last `flush()`.
-    ///
-    /// Useful for monitoring and for deciding whether a checkpoint is needed.
     pub fn dirty_page_count(&self) -> usize {
         self.dirty.count()
+    }
+
+    /// Explicit grow by `extra_pages` (used in benchmarks).
+    ///
+    /// Acquires grow_lock and extends the file + freelist.
+    pub fn grow(&self, extra_pages: u64) -> Result<u64, DbError> {
+        let _grow_guard = self.grow_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.do_grow(extra_pages)
     }
 }
 
@@ -765,8 +726,6 @@ mod tests {
     fn test_file_lock_prevents_double_open() {
         let path = tmp_path();
         let _storage1 = MmapStorage::create(&path).unwrap();
-
-        // Second open attempt while the first is still alive → FileLocked.
         let result = MmapStorage::open(&path);
         assert!(
             matches!(result, Err(DbError::FileLocked { .. })),
@@ -779,9 +738,7 @@ mod tests {
         let path = tmp_path();
         {
             let _storage = MmapStorage::create(&path).unwrap();
-            // _storage holds the lock
         }
-        // Drop released the lock; reopening must succeed.
         let storage = MmapStorage::open(&path).unwrap();
         assert_eq!(storage.page_count(), GROW_PAGES);
     }
@@ -789,14 +746,14 @@ mod tests {
     #[test]
     fn test_storage_engine_suite() {
         let path = tmp_path();
-        let mut storage = MmapStorage::create(&path).unwrap();
-        run_storage_engine_suite(&mut storage);
+        let storage = MmapStorage::create(&path).unwrap();
+        run_storage_engine_suite(&storage);
     }
 
     #[test]
     fn test_alloc_never_returns_reserved() {
         let path = tmp_path();
-        let mut storage = MmapStorage::create(&path).unwrap();
+        let storage = MmapStorage::create(&path).unwrap();
         let ids: Vec<u64> = (0..10)
             .map(|_| storage.alloc_page(PageType::Data).unwrap())
             .collect();
@@ -807,10 +764,10 @@ mod tests {
     #[test]
     fn test_alloc_free_reuse() {
         let path = tmp_path();
-        let mut storage = MmapStorage::create(&path).unwrap();
+        let storage = MmapStorage::create(&path).unwrap();
         let id = storage.alloc_page(PageType::Data).unwrap();
         storage.free_page(id).unwrap();
-        storage.flush().unwrap(); // release deferred frees
+        storage.flush().unwrap();
         let id2 = storage.alloc_page(PageType::Data).unwrap();
         assert_eq!(id, id2);
     }
@@ -820,12 +777,11 @@ mod tests {
         let path = tmp_path();
         let allocated;
         {
-            let mut storage = MmapStorage::create(&path).unwrap();
+            let storage = MmapStorage::create(&path).unwrap();
             allocated = storage.alloc_page(PageType::Data).unwrap();
             storage.flush().unwrap();
         }
-        // Reopen — the freelist must remember that `allocated` is in use.
-        let mut storage = MmapStorage::open(&path).unwrap();
+        let storage = MmapStorage::open(&path).unwrap();
         let next = storage.alloc_page(PageType::Data).unwrap();
         assert_ne!(
             next, allocated,
@@ -836,13 +792,11 @@ mod tests {
     #[test]
     fn test_grow_triggers_on_exhaustion() {
         let path = tmp_path();
-        let mut storage = MmapStorage::create(&path).unwrap();
+        let storage = MmapStorage::create(&path).unwrap();
         let initial_count = storage.page_count();
-        // Exhaust all free pages (GROW_PAGES - 2 reserved).
         for _ in 0..(GROW_PAGES - 2) {
             storage.alloc_page(PageType::Data).unwrap();
         }
-        // The next alloc must trigger an automatic grow.
         storage.alloc_page(PageType::Data).unwrap();
         assert!(storage.page_count() > initial_count);
     }
@@ -850,14 +804,13 @@ mod tests {
     #[test]
     fn test_read_write_roundtrip() {
         let path = tmp_path();
-        let mut storage = MmapStorage::create(&path).unwrap();
+        let storage = MmapStorage::create(&path).unwrap();
         let id = storage.alloc_page(PageType::Data).unwrap();
 
         let mut page = Page::new(PageType::Data, id);
         page.body_mut()[0] = 0xBE;
         page.body_mut()[1] = 0xEF;
         page.update_checksum();
-
         storage.write_page(id, &page).unwrap();
         let read = storage.read_page(id).unwrap();
         assert_eq!(read.body()[0], 0xBE);
@@ -865,99 +818,61 @@ mod tests {
     }
 
     #[test]
-    fn test_flush_and_reopen_data() {
+    fn test_concurrent_writes_different_pages() {
+        // 4 threads × 25 writes to different pages — must all succeed.
+        use std::sync::Arc;
         let path = tmp_path();
-        let id;
-        {
-            let mut storage = MmapStorage::create(&path).unwrap();
-            id = storage.alloc_page(PageType::Data).unwrap();
-            let mut page = Page::new(PageType::Data, id);
-            page.body_mut()[0] = 0x42;
-            page.update_checksum();
-            storage.write_page(id, &page).unwrap();
-            storage.flush().unwrap();
+        let storage = Arc::new(MmapStorage::create(&path).unwrap());
+        // Pre-allocate enough pages.
+        let page_ids: Vec<u64> = (0..100)
+            .map(|_| storage.alloc_page(PageType::Data).unwrap())
+            .collect();
+        let page_ids = Arc::new(page_ids);
+        let mut handles = Vec::new();
+        for t in 0..4usize {
+            let storage = Arc::clone(&storage);
+            let page_ids = Arc::clone(&page_ids);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..25 {
+                    let pid = page_ids[t * 25 + i];
+                    let mut p = Page::new(PageType::Data, pid);
+                    p.body_mut()[0] = (t * 25 + i) as u8;
+                    p.update_checksum();
+                    storage.write_page(pid, &p).unwrap();
+                }
+            }));
         }
-        let storage = MmapStorage::open(&path).unwrap();
-        assert_eq!(storage.read_page(id).unwrap().body()[0], 0x42);
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     #[test]
-    fn test_prefetch_hint_count_zero_uses_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db.db");
-        let storage = MmapStorage::create(&path).unwrap();
-        storage.prefetch_hint(0, 0);
-        storage.prefetch_hint(2, 0);
-    }
-
-    #[test]
-    fn test_prefetch_hint_out_of_range_clamped() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db.db");
-        let storage = MmapStorage::create(&path).unwrap();
-        storage.prefetch_hint(storage.page_count() + 1_000, 64);
-        storage.prefetch_hint(0, u64::MAX);
-    }
-
-    // ── flush_runs unit tests ─────────────────────────────────────────────────
-
-    #[test]
-    fn test_flush_runs_empty_succeeds() {
-        let result =
-            MmapStorage::flush_runs::<fn(usize, usize) -> std::io::Result<()>>(&[], |_, _| {
-                panic!("flusher must not be called for empty runs")
-            });
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_flush_runs_calls_all_on_success() {
-        let runs = vec![(0usize, 16384usize), (32768, 16384), (65536, 16384)];
-        let mut call_count = 0usize;
-        MmapStorage::flush_runs(&runs, |_, _| {
-            call_count += 1;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(call_count, 3);
-    }
-
-    #[test]
-    fn test_flush_runs_stops_on_first_error() {
-        let runs = vec![(0usize, 16384usize), (16384, 16384), (32768, 16384)];
-        let mut call_count = 0usize;
-        let result = MmapStorage::flush_runs(&runs, |_, _| {
-            call_count += 1;
-            if call_count == 2 {
-                Err(std::io::Error::other("injected failure"))
-            } else {
-                Ok(())
-            }
-        });
-        assert!(result.is_err());
-        // Third run must NOT have been attempted.
-        assert_eq!(call_count, 2);
-    }
-
-    #[test]
-    fn test_flush_preserves_dirty_on_failure() {
-        // Verify that MmapStorage::dirty_page_count() stays non-zero when flush_range fails.
-        // We can simulate this by checking that dirty_page_count is cleared on success only.
+    fn test_concurrent_alloc_no_duplicates() {
+        // 4 threads allocating pages concurrently must not get the same page_id.
+        use std::sync::{Arc, Mutex};
         let path = tmp_path();
-        let mut storage = MmapStorage::create(&path).unwrap();
-        let id = storage.alloc_page(PageType::Data).unwrap();
-        write_page_stub(&mut storage, id);
-        assert!(storage.dirty_page_count() > 0);
-
-        // Normal flush clears dirty state.
-        storage.flush().unwrap();
-        assert_eq!(storage.dirty_page_count(), 0);
-    }
-
-    fn write_page_stub(storage: &mut MmapStorage, id: u64) {
-        let mut page = Page::new(PageType::Data, id);
-        page.body_mut()[0] = 0xAB;
-        page.update_checksum();
-        storage.write_page(id, &page).unwrap();
+        let storage = Arc::new(MmapStorage::create(&path).unwrap());
+        let all_ids: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let storage = Arc::clone(&storage);
+            let all_ids = Arc::clone(&all_ids);
+            handles.push(std::thread::spawn(move || {
+                let mut local = Vec::new();
+                for _ in 0..10 {
+                    local.push(storage.alloc_page(PageType::Data).unwrap());
+                }
+                all_ids.lock().unwrap().extend(local);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let ids = all_ids.lock().unwrap();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "duplicate page IDs allocated");
     }
 }

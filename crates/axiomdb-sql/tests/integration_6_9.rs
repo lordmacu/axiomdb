@@ -78,23 +78,16 @@ macro_rules! setup {
 
 #[test]
 fn test_pk_btree_populated_on_insert() {
+    // Tables with PRIMARY KEY are clustered: the PK "index" root IS the
+    // clustered B-tree root (ClusteredLeaf/ClusteredInternal pages), not a
+    // standard B-Tree. Verify the row is present via a full clustered scan.
     let mut db = Db::new();
     setup!(db, "CREATE TABLE t (id INT PRIMARY KEY, x TEXT)");
     db.ok("INSERT INTO t VALUES (1, 'a')");
 
-    // Verify PK index exists and has a non-empty root.
-    let snap = db.snap();
-    let mut reader = axiomdb_catalog::CatalogReader::new(&db.storage, snap).unwrap();
-    let t = reader.get_table("public", "t").unwrap().unwrap();
-    let indexes = reader.list_indexes(t.id).unwrap();
-    let pk = indexes.iter().find(|i| i.is_primary).unwrap();
-    // Can do a B-Tree lookup on the PK root — should find key=1.
-    let key = axiomdb_sql::key_encoding::encode_index_key(&[Value::Int(1)]).unwrap();
-    let result = axiomdb_index::BTree::lookup_in(&db.storage, pk.root_page_id, &key).unwrap();
-    assert!(
-        result.is_some(),
-        "PK B-Tree must contain key=1 after INSERT"
-    );
+    let rows = db.rows("SELECT id, x FROM t WHERE id = 1");
+    assert_eq!(rows.len(), 1, "PK lookup must return exactly one row");
+    assert_eq!(rows[0][0], Value::Int(1));
 }
 
 #[test]
@@ -132,11 +125,16 @@ fn test_fk_parent_lookup_uses_btree_not_scan() {
 
 #[test]
 fn test_fk_auto_index_created_with_is_fk_index_flag() {
+    // FK auto-index is only created for heap child tables.
+    // Clustered child tables (those with a PRIMARY KEY) use fk_index_id=0 and
+    // fall back to a full scan for FK enforcement because the composite
+    // heap-RID key encoding is incompatible with the clustered layout.
     let mut db = Db::new();
     setup!(
         db,
         "CREATE TABLE users (id INT PRIMARY KEY)",
-        "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT REFERENCES users(id))"
+        // orders has no PK → heap table → FK auto-index IS created
+        "CREATE TABLE orders (id INT, user_id INT REFERENCES users(id))"
     );
     let snap = db.snap();
     let mut reader = axiomdb_catalog::CatalogReader::new(&db.storage, snap).unwrap();
@@ -146,7 +144,7 @@ fn test_fk_auto_index_created_with_is_fk_index_flag() {
     let fk = &fks[0];
     assert_ne!(
         fk.fk_index_id, 0,
-        "FK auto-index must be created (non-zero id)"
+        "FK auto-index must be created for heap child tables (non-zero id)"
     );
 
     let indexes = reader.list_indexes(orders.id).unwrap();
