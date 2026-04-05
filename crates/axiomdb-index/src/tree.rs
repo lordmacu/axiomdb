@@ -99,7 +99,7 @@ pub struct BTree {
 impl BTree {
     /// Creates or reopens a B+ Tree.
     pub fn new(
-        mut storage: Box<dyn StorageEngine>,
+        storage: Box<dyn StorageEngine>,
         root_page_id: Option<u64>,
     ) -> Result<Self, DbError> {
         let root_pid = match root_page_id {
@@ -597,15 +597,16 @@ impl BTree {
             });
         }
 
-        // Structural path: leaf will underflow — allocate a replacement page so
-        // the rebalance path (`rotate_left`, `rotate_right`, `merge_children`)
-        // can produce a new page ID that the parent can update.
-        let new_pid = storage.alloc_page(PageType::Index)?;
-        let mut p = Page::new(PageType::Index, new_pid);
-        *cast_leaf_mut(&mut p) = node;
-        p.update_checksum();
-        storage.write_page(new_pid, &p)?;
-        storage.free_page(old_pid)?;
+        // Structural path: leaf will underflow — write back in-place (same page
+        // ID) so the predecessor leaf's next_leaf pointer remains valid.
+        //
+        // The old CoW approach allocated a new page and freed the old one, which
+        // silently broke the predecessor → old_pid → ... chain; rotate/merge
+        // would then create more new IDs for the involved leaves, making the
+        // broken chain permanent.  Using write_leaf_same_pid here (and doing the
+        // same in rotate_right/rotate_left/merge_children for leaf nodes) keeps
+        // the next_leaf chain intact without any predecessor fixup pass.
+        let new_pid = Self::write_leaf_same_pid(storage, old_pid, node)?;
 
         Ok(DeleteResult::Deleted {
             new_pid,
@@ -693,10 +694,12 @@ impl BTree {
         is_leaf: bool,
     ) -> Result<u64, DbError> {
         let np = storage.alloc_page(PageType::Index)?;
-        let nc = storage.alloc_page(PageType::Index)?;
-        let nl = storage.alloc_page(PageType::Index)?;
 
         if is_leaf {
+            // In-place leaf rotation: reuse left_pid and child_pid so the
+            // predecessor's next_leaf pointer (→ left_pid) stays valid.
+            // left.next_leaf = child_pid is unchanged — still correct after
+            // moving the last key of left into child.
             let mut left = match NodeCopy::read(storage, left_pid)? {
                 NodeCopy::Leaf(n) => n,
                 NodeCopy::Internal(_) => unreachable!(),
@@ -718,18 +721,21 @@ impl BTree {
 
             parent.key_lens[child_idx - 1] = child.key_lens[0];
             parent.keys[child_idx - 1] = child.keys[0];
-            parent.set_child_at(child_idx - 1, nl);
-            parent.set_child_at(child_idx, nc);
+            parent.set_child_at(child_idx - 1, left_pid);
+            parent.set_child_at(child_idx, child_pid);
 
-            let mut lp = Page::new(PageType::Index, nl);
+            let mut lp = Page::new(PageType::Index, left_pid);
             *cast_leaf_mut(&mut lp) = left;
             lp.update_checksum();
-            storage.write_page(nl, &lp)?;
-            let mut cp = Page::new(PageType::Index, nc);
+            storage.write_page(left_pid, &lp)?;
+            let mut cp = Page::new(PageType::Index, child_pid);
             *cast_leaf_mut(&mut cp) = child;
             cp.update_checksum();
-            storage.write_page(nc, &cp)?;
+            storage.write_page(child_pid, &cp)?;
+            // Do NOT free left_pid or child_pid — they are still live leaves.
         } else {
+            let nc = storage.alloc_page(PageType::Index)?;
+            let nl = storage.alloc_page(PageType::Index)?;
             let mut left = match NodeCopy::read(storage, left_pid)? {
                 NodeCopy::Internal(n) => n,
                 NodeCopy::Leaf(_) => unreachable!(),
@@ -780,6 +786,9 @@ impl BTree {
             *cast_internal_mut(&mut cp) = child;
             cp.update_checksum();
             storage.write_page(nc, &cp)?;
+            // CoW: old internal node pages are superseded.
+            storage.free_page(child_pid)?;
+            storage.free_page(left_pid)?;
         }
 
         #[cfg(debug_assertions)]
@@ -790,8 +799,6 @@ impl BTree {
         storage.write_page(np, &pp)?;
 
         storage.free_page(parent_pid)?;
-        storage.free_page(child_pid)?;
-        storage.free_page(left_pid)?;
         Ok(np)
     }
 
@@ -805,10 +812,12 @@ impl BTree {
         is_leaf: bool,
     ) -> Result<u64, DbError> {
         let np = storage.alloc_page(PageType::Index)?;
-        let nc = storage.alloc_page(PageType::Index)?;
-        let nr = storage.alloc_page(PageType::Index)?;
 
         if is_leaf {
+            // In-place leaf rotation: reuse child_pid and right_pid so
+            // next_leaf pointers remain valid.
+            // child.next_leaf = right_pid is unchanged — still correct after
+            // appending right's first key to child.
             let mut child = match NodeCopy::read(storage, child_pid)? {
                 NodeCopy::Leaf(n) => n,
                 NodeCopy::Internal(_) => unreachable!(),
@@ -829,18 +838,21 @@ impl BTree {
 
             parent.key_lens[child_idx] = right.key_lens[0];
             parent.keys[child_idx] = right.keys[0];
-            parent.set_child_at(child_idx, nc);
-            parent.set_child_at(child_idx + 1, nr);
+            parent.set_child_at(child_idx, child_pid);
+            parent.set_child_at(child_idx + 1, right_pid);
 
-            let mut cp = Page::new(PageType::Index, nc);
+            let mut cp = Page::new(PageType::Index, child_pid);
             *cast_leaf_mut(&mut cp) = child;
             cp.update_checksum();
-            storage.write_page(nc, &cp)?;
-            let mut rp = Page::new(PageType::Index, nr);
+            storage.write_page(child_pid, &cp)?;
+            let mut rp = Page::new(PageType::Index, right_pid);
             *cast_leaf_mut(&mut rp) = right;
             rp.update_checksum();
-            storage.write_page(nr, &rp)?;
+            storage.write_page(right_pid, &rp)?;
+            // Do NOT free child_pid or right_pid — they are still live leaves.
         } else {
+            let nc = storage.alloc_page(PageType::Index)?;
+            let nr = storage.alloc_page(PageType::Index)?;
             let mut child = match NodeCopy::read(storage, child_pid)? {
                 NodeCopy::Internal(n) => n,
                 NodeCopy::Leaf(_) => unreachable!(),
@@ -873,6 +885,9 @@ impl BTree {
             *cast_internal_mut(&mut rp) = right;
             rp.update_checksum();
             storage.write_page(nr, &rp)?;
+            // CoW: old internal node pages are superseded.
+            storage.free_page(child_pid)?;
+            storage.free_page(right_pid)?;
         }
 
         #[cfg(debug_assertions)]
@@ -883,8 +898,6 @@ impl BTree {
         storage.write_page(np, &pp)?;
 
         storage.free_page(parent_pid)?;
-        storage.free_page(child_pid)?;
-        storage.free_page(right_pid)?;
         Ok(np)
     }
 
@@ -897,10 +910,13 @@ impl BTree {
         right_pid: u64,
         is_leaf: bool,
     ) -> Result<u64, DbError> {
-        let mp = storage.alloc_page(PageType::Index)?;
         let npp = storage.alloc_page(PageType::Index)?;
 
-        if is_leaf {
+        // `merged_pid` is the page ID that will hold the merged node.
+        // For leaves we reuse `left_pid` in-place so the predecessor's
+        // next_leaf pointer (→ left_pid) remains valid — no fixup needed.
+        // For internal nodes we allocate a fresh page (CoW).
+        let merged_pid = if is_leaf {
             let left = match NodeCopy::read(storage, left_pid)? {
                 NodeCopy::Leaf(n) => n,
                 NodeCopy::Internal(_) => unreachable!(),
@@ -918,11 +934,14 @@ impl BTree {
             merged.set_num_keys(ln + rn);
             merged.set_next_leaf(right.next_leaf_val());
 
-            let mut pg = Page::new(PageType::Index, mp);
+            let mut pg = Page::new(PageType::Index, left_pid);
             *cast_leaf_mut(&mut pg) = merged;
             pg.update_checksum();
-            storage.write_page(mp, &pg)?;
+            storage.write_page(left_pid, &pg)?;
+            // right_pid is freed below; left_pid stays live.
+            left_pid
         } else {
+            let mp = storage.alloc_page(PageType::Index)?;
             let left = match NodeCopy::read(storage, left_pid)? {
                 NodeCopy::Internal(n) => n,
                 NodeCopy::Leaf(_) => unreachable!(),
@@ -949,9 +968,11 @@ impl BTree {
             *cast_internal_mut(&mut pg) = merged;
             pg.update_checksum();
             storage.write_page(mp, &pg)?;
-        }
+            storage.free_page(left_pid)?;
+            mp
+        };
 
-        parent.set_child_at(sep_idx, mp);
+        parent.set_child_at(sep_idx, merged_pid);
         parent.remove_at(sep_idx, sep_idx + 1);
 
         #[cfg(debug_assertions)]
@@ -962,7 +983,6 @@ impl BTree {
         storage.write_page(npp, &pp)?;
 
         storage.free_page(parent_pid)?;
-        storage.free_page(left_pid)?;
         storage.free_page(right_pid)?;
         Ok(npp)
     }
@@ -1347,8 +1367,12 @@ impl BTree {
             }
         }
 
-        // Write the last (possibly partial) leaf. next_leaf = NULL_PAGE (0).
+        // Write the last (possibly partial) leaf with next_leaf = NULL_PAGE.
+        // NULL_PAGE = u64::MAX, NOT 0 — LeafNodePage::zeroed() initialises
+        // next_leaf to 0, so we must set it explicitly to avoid the range
+        // iterator following page 0 (the meta page) as if it were a real leaf.
         {
+            cur_leaf.set_next_leaf(NULL_PAGE);
             let mut page = Page::new(PageType::Index, cur_pid);
             *cast_leaf_mut(&mut page) = cur_leaf;
             page.update_checksum();

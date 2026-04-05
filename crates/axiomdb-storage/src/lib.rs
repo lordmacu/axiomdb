@@ -16,6 +16,7 @@ pub mod memory;
 pub mod meta;
 pub mod mmap;
 pub mod page;
+pub mod page_lock;
 pub mod page_ref;
 pub mod zone_map;
 

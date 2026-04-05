@@ -25,14 +25,24 @@
 //! to know children exist. For CASCADE / SET NULL, a full table scan is used
 //! to guarantee ALL matching children are found.
 
-use axiomdb_catalog::{schema::FkAction, CatalogReader, CatalogWriter, FkDef};
-use axiomdb_core::{error::DbError, RecordId};
-use axiomdb_index::BTree;
-use axiomdb_storage::{heap_chain::HeapChain, StorageEngine};
-use axiomdb_types::Value;
-use axiomdb_wal::TxnManager;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{bloom::BloomRegistry, key_encoding::encode_index_key, table::TableEngine};
+/// `(pk_key_bytes, decoded_row)` pair returned by clustered-child scan helpers.
+type PkRowPair = (Vec<u8>, Vec<Value>);
+
+use axiomdb_catalog::{schema::FkAction, schema::IndexDef, CatalogReader, CatalogWriter, FkDef};
+use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
+use axiomdb_index::BTree;
+use axiomdb_storage::{heap::RowHeader, heap_chain::HeapChain, StorageEngine};
+use axiomdb_types::{codec::encode_row, Value};
+use axiomdb_wal::{ClusteredRowImage, TxnManager};
+
+use crate::{
+    bloom::BloomRegistry,
+    clustered_secondary::ClusteredSecondaryLayout,
+    key_encoding::encode_index_key,
+    table::{column_data_types, TableEngine},
+};
 
 /// Maximum ON DELETE CASCADE recursion depth.
 /// Matches InnoDB's `FK_MAX_CASCADE_DEL`. Prevents infinite loops in circular graphs.
@@ -221,9 +231,6 @@ pub fn enforce_fk_on_parent_delete(
                     table_id: fk.child_table_id,
                 })?
         };
-        child_table_def.ensure_heap_runtime(
-            "foreign key enforcement on clustered child table — Phase 39.17+",
-        )?;
         let child_cols = {
             let mut reader = CatalogReader::new(storage, snap)?;
             reader.list_columns(fk.child_table_id)?
@@ -308,102 +315,151 @@ pub fn enforce_fk_on_parent_delete(
                 }
 
                 FkAction::Cascade => {
-                    // Phase 6.9: use FK composite index range scan if available (O(log n + k)).
-                    // Falls back to full scan for pre-6.9 FKs (fk_index_id=0).
-                    let child_rows = if let Some(root) = fk_index_root {
-                        let (lo, hi) = crate::index_maintenance::fk_key_range(parent_key_val)?;
-                        let entries = BTree::range_in(storage, root, Some(&lo), Some(&hi))?;
-                        // Read full row values for each visible child.
-                        // Filter dead FK index entries by heap visibility.
-                        let mut rows = Vec::with_capacity(entries.len());
-                        for (child_rid, _) in entries {
-                            if !HeapChain::is_slot_visible(
-                                storage,
-                                child_rid.page_id,
-                                child_rid.slot_id,
-                                snap,
-                            )? {
-                                continue; // dead entry — skip
-                            }
-                            let row_bytes = axiomdb_storage::heap_chain::HeapChain::read_row(
-                                storage,
-                                child_rid.page_id,
-                                child_rid.slot_id,
-                            )?;
-                            if let Some(bytes) = row_bytes {
-                                let vals =
-                                    crate::table::decode_row_from_bytes(&bytes, &child_cols)?;
-                                rows.push((child_rid, vals));
-                            }
-                        }
-                        rows
-                    } else {
-                        find_children_via_scan(
+                    if child_table_def.is_clustered() {
+                        // Clustered child: scan with PK keys, apply delete-marks.
+                        // fk_index_root is always None for clustered children.
+                        let children_with_pk = find_clustered_children_with_pk(
                             storage,
                             &child_table_def,
                             &child_cols,
                             fk.child_col_idx,
                             parent_key_val,
                             snap,
-                        )?
-                    };
+                        )?;
 
-                    if child_rows.is_empty() {
-                        continue;
-                    }
+                        if children_with_pk.is_empty() {
+                            continue;
+                        }
 
-                    // Recursively enforce FK on children's children BEFORE deleting.
-                    enforce_fk_on_parent_delete(
-                        &child_rows,
-                        fk.child_table_id,
-                        storage,
-                        txn,
-                        bloom,
-                        depth + 1,
-                    )?;
+                        // Recursive FK enforcement (dummy RIDs — only values matter).
+                        let child_rows_for_recursive: Vec<(RecordId, Vec<Value>)> =
+                            children_with_pk
+                                .iter()
+                                .map(|(_, vals)| {
+                                    (
+                                        RecordId {
+                                            page_id: 0,
+                                            slot_id: 0,
+                                        },
+                                        vals.clone(),
+                                    )
+                                })
+                                .collect();
+                        enforce_fk_on_parent_delete(
+                            &child_rows_for_recursive,
+                            fk.child_table_id,
+                            storage,
+                            txn,
+                            bloom,
+                            depth + 1,
+                        )?;
 
-                    // Batch-delete children from the heap.
-                    let child_rids: Vec<RecordId> =
-                        child_rows.iter().map(|(rid, _)| *rid).collect();
-                    crate::table::TableEngine::delete_rows_batch(
-                        storage,
-                        txn,
-                        &child_table_def,
-                        &child_rids,
-                    )?;
-
-                    // Maintain secondary indexes on the child table.
-                    // IMPORTANT: update `current_secondary` in-memory after each row
-                    // to propagate CoW root changes. B-Tree delete is CoW: it frees
-                    // the old root page and allocates a new one. Without in-memory
-                    // updates, the next row's delete would use a freed page.
-                    let mut current_secondary = {
-                        let mut reader = CatalogReader::new(storage, snap)?;
-                        let all = reader.list_indexes(fk.child_table_id)?;
-                        all.into_iter()
-                            .filter(|i| !i.columns.is_empty())
-                            .collect::<Vec<_>>()
-                    };
-                    if !current_secondary.is_empty() {
-                        for (child_rid, child_row_vals) in &child_rows {
-                            let updated = crate::index_maintenance::delete_from_indexes(
-                                &current_secondary,
-                                child_row_vals,
-                                *child_rid,
+                        // Delete-mark all matching clustered rows.
+                        // Root may have been updated by recursive operations above.
+                        let current_root = txn
+                            .clustered_root(fk.child_table_id)
+                            .unwrap_or(child_table_def.root_page_id);
+                        let pk_keys: Vec<Vec<u8>> =
+                            children_with_pk.iter().map(|(k, _)| k.clone()).collect();
+                        delete_mark_clustered_rows(
+                            storage,
+                            txn,
+                            fk.child_table_id,
+                            current_root,
+                            &pk_keys,
+                            snap,
+                        )?;
+                        // Secondary index entries left in place — MVCC deferred cleanup
+                        // (same behavior as regular clustered DELETE executor).
+                    } else {
+                        // Heap child: FK index range scan if available, else full scan.
+                        let child_rows = if let Some(root) = fk_index_root {
+                            let (lo, hi) = crate::index_maintenance::fk_key_range(parent_key_val)?;
+                            let entries = BTree::range_in(storage, root, Some(&lo), Some(&hi))?;
+                            let mut rows = Vec::with_capacity(entries.len());
+                            for (child_rid, _) in entries {
+                                if !HeapChain::is_slot_visible(
+                                    storage,
+                                    child_rid.page_id,
+                                    child_rid.slot_id,
+                                    snap,
+                                )? {
+                                    continue;
+                                }
+                                let row_bytes = axiomdb_storage::heap_chain::HeapChain::read_row(
+                                    storage,
+                                    child_rid.page_id,
+                                    child_rid.slot_id,
+                                )?;
+                                if let Some(bytes) = row_bytes {
+                                    let vals =
+                                        crate::table::decode_row_from_bytes(&bytes, &child_cols)?;
+                                    rows.push((child_rid, vals));
+                                }
+                            }
+                            rows
+                        } else {
+                            find_children_via_scan(
                                 storage,
-                                bloom,
-                                &[],
-                            )?;
-                            for (index_id, new_root) in updated {
-                                CatalogWriter::new(storage, txn)?
-                                    .update_index_root(index_id, new_root)?;
-                                // Refresh in-memory roots so the next row uses the
-                                // correct (post-CoW) root page.
-                                if let Some(idx) = current_secondary
-                                    .iter_mut()
-                                    .find(|i| i.index_id == index_id)
-                                {
-                                    idx.root_page_id = new_root;
+                                &child_table_def,
+                                &child_cols,
+                                fk.child_col_idx,
+                                parent_key_val,
+                                snap,
+                            )?
+                        };
+
+                        if child_rows.is_empty() {
+                            continue;
+                        }
+
+                        // Recursively enforce FK on children's children BEFORE deleting.
+                        enforce_fk_on_parent_delete(
+                            &child_rows,
+                            fk.child_table_id,
+                            storage,
+                            txn,
+                            bloom,
+                            depth + 1,
+                        )?;
+
+                        // Batch-delete children from the heap.
+                        let child_rids: Vec<RecordId> =
+                            child_rows.iter().map(|(rid, _)| *rid).collect();
+                        crate::table::TableEngine::delete_rows_batch(
+                            storage,
+                            txn,
+                            &child_table_def,
+                            &child_rids,
+                        )?;
+
+                        // Maintain secondary indexes on the child table.
+                        let mut current_secondary = {
+                            let mut reader = CatalogReader::new(storage, snap)?;
+                            let all = reader.list_indexes(fk.child_table_id)?;
+                            all.into_iter()
+                                .filter(|i| !i.columns.is_empty())
+                                .collect::<Vec<_>>()
+                        };
+                        if !current_secondary.is_empty() {
+                            for (child_rid, child_row_vals) in &child_rows {
+                                let updated = crate::index_maintenance::delete_from_indexes(
+                                    &current_secondary,
+                                    child_row_vals,
+                                    *child_rid,
+                                    storage,
+                                    bloom,
+                                    &[],
+                                )?;
+                                for (index_id, new_root) in updated {
+                                    CatalogWriter::new(storage, txn)?
+                                        .update_index_root(index_id, new_root)?;
+                                    if let Some(idx) = current_secondary
+                                        .iter_mut()
+                                        .find(|i| i.index_id == index_id)
+                                    {
+                                        idx.root_page_id = new_root;
+                                    }
                                 }
                             }
                         }
@@ -411,138 +467,202 @@ pub fn enforce_fk_on_parent_delete(
                 }
 
                 FkAction::SetNull => {
-                    // Phase 6.9: same range-scan approach as CASCADE.
-                    // Filter dead FK index entries by heap visibility.
-                    let child_rows = if let Some(root) = fk_index_root {
-                        let (lo, hi) = crate::index_maintenance::fk_key_range(parent_key_val)?;
-                        let entries = BTree::range_in(storage, root, Some(&lo), Some(&hi))?;
-                        let mut rows = Vec::with_capacity(entries.len());
-                        for (child_rid, _) in entries {
-                            if !HeapChain::is_slot_visible(
-                                storage,
-                                child_rid.page_id,
-                                child_rid.slot_id,
-                                snap,
-                            )? {
-                                continue;
-                            }
-                            let row_bytes = axiomdb_storage::heap_chain::HeapChain::read_row(
-                                storage,
-                                child_rid.page_id,
-                                child_rid.slot_id,
-                            )?;
-                            if let Some(bytes) = row_bytes {
-                                let vals =
-                                    crate::table::decode_row_from_bytes(&bytes, &child_cols)?;
-                                rows.push((child_rid, vals));
-                            }
-                        }
-                        rows
-                    } else {
-                        find_children_via_scan(
+                    if child_table_def.is_clustered() {
+                        // Clustered child: scan with PK keys, then delete-mark + re-insert
+                        // each row with the FK column set to NULL.
+                        let children_with_pk = find_clustered_children_with_pk(
                             storage,
                             &child_table_def,
                             &child_cols,
                             fk.child_col_idx,
                             parent_key_val,
                             snap,
-                        )?
-                    };
-
-                    if child_rows.is_empty() {
-                        continue;
-                    }
-
-                    let mut current_indexes = {
-                        let mut reader = CatalogReader::new(storage, snap)?;
-                        let all = reader.list_indexes(fk.child_table_id)?;
-                        all.into_iter()
-                            .filter(|i| !i.columns.is_empty())
-                            .collect::<Vec<_>>()
-                    };
-                    let compiled_preds = crate::partial_index::compile_index_predicates(
-                        &current_indexes,
-                        &child_cols,
-                    )?;
-                    let mut update_pairs: Vec<(RecordId, Vec<Value>, RecordId, Vec<Value>)> =
-                        Vec::with_capacity(child_rows.len());
-
-                    for (child_rid, child_row) in &child_rows {
-                        // Set FK column to NULL in child row.
-                        let mut new_child_row = child_row.clone();
-                        new_child_row[fk.child_col_idx as usize] = Value::Null;
-
-                        let new_rid = TableEngine::update_row(
-                            storage,
-                            txn,
-                            &child_table_def,
-                            &child_cols,
-                            *child_rid,
-                            new_child_row.clone(),
                         )?;
-                        update_pairs.push((*child_rid, child_row.clone(), new_rid, new_child_row));
-                    }
 
-                    for (idx_pos, idx) in current_indexes.iter_mut().enumerate() {
-                        if idx.columns.is_empty() {
+                        if children_with_pk.is_empty() {
                             continue;
                         }
 
-                        let pred = compiled_preds.get(idx_pos).and_then(|p| p.as_ref());
-                        let mut delete_keys: Vec<Vec<u8>> = Vec::new();
-                        let mut insert_rows: Vec<(RecordId, &Vec<Value>)> = Vec::new();
+                        let primary_idx = {
+                            let mut reader = CatalogReader::new(storage, snap)?;
+                            reader
+                                .list_indexes(fk.child_table_id)?
+                                .into_iter()
+                                .find(|i| i.is_primary && !i.columns.is_empty())
+                                .ok_or_else(|| DbError::Internal {
+                                    message: format!(
+                                        "clustered child table {} missing primary index",
+                                        fk.child_table_id
+                                    ),
+                                })?
+                        };
+                        let mut secondary_idxs: Vec<IndexDef> = {
+                            let mut reader = CatalogReader::new(storage, snap)?;
+                            reader
+                                .list_indexes(fk.child_table_id)?
+                                .into_iter()
+                                .filter(|i| !i.is_primary && !i.columns.is_empty())
+                                .collect()
+                        };
 
-                        for (old_rid, old_values, new_rid, new_values) in &update_pairs {
-                            if crate::index_maintenance::update_affects_index(
-                                idx, pred, old_values, *old_rid, new_values, *new_rid,
-                            )? {
-                                if let Some(key_vals) =
-                                    crate::index_maintenance::index_key_values_if_indexed(
-                                        idx, old_values, pred,
+                        let mut current_root = txn
+                            .clustered_root(fk.child_table_id)
+                            .unwrap_or(child_table_def.root_page_id);
+
+                        for (pk_key, old_values) in &children_with_pk {
+                            let mut new_values = old_values.clone();
+                            new_values[fk.child_col_idx as usize] = Value::Null;
+                            current_root = apply_clustered_set_null(
+                                storage,
+                                txn,
+                                fk.child_table_id,
+                                current_root,
+                                &primary_idx,
+                                &mut secondary_idxs,
+                                &child_cols,
+                                pk_key,
+                                old_values,
+                                &new_values,
+                                snap,
+                            )?;
+                        }
+                    } else {
+                        // Heap child: FK index range scan if available, else full scan.
+                        let child_rows = if let Some(root) = fk_index_root {
+                            let (lo, hi) = crate::index_maintenance::fk_key_range(parent_key_val)?;
+                            let entries = BTree::range_in(storage, root, Some(&lo), Some(&hi))?;
+                            let mut rows = Vec::with_capacity(entries.len());
+                            for (child_rid, _) in entries {
+                                if !HeapChain::is_slot_visible(
+                                    storage,
+                                    child_rid.page_id,
+                                    child_rid.slot_id,
+                                    snap,
+                                )? {
+                                    continue;
+                                }
+                                let row_bytes = axiomdb_storage::heap_chain::HeapChain::read_row(
+                                    storage,
+                                    child_rid.page_id,
+                                    child_rid.slot_id,
+                                )?;
+                                if let Some(bytes) = row_bytes {
+                                    let vals =
+                                        crate::table::decode_row_from_bytes(&bytes, &child_cols)?;
+                                    rows.push((child_rid, vals));
+                                }
+                            }
+                            rows
+                        } else {
+                            find_children_via_scan(
+                                storage,
+                                &child_table_def,
+                                &child_cols,
+                                fk.child_col_idx,
+                                parent_key_val,
+                                snap,
+                            )?
+                        };
+
+                        if child_rows.is_empty() {
+                            continue;
+                        }
+
+                        let mut current_indexes = {
+                            let mut reader = CatalogReader::new(storage, snap)?;
+                            let all = reader.list_indexes(fk.child_table_id)?;
+                            all.into_iter()
+                                .filter(|i| !i.columns.is_empty())
+                                .collect::<Vec<_>>()
+                        };
+                        let compiled_preds = crate::partial_index::compile_index_predicates(
+                            &current_indexes,
+                            &child_cols,
+                        )?;
+                        let mut update_pairs: Vec<(RecordId, Vec<Value>, RecordId, Vec<Value>)> =
+                            Vec::with_capacity(child_rows.len());
+
+                        for (child_rid, child_row) in &child_rows {
+                            let mut new_child_row = child_row.clone();
+                            new_child_row[fk.child_col_idx as usize] = Value::Null;
+
+                            let new_rid = TableEngine::update_row(
+                                storage,
+                                txn,
+                                &child_table_def,
+                                &child_cols,
+                                *child_rid,
+                                new_child_row.clone(),
+                            )?;
+                            update_pairs.push((
+                                *child_rid,
+                                child_row.clone(),
+                                new_rid,
+                                new_child_row,
+                            ));
+                        }
+
+                        for (idx_pos, idx) in current_indexes.iter_mut().enumerate() {
+                            if idx.columns.is_empty() {
+                                continue;
+                            }
+
+                            let pred = compiled_preds.get(idx_pos).and_then(|p| p.as_ref());
+                            let mut delete_keys: Vec<Vec<u8>> = Vec::new();
+                            let mut insert_rows: Vec<(RecordId, &Vec<Value>)> = Vec::new();
+
+                            for (old_rid, old_values, new_rid, new_values) in &update_pairs {
+                                if crate::index_maintenance::update_affects_index(
+                                    idx, pred, old_values, *old_rid, new_values, *new_rid,
+                                )? {
+                                    if let Some(key_vals) =
+                                        crate::index_maintenance::index_key_values_if_indexed(
+                                            idx, old_values, pred,
+                                        )?
+                                    {
+                                        delete_keys.push(
+                                            crate::index_maintenance::encode_index_entry_key(
+                                                idx, &key_vals, *old_rid,
+                                            )?,
+                                        );
+                                    }
+                                    insert_rows.push((*new_rid, new_values));
+                                }
+                            }
+
+                            if !delete_keys.is_empty() {
+                                delete_keys.sort_unstable();
+                                if let Some(new_root) =
+                                    crate::index_maintenance::delete_many_from_single_index(
+                                        idx,
+                                        &delete_keys,
+                                        storage,
+                                        bloom,
                                     )?
                                 {
-                                    delete_keys.push(
-                                        crate::index_maintenance::encode_index_entry_key(
-                                            idx, &key_vals, *old_rid,
-                                        )?,
-                                    );
+                                    CatalogWriter::new(storage, txn)?
+                                        .update_index_root(idx.index_id, new_root)?;
                                 }
-                                insert_rows.push((*new_rid, new_values));
                             }
-                        }
 
-                        if !delete_keys.is_empty() {
-                            delete_keys.sort_unstable();
-                            if let Some(new_root) =
-                                crate::index_maintenance::delete_many_from_single_index(
-                                    idx,
-                                    &delete_keys,
-                                    storage,
-                                    bloom,
-                                )?
-                            {
-                                CatalogWriter::new(storage, txn)?
-                                    .update_index_root(idx.index_id, new_root)?;
-                            }
-                        }
-
-                        if !insert_rows.is_empty() {
-                            let batch_refs: Vec<(&[Value], RecordId)> = insert_rows
-                                .iter()
-                                .map(|(rid, vals)| (vals.as_slice(), *rid))
-                                .collect();
-                            if let Some(new_root) =
-                                crate::index_maintenance::insert_many_into_single_index(
-                                    idx,
-                                    pred,
-                                    &batch_refs,
-                                    storage,
-                                    bloom,
-                                    snap,
-                                )?
-                            {
-                                CatalogWriter::new(storage, txn)?
-                                    .update_index_root(idx.index_id, new_root)?;
+                            if !insert_rows.is_empty() {
+                                let batch_refs: Vec<(&[Value], RecordId)> = insert_rows
+                                    .iter()
+                                    .map(|(rid, vals)| (vals.as_slice(), *rid))
+                                    .collect();
+                                if let Some(new_root) =
+                                    crate::index_maintenance::insert_many_into_single_index(
+                                        idx,
+                                        pred,
+                                        &batch_refs,
+                                        storage,
+                                        bloom,
+                                        snap,
+                                    )?
+                                {
+                                    CatalogWriter::new(storage, txn)?
+                                        .update_index_root(idx.index_id, new_root)?;
+                                }
                             }
                         }
                     }
@@ -593,9 +713,6 @@ pub fn enforce_fk_on_parent_update(
                     table_id: fk.child_table_id,
                 })?
         };
-        child_table_def.ensure_heap_runtime(
-            "foreign key enforcement on clustered child table — Phase 39.17+",
-        )?;
         let child_cols = {
             let mut reader = CatalogReader::new(storage, snap)?;
             reader.list_columns(fk.child_table_id)?
@@ -680,9 +797,11 @@ fn children_exist_via_scan(
     fk_val: &Value,
     snap: axiomdb_core::TransactionSnapshot,
 ) -> Result<bool, DbError> {
-    child_table_def
-        .ensure_heap_runtime("foreign key enforcement on clustered child table — Phase 39.17+")?;
-    let rows = TableEngine::scan_table(storage, child_table_def, child_cols, snap, None)?;
+    let rows = if child_table_def.is_clustered() {
+        crate::table::scan_clustered_table(storage, child_table_def, child_cols, snap)?
+    } else {
+        TableEngine::scan_table(storage, child_table_def, child_cols, snap, None)?
+    };
     Ok(rows.iter().any(|(_, row)| {
         row.get(child_col_idx as usize)
             .map(|v| v == fk_val)
@@ -704,9 +823,11 @@ fn find_children_via_scan(
     fk_val: &Value,
     snap: axiomdb_core::TransactionSnapshot,
 ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
-    child_table_def
-        .ensure_heap_runtime("foreign key enforcement on clustered child table — Phase 39.17+")?;
-    let rows = TableEngine::scan_table(storage, child_table_def, child_cols, snap, None)?;
+    let rows = if child_table_def.is_clustered() {
+        crate::table::scan_clustered_table(storage, child_table_def, child_cols, snap)?
+    } else {
+        TableEngine::scan_table(storage, child_table_def, child_cols, snap, None)?
+    };
     Ok(rows
         .into_iter()
         .filter(|(_, row)| {
@@ -715,6 +836,170 @@ fn find_children_via_scan(
                 .unwrap_or(false)
         })
         .collect())
+}
+
+/// Scans a clustered child table and returns `(pk_key_bytes, decoded_row)` for
+/// every visible row where the FK column equals `fk_val`.
+fn find_clustered_children_with_pk(
+    storage: &dyn StorageEngine,
+    child_table_def: &axiomdb_catalog::schema::TableDef,
+    child_cols: &[axiomdb_catalog::schema::ColumnDef],
+    child_col_idx: u16,
+    fk_val: &Value,
+    snap: TransactionSnapshot,
+) -> Result<Vec<PkRowPair>, DbError> {
+    use std::ops::Bound;
+    let col_types = column_data_types(child_cols);
+    let iter = axiomdb_storage::clustered_tree::range(
+        storage,
+        Some(child_table_def.root_page_id),
+        Bound::Unbounded,
+        Bound::Unbounded,
+        &snap,
+    )?;
+    let mut result = Vec::new();
+    for row in iter {
+        let row = row?;
+        let vals =
+            crate::table::decode_row_from_bytes(&row.row_data, child_cols).or_else(|_| {
+                // Overflow row: use the column_data_types path
+                axiomdb_types::codec::decode_row(&row.row_data, &col_types)
+            })?;
+        let matches = vals
+            .get(child_col_idx as usize)
+            .map(|v| v == fk_val)
+            .unwrap_or(false);
+        if matches {
+            result.push((row.key, vals));
+        }
+    }
+    Ok(result)
+}
+
+/// Applies MVCC delete-marks to clustered rows identified by their PK keys.
+fn delete_mark_clustered_rows(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_id: u32,
+    root_pid: u64,
+    pk_keys: &[Vec<u8>],
+    snap: TransactionSnapshot,
+) -> Result<(), DbError> {
+    use axiomdb_storage::{clustered_leaf, clustered_tree};
+
+    let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+
+    for pk_key in pk_keys {
+        let leaf_ref = clustered_tree::descend_to_leaf_pub(storage, root_pid, pk_key)?;
+        let page_id = leaf_ref.header().page_id;
+        let mut page = leaf_ref.into_page();
+
+        let pos = match clustered_leaf::search(&page, pk_key) {
+            Ok(pos) => pos,
+            Err(_) => continue, // key not on this page — skip
+        };
+
+        let cell = clustered_leaf::read_cell(&page, pos as u16)?;
+        if !cell.row_header.is_visible(&snap) {
+            continue;
+        }
+
+        clustered_leaf::patch_txn_id_deleted(&mut page, pos, txn_id)?;
+        page.update_checksum();
+        storage.write_page(page_id, &page)?;
+        txn.record_clustered_delete_mark_lightweight(
+            table_id,
+            root_pid,
+            std::slice::from_ref(pk_key),
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Applies SET NULL to a single clustered row: delete-marks the old cell and
+/// re-inserts the updated row, then maintains secondary indexes.
+///
+/// Returns the new effective clustered root (may differ if a split occurred).
+#[allow(clippy::too_many_arguments)]
+fn apply_clustered_set_null(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    table_id: u32,
+    root_pid: u64,
+    primary_idx: &IndexDef,
+    secondary_idxs: &mut [IndexDef],
+    child_cols: &[axiomdb_catalog::schema::ColumnDef],
+    pk_key: &[u8],
+    old_values: &[Value],
+    new_values: &[Value],
+    snap: TransactionSnapshot,
+) -> Result<u64, DbError> {
+    use axiomdb_storage::{clustered_leaf, clustered_tree};
+
+    let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+
+    // Step 1: Delete-mark the old clustered row.
+    {
+        let leaf_ref = clustered_tree::descend_to_leaf_pub(storage, root_pid, pk_key)?;
+        let page_id = leaf_ref.header().page_id;
+        let mut page = leaf_ref.into_page();
+
+        let pos = match clustered_leaf::search(&page, pk_key) {
+            Ok(pos) => pos,
+            Err(_) => return Ok(root_pid), // key not found — nothing to do
+        };
+
+        let cell = clustered_leaf::read_cell(&page, pos as u16)?;
+        if !cell.row_header.is_visible(&snap) {
+            return Ok(root_pid); // already invisible
+        }
+
+        clustered_leaf::patch_txn_id_deleted(&mut page, pos, txn_id)?;
+        page.update_checksum();
+        storage.write_page(page_id, &page)?;
+        txn.record_clustered_delete_mark_lightweight(table_id, root_pid, &[pk_key.to_vec()])?;
+    }
+
+    // Step 2: Re-insert the row with the FK column set to NULL.
+    let col_types = column_data_types(child_cols);
+    let encoded = encode_row(new_values, &col_types)?;
+    let row_header = RowHeader {
+        txn_id_created: txn_id,
+        txn_id_deleted: 0,
+        row_version: 0,
+        _flags: 0,
+    };
+
+    let new_root = axiomdb_storage::clustered_tree::insert(
+        storage,
+        Some(root_pid),
+        pk_key,
+        &row_header,
+        &encoded,
+    )?;
+    if new_root != root_pid {
+        CatalogWriter::new(storage, txn)?.update_table_root(table_id, new_root)?;
+    }
+    let image = ClusteredRowImage::new(new_root, row_header, &encoded);
+    txn.record_clustered_insert(table_id, pk_key, &image)?;
+
+    // Step 3: Update clustered secondary indexes for the changed FK column.
+    for idx in secondary_idxs.iter_mut() {
+        let layout = match ClusteredSecondaryLayout::derive(idx, primary_idx) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let root_atomic = AtomicU64::new(idx.root_page_id);
+        let _ = layout.update_row(storage, &root_atomic, old_values, new_values)?;
+        let new_idx_root = root_atomic.load(Ordering::Acquire);
+        if new_idx_root != idx.root_page_id {
+            CatalogWriter::new(storage, txn)?.update_index_root(idx.index_id, new_idx_root)?;
+            idx.root_page_id = new_idx_root;
+        }
+    }
+
+    Ok(new_root)
 }
 
 /// Resolves `(table_id, col_idx)` to `(table_name, column_name)` using the catalog.

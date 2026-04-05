@@ -7,6 +7,20 @@ use crate::page_ref::PageRef;
 ///
 /// Implementations: [`MmapStorage`] (disk, mmap) and [`MemoryStorage`] (RAM, tests).
 ///
+/// ## Interior mutability (Phase 40.3)
+///
+/// All mutating methods (`write_page`, `alloc_page`, `free_page`, `flush`,
+/// `set_current_snapshot`) now take `&self` instead of `&mut self`. Mutable
+/// state is managed internally with per-page `RwLock`s, a sharded
+/// [`PageLockTable`], and `Mutex`/`AtomicU64` fields.
+///
+/// This mirrors the design of both InnoDB (per-page `block_lock`, no `&mut`
+/// on the buffer pool) and PostgreSQL (per-buffer atomic `state` field with
+/// no `&mut` on the `BufferDescriptor` array).
+///
+/// Two transactions writing **different** pages proceed in full parallelism.
+/// Two transactions writing the **same** page are serialized by the page lock.
+///
 /// ## Owned page references (Phase 7.4a)
 ///
 /// `read_page` returns an owned [`PageRef`] (heap-allocated copy) instead of
@@ -19,29 +33,38 @@ use crate::page_ref::PageRef;
 ///
 /// ## Usage with trait objects
 /// ```rust,ignore
-/// fn do_something(engine: &mut dyn StorageEngine) { ... }
+/// fn do_something(engine: &dyn StorageEngine) { ... }
 /// let engine: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
 /// ```
 ///
 /// [`MmapStorage`]: crate::MmapStorage
 /// [`MemoryStorage`]: crate::MemoryStorage
+/// [`PageLockTable`]: crate::page_lock::PageLockTable
 pub trait StorageEngine: Send + Sync {
     /// Returns an owned copy of page `page_id`.
     /// Verifies the checksum before returning.
     fn read_page(&self, page_id: u64) -> Result<PageRef, DbError>;
 
     /// Writes `page` to `page_id`. The page must have a valid checksum.
-    fn write_page(&mut self, page_id: u64, page: &Page) -> Result<(), DbError>;
+    ///
+    /// Acquires a per-page exclusive lock for the duration of the write.
+    /// Thread-safe: concurrent writes to **different** pages proceed in
+    /// parallel; concurrent writes to the **same** page are serialized.
+    fn write_page(&self, page_id: u64, page: &Page) -> Result<(), DbError>;
 
     /// Allocates a new page of the given type. Grows the storage if necessary.
-    fn alloc_page(&mut self, page_type: PageType) -> Result<u64, DbError>;
+    ///
+    /// Thread-safe: allocation acquires a `Mutex<FreeList>` held only during
+    /// the bitmap scan (~microseconds). File growth acquires a separate
+    /// grow lock to prevent concurrent resizes.
+    fn alloc_page(&self, page_type: PageType) -> Result<u64, DbError>;
 
     /// Returns `page_id` to the free page pool.
     /// Returns an error on double-free or invalid page_id.
-    fn free_page(&mut self, page_id: u64) -> Result<(), DbError>;
+    fn free_page(&self, page_id: u64) -> Result<(), DbError>;
 
     /// Syncs to durable storage. No-op in MemoryStorage.
-    fn flush(&mut self) -> Result<(), DbError>;
+    fn flush(&self) -> Result<(), DbError>;
 
     /// Current capacity (total pages in storage).
     fn page_count(&self) -> u64;
@@ -57,7 +80,7 @@ pub trait StorageEngine: Send + Sync {
     /// Tells the storage the current transaction's snapshot_id so that
     /// `free_page` can tag deferred frees with the epoch at which they became
     /// unreachable. Implementations that do not defer frees may ignore this.
-    fn set_current_snapshot(&mut self, _snapshot_id: u64) {}
+    fn set_current_snapshot(&self, _snapshot_id: u64) {}
 
     /// Returns the number of pages currently waiting in the deferred-free queue.
     /// Useful for diagnostics and tests. Default: 0.
@@ -85,7 +108,7 @@ pub mod tests {
 
     /// Generic test suite for any StorageEngine implementation.
     /// Call from the implementation-specific tests.
-    pub fn run_storage_engine_suite(engine: &mut dyn StorageEngine) {
+    pub fn run_storage_engine_suite(engine: &dyn StorageEngine) {
         // alloc returns unique page_ids.
         let id1 = engine.alloc_page(PageType::Data).unwrap();
         let id2 = engine.alloc_page(PageType::Data).unwrap();

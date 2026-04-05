@@ -337,13 +337,13 @@ struct CountingStorage {
 
 impl axiomdb_storage::StorageEngine for CountingStorage {
     fn alloc_page(
-        &mut self,
+        &self,
         t: axiomdb_storage::PageType,
     ) -> Result<u64, axiomdb_core::error::DbError> {
         self.allocs.fetch_add(1, AOrdering::Relaxed);
         self.inner.alloc_page(t)
     }
-    fn free_page(&mut self, id: u64) -> Result<(), axiomdb_core::error::DbError> {
+    fn free_page(&self, id: u64) -> Result<(), axiomdb_core::error::DbError> {
         self.frees.fetch_add(1, AOrdering::Relaxed);
         self.inner.free_page(id)
     }
@@ -351,7 +351,7 @@ impl axiomdb_storage::StorageEngine for CountingStorage {
         self.inner.read_page(id)
     }
     fn write_page(
-        &mut self,
+        &self,
         id: u64,
         p: &axiomdb_storage::Page,
     ) -> Result<(), axiomdb_core::error::DbError> {
@@ -360,7 +360,7 @@ impl axiomdb_storage::StorageEngine for CountingStorage {
     fn page_count(&self) -> u64 {
         self.inner.page_count()
     }
-    fn flush(&mut self) -> Result<(), axiomdb_core::error::DbError> {
+    fn flush(&self) -> Result<(), axiomdb_core::error::DbError> {
         self.inner.flush()
     }
 }

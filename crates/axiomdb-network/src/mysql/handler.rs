@@ -726,7 +726,6 @@ pub async fn handle_connection_with_timeouts(
                                                             &mut reader,
                                                             session.effective_database(),
                                                         ) {
-                                                            drop(reader);
                                                             plan_cache.store(
                                                                 stmt_sql, &analyzed, deps, sv,
                                                             );

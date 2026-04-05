@@ -131,7 +131,9 @@ fn select_from_empty_clustered_table_returns_zero_rows() {
 }
 
 #[test]
-fn startup_index_integrity_skips_clustered_tables() {
+fn startup_index_integrity_checks_clustered_secondary_indexes() {
+    // Clustered tables ARE checked: the primary "index" is the data itself
+    // (no divergence possible), but secondary indexes are verified.
     let (mut storage, mut txn) = setup();
 
     run(
@@ -141,7 +143,9 @@ fn startup_index_integrity_skips_clustered_tables() {
     );
 
     let report = verify_and_repair_indexes_on_open(&mut storage, &mut txn).unwrap();
-    assert_eq!(report.tables_checked, 0);
-    assert_eq!(report.indexes_checked, 0);
+    // 1 table checked, 1 secondary index (email UNIQUE) checked.
+    assert_eq!(report.tables_checked, 1);
+    assert_eq!(report.indexes_checked, 1);
+    // Freshly created table — index is consistent, nothing rebuilt.
     assert!(report.rebuilt_indexes.is_empty());
 }

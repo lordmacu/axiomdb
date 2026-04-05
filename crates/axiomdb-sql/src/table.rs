@@ -1890,6 +1890,7 @@ mod tests {
             storage_layout: axiomdb_catalog::schema::TableStorageLayout::Heap,
             schema_name: "public".into(),
             table_name: "t".into(),
+            schema_version: 1,
         }
     }
 

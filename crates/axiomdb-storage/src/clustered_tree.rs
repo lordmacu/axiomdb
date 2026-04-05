@@ -698,7 +698,6 @@ pub fn restore_exact_row_image(
     row_data: &[u8],
 ) -> Result<u64, DbError> {
     validate_row_payload(key, row_data)?;
-
     let root_after_delete = match delete_physical_by_key(storage, root_pid, key)? {
         Some(new_root) => new_root,
         None => root_pid,
@@ -1998,19 +1997,19 @@ mod tests {
             self.inner.read_page(page_id)
         }
 
-        fn write_page(&mut self, page_id: u64, page: &Page) -> Result<(), DbError> {
+        fn write_page(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
             self.inner.write_page(page_id, page)
         }
 
-        fn alloc_page(&mut self, page_type: PageType) -> Result<u64, DbError> {
+        fn alloc_page(&self, page_type: PageType) -> Result<u64, DbError> {
             self.inner.alloc_page(page_type)
         }
 
-        fn free_page(&mut self, page_id: u64) -> Result<(), DbError> {
+        fn free_page(&self, page_id: u64) -> Result<(), DbError> {
             self.inner.free_page(page_id)
         }
 
-        fn flush(&mut self) -> Result<(), DbError> {
+        fn flush(&self) -> Result<(), DbError> {
             self.inner.flush()
         }
 

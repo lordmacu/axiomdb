@@ -3,6 +3,12 @@
 //! [`PageDirtyTracker`] is embedded in [`MmapStorage`] and updated on every
 //! `write_page` and `alloc_page` call. After `flush()`, the set is cleared.
 //!
+//! ## Interior mutability (Phase 40.3)
+//!
+//! `mark()` and `clear()` now take `&self`. The inner `HashSet` is protected
+//! by a `Mutex`. Contention is negligible in practice: the mutex is held only
+//! for a single `HashSet::insert` or `HashSet::clear` call (~nanoseconds).
+//!
 //! ## Purpose
 //!
 //! Knowing which pages are dirty enables:
@@ -12,7 +18,7 @@
 //!
 //! [`MmapStorage`]: crate::mmap::MmapStorage
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Mutex};
 
 // ── Free functions ─────────────────────────────────────────────────────────────
 
@@ -20,8 +26,6 @@ use std::collections::HashSet;
 ///
 /// Input must be sorted ascending; duplicates are tolerated (ignored).
 /// Returns `(start_page_id, run_length_in_pages)` pairs.
-///
-/// This is a pure function and does not touch any [`PageDirtyTracker`] state.
 pub fn coalesce_page_ids(sorted_ids: &[u64]) -> Vec<(u64, u64)> {
     let mut runs: Vec<(u64, u64)> = Vec::new();
     for &id in sorted_ids {
@@ -35,61 +39,73 @@ pub fn coalesce_page_ids(sorted_ids: &[u64]) -> Vec<(u64, u64)> {
 }
 
 /// In-memory set of page IDs that have been written since the last flush.
+///
+/// All methods take `&self`; interior mutability is provided by `Mutex<HashSet>`.
 #[derive(Debug, Default)]
 pub struct PageDirtyTracker {
-    dirty: HashSet<u64>,
+    dirty: Mutex<HashSet<u64>>,
 }
 
 impl PageDirtyTracker {
     /// Creates an empty tracker.
     pub fn new() -> Self {
         Self {
-            dirty: HashSet::new(),
+            dirty: Mutex::new(HashSet::new()),
         }
     }
 
     /// Marks `page_id` as dirty (written, pending flush).
     #[inline]
-    pub fn mark(&mut self, page_id: u64) {
-        self.dirty.insert(page_id);
+    pub fn mark(&self, page_id: u64) {
+        self.dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(page_id);
     }
 
     /// Returns `true` if `page_id` has been written since the last flush.
     #[inline]
     pub fn contains(&self, page_id: u64) -> bool {
-        self.dirty.contains(&page_id)
+        self.dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&page_id)
     }
 
     /// Number of dirty pages currently tracked.
     #[inline]
     pub fn count(&self) -> usize {
-        self.dirty.len()
+        self.dirty.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Returns `true` if no pages are dirty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.dirty.is_empty()
+        self.dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// Clears all dirty marks. Called by `MmapStorage::flush()` after sync.
-    pub fn clear(&mut self) {
-        self.dirty.clear();
+    pub fn clear(&self) {
+        self.dirty.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Returns dirty page IDs sorted ascending.
     ///
     /// Useful for deterministic output (logs, tests, and targeted `flush_range`).
     pub fn sorted_ids(&self) -> Vec<u64> {
-        let mut ids: Vec<u64> = self.dirty.iter().copied().collect();
+        let guard = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ids: Vec<u64> = guard.iter().copied().collect();
+        drop(guard); // release before sort
         ids.sort_unstable();
         ids
     }
 
     /// Returns the dirty pages coalesced into contiguous runs `(start_page, len)`.
     ///
-    /// Used by [`MmapStorage::flush`] to issue targeted `flush_range` calls
-    /// instead of flushing the entire file.
+    /// Used by [`MmapStorage::flush`] to issue targeted `flush_range` calls.
     ///
     /// [`MmapStorage::flush`]: crate::mmap::MmapStorage
     pub fn contiguous_runs(&self) -> Vec<(u64, u64)> {
@@ -112,7 +128,7 @@ mod tests {
 
     #[test]
     fn test_mark_and_contains() {
-        let mut t = PageDirtyTracker::new();
+        let t = PageDirtyTracker::new();
         t.mark(5);
         assert!(t.contains(5));
         assert!(!t.contains(6));
@@ -121,7 +137,7 @@ mod tests {
 
     #[test]
     fn test_mark_idempotent() {
-        let mut t = PageDirtyTracker::new();
+        let t = PageDirtyTracker::new();
         t.mark(3);
         t.mark(3);
         assert_eq!(t.count(), 1);
@@ -129,7 +145,7 @@ mod tests {
 
     #[test]
     fn test_clear_resets() {
-        let mut t = PageDirtyTracker::new();
+        let t = PageDirtyTracker::new();
         t.mark(1);
         t.mark(2);
         t.mark(3);
@@ -140,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_sorted_ids_ascending() {
-        let mut t = PageDirtyTracker::new();
+        let t = PageDirtyTracker::new();
         for id in [10, 2, 7, 1, 99] {
             t.mark(id);
         }
@@ -167,13 +183,11 @@ mod tests {
 
     #[test]
     fn test_coalesce_contiguous_pages() {
-        // Pages 3, 4, 5 → one run of length 3
         assert_eq!(coalesce_page_ids(&[3, 4, 5]), vec![(3, 3)]);
     }
 
     #[test]
     fn test_coalesce_split_runs() {
-        // Pages 1, 2 then gap then 5, 6, 7 → two runs
         assert_eq!(coalesce_page_ids(&[1, 2, 5, 6, 7]), vec![(1, 2), (5, 3)]);
     }
 
@@ -184,7 +198,6 @@ mod tests {
 
     #[test]
     fn test_coalesce_duplicate_ids_ignored() {
-        // Input: [3, 3, 4] — duplicate 3 must not inflate the run
         assert_eq!(coalesce_page_ids(&[3, 3, 4]), vec![(3, 2)]);
     }
 
@@ -198,14 +211,14 @@ mod tests {
 
     #[test]
     fn test_contiguous_runs_single_page() {
-        let mut t = PageDirtyTracker::new();
+        let t = PageDirtyTracker::new();
         t.mark(7);
         assert_eq!(t.contiguous_runs(), vec![(7, 1)]);
     }
 
     #[test]
     fn test_contiguous_runs_contiguous() {
-        let mut t = PageDirtyTracker::new();
+        let t = PageDirtyTracker::new();
         for id in [10, 11, 12] {
             t.mark(id);
         }
@@ -214,7 +227,7 @@ mod tests {
 
     #[test]
     fn test_contiguous_runs_two_separated_runs() {
-        let mut t = PageDirtyTracker::new();
+        let t = PageDirtyTracker::new();
         for id in [2, 3, 7, 8, 9] {
             t.mark(id);
         }
