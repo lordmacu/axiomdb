@@ -698,11 +698,12 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                     }
                 }
             }
-            // MODIFY [COLUMN] col_def — not yet implemented
+            // MODIFY [COLUMN] col_name new_type [constraints]
             Token::Modify => {
-                return Err(DbError::NotImplemented {
-                    feature: "ALTER TABLE MODIFY COLUMN — Phase N".into(),
-                });
+                p.advance();
+                p.eat(&Token::Column); // optional COLUMN keyword
+                let col_def = parse_column_def(p)?;
+                AlterTableOp::ModifyColumn(col_def)
             }
             // REBUILD — convert heap table to clustered format (Phase 39.19)
             Token::Ident(s) if s.eq_ignore_ascii_case("rebuild") => {

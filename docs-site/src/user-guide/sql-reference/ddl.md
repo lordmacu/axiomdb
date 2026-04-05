@@ -519,9 +519,42 @@ ALTER TABLE users DROP COLUMN phone IF EXISTS;
 > Dropping a column is permanent. The data stored in that column is discarded
 > when rows are rewritten and cannot be recovered without a backup.
 
-> **Not yet supported:** dropping a column that is part of a PRIMARY KEY,
-> UNIQUE constraint, or FOREIGN KEY. These require constraint-aware DDL
-> (Phase 4.22b).
+> Dropping a column that is part of a UNIQUE index or a FOREIGN KEY is
+> rejected with an error. Drop the index or constraint first, then drop
+> the column. Dropping a PRIMARY KEY column is not allowed on clustered
+> tables (the PK is the physical storage key).
+
+### Modify Column
+
+Changes the data type or nullability of an existing column. All existing rows
+are rewritten, coercing their stored values to the new type.
+
+```sql
+ALTER TABLE table_name MODIFY COLUMN column_name new_type [NOT NULL];
+```
+
+```sql
+-- Widen an integer column to 64 bits (existing values preserved)
+ALTER TABLE events MODIFY COLUMN count BIGINT;
+
+-- Convert integers to text (always safe, values become their decimal string)
+ALTER TABLE codes MODIFY COLUMN code TEXT;
+
+-- Add a NOT NULL constraint (fails if any row has NULL in that column)
+ALTER TABLE orders MODIFY COLUMN status TEXT NOT NULL;
+```
+
+**Rules and restrictions:**
+
+- Narrowing casts (e.g. `BIGINT → INT`, `TEXT → INT`) are applied with strict
+  coercion. If any existing value cannot be represented in the new type the
+  statement fails and no rows are changed.
+- A column that is part of a secondary index (UNIQUE or otherwise) cannot have
+  its type changed. Drop the index first, modify the column, then recreate the
+  index.
+- The PRIMARY KEY column's type cannot be changed on a clustered table.
+- Changing nullability from nullable to `NOT NULL` is allowed only when every
+  existing row has a non-NULL value for that column.
 
 ### Rename Column
 

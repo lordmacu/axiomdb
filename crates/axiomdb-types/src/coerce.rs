@@ -161,6 +161,12 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
             Ok(Value::Real(if b { 1.0 } else { 0.0 }))
         }
 
+        // ── Any numeric/bool → Text (always safe: every value has a text repr) ──
+        (Value::Int(n), DataType::Text) => Ok(Value::Text(n.to_string())),
+        (Value::BigInt(n), DataType::Text) => Ok(Value::Text(n.to_string())),
+        (Value::Real(f), DataType::Text) => Ok(Value::Text(f.to_string())),
+        (Value::Bool(b), DataType::Text) => Ok(Value::Text(if b { "1" } else { "0" }.to_string())),
+
         // ── Everything else is an error ───────────────────────────────────────
         (value, target) => Err(DbError::InvalidCoercion {
             from: value.variant_name().into(),
