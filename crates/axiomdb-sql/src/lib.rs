@@ -37,7 +37,7 @@ pub use ast::{
     CreateIndexStmt, CreateTableStmt, DeleteStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt,
     ForeignKeyAction, FromClause, IndexColumn, InsertSource, InsertStmt, JoinClause, JoinCondition,
     JoinType, NullsOrder, OrderByItem, SelectItem, SelectStmt, SetStmt, SetValue, ShowColumnsStmt,
-    ShowDatabasesStmt, ShowTablesStmt, SortOrder, Stmt, TableConstraint, TableRef,
+    ShowDatabasesStmt, ShowIndexStmt, ShowTablesStmt, SortOrder, Stmt, TableConstraint, TableRef,
     TruncateTableStmt, UpdateStmt, UseDatabaseStmt,
 };
 pub use bloom::BloomRegistry;

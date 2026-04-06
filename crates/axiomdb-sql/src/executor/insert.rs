@@ -422,9 +422,65 @@ fn execute_insert_ctx(
             }
         }
         InsertSource::DefaultValues => {
-            return Err(DbError::NotImplemented {
-                feature: "DEFAULT VALUES — Phase 4.3c".into(),
-            })
+            // Build a row where every column is NULL, then apply AUTO_INCREMENT.
+            let mut full_values: Vec<Value> = schema_cols.iter().map(|_| Value::Null).collect();
+            if let Some(ai_col) = auto_inc_col {
+                if matches!(full_values.get(ai_col), Some(Value::Null)) {
+                    let id =
+                        next_auto_inc_ctx(storage, txn, &resolved.def, schema_cols, ai_col)?;
+                    full_values[ai_col] = match schema_cols[ai_col].col_type {
+                        axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
+                        _ => Value::Int(id as i32),
+                    };
+                    first_generated = Some(id);
+                }
+            }
+            check_row_constraints(
+                &resolved.constraints,
+                &full_values,
+                &resolved.def.table_name,
+            )?;
+            if !resolved.foreign_keys.is_empty() {
+                crate::fk_enforcement::check_fk_child_insert(
+                    &full_values,
+                    &resolved.foreign_keys,
+                    storage,
+                    txn,
+                    bloom,
+                )?;
+            }
+            let rid = TableEngine::insert_row_with_ctx(
+                storage,
+                txn,
+                &resolved.def,
+                schema_cols,
+                ctx,
+                full_values.clone(),
+                1,
+            )?;
+            if !secondary_indexes.is_empty() {
+                let snap = txn.active_snapshot()?;
+                let updated = crate::index_maintenance::insert_into_indexes_with_undo(
+                    &secondary_indexes,
+                    &full_values,
+                    rid,
+                    storage,
+                    bloom,
+                    &compiled_preds,
+                    snap,
+                    Some(txn),
+                )?;
+                for (index_id, new_root) in updated {
+                    CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
+                    if let Some(idx) = secondary_indexes
+                        .iter_mut()
+                        .find(|i| i.index_id == index_id)
+                    {
+                        idx.root_page_id = new_root;
+                    }
+                }
+            }
+            count += 1;
         }
     }
 
@@ -698,9 +754,43 @@ fn execute_insert(
         }
 
         InsertSource::DefaultValues => {
-            return Err(DbError::NotImplemented {
-                feature: "DEFAULT VALUES — Phase 4.3c".into(),
-            })
+            let mut full_values: Vec<Value> = schema_cols.iter().map(|_| Value::Null).collect();
+            if let Some(ai_col) = auto_inc_col {
+                if matches!(full_values.get(ai_col), Some(Value::Null)) {
+                    let id = next_auto_inc(storage, txn, &resolved.def, schema_cols, ai_col)?;
+                    full_values[ai_col] = match schema_cols[ai_col].col_type {
+                        axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
+                        _ => Value::Int(id as i32),
+                    };
+                    if first_generated.is_none() {
+                        first_generated = Some(id);
+                    }
+                }
+            }
+            let rid = TableEngine::insert_row(
+                storage,
+                txn,
+                &resolved.def,
+                schema_cols,
+                full_values.clone(),
+            )?;
+            if !secondary_indexes.is_empty() {
+                let snap = txn.active_snapshot()?;
+                let updated = crate::index_maintenance::insert_into_indexes_with_undo(
+                    &secondary_indexes,
+                    &full_values,
+                    rid,
+                    storage,
+                    &mut noop_bloom,
+                    &compiled_preds,
+                    snap,
+                    Some(txn),
+                )?;
+                for (index_id, new_root) in updated {
+                    CatalogWriter::new(storage, txn)?.update_index_root(index_id, new_root)?;
+                }
+            }
+            count += 1;
         }
     }
 
@@ -833,9 +923,37 @@ fn execute_clustered_insert_ctx(
             }
         }
         InsertSource::DefaultValues => {
-            return Err(DbError::NotImplemented {
-                feature: "DEFAULT VALUES — Phase 4.3c".into(),
-            })
+            let mut full_values: Vec<Value> = schema_cols.iter().map(|_| Value::Null).collect();
+            assign_auto_increment(
+                storage,
+                txn,
+                &resolved.def,
+                schema_cols,
+                full_values.as_mut_slice(),
+                &mut first_generated,
+            )?;
+            check_row_constraints(
+                &resolved.constraints,
+                &full_values,
+                &resolved.def.table_name,
+            )?;
+            if !resolved.foreign_keys.is_empty() {
+                crate::fk_enforcement::check_fk_child_insert(
+                    &full_values,
+                    &resolved.foreign_keys,
+                    storage,
+                    txn,
+                    bloom,
+                )?;
+            }
+            prepared_rows.push(crate::clustered_table::prepare_row_with_ctx(
+                full_values,
+                schema_cols,
+                &primary_idx,
+                &resolved.def.table_name,
+                ctx,
+                1,
+            )?);
         }
     }
 
@@ -1159,9 +1277,35 @@ fn execute_clustered_insert(
             }
         }
         InsertSource::DefaultValues => {
-            return Err(DbError::NotImplemented {
-                feature: "DEFAULT VALUES — Phase 4.3c".into(),
-            })
+            let mut full_values: Vec<Value> = schema_cols.iter().map(|_| Value::Null).collect();
+            assign_auto_increment(
+                storage,
+                txn,
+                &resolved.def,
+                schema_cols,
+                full_values.as_mut_slice(),
+                &mut first_generated,
+            )?;
+            check_row_constraints(
+                &resolved.constraints,
+                &full_values,
+                &resolved.def.table_name,
+            )?;
+            if !resolved.foreign_keys.is_empty() {
+                crate::fk_enforcement::check_fk_child_insert(
+                    &full_values,
+                    &resolved.foreign_keys,
+                    storage,
+                    txn,
+                    &mut noop_bloom,
+                )?;
+            }
+            prepared_rows.push(crate::clustered_table::prepare_row(
+                full_values,
+                schema_cols,
+                &primary_idx,
+                &resolved.def.table_name,
+            )?);
         }
     }
 

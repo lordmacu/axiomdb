@@ -606,18 +606,24 @@ INSERT INTO products (name, price, stock) VALUES
 
 ### INSERT ... DEFAULT VALUES
 
-Inserts a single row using all column defaults. Useful when every column has a default.
+Inserts a single row where every column receives its default value. Columns declared
+`AUTO_INCREMENT` receive the next generated ID; all other columns receive `NULL`.
 
 ```sql
-CREATE TABLE audit_events (
-    id         BIGINT      PRIMARY KEY AUTO_INCREMENT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    event_type TEXT        NOT NULL DEFAULT 'unknown'
-);
+-- Table with AUTO_INCREMENT primary key
+CREATE TABLE hits (id INT AUTO_INCREMENT PRIMARY KEY, url TEXT);
 
-INSERT INTO audit_events DEFAULT VALUES;
--- Row: id=1, created_at=<now>, event_type='unknown'
+INSERT INTO hits DEFAULT VALUES;   -- id=1, url=NULL
+INSERT INTO hits DEFAULT VALUES;   -- id=2, url=NULL
 ```
+
+> If the table has a `NOT NULL` column without `AUTO_INCREMENT` and no default
+> expression, `INSERT DEFAULT VALUES` will fail because the generated row would
+> have `NULL` in that column.
+
+> **Note:** stored `DEFAULT` expressions (e.g. `DEFAULT CURRENT_TIMESTAMP`,
+> `DEFAULT 0`) are not yet persisted in the catalog. Only `AUTO_INCREMENT` and
+> implicit `NULL` defaults are applied by `INSERT DEFAULT VALUES`.
 
 ### INSERT ... SELECT
 
