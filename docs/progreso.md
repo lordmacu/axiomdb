@@ -498,15 +498,15 @@
 ### Phase 19 — Maintenance + observability `⏳` week 44-46
 - [ ] 19.1 ⏳ Auto-vacuum — background task in Tokio, configurable threshold per table
 - [ ] 19.2 ⏳ VACUUM CONCURRENTLY — compact without blocking reads or writes
-- [ ] 19.3 ⏳ Deadlock detection — DFS on wait graph every 100ms
+- [ ] 19.3 ⏳ Deadlock detection — DFS on wait graph every 100ms; ⚠️ TRIPLICATE: same feature also in 13.8 and 40.6 — implement once in Phase 40.6, then mark all three
 - [ ] 19.4 ⏳ Statement fingerprinting — normalize SQL (remove literals, replace with `$1`, `$2`); hash the result to group identical queries with different parameters; prerequisite for pg_stat_statements and slow query log
 - [ ] 19.4b ⏳ pg_stat_statements — fingerprint (via 19.4) + calls + total/min/max/stddev time + cache hits/misses per query
 - [ ] 19.5 ⏳ Slow query log — JSON with execution plan
-- [ ] 19.6 ⏳ Connection pooling — Semaphore + built-in idle pool
+- [ ] 19.6 ⏳ Connection pooling — Semaphore + built-in idle pool; ⚠️ DUPLICATE of 16.10 — implement once and mark both
 - [ ] 19.7 ⏳ pg_stat_activity — view and cancel running queries
 - [ ] 19.7b ⏳ Cancel / kill query — `SELECT axiom_cancel_query(pid)` sends cancellation signal to a running query (like `pg_cancel_backend`); `axiom_terminate_session(pid)` forcibly closes a connection; without this, a runaway `SELECT * FROM logs` (millions of rows) cannot be stopped without restarting the server; integrates with pg_stat_activity (19.7) to expose the pid (moved from 7.18)
 - [ ] 19.8 ⏳ pg_stat_progress_vacuum — real-time vacuum progress
-- [ ] 19.9 ⏳ lock_timeout — error if waiting for a lock more than N ms
+- [x] 19.9 ✅ lock_timeout — implemented in Phase 7.10: `SET lock_timeout = N`; `DbError::LockTimeout` with MySQL error 1205 + SQLSTATE 40001; `lock_wait_timeout`/`innodb_lock_wait_timeout` aliases; per-session; default 30s
 - [ ] 19.10 ⏳ deadlock_timeout — how long to wait before running deadlock detector
 - [ ] 19.11 ⏳ idle_in_transaction_session_timeout — kill abandoned transactions
 - [ ] 19.12 ⏳ pg_stat_user_tables — seq_scan, idx_scan, n_live_tup, n_dead_tup per table
@@ -549,7 +549,7 @@
 - [ ] 20.20 ⏳ XMLType — `CREATE TABLE contratos (id BIGINT, contenido XML)`; `XMLType` stores XML documents natively with validation against XSD schemas; `XMLTABLE()` shreds XML into relational rows: `SELECT * FROM XMLTABLE('/pedidos/pedido' PASSING xml_col COLUMNS id INT PATH '@id', total DECIMAL PATH 'total')`; `XMLQUERY()` for XQuery expressions; `XMLELEMENT()`, `XMLFOREST()` to construct XML from relational data; critical for: SOAP web services, EDI (Electronic Data Interchange), SWIFT financial messages, HL7 healthcare, FIX protocol trading, legacy enterprise systems that speak XML; PostgreSQL has XMLType, MySQL does not; many Oracle migration projects require it
 
 ### Phase 21 — Advanced SQL `⏳` week 49-51
-- [ ] 21.1 ⏳ Savepoints — `SAVEPOINT`, `ROLLBACK TO`, `RELEASE`
+- [x] 21.1 ✅ Savepoints — `SAVEPOINT name`, `ROLLBACK TO [SAVEPOINT] name`, `RELEASE [SAVEPOINT] name` — implemented in Phase 7.12; stack-based MySQL/PG/SQLite compatible model; nested; duplicate names allowed (most-recent wins)
 - [ ] 21.2 ⏳ CTEs — `WITH` queries
 - [ ] 21.3 ⏳ Recursive CTEs — `WITH RECURSIVE` for trees and hierarchies
 - [ ] 21.4 ⏳ RETURNING — in INSERT, UPDATE, DELETE
@@ -565,7 +565,7 @@
 - [ ] 21.10 ⏳ Cursors — `DECLARE`, `FETCH`, `CLOSE`
 - [ ] 21.11 ⏳ Query hints — `/*+ INDEX() HASH_JOIN() PARALLEL() */`
 - [ ] 21.12 ⏳ DISTINCT ON — first row per group `SELECT DISTINCT ON (user_id) *`
-- [ ] 21.13 ⏳ NULLS FIRST / NULLS LAST — `ORDER BY price ASC NULLS LAST`
+- [x] 21.13 ✅ NULLS FIRST / NULLS LAST — implemented in Phase 4.10c; ASC→NULLS LAST and DESC→NULLS FIRST as PG defaults; explicit override supported
 - [ ] 21.14 ⏳ CREATE TABLE AS SELECT — create table from query result
 - [ ] 21.15 ⏳ CREATE TABLE LIKE — clone structure from another table
 - [ ] 21.16 ⏳ DEFERRABLE constraints — `DEFERRABLE INITIALLY DEFERRED/IMMEDIATE`; buffer of pending violations per transaction; verify all on COMMIT; full rollback if any fail; prerequisite for bulk imports without FK ordering
@@ -722,7 +722,7 @@
 - [ ] 24.6 ⏳ BIT(n) / VARBIT(n) — bit strings with `bitvec`
 - [ ] 24.7 ⏳ TIMESTAMPTZ — always UTC internally, convert on display
 - [ ] 24.8 ⏳ INTERVAL — months/days/µs separated with calendar arithmetic
-- [ ] 24.9 ⏳ UUID v4/v7 — `[u8;16]`, v7 sortable for PKs
+- [x] 24.9 ✅ UUID v4/v7 — implemented in Phase 4.19c: `gen_random_uuid()`/`uuid_generate_v4()` (v4 random); `uuid_generate_v7()`/`uuid7()` (v7 time-ordered, better B-tree locality); `is_valid_uuid(text)→BOOL`; storage as `[u8;16]` in codec
 - [ ] 24.10 ⏳ INET, CIDR, MACADDR — network types with operators
 - [ ] 24.11 ⏳ RANGE(T) — `int4range`, `daterange`, `tsrange` with `@>` and `&&`
 - [ ] 24.12 ⏳ COMPOSITE types — `CREATE TYPE ... AS (fields)`
@@ -736,7 +736,7 @@
 - [ ] 25.3 ⏳ VECTOR quantization — f16 (2x savings) and int8 (4x savings)
 - [ ] 25.4 ⏳ PAX layout — columnar within each 8KB page
 - [ ] 25.5 ⏳ Per-column statistics — histogram, correlation, most_common
-- [ ] 25.6 ⏳ ANALYZE — update statistics manually and automatically
+- [x] 25.6 ✅ ANALYZE — implemented in Phase 6.12: `ANALYZE [TABLE name [(column)]]`; exact NDV full scan; resets staleness; `StaleStatsTracker` in SessionContext (Phase 6.11); auto-update after >20% row change
 - [ ] 25.7 ⏳ Zero-copy rkyv — B+ Tree nodes without deserializing from mmap
 - [ ] 25.8 ⏳ Compression by type — Delta, BitPack, LZ4, ZSTD by column
 - [ ] 25.9 ⏳ Encoding benchmarks — compare VarInt vs fixed, PAX vs NSM, zero-copy vs deserialize
@@ -775,17 +775,17 @@
 - [ ] 27.11 ⏳ OR-to-UNION rewrite — `WHERE a=1 OR b=2` → `SELECT WHERE a=1 UNION SELECT WHERE b=2`; allows using two different indexes vs full scan
 
 ### Phase 28 — SQL completeness `⏳` week 79-81
-- [ ] 28.1 ⏳ Isolation levels — READ COMMITTED, REPEATABLE READ, SERIALIZABLE (SSI)
-- [ ] 28.2 ⏳ SELECT FOR UPDATE / FOR SHARE / SKIP LOCKED / NOWAIT
+- [x] 28.1 ✅ Isolation levels — RC, RR, SERIALIZABLE (aliased to RR snapshot) implemented in Phase 7.1; `SET TRANSACTION ISOLATION LEVEL`; `TxnManager::active_snapshot()` returns fresh (RC) or frozen (RR) snapshots; isolation tests in 7.13
+- [ ] 28.2 ⏳ SELECT FOR UPDATE / FOR SHARE / SKIP LOCKED / NOWAIT; ⚠️ DUPLICATE of 13.8b and 28.11 — implement once when Phase 40.5 (LockManager) is ready
 - [ ] 28.3 ⏳ LOCK TABLE — ACCESS SHARE, ROW EXCLUSIVE, ACCESS EXCLUSIVE modes
 - [ ] 28.4 ⏳ Advisory locks — `pg_advisory_lock` / `pg_try_advisory_lock`
 - [ ] 28.5 ⏳ UNION / UNION ALL / INTERSECT / EXCEPT
-- [ ] 28.6 ⏳ EXISTS / NOT EXISTS / IN subquery / correlated subqueries
-- [ ] 28.7 ⏳ Simple and searched CASE — in SELECT, WHERE, ORDER BY
+- [x] 28.6 ✅ EXISTS / NOT EXISTS / IN subquery / correlated subqueries / derived tables — implemented in Phase 4.11; `SubqueryRunner` trait + `eval_with`; 14 integration tests
+- [x] 28.7 ✅ Simple and searched CASE — implemented in Phase 4.24; NULL semantics; nested; works in SELECT/WHERE/ORDER BY/GROUP BY
 - [ ] 28.8 ⏳ TABLESAMPLE SYSTEM and BERNOULLI with REPEATABLE
 - [ ] 28.9 ⏳ Serializable Snapshot Isolation (SSI) — write-read dependency graph between transactions; DFS to detect cycles; automatic rollback of the youngest transaction on cycle detection; prerequisite: 7.1 (MVCC visibility)
 - [ ] 28.10 ⏳ Isolation level tests — dirty read, non-repeatable read, phantom read; each test uses real concurrent transactions; verify that each level prevents exactly what it should and no more
-- [ ] 28.11 ⏳ SELECT FOR UPDATE / FOR SHARE with skip locked — required by job queues (Celery, Sidekiq, Resque); without this feature task ORMs do not work
+- [ ] 28.11 ⏳ SELECT FOR UPDATE / FOR SHARE with skip locked — required by job queues; ⚠️ TRIPLICATE of 13.8b and 28.2 — implement once when Phase 40.5 is ready
 
 ### Phase 29 — Complete functions `⏳` week 82-84
 - [ ] 29.1 ⏳ Advanced aggregations — `STRING_AGG`, `ARRAY_AGG`, `JSON_AGG`
@@ -795,9 +795,9 @@
 - [ ] 29.5 ⏳ Date functions — `AT TIME ZONE`, `AGE`, `TO_CHAR`, `TO_DATE`
 - [ ] 29.6 ⏳ Timezone database — embedded tzdata, portable without depending on the OS
 - [ ] 29.7 ⏳ Math functions — trigonometry, logarithms, `GCD`, `RANDOM`
-- [ ] 29.8 ⏳ COALESCE / NULLIF / GREATEST / LEAST — basic comparison functions
-- [ ] 29.9 ⏳ GENERATE_SERIES — numeric and date sequence generator
-- [ ] 29.10 ⏳ UNNEST — expand array to individual rows
+- [x] 29.8 ⚠️ COALESCE / NULLIF — implemented in Phase 4.19 (COALESCE) and eval/functions/nulls.rs (NULLIF); GREATEST / LEAST NOT yet implemented → remaining gap
+- [ ] 29.9 ⏳ GENERATE_SERIES — numeric and date sequence generator; ⚠️ DUPLICATE of 20.10 — implement once and mark both
+- [ ] 29.10 ⏳ UNNEST — expand array to individual rows; ⚠️ DUPLICATE of 20.14 — implement once and mark both
 - [ ] 29.11 ⏳ ARRAY_TO_STRING / STRING_TO_ARRAY — array ↔ text conversion
 - [ ] 29.12 ⏳ JSON_OBJECT / JSON_ARRAY / JSON_BUILD_OBJECT — JSON constructors
 - [ ] 29.13 ⏳ WIDTH_BUCKET — assign values to buckets for histograms
@@ -817,7 +817,7 @@
 - [ ] 30.5 ⏳ CREATE INDEX CONCURRENTLY — without blocking writes
 - [ ] 30.6 ⏳ Complete information_schema — tables, columns, constraints
 - [ ] 30.7 ⏳ Basic pg_catalog — pg_class, pg_attribute, pg_index
-- [ ] 30.8 ⏳ DESCRIBE / SHOW TABLES / SHOW CREATE TABLE
+- [x] 30.8 ⚠️ DESCRIBE / SHOW TABLES / SHOW COLUMNS — implemented in Phase 4.20 (MySQL-compatible 6-column output); SHOW CREATE TABLE NOT yet implemented → remaining gap
 - [ ] 30.9 ⏳ Two-phase commit — `PREPARE TRANSACTION` / `COMMIT PREPARED`
 - [ ] 30.10 ⏳ DDL Triggers — `CREATE EVENT TRIGGER ON ddl_command_end`
 - [ ] 30.11 ⏳ TABLESPACES — `CREATE TABLESPACE`, tiered storage
@@ -842,7 +842,7 @@
 - [x] 31.9 ✅ Strict mode — already implemented in 4.25c; no action needed
 - [ ] 31.10 ⏳ Logical replication — `CREATE PUBLICATION` + `CREATE SUBSCRIPTION`
 - [ ] 31.11 ⏳ mTLS + pg_hba.conf equivalent
-- [ ] 31.12 ⏳ Connection string DSN — `axiomdb://user:pass@host:port/dbname?param=val`; `postgres://` and `mysql://` as aliases
+- [x] 31.12 ✅ Connection string DSN — implemented in Phase 5.15: `axiomdb://`, `mysql://`, `postgres://`, `file:` and plain paths; percent-decodes credentials; `Db::open_dsn`, `axiomdb_open_dsn`; `AXIOMDB_URL` env var
 - [ ] 31.13 ⏳ Read replicas routing — automatically route read-only queries to replicas from the connection pool
 
 ### Phase 32 — Final architecture `⏳` week 91-93
@@ -852,7 +852,7 @@
 - [ ] 32.4 ⏳ Central engine with complete pipeline — cache→parse→rbac→plan→opt→exec→audit
 - [ ] 32.5 ⏳ WAL as event bus — replication, CDC, cache, triggers, audit
 - [ ] 32.6 ⏳ Release profiles — LTO fat, codegen-units=1, panic=abort
-- [ ] 32.7 ⏳ CI/CD — GitHub Actions with test + clippy + bench on each PR
+- [x] 32.7 ✅ CI/CD — GitHub Actions implemented: `.github/workflows/ci.yml` (push/PR: test + clippy) + `release.yml` (tags v*: Linux musl + macOS arm64/x86 binaries) + `deploy-docs.yml`; ⚠️ DUPLICATE of 35.9
 - [ ] 32.8 ⏳ Stable plugin API — version public API with semver; ABI guarantees for extensions
 - [ ] 32.9 ⏳ Regression test suite — reproduce historical bugs; safety net for the final refactor
 
@@ -929,7 +929,7 @@
 - [ ] 35.6 ⏳ axiomdb-client crate — official Rust SDK with connection pool
 - [ ] 35.7 ⏳ Python package — `pip install axiomdb-python` with psycopg2-style API
 - [ ] 35.8 ⏳ Homebrew formula — `brew install axiomdb` for macOS
-- [ ] 35.9 ⏳ GitHub Actions CI — test + clippy + bench + fuzz on each PR
+- [x] 35.9 ✅ GitHub Actions CI — implemented (see Phase 32.7: ci.yml + release.yml + deploy-docs.yml); fuzz targets still pending
 - [ ] 35.10 ⏳ Performance tuning guide — which parameters to adjust for each workload
 - [ ] 35.11 ⏳ Kubernetes operator — `AxiomDBCluster` CRD with replica management and auto-scaling
 - [ ] 35.12 ⏳ Helm chart — K8s deployment with production defaults
