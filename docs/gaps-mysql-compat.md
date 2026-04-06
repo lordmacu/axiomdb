@@ -1,6 +1,6 @@
 # MySQL Compatibility Gaps — AxiomDB
 
-Last updated: 2026-04-06 (eighth audit)
+Last updated: 2026-04-06 (ninth audit)
 
 This document tracks SQL features that are missing or incomplete relative to MySQL 8.
 Items are ordered by implementation priority within each section.
@@ -262,6 +262,21 @@ the connection is a protocol violation that causes client reconnect loops.
 
 Fix: add match arms for known-but-unimplemented COM bytes that return ERR 1047 +
 keep the connection alive; only truly unknown bytes should close.
+
+### FK references not updated when a table is renamed — **data integrity bug**
+
+`ALTER TABLE t RENAME TO new_name` and `RENAME TABLE t TO new_name` do not update
+foreign key definitions that reference the renamed table. If table `orders` has a FK
+pointing to `users`, and `users` is renamed to `accounts`, the FK catalog entry still
+stores the old reference. Subsequent FK enforcement (INSERT into `orders`, DELETE from
+`accounts`) breaks silently or errors with table-not-found.
+
+- `executor/ddl.rs:1697-1711` — `alter_rename_table()` updates only the table's own
+  catalog entry; it does not scan `axiom_foreign_keys` for `parent_table_id` or child
+  references pointing to the renamed table
+- Fix: after updating the table catalog entry, query `axiom_foreign_keys` for all FK
+  rows where `parent_table_name = old_name` (or `parent_table_id`) and update them
+  to the new name; do the same for child-side FKs if stored by name
 
 ### `COUNT(DISTINCT col)` / `SUM(DISTINCT col)` / `AVG(DISTINCT col)` not parsed
 
@@ -710,6 +725,73 @@ decide how to format and display values. Wrong codes cause silent display errors
 Fix: add `ColumnType::TinyInt`, `SmallInt`, `MediumInt`, `Time`, `DateTime` to the
 type system; map all in `datatype_to_mysql_type()`.
 
+### Standalone `RENAME TABLE t1 TO t2` statement not in parser
+
+MySQL's `RENAME TABLE` is a standalone DDL statement, distinct from `ALTER TABLE t
+RENAME TO t2`. It also supports renaming multiple tables atomically:
+
+```sql
+RENAME TABLE users TO accounts;
+RENAME TABLE a TO b, c TO d;   -- atomic multi-rename
+```
+
+There is no `RenameTable` variant in the `Stmt` enum (`ast.rs:472-513`). Only
+`ALTER TABLE t RENAME TO ...` is handled. ORMs (ActiveRecord, Flyway, Liquibase)
+generate the standalone form.
+
+Fix: add `Stmt::RenameTable(Vec<(String, String)>)` to the AST; parse in
+`parser/mod.rs`; executor calls `alter_rename_table()` for each pair atomically.
+
+### `@@global.var` / `@@session.var` prefix not stripped in variable lookup
+
+`SELECT @@global.max_allowed_packet` passes `"@@global.max_allowed_packet"` to
+`session.rs:get_variable()`. The function strips `@@session.` and `@@` but not
+`@@global.`, so the lookup fails and returns `None`.
+
+```sql
+SELECT @@global.max_allowed_packet;    -- None → client error
+SELECT @@session.transaction_isolation; -- works
+SET @@global.autocommit = 1;           -- variable name not stripped correctly
+```
+
+Fix: in `get_variable()` and `apply_set()`, strip `@@global.` prefix with the same
+treatment as `@@session.`.
+
+### `SET CHARACTER SET charset` not handled
+
+`SET CHARACTER SET utf8mb4` is a MySQL statement that sets only the client character
+set (not the connection collation, unlike `SET NAMES`). It is not handled in
+`session.rs:apply_set()` — only `SET NAMES` and generic variable assignments are
+there. JDBC drivers use this form.
+
+Fix: add a branch in `apply_set()` recognising `CHARACTER SET` (two tokens) and
+setting `client_charset` only.
+
+### Missing session variables: `character_set_system`, `init_connect`, `collation_server`
+
+These MySQL standard read-only variables return `None` from `get_variable()` and
+cause errors in ORMs and monitoring tools:
+
+- `character_set_system` — always `utf8mb4` in MySQL 8
+- `init_connect` — SQL to run on new connections; default is `""` (empty)
+- `collation_server` — server-level collation; default `utf8mb4_0900_ai_ci`
+- `character_set_server` — already partially handled?
+
+Fix: add explicit `Some(...)` returns in `get_variable()` before the fallthrough.
+
+### `ALTER TABLE t CONVERT TO CHARACTER SET charset`
+
+Rewrites all text columns to a new character set. Not in the `AlterTableOp` enum
+(`ast.rs:345-389`). Common in migrations upgrading `latin1` → `utf8mb4`.
+
+```sql
+ALTER TABLE users CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+```
+
+Fix: add `AlterTableOp::ConvertCharset { charset: String, collate: Option<String> }`;
+executor rewrites TEXT/VARCHAR column encodings and updates table/column metadata in
+catalog.
+
 ### `UPDATE t SET col = DEFAULT` not parsed
 
 MySQL's `DEFAULT` keyword is valid in the SET clause of UPDATE to reset a column
@@ -1111,6 +1193,35 @@ expression context (`parser/expr.rs:406-556`).
 
 Fix: after parsing any leaf expression (identifier, string literal), check for
 `Token::Collate ident` and wrap in `Expr::Collate { expr, collation }`.
+
+### `CREATE INDEX … USING HASH` silently creates a B-Tree
+
+`CREATE INDEX idx ON t(col) USING HASH` is valid MySQL syntax and should either
+create a hash index or return a clear "not supported" error. Currently it maps
+silently to a B-Tree (`executor/ddl.rs:931-934`) with no warning, so clients that
+check index metadata via `SHOW INDEX` will see `BTREE` where they expected `HASH`.
+
+Fix: either add `IndexType::Hash` with explicit `NotImplemented` execution (honest
+error) or emit a warning that HASH is silently promoted to BTREE.
+
+### `CREATE INDEX … COMMENT 'text'` — comment field not persisted
+
+`CREATE INDEX idx ON t(col) COMMENT 'my comment'` — MySQL allows attaching a comment
+to an index — is not parsed. The `CreateIndexStmt` struct has no `comment` field
+(`ast.rs:304-322`). The clause either causes a parse error or is silently discarded.
+
+Fix: add `comment: Option<String>` to `CreateIndexStmt` and `IndexDef`; parser
+consumes `COMMENT 'text'` after the WITH clause; catalog stores it.
+
+### `RENAME TABLE a TO b, c TO d` multi-table atomic rename
+
+The current rename implementation processes one pair via `break` after the first
+`RenameTable` op (`ddl.rs:1711`), preventing multi-pair renames. MySQL guarantees
+all renames in a `RENAME TABLE a TO b, c TO d` are atomic.
+
+Fix: remove the `break` from the ALTER TABLE rename branch and collect all rename
+pairs before executing; or handle multi-pair rename in the standalone `RENAME TABLE`
+statement (once that is added).
 
 ### `COM_FIELD_LIST` (0x04)
 
