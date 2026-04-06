@@ -65,6 +65,38 @@ with date-only columns.
 
 These affect specific use cases but are not blockers for basic ORM usage.
 
+### `DROP PRIMARY KEY` on clustered table
+
+`ALTER TABLE t DROP PRIMARY KEY` returns `NotImplemented` on clustered tables.
+The PK is the clustered index root — dropping it requires a full table rebuild
+back to heap layout (reverse of `ALTER TABLE REBUILD`).
+
+- `executor/ddl.rs:1031`
+- Only relevant for clustered tables; heap tables don't have an inline PK tree
+
+### `ALTER TABLE DROP / MODIFY COLUMN` auto-index handling
+
+`DROP COLUMN col` and `MODIFY COLUMN col ...` return `NotImplemented` if the
+column is part of an index (`ddl.rs:1858`, `ddl.rs:1944`). Current error message:
+"Cannot drop/change type: it is part of index. Drop the index first."
+
+MySQL automatically drops or rebuilds the index as part of the column operation.
+ORMs expect this to work without manual index removal.
+
+- `executor/ddl.rs:1858` (DROP COLUMN guard)
+- `executor/ddl.rs:1944` (MODIFY COLUMN type-change guard)
+- Fix: detect affected indexes, drop them, rewrite column, rebuild the index
+
+### `SHOW WARNINGS` / `SHOW ERRORS`
+
+Not in the parser. MySQL connectors (JDBC, MySQL Connector/Python, mysqlclient)
+issue `SHOW WARNINGS` after every DML statement to surface soft errors and
+notes. Without it, JDBC-based ORMs may hang waiting for a response.
+
+- Parser: add `ShowWarningsStmt` / `ShowErrorsStmt`
+- Executor: return the per-session warning buffer; `SHOW WARNINGS LIMIT N`
+  and `SHOW ERRORS` should read from a `Vec<Warning>` on `SessionContext`
+
 ### `SHOW CREATE TABLE`
 
 Used by MySQL Workbench, Sequel Pro, and `mysqldump` to reconstruct schemas.
@@ -184,6 +216,65 @@ Not implemented. Needed for date arithmetic.
 ### `TIMESTAMPDIFF()`
 
 Not implemented. Common in age/duration calculations.
+
+### `DATE()` scalar function
+
+`DATE(ts)` extracts the date portion from a TIMESTAMP. Not in `eval/functions/datetime.rs`.
+Also missing: `TIME(ts)` (extract time), `ADDDATE()` / `SUBDATE()` (aliases for
+`DATE_ADD` / `DATE_SUB`).
+
+- `eval/functions/datetime.rs`
+
+### `EXTRACT(unit FROM expr)`
+
+SQL standard date/time extraction not in parser or evaluator.
+`EXTRACT(YEAR FROM ts)` returns the year as an integer. Differs from `YEAR(ts)` in that
+the unit is a keyword, not a function argument.
+
+- Parser: special-case `EXTRACT(unit FROM expr)` syntax
+- Evaluator: map to existing year/month/day/hour/minute/second logic
+
+### Additional date component functions
+
+Not implemented: `WEEK()`, `WEEKDAY()`, `WEEKOFYEAR()`, `QUARTER()`, `DAYNAME()`,
+`MONTHNAME()`, `DAYOFWEEK()`, `DAYOFMONTH()`, `DAYOFYEAR()`, `YEARWEEK()`,
+`LAST_DAY()`, `MAKEDATE(year, day)`, `MAKETIME(h, m, s)`, `TIME_TO_SEC()`, `SEC_TO_TIME()`.
+All belong in `eval/functions/datetime.rs`.
+
+### `SHA1()` / `SHA2()` / `MD5()` hash functions
+
+Not implemented. Used for content hashing, password migration scripts, and checksums.
+
+- `eval/functions/` — straightforward: call Rust `sha1` / `sha2` / `md5` crate
+
+### `SLEEP(seconds)` function
+
+Not implemented. Widely used in integration tests and simulations.
+MySQL: `SLEEP(N)` pauses N seconds and returns 0 (or 1 if interrupted).
+
+- `eval/functions/system.rs` — `std::thread::sleep(Duration::from_secs_f64(n))`
+
+### `TRUNCATE(n, d)` numeric function
+
+Not implemented. `TRUNCATE(3.14159, 2)` → `3.14`. Different from `TRUNCATE TABLE`.
+Commonly used in financial calculations.
+
+- `eval/functions/numeric.rs`
+
+### `BIN()` / `OCT()` / `CONV()` base conversion
+
+Not implemented. `BIN(255)` → `'11111111'`; `OCT(8)` → `'10'`;
+`CONV('ff', 16, 10)` → `'255'`. Used for bit manipulation and protocol parsing.
+
+- `eval/functions/numeric.rs` or `string.rs`
+
+### `ELT()` / `FIELD()` string lookup functions
+
+Not implemented. `ELT(2, 'a', 'b', 'c')` → `'b'` (Nth element);
+`FIELD('b', 'a', 'b', 'c')` → `2` (1-based position of first match, 0 if not found).
+Common in enum-style queries without a lookup table.
+
+- `eval/functions/string.rs`
 
 ### `CONVERT(expr USING charset)`
 
