@@ -1,6 +1,6 @@
 # MySQL Compatibility Gaps — AxiomDB
 
-Last updated: 2026-04-06 (ninth audit)
+Last updated: 2026-04-06 (tenth audit)
 
 This document tracks SQL features that are missing or incomplete relative to MySQL 8.
 Items are ordered by implementation priority within each section.
@@ -277,6 +277,119 @@ stores the old reference. Subsequent FK enforcement (INSERT into `orders`, DELET
 - Fix: after updating the table catalog entry, query `axiom_foreign_keys` for all FK
   rows where `parent_table_name = old_name` (or `parent_table_id`) and update them
   to the new name; do the same for child-side FKs if stored by name
+
+### CHECK constraints not evaluated on `UPDATE` — **bug**
+
+`check_row_constraints()` is called on INSERT paths but never on UPDATE. Any
+`CHECK (price > 0)` or `CHECK (status IN ('active','inactive'))` constraint defined
+on a table can be violated silently via UPDATE.
+
+```sql
+CREATE TABLE products (price DECIMAL(10,2) CHECK (price > 0));
+INSERT INTO products VALUES (5.00);   -- enforced ✓
+UPDATE products SET price = -1.00;    -- AxiomDB: succeeds, MySQL: ERROR 3819
+```
+
+- `executor/update.rs` — add `check_row_constraints(storage, catalog, txn, &table, &new_values)`
+  before writing rows in all three update paths (heap, clustered, field-patch)
+
+### `ROUND(2.5)` returns 2 instead of 3 — banker's rounding vs MySQL round-half-up — **bug**
+
+`eval/functions/numeric.rs:90` uses Rust's `.round()` which implements IEEE 754
+banker's rounding (round-to-nearest-even). MySQL uses round-half-up:
+
+```sql
+SELECT ROUND(2.5);   -- MySQL: 3,  AxiomDB: 2  ← wrong
+SELECT ROUND(3.5);   -- MySQL: 4,  AxiomDB: 4  ← correct
+SELECT ROUND(4.5);   -- MySQL: 5,  AxiomDB: 4  ← wrong
+SELECT ROUND(-2.5);  -- MySQL: -3, AxiomDB: -2 ← wrong
+```
+
+Fix: replace `.round()` with `(f * factor + 0.5 * f.signum()).floor() / factor`
+(positive) and its sign-aware equivalent (negative).
+
+### Hex literals (`0xFF`, `x'FF'`) and binary literals (`0b1010`, `b'1010'`) not parsed
+
+The lexer has no regex patterns for MySQL hex and binary literal forms (`lexer.rs`).
+They are tokenized as identifiers or cause parse errors:
+
+```sql
+SELECT 0xFF;             -- parse error or wrong value
+SELECT x'48656c6c6f';   -- parse error (should be 'Hello')
+SELECT 0b1010;          -- parse error
+SELECT b'1010';         -- parse error
+```
+
+All four forms appear in MySQL migration scripts and bitfield-heavy schemas.
+
+Fix: add lexer patterns: `0x[0-9a-fA-F]+` (→ integer), `x'[0-9a-fA-F]+'` (→ bytes),
+`0b[01]+` (→ integer), `b'[01]+'` (→ bytes).
+
+### Double-quote strings not supported with `ANSI_QUOTES` OFF (MySQL default)
+
+In MySQL's default configuration (`ANSI_QUOTES` is OFF), double-quoted values are
+string literals, not identifiers:
+
+```sql
+SELECT "hello";          -- MySQL: returns 'hello' as TEXT
+SELECT "users"."name";   -- MySQL: column reference (ANSI_QUOTES ON)
+```
+
+AxiomDB always parses `"..."` as a quoted identifier (`DqIdent` in the lexer),
+never as a string literal. Any MySQL application that uses double-quoted strings
+without setting `ANSI_QUOTES` will get wrong results.
+
+Fix: expose `sql_mode` / `ansi_quotes: bool` on `SessionContext`; when `false`
+(MySQL default), the lexer treats `"..."` as `StringLit`; add toggle via
+`SET sql_mode = 'ANSI_QUOTES'`.
+
+### Float division by zero returns `Infinity` instead of `NULL` — **bug**
+
+`eval/ops.rs:216` performs IEEE 754 division: when the divisor is `0.0`, Rust
+returns `±Infinity` instead of `NULL`. MySQL returns `NULL` for any division by zero
+(integer or float).
+
+```sql
+SELECT 1.0 / 0;    -- MySQL: NULL,  AxiomDB: Inf   ← wrong
+SELECT -1.0 / 0;   -- MySQL: NULL,  AxiomDB: -Inf  ← wrong
+```
+
+Fix: add `if b == 0.0 { return Ok(Value::Null); }` before the float division
+in `ops.rs`.
+
+### Integer literal overflow silently dropped by lexer
+
+The lexer parses integer literals with `.parse::<i64>().ok()` — when a literal
+exceeds `i64::MAX` (9223372036854775807), `ok()` swallows the error and the token
+is silently dropped. The query then fails with a confusing parse error:
+
+```sql
+SELECT 9999999999999999999;        -- AxiomDB: parse error, MySQL: BigInt literal
+INSERT INTO t VALUES (10000000000000000000);  -- silently broken
+```
+
+Fix: try `i64` first; on overflow, try `u64`; if still too large, parse as
+`f64` with a precision warning (same approach MySQL uses for BIGINT UNSIGNED).
+
+### MySQL error numbers not returned in ERR packets
+
+MySQL ERR packets carry both a SQLSTATE code AND a 2-byte MySQL error number
+(e.g. 1054 for unknown column, 1048 for NOT NULL, 1050 for table already exists).
+AxiomDB uses PostgreSQL-style SQLSTATE codes in the ERR packet:
+
+| Error | AxiomDB SQLSTATE | MySQL SQLSTATE | MySQL error# |
+|---|---|---|---|
+| Table not found | `42P01` | `42S02` | 1146 |
+| Column not found | `42703` | `42S22` | 1054 |
+| NOT NULL violated | `23502` | `23000` | 1048 |
+| Unique violated | `23505` | `23000` | 1062 |
+
+MySQL clients (JDBC, connectors, ORMs) match on the error number first, SQLSTATE
+second. Wrong SQLSTATE codes cause silent misclassification of errors.
+
+Fix: add a `mysql_error_code() -> u16` method to `DbError` and ensure the ERR
+packet serialiser in `result.rs` uses MySQL-compatible codes (1146, 1054, 1048,
+1062, etc.) instead of the PostgreSQL equivalents.
 
 ### `COUNT(DISTINCT col)` / `SUM(DISTINCT col)` / `AVG(DISTINCT col)` not parsed
 
@@ -1222,6 +1335,16 @@ all renames in a `RENAME TABLE a TO b, c TO d` are atomic.
 Fix: remove the `break` from the ALTER TABLE rename branch and collect all rename
 pairs before executing; or handle multi-pair rename in the standalone `RENAME TABLE`
 statement (once that is added).
+
+### Prepared statement parameter count not validated (> 65535)
+
+`parse_execute_packet()` in `prepared.rs` reads `param_count` from the prepared
+statement but does not validate it is ≤ 65535 (MySQL's limit). A malformed or
+crafted packet declaring 100,000 parameters would cause a large null-bitmap
+allocation.
+
+Fix: add `if param_count > 65535 { return Err(DbError::InvalidValue { ... }); }`
+before processing the null bitmap in `parse_execute_packet()`.
 
 ### `COM_FIELD_LIST` (0x04)
 
