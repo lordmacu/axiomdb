@@ -937,6 +937,10 @@ fn dispatch_ctx(
             let db = ddl_database(&s.table.database, ctx);
             execute_show_columns(s, storage, txn, &db)
         }
+        Stmt::ShowIndex(s) => {
+            let db = ddl_database(&s.table.database, ctx);
+            execute_show_index(s, storage, txn, &db)
+        }
         Stmt::TruncateTable(s) => {
             let db = ddl_database(&s.table.database, ctx);
             execute_truncate(s, storage, txn, &db)
@@ -1174,6 +1178,7 @@ fn dispatch(
         Stmt::ShowDatabases(s) => execute_show_databases(s, storage, txn),
         Stmt::ShowTables(s) => execute_show_tables(s, storage, txn, DEFAULT_DATABASE_NAME),
         Stmt::ShowColumns(s) => execute_show_columns(s, storage, txn, DEFAULT_DATABASE_NAME),
+        Stmt::ShowIndex(s) => execute_show_index(s, storage, txn, DEFAULT_DATABASE_NAME),
         Stmt::Analyze(_) => Err(DbError::NotImplemented {
             feature: "ANALYZE requires session context — use execute_with_ctx".into(),
         }),

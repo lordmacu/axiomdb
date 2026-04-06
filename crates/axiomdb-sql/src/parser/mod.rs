@@ -314,9 +314,26 @@ impl<'src> Parser<'src> {
                         let table = self.parse_table_ref()?;
                         Ok(Stmt::ShowColumns(crate::ast::ShowColumnsStmt { table }))
                     }
+                    // SHOW INDEX FROM table
+                    Token::Index => {
+                        self.advance();
+                        self.expect(&Token::From)?;
+                        let table = self.parse_table_ref()?;
+                        Ok(Stmt::ShowIndex(crate::ast::ShowIndexStmt { table }))
+                    }
+                    // SHOW INDEXES / SHOW KEYS FROM table
+                    Token::Ident(kw)
+                        if kw.eq_ignore_ascii_case("indexes")
+                            || kw.eq_ignore_ascii_case("keys") =>
+                    {
+                        self.advance();
+                        self.expect(&Token::From)?;
+                        let table = self.parse_table_ref()?;
+                        Ok(Stmt::ShowIndex(crate::ast::ShowIndexStmt { table }))
+                    }
                     other => Err(DbError::ParseError {
                         message: format!(
-                            "expected DATABASES, TABLES or COLUMNS after SHOW, found {:?}",
+                            "expected DATABASES, TABLES, COLUMNS or INDEX after SHOW, found {:?}",
                             other,
                         ),
                         position: Some(self.current_pos()),

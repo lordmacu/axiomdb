@@ -413,6 +413,12 @@ pub struct ShowColumnsStmt {
     pub table: TableRef,
 }
 
+/// `SHOW INDEX FROM table` / `SHOW INDEXES FROM table` / `SHOW KEYS FROM table`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowIndexStmt {
+    pub table: TableRef,
+}
+
 /// Value assigned in a `SET` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SetValue {
@@ -485,6 +491,7 @@ pub enum Stmt {
     ShowTables(ShowTablesStmt),
     ShowDatabases(ShowDatabasesStmt),
     ShowColumns(ShowColumnsStmt),
+    ShowIndex(ShowIndexStmt),
     // Transaction control
     Begin,
     Commit,

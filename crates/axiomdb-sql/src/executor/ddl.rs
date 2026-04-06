@@ -1435,6 +1435,102 @@ fn execute_show_columns(
     })
 }
 
+/// `SHOW INDEX FROM table` / `SHOW INDEXES FROM table` / `SHOW KEYS FROM table`
+///
+/// Returns one row per indexed column (matching MySQL's `SHOW INDEX` output).
+/// Columns: Table, Non_unique, Key_name, Seq_in_index, Column_name,
+///          Collation, Cardinality, Sub_part, Packed, Null, Index_type,
+///          Comment, Index_comment, Visible.
+pub(crate) fn execute_show_index(
+    stmt: crate::ast::ShowIndexStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    database: &str,
+) -> Result<QueryResult, DbError> {
+    let schema = stmt.table.schema.as_deref().unwrap_or("public");
+    let snap = txn.active_snapshot()?;
+    let mut reader = CatalogReader::new(storage, snap)?;
+
+    let table_def =
+        reader
+            .get_table_in_database(database, schema, &stmt.table.name)?
+            .ok_or_else(|| DbError::TableNotFound {
+                name: stmt.table.name.clone(),
+            })?;
+    let col_defs = reader.list_columns(table_def.id)?;
+    let indexes = reader.list_indexes(table_def.id)?;
+
+    let out_cols = vec![
+        ColumnMeta::computed("Table", DataType::Text),
+        ColumnMeta::computed("Non_unique", DataType::Int),
+        ColumnMeta::computed("Key_name", DataType::Text),
+        ColumnMeta::computed("Seq_in_index", DataType::Int),
+        ColumnMeta::computed("Column_name", DataType::Text),
+        ColumnMeta::computed("Collation", DataType::Text),
+        ColumnMeta::computed("Cardinality", DataType::Int),
+        ColumnMeta::computed("Sub_part", DataType::Text),
+        ColumnMeta::computed("Packed", DataType::Text),
+        ColumnMeta::computed("Null", DataType::Text),
+        ColumnMeta::computed("Index_type", DataType::Text),
+        ColumnMeta::computed("Comment", DataType::Text),
+        ColumnMeta::computed("Index_comment", DataType::Text),
+        ColumnMeta::computed("Visible", DataType::Text),
+    ];
+
+    let table_name = &stmt.table.name;
+    let mut rows: Vec<Row> = Vec::new();
+
+    // Emit one row per indexed column.
+    for idx in &indexes {
+        let key_name = if idx.is_primary {
+            "PRIMARY".to_string()
+        } else {
+            idx.name.clone()
+        };
+        let non_unique = if idx.is_unique || idx.is_primary {
+            Value::Int(0)
+        } else {
+            Value::Int(1)
+        };
+
+        for (seq, ic) in idx.columns.iter().enumerate() {
+            let col_name = col_defs
+                .iter()
+                .find(|c| c.col_idx == ic.col_idx)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| format!("col_{}", ic.col_idx));
+
+            let nullable_flag = col_defs
+                .iter()
+                .find(|c| c.col_idx == ic.col_idx)
+                .map(|c| if c.nullable { "YES" } else { "" })
+                .unwrap_or("YES");
+
+            rows.push(vec![
+                Value::Text(table_name.clone()),
+                non_unique.clone(),
+                Value::Text(key_name.clone()),
+                Value::Int((seq + 1) as i32),
+                Value::Text(col_name),
+                Value::Text("A".into()),    // Collation: Ascending
+                Value::Int(0),              // Cardinality: unknown (stats deferred)
+                Value::Null,                // Sub_part
+                Value::Null,                // Packed
+                Value::Text(nullable_flag.into()),
+                Value::Text("BTREE".into()),
+                Value::Text("".into()),     // Comment
+                Value::Text("".into()),     // Index_comment
+                Value::Text("YES".into()),  // Visible
+            ]);
+        }
+    }
+
+    Ok(QueryResult::Rows {
+        columns: out_cols,
+        rows,
+    })
+}
+
 /// Returns the SQL type name string for display in SHOW COLUMNS / DESCRIBE.
 fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
     match ct {

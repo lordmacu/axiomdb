@@ -196,7 +196,10 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             | Stmt::AlterTable(_)
             | Stmt::Analyze(_) => Ok(()),
             // Introspection — catalog meta tables, no user data table deps.
-            Stmt::ShowTables(_) | Stmt::ShowDatabases(_) | Stmt::ShowColumns(_) => Ok(()),
+            Stmt::ShowTables(_)
+            | Stmt::ShowDatabases(_)
+            | Stmt::ShowColumns(_)
+            | Stmt::ShowIndex(_) => Ok(()),
             // Transaction control — no deps.
             Stmt::Begin
             | Stmt::Commit

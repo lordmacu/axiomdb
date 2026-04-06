@@ -635,12 +635,11 @@ The rebuild path follows PostgreSQL <code>CLUSTER</code> and InnoDB sorted-rebui
 
 ### Not Yet Supported
 
-The following ALTER TABLE forms are planned for Phase 4.22b and later:
+The following ALTER TABLE forms are planned for later phases:
 
-- `MODIFY COLUMN` / `ALTER COLUMN` — changing a column's data type
-- `ADD CONSTRAINT` — adding a CHECK, UNIQUE, or FOREIGN KEY after table creation
-- `DROP CONSTRAINT` — removing a named constraint
-- Dropping columns that participate in a constraint
+- `ADD CONSTRAINT` / `DROP CONSTRAINT` for multi-column foreign keys
+- Dropping or modifying a column that participates in a secondary index (drop the index first)
+- Non-blocking `ALTER TABLE` (zero-downtime schema migration via shadow table + WAL delta)
 
 ---
 
@@ -698,3 +697,54 @@ ANALYZE TABLE orders (status);
 
 See [Index Statistics](../features/indexes.md#index-statistics-and-query-planner)
 for how NDV and row_count affect query planning decisions.
+
+---
+
+## SHOW INDEX
+
+Lists all indexes defined on a table. `SHOW INDEXES` and `SHOW KEYS` are
+synonyms recognized by MySQL clients and ORMs.
+
+```sql
+SHOW INDEX   FROM table_name;
+SHOW INDEXES FROM table_name;
+SHOW KEYS    FROM table_name;
+```
+
+The result set matches MySQL's `SHOW INDEX` column layout:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `Table` | TEXT | Table name |
+| `Non_unique` | INT | `0` for PRIMARY / UNIQUE, `1` otherwise |
+| `Key_name` | TEXT | `"PRIMARY"` for the PK; index name otherwise |
+| `Seq_in_index` | INT | 1-based column position within the index |
+| `Column_name` | TEXT | Name of the indexed column |
+| `Collation` | TEXT | `"A"` (ascending) |
+| `Cardinality` | INT | Estimated distinct values (0 until `ANALYZE` is run) |
+| `Sub_part` | TEXT | `NULL` (prefix indexes not yet supported) |
+| `Packed` | TEXT | `NULL` |
+| `Null` | TEXT | `"YES"` if the column is nullable, `""` otherwise |
+| `Index_type` | TEXT | Always `"BTREE"` |
+| `Comment` | TEXT | `""` |
+| `Index_comment` | TEXT | `""` |
+| `Visible` | TEXT | Always `"YES"` |
+
+```sql
+CREATE TABLE orders (
+    id       INT  PRIMARY KEY,
+    email    TEXT UNIQUE,
+    status   TEXT
+);
+CREATE INDEX idx_status ON orders (status);
+
+SHOW INDEX FROM orders;
+```
+
+Example output:
+
+| Table  | Non_unique | Key_name   | Seq_in_index | Column_name | … |
+|--------|-----------|------------|--------------|-------------|---|
+| orders | 0         | PRIMARY    | 1            | id          | … |
+| orders | 0         | idx_email  | 1            | email       | … |
+| orders | 1         | idx_status | 1            | status      | … |
