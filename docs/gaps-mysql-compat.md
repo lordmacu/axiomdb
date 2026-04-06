@@ -1,6 +1,6 @@
 # MySQL Compatibility Gaps — AxiomDB
 
-Last updated: 2026-04-05 (fourth audit)
+Last updated: 2026-04-05 (fifth audit)
 
 This document tracks SQL features that are missing or incomplete relative to MySQL 8.
 Items are ordered by implementation priority within each section.
@@ -87,6 +87,67 @@ after `START TRANSACTION` is parsed.
 - Fix: after consuming optional `TRANSACTION`, also eat optional `WORK` (for BEGIN)
   and optional `READ ONLY` / `READ WRITE` modifiers (for both)
 - `SessionContext.next_txn_read_only: bool` for `READ ONLY` → restrict DML
+
+### `DELETE` / `UPDATE` with `ORDER BY` + `LIMIT`
+
+`DeleteStmt` and `UpdateStmt` have no `order_by` or `limit` fields (`ast.rs:264-277`).
+The parser never reads them. Used extensively for safe batch processing:
+
+```sql
+DELETE FROM audit_log ORDER BY created_at ASC LIMIT 1000;
+UPDATE jobs SET status='retrying' ORDER BY priority DESC LIMIT 50;
+```
+
+- `ast.rs` — add `order_by: Vec<SortExpr>` and `limit: Option<Expr>` to both structs
+- `parser/dml.rs` — parse optional `ORDER BY` + `LIMIT` after `WHERE` in DELETE and UPDATE
+- Executor: apply sort + limit before mutation
+
+### `LOCK TABLES` / `UNLOCK TABLES` / `FLUSH TABLES` / `KILL`
+
+Not in the lexer — `LOCK`, `UNLOCK`, `FLUSH`, `KILL` are not token keywords.
+`mysqldump` uses all four:
+
+```sql
+LOCK TABLES t READ;
+LOCK TABLES t WRITE;
+UNLOCK TABLES;
+FLUSH TABLES;
+FLUSH TABLES WITH READ LOCK;
+KILL QUERY 42;
+KILL CONNECTION 42;
+```
+
+- Short-term fix: parse and silently ignore `LOCK`/`UNLOCK`/`FLUSH` (for import compatibility)
+- `KILL QUERY` should send an interrupt signal to the target session
+- `parser/mod.rs` — add token arms for these keywords
+
+### `CONCAT(NULL, 'a')` returns `'a'` instead of `NULL` — **bug**
+
+`eval/functions/string.rs:200` has a comment "SQL CONCAT skips NULLs (MySQL behavior)"
+but this is wrong. MySQL's `CONCAT()` returns `NULL` if **any** argument is `NULL`.
+It is `CONCAT_WS()` that skips NULLs. The current code implements `CONCAT_WS`
+semantics for `CONCAT`.
+
+```sql
+SELECT CONCAT(NULL, 'hello');  -- AxiomDB: 'hello', MySQL: NULL ← wrong
+SELECT CONCAT_WS(',', NULL, 'a');  -- AxiomDB: 'a',     MySQL: 'a'  ← correct
+```
+
+Fix: change the `Value::Null => {}` arm in `concat` to `Value::Null => return Ok(Value::Null)`.
+
+### `SUBSTR(str, -3)` returns `''` instead of `'llo'` — **bug**
+
+`eval/functions/string.rs:154`: `Value::Int(n) => n as usize`. When `n` is negative
+(e.g. `-3i64`), casting to `usize` in Rust wraps to `18446744073709551613`, which
+then clamps to `chars.len()` producing an empty slice.
+
+MySQL treats a negative start position as counting from the end of the string:
+```sql
+SUBSTR('hello', -3)     -- MySQL: 'llo',  AxiomDB: ''  ← bug
+SUBSTR('hello', -3, 2)  -- MySQL: 'll',   AxiomDB: ''  ← bug
+```
+
+Fix: before the `n as usize` cast, if `n < 0` compute `chars.len().saturating_sub(n.unsigned_abs())`.
 
 ### Expression operators: `REGEXP`, `RLIKE`, `XOR`, `DIV`, `<=>`, bitwise operators
 
@@ -175,6 +236,76 @@ with date-only columns.
 ## MEDIUM PRIORITY
 
 These affect specific use cases but are not blockers for basic ORM usage.
+
+### `LIMIT offset, count` (MySQL comma syntax — reversed)
+
+MySQL's `LIMIT offset, count` form (first number is offset, second is limit) is not
+parsed. `parser/dml.rs` only handles `LIMIT count [OFFSET offset]`.
+
+```sql
+SELECT * FROM t LIMIT 5, 10;   -- MySQL: skip 5, return 10
+                                -- AxiomDB: misparses as LIMIT 5 (correct) but ignores 10
+```
+
+The comma form is extremely common in legacy MySQL code and ORMs targeting MySQL 5.x.
+
+Fix: after parsing the first `LIMIT` number, if next token is `,` consume it and
+treat first number as offset, second as limit.
+
+### `HAVING` clause with `SELECT` alias
+
+```sql
+SELECT dept, COUNT(*) AS cnt FROM employees GROUP BY dept HAVING cnt > 5;
+```
+
+The `HAVING` clause cannot resolve `cnt` — it was defined as an alias in `SELECT`.
+AxiomDB requires repeating the expression: `HAVING COUNT(*) > 5`.
+
+MySQL (and PostgreSQL) allow aliases defined in `SELECT` to be used in `HAVING`.
+This is a very common pattern.
+
+Fix: in `executor/aggregate.rs`, before evaluating the HAVING predicate, build an alias
+map from the SELECT projections and substitute aliases in the HAVING expression.
+
+### `INSERT INTO t SET col1=1, col2=2` (MySQL-specific SET syntax)
+
+Not in the parser. MySQL's alternative INSERT syntax using assignment list:
+
+```sql
+INSERT INTO users SET name='Alice', email='alice@example.com', active=1;
+```
+
+Used by MySQL ORMs and legacy applications. `InsertSource::Set` variant missing
+from `ast.rs`.
+
+Fix: in `parser/dml.rs`, after parsing the table ref, branch on `Token::Set` →
+parse assignment list → treat as single-row `VALUES`.
+
+### `INSERT INTO t (a,b) VALUES (1, DEFAULT)` — DEFAULT in VALUES list
+
+`DEFAULT` as a value inside a `VALUES` list is not an `Expr` variant (`expr.rs`).
+Common when inserting with explicit column list and wanting defaults for some:
+
+```sql
+INSERT INTO products (name, price, stock) VALUES ('Widget', 9.99, DEFAULT);
+```
+
+Fix: add `Expr::Default` variant; in executor, resolve it to the column's default value
+(same logic as `INSERT DEFAULT VALUES`).
+
+### `CREATE DATABASE IF NOT EXISTS` / `CHARACTER SET` / `COLLATE`
+
+`parse_create_database()` (`parser/ddl.rs:19`) parses only the database name.
+Extra tokens cause parse errors:
+
+```sql
+CREATE DATABASE IF NOT EXISTS mydb;                                 -- parse error
+CREATE DATABASE mydb CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;    -- parse error
+ALTER DATABASE mydb CHARACTER SET utf8mb4;                         -- parse error
+```
+
+Fix: consume optional `IF NOT EXISTS`, then loop consuming `CHARACTER SET name`,
+`COLLATE name`, `DEFAULT CHARSET name` — all can be stored or ignored.
 
 ### `ALTER TABLE ADD INDEX` / `DROP INDEX` / `CHANGE COLUMN` / `AUTO_INCREMENT=N`
 
@@ -371,6 +502,64 @@ includes actual row counts and execution times. Used by query-analysis tools.
 
 - Parser: extend EXPLAIN stmt with `format: Option<ExplainFormat>` and `analyze: bool`
 - Executor: serialize existing plan struct as JSON for FORMAT=JSON
+
+### `COM_CHANGE_USER` (0x11) not handled
+
+JDBC connection pools (c3p0, HikariCP with older MySQL drivers) send
+`COM_CHANGE_USER` to recycle a connection with a new user context. The handler
+has no case for command byte `0x11`, so the connection will be closed or hang.
+
+Fix: in `handler.rs` command loop, add a case for `0x11` that resets session state
+and re-authenticates (or simply resets like `COM_RESET_CONNECTION`).
+
+### `INSERT LOW_PRIORITY` / `HIGH_PRIORITY` / `DELAYED` modifiers
+
+Not in the lexer. These modifiers precede `INTO` in MySQL INSERT:
+
+```sql
+INSERT LOW_PRIORITY INTO t VALUES (1);
+INSERT HIGH_PRIORITY INTO t VALUES (1);
+INSERT DELAYED INTO t VALUES (1);
+```
+
+Fix: in `parser/dml.rs`, after `Token::Insert`, consume and discard optional
+`LOW_PRIORITY`, `HIGH_PRIORITY`, or `DELAYED` before `INTO`.
+
+### `SELECT ... INTO @var` / `SELECT ... INTO OUTFILE`
+
+Not parsed. MySQL allows storing SELECT results:
+
+```sql
+SELECT name INTO @user_name FROM users WHERE id = 1 LIMIT 1;
+SELECT * INTO OUTFILE '/tmp/data.csv' FIELDS TERMINATED BY ',' FROM t;
+```
+
+The `INTO` keyword in SELECT context (between SELECT list and FROM) is not
+in the parser or AST.
+
+### `CREATE INDEX col(N)` prefix index
+
+`IndexColumn` struct (`ast.rs:169`) has no `prefix_length` field. MySQL allows
+indexing only the first N characters of a TEXT/VARCHAR column:
+
+```sql
+CREATE INDEX idx ON t (description(100));
+```
+
+Fix: add `prefix_length: Option<u32>` to `IndexColumn`; encode prefix in B-Tree key.
+
+### `FULLTEXT INDEX` / `SPATIAL INDEX` in CREATE INDEX / CREATE TABLE
+
+`IndexType` enum only has `BTree` and `Brin` (`ast.rs:290`). `FULLTEXT` and `SPATIAL`
+keywords are not in the parser. These appear in mysqldump output:
+
+```sql
+CREATE FULLTEXT INDEX ft_idx ON t (body);
+ALTER TABLE t ADD FULLTEXT INDEX ft_idx (body);
+```
+
+Fix: add `Fulltext` and `Spatial` variants to `IndexType`; executor returns
+`NotImplemented` with a clear message (or silently creates a regular B-Tree index).
 
 ### Version-conditional MySQL comments (`/*!...*/`)
 
