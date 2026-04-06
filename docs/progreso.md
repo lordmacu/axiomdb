@@ -775,7 +775,7 @@
 - [ ] 27.11 ⏳ OR-to-UNION rewrite — `WHERE a=1 OR b=2` → `SELECT WHERE a=1 UNION SELECT WHERE b=2`; allows using two different indexes vs full scan
 
 ### Phase 28 — SQL completeness `⏳` week 79-81
-- [x] 28.1 ✅ Isolation levels — RC, RR, SERIALIZABLE (aliased to RR snapshot) implemented in Phase 7.1; `SET TRANSACTION ISOLATION LEVEL`; `TxnManager::active_snapshot()` returns fresh (RC) or frozen (RR) snapshots; isolation tests in 7.13
+- [x] 28.1 ⚠️ Isolation levels — RC, RR, SERIALIZABLE (aliased to RR snapshot) implemented in Phase 7.1; `TxnManager::active_snapshot()` returns fresh (RC) or frozen (RR) snapshots; isolation tests in 7.13; ⚠️ `SET transaction_isolation = 'read committed'` works (executor/mod.rs:1098) but standard SQL syntax `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` is NOT parsed — parser only handles `variable = value` form after SET
 - [ ] 28.2 ⏳ SELECT FOR UPDATE / FOR SHARE / SKIP LOCKED / NOWAIT; ⚠️ DUPLICATE of 13.8b and 28.11 — implement once when Phase 40.5 (LockManager) is ready
 - [ ] 28.3 ⏳ LOCK TABLE — ACCESS SHARE, ROW EXCLUSIVE, ACCESS EXCLUSIVE modes
 - [ ] 28.4 ⏳ Advisory locks — `pg_advisory_lock` / `pg_try_advisory_lock`
