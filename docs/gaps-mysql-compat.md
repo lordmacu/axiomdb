@@ -1,6 +1,6 @@
 # MySQL Compatibility Gaps — AxiomDB
 
-Last updated: 2026-04-05 (fifth audit)
+Last updated: 2026-04-05 (sixth audit)
 
 This document tracks SQL features that are missing or incomplete relative to MySQL 8.
 Items are ordered by implementation priority within each section.
@@ -230,6 +230,39 @@ with date-only columns.
 
 - `executor/shared.rs:179`
 - Map to `ColumnType::Timestamp` with truncation, or add a new `ColumnType::Date`
+
+### `INSERT` column count mismatch silently pads with `NULL` — **bug**
+
+`INSERT INTO t (a, b) VALUES (1)` — one value for two columns — does not return an
+error. The executor at `insert.rs:1622-1633` silently pads the missing column with
+`NULL`, even in strict mode. MySQL returns error 1136: "Column count doesn't match
+value count at row 1".
+
+```sql
+CREATE TABLE t (a INT, b INT NOT NULL);
+INSERT INTO t (a, b) VALUES (1);   -- AxiomDB: inserts (1, NULL), MySQL: ERROR 1136
+```
+
+Silent padding masks programmer errors and violates `NOT NULL` constraints silently.
+
+Fix: in `executor/insert.rs`, after building the column map, check
+`values.len() == col_map.len()` and return `DbError::ColumnCountMismatch` if not.
+
+### Positional `ORDER BY` / `GROUP BY` (column ordinals)
+
+`ORDER BY 1, 2` and `GROUP BY 1` — referring to SELECT list columns by position —
+are not recognized by the parser or executor. MySQL and the SQL standard both support
+this. Every ORM-generated pagination query and many hand-written analytics queries
+rely on it.
+
+```sql
+SELECT name, age FROM users ORDER BY 2 DESC, 1 ASC;  -- AxiomDB: parse error
+SELECT dept, COUNT(*) FROM employees GROUP BY 1;      -- AxiomDB: parse error
+```
+
+Fix: in `executor/select.rs`, after parsing `ORDER BY` / `GROUP BY`, resolve integer
+literals to the corresponding position in the `SELECT` projection list before
+evaluating.
 
 ---
 
@@ -482,6 +515,108 @@ query analyzers.
 - `executor/mod.rs:1188`
 - Needs to be wired into the no-ctx dispatch path
 
+### `LIKE … ESCAPE '\'` clause not parsed
+
+`WHERE path LIKE 'reports\_%' ESCAPE '\'` — the `ESCAPE` clause that defines the
+escape character for `LIKE` patterns — is not in the AST or parser. Any schema that
+searches for literal `%` or `_` characters requires this.
+
+```sql
+SELECT * FROM files WHERE name LIKE '100\%' ESCAPE '\';   -- parse error
+```
+
+Fix: add `escape: Option<Expr>` to `BinaryOp::Like` or as a separate `Expr::Like`
+variant; `eval/core.rs` `like_match` already has an escape param, just needs wiring.
+
+### Column `DEFAULT` expressions not persisted in catalog
+
+`ColumnDef` in the schema (catalog's `ColumnDef` struct, `schema.rs:503`) has no
+`default_value` field. Default expressions parsed by the DDL parser are silently
+discarded after parse. Consequences:
+
+- `ON DELETE SET DEFAULT` / `ON UPDATE SET DEFAULT` FK actions cannot work
+- `INSERT DEFAULT VALUES` cannot fall back to column-defined defaults (it only
+  produces NULL or the AUTO_INCREMENT value)
+- `ALTER TABLE t ALTER COLUMN price SET DEFAULT 0` has nowhere to store the result
+
+Fix: add `default_expr: Option<Expr>` (or its SQL string form) to the persisted
+`ColumnDef`; serialize/deserialize in `catalog/schema.rs`; executor resolves it on
+INSERT and FK referential actions.
+
+### `AUTO_INCREMENT` with explicit value `0` should auto-assign
+
+MySQL treats `0` and `NULL` identically for `AUTO_INCREMENT` columns: both result
+in the next sequence value being assigned. AxiomDB stores the literal `0`.
+
+```sql
+INSERT INTO t (id, name) VALUES (0, 'Alice');  -- MySQL: id assigned 1, AxiomDB: id = 0
+```
+
+Fix: in `executor/insert.rs`, when a column has `auto_increment=true` and the
+supplied value is `Value::Int(0)`, treat it the same as `NULL` and call the
+sequence generator.
+
+### `VARCHAR(N)` length not validated or enforced
+
+`VARCHAR(10)` accepts and stores strings longer than 10 characters without truncation
+or error. The column type's `length` field is stored in the catalog but never checked
+during INSERT or UPDATE.
+
+```sql
+CREATE TABLE t (name VARCHAR(5));
+INSERT INTO t VALUES ('toolongvalue');   -- MySQL: error 1406 / truncation warning
+                                          -- AxiomDB: stored as-is
+```
+
+Fix: in `executor/insert.rs` and `executor/update.rs`, after type coercion, check
+`Value::Text(s).len() > col.varchar_len` and either truncate with a warning
+(permissive mode) or return `DataTooLong` error (strict mode).
+
+### `CHAR(n)` not distinguished from `VARCHAR(n)` — missing right-padding
+
+`CHAR(5)` stores fixed-length strings right-padded with spaces; `VARCHAR(5)` stores
+variable-length strings. AxiomDB treats both identically, making
+`SELECT length(char_col)` return wrong results and breaking CHAR-based comparison
+semantics (`'abc' = 'abc  '` is TRUE for CHAR columns in MySQL).
+
+Fix: add `ColumnType::Char(u32)` distinct from `ColumnType::Varchar(u32)` (or a
+flag on the existing VARCHAR type); pad to length on INSERT; strip trailing spaces
+before comparison and output.
+
+### Default string comparison is case-sensitive (MySQL default is case-insensitive)
+
+`SessionCollation::Binary` is the AxiomDB default, making all string comparisons
+case-sensitive. MySQL's default collation is `utf8mb4_general_ci` (case-insensitive).
+This means:
+
+```sql
+SELECT * FROM users WHERE name = 'alice';  -- MySQL: finds 'Alice'; AxiomDB: does not
+```
+
+Any application written against MySQL and then tested against AxiomDB will find
+silent behavior differences for text equality, LIKE, ORDER BY, and GROUP BY.
+
+- `session.rs` — change `SessionCollation::default()` from `Binary` to `CaseInsensitive`
+  when `CompatMode` is `MySQL` (already have `CompatMode::Mysql`)
+- Alternatively, emit the correct `@@collation_connection = utf8mb4_general_ci` in
+  the server greeting so clients see the expected default
+
+### Date string implicit coercion in comparisons
+
+`WHERE created_at = '2024-01-01'` does not implicitly parse `'2024-01-01'` as a
+`DATE`/`TIMESTAMP` when comparing against a TIMESTAMP column. MySQL automatically
+coerces the string using `STR_TO_DATE` semantics.
+
+```sql
+SELECT * FROM logs WHERE created_at = '2024-01-01';       -- AxiomDB: type error
+SELECT * FROM logs WHERE created_at >= '2024-01-01 00:00:00';  -- works (explicit)
+```
+
+Fix: in `executor/type_coercion.rs` (or `eval/core.rs`), when comparing a `Text`
+value against a `Timestamp`/`Date` column, attempt `STR_TO_DATE(text, '%Y-%m-%d')`
+and `STR_TO_DATE(text, '%Y-%m-%d %H:%i:%s')` as coercion fallbacks before
+returning a type mismatch error.
+
 ---
 
 ## LOW PRIORITY
@@ -699,6 +834,31 @@ Not implemented. `ELT(2, 'a', 'b', 'c')` → `'b'` (Nth element);
 Common in enum-style queries without a lookup table.
 
 - `eval/functions/string.rs`
+
+### `CONVERT(expr, type)` MySQL two-argument syntax
+
+MySQL's `CONVERT(expr, CHAR)` / `CONVERT(expr, UNSIGNED)` two-argument form is not
+in the function dispatcher — only `CONVERT(expr USING charset)` is partially
+handled. Both forms are common in MySQL queries:
+
+```sql
+SELECT CONVERT(price, CHAR);             -- stringify a numeric
+SELECT CONVERT('42', UNSIGNED INTEGER);  -- parse string as unsigned int
+```
+
+Fix: in `executor/select.rs` or `eval/functions/`, detect when `CONVERT` has two
+positional args (instead of `USING`) and route to the type-cast path (same as
+`CAST(expr AS type)`).
+
+### `DISTINCT` with non-selected `ORDER BY` column — missing validation
+
+`SELECT DISTINCT a FROM t ORDER BY b` should be rejected when `b` is not in the
+SELECT list (MySQL error 3065, SQL standard violation). AxiomDB currently executes
+it silently, producing undefined ordering.
+
+Fix: in the semantic analyzer (`analyzer.rs` or `select.rs`), after resolving ORDER
+BY expressions, verify that any ORDER BY column is either in the DISTINCT SELECT
+list or is an expression of a column that is.
 
 ### `CONVERT(expr USING charset)`
 
