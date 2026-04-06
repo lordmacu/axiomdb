@@ -1,6 +1,6 @@
 # MySQL Compatibility Gaps — AxiomDB
 
-Last updated: 2026-04-05
+Last updated: 2026-04-05 (third audit)
 
 This document tracks SQL features that are missing or incomplete relative to MySQL 8.
 Items are ordered by implementation priority within each section.
@@ -10,6 +10,40 @@ Items are ordered by implementation priority within each section.
 ## HIGH PRIORITY
 
 These block common ORMs, migration tools, and client libraries.
+
+### `CREATE TABLE` table options (ENGINE, CHARSET, COLLATE, COMMENT, AUTO_INCREMENT)
+
+`CREATE TABLE t (...) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+causes a **parse error** because the parser returns immediately after `)` without
+consuming table options. Every `mysqldump` output and most ORM migration scripts
+append these options. This blocks importing any real MySQL schema.
+
+- `parser/ddl.rs:58` — after `p.expect(&Token::RParen)?` add a loop that consumes
+  table options: `ENGINE=`, `DEFAULT CHARSET=`, `CHARSET=`, `COLLATE=`, `COMMENT=`,
+  `ROW_FORMAT=`, `AUTO_INCREMENT=N`, `KEY_BLOCK_SIZE=`, `COMPRESSION=`, `PACK_KEYS=`;
+  all can be silently ignored (store or discard)
+
+### `INFORMATION_SCHEMA` virtual database
+
+`SELECT * FROM information_schema.tables` / `.columns` / `.statistics` returns
+table-not-found. All major ORMs (Sequelize, TypeORM, Prisma, ActiveRecord, GORM,
+Hibernate) query `information_schema` on connect to discover schema, validate
+migrations, and generate SQL. Without it, ORM auto-discovery is impossible.
+
+- Executor: intercept queries to `information_schema.*` and route to a virtual
+  catalog reader; minimum tables: `TABLES`, `COLUMNS`, `KEY_COLUMN_USAGE`,
+  `REFERENTIAL_CONSTRAINTS`, `TABLE_CONSTRAINTS`, `STATISTICS`
+
+### `BEGIN WORK` / `START TRANSACTION READ ONLY` / `START TRANSACTION READ WRITE`
+
+`BEGIN WORK` causes a parse error: `WORK` is not consumed. `START TRANSACTION READ ONLY`
+and `START TRANSACTION READ WRITE` also fail because the `READ` token is left over
+after `START TRANSACTION` is parsed.
+
+- `parser/mod.rs:354-363`
+- Fix: after consuming optional `TRANSACTION`, also eat optional `WORK` (for BEGIN)
+  and optional `READ ONLY` / `READ WRITE` modifiers (for both)
+- `SessionContext.next_txn_read_only: bool` for `READ ONLY` → restrict DML
 
 ### `UNION` / `UNION ALL`
 
@@ -64,6 +98,34 @@ with date-only columns.
 ## MEDIUM PRIORITY
 
 These affect specific use cases but are not blockers for basic ORM usage.
+
+### `ALTER TABLE RENAME INDEX`
+
+`ALTER TABLE t RENAME INDEX old_name TO new_name` is not in the `AlterTableOp` enum.
+Common in migration tools that rename indexes without dropping/recreating them.
+
+- `ast.rs:368` — add `AlterTableOp::RenameIndex { old_name: String, new_name: String }`
+- `parser/ddl.rs` — parse `RENAME INDEX old TO new` in the ALTER TABLE dispatch
+- Executor: update index name in `axiom_indexes` catalog; no data movement needed
+
+### `SQL_CALC_FOUND_ROWS` / `FOUND_ROWS()`
+
+`SELECT SQL_CALC_FOUND_ROWS * FROM t LIMIT 10` sets a session counter to the total
+pre-LIMIT row count; `SELECT FOUND_ROWS()` returns it. Legacy MySQL pagination idiom
+(deprecated in MySQL 8.0.17 but still in wide use).
+
+- Parser: consume and discard `SQL_CALC_FOUND_ROWS` modifier in SELECT
+- Executor: before applying LIMIT, stash full row count in session
+- `eval/functions/system.rs` — add `found_rows` function reading session counter
+
+### `LAST_INSERT_ID(expr)` with argument
+
+`LAST_INSERT_ID(expr)` with a non-zero argument evaluates `expr`, stores it as the
+new last-insert-id, and returns it. Currently `system.rs:19` ignores all arguments
+and reads the thread-local. Applications use this idiom for manual sequence tracking.
+
+- `eval/functions/system.rs:19` — check `args.len() > 0`; eval `args[0]`; write to
+  `THREAD_LAST_INSERT_ID` and return the value
 
 ### `DROP PRIMARY KEY` on clustered table
 
@@ -167,6 +229,21 @@ query analyzers.
 ## LOW PRIORITY
 
 Advanced features, rarely needed for basic MySQL client compatibility.
+
+### `FORMAT(n, d)` number formatting function
+
+`FORMAT(1234567.89, 2)` → `'1,234,567.89'` — formats a number with thousands
+separators and d decimal places. Used in reporting queries and display layers.
+
+- `eval/functions/string.rs` — straightforward string formatting
+
+### `EXPLAIN FORMAT=JSON` / `EXPLAIN ANALYZE`
+
+`EXPLAIN FORMAT=JSON SELECT ...` returns a structured JSON plan; `EXPLAIN ANALYZE`
+includes actual row counts and execution times. Used by query-analysis tools.
+
+- Parser: extend EXPLAIN stmt with `format: Option<ExplainFormat>` and `analyze: bool`
+- Executor: serialize existing plan struct as JSON for FORMAT=JSON
 
 ### `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`
 
