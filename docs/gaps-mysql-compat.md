@@ -1,6 +1,6 @@
 # MySQL Compatibility Gaps — AxiomDB
 
-Last updated: 2026-04-06 (seventh audit)
+Last updated: 2026-04-06 (eighth audit)
 
 This document tracks SQL features that are missing or incomplete relative to MySQL 8.
 Items are ordered by implementation priority within each section.
@@ -262,6 +262,68 @@ the connection is a protocol violation that causes client reconnect loops.
 
 Fix: add match arms for known-but-unimplemented COM bytes that return ERR 1047 +
 keep the connection alive; only truly unknown bytes should close.
+
+### `COUNT(DISTINCT col)` / `SUM(DISTINCT col)` / `AVG(DISTINCT col)` not parsed
+
+The aggregate function parser only supports `DISTINCT` inside `GROUP_CONCAT`.
+For all other aggregates, `DISTINCT` inside the function call is not recognised:
+
+```sql
+SELECT COUNT(DISTINCT user_id) FROM events;       -- parse error
+SELECT SUM(DISTINCT amount) FROM transactions;    -- parse error
+SELECT AVG(DISTINCT score) FROM grades;           -- parse error
+```
+
+Very common in analytics queries — used any time a distinct count is needed without
+a subquery.
+
+- `parser/expr.rs:422-512` — in `parse_ident_or_call`, after opening `(`, check for
+  an optional `DISTINCT` keyword and store `distinct: bool` in the aggregate AST node
+- `executor/aggregate.rs:174-187` — apply deduplication before accumulating when
+  `distinct = true`
+
+### `IS TRUE` / `IS FALSE` / `IS NOT TRUE` / `IS NOT FALSE` predicates
+
+MySQL boolean predicates are not in the IS-clause parser:
+
+```sql
+WHERE is_active IS TRUE          -- parse error or wrong result
+WHERE deleted IS NOT FALSE       -- parse error
+WHERE (score > 90) IS TRUE       -- parse error
+```
+
+- `parser/expr.rs:120-131` — after `IS [NOT]`, currently only handles `NULL`;
+  extend to check for `TRUE` / `FALSE` tokens and emit the corresponding predicate
+- Semantics: `IS TRUE` is equivalent to `= 1`; `IS NOT TRUE` is `<> 1 OR IS NULL`;
+  mirrors MySQL 3-valued logic
+
+### `CREATE TABLE … SELECT …` (CTAS)
+
+`CREATE TABLE new_table SELECT * FROM existing_table` — the most common table-copy
+idiom in MySQL — is not handled. The CREATE TABLE parser at `ddl.rs:36-66` expects
+`(column_defs)` immediately after the table name; a `SELECT` keyword there causes a
+parse error.
+
+```sql
+CREATE TABLE audit_backup SELECT * FROM audit_log WHERE year = 2023;
+```
+
+Fix: after parsing the table name, branch on `Token::Select` to execute the inner
+SELECT and derive columns/data from the result; column types inferred from SELECT
+output.
+
+### `CREATE TABLE … LIKE other_table` (schema clone)
+
+`CREATE TABLE new_table LIKE existing_table` copies the full schema (columns, indexes,
+constraints) without copying data. Not in the parser — `LIKE` after the table name is
+not handled (`ddl.rs:36-66`).
+
+```sql
+CREATE TABLE users_staging LIKE users;
+```
+
+Fix: after parsing the table name, if next token is `LIKE`, read the source table name
+and copy its `TableDef` from the catalog into the new table.
 
 ### `INSERT IGNORE` not parsed
 
@@ -648,6 +710,33 @@ decide how to format and display values. Wrong codes cause silent display errors
 Fix: add `ColumnType::TinyInt`, `SmallInt`, `MediumInt`, `Time`, `DateTime` to the
 type system; map all in `datatype_to_mysql_type()`.
 
+### `UPDATE t SET col = DEFAULT` not parsed
+
+MySQL's `DEFAULT` keyword is valid in the SET clause of UPDATE to reset a column
+to its default value:
+
+```sql
+UPDATE products SET stock = DEFAULT WHERE discontinued = 1;
+UPDATE users SET last_seen = DEFAULT;   -- resets to column DEFAULT (e.g. NOW())
+```
+
+The parser at `parser/dml.rs:462-467` treats `DEFAULT` as an identifier, not a
+keyword, in this position — it either errors or resolves `DEFAULT` as a column name.
+
+Fix: in `parse_assignment`, after `col =`, check for `Token::Default` and emit
+`Expr::Default`; executor resolves it to the column's stored default (same path
+as `INSERT ... VALUES (1, DEFAULT)`).
+
+### `COM_STATISTICS` (0x09) stub needed
+
+`COM_STATISTICS` is sent by some MySQL monitoring agents and legacy clients. It
+expects a plain-text response (not a packet frame) with counters like
+`Uptime: 3600  Threads: 1  ...`. The current handler returns error 1047 and may
+close the connection.
+
+Fix: add `0x09 =>` case returning a minimal statistics string (uptime, thread count)
+without closing the connection.
+
 ### `LIKE … ESCAPE '\'` clause not parsed
 
 `WHERE path LIKE 'reports\_%' ESCAPE '\'` — the `ESCAPE` clause that defines the
@@ -982,6 +1071,90 @@ Not in `eval/functions/mod.rs` dispatch table. Fall to `NotImplemented`:
 
 Fix: add all to `eval/functions/numeric.rs` — all are one-liners using Rust's
 `f64::{ln, log2, log10, exp, sin, cos, tan, atan, atan2}`.
+
+### `expr + INTERVAL 1 DAY` temporal arithmetic
+
+`NOW() + INTERVAL 1 DAY`, `created_at + INTERVAL 3 MONTH` and similar interval
+expressions are not in the parser. `INTERVAL` is not a lexer token, so these cause
+parse errors. Ubiquitous in date-range queries and expiry calculations.
+
+```sql
+SELECT * FROM sessions WHERE expires_at < NOW() + INTERVAL 30 MINUTE;
+SELECT created_at + INTERVAL 1 YEAR FROM contracts;
+```
+
+Fix: add `Token::Interval` to the lexer; in the binary expression parser, when
+`+` or `-` is followed by `INTERVAL n unit`, emit a special `Expr::IntervalAdd`
+node; evaluator adds/subtracts the chrono `Duration` equivalent.
+
+### `GROUP BY … WITH ROLLUP`
+
+`SELECT dept, SUM(salary) FROM employees GROUP BY dept WITH ROLLUP` generates
+subtotals at each grouping level (extra rows with `NULL` in place of each group key).
+Neither the parser nor executor handles `WITH ROLLUP`; it causes a parse error.
+
+Fix: after parsing the GROUP BY column list in `parser/dml.rs`, consume optional
+`WITH ROLLUP` and set `with_rollup: bool` in `SelectStmt`; executor adds synthetic
+NULL rows after each group boundary.
+
+### `COLLATE collation_name` in expression context
+
+MySQL allows overriding collation per-expression in WHERE / ORDER BY:
+
+```sql
+WHERE name COLLATE utf8mb4_unicode_ci = 'Alice'
+ORDER BY name COLLATE utf8mb4_bin
+```
+
+The `COLLATE` keyword is only recognised in DDL column definitions, not in DML
+expression context (`parser/expr.rs:406-556`).
+
+Fix: after parsing any leaf expression (identifier, string literal), check for
+`Token::Collate ident` and wrap in `Expr::Collate { expr, collation }`.
+
+### `COM_FIELD_LIST` (0x04)
+
+Old MySQL clients (MySQL 5.x CLI, some ODBC drivers) use `COM_FIELD_LIST` to fetch
+column metadata without executing a SELECT. Current handler: unknown command error.
+
+Fix: add `0x04 =>` case, parse the table name from the payload, look up the schema,
+and return `ColumnDefinition` packets (same structs used in result set headers).
+
+### `SHOW TABLES` dynamic column name (`Tables_in_<db>`)
+
+MySQL returns `SHOW TABLES` with a column named `Tables_in_<database>` where
+`<database>` is the current database name. AxiomDB returns a static column name.
+MySQL CLI and some ORMs use this column name for formatting.
+
+Fix: in the SHOW TABLES executor path, build the column metadata dynamically as
+`format!("Tables_in_{}", current_database)`.
+
+### `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` standard syntax
+
+SQL standard `a IS NOT DISTINCT FROM b` is a verbose null-safe equality (same as
+`<=>` in MySQL). Not in the IS-clause parser (`parser/expr.rs:120-131`). Rarely
+used in MySQL code but appears in SQL-standard ORM output.
+
+Fix: after `IS [NOT]`, check for `DISTINCT FROM` keyword sequence and emit
+`BinaryOp::NullSafeEq` (same as `<=>`).
+
+### `MATCH(cols) AGAINST (expr)` fulltext search syntax
+
+`WHERE MATCH(title, body) AGAINST ('search terms' IN BOOLEAN MODE)` is not in the
+parser. Will cause a parse error. Fulltext index execution can return
+`NotImplemented` for now — just parsing cleanly unblocks schema imports.
+
+Fix: add `MATCH` as a special token; parse `MATCH(col_list) AGAINST (expr [mode])`
+as a special expression node; executor returns `NotImplemented` until Phase 22.
+
+### `COM_RESET_CONNECTION` incomplete reset
+
+`COM_RESET_CONNECTION` (0x1f) at `handler.rs:889-906` calls `SessionContext::new()`
+but may not reset character set, collation, prepared statement cache, and user
+variables accumulated during the session. MySQL specifies a full session-state wipe.
+
+Fix: ensure `COM_RESET_CONNECTION` also clears prepared statements, collation
+settings, and user-defined `@variables`; verify `SessionContext::new()` covers all.
 
 ### `NATURAL JOIN` not implemented
 
