@@ -1,6 +1,6 @@
 # MySQL Compatibility Gaps — AxiomDB
 
-Last updated: 2026-04-05 (sixth audit)
+Last updated: 2026-04-06 (seventh audit)
 
 This document tracks SQL features that are missing or incomplete relative to MySQL 8.
 Items are ordered by implementation priority within each section.
@@ -247,6 +247,35 @@ Silent padding masks programmer errors and violates `NOT NULL` constraints silen
 
 Fix: in `executor/insert.rs`, after building the column map, check
 `values.len() == col_map.len()` and return `DbError::ColumnCountMismatch` if not.
+
+### Unknown COM_* commands close the connection
+
+All unrecognised `COM_*` command bytes fall through to error 1047 "Unknown command"
+and may close the connection (`handler.rs:1356-1367`). MySQL clients (connectors,
+ORMs, tools) sometimes send commands that are valid in some MySQL versions but rare:
+`COM_STATISTICS` (0x09), `COM_PROCESS_INFO` (0x0a), `COM_DEBUG` (0x0d),
+`COM_FIELD_LIST` (0x04), `COM_REFRESH` (0x07), `COM_SHUTDOWN` (0x08),
+`COM_BINLOG_DUMP` (0x12), `COM_STMT_FETCH` (0x1c).
+
+MySQL always stays connected and returns a graceful error packet. AxiomDB dropping
+the connection is a protocol violation that causes client reconnect loops.
+
+Fix: add match arms for known-but-unimplemented COM bytes that return ERR 1047 +
+keep the connection alive; only truly unknown bytes should close.
+
+### `INSERT IGNORE` not parsed
+
+`INSERT IGNORE INTO t VALUES (...)` silences constraint violations (UNIQUE, FK,
+NOT NULL) and continues; MySQL returns a warning count instead of an error. Used
+heavily for idempotent bulk loads and deduplication patterns.
+
+```sql
+INSERT IGNORE INTO tags (post_id, tag) VALUES (1, 'rust');  -- parse error
+```
+
+- `parser/dml.rs:376-436` — add `IGNORE` token consumption after `INSERT`
+- Store `ignore: bool` in `InsertStmt`; executor wraps each row in a try-catch and
+  converts `DuplicateKey` / `NotNullViolation` to warnings when `ignore = true`
 
 ### Positional `ORDER BY` / `GROUP BY` (column ordinals)
 
@@ -514,6 +543,110 @@ query analyzers.
 
 - `executor/mod.rs:1188`
 - Needs to be wired into the no-ctx dispatch path
+
+### Session variables return `None` for common ORM capability queries
+
+`session.rs:get_variable()` returns `None` for any variable not in its explicit
+match list. MySQL clients and ORMs query these on connect to detect server
+capabilities:
+
+```sql
+SELECT @@performance_schema;      -- None → ORM throws or skips feature
+SELECT @@have_query_cache;        -- None
+SELECT @@log_bin;                 -- None → replication-aware clients break
+SELECT @@net_buffer_length;       -- None
+SELECT @@transaction_read_only;   -- None → JDBC connection validation fails
+SELECT @@sql_mode;                -- None → strictness-aware ORMs break
+```
+
+Fix: add safe defaults to `session.rs:get_variable()`:
+`performance_schema→"0"`, `have_query_cache→"NO"`, `log_bin→"0"`,
+`net_buffer_length→"16384"`, `transaction_read_only→"0"`, `sql_mode→""`.
+
+### `SELECT ... FOR UPDATE` / `SELECT ... LOCK IN SHARE MODE` not parsed
+
+Row-level locking hints are not in the parser. JPA/Hibernate, GORM, and hand-written
+transaction code use these extensively:
+
+```sql
+SELECT * FROM accounts WHERE id = 1 FOR UPDATE;         -- parse error
+SELECT * FROM products WHERE id = 5 LOCK IN SHARE MODE; -- parse error
+```
+
+- `parser/dml.rs:92-105` — after LIMIT/OFFSET, check for `FOR UPDATE` and
+  `LOCK IN SHARE MODE`; store `lock_mode: Option<LockMode>` in `SelectStmt`
+- Executor: execute as normal SELECT for now (row-level locking is Phase 13.7);
+  silently accepting the syntax unblocks every ORM that generates these clauses
+
+### `SELECT HIGH_PRIORITY` / `STRAIGHT_JOIN` modifiers not consumed
+
+MySQL SELECT modifiers placed between `SELECT` and the column list are not
+recognised by the parser and cause parse errors:
+
+```sql
+SELECT HIGH_PRIORITY id FROM t WHERE id = 1;   -- parse error
+SELECT STRAIGHT_JOIN * FROM t JOIN s ON t.id = s.t_id;  -- parse error
+```
+
+These are hints/directives that have no effect on result correctness — they only
+matter for optimizer behaviour. The correct fix is to consume and discard them.
+
+- `parser/dml.rs:50-106` — after `SELECT`, consume optional `HIGH_PRIORITY`,
+  `SQL_SMALL_RESULT`, `SQL_BIG_RESULT`, `SQL_BUFFER_RESULT`, `STRAIGHT_JOIN`
+  before parsing the column list
+
+### Multi-table `DELETE` / `UPDATE` with `JOIN` (MySQL-specific syntax)
+
+MySQL allows deleting or updating rows via JOIN across multiple tables:
+
+```sql
+DELETE o FROM orders o JOIN customers c ON o.customer_id = c.id
+WHERE c.deleted_at IS NOT NULL;
+
+UPDATE orders o JOIN customers c ON o.customer_id = c.id
+SET o.priority = c.tier WHERE c.country = 'US';
+```
+
+Neither `DeleteStmt` nor `UpdateStmt` support a join clause or multiple target
+tables (`parser/dml.rs:440-476`). Widely used in data migration and cleanup scripts.
+
+Fix: extend AST and parser to recognise the multi-table form; executor evaluates the
+join, then applies DELETE/UPDATE only to the primary target table's rows.
+
+### `CALL procedure_name()` / `DO expr` statements not parsed
+
+`CALL` and `DO` are not in the lexer token set or the top-level parser dispatch
+(`parser/mod.rs:227-293`). Any application using stored procedures or inline
+expression execution will immediately get a parse error.
+
+- `CALL p(args)` — execute a stored procedure; return `NotImplemented` until
+  Phase 16.7, but must parse cleanly
+- `DO expr` — evaluate an expression and discard the result (used for side effects
+  like `DO SLEEP(1)` or `DO RELEASE_LOCK('name')`)
+
+Fix: add `Call` and `Do` to the lexer; parse and return `NotImplemented` (or
+silently succeed for DO with no visible output).
+
+### Column type wire encoding missing integer subtypes and date subtypes
+
+`result.rs:datatype_to_mysql_type()` does not map all MySQL column types to the
+correct protocol type codes. Missing:
+
+| MySQL type | Expected code | Current behaviour |
+|---|---|---|
+| TINYINT | `0x01` (TINY) | falls to default |
+| SMALLINT | `0x02` (SHORT) | falls to default |
+| MEDIUMINT | `0x09` (INT24) | falls to default |
+| YEAR | `0x0d` (YEAR) | not in AxiomDB AST |
+| TIME | `0x0b` (TIME) | not in AxiomDB ColumnType |
+| DATETIME | `0x0c` (DATETIME) | mapped same as TIMESTAMP |
+
+Tools like MySQL Workbench, DBeaver, and JDBC drivers use the column type byte to
+decide how to format and display values. Wrong codes cause silent display errors
+(timestamps shown as strings, year shown as integer, etc.).
+
+Fix: add `ColumnType::TinyInt`, `SmallInt`, `MediumInt`, `Time`, `DateTime` to the
+type system; map all in `datatype_to_mysql_type()`.
 
 ### `LIKE … ESCAPE '\'` clause not parsed
 
@@ -834,6 +967,60 @@ Not implemented. `ELT(2, 'a', 'b', 'c')` → `'b'` (Nth element);
 Common in enum-style queries without a lookup table.
 
 - `eval/functions/string.rs`
+
+### Math functions: `PI()`, `LOG()`, `EXP()`, trig functions, `RADIANS()` / `DEGREES()`
+
+Not in `eval/functions/mod.rs` dispatch table. Fall to `NotImplemented`:
+
+- `PI()` — constant π (3.14159…)
+- `LOG(x)` / `LOG(base, x)` — natural log / log base N
+- `LOG2(x)` / `LOG10(x)` — log base 2 and 10
+- `EXP(x)` — eˣ
+- `SIN(x)` / `COS(x)` / `TAN(x)` — trigonometric
+- `ATAN(x)` / `ATAN2(y, x)` — inverse tangent
+- `RADIANS(d)` / `DEGREES(r)` — angle unit conversion
+
+Fix: add all to `eval/functions/numeric.rs` — all are one-liners using Rust's
+`f64::{ln, log2, log10, exp, sin, cos, tan, atan, atan2}`.
+
+### `NATURAL JOIN` not implemented
+
+`SELECT … FROM t1 NATURAL JOIN t2` — automatic join on columns with matching names
+— is not in the Token enum or `parse_join_clauses()` (`parser/dml.rs:213-300`).
+
+Fix: add `NATURAL` token; in the parser, detect `NATURAL [LEFT] JOIN` and build the
+`USING` list from the intersection of column names from both tables.
+
+### Date functions: `SYSDATE()`, `UTC_*`, `FROM_UNIXTIME()`, `DATEDIFF()`, `CONVERT_TZ()`
+
+Missing from `eval/functions/datetime.rs`:
+
+- `SYSDATE()` — returns execution time (MySQL: `NOW()` returns statement start time, `SYSDATE()` returns actual clock; currently both are aliased to NOW)
+- `UTC_DATE()` / `UTC_TIME()` / `UTC_TIMESTAMP()` — UTC equivalents of current date/time
+- `FROM_UNIXTIME(n)` — converts Unix epoch seconds to DATETIME
+- `UNIX_TIMESTAMP()` / `UNIX_TIMESTAMP(dt)` — current time or given DATETIME as Unix epoch
+- `DATEDIFF(d1, d2)` — days between two dates
+- `CONVERT_TZ(dt, from_tz, to_tz)` — timezone conversion
+
+### String functions: `NVL2()`, `INSERT(str, pos, len, new)`, `ORD()`, `SOUNDEX()`, `CHAR()` variadic
+
+Not in the function dispatcher:
+
+- `NVL2(expr, val_if_not_null, val_if_null)` — 3-arg null conditional (`nulls.rs`)
+- `INSERT(str, pos, len, newstr)` — replaces `len` chars at `pos` with `newstr` (the string manipulation function, NOT SQL INSERT)
+- `ORD(str)` — returns Unicode code point of first character
+- `SOUNDEX(str)` — phonetic encoding
+- `CHAR(n1, n2, …)` — current impl takes single arg; MySQL accepts variadic and concatenates chars
+
+### `CRC32()`, `BENCHMARK()`, `INET_ATON()` / `INET_NTOA()` / `IS_IPV4()` / `IS_IPV6()`
+
+Not in `eval/functions/mod.rs` dispatch:
+
+- `CRC32(str)` → 32-bit CRC checksum as unsigned int; used in data integrity checks
+- `BENCHMARK(n, expr)` → evaluates `expr` N times, returns 0; used in performance testing
+- `INET_ATON('10.0.0.1')` → 167772161; `INET_NTOA(167772161)` → `'10.0.0.1'`
+- `INET6_ATON(str)` / `INET6_NTOA(bytes)` — IPv6 equivalents
+- `IS_IPV4(str)` / `IS_IPV6(str)` / `IS_IPV4_MAPPED(str)` — IP address validation
 
 ### `CONVERT(expr, type)` MySQL two-argument syntax
 
