@@ -1,6 +1,6 @@
 # MySQL Compatibility Gaps — AxiomDB
 
-Last updated: 2026-04-05 (third audit)
+Last updated: 2026-04-05 (fourth audit)
 
 This document tracks SQL features that are missing or incomplete relative to MySQL 8.
 Items are ordered by implementation priority within each section.
@@ -10,6 +10,49 @@ Items are ordered by implementation priority within each section.
 ## HIGH PRIORITY
 
 These block common ORMs, migration tools, and client libraries.
+
+### Column attributes: `UNSIGNED`, `COLLATE`, `CHARACTER SET`, `ON UPDATE CURRENT_TIMESTAMP`, `COMMENT`
+
+Any of these column-level attributes cause a **parse error** because they are not
+recognized after the column type in `parser/ddl.rs:77-135`.
+
+```sql
+id       INT UNSIGNED,                              -- parse error
+name     VARCHAR(100) COLLATE utf8mb4_unicode_ci,   -- parse error
+locale   VARCHAR(10)  CHARACTER SET utf8mb4,        -- parse error
+updated  TIMESTAMP    ON UPDATE CURRENT_TIMESTAMP,  -- parse error
+score    INT          COMMENT 'Player score',       -- parse error
+```
+
+- `UNSIGNED` — marks a non-negative integer; MySQL stores double the positive range
+- `COLLATE` / `CHARACTER SET` — per-column encoding; present in virtually every
+  modern MySQL schema dump
+- `ON UPDATE CURRENT_TIMESTAMP` — auto-updates a TIMESTAMP column on row UPDATE;
+  ubiquitous in audit/tracking tables (`created_at`, `updated_at` patterns)
+- `COMMENT` — column metadata; used by all schema tools
+
+Fix: extend `parse_column_def` to consume and discard (or store) these tokens
+after the data type and before the column constraints loop.
+
+### `CREATE TABLE` inline `INDEX` / `KEY` definitions
+
+`CREATE TABLE t (..., INDEX idx_name (col), ...)` causes a **parse error** because
+`INDEX` and `KEY` are not in `is_table_constraint_start` (`parser/ddl.rs:68-72`).
+Used in virtually every MySQL schema — the most common way to define non-unique
+indexes inline.
+
+```sql
+CREATE TABLE posts (
+  id      INT PRIMARY KEY,
+  user_id INT,
+  status  VARCHAR(20),
+  INDEX   idx_user (user_id),          -- parse error
+  KEY     idx_status (status)          -- parse error
+);
+```
+
+Fix: add `Token::Index` and `Token::Key` (or Ident "key") to `is_table_constraint_start`;
+parse as `CREATE INDEX` — the named index is created on the same table.
 
 ### `CREATE TABLE` table options (ENGINE, CHARSET, COLLATE, COMMENT, AUTO_INCREMENT)
 
@@ -44,6 +87,40 @@ after `START TRANSACTION` is parsed.
 - Fix: after consuming optional `TRANSACTION`, also eat optional `WORK` (for BEGIN)
   and optional `READ ONLY` / `READ WRITE` modifiers (for both)
 - `SessionContext.next_txn_read_only: bool` for `READ ONLY` → restrict DML
+
+### Expression operators: `REGEXP`, `RLIKE`, `XOR`, `DIV`, `<=>`, bitwise operators
+
+These operators are not in the lexer and cause **parse errors**:
+
+- `REGEXP` / `RLIKE` — regex pattern matching: `WHERE email REGEXP '^[a-z]+'`. Used in data validation and search queries. Should map to Rust `regex` crate.
+- `NOT REGEXP` / `NOT RLIKE` — negated regex.
+- `XOR` — boolean exclusive OR: `WHERE a XOR b`. Less common but valid SQL.
+- `DIV` — integer division keyword: `7 DIV 2 = 3`. Many MySQL codebases use `DIV` for integer math to avoid float conversion.
+- `<=>` — null-safe equality: `NULL <=> NULL = 1` (vs `NULL = NULL = NULL`). Used in queries that compare nullable columns without explicit `IS NULL` checks.
+- `&`, `|`, `^`, `~` — bitwise AND/OR/XOR/NOT: `WHERE flags & 0x01 = 1`. Ubiquitous in permission/bitmask columns.
+- `<<`, `>>` — bitwise shift: `SELECT 1 << 4`.
+
+Fix: add tokens to lexer; add parse arms in `parser/expr.rs` at the correct precedence levels.
+
+### `SET SESSION` / `SET GLOBAL` / multi-variable `SET`
+
+These forms cause parse errors or silently fail:
+
+```sql
+SET SESSION transaction_isolation = 'READ-COMMITTED';  -- SESSION keyword not consumed
+SET GLOBAL max_allowed_packet = 16777216;              -- GLOBAL keyword not consumed
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED; -- rejected
+SET var1 = val1, var2 = val2;                          -- comma-separated not parsed
+SET @user_var = 42;                                    -- @var (single @) not supported
+```
+
+- `SET SESSION var = val` — JDBC drivers use this form exclusively
+- `SET GLOBAL var = val` — admin tools
+- Multi-variable `SET` with comma — standard MySQL
+- `SET @user_var = expr` — user-defined variables; widely used for temp values in migrations
+
+Fix: in `parser/mod.rs:380`, handle SESSION/GLOBAL keywords before variable name;
+parse comma-separated list; support `@ident` as a user variable reference.
 
 ### `UNION` / `UNION ALL`
 
@@ -98,6 +175,25 @@ with date-only columns.
 ## MEDIUM PRIORITY
 
 These affect specific use cases but are not blockers for basic ORM usage.
+
+### `ALTER TABLE ADD INDEX` / `DROP INDEX` / `CHANGE COLUMN` / `AUTO_INCREMENT=N`
+
+Not in `AlterTableOp` enum. Common in migration scripts:
+
+```sql
+ALTER TABLE t ADD INDEX idx_email (email);          -- not parsed
+ALTER TABLE t ADD UNIQUE INDEX uk_slug (slug);      -- not parsed
+ALTER TABLE t DROP INDEX idx_email;                 -- not parsed (only DROP CONSTRAINT)
+ALTER TABLE t CHANGE COLUMN old_name new_name INT;  -- not parsed (rename+retype in one op)
+ALTER TABLE t AUTO_INCREMENT = 1000;                -- not parsed
+ALTER TABLE t ALTER COLUMN price SET DEFAULT 0;     -- not parsed
+ALTER TABLE t ALTER COLUMN price DROP DEFAULT;      -- not parsed
+```
+
+- `ADD INDEX` / `ADD UNIQUE INDEX` — most migration tools add indexes via ALTER TABLE, not via separate `CREATE INDEX`
+- `CHANGE COLUMN` — MySQL-specific rename+retype in one operation; many ORMs generate this
+- `AUTO_INCREMENT = N` — reset the auto-increment sequence counter; used after bulk deletes and migrations
+- `ALTER COLUMN SET DEFAULT` / `DROP DEFAULT` — change column defaults without rewriting rows
 
 ### `ALTER TABLE RENAME INDEX`
 
@@ -158,6 +254,37 @@ notes. Without it, JDBC-based ORMs may hang waiting for a response.
 - Parser: add `ShowWarningsStmt` / `ShowErrorsStmt`
 - Executor: return the per-session warning buffer; `SHOW WARNINGS LIMIT N`
   and `SHOW ERRORS` should read from a `Vec<Warning>` on `SessionContext`
+
+### `SET FOREIGN_KEY_CHECKS = 0` / `SET UNIQUE_CHECKS = 0`
+
+`mysqldump` wraps every import with these statements. If AxiomDB doesn't recognize
+them as valid SET variables, the import fails immediately. They should be accepted
+and either silently ignored or honoured.
+
+- `FOREIGN_KEY_CHECKS = 0` — disables FK enforcement during bulk import
+- `UNIQUE_CHECKS = 0` — disables unique constraint checking during bulk import
+- `sql_notes = 0` — suppresses note-level warnings
+
+Fix: add these to the handled SET variables in `session.rs`; `FOREIGN_KEY_CHECKS=0`
+ideally propagates to the executor to skip FK validation.
+
+### `SHOW FULL TABLES` / `SHOW FULL COLUMNS` / `SHOW TABLE STATUS`
+
+ORM schema discovery uses these variants:
+
+- `SHOW FULL TABLES [FROM db] [LIKE pattern]` — adds `Table_type` column (`BASE TABLE` / `VIEW`); Sequelize and ActiveRecord use this
+- `SHOW FULL COLUMNS FROM t` — adds `Privileges` and `Comment` columns; Prisma and TypeORM use this
+- `SHOW TABLE STATUS [FROM db] [LIKE pattern]` — returns rows/engine/charset per table; schema tools use this for metadata
+
+Parser currently does not handle the `FULL` modifier or `TABLE STATUS`.
+
+### `SHOW ENGINES` / `SHOW CHARSET` / `SHOW COLLATION`
+
+Not parsed. MySQL Workbench, DBeaver, TablePlus probe these on connect:
+
+- `SHOW ENGINES` — list storage engines; return a single row: `AxiomDB | DEFAULT | ...`
+- `SHOW CHARSET` / `SHOW CHARACTER SET` — list supported charsets; return utf8mb4, utf8, latin1
+- `SHOW COLLATION [LIKE pattern]` — list collations; return utf8mb4_unicode_ci, utf8mb4_bin, etc.
 
 ### `SHOW CREATE TABLE`
 
@@ -244,6 +371,37 @@ includes actual row counts and execution times. Used by query-analysis tools.
 
 - Parser: extend EXPLAIN stmt with `format: Option<ExplainFormat>` and `analyze: bool`
 - Executor: serialize existing plan struct as JSON for FORMAT=JSON
+
+### Version-conditional MySQL comments (`/*!...*/`)
+
+`mysqldump` wraps version-specific SQL in `/*!50600 SET ... */` comments.
+The parser currently strips all `/* ... */` comments, losing the code inside.
+
+```sql
+/*!40101 SET character_set_client = utf8 */;       -- silently dropped
+/*!50600 SET GLOBAL innodb_file_per_table = 1 */;  -- silently dropped
+```
+
+Fix: in the lexer, detect `/*!` prefix; if the embedded version number is ≤ AxiomDB's
+MySQL compatibility version (80000), execute the content; otherwise skip.
+
+### `GENERATED ALWAYS AS (expr) STORED/VIRTUAL` columns
+
+Computed columns not in parser or executor:
+
+```sql
+CREATE TABLE orders (
+  price    DECIMAL(10,2),
+  tax_rate DECIMAL(5,4),
+  total    DECIMAL(10,2) GENERATED ALWAYS AS (price * (1 + tax_rate)) STORED
+);
+```
+
+- `STORED` — value computed on INSERT/UPDATE and persisted on disk
+- `VIRTUAL` — value computed at read time, not stored
+
+Fix: add to `ColumnDef.generated: Option<(Expr, Generated)>`;
+executor materializes on INSERT/UPDATE (STORED) or SELECT (VIRTUAL).
 
 ### `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`
 
