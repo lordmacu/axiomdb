@@ -1,0 +1,432 @@
+/// Three update paths:
+/// 1. Non-key in-place: `update_in_place()` when PK and index keys unchanged
+/// 2. Non-key relocation: `update_with_relocation()` when row grows beyond leaf
+/// 3. Key change: `delete_mark()` + `insert()` when PK changes
+#[allow(clippy::too_many_arguments)]
+fn execute_clustered_update(
+    where_clause: Option<Expr>,
+    assignments: Vec<(usize, Expr)>,
+    schema_cols: &[axiomdb_catalog::schema::ColumnDef],
+    secondary_indexes: &[axiomdb_catalog::IndexDef],
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    conn_txn: &mut ConnectionTxn,
+    snap: axiomdb_core::TransactionSnapshot,
+    resolved: &axiomdb_catalog::ResolvedTable,
+    bloom: &mut crate::bloom::BloomRegistry,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    use std::ops::Bound;
+
+    let col_types: Vec<axiomdb_types::DataType> = schema_cols
+        .iter()
+        .map(|c| crate::table::column_type_to_data_type(c.col_type))
+        .collect();
+
+    let pk_col_positions: Vec<usize> = clustered_update_primary_index(resolved)?
+        .columns
+        .iter()
+        .map(|c| c.col_idx as usize)
+        .collect();
+
+    let mut root_pid = txn
+        .clustered_root(resolved.def.id)
+        .unwrap_or(resolved.def.root_page_id);
+
+    // ── Fused clustered scan-patch fast path ─────────────────────────────
+    // When ALL of these hold, skip candidate collection entirely and patch
+    // fields directly on clustered leaf pages in a single pass:
+    //   1. All SET cols fixed-size (field_patch eligible)
+    //   2. No FK constraints
+    //   3. No secondary indexes with changed key columns
+    //   4. PK columns not changed
+    let field_patch_ok = resolved.foreign_keys.is_empty()
+        && assignments.iter().all(|(col_pos, _)| {
+            axiomdb_types::field_patch::fixed_encoded_size(col_types[*col_pos]).is_some()
+        });
+    let pk_might_change = assignments.iter().any(|(col_pos, _)| pk_col_positions.contains(col_pos));
+    let has_affected_secondary = secondary_indexes.iter().any(|idx| {
+        !idx.is_primary
+            && idx.columns.iter().any(|c| {
+                assignments.iter().any(|(a_pos, _)| *a_pos == c.col_idx as usize)
+            })
+    });
+
+    let access_method = where_clause
+        .as_ref()
+        .map(|wc| {
+            normalize_clustered_update_access_method(crate::planner::plan_update_candidates_ctx(
+                wc,
+                secondary_indexes,
+                schema_cols,
+                ctx.effective_collation(),
+            ))
+        })
+        .unwrap_or(crate::planner::AccessMethod::Scan);
+
+    if field_patch_ok && !pk_might_change && !has_affected_secondary {
+        let bounds = match &access_method {
+            crate::planner::AccessMethod::Scan => {
+                Some((Bound::Unbounded, Bound::Unbounded))
+            }
+            crate::planner::AccessMethod::IndexLookup { index_def, key } if index_def.is_primary => {
+                Some((Bound::Included(key.clone()), Bound::Included(key.clone())))
+            }
+            crate::planner::AccessMethod::IndexRange { index_def, lo, hi } if index_def.is_primary => {
+                Some((
+                    lo.clone().map_or(Bound::Unbounded, Bound::Included),
+                    hi.clone().map_or(Bound::Unbounded, Bound::Included),
+                ))
+            }
+            _ => None,
+        };
+
+        if let Some((from, to)) = bounds {
+            return fused_clustered_scan_patch(
+                where_clause.as_ref(),
+                &assignments,
+                &col_types,
+                storage,
+                txn,
+                conn_txn,
+                snap.clone(),
+                resolved,
+                root_pid,
+                ctx,
+                from,
+                to,
+            );
+        }
+    }
+
+    let candidates = collect_clustered_update_candidates(
+        where_clause.as_ref(),
+        schema_cols,
+        secondary_indexes,
+        &access_method,
+        storage,
+        snap.clone(),
+        resolved,
+        root_pid,
+    )?;
+
+    if candidates.is_empty() {
+        return Ok(QueryResult::Affected {
+            count: 0,
+            last_insert_id: None,
+        });
+    }
+
+    // ── FK pre-flight (before any storage mutation) ──────────────────────────
+    // Mirrors the batch-check in execute_update_with_candidates:
+    // 1. Child FK: new FK value must reference an existing parent row.
+    // 2. Parent FK: RESTRICT/NO ACTION if a referenced column changes.
+    {
+        let mut batch_old: Vec<(axiomdb_core::RecordId, Vec<axiomdb_types::Value>)> = Vec::new();
+        let mut batch_new: Vec<Vec<axiomdb_types::Value>> = Vec::new();
+
+        for candidate in &candidates {
+            let mut new_values = candidate.values.clone();
+            let mut changed = false;
+            for &(col_pos, ref val_expr) in &assignments {
+                let nv = eval(val_expr, &candidate.values)?;
+                if nv != candidate.values[col_pos] {
+                    changed = true;
+                }
+                new_values[col_pos] = nv;
+            }
+            if !changed {
+                continue;
+            }
+            // RID field is unused by enforce_fk_on_parent_update — use a zero placeholder.
+            batch_old.push((
+                axiomdb_core::RecordId { page_id: 0, slot_id: 0 },
+                candidate.values.clone(),
+            ));
+            batch_new.push(new_values);
+        }
+
+        if !batch_old.is_empty() {
+            if !resolved.foreign_keys.is_empty() {
+                for ((_, old_values), new_values) in batch_old.iter().zip(batch_new.iter()) {
+                    crate::fk_enforcement::check_fk_child_update(
+                        old_values,
+                        new_values,
+                        &resolved.foreign_keys,
+                        storage,
+                        txn,
+                        conn_txn,
+                        bloom,
+                    )?;
+                }
+            }
+            crate::fk_enforcement::enforce_fk_on_parent_update(
+                &batch_old,
+                &batch_new,
+                resolved.def.id,
+                storage,
+                txn,
+                conn_txn,
+            )?;
+        }
+    }
+
+    let txn_id = conn_txn.txn_id;
+    let mut matched_count = 0u64;
+    let mut changed_count = 0u64;
+
+    let primary_idx = clustered_update_primary_index(resolved)?;
+    let secondary_layouts: Vec<(
+        &axiomdb_catalog::IndexDef,
+        crate::clustered_secondary::ClusteredSecondaryLayout,
+        std::sync::atomic::AtomicU64,
+    )> = secondary_indexes
+        .iter()
+        .filter(|idx| !idx.is_primary && !idx.columns.is_empty())
+        .filter_map(|idx| {
+            crate::clustered_secondary::ClusteredSecondaryLayout::derive(idx, primary_idx)
+                .ok()
+                .map(|layout| {
+                    (
+                        idx,
+                        layout,
+                        std::sync::atomic::AtomicU64::new(idx.root_page_id),
+                    )
+                })
+        })
+        .collect();
+
+    for candidate in &candidates {
+        matched_count += 1;
+
+        let mut new_values = candidate.values.clone();
+        let mut changed = false;
+        for &(col_pos, ref val_expr) in &assignments {
+            let nv = eval(val_expr, &candidate.values)?;
+            if nv != candidate.values[col_pos] {
+                changed = true;
+            }
+            new_values[col_pos] = nv;
+        }
+        if !changed {
+            continue;
+        }
+
+        let pk_changed = pk_col_positions
+            .iter()
+            .any(|&pos| candidate.values[pos] != new_values[pos]);
+
+        // Field-patch optimization: when all changed columns are fixed-size
+        // and PK is unchanged, patch bytes directly in the existing row_data
+        // instead of full encode_row(). Saves ~16× per row.
+        let field_patch_ok = !pk_changed
+            && assignments.iter().all(|(col_pos, _)| {
+                axiomdb_types::field_patch::fixed_encoded_size(col_types[*col_pos]).is_some()
+            });
+
+        let new_row_data = if field_patch_ok {
+            // Patch only changed fields in a copy of the existing row_data.
+            let mut patched = candidate.row_data.clone();
+            let bitmap_len = col_types.len().div_ceil(8);
+            let bitmap = patched[..bitmap_len].to_vec();
+            for &(col_pos, _) in &assignments {
+                if candidate.values[col_pos] == new_values[col_pos] {
+                    continue;
+                }
+                if let Some(loc) =
+                    axiomdb_types::field_patch::compute_field_location_runtime(
+                        &col_types,
+                        col_pos,
+                        &bitmap,
+                        Some(&patched),
+                    )
+                {
+                    let _ = axiomdb_types::field_patch::write_field(
+                        &mut patched,
+                        &loc,
+                        &new_values[col_pos],
+                    );
+                }
+            }
+            patched
+        } else {
+            axiomdb_types::codec::encode_row(&new_values, &col_types)?
+        };
+
+        let old_image =
+            axiomdb_wal::ClusteredRowImage::new(root_pid, candidate.row_header, &candidate.row_data);
+
+        if pk_changed {
+            let new_pk_key = crate::key_encoding::encode_index_key(
+                &pk_col_positions
+                    .iter()
+                    .map(|&pos| new_values[pos].clone())
+                    .collect::<Vec<_>>(),
+            )?;
+
+            if !axiomdb_storage::clustered_tree::delete_mark(
+                storage,
+                Some(root_pid),
+                &candidate.pk_key,
+                txn_id,
+                &snap,
+            )? {
+                continue;
+            }
+
+            let delete_marked_header = axiomdb_storage::heap::RowHeader {
+                txn_id_created: candidate.row_header.txn_id_created,
+                txn_id_deleted: txn_id,
+                row_version: candidate.row_header.row_version,
+                _flags: candidate.row_header._flags,
+            };
+            let delete_mark_image = axiomdb_wal::ClusteredRowImage::new(
+                root_pid,
+                delete_marked_header,
+                &candidate.row_data,
+            );
+            txn.record_clustered_delete_mark(
+                conn_txn,
+                resolved.def.id,
+                &candidate.pk_key,
+                &old_image,
+                &delete_mark_image,
+            )?;
+
+            let new_header = axiomdb_storage::heap::RowHeader {
+                txn_id_created: txn_id,
+                txn_id_deleted: 0,
+                row_version: 0,
+                _flags: candidate.row_header._flags,
+            };
+            root_pid = axiomdb_storage::clustered_tree::insert(
+                storage,
+                Some(root_pid),
+                &new_pk_key,
+                &new_header,
+                &new_row_data,
+            )?;
+            let inserted_image =
+                axiomdb_wal::ClusteredRowImage::new(root_pid, new_header, &new_row_data);
+            txn.record_clustered_insert(conn_txn, resolved.def.id, &new_pk_key, &inserted_image)?;
+
+            for (idx, layout, sec_root) in &secondary_layouts {
+                apply_clustered_secondary_update(
+                    idx,
+                    layout,
+                    sec_root,
+                    &candidate.values,
+                    &new_values,
+                    storage,
+                    txn,
+                    conn_txn,
+                    bloom,
+                )?;
+            }
+        } else {
+            let new_header = axiomdb_storage::heap::RowHeader {
+                txn_id_created: txn_id,
+                txn_id_deleted: 0,
+                row_version: candidate.row_header.row_version.saturating_add(1),
+                _flags: candidate.row_header._flags,
+            };
+
+            match axiomdb_storage::clustered_tree::update_in_place(
+                storage,
+                Some(root_pid),
+                &candidate.pk_key,
+                &new_row_data,
+                txn_id,
+                &snap,
+            ) {
+                Ok(true) => {
+                    let new_image =
+                        axiomdb_wal::ClusteredRowImage::new(root_pid, new_header, &new_row_data);
+                    txn.record_clustered_update(
+                        conn_txn,
+                        resolved.def.id,
+                        &candidate.pk_key,
+                        &old_image,
+                        &new_image,
+                    )?;
+                }
+                Ok(false) => continue,
+                Err(DbError::HeapPageFull { .. }) => {
+                    if let Some(new_root) = axiomdb_storage::clustered_tree::update_with_relocation(
+                        storage,
+                        Some(root_pid),
+                        &candidate.pk_key,
+                        &new_row_data,
+                        txn_id,
+                        &snap,
+                    )? {
+                        let new_image = axiomdb_wal::ClusteredRowImage::new(
+                            new_root,
+                            new_header,
+                            &new_row_data,
+                        );
+                        txn.record_clustered_update(
+                            conn_txn,
+                            resolved.def.id,
+                            &candidate.pk_key,
+                            &old_image,
+                            &new_image,
+                        )?;
+                        root_pid = new_root;
+                    } else {
+                        continue;
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+
+            let any_sec_col_changed = secondary_layouts.iter().any(|(idx, _, _)| {
+                idx.columns.iter().any(|c| {
+                    let pos = c.col_idx as usize;
+                    candidate.values.get(pos) != new_values.get(pos)
+                })
+            });
+            if any_sec_col_changed {
+                for (idx, layout, sec_root) in &secondary_layouts {
+                    apply_clustered_secondary_update(
+                        idx,
+                        layout,
+                        sec_root,
+                        &candidate.values,
+                        &new_values,
+                        storage,
+                        txn,
+                        conn_txn,
+                        bloom,
+                    )?;
+                }
+            }
+        }
+
+        changed_count += 1;
+    }
+
+    if root_pid != resolved.def.root_page_id {
+        axiomdb_catalog::CatalogWriter::new(storage, txn, conn_txn)?
+            .update_table_root(resolved.def.id, root_pid)?;
+    }
+
+    for (idx, _, sec_root) in &secondary_layouts {
+        let current = sec_root.load(std::sync::atomic::Ordering::Acquire);
+        if current != idx.root_page_id {
+            axiomdb_catalog::CatalogWriter::new(storage, txn, conn_txn)?
+                .update_index_root(idx.index_id, current)?;
+        }
+    }
+
+    if changed_count > 0 {
+        ctx.stats.on_rows_changed(resolved.def.id, changed_count);
+    }
+    ctx.invalidate_all();
+
+    Ok(QueryResult::Affected {
+        count: matched_count,
+        last_insert_id: None,
+    })
+}
+

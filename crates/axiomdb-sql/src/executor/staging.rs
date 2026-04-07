@@ -7,6 +7,7 @@
 // table switch inside consecutive INSERTs, and any ineligible INSERT shape.
 // On ROLLBACK the buffer is discarded without calling this function.
 
+#[allow(dead_code)]
 fn detect_committed_empty_unique_indexes(
     storage: &mut dyn StorageEngine,
     indexes: &[IndexDef],
@@ -38,6 +39,7 @@ pub(super) struct InsertBatchApply<'a> {
 fn persist_batch_insert_indexes(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    conn_txn: &mut ConnectionTxn,
     bloom: &mut crate::bloom::BloomRegistry,
     plan: &mut InsertBatchApply<'_>,
     rids: &[RecordId],
@@ -46,7 +48,7 @@ fn persist_batch_insert_indexes(
         return Ok(false);
     }
 
-    let snap = txn.active_snapshot()?;
+    let snap = txn.active_snapshot(conn_txn);
     let updated = crate::index_maintenance::batch_insert_into_indexes(
         plan.indexes,
         plan.rows,
@@ -59,7 +61,7 @@ fn persist_batch_insert_indexes(
         snap,
     )?;
     for (index_id, new_root) in &updated {
-        CatalogWriter::new(storage, txn)?.update_index_root(*index_id, *new_root)?;
+        CatalogWriter::new(storage, txn, conn_txn)?.update_index_root(*index_id, *new_root)?;
     }
 
     // Record UndoIndexInsert for each (row, index) so ROLLBACK can clean B-Trees.
@@ -83,7 +85,7 @@ fn persist_batch_insert_indexes(
             } else {
                 crate::key_encoding::encode_index_key(&key_vals)?
             };
-            let _ = txn.record_index_insert(idx.index_id, idx.root_page_id, key);
+            txn.record_index_insert(conn_txn, idx.index_id, idx.root_page_id, key);
         }
     }
 
@@ -93,11 +95,12 @@ fn persist_batch_insert_indexes(
 pub(super) fn apply_insert_batch(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    conn_txn: &mut ConnectionTxn,
     bloom: &mut crate::bloom::BloomRegistry,
     mut plan: InsertBatchApply<'_>,
 ) -> Result<Vec<RecordId>, DbError> {
-    let rids = TableEngine::insert_rows_batch(storage, txn, plan.table_def, plan.columns, plan.rows)?;
-    let _ = persist_batch_insert_indexes(storage, txn, bloom, &mut plan, &rids)?;
+    let rids = TableEngine::insert_rows_batch(storage, txn, conn_txn, plan.table_def, plan.columns, plan.rows)?;
+    let _ = persist_batch_insert_indexes(storage, txn, conn_txn, bloom, &mut plan, &rids)?;
     Ok(rids)
 }
 
@@ -110,7 +113,10 @@ pub(super) fn apply_insert_batch_with_ctx(
 ) -> Result<Vec<RecordId>, DbError> {
     let rids =
         TableEngine::insert_rows_batch_with_ctx(storage, txn, plan.table_def, plan.columns, ctx, plan.rows)?;
-    let roots_changed = persist_batch_insert_indexes(storage, txn, bloom, &mut plan, &rids)?;
+    let roots_changed = {
+        let conn = ctx.conn_txn.as_mut().expect("active txn for index flush");
+        persist_batch_insert_indexes(storage, txn, conn, bloom, &mut plan, &rids)?
+    };
     if roots_changed {
         ctx.invalidate_all();
     }
@@ -221,17 +227,21 @@ pub(super) fn flush_clustered_insert_batch(
         .collect();
 
     let mut secondary_indexes = batch.secondary_indexes;
-    let count = apply_clustered_insert_rows(
-        storage,
-        txn,
-        bloom,
-        &batch.table_def,
-        &batch.primary_idx,
-        &mut secondary_indexes,
-        &batch.secondary_layouts,
-        &batch.compiled_preds,
-        &prepared,
-    )?;
+    let count = {
+        let conn = ctx.conn_txn.as_mut().expect("active txn for clustered insert flush");
+        apply_clustered_insert_rows(
+            storage,
+            txn,
+            conn,
+            bloom,
+            &batch.table_def,
+            &batch.primary_idx,
+            &mut secondary_indexes,
+            &batch.secondary_layouts,
+            &batch.compiled_preds,
+            &prepared,
+        )?
+    };
 
     ctx.stats.on_rows_changed(batch.table_id, count);
     ctx.invalidate_all();

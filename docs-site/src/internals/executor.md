@@ -16,13 +16,22 @@ stable facade and responsibility-based source files behind it.
 | `executor/mod.rs` | public facade, statement dispatch, thread-local last-insert-id |
 | `executor/shared.rs` | helpers shared across multiple statement families |
 | `executor/select.rs` | SELECT entrypoints, projection, ORDER BY/LIMIT wiring |
-| `executor/joins.rs` | nested-loop join execution and join-specific metadata |
+| `executor/select_core.rs` | core SELECT evaluation loop (heap + clustered paths) |
+| `executor/select_ctx.rs` | SelectCtx builder and scan context |
+| `executor/select_helpers.rs` | projection, column resolution, row materialization |
+| `executor/select_joins_ctx.rs` | join context and nested-loop join helpers |
 | `executor/aggregate.rs` | GROUP BY, aggregates, DISTINCT/group-key helpers |
 | `executor/insert.rs` | INSERT and INSERT ... SELECT paths |
-| `executor/update.rs` | UPDATE execution |
+| `executor/insert_heap_ctx.rs` | heap INSERT context and batch path |
+| `executor/insert_helpers.rs` | AUTO_INCREMENT, constraint checks, default values |
+| `executor/update_ctx.rs` | UPDATE context builder |
+| `executor/update_candidates.rs` | candidate row collection for heap/clustered UPDATE |
+| `executor/update_entry.rs` | single-row UPDATE application |
+| `executor/update_clustered.rs` | clustered UPDATE orchestration |
+| `executor/update_clustered_helpers.rs` | clustered UPDATE helpers (patch, zero-alloc fast path) |
+| `executor/update_fused_range.rs` | fused clustered scan+patch for range UPDATE |
 | `executor/delete.rs` | DELETE execution and candidate collection |
 | `executor/bulk_empty.rs` | shared bulk-empty helpers for DELETE/TRUNCATE |
-| `executor/ddl.rs` | DDL, SHOW, ANALYZE, TRUNCATE |
 | `executor/staging.rs` | transactional INSERT staging flushes and barrier handling |
 
 <div class="callout callout-design">
@@ -1827,7 +1836,7 @@ skip untouched indexes safely.
 
 ## Clustered UPDATE In-Place Zero-Alloc Fast Path (Phase 39.22)
 
-`fused_clustered_scan_patch` in `executor/update.rs` implements a zero-allocation
+`fused_clustered_scan_patch` in `executor/update_fused_range.rs` implements a zero-allocation
 UPDATE fast path for clustered tables when all SET columns are fixed-size.
 
 ### Allocation audit

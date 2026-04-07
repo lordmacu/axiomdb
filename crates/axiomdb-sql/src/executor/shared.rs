@@ -8,7 +8,11 @@ fn resolve_table_cached(
 
     // If the user explicitly specified a database, verify it exists first.
     if tref.database.is_some() {
-        let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+        let snap = ctx
+            .conn_txn
+            .as_ref()
+            .map(|c| txn.active_snapshot(c))
+            .unwrap_or_else(|| txn.snapshot());
         let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
         if !reader.database_exists(&database)? {
             return Err(DbError::DatabaseNotFound {
@@ -17,26 +21,39 @@ fn resolve_table_cached(
         }
     }
 
+    // Inside an explicit transaction, catalog metadata can change mid-transaction
+    // (bulk DELETE, TRUNCATE, DDL, savepoint rollback). Skip the cache so every
+    // statement always reads the current catalog state via the active snapshot.
+    let in_txn = ctx.conn_txn.is_some();
+
     // If the user specified an explicit schema, resolve directly.
     if let Some(schema) = tref.schema.as_deref() {
-        if let Some(cached) = ctx.get_table(&database, schema, &tref.name) {
-            return Ok(cached.clone());
+        if !in_txn {
+            if let Some(cached) = ctx.get_table(&database, schema, &tref.name) {
+                return Ok(cached.clone());
+            }
         }
-        let mut resolver = make_resolver_with_database(storage, txn, &database)?;
+        let mut resolver = make_resolver_with_database(storage, txn, ctx.conn_txn.as_ref(), &database)?;
         let resolved = resolver.resolve_table(Some(schema), &tref.name)?;
-        ctx.cache_table(&database, schema, &tref.name, resolved.clone());
+        if !in_txn {
+            ctx.cache_table(&database, schema, &tref.name, resolved.clone());
+        }
         return Ok(resolved);
     }
 
     // Unqualified name: scan search_path in order until a match is found.
     let search_path: Vec<String> = ctx.search_path.clone();
     for schema in &search_path {
-        if let Some(cached) = ctx.get_table(&database, schema, &tref.name) {
-            return Ok(cached.clone());
+        if !in_txn {
+            if let Some(cached) = ctx.get_table(&database, schema, &tref.name) {
+                return Ok(cached.clone());
+            }
         }
-        let mut resolver = make_resolver_with_database(storage, txn, &database)?;
+        let mut resolver = make_resolver_with_database(storage, txn, ctx.conn_txn.as_ref(), &database)?;
         if let Ok(resolved) = resolver.resolve_table(Some(schema), &tref.name) {
-            ctx.cache_table(&database, schema, &tref.name, resolved.clone());
+            if !in_txn {
+                ctx.cache_table(&database, schema, &tref.name, resolved.clone());
+            }
             return Ok(resolved);
         }
     }
@@ -87,6 +104,7 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
             collect_column_refs(right, mask);
         }
         Expr::IsNull { expr, .. } => collect_column_refs(expr, mask),
+        Expr::IsBoolean { expr, .. } => collect_column_refs(expr, mask),
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -143,21 +161,15 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
 
 // ── Dispatch ─────────────────────────────────────────────────────────────────
 
-/// Routes a statement to its handler. Called both inside `autocommit` and
-/// directly when an explicit transaction is already active.
-fn make_resolver<'a>(
-    storage: &'a dyn StorageEngine,
-    txn: &TxnManager,
-) -> Result<SchemaResolver<'a>, DbError> {
-    make_resolver_with_database(storage, txn, DEFAULT_DATABASE_NAME)
-}
-
 fn make_resolver_with_database<'a>(
     storage: &'a dyn StorageEngine,
     txn: &TxnManager,
+    conn_txn: Option<&axiomdb_wal::ConnectionTxn>,
     database: &'a str,
 ) -> Result<SchemaResolver<'a>, DbError> {
-    let snap: TransactionSnapshot = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let snap: TransactionSnapshot = conn_txn
+        .map(|c| txn.active_snapshot(c))
+        .unwrap_or_else(|| txn.snapshot());
     SchemaResolver::new(storage, snap, database, "public")
 }
 

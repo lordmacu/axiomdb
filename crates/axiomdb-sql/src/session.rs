@@ -8,6 +8,7 @@ use axiomdb_catalog::{
 };
 use axiomdb_core::error::DbError;
 use axiomdb_types::Value;
+use axiomdb_wal::ConnectionTxn;
 
 use crate::clustered_secondary::ClusteredSecondaryLayout;
 use crate::expr::Expr;
@@ -195,6 +196,7 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         | DbError::ForeignKeyNoParentIndex { .. }
         | DbError::NotNullViolation { .. }
         | DbError::CheckViolation { .. }
+        | DbError::ColumnCountMismatch { .. }
         | DbError::TypeMismatch { .. }
         | DbError::InvalidValue { .. }
         | DbError::InvalidCoercion { .. }
@@ -554,6 +556,11 @@ pub struct SessionContext {
     /// Stack is truncated on rollback/release (later savepoints destroyed).
     /// Cleared entirely on `COMMIT` / `ROLLBACK`.
     pub savepoints: Vec<(String, axiomdb_wal::Savepoint)>,
+    /// Active per-connection transaction state (Phase 40.4b).
+    ///
+    /// `Some` when a transaction is open (explicit or autocommit-implicit).
+    /// `None` between transactions.
+    pub conn_txn: Option<ConnectionTxn>,
 }
 
 impl Default for SessionContext {
@@ -584,6 +591,7 @@ impl SessionContext {
             next_txn_isolation: None,
             lock_timeout_secs: 30,
             savepoints: Vec::new(),
+            conn_txn: None,
         }
     }
 

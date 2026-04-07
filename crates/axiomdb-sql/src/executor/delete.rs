@@ -18,27 +18,31 @@ fn execute_delete_ctx(
         .cloned()
         .collect();
 
-    let snap = txn.active_snapshot()?;
+    let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("conn_txn for delete_ctx"));
 
     // ── Clustered table DELETE dispatch (Phase 39.17) ────────────────────
     if resolved.def.is_clustered() {
-        return execute_clustered_delete(
+        let mut conn = ctx.conn_txn.take().expect("conn_txn for clustered delete");
+        let result = execute_clustered_delete(
             stmt.where_clause,
             &resolved.columns,
             &secondary_indexes,
             storage,
             txn,
+            &mut conn,
             snap,
             &resolved,
             bloom,
             ctx,
         );
+        ctx.conn_txn = Some(conn);
+        return result;
     }
 
     // Check if any FK constraint references THIS table as the parent.
     // If so, we must scan rows (to get parent key values) and cannot use the fast path.
     let has_fk_references = {
-        let mut reader = CatalogReader::new(storage, snap)?;
+        let mut reader = CatalogReader::new(storage, snap.clone())?;
         !reader
             .list_fk_constraints_referencing(resolved.def.id)?
             .is_empty()
@@ -59,7 +63,10 @@ fn execute_delete_ctx(
         let plan = plan_bulk_empty_table(storage, &resolved.def, &all_indexes, snap)?;
         let count = plan.visible_row_count;
 
-        apply_bulk_empty_table(storage, txn, bloom, &resolved.def, plan)?;
+        {
+            let conn = ctx.conn_txn.as_mut().expect("conn_txn for bulk_empty delete_ctx");
+            apply_bulk_empty_table(storage, txn, conn, bloom, &resolved.def, plan)?;
+        }
 
         // Invalidate session schema cache so the next query reloads the new roots.
         ctx.invalidate_all();
@@ -108,11 +115,13 @@ fn execute_delete_ctx(
     // FK parent enforcement: must run BEFORE heap delete so RESTRICT can abort
     // cleanly and CASCADE/SET NULL can still read/update child rows.
     if has_fk_references && !to_delete.is_empty() {
+        let conn = ctx.conn_txn.as_mut().expect("conn_txn for fk_parent_delete");
         crate::fk_enforcement::enforce_fk_on_parent_delete(
             &to_delete,
             resolved.def.id,
             storage,
             txn,
+            conn,
             bloom,
             0,
         )?;
@@ -120,7 +129,7 @@ fn execute_delete_ctx(
 
     // Batch-delete from heap: each page read+written once instead of 3× per row.
     let rids_only: Vec<RecordId> = to_delete.iter().map(|(rid, _)| *rid).collect();
-    let count = TableEngine::delete_rows_batch(storage, txn, &resolved.def, &rids_only)?;
+    let count = TableEngine::delete_rows_batch(storage, txn, ctx.conn_txn.as_mut().expect("conn_txn for delete_rows_batch"), &resolved.def, &rids_only)?;
 
     // MVCC deferred index deletion (PostgreSQL model): ALL index entries are left
     // in place during DELETE — PK, UNIQUE, FK auto-indexes, and non-unique alike.
@@ -154,6 +163,7 @@ fn execute_clustered_delete(
     secondary_indexes: &[axiomdb_catalog::IndexDef],
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
     snap: axiomdb_core::TransactionSnapshot,
     resolved: &axiomdb_catalog::ResolvedTable,
     bloom: &mut crate::bloom::BloomRegistry,
@@ -164,7 +174,7 @@ fn execute_clustered_delete(
         .unwrap_or(resolved.def.root_page_id);
 
     let has_fk_references = {
-        let mut reader = CatalogReader::new(storage, snap)?;
+        let mut reader = CatalogReader::new(storage, snap.clone())?;
         !reader
             .list_fk_constraints_referencing(resolved.def.id)?
             .is_empty()
@@ -174,8 +184,8 @@ fn execute_clustered_delete(
     // Walk leaf chain directly, mark ALL visible cells as deleted.
     // Zero row decode — only reads RowHeader (24 bytes per cell).
     if where_clause.is_none() && !has_fk_references {
-        let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
-        let count = delete_mark_all_clustered_leaves(storage, txn, resolved.def.id, root_pid, txn_id, snap)?;
+        let txn_id = conn_txn.txn_id;
+        let count = delete_mark_all_clustered_leaves(storage, txn, conn_txn, resolved.def.id, root_pid, txn_id, snap.clone())?;
         if count > 0 {
             ctx.stats.on_rows_changed(resolved.def.id, count);
         }
@@ -191,7 +201,7 @@ fn execute_clustered_delete(
         schema_cols,
         secondary_indexes,
         storage,
-        snap,
+        snap.clone(),
         resolved,
         root_pid,
         ctx.effective_collation(),
@@ -222,12 +232,13 @@ fn execute_clustered_delete(
             resolved.def.id,
             storage,
             txn,
+            conn_txn,
             bloom,
             0,
         )?;
     }
 
-    let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+    let txn_id = conn_txn.txn_id;
     let mut count = 0u64;
 
     // InnoDB-inspired batch delete: candidates arrive in PK order from the
@@ -285,7 +296,7 @@ fn execute_clustered_delete(
 
         // Lightweight batch WAL + undo for all patched cells on this leaf.
         if !patched_keys.is_empty() {
-            txn.record_clustered_delete_mark_lightweight(resolved.def.id, root_pid, &patched_keys)?;
+            txn.record_clustered_delete_mark_lightweight(conn_txn, resolved.def.id, root_pid, &patched_keys)?;
         }
     }
 
@@ -397,6 +408,7 @@ fn clustered_rows_for_secondary_delete_access(
 fn delete_mark_all_clustered_leaves(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_id: u32,
     root_pid: u64,
     txn_id: u64,
@@ -473,7 +485,7 @@ fn delete_mark_all_clustered_leaves(
         // This reduces per-row WAL from ~150 bytes to ~70 bytes (header-only images)
         // and undo from ~100 bytes (full row clone) to ~16 bytes (PK key only).
         if !patched_keys.is_empty() {
-            txn.record_clustered_delete_mark_lightweight(table_id, root_pid, &patched_keys)?;
+            txn.record_clustered_delete_mark_lightweight(conn_txn, table_id, root_pid, &patched_keys)?;
         }
         current = next;
     }
@@ -744,9 +756,11 @@ fn execute_delete(
     stmt: DeleteStmt,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
 ) -> Result<QueryResult, DbError> {
     let resolved = {
-        let mut resolver = make_resolver(storage, txn)?;
+        let mut resolver =
+            make_resolver_with_database(storage, txn, Some(conn_txn), DEFAULT_DATABASE_NAME)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
     let schema_cols = resolved.columns.clone();
@@ -762,7 +776,7 @@ fn execute_delete(
     // No-op bloom for the non-ctx path (bloom is managed by execute_with_ctx callers).
     let mut noop_bloom = crate::bloom::BloomRegistry::new();
 
-    let snap = txn.active_snapshot()?;
+    let snap = txn.active_snapshot(conn_txn);
     if resolved.def.is_clustered() {
         let mut temp_ctx = SessionContext::new();
         return execute_clustered_delete(
@@ -771,6 +785,7 @@ fn execute_delete(
             &secondary_indexes,
             storage,
             txn,
+            conn_txn,
             snap,
             &resolved,
             &mut noop_bloom,
@@ -781,7 +796,7 @@ fn execute_delete(
     // Check if any FK constraint references THIS table as the parent.
     // If so, fall through to the row-by-row path so RESTRICT/CASCADE still fires.
     let has_fk_references = {
-        let mut reader = CatalogReader::new(storage, snap)?;
+        let mut reader = CatalogReader::new(storage, snap.clone())?;
         !reader
             .list_fk_constraints_referencing(resolved.def.id)?
             .is_empty()
@@ -791,7 +806,7 @@ fn execute_delete(
     if stmt.where_clause.is_none() && !has_fk_references {
         let plan = plan_bulk_empty_table(storage, &resolved.def, &secondary_indexes, snap)?;
         let count = plan.visible_row_count;
-        apply_bulk_empty_table(storage, txn, &mut noop_bloom, &resolved.def, plan)?;
+        apply_bulk_empty_table(storage, txn, conn_txn, &mut noop_bloom, &resolved.def, plan)?;
         return Ok(QueryResult::Affected {
             count,
             last_insert_id: None,
@@ -819,7 +834,7 @@ fn execute_delete(
 
     // Batch-delete from heap: each page read+written once instead of 3× per row.
     let rids_only: Vec<RecordId> = to_delete.iter().map(|(rid, _)| *rid).collect();
-    let count = TableEngine::delete_rows_batch(storage, txn, &resolved.def, &rids_only)?;
+    let count = TableEngine::delete_rows_batch(storage, txn, conn_txn, &resolved.def, &rids_only)?;
 
     // MVCC deferred index deletion (PostgreSQL model): all index entries left in
     // place. Dead entries filtered by heap visibility. VACUUM cleans later.

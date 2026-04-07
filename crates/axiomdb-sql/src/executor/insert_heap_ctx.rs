@@ -1,0 +1,398 @@
+fn execute_insert_ctx(
+    stmt: InsertStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let resolved = resolve_table_cached(storage, txn, ctx, &stmt.table)?;
+    if resolved.def.is_clustered() {
+        if ctx.pending_inserts.is_some() {
+            flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
+        }
+        // For explicit transactions with a VALUES source, stage rows into the
+        // batch instead of writing immediately.  All other cases (SELECT source,
+        // autocommit) go through the existing single-statement path.
+        if ctx.in_explicit_txn {
+            if let InsertSource::Values(_) = &stmt.source {
+                return enqueue_clustered_insert_ctx(stmt, storage, txn, bloom, ctx, resolved);
+            }
+        }
+        return execute_clustered_insert_ctx(stmt, storage, txn, bloom, ctx, resolved);
+    }
+    resolved
+        .def
+        .ensure_heap_runtime("INSERT into clustered table — Phase 39.14")?;
+
+    let schema_cols = &resolved.columns;
+    let mut secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
+        .indexes
+        .iter()
+        .filter(|i| !i.columns.is_empty())
+        .cloned()
+        .collect();
+
+    let col_positions: Vec<usize> = match &stmt.columns {
+        None => (0..schema_cols.len()).collect(),
+        Some(named_cols) => {
+            let mut map = vec![usize::MAX; schema_cols.len()];
+            for (val_pos, col_name) in named_cols.iter().enumerate() {
+                let schema_pos = schema_cols
+                    .iter()
+                    .position(|c| &c.name == col_name)
+                    .ok_or_else(|| DbError::ColumnNotFound {
+                        name: col_name.clone(),
+                        table: resolved.def.table_name.clone(),
+                    })?;
+                map[schema_pos] = val_pos;
+            }
+            map
+        }
+    };
+
+    // Number of explicitly-named columns (None = INSERT without column list = all columns).
+    let explicit_col_count: Option<usize> = stmt.columns.as_ref().map(|c| c.len());
+
+    let mut count = 0u64;
+
+    // Find the AUTO_INCREMENT column (at most one per table).
+    let auto_inc_col: Option<usize> = schema_cols.iter().position(|c| c.auto_increment);
+    let mut first_generated: Option<u64> = None;
+
+    fn next_auto_inc_ctx(
+        storage: &mut dyn StorageEngine,
+        txn: &TxnManager,
+        conn_txn: &ConnectionTxn,
+        table_def: &axiomdb_catalog::schema::TableDef,
+        schema_cols: &[axiomdb_catalog::schema::ColumnDef],
+        col_idx: usize,
+    ) -> Result<u64, DbError> {
+        let table_id = table_def.id;
+        let cached = AUTO_INC_SEQ.with(|seq| seq.borrow().get(&table_id).copied());
+        if let Some(next) = cached {
+            AUTO_INC_SEQ.with(|seq| seq.borrow_mut().insert(table_id, next + 1));
+            return Ok(next);
+        }
+        let snap = txn.active_snapshot(conn_txn);
+        let rows = TableEngine::scan_table(storage, table_def, schema_cols, snap, None)?;
+        let max_existing: u64 = rows
+            .iter()
+            .filter_map(|(_, vals)| vals.get(col_idx))
+            .filter_map(|v| match v {
+                Value::Int(n) => Some(*n as u64),
+                Value::BigInt(n) => Some(*n as u64),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let next = max_existing + 1;
+        AUTO_INC_SEQ.with(|seq| seq.borrow_mut().insert(table_id, next + 1));
+        Ok(next)
+    }
+
+    let compiled_preds =
+        crate::partial_index::compile_index_predicates(&secondary_indexes, schema_cols)?;
+
+    match stmt.source {
+        // ── INSERT ... VALUES — immediate path ────────────────────────────────
+        // NOTE: heap-table INSERT staging (buffering rows in ctx.pending_inserts
+        // before flush) was removed. Staging delayed the physical heap write and
+        // its UndoInsert record until a barrier statement (DELETE, SELECT, etc.)
+        // triggered a flush — which could happen *after* a user savepoint was
+        // taken. If rollback_to_savepoint ran before the flush it captured
+        // undo_len=0 and incorrectly undid the flush, making the pre-savepoint
+        // row disappear (test: test_bulk_delete_savepoint_rollback_restores_data).
+        // Clustered tables retain batch staging via enqueue_clustered_insert_ctx
+        // (handled above) which tracks savepoint semantics via clustered_roots.
+        // All heap inserts now use the immediate write path so UndoInsert is
+        // recorded before any subsequent savepoint.
+        InsertSource::Values(rows) => {
+            let mut full_batch: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+
+            for (row_idx, value_exprs) in rows.into_iter().enumerate() {
+                let provided: Vec<Value> = value_exprs
+                    .iter()
+                    .map(|e| eval(e, &[]))
+                    .collect::<Result<_, _>>()?;
+
+                // MySQL error 1136: column count in VALUES must match the explicit column list.
+                if let Some(expected) = explicit_col_count {
+                    if provided.len() != expected {
+                        return Err(DbError::ColumnCountMismatch {
+                            expected,
+                            got: provided.len(),
+                            row: row_idx + 1,
+                        });
+                    }
+                }
+
+                let mut full_values: Vec<Value> = col_positions
+                    .iter()
+                    .map(|&idx| {
+                        if idx == usize::MAX {
+                            Value::Null
+                        } else {
+                            provided.get(idx).cloned().unwrap_or(Value::Null)
+                        }
+                    })
+                    .collect();
+
+                if let Some(ai_col) = auto_inc_col {
+                    // MySQL: explicit 0 on AUTO_INCREMENT column is treated same as NULL.
+                    let is_auto_trigger = matches!(
+                        full_values.get(ai_col),
+                        Some(Value::Null) | Some(Value::Int(0)) | Some(Value::BigInt(0))
+                    );
+                    if is_auto_trigger {
+                        let id =
+                            next_auto_inc_ctx(storage, txn, ctx.conn_txn.as_ref().expect("active txn"), &resolved.def, schema_cols, ai_col)?;
+                        full_values[ai_col] = match schema_cols[ai_col].col_type {
+                            axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
+                            _ => Value::Int(id as i32),
+                        };
+                        if first_generated.is_none() {
+                            first_generated = Some(id);
+                        }
+                    }
+                }
+
+                // Evaluate active CHECK constraints from axiom_constraints.
+                check_row_constraints(
+                    &resolved.constraints,
+                    &full_values,
+                    &resolved.def.table_name,
+                )?;
+
+                // FK validation: every non-NULL FK value must reference an existing parent row.
+                if !resolved.foreign_keys.is_empty() {
+                    crate::fk_enforcement::check_fk_child_insert(
+                        &full_values,
+                        &resolved.foreign_keys,
+                        storage,
+                        txn,
+                        ctx.conn_txn.as_ref().expect("conn_txn for fk_check_insert"),
+                        bloom,
+                    )?;
+                }
+
+                full_batch.push(full_values);
+            }
+
+            if full_batch.len() == 1 {
+                let full_values = full_batch.remove(0);
+                let rid = TableEngine::insert_row_with_ctx(
+                    storage,
+                    txn,
+                    &resolved.def,
+                    schema_cols,
+                    ctx,
+                    full_values.clone(),
+                    1,
+                )?;
+                if !secondary_indexes.is_empty() {
+                    let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
+                    let updated = crate::index_maintenance::insert_into_indexes_with_undo(
+                        &secondary_indexes,
+                        &full_values,
+                        rid,
+                        storage,
+                        bloom,
+                        &compiled_preds,
+                        snap,
+                        Some(txn),
+                        Some(ctx.conn_txn.as_mut().expect("active txn")),
+                    )?;
+                    for (index_id, new_root) in updated {
+                        CatalogWriter::new(storage, txn, ctx.conn_txn.as_mut().expect("active txn"))?.update_index_root(index_id, new_root)?;
+                        if let Some(idx) = secondary_indexes
+                            .iter_mut()
+                            .find(|i| i.index_id == index_id)
+                        {
+                            idx.root_page_id = new_root;
+                        }
+                        ctx.invalidate_all();
+                    }
+                }
+                count = 1;
+            } else {
+                let committed_empty = std::collections::HashSet::new();
+                let n = full_batch.len() as u64;
+                apply_insert_batch_with_ctx(
+                    storage,
+                    txn,
+                    bloom,
+                    ctx,
+                    InsertBatchApply {
+                        table_def: &resolved.def,
+                        columns: schema_cols,
+                        indexes: &mut secondary_indexes,
+                        rows: &full_batch,
+                        compiled_preds: &compiled_preds,
+                        skip_unique_check: false,
+                        committed_empty: &committed_empty,
+                    },
+                )?;
+                count = n;
+            }
+        }
+        InsertSource::Select(select_stmt) => {
+            let select_rows = match execute_select_ctx(*select_stmt, storage, txn, bloom, ctx)? {
+                QueryResult::Rows { rows, .. } => rows,
+                other => {
+                    return Err(DbError::Other(format!(
+                        "INSERT SELECT: expected Rows from SELECT, got {other:?}"
+                    )))
+                }
+            };
+            for (row_idx, row_values) in select_rows.into_iter().enumerate() {
+                let mut full_values: Vec<Value> = col_positions
+                    .iter()
+                    .map(|&idx| {
+                        if idx == usize::MAX {
+                            Value::Null
+                        } else {
+                            row_values.get(idx).cloned().unwrap_or(Value::Null)
+                        }
+                    })
+                    .collect();
+                if let Some(ai_col) = auto_inc_col {
+                    if matches!(full_values.get(ai_col), Some(Value::Null)) {
+                        let id =
+                            next_auto_inc_ctx(storage, txn, ctx.conn_txn.as_ref().expect("active txn"), &resolved.def, schema_cols, ai_col)?;
+                        full_values[ai_col] = match schema_cols[ai_col].col_type {
+                            axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
+                            _ => Value::Int(id as i32),
+                        };
+                        if first_generated.is_none() {
+                            first_generated = Some(id);
+                        }
+                    }
+                }
+                // FK validation for INSERT SELECT path.
+                if !resolved.foreign_keys.is_empty() {
+                    crate::fk_enforcement::check_fk_child_insert(
+                        &full_values,
+                        &resolved.foreign_keys,
+                        storage,
+                        txn,
+                        ctx.conn_txn.as_ref().expect("conn_txn for fk_check_insert"),
+                        bloom,
+                    )?;
+                }
+                // Clone so full_values remains available for index maintenance.
+                let rid = TableEngine::insert_row_with_ctx(
+                    storage,
+                    txn,
+                    &resolved.def,
+                    schema_cols,
+                    ctx,
+                    full_values.clone(),
+                    row_idx + 1,
+                )?;
+                if !secondary_indexes.is_empty() {
+                    let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
+                    let updated = crate::index_maintenance::insert_into_indexes_with_undo(
+                        &secondary_indexes,
+                        &full_values,
+                        rid,
+                        storage,
+                        bloom,
+                        &compiled_preds,
+                        snap,
+                        Some(txn),
+                        Some(ctx.conn_txn.as_mut().expect("active txn")),
+                    )?;
+                    for (index_id, new_root) in updated {
+                        CatalogWriter::new(storage, txn, ctx.conn_txn.as_mut().expect("active txn"))?.update_index_root(index_id, new_root)?;
+                        if let Some(idx) = secondary_indexes
+                            .iter_mut()
+                            .find(|i| i.index_id == index_id)
+                        {
+                            idx.root_page_id = new_root;
+                        }
+                    }
+                }
+                count += 1;
+            }
+        }
+        InsertSource::DefaultValues => {
+            // Build a row where every column is NULL, then apply AUTO_INCREMENT.
+            let mut full_values: Vec<Value> = schema_cols.iter().map(|_| Value::Null).collect();
+            if let Some(ai_col) = auto_inc_col {
+                if matches!(full_values.get(ai_col), Some(Value::Null)) {
+                    let id =
+                        next_auto_inc_ctx(storage, txn, ctx.conn_txn.as_ref().expect("active txn"), &resolved.def, schema_cols, ai_col)?;
+                    full_values[ai_col] = match schema_cols[ai_col].col_type {
+                        axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
+                        _ => Value::Int(id as i32),
+                    };
+                    first_generated = Some(id);
+                }
+            }
+            check_row_constraints(
+                &resolved.constraints,
+                &full_values,
+                &resolved.def.table_name,
+            )?;
+            if !resolved.foreign_keys.is_empty() {
+                crate::fk_enforcement::check_fk_child_insert(
+                    &full_values,
+                    &resolved.foreign_keys,
+                    storage,
+                    txn,
+                    ctx.conn_txn.as_ref().expect("conn_txn for fk_check_insert"),
+                    bloom,
+                )?;
+            }
+            let rid = TableEngine::insert_row_with_ctx(
+                storage,
+                txn,
+                &resolved.def,
+                schema_cols,
+                ctx,
+                full_values.clone(),
+                1,
+            )?;
+            if !secondary_indexes.is_empty() {
+                let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
+                let updated = crate::index_maintenance::insert_into_indexes_with_undo(
+                    &secondary_indexes,
+                    &full_values,
+                    rid,
+                    storage,
+                    bloom,
+                    &compiled_preds,
+                    snap,
+                    Some(txn),
+                    Some(ctx.conn_txn.as_mut().expect("active txn")),
+                )?;
+                for (index_id, new_root) in updated {
+                    CatalogWriter::new(storage, txn, ctx.conn_txn.as_mut().expect("active txn"))?.update_index_root(index_id, new_root)?;
+                    if let Some(idx) = secondary_indexes
+                        .iter_mut()
+                        .find(|i| i.index_id == index_id)
+                    {
+                        idx.root_page_id = new_root;
+                    }
+                }
+            }
+            count += 1;
+        }
+    }
+
+    if let Some(id) = first_generated {
+        THREAD_LAST_INSERT_ID.with(|v| v.set(id));
+        // Track row changes for stats staleness (Phase 6.11).
+        ctx.stats.on_rows_changed(resolved.def.id, count);
+        return Ok(QueryResult::affected_with_id(count, id));
+    }
+
+    // Track row changes for stats staleness (Phase 6.11).
+    ctx.stats.on_rows_changed(resolved.def.id, count);
+
+    Ok(QueryResult::Affected {
+        count,
+        last_insert_id: None,
+    })
+}
+

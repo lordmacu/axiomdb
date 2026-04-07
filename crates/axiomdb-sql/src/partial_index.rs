@@ -139,10 +139,12 @@ pub fn resolve_predicate_columns(expr: Expr, col_defs: &[ColumnDef]) -> Result<E
             expr: inner,
             pattern,
             negated,
+            escape,
         } => Ok(Expr::Like {
             expr: Box::new(resolve_predicate_columns(*inner, col_defs)?),
             pattern: Box::new(resolve_predicate_columns(*pattern, col_defs)?),
             negated,
+            escape,
         }),
         Expr::Function { name, args } => Ok(Expr::Function {
             name,
@@ -150,6 +152,15 @@ pub fn resolve_predicate_columns(expr: Expr, col_defs: &[ColumnDef]) -> Result<E
                 .into_iter()
                 .map(|e| resolve_predicate_columns(e, col_defs))
                 .collect::<Result<_, _>>()?,
+        }),
+        Expr::IsBoolean {
+            expr: inner,
+            value,
+            negated,
+        } => Ok(Expr::IsBoolean {
+            expr: Box::new(resolve_predicate_columns(*inner, col_defs)?),
+            value,
+            negated,
         }),
         // Subqueries, correlated references, CASE, aggregates, etc. cannot appear
         // in a partial index predicate — reject them clearly at CREATE INDEX time.
