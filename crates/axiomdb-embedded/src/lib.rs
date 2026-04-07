@@ -259,10 +259,11 @@ mod db {
                 });
             }
             let stmt = parse(sql, None)?;
-            let snap = self
-                .txn
-                .active_snapshot()
-                .unwrap_or_else(|_| self.txn.snapshot());
+            let snap = if let Some(ref ct) = self.session.conn_txn {
+                self.txn.active_snapshot(ct)
+            } else {
+                self.txn.snapshot()
+            };
             let analyzed = analyze_cached(stmt, &self.storage, snap, &mut self.schema_cache)?;
             execute_with_ctx(
                 analyzed,
@@ -345,10 +346,11 @@ mod db {
             let param_count = count_params(&stmt);
 
             // Analyze — resolves column indices, type checks.
-            let snap = self
-                .txn
-                .active_snapshot()
-                .unwrap_or_else(|_| self.txn.snapshot());
+            let snap = if let Some(ref ct) = self.session.conn_txn {
+                self.txn.active_snapshot(ct)
+            } else {
+                self.txn.snapshot()
+            };
             let analyzed = analyze_cached(stmt, &self.storage, snap, &mut self.schema_cache)?;
 
             Ok(PreparedStatement {

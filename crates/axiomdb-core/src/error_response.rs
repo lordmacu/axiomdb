@@ -226,6 +226,14 @@ fn derive_detail_hint(err: &DbError) -> (Option<String>, Option<String>) {
             )),
         ),
 
+        DbError::ColumnCountMismatch { expected, got, row } => (
+            None,
+            Some(format!(
+                "Column count doesn't match value count at row {row}: \
+                 expected {expected} values but got {got}."
+            )),
+        ),
+
         DbError::CheckViolation { table, constraint } => (
             None,
             Some(format!(

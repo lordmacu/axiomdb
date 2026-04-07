@@ -98,6 +98,13 @@ pub enum DbError {
     #[error("CHECK constraint violation on {table}.{constraint}")]
     CheckViolation { table: String, constraint: String },
 
+    #[error("column count doesn't match value count at row {row}: expected {expected}, got {got}")]
+    ColumnCountMismatch {
+        expected: usize,
+        got: usize,
+        row: usize,
+    },
+
     /// Startup-time index integrity verification found an unrecoverable index problem.
     ///
     /// Raised during open/recovery before the database starts serving traffic.
@@ -328,6 +335,7 @@ impl DbError {
             DbError::ForeignKeyNoParentIndex { .. } => "42830",
             DbError::NotNullViolation { .. } => "23502",
             DbError::CheckViolation { .. } => "23514",
+            DbError::ColumnCountMismatch { .. } => "21S01",
             DbError::DuplicateKey => "23505",
             // ── Transaction ───────────────────────────────────────────────
             DbError::WalGroupCommitFailed { .. } => "XX000",

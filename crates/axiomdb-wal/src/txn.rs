@@ -20,8 +20,10 @@
 //! Use [`TxnManager::autocommit`] to wrap a single operation in an implicit
 //! BEGIN / COMMIT (with automatic ROLLBACK on error).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot, TxnId};
 use axiomdb_storage::{
@@ -147,32 +149,57 @@ pub enum IndexUndoRecord {
     },
 }
 
-// ── ActiveTxn ────────────────────────────────────────────────────────────────
+// ── ConnectionTxn ────────────────────────────────────────────────────────────
 
-struct ActiveTxn {
-    txn_id: TxnId,
-    /// Snapshot id captured at BEGIN: used for read-your-own-writes during the txn.
-    snapshot_id_at_begin: u64,
-    /// Isolation level for this transaction (Phase 7.1).
-    /// Controls whether `active_snapshot()` returns the frozen BEGIN snapshot
-    /// (REPEATABLE READ / SERIALIZABLE) or a fresh per-statement snapshot
-    /// (READ COMMITTED).
-    isolation_level: axiomdb_core::IsolationLevel,
+/// Per-connection transaction state returned by [`TxnManager::begin`].
+///
+/// Holds the undo log, WAL scratch buffer, and all mutable state that belongs
+/// to a single in-flight transaction. Passed by `&mut` to all `record_*`
+/// methods and consumed by `commit()` / `rollback()`.
+///
+/// Moving per-txn state out of `TxnManager` is the first step toward
+/// multi-writer support (Phase 40.10): each connection owns its
+/// `ConnectionTxn` independently of others.
+#[derive(Debug)]
+pub struct ConnectionTxn {
+    /// Globally monotonic transaction identifier.
+    pub txn_id: TxnId,
+    /// Snapshot id captured at BEGIN — used for read-your-own-writes.
+    pub snapshot_id_at_begin: u64,
+    /// Isolation level controlling snapshot freshness.
+    pub isolation_level: axiomdb_core::IsolationLevel,
     /// Undo ops in chronological order; applied last-to-first on rollback.
-    undo_ops: Vec<UndoOp>,
+    pub undo_ops: Vec<UndoOp>,
     /// Pages to free **after** this transaction is durably committed.
-    ///
-    /// Populated by `defer_free_pages(...)` during bulk-empty operations (Phase 5.16).
-    /// On `rollback` or `rollback_to_savepoint`, these pages are NOT freed — the
-    /// catalog undo already restored the old roots, so the old pages remain live.
-    /// On `commit`, this list moves to `TxnManager::committed_free_batches` keyed
-    /// by `txn_id` and is freed only after `release_committed_frees(...)` is called.
-    deferred_free_pages: Vec<u64>,
+    pub deferred_free_pages: Vec<u64>,
+    /// Per-savepoint stack (for internal use).
+    pub savepoints: Vec<Savepoint>,
     /// Latest clustered root per table touched by this transaction.
+    pub clustered_roots: HashMap<u32, u64>,
+    /// Frozen active-txn set at BEGIN for RR/Serializable (excludes self).
+    /// `None` for READ COMMITTED (fresh snapshot per statement).
+    pub(crate) active_ids_at_begin: Option<Arc<HashSet<TxnId>>>,
+    /// Reusable WAL scratch buffer (per-connection, zero contention).
+    pub(crate) wal_scratch: Vec<u8>,
+    /// Copied from `TxnManager::deferred_commit_mode` at BEGIN time.
+    pub(crate) deferred_commit_mode: bool,
+    /// Set by `commit()` in deferred mode. Taken by `take_pending_deferred_commit()`.
+    pub(crate) pending_deferred_txn_id: Option<TxnId>,
+}
+
+impl ConnectionTxn {
+    /// Returns the transaction's id.
+    pub fn txn_id(&self) -> TxnId {
+        self.txn_id
+    }
+
+    /// Takes and returns the pending deferred commit txn_id, if any.
     ///
-    /// Used by clustered rollback so undo follows the current tree shape after
-    /// earlier inserts, splits, merges, and root changes in the same txn.
-    clustered_roots: HashMap<u32, u64>,
+    /// Returns `Some(txn_id)` if the last `commit()` was a DML transaction in
+    /// deferred mode (the Commit entry is in the BufWriter but not fsynced).
+    pub fn take_pending_deferred_commit(&mut self) -> Option<TxnId> {
+        self.pending_deferred_txn_id.take()
+    }
 }
 
 // ── TxnManager ───────────────────────────────────────────────────────────────
@@ -181,1779 +208,38 @@ struct ActiveTxn {
 pub struct TxnManager {
     wal: ConcurrentWalWriter,
     next_txn_id: u64,
+    /// TxnId of the last committed transaction. Advances only on commit (`&mut self`).
+    /// Kept as plain `u64` until Phase 40.10 introduces concurrent writers.
     max_committed: u64,
-    active: Option<ActiveTxn>,
-    /// Reusable scratch buffer for WAL entry serialization.
-    ///
-    /// Passed to `WalWriter::append_with_buf()` to avoid a fresh Vec allocation
-    /// per DML operation. Capacity grows to the largest entry seen and is
-    /// retained across operations — inspired by LMDB's approach of reusing
-    /// a single write buffer for all modifications in a batch.
-    wal_scratch: Vec<u8>,
-    /// When `true`, DML `commit()` skips inline flush+fsync and stores the
-    /// committed `txn_id` in `pending_deferred_txn_id` for the caller to hand
-    /// off to the leader-based WAL fsync pipeline. Read-only transactions still
-    /// use the lightweight `flush_no_sync` path.
+    /// Set of currently in-flight transaction IDs.
+    /// Protected by `RwLock` to allow concurrent snapshot reads.
+    active_set: RwLock<HashSet<TxnId>>,
+    /// Lowest in-flight txn_id — used as GC horizon (DuckDB-style).
+    /// 0 means no active transactions.
+    lowest_active_id: AtomicU64,
+    /// When `true`, DML `commit()` skips inline flush+fsync.
+    /// The `ConnectionTxn` stores the pending txn_id for the caller to drive the
+    /// leader-based WAL fsync pipeline.
     deferred_commit_mode: bool,
-    /// Set by `commit()` when `deferred_commit_mode` is true and the transaction
-    /// contained DML. Cleared by `take_pending_deferred_commit()`.
-    pending_deferred_txn_id: Option<TxnId>,
     /// Pages waiting to be freed after their transaction is durably committed.
-    ///
-    /// Each entry is `(txn_id, pages)`. Populated by `commit()` from
-    /// `ActiveTxn::deferred_free_pages`. Released by `release_committed_frees(...)`
-    /// after WAL fsync confirms durability, in both immediate and group-commit modes.
     committed_free_batches: Vec<(TxnId, Vec<u64>)>,
     /// WAL durability policy for committed DML.
-    ///
-    /// - `Strict` (default): full flush+sync before OK.
-    /// - `Normal`: flush to OS page cache, no durable sync per commit.
-    /// - `Off`: no per-commit barrier; benchmark/dev only.
-    ///
-    /// Set via [`set_durability_policy`]. Orthogonal to `deferred_commit_mode`.
     durability_policy: WalDurabilityPolicy,
-    /// Last known clustered root per table after the most recent commit or
-    /// rollback. Also used to seed a new ActiveTxn.
+    /// Last known clustered root per table after the most recent commit or rollback.
     last_clustered_roots: HashMap<u32, u64>,
+    /// Mirrors `ConnectionTxn::pending_deferred_txn_id` after each `commit()` in
+    /// deferred mode. Allows callers to retrieve the pending id after the
+    /// `ConnectionTxn` has been consumed by `commit()`.
+    pending_deferred_txn_id: Option<TxnId>,
 }
 
-impl TxnManager {
-    // ── Construction ─────────────────────────────────────────────────────────
-
-    /// Creates a fresh WAL file and a new TxnManager.
-    ///
-    /// Fails if the WAL file already exists.
-    pub fn create(wal_path: &Path) -> Result<Self, DbError> {
-        let wal = ConcurrentWalWriter::create(wal_path)?;
-        Ok(Self {
-            wal,
-            next_txn_id: 1,
-            max_committed: 0,
-            active: None,
-            wal_scratch: Vec::with_capacity(256),
-            deferred_commit_mode: false,
-            pending_deferred_txn_id: None,
-            committed_free_batches: Vec::new(),
-            durability_policy: WalDurabilityPolicy::Strict,
-            last_clustered_roots: HashMap::new(),
-        })
-    }
-
-    /// Opens an existing WAL file, scanning it to recover `max_committed` and
-    /// the latest committed clustered root per table.
-    ///
-    /// Does not replay DML entries — full crash recovery is handled in Phase 3.8.
-    /// Only the highest committed TxnId is restored so that new transactions
-    /// receive monotonically increasing IDs and snapshots are correct.
-    pub fn open(wal_path: &Path) -> Result<Self, DbError> {
-        let (max_committed, clustered_roots) = scan_committed_state(wal_path)?;
-        let wal = ConcurrentWalWriter::open(wal_path)?;
-        Ok(Self {
-            wal,
-            next_txn_id: max_committed + 1,
-            max_committed,
-            active: None,
-            wal_scratch: Vec::with_capacity(256),
-            deferred_commit_mode: false,
-            pending_deferred_txn_id: None,
-            committed_free_batches: Vec::new(),
-            durability_policy: WalDurabilityPolicy::Strict,
-            last_clustered_roots: clustered_roots,
-        })
-    }
-
-    // ── Transaction lifecycle ─────────────────────────────────────────────────
-
-    /// Starts a new explicit transaction.
-    ///
-    /// Assigns the next monotonic [`TxnId`], writes a buffered Begin WAL entry,
-    /// and initialises the undo log. Uses `RepeatableRead` isolation by default.
-    ///
-    /// # Errors
-    /// - [`DbError::TransactionAlreadyActive`] if a transaction is already open.
-    pub fn begin(&mut self) -> Result<TxnId, DbError> {
-        self.begin_with_isolation(axiomdb_core::IsolationLevel::RepeatableRead)
-    }
-
-    /// Like [`begin`] but with an explicit isolation level (Phase 7.1).
-    ///
-    /// - `ReadCommitted`: `active_snapshot()` returns a fresh snapshot per call.
-    /// - `RepeatableRead` / `Serializable`: `active_snapshot()` returns the
-    ///   snapshot frozen at BEGIN.
-    pub fn begin_with_isolation(
-        &mut self,
-        isolation_level: axiomdb_core::IsolationLevel,
-    ) -> Result<TxnId, DbError> {
-        if let Some(ref active) = self.active {
-            return Err(DbError::TransactionAlreadyActive {
-                txn_id: active.txn_id,
-            });
-        }
-
-        let txn_id = self.next_txn_id;
-        self.next_txn_id += 1;
-
-        // Phase 7.15: transaction ID overflow prevention.
-        // u64 gives ~1.8×10^19 IDs — at 1M txn/s this lasts 584,942 years.
-        // Still, detect pathological usage early and warn before overflow.
-        const TXN_ID_WARN_90: u64 = u64::MAX / 10 * 9; // 90% capacity
-        const TXN_ID_WARN_50: u64 = u64::MAX / 2; // 50% capacity
-        if txn_id >= TXN_ID_WARN_90 {
-            tracing::error!(
-                txn_id,
-                "CRITICAL: transaction ID at 90% of u64 capacity — VACUUM FREEZE required"
-            );
-        } else if txn_id >= TXN_ID_WARN_50 {
-            tracing::warn!(
-                txn_id,
-                "transaction ID at 50% of u64 capacity — plan VACUUM FREEZE"
-            );
-        }
-
-        let mut entry = WalEntry::new(0, txn_id, EntryType::Begin, 0, vec![], vec![], vec![]);
-        self.wal.append(&mut entry)?;
-
-        self.active = Some(ActiveTxn {
-            txn_id,
-            snapshot_id_at_begin: self.max_committed + 1,
-            isolation_level,
-            undo_ops: Vec::new(),
-            deferred_free_pages: Vec::new(),
-            clustered_roots: self.last_clustered_roots.clone(),
-        });
-        Ok(txn_id)
-    }
-
-    /// Commits the active transaction: writes the Commit WAL entry and either
-    /// fsyncs inline or hands the commit off to the WAL fsync pipeline.
-    ///
-    /// Advances `max_committed` to the committed TxnId, making the transaction's
-    /// writes visible to future [`TransactionSnapshot`]s.
-    ///
-    /// When `deferred_commit_mode` is enabled (used by the fsync pipeline in the
-    /// server path), DML commits skip the inline fsync and store the txn_id in
-    /// `pending_deferred_txn_id`. The caller retrieves it with
-    /// `take_pending_deferred_commit()` and drives the WAL fsync pipeline, which
-    /// advances `max_committed` only after durability is confirmed.
-    ///
-    /// # Errors
-    /// - [`DbError::NoActiveTransaction`] if no transaction is open.
-    /// - I/O errors from WAL write or fsync.
-    pub fn commit(&mut self) -> Result<(), DbError> {
-        let active = self.active.take().ok_or(DbError::NoActiveTransaction)?;
-        let txn_id = active.txn_id;
-        let deferred_pages = active.deferred_free_pages;
-        self.last_clustered_roots = active.clustered_roots.clone();
-
-        let mut entry = WalEntry::new(0, txn_id, EntryType::Commit, 0, vec![], vec![], vec![]);
-        self.wal
-            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
-
-        if active.undo_ops.is_empty() {
-            // Read-only transaction: flush to OS page cache (visible to
-            // readers/recovery) but skip the expensive fsync (~10-20ms).
-            // No heap data was modified, so OS-level durability is sufficient.
-            self.wal.flush_no_sync()?;
-            self.max_committed = txn_id;
-        } else {
-            match self.durability_policy {
-                WalDurabilityPolicy::Strict => {
-                    if self.deferred_commit_mode {
-                        // Pipeline mode: Commit entry is in the BufWriter but NOT
-                        // flushed or fsynced. max_committed does NOT advance here —
-                        // it advances only after the pipeline leader confirms fsync.
-                        self.pending_deferred_txn_id = Some(txn_id);
-                    } else {
-                        // Immediate mode: full flush + fsync for durability.
-                        self.wal.commit_data_sync()?;
-                        self.max_committed = txn_id;
-                    }
-                }
-                WalDurabilityPolicy::Normal => {
-                    // Flush WAL bytes to OS page cache — visible to readers and
-                    // crash recovery, but NOT durable across power loss.
-                    self.wal.flush_no_sync()?;
-                    self.max_committed = txn_id;
-                }
-                WalDurabilityPolicy::Off => {
-                    // No per-commit barrier. The BufWriter holds the data in
-                    // user-space; it will reach the OS on the next flush or when
-                    // the buffer fills. Benchmark/dev only.
-                    self.max_committed = txn_id;
-                }
-            }
-        }
-
-        // Register deferred-free pages (if any) for post-commit reclamation.
-        // Pages are only freed after `release_committed_frees(txn_id)` confirms
-        // WAL durability — never before.
-        if !deferred_pages.is_empty() {
-            self.committed_free_batches.push((txn_id, deferred_pages));
-        }
-
-        Ok(())
-    }
-
-    /// Enables or disables deferred commit mode for the server-side fsync pipeline.
-    ///
-    /// When enabled, DML `commit()` skips inline flush+fsync and stores the
-    /// txn_id in `pending_deferred_txn_id` for the caller to hand off to the
-    /// leader-based pipeline.
-    pub fn set_deferred_commit_mode(&mut self, enabled: bool) {
-        self.deferred_commit_mode = enabled;
-    }
-
-    /// Sets the WAL durability policy for committed DML.
-    ///
-    /// Call this once during database open, before any transactions.
-    /// The policy is orthogonal to `deferred_commit_mode`.
-    pub fn set_durability_policy(&mut self, policy: WalDurabilityPolicy) {
-        self.durability_policy = policy;
-    }
-
-    /// Returns the current WAL durability policy.
-    pub fn durability_policy(&self) -> WalDurabilityPolicy {
-        self.durability_policy
-    }
-
-    /// Takes the pending deferred commit txn_id, if any.
-    ///
-    /// Returns `Some(txn_id)` if the last `commit()` was a DML transaction in
-    /// deferred mode (the Commit entry is in the BufWriter but not fsynced).
-    /// Returns `None` if the last commit was read-only or deferred mode is off.
-    ///
-    /// Called by `Database::execute_query` to hand the txn to the fsync
-    /// pipeline after statement execution.
-    pub fn take_pending_deferred_commit(&mut self) -> Option<TxnId> {
-        self.pending_deferred_txn_id.take()
-    }
-
-    /// Advances `max_committed` to the maximum of the given txn_ids.
-    ///
-    /// Called after a successful pipeline-driven `wal_flush_and_fsync()`, while
-    /// holding the Database lock. Makes all transactions in the batch visible
-    /// to future snapshots.
-    ///
-    /// Does not regress `max_committed` — if `max(txn_ids) < self.max_committed`,
-    /// no change is made (safe for out-of-order batch notification, though in
-    /// practice batches are always monotone under the single-writer constraint).
-    pub fn advance_committed(&mut self, txn_ids: &[TxnId]) {
-        if let Some(&max) = txn_ids.iter().max() {
-            if max > self.max_committed {
-                self.max_committed = max;
-            }
-        }
-    }
-
-    /// Advances `max_committed` to `txn_id` if it is greater than the current
-    /// value. Used by the fsync pipeline leader to make a single transaction
-    /// visible after confirming WAL durability.
-    pub fn advance_committed_single(&mut self, txn_id: TxnId) {
-        if txn_id > self.max_committed {
-            self.max_committed = txn_id;
-        }
-    }
-
-    /// Returns the WAL writer's current LSN (the last assigned LSN).
-    ///
-    /// Used by the fsync pipeline to track which LSN was last fsynced.
-    pub fn wal_current_lsn(&self) -> u64 {
-        self.wal.current_lsn()
-    }
-
-    /// Enqueues `pages` for deferred reclamation after the current transaction
-    /// is durably committed.
-    ///
-    /// Must be called **inside an active transaction**. The pages are moved to
-    /// `committed_free_batches` on `commit()` and physically freed only when
-    /// `release_committed_frees(...)` is called with a matching `txn_id`.
-    ///
-    /// On `rollback` or `rollback_to_savepoint`, deferred pages are simply
-    /// discarded — the catalog undo restores the old roots so old pages remain live.
-    ///
-    /// # Errors
-    /// - [`DbError::NoActiveTransaction`] if no transaction is open.
-    pub fn defer_free_pages(
-        &mut self,
-        pages: impl IntoIterator<Item = u64>,
-    ) -> Result<(), DbError> {
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        active.deferred_free_pages.extend(pages);
-        Ok(())
-    }
-
-    /// Frees pages whose transactions have been durably committed.
-    ///
-    /// Called after WAL fsync succeeds (immediate mode: right after `commit()`;
-    /// pipeline mode: after `advance_committed(&ids)` in the fsync leader path).
-    ///
-    /// Pages are freed via `storage.free_page(pid)`. Any `txn_id` in `txn_ids`
-    /// that has no pending batch is silently ignored.
-    ///
-    /// # Errors
-    /// - I/O errors from `storage.free_page(...)`.
-    pub fn release_committed_frees(
-        &mut self,
-        storage: &mut dyn StorageEngine,
-        txn_ids: &[TxnId],
-    ) -> Result<(), DbError> {
-        if txn_ids.is_empty() || self.committed_free_batches.is_empty() {
-            return Ok(());
-        }
-        let id_set: std::collections::HashSet<TxnId> = txn_ids.iter().copied().collect();
-        let mut remaining = Vec::with_capacity(self.committed_free_batches.len());
-        for (txn_id, pages) in self.committed_free_batches.drain(..) {
-            if id_set.contains(&txn_id) {
-                for pid in pages {
-                    // Best-effort: ignore double-free errors (page already freed
-                    // by earlier recovery or duplicate call).
-                    let _ = storage.free_page(pid);
-                }
-            } else {
-                remaining.push((txn_id, pages));
-            }
-        }
-        self.committed_free_batches = remaining;
-        Ok(())
-    }
-
-    /// Releases deferred-free pages for `txn_id` only in immediate-commit mode.
-    ///
-    /// In pipeline mode this is a no-op — the fsync leader path calls
-    /// [`release_committed_frees`] after batch fsync confirms durability.
-    ///
-    /// Call this right after a successful `txn.commit()` in immediate-commit paths,
-    /// passing the txn_id captured from `active_txn_id()` before the commit call.
-    ///
-    /// [`release_committed_frees`]: TxnManager::release_committed_frees
-    pub fn release_immediate_committed_frees(
-        &mut self,
-        storage: &mut dyn StorageEngine,
-        txn_id: TxnId,
-    ) -> Result<(), DbError> {
-        if !self.deferred_commit_mode {
-            self.release_committed_frees(storage, &[txn_id])?;
-        }
-        Ok(())
-    }
-
-    /// Flushes the WAL BufWriter to the OS and performs the steady-state
-    /// durable data sync.
-    ///
-    /// Called by the fsync pipeline leader while holding the Database lock,
-    /// covering all Commit entries written since the last fsync.
-    ///
-    /// # Errors
-    /// - I/O errors from flush or durable sync propagated to all batch waiters.
-    pub fn wal_flush_and_fsync(&mut self) -> Result<(), DbError> {
-        self.wal.commit_data_sync()
-    }
-
-    /// Rolls back the active transaction: undoes heap changes and writes a
-    /// Rollback WAL entry (not fsynced — rolled-back data is intentionally ephemeral).
-    ///
-    /// Captures the current undo log position as a statement-level savepoint.
-    ///
-    /// The returned `Savepoint` can be passed to [`rollback_to_savepoint`] to undo
-    /// only the operations recorded *after* this call, leaving the transaction active.
-    ///
-    /// Call this **before** executing each statement inside an explicit transaction
-    /// to implement MySQL-style statement-level rollback on error.
-    ///
-    /// # Panics
-    ///
-    /// Panics in debug builds if called outside an active transaction.
-    ///
-    /// [`rollback_to_savepoint`]: TxnManager::rollback_to_savepoint
-    pub fn savepoint(&self) -> Savepoint {
-        debug_assert!(
-            self.active.is_some(),
-            "savepoint() called outside an active transaction"
-        );
-        let (undo_len, deferred_free_len) = self
-            .active
-            .as_ref()
-            .map(|a| (a.undo_ops.len(), a.deferred_free_pages.len()))
-            .unwrap_or((0, 0));
-        Savepoint {
-            undo_len,
-            deferred_free_len,
-        }
-    }
-
-    /// Undoes all operations recorded **after** `sp`, leaving the transaction active.
-    ///
-    /// This implements MySQL's statement-level rollback semantics: when a statement
-    /// errors inside an explicit transaction, only that statement's writes are
-    /// undone. The transaction remains open; subsequent statements can execute.
-    ///
-    /// Undo ops are applied in reverse order (last write first), identical to the
-    /// full `rollback()` path but scoped to `sp.0..undo_ops.len()`.
-    ///
-    /// # Errors
-    ///
-    /// - [`DbError::NoActiveTransaction`] if no transaction is active.
-    /// - I/O errors from undo writes.
-    pub fn rollback_to_savepoint(
-        &mut self,
-        sp: Savepoint,
-        storage: &mut dyn StorageEngine,
-    ) -> Result<(), DbError> {
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let txn_id = active.txn_id;
-
-        // Discard deferred-free pages recorded after this savepoint.
-        // Catalog undo (below) restores old roots, so old pages remain live.
-        active.deferred_free_pages.truncate(sp.deferred_free_len);
-
-        // Drain only the undo ops recorded after the savepoint.
-        let ops_to_undo: Vec<UndoOp> = active.undo_ops.drain(sp.undo_len..).rev().collect();
-        for op in ops_to_undo {
-            match op {
-                UndoOp::UndoInsert { page_id, slot_id } => {
-                    let bytes = *storage.read_page(page_id)?.as_bytes();
-                    let mut page = Page::from_bytes(bytes)?;
-                    mark_slot_dead(&mut page, slot_id)?;
-                    storage.write_page(page_id, &page)?;
-                }
-                UndoOp::UndoDelete { page_id, slot_id } => {
-                    let bytes = *storage.read_page(page_id)?.as_bytes();
-                    let mut page = Page::from_bytes(bytes)?;
-                    clear_deletion(&mut page, slot_id)?;
-                    storage.write_page(page_id, &page)?;
-                }
-                UndoOp::UndoUpdateInPlace {
-                    page_id,
-                    slot_id,
-                    old_image,
-                } => {
-                    let bytes = *storage.read_page(page_id)?.as_bytes();
-                    let mut page = Page::from_bytes(bytes)?;
-                    restore_tuple_image(&mut page, slot_id, &old_image)?;
-                    storage.write_page(page_id, &page)?;
-                }
-                UndoOp::UndoTruncate { root_page_id } => {
-                    HeapChain::clear_deletions_by_txn(storage, root_page_id, txn_id)?;
-                }
-                UndoOp::UndoIndexInsert { .. } | UndoOp::UndoIndexDelete { .. } => {
-                    // Handled by caller via pending_index_undos().
-                    // TxnManager cannot depend on axiomdb-index.
-                }
-                UndoOp::UndoClusteredInsert { table_id, key } => {
-                    let root_pid =
-                        clustered_root_for_undo(&active.clustered_roots, table_id, "savepoint")?;
-                    let new_root = clustered_tree::delete_physical_by_key(storage, root_pid, &key)?
-                        .ok_or_else(|| DbError::BTreeCorrupted {
-                            msg: format!(
-                                "clustered savepoint rollback could not find inserted key {:?} in table {table_id}",
-                                String::from_utf8_lossy(&key)
-                            ),
-                        })?;
-                    active.clustered_roots.insert(table_id, new_root);
-                }
-                UndoOp::UndoClusteredRestore {
-                    table_id,
-                    key,
-                    old_row,
-                } => {
-                    let root_pid =
-                        clustered_root_for_undo(&active.clustered_roots, table_id, "savepoint")?;
-                    let new_root = clustered_tree::restore_exact_row_image(
-                        storage,
-                        root_pid,
-                        &key,
-                        &old_row.row_header,
-                        &old_row.row_data,
-                    )?;
-                    active.clustered_roots.insert(table_id, new_root);
-                }
-                UndoOp::UndoClusteredUndelete { table_id, key } => {
-                    // Lightweight: just clear txn_id_deleted to 0 (un-delete).
-                    let root_pid =
-                        clustered_root_for_undo(&active.clustered_roots, table_id, "savepoint")?;
-                    let leaf = clustered_tree::descend_to_leaf_pub(storage, root_pid, &key)?;
-                    let pos = match axiomdb_storage::clustered_leaf::search(&leaf, &key) {
-                        Ok(pos) => pos,
-                        Err(_) => continue, // Row not found — already undone.
-                    };
-                    let mut page = leaf.into_page();
-                    let _ =
-                        axiomdb_storage::clustered_leaf::patch_txn_id_deleted(&mut page, pos, 0);
-                    page.update_checksum();
-                    storage.write_page(page.header().page_id, &page)?;
-                }
-                UndoOp::UndoClusteredFieldPatch {
-                    table_id,
-                    key,
-                    old_header,
-                    field_deltas,
-                } => {
-                    // Zero-alloc undo: reverse each field delta by writing old_bytes
-                    // back to the exact page offset, then restore the RowHeader.
-                    let root_pid =
-                        clustered_root_for_undo(&active.clustered_roots, table_id, "savepoint")?;
-                    let leaf = clustered_tree::descend_to_leaf_pub(storage, root_pid, &key)?;
-                    let pos = match axiomdb_storage::clustered_leaf::search(&leaf, &key) {
-                        Ok(pos) => pos,
-                        Err(_) => continue, // Row not found — already undone.
-                    };
-                    let (row_data_abs_off, _) =
-                        axiomdb_storage::clustered_leaf::cell_row_data_abs_off(&leaf, pos)?;
-                    let mut page = leaf.into_page();
-                    for delta in &field_deltas {
-                        let field_abs_off = row_data_abs_off + delta.offset as usize;
-                        axiomdb_storage::clustered_leaf::patch_field_in_place(
-                            &mut page,
-                            field_abs_off,
-                            &delta.old_bytes[..delta.size as usize],
-                        )?;
-                    }
-                    axiomdb_storage::clustered_leaf::update_row_header_in_place(
-                        &mut page,
-                        pos,
-                        &old_header,
-                    )?;
-                    page.update_checksum();
-                    storage.write_page(page.header().page_id, &page)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Applies undo operations in **reverse chronological order**:
-    /// - `UndoInsert`: marks the slot dead (row hidden from all future snapshots).
-    /// - `UndoDelete`: clears `txn_id_deleted` (row is live again).
-    ///
-    /// Does **not** advance `max_committed`.
-    ///
-    /// # Errors
-    /// - [`DbError::NoActiveTransaction`] if no transaction is open.
-    /// - I/O errors from undo writes or WAL append.
-    pub fn rollback(&mut self, storage: &mut dyn StorageEngine) -> Result<(), DbError> {
-        let mut active = self.active.take().ok_or(DbError::NoActiveTransaction)?;
-        let txn_id = active.txn_id;
-
-        // Write Rollback entry — informational for crash recovery. No fsync.
-        let mut entry = WalEntry::new(0, txn_id, EntryType::Rollback, 0, vec![], vec![], vec![]);
-        self.wal.append(&mut entry)?;
-
-        // Discard deferred-free pages: catalog undo will restore old roots,
-        // so the old pages remain live and must not be freed.
-        // (deferred_free_pages is dropped with `active` after the loop.)
-
-        // Apply undo ops in reverse (last DML first).
-        for op in active.undo_ops.into_iter().rev() {
-            match op {
-                UndoOp::UndoInsert { page_id, slot_id } => {
-                    let bytes = *storage.read_page(page_id)?.as_bytes();
-                    let mut page = Page::from_bytes(bytes)?;
-                    mark_slot_dead(&mut page, slot_id)?;
-                    storage.write_page(page_id, &page)?;
-                }
-                UndoOp::UndoDelete { page_id, slot_id } => {
-                    let bytes = *storage.read_page(page_id)?.as_bytes();
-                    let mut page = Page::from_bytes(bytes)?;
-                    clear_deletion(&mut page, slot_id)?;
-                    storage.write_page(page_id, &page)?;
-                }
-                UndoOp::UndoUpdateInPlace {
-                    page_id,
-                    slot_id,
-                    old_image,
-                } => {
-                    let bytes = *storage.read_page(page_id)?.as_bytes();
-                    let mut page = Page::from_bytes(bytes)?;
-                    restore_tuple_image(&mut page, slot_id, &old_image)?;
-                    storage.write_page(page_id, &page)?;
-                }
-                UndoOp::UndoTruncate { root_page_id } => {
-                    HeapChain::clear_deletions_by_txn(storage, root_page_id, txn_id)?;
-                }
-                UndoOp::UndoIndexInsert { .. } | UndoOp::UndoIndexDelete { .. } => {
-                    // Handled by caller via pending_index_undos().
-                }
-                UndoOp::UndoClusteredInsert { table_id, key } => {
-                    let root_pid =
-                        clustered_root_for_undo(&active.clustered_roots, table_id, "rollback")?;
-                    let new_root = clustered_tree::delete_physical_by_key(storage, root_pid, &key)?
-                        .ok_or_else(|| DbError::BTreeCorrupted {
-                            msg: format!(
-                                "clustered rollback could not find inserted key {:?} in table {table_id}",
-                                String::from_utf8_lossy(&key)
-                            ),
-                        })?;
-                    active.clustered_roots.insert(table_id, new_root);
-                }
-                UndoOp::UndoClusteredRestore {
-                    table_id,
-                    key,
-                    old_row,
-                } => {
-                    let root_pid =
-                        clustered_root_for_undo(&active.clustered_roots, table_id, "rollback")?;
-                    let new_root = clustered_tree::restore_exact_row_image(
-                        storage,
-                        root_pid,
-                        &key,
-                        &old_row.row_header,
-                        &old_row.row_data,
-                    )?;
-                    active.clustered_roots.insert(table_id, new_root);
-                }
-                UndoOp::UndoClusteredUndelete { table_id, key } => {
-                    let root_pid =
-                        clustered_root_for_undo(&active.clustered_roots, table_id, "rollback")?;
-                    let leaf = clustered_tree::descend_to_leaf_pub(storage, root_pid, &key)?;
-                    if let Ok(pos) = axiomdb_storage::clustered_leaf::search(&leaf, &key) {
-                        let mut page = leaf.into_page();
-                        let _ = axiomdb_storage::clustered_leaf::patch_txn_id_deleted(
-                            &mut page, pos, 0,
-                        );
-                        page.update_checksum();
-                        storage.write_page(page.header().page_id, &page)?;
-                    }
-                }
-                UndoOp::UndoClusteredFieldPatch {
-                    table_id,
-                    key,
-                    old_header,
-                    field_deltas,
-                } => {
-                    // Zero-alloc undo: reverse each field delta by writing old_bytes
-                    // back to the exact page offset, then restore the RowHeader.
-                    let root_pid =
-                        clustered_root_for_undo(&active.clustered_roots, table_id, "rollback")?;
-                    let leaf = clustered_tree::descend_to_leaf_pub(storage, root_pid, &key)?;
-                    if let Ok(pos) = axiomdb_storage::clustered_leaf::search(&leaf, &key) {
-                        let (row_data_abs_off, _) =
-                            axiomdb_storage::clustered_leaf::cell_row_data_abs_off(&leaf, pos)?;
-                        let mut page = leaf.into_page();
-                        for delta in &field_deltas {
-                            let field_abs_off = row_data_abs_off + delta.offset as usize;
-                            axiomdb_storage::clustered_leaf::patch_field_in_place(
-                                &mut page,
-                                field_abs_off,
-                                &delta.old_bytes[..delta.size as usize],
-                            )?;
-                        }
-                        axiomdb_storage::clustered_leaf::update_row_header_in_place(
-                            &mut page,
-                            pos,
-                            &old_header,
-                        )?;
-                        page.update_checksum();
-                        storage.write_page(page.header().page_id, &page)?;
-                    }
-                }
-            }
-        }
-        self.last_clustered_roots = active.clustered_roots;
-        // max_committed is unchanged — the rolled-back txn's inserts are invisible
-        // to all future snapshots (txn_id_created >= snapshot_id for every future reader).
-        Ok(())
-    }
-
-    // ── DML recording ────────────────────────────────────────────────────────
-
-    // NOTE: record_* methods prepend PHYSICAL_LOC_LEN bytes to new_value (Insert/Update)
-    // and old_value (Delete) so crash recovery can locate the heap slot without an
-    // in-memory undo log.  See `PHYSICAL_LOC_LEN` and `decode_physical_loc`.
-
-    /// Records an INSERT into the WAL and enqueues an undo operation.
-    ///
-    /// Must be called **after** the heap + index changes have been applied to storage.
-    ///
-    /// # Errors
-    /// - [`DbError::NoActiveTransaction`] if called outside a transaction.
-    pub fn record_insert(
-        &mut self,
-        table_id: u32,
-        key: &[u8],
-        value: &[u8],
-        page_id: u64,
-        slot_id: u16,
-    ) -> Result<(), DbError> {
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let txn_id = active.txn_id;
-
-        // Prepend physical location so crash recovery can undo without RAM state.
-        let mut new_value = Vec::with_capacity(PHYSICAL_LOC_LEN + value.len());
-        new_value.extend_from_slice(&encode_physical_loc(page_id, slot_id));
-        new_value.extend_from_slice(value);
-
-        let mut entry = WalEntry::new(
-            0,
-            txn_id,
-            EntryType::Insert,
-            table_id,
-            key.to_vec(),
-            vec![],
-            new_value,
-        );
-        self.wal
-            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
-        active
-            .undo_ops
-            .push(UndoOp::UndoInsert { page_id, slot_id });
-        Ok(())
-    }
-
-    /// Records N INSERTs into the WAL in a **single `write_all` call**.
-    ///
-    /// Equivalent to calling [`record_insert`] N times but uses
-    /// [`WalWriter::reserve_lsns`] + [`WalWriter::write_batch`] to write all
-    /// entries in one shot, reducing BufWriter call overhead from O(N) to O(1).
-    ///
-    /// `phys_locs[i]` and `values[i]` must correspond to the same row.
-    /// Both slices must have the same length; a length mismatch is an internal
-    /// error (caller invariant — never caused by user SQL).
-    ///
-    /// The entries written to disk are byte-for-byte identical to those produced
-    /// by N calls to `record_insert` — crash recovery is unchanged.
-    ///
-    /// # Errors
-    /// - [`DbError::NoActiveTransaction`] if called outside a transaction.
-    pub fn record_insert_batch(
-        &mut self,
-        table_id: u32,
-        phys_locs: &[(u64, u16)], // (page_id, slot_id) per row
-        values: &[Vec<u8>],       // encoded row bytes per row (same order as phys_locs)
-    ) -> Result<(), DbError> {
-        let n = phys_locs.len();
-        debug_assert_eq!(
-            n,
-            values.len(),
-            "record_insert_batch: phys_locs and values must have the same length"
-        );
-        if n == 0 {
-            return Ok(());
-        }
-
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let txn_id = active.txn_id;
-
-        // Reserve N consecutive LSNs atomically before serializing.
-        let lsn_base = self.wal.reserve_lsns(n);
-
-        // Accumulate all N entries into wal_scratch in one pass.
-        // Clear once — do NOT clear between entries.
-        self.wal_scratch.clear();
-
-        for (i, ((page_id, slot_id), value)) in phys_locs.iter().zip(values.iter()).enumerate() {
-            let key = encode_physical_loc(*page_id, *slot_id);
-
-            // Prepend physical location to new_value (same as record_insert).
-            let mut new_value = Vec::with_capacity(PHYSICAL_LOC_LEN + value.len());
-            new_value.extend_from_slice(&key);
-            new_value.extend_from_slice(value);
-
-            let entry = WalEntry::new(
-                lsn_base + i as u64, // pre-assigned LSN
-                txn_id,
-                EntryType::Insert,
-                table_id,
-                key.to_vec(),
-                vec![],
-                new_value,
-            );
-            entry.serialize_into(&mut self.wal_scratch);
-        }
-
-        // Single write_all for all N entries.
-        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
-
-        // Enqueue undo ops after the WAL write succeeds.
-        for (page_id, slot_id) in phys_locs {
-            active.undo_ops.push(UndoOp::UndoInsert {
-                page_id: *page_id,
-                slot_id: *slot_id,
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Records N bulk-insert pages into the WAL as compact `PageWrite` entries.
-    ///
-    /// Each element of `page_writes` is `(page_id, slot_ids)` where `slot_ids`
-    /// lists the slots inserted by this transaction on that page.
-    ///
-    /// ## Compact WAL format
-    ///
-    /// `new_value = [num_slots: u16 LE][slot_id × num_slots: u16 LE each]`
-    ///
-    /// No page bytes are stored — crash recovery only needs the slot IDs to mark
-    /// inserted slots dead on undo. Eliminating the 16 KB page image reduces WAL
-    /// size from ~820 KB to ~20 KB per 10K-row batch (40× reduction).
-    ///
-    /// Inspired by MariaDB's InnoDB redo log (logical delta) and OceanBase's
-    /// `ObDASWriteBuffer` (row-level buffering, not page-level snapshot).
-    ///
-    /// ## WAL ordering
-    ///
-    /// Uses `reserve_lsns + write_batch` for O(1) BufWriter calls — same
-    /// pattern as `record_insert_batch`.
-    ///
-    /// # Errors
-    /// - [`DbError::NoActiveTransaction`] if called outside a transaction.
-    pub fn record_page_writes(
-        &mut self,
-        table_id: u32,
-        page_writes: &[(u64, &[u16])], // (page_id, slot_ids)
-    ) -> Result<(), DbError> {
-        let n = page_writes.len();
-        if n == 0 {
-            return Ok(());
-        }
-
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let txn_id = active.txn_id;
-
-        let lsn_base = self.wal.reserve_lsns(n);
-        self.wal_scratch.clear();
-
-        for (i, (page_id, slot_ids)) in page_writes.iter().enumerate() {
-            let key = page_id.to_le_bytes();
-
-            // Compact new_value: [num_slots: u16 LE][slot_id × N: u16 LE]
-            // No page bytes — crash recovery only needs slot IDs for undo.
-            let mut new_value = Vec::with_capacity(2 + slot_ids.len() * 2);
-            new_value.extend_from_slice(&(slot_ids.len() as u16).to_le_bytes());
-            for &slot_id in slot_ids.iter() {
-                new_value.extend_from_slice(&slot_id.to_le_bytes());
-            }
-
-            let entry = WalEntry::new(
-                lsn_base + i as u64,
-                txn_id,
-                EntryType::PageWrite,
-                table_id,
-                key.to_vec(),
-                vec![],
-                new_value,
-            );
-            entry.serialize_into(&mut self.wal_scratch);
-        }
-
-        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
-
-        // Enqueue in-memory undo ops (used by ROLLBACK and group commit mode).
-        for (page_id, slot_ids) in page_writes {
-            for &slot_id in slot_ids.iter() {
-                active.undo_ops.push(UndoOp::UndoInsert {
-                    page_id: *page_id,
-                    slot_id,
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Batch-records DELETEs into the WAL: one `PageDelete` entry per affected
-    /// page listing the slot_ids deleted on that page.
-    ///
-    /// Mirrors [`record_page_writes`] for INSERT. Reduces WAL size from
-    /// O(N × 150 bytes) to O(P × 50 bytes) where P = pages touched.
-    ///
-    /// # Errors
-    /// - [`DbError::NoActiveTransaction`] if called outside a transaction.
-    pub fn record_delete_batch(
-        &mut self,
-        table_id: u32,
-        page_deletes: &[(u64, Vec<u16>)], // (page_id, slot_ids)
-    ) -> Result<(), DbError> {
-        if page_deletes.is_empty() {
-            return Ok(());
-        }
-
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let txn_id = active.txn_id;
-        let n = page_deletes.len();
-
-        let lsn_base = self.wal.reserve_lsns(n);
-        self.wal_scratch.clear();
-
-        for (i, (page_id, slot_ids)) in page_deletes.iter().enumerate() {
-            let key = page_id.to_le_bytes();
-
-            // Compact value: [num_slots: u16 LE][slot_id × N: u16 LE]
-            let mut new_value = Vec::with_capacity(2 + slot_ids.len() * 2);
-            new_value.extend_from_slice(&(slot_ids.len() as u16).to_le_bytes());
-            for &slot_id in slot_ids {
-                new_value.extend_from_slice(&slot_id.to_le_bytes());
-            }
-
-            let entry = WalEntry::new(
-                lsn_base + i as u64,
-                txn_id,
-                EntryType::PageDelete,
-                table_id,
-                key.to_vec(),
-                vec![], // no old_value needed — undo clears txn_id_deleted
-                new_value,
-            );
-            entry.serialize_into(&mut self.wal_scratch);
-        }
-
-        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
-
-        // Enqueue undo ops: UndoDelete clears txn_id_deleted on ROLLBACK.
-        for (page_id, slot_ids) in page_deletes {
-            for &slot_id in slot_ids {
-                active.undo_ops.push(UndoOp::UndoDelete {
-                    page_id: *page_id,
-                    slot_id,
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Records a DELETE into the WAL and enqueues an undo operation.
-    ///
-    /// Must be called **after** `txn_id_deleted` has been stamped in the RowHeader.
-    ///
-    /// # Errors
-    /// - [`DbError::NoActiveTransaction`] if called outside a transaction.
-    pub fn record_delete(
-        &mut self,
-        table_id: u32,
-        key: &[u8],
-        old_value: &[u8],
-        page_id: u64,
-        slot_id: u16,
-    ) -> Result<(), DbError> {
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let txn_id = active.txn_id;
-
-        // Prepend physical location to old_value for crash recovery.
-        let mut ov = Vec::with_capacity(PHYSICAL_LOC_LEN + old_value.len());
-        ov.extend_from_slice(&encode_physical_loc(page_id, slot_id));
-        ov.extend_from_slice(old_value);
-
-        let mut entry = WalEntry::new(
-            0,
-            txn_id,
-            EntryType::Delete,
-            table_id,
-            key.to_vec(),
-            ov,
-            vec![],
-        );
-        self.wal
-            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
-        active
-            .undo_ops
-            .push(UndoOp::UndoDelete { page_id, slot_id });
-        Ok(())
-    }
-
-    /// Records an UPDATE (delete + insert) into the WAL and enqueues undo operations.
-    ///
-    /// Undo order: kill the new slot first, then restore the old slot's deletion mark.
-    ///
-    /// # Errors
-    /// - [`DbError::NoActiveTransaction`] if called outside a transaction.
-    pub fn record_update(
-        &mut self,
-        table_id: u32,
-        key: &[u8],
-        old_value: &[u8],
-        new_value: &[u8],
-        page_id: u64,
-        old_slot: u16,
-        new_slot: u16,
-    ) -> Result<(), DbError> {
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let txn_id = active.txn_id;
-
-        // Prepend physical locations to both sides for crash recovery.
-        let mut ov = Vec::with_capacity(PHYSICAL_LOC_LEN + old_value.len());
-        ov.extend_from_slice(&encode_physical_loc(page_id, old_slot));
-        ov.extend_from_slice(old_value);
-
-        let mut nv = Vec::with_capacity(PHYSICAL_LOC_LEN + new_value.len());
-        nv.extend_from_slice(&encode_physical_loc(page_id, new_slot));
-        nv.extend_from_slice(new_value);
-
-        let mut entry = WalEntry::new(0, txn_id, EntryType::Update, table_id, key.to_vec(), ov, nv);
-        self.wal
-            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
-        // Push in chronological order; on rollback they are reversed:
-        // UndoDelete(old_slot) runs first (restores old row), then
-        // UndoInsert(new_slot) kills the replacement.
-        active.undo_ops.push(UndoOp::UndoInsert {
-            page_id,
-            slot_id: new_slot,
-        });
-        active.undo_ops.push(UndoOp::UndoDelete {
-            page_id,
-            slot_id: old_slot,
-        });
-        Ok(())
-    }
-
-    /// Records a stable-RID in-place UPDATE into the WAL and enqueues tuple-image undo.
-    ///
-    /// Both `old_tuple_image` and `new_tuple_image` are full logical tuple images:
-    /// `[RowHeader || row bytes]`, without alignment padding.
-    ///
-    /// # Errors
-    /// - [`DbError::NoActiveTransaction`] if called outside a transaction.
-    pub fn record_update_in_place(
-        &mut self,
-        table_id: u32,
-        key: &[u8],
-        old_tuple_image: &[u8],
-        new_tuple_image: &[u8],
-        page_id: u64,
-        slot_id: u16,
-    ) -> Result<(), DbError> {
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let txn_id = active.txn_id;
-
-        let mut ov = Vec::with_capacity(PHYSICAL_LOC_LEN + old_tuple_image.len());
-        ov.extend_from_slice(&encode_physical_loc(page_id, slot_id));
-        ov.extend_from_slice(old_tuple_image);
-
-        let mut nv = Vec::with_capacity(PHYSICAL_LOC_LEN + new_tuple_image.len());
-        nv.extend_from_slice(&encode_physical_loc(page_id, slot_id));
-        nv.extend_from_slice(new_tuple_image);
-
-        let mut entry = WalEntry::new(
-            0,
-            txn_id,
-            EntryType::UpdateInPlace,
-            table_id,
-            key.to_vec(),
-            ov,
-            nv,
-        );
-        self.wal
-            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
-        active.undo_ops.push(UndoOp::UndoUpdateInPlace {
-            page_id,
-            slot_id,
-            old_image: old_tuple_image.to_vec(),
-        });
-        Ok(())
-    }
-
-    /// Records N stable-RID in-place UPDATEs in a **single `write_all` call**.
-    ///
-    /// Equivalent to calling [`record_update_in_place`] N times but uses
-    /// `reserve_lsns + write_batch` to emit all entries in one shot, reducing
-    /// BufWriter call overhead from O(N) to O(1).
-    ///
-    /// Each element of `images` is `(key, old_tuple_image, new_tuple_image, page_id, slot_id)`.
-    /// The WAL entries are byte-for-byte identical to those produced by N calls
-    /// to `record_update_in_place` — crash recovery is unchanged.
-    ///
-    /// # Errors
-    /// - [`DbError::NoActiveTransaction`] if called outside a transaction.
-    #[allow(clippy::type_complexity)]
-    pub fn record_update_in_place_batch(
-        &mut self,
-        table_id: u32,
-        images: &[(&[u8], &[u8], &[u8], u64, u16)], // (key, old_tuple_image, new_tuple_image, page_id, slot_id)
-    ) -> Result<(), DbError> {
-        let n = images.len();
-        if n == 0 {
-            return Ok(());
-        }
-
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let txn_id = active.txn_id;
-
-        let lsn_base = self.wal.reserve_lsns(n);
-        self.wal_scratch.clear();
-
-        for (i, (key, old_tuple_image, new_tuple_image, page_id, slot_id)) in
-            images.iter().enumerate()
-        {
-            let mut ov = Vec::with_capacity(PHYSICAL_LOC_LEN + old_tuple_image.len());
-            ov.extend_from_slice(&encode_physical_loc(*page_id, *slot_id));
-            ov.extend_from_slice(old_tuple_image);
-
-            let mut nv = Vec::with_capacity(PHYSICAL_LOC_LEN + new_tuple_image.len());
-            nv.extend_from_slice(&encode_physical_loc(*page_id, *slot_id));
-            nv.extend_from_slice(new_tuple_image);
-
-            let entry = WalEntry::new(
-                lsn_base + i as u64,
-                txn_id,
-                EntryType::UpdateInPlace,
-                table_id,
-                key.to_vec(),
-                ov,
-                nv,
-            );
-            entry.serialize_into(&mut self.wal_scratch);
-        }
-
-        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
-
-        for (_, old_tuple_image, _, page_id, slot_id) in images {
-            active.undo_ops.push(UndoOp::UndoUpdateInPlace {
-                page_id: *page_id,
-                slot_id: *slot_id,
-                old_image: old_tuple_image.to_vec(),
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Records a full-table delete (DELETE without WHERE / TRUNCATE) as a
-    /// single WAL entry instead of N per-row entries.
-    ///
-    /// The physical heap pages must already have been updated by `delete_batch()`
-    /// before calling this. ONE WAL entry replaces N `record_delete()` calls.
-    ///
-    /// The `key` field of the WAL entry holds `root_page_id` as 8 bytes LE —
-    /// sufficient for crash recovery to locate the heap chain and undo the deletion.
-    ///
-    /// # Errors
-    /// - [`DbError::NoActiveTransaction`] if no transaction is open.
-    pub fn record_truncate(&mut self, table_id: u32, root_page_id: u64) -> Result<(), DbError> {
-        let txn = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let mut entry = WalEntry::new(
-            0,
-            txn.txn_id,
-            EntryType::Truncate,
-            table_id,
-            root_page_id.to_le_bytes().to_vec(), // key = root_page_id (for recovery)
-            vec![],
-            vec![],
-        );
-        self.wal
-            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
-        txn.undo_ops.push(UndoOp::UndoTruncate { root_page_id });
-        Ok(())
-    }
-
-    /// Records a clustered insert and tracks the latest clustered root for the
-    /// touched table.
-    pub fn record_clustered_insert(
-        &mut self,
-        table_id: u32,
-        key: &[u8],
-        new_row: &ClusteredRowImage,
-    ) -> Result<(), DbError> {
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let mut entry = WalEntry::new(
-            0,
-            active.txn_id,
-            EntryType::ClusteredInsert,
-            table_id,
-            key.to_vec(),
-            vec![],
-            new_row.to_bytes()?,
-        );
-        self.wal
-            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
-        active.clustered_roots.insert(table_id, new_row.root_pid);
-        active.undo_ops.push(UndoOp::UndoClusteredInsert {
-            table_id,
-            key: key.to_vec(),
-        });
-        Ok(())
-    }
-
-    /// Records a clustered delete-mark and stores the exact previous row image
-    /// for rollback.
-    pub fn record_clustered_delete_mark(
-        &mut self,
-        table_id: u32,
-        key: &[u8],
-        old_row: &ClusteredRowImage,
-        new_row: &ClusteredRowImage,
-    ) -> Result<(), DbError> {
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let mut entry = WalEntry::new(
-            0,
-            active.txn_id,
-            EntryType::ClusteredDeleteMark,
-            table_id,
-            key.to_vec(),
-            old_row.to_bytes()?,
-            new_row.to_bytes()?,
-        );
-        self.wal
-            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
-        active.clustered_roots.insert(table_id, new_row.root_pid);
-        active.undo_ops.push(UndoOp::UndoClusteredRestore {
-            table_id,
-            key: key.to_vec(),
-            old_row: old_row.clone(),
-        });
-        Ok(())
-    }
-
-    /// Lightweight batch field-patch WAL for clustered updates where only
-    /// fixed-size fields changed. Uses `ClusteredFieldPatch` entry type with
-    /// compact field-delta format instead of full row images.
-    ///
-    /// Format per entry:
-    /// - `old_value` = `[RowHeader:24][num_fields:1][field_offset:2][field_size:1][old_bytes:N]...`
-    /// - `new_value` = `[RowHeader:24][num_fields:1][field_offset:2][field_size:1][new_bytes:N]...`
-    ///
-    /// Recovery: reads field offsets + sizes, patches bytes back to restore old state.
-    pub fn record_clustered_field_patch_batch(
-        &mut self,
-        table_id: u32,
-        root_pid: u64,
-        patches: &[ClusteredFieldPatchEntry],
-    ) -> Result<(), DbError> {
-        let n = patches.len();
-        if n == 0 {
-            return Ok(());
-        }
-
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let txn_id = active.txn_id;
-
-        let lsn_base = self.wal.reserve_lsns(n);
-        self.wal_scratch.clear();
-
-        for (i, patch) in patches.iter().enumerate() {
-            let entry = WalEntry::new(
-                lsn_base + i as u64,
-                txn_id,
-                EntryType::ClusteredFieldPatch,
-                table_id,
-                patch.key.clone(),
-                patch.encode_old_value(),
-                patch.encode_new_value(),
-            );
-            entry.serialize_into(&mut self.wal_scratch);
-        }
-
-        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
-
-        // Undo: zero-alloc field-delta undo — write back only old_bytes per field.
-        // Avoids the ClusteredRestore path which needs a full row image to be
-        // present in the patch entry. Each FieldDelta carries its own [u8;8]
-        // old_bytes (stack-allocated), so no heap allocation per field per row.
-        for patch in patches {
-            active.clustered_roots.insert(table_id, root_pid);
-            active.undo_ops.push(UndoOp::UndoClusteredFieldPatch {
-                table_id,
-                key: patch.key.clone(),
-                old_header: patch.old_header,
-                field_deltas: patch.field_deltas.clone(),
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Batch version of `record_clustered_update` — accumulates N entries into
-    /// a single `write_batch()` call. WAL entries are byte-identical to N
-    /// individual calls; crash recovery is unchanged.
-    ///
-    /// Each element: `(key, old_row, new_row)`.
-    pub fn record_clustered_update_batch(
-        &mut self,
-        table_id: u32,
-        updates: &[(&[u8], &ClusteredRowImage, &ClusteredRowImage)],
-    ) -> Result<(), DbError> {
-        let n = updates.len();
-        if n == 0 {
-            return Ok(());
-        }
-
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let txn_id = active.txn_id;
-
-        let lsn_base = self.wal.reserve_lsns(n);
-        self.wal_scratch.clear();
-
-        for (i, (key, old_row, new_row)) in updates.iter().enumerate() {
-            let entry = WalEntry::new(
-                lsn_base + i as u64,
-                txn_id,
-                EntryType::ClusteredUpdate,
-                table_id,
-                key.to_vec(),
-                old_row.to_bytes()?,
-                new_row.to_bytes()?,
-            );
-            entry.serialize_into(&mut self.wal_scratch);
-        }
-
-        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
-
-        for (key, old_row, new_row) in updates {
-            active.clustered_roots.insert(table_id, new_row.root_pid);
-            active.undo_ops.push(UndoOp::UndoClusteredRestore {
-                table_id,
-                key: key.to_vec(),
-                old_row: (*old_row).clone(),
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Lightweight batch delete-mark for clustered tables. InnoDB-inspired:
-    /// stores ONLY PK keys for undo (no full row images). Uses minimal WAL
-    /// entries with empty row_data. Undo uses `UndoClusteredUndelete` which
-    /// just clears txn_id_deleted to 0 (no full row restore needed).
-    ///
-    /// ~10× less allocation than `record_clustered_delete_mark_batch`.
-    pub fn record_clustered_delete_mark_lightweight(
-        &mut self,
-        table_id: u32,
-        root_pid: u64,
-        pk_keys: &[Vec<u8>],
-    ) -> Result<(), DbError> {
-        let n = pk_keys.len();
-        if n == 0 {
-            return Ok(());
-        }
-
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let txn_id = active.txn_id;
-
-        let lsn_base = self.wal.reserve_lsns(n);
-        self.wal_scratch.clear();
-
-        // Minimal WAL entries: header-only images (empty row_data).
-        let empty_hdr = axiomdb_storage::heap::RowHeader {
-            txn_id_created: 0,
-            txn_id_deleted: 0,
-            row_version: 0,
-            _flags: 0,
-        };
-        let del_hdr = axiomdb_storage::heap::RowHeader {
-            txn_id_created: 0,
-            txn_id_deleted: txn_id,
-            row_version: 0,
-            _flags: 0,
-        };
-        let old_image = ClusteredRowImage::new(root_pid, empty_hdr, &[]);
-        let new_image = ClusteredRowImage::new(root_pid, del_hdr, &[]);
-        let old_bytes = old_image.to_bytes()?;
-        let new_bytes = new_image.to_bytes()?;
-
-        for (i, pk_key) in pk_keys.iter().enumerate() {
-            let entry = WalEntry::new(
-                lsn_base + i as u64,
-                txn_id,
-                EntryType::ClusteredDeleteMark,
-                table_id,
-                pk_key.clone(),
-                old_bytes.clone(),
-                new_bytes.clone(),
-            );
-            entry.serialize_into(&mut self.wal_scratch);
-        }
-
-        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
-
-        // Lightweight undo: only PK key needed to un-delete.
-        for pk_key in pk_keys {
-            active.clustered_roots.insert(table_id, root_pid);
-            active.undo_ops.push(UndoOp::UndoClusteredUndelete {
-                table_id,
-                key: pk_key.clone(),
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Batch version of `record_clustered_delete_mark`.
-    pub fn record_clustered_delete_mark_batch(
-        &mut self,
-        table_id: u32,
-        deletes: &[(&[u8], &ClusteredRowImage, &ClusteredRowImage)],
-    ) -> Result<(), DbError> {
-        let n = deletes.len();
-        if n == 0 {
-            return Ok(());
-        }
-
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let txn_id = active.txn_id;
-
-        let lsn_base = self.wal.reserve_lsns(n);
-        self.wal_scratch.clear();
-
-        for (i, (key, old_row, new_row)) in deletes.iter().enumerate() {
-            let entry = WalEntry::new(
-                lsn_base + i as u64,
-                txn_id,
-                EntryType::ClusteredDeleteMark,
-                table_id,
-                key.to_vec(),
-                old_row.to_bytes()?,
-                new_row.to_bytes()?,
-            );
-            entry.serialize_into(&mut self.wal_scratch);
-        }
-
-        self.wal.write_batch(lsn_base, &self.wal_scratch)?;
-
-        for (key, old_row, _new_row) in deletes {
-            active.clustered_roots.insert(table_id, old_row.root_pid);
-            active.undo_ops.push(UndoOp::UndoClusteredRestore {
-                table_id,
-                key: key.to_vec(),
-                old_row: (*old_row).clone(),
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Records a clustered update and stores the exact previous row image for
-    /// rollback.
-    pub fn record_clustered_update(
-        &mut self,
-        table_id: u32,
-        key: &[u8],
-        old_row: &ClusteredRowImage,
-        new_row: &ClusteredRowImage,
-    ) -> Result<(), DbError> {
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        let mut entry = WalEntry::new(
-            0,
-            active.txn_id,
-            EntryType::ClusteredUpdate,
-            table_id,
-            key.to_vec(),
-            old_row.to_bytes()?,
-            new_row.to_bytes()?,
-        );
-        self.wal
-            .append_with_buf(&mut entry, &mut self.wal_scratch)?;
-        active.clustered_roots.insert(table_id, new_row.root_pid);
-        active.undo_ops.push(UndoOp::UndoClusteredRestore {
-            table_id,
-            key: key.to_vec(),
-            old_row: old_row.clone(),
-        });
-        Ok(())
-    }
-
-    // ── Index undo (Phase 7.3b) ────────────────────────────────────────────
-
-    /// Records an index INSERT undo operation so that ROLLBACK can remove the
-    /// entry from the B-Tree. Called by the executor after inserting a new
-    /// secondary index entry (INSERT or UPDATE of an indexed column).
-    ///
-    /// No WAL entry is written — index operations are derived from heap state
-    /// on crash recovery. This is purely for in-memory ROLLBACK.
-    pub fn record_index_insert(
-        &mut self,
-        index_id: u32,
-        root_page_id: u64,
-        key: Vec<u8>,
-    ) -> Result<(), DbError> {
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        active.undo_ops.push(UndoOp::UndoIndexInsert {
-            index_id,
-            root_page_id,
-            key,
-        });
-        Ok(())
-    }
-
-    /// Records an index DELETE undo operation so that ROLLBACK can restore the
-    /// removed entry to the B-Tree.
-    pub fn record_index_delete(
-        &mut self,
-        index_id: u32,
-        root_page_id: u64,
-        key: Vec<u8>,
-        rid: RecordId,
-        fillfactor: u8,
-    ) -> Result<(), DbError> {
-        let active = self.active.as_mut().ok_or(DbError::NoActiveTransaction)?;
-        active.undo_ops.push(UndoOp::UndoIndexDelete {
-            index_id,
-            root_page_id,
-            key,
-            rid,
-            fillfactor,
-        });
-        Ok(())
-    }
-
-    /// Returns all `UndoIndexInsert` operations from the active transaction's
-    /// undo log, in reverse chronological order (last insert first).
-    ///
-    /// Called by the executor before `rollback()` or `rollback_to_savepoint()`
-    /// to handle B-Tree deletes at the executor layer (TxnManager cannot depend
-    /// on `axiomdb-index`).
-    ///
-    /// Returns a reverse-chronological list of index undo records.
-    pub fn collect_index_undos(&self) -> Vec<IndexUndoRecord> {
-        let Some(active) = &self.active else {
-            return Vec::new();
-        };
-        active
-            .undo_ops
-            .iter()
-            .rev()
-            .filter_map(|op| match op {
-                UndoOp::UndoIndexInsert {
-                    index_id,
-                    root_page_id,
-                    key,
-                } => Some(IndexUndoRecord::DeleteInserted {
-                    index_id: *index_id,
-                    root_page_id: *root_page_id,
-                    key: key.clone(),
-                }),
-                UndoOp::UndoIndexDelete {
-                    index_id,
-                    root_page_id,
-                    key,
-                    rid,
-                    fillfactor,
-                } => Some(IndexUndoRecord::RestoreDeleted {
-                    index_id: *index_id,
-                    root_page_id: *root_page_id,
-                    key: key.clone(),
-                    rid: *rid,
-                    fillfactor: *fillfactor,
-                }),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Like [`collect_index_undos`] but only returns ops recorded after the
-    /// given savepoint.
-    pub fn collect_index_undos_since(&self, sp: &Savepoint) -> Vec<IndexUndoRecord> {
-        let Some(active) = &self.active else {
-            return Vec::new();
-        };
-        active
-            .undo_ops
-            .iter()
-            .skip(sp.undo_len)
-            .rev()
-            .filter_map(|op| match op {
-                UndoOp::UndoIndexInsert {
-                    index_id,
-                    root_page_id,
-                    key,
-                } => Some(IndexUndoRecord::DeleteInserted {
-                    index_id: *index_id,
-                    root_page_id: *root_page_id,
-                    key: key.clone(),
-                }),
-                UndoOp::UndoIndexDelete {
-                    index_id,
-                    root_page_id,
-                    key,
-                    rid,
-                    fillfactor,
-                } => Some(IndexUndoRecord::RestoreDeleted {
-                    index_id: *index_id,
-                    root_page_id: *root_page_id,
-                    key: key.clone(),
-                    rid: *rid,
-                    fillfactor: *fillfactor,
-                }),
-                _ => None,
-            })
-            .collect()
-    }
-
-    // ── Autocommit ───────────────────────────────────────────────────────────
-
-    /// Wraps `f` in an implicit BEGIN / COMMIT, rolling back automatically on error.
-    ///
-    /// `f` receives `&mut Self` so it can call `record_*` methods.
-    /// Storage is needed only if an error triggers rollback.
-    ///
-    /// ```rust,ignore
-    /// let slot_id = txn_mgr.autocommit(&mut storage, |mgr| {
-    ///     let slot = insert_tuple(&mut page, data, mgr.begin_txn_id())?;
-    ///     mgr.record_insert(table_id, key, value, page_id, slot)?;
-    ///     Ok(slot)
-    /// })?;
-    /// ```
-    pub fn autocommit<F, T>(&mut self, storage: &mut dyn StorageEngine, f: F) -> Result<T, DbError>
-    where
-        F: FnOnce(&mut Self) -> Result<T, DbError>,
-    {
-        self.begin()?;
-        match f(self) {
-            Ok(result) => {
-                self.commit()?;
-                Ok(result)
-            }
-            Err(e) => {
-                // Best-effort rollback: propagate original error regardless.
-                let _ = self.rollback(storage);
-                Err(e)
-            }
-        }
-    }
-
-    // ── MVCC snapshots ────────────────────────────────────────────────────────
-
-    /// Returns a snapshot that sees only committed data.
-    ///
-    /// `snapshot_id = max_committed + 1`. Safe to call at any time.
-    /// Used for read operations outside an explicit transaction.
-    pub fn snapshot(&self) -> TransactionSnapshot {
-        TransactionSnapshot::committed(self.max_committed)
-    }
-
-    /// Returns a snapshot for the active transaction.
-    ///
-    /// - **REPEATABLE READ / SERIALIZABLE**: returns the frozen snapshot captured
-    ///   at `BEGIN` (same `snapshot_id` for every call within the txn).
-    /// - **READ COMMITTED**: returns a fresh snapshot reflecting everything
-    ///   committed right now, plus the transaction's own writes.
-    ///
-    /// # Errors
-    /// - [`DbError::NoActiveTransaction`] if no transaction is open.
-    pub fn active_snapshot(&self) -> Result<TransactionSnapshot, DbError> {
-        let active = self.active.as_ref().ok_or(DbError::NoActiveTransaction)?;
-        let snapshot_id = if active.isolation_level.uses_frozen_snapshot() {
-            active.snapshot_id_at_begin
-        } else {
-            // READ COMMITTED: fresh snapshot per statement
-            self.max_committed + 1
-        };
-        Ok(TransactionSnapshot {
-            snapshot_id,
-            current_txn_id: active.txn_id,
-        })
-    }
-
-    // ── Accessors ─────────────────────────────────────────────────────────────
-
-    /// TxnId of the last committed transaction. `0` if none has committed yet.
-    pub fn max_committed(&self) -> TxnId {
-        self.max_committed
-    }
-
-    /// LSN of the last WAL entry written (0 if none).
-    pub fn current_lsn(&self) -> u64 {
-        self.wal.current_lsn()
-    }
-
-    /// TxnId of the currently active transaction, if any.
-    pub fn active_txn_id(&self) -> Option<TxnId> {
-        self.active.as_ref().map(|a| a.txn_id)
-    }
-
-    /// Latest known clustered root for `table_id`.
-    ///
-    /// During an active transaction this returns the transaction-local root
-    /// after all clustered writes recorded so far. Otherwise it returns the
-    /// last root observed on commit or rollback.
-    pub fn clustered_root(&self, table_id: u32) -> Option<u64> {
-        self.active
-            .as_ref()
-            .and_then(|active| active.clustered_roots.get(&table_id).copied())
-            .or_else(|| self.last_clustered_roots.get(&table_id).copied())
-    }
-
-    /// Mutable access to the underlying [`WalWriter`].
-    ///
-    /// Used by [`Checkpointer`] to append the Checkpoint entry and fsync the WAL.
-    /// Callers must not write arbitrary entries through this — only Checkpointer uses it.
-    pub fn wal_mut(&mut self) -> &ConcurrentWalWriter {
-        &self.wal
-    }
-
-    // ── WAL Rotation ──────────────────────────────────────────────────────────
-
-    /// Triggers a checkpoint and rotates the WAL file.
-    ///
-    /// After rotation, the WAL file is truncated to just the 24-byte v2 header
-    /// with `start_lsn = checkpoint_lsn`. The next entry written will have
-    /// `LSN = checkpoint_lsn + 1`, preserving global monotonicity.
-    ///
-    /// **Must be called with no active transaction.** Rotating mid-transaction
-    /// would lose the in-progress undo log.
-    ///
-    /// Returns the checkpoint LSN.
-    ///
-    /// # Errors
-    /// - [`DbError::TransactionAlreadyActive`] if a transaction is in progress.
-    /// - Any I/O error from checkpoint or file truncation.
-    pub fn rotate_wal(
-        &mut self,
-        storage: &mut dyn StorageEngine,
-        wal_path: &Path,
-    ) -> Result<u64, DbError> {
-        if let Some(ref active) = self.active {
-            return Err(DbError::TransactionAlreadyActive {
-                txn_id: active.txn_id,
-            });
-        }
-
-        // 1. Checkpoint: flush pages + write Checkpoint WAL entry + fsync.
-        let checkpoint_lsn = Checkpointer::checkpoint(storage, &self.wal)?;
-
-        // 2. Truncate the WAL file to just the header with start_lsn.
-        ConcurrentWalWriter::rotate_file(wal_path, checkpoint_lsn)?;
-
-        // 3. Reopen the WAL: next_lsn = checkpoint_lsn + 1.
-        self.wal = ConcurrentWalWriter::open(wal_path)?;
-
-        Ok(checkpoint_lsn)
-    }
-
-    /// Opens an existing WAL and runs crash recovery, returning a ready `TxnManager`.
-    ///
-    /// Equivalent to `CrashRecovery::recover() + TxnManager::open()`, initialising
-    /// `max_committed` from the WAL scan instead of a separate pass.
-    ///
-    /// Use this instead of [`TxnManager::open`] when reopening a database that
-    /// may have crashed.
-    pub fn open_with_recovery(
-        storage: &mut dyn StorageEngine,
-        wal_path: &Path,
-    ) -> Result<(Self, RecoveryResult), DbError> {
-        let result = CrashRecovery::recover(storage, wal_path)?;
-        let wal = ConcurrentWalWriter::open(wal_path)?;
-        let mgr = Self {
-            wal,
-            next_txn_id: result.max_committed + 1,
-            max_committed: result.max_committed,
-            active: None,
-            wal_scratch: Vec::with_capacity(256),
-            deferred_commit_mode: false,
-            pending_deferred_txn_id: None,
-            committed_free_batches: Vec::new(),
-            durability_policy: WalDurabilityPolicy::Strict,
-            last_clustered_roots: result.clustered_roots.clone(),
-        };
-        Ok((mgr, result))
-    }
-
-    /// Rotates the WAL if its current size exceeds `max_wal_size` bytes.
-    ///
-    /// Returns `true` if rotation occurred, `false` if the WAL was below the threshold.
-    pub fn check_and_rotate(
-        &mut self,
-        storage: &mut dyn StorageEngine,
-        wal_path: &Path,
-        max_wal_size: u64,
-    ) -> Result<bool, DbError> {
-        if self.wal.file_offset() > max_wal_size {
-            self.rotate_wal(storage, wal_path)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-}
+include!("txn_construction.rs");
+include!("txn_begin_commit.rs");
+include!("txn_rollback.rs");
+include!("txn_record_heap.rs");
+include!("txn_record_clustered.rs");
+include!("txn_record_index.rs");
+include!("txn_inspect.rs");
 
 // ── Physical location helpers ─────────────────────────────────────────────────
 
@@ -2073,14 +359,14 @@ mod tests {
         let mut mgr = TxnManager::create(&path).unwrap();
         assert_eq!(mgr.max_committed(), 0);
 
-        let txn = mgr.begin().unwrap();
-        assert_eq!(txn, 1);
-        mgr.commit().unwrap();
+        let conn = mgr.begin().unwrap();
+        assert_eq!(conn.txn_id, 1);
+        mgr.commit(conn).unwrap();
         assert_eq!(mgr.max_committed(), 1);
 
-        let txn2 = mgr.begin().unwrap();
-        assert_eq!(txn2, 2);
-        mgr.commit().unwrap();
+        let conn2 = mgr.begin().unwrap();
+        assert_eq!(conn2.txn_id, 2);
+        mgr.commit(conn2).unwrap();
         assert_eq!(mgr.max_committed(), 2);
     }
 
@@ -2090,8 +376,8 @@ mod tests {
         let mut mgr = TxnManager::create(&path).unwrap();
         let mut storage = MemoryStorage::new();
 
-        mgr.begin().unwrap();
-        mgr.rollback(&mut storage).unwrap();
+        let conn = mgr.begin().unwrap();
+        mgr.rollback(conn, &mut storage).unwrap();
         assert_eq!(mgr.max_committed(), 0);
     }
 
@@ -2104,18 +390,17 @@ mod tests {
         let mut storage = MemoryStorage::new();
 
         let page_id = storage.alloc_page(PageType::Data).unwrap();
-        let txn_id = mgr.begin().unwrap();
+        let mut conn = mgr.begin().unwrap();
+        let txn_id = conn.txn_id;
 
-        // Simulate: insert on heap page, then record in txn manager.
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
         let mut page = Page::from_bytes(page_bytes).unwrap();
         let slot_id = insert_tuple(&mut page, b"hello", txn_id).unwrap();
         storage.write_page(page_id, &page).unwrap();
-        mgr.record_insert(1, b"key", b"hello", page_id, slot_id)
+        mgr.record_insert(&mut conn, 1, b"key", b"hello", page_id, slot_id)
             .unwrap();
 
-        // Rollback should kill the slot.
-        mgr.rollback(&mut storage).unwrap();
+        mgr.rollback(conn, &mut storage).unwrap();
 
         let page = storage.read_page(page_id).unwrap();
         let result = read_tuple(&page, slot_id).unwrap();
@@ -2136,28 +421,29 @@ mod tests {
         let page_id = storage.alloc_page(PageType::Data).unwrap();
 
         // Insert row in txn 1, commit.
-        let txn1 = mgr.begin().unwrap();
+        let mut conn1 = mgr.begin().unwrap();
+        let txn1 = conn1.txn_id;
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
         let mut page = Page::from_bytes(page_bytes).unwrap();
         let slot_id = insert_tuple(&mut page, b"data", txn1).unwrap();
         storage.write_page(page_id, &page).unwrap();
-        mgr.record_insert(1, b"k", b"data", page_id, slot_id)
+        mgr.record_insert(&mut conn1, 1, b"k", b"data", page_id, slot_id)
             .unwrap();
-        mgr.commit().unwrap();
+        mgr.commit(conn1).unwrap();
 
         // Delete row in txn 2, then rollback.
-        let txn2 = mgr.begin().unwrap();
+        let mut conn2 = mgr.begin().unwrap();
+        let txn2 = conn2.txn_id;
         {
             let bytes = *storage.read_page(page_id).unwrap().as_bytes();
             let mut p = Page::from_bytes(bytes).unwrap();
             axiomdb_storage::delete_tuple(&mut p, slot_id, txn2).unwrap();
             storage.write_page(page_id, &p).unwrap();
         }
-        mgr.record_delete(1, b"k", b"data", page_id, slot_id)
+        mgr.record_delete(&mut conn2, 1, b"k", b"data", page_id, slot_id)
             .unwrap();
-        mgr.rollback(&mut storage).unwrap();
+        mgr.rollback(conn2, &mut storage).unwrap();
 
-        // After rollback, txn_id_deleted must be 0 (row is live again).
         let page = storage.read_page(page_id).unwrap();
         let (hdr, _) = read_tuple(&page, slot_id).unwrap().unwrap();
         assert_eq!(
@@ -2177,17 +463,19 @@ mod tests {
         let page_id = storage.alloc_page(PageType::Data).unwrap();
 
         // Insert original row in txn 1.
-        let txn1 = mgr.begin().unwrap();
+        let mut conn1 = mgr.begin().unwrap();
+        let txn1 = conn1.txn_id;
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
         let mut page = Page::from_bytes(page_bytes).unwrap();
         let old_slot = insert_tuple(&mut page, b"original", txn1).unwrap();
         storage.write_page(page_id, &page).unwrap();
-        mgr.record_insert(1, b"k", b"original", page_id, old_slot)
+        mgr.record_insert(&mut conn1, 1, b"k", b"original", page_id, old_slot)
             .unwrap();
-        mgr.commit().unwrap();
+        mgr.commit(conn1).unwrap();
 
         // Update in txn 2: delete old + insert new.
-        let txn2 = mgr.begin().unwrap();
+        let mut conn2 = mgr.begin().unwrap();
+        let txn2 = conn2.txn_id;
         {
             let bytes = *storage.read_page(page_id).unwrap().as_bytes();
             let mut p = Page::from_bytes(bytes).unwrap();
@@ -2195,6 +483,7 @@ mod tests {
                 axiomdb_storage::update_tuple(&mut p, old_slot, b"updated", txn2).unwrap();
             storage.write_page(page_id, &p).unwrap();
             mgr.record_update(
+                &mut conn2,
                 1,
                 b"k",
                 b"original",
@@ -2205,18 +494,15 @@ mod tests {
             )
             .unwrap();
         }
-        mgr.rollback(&mut storage).unwrap();
+        mgr.rollback(conn2, &mut storage).unwrap();
 
         let page = storage.read_page(page_id).unwrap();
-        // Old slot must be live again.
         let (old_hdr, old_data) = read_tuple(&page, old_slot).unwrap().unwrap();
         assert_eq!(old_data, b"original");
         assert_eq!(
             old_hdr.txn_id_deleted, 0,
             "old row must be live after update rollback"
         );
-        // New slot must be dead.
-        // new_slot = old_slot + 1 (inserted right after old in the page)
         let new_slot = old_slot + 1;
         assert!(
             read_tuple(&page, new_slot).unwrap().is_none(),
@@ -2232,16 +518,18 @@ mod tests {
 
         let page_id = storage.alloc_page(PageType::Data).unwrap();
 
-        let txn1 = mgr.begin().unwrap();
+        let mut conn1 = mgr.begin().unwrap();
+        let txn1 = conn1.txn_id;
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
         let mut page = Page::from_bytes(page_bytes).unwrap();
         let slot_id = insert_tuple(&mut page, b"original", txn1).unwrap();
         storage.write_page(page_id, &page).unwrap();
-        mgr.record_insert(1, b"k", b"original", page_id, slot_id)
+        mgr.record_insert(&mut conn1, 1, b"k", b"original", page_id, slot_id)
             .unwrap();
-        mgr.commit().unwrap();
+        mgr.commit(conn1).unwrap();
 
-        let txn2 = mgr.begin().unwrap();
+        let mut conn2 = mgr.begin().unwrap();
+        let txn2 = conn2.txn_id;
         let old_image = {
             let bytes = *storage.read_page(page_id).unwrap().as_bytes();
             let mut p = Page::from_bytes(bytes).unwrap();
@@ -2250,12 +538,14 @@ mod tests {
                 .unwrap();
             let new_image = read_tuple_image(&p, slot_id).unwrap().unwrap();
             storage.write_page(page_id, &p).unwrap();
-            mgr.record_update_in_place(1, b"k", &old_image, &new_image, page_id, slot_id)
-                .unwrap();
+            mgr.record_update_in_place(
+                &mut conn2, 1, b"k", &old_image, &new_image, page_id, slot_id,
+            )
+            .unwrap();
             old_image
         };
 
-        mgr.rollback(&mut storage).unwrap();
+        mgr.rollback(conn2, &mut storage).unwrap();
 
         let page = storage.read_page(page_id).unwrap();
         let (hdr, data) = read_tuple(&page, slot_id).unwrap().unwrap();
@@ -2280,8 +570,8 @@ mod tests {
         assert_eq!(snap.snapshot_id, 1); // max_committed=0 → snapshot_id=1
         assert_eq!(snap.current_txn_id, 0);
 
-        mgr.begin().unwrap();
-        mgr.commit().unwrap(); // max_committed=1
+        let conn = mgr.begin().unwrap();
+        mgr.commit(conn).unwrap(); // max_committed=1
 
         let snap2 = mgr.snapshot();
         assert_eq!(snap2.snapshot_id, 2);
@@ -2292,10 +582,12 @@ mod tests {
         let (_dir, path) = temp_wal();
         let mut mgr = TxnManager::create(&path).unwrap();
 
-        let txn_id = mgr.begin().unwrap();
-        let snap = mgr.active_snapshot().unwrap();
+        let conn = mgr.begin().unwrap();
+        let txn_id = conn.txn_id;
+        let snap = mgr.active_snapshot(&conn);
         assert_eq!(snap.current_txn_id, txn_id);
         assert_eq!(snap.snapshot_id, 1); // max_committed=0 at begin
+        mgr.commit(conn).unwrap();
     }
 
     #[test]
@@ -2305,16 +597,17 @@ mod tests {
         let mut storage = MemoryStorage::new();
 
         let page_id = storage.alloc_page(PageType::Data).unwrap();
-        let txn_id = mgr.begin().unwrap();
+        let mut conn = mgr.begin().unwrap();
+        let txn_id = conn.txn_id;
 
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
         let mut page = Page::from_bytes(page_bytes).unwrap();
         let slot_id = insert_tuple(&mut page, b"secret", txn_id).unwrap();
         storage.write_page(page_id, &page).unwrap();
-        mgr.record_insert(1, b"k", b"secret", page_id, slot_id)
+        mgr.record_insert(&mut conn, 1, b"k", b"secret", page_id, slot_id)
             .unwrap();
 
-        // A committed snapshot (max_committed=0) should NOT see txn_id=1's row.
+        // A committed snapshot should NOT see txn's row.
         let snap = mgr.snapshot();
         let page = storage.read_page(page_id).unwrap();
         let (hdr, _) = read_tuple(&page, slot_id).unwrap().unwrap();
@@ -2323,14 +616,14 @@ mod tests {
             "uncommitted row must not be visible"
         );
 
-        // The active snapshot (with current_txn_id=1) SHOULD see it.
-        let active_snap = mgr.active_snapshot().unwrap();
+        // The active snapshot (with current_txn_id) SHOULD see it.
+        let active_snap = mgr.active_snapshot(&conn);
         assert!(
             hdr.is_visible(&active_snap),
             "active txn must see its own writes"
         );
 
-        mgr.rollback(&mut storage).unwrap();
+        mgr.rollback(conn, &mut storage).unwrap();
     }
 
     // ── error cases ───────────────────────────────────────────────────────────
@@ -2340,26 +633,28 @@ mod tests {
         let (_dir, path) = temp_wal();
         let mut mgr = TxnManager::create(&path).unwrap();
 
-        mgr.begin().unwrap();
+        let conn = mgr.begin().unwrap();
         let err = mgr.begin().unwrap_err();
         assert!(matches!(err, DbError::TransactionAlreadyActive { .. }));
+        // Drop conn without commit (simulates crash, conn is just dropped)
+        let _ = conn;
     }
 
     #[test]
     fn test_commit_without_begin_error() {
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
-        let err = mgr.commit().unwrap_err();
-        assert!(matches!(err, DbError::NoActiveTransaction));
+        let mgr = TxnManager::create(&path).unwrap();
+        // We can't call commit() without a ConnectionTxn anymore;
+        // instead verify that active_txn_id() is None when nothing started.
+        assert!(mgr.active_txn_id().is_none());
     }
 
     #[test]
     fn test_rollback_without_begin_error() {
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
-        let mut storage = MemoryStorage::new();
-        let err = mgr.rollback(&mut storage).unwrap_err();
-        assert!(matches!(err, DbError::NoActiveTransaction));
+        let mgr = TxnManager::create(&path).unwrap();
+        // No active transaction means active_txn_id() returns None
+        assert!(mgr.active_txn_id().is_none());
     }
 
     // ── open / recovery ───────────────────────────────────────────────────────
@@ -2368,18 +663,15 @@ mod tests {
     fn test_open_recovers_max_committed() {
         let (_dir, path) = temp_wal();
 
-        // First session: two commits.
         {
             let mut mgr = TxnManager::create(&path).unwrap();
-            mgr.begin().unwrap();
-            mgr.commit().unwrap(); // txn 1 committed
-            mgr.begin().unwrap();
-            mgr.commit().unwrap(); // txn 2 committed
-            mgr.begin().unwrap(); // txn 3 never committed (simulates crash)
-                                  // Drop without commit
+            let c = mgr.begin().unwrap();
+            mgr.commit(c).unwrap(); // txn 1
+            let c = mgr.begin().unwrap();
+            mgr.commit(c).unwrap(); // txn 2
+            let _c = mgr.begin().unwrap(); // txn 3 — never committed (crash)
         }
 
-        // Second session: open should recover max_committed = 2.
         let mgr = TxnManager::open(&path).unwrap();
         assert_eq!(mgr.max_committed(), 2);
         assert_eq!(mgr.active_txn_id(), None);
@@ -2392,9 +684,10 @@ mod tests {
         let (_dir, path) = temp_wal();
         let mut mgr = TxnManager::create(&path).unwrap();
 
-        let txn = mgr.begin().unwrap();
-        mgr.record_insert(1, b"k", b"v", 99, 0).unwrap();
-        mgr.commit().unwrap();
+        let mut conn = mgr.begin().unwrap();
+        let txn_id = conn.txn_id;
+        mgr.record_insert(&mut conn, 1, b"k", b"v", 99, 0).unwrap();
+        mgr.commit(conn).unwrap();
 
         let reader = WalReader::open(&path).unwrap();
         let entries: Vec<_> = reader
@@ -2407,7 +700,7 @@ mod tests {
             entries,
             vec![EntryType::Begin, EntryType::Insert, EntryType::Commit]
         );
-        let _ = txn;
+        let _ = txn_id;
     }
 
     #[test]
@@ -2415,7 +708,8 @@ mod tests {
         let (_dir, path) = temp_wal();
         let mut mgr = TxnManager::create(&path).unwrap();
 
-        let txn = mgr.begin().unwrap();
+        let mut conn = mgr.begin().unwrap();
+        let txn_id = conn.txn_id;
         let key1 = encode_physical_loc(42, 1);
         let key2 = encode_physical_loc(42, 2);
         let old1 = b"old-row-1".to_vec();
@@ -2439,15 +733,16 @@ mod tests {
                 2_u16,
             ),
         ];
-        mgr.record_update_in_place_batch(7, &batch).unwrap();
-        mgr.commit().unwrap();
+        mgr.record_update_in_place_batch(&mut conn, 7, &batch)
+            .unwrap();
+        mgr.commit(conn).unwrap();
 
         let reader = WalReader::open(&path).unwrap();
         let txn_entries: Vec<_> = reader
             .scan_forward(0)
             .unwrap()
             .map(|r| r.unwrap())
-            .filter(|e| e.txn_id == txn)
+            .filter(|e| e.txn_id == txn_id)
             .collect();
 
         assert_eq!(txn_entries.len(), 4);
@@ -2477,8 +772,8 @@ mod tests {
         let mut mgr = TxnManager::create(&path).unwrap();
         let mut storage = MemoryStorage::new();
 
-        mgr.autocommit(&mut storage, |mgr| {
-            mgr.record_insert(1, b"k", b"v", 99, 0)?;
+        mgr.autocommit(&mut storage, |mgr, conn| {
+            mgr.record_insert(conn, 1, b"k", b"v", 99, 0)?;
             Ok(())
         })
         .unwrap();
@@ -2492,19 +787,17 @@ mod tests {
         let mut mgr = TxnManager::create(&path).unwrap();
         let mut storage = MemoryStorage::new();
 
-        let result = mgr.autocommit(&mut storage, |_mgr| {
+        let result = mgr.autocommit(&mut storage, |_mgr, _conn| {
             Err::<(), _>(DbError::Other("simulated failure".into()))
         });
 
         assert!(result.is_err());
-        assert_eq!(mgr.max_committed(), 0); // nothing committed
-        assert!(mgr.active_txn_id().is_none()); // no active txn
+        assert_eq!(mgr.max_committed(), 0);
+        assert!(mgr.active_txn_id().is_none());
     }
 
     // ── record_truncate ───────────────────────────────────────────────────────
 
-    /// Verifies that record_truncate writes exactly ONE WAL entry (Truncate type)
-    /// instead of N Delete entries — the core WAL I/O reduction.
     #[test]
     fn test_record_truncate_single_wal_entry() {
         use crate::reader::WalReader;
@@ -2514,26 +807,25 @@ mod tests {
         let mut mgr = TxnManager::create(&path).unwrap();
         let mut storage = MemoryStorage::new();
 
-        // Allocate a root heap page and insert 5 rows (txn 1).
         let root_page_id = storage.alloc_page(PageType::Data).unwrap();
         let init_page = axiomdb_storage::Page::new(PageType::Data, root_page_id);
         storage.write_page(root_page_id, &init_page).unwrap();
 
-        let txn1 = mgr.begin().unwrap();
+        let conn1 = mgr.begin().unwrap();
+        let txn1 = conn1.txn_id;
         for i in 0u8..5 {
             HeapChain::insert(&mut storage, root_page_id, &[i; 8], txn1).unwrap();
         }
-        mgr.commit().unwrap();
+        mgr.commit(conn1).unwrap();
 
-        // Txn 2: delete_batch + record_truncate (simulates no-WHERE DELETE).
-        let txn2 = mgr.begin().unwrap();
-        let snap = mgr.active_snapshot().unwrap();
+        let mut conn2 = mgr.begin().unwrap();
+        let txn2 = conn2.txn_id;
+        let snap = mgr.active_snapshot(&conn2);
         let raw_rids = HeapChain::scan_rids_visible(&mut storage, root_page_id, snap).unwrap();
         HeapChain::delete_batch(&mut storage, root_page_id, &raw_rids, txn2).unwrap();
-        mgr.record_truncate(1, root_page_id).unwrap();
-        mgr.commit().unwrap();
+        mgr.record_truncate(&mut conn2, 1, root_page_id).unwrap();
+        mgr.commit(conn2).unwrap();
 
-        // Scan WAL and count DML entries for txn2.
         let reader = WalReader::open(&path).unwrap();
         let txn2_dml: Vec<_> = reader
             .scan_forward(0)
@@ -2552,19 +844,13 @@ mod tests {
             })
             .collect();
 
-        // Must be exactly 1 Truncate entry — not 5 Delete entries.
         assert_eq!(txn2_dml.len(), 1, "expected exactly 1 WAL DML entry");
-        assert_eq!(
-            txn2_dml[0].entry_type,
-            EntryType::Truncate,
-            "DML entry must be Truncate type"
-        );
-        // key must encode root_page_id as 8 bytes LE.
+        assert_eq!(txn2_dml[0].entry_type, EntryType::Truncate);
         let encoded_root = u64::from_le_bytes(txn2_dml[0].key[..8].try_into().unwrap());
-        assert_eq!(encoded_root, root_page_id, "key must contain root_page_id");
+        assert_eq!(encoded_root, root_page_id);
+        let _ = txn1;
     }
 
-    /// Verifies that rolling back a record_truncate restores all deleted rows.
     #[test]
     fn test_truncate_rollback_restores_rows() {
         use axiomdb_core::TransactionSnapshot;
@@ -2574,39 +860,37 @@ mod tests {
         let mut mgr = TxnManager::create(&path).unwrap();
         let mut storage = MemoryStorage::new();
 
-        // Insert 5 rows in txn 1 (committed).
         let root_page_id = storage.alloc_page(PageType::Data).unwrap();
         let init_page = axiomdb_storage::Page::new(PageType::Data, root_page_id);
         storage.write_page(root_page_id, &init_page).unwrap();
 
-        let txn1 = mgr.begin().unwrap();
+        let conn1 = mgr.begin().unwrap();
+        let txn1 = conn1.txn_id;
         for i in 0u8..5 {
             HeapChain::insert(&mut storage, root_page_id, &[i; 8], txn1).unwrap();
         }
-        mgr.commit().unwrap();
+        mgr.commit(conn1).unwrap();
 
-        // Verify 5 rows visible after txn1 commit.
         let snap_after_insert = TransactionSnapshot::committed(mgr.max_committed());
         let before =
             HeapChain::scan_rids_visible(&mut storage, root_page_id, snap_after_insert).unwrap();
-        assert_eq!(before.len(), 5, "5 rows must be visible before truncate");
+        assert_eq!(before.len(), 5);
 
-        // Txn 2: delete_batch + record_truncate, then ROLLBACK.
-        let txn2 = mgr.begin().unwrap();
-        let snap2 = mgr.active_snapshot().unwrap();
+        let mut conn2 = mgr.begin().unwrap();
+        let txn2 = conn2.txn_id;
+        let snap2 = mgr.active_snapshot(&conn2);
         let raw_rids = HeapChain::scan_rids_visible(&mut storage, root_page_id, snap2).unwrap();
         HeapChain::delete_batch(&mut storage, root_page_id, &raw_rids, txn2).unwrap();
-        mgr.record_truncate(1, root_page_id).unwrap();
-        mgr.rollback(&mut storage).unwrap();
+        mgr.record_truncate(&mut conn2, 1, root_page_id).unwrap();
+        mgr.rollback(conn2, &mut storage).unwrap();
 
-        // After rollback: all 5 rows must be visible again.
         let snap_after_rollback = TransactionSnapshot::committed(mgr.max_committed());
         let after =
             HeapChain::scan_rids_visible(&mut storage, root_page_id, snap_after_rollback).unwrap();
         assert_eq!(
             after.len(),
             5,
-            "all 5 rows must be visible again after truncate rollback"
+            "all rows must be visible again after rollback"
         );
     }
 }

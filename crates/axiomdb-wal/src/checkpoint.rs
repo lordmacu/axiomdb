@@ -164,9 +164,10 @@ mod tests {
         let mut storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&path).unwrap();
 
-        mgr.begin().unwrap();
-        mgr.record_insert(1, b"key", b"value", 99, 0).unwrap();
-        mgr.commit().unwrap();
+        let mut conn = mgr.begin().unwrap();
+        mgr.record_insert(&mut conn, 1, b"key", b"value", 99, 0)
+            .unwrap();
+        mgr.commit(conn).unwrap();
 
         let ckpt_lsn = Checkpointer::checkpoint(&mut storage, mgr.wal_mut()).unwrap();
 

@@ -81,16 +81,16 @@ mod tests {
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
         // Write 3 entries (LSNs 1, 2, 3).
-        mgr.begin().unwrap();
-        mgr.record_insert(1, b"k", b"v", 99, 0).unwrap();
-        mgr.commit().unwrap();
+        let mut conn = mgr.begin().unwrap();
+        mgr.record_insert(&mut conn, 1, b"k", b"v", 99, 0).unwrap();
+        mgr.commit(conn).unwrap();
         // LSN 1=Begin, 2=Insert, 3=Commit → current_lsn = 3
 
         let checkpoint_lsn = mgr.rotate_wal(&mut storage, &wal_path).unwrap();
         assert_eq!(checkpoint_lsn, 4); // Checkpoint entry = LSN 4
 
         // Next entry after rotation must be LSN 5, not LSN 1.
-        mgr.begin().unwrap();
+        let _conn = mgr.begin().unwrap();
         let lsn = mgr.current_lsn();
         // current_lsn after begin (LSN 5 is the Begin entry).
         assert!(
@@ -105,8 +105,8 @@ mod tests {
         let mut storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
-        mgr.begin().unwrap();
-        mgr.commit().unwrap();
+        let conn = mgr.begin().unwrap();
+        mgr.commit(conn).unwrap();
         mgr.rotate_wal(&mut storage, &wal_path).unwrap();
 
         // After rotation, the logical WAL contains only the header, but the
@@ -131,8 +131,8 @@ mod tests {
 
         let mut prev_lsn = 0u64;
         for _ in 0..3 {
-            mgr.begin().unwrap();
-            mgr.commit().unwrap();
+            let conn = mgr.begin().unwrap();
+            mgr.commit(conn).unwrap();
             let ckpt = mgr.rotate_wal(&mut storage, &wal_path).unwrap();
             assert!(
                 ckpt > prev_lsn,
@@ -148,7 +148,7 @@ mod tests {
         let mut storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
-        mgr.begin().unwrap();
+        let _conn = mgr.begin().unwrap();
         let err = mgr.rotate_wal(&mut storage, &wal_path).unwrap_err();
         assert!(matches!(err, DbError::TransactionAlreadyActive { .. }));
     }
@@ -172,8 +172,8 @@ mod tests {
         let mut storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
-        mgr.begin().unwrap();
-        mgr.commit().unwrap();
+        let conn = mgr.begin().unwrap();
+        mgr.commit(conn).unwrap();
 
         // Threshold = 0 — any WAL size triggers rotation.
         let rotated = mgr.check_and_rotate(&mut storage, &wal_path, 0).unwrap();
@@ -186,8 +186,8 @@ mod tests {
         let mut storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
-        mgr.begin().unwrap();
-        mgr.commit().unwrap();
+        let conn = mgr.begin().unwrap();
+        mgr.commit(conn).unwrap();
 
         let rotator = WalRotator::new(0); // always triggers
         let rotated = rotator
@@ -202,8 +202,8 @@ mod tests {
         let mut storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
-        mgr.begin().unwrap();
-        mgr.commit().unwrap();
+        let conn = mgr.begin().unwrap();
+        mgr.commit(conn).unwrap();
         let ckpt_lsn = mgr.rotate_wal(&mut storage, &wal_path).unwrap();
 
         let stored = axiomdb_storage::read_checkpoint_lsn(&storage).unwrap();
@@ -217,16 +217,16 @@ mod tests {
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
         // First session: 2 entries (LSN 1=Begin, 2=Commit) + rotate (LSN 3=Checkpoint).
-        mgr.begin().unwrap();
-        mgr.commit().unwrap();
+        let conn = mgr.begin().unwrap();
+        mgr.commit(conn).unwrap();
         let ckpt = mgr.rotate_wal(&mut storage, &wal_path).unwrap();
         assert_eq!(ckpt, 3);
 
         // After rotation: new begin must be LSN 4.
-        mgr.begin().unwrap();
+        let conn2 = mgr.begin().unwrap();
         let begin_lsn = mgr.current_lsn();
         assert_eq!(begin_lsn, 4);
-        mgr.commit().unwrap();
+        mgr.commit(conn2).unwrap();
         let commit_lsn = mgr.current_lsn();
         assert_eq!(commit_lsn, 5);
     }
@@ -240,8 +240,8 @@ mod tests {
         let ckpt_lsn = {
             let mut storage = MmapStorage::create(&db_path).unwrap();
             let mut mgr = TxnManager::create(&wal_path).unwrap();
-            mgr.begin().unwrap();
-            mgr.commit().unwrap();
+            let conn = mgr.begin().unwrap();
+            mgr.commit(conn).unwrap();
             mgr.rotate_wal(&mut storage, &wal_path).unwrap()
         };
 
@@ -258,12 +258,12 @@ mod tests {
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
         // Write, rotate, write again.
-        mgr.begin().unwrap();
-        mgr.commit().unwrap();
+        let conn1 = mgr.begin().unwrap();
+        mgr.commit(conn1).unwrap();
         mgr.rotate_wal(&mut storage, &wal_path).unwrap(); // WAL now empty
 
-        mgr.begin().unwrap();
-        mgr.commit().unwrap();
+        let conn2 = mgr.begin().unwrap();
+        mgr.commit(conn2).unwrap();
 
         // Only the post-rotation entries should be in the WAL (Begin + Commit).
         let reader = WalReader::open(&wal_path).unwrap();

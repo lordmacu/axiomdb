@@ -67,25 +67,47 @@ unsafe impl bytemuck::Pod for RowHeader {}
 impl RowHeader {
     /// Returns `true` if this row is visible to the given transaction snapshot.
     ///
-    /// ## Visibility rule (MVCC)
+    /// ## Visibility rule (MVCC — multi-writer correct)
     ///
     /// A tuple is visible to snapshot `S` when:
-    /// - **Created before snapshot or by us:**
-    ///   `txn_id_created == S.current_txn_id`  (read your own writes)
-    ///   OR `txn_id_created < S.snapshot_id`   (committed before snapshot)
-    /// - **Not deleted, or deleted after snapshot and not by us:**
-    ///   `txn_id_deleted == 0`                  (live)
-    ///   OR `(txn_id_deleted >= S.snapshot_id` — not yet committed when snap taken,
-    ///   `AND txn_id_deleted != S.current_txn_id)` — not deleted by us
+    ///
+    /// **Created by us (read-your-own-writes):**
+    ///   `S.current_txn_id != 0 && txn_id_created == S.current_txn_id`
+    ///
+    /// **OR created by a committed transaction before the snapshot:**
+    ///   `txn_id_created < S.snapshot_id`
+    ///   AND `txn_id_created ∉ S.active_ids`  (was committed — not in-flight at snap)
+    ///
+    /// **AND not deleted (or deleted after the snapshot / deleted while in-flight):**
+    ///   `txn_id_deleted == 0`                           (live)
+    ///   OR `txn_id_deleted >= S.snapshot_id`            (deleted after snapshot)
+    ///   OR `txn_id_deleted ∈ S.active_ids`             (deleter was uncommitted)
+    ///   AND NOT deleted by us: `txn_id_deleted != S.current_txn_id`
     ///
     /// `snapshot_id = max_committed_txn_id + 1` at the time the snapshot was taken.
+    /// `active_ids` holds every txn_id that was in-flight when the snapshot was
+    /// constructed — their writes must be excluded even if `txn_id < snapshot_id`.
     pub fn is_visible(&self, snap: &TransactionSnapshot) -> bool {
-        let created_visible =
-            self.txn_id_created == snap.current_txn_id || self.txn_id_created < snap.snapshot_id;
-        let not_deleted = self.txn_id_deleted == 0
-            || (self.txn_id_deleted >= snap.snapshot_id
-                && self.txn_id_deleted != snap.current_txn_id);
-        created_visible && not_deleted
+        // ── creation visibility ────────────────────────────────────────────────
+        let created_by_self =
+            snap.current_txn_id != 0 && self.txn_id_created == snap.current_txn_id;
+        let created_committed = self.txn_id_created < snap.snapshot_id
+            && !snap.active_ids.contains(&self.txn_id_created);
+        if !created_by_self && !created_committed {
+            return false;
+        }
+
+        // ── deletion visibility ────────────────────────────────────────────────
+        if self.txn_id_deleted == 0 {
+            return true; // row is live
+        }
+        // Deleted by our own transaction → not visible to us
+        if snap.current_txn_id != 0 && self.txn_id_deleted == snap.current_txn_id {
+            return false;
+        }
+        // Deleted by a transaction that was not yet committed at snapshot time
+        // (either it started after the snapshot, or it was in-flight at snapshot)
+        self.txn_id_deleted >= snap.snapshot_id || snap.active_ids.contains(&self.txn_id_deleted)
     }
 }
 
@@ -587,7 +609,7 @@ pub fn scan_visible<'p>(
     snap: &TransactionSnapshot,
 ) -> impl Iterator<Item = (u16, &'p [u8])> + 'p {
     let n = num_slots(page);
-    let snap = *snap;
+    let snap = snap.clone();
     (0..n).filter_map(move |slot_id| {
         let entry = read_slot(page, slot_id);
         if entry.is_dead() {
@@ -951,9 +973,12 @@ mod tests {
     // ── visibility ─────────────────────────────────────────────────────────
 
     fn snap(snapshot_id: u64, current_txn_id: u64) -> TransactionSnapshot {
+        use std::collections::HashSet;
+        use std::sync::Arc;
         TransactionSnapshot {
             snapshot_id,
             current_txn_id,
+            active_ids: Arc::new(HashSet::new()),
         }
     }
 

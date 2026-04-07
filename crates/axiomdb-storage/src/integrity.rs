@@ -601,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_check_all_skips_meta_and_freelist() {
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         // Allocate a data page and insert a committed row.
         let page_id = storage.alloc_page(PageType::Data).unwrap();
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn test_post_recovery_clean() {
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let page_id = storage.alloc_page(PageType::Data).unwrap();
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
         let mut page = Page::from_bytes(page_bytes).unwrap();
@@ -635,7 +635,7 @@ mod tests {
     fn test_post_recovery_detects_uncommitted_row() {
         // Simulate: recovery missed undoing an uncommitted insert.
         // Row has txn_id_created=5 but max_committed=1.
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let page_id = storage.alloc_page(PageType::Data).unwrap();
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
         let mut page = Page::from_bytes(page_bytes).unwrap();

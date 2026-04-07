@@ -1,0 +1,264 @@
+// ── TableDef ──────────────────────────────────────────────────────────────────
+
+/// Metadata for a user table — one row in `axiom_tables`.
+///
+/// ## On-disk format (`to_bytes` / `from_bytes`)
+///
+/// ```text
+/// legacy (v0):
+///   [table_id:4 LE][root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8]
+///
+/// v1:
+///   [table_id:4 LE][root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8][layout:1]
+///
+/// v2 (current):
+///   [table_id:4 LE][root_page_id:8 LE][schema_len:1][schema UTF-8][name_len:1][name UTF-8][layout:1][schema_version:8 LE]
+/// ```
+///
+/// v0 rows decode as `storage_layout = Heap, schema_version = 1`.
+/// v1 rows decode as `schema_version = 1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableDef {
+    pub id: TableId,
+    /// Root page of the table's primary row store.
+    ///
+    /// For heap tables this points to the `HeapChain` root.
+    /// For clustered tables this points to the clustered leaf/internal root.
+    /// Must never be 0 (page 0 is the meta page).
+    pub root_page_id: u64,
+    pub storage_layout: TableStorageLayout,
+    pub schema_name: String,
+    pub table_name: String,
+    /// Monotonically increasing version counter for this table's schema.
+    ///
+    /// Initialized to `1` when the table is created. Bumped by every DDL
+    /// operation that modifies this specific table (CREATE INDEX, DROP INDEX,
+    /// DROP TABLE, TRUNCATE TABLE). Used by the plan cache to detect stale
+    /// cached plans without invalidating the entire cache on any DDL event.
+    ///
+    /// Mirrors PostgreSQL's per-relation version tracking in `relcache`.
+    pub schema_version: u64,
+}
+
+impl TableDef {
+    pub fn is_heap(&self) -> bool {
+        self.storage_layout == TableStorageLayout::Heap
+    }
+
+    pub fn is_clustered(&self) -> bool {
+        self.storage_layout == TableStorageLayout::Clustered
+    }
+
+    pub fn ensure_heap_runtime(&self, feature: &str) -> Result<(), DbError> {
+        if self.is_clustered() {
+            return Err(DbError::NotImplemented {
+                feature: feature.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Serializes to binary row format (v2).
+    ///
+    /// Format:
+    /// `[table_id:4][root_page_id:8][schema_len:1][schema bytes][name_len:1][name bytes][layout:1][schema_version:8 LE]`
+    ///
+    /// # Panics (debug only)
+    /// If `schema_name` or `table_name` exceeds 255 bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let schema = self.schema_name.as_bytes();
+        let name = self.table_name.as_bytes();
+        debug_assert!(schema.len() <= 255, "schema_name too long");
+        debug_assert!(name.len() <= 255, "table_name too long");
+
+        let mut buf = Vec::with_capacity(4 + 8 + 1 + schema.len() + 1 + name.len() + 1 + 8);
+        buf.extend_from_slice(&self.id.to_le_bytes());
+        buf.extend_from_slice(&self.root_page_id.to_le_bytes());
+        buf.push(schema.len() as u8);
+        buf.extend_from_slice(schema);
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(name);
+        buf.push(self.storage_layout.into());
+        buf.extend_from_slice(&self.schema_version.to_le_bytes());
+        buf
+    }
+
+    /// Deserializes from binary row format.
+    ///
+    /// Returns `(TableDef, bytes_consumed)` on success.
+    ///
+    /// # Errors
+    /// - [`DbError::ParseError`] if `bytes` is too short or contains invalid UTF-8.
+    pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), DbError> {
+        let err = || DbError::ParseError {
+            message: "truncated TableRow bytes".into(),
+            position: None,
+        };
+
+        // Minimum: 4 (id) + 8 (root_page_id) + 1 (schema_len) + 0 + 1 (name_len) + 0 = 14
+        if bytes.len() < 14 {
+            return Err(err());
+        }
+
+        let id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let root_page_id = u64::from_le_bytes([
+            bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+        ]);
+        let schema_len = bytes[12] as usize;
+        let pos = 13;
+
+        if bytes.len() < pos + schema_len + 1 {
+            return Err(err());
+        }
+        let schema_name = std::str::from_utf8(&bytes[pos..pos + schema_len])
+            .map_err(|_| DbError::ParseError {
+                message: "invalid UTF-8 in schema_name".into(),
+                position: None,
+            })?
+            .to_string();
+        let pos = pos + schema_len;
+
+        let name_len = bytes[pos] as usize;
+        let pos = pos + 1;
+        if bytes.len() < pos + name_len {
+            return Err(err());
+        }
+        let table_name = std::str::from_utf8(&bytes[pos..pos + name_len])
+            .map_err(|_| DbError::ParseError {
+                message: "invalid UTF-8 in table_name".into(),
+                position: None,
+            })?
+            .to_string();
+        let mut consumed = pos + name_len;
+        // Three on-disk formats — decode trailing bytes by total remaining size:
+        //   v0 (0 trailing):  storage_layout = Heap, schema_version = 1
+        //   v1 (1 trailing):  storage_layout from byte, schema_version = 1
+        //   v2 (9 trailing):  storage_layout from byte, schema_version from 8 LE bytes
+        let (storage_layout, schema_version) = match bytes.len() - consumed {
+            0 => (TableStorageLayout::Heap, 1u64),
+            1 => {
+                let layout = TableStorageLayout::try_from(bytes[consumed])?;
+                consumed += 1;
+                (layout, 1u64)
+            }
+            9 => {
+                let layout = TableStorageLayout::try_from(bytes[consumed])?;
+                consumed += 1;
+                let v = u64::from_le_bytes(
+                    bytes[consumed..consumed + 8]
+                        .try_into()
+                        .expect("slice is exactly 8 bytes"),
+                );
+                consumed += 8;
+                (layout, v)
+            }
+            _ => {
+                return Err(DbError::ParseError {
+                    message: "unexpected trailing bytes in TableRow".into(),
+                    position: None,
+                })
+            }
+        };
+
+        Ok((
+            Self {
+                id,
+                root_page_id,
+                storage_layout,
+                schema_name,
+                table_name,
+                schema_version,
+            },
+            consumed,
+        ))
+    }
+}
+
+// ── ColumnDef ─────────────────────────────────────────────────────────────────
+
+/// Metadata for a single column — one row in `axiom_columns`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnDef {
+    pub table_id: TableId,
+    pub col_idx: u16,
+    pub name: String,
+    pub col_type: ColumnType,
+    pub nullable: bool,
+    /// `true` if this column was declared `AUTO_INCREMENT` or `SERIAL`.
+    pub auto_increment: bool,
+}
+
+impl ColumnDef {
+    /// Serializes to binary row format.
+    ///
+    /// Format: `[table_id:4][col_idx:2][col_type:1][flags:1][name_len:1][name bytes]`
+    /// - `flags bit0` = nullable
+    /// - `flags bit1` = auto_increment
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let name = self.name.as_bytes();
+        debug_assert!(name.len() <= 255, "column name too long");
+
+        let mut flags: u8 = 0;
+        if self.nullable {
+            flags |= 0x01;
+        }
+        if self.auto_increment {
+            flags |= 0x02;
+        }
+
+        let mut buf = Vec::with_capacity(4 + 2 + 1 + 1 + 1 + name.len());
+        buf.extend_from_slice(&self.table_id.to_le_bytes());
+        buf.extend_from_slice(&self.col_idx.to_le_bytes());
+        buf.push(u8::from(self.col_type));
+        buf.push(flags);
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(name);
+        buf
+    }
+
+    /// Deserializes from binary row format.
+    ///
+    /// Backward-compatible: bit1 of flags was always 0 in older rows,
+    /// so `auto_increment` defaults to `false` for pre-4.14 catalog data.
+    pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), DbError> {
+        let err = || DbError::ParseError {
+            message: "truncated ColumnRow bytes".into(),
+            position: None,
+        };
+
+        if bytes.len() < 9 {
+            return Err(err());
+        }
+
+        let table_id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let col_idx = u16::from_le_bytes([bytes[4], bytes[5]]);
+        let col_type = ColumnType::try_from(bytes[6])?;
+        let flags = bytes[7];
+        let nullable = flags & 0x01 != 0;
+        let auto_increment = flags & 0x02 != 0;
+        let name_len = bytes[8] as usize;
+
+        if bytes.len() < 9 + name_len {
+            return Err(err());
+        }
+        let name = std::str::from_utf8(&bytes[9..9 + name_len])
+            .map_err(|_| DbError::ParseError {
+                message: "invalid UTF-8 in column name".into(),
+                position: None,
+            })?
+            .to_string();
+        let consumed = 9 + name_len;
+
+        Ok((
+            Self {
+                table_id,
+                col_idx,
+                name,
+                col_type,
+                nullable,
+                auto_increment,
+            },
+            consumed,
+        ))
+    }
+}

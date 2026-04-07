@@ -1,0 +1,261 @@
+// ── Statement analysis ────────────────────────────────────────────────────────
+
+fn analyze_stmt(
+    stmt: Stmt,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_database: &str,
+    default_schema: &str,
+) -> Result<Stmt, DbError> {
+    match stmt {
+        Stmt::Select(s) => {
+            analyze_select(s, storage, snapshot, default_database, default_schema).map(Stmt::Select)
+        }
+        Stmt::Insert(s) => {
+            analyze_insert(s, storage, snapshot, default_database, default_schema).map(Stmt::Insert)
+        }
+        Stmt::Update(s) => {
+            analyze_update(s, storage, snapshot, default_database, default_schema).map(Stmt::Update)
+        }
+        Stmt::Delete(s) => {
+            analyze_delete(s, storage, snapshot, default_database, default_schema).map(Stmt::Delete)
+        }
+        Stmt::CreateTable(s) => {
+            analyze_create_table(s, storage, snapshot, default_database, default_schema)
+                .map(Stmt::CreateTable)
+        }
+        Stmt::DropTable(s) => {
+            analyze_drop_table(s, storage, snapshot, default_database, default_schema)
+                .map(Stmt::DropTable)
+        }
+        Stmt::CreateIndex(s) => {
+            analyze_create_index(s, storage, snapshot, default_database, default_schema)
+                .map(Stmt::CreateIndex)
+        }
+        Stmt::AlterTable(s) => {
+            analyze_alter_table(s, storage, snapshot, default_database, default_schema)
+                .map(Stmt::AlterTable)
+        }
+        // Statements that need no semantic analysis for Phase 4.18:
+        other => Ok(other),
+    }
+}
+
+// ── Cached analysis dispatcher ────────────────────────────────────────────────
+
+fn analyze_stmt_cached(
+    stmt: Stmt,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_database: &str,
+    default_schema: &str,
+    cache: &mut SchemaCache,
+) -> Result<Stmt, DbError> {
+    match stmt {
+        // INSERT is the hot path — use the cached variant
+        Stmt::Insert(s) => analyze_insert_cached(
+            s,
+            storage,
+            snapshot,
+            default_database,
+            default_schema,
+            cache,
+        )
+        .map(Stmt::Insert),
+        // DDL invalidates the cache
+        Stmt::CreateTable(_) | Stmt::DropTable(_) | Stmt::AlterTable(_) => {
+            cache.invalidate();
+            analyze_stmt(stmt, storage, snapshot, default_database, default_schema)
+        }
+        // Everything else: fall back to uncached
+        other => analyze_stmt(other, storage, snapshot, default_database, default_schema),
+    }
+}
+
+fn analyze_insert_cached(
+    mut s: InsertStmt,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_database: &str,
+    default_schema: &str,
+    cache: &mut SchemaCache,
+) -> Result<InsertStmt, DbError> {
+    let database = s.table.database.as_deref().unwrap_or(default_database);
+    let schema = s.table.schema.as_deref().unwrap_or(default_schema);
+
+    // Try cache first — avoids HeapChain::scan_visible × 2 on repeated inserts
+    let (table_def, columns): (axiomdb_catalog::TableDef, Vec<axiomdb_catalog::ColumnDef>) =
+        if let Some(td) = cache.get_table(database, schema, &s.table.name) {
+            let cols = cache.get_columns(td.id).cloned().unwrap_or_default();
+            (td.clone(), cols)
+        } else {
+            // Cache miss: resolve with search_path fallback
+            let mut reader = CatalogReader::new(storage, snapshot.clone())?;
+            let td = resolve_dml_table(&mut reader, &s.table, default_database, default_schema)?;
+            let cols = reader.list_columns(td.id)?;
+            cache.insert(database, schema, &s.table.name, td.clone(), cols.clone());
+            (td, cols)
+        };
+    let _ = table_def; // used only to populate cache; executor reads from catalog directly
+
+    // Validate named column list if provided
+    if let Some(ref col_names) = s.columns {
+        for col_name in col_names {
+            if !columns.iter().any(|c| &c.name == col_name) {
+                let available = columns
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(DbError::ColumnNotFound {
+                    name: col_name.clone(),
+                    table: format!("\"{}\" (available: {})", s.table.name, available),
+                });
+            }
+        }
+    }
+
+    // Analyze SELECT source if present
+    if let InsertSource::Select(ref select) = s.source {
+        let analyzed = analyze_select(
+            *select.clone(),
+            storage,
+            snapshot,
+            default_database,
+            default_schema,
+        )?;
+        s.source = InsertSource::Select(Box::new(analyzed));
+    }
+
+    Ok(s)
+}
+
+// ── SELECT ────────────────────────────────────────────────────────────────────
+
+/// Public entry for analyzing a SELECT with no outer scopes.
+///
+/// Delegates to [`analyze_select_with_outer`] with an empty outer-scope slice.
+fn analyze_select(
+    s: SelectStmt,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_database: &str,
+    default_schema: &str,
+) -> Result<SelectStmt, DbError> {
+    analyze_select_with_outer(s, storage, snapshot, default_database, default_schema, &[])
+}
+
+/// Analyze a SELECT statement, threading `outer_scopes` through every expression
+/// so that correlated column references produce `Expr::OuterColumn` nodes.
+///
+/// Called recursively for subqueries: when a subquery is encountered inside
+/// `resolve_expr_full`, the current `BindContext` is appended to `outer_scopes`
+/// and this function is invoked on the inner `SelectStmt`.
+fn analyze_select_with_outer(
+    mut s: SelectStmt,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_database: &str,
+    default_schema: &str,
+    outer_scopes: &[&BindContext],
+) -> Result<SelectStmt, DbError> {
+    // Build resolution context from FROM and JOINs.
+    let ctx = build_context(
+        &s.from,
+        &s.joins,
+        storage,
+        snapshot.clone(),
+        default_database,
+        default_schema,
+    )?;
+
+    // If FROM is a derived table (subquery in FROM), `build_context` analyzed
+    // the inner query to extract virtual column names, but did NOT store the
+    // analyzed version back into `s.from`. Fix that here so the executor
+    // receives the analyzed inner query with correct `col_idx` values.
+    if let Some(FromClause::Subquery { query, alias }) = s.from {
+        let analyzed_inner = analyze_select_with_outer(
+            *query,
+            storage,
+            snapshot.clone(),
+            default_database,
+            default_schema,
+            outer_scopes,
+        )?;
+        s.from = Some(FromClause::Subquery {
+            query: Box::new(analyzed_inner),
+            alias,
+        });
+    }
+
+    // AnalyzeState is needed so that subquery arms inside expressions can
+    // recurse back into analyze_select_with_outer.
+    let state = AnalyzeState {
+        storage,
+        snapshot,
+        default_database,
+        default_schema,
+    };
+
+    // Resolve JOIN conditions.
+    let mut resolved_joins = Vec::with_capacity(s.joins.len());
+    for mut join in s.joins {
+        join.condition = match join.condition {
+            JoinCondition::On(expr) => {
+                JoinCondition::On(resolve_expr_full(expr, &ctx, outer_scopes, Some(&state))?)
+            }
+            JoinCondition::Using(cols) => {
+                // Detailed column-by-column validation deferred (Phase 4.22).
+                JoinCondition::Using(cols)
+            }
+        };
+        resolved_joins.push(join);
+    }
+    s.joins = resolved_joins;
+
+    // Resolve WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET.
+    s.where_clause = resolve_opt_expr_full(s.where_clause, &ctx, outer_scopes, Some(&state))?;
+    s.group_by = s
+        .group_by
+        .into_iter()
+        .map(|e| resolve_expr_full(e, &ctx, outer_scopes, Some(&state)))
+        .collect::<Result<_, _>>()?;
+    s.having = resolve_opt_expr_full(s.having, &ctx, outer_scopes, Some(&state))?;
+
+    // Resolve ORDER BY.
+    let mut resolved_order = Vec::with_capacity(s.order_by.len());
+    for mut item in s.order_by {
+        item.expr = resolve_expr_full(item.expr, &ctx, outer_scopes, Some(&state))?;
+        resolved_order.push(item);
+    }
+    s.order_by = resolved_order;
+
+    s.limit = resolve_opt_expr_full(s.limit, &ctx, outer_scopes, Some(&state))?;
+    s.offset = resolve_opt_expr_full(s.offset, &ctx, outer_scopes, Some(&state))?;
+
+    // Resolve SELECT list.
+    let mut resolved_cols = Vec::with_capacity(s.columns.len());
+    for item in s.columns {
+        let resolved = match item {
+            SelectItem::Wildcard => SelectItem::Wildcard,
+            SelectItem::QualifiedWildcard(ref table_name) => {
+                // Validate the table/alias is in scope.
+                if !ctx.tables.is_empty() && ctx.find_table(table_name).is_none() {
+                    return Err(DbError::TableNotFound {
+                        name: format!("{table_name}.*"),
+                    });
+                }
+                item
+            }
+            SelectItem::Expr { expr, alias } => SelectItem::Expr {
+                expr: resolve_expr_full(expr, &ctx, outer_scopes, Some(&state))?,
+                alias,
+            },
+        };
+        resolved_cols.push(resolved);
+    }
+    s.columns = resolved_cols;
+
+    Ok(s)
+}
+

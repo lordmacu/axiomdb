@@ -40,7 +40,7 @@ use axiomdb_storage::{
     alloc_constraint_id, alloc_fk_id, alloc_index_id, alloc_table_id, clustered_leaf,
     write_meta_u64, HeapChain, Page, PageType, StorageEngine,
 };
-use axiomdb_wal::TxnManager;
+use axiomdb_wal::{ConnectionTxn, TxnManager};
 
 use crate::{
     bootstrap::{CatalogBootstrap, CatalogPageIds},
@@ -88,6 +88,7 @@ pub const SYSTEM_TABLE_SCHEMAS: u32 = u32::MAX - 8;
 pub struct CatalogWriter<'a> {
     storage: &'a mut dyn StorageEngine,
     txn: &'a mut TxnManager,
+    conn: &'a mut ConnectionTxn,
     page_ids: CatalogPageIds,
     notifier: Option<Arc<CatalogChangeNotifier>>,
 }
@@ -100,11 +101,13 @@ impl<'a> CatalogWriter<'a> {
     pub fn new(
         storage: &'a mut dyn StorageEngine,
         txn: &'a mut TxnManager,
+        conn: &'a mut ConnectionTxn,
     ) -> Result<Self, DbError> {
         let page_ids = CatalogBootstrap::ensure_database_roots(storage)?;
         Ok(Self {
             storage,
             txn,
+            conn,
             page_ids,
             notifier: None,
         })
@@ -136,7 +139,7 @@ impl<'a> CatalogWriter<'a> {
     /// (should not happen — DDL methods verify active txn before calling this).
     fn fire(&self, kind: SchemaChangeKind) {
         if let Some(n) = &self.notifier {
-            let txn_id = self.txn.active_txn_id().unwrap_or(0);
+            let txn_id = self.conn.txn_id;
             n.notify(&SchemaChangeEvent { kind, txn_id });
         }
     }
@@ -149,13 +152,11 @@ impl<'a> CatalogWriter<'a> {
             name: name.to_string(),
         }
         .to_bytes();
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = self.conn.txn_id;
         let (page_id, slot_id) =
             HeapChain::insert(self.storage, self.page_ids.databases, &data, txn_id)?;
         self.txn.record_insert(
+            self.conn,
             SYSTEM_TABLE_DATABASES,
             name.as_bytes(),
             &data,
@@ -169,11 +170,8 @@ impl<'a> CatalogWriter<'a> {
     ///
     /// Returns `Ok(false)` when no visible row exists.
     pub fn drop_database(&mut self, name: &str) -> Result<bool, DbError> {
-        let snap = self.txn.active_snapshot()?;
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
+        let snap = self.txn.active_snapshot(self.conn);
+        let txn_id = self.conn.txn_id;
         let rows = crate::reader::CatalogReader::scan_databases_root(
             self.storage,
             self.page_ids.databases,
@@ -184,6 +182,7 @@ impl<'a> CatalogWriter<'a> {
             if def.name == name {
                 HeapChain::delete(self.storage, rid.page_id, rid.slot_id, txn_id)?;
                 self.txn.record_delete(
+                    self.conn,
                     SYSTEM_TABLE_DATABASES,
                     name.as_bytes(),
                     &data,
@@ -208,13 +207,11 @@ impl<'a> CatalogWriter<'a> {
             database_name: database_name.to_string(),
         }
         .to_bytes();
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = self.conn.txn_id;
         let (page_id, slot_id) =
             HeapChain::insert(self.storage, self.page_ids.table_databases, &data, txn_id)?;
         self.txn.record_insert(
+            self.conn,
             SYSTEM_TABLE_TABLE_DATABASES,
             &table_id.to_le_bytes(),
             &data,
@@ -226,11 +223,8 @@ impl<'a> CatalogWriter<'a> {
 
     /// Deletes the explicit table → database ownership binding, if present.
     pub fn drop_table_database_binding(&mut self, table_id: TableId) -> Result<(), DbError> {
-        let snap = self.txn.active_snapshot()?;
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
+        let snap = self.txn.active_snapshot(self.conn);
+        let txn_id = self.conn.txn_id;
         let rows = crate::reader::CatalogReader::scan_table_databases_root(
             self.storage,
             self.page_ids.table_databases,
@@ -241,6 +235,7 @@ impl<'a> CatalogWriter<'a> {
             if def.table_id == table_id {
                 HeapChain::delete(self.storage, rid.page_id, rid.slot_id, txn_id)?;
                 self.txn.record_delete(
+                    self.conn,
                     SYSTEM_TABLE_TABLE_DATABASES,
                     &table_id.to_le_bytes(),
                     &data,
@@ -260,11 +255,8 @@ impl<'a> CatalogWriter<'a> {
         &mut self,
         database_name: &str,
     ) -> Result<Vec<TableId>, DbError> {
-        let snap = self.txn.active_snapshot()?;
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
+        let snap = self.txn.active_snapshot(self.conn);
+        let txn_id = self.conn.txn_id;
         let rows = crate::reader::CatalogReader::scan_table_databases_root(
             self.storage,
             self.page_ids.table_databases,
@@ -276,6 +268,7 @@ impl<'a> CatalogWriter<'a> {
             if def.database_name == database_name {
                 HeapChain::delete(self.storage, rid.page_id, rid.slot_id, txn_id)?;
                 self.txn.record_delete(
+                    self.conn,
                     SYSTEM_TABLE_TABLE_DATABASES,
                     &def.table_id.to_le_bytes(),
                     &data,
@@ -300,13 +293,11 @@ impl<'a> CatalogWriter<'a> {
             name: schema.to_string(),
         }
         .to_bytes();
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = self.conn.txn_id;
         let key = format!("{}\0{}", database, schema);
         let (page_id, slot_id) = HeapChain::insert(self.storage, root, &data, txn_id)?;
         self.txn.record_insert(
+            self.conn,
             SYSTEM_TABLE_SCHEMAS,
             key.as_bytes(),
             &data,
@@ -372,16 +363,19 @@ impl<'a> CatalogWriter<'a> {
         };
         let data = def.to_bytes();
 
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = self.conn.txn_id;
         let (page_id, slot_id) =
             HeapChain::insert(self.storage, self.page_ids.tables, &data, txn_id)?;
 
         let key = table_id.to_le_bytes();
-        self.txn
-            .record_insert(SYSTEM_TABLE_TABLES, &key, &data, page_id, slot_id)?;
+        self.txn.record_insert(
+            self.conn,
+            SYSTEM_TABLE_TABLES,
+            &key,
+            &data,
+            page_id,
+            slot_id,
+        )?;
 
         self.fire(SchemaChangeKind::TableCreated { table_id });
         Ok(def)
@@ -415,10 +409,7 @@ impl<'a> CatalogWriter<'a> {
     pub fn create_column(&mut self, def: ColumnDef) -> Result<(), DbError> {
         let data = def.to_bytes();
 
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = self.conn.txn_id;
         let (page_id, slot_id) =
             HeapChain::insert(self.storage, self.page_ids.columns, &data, txn_id)?;
 
@@ -426,8 +417,14 @@ impl<'a> CatalogWriter<'a> {
         let mut key = [0u8; 6];
         key[0..4].copy_from_slice(&def.table_id.to_le_bytes());
         key[4..6].copy_from_slice(&def.col_idx.to_le_bytes());
-        self.txn
-            .record_insert(SYSTEM_TABLE_COLUMNS, &key, &data, page_id, slot_id)?;
+        self.txn.record_insert(
+            self.conn,
+            SYSTEM_TABLE_COLUMNS,
+            &key,
+            &data,
+            page_id,
+            slot_id,
+        )?;
 
         Ok(())
     }
@@ -452,16 +449,19 @@ impl<'a> CatalogWriter<'a> {
         let row = IndexDef { index_id, ..def };
         let data = row.to_bytes();
 
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = self.conn.txn_id;
         let (page_id, slot_id) =
             HeapChain::insert(self.storage, self.page_ids.indexes, &data, txn_id)?;
 
         let key = index_id.to_le_bytes();
-        self.txn
-            .record_insert(SYSTEM_TABLE_INDEXES, &key, &data, page_id, slot_id)?;
+        self.txn.record_insert(
+            self.conn,
+            SYSTEM_TABLE_INDEXES,
+            &key,
+            &data,
+            page_id,
+            slot_id,
+        )?;
 
         self.fire(SchemaChangeKind::IndexCreated {
             index_id,
@@ -482,15 +482,12 @@ impl<'a> CatalogWriter<'a> {
     /// # Errors
     /// - [`DbError::NoActiveTransaction`] if no transaction is active.
     pub fn delete_table(&mut self, table_id: TableId) -> Result<(), DbError> {
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
-        let snap = self.txn.active_snapshot()?;
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
 
         // Collect rows first (releases the immutable borrow on storage).
-        let table_rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, snap)?;
-        let col_rows = HeapChain::scan_visible(self.storage, self.page_ids.columns, snap)?;
+        let table_rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, snap.clone())?;
+        let col_rows = HeapChain::scan_visible(self.storage, self.page_ids.columns, snap.clone())?;
         let idx_rows = HeapChain::scan_visible(self.storage, self.page_ids.indexes, snap)?;
 
         // Delete matching rows from axiom_tables.
@@ -499,8 +496,14 @@ impl<'a> CatalogWriter<'a> {
             if def.id == table_id {
                 HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
                 let key = table_id.to_le_bytes();
-                self.txn
-                    .record_delete(SYSTEM_TABLE_TABLES, &key, &data, page_id, slot_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_TABLES,
+                    &key,
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
             }
         }
 
@@ -510,8 +513,14 @@ impl<'a> CatalogWriter<'a> {
             if def.table_id == table_id {
                 HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
                 let key = table_id.to_le_bytes();
-                self.txn
-                    .record_delete(SYSTEM_TABLE_COLUMNS, &key, &data, page_id, slot_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_COLUMNS,
+                    &key,
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
             }
         }
 
@@ -523,8 +532,14 @@ impl<'a> CatalogWriter<'a> {
                 dropped_index_ids.push(def.index_id);
                 HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
                 let key = table_id.to_le_bytes();
-                self.txn
-                    .record_delete(SYSTEM_TABLE_INDEXES, &key, &data, page_id, slot_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_INDEXES,
+                    &key,
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
             }
         }
 
@@ -546,11 +561,8 @@ impl<'a> CatalogWriter<'a> {
     /// - [`DbError::NoActiveTransaction`] if no transaction is active.
     /// - [`DbError::Internal`] if the column row is not found (caller must validate first).
     pub fn delete_column(&mut self, table_id: TableId, col_idx: u16) -> Result<(), DbError> {
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
-        let snap = self.txn.active_snapshot()?;
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
         let rows = HeapChain::scan_visible(self.storage, self.page_ids.columns, snap)?;
 
         for (page_id, slot_id, data) in rows {
@@ -560,8 +572,14 @@ impl<'a> CatalogWriter<'a> {
                 let mut key = [0u8; 6];
                 key[0..4].copy_from_slice(&table_id.to_le_bytes());
                 key[4..6].copy_from_slice(&col_idx.to_le_bytes());
-                self.txn
-                    .record_delete(SYSTEM_TABLE_COLUMNS, &key, &data, page_id, slot_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_COLUMNS,
+                    &key,
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
                 return Ok(());
             }
         }
@@ -579,7 +597,7 @@ impl<'a> CatalogWriter<'a> {
         col_idx: u16,
         new_name: String,
     ) -> Result<(), DbError> {
-        let snap = self.txn.active_snapshot()?;
+        let snap = self.txn.active_snapshot(self.conn);
         let rows = HeapChain::scan_visible(self.storage, self.page_ids.columns, snap)?;
 
         // Find and remember the old ColumnDef.
@@ -617,11 +635,8 @@ impl<'a> CatalogWriter<'a> {
         new_name: String,
         schema: &str,
     ) -> Result<(), DbError> {
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
-        let snap = self.txn.active_snapshot()?;
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
         let rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, snap)?;
 
         for (page_id, slot_id, data) in rows {
@@ -630,8 +645,14 @@ impl<'a> CatalogWriter<'a> {
                 // Delete old row.
                 HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
                 let key = table_id.to_le_bytes();
-                self.txn
-                    .record_delete(SYSTEM_TABLE_TABLES, &key, &data, page_id, slot_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_TABLES,
+                    &key,
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
 
                 // Insert new row with updated name.
                 let new_def = TableDef {
@@ -642,8 +663,14 @@ impl<'a> CatalogWriter<'a> {
                 let new_data = new_def.to_bytes();
                 let (pg2, sl2) =
                     HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id)?;
-                self.txn
-                    .record_insert(SYSTEM_TABLE_TABLES, &key, &new_data, pg2, sl2)?;
+                self.txn.record_insert(
+                    self.conn,
+                    SYSTEM_TABLE_TABLES,
+                    &key,
+                    &new_data,
+                    pg2,
+                    sl2,
+                )?;
                 return Ok(());
             }
         }
@@ -665,11 +692,8 @@ impl<'a> CatalogWriter<'a> {
         table_id: TableId,
         new_root_page_id: u64,
     ) -> Result<(), DbError> {
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
-        let snap = self.txn.active_snapshot()?;
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
         let rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, snap)?;
 
         for (page_id, slot_id, data) in rows {
@@ -678,8 +702,14 @@ impl<'a> CatalogWriter<'a> {
                 // Delete old row.
                 HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
                 let key = table_id.to_le_bytes();
-                self.txn
-                    .record_delete(SYSTEM_TABLE_TABLES, &key, &data, page_id, slot_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_TABLES,
+                    &key,
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
 
                 // Insert new row with updated root_page_id.
                 let new_def = TableDef {
@@ -689,8 +719,14 @@ impl<'a> CatalogWriter<'a> {
                 let new_data = new_def.to_bytes();
                 let (pg2, sl2) =
                     HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id)?;
-                self.txn
-                    .record_insert(SYSTEM_TABLE_TABLES, &key, &new_data, pg2, sl2)?;
+                self.txn.record_insert(
+                    self.conn,
+                    SYSTEM_TABLE_TABLES,
+                    &key,
+                    &new_data,
+                    pg2,
+                    sl2,
+                )?;
                 return Ok(());
             }
         }
@@ -705,11 +741,8 @@ impl<'a> CatalogWriter<'a> {
         table_id: TableId,
         new_layout: TableStorageLayout,
     ) -> Result<(), DbError> {
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
-        let snap = self.txn.active_snapshot()?;
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
         let rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, snap)?;
 
         for (page_id, slot_id, data) in rows {
@@ -717,8 +750,14 @@ impl<'a> CatalogWriter<'a> {
             if def.id == table_id {
                 HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
                 let key = table_id.to_le_bytes();
-                self.txn
-                    .record_delete(SYSTEM_TABLE_TABLES, &key, &data, page_id, slot_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_TABLES,
+                    &key,
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
 
                 let new_def = TableDef {
                     storage_layout: new_layout,
@@ -727,8 +766,14 @@ impl<'a> CatalogWriter<'a> {
                 let new_data = new_def.to_bytes();
                 let (pg2, sl2) =
                     HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id)?;
-                self.txn
-                    .record_insert(SYSTEM_TABLE_TABLES, &key, &new_data, pg2, sl2)?;
+                self.txn.record_insert(
+                    self.conn,
+                    SYSTEM_TABLE_TABLES,
+                    &key,
+                    &new_data,
+                    pg2,
+                    sl2,
+                )?;
                 return Ok(());
             }
         }
@@ -752,11 +797,8 @@ impl<'a> CatalogWriter<'a> {
     /// - [`DbError::NoActiveTransaction`] if no transaction is active.
     /// - [`DbError::Internal`] if `table_id` is not found in `axiom_tables`.
     pub fn bump_table_schema_version(&mut self, table_id: TableId) -> Result<u64, DbError> {
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
-        let snap = self.txn.active_snapshot()?;
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
         let rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, snap)?;
 
         for (page_id, slot_id, data) in rows {
@@ -764,8 +806,14 @@ impl<'a> CatalogWriter<'a> {
             if def.id == table_id {
                 HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
                 let key = table_id.to_le_bytes();
-                self.txn
-                    .record_delete(SYSTEM_TABLE_TABLES, &key, &data, page_id, slot_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_TABLES,
+                    &key,
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
 
                 let new_version = def.schema_version + 1;
                 let new_def = TableDef {
@@ -775,8 +823,14 @@ impl<'a> CatalogWriter<'a> {
                 let new_data = new_def.to_bytes();
                 let (pg2, sl2) =
                     HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id)?;
-                self.txn
-                    .record_insert(SYSTEM_TABLE_TABLES, &key, &new_data, pg2, sl2)?;
+                self.txn.record_insert(
+                    self.conn,
+                    SYSTEM_TABLE_TABLES,
+                    &key,
+                    &new_data,
+                    pg2,
+                    sl2,
+                )?;
                 return Ok(new_version);
             }
         }
@@ -793,11 +847,8 @@ impl<'a> CatalogWriter<'a> {
     /// - [`DbError::NoActiveTransaction`] if no transaction is active.
     /// - [`DbError::CatalogIndexNotFound`] if no visible index with that ID exists.
     pub fn delete_index(&mut self, index_id: u32) -> Result<(), DbError> {
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
-        let snap = self.txn.active_snapshot()?;
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
 
         let rows = HeapChain::scan_visible(self.storage, self.page_ids.indexes, snap)?;
 
@@ -807,8 +858,14 @@ impl<'a> CatalogWriter<'a> {
                 let table_id = def.table_id;
                 HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
                 let key = index_id.to_le_bytes();
-                self.txn
-                    .record_delete(SYSTEM_TABLE_INDEXES, &key, &data, page_id, slot_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_INDEXES,
+                    &key,
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
                 self.fire(SchemaChangeKind::IndexDropped { index_id, table_id });
                 return Ok(());
             }
@@ -826,11 +883,8 @@ impl<'a> CatalogWriter<'a> {
     /// - [`DbError::NoActiveTransaction`] if no transaction is active.
     /// - [`DbError::CatalogIndexNotFound`] if no visible index with that ID exists.
     pub fn update_index_root(&mut self, index_id: u32, new_root: u64) -> Result<(), DbError> {
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
-        let snap = self.txn.active_snapshot()?;
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
 
         let rows = HeapChain::scan_visible(self.storage, self.page_ids.indexes, snap)?;
         for (page_id, slot_id, data) in rows {
@@ -839,8 +893,14 @@ impl<'a> CatalogWriter<'a> {
                 // Delete old row.
                 HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
                 let key = index_id.to_le_bytes();
-                self.txn
-                    .record_delete(SYSTEM_TABLE_INDEXES, &key, &data, page_id, slot_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_INDEXES,
+                    &key,
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
 
                 // Insert updated row.
                 let updated = IndexDef {
@@ -851,6 +911,7 @@ impl<'a> CatalogWriter<'a> {
                 let (new_page_id, new_slot_id) =
                     HeapChain::insert(self.storage, self.page_ids.indexes, &new_data, txn_id)?;
                 self.txn.record_insert(
+                    self.conn,
                     SYSTEM_TABLE_INDEXES,
                     &key,
                     &new_data,
@@ -882,15 +943,18 @@ impl<'a> CatalogWriter<'a> {
         };
         let data = row.to_bytes();
 
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = self.conn.txn_id;
         let (page_id, slot_id) = HeapChain::insert(self.storage, constraints_root, &data, txn_id)?;
 
         let key = constraint_id.to_le_bytes();
-        self.txn
-            .record_insert(SYSTEM_TABLE_CONSTRAINTS, &key, &data, page_id, slot_id)?;
+        self.txn.record_insert(
+            self.conn,
+            SYSTEM_TABLE_CONSTRAINTS,
+            &key,
+            &data,
+            page_id,
+            slot_id,
+        )?;
 
         Ok(constraint_id)
     }
@@ -902,11 +966,8 @@ impl<'a> CatalogWriter<'a> {
     /// - Returns `Ok(())` silently if the constraint is not found (idempotent).
     pub fn drop_constraint(&mut self, constraint_id: u32) -> Result<(), DbError> {
         let constraints_root = CatalogBootstrap::ensure_constraints_root(self.storage)?;
-        let snap = self.txn.active_snapshot()?;
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
+        let snap = self.txn.active_snapshot(self.conn);
+        let txn_id = self.conn.txn_id;
 
         let rids = crate::reader::CatalogReader::scan_constraints_root(
             self.storage,
@@ -924,6 +985,7 @@ impl<'a> CatalogWriter<'a> {
                         txn_id,
                     )?;
                     self.txn.record_delete(
+                        self.conn,
                         SYSTEM_TABLE_CONSTRAINTS,
                         &key,
                         &data,
@@ -953,15 +1015,18 @@ impl<'a> CatalogWriter<'a> {
         let row = FkDef { fk_id, ..def };
         let data = row.to_bytes();
 
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
+        let txn_id = self.conn.txn_id;
         let (page_id, slot_id) = HeapChain::insert(self.storage, fk_root, &data, txn_id)?;
 
         let key = fk_id.to_le_bytes();
-        self.txn
-            .record_insert(SYSTEM_TABLE_FOREIGN_KEYS, &key, &data, page_id, slot_id)?;
+        self.txn.record_insert(
+            self.conn,
+            SYSTEM_TABLE_FOREIGN_KEYS,
+            &key,
+            &data,
+            page_id,
+            slot_id,
+        )?;
 
         Ok(fk_id)
     }
@@ -977,11 +1042,8 @@ impl<'a> CatalogWriter<'a> {
             Ok(ids) if ids.foreign_keys != 0 => ids.foreign_keys,
             _ => return Ok(()), // no FK table yet — nothing to drop
         };
-        let snap = self.txn.active_snapshot()?;
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
+        let snap = self.txn.active_snapshot(self.conn);
+        let txn_id = self.conn.txn_id;
 
         let rows = crate::reader::CatalogReader::scan_fk_root(self.storage, fk_root, snap)?;
         for (rid, data) in rows {
@@ -995,6 +1057,7 @@ impl<'a> CatalogWriter<'a> {
                         txn_id,
                     )?;
                     self.txn.record_delete(
+                        self.conn,
                         SYSTEM_TABLE_FOREIGN_KEYS,
                         &key,
                         &data,
@@ -1019,11 +1082,8 @@ impl<'a> CatalogWriter<'a> {
     /// Statistics writes are advisory — callers may ignore errors.
     pub fn upsert_stats(&mut self, def: StatsDef) -> Result<(), DbError> {
         let stats_root = CatalogBootstrap::ensure_stats_root(self.storage)?;
-        let snap = self.txn.active_snapshot()?;
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
+        let snap = self.txn.active_snapshot(self.conn);
+        let txn_id = self.conn.txn_id;
 
         // MVCC-delete existing row for this (table_id, col_idx) if present.
         let existing =
@@ -1043,6 +1103,7 @@ impl<'a> CatalogWriter<'a> {
                         txn_id,
                     )?;
                     self.txn.record_delete(
+                        self.conn,
                         SYSTEM_TABLE_STATS,
                         &key,
                         &old_data,
@@ -1063,7 +1124,7 @@ impl<'a> CatalogWriter<'a> {
         .concat();
         let (page_id, slot_id) = HeapChain::insert(self.storage, stats_root, &data, txn_id)?;
         self.txn
-            .record_insert(SYSTEM_TABLE_STATS, &key, &data, page_id, slot_id)?;
+            .record_insert(self.conn, SYSTEM_TABLE_STATS, &key, &data, page_id, slot_id)?;
         Ok(())
     }
 
@@ -1073,11 +1134,8 @@ impl<'a> CatalogWriter<'a> {
             Ok(ids) if ids.stats != 0 => ids.stats,
             _ => return Ok(()),
         };
-        let snap = self.txn.active_snapshot()?;
-        let txn_id = self
-            .txn
-            .active_txn_id()
-            .ok_or(DbError::NoActiveTransaction)?;
+        let snap = self.txn.active_snapshot(self.conn);
+        let txn_id = self.conn.txn_id;
         let existing =
             crate::reader::CatalogReader::scan_stats_root(self.storage, stats_root, snap)?;
         for (rid, old_data) in existing {
@@ -1090,6 +1148,7 @@ impl<'a> CatalogWriter<'a> {
                     .concat();
                     HeapChain::delete(self.storage, rid.page_id, rid.slot_id, txn_id)?;
                     self.txn.record_delete(
+                        self.conn,
                         SYSTEM_TABLE_STATS,
                         &key,
                         &old_data,
