@@ -309,27 +309,17 @@ SELECT CAST('100' AS BIGINT);    -- 100
 INSERT INTO users (age) VALUES (CAST('30' AS INT));
 ```
 
-<div class="callout callout-tip">
-<span class="callout-icon">💡</span>
-<div class="callout-body">
-<span class="callout-label">Current Limitation</span>
-<code>CAST(numeric AS TEXT)</code> — converting an integer or real value to text — is not
-supported in the current release and raises <code>22018 invalid_character_value_for_cast</code>.
-Use application-side formatting or wait for Phase 5 (full coercion matrix). The supported
-direction is <strong>text → number</strong>, not number → text.
-</div>
-</div>
+**Supported CAST pairs:**
 
-**Supported CAST pairs (Phase 4.16):**
-
-| From    | To                        | Notes                                 |
-|---------|---------------------------|---------------------------------------|
-| `TEXT`  | `INT`, `BIGINT`           | Entire string must be a valid integer |
-| `TEXT`  | `REAL`                    | Entire string must be a valid float   |
-| `TEXT`  | `DECIMAL`                 | Entire string must be a valid decimal |
-| `INT`   | `BIGINT`, `REAL`, `DECIMAL` | Widening — always succeeds          |
-| `BIGINT`| `REAL`, `DECIMAL`         | Widening — always succeeds            |
-| `NULL`  | any                       | Always returns NULL                   |
+| From    | To                              | Notes                                         |
+|---------|---------------------------------|-----------------------------------------------|
+| `TEXT`  | `INT`, `BIGINT`                 | Entire string must be a valid integer         |
+| `TEXT`  | `REAL`                          | Entire string must be a valid float           |
+| `TEXT`  | `DECIMAL`                       | Entire string must be a valid decimal         |
+| `INT`   | `BIGINT`, `REAL`, `DECIMAL`, `TEXT` | Widening or lossless stringify — always succeeds |
+| `BIGINT`| `REAL`, `DECIMAL`, `TEXT`       | Widening or lossless stringify — always succeeds |
+| `REAL`  | `TEXT`                          | Lossless stringify — always succeeds          |
+| `NULL`  | any                             | Always returns NULL                           |
 
 ### Conditional Functions
 
