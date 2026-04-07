@@ -69,7 +69,8 @@ impl<'a> CatalogReader<'a> {
         schema: &str,
         name: &str,
     ) -> Result<Option<TableDef>, DbError> {
-        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot)?;
+        let rows =
+            HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot.clone())?;
         for (_, _, data) in rows {
             let (def, _) = TableDef::from_bytes(&data)?;
             if def.schema_name == schema
@@ -86,7 +87,8 @@ impl<'a> CatalogReader<'a> {
     ///
     /// Returns `None` if no such table is visible to the current snapshot.
     pub fn get_table_by_id(&mut self, table_id: TableId) -> Result<Option<TableDef>, DbError> {
-        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot)?;
+        let rows =
+            HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot.clone())?;
         for (_, _, data) in rows {
             let (def, _) = TableDef::from_bytes(&data)?;
             if def.id == table_id {
@@ -102,7 +104,8 @@ impl<'a> CatalogReader<'a> {
     /// Used by the plan cache's dependency staleness check — cheaper than a
     /// full `get_table_by_id` when only the version counter is needed.
     pub fn get_table_schema_version(&mut self, table_id: TableId) -> Result<Option<u64>, DbError> {
-        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot)?;
+        let rows =
+            HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot.clone())?;
         for (_, _, data) in rows {
             let (def, _) = TableDef::from_bytes(&data)?;
             if def.id == table_id {
@@ -123,7 +126,8 @@ impl<'a> CatalogReader<'a> {
         database: &str,
         schema: &str,
     ) -> Result<Vec<TableDef>, DbError> {
-        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot)?;
+        let rows =
+            HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot.clone())?;
         let mut result = Vec::new();
         for (_, _, data) in rows {
             let (def, _) = TableDef::from_bytes(&data)?;
@@ -151,7 +155,7 @@ impl<'a> CatalogReader<'a> {
                 Ok(None)
             };
         }
-        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
         for (_, _, data) in rows {
             let (def, _) = DatabaseDef::from_bytes(&data)?;
             if def.name == name {
@@ -169,7 +173,7 @@ impl<'a> CatalogReader<'a> {
                 name: DEFAULT_DATABASE_NAME.to_string(),
             }]);
         }
-        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
         let mut out = Vec::new();
         for (_, _, data) in rows {
             let (def, _) = DatabaseDef::from_bytes(&data)?;
@@ -196,7 +200,7 @@ impl<'a> CatalogReader<'a> {
             // Legacy database: only `public` exists.
             return Ok(false);
         }
-        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
         for (_, _, data) in rows {
             let (def, _) = SchemaDef::from_bytes(&data)?;
             if def.database_name == database && def.name == schema {
@@ -205,7 +209,7 @@ impl<'a> CatalogReader<'a> {
         }
         // Legacy fallback: check if any visible table uses this schema name.
         let table_rows =
-            HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot)?;
+            HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot.clone())?;
         for (_, _, data) in table_rows {
             let (td, _) = TableDef::from_bytes(&data)?;
             if td.schema_name == schema {
@@ -224,7 +228,7 @@ impl<'a> CatalogReader<'a> {
         let root = self.page_ids.schemas;
         let mut out = Vec::new();
         if root != 0 {
-            let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+            let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
             for (_, _, data) in rows {
                 let (def, _) = SchemaDef::from_bytes(&data)?;
                 if def.database_name == database {
@@ -252,7 +256,7 @@ impl<'a> CatalogReader<'a> {
         if root == 0 {
             return Ok(None);
         }
-        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
         for (_, _, data) in rows {
             let (def, _) = TableDatabaseDef::from_bytes(&data)?;
             if def.table_id == table_id {
@@ -276,7 +280,8 @@ impl<'a> CatalogReader<'a> {
         &mut self,
         database: &str,
     ) -> Result<Vec<TableDef>, DbError> {
-        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot)?;
+        let rows =
+            HeapChain::scan_visible_ro(self.storage, self.page_ids.tables, self.snapshot.clone())?;
         let mut result = Vec::new();
         for (_, _, data) in rows {
             let (def, _) = TableDef::from_bytes(&data)?;
@@ -299,7 +304,8 @@ impl<'a> CatalogReader<'a> {
 
     /// Returns all visible columns for `table_id`, ordered by `col_idx`.
     pub fn list_columns(&mut self, table_id: TableId) -> Result<Vec<ColumnDef>, DbError> {
-        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.columns, self.snapshot)?;
+        let rows =
+            HeapChain::scan_visible_ro(self.storage, self.page_ids.columns, self.snapshot.clone())?;
         let mut result = Vec::new();
         for (_, _, data) in rows {
             let (def, _) = ColumnDef::from_bytes(&data)?;
@@ -315,7 +321,8 @@ impl<'a> CatalogReader<'a> {
 
     /// Returns all visible indexes for `table_id`.
     pub fn list_indexes(&mut self, table_id: TableId) -> Result<Vec<IndexDef>, DbError> {
-        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.indexes, self.snapshot)?;
+        let rows =
+            HeapChain::scan_visible_ro(self.storage, self.page_ids.indexes, self.snapshot.clone())?;
         let mut result = Vec::new();
         for (_, _, data) in rows {
             let (def, _) = IndexDef::from_bytes(&data)?;
@@ -328,7 +335,8 @@ impl<'a> CatalogReader<'a> {
 
     /// Returns the first visible index with the given `index_id`.
     pub fn get_index_by_id(&mut self, index_id: u32) -> Result<Option<IndexDef>, DbError> {
-        let rows = HeapChain::scan_visible_ro(self.storage, self.page_ids.indexes, self.snapshot)?;
+        let rows =
+            HeapChain::scan_visible_ro(self.storage, self.page_ids.indexes, self.snapshot.clone())?;
         for (_, _, data) in rows {
             let (def, _) = IndexDef::from_bytes(&data)?;
             if def.index_id == index_id {
@@ -346,7 +354,7 @@ impl<'a> CatalogReader<'a> {
         if root == 0 {
             return Ok(Vec::new()); // legacy database — no constraints table yet
         }
-        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
         let mut result = Vec::new();
         for (_, _, data) in rows {
             if let Ok((def, _)) = ConstraintDef::from_bytes(&data) {
@@ -368,7 +376,7 @@ impl<'a> CatalogReader<'a> {
         if root == 0 {
             return Ok(None);
         }
-        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
         for (_, _, data) in rows {
             if let Ok((def, _)) = ConstraintDef::from_bytes(&data) {
                 if def.table_id == table_id && def.name == name {
@@ -407,7 +415,7 @@ impl<'a> CatalogReader<'a> {
         if root == 0 {
             return Ok(Vec::new());
         }
-        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
         let mut result = Vec::new();
         for (_, _, data) in rows {
             if let Ok((def, _)) = FkDef::from_bytes(&data) {
@@ -431,7 +439,7 @@ impl<'a> CatalogReader<'a> {
         if root == 0 {
             return Ok(Vec::new());
         }
-        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
         let mut result = Vec::new();
         for (_, _, data) in rows {
             if let Ok((def, _)) = FkDef::from_bytes(&data) {
@@ -454,7 +462,7 @@ impl<'a> CatalogReader<'a> {
         if root == 0 {
             return Ok(None);
         }
-        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
         for (_, _, data) in rows {
             if let Ok((def, _)) = FkDef::from_bytes(&data) {
                 if def.child_table_id == child_table_id && def.name == name {
@@ -474,7 +482,7 @@ impl<'a> CatalogReader<'a> {
         if root == 0 {
             return Ok(None);
         }
-        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
         for (_, _, data) in rows {
             if let Ok((def, _)) = StatsDef::from_bytes(&data) {
                 if def.table_id == table_id && def.col_idx == col_idx {
@@ -492,7 +500,7 @@ impl<'a> CatalogReader<'a> {
         if root == 0 {
             return Ok(vec![]);
         }
-        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot)?;
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
         let mut result = Vec::new();
         for (_, _, data) in rows {
             if let Ok((def, _)) = StatsDef::from_bytes(&data) {

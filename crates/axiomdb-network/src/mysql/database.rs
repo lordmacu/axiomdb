@@ -243,10 +243,11 @@ impl Database {
         let is_ddl = is_schema_changing(&stmt);
 
         // ── analyze ───────────────────────────────────────────────────────────
-        let snap = self
-            .txn
-            .active_snapshot()
-            .unwrap_or_else(|_| self.txn.snapshot());
+        let snap = if let Some(ref ct) = session.conn_txn {
+            self.txn.active_snapshot(ct)
+        } else {
+            self.txn.snapshot()
+        };
         let analyzed = match analyze_cached_with_defaults(
             stmt,
             &self.storage,
@@ -310,10 +311,11 @@ impl Database {
         let stmt = parse(sql, None)?;
 
         // Analyze (uses &self.storage, &self.txn — shared refs)
-        let snap = self
-            .txn
-            .active_snapshot()
-            .unwrap_or_else(|_| self.txn.snapshot());
+        let snap = if let Some(ref ct) = session.conn_txn {
+            self.txn.active_snapshot(ct)
+        } else {
+            self.txn.snapshot()
+        };
         let analyzed = analyze_cached_with_defaults(
             stmt,
             &self.storage,
@@ -415,7 +417,9 @@ impl Database {
         match session.on_error {
             OnErrorMode::RollbackTransaction => {
                 if self.txn.active_txn_id().is_some() {
-                    let _ = self.txn.rollback(&mut self.storage);
+                    if let Some(conn) = session.conn_txn.take() {
+                        let _ = self.txn.rollback(conn, &mut self.storage);
+                    }
                 }
                 Err(err)
             }
@@ -426,7 +430,9 @@ impl Database {
             }
             OnErrorMode::Ignore => {
                 if self.txn.active_txn_id().is_some() {
-                    let _ = self.txn.rollback(&mut self.storage);
+                    if let Some(conn) = session.conn_txn.take() {
+                        let _ = self.txn.rollback(conn, &mut self.storage);
+                    }
                 }
                 Err(err)
             }
@@ -463,10 +469,11 @@ impl Database {
         let is_ddl = is_schema_changing(&stmt);
 
         // Fresh snapshot (same as execute_query — PostgreSQL model).
-        let snap = self
-            .txn
-            .active_snapshot()
-            .unwrap_or_else(|_| self.txn.snapshot());
+        let snap = if let Some(ref ct) = session.conn_txn {
+            self.txn.active_snapshot(ct)
+        } else {
+            self.txn.snapshot()
+        };
 
         // Analyze (resolve columns, type check).
         let analyzed = match analyze_cached_with_defaults(
@@ -545,9 +552,7 @@ impl Database {
 
     /// Returns a snapshot for plan cache analysis (outside a transaction).
     pub fn txn_snapshot_for_cache(&self) -> axiomdb_core::TransactionSnapshot {
-        self.txn
-            .active_snapshot()
-            .unwrap_or_else(|_| self.txn.snapshot())
+        self.txn.snapshot()
     }
 
     /// Returns a shared reference to the storage engine for read-only operations.
@@ -603,10 +608,7 @@ impl Database {
             _ => return None,
         };
         let schema = table_ref.schema.as_deref().unwrap_or(DEFAULT_DATABASE_NAME);
-        let snap = self
-            .txn
-            .active_snapshot()
-            .unwrap_or_else(|_| self.txn.snapshot());
+        let snap = self.txn.snapshot();
         CatalogReader::new(&self.storage, snap)
             .ok()?
             .get_table_in_database(database, schema, &table_ref.name)
@@ -616,10 +618,7 @@ impl Database {
 
     /// Returns `true` if a logical database exists in the catalog.
     pub fn database_exists(&self, name: &str) -> Result<bool, DbError> {
-        let snap = self
-            .txn
-            .active_snapshot()
-            .unwrap_or_else(|_| self.txn.snapshot());
+        let snap = self.txn.snapshot();
         let mut reader = CatalogReader::new(&self.storage, snap)?;
         reader.database_exists(name)
     }
@@ -864,7 +863,8 @@ mod tests {
         .expect("create table");
 
         session.on_error = OnErrorMode::Ignore;
-        db.txn.begin().expect("begin txn");
+        session.conn_txn = Some(db.txn.begin().expect("begin txn"));
+        session.in_explicit_txn = true;
 
         db.execute_query(
             "INSERT INTO t VALUES (1, 'alice@example.com')",
@@ -907,14 +907,14 @@ mod tests {
         .expect("create table");
 
         session.on_error = OnErrorMode::Ignore;
-        db.txn.begin().expect("begin txn");
+        let conn_txn = db.txn.begin().expect("begin txn");
+        let snap = db.txn.active_snapshot(&conn_txn);
+        session.conn_txn = Some(conn_txn);
 
         let analyzed = analyze_cached_with_defaults(
             parse("INSERT INTO t VALUES (1, 'alice@example.com')", None).expect("parse insert"),
             &db.storage,
-            db.txn
-                .active_snapshot()
-                .unwrap_or_else(|_| db.txn.snapshot()),
+            snap,
             session.effective_database(),
             session.current_schema(),
             &mut cache,
@@ -946,7 +946,7 @@ mod tests {
         let mut session = SessionContext::new();
 
         session.on_error = OnErrorMode::Ignore;
-        db.txn.begin().expect("begin txn");
+        session.conn_txn = Some(db.txn.begin().expect("begin txn"));
 
         let err = db
             .apply_on_error_pipeline_failure(
@@ -978,7 +978,7 @@ mod tests {
         };
         assert_eq!(rows, vec![vec![Value::Int(0)]]);
 
-        db.txn.begin().expect("begin txn");
+        session.conn_txn = Some(db.txn.begin().expect("begin txn"));
         let result = db
             .execute_read_query("SELECT @@in_transaction", &mut session, &mut cache)
             .expect("read-only @@in_transaction should see active txn");

@@ -583,8 +583,8 @@ mod tests {
         let storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal).unwrap();
 
-        mgr.begin().unwrap();
-        mgr.commit().unwrap();
+        let conn = mgr.begin().unwrap();
+        mgr.commit(conn).unwrap();
 
         assert!(!CrashRecovery::is_needed(&storage, &wal).unwrap());
     }
@@ -595,7 +595,7 @@ mod tests {
         let storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal).unwrap();
 
-        mgr.begin().unwrap();
+        let _conn = mgr.begin().unwrap();
         // Simulate crash: no commit
         drop(mgr);
 
@@ -629,10 +629,10 @@ mod tests {
         let mut storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal).unwrap();
 
-        mgr.begin().unwrap(); // txn 1
-        mgr.commit().unwrap();
-        mgr.begin().unwrap(); // txn 2
-        mgr.commit().unwrap();
+        let conn1 = mgr.begin().unwrap(); // txn 1
+        mgr.commit(conn1).unwrap();
+        let conn2 = mgr.begin().unwrap(); // txn 2
+        mgr.commit(conn2).unwrap();
 
         let result = CrashRecovery::recover(&mut storage, &wal).unwrap();
         assert_eq!(result.max_committed, 2);
@@ -648,12 +648,12 @@ mod tests {
         let page_id = fresh_data_page(&mut storage);
         let mut mgr = TxnManager::create(&wal).unwrap();
 
-        let txn_id = mgr.begin().unwrap();
+        let mut conn = mgr.begin().unwrap();
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
         let mut page = Page::from_bytes(page_bytes).unwrap();
-        let slot_id = insert_tuple(&mut page, b"data", txn_id).unwrap();
+        let slot_id = insert_tuple(&mut page, b"data", conn.txn_id).unwrap();
         storage.write_page(page_id, &page).unwrap();
-        mgr.record_insert(1, b"key", b"data", page_id, slot_id)
+        mgr.record_insert(&mut conn, 1, b"key", b"data", page_id, slot_id)
             .unwrap();
         // Simulate crash: drop flushes the BufWriter to disk without fsync.
         drop(mgr);
@@ -679,24 +679,24 @@ mod tests {
         let mut mgr = TxnManager::create(&wal).unwrap();
 
         // Commit an INSERT (txn 1).
-        let txn1 = mgr.begin().unwrap();
+        let mut conn1 = mgr.begin().unwrap();
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
         let mut page = Page::from_bytes(page_bytes).unwrap();
-        let slot_id = insert_tuple(&mut page, b"row", txn1).unwrap();
+        let slot_id = insert_tuple(&mut page, b"row", conn1.txn_id).unwrap();
         storage.write_page(page_id, &page).unwrap();
-        mgr.record_insert(1, b"k", b"row", page_id, slot_id)
+        mgr.record_insert(&mut conn1, 1, b"k", b"row", page_id, slot_id)
             .unwrap();
-        mgr.commit().unwrap();
+        mgr.commit(conn1).unwrap();
 
         // Crash during DELETE (txn 2).
-        let txn2 = mgr.begin().unwrap();
+        let mut conn2 = mgr.begin().unwrap();
         {
             let bytes = *storage.read_page(page_id).unwrap().as_bytes();
             let mut p = Page::from_bytes(bytes).unwrap();
-            axiomdb_storage::delete_tuple(&mut p, slot_id, txn2).unwrap();
+            axiomdb_storage::delete_tuple(&mut p, slot_id, conn2.txn_id).unwrap();
             storage.write_page(page_id, &p).unwrap();
         }
-        mgr.record_delete(1, b"k", b"row", page_id, slot_id)
+        mgr.record_delete(&mut conn2, 1, b"k", b"row", page_id, slot_id)
             .unwrap();
         drop(mgr); // simulate crash
 
@@ -718,24 +718,25 @@ mod tests {
         let mut mgr = TxnManager::create(&wal).unwrap();
 
         // Commit original row (txn 1).
-        let txn1 = mgr.begin().unwrap();
+        let mut conn1 = mgr.begin().unwrap();
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
         let mut page = Page::from_bytes(page_bytes).unwrap();
-        let old_slot = insert_tuple(&mut page, b"original", txn1).unwrap();
+        let old_slot = insert_tuple(&mut page, b"original", conn1.txn_id).unwrap();
         storage.write_page(page_id, &page).unwrap();
-        mgr.record_insert(1, b"k", b"original", page_id, old_slot)
+        mgr.record_insert(&mut conn1, 1, b"k", b"original", page_id, old_slot)
             .unwrap();
-        mgr.commit().unwrap();
+        mgr.commit(conn1).unwrap();
 
         // Crash during UPDATE (txn 2).
-        let txn2 = mgr.begin().unwrap();
+        let mut conn2 = mgr.begin().unwrap();
         {
             let bytes = *storage.read_page(page_id).unwrap().as_bytes();
             let mut p = Page::from_bytes(bytes).unwrap();
             let new_slot =
-                axiomdb_storage::update_tuple(&mut p, old_slot, b"updated", txn2).unwrap();
+                axiomdb_storage::update_tuple(&mut p, old_slot, b"updated", conn2.txn_id).unwrap();
             storage.write_page(page_id, &p).unwrap();
             mgr.record_update(
+                &mut conn2,
                 1,
                 b"k",
                 b"original",
@@ -769,26 +770,28 @@ mod tests {
         let page_id = fresh_data_page(&mut storage);
         let mut mgr = TxnManager::create(&wal).unwrap();
 
-        let txn1 = mgr.begin().unwrap();
+        let mut conn1 = mgr.begin().unwrap();
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
         let mut page = Page::from_bytes(page_bytes).unwrap();
-        let slot_id = insert_tuple(&mut page, b"original", txn1).unwrap();
+        let slot_id = insert_tuple(&mut page, b"original", conn1.txn_id).unwrap();
         storage.write_page(page_id, &page).unwrap();
-        mgr.record_insert(1, b"k", b"original", page_id, slot_id)
+        mgr.record_insert(&mut conn1, 1, b"k", b"original", page_id, slot_id)
             .unwrap();
-        mgr.commit().unwrap();
+        mgr.commit(conn1).unwrap();
 
-        let txn2 = mgr.begin().unwrap();
+        let mut conn2 = mgr.begin().unwrap();
         {
             let bytes = *storage.read_page(page_id).unwrap().as_bytes();
             let mut p = Page::from_bytes(bytes).unwrap();
-            let old_image = rewrite_tuple_same_slot(&mut p, slot_id, b"updated", txn2)
+            let old_image = rewrite_tuple_same_slot(&mut p, slot_id, b"updated", conn2.txn_id)
                 .unwrap()
                 .unwrap();
             let new_image = read_tuple_image(&p, slot_id).unwrap().unwrap();
             storage.write_page(page_id, &p).unwrap();
-            mgr.record_update_in_place(1, b"k", &old_image, &new_image, page_id, slot_id)
-                .unwrap();
+            mgr.record_update_in_place(
+                &mut conn2, 1, b"k", &old_image, &new_image, page_id, slot_id,
+            )
+            .unwrap();
         }
         drop(mgr);
 
@@ -811,12 +814,13 @@ mod tests {
         let page_id = fresh_data_page(&mut storage);
         let mut mgr = TxnManager::create(&wal).unwrap();
 
-        let txn_id = mgr.begin().unwrap();
+        let mut conn = mgr.begin().unwrap();
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
         let mut page = Page::from_bytes(page_bytes).unwrap();
-        let slot_id = insert_tuple(&mut page, b"x", txn_id).unwrap();
+        let slot_id = insert_tuple(&mut page, b"x", conn.txn_id).unwrap();
         storage.write_page(page_id, &page).unwrap();
-        mgr.record_insert(1, b"k", b"x", page_id, slot_id).unwrap();
+        mgr.record_insert(&mut conn, 1, b"k", b"x", page_id, slot_id)
+            .unwrap();
         drop(mgr); // simulate crash
 
         // First recovery.
@@ -838,26 +842,26 @@ mod tests {
         let mut mgr = TxnManager::create(&wal).unwrap();
 
         // Commit a row to delete later.
-        let txn1 = mgr.begin().unwrap();
+        let mut conn1 = mgr.begin().unwrap();
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
         let mut page = Page::from_bytes(page_bytes).unwrap();
-        let del_slot = insert_tuple(&mut page, b"deleteme", txn1).unwrap();
+        let del_slot = insert_tuple(&mut page, b"deleteme", conn1.txn_id).unwrap();
         storage.write_page(page_id, &page).unwrap();
-        mgr.record_insert(1, b"d", b"deleteme", page_id, del_slot)
+        mgr.record_insert(&mut conn1, 1, b"d", b"deleteme", page_id, del_slot)
             .unwrap();
-        mgr.commit().unwrap();
+        mgr.commit(conn1).unwrap();
 
         // Crash during txn2: INSERT row1, DELETE del_slot.
-        let txn2 = mgr.begin().unwrap();
+        let mut conn2 = mgr.begin().unwrap();
         {
             let bytes = *storage.read_page(page_id).unwrap().as_bytes();
             let mut p = Page::from_bytes(bytes).unwrap();
-            let ins_slot = insert_tuple(&mut p, b"newrow", txn2).unwrap();
-            axiomdb_storage::delete_tuple(&mut p, del_slot, txn2).unwrap();
+            let ins_slot = insert_tuple(&mut p, b"newrow", conn2.txn_id).unwrap();
+            axiomdb_storage::delete_tuple(&mut p, del_slot, conn2.txn_id).unwrap();
             storage.write_page(page_id, &p).unwrap();
-            mgr.record_insert(1, b"n", b"newrow", page_id, ins_slot)
+            mgr.record_insert(&mut conn2, 1, b"n", b"newrow", page_id, ins_slot)
                 .unwrap();
-            mgr.record_delete(1, b"d", b"deleteme", page_id, del_slot)
+            mgr.record_delete(&mut conn2, 1, b"d", b"deleteme", page_id, del_slot)
                 .unwrap();
         }
         drop(mgr); // crash
@@ -882,12 +886,12 @@ mod tests {
         let mut mgr = TxnManager::create(&wal).unwrap();
 
         // Commit txn 1, then checkpoint.
-        mgr.begin().unwrap();
-        mgr.commit().unwrap();
+        let conn1 = mgr.begin().unwrap();
+        mgr.commit(conn1).unwrap();
         mgr.rotate_wal(&mut storage, &wal).unwrap(); // checkpoint embedded in rotation
 
         // Crash txn 2 (in new WAL segment after rotation).
-        mgr.begin().unwrap();
+        let _conn2 = mgr.begin().unwrap();
         drop(mgr); // crash
 
         let result = CrashRecovery::recover(&mut storage, &wal).unwrap();
@@ -904,10 +908,10 @@ mod tests {
         let mut mgr = TxnManager::create(&wal).unwrap();
 
         // Commit txn 1.
-        mgr.begin().unwrap();
-        mgr.commit().unwrap();
+        let conn1 = mgr.begin().unwrap();
+        mgr.commit(conn1).unwrap();
         // Crash txn 2.
-        mgr.begin().unwrap();
+        let _conn2 = mgr.begin().unwrap();
         drop(mgr);
 
         let (mgr2, result) = TxnManager::open_with_recovery(&mut storage, &wal).unwrap();
@@ -931,13 +935,13 @@ mod tests {
             let mut mgr = TxnManager::create(&wal_path).unwrap();
 
             let page_id = storage.alloc_page(PageType::Data).unwrap();
-            let txn_id = mgr.begin().unwrap();
+            let mut conn = mgr.begin().unwrap();
             let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
             let mut page = Page::from_bytes(page_bytes).unwrap();
-            let slot_id = insert_tuple(&mut page, b"crash row", txn_id).unwrap();
+            let slot_id = insert_tuple(&mut page, b"crash row", conn.txn_id).unwrap();
             storage.write_page(page_id, &page).unwrap();
             storage.flush().unwrap(); // ensure page is on disk
-            mgr.record_insert(1, b"k", b"crash row", page_id, slot_id)
+            mgr.record_insert(&mut conn, 1, b"k", b"crash row", page_id, slot_id)
                 .unwrap();
             // Flush WAL buffer to OS (simulates kernel flushing on process exit).
             // Not fsynced — a real crash would not guarantee durability.
@@ -983,18 +987,18 @@ mod tests {
         let mut mgr = TxnManager::create(&wal).unwrap();
 
         // Txn 1: insert 5 rows + commit.
-        let txn1 = mgr.begin().unwrap();
+        let conn1 = mgr.begin().unwrap();
         for i in 0u8..5 {
-            HeapChain::insert(&mut storage, root_page_id, &[i; 8], txn1).unwrap();
+            HeapChain::insert(&mut storage, root_page_id, &[i; 8], conn1.txn_id).unwrap();
         }
-        mgr.commit().unwrap();
+        mgr.commit(conn1).unwrap();
 
         // Txn 2: delete_batch + record_truncate — then CRASH (no commit).
-        let txn2 = mgr.begin().unwrap();
-        let snap = mgr.active_snapshot().unwrap();
+        let mut conn2 = mgr.begin().unwrap();
+        let snap = mgr.active_snapshot(&conn2);
         let raw_rids = HeapChain::scan_rids_visible(&mut storage, root_page_id, snap).unwrap();
-        HeapChain::delete_batch(&mut storage, root_page_id, &raw_rids, txn2).unwrap();
-        mgr.record_truncate(1, root_page_id).unwrap();
+        HeapChain::delete_batch(&mut storage, root_page_id, &raw_rids, conn2.txn_id).unwrap();
+        mgr.record_truncate(&mut conn2, 1, root_page_id).unwrap();
         // Flush WAL buffer to disk (simulate kernel flush on crash).
         mgr.wal_mut().flush_buffer().unwrap();
         drop(mgr); // crash — no commit

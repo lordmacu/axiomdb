@@ -675,10 +675,12 @@ fn subst_expr_param(expr: Expr, params: &[Value]) -> Expr {
             expr,
             pattern,
             negated,
+            escape,
         } => Expr::Like {
             expr: Box::new(subst_expr_param(*expr, params)),
             pattern: Box::new(subst_expr_param(*pattern, params)),
             negated,
+            escape: escape.map(|e| Box::new(subst_expr_param(*e, params))),
         },
         Expr::In {
             expr,
