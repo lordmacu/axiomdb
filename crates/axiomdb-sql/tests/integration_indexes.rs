@@ -13,7 +13,7 @@
 
 use axiomdb_catalog::CatalogBootstrap;
 use axiomdb_core::error::DbError;
-use axiomdb_sql::{analyze, execute, parse, QueryResult};
+use axiomdb_sql::{analyze, execute, execute_snapshot, parse, QueryResult};
 use axiomdb_storage::MemoryStorage;
 use axiomdb_types::Value;
 use axiomdb_wal::TxnManager;
@@ -30,7 +30,7 @@ fn run_result(
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
     let stmt = parse(sql, None)?;
-    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let snap = execute_snapshot(txn);
     let analyzed = analyze(stmt, storage, snap)?;
     execute(analyzed, storage, txn)
 }
@@ -639,7 +639,7 @@ fn run_ctx_idx(
     ctx: &mut SessionContext,
 ) -> QueryResult {
     let stmt = parse(sql, None).unwrap();
-    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let snap = txn.snapshot();
     let analyzed = analyze(stmt, storage, snap).unwrap();
     execute_with_ctx(analyzed, storage, txn, bloom, ctx)
         .unwrap_or_else(|e| panic!("SQL failed: {sql}\nError: {e:?}"))
@@ -743,7 +743,7 @@ fn test_5_21_staged_flush_pk_index_correct() {
     run_ctx_idx("BEGIN", &mut storage, &mut txn, &mut bloom, &mut ctx);
     let e = {
         let stmt = parse("INSERT INTO pkt VALUES (1, 999)", None).unwrap();
-        let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+        let snap = txn.snapshot();
         let analyzed = analyze(stmt, &storage, snap).unwrap();
         execute_with_ctx(analyzed, &mut storage, &mut txn, &mut bloom, &mut ctx)
             .expect_err("expected UniqueViolation")

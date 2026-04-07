@@ -33,7 +33,7 @@ fn run_result(
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
     let stmt = parse(sql, None)?;
-    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let snap = txn.snapshot();
     let analyzed = analyze(stmt, storage, snap)?;
     execute(analyzed, storage, txn)
 }

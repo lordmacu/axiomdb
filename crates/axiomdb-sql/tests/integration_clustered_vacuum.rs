@@ -39,7 +39,7 @@ fn table_indexes(
     txn: &TxnManager,
     table_name: &str,
 ) -> Vec<IndexDef> {
-    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let snap = txn.snapshot();
     let mut reader = CatalogReader::new(storage, snap).unwrap();
     let table = reader.get_table("public", table_name).unwrap().unwrap();
     reader.list_indexes(table.id).unwrap()

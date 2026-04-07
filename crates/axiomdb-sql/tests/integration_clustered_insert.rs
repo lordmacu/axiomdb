@@ -209,8 +209,8 @@ fn clustered_insert_reuses_committed_delete_marked_primary_key() {
 
     // Advance TxnManager so later executor snapshots treat the synthetic
     // delete-mark as committed state.
-    txn.begin().unwrap();
-    txn.commit().unwrap();
+    let conn_txn = txn.begin().unwrap();
+    txn.commit(conn_txn).unwrap();
     assert_eq!(txn.max_committed(), delete_txn);
 
     run(

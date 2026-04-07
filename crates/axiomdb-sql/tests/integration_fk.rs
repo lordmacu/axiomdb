@@ -35,10 +35,11 @@ impl Db {
 
     fn run(&mut self, sql: &str) -> Result<QueryResult, DbError> {
         let stmt = parse(sql, None)?;
-        let snap = self
-            .txn
-            .active_snapshot()
-            .unwrap_or_else(|_| self.txn.snapshot());
+        let snap = if let Some(ref ct) = self.ctx.conn_txn {
+            self.txn.active_snapshot(ct)
+        } else {
+            self.txn.snapshot()
+        };
         let analyzed = analyze(stmt, &self.storage, snap)?;
         execute_with_ctx(
             analyzed,
@@ -98,12 +99,16 @@ fn test_create_table_persists_fk() {
 
 #[test]
 fn test_create_table_fk_has_composite_key_index() {
-    // Phase 6.9: FK auto-index is created with composite keys (fk_val | RecordId).
+    // Phase 6.9: FK auto-index is created with composite keys (fk_val | RecordId)
+    // for heap child tables. Heap child: no PRIMARY KEY → TableStorageLayout::Heap.
+    // Clustered child tables (with PRIMARY KEY) use full-scan enforcement instead
+    // (heap-RID composite format is incompatible with the clustered layout).
     let mut db = Db::new();
     setup!(
         db,
         "CREATE TABLE users (id INT PRIMARY KEY)",
-        "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT REFERENCES users(id))"
+        // No PRIMARY KEY on orders → heap layout → FK auto-index is created.
+        "CREATE TABLE orders (order_id INT, user_id INT REFERENCES users(id))"
     );
     let snap = db.snapshot();
     let mut reader = axiomdb_catalog::CatalogReader::new(&db.storage, snap).unwrap();
@@ -112,7 +117,7 @@ fn test_create_table_fk_has_composite_key_index() {
     assert_eq!(fks.len(), 1, "FK should be persisted in catalog");
     assert_ne!(
         fks[0].fk_index_id, 0,
-        "fk_index_id must be non-zero (auto-index created in 6.9)"
+        "fk_index_id must be non-zero for heap child table (auto-index created in 6.9)"
     );
 
     // The FK auto-index should be marked is_fk_index=true.
@@ -588,6 +593,7 @@ fn test_legacy_db_fk_root_zero_returns_empty() {
     let snap = TransactionSnapshot {
         snapshot_id: 0,
         current_txn_id: 0,
+        active_ids: std::sync::Arc::new(std::collections::HashSet::new()),
     };
     let mut reader = axiomdb_catalog::CatalogReader::new(&storage, snap).unwrap();
     assert_eq!(reader.list_fk_constraints(1).unwrap().len(), 0);

@@ -3,8 +3,8 @@
 use axiomdb_catalog::CatalogBootstrap;
 use axiomdb_core::error::DbError;
 use axiomdb_sql::{
-    analyze, analyze_with_defaults, bloom::BloomRegistry, execute, execute_with_ctx, parse,
-    QueryResult, SessionContext,
+    analyze, analyze_with_defaults, bloom::BloomRegistry, execute, execute_snapshot,
+    execute_with_ctx, parse, QueryResult, SessionContext,
 };
 use axiomdb_storage::MemoryStorage;
 use axiomdb_types::Value;
@@ -20,7 +20,7 @@ pub(crate) fn run_result(
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
     let stmt = parse(sql, None)?;
-    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let snap = execute_snapshot(txn);
     let analyzed = analyze(stmt, storage, snap)?;
     execute(analyzed, storage, txn)
 }
@@ -56,7 +56,11 @@ pub(crate) fn run_ctx(
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     let stmt = parse(sql, None)?;
-    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let snap = if let Some(ref ct) = ctx.conn_txn {
+        txn.active_snapshot(ct)
+    } else {
+        txn.snapshot()
+    };
     let analyzed = analyze_with_defaults(
         stmt,
         storage,
@@ -86,7 +90,11 @@ pub(crate) fn run_ctx_5_21(
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     let stmt = parse(sql, None)?;
-    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let snap = if let Some(ref ct) = ctx.conn_txn {
+        txn.active_snapshot(ct)
+    } else {
+        txn.snapshot()
+    };
     let analyzed = analyze(stmt, storage, snap)?;
     execute_with_ctx(analyzed, storage, txn, bloom, ctx)
 }

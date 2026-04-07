@@ -29,12 +29,12 @@ fn setup() -> (MemoryStorage, TxnManager) {
 fn test_resolve_table_by_default_schema() {
     let (mut storage, mut txn) = setup();
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     let table_id = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn).unwrap();
+        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
         w.create_table("public", "users").unwrap()
     };
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
     let mut resolver =
@@ -50,12 +50,12 @@ fn test_resolve_table_by_default_schema() {
 fn test_resolve_table_by_explicit_schema() {
     let (mut storage, mut txn) = setup();
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn).unwrap();
+        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
         w.create_table("analytics", "events").unwrap();
     }
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
     let mut resolver =
@@ -99,9 +99,9 @@ fn test_resolve_table_not_found_error_message_is_qualified() {
 fn test_resolve_table_columns_sorted_by_col_idx() {
     let (mut storage, mut txn) = setup();
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     let table_id = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn).unwrap();
+        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
         let tid = w.create_table("public", "users").unwrap();
         // Insert columns in reverse order.
         for (idx, name) in [(2u16, "email"), (0u16, "id"), (1u16, "username")] {
@@ -117,7 +117,7 @@ fn test_resolve_table_columns_sorted_by_col_idx() {
         }
         tid
     };
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
     let mut resolver =
@@ -138,9 +138,9 @@ fn test_resolve_table_columns_sorted_by_col_idx() {
 fn test_resolve_table_includes_indexes() {
     let (mut storage, mut txn) = setup();
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     let table_id = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn).unwrap();
+        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
         let tid = w.create_table("public", "orders").unwrap();
         w.create_index(IndexDef {
             index_id: 0,
@@ -176,7 +176,7 @@ fn test_resolve_table_includes_indexes() {
         .unwrap();
         tid
     };
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
     let mut resolver =
@@ -205,9 +205,9 @@ fn test_database_catalog_bootstrap_includes_default_database() {
 fn test_database_binding_separates_same_table_name_across_databases() {
     let (mut storage, mut txn) = setup();
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     let (default_table_id, analytics_table_id) = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn).unwrap();
+        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
         w.create_database("analytics").unwrap();
         let default_tid = w.create_table("public", "events").unwrap();
         let analytics_tid = w.create_table("public", "events").unwrap();
@@ -215,7 +215,7 @@ fn test_database_binding_separates_same_table_name_across_databases() {
             .unwrap();
         (default_tid, analytics_tid)
     };
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
     let mut reader = CatalogReader::new(&storage, snap).unwrap();
@@ -247,9 +247,9 @@ fn test_database_binding_separates_same_table_name_across_databases() {
 fn test_resolve_column_found() {
     let (mut storage, mut txn) = setup();
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     let table_id = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn).unwrap();
+        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
         let tid = w.create_table("public", "users").unwrap();
         w.create_column(ColumnDef {
             table_id: tid,
@@ -271,7 +271,7 @@ fn test_resolve_column_found() {
         .unwrap();
         tid
     };
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
     let mut resolver =
@@ -287,9 +287,9 @@ fn test_resolve_column_found() {
 fn test_resolve_column_not_found_returns_column_not_found_error() {
     let (mut storage, mut txn) = setup();
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     let table_id = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn).unwrap();
+        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
         let tid = w.create_table("public", "users").unwrap();
         w.create_column(ColumnDef {
             table_id: tid,
@@ -302,7 +302,7 @@ fn test_resolve_column_not_found_returns_column_not_found_error() {
         .unwrap();
         tid
     };
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
     let mut resolver =
@@ -329,12 +329,12 @@ fn test_resolve_column_not_found_returns_column_not_found_error() {
 fn test_table_exists_returns_true_for_committed_table() {
     let (mut storage, mut txn) = setup();
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn).unwrap();
+        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
         w.create_table("public", "products").unwrap();
     }
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
     let mut resolver =
@@ -355,12 +355,12 @@ fn test_table_exists_returns_false_for_nonexistent_table() {
 fn test_table_exists_respects_schema() {
     let (mut storage, mut txn) = setup();
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn).unwrap();
+        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
         w.create_table("analytics", "events").unwrap();
     }
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
     let mut resolver =
@@ -380,9 +380,9 @@ fn test_mvcc_resolver_does_not_see_uncommitted_table() {
     // Snapshot taken before the table is created.
     let snap_before = txn.snapshot();
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn).unwrap();
+        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
         w.create_table("public", "invisible").unwrap();
     }
     // Not committed yet — old snapshot must not see it.
@@ -390,7 +390,7 @@ fn test_mvcc_resolver_does_not_see_uncommitted_table() {
         SchemaResolver::new(&storage, snap_before, DEFAULT_DATABASE_NAME, "public").unwrap();
     assert!(!resolver_old.table_exists(None, "invisible").unwrap());
 
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     // New snapshot after commit sees it.
     let snap_after = txn.snapshot();

@@ -62,7 +62,7 @@ fn test_crash_recovery_freelist_survives() {
     let allocated_ids: Vec<u64>;
 
     {
-        let mut engine = MmapStorage::create(&db_path).expect("create");
+        let engine = MmapStorage::create(&db_path).expect("create");
         allocated_ids = (0..5)
             .map(|_| engine.alloc_page(PageType::Data).expect("alloc"))
             .collect();
@@ -73,7 +73,7 @@ fn test_crash_recovery_freelist_survives() {
 
     // After reopening, the freelist remembers which pages were in use.
     {
-        let mut engine = MmapStorage::open(&db_path).expect("reopen");
+        let engine = MmapStorage::open(&db_path).expect("reopen");
         // The first free ID must be `allocated_ids[0]` (it was freed).
         let next = engine.alloc_page(PageType::Data).expect("alloc");
         assert_eq!(
@@ -97,7 +97,7 @@ fn test_crash_recovery_multiple_grows() {
     let count_after_grows;
 
     {
-        let mut engine = MmapStorage::create(&db_path).expect("create");
+        let engine = MmapStorage::create(&db_path).expect("create");
         // Exhaust initial capacity to force two grows.
         let initial = engine.page_count();
         for _ in 0..(initial - 2 + 64 + 1) {
@@ -199,7 +199,7 @@ fn test_box_dyn_storage_engine_memory() {
 fn test_mmap_auto_grow_on_exhaustion() {
     let dir = tmp_dir();
     let db_path = dir.path().join("grow.db");
-    let mut engine = MmapStorage::create(&db_path).expect("create");
+    let engine = MmapStorage::create(&db_path).expect("create");
     let initial_count = engine.page_count();
 
     // Exhaust initial pages.
@@ -220,7 +220,7 @@ fn test_mmap_auto_grow_on_exhaustion() {
 
 #[test]
 fn test_memory_auto_grow_on_exhaustion() {
-    let mut engine = MemoryStorage::new();
+    let engine = MemoryStorage::new();
     let initial = engine.page_count();
     for _ in 0..(initial - 2) {
         engine.alloc_page(PageType::Data).expect("alloc");
@@ -236,7 +236,7 @@ fn test_memory_auto_grow_on_exhaustion() {
 fn test_flush_empty_dirty_set_succeeds() {
     // No writes → flush must succeed without touching any pages.
     let dir = tmp_dir();
-    let mut engine = MmapStorage::create(&dir.path().join("empty_flush.db")).expect("create");
+    let engine = MmapStorage::create(&dir.path().join("empty_flush.db")).expect("create");
     // After create() the dirty tracker is empty (create flushed internally).
     assert_eq!(engine.dirty_page_count(), 0);
     engine.flush().expect("flush on clean state must succeed");
@@ -301,14 +301,14 @@ fn test_flush_freelist_only_change() {
     let allocated;
 
     {
-        let mut engine = MmapStorage::create(&db_path).expect("create");
+        let engine = MmapStorage::create(&db_path).expect("create");
         allocated = engine.alloc_page(PageType::Data).expect("alloc");
         engine.flush().expect("flush after freelist change");
     }
 
     // Reopen — freelist must remember `allocated` is in use.
     {
-        let mut engine = MmapStorage::open(&db_path).expect("reopen");
+        let engine = MmapStorage::open(&db_path).expect("reopen");
         let next = engine.alloc_page(PageType::Data).expect("alloc");
         assert_ne!(
             next, allocated,

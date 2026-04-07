@@ -335,9 +335,9 @@ fn install_primary_index(
     }
 
     let final_root = root_pid.load(Ordering::Acquire);
-    txn.begin().expect("begin catalog txn for PK install");
+    let mut conn_txn = txn.begin().expect("begin catalog txn for PK install");
     {
-        let mut writer = CatalogWriter::new(storage, txn).expect("catalog writer");
+        let mut writer = CatalogWriter::new(storage, txn, &mut conn_txn).expect("catalog writer");
         writer
             .create_index(IndexDef {
                 index_id: 0,
@@ -356,7 +356,7 @@ fn install_primary_index(
             })
             .expect("create primary index catalog row");
     }
-    txn.commit().expect("commit PK install");
+    txn.commit(conn_txn).expect("commit PK install");
 }
 
 fn alloc_empty_index_root(storage: &mut MemoryStorage) -> u64 {

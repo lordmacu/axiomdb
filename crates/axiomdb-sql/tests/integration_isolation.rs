@@ -25,7 +25,7 @@ fn run_ctx(
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     let stmt = parse(sql, None)?;
-    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let snap = txn.snapshot();
     let analyzed = analyze_with_defaults(
         stmt,
         storage,
@@ -232,8 +232,8 @@ fn test_repeatable_read_sees_frozen_snapshot() {
     // In single-writer model, we can't do concurrent writes inside an active txn.
     // Instead, we verify the snapshot is frozen by checking snapshot_id doesn't change.
     // The structural test: active_snapshot() returns the same snapshot_id each time.
-    let snap1 = txn.active_snapshot().unwrap();
-    let snap2 = txn.active_snapshot().unwrap();
+    let snap1 = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
+    let snap2 = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
     assert_eq!(
         snap1.snapshot_id, snap2.snapshot_id,
         "RR snapshot must be frozen"
@@ -278,7 +278,7 @@ fn test_read_committed_snapshot_refreshes() {
     run_ctx("BEGIN", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
 
     // Verify snapshot is NOT frozen — snapshot_id uses current max_committed
-    let snap1 = txn.active_snapshot().unwrap();
+    let snap1 = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
     // In single-writer, max_committed doesn't change mid-txn (we hold the lock).
     // But structurally, RC returns max_committed+1 which may differ from
     // the frozen snapshot_id_at_begin if commits happened between BEGIN and now.
@@ -491,8 +491,8 @@ fn test_serializable_uses_frozen_snapshot() {
     run_ctx("BEGIN", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
 
     // Frozen snapshot (same as RR)
-    let snap1 = txn.active_snapshot().unwrap();
-    let snap2 = txn.active_snapshot().unwrap();
+    let snap1 = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
+    let snap2 = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
     assert_eq!(snap1.snapshot_id, snap2.snapshot_id);
 
     run_ctx("COMMIT", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
@@ -524,8 +524,8 @@ fn test_next_txn_isolation_consumed() {
 
     // Next BEGIN uses session default (RR)
     run_ctx("BEGIN", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
-    let snap1 = txn.active_snapshot().unwrap();
-    let snap2 = txn.active_snapshot().unwrap();
+    let snap1 = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
+    let snap2 = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
     assert_eq!(
         snap1.snapshot_id, snap2.snapshot_id,
         "should be RR (frozen)"

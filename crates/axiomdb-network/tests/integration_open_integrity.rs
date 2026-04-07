@@ -26,15 +26,15 @@ fn rewrite_server_index_root(
         .into_iter()
         .find(|idx| idx.name == target_index_name)
         .unwrap_or_else(|| panic!("index {target_index_name} missing on {table_name}"));
-    txn.begin().expect("begin catalog txn");
+    let mut conn_txn = txn.begin().expect("begin catalog txn");
     {
-        let mut writer =
-            axiomdb_catalog::CatalogWriter::new(&mut storage, &mut txn).expect("catalog writer");
+        let mut writer = axiomdb_catalog::CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn)
+            .expect("catalog writer");
         writer
             .update_index_root(target.index_id, new_root)
             .expect("rewrite root");
     }
-    txn.commit().expect("commit catalog txn");
+    txn.commit(conn_txn).expect("commit catalog txn");
     storage.flush().expect("flush corrupted index");
 }
 

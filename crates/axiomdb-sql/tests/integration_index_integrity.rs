@@ -66,7 +66,7 @@ fn run_sql(
     sql: &str,
 ) -> Result<QueryResult, DbError> {
     let stmt = parse(sql, None)?;
-    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let snap = txn.snapshot();
     let analyzed = analyze(stmt, storage, snap)?;
     execute_with_ctx(analyzed, storage, txn, bloom, ctx)
 }
@@ -94,14 +94,15 @@ fn rewrite_index_root(db: &DiskDb, table_name: &str, index_name: &str, new_root_
     let mut storage = MmapStorage::open(&db.db_path).expect("open db");
     let mut txn = TxnManager::open(&db.wal_path).expect("open wal");
     let idx = load_index(&storage, &txn, table_name, index_name);
-    txn.begin().expect("begin catalog txn");
+    let mut conn_txn = txn.begin().expect("begin catalog txn");
     {
-        let mut writer = CatalogWriter::new(&mut storage, &mut txn).expect("catalog writer");
+        let mut writer =
+            CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).expect("catalog writer");
         writer
             .update_index_root(idx.index_id, new_root_page_id)
             .expect("update index root");
     }
-    txn.commit().expect("commit catalog txn");
+    txn.commit(conn_txn).expect("commit catalog txn");
     storage.flush().expect("flush rewritten catalog");
 }
 

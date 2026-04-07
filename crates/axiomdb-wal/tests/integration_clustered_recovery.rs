@@ -5,7 +5,9 @@ use axiomdb_storage::{
     clustered_tree::{self, ClusteredRow},
     MemoryStorage, RowHeader, StorageEngine,
 };
-use axiomdb_wal::{ClusteredFieldPatchEntry, ClusteredRowImage, FieldDelta, TxnManager};
+use axiomdb_wal::{
+    ClusteredFieldPatchEntry, ClusteredRowImage, ConnectionTxn, FieldDelta, TxnManager,
+};
 use tempfile::TempDir;
 
 const TABLE_ID: u32 = 39;
@@ -32,13 +34,14 @@ fn row_image(root_pid: u64, row: &ClusteredRow) -> ClusteredRowImage {
 fn apply_clustered_field_patch(
     storage: &mut MemoryStorage,
     mgr: &mut TxnManager,
+    conn_txn: &mut ConnectionTxn,
     root_pid: u64,
-    txn_id: u64,
     key: &[u8],
     offset: usize,
     old_bytes: &[u8],
     new_bytes: &[u8],
 ) {
+    let txn_id = conn_txn.txn_id;
     let leaf = clustered_tree::descend_to_leaf_pub(storage, root_pid, key)
         .expect("descend to clustered leaf");
     let pos = clustered_leaf::search(&leaf, key).expect("find clustered row");
@@ -82,6 +85,7 @@ fn apply_clustered_field_patch(
         .expect("write patched clustered leaf");
 
     mgr.record_clustered_field_patch_batch(
+        conn_txn,
         TABLE_ID,
         root_pid,
         &[ClusteredFieldPatchEntry {
@@ -131,7 +135,8 @@ fn crash_recovery_undoes_uncommitted_clustered_insert() {
     let mut storage = MemoryStorage::new();
     let mut mgr = TxnManager::create(&wal_path).expect("create wal");
 
-    let txn1 = mgr.begin().expect("begin seed txn");
+    let mut conn1 = mgr.begin().expect("begin seed txn");
+    let txn1 = conn1.txn_id;
     let seed_key = 10u32.to_be_bytes();
     let seed_payload = b"seed".to_vec();
     let mut root = Some(
@@ -146,11 +151,12 @@ fn crash_recovery_undoes_uncommitted_clustered_insert() {
     );
     let seed_image =
         ClusteredRowImage::new(root.expect("seed root"), row_header(txn1), &seed_payload);
-    mgr.record_clustered_insert(TABLE_ID, &seed_key, &seed_image)
+    mgr.record_clustered_insert(&mut conn1, TABLE_ID, &seed_key, &seed_image)
         .expect("record seed insert");
-    mgr.commit().expect("commit seed txn");
+    mgr.commit(conn1).expect("commit seed txn");
 
-    let txn2 = mgr.begin().expect("begin crash txn");
+    let mut conn2 = mgr.begin().expect("begin crash txn");
+    let txn2 = conn2.txn_id;
     for key in 0u32..64 {
         let key_bytes = (1000 + key).to_be_bytes();
         let payload = vec![key as u8; 300];
@@ -161,7 +167,7 @@ fn crash_recovery_undoes_uncommitted_clustered_insert() {
         );
         let image =
             ClusteredRowImage::new(root.expect("root after crash insert"), header, &payload);
-        mgr.record_clustered_insert(TABLE_ID, &key_bytes, &image)
+        mgr.record_clustered_insert(&mut conn2, TABLE_ID, &key_bytes, &image)
             .expect("record crash insert");
     }
     drop(mgr);
@@ -199,18 +205,20 @@ fn crash_recovery_restores_clustered_delete_mark() {
     let mut storage = MemoryStorage::new();
     let mut mgr = TxnManager::create(&wal_path).expect("create wal");
 
-    let txn1 = mgr.begin().expect("begin seed txn");
+    let mut conn1 = mgr.begin().expect("begin seed txn");
+    let txn1 = conn1.txn_id;
     let key = b"pk-delete";
     let payload = b"live-row".to_vec();
     let root = clustered_tree::insert(&mut storage, None, key, &row_header(txn1), &payload)
         .expect("seed clustered row");
     let image = ClusteredRowImage::new(root, row_header(txn1), &payload);
-    mgr.record_clustered_insert(TABLE_ID, key, &image)
+    mgr.record_clustered_insert(&mut conn1, TABLE_ID, key, &image)
         .expect("record seed insert");
-    mgr.commit().expect("commit seed txn");
+    mgr.commit(conn1).expect("commit seed txn");
 
-    let txn2 = mgr.begin().expect("begin crash delete txn");
-    let snapshot = mgr.active_snapshot().expect("active snapshot");
+    let mut conn2 = mgr.begin().expect("begin crash delete txn");
+    let txn2 = conn2.txn_id;
+    let snapshot = mgr.active_snapshot(&conn2);
     let old_row = clustered_tree::lookup(&storage, Some(root), key, &snapshot)
         .expect("lookup old row")
         .expect("old row exists");
@@ -230,7 +238,7 @@ fn crash_recovery_restores_clustered_delete_mark() {
         },
         &old_row.row_data,
     );
-    mgr.record_clustered_delete_mark(TABLE_ID, key, &old_image, &new_image)
+    mgr.record_clustered_delete_mark(&mut conn2, TABLE_ID, key, &old_image, &new_image)
         .expect("record clustered delete-mark");
     drop(mgr);
 
@@ -255,18 +263,20 @@ fn crash_recovery_restores_overflow_backed_clustered_update() {
     let mut storage = MemoryStorage::new();
     let mut mgr = TxnManager::create(&wal_path).expect("create wal");
 
-    let txn1 = mgr.begin().expect("begin seed txn");
+    let mut conn1 = mgr.begin().expect("begin seed txn");
+    let txn1 = conn1.txn_id;
     let key = b"pk-overflow";
     let old_payload = vec![7u8; 12_000];
     let root = clustered_tree::insert(&mut storage, None, key, &row_header(txn1), &old_payload)
         .expect("seed overflow-backed row");
     let image = ClusteredRowImage::new(root, row_header(txn1), &old_payload);
-    mgr.record_clustered_insert(TABLE_ID, key, &image)
+    mgr.record_clustered_insert(&mut conn1, TABLE_ID, key, &image)
         .expect("record seed insert");
-    mgr.commit().expect("commit seed txn");
+    mgr.commit(conn1).expect("commit seed txn");
 
-    let txn2 = mgr.begin().expect("begin crash update txn");
-    let snapshot = mgr.active_snapshot().expect("active snapshot");
+    let mut conn2 = mgr.begin().expect("begin crash update txn");
+    let txn2 = conn2.txn_id;
+    let snapshot = mgr.active_snapshot(&conn2);
     let old_row = clustered_tree::lookup(&storage, Some(root), key, &snapshot)
         .expect("lookup old row")
         .expect("old row exists");
@@ -294,7 +304,7 @@ fn crash_recovery_restores_overflow_backed_clustered_update() {
         },
         &new_payload,
     );
-    mgr.record_clustered_update(TABLE_ID, key, &old_image, &new_image)
+    mgr.record_clustered_update(&mut conn2, TABLE_ID, key, &old_image, &new_image)
         .expect("record clustered update");
     drop(mgr);
 
@@ -320,7 +330,8 @@ fn crash_recovery_restores_relocate_update_logically() {
     let mut storage = MemoryStorage::new();
     let mut mgr = TxnManager::create(&wal_path).expect("create wal");
 
-    let txn1 = mgr.begin().expect("begin seed txn");
+    let mut conn1 = mgr.begin().expect("begin seed txn");
+    let txn1 = conn1.txn_id;
     let mut root = None;
     for key in 0u32..7 {
         let key_bytes = key.to_be_bytes();
@@ -330,17 +341,18 @@ fn crash_recovery_restores_relocate_update_logically() {
                 .expect("seed split-tree row"),
         );
         let image = ClusteredRowImage::new(root.expect("seed root"), row_header(txn1), &payload);
-        mgr.record_clustered_insert(TABLE_ID, &key_bytes, &image)
+        mgr.record_clustered_insert(&mut conn1, TABLE_ID, &key_bytes, &image)
             .expect("record seed insert");
     }
-    mgr.commit().expect("commit seed txn");
+    mgr.commit(conn1).expect("commit seed txn");
 
     let root = mgr
         .clustered_root(TABLE_ID)
         .expect("clustered root after seed");
     let key = 3u32.to_be_bytes();
-    let txn2 = mgr.begin().expect("begin crash relocate txn");
-    let snapshot = mgr.active_snapshot().expect("active snapshot");
+    let mut conn2 = mgr.begin().expect("begin crash relocate txn");
+    let txn2 = conn2.txn_id;
+    let snapshot = mgr.active_snapshot(&conn2);
     let old_row = clustered_tree::lookup(&storage, Some(root), &key, &snapshot)
         .expect("lookup old row")
         .expect("old row exists");
@@ -359,7 +371,7 @@ fn crash_recovery_restores_relocate_update_logically() {
         .expect("relocated row exists");
     let old_image = row_image(root_after, &old_row);
     let new_image = row_image(root_after, &new_row);
-    mgr.record_clustered_update(TABLE_ID, &key, &old_image, &new_image)
+    mgr.record_clustered_update(&mut conn2, TABLE_ID, &key, &old_image, &new_image)
         .expect("record relocate update");
     drop(mgr);
 
@@ -387,21 +399,31 @@ fn crash_recovery_undoes_uncommitted_clustered_field_patch() {
     let mut storage = MemoryStorage::new();
     let mut mgr = TxnManager::create(&wal_path).expect("create wal");
 
-    let txn1 = mgr.begin().expect("begin seed txn");
+    let mut conn1 = mgr.begin().expect("begin seed txn");
+    let txn1 = conn1.txn_id;
     let key = b"pk-field-patch";
     let original = b"abcdefghijklmnop".to_vec();
     let root = clustered_tree::insert(&mut storage, None, key, &row_header(txn1), &original)
         .expect("seed clustered row");
     let image = ClusteredRowImage::new(root, row_header(txn1), &original);
-    mgr.record_clustered_insert(TABLE_ID, key, &image)
+    mgr.record_clustered_insert(&mut conn1, TABLE_ID, key, &image)
         .expect("record seed insert");
-    mgr.commit().expect("commit seed txn");
+    mgr.commit(conn1).expect("commit seed txn");
 
     let root = mgr
         .clustered_root(TABLE_ID)
         .expect("clustered root after seed");
-    let txn2 = mgr.begin().expect("begin field patch txn");
-    apply_clustered_field_patch(&mut storage, &mut mgr, root, txn2, key, 4, b"efgh", b"WXYZ");
+    let mut conn2 = mgr.begin().expect("begin field patch txn");
+    apply_clustered_field_patch(
+        &mut storage,
+        &mut mgr,
+        &mut conn2,
+        root,
+        key,
+        4,
+        b"efgh",
+        b"WXYZ",
+    );
     drop(mgr);
 
     let (mgr2, result) = TxnManager::open_with_recovery(&mut storage, &wal_path)
@@ -427,22 +449,33 @@ fn clean_reopen_handles_committed_clustered_field_patch_entries() {
     let mut storage = MemoryStorage::new();
     let mut mgr = TxnManager::create(&wal_path).expect("create wal");
 
-    let txn1 = mgr.begin().expect("begin seed txn");
+    let mut conn1 = mgr.begin().expect("begin seed txn");
+    let txn1 = conn1.txn_id;
     let key = b"pk-field-patch";
     let original = b"abcdefghijklmnop".to_vec();
     let root = clustered_tree::insert(&mut storage, None, key, &row_header(txn1), &original)
         .expect("seed clustered row");
     let image = ClusteredRowImage::new(root, row_header(txn1), &original);
-    mgr.record_clustered_insert(TABLE_ID, key, &image)
+    mgr.record_clustered_insert(&mut conn1, TABLE_ID, key, &image)
         .expect("record seed insert");
-    mgr.commit().expect("commit seed txn");
+    mgr.commit(conn1).expect("commit seed txn");
 
     let root = mgr
         .clustered_root(TABLE_ID)
         .expect("clustered root after seed");
-    let txn2 = mgr.begin().expect("begin field patch txn");
-    apply_clustered_field_patch(&mut storage, &mut mgr, root, txn2, key, 4, b"efgh", b"WXYZ");
-    mgr.commit().expect("commit field patch txn");
+    let mut conn2 = mgr.begin().expect("begin field patch txn");
+    let txn2 = conn2.txn_id;
+    apply_clustered_field_patch(
+        &mut storage,
+        &mut mgr,
+        &mut conn2,
+        root,
+        key,
+        4,
+        b"efgh",
+        b"WXYZ",
+    );
+    mgr.commit(conn2).expect("commit field patch txn");
     drop(mgr);
 
     let (mgr2, result) = TxnManager::open_with_recovery(&mut storage, &wal_path)
@@ -469,17 +502,19 @@ fn clean_reopen_restores_last_committed_clustered_root() {
     let mut storage = MemoryStorage::new();
     let mut mgr = TxnManager::create(&wal_path).expect("create wal");
 
-    let txn1 = mgr.begin().expect("begin first txn");
+    let mut conn1 = mgr.begin().expect("begin first txn");
+    let txn1 = conn1.txn_id;
     let key1 = 1u32.to_be_bytes();
     let payload1 = b"row-1".to_vec();
     let root1 = clustered_tree::insert(&mut storage, None, &key1, &row_header(txn1), &payload1)
         .expect("insert first committed row");
     let image1 = ClusteredRowImage::new(root1, row_header(txn1), &payload1);
-    mgr.record_clustered_insert(TABLE_ID, &key1, &image1)
+    mgr.record_clustered_insert(&mut conn1, TABLE_ID, &key1, &image1)
         .expect("record first insert");
-    mgr.commit().expect("commit first txn");
+    mgr.commit(conn1).expect("commit first txn");
 
-    let txn2 = mgr.begin().expect("begin second txn");
+    let mut conn2 = mgr.begin().expect("begin second txn");
+    let txn2 = conn2.txn_id;
     let mut root = Some(root1);
     for key in 2u32..48 {
         let key_bytes = key.to_be_bytes();
@@ -490,10 +525,10 @@ fn clean_reopen_restores_last_committed_clustered_root() {
         );
         let image =
             ClusteredRowImage::new(root.expect("root after insert"), row_header(txn2), &payload);
-        mgr.record_clustered_insert(TABLE_ID, &key_bytes, &image)
+        mgr.record_clustered_insert(&mut conn2, TABLE_ID, &key_bytes, &image)
             .expect("record committed insert");
     }
-    mgr.commit().expect("commit second txn");
+    mgr.commit(conn2).expect("commit second txn");
     let committed_root = mgr
         .clustered_root(TABLE_ID)
         .expect("committed clustered root");
