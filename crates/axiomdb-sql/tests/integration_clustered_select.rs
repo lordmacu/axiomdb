@@ -325,12 +325,13 @@ fn clustered_select_hides_uncommitted_rows_from_older_snapshot() {
     );
 
     let snap_before = writer.snapshot();
-    let mut reader = CatalogReader::new(&storage, snap_before).unwrap();
+    let mut reader = CatalogReader::new(&storage, snap_before.clone()).unwrap();
     let table = reader.get_table("public", "users").unwrap().unwrap();
     let columns = reader.list_columns(table.id).unwrap();
     let key = encode_index_key(&[Value::Int(1)]).unwrap();
 
-    writer.begin().unwrap();
+    // Use explicit BEGIN via run() so the ConnectionTxn flows through the thread-local.
+    run("BEGIN", &mut storage, &mut writer);
     run(
         "INSERT INTO users VALUES (1, 'Alice')",
         &mut storage,
@@ -343,8 +344,7 @@ fn clustered_select_hides_uncommitted_rows_from_older_snapshot() {
             .is_none(),
         "snapshot opened before the clustered insert must not see the uncommitted row"
     );
-
-    writer.commit().unwrap();
+    run("COMMIT", &mut storage, &mut writer);
     let visible =
         lookup_clustered_row(&storage, &table, &columns, &key, writer.snapshot()).unwrap();
     let (_, values) = visible.expect("committed clustered row must be visible");

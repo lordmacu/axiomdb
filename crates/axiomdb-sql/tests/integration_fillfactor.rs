@@ -38,10 +38,11 @@ impl Db {
 
     fn run(&mut self, sql: &str) -> Result<QueryResult, DbError> {
         let stmt = parse(sql, None)?;
-        let snap = self
-            .txn
-            .active_snapshot()
-            .unwrap_or_else(|_| self.txn.snapshot());
+        let snap = if let Some(ref ct) = self.ctx.conn_txn {
+            self.txn.active_snapshot(ct)
+        } else {
+            self.txn.snapshot()
+        };
         let analyzed = analyze(stmt, &self.storage, snap)?;
         execute_with_ctx(
             analyzed,

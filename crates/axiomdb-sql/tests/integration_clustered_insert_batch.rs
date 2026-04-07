@@ -16,6 +16,7 @@ fn ok(
         .unwrap_or_else(|e| panic!("SQL failed: {sql}\nError: {e:?}"))
 }
 
+#[allow(dead_code)]
 fn count(result: QueryResult) -> u64 {
     match result {
         QueryResult::Affected { count, .. } => count,

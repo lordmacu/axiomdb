@@ -34,9 +34,10 @@ impl Fixture {
 
     /// Create a table with given columns and return table_id.
     fn create_table(&mut self, name: &str, cols: &[(&str, ColumnType)]) -> u32 {
-        self.txn.begin().unwrap();
+        let mut conn_txn = self.txn.begin().unwrap();
         let table_id = {
-            let mut w = CatalogWriter::new(&mut self.storage, &mut self.txn).unwrap();
+            let mut w =
+                CatalogWriter::new(&mut self.storage, &mut self.txn, &mut conn_txn).unwrap();
             let tid = w.create_table("public", name).unwrap();
             for (i, (col_name, col_type)) in cols.iter().enumerate() {
                 w.create_column(ColumnDef {
@@ -51,7 +52,7 @@ impl Fixture {
             }
             tid
         };
-        self.txn.commit().unwrap();
+        self.txn.commit(conn_txn).unwrap();
         table_id
     }
 

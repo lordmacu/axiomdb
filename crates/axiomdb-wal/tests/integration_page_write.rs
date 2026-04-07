@@ -13,7 +13,7 @@ use axiomdb_storage::{
     heap::{insert_tuple, read_tuple},
     MmapStorage, Page, PageType, StorageEngine,
 };
-use axiomdb_wal::{CrashRecovery, EntryType, TxnManager, WalEntry, WalReader};
+use axiomdb_wal::{ConnectionTxn, CrashRecovery, EntryType, TxnManager, WalEntry, WalReader};
 use tempfile::TempDir;
 
 // ── TestEnv ───────────────────────────────────────────────────────────────────
@@ -41,14 +41,14 @@ fn make_storage_with_page(env: &TestEnv) -> (MmapStorage, u64) {
     (storage, page_id)
 }
 
-// Insert rows into a page and return (page_id, Vec<slot_id>).
+// Insert rows into a page and return Vec<slot_id>.
 fn insert_rows_on_page(
     storage: &mut MmapStorage,
-    txn: &mut TxnManager,
+    conn: &ConnectionTxn,
     page_id: u64,
     rows: &[&[u8]],
 ) -> Vec<u16> {
-    let txn_id = txn.active_txn_id().unwrap();
+    let txn_id = conn.txn_id;
     let raw = *storage.read_page(page_id).unwrap().as_bytes();
     let mut page = Page::from_bytes(raw).unwrap();
     let mut slot_ids = Vec::new();
@@ -113,9 +113,9 @@ fn test_record_page_writes_empty_is_noop() {
     let (_, _) = make_storage_with_page(&env);
     let mut txn = TxnManager::create(&env.wal).unwrap();
 
-    txn.begin().unwrap();
-    txn.record_page_writes(1, &[]).unwrap();
-    txn.commit().unwrap();
+    let mut conn = txn.begin().unwrap();
+    txn.record_page_writes(&mut conn, 1, &[]).unwrap();
+    txn.commit(conn).unwrap();
     // No panic, no error.
 }
 
@@ -125,15 +125,11 @@ fn test_record_page_writes_produces_readable_wal_entries() {
     let (mut storage, page_id) = make_storage_with_page(&env);
     let mut txn = TxnManager::create(&env.wal).unwrap();
 
-    txn.begin().unwrap();
-    let slot_ids = insert_rows_on_page(
-        &mut storage,
-        &mut txn,
-        page_id,
-        &[b"row0", b"row1", b"row2"],
-    );
-    txn.record_page_writes(1, &[(page_id, &slot_ids)]).unwrap();
-    txn.commit().unwrap();
+    let mut conn = txn.begin().unwrap();
+    let slot_ids = insert_rows_on_page(&mut storage, &conn, page_id, &[b"row0", b"row1", b"row2"]);
+    txn.record_page_writes(&mut conn, 1, &[(page_id, &slot_ids)])
+        .unwrap();
+    txn.commit(conn).unwrap();
 
     // Read back WAL and find the PageWrite entry.
     let reader = WalReader::open(&env.wal).unwrap();
@@ -176,14 +172,15 @@ fn test_crash_recovery_undoes_uncommitted_page_write() {
     let (mut storage, page_id) = make_storage_with_page(&env);
     let mut txn = TxnManager::create(&env.wal).unwrap();
 
-    txn.begin().unwrap();
+    let mut conn = txn.begin().unwrap();
     let slot_ids = insert_rows_on_page(
         &mut storage,
-        &mut txn,
+        &conn,
         page_id,
         &[b"should be lost", b"also lost", b"gone too"],
     );
-    txn.record_page_writes(1, &[(page_id, &slot_ids)]).unwrap();
+    txn.record_page_writes(&mut conn, 1, &[(page_id, &slot_ids)])
+        .unwrap();
     // Flush to OS page cache (simulates crash — WAL in kernel buffer, no fsync).
     // Drop without commit: undo_ops lost, WAL has Begin+PageWrite but no Commit.
     drop(txn);
@@ -214,15 +211,16 @@ fn test_committed_page_write_rows_visible_after_restart() {
     let (mut storage, page_id) = make_storage_with_page(&env);
     let mut txn = TxnManager::create(&env.wal).unwrap();
 
-    txn.begin().unwrap();
+    let mut conn = txn.begin().unwrap();
     let slot_ids = insert_rows_on_page(
         &mut storage,
-        &mut txn,
+        &conn,
         page_id,
         &[b"row_a", b"row_b", b"row_c"],
     );
-    txn.record_page_writes(1, &[(page_id, &slot_ids)]).unwrap();
-    txn.commit().unwrap(); // fsync — durable
+    txn.record_page_writes(&mut conn, 1, &[(page_id, &slot_ids)])
+        .unwrap();
+    txn.commit(conn).unwrap(); // fsync — durable
 
     drop(txn);
 
@@ -254,9 +252,10 @@ fn test_page_write_recovery_is_idempotent() {
     let (mut storage, page_id) = make_storage_with_page(&env);
     let mut txn = TxnManager::create(&env.wal).unwrap();
 
-    txn.begin().unwrap();
-    let slot_ids = insert_rows_on_page(&mut storage, &mut txn, page_id, &[b"idempotent"]);
-    txn.record_page_writes(1, &[(page_id, &slot_ids)]).unwrap();
+    let mut conn = txn.begin().unwrap();
+    let slot_ids = insert_rows_on_page(&mut storage, &conn, page_id, &[b"idempotent"]);
+    txn.record_page_writes(&mut conn, 1, &[(page_id, &slot_ids)])
+        .unwrap();
     drop(txn); // no commit
 
     // First recovery

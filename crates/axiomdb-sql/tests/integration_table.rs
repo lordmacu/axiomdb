@@ -58,10 +58,11 @@ fn test_table_engine_insert_and_scan() {
     ];
     let table_def = create_table_helper(&mut storage, &mut txn, "users", &columns);
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     TableEngine::insert_row(
         &mut storage,
         &mut txn,
+        &mut conn_txn,
         &table_def,
         &columns,
         vec![Value::Int(1), Value::Text("alice".into())],
@@ -70,6 +71,7 @@ fn test_table_engine_insert_and_scan() {
     TableEngine::insert_row(
         &mut storage,
         &mut txn,
+        &mut conn_txn,
         &table_def,
         &columns,
         vec![Value::Int(2), Value::Text("bob".into())],
@@ -78,12 +80,13 @@ fn test_table_engine_insert_and_scan() {
     TableEngine::insert_row(
         &mut storage,
         &mut txn,
+        &mut conn_txn,
         &table_def,
         &columns,
         vec![Value::Int(3), Value::Text("carol".into())],
     )
     .unwrap();
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
     let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
@@ -109,16 +112,17 @@ fn test_table_engine_insert_mvcc_visibility() {
     // Snapshot taken BEFORE the insert.
     let snap_before = txn.snapshot();
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     TableEngine::insert_row(
         &mut storage,
         &mut txn,
+        &mut conn_txn,
         &table_def,
         &columns,
         vec![Value::Int(42)],
     )
     .unwrap();
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     // Old snapshot sees 0 rows.
     let rows_old =
@@ -145,10 +149,11 @@ fn test_table_engine_delete_row() {
     let table_def = create_table_helper(&mut storage, &mut txn, "t", &columns);
 
     // Insert 2 rows.
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     let rid1 = TableEngine::insert_row(
         &mut storage,
         &mut txn,
+        &mut conn_txn,
         &table_def,
         &columns,
         vec![Value::Int(1)],
@@ -157,17 +162,18 @@ fn test_table_engine_delete_row() {
     TableEngine::insert_row(
         &mut storage,
         &mut txn,
+        &mut conn_txn,
         &table_def,
         &columns,
         vec![Value::Int(2)],
     )
     .unwrap();
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     // Delete row 1.
-    txn.begin().unwrap();
-    TableEngine::delete_row(&mut storage, &mut txn, &table_def, rid1).unwrap();
-    txn.commit().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
+    TableEngine::delete_row(&mut storage, &mut txn, &mut conn_txn, &table_def, rid1).unwrap();
+    txn.commit(conn_txn).unwrap();
 
     // Scan sees only row 2.
     let snap = txn.snapshot();
@@ -188,25 +194,27 @@ fn test_table_engine_delete_invalid_slot_error() {
     let columns = vec![col(0, "id", ColumnType::Int)];
     let table_def = create_table_helper(&mut storage, &mut txn, "t", &columns);
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     let rid = TableEngine::insert_row(
         &mut storage,
         &mut txn,
+        &mut conn_txn,
         &table_def,
         &columns,
         vec![Value::Int(1)],
     )
     .unwrap();
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     // Use a slot_id that is guaranteed to be out of range.
     let bad_rid = RecordId {
         page_id: rid.page_id,
         slot_id: 9999,
     };
-    txn.begin().unwrap();
-    let err = TableEngine::delete_row(&mut storage, &mut txn, &table_def, bad_rid).unwrap_err();
-    txn.rollback(&mut storage).unwrap();
+    let mut conn_txn = txn.begin().unwrap();
+    let err = TableEngine::delete_row(&mut storage, &mut txn, &mut conn_txn, &table_def, bad_rid)
+        .unwrap_err();
+    txn.rollback(conn_txn, &mut storage).unwrap();
     assert!(
         matches!(err, axiomdb_core::error::DbError::InvalidSlot { .. }),
         "expected InvalidSlot for out-of-range slot, got {err:?}"
@@ -227,29 +235,31 @@ fn test_table_engine_update_row() {
     ];
     let table_def = create_table_helper(&mut storage, &mut txn, "t", &columns);
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     let old_rid = TableEngine::insert_row(
         &mut storage,
         &mut txn,
+        &mut conn_txn,
         &table_def,
         &columns,
         vec![Value::Int(1), Value::Int(30)],
     )
     .unwrap();
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     // Update age from 30 to 31.
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     let new_rid = TableEngine::update_row(
         &mut storage,
         &mut txn,
+        &mut conn_txn,
         &table_def,
         &columns,
         old_rid,
         vec![Value::Int(1), Value::Int(31)],
     )
     .unwrap();
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
     let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
@@ -277,28 +287,30 @@ fn test_table_engine_update_changes_record_id() {
     let columns = vec![col(0, "v", ColumnType::Int)];
     let table_def = create_table_helper(&mut storage, &mut txn, "t", &columns);
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     let old_rid = TableEngine::insert_row(
         &mut storage,
         &mut txn,
+        &mut conn_txn,
         &table_def,
         &columns,
         vec![Value::Int(10)],
     )
     .unwrap();
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     let new_rid = TableEngine::update_row(
         &mut storage,
         &mut txn,
+        &mut conn_txn,
         &table_def,
         &columns,
         old_rid,
         vec![Value::Int(20)],
     )
     .unwrap();
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     // The new RecordId is valid and the value was updated.
     let snap = txn.snapshot();
@@ -326,16 +338,17 @@ fn test_table_engine_coercion_on_insert() {
     let table_def = create_table_helper(&mut storage, &mut txn, "t", &columns);
 
     // Insert Text("42") into an INT column — coercion must convert it to Int(42).
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     TableEngine::insert_row(
         &mut storage,
         &mut txn,
+        &mut conn_txn,
         &table_def,
         &columns,
         vec![Value::Text("42".into())],
     )
     .unwrap();
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
     let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
@@ -348,28 +361,35 @@ fn test_table_engine_coercion_on_insert() {
 }
 
 #[test]
-fn test_table_engine_insert_outside_txn_error() {
+fn test_table_engine_insert_type_mismatch_error() {
+    // Verifies that passing wrong number of values returns TypeMismatch.
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("w.wal");
     let mut storage = MemoryStorage::new();
     CatalogBootstrap::init(&mut storage).unwrap();
     let mut txn = TxnManager::create(&wal_path).unwrap();
 
-    let columns = vec![col(0, "id", ColumnType::Int)];
+    let columns = vec![
+        col(0, "id", ColumnType::Int),
+        col(1, "name", ColumnType::Text),
+    ];
     let table_def = create_table_helper(&mut storage, &mut txn, "t", &columns);
 
-    // No txn.begin() — must fail with NoActiveTransaction.
+    // Pass only 1 value for 2 columns — must fail with TypeMismatch.
+    let mut conn_txn = txn.begin().unwrap();
     let err = TableEngine::insert_row(
         &mut storage,
         &mut txn,
+        &mut conn_txn,
         &table_def,
         &columns,
-        vec![Value::Int(1)],
+        vec![Value::Int(1)], // only 1 value for 2 columns
     )
     .unwrap_err();
+    txn.rollback(conn_txn, &mut storage).unwrap();
     assert!(
-        matches!(err, axiomdb_core::error::DbError::NoActiveTransaction),
-        "expected NoActiveTransaction, got {err:?}"
+        matches!(err, axiomdb_core::error::DbError::TypeMismatch { .. }),
+        "expected TypeMismatch, got {err:?}"
     );
 }
 
@@ -385,31 +405,33 @@ fn test_table_engine_scan_respects_snapshot() {
     let table_def = create_table_helper(&mut storage, &mut txn, "t", &columns);
 
     // Insert row A.
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     TableEngine::insert_row(
         &mut storage,
         &mut txn,
+        &mut conn_txn,
         &table_def,
         &columns,
         vec![Value::Int(1)],
     )
     .unwrap();
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     // Snapshot after A committed — sees 1 row.
     let snap_after_a = txn.snapshot();
 
     // Insert row B.
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     TableEngine::insert_row(
         &mut storage,
         &mut txn,
+        &mut conn_txn,
         &table_def,
         &columns,
         vec![Value::Int(2)],
     )
     .unwrap();
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     // snap_after_a must still see only row A.
     let rows =
@@ -441,18 +463,19 @@ fn test_table_engine_chain_growth() {
     let big = vec![0xABu8; 4000];
     let n_rows = 20usize;
 
-    txn.begin().unwrap();
+    let mut conn_txn = txn.begin().unwrap();
     for _ in 0..n_rows {
         TableEngine::insert_row(
             &mut storage,
             &mut txn,
+            &mut conn_txn,
             &table_def,
             &columns,
             vec![Value::Bytes(big.clone())],
         )
         .unwrap();
     }
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
     let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
@@ -471,8 +494,8 @@ fn create_table_helper(
     name: &str,
     columns: &[ColumnDef],
 ) -> TableDef {
-    txn.begin().unwrap();
-    let mut writer = CatalogWriter::new(storage, txn).unwrap();
+    let mut conn_txn = txn.begin().unwrap();
+    let mut writer = CatalogWriter::new(storage, txn, &mut conn_txn).unwrap();
     let table_id = writer.create_table("public", name).unwrap();
     for (i, col) in columns.iter().enumerate() {
         writer
@@ -487,7 +510,7 @@ fn create_table_helper(
             .unwrap();
     }
     drop(writer);
-    txn.commit().unwrap();
+    txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
     let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap).unwrap();

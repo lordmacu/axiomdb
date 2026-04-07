@@ -25,8 +25,8 @@ fn row_header(txn_id: u64) -> RowHeader {
 }
 
 fn prime_max_committed(mgr: &mut TxnManager) {
-    mgr.begin().expect("begin prime txn");
-    mgr.commit().expect("commit prime txn");
+    let conn = mgr.begin().expect("begin prime txn");
+    mgr.commit(conn).expect("commit prime txn");
 }
 
 fn row_image(root_pid: u64, row: &ClusteredRow) -> ClusteredRowImage {
@@ -56,7 +56,8 @@ fn clustered_insert_rollback_handles_root_changes() {
     let mut mgr = TxnManager::create(&wal_path).expect("create wal");
     let mut storage = MemoryStorage::new();
 
-    let txn_id = mgr.begin().expect("begin clustered txn");
+    let mut conn = mgr.begin().expect("begin clustered txn");
+    let txn_id = conn.txn_id;
     let mut root = None;
 
     for key in 0u32..128 {
@@ -68,11 +69,11 @@ fn clustered_insert_rollback_handles_root_changes() {
                 .expect("clustered insert"),
         );
         let image = ClusteredRowImage::new(root.unwrap(), header, &payload);
-        mgr.record_clustered_insert(TABLE_ID, &key_bytes, &image)
+        mgr.record_clustered_insert(&mut conn, TABLE_ID, &key_bytes, &image)
             .expect("record clustered insert");
     }
 
-    mgr.rollback(&mut storage)
+    mgr.rollback(conn, &mut storage)
         .expect("rollback clustered inserts");
 
     let root_after = mgr
@@ -97,8 +98,9 @@ fn clustered_delete_mark_rollback_restores_old_row() {
     let root = clustered_tree::insert(&mut storage, None, key, &row_header(1), &payload)
         .expect("seed clustered row");
 
-    let txn_id = mgr.begin().expect("begin delete-mark txn");
-    let snapshot = mgr.active_snapshot().expect("active snapshot");
+    let mut conn = mgr.begin().expect("begin delete-mark txn");
+    let txn_id = conn.txn_id;
+    let snapshot = mgr.active_snapshot(&conn);
     let old_row = clustered_tree::lookup(&storage, Some(root), key, &snapshot)
         .expect("lookup old row")
         .expect("old row exists");
@@ -120,10 +122,10 @@ fn clustered_delete_mark_rollback_restores_old_row() {
         },
         &old_row.row_data,
     );
-    mgr.record_clustered_delete_mark(TABLE_ID, key, &old_image, &new_image)
+    mgr.record_clustered_delete_mark(&mut conn, TABLE_ID, key, &old_image, &new_image)
         .expect("record clustered delete-mark");
 
-    mgr.rollback(&mut storage)
+    mgr.rollback(conn, &mut storage)
         .expect("rollback clustered delete-mark");
 
     let root_after = mgr
@@ -151,8 +153,9 @@ fn clustered_update_rollback_restores_old_overflow_backed_row() {
     let root = clustered_tree::insert(&mut storage, None, key, &row_header(1), &old_payload)
         .expect("seed overflow-backed row");
 
-    let txn_id = mgr.begin().expect("begin update txn");
-    let snapshot = mgr.active_snapshot().expect("active snapshot");
+    let mut conn = mgr.begin().expect("begin update txn");
+    let txn_id = conn.txn_id;
+    let snapshot = mgr.active_snapshot(&conn);
     let old_row = clustered_tree::lookup(&storage, Some(root), key, &snapshot)
         .expect("lookup old row")
         .expect("overflow-backed row exists");
@@ -181,10 +184,10 @@ fn clustered_update_rollback_restores_old_overflow_backed_row() {
         },
         &new_payload,
     );
-    mgr.record_clustered_update(TABLE_ID, key, &old_image, &new_image)
+    mgr.record_clustered_update(&mut conn, TABLE_ID, key, &old_image, &new_image)
         .expect("record clustered update");
 
-    mgr.rollback(&mut storage)
+    mgr.rollback(conn, &mut storage)
         .expect("rollback clustered overflow update");
 
     let root_after = mgr
@@ -222,8 +225,9 @@ fn clustered_relocate_update_rollback_restores_old_row() {
 
     let root = root.expect("seed root");
     let key = 3u32.to_be_bytes();
-    let txn_id = mgr.begin().expect("begin relocate-update txn");
-    let snapshot = mgr.active_snapshot().expect("active snapshot");
+    let mut conn = mgr.begin().expect("begin relocate-update txn");
+    let txn_id = conn.txn_id;
+    let snapshot = mgr.active_snapshot(&conn);
     let old_row = clustered_tree::lookup(&storage, Some(root), &key, &snapshot)
         .expect("lookup old row")
         .expect("old row exists");
@@ -245,10 +249,10 @@ fn clustered_relocate_update_rollback_restores_old_row() {
 
     let old_image = row_image(root_after, &old_row);
     let new_image = row_image(root_after, &new_row);
-    mgr.record_clustered_update(TABLE_ID, &key, &old_image, &new_image)
+    mgr.record_clustered_update(&mut conn, TABLE_ID, &key, &old_image, &new_image)
         .expect("record relocate update");
 
-    mgr.rollback(&mut storage)
+    mgr.rollback(conn, &mut storage)
         .expect("rollback relocate update");
 
     let root_final = mgr
@@ -272,7 +276,8 @@ fn clustered_savepoint_undoes_only_late_writes() {
     let mut mgr = TxnManager::create(&wal_path).expect("create wal");
     let mut storage = MemoryStorage::new();
 
-    let txn_id = mgr.begin().expect("begin clustered txn");
+    let mut conn = mgr.begin().expect("begin clustered txn");
+    let txn_id = conn.txn_id;
     let mut root = None;
     let key1 = 1u32.to_be_bytes();
     let key2 = 2u32.to_be_bytes();
@@ -282,26 +287,26 @@ fn clustered_savepoint_undoes_only_late_writes() {
             .expect("insert first row"),
     );
     let image1 = ClusteredRowImage::new(root.unwrap(), row_header(txn_id), b"row-1");
-    mgr.record_clustered_insert(TABLE_ID, &key1, &image1)
+    mgr.record_clustered_insert(&mut conn, TABLE_ID, &key1, &image1)
         .expect("record first insert");
 
-    let sp = mgr.savepoint();
+    let sp = mgr.savepoint(&conn);
 
     root = Some(
         clustered_tree::insert(&mut storage, root, &key2, &row_header(txn_id), b"row-2")
             .expect("insert second row"),
     );
     let image2 = ClusteredRowImage::new(root.unwrap(), row_header(txn_id), b"row-2");
-    mgr.record_clustered_insert(TABLE_ID, &key2, &image2)
+    mgr.record_clustered_insert(&mut conn, TABLE_ID, &key2, &image2)
         .expect("record second insert");
 
-    mgr.rollback_to_savepoint(sp, &mut storage)
+    mgr.rollback_to_savepoint(&mut conn, sp, &mut storage)
         .expect("rollback to savepoint");
 
     let root_after = mgr
         .clustered_root(TABLE_ID)
         .expect("clustered root after savepoint");
-    let snapshot = mgr.active_snapshot().expect("active snapshot");
+    let snapshot = mgr.active_snapshot(&conn);
 
     let first = clustered_tree::lookup(&storage, Some(root_after), &key1, &snapshot)
         .expect("lookup first row");

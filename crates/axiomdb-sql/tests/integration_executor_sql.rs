@@ -423,12 +423,11 @@ fn test_cast_text_to_bigint() {
 }
 
 #[test]
-fn test_cast_int_to_text_not_supported_in_strict() {
-    // CAST uses strict mode; Int→Text conversion is not allowed in strict mode.
-    // Use CAST with supported conversions (Text→Int is supported, Int→Text is not).
+fn test_cast_int_to_text() {
+    // Int→Text is lossless and always allowed (strict and permissive alike).
     let (mut storage, mut txn) = setup();
-    let err = run_result("SELECT CAST(123 AS TEXT)", &mut storage, &mut txn);
-    assert!(matches!(err, Err(DbError::InvalidCoercion { .. })));
+    let r = rows(run("SELECT CAST(123 AS TEXT)", &mut storage, &mut txn));
+    assert_eq!(r[0][0], Value::Text("123".into()));
 }
 
 #[test]

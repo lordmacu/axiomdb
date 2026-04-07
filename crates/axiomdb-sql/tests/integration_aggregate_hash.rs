@@ -5,9 +5,7 @@
 /// (non_agg_col_indices path), HAVING with non-agg column, and mixed-type SUM.
 mod common;
 
-use axiomdb_storage::MemoryStorage;
 use axiomdb_types::Value;
-use axiomdb_wal::TxnManager;
 
 use common::{rows, run, setup};
 

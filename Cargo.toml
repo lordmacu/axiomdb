@@ -88,6 +88,9 @@ percent-encoding = "2"
 # SQL lexer — DFA-based tokenizer
 logos = "0.14"
 
+# Regular expression engine (REGEXP/RLIKE operator)
+regex = "1"
+
 # Character-set transcoding (MySQL transport layer)
 encoding_rs = "0.8"
 socket2 = "0.5"
@@ -102,7 +105,9 @@ axiomdb-index   = { path = "crates/axiomdb-index" }
 
 [profile.dev]
 opt-level = 0
-debug     = true
+debug     = 1             # line tables only — faster link, same backtraces
+codegen-units = 256       # max parallelism inside each crate
+split-debuginfo = "unpacked"  # macOS: keep .dSYM separate → faster linking
 
 [profile.release]
 opt-level       = 3

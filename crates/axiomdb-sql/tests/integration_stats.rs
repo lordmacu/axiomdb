@@ -36,10 +36,11 @@ impl Db {
     }
     fn run(&mut self, sql: &str) -> Result<QueryResult, DbError> {
         let stmt = parse(sql, None)?;
-        let snap = self
-            .txn
-            .active_snapshot()
-            .unwrap_or_else(|_| self.txn.snapshot());
+        let snap = if let Some(ref ct) = self.ctx.conn_txn {
+            self.txn.active_snapshot(ct)
+        } else {
+            self.txn.snapshot()
+        };
         let analyzed = analyze(stmt, &self.storage, snap)?;
         execute_with_ctx(
             analyzed,
@@ -187,6 +188,7 @@ fn test_pre_610_database_no_stats_root() {
     let snap = axiomdb_core::TransactionSnapshot {
         snapshot_id: 0,
         current_txn_id: 0,
+        active_ids: std::sync::Arc::new(std::collections::HashSet::new()),
     };
     let mut reader = axiomdb_catalog::CatalogReader::new(&storage, snap).unwrap();
     let stats = reader.list_stats(1).unwrap();
@@ -299,8 +301,8 @@ fn test_planner_uses_scan_for_low_cardinality() {
         cols.iter().find(|c| c.name == "code").unwrap().col_idx
     };
     // upsert_stats requires an active transaction.
-    db.txn.begin().unwrap();
-    CatalogWriter::new(&mut db.storage, &mut db.txn)
+    let mut conn_txn = db.txn.begin().unwrap();
+    CatalogWriter::new(&mut db.storage, &mut db.txn, &mut conn_txn)
         .unwrap()
         .upsert_stats(axiomdb_catalog::StatsDef {
             table_id,
@@ -309,7 +311,7 @@ fn test_planner_uses_scan_for_low_cardinality() {
             ndv: 3,
         })
         .unwrap();
-    db.txn.commit().unwrap();
+    db.txn.commit(conn_txn).unwrap();
     // Invalidate session cache so the planner reloads fresh stats.
     db.ctx
         .invalidate_table(axiomdb_catalog::DEFAULT_DATABASE_NAME, "public", "t");

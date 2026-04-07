@@ -498,6 +498,7 @@ fn like(e: Expr, p: Expr) -> Expr {
         expr: Box::new(e),
         pattern: Box::new(p),
         negated: false,
+        escape: None,
     }
 }
 fn not_like(e: Expr, p: Expr) -> Expr {
@@ -505,6 +506,7 @@ fn not_like(e: Expr, p: Expr) -> Expr {
         expr: Box::new(e),
         pattern: Box::new(p),
         negated: true,
+        escape: None,
     }
 }
 
@@ -660,6 +662,7 @@ fn test_nested_where_age_and_name() {
             expr: Box::new(col(1)),
             pattern: Box::new(text("A%")),
             negated: false,
+            escape: None,
         },
     );
     assert_eq!(ok_row(expr, &row), Value::Bool(true));
@@ -677,6 +680,7 @@ fn test_nested_null_age_excluded() {
             expr: Box::new(col(1)),
             pattern: Box::new(text("A%")),
             negated: false,
+            escape: None,
         },
     );
     let result = ok_row(expr, &row);
@@ -725,4 +729,206 @@ fn test_between_via_and_equivalence() {
         binop(BinaryOp::LtEq, col(0), int(10)),
     );
     assert_eq!(ok_row(via_between, &row), ok_row(via_and, &row));
+}
+
+// ── G4: REGEXP / RLIKE ────────────────────────────────────────────────────────
+
+#[test]
+fn test_regexp_match() {
+    assert_eq!(
+        ok(binop(BinaryOp::Regexp, text("hello123"), text("[0-9]+"))),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn test_regexp_no_match() {
+    assert_eq!(
+        ok(binop(BinaryOp::Regexp, text("hello"), text("^[0-9]+$"))),
+        Value::Bool(false)
+    );
+}
+
+#[test]
+fn test_regexp_null_left() {
+    assert_eq!(
+        ok(binop(BinaryOp::Regexp, null(), text("[a-z]+"))),
+        Value::Null
+    );
+}
+
+#[test]
+fn test_regexp_null_pattern() {
+    assert_eq!(
+        ok(binop(BinaryOp::Regexp, text("hello"), null())),
+        Value::Null
+    );
+}
+
+// ── G4: XOR ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_xor_true_false() {
+    assert_eq!(
+        ok(binop(BinaryOp::Xor, bool_lit(true), bool_lit(false))),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn test_xor_true_true() {
+    assert_eq!(
+        ok(binop(BinaryOp::Xor, bool_lit(true), bool_lit(true))),
+        Value::Bool(false)
+    );
+}
+
+#[test]
+fn test_xor_false_false() {
+    assert_eq!(
+        ok(binop(BinaryOp::Xor, bool_lit(false), bool_lit(false))),
+        Value::Bool(false)
+    );
+}
+
+#[test]
+fn test_xor_null_propagates() {
+    assert_eq!(
+        ok(binop(BinaryOp::Xor, null(), bool_lit(true))),
+        Value::Null
+    );
+}
+
+// ── G4: DIV (integer division) ────────────────────────────────────────────────
+
+#[test]
+fn test_int_div_basic() {
+    assert_eq!(
+        ok(binop(BinaryOp::IntDiv, bigint(7), bigint(2))),
+        Value::BigInt(3)
+    );
+}
+
+#[test]
+fn test_int_div_truncates_toward_zero() {
+    assert_eq!(
+        ok(binop(BinaryOp::IntDiv, bigint(-7), bigint(2))),
+        Value::BigInt(-3)
+    );
+}
+
+#[test]
+fn test_int_div_by_zero_returns_null() {
+    assert_eq!(
+        ok(binop(BinaryOp::IntDiv, bigint(5), bigint(0))),
+        Value::Null
+    );
+}
+
+// ── G4: <=> (null-safe equality) ─────────────────────────────────────────────
+
+#[test]
+fn test_null_safe_eq_null_null() {
+    assert_eq!(
+        ok(binop(BinaryOp::NullSafe, null(), null())),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn test_null_safe_eq_null_value() {
+    assert_eq!(
+        ok(binop(BinaryOp::NullSafe, null(), int(1))),
+        Value::Bool(false)
+    );
+}
+
+#[test]
+fn test_null_safe_eq_equal_values() {
+    assert_eq!(
+        ok(binop(BinaryOp::NullSafe, int(42), int(42))),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn test_null_safe_eq_different_values() {
+    assert_eq!(
+        ok(binop(BinaryOp::NullSafe, int(1), int(2))),
+        Value::Bool(false)
+    );
+}
+
+// ── G4: Bitwise operators ─────────────────────────────────────────────────────
+
+#[test]
+fn test_bitwise_and() {
+    assert_eq!(
+        ok(binop(BinaryOp::BitAnd, bigint(0b1100), bigint(0b1010))),
+        Value::BigInt(0b1000)
+    );
+}
+
+#[test]
+fn test_bitwise_or() {
+    assert_eq!(
+        ok(binop(BinaryOp::BitOr, bigint(0b1100), bigint(0b1010))),
+        Value::BigInt(0b1110)
+    );
+}
+
+#[test]
+fn test_bitwise_xor() {
+    assert_eq!(
+        ok(binop(BinaryOp::BitXor, bigint(0b1100), bigint(0b1010))),
+        Value::BigInt(0b0110)
+    );
+}
+
+#[test]
+fn test_shift_left() {
+    assert_eq!(
+        ok(binop(BinaryOp::ShiftLeft, bigint(1), bigint(4))),
+        Value::BigInt(16)
+    );
+}
+
+#[test]
+fn test_shift_right() {
+    assert_eq!(
+        ok(binop(BinaryOp::ShiftRight, bigint(16), bigint(2))),
+        Value::BigInt(4)
+    );
+}
+
+#[test]
+fn test_bitwise_not() {
+    // ~0 = all 1s = u64::MAX cast to i64 = -1 (two's complement)
+    let result = ok(unop(UnaryOp::BitNot, bigint(0)));
+    assert_eq!(result, Value::BigInt(-1));
+}
+
+#[test]
+fn test_bitwise_not_one() {
+    // ~1 as u64 = 0xFFFFFFFFFFFFFFFE = -2 as i64
+    let result = ok(unop(UnaryOp::BitNot, bigint(1)));
+    assert_eq!(result, Value::BigInt(-2));
+}
+
+// ── G4: Hex literals (parser) ─────────────────────────────────────────────────
+
+#[test]
+fn test_hex_literal_parses_to_bigint() {
+    use axiomdb_sql::{parse, SelectItem, Stmt};
+    let stmt = parse("SELECT 0xFF", None).unwrap();
+    // Parser emits SELECT with Expr::Literal(Value::BigInt(255))
+    if let Stmt::Select(sel) = stmt {
+        if let SelectItem::Expr { expr, .. } = &sel.columns[0] {
+            assert_eq!(expr, &Expr::Literal(Value::BigInt(255)));
+        } else {
+            panic!("expected Expr item");
+        }
+    } else {
+        panic!("expected SELECT");
+    }
 }

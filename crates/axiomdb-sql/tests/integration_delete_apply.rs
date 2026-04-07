@@ -101,31 +101,81 @@ fn test_bulk_delete_then_rollback_restores_data() {
 #[test]
 fn test_bulk_delete_savepoint_rollback_restores_data() {
     // Tests TxnManager savepoint API directly (SQL SAVEPOINT is Phase 7.12).
-    let (mut storage, mut txn) = setup();
-    setup_pk_table(&mut storage, &mut txn);
-    txn.begin().unwrap(); // explicit BEGIN
-                          // Insert item6 before the savepoint.
-    run(
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    // Set up the table using run_ctx so SessionContext tracks the auto-commit txn.
+    run_ctx(
+        "CREATE TABLE items (id INT NOT NULL, label TEXT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    for i in 1..=5 {
+        run_ctx(
+            &format!("INSERT INTO items VALUES ({i}, 'item{i}')"),
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap();
+    }
+    // Begin an explicit transaction via SQL so conn_txn is in ctx.
+    run_ctx("BEGIN", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
+    // Insert item6 before the savepoint.
+    run_ctx(
         "INSERT INTO items VALUES (6, 'item6')",
         &mut storage,
         &mut txn,
-    );
-    let sp = txn.savepoint();
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let sp = txn.savepoint(ctx.conn_txn.as_ref().expect("active txn"));
     // Bulk delete inside the transaction.
-    run("DELETE FROM items", &mut storage, &mut txn);
+    run_ctx(
+        "DELETE FROM items",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
     assert_eq!(
-        rows(run("SELECT * FROM items", &mut storage, &mut txn)).len(),
+        rows(
+            run_ctx(
+                "SELECT * FROM items",
+                &mut storage,
+                &mut txn,
+                &mut bloom,
+                &mut ctx
+            )
+            .unwrap()
+        )
+        .len(),
         0,
         "inside txn after DELETE: must be empty"
     );
     // Rollback to savepoint — restores pre-delete state (items 1-5 + item6).
-    txn.rollback_to_savepoint(sp, &mut storage).unwrap();
-    let count = rows(run("SELECT * FROM items", &mut storage, &mut txn)).len();
+    txn.rollback_to_savepoint(ctx.conn_txn.as_mut().expect("active txn"), sp, &mut storage)
+        .unwrap();
+    let count = rows(
+        run_ctx(
+            "SELECT * FROM items",
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap(),
+    )
+    .len();
     assert_eq!(
         count, 6,
         "after savepoint rollback: must see items 1–5 + item6"
     );
-    txn.commit().unwrap();
+    run_ctx("COMMIT", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
 }
 
 #[test]

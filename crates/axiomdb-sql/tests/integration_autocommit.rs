@@ -28,7 +28,11 @@ fn run_ctx(
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     let stmt = parse(sql, None)?;
-    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let snap = if let Some(ref ct) = ctx.conn_txn {
+        txn.active_snapshot(ct)
+    } else {
+        txn.snapshot()
+    };
     let analyzed = analyze(stmt, storage, snap)?;
     execute_with_ctx(analyzed, storage, txn, bloom, ctx)
 }
@@ -487,7 +491,7 @@ fn test_savepoint_rollback_leaves_pre_savepoint_writes() {
     );
 
     // Capture savepoint after first INSERT is physically committed to the heap.
-    let sp = txn.savepoint();
+    let sp = txn.savepoint(ctx.conn_txn.as_ref().expect("active txn"));
 
     ok(
         "INSERT INTO t VALUES (2)",
@@ -507,7 +511,8 @@ fn test_savepoint_rollback_leaves_pre_savepoint_writes() {
     );
 
     // Rollback to savepoint — row 2 disappears, row 1 survives, txn still active.
-    txn.rollback_to_savepoint(sp, &mut storage).unwrap();
+    txn.rollback_to_savepoint(ctx.conn_txn.as_mut().expect("active txn"), sp, &mut storage)
+        .unwrap();
     assert!(txn.active_txn_id().is_some(), "txn must remain active");
 
     ok("COMMIT", &mut storage, &mut txn, &mut bloom, &mut ctx);
@@ -543,9 +548,10 @@ fn test_savepoint_noop_when_no_writes_after() {
         &mut ctx,
     );
 
-    let sp = txn.savepoint();
+    let sp = txn.savepoint(ctx.conn_txn.as_ref().expect("active txn"));
     // No writes after the savepoint.
-    txn.rollback_to_savepoint(sp, &mut storage).unwrap();
+    txn.rollback_to_savepoint(ctx.conn_txn.as_mut().expect("active txn"), sp, &mut storage)
+        .unwrap();
 
     // Row 99 still there (was before the savepoint).
     ok("COMMIT", &mut storage, &mut txn, &mut bloom, &mut ctx);

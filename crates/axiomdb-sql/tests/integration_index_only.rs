@@ -47,7 +47,7 @@ fn run_result(
     txn: &mut TxnManager,
 ) -> Result<QueryResult, DbError> {
     let stmt = parse(sql, None)?;
-    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let snap = txn.snapshot();
     let analyzed = analyze(stmt, storage, snap)?;
     execute(analyzed, storage, txn)
 }
@@ -446,7 +446,7 @@ fn rctx(
     ctx: &mut SessionContext,
 ) -> QueryResult {
     let stmt = parse(sql, None).unwrap_or_else(|e| panic!("parse failed: {sql}\n{e:?}"));
-    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let snap = txn.snapshot();
     let analyzed =
         analyze(stmt, storage, snap).unwrap_or_else(|e| panic!("analyze failed: {sql}\n{e:?}"));
     execute_with_ctx(analyzed, storage, txn, bloom, ctx)
