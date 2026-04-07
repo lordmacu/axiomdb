@@ -815,3 +815,143 @@ Example output:
 | orders | 0         | PRIMARY    | 1            | id          | … |
 | orders | 0         | idx_email  | 1            | email       | … |
 | orders | 1         | idx_status | 1            | status      | … |
+
+---
+
+## SHOW TABLES / SHOW FULL TABLES
+
+Lists tables in the current (or specified) schema.
+
+```sql
+SHOW TABLES [FROM schema] [LIKE 'pattern'];
+SHOW FULL TABLES [FROM schema] [LIKE 'pattern'];
+```
+
+`SHOW FULL TABLES` adds a `Table_type` column, required by Sequelize, ActiveRecord,
+and other ORMs that probe the schema on startup.
+
+| Column | SHOW TABLES | SHOW FULL TABLES |
+|--------|:-----------:|:----------------:|
+| `Tables_in_<schema>` | ✓ | ✓ |
+| `Table_type` | — | ✓ (always `"BASE TABLE"`) |
+
+```sql
+CREATE TABLE products (id INT, name TEXT);
+CREATE TABLE orders   (id INT, total REAL);
+
+SHOW FULL TABLES;
+-- Tables_in_public  Table_type
+-- products          BASE TABLE
+-- orders            BASE TABLE
+```
+
+---
+
+## SHOW COLUMNS / SHOW FULL COLUMNS
+
+Lists column metadata for a table. `DESCRIBE` and `DESC` are synonyms.
+
+```sql
+SHOW COLUMNS      FROM table_name;
+SHOW FULL COLUMNS FROM table_name;
+DESCRIBE table_name;
+```
+
+`SHOW FULL COLUMNS` adds three extra columns required by Prisma, TypeORM, and
+MySQL Workbench:
+
+| Column | SHOW COLUMNS | SHOW FULL COLUMNS |
+|--------|:------------:|:-----------------:|
+| `Field` | ✓ | ✓ |
+| `Type` | ✓ | ✓ |
+| `Null` | ✓ | ✓ |
+| `Key` | ✓ | ✓ |
+| `Default` | ✓ | ✓ |
+| `Extra` | ✓ | ✓ |
+| `Collation` | — | ✓ (`utf8mb4_general_ci` for text, `NULL` for numeric) |
+| `Privileges` | — | ✓ (`select,insert,update,references`) |
+| `Comment` | — | ✓ (always `""`) |
+
+---
+
+## SHOW TABLE STATUS
+
+Returns one row per table with storage metadata, compatible with MySQL's
+`SHOW TABLE STATUS` output.
+
+```sql
+SHOW TABLE STATUS [FROM schema] [LIKE 'pattern'];
+```
+
+The result set has 18 columns:
+
+| Column | Description |
+|--------|-------------|
+| `Name` | Table name |
+| `Engine` | Always `"InnoDB"` |
+| `Version` | Always `10` |
+| `Row_format` | Always `"Dynamic"` |
+| `Rows` | Approximate row count from last `ANALYZE` |
+| `Avg_row_length` | `0` (not tracked) |
+| `Data_length` | `0` (not tracked) |
+| `Max_data_length` | `0` |
+| `Index_length` | `0` |
+| `Data_free` | `0` |
+| `Auto_increment` | `NULL` |
+| `Create_time` | `NULL` |
+| `Update_time` | `NULL` |
+| `Check_time` | `NULL` |
+| `Collation` | Always `"utf8mb4_general_ci"` |
+| `Checksum` | `NULL` |
+| `Create_options` | `""` |
+| `Comment` | `""` |
+
+```sql
+SHOW TABLE STATUS LIKE 'order%';
+-- Returns rows for all tables whose names start with "order".
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision</span>
+Row counts come from the stats catalog populated by <code>ANALYZE TABLE</code>,
+not from live heap scans, keeping <code>SHOW TABLE STATUS</code> O(1) regardless
+of table size — the same trade-off MySQL InnoDB makes with its own approximate
+row counts.
+</div>
+</div>
+
+---
+
+## SHOW ENGINES / SHOW CHARSET / SHOW COLLATION
+
+Informational commands used by DB management tools (MySQL Workbench, DBeaver,
+TablePlus) and JDBC drivers on connect.
+
+```sql
+SHOW ENGINES;
+SHOW CHARSET;           -- or SHOW CHARACTER SET
+SHOW COLLATION;
+```
+
+**SHOW ENGINES** returns a single row:
+
+| Engine | Support | Transactions | XA | Savepoints |
+|--------|---------|:------------:|:--:|:----------:|
+| InnoDB | DEFAULT | YES | YES | YES |
+
+**SHOW CHARSET** returns four rows: `utf8mb4`, `utf8`, `latin1`, `binary`.
+
+**SHOW COLLATION** returns five rows: `utf8mb4_general_ci`, `utf8mb4_bin`,
+`utf8_general_ci`, `latin1_swedish_ci`, `binary`.
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Tip</span>
+These commands are read-only and have no effect on query behavior. AxiomDB
+always stores strings as UTF-8 internally; the charset/collation metadata
+exists solely for client compatibility.
+</div>
+</div>

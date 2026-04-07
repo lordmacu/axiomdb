@@ -236,6 +236,8 @@ pub struct OrderByItem {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
     pub distinct: bool,
+    /// `SQL_CALC_FOUND_ROWS` modifier: stash pre-LIMIT count for `FOUND_ROWS()` (4.5e).
+    pub calc_found_rows: bool,
     pub columns: Vec<SelectItem>,
     pub from: Option<FromClause>,
     pub joins: Vec<JoinClause>,
@@ -430,6 +432,33 @@ pub enum AlterTableOp {
     ModifyColumn(ColumnDef),
     /// `REBUILD` — convert heap table to clustered format (Phase 39.19).
     Rebuild,
+    /// `RENAME INDEX old TO new` (4.22g)
+    RenameIndex {
+        old_name: String,
+        new_name: String,
+    },
+    /// `CONVERT TO CHARACTER SET charset [COLLATE collation]` (4.22i) — accepted, no-op.
+    ConvertCharset,
+    /// `ADD [UNIQUE] [INDEX|KEY] [name] (col [, col]*)` (4.22h)
+    AddIndex {
+        unique: bool,
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    /// `DROP INDEX name` within ALTER TABLE (4.22h)
+    DropIndex {
+        name: String,
+    },
+    /// `CHANGE [COLUMN] old_name new_col_def` (4.22h) — rename + retype in one op.
+    ChangeColumn {
+        old_name: String,
+        new_def: ColumnDef,
+    },
+    /// `AUTO_INCREMENT = N` (4.22h) — reset the auto-increment counter.
+    /// Not yet persisted (counter storage in 4.18e); accepted as a no-op.
+    SetAutoIncrement(u64),
+    /// `ENGINE = name` (4.22h) — accepted, ignored.
+    SetEngine,
 }
 
 /// `ALTER TABLE`
@@ -445,6 +474,8 @@ pub struct AlterTableStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShowTablesStmt {
     pub schema: Option<String>,
+    /// `SHOW FULL TABLES` — adds `Table_type` column (BASE TABLE | VIEW).
+    pub full: bool,
 }
 
 /// `SHOW DATABASES`
@@ -455,12 +486,34 @@ pub struct ShowDatabasesStmt;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShowColumnsStmt {
     pub table: TableRef,
+    /// `SHOW FULL COLUMNS` — adds Collation, Privileges, Comment columns.
+    pub full: bool,
+}
+
+/// `SHOW TABLE STATUS [FROM db] [LIKE pattern]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowTableStatusStmt {
+    pub schema: Option<String>,
+    pub like_pattern: Option<String>,
 }
 
 /// `SHOW INDEX FROM table` / `SHOW INDEXES FROM table` / `SHOW KEYS FROM table`
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShowIndexStmt {
     pub table: TableRef,
+}
+
+/// `SHOW CREATE TABLE table` — reconstruct the DDL for a table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowCreateTableStmt {
+    pub table: TableRef,
+}
+
+/// `RENAME TABLE old TO new [, old2 TO new2 ...]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenameTableStmt {
+    /// One or more (old_name, new_name) pairs.
+    pub pairs: Vec<(String, String)>,
 }
 
 /// Value assigned in a `SET` statement.
@@ -549,6 +602,22 @@ pub enum Stmt {
     ShowDatabases(ShowDatabasesStmt),
     ShowColumns(ShowColumnsStmt),
     ShowIndex(ShowIndexStmt),
+    /// `SHOW CREATE TABLE t` — reconstruct DDL (4.20b).
+    ShowCreateTable(ShowCreateTableStmt),
+    /// `SHOW TABLE STATUS [FROM db] [LIKE pattern]` (5.9f).
+    ShowTableStatus(ShowTableStatusStmt),
+    /// `SHOW ENGINES` — static engine list (5.9g).
+    ShowEngines,
+    /// `SHOW CHARSET` / `SHOW CHARACTER SET` — static charset list (5.9g).
+    ShowCharset,
+    /// `SHOW COLLATION` — static collation list (5.9g).
+    ShowCollation,
+    /// `SHOW VARIABLES` — static variable dump (intercepted by wire handler).
+    ShowVariables,
+    /// `SHOW STATUS` — intercepted by wire handler.
+    ShowStatus,
+    /// `RENAME TABLE a TO b [, c TO d ...]` (4.3h).
+    RenameTable(RenameTableStmt),
     // Transaction control
     Begin,
     Commit,
@@ -595,6 +664,7 @@ mod tests {
     fn test_select_star_from_table_with_where_and_order() {
         let stmt = Stmt::Select(SelectStmt {
             distinct: false,
+            calc_found_rows: false,
             columns: vec![SelectItem::Wildcard],
             from: Some(FromClause::Table(TableRef::simple("users"))),
             joins: vec![],
@@ -618,6 +688,7 @@ mod tests {
         // SELECT 1  — health-check query used by ORMs
         let stmt = Stmt::Select(SelectStmt {
             distinct: false,
+            calc_found_rows: false,
             columns: vec![SelectItem::Expr {
                 expr: Expr::int(1),
                 alias: None,
@@ -793,6 +864,7 @@ mod tests {
     fn test_subquery_from_clause() {
         let subquery = SelectStmt {
             distinct: false,
+            calc_found_rows: false,
             columns: vec![SelectItem::Wildcard],
             from: Some(FromClause::Table(TableRef::simple("users"))),
             joins: vec![],
@@ -890,9 +962,13 @@ mod tests {
 
     #[test]
     fn test_show_tables_and_columns() {
-        let show_tables = Stmt::ShowTables(ShowTablesStmt { schema: None });
+        let show_tables = Stmt::ShowTables(ShowTablesStmt {
+            schema: None,
+            full: false,
+        });
         let show_cols = Stmt::ShowColumns(ShowColumnsStmt {
             table: TableRef::simple("users"),
+            full: false,
         });
         assert!(matches!(show_tables, Stmt::ShowTables(_)));
         assert!(matches!(show_cols, Stmt::ShowColumns(_)));

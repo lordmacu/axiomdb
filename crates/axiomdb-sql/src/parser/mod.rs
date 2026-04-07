@@ -32,7 +32,17 @@ use crate::{
 /// - [`DbError::ParseError`] — input too long, unrecognized character,
 ///   unexpected token, missing token, or identifier > 64 characters.
 pub fn parse(input: &str, max_bytes: Option<usize>) -> Result<Stmt, DbError> {
-    let tokens = tokenize(input, max_bytes)?;
+    // 4.1f: expand MySQL version-conditional comments `/*!NNNNN SQL*/` before
+    // tokenizing. If the input contains no `/*!`, no allocation is made.
+    let expanded;
+    let effective = match crate::lexer::expand_version_comments(input) {
+        Some(s) => {
+            expanded = s;
+            expanded.as_str()
+        }
+        None => input,
+    };
+    let tokens = tokenize(effective, max_bytes)?;
     let mut p = Parser::new(&tokens);
     let stmt = p.parse_stmt()?;
 
@@ -149,6 +159,33 @@ impl<'src> Parser<'src> {
             true
         } else {
             false
+        }
+    }
+
+    /// Consume the current token if it is an identifier matching `keyword`
+    /// case-insensitively; return `true` if consumed, `false` otherwise.
+    pub(crate) fn eat_ident_ci(&mut self, keyword: &str) -> bool {
+        match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case(keyword) => {
+                self.pos += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Parse the current token as a string literal and return its value.
+    /// Returns an error if the current token is not a string literal.
+    pub(crate) fn parse_string_literal(&mut self) -> Result<String, DbError> {
+        match self.peek().clone() {
+            Token::StringLit(s) => {
+                self.pos += 1;
+                Ok(s.clone())
+            }
+            other => Err(DbError::ParseError {
+                message: format!("expected string literal, found {other:?}"),
+                position: Some(self.current_pos()),
+            }),
         }
     }
 
@@ -310,6 +347,12 @@ impl<'src> Parser<'src> {
             }
             Token::Show => {
                 self.advance();
+                // Optional FULL modifier for SHOW FULL TABLES / SHOW FULL COLUMNS (5.9f).
+                // `FULL` is a reserved token (Token::Full), not an identifier.
+                let full = self.eat(&Token::Full);
+                // Optional GLOBAL / SESSION modifier for SHOW VARIABLES (already
+                // handled by the interceptor, but consume it so we don't error).
+                let _global = self.eat_ident_ci("GLOBAL") || self.eat_ident_ci("SESSION");
                 match self.peek().clone() {
                     Token::Databases => {
                         self.advance();
@@ -317,19 +360,60 @@ impl<'src> Parser<'src> {
                     }
                     Token::Tables => {
                         self.advance();
-                        let schema = if self.eat(&Token::From) {
+                        let schema = if self.eat(&Token::From) || self.eat_ident_ci("IN") {
                             Some(self.parse_identifier()?)
                         } else {
                             None
                         };
-                        Ok(Stmt::ShowTables(crate::ast::ShowTablesStmt { schema }))
+                        // Consume optional LIKE 'pattern' (ignored by executor — full list returned).
+                        if self.eat(&Token::Like) {
+                            let _ = self.parse_string_literal();
+                        }
+                        Ok(Stmt::ShowTables(crate::ast::ShowTablesStmt { schema, full }))
+                    }
+                    // SHOW TABLE STATUS [FROM db] [LIKE 'pattern']
+                    Token::Table => {
+                        self.advance();
+                        if self.eat_ident_ci("STATUS") {
+                            let schema = if self.eat(&Token::From) || self.eat_ident_ci("IN") {
+                                Some(self.parse_identifier()?)
+                            } else {
+                                None
+                            };
+                            let like_pattern = if self.eat(&Token::Like) {
+                                Some(self.parse_string_literal()?)
+                            } else {
+                                None
+                            };
+                            return Ok(Stmt::ShowTableStatus(
+                                crate::ast::ShowTableStatusStmt { schema, like_pattern },
+                            ));
+                        }
+                        // SHOW CREATE TABLE handled below via Token::Create,
+                        // but SHOW TABLE STATUS consumed here so rewind is not possible.
+                        // If we're here and it's not STATUS, it's a parse error.
+                        Err(DbError::ParseError {
+                            message: "expected STATUS after SHOW TABLE".into(),
+                            position: Some(self.current_pos()),
+                        })
+                    }
+                    // SHOW CREATE TABLE t
+                    Token::Create => {
+                        self.advance();
+                        self.expect(&Token::Table)?;
+                        let table = self.parse_table_ref()?;
+                        Ok(Stmt::ShowCreateTable(crate::ast::ShowCreateTableStmt { table }))
                     }
                     // COLUMNS is not a reserved keyword — it tokenizes as Ident
                     Token::Ident(kw) | Token::QuotedIdent(kw) if kw.eq_ignore_ascii_case("columns") => {
                         self.advance();
                         self.expect(&Token::From)?;
                         let table = self.parse_table_ref()?;
-                        Ok(Stmt::ShowColumns(crate::ast::ShowColumnsStmt { table }))
+                        // Consume optional LIKE / WHERE filter (ignored — full list returned).
+                        if self.eat(&Token::Like) {
+                            let _ = self.parse_string_literal();
+                        }
+                        Ok(Stmt::ShowColumns(crate::ast::ShowColumnsStmt { table, full }))
                     }
                     // SHOW INDEX FROM table
                     Token::Index => {
@@ -348,20 +432,91 @@ impl<'src> Parser<'src> {
                         let table = self.parse_table_ref()?;
                         Ok(Stmt::ShowIndex(crate::ast::ShowIndexStmt { table }))
                     }
+                    // SHOW WARNINGS / SHOW ERRORS — return empty (5.9e deferred)
+                    Token::Ident(kw)
+                        if kw.eq_ignore_ascii_case("warnings")
+                            || kw.eq_ignore_ascii_case("errors") =>
+                    {
+                        self.advance();
+                        // Optional LIMIT N — consume and discard
+                        if self.eat(&Token::Limit) {
+                            let _ = self.peek();
+                            self.advance();
+                        }
+                        Ok(Stmt::Noop)
+                    }
+                    // SHOW ENGINES — DB tools (5.9g)
+                    Token::Ident(kw) if kw.eq_ignore_ascii_case("engines") => {
+                        self.advance();
+                        Ok(Stmt::ShowEngines)
+                    }
+                    // SHOW CHARSET / SHOW CHARACTER SET — DB tools (5.9g)
+                    Token::Ident(kw)
+                        if kw.eq_ignore_ascii_case("charset")
+                            || kw.eq_ignore_ascii_case("character") =>
+                    {
+                        self.advance();
+                        self.eat_ident_ci("SET");
+                        // Optional LIKE / WHERE — consume and discard
+                        if self.eat(&Token::Like) {
+                            let _ = self.parse_string_literal();
+                        }
+                        Ok(Stmt::ShowCharset)
+                    }
+                    // SHOW COLLATION — DB tools (5.9g)
+                    Token::Ident(kw) if kw.eq_ignore_ascii_case("collation") => {
+                        self.advance();
+                        if self.eat(&Token::Like) {
+                            let _ = self.parse_string_literal();
+                        }
+                        Ok(Stmt::ShowCollation)
+                    }
+                    // SHOW VARIABLES is intercepted by the wire handler, but we need
+                    // a fallback in case the executor is called directly.
+                    Token::Ident(kw) if kw.eq_ignore_ascii_case("variables") => {
+                        self.advance();
+                        if self.eat(&Token::Like) {
+                            let _ = self.parse_string_literal();
+                        }
+                        Ok(Stmt::ShowVariables)
+                    }
+                    // SHOW STATUS handled like SHOW VARIABLES
+                    Token::Ident(kw) if kw.eq_ignore_ascii_case("status") => {
+                        self.advance();
+                        if self.eat(&Token::Like) {
+                            let _ = self.parse_string_literal();
+                        }
+                        Ok(Stmt::ShowStatus)
+                    }
                     other => Err(DbError::ParseError {
                         message: format!(
-                            "expected DATABASES, TABLES, COLUMNS or INDEX after SHOW, found {:?}",
-                            other,
+                            "unexpected token after SHOW: {other:?}"
                         ),
                         position: Some(self.current_pos()),
                     }),
                 }
             }
+            // RENAME TABLE old TO new [, old2 TO new2 ...]
+            Token::Rename => {
+                self.advance();
+                self.expect(&Token::Table)?;
+                let mut pairs = Vec::new();
+                loop {
+                    let old_name = self.parse_identifier()?;
+                    self.expect(&Token::To)?;
+                    let new_name = self.parse_identifier()?;
+                    pairs.push((old_name, new_name));
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                }
+                Ok(Stmt::RenameTable(crate::ast::RenameTableStmt { pairs }))
+            }
             // DESCRIBE table_name / DESC table_name
             Token::Describe => {
                 self.advance();
                 let table = self.parse_table_ref()?;
-                Ok(Stmt::ShowColumns(crate::ast::ShowColumnsStmt { table }))
+                Ok(Stmt::ShowColumns(crate::ast::ShowColumnsStmt { table, full: false }))
             }
             Token::Alter => {
                 self.advance();

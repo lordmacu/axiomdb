@@ -74,6 +74,8 @@ fn dispatch(
             execute_show_columns(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
         }
         Stmt::ShowIndex(s) => execute_show_index(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME),
+        Stmt::ShowCreateTable(s) => execute_show_create_table(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME),
+        Stmt::RenameTable(s) => execute_rename_table(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME),
         Stmt::Analyze(_) => Err(DbError::NotImplemented {
             feature: "ANALYZE requires session context — use execute_with_ctx".into(),
         }),
@@ -99,6 +101,22 @@ fn dispatch(
         Stmt::CreateTableAsSelect(_) => Err(DbError::NotImplemented {
             feature: "CREATE TABLE AS SELECT requires session context — use execute_with_ctx".into(),
         }),
+        // 5.9f: SHOW TABLE STATUS
+        Stmt::ShowTableStatus(s) => {
+            execute_show_table_status(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
+        }
+        // 5.9g: SHOW ENGINES / CHARSET / COLLATION
+        Stmt::ShowEngines => Ok(execute_show_engines()),
+        Stmt::ShowCharset => Ok(execute_show_charset()),
+        Stmt::ShowCollation => Ok(execute_show_collation()),
+        // SHOW VARIABLES / SHOW STATUS — intercepted at wire level; minimal fallback here.
+        Stmt::ShowVariables | Stmt::ShowStatus => Ok(QueryResult::Rows {
+            columns: vec![
+                ColumnMeta::computed("Variable_name", DataType::Text),
+                ColumnMeta::computed("Value", DataType::Text),
+            ],
+            rows: vec![],
+        }),
     }
 }
 
@@ -108,13 +126,11 @@ fn dispatch(
 /// execute the query. Returns the query plan as a result set in MySQL format.
 fn execute_explain(
     inner: Stmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
-    bloom: &mut crate::bloom::BloomRegistry,
+    exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     match inner {
-        Stmt::Select(s) => explain_select(s, storage, txn, bloom, ctx),
+        Stmt::Select(s) => explain_select(s, exec_ctx, ctx),
         other => {
             // For non-SELECT, just show the statement type.
             let type_name = match &other {
@@ -143,11 +159,11 @@ fn execute_explain(
 
 fn explain_select(
     stmt: SelectStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
-    _bloom: &mut crate::bloom::BloomRegistry,
+    exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
     let columns = explain_columns();
 
     // Resolve table (same as execute_select_ctx).

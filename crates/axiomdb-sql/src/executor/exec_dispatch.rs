@@ -1,21 +1,23 @@
 /// Routes a statement to its handler using a `SessionContext` for schema caching.
 fn dispatch_ctx(
     stmt: Stmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
-    bloom: &mut crate::bloom::BloomRegistry,
+    exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut doc comments.
+    let storage = unsafe { exec_ctx.storage_mut() };
+    let txn = unsafe { exec_ctx.coord_mut() };
+    let bloom = unsafe { exec_ctx.bloom_mut() };
     // Flush staged inserts before any non-INSERT barrier statement.
     // INSERT statements handle same-table vs. different-table flush internally.
     if !matches!(stmt, Stmt::Insert(_)) {
-        flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
+        flush_pending_inserts_ctx(exec_ctx, ctx)?;
     }
     match stmt {
-        Stmt::Select(s) => execute_select_ctx(s, storage, txn, bloom, ctx),
-        Stmt::Insert(s) => execute_insert_ctx(s, storage, txn, bloom, ctx),
-        Stmt::Update(s) => execute_update_ctx(s, storage, txn, bloom, ctx),
-        Stmt::Delete(s) => execute_delete_ctx(s, storage, txn, bloom, ctx),
+        Stmt::Select(s) => execute_select_ctx(s, exec_ctx, ctx),
+        Stmt::Insert(s) => execute_insert_ctx(s, exec_ctx, ctx),
+        Stmt::Update(s) => execute_update_ctx(s, exec_ctx, ctx),
+        Stmt::Delete(s) => execute_delete_ctx(s, exec_ctx, ctx),
         Stmt::CreateTable(mut s) => {
             ctx.invalidate_all();
             let db = ddl_database(&s.table.database, ctx);
@@ -75,9 +77,9 @@ fn dispatch_ctx(
             let conn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
             execute_alter_table(s, storage, txn, conn, &db)
         }
-        Stmt::Analyze(s) => execute_analyze(s, storage, txn, ctx),
-        Stmt::Explain(inner) => execute_explain(*inner, storage, txn, bloom, ctx),
-        Stmt::Vacuum(s) => crate::vacuum::execute_vacuum(s, storage, txn, bloom, ctx),
+        Stmt::Analyze(s) => execute_analyze(s, exec_ctx, ctx),
+        Stmt::Explain(inner) => execute_explain(*inner, exec_ctx, ctx),
+        Stmt::Vacuum(s) => crate::vacuum::execute_vacuum(s, exec_ctx, ctx),
         Stmt::Set(s) => execute_set_ctx(s, ctx),
         Stmt::UseDatabase(s) => execute_use_database(s, storage, txn, ctx),
         Stmt::Noop => Ok(QueryResult::Empty),
@@ -104,6 +106,17 @@ fn dispatch_ctx(
             let conn = ctx.conn_txn.as_mut().expect("conn_txn set");
             execute_show_index(s, storage, txn, conn, &db)
         }
+        Stmt::ShowCreateTable(s) => {
+            let db = ddl_database(&s.table.database, ctx);
+            let conn = ctx.conn_txn.as_mut().expect("conn_txn set");
+            execute_show_create_table(s, storage, txn, conn, &db)
+        }
+        Stmt::RenameTable(s) => {
+            ctx.invalidate_all();
+            let db = ctx.effective_database().to_string();
+            let conn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
+            execute_rename_table(s, storage, txn, conn, &db)
+        }
         Stmt::TruncateTable(s) => {
             let db = ddl_database(&s.table.database, ctx);
             let conn = ctx.conn_txn.as_mut().expect("conn_txn set");
@@ -121,8 +134,29 @@ fn dispatch_ctx(
         // G5.6: CREATE TABLE ... AS SELECT
         Stmt::CreateTableAsSelect(s) => {
             ctx.invalidate_all();
-            execute_create_table_as_select(s, storage, txn, bloom, ctx)
+            execute_create_table_as_select(s, exec_ctx, ctx)
         }
+        // 5.9f: SHOW TABLE STATUS — needs database context
+        Stmt::ShowTableStatus(mut s) => {
+            if s.schema.is_none() {
+                s.schema = Some(ctx.current_schema().to_string());
+            }
+            let db = ctx.effective_database().to_string();
+            let conn = ctx.conn_txn.as_mut().expect("conn_txn set");
+            execute_show_table_status(s, storage, txn, conn, &db)
+        }
+        // 5.9g: SHOW ENGINES / CHARSET / COLLATION — static, no ctx needed
+        Stmt::ShowEngines => Ok(execute_show_engines()),
+        Stmt::ShowCharset => Ok(execute_show_charset()),
+        Stmt::ShowCollation => Ok(execute_show_collation()),
+        // SHOW VARIABLES / SHOW STATUS — intercepted at wire level; empty fallback.
+        Stmt::ShowVariables | Stmt::ShowStatus => Ok(QueryResult::Rows {
+            columns: vec![
+                ColumnMeta::computed("Variable_name", DataType::Text),
+                ColumnMeta::computed("Value", DataType::Text),
+            ],
+            rows: vec![],
+        }),
         other => {
             let conn = ctx.conn_txn.as_mut().expect("conn_txn set for dispatch");
             dispatch(other, storage, txn, conn)

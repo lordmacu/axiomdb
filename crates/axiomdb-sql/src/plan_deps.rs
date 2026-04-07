@@ -199,7 +199,15 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             Stmt::ShowTables(_)
             | Stmt::ShowDatabases(_)
             | Stmt::ShowColumns(_)
-            | Stmt::ShowIndex(_) => Ok(()),
+            | Stmt::ShowIndex(_)
+            | Stmt::ShowCreateTable(_)
+            | Stmt::ShowTableStatus(_)
+            | Stmt::ShowEngines
+            | Stmt::ShowCharset
+            | Stmt::ShowCollation
+            | Stmt::ShowVariables
+            | Stmt::ShowStatus
+            | Stmt::RenameTable(_) => Ok(()),
             // Transaction control — no deps.
             Stmt::Begin
             | Stmt::Commit
@@ -380,6 +388,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             Expr::Column { .. }
             | Expr::OuterColumn { .. }
             | Expr::Literal(_)
+            | Expr::Default
             | Expr::Param { .. } => Ok(()),
         }
     }
