@@ -240,6 +240,95 @@ WHERE NOT EXISTS (
 
 ---
 
+## MySQL-Compatible Operators (G2 / G4)
+
+### IS TRUE / IS FALSE
+
+```sql
+-- Non-zero integers count as TRUE; NULL is never TRUE
+SELECT * FROM flags WHERE active IS TRUE;
+SELECT * FROM flags WHERE active IS NOT FALSE;
+
+-- NULL IS TRUE  → FALSE
+-- NULL IS FALSE → FALSE
+-- 0 IS FALSE    → TRUE
+-- 1 IS TRUE     → TRUE
+```
+
+### REGEXP / RLIKE — Regular Expression Match
+
+`REGEXP` (alias `RLIKE`) tests whether a string matches a POSIX regular expression.
+
+```sql
+-- Emails matching a pattern
+SELECT * FROM users WHERE email REGEXP '^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$';
+
+-- Rows where code starts with a digit
+SELECT * FROM products WHERE sku RLIKE '^[0-9]';
+
+-- NOT REGEXP
+SELECT * FROM products WHERE name NOT REGEXP '[0-9]';
+```
+
+### XOR — Exclusive OR
+
+```sql
+SELECT a XOR b FROM flags;   -- true if exactly one of a, b is true
+```
+
+### DIV — Integer Division
+
+`DIV` performs integer (truncated) division. Returns NULL if the divisor is zero.
+
+```sql
+SELECT 7 DIV 2;      -- 3
+SELECT -7 DIV 2;     -- -3  (truncates toward zero)
+SELECT 5 DIV 0;      -- NULL  (MySQL-compatible, not an error)
+```
+
+### `<=>` — Null-Safe Equality
+
+`<=>` is like `=` but never returns NULL — it returns TRUE when both sides are NULL.
+
+```sql
+-- Regular = returns NULL for NULL comparisons
+SELECT NULL = NULL;    -- NULL (unknown)
+
+-- Null-safe operator always returns TRUE/FALSE
+SELECT NULL <=> NULL;  -- 1 (TRUE)
+SELECT NULL <=> 1;     -- 0 (FALSE)
+SELECT 1    <=> 1;     -- 1 (TRUE)
+```
+
+### Bitwise Operators
+
+| Operator | Meaning          | Example               |
+|----------|------------------|-----------------------|
+| `&`      | Bitwise AND      | `flags & 0x01`        |
+| `\|`     | Bitwise OR       | `a \| b`              |
+| `^`      | Bitwise XOR      | `a ^ b`               |
+| `~`      | Bitwise NOT      | `~0` → `-1`           |
+| `<<`     | Shift left       | `1 << 4` → `16`       |
+| `>>`     | Shift right      | `16 >> 2` → `4`       |
+
+```sql
+-- Check if bit 0 is set
+SELECT * FROM events WHERE type & 0x01 = 1;
+
+-- Combine flags
+SELECT (read_perm | write_perm) AS combined FROM permissions;
+```
+
+### Hex Literals
+
+```sql
+SELECT 0xFF;        -- 255
+SELECT 0x1A2B;      -- 6699
+SELECT flags & 0xFF FROM events;   -- bitmask with hex constant
+```
+
+---
+
 ## Scalar Functions
 
 ### Numeric Functions

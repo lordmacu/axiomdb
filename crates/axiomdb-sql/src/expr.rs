@@ -62,14 +62,27 @@ pub enum Expr {
         negated: bool,
     },
 
-    /// `expr [NOT] LIKE pattern`
+    /// `expr [NOT] LIKE pattern [ESCAPE char]`
     ///
     /// `%` = any sequence of zero or more characters.
     /// `_` = exactly one character.
+    /// `ESCAPE char` overrides the default backslash escape character.
     /// Case-sensitive. Operates on Unicode characters (not bytes).
     Like {
         expr: Box<Expr>,
         pattern: Box<Expr>,
+        negated: bool,
+        /// Optional single-character escape override. `None` = no escape character.
+        escape: Option<Box<Expr>>,
+    },
+
+    /// `expr IS [NOT] TRUE` / `expr IS [NOT] FALSE`
+    ///
+    /// Unlike `= TRUE`, this predicate never returns NULL — it always returns
+    /// TRUE or FALSE. NULL IS TRUE → FALSE, NULL IS NOT TRUE → TRUE.
+    IsBoolean {
+        expr: Box<Expr>,
+        value: bool,
         negated: bool,
     },
 
@@ -252,10 +265,36 @@ pub enum BinaryOp {
     And,
     /// `OR` — short-circuit: `TRUE OR anything = TRUE`.
     Or,
+    /// `XOR` — boolean exclusive-or.  NULL XOR x = NULL.
+    Xor,
 
     // String
     /// `||` — string concatenation. Both operands must be `Text`.
     Concat,
+
+    // Null-safe
+    /// `<=>` — null-safe equality; returns Bool, never NULL.
+    NullSafe,
+
+    // Integer arithmetic
+    /// `DIV` — integer division, truncates toward zero.  NULL propagates.
+    IntDiv,
+
+    // Bitwise
+    /// `&` — bitwise AND.
+    BitAnd,
+    /// `|` — bitwise OR.
+    BitOr,
+    /// `^` — bitwise XOR.
+    BitXor,
+    /// `<<` — bitwise shift left.
+    ShiftLeft,
+    /// `>>` — bitwise shift right.
+    ShiftRight,
+
+    // Pattern matching
+    /// `REGEXP` / `RLIKE` — regular-expression match.
+    Regexp,
 }
 
 // ── UnaryOp ───────────────────────────────────────────────────────────────────
@@ -267,6 +306,8 @@ pub enum UnaryOp {
     Neg,
     /// Boolean negation: `NOT expr`.
     Not,
+    /// Bitwise NOT: `~expr`.
+    BitNot,
 }
 
 // ── Convenience constructors ──────────────────────────────────────────────────

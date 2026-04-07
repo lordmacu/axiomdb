@@ -16,7 +16,7 @@ use super::{
     functions::eval_function,
     ops::{
         apply_and_values, apply_not, compare_values, eval_and, eval_binary, eval_in, eval_or,
-        eval_unary, is_truthy,
+        eval_unary, eval_xor, is_truthy, like_match_with_escape,
     },
 };
 
@@ -63,6 +63,12 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             right,
         } => eval_or(left, right, row),
 
+        Expr::BinaryOp {
+            op: BinaryOp::Xor,
+            left,
+            right,
+        } => eval_xor(left, right, row),
+
         Expr::BinaryOp { op, left, right } => {
             let l = eval(left, row)?;
             let r = eval(right, row)?;
@@ -95,13 +101,25 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             expr,
             pattern,
             negated,
+            escape,
         } => {
             let v = eval(expr, row)?;
             let p = eval(pattern, row)?;
             match (v, p) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Text(text), Value::Text(pat)) => {
-                    let matched = like_match_collated(current_eval_collation(), &text, &pat);
+                    let matched = if let Some(esc_expr) = escape {
+                        match eval(esc_expr, row)? {
+                            Value::Text(esc) => {
+                                let ch = esc.chars().next().unwrap_or('\\');
+                                like_match_with_escape(&text, &pat, ch)
+                            }
+                            Value::Null => return Ok(Value::Null),
+                            _ => like_match_collated(current_eval_collation(), &text, &pat),
+                        }
+                    } else {
+                        like_match_collated(current_eval_collation(), &text, &pat)
+                    };
                     Ok(Value::Bool(if *negated { !matched } else { matched }))
                 }
                 (v, p) => Err(DbError::TypeMismatch {
@@ -109,6 +127,23 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
                     got: format!("{} LIKE {}", v.variant_name(), p.variant_name()),
                 }),
             }
+        }
+
+        Expr::IsBoolean {
+            expr,
+            value,
+            negated,
+        } => {
+            let v = eval(expr, row)?;
+            let result = match &v {
+                Value::Null => false,
+                Value::Bool(b) => *b == *value,
+                Value::Int(n) => (*n != 0) == *value,
+                Value::BigInt(n) => (*n != 0) == *value,
+                Value::Real(f) => (*f != 0.0) == *value,
+                _ => false,
+            };
+            Ok(Value::Bool(if *negated { !result } else { result }))
         }
 
         Expr::In {
@@ -299,6 +334,12 @@ pub fn eval_with<R: SubqueryRunner>(
             right,
         } => eval_or_with(left, right, row, sq),
 
+        Expr::BinaryOp {
+            op: BinaryOp::Xor,
+            left,
+            right,
+        } => eval_xor_with(left, right, row, sq),
+
         Expr::BinaryOp { op, left, right } => {
             let l = eval_with(left, row, sq)?;
             let r = eval_with(right, row, sq)?;
@@ -330,13 +371,25 @@ pub fn eval_with<R: SubqueryRunner>(
             expr,
             pattern,
             negated,
+            escape,
         } => {
             let v = eval_with(expr, row, sq)?;
             let p = eval_with(pattern, row, sq)?;
             match (v, p) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Text(text), Value::Text(pat)) => {
-                    let matched = like_match_collated(current_eval_collation(), &text, &pat);
+                    let matched = if let Some(esc_expr) = escape {
+                        match eval_with(esc_expr, row, sq)? {
+                            Value::Text(esc) => {
+                                let ch = esc.chars().next().unwrap_or('\\');
+                                like_match_with_escape(&text, &pat, ch)
+                            }
+                            Value::Null => return Ok(Value::Null),
+                            _ => like_match_collated(current_eval_collation(), &text, &pat),
+                        }
+                    } else {
+                        like_match_collated(current_eval_collation(), &text, &pat)
+                    };
                     Ok(Value::Bool(if *negated { !matched } else { matched }))
                 }
                 (v, p) => Err(DbError::TypeMismatch {
@@ -344,6 +397,23 @@ pub fn eval_with<R: SubqueryRunner>(
                     got: format!("{} LIKE {}", v.variant_name(), p.variant_name()),
                 }),
             }
+        }
+
+        Expr::IsBoolean {
+            expr,
+            value,
+            negated,
+        } => {
+            let v = eval_with(expr, row, sq)?;
+            let result = match &v {
+                Value::Null => false,
+                Value::Bool(b) => *b == *value,
+                Value::Int(n) => (*n != 0) == *value,
+                Value::BigInt(n) => (*n != 0) == *value,
+                Value::Real(f) => (*f != 0.0) == *value,
+                _ => false,
+            };
+            Ok(Value::Bool(if *negated { !result } else { result }))
         }
 
         Expr::In {
@@ -518,6 +588,24 @@ fn eval_or_with<R: SubqueryRunner>(
         other => Err(DbError::TypeMismatch {
             expected: "Bool".into(),
             got: other.variant_name().into(),
+        }),
+    }
+}
+
+fn eval_xor_with<R: SubqueryRunner>(
+    left: &Expr,
+    right: &Expr,
+    row: &[Value],
+    sq: &mut R,
+) -> Result<Value, DbError> {
+    let l = eval_with(left, row, sq)?;
+    let r = eval_with(right, row, sq)?;
+    match (&l, &r) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a ^ b)),
+        _ => Err(DbError::TypeMismatch {
+            expected: "Bool".into(),
+            got: l.variant_name().into(),
         }),
     }
 }

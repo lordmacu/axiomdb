@@ -87,7 +87,14 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
                 Value::BigInt(n) => Ok(Value::BigInt(n)),
                 Value::Real(f) => {
                     let factor = 10f64.powi(decimals as i32);
-                    Ok(Value::Real((f * factor).round() / factor))
+                    // MySQL uses round-half-away-from-zero, not IEEE 754 banker's rounding.
+                    let shifted = f * factor;
+                    let rounded = if shifted >= 0.0 {
+                        shifted.floor() + if shifted.fract() >= 0.5 { 1.0 } else { 0.0 }
+                    } else {
+                        shifted.ceil() - if (-shifted).fract() >= 0.5 { 1.0 } else { 0.0 }
+                    };
+                    Ok(Value::Real(rounded / factor))
                 }
                 other => Err(DbError::TypeMismatch {
                     expected: "numeric".into(),

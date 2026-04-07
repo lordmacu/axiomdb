@@ -119,15 +119,51 @@ pub(super) fn eval_unary(op: UnaryOp, v: Value) -> Result<Value, DbError> {
                 got: other.variant_name().into(),
             }),
         },
+        UnaryOp::BitNot => {
+            // MySQL: ~n → bitwise NOT of the integer representation.
+            // Cast to u64, apply bitwise NOT, return as BigInt.
+            let n = value_to_i64_bits(&v);
+            Ok(Value::BigInt(!(n as u64) as i64))
+        }
+    }
+}
+
+// ── XOR ───────────────────────────────────────────────────────────────────────
+
+/// Boolean XOR — no short-circuit because both sides are needed.
+pub(super) fn eval_xor(left: &Expr, right: &Expr, row: &[Value]) -> Result<Value, DbError> {
+    let l = crate::eval::eval(left, row)?;
+    let r = crate::eval::eval(right, row)?;
+    match (&l, &r) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a ^ b)),
+        _ => Err(DbError::TypeMismatch {
+            expected: "Bool".into(),
+            got: l.variant_name().into(),
+        }),
     }
 }
 
 // ── Binary evaluation ─────────────────────────────────────────────────────────
 
-/// Evaluates a binary op on already-evaluated operands (non-AND/OR).
-/// NULL propagates: if either operand is NULL, the result is NULL.
+/// Evaluates a binary op on already-evaluated operands (non-AND/OR/XOR).
+/// NULL propagates: if either operand is NULL, the result is NULL
+/// (except `<=>` which handles NULL explicitly).
 pub(super) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbError> {
-    // NULL propagation for all binary ops except IS NULL.
+    // `<=>` (null-safe equality) must run BEFORE the NULL propagation check.
+    if op == BinaryOp::NullSafe {
+        let result = match (&l, &r) {
+            (Value::Null, Value::Null) => true,
+            (Value::Null, _) | (_, Value::Null) => false,
+            _ => match eval_comparison(BinaryOp::Eq, l, r)? {
+                Value::Bool(b) => b,
+                _ => false,
+            },
+        };
+        return Ok(Value::Bool(result));
+    }
+
+    // NULL propagation for all other binary ops.
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(Value::Null);
     }
@@ -135,6 +171,7 @@ pub(super) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
             eval_arithmetic(op, l, r)
         }
+        BinaryOp::IntDiv => eval_int_div(l, r),
 
         BinaryOp::Eq
         | BinaryOp::NotEq
@@ -145,8 +182,42 @@ pub(super) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
 
         BinaryOp::Concat => eval_concat(l, r),
 
-        // AND and OR are handled in `eval` before calling here.
+        BinaryOp::BitAnd => Ok(Value::BigInt(value_to_i64_bits(&l) & value_to_i64_bits(&r))),
+        BinaryOp::BitOr => Ok(Value::BigInt(value_to_i64_bits(&l) | value_to_i64_bits(&r))),
+        BinaryOp::BitXor => Ok(Value::BigInt(value_to_i64_bits(&l) ^ value_to_i64_bits(&r))),
+        BinaryOp::ShiftLeft => {
+            let n = value_to_i64_bits(&l);
+            let s = value_to_i64_bits(&r);
+            if s < 0 || s >= 64 {
+                Ok(Value::BigInt(0))
+            } else {
+                Ok(Value::BigInt(n << s))
+            }
+        }
+        BinaryOp::ShiftRight => {
+            let n = value_to_i64_bits(&l) as u64;
+            let s = value_to_i64_bits(&r);
+            if s < 0 || s >= 64 {
+                Ok(Value::BigInt(0))
+            } else {
+                Ok(Value::BigInt((n >> s) as i64))
+            }
+        }
+
+        BinaryOp::Regexp => eval_regexp(l, r),
+
+        BinaryOp::Xor => match (&l, &r) {
+            (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a ^ b)),
+            _ => Err(DbError::TypeMismatch {
+                expected: "Bool".into(),
+                got: l.variant_name().into(),
+            }),
+        },
+
+        // AND, OR, XOR are handled in `eval` before calling here.
         BinaryOp::And | BinaryOp::Or => unreachable!("AND/OR handled in eval"),
+        // NullSafe handled above.
+        BinaryOp::NullSafe => unreachable!(),
     }
 }
 
@@ -157,7 +228,13 @@ fn eval_arithmetic(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbError> {
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => int_arith(op, a, b),
         (Value::BigInt(a), Value::BigInt(b)) => bigint_arith(op, a, b),
-        (Value::Real(a), Value::Real(b)) => Ok(Value::Real(real_arith(op, a, b)?)),
+        (Value::Real(a), Value::Real(b)) => {
+            // MySQL: float division by zero → NULL (not ±Infinity).
+            if op == BinaryOp::Div && b == 0.0 {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Real(real_arith(op, a, b)?))
+        }
         (Value::Decimal(m1, s1), Value::Decimal(m2, s2)) => decimal_arith(op, m1, s1, m2, s2),
         _ => unreachable!("coerce_for_op ensures matching types"),
     }
@@ -413,4 +490,120 @@ pub fn like_match(text: &str, pattern: &str) -> bool {
     }
 
     pi == m
+}
+
+/// Evaluates `text LIKE pattern ESCAPE escape_ch`.
+///
+/// When `escape_ch` is Some(c), any pattern character immediately following `c`
+/// is treated as a literal (not as `%` or `_`). The escape char itself is matched
+/// by doubling it: `LIKE 'a%%' ESCAPE '%'` matches literal `a%`.
+pub fn like_match_with_escape(text: &str, pattern: &str, escape_ch: char) -> bool {
+    let text: Vec<char> = text.chars().collect();
+    let pat: Vec<char> = pattern.chars().collect();
+    let (n, m) = (text.len(), pat.len());
+
+    let mut ti: usize = 0;
+    let mut pi: usize = 0;
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti: usize = 0;
+
+    while ti < n {
+        if pi < m && pat[pi] == escape_ch {
+            // Escaped character: treat next pattern char as literal.
+            pi += 1;
+            if pi < m && pi < m && pat[pi] == text[ti] {
+                ti += 1;
+                pi += 1;
+            } else if let Some(spi) = star_pi {
+                star_ti += 1;
+                ti = star_ti;
+                pi = spi + 1;
+            } else {
+                return false;
+            }
+        } else if pi < m && (pat[pi] == '_' || pat[pi] == text[ti]) {
+            ti += 1;
+            pi += 1;
+        } else if pi < m && pat[pi] == '%' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(spi) = star_pi {
+            star_ti += 1;
+            ti = star_ti;
+            pi = spi + 1;
+        } else {
+            return false;
+        }
+    }
+
+    // Consume trailing '%' (skip escaped chars — they require a character).
+    while pi < m {
+        if pat[pi] == escape_ch {
+            break; // escaped char needs text char → no match
+        }
+        if pat[pi] != '%' {
+            break;
+        }
+        pi += 1;
+    }
+
+    pi == m
+}
+
+// ── Bitwise helpers ───────────────────────────────────────────────────────────
+
+/// Cast a Value to its i64 bit-pattern for bitwise operations.
+/// NULL must be handled by the caller before calling this.
+pub(super) fn value_to_i64_bits(v: &Value) -> i64 {
+    match v {
+        Value::Bool(b) => *b as i64,
+        Value::Int(n) => *n as i64,
+        Value::BigInt(n) => *n,
+        Value::Real(f) => *f as i64,
+        Value::Text(s) => s.parse::<i64>().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+// ── Integer division ──────────────────────────────────────────────────────────
+
+/// `a DIV b` — integer division truncated toward zero.
+fn eval_int_div(l: Value, r: Value) -> Result<Value, DbError> {
+    let a = value_to_i64_bits(&l);
+    let b = value_to_i64_bits(&r);
+    if b == 0 {
+        // MySQL: integer DIV by zero returns NULL (not an error).
+        return Ok(Value::Null);
+    }
+    Ok(Value::BigInt(a / b))
+}
+
+// ── REGEXP ────────────────────────────────────────────────────────────────────
+
+/// `text REGEXP pattern` — evaluates the regex against the text.
+/// Returns Bool or propagates NULL.
+fn eval_regexp(l: Value, r: Value) -> Result<Value, DbError> {
+    let text = match l {
+        Value::Text(s) => s,
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "Text".into(),
+                got: other.variant_name().into(),
+            })
+        }
+    };
+    let pattern = match r {
+        Value::Text(s) => s,
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "Text".into(),
+                got: other.variant_name().into(),
+            })
+        }
+    };
+    let re = regex::Regex::new(&pattern).map_err(|e| DbError::InvalidValue {
+        reason: format!("invalid REGEXP pattern: {e}"),
+    })?;
+    Ok(Value::Bool(re.is_match(&text)))
 }

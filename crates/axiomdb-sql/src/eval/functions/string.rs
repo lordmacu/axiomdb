@@ -149,10 +149,10 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
                     })
                 }
             };
-            let start = if args.len() > 1 {
+            let start_raw: i64 = if args.len() > 1 {
                 match crate::eval::eval(&args[1], row)? {
-                    Value::Int(n) => n as usize,
-                    Value::BigInt(n) => n as usize,
+                    Value::Int(n) => n as i64,
+                    Value::BigInt(n) => n,
                     Value::Null => return Ok(Value::Null),
                     other => {
                         return Err(DbError::TypeMismatch {
@@ -165,10 +165,15 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
                 1
             };
             let chars: Vec<char> = s.chars().collect();
-            let start_idx = if start == 0 {
+            let start_idx = if start_raw < 0 {
+                // MySQL: negative index counts from end; -1 = last char
+                chars
+                    .len()
+                    .saturating_sub(start_raw.unsigned_abs() as usize)
+            } else if start_raw == 0 {
                 0
             } else {
-                (start - 1).min(chars.len())
+                ((start_raw as usize) - 1).min(chars.len())
             };
             let result = if args.len() > 2 {
                 match crate::eval::eval(&args[2], row)? {
@@ -197,7 +202,7 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             let mut result = String::new();
             for arg in args {
                 match crate::eval::eval(arg, row)? {
-                    Value::Null => {} // SQL CONCAT skips NULLs (MySQL behavior)
+                    Value::Null => return Ok(Value::Null), // MySQL: any NULL arg → NULL result
                     Value::Text(s) => result.push_str(&s),
                     Value::Int(n) => result.push_str(&n.to_string()),
                     Value::BigInt(n) => result.push_str(&n.to_string()),
