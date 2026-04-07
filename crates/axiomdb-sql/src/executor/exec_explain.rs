@@ -117,6 +117,8 @@ fn dispatch(
             ],
             rows: vec![],
         }),
+        // SHOW WARNINGS / SHOW ERRORS — no session context, return empty result set (5.9e)
+        Stmt::ShowWarnings { .. } | Stmt::ShowErrors { .. } => Ok(show_warnings_result(&[])),
     }
 }
 
@@ -319,6 +321,30 @@ fn explain_select(
     ]];
 
     Ok(QueryResult::Rows { columns, rows })
+}
+
+/// Builds the 3-column result set for SHOW WARNINGS / SHOW ERRORS (5.9e).
+///
+/// MySQL protocol: connectors call `SHOW WARNINGS` after every DML statement.
+/// They expect a result set with columns Level/Code/Message, NOT an OK packet.
+/// An empty row list is valid and means "no warnings".
+pub(crate) fn show_warnings_result(warnings: &[crate::session::SqlWarning]) -> QueryResult {
+    let columns = vec![
+        ColumnMeta::computed("Level", DataType::Text),
+        ColumnMeta::computed("Code", DataType::Int),
+        ColumnMeta::computed("Message", DataType::Text),
+    ];
+    let rows: Vec<Vec<Value>> = warnings
+        .iter()
+        .map(|w| {
+            vec![
+                Value::Text(w.level.into()),
+                Value::Int(w.code as i32),
+                Value::Text(w.message.clone()),
+            ]
+        })
+        .collect();
+    QueryResult::Rows { columns, rows }
 }
 
 fn explain_columns() -> Vec<ColumnMeta> {

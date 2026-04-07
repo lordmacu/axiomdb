@@ -955,3 +955,40 @@ always stores strings as UTF-8 internally; the charset/collation metadata
 exists solely for client compatibility.
 </div>
 </div>
+
+## SHOW WARNINGS / SHOW ERRORS
+
+Returns the warning or error list from the current session.
+
+```sql
+SHOW WARNINGS [LIMIT N];
+SHOW ERRORS  [LIMIT N];
+```
+
+MySQL connectors (`JDBC`, `MySQL Connector/Python`, `mysqlclient`) issue
+`SHOW WARNINGS` automatically after every DML statement. AxiomDB returns a
+three-column result set that these clients expect:
+
+| Column  | Type | Description                                   |
+|---------|------|-----------------------------------------------|
+| Level   | TEXT | `Note`, `Warning`, or `Error`                 |
+| Code    | INT  | MySQL error number                            |
+| Message | TEXT | Human-readable description                    |
+
+`SHOW ERRORS` is identical but only returns rows whose `Level` is `Error`.
+
+`LIMIT N` restricts the result to the first N rows.
+
+An empty result set (zero rows) is valid and means there are no outstanding
+warnings or errors in the current session.
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Connector Compatibility</span>
+MySQL Connector/Python and JDBC issue <code>SHOW WARNINGS</code> after every
+statement by default. Returning the correct three-column result set (not an
+error or an OK packet) is required for these connectors to work without
+warnings or connection drops.
+</div>
+</div>

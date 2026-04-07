@@ -207,6 +207,8 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             | Stmt::ShowCollation
             | Stmt::ShowVariables
             | Stmt::ShowStatus
+            | Stmt::ShowWarnings { .. }
+            | Stmt::ShowErrors { .. }
             | Stmt::RenameTable(_) => Ok(()),
             // Transaction control — no deps.
             Stmt::Begin

@@ -432,18 +432,30 @@ impl<'src> Parser<'src> {
                         let table = self.parse_table_ref()?;
                         Ok(Stmt::ShowIndex(crate::ast::ShowIndexStmt { table }))
                     }
-                    // SHOW WARNINGS / SHOW ERRORS — return empty (5.9e deferred)
-                    Token::Ident(kw)
-                        if kw.eq_ignore_ascii_case("warnings")
-                            || kw.eq_ignore_ascii_case("errors") =>
-                    {
+                    // SHOW WARNINGS [LIMIT n] / SHOW ERRORS [LIMIT n] — 5.9e
+                    Token::Ident(kw) if kw.eq_ignore_ascii_case("warnings") => {
                         self.advance();
-                        // Optional LIMIT N — consume and discard
-                        if self.eat(&Token::Limit) {
-                            let _ = self.peek();
-                            self.advance();
-                        }
-                        Ok(Stmt::Noop)
+                        let limit = if self.eat(&Token::Limit) {
+                            match self.peek().clone() {
+                                Token::Integer(n) => { self.advance(); Some(n as u64) }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        Ok(Stmt::ShowWarnings { limit })
+                    }
+                    Token::Ident(kw) if kw.eq_ignore_ascii_case("errors") => {
+                        self.advance();
+                        let limit = if self.eat(&Token::Limit) {
+                            match self.peek().clone() {
+                                Token::Integer(n) => { self.advance(); Some(n as u64) }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        Ok(Stmt::ShowErrors { limit })
                     }
                     // SHOW ENGINES — DB tools (5.9g)
                     Token::Ident(kw) if kw.eq_ignore_ascii_case("engines") => {

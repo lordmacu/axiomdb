@@ -1,4 +1,5 @@
-/// Integration tests for 5.9f/5.9g:
+/// Integration tests for 5.9e / 5.9f / 5.9g:
+/// - SHOW WARNINGS / SHOW ERRORS (5.9e)
 /// - SHOW FULL TABLES
 /// - SHOW FULL COLUMNS
 /// - SHOW TABLE STATUS
@@ -16,6 +17,41 @@ fn full_result(result: axiomdb_sql::QueryResult) -> (Vec<String>, Vec<Vec<Value>
         }
         other => panic!("expected Rows, got {other:?}"),
     }
+}
+
+// ── 5.9e: SHOW WARNINGS / SHOW ERRORS ────────────────────────────────────────
+
+#[test]
+fn show_warnings_empty_returns_three_columns() {
+    let (mut storage, mut txn) = setup();
+    let result = run("SHOW WARNINGS", &mut storage, &mut txn);
+    let (cols, data) = full_result(result);
+    assert_eq!(cols.len(), 3);
+    assert_eq!(cols[0], "Level");
+    assert_eq!(cols[1], "Code");
+    assert_eq!(cols[2], "Message");
+    assert_eq!(data.len(), 0, "fresh session has no warnings");
+}
+
+#[test]
+fn show_errors_empty_returns_three_columns() {
+    let (mut storage, mut txn) = setup();
+    let result = run("SHOW ERRORS", &mut storage, &mut txn);
+    let (cols, data) = full_result(result);
+    assert_eq!(cols.len(), 3);
+    assert_eq!(cols[0], "Level");
+    assert_eq!(cols[1], "Code");
+    assert_eq!(cols[2], "Message");
+    assert_eq!(data.len(), 0, "fresh session has no errors");
+}
+
+#[test]
+fn show_warnings_limit_parses() {
+    let (mut storage, mut txn) = setup();
+    // SHOW WARNINGS LIMIT 1 must parse and return a result set (empty on fresh session).
+    let result = run("SHOW WARNINGS LIMIT 1", &mut storage, &mut txn);
+    let (cols, _) = full_result(result);
+    assert_eq!(cols.len(), 3);
 }
 
 // ── 5.9f: SHOW FULL TABLES ───────────────────────────────────────────────────

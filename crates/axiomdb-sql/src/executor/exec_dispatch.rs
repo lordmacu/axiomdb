@@ -149,6 +149,33 @@ fn dispatch_ctx(
         Stmt::ShowEngines => Ok(execute_show_engines()),
         Stmt::ShowCharset => Ok(execute_show_charset()),
         Stmt::ShowCollation => Ok(execute_show_collation()),
+        // SHOW WARNINGS / SHOW ERRORS — return per-session warning list (5.9e)
+        Stmt::ShowWarnings { limit } => {
+            let warnings: Vec<_> = ctx.warnings.iter().cloned().collect();
+            let mut result = show_warnings_result(&warnings);
+            if let Some(n) = limit {
+                if let QueryResult::Rows { ref mut rows, .. } = result {
+                    rows.truncate(n as usize);
+                }
+            }
+            Ok(result)
+        }
+        Stmt::ShowErrors { limit } => {
+            // SHOW ERRORS only shows "Error"-level entries.
+            let errors: Vec<_> = ctx
+                .warnings
+                .iter()
+                .filter(|w| w.level == "Error")
+                .cloned()
+                .collect();
+            let mut result = show_warnings_result(&errors);
+            if let Some(n) = limit {
+                if let QueryResult::Rows { ref mut rows, .. } = result {
+                    rows.truncate(n as usize);
+                }
+            }
+            Ok(result)
+        }
         // SHOW VARIABLES / SHOW STATUS — intercepted at wire level; empty fallback.
         Stmt::ShowVariables | Stmt::ShowStatus => Ok(QueryResult::Rows {
             columns: vec![
