@@ -1,27 +1,35 @@
 //! Expression sub-parser — parses [`Expr`] from the token stream.
 //!
-//! ## Operator precedence (lowest to highest)
+//! ## Operator precedence (lowest to highest, MySQL-compatible)
 //!
 //! ```text
 //! expr           ::= or_expr
-//! or_expr        ::= and_expr (OR and_expr)*
+//! or_expr        ::= xor_expr (OR xor_expr)*
+//! xor_expr       ::= and_expr (XOR and_expr)*
 //! and_expr       ::= not_expr (AND not_expr)*
 //! not_expr       ::= NOT not_expr | is_null_expr
-//! is_null_expr   ::= predicate (IS [NOT] NULL)?
-//! predicate      ::= addition ([NOT] BETWEEN addition AND addition)
-//!                  | addition [NOT] LIKE atom [ESCAPE atom]
-//!                  | addition [NOT] IN '(' expr_list ')'
-//!                  | addition (cmp_op addition)?
+//! is_null_expr   ::= predicate (IS [NOT] (NULL|TRUE|FALSE))?
+//! predicate      ::= bitor_expr ([NOT] BETWEEN bitor_expr AND bitor_expr)
+//!                  | bitor_expr [NOT] LIKE atom [ESCAPE atom]
+//!                  | bitor_expr [NOT] IN '(' expr_list ')'
+//!                  | bitor_expr [NOT] REGEXP bitor_expr
+//!                  | bitor_expr '<=>' bitor_expr
+//!                  | bitor_expr (cmp_op bitor_expr)?
+//! bitor_expr     ::= bitand_expr ('|' bitand_expr)*
+//! bitand_expr    ::= shift_expr ('&' shift_expr)*
+//! shift_expr     ::= addition (('<<'|'>>') addition)*
 //! addition       ::= multiplication (('+' | '-' | '||') multiplication)*
-//! multiplication ::= unary (('*' | '/' | '%') unary)*
-//! unary          ::= '-' unary | atom
-//! atom           ::= literal | col_ref | fn_call | '(' expr ')'
+//! multiplication ::= bitxor_expr (('*'|'/'|'%'|DIV) bitxor_expr)*
+//! bitxor_expr    ::= unary ('^' unary)*
+//! unary          ::= '-' unary | '~' unary | atom
+//! atom           ::= literal | hex_lit | col_ref | fn_call | '(' expr ')'
 //! col_ref        ::= identifier ['.' identifier]
 //! fn_call        ::= identifier '(' ([*] | [expr (',' expr)*]) ')'
 //! ```
 //!
 //! Phase 4.3 covered: literals, NOT, comparisons, AND, OR.
 //! Phase 4.4 adds: IS NULL, BETWEEN, LIKE, IN, arithmetic, table.col, function calls.
+//! Phase 4.G4 adds: XOR, REGEXP/RLIKE, <=>, bitwise (&|^~<<>>), DIV, hex literals.
 
 use axiomdb_core::error::DbError;
 use axiomdb_types::Value;
@@ -31,6 +39,16 @@ use crate::{
     expr::{BinaryOp, Expr, UnaryOp},
     lexer::Token,
 };
+
+// Helper: build a BinaryOp node.
+#[inline]
+fn binop(op: BinaryOp, left: Expr, right: Expr) -> Expr {
+    Expr::BinaryOp {
+        op,
+        left: Box::new(left),
+        right: Box::new(right),
+    }
+}
 
 // ── Subquery helper ───────────────────────────────────────────────────────────
 
@@ -53,14 +71,21 @@ pub(crate) fn parse_expr(p: &mut Parser) -> Result<Expr, DbError> {
 // ── OR ────────────────────────────────────────────────────────────────────────
 
 fn parse_or(p: &mut Parser) -> Result<Expr, DbError> {
-    let mut left = parse_and(p)?;
+    let mut left = parse_xor(p)?;
     while p.eat(&Token::Or) {
+        let right = parse_xor(p)?;
+        left = binop(BinaryOp::Or, left, right);
+    }
+    Ok(left)
+}
+
+// ── XOR ───────────────────────────────────────────────────────────────────────
+
+fn parse_xor(p: &mut Parser) -> Result<Expr, DbError> {
+    let mut left = parse_and(p)?;
+    while p.eat(&Token::Xor) {
         let right = parse_and(p)?;
-        left = Expr::BinaryOp {
-            op: BinaryOp::Or,
-            left: Box::new(left),
-            right: Box::new(right),
-        };
+        left = binop(BinaryOp::Xor, left, right);
     }
     Ok(left)
 }
@@ -71,11 +96,7 @@ fn parse_and(p: &mut Parser) -> Result<Expr, DbError> {
     let mut left = parse_not(p)?;
     while p.eat(&Token::And) {
         let right = parse_not(p)?;
-        left = Expr::BinaryOp {
-            op: BinaryOp::And,
-            left: Box::new(left),
-            right: Box::new(right),
-        };
+        left = binop(BinaryOp::And, left, right);
     }
     Ok(left)
 }
@@ -121,26 +142,54 @@ fn parse_is_null(p: &mut Parser) -> Result<Expr, DbError> {
     let expr = parse_predicate(p)?;
     if p.eat(&Token::Is) {
         let negated = p.eat(&Token::Not);
-        p.expect(&Token::Null)?;
-        return Ok(Expr::IsNull {
-            expr: Box::new(expr),
-            negated,
-        });
+        match p.peek() {
+            Token::Null => {
+                p.advance();
+                return Ok(Expr::IsNull {
+                    expr: Box::new(expr),
+                    negated,
+                });
+            }
+            Token::True => {
+                p.advance();
+                return Ok(Expr::IsBoolean {
+                    expr: Box::new(expr),
+                    value: true,
+                    negated,
+                });
+            }
+            Token::False => {
+                p.advance();
+                return Ok(Expr::IsBoolean {
+                    expr: Box::new(expr),
+                    value: false,
+                    negated,
+                });
+            }
+            _ => {
+                return Err(DbError::ParseError {
+                    message: "expected NULL, TRUE, or FALSE after IS [NOT]".into(),
+                    position: None,
+                });
+            }
+        }
     }
     Ok(expr)
 }
 
-// ── Predicate: BETWEEN, LIKE, IN, comparison ──────────────────────────────────
+// ── Predicate: BETWEEN, LIKE, REGEXP, IN, <=>, comparison ────────────────────
 
 fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
-    let left = parse_addition(p)?;
+    let left = parse_bitor(p)?;
 
-    // Check for optional NOT before BETWEEN/LIKE/IN.
-    // Note: bare NOT here means `a NOT BETWEEN …`, not `NOT a`.
-    // Bare NOT before a comparison (`a NOT > b`) is a parse error.
+    // Check for optional NOT before BETWEEN/LIKE/IN/REGEXP.
     let negated = if matches!(
         (p.peek(), p.peek_at(1)),
-        (Token::Not, Token::Between) | (Token::Not, Token::Like) | (Token::Not, Token::In)
+        (Token::Not, Token::Between)
+            | (Token::Not, Token::Like)
+            | (Token::Not, Token::In)
+            | (Token::Not, Token::Regexp)
+            | (Token::Not, Token::Rlike)
     ) {
         p.advance(); // consume NOT
         true
@@ -151,9 +200,9 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
     match p.peek() {
         Token::Between => {
             p.advance();
-            let low = parse_addition(p)?;
+            let low = parse_bitor(p)?;
             p.expect(&Token::And)?;
-            let high = parse_addition(p)?;
+            let high = parse_bitor(p)?;
             Ok(Expr::Between {
                 expr: Box::new(left),
                 low: Box::new(low),
@@ -164,14 +213,17 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
         Token::Like => {
             p.advance();
             let pattern = parse_atom(p)?;
-            // Optional ESCAPE clause — consume and discard (Phase 4.x)
-            if p.eat(&Token::Escape) {
-                parse_atom(p)?; // discard escape char
-            }
+            // Optional ESCAPE clause (4.4d) — single-char escape override.
+            let escape = if p.eat(&Token::Escape) {
+                Some(Box::new(parse_atom(p)?))
+            } else {
+                None
+            };
             Ok(Expr::Like {
                 expr: Box::new(left),
                 pattern: Box::new(pattern),
                 negated,
+                escape,
             })
         }
         Token::In => {
@@ -199,8 +251,22 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
                 negated,
             })
         }
+        Token::Regexp | Token::Rlike => {
+            p.advance();
+            let pattern = parse_bitor(p)?;
+            let op_expr = binop(BinaryOp::Regexp, left, pattern);
+            if negated {
+                Ok(Expr::UnaryOp {
+                    op: UnaryOp::Not,
+                    operand: Box::new(op_expr),
+                })
+            } else {
+                Ok(op_expr)
+            }
+        }
         cmp if !negated => {
             let op = match cmp {
+                Token::NullSafe => BinaryOp::NullSafe,
                 Token::Eq => BinaryOp::Eq,
                 Token::NotEq => BinaryOp::NotEq,
                 Token::Lt => BinaryOp::Lt,
@@ -210,22 +276,57 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
                 _ => return Ok(left),
             };
             p.advance();
-            let right = parse_addition(p)?;
-            Ok(Expr::BinaryOp {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            })
+            let right = parse_bitor(p)?;
+            Ok(binop(op, left, right))
         }
         _ if negated => {
-            // NOT was consumed but no BETWEEN/LIKE/IN followed — error.
+            // NOT was consumed but no BETWEEN/LIKE/IN/REGEXP followed — error.
             Err(DbError::ParseError {
-                message: "expected BETWEEN, LIKE, or IN after NOT".into(),
+                message: "expected BETWEEN, LIKE, IN, or REGEXP after NOT".into(),
                 position: Some(p.current_pos()),
             })
         }
         _ => Ok(left),
     }
+}
+
+// ── Bitwise OR: | ─────────────────────────────────────────────────────────────
+
+fn parse_bitor(p: &mut Parser) -> Result<Expr, DbError> {
+    let mut left = parse_bitand(p)?;
+    while p.eat(&Token::Pipe) {
+        let right = parse_bitand(p)?;
+        left = binop(BinaryOp::BitOr, left, right);
+    }
+    Ok(left)
+}
+
+// ── Bitwise AND: & ────────────────────────────────────────────────────────────
+
+fn parse_bitand(p: &mut Parser) -> Result<Expr, DbError> {
+    let mut left = parse_shift(p)?;
+    while p.eat(&Token::Amp) {
+        let right = parse_shift(p)?;
+        left = binop(BinaryOp::BitAnd, left, right);
+    }
+    Ok(left)
+}
+
+// ── Bit shifts: <<, >> ────────────────────────────────────────────────────────
+
+fn parse_shift(p: &mut Parser) -> Result<Expr, DbError> {
+    let mut left = parse_addition(p)?;
+    loop {
+        let op = match p.peek() {
+            Token::ShiftLeft => BinaryOp::ShiftLeft,
+            Token::ShiftRight => BinaryOp::ShiftRight,
+            _ => break,
+        };
+        p.advance();
+        let right = parse_addition(p)?;
+        left = binop(op, left, right);
+    }
+    Ok(left)
 }
 
 // ── Addition: +, -, || ────────────────────────────────────────────────────────
@@ -250,35 +351,50 @@ fn parse_addition(p: &mut Parser) -> Result<Expr, DbError> {
     Ok(left)
 }
 
-// ── Multiplication: *, /, % ───────────────────────────────────────────────────
+// ── Multiplication: *, /, DIV, % ─────────────────────────────────────────────
 
 fn parse_multiplication(p: &mut Parser) -> Result<Expr, DbError> {
-    let mut left = parse_unary(p)?;
+    let mut left = parse_bitxor(p)?;
     loop {
         let op = match p.peek() {
             Token::Star => BinaryOp::Mul,
             Token::Slash => BinaryOp::Div,
             Token::Percent => BinaryOp::Mod,
+            Token::IntDiv => BinaryOp::IntDiv,
             _ => break,
         };
         p.advance();
-        let right = parse_unary(p)?;
-        left = Expr::BinaryOp {
-            op,
-            left: Box::new(left),
-            right: Box::new(right),
-        };
+        let right = parse_bitxor(p)?;
+        left = binop(op, left, right);
     }
     Ok(left)
 }
 
-// ── Unary: unary minus ────────────────────────────────────────────────────────
+// ── Bitwise XOR: ^ ───────────────────────────────────────────────────────────
+
+fn parse_bitxor(p: &mut Parser) -> Result<Expr, DbError> {
+    let mut left = parse_unary(p)?;
+    while p.eat(&Token::Caret) {
+        let right = parse_unary(p)?;
+        left = binop(BinaryOp::BitXor, left, right);
+    }
+    Ok(left)
+}
+
+// ── Unary: unary minus, bitwise NOT ──────────────────────────────────────────
 
 fn parse_unary(p: &mut Parser) -> Result<Expr, DbError> {
     if p.eat(&Token::Minus) {
         let operand = parse_unary(p)?;
         return Ok(Expr::UnaryOp {
             op: UnaryOp::Neg,
+            operand: Box::new(operand),
+        });
+    }
+    if p.eat(&Token::Tilde) {
+        let operand = parse_unary(p)?;
+        return Ok(Expr::UnaryOp {
+            op: UnaryOp::BitNot,
             operand: Box::new(operand),
         });
     }
@@ -299,6 +415,10 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
             Ok(Expr::Param { idx })
         }
 
+        Token::HexLit(n) => {
+            p.advance();
+            Ok(Expr::Literal(Value::BigInt(n)))
+        }
         Token::Integer(n) => {
             p.advance();
             if n >= i32::MIN as i64 && n <= i32::MAX as i64 {
@@ -349,7 +469,11 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
         | Token::Desc
         | Token::Action
         | Token::Names
-        | Token::Autocommit => parse_ident_or_call(p),
+        | Token::Autocommit
+        | Token::Regexp
+        | Token::Rlike
+        | Token::Xor
+        | Token::IntDiv => parse_ident_or_call(p),
 
         // ── CASE WHEN ... END ─────────────────────────────────────────────────
         Token::Case => {

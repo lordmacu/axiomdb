@@ -331,7 +331,55 @@ pub enum Token<'src> {
     #[token("NAMES", ignore(ascii_case))]
     Names,
 
+    // ── MySQL compatibility keywords ──────────────────────────────────────────
+    /// `WORK` — used in `BEGIN WORK`.
+    #[token("WORK", ignore(ascii_case))]
+    Work,
+    /// `READ` — used in `START TRANSACTION READ ONLY/WRITE`.
+    #[token("READ", ignore(ascii_case))]
+    Read,
+    /// `ONLY` — used in `READ ONLY`.
+    #[token("ONLY", ignore(ascii_case))]
+    Only,
+    /// `WRITE` — used in `READ WRITE` and `LOCK TABLES ... WRITE`.
+    #[token("WRITE", ignore(ascii_case))]
+    Write,
+    /// `GLOBAL` — used in `SET GLOBAL var = val`.
+    #[token("GLOBAL", ignore(ascii_case))]
+    Global,
+    /// `SESSION` — used in `SET SESSION var = val`.
+    #[token("SESSION", ignore(ascii_case))]
+    Session,
+    /// `LOCAL` — synonym for SESSION in `SET LOCAL var = val`.
+    #[token("LOCAL", ignore(ascii_case))]
+    Local,
+    /// `LOCK` — statement keyword for `LOCK TABLES`.
+    #[token("LOCK", ignore(ascii_case))]
+    Lock,
+    /// `UNLOCK` — statement keyword for `UNLOCK TABLES`.
+    #[token("UNLOCK", ignore(ascii_case))]
+    Unlock,
+    /// `FLUSH` — statement keyword for `FLUSH TABLES`.
+    #[token("FLUSH", ignore(ascii_case))]
+    Flush,
+    /// `KILL` — statement keyword for `KILL [QUERY|CONNECTION] id`.
+    #[token("KILL", ignore(ascii_case))]
+    Kill,
+    /// `QUERY` — used in `KILL QUERY id`.
+    #[token("QUERY", ignore(ascii_case))]
+    Query,
+    /// `CONNECTION` — used in `KILL CONNECTION id`.
+    #[token("CONNECTION", ignore(ascii_case))]
+    Connection,
+
     // ── Literals ──────────────────────────────────────────────────────────────
+    /// Hexadecimal integer literal: `0x1A2B` or `0X1a2b`.
+    /// Converted to `i64`; very large values clamp to `i64::MAX`.
+    #[regex(r"0[xX][0-9a-fA-F]+", |lex| {
+        i64::from_str_radix(&lex.slice()[2..], 16).ok()
+    })]
+    HexLit(i64),
+
     /// Integer literal (unsigned; unary `-` is a separate `Minus` token).
     #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
     Integer(i64),
@@ -371,6 +419,20 @@ pub enum Token<'src> {
     })]
     DqIdent(&'src str),
 
+    // ── MySQL expression keywords ─────────────────────────────────────────────
+    /// `REGEXP` — regular-expression match operator.
+    #[token("REGEXP", ignore(ascii_case))]
+    Regexp,
+    /// `RLIKE` — alias for REGEXP.
+    #[token("RLIKE", ignore(ascii_case))]
+    Rlike,
+    /// `XOR` — boolean exclusive-or.
+    #[token("XOR", ignore(ascii_case))]
+    Xor,
+    /// `DIV` — integer division (`a DIV b` truncates toward zero).
+    #[token("DIV", ignore(ascii_case))]
+    IntDiv,
+
     // ── Operators ─────────────────────────────────────────────────────────────
     #[token("=")]
     Eq,
@@ -378,10 +440,19 @@ pub enum Token<'src> {
     #[token("<>")]
     #[token("!=")]
     NotEq,
+    /// `<=>` — null-safe equality (never returns NULL).
+    #[token("<=>")]
+    NullSafe,
     #[token("<=")]
     LtEq,
     #[token(">=")]
     GtEq,
+    /// `<<` — bitwise shift left.
+    #[token("<<")]
+    ShiftLeft,
+    /// `>>` — bitwise shift right.
+    #[token(">>")]
+    ShiftRight,
     #[token("<")]
     Lt,
     #[token(">")]
@@ -397,9 +468,22 @@ pub enum Token<'src> {
     Slash,
     #[token("%")]
     Percent,
-    /// String concatenation operator `||`.
+    /// String concatenation operator `||` (also doubles as bitwise-OR alternative
+    /// when `sql_mode` includes PIPES_AS_CONCAT=OFF, but we keep as concat).
     #[token("||")]
     Concat,
+    /// `&` — bitwise AND.
+    #[token("&")]
+    Amp,
+    /// `|` — bitwise OR. Must appear after `||` so logos picks the longer match.
+    #[token("|")]
+    Pipe,
+    /// `^` — bitwise XOR.
+    #[token("^")]
+    Caret,
+    /// `~` — bitwise NOT (unary).
+    #[token("~")]
+    Tilde,
     #[token(".")]
     Dot,
 

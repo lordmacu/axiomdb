@@ -349,13 +349,21 @@ fn parse_order_item(p: &mut Parser) -> Result<OrderByItem, DbError> {
 
 fn parse_limit_offset(p: &mut Parser) -> Result<(Option<Expr>, Option<Expr>), DbError> {
     if p.eat(&Token::Limit) {
-        let limit = parse_expr(p)?;
-        let offset = if p.eat(&Token::Offset) {
-            Some(parse_expr(p)?)
+        let first = parse_expr(p)?;
+        if p.eat(&Token::Comma) {
+            // MySQL comma syntax: LIMIT offset, count
+            // The first number is the OFFSET, the second is the COUNT (LIMIT).
+            let count = parse_expr(p)?;
+            Ok((Some(count), Some(first)))
         } else {
-            None
-        };
-        Ok((Some(limit), offset))
+            // Standard: LIMIT count [OFFSET offset]
+            let offset = if p.eat(&Token::Offset) {
+                Some(parse_expr(p)?)
+            } else {
+                None
+            };
+            Ok((Some(first), offset))
+        }
     } else {
         Ok((None, None))
     }

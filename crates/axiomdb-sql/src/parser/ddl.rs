@@ -17,10 +17,43 @@ use super::{expr::parse_expr, Parser};
 // ── CREATE TABLE ──────────────────────────────────────────────────────────────
 
 pub(crate) fn parse_create_database(p: &mut Parser) -> Result<Stmt, DbError> {
+    // Optional IF NOT EXISTS
+    eat_if_not_exists(p)?;
     let name = p.parse_identifier()?;
+    // Consume optional CHARACTER SET / COLLATE / DEFAULT modifiers.
+    // mysqldump generates: CREATE DATABASE IF NOT EXISTS `db` DEFAULT CHARACTER SET utf8mb4
+    skip_create_database_options(p);
     Ok(Stmt::CreateDatabase(crate::ast::CreateDatabaseStmt {
         name,
     }))
+}
+
+/// Consume optional CHARACTER SET / COLLATE / DEFAULT clauses after a database name.
+fn skip_create_database_options(p: &mut Parser) {
+    loop {
+        match p.peek().clone() {
+            // DEFAULT keyword before CHARACTER SET / COLLATE
+            Token::Default => {
+                p.advance();
+            }
+            // CHARACTER SET charset_name
+            Token::Ident(s) if s.eq_ignore_ascii_case("character") => {
+                p.advance(); // CHARACTER
+                             // optional SET keyword
+                if matches!(p.peek(), Token::Set) {
+                    p.advance();
+                }
+                // charset name (identifier or string)
+                let _ = p.parse_identifier();
+            }
+            // COLLATE collation_name
+            Token::Ident(s) if s.eq_ignore_ascii_case("collate") => {
+                p.advance(); // COLLATE
+                let _ = p.parse_identifier();
+            }
+            _ => break,
+        }
+    }
 }
 
 pub(crate) fn parse_create_schema(p: &mut Parser) -> Result<Stmt, DbError> {
@@ -57,6 +90,10 @@ pub(crate) fn parse_create_table(p: &mut Parser) -> Result<Stmt, DbError> {
 
     p.expect(&Token::RParen)?;
 
+    // Consume optional MySQL table options after the closing `)`.
+    // mysqldump output always includes: ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 etc.
+    skip_table_options(p);
+
     Ok(Stmt::CreateTable(CreateTableStmt {
         if_not_exists,
         table,
@@ -65,10 +102,98 @@ pub(crate) fn parse_create_table(p: &mut Parser) -> Result<Stmt, DbError> {
     }))
 }
 
+/// Consume MySQL table-level options that appear after the closing `)` of a
+/// CREATE TABLE statement. Examples:
+///   `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci AUTO_INCREMENT=5`
+///
+/// These are all silently discarded — AxiomDB doesn't use them but must not
+/// fail to parse valid MySQL schema dumps.
+fn skip_table_options(p: &mut Parser) {
+    loop {
+        // Optional DEFAULT before CHARSET / CHARACTER SET / COLLATE
+        let had_default = p.eat(&Token::Default);
+        match p.peek().clone() {
+            // key = value pairs: ENGINE=InnoDB, AUTO_INCREMENT=5, etc.
+            // Identifiers that are MySQL-specific option keywords
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("engine")
+                    || s.eq_ignore_ascii_case("charset")
+                    || s.eq_ignore_ascii_case("collate")
+                    || s.eq_ignore_ascii_case("auto_increment")
+                    || s.eq_ignore_ascii_case("comment")
+                    || s.eq_ignore_ascii_case("row_format")
+                    || s.eq_ignore_ascii_case("key_block_size")
+                    || s.eq_ignore_ascii_case("compression")
+                    || s.eq_ignore_ascii_case("encryption")
+                    || s.eq_ignore_ascii_case("avg_row_length")
+                    || s.eq_ignore_ascii_case("max_rows")
+                    || s.eq_ignore_ascii_case("min_rows")
+                    || s.eq_ignore_ascii_case("pack_keys")
+                    || s.eq_ignore_ascii_case("stats_persistent")
+                    || s.eq_ignore_ascii_case("checksum")
+                    || s.eq_ignore_ascii_case("delay_key_write")
+                    || s.eq_ignore_ascii_case("tablespace")
+                    || s.eq_ignore_ascii_case("storage")
+                    || s.eq_ignore_ascii_case("connection") =>
+            {
+                p.advance(); // keyword
+                if p.eat(&Token::Eq) {
+                    skip_table_option_value(p);
+                }
+            }
+            // AUTO_INCREMENT may be lexed as a keyword token rather than Ident
+            Token::AutoIncrement => {
+                p.advance();
+                if p.eat(&Token::Eq) {
+                    skip_table_option_value(p);
+                }
+            }
+            // CHARACTER SET charset_name
+            Token::Ident(s) if s.eq_ignore_ascii_case("character") => {
+                p.advance(); // CHARACTER
+                if matches!(p.peek(), Token::Set) {
+                    p.advance();
+                } // SET
+                if p.eat(&Token::Eq) {
+                    skip_table_option_value(p);
+                } else {
+                    skip_table_option_value(p);
+                }
+            }
+            // DEFAULT keyword was consumed but nothing followed — stop.
+            _ if had_default => break,
+            _ => break,
+        }
+    }
+}
+
+/// Consume a single table option value: an identifier, integer, string, or keyword.
+fn skip_table_option_value(p: &mut Parser) {
+    match p.peek().clone() {
+        Token::Ident(_) | Token::QuotedIdent(_) | Token::DqIdent(_) => {
+            p.advance();
+        }
+        Token::Integer(_) | Token::Float(_) | Token::StringLit(_) => {
+            p.advance();
+        }
+        // Keywords that commonly appear as values
+        Token::Default | Token::No | Token::Key | Token::Index => {
+            p.advance();
+        }
+        _ => {}
+    }
+}
+
 fn is_table_constraint_start(p: &Parser) -> bool {
     matches!(
         p.peek(),
-        Token::Primary | Token::Unique | Token::Foreign | Token::Check | Token::Constraint
+        Token::Primary
+            | Token::Unique
+            | Token::Foreign
+            | Token::Check
+            | Token::Constraint
+            | Token::Index  // inline INDEX idx (col) — MySQL extension
+            | Token::Key // inline KEY idx (col) — MySQL extension
     )
 }
 
@@ -122,6 +247,58 @@ fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
             Token::Check => {
                 // 4.3b
                 constraints.push(parse_check_column_constraint(p)?);
+            }
+            // ── MySQL column attributes (4.1c) ────────────────────────────────
+            // UNSIGNED / ZEROFILL / SIGNED — modifiers on numeric types.
+            // Parsed and discarded; AxiomDB stores all integers as signed.
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("unsigned")
+                    || s.eq_ignore_ascii_case("zerofill")
+                    || s.eq_ignore_ascii_case("signed") =>
+            {
+                p.advance();
+            }
+            // COLLATE collation_name
+            Token::Ident(s) if s.eq_ignore_ascii_case("collate") => {
+                p.advance();
+                let _ = p.parse_identifier()?;
+            }
+            // CHARACTER SET charset_name
+            Token::Ident(s) if s.eq_ignore_ascii_case("character") => {
+                p.advance(); // CHARACTER
+                if matches!(p.peek(), Token::Set) {
+                    p.advance();
+                } // SET
+                let _ = p.parse_identifier()?;
+            }
+            // COMMENT 'text'
+            Token::Ident(s) if s.eq_ignore_ascii_case("comment") => {
+                p.advance();
+                if matches!(p.peek(), Token::StringLit(_)) {
+                    p.advance();
+                }
+            }
+            // VISIBLE / INVISIBLE — MySQL 8.0 index visibility
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("visible") || s.eq_ignore_ascii_case("invisible") =>
+            {
+                p.advance();
+            }
+            // ON UPDATE expr — auto-update trigger (e.g. ON UPDATE CURRENT_TIMESTAMP)
+            Token::On => {
+                p.advance(); // ON
+                if matches!(p.peek(), Token::Update) {
+                    p.advance(); // UPDATE
+                                 // Consume the expression (typically CURRENT_TIMESTAMP or a function call)
+                    let _ = parse_expr(p)?;
+                }
+                // If not UPDATE, we consumed ON spuriously — but ON only appears
+                // here in "ON UPDATE" context for column defs, so this is safe.
+            }
+            // STORAGE DEFAULT|DISK|MEMORY — NDB engine storage attribute
+            Token::Ident(s) if s.eq_ignore_ascii_case("storage") => {
+                p.advance();
+                let _ = p.parse_identifier();
             }
             _ => break,
         }
@@ -183,9 +360,29 @@ fn parse_table_constraint(p: &mut Parser) -> Result<TableConstraint, DbError> {
             p.expect(&Token::RParen)?;
             Ok(TableConstraint::Check { name, expr })
         }
+        // ── MySQL inline INDEX / KEY ──────────────────────────────────────────
+        // `INDEX idx_name (col1, col2)` and `KEY idx_name (col1, col2)` inside
+        // the column list are MySQL extensions for non-unique indexes.
+        // We parse them as TableConstraint::Index (non-unique).
+        Token::Index | Token::Key => {
+            p.advance(); // consume INDEX or KEY
+            // Optional index name (may be absent in some MySQL dumps)
+            let idx_name = match p.peek() {
+                Token::LParen => None,
+                _ => Some(p.parse_identifier()?),
+            };
+            // Column list: (col1 [ASC|DESC], col2 ...)
+            let columns = parse_index_column_list_paren(p)?;
+            // Optionally consume index options: USING BTREE / HASH, COMMENT, etc.
+            skip_index_options(p);
+            Ok(TableConstraint::Index {
+                name: idx_name,
+                columns,
+            })
+        }
         other => Err(DbError::ParseError {
             message: format!(
-                "expected PRIMARY, UNIQUE, FOREIGN, or CHECK in table constraint, found {:?}",
+                "expected PRIMARY, UNIQUE, FOREIGN, CHECK, INDEX, or KEY in table constraint, found {:?}",
                 other,
             ),
             position: Some(p.current_pos()),
@@ -291,6 +488,70 @@ fn parse_fk_action(p: &mut Parser) -> Result<ForeignKeyAction, DbError> {
             ),
             position: Some(p.current_pos()),
         }),
+    }
+}
+
+// ── Inline index helpers ──────────────────────────────────────────────────────
+
+/// Parse `(col1 [ASC|DESC], col2 ...)` for an inline INDEX/KEY definition.
+/// Returns just the column names (direction discarded — non-unique indexes
+/// are stored without direction in AxiomDB's catalog).
+fn parse_index_column_list_paren(p: &mut Parser) -> Result<Vec<String>, DbError> {
+    p.expect(&Token::LParen)?;
+    let mut columns = Vec::new();
+    loop {
+        let col = p.parse_identifier()?;
+        columns.push(col);
+        // Optional column length: col(255)
+        if p.eat(&Token::LParen) {
+            // consume length spec
+            while !matches!(p.peek(), Token::RParen | Token::Eof) {
+                p.advance();
+            }
+            p.eat(&Token::RParen);
+        }
+        // Optional ASC / DESC
+        p.eat(&Token::Asc);
+        p.eat(&Token::Desc);
+        if !p.eat(&Token::Comma) {
+            break;
+        }
+    }
+    p.expect(&Token::RParen)?;
+    Ok(columns)
+}
+
+/// Consume optional index options that may follow the column list:
+/// `USING BTREE|HASH`, `COMMENT 'text'`, `KEY_BLOCK_SIZE=N`, etc.
+fn skip_index_options(p: &mut Parser) {
+    loop {
+        match p.peek().clone() {
+            Token::Using => {
+                p.advance(); // USING
+                let _ = p.parse_identifier(); // BTREE / HASH
+            }
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("comment")
+                    || s.eq_ignore_ascii_case("key_block_size")
+                    || s.eq_ignore_ascii_case("with")
+                    || s.eq_ignore_ascii_case("parser")
+                    || s.eq_ignore_ascii_case("invisible")
+                    || s.eq_ignore_ascii_case("visible") =>
+            {
+                p.advance();
+                if p.eat(&Token::Eq) {
+                    skip_table_option_value(p);
+                } else {
+                    match p.peek() {
+                        Token::StringLit(_) | Token::Integer(_) | Token::Ident(_) => {
+                            p.advance();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => break,
+        }
     }
 }
 

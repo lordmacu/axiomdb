@@ -164,6 +164,14 @@ pub enum TableConstraint {
         name: Option<String>,
         expr: Expr,
     },
+    /// Non-unique index defined inline in a CREATE TABLE column list.
+    ///
+    /// `INDEX idx_name (col1, col2)` and `KEY idx_name (col1, col2)` are MySQL
+    /// extensions equivalent to a separate `CREATE INDEX` statement.
+    Index {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
 }
 
 /// A column listed in `CREATE INDEX`, with optional sort direction.
@@ -510,6 +518,12 @@ pub enum Stmt {
     // Session
     Set(SetStmt),
     UseDatabase(UseDatabaseStmt),
+    /// A parsed but semantically empty statement.
+    ///
+    /// Used for MySQL compatibility statements that must parse cleanly but
+    /// require no action: `LOCK TABLES`, `UNLOCK TABLES`, `FLUSH TABLES`,
+    /// `KILL [QUERY|CONNECTION] id`, etc.
+    Noop,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

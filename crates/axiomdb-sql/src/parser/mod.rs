@@ -173,7 +173,24 @@ impl<'src> Parser<'src> {
             | Token::Set
             | Token::Action
             | Token::Names
-            | Token::Autocommit => {
+            | Token::Autocommit
+            | Token::Work
+            | Token::Read
+            | Token::Only
+            | Token::Write
+            | Token::Global
+            | Token::Session
+            | Token::Local
+            | Token::Lock
+            | Token::Unlock
+            | Token::Flush
+            | Token::Kill
+            | Token::Query
+            | Token::Connection
+            | Token::Regexp
+            | Token::Rlike
+            | Token::Xor
+            | Token::IntDiv => {
                 let tok = self.advance();
                 keyword_as_identifier(&tok.token)
             }
@@ -353,13 +370,20 @@ impl<'src> Parser<'src> {
             }
             Token::Begin => {
                 self.advance();
-                // Accept optional TRANSACTION keyword
+                // Accept optional WORK or TRANSACTION keyword (MySQL: BEGIN WORK)
+                self.eat(&Token::Work);
                 self.eat(&Token::Transaction);
                 Ok(Stmt::Begin)
             }
             Token::Start => {
                 self.advance();
                 self.eat(&Token::Transaction);
+                // Optional READ ONLY / READ WRITE modifier — consumed and ignored
+                // (AxiomDB uses optimistic MVCC; both modes work the same until Phase 13.7)
+                if self.eat(&Token::Read) {
+                    self.eat(&Token::Only);
+                    self.eat(&Token::Write);
+                }
                 Ok(Stmt::Begin)
             }
             Token::Commit => {
@@ -379,10 +403,57 @@ impl<'src> Parser<'src> {
             }
             Token::Set => {
                 self.advance(); // consume SET
-                let variable = self.parse_identifier()?;
+                // Skip optional SESSION / GLOBAL / LOCAL scope prefix.
+                // These are MySQL syntax (SET SESSION var = val, SET GLOBAL var = val).
+                // AxiomDB applies all settings at session scope regardless.
+                self.eat(&Token::Session);
+                self.eat(&Token::Global);
+                self.eat(&Token::Local);
+                // Skip optional @@ or @ prefix (already consumed as part of identifier
+                // in the wire-level interceptor; here we handle the raw SQL path).
+                let variable = self.parse_set_variable()?;
                 self.expect(&Token::Eq)?;
                 let value = self.parse_set_value()?;
+                // Silently skip additional `, var = val` pairs — multi-var SET.
+                // Each additional pair is parsed and thrown away; only the first
+                // variable takes effect. This is sufficient for mysqldump compatibility
+                // where `SET NAMES utf8mb4, collation_connection = utf8mb4_unicode_ci`
+                // is common.
+                while self.eat(&Token::Comma) {
+                    self.eat(&Token::Session);
+                    self.eat(&Token::Global);
+                    self.eat(&Token::Local);
+                    let _ = self.parse_set_variable();
+                    if self.eat(&Token::Eq) {
+                        let _ = self.parse_set_value();
+                    }
+                }
                 Ok(Stmt::Set(SetStmt { variable, value }))
+            }
+
+            // ── MySQL no-op statements ────────────────────────────────────────────
+            // These are common in mysqldump output or sent by MySQL clients.
+            // Parse and discard them cleanly.
+            Token::Lock => {
+                self.advance(); // LOCK
+                // Consume everything up to the end of the statement.
+                self.skip_until_statement_end();
+                Ok(Stmt::Noop)
+            }
+            Token::Unlock => {
+                self.advance(); // UNLOCK
+                self.skip_until_statement_end();
+                Ok(Stmt::Noop)
+            }
+            Token::Flush => {
+                self.advance(); // FLUSH
+                self.skip_until_statement_end();
+                Ok(Stmt::Noop)
+            }
+            Token::Kill => {
+                self.advance(); // KILL
+                self.skip_until_statement_end();
+                Ok(Stmt::Noop)
             }
             Token::Use => {
                 self.advance();
@@ -469,6 +540,40 @@ impl<'src> Parser<'src> {
     /// - `TRUE`       → `SetValue::Expr(Literal(Bool(true)))`
     /// - `FALSE`      → `SetValue::Expr(Literal(Bool(false)))`
     /// - Any other expression (literals, integers, strings) → `SetValue::Expr`
+    /// Parse a SET variable name, stripping any `@@` or `@` prefix.
+    ///
+    /// MySQL sends `SET @@session.autocommit = 1` and `SET @user_var = 1`.
+    /// We strip the `@` characters and split on `.` to get the bare name.
+    pub(crate) fn parse_set_variable(&mut self) -> Result<String, DbError> {
+        // Handle `@@variable` — two `@` signs followed by an identifier
+        // The lexer tokenizes `@@autocommit` as `Ident("@@autocommit")` (no explicit @@ token).
+        // But if it's tokenized differently, fall back to parse_identifier.
+        let name = self.parse_identifier()?;
+        // Strip leading `@` chars (e.g. "@@session.autocommit" → "autocommit")
+        let stripped = name.trim_start_matches('@');
+        // Strip optional scope prefix (e.g. "session.autocommit" → "autocommit")
+        let bare = if let Some(dot_pos) = stripped.rfind('.') {
+            &stripped[dot_pos + 1..]
+        } else {
+            stripped
+        };
+        Ok(bare.to_string())
+    }
+
+    /// Consume tokens until EOF or semicolon (end of statement), used for
+    /// no-op statements (LOCK, UNLOCK, FLUSH, KILL) where we want to parse
+    /// cleanly without interpreting the arguments.
+    pub(crate) fn skip_until_statement_end(&mut self) {
+        loop {
+            match self.peek() {
+                Token::Eof | Token::Semicolon => break,
+                _ => {
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
     pub(crate) fn parse_set_value(&mut self) -> Result<SetValue, DbError> {
         use crate::expr::Expr;
         match self.peek().clone() {
@@ -528,6 +633,25 @@ fn keyword_as_identifier(tok: &Token<'_>) -> String {
         Token::Action => "action".into(),
         Token::Names => "names".into(),
         Token::Autocommit => "autocommit".into(),
+        // MySQL compatibility keywords usable as identifiers
+        Token::Work => "work".into(),
+        Token::Read => "read".into(),
+        Token::Only => "only".into(),
+        Token::Write => "write".into(),
+        Token::Global => "global".into(),
+        Token::Session => "session".into(),
+        Token::Local => "local".into(),
+        Token::Lock => "lock".into(),
+        Token::Unlock => "unlock".into(),
+        Token::Flush => "flush".into(),
+        Token::Kill => "kill".into(),
+        Token::Query => "query".into(),
+        Token::Connection => "connection".into(),
+        // Expression operator keywords usable as identifiers
+        Token::Regexp => "regexp".into(),
+        Token::Rlike => "rlike".into(),
+        Token::Xor => "xor".into(),
+        Token::IntDiv => "div".into(),
         _ => unreachable!("only called for known unreserved keywords"),
     }
 }
