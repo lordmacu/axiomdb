@@ -7,7 +7,8 @@ use axiomdb_types::Value;
 use crate::{
     ast::{
         Assignment, DeleteStmt, FromClause, InsertSource, InsertStmt, JoinClause, JoinCondition,
-        JoinType, NullsOrder, OrderByItem, SelectItem, SelectStmt, SortOrder, Stmt, UpdateStmt,
+        JoinType, LockMode, NullsOrder, OrderByItem, SelectItem, SelectStmt, SortOrder, Stmt,
+        UpdateStmt,
     },
     expr::Expr,
     lexer::Token,
@@ -91,6 +92,20 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
 
     let (limit, offset) = parse_limit_offset(p)?;
 
+    // `FOR UPDATE` or `LOCK IN SHARE MODE` (row-level lock hint, ignored until Phase 13.7)
+    let lock_mode = if p.eat(&Token::For) {
+        p.expect(&Token::Update)?;
+        Some(LockMode::ForUpdate)
+    } else if matches!(p.peek(), Token::Lock) {
+        p.advance(); // LOCK
+        p.expect(&Token::In)?;
+        p.expect(&Token::Share)?;
+        p.expect(&Token::Mode)?;
+        Some(LockMode::ShareMode)
+    } else {
+        None
+    };
+
     Ok(SelectStmt {
         distinct,
         columns,
@@ -102,6 +117,7 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
         order_by,
         limit,
         offset,
+        lock_mode,
     })
 }
 
@@ -379,9 +395,22 @@ fn parse_expr_list(p: &mut Parser) -> Result<Vec<Expr>, DbError> {
     Ok(exprs)
 }
 
+/// Parse a single argument to `CALL proc(arg1, arg2, ...)`.
+/// Exposed as `pub(crate)` for use by the top-level parser dispatch.
+pub(crate) fn parse_call_arg(p: &mut Parser) -> Result<Expr, DbError> {
+    parse_expr(p)
+}
+
+/// Parse the expression after `DO`.
+pub(crate) fn parse_do_expr(p: &mut Parser) -> Result<Expr, DbError> {
+    parse_expr(p)
+}
+
 // ── INSERT ────────────────────────────────────────────────────────────────────
 
 fn parse_insert(p: &mut Parser) -> Result<Stmt, DbError> {
+    // `INSERT IGNORE INTO ...` — silently skip constraint violations
+    let ignore = p.eat(&Token::Ignore);
     p.expect(&Token::Into)?;
     let table = p.parse_table_ref()?;
 
@@ -440,6 +469,7 @@ fn parse_insert(p: &mut Parser) -> Result<Stmt, DbError> {
         table,
         columns,
         source,
+        ignore,
     }))
 }
 
@@ -460,10 +490,25 @@ fn parse_update(p: &mut Parser) -> Result<Stmt, DbError> {
         None
     };
 
+    // `UPDATE ... ORDER BY col [ASC|DESC] LIMIT N`
+    let order_by = if p.eat(&Token::Order) {
+        p.expect(&Token::By)?;
+        parse_order_items(p)?
+    } else {
+        vec![]
+    };
+    let limit = if p.eat(&Token::Limit) {
+        Some(parse_expr(p)?)
+    } else {
+        None
+    };
+
     Ok(Stmt::Update(UpdateStmt {
         table,
         assignments,
         where_clause,
+        order_by,
+        limit,
     }))
 }
 
@@ -484,8 +529,24 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
     } else {
         None
     };
+
+    // `DELETE ... ORDER BY col [ASC|DESC] LIMIT N`
+    let order_by = if p.eat(&Token::Order) {
+        p.expect(&Token::By)?;
+        parse_order_items(p)?
+    } else {
+        vec![]
+    };
+    let limit = if p.eat(&Token::Limit) {
+        Some(parse_expr(p)?)
+    } else {
+        None
+    };
+
     Ok(Stmt::Delete(DeleteStmt {
         table,
         where_clause,
+        order_by,
+        limit,
     }))
 }

@@ -24,6 +24,14 @@ fn analyze_stmt(
             analyze_create_table(s, storage, snapshot, default_database, default_schema)
                 .map(Stmt::CreateTable)
         }
+        // CREATE TABLE LIKE — no column resolution needed; source table is resolved at execution
+        Stmt::CreateTableLike(_) => Ok(stmt),
+        // CREATE TABLE AS SELECT — analyze the inner SELECT
+        Stmt::CreateTableAsSelect(mut s) => {
+            s.select =
+                analyze_select(s.select, storage, snapshot, default_database, default_schema)?;
+            Ok(Stmt::CreateTableAsSelect(s))
+        }
         Stmt::DropTable(s) => {
             analyze_drop_table(s, storage, snapshot, default_database, default_schema)
                 .map(Stmt::DropTable)
@@ -63,7 +71,11 @@ fn analyze_stmt_cached(
         )
         .map(Stmt::Insert),
         // DDL invalidates the cache
-        Stmt::CreateTable(_) | Stmt::DropTable(_) | Stmt::AlterTable(_) => {
+        Stmt::CreateTable(_)
+        | Stmt::CreateTableLike(_)
+        | Stmt::CreateTableAsSelect(_)
+        | Stmt::DropTable(_)
+        | Stmt::AlterTable(_) => {
             cache.invalidate();
             analyze_stmt(stmt, storage, snapshot, default_database, default_schema)
         }

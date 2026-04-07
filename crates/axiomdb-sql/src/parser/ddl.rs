@@ -6,8 +6,8 @@ use axiomdb_types::DataType;
 use crate::{
     ast::{
         AlterTableOp, AlterTableStmt, ColumnConstraint, ColumnDef, CreateIndexStmt,
-        CreateTableStmt, DropIndexStmt, DropTableStmt, ForeignKeyAction, IndexColumn, SortOrder,
-        Stmt, TableConstraint,
+        CreateTableAsSelectStmt, CreateTableLikeStmt, CreateTableStmt, DropIndexStmt,
+        DropTableStmt, ForeignKeyAction, IndexColumn, SortOrder, Stmt, TableConstraint,
     },
     lexer::Token,
 };
@@ -68,7 +68,32 @@ pub(crate) fn parse_create_schema(p: &mut Parser) -> Result<Stmt, DbError> {
 /// Parses everything after `CREATE TABLE` has been consumed.
 pub(crate) fn parse_create_table(p: &mut Parser) -> Result<Stmt, DbError> {
     let if_not_exists = eat_if_not_exists(p)?;
-    let table = p.parse_table_ref()?;
+    let new_table = p.parse_table_ref()?;
+
+    // `CREATE TABLE new LIKE src` — copy schema without data
+    if p.eat(&Token::Like) {
+        let source_table = p.parse_table_ref()?;
+        return Ok(Stmt::CreateTableLike(CreateTableLikeStmt {
+            if_not_exists,
+            new_table,
+            source_table,
+        }));
+    }
+
+    // `CREATE TABLE new AS SELECT ...` or `CREATE TABLE new SELECT ...`
+    // MySQL allows both forms (with and without AS).
+    p.eat(&Token::As); // consume optional AS
+    if matches!(p.peek(), Token::Select) {
+        p.advance(); // consume SELECT
+        let select = super::dml::parse_select(p)?;
+        return Ok(Stmt::CreateTableAsSelect(CreateTableAsSelectStmt {
+            new_table,
+            select,
+        }));
+    }
+
+    // Standard form: `CREATE TABLE new (col_defs...)`
+    let table = new_table;
     p.expect(&Token::LParen)?;
 
     let mut columns: Vec<ColumnDef> = Vec::new();

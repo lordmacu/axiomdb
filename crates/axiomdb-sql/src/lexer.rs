@@ -371,6 +371,24 @@ pub enum Token<'src> {
     /// `CONNECTION` — used in `KILL CONNECTION id`.
     #[token("CONNECTION", ignore(ascii_case))]
     Connection,
+    /// `CALL` — used in `CALL proc(args)` (MySQL stored procedure call → Noop).
+    #[token("CALL", ignore(ascii_case))]
+    Call,
+    /// `DO` — used in `DO expr` (MySQL expression discard → Noop).
+    #[token("DO", ignore(ascii_case))]
+    Do,
+    /// `IGNORE` — used in `INSERT IGNORE INTO ...`.
+    #[token("IGNORE", ignore(ascii_case))]
+    Ignore,
+    /// `FOR` — used in `SELECT ... FOR UPDATE`.
+    #[token("FOR", ignore(ascii_case))]
+    For,
+    /// `SHARE` — used in `SELECT ... LOCK IN SHARE MODE`.
+    #[token("SHARE", ignore(ascii_case))]
+    Share,
+    /// `MODE` — used in `LOCK IN SHARE MODE`.
+    #[token("MODE", ignore(ascii_case))]
+    Mode,
 
     // ── Literals ──────────────────────────────────────────────────────────────
     /// Hexadecimal integer literal: `0x1A2B` or `0X1a2b`.

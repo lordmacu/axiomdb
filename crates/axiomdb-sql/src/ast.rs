@@ -245,6 +245,8 @@ pub struct SelectStmt {
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
+    /// Row-level lock mode: `FOR UPDATE` or `LOCK IN SHARE MODE` (ignored until Phase 13.7).
+    pub lock_mode: Option<LockMode>,
 }
 
 // ── DML statements ────────────────────────────────────────────────────────────
@@ -267,6 +269,8 @@ pub struct InsertStmt {
     /// Column list after the table name. `None` means all columns in schema order.
     pub columns: Option<Vec<String>>,
     pub source: InsertSource,
+    /// `INSERT IGNORE` — skip rows that would cause a constraint violation.
+    pub ignore: bool,
 }
 
 /// An `UPDATE` statement.
@@ -275,6 +279,10 @@ pub struct UpdateStmt {
     pub table: TableRef,
     pub assignments: Vec<Assignment>,
     pub where_clause: Option<Expr>,
+    /// `UPDATE ... ORDER BY col [ASC|DESC]` — sort candidates before applying.
+    pub order_by: Vec<OrderByItem>,
+    /// `UPDATE ... LIMIT N` — cap the number of rows updated.
+    pub limit: Option<Expr>,
 }
 
 /// A `DELETE` statement.
@@ -282,6 +290,34 @@ pub struct UpdateStmt {
 pub struct DeleteStmt {
     pub table: TableRef,
     pub where_clause: Option<Expr>,
+    /// `DELETE ... ORDER BY col [ASC|DESC]` — sort candidates before deleting.
+    pub order_by: Vec<OrderByItem>,
+    /// `DELETE ... LIMIT N` — cap the number of rows deleted.
+    pub limit: Option<Expr>,
+}
+
+/// Row-level lock mode for `SELECT ... FOR UPDATE` / `LOCK IN SHARE MODE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    /// `FOR UPDATE` — exclusive write lock (ignored until Phase 13.7).
+    ForUpdate,
+    /// `LOCK IN SHARE MODE` — shared read lock (ignored until Phase 13.7).
+    ShareMode,
+}
+
+/// `CREATE TABLE new_table LIKE source_table` — copy schema without data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTableLikeStmt {
+    pub if_not_exists: bool,
+    pub new_table: TableRef,
+    pub source_table: TableRef,
+}
+
+/// `CREATE TABLE new_table AS SELECT ...` — derive schema from query result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTableAsSelectStmt {
+    pub new_table: TableRef,
+    pub select: SelectStmt,
 }
 
 // ── DDL statements ────────────────────────────────────────────────────────────
@@ -483,8 +519,21 @@ pub enum Stmt {
     Insert(InsertStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
+    /// `CALL proc(args)` — MySQL stored procedure call; executes as Noop (Phase 17+).
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
+    /// `DO expr` — MySQL expression discard; executes as Noop.
+    Do {
+        expr: Expr,
+    },
     // DDL
     CreateTable(CreateTableStmt),
+    /// `CREATE TABLE new LIKE src` — copy schema without data.
+    CreateTableLike(CreateTableLikeStmt),
+    /// `CREATE TABLE new AS SELECT ...` — derive schema + populate from query.
+    CreateTableAsSelect(CreateTableAsSelectStmt),
     CreateDatabase(CreateDatabaseStmt),
     CreateSchema(CreateSchemaStmt),
     CreateIndex(CreateIndexStmt),
@@ -559,6 +608,7 @@ mod tests {
             }],
             limit: Some(Expr::int(10)),
             offset: Some(Expr::int(0)),
+            lock_mode: None,
         });
         assert!(matches!(stmt, Stmt::Select(_)));
     }
@@ -580,6 +630,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
+            lock_mode: None,
         });
         if let Stmt::Select(s) = stmt {
             assert!(s.from.is_none());
@@ -671,6 +722,7 @@ mod tests {
                 vec![Expr::int(1), Expr::text("Alice")],
                 vec![Expr::int(2), Expr::text("Bob")],
             ]),
+            ignore: false,
         });
         if let Stmt::Insert(ins) = stmt {
             if let InsertSource::Values(rows) = &ins.source {
@@ -698,6 +750,8 @@ mod tests {
                 },
             ],
             where_clause: Some(Expr::binop(BinaryOp::Eq, col(1, "id"), Expr::int(42))),
+            order_by: vec![],
+            limit: None,
         });
         assert!(matches!(stmt, Stmt::Update(_)));
     }
@@ -710,6 +764,8 @@ mod tests {
                 expr: Box::new(col(0, "email")),
                 negated: false,
             }),
+            order_by: vec![],
+            limit: None,
         });
         assert!(matches!(stmt, Stmt::Delete(_)));
     }
@@ -746,6 +802,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
+            lock_mode: None,
         };
         let from = FromClause::Subquery {
             query: Box::new(subquery),

@@ -94,6 +94,7 @@ fn execute_insert(
 
     let compiled_preds =
         crate::partial_index::compile_index_predicates(&secondary_indexes, schema_cols)?;
+    let ignore = stmt.ignore;
 
     match stmt.source {
         // ── INSERT ... VALUES ─────────────────────────────────────────────────
@@ -140,38 +141,57 @@ fn execute_insert(
 
             // ── Phase 2: insert into the heap / indexes ──────────────────────
             //
-            // Single-row path stays unchanged.
-            // Multi-row `VALUES` now uses the batch heap path even when indexes
-            // exist, then applies grouped index maintenance once per statement.
-            if full_batch.len() == 1 {
-                // ── Single row — existing path, no overhead ────────────────────
-                let full_values = full_batch.remove(0);
-                let rid = TableEngine::insert_row(
-                    storage,
-                    txn,
-                    conn_txn,
-                    &resolved.def,
-                    schema_cols,
-                    full_values.clone(),
-                )?;
-                if !secondary_indexes.is_empty() {
-                    let snap = txn.active_snapshot(conn_txn);
-                    let updated = crate::index_maintenance::insert_into_indexes_with_undo(
-                        &secondary_indexes,
-                        &full_values,
-                        rid,
+            // Per-row path: used for single-row inserts and INSERT IGNORE.
+            // Batch path: used for multi-row inserts without IGNORE.
+            if full_batch.len() == 1 || ignore {
+                for full_values in full_batch {
+                    let rid = match TableEngine::insert_row(
                         storage,
-                        &mut noop_bloom,
-                        &compiled_preds,
-                        snap,
-                        Some(txn),
-                        Some(conn_txn),
-                    )?;
-                    for (index_id, new_root) in updated {
-                        CatalogWriter::new(storage, txn, conn_txn)?.update_index_root(index_id, new_root)?;
+                        txn,
+                        conn_txn,
+                        &resolved.def,
+                        schema_cols,
+                        full_values.clone(),
+                    ) {
+                        Ok(rid) => rid,
+                        Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
+                        Err(e) => return Err(e),
+                    };
+                    if !secondary_indexes.is_empty() {
+                        let snap = txn.active_snapshot(conn_txn);
+                        match crate::index_maintenance::insert_into_indexes_with_undo(
+                            &secondary_indexes,
+                            &full_values,
+                            rid,
+                            storage,
+                            &mut noop_bloom,
+                            &compiled_preds,
+                            snap,
+                            Some(txn),
+                            Some(conn_txn),
+                        ) {
+                            Ok(updated) => {
+                                for (index_id, new_root) in updated {
+                                    CatalogWriter::new(storage, txn, conn_txn)?
+                                        .update_index_root(index_id, new_root)?;
+                                }
+                            }
+                            Err(e) if ignore && is_ignorable_insert_error(&e) => {
+                                // Undo the heap insert — unique violation on secondary index.
+                                TableEngine::delete_row(
+                                    storage,
+                                    txn,
+                                    conn_txn,
+                                    &resolved.def,
+                                    rid,
+                                )?;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
+                    count += 1;
                 }
-                count = 1;
             } else {
                 let n = full_batch.len() as u64;
                 let committed_empty = std::collections::HashSet::new();
@@ -230,17 +250,21 @@ fn execute_insert(
                     }
                 }
 
-                let rid = TableEngine::insert_row(
+                let rid = match TableEngine::insert_row(
                     storage,
                     txn,
                     conn_txn,
                     &resolved.def,
                     schema_cols,
                     full_values.clone(),
-                )?;
+                ) {
+                    Ok(rid) => rid,
+                    Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
+                    Err(e) => return Err(e),
+                };
                 if !secondary_indexes.is_empty() {
                     let snap = txn.active_snapshot(conn_txn);
-                    let updated = crate::index_maintenance::insert_into_indexes_with_undo(
+                    match crate::index_maintenance::insert_into_indexes_with_undo(
                         &secondary_indexes,
                         &full_values,
                         rid,
@@ -250,9 +274,18 @@ fn execute_insert(
                         snap,
                         Some(txn),
                         Some(conn_txn),
-                    )?;
-                    for (index_id, new_root) in updated {
-                        CatalogWriter::new(storage, txn, conn_txn)?.update_index_root(index_id, new_root)?;
+                    ) {
+                        Ok(updated) => {
+                            for (index_id, new_root) in updated {
+                                CatalogWriter::new(storage, txn, conn_txn)?
+                                    .update_index_root(index_id, new_root)?;
+                            }
+                        }
+                        Err(e) if ignore && is_ignorable_insert_error(&e) => {
+                            TableEngine::delete_row(storage, txn, conn_txn, &resolved.def, rid)?;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 count += 1;
@@ -312,5 +345,19 @@ fn execute_insert(
         count,
         last_insert_id: None,
     })
+}
+
+/// Returns `true` if the error should be silently suppressed by `INSERT IGNORE`.
+///
+/// MySQL INSERT IGNORE converts these constraint violations into warnings and
+/// skips the offending row. All other errors are still propagated as failures.
+fn is_ignorable_insert_error(e: &DbError) -> bool {
+    matches!(
+        e,
+        DbError::UniqueViolation { .. }
+            | DbError::DuplicateKey
+            | DbError::NotNullViolation { .. }
+            | DbError::ForeignKeyViolation { .. }
+    )
 }
 

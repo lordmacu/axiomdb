@@ -43,6 +43,8 @@ fn execute_update(
         let mut temp_ctx = SessionContext::new();
         return execute_clustered_update(
             stmt.where_clause,
+            &stmt.order_by,
+            stmt.limit.as_ref(),
             assignments,
             &schema_cols,
             &secondary_indexes,
@@ -56,7 +58,7 @@ fn execute_update(
         );
     }
 
-    let candidate_rows: Vec<(RecordId, Vec<Value>)> = if let Some(ref wc) = stmt.where_clause {
+    let candidate_rows_raw: Vec<(RecordId, Vec<Value>)> = if let Some(ref wc) = stmt.where_clause {
         let update_access = crate::planner::plan_update_candidates(
             wc,
             &secondary_indexes,
@@ -75,6 +77,13 @@ fn execute_update(
     } else {
         TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?
     };
+
+    // Apply ORDER BY + LIMIT (G5.3): sort candidates then truncate to limit.
+    let candidate_rows = apply_order_by_limit_to_candidates(
+        candidate_rows_raw,
+        &stmt.order_by,
+        stmt.limit.as_ref(),
+    )?;
 
     let compiled_preds =
         crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;

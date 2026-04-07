@@ -109,6 +109,20 @@ fn dispatch_ctx(
             let conn = ctx.conn_txn.as_mut().expect("conn_txn set");
             execute_truncate(s, storage, txn, conn, &db)
         }
+        // G5.1: CALL / DO — execute as Noop
+        Stmt::Call { .. } | Stmt::Do { .. } => Ok(QueryResult::Empty),
+        // G5.5: CREATE TABLE ... LIKE
+        Stmt::CreateTableLike(s) => {
+            ctx.invalidate_all();
+            let db = ddl_database(&s.new_table.database, ctx);
+            let conn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
+            execute_create_table_like(s, storage, txn, conn, &db)
+        }
+        // G5.6: CREATE TABLE ... AS SELECT
+        Stmt::CreateTableAsSelect(s) => {
+            ctx.invalidate_all();
+            execute_create_table_as_select(s, storage, txn, bloom, ctx)
+        }
         other => {
             let conn = ctx.conn_txn.as_mut().expect("conn_txn set for dispatch");
             dispatch(other, storage, txn, conn)

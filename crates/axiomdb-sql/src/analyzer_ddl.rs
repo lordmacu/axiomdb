@@ -87,6 +87,17 @@ fn analyze_update(
     s.assignments = resolved;
 
     s.where_clause = resolve_opt_expr(s.where_clause, &ctx)?;
+
+    // Resolve ORDER BY expressions so column references have correct col_idx.
+    let mut resolved_order = Vec::with_capacity(s.order_by.len());
+    for mut item in s.order_by {
+        item.expr = resolve_expr(item.expr, &ctx)?;
+        resolved_order.push(item);
+    }
+    s.order_by = resolved_order;
+
+    s.limit = resolve_opt_expr(s.limit, &ctx)?;
+
     Ok(s)
 }
 
@@ -113,6 +124,17 @@ fn analyze_delete(
     };
 
     s.where_clause = resolve_opt_expr(s.where_clause, &ctx)?;
+
+    // Resolve ORDER BY expressions so column references have correct col_idx.
+    let mut resolved_order = Vec::with_capacity(s.order_by.len());
+    for mut item in s.order_by {
+        item.expr = resolve_expr(item.expr, &ctx)?;
+        resolved_order.push(item);
+    }
+    s.order_by = resolved_order;
+
+    s.limit = resolve_opt_expr(s.limit, &ctx)?;
+
     Ok(s)
 }
 

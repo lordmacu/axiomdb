@@ -619,3 +619,240 @@ fn persist_fk_constraint(
     Ok(())
 }
 
+// ── CREATE TABLE LIKE ─────────────────────────────────────────────────────────
+
+/// Implements `CREATE TABLE new_table LIKE source_table`.
+///
+/// Copies the full schema (columns + indexes) from `source_table` into a new
+/// empty table. No data is copied. FK constraints are intentionally not copied
+/// (MySQL behaviour: `CREATE TABLE … LIKE` does not inherit FK constraints).
+fn execute_create_table_like(
+    stmt: crate::ast::CreateTableLikeStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    database: &str,
+) -> Result<QueryResult, DbError> {
+    use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
+
+    let new_schema = stmt.new_table.schema.as_deref().unwrap_or("public");
+    let src_schema = stmt.source_table.schema.as_deref().unwrap_or("public");
+    let src_db = stmt.source_table.database.as_deref().unwrap_or(database);
+
+    // 1. Resolve source table (read-only snapshot).
+    let source = {
+        let snap = txn.active_snapshot(conn_txn);
+        let mut resolver = SchemaResolver::new(storage, snap, src_db, src_schema)?;
+        resolver.resolve_table(Some(src_schema), &stmt.source_table.name)?
+    };
+
+    // 2. Check the destination does not already exist.
+    {
+        let mut resolver = make_resolver_with_database(storage, txn, Some(conn_txn), database)?;
+        if resolver.table_exists(Some(new_schema), &stmt.new_table.name)? {
+            if stmt.if_not_exists {
+                return Ok(QueryResult::Empty);
+            }
+            return Err(DbError::TableAlreadyExists {
+                schema: new_schema.to_string(),
+                name: stmt.new_table.name.clone(),
+            });
+        }
+    }
+
+    // 3. Create the new table with the same storage layout.
+    let new_def = {
+        let mut writer = CatalogWriter::new(storage, txn, conn_txn)?;
+        let def = writer.create_table_with_layout(
+            new_schema,
+            &stmt.new_table.name,
+            source.def.storage_layout,
+        )?;
+        if database != DEFAULT_DATABASE_NAME {
+            writer.bind_table_to_database(def.id, database)?;
+        }
+        def
+    };
+    let new_table_id = new_def.id;
+
+    // 4. Copy columns (same col_idx, same type/nullable/auto_increment flags).
+    for col in &source.columns {
+        CatalogWriter::new(storage, txn, conn_txn)?.create_column(CatalogColumnDef {
+            table_id: new_table_id,
+            col_idx: col.col_idx,
+            name: col.name.clone(),
+            col_type: col.col_type,
+            nullable: col.nullable,
+            auto_increment: col.auto_increment,
+        })?;
+    }
+
+    // 5. Copy indexes with fresh empty B-tree roots.
+    //    For clustered tables the primary index root IS the table root page.
+    for idx in &source.indexes {
+        let root_page_id = if idx.is_primary && source.def.is_clustered() {
+            new_def.root_page_id
+        } else {
+            let pid = storage.alloc_page(PageType::Index)?;
+            let mut page = Page::new(PageType::Index, pid);
+            let leaf = cast_leaf_mut(&mut page);
+            leaf.is_leaf = 1;
+            leaf.set_num_keys(0);
+            leaf.set_next_leaf(NULL_PAGE);
+            page.update_checksum();
+            storage.write_page(pid, &page)?;
+            pid
+        };
+
+        CatalogWriter::new(storage, txn, conn_txn)?.create_index(IndexDef {
+            index_id: 0,
+            table_id: new_table_id,
+            name: idx.name.clone(),
+            root_page_id,
+            is_unique: idx.is_unique,
+            is_primary: idx.is_primary,
+            // FK-backing indexes are not preserved — FK constraints are not copied.
+            is_fk_index: false,
+            columns: idx.columns.clone(),
+            predicate: idx.predicate.clone(),
+            fillfactor: idx.fillfactor,
+            include_columns: idx.include_columns.clone(),
+            index_type: idx.index_type,
+            pages_per_range: idx.pages_per_range,
+        })?;
+    }
+
+    Ok(QueryResult::Empty)
+}
+
+// ── CREATE TABLE AS SELECT ────────────────────────────────────────────────────
+
+/// Implements `CREATE TABLE new_table AS SELECT …`.
+///
+/// 1. Executes the inner SELECT to materialize all rows.
+/// 2. Infers column types from the first non-NULL value in each output column
+///    (defaults to `TEXT` for all-NULL columns).
+/// 3. Creates a new Heap table with the inferred schema.
+/// 4. Inserts all rows.
+///
+/// The resulting table has no primary key, no indexes, and no FK constraints.
+fn execute_create_table_as_select(
+    stmt: crate::ast::CreateTableAsSelectStmt,
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    bloom: &mut crate::bloom::BloomRegistry,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let new_schema = stmt
+        .new_table
+        .schema
+        .clone()
+        .unwrap_or_else(|| ctx.current_schema().to_string());
+    let database = ctx.effective_database().to_string();
+    let new_name = stmt.new_table.name.clone();
+
+    // 1. Run the SELECT (read-only — borrows storage/txn immutably via coercion).
+    let result = execute_select_ctx(stmt.select, storage, txn, bloom, ctx)?;
+    let (col_meta, rows) = match result {
+        QueryResult::Rows { columns, rows } => (columns, rows),
+        // SELECT without FROM (e.g. SELECT 1) returns Rows with zero or one row.
+        other => {
+            return Err(DbError::Other(format!(
+                "CTAS inner query returned unexpected result: {other:?}"
+            )))
+        }
+    };
+
+    // 2. Infer column types: first non-NULL value in each column determines the type.
+    let num_cols = col_meta.len();
+    let mut inferred: Vec<Option<ColumnType>> = vec![None; num_cols];
+    'rows: for row in &rows {
+        for (i, val) in row.iter().enumerate() {
+            if inferred[i].is_some() {
+                continue;
+            }
+            inferred[i] = match val {
+                Value::Null => None,
+                Value::Bool(_) => Some(ColumnType::Bool),
+                Value::Int(_) => Some(ColumnType::Int),
+                Value::BigInt(_) => Some(ColumnType::BigInt),
+                Value::Real(_) => Some(ColumnType::Float),
+                Value::Text(_) => Some(ColumnType::Text),
+                Value::Bytes(_) => Some(ColumnType::Bytes),
+                Value::Timestamp(_) => Some(ColumnType::Timestamp),
+                Value::Uuid(_) => Some(ColumnType::Uuid),
+                // Decimal / Date not in ColumnType yet — store as Text.
+                _ => Some(ColumnType::Text),
+            };
+        }
+        if inferred.iter().all(|t| t.is_some()) {
+            break 'rows;
+        }
+    }
+    let col_types: Vec<ColumnType> = inferred
+        .into_iter()
+        .map(|t| t.unwrap_or(ColumnType::Text))
+        .collect();
+
+    // 3. Check destination table does not already exist.
+    {
+        let conn_txn = ctx.conn_txn.as_ref().expect("conn_txn set for DDL");
+        let mut resolver =
+            make_resolver_with_database(storage, txn, Some(conn_txn), &database)?;
+        if resolver.table_exists(Some(&new_schema), &new_name)? {
+            return Err(DbError::TableAlreadyExists {
+                schema: new_schema.clone(),
+                name: new_name.clone(),
+            });
+        }
+    }
+
+    // 4. Create the table (Heap — no primary key in CTAS).
+    let new_def = {
+        let conn_txn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
+        let mut writer = CatalogWriter::new(storage, txn, conn_txn)?;
+        let def = writer
+            .create_table_with_layout(&new_schema, &new_name, axiomdb_catalog::schema::TableStorageLayout::Heap)?;
+        if database != DEFAULT_DATABASE_NAME {
+            writer.bind_table_to_database(def.id, &database)?;
+        }
+        def
+    };
+
+    // 5. Create columns from inferred types + output column names.
+    for (i, (meta, col_type)) in col_meta.iter().zip(col_types.iter()).enumerate() {
+        let conn_txn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
+        CatalogWriter::new(storage, txn, conn_txn)?.create_column(CatalogColumnDef {
+            table_id: new_def.id,
+            col_idx: i as u16,
+            name: meta.name.clone(),
+            col_type: *col_type,
+            nullable: true, // CTAS columns are always nullable
+            auto_increment: false,
+        })?;
+    }
+
+    // Build a ColumnDef slice for TableEngine::insert_row.
+    let schema_cols: Vec<CatalogColumnDef> = col_meta
+        .iter()
+        .zip(col_types.iter())
+        .enumerate()
+        .map(|(i, (meta, &col_type))| CatalogColumnDef {
+            table_id: new_def.id,
+            col_idx: i as u16,
+            name: meta.name.clone(),
+            col_type,
+            nullable: true,
+            auto_increment: false,
+        })
+        .collect();
+
+    // 6. Insert all rows into the new table.
+    for row in rows {
+        let conn_txn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
+        TableEngine::insert_row(storage, txn, conn_txn, &new_def, &schema_cols, row)?;
+    }
+
+    Ok(QueryResult::Empty)
+}
+

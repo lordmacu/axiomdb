@@ -26,9 +26,52 @@ fn execute_clustered_insert_ctx(
         crate::partial_index::compile_index_predicates(&secondary_indexes, schema_cols)?;
     let col_positions =
         build_insert_column_positions(schema_cols, &stmt.columns, &resolved.def.table_name)?;
+    let ignore = stmt.ignore;
 
     let mut prepared_rows = Vec::new();
     let mut first_generated = None;
+
+    macro_rules! prepare_one_row_ctx {
+        ($full_values:expr, $row_idx:expr) => {{
+            let fv = $full_values;
+            match check_row_constraints(&resolved.constraints, &fv, &resolved.def.table_name) {
+                Err(e) if ignore && is_ignorable_insert_error(&e) => {}
+                Err(e) => return Err(e),
+                Ok(()) => {
+                    let fk_ok = if !resolved.foreign_keys.is_empty() {
+                        match crate::fk_enforcement::check_fk_child_insert(
+                            &fv,
+                            &resolved.foreign_keys,
+                            storage,
+                            txn,
+                            ctx.conn_txn.as_ref().expect("conn_txn for fk_check_insert"),
+                            bloom,
+                        ) {
+                            Err(e) if ignore && is_ignorable_insert_error(&e) => false,
+                            Err(e) => return Err(e),
+                            Ok(()) => true,
+                        }
+                    } else {
+                        true
+                    };
+                    if fk_ok {
+                        match crate::clustered_table::prepare_row_with_ctx(
+                            fv,
+                            schema_cols,
+                            &primary_idx,
+                            &resolved.def.table_name,
+                            ctx,
+                            $row_idx,
+                        ) {
+                            Err(e) if ignore && is_ignorable_insert_error(&e) => {}
+                            Err(e) => return Err(e),
+                            Ok(row) => prepared_rows.push(row),
+                        }
+                    }
+                }
+            }
+        }};
+    }
 
     match stmt.source {
         InsertSource::Values(rows) => {
@@ -47,29 +90,7 @@ fn execute_clustered_insert_ctx(
                     full_values.as_mut_slice(),
                     &mut first_generated,
                 )?;
-                check_row_constraints(
-                    &resolved.constraints,
-                    &full_values,
-                    &resolved.def.table_name,
-                )?;
-                if !resolved.foreign_keys.is_empty() {
-                    crate::fk_enforcement::check_fk_child_insert(
-                        &full_values,
-                        &resolved.foreign_keys,
-                        storage,
-                        txn,
-                        ctx.conn_txn.as_ref().expect("conn_txn for fk_check_insert"),
-                        bloom,
-                    )?;
-                }
-                prepared_rows.push(crate::clustered_table::prepare_row_with_ctx(
-                    full_values,
-                    schema_cols,
-                    &primary_idx,
-                    &resolved.def.table_name,
-                    ctx,
-                    row_idx + 1,
-                )?);
+                prepare_one_row_ctx!(full_values, row_idx + 1);
             }
         }
         InsertSource::Select(select_stmt) => {
@@ -93,29 +114,7 @@ fn execute_clustered_insert_ctx(
                     full_values.as_mut_slice(),
                     &mut first_generated,
                 )?;
-                check_row_constraints(
-                    &resolved.constraints,
-                    &full_values,
-                    &resolved.def.table_name,
-                )?;
-                if !resolved.foreign_keys.is_empty() {
-                    crate::fk_enforcement::check_fk_child_insert(
-                        &full_values,
-                        &resolved.foreign_keys,
-                        storage,
-                        txn,
-                        ctx.conn_txn.as_ref().expect("conn_txn for fk_check_insert"),
-                        bloom,
-                    )?;
-                }
-                prepared_rows.push(crate::clustered_table::prepare_row_with_ctx(
-                    full_values,
-                    schema_cols,
-                    &primary_idx,
-                    &resolved.def.table_name,
-                    ctx,
-                    row_idx + 1,
-                )?);
+                prepare_one_row_ctx!(full_values, row_idx + 1);
             }
         }
         InsertSource::DefaultValues => {
@@ -129,44 +128,45 @@ fn execute_clustered_insert_ctx(
                 full_values.as_mut_slice(),
                 &mut first_generated,
             )?;
-            check_row_constraints(
-                &resolved.constraints,
-                &full_values,
-                &resolved.def.table_name,
-            )?;
-            if !resolved.foreign_keys.is_empty() {
-                crate::fk_enforcement::check_fk_child_insert(
-                    &full_values,
-                    &resolved.foreign_keys,
-                    storage,
-                    txn,
-                    ctx.conn_txn.as_ref().expect("conn_txn for fk_check_insert"),
-                    bloom,
-                )?;
-            }
-            prepared_rows.push(crate::clustered_table::prepare_row_with_ctx(
-                full_values,
-                schema_cols,
-                &primary_idx,
-                &resolved.def.table_name,
-                ctx,
-                1,
-            )?);
+            prepare_one_row_ctx!(full_values, 1);
         }
     }
 
-    let count = apply_clustered_insert_rows(
-        storage,
-        txn,
-        ctx.conn_txn.as_mut().expect("active txn"),
-        bloom,
-        &resolved.def,
-        &primary_idx,
-        &mut secondary_indexes,
-        &secondary_layouts,
-        &compiled_preds,
-        &prepared_rows,
-    )?;
+    let count = if ignore {
+        let mut total = 0u64;
+        for i in 0..prepared_rows.len() {
+            match apply_clustered_insert_rows(
+                storage,
+                txn,
+                ctx.conn_txn.as_mut().expect("active txn"),
+                bloom,
+                &resolved.def,
+                &primary_idx,
+                &mut secondary_indexes,
+                &secondary_layouts,
+                &compiled_preds,
+                &prepared_rows[i..i + 1],
+            ) {
+                Ok(n) => total += n,
+                Err(e) if is_ignorable_insert_error(&e) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        total
+    } else {
+        apply_clustered_insert_rows(
+            storage,
+            txn,
+            ctx.conn_txn.as_mut().expect("active txn"),
+            bloom,
+            &resolved.def,
+            &primary_idx,
+            &mut secondary_indexes,
+            &secondary_layouts,
+            &compiled_preds,
+            &prepared_rows,
+        )?
+    };
     ctx.stats.on_rows_changed(resolved.def.id, count);
     ctx.invalidate_all();
 
@@ -262,6 +262,7 @@ fn enqueue_clustered_insert_ctx(
 
     let col_positions =
         build_insert_column_positions(schema_cols, &stmt.columns, &resolved.def.table_name)?;
+    let ignore = stmt.ignore;
 
     let mut count = 0u64;
     let mut first_generated = None;
@@ -286,31 +287,40 @@ fn enqueue_clustered_insert_ctx(
             full_values.as_mut_slice(),
             &mut first_generated,
         )?;
-        check_row_constraints(
+        match check_row_constraints(
             &resolved.constraints,
             &full_values,
             &resolved.def.table_name,
-        )?;
+        ) {
+            Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
+            other => other?,
+        }
         if !resolved.foreign_keys.is_empty() {
-            crate::fk_enforcement::check_fk_child_insert(
+            match crate::fk_enforcement::check_fk_child_insert(
                 &full_values,
                 &resolved.foreign_keys,
                 storage,
                 txn,
                 ctx.conn_txn.as_ref().expect("conn_txn for fk_check_insert"),
                 bloom,
-            )?;
+            ) {
+                Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
+                other => other?,
+            }
         }
 
         // Encode the row (coercion + PK extraction + row codec).
-        let prepared = crate::clustered_table::prepare_row_with_ctx(
+        let prepared = match crate::clustered_table::prepare_row_with_ctx(
             full_values,
             schema_cols,
             &primary_idx,
             &resolved.def.table_name,
             ctx,
             row_idx + 1,
-        )?;
+        ) {
+            Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
+            other => other?,
+        };
 
         // Intra-batch PK duplicate check — O(1) via staged_pks HashSet.
         if ctx
@@ -320,6 +330,9 @@ fn enqueue_clustered_insert_ctx(
             .staged_pks
             .contains(&prepared.primary_key_bytes)
         {
+            if ignore {
+                continue;
+            }
             let idx_name = ctx
                 .clustered_insert_batch
                 .as_ref()
