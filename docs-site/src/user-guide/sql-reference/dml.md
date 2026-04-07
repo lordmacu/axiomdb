@@ -646,6 +646,43 @@ WHERE status = 'delivered'
 GROUP BY 1;
 ```
 
+### INSERT IGNORE
+
+`INSERT IGNORE` silently skips rows that would cause a constraint violation instead
+of aborting the statement. Violations that are suppressed:
+
+- `UNIQUE` / `PRIMARY KEY` duplicate
+- `NOT NULL` on a null value
+- `FOREIGN KEY` reference not found
+
+All other rows in the same statement are still inserted.
+
+```sql
+-- Skip the duplicate tag, insert the new one
+INSERT IGNORE INTO post_tags (post_id, tag)
+VALUES (1, 'rust'), (1, 'rust');   -- second row skipped
+
+-- Bulk-import from a staging table, ignoring conflicts
+INSERT IGNORE INTO products (sku, name, price)
+SELECT sku, name, price FROM staging_products;
+```
+
+The affected-rows count reflects only the rows **actually inserted**, not the
+total rows attempted.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Per-row undo on index failure</span>
+For heap tables, when a secondary-index uniqueness check fails <em>after</em> the heap
+row was already written, AxiomDB calls <code>delete_row()</code> to undo that heap insert
+before skipping to the next row. The heap insert and its immediate delete happen
+within the same uncommitted transaction — so no other session ever sees the
+intermediate state. This avoids a two-phase prepare/commit and keeps the
+implementation simpler than MySQL's deferred constraint evaluation.
+</div>
+</div>
+
 ---
 
 ## UPDATE
@@ -655,7 +692,9 @@ Modifies existing rows. All matching rows are updated in a single statement.
 ```sql
 UPDATE table_name
 SET column = expression [, column = expression ...]
-[WHERE condition];
+[WHERE condition]
+[ORDER BY column [ASC|DESC] [, ...]]
+[LIMIT n];
 ```
 
 ```sql
@@ -680,6 +719,42 @@ WHERE status = 'pending'
 > rarely what you want. Always double-check before running unbounded updates in
 > production.
 
+### UPDATE ORDER BY + LIMIT
+
+`ORDER BY` and `LIMIT` are MySQL extensions that let you update a deterministic
+subset of rows — useful for rate-limiting bulk operations or processing a queue
+in priority order.
+
+```sql
+-- Give the 3 lowest-priced products a 5% bump
+UPDATE products
+SET price = price * 1.05
+ORDER BY price ASC
+LIMIT 3;
+
+-- Zero out the scores of the top 10 players (leaderboard reset)
+UPDATE leaderboard
+SET score = 0
+ORDER BY score DESC
+LIMIT 10;
+```
+
+Both `ORDER BY` and `LIMIT` apply to **heap and clustered tables**. The planner
+collects all candidate rows first, sorts them, truncates to the limit, then
+applies the update — so only the specified N rows change.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — ORDER BY bypasses clustered fast paths</span>
+AxiomDB's clustered UPDATE has a fused scan-patch fast path that patches fixed-size
+fields directly on leaf pages without collecting candidates. When <code>ORDER BY</code> or
+<code>LIMIT</code> is present that fast path is disabled — candidates must be collected,
+sorted, and truncated first. This is the same trade-off MySQL InnoDB makes: the
+optimizer cannot push a sort into a B-Tree scan.
+</div>
+</div>
+
 ---
 
 ## DELETE
@@ -687,7 +762,10 @@ WHERE status = 'pending'
 Removes rows from a table.
 
 ```sql
-DELETE FROM table_name [WHERE condition];
+DELETE FROM table_name
+[WHERE condition]
+[ORDER BY column [ASC|DESC] [, ...]]
+[LIMIT n];
 ```
 
 ```sql
@@ -700,6 +778,26 @@ DELETE FROM sessions WHERE expires_at < CURRENT_TIMESTAMP;
 -- Soft delete pattern (prefer UPDATE to mark rows inactive)
 UPDATE users SET deleted_at = CURRENT_TIMESTAMP WHERE id = 7;
 -- Then filter: SELECT * FROM users WHERE deleted_at IS NULL;
+```
+
+### DELETE ORDER BY + LIMIT
+
+`ORDER BY` and `LIMIT` let you delete a bounded, deterministic subset — useful
+for purging old records in small batches or removing the worst-ranked rows.
+
+```sql
+-- Delete the 100 oldest audit records (keep the table from growing unbounded)
+DELETE FROM audit_log
+ORDER BY created_at ASC
+LIMIT 100;
+
+-- Remove the 5 lowest-rated items from a product feed
+DELETE FROM product_feed
+ORDER BY rating ASC
+LIMIT 5;
+
+-- LIMIT without ORDER BY deletes N arbitrary rows
+DELETE FROM temp_imports LIMIT 500;
 ```
 
 <div class="callout callout-advantage">
@@ -1409,3 +1507,43 @@ SHOW STATUS LIKE 'Com_stmt_send_long_data';
 -- Variable_name                | Value
 -- Com_stmt_send_long_data      | 3
 ```
+
+---
+
+## CALL and DO
+
+### CALL — stored procedure invocation
+
+`CALL` invokes a stored procedure. AxiomDB does not implement stored procedures
+yet (scheduled for Phase 17), but it parses and silently ignores `CALL` statements
+so that applications and migration scripts that issue them do not break.
+
+```sql
+CALL flush_expired_sessions();
+CALL update_statistics('users', 1000);
+```
+
+The statement succeeds and returns an empty result. No error is raised.
+
+### DO — discard expression result
+
+`DO` evaluates an expression and discards the result. It is MySQL's lightweight
+alternative to `SELECT expr` when you only want the side effect (e.g., calling a
+stored function for its side effect) and do not need a result set.
+
+```sql
+DO SLEEP(0);
+DO @x := 42;
+```
+
+AxiomDB parses `DO` and returns success without evaluating the expression.
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Migration Compatibility</span>
+<code>CALL</code> and <code>DO</code> are commonly emitted by migration frameworks and ORMs
+that support MySQL stored procedures. Treating them as no-ops lets AxiomDB run
+migration files unmodified even before full stored-procedure support is available.
+</div>
+</div>

@@ -34,6 +34,10 @@ fn execute_update_ctx(
         })
         .collect::<Result<_, DbError>>()?;
 
+    // Extract ORDER BY / LIMIT before stmt.where_clause borrow (G5.3).
+    let stmt_order_by = stmt.order_by;
+    let stmt_limit = stmt.limit;
+
     let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
 
     // ── Clustered table UPDATE dispatch (Phase 39.16) ────────────────────
@@ -41,6 +45,8 @@ fn execute_update_ctx(
         let mut conn = ctx.conn_txn.take().expect("active txn for clustered update");
         let result = execute_clustered_update(
             stmt.where_clause,
+            &stmt_order_by,
+            stmt_limit.as_ref(),
             assignments,
             &schema_cols,
             &secondary_indexes,
@@ -106,7 +112,7 @@ fn execute_update_ctx(
         }
 
         // Fall through to standard candidate collection.
-        let candidate_rows: Vec<(RecordId, Vec<Value>)> = collect_delete_candidates(
+        let candidate_rows_raw: Vec<(RecordId, Vec<Value>)> = collect_delete_candidates(
             wc,
             &secondary_indexes,
             &schema_cols,
@@ -115,6 +121,11 @@ fn execute_update_ctx(
             snap.clone(),
             &resolved.def,
             bloom,
+        )?;
+        let candidate_rows = apply_order_by_limit_to_candidates(
+            candidate_rows_raw,
+            &stmt_order_by,
+            stmt_limit.as_ref(),
         )?;
 
         let mut conn = ctx.conn_txn.take().expect("active txn for execute_update_with_candidates");
@@ -138,8 +149,13 @@ fn execute_update_ctx(
     }
 
     // No WHERE clause — full table scan.
-    let candidate_rows: Vec<(RecordId, Vec<Value>)> =
+    let candidate_rows_raw: Vec<(RecordId, Vec<Value>)> =
         TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap.clone(), None)?;
+    let candidate_rows = apply_order_by_limit_to_candidates(
+        candidate_rows_raw,
+        &stmt_order_by,
+        stmt_limit.as_ref(),
+    )?;
 
     let mut conn = ctx.conn_txn.take().expect("active txn for execute_update_with_candidates fullscan");
     let result = execute_update_with_candidates(

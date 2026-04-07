@@ -460,6 +460,34 @@ impl<'src> Parser<'src> {
                 let name = self.parse_identifier()?;
                 Ok(Stmt::UseDatabase(crate::ast::UseDatabaseStmt { name }))
             }
+            // ── MySQL CALL / DO ───────────────────────────────────────────────────
+            Token::Call => {
+                self.advance(); // consume CALL
+                // Parse qualified or unqualified procedure name
+                let mut name = self.parse_identifier()?;
+                // Handle schema.proc form
+                if self.eat(&Token::Dot) {
+                    let proc = self.parse_identifier()?;
+                    name = format!("{}.{}", name, proc);
+                }
+                // Parse argument list (may be empty)
+                let mut args = vec![];
+                if self.eat(&Token::LParen) {
+                    if !matches!(self.peek(), Token::RParen) {
+                        args.push(dml::parse_call_arg(self)?);
+                        while self.eat(&Token::Comma) {
+                            args.push(dml::parse_call_arg(self)?);
+                        }
+                    }
+                    self.expect(&Token::RParen)?;
+                }
+                Ok(Stmt::Call { name, args })
+            }
+            Token::Do => {
+                self.advance(); // consume DO
+                let expr = dml::parse_do_expr(self)?;
+                Ok(Stmt::Do { expr })
+            }
             Token::Eof => Err(DbError::ParseError {
                 message: "empty input: no SQL statement found".into(),
                 position: Some(self.current_pos()),

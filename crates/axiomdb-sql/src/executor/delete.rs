@@ -25,6 +25,8 @@ fn execute_delete_ctx(
         let mut conn = ctx.conn_txn.take().expect("conn_txn for clustered delete");
         let result = execute_clustered_delete(
             stmt.where_clause,
+            &stmt.order_by,
+            stmt.limit.as_ref(),
             &resolved.columns,
             &secondary_indexes,
             storage,
@@ -48,10 +50,11 @@ fn execute_delete_ctx(
             .is_empty()
     };
 
-    // No-WHERE + no FK parent references → bulk-empty fast path (Phase 5.16).
+    // No-WHERE + no FK parent references + no ORDER BY/LIMIT → bulk-empty fast path (Phase 5.16).
     // This replaces the old "no secondary indexes" gate: PK + UNIQUE + composite
     // indexes are all handled by root rotation, not per-row B-Tree deletes.
-    if stmt.where_clause.is_none() && !has_fk_references {
+    let has_order_limit_ctx = !stmt.order_by.is_empty() || stmt.limit.is_some();
+    if stmt.where_clause.is_none() && !has_fk_references && !has_order_limit_ctx {
         // Collect all indexes with columns (PK, UNIQUE, non-unique, FK auto-indexes).
         let all_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
             .indexes
@@ -107,10 +110,12 @@ fn execute_delete_ctx(
             bloom,
         )?
     } else {
-        // No WHERE and has_fk_references=true (bulk-empty path already returned
-        // for the no-WHERE + no-FK case). Full scan: all rows qualify.
+        // No WHERE (has_fk_references=true or has_order_limit_ctx=true) — full scan.
         TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?
     };
+
+    // Apply ORDER BY + LIMIT (G5.2).
+    let to_delete = apply_order_by_limit_to_candidates(to_delete, &stmt.order_by, stmt.limit.as_ref())?;
 
     // FK parent enforcement: must run BEFORE heap delete so RESTRICT can abort
     // cleanly and CASCADE/SET NULL can still read/update child rows.
@@ -159,6 +164,8 @@ fn execute_delete_ctx(
 #[allow(clippy::too_many_arguments)]
 fn execute_clustered_delete(
     where_clause: Option<Expr>,
+    order_by: &[OrderByItem],
+    limit: Option<&Expr>,
     schema_cols: &[axiomdb_catalog::schema::ColumnDef],
     secondary_indexes: &[axiomdb_catalog::IndexDef],
     storage: &mut dyn StorageEngine,
@@ -183,7 +190,8 @@ fn execute_clustered_delete(
     // ── Fast path: DELETE without WHERE on clustered table ────────────────
     // Walk leaf chain directly, mark ALL visible cells as deleted.
     // Zero row decode — only reads RowHeader (24 bytes per cell).
-    if where_clause.is_none() && !has_fk_references {
+    // ORDER BY / LIMIT require candidate collection + sort, so bypass fast path.
+    if where_clause.is_none() && !has_fk_references && order_by.is_empty() && limit.is_none() {
         let txn_id = conn_txn.txn_id;
         let count = delete_mark_all_clustered_leaves(storage, txn, conn_txn, resolved.def.id, root_pid, txn_id, snap.clone())?;
         if count > 0 {
@@ -196,7 +204,7 @@ fn execute_clustered_delete(
         });
     }
 
-    let candidates = collect_clustered_delete_candidates(
+    let mut candidates = collect_clustered_delete_candidates(
         where_clause.as_ref(),
         schema_cols,
         secondary_indexes,
@@ -206,6 +214,11 @@ fn execute_clustered_delete(
         root_pid,
         ctx.effective_collation(),
     )?;
+
+    // Apply ORDER BY + LIMIT (G5.2): sort by row values then truncate.
+    if !order_by.is_empty() || limit.is_some() {
+        candidates = apply_order_by_limit_to_clustered_candidates(candidates, order_by, limit)?;
+    }
 
     if candidates.is_empty() {
         return Ok(QueryResult::Affected {
@@ -781,6 +794,8 @@ fn execute_delete(
         let mut temp_ctx = SessionContext::new();
         return execute_clustered_delete(
             stmt.where_clause,
+            &stmt.order_by,
+            stmt.limit.as_ref(),
             &schema_cols,
             &secondary_indexes,
             storage,
@@ -802,8 +817,10 @@ fn execute_delete(
             .is_empty()
     };
 
-    // No-WHERE + no parent-FK references → bulk-empty fast path (Phase 5.16).
-    if stmt.where_clause.is_none() && !has_fk_references {
+    // No-WHERE + no parent-FK references + no ORDER BY/LIMIT → bulk-empty fast path (Phase 5.16).
+    // ORDER BY / LIMIT require scanning + sorting first, so bypass bulk-empty.
+    let has_order_limit = !stmt.order_by.is_empty() || stmt.limit.is_some();
+    if stmt.where_clause.is_none() && !has_fk_references && !has_order_limit {
         let plan = plan_bulk_empty_table(storage, &resolved.def, &secondary_indexes, snap)?;
         let count = plan.visible_row_count;
         apply_bulk_empty_table(storage, txn, conn_txn, &mut noop_bloom, &resolved.def, plan)?;
@@ -828,9 +845,12 @@ fn execute_delete(
             &noop_bloom,
         )?
     } else {
-        // No WHERE + has_fk_references=true — full scan, all rows qualify.
+        // No WHERE (has_fk_references=true or has_order_limit=true) — full scan.
         TableEngine::scan_table(storage, &resolved.def, &schema_cols, snap, None)?
     };
+
+    // Apply ORDER BY + LIMIT (G5.2): sort candidates then truncate to limit.
+    let to_delete = apply_order_by_limit_to_candidates(to_delete, &stmt.order_by, stmt.limit.as_ref())?;
 
     // Batch-delete from heap: each page read+written once instead of 3× per row.
     let rids_only: Vec<RecordId> = to_delete.iter().map(|(rid, _)| *rid).collect();
@@ -843,6 +863,90 @@ fn execute_delete(
         count,
         last_insert_id: None,
     })
+}
+
+// ── ORDER BY + LIMIT for DML candidates ───────────────────────────────────────
+
+/// Sorts candidate rows by `order_by` expressions and truncates to `limit`.
+///
+/// Used by DELETE … ORDER BY … LIMIT and UPDATE … ORDER BY … LIMIT (G5.2 / G5.3).
+/// Both expressions are evaluated against the original row values.
+fn apply_order_by_limit_to_candidates(
+    mut candidates: Vec<(RecordId, Vec<Value>)>,
+    order_by: &[OrderByItem],
+    limit: Option<&Expr>,
+) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+    if !order_by.is_empty() {
+        let mut sort_err: Option<DbError> = None;
+        candidates.sort_by(|(_, a_vals), (_, b_vals)| {
+            if sort_err.is_some() {
+                return std::cmp::Ordering::Equal;
+            }
+            match compare_rows_for_sort(a_vals, b_vals, order_by) {
+                Ok(ord) => ord,
+                Err(e) => {
+                    sort_err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            }
+        });
+        if let Some(e) = sort_err {
+            return Err(e);
+        }
+    }
+    if let Some(limit_expr) = limit {
+        let n = eval(limit_expr, &[])?;
+        let n: usize = match n {
+            Value::Int(v) => v.max(0) as usize,
+            Value::BigInt(v) => v.max(0) as usize,
+            _ => {
+                return Err(DbError::InvalidValue {
+                    reason: "ORDER BY … LIMIT must be an integer".into(),
+                })
+            }
+        };
+        candidates.truncate(n);
+    }
+    Ok(candidates)
+}
+
+fn apply_order_by_limit_to_clustered_candidates(
+    mut candidates: Vec<ClusteredDeleteCandidate>,
+    order_by: &[OrderByItem],
+    limit: Option<&Expr>,
+) -> Result<Vec<ClusteredDeleteCandidate>, DbError> {
+    if !order_by.is_empty() {
+        let mut sort_err: Option<DbError> = None;
+        candidates.sort_by(|a, b| {
+            if sort_err.is_some() {
+                return std::cmp::Ordering::Equal;
+            }
+            match compare_rows_for_sort(&a.values, &b.values, order_by) {
+                Ok(ord) => ord,
+                Err(e) => {
+                    sort_err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            }
+        });
+        if let Some(e) = sort_err {
+            return Err(e);
+        }
+    }
+    if let Some(limit_expr) = limit {
+        let n = eval(limit_expr, &[])?;
+        let n: usize = match n {
+            Value::Int(v) => v.max(0) as usize,
+            Value::BigInt(v) => v.max(0) as usize,
+            _ => {
+                return Err(DbError::InvalidValue {
+                    reason: "DELETE … LIMIT must be an integer".into(),
+                })
+            }
+        };
+        candidates.truncate(n);
+    }
+    Ok(candidates)
 }
 
 // ── CREATE TABLE ─────────────────────────────────────────────────────────────

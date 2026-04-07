@@ -92,6 +92,7 @@ fn execute_insert_ctx(
 
     let compiled_preds =
         crate::partial_index::compile_index_predicates(&secondary_indexes, schema_cols)?;
+    let ignore = stmt.ignore;
 
     match stmt.source {
         // ── INSERT ... VALUES — immediate path ────────────────────────────────
@@ -157,63 +158,88 @@ fn execute_insert_ctx(
                 }
 
                 // Evaluate active CHECK constraints from axiom_constraints.
-                check_row_constraints(
+                match check_row_constraints(
                     &resolved.constraints,
                     &full_values,
                     &resolved.def.table_name,
-                )?;
+                ) {
+                    Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
+                    other => other?,
+                }
 
                 // FK validation: every non-NULL FK value must reference an existing parent row.
                 if !resolved.foreign_keys.is_empty() {
-                    crate::fk_enforcement::check_fk_child_insert(
+                    match crate::fk_enforcement::check_fk_child_insert(
                         &full_values,
                         &resolved.foreign_keys,
                         storage,
                         txn,
                         ctx.conn_txn.as_ref().expect("conn_txn for fk_check_insert"),
                         bloom,
-                    )?;
+                    ) {
+                        Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
+                        other => other?,
+                    }
                 }
 
                 full_batch.push(full_values);
             }
 
-            if full_batch.len() == 1 {
-                let full_values = full_batch.remove(0);
-                let rid = TableEngine::insert_row_with_ctx(
-                    storage,
-                    txn,
-                    &resolved.def,
-                    schema_cols,
-                    ctx,
-                    full_values.clone(),
-                    1,
-                )?;
-                if !secondary_indexes.is_empty() {
-                    let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
-                    let updated = crate::index_maintenance::insert_into_indexes_with_undo(
-                        &secondary_indexes,
-                        &full_values,
-                        rid,
+            if full_batch.len() == 1 || ignore {
+                for (row_idx, full_values) in full_batch.into_iter().enumerate() {
+                    let rid = match TableEngine::insert_row_with_ctx(
                         storage,
-                        bloom,
-                        &compiled_preds,
-                        snap,
-                        Some(txn),
-                        Some(ctx.conn_txn.as_mut().expect("active txn")),
-                    )?;
-                    for (index_id, new_root) in updated {
-                        CatalogWriter::new(storage, txn, ctx.conn_txn.as_mut().expect("active txn"))?.update_index_root(index_id, new_root)?;
-                        if let Some(idx) = secondary_indexes
-                            .iter_mut()
-                            .find(|i| i.index_id == index_id)
-                        {
-                            idx.root_page_id = new_root;
+                        txn,
+                        &resolved.def,
+                        schema_cols,
+                        ctx,
+                        full_values.clone(),
+                        row_idx + 1,
+                    ) {
+                        Ok(rid) => rid,
+                        Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
+                        Err(e) => return Err(e),
+                    };
+                    if !secondary_indexes.is_empty() {
+                        let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
+                        match crate::index_maintenance::insert_into_indexes_with_undo(
+                            &secondary_indexes,
+                            &full_values,
+                            rid,
+                            storage,
+                            bloom,
+                            &compiled_preds,
+                            snap,
+                            Some(txn),
+                            Some(ctx.conn_txn.as_mut().expect("active txn")),
+                        ) {
+                            Ok(updated) => {
+                                for (index_id, new_root) in updated {
+                                    CatalogWriter::new(storage, txn, ctx.conn_txn.as_mut().expect("active txn"))?.update_index_root(index_id, new_root)?;
+                                    if let Some(idx) = secondary_indexes
+                                        .iter_mut()
+                                        .find(|i| i.index_id == index_id)
+                                    {
+                                        idx.root_page_id = new_root;
+                                    }
+                                    ctx.invalidate_all();
+                                }
+                            }
+                            Err(e) if ignore && is_ignorable_insert_error(&e) => {
+                                TableEngine::delete_row(
+                                    storage,
+                                    txn,
+                                    ctx.conn_txn.as_mut().expect("active txn"),
+                                    &resolved.def,
+                                    rid,
+                                )?;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
                         }
-                        ctx.invalidate_all();
                     }
+                    count += 1;
                 }
-                count = 1;
             } else {
                 let committed_empty = std::collections::HashSet::new();
                 let n = full_batch.len() as u64;
@@ -270,17 +296,20 @@ fn execute_insert_ctx(
                 }
                 // FK validation for INSERT SELECT path.
                 if !resolved.foreign_keys.is_empty() {
-                    crate::fk_enforcement::check_fk_child_insert(
+                    match crate::fk_enforcement::check_fk_child_insert(
                         &full_values,
                         &resolved.foreign_keys,
                         storage,
                         txn,
                         ctx.conn_txn.as_ref().expect("conn_txn for fk_check_insert"),
                         bloom,
-                    )?;
+                    ) {
+                        Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
+                        other => other?,
+                    }
                 }
                 // Clone so full_values remains available for index maintenance.
-                let rid = TableEngine::insert_row_with_ctx(
+                let rid = match TableEngine::insert_row_with_ctx(
                     storage,
                     txn,
                     &resolved.def,
@@ -288,10 +317,14 @@ fn execute_insert_ctx(
                     ctx,
                     full_values.clone(),
                     row_idx + 1,
-                )?;
+                ) {
+                    Ok(rid) => rid,
+                    Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
+                    Err(e) => return Err(e),
+                };
                 if !secondary_indexes.is_empty() {
                     let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
-                    let updated = crate::index_maintenance::insert_into_indexes_with_undo(
+                    match crate::index_maintenance::insert_into_indexes_with_undo(
                         &secondary_indexes,
                         &full_values,
                         rid,
@@ -301,15 +334,29 @@ fn execute_insert_ctx(
                         snap,
                         Some(txn),
                         Some(ctx.conn_txn.as_mut().expect("active txn")),
-                    )?;
-                    for (index_id, new_root) in updated {
-                        CatalogWriter::new(storage, txn, ctx.conn_txn.as_mut().expect("active txn"))?.update_index_root(index_id, new_root)?;
-                        if let Some(idx) = secondary_indexes
-                            .iter_mut()
-                            .find(|i| i.index_id == index_id)
-                        {
-                            idx.root_page_id = new_root;
+                    ) {
+                        Ok(updated) => {
+                            for (index_id, new_root) in updated {
+                                CatalogWriter::new(storage, txn, ctx.conn_txn.as_mut().expect("active txn"))?.update_index_root(index_id, new_root)?;
+                                if let Some(idx) = secondary_indexes
+                                    .iter_mut()
+                                    .find(|i| i.index_id == index_id)
+                                {
+                                    idx.root_page_id = new_root;
+                                }
+                            }
                         }
+                        Err(e) if ignore && is_ignorable_insert_error(&e) => {
+                            TableEngine::delete_row(
+                                storage,
+                                txn,
+                                ctx.conn_txn.as_mut().expect("active txn"),
+                                &resolved.def,
+                                rid,
+                            )?;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 count += 1;

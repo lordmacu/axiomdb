@@ -10,7 +10,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              39.18 (clustered VACUUM smoke), 39.19 (clustered REBUILD guard rails),
              39.21 (aggregate hash execution — zero-alloc clustered scan),
              39.22 (UPDATE in-place zero-alloc: single/multi field patch, rollback, TEXT-before-INT),
-             40.1b (CREATE INDEX on clustered tables)
+             40.1b (CREATE INDEX on clustered tables),
+             4.G5 (DELETE/UPDATE ORDER BY+LIMIT, INSERT IGNORE, CREATE LIKE, CTAS, CALL/DO)
 """
 import os
 import signal
@@ -2641,6 +2642,67 @@ except Exception as e:
     ok("40.2 duplicate index name raises error", True, str(e))
 
 conn_ci.close()
+
+# ── G5.1 — CALL / DO as no-ops ───────────────────────────────────────────────
+
+print("\n[G5 — DML extensions]")
+conn_g5 = _connect()
+c_g5 = conn_g5.cursor()
+c_g5.execute("CALL some_procedure(1, 2)")
+c_g5.fetchall()
+ok("G5.1 CALL noop", True)
+c_g5.execute("DO SLEEP(0)")
+c_g5.fetchall()
+ok("G5.1 DO noop", True)
+
+# ── G5.2 — DELETE ORDER BY + LIMIT ───────────────────────────────────────────
+c_g5.execute("CREATE TABLE g5_scores (id INT, val INT)")
+c_g5.execute("INSERT INTO g5_scores VALUES (1,30),(2,10),(3,20),(4,40),(5,5)")
+c_g5.execute("DELETE FROM g5_scores ORDER BY val ASC LIMIT 2")
+ok("G5.2 DELETE ORDER BY LIMIT affected=2", conn_g5.affected_rows() == 2)
+c_g5.execute("SELECT val FROM g5_scores ORDER BY val")
+rows = c_g5.fetchall()
+ok("G5.2 DELETE ORDER BY LIMIT remaining vals", [r[0] for r in rows] == [20, 30, 40])
+
+# ── G5.3 — UPDATE ORDER BY + LIMIT ───────────────────────────────────────────
+c_g5.execute("CREATE TABLE g5_prices (id INT, price INT)")
+c_g5.execute("INSERT INTO g5_prices VALUES (1,100),(2,200),(3,300),(4,400)")
+c_g5.execute("UPDATE g5_prices SET price = price + 1000 ORDER BY price ASC LIMIT 2")
+ok("G5.3 UPDATE ORDER BY LIMIT affected=2", conn_g5.affected_rows() == 2)
+c_g5.execute("SELECT price FROM g5_prices ORDER BY price")
+rows = c_g5.fetchall()
+ok("G5.3 UPDATE ORDER BY LIMIT new prices", [r[0] for r in rows] == [300, 400, 1100, 1200])
+
+# ── G5.4 — INSERT IGNORE ─────────────────────────────────────────────────────
+c_g5.execute("CREATE TABLE g5_uniq (id INT UNIQUE, val INT)")
+c_g5.execute("INSERT INTO g5_uniq VALUES (1, 10)")
+c_g5.execute("INSERT IGNORE INTO g5_uniq VALUES (1, 20), (2, 30)")
+ok("G5.4 INSERT IGNORE skips duplicate, inserts new", conn_g5.affected_rows() == 1)
+c_g5.execute("SELECT val FROM g5_uniq ORDER BY id")
+rows = c_g5.fetchall()
+ok("G5.4 INSERT IGNORE original row unchanged", rows[0][0] == 10)
+ok("G5.4 INSERT IGNORE new row inserted", rows[1][0] == 30)
+
+# ── G5.5 — CREATE TABLE LIKE ─────────────────────────────────────────────────
+c_g5.execute("CREATE TABLE g5_orig (id INT, name TEXT, score FLOAT)")
+c_g5.execute("CREATE TABLE g5_copy LIKE g5_orig")
+c_g5.execute("INSERT INTO g5_copy VALUES (1, 'x', 3.14)")
+ok("G5.5 CREATE TABLE LIKE — insert works", conn_g5.affected_rows() == 1)
+c_g5.execute("SELECT id, name FROM g5_copy")
+rows = c_g5.fetchall()
+ok("G5.5 CREATE TABLE LIKE — schema matches", rows[0] == (1, 'x'))
+
+# ── G5.6 — CTAS ──────────────────────────────────────────────────────────────
+c_g5.execute("CREATE TABLE g5_items (id INT, price INT)")
+c_g5.execute("INSERT INTO g5_items VALUES (1,100),(2,200),(3,300)")
+c_g5.execute("CREATE TABLE g5_cheap AS SELECT id, price FROM g5_items WHERE price < 250")
+c_g5.execute("SELECT COUNT(*) FROM g5_cheap")
+ok("G5.6 CTAS row count", c_g5.fetchone()[0] == 2)
+c_g5.execute("SELECT id FROM g5_cheap ORDER BY id")
+rows = c_g5.fetchall()
+ok("G5.6 CTAS correct rows", [r[0] for r in rows] == [1, 2])
+
+conn_g5.close()
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

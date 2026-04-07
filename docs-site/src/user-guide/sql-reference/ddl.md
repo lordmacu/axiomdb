@@ -352,6 +352,73 @@ CREATE TABLE order_items (
 );
 ```
 
+### CREATE TABLE LIKE
+
+Copies the schema of an existing table into a new empty table. Column definitions,
+constraints, and indexes are all replicated — but no rows are copied.
+
+```sql
+CREATE TABLE staging LIKE production_orders;
+
+CREATE TABLE IF NOT EXISTS archive_users LIKE users;
+```
+
+The new table is independent of the source. Changes to the source schema (via
+`ALTER TABLE`) do not affect the copy, and vice versa.
+
+**What is copied:**
+- All columns (name, type, nullability, default, auto_increment)
+- All constraints (PRIMARY KEY, UNIQUE, CHECK, FOREIGN KEY)
+- All secondary indexes (with fresh empty B-tree roots)
+
+**What is not copied:** rows, AUTO_INCREMENT counter state, table-level comments.
+
+### CREATE TABLE AS SELECT (CTAS)
+
+Creates a new heap table and populates it from a `SELECT` query in one statement.
+
+```sql
+CREATE TABLE cheap_products AS
+SELECT id, name, price
+FROM products
+WHERE price < 50;
+
+-- With AS keyword (optional)
+CREATE TABLE report_2024 AS
+SELECT user_id, SUM(total) AS revenue
+FROM orders
+WHERE YEAR(placed_at) = 2024
+GROUP BY user_id;
+```
+
+**Column types** are inferred from the first non-NULL value in each column of the
+result set. If the first row is all-NULL for a column, AxiomDB falls back to `TEXT`.
+Column names come from the SELECT projection aliases (or the raw expression text if
+no alias is given).
+
+The resulting table is always a **heap table** regardless of whether the source
+table is clustered. To create a clustered copy, add a `PRIMARY KEY` and use
+`ALTER TABLE ... REBUILD` or declare the PK inline:
+
+```sql
+-- Heap CTAS first, then promote to clustered
+CREATE TABLE copy AS SELECT * FROM src;
+ALTER TABLE copy ADD CONSTRAINT PRIMARY KEY (id);
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — CTAS always produces heap tables</span>
+CTAS infers column types from result values, not from column metadata — so the
+output schema is not known until the SELECT runs. Deciding whether to build a
+clustered tree would require a two-pass approach (run SELECT, build schema, then
+rebuild as clustered). AxiomDB uses a single-pass approach: heap first, clustered
+on explicit request. This matches SQLite's behavior and avoids a hidden O(N log N)
+sort on every CTAS.
+</div>
+</div>
+
 ---
 
 ## CREATE INDEX

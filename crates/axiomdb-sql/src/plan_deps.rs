@@ -218,6 +218,12 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             Stmt::Explain(inner) => self.visit_stmt(inner),
             // Session — no catalog table deps.
             Stmt::Set(_) | Stmt::UseDatabase(_) | Stmt::Noop => Ok(()),
+            // MySQL noops — no deps.
+            Stmt::Call { .. } | Stmt::Do { .. } => Ok(()),
+            // CREATE TABLE LIKE — DDL, no deps.
+            Stmt::CreateTableLike(_) => Ok(()),
+            // CREATE TABLE AS SELECT — deps come from the inner SELECT.
+            Stmt::CreateTableAsSelect(s) => self.visit_select(&s.select),
         }
     }
 

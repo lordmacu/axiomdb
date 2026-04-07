@@ -89,6 +89,16 @@ fn dispatch(
             })
         }
         Stmt::Noop => Ok(QueryResult::Empty),
+        // G5.1: CALL / DO — execute as Noop (no session context needed)
+        Stmt::Call { .. } | Stmt::Do { .. } => Ok(QueryResult::Empty),
+        // G5.5: CREATE TABLE LIKE
+        Stmt::CreateTableLike(s) => {
+            execute_create_table_like(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
+        }
+        // G5.6: CREATE TABLE AS SELECT — requires session context (cannot run via dispatch)
+        Stmt::CreateTableAsSelect(_) => Err(DbError::NotImplemented {
+            feature: "CREATE TABLE AS SELECT requires session context — use execute_with_ctx".into(),
+        }),
     }
 }
 

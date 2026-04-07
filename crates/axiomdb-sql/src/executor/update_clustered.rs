@@ -5,6 +5,8 @@
 #[allow(clippy::too_many_arguments)]
 fn execute_clustered_update(
     where_clause: Option<Expr>,
+    order_by: &[OrderByItem],
+    limit: Option<&Expr>,
     assignments: Vec<(usize, Expr)>,
     schema_cols: &[axiomdb_catalog::schema::ColumnDef],
     secondary_indexes: &[axiomdb_catalog::IndexDef],
@@ -64,7 +66,8 @@ fn execute_clustered_update(
         })
         .unwrap_or(crate::planner::AccessMethod::Scan);
 
-    if field_patch_ok && !pk_might_change && !has_affected_secondary {
+    // ORDER BY / LIMIT require candidate collection + sort — skip the fast path.
+    if field_patch_ok && !pk_might_change && !has_affected_secondary && order_by.is_empty() && limit.is_none() {
         let bounds = match &access_method {
             crate::planner::AccessMethod::Scan => {
                 Some((Bound::Unbounded, Bound::Unbounded))
@@ -99,7 +102,7 @@ fn execute_clustered_update(
         }
     }
 
-    let candidates = collect_clustered_update_candidates(
+    let mut candidates = collect_clustered_update_candidates(
         where_clause.as_ref(),
         schema_cols,
         secondary_indexes,
@@ -109,6 +112,11 @@ fn execute_clustered_update(
         resolved,
         root_pid,
     )?;
+
+    // Apply ORDER BY + LIMIT (G5.3): sort by row values then truncate.
+    if !order_by.is_empty() || limit.is_some() {
+        candidates = apply_order_by_limit_to_clustered_update_candidates(candidates, order_by, limit)?;
+    }
 
     if candidates.is_empty() {
         return Ok(QueryResult::Affected {
@@ -428,5 +436,44 @@ fn execute_clustered_update(
         count: matched_count,
         last_insert_id: None,
     })
+}
+
+fn apply_order_by_limit_to_clustered_update_candidates(
+    mut candidates: Vec<ClusteredUpdateCandidate>,
+    order_by: &[OrderByItem],
+    limit: Option<&Expr>,
+) -> Result<Vec<ClusteredUpdateCandidate>, DbError> {
+    if !order_by.is_empty() {
+        let mut sort_err: Option<DbError> = None;
+        candidates.sort_by(|a, b| {
+            if sort_err.is_some() {
+                return std::cmp::Ordering::Equal;
+            }
+            match compare_rows_for_sort(&a.values, &b.values, order_by) {
+                Ok(ord) => ord,
+                Err(e) => {
+                    sort_err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            }
+        });
+        if let Some(e) = sort_err {
+            return Err(e);
+        }
+    }
+    if let Some(limit_expr) = limit {
+        let n = eval(limit_expr, &[])?;
+        let n: usize = match n {
+            Value::Int(v) => v.max(0) as usize,
+            Value::BigInt(v) => v.max(0) as usize,
+            _ => {
+                return Err(DbError::InvalidValue {
+                    reason: "UPDATE … LIMIT must be an integer".into(),
+                })
+            }
+        };
+        candidates.truncate(n);
+    }
+    Ok(candidates)
 }
 
