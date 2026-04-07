@@ -217,7 +217,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             // EXPLAIN: recurse into the wrapped statement.
             Stmt::Explain(inner) => self.visit_stmt(inner),
             // Session — no catalog table deps.
-            Stmt::Set(_) | Stmt::UseDatabase(_) => Ok(()),
+            Stmt::Set(_) | Stmt::UseDatabase(_) | Stmt::Noop => Ok(()),
         }
     }
 
@@ -344,6 +344,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 self.visit_expr(pattern)
             }
             Expr::IsNull { expr, .. } => self.visit_expr(expr),
+            Expr::IsBoolean { expr, .. } => self.visit_expr(expr),
             Expr::Cast { expr, .. } => self.visit_expr(expr),
             Expr::Case {
                 operand,

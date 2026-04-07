@@ -59,14 +59,14 @@ pub fn verify_and_repair_indexes_on_open(
     txn: &mut TxnManager,
 ) -> Result<IndexIntegrityReport, DbError> {
     let snapshot = txn.snapshot();
-    let tables = list_visible_tables(storage, snapshot)?;
+    let tables = list_visible_tables(storage, snapshot.clone())?;
     let mut report = IndexIntegrityReport::default();
     let mut pending = Vec::new();
 
     for table_def in &tables {
         report.tables_checked += 1;
         let (col_defs, indexes) = {
-            let mut reader = CatalogReader::new(storage, snapshot)?;
+            let mut reader = CatalogReader::new(storage, snapshot.clone())?;
             (
                 reader.list_columns(table_def.id)?,
                 reader.list_indexes(table_def.id)?,
@@ -97,7 +97,12 @@ pub fn verify_and_repair_indexes_on_open(
                 None => continue, // no PK metadata — skip
             };
 
-            let rows = crate::table::scan_clustered_table(storage, table_def, &col_defs, snapshot)?;
+            let rows = crate::table::scan_clustered_table(
+                storage,
+                table_def,
+                &col_defs,
+                snapshot.clone(),
+            )?;
             let compiled_preds = compile_index_predicates(&indexes, &col_defs)?;
 
             for idx in secondary {
@@ -157,7 +162,8 @@ pub fn verify_and_repair_indexes_on_open(
             }
         } else {
             // Heap table: verify all indexes.
-            let rows = TableEngine::scan_table(storage, table_def, &col_defs, snapshot, None)?;
+            let rows =
+                TableEngine::scan_table(storage, table_def, &col_defs, snapshot.clone(), None)?;
             let compiled_preds = compile_index_predicates(&indexes, &col_defs)?;
 
             for (idx, compiled_pred) in indexes.iter().zip(compiled_preds.iter()) {
@@ -169,7 +175,11 @@ pub fn verify_and_repair_indexes_on_open(
                 }
 
                 let build = match build_index_root_from_heap(
-                    storage, table_def, &col_defs, idx, snapshot,
+                    storage,
+                    table_def,
+                    &col_defs,
+                    idx,
+                    snapshot.clone(),
                 ) {
                     Ok(build) => build,
                     Err(err) => {
@@ -230,16 +240,17 @@ fn apply_pending_rebuilds(
         return Err(err);
     }
 
-    let txn_id = match txn.begin() {
-        Ok(id) => id,
+    let mut conn_txn = match txn.begin() {
+        Ok(ct) => ct,
         Err(err) => {
             cleanup_pending_new_roots(storage, pending);
             return Err(err);
         }
     };
+    let txn_id = conn_txn.txn_id;
 
     let apply_result = (|| -> Result<(), DbError> {
-        let mut writer = CatalogWriter::new(storage, txn)?;
+        let mut writer = CatalogWriter::new(storage, txn, &mut conn_txn)?;
         let mut old_pages_to_free = Vec::new();
         for rebuild in pending {
             writer.update_index_root(rebuild.index_id, rebuild.new_root)?;
@@ -247,17 +258,17 @@ fn apply_pending_rebuilds(
         }
         old_pages_to_free.sort_unstable();
         old_pages_to_free.dedup();
-        txn.defer_free_pages(old_pages_to_free)?;
+        txn.defer_free_pages(&mut conn_txn, old_pages_to_free);
         Ok(())
     })();
 
     if let Err(err) = apply_result {
-        let _ = txn.rollback(storage);
+        let _ = txn.rollback(conn_txn, storage);
         cleanup_pending_new_roots(storage, pending);
         return Err(err);
     }
 
-    txn.commit()?;
+    txn.commit(conn_txn)?;
     txn.release_immediate_committed_frees(storage, txn_id)?;
     Ok(())
 }

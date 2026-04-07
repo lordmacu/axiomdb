@@ -108,6 +108,7 @@ pub fn insert_into_indexes(
         compiled_preds,
         snap,
         None,
+        None,
     )
 }
 
@@ -122,6 +123,7 @@ pub fn insert_into_indexes_with_undo(
     compiled_preds: &[Option<Expr>],
     snap: TransactionSnapshot,
     mut txn: Option<&mut axiomdb_wal::TxnManager>,
+    mut conn_txn: Option<&mut axiomdb_wal::ConnectionTxn>,
 ) -> Result<Vec<(u32, u64)>, DbError> {
     let mut updated_roots = Vec::new();
 
@@ -179,7 +181,7 @@ pub fn insert_into_indexes_with_undo(
                     storage,
                     existing_rid.page_id,
                     existing_rid.slot_id,
-                    snap,
+                    snap.clone(),
                 )? {
                     let dup_val = key_vals.first().map(|v| format!("{v}"));
                     return Err(DbError::UniqueViolation {
@@ -203,8 +205,8 @@ pub fn insert_into_indexes_with_undo(
         }
 
         // Record undo op so ROLLBACK can remove this B-Tree entry.
-        if let Some(ref mut tm) = txn {
-            let _ = tm.record_index_insert(idx.index_id, current_root, key);
+        if let (Some(ref mut tm), Some(ref mut ct)) = (&mut txn, &mut conn_txn) {
+            tm.record_index_insert(ct, idx.index_id, current_root, key);
         }
     }
 
@@ -568,7 +570,7 @@ pub fn batch_insert_into_indexes(
                         storage,
                         existing_rid.page_id,
                         existing_rid.slot_id,
-                        snap,
+                        snap.clone(),
                     )? {
                         let dup_val = Some("(encoded)".to_string());
                         return Err(DbError::UniqueViolation {
@@ -632,7 +634,7 @@ pub fn insert_many_into_single_index(
                     storage,
                     existing_rid.page_id,
                     existing_rid.slot_id,
-                    snap,
+                    snap.clone(),
                 )? {
                     let dup_val = key_vals.first().map(|v| format!("{v}"));
                     return Err(DbError::UniqueViolation {

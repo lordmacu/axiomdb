@@ -232,22 +232,23 @@ fn plan_bulk_empty_table(
 fn apply_bulk_empty_table(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
     bloom: &mut crate::bloom::BloomRegistry,
     table_def: &axiomdb_catalog::TableDef,
     plan: BulkEmptyPlan,
 ) -> Result<(), DbError> {
     // Rotate data root in the catalog (works for both heap and clustered tables).
-    CatalogWriter::new(storage, txn)?.update_table_root(table_def.id, plan.new_data_root)?;
+    CatalogWriter::new(storage, txn, conn_txn)?.update_table_root(table_def.id, plan.new_data_root)?;
 
     // Rotate each index root in the catalog + reset its Bloom filter.
     for (index_id, new_root) in &plan.new_index_roots {
-        CatalogWriter::new(storage, txn)?.update_index_root(*index_id, *new_root)?;
+        CatalogWriter::new(storage, txn, conn_txn)?.update_index_root(*index_id, *new_root)?;
         // Reset bloom filter so old key presence checks return false.
         bloom.create(*index_id, 0);
     }
 
     // Enqueue old pages for post-commit reclamation.
-    txn.defer_free_pages(plan.old_pages_to_free)?;
+    txn.defer_free_pages(conn_txn, plan.old_pages_to_free);
 
     Ok(())
 }

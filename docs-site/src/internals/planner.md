@@ -6,6 +6,21 @@ on a usable index key and substitutes a B-Tree lookup for a full table scan.
 
 ---
 
+## Source Layout
+
+| File | Responsibility |
+|---|---|
+| `planner.rs` | public `plan()` entry point, dispatches to sub-planners |
+| `planner_ctx.rs` | `PlanCtx` — shared planning state (catalog, indexes, columns) |
+| `planner_select.rs` | SELECT access method selection (scan vs index vs index-only) |
+| `planner_types.rs` | `AccessMethod`, `PlanResult`, and related types |
+| `planner_zone.rs` | zone-map predicate evaluation for page-level pruning |
+| `table_ctx.rs` | `TableCtx` — per-statement table access context |
+| `table_scan.rs` | heap and index scan iterators |
+| `table_write.rs` | write helpers shared across INSERT/UPDATE/DELETE |
+
+---
+
 ## Access Methods
 
 The planner returns an `AccessMethod` that drives the executor's row-fetching strategy:

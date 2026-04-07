@@ -63,6 +63,7 @@ pub fn check_fk_child_insert(
     foreign_keys: &[FkDef],
     storage: &mut dyn StorageEngine,
     txn: &TxnManager,
+    conn_txn: &axiomdb_wal::ConnectionTxn,
     bloom: &mut BloomRegistry,
 ) -> Result<(), DbError> {
     if foreign_keys.is_empty() {
@@ -70,7 +71,7 @@ pub fn check_fk_child_insert(
     }
     // Bloom is now used for FK parent lookup (Phase 6.9: PK B-Trees populated).
 
-    let snap = txn.active_snapshot()?;
+    let snap = txn.active_snapshot(conn_txn);
 
     for fk in foreign_keys {
         let fk_val = row.get(fk.child_col_idx as usize).unwrap_or(&Value::Null);
@@ -86,7 +87,7 @@ pub fn check_fk_child_insert(
         // We use a block scope so the reader (which holds &storage) is dropped
         // before any call that needs &mut storage.
         let (parent_index_id, parent_index_root, parent_clustered_primary) = {
-            let mut reader = CatalogReader::new(storage, snap)?;
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
             let parent_def = reader.get_table_by_id(fk.parent_table_id)?.ok_or(
                 DbError::CatalogTableNotFound {
                     table_id: fk.parent_table_id,
@@ -102,7 +103,7 @@ pub fn check_fk_child_insert(
                 })
                 .ok_or_else(|| {
                     let (tname, cname) =
-                        resolve_names(storage, snap, fk.parent_table_id, fk.parent_col_idx);
+                        resolve_names(storage, snap.clone(), fk.parent_table_id, fk.parent_col_idx);
                     DbError::ForeignKeyNoParentIndex {
                         table: tname,
                         column: cname,
@@ -157,6 +158,7 @@ pub fn check_fk_child_update(
     foreign_keys: &[FkDef],
     storage: &mut dyn StorageEngine,
     txn: &TxnManager,
+    conn_txn: &axiomdb_wal::ConnectionTxn,
     bloom: &mut BloomRegistry,
 ) -> Result<(), DbError> {
     if foreign_keys.is_empty() {
@@ -181,7 +183,7 @@ pub fn check_fk_child_update(
         return Ok(());
     }
 
-    check_fk_child_insert(new_row, &changed_fks, storage, txn, bloom)
+    check_fk_child_insert(new_row, &changed_fks, storage, txn, conn_txn, bloom)
 }
 
 // ── DELETE parent ─────────────────────────────────────────────────────────────
@@ -198,6 +200,7 @@ pub fn enforce_fk_on_parent_delete(
     parent_table_id: u32,
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
     bloom: &mut BloomRegistry,
     depth: u32,
 ) -> Result<(), DbError> {
@@ -210,11 +213,11 @@ pub fn enforce_fk_on_parent_delete(
         });
     }
 
-    let snap = txn.active_snapshot()?;
+    let snap = txn.active_snapshot(conn_txn);
 
     // Load all FK constraints referencing this table as parent.
     let fk_list = {
-        let mut reader = CatalogReader::new(storage, snap)?;
+        let mut reader = CatalogReader::new(storage, snap.clone())?;
         reader.list_fk_constraints_referencing(parent_table_id)?
     };
     if fk_list.is_empty() {
@@ -224,7 +227,7 @@ pub fn enforce_fk_on_parent_delete(
     for fk in &fk_list {
         // Load child table metadata.
         let child_table_def = {
-            let mut reader = CatalogReader::new(storage, snap)?;
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
             reader
                 .get_table_by_id(fk.child_table_id)?
                 .ok_or(DbError::CatalogTableNotFound {
@@ -232,7 +235,7 @@ pub fn enforce_fk_on_parent_delete(
                 })?
         };
         let child_cols = {
-            let mut reader = CatalogReader::new(storage, snap)?;
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
             reader.list_columns(fk.child_table_id)?
         };
 
@@ -261,7 +264,7 @@ pub fn enforce_fk_on_parent_delete(
         // fk_index_id != 0 means a composite-key FK auto-index was created.
         // fk_index_id == 0 means the user provided their own index (or pre-6.9 FK).
         let fk_index_root: Option<u64> = if fk.fk_index_id != 0 {
-            let mut reader = CatalogReader::new(storage, snap)?;
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
             reader
                 .list_indexes(fk.child_table_id)?
                 .into_iter()
@@ -290,8 +293,13 @@ pub fn enforce_fk_on_parent_delete(
                         // Check heap visibility: dead FK index entries (from deferred
                         // deletion) must not cause false RESTRICT violations.
                         entries.iter().any(|(rid, _)| {
-                            HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap)
-                                .unwrap_or(false)
+                            HeapChain::is_slot_visible(
+                                storage,
+                                rid.page_id,
+                                rid.slot_id,
+                                snap.clone(),
+                            )
+                            .unwrap_or(false)
                         })
                     } else {
                         // Pre-6.9 FK or user index: fall back to full scan.
@@ -301,7 +309,7 @@ pub fn enforce_fk_on_parent_delete(
                             &child_cols,
                             fk.child_col_idx,
                             parent_key_val,
-                            snap,
+                            snap.clone(),
                         )?
                     };
 
@@ -324,7 +332,7 @@ pub fn enforce_fk_on_parent_delete(
                             &child_cols,
                             fk.child_col_idx,
                             parent_key_val,
-                            snap,
+                            snap.clone(),
                         )?;
 
                         if children_with_pk.is_empty() {
@@ -350,6 +358,7 @@ pub fn enforce_fk_on_parent_delete(
                             fk.child_table_id,
                             storage,
                             txn,
+                            conn_txn,
                             bloom,
                             depth + 1,
                         )?;
@@ -364,10 +373,11 @@ pub fn enforce_fk_on_parent_delete(
                         delete_mark_clustered_rows(
                             storage,
                             txn,
+                            conn_txn,
                             fk.child_table_id,
                             current_root,
                             &pk_keys,
-                            snap,
+                            snap.clone(),
                         )?;
                         // Secondary index entries left in place — MVCC deferred cleanup
                         // (same behavior as regular clustered DELETE executor).
@@ -382,7 +392,7 @@ pub fn enforce_fk_on_parent_delete(
                                     storage,
                                     child_rid.page_id,
                                     child_rid.slot_id,
-                                    snap,
+                                    snap.clone(),
                                 )? {
                                     continue;
                                 }
@@ -405,7 +415,7 @@ pub fn enforce_fk_on_parent_delete(
                                 &child_cols,
                                 fk.child_col_idx,
                                 parent_key_val,
-                                snap,
+                                snap.clone(),
                             )?
                         };
 
@@ -419,6 +429,7 @@ pub fn enforce_fk_on_parent_delete(
                             fk.child_table_id,
                             storage,
                             txn,
+                            conn_txn,
                             bloom,
                             depth + 1,
                         )?;
@@ -429,13 +440,14 @@ pub fn enforce_fk_on_parent_delete(
                         crate::table::TableEngine::delete_rows_batch(
                             storage,
                             txn,
+                            conn_txn,
                             &child_table_def,
                             &child_rids,
                         )?;
 
                         // Maintain secondary indexes on the child table.
                         let mut current_secondary = {
-                            let mut reader = CatalogReader::new(storage, snap)?;
+                            let mut reader = CatalogReader::new(storage, snap.clone())?;
                             let all = reader.list_indexes(fk.child_table_id)?;
                             all.into_iter()
                                 .filter(|i| !i.columns.is_empty())
@@ -452,7 +464,7 @@ pub fn enforce_fk_on_parent_delete(
                                     &[],
                                 )?;
                                 for (index_id, new_root) in updated {
-                                    CatalogWriter::new(storage, txn)?
+                                    CatalogWriter::new(storage, txn, conn_txn)?
                                         .update_index_root(index_id, new_root)?;
                                     if let Some(idx) = current_secondary
                                         .iter_mut()
@@ -476,7 +488,7 @@ pub fn enforce_fk_on_parent_delete(
                             &child_cols,
                             fk.child_col_idx,
                             parent_key_val,
-                            snap,
+                            snap.clone(),
                         )?;
 
                         if children_with_pk.is_empty() {
@@ -484,7 +496,7 @@ pub fn enforce_fk_on_parent_delete(
                         }
 
                         let primary_idx = {
-                            let mut reader = CatalogReader::new(storage, snap)?;
+                            let mut reader = CatalogReader::new(storage, snap.clone())?;
                             reader
                                 .list_indexes(fk.child_table_id)?
                                 .into_iter()
@@ -497,7 +509,7 @@ pub fn enforce_fk_on_parent_delete(
                                 })?
                         };
                         let mut secondary_idxs: Vec<IndexDef> = {
-                            let mut reader = CatalogReader::new(storage, snap)?;
+                            let mut reader = CatalogReader::new(storage, snap.clone())?;
                             reader
                                 .list_indexes(fk.child_table_id)?
                                 .into_iter()
@@ -515,6 +527,7 @@ pub fn enforce_fk_on_parent_delete(
                             current_root = apply_clustered_set_null(
                                 storage,
                                 txn,
+                                conn_txn,
                                 fk.child_table_id,
                                 current_root,
                                 &primary_idx,
@@ -523,7 +536,7 @@ pub fn enforce_fk_on_parent_delete(
                                 pk_key,
                                 old_values,
                                 &new_values,
-                                snap,
+                                snap.clone(),
                             )?;
                         }
                     } else {
@@ -537,7 +550,7 @@ pub fn enforce_fk_on_parent_delete(
                                     storage,
                                     child_rid.page_id,
                                     child_rid.slot_id,
-                                    snap,
+                                    snap.clone(),
                                 )? {
                                     continue;
                                 }
@@ -560,7 +573,7 @@ pub fn enforce_fk_on_parent_delete(
                                 &child_cols,
                                 fk.child_col_idx,
                                 parent_key_val,
-                                snap,
+                                snap.clone(),
                             )?
                         };
 
@@ -569,7 +582,7 @@ pub fn enforce_fk_on_parent_delete(
                         }
 
                         let mut current_indexes = {
-                            let mut reader = CatalogReader::new(storage, snap)?;
+                            let mut reader = CatalogReader::new(storage, snap.clone())?;
                             let all = reader.list_indexes(fk.child_table_id)?;
                             all.into_iter()
                                 .filter(|i| !i.columns.is_empty())
@@ -589,6 +602,7 @@ pub fn enforce_fk_on_parent_delete(
                             let new_rid = TableEngine::update_row(
                                 storage,
                                 txn,
+                                conn_txn,
                                 &child_table_def,
                                 &child_cols,
                                 *child_rid,
@@ -640,7 +654,7 @@ pub fn enforce_fk_on_parent_delete(
                                         bloom,
                                     )?
                                 {
-                                    CatalogWriter::new(storage, txn)?
+                                    CatalogWriter::new(storage, txn, conn_txn)?
                                         .update_index_root(idx.index_id, new_root)?;
                                 }
                             }
@@ -657,10 +671,10 @@ pub fn enforce_fk_on_parent_delete(
                                         &batch_refs,
                                         storage,
                                         bloom,
-                                        snap,
+                                        snap.clone(),
                                     )?
                                 {
-                                    CatalogWriter::new(storage, txn)?
+                                    CatalogWriter::new(storage, txn, conn_txn)?
                                         .update_index_root(idx.index_id, new_root)?;
                                 }
                             }
@@ -690,14 +704,15 @@ pub fn enforce_fk_on_parent_update(
     parent_table_id: u32,
     storage: &mut dyn StorageEngine,
     txn: &TxnManager,
+    conn_txn: &axiomdb_wal::ConnectionTxn,
 ) -> Result<(), DbError> {
     if old_rows.is_empty() {
         return Ok(());
     }
 
-    let snap = txn.active_snapshot()?;
+    let snap = txn.active_snapshot(conn_txn);
     let fk_list = {
-        let mut reader = CatalogReader::new(storage, snap)?;
+        let mut reader = CatalogReader::new(storage, snap.clone())?;
         reader.list_fk_constraints_referencing(parent_table_id)?
     };
     if fk_list.is_empty() {
@@ -706,7 +721,7 @@ pub fn enforce_fk_on_parent_update(
 
     for fk in &fk_list {
         let child_table_def = {
-            let mut reader = CatalogReader::new(storage, snap)?;
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
             reader
                 .get_table_by_id(fk.child_table_id)?
                 .ok_or(DbError::CatalogTableNotFound {
@@ -714,7 +729,7 @@ pub fn enforce_fk_on_parent_update(
                 })?
         };
         let child_cols = {
-            let mut reader = CatalogReader::new(storage, snap)?;
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
             reader.list_columns(fk.child_table_id)?
         };
         let child_col_name = child_cols
@@ -725,7 +740,7 @@ pub fn enforce_fk_on_parent_update(
 
         // Use FK composite index if available (fk_index_id != 0), else fallback to scan.
         let fk_index_root: Option<u64> = if fk.fk_index_id != 0 {
-            let mut reader = CatalogReader::new(storage, snap)?;
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
             reader
                 .list_indexes(fk.child_table_id)?
                 .into_iter()
@@ -759,7 +774,7 @@ pub fn enforce_fk_on_parent_update(
                     &child_cols,
                     fk.child_col_idx,
                     old_key_val,
-                    snap,
+                    snap.clone(),
                 )?
             };
 
@@ -880,6 +895,7 @@ fn find_clustered_children_with_pk(
 fn delete_mark_clustered_rows(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_id: u32,
     root_pid: u64,
     pk_keys: &[Vec<u8>],
@@ -887,7 +903,7 @@ fn delete_mark_clustered_rows(
 ) -> Result<(), DbError> {
     use axiomdb_storage::{clustered_leaf, clustered_tree};
 
-    let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+    let txn_id = conn_txn.txn_id;
 
     for pk_key in pk_keys {
         let leaf_ref = clustered_tree::descend_to_leaf_pub(storage, root_pid, pk_key)?;
@@ -908,6 +924,7 @@ fn delete_mark_clustered_rows(
         page.update_checksum();
         storage.write_page(page_id, &page)?;
         txn.record_clustered_delete_mark_lightweight(
+            conn_txn,
             table_id,
             root_pid,
             std::slice::from_ref(pk_key),
@@ -925,6 +942,7 @@ fn delete_mark_clustered_rows(
 fn apply_clustered_set_null(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_id: u32,
     root_pid: u64,
     primary_idx: &IndexDef,
@@ -937,52 +955,66 @@ fn apply_clustered_set_null(
 ) -> Result<u64, DbError> {
     use axiomdb_storage::{clustered_leaf, clustered_tree};
 
-    let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
+    let txn_id = conn_txn.txn_id;
 
-    // Step 1: Delete-mark the old clustered row.
-    {
+    // Step 1: Read the current row header so we can build the old_image for WAL.
+    let old_image = {
         let leaf_ref = clustered_tree::descend_to_leaf_pub(storage, root_pid, pk_key)?;
-        let page_id = leaf_ref.header().page_id;
-        let mut page = leaf_ref.into_page();
-
+        let page = leaf_ref.into_page();
         let pos = match clustered_leaf::search(&page, pk_key) {
             Ok(pos) => pos,
             Err(_) => return Ok(root_pid), // key not found — nothing to do
         };
-
         let cell = clustered_leaf::read_cell(&page, pos as u16)?;
         if !cell.row_header.is_visible(&snap) {
             return Ok(root_pid); // already invisible
         }
-
-        clustered_leaf::patch_txn_id_deleted(&mut page, pos, txn_id)?;
-        page.update_checksum();
-        storage.write_page(page_id, &page)?;
-        txn.record_clustered_delete_mark_lightweight(table_id, root_pid, &[pk_key.to_vec()])?;
-    }
-
-    // Step 2: Re-insert the row with the FK column set to NULL.
-    let col_types = column_data_types(child_cols);
-    let encoded = encode_row(new_values, &col_types)?;
-    let row_header = RowHeader {
-        txn_id_created: txn_id,
-        txn_id_deleted: 0,
-        row_version: 0,
-        _flags: 0,
+        ClusteredRowImage::new(root_pid, cell.row_header, cell.row_data)
     };
 
-    let new_root = axiomdb_storage::clustered_tree::insert(
+    // Step 2: Update the row in-place (PK unchanged — SET NULL only changes the FK column).
+    // Using update_in_place / update_with_relocation avoids a duplicate-key error that
+    // would occur if we delete-mark then re-insert at the same PK key.
+    let col_types = column_data_types(child_cols);
+    let encoded = encode_row(new_values, &col_types)?;
+    let new_header = RowHeader {
+        txn_id_created: txn_id,
+        txn_id_deleted: 0,
+        row_version: old_image.row_header.row_version.saturating_add(1),
+        _flags: old_image.row_header._flags,
+    };
+
+    let new_root = match clustered_tree::update_in_place(
         storage,
         Some(root_pid),
         pk_key,
-        &row_header,
         &encoded,
-    )?;
+        txn_id,
+        &snap,
+    ) {
+        Ok(true) => root_pid,
+        Ok(false) => return Ok(root_pid), // someone else updated this row
+        Err(axiomdb_core::error::DbError::HeapPageFull { .. }) => {
+            match clustered_tree::update_with_relocation(
+                storage,
+                Some(root_pid),
+                pk_key,
+                &encoded,
+                txn_id,
+                &snap,
+            )? {
+                Some(r) => r,
+                None => return Ok(root_pid),
+            }
+        }
+        Err(err) => return Err(err),
+    };
+
     if new_root != root_pid {
-        CatalogWriter::new(storage, txn)?.update_table_root(table_id, new_root)?;
+        CatalogWriter::new(storage, txn, conn_txn)?.update_table_root(table_id, new_root)?;
     }
-    let image = ClusteredRowImage::new(new_root, row_header, &encoded);
-    txn.record_clustered_insert(table_id, pk_key, &image)?;
+    let new_image = ClusteredRowImage::new(new_root, new_header, &encoded);
+    txn.record_clustered_update(conn_txn, table_id, pk_key, &old_image, &new_image)?;
 
     // Step 3: Update clustered secondary indexes for the changed FK column.
     for idx in secondary_idxs.iter_mut() {
@@ -994,7 +1026,8 @@ fn apply_clustered_set_null(
         let _ = layout.update_row(storage, &root_atomic, old_values, new_values)?;
         let new_idx_root = root_atomic.load(Ordering::Acquire);
         if new_idx_root != idx.root_page_id {
-            CatalogWriter::new(storage, txn)?.update_index_root(idx.index_id, new_idx_root)?;
+            CatalogWriter::new(storage, txn, conn_txn)?
+                .update_index_root(idx.index_id, new_idx_root)?;
             idx.root_page_id = new_idx_root;
         }
     }

@@ -50,19 +50,22 @@ pub fn execute_vacuum(
     bloom: &mut crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
-    let snap = txn.active_snapshot().unwrap_or_else(|_| txn.snapshot());
+    let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn for vacuum"));
     // Under RwLock: no concurrent readers, all committed deletes are safe.
     let oldest_safe_txn = txn.max_committed() + 1;
 
     let results = if let Some(ref table_ref) = stmt.table {
         let db = ctx.effective_database().to_string();
-        let mut resolver = SchemaResolver::new(storage, snap, &db, "public")?;
+        let mut resolver = SchemaResolver::new(storage, snap.clone(), &db, "public")?;
         let resolved = resolver.resolve_table(table_ref.schema.as_deref(), &table_ref.name)?;
         let r = vacuum_one_table(
             &resolved.def,
             &resolved.indexes,
             storage,
             txn,
+            ctx.conn_txn
+                .as_mut()
+                .expect("active txn for vacuum one table"),
             snap,
             oldest_safe_txn,
             bloom,
@@ -72,13 +75,13 @@ pub fn execute_vacuum(
         // Vacuum all tables in current database.
         let db = ctx.effective_database().to_string();
         let tables = {
-            let mut reader = CatalogReader::new(storage, snap)?;
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
             reader.list_tables_in_database(&db, "public")?
         };
         let mut results = Vec::new();
         for table_def in &tables {
             let indexes = {
-                let mut reader = CatalogReader::new(storage, snap)?;
+                let mut reader = CatalogReader::new(storage, snap.clone())?;
                 reader.list_indexes(table_def.id)?
             };
             let r = vacuum_one_table(
@@ -86,7 +89,10 @@ pub fn execute_vacuum(
                 &indexes,
                 storage,
                 txn,
-                snap,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("active txn for vacuum all tables"),
+                snap.clone(),
                 oldest_safe_txn,
                 bloom,
             )?;
@@ -136,14 +142,23 @@ fn vacuum_one_table(
     indexes: &[IndexDef],
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
     snap: TransactionSnapshot,
     oldest_safe_txn: u64,
     bloom: &mut crate::bloom::BloomRegistry,
 ) -> Result<VacuumTableResult, DbError> {
-    // Dispatch by storage layout.
     if table_def.is_clustered() {
-        return vacuum_clustered_table(table_def, indexes, storage, txn, oldest_safe_txn, bloom);
+        return vacuum_clustered_table(
+            table_def,
+            indexes,
+            storage,
+            txn,
+            conn_txn,
+            oldest_safe_txn,
+            bloom,
+        );
     }
+    // Non-clustered path below...
 
     // 1. Heap vacuum: walk the heap chain, mark dead slots.
     let dead_rows = vacuum_heap_chain(storage, table_def.root_page_id, oldest_safe_txn)?;
@@ -156,7 +171,7 @@ fn vacuum_one_table(
         if idx.columns.is_empty() {
             continue;
         }
-        dead_index_entries += vacuum_index(storage, txn, idx, snap, bloom)?;
+        dead_index_entries += vacuum_index(storage, txn, conn_txn, idx, snap.clone(), bloom)?;
     }
 
     Ok(VacuumTableResult {
@@ -220,6 +235,7 @@ fn vacuum_heap_chain(
 fn vacuum_index(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
     index: &IndexDef,
     snap: TransactionSnapshot,
     bloom: &mut crate::bloom::BloomRegistry,
@@ -232,7 +248,7 @@ fn vacuum_index(
     // Collect keys of dead entries.
     let mut dead_keys: Vec<Vec<u8>> = Vec::new();
     for (rid, key_bytes) in &all_entries {
-        if !HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap)? {
+        if !HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap.clone())? {
             dead_keys.push(key_bytes.clone());
         }
     }
@@ -245,7 +261,7 @@ fn vacuum_index(
     dead_keys.sort_unstable();
     let root_pid = AtomicU64::new(index.root_page_id);
     BTree::delete_many_in(storage, &root_pid, &dead_keys)?;
-    persist_index_root_if_changed(storage, txn, index, &root_pid)?;
+    persist_index_root_if_changed(storage, txn, conn_txn, index, &root_pid)?;
 
     // Mark bloom as dirty so it's rebuilt on next use.
     bloom.mark_dirty(index.index_id);
@@ -260,6 +276,7 @@ fn vacuum_clustered_table(
     indexes: &[IndexDef],
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
     oldest_safe_txn: u64,
     bloom: &mut crate::bloom::BloomRegistry,
 ) -> Result<VacuumTableResult, DbError> {
@@ -275,7 +292,7 @@ fn vacuum_clustered_table(
             .filter(|i| !i.is_primary && !i.columns.is_empty())
         {
             dead_index_entries +=
-                vacuum_clustered_secondary(storage, txn, idx, pk_idx, table_def, bloom)?;
+                vacuum_clustered_secondary(storage, txn, conn_txn, idx, pk_idx, table_def, bloom)?;
         }
     }
 
@@ -365,6 +382,7 @@ fn leftmost_clustered_leaf(storage: &dyn StorageEngine, mut pid: u64) -> Result<
 fn vacuum_clustered_secondary(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
     index: &IndexDef,
     primary_idx: &IndexDef,
     table_def: &axiomdb_catalog::TableDef,
@@ -402,7 +420,7 @@ fn vacuum_clustered_secondary(
     dead_keys.sort_unstable();
     let root_pid = AtomicU64::new(index.root_page_id);
     BTree::delete_many_in(storage, &root_pid, &dead_keys)?;
-    persist_index_root_if_changed(storage, txn, index, &root_pid)?;
+    persist_index_root_if_changed(storage, txn, conn_txn, index, &root_pid)?;
     bloom.mark_dirty(index.index_id);
 
     Ok(count)
@@ -411,12 +429,13 @@ fn vacuum_clustered_secondary(
 fn persist_index_root_if_changed(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
     index: &IndexDef,
     root_pid: &AtomicU64,
 ) -> Result<(), DbError> {
     let new_root = root_pid.load(Ordering::Relaxed);
     if new_root != index.root_page_id {
-        CatalogWriter::new(storage, txn)?.update_index_root(index.index_id, new_root)?;
+        CatalogWriter::new(storage, txn, conn_txn)?.update_index_root(index.index_id, new_root)?;
     }
     Ok(())
 }
@@ -520,15 +539,15 @@ mod tests {
         let mut storage = MemoryStorage::new();
         CatalogBootstrap::init(&mut storage).unwrap();
         let mut txn = TxnManager::create(&wal_path).unwrap();
-        txn.begin().unwrap();
+        let mut conn_txn = txn.begin().unwrap();
 
-        let table_id = CatalogWriter::new(&mut storage, &mut txn)
+        let table_id = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn)
             .unwrap()
             .create_table("public", "users")
             .unwrap();
         let old_root = storage.alloc_page(PageType::Index).unwrap();
         let new_root = storage.alloc_page(PageType::Index).unwrap();
-        let index_id = CatalogWriter::new(&mut storage, &mut txn)
+        let index_id = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn)
             .unwrap()
             .create_index(axiomdb_catalog::IndexDef {
                 index_id: 0,
@@ -550,7 +569,7 @@ mod tests {
             })
             .unwrap();
 
-        let snap = txn.active_snapshot().unwrap();
+        let snap = txn.active_snapshot(&conn_txn);
         let index_def = {
             let mut reader = CatalogReader::new(&storage, snap).unwrap();
             reader
@@ -562,10 +581,17 @@ mod tests {
         };
 
         let rotated_root = AtomicU64::new(new_root);
-        persist_index_root_if_changed(&mut storage, &mut txn, &index_def, &rotated_root).unwrap();
+        persist_index_root_if_changed(
+            &mut storage,
+            &mut txn,
+            &mut conn_txn,
+            &index_def,
+            &rotated_root,
+        )
+        .unwrap();
 
         let updated = {
-            let snap = txn.active_snapshot().unwrap();
+            let snap = txn.active_snapshot(&conn_txn);
             let mut reader = CatalogReader::new(&storage, snap).unwrap();
             reader
                 .list_indexes(table_id)
