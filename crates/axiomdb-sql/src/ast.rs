@@ -616,6 +616,14 @@ pub enum Stmt {
     ShowVariables,
     /// `SHOW STATUS` — intercepted by wire handler.
     ShowStatus,
+    /// `SHOW WARNINGS [LIMIT n]` — returns per-session warning list (5.9e).
+    ShowWarnings {
+        limit: Option<u64>,
+    },
+    /// `SHOW ERRORS [LIMIT n]` — returns per-session error list (5.9e).
+    ShowErrors {
+        limit: Option<u64>,
+    },
     /// `RENAME TABLE a TO b [, c TO d ...]` (4.3h).
     RenameTable(RenameTableStmt),
     // Transaction control
