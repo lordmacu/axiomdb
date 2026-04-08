@@ -33,6 +33,7 @@ pub mod prepared;
 pub mod result;
 pub mod session;
 pub mod snapshot_registry;
+pub(crate) mod sql_scan;
 pub mod status;
 
 pub use database::Database;

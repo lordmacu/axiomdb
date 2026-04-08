@@ -1,6 +1,7 @@
 fn execute_clustered_insert_ctx(
     stmt: InsertStmt,
     exec_ctx: &ExecutionContext,
+    conn_txn: &mut ConnectionTxn,
     ctx: &mut SessionContext,
     resolved: ResolvedTable,
 ) -> Result<QueryResult, DbError> {
@@ -48,7 +49,7 @@ fn execute_clustered_insert_ctx(
                             &resolved.foreign_keys,
                             storage,
                             txn,
-                            ctx.conn_txn.as_ref().expect("conn_txn for fk_check_insert"),
+                            &*conn_txn,
                             bloom,
                         ) {
                             Err(e) if ignore && is_ignorable_insert_error(&e) => false,
@@ -89,7 +90,7 @@ fn execute_clustered_insert_ctx(
                 assign_auto_increment(
                     storage,
                     txn,
-                    ctx.conn_txn.as_ref().expect("active txn"),
+                    &*conn_txn,
                     &resolved.def,
                     schema_cols,
                     full_values.as_mut_slice(),
@@ -99,7 +100,7 @@ fn execute_clustered_insert_ctx(
             }
         }
         InsertSource::Select(select_stmt) => {
-            let select_rows = match execute_select_ctx(*select_stmt, exec_ctx, ctx)? {
+            let select_rows = match execute_select_ctx(*select_stmt, exec_ctx, Some(&*conn_txn), ctx)? {
                 QueryResult::Rows { rows, .. } => rows,
                 other => {
                     return Err(DbError::Other(format!(
@@ -113,7 +114,7 @@ fn execute_clustered_insert_ctx(
                 assign_auto_increment(
                     storage,
                     txn,
-                    ctx.conn_txn.as_ref().expect("active txn"),
+                    &*conn_txn,
                     &resolved.def,
                     schema_cols,
                     full_values.as_mut_slice(),
@@ -127,7 +128,7 @@ fn execute_clustered_insert_ctx(
             assign_auto_increment(
                 storage,
                 txn,
-                ctx.conn_txn.as_ref().expect("active txn"),
+                &*conn_txn,
                 &resolved.def,
                 schema_cols,
                 full_values.as_mut_slice(),
@@ -143,7 +144,7 @@ fn execute_clustered_insert_ctx(
             match apply_clustered_insert_rows(
                 storage,
                 txn,
-                ctx.conn_txn.as_mut().expect("active txn"),
+                conn_txn,
                 bloom,
                 &resolved.def,
                 &primary_idx,
@@ -162,7 +163,7 @@ fn execute_clustered_insert_ctx(
         apply_clustered_insert_rows(
             storage,
             txn,
-            ctx.conn_txn.as_mut().expect("active txn"),
+            conn_txn,
             bloom,
             &resolved.def,
             &primary_idx,
@@ -206,6 +207,7 @@ const CLUSTERED_BATCH_MAX_ROWS: usize = 200_000;
 fn enqueue_clustered_insert_ctx(
     stmt: InsertStmt,
     exec_ctx: &ExecutionContext,
+    conn_txn: &mut ConnectionTxn,
     ctx: &mut SessionContext,
     resolved: ResolvedTable,
 ) -> Result<QueryResult, DbError> {
@@ -289,7 +291,7 @@ fn enqueue_clustered_insert_ctx(
         assign_auto_increment(
             storage,
             txn,
-            ctx.conn_txn.as_ref().expect("active txn"),
+            &*conn_txn,
             &resolved.def,
             schema_cols,
             full_values.as_mut_slice(),
@@ -307,7 +309,7 @@ fn enqueue_clustered_insert_ctx(
                 &resolved.foreign_keys,
                 storage,
                 txn,
-                ctx.conn_txn.as_ref().expect("conn_txn for fk_check_insert"),
+                &*conn_txn,
                 bloom,
             ) {
                 Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
@@ -384,4 +386,3 @@ fn enqueue_clustered_insert_ctx(
         last_insert_id: None,
     })
 }
-

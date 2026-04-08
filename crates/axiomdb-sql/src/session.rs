@@ -393,6 +393,34 @@ pub fn apply_strict_to_sql_mode(current: &str, enabled: bool) -> String {
     }
 }
 
+/// Minimal parser-affecting SQL mode flags tracked by the engine.
+///
+/// Phase 4.2f only needs `ANSI_QUOTES`. Other parser-affecting MySQL modes
+/// (`NO_BACKSLASH_ESCAPES`, `PIPES_AS_CONCAT`, `IGNORE_SPACE`, ...) are deferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SqlModeFlags {
+    pub ansi_quotes: bool,
+}
+
+impl SqlModeFlags {
+    /// Builds flags from a normalized `sql_mode` string.
+    pub fn from_normalized_sql_mode(normalized: &str) -> Self {
+        Self {
+            ansi_quotes: sql_mode_has_ansi_quotes(normalized),
+        }
+    }
+
+    /// Builds flags from a raw `sql_mode` string, applying normalization first.
+    pub fn from_sql_mode(raw: &str) -> Self {
+        Self::from_normalized_sql_mode(&normalize_sql_mode(raw))
+    }
+}
+
+/// Returns `true` when `normalized` contains `ANSI_QUOTES`.
+pub fn sql_mode_has_ansi_quotes(normalized: &str) -> bool {
+    normalized.split(',').any(|t| t.trim() == "ANSI_QUOTES")
+}
+
 // ── PendingInsertBatch ────────────────────────────────────────────────────────
 
 /// Transaction-local staging buffer for consecutive `INSERT ... VALUES` statements.
@@ -491,6 +519,11 @@ pub struct SessionContext {
     /// coercion, stores the result, and appends a SQL warning 1265 to the
     /// session. If permissive coercion also fails the error is returned.
     pub strict_mode: bool,
+    /// Whether double quotes are parsed as quoted identifiers (`true`) or as
+    /// string literals (`false`, MySQL default).
+    ///
+    /// Derived from `SET sql_mode = ...`.
+    pub ansi_quotes: bool,
     /// How statement errors affect the current transaction (default: `RollbackStatement`).
     ///
     /// Set via `SET on_error = 'rollback_statement' | 'rollback_transaction' |
@@ -578,6 +611,7 @@ impl SessionContext {
             heap_tail: HashMap::new(),
             autocommit: true,
             strict_mode: true,
+            ansi_quotes: false,
             on_error: OnErrorMode::RollbackStatement,
             compat_mode: CompatMode::Standard,
             explicit_collation: None,
@@ -651,6 +685,13 @@ impl SessionContext {
     /// Returns the canonical name of the effective session collation (`"binary"` or `"es"`).
     pub fn effective_collation_name(&self) -> &'static str {
         session_collation_name(self.effective_collation())
+    }
+
+    /// Returns the parser-affecting SQL mode flags for this session.
+    pub fn sql_mode_flags(&self) -> SqlModeFlags {
+        SqlModeFlags {
+            ansi_quotes: self.ansi_quotes,
+        }
     }
 
     // ── Schema cache ──────────────────────────────────────────────────────────
@@ -774,6 +815,15 @@ mod tests {
     fn test_session_context_strict_mode_default_true() {
         let ctx = SessionContext::new();
         assert!(ctx.strict_mode, "strict_mode must default to true");
+    }
+
+    #[test]
+    fn test_session_context_ansi_quotes_default_false() {
+        let ctx = SessionContext::new();
+        assert!(
+            !ctx.ansi_quotes,
+            "ansi_quotes must default to false (MySQL default)"
+        );
     }
 
     // ── on_error helpers ──────────────────────────────────────────────────────
@@ -946,6 +996,22 @@ mod tests {
         assert!(sql_mode_is_strict("STRICT_ALL_TABLES"));
         assert!(!sql_mode_is_strict("ANSI_QUOTES"));
         assert!(!sql_mode_is_strict(""));
+    }
+
+    #[test]
+    fn test_sql_mode_has_ansi_quotes() {
+        assert!(sql_mode_has_ansi_quotes("ANSI_QUOTES"));
+        assert!(sql_mode_has_ansi_quotes("STRICT_TRANS_TABLES,ANSI_QUOTES"));
+        assert!(!sql_mode_has_ansi_quotes("STRICT_TRANS_TABLES"));
+        assert!(!sql_mode_has_ansi_quotes(""));
+    }
+
+    #[test]
+    fn test_sql_mode_flags_from_normalized_sql_mode() {
+        let flags = SqlModeFlags::from_normalized_sql_mode("STRICT_TRANS_TABLES,ANSI_QUOTES");
+        assert!(flags.ansi_quotes);
+        let flags = SqlModeFlags::from_normalized_sql_mode("STRICT_TRANS_TABLES");
+        assert!(!flags.ansi_quotes);
     }
 
     #[test]

@@ -27,7 +27,12 @@ pub fn execute_read_only_with_ctx(
 ) -> Result<QueryResult, DbError> {
     let exec_ctx = ExecutionContext::new(storage, txn, bloom);
     match stmt {
-        Stmt::Select(s) => execute_select_ctx(s, &exec_ctx, ctx),
+        Stmt::Select(s) => {
+            let conn = ctx.conn_txn.take();
+            let r = execute_select_ctx(s, &exec_ctx, conn.as_ref(), ctx);
+            ctx.conn_txn = conn;
+            r
+        }
         Stmt::ShowTables(mut s) => {
             if s.schema.is_none() {
                 s.schema = Some(ctx.current_schema().to_string());

@@ -33,6 +33,52 @@ SELECT * FROM orders WHERE (status = 'paid' OR status = 'shipped') AND total > 1
 
 ---
 
+## String Literals and Identifier Quoting
+
+AxiomDB follows MySQL session semantics for double quotes:
+
+- Single quotes always produce string literals: `'hello'`
+- Backticks always produce quoted identifiers: `` `order` ``
+- Double quotes depend on `@@sql_mode`
+
+### Default mode: `ANSI_QUOTES` OFF
+
+By default, `@@sql_mode` does **not** include `ANSI_QUOTES`, so double quotes
+behave like string delimiters:
+
+```sql
+SELECT "hello";                 -- string literal
+SELECT * FROM users WHERE name = "Alice";
+```
+
+### `ANSI_QUOTES` enabled
+
+When the session enables `ANSI_QUOTES`, double quotes switch to delimited
+identifiers and no longer produce string literals:
+
+```sql
+SET sql_mode = 'ANSI_QUOTES,STRICT_TRANS_TABLES';
+
+SELECT "name" FROM "users";     -- identifier quoting
+SELECT 'hello';                 -- use single quotes for strings
+```
+
+If `ANSI_QUOTES` is ON, `SELECT "hello"` is parsed as a column reference to the
+identifier `hello`, not as the string literal `"hello"`.
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Tip — ORM Compatibility</span>
+Older MySQL clients often assume the server default <code>ANSI_QUOTES = OFF</code>
+and send double-quoted strings in generated SQL. AxiomDB matches that default,
+so those statements parse the same way they do on MySQL 8 unless the session
+explicitly enables <code>ANSI_QUOTES</code>.
+</div>
+</div>
+
+---
+
 ## Arithmetic Operators
 
 | Operator | Meaning          | Example                           | Result |

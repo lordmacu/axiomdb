@@ -1,7 +1,7 @@
 //! Integration tests for the SQL lexer (subfase 4.2 + 4.2b).
 
 use axiomdb_core::DbError;
-use axiomdb_sql::{tokenize, Token};
+use axiomdb_sql::{tokenize, tokenize_with_sql_mode, SqlModeFlags, Token};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -289,7 +289,17 @@ fn test_backtick_identifier() {
 
 #[test]
 fn test_double_quote_identifier() {
-    assert!(matches!(&tokens(r#""my col""#)[0], Token::DqIdent(s) if *s == "my col"));
+    assert!(matches!(
+        &tokens(r#""my col""#)[0],
+        Token::StringLit(s) if s == "my col"
+    ));
+}
+
+#[test]
+fn test_double_quote_identifier_with_ansi_quotes() {
+    let toks =
+        tokenize_with_sql_mode(r#""my col""#, None, SqlModeFlags { ansi_quotes: true }).unwrap();
+    assert!(matches!(&toks[0].token, Token::DqIdent(s) if s == "my col"));
 }
 
 // ── Operators ─────────────────────────────────────────────────────────────────

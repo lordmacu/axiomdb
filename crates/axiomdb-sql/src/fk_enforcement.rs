@@ -981,16 +981,12 @@ fn apply_fk_update_children(
                 if crate::index_maintenance::update_affects_index(
                     idx, pred, old_values, *old_rid, new_values, *new_rid,
                 )? {
-                    if let Some(key_vals) =
-                        crate::index_maintenance::index_key_values_if_indexed(
-                            idx, old_values, pred,
-                        )?
-                    {
-                        delete_keys.push(
-                            crate::index_maintenance::encode_index_entry_key(
-                                idx, &key_vals, *old_rid,
-                            )?,
-                        );
+                    if let Some(key_vals) = crate::index_maintenance::index_key_values_if_indexed(
+                        idx, old_values, pred,
+                    )? {
+                        delete_keys.push(crate::index_maintenance::encode_index_entry_key(
+                            idx, &key_vals, *old_rid,
+                        )?);
                     }
                     insert_rows.push((*new_rid, new_values));
                 }
@@ -998,14 +994,12 @@ fn apply_fk_update_children(
 
             if !delete_keys.is_empty() {
                 delete_keys.sort_unstable();
-                if let Some(new_root) =
-                    crate::index_maintenance::delete_many_from_single_index(
-                        idx,
-                        &delete_keys,
-                        storage,
-                        bloom,
-                    )?
-                {
+                if let Some(new_root) = crate::index_maintenance::delete_many_from_single_index(
+                    idx,
+                    &delete_keys,
+                    storage,
+                    bloom,
+                )? {
                     CatalogWriter::new(storage, txn, conn_txn)?
                         .update_index_root(idx.index_id, new_root)?;
                 }
@@ -1016,16 +1010,14 @@ fn apply_fk_update_children(
                     .iter()
                     .map(|(rid, vals)| (vals.as_slice(), *rid))
                     .collect();
-                if let Some(new_root) =
-                    crate::index_maintenance::insert_many_into_single_index(
-                        idx,
-                        pred,
-                        &batch_refs,
-                        storage,
-                        bloom,
-                        snap.clone(),
-                    )?
-                {
+                if let Some(new_root) = crate::index_maintenance::insert_many_into_single_index(
+                    idx,
+                    pred,
+                    &batch_refs,
+                    storage,
+                    bloom,
+                    snap.clone(),
+                )? {
                     CatalogWriter::new(storage, txn, conn_txn)?
                         .update_index_root(idx.index_id, new_root)?;
                 }

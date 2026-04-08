@@ -1931,7 +1931,7 @@ for (row_idx, value_exprs) in rows.into_iter().enumerate() {
 This makes warning 1265 messages meaningful for multi-row inserts:
 `"Data truncated for column 'stock' at row 2"`.
 
-### SET strict_mode / SET sql_mode
+### SET strict_mode / SET sql_mode / ANSI_QUOTES
 
 The executor intercepts `SET strict_mode` and `SET sql_mode` in `execute_set_ctx`
 (called from `dispatch_ctx`). It delegates to helpers from `session.rs`:
@@ -1944,12 +1944,20 @@ The executor intercepts `SET strict_mode` and `SET sql_mode` in `execute_set_ctx
 "sql_mode" => {
     let normalized = normalize_sql_mode(&raw);
     ctx.strict_mode = sql_mode_is_strict(&normalized);
+    ctx.ansi_quotes = sql_mode_has_ansi_quotes(&normalized);
 }
 ```
 
 The wire layer (`handler.rs`) syncs the wire-visible `@@sql_mode` and
-`@@strict_mode` variables with the session `bool` after every intercepted SET.
-Both variables are surfaced in `SHOW VARIABLES`.
+`@@strict_mode` variables with the session state after every intercepted `SET`.
+The parser-facing `ctx.ansi_quotes` bit is also synced into the SQL execution
+path so `COM_QUERY`, ad-hoc plan-cache normalization, multi-statement splitting,
+and `COM_STMT_PREPARE` all see the same quote mode for the current connection.
+
+Prepared statements persist `compiled_ansi_quotes` at prepare time. `COM_STMT_EXECUTE`
+reuses that bit both when reparsing after a schema-version miss and when falling
+back to SQL-string substitution, so a statement prepared under `ANSI_QUOTES`
+never silently changes meaning after the client later flips `@@sql_mode`.
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>

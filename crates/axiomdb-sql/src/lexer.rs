@@ -15,10 +15,13 @@
 //! 3. Always appends a [`Token::Eof`] sentinel.
 //!
 //! String escape processing is handled by [`process_string_literal`], which
-//! is called from within the logos callback for `StringLit`.
+//! is called from within the logos callback for `StringLit`. Double-quoted
+//! fragments are resolved after lexing based on `SqlModeFlags.ansi_quotes`.
 
 use axiomdb_core::error::DbError;
 use logos::Logos;
+
+use crate::session::SqlModeFlags;
 
 // ── Span / SpannedToken ───────────────────────────────────────────────────────
 
@@ -53,9 +56,10 @@ impl<'src> SpannedToken<'src> {
 ///
 /// ## Zero-copy identifiers
 ///
-/// `Ident`, `QuotedIdent`, and `DqIdent` hold `&'src str` slices directly
-/// into the input string — no heap allocation. Only `StringLit` allocates
-/// a `String` because escape sequences transform the content in place.
+/// `Ident` and `QuotedIdent` hold `&'src str` slices directly into the input
+/// string. `StringLit` allocates a `String` because escape sequences transform
+/// the content in place. `DqIdent` also allocates because `""` escaping must
+/// be decoded when `ANSI_QUOTES` is enabled.
 ///
 /// Keywords are case-insensitive: `SELECT`, `select`, and `Select` all
 /// produce [`Token::Select`].
@@ -458,13 +462,13 @@ pub enum Token<'src> {
     })]
     QuotedIdent(&'src str),
 
-    /// Double-quote-quoted identifier (SQL standard): `"any content"`.
-    /// Zero-copy: returns a slice of the input with quotes stripped.
-    #[regex(r#""[^"]*""#, |lex| {
-        let s = lex.slice();
-        &s[1..s.len() - 1]
-    })]
-    DqIdent(&'src str),
+    /// Raw double-quoted fragment. Resolved in [`tokenize_with_sql_mode`] into
+    /// either `StringLit` (MySQL default) or `DqIdent` (`ANSI_QUOTES`).
+    #[regex(r#""([^"\\]|\\.|"")*""#, |lex| lex.slice())]
+    RawDoubleQuoted(&'src str),
+
+    /// Double-quote-quoted identifier after `ANSI_QUOTES` decoding.
+    DqIdent(String),
 
     // ── MySQL expression keywords ─────────────────────────────────────────────
     /// `REGEXP` — regular-expression match operator.
@@ -629,6 +633,65 @@ pub(crate) fn process_string_literal(raw: &str) -> Option<String> {
     Some(result)
 }
 
+/// Processes escape sequences in a raw double-quoted SQL string literal.
+///
+/// Mirrors [`process_string_literal`] but uses `"` as the delimiter and `""`
+/// as the SQL-standard doubled-quote escape.
+fn process_double_quoted_string_literal(raw: &str) -> Option<String> {
+    let inner = &raw[1..raw.len() - 1];
+    let mut result = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                None => return None,
+                Some('n') => result.push('\n'),
+                Some('r') => result.push('\r'),
+                Some('t') => result.push('\t'),
+                Some('0') => result.push('\0'),
+                Some('b') => result.push('\x08'),
+                Some('Z') => result.push('\x1A'),
+                Some(other) => result.push(other),
+            },
+            '"' => {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    result.push('"');
+                }
+            }
+            other => result.push(other),
+        }
+    }
+
+    Some(result)
+}
+
+/// Processes a raw double-quoted identifier in `ANSI_QUOTES` mode.
+///
+/// MySQL/MariaDB delimited identifiers use doubled quotes (`""`) to embed a
+/// literal quote inside the identifier name.
+fn process_double_quoted_identifier(raw: &str) -> Option<String> {
+    let inner = &raw[1..raw.len() - 1];
+    let mut result = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            if chars.peek() == Some(&'"') {
+                chars.next();
+                result.push('"');
+            } else {
+                return None;
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    Some(result)
+}
+
 // ── tokenize ─────────────────────────────────────────────────────────────────
 
 /// Tokenizes `input` into a flat stream of [`SpannedToken`]s.
@@ -650,6 +713,18 @@ pub(crate) fn process_string_literal(raw: &str) -> Option<String> {
 pub fn tokenize<'src>(
     input: &'src str,
     max_bytes: Option<usize>,
+) -> Result<Vec<SpannedToken<'src>>, DbError> {
+    tokenize_with_sql_mode(input, max_bytes, SqlModeFlags::default())
+}
+
+/// Tokenizes `input` with parser-affecting SQL mode flags.
+///
+/// `ANSI_QUOTES = false` (MySQL default) maps `"..."` to `StringLit`.
+/// `ANSI_QUOTES = true` maps `"..."` to `DqIdent`.
+pub fn tokenize_with_sql_mode<'src>(
+    input: &'src str,
+    max_bytes: Option<usize>,
+    sql_mode: SqlModeFlags,
 ) -> Result<Vec<SpannedToken<'src>>, DbError> {
     // 4.2b: reject oversized queries before scanning.
     if let Some(max) = max_bytes {
@@ -674,6 +749,24 @@ pub fn tokenize<'src>(
         let end = logos_span.end;
 
         match result {
+            Ok(Token::RawDoubleQuoted(raw)) => {
+                let token = if sql_mode.ansi_quotes {
+                    Token::DqIdent(process_double_quoted_identifier(raw).ok_or_else(|| {
+                        DbError::ParseError {
+                            message: "invalid double-quoted identifier".into(),
+                            position: Some(start),
+                        }
+                    })?)
+                } else {
+                    Token::StringLit(process_double_quoted_string_literal(raw).ok_or_else(
+                        || DbError::ParseError {
+                            message: "invalid double-quoted string literal".into(),
+                            position: Some(start),
+                        },
+                    )?)
+                };
+                tokens.push(SpannedToken::new(token, start, end));
+            }
             Ok(token) => tokens.push(SpannedToken::new(token, start, end)),
             // logos 0.13+: unrecognized input produces Err(()) (the default error type).
             Err(()) => {
@@ -880,6 +973,18 @@ mod tests {
     #[test]
     fn test_string_sql_doubling() {
         assert_eq!(tok("'it''s'")[0], Token::StringLit("it's".into()));
+    }
+
+    #[test]
+    fn test_double_quoted_string_default_mode() {
+        assert_eq!(tok(r#""hello""#)[0], Token::StringLit("hello".into()));
+    }
+
+    #[test]
+    fn test_double_quoted_identifier_ansi_quotes_mode() {
+        let toks = tokenize_with_sql_mode(r#""my""col""#, None, SqlModeFlags { ansi_quotes: true })
+            .unwrap();
+        assert_eq!(toks[0].token, Token::DqIdent(r#"my"col"#.into()));
     }
 
     // ── Operators ────────────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 fn execute_select_ctx(
     mut stmt: SelectStmt,
     exec_ctx: &ExecutionContext,
+    conn_txn: Option<&ConnectionTxn>,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     let storage = exec_ctx.storage();
@@ -12,12 +13,12 @@ fn execute_select_ctx(
 
     // SELECT without FROM: no table resolution needed.
     if stmt.from.is_none() {
-        return execute_select(stmt, storage, txn, ctx.conn_txn.as_ref());
+        return execute_select(stmt, storage, txn, conn_txn);
     }
 
     // Subquery in FROM: no caching path yet — delegate.
     if matches!(stmt.from, Some(FromClause::Subquery { .. })) {
-        return execute_select(stmt, storage, txn, ctx.conn_txn.as_ref());
+        return execute_select(stmt, storage, txn, conn_txn);
     }
 
     let from_table_ref = match stmt.from.take() {
@@ -38,7 +39,7 @@ fn execute_select_ctx(
             from_table_ref,
             storage,
             txn,
-            ctx.conn_txn.as_ref(),
+            conn_txn,
             default_db,
         );
     }
@@ -46,7 +47,11 @@ fn execute_select_ctx(
     if stmt.joins.is_empty() {
         // Single-table path — use cache.
         let resolved = resolve_table_cached(storage, txn, ctx, &from_table_ref)?;
-        let snap = ctx.conn_txn.as_ref().map(|c| txn.active_snapshot(c)).unwrap_or_else(|| txn.snapshot());
+        let snap = if let Some(ct) = conn_txn {
+            txn.active_snapshot(ct)
+        } else {
+            txn.snapshot()
+        };
 
         // ── COUNT(*) fast path (Phase 8) ─────────────────────────────────
         // Detect `SELECT COUNT(*) FROM table` with no WHERE, no GROUP BY,

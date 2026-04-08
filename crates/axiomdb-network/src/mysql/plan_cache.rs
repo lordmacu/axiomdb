@@ -152,11 +152,12 @@ impl PlanCache {
     pub fn lookup(
         &mut self,
         sql: &str,
+        ansi_quotes: bool,
         global_version: u64,
         reader: &mut CatalogReader<'_>,
     ) -> Result<Option<(Stmt, Vec<Value>)>, DbError> {
-        let (normalized, params) = normalize_sql(sql);
-        let key = fnv1a_hash(normalized.as_bytes());
+        let (normalized, params) = normalize_sql(sql, ansi_quotes);
+        let key = cache_key(&normalized, ansi_quotes);
 
         // 1. Check entry existence and structural match.
         let stale = match self.entries.get(&key) {
@@ -223,9 +224,16 @@ impl PlanCache {
     /// - `deps` — catalog deps extracted by `extract_table_deps` at compile time.
     /// - `global_version` — current `Database::schema_version` at store time,
     ///   used to initialize the fast-path validation stamp.
-    pub fn store(&mut self, sql: &str, stmt: &Stmt, deps: PlanDeps, global_version: u64) {
-        let (normalized, params) = normalize_sql(sql);
-        let key = fnv1a_hash(normalized.as_bytes());
+    pub fn store(
+        &mut self,
+        sql: &str,
+        ansi_quotes: bool,
+        stmt: &Stmt,
+        deps: PlanDeps,
+        global_version: u64,
+    ) {
+        let (normalized, params) = normalize_sql(sql, ansi_quotes);
+        let key = cache_key(&normalized, ansi_quotes);
 
         // Preserve and bump generation from previous entry (re-analysis after stale).
         let generation = self
@@ -315,98 +323,8 @@ pub struct CacheStats {
 /// - Identifiers, keywords, operators
 /// - Numbers that are part of identifiers (e.g., `table1`)
 /// - Negative signs (treated as unary operators by the parser)
-pub fn normalize_sql(sql: &str) -> (String, Vec<Value>) {
-    let mut result = String::with_capacity(sql.len());
-    let mut params = Vec::new();
-    let bytes = sql.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        let b = bytes[i];
-
-        // Skip whitespace.
-        if b.is_ascii_whitespace() {
-            result.push(b as char);
-            i += 1;
-            continue;
-        }
-
-        // String literal: 'content'
-        if b == b'\'' {
-            i += 1;
-            let mut s = String::new();
-            while i < len {
-                if bytes[i] == b'\'' {
-                    if i + 1 < len && bytes[i + 1] == b'\'' {
-                        s.push('\''); // escaped quote
-                        i += 2;
-                    } else {
-                        i += 1; // closing quote
-                        break;
-                    }
-                } else {
-                    s.push(bytes[i] as char);
-                    i += 1;
-                }
-            }
-            result.push('?');
-            params.push(Value::Text(s));
-            continue;
-        }
-
-        // Number literal: starts with digit or '.' followed by digit.
-        if b.is_ascii_digit() || (b == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit()) {
-            let num_start = i;
-            let mut is_float = b == b'.';
-            i += 1;
-            while i < len
-                && (bytes[i].is_ascii_digit()
-                    || bytes[i] == b'.'
-                    || bytes[i] == b'e'
-                    || bytes[i] == b'E')
-            {
-                if bytes[i] == b'.' || bytes[i] == b'e' || bytes[i] == b'E' {
-                    is_float = true;
-                }
-                i += 1;
-            }
-
-            // If preceded by a letter or underscore, it's part of an identifier (e.g., "table1").
-            if num_start > 0
-                && (bytes[num_start - 1].is_ascii_alphanumeric() || bytes[num_start - 1] == b'_')
-            {
-                result.push_str(&sql[num_start..i]);
-                continue;
-            }
-
-            let num_str = &sql[num_start..i];
-            if is_float {
-                if let Ok(f) = num_str.parse::<f64>() {
-                    result.push('?');
-                    params.push(Value::Real(f));
-                } else {
-                    result.push_str(num_str);
-                }
-            } else if let Ok(n) = num_str.parse::<i64>() {
-                result.push('?');
-                if n >= i32::MIN as i64 && n <= i32::MAX as i64 {
-                    params.push(Value::Int(n as i32));
-                } else {
-                    params.push(Value::BigInt(n));
-                }
-            } else {
-                result.push_str(num_str);
-            }
-            continue;
-        }
-
-        // Everything else: copy as-is.
-        result.push(b as char);
-        i += 1;
-    }
-
-    (result, params)
+pub fn normalize_sql(sql: &str, ansi_quotes: bool) -> (String, Vec<Value>) {
+    super::sql_scan::normalize_sql(sql, ansi_quotes)
 }
 
 /// Substitutes `Expr::Param { idx }` nodes in the AST with literal values.
@@ -424,6 +342,15 @@ fn fnv1a_hash(data: &[u8]) -> u64 {
     hash
 }
 
+fn cache_key(normalized: &str, ansi_quotes: bool) -> u64 {
+    let mut hash = fnv1a_hash(&[u8::from(ansi_quotes)]);
+    for &byte in normalized.as_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -434,7 +361,7 @@ mod tests {
 
     #[test]
     fn test_normalize_integer() {
-        let (norm, params) = normalize_sql("SELECT * FROM t WHERE id = 42");
+        let (norm, params) = normalize_sql("SELECT * FROM t WHERE id = 42", false);
         assert_eq!(norm, "SELECT * FROM t WHERE id = ?");
         assert_eq!(params.len(), 1);
         assert_eq!(params[0], Value::Int(42));
@@ -442,14 +369,14 @@ mod tests {
 
     #[test]
     fn test_normalize_string() {
-        let (norm, params) = normalize_sql("SELECT * FROM t WHERE name = 'alice'");
+        let (norm, params) = normalize_sql("SELECT * FROM t WHERE name = 'alice'", false);
         assert_eq!(norm, "SELECT * FROM t WHERE name = ?");
         assert_eq!(params, vec![Value::Text("alice".into())]);
     }
 
     #[test]
     fn test_normalize_multiple_literals() {
-        let (norm, params) = normalize_sql("INSERT INTO t VALUES (1, 'hello', 2.5)");
+        let (norm, params) = normalize_sql("INSERT INTO t VALUES (1, 'hello', 2.5)", false);
         assert_eq!(norm, "INSERT INTO t VALUES (?, ?, ?)");
         assert_eq!(params.len(), 3);
         assert_eq!(params[0], Value::Int(1));
@@ -459,14 +386,14 @@ mod tests {
 
     #[test]
     fn test_normalize_preserves_identifiers() {
-        let (norm, _) = normalize_sql("SELECT col1 FROM table2 WHERE id = 5");
+        let (norm, _) = normalize_sql("SELECT col1 FROM table2 WHERE id = 5", false);
         assert!(norm.contains("table2"));
         assert!(norm.contains("col1"));
     }
 
     #[test]
     fn test_normalize_escaped_string() {
-        let (norm, params) = normalize_sql("SELECT * FROM t WHERE s = 'it''s'");
+        let (norm, params) = normalize_sql("SELECT * FROM t WHERE s = 'it''s'", false);
         assert_eq!(norm, "SELECT * FROM t WHERE s = ?");
         assert_eq!(params, vec![Value::Text("it's".into())]);
     }
@@ -489,13 +416,13 @@ mod tests {
         let stmt = axiomdb_sql::parser::parse(sql, None).unwrap();
         let deps = PlanDeps::default();
 
-        cache.store(sql, &stmt, deps.clone(), 1);
-        let (_, params) = normalize_sql(sql);
-        let key = fnv1a_hash(normalize_sql(sql).0.as_bytes());
+        cache.store(sql, false, &stmt, deps.clone(), 1);
+        let (_, params) = normalize_sql(sql, false);
+        let key = cache_key(&normalize_sql(sql, false).0, false);
         assert_eq!(cache.entries[&key].generation, 0);
 
         // Re-store (simulates re-analysis after stale detection).
-        cache.store(sql, &stmt, deps, 2);
+        cache.store(sql, false, &stmt, deps, 2);
         assert_eq!(cache.entries[&key].generation, 1);
         let _ = params;
     }
@@ -509,14 +436,14 @@ mod tests {
         let stmt1 = axiomdb_sql::parser::parse(sql1, None).unwrap();
         let mut deps1 = PlanDeps::default();
         deps1.tables.push((10, 1)); // table_id=10, schema_version=1
-        cache.store(sql1, &stmt1, deps1, 1);
+        cache.store(sql1, false, &stmt1, deps1, 1);
 
         // Store entry with table_id=20
         let sql2 = "SELECT * FROM u WHERE id = 1";
         let stmt2 = axiomdb_sql::parser::parse(sql2, None).unwrap();
         let mut deps2 = PlanDeps::default();
         deps2.tables.push((20, 1)); // table_id=20
-        cache.store(sql2, &stmt2, deps2, 1);
+        cache.store(sql2, false, &stmt2, deps2, 1);
 
         assert_eq!(cache.entries.len(), 2);
 
@@ -526,7 +453,7 @@ mod tests {
         assert_eq!(cache.invalidations, 1);
 
         // sql2 entry (table_id=20) must survive.
-        let key2 = fnv1a_hash(normalize_sql(sql2).0.as_bytes());
+        let key2 = cache_key(&normalize_sql(sql2, false).0, false);
         assert!(cache.entries.contains_key(&key2));
     }
 
@@ -542,11 +469,11 @@ mod tests {
         let stmt2 = axiomdb_sql::parser::parse(sql2, None).unwrap();
         let stmt3 = axiomdb_sql::parser::parse(sql3, None).unwrap();
 
-        cache.store(sql1, &stmt1, PlanDeps::default(), 1); // seq=0
-        cache.store(sql2, &stmt2, PlanDeps::default(), 1); // seq=0
+        cache.store(sql1, false, &stmt1, PlanDeps::default(), 1); // seq=0
+        cache.store(sql2, false, &stmt2, PlanDeps::default(), 1); // seq=0
 
         // At capacity now (2 entries). Adding sql3 should evict the LRU (sql1 or sql2).
-        cache.store(sql3, &stmt3, PlanDeps::default(), 1);
+        cache.store(sql3, false, &stmt3, PlanDeps::default(), 1);
         assert_eq!(cache.entries.len(), 2);
     }
 
@@ -560,9 +487,20 @@ mod tests {
 
         let sql = "SELECT * FROM t WHERE id = 1";
         let stmt = axiomdb_sql::parser::parse(sql, None).unwrap();
-        cache.store(sql, &stmt, PlanDeps::default(), 0);
+        cache.store(sql, false, &stmt, PlanDeps::default(), 0);
 
         let stats = cache.stats();
         assert_eq!(stats.entries, 1);
+    }
+
+    #[test]
+    fn test_normalize_sql_double_quoted_literal_only_when_ansi_quotes_off() {
+        let (norm_off, params_off) = normalize_sql(r#"SELECT "hello""#, false);
+        assert_eq!(norm_off, "SELECT ?");
+        assert_eq!(params_off, vec![Value::Text("hello".into())]);
+
+        let (norm_on, params_on) = normalize_sql(r#"SELECT "hello""#, true);
+        assert_eq!(norm_on, r#"SELECT "hello""#);
+        assert!(params_on.is_empty());
     }
 }

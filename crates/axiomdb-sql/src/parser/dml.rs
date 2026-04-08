@@ -196,9 +196,13 @@ fn parse_select_item(p: &mut Parser) -> Result<SelectItem, DbError> {
 /// Parse an alias — allows certain keywords as alias names.
 fn parse_alias(p: &mut Parser) -> Result<String, DbError> {
     match p.peek().clone() {
-        Token::Ident(s) | Token::QuotedIdent(s) | Token::DqIdent(s) => {
+        Token::Ident(s) | Token::QuotedIdent(s) => {
             p.advance();
             Ok(s.to_string())
+        }
+        Token::DqIdent(s) => {
+            p.advance();
+            Ok(s)
         }
         // Allow unreserved keywords as aliases
         Token::Key => {

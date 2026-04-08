@@ -38,7 +38,7 @@ use axiomdb_sql::{
     analyze_cached_with_defaults,
     ast::Stmt,
     bloom::BloomRegistry,
-    execute_read_only_with_ctx, execute_with_ctx, parse,
+    execute_read_only_with_ctx, execute_with_ctx, parse_with_sql_mode,
     result::{ColumnMeta, QueryResult},
     session::{is_ignorable_on_error, OnErrorMode},
     verify_and_repair_indexes_on_open, SchemaCache, SessionContext,
@@ -236,7 +236,7 @@ impl Database {
         }
 
         // ── parse ─────────────────────────────────────────────────────────────
-        let stmt = match parse(sql, None) {
+        let stmt = match parse_with_sql_mode(sql, None, session.sql_mode_flags()) {
             Ok(s) => s,
             Err(e) => return self.apply_on_error_pipeline_failure(sql, session, e),
         };
@@ -308,7 +308,7 @@ impl Database {
         }
 
         // Parse
-        let stmt = parse(sql, None)?;
+        let stmt = parse_with_sql_mode(sql, None, session.sql_mode_flags())?;
 
         // Analyze (uses &self.storage, &self.txn — shared refs)
         let snap = if let Some(ref ct) = session.conn_txn {

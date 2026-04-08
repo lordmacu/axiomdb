@@ -77,7 +77,7 @@ mod db {
         bloom::BloomRegistry,
         execute_with_ctx,
         expr::Expr,
-        parse,
+        parse_with_sql_mode,
         result::QueryResult,
         verify_and_repair_indexes_on_open, SchemaCache, SessionContext,
     };
@@ -258,7 +258,7 @@ mod db {
                     operation: "database is in read-only degraded mode",
                 });
             }
-            let stmt = parse(sql, None)?;
+            let stmt = parse_with_sql_mode(sql, None, self.session.sql_mode_flags())?;
             let snap = if let Some(ref ct) = self.session.conn_txn {
                 self.txn.active_snapshot(ct)
             } else {
@@ -340,7 +340,7 @@ mod db {
         /// parameter values, skipping parse + analyze on each call.
         pub fn prepare(&mut self, sql: &str) -> Result<PreparedStatement, DbError> {
             // Parse with parameter support.
-            let stmt = parse(sql, None)?;
+            let stmt = parse_with_sql_mode(sql, None, self.session.sql_mode_flags())?;
 
             // Count Param nodes in the AST.
             let param_count = count_params(&stmt);
