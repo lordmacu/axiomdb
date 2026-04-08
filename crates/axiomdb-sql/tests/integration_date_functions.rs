@@ -345,3 +345,116 @@ fn year_null_returns_null() {
 fn month_null_returns_null() {
     assert_eq!(scalar("SELECT month(NULL)"), Value::Null);
 }
+
+// ── 4.18d: Implicit date-string coercion in comparisons ──────────────────────
+
+mod date_coercion {
+    use super::*;
+
+    fn db() -> (MemoryStorage, TxnManager) {
+        let (mut st, mut txn) = setup();
+        run_result(
+            "CREATE TABLE events (id INT PRIMARY KEY, created_at TIMESTAMP)",
+            &mut st,
+            &mut txn,
+        )
+        .unwrap();
+        // Insert via STR_TO_DATE so the stored Value::Timestamp is correct.
+        run_result(
+            "INSERT INTO events VALUES (1, STR_TO_DATE('2024-01-15 10:00:00', '%Y-%m-%d %H:%i:%s'))",
+            &mut st,
+            &mut txn,
+        )
+        .unwrap();
+        run_result(
+            "INSERT INTO events VALUES (2, STR_TO_DATE('2024-06-01 00:00:00', '%Y-%m-%d %H:%i:%s'))",
+            &mut st,
+            &mut txn,
+        )
+        .unwrap();
+        (st, txn)
+    }
+
+    fn count_rows(sql: &str) -> usize {
+        let (mut st, mut txn) = db();
+        let r = run_result(sql, &mut st, &mut txn).unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => rows.len(),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ts_eq_datetime_string() {
+        // Exact match: row 1 is at 10:00:00.
+        assert_eq!(
+            count_rows("SELECT * FROM events WHERE created_at = '2024-01-15 10:00:00'"),
+            1
+        );
+    }
+
+    #[test]
+    fn ts_eq_date_only_string_no_match() {
+        // '2024-01-15' → '2024-01-15 00:00:00'; row 1 is at 10:00:00 → no match.
+        assert_eq!(
+            count_rows("SELECT * FROM events WHERE created_at = '2024-01-15'"),
+            0
+        );
+    }
+
+    #[test]
+    fn ts_gt_date_string() {
+        // Both rows are after '2024-01-01 00:00:00'.
+        assert_eq!(
+            count_rows("SELECT * FROM events WHERE created_at > '2024-01-01'"),
+            2
+        );
+    }
+
+    #[test]
+    fn ts_lt_date_string() {
+        // Both rows are before '2025-01-01 00:00:00'.
+        assert_eq!(
+            count_rows("SELECT * FROM events WHERE created_at < '2025-01-01'"),
+            2
+        );
+    }
+
+    #[test]
+    fn ts_between_strings() {
+        // Row 1 (Jan 15) is between Jan 1 and Feb 1; row 2 (Jun 1) is not.
+        assert_eq!(
+            count_rows(
+                "SELECT * FROM events WHERE created_at BETWEEN '2024-01-01' AND '2024-02-01'"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn ts_neq_string() {
+        // Both rows differ from '2024-03-01 00:00:00'.
+        assert_eq!(
+            count_rows("SELECT * FROM events WHERE created_at != '2024-03-01'"),
+            2
+        );
+    }
+
+    #[test]
+    fn reversed_string_gt_col() {
+        // '2025-01-01' > created_at — both rows.
+        assert_eq!(
+            count_rows("SELECT * FROM events WHERE '2025-01-01' > created_at"),
+            2
+        );
+    }
+
+    #[test]
+    fn reversed_string_lt_col() {
+        // '2024-01-01' < created_at — both rows.
+        assert_eq!(
+            count_rows("SELECT * FROM events WHERE '2024-01-01' < created_at"),
+            2
+        );
+    }
+}

@@ -275,3 +275,83 @@ fn test_having_non_agg_column() {
     assert_eq!(r.len(), 2, "ages 30 and 40 pass HAVING age > 25");
     assert!(r.iter().all(|row| row[1] == Value::BigInt(2)));
 }
+
+// ── COUNT(DISTINCT) / SUM(DISTINCT) / AVG(DISTINCT) — 4.9f ───────────────────
+
+#[test]
+fn test_count_distinct_basic() {
+    let (mut s, mut t) = setup();
+    run("CREATE TABLE t (id INT, val INT)", &mut s, &mut t);
+    run(
+        "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)",
+        &mut s,
+        &mut t,
+    );
+    let r = rows(run("SELECT COUNT(DISTINCT val) FROM t", &mut s, &mut t));
+    assert_eq!(r, vec![vec![Value::BigInt(3)]]);
+}
+
+#[test]
+fn test_count_distinct_vs_count_all() {
+    let (mut s, mut t) = setup();
+    run("CREATE TABLE t (id INT, grp INT, val INT)", &mut s, &mut t);
+    run(
+        "INSERT INTO t VALUES (1, 1, 10), (2, 1, 10), (3, 1, 20), (4, 2, 10), (5, 2, 30)",
+        &mut s,
+        &mut t,
+    );
+    let r = rows(run(
+        "SELECT grp, COUNT(*), COUNT(DISTINCT val) FROM t GROUP BY grp ORDER BY grp",
+        &mut s,
+        &mut t,
+    ));
+    assert_eq!(r.len(), 2);
+    // grp=1: 3 rows, 2 distinct vals (10, 20)
+    assert_eq!(r[0][1], Value::BigInt(3));
+    assert_eq!(r[0][2], Value::BigInt(2));
+    // grp=2: 2 rows, 2 distinct vals (10, 30)
+    assert_eq!(r[1][1], Value::BigInt(2));
+    assert_eq!(r[1][2], Value::BigInt(2));
+}
+
+#[test]
+fn test_count_distinct_with_nulls() {
+    let (mut s, mut t) = setup();
+    run("CREATE TABLE t (id INT, val INT)", &mut s, &mut t);
+    run(
+        "INSERT INTO t VALUES (1, 10), (2, NULL), (3, 10), (4, NULL), (5, 20)",
+        &mut s,
+        &mut t,
+    );
+    let r = rows(run("SELECT COUNT(DISTINCT val) FROM t", &mut s, &mut t));
+    // NULLs are excluded; 2 distinct non-NULL values
+    assert_eq!(r, vec![vec![Value::BigInt(2)]]);
+}
+
+#[test]
+fn test_sum_distinct() {
+    let (mut s, mut t) = setup();
+    run("CREATE TABLE t (id INT, val INT)", &mut s, &mut t);
+    run(
+        "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)",
+        &mut s,
+        &mut t,
+    );
+    let r = rows(run("SELECT SUM(DISTINCT val) FROM t", &mut s, &mut t));
+    // 10 + 20 + 30 = 60
+    assert_eq!(r, vec![vec![Value::Int(60)]]);
+}
+
+#[test]
+fn test_avg_distinct() {
+    let (mut s, mut t) = setup();
+    run("CREATE TABLE t (id INT, val INT)", &mut s, &mut t);
+    run(
+        "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)",
+        &mut s,
+        &mut t,
+    );
+    let r = rows(run("SELECT AVG(DISTINCT val) FROM t", &mut s, &mut t));
+    // avg(10, 20, 30) = 20.0
+    assert_eq!(r, vec![vec![Value::Real(20.0)]]);
+}
