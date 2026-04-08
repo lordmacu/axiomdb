@@ -599,3 +599,78 @@ fn test_legacy_db_fk_root_zero_returns_empty() {
     assert_eq!(reader.list_fk_constraints(1).unwrap().len(), 0);
     assert_eq!(reader.list_fk_constraints_referencing(1).unwrap().len(), 0);
 }
+
+// ── ON UPDATE CASCADE tests ─────────────────────────────────────────────────
+
+#[test]
+fn test_on_update_cascade_propagates_new_pk() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE parent (id INT PRIMARY KEY)");
+    db.ok("CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id) ON UPDATE CASCADE)");
+    db.ok("INSERT INTO parent VALUES (1)");
+    db.ok("INSERT INTO child VALUES (10, 1)");
+    db.ok("INSERT INTO child VALUES (20, 1)");
+    // Update parent PK → children should cascade.
+    db.ok("UPDATE parent SET id = 99 WHERE id = 1");
+    let r = rows(db.ok("SELECT pid FROM child ORDER BY id"));
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][0], Value::Int(99));
+    assert_eq!(r[1][0], Value::Int(99));
+    // Parent should have new PK.
+    let p = rows(db.ok("SELECT id FROM parent"));
+    assert_eq!(p[0][0], Value::Int(99));
+}
+
+#[test]
+fn test_on_update_cascade_no_change_when_key_unchanged() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE parent (id INT PRIMARY KEY, name TEXT)");
+    db.ok("CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id) ON UPDATE CASCADE)");
+    db.ok("INSERT INTO parent VALUES (1, 'a')");
+    db.ok("INSERT INTO child VALUES (10, 1)");
+    // Update non-PK column — no cascade needed.
+    db.ok("UPDATE parent SET name = 'b' WHERE id = 1");
+    let r = rows(db.ok("SELECT pid FROM child"));
+    assert_eq!(r[0][0], Value::Int(1));
+}
+
+#[test]
+fn test_on_update_cascade_no_children_ok() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE parent (id INT PRIMARY KEY)");
+    db.ok("CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id) ON UPDATE CASCADE)");
+    db.ok("INSERT INTO parent VALUES (1)");
+    db.ok("INSERT INTO parent VALUES (2)");
+    // No children referencing id=2 — should succeed.
+    db.ok("UPDATE parent SET id = 99 WHERE id = 2");
+}
+
+// ── ON UPDATE SET NULL tests ────────────────────────────────────────────────
+
+#[test]
+fn test_on_update_set_null_nullifies_children() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE parent (id INT PRIMARY KEY)");
+    db.ok("CREATE TABLE child (id INT PRIMARY KEY, pid INT NULL REFERENCES parent(id) ON UPDATE SET NULL)");
+    db.ok("INSERT INTO parent VALUES (1)");
+    db.ok("INSERT INTO child VALUES (10, 1)");
+    db.ok("INSERT INTO child VALUES (20, 1)");
+    // Update parent PK → children FK should become NULL.
+    db.ok("UPDATE parent SET id = 99 WHERE id = 1");
+    let r = rows(db.ok("SELECT pid FROM child ORDER BY id"));
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][0], Value::Null);
+    assert_eq!(r[1][0], Value::Null);
+}
+
+#[test]
+fn test_on_update_set_null_no_change_when_key_unchanged() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE parent (id INT PRIMARY KEY, name TEXT)");
+    db.ok("CREATE TABLE child (id INT PRIMARY KEY, pid INT NULL REFERENCES parent(id) ON UPDATE SET NULL)");
+    db.ok("INSERT INTO parent VALUES (1, 'a')");
+    db.ok("INSERT INTO child VALUES (10, 1)");
+    db.ok("UPDATE parent SET name = 'b' WHERE id = 1");
+    let r = rows(db.ok("SELECT pid FROM child"));
+    assert_eq!(r[0][0], Value::Int(1)); // Still 1, not NULL.
+}

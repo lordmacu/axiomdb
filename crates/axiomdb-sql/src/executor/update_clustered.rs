@@ -175,6 +175,7 @@ fn execute_clustered_update(
                 storage,
                 txn,
                 conn_txn,
+                bloom,
             )?;
         }
     }

@@ -119,6 +119,7 @@ fn execute_update_with_candidates(
             storage,
             txn,
             conn_txn,
+            bloom,
         )?;
     }
 
