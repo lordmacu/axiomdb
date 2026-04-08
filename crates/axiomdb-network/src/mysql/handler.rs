@@ -1391,6 +1391,48 @@ pub async fn handle_connection_with_timeouts(
                 lifecycle.enter(ConnectionPhase::Idle);
             }
 
+            // ── Deprecated / unsupported COM_* commands ─────────────────
+            // Return ERR 1235 (ER_NOT_SUPPORTED_YET) with a specific message
+            // instead of the generic 1047 "Unknown command".  The connection
+            // stays alive — MySQL behaviour for deprecated commands.
+            0x04 | // COM_FIELD_LIST (deprecated MySQL 5.7.11)
+            0x07 | // COM_REFRESH (deprecated MySQL 5.7.11)
+            0x08 | // COM_SHUTDOWN (deprecated MySQL 5.7.9)
+            0x0a | // COM_PROCESS_INFO (deprecated MySQL 5.7.11)
+            0x0d | // COM_DEBUG
+            0x05 | // COM_CREATE_DB (deprecated)
+            0x06 | // COM_DROP_DB (deprecated)
+            0x12 | // COM_BINLOG_DUMP
+            0x1c   // COM_STMT_FETCH (server-side cursors)
+            => {
+                let name = match cmd {
+                    0x04 => "COM_FIELD_LIST",
+                    0x05 => "COM_CREATE_DB",
+                    0x06 => "COM_DROP_DB",
+                    0x07 => "COM_REFRESH",
+                    0x08 => "COM_SHUTDOWN",
+                    0x0a => "COM_PROCESS_INFO",
+                    0x0d => "COM_DEBUG",
+                    0x12 => "COM_BINLOG_DUMP",
+                    0x1c => "COM_STMT_FETCH",
+                    _ => "UNKNOWN",
+                };
+                debug!(conn_id, cmd = cmd, name, "unsupported command");
+                let err = build_err_packet(
+                    1235,
+                    b"0A000",
+                    &format!("{name} is not supported"),
+                );
+                if send_execute_packet(&mut writer, &lifecycle, &conn_state, 1u8, err.as_slice())
+                    .await
+                    .is_err()
+                {
+                    lifecycle.close();
+                    break;
+                }
+                lifecycle.enter(ConnectionPhase::Idle);
+            }
+
             other => {
                 warn!(conn_id, cmd = other, "unknown command");
                 let err = build_err_packet(1047, b"HY000", "Unknown command");
