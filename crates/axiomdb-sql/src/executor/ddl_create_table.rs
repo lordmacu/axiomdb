@@ -770,7 +770,9 @@ fn execute_create_table_as_select(
     let new_name = stmt.new_table.name.clone();
 
     // 1. Run the SELECT (read-only — borrows storage/txn immutably via coercion).
-    let result = execute_select_ctx(stmt.select, exec_ctx, ctx)?;
+    let conn = ctx.conn_txn.take();
+    let result = execute_select_ctx(stmt.select, exec_ctx, conn.as_ref(), ctx)?;
+    ctx.conn_txn = conn;
     let (col_meta, rows) = match result {
         QueryResult::Rows { columns, rows } => (columns, rows),
         // SELECT without FROM (e.g. SELECT 1) returns Rows with zero or one row.

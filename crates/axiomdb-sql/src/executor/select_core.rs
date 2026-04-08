@@ -326,7 +326,7 @@ fn execute_select_derived(
     let mut temp_ctx = SessionContext::new();
     let temp_bloom = crate::bloom::BloomRegistry::new();
     let temp_exec_ctx = ExecutionContext::new(storage, txn, &temp_bloom);
-    let inner_result = execute_select_ctx(inner_query, &temp_exec_ctx, &mut temp_ctx)?;
+    let inner_result = execute_select_ctx(inner_query, &temp_exec_ctx, None, &mut temp_ctx)?;
     let (derived_cols, derived_rows) = match inner_result {
         QueryResult::Rows { columns, rows } => (columns, rows),
         _ => {

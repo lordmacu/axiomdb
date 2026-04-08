@@ -901,7 +901,7 @@ SELECT @@transaction_isolation;  -- 'REPEATABLE-READ'
 | `@@character_set_results` | `'utf8mb4'` | Result character set |
 | `@@collation_connection` | `'utf8mb4_general_ci'` | Connection collation |
 | `@@max_allowed_packet` | `67108864` | Maximum packet size (64 MB) |
-| `@@sql_mode` | `'STRICT_TRANS_TABLES'` | Active SQL mode (see [Strict Mode](#strict-mode)) |
+| `@@sql_mode` | `'STRICT_TRANS_TABLES'` | Active SQL mode. `STRICT_TRANS_TABLES` controls coercion strictness; `ANSI_QUOTES` controls whether `"` parses as a string or as an identifier delimiter |
 | `@@strict_mode` | `'ON'` | AxiomDB strict coercion flag (alias for `STRICT_TRANS_TABLES` in sql_mode) |
 | `@@transaction_isolation` | `'REPEATABLE-READ'` | Isolation level |
 
@@ -919,6 +919,9 @@ SET character_set_client = 'utf8mb4';
 -- Control coercion strictness (see Strict Mode below)
 SET strict_mode = OFF;
 SET sql_mode = '';
+
+-- Enable ANSI_QUOTES for this connection
+SET sql_mode = 'ANSI_QUOTES,STRICT_TRANS_TABLES';
 ```
 
 ### @@in_transaction — transaction state check
@@ -1172,6 +1175,34 @@ at connection time to get MySQL 5 permissive behavior. AxiomDB supports this pat
 <code>SHOW WARNINGS</code> after bulk loads to audit truncated values.
 </div>
 </div>
+
+### ANSI_QUOTES
+
+`ANSI_QUOTES` is a parser-affecting `sql_mode` flag. It changes how the session
+interprets double quotes in every newly parsed statement:
+
+- `ANSI_QUOTES` **OFF** (default): `"value"` is a string literal
+- `ANSI_QUOTES` **ON**: `"value"` is a quoted identifier
+
+```sql
+SELECT "hello";     -- string literal by default
+
+SET sql_mode = 'ANSI_QUOTES,STRICT_TRANS_TABLES';
+SELECT "name" FROM "users";   -- quoted identifiers
+
+SET sql_mode = 'STRICT_TRANS_TABLES';
+SELECT "hello";     -- back to string literal parsing
+```
+
+The flag is session-local. It affects:
+
+- normal `COM_QUERY` statements
+- multi-statement splitting inside one query packet
+- `COM_STMT_PREPARE` / `COM_STMT_EXECUTE`
+- plan-cache normalization for ad-hoc SQL
+
+That means prepared statements keep the quote mode that was active when they
+were prepared, even if `@@sql_mode` changes later for the connection.
 
 ### SHOW WARNINGS
 

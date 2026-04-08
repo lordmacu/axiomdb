@@ -8,56 +8,8 @@
 ///
 /// Strips a trailing `;` on the last statement (common in SQL scripts).
 /// Returns `[sql]` unchanged if there is only one statement.
-fn split_sql_statements(sql: &str) -> Vec<&str> {
-    let mut stmts: Vec<&str> = Vec::new();
-    let mut start = 0usize;
-    let mut in_string = false;
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' if !in_string => {
-                in_string = true;
-                i += 1;
-            }
-            b'\'' if in_string => {
-                // Handle escaped quote `''` (SQL standard) or `\'` (MySQL extension)
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2; // skip both quotes
-                } else {
-                    in_string = false;
-                    i += 1;
-                }
-            }
-            b'\\' if in_string => {
-                i += 2; // skip escaped character
-            }
-            b';' if !in_string => {
-                let stmt = sql[start..i].trim();
-                if !stmt.is_empty() {
-                    stmts.push(stmt);
-                }
-                start = i + 1;
-                i += 1;
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-
-    // Remaining text after the last `;`
-    let tail = sql[start..].trim();
-    if !tail.is_empty() {
-        stmts.push(tail);
-    }
-
-    if stmts.is_empty() {
-        stmts.push(sql.trim());
-    }
-
-    stmts
+fn split_sql_statements(sql: &str, ansi_quotes: bool) -> Vec<&str> {
+    super::sql_scan::split_sql_statements(sql, ansi_quotes)
 }
 
 // ── Group commit helper ───────────────────────────────────────────────────────
@@ -348,4 +300,3 @@ fn single_null_row(col_name: &str) -> Vec<(u8, Vec<u8>)> {
     serialize_query_result(qr, 1, DEFAULT_SERVER_COLLATION)
         .expect("utf8mb4 encoding always valid for ASCII data")
 }
-

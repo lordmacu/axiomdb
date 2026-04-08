@@ -606,7 +606,9 @@ fn test_legacy_db_fk_root_zero_returns_empty() {
 fn test_on_update_cascade_propagates_new_pk() {
     let mut db = Db::new();
     db.ok("CREATE TABLE parent (id INT PRIMARY KEY)");
-    db.ok("CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id) ON UPDATE CASCADE)");
+    db.ok(
+        "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id) ON UPDATE CASCADE)",
+    );
     db.ok("INSERT INTO parent VALUES (1)");
     db.ok("INSERT INTO child VALUES (10, 1)");
     db.ok("INSERT INTO child VALUES (20, 1)");
@@ -625,7 +627,9 @@ fn test_on_update_cascade_propagates_new_pk() {
 fn test_on_update_cascade_no_change_when_key_unchanged() {
     let mut db = Db::new();
     db.ok("CREATE TABLE parent (id INT PRIMARY KEY, name TEXT)");
-    db.ok("CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id) ON UPDATE CASCADE)");
+    db.ok(
+        "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id) ON UPDATE CASCADE)",
+    );
     db.ok("INSERT INTO parent VALUES (1, 'a')");
     db.ok("INSERT INTO child VALUES (10, 1)");
     // Update non-PK column — no cascade needed.
@@ -638,7 +642,9 @@ fn test_on_update_cascade_no_change_when_key_unchanged() {
 fn test_on_update_cascade_no_children_ok() {
     let mut db = Db::new();
     db.ok("CREATE TABLE parent (id INT PRIMARY KEY)");
-    db.ok("CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id) ON UPDATE CASCADE)");
+    db.ok(
+        "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id) ON UPDATE CASCADE)",
+    );
     db.ok("INSERT INTO parent VALUES (1)");
     db.ok("INSERT INTO parent VALUES (2)");
     // No children referencing id=2 — should succeed.

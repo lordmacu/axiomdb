@@ -51,12 +51,12 @@ pub use eval::{
 pub use exec_ctx::ExecutionContext;
 pub use executor::{execute, execute_read_only_with_ctx, execute_snapshot, execute_with_ctx};
 pub use expr::{BinaryOp, Expr, UnaryOp};
-pub use lexer::{tokenize, Span, SpannedToken, Token};
-pub use session::{CompatMode, SessionCollation};
+pub use lexer::{tokenize, tokenize_with_sql_mode, Span, SpannedToken, Token};
+pub use session::{CompatMode, SessionCollation, SqlModeFlags};
 // Note: Token<'src> and SpannedToken<'src> carry a lifetime tied to the input string.
 pub use analyzer::{analyze, analyze_cached, analyze_cached_with_defaults, analyze_with_defaults};
 pub use index_integrity::{verify_and_repair_indexes_on_open, IndexIntegrityReport, RebuiltIndex};
-pub use parser::parse;
+pub use parser::{parse, parse_expr_only_with_sql_mode, parse_with_sql_mode};
 pub use result::{ColumnMeta, QueryResult, Row};
 pub use schema_cache::SchemaCache;
 pub use session::SessionContext;

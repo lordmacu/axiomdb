@@ -463,6 +463,7 @@ fn test_execute_packet_mysql_type_string_limit_param() {
         param_count: 1,
         param_types: vec![0xfd], // MYSQL_TYPE_STRING
         analyzed_stmt: None,
+        compiled_ansi_quotes: false,
         compiled_database: "axiomdb".into(),
         compiled_at_version: 0,
         deps: axiomdb_sql::plan_deps::PlanDeps::default(),
@@ -526,6 +527,7 @@ fn test_execute_packet_long_data_text_wins_over_null_and_inline() {
         param_count: 1,
         param_types: vec![0xfd], // MYSQL_TYPE_VAR_STRING
         analyzed_stmt: None,
+        compiled_ansi_quotes: false,
         compiled_database: "axiomdb".into(),
         compiled_at_version: 0,
         deps: axiomdb_sql::plan_deps::PlanDeps::default(),
@@ -563,6 +565,7 @@ fn test_execute_packet_long_data_blob_decodes_as_bytes() {
         param_count: 1,
         param_types: vec![0xfc], // MYSQL_TYPE_BLOB
         analyzed_stmt: None,
+        compiled_ansi_quotes: false,
         compiled_database: "axiomdb".into(),
         compiled_at_version: 0,
         deps: axiomdb_sql::plan_deps::PlanDeps::default(),

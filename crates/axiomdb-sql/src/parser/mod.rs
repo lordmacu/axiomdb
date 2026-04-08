@@ -18,7 +18,8 @@ use axiomdb_types::Value;
 
 use crate::{
     ast::{SetStmt, SetValue, Stmt, TableRef},
-    lexer::{tokenize, Span, SpannedToken, Token},
+    lexer::{Span, SpannedToken, Token},
+    session::SqlModeFlags,
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -32,6 +33,15 @@ use crate::{
 /// - [`DbError::ParseError`] — input too long, unrecognized character,
 ///   unexpected token, missing token, or identifier > 64 characters.
 pub fn parse(input: &str, max_bytes: Option<usize>) -> Result<Stmt, DbError> {
+    parse_with_sql_mode(input, max_bytes, SqlModeFlags::default())
+}
+
+/// Parse a single SQL statement from `input` with parser-affecting SQL mode flags.
+pub fn parse_with_sql_mode(
+    input: &str,
+    max_bytes: Option<usize>,
+    sql_mode: SqlModeFlags,
+) -> Result<Stmt, DbError> {
     // 4.1f: expand MySQL version-conditional comments `/*!NNNNN SQL*/` before
     // tokenizing. If the input contains no `/*!`, no allocation is made.
     let expanded;
@@ -42,7 +52,7 @@ pub fn parse(input: &str, max_bytes: Option<usize>) -> Result<Stmt, DbError> {
         }
         None => input,
     };
-    let tokens = tokenize(effective, max_bytes)?;
+    let tokens = crate::lexer::tokenize_with_sql_mode(effective, max_bytes, sql_mode)?;
     let mut p = Parser::new(&tokens);
     let stmt = p.parse_stmt()?;
 
@@ -65,7 +75,15 @@ pub fn parse(input: &str, max_bytes: Option<usize>) -> Result<Stmt, DbError> {
 /// Used to re-evaluate CHECK constraint expressions stored in `axiom_constraints`
 /// (Phase 4.22b). Returns `DbError::ParseError` if `input` is not a valid expression.
 pub fn parse_expr_only(input: &str) -> Result<crate::expr::Expr, DbError> {
-    let tokens = tokenize(input, None)?;
+    parse_expr_only_with_sql_mode(input, SqlModeFlags::default())
+}
+
+/// Parses a single SQL expression from `input` with parser-affecting SQL mode flags.
+pub fn parse_expr_only_with_sql_mode(
+    input: &str,
+    sql_mode: SqlModeFlags,
+) -> Result<crate::expr::Expr, DbError> {
+    let tokens = crate::lexer::tokenize_with_sql_mode(input, None, sql_mode)?;
     let mut p = Parser::new(&tokens);
     let e = expr::parse_expr(&mut p)?;
     Ok(e)
@@ -198,9 +216,13 @@ impl<'src> Parser<'src> {
     pub(crate) fn parse_identifier(&mut self) -> Result<String, DbError> {
         let pos = self.current_pos();
         let name = match self.peek().clone() {
-            Token::Ident(s) | Token::QuotedIdent(s) | Token::DqIdent(s) => {
+            Token::Ident(s) | Token::QuotedIdent(s) => {
                 self.pos += 1;
                 s.to_string() // &'src str → String: the one allocation per identifier
+            }
+            Token::DqIdent(s) => {
+                self.pos += 1;
+                s
             }
             // Allow certain keywords to be used as identifiers (unreserved words).
             Token::Key

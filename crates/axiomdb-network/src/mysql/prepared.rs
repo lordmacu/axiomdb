@@ -487,53 +487,28 @@ fn ymd_to_days(year: i32, month: i32, day: i32) -> i32 {
 /// Replaces `?` placeholders with SQL literals.
 ///
 /// Safe from SQL injection: strings are single-quote escaped using `value_to_sql_literal`.
-/// `?` inside single-quoted string literals in the template are not replaced.
-pub fn substitute_params(template: &str, params: &[Value]) -> Result<String, DbError> {
-    let mut result = String::with_capacity(template.len() + params.len() * 8);
+/// `?` inside string literals, delimited identifiers, or comments are not replaced.
+pub fn substitute_params(
+    template: &str,
+    params: &[Value],
+    ansi_quotes: bool,
+) -> Result<String, DbError> {
     let mut param_idx = 0usize;
-    let mut in_string = false;
-    let bytes = template.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        let ch = bytes[i];
-        match ch {
-            b'\'' => {
-                in_string = !in_string;
-                result.push('\'');
-            }
-            b'?' if !in_string => {
-                if param_idx >= params.len() {
-                    return Err(DbError::ParseError {
-                        message: format!(
-                            "prepared statement has {} placeholders but only {} params provided",
-                            count_question_marks(template),
-                            params.len()
-                        ),
-                        position: None,
-                    });
-                }
-                result.push_str(&value_to_sql_literal(&params[param_idx]));
-                param_idx += 1;
-            }
-            _ => result.push(ch as char),
+    super::sql_scan::substitute_params_with(template, ansi_quotes, |out| {
+        if param_idx >= params.len() {
+            return Err(DbError::ParseError {
+                message: format!(
+                    "prepared statement has {} placeholders but only {} params provided",
+                    super::sql_scan::count_question_marks(template, ansi_quotes),
+                    params.len()
+                ),
+                position: None,
+            });
         }
-        i += 1;
-    }
-    Ok(result)
-}
-
-fn count_question_marks(sql: &str) -> usize {
-    let mut count = 0;
-    let mut in_string = false;
-    for ch in sql.chars() {
-        match ch {
-            '\'' => in_string = !in_string,
-            '?' if !in_string => count += 1,
-            _ => {}
-        }
-    }
-    count
+        out.push_str(&value_to_sql_literal(&params[param_idx]));
+        param_idx += 1;
+        Ok(())
+    })
 }
 
 /// Converts a `Value` to a SQL literal string safe for embedding in SQL.
@@ -748,7 +723,8 @@ mod tests {
 
     #[test]
     fn test_substitute_int() {
-        let result = substitute_params("SELECT * FROM t WHERE id = ?", &[Value::Int(42)]).unwrap();
+        let result =
+            substitute_params("SELECT * FROM t WHERE id = ?", &[Value::Int(42)], false).unwrap();
         assert_eq!(result, "SELECT * FROM t WHERE id = 42");
     }
 
@@ -757,6 +733,7 @@ mod tests {
         let result = substitute_params(
             "SELECT * FROM t WHERE name = ?",
             &[Value::Text("O'Brien".into())],
+            false,
         )
         .unwrap();
         assert_eq!(result, "SELECT * FROM t WHERE name = 'O''Brien'");
@@ -764,7 +741,7 @@ mod tests {
 
     #[test]
     fn test_substitute_null() {
-        let result = substitute_params("INSERT INTO t VALUES (?)", &[Value::Null]).unwrap();
+        let result = substitute_params("INSERT INTO t VALUES (?)", &[Value::Null], false).unwrap();
         assert_eq!(result, "INSERT INTO t VALUES (NULL)");
     }
 
@@ -773,6 +750,7 @@ mod tests {
         let result = substitute_params(
             "INSERT INTO t VALUES (?, ?)",
             &[Value::Int(1), Value::Text("hello".into())],
+            false,
         )
         .unwrap();
         assert_eq!(result, "INSERT INTO t VALUES (1, 'hello')");
@@ -780,14 +758,23 @@ mod tests {
 
     #[test]
     fn test_question_mark_in_string_not_substituted() {
-        let result = substitute_params("SELECT '?' FROM t WHERE id = ?", &[Value::Int(5)]).unwrap();
+        let result =
+            substitute_params("SELECT '?' FROM t WHERE id = ?", &[Value::Int(5)], false).unwrap();
         assert_eq!(result, "SELECT '?' FROM t WHERE id = 5");
     }
 
     #[test]
     fn test_too_few_params_error() {
-        let result = substitute_params("SELECT * FROM t WHERE id = ?", &[]);
+        let result = substitute_params("SELECT * FROM t WHERE id = ?", &[], false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_question_mark_in_double_quoted_string_not_substituted_when_ansi_quotes_off() {
+        let result =
+            substitute_params(r#"SELECT "?" FROM t WHERE id = ?"#, &[Value::Int(5)], false)
+                .unwrap();
+        assert_eq!(result, r#"SELECT "?" FROM t WHERE id = 5"#);
     }
 
     #[test]
@@ -852,6 +839,7 @@ mod tests {
         let sql = substitute_params(
             "SELECT * FROM t ORDER BY a LIMIT ? OFFSET ?",
             &[Value::Text("2".into()), Value::Text("1".into())],
+            false,
         )
         .unwrap();
         assert_eq!(sql, "SELECT * FROM t ORDER BY a LIMIT '2' OFFSET '1'");
@@ -863,6 +851,7 @@ mod tests {
         let sql = substitute_params(
             "SELECT * FROM t ORDER BY a LIMIT ? OFFSET ?",
             &[Value::Int(5), Value::Int(10)],
+            false,
         )
         .unwrap();
         assert_eq!(sql, "SELECT * FROM t ORDER BY a LIMIT 5 OFFSET 10");
@@ -922,6 +911,7 @@ mod tests {
             compiled_at_version: 0,
             deps: axiomdb_sql::plan_deps::PlanDeps::default(),
             generation: 0,
+            compiled_ansi_quotes: false,
             last_used_seq: 0,
             pending_long_data: vec![None; 1],
             pending_long_data_error: None,
@@ -965,6 +955,7 @@ mod tests {
             compiled_at_version: 0,
             deps: axiomdb_sql::plan_deps::PlanDeps::default(),
             generation: 0,
+            compiled_ansi_quotes: false,
             last_used_seq: 0,
             pending_long_data: vec![None; param_count as usize],
             pending_long_data_error: None,

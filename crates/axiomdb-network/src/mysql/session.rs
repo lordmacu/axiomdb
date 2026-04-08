@@ -15,8 +15,8 @@ use axiomdb_sql::plan_deps::PlanDeps;
 use axiomdb_sql::session::{
     apply_strict_to_sql_mode, compat_mode_name, normalize_sql_mode, on_error_mode_name,
     parse_boolish_setting, parse_compat_mode_setting, parse_on_error_setting,
-    parse_session_collation_setting, session_collation_name, sql_mode_is_strict, CompatMode,
-    OnErrorMode, SessionCollation,
+    parse_session_collation_setting, session_collation_name, sql_mode_has_ansi_quotes,
+    sql_mode_is_strict, CompatMode, OnErrorMode, SessionCollation, SqlModeFlags,
 };
 
 use super::charset::{self, CharsetDef, CollationDef, DEFAULT_SERVER_COLLATION};
@@ -69,6 +69,11 @@ pub struct PreparedStatement {
     pub generation: u32,
     /// Selected database at the last successful parse+analyze.
     pub compiled_database: String,
+    /// Quote-mode snapshot at PREPARE time.
+    ///
+    /// Existing prepared statements keep the parsing semantics they were
+    /// prepared with even if the session later changes `sql_mode`.
+    pub compiled_ansi_quotes: bool,
     /// Logical clock for LRU eviction. Updated to `ConnectionState::execute_seq`
     /// on every `COM_STMT_EXECUTE`. The statement with the lowest value is
     /// evicted when the per-connection cache reaches its limit.
@@ -129,23 +134,11 @@ impl PreparedStatement {
     }
 }
 
-/// Counts unquoted `?` placeholders in a SQL string.
+/// Counts unquoted `?` placeholders in a SQL string for the current quote mode.
 ///
-/// `?` characters inside single-quoted string literals are NOT counted.
-pub fn count_params(sql: &str) -> u16 {
-    let mut count = 0u16;
-    let mut in_string = false;
-    let mut prev = '\0';
-    for ch in sql.chars() {
-        match ch {
-            '\'' if !in_string => in_string = true,
-            '\'' if in_string && prev != '\\' => in_string = false,
-            '?' if !in_string => count += 1,
-            _ => {}
-        }
-        prev = ch;
-    }
-    count
+/// `?` characters inside string literals, identifiers, or comments are not counted.
+pub fn count_params(sql: &str, ansi_quotes: bool) -> u16 {
+    super::sql_scan::count_params(sql, ansi_quotes)
 }
 
 // ── ConnectionState ───────────────────────────────────────────────────────────
@@ -823,7 +816,8 @@ impl ConnectionState {
             }
         }
 
-        let param_count = count_params(&sql);
+        let compiled_ansi_quotes = self.ansi_quotes();
+        let param_count = count_params(&sql, compiled_ansi_quotes);
         let stmt_id = self.next_stmt_id;
         // Advance, wrapping to 1 (never 0)
         self.next_stmt_id = self.next_stmt_id.wrapping_add(1).max(1);
@@ -842,12 +836,28 @@ impl ConnectionState {
                 deps: PlanDeps::default(), // populated by handler after extract_table_deps
                 generation: 0,
                 compiled_database: current_database.to_string(),
+                compiled_ansi_quotes,
                 last_used_seq: 0,
                 pending_long_data: vec![None; param_count as usize],
                 pending_long_data_error: None,
             },
         );
         (stmt_id, param_count)
+    }
+
+    /// Returns `true` when the normalized session `sql_mode` enables `ANSI_QUOTES`.
+    pub fn ansi_quotes(&self) -> bool {
+        self.variables
+            .get("sql_mode")
+            .map(|s| sql_mode_has_ansi_quotes(s))
+            .unwrap_or(false)
+    }
+
+    /// Returns parser-affecting SQL mode flags for this connection.
+    pub fn sql_mode_flags(&self) -> SqlModeFlags {
+        SqlModeFlags {
+            ansi_quotes: self.ansi_quotes(),
+        }
     }
 }
 
@@ -1164,6 +1174,12 @@ mod tests {
     }
 
     #[test]
+    fn test_default_ansi_quotes_is_off() {
+        let s = ConnectionState::new();
+        assert!(!s.ansi_quotes());
+    }
+
+    #[test]
     fn test_set_strict_mode_off_updates_sql_mode() {
         let mut s = ConnectionState::new();
         assert!(s.apply_set("SET strict_mode = OFF").unwrap());
@@ -1223,6 +1239,7 @@ mod tests {
         s.apply_set("SET sql_mode = 'ANSI_QUOTES,STRICT_TRANS_TABLES'")
             .unwrap();
         assert_eq!(s.get_variable("strict_mode"), Some("ON".into()));
+        assert!(s.ansi_quotes());
         let sql_mode = s.get_variable("sql_mode").unwrap();
         assert!(sql_mode.contains("STRICT_TRANS_TABLES"), "{sql_mode}");
         assert!(sql_mode.contains("ANSI_QUOTES"), "{sql_mode}");
@@ -1258,5 +1275,24 @@ mod tests {
         assert_eq!(ps.compiled_at_version, 7);
         assert_eq!(ps.last_used_seq, 0);
         assert!(ps.analyzed_stmt.is_none());
+        assert!(!ps.compiled_ansi_quotes);
+    }
+
+    #[test]
+    fn test_prepare_statement_question_mark_in_double_quoted_string_not_counted_when_ansi_quotes_off(
+    ) {
+        let mut s = ConnectionState::new();
+        let (_id, param_count) = s.prepare_statement(r#"SELECT "?" , ?"#.into(), 0, "axiomdb");
+        assert_eq!(param_count, 1);
+    }
+
+    #[test]
+    fn test_prepare_statement_captures_compiled_ansi_quotes() {
+        let mut s = ConnectionState::new();
+        s.apply_set("SET sql_mode = 'ANSI_QUOTES,STRICT_TRANS_TABLES'")
+            .unwrap();
+        let (id, _param_count) =
+            s.prepare_statement(r#"SELECT "name" FROM "t""#.into(), 0, "axiomdb");
+        assert!(s.prepared_statements[&id].compiled_ansi_quotes);
     }
 }

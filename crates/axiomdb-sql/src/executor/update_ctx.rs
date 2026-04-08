@@ -1,6 +1,7 @@
 fn execute_update_ctx(
     stmt: UpdateStmt,
     exec_ctx: &ExecutionContext,
+    conn_txn: &mut ConnectionTxn,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
@@ -40,12 +41,11 @@ fn execute_update_ctx(
     let stmt_order_by = stmt.order_by;
     let stmt_limit = stmt.limit;
 
-    let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
+    let snap = txn.active_snapshot(conn_txn);
 
     // ── Clustered table UPDATE dispatch (Phase 39.16) ────────────────────
     if resolved.def.is_clustered() {
-        let mut conn = ctx.conn_txn.take().expect("active txn for clustered update");
-        let result = execute_clustered_update(
+        return execute_clustered_update(
             stmt.where_clause,
             &stmt_order_by,
             stmt_limit.as_ref(),
@@ -54,14 +54,12 @@ fn execute_update_ctx(
             &secondary_indexes,
             storage,
             txn,
-            &mut conn,
+            conn_txn,
             snap,
             &resolved,
             bloom,
             ctx,
         );
-        ctx.conn_txn = Some(conn);
-        return result;
     }
 
     // Pre-compute field-patch eligibility early — needed for both the fused
@@ -94,8 +92,7 @@ fn execute_update_ctx(
         if let crate::planner::AccessMethod::IndexRange { ref index_def, ref lo, ref hi } = update_access {
             let has_affected_secondary = secondary_indexes.iter().any(|i| !i.is_primary);
             if index_def.is_primary && field_patch_eligible && !has_affected_secondary {
-                let mut conn = ctx.conn_txn.take().expect("active txn for fused_index_range_patch");
-                let result = fused_index_range_patch(
+                return fused_index_range_patch(
                     index_def,
                     lo.as_deref(),
                     hi.as_deref(),
@@ -103,13 +100,11 @@ fn execute_update_ctx(
                     &col_types,
                     storage,
                     txn,
-                    &mut conn,
+                    conn_txn,
                     snap,
                     &resolved,
                     ctx,
                 );
-                ctx.conn_txn = Some(conn);
-                return result;
             }
         }
 
@@ -130,8 +125,7 @@ fn execute_update_ctx(
             stmt_limit.as_ref(),
         )?;
 
-        let mut conn = ctx.conn_txn.take().expect("active txn for execute_update_with_candidates");
-        let result = execute_update_with_candidates(
+        return execute_update_with_candidates(
             candidate_rows,
             assignments,
             &schema_cols,
@@ -140,14 +134,12 @@ fn execute_update_ctx(
             field_patch_eligible,
             storage,
             txn,
-            &mut conn,
+            conn_txn,
             snap,
             &resolved,
             ctx,
             bloom,
         );
-        ctx.conn_txn = Some(conn);
-        return result;
     }
 
     // No WHERE clause — full table scan.
@@ -159,8 +151,7 @@ fn execute_update_ctx(
         stmt_limit.as_ref(),
     )?;
 
-    let mut conn = ctx.conn_txn.take().expect("active txn for execute_update_with_candidates fullscan");
-    let result = execute_update_with_candidates(
+    execute_update_with_candidates(
         candidate_rows,
         assignments,
         &schema_cols,
@@ -169,13 +160,11 @@ fn execute_update_ctx(
         field_patch_eligible,
         storage,
         txn,
-        &mut conn,
+        conn_txn,
         snap,
         &resolved,
         ctx,
         bloom,
-    );
-    ctx.conn_txn = Some(conn);
-    result
+    )
 }
 

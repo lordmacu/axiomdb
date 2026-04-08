@@ -10,7 +10,7 @@
 use axiomdb_sql::{
     ast::{SelectItem, Stmt},
     expr::{BinaryOp, Expr},
-    parse,
+    parse, parse_with_sql_mode, SqlModeFlags,
 };
 use axiomdb_types::Value;
 
@@ -22,6 +22,18 @@ fn parse_ok(sql: &str) -> Stmt {
 
 fn select_first_expr(sql: &str) -> Expr {
     match parse_ok(sql) {
+        Stmt::Select(s) => match &s.columns[0] {
+            SelectItem::Expr { expr, .. } => expr.clone(),
+            other => panic!("expected Expr item, got {other:?}"),
+        },
+        other => panic!("expected SELECT, got {other:?}"),
+    }
+}
+
+fn select_first_expr_with_ansi_quotes(sql: &str) -> Expr {
+    match parse_with_sql_mode(sql, None, SqlModeFlags { ansi_quotes: true })
+        .unwrap_or_else(|e| panic!("parse failed for {:?}: {}", sql, e))
+    {
         Stmt::Select(s) => match &s.columns[0] {
             SelectItem::Expr { expr, .. } => expr.clone(),
             other => panic!("expected Expr item, got {other:?}"),
@@ -185,6 +197,23 @@ fn test_limit_comma_zero_offset() {
             assert!(s.offset.is_some());
         }
         other => panic!("expected SELECT, got {other:?}"),
+    }
+}
+
+// ── G4: ANSI_QUOTES OFF / ON behavior (4.2f) ────────────────────────────────
+
+#[test]
+fn test_double_quoted_string_parses_in_default_mode() {
+    let e = select_first_expr(r#"SELECT "hello""#);
+    assert_eq!(e, Expr::Literal(Value::Text("hello".into())));
+}
+
+#[test]
+fn test_double_quoted_identifier_parses_when_ansi_quotes_enabled() {
+    let e = select_first_expr_with_ansi_quotes(r#"SELECT "name" FROM "users""#);
+    match e {
+        Expr::Column { name, .. } => assert_eq!(name, "name"),
+        other => panic!("expected quoted identifier column, got {other:?}"),
     }
 }
 

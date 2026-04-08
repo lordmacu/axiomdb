@@ -1,6 +1,7 @@
 fn execute_delete_ctx(
     stmt: DeleteStmt,
     exec_ctx: &ExecutionContext,
+    conn_txn: &mut ConnectionTxn,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
@@ -20,12 +21,11 @@ fn execute_delete_ctx(
         .cloned()
         .collect();
 
-    let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("conn_txn for delete_ctx"));
+    let snap = txn.active_snapshot(conn_txn);
 
     // ── Clustered table DELETE dispatch (Phase 39.17) ────────────────────
     if resolved.def.is_clustered() {
-        let mut conn = ctx.conn_txn.take().expect("conn_txn for clustered delete");
-        let result = execute_clustered_delete(
+        return execute_clustered_delete(
             stmt.where_clause,
             &stmt.order_by,
             stmt.limit.as_ref(),
@@ -33,14 +33,12 @@ fn execute_delete_ctx(
             &secondary_indexes,
             storage,
             txn,
-            &mut conn,
+            conn_txn,
             snap,
             &resolved,
             bloom,
             ctx,
         );
-        ctx.conn_txn = Some(conn);
-        return result;
     }
 
     // Check if any FK constraint references THIS table as the parent.
@@ -68,10 +66,7 @@ fn execute_delete_ctx(
         let plan = plan_bulk_empty_table(storage, &resolved.def, &all_indexes, snap)?;
         let count = plan.visible_row_count;
 
-        {
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn for bulk_empty delete_ctx");
-            apply_bulk_empty_table(storage, txn, conn, bloom, &resolved.def, plan)?;
-        }
+        apply_bulk_empty_table(storage, txn, conn_txn, bloom, &resolved.def, plan)?;
 
         // Invalidate session schema cache so the next query reloads the new roots.
         ctx.invalidate_all();
@@ -122,13 +117,12 @@ fn execute_delete_ctx(
     // FK parent enforcement: must run BEFORE heap delete so RESTRICT can abort
     // cleanly and CASCADE/SET NULL can still read/update child rows.
     if has_fk_references && !to_delete.is_empty() {
-        let conn = ctx.conn_txn.as_mut().expect("conn_txn for fk_parent_delete");
         crate::fk_enforcement::enforce_fk_on_parent_delete(
             &to_delete,
             resolved.def.id,
             storage,
             txn,
-            conn,
+            conn_txn,
             bloom,
             0,
         )?;
@@ -136,7 +130,7 @@ fn execute_delete_ctx(
 
     // Batch-delete from heap: each page read+written once instead of 3× per row.
     let rids_only: Vec<RecordId> = to_delete.iter().map(|(rid, _)| *rid).collect();
-    let count = TableEngine::delete_rows_batch(storage, txn, ctx.conn_txn.as_mut().expect("conn_txn for delete_rows_batch"), &resolved.def, &rids_only)?;
+    let count = TableEngine::delete_rows_batch(storage, txn, conn_txn, &resolved.def, &rids_only)?;
 
     // MVCC deferred index deletion (PostgreSQL model): ALL index entries are left
     // in place during DELETE — PK, UNIQUE, FK auto-indexes, and non-unique alike.

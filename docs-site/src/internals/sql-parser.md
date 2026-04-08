@@ -44,11 +44,15 @@ results.
 
 ### Zero-Copy Tokens
 
-Identifiers and quoted identifiers are represented as `&'src str` — slices into the
-original SQL string. No heap allocation occurs during lexing for identifiers.
+Unquoted identifiers and backtick-quoted identifiers are represented as `&'src str`
+— slices into the original SQL string. No heap allocation occurs during lexing for
+those identifier classes.
 
-Only `StringLit` allocates a `String`, because escape sequence processing (`\'`, `\\`,
-`\n`) transforms the content in place and cannot be zero-copy.
+`StringLit` allocates a `String`, because escape sequence processing (`\'`, `\\`,
+`\n`) transforms the content in place and cannot be zero-copy. `DqIdent` also
+allocates because `ANSI_QUOTES` mode uses doubled quotes (`""`) inside the
+identifier and the lexer resolves a raw `"..."` fragment into either
+`StringLit` or `DqIdent(String)` after scanning.
 
 ```rust
 pub struct SpannedToken<'src> {
@@ -92,7 +96,8 @@ pub enum Token<'src> {
     // Identifier variants
     Ident(&'src str),           // unquoted identifier
     QuotedIdent(&'src str),     // backtick-quoted `identifier`
-    DqIdent(&'src str),         // double-quote "identifier"
+    RawDoubleQuoted(&'src str), // raw "..." fragment, resolved after scanning
+    DqIdent(String),            // ANSI_QUOTES-delimited identifier
     // Literals
     IntLit(i64), FloatLit(f64), StringLit(String), HexLit(Vec<u8>),
     TrueLit, FalseLit, NullLit,
@@ -130,6 +135,32 @@ All three MySQL-compatible comment styles are skipped automatically:
 # single-line comment  (MySQL extension)
 /* block comment */
 ```
+
+### Session-Aware Double Quotes
+
+The lexer is intentionally split into two steps for `"..."` fragments:
+
+1. logos scans the raw bytes into `Token::RawDoubleQuoted(&str)`
+2. `tokenize_with_sql_mode(..., SqlModeFlags)` resolves that fragment into:
+   - `Token::StringLit(String)` when `ANSI_QUOTES` is OFF
+   - `Token::DqIdent(String)` when `ANSI_QUOTES` is ON
+
+This keeps the DFA stable while still matching MySQL/MariaDB session semantics.
+The public parser entry points `parse_with_sql_mode(...)` and
+`parse_expr_only_with_sql_mode(...)` thread the flag from `SessionContext` into
+the parser.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — MariaDB-Style Session Parse Mode</span>
+AxiomDB follows MariaDB/MySQL here: <code>ANSI_QUOTES</code> changes expression
+parsing for the current session, not just DDL identifier handling. The lexer keeps
+one raw token for <code>"..."</code> and resolves it after scanning so the hot path
+for normal identifiers stays zero-copy instead of widening <code>Ident</code> or
+adding a second full lexer.
+</div>
+</div>
 
 ### fail-fast Limits
 

@@ -500,6 +500,7 @@ pub async fn handle_connection_with_timeouts(
                                 .as_deref()
                                 .unwrap_or("STRICT_TRANS_TABLES"),
                         );
+                        session.ansi_quotes = conn_state.ansi_quotes();
                         // Sync on_error, compat_mode, and explicit_collation so the executor
                         // and pipeline use the new session semantics immediately.
                         session.on_error = conn_state.on_error();
@@ -553,7 +554,7 @@ pub async fn handle_connection_with_timeouts(
                 // Each non-empty statement is executed and its result set sent
                 // with SERVER_MORE_RESULTS_EXISTS in the final EOF/OK, except the
                 // last statement which uses normal status flags.
-                let stmts: Vec<&str> = split_sql_statements(sql);
+                let stmts: Vec<&str> = split_sql_statements(sql, session.ansi_quotes);
                 let stmt_count = stmts.len();
                 let mut seq: u8 = 1;
                 let mut connection_broken = false;
@@ -576,6 +577,7 @@ pub async fn handle_connection_with_timeouts(
                                     .as_deref()
                                     .unwrap_or("STRICT_TRANS_TABLES"),
                             );
+                            session.ansi_quotes = conn_state.ansi_quotes();
                             session.on_error = conn_state.on_error();
                             session.compat_mode = conn_state.compat_mode();
                             session.explicit_collation = conn_state.explicit_collation();
@@ -669,10 +671,15 @@ pub async fn handle_connection_with_timeouts(
                                     // skip per-table catalog scan (zero catalog I/O).
                                     // Slow path: only when DDL happened, scan per-table deps.
                                     let cached_result = {
-                                        let snap = guard.txn_snapshot_for_cache();
-                                        match CatalogReader::new(&guard.storage, snap) {
-                                            Ok(mut reader) => plan_cache
-                                                .lookup(stmt_sql, sv, &mut reader)
+                                            let snap = guard.txn_snapshot_for_cache();
+                                            match CatalogReader::new(&guard.storage, snap) {
+                                                Ok(mut reader) => plan_cache
+                                                .lookup(
+                                                    stmt_sql,
+                                                    session.ansi_quotes,
+                                                    sv,
+                                                    &mut reader,
+                                                )
                                                 .unwrap_or(None),
                                             Err(_) => None,
                                         }
@@ -695,10 +702,16 @@ pub async fn handle_connection_with_timeouts(
                                         // The extra analyze (~1 µs) runs once per unique query
                                         // pattern; all subsequent hits skip both parse AND analyze.
                                         if result.is_ok() {
-                                            let (norm_sql, _) =
-                                                super::plan_cache::normalize_sql(stmt_sql);
+                                            let (norm_sql, _) = super::plan_cache::normalize_sql(
+                                                stmt_sql,
+                                                session.ansi_quotes,
+                                            );
                                             if let Ok(norm_stmt) =
-                                                axiomdb_sql::parser::parse(&norm_sql, None)
+                                                axiomdb_sql::parse_with_sql_mode(
+                                                    &norm_sql,
+                                                    None,
+                                                    session.sql_mode_flags(),
+                                                )
                                             {
                                                 // Analyze the normalized Stmt so the cache
                                                 // stores resolved col_idx + type info.
@@ -727,7 +740,11 @@ pub async fn handle_connection_with_timeouts(
                                                             session.effective_database(),
                                                         ) {
                                                             plan_cache.store(
-                                                                stmt_sql, &analyzed, deps, sv,
+                                                                stmt_sql,
+                                                                session.ansi_quotes,
+                                                                &analyzed,
+                                                                deps,
+                                                                sv,
                                                             );
                                                         }
                                                     }
@@ -743,7 +760,11 @@ pub async fn handle_connection_with_timeouts(
                                     // execution so we can call plan_cache.invalidate_table()
                                     // after DDL succeeds (eager belt-and-suspenders; the lazy
                                     // is_stale() check is the primary cross-connection path).
-                                    let ddl_table_id = axiomdb_sql::parse(stmt_sql, None)
+                                    let ddl_table_id = axiomdb_sql::parse_with_sql_mode(
+                                        stmt_sql,
+                                        None,
+                                        session.sql_mode_flags(),
+                                    )
                                         .ok()
                                         .and_then(|ref parsed| {
                                             guard.ddl_affected_table_id(
@@ -932,7 +953,8 @@ pub async fn handle_connection_with_timeouts(
                 let (analyzed_stmt, result_cols, prepared_deps) = {
                     let guard = db.write().await;
                     let snap = guard.txn.snapshot();
-                    match axiomdb_sql::parse(&sql, None).and_then(|s| {
+                    match axiomdb_sql::parse_with_sql_mode(&sql, None, session.sql_mode_flags())
+                        .and_then(|s| {
                         axiomdb_sql::analyze_with_defaults(
                             s,
                             &guard.storage,
@@ -968,12 +990,14 @@ pub async fn handle_connection_with_timeouts(
                     current_version,
                     session.effective_database(),
                 );
+                let prepared_ansi_quotes = conn_state.ansi_quotes();
                 // Store the cached analyzed statement, schema version, and OID deps.
                 if let Some(ps) = conn_state.prepared_statements.get_mut(&stmt_id) {
                     ps.analyzed_stmt = analyzed_stmt;
                     ps.compiled_at_version = current_version;
                     ps.deps = prepared_deps;
                     ps.compiled_database = session.effective_database().to_string();
+                    ps.compiled_ansi_quotes = prepared_ansi_quotes;
                 }
                 let packets = build_prepare_response(
                     stmt_id,
@@ -1070,8 +1094,14 @@ pub async fn handle_connection_with_timeouts(
                                 let (new_plan, new_deps) = {
                                     let guard = db.write().await;
                                     let snap = guard.txn.snapshot();
-                                    match axiomdb_sql::parse(&stmt.sql_template, None).and_then(
-                                        |s| {
+                                    match axiomdb_sql::parse_with_sql_mode(
+                                        &stmt.sql_template,
+                                        None,
+                                        axiomdb_sql::SqlModeFlags {
+                                            ansi_quotes: stmt.compiled_ansi_quotes,
+                                        },
+                                    )
+                                    .and_then(|s| {
                                             axiomdb_sql::analyze_with_defaults(
                                                 s,
                                                 &guard.storage,
@@ -1133,7 +1163,11 @@ pub async fn handle_connection_with_timeouts(
                             } else {
                                 // ── FALLBACK: no cached plan, use string substitution ──
                                 let sql_template = stmt.sql_template.clone();
-                                match substitute_params(&sql_template, &exec.params) {
+                                match substitute_params(
+                                    &sql_template,
+                                    &exec.params,
+                                    stmt.compiled_ansi_quotes,
+                                ) {
                                     Ok(final_sql) => {
                                         debug!(conn_id, sql = %final_sql, "COM_STMT_EXECUTE (no cache)");
                                         let mut guard = db.write().await;

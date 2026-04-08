@@ -1,4 +1,9 @@
 /// Routes a statement to its handler using a `SessionContext` for schema caching.
+///
+/// `ctx.conn_txn` remains the single source of truth for the active connection
+/// transaction. Session-aware handlers read or temporarily take it from `ctx`
+/// as needed, while legacy helpers that still require an explicit
+/// `&mut ConnectionTxn` borrow it from `ctx.conn_txn.as_mut()`.
 fn dispatch_ctx(
     stmt: Stmt,
     exec_ctx: &ExecutionContext,
@@ -8,36 +13,80 @@ fn dispatch_ctx(
     let storage = unsafe { exec_ctx.storage_mut() };
     let txn = unsafe { exec_ctx.coord_mut() };
     let bloom = unsafe { exec_ctx.bloom_mut() };
+
     // Flush staged inserts before any non-INSERT barrier statement.
     // INSERT statements handle same-table vs. different-table flush internally.
     if !matches!(stmt, Stmt::Insert(_)) {
         flush_pending_inserts_ctx(exec_ctx, ctx)?;
     }
-    match stmt {
-        Stmt::Select(s) => execute_select_ctx(s, exec_ctx, ctx),
-        Stmt::Insert(s) => execute_insert_ctx(s, exec_ctx, ctx),
-        Stmt::Update(s) => execute_update_ctx(s, exec_ctx, ctx),
-        Stmt::Delete(s) => execute_delete_ctx(s, exec_ctx, ctx),
+    // ── Phase 40.4b: extract conn_txn via take() for DML calls ────────────
+    // DML _ctx functions now receive conn_txn as an explicit parameter.
+    // take() separates the mutable borrow so both conn_txn and ctx can be
+    // passed without violating the borrow-checker. Restored after each call.
+    let result = match stmt {
+        Stmt::Select(s) => {
+            let conn = ctx.conn_txn.take().expect("conn_txn set");
+            let r = execute_select_ctx(s, exec_ctx, Some(&conn), ctx);
+            ctx.conn_txn = Some(conn);
+            r
+        }
+        Stmt::Insert(s) => {
+            let mut conn = ctx.conn_txn.take().expect("conn_txn set");
+            let r = execute_insert_ctx(s, exec_ctx, &mut conn, ctx);
+            ctx.conn_txn = Some(conn);
+            r
+        }
+        Stmt::Update(s) => {
+            let mut conn = ctx.conn_txn.take().expect("conn_txn set");
+            let r = execute_update_ctx(s, exec_ctx, &mut conn, ctx);
+            ctx.conn_txn = Some(conn);
+            r
+        }
+        Stmt::Delete(s) => {
+            let mut conn = ctx.conn_txn.take().expect("conn_txn set");
+            let r = execute_delete_ctx(s, exec_ctx, &mut conn, ctx);
+            ctx.conn_txn = Some(conn);
+            r
+        }
         Stmt::CreateTable(mut s) => {
             ctx.invalidate_all();
             let db = ddl_database(&s.table.database, ctx);
-            // Unqualified CREATE TABLE uses the first schema in search_path.
             if s.table.schema.is_none() {
                 s.table.schema = Some(ctx.current_schema().to_string());
             }
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
-            execute_create_table(s, storage, txn, conn, &db)
+            execute_create_table(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
         }
         Stmt::CreateDatabase(s) => {
             ctx.invalidate_all();
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
-            execute_create_database(s, storage, txn, conn)
+            execute_create_database(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+            )
         }
         Stmt::CreateSchema(s) => {
             ctx.invalidate_all();
             let db = ctx.effective_database().to_string();
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
-            execute_create_schema(s, storage, txn, conn, &db)
+            execute_create_schema(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
         }
         Stmt::DropTable(s) => {
             ctx.invalidate_all();
@@ -47,8 +96,15 @@ fn dispatch_ctx(
                 .and_then(|t| t.database.as_deref())
                 .unwrap_or(ctx.effective_database())
                 .to_string();
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
-            execute_drop_table(s, storage, txn, conn, &db)
+            execute_drop_table(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
         }
         Stmt::DropDatabase(s) => {
             ctx.invalidate_all();
@@ -57,8 +113,16 @@ fn dispatch_ctx(
         Stmt::CreateIndex(s) => {
             ctx.invalidate_all();
             let db = ddl_database(&s.table.database, ctx);
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
-            execute_create_index(s, storage, txn, conn, bloom, &db)
+            execute_create_index(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                bloom,
+                &db,
+            )
         }
         Stmt::DropIndex(s) => {
             ctx.invalidate_all();
@@ -68,14 +132,29 @@ fn dispatch_ctx(
                 .and_then(|t| t.database.as_deref())
                 .unwrap_or(ctx.effective_database())
                 .to_string();
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
-            execute_drop_index(s, storage, txn, conn, bloom, &db)
+            execute_drop_index(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                bloom,
+                &db,
+            )
         }
         Stmt::AlterTable(s) => {
             ctx.invalidate_all();
             let db = ddl_database(&s.table.database, ctx);
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
-            execute_alter_table(s, storage, txn, conn, &db)
+            execute_alter_table(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
         }
         Stmt::Analyze(s) => execute_analyze(s, exec_ctx, ctx),
         Stmt::Explain(inner) => execute_explain(*inner, exec_ctx, ctx),
@@ -83,44 +162,89 @@ fn dispatch_ctx(
         Stmt::Set(s) => execute_set_ctx(s, ctx),
         Stmt::UseDatabase(s) => execute_use_database(s, storage, txn, ctx),
         Stmt::Noop => Ok(QueryResult::Empty),
-        Stmt::ShowDatabases(s) => {
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set");
-            execute_show_databases(s, storage, txn, conn)
-        }
+        Stmt::ShowDatabases(s) => execute_show_databases(
+            s,
+            storage,
+            txn,
+            ctx.conn_txn
+                .as_mut()
+                .expect("conn_txn must be set before dispatch_ctx"),
+        ),
         Stmt::ShowTables(mut s) => {
-            // Default to current schema from search_path if not explicit.
             if s.schema.is_none() {
                 s.schema = Some(ctx.current_schema().to_string());
             }
             let db = ctx.effective_database().to_string();
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set");
-            execute_show_tables(s, storage, txn, conn, &db)
+            execute_show_tables(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
         }
         Stmt::ShowColumns(s) => {
             let db = ddl_database(&s.table.database, ctx);
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set");
-            execute_show_columns(s, storage, txn, conn, &db)
+            execute_show_columns(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
         }
         Stmt::ShowIndex(s) => {
             let db = ddl_database(&s.table.database, ctx);
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set");
-            execute_show_index(s, storage, txn, conn, &db)
+            execute_show_index(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
         }
         Stmt::ShowCreateTable(s) => {
             let db = ddl_database(&s.table.database, ctx);
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set");
-            execute_show_create_table(s, storage, txn, conn, &db)
+            execute_show_create_table(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
         }
         Stmt::RenameTable(s) => {
             ctx.invalidate_all();
             let db = ctx.effective_database().to_string();
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
-            execute_rename_table(s, storage, txn, conn, &db)
+            execute_rename_table(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
         }
         Stmt::TruncateTable(s) => {
             let db = ddl_database(&s.table.database, ctx);
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set");
-            execute_truncate(s, storage, txn, conn, &db)
+            execute_truncate(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
         }
         // G5.1: CALL / DO — execute as Noop
         Stmt::Call { .. } | Stmt::Do { .. } => Ok(QueryResult::Empty),
@@ -128,8 +252,15 @@ fn dispatch_ctx(
         Stmt::CreateTableLike(s) => {
             ctx.invalidate_all();
             let db = ddl_database(&s.new_table.database, ctx);
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
-            execute_create_table_like(s, storage, txn, conn, &db)
+            execute_create_table_like(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
         }
         // G5.6: CREATE TABLE ... AS SELECT
         Stmt::CreateTableAsSelect(s) => {
@@ -142,8 +273,15 @@ fn dispatch_ctx(
                 s.schema = Some(ctx.current_schema().to_string());
             }
             let db = ctx.effective_database().to_string();
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set");
-            execute_show_table_status(s, storage, txn, conn, &db)
+            execute_show_table_status(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
         }
         // 5.9g: SHOW ENGINES / CHARSET / COLLATION — static, no ctx needed
         Stmt::ShowEngines => Ok(execute_show_engines()),
@@ -161,7 +299,6 @@ fn dispatch_ctx(
             Ok(result)
         }
         Stmt::ShowErrors { limit } => {
-            // SHOW ERRORS only shows "Error"-level entries.
             let errors: Vec<_> = ctx
                 .warnings
                 .iter()
@@ -184,11 +321,16 @@ fn dispatch_ctx(
             ],
             rows: vec![],
         }),
-        other => {
-            let conn = ctx.conn_txn.as_mut().expect("conn_txn set for dispatch");
-            dispatch(other, storage, txn, conn)
-        }
-    }
+        other => dispatch(
+            other,
+            storage,
+            txn,
+            ctx.conn_txn
+                .as_mut()
+                .expect("conn_txn must be set before dispatch_ctx"),
+        ),
+    };
+    result
 }
 
 /// Compute the effective database for a DDL statement: if the `TableRef` has
@@ -275,7 +417,10 @@ fn execute_set_ctx(stmt: SetStmt, ctx: &mut SessionContext) -> Result<QueryResul
             }
         },
         "sql_mode" => match stmt.value {
-            SetValue::Default => ctx.strict_mode = true,
+            SetValue::Default => {
+                ctx.strict_mode = true;
+                ctx.ansi_quotes = false;
+            }
             SetValue::Expr(expr) => {
                 let v = eval(&expr, &[])?;
                 let raw = match &v {
@@ -288,6 +433,7 @@ fn execute_set_ctx(stmt: SetStmt, ctx: &mut SessionContext) -> Result<QueryResul
                 };
                 let normalized = normalize_sql_mode(&raw);
                 ctx.strict_mode = sql_mode_is_strict(&normalized);
+                ctx.ansi_quotes = crate::session::sql_mode_has_ansi_quotes(&normalized);
             }
         },
         "on_error" => {

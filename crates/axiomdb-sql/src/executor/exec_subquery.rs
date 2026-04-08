@@ -245,7 +245,10 @@ impl<'a> SubqueryRunner for ExecSubqueryRunner<'a> {
     fn run(&mut self, stmt: &SelectStmt) -> Result<QueryResult, DbError> {
         let bound = substitute_outer(stmt.clone(), self.outer_row);
         let exec_ctx = ExecutionContext::new(self.storage, self.txn, self.bloom);
-        execute_select_ctx(bound, &exec_ctx, self.ctx)
+        let conn = self.ctx.conn_txn.take();
+        let r = execute_select_ctx(bound, &exec_ctx, conn.as_ref(), self.ctx);
+        self.ctx.conn_txn = conn;
+        r
     }
 }
 
