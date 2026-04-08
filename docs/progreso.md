@@ -417,6 +417,49 @@
 
 ---
 
+## GAP CLOSURE — Auditoría 2026-04-08
+
+> Hallazgos de la auditoría completa de 5 subsistemas.
+> Spec: `specs/fase-gap-audit/audit-2026-04-08.md`
+> Orden de ejecución: GAP-A → GAP-B → GAP-C
+
+### GAP-A — Hardening: eliminar panics de producción `⏳`
+<!-- PRIORIDAD: CRÍTICA — hacer antes de cualquier otra implementación -->
+- [ ] GAP-A.1 ⏳ key_encoding.rs — reemplazar 6 `unwrap()` en `decode_index_key` con `map_err(DbError::CorruptedIndex)`; agregar test con key truncada
+- [ ] GAP-A.2 ⏳ eval/batch.rs — reemplazar 12 `try_into().unwrap()` en BatchPredicate con bounds check + skip row en fila con encoding inválido
+- [ ] GAP-A.3 ⏳ schema_constraints.rs — reemplazar 7 `unwrap()` en deserialización de ConstraintDef/FkDef con `DbError::ParseError` + contexto
+- [ ] GAP-A.4 ⏳ doublewrite.rs — `checked_mul()` en `slot_count * DW_SLOT_SIZE`; bounds check antes de slice; test con doublewrite corrupto
+- [ ] GAP-A.5 ⏳ fsync_pipeline.rs — reemplazar 4 `.expect("poisoned")` en Mutex con `unwrap_or_else` que retorna `DbError::InternalError`
+- [ ] GAP-A.6 ⏳ notifier.rs — reemplazar 3 `.expect("poisoned")` en RwLock del catalog notifier; mismo patrón que A.5
+- [ ] GAP-A.7 ⏳ agg_accum.rs — validar `simple_arg` en constructor de acumuladores DISTINCT; retornar error si None en vez de unwrap
+- [ ] GAP-A.8 ⏳ exec_with_ctx.rs — refactor ~20 `expect("conn_txn")` con helper `fn require_conn_txn() -> Result<&ConnTxn, DbError>`
+
+### GAP-B — MySQL wire compat crítica `⏳`
+<!-- PRIORIDAD: ALTA — desbloquea ORMs y clientes -->
+- [ ] GAP-B.1 ⏳ UNION / UNION ALL — parser: consumir UNION [ALL] entre SELECTs → `Stmt::Union { selects, all }` AST; executor: materializar ambos lados, dedup (UNION) o append (UNION ALL); wire: serializar como result set único
+- [ ] GAP-B.2 ⏳ Column type wire codes — `datatype_to_mysql_type()` en `result.rs`: TINYINT→0x01, SMALLINT→0x02, MEDIUMINT→0x09, YEAR→0x0d, TIME→0x0b, DATETIME→0x0c; agregar DataType variants si faltan
+- [ ] GAP-B.3 ⏳ DECIMAL column type — almacenar como `i128` con scale en row codec; `DataType::Decimal(precision, scale)`; CREATE TABLE + INSERT/SELECT/WHERE; arithmetic con scale propagation
+- [ ] GAP-B.4 ⏳ DATE column type independiente — `DataType::Date` como days-since-epoch (i32); distinto de Timestamp; row codec + comparisons + key encoding + wire binary encoding
+- [ ] GAP-B.5 ⏳ Multi-table DELETE/UPDATE JOIN — parser: `DELETE t FROM t JOIN s ON ...`; `UPDATE t JOIN s ON ... SET t.col=val`; extender DeleteStmt/UpdateStmt con optional join clause; executor: join + filter + DML
+- [ ] GAP-B.6 ⏳ FK RENAME TABLE fix — al ejecutar RENAME TABLE, scan `axiom_foreign_keys` y actualizar todas las referencias parent/child que apuntan al nombre viejo
+- [ ] GAP-B.7 ⏳ SHOW PROCESSLIST real — exponer conexiones activas desde `handler.rs`; `Arc<DashMap<conn_id, ConnectionInfo>>` compartido; Id, User, Host, db, Command, Time, State, Info
+- [ ] GAP-B.8 ⏳ INTERSECT / EXCEPT — parser + executor; INTERSECT = hash-based intersection; EXCEPT = hash-based difference; reutilizar infraestructura de UNION (GAP-B.1)
+
+### GAP-C — SQL completeness + DDL robustness `⏳`
+<!-- PRIORIDAD: MEDIA — mejora significativa de compatibilidad -->
+- [ ] GAP-C.1 ⏳ Subquery in JOIN — `FROM t JOIN (SELECT …) alias ON …`; el FROM subquery path ya existe (Phase 4.11); falta wiring en `select_joins_ctx.rs:33` y `select_helpers.rs:38` para posición JOIN
+- [ ] GAP-C.2 ⏳ Composite FK (multi-column) — extender `axiom_foreign_keys` encoding para N columnas; `REFERENCES t (col1, col2)` en CREATE TABLE y ALTER TABLE; enforcement en INSERT/UPDATE/DELETE con compound key lookup
+- [ ] GAP-C.3 ⏳ ALTER TABLE DROP/MODIFY COLUMN con index — detectar indexes afectados, auto-drop, proceder con column op, rebuild si MODIFY; `ddl_alter_column.rs:373, 461`
+- [ ] GAP-C.4 ⏳ ON DELETE/UPDATE SET DEFAULT — usar default expression persistida (4.18e) para setear columna child al DEFAULT del catálogo; `fk_enforcement.rs:686, 811`
+- [ ] GAP-C.5 ⏳ GROUP BY WITH ROLLUP — parser: consumir `WITH ROLLUP` después de GROUP BY; executor: generar filas subtotal con NULL en group keys por cada nivel de agrupación
+- [ ] GAP-C.6 ⏳ ALTER AUTO_INCREMENT=N persistence — escribir nuevo valor en catálogo (sequence counter) via CatalogWriter; actualmente acepta silenciosamente sin persistir
+- [ ] GAP-C.7 ⏳ DROP INDEX not found → error propio — cambiar NotImplemented por `DbError::IndexNotFound` en `ddl_drop_index.rs:91`; incluir nombre del índice buscado
+- [ ] GAP-C.8 ⏳ Correlated subquery depth > 1 — substitution chain en analyzer: propagar `OuterColumn` references a través de múltiples niveles de nesting; `analyzer_expr.rs:7-34`
+- [ ] GAP-C.9 ⏳ MySQL default collation case-insensitive — cuando `CompatMode::Mysql` activo, default `SessionCollation` a `CaseInsensitive`; emitir `collation_connection = utf8mb4_general_ci` (collation_id 45) en server greeting
+- [ ] GAP-C.10 ⏳ COM_STMT_SEND_LONG_DATA validación — verificar que stmt_id existe en `pending_long_data` antes de almacenar; retornar ERR si stmt_id inválido en vez de panic potencial
+
+---
+
 ## BLOCK 3 — Advanced Features (Phases 11-15)
 
 ### Phase 11 — Robustness and indexes `🔄` week 61-64

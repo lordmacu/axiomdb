@@ -1,6 +1,7 @@
 fn execute_insert_ctx(
     stmt: InsertStmt,
     exec_ctx: &ExecutionContext,
+    conn_txn: &mut ConnectionTxn,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
@@ -140,7 +141,7 @@ fn execute_insert_ctx(
                     );
                     if is_auto_trigger {
                         let id =
-                            next_auto_inc_ctx(storage, txn, ctx.conn_txn.as_ref().expect("active txn"), &resolved.def, schema_cols, ai_col)?;
+                            next_auto_inc_ctx(storage, txn, conn_txn, &resolved.def, schema_cols, ai_col)?;
                         full_values[ai_col] = match schema_cols[ai_col].col_type {
                             axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
                             _ => Value::Int(id as i32),
@@ -166,7 +167,7 @@ fn execute_insert_ctx(
                         &resolved.foreign_keys,
                         storage,
                         txn,
-                        ctx.conn_txn.as_ref().expect("conn_txn for fk_check_insert"),
+                        conn_txn,
                         bloom,
                     ) {
                         Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
@@ -193,7 +194,7 @@ fn execute_insert_ctx(
                         Err(e) => return Err(e),
                     };
                     if !secondary_indexes.is_empty() {
-                        let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
+                        let snap = txn.active_snapshot(conn_txn);
                         match crate::index_maintenance::insert_into_indexes_with_undo(
                             &secondary_indexes,
                             &full_values,
@@ -203,11 +204,11 @@ fn execute_insert_ctx(
                             &compiled_preds,
                             snap,
                             Some(txn),
-                            Some(ctx.conn_txn.as_mut().expect("active txn")),
+                            Some(conn_txn),
                         ) {
                             Ok(updated) => {
                                 for (index_id, new_root) in updated {
-                                    CatalogWriter::new(storage, txn, ctx.conn_txn.as_mut().expect("active txn"))?.update_index_root(index_id, new_root)?;
+                                    CatalogWriter::new(storage, txn, conn_txn)?.update_index_root(index_id, new_root)?;
                                     if let Some(idx) = secondary_indexes
                                         .iter_mut()
                                         .find(|i| i.index_id == index_id)
@@ -221,7 +222,7 @@ fn execute_insert_ctx(
                                 TableEngine::delete_row(
                                     storage,
                                     txn,
-                                    ctx.conn_txn.as_mut().expect("active txn"),
+                                    conn_txn,
                                     &resolved.def,
                                     rid,
                                 )?;
@@ -267,7 +268,7 @@ fn execute_insert_ctx(
                 if let Some(ai_col) = auto_inc_col {
                     if matches!(full_values.get(ai_col), Some(Value::Null)) {
                         let id =
-                            next_auto_inc_ctx(storage, txn, ctx.conn_txn.as_ref().expect("active txn"), &resolved.def, schema_cols, ai_col)?;
+                            next_auto_inc_ctx(storage, txn, conn_txn, &resolved.def, schema_cols, ai_col)?;
                         full_values[ai_col] = match schema_cols[ai_col].col_type {
                             axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
                             _ => Value::Int(id as i32),
@@ -284,7 +285,7 @@ fn execute_insert_ctx(
                         &resolved.foreign_keys,
                         storage,
                         txn,
-                        ctx.conn_txn.as_ref().expect("conn_txn for fk_check_insert"),
+                        conn_txn,
                         bloom,
                     ) {
                         Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
@@ -306,7 +307,7 @@ fn execute_insert_ctx(
                     Err(e) => return Err(e),
                 };
                 if !secondary_indexes.is_empty() {
-                    let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
+                    let snap = txn.active_snapshot(conn_txn);
                     match crate::index_maintenance::insert_into_indexes_with_undo(
                         &secondary_indexes,
                         &full_values,
@@ -316,11 +317,11 @@ fn execute_insert_ctx(
                         &compiled_preds,
                         snap,
                         Some(txn),
-                        Some(ctx.conn_txn.as_mut().expect("active txn")),
+                        Some(conn_txn),
                     ) {
                         Ok(updated) => {
                             for (index_id, new_root) in updated {
-                                CatalogWriter::new(storage, txn, ctx.conn_txn.as_mut().expect("active txn"))?.update_index_root(index_id, new_root)?;
+                                CatalogWriter::new(storage, txn, conn_txn)?.update_index_root(index_id, new_root)?;
                                 if let Some(idx) = secondary_indexes
                                     .iter_mut()
                                     .find(|i| i.index_id == index_id)
@@ -333,7 +334,7 @@ fn execute_insert_ctx(
                             TableEngine::delete_row(
                                 storage,
                                 txn,
-                                ctx.conn_txn.as_mut().expect("active txn"),
+                                conn_txn,
                                 &resolved.def,
                                 rid,
                             )?;
@@ -351,7 +352,7 @@ fn execute_insert_ctx(
             if let Some(ai_col) = auto_inc_col {
                 if matches!(full_values.get(ai_col), Some(Value::Null)) {
                     let id =
-                        next_auto_inc_ctx(storage, txn, ctx.conn_txn.as_ref().expect("active txn"), &resolved.def, schema_cols, ai_col)?;
+                        next_auto_inc_ctx(storage, txn, conn_txn, &resolved.def, schema_cols, ai_col)?;
                     full_values[ai_col] = match schema_cols[ai_col].col_type {
                         axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
                         _ => Value::Int(id as i32),
@@ -371,7 +372,7 @@ fn execute_insert_ctx(
                     &resolved.foreign_keys,
                     storage,
                     txn,
-                    ctx.conn_txn.as_ref().expect("conn_txn for fk_check_insert"),
+                    conn_txn,
                     bloom,
                 )?;
             }
@@ -385,7 +386,7 @@ fn execute_insert_ctx(
                 1,
             )?;
             if !secondary_indexes.is_empty() {
-                let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn"));
+                let snap = txn.active_snapshot(conn_txn);
                 let updated = crate::index_maintenance::insert_into_indexes_with_undo(
                     &secondary_indexes,
                     &full_values,
@@ -395,10 +396,10 @@ fn execute_insert_ctx(
                     &compiled_preds,
                     snap,
                     Some(txn),
-                    Some(ctx.conn_txn.as_mut().expect("active txn")),
+                    Some(conn_txn),
                 )?;
                 for (index_id, new_root) in updated {
-                    CatalogWriter::new(storage, txn, ctx.conn_txn.as_mut().expect("active txn"))?.update_index_root(index_id, new_root)?;
+                    CatalogWriter::new(storage, txn, conn_txn)?.update_index_root(index_id, new_root)?;
                     if let Some(idx) = secondary_indexes
                         .iter_mut()
                         .find(|i| i.index_id == index_id)
