@@ -1,10 +1,11 @@
 fn execute_select_ctx(
     mut stmt: SelectStmt,
-    storage: &dyn StorageEngine,
-    txn: &TxnManager,
-    bloom: &crate::bloom::BloomRegistry,
+    exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
+    let bloom = exec_ctx.bloom();
     // Set the session collation for all eval() calls in this ctx execution.
     // Cleared automatically when _coll_guard is dropped at function exit.
     let _coll_guard = CollationGuard::new(ctx.effective_collation());
@@ -23,6 +24,24 @@ fn execute_select_ctx(
         Some(FromClause::Table(tref)) => tref,
         _ => unreachable!("already handled None and Subquery above"),
     };
+
+    // INFORMATION_SCHEMA virtual tables (4.20c).
+    if from_table_ref
+        .schema
+        .as_deref()
+        .map(crate::information_schema::is_information_schema)
+        .unwrap_or(false)
+    {
+        let default_db = ctx.selected_database().unwrap_or(DEFAULT_DATABASE_NAME);
+        return execute_information_schema_select(
+            stmt,
+            from_table_ref,
+            storage,
+            txn,
+            ctx.conn_txn.as_ref(),
+            default_db,
+        );
+    }
 
     if stmt.joins.is_empty() {
         // Single-table path — use cache.
@@ -153,6 +172,7 @@ fn execute_select_ctx(
                 }
                 // Subquery internals are not scanned — they run as separate queries.
                 crate::expr::Expr::Literal(_)
+                | crate::expr::Expr::Default
                 | crate::expr::Expr::Param { .. }
                 | crate::expr::Expr::OuterColumn { .. }
                 | crate::expr::Expr::Subquery(_)
@@ -576,9 +596,9 @@ fn execute_select_ctx(
             if !where_already_applied {
                 if let Some(ref wc) = stmt.where_clause {
                     let mut runner = ExecSubqueryRunner {
-                        storage,
-                        txn,
-                        bloom,
+                        storage: exec_ctx.storage(),
+                        txn: exec_ctx.coord(),
+                        bloom: exec_ctx.bloom(),
                         ctx,
                         outer_row: &values,
                     };
@@ -602,16 +622,17 @@ fn execute_select_ctx(
             return execute_select_grouped(stmt, combined_rows, strategy);
         }
 
-        combined_rows = apply_order_by(combined_rows, &stmt.order_by)?;
+        let resolved_ob = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
+        combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
 
         let out_cols = build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
         let mut rows = combined_rows
             .iter()
             .map(|v| {
                 let mut runner = ExecSubqueryRunner {
-                    storage,
-                    txn,
-                    bloom,
+                    storage: exec_ctx.storage(),
+                    txn: exec_ctx.coord(),
+                    bloom: exec_ctx.bloom(),
                     ctx,
                     outer_row: v,
                 };
@@ -622,6 +643,9 @@ fn execute_select_ctx(
         if stmt.distinct {
             rows = apply_distinct_with_session(rows);
         }
+        if stmt.calc_found_rows {
+            set_found_rows(rows.len() as u64);
+        }
         rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 
         Ok(QueryResult::Rows {
@@ -630,6 +654,6 @@ fn execute_select_ctx(
         })
     } else {
         // Multi-table JOIN path — use cache for each table.
-        execute_select_with_joins_ctx(stmt, from_table_ref, storage, txn, ctx)
+        execute_select_with_joins_ctx(stmt, from_table_ref, exec_ctx, ctx)
     }
 }

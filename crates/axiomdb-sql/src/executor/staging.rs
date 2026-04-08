@@ -140,11 +140,13 @@ pub(super) fn apply_insert_batch_with_ctx(
 /// since the caller (COMMIT/barrier) will propagate the error and the
 /// transaction state is now inconsistent.
 pub(super) fn flush_pending_inserts_ctx(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
-    bloom: &mut crate::bloom::BloomRegistry,
+    exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
 ) -> Result<(), DbError> {
+    // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
+    let storage = unsafe { exec_ctx.storage_mut() };
+    let txn = unsafe { exec_ctx.coord_mut() };
+    let bloom = unsafe { exec_ctx.bloom_mut() };
     let batch = match ctx.pending_inserts.take() {
         Some(b) => b,
         None => return Ok(()),
@@ -196,11 +198,13 @@ pub(super) fn flush_pending_inserts_ctx(
 ///    recording, secondary-index maintenance, and root persistence.
 /// 4. Update the stats tracker and invalidate the schema cache.
 pub(super) fn flush_clustered_insert_batch(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
-    bloom: &mut crate::bloom::BloomRegistry,
+    exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
 ) -> Result<(), DbError> {
+    // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
+    let storage = unsafe { exec_ctx.storage_mut() };
+    let txn = unsafe { exec_ctx.coord_mut() };
+    let bloom = unsafe { exec_ctx.bloom_mut() };
     let batch = match ctx.clustered_insert_batch.take() {
         Some(b) => b,
         None => return Ok(()),

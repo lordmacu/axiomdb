@@ -45,11 +45,13 @@ pub struct VacuumTableResult {
 /// Returns one `VacuumTableResult` per table vacuumed.
 pub fn execute_vacuum(
     stmt: VacuumStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
-    bloom: &mut crate::bloom::BloomRegistry,
+    exec_ctx: &crate::exec_ctx::ExecutionContext,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
+    let storage = unsafe { exec_ctx.storage_mut() };
+    let txn = unsafe { exec_ctx.coord_mut() };
+    let bloom = unsafe { exec_ctx.bloom_mut() };
     let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn for vacuum"));
     // Under RwLock: no concurrent readers, all committed deletes are safe.
     let oldest_safe_txn = txn.max_committed() + 1;

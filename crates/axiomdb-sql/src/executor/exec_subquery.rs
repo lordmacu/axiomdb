@@ -10,6 +10,10 @@ thread_local! {
     /// Read by `LAST_INSERT_ID()` / `lastval()` in the expression evaluator.
     static THREAD_LAST_INSERT_ID: Cell<u64> = const { Cell::new(0) };
 
+    /// Pre-LIMIT row count stored by SQL_CALC_FOUND_ROWS (4.5e).
+    /// Read by `FOUND_ROWS()` function.
+    static THREAD_FOUND_ROWS: Cell<u64> = const { Cell::new(0) };
+
     /// Per-thread `ConnectionTxn` for the legacy single-connection `execute()` API.
     ///
     /// When `execute(BEGIN, ...)` is called, the `ConnectionTxn` is stored here so
@@ -23,6 +27,22 @@ thread_local! {
 /// Exported so `eval.rs` can call it from `eval_function`.
 pub(crate) fn last_insert_id_value() -> u64 {
     THREAD_LAST_INSERT_ID.with(|v| v.get())
+}
+
+/// Sets the value of `LAST_INSERT_ID()` for the current thread.
+/// Called by `LAST_INSERT_ID(expr)` 1-arg form (4.14b).
+pub(crate) fn set_last_insert_id(id: u64) {
+    THREAD_LAST_INSERT_ID.with(|v| v.set(id));
+}
+
+/// Returns the `FOUND_ROWS()` value for the current thread (4.5e).
+pub(crate) fn found_rows_value() -> u64 {
+    THREAD_FOUND_ROWS.with(|v| v.get())
+}
+
+/// Stores the pre-LIMIT row count for `FOUND_ROWS()` (4.5e).
+pub(crate) fn set_found_rows(n: u64) {
+    THREAD_FOUND_ROWS.with(|v| v.set(n));
 }
 
 /// Returns the correct snapshot for analyzing a statement before calling [`execute`].
@@ -224,7 +244,8 @@ struct ExecSubqueryRunner<'a> {
 impl<'a> SubqueryRunner for ExecSubqueryRunner<'a> {
     fn run(&mut self, stmt: &SelectStmt) -> Result<QueryResult, DbError> {
         let bound = substitute_outer(stmt.clone(), self.outer_row);
-        execute_select_ctx(bound, self.storage, self.txn, self.bloom, self.ctx)
+        let exec_ctx = ExecutionContext::new(self.storage, self.txn, self.bloom);
+        execute_select_ctx(bound, &exec_ctx, self.ctx)
     }
 }
 

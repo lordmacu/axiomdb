@@ -1,11 +1,13 @@
 fn execute_clustered_insert_ctx(
     stmt: InsertStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
-    bloom: &mut crate::bloom::BloomRegistry,
+    exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
     resolved: ResolvedTable,
 ) -> Result<QueryResult, DbError> {
+    // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
+    let storage = unsafe { exec_ctx.storage_mut() };
+    let txn = unsafe { exec_ctx.coord_mut() };
+    let bloom = unsafe { exec_ctx.bloom_mut() };
     let schema_cols = &resolved.columns;
     let primary_idx =
         crate::clustered_table::primary_index(&resolved.indexes, &resolved.def.table_name)?.clone();
@@ -94,7 +96,7 @@ fn execute_clustered_insert_ctx(
             }
         }
         InsertSource::Select(select_stmt) => {
-            let select_rows = match execute_select_ctx(*select_stmt, storage, txn, bloom, ctx)? {
+            let select_rows = match execute_select_ctx(*select_stmt, exec_ctx, ctx)? {
                 QueryResult::Rows { rows, .. } => rows,
                 other => {
                     return Err(DbError::Other(format!(
@@ -200,12 +202,14 @@ const CLUSTERED_BATCH_MAX_ROWS: usize = 200_000;
 ///   via `lookup_physical`.
 fn enqueue_clustered_insert_ctx(
     stmt: InsertStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
-    bloom: &mut crate::bloom::BloomRegistry,
+    exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
     resolved: ResolvedTable,
 ) -> Result<QueryResult, DbError> {
+    // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
+    let storage = unsafe { exec_ctx.storage_mut() };
+    let txn = unsafe { exec_ctx.coord_mut() };
+    let bloom = unsafe { exec_ctx.bloom_mut() };
     let schema_cols = &resolved.columns;
     let table_id = resolved.def.id;
 
@@ -215,7 +219,7 @@ fn enqueue_clustered_insert_ctx(
         .as_ref()
         .is_some_and(|b| b.table_id != table_id)
     {
-        flush_clustered_insert_batch(storage, txn, bloom, ctx)?;
+        flush_clustered_insert_batch(exec_ctx, ctx)?;
     }
 
     // Initialize batch if none exists yet for this table.
@@ -365,7 +369,7 @@ fn enqueue_clustered_insert_ctx(
         .as_ref()
         .is_some_and(|b| b.rows.len() >= CLUSTERED_BATCH_MAX_ROWS)
     {
-        flush_clustered_insert_batch(storage, txn, bloom, ctx)?;
+        flush_clustered_insert_batch(exec_ctx, ctx)?;
     }
 
     if let Some(id) = first_generated {

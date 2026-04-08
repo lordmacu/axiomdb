@@ -25,8 +25,9 @@ pub fn execute_read_only_with_ctx(
     bloom: &crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    let exec_ctx = ExecutionContext::new(storage, txn, bloom);
     match stmt {
-        Stmt::Select(s) => execute_select_ctx(s, storage, txn, bloom, ctx),
+        Stmt::Select(s) => execute_select_ctx(s, &exec_ctx, ctx),
         Stmt::ShowTables(mut s) => {
             if s.schema.is_none() {
                 s.schema = Some(ctx.current_schema().to_string());

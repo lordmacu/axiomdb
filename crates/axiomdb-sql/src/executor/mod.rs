@@ -52,13 +52,14 @@ use axiomdb_storage::{
 use axiomdb_types::{DataType, Value};
 use axiomdb_wal::{ConnectionTxn, IndexUndoRecord, Savepoint, TxnManager};
 
+use crate::exec_ctx::ExecutionContext;
 use crate::{
     ast::{
         AlterTableOp, AlterTableStmt, ColumnConstraint, CreateDatabaseStmt, CreateIndexStmt,
         CreateTableStmt, DeleteStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, FromClause,
         InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType, NullsOrder, OrderByItem,
-        SelectItem, SelectStmt, SetStmt, SetValue, ShowDatabasesStmt, SortOrder, Stmt, UpdateStmt,
-        UseDatabaseStmt,
+        SelectItem, SelectStmt, SetStmt, SetValue, ShowDatabasesStmt, SortOrder, Stmt, TableRef,
+        UpdateStmt, UseDatabaseStmt,
     },
     eval::{eval, eval_with, is_truthy, CollationGuard, SubqueryRunner},
     expr::{BinaryOp, Expr},
