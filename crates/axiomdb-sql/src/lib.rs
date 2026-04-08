@@ -14,11 +14,13 @@ pub mod bloom;
 pub mod clustered_secondary;
 pub mod clustered_table;
 pub mod eval;
+pub mod exec_ctx;
 pub mod executor;
 pub mod expr;
 pub mod fk_enforcement;
 pub mod index_integrity;
 pub mod index_maintenance;
+pub mod information_schema;
 pub mod key_encoding;
 pub mod lexer;
 pub mod parser;
@@ -45,6 +47,7 @@ pub use eval::{
     eval, eval_in_session, eval_with, eval_with_in_session, is_truthy, like_match, ClosureRunner,
     CollationGuard, NoSubquery, SubqueryRunner,
 };
+pub use exec_ctx::ExecutionContext;
 pub use executor::{execute, execute_read_only_with_ctx, execute_snapshot, execute_with_ctx};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lexer::{tokenize, Span, SpannedToken, Token};
