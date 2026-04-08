@@ -1,24 +1,26 @@
 fn execute_insert_ctx(
     stmt: InsertStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
-    bloom: &mut crate::bloom::BloomRegistry,
+    exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
+    let storage = unsafe { exec_ctx.storage_mut() };
+    let txn = unsafe { exec_ctx.coord_mut() };
+    let bloom = unsafe { exec_ctx.bloom_mut() };
     let resolved = resolve_table_cached(storage, txn, ctx, &stmt.table)?;
     if resolved.def.is_clustered() {
         if ctx.pending_inserts.is_some() {
-            flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
+            flush_pending_inserts_ctx(exec_ctx, ctx)?;
         }
         // For explicit transactions with a VALUES source, stage rows into the
         // batch instead of writing immediately.  All other cases (SELECT source,
         // autocommit) go through the existing single-statement path.
         if ctx.in_explicit_txn {
             if let InsertSource::Values(_) = &stmt.source {
-                return enqueue_clustered_insert_ctx(stmt, storage, txn, bloom, ctx, resolved);
+                return enqueue_clustered_insert_ctx(stmt, exec_ctx, ctx, resolved);
             }
         }
-        return execute_clustered_insert_ctx(stmt, storage, txn, bloom, ctx, resolved);
+        return execute_clustered_insert_ctx(stmt, exec_ctx, ctx, resolved);
     }
     resolved
         .def
@@ -262,7 +264,7 @@ fn execute_insert_ctx(
             }
         }
         InsertSource::Select(select_stmt) => {
-            let select_rows = match execute_select_ctx(*select_stmt, storage, txn, bloom, ctx)? {
+            let select_rows = match execute_select_ctx(*select_stmt, exec_ctx, ctx)? {
                 QueryResult::Rows { rows, .. } => rows,
                 other => {
                     return Err(DbError::Other(format!(

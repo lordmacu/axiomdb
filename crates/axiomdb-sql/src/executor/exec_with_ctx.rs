@@ -5,12 +5,17 @@ pub fn execute_with_ctx(
     bloom: &mut crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    // Use new() (shared refs) so that txn/storage/bloom remain usable directly
+    // for begin/commit/rollback/savepoint calls below. The &mut borrows held by
+    // the caller guarantee exclusive access; the single-writer constraint (Phase 3)
+    // ensures storage_mut()/coord_mut()/bloom_mut() are safe to call on this ctx.
+    let exec_ctx = ExecutionContext::new(storage, txn, bloom);
     if ctx.conn_txn.is_some() {
         match &stmt {
             Stmt::Commit => {
                 // Flush any staged rows before writing the Commit WAL entry.
-                flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
-                flush_clustered_insert_batch(storage, txn, bloom, ctx)?;
+                flush_pending_inserts_ctx(&exec_ctx, ctx)?;
+                flush_clustered_insert_batch(&exec_ctx, ctx)?;
                 ctx.in_explicit_txn = false;
                 ctx.savepoints.clear(); // all savepoints destroyed on COMMIT
                 let conn = ctx.conn_txn.take().expect("conn_txn checked above");
@@ -33,8 +38,8 @@ pub fn execute_with_ctx(
                 return Err(DbError::TransactionAlreadyActive { txn_id });
             }
             Stmt::Savepoint(ref name) => {
-                flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
-                flush_clustered_insert_batch(storage, txn, bloom, ctx)?;
+                flush_pending_inserts_ctx(&exec_ctx, ctx)?;
+                flush_clustered_insert_batch(&exec_ctx, ctx)?;
                 let sp = txn.savepoint(ctx.conn_txn.as_ref().expect("conn_txn checked above"));
                 ctx.savepoints.push((name.clone(), sp));
                 return Ok(QueryResult::Empty);
@@ -77,15 +82,16 @@ pub fn execute_with_ctx(
         if is_ddl(&stmt) {
             // DDL implicitly commits the current transaction — flush staged
             // rows into the pre-DDL transaction before committing it.
-            flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
-            flush_clustered_insert_batch(storage, txn, bloom, ctx)?;
+            flush_pending_inserts_ctx(&exec_ctx, ctx)?;
+            flush_clustered_insert_batch(&exec_ctx, ctx)?;
             ctx.in_explicit_txn = false;
             let pre_conn = ctx.conn_txn.take().expect("conn_txn checked above");
             let pre_tid = pre_conn.txn_id;
             txn.commit(pre_conn)?;
             txn.release_immediate_committed_frees(storage, pre_tid)?;
             ctx.conn_txn = Some(txn.begin()?);
-            return match dispatch_ctx(stmt, storage, txn, bloom, ctx) {
+            let exec_ctx2 = ExecutionContext::from_mut(storage, txn, bloom);
+            return match dispatch_ctx(stmt, &exec_ctx2, ctx) {
                 Ok(result) => {
                     let ddl_conn = ctx.conn_txn.take().expect("just set above");
                     let ddl_tid = ddl_conn.txn_id;
@@ -107,17 +113,17 @@ pub fn execute_with_ctx(
         // (b) a later statement error does not roll back previously staged rows;
         // (c) barrier semantics: the current statement sees flushed rows.
         if should_flush_pending_inserts_before_stmt(&stmt, ctx) {
-            flush_pending_inserts_ctx(storage, txn, bloom, ctx)?;
+            flush_pending_inserts_ctx(&exec_ctx, ctx)?;
         }
         if should_flush_clustered_batch_before_stmt(&stmt, ctx) {
-            flush_clustered_insert_batch(storage, txn, bloom, ctx)?;
+            flush_clustered_insert_batch(&exec_ctx, ctx)?;
         }
         let sp_opt: Option<Savepoint> = if ctx.on_error == OnErrorMode::RollbackTransaction {
             None
         } else {
             Some(txn.savepoint(ctx.conn_txn.as_ref().expect("conn_txn set above")))
         };
-        match dispatch_ctx(stmt, storage, txn, bloom, ctx) {
+        match dispatch_ctx(stmt, &exec_ctx, ctx) {
             Ok(result) => Ok(result),
             Err(e) => match ctx.on_error {
                 OnErrorMode::RollbackTransaction => {
@@ -180,7 +186,8 @@ pub fn execute_with_ctx(
                 // NOTE: `in_explicit_txn` is NOT set here — this is an implicit
                 // autocommit transaction. Single-statement INSERTs use the existing
                 // multi-row batch path inside execute_insert_ctx, not the staging buffer.
-                match dispatch_ctx(other, storage, txn, bloom, ctx) {
+                let exec_ctx2 = ExecutionContext::from_mut(storage, txn, bloom);
+                match dispatch_ctx(other, &exec_ctx2, ctx) {
                     Ok(result) => {
                         let conn = ctx.conn_txn.take().expect("just set above");
                         let tid = conn.txn_id;
@@ -213,7 +220,8 @@ pub fn execute_with_ctx(
             }
             Stmt::Select(_) => {
                 ctx.conn_txn = Some(txn.begin()?);
-                match dispatch_ctx(stmt, storage, txn, bloom, ctx) {
+                let exec_ctx2 = ExecutionContext::from_mut(storage, txn, bloom);
+                match dispatch_ctx(stmt, &exec_ctx2, ctx) {
                     Ok(result) => {
                         let conn = ctx.conn_txn.take().expect("just set above");
                         txn.commit(conn)?;
@@ -228,7 +236,8 @@ pub fn execute_with_ctx(
             }
             other if is_ddl(&other) => {
                 ctx.conn_txn = Some(txn.begin()?);
-                match dispatch_ctx(other, storage, txn, bloom, ctx) {
+                let exec_ctx2 = ExecutionContext::from_mut(storage, txn, bloom);
+                match dispatch_ctx(other, &exec_ctx2, ctx) {
                     Ok(result) => {
                         let conn = ctx.conn_txn.take().expect("just set above");
                         txn.commit(conn)?;
@@ -250,7 +259,8 @@ pub fn execute_with_ctx(
                 } else {
                     None
                 };
-                match dispatch_ctx(other, storage, txn, bloom, ctx) {
+                let exec_ctx2 = ExecutionContext::from_mut(storage, txn, bloom);
+                match dispatch_ctx(other, &exec_ctx2, ctx) {
                     Ok(result) => Ok(result),
                     Err(e) => match ctx.on_error {
                         OnErrorMode::Ignore if crate::session::is_ignorable_on_error(&e) => {

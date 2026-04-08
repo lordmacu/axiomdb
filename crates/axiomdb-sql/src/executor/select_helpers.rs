@@ -107,7 +107,8 @@ fn execute_select_with_joins(
     }
 
     // Sort source rows before projection.
-    combined_rows = apply_order_by(combined_rows, &stmt.order_by)?;
+    let resolved_ob = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
+    combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
 
     // Build output ColumnMeta.
     let out_cols = build_join_column_meta(&stmt.columns, &all_resolved, &stmt.joins)?;

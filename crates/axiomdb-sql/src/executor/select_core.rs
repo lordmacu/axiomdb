@@ -62,6 +62,23 @@ fn execute_select(
         _ => unreachable!("already handled None and Subquery above"),
     };
 
+    // INFORMATION_SCHEMA virtual tables (4.20c).
+    if from_table_ref
+        .schema
+        .as_deref()
+        .map(crate::information_schema::is_information_schema)
+        .unwrap_or(false)
+    {
+        return execute_information_schema_select(
+            stmt,
+            from_table_ref,
+            storage,
+            txn,
+            conn_txn,
+            DEFAULT_DATABASE_NAME,
+        );
+    }
+
     if stmt.joins.is_empty() {
         // ── Single-table path (no JOIN) ───────────────────────────────────────
         let resolved = {
@@ -252,7 +269,8 @@ fn execute_select(
             return execute_select_grouped(stmt, combined_rows, GroupByStrategy::Hash);
         }
 
-        combined_rows = apply_order_by(combined_rows, &stmt.order_by)?;
+        let resolved_ob = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
+        combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
 
         let out_cols = build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
         let mut rows = combined_rows
@@ -273,6 +291,9 @@ fn execute_select(
 
         if stmt.distinct {
             rows = apply_distinct_with_session(rows);
+        }
+        if stmt.calc_found_rows {
+            set_found_rows(rows.len() as u64);
         }
         rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 
@@ -304,7 +325,8 @@ fn execute_select_derived(
     // Execute the inner query to materialize the derived table.
     let mut temp_ctx = SessionContext::new();
     let temp_bloom = crate::bloom::BloomRegistry::new();
-    let inner_result = execute_select_ctx(inner_query, storage, txn, &temp_bloom, &mut temp_ctx)?;
+    let temp_exec_ctx = ExecutionContext::new(storage, txn, &temp_bloom);
+    let inner_result = execute_select_ctx(inner_query, &temp_exec_ctx, &mut temp_ctx)?;
     let (derived_cols, derived_rows) = match inner_result {
         QueryResult::Rows { columns, rows } => (columns, rows),
         _ => {
@@ -339,7 +361,8 @@ fn execute_select_derived(
         return execute_select_grouped(stmt, combined_rows, GroupByStrategy::Hash);
     }
 
-    combined_rows = apply_order_by(combined_rows, &stmt.order_by)?;
+    let resolved_ob = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
+    combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
 
     // Build output columns from SELECT list against derived column metadata.
     let out_cols = build_derived_output_columns(&stmt.columns, &derived_cols)?;
@@ -350,6 +373,9 @@ fn execute_select_derived(
 
     if stmt.distinct {
         rows = apply_distinct_with_session(rows);
+    }
+    if stmt.calc_found_rows {
+        set_found_rows(rows.len() as u64);
     }
     rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 

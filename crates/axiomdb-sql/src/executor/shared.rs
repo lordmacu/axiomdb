@@ -97,7 +97,7 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
                 mask[*col_idx] = true;
             }
         }
-        Expr::Literal(_) | Expr::OuterColumn { .. } | Expr::Param { .. } => {}
+        Expr::Literal(_) | Expr::Default | Expr::OuterColumn { .. } | Expr::Param { .. } => {}
         Expr::UnaryOp { operand, .. } => collect_column_refs(operand, mask),
         Expr::BinaryOp { left, right, .. } => {
             collect_column_refs(left, mask);
@@ -566,6 +566,76 @@ fn remap_expr_for_grouped(expr: &Expr, select_items: &[SelectItem]) -> Expr {
         },
         other => other,
     }
+}
+
+/// Resolves positional `ORDER BY` references (integer literals) to the
+/// corresponding SELECT item expressions (4.10e / G8).
+///
+/// `ORDER BY 1` → expression of the 1st SELECT item (1-indexed).
+/// Non-integer or out-of-range positions are left unchanged.
+fn resolve_positional_order_by(
+    order_by: &[crate::ast::OrderByItem],
+    select_items: &[SelectItem],
+) -> Vec<crate::ast::OrderByItem> {
+    order_by
+        .iter()
+        .map(|item| {
+            let resolved_expr = match &item.expr {
+                Expr::Literal(Value::Int(n)) if *n >= 1 => {
+                    let idx = (*n as usize) - 1;
+                    if let Some(SelectItem::Expr { expr, .. }) = select_items.get(idx) {
+                        expr.clone()
+                    } else {
+                        item.expr.clone()
+                    }
+                }
+                Expr::Literal(Value::BigInt(n)) if *n >= 1 => {
+                    let idx = (*n as usize) - 1;
+                    if let Some(SelectItem::Expr { expr, .. }) = select_items.get(idx) {
+                        expr.clone()
+                    } else {
+                        item.expr.clone()
+                    }
+                }
+                _ => item.expr.clone(),
+            };
+            crate::ast::OrderByItem {
+                expr: resolved_expr,
+                order: item.order,
+                nulls: item.nulls,
+            }
+        })
+        .collect()
+}
+
+/// Resolves positional `GROUP BY` references (integer literals) to the
+/// corresponding SELECT item expressions (4.10e / G8).
+///
+/// `GROUP BY 1` → expression of the 1st SELECT item (1-indexed).
+/// Non-integer or out-of-range positions are left unchanged.
+fn resolve_positional_group_by(exprs: &[Expr], select_items: &[SelectItem]) -> Vec<Expr> {
+    exprs
+        .iter()
+        .map(|e| match e {
+            Expr::Literal(Value::Int(n)) if *n >= 1 => {
+                let idx = (*n as usize) - 1;
+                if let Some(SelectItem::Expr { expr, .. }) = select_items.get(idx) {
+                    expr.clone()
+                } else {
+                    e.clone()
+                }
+            }
+            Expr::Literal(Value::BigInt(n)) if *n >= 1 => {
+                let idx = (*n as usize) - 1;
+                if let Some(SelectItem::Expr { expr, .. }) = select_items.get(idx) {
+                    expr.clone()
+                } else {
+                    e.clone()
+                }
+            }
+            _ => e.clone(),
+        })
+        .collect()
 }
 
 /// Evaluates a LIMIT or OFFSET expression as a non-negative `usize`.

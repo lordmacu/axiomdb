@@ -1,10 +1,11 @@
 fn execute_select_with_joins_ctx(
     stmt: SelectStmt,
     from_ref: crate::ast::TableRef,
-    storage: &dyn StorageEngine,
-    txn: &TxnManager,
+    exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
     // Session collation for eval()-based comparisons in join ON, WHERE, ORDER BY, etc.
     // Guard propagates from execute_select_ctx when called via the join path, but
     // we set it here too so this function can also be called independently.
@@ -92,7 +93,8 @@ fn execute_select_with_joins_ctx(
         return execute_select_grouped(stmt, combined_rows, GroupByStrategy::Hash);
     }
 
-    combined_rows = apply_order_by(combined_rows, &stmt.order_by)?;
+    let resolved_ob = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
+    combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
 
     let out_cols = build_join_column_meta(&stmt.columns, &all_resolved, &stmt.joins)?;
 

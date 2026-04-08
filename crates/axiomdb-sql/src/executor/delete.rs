@@ -1,10 +1,12 @@
 fn execute_delete_ctx(
     stmt: DeleteStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
-    bloom: &mut crate::bloom::BloomRegistry,
+    exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
+    let storage = unsafe { exec_ctx.storage_mut() };
+    let txn = unsafe { exec_ctx.coord_mut() };
+    let bloom = unsafe { exec_ctx.bloom_mut() };
     let resolved = resolve_table_cached(
         storage,
         txn,
