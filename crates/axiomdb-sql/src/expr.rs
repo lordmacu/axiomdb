@@ -203,6 +203,13 @@ pub enum Expr {
     /// unsubstituted `Param` is a programming error.
     Param { idx: usize },
 
+    /// `DEFAULT` — the column's declared default value.
+    ///
+    /// Valid in `INSERT ... VALUES (1, DEFAULT)` and `UPDATE t SET col = DEFAULT`.
+    /// Resolved to `Value::Null` at eval time; the executor applies the column's
+    /// declared default when default-expression persistence is implemented (4.18e).
+    Default,
+
     // ── Aggregate-specific forms ───────────────────────────────────────────────
     /// `GROUP_CONCAT([DISTINCT] expr [ORDER BY e [ASC|DESC], ...] [SEPARATOR 'str'])`
     ///

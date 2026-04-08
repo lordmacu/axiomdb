@@ -32,7 +32,7 @@
 //! Phase 4.G4 adds: XOR, REGEXP/RLIKE, <=>, bitwise (&|^~<<>>), DIV, hex literals.
 
 use axiomdb_core::error::DbError;
-use axiomdb_types::Value;
+use axiomdb_types::{DataType, Value};
 
 use crate::{
     ast::SortOrder,
@@ -447,6 +447,10 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
             p.advance();
             Ok(Expr::Literal(Value::Null))
         }
+        Token::Default => {
+            p.advance();
+            Ok(Expr::Default)
+        }
         Token::LParen => {
             p.advance();
             // (SELECT ...) — scalar subquery.
@@ -473,7 +477,11 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
         | Token::Regexp
         | Token::Rlike
         | Token::Xor
-        | Token::IntDiv => parse_ident_or_call(p),
+        | Token::IntDiv
+        // Reserved DML keywords that double as MySQL built-in function names.
+        | Token::Truncate  // TRUNCATE(x, d) — numeric rounding function
+        | Token::Insert    // INSERT(str, pos, len, newstr) — string replacement
+        => parse_ident_or_call(p),
 
         // ── CASE WHEN ... END ─────────────────────────────────────────────────
         Token::Case => {
@@ -652,6 +660,26 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
             });
         }
 
+        // CONVERT(expr, type) or CONVERT(expr USING charset) — MySQL syntax (4.19g).
+        // Both forms are desugared to Expr::Cast; USING form maps to Text.
+        if name.eq_ignore_ascii_case("convert") {
+            let expr = parse_expr(p)?;
+            let target = if p.eat(&Token::Using) {
+                // CONVERT(expr USING charset_name) — consume charset name, cast to Text.
+                // charset name may be an identifier or a keyword (utf8, binary, etc.)
+                p.advance(); // consume whatever the charset token is
+                DataType::Text
+            } else {
+                p.expect(&Token::Comma)?;
+                parse_convert_type(p)?
+            };
+            p.expect(&Token::RParen)?;
+            return Ok(Expr::Cast {
+                expr: Box::new(expr),
+                target,
+            });
+        }
+
         // COUNT(*) and similar aggregate wildcards
         if p.eat(&Token::Star) {
             p.expect(&Token::RParen)?;
@@ -660,6 +688,42 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
                 args: vec![],
             });
         }
+
+        // COUNT(DISTINCT col) / SUM(DISTINCT col) / AVG(DISTINCT col) — 4.9f
+        let name_lower = name.to_ascii_lowercase();
+        if matches!(name_lower.as_str(), "count" | "sum" | "avg" | "min" | "max")
+            && p.eat(&Token::Distinct)
+        {
+            let arg = parse_expr(p)?;
+            p.expect(&Token::RParen)?;
+            // MIN(DISTINCT) / MAX(DISTINCT) desugar to MIN/MAX (DISTINCT has no effect).
+            let effective_name = match name_lower.as_str() {
+                "min" | "max" => name_lower.clone(),
+                _ => format!("{name_lower}_distinct"),
+            };
+            return Ok(Expr::Function {
+                name: effective_name,
+                args: vec![arg],
+            });
+        }
+
+        // TIMESTAMPDIFF(unit, ts1, ts2) — first arg is a bare date unit keyword
+        // (SECOND, MINUTE, HOUR, DAY, WEEK, MONTH, YEAR, MICROSECOND).
+        // We parse it as a string literal to avoid "ColumnNotFound: DAY" from the analyzer.
+        let name_lower = name.to_ascii_lowercase();
+        if name_lower == "timestampdiff" && !matches!(p.peek(), Token::RParen) {
+            let unit_str = p.parse_identifier()?;
+            let mut args = vec![Expr::Literal(Value::Text(unit_str.to_ascii_uppercase()))];
+            while p.eat(&Token::Comma) {
+                args.push(parse_expr(p)?);
+            }
+            p.expect(&Token::RParen)?;
+            return Ok(Expr::Function {
+                name: name_lower,
+                args,
+            });
+        }
+
         // Regular args or no args
         let mut args = Vec::new();
         if !matches!(p.peek(), Token::RParen) {
@@ -677,4 +741,48 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
 
     // Plain column reference
     Ok(Expr::Column { col_idx: 0, name })
+}
+
+/// Parses the type argument for `CONVERT(expr, type)` — MySQL-specific type names
+/// that are not standard SQL data types (SIGNED, UNSIGNED, BINARY, JSON…).
+fn parse_convert_type(p: &mut Parser) -> Result<DataType, DbError> {
+    // Handle MySQL-specific CONVERT type keywords that aren't standard SQL types.
+    match p.peek().clone() {
+        Token::Ident(s) => {
+            let lower = s.to_ascii_lowercase();
+            match lower.as_str() {
+                "signed" => {
+                    p.advance();
+                    // SIGNED [INTEGER] — optional INTEGER keyword
+                    if let Token::TyInt | Token::TyInteger = p.peek() {
+                        p.advance();
+                    }
+                    Ok(DataType::BigInt)
+                }
+                "unsigned" => {
+                    p.advance();
+                    // UNSIGNED [INTEGER]
+                    if let Token::TyInt | Token::TyInteger = p.peek() {
+                        p.advance();
+                    }
+                    Ok(DataType::BigInt)
+                }
+                "binary" => {
+                    p.advance();
+                    // Consume optional (N) length specifier.
+                    if p.eat(&Token::LParen) {
+                        p.advance(); // integer length
+                        p.expect(&Token::RParen)?;
+                    }
+                    Ok(DataType::Bytes)
+                }
+                "json" => {
+                    p.advance();
+                    Ok(DataType::Text)
+                }
+                _ => super::ddl::parse_data_type(p),
+            }
+        }
+        _ => super::ddl::parse_data_type(p),
+    }
 }

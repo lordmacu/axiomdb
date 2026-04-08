@@ -47,9 +47,40 @@ pub(crate) fn parse_dml(p: &mut Parser) -> Result<Stmt, DbError> {
 
 // ── SELECT ────────────────────────────────────────────────────────────────────
 
+/// Consume an identifier that matches `keyword` (case-insensitive).
+/// Returns true and advances if matched, false otherwise.
+fn eat_ident_ci(p: &mut Parser, keyword: &str) -> bool {
+    if let Token::Ident(s) = p.peek() {
+        if s.eq_ignore_ascii_case(keyword) {
+            p.advance();
+            return true;
+        }
+    }
+    false
+}
+
 /// Parses everything after `SELECT` has been consumed.
 pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
     let distinct = p.eat(&Token::Distinct);
+
+    // MySQL optimizer hint modifiers (4.4i): consume and discard.
+    // SQL_CALC_FOUND_ROWS is stored for FOUND_ROWS() support (4.5e).
+    let mut calc_found_rows = false;
+    loop {
+        if eat_ident_ci(p, "SQL_CALC_FOUND_ROWS") {
+            calc_found_rows = true;
+        } else if eat_ident_ci(p, "HIGH_PRIORITY")
+            || eat_ident_ci(p, "STRAIGHT_JOIN")
+            || eat_ident_ci(p, "SQL_SMALL_RESULT")
+            || eat_ident_ci(p, "SQL_BIG_RESULT")
+            || eat_ident_ci(p, "SQL_BUFFER_RESULT")
+        {
+            // discard
+        } else {
+            break;
+        }
+    }
+
     let columns = parse_select_list(p)?;
 
     let from = if p.eat(&Token::From) {
@@ -108,6 +139,7 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
 
     Ok(SelectStmt {
         distinct,
+        calc_found_rows,
         columns,
         from,
         joins,
@@ -409,6 +441,12 @@ pub(crate) fn parse_do_expr(p: &mut Parser) -> Result<Expr, DbError> {
 // ── INSERT ────────────────────────────────────────────────────────────────────
 
 fn parse_insert(p: &mut Parser) -> Result<Stmt, DbError> {
+    // MySQL priority / delay modifiers — consume and discard (4.6e).
+    // `INSERT LOW_PRIORITY INTO ...` / `INSERT HIGH_PRIORITY INTO ...`
+    // `INSERT DELAYED INTO ...`
+    eat_ident_ci(p, "LOW_PRIORITY");
+    eat_ident_ci(p, "HIGH_PRIORITY");
+    eat_ident_ci(p, "DELAYED");
     // `INSERT IGNORE INTO ...` — silently skip constraint violations
     let ignore = p.eat(&Token::Ignore);
     p.expect(&Token::Into)?;
@@ -425,6 +463,30 @@ fn parse_insert(p: &mut Parser) -> Result<Stmt, DbError> {
     } else {
         None
     };
+
+    // `INSERT INTO t SET col=val, ...` — MySQL assignment syntax.
+    // Only valid when no explicit column list was given (columns.is_none()).
+    if columns.is_none() && matches!(p.peek(), Token::Set) {
+        p.advance(); // consume SET
+        let mut col_names: Vec<String> = Vec::new();
+        let mut col_values: Vec<Expr> = Vec::new();
+        loop {
+            let col = p.parse_identifier()?;
+            p.expect(&Token::Eq)?;
+            let val = parse_expr(p)?;
+            col_names.push(col);
+            col_values.push(val);
+            if !p.eat(&Token::Comma) {
+                break;
+            }
+        }
+        return Ok(Stmt::Insert(InsertStmt {
+            table,
+            columns: Some(col_names),
+            source: InsertSource::Values(vec![col_values]),
+            ignore,
+        }));
+    }
 
     let source = match p.peek() {
         Token::Values => {
@@ -457,7 +519,7 @@ fn parse_insert(p: &mut Parser) -> Result<Stmt, DbError> {
         other => {
             return Err(DbError::ParseError {
                 message: format!(
-                    "expected VALUES, DEFAULT VALUES, or SELECT in INSERT, found {:?}",
+                    "expected VALUES, DEFAULT VALUES, SET, or SELECT in INSERT, found {:?}",
                     other,
                 ),
                 position: Some(p.current_pos()),

@@ -907,6 +907,7 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
     loop {
         let op = match p.peek().clone() {
             // ADD [CONSTRAINT name] <constraint> | ADD [COLUMN] col_def
+            // ADD [UNIQUE] [INDEX|KEY] [name] (cols)
             Token::Add => {
                 p.advance();
                 // Peek: is this ADD CONSTRAINT or ADD UNIQUE (without CONSTRAINT keyword)?
@@ -916,10 +917,55 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                     // handles the optional CONSTRAINT name prefix itself.
                     let constraint = parse_table_constraint(p)?;
                     AlterTableOp::AddConstraint(constraint)
+                } else if matches!(p.peek(), Token::Index)
+                    || matches!(p.peek(), Token::Ident(ref kw) if kw.eq_ignore_ascii_case("key"))
+                {
+                    // ADD INDEX [name] (cols)
+                    p.advance(); // consume INDEX/KEY
+                    let name = if !matches!(p.peek(), Token::LParen) {
+                        Some(p.parse_identifier()?)
+                    } else {
+                        None
+                    };
+                    let columns = parse_index_column_list_paren(p)?;
+                    AlterTableOp::AddIndex {
+                        unique: false,
+                        name,
+                        columns,
+                    }
                 } else if matches!(p.peek(), Token::Unique) {
-                    // ADD UNIQUE (cols) — shorthand without CONSTRAINT name
-                    let constraint = parse_table_constraint(p)?; // eats Unique
-                    AlterTableOp::AddConstraint(constraint)
+                    // ADD UNIQUE [INDEX|KEY] [name] (cols)  OR  ADD UNIQUE (constraint)
+                    p.advance(); // consume UNIQUE
+                    if matches!(p.peek(), Token::Index)
+                        || matches!(p.peek(), Token::Ident(ref kw) if kw.eq_ignore_ascii_case("key"))
+                    {
+                        // ADD UNIQUE INDEX [name] (cols)
+                        p.advance();
+                        let name = if !matches!(p.peek(), Token::LParen) {
+                            Some(p.parse_identifier()?)
+                        } else {
+                            None
+                        };
+                        let columns = parse_index_column_list_paren(p)?;
+                        AlterTableOp::AddIndex {
+                            unique: true,
+                            name,
+                            columns,
+                        }
+                    } else {
+                        // ADD UNIQUE [name] (cols) — shorthand
+                        let name = if !matches!(p.peek(), Token::LParen) {
+                            Some(p.parse_identifier()?)
+                        } else {
+                            None
+                        };
+                        let columns = parse_index_column_list_paren(p)?;
+                        AlterTableOp::AddIndex {
+                            unique: true,
+                            name,
+                            columns,
+                        }
+                    }
                 } else {
                     // ADD [COLUMN] col_def — existing behavior
                     p.eat(&Token::Column);
@@ -927,11 +973,81 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                     AlterTableOp::AddColumn(col_def)
                 }
             }
-            // DROP CONSTRAINT [IF EXISTS] name | DROP [COLUMN] [IF EXISTS] col_name
+            // RENAME COLUMN old TO new  |  RENAME TO new_name  |  RENAME INDEX old TO new
+            Token::Rename => {
+                p.advance();
+                match p.peek().clone() {
+                    Token::Column => {
+                        p.advance();
+                        let old_name = p.parse_identifier()?;
+                        p.expect(&Token::To)?;
+                        let new_name = p.parse_identifier()?;
+                        AlterTableOp::RenameColumn { old_name, new_name }
+                    }
+                    Token::To | Token::As => {
+                        p.advance();
+                        let new_name = p.parse_identifier()?;
+                        AlterTableOp::RenameTable(new_name)
+                    }
+                    // RENAME INDEX old TO new
+                    Token::Index => {
+                        p.advance();
+                        let old_name = p.parse_identifier()?;
+                        p.expect(&Token::To)?;
+                        let new_name = p.parse_identifier()?;
+                        AlterTableOp::RenameIndex { old_name, new_name }
+                    }
+                    // RENAME KEY old TO new (MySQL synonym)
+                    Token::Ident(ref kw) if kw.eq_ignore_ascii_case("key") => {
+                        p.advance();
+                        let old_name = p.parse_identifier()?;
+                        p.expect(&Token::To)?;
+                        let new_name = p.parse_identifier()?;
+                        AlterTableOp::RenameIndex { old_name, new_name }
+                    }
+                    other => {
+                        return Err(DbError::ParseError {
+                            message: format!(
+                            "expected COLUMN, TO, INDEX, or KEY after RENAME in ALTER TABLE, found {other:?}",
+                        ),
+                            position: Some(p.current_pos()),
+                        })
+                    }
+                }
+            }
+            // MODIFY [COLUMN] col_name new_type [constraints]
+            Token::Modify => {
+                p.advance();
+                p.eat(&Token::Column); // optional COLUMN keyword
+                let col_def = parse_column_def(p)?;
+                AlterTableOp::ModifyColumn(col_def)
+            }
+            // CHANGE [COLUMN] old_col_name new_col_def
+            Token::Ident(ref kw) if kw.eq_ignore_ascii_case("change") => {
+                p.advance();
+                p.eat(&Token::Column); // optional COLUMN keyword
+                let old_name = p.parse_identifier()?;
+                let new_def = parse_column_def(p)?;
+                AlterTableOp::ChangeColumn { old_name, new_def }
+            }
+            // DROP INDEX name | DROP PRIMARY KEY | DROP CONSTRAINT ... | DROP COLUMN ...
             Token::Drop => {
                 p.advance();
-                if matches!(p.peek(), Token::Constraint) {
-                    // DROP CONSTRAINT [IF EXISTS] name
+                if matches!(p.peek(), Token::Index)
+                    || matches!(p.peek(), Token::Ident(ref kw) if kw.eq_ignore_ascii_case("key"))
+                {
+                    p.advance();
+                    let name = p.parse_identifier()?;
+                    AlterTableOp::DropIndex { name }
+                } else if matches!(p.peek(), Token::Primary) {
+                    // DROP PRIMARY KEY — handled later in executor
+                    p.advance(); // PRIMARY
+                    p.eat(&Token::Key); // optional KEY keyword
+                                        // Re-use DropIndex with "PRIMARY" as the sentinel name
+                    AlterTableOp::DropIndex {
+                        name: "PRIMARY".to_string(),
+                    }
+                } else if matches!(p.peek(), Token::Constraint) {
                     p.advance(); // consume CONSTRAINT
                     let if_exists =
                         if matches!(p.peek(), Token::If) && matches!(p.peek_at(1), Token::Exists) {
@@ -944,7 +1060,7 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                     let name = p.parse_identifier()?;
                     AlterTableOp::DropConstraint { name, if_exists }
                 } else {
-                    // DROP [COLUMN] [IF EXISTS] col_name — existing behavior
+                    // DROP [COLUMN] [IF EXISTS] col_name
                     p.eat(&Token::Column);
                     let if_exists =
                         if matches!(p.peek(), Token::If) && matches!(p.peek_at(1), Token::Exists) {
@@ -958,38 +1074,52 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                     AlterTableOp::DropColumn { name, if_exists }
                 }
             }
-            // RENAME COLUMN old TO new  |  RENAME TO new_name
-            Token::Rename => {
+            // CONVERT TO CHARACTER SET charset [COLLATE collation]
+            Token::Ident(ref kw) if kw.eq_ignore_ascii_case("convert") => {
                 p.advance();
+                p.expect(&Token::To)?;
+                // expect CHARACTER SET or CHARSET (either form)
                 match p.peek().clone() {
-                    Token::Column => {
+                    Token::Ident(ref s) if s.eq_ignore_ascii_case("charset") => {
                         p.advance();
-                        let old_name = p.parse_identifier()?;
-                        p.expect(&Token::To)?;
-                        let new_name = p.parse_identifier()?;
-                        AlterTableOp::RenameColumn { old_name, new_name }
                     }
-                    Token::To => {
+                    Token::Ident(ref s) if s.eq_ignore_ascii_case("character") => {
+                        p.advance(); // CHARACTER
+                                     // SET is Token::Set
+                        p.eat(&Token::Set);
+                    }
+                    _ => {} // tolerate unexpected token
+                }
+                // consume charset name
+                let _ = p.parse_identifier();
+                // optional COLLATE collation
+                if let Token::Ident(ref s) = p.peek().clone() {
+                    if s.eq_ignore_ascii_case("collate") {
                         p.advance();
-                        let new_name = p.parse_identifier()?;
-                        AlterTableOp::RenameTable(new_name)
-                    }
-                    other => {
-                        return Err(DbError::ParseError {
-                            message: format!(
-                            "expected COLUMN or TO after RENAME in ALTER TABLE, found {other:?}",
-                        ),
-                            position: Some(p.current_pos()),
-                        })
+                        let _ = p.parse_identifier();
                     }
                 }
+                AlterTableOp::ConvertCharset
             }
-            // MODIFY [COLUMN] col_name new_type [constraints]
-            Token::Modify => {
+            // AUTO_INCREMENT = N
+            Token::Ident(ref kw) if kw.eq_ignore_ascii_case("auto_increment") => {
                 p.advance();
-                p.eat(&Token::Column); // optional COLUMN keyword
-                let col_def = parse_column_def(p)?;
-                AlterTableOp::ModifyColumn(col_def)
+                p.eat(&Token::Eq);
+                let n = match p.peek().clone() {
+                    Token::Integer(n) => {
+                        p.advance();
+                        n as u64
+                    }
+                    _ => 0,
+                };
+                AlterTableOp::SetAutoIncrement(n)
+            }
+            // ENGINE = name
+            Token::Ident(ref kw) if kw.eq_ignore_ascii_case("engine") => {
+                p.advance();
+                p.eat(&Token::Eq);
+                let _ = p.parse_identifier();
+                AlterTableOp::SetEngine
             }
             // REBUILD — convert heap table to clustered format (Phase 39.19)
             Token::Ident(s) if s.eq_ignore_ascii_case("rebuild") => {
