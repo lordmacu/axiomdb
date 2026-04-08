@@ -208,9 +208,11 @@ impl ConnectionTxn {
 pub struct TxnManager {
     wal: ConcurrentWalWriter,
     next_txn_id: u64,
-    /// TxnId of the last committed transaction. Advances only on commit (`&mut self`).
-    /// Kept as plain `u64` until Phase 40.10 introduces concurrent writers.
-    max_committed: u64,
+    /// TxnId of the last committed transaction.
+    /// `AtomicU64` allows `snapshot()` to read without `&mut self`.
+    /// Written under `active_set.write()` lock for atomicity (DuckDB + PostgreSQL pattern).
+    /// Read under `active_set.read()` lock when building MVCC snapshots.
+    max_committed: AtomicU64,
     /// Set of currently in-flight transaction IDs.
     /// Protected by `RwLock` to allow concurrent snapshot reads.
     active_set: RwLock<HashSet<TxnId>>,
