@@ -40,6 +40,7 @@ fn resolve_expr_full(
 ) -> Result<Expr, DbError> {
     match expr {
         Expr::Literal(v) => Ok(Expr::Literal(v)),
+        Expr::Default => Ok(Expr::Default),
 
         Expr::Column { col_idx: _, name } => {
             // 1. Try the inner (current) scope first.

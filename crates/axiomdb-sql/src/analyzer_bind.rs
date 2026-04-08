@@ -315,6 +315,28 @@ fn bound_table_ref(
 ) -> Result<BoundTable, DbError> {
     let database = table_ref.database.as_deref().unwrap_or(default_database);
     let schema = table_ref.schema.as_deref().unwrap_or(default_schema);
+
+    // INFORMATION_SCHEMA virtual tables (4.20c) — synthetic column binding,
+    // no catalog lookup required.
+    if crate::information_schema::is_information_schema(schema) {
+        let cols = crate::information_schema::make_is_catalog_columns(
+            &table_ref.name,
+            *col_offset,
+        )
+        .ok_or_else(|| DbError::TableNotFound {
+            name: format!("information_schema.{}", table_ref.name),
+        })?;
+        let n = cols.len();
+        let bound = BoundTable {
+            alias: table_ref.alias.clone(),
+            name: table_ref.name.clone(),
+            columns: cols,
+            col_offset: *col_offset,
+        };
+        *col_offset += n;
+        return Ok(bound);
+    }
+
     let mut reader = CatalogReader::new(storage, snapshot)?;
 
     // If the user explicitly specified a database, verify it exists first.

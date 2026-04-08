@@ -268,6 +268,57 @@ fn analyze_select_with_outer(
     }
     s.columns = resolved_cols;
 
+    // 4.12c: DISTINCT + non-selected ORDER BY → MySQL error 3065.
+    // `SELECT DISTINCT a FROM t ORDER BY b` is invalid when b is not derived
+    // from any expression in the SELECT list, because DISTINCT deduplications
+    // happen on the projection output before sorting; the sort key must therefore
+    // be computable from the projected columns.
+    if s.distinct && !s.order_by.is_empty() {
+        // Build the set of col_idx values that appear in the SELECT list.
+        let selected_col_idxs: std::collections::HashSet<usize> = s
+            .columns
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::Expr { expr, .. } => expr_column_idx(expr),
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => None,
+            })
+            .collect();
+
+        // Wildcards cover all columns — no restriction possible.
+        let has_wildcard = s.columns.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_)
+            )
+        });
+
+        if !has_wildcard {
+            for item in &s.order_by {
+                // If the ORDER BY expression is a column reference, it must
+                // appear in the SELECT list. Non-column expressions (literals,
+                // functions, CASE) are rejected unless they match a SELECT expr.
+                if let Some(idx) = expr_column_idx(&item.expr) {
+                    if !selected_col_idxs.contains(&idx) {
+                        return Err(DbError::ParseError {
+                            message: "ORDER BY expression not in DISTINCT SELECT list \
+                                      (expression must appear in the SELECT list)"
+                                .into(),
+                            position: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     Ok(s)
+}
+
+/// Returns the `col_idx` if `expr` is a simple `Expr::Column`; `None` otherwise.
+fn expr_column_idx(expr: &Expr) -> Option<usize> {
+    match expr {
+        Expr::Column { col_idx, .. } => Some(*col_idx),
+        _ => None,
+    }
 }
 
