@@ -113,6 +113,9 @@ pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub constraints: Vec<ColumnConstraint>,
+    /// Maximum character length for `VARCHAR(N)` / `CHAR(N)` columns.
+    /// `0` means unbounded (no length constraint). Mirrors `CatalogColumnDef::type_len`.
+    pub type_len: u16,
 }
 
 /// Inline column constraint in a column definition.
@@ -736,16 +739,19 @@ mod tests {
                         ColumnConstraint::PrimaryKey,
                         ColumnConstraint::AutoIncrement,
                     ],
+                    type_len: 0,
                 },
                 ColumnDef {
                     name: "email".into(),
                     data_type: DataType::Text,
                     constraints: vec![ColumnConstraint::NotNull, ColumnConstraint::Unique],
+                    type_len: 0,
                 },
                 ColumnDef {
                     name: "age".into(),
                     data_type: DataType::Int,
                     constraints: vec![ColumnConstraint::Default(Expr::int(0))],
+                    type_len: 0,
                 },
             ],
             table_constraints: vec![],
@@ -763,11 +769,13 @@ mod tests {
                     name: "id".into(),
                     data_type: DataType::BigInt,
                     constraints: vec![ColumnConstraint::NotNull],
+                    type_len: 0,
                 },
                 ColumnDef {
                     name: "user_id".into(),
                     data_type: DataType::BigInt,
                     constraints: vec![ColumnConstraint::NotNull],
+                    type_len: 0,
                 },
             ],
             table_constraints: vec![
@@ -907,6 +915,7 @@ mod tests {
                     name: "phone".into(),
                     data_type: DataType::Text,
                     constraints: vec![ColumnConstraint::Null],
+                    type_len: 0,
                 }),
                 AlterTableOp::DropColumn {
                     name: "legacy_col".into(),
@@ -1013,6 +1022,7 @@ mod tests {
                 op: UnaryOp::Neg,
                 operand: Box::new(Expr::int(1)),
             })],
+            type_len: 0,
         };
         assert_eq!(col_def.name, "balance");
     }

@@ -201,6 +201,7 @@ mod tests {
             col_type: ColumnType::Text,
             nullable: true,
             auto_increment: false,
+            type_len: 0,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -217,6 +218,7 @@ mod tests {
             col_type: ColumnType::BigInt,
             nullable: false,
             auto_increment: false,
+            type_len: 0,
         };
         let bytes = def.to_bytes();
         let (back, _) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -233,6 +235,7 @@ mod tests {
             col_type: ColumnType::Int,
             nullable: false,
             auto_increment: false,
+            type_len: 0,
         };
         let bytes = def.to_bytes();
         assert!(ColumnDef::from_bytes(&bytes[..5]).is_err());

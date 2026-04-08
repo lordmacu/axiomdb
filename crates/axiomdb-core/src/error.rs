@@ -154,6 +154,17 @@ pub enum DbError {
     #[error("type mismatch: expected {expected}, got {got}")]
     TypeMismatch { expected: String, got: String },
 
+    /// Value exceeds the declared VARCHAR(N) / CHAR(N) column length.
+    /// MySQL error 1406 / SQLSTATE 22001 (string_data_right_truncation).
+    #[error(
+        "data too long for column '{column}': value is {actual_len} chars, maximum is {max_len}"
+    )]
+    DataTooLong {
+        column: String,
+        max_len: u16,
+        actual_len: usize,
+    },
+
     // ── Heap pages ───────────────────────────────────────────────
     #[error("heap page {page_id} is full (need {needed} bytes, have {available})")]
     HeapPageFull {
@@ -361,6 +372,7 @@ impl DbError {
             DbError::KeyTooLong { .. } => "22001",
             DbError::IndexKeyTooLong { .. } => "54000",
             DbError::ValueTooLarge { .. } => "22001",
+            DbError::DataTooLong { .. } => "22001",
             DbError::InvalidValue { .. } => "22P02",
             // ── Subqueries ────────────────────────────────────────────────
             DbError::CardinalityViolation { .. } => "21000",

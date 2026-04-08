@@ -203,6 +203,7 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         | DbError::DivisionByZero
         | DbError::Overflow
         | DbError::ValueTooLarge { .. }
+        | DbError::DataTooLong { .. }
         | DbError::NoActiveTransaction
         | DbError::TransactionAlreadyActive { .. }
         | DbError::CardinalityViolation { .. }

@@ -47,6 +47,7 @@ fn execute_create_table(
 
     for (i, col_def) in stmt.columns.iter().enumerate() {
         let col_type = datatype_to_column_type(&col_def.data_type)?;
+        let type_len = col_def.type_len;
         let nullable = !col_def
             .constraints
             .iter()
@@ -79,6 +80,7 @@ fn execute_create_table(
             col_type,
             nullable,
             auto_increment,
+            type_len,
         })?;
     }
 
@@ -684,6 +686,7 @@ fn execute_create_table_like(
             col_type: col.col_type,
             nullable: col.nullable,
             auto_increment: col.auto_increment,
+            type_len: col.type_len,
         })?;
     }
 
@@ -830,6 +833,7 @@ fn execute_create_table_as_select(
             col_type: *col_type,
             nullable: true, // CTAS columns are always nullable
             auto_increment: false,
+            type_len: 0,
         })?;
     }
 
@@ -845,6 +849,7 @@ fn execute_create_table_as_select(
             col_type,
             nullable: true,
             auto_increment: false,
+            type_len: 0,
         })
         .collect();
 

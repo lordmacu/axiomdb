@@ -75,7 +75,10 @@ fn execute_update_with_candidates(
         }
     }
 
-    // CHECK constraint validation (mirrors INSERT path).
+    // VARCHAR(N) length + CHECK constraint validation (mirrors INSERT path).
+    for (_, _, new_values) in &to_update {
+        check_varchar_lengths(&resolved.columns, new_values)?;
+    }
     if !resolved.constraints.is_empty() {
         for (_, _, new_values) in &to_update {
             check_row_constraints(

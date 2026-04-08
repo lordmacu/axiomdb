@@ -186,6 +186,10 @@ pub struct ColumnDef {
     pub nullable: bool,
     /// `true` if this column was declared `AUTO_INCREMENT` or `SERIAL`.
     pub auto_increment: bool,
+    /// Maximum character length for `VARCHAR(N)` / `CHAR(N)` columns.
+    /// `0` means unbounded (equivalent to `TEXT`). Stored as 2 bytes after
+    /// the name when `flags bit2` is set (backward-compatible extension).
+    pub type_len: u16,
 }
 
 impl ColumnDef {
@@ -198,6 +202,7 @@ impl ColumnDef {
         let name = self.name.as_bytes();
         debug_assert!(name.len() <= 255, "column name too long");
 
+        let has_type_len = self.type_len > 0;
         let mut flags: u8 = 0;
         if self.nullable {
             flags |= 0x01;
@@ -205,14 +210,20 @@ impl ColumnDef {
         if self.auto_increment {
             flags |= 0x02;
         }
+        if has_type_len {
+            flags |= 0x04; // bit2: type_len extension present
+        }
 
-        let mut buf = Vec::with_capacity(4 + 2 + 1 + 1 + 1 + name.len());
+        let mut buf = Vec::with_capacity(4 + 2 + 1 + 1 + 1 + name.len() + if has_type_len { 2 } else { 0 });
         buf.extend_from_slice(&self.table_id.to_le_bytes());
         buf.extend_from_slice(&self.col_idx.to_le_bytes());
         buf.push(u8::from(self.col_type));
         buf.push(flags);
         buf.push(name.len() as u8);
         buf.extend_from_slice(name);
+        if has_type_len {
+            buf.extend_from_slice(&self.type_len.to_le_bytes());
+        }
         buf
     }
 
@@ -236,6 +247,7 @@ impl ColumnDef {
         let flags = bytes[7];
         let nullable = flags & 0x01 != 0;
         let auto_increment = flags & 0x02 != 0;
+        let has_type_len = flags & 0x04 != 0;
         let name_len = bytes[8] as usize;
 
         if bytes.len() < 9 + name_len {
@@ -247,7 +259,19 @@ impl ColumnDef {
                 position: None,
             })?
             .to_string();
-        let consumed = 9 + name_len;
+        let mut consumed = 9 + name_len;
+
+        // Backward-compatible extension: type_len present only when bit2 set.
+        let type_len = if has_type_len {
+            if bytes.len() < consumed + 2 {
+                return Err(err());
+            }
+            let v = u16::from_le_bytes([bytes[consumed], bytes[consumed + 1]]);
+            consumed += 2;
+            v
+        } else {
+            0
+        };
 
         Ok((
             Self {
@@ -257,6 +281,7 @@ impl ColumnDef {
                 col_type,
                 nullable,
                 auto_increment,
+                type_len,
             },
             consumed,
         ))

@@ -226,7 +226,7 @@ fn is_table_constraint_start(p: &Parser) -> bool {
 
 fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
     let name = p.parse_identifier()?;
-    let data_type = parse_data_type(p)?;
+    let (data_type, type_len) = parse_data_type(p)?;
     let mut constraints = Vec::new();
 
     loop {
@@ -333,6 +333,7 @@ fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
         name,
         data_type,
         constraints,
+        type_len,
     })
 }
 
@@ -592,54 +593,57 @@ fn parse_check_column_constraint(p: &mut Parser) -> Result<ColumnConstraint, DbE
 
 // ── Data type ─────────────────────────────────────────────────────────────────
 
-pub(crate) fn parse_data_type(p: &mut Parser) -> Result<DataType, DbError> {
+/// Parses a SQL data type keyword, returning `(DataType, type_len)`.
+///
+/// `type_len` is the `N` from `VARCHAR(N)` / `CHAR(N)`, or `0` for all other types.
+pub(crate) fn parse_data_type(p: &mut Parser) -> Result<(DataType, u16), DbError> {
     let pos = p.current_pos();
     match p.peek().clone() {
         Token::TyInt | Token::TyInteger => {
             p.advance();
-            Ok(DataType::Int)
+            Ok((DataType::Int, 0))
         }
         Token::TyBigint => {
             p.advance();
-            Ok(DataType::BigInt)
+            Ok((DataType::BigInt, 0))
         }
         Token::TyReal | Token::TyDouble | Token::TyFloat => {
             p.advance();
-            Ok(DataType::Real)
+            Ok((DataType::Real, 0))
         }
         Token::TyDecimal | Token::TyNumeric => {
             p.advance();
             eat_optional_precision_scale(p)?;
-            Ok(DataType::Decimal)
+            Ok((DataType::Decimal, 0))
         }
         Token::TyBool | Token::TyBoolean => {
             p.advance();
-            Ok(DataType::Bool)
+            Ok((DataType::Bool, 0))
         }
         Token::TyText => {
             p.advance();
-            Ok(DataType::Text)
+            Ok((DataType::Text, 0))
         }
         Token::TyVarchar | Token::TyChar => {
             p.advance();
-            eat_optional_length(p)?;
-            Ok(DataType::Text)
+            let len = eat_optional_length(p)?;
+            Ok((DataType::Text, len))
         }
         Token::TyBlob | Token::TyBytea => {
             p.advance();
-            Ok(DataType::Bytes)
+            Ok((DataType::Bytes, 0))
         }
         Token::TyDate => {
             p.advance();
-            Ok(DataType::Date)
+            Ok((DataType::Date, 0))
         }
         Token::TyTimestamp | Token::TyDatetime => {
             p.advance();
-            Ok(DataType::Timestamp)
+            Ok((DataType::Timestamp, 0))
         }
         Token::TyUuid => {
             p.advance();
-            Ok(DataType::Uuid)
+            Ok((DataType::Uuid, 0))
         }
         other => Err(DbError::ParseError {
             message: format!(
@@ -674,18 +678,26 @@ fn eat_optional_precision_scale(p: &mut Parser) -> Result<(), DbError> {
     Ok(())
 }
 
-fn eat_optional_length(p: &mut Parser) -> Result<(), DbError> {
+fn eat_optional_length(p: &mut Parser) -> Result<u16, DbError> {
     if p.eat(&Token::LParen) {
-        if !matches!(p.peek(), Token::Integer(_)) {
-            return Err(DbError::ParseError {
-                message: "expected length integer in type parameter".into(),
-                position: Some(p.current_pos()),
-            });
-        }
-        p.advance();
+        let len = match p.peek() {
+            Token::Integer(n) => {
+                let v = (*n).min(u16::MAX as i64).max(0) as u16;
+                p.advance();
+                v
+            }
+            _ => {
+                return Err(DbError::ParseError {
+                    message: "expected length integer in type parameter".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+        };
         p.expect(&Token::RParen)?;
+        Ok(len)
+    } else {
+        Ok(0)
     }
-    Ok(())
 }
 
 // ── Identifier list ───────────────────────────────────────────────────────────

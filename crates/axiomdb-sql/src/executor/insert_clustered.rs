@@ -36,7 +36,9 @@ fn execute_clustered_insert(
     macro_rules! prepare_one_row {
         ($full_values:expr) => {{
             let fv = $full_values;
-            match check_row_constraints(&resolved.constraints, &fv, &resolved.def.table_name) {
+            match check_varchar_lengths(&resolved.columns, &fv)
+                .and_then(|()| check_row_constraints(&resolved.constraints, &fv, &resolved.def.table_name))
+            {
                 Err(e) if ignore && is_ignorable_insert_error(&e) => {}
                 Err(e) => return Err(e),
                 Ok(()) => {

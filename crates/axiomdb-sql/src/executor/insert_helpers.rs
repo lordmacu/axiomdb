@@ -152,6 +152,36 @@ fn assign_auto_increment(
 
 // ── UPDATE ────────────────────────────────────────────────────────────────────
 
+/// Checks that no `Text` value exceeds the declared `type_len` for its column.
+///
+/// Called on every INSERT and UPDATE row before it is written to storage.
+/// Returns [`DbError::DataTooLong`] on the first violation found.
+/// Columns with `type_len == 0` are unbounded and are skipped.
+pub(crate) fn check_varchar_lengths(
+    schema_cols: &[CatalogColumnDef],
+    row_values: &[Value],
+) -> Result<(), DbError> {
+    for (col, val) in schema_cols.iter().zip(row_values.iter()) {
+        if col.type_len == 0 {
+            continue;
+        }
+        if col.col_type != ColumnType::Text {
+            continue;
+        }
+        if let Value::Text(s) = val {
+            let char_count = s.chars().count();
+            if char_count > col.type_len as usize {
+                return Err(DbError::DataTooLong {
+                    column: col.name.clone(),
+                    max_len: col.type_len,
+                    actual_len: char_count,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn check_row_constraints(
     constraints: &[axiomdb_catalog::schema::ConstraintDef],
     row_values: &[Value],

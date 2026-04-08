@@ -652,7 +652,7 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
                     position: Some(p.current_pos()),
                 });
             }
-            let target = super::ddl::parse_data_type(p)?;
+            let (target, _) = super::ddl::parse_data_type(p)?;
             p.expect(&Token::RParen)?;
             return Ok(Expr::Cast {
                 expr: Box::new(expr),
@@ -780,9 +780,9 @@ fn parse_convert_type(p: &mut Parser) -> Result<DataType, DbError> {
                     p.advance();
                     Ok(DataType::Text)
                 }
-                _ => super::ddl::parse_data_type(p),
+                _ => super::ddl::parse_data_type(p).map(|(dt, _)| dt),
             }
         }
-        _ => super::ddl::parse_data_type(p),
+        _ => super::ddl::parse_data_type(p).map(|(dt, _)| dt),
     }
 }
