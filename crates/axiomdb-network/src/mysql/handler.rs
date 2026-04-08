@@ -1338,6 +1338,59 @@ pub async fn handle_connection_with_timeouts(
                 lifecycle.enter(ConnectionPhase::Idle);
             }
 
+            // COM_STATISTICS (0x09) — legacy monitoring agents expect a plain-text
+            // statistics string (5.4c). The response payload is the raw UTF-8 string;
+            // the codec adds the MySQL 4-byte packet header automatically.
+            0x09 => {
+                let uptime = status.uptime_secs();
+                let threads = status.threads_connected.load(Ordering::Relaxed);
+                let questions = status.questions.load(Ordering::Relaxed);
+                let qps = if uptime > 0 {
+                    questions as f64 / uptime as f64
+                } else {
+                    0.0
+                };
+                let stats_str = format!(
+                    "Uptime: {uptime}  Threads: {threads}  Questions: {questions}  \
+                     Slow queries: 0  Opens: 0  Flush tables: 1  Open tables: 0  \
+                     Queries per second avg: {qps:.3}"
+                );
+                if send_execute_packet(
+                    &mut writer,
+                    &lifecycle,
+                    &conn_state,
+                    1u8,
+                    stats_str.as_bytes(),
+                )
+                .await
+                .is_err()
+                {
+                    lifecycle.close();
+                    break;
+                }
+                lifecycle.enter(ConnectionPhase::Idle);
+            }
+
+            // COM_CHANGE_USER (0x11) — connection pool recycling (HikariCP / c3p0).
+            // Reset session state and reply OK, identical to COM_RESET_CONNECTION (5.11d).
+            0x11 => {
+                debug!(conn_id, "COM_CHANGE_USER — reset session");
+                session = SessionContext::new();
+                conn_state = ConnectionState::new();
+                reader
+                    .decoder_mut()
+                    .set_max_payload_len(ConnectionState::DEFAULT_MAX_ALLOWED_PACKET);
+                let ok = build_ok_packet(0, 0, 0);
+                if send_execute_packet(&mut writer, &lifecycle, &conn_state, 1u8, ok.as_slice())
+                    .await
+                    .is_err()
+                {
+                    lifecycle.close();
+                    break;
+                }
+                lifecycle.enter(ConnectionPhase::Idle);
+            }
+
             other => {
                 warn!(conn_id, cmd = other, "unknown command");
                 let err = build_err_packet(1047, b"HY000", "Unknown command");

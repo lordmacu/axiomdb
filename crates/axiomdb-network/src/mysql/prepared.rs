@@ -126,6 +126,15 @@ pub fn parse_execute_packet(
     let mut pos = 9usize;
 
     let n = stmt.param_count as usize;
+    // 5.10b: guard against malformed packets claiming more than 65535 params.
+    // A param_count > 65535 is impossible in the MySQL protocol but a forged
+    // packet could attempt it; reject early before allocating the null bitmap.
+    if n > 65535 {
+        return Err(DbError::ParseError {
+            message: format!("COM_STMT_EXECUTE param_count {n} exceeds protocol limit 65535"),
+            position: None,
+        });
+    }
     if n == 0 {
         return Ok(ExecutePacket {
             stmt_id,
