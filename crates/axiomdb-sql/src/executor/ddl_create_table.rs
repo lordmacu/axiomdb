@@ -738,11 +738,12 @@ fn execute_create_table_like(
 /// The resulting table has no primary key, no indexes, and no FK constraints.
 fn execute_create_table_as_select(
     stmt: crate::ast::CreateTableAsSelectStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
-    bloom: &mut crate::bloom::BloomRegistry,
+    exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    // SAFETY: see ExecutionContext::storage_mut / coord_mut.
+    let storage = unsafe { exec_ctx.storage_mut() };
+    let txn = unsafe { exec_ctx.coord_mut() };
     let new_schema = stmt
         .new_table
         .schema
@@ -752,7 +753,7 @@ fn execute_create_table_as_select(
     let new_name = stmt.new_table.name.clone();
 
     // 1. Run the SELECT (read-only — borrows storage/txn immutably via coercion).
-    let result = execute_select_ctx(stmt.select, storage, txn, bloom, ctx)?;
+    let result = execute_select_ctx(stmt.select, exec_ctx, ctx)?;
     let (col_meta, rows) = match result {
         QueryResult::Rows { columns, rows } => (columns, rows),
         // SELECT without FROM (e.g. SELECT 1) returns Rows with zero or one row.

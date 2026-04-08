@@ -1,5 +1,34 @@
 // ── DROP INDEX ────────────────────────────────────────────────────────────────
 
+/// Scans all tables in all schemas of `database` to find which table owns an
+/// index named `index_name`.
+///
+/// Returns the first matching `TableRef` (schema = "public", name = table_name),
+/// or `None` if no table in the database has an index with that name.
+///
+/// Used by `execute_drop_index` when no `ON table` clause is provided (4.22d).
+fn find_table_for_index(
+    storage: &dyn StorageEngine,
+    snap: TransactionSnapshot,
+    index_name: &str,
+    database: &str,
+) -> Result<Option<TableRef>, DbError> {
+    let mut reader = CatalogReader::new(storage, snap)?;
+    let tables = reader.list_tables_in_database(database, "public")?;
+    for t in tables {
+        let indexes = reader.list_indexes(t.id)?;
+        if indexes.iter().any(|i| i.name == index_name) {
+            return Ok(Some(TableRef {
+                database: None,
+                schema: None,
+                name: t.table_name,
+                alias: None,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 fn execute_drop_index(
     stmt: DropIndexStmt,
     storage: &mut dyn StorageEngine,
@@ -10,11 +39,20 @@ fn execute_drop_index(
 ) -> Result<QueryResult, DbError> {
     let snap = txn.active_snapshot(conn_txn);
 
-    // MySQL requires `DROP INDEX name ON table`. If no table is provided, we cannot
-    // efficiently search all indexes for Phase 4.5.
-    let table_ref = stmt.table.as_ref().ok_or_else(|| DbError::NotImplemented {
-        feature: "DROP INDEX without ON table — Phase 4.20".into(),
-    })?;
+    // Resolve the target table. When ON table is omitted (4.22d), scan all
+    // tables in all schemas to find one that contains an index with this name.
+    let table_ref: TableRef = match stmt.table {
+        Some(tr) => tr,
+        None => match find_table_for_index(storage, snap.clone(), &stmt.name, database)? {
+            Some(tr) => tr,
+            None if stmt.if_exists => return Ok(QueryResult::Empty),
+            None => {
+                return Err(DbError::NotImplemented {
+                    feature: format!("DROP INDEX — index '{}' not found in any table", stmt.name),
+                })
+            }
+        },
+    };
 
     let schema = table_ref.schema.as_deref().unwrap_or("public");
 
