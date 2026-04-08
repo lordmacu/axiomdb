@@ -392,14 +392,39 @@ pub enum Token<'src> {
 
     // ── Literals ──────────────────────────────────────────────────────────────
     /// Hexadecimal integer literal: `0x1A2B` or `0X1a2b`.
-    /// Converted to `i64`; very large values clamp to `i64::MAX`.
+    /// Converted to `i64`; values exceeding `i64::MAX` clamp to `i64::MAX`.
     #[regex(r"0[xX][0-9a-fA-F]+", |lex| {
-        i64::from_str_radix(&lex.slice()[2..], 16).ok()
+        i64::from_str_radix(&lex.slice()[2..], 16)
+            .or_else(|_| u64::from_str_radix(&lex.slice()[2..], 16).map(|n| n as i64))
+            .ok()
     })]
     HexLit(i64),
 
     /// Integer literal (unsigned; unary `-` is a separate `Minus` token).
-    #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
+    ///
+    /// Multiple patterns (4.2d, 4.2e):
+    /// - `[0-9]+` — decimal; values > `i64::MAX` clamp to `i64::MAX`
+    /// - `0b` / `0B` — binary integer (`0b1010`)
+    /// - `b'...'` / `B'...'` — binary bit-string (`b'1010'`)
+    #[regex(r"[0-9]+", |lex| {
+        let s = lex.slice();
+        s.parse::<i64>()
+            .or_else(|_| s.parse::<u64>().map(|n| n.min(i64::MAX as u64) as i64))
+            .ok()
+    })]
+    #[regex(r"0[bB][01]+", |lex| {
+        i64::from_str_radix(&lex.slice()[2..], 2)
+            .or_else(|_| u64::from_str_radix(&lex.slice()[2..], 2).map(|n| n as i64))
+            .ok()
+    })]
+    #[regex(r"[bB]'[01]*'", |lex| {
+        let s = lex.slice();
+        let inner = &s[2..s.len() - 1];
+        if inner.is_empty() { return Some(0i64); }
+        i64::from_str_radix(inner, 2)
+            .or_else(|_| u64::from_str_radix(inner, 2).map(|n| n as i64))
+            .ok()
+    })]
     Integer(i64),
 
     /// Float literal — must contain `.` or `e`/`E`.
@@ -411,7 +436,11 @@ pub enum Token<'src> {
 
     /// Single-quoted string literal with escape processing.
     /// `''` inside the string is the SQL-standard doubled-quote escape.
+    ///
+    /// Also handles hex byte-string `x'AABB'` / `X'AABB'` (4.2e):
+    /// decoded as UTF-8 when valid, latin-1 otherwise.
     #[regex(r"'([^'\\]|\\.|'')*'", |lex| process_string_literal(lex.slice()))]
+    #[regex(r"[xX]'[0-9a-fA-F]*'", |lex| decode_hex_string_literal(lex.slice()))]
     StringLit(String),
 
     // ── Identifiers ───────────────────────────────────────────────────────────
@@ -527,6 +556,36 @@ pub enum Token<'src> {
 
 // ── String escape processing ──────────────────────────────────────────────────
 
+/// Decodes a MySQL hex byte-string literal `x'AABB'` / `X'AABB'` (4.2e).
+///
+/// Returns the decoded bytes as a `String`:
+/// - If the bytes are valid UTF-8, returns `from_utf8` directly.
+/// - Otherwise, maps each byte to its latin-1 char equivalent (MySQL behavior).
+pub(crate) fn decode_hex_string_literal(raw: &str) -> Option<String> {
+    // Strip the leading `x'` / `X'` and trailing `'`.
+    let inner = &raw[2..raw.len() - 1];
+    if inner.is_empty() {
+        return Some(String::new());
+    }
+    if inner.len() % 2 != 0 {
+        return None; // Odd hex digits are invalid.
+    }
+    let bytes: Option<Vec<u8>> = inner
+        .as_bytes()
+        .chunks(2)
+        .map(|chunk| {
+            let hi = (chunk[0] as char).to_digit(16)?;
+            let lo = (chunk[1] as char).to_digit(16)?;
+            Some((hi * 16 + lo) as u8)
+        })
+        .collect();
+    let bytes = bytes?;
+    Some(
+        String::from_utf8(bytes.clone())
+            .unwrap_or_else(|_| bytes.iter().map(|&b| b as char).collect()),
+    )
+}
+
 /// Processes escape sequences in a raw single-quoted SQL string literal.
 ///
 /// `raw` must include the surrounding single quotes (e.g. `'hello\nworld'`).
@@ -632,6 +691,84 @@ pub fn tokenize<'src>(
     tokens.push(SpannedToken::new(Token::Eof, eof_pos, eof_pos));
 
     Ok(tokens)
+}
+
+// ── MySQL version-conditional comment preprocessing (4.1f) ────────────────────
+
+/// Expands MySQL version-conditional comments in `input` (4.1f).
+///
+/// `/*!NNNNN SQL*/` — if NNNNN ≤ 80000 (MySQL 8.0.0), replaces with ` SQL `.
+/// `/*!SQL*/` (no version number) — always includes the SQL.
+/// Regular `/* */` block comments are left unchanged (handled by the logos `skip` rule).
+///
+/// Returns a `String` only when `/*!` is present; otherwise returns the input unchanged.
+/// The caller stores the returned `String` so that tokens can borrow from it.
+pub fn expand_version_comments(input: &str) -> Option<String> {
+    if !input.contains("/*!") {
+        return None; // Fast path: no version comments, no allocation needed.
+    }
+
+    let mut result = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Look for `/*!` (version comment start).
+        if i + 2 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' && bytes[i + 2] == b'!' {
+            // Find the matching `*/`.
+            let search_start = i + 3;
+            let close = find_block_comment_end(bytes, search_start);
+            match close {
+                None => {
+                    // Unterminated comment — copy rest as-is and stop.
+                    result.push_str(&input[i..]);
+                    i = bytes.len();
+                }
+                Some(end) => {
+                    let inner = &input[search_start..end];
+                    // Parse optional leading version number (1–5 digits).
+                    let ver_end = inner
+                        .find(|c: char| !c.is_ascii_digit())
+                        .unwrap_or(inner.len());
+                    let content = if ver_end > 0 {
+                        let ver: u32 = inner[..ver_end].parse().unwrap_or(u32::MAX);
+                        if ver <= 80000 {
+                            &inner[ver_end..]
+                        } else {
+                            "" // Version too new — suppress.
+                        }
+                    } else {
+                        inner // No version number — always include.
+                    };
+                    result.push(' ');
+                    result.push_str(content);
+                    result.push(' ');
+                    i = end + 2; // Skip past `*/`.
+                }
+            }
+        } else {
+            // SAFETY: `bytes[i]` is valid ASCII or the start of a multi-byte char.
+            // For non-ASCII, copy the full char.
+            let ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
+            result.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+
+    Some(result)
+}
+
+/// Returns the byte offset of `*` in the `*/` that closes a block comment,
+/// starting the search at `from` (the position after `/*`).
+fn find_block_comment_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -810,5 +947,118 @@ mod tests {
     fn test_eof_always_last() {
         let tokens = tok("SELECT 1");
         assert_eq!(*tokens.last().unwrap(), Token::Eof);
+    }
+
+    // ── Integer overflow (4.2d) ───────────────────────────────────────────────
+
+    #[test]
+    fn test_integer_normal() {
+        assert_eq!(tok("42")[0], Token::Integer(42));
+    }
+
+    #[test]
+    fn test_integer_overflow_clamped() {
+        // 9999999999999999999 > i64::MAX (9223372036854775807) — should clamp
+        assert_eq!(tok("9999999999999999999")[0], Token::Integer(i64::MAX));
+    }
+
+    #[test]
+    fn test_integer_i64_max() {
+        assert_eq!(
+            tok("9223372036854775807")[0],
+            Token::Integer(9223372036854775807)
+        );
+    }
+
+    // ── Binary literals (4.2e) ────────────────────────────────────────────────
+
+    #[test]
+    fn test_binary_prefix_0b() {
+        assert_eq!(tok("0b1010")[0], Token::Integer(10));
+    }
+
+    #[test]
+    fn test_binary_prefix_0b_uppercase() {
+        assert_eq!(tok("0B1111")[0], Token::Integer(15));
+    }
+
+    #[test]
+    fn test_binary_bit_string() {
+        assert_eq!(tok("b'1010'")[0], Token::Integer(10));
+    }
+
+    #[test]
+    fn test_binary_bit_string_uppercase() {
+        assert_eq!(tok("B'1111'")[0], Token::Integer(15));
+    }
+
+    #[test]
+    fn test_binary_bit_string_empty() {
+        assert_eq!(tok("b''")[0], Token::Integer(0));
+    }
+
+    // ── Hex string literals (4.2e) ────────────────────────────────────────────
+
+    #[test]
+    fn test_hex_string_literal_ascii() {
+        // x'48656c6c6f' = b"Hello"
+        assert_eq!(tok("x'48656c6c6f'")[0], Token::StringLit("Hello".into()));
+    }
+
+    #[test]
+    fn test_hex_string_literal_uppercase_x() {
+        assert_eq!(tok("X'48656c6c6f'")[0], Token::StringLit("Hello".into()));
+    }
+
+    #[test]
+    fn test_hex_string_literal_empty() {
+        assert_eq!(tok("x''")[0], Token::StringLit(String::new()));
+    }
+
+    // ── Version-conditional comments (4.1f) ───────────────────────────────────
+
+    #[test]
+    fn test_version_comment_included() {
+        // /*!40101 SET NAMES ... */ — version 40101 ≤ 80000, SQL is included
+        let result = expand_version_comments("/*!40101 SELECT 1*/");
+        assert!(result.is_some());
+        let s = result.unwrap();
+        assert!(s.contains("SELECT 1"), "SQL should be included: {s}");
+    }
+
+    #[test]
+    fn test_version_comment_excluded() {
+        // /*!99999 SELECT 1*/ — version 99999 > 80000, SQL suppressed
+        let result = expand_version_comments("/*!99999 SELECT 1*/");
+        assert!(result.is_some());
+        let s = result.unwrap();
+        assert!(!s.contains("SELECT"), "SQL should be suppressed: {s}");
+    }
+
+    #[test]
+    fn test_version_comment_no_version() {
+        // /*! SQL */ — no version number, always included
+        let result = expand_version_comments("/*! SELECT 1 */");
+        assert!(result.is_some());
+        let s = result.unwrap();
+        assert!(s.contains("SELECT 1"), "SQL should be included: {s}");
+    }
+
+    #[test]
+    fn test_version_comment_no_version_comments_fast_path() {
+        // No /*! in input — returns None (no allocation)
+        let result = expand_version_comments("SELECT 1");
+        assert!(result.is_none(), "Should be None for no version comments");
+    }
+
+    #[test]
+    fn test_version_comment_mixed() {
+        // Regular block comment left as-is (handled by logos skip)
+        let result = expand_version_comments("/* regular */ /*!50001 SELECT 1*/");
+        assert!(result.is_some());
+        let s = result.unwrap();
+        assert!(s.contains("SELECT 1"));
+        // The regular comment is preserved (logos will skip it)
+        assert!(s.contains("/* regular */"));
     }
 }
