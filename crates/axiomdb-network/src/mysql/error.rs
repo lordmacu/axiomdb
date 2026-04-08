@@ -141,6 +141,15 @@ pub fn dberror_to_mysql(e: &DbError, sql: Option<&str>) -> MysqlError {
             b"22007",
             format!("Cannot cast {value} ({from}) to {to}: {reason}"),
         ),
+        DbError::DataTooLong {
+            column,
+            max_len,
+            actual_len,
+        } => (
+            1406,
+            b"22001",
+            format!("Data too long for column '{column}' at row 1 (max {max_len} chars, got {actual_len})"),
+        ),
         DbError::NotImplemented { feature } => {
             (1235, b"0A000", format!("Not supported yet: {feature}"))
         }

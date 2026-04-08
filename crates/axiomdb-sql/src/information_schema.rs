@@ -174,6 +174,7 @@ pub fn make_is_catalog_columns(
                 col_type: *col_type,
                 nullable: true,
                 auto_increment: false,
+                type_len: 0,
             })
             .collect(),
     )

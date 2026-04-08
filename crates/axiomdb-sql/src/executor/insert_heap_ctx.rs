@@ -159,12 +159,10 @@ fn execute_insert_ctx(
                     }
                 }
 
-                // Evaluate active CHECK constraints from axiom_constraints.
-                match check_row_constraints(
-                    &resolved.constraints,
-                    &full_values,
-                    &resolved.def.table_name,
-                ) {
+                // VARCHAR(N) length check + CHECK constraints.
+                match check_varchar_lengths(&resolved.columns, &full_values)
+                    .and_then(|()| check_row_constraints(&resolved.constraints, &full_values, &resolved.def.table_name))
+                {
                     Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
                     other => other?,
                 }
@@ -378,6 +376,7 @@ fn execute_insert_ctx(
                     first_generated = Some(id);
                 }
             }
+            check_varchar_lengths(&resolved.columns, &full_values)?;
             check_row_constraints(
                 &resolved.constraints,
                 &full_values,

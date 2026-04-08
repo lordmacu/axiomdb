@@ -23,6 +23,7 @@ fn col(idx: u16, name: &str, col_type: ColumnType) -> ColumnDef {
         col_type,
         nullable: true,
         auto_increment: false,
+        type_len: 0,
     }
 }
 
@@ -506,6 +507,7 @@ fn create_table_helper(
                 col_type: col.col_type,
                 nullable: col.nullable,
                 auto_increment: false,
+                type_len: 0,
             })
             .unwrap();
     }

@@ -702,6 +702,7 @@ mod tests {
             col_type,
             nullable: true,
             auto_increment: false,
+            type_len: 0,
         }
     }
 
@@ -765,6 +766,7 @@ mod tests {
                 col_type: ColumnType::Int,
                 nullable: false,
                 auto_increment: false,
+                type_len: 0,
             },
             ColumnDef {
                 table_id: 1,
@@ -773,6 +775,7 @@ mod tests {
                 col_type: ColumnType::Int,
                 nullable: false,
                 auto_increment: false,
+                type_len: 0,
             },
         ];
 
@@ -823,6 +826,7 @@ mod tests {
                 col_type: ColumnType::Int,
                 nullable: false,
                 auto_increment: false,
+                type_len: 0,
             },
             ColumnDef {
                 table_id: 1,
@@ -831,6 +835,7 @@ mod tests {
                 col_type: ColumnType::Text,
                 nullable: false,
                 auto_increment: false,
+                type_len: 0,
             },
         ];
 

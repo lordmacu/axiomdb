@@ -47,6 +47,7 @@ impl Fixture {
                     col_type: *col_type,
                     nullable: true,
                     auto_increment: false,
+                    type_len: 0,
                 })
                 .unwrap();
             }

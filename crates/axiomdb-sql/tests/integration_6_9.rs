@@ -313,6 +313,70 @@ fn test_composite_index_prefix_scan_returns_multiple_rows() {
     );
 }
 
+// ── VARCHAR(N) enforcement (4.18c) ────────────────────────────────────────────
+
+#[test]
+fn test_varchar_insert_within_limit_succeeds() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(10))");
+    db.ok("INSERT INTO t VALUES (1, 'hello')");
+    let rows = db.rows("SELECT name FROM t WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Text("hello".into()));
+}
+
+#[test]
+fn test_varchar_insert_exact_limit_succeeds() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, tag VARCHAR(5))");
+    db.ok("INSERT INTO t VALUES (1, 'abcde')"); // exactly 5 chars
+    let rows = db.rows("SELECT tag FROM t");
+    assert_eq!(rows[0][0], Value::Text("abcde".into()));
+}
+
+#[test]
+fn test_varchar_insert_exceeds_limit_errors() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, tag VARCHAR(5))");
+    let e = db.err("INSERT INTO t VALUES (1, 'toolong')"); // 7 chars
+    assert!(
+        matches!(e, DbError::DataTooLong { ref column, max_len: 5, actual_len: 7 } if column == "tag"),
+        "unexpected error: {e}"
+    );
+}
+
+#[test]
+fn test_varchar_update_exceeds_limit_errors() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(5))");
+    db.ok("INSERT INTO t VALUES (1, 'hi')");
+    let e = db.err("UPDATE t SET name = 'toolong' WHERE id = 1");
+    assert!(
+        matches!(e, DbError::DataTooLong { ref column, max_len: 5, .. } if column == "name"),
+        "unexpected error: {e}"
+    );
+}
+
+#[test]
+fn test_varchar_unbounded_text_allows_long_string() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, data TEXT)");
+    let long = "x".repeat(500);
+    db.ok(&format!("INSERT INTO t VALUES (1, '{long}')"));
+    let rows = db.rows("SELECT data FROM t");
+    assert_eq!(rows[0][0], Value::Text(long));
+}
+
+#[test]
+fn test_char_insert_exceeds_limit_errors() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, code CHAR(3))");
+    let e = db.err("INSERT INTO t VALUES (1, 'ABCD')"); // 4 chars > 3
+    assert!(
+        matches!(e, DbError::DataTooLong { ref column, max_len: 3, actual_len: 4 } if column == "code"),
+        "unexpected error: {e}"
+    );
+}
+
 #[test]
 fn test_composite_index_three_columns() {
     let mut db = Db::new();
