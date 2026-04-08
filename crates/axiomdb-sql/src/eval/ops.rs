@@ -355,7 +355,7 @@ fn eval_comparison(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbError> {
 }
 
 /// Compares two non-NULL values of compatible types.
-pub(super) fn compare_values(l: &Value, r: &Value) -> Result<std::cmp::Ordering, DbError> {
+pub(crate) fn compare_values(l: &Value, r: &Value) -> Result<std::cmp::Ordering, DbError> {
     // Try numeric widening for mixed types first; fall through on incompatible types.
     let (l, r) = match coerce_for_op(l.clone(), r.clone()) {
         Ok(pair) => pair,
@@ -387,9 +387,52 @@ pub(super) fn compare_values(l: &Value, r: &Value) -> Result<std::cmp::Ordering,
         (Value::Date(a), Value::Date(b)) => Ok(a.cmp(b)),
         (Value::Timestamp(a), Value::Timestamp(b)) => Ok(a.cmp(b)),
         (Value::Uuid(a), Value::Uuid(b)) => Ok(a.cmp(b)),
+        // 4.18d: implicit coercion of string literals to date/timestamp (MySQL
+        // compatibility). `WHERE ts_col = '2024-01-01'` and similar patterns used
+        // by every ORM must not fail with TypeMismatch.
+        // text_vs_ts_cmp returns `stored.cmp(parsed_text)` — i.e. ordering of the
+        // stored value relative to the text. For (Timestamp, Text) that's exactly
+        // what we want. For (Text, Timestamp) we need the reverse.
+        (Value::Timestamp(micros), Value::Text(s)) => text_vs_ts_cmp(s, *micros),
+        (Value::Text(s), Value::Timestamp(micros)) => {
+            text_vs_ts_cmp(s, *micros).map(|o| o.reverse())
+        }
+        (Value::Date(days), Value::Text(s)) => text_vs_date_cmp(s, *days),
+        (Value::Text(s), Value::Date(days)) => text_vs_date_cmp(s, *days).map(|o| o.reverse()),
         _ => Err(DbError::TypeMismatch {
             expected: "comparable types".into(),
             got: format!("{} and {}", l.variant_name(), r.variant_name()),
+        }),
+    }
+}
+
+// ── Date/timestamp text-coercion helpers (4.18d) ──────────────────────────────
+
+/// Parses `s` as `%Y-%m-%d %H:%i:%s` or `%Y-%m-%d` and compares with `micros`.
+fn text_vs_ts_cmp(s: &str, micros: i64) -> Result<std::cmp::Ordering, DbError> {
+    use crate::eval::functions::datetime::{micros_to_ndt, str_to_date_inner};
+    let parsed =
+        str_to_date_inner(s, "%Y-%m-%d %H:%i:%s").or_else(|| str_to_date_inner(s, "%Y-%m-%d"));
+    match parsed {
+        Some((ndt, _)) => Ok(micros_to_ndt(micros).cmp(&ndt)),
+        None => Err(DbError::TypeMismatch {
+            expected: "date/time string".into(),
+            got: s.to_string(),
+        }),
+    }
+}
+
+/// Parses `s` as `%Y-%m-%d` (or datetime with time part ignored) and compares
+/// with `days` (days since 1970-01-01).
+fn text_vs_date_cmp(s: &str, days: i32) -> Result<std::cmp::Ordering, DbError> {
+    use crate::eval::functions::datetime::{days_to_ndate, str_to_date_inner};
+    let parsed =
+        str_to_date_inner(s, "%Y-%m-%d").or_else(|| str_to_date_inner(s, "%Y-%m-%d %H:%i:%s"));
+    match parsed {
+        Some((ndt, _)) => Ok(days_to_ndate(days).cmp(&ndt.date())),
+        None => Err(DbError::TypeMismatch {
+            expected: "date string".into(),
+            got: s.to_string(),
         }),
     }
 }

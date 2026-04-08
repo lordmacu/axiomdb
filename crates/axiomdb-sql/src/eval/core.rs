@@ -35,6 +35,7 @@ use super::{
 pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
     match expr {
         Expr::Literal(v) => Ok(v.clone()),
+        Expr::Default => Ok(Value::Null),
 
         Expr::Column { col_idx, name: _ } => {
             row.get(*col_idx)
@@ -302,6 +303,11 @@ pub fn eval_with<R: SubqueryRunner>(
                     len: row.len(),
                 })
         }
+
+        // DEFAULT resolves to NULL at eval time.
+        // The executor (insert/update) replaces Null with the column's declared
+        // default when default-expression persistence is implemented (4.18e).
+        Expr::Default => Ok(Value::Null),
 
         Expr::OuterColumn { col_idx, name } => Err(DbError::Internal {
             message: format!(
