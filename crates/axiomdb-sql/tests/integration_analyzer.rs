@@ -463,6 +463,60 @@ fn test_create_index_validates_table() {
     assert!(matches!(err, DbError::TableNotFound { .. }), "got: {err}");
 }
 
+// ── 4.12c: DISTINCT with non-selected ORDER BY ────────────────────────────────
+
+#[test]
+fn test_distinct_order_by_selected_col_ok() {
+    let mut f = Fixture::new();
+    f.create_table(
+        "items",
+        &[("id", ColumnType::Int), ("name", ColumnType::Text)],
+    );
+    // ORDER BY col that IS in the SELECT list — must succeed.
+    assert!(f
+        .analyze("SELECT DISTINCT name FROM items ORDER BY name")
+        .is_ok());
+}
+
+#[test]
+fn test_distinct_order_by_nonselected_col_error() {
+    let mut f = Fixture::new();
+    f.create_table(
+        "items",
+        &[("id", ColumnType::Int), ("name", ColumnType::Text)],
+    );
+    // ORDER BY col NOT in the SELECT list — must fail.
+    let err = f.analyze_err("SELECT DISTINCT name FROM items ORDER BY id");
+    assert!(
+        matches!(err, DbError::ParseError { .. }),
+        "expected ParseError, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_distinct_wildcard_order_by_any_col_ok() {
+    let mut f = Fixture::new();
+    f.create_table(
+        "items",
+        &[("id", ColumnType::Int), ("name", ColumnType::Text)],
+    );
+    // SELECT DISTINCT * covers all columns — any ORDER BY col is valid.
+    assert!(f
+        .analyze("SELECT DISTINCT * FROM items ORDER BY id")
+        .is_ok());
+}
+
+#[test]
+fn test_non_distinct_order_by_any_col_ok() {
+    let mut f = Fixture::new();
+    f.create_table(
+        "items",
+        &[("id", ColumnType::Int), ("name", ColumnType::Text)],
+    );
+    // Without DISTINCT, ORDER BY any column is fine.
+    assert!(f.analyze("SELECT name FROM items ORDER BY id").is_ok());
+}
+
 // ── Transaction stmts pass through ───────────────────────────────────────────
 
 #[test]
