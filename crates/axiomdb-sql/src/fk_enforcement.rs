@@ -697,14 +697,14 @@ pub fn enforce_fk_on_parent_delete(
 /// Enforces FK constraints when the referenced parent key columns are updated.
 ///
 /// Only RESTRICT / NO ACTION are supported. CASCADE / SET NULL on UPDATE are
-/// deferred to Phase 6.9.
 pub fn enforce_fk_on_parent_update(
     old_rows: &[(RecordId, Vec<Value>)],
     new_values_per_row: &[Vec<Value>],
     parent_table_id: u32,
     storage: &mut dyn StorageEngine,
-    txn: &TxnManager,
-    conn_txn: &axiomdb_wal::ConnectionTxn,
+    txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    bloom: &mut crate::BloomRegistry,
 ) -> Result<(), DbError> {
     if old_rows.is_empty() {
         return Ok(());
@@ -787,10 +787,29 @@ pub fn enforce_fk_on_parent_update(
                             child_column: child_col_name.clone(),
                         });
                     }
-                    _ => {
+                    FkAction::Cascade | FkAction::SetNull => {
+                        let replacement = if fk.on_update == FkAction::Cascade {
+                            new_key_val.clone()
+                        } else {
+                            Value::Null
+                        };
+                        apply_fk_update_children(
+                            storage,
+                            txn,
+                            conn_txn,
+                            bloom,
+                            &child_table_def,
+                            &child_cols,
+                            fk,
+                            fk_index_root,
+                            old_key_val,
+                            &replacement,
+                            snap.clone(),
+                        )?;
+                    }
+                    FkAction::SetDefault => {
                         return Err(DbError::NotImplemented {
-                            feature: "ON UPDATE CASCADE / SET NULL / SET DEFAULT — Phase 6.9"
-                                .into(),
+                            feature: "ON UPDATE SET DEFAULT".into(),
                         });
                     }
                 }
@@ -798,6 +817,221 @@ pub fn enforce_fk_on_parent_update(
         }
     }
 
+    Ok(())
+}
+
+/// Updates all child rows whose FK column equals `old_parent_val`, setting the
+/// FK column to `replacement_val`.  Handles both clustered and heap child tables,
+/// including secondary index maintenance.
+///
+/// Used by ON UPDATE CASCADE (`replacement_val` = new parent key) and
+/// ON UPDATE SET NULL (`replacement_val` = `Value::Null`).
+#[allow(clippy::too_many_arguments)]
+fn apply_fk_update_children(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    bloom: &mut crate::BloomRegistry,
+    child_table_def: &axiomdb_catalog::schema::TableDef,
+    child_cols: &[axiomdb_catalog::schema::ColumnDef],
+    fk: &FkDef,
+    fk_index_root: Option<u64>,
+    old_parent_val: &Value,
+    replacement_val: &Value,
+    snap: axiomdb_core::TransactionSnapshot,
+) -> Result<(), DbError> {
+    if child_table_def.is_clustered() {
+        // ── Clustered child table ────────────────────────────────────
+        let children_with_pk = find_clustered_children_with_pk(
+            storage,
+            child_table_def,
+            child_cols,
+            fk.child_col_idx,
+            old_parent_val,
+            snap.clone(),
+        )?;
+        if children_with_pk.is_empty() {
+            return Ok(());
+        }
+
+        let primary_idx = {
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
+            reader
+                .list_indexes(fk.child_table_id)?
+                .into_iter()
+                .find(|i| i.is_primary && !i.columns.is_empty())
+                .ok_or_else(|| DbError::Internal {
+                    message: format!(
+                        "clustered child table {} missing primary index",
+                        fk.child_table_id
+                    ),
+                })?
+        };
+        let mut secondary_idxs: Vec<IndexDef> = {
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
+            reader
+                .list_indexes(fk.child_table_id)?
+                .into_iter()
+                .filter(|i| !i.is_primary && !i.columns.is_empty())
+                .collect()
+        };
+
+        let mut current_root = txn
+            .clustered_root(fk.child_table_id)
+            .unwrap_or(child_table_def.root_page_id);
+
+        for (pk_key, old_values) in &children_with_pk {
+            let mut new_values = old_values.clone();
+            new_values[fk.child_col_idx as usize] = replacement_val.clone();
+            current_root = apply_clustered_set_null(
+                storage,
+                txn,
+                conn_txn,
+                fk.child_table_id,
+                current_root,
+                &primary_idx,
+                &mut secondary_idxs,
+                child_cols,
+                pk_key,
+                old_values,
+                &new_values,
+                snap.clone(),
+            )?;
+        }
+    } else {
+        // ── Heap child table ─────────────────────────────────────────
+        let child_rows = if let Some(root) = fk_index_root {
+            let (lo, hi) = crate::index_maintenance::fk_key_range(old_parent_val)?;
+            let entries = BTree::range_in(storage, root, Some(&lo), Some(&hi))?;
+            let mut rows = Vec::with_capacity(entries.len());
+            for (child_rid, _) in entries {
+                if !HeapChain::is_slot_visible(
+                    storage,
+                    child_rid.page_id,
+                    child_rid.slot_id,
+                    snap.clone(),
+                )? {
+                    continue;
+                }
+                let row_bytes = axiomdb_storage::heap_chain::HeapChain::read_row(
+                    storage,
+                    child_rid.page_id,
+                    child_rid.slot_id,
+                )?;
+                if let Some(bytes) = row_bytes {
+                    let vals = crate::table::decode_row_from_bytes(&bytes, child_cols)?;
+                    rows.push((child_rid, vals));
+                }
+            }
+            rows
+        } else {
+            find_children_via_scan(
+                storage,
+                child_table_def,
+                child_cols,
+                fk.child_col_idx,
+                old_parent_val,
+                snap.clone(),
+            )?
+        };
+
+        if child_rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut current_indexes = {
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
+            let all = reader.list_indexes(fk.child_table_id)?;
+            all.into_iter()
+                .filter(|i| !i.columns.is_empty())
+                .collect::<Vec<_>>()
+        };
+        let compiled_preds =
+            crate::partial_index::compile_index_predicates(&current_indexes, child_cols)?;
+        let mut update_pairs: Vec<(RecordId, Vec<Value>, RecordId, Vec<Value>)> =
+            Vec::with_capacity(child_rows.len());
+
+        for (child_rid, child_row) in &child_rows {
+            let mut new_child_row = child_row.clone();
+            new_child_row[fk.child_col_idx as usize] = replacement_val.clone();
+
+            let new_rid = TableEngine::update_row(
+                storage,
+                txn,
+                conn_txn,
+                child_table_def,
+                child_cols,
+                *child_rid,
+                new_child_row.clone(),
+            )?;
+            update_pairs.push((*child_rid, child_row.clone(), new_rid, new_child_row));
+        }
+
+        // Maintain secondary indexes on the child table.
+        for (idx_pos, idx) in current_indexes.iter_mut().enumerate() {
+            if idx.columns.is_empty() {
+                continue;
+            }
+
+            let pred = compiled_preds.get(idx_pos).and_then(|p| p.as_ref());
+            let mut delete_keys: Vec<Vec<u8>> = Vec::new();
+            let mut insert_rows: Vec<(RecordId, &Vec<Value>)> = Vec::new();
+
+            for (old_rid, old_values, new_rid, new_values) in &update_pairs {
+                if crate::index_maintenance::update_affects_index(
+                    idx, pred, old_values, *old_rid, new_values, *new_rid,
+                )? {
+                    if let Some(key_vals) =
+                        crate::index_maintenance::index_key_values_if_indexed(
+                            idx, old_values, pred,
+                        )?
+                    {
+                        delete_keys.push(
+                            crate::index_maintenance::encode_index_entry_key(
+                                idx, &key_vals, *old_rid,
+                            )?,
+                        );
+                    }
+                    insert_rows.push((*new_rid, new_values));
+                }
+            }
+
+            if !delete_keys.is_empty() {
+                delete_keys.sort_unstable();
+                if let Some(new_root) =
+                    crate::index_maintenance::delete_many_from_single_index(
+                        idx,
+                        &delete_keys,
+                        storage,
+                        bloom,
+                    )?
+                {
+                    CatalogWriter::new(storage, txn, conn_txn)?
+                        .update_index_root(idx.index_id, new_root)?;
+                }
+            }
+
+            if !insert_rows.is_empty() {
+                let batch_refs: Vec<(&[Value], RecordId)> = insert_rows
+                    .iter()
+                    .map(|(rid, vals)| (vals.as_slice(), *rid))
+                    .collect();
+                if let Some(new_root) =
+                    crate::index_maintenance::insert_many_into_single_index(
+                        idx,
+                        pred,
+                        &batch_refs,
+                        storage,
+                        bloom,
+                        snap.clone(),
+                    )?
+                {
+                    CatalogWriter::new(storage, txn, conn_txn)?
+                        .update_index_root(idx.index_id, new_root)?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
