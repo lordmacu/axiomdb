@@ -363,7 +363,7 @@ fn collect_col_idxs_non_agg(expr: &Expr, out: &mut Vec<usize>) {
                 collect_col_idxs_non_agg(e, out);
             }
         }
-        Expr::Literal(_) | Expr::OuterColumn { .. } | Expr::Param { .. }
+        Expr::Literal(_) | Expr::Default | Expr::OuterColumn { .. } | Expr::Param { .. }
         | Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {}
     }
 }
@@ -420,7 +420,7 @@ fn collect_non_agg_col_idxs_in_expr(expr: &Expr, inside_agg: bool, out: &mut Vec
                 collect_non_agg_col_idxs_in_expr(e, inside_agg, out);
             }
         }
-        Expr::Column { .. } | Expr::Literal(_) | Expr::OuterColumn { .. }
+        Expr::Column { .. } | Expr::Literal(_) | Expr::Default | Expr::OuterColumn { .. }
         | Expr::Param { .. } | Expr::Subquery(_) | Expr::InSubquery { .. }
         | Expr::Exists { .. } => {}
     }

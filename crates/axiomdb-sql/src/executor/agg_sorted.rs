@@ -84,7 +84,8 @@ fn execute_select_grouped_sorted(
                     .map(|acc| acc.finalize())
                     .collect::<Result<_, _>>()?;
                 if let Some(ref having) = stmt.having {
-                    let v = eval_with_aggs(having, &representative_row, &agg_values, &agg_exprs)?;
+                    let resolved_having = resolve_having_aliases(having.clone(), &stmt.columns);
+                    let v = eval_with_aggs(&resolved_having, &representative_row, &agg_values, &agg_exprs)?;
                     if is_truthy(&v) {
                         let out_row = project_grouped_row(
                             &stmt.columns,
