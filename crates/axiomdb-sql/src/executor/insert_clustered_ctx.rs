@@ -80,11 +80,12 @@ fn execute_clustered_insert_ctx(
     match stmt.source {
         InsertSource::Values(rows) => {
             for (row_idx, value_exprs) in rows.into_iter().enumerate() {
-                let provided: Vec<Value> = value_exprs
+                let mut provided: Vec<Value> = value_exprs
                     .iter()
                     .map(|e| eval(e, &[]))
                     .collect::<Result<_, _>>()?;
-                let mut full_values = materialize_insert_row(&col_positions, &provided);
+                resolve_expr_defaults(&col_positions, &value_exprs, &mut provided, schema_cols);
+                let mut full_values = materialize_insert_row(&col_positions, &provided, schema_cols);
                 assign_auto_increment(
                     storage,
                     txn,
@@ -108,7 +109,7 @@ fn execute_clustered_insert_ctx(
             };
 
             for (row_idx, row_values) in select_rows.into_iter().enumerate() {
-                let mut full_values = materialize_insert_row(&col_positions, &row_values);
+                let mut full_values = materialize_insert_row(&col_positions, &row_values, schema_cols);
                 assign_auto_increment(
                     storage,
                     txn,
@@ -279,11 +280,12 @@ fn enqueue_clustered_insert_ctx(
     };
 
     for (row_idx, value_exprs) in rows.into_iter().enumerate() {
-        let provided: Vec<Value> = value_exprs
+        let mut provided: Vec<Value> = value_exprs
             .iter()
             .map(|e| eval(e, &[]))
             .collect::<Result<_, _>>()?;
-        let mut full_values = materialize_insert_row(&col_positions, &provided);
+        resolve_expr_defaults(&col_positions, &value_exprs, &mut provided, schema_cols);
+        let mut full_values = materialize_insert_row(&col_positions, &provided, schema_cols);
         assign_auto_increment(
             storage,
             txn,

@@ -73,6 +73,16 @@ fn execute_create_table(
             inline_fk_specs.push((i as u16, col_def.name.clone(), refs));
         }
 
+        let default_expr = col_def
+            .constraints
+            .iter()
+            .find_map(|c| match c {
+                ColumnConstraint::Default(expr) => {
+                    Some(crate::expr_to_sql::expr_to_sql_string(expr))
+                }
+                _ => None,
+            });
+
         writer.create_column(CatalogColumnDef {
             table_id,
             col_idx: i as u16,
@@ -82,6 +92,7 @@ fn execute_create_table(
             auto_increment,
             type_len,
             is_fixed_len: col_def.is_char,
+            default_expr,
         })?;
     }
 
@@ -689,6 +700,7 @@ fn execute_create_table_like(
             auto_increment: col.auto_increment,
             type_len: col.type_len,
             is_fixed_len: col.is_fixed_len,
+            default_expr: col.default_expr.clone(),
         })?;
     }
 
@@ -837,6 +849,7 @@ fn execute_create_table_as_select(
             auto_increment: false,
             type_len: 0,
             is_fixed_len: false,
+            default_expr: None,
         })?;
     }
 
@@ -854,6 +867,7 @@ fn execute_create_table_as_select(
             auto_increment: false,
             type_len: 0,
             is_fixed_len: false,
+            default_expr: None,
         })
         .collect();
 

@@ -473,3 +473,89 @@ fn test_char_unicode_padding() {
     let rows = db.rows("SELECT code FROM t WHERE id = 1");
     assert_eq!(rows[0][0], Value::Text("café ".into()));
 }
+
+// ── DEFAULT expression persistence tests ────────────────────────────────────
+
+#[test]
+fn test_default_int_on_missing_column() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, status INT DEFAULT 42)");
+    db.ok("INSERT INTO t (id) VALUES (1)");
+    let rows = db.rows("SELECT status FROM t WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Int(42));
+}
+
+#[test]
+fn test_default_text_on_missing_column() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, name TEXT DEFAULT 'unknown')");
+    db.ok("INSERT INTO t (id) VALUES (1)");
+    let rows = db.rows("SELECT name FROM t WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Text("unknown".into()));
+}
+
+#[test]
+fn test_default_negative_value() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, balance INT DEFAULT -1)");
+    db.ok("INSERT INTO t (id) VALUES (1)");
+    let rows = db.rows("SELECT balance FROM t WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Int(-1));
+}
+
+#[test]
+fn test_default_bool() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, active BOOLEAN DEFAULT TRUE)");
+    db.ok("INSERT INTO t (id) VALUES (1)");
+    let rows = db.rows("SELECT active FROM t WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Bool(true));
+}
+
+#[test]
+fn test_default_null_when_no_default() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
+    db.ok("INSERT INTO t (id) VALUES (1)");
+    let rows = db.rows("SELECT name FROM t WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Null);
+}
+
+#[test]
+fn test_default_keyword_in_values() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, status INT DEFAULT 99)");
+    db.ok("INSERT INTO t VALUES (1, DEFAULT)");
+    let rows = db.rows("SELECT status FROM t WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Int(99));
+}
+
+#[test]
+fn test_default_explicit_value_overrides() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, status INT DEFAULT 42)");
+    db.ok("INSERT INTO t VALUES (1, 7)");
+    let rows = db.rows("SELECT status FROM t WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Int(7));
+}
+
+#[test]
+fn test_default_multiple_columns() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, a INT DEFAULT 10, b TEXT DEFAULT 'hi', c BOOLEAN DEFAULT FALSE)");
+    db.ok("INSERT INTO t (id) VALUES (1)");
+    let rows = db.rows("SELECT a, b, c FROM t WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Int(10));
+    assert_eq!(rows[0][1], Value::Text("hi".into()));
+    assert_eq!(rows[0][2], Value::Bool(false));
+}
+
+#[test]
+fn test_default_preserved_on_create_table_like() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE src (id INT PRIMARY KEY, val INT DEFAULT 55)");
+    db.ok("CREATE TABLE dst LIKE src");
+    db.ok("INSERT INTO dst (id) VALUES (1)");
+    let rows = db.rows("SELECT val FROM dst WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Int(55));
+}

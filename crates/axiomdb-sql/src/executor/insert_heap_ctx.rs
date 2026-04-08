@@ -113,10 +113,11 @@ fn execute_insert_ctx(
             let mut full_batch: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
 
             for (row_idx, value_exprs) in rows.into_iter().enumerate() {
-                let provided: Vec<Value> = value_exprs
+                let mut provided: Vec<Value> = value_exprs
                     .iter()
                     .map(|e| eval(e, &[]))
                     .collect::<Result<_, _>>()?;
+                resolve_expr_defaults(&col_positions, &value_exprs, &mut provided, &resolved.columns);
 
                 // MySQL error 1136: column count in VALUES must match the explicit column list.
                 if let Some(expected) = explicit_col_count {
@@ -129,16 +130,7 @@ fn execute_insert_ctx(
                     }
                 }
 
-                let mut full_values: Vec<Value> = col_positions
-                    .iter()
-                    .map(|&idx| {
-                        if idx == usize::MAX {
-                            Value::Null
-                        } else {
-                            provided.get(idx).cloned().unwrap_or(Value::Null)
-                        }
-                    })
-                    .collect();
+                let mut full_values = materialize_insert_row(&col_positions, &provided, &resolved.columns);
 
                 if let Some(ai_col) = auto_inc_col {
                     // MySQL: explicit 0 on AUTO_INCREMENT column is treated same as NULL.
@@ -271,16 +263,7 @@ fn execute_insert_ctx(
                 }
             };
             for (row_idx, row_values) in select_rows.into_iter().enumerate() {
-                let mut full_values: Vec<Value> = col_positions
-                    .iter()
-                    .map(|&idx| {
-                        if idx == usize::MAX {
-                            Value::Null
-                        } else {
-                            row_values.get(idx).cloned().unwrap_or(Value::Null)
-                        }
-                    })
-                    .collect();
+                let mut full_values = materialize_insert_row(&col_positions, &row_values, &resolved.columns);
                 if let Some(ai_col) = auto_inc_col {
                     if matches!(full_values.get(ai_col), Some(Value::Null)) {
                         let id =

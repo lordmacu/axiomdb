@@ -152,6 +152,9 @@ fn test_create_columns_list_ordered_by_col_idx() {
             col_type: ColumnType::Text,
             nullable: true,
             auto_increment: false,
+            type_len: 0,
+            is_fixed_len: false,
+            default_expr: None,
         })
         .unwrap();
         w.create_column(ColumnDef {
@@ -161,6 +164,9 @@ fn test_create_columns_list_ordered_by_col_idx() {
             col_type: ColumnType::BigInt,
             nullable: false,
             auto_increment: false,
+            type_len: 0,
+            is_fixed_len: false,
+            default_expr: None,
         })
         .unwrap();
         w.create_column(ColumnDef {
@@ -170,6 +176,9 @@ fn test_create_columns_list_ordered_by_col_idx() {
             col_type: ColumnType::Text,
             nullable: false,
             auto_increment: false,
+            type_len: 0,
+            is_fixed_len: false,
+            default_expr: None,
         })
         .unwrap();
         tid
@@ -357,6 +366,9 @@ fn test_delete_table_cascades_columns_and_indexes() {
             col_type: ColumnType::Int,
             nullable: false,
             auto_increment: false,
+            type_len: 0,
+            is_fixed_len: false,
+            default_expr: None,
         })
         .unwrap();
         w.create_index(IndexDef {

@@ -75,17 +75,61 @@ fn build_insert_column_positions(
     }
 }
 
-fn materialize_insert_row(col_positions: &[usize], provided: &[Value]) -> Vec<Value> {
+fn materialize_insert_row(
+    col_positions: &[usize],
+    provided: &[Value],
+    schema_cols: &[CatalogColumnDef],
+) -> Vec<Value> {
     col_positions
         .iter()
-        .map(|&idx| {
-            if idx == usize::MAX {
-                Value::Null
+        .enumerate()
+        .map(|(col_idx, &val_idx)| {
+            if val_idx == usize::MAX {
+                // Missing column — use the stored DEFAULT expression if available.
+                eval_default_for_column(schema_cols.get(col_idx))
             } else {
-                provided.get(idx).cloned().unwrap_or(Value::Null)
+                provided.get(val_idx).cloned().unwrap_or(Value::Null)
             }
         })
         .collect()
+}
+
+/// Evaluates the stored DEFAULT expression for a column, returning `Value::Null`
+/// if no default is declared.
+fn eval_default_for_column(col: Option<&CatalogColumnDef>) -> Value {
+    let col = match col {
+        Some(c) => c,
+        None => return Value::Null,
+    };
+    let expr_str = match &col.default_expr {
+        Some(s) => s,
+        None => return Value::Null,
+    };
+    match crate::parser::parse_expr_only(expr_str) {
+        Ok(expr) => eval(&expr, &[]).unwrap_or(Value::Null),
+        Err(_) => Value::Null,
+    }
+}
+
+/// Resolves `Expr::Default` tokens in a row of provided value expressions.
+///
+/// `col_positions[schema_idx] == val_idx` maps schema columns to provided values.
+/// When a provided value was `Expr::Default`, replaces it with the schema
+/// column's stored default expression result.
+pub(crate) fn resolve_expr_defaults(
+    col_positions: &[usize],
+    exprs: &[Expr],
+    provided: &mut [Value],
+    schema_cols: &[CatalogColumnDef],
+) {
+    for (schema_idx, &val_idx) in col_positions.iter().enumerate() {
+        if val_idx == usize::MAX || val_idx >= exprs.len() {
+            continue;
+        }
+        if matches!(&exprs[val_idx], Expr::Default) {
+            provided[val_idx] = eval_default_for_column(schema_cols.get(schema_idx));
+        }
+    }
 }
 
 fn assign_auto_increment(

@@ -298,6 +298,15 @@ fn alter_add_column(
         auto_increment,
         type_len: col_def.type_len,
         is_fixed_len: col_def.is_char,
+        default_expr: col_def
+            .constraints
+            .iter()
+            .find_map(|c| match c {
+                crate::ast::ColumnConstraint::Default(expr) => {
+                    Some(crate::expr_to_sql::expr_to_sql_string(expr))
+                }
+                _ => None,
+            }),
     };
 
     // 1. Add column to catalog.
@@ -515,6 +524,16 @@ fn alter_modify_column(
         auto_increment: old_columns[col_pos].auto_increment,
         type_len: col_def.type_len,
         is_fixed_len: col_def.is_char,
+        default_expr: col_def
+            .constraints
+            .iter()
+            .find_map(|c| match c {
+                crate::ast::ColumnConstraint::Default(expr) => {
+                    Some(crate::expr_to_sql::expr_to_sql_string(expr))
+                }
+                _ => None,
+            })
+            .or_else(|| old_columns[col_pos].default_expr.clone()),
     };
     CatalogWriter::new(storage, txn, conn_txn)?.create_column(new_catalog_col.clone())?;
 

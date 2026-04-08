@@ -704,6 +704,7 @@ mod tests {
             auto_increment: false,
             type_len: 0,
             is_fixed_len: false,
+            default_expr: None,
         }
     }
 
@@ -769,6 +770,7 @@ mod tests {
                 auto_increment: false,
                 type_len: 0,
                 is_fixed_len: false,
+                default_expr: None,
             },
             ColumnDef {
                 table_id: 1,
@@ -779,6 +781,7 @@ mod tests {
                 auto_increment: false,
                 type_len: 0,
                 is_fixed_len: false,
+                default_expr: None,
             },
         ];
 
@@ -831,6 +834,7 @@ mod tests {
                 auto_increment: false,
                 type_len: 0,
                 is_fixed_len: false,
+                default_expr: None,
             },
             ColumnDef {
                 table_id: 1,
@@ -841,6 +845,7 @@ mod tests {
                 auto_increment: false,
                 type_len: 0,
                 is_fixed_len: false,
+                default_expr: None,
             },
         ];
 
