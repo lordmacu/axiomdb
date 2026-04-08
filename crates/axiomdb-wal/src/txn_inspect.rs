@@ -40,12 +40,17 @@ impl TxnManager {
     ///
     /// `snapshot_id = max_committed + 1`. Safe to call at any time.
     pub fn snapshot(&self) -> TransactionSnapshot {
-        let active_ids = {
+        // Read max_committed AND active_set under the same read lock.
+        // PostgreSQL ProcArrayLock (shared) pattern: prevents a window where
+        // a concurrent commit advances max_committed but isn't yet in active_ids,
+        // causing a snapshot to see a txn as both committed and still in-flight.
+        let (mc, active_ids) = {
             let set = self.active_set.read().unwrap();
-            Arc::new(set.clone())
+            let mc = self.max_committed.load(Ordering::Acquire);
+            (mc, Arc::new(set.clone()))
         };
         TransactionSnapshot {
-            snapshot_id: self.max_committed + 1,
+            snapshot_id: mc + 1,
             current_txn_id: 0,
             active_ids,
         }
@@ -57,6 +62,7 @@ impl TxnManager {
     /// - **READ COMMITTED**: returns a fresh snapshot per call.
     pub fn active_snapshot(&self, conn_txn: &ConnectionTxn) -> TransactionSnapshot {
         if conn_txn.isolation_level.uses_frozen_snapshot() {
+            // RR/Serializable: frozen snapshot captured atomically at BEGIN.
             TransactionSnapshot {
                 snapshot_id: conn_txn.snapshot_id_at_begin,
                 current_txn_id: conn_txn.txn_id,
@@ -66,13 +72,15 @@ impl TxnManager {
                     .unwrap_or_else(|| Arc::new(HashSet::new())),
             }
         } else {
-            // READ COMMITTED: fresh snapshot per statement
-            let active_ids = {
+            // READ COMMITTED: fresh snapshot per statement.
+            // Read max_committed + active_set atomically under read lock.
+            let (mc, active_ids) = {
                 let set = self.active_set.read().unwrap();
-                Arc::new(set.clone())
+                let mc = self.max_committed.load(Ordering::Acquire);
+                (mc, Arc::new(set.clone()))
             };
             TransactionSnapshot {
-                snapshot_id: self.max_committed + 1,
+                snapshot_id: mc + 1,
                 current_txn_id: conn_txn.txn_id,
                 active_ids,
             }
@@ -83,7 +91,7 @@ impl TxnManager {
 
     /// TxnId of the last committed transaction. `0` if none has committed yet.
     pub fn max_committed(&self) -> TxnId {
-        self.max_committed
+        self.max_committed.load(Ordering::Acquire)
     }
 
     /// LSN of the last WAL entry written (0 if none).
@@ -116,13 +124,14 @@ impl TxnManager {
     ///
     /// Returns `Err(DbError::NoActiveTransaction)` if no transaction is active.
     pub fn snapshot_for_active(&self) -> Result<TransactionSnapshot, DbError> {
-        let txn_id = self.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
-        let active_ids = {
+        let (txn_id, mc, active_ids) = {
             let set = self.active_set.read().unwrap();
-            Arc::new(set.clone())
+            let txn_id = set.iter().copied().next().ok_or(DbError::NoActiveTransaction)?;
+            let mc = self.max_committed.load(Ordering::Acquire);
+            (txn_id, mc, Arc::new(set.clone()))
         };
         Ok(TransactionSnapshot {
-            snapshot_id: self.max_committed + 1,
+            snapshot_id: mc + 1,
             current_txn_id: txn_id,
             active_ids,
         })
@@ -210,7 +219,7 @@ impl TxnManager {
         let mgr = Self {
             wal,
             next_txn_id: result.max_committed + 1,
-            max_committed: result.max_committed,
+            max_committed: AtomicU64::new(result.max_committed),
             active_set: RwLock::new(HashSet::new()),
             lowest_active_id: AtomicU64::new(0),
             deferred_commit_mode: false,

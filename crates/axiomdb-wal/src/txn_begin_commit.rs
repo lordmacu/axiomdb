@@ -54,27 +54,26 @@ impl TxnManager {
         let mut entry = WalEntry::new(0, txn_id, EntryType::Begin, 0, vec![], vec![], vec![]);
         self.wal.append(&mut entry)?;
 
-        let snapshot_id_at_begin = self.max_committed + 1;
-
-        // Capture the active set BEFORE inserting self — so self is excluded from
-        // the frozen snapshot (own writes are visible via current_txn_id check).
-        let active_ids_at_begin = if isolation_level.uses_frozen_snapshot() {
-            let set = self.active_set.read().unwrap();
-            let snap = set.clone();
-            Some(Arc::new(snap))
-        } else {
-            None
-        };
-
-        // Register in active_set.
-        {
+        // Atomically: read max_committed, capture active set (BEFORE inserting self),
+        // then insert self. Single write lock covers all three operations.
+        // PostgreSQL ProcArrayLock + DuckDB transaction_lock pattern.
+        let (snapshot_id_at_begin, active_ids_at_begin) = {
             let mut set = self.active_set.write().unwrap();
+            let mc = self.max_committed.load(Ordering::Acquire);
+            // Capture set BEFORE inserting self — own writes visible via current_txn_id,
+            // not via active_ids. Self must be excluded from the frozen snapshot.
+            let active_ids = if isolation_level.uses_frozen_snapshot() {
+                Some(Arc::new(set.clone()))
+            } else {
+                None
+            };
             set.insert(txn_id);
             let prev = self.lowest_active_id.load(Ordering::Relaxed);
             if prev == 0 || txn_id < prev {
                 self.lowest_active_id.store(txn_id, Ordering::Relaxed);
             }
-        }
+            (mc + 1, active_ids)
+        };
 
         Ok(ConnectionTxn {
             txn_id,
@@ -104,37 +103,44 @@ impl TxnManager {
         self.wal
             .append_with_buf(&mut entry, &mut conn_txn.wal_scratch)?;
 
-        if conn_txn.undo_ops.is_empty() {
+        // Determine if max_committed should advance now or later (deferred pipeline).
+        // I/O (flush/fsync) happens BEFORE acquiring the lock to minimize lock hold time.
+        let advance_now = if conn_txn.undo_ops.is_empty() {
             // Read-only transaction: flush to OS page cache only (no fsync).
             self.wal.flush_no_sync()?;
-            self.max_committed = txn_id;
+            true
         } else {
             match self.durability_policy {
                 WalDurabilityPolicy::Strict => {
                     if conn_txn.deferred_commit_mode {
-                        // Pipeline mode: Commit entry is buffered but not fsynced.
-                        // max_committed advances only after the pipeline confirms fsync.
+                        // Pipeline mode: Commit entry buffered but not fsynced yet.
+                        // max_committed advances only after the pipeline confirms fsync
+                        // via advance_committed() / advance_committed_single().
                         conn_txn.pending_deferred_txn_id = Some(txn_id);
                         // Mirror on TxnManager so callers can retrieve after conn_txn is consumed.
                         self.pending_deferred_txn_id = Some(txn_id);
+                        false
                     } else {
                         self.wal.commit_data_sync()?;
-                        self.max_committed = txn_id;
+                        true
                     }
                 }
                 WalDurabilityPolicy::Normal => {
                     self.wal.flush_no_sync()?;
-                    self.max_committed = txn_id;
+                    true
                 }
-                WalDurabilityPolicy::Off => {
-                    self.max_committed = txn_id;
-                }
+                WalDurabilityPolicy::Off => true,
             }
-        }
+        };
 
-        // Remove from active_set and update lowest_active_id.
+        // ATOMICALLY: advance max_committed (if non-deferred) AND remove from active_set.
+        // DuckDB transaction_lock + PostgreSQL ProcArrayLock pattern:
+        // no snapshot can observe a txn as both committed and still in-flight.
         {
             let mut set = self.active_set.write().unwrap();
+            if advance_now {
+                self.max_committed.store(txn_id, Ordering::Release);
+            }
             set.remove(&txn_id);
             let new_lowest = set.iter().copied().min().unwrap_or(0);
             self.lowest_active_id.store(new_lowest, Ordering::Relaxed);
@@ -186,9 +192,10 @@ impl TxnManager {
     /// practice batches are always monotone under the single-writer constraint).
     pub fn advance_committed(&mut self, txn_ids: &[TxnId]) {
         if let Some(&max) = txn_ids.iter().max() {
-            if max > self.max_committed {
-                self.max_committed = max;
-            }
+            // fetch_max: only advances, never regresses. Ordering::Release so
+            // subsequent Acquire loads see committed rows. active_set was already
+            // updated in commit() — no lock needed here.
+            self.max_committed.fetch_max(max, Ordering::Release);
         }
     }
 
@@ -196,9 +203,7 @@ impl TxnManager {
     /// value. Used by the fsync pipeline leader to make a single transaction
     /// visible after confirming WAL durability.
     pub fn advance_committed_single(&mut self, txn_id: TxnId) {
-        if txn_id > self.max_committed {
-            self.max_committed = txn_id;
-        }
+        self.max_committed.fetch_max(txn_id, Ordering::Release);
     }
 
     /// Returns the WAL writer's current LSN (the last assigned LSN).

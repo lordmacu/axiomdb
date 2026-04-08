@@ -9,7 +9,7 @@ impl TxnManager {
         Ok(Self {
             wal,
             next_txn_id: 1,
-            max_committed: 0,
+            max_committed: AtomicU64::new(0),
             active_set: RwLock::new(HashSet::new()),
             lowest_active_id: AtomicU64::new(0),
             deferred_commit_mode: false,
@@ -32,7 +32,7 @@ impl TxnManager {
         Ok(Self {
             wal,
             next_txn_id: max_committed + 1,
-            max_committed,
+            max_committed: AtomicU64::new(max_committed),
             active_set: RwLock::new(HashSet::new()),
             lowest_active_id: AtomicU64::new(0),
             deferred_commit_mode: false,
