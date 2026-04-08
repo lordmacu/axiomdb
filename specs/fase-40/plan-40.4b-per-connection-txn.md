@@ -1,562 +1,412 @@
 # Plan: 40.4b — Per-Connection Transaction State
 
-## Files to create / modify
+> **Estado al 2026-04-07**: ~65% ya implementado en commits anteriores.
+> Este plan cubre únicamente el trabajo **restante**.
 
-| File | Change |
+## Trabajo ya completado (no repetir)
+
+| Criterio | Estado |
 |---|---|
-| `crates/axiomdb-core/src/traits.rs` | Add `active_ids: Arc<HashSet<TxnId>>` to `TransactionSnapshot` |
-| `crates/axiomdb-storage/src/heap.rs` | Update `RowHeader::is_visible()` for `active_ids` |
-| `crates/axiomdb-storage/src/clustered_tree.rs` | Update `active_snapshot()` helper in tests |
-| `crates/axiomdb-wal/src/txn.rs` | Major refactor: extract ConnectionTxn, refactor TxnManager |
-| `crates/axiomdb-wal/src/lib.rs` | Re-export `ConnectionTxn`, `ExecutionContext` |
-| `crates/axiomdb-sql/src/executor/mod.rs` | Executor signature sweep |
-| `crates/axiomdb-sql/src/executor/insert.rs` | Signature sweep |
-| `crates/axiomdb-sql/src/executor/update.rs` | Signature sweep |
-| `crates/axiomdb-sql/src/executor/delete.rs` | Signature sweep |
-| `crates/axiomdb-sql/src/executor/ddl.rs` | Signature sweep |
-| `crates/axiomdb-sql/src/executor/bulk_empty.rs` | Signature sweep |
-| `crates/axiomdb-sql/src/executor/staging.rs` | Signature sweep |
-| `crates/axiomdb-sql/src/executor/shared.rs` | Signature sweep |
-| `crates/axiomdb-sql/src/executor/select.rs` | Snapshot usage update |
-| `crates/axiomdb-sql/src/executor/aggregate.rs` | Snapshot usage update |
-| `crates/axiomdb-sql/src/table.rs` | Signature sweep |
-| `crates/axiomdb-sql/src/vacuum.rs` | Signature sweep |
-| `crates/axiomdb-sql/src/fk_enforcement.rs` | Signature sweep |
-| `crates/axiomdb-sql/src/index_integrity.rs` | Signature sweep |
-| `crates/axiomdb-sql/src/index_maintenance.rs` | Signature sweep |
-| `crates/axiomdb-sql/src/lib.rs` | Update `execute_with_ctx` signature |
-| `crates/axiomdb-catalog/src/writer.rs` | TxnManager → ConnectionTxn |
-| `crates/axiomdb-catalog/src/reader.rs` | Snapshot update |
-| `crates/axiomdb-network/src/mysql/database.rs` | Build ExecutionContext, store conn_txn |
-| `crates/axiomdb-network/src/mysql/handler.rs` | Per-connection `Option<ConnectionTxn>` |
-| `crates/axiomdb-embedded/src/lib.rs` | `Db` gains `conn_txn: Option<ConnectionTxn>` |
+| `ActiveTxn` struct removida | ✅ |
+| `ConnectionTxn` público en `axiomdb-wal` | ✅ |
+| `TxnManager.active_set: RwLock<HashSet<TxnId>>` | ✅ |
+| `TxnManager.lowest_active_id: AtomicU64` | ✅ |
+| `begin()` retorna `ConnectionTxn` | ✅ |
+| `commit(conn_txn)` toma ownership | ✅ |
+| `rollback(conn_txn, storage)` toma ownership | ✅ |
+| `active_snapshot(conn_txn)` RR/RC correcto | ✅ |
+| `TransactionSnapshot.active_ids: Arc<HashSet<TxnId>>` | ✅ |
+| `autocommit()` wrapper | ✅ |
+| WAL rotation y crash recovery | ✅ |
+| Todos los `record_*` toman `conn_txn: &mut ConnectionTxn` | ✅ |
 
-## Algorithm / Data structures
+## Trabajo restante
 
-### Step 1: TransactionSnapshot update
+| Criterio | Estado |
+|---|---|
+| `TxnManager.max_committed: AtomicU64` | ❌ sigue u64 |
+| Atomicidad: advance + remove bajo mismo write lock | ❌ separados |
+| Atomicidad: snapshot lee max_committed + active_set bajo mismo read lock | ❌ separados |
+| `ExecutionContext<'a>` struct | ❌ no existe |
+| Signature sweep ~106 firmas (`txn: &*TxnManager`) en axiomdb-sql | ❌ |
+| `conn_txn` removido de `SessionContext` | ❌ sigue en `ctx.conn_txn` |
+| `axiomdb-network` database.rs usa `ExecutionContext` | ❌ |
+| `axiomdb-embedded` usa `ExecutionContext` | ❌ |
+| Wire protocol smoke test | ❌ |
 
-```rust
-// axiomdb-core/src/traits.rs — BEFORE
-pub struct TransactionSnapshot {
-    pub snapshot_id: TxnId,
-    pub current_txn_id: TxnId,
-}
+---
 
-// AFTER
-use std::collections::HashSet;
-use std::sync::Arc;
+## Archivos a modificar
 
-pub struct TransactionSnapshot {
-    pub snapshot_id: TxnId,
-    pub current_txn_id: TxnId,
-    /// Txn IDs that were in-flight when this snapshot was taken.
-    /// A row created by any of these is NOT visible (uncommitted).
-    /// Empty for plain committed() snapshots (backward compatible).
-    pub active_ids: Arc<HashSet<TxnId>>,
-}
+### Commit 1 — Atomicidad (solo axiomdb-wal)
 
-impl TransactionSnapshot {
-    pub fn committed(max_committed: TxnId) -> Self {
-        Self {
-            snapshot_id: max_committed.saturating_add(1),
-            current_txn_id: 0,
-            active_ids: Arc::new(HashSet::new()),
-        }
-    }
-    pub fn active(txn_id: TxnId, max_committed_at_start: TxnId) -> Self {
-        Self {
-            snapshot_id: max_committed_at_start.saturating_add(1),
-            current_txn_id: txn_id,
-            active_ids: Arc::new(HashSet::new()),  // populated by TxnManager in 40.4b
-        }
-    }
-}
-```
+| Archivo | Cambio |
+|---|---|
+| `crates/axiomdb-wal/src/txn.rs` | `max_committed: u64` → `AtomicU64` |
+| `crates/axiomdb-wal/src/txn_begin_commit.rs` | advance + remove bajo mismo write lock; snapshot bajo read lock |
+| `crates/axiomdb-wal/src/txn_inspect.rs` | `snapshot()` y `active_snapshot()` leen `max_committed` dentro del lock |
+| `crates/axiomdb-wal/src/txn_construction.rs` | `open()` usa `AtomicU64::new(...)` |
 
-### Step 2: RowHeader::is_visible() update
+### Commit 2 — ExecutionContext + signature sweep
 
-```rust
-// axiomdb-storage/src/heap.rs
-pub fn is_visible(&self, snap: &TransactionSnapshot) -> bool {
-    // Row was created by current txn (read-your-own-writes)
-    let created_by_self = snap.current_txn_id != 0
-        && self.txn_id_created == snap.current_txn_id;
+| Archivo | Cambio |
+|---|---|
+| `crates/axiomdb-sql/src/exec_ctx.rs` | **CREAR** — `ExecutionContext<'a>` struct |
+| `crates/axiomdb-sql/src/lib.rs` | re-export `ExecutionContext` |
+| `crates/axiomdb-sql/src/session.rs` | remover `conn_txn: Option<ConnectionTxn>` de `SessionContext` |
+| `crates/axiomdb-sql/src/executor/exec_with_ctx.rs` | firma → `(stmt, exec_ctx, conn_txn, ctx)` |
+| `crates/axiomdb-sql/src/executor/exec_entry.rs` | actualizar entry points |
+| `crates/axiomdb-sql/src/executor/exec_dispatch.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/insert_heap.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/insert_heap_ctx.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/insert_clustered.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/insert_clustered_ctx.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/insert_helpers.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/delete.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/update_ctx.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/update_entry.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/update_clustered.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/update_clustered_helpers.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/update_candidates.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/ddl_create_table.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/ddl_create_index.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/ddl_drop_table.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/ddl_drop_index.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/ddl_alter_column.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/ddl_alter_constraint.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/ddl_alter_rebuild.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/ddl_show.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/ddl_analyze.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/select_core.rs` | `txn: &TxnManager` → `exec_ctx` |
+| `crates/axiomdb-sql/src/executor/select_ctx.rs` | `txn: &TxnManager` → `exec_ctx` |
+| `crates/axiomdb-sql/src/executor/select_helpers.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/select_joins_ctx.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/shared.rs` | `conn_txn` viene de parámetro, no de `ctx` |
+| `crates/axiomdb-sql/src/executor/staging.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/bulk_empty.rs` | signature sweep |
+| `crates/axiomdb-sql/src/executor/agg_*.rs` | snapshot reads usan `exec_ctx.coord` |
+| `crates/axiomdb-sql/src/executor/exec_subquery.rs` | `txn: &TxnManager` → `exec_ctx` |
+| `crates/axiomdb-sql/src/executor/exec_explain.rs` | signature sweep |
+| `crates/axiomdb-network/src/mysql/database.rs` | construir `ExecutionContext`, pasar `conn_txn` por separado |
+| `crates/axiomdb-embedded/src/lib.rs` | `conn_txn` ya no en `session.conn_txn` |
 
-    // Row was committed before this snapshot AND not in-flight at snapshot time
-    let created_committed = self.txn_id_created < snap.snapshot_id
-        && !snap.active_ids.contains(&self.txn_id_created);
+---
 
-    let created_visible = created_by_self || created_committed;
-    if !created_visible {
-        return false;
-    }
+## Algoritmos
 
-    // Row not deleted
-    if self.txn_id_deleted == 0 {
-        return true;
-    }
-    // Deleted by current txn (we deleted it, not visible to us)
-    if snap.current_txn_id != 0 && self.txn_id_deleted == snap.current_txn_id {
-        return false;
-    }
-    // Deletion not visible: deleted after snapshot OR deleter still in-flight
-    self.txn_id_deleted >= snap.snapshot_id
-        || snap.active_ids.contains(&self.txn_id_deleted)
-}
-```
+### Commit 1: AtomicU64 + atomicidad DuckDB/PostgreSQL
 
-**Compatibility**: `TransactionSnapshot::committed(n)` has empty `active_ids` →
-`active_ids.contains()` always false → existing behavior preserved for all unit tests
-that use `committed()` directly.
+**Insight de research**: DuckDB usa `atomic<transaction_t> last_commit` escrito DENTRO del
+`transaction_lock` mutex. PostgreSQL usa `ProcArrayLock` (exclusive) cubriendo tanto el
+advance de `latestCompletedXid` como la remoción del active set.
 
-### Step 3: ConnectionTxn struct
+Para AxiomDB: `max_committed: AtomicU64` escrito dentro de `active_set.write()`.
+Esto permite:
+- `snapshot()` lea ambos sin lock para "best-effort" (métricas)
+- `snapshot()` lea ambos DENTRO de `active_set.read()` para garantía estricta (MVCC)
 
 ```rust
-// axiomdb-wal/src/txn.rs — new public struct (replaces private ActiveTxn)
-pub struct ConnectionTxn {
-    pub txn_id: TxnId,
-    pub snapshot_id_at_begin: u64,
-    pub isolation_level: IsolationLevel,
-    pub undo_ops: Vec<UndoOp>,
-    pub deferred_free_pages: Vec<u64>,
-    pub savepoints: Vec<Savepoint>,
-    pub clustered_roots: HashMap<u32, u64>,
-    /// Frozen active-txn set at BEGIN (for RR/Serializable isolation).
-    /// None for READ COMMITTED (fresh snapshot per statement).
-    pub(crate) active_ids_at_begin: Option<Arc<HashSet<TxnId>>>,
-    /// Reusable WAL scratch buffer (per-connection, zero contention).
-    pub(crate) wal_scratch: Vec<u8>,
-    /// Copied from TxnManager at BEGIN time (server-wide config).
-    pub(crate) deferred_commit_mode: bool,
-    /// Set by commit() in deferred mode. Taken by take_pending_deferred_commit().
-    pub(crate) pending_deferred_txn_id: Option<TxnId>,
+// TxnManager — struct change
+max_committed: AtomicU64,  // era: max_committed: u64
+
+// TxnManager::commit() — advance + remove ATÓMICAMENTE bajo write lock
+{
+    let mut set = self.active_set.write().unwrap();
+    // DuckDB pattern: advance under lock
+    self.max_committed.store(txn_id, Ordering::Release);
+    set.remove(&txn_id);
+    let new_lowest = set.iter().copied().min().unwrap_or(0);
+    self.lowest_active_id.store(new_lowest, Ordering::Relaxed);
 }
+// ← fuera del lock: handle deferred_free_pages, last_clustered_roots
 
-impl ConnectionTxn {
-    pub fn txn_id(&self) -> TxnId { self.txn_id }
-
-    pub fn take_pending_deferred_commit(&mut self) -> Option<TxnId> {
-        self.pending_deferred_txn_id.take()
-    }
-}
-```
-
-### Step 4: ExecutionContext struct
-
-```rust
-// axiomdb-wal/src/txn.rs (or a new exec_ctx.rs)
-pub struct ExecutionContext<'a> {
-    pub storage: &'a dyn StorageEngine,
-    pub coord:   &'a TxnManager,
-    pub wal:     &'a ConcurrentWalWriter,
-    pub bloom:   &'a BloomRegistry,
-}
-```
-
-> **Note**: `ExecutionContext` imports `BloomRegistry` from `axiomdb-sql`. To avoid
-> a crate dependency cycle (`axiomdb-wal` → `axiomdb-sql`), `ExecutionContext` must
-> live in `axiomdb-sql`, not `axiomdb-wal`. Define it in `axiomdb-sql/src/exec_ctx.rs`
-> and import `TxnManager` + `ConcurrentWalWriter` from `axiomdb-wal`.
-
-### Step 5: TxnManager changes
-
-```rust
-pub struct TxnManager {
-    wal: ConcurrentWalWriter,
-    next_txn_id: u64,                                // stays u64 (under &mut self)
-    max_committed: AtomicU64,                        // was u64
-    // active: Option<ActiveTxn>,                   // REMOVED
-    active_set: RwLock<HashSet<TxnId>>,              // NEW — PostgreSQL ProcArray
-    lowest_active_id: AtomicU64,                     // NEW — DuckDB GC horizon
-    committed_free_batches: Vec<(TxnId, Vec<u64>)>,
-    durability_policy: WalDurabilityPolicy,
-    deferred_commit_mode: bool,                      // server-wide config; copied to ConnTxn
-    last_clustered_roots: HashMap<u32, u64>,
-}
-```
-
-**Key method signatures after refactoring:**
-
-```rust
-// begin — returns ConnectionTxn (not stored in self)
-pub fn begin_with_isolation(&mut self, iso: IsolationLevel) -> Result<ConnectionTxn, DbError> {
-    let txn_id = self.next_txn_id;
-    self.next_txn_id += 1;
-    // overflow check...
-
-    // Write WAL BEGIN (no scratch buffer needed — begin() uses wal.append() directly)
-    let mut entry = WalEntry::new(0, txn_id, EntryType::Begin, ...);
-    self.wal.append(&mut entry)?;
-
-    // Snapshot: read max_committed + active_set atomically
-    let (snapshot_id_at_begin, active_ids_at_begin) = {
-        let set = self.active_set.read().unwrap();
-        let mc = self.max_committed.load(Ordering::Acquire);
-        // Add self to active_set before releasing lock
-        // Wait: we need WRITE lock for this. Use write lock from the start.
-    };
-    // Revised: use write lock once for both registration and snapshot capture
-    let (snapshot_id_at_begin, active_ids_at_begin) = {
-        let mut set = self.active_set.write().unwrap();
-        set.insert(txn_id);
-        // Update lowest_active_id
-        let prev = self.lowest_active_id.load(Ordering::Relaxed);
-        if prev == 0 || txn_id < prev {
-            self.lowest_active_id.store(txn_id, Ordering::Relaxed);
-        }
-        let mc = self.max_committed.load(Ordering::Acquire);
-        let active_ids = if iso.uses_frozen_snapshot() {
-            Some(Arc::new(set.clone()))  // freeze set AFTER adding self (correct: self won't see own rows via active_ids)
-            // Actually: self should NOT be in active_ids_at_begin for the frozen snapshot
-            // because the snapshot is for reads of OTHER txns' data, not own data.
-            // Self's own writes are handled by current_txn_id check.
-            // So: capture set BEFORE inserting self.
-        } else {
-            None
-        };
-        (mc + 1, active_ids)
-    };
-    // For RR: capture active_set BEFORE adding self to it
-    // Revised: insert first, then build snapshot EXCLUDING self
-    ...
-
-    Ok(ConnectionTxn {
-        txn_id,
-        snapshot_id_at_begin,
-        isolation_level: iso,
-        undo_ops: Vec::new(),
-        deferred_free_pages: Vec::new(),
-        savepoints: Vec::new(),
-        clustered_roots: self.last_clustered_roots.clone(),
-        active_ids_at_begin,
-        wal_scratch: Vec::with_capacity(256),
-        deferred_commit_mode: self.deferred_commit_mode,
-        pending_deferred_txn_id: None,
-    })
-}
-
-// commit — takes ConnectionTxn by value (dropped after commit)
-pub fn commit(&mut self, mut conn_txn: ConnectionTxn) -> Result<(), DbError> {
-    let txn_id = conn_txn.txn_id;
-
-    // WAL COMMIT entry (uses conn_txn.wal_scratch)
-    let mut entry = WalEntry::new(0, txn_id, EntryType::Commit, ...);
-    self.wal.append_with_buf(&mut entry, &mut conn_txn.wal_scratch)?;
-
-    // Read-only check (no undo_ops → no fsync needed)
-    let is_read_only = conn_txn.undo_ops.is_empty();
-    if is_read_only {
-        self.wal.flush_no_sync()?;
-    } else {
-        match self.durability_policy { ... }
-    }
-
-    // ATOMICALLY: advance max_committed + remove from active_set
-    {
-        let mut set = self.active_set.write().unwrap();
-        self.max_committed.store(txn_id, Ordering::Release);
-        set.remove(&txn_id);
-        let new_lowest = set.iter().copied().min().unwrap_or(0);
-        self.lowest_active_id.store(new_lowest, Ordering::Relaxed);
-    }
-
-    self.last_clustered_roots = conn_txn.clustered_roots;
-    if !conn_txn.deferred_free_pages.is_empty() {
-        self.committed_free_batches.push((txn_id, conn_txn.deferred_free_pages));
-    }
-    Ok(())
-    // conn_txn dropped here
-}
-
-// rollback — takes ConnectionTxn by value
-pub fn rollback(&mut self, mut conn_txn: ConnectionTxn,
-                storage: &dyn StorageEngine) -> Result<(), DbError> {
-    // Apply undo_ops in reverse (same logic as before, but reading conn_txn.undo_ops)
-    for op in conn_txn.undo_ops.drain(..).rev() { ... }
-
-    // Remove from active_set (no max_committed advance on rollback)
-    {
-        let mut set = self.active_set.write().unwrap();
-        set.remove(&conn_txn.txn_id);
-        let new_lowest = set.iter().copied().min().unwrap_or(0);
-        self.lowest_active_id.store(new_lowest, Ordering::Relaxed);
-    }
-    // conn_txn dropped; last_clustered_roots NOT updated (rollback = no state change)
-    Ok(())
-}
-
-// snapshot — &self (AtomicU64 + RwLock read)
+// TxnManager::snapshot() — lee ambos bajo read lock (PostgreSQL ProcArrayLock pattern)
 pub fn snapshot(&self) -> TransactionSnapshot {
     let set = self.active_set.read().unwrap();
-    let mc = self.max_committed.load(Ordering::Acquire);
+    let mc = self.max_committed.load(Ordering::Acquire); // dentro del lock
+    let active_ids = Arc::new(set.clone());
     TransactionSnapshot {
         snapshot_id: mc + 1,
         current_txn_id: 0,
-        active_ids: Arc::new(set.clone()),
+        active_ids,
     }
 }
 
-// active_snapshot — &self + &ConnectionTxn (no longer fallible)
+// TxnManager::active_snapshot() — igual, lee mc dentro del lock para RC
 pub fn active_snapshot(&self, conn_txn: &ConnectionTxn) -> TransactionSnapshot {
     if conn_txn.isolation_level.uses_frozen_snapshot() {
-        TransactionSnapshot {
-            snapshot_id: conn_txn.snapshot_id_at_begin,
-            current_txn_id: conn_txn.txn_id,
-            active_ids: conn_txn.active_ids_at_begin.clone()
-                .unwrap_or_else(|| Arc::new(HashSet::new())),
-        }
+        // RR/Serializable: snapshot congelado en BEGIN (ya correcto, no cambia)
+        TransactionSnapshot { ... }
     } else {
-        // READ COMMITTED: fresh snapshot
+        // READ COMMITTED: snapshot fresco — lee mc dentro del lock
         let set = self.active_set.read().unwrap();
         let mc = self.max_committed.load(Ordering::Acquire);
+        let active_ids = Arc::new(set.clone());
         TransactionSnapshot {
             snapshot_id: mc + 1,
             current_txn_id: conn_txn.txn_id,
-            active_ids: Arc::new(set.clone()),
+            active_ids,
         }
     }
 }
+```
 
-// record_insert — &self (only needs self.wal) + conn_txn: &mut ConnectionTxn
-pub fn record_insert(&self, conn_txn: &mut ConnectionTxn,
-                     table_id: u32, key: &[u8], value: &[u8],
-                     page_id: u64, slot_id: u16) -> Result<(), DbError> {
-    let txn_id = conn_txn.txn_id;
-    // encode physical loc...
-    let mut entry = WalEntry::new(0, txn_id, EntryType::Insert, table_id, ...);
-    self.wal.append_with_buf(&mut entry, &mut conn_txn.wal_scratch)?;
-    conn_txn.undo_ops.push(UndoOp::UndoInsert { page_id, slot_id });
-    Ok(())
+**Sitios a actualizar** tras `AtomicU64`:
+- `self.max_committed = x` → `self.max_committed.store(x, Ordering::Release)` (~8 sitios)
+- `self.max_committed + 1` → `self.max_committed.load(Ordering::Acquire) + 1` (~5 sitios)
+- `result.max_committed` en recovery → `AtomicU64::new(result.max_committed)` (1 sitio)
+
+**Nota**: `advance_committed()` y `advance_committed_single()` también mueven max_committed
+bajo la lógica del pipeline fsync — deben adquirir `active_set.write()` o simplemente usar
+`fetch_max()` en `AtomicU64` con `Ordering::Release` (correcto porque el pipeline no necesita
+modificar `active_set` en ese momento — la remoción ya ocurrió en el commit original).
+
+```rust
+// advance_committed_single — solo actualiza max_committed sin tocar active_set
+// (el txn ya fue removido del active_set en commit())
+pub fn advance_committed_single(&mut self, txn_id: TxnId) {
+    // fetch_max es más seguro que store para evitar regresión
+    self.max_committed.fetch_max(txn_id, Ordering::Release);
 }
-// Same pattern for all 13 other record_* methods.
-
-// autocommit — &mut self + closure taking (&Self, &mut ConnectionTxn)
-pub fn autocommit<F, T>(&mut self, storage: &dyn StorageEngine, f: F) -> Result<T, DbError>
-where
-    F: FnOnce(&Self, &mut ConnectionTxn) -> Result<T, DbError>,
-{
-    let mut conn = self.begin()?;
-    match f(self, &mut conn) {
-        Ok(v) => { self.commit(conn)?; Ok(v) }
-        Err(e) => { let _ = self.rollback(conn, storage); Err(e) }
+pub fn advance_committed(&mut self, txn_ids: &[TxnId]) {
+    if let Some(&max) = txn_ids.iter().max() {
+        self.max_committed.fetch_max(max, Ordering::Release);
     }
 }
 ```
 
-### Step 6: BEGIN — active_ids_at_begin capture ordering
+### Commit 2: ExecutionContext + signature sweep
 
-Critical ordering in `begin()` for the frozen RR snapshot:
-```
-1. Acquire active_set WRITE lock
-2. Capture mc = max_committed.load(Acquire)
-3. Capture active_ids_copy = active_set.clone()   ← BEFORE inserting self
-4. Insert txn_id into active_set
-5. Update lowest_active_id
-6. Release write lock
-7. active_ids_at_begin = Some(Arc::new(active_ids_copy))  ← excludes self (correct)
-```
+**Insight de research**: DataFusion usa `Arc<TaskContext>` — contexto inmutable por query,
+contiene refs read-only a runtime/catalogo/funciones. Para AxiomDB, `'a` lifetime es
+suficiente (no se necesita `Arc` bajo single-writer con `&mut Database` lock).
 
-Self must NOT be in `active_ids_at_begin` — own writes are visible via `current_txn_id`,
-not via the `active_ids` check. If self were in the set, own inserts would be invisible.
+**Ubicación**: `axiomdb-sql/src/exec_ctx.rs`
+(no en `axiomdb-wal` — `BloomRegistry` vive en `axiomdb-sql` y no puede depender de `axiomdb-wal`)
 
-### Step 7: Executor signature pattern
-
-All executor functions follow this uniform pattern:
 ```rust
-// BEFORE
-fn execute_xxx_ctx(
-    stmt: XxxStmt,
-    storage: &dyn StorageEngine,
+// crates/axiomdb-sql/src/exec_ctx.rs
+use axiomdb_storage::StorageEngine;
+use axiomdb_wal::TxnManager;
+use crate::bloom::BloomRegistry;
+
+/// Bundles shared read-only references for executor functions.
+///
+/// Inspired by DataFusion's `TaskContext` and DuckDB's `ClientContext`:
+/// immutable during query execution, zero-overhead (lifetime refs, no Arc).
+///
+/// In Phase 40.11 `coord` will be renamed to `TxnCoordinator`. Adding
+/// `LockManager` in 40.11 only requires one new field here — no further
+/// signature sweeps.
+pub struct ExecutionContext<'a> {
+    pub storage: &'a dyn StorageEngine,
+    pub coord:   &'a TxnManager,
+    pub bloom:   &'a BloomRegistry,
+}
+
+impl<'a> ExecutionContext<'a> {
+    pub fn new(
+        storage: &'a dyn StorageEngine,
+        coord: &'a TxnManager,
+        bloom: &'a BloomRegistry,
+    ) -> Self {
+        Self { storage, coord, bloom }
+    }
+}
+```
+
+**Nota**: `wal` no se incluye en `ExecutionContext` porque las funciones del executor
+no escriben al WAL directamente — eso va por `coord.record_*()` que accede al WAL
+internamente. Solo `database.rs` y `Db::execute()` acceden al WAL para el pipeline
+de fsync.
+
+**SessionContext — remover conn_txn**:
+
+```rust
+// session.rs — ANTES
+pub struct SessionContext {
+    // ...
+    pub conn_txn: Option<ConnectionTxn>,
+    // ...
+}
+
+// session.rs — DESPUÉS
+pub struct SessionContext {
+    // ...
+    // conn_txn removido — pasa como parámetro explícito
+    // ...
+    pub in_explicit_txn: bool,  // flag que indica si hay txn activa (para autocommit logic)
+}
+```
+
+`in_explicit_txn` reemplaza al check `ctx.conn_txn.is_some()` en los lugares que solo
+necesitan saber si hay una transacción activa (no el estado de la misma).
+
+**Firma canónica del executor** después del sweep:
+
+```rust
+// ANTES
+pub fn execute_with_ctx(
+    stmt: Stmt,
+    storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
-    bloom: &BloomRegistry,
+    bloom: &mut BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError>
 
-// AFTER
-fn execute_xxx_ctx(
-    stmt: XxxStmt,
-    exec_ctx: &ExecutionContext,     // storage, coord, wal, bloom
+// DESPUÉS
+pub fn execute_with_ctx(
+    stmt: Stmt,
+    exec_ctx: &ExecutionContext,
     conn_txn: &mut ConnectionTxn,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError>
 ```
 
-Inside the body, replace:
-- `storage` → `exec_ctx.storage`
-- `bloom` → `exec_ctx.bloom`
-- `txn.record_insert(...)` → `exec_ctx.coord.record_insert(conn_txn, ...)`
-- `txn.active_snapshot()` → `exec_ctx.coord.active_snapshot(conn_txn)`
-- `txn.snapshot()` → `exec_ctx.coord.snapshot()`
-- `txn.begin_txn_id()` or `txn.active_txn_id()` → `conn_txn.txn_id()`
-- `txn.clustered_root(id)` → `exec_ctx.coord.clustered_root(Some(conn_txn), id)`
+**Nota sobre mutabilidad**: `exec_ctx` es `&ExecutionContext` (inmutable) porque
+`storage` en `ExecutionContext` ya es `&dyn StorageEngine` (interior mutability vía
+`PageLockTable` implementado en 40.3). `TxnManager` sigue necesitando `&mut` para
+`begin/commit/rollback` — estos se llaman FUERA del executor (en `execute_with_ctx`
+wrapper) antes de pasar `conn_txn` adentro.
 
-### Step 8: Database::execute_query (network layer) new flow
+**Patrón para el entry point en database.rs**:
 
 ```rust
-// database.rs — build ExecutionContext and thread conn_txn
-fn execute_query(
-    &mut self,
-    sql: &str,
-    handler_state: &mut HandlerState,
-    ctx: &mut SessionContext,
-) -> Result<QueryResult, DbError> {
-    let exec_ctx = ExecutionContext {
-        storage: &self.storage,
-        coord: &self.txn,
-        wal: self.txn.wal(),
-        bloom: &self.bloom,
-    };
+// database.rs — DESPUÉS
+let mut conn_txn = if session.in_explicit_txn {
+    // El conn_txn se pasa desde HandlerState (futuro) o se recupera
+    // Por ahora: no cambia en network porque Database.execute_query toma &mut self
+    // Ruta de transición: conn_txn vive en session hasta 40.10
+    // DEFER: mover conn_txn de session.conn_txn a HandlerState es 40.10
+    // En 40.4b: solo removerlo de SessionContext en la capa SQL interna
+};
 
-    // Autocommit path: create/destroy ConnectionTxn inline
-    if is_autocommit(sql, handler_state) {
-        let mut conn_txn = self.txn.begin()?;
-        let result = execute_stmt(sql, &exec_ctx, &mut conn_txn, ctx);
-        match result {
-            Ok(r) => { self.txn.commit(conn_txn)?; Ok(r) }
-            Err(e) => { let _ = self.txn.rollback(conn_txn, &self.storage); Err(e) }
-        }
-    } else {
-        // Explicit transaction: conn_txn lives in handler_state
-        let conn_txn = handler_state.conn_txn.as_mut().unwrap();
-        execute_stmt(sql, &exec_ctx, conn_txn, ctx)
-    }
-}
+let exec_ctx = ExecutionContext::new(&self.storage, &self.txn, &self.bloom);
+let result = execute_with_ctx(analyzed, &exec_ctx, &mut conn_txn, session);
 ```
 
-`HandlerState` (or equivalent per-connection state in handler.rs) gains:
-```rust
-pub conn_txn: Option<ConnectionTxn>,
-```
+**Ruta de transición para conn_txn en network/embedded**:
+Para evitar un cambio demasiado disruptivo, `conn_txn` se mantiene fuera de
+`SessionContext` pero se pasa desde el llamador. En `Database::execute_query`,
+se extrae de un campo local `self.active_conn_txn: Option<ConnectionTxn>` que
+reemplaza `session.conn_txn`. En `Db` (embedded), igual: `self.conn_txn: Option<ConnectionTxn>`.
 
-BEGIN in handler: `handler_state.conn_txn = Some(self.db.txn.begin()?)`
-COMMIT: `self.db.txn.commit(handler_state.conn_txn.take().unwrap())?`
-ROLLBACK: `self.db.txn.rollback(handler_state.conn_txn.take().unwrap(), &self.db.storage)?`
+---
 
-## Implementation phases
+## Fases de implementación
 
-### Phase 1 — Core types (axiomdb-core + axiomdb-storage)
+### Fase 1: max_committed AtomicU64 (Commit 1)
 
-1. `axiomdb-core/src/traits.rs`: add `active_ids: Arc<HashSet<TxnId>>` to
-   `TransactionSnapshot`. Update `committed()` and `active()` constructors.
-   Add imports: `use std::collections::HashSet; use std::sync::Arc;`
-2. `axiomdb-storage/src/heap.rs`: update `RowHeader::is_visible()` per algorithm above.
-3. `axiomdb-storage/src/clustered_tree.rs`: update test helpers (`active_snapshot()`,
-   `committed_snapshot()`) — they just call `TransactionSnapshot::active/committed()`,
-   so no logic change needed, only add `active_ids: Arc::new(HashSet::new())` if direct
-   struct literals exist.
-4. Run `cargo test -p axiomdb-storage` — must pass before proceeding.
+1. Cambiar `max_committed: u64` → `AtomicU64` en `TxnManager` struct (`txn.rs`)
+2. Actualizar `txn_construction.rs`: `max_committed: AtomicU64::new(result.max_committed)`
+3. Actualizar `txn_begin_commit.rs`:
+   - `commit()`: mover advance + remove dentro del mismo `active_set.write()` block
+   - `advance_committed()` / `advance_committed_single()`: usar `fetch_max` con `Ordering::Release`
+4. Actualizar `txn_inspect.rs`:
+   - `snapshot()`: leer `max_committed` dentro de `active_set.read()` lock
+   - `active_snapshot()`: igual para READ COMMITTED path
+   - `snapshot_for_active()`: igual
+   - `max_committed()` accessor: `self.max_committed.load(Ordering::Acquire)`
+5. Verificar: `begin_with_isolation()` — `snapshot_id_at_begin = max_committed.load(Acquire) + 1`
+6. Correr: `cargo nextest run -p axiomdb-wal`
 
-### Phase 2 — ConnectionTxn + ExecutionContext (axiomdb-wal + axiomdb-sql)
+### Fase 2: ExecutionContext struct (inicio Commit 2)
 
-5. `axiomdb-wal/src/txn.rs`:
-   a. Add `ConnectionTxn` struct (public) replacing private `ActiveTxn`.
-   b. Refactor `TxnManager`: remove `active`, add `active_set`, `lowest_active_id`,
-      change `max_committed` to `AtomicU64`.
-   c. Rewrite `begin_with_isolation()`, `commit()`, `rollback()`, `snapshot()`,
-      `active_snapshot()`, `autocommit()` per algorithm above.
-   d. Rewrite all 14 `record_*` methods to take `conn_txn: &mut ConnectionTxn`.
-   e. Update `savepoint()`, `rollback_to_savepoint()`, `defer_free_pages()`,
-      `clustered_root()` to take `conn_txn`.
-   f. Update `advance_committed()` / `advance_committed_single()` — now uses
-      `max_committed.store(...)`, takes `&self`.
-   g. Update `rotate_wal()` — check `active_set` instead of `self.active`.
-   h. Fix all unit tests in `txn.rs` to use new API.
-   i. Re-export `ConnectionTxn` from `axiomdb-wal/src/lib.rs`.
-6. `axiomdb-sql/src/exec_ctx.rs` (NEW FILE): define `ExecutionContext<'a>`.
-   Add to `axiomdb-sql/src/lib.rs`: `pub mod exec_ctx; pub use exec_ctx::ExecutionContext;`
-7. Run `cargo test -p axiomdb-wal` — must pass before proceeding.
+1. Crear `crates/axiomdb-sql/src/exec_ctx.rs` con `ExecutionContext<'a>`
+2. Re-exportar desde `crates/axiomdb-sql/src/lib.rs`
+3. Verificar compilación: `cargo check -p axiomdb-sql`
 
-### Phase 3 — Executor sweep (axiomdb-sql)
+### Fase 3: Remover conn_txn de SessionContext
 
-8. Start with `axiomdb-sql/src/executor/mod.rs` — change the top-level
-   `execute_with_ctx()` entry point. Let compiler failures guide the rest.
-9. Sweep in order (follow compiler errors):
-   - `executor/insert.rs` → `executor/update.rs` → `executor/delete.rs`
-   - `executor/ddl.rs` → `executor/bulk_empty.rs` → `executor/staging.rs`
-   - `executor/shared.rs` → `executor/select.rs` → `executor/aggregate.rs`
-   - `table.rs` → `vacuum.rs` → `fk_enforcement.rs`
-   - `index_integrity.rs` → `index_maintenance.rs`
-10. Update `axiomdb-catalog/src/writer.rs` and `reader.rs`.
-11. Run `cargo test -p axiomdb-sql` — must pass before proceeding.
+1. En `session.rs`: remover campo `conn_txn: Option<ConnectionTxn>`
+2. Añadir campo `in_explicit_txn: bool` (reemplaza `conn_txn.is_some()` checks)
+3. En `Database` (network): añadir `active_conn_txn: Option<ConnectionTxn>`
+4. En `Db` (embedded): ya tiene `conn_txn: Option<ConnectionTxn>` propio — verificar
+5. Corregir todos los `ctx.conn_txn` → acceder desde el nuevo lugar
+6. `cargo check -p axiomdb-sql -p axiomdb-network -p axiomdb-embedded`
 
-### Phase 4 — Network + Embedded
+### Fase 4: Signature sweep (resto de Commit 2)
 
-12. `axiomdb-network/src/mysql/database.rs`:
-    - Add `conn_txn: Option<ConnectionTxn>` to `HandlerState` (or wherever
-      per-connection state is stored — check handler.rs for the exact struct).
-    - Update `execute_query` / `execute_stmt` to build `ExecutionContext` and
-      thread `conn_txn` per algorithm above.
-    - Update BEGIN/COMMIT/ROLLBACK handling in `handler.rs`.
-13. `axiomdb-embedded/src/lib.rs`:
-    - Add `conn_txn: Option<ConnectionTxn>` to `Db`.
-    - Update `execute()`, `query()`, `begin()`, `commit()`, `rollback()`.
-14. Run `cargo test -p axiomdb-network` and `cargo test -p axiomdb-embedded`.
+Estrategia: cambiar de afuera hacia adentro.
 
-### Phase 5 — Closing protocol
+1. `exec_with_ctx.rs` — entry point principal del executor
+2. `exec_dispatch.rs` — dispatcher central
+3. DML: `insert_heap_ctx.rs`, `insert_clustered_ctx.rs`, `delete.rs`, `update_ctx.rs`
+4. DDL: `ddl_create_table.rs`, `ddl_alter_column.rs`, `ddl_alter_constraint.rs`, etc.
+5. SELECT: `select_ctx.rs`, `select_core.rs` — `txn: &TxnManager` → `exec_ctx.coord`
+6. Helpers: `shared.rs`, `staging.rs`, `bulk_empty.rs`, `exec_subquery.rs`
+7. Leaf helpers: `insert_heap.rs`, `insert_clustered.rs`, `update_clustered.rs`, etc.
+8. `cargo nextest run -p axiomdb-sql` — debe pasar limpio
 
-15. `cargo test --workspace` — must be clean.
-16. `cargo clippy --workspace -- -D warnings` — must be clean.
-17. `cargo fmt --check` — must be clean.
-18. Wire test: update `tools/wire-test.py` with:
-    - Explicit BEGIN / INSERT / COMMIT smoke test
-    - ROLLBACK restores state
-    - Concurrent (sequential) autocommit INSERTs still visible
+### Fase 5: Network + embedded (Commit 2 continuación)
 
-## Tests to write
+1. `database.rs`: construir `ExecutionContext`, pasar `&mut self.active_conn_txn` unwrap
+2. `embedded/src/lib.rs`: actualizar `execute()` / `query()` para usar `ExecutionContext`
+3. `cargo nextest run -p axiomdb-network -p axiomdb-embedded`
 
-**Unit (axiomdb-wal/src/txn.rs):**
-- `test_begin_returns_connection_txn` — begin() returns ConnectionTxn, not stored in TxnManager
-- `test_commit_takes_connection_txn` — after commit(conn_txn), conn_txn is consumed
-- `test_two_connections_independent_undo_logs` — two ConnectionTxns have separate undo_ops
-- `test_snapshot_excludes_active_ids` — snapshot() active_ids includes in-flight txn
-- `test_commit_atomic_max_committed_and_active_set` — max_committed advances AND active_set
-  loses the txn ID in the same atomic operation (verify with a second snapshot taken after)
-- `test_rollback_does_not_advance_max_committed` — max_committed stays after rollback
-- `test_lowest_active_id_updated_on_begin_and_commit`
-- `test_rr_snapshot_frozen_at_begin` — RR conn_txn.active_ids_at_begin captured correctly
-- `test_rc_snapshot_fresh_per_call` — RC always returns fresh active_ids
+### Fase 6: Wire test + closing
 
-**Integration (axiomdb-sql/tests/):**
-- `integration_explicit_txn.rs` (new or extend existing):
-  - `test_explicit_begin_commit_visible`
-  - `test_explicit_begin_rollback_invisible`
-  - `test_savepoint_within_connection_txn`
-  - `test_two_sequential_explicit_txns` (A commits → B sees A's writes)
+1. `tools/wire-test.py` — agregar:
+   - Escenario: `BEGIN` + varios INSERTs + `COMMIT` — rows visibles después
+   - Escenario: `BEGIN` + INSERT + `ROLLBACK` — rows NO visibles
+   - Escenario: autocommit INSERT inmediatamente visible en SELECT siguiente
+2. `cargo nextest run --workspace`
+3. `cargo clippy --workspace -- -D warnings`
+4. `cargo fmt --check`
 
-**Wire protocol (tools/wire-test.py):**
-- `BEGIN; INSERT INTO t VALUES (1); COMMIT;` → `SELECT COUNT(*) FROM t` = 1
-- `BEGIN; INSERT INTO t VALUES (2); ROLLBACK;` → count unchanged
-- Autocommit INSERT → immediately visible in next query
-- `SET autocommit = 0; INSERT ...; COMMIT;` → standard explicit txn
+---
 
-## Anti-patterns to avoid
+## Tests a escribir
 
-- **DO NOT** change `is_visible()` before `TransactionSnapshot` has `active_ids` —
-  the struct change must land first (Phase 1) or `is_visible()` will fail to compile.
-- **DO NOT** update executor signatures before `ConnectionTxn` and `ExecutionContext`
-  are fully defined and compiling — Phase 2 must complete before Phase 3 starts.
-- **DO NOT** make `next_txn_id` an `AtomicU64` in this phase — it's still under
-  `&mut TxnManager`. AtomicU64 here would be incorrect and wasteful; wait for 40.10.
-- **DO NOT** put `ExecutionContext` in `axiomdb-wal` — it needs `BloomRegistry` from
-  `axiomdb-sql`, which would create a dependency cycle. It lives in `axiomdb-sql`.
-- **DO NOT** include `self` (the new ConnectionTxn's own txn_id) in `active_ids_at_begin` —
-  own writes must be visible via `current_txn_id` check, not blocked by `active_ids`.
-- **DO NOT** advance `max_committed` on ROLLBACK — only COMMIT advances it.
-- **DO NOT** try to compile across crates mid-sweep — complete each phase's crate
-  before moving to the next (follow the dependency order: core → storage → wal → sql → net).
-- **DO NOT** use `Arc::clone` in hot paths (record_insert) — `wal_scratch` is per-connection
-  Vec, no cloning needed. Only snapshot construction clones the active_ids set.
-- **DO NOT** change `autocommit()` in WAL tests to require `ExecutionContext` —
-  WAL-level tests don't have `BloomRegistry`. Use the simpler `fn(&Self, &mut ConnectionTxn)`
-  closure form for `TxnManager::autocommit()`.
+### Unit (axiomdb-wal)
+- `test_max_committed_atomic`: verificar que `max_committed` avanza correctamente tras commit
+- `test_snapshot_atomic_visibility`: snapshot construido justo antes de commit no ve ese txn
+- `test_active_ids_in_snapshot`: snapshot incluye IDs en-flight en `active_ids`
 
-## Risks
+### Integration (axiomdb-sql)
+- Todos los tests existentes deben pasar sin cambios (comportamiento idéntico)
 
-| Risk | Mitigation |
+### Wire
+- `BEGIN` / multi-INSERT / `COMMIT` / `SELECT` → rows visibles
+- `BEGIN` / INSERT / `ROLLBACK` / `SELECT` → rows no visibles
+- Autocommit: INSERT + SELECT inmediato → visible
+
+---
+
+## Anti-patterns a evitar
+
+- **NO** leer `max_committed` fuera del `active_set` lock cuando se construye un snapshot
+  → viola la invariante de visibilidad (PostgreSQL + DuckDB ambos leen bajo lock)
+- **NO** usar `Ordering::Relaxed` para el `store` de `max_committed` en commit
+  → el `Release` es necesario para que lectores con `Acquire` vean los datos escritos
+- **NO** poner `BloomRegistry` en `axiomdb-wal` para que `ExecutionContext` viva ahí
+  → crea dependencia cíclica; `ExecutionContext` vive en `axiomdb-sql`
+- **NO** dejar `conn_txn` en `SessionContext` — ese campo es la raíz del problema
+  que impide múltiples conexiones concurrentes (40.10)
+- **NO** hacer `storage: &mut dyn StorageEngine` en `ExecutionContext`
+  → storage ya es `&self` con interior mutability (40.3); `&mut` es incorrecto y bloquearía aliasing
+
+---
+
+## Riesgos
+
+| Riesgo | Mitigación |
 |---|---|
-| `is_visible()` behavior change breaks existing MVCC tests | Phase 1: run storage tests immediately after. Empty `active_ids` in `committed()` preserves old behavior exactly. |
-| Borrow checker conflicts in `autocommit()` closure | The closure takes `&Self` (shared), not `&mut Self`. After `begin()` returns, mutable borrow ends. Shared borrow during closure, then mutable for `commit()`. This compiles. |
-| `ExecutionContext` lifetime vs borrow of `Database` fields | `exec_ctx` has lifetime `'_` tied to the statement execution scope. Always let `exec_ctx` go out of scope before calling `self.txn.commit()` (different borrow). |
-| ~100 executor signatures is large mechanical change — easy to miss one | Use compiler as the guide: start at `execute_with_ctx` entry point, follow errors down. Every error points to the next site. |
-| Handler stores `Option<ConnectionTxn>` — must not be dropped on session end without rollback | Implement `Drop` for handler connection state that calls `rollback()` if `conn_txn.is_some()`. |
-| `active_ids` Arc clone per snapshot is O(active connections) | Under single-writer (pre-40.10), active_set has 0 or 1 elements — clone is O(1). Negligible cost. |
+| `AtomicU64` ordering incorrecto → snapshot ve datos uncommitted | Usar `Release` en store, `Acquire` en load; ambos dentro del `active_set` lock |
+| `advance_committed` en pipeline fsync no tiene active_set — ¿inconsistencia? | No hay inconsistencia: el txn ya fue removido del active_set en `commit()`; `advance_committed` solo avanza el número visible |
+| ~106 firmas cambiadas — riesgo de regresión silenciosa | `cargo nextest run -p axiomdb-sql` debe pasar limpio antes de tocar network/embedded |
+| `conn_txn` removido de `SessionContext` — tests unitarios en axiomdb-sql que usan `ctx.conn_txn` directamente | Buscar con grep antes de remover; actualizar todos los sitios de uso |
+| Lifetime `'a` en `ExecutionContext` — posibles conflictos con borrow checker | `storage` es `&'a dyn StorageEngine` (ya resuelto en 40.3); `TxnManager` es `&'a TxnManager`; no hay mutabilidad compartida |
+
+---
+
+## Notas de research
+
+Comparaciones con los 6 sistemas investigados:
+
+| Sistema | max_committed atomic | Bajo mismo lock | ExecutionContext |
+|---|---|---|---|
+| PostgreSQL | Sí (TransamVariables, protegida por ProcArrayLock) | Sí (exclusive lock cubre advance + XID clear) | Thread-local implícita (EState) |
+| DuckDB | Sí (`atomic<transaction_t> last_commit`) | Sí (transaction_lock cubre assign + remove) | `Arc<ClientContext>` |
+| AxiomDB 40.4b | Sí (`AtomicU64`) | **Sí (active_set.write() cubre ambos)** | `ExecutionContext<'a>` |
+| AxiomDB actual | No (plain u64) | No (separados) | No existe |
