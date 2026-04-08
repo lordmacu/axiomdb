@@ -924,6 +924,50 @@ impl<'a> CatalogWriter<'a> {
         Err(DbError::CatalogIndexNotFound { index_id })
     }
 
+    /// Renames an index in the catalog (ALTER TABLE RENAME INDEX).
+    ///
+    /// Deletes the old row and inserts an updated one with the new name.
+    ///
+    /// # Errors
+    /// - [`DbError::CatalogIndexNotFound`] if no index with `index_id` is visible.
+    pub fn rename_index(&mut self, index_id: u32, new_name: String) -> Result<(), DbError> {
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, self.page_ids.indexes, snap)?;
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = IndexDef::from_bytes(&data)?;
+            if def.index_id == index_id {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = index_id.to_le_bytes();
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_INDEXES,
+                    &key,
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                let updated = IndexDef {
+                    name: new_name,
+                    ..def
+                };
+                let new_data = updated.to_bytes();
+                let (new_page_id, new_slot_id) =
+                    HeapChain::insert(self.storage, self.page_ids.indexes, &new_data, txn_id)?;
+                self.txn.record_insert(
+                    self.conn,
+                    SYSTEM_TABLE_INDEXES,
+                    &key,
+                    &new_data,
+                    new_page_id,
+                    new_slot_id,
+                )?;
+                return Ok(());
+            }
+        }
+        Err(DbError::CatalogIndexNotFound { index_id })
+    }
+
     // ── Constraint operations (Phase 4.22b) ───────────────────────────────────
 
     /// Allocates a new `constraint_id` and inserts a constraint definition row

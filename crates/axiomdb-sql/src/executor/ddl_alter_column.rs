@@ -190,6 +190,48 @@ fn execute_alter_table(
             AlterTableOp::ModifyColumn(col_def) => {
                 alter_modify_column(storage, txn, conn_txn, &table_def.def, &mut columns, col_def, schema)?;
             }
+            AlterTableOp::RenameIndex { old_name, new_name } => {
+                alter_rename_index(storage, txn, conn_txn, table_def.def.id, &old_name, &new_name)?;
+            }
+            AlterTableOp::ConvertCharset | AlterTableOp::SetEngine => {
+                // Accepted and ignored — charset/engine are compat metadata only.
+            }
+            AlterTableOp::SetAutoIncrement(_) => {
+                // AUTO_INCREMENT counter reset accepted; not yet persisted (4.18e).
+            }
+            AlterTableOp::AddIndex { unique, name, columns } => {
+                alter_add_index(
+                    storage, txn, conn_txn, &table_def, &columns, unique, name, database,
+                )?;
+                // Refresh columns after index creation (schema version bumped by create_index).
+            }
+            AlterTableOp::DropIndex { name } => {
+                alter_drop_index(storage, txn, conn_txn, table_def.def.id, &name, table_def.def.is_clustered())?;
+            }
+            AlterTableOp::ChangeColumn { old_name, new_def } => {
+                // CHANGE COLUMN = rename + retype in one op.
+                // Strategy: run MODIFY with a temp def named old_name (retype),
+                // then rename old_name → new_def.name if they differ.
+                let rename_needed = old_name != new_def.name;
+                let new_name = new_def.name.clone();
+                // Step 1: Modify type/nullability under the OLD name.
+                let modify_def = crate::ast::ColumnDef {
+                    name: old_name.clone(),
+                    ..new_def
+                };
+                alter_modify_column(storage, txn, conn_txn, &table_def.def, &mut columns, modify_def, schema)?;
+                // Step 2: Rename if needed.
+                if rename_needed {
+                    let snap2 = txn.active_snapshot(conn_txn);
+                    columns = CatalogReader::new(storage, snap2)?.list_columns(table_def.def.id)?;
+                    alter_rename_column(
+                        storage, txn, conn_txn, &table_def.def, &columns,
+                        &old_name, &new_name, schema,
+                    )?;
+                    let snap3 = txn.active_snapshot(conn_txn);
+                    columns = CatalogReader::new(storage, snap3)?.list_columns(table_def.def.id)?;
+                }
+            }
         }
     }
 
@@ -532,6 +574,100 @@ fn alter_rename_table(
     }
 
     CatalogWriter::new(storage, txn, conn_txn)?.rename_table(table_def.id, new_name.to_string(), schema)?;
+    Ok(())
+}
+
+/// Renames an index: update the name field in the catalog row.
+fn alter_rename_index(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    table_id: u32,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), DbError> {
+    let snap = txn.active_snapshot(conn_txn);
+    let indexes = CatalogReader::new(storage, snap)?.list_indexes(table_id)?;
+    let idx = indexes.into_iter().find(|i| i.name == old_name).ok_or_else(|| {
+        DbError::NotImplemented {
+            feature: format!("RENAME INDEX: index '{old_name}' not found"),
+        }
+    })?;
+    CatalogWriter::new(storage, txn, conn_txn)?.rename_index(idx.index_id, new_name.to_string())?;
+    Ok(())
+}
+
+/// Creates an index for ALTER TABLE ADD INDEX / ADD UNIQUE INDEX.
+fn alter_add_index(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    table_def: &axiomdb_catalog::resolver::ResolvedTable,
+    col_names: &[String],
+    unique: bool,
+    name: Option<String>,
+    database: &str,
+) -> Result<(), DbError> {
+    use crate::ast::{CreateIndexStmt, IndexType, SortOrder, TableRef};
+    // Build a synthetic CreateIndexStmt and delegate to execute_create_index.
+    let idx_name = name.unwrap_or_else(|| {
+        // Auto-generate name: col1_col2
+        col_names.join("_")
+    });
+    let stmt = CreateIndexStmt {
+        if_not_exists: false,
+        unique,
+        name: idx_name,
+        table: TableRef {
+            database: Some(database.to_string()),
+            schema: Some(table_def.def.schema_name.clone()),
+            name: table_def.def.table_name.clone(),
+            alias: None,
+        },
+        columns: col_names
+            .iter()
+            .map(|c| crate::ast::IndexColumn {
+                name: c.clone(),
+                order: SortOrder::Asc,
+            })
+            .collect(),
+        predicate: None,
+        fillfactor: None,
+        include_columns: vec![],
+        index_type: IndexType::BTree,
+        pages_per_range: None,
+    };
+    let mut noop_bloom = crate::bloom::BloomRegistry::new();
+    execute_create_index(stmt, storage, txn, conn_txn, &mut noop_bloom, database)
+        .map(|_| ())
+}
+
+/// Drops an index by name for ALTER TABLE DROP INDEX.
+fn alter_drop_index(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    table_id: u32,
+    name: &str,
+    is_clustered: bool,
+) -> Result<(), DbError> {
+    if name == "PRIMARY" && is_clustered {
+        return Err(DbError::NotImplemented {
+            feature: "DROP PRIMARY KEY on clustered table — Phase 39.19".into(),
+        });
+    }
+    let snap = txn.active_snapshot(conn_txn);
+    let indexes = CatalogReader::new(storage, snap)?.list_indexes(table_id)?;
+    let idx = match indexes.into_iter().find(|i| {
+        if name == "PRIMARY" { i.is_primary } else { i.name == name }
+    }) {
+        Some(i) => i,
+        None => return Ok(()), // index not found — treat as no-op (IF EXISTS semantics)
+    };
+    let root = idx.root_page_id;
+    CatalogWriter::new(storage, txn, conn_txn)?.delete_index(idx.index_id)?;
+    free_btree_pages(storage, root)?;
+    let _ = CatalogWriter::new(storage, txn, conn_txn)?.bump_table_schema_version(table_id);
     Ok(())
 }
 

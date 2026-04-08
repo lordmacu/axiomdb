@@ -3,10 +3,12 @@
 /// Everything needed to swap a table (and all its indexes) to empty roots.
 fn execute_analyze(
     stmt: crate::ast::AnalyzeStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    // SAFETY: see ExecutionContext::storage_mut / coord_mut.
+    let storage = unsafe { exec_ctx.storage_mut() };
+    let txn = unsafe { exec_ctx.coord_mut() };
     let schema = "public";
     let database = ctx.effective_database().to_string();
     let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("conn_txn for analyze"));
