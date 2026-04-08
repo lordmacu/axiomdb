@@ -227,7 +227,11 @@ impl<'src> Parser<'src> {
             | Token::Regexp
             | Token::Rlike
             | Token::Xor
-            | Token::IntDiv => {
+            | Token::IntDiv
+            // DML keywords that double as MySQL built-in function names.
+            | Token::Truncate  // TRUNCATE(x, d) — numeric rounding function
+            | Token::Insert    // INSERT(str, pos, len, newstr) — string replacement
+            => {
                 let tok = self.advance();
                 keyword_as_identifier(&tok.token)
             }
@@ -847,6 +851,9 @@ fn keyword_as_identifier(tok: &Token<'_>) -> String {
         Token::Rlike => "rlike".into(),
         Token::Xor => "xor".into(),
         Token::IntDiv => "div".into(),
+        // DML keywords that double as MySQL built-in function names.
+        Token::Truncate => "truncate".into(),
+        Token::Insert => "insert".into(),
         _ => unreachable!("only called for known unreserved keywords"),
     }
 }

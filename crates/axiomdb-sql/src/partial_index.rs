@@ -162,6 +162,10 @@ pub fn resolve_predicate_columns(expr: Expr, col_defs: &[ColumnDef]) -> Result<E
             value,
             negated,
         }),
+        // DEFAULT is a no-op placeholder; treat as unsupported in partial index predicates.
+        Expr::Default => Err(DbError::NotImplemented {
+            feature: "partial index predicate: DEFAULT expression".into(),
+        }),
         // Subqueries, correlated references, CASE, aggregates, etc. cannot appear
         // in a partial index predicate — reject them clearly at CREATE INDEX time.
         Expr::Subquery(_)
