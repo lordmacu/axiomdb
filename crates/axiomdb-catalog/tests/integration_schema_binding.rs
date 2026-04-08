@@ -258,6 +258,8 @@ fn test_resolve_column_found() {
             col_type: ColumnType::BigInt,
             nullable: false,
             auto_increment: false,
+            type_len: 0,
+            is_fixed_len: false,
         })
         .unwrap();
         w.create_column(ColumnDef {
@@ -267,6 +269,8 @@ fn test_resolve_column_found() {
             col_type: ColumnType::Text,
             nullable: true,
             auto_increment: false,
+            type_len: 0,
+            is_fixed_len: false,
         })
         .unwrap();
         tid
@@ -298,6 +302,8 @@ fn test_resolve_column_not_found_returns_column_not_found_error() {
             col_type: ColumnType::BigInt,
             nullable: false,
             auto_increment: false,
+            type_len: 0,
+            is_fixed_len: false,
         })
         .unwrap();
         tid

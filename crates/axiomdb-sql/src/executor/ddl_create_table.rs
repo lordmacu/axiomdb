@@ -81,6 +81,7 @@ fn execute_create_table(
             nullable,
             auto_increment,
             type_len,
+            is_fixed_len: col_def.is_char,
         })?;
     }
 
@@ -687,6 +688,7 @@ fn execute_create_table_like(
             nullable: col.nullable,
             auto_increment: col.auto_increment,
             type_len: col.type_len,
+            is_fixed_len: col.is_fixed_len,
         })?;
     }
 
@@ -834,6 +836,7 @@ fn execute_create_table_as_select(
             nullable: true, // CTAS columns are always nullable
             auto_increment: false,
             type_len: 0,
+            is_fixed_len: false,
         })?;
     }
 
@@ -850,6 +853,7 @@ fn execute_create_table_as_select(
             nullable: true,
             auto_increment: false,
             type_len: 0,
+            is_fixed_len: false,
         })
         .collect();
 

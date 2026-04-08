@@ -35,8 +35,8 @@ fn execute_clustered_insert_ctx(
 
     macro_rules! prepare_one_row_ctx {
         ($full_values:expr, $row_idx:expr) => {{
-            let fv = $full_values;
-            match check_varchar_lengths(&resolved.columns, &fv)
+            let mut fv = $full_values;
+            match enforce_text_constraints(&resolved.columns, &mut fv)
                 .and_then(|()| check_row_constraints(&resolved.constraints, &fv, &resolved.def.table_name))
             {
                 Err(e) if ignore && is_ignorable_insert_error(&e) => {}
@@ -293,7 +293,7 @@ fn enqueue_clustered_insert_ctx(
             full_values.as_mut_slice(),
             &mut first_generated,
         )?;
-        match check_varchar_lengths(&resolved.columns, &full_values)
+        match enforce_text_constraints(&resolved.columns, &mut full_values)
             .and_then(|()| check_row_constraints(&resolved.constraints, &full_values, &resolved.def.table_name))
         {
             Err(e) if ignore && is_ignorable_insert_error(&e) => continue,

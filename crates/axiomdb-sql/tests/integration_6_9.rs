@@ -392,3 +392,84 @@ fn test_composite_index_three_columns() {
     assert_eq!(result.len(), 1);
     assert_eq!(result[0][0], Value::Int(1));
 }
+
+// ── CHAR(N) right-padding tests ─────────────────────────────────────────────
+
+#[test]
+fn test_char_right_padding_on_insert() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, code CHAR(5))");
+    db.ok("INSERT INTO t VALUES (1, 'AB')");
+    let rows = db.rows("SELECT code FROM t WHERE id = 1");
+    // CHAR(5) pads 'AB' to 'AB   ' (5 chars).
+    assert_eq!(rows[0][0], Value::Text("AB   ".into()));
+}
+
+#[test]
+fn test_char_exact_length_no_padding() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, code CHAR(3))");
+    db.ok("INSERT INTO t VALUES (1, 'ABC')");
+    let rows = db.rows("SELECT code FROM t WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Text("ABC".into()));
+}
+
+#[test]
+fn test_char_rejects_too_long() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, code CHAR(3))");
+    let e = db.err("INSERT INTO t VALUES (1, 'ABCDEF')");
+    assert!(
+        format!("{e}").contains("data too long"),
+        "expected DataTooLong, got: {e}"
+    );
+}
+
+#[test]
+fn test_char_trailing_spaces_stripped_then_padded() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, code CHAR(5))");
+    // Insert value with trailing spaces — should strip then pad to 5.
+    db.ok("INSERT INTO t VALUES (1, 'AB   ')");
+    let rows = db.rows("SELECT code FROM t WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Text("AB   ".into()));
+}
+
+#[test]
+fn test_varchar_no_padding() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(10))");
+    db.ok("INSERT INTO t VALUES (1, 'AB')");
+    let rows = db.rows("SELECT name FROM t WHERE id = 1");
+    // VARCHAR does NOT pad.
+    assert_eq!(rows[0][0], Value::Text("AB".into()));
+}
+
+#[test]
+fn test_char_update_pads() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, code CHAR(4))");
+    db.ok("INSERT INTO t VALUES (1, 'ABCD')");
+    db.ok("UPDATE t SET code = 'XY' WHERE id = 1");
+    let rows = db.rows("SELECT code FROM t WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Text("XY  ".into()));
+}
+
+#[test]
+fn test_char_empty_string_padded() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, code CHAR(3))");
+    db.ok("INSERT INTO t VALUES (1, '')");
+    let rows = db.rows("SELECT code FROM t WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Text("   ".into()));
+}
+
+#[test]
+fn test_char_unicode_padding() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE t (id INT PRIMARY KEY, code CHAR(5))");
+    // 'café' is 4 chars, should pad to 5.
+    db.ok("INSERT INTO t VALUES (1, 'café')");
+    let rows = db.rows("SELECT code FROM t WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Text("café ".into()));
+}

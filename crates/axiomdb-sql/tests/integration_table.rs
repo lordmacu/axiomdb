@@ -24,6 +24,7 @@ fn col(idx: u16, name: &str, col_type: ColumnType) -> ColumnDef {
         nullable: true,
         auto_increment: false,
         type_len: 0,
+        is_fixed_len: false,
     }
 }
 
@@ -508,6 +509,7 @@ fn create_table_helper(
                 nullable: col.nullable,
                 auto_increment: false,
                 type_len: 0,
+                is_fixed_len: false,
             })
             .unwrap();
     }

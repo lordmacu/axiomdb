@@ -116,6 +116,9 @@ pub struct ColumnDef {
     /// Maximum character length for `VARCHAR(N)` / `CHAR(N)` columns.
     /// `0` means unbounded (no length constraint). Mirrors `CatalogColumnDef::type_len`.
     pub type_len: u16,
+    /// `true` when the column was declared `CHAR(N)` (fixed-length).
+    /// `false` for `VARCHAR(N)` and `TEXT`.
+    pub is_char: bool,
 }
 
 /// Inline column constraint in a column definition.
@@ -740,18 +743,21 @@ mod tests {
                         ColumnConstraint::AutoIncrement,
                     ],
                     type_len: 0,
+                    is_char: false,
                 },
                 ColumnDef {
                     name: "email".into(),
                     data_type: DataType::Text,
                     constraints: vec![ColumnConstraint::NotNull, ColumnConstraint::Unique],
                     type_len: 0,
+                    is_char: false,
                 },
                 ColumnDef {
                     name: "age".into(),
                     data_type: DataType::Int,
                     constraints: vec![ColumnConstraint::Default(Expr::int(0))],
                     type_len: 0,
+                    is_char: false,
                 },
             ],
             table_constraints: vec![],
@@ -770,12 +776,14 @@ mod tests {
                     data_type: DataType::BigInt,
                     constraints: vec![ColumnConstraint::NotNull],
                     type_len: 0,
+                    is_char: false,
                 },
                 ColumnDef {
                     name: "user_id".into(),
                     data_type: DataType::BigInt,
                     constraints: vec![ColumnConstraint::NotNull],
                     type_len: 0,
+                    is_char: false,
                 },
             ],
             table_constraints: vec![
@@ -916,6 +924,7 @@ mod tests {
                     data_type: DataType::Text,
                     constraints: vec![ColumnConstraint::Null],
                     type_len: 0,
+                    is_char: false,
                 }),
                 AlterTableOp::DropColumn {
                     name: "legacy_col".into(),
@@ -1023,6 +1032,7 @@ mod tests {
                 operand: Box::new(Expr::int(1)),
             })],
             type_len: 0,
+            is_char: false,
         };
         assert_eq!(col_def.name, "balance");
     }

@@ -75,9 +75,9 @@ fn execute_update_with_candidates(
         }
     }
 
-    // VARCHAR(N) length + CHECK constraint validation (mirrors INSERT path).
-    for (_, _, new_values) in &to_update {
-        check_varchar_lengths(&resolved.columns, new_values)?;
+    // CHAR(N) padding + VARCHAR(N) length + CHECK constraint validation (mirrors INSERT path).
+    for (_, _, new_values) in &mut to_update {
+        enforce_text_constraints(&resolved.columns, new_values)?;
     }
     if !resolved.constraints.is_empty() {
         for (_, _, new_values) in &to_update {

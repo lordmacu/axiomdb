@@ -226,7 +226,7 @@ fn is_table_constraint_start(p: &Parser) -> bool {
 
 fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
     let name = p.parse_identifier()?;
-    let (data_type, type_len) = parse_data_type(p)?;
+    let (data_type, type_len, is_char) = parse_data_type(p)?;
     let mut constraints = Vec::new();
 
     loop {
@@ -334,6 +334,7 @@ fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
         data_type,
         constraints,
         type_len,
+        is_char,
     })
 }
 
@@ -593,57 +594,63 @@ fn parse_check_column_constraint(p: &mut Parser) -> Result<ColumnConstraint, DbE
 
 // ── Data type ─────────────────────────────────────────────────────────────────
 
-/// Parses a SQL data type keyword, returning `(DataType, type_len)`.
+/// Parses a SQL data type keyword, returning `(DataType, type_len, is_char)`.
 ///
 /// `type_len` is the `N` from `VARCHAR(N)` / `CHAR(N)`, or `0` for all other types.
-pub(crate) fn parse_data_type(p: &mut Parser) -> Result<(DataType, u16), DbError> {
+/// `is_char` is `true` only for `CHAR(N)` declarations (fixed-length).
+pub(crate) fn parse_data_type(p: &mut Parser) -> Result<(DataType, u16, bool), DbError> {
     let pos = p.current_pos();
     match p.peek().clone() {
         Token::TyInt | Token::TyInteger => {
             p.advance();
-            Ok((DataType::Int, 0))
+            Ok((DataType::Int, 0, false))
         }
         Token::TyBigint => {
             p.advance();
-            Ok((DataType::BigInt, 0))
+            Ok((DataType::BigInt, 0, false))
         }
         Token::TyReal | Token::TyDouble | Token::TyFloat => {
             p.advance();
-            Ok((DataType::Real, 0))
+            Ok((DataType::Real, 0, false))
         }
         Token::TyDecimal | Token::TyNumeric => {
             p.advance();
             eat_optional_precision_scale(p)?;
-            Ok((DataType::Decimal, 0))
+            Ok((DataType::Decimal, 0, false))
         }
         Token::TyBool | Token::TyBoolean => {
             p.advance();
-            Ok((DataType::Bool, 0))
+            Ok((DataType::Bool, 0, false))
         }
         Token::TyText => {
             p.advance();
-            Ok((DataType::Text, 0))
+            Ok((DataType::Text, 0, false))
         }
-        Token::TyVarchar | Token::TyChar => {
+        Token::TyVarchar => {
             p.advance();
             let len = eat_optional_length(p)?;
-            Ok((DataType::Text, len))
+            Ok((DataType::Text, len, false))
+        }
+        Token::TyChar => {
+            p.advance();
+            let len = eat_optional_length(p)?;
+            Ok((DataType::Text, len, true))
         }
         Token::TyBlob | Token::TyBytea => {
             p.advance();
-            Ok((DataType::Bytes, 0))
+            Ok((DataType::Bytes, 0, false))
         }
         Token::TyDate => {
             p.advance();
-            Ok((DataType::Date, 0))
+            Ok((DataType::Date, 0, false))
         }
         Token::TyTimestamp | Token::TyDatetime => {
             p.advance();
-            Ok((DataType::Timestamp, 0))
+            Ok((DataType::Timestamp, 0, false))
         }
         Token::TyUuid => {
             p.advance();
-            Ok((DataType::Uuid, 0))
+            Ok((DataType::Uuid, 0, false))
         }
         other => Err(DbError::ParseError {
             message: format!(
