@@ -386,9 +386,10 @@ impl ConnectionState {
             return Ok(true);
         }
 
-        // Parse: [@@session. | @@][varname] = value
+        // Parse: [@@session. | @@global. | @@][varname] = value (5.9k)
         let rest = rest
             .strip_prefix("@@session.")
+            .or_else(|| rest.strip_prefix("@@global."))
             .or_else(|| rest.strip_prefix("@@"))
             .unwrap_or(rest);
 
@@ -582,11 +583,13 @@ impl ConnectionState {
     /// Handles both `varname` and `@@session.varname` and `@@varname` forms.
     /// Returns `None` if the variable is unknown.
     pub fn get_variable(&self, raw_name: &str) -> Option<String> {
-        let name = raw_name
+        // Strip all common @@-prefixes: @@session., @@global., @@ (5.9k).
+        let stripped = raw_name
             .trim()
             .trim_start_matches("@@session.")
-            .trim_start_matches("@@")
-            .to_ascii_lowercase();
+            .trim_start_matches("@@global.")
+            .trim_start_matches("@@");
+        let name = stripped.to_ascii_lowercase();
 
         match name.as_str() {
             "autocommit" => Some(if self.autocommit {
@@ -613,11 +616,128 @@ impl ConnectionState {
             "lower_case_table_names" => Some("0".into()),
             "version_comment" => Some("AxiomDB".into()),
             "version" => Some("8.0.36-AxiomDB-0.1.0".into()),
-            "global.time_zone" | "time_zone" => Some(
+            "time_zone" => Some(
                 self.variables
                     .get("time_zone")
                     .cloned()
                     .unwrap_or("SYSTEM".into()),
+            ),
+            // For variables with known defaults: check the per-session map first
+            // (SET may have overridden them), then fall back to the static default.
+            // 5.9j / 5.9k / 5.9l — variables ORMs and drivers query on connect.
+            "character_set_system" => Some(
+                self.variables
+                    .get("character_set_system")
+                    .cloned()
+                    .unwrap_or_else(|| "utf8mb3".into()),
+            ),
+            "init_connect" => Some(
+                self.variables
+                    .get("init_connect")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            "performance_schema" => Some(
+                self.variables
+                    .get("performance_schema")
+                    .cloned()
+                    .unwrap_or_else(|| "ON".into()),
+            ),
+            "have_query_cache" => Some(
+                self.variables
+                    .get("have_query_cache")
+                    .cloned()
+                    .unwrap_or_else(|| "NO".into()),
+            ),
+            "log_bin" => Some(
+                self.variables
+                    .get("log_bin")
+                    .cloned()
+                    .unwrap_or_else(|| "OFF".into()),
+            ),
+            "net_buffer_length" => Some(
+                self.variables
+                    .get("net_buffer_length")
+                    .cloned()
+                    .unwrap_or_else(|| "16384".into()),
+            ),
+            "transaction_read_only" | "tx_read_only" => Some(
+                self.variables
+                    .get("transaction_read_only")
+                    .cloned()
+                    .unwrap_or_else(|| "0".into()),
+            ),
+            "wait_timeout" => Some(
+                self.variables
+                    .get("wait_timeout")
+                    .cloned()
+                    .unwrap_or_else(|| "28800".into()),
+            ),
+            "interactive_timeout" => Some(
+                self.variables
+                    .get("interactive_timeout")
+                    .cloned()
+                    .unwrap_or_else(|| "28800".into()),
+            ),
+            "net_write_timeout" => Some(
+                self.variables
+                    .get("net_write_timeout")
+                    .cloned()
+                    .unwrap_or_else(|| "60".into()),
+            ),
+            "net_read_timeout" => Some(
+                self.variables
+                    .get("net_read_timeout")
+                    .cloned()
+                    .unwrap_or_else(|| "30".into()),
+            ),
+            "connect_timeout" => Some(
+                self.variables
+                    .get("connect_timeout")
+                    .cloned()
+                    .unwrap_or_else(|| "10".into()),
+            ),
+            "max_connections" => Some(
+                self.variables
+                    .get("max_connections")
+                    .cloned()
+                    .unwrap_or_else(|| "151".into()),
+            ),
+            "skip_networking" => Some(
+                self.variables
+                    .get("skip_networking")
+                    .cloned()
+                    .unwrap_or_else(|| "OFF".into()),
+            ),
+            "have_openssl" | "have_ssl" => Some(
+                self.variables
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| "DISABLED".into()),
+            ),
+            "license" => Some("GPL".into()),
+            "protocol_version" => Some("10".into()),
+            "external_user" | "proxy_user" => {
+                Some(self.variables.get(&name).cloned().unwrap_or_default())
+            }
+            "event_scheduler" => Some(
+                self.variables
+                    .get("event_scheduler")
+                    .cloned()
+                    .unwrap_or_else(|| "OFF".into()),
+            ),
+            "default_storage_engine" | "storage_engine" => Some(
+                self.variables
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| "InnoDB".into()),
+            ),
+            "innodb_version" => Some("8.0.36".into()),
+            "system_time_zone" => Some(
+                self.variables
+                    .get("system_time_zone")
+                    .cloned()
+                    .unwrap_or_else(|| "UTC".into()),
             ),
             other => self.variables.get(other).cloned(),
         }

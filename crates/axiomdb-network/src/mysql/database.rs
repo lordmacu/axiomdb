@@ -795,6 +795,8 @@ fn stmt_may_mutate(stmt: &Stmt) -> bool {
             | Stmt::ShowTables(_)
             | Stmt::ShowDatabases(_)
             | Stmt::ShowColumns(_)
+            | Stmt::ShowIndex(_)
+            | Stmt::ShowCreateTable(_)
             | Stmt::Set(_)
             | Stmt::UseDatabase(_)
     )
