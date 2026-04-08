@@ -112,6 +112,9 @@ fn test_resolve_table_columns_sorted_by_col_idx() {
                 col_type: ColumnType::Text,
                 nullable: idx != 0,
                 auto_increment: false,
+                type_len: 0,
+                is_fixed_len: false,
+                default_expr: None,
             })
             .unwrap();
         }
@@ -260,6 +263,7 @@ fn test_resolve_column_found() {
             auto_increment: false,
             type_len: 0,
             is_fixed_len: false,
+            default_expr: None,
         })
         .unwrap();
         w.create_column(ColumnDef {
@@ -271,6 +275,7 @@ fn test_resolve_column_found() {
             auto_increment: false,
             type_len: 0,
             is_fixed_len: false,
+            default_expr: None,
         })
         .unwrap();
         tid
@@ -304,6 +309,7 @@ fn test_resolve_column_not_found_returns_column_not_found_error() {
             auto_increment: false,
             type_len: 0,
             is_fixed_len: false,
+            default_expr: None,
         })
         .unwrap();
         tid

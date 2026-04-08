@@ -196,6 +196,11 @@ pub struct ColumnDef {
     /// and trailing spaces are stripped on read (MySQL default behavior).
     /// Stored in `flags bit3` (backward-compatible: old rows read as `false`).
     pub is_fixed_len: bool,
+    /// SQL text of the DEFAULT expression (e.g. `"42"`, `"'active'"`, `"-1"`).
+    /// `None` means no DEFAULT was declared (missing columns default to NULL).
+    /// Stored as `[u16 len][utf8 bytes]` after the other extensions when
+    /// `flags bit4` is set (backward-compatible: old rows read as `None`).
+    pub default_expr: Option<String>,
 }
 
 impl ColumnDef {
@@ -206,11 +211,15 @@ impl ColumnDef {
     /// - `flags bit1` = auto_increment
     /// - `flags bit2` = type_len extension present
     /// - `flags bit3` = is_fixed_len (CHAR vs VARCHAR)
+    /// - `flags bit4` = default_expr extension present
     pub fn to_bytes(&self) -> Vec<u8> {
         let name = self.name.as_bytes();
         debug_assert!(name.len() <= 255, "column name too long");
 
         let has_type_len = self.type_len > 0;
+        let default_bytes = self.default_expr.as_deref().map(|s| s.as_bytes());
+        let has_default = default_bytes.is_some();
+
         let mut flags: u8 = 0;
         if self.nullable {
             flags |= 0x01;
@@ -224,8 +233,13 @@ impl ColumnDef {
         if self.is_fixed_len {
             flags |= 0x08; // bit3: CHAR (fixed-length)
         }
+        if has_default {
+            flags |= 0x10; // bit4: default_expr present
+        }
 
-        let mut buf = Vec::with_capacity(4 + 2 + 1 + 1 + 1 + name.len() + if has_type_len { 2 } else { 0 });
+        let extra = if has_type_len { 2 } else { 0 }
+            + default_bytes.map_or(0, |b| 2 + b.len());
+        let mut buf = Vec::with_capacity(4 + 2 + 1 + 1 + 1 + name.len() + extra);
         buf.extend_from_slice(&self.table_id.to_le_bytes());
         buf.extend_from_slice(&self.col_idx.to_le_bytes());
         buf.push(u8::from(self.col_type));
@@ -234,6 +248,10 @@ impl ColumnDef {
         buf.extend_from_slice(name);
         if has_type_len {
             buf.extend_from_slice(&self.type_len.to_le_bytes());
+        }
+        if let Some(db) = default_bytes {
+            buf.extend_from_slice(&(db.len() as u16).to_le_bytes());
+            buf.extend_from_slice(db);
         }
         buf
     }
@@ -260,6 +278,7 @@ impl ColumnDef {
         let auto_increment = flags & 0x02 != 0;
         let has_type_len = flags & 0x04 != 0;
         let is_fixed_len = flags & 0x08 != 0;
+        let has_default = flags & 0x10 != 0;
         let name_len = bytes[8] as usize;
 
         if bytes.len() < 9 + name_len {
@@ -285,6 +304,28 @@ impl ColumnDef {
             0
         };
 
+        // Backward-compatible extension: default_expr present only when bit4 set.
+        let default_expr = if has_default {
+            if bytes.len() < consumed + 2 {
+                return Err(err());
+            }
+            let dlen = u16::from_le_bytes([bytes[consumed], bytes[consumed + 1]]) as usize;
+            consumed += 2;
+            if bytes.len() < consumed + dlen {
+                return Err(err());
+            }
+            let s = std::str::from_utf8(&bytes[consumed..consumed + dlen])
+                .map_err(|_| DbError::ParseError {
+                    message: "invalid UTF-8 in default_expr".into(),
+                    position: None,
+                })?
+                .to_string();
+            consumed += dlen;
+            Some(s)
+        } else {
+            None
+        };
+
         Ok((
             Self {
                 table_id,
@@ -295,6 +336,7 @@ impl ColumnDef {
                 auto_increment,
                 type_len,
                 is_fixed_len,
+                default_expr,
             },
             consumed,
         ))

@@ -84,11 +84,12 @@ fn execute_clustered_insert(
     match stmt.source {
         InsertSource::Values(rows) => {
             for value_exprs in rows {
-                let provided: Vec<Value> = value_exprs
+                let mut provided: Vec<Value> = value_exprs
                     .iter()
                     .map(|e| eval(e, &[]))
                     .collect::<Result<_, _>>()?;
-                let mut full_values = materialize_insert_row(&col_positions, &provided);
+                resolve_expr_defaults(&col_positions, &value_exprs, &mut provided, schema_cols);
+                let mut full_values = materialize_insert_row(&col_positions, &provided, schema_cols);
                 assign_auto_increment(
                     storage,
                     txn,
@@ -112,7 +113,7 @@ fn execute_clustered_insert(
             };
 
             for row_values in select_rows {
-                let mut full_values = materialize_insert_row(&col_positions, &row_values);
+                let mut full_values = materialize_insert_row(&col_positions, &row_values, schema_cols);
                 assign_auto_increment(
                     storage,
                     txn,

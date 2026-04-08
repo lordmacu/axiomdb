@@ -437,6 +437,7 @@ fn virtual_columns_from_select(select: &SelectStmt) -> Vec<ColumnDef> {
                 auto_increment: false,
                 type_len: 0,
                 is_fixed_len: false,
+                default_expr: None,
             }
         })
         .collect()

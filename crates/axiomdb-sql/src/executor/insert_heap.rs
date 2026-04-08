@@ -106,21 +106,13 @@ fn execute_insert(
             let mut full_batch: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
 
             for value_exprs in &rows {
-                let provided: Vec<Value> = value_exprs
+                let mut provided: Vec<Value> = value_exprs
                     .iter()
                     .map(|e| eval(e, &[]))
                     .collect::<Result<_, _>>()?;
+                resolve_expr_defaults(&col_positions, value_exprs, &mut provided, schema_cols);
 
-                let mut full_values: Vec<Value> = col_positions
-                    .iter()
-                    .map(|&idx| {
-                        if idx == usize::MAX {
-                            Value::Null
-                        } else {
-                            provided.get(idx).cloned().unwrap_or(Value::Null)
-                        }
-                    })
-                    .collect();
+                let mut full_values = materialize_insert_row(&col_positions, &provided, schema_cols);
 
                 // AUTO_INCREMENT: assign the next ID before batching.
                 if let Some(ai_col) = auto_inc_col {
@@ -226,16 +218,7 @@ fn execute_insert(
             };
 
             for row_values in select_rows {
-                let mut full_values: Vec<Value> = col_positions
-                    .iter()
-                    .map(|&idx| {
-                        if idx == usize::MAX {
-                            Value::Null
-                        } else {
-                            row_values.get(idx).cloned().unwrap_or(Value::Null)
-                        }
-                    })
-                    .collect();
+                let mut full_values = materialize_insert_row(&col_positions, &row_values, schema_cols);
 
                 if let Some(ai_col) = auto_inc_col {
                     if matches!(full_values.get(ai_col), Some(Value::Null)) {

@@ -17,6 +17,7 @@ pub mod eval;
 pub mod exec_ctx;
 pub mod executor;
 pub mod expr;
+pub mod expr_to_sql;
 pub mod fk_enforcement;
 pub mod index_integrity;
 pub mod index_maintenance;

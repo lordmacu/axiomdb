@@ -142,6 +142,7 @@ fn test_create_column_fires_no_event() {
             auto_increment: false,
             type_len: 0,
             is_fixed_len: false,
+            default_expr: None,
         })
         .unwrap();
         let count_after_column = events.lock().unwrap().len();
