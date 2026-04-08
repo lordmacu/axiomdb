@@ -159,8 +159,8 @@ fn execute_insert_ctx(
                     }
                 }
 
-                // VARCHAR(N) length check + CHECK constraints.
-                match check_varchar_lengths(&resolved.columns, &full_values)
+                // CHAR(N) padding + VARCHAR(N) length check + CHECK constraints.
+                match enforce_text_constraints(&resolved.columns, &mut full_values)
                     .and_then(|()| check_row_constraints(&resolved.constraints, &full_values, &resolved.def.table_name))
                 {
                     Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
@@ -376,7 +376,7 @@ fn execute_insert_ctx(
                     first_generated = Some(id);
                 }
             }
-            check_varchar_lengths(&resolved.columns, &full_values)?;
+            enforce_text_constraints(&resolved.columns, &mut full_values)?;
             check_row_constraints(
                 &resolved.constraints,
                 &full_values,

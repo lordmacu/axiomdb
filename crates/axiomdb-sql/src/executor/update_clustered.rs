@@ -220,7 +220,7 @@ fn execute_clustered_update(
             continue;
         }
 
-        check_varchar_lengths(schema_cols, &new_values)?;
+        enforce_text_constraints(schema_cols, &mut new_values)?;
 
         let pk_changed = pk_col_positions
             .iter()

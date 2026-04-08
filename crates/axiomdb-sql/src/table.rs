@@ -703,6 +703,7 @@ mod tests {
             nullable: true,
             auto_increment: false,
             type_len: 0,
+            is_fixed_len: false,
         }
     }
 
@@ -767,6 +768,7 @@ mod tests {
                 nullable: false,
                 auto_increment: false,
                 type_len: 0,
+                is_fixed_len: false,
             },
             ColumnDef {
                 table_id: 1,
@@ -776,6 +778,7 @@ mod tests {
                 nullable: false,
                 auto_increment: false,
                 type_len: 0,
+                is_fixed_len: false,
             },
         ];
 
@@ -827,6 +830,7 @@ mod tests {
                 nullable: false,
                 auto_increment: false,
                 type_len: 0,
+                is_fixed_len: false,
             },
             ColumnDef {
                 table_id: 1,
@@ -836,6 +840,7 @@ mod tests {
                 nullable: false,
                 auto_increment: false,
                 type_len: 0,
+                is_fixed_len: false,
             },
         ];
 

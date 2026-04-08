@@ -152,30 +152,62 @@ fn assign_auto_increment(
 
 // ── UPDATE ────────────────────────────────────────────────────────────────────
 
-/// Checks that no `Text` value exceeds the declared `type_len` for its column.
+/// Enforces text column constraints: VARCHAR(N) length validation and CHAR(N)
+/// right-padding with spaces.
 ///
 /// Called on every INSERT and UPDATE row before it is written to storage.
-/// Returns [`DbError::DataTooLong`] on the first violation found.
-/// Columns with `type_len == 0` are unbounded and are skipped.
-pub(crate) fn check_varchar_lengths(
+///
+/// - **VARCHAR(N)**: rejects values longer than N characters with
+///   [`DbError::DataTooLong`].
+/// - **CHAR(N)**: right-pads values shorter than N with spaces; rejects values
+///   longer than N (after stripping trailing spaces, per MySQL behavior).
+/// - Columns with `type_len == 0` are unbounded (`TEXT`) and are skipped.
+pub(crate) fn enforce_text_constraints(
     schema_cols: &[CatalogColumnDef],
-    row_values: &[Value],
+    row_values: &mut [Value],
 ) -> Result<(), DbError> {
-    for (col, val) in schema_cols.iter().zip(row_values.iter()) {
+    for (col, val) in schema_cols.iter().zip(row_values.iter_mut()) {
         if col.type_len == 0 {
             continue;
         }
         if col.col_type != ColumnType::Text {
             continue;
         }
+        let max_len = col.type_len as usize;
         if let Value::Text(s) = val {
-            let char_count = s.chars().count();
-            if char_count > col.type_len as usize {
-                return Err(DbError::DataTooLong {
-                    column: col.name.clone(),
-                    max_len: col.type_len,
-                    actual_len: char_count,
-                });
+            if col.is_fixed_len {
+                // CHAR(N): strip trailing spaces first (MySQL behavior), then
+                // check length, then pad to exactly N characters.
+                let trimmed = s.trim_end_matches(' ');
+                let char_count = trimmed.chars().count();
+                if char_count > max_len {
+                    return Err(DbError::DataTooLong {
+                        column: col.name.clone(),
+                        max_len: col.type_len,
+                        actual_len: char_count,
+                    });
+                }
+                if char_count < max_len {
+                    let mut padded = String::with_capacity(trimmed.len() + (max_len - char_count));
+                    padded.push_str(trimmed);
+                    for _ in 0..(max_len - char_count) {
+                        padded.push(' ');
+                    }
+                    *s = padded;
+                } else if trimmed.len() != s.len() {
+                    // Same char count but had trailing spaces — normalize.
+                    *s = trimmed.to_string();
+                }
+            } else {
+                // VARCHAR(N): reject if too long.
+                let char_count = s.chars().count();
+                if char_count > max_len {
+                    return Err(DbError::DataTooLong {
+                        column: col.name.clone(),
+                        max_len: col.type_len,
+                        actual_len: char_count,
+                    });
+                }
             }
         }
     }

@@ -190,6 +190,12 @@ pub struct ColumnDef {
     /// `0` means unbounded (equivalent to `TEXT`). Stored as 2 bytes after
     /// the name when `flags bit2` is set (backward-compatible extension).
     pub type_len: u16,
+    /// `true` when the column was declared `CHAR(N)` (fixed-length).
+    /// `false` for `VARCHAR(N)` and `TEXT`.
+    /// CHAR values are right-padded with spaces to `type_len` on write
+    /// and trailing spaces are stripped on read (MySQL default behavior).
+    /// Stored in `flags bit3` (backward-compatible: old rows read as `false`).
+    pub is_fixed_len: bool,
 }
 
 impl ColumnDef {
@@ -198,6 +204,8 @@ impl ColumnDef {
     /// Format: `[table_id:4][col_idx:2][col_type:1][flags:1][name_len:1][name bytes]`
     /// - `flags bit0` = nullable
     /// - `flags bit1` = auto_increment
+    /// - `flags bit2` = type_len extension present
+    /// - `flags bit3` = is_fixed_len (CHAR vs VARCHAR)
     pub fn to_bytes(&self) -> Vec<u8> {
         let name = self.name.as_bytes();
         debug_assert!(name.len() <= 255, "column name too long");
@@ -212,6 +220,9 @@ impl ColumnDef {
         }
         if has_type_len {
             flags |= 0x04; // bit2: type_len extension present
+        }
+        if self.is_fixed_len {
+            flags |= 0x08; // bit3: CHAR (fixed-length)
         }
 
         let mut buf = Vec::with_capacity(4 + 2 + 1 + 1 + 1 + name.len() + if has_type_len { 2 } else { 0 });
@@ -248,6 +259,7 @@ impl ColumnDef {
         let nullable = flags & 0x01 != 0;
         let auto_increment = flags & 0x02 != 0;
         let has_type_len = flags & 0x04 != 0;
+        let is_fixed_len = flags & 0x08 != 0;
         let name_len = bytes[8] as usize;
 
         if bytes.len() < 9 + name_len {
@@ -282,6 +294,7 @@ impl ColumnDef {
                 nullable,
                 auto_increment,
                 type_len,
+                is_fixed_len,
             },
             consumed,
         ))

@@ -297,6 +297,7 @@ fn alter_add_column(
         nullable,
         auto_increment,
         type_len: col_def.type_len,
+        is_fixed_len: col_def.is_char,
     };
 
     // 1. Add column to catalog.
@@ -513,6 +514,7 @@ fn alter_modify_column(
         nullable: new_nullable,
         auto_increment: old_columns[col_pos].auto_increment,
         type_len: col_def.type_len,
+        is_fixed_len: col_def.is_char,
     };
     CatalogWriter::new(storage, txn, conn_txn)?.create_column(new_catalog_col.clone())?;
 

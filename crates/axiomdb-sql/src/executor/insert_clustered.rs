@@ -35,8 +35,8 @@ fn execute_clustered_insert(
     /// When `ignore` is true, ignorable constraint errors silently skip the row.
     macro_rules! prepare_one_row {
         ($full_values:expr) => {{
-            let fv = $full_values;
-            match check_varchar_lengths(&resolved.columns, &fv)
+            let mut fv = $full_values;
+            match enforce_text_constraints(&resolved.columns, &mut fv)
                 .and_then(|()| check_row_constraints(&resolved.constraints, &fv, &resolved.def.table_name))
             {
                 Err(e) if ignore && is_ignorable_insert_error(&e) => {}

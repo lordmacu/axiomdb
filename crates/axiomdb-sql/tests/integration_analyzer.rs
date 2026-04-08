@@ -48,6 +48,7 @@ impl Fixture {
                     nullable: true,
                     auto_increment: false,
                     type_len: 0,
+                    is_fixed_len: false,
                 })
                 .unwrap();
             }

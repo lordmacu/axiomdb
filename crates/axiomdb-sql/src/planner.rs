@@ -51,6 +51,7 @@ mod tests {
             nullable: false,
             auto_increment: false,
             type_len: 0,
+            is_fixed_len: false,
         }
     }
 
@@ -63,6 +64,7 @@ mod tests {
             nullable: false,
             auto_increment: false,
             type_len: 0,
+            is_fixed_len: false,
         }
     }
 

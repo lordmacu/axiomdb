@@ -97,10 +97,13 @@ fn test_data_types_text() {
     let ct = create_table("CREATE TABLE t (a TEXT, b VARCHAR(255), c CHAR(10))");
     assert_eq!(ct.columns[0].data_type, DataType::Text);
     assert_eq!(ct.columns[0].type_len, 0); // unbounded
+    assert!(!ct.columns[0].is_char); // TEXT is not CHAR
     assert_eq!(ct.columns[1].data_type, DataType::Text); // VARCHAR(n) → Text
     assert_eq!(ct.columns[1].type_len, 255); // length preserved
+    assert!(!ct.columns[1].is_char); // VARCHAR is not CHAR
     assert_eq!(ct.columns[2].data_type, DataType::Text); // CHAR(n) → Text
     assert_eq!(ct.columns[2].type_len, 10); // length preserved
+    assert!(ct.columns[2].is_char); // CHAR is fixed-length
 }
 
 #[test]
