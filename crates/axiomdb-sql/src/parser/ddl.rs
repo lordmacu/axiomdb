@@ -917,10 +917,8 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                     // handles the optional CONSTRAINT name prefix itself.
                     let constraint = parse_table_constraint(p)?;
                     AlterTableOp::AddConstraint(constraint)
-                } else if matches!(p.peek(), Token::Index)
-                    || matches!(p.peek(), Token::Ident(ref kw) if kw.eq_ignore_ascii_case("key"))
-                {
-                    // ADD INDEX [name] (cols)
+                } else if matches!(p.peek(), Token::Index | Token::Key) {
+                    // ADD INDEX [name] (cols)  /  ADD KEY [name] (cols) — KEY is a synonym
                     p.advance(); // consume INDEX/KEY
                     let name = if !matches!(p.peek(), Token::LParen) {
                         Some(p.parse_identifier()?)
@@ -998,7 +996,7 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                         AlterTableOp::RenameIndex { old_name, new_name }
                     }
                     // RENAME KEY old TO new (MySQL synonym)
-                    Token::Ident(ref kw) if kw.eq_ignore_ascii_case("key") => {
+                    Token::Key => {
                         p.advance();
                         let old_name = p.parse_identifier()?;
                         p.expect(&Token::To)?;
@@ -1033,9 +1031,7 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
             // DROP INDEX name | DROP PRIMARY KEY | DROP CONSTRAINT ... | DROP COLUMN ...
             Token::Drop => {
                 p.advance();
-                if matches!(p.peek(), Token::Index)
-                    || matches!(p.peek(), Token::Ident(ref kw) if kw.eq_ignore_ascii_case("key"))
-                {
+                if matches!(p.peek(), Token::Index | Token::Key) {
                     p.advance();
                     let name = p.parse_identifier()?;
                     AlterTableOp::DropIndex { name }
@@ -1101,8 +1097,8 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                 }
                 AlterTableOp::ConvertCharset
             }
-            // AUTO_INCREMENT = N
-            Token::Ident(ref kw) if kw.eq_ignore_ascii_case("auto_increment") => {
+            // AUTO_INCREMENT = N  (Token::AutoIncrement is the lexed form)
+            Token::AutoIncrement => {
                 p.advance();
                 p.eat(&Token::Eq);
                 let n = match p.peek().clone() {
