@@ -356,3 +356,105 @@ fn eval_with_aggs(
     }
 }
 
+/// Resolves SELECT aliases in a HAVING expression (G8 / 4.21b).
+///
+/// MySQL allows HAVING to reference column aliases defined in the SELECT list:
+///   `SELECT dept, COUNT(*) AS cnt FROM t GROUP BY dept HAVING cnt > 5`
+///
+/// This function walks the HAVING expression and replaces any `Expr::Column`
+/// whose name matches a SELECT alias with the corresponding SELECT expression.
+/// Called before `eval_with_aggs` so the replaced expressions are evaluated
+/// via the normal aggregate path.
+fn resolve_having_aliases(expr: Expr, select_items: &[SelectItem]) -> Expr {
+    // Build alias → expression map from SELECT list.
+    let alias_map: std::collections::HashMap<String, Expr> = select_items
+        .iter()
+        .filter_map(|item| {
+            if let SelectItem::Expr {
+                expr,
+                alias: Some(alias),
+            } = item
+            {
+                Some((alias.to_ascii_lowercase(), expr.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if alias_map.is_empty() {
+        return expr;
+    }
+    subst_having_aliases(expr, &alias_map)
+}
+
+fn subst_having_aliases(
+    expr: Expr,
+    alias_map: &std::collections::HashMap<String, Expr>,
+) -> Expr {
+    match expr {
+        // Replace a bare column reference that matches an alias.
+        Expr::Column { ref name, .. } => {
+            if let Some(replacement) = alias_map.get(&name.to_ascii_lowercase()) {
+                replacement.clone()
+            } else {
+                expr
+            }
+        }
+        // Recurse into compound expressions.
+        Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+            op,
+            left: Box::new(subst_having_aliases(*left, alias_map)),
+            right: Box::new(subst_having_aliases(*right, alias_map)),
+        },
+        Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+            op,
+            operand: Box::new(subst_having_aliases(*operand, alias_map)),
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(subst_having_aliases(*expr, alias_map)),
+            negated,
+        },
+        Expr::IsBoolean {
+            expr,
+            value,
+            negated,
+        } => Expr::IsBoolean {
+            expr: Box::new(subst_having_aliases(*expr, alias_map)),
+            value,
+            negated,
+        },
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(subst_having_aliases(*expr, alias_map)),
+            low: Box::new(subst_having_aliases(*low, alias_map)),
+            high: Box::new(subst_having_aliases(*high, alias_map)),
+            negated,
+        },
+        Expr::In { expr, list, negated } => Expr::In {
+            expr: Box::new(subst_having_aliases(*expr, alias_map)),
+            list: list
+                .into_iter()
+                .map(|e| subst_having_aliases(e, alias_map))
+                .collect(),
+            negated,
+        },
+        Expr::Function { name, args } => Expr::Function {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| subst_having_aliases(a, alias_map))
+                .collect(),
+        },
+        Expr::Cast { expr, target } => Expr::Cast {
+            expr: Box::new(subst_having_aliases(*expr, alias_map)),
+            target,
+        },
+        other => other,
+    }
+}
+

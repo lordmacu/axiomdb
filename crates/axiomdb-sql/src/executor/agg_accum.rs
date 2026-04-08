@@ -7,14 +7,20 @@ enum AggAccumulator {
     CountStar { n: u64 },
     /// `COUNT(col)` — increments only for non-NULL values.
     CountCol { n: u64 },
+    /// `COUNT(DISTINCT col)` — counts unique non-NULL values (4.9f).
+    CountDistinct { seen: std::collections::HashSet<String>, n: u64 },
     /// `SUM(col)` — sum of non-NULL values. `None` = all values were NULL.
     Sum { acc: Option<Value> },
+    /// `SUM(DISTINCT col)` — sum of unique non-NULL values (4.9f).
+    SumDistinct { values: Vec<Value> },
     /// `MIN(col)` — minimum non-NULL value.
     Min { acc: Option<Value> },
     /// `MAX(col)` — maximum non-NULL value.
     Max { acc: Option<Value> },
     /// `AVG(col)` — running sum + count; final = sum / count as Real.
     Avg { sum: Value, count: u64 },
+    /// `AVG(DISTINCT col)` — average of unique non-NULL values (4.9f).
+    AvgDistinct { values: Vec<Value> },
     /// `GROUP_CONCAT(...)` — accumulates `(text_value, sort_key_values)` per row.
     GroupConcat {
         /// Accumulated rows: (coerced-to-text value, evaluated ORDER BY key values).
@@ -48,13 +54,19 @@ impl AggAccumulator {
             AggExpr::Simple { name, arg, .. } => match name.as_str() {
                 "count" if arg.is_none() => Self::CountStar { n: 0 },
                 "count" => Self::CountCol { n: 0 },
+                "count_distinct" => Self::CountDistinct {
+                    seen: std::collections::HashSet::new(),
+                    n: 0,
+                },
                 "sum" => Self::Sum { acc: None },
+                "sum_distinct" => Self::SumDistinct { values: Vec::new() },
                 "min" => Self::Min { acc: None },
                 "max" => Self::Max { acc: None },
                 "avg" => Self::Avg {
                     sum: Value::Int(0),
                     count: 0,
                 },
+                "avg_distinct" => Self::AvgDistinct { values: Vec::new() },
                 _ => unreachable!("AggAccumulator::new called with non-aggregate"),
             },
         }
@@ -89,6 +101,30 @@ impl AggAccumulator {
                     if !matches!(v, Value::Null) {
                         *n += 1;
                     }
+                }
+            }
+
+            Self::CountDistinct { seen, n } => {
+                let v = eval(simple_arg.unwrap(), row)?;
+                if !matches!(v, Value::Null) {
+                    let key = value_to_display_string(v);
+                    if seen.insert(key) {
+                        *n += 1;
+                    }
+                }
+            }
+
+            Self::SumDistinct { values } => {
+                let v = eval(simple_arg.unwrap(), row)?;
+                if !matches!(v, Value::Null) && !values.iter().any(|e| e == &v) {
+                    values.push(v);
+                }
+            }
+
+            Self::AvgDistinct { values } => {
+                let v = eval(simple_arg.unwrap(), row)?;
+                if !matches!(v, Value::Null) && !values.iter().any(|e| e == &v) {
+                    values.push(v);
                 }
             }
 
@@ -193,10 +229,32 @@ impl AggAccumulator {
         match self {
             Self::CountStar { n } => Ok(Value::BigInt(n as i64)),
             Self::CountCol { n } => Ok(Value::BigInt(n as i64)),
+            Self::CountDistinct { n, .. } => Ok(Value::BigInt(n as i64)),
             Self::Sum { acc } => Ok(acc.unwrap_or(Value::Null)),
+            Self::SumDistinct { values } => {
+                let mut acc: Option<Value> = None;
+                for v in values {
+                    acc = Some(match acc {
+                        None => v,
+                        Some(a) => value_agg_add(a, v)?,
+                    });
+                }
+                Ok(acc.unwrap_or(Value::Null))
+            }
             Self::Min { acc } => Ok(acc.unwrap_or(Value::Null)),
             Self::Max { acc } => Ok(acc.unwrap_or(Value::Null)),
             Self::Avg { sum, count } => finalize_avg(sum, count),
+            Self::AvgDistinct { values } => {
+                let count = values.len() as u64;
+                if count == 0 {
+                    return Ok(Value::Null);
+                }
+                let mut sum = Value::Int(0);
+                for v in values {
+                    sum = value_agg_add(sum, v)?;
+                }
+                finalize_avg(sum, count)
+            }
             Self::GroupConcat {
                 mut rows,
                 separator,

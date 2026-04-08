@@ -1,5 +1,9 @@
 fn is_aggregate(name: &str) -> bool {
-    matches!(name, "count" | "sum" | "min" | "max" | "avg")
+    matches!(
+        name,
+        "count" | "sum" | "min" | "max" | "avg"
+            | "count_distinct" | "sum_distinct" | "avg_distinct"
+    )
 }
 
 /// Returns `true` if `expr` or any sub-expression is an aggregate call.
@@ -32,7 +36,7 @@ fn contains_aggregate(expr: &Expr) -> bool {
                 || else_result.as_deref().is_some_and(contains_aggregate)
         }
         Expr::Cast { expr, .. } => contains_aggregate(expr),
-        Expr::Literal(_) | Expr::Column { .. } | Expr::OuterColumn { .. } | Expr::Param { .. } => {
+        Expr::Literal(_) | Expr::Default | Expr::Column { .. } | Expr::OuterColumn { .. } | Expr::Param { .. } => {
             false
         }
         // Subquery internals are analyzed independently; aggregates inside them
@@ -233,7 +237,7 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
             collect_agg_exprs_from(expr, result);
             collect_agg_exprs_from(pattern, result);
         }
-        Expr::Literal(_) | Expr::Column { .. } | Expr::OuterColumn { .. } | Expr::Param { .. } => {}
+        Expr::Literal(_) | Expr::Default | Expr::Column { .. } | Expr::OuterColumn { .. } | Expr::Param { .. } => {}
         // Aggregates inside a subquery belong to the inner query, not the outer.
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {}
     }

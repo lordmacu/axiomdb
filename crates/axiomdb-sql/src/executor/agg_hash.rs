@@ -109,10 +109,14 @@ fn group_keys_equal(a: &[Value], b: &[Value]) -> bool {
 /// `combined_rows` are the post-scan, post-WHERE rows (not yet projected).
 /// `strategy` controls whether hash or sorted streaming aggregation is used.
 fn execute_select_grouped(
-    stmt: SelectStmt,
+    mut stmt: SelectStmt,
     combined_rows: Vec<Row>,
     strategy: GroupByStrategy,
 ) -> Result<QueryResult, DbError> {
+    // Resolve positional GROUP BY (e.g. GROUP BY 1) to SELECT expressions (G8).
+    stmt.group_by = resolve_positional_group_by(&stmt.group_by, &stmt.columns);
+    // Resolve positional ORDER BY (e.g. ORDER BY 2) to SELECT expressions (G8).
+    stmt.order_by = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
     match strategy {
         GroupByStrategy::Hash => execute_select_grouped_hash(stmt, combined_rows),
         GroupByStrategy::Sorted { presorted } => {
@@ -269,7 +273,9 @@ fn execute_select_grouped_hash(
         );
 
         if let Some(ref having) = stmt.having {
-            let v = eval_with_aggs(having, &virtual_row, &agg_values, &agg_exprs)?;
+            let resolved_having =
+                resolve_having_aliases(having.clone(), &stmt.columns);
+            let v = eval_with_aggs(&resolved_having, &virtual_row, &agg_values, &agg_exprs)?;
             if !is_truthy(&v) {
                 continue;
             }
