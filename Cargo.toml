@@ -21,7 +21,7 @@ members = [
     "crates/axiomdb-server",
     "crates/axiomdb-cli",
     "crates/axiomdb-embedded",
-    "benches/comparison/axiomdb_bench",
+    "benches/comparison/axiomdb_bench", "crates/axiomdb-lock",
 ]
 
 [workspace.package]
