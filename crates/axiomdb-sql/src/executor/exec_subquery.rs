@@ -85,6 +85,129 @@ type SubqueryCache = HashMap<usize, QueryResult>;
 /// first access, then reused for all subsequent outer rows.
 type InSetCache = HashMap<usize, InSubquerySet>;
 
+/// Cache for correlated scalar subquery results keyed by parameter values.
+///
+/// Inspired by MariaDB's `Expression_cache_tmptable` (sql_expression_cache.h):
+/// when a correlated scalar subquery like `(SELECT SUM(amount) FROM orders
+/// WHERE user_id = outer.id)` is evaluated per outer row, the result depends
+/// only on the correlated parameter values (`outer.id`). We cache by:
+///
+///   (AST pointer, hash of OuterColumn values) → QueryResult
+///
+/// This turns O(n × cost(inner)) into O(distinct_keys × cost(inner)) which
+/// is often O(n) when every outer row has a unique key, but avoids re-execution
+/// for duplicate key values and amortizes the overhead of substitute_outer +
+/// execute_select_ctx.
+///
+/// For the common benchmark pattern (1:N join with unique outer PK), this cache
+/// has ~100% miss rate and doesn't help. The real win comes from avoiding the
+/// `substitute_outer(stmt.clone(), ...)` overhead by pre-extracting the
+/// correlated column indices and using a direct HashMap lookup.
+type CorrelatedCache = HashMap<(usize, u64), QueryResult>;
+
+/// Extracts the `OuterColumn` indices referenced by a `SelectStmt`.
+/// Used to compute cache keys for correlated subqueries.
+fn extract_outer_col_indices(stmt: &SelectStmt) -> Vec<usize> {
+    let mut indices = Vec::new();
+    fn walk_expr(expr: &Expr, indices: &mut Vec<usize>) {
+        match expr {
+            Expr::OuterColumn { col_idx, .. } => {
+                if !indices.contains(col_idx) {
+                    indices.push(*col_idx);
+                }
+            }
+            Expr::UnaryOp { operand, .. } => walk_expr(operand, indices),
+            Expr::BinaryOp { left, right, .. } => {
+                walk_expr(left, indices);
+                walk_expr(right, indices);
+            }
+            Expr::IsNull { expr, .. } | Expr::IsBoolean { expr, .. } | Expr::Cast { expr, .. } => {
+                walk_expr(expr, indices)
+            }
+            Expr::Between { expr, low, high, .. } => {
+                walk_expr(expr, indices);
+                walk_expr(low, indices);
+                walk_expr(high, indices);
+            }
+            Expr::Like { expr, pattern, escape, .. } => {
+                walk_expr(expr, indices);
+                walk_expr(pattern, indices);
+                if let Some(e) = escape {
+                    walk_expr(e, indices);
+                }
+            }
+            Expr::In { expr, list, .. } => {
+                walk_expr(expr, indices);
+                for e in list {
+                    walk_expr(e, indices);
+                }
+            }
+            Expr::Function { args, .. } => {
+                for a in args {
+                    walk_expr(a, indices);
+                }
+            }
+            Expr::Case { operand, when_thens, else_result, .. } => {
+                if let Some(op) = operand {
+                    walk_expr(op, indices);
+                }
+                for (w, t) in when_thens {
+                    walk_expr(w, indices);
+                    walk_expr(t, indices);
+                }
+                if let Some(e) = else_result {
+                    walk_expr(e, indices);
+                }
+            }
+            Expr::Subquery(inner) => walk_stmt(inner, indices),
+            Expr::InSubquery { expr, query, .. } => {
+                walk_expr(expr, indices);
+                walk_stmt(query, indices);
+            }
+            Expr::Exists { query, .. } => walk_stmt(query, indices),
+            _ => {}
+        }
+    }
+    fn walk_stmt(stmt: &SelectStmt, indices: &mut Vec<usize>) {
+        for item in &stmt.columns {
+            if let SelectItem::Expr { expr, .. } = item {
+                walk_expr(expr, indices);
+            }
+        }
+        if let Some(ref wc) = stmt.where_clause {
+            walk_expr(wc, indices);
+        }
+        if let Some(ref h) = stmt.having {
+            walk_expr(h, indices);
+        }
+        for e in &stmt.group_by {
+            walk_expr(e, indices);
+        }
+        for ob in &stmt.order_by {
+            walk_expr(&ob.expr, indices);
+        }
+        for join in &stmt.joins {
+            if let JoinCondition::On(ref e) = join.condition {
+                walk_expr(e, indices);
+            }
+        }
+    }
+    walk_stmt(stmt, &mut indices);
+    indices.sort_unstable();
+    indices
+}
+
+/// Computes a hash key from the outer row values at the given column indices.
+fn hash_outer_params(outer_row: &[Value], col_indices: &[usize]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for &idx in col_indices {
+        let val = outer_row.get(idx).cloned().unwrap_or(Value::Null);
+        crate::eval::core::HashableValue(val).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// Returns `true` if the expression tree contains any `Expr::OuterColumn` node,
 /// meaning the subquery is correlated with an enclosing scope.
 fn expr_has_outer_ref(expr: &Expr) -> bool {
@@ -364,18 +487,34 @@ struct ExecSubqueryRunner<'a> {
     outer_row: &'a [Value],
     cache: Option<&'a mut SubqueryCache>,
     in_set_cache: Option<&'a mut InSetCache>,
+    correlated_cache: Option<&'a mut CorrelatedCache>,
 }
 
 impl<'a> SubqueryRunner for ExecSubqueryRunner<'a> {
     fn run(&mut self, stmt: &SelectStmt) -> Result<QueryResult, DbError> {
-        // Fast path: if the subquery is uncorrelated (no OuterColumn refs),
-        // check the cache before executing.
         let cache_key = std::ptr::from_ref(stmt) as usize;
         let is_uncorrelated = !stmt_has_outer_ref(stmt);
 
+        // Fast path 1: uncorrelated subquery — cache by AST pointer.
         if is_uncorrelated {
             if let Some(ref cache) = self.cache {
                 if let Some(cached) = cache.get(&cache_key) {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
+        // Fast path 2: correlated subquery — cache by (AST pointer, param hash).
+        // Inspired by MariaDB's Expression_cache (sql_expression_cache.h):
+        // cache results keyed by the outer column values that parameterize
+        // the inner query. Avoids re-execution when the same parameter
+        // combination appears multiple times.
+        if !is_uncorrelated {
+            if let Some(ref corr_cache) = self.correlated_cache {
+                let outer_indices = extract_outer_col_indices(stmt);
+                let param_hash = hash_outer_params(self.outer_row, &outer_indices);
+                let corr_key = (cache_key, param_hash);
+                if let Some(cached) = corr_cache.get(&corr_key) {
                     return Ok(cached.clone());
                 }
             }
@@ -394,6 +533,10 @@ impl<'a> SubqueryRunner for ExecSubqueryRunner<'a> {
             if let Some(ref mut cache) = self.cache {
                 cache.insert(cache_key, result.clone());
             }
+        } else if let Some(ref mut corr_cache) = self.correlated_cache {
+            let outer_indices = extract_outer_col_indices(stmt);
+            let param_hash = hash_outer_params(self.outer_row, &outer_indices);
+            corr_cache.insert((cache_key, param_hash), result.clone());
         }
 
         Ok(result)

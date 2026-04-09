@@ -28,6 +28,7 @@ fn execute_information_schema_select(
     let mut combined_rows: Vec<Row> = Vec::new();
     let mut sq_cache_is: SubqueryCache = HashMap::new();
     let mut in_set_cache_is: InSetCache = HashMap::new();
+    let mut corr_cache_is: CorrelatedCache = HashMap::new();
     for values in derived_rows {
         if let Some(ref wc) = stmt.where_clause {
             let mut temp_ctx = SessionContext::new();
@@ -40,6 +41,7 @@ fn execute_information_schema_select(
                 outer_row: &values,
                 cache: Some(&mut sq_cache_is),
                 in_set_cache: Some(&mut in_set_cache_is),
+                correlated_cache: Some(&mut corr_cache_is),
             };
             if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
                 continue;
