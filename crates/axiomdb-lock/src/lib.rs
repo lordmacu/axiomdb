@@ -7,14 +7,15 @@
 //! - FIFO wait queue with async `tokio::sync::Notify`
 //! - Per-transaction lock tracking for bulk release on COMMIT/ROLLBACK
 //!
-//! ## Phase 40.5 scope
+//! ## Scope
 //!
-//! Core lock manager infrastructure. Does NOT include:
-//! - Deadlock detection (40.6)
-//! - Implicit lock detection via RowHeader (40.7/40.11)
-//! - Executor integration (40.11)
+//! - 40.5: Core lock manager infrastructure
+//! - 40.6: Deadlock detection (Brent's cycle-finding, victim selection)
+//!
+//! Not yet: Implicit lock detection (40.7/40.11), executor integration (40.11).
 
 pub mod bitmap;
+pub(crate) mod deadlock;
 pub mod entry;
 pub mod manager;
 pub mod mode;
