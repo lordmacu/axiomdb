@@ -31,7 +31,7 @@ impl HeapChain {
         match insert_tuple(&mut page, data, txn_id) {
             Ok(slot_id) => {
                 page.update_checksum();
-                storage.write_page(last_page_id, &page)?;
+                storage.write_page_under_page_lock(last_page_id, &page)?;
                 // _latch dropped here (RAII)
                 Ok((last_page_id, slot_id))
             }
@@ -50,7 +50,7 @@ impl HeapChain {
 
                 // Latch ordering: new_page before last_page (prevents deadlock).
                 let _latch_new = locks.write(new_page_id);
-                storage.write_page(new_page_id, &new_page)?;
+                storage.write_page_under_page_lock(new_page_id, &new_page)?;
 
                 // Re-latch the old last page to update the chain pointer.
                 let _latch_prev = locks.write(last_page_id);
@@ -58,7 +58,7 @@ impl HeapChain {
                 let mut prev_page = Page::from_bytes(raw2)?;
                 chain_set_next_page(&mut prev_page, new_page_id);
                 prev_page.update_checksum();
-                storage.write_page(last_page_id, &prev_page)?;
+                storage.write_page_under_page_lock(last_page_id, &prev_page)?;
 
                 Ok((new_page_id, slot_id))
             }
@@ -84,30 +84,35 @@ impl HeapChain {
         let last_page_id =
             Self::resolve_tail_with_hint(storage, root_page_id, hint.as_deref_mut())?;
 
+        let locks = storage.page_lock_table();
+        let _latch = locks.write(last_page_id);
         let raw = *storage.read_page(last_page_id)?.as_bytes();
         let mut page = Page::from_bytes(raw)?;
 
         match insert_tuple(&mut page, data, txn_id) {
             Ok(slot_id) => {
                 page.update_checksum();
-                storage.write_page(last_page_id, &page)?;
+                storage.write_page_under_page_lock(last_page_id, &page)?;
                 // Hint stays valid — same tail page, nothing changed.
                 Ok((last_page_id, slot_id))
             }
             Err(DbError::HeapPageFull { .. }) => {
+                drop(_latch);
                 // Allocate new tail page and link it.
                 let new_page_id = storage.alloc_page(PageType::Data)?;
                 let mut new_page = Page::new(PageType::Data, new_page_id);
                 let slot_id = insert_tuple(&mut new_page, data, txn_id)?;
                 new_page.update_checksum();
                 // Step 1: write new page first (crash safety).
-                storage.write_page(new_page_id, &new_page)?;
+                let _latch_new = locks.write(new_page_id);
+                storage.write_page_under_page_lock(new_page_id, &new_page)?;
                 // Step 2: link from previous tail.
+                let _latch_prev = locks.write(last_page_id);
                 let raw2 = *storage.read_page(last_page_id)?.as_bytes();
                 let mut prev_page = Page::from_bytes(raw2)?;
                 chain_set_next_page(&mut prev_page, new_page_id);
                 prev_page.update_checksum();
-                storage.write_page(last_page_id, &prev_page)?;
+                storage.write_page_under_page_lock(last_page_id, &prev_page)?;
                 // Update hint to new tail.
                 if let Some(h) = hint {
                     h.root_page_id = root_page_id;
@@ -166,7 +171,7 @@ impl HeapChain {
         let mut page = Page::from_bytes(raw)?;
         crate::heap::delete_tuple(&mut page, slot_id, txn_id)?;
         page.update_checksum();
-        storage.write_page(page_id, &page)?;
+        storage.write_page_under_page_lock(page_id, &page)?;
         Ok(())
     }
 
@@ -247,7 +252,7 @@ impl HeapChain {
 
             // ── One checksum + one write for all slots on this page ───────────
             page.update_checksum();
-            storage.write_page(page_id, &page)?;
+            storage.write_page_under_page_lock(page_id, &page)?;
         }
 
         Ok(result)
@@ -287,6 +292,7 @@ impl HeapChain {
         let mut i = 0;
         while i < indexed.len() {
             let page_id = indexed[i].1;
+            let _latch = storage.page_lock_table().write(page_id);
             // Use into_page() to avoid 16KB copy from PageRef.
             let mut page = storage.read_page(page_id)?.into_page();
             let mut dirty = false;
@@ -304,7 +310,7 @@ impl HeapChain {
 
             if dirty {
                 page.update_checksum();
-                storage.write_page(page_id, &page)?;
+                storage.write_page_under_page_lock(page_id, &page)?;
             }
         }
 

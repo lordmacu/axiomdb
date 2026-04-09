@@ -12,6 +12,7 @@ fn execute_delete_ctx(
         storage,
         txn,
         ctx,
+        Some(conn_txn),
         &stmt.table,
     )?;
     let secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved

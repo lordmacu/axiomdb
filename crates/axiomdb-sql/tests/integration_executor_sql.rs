@@ -713,9 +713,8 @@ fn test_insert_with_column_default() {
 
     let r = rows(run("SELECT id, status FROM t", &mut storage, &mut txn));
     assert_eq!(r[0][0], Value::Int(1));
-    // status defaults to NULL when not specified via col list (no DEFAULT in executor yet)
-    // This test verifies the current behavior (NULL for omitted columns)
-    assert_eq!(r[0][1], Value::Null);
+    // status uses the column DEFAULT ('pending') when omitted from the column list.
+    assert_eq!(r[0][1], Value::Text("pending".into()));
 }
 
 // ── Full round-trip: CREATE → INSERT → SELECT → UPDATE → DELETE ──────────────

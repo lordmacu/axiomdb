@@ -289,7 +289,7 @@ fn dispatch_ctx(
         Stmt::ShowCollation => Ok(execute_show_collation()),
         // SHOW WARNINGS / SHOW ERRORS — return per-session warning list (5.9e)
         Stmt::ShowWarnings { limit } => {
-            let warnings: Vec<_> = ctx.warnings.iter().cloned().collect();
+            let warnings = ctx.warnings.to_vec();
             let mut result = show_warnings_result(&warnings);
             if let Some(n) = limit {
                 if let QueryResult::Rows { ref mut rows, .. } = result {

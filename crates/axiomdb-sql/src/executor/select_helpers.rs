@@ -123,6 +123,9 @@ fn execute_select_with_joins(
     if stmt.distinct {
         rows = apply_distinct_with_session(rows);
     }
+    if stmt.calc_found_rows {
+        set_found_rows(rows.len() as u64);
+    }
     // LIMIT/OFFSET applied after deduplication.
     rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
 

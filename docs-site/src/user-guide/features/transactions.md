@@ -301,6 +301,11 @@ COMMIT;
 If any step fails (constraint violation, connection drop, server crash), the WAL
 ensures the entire transaction is rolled back on recovery.
 
+The same safety rule now applies to connection cleanup paths. If a client has an
+open implicit or explicit transaction and then sends `COM_RESET_CONNECTION`,
+`COM_CHANGE_USER`, or disconnects without committing, AxiomDB rolls that
+transaction back before releasing the session.
+
 <div class="callout callout-tip">
 <span class="callout-icon">💡</span>
 <div class="callout-body">

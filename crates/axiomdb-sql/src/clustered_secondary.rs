@@ -11,7 +11,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axiomdb_catalog::IndexDef;
-use axiomdb_core::{error::DbError, RecordId};
+use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
 use axiomdb_index::BTree;
 use axiomdb_storage::StorageEngine;
 use axiomdb_types::Value;
@@ -214,6 +214,34 @@ impl ClusteredSecondaryLayout {
         root_page_id: &AtomicU64,
         row: &[Value],
     ) -> Result<bool, DbError> {
+        self.insert_row_maybe_visible(storage, root_page_id, None, None, row)
+    }
+
+    pub fn insert_row_visible(
+        &self,
+        storage: &mut dyn StorageEngine,
+        root_page_id: &AtomicU64,
+        table_root_page_id: u64,
+        snap: &TransactionSnapshot,
+        row: &[Value],
+    ) -> Result<bool, DbError> {
+        self.insert_row_maybe_visible(
+            storage,
+            root_page_id,
+            Some(table_root_page_id),
+            Some(snap),
+            row,
+        )
+    }
+
+    fn insert_row_maybe_visible(
+        &self,
+        storage: &mut dyn StorageEngine,
+        root_page_id: &AtomicU64,
+        table_root_page_id: Option<u64>,
+        snap: Option<&TransactionSnapshot>,
+        row: &[Value],
+    ) -> Result<bool, DbError> {
         let Some(entry) = self.entry_from_row(row)? else {
             return Ok(false);
         };
@@ -224,6 +252,8 @@ impl ClusteredSecondaryLayout {
                 root_page_id.load(Ordering::Acquire),
                 &entry.logical_key,
                 None,
+                table_root_page_id,
+                snap,
             )?;
         }
 
@@ -265,6 +295,37 @@ impl ClusteredSecondaryLayout {
         old_row: &[Value],
         new_row: &[Value],
     ) -> Result<ClusteredSecondaryUpdateOutcome, DbError> {
+        self.update_row_maybe_visible(storage, root_page_id, None, None, old_row, new_row)
+    }
+
+    pub fn update_row_visible(
+        &self,
+        storage: &mut dyn StorageEngine,
+        root_page_id: &AtomicU64,
+        table_root_page_id: u64,
+        snap: &TransactionSnapshot,
+        old_row: &[Value],
+        new_row: &[Value],
+    ) -> Result<ClusteredSecondaryUpdateOutcome, DbError> {
+        self.update_row_maybe_visible(
+            storage,
+            root_page_id,
+            Some(table_root_page_id),
+            Some(snap),
+            old_row,
+            new_row,
+        )
+    }
+
+    fn update_row_maybe_visible(
+        &self,
+        storage: &mut dyn StorageEngine,
+        root_page_id: &AtomicU64,
+        table_root_page_id: Option<u64>,
+        snap: Option<&TransactionSnapshot>,
+        old_row: &[Value],
+        new_row: &[Value],
+    ) -> Result<ClusteredSecondaryUpdateOutcome, DbError> {
         let old_entry = self.entry_from_row(old_row)?;
         let new_entry = self.entry_from_row(new_row)?;
 
@@ -280,8 +341,11 @@ impl ClusteredSecondaryLayout {
                         root_page_id.load(Ordering::Acquire),
                         &new.logical_key,
                         None,
+                        table_root_page_id,
+                        snap,
                     )?;
                 }
+                let _ = BTree::delete_in(storage, root_page_id, &new.physical_key);
                 BTree::insert_in(
                     storage,
                     root_page_id,
@@ -302,9 +366,12 @@ impl ClusteredSecondaryLayout {
                         root_page_id.load(Ordering::Acquire),
                         &new.logical_key,
                         Some(&old.physical_key),
+                        table_root_page_id,
+                        snap,
                     )?;
                 }
                 let _ = BTree::delete_in(storage, root_page_id, &old.physical_key)?;
+                let _ = BTree::delete_in(storage, root_page_id, &new.physical_key);
                 BTree::insert_in(
                     storage,
                     root_page_id,
@@ -323,12 +390,35 @@ impl ClusteredSecondaryLayout {
         root_page_id: u64,
         logical_key: &[Value],
         excluded_physical_key: Option<&[u8]>,
+        table_root_page_id: Option<u64>,
+        snap: Option<&TransactionSnapshot>,
     ) -> Result<(), DbError> {
         let matches = self.scan_prefix(storage, root_page_id, logical_key)?;
         let conflict = matches.into_iter().any(|entry| {
-            excluded_physical_key
-                .map(|excluded| entry.physical_key.as_slice() != excluded)
-                .unwrap_or(true)
+            if excluded_physical_key
+                .map(|excluded| entry.physical_key.as_slice() == excluded)
+                .unwrap_or(false)
+            {
+                return false;
+            }
+
+            if let (Some(table_root_page_id), Some(snap)) = (table_root_page_id, snap) {
+                let pk_key = match encode_index_key(&entry.primary_key) {
+                    Ok(pk_key) => pk_key,
+                    Err(_) => return true,
+                };
+
+                return axiomdb_storage::clustered_tree::lookup(
+                    storage,
+                    Some(table_root_page_id),
+                    &pk_key,
+                    snap,
+                )
+                .map(|row| row.is_some())
+                .unwrap_or(true);
+            }
+
+            true
         });
 
         if conflict {

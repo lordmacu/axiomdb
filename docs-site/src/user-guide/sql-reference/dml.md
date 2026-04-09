@@ -1201,6 +1201,11 @@ The flag is session-local. It affects:
 - `COM_STMT_PREPARE` / `COM_STMT_EXECUTE`
 - plan-cache normalization for ad-hoc SQL
 
+When `ANSI_QUOTES` is OFF, a double-quoted string also shields raw SQL helpers:
+
+- `SELECT "a ? b", ?` counts only the second `?` as a prepared-statement parameter
+- `SELECT "a;b"; SELECT 1;` splits into two statements, not three
+
 That means prepared statements keep the quote mode that was active when they
 were prepared, even if `@@sql_mode` changes later for the connection.
 

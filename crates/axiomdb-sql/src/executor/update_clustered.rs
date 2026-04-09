@@ -49,9 +49,10 @@ fn execute_clustered_update(
     let pk_might_change = assignments.iter().any(|(col_pos, _)| pk_col_positions.contains(col_pos));
     let has_affected_secondary = secondary_indexes.iter().any(|idx| {
         !idx.is_primary
-            && idx.columns.iter().any(|c| {
-                assignments.iter().any(|(a_pos, _)| *a_pos == c.col_idx as usize)
-            })
+            && (idx.predicate.is_some()
+                || idx.columns.iter().any(|c| {
+                    assignments.iter().any(|(a_pos, _)| *a_pos == c.col_idx as usize)
+                }))
     });
 
     let access_method = where_clause
@@ -185,19 +186,24 @@ fn execute_clustered_update(
     let mut changed_count = 0u64;
 
     let primary_idx = clustered_update_primary_index(resolved)?;
+    let compiled_secondary_preds =
+        crate::partial_index::compile_index_predicates(secondary_indexes, schema_cols)?;
     let secondary_layouts: Vec<(
         &axiomdb_catalog::IndexDef,
+        Option<crate::expr::Expr>,
         crate::clustered_secondary::ClusteredSecondaryLayout,
         std::sync::atomic::AtomicU64,
     )> = secondary_indexes
         .iter()
-        .filter(|idx| !idx.is_primary && !idx.columns.is_empty())
-        .filter_map(|idx| {
+        .zip(compiled_secondary_preds.iter())
+        .filter(|(idx, _)| !idx.is_primary && !idx.columns.is_empty())
+        .filter_map(|(idx, compiled_pred)| {
             crate::clustered_secondary::ClusteredSecondaryLayout::derive(idx, primary_idx)
                 .ok()
                 .map(|layout| {
                     (
                         idx,
+                        compiled_pred.clone(),
                         layout,
                         std::sync::atomic::AtomicU64::new(idx.root_page_id),
                     )
@@ -321,11 +327,13 @@ fn execute_clustered_update(
                 axiomdb_wal::ClusteredRowImage::new(root_pid, new_header, &new_row_data);
             txn.record_clustered_insert(conn_txn, resolved.def.id, &new_pk_key, &inserted_image)?;
 
-            for (idx, layout, sec_root) in &secondary_layouts {
+            for (idx, compiled_pred, layout, sec_root) in &secondary_layouts {
                 apply_clustered_secondary_update(
                     idx,
+                    compiled_pred.as_ref(),
                     layout,
                     sec_root,
+                    root_pid,
                     &candidate.values,
                     &new_values,
                     storage,
@@ -391,18 +399,21 @@ fn execute_clustered_update(
                 Err(err) => return Err(err),
             }
 
-            let any_sec_col_changed = secondary_layouts.iter().any(|(idx, _, _)| {
-                idx.columns.iter().any(|c| {
-                    let pos = c.col_idx as usize;
-                    candidate.values.get(pos) != new_values.get(pos)
-                })
+            let any_sec_col_changed = secondary_layouts.iter().any(|(idx, _, _, _)| {
+                idx.predicate.is_some()
+                    || idx.columns.iter().any(|c| {
+                        let pos = c.col_idx as usize;
+                        candidate.values.get(pos) != new_values.get(pos)
+                    })
             });
             if any_sec_col_changed {
-                for (idx, layout, sec_root) in &secondary_layouts {
+                for (idx, compiled_pred, layout, sec_root) in &secondary_layouts {
                     apply_clustered_secondary_update(
                         idx,
+                        compiled_pred.as_ref(),
                         layout,
                         sec_root,
+                        root_pid,
                         &candidate.values,
                         &new_values,
                         storage,
@@ -422,7 +433,7 @@ fn execute_clustered_update(
             .update_table_root(resolved.def.id, root_pid)?;
     }
 
-    for (idx, _, sec_root) in &secondary_layouts {
+    for (idx, _, _, sec_root) in &secondary_layouts {
         let current = sec_root.load(std::sync::atomic::Ordering::Acquire);
         if current != idx.root_page_id {
             axiomdb_catalog::CatalogWriter::new(storage, txn, conn_txn)?
@@ -479,4 +490,3 @@ fn apply_order_by_limit_to_clustered_update_candidates(
     }
     Ok(candidates)
 }
-

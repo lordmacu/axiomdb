@@ -81,6 +81,32 @@ fn build_query_err_packet(e: &DbError, sql: &str, session: &ConnectionState) -> 
     }
 }
 
+async fn rollback_active_session_txn(
+    db: &Arc<RwLock<Database>>,
+    session: &mut SessionContext,
+    conn_id: u32,
+    reason: &str,
+) {
+    if session.conn_txn.is_none() {
+        return;
+    }
+
+    debug!(
+        conn_id,
+        reason = reason,
+        "rolling back active session transaction during connection cleanup"
+    );
+    let mut guard = db.write().await;
+    if let Err(e) = guard.execute_stmt(Stmt::Rollback, session) {
+        warn!(
+            conn_id,
+            reason = reason,
+            err = %e,
+            "failed to rollback active session transaction during connection cleanup"
+        );
+    }
+}
+
 /// Handles one MySQL connection from handshake to disconnection.
 pub async fn handle_connection(stream: TcpStream, db: Arc<RwLock<Database>>, conn_id: u32) {
     handle_connection_with_timeouts(stream, db, conn_id, LifecycleTimeouts::default()).await;
@@ -909,6 +935,8 @@ pub async fn handle_connection_with_timeouts(
 
             // COM_RESET_CONNECTION
             0x1f => {
+                rollback_active_session_txn(&db, &mut session, conn_id, "COM_RESET_CONNECTION")
+                    .await;
                 session = SessionContext::new();
                 conn_state = ConnectionState::new();
                 // Restore the codec limit to the default after session reset.
@@ -1409,6 +1437,7 @@ pub async fn handle_connection_with_timeouts(
             // Reset session state and reply OK, identical to COM_RESET_CONNECTION (5.11d).
             0x11 => {
                 debug!(conn_id, "COM_CHANGE_USER — reset session");
+                rollback_active_session_txn(&db, &mut session, conn_id, "COM_CHANGE_USER").await;
                 session = SessionContext::new();
                 conn_state = ConnectionState::new();
                 reader
@@ -1482,6 +1511,7 @@ pub async fn handle_connection_with_timeouts(
         }
     }
 
+    rollback_active_session_txn(&db, &mut session, conn_id, "connection_close").await;
     info!(conn_id, "connection closed");
 }
 

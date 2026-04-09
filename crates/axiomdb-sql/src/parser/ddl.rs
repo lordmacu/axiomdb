@@ -179,11 +179,8 @@ fn skip_table_options(p: &mut Parser) {
                 if matches!(p.peek(), Token::Set) {
                     p.advance();
                 } // SET
-                if p.eat(&Token::Eq) {
-                    skip_table_option_value(p);
-                } else {
-                    skip_table_option_value(p);
-                }
+                p.eat(&Token::Eq);
+                skip_table_option_value(p);
             }
             // DEFAULT keyword was consumed but nothing followed — stop.
             _ if had_default => break,
@@ -929,11 +926,15 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
             // ADD [UNIQUE] [INDEX|KEY] [name] (cols)
             Token::Add => {
                 p.advance();
-                // Peek: is this ADD CONSTRAINT or ADD UNIQUE (without CONSTRAINT keyword)?
-                if matches!(p.peek(), Token::Constraint) {
-                    // ADD CONSTRAINT name <type>
-                    // Do NOT pre-consume CONSTRAINT — parse_table_constraint
-                    // handles the optional CONSTRAINT name prefix itself.
+                // Constraint forms:
+                // ADD CONSTRAINT name <type>
+                // ADD PRIMARY KEY (...)
+                // ADD FOREIGN KEY (...)
+                // ADD CHECK (...)
+                if matches!(
+                    p.peek(),
+                    Token::Constraint | Token::Primary | Token::Foreign | Token::Check
+                ) {
                     let constraint = parse_table_constraint(p)?;
                     AlterTableOp::AddConstraint(constraint)
                 } else if matches!(p.peek(), Token::Index | Token::Key) {
@@ -954,7 +955,7 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                     // ADD UNIQUE [INDEX|KEY] [name] (cols)  OR  ADD UNIQUE (constraint)
                     p.advance(); // consume UNIQUE
                     if matches!(p.peek(), Token::Index)
-                        || matches!(p.peek(), Token::Ident(ref kw) if kw.eq_ignore_ascii_case("key"))
+                        || matches!(p.peek(), Token::Ident(kw) if kw.eq_ignore_ascii_case("key"))
                     {
                         // ADD UNIQUE INDEX [name] (cols)
                         p.advance();
@@ -1040,7 +1041,7 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                 AlterTableOp::ModifyColumn(col_def)
             }
             // CHANGE [COLUMN] old_col_name new_col_def
-            Token::Ident(ref kw) if kw.eq_ignore_ascii_case("change") => {
+            Token::Ident(kw) if kw.eq_ignore_ascii_case("change") => {
                 p.advance();
                 p.eat(&Token::Column); // optional COLUMN keyword
                 let old_name = p.parse_identifier()?;
@@ -1090,15 +1091,15 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                 }
             }
             // CONVERT TO CHARACTER SET charset [COLLATE collation]
-            Token::Ident(ref kw) if kw.eq_ignore_ascii_case("convert") => {
+            Token::Ident(kw) if kw.eq_ignore_ascii_case("convert") => {
                 p.advance();
                 p.expect(&Token::To)?;
                 // expect CHARACTER SET or CHARSET (either form)
                 match p.peek().clone() {
-                    Token::Ident(ref s) if s.eq_ignore_ascii_case("charset") => {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("charset") => {
                         p.advance();
                     }
-                    Token::Ident(ref s) if s.eq_ignore_ascii_case("character") => {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("character") => {
                         p.advance(); // CHARACTER
                                      // SET is Token::Set
                         p.eat(&Token::Set);
@@ -1108,7 +1109,7 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                 // consume charset name
                 let _ = p.parse_identifier();
                 // optional COLLATE collation
-                if let Token::Ident(ref s) = p.peek().clone() {
+                if let Token::Ident(s) = p.peek().clone() {
                     if s.eq_ignore_ascii_case("collate") {
                         p.advance();
                         let _ = p.parse_identifier();
@@ -1130,7 +1131,7 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                 AlterTableOp::SetAutoIncrement(n)
             }
             // ENGINE = name
-            Token::Ident(ref kw) if kw.eq_ignore_ascii_case("engine") => {
+            Token::Ident(kw) if kw.eq_ignore_ascii_case("engine") => {
                 p.advance();
                 p.eat(&Token::Eq);
                 let _ = p.parse_identifier();

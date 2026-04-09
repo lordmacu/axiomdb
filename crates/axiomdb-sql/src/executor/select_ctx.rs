@@ -340,6 +340,7 @@ fn execute_select_ctx(
                     let scan_limit = if stmt.order_by.is_empty()
                         && stmt.group_by.is_empty()
                         && stmt.having.is_none()
+                        && !stmt.calc_found_rows
                     {
                         stmt.limit.as_ref().and_then(|expr| match expr {
                             Expr::Literal(Value::Int(n)) => Some(*n as usize),
@@ -643,7 +644,11 @@ fn execute_select_ctx(
 
         let resolved_ob = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
         // Top-N optimization: partial sort when ORDER BY + LIMIT present.
-        if !resolved_ob.is_empty() && stmt.limit.is_some() && !stmt.distinct {
+        if !resolved_ob.is_empty()
+            && stmt.limit.is_some()
+            && !stmt.distinct
+            && !stmt.calc_found_rows
+        {
             let (limit_n, offset_n) = eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
             let top_n = offset_n + limit_n.unwrap_or(usize::MAX).min(usize::MAX - offset_n);
             combined_rows = apply_order_by_top_n(combined_rows, &resolved_ob, top_n)?;

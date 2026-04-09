@@ -16,6 +16,7 @@ use axiomdb_sql::{
     QueryResult, SessionContext,
 };
 use axiomdb_storage::{MmapStorage, Page, PageType, StorageEngine};
+use axiomdb_types::Value;
 use axiomdb_wal::TxnManager;
 use std::path::PathBuf;
 
@@ -142,6 +143,22 @@ fn count_index_entries(
         .len()
 }
 
+/// Counts visible rows in a table via SQL SELECT COUNT(*).
+/// Works for both heap and clustered tables.
+fn count_table_rows(storage: &mut MmapStorage, txn: &mut TxnManager, table_name: &str) -> usize {
+    let mut bloom = BloomRegistry::new();
+    let mut ctx = SessionContext::new();
+    let sql = format!("SELECT COUNT(*) FROM {table_name}");
+    match run_sql(storage, txn, &mut bloom, &mut ctx, &sql).expect("count rows") {
+        QueryResult::Rows { rows, .. } => match &rows[0][0] {
+            Value::BigInt(n) => *n as usize,
+            Value::Int(n) => *n as usize,
+            other => panic!("unexpected count value: {other:?}"),
+        },
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_verify_and_repair_rebuilds_missing_unique_index_entry() {
     let db = DiskDb::create(&[
@@ -159,7 +176,10 @@ fn test_verify_and_repair_rebuilds_missing_unique_index_entry() {
         verify_and_repair_indexes_on_open(&mut storage, &mut txn).expect("rebuild missing entry");
 
     assert_eq!(report.tables_checked, 1);
-    assert_eq!(report.indexes_checked, 2, "PK + unique secondary");
+    assert_eq!(
+        report.indexes_checked, 1,
+        "only uq_email — clustered PK is the B-tree itself, not a separate index"
+    );
     assert_eq!(
         report.rebuilt_indexes.len(),
         1,
@@ -167,17 +187,16 @@ fn test_verify_and_repair_rebuilds_missing_unique_index_entry() {
     );
     assert_eq!(report.rebuilt_indexes[0].table_name, "users");
     assert_eq!(report.rebuilt_indexes[0].index_name, "uq_email");
-    assert_eq!(
-        count_index_entries(&storage, &txn, "users", "users_pkey"),
-        3
-    );
+    // For a clustered table the PK is the B-tree data structure itself — use
+    // a row count instead of BTree::range_in which expects secondary-index pages.
+    assert_eq!(count_table_rows(&mut storage, &mut txn, "users"), 3);
     assert_eq!(count_index_entries(&storage, &txn, "users", "uq_email"), 3);
     drop(txn);
     drop(storage);
 
     let (mut storage, mut txn) = db.open_recovered();
     assert_eq!(
-        count_index_entries(&storage, &txn, "users", "users_pkey"),
+        count_table_rows(&mut storage, &mut txn, "users"),
         3,
         "repair must not damage the primary key index across reopen"
     );

@@ -12,6 +12,7 @@ impl TableEngine {
         table_def: &TableDef,
         columns: &[ColumnDef],
         ctx: &mut SessionContext,
+        conn_txn: &mut axiomdb_wal::ConnectionTxn,
         values: Vec<Value>,
         row_num: usize,
     ) -> Result<RecordId, DbError> {
@@ -46,9 +47,7 @@ impl TableEngine {
 
         let key = encode_rid(page_id, slot_id);
         txn.record_insert(
-            ctx.conn_txn
-                .as_mut()
-                .expect("active txn for insert_row_with_ctx"),
+            conn_txn,
             table_def.id,
             &key,
             &encoded,
@@ -66,6 +65,7 @@ impl TableEngine {
         table_def: &TableDef,
         columns: &[ColumnDef],
         ctx: &mut SessionContext,
+        conn_txn: &mut axiomdb_wal::ConnectionTxn,
         batch: &[Vec<Value>],
     ) -> Result<Vec<RecordId>, DbError> {
         ensure_heap_table(table_def, "INSERT into clustered table — Phase 39.14")?;
@@ -131,9 +131,7 @@ impl TableEngine {
             .map(|(pid, slots)| (*pid, slots.as_slice()))
             .collect();
         txn.record_page_writes(
-            ctx.conn_txn
-                .as_mut()
-                .expect("active txn for insert_rows_batch_with_ctx"),
+            conn_txn,
             table_def.id,
             &pw_refs,
         )?;
@@ -155,6 +153,7 @@ impl TableEngine {
         table_def: &TableDef,
         columns: &[ColumnDef],
         ctx: &mut SessionContext,
+        conn_txn: &mut axiomdb_wal::ConnectionTxn,
         record_id: RecordId,
         new_values: Vec<Value>,
     ) -> Result<RecordId, DbError> {
@@ -173,9 +172,7 @@ impl TableEngine {
         let new_rid = update_encoded_row_with_hint(
             storage,
             txn,
-            ctx.conn_txn
-                .as_mut()
-                .expect("active txn for update_row_with_ctx"),
+            conn_txn,
             table_def,
             record_id,
             &new_encoded,
@@ -197,6 +194,7 @@ impl TableEngine {
         table_def: &TableDef,
         columns: &[ColumnDef],
         ctx: &mut SessionContext,
+        conn_txn: &mut axiomdb_wal::ConnectionTxn,
         updates: Vec<(RecordId, Vec<Value>)>,
     ) -> Result<u64, DbError> {
         ensure_heap_table(table_def, "UPDATE on clustered table — Phase 39.16")?;
@@ -209,9 +207,7 @@ impl TableEngine {
         Self::delete_rows_batch(
             storage,
             txn,
-            ctx.conn_txn
-                .as_mut()
-                .expect("active txn for delete_in_update_ctx"),
+            conn_txn,
             table_def,
             &rids,
         )?;
@@ -249,7 +245,7 @@ impl TableEngine {
             .map(|(pid, slots)| (*pid, slots.as_slice()))
             .collect();
         txn.record_page_writes(
-            ctx.conn_txn.as_mut().expect("active txn for batch ctx"),
+            conn_txn,
             table_def.id,
             &pw_refs,
         )?;

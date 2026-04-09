@@ -188,7 +188,7 @@ pub(super) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
         BinaryOp::ShiftLeft => {
             let n = value_to_i64_bits(&l);
             let s = value_to_i64_bits(&r);
-            if s < 0 || s >= 64 {
+            if !(0..64).contains(&s) {
                 Ok(Value::BigInt(0))
             } else {
                 Ok(Value::BigInt(n << s))
@@ -197,7 +197,7 @@ pub(super) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
         BinaryOp::ShiftRight => {
             let n = value_to_i64_bits(&l) as u64;
             let s = value_to_i64_bits(&r);
-            if s < 0 || s >= 64 {
+            if !(0..64).contains(&s) {
                 Ok(Value::BigInt(0))
             } else {
                 Ok(Value::BigInt((n >> s) as i64))
@@ -554,7 +554,7 @@ pub fn like_match_with_escape(text: &str, pattern: &str, escape_ch: char) -> boo
         if pi < m && pat[pi] == escape_ch {
             // Escaped character: treat next pattern char as literal.
             pi += 1;
-            if pi < m && pi < m && pat[pi] == text[ti] {
+            if pi < m && pat[pi] == text[ti] {
                 ti += 1;
                 pi += 1;
             } else if let Some(spi) = star_pi {

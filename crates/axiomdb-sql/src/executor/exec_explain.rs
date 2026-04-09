@@ -182,7 +182,10 @@ fn explain_select(
         }
     };
 
-    let resolved = resolve_table_cached(storage, txn, ctx, from_table_ref)?;
+    let conn = ctx.conn_txn.take();
+    let resolved = resolve_table_cached(storage, txn, ctx, conn.as_ref(), from_table_ref);
+    ctx.conn_txn = conn;
+    let resolved = resolved?;
     let snap = ctx
         .conn_txn
         .as_ref()

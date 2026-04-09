@@ -357,11 +357,21 @@ impl axiomdb_storage::StorageEngine for CountingStorage {
     ) -> Result<(), axiomdb_core::error::DbError> {
         self.inner.write_page(id, p)
     }
+    fn write_page_under_page_lock(
+        &self,
+        id: u64,
+        p: &axiomdb_storage::Page,
+    ) -> Result<(), axiomdb_core::error::DbError> {
+        self.inner.write_page_under_page_lock(id, p)
+    }
     fn page_count(&self) -> u64 {
         self.inner.page_count()
     }
     fn flush(&self) -> Result<(), axiomdb_core::error::DbError> {
         self.inner.flush()
+    }
+    fn page_lock_table(&self) -> &axiomdb_storage::page_lock::PageLockTable {
+        self.inner.page_lock_table()
     }
 }
 

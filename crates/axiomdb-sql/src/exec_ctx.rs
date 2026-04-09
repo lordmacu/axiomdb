@@ -129,7 +129,7 @@ impl<'a> ExecutionContext<'a> {
     pub(crate) unsafe fn storage_mut(&self) -> &'a mut dyn axiomdb_storage::StorageEngine {
         // SAFETY: see doc comment above. The pointer is valid for 'a and we
         // ensure no aliased mutable references exist (single-writer constraint).
-        #[allow(clippy::cast_ref_to_mut)]
+        #[allow(invalid_reference_casting)]
         let mptr: *mut (dyn axiomdb_storage::StorageEngine + 'a) =
             self.storage_ptr as *mut (dyn axiomdb_storage::StorageEngine + 'a);
         &mut *mptr
@@ -144,7 +144,7 @@ impl<'a> ExecutionContext<'a> {
     #[allow(clippy::mut_from_ref)]
     pub(crate) unsafe fn coord_mut(&self) -> &'a mut axiomdb_wal::TxnManager {
         // SAFETY: see doc comment above.
-        #[allow(clippy::cast_ref_to_mut)]
+        #[allow(invalid_reference_casting)]
         &mut *(self.coord_ptr as *mut axiomdb_wal::TxnManager)
     }
 
@@ -158,7 +158,7 @@ impl<'a> ExecutionContext<'a> {
     #[allow(clippy::mut_from_ref)]
     pub(crate) unsafe fn bloom_mut(&self) -> &'a mut crate::bloom::BloomRegistry {
         // SAFETY: see doc comment above.
-        #[allow(clippy::cast_ref_to_mut)]
+        #[allow(invalid_reference_casting)]
         &mut *(self.bloom_ptr as *mut crate::bloom::BloomRegistry)
     }
 }

@@ -275,6 +275,11 @@ fn enqueue_clustered_insert_ctx(
 
     let mut count = 0u64;
     let mut first_generated = None;
+    let statement_start_len = ctx
+        .clustered_insert_batch
+        .as_ref()
+        .map_or(0, |batch| batch.rows.len());
+    let mut statement_staged_pks: Vec<Vec<u8>> = Vec::new();
 
     let rows = match stmt.source {
         InsertSource::Values(rows) => rows,
@@ -349,7 +354,12 @@ fn enqueue_clustered_insert_ctx(
                 .name
                 .clone();
             let pk_first = prepared.primary_key_values.first().map(|v| format!("{v}"));
-            ctx.clustered_insert_batch = None; // discard batch
+            if let Some(batch) = ctx.clustered_insert_batch.as_mut() {
+                batch.rows.truncate(statement_start_len);
+                for pk in &statement_staged_pks {
+                    batch.staged_pks.remove(pk);
+                }
+            }
             return Err(DbError::UniqueViolation {
                 index_name: idx_name,
                 value: pk_first,
@@ -358,6 +368,7 @@ fn enqueue_clustered_insert_ctx(
 
         let batch = ctx.clustered_insert_batch.as_mut().unwrap();
         batch.staged_pks.insert(prepared.primary_key_bytes.clone());
+        statement_staged_pks.push(prepared.primary_key_bytes.clone());
         batch.rows.push(crate::session::StagedClusteredRow {
             values: prepared.values,
             encoded_row: prepared.encoded_row,

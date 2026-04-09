@@ -71,9 +71,7 @@ fn execute_create_schema(
         if stmt.if_not_exists {
             return Ok(QueryResult::Empty);
         }
-        return Err(DbError::SchemaAlreadyExists {
-            name: stmt.name,
-        });
+        return Err(DbError::SchemaAlreadyExists { name: stmt.name });
     }
     CatalogWriter::new(storage, txn, conn_txn)?.create_schema(database, &stmt.name)?;
     Ok(QueryResult::Affected {
@@ -108,12 +106,19 @@ fn execute_drop_database(
     };
 
     for table in tables {
-        let conn = ctx.conn_txn.as_mut().expect("conn_txn for drop_database tables");
+        let conn = ctx
+            .conn_txn
+            .as_mut()
+            .expect("conn_txn for drop_database tables");
         drop_table_fully(storage, txn, conn, table.id)?;
     }
     {
-        let conn = ctx.conn_txn.as_mut().expect("conn_txn for drop_database bindings");
-        CatalogWriter::new(storage, txn, conn)?.drop_table_database_bindings_for_database(&stmt.name)?;
+        let conn = ctx
+            .conn_txn
+            .as_mut()
+            .expect("conn_txn for drop_database bindings");
+        CatalogWriter::new(storage, txn, conn)?
+            .drop_table_database_bindings_for_database(&stmt.name)?;
         let conn = ctx.conn_txn.as_mut().expect("conn_txn for drop_database");
         let _ = CatalogWriter::new(storage, txn, conn)?.drop_database(&stmt.name)?;
     }
@@ -145,14 +150,20 @@ fn execute_show_tables(
             .into_iter()
             .map(|t| vec![Value::Text(t.table_name), Value::Text("BASE TABLE".into())])
             .collect();
-        Ok(QueryResult::Rows { columns: out_cols, rows })
+        Ok(QueryResult::Rows {
+            columns: out_cols,
+            rows,
+        })
     } else {
         let out_cols = vec![ColumnMeta::computed(col_name, DataType::Text)];
         let rows: Vec<Row> = tables
             .into_iter()
             .map(|t| vec![Value::Text(t.table_name)])
             .collect();
-        Ok(QueryResult::Rows { columns: out_cols, rows })
+        Ok(QueryResult::Rows {
+            columns: out_cols,
+            rows,
+        })
     }
 }
 
@@ -167,12 +178,11 @@ fn execute_show_columns(
     let snap = txn.active_snapshot(conn_txn);
     let mut reader = CatalogReader::new(storage, snap)?;
 
-    let table_def =
-        reader
-            .get_table_in_database(database, schema, &stmt.table.name)?
-            .ok_or_else(|| DbError::TableNotFound {
-                name: stmt.table.name.clone(),
-            })?;
+    let table_def = reader
+        .get_table_in_database(database, schema, &stmt.table.name)?
+        .ok_or_else(|| DbError::TableNotFound {
+            name: stmt.table.name.clone(),
+        })?;
     let columns = reader.list_columns(table_def.id)?;
 
     let base_cols = vec![
@@ -199,7 +209,11 @@ fn execute_show_columns(
         .map(|c| {
             let type_str = column_type_to_sql_name(c.col_type);
             let null_str = if c.nullable { "YES" } else { "NO" };
-            let extra = if c.auto_increment { "auto_increment" } else { "" };
+            let extra = if c.auto_increment {
+                "auto_increment"
+            } else {
+                ""
+            };
             let mut row = vec![
                 Value::Text(c.name.clone()),
                 Value::Text(type_str.into()),
@@ -247,12 +261,11 @@ pub(crate) fn execute_show_index(
     let snap = txn.active_snapshot(conn_txn);
     let mut reader = CatalogReader::new(storage, snap)?;
 
-    let table_def =
-        reader
-            .get_table_in_database(database, schema, &stmt.table.name)?
-            .ok_or_else(|| DbError::TableNotFound {
-                name: stmt.table.name.clone(),
-            })?;
+    let table_def = reader
+        .get_table_in_database(database, schema, &stmt.table.name)?
+        .ok_or_else(|| DbError::TableNotFound {
+            name: stmt.table.name.clone(),
+        })?;
     let col_defs = reader.list_columns(table_def.id)?;
     let indexes = reader.list_indexes(table_def.id)?;
 
@@ -308,15 +321,15 @@ pub(crate) fn execute_show_index(
                 Value::Text(key_name.clone()),
                 Value::Int((seq + 1) as i32),
                 Value::Text(col_name),
-                Value::Text("A".into()),    // Collation: Ascending
-                Value::Int(0),              // Cardinality: unknown (stats deferred)
-                Value::Null,                // Sub_part
-                Value::Null,                // Packed
+                Value::Text("A".into()), // Collation: Ascending
+                Value::Int(0),           // Cardinality: unknown (stats deferred)
+                Value::Null,             // Sub_part
+                Value::Null,             // Packed
                 Value::Text(nullable_flag.into()),
                 Value::Text("BTREE".into()),
-                Value::Text("".into()),     // Comment
-                Value::Text("".into()),     // Index_comment
-                Value::Text("YES".into()),  // Visible
+                Value::Text("".into()),    // Comment
+                Value::Text("".into()),    // Index_comment
+                Value::Text("YES".into()), // Visible
             ]);
         }
     }
@@ -345,7 +358,9 @@ fn execute_show_create_table(
 
     let table_def = reader
         .get_table_in_database(database, schema, &stmt.table.name)?
-        .ok_or_else(|| DbError::TableNotFound { name: stmt.table.name.clone() })?;
+        .ok_or_else(|| DbError::TableNotFound {
+            name: stmt.table.name.clone(),
+        })?;
 
     let columns = reader.list_columns(table_def.id)?;
     let indexes = reader.list_indexes(table_def.id)?;
@@ -356,13 +371,22 @@ fn execute_show_create_table(
     for col in &columns {
         let type_str = column_type_to_sql_name(col.col_type);
         let null_str = if col.nullable { "" } else { " NOT NULL" };
-        let extra = if col.auto_increment { " AUTO_INCREMENT" } else { "" };
-        ddl.push_str(&format!("  `{}` {}{}{},\n", col.name, type_str, null_str, extra));
+        let extra = if col.auto_increment {
+            " AUTO_INCREMENT"
+        } else {
+            ""
+        };
+        ddl.push_str(&format!(
+            "  `{}` {}{}{},\n",
+            col.name, type_str, null_str, extra
+        ));
     }
 
     // PRIMARY KEY
     if let Some(pk) = indexes.iter().find(|i| i.is_primary) {
-        let pk_cols: Vec<String> = pk.columns.iter()
+        let pk_cols: Vec<String> = pk
+            .columns
+            .iter()
             .filter_map(|ic| columns.iter().find(|c| c.col_idx == ic.col_idx))
             .map(|c| format!("`{}`", c.name))
             .collect();
@@ -374,14 +398,18 @@ fn execute_show_create_table(
     // Secondary indexes
     for idx in indexes.iter().filter(|i| !i.is_primary) {
         let unique_kw = if idx.is_unique { "UNIQUE " } else { "" };
-        let idx_cols: Vec<String> = idx.columns.iter()
+        let idx_cols: Vec<String> = idx
+            .columns
+            .iter()
             .filter_map(|ic| columns.iter().find(|c| c.col_idx == ic.col_idx))
             .map(|c| format!("`{}`", c.name))
             .collect();
         if !idx_cols.is_empty() {
             ddl.push_str(&format!(
                 "  {}KEY `{}` ({}),\n",
-                unique_kw, idx.name, idx_cols.join(", ")
+                unique_kw,
+                idx.name,
+                idx_cols.join(", ")
             ));
         }
     }
@@ -392,7 +420,7 @@ fn execute_show_create_table(
         ddl.push('\n');
     }
 
-    let engine = if table_def.is_clustered() { "InnoDB" } else { "InnoDB" };
+    let engine = "InnoDB";
     ddl.push_str(&format!(") ENGINE={}", engine));
 
     let out_cols = vec![
@@ -421,7 +449,9 @@ fn execute_rename_table(
         let snap = txn.active_snapshot(conn_txn);
         let table_def = CatalogReader::new(storage, snap)?
             .get_table_in_database(database, schema, &old_name)?
-            .ok_or_else(|| DbError::TableNotFound { name: old_name.clone() })?;
+            .ok_or_else(|| DbError::TableNotFound {
+                name: old_name.clone(),
+            })?;
         // Check new name not already in use.
         let snap2 = txn.active_snapshot(conn_txn);
         if CatalogReader::new(storage, snap2)?
@@ -433,10 +463,12 @@ fn execute_rename_table(
                 name: new_name.clone(),
             });
         }
-        CatalogWriter::new(storage, txn, conn_txn)?
-            .rename_table(table_def.id, new_name, schema)?;
+        CatalogWriter::new(storage, txn, conn_txn)?.rename_table(table_def.id, new_name, schema)?;
     }
-    Ok(QueryResult::Affected { count: 0, last_insert_id: None })
+    Ok(QueryResult::Affected {
+        count: 0,
+        last_insert_id: None,
+    })
 }
 
 // ── SHOW TABLE STATUS ────────────────────────────────────────────────────────
@@ -501,18 +533,21 @@ fn execute_show_table_status(
             Value::BigInt(0),
             Value::BigInt(0),
             Value::BigInt(0),
-            Value::Null,                                     // Auto_increment
-            Value::Null,                                     // Create_time
-            Value::Null,                                     // Update_time
-            Value::Null,                                     // Check_time
+            Value::Null, // Auto_increment
+            Value::Null, // Create_time
+            Value::Null, // Update_time
+            Value::Null, // Check_time
             Value::Text("utf8mb4_general_ci".into()),
-            Value::Null,                                     // Checksum
+            Value::Null, // Checksum
             Value::Text("".into()),
             Value::Text("".into()),
         ]);
     }
 
-    Ok(QueryResult::Rows { columns: out_cols, rows })
+    Ok(QueryResult::Rows {
+        columns: out_cols,
+        rows,
+    })
 }
 
 /// Simple SQL LIKE pattern matching (% = any sequence, _ = any single char).
@@ -665,4 +700,3 @@ fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Uuid => "UUID",
     }
 }
-

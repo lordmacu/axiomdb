@@ -342,23 +342,15 @@ fn test_index_maintained_on_update() {
     let (mut storage, mut txn) = setup();
 
     run("BEGIN", &mut storage, &mut txn);
-    run(
-        "CREATE TABLE kv (key INT, val TEXT)",
-        &mut storage,
-        &mut txn,
-    );
+    run("CREATE TABLE kv (k INT, val TEXT)", &mut storage, &mut txn);
     run("INSERT INTO kv VALUES (1, 'old')", &mut storage, &mut txn);
-    run(
-        "CREATE INDEX kv_key_idx ON kv (key)",
-        &mut storage,
-        &mut txn,
-    );
+    run("CREATE INDEX kv_key_idx ON kv (k)", &mut storage, &mut txn);
     run("COMMIT", &mut storage, &mut txn);
 
     // Update: key 1 → 99.
     run("BEGIN", &mut storage, &mut txn);
     run(
-        "UPDATE kv SET key = 99 WHERE val = 'old'",
+        "UPDATE kv SET k = 99 WHERE val = 'old'",
         &mut storage,
         &mut txn,
     );
@@ -367,7 +359,7 @@ fn test_index_maintained_on_update() {
     // Old key should be gone.
     run("BEGIN", &mut storage, &mut txn);
     let result = rows(run(
-        "SELECT val FROM kv WHERE key = 1",
+        "SELECT val FROM kv WHERE k = 1",
         &mut storage,
         &mut txn,
     ));
@@ -379,7 +371,7 @@ fn test_index_maintained_on_update() {
 
     // New key should be findable.
     let result = rows(run(
-        "SELECT val FROM kv WHERE key = 99",
+        "SELECT val FROM kv WHERE k = 99",
         &mut storage,
         &mut txn,
     ));

@@ -26,6 +26,23 @@
   - `cargo clippy --workspace -- -D warnings`
   - `cargo fmt --check`
   - `tools/wire-test.py`: `338/338`
+- Phase 4 subphase `4.2f` is also closed in code and validation.
+- `sql_mode` now drives a shared `ansi_quotes` parse bit across:
+  - normal SQL parsing
+  - prepared-statement parameter counting/substitution
+  - ad-hoc plan-cache normalization
+  - multi-statement packet splitting
+- connection cleanup is now transaction-safe:
+  - `COM_RESET_CONNECTION`, `COM_CHANGE_USER`, and disconnect all roll back any
+    still-open session transaction before clearing the session state
+- closeout regressions fixed while validating the workspace:
+  - `FOUND_ROWS()` now records the pre-limit cardinality on join and ctx paths
+  - clustered insert staging rolls back only the failing statement
+  - clustered partial-index maintenance now treats predicate-only updates as
+    index-affecting and ignores stale dead secondary entries during uniqueness checks
+- local macOS dev builds now use `.cargo/config.toml` plus
+  `tools/rustc-macos.sh` / `tools/linker-macos.sh` to strip
+  `com.apple.provenance` from outputs and keep proc-macro/test binaries runnable
 
 ## 2026-04-03
 

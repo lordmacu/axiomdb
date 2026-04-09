@@ -124,6 +124,11 @@ mod tests {
             self.inner.write_page(page_id, page)
         }
 
+        fn write_page_under_page_lock(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.inner.write_page_under_page_lock(page_id, page)
+        }
+
         fn alloc_page(&self, page_type: PageType) -> Result<u64, DbError> {
             self.inner.alloc_page(page_type)
         }

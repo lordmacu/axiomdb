@@ -27,3 +27,25 @@
 - `cargo clippy --workspace -- -D warnings`
 - `cargo fmt --check`
 - `tools/wire-test.py`: `338/338`
+
+## 2026-04-09 — ANSI quotes + validation hardening
+
+### 4.2f — `ANSI_QUOTES` OFF by default
+
+- new sessions now parse `"..."` as string literals by default, matching MySQL
+- `SET sql_mode = 'ANSI_QUOTES'` switches double quotes to identifier mode for
+  subsequent statements in the same session
+- prepared statements, plan-cache normalization, and multi-statement packet
+  splitting all reuse the same quote-mode bit
+
+### Validation fixes folded into the closeout
+
+- `FOUND_ROWS()` now captures the pre-limit row count even on join/ctx paths
+- clustered insert staging rolls back only the failing statement instead of
+  discarding earlier staged rows from the same transaction
+- clustered partial-index maintenance now treats predicate-only changes as
+  index-affecting and ignores stale dead secondary entries during uniqueness checks
+- connection cleanup (`COM_RESET_CONNECTION`, `COM_CHANGE_USER`, disconnect)
+  now rolls back any still-open session transaction before releasing the session
+- local macOS build wrappers were added under `.cargo/` and `tools/` so tests
+  keep running around the current `com.apple.provenance` issue

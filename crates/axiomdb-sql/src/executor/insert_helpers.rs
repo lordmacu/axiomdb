@@ -1,8 +1,13 @@
+#[expect(
+    clippy::too_many_arguments,
+    reason = "clustered insert secondary maintenance naturally needs executor state plus index metadata"
+)]
 fn maintain_clustered_secondary_inserts(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
     conn_txn: &mut ConnectionTxn,
     bloom: &mut crate::bloom::BloomRegistry,
+    table_root_page_id: u64,
     secondary_indexes: &mut [IndexDef],
     secondary_layouts: &[crate::clustered_secondary::ClusteredSecondaryLayout],
     compiled_preds: &[Option<Expr>],
@@ -31,7 +36,8 @@ fn maintain_clustered_secondary_inserts(
         };
 
         let root_pid = std::sync::atomic::AtomicU64::new(idx.root_page_id);
-        layout.insert_row(storage, &root_pid, row_values)?;
+        let snap = txn.active_snapshot(conn_txn);
+        layout.insert_row_visible(storage, &root_pid, table_root_page_id, &snap, row_values)?;
         bloom.add(idx.index_id, &entry.physical_key);
         let new_index_root = root_pid.load(std::sync::atomic::Ordering::Acquire);
         txn.record_index_insert(conn_txn, idx.index_id, new_index_root, entry.physical_key);
@@ -40,7 +46,8 @@ fn maintain_clustered_secondary_inserts(
         }
         if new_index_root != idx.root_page_id {
             let persist_started = debug_clustered_insert.then(Instant::now);
-            CatalogWriter::new(storage, txn, conn_txn)?.update_index_root(idx.index_id, new_index_root)?;
+            CatalogWriter::new(storage, txn, conn_txn)?
+                .update_index_root(idx.index_id, new_index_root)?;
             if let Some(started) = persist_started {
                 root_persist_time += started.elapsed();
             }

@@ -61,6 +61,28 @@ impl MemoryStorage {
             page_locks: crate::page_lock::PageLockTable::new(),
         }
     }
+
+    fn write_page_inner(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
+        page.verify_checksum()?;
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let idx = page_id as usize;
+        if idx >= inner.pages.len() {
+            return Err(DbError::PageNotFound { page_id });
+        }
+        // Direct 16 KB copy into the flat array slot — no heap allocation.
+        // SAFETY: both src and dst are valid Page slots. src (page) is passed
+        // by the caller and does not alias inner.pages[idx] because write_page
+        // takes &Page from outside, not &self.pages[idx].
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                page as *const Page,
+                &mut inner.pages[idx] as *mut Page,
+                1,
+            );
+        }
+        inner.allocated[idx] = true;
+        Ok(())
+    }
 }
 
 impl Default for MemoryStorage {
@@ -86,25 +108,12 @@ impl StorageEngine for MemoryStorage {
     }
 
     fn write_page(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
-        page.verify_checksum()?;
-        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        let idx = page_id as usize;
-        if idx >= inner.pages.len() {
-            return Err(DbError::PageNotFound { page_id });
-        }
-        // Direct 16 KB copy into the flat array slot — no heap allocation.
-        // SAFETY: both src and dst are valid Page slots. src (page) is passed
-        // by the caller and does not alias inner.pages[idx] because write_page
-        // takes &Page from outside, not &self.pages[idx].
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                page as *const Page,
-                &mut inner.pages[idx] as *mut Page,
-                1,
-            );
-        }
-        inner.allocated[idx] = true;
-        Ok(())
+        let _page_guard = self.page_locks.write(page_id);
+        self.write_page_inner(page_id, page)
+    }
+
+    fn write_page_under_page_lock(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
+        self.write_page_inner(page_id, page)
     }
 
     fn alloc_page(&self, page_type: PageType) -> Result<u64, DbError> {

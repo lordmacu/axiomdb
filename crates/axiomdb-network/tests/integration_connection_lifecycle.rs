@@ -24,26 +24,14 @@ struct TestServer {
 }
 
 async fn spawn_server(timeouts: LifecycleTimeouts) -> TestServer {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Arc::new(RwLock::new(
-        Database::open(dir.path()).expect("open test db"),
-    ));
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind listener");
-    let addr = listener.local_addr().expect("local addr");
-    let task = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        handle_connection_with_timeouts(stream, db, 1, timeouts).await;
-    });
-    TestServer {
-        addr,
-        task,
-        _dir: dir,
-    }
+    spawn_server_with_setup_and_connections(timeouts, &[], 1).await
 }
 
-async fn spawn_server_with_setup(timeouts: LifecycleTimeouts, setup_sql: &[&str]) -> TestServer {
+async fn spawn_server_with_setup_and_connections(
+    timeouts: LifecycleTimeouts,
+    setup_sql: &[&str],
+    connections: usize,
+) -> TestServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open(dir.path()).expect("open test db");
     let mut session = SessionContext::new();
@@ -58,14 +46,21 @@ async fn spawn_server_with_setup(timeouts: LifecycleTimeouts, setup_sql: &[&str]
         .expect("bind listener");
     let addr = listener.local_addr().expect("local addr");
     let task = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        handle_connection_with_timeouts(stream, db, 1, timeouts).await;
+        for conn_id in 1..=connections {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_connection_with_timeouts(stream, Arc::clone(&db), conn_id as u32, timeouts)
+                .await;
+        }
     });
     TestServer {
         addr,
         task,
         _dir: dir,
     }
+}
+
+async fn spawn_server_with_setup(timeouts: LifecycleTimeouts, setup_sql: &[&str]) -> TestServer {
+    spawn_server_with_setup_and_connections(timeouts, setup_sql, 1).await
 }
 
 async fn read_packet(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
@@ -303,6 +298,101 @@ async fn test_reset_connection_preserves_interactive_classification() {
     );
 
     com_quit(&mut stream).await.expect("COM_QUIT");
+    server.task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn test_reset_connection_rolls_back_active_implicit_txn() {
+    let server = spawn_server_with_setup(
+        LifecycleTimeouts {
+            auth_timeout: Duration::from_millis(200),
+        },
+        &["CREATE TABLE reset_tx (id INT PRIMARY KEY, v INT)"],
+    )
+    .await;
+    let mut stream = TcpStream::connect(server.addr).await.expect("connect");
+    authenticate(&mut stream, false).await.expect("auth");
+
+    let ok = com_query(&mut stream, "SET autocommit = 0")
+        .await
+        .expect("SET autocommit");
+    assert_eq!(ok[0], 0x00, "SET autocommit must return OK");
+
+    let ok = com_query(&mut stream, "INSERT INTO reset_tx VALUES (1, 10)")
+        .await
+        .expect("INSERT starts implicit txn");
+    assert_eq!(ok[0], 0x00, "INSERT must return OK");
+
+    let ok = com_reset_connection(&mut stream)
+        .await
+        .expect("COM_RESET_CONNECTION");
+    assert_eq!(ok[0], 0x00, "COM_RESET_CONNECTION must return OK");
+
+    let count = com_query_single_text(&mut stream, "SELECT COUNT(*) FROM reset_tx")
+        .await
+        .expect("SELECT COUNT after reset");
+    assert_eq!(
+        count.as_deref(),
+        Some("0"),
+        "reset must roll back implicit txn"
+    );
+
+    let ok = com_query(&mut stream, "INSERT INTO reset_tx VALUES (2, 20)")
+        .await
+        .expect("INSERT after reset");
+    assert_eq!(ok[0], 0x00, "connection must remain writable after reset");
+
+    com_quit(&mut stream).await.expect("COM_QUIT");
+    server.task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn test_com_quit_rolls_back_active_implicit_txn() {
+    let server = spawn_server_with_setup_and_connections(
+        LifecycleTimeouts {
+            auth_timeout: Duration::from_millis(200),
+        },
+        &["CREATE TABLE quit_tx (id INT PRIMARY KEY, v INT)"],
+        2,
+    )
+    .await;
+
+    let mut stream1 = TcpStream::connect(server.addr)
+        .await
+        .expect("connect first");
+    authenticate(&mut stream1, false).await.expect("auth first");
+    let ok = com_query(&mut stream1, "SET autocommit = 0")
+        .await
+        .expect("SET autocommit first");
+    assert_eq!(ok[0], 0x00, "SET autocommit must return OK");
+    let ok = com_query(&mut stream1, "INSERT INTO quit_tx VALUES (1, 10)")
+        .await
+        .expect("INSERT first");
+    assert_eq!(ok[0], 0x00, "INSERT must return OK");
+    com_quit(&mut stream1).await.expect("COM_QUIT first");
+    drop(stream1);
+
+    let mut stream2 = TcpStream::connect(server.addr)
+        .await
+        .expect("connect second");
+    authenticate(&mut stream2, false)
+        .await
+        .expect("auth second");
+    let count = com_query_single_text(&mut stream2, "SELECT COUNT(*) FROM quit_tx")
+        .await
+        .expect("SELECT COUNT second");
+    assert_eq!(
+        count.as_deref(),
+        Some("0"),
+        "COM_QUIT must roll back implicit txn"
+    );
+
+    let ok = com_query(&mut stream2, "INSERT INTO quit_tx VALUES (2, 20)")
+        .await
+        .expect("INSERT second");
+    assert_eq!(ok[0], 0x00, "writer must be released after COM_QUIT");
+
+    com_quit(&mut stream2).await.expect("COM_QUIT second");
     server.task.await.expect("server task");
 }
 

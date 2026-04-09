@@ -12,6 +12,7 @@ fn execute_update_ctx(
         storage,
         txn,
         ctx,
+        Some(conn_txn),
         &stmt.table,
     )?;
     let schema_cols = resolved.columns.clone();

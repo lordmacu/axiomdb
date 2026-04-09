@@ -2,6 +2,7 @@ mod common;
 
 use axiomdb_core::error::DbError;
 use axiomdb_sql::QueryResult;
+use axiomdb_types::Value;
 use common::{rows, run_ctx, setup_ctx};
 
 /// Helper: run SQL and panic on error.
@@ -313,10 +314,20 @@ fn clustered_batch_intra_batch_pk_duplicate_returns_error() {
         "expected UniqueViolation, got {err:?}"
     );
 
-    // Batch must be discarded after the error.
-    assert!(
-        ctx.clustered_insert_batch.is_none(),
-        "batch discarded after pk duplicate"
+    // Only the failing statement is rolled back; previously staged rows stay buffered.
+    let batch = ctx
+        .clustered_insert_batch
+        .as_ref()
+        .expect("prior staged rows preserved after statement-local duplicate");
+    assert_eq!(
+        batch.rows.len(),
+        1,
+        "failing statement must not discard prior rows"
+    );
+    assert_eq!(
+        batch.rows[0].primary_key_values,
+        vec![Value::Int(5)],
+        "original staged row remains buffered"
     );
 
     ok("ROLLBACK", &mut s, &mut txn, &mut bloom, &mut ctx);
