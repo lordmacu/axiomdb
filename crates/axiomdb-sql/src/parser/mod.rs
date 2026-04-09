@@ -761,24 +761,29 @@ impl<'src> Parser<'src> {
     /// - `TRUE`       → `SetValue::Expr(Literal(Bool(true)))`
     /// - `FALSE`      → `SetValue::Expr(Literal(Bool(false)))`
     /// - Any other expression (literals, integers, strings) → `SetValue::Expr`
-    /// Parse a SET variable name, stripping any `@@` or `@` prefix.
     ///
-    /// MySQL sends `SET @@session.autocommit = 1` and `SET @user_var = 1`.
-    /// We strip the `@` characters and split on `.` to get the bare name.
+    /// Parse a SET variable name, stripping any `@@` / `@` prefix and optional
+    /// scope qualifier such as `session.` or `global.`.
     pub(crate) fn parse_set_variable(&mut self) -> Result<String, DbError> {
-        // Handle `@@variable` — two `@` signs followed by an identifier
-        // The lexer tokenizes `@@autocommit` as `Ident("@@autocommit")` (no explicit @@ token).
-        // But if it's tokenized differently, fall back to parse_identifier.
+        if self.eat(&Token::AtAt) || self.eat(&Token::At) {
+            // Optional scope prefix after @@, e.g. @@session.autocommit.
+            if matches!(self.peek(), Token::Session | Token::Global | Token::Local) {
+                let _ = self.parse_identifier()?;
+                let _ = self.eat(&Token::Dot);
+            }
+
+            let mut name = self.parse_identifier()?;
+            while self.eat(&Token::Dot) {
+                name = self.parse_identifier()?;
+            }
+            return Ok(name);
+        }
+
+        // Backward-compatible fallback in case the prefix arrives as part of a
+        // single identifier token in some caller or future lexer variant.
         let name = self.parse_identifier()?;
-        // Strip leading `@` chars (e.g. "@@session.autocommit" → "autocommit")
         let stripped = name.trim_start_matches('@');
-        // Strip optional scope prefix (e.g. "session.autocommit" → "autocommit")
-        let bare = if let Some(dot_pos) = stripped.rfind('.') {
-            &stripped[dot_pos + 1..]
-        } else {
-            stripped
-        };
-        Ok(bare.to_string())
+        Ok(stripped.rsplit('.').next().unwrap_or(stripped).to_string())
     }
 
     /// Consume tokens until EOF or semicolon (end of statement), used for

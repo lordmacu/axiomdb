@@ -296,7 +296,11 @@ fn execute_select(
         // Top-N optimization: if ORDER BY + LIMIT, use partial sort (O(n log k))
         // instead of full sort (O(n log n)). Inspired by PostgreSQL's bounded
         // heapsort and DuckDB's TopN physical operator.
-        if !resolved_ob.is_empty() && stmt.limit.is_some() && !stmt.distinct {
+        if !resolved_ob.is_empty()
+            && stmt.limit.is_some()
+            && !stmt.distinct
+            && !stmt.calc_found_rows
+        {
             let (limit_n, offset_n) = eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
             let top_n = offset_n + limit_n.unwrap_or(usize::MAX).min(usize::MAX - offset_n);
             combined_rows = apply_order_by_top_n(combined_rows, &resolved_ob, top_n)?;
@@ -404,7 +408,14 @@ fn execute_select_derived(
     }
 
     let resolved_ob = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
-    combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
+    if !resolved_ob.is_empty() && stmt.limit.is_some() && !stmt.distinct && !stmt.calc_found_rows
+    {
+        let (limit_n, offset_n) = eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
+        let top_n = offset_n + limit_n.unwrap_or(usize::MAX).min(usize::MAX - offset_n);
+        combined_rows = apply_order_by_top_n(combined_rows, &resolved_ob, top_n)?;
+    } else {
+        combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
+    }
 
     // Build output columns from SELECT list against derived column metadata.
     let out_cols = build_derived_output_columns(&stmt.columns, &derived_cols)?;
@@ -426,4 +437,3 @@ fn execute_select_derived(
         rows,
     })
 }
-

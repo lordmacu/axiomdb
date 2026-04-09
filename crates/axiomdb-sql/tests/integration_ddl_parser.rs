@@ -3,7 +3,7 @@
 use axiomdb_core::DbError;
 use axiomdb_sql::expr::{BinaryOp, Expr, UnaryOp};
 use axiomdb_sql::{
-    ast::{ColumnConstraint, ForeignKeyAction, SortOrder, Stmt, TableConstraint},
+    ast::{AlterTableOp, ColumnConstraint, ForeignKeyAction, SortOrder, Stmt, TableConstraint},
     parse,
 };
 use axiomdb_types::{DataType, Value};
@@ -19,6 +19,13 @@ fn create_table(sql: &str) -> axiomdb_sql::ast::CreateTableStmt {
 
 fn parse_err(sql: &str) -> DbError {
     parse(sql, None).unwrap_err()
+}
+
+fn alter_table(sql: &str) -> axiomdb_sql::ast::AlterTableStmt {
+    match parse(sql, None).unwrap() {
+        Stmt::AlterTable(at) => at,
+        other => panic!("expected AlterTable, got {other:?}"),
+    }
 }
 
 // ── Basic CREATE TABLE ────────────────────────────────────────────────────────
@@ -649,5 +656,16 @@ fn test_full_orders_table_with_fk() {
             on_update: ForeignKeyAction::Restrict,
             ..
         }
+    ));
+}
+
+#[test]
+fn test_alter_table_add_primary_key_without_constraint_keyword() {
+    let at = alter_table("ALTER TABLE users ADD PRIMARY KEY (id, tenant_id)");
+    assert_eq!(at.operations.len(), 1);
+    assert!(matches!(
+        &at.operations[0],
+        AlterTableOp::AddConstraint(TableConstraint::PrimaryKey { name: None, columns })
+            if columns == &["id", "tenant_id"]
     ));
 }

@@ -277,6 +277,7 @@ fn apply_clustered_insert_rows(
                                 txn,
                                 conn_txn,
                                 bloom,
+                                current_root,
                                 secondary_indexes,
                                 secondary_layouts,
                                 compiled_preds,
@@ -371,6 +372,7 @@ fn apply_clustered_insert_rows(
             txn,
             conn_txn,
             bloom,
+            current_root,
             secondary_indexes,
             secondary_layouts,
             compiled_preds,
@@ -406,4 +408,3 @@ fn apply_clustered_insert_rows(
 
     Ok(rows.len() as u64)
 }
-

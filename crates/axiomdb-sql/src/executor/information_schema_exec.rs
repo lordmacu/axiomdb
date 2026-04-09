@@ -142,27 +142,27 @@ fn generate_is_tables_rows(
         let tables = reader.list_tables_in_database(&db.name, "public")?;
         for t in tables {
             rows.push(vec![
-                Value::Text("def".into()),             // TABLE_CATALOG
-                Value::Text(db.name.clone()),          // TABLE_SCHEMA
-                Value::Text(t.table_name.clone()),     // TABLE_NAME
-                Value::Text("BASE TABLE".into()),      // TABLE_TYPE
-                Value::Text("InnoDB".into()),          // ENGINE
-                Value::BigInt(10),                     // VERSION
-                Value::Text("Dynamic".into()),         // ROW_FORMAT
-                Value::Null,                           // TABLE_ROWS
-                Value::BigInt(0),                      // AVG_ROW_LENGTH
-                Value::BigInt(0),                      // DATA_LENGTH
-                Value::BigInt(0),                      // MAX_DATA_LENGTH
-                Value::BigInt(0),                      // INDEX_LENGTH
-                Value::BigInt(0),                      // DATA_FREE
-                Value::Null,                           // AUTO_INCREMENT
-                Value::Null,                           // CREATE_TIME
-                Value::Null,                           // UPDATE_TIME
-                Value::Null,                           // CHECK_TIME
+                Value::Text("def".into()),                // TABLE_CATALOG
+                Value::Text(db.name.clone()),             // TABLE_SCHEMA
+                Value::Text(t.table_name.clone()),        // TABLE_NAME
+                Value::Text("BASE TABLE".into()),         // TABLE_TYPE
+                Value::Text("InnoDB".into()),             // ENGINE
+                Value::BigInt(10),                        // VERSION
+                Value::Text("Dynamic".into()),            // ROW_FORMAT
+                Value::Null,                              // TABLE_ROWS
+                Value::BigInt(0),                         // AVG_ROW_LENGTH
+                Value::BigInt(0),                         // DATA_LENGTH
+                Value::BigInt(0),                         // MAX_DATA_LENGTH
+                Value::BigInt(0),                         // INDEX_LENGTH
+                Value::BigInt(0),                         // DATA_FREE
+                Value::Null,                              // AUTO_INCREMENT
+                Value::Null,                              // CREATE_TIME
+                Value::Null,                              // UPDATE_TIME
+                Value::Null,                              // CHECK_TIME
                 Value::Text("utf8mb4_0900_ai_ci".into()), // TABLE_COLLATION
-                Value::Null,                           // CHECKSUM
-                Value::Text("".into()),                // CREATE_OPTIONS
-                Value::Text("".into()),                // TABLE_COMMENT
+                Value::Null,                              // CHECKSUM
+                Value::Text("".into()),                   // CREATE_OPTIONS
+                Value::Text("".into()),                   // TABLE_COMMENT
             ]);
         }
     }
@@ -188,7 +188,11 @@ fn generate_is_columns_rows(
                 let data_type_str = column_type_to_is_data_type(col.col_type);
                 let col_type_str = column_type_to_column_type_str(col.col_type);
                 let is_nullable = if col.nullable { "YES" } else { "NO" };
-                let extra = if col.auto_increment { "auto_increment" } else { "" };
+                let extra = if col.auto_increment {
+                    "auto_increment"
+                } else {
+                    ""
+                };
                 let char_max_len = match col.col_type {
                     ColumnType::Text => Value::BigInt(65535),
                     _ => Value::Null,
@@ -200,28 +204,28 @@ fn generate_is_columns_rows(
                     _ => Value::Null,
                 };
                 rows.push(vec![
-                    Value::Text("def".into()),                         // TABLE_CATALOG
-                    Value::Text(db.name.clone()),                      // TABLE_SCHEMA
-                    Value::Text(t.table_name.clone()),                 // TABLE_NAME
-                    Value::Text(col.name.clone()),                     // COLUMN_NAME
-                    Value::BigInt((col.col_idx as i64) + 1),          // ORDINAL_POSITION
-                    Value::Null,                                       // COLUMN_DEFAULT
-                    Value::Text(is_nullable.into()),                   // IS_NULLABLE
-                    Value::Text(data_type_str.into()),                 // DATA_TYPE
-                    char_max_len,                                      // CHARACTER_MAXIMUM_LENGTH
-                    Value::Null,                                       // CHARACTER_OCTET_LENGTH
-                    num_prec,                                          // NUMERIC_PRECISION
-                    Value::Null,                                       // NUMERIC_SCALE
-                    Value::Null,                                       // DATETIME_PRECISION
-                    Value::Null,                                       // CHARACTER_SET_NAME
-                    Value::Null,                                       // COLLATION_NAME
-                    Value::Text(col_type_str.into()),                  // COLUMN_TYPE
-                    Value::Text("".into()),                            // COLUMN_KEY
-                    Value::Text(extra.into()),                         // EXTRA
+                    Value::Text("def".into()),                             // TABLE_CATALOG
+                    Value::Text(db.name.clone()),                          // TABLE_SCHEMA
+                    Value::Text(t.table_name.clone()),                     // TABLE_NAME
+                    Value::Text(col.name.clone()),                         // COLUMN_NAME
+                    Value::BigInt((col.col_idx as i64) + 1),               // ORDINAL_POSITION
+                    Value::Null,                                           // COLUMN_DEFAULT
+                    Value::Text(is_nullable.into()),                       // IS_NULLABLE
+                    Value::Text(data_type_str.into()),                     // DATA_TYPE
+                    char_max_len,                     // CHARACTER_MAXIMUM_LENGTH
+                    Value::Null,                      // CHARACTER_OCTET_LENGTH
+                    num_prec,                         // NUMERIC_PRECISION
+                    Value::Null,                      // NUMERIC_SCALE
+                    Value::Null,                      // DATETIME_PRECISION
+                    Value::Null,                      // CHARACTER_SET_NAME
+                    Value::Null,                      // COLLATION_NAME
+                    Value::Text(col_type_str.into()), // COLUMN_TYPE
+                    Value::Text("".into()),           // COLUMN_KEY
+                    Value::Text(extra.into()),        // EXTRA
                     Value::Text("select,insert,update,references".into()), // PRIVILEGES
-                    Value::Text("".into()),                            // COLUMN_COMMENT
-                    Value::Text("".into()),                            // GENERATION_EXPRESSION
-                    Value::Null,                                       // SRS_ID
+                    Value::Text("".into()),           // COLUMN_COMMENT
+                    Value::Text("".into()),           // GENERATION_EXPRESSION
+                    Value::Null,                      // SRS_ID
                 ]);
             }
         }
@@ -258,22 +262,22 @@ fn generate_is_key_column_usage_rows(
                 for (seq, ic) in idx.columns.iter().enumerate() {
                     let col_name = columns
                         .iter()
-                        .find(|c| c.col_idx == ic.col_idx as u16)
+                        .find(|c| c.col_idx == ic.col_idx)
                         .map(|c| c.name.clone())
                         .unwrap_or_default();
                     rows.push(vec![
-                        Value::Text("def".into()),             // CONSTRAINT_CATALOG
-                        Value::Text(db.name.clone()),          // CONSTRAINT_SCHEMA
-                        Value::Text(constraint_name.clone()),  // CONSTRAINT_NAME
-                        Value::Text("def".into()),             // TABLE_CATALOG
-                        Value::Text(db.name.clone()),          // TABLE_SCHEMA
-                        Value::Text(t.table_name.clone()),     // TABLE_NAME
-                        Value::Text(col_name),                 // COLUMN_NAME
-                        Value::BigInt((seq + 1) as i64),       // ORDINAL_POSITION
-                        Value::Null,                           // POSITION_IN_UNIQUE_CONSTRAINT
-                        Value::Null,                           // REFERENCED_TABLE_SCHEMA
-                        Value::Null,                           // REFERENCED_TABLE_NAME
-                        Value::Null,                           // REFERENCED_COLUMN_NAME
+                        Value::Text("def".into()),            // CONSTRAINT_CATALOG
+                        Value::Text(db.name.clone()),         // CONSTRAINT_SCHEMA
+                        Value::Text(constraint_name.clone()), // CONSTRAINT_NAME
+                        Value::Text("def".into()),            // TABLE_CATALOG
+                        Value::Text(db.name.clone()),         // TABLE_SCHEMA
+                        Value::Text(t.table_name.clone()),    // TABLE_NAME
+                        Value::Text(col_name),                // COLUMN_NAME
+                        Value::BigInt((seq + 1) as i64),      // ORDINAL_POSITION
+                        Value::Null,                          // POSITION_IN_UNIQUE_CONSTRAINT
+                        Value::Null,                          // REFERENCED_TABLE_SCHEMA
+                        Value::Null,                          // REFERENCED_TABLE_NAME
+                        Value::Null,                          // REFERENCED_COLUMN_NAME
                     ]);
                 }
             }
@@ -306,13 +310,13 @@ fn generate_is_table_constraints_rows(
                     continue;
                 };
                 rows.push(vec![
-                    Value::Text("def".into()),              // CONSTRAINT_CATALOG
-                    Value::Text(db.name.clone()),           // CONSTRAINT_SCHEMA
-                    Value::Text(constraint_name),           // CONSTRAINT_NAME
-                    Value::Text(db.name.clone()),           // TABLE_SCHEMA
-                    Value::Text(t.table_name.clone()),      // TABLE_NAME
-                    Value::Text(constraint_type.into()),    // CONSTRAINT_TYPE
-                    Value::Text("YES".into()),              // ENFORCED
+                    Value::Text("def".into()),           // CONSTRAINT_CATALOG
+                    Value::Text(db.name.clone()),        // CONSTRAINT_SCHEMA
+                    Value::Text(constraint_name),        // CONSTRAINT_NAME
+                    Value::Text(db.name.clone()),        // TABLE_SCHEMA
+                    Value::Text(t.table_name.clone()),   // TABLE_NAME
+                    Value::Text(constraint_type.into()), // CONSTRAINT_TYPE
+                    Value::Text("YES".into()),           // ENFORCED
                 ]);
             }
         }
@@ -354,37 +358,41 @@ fn generate_is_statistics_rows(
                 } else {
                     idx.name.clone()
                 };
-                let non_unique: i64 = if idx.is_unique || idx.is_primary { 0 } else { 1 };
+                let non_unique: i64 = if idx.is_unique || idx.is_primary {
+                    0
+                } else {
+                    1
+                };
                 for (seq, ic) in idx.columns.iter().enumerate() {
                     let col_name = columns
                         .iter()
-                        .find(|c| c.col_idx == ic.col_idx as u16)
+                        .find(|c| c.col_idx == ic.col_idx)
                         .map(|c| c.name.clone())
                         .unwrap_or_default();
                     let nullable = columns
                         .iter()
-                        .find(|c| c.col_idx == ic.col_idx as u16)
+                        .find(|c| c.col_idx == ic.col_idx)
                         .map(|c| if c.nullable { "YES" } else { "" })
                         .unwrap_or("YES");
                     rows.push(vec![
-                        Value::Text("def".into()),             // TABLE_CATALOG
-                        Value::Text(db.name.clone()),          // TABLE_SCHEMA
-                        Value::Text(t.table_name.clone()),     // TABLE_NAME
-                        Value::BigInt(non_unique),             // NON_UNIQUE
-                        Value::Text(db.name.clone()),          // INDEX_SCHEMA
-                        Value::Text(index_name.clone()),       // INDEX_NAME
-                        Value::BigInt((seq + 1) as i64),       // SEQ_IN_INDEX
-                        Value::Text(col_name),                 // COLUMN_NAME
-                        Value::Text("A".into()),               // COLLATION
-                        Value::BigInt(0),                      // CARDINALITY
-                        Value::Null,                           // SUB_PART
-                        Value::Null,                           // PACKED
-                        Value::Text(nullable.into()),          // NULLABLE
-                        Value::Text("BTREE".into()),           // INDEX_TYPE
-                        Value::Text("".into()),                // COMMENT
-                        Value::Text("".into()),                // INDEX_COMMENT
-                        Value::Text("YES".into()),             // IS_VISIBLE
-                        Value::Null,                           // EXPRESSION
+                        Value::Text("def".into()),         // TABLE_CATALOG
+                        Value::Text(db.name.clone()),      // TABLE_SCHEMA
+                        Value::Text(t.table_name.clone()), // TABLE_NAME
+                        Value::BigInt(non_unique),         // NON_UNIQUE
+                        Value::Text(db.name.clone()),      // INDEX_SCHEMA
+                        Value::Text(index_name.clone()),   // INDEX_NAME
+                        Value::BigInt((seq + 1) as i64),   // SEQ_IN_INDEX
+                        Value::Text(col_name),             // COLUMN_NAME
+                        Value::Text("A".into()),           // COLLATION
+                        Value::BigInt(0),                  // CARDINALITY
+                        Value::Null,                       // SUB_PART
+                        Value::Null,                       // PACKED
+                        Value::Text(nullable.into()),      // NULLABLE
+                        Value::Text("BTREE".into()),       // INDEX_TYPE
+                        Value::Text("".into()),            // COMMENT
+                        Value::Text("".into()),            // INDEX_COMMENT
+                        Value::Text("YES".into()),         // IS_VISIBLE
+                        Value::Null,                       // EXPRESSION
                     ]);
                 }
             }

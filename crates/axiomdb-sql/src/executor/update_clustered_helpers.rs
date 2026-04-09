@@ -31,7 +31,8 @@ fn clustered_rows_for_secondary_access(
     snap: axiomdb_core::TransactionSnapshot,
 ) -> Result<Vec<axiomdb_storage::clustered_tree::ClusteredRow>, DbError> {
     let primary_idx = clustered_update_primary_index(resolved)?;
-    let layout = crate::clustered_secondary::ClusteredSecondaryLayout::derive(index_def, primary_idx)?;
+    let layout =
+        crate::clustered_secondary::ClusteredSecondaryLayout::derive(index_def, primary_idx)?;
     let hi_owned = hi.map(clustered_secondary_high_bound);
     let pairs = BTree::range_in(storage, index_def.root_page_id, lo, hi_owned.as_deref())?;
     let mut rows = Vec::with_capacity(pairs.len());
@@ -148,10 +149,16 @@ fn collect_clustered_update_candidates(
     Ok(candidates)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "clustered secondary update needs both old/new rows and executor state"
+)]
 fn apply_clustered_secondary_update(
     idx: &axiomdb_catalog::IndexDef,
+    compiled_pred: Option<&crate::expr::Expr>,
     layout: &crate::clustered_secondary::ClusteredSecondaryLayout,
     sec_root: &std::sync::atomic::AtomicU64,
+    table_root_page_id: u64,
     old_values: &[Value],
     new_values: &[Value],
     storage: &mut dyn StorageEngine,
@@ -159,9 +166,40 @@ fn apply_clustered_secondary_update(
     conn_txn: &mut ConnectionTxn,
     bloom: &mut crate::bloom::BloomRegistry,
 ) -> Result<(), DbError> {
-    let old_entry = layout.entry_from_row(old_values)?;
-    let new_entry = layout.entry_from_row(new_values)?;
-    let outcome = layout.update_row(storage, sec_root, old_values, new_values)?;
+    let snap = txn.active_snapshot(conn_txn);
+    let old_indexed =
+        crate::index_maintenance::index_key_values_if_indexed(idx, old_values, compiled_pred)?
+            .is_some();
+    let new_indexed =
+        crate::index_maintenance::index_key_values_if_indexed(idx, new_values, compiled_pred)?
+            .is_some();
+    let old_entry = old_indexed
+        .then(|| layout.entry_from_row(old_values))
+        .transpose()?
+        .flatten();
+    let new_entry = new_indexed
+        .then(|| layout.entry_from_row(new_values))
+        .transpose()?
+        .flatten();
+    let outcome = match (old_indexed, new_indexed) {
+        (false, false) => crate::clustered_secondary::ClusteredSecondaryUpdateOutcome::Unchanged,
+        (false, true) => {
+            layout.insert_row_visible(storage, sec_root, table_root_page_id, &snap, new_values)?;
+            crate::clustered_secondary::ClusteredSecondaryUpdateOutcome::Inserted
+        }
+        (true, false) => {
+            let _ = layout.delete_row(storage, sec_root, old_values)?;
+            crate::clustered_secondary::ClusteredSecondaryUpdateOutcome::Deleted
+        }
+        (true, true) => layout.update_row_visible(
+            storage,
+            sec_root,
+            table_root_page_id,
+            &snap,
+            old_values,
+            new_values,
+        )?,
+    };
     let current_root = sec_root.load(std::sync::atomic::Ordering::Acquire);
 
     match outcome {
@@ -169,7 +207,12 @@ fn apply_clustered_secondary_update(
         crate::clustered_secondary::ClusteredSecondaryUpdateOutcome::Inserted => {
             if let Some(new_entry) = new_entry {
                 bloom.add(idx.index_id, &new_entry.physical_key);
-                txn.record_index_insert(conn_txn, idx.index_id, current_root, new_entry.physical_key);
+                txn.record_index_insert(
+                    conn_txn,
+                    idx.index_id,
+                    current_root,
+                    new_entry.physical_key,
+                );
             }
         }
         crate::clustered_secondary::ClusteredSecondaryUpdateOutcome::Deleted => {
@@ -203,7 +246,12 @@ fn apply_clustered_secondary_update(
             }
             if let Some(new_entry) = new_entry {
                 bloom.add(idx.index_id, &new_entry.physical_key);
-                txn.record_index_insert(conn_txn, idx.index_id, current_root, new_entry.physical_key);
+                txn.record_index_insert(
+                    conn_txn,
+                    idx.index_id,
+                    current_root,
+                    new_entry.physical_key,
+                );
             }
         }
     }
@@ -253,9 +301,7 @@ fn fused_clustered_scan_patch(
                     }
                     _ => {
                         return Err(DbError::BTreeCorrupted {
-                            msg: format!(
-                                "fused_clustered_scan_patch: unexpected page type {pt:?}"
-                            ),
+                            msg: format!("fused_clustered_scan_patch: unexpected page type {pt:?}"),
                         });
                     }
                 }
@@ -282,8 +328,7 @@ fn fused_clustered_scan_patch(
 
     // Compile BatchPredicate for zero-alloc raw-byte WHERE evaluation.
     // Falls back to eval() for unsupported patterns (OR, LIKE, Text comparisons).
-    let batch_pred = where_clause
-        .and_then(|wc| crate::eval::batch::try_compile(wc, col_types));
+    let batch_pred = where_clause.and_then(|wc| crate::eval::batch::try_compile(wc, col_types));
 
     let mut matched = 0u64;
     let mut patched = 0u64;
@@ -502,9 +547,8 @@ fn fused_clustered_scan_patch(
                         continue;
                     };
 
-                    let new_encoded = axiomdb_types::field_patch::encode_value_fixed(
-                        new_val, loc.data_type,
-                    )?;
+                    let new_encoded =
+                        axiomdb_types::field_patch::encode_value_fixed(new_val, loc.data_type)?;
                     let field_abs = row_data_abs_off + loc.offset;
 
                     // Capture old bytes from the page (no clone of full row).
@@ -548,12 +592,14 @@ fn fused_clustered_scan_patch(
             // no Vec<u8> heap allocation per field.
             let field_deltas: Vec<axiomdb_wal::FieldDelta> = field_writes
                 .iter()
-                .map(|(field_abs, size, old_buf, new_buf)| axiomdb_wal::FieldDelta {
-                    offset: (field_abs - row_data_abs_off) as u16,
-                    size: *size as u8,
-                    old_bytes: *old_buf,
-                    new_bytes: *new_buf,
-                })
+                .map(
+                    |(field_abs, size, old_buf, new_buf)| axiomdb_wal::FieldDelta {
+                        offset: (field_abs - row_data_abs_off) as u16,
+                        size: *size as u8,
+                        old_bytes: *old_buf,
+                        new_bytes: *new_buf,
+                    },
+                )
                 .collect();
 
             wal_patches.push(axiomdb_wal::ClusteredFieldPatchEntry {
@@ -600,4 +646,3 @@ fn fused_clustered_scan_patch(
         last_insert_id: None,
     })
 }
-

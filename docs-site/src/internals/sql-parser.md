@@ -150,6 +150,16 @@ The public parser entry points `parse_with_sql_mode(...)` and
 `parse_expr_only_with_sql_mode(...)` thread the flag from `SessionContext` into
 the parser.
 
+The same `ansi_quotes` bit is also consumed by the raw-SQL scanner in the wire
+layer. Parameter counting, SQL-string substitution, and multi-statement splitting
+all use the same quote-mode decision, so `?` and `;` inside `"..."` are ignored
+only when the current session treats those bytes as a string literal.
+
+MySQL variable prefixes are tokenized explicitly as `Token::At` / `Token::AtAt`
+instead of being folded into `Ident`. That keeps `SET @@session.autocommit = 1`
+parsing fast and avoids widening the hot identifier path just to special-case
+wire/session variables.
+
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">

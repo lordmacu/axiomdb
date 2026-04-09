@@ -448,15 +448,13 @@ fn test_semicolon_multi_statement() {
 // ── Error cases (4.2b) ────────────────────────────────────────────────────────
 
 #[test]
-fn test_error_unexpected_at_sign() {
-    let e = tokens_err("@");
-    assert!(matches!(e, DbError::ParseError { .. }));
+fn test_at_sign_tokenizes_for_mysql_variables() {
+    assert_eq!(tokens("@")[0], Token::At);
 }
 
 #[test]
-fn test_error_unexpected_caret() {
-    let e = tokens_err("^");
-    assert!(matches!(e, DbError::ParseError { .. }));
+fn test_bitwise_xor_operator() {
+    assert_eq!(tokens("^")[0], Token::Caret);
 }
 
 #[test]
@@ -467,11 +465,11 @@ fn test_error_unexpected_dollar() {
 
 #[test]
 fn test_error_unexpected_char_position_in_message() {
-    let e = tokens_err("SELECT @");
+    let e = tokens_err("SELECT $");
     if let DbError::ParseError { message, .. } = e {
         assert!(
-            message.contains('@'),
-            "error message should contain '@': {message}"
+            message.contains('$'),
+            "error message should contain '$': {message}"
         );
     } else {
         panic!("expected ParseError");

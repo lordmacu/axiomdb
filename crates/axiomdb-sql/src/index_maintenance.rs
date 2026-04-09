@@ -114,6 +114,10 @@ pub fn insert_into_indexes(
 
 /// Like [`insert_into_indexes`] but optionally records `UndoIndexInsert` ops
 /// in the transaction's undo log so ROLLBACK can remove the B-Tree entries.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "index maintenance needs row data, storage state, predicates, and optional txn hooks"
+)]
 pub fn insert_into_indexes_with_undo(
     indexes: &[IndexDef],
     row: &[Value],

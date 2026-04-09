@@ -549,6 +549,12 @@ pub enum Token<'src> {
     Semicolon,
     #[token(":")]
     Colon,
+    /// `@@` — MySQL session/system variable prefix.
+    #[token("@@")]
+    AtAt,
+    /// `@` — MySQL user-variable prefix.
+    #[token("@")]
+    At,
     /// `?` — positional parameter placeholder in a prepared statement template.
     #[token("?")]
     Question,
@@ -571,7 +577,7 @@ pub(crate) fn decode_hex_string_literal(raw: &str) -> Option<String> {
     if inner.is_empty() {
         return Some(String::new());
     }
-    if inner.len() % 2 != 0 {
+    if !inner.len().is_multiple_of(2) {
         return None; // Odd hex digits are invalid.
     }
     let bytes: Option<Vec<u8>> = inner
@@ -1025,7 +1031,7 @@ mod tests {
 
     #[test]
     fn test_error_unexpected_char() {
-        let e = tok_err("@");
+        let e = tok_err("$");
         assert!(matches!(e, DbError::ParseError { .. }));
     }
 

@@ -20,7 +20,7 @@ thread_local! {
     /// that subsequent `execute(INSERT/UPDATE/..., ...)` calls can retrieve it to
     /// pass down to executor functions that need the connection-level state.
     /// Consumed by `execute(COMMIT/ROLLBACK, ...)`.
-    static EXECUTE_CONN: RefCell<Option<ConnectionTxn>> = RefCell::new(None);
+    static EXECUTE_CONN: RefCell<Option<ConnectionTxn>> = const { RefCell::new(None) };
 }
 
 /// Returns the value of `LAST_INSERT_ID()` for the current thread.
@@ -124,12 +124,19 @@ fn extract_outer_col_indices(stmt: &SelectStmt) -> Vec<usize> {
             Expr::IsNull { expr, .. } | Expr::IsBoolean { expr, .. } | Expr::Cast { expr, .. } => {
                 walk_expr(expr, indices)
             }
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 walk_expr(expr, indices);
                 walk_expr(low, indices);
                 walk_expr(high, indices);
             }
-            Expr::Like { expr, pattern, escape, .. } => {
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
                 walk_expr(expr, indices);
                 walk_expr(pattern, indices);
                 if let Some(e) = escape {
@@ -147,7 +154,12 @@ fn extract_outer_col_indices(stmt: &SelectStmt) -> Vec<usize> {
                     walk_expr(a, indices);
                 }
             }
-            Expr::Case { operand, when_thens, else_result, .. } => {
+            Expr::Case {
+                operand,
+                when_thens,
+                else_result,
+                ..
+            } => {
                 if let Some(op) = operand {
                     walk_expr(op, indices);
                 }
@@ -214,9 +226,7 @@ fn expr_has_outer_ref(expr: &Expr) -> bool {
     match expr {
         Expr::OuterColumn { .. } => true,
         Expr::UnaryOp { operand, .. } => expr_has_outer_ref(operand),
-        Expr::BinaryOp { left, right, .. } => {
-            expr_has_outer_ref(left) || expr_has_outer_ref(right)
-        }
+        Expr::BinaryOp { left, right, .. } => expr_has_outer_ref(left) || expr_has_outer_ref(right),
         Expr::IsNull { expr, .. } => expr_has_outer_ref(expr),
         Expr::IsBoolean { expr, .. } => expr_has_outer_ref(expr),
         Expr::Between {
@@ -230,7 +240,7 @@ fn expr_has_outer_ref(expr: &Expr) -> bool {
         } => {
             expr_has_outer_ref(expr)
                 || expr_has_outer_ref(pattern)
-                || escape.as_ref().map_or(false, |e| expr_has_outer_ref(e))
+                || escape.as_ref().is_some_and(|e| expr_has_outer_ref(e))
         }
         Expr::In { expr, list, .. } => {
             expr_has_outer_ref(expr) || list.iter().any(expr_has_outer_ref)
@@ -242,13 +252,11 @@ fn expr_has_outer_ref(expr: &Expr) -> bool {
             else_result,
             ..
         } => {
-            operand.as_ref().map_or(false, |e| expr_has_outer_ref(e))
+            operand.as_ref().is_some_and(|e| expr_has_outer_ref(e))
                 || when_thens
                     .iter()
                     .any(|(w, t)| expr_has_outer_ref(w) || expr_has_outer_ref(t))
-                || else_result
-                    .as_ref()
-                    .map_or(false, |e| expr_has_outer_ref(e))
+                || else_result.as_ref().is_some_and(|e| expr_has_outer_ref(e))
         }
         Expr::Cast { expr, .. } => expr_has_outer_ref(expr),
         Expr::Subquery(inner) => stmt_has_outer_ref(inner),
@@ -256,11 +264,8 @@ fn expr_has_outer_ref(expr: &Expr) -> bool {
             expr_has_outer_ref(expr) || stmt_has_outer_ref(query)
         }
         Expr::Exists { query, .. } => stmt_has_outer_ref(query),
-        Expr::GroupConcat {
-            expr, order_by, ..
-        } => {
-            expr_has_outer_ref(expr)
-                || order_by.iter().any(|(e, _)| expr_has_outer_ref(e))
+        Expr::GroupConcat { expr, order_by, .. } => {
+            expr_has_outer_ref(expr) || order_by.iter().any(|(e, _)| expr_has_outer_ref(e))
         }
         // Leaves: Literal, Column, Default, Param — no outer refs.
         _ => false,
@@ -542,11 +547,7 @@ impl<'a> SubqueryRunner for ExecSubqueryRunner<'a> {
         Ok(result)
     }
 
-    fn run_in_check(
-        &mut self,
-        stmt: &SelectStmt,
-        needle: &Value,
-    ) -> Result<(bool, bool), DbError> {
+    fn run_in_check(&mut self, stmt: &SelectStmt, needle: &Value) -> Result<(bool, bool), DbError> {
         let cache_key = std::ptr::from_ref(stmt) as usize;
         let is_uncorrelated = !stmt_has_outer_ref(stmt);
 
@@ -710,14 +711,12 @@ fn extract_equijoin_outer_inner(expr: &Expr) -> Option<(usize, usize)> {
     } = expr
     {
         match (left.as_ref(), right.as_ref()) {
-            (
-                Expr::OuterColumn { col_idx: oc, .. },
-                Expr::Column { col_idx: ic, .. },
-            ) => Some((*oc, *ic)),
-            (
-                Expr::Column { col_idx: ic, .. },
-                Expr::OuterColumn { col_idx: oc, .. },
-            ) => Some((*oc, *ic)),
+            (Expr::OuterColumn { col_idx: oc, .. }, Expr::Column { col_idx: ic, .. }) => {
+                Some((*oc, *ic))
+            }
+            (Expr::Column { col_idx: ic, .. }, Expr::OuterColumn { col_idx: oc, .. }) => {
+                Some((*oc, *ic))
+            }
             _ => None,
         }
     } else {
@@ -777,12 +776,7 @@ fn apply_exists_semijoin(
     let mut temp_ctx = SessionContext::new();
     let temp_bloom = crate::bloom::BloomRegistry::new();
     let exec_ctx = ExecutionContext::new(storage, txn, &temp_bloom);
-    let result = execute_select_ctx(
-        decorr.inner_stmt.clone(),
-        &exec_ctx,
-        None,
-        &mut temp_ctx,
-    )?;
+    let result = execute_select_ctx(decorr.inner_stmt.clone(), &exec_ctx, None, &mut temp_ctx)?;
 
     // Build HashSet from the inner join key column.
     let inner_rows = match result {
@@ -818,19 +812,3 @@ fn apply_exists_semijoin(
     }
     Ok(combined)
 }
-
-/// Same as `apply_exists_semijoin` but for the ctx-path that receives
-/// pre-decoded rows (no RecordId).
-fn apply_exists_semijoin_rows(
-    outer_rows: Vec<Row>,
-    decorr: &ExistsDecorrelation,
-    storage: &dyn StorageEngine,
-    txn: &TxnManager,
-) -> Result<Vec<Row>, DbError> {
-    let with_rid: Vec<(RecordId, Row)> = outer_rows
-        .into_iter()
-        .map(|r| (RecordId { page_id: 0, slot_id: 0 }, r))
-        .collect();
-    apply_exists_semijoin(with_rid, decorr, storage, txn)
-}
-

@@ -360,6 +360,31 @@ impl MmapStorage {
         self.pwrite_bytes(offset, page.as_bytes())
     }
 
+    fn write_page_inner(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
+        if page_id >= self.page_count.load(Ordering::Acquire) {
+            return Err(DbError::PageNotFound { page_id });
+        }
+        #[cfg(debug_assertions)]
+        {
+            let body = page.body();
+            let hdr_page_type = page.as_bytes()[8];
+            if hdr_page_type == 2 && !body.is_empty() && body[0] == 0 {
+                let num_keys = u16::from_le_bytes([body[2], body[3]]) as usize;
+                let max_n = num_keys.min(223);
+                for i in 0..max_n {
+                    let len = body[8 + i];
+                    assert!(
+                        len as usize <= 64,
+                        "write_page({page_id}): corrupt internal node key_lens[{i}]={len}>64, num_keys={num_keys}"
+                    );
+                }
+            }
+        }
+        self.pwrite_page(page_id, page)?;
+        self.dirty.mark(page_id);
+        Ok(())
+    }
+
     fn read_page_from_mmap(mmap: &Mmap, page_id: u64) -> Result<crate::page_ref::PageRef, DbError> {
         let offset = page_id as usize * PAGE_SIZE;
         if offset + PAGE_SIZE > mmap.len() {
@@ -459,33 +484,15 @@ impl StorageEngine for MmapStorage {
     }
 
     fn write_page(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
-        if page_id >= self.page_count.load(Ordering::Acquire) {
-            return Err(DbError::PageNotFound { page_id });
-        }
-        // Debug guard: catch corrupted internal B-tree nodes before they reach disk.
-        #[cfg(debug_assertions)]
-        {
-            let body = page.body();
-            let hdr_page_type = page.as_bytes()[8];
-            if hdr_page_type == 2 && !body.is_empty() && body[0] == 0 {
-                let num_keys = u16::from_le_bytes([body[2], body[3]]) as usize;
-                let max_n = num_keys.min(223);
-                for i in 0..max_n {
-                    let len = body[8 + i];
-                    assert!(
-                        len as usize <= 64,
-                        "write_page({page_id}): corrupt internal node key_lens[{i}]={len}>64, num_keys={num_keys}"
-                    );
-                }
-            }
-        }
         // Acquire per-page exclusive lock.
         // Two threads writing DIFFERENT pages: different locks → full parallelism.
         // Two threads writing SAME page: same lock → serialized → correctness.
         let _page_guard = self.page_locks.write(page_id);
-        self.pwrite_page(page_id, page)?;
-        self.dirty.mark(page_id);
-        Ok(())
+        self.write_page_inner(page_id, page)
+    }
+
+    fn write_page_under_page_lock(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
+        self.write_page_inner(page_id, page)
     }
 
     fn alloc_page(&self, page_type: PageType) -> Result<u64, DbError> {

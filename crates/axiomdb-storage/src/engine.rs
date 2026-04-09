@@ -47,10 +47,19 @@ pub trait StorageEngine: Send + Sync {
 
     /// Writes `page` to `page_id`. The page must have a valid checksum.
     ///
-    /// Acquires a per-page exclusive lock for the duration of the write.
-    /// Thread-safe: concurrent writes to **different** pages proceed in
-    /// parallel; concurrent writes to the **same** page are serialized.
+    /// General entry point for callers that do not already hold the page's
+    /// exclusive latch. Implementations serialize concurrent writers on the
+    /// same page internally.
     fn write_page(&self, page_id: u64, page: &Page) -> Result<(), DbError>;
+
+    /// Writes `page` to `page_id` assuming the caller already holds the page's
+    /// exclusive latch from [`page_lock_table`](Self::page_lock_table).
+    ///
+    /// Read-modify-write paths such as [`crate::HeapChain`] must use this
+    /// method after taking the latch themselves; calling [`write_page`] there
+    /// would re-acquire the same lock and can self-deadlock on backends that
+    /// enforce per-page locking internally.
+    fn write_page_under_page_lock(&self, page_id: u64, page: &Page) -> Result<(), DbError>;
 
     /// Allocates a new page of the given type. Grows the storage if necessary.
     ///
@@ -90,9 +99,10 @@ pub trait StorageEngine: Send + Sync {
 
     /// Returns a reference to the per-page lock table for heap chain operations.
     ///
-    /// HeapChain write methods (insert, delete, batch) acquire X-latches from
-    /// this table before modifying page contents. Readers don't latch — MVCC
-    /// visibility handles concurrent reads (Phase 40.7).
+    /// HeapChain read-modify-write methods acquire X-latches from this table
+    /// before mutating page contents and then persist through
+    /// `write_page_under_page_lock`. Readers don't latch — MVCC visibility
+    /// handles concurrent reads (Phase 40.7).
     fn page_lock_table(&self) -> &crate::page_lock::PageLockTable;
 }
 

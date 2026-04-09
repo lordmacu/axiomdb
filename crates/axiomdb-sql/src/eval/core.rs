@@ -261,8 +261,6 @@ pub fn eval_in_session(
     eval(expr, row)
 }
 
-/// Evaluates `expr` against `row` using `sq` for subqueries, with the given
-/// session collation for text comparisons.
 // ── HashableValue — wraps Value for use in HashSet (IN subquery optimization) ─
 
 /// Thin newtype enabling `Hash` for `Value` so that `IN (SELECT …)` can build a

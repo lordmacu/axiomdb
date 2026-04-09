@@ -1,3 +1,14 @@
+#[cfg(test)]
+pub(crate) struct HeapUpdateRecord<'a> {
+    pub(crate) table_id: u32,
+    pub(crate) key: &'a [u8],
+    pub(crate) old_value: &'a [u8],
+    pub(crate) new_value: &'a [u8],
+    pub(crate) page_id: u64,
+    pub(crate) old_slot: u16,
+    pub(crate) new_slot: u16,
+}
+
 impl TxnManager {
     // ── DML recording ────────────────────────────────────────────────────────
 
@@ -270,37 +281,40 @@ impl TxnManager {
         Ok(())
     }
 
-    pub fn record_update(
+    #[cfg(test)]
+    pub(crate) fn record_update(
         &self,
         conn_txn: &mut ConnectionTxn,
-        table_id: u32,
-        key: &[u8],
-        old_value: &[u8],
-        new_value: &[u8],
-        page_id: u64,
-        old_slot: u16,
-        new_slot: u16,
+        update: HeapUpdateRecord<'_>,
     ) -> Result<(), DbError> {
         let txn_id = conn_txn.txn_id;
 
-        let mut ov = Vec::with_capacity(PHYSICAL_LOC_LEN + old_value.len());
-        ov.extend_from_slice(&encode_physical_loc(page_id, old_slot));
-        ov.extend_from_slice(old_value);
+        let mut ov = Vec::with_capacity(PHYSICAL_LOC_LEN + update.old_value.len());
+        ov.extend_from_slice(&encode_physical_loc(update.page_id, update.old_slot));
+        ov.extend_from_slice(update.old_value);
 
-        let mut nv = Vec::with_capacity(PHYSICAL_LOC_LEN + new_value.len());
-        nv.extend_from_slice(&encode_physical_loc(page_id, new_slot));
-        nv.extend_from_slice(new_value);
+        let mut nv = Vec::with_capacity(PHYSICAL_LOC_LEN + update.new_value.len());
+        nv.extend_from_slice(&encode_physical_loc(update.page_id, update.new_slot));
+        nv.extend_from_slice(update.new_value);
 
-        let mut entry = WalEntry::new(0, txn_id, EntryType::Update, table_id, key.to_vec(), ov, nv);
+        let mut entry = WalEntry::new(
+            0,
+            txn_id,
+            EntryType::Update,
+            update.table_id,
+            update.key.to_vec(),
+            ov,
+            nv,
+        );
         self.wal
             .append_with_buf(&mut entry, &mut conn_txn.wal_scratch)?;
         conn_txn.undo_ops.push(UndoOp::UndoInsert {
-            page_id,
-            slot_id: new_slot,
+            page_id: update.page_id,
+            slot_id: update.new_slot,
         });
         conn_txn.undo_ops.push(UndoOp::UndoDelete {
-            page_id,
-            slot_id: old_slot,
+            page_id: update.page_id,
+            slot_id: update.old_slot,
         });
         Ok(())
     }
@@ -428,5 +442,4 @@ impl TxnManager {
             .push(UndoOp::UndoTruncate { root_page_id });
         Ok(())
     }
-
 }

@@ -23,6 +23,30 @@
   - repaired roots are written back through catalog replacement helpers
   - old index pages are reclaimed only via deferred free, never inline during the swap
 
+## 2026-04-09 — ANSI quote mode and closeout hardening
+
+- `crates/axiomdb-sql/src/lexer.rs` and `crates/axiomdb-sql/src/parser/mod.rs`
+  now treat MySQL variable prefixes as first-class tokens:
+  - `Token::AtAt` for `@@`
+  - `Token::At` for `@`
+  - `parse_set_variable(...)` strips optional `session.` / `global.` scope after tokenization
+- The `ansi_quotes` session bit is now one shared contract across parser and
+  wire helpers:
+  - lexer resolves raw `"` fragments to `StringLit` vs `DqIdent`
+  - raw-SQL helpers use the same bit for parameter counting and statement splitting
+  - plan-cache lookup no longer crosses quote-mode boundaries
+- Connection cleanup now has a stronger invariant in `mysql/handler.rs`:
+  - before resetting or dropping a session, the server checks `session.conn_txn`
+  - if a transaction is still open, it issues `ROLLBACK` under the database write lock
+  - reset/disconnect paths therefore cannot leak writer ownership into the next connection
+- Clustered validation hardening now includes:
+  - staged clustered INSERT batches track per-statement PKs so rollback truncates
+    only rows introduced by the failing statement
+  - clustered UPDATE secondary maintenance recompiles predicate dependencies and
+    treats predicate-only changes as index-affecting
+  - uniqueness checks on clustered secondaries ignore stale dead entries by
+    verifying visibility through the authoritative clustered primary root
+
 ## 2026-04-03 — Aggregate hash execution + zero-alloc clustered scan (39.21)
 
 - `crates/axiomdb-sql/src/executor/aggregate.rs` now has two specialized hash

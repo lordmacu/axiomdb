@@ -737,13 +737,15 @@ mod tests {
             storage.write_page(page_id, &p).unwrap();
             mgr.record_update(
                 &mut conn2,
-                1,
-                b"k",
-                b"original",
-                b"updated",
-                page_id,
-                old_slot,
-                new_slot,
+                crate::txn::HeapUpdateRecord {
+                    table_id: 1,
+                    key: b"k",
+                    old_value: b"original",
+                    new_value: b"updated",
+                    page_id,
+                    old_slot,
+                    new_slot,
+                },
             )
             .unwrap();
         }

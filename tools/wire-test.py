@@ -10,7 +10,7 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              39.18 (clustered VACUUM smoke), 39.19 (clustered REBUILD guard rails),
              39.21 (aggregate hash execution — zero-alloc clustered scan),
              39.22 (UPDATE in-place zero-alloc: single/multi field patch, rollback, TEXT-before-INT),
-             40.1b (CREATE INDEX on clustered tables),
+             40.1b (CREATE INDEX on clustered tables), 4.22e (ALTER DROP/MODIFY auto-index repair),
              4.G5 (DELETE/UPDATE ORDER BY+LIMIT, INSERT IGNORE, CREATE LIKE, CTAS, CALL/DO)
 """
 import os
@@ -59,16 +59,20 @@ def _check_binary_freshness(binary):
 
 def start_server():
     global _server_proc, _data_dir
-    debug   = "target/debug/axiomdb-server"
-    release = "target/release/axiomdb-server"
-    if os.path.isfile(debug) and os.path.isfile(release):
-        binary = debug if os.path.getmtime(debug) > os.path.getmtime(release) else release
-    elif os.path.isfile(release):
-        binary = release
-    elif os.path.isfile(debug):
-        binary = debug
+    explicit = os.environ.get("AXIOMDB_SERVER_BIN")
+    if explicit:
+        binary = explicit
     else:
-        binary = debug  # trigger "not found" message below
+        debug   = "target/debug/axiomdb-server"
+        release = "target/release/axiomdb-server"
+        if os.path.isfile(debug) and os.path.isfile(release):
+            binary = debug if os.path.getmtime(debug) > os.path.getmtime(release) else release
+        elif os.path.isfile(release):
+            binary = release
+        elif os.path.isfile(debug):
+            binary = debug
+        else:
+            binary = debug  # trigger "not found" message below
     if not os.path.isfile(binary):
         print("Server binary not found — build first: cargo build -p axiomdb-server")
         sys.exit(1)
@@ -1514,6 +1518,50 @@ cur2.execute("SELECT @@strict_mode")
 ok("@@strict_mode is ON after SET sql_mode = 'STRICT_TRANS_TABLES'",
    cur2.fetchone()[0] == "ON")
 
+print("\n[ANSI_QUOTES toggles double-quote semantics]")
+cs.execute("DROP TABLE IF EXISTS t_wire_ansi_quotes")
+cs.execute("CREATE TABLE t_wire_ansi_quotes (c INT)")
+cs.execute("INSERT INTO t_wire_ansi_quotes VALUES (7)")
+
+cs.execute('SELECT "literal"')
+row_default_quotes = cs.fetchone()
+ok('ANSI_QUOTES OFF: SELECT "literal" returns a string literal',
+   row_default_quotes is not None and row_default_quotes[0] == "literal",
+   row_default_quotes)
+
+cs.execute("SET sql_mode = 'STRICT_TRANS_TABLES,ANSI_QUOTES'")
+cur2.execute("SELECT @@sql_mode")
+ansi_mode_enabled = cur2.fetchone()[0]
+ok("@@sql_mode contains ANSI_QUOTES after SET",
+   "ANSI_QUOTES" in ansi_mode_enabled, ansi_mode_enabled)
+
+cs.execute('SELECT "c" FROM t_wire_ansi_quotes')
+row_identifier_quotes = cs.fetchone()
+ok('ANSI_QUOTES ON: SELECT "c" resolves a quoted identifier',
+   row_identifier_quotes is not None and row_identifier_quotes[0] == 7,
+   row_identifier_quotes)
+
+ansi_literal_err = None
+try:
+    cs.execute('SELECT "literal"')
+except Exception as e:
+    ansi_literal_err = e
+ok('ANSI_QUOTES ON: SELECT "literal" no longer behaves as a string literal',
+   ansi_literal_err is not None, ansi_literal_err)
+
+cs.execute("SET sql_mode = 'STRICT_TRANS_TABLES'")
+cur2.execute("SELECT @@sql_mode")
+ansi_mode_disabled = cur2.fetchone()[0]
+ok("@@sql_mode drops ANSI_QUOTES after reset",
+   "ANSI_QUOTES" not in ansi_mode_disabled, ansi_mode_disabled)
+
+cs.execute('SELECT "literal"')
+row_reset_quotes = cs.fetchone()
+ok('ANSI_QUOTES reset: SELECT "literal" returns a string literal again',
+   row_reset_quotes is not None and row_reset_quotes[0] == "literal",
+   row_reset_quotes)
+
+cs.execute("DROP TABLE IF EXISTS t_wire_ansi_quotes")
 cs.execute("DROP TABLE IF EXISTS t_wire_strict")
 conn_strict.close()
 
@@ -2643,10 +2691,103 @@ except Exception as e:
 
 conn_ci.close()
 
+# ── 4.22c ALTER TABLE ADD PRIMARY KEY ────────────────────────────────────────
+
+print("\n[4.22c] ALTER TABLE ADD PRIMARY KEY")
+conn_422c = pymysql.connect(host="127.0.0.1", port=PORT, user="root",
+                            password="root",
+                            charset="utf8mb4", autocommit=True)
+c_422c = conn_422c.cursor()
+
+c_422c.execute("CREATE TABLE alter_pk42 (id INT, email TEXT)")
+c_422c.execute(
+    "INSERT INTO alter_pk42 VALUES (1, 'alice@example.com'), (2, 'bob@example.com')"
+)
+c_422c.execute("CREATE UNIQUE INDEX idx_alter_pk42_email ON alter_pk42 (email)")
+c_422c.execute("ALTER TABLE alter_pk42 ADD PRIMARY KEY (id)")
+
+c_422c.execute("SELECT COUNT(*) FROM alter_pk42")
+ok("4.22c existing rows survive ADD PRIMARY KEY", c_422c.fetchone()[0] == 2)
+
+try:
+    c_422c.execute("INSERT INTO alter_pk42 VALUES (NULL, 'carol@example.com')")
+    c_422c.fetchall()
+    ok("4.22c inserted NULL into added PRIMARY KEY", False, "no error raised")
+except pymysql.MySQLError:
+    ok("4.22c added PRIMARY KEY rejects NULL inserts", True)
+
+try:
+    c_422c.execute("INSERT INTO alter_pk42 VALUES (3, 'alice@example.com')")
+    c_422c.fetchall()
+    ok("4.22c secondary unique index survives rebuild", False, "no error raised")
+except Exception as e:
+    ok("4.22c secondary unique index survives rebuild", True, str(e))
+
+c_422c.execute("CREATE TABLE alter_pk42_null (id INT, email TEXT)")
+c_422c.execute(
+    "INSERT INTO alter_pk42_null VALUES (1, 'ok@example.com'), (NULL, 'bad@example.com')"
+)
+try:
+    c_422c.execute("ALTER TABLE alter_pk42_null ADD PRIMARY KEY (id)")
+    c_422c.fetchall()
+    ok("4.22c NULL existing PK values are rejected", False, "no error raised")
+except Exception as e:
+    ok("4.22c NULL existing PK values are rejected", True, str(e))
+
+conn_422c.close()
+
+# ── 4.22e ALTER TABLE DROP/MODIFY COLUMN auto-index repair ───────────────────
+
+print("\n[4.22e] ALTER TABLE DROP/MODIFY COLUMN auto-index repair")
+conn_422e = connect()
+c_422e = conn_422e.cursor()
+
+c_422e.execute("CREATE TABLE alter_drop42e (id INT, email TEXT, deleted_at INT)")
+c_422e.execute(
+    "CREATE UNIQUE INDEX uq_drop42e_live ON alter_drop42e (email) WHERE deleted_at IS NULL"
+)
+c_422e.execute("INSERT INTO alter_drop42e VALUES (1, 'alice@example.com', NULL)")
+conn_422e.commit()
+c_422e.execute("ALTER TABLE alter_drop42e DROP COLUMN deleted_at")
+conn_422e.commit()
+try:
+    c_422e.execute("INSERT INTO alter_drop42e VALUES (2, 'alice@example.com')")
+    conn_422e.commit()
+    ok("4.22e DROP COLUMN auto-drops affected partial index", True)
+except Exception as e:
+    conn_422e.rollback()
+    ok("4.22e DROP COLUMN auto-drops affected partial index", False, str(e))
+
+c_422e.execute("SELECT COUNT(*) FROM alter_drop42e")
+ok("4.22e dropped-column table remains writable", c_422e.fetchone()[0] == 2)
+
+c_422e.execute("CREATE TABLE alter_mod42e (id INT, score INT)")
+c_422e.execute("CREATE UNIQUE INDEX uq_mod42e_score ON alter_mod42e (score)")
+c_422e.execute("INSERT INTO alter_mod42e VALUES (1, 100), (2, 200)")
+conn_422e.commit()
+c_422e.execute("ALTER TABLE alter_mod42e MODIFY COLUMN score BIGINT")
+conn_422e.commit()
+c_422e.execute("SELECT id, score FROM alter_mod42e ORDER BY id")
+mod_rows = c_422e.fetchall()
+ok(
+    "4.22e MODIFY COLUMN preserves existing rows after type rewrite",
+    mod_rows == ((1, 100), (2, 200)),
+    mod_rows,
+)
+try:
+    c_422e.execute("INSERT INTO alter_mod42e VALUES (3, 100)")
+    conn_422e.commit()
+    ok("4.22e MODIFY COLUMN rebuilds unique secondary index", False, "no error raised")
+except Exception as e:
+    conn_422e.rollback()
+    ok("4.22e MODIFY COLUMN rebuilds unique secondary index", True, str(e))
+
+conn_422e.close()
+
 # ── G5.1 — CALL / DO as no-ops ───────────────────────────────────────────────
 
 print("\n[G5 — DML extensions]")
-conn_g5 = _connect()
+conn_g5 = connect()
 c_g5 = conn_g5.cursor()
 c_g5.execute("CALL some_procedure(1, 2)")
 c_g5.fetchall()

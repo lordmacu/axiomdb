@@ -109,14 +109,13 @@ pub(super) fn apply_insert_batch_with_ctx(
     txn: &mut TxnManager,
     bloom: &mut crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
     mut plan: InsertBatchApply<'_>,
 ) -> Result<Vec<RecordId>, DbError> {
     let rids =
-        TableEngine::insert_rows_batch_with_ctx(storage, txn, plan.table_def, plan.columns, ctx, plan.rows)?;
-    let roots_changed = {
-        let conn = ctx.conn_txn.as_mut().expect("active txn for index flush");
-        persist_batch_insert_indexes(storage, txn, conn, bloom, &mut plan, &rids)?
-    };
+        TableEngine::insert_rows_batch_with_ctx(storage, txn, plan.table_def, plan.columns, ctx, conn_txn, plan.rows)?;
+    let roots_changed =
+        persist_batch_insert_indexes(storage, txn, conn_txn, bloom, &mut plan, &rids)?;
     if roots_changed {
         ctx.invalidate_all();
     }
@@ -157,11 +156,13 @@ pub(super) fn flush_pending_inserts_ctx(
     }
 
     let mut indexes = batch.indexes;
-    let rids = apply_insert_batch_with_ctx(
+    let mut conn = ctx.conn_txn.take().expect("active txn for flush_pending_inserts_ctx");
+    let result = apply_insert_batch_with_ctx(
         storage,
         txn,
         bloom,
         ctx,
+        &mut conn,
         InsertBatchApply {
             table_def: &batch.table_def,
             columns: &batch.columns,
@@ -171,7 +172,9 @@ pub(super) fn flush_pending_inserts_ctx(
             skip_unique_check: true, // pre-verified at enqueue time
             committed_empty: &batch.committed_empty,
         },
-    )?;
+    );
+    ctx.conn_txn = Some(conn);
+    let rids = result?;
 
     // ── Phase 4: stats ────────────────────────────────────────────────────────
     ctx.stats

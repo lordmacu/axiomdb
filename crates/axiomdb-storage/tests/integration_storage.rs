@@ -7,7 +7,7 @@
 //! - Exercise the StorageEngine trait as a unified interface.
 
 use axiomdb_core::error::DbError;
-use axiomdb_storage::{MemoryStorage, MmapStorage, Page, PageType, StorageEngine};
+use axiomdb_storage::{HeapChain, MemoryStorage, MmapStorage, Page, PageType, StorageEngine};
 use tempfile::TempDir;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -53,6 +53,31 @@ fn test_crash_recovery_data_survives() {
         let engine = MmapStorage::open(&db_path).expect("reopen");
         assert_pattern(&engine, page_id, 0xAB);
     }
+}
+
+#[test]
+fn test_mmap_heap_chain_insert_persists_under_page_latch() {
+    let dir = tmp_dir();
+    let db_path = dir.path().join("heap_chain.db");
+    let mut storage = MmapStorage::create(&db_path).expect("create");
+    let root = storage.alloc_page(PageType::Data).expect("alloc root");
+    let root_page = Page::new(PageType::Data, root);
+    storage.write_page(root, &root_page).expect("init root");
+
+    let rid = HeapChain::insert(&mut storage, root, b"seed", 1).expect("heap insert");
+    assert_eq!(rid.0, root, "single insert should stay on root page");
+    storage.flush().expect("flush");
+    drop(storage);
+
+    let mut storage = MmapStorage::open(&db_path).expect("reopen");
+    let rows = HeapChain::scan_visible(
+        &mut storage,
+        root,
+        axiomdb_core::TransactionSnapshot::committed(1),
+    )
+    .expect("scan");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].2, b"seed");
 }
 
 #[test]
