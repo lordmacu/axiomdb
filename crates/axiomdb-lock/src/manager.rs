@@ -1,0 +1,742 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use axiomdb_core::error::DbError;
+use axiomdb_core::TxnId;
+
+use crate::bitmap::SlotBitmap;
+use crate::entry::{LockEntry, LockQueue, LockWaiter, WaitAbortReason};
+use crate::mode::{LockFlags, LockMode};
+use crate::txn_locks::LockRef;
+
+/// Result of a lock acquisition attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockResult {
+    /// Lock was granted immediately (no conflict).
+    Granted,
+    /// Lock was granted after waiting for conflicting locks to release.
+    WaitGranted,
+}
+
+const RECORD_SHARDS: usize = 64;
+const TABLE_SHARDS: usize = 16;
+const DEFAULT_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(50); // InnoDB default
+
+/// Sharded row-level lock manager.
+///
+/// Architecture inspired by InnoDB's `lock_sys_t` (sharded hash table with
+/// per-page record bitmaps) and PostgreSQL's partitioned `LockMethodLockHash`
+/// (16 partitions with per-partition LWLock).
+///
+/// - 64 shards for record locks (keyed by `page_id`)
+/// - 16 shards for table locks (keyed by `table_id`)
+/// - Each shard: `Mutex<HashMap<key, LockQueue>>`
+/// - `std::sync::Mutex` (not tokio): held for ~1-10µs, never across `.await`
+///
+/// Thread-safe (`Send + Sync`). Multiple connections can acquire/release
+/// locks on different shards concurrently with zero contention.
+pub struct LockManager {
+    record_shards: Box<[Mutex<HashMap<u64, LockQueue>>]>,
+    table_shards: Box<[Mutex<HashMap<u32, LockQueue>>]>,
+    lock_wait_timeout: Duration,
+}
+
+// SAFETY: All fields are Send+Sync (Mutex<HashMap<..>>, Duration).
+unsafe impl Send for LockManager {}
+unsafe impl Sync for LockManager {}
+
+impl LockManager {
+    pub fn new() -> Self {
+        Self::with_timeout(DEFAULT_LOCK_WAIT_TIMEOUT)
+    }
+
+    pub fn with_timeout(timeout: Duration) -> Self {
+        let record_shards: Vec<_> = (0..RECORD_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect();
+        let table_shards: Vec<_> = (0..TABLE_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect();
+        Self {
+            record_shards: record_shards.into_boxed_slice(),
+            table_shards: table_shards.into_boxed_slice(),
+            lock_wait_timeout: timeout,
+        }
+    }
+
+    /// Acquires a record lock on a specific slot (heap_no) within a page.
+    ///
+    /// If the lock cannot be granted immediately (conflict with another
+    /// transaction), the caller awaits a `tokio::sync::Notify` until the
+    /// holder releases or the timeout expires.
+    ///
+    /// InnoDB bitmap optimization: if the same transaction already holds a
+    /// lock with the same mode on the same page, the slot is added to the
+    /// existing entry's bitmap without creating a new `LockEntry`.
+    pub async fn acquire_record_lock(
+        &self,
+        txn_id: TxnId,
+        page_id: u64,
+        slot_id: u16,
+        mode: LockMode,
+        flags: LockFlags,
+    ) -> Result<LockResult, DbError> {
+        let shard_idx = page_id as usize % RECORD_SHARDS;
+        let notify = {
+            let mut shard = self.record_shards[shard_idx].lock().unwrap();
+            let queue = shard.entry(page_id).or_default();
+
+            // Fast path: same txn already holds compatible lock on this page.
+            // Extend the bitmap instead of creating a new entry.
+            if let Some(idx) = queue.find_granted_idx(txn_id, mode) {
+                if let Some(ref mut bm) = queue.granted[idx].bitmap {
+                    bm.set(slot_id);
+                }
+                return Ok(LockResult::Granted);
+            }
+
+            // Check for upgrade: txn holds S, requests X.
+            if mode == LockMode::Exclusive {
+                if let Some(idx) = queue.find_granted_idx(txn_id, LockMode::Shared) {
+                    // Check if any OTHER txn conflicts with X on this slot.
+                    let has_other_conflict =
+                        queue.find_conflict(txn_id, mode, Some(slot_id)).is_some();
+                    if !has_other_conflict && queue.waiting.is_empty() {
+                        // Upgrade in place: S → X.
+                        queue.granted[idx].mode = LockMode::Exclusive;
+                        if let Some(ref mut bm) = queue.granted[idx].bitmap {
+                            bm.set(slot_id);
+                        }
+                        return Ok(LockResult::Granted);
+                    }
+                    // Fall through to wait — upgrade blocked by other holders.
+                }
+            }
+
+            // Check conflict with granted locks.
+            let has_conflict = queue.find_conflict(txn_id, mode, Some(slot_id)).is_some();
+
+            // FIFO discipline: if there are waiters, we must also wait even if
+            // our request is compatible with granted locks. This prevents
+            // starvation of earlier waiters (PostgreSQL ProcSleep pattern).
+            if !has_conflict && queue.waiting.is_empty() {
+                // Granted immediately.
+                let mut entry = LockEntry {
+                    txn_id,
+                    mode,
+                    flags,
+                    requested_at: Instant::now(),
+                    bitmap: Some(SlotBitmap::with_slot(slot_id)),
+                };
+                entry.flags = entry.flags.difference(LockFlags::WAITING);
+                queue.granted.push(entry);
+                return Ok(LockResult::Granted);
+            }
+
+            // Must wait. Create a Notify and enqueue.
+            let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+            let waiter = LockWaiter {
+                entry: LockEntry {
+                    txn_id,
+                    mode,
+                    flags: flags.union(LockFlags::WAITING),
+                    requested_at: Instant::now(),
+                    bitmap: Some(SlotBitmap::with_slot(slot_id)),
+                },
+                notify: std::sync::Arc::clone(&notify),
+                abort_reason: None,
+            };
+            queue.waiting.push_back(waiter);
+            notify
+            // Shard mutex dropped here.
+        };
+
+        // Wait outside the mutex.
+        match tokio::time::timeout(self.lock_wait_timeout, notify.notified()).await {
+            Ok(()) => {
+                // Woken up — check if we were granted or aborted.
+                let shard = self.record_shards[shard_idx].lock().unwrap();
+                if let Some(queue) = shard.get(&page_id) {
+                    // Check if we're now in granted list.
+                    if queue
+                        .granted
+                        .iter()
+                        .any(|e| e.txn_id == txn_id && e.mode == mode)
+                    {
+                        return Ok(LockResult::WaitGranted);
+                    }
+                    // Check if we were aborted (deadlock).
+                    if let Some(waiter) = queue.waiting.iter().find(|w| w.entry.txn_id == txn_id) {
+                        if waiter.abort_reason == Some(WaitAbortReason::Deadlock) {
+                            return Err(DbError::DeadlockDetected);
+                        }
+                    }
+                }
+                // If we get here, we were granted (entry moved to granted + queue
+                // may have been cleaned up).
+                Ok(LockResult::WaitGranted)
+            }
+            Err(_) => {
+                // Timeout — remove ourselves from the waiting queue.
+                let mut shard = self.record_shards[shard_idx].lock().unwrap();
+                if let Some(queue) = shard.get_mut(&page_id) {
+                    queue.remove_waiter_by_txn(txn_id);
+                    if queue.is_empty() {
+                        shard.remove(&page_id);
+                    }
+                }
+                Err(DbError::LockTimeout)
+            }
+        }
+    }
+
+    /// Acquires a table-level lock (IS, IX, S, X, or AutoIncrement).
+    ///
+    /// Table locks are acquired BEFORE row locks:
+    /// - Before S row lock → acquire IS on table
+    /// - Before X row lock → acquire IX on table
+    /// - DDL (DROP/ALTER) → acquire X on table
+    pub async fn acquire_table_lock(
+        &self,
+        txn_id: TxnId,
+        table_id: u32,
+        mode: LockMode,
+    ) -> Result<LockResult, DbError> {
+        let shard_idx = table_id as usize % TABLE_SHARDS;
+        let notify = {
+            let mut shard = self.table_shards[shard_idx].lock().unwrap();
+            let queue = shard.entry(table_id).or_default();
+
+            // Already holds same or stronger lock?
+            if queue
+                .granted
+                .iter()
+                .any(|e| e.txn_id == txn_id && e.mode == mode)
+            {
+                return Ok(LockResult::Granted);
+            }
+
+            let has_conflict = queue.find_conflict(txn_id, mode, None).is_some();
+
+            if !has_conflict && queue.waiting.is_empty() {
+                queue.granted.push(LockEntry {
+                    txn_id,
+                    mode,
+                    flags: LockFlags::TABLE_LOCK,
+                    requested_at: Instant::now(),
+                    bitmap: None,
+                });
+                return Ok(LockResult::Granted);
+            }
+
+            let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+            queue.waiting.push_back(LockWaiter {
+                entry: LockEntry {
+                    txn_id,
+                    mode,
+                    flags: LockFlags::TABLE_LOCK.union(LockFlags::WAITING),
+                    requested_at: Instant::now(),
+                    bitmap: None,
+                },
+                notify: std::sync::Arc::clone(&notify),
+                abort_reason: None,
+            });
+            notify
+        };
+
+        match tokio::time::timeout(self.lock_wait_timeout, notify.notified()).await {
+            Ok(()) => Ok(LockResult::WaitGranted),
+            Err(_) => {
+                let mut shard = self.table_shards[shard_idx].lock().unwrap();
+                if let Some(queue) = shard.get_mut(&table_id) {
+                    queue.remove_waiter_by_txn(txn_id);
+                    if queue.is_empty() {
+                        shard.remove(&table_id);
+                    }
+                }
+                Err(DbError::LockTimeout)
+            }
+        }
+    }
+
+    /// Releases all locks held by a transaction (called on COMMIT/ROLLBACK).
+    ///
+    /// For each `LockRef`, acquires the appropriate shard mutex, removes the
+    /// entry, promotes compatible waiters, then drops the mutex BEFORE
+    /// notifying waiters (InnoDB pattern: never hold lock_sys latch during
+    /// signal).
+    ///
+    /// Returns the number of waiters that were granted.
+    pub fn release_all_locks(&self, txn_id: TxnId, held_locks: &[LockRef]) -> usize {
+        let mut total_granted = 0;
+        let mut all_notifies: Vec<std::sync::Arc<tokio::sync::Notify>> = Vec::new();
+
+        for lock_ref in held_locks {
+            match lock_ref {
+                LockRef::Record { page_id, .. } => {
+                    let shard_idx = *page_id as usize % RECORD_SHARDS;
+                    let mut shard = self.record_shards[shard_idx].lock().unwrap();
+                    if let Some(queue) = shard.get_mut(page_id) {
+                        queue.remove_granted_by_txn(txn_id);
+                        let notifies = queue.try_grant_waiters();
+                        total_granted += notifies.len();
+                        all_notifies.extend(notifies);
+                        if queue.is_empty() {
+                            shard.remove(page_id);
+                        }
+                    }
+                }
+                LockRef::Table { table_id } => {
+                    let shard_idx = *table_id as usize % TABLE_SHARDS;
+                    let mut shard = self.table_shards[shard_idx].lock().unwrap();
+                    if let Some(queue) = shard.get_mut(table_id) {
+                        queue.remove_granted_by_txn(txn_id);
+                        let notifies = queue.try_grant_waiters();
+                        total_granted += notifies.len();
+                        all_notifies.extend(notifies);
+                        if queue.is_empty() {
+                            shard.remove(table_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Notify all waiters AFTER dropping all shard mutexes.
+        for notify in all_notifies {
+            notify.notify_one();
+        }
+
+        total_granted
+    }
+
+    /// Hook for the deadlock detector (40.6).
+    ///
+    /// Sets `abort_reason = Deadlock` on the victim's `LockWaiter` and
+    /// notifies it so it wakes up and returns `DbError::DeadlockDetected`.
+    pub fn abort_waiter(&self, txn_id: TxnId, lock_ref: &LockRef) {
+        match lock_ref {
+            LockRef::Record { page_id, .. } => {
+                let shard_idx = *page_id as usize % RECORD_SHARDS;
+                let mut shard = self.record_shards[shard_idx].lock().unwrap();
+                if let Some(queue) = shard.get_mut(page_id) {
+                    if let Some(waiter) =
+                        queue.waiting.iter_mut().find(|w| w.entry.txn_id == txn_id)
+                    {
+                        waiter.abort_reason = Some(WaitAbortReason::Deadlock);
+                        waiter.notify.notify_one();
+                    }
+                }
+            }
+            LockRef::Table { table_id } => {
+                let shard_idx = *table_id as usize % TABLE_SHARDS;
+                let mut shard = self.table_shards[shard_idx].lock().unwrap();
+                if let Some(queue) = shard.get_mut(table_id) {
+                    if let Some(waiter) =
+                        queue.waiting.iter_mut().find(|w| w.entry.txn_id == txn_id)
+                    {
+                        waiter.abort_reason = Some(WaitAbortReason::Deadlock);
+                        waiter.notify.notify_one();
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Default for LockManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn two_txns_different_rows_both_granted() {
+        let rt = rt();
+        rt.block_on(async {
+            let lm = LockManager::new();
+            let r1 = lm
+                .acquire_record_lock(1, 100, 0, LockMode::Exclusive, LockFlags::NONE)
+                .await
+                .unwrap();
+            let r2 = lm
+                .acquire_record_lock(2, 100, 1, LockMode::Exclusive, LockFlags::NONE)
+                .await
+                .unwrap();
+            assert_eq!(r1, LockResult::Granted);
+            assert_eq!(r2, LockResult::Granted);
+        });
+    }
+
+    #[test]
+    fn s_s_same_row_both_granted() {
+        let rt = rt();
+        rt.block_on(async {
+            let lm = LockManager::new();
+            let r1 = lm
+                .acquire_record_lock(1, 100, 5, LockMode::Shared, LockFlags::NONE)
+                .await
+                .unwrap();
+            let r2 = lm
+                .acquire_record_lock(2, 100, 5, LockMode::Shared, LockFlags::NONE)
+                .await
+                .unwrap();
+            assert_eq!(r1, LockResult::Granted);
+            assert_eq!(r2, LockResult::Granted);
+        });
+    }
+
+    #[test]
+    fn s_x_same_row_x_waits_then_granted() {
+        let rt = rt();
+        rt.block_on(async {
+            let lm = std::sync::Arc::new(LockManager::new());
+
+            // Txn 1 acquires S.
+            lm.acquire_record_lock(1, 100, 5, LockMode::Shared, LockFlags::NONE)
+                .await
+                .unwrap();
+
+            let lm2 = std::sync::Arc::clone(&lm);
+            // Txn 2 tries X — should wait.
+            let handle = tokio::spawn(async move {
+                lm2.acquire_record_lock(2, 100, 5, LockMode::Exclusive, LockFlags::NONE)
+                    .await
+            });
+
+            // Give txn 2 time to enqueue.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // Release txn 1's locks.
+            lm.release_all_locks(
+                1,
+                &[LockRef::Record {
+                    page_id: 100,
+                    slot_id: 5,
+                }],
+            );
+
+            let result = handle.await.unwrap().unwrap();
+            assert_eq!(result, LockResult::WaitGranted);
+        });
+    }
+
+    #[test]
+    fn x_x_same_row_second_waits() {
+        let rt = rt();
+        rt.block_on(async {
+            let lm = std::sync::Arc::new(LockManager::new());
+            lm.acquire_record_lock(1, 100, 5, LockMode::Exclusive, LockFlags::NONE)
+                .await
+                .unwrap();
+
+            let lm2 = std::sync::Arc::clone(&lm);
+            let handle = tokio::spawn(async move {
+                lm2.acquire_record_lock(2, 100, 5, LockMode::Exclusive, LockFlags::NONE)
+                    .await
+            });
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            lm.release_all_locks(
+                1,
+                &[LockRef::Record {
+                    page_id: 100,
+                    slot_id: 5,
+                }],
+            );
+
+            let result = handle.await.unwrap().unwrap();
+            assert_eq!(result, LockResult::WaitGranted);
+        });
+    }
+
+    #[test]
+    fn table_ix_ix_compatible() {
+        let rt = rt();
+        rt.block_on(async {
+            let lm = LockManager::new();
+            let r1 = lm
+                .acquire_table_lock(1, 10, LockMode::IntentionExclusive)
+                .await
+                .unwrap();
+            let r2 = lm
+                .acquire_table_lock(2, 10, LockMode::IntentionExclusive)
+                .await
+                .unwrap();
+            assert_eq!(r1, LockResult::Granted);
+            assert_eq!(r2, LockResult::Granted);
+        });
+    }
+
+    #[test]
+    fn table_ix_s_conflict() {
+        let rt = rt();
+        rt.block_on(async {
+            let lm = std::sync::Arc::new(LockManager::new());
+            lm.acquire_table_lock(1, 10, LockMode::IntentionExclusive)
+                .await
+                .unwrap();
+
+            let lm2 = std::sync::Arc::clone(&lm);
+            let handle =
+                tokio::spawn(async move { lm2.acquire_table_lock(2, 10, LockMode::Shared).await });
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            lm.release_all_locks(1, &[LockRef::Table { table_id: 10 }]);
+
+            let result = handle.await.unwrap().unwrap();
+            assert_eq!(result, LockResult::WaitGranted);
+        });
+    }
+
+    #[test]
+    fn lock_upgrade_s_to_x() {
+        let rt = rt();
+        rt.block_on(async {
+            let lm = LockManager::new();
+            // Txn 1 acquires S.
+            lm.acquire_record_lock(1, 100, 5, LockMode::Shared, LockFlags::NONE)
+                .await
+                .unwrap();
+            // Txn 1 upgrades to X (no other holders).
+            let r = lm
+                .acquire_record_lock(1, 100, 5, LockMode::Exclusive, LockFlags::NONE)
+                .await
+                .unwrap();
+            assert_eq!(r, LockResult::Granted);
+        });
+    }
+
+    #[test]
+    fn same_txn_same_mode_extends_bitmap() {
+        let rt = rt();
+        rt.block_on(async {
+            let lm = LockManager::new();
+            lm.acquire_record_lock(1, 100, 5, LockMode::Exclusive, LockFlags::NONE)
+                .await
+                .unwrap();
+            // Same txn, same page, same mode, different slot → bitmap extension.
+            let r = lm
+                .acquire_record_lock(1, 100, 10, LockMode::Exclusive, LockFlags::NONE)
+                .await
+                .unwrap();
+            assert_eq!(r, LockResult::Granted);
+
+            // Verify bitmap has both slots.
+            let shard = lm.record_shards[100 % RECORD_SHARDS].lock().unwrap();
+            let queue = shard.get(&100).unwrap();
+            assert_eq!(queue.granted.len(), 1); // single entry
+            let bm = queue.granted[0].bitmap.as_ref().unwrap();
+            assert!(bm.test(5));
+            assert!(bm.test(10));
+        });
+    }
+
+    #[test]
+    fn bulk_release_grants_waiters() {
+        let rt = rt();
+        rt.block_on(async {
+            let lm = std::sync::Arc::new(LockManager::new());
+
+            // Txn 1 locks 3 different rows.
+            for slot in 0..3u16 {
+                lm.acquire_record_lock(1, 200, slot, LockMode::Exclusive, LockFlags::NONE)
+                    .await
+                    .unwrap();
+            }
+
+            // 3 waiters, each on a different slot.
+            let mut handles = Vec::new();
+            for slot in 0..3u16 {
+                let lm2 = std::sync::Arc::clone(&lm);
+                let txn_id = 10 + slot as u64;
+                handles.push(tokio::spawn(async move {
+                    lm2.acquire_record_lock(txn_id, 200, slot, LockMode::Exclusive, LockFlags::NONE)
+                        .await
+                }));
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // Bulk release.
+            let refs: Vec<_> = (0..3u16)
+                .map(|s| LockRef::Record {
+                    page_id: 200,
+                    slot_id: s,
+                })
+                .collect();
+            let granted = lm.release_all_locks(1, &refs);
+            assert_eq!(granted, 3);
+
+            for h in handles {
+                assert_eq!(h.await.unwrap().unwrap(), LockResult::WaitGranted);
+            }
+        });
+    }
+
+    #[test]
+    fn lock_wait_timeout() {
+        let rt = rt();
+        rt.block_on(async {
+            let lm = std::sync::Arc::new(LockManager::with_timeout(Duration::from_millis(100)));
+            lm.acquire_record_lock(1, 100, 5, LockMode::Exclusive, LockFlags::NONE)
+                .await
+                .unwrap();
+
+            let lm2 = std::sync::Arc::clone(&lm);
+            let result = lm2
+                .acquire_record_lock(2, 100, 5, LockMode::Exclusive, LockFlags::NONE)
+                .await;
+            assert!(result.is_err());
+            match result.unwrap_err() {
+                DbError::LockTimeout { .. } => {}
+                other => panic!("expected LockTimeout, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn fifo_ordering() {
+        let rt = rt();
+        rt.block_on(async {
+            let lm = std::sync::Arc::new(LockManager::new());
+            lm.acquire_record_lock(1, 100, 5, LockMode::Exclusive, LockFlags::NONE)
+                .await
+                .unwrap();
+
+            // 3 waiters enqueue in order.
+            let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut handles = Vec::new();
+            for txn in 2..=4u64 {
+                let lm2 = std::sync::Arc::clone(&lm);
+                let order2 = std::sync::Arc::clone(&order);
+                handles.push(tokio::spawn(async move {
+                    lm2.acquire_record_lock(txn, 100, 5, LockMode::Exclusive, LockFlags::NONE)
+                        .await
+                        .unwrap();
+                    order2.lock().unwrap().push(txn);
+                    // Release immediately so next waiter can proceed.
+                    lm2.release_all_locks(
+                        txn,
+                        &[LockRef::Record {
+                            page_id: 100,
+                            slot_id: 5,
+                        }],
+                    );
+                }));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            // Release holder — triggers FIFO grant chain.
+            lm.release_all_locks(
+                1,
+                &[LockRef::Record {
+                    page_id: 100,
+                    slot_id: 5,
+                }],
+            );
+
+            for h in handles {
+                h.await.unwrap();
+            }
+
+            // X locks are exclusive — only one at a time.
+            // FIFO order: 2, 3, 4.
+            let grant_order = order.lock().unwrap().clone();
+            assert_eq!(grant_order, vec![2, 3, 4]);
+        });
+    }
+
+    #[test]
+    fn stress_8_tasks_1000_locks_disjoint() {
+        // Each task locks a non-overlapping range of pages → zero contention.
+        // Validates shard concurrency and memory cleanup under load.
+        let rt = rt();
+        rt.block_on(async {
+            let lm = std::sync::Arc::new(LockManager::new());
+            let mut handles = Vec::new();
+
+            for task in 0..8u64 {
+                let lm2 = std::sync::Arc::clone(&lm);
+                handles.push(tokio::spawn(async move {
+                    let txn_id = 100 + task;
+                    let base_page = task * 1000; // non-overlapping
+                    let mut refs = Vec::new();
+                    for i in 0..1000u16 {
+                        let page_id = base_page + i as u64;
+                        let slot_id = i % 64;
+                        lm2.acquire_record_lock(
+                            txn_id,
+                            page_id,
+                            slot_id,
+                            LockMode::Exclusive,
+                            LockFlags::NONE,
+                        )
+                        .await
+                        .unwrap();
+                        refs.push(LockRef::Record { page_id, slot_id });
+                    }
+                    lm2.release_all_locks(txn_id, &refs);
+                }));
+            }
+
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn stress_contended_acquire_release_cycles() {
+        // 4 tasks contend on the SAME row with short hold times.
+        // Each acquires X, does "work" (brief sleep), releases, repeats.
+        let rt = rt();
+        rt.block_on(async {
+            let lm = std::sync::Arc::new(LockManager::with_timeout(Duration::from_secs(5)));
+            let mut handles = Vec::new();
+
+            for task in 0..4u64 {
+                let lm2 = std::sync::Arc::clone(&lm);
+                handles.push(tokio::spawn(async move {
+                    let txn_id = 200 + task;
+                    for _ in 0..50 {
+                        lm2.acquire_record_lock(
+                            txn_id,
+                            999,
+                            0,
+                            LockMode::Exclusive,
+                            LockFlags::NONE,
+                        )
+                        .await
+                        .unwrap();
+                        tokio::task::yield_now().await;
+                        lm2.release_all_locks(
+                            txn_id,
+                            &[LockRef::Record {
+                                page_id: 999,
+                                slot_id: 0,
+                            }],
+                        );
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+    }
+}
