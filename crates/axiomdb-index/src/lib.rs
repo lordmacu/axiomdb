@@ -11,6 +11,7 @@ pub mod page_layout;
 pub mod prefix;
 
 mod iter;
+mod latch;
 mod tree;
 
 pub use iter::RangeIter;

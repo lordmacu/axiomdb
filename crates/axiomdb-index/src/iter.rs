@@ -99,6 +99,11 @@ impl<'a> Iterator for RangeIter<'a> {
             }
 
             let result = {
+                // Phase 40.8: S-latch the current leaf before reading.
+                // The latch is dropped at the end of this block (before
+                // acquiring the next leaf's latch), preventing the
+                // deadlock of holding two leaf S-latches simultaneously.
+                let _latch = self.storage.page_lock_table().read(self.current_pid);
                 let page = match self.storage.read_page(self.current_pid) {
                     Ok(p) => p,
                     Err(e) => return Some(Err(e)),
