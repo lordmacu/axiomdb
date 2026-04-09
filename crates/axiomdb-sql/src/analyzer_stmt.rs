@@ -209,9 +209,24 @@ fn analyze_select_with_outer(
         default_schema,
     };
 
-    // Resolve JOIN conditions.
+    // Persist analyzed join-side derived tables back into the AST before
+    // resolving JOIN conditions so the executor receives analyzed inner SELECTs.
     let mut resolved_joins = Vec::with_capacity(s.joins.len());
     for mut join in s.joins {
+        if let FromClause::Subquery { query, alias } = join.table {
+            let analyzed_inner = analyze_select_with_outer(
+                *query,
+                storage,
+                state.snapshot.clone(),
+                state.default_database,
+                state.default_schema,
+                outer_scopes,
+            )?;
+            join.table = FromClause::Subquery {
+                query: Box::new(analyzed_inner),
+                alias,
+            };
+        }
         join.condition = match join.condition {
             JoinCondition::On(expr) => {
                 JoinCondition::On(resolve_expr_full(expr, &ctx, outer_scopes, Some(&state))?)
@@ -321,4 +336,3 @@ fn expr_column_idx(expr: &Expr) -> Option<usize> {
         _ => None,
     }
 }
-

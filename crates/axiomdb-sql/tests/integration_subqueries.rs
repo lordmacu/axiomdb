@@ -356,6 +356,254 @@ fn derived_table_with_group_by_inside() {
     assert_eq!(r[0][0], Value::Int(1));
 }
 
+// ── Derived table in JOIN ─────────────────────────────────────────────────────
+
+#[test]
+fn derived_table_in_join_basic() {
+    let (mut storage, mut txn) = setup();
+    setup_schema(&mut storage, &mut txn);
+    insert_users(&mut storage, &mut txn);
+    insert_orders(&mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT big.total \
+         FROM users \
+         JOIN (SELECT user_id, total FROM orders WHERE total > 400) AS big \
+         ON big.user_id = users.id \
+         ORDER BY big.total",
+        &mut storage,
+        &mut txn,
+    ));
+
+    assert_eq!(r, vec![vec![Value::Int(500)], vec![Value::Int(1500)]]);
+}
+
+#[test]
+fn derived_table_in_left_join_preserves_unmatched_rows() {
+    let (mut storage, mut txn) = setup();
+    setup_schema(&mut storage, &mut txn);
+    insert_users(&mut storage, &mut txn);
+    insert_orders(&mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT users.id, stats.order_count \
+         FROM users \
+         LEFT JOIN ( \
+             SELECT user_id, COUNT(*) AS order_count \
+             FROM orders \
+             GROUP BY user_id \
+         ) AS stats ON stats.user_id = users.id \
+         ORDER BY users.id",
+        &mut storage,
+        &mut txn,
+    ));
+
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Int(1), Value::BigInt(2)],
+            vec![Value::Int(2), Value::BigInt(1)],
+            vec![Value::Int(3), Value::Null],
+        ]
+    );
+}
+
+#[test]
+fn derived_table_in_right_join_preserves_unmatched_rows() {
+    let (mut storage, mut txn) = setup();
+    setup_schema(&mut storage, &mut txn);
+    insert_users(&mut storage, &mut txn);
+    insert_orders(&mut storage, &mut txn);
+    run(
+        "INSERT INTO orders VALUES (13, 99, 50)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let r = rows(run(
+        "SELECT users.id, stats.user_id, stats.order_count \
+         FROM users \
+         RIGHT JOIN ( \
+             SELECT user_id, COUNT(*) AS order_count \
+             FROM orders \
+             GROUP BY user_id \
+         ) AS stats ON stats.user_id = users.id \
+         ORDER BY stats.user_id",
+        &mut storage,
+        &mut txn,
+    ));
+
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Int(1), Value::Int(1), Value::BigInt(2)],
+            vec![Value::Int(2), Value::Int(2), Value::BigInt(1)],
+            vec![Value::Null, Value::Int(99), Value::BigInt(1)],
+        ]
+    );
+}
+
+#[test]
+fn derived_table_in_full_join_preserves_unmatched_rows_from_both_sides() {
+    let (mut storage, mut txn) = setup();
+    setup_schema(&mut storage, &mut txn);
+    insert_users(&mut storage, &mut txn);
+    insert_orders(&mut storage, &mut txn);
+    run(
+        "INSERT INTO orders VALUES (13, 99, 50)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let mut r = rows(run(
+        "SELECT users.id, stats.user_id, stats.order_count \
+         FROM users \
+         FULL JOIN ( \
+             SELECT user_id, COUNT(*) AS order_count \
+             FROM orders \
+             GROUP BY user_id \
+         ) AS stats ON stats.user_id = users.id",
+        &mut storage,
+        &mut txn,
+    ));
+
+    r.sort_by_key(|row| {
+        let left = match &row[0] {
+            Value::Int(n) => *n,
+            Value::Null => i32::MAX - 1,
+            other => panic!("expected INT/NULL for users.id, got {other:?}"),
+        };
+        let right = match &row[1] {
+            Value::Int(n) => *n,
+            Value::Null => i32::MAX,
+            other => panic!("expected INT/NULL for stats.user_id, got {other:?}"),
+        };
+        (left, right)
+    });
+
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Int(1), Value::Int(1), Value::BigInt(2)],
+            vec![Value::Int(2), Value::Int(2), Value::BigInt(1)],
+            vec![Value::Int(3), Value::Null, Value::Null],
+            vec![Value::Null, Value::Int(99), Value::BigInt(1)],
+        ]
+    );
+}
+
+#[test]
+fn derived_table_in_join_using_resolves_names() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE users2 (id INT, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE TABLE archived_users (id INT, name TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO users2 VALUES (1, 'Alice'), (2, 'Bob')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO archived_users VALUES (1, 'Alicia'), (3, 'Carol')",
+        &mut storage,
+        &mut txn,
+    );
+
+    let r = rows(run(
+        "SELECT old_users.name \
+         FROM users2 \
+         JOIN (SELECT id, name FROM archived_users) AS old_users USING (id)",
+        &mut storage,
+        &mut txn,
+    ));
+
+    assert_eq!(r, vec![vec![Value::Text("Alicia".into())]]);
+}
+
+#[test]
+fn derived_table_in_join_alias_wildcard_returns_derived_columns() {
+    let (mut storage, mut txn) = setup();
+    setup_schema(&mut storage, &mut txn);
+    insert_users(&mut storage, &mut txn);
+    insert_orders(&mut storage, &mut txn);
+
+    let result = run_result(
+        "SELECT stats.* \
+         FROM users \
+         JOIN ( \
+             SELECT user_id, COUNT(*) AS order_count \
+             FROM orders \
+             GROUP BY user_id \
+         ) AS stats ON stats.user_id = users.id \
+         ORDER BY stats.user_id",
+        &mut storage,
+        &mut txn,
+    )
+    .unwrap();
+
+    match result {
+        QueryResult::Rows { columns, rows } => {
+            assert_eq!(
+                columns.len(),
+                2,
+                "stats.* should expose only derived columns"
+            );
+            assert_eq!(columns[0].name, "user_id");
+            assert_eq!(columns[1].name, "order_count");
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Int(1), Value::BigInt(2)],
+                    vec![Value::Int(2), Value::BigInt(1)],
+                ]
+            );
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn derived_table_join_chain_mixes_base_and_derived_sources() {
+    let (mut storage, mut txn) = setup();
+    setup_schema(&mut storage, &mut txn);
+    insert_users(&mut storage, &mut txn);
+    insert_orders(&mut storage, &mut txn);
+
+    let r = rows(run(
+        "SELECT users.id, stats.order_count, admins.role \
+         FROM users \
+         LEFT JOIN ( \
+             SELECT user_id, COUNT(*) AS order_count \
+             FROM orders \
+             GROUP BY user_id \
+         ) AS stats ON stats.user_id = users.id \
+         LEFT JOIN ( \
+             SELECT id, role \
+             FROM users \
+             WHERE role = 'admin' \
+         ) AS admins ON admins.id = users.id \
+         ORDER BY users.id",
+        &mut storage,
+        &mut txn,
+    ));
+
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Int(1), Value::BigInt(2), Value::Text("admin".into())],
+            vec![Value::Int(2), Value::BigInt(1), Value::Null],
+            vec![Value::Int(3), Value::Null, Value::Null],
+        ]
+    );
+}
+
 // ── Nested subqueries (2 levels) ──────────────────────────────────────────────
 
 #[test]
