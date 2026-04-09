@@ -139,6 +139,10 @@ mod tests {
         fn page_count(&self) -> u64 {
             self.inner.page_count()
         }
+
+        fn page_lock_table(&self) -> &crate::page_lock::PageLockTable {
+            self.inner.page_lock_table()
+        }
     }
 
     /// Creates a MemoryStorage with one root heap page allocated.
