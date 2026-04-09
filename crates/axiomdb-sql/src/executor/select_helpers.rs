@@ -14,61 +14,71 @@ fn execute_select_with_joins(
     txn: &TxnManager,
     conn_txn: Option<&ConnectionTxn>,
 ) -> Result<QueryResult, DbError> {
-    // Resolve all tables (FROM + each JOIN table) and compute col_offsets.
-    let mut all_resolved: Vec<axiomdb_catalog::ResolvedTable> = Vec::new();
-    let mut col_offsets: Vec<usize> = Vec::new(); // col_offset[i] = start of table i in combined row
+    // Resolve/materialize all join sources (FROM + each JOIN table/subquery).
+    let mut all_sources: Vec<JoinSourceSchema> = Vec::new();
+    let mut scanned: Vec<Vec<Row>> = Vec::new();
+    let mut col_offsets: Vec<usize> = Vec::new(); // col_offset[i] = start of source i in combined row
     let mut running_offset = 0usize;
+    let snap = conn_txn
+        .map(|c| txn.active_snapshot(c))
+        .unwrap_or_else(|| txn.snapshot());
 
     {
         let mut resolver = make_resolver_with_database(storage, txn, conn_txn, DEFAULT_DATABASE_NAME)?;
         let from_t = resolver.resolve_table(from_ref.schema.as_deref(), &from_ref.name)?;
+        let from_rows =
+            crate::table::scan_table_any_layout(storage, &from_t.def, &from_t.columns, snap.clone())?;
         col_offsets.push(running_offset);
         running_offset += from_t.columns.len();
-        all_resolved.push(from_t);
+        all_sources.push(join_source_schema_from_resolved(&from_ref, &from_t));
+        scanned.push(from_rows.into_iter().map(|(_, r)| r).collect());
 
         for join in &stmt.joins {
             match &join.table {
                 FromClause::Table(tref) => {
                     let jt = resolver.resolve_table(tref.schema.as_deref(), &tref.name)?;
+                    let rows =
+                        crate::table::scan_table_any_layout(storage, &jt.def, &jt.columns, snap.clone())?;
                     col_offsets.push(running_offset);
                     running_offset += jt.columns.len();
-                    all_resolved.push(jt);
+                    all_sources.push(join_source_schema_from_resolved(tref, &jt));
+                    scanned.push(rows.into_iter().map(|(_, r)| r).collect());
                 }
-                FromClause::Subquery { .. } => {
-                    return Err(DbError::NotImplemented {
-                        feature: "subquery in JOIN — Phase 4.11".into(),
-                    })
+                FromClause::Subquery { query, alias } => {
+                    let inner_result = execute_select((**query).clone(), storage, txn, conn_txn)?;
+                    let (columns, rows) = match inner_result {
+                        QueryResult::Rows { columns, rows } => (columns, rows),
+                        _ => {
+                            return Err(DbError::Internal {
+                                message: "join-side subquery did not return rows".into(),
+                            });
+                        }
+                    };
+                    col_offsets.push(running_offset);
+                    running_offset += columns.len();
+                    all_sources.push(join_source_schema_from_derived(alias, columns));
+                    scanned.push(rows);
                 }
             }
         }
-    } // resolver dropped — storage immutable borrow released
-
-    // Pre-scan all tables once (consistent snapshot for all).
-    let snap = conn_txn
-        .map(|c| txn.active_snapshot(c))
-        .unwrap_or_else(|| txn.snapshot());
-    let mut scanned: Vec<Vec<Row>> = Vec::with_capacity(all_resolved.len());
-    for t in &all_resolved {
-        let rows = crate::table::scan_table_any_layout(storage, &t.def, &t.columns, snap.clone())?;
-        scanned.push(rows.into_iter().map(|(_, r)| r).collect());
     }
 
     // Progressive nested-loop join.
     let mut combined_rows: Vec<Row> = scanned[0].clone();
-    let mut left_col_count = all_resolved[0].columns.len();
+    let mut left_col_count = all_sources[0].columns.len();
 
     // left_schema tracks (col_name, global_col_idx) for all accumulated left columns.
     // Used by USING conditions to locate column positions by name.
-    let mut left_schema: Vec<(String, usize)> = all_resolved[0]
+    let mut left_schema: Vec<(String, usize)> = all_sources[0]
         .columns
         .iter()
         .enumerate()
-        .map(|(i, c)| (c.name.clone(), i))
+        .map(|(i, col)| (col.name.clone(), i))
         .collect();
 
     for (i, join) in stmt.joins.iter().enumerate() {
         let right_idx = i + 1;
-        let right_col_count = all_resolved[right_idx].columns.len();
+        let right_col_count = all_sources[right_idx].columns.len();
         let right_col_offset = col_offsets[right_idx];
 
         combined_rows = apply_join(
@@ -80,11 +90,11 @@ fn execute_select_with_joins(
             &join.condition,
             &left_schema,
             right_col_offset,
-            &all_resolved[right_idx].columns,
+            &all_sources[right_idx].columns,
         )?;
 
         // Extend left_schema with the right table's columns at their global positions.
-        for (j, col) in all_resolved[right_idx].columns.iter().enumerate() {
+        for (j, col) in all_sources[right_idx].columns.iter().enumerate() {
             left_schema.push((col.name.clone(), right_col_offset + j));
         }
         left_col_count += right_col_count;
@@ -111,12 +121,12 @@ fn execute_select_with_joins(
     combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
 
     // Build output ColumnMeta.
-    let out_cols = build_join_column_meta(&stmt.columns, &all_resolved, &stmt.joins)?;
+    let out_cols = build_join_column_meta(&stmt.columns, &all_sources, &stmt.joins)?;
 
     // Project SELECT list.
     let mut rows = combined_rows
         .iter()
-        .map(|r| project_row(&stmt.columns, r))
+        .map(|r| project_join_row(&stmt.columns, r, &all_sources))
         .collect::<Result<Vec<_>, _>>()?;
 
     // DISTINCT deduplication (after projection, before LIMIT).

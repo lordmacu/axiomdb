@@ -348,6 +348,66 @@ fn test_qualified_column_resolves_ambiguity() {
     assert!(matches!(stmt, axiomdb_sql::ast::Stmt::Select(_)));
 }
 
+#[test]
+fn test_join_side_subquery_is_persisted_as_analyzed_ast() {
+    let mut f = Fixture::new();
+    f.create_table("users", &[("id", ColumnType::BigInt)]);
+    f.create_table(
+        "orders",
+        &[
+            ("id", ColumnType::BigInt),
+            ("user_id", ColumnType::BigInt),
+            ("total", ColumnType::Int),
+        ],
+    );
+
+    let stmt = f
+        .analyze(
+            "SELECT stats.total \
+             FROM users \
+             JOIN (SELECT user_id, total FROM orders WHERE total > 100) AS stats \
+             ON stats.user_id = users.id",
+        )
+        .unwrap();
+
+    let axiomdb_sql::ast::Stmt::Select(select) = stmt else {
+        panic!("expected Select stmt");
+    };
+    assert_eq!(select.joins.len(), 1);
+
+    match &select.joins[0].table {
+        axiomdb_sql::ast::FromClause::Subquery { query, alias } => {
+            assert_eq!(alias, "stats");
+
+            match &query.where_clause {
+                Some(axiomdb_sql::expr::Expr::BinaryOp { left, .. }) => match &**left {
+                    axiomdb_sql::expr::Expr::Column { col_idx, name } => {
+                        assert_eq!(*col_idx, 2, "orders.total should resolve to column 2");
+                        assert_eq!(name, "total");
+                    }
+                    other => panic!("expected analyzed Column in inner WHERE, got {other:?}"),
+                },
+                other => panic!("expected BinaryOp WHERE in inner query, got {other:?}"),
+            }
+        }
+        other => panic!("expected join-side subquery, got {other:?}"),
+    }
+
+    match &select.columns[0] {
+        axiomdb_sql::ast::SelectItem::Expr {
+            expr: axiomdb_sql::expr::Expr::Column { col_idx, name },
+            ..
+        } => {
+            assert_eq!(
+                *col_idx, 2,
+                "stats.total should resolve after users.id + stats.user_id"
+            );
+            assert_eq!(name, "stats.total");
+        }
+        other => panic!("expected analyzed outer projection, got {other:?}"),
+    }
+}
+
 // ── INSERT validation ─────────────────────────────────────────────────────────
 
 #[test]

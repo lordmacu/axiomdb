@@ -2,6 +2,52 @@
 /// (HashMap construction overhead > n×m comparisons for small n,m).
 const HASH_JOIN_MIN_ROWS: usize = 32;
 
+#[derive(Debug, Clone)]
+struct JoinSourceSchema {
+    match_names: Vec<String>,
+    columns: Vec<ColumnMeta>,
+}
+
+fn join_source_schema_from_resolved(
+    table_ref: &TableRef,
+    resolved: &axiomdb_catalog::ResolvedTable,
+) -> JoinSourceSchema {
+    let mut match_names = Vec::new();
+    if let Some(alias) = table_ref.alias.as_ref() {
+        match_names.push(alias.clone());
+    }
+    if !match_names.iter().any(|name| name == &resolved.def.table_name) {
+        match_names.push(resolved.def.table_name.clone());
+    }
+
+    let columns = resolved
+        .columns
+        .iter()
+        .map(|col| ColumnMeta {
+            name: col.name.clone(),
+            data_type: column_type_to_datatype(col.col_type),
+            nullable: col.nullable,
+            table_name: Some(resolved.def.table_name.clone()),
+        })
+        .collect();
+
+    JoinSourceSchema {
+        match_names,
+        columns,
+    }
+}
+
+fn join_source_schema_from_derived(alias: &str, columns: Vec<ColumnMeta>) -> JoinSourceSchema {
+    JoinSourceSchema {
+        match_names: vec![alias.to_string()],
+        columns,
+    }
+}
+
+fn join_source_matches(source: &JoinSourceSchema, qualifier: &str) -> bool {
+    source.match_names.iter().any(|name| name == qualifier)
+}
+
 // ── Adaptive Join Selection (Phase 9.9) ─────────────────────────────────────
 //
 // Cost-based selection inspired by PostgreSQL joinpath.c:
@@ -27,7 +73,7 @@ fn apply_join(
     condition: &JoinCondition,
     left_schema: &[(String, usize)],
     right_col_offset: usize,
-    right_columns: &[axiomdb_catalog::schema::ColumnDef],
+    right_columns: &[ColumnMeta],
 ) -> Result<Vec<Row>, DbError> {
     // Phase 9.9: Adaptive join selection.
     let is_large = left_rows.len() >= HASH_JOIN_MIN_ROWS
@@ -200,7 +246,7 @@ fn eval_join_cond(
     combined: &[Value],
     left_schema: &[(String, usize)],
     right_col_offset: usize,
-    right_columns: &[axiomdb_catalog::schema::ColumnDef],
+    right_columns: &[ColumnMeta],
 ) -> Result<bool, DbError> {
     match cond {
         JoinCondition::On(expr) => Ok(is_truthy(&eval(expr, combined)?)),
@@ -644,55 +690,49 @@ fn concat_rows(left: &[Value], right: &[Value]) -> Row {
 /// Builds `ColumnMeta` for the output of a JOIN query.
 fn build_join_column_meta(
     items: &[SelectItem],
-    all_tables: &[axiomdb_catalog::ResolvedTable],
+    all_sources: &[JoinSourceSchema],
     joins: &[JoinClause],
 ) -> Result<Vec<ColumnMeta>, DbError> {
     // Precompute outer-join nullability once for the whole chain.
     // This correctly handles LEFT, RIGHT, FULL, and mixed chains.
-    let nullable_tables = compute_outer_nullable(all_tables.len(), joins);
+    let nullable_tables = compute_outer_nullable(all_sources.len(), joins);
     let mut out = Vec::new();
 
     for item in items {
         match item {
             SelectItem::Wildcard => {
                 // Expand all columns from all tables in order.
-                for (t_idx, table) in all_tables.iter().enumerate() {
+                for (t_idx, source) in all_sources.iter().enumerate() {
                     let outer_nullable = nullable_tables[t_idx];
-                    for col in &table.columns {
-                        out.push(ColumnMeta {
-                            name: col.name.clone(),
-                            data_type: column_type_to_datatype(col.col_type),
-                            nullable: col.nullable || outer_nullable,
-                            table_name: Some(table.def.table_name.clone()),
-                        });
+                    for col in &source.columns {
+                        let mut meta = col.clone();
+                        meta.nullable |= outer_nullable;
+                        out.push(meta);
                     }
                 }
             }
 
             SelectItem::QualifiedWildcard(qualifier) => {
                 // Expand only the columns from the matching table.
-                let t_idx = all_tables
+                let t_idx = all_sources
                     .iter()
-                    .position(|t| t.def.table_name == *qualifier || t.def.schema_name == *qualifier)
+                    .position(|source| join_source_matches(source, qualifier))
                     .ok_or_else(|| DbError::TableNotFound {
                         name: qualifier.clone(),
                     })?;
-                let table = &all_tables[t_idx];
+                let source = &all_sources[t_idx];
                 let outer_nullable = nullable_tables[t_idx];
-                for col in &table.columns {
-                    out.push(ColumnMeta {
-                        name: col.name.clone(),
-                        data_type: column_type_to_datatype(col.col_type),
-                        nullable: col.nullable || outer_nullable,
-                        table_name: Some(table.def.table_name.clone()),
-                    });
+                for col in &source.columns {
+                    let mut meta = col.clone();
+                    meta.nullable |= outer_nullable;
+                    out.push(meta);
                 }
             }
 
             SelectItem::Expr { expr, alias } => {
                 let name = expr_column_name(expr, alias.as_deref());
                 // Infer type: plain column reference uses catalog type; others use Text fallback.
-                let (dt, nullable) = infer_expr_type_join(expr, all_tables, &nullable_tables);
+                let (dt, nullable) = infer_expr_type_join(expr, all_sources, &nullable_tables);
                 out.push(ColumnMeta {
                     name,
                     data_type: dt,
@@ -703,6 +743,50 @@ fn build_join_column_meta(
         }
     }
     Ok(out)
+}
+
+/// Projects a combined JOIN row through the SELECT list.
+///
+/// Unlike [`project_row`], qualified wildcards (`alias.*`) expand only the
+/// matching source slice inside the combined row instead of the entire row.
+fn project_join_row(
+    items: &[SelectItem],
+    values: &[Value],
+    all_sources: &[JoinSourceSchema],
+) -> Result<Row, DbError> {
+    let mut out = Vec::new();
+
+    for item in items {
+        match item {
+            SelectItem::Wildcard => out.extend_from_slice(values),
+            SelectItem::QualifiedWildcard(qualifier) => {
+                let source_idx = all_sources
+                    .iter()
+                    .position(|source| join_source_matches(source, qualifier))
+                    .ok_or_else(|| DbError::TableNotFound {
+                        name: qualifier.clone(),
+                    })?;
+                let range = join_source_row_range(all_sources, source_idx);
+                out.extend_from_slice(&values[range]);
+            }
+            SelectItem::Expr { expr, .. } => out.push(eval(expr, values)?),
+        }
+    }
+
+    Ok(out)
+}
+
+fn join_source_row_range(
+    all_sources: &[JoinSourceSchema],
+    source_idx: usize,
+) -> std::ops::Range<usize> {
+    let start = all_sources
+        .iter()
+        .take(source_idx)
+        .map(|source| source.columns.len())
+        .sum::<usize>();
+    let end = start + all_sources[source_idx].columns.len();
+    start..end
 }
 
 /// Computes per-table outer-join nullability for a join chain.
@@ -746,20 +830,19 @@ fn compute_outer_nullable(table_count: usize, joins: &[JoinClause]) -> Vec<bool>
 /// Infers (DataType, nullable) for an expression in a JOIN context.
 fn infer_expr_type_join(
     expr: &Expr,
-    all_tables: &[axiomdb_catalog::ResolvedTable],
+    all_sources: &[JoinSourceSchema],
     nullable_tables: &[bool],
 ) -> (DataType, bool) {
     if let Expr::Column { col_idx, .. } = expr {
         // Find which table owns this col_idx and what the column type is.
         let mut offset = 0;
-        for (t_idx, table) in all_tables.iter().enumerate() {
-            let end = offset + table.columns.len();
+        for (t_idx, source) in all_sources.iter().enumerate() {
+            let end = offset + source.columns.len();
             if *col_idx < end {
                 let local_pos = col_idx - offset;
-                if let Some(col) = table.columns.get(local_pos) {
+                if let Some(col) = source.columns.get(local_pos) {
                     let outer_nullable = nullable_tables.get(t_idx).copied().unwrap_or(false);
-                    let nullable = col.nullable || outer_nullable;
-                    return (column_type_to_datatype(col.col_type), nullable);
+                    return (col.data_type, col.nullable || outer_nullable);
                 }
             }
             offset = end;
