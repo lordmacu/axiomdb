@@ -138,6 +138,10 @@ impl StorageEngine for CountingPrefetchStorage {
         self.prefetches.fetch_add(1, Ordering::Relaxed);
         self.inner.prefetch_hint(start_page_id, count);
     }
+
+    fn page_lock_table(&self) -> &crate::page_lock::PageLockTable {
+        self.inner.page_lock_table()
+    }
 }
 
 include!("tests_insert.rs");

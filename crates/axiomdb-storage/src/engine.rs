@@ -87,6 +87,13 @@ pub trait StorageEngine: Send + Sync {
     fn deferred_free_count(&self) -> usize {
         0
     }
+
+    /// Returns a reference to the per-page lock table for heap chain operations.
+    ///
+    /// HeapChain write methods (insert, delete, batch) acquire X-latches from
+    /// this table before modifying page contents. Readers don't latch — MVCC
+    /// visibility handles concurrent reads (Phase 40.7).
+    fn page_lock_table(&self) -> &crate::page_lock::PageLockTable;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

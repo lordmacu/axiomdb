@@ -670,6 +670,10 @@ impl StorageEngine for MmapStorage {
             .unwrap_or_else(|e| e.into_inner())
             .len()
     }
+
+    fn page_lock_table(&self) -> &PageLockTable {
+        &self.page_locks
+    }
 }
 
 // ── Public MmapStorage helpers (non-trait) ────────────────────────────────────

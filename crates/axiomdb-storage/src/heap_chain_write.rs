@@ -16,10 +16,15 @@ impl HeapChain {
         data: &[u8],
         txn_id: TxnId,
     ) -> Result<(u64, u16), DbError> {
+        let locks = storage.page_lock_table();
+
         // Walk to the last page.
         let last_page_id = Self::last_page_id(storage, root_page_id)?;
 
-        // Try to insert into the last page.
+        // Acquire X-latch on the target page before modification.
+        // PostgreSQL pattern: LockBuffer(BUFFER_LOCK_EXCLUSIVE) before heap insert.
+        let _latch = locks.write(last_page_id);
+
         let raw = *storage.read_page(last_page_id)?.as_bytes();
         let mut page = Page::from_bytes(raw)?;
 
@@ -27,9 +32,14 @@ impl HeapChain {
             Ok(slot_id) => {
                 page.update_checksum();
                 storage.write_page(last_page_id, &page)?;
+                // _latch dropped here (RAII)
                 Ok((last_page_id, slot_id))
             }
             Err(DbError::HeapPageFull { .. }) => {
+                // Drop latch on full page before allocating (avoid holding
+                // latch during potentially slow alloc).
+                drop(_latch);
+
                 // Chain is full on last page. Allocate a new page.
                 let new_page_id = storage.alloc_page(PageType::Data)?;
                 let mut new_page = Page::new(PageType::Data, new_page_id);
@@ -38,10 +48,12 @@ impl HeapChain {
                 let slot_id = insert_tuple(&mut new_page, data, txn_id)?;
                 new_page.update_checksum();
 
-                // Step 1: write the new page (with data) first.
+                // Latch ordering: new_page before last_page (prevents deadlock).
+                let _latch_new = locks.write(new_page_id);
                 storage.write_page(new_page_id, &new_page)?;
 
-                // Step 2: update chain pointer in the previous last page.
+                // Re-latch the old last page to update the chain pointer.
+                let _latch_prev = locks.write(last_page_id);
                 let raw2 = *storage.read_page(last_page_id)?.as_bytes();
                 let mut prev_page = Page::from_bytes(raw2)?;
                 chain_set_next_page(&mut prev_page, new_page_id);
@@ -149,6 +161,7 @@ impl HeapChain {
         slot_id: u16,
         txn_id: TxnId,
     ) -> Result<(), DbError> {
+        let _latch = storage.page_lock_table().write(page_id);
         let raw = *storage.read_page(page_id)?.as_bytes();
         let mut page = Page::from_bytes(raw)?;
         crate::heap::delete_tuple(&mut page, slot_id, txn_id)?;
@@ -204,10 +217,12 @@ impl HeapChain {
         let mut result = Vec::with_capacity(rids.len());
         let mut i = 0;
 
+        let locks = storage.page_lock_table();
         while i < sorted.len() {
             let page_id = sorted[i].0;
 
-            // ── Read page ONCE ────────────────────────────────────────────────
+            // ── X-latch + Read page ONCE ─────────────────────────────────────
+            let _latch = locks.write(page_id);
             let raw = *storage.read_page(page_id)?.as_bytes();
             let mut page = Page::from_bytes(raw)?;
 

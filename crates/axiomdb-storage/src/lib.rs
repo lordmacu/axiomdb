@@ -11,6 +11,7 @@ pub mod engine;
 pub mod freelist;
 pub mod heap;
 pub mod heap_chain;
+pub mod heap_hint;
 pub mod integrity;
 pub mod memory;
 pub mod meta;

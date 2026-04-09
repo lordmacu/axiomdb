@@ -36,6 +36,7 @@ struct MemoryStorageInner {
 /// - `read_page` → direct array index, no pointer indirection
 pub struct MemoryStorage {
     inner: RwLock<MemoryStorageInner>,
+    page_locks: crate::page_lock::PageLockTable,
 }
 
 impl MemoryStorage {
@@ -57,6 +58,7 @@ impl MemoryStorage {
                 allocated,
                 freelist,
             }),
+            page_locks: crate::page_lock::PageLockTable::new(),
         }
     }
 }
@@ -150,6 +152,10 @@ impl StorageEngine for MemoryStorage {
             .unwrap_or_else(|e| e.into_inner())
             .freelist
             .total_pages()
+    }
+
+    fn page_lock_table(&self) -> &crate::page_lock::PageLockTable {
+        &self.page_locks
     }
 }
 
