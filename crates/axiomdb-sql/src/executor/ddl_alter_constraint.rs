@@ -10,7 +10,7 @@ fn alter_add_constraint(
     tc: crate::ast::TableConstraint,
     database: &str,
     schema: &str,
-) -> Result<(), DbError> {
+) -> Result<Option<QueryResult>, DbError> {
     use crate::ast::TableConstraint;
     use axiomdb_catalog::schema::ConstraintDef;
 
@@ -52,7 +52,7 @@ fn alter_add_constraint(
             };
             let mut noop_bloom = crate::bloom::BloomRegistry::new();
             execute_create_index(stmt, storage, txn, conn_txn, &mut noop_bloom, database)?;
-            Ok(())
+            Ok(None)
         }
 
         TableConstraint::Check { name, expr } => {
@@ -99,7 +99,7 @@ fn alter_add_constraint(
                 name: cname,
                 check_expr,
             })?;
-            Ok(())
+            Ok(None)
         }
 
         TableConstraint::ForeignKey {
@@ -191,20 +191,27 @@ fn alter_add_constraint(
                 }
             }
 
-            Ok(())
+            Ok(None)
         }
 
-        TableConstraint::PrimaryKey { .. } => Err(DbError::NotImplemented {
-            feature: "ADD CONSTRAINT PRIMARY KEY — requires full table rewrite".into(),
-        }),
+        TableConstraint::PrimaryKey { name, columns } => Ok(Some(alter_add_primary_key(
+            storage,
+            txn,
+            conn_txn,
+            table_def,
+            columns_arg,
+            name,
+            columns,
+            database,
+            schema,
+        )?)),
 
-        TableConstraint::Index { name, columns: col_names } => {
+        TableConstraint::Index {
+            name,
+            columns: col_names,
+        } => {
             let idx_name = name.unwrap_or_else(|| {
-                format!(
-                    "{}_{}_idx",
-                    table_def.def.table_name,
-                    col_names.join("_")
-                )
+                format!("{}_{}_idx", table_def.def.table_name, col_names.join("_"))
             });
             let stmt = crate::ast::CreateIndexStmt {
                 name: idx_name,
@@ -231,9 +238,169 @@ fn alter_add_constraint(
             };
             let mut noop_bloom = crate::bloom::BloomRegistry::new();
             execute_create_index(stmt, storage, txn, conn_txn, &mut noop_bloom, database)?;
-            Ok(())
+            Ok(None)
         }
     }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ALTER TABLE ADD PRIMARY KEY coordinates catalog, executor, and namespace state"
+)]
+fn alter_add_primary_key(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    table_def: &axiomdb_catalog::ResolvedTable,
+    columns_arg: &[axiomdb_catalog::schema::ColumnDef],
+    name: Option<String>,
+    col_names: Vec<String>,
+    database: &str,
+    schema: &str,
+) -> Result<QueryResult, DbError> {
+    use axiomdb_catalog::schema::{IndexColumnDef, IndexDef, SortOrder};
+    use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
+    use axiomdb_storage::page::PageType;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    table_def
+        .def
+        .ensure_heap_runtime("ALTER TABLE ADD PRIMARY KEY on clustered table")?;
+
+    if table_def.indexes.iter().any(|idx| idx.is_primary) {
+        return Err(DbError::Other(format!(
+            "table '{}' already has a PRIMARY KEY",
+            table_def.def.table_name
+        )));
+    }
+
+    if col_names.is_empty() {
+        return Err(DbError::InvalidValue {
+            reason: "PRIMARY KEY requires at least one column".into(),
+        });
+    }
+
+    let pk_name = name.unwrap_or_else(|| format!("{}_pkey", table_def.def.table_name));
+    if table_def.indexes.iter().any(|idx| idx.name == pk_name) {
+        return Err(DbError::IndexAlreadyExists {
+            name: pk_name,
+            table: table_def.def.table_name.clone(),
+        });
+    }
+
+    let pk_columns: Vec<IndexColumnDef> = col_names
+        .iter()
+        .map(|col_name| {
+            let col = columns_arg
+                .iter()
+                .find(|c| c.name == *col_name)
+                .ok_or_else(|| DbError::ColumnNotFound {
+                    name: col_name.clone(),
+                    table: table_def.def.table_name.clone(),
+                })?;
+            Ok(IndexColumnDef {
+                col_idx: col.col_idx,
+                order: SortOrder::Asc,
+            })
+        })
+        .collect::<Result<_, DbError>>()?;
+
+    let provisional_root = {
+        let root_page_id = storage.alloc_page(PageType::Index)?;
+        let mut page = Page::new(PageType::Index, root_page_id);
+        let leaf = cast_leaf_mut(&mut page);
+        leaf.is_leaf = 1;
+        leaf.set_num_keys(0);
+        leaf.set_next_leaf(NULL_PAGE);
+        page.update_checksum();
+        storage.write_page(root_page_id, &page)?;
+
+        let root_pid = AtomicU64::new(root_page_id);
+        let snap = txn.active_snapshot(conn_txn);
+        let rows = TableEngine::scan_table(storage, &table_def.def, columns_arg, snap, None)?;
+
+        for (rid, row_values) in &rows {
+            let key_vals: Vec<Value> = pk_columns
+                .iter()
+                .map(|col| row_values[col.col_idx as usize].clone())
+                .collect();
+
+            if let Some(null_pos) = key_vals.iter().position(|v| matches!(v, Value::Null)) {
+                let current_root = root_pid.load(Ordering::Acquire);
+                let _ = free_btree_pages(storage, current_root);
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "PRIMARY KEY column '{}' cannot contain NULL values",
+                        col_names[null_pos]
+                    ),
+                });
+            }
+
+            let key = crate::key_encoding::encode_index_key(&key_vals)?;
+            if let Err(err) = BTree::insert_in(storage, &root_pid, &key, *rid, 90) {
+                let current_root = root_pid.load(Ordering::Acquire);
+                let _ = free_btree_pages(storage, current_root);
+                return match err {
+                    DbError::DuplicateKey => Err(DbError::UniqueViolation {
+                        index_name: pk_name.clone(),
+                        value: Some(format!(
+                            "({})",
+                            key_vals
+                                .iter()
+                                .map(|v| format!("{v}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )),
+                    }),
+                    other => Err(other),
+                };
+            }
+        }
+
+        root_pid.load(Ordering::Acquire)
+    };
+
+    let build_result = (|| -> Result<QueryResult, DbError> {
+        CatalogWriter::new(storage, txn, conn_txn)?.create_index(IndexDef {
+            index_id: 0,
+            table_id: table_def.def.id,
+            name: pk_name.clone(),
+            root_page_id: provisional_root,
+            is_unique: true,
+            is_primary: true,
+            columns: pk_columns.clone(),
+            predicate: None,
+            fillfactor: 90,
+            is_fk_index: false,
+            include_columns: vec![],
+            index_type: 0,
+            pages_per_range: 128,
+        })?;
+
+        for col in columns_arg
+            .iter()
+            .filter(|c| pk_columns.iter().any(|pk| pk.col_idx == c.col_idx) && c.nullable)
+        {
+            CatalogWriter::new(storage, txn, conn_txn)?
+                .delete_column(table_def.def.id, col.col_idx)?;
+            let mut updated = col.clone();
+            updated.nullable = false;
+            CatalogWriter::new(storage, txn, conn_txn)?.create_column(updated)?;
+        }
+
+        let refreshed = {
+            let mut resolver = make_resolver_with_database(storage, txn, Some(conn_txn), database)?;
+            resolver.resolve_table(Some(schema), &table_def.def.table_name)?
+        };
+
+        alter_rebuild_to_clustered(storage, txn, conn_txn, &refreshed, database, schema)
+    })();
+
+    if build_result.is_err() {
+        let _ = free_btree_pages(storage, provisional_root);
+    }
+
+    build_result
 }
 
 fn alter_drop_constraint(

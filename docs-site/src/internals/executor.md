@@ -1565,10 +1565,16 @@ expression. Full metadata exposure is planned for a later catalog enhancement.
 
 ## ALTER TABLE Execution
 
-ALTER TABLE dispatches to one of five handlers depending on the operation.
-Three of them (ADD COLUMN, DROP COLUMN, and MODIFY COLUMN) require rewriting
-every row in the table. The other two (RENAME COLUMN and RENAME TO) touch
-only the catalog.
+ALTER TABLE dispatches per operation. Four paths are physically interesting:
+
+- `ADD COLUMN`
+- `DROP COLUMN`
+- `MODIFY COLUMN`
+- `ADD PRIMARY KEY`
+
+`RENAME COLUMN` and `RENAME TO` remain catalog-only. `ADD COLUMN`, `DROP COLUMN`,
+and `MODIFY COLUMN` use the shared row-rewrite path; `ADD PRIMARY KEY` uses a
+dedicated heap→clustered rebuild flow.
 
 ### Why Row Rewriting Is Needed
 
@@ -1649,6 +1655,42 @@ coercion failures abort the entire statement:
 | DROP COLUMN | Remove the value at `col_idx` from the row vector |
 | MODIFY COLUMN | Replace value at `col_idx` with `coerce(value, new_type, Strict)?` |
 
+### Secondary-index repair after DROP/MODIFY
+
+Row rewrite is only part of the ALTER work. Secondary-index metadata and roots
+must also be repaired after the new row layout is in place.
+
+The executor classifies every secondary index as:
+
+- definition-dependent on the target column
+  - key column match
+  - `INCLUDE` column match
+  - partial-index predicate references the column
+- surviving but definition-independent
+
+Repair matrix:
+
+| Layout | DROP COLUMN | MODIFY COLUMN |
+|---|---|---|
+| Heap | Drop affected indexes, rebuild all surviving secondaries | Rebuild all secondaries |
+| Clustered | Drop affected indexes, keep unrelated roots | Rebuild only affected secondaries |
+
+The heap rule is stricter because heap rewrites assign new `RecordId`s. Even an
+unrelated heap secondary index would point at stale row locations after the
+rewrite. Clustered secondaries bookmark PRIMARY KEY bytes instead, so unrelated
+roots remain valid there.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Borrowed Bookmark Split</span>
+This follows the same physical distinction MariaDB/InnoDB relies on: heap-style
+secondary bookmarks track physical row locations, while clustered secondaries
+track logical primary-key identity. AxiomDB therefore rebuilds all heap
+secondaries after RID-changing rewrites but only the affected clustered ones.
+</div>
+</div>
+
 ### Ordering Constraint — Catalog Before vs. After Rewrite
 
 The ordering of the catalog update relative to the row rewrite is not arbitrary.
@@ -1681,19 +1723,52 @@ been written in the new (narrower) layout but the catalog still shows the old
 schema. Recovery rolls back the uncommitted row rewrites and the catalog is
 never touched — the table is fully consistent under the old schema.
 
-**MODIFY COLUMN — rewrite rows FIRST (with strict coercion), then update catalog:**
+**MODIFY COLUMN — rewrite rows FIRST (with strict coercion), then repair metadata:**
 
 ```
-1. Guard: column not in secondary index (type change would break key encoding)
-2. Guard: PK column cannot become nullable on clustered table
-3. rewrite_rows(old_schema → new_schema, coerce(val, new_type, Strict)?)
-4. catalog.delete_column(table_id, col_idx)
-5. catalog.create_column(new_ColumnDef)  // same col_idx, new type/nullable
+1. Guard: reject PRIMARY KEY / FOREIGN KEY / CHECK-dependent columns
+2. rewrite_rows(old_schema → new_schema, coerce(val, new_type, Strict)?)
+3. catalog.delete_column(table_id, col_idx)
+4. catalog.create_column(new_ColumnDef)  // same col_idx, new type/nullable
+5. rebuild the required secondary-index roots for heap or clustered layout
 ```
 
 If coercion fails for any row (e.g. `TEXT → INT` on a non-numeric value), the
 error is returned immediately and no rows are changed. The statement is atomic:
 either all rows are coerced successfully or none are.
+
+### ADD PRIMARY KEY on heap tables
+
+`ALTER TABLE ... ADD PRIMARY KEY (...)` does not go through `rewrite_rows`.
+Instead it stages the clustered promotion in four steps:
+
+```text
+1. Resolve PK columns and reject existing PRIMARY KEY metadata.
+2. Scan visible heap rows:
+   - reject NULL in any PK component
+   - insert each key tuple into a provisional unique B-tree root
+   - map duplicate insert to SQL-level UniqueViolation
+3. Persist provisional PK metadata and flip PK columns to NOT NULL in catalog.
+4. Re-resolve the table and reuse alter_rebuild_to_clustered():
+   - build clustered primary storage in PK order
+   - rebuild secondary indexes as clustered bookmark trees
+   - swap table root/layout and authoritative index roots
+```
+
+If any step after provisional-root allocation fails, the executor frees the
+temporary B-tree pages explicitly. The catalog writes still live inside the same
+statement transaction, so rollback restores the pre-ALTER metadata.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Provisional PK First</span>
+The executor builds a real unique heap index before starting the clustered
+rewrite. That gives SQL-level duplicate detection up front and lets the existing
+heap→clustered rebuild path run against normal catalog metadata instead of a
+special-case in-memory key set.
+</div>
+</div>
 
 The invariant is: **the catalog always describes rows that can be decoded.**
 Swapping the order for either operation would create a window where the catalog

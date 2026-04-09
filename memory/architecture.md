@@ -1,5 +1,28 @@
 # Architecture Notes
 
+## 2026-04-09 — ALTER TABLE ADD PRIMARY KEY and indexed DROP/MODIFY repair
+
+- `crates/axiomdb-sql/src/executor/ddl_alter_constraint.rs` now treats
+  `ALTER TABLE ... ADD PRIMARY KEY (...)` as a staged heap→clustered migration:
+  - build a provisional unique heap index root from visible rows
+  - reject `NULL` PK components and duplicate tuples before any physical swap
+  - persist primary-index metadata and mark PK columns `NOT NULL`
+  - re-resolve the table and reuse `alter_rebuild_to_clustered(...)`
+- `crates/axiomdb-sql/src/executor/ddl_alter_column.rs` now owns the ALTER
+  repair matrix for indexed `DROP COLUMN` / `MODIFY COLUMN`:
+  - detect dependency through key columns, `INCLUDE` columns, and partial-index predicates
+  - reject PRIMARY KEY / FOREIGN KEY / CHECK-dependent column changes
+  - heap rewrite path rebuilds every surviving secondary index because `RecordId`
+    bookmarks change
+  - clustered rewrite path drops or rebuilds only the affected secondary roots
+- `crates/axiomdb-catalog/src/writer.rs` now exposes:
+  - `replace_index_def(...)` for MVCC-safe full-row index metadata replacement
+  - `replace_foreign_key(...)` for FK column-ordinal remap after unrelated column drops
+- The ALTER invariant is now:
+  - old roots remain authoritative until row rewrite succeeds
+  - repaired roots are written back through catalog replacement helpers
+  - old index pages are reclaimed only via deferred free, never inline during the swap
+
 ## 2026-04-03 — Aggregate hash execution + zero-alloc clustered scan (39.21)
 
 - `crates/axiomdb-sql/src/executor/aggregate.rs` now has two specialized hash

@@ -883,14 +883,34 @@ impl<'a> CatalogWriter<'a> {
     /// - [`DbError::NoActiveTransaction`] if no transaction is active.
     /// - [`DbError::CatalogIndexNotFound`] if no visible index with that ID exists.
     pub fn update_index_root(&mut self, index_id: u32, new_root: u64) -> Result<(), DbError> {
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, self.page_ids.indexes, snap)?;
+        for (_, _, data) in rows {
+            let (def, _) = IndexDef::from_bytes(&data)?;
+            if def.index_id == index_id {
+                return self.replace_index_def(IndexDef {
+                    root_page_id: new_root,
+                    ..def
+                });
+            }
+        }
+        Err(DbError::CatalogIndexNotFound { index_id })
+    }
+
+    /// Replaces the visible row for `def.index_id` with the provided definition.
+    ///
+    /// Preserves `index_id` and rewrites the full catalog payload, which allows
+    /// callers to update root page, column list, INCLUDE columns, or other
+    /// metadata in one MVCC-safe operation.
+    pub fn replace_index_def(&mut self, def: IndexDef) -> Result<(), DbError> {
+        let index_id = def.index_id;
         let txn_id = self.conn.txn_id;
         let snap = self.txn.active_snapshot(self.conn);
 
         let rows = HeapChain::scan_visible(self.storage, self.page_ids.indexes, snap)?;
         for (page_id, slot_id, data) in rows {
-            let (def, _) = IndexDef::from_bytes(&data)?;
-            if def.index_id == index_id {
-                // Delete old row.
+            let (existing, _) = IndexDef::from_bytes(&data)?;
+            if existing.index_id == index_id {
                 HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
                 let key = index_id.to_le_bytes();
                 self.txn.record_delete(
@@ -902,12 +922,7 @@ impl<'a> CatalogWriter<'a> {
                     slot_id,
                 )?;
 
-                // Insert updated row.
-                let updated = IndexDef {
-                    root_page_id: new_root,
-                    ..def
-                };
-                let new_data = updated.to_bytes();
+                let new_data = def.to_bytes();
                 let (new_page_id, new_slot_id) =
                     HeapChain::insert(self.storage, self.page_ids.indexes, &new_data, txn_id)?;
                 self.txn.record_insert(
@@ -921,6 +936,7 @@ impl<'a> CatalogWriter<'a> {
                 return Ok(());
             }
         }
+
         Err(DbError::CatalogIndexNotFound { index_id })
     }
 
@@ -1113,6 +1129,57 @@ impl<'a> CatalogWriter<'a> {
             }
         }
         Ok(()) // not found — idempotent
+    }
+
+    /// Replaces the visible row for `def.fk_id` with the provided FK definition.
+    ///
+    /// Preserves `fk_id` and rewrites the full catalog payload so callers can
+    /// adjust column positions or auto-index references after ALTER TABLE.
+    pub fn replace_foreign_key(&mut self, def: FkDef) -> Result<(), DbError> {
+        let fk_root = match CatalogBootstrap::page_ids(self.storage) {
+            Ok(ids) if ids.foreign_keys != 0 => ids.foreign_keys,
+            _ => {
+                return Err(DbError::CatalogTableNotFound {
+                    table_id: SYSTEM_TABLE_FOREIGN_KEYS,
+                })
+            }
+        };
+        let fk_id = def.fk_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let txn_id = self.conn.txn_id;
+
+        let rows = crate::reader::CatalogReader::scan_fk_root(self.storage, fk_root, snap)?;
+        for (rid, data) in rows {
+            if let Ok((existing, _)) = FkDef::from_bytes(&data) {
+                if existing.fk_id == fk_id {
+                    let key = fk_id.to_le_bytes();
+                    HeapChain::delete(self.storage, rid.page_id, rid.slot_id, txn_id)?;
+                    self.txn.record_delete(
+                        self.conn,
+                        SYSTEM_TABLE_FOREIGN_KEYS,
+                        &key,
+                        &data,
+                        rid.page_id,
+                        rid.slot_id,
+                    )?;
+
+                    let new_data = def.to_bytes();
+                    let (new_page_id, new_slot_id) =
+                        HeapChain::insert(self.storage, fk_root, &new_data, txn_id)?;
+                    self.txn.record_insert(
+                        self.conn,
+                        SYSTEM_TABLE_FOREIGN_KEYS,
+                        &key,
+                        &new_data,
+                        new_page_id,
+                        new_slot_id,
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+
+        Ok(())
     }
 
     // ── Statistics operations (Phase 6.10) ───────────────────────────────────

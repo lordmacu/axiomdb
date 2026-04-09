@@ -13,7 +13,8 @@ pub(crate) fn build_index_root_from_heap(
     idx: &IndexDef,
     snap: TransactionSnapshot,
 ) -> Result<IndexBuildResult, DbError> {
-    table_def.ensure_heap_runtime("CREATE INDEX / heap rebuild on clustered table — Phase 39.13+")?;
+    table_def
+        .ensure_heap_runtime("CREATE INDEX / heap rebuild on clustered table — Phase 39.13+")?;
     use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -58,6 +59,84 @@ pub(crate) fn build_index_root_from_heap(
     })
 }
 
+pub(crate) fn build_index_root_from_existing_def(
+    storage: &mut dyn StorageEngine,
+    table_def: &TableDef,
+    col_defs: &[CatalogColumnDef],
+    idx: &IndexDef,
+    snap: TransactionSnapshot,
+) -> Result<IndexBuildResult, DbError> {
+    if idx.index_type != 0 {
+        return Err(DbError::NotImplemented {
+            feature: "ALTER TABLE index rebuild for non-BTree indexes".into(),
+        });
+    }
+    if table_def.is_clustered() {
+        build_index_root_from_clustered(storage, table_def, col_defs, idx, snap)
+    } else {
+        build_index_root_from_heap(storage, table_def, col_defs, idx, snap)
+    }
+}
+
+fn build_index_root_from_clustered(
+    storage: &mut dyn StorageEngine,
+    table_def: &TableDef,
+    col_defs: &[CatalogColumnDef],
+    idx: &IndexDef,
+    snap: TransactionSnapshot,
+) -> Result<IndexBuildResult, DbError> {
+    use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let root_page_id = storage.alloc_page(PageType::Index)?;
+    {
+        let mut page = Page::new(PageType::Index, root_page_id);
+        let leaf = cast_leaf_mut(&mut page);
+        leaf.is_leaf = 1;
+        leaf.set_num_keys(0);
+        leaf.set_next_leaf(NULL_PAGE);
+        page.update_checksum();
+        storage.write_page(root_page_id, &page)?;
+    }
+    let root_pid = AtomicU64::new(root_page_id);
+
+    let pred_expr = match &idx.predicate {
+        Some(sql) => Some(crate::partial_index::compile_predicate_sql(sql, col_defs)?),
+        None => None,
+    };
+    let primary_idx = CatalogReader::new(storage, snap.clone())?
+        .list_indexes(table_def.id)?
+        .into_iter()
+        .find(|i| i.is_primary)
+        .ok_or_else(|| {
+            DbError::Other(format!(
+                "clustered table '{}' has no primary index — catalog inconsistency",
+                table_def.table_name
+            ))
+        })?;
+    let layout = crate::clustered_secondary::ClusteredSecondaryLayout::derive(idx, &primary_idx)?;
+    let rows = crate::table::scan_clustered_table(storage, table_def, col_defs, snap)?;
+    let mut skipped_key_too_long = 0usize;
+
+    for (_rid, row_vals) in &rows {
+        if let Some(pred) = &pred_expr {
+            if !crate::eval::is_truthy(&crate::eval::eval(pred, row_vals)?) {
+                continue;
+            }
+        }
+        match layout.insert_row(storage, &root_pid, row_vals) {
+            Ok(_) => {}
+            Err(DbError::IndexKeyTooLong { .. }) => skipped_key_too_long += 1,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(IndexBuildResult {
+        root_page_id: root_pid.load(Ordering::Acquire),
+        skipped_key_too_long,
+    })
+}
+
 fn execute_create_index(
     stmt: CreateIndexStmt,
     storage: &mut dyn StorageEngine,
@@ -75,8 +154,7 @@ fn execute_create_index(
 
     // 1. Resolve table definition + column list.
     let (table_def, col_defs) = {
-        let mut resolver =
-            make_resolver_with_database(storage, txn, Some(conn_txn), database)?;
+        let mut resolver = make_resolver_with_database(storage, txn, Some(conn_txn), database)?;
         let resolved = resolver.resolve_table(Some(schema), &stmt.table.name)?;
         (resolved.def.clone(), resolved.columns.clone())
     };
@@ -293,12 +371,13 @@ fn execute_create_index(
     for idx_col in &index_columns {
         let ndv = compute_ndv_exact(idx_col.col_idx, &rows);
         // Ignore stats write errors — stats are advisory, not correctness-critical.
-        let _ = CatalogWriter::new(storage, txn, conn_txn)?.upsert_stats(axiomdb_catalog::StatsDef {
-            table_id: table_def.id,
-            col_idx: idx_col.col_idx,
-            row_count: rows.len() as u64,
-            ndv,
-        });
+        let _ =
+            CatalogWriter::new(storage, txn, conn_txn)?.upsert_stats(axiomdb_catalog::StatsDef {
+                table_id: table_def.id,
+                col_idx: idx_col.col_idx,
+                row_count: rows.len() as u64,
+                ndv,
+            });
     }
 
     // 9. Bump per-table schema_version so plan caches referencing this table
@@ -330,4 +409,3 @@ fn compute_ndv_exact(col_idx: u16, rows: &[(RecordId, Vec<Value>)]) -> i64 {
     }
     seen.len() as i64
 }
-

@@ -8,7 +8,7 @@ fn execute_insert_ctx(
     let storage = unsafe { exec_ctx.storage_mut() };
     let txn = unsafe { exec_ctx.coord_mut() };
     let bloom = unsafe { exec_ctx.bloom_mut() };
-    let resolved = resolve_table_cached(storage, txn, ctx, &stmt.table)?;
+    let resolved = resolve_table_cached(storage, txn, ctx, Some(conn_txn), &stmt.table)?;
     if resolved.def.is_clustered() {
         if ctx.pending_inserts.is_some() {
             flush_pending_inserts_ctx(exec_ctx, ctx)?;
@@ -118,7 +118,12 @@ fn execute_insert_ctx(
                     .iter()
                     .map(|e| eval(e, &[]))
                     .collect::<Result<_, _>>()?;
-                resolve_expr_defaults(&col_positions, &value_exprs, &mut provided, &resolved.columns);
+                resolve_expr_defaults(
+                    &col_positions,
+                    &value_exprs,
+                    &mut provided,
+                    &resolved.columns,
+                );
 
                 // MySQL error 1136: column count in VALUES must match the explicit column list.
                 if let Some(expected) = explicit_col_count {
@@ -131,7 +136,8 @@ fn execute_insert_ctx(
                     }
                 }
 
-                let mut full_values = materialize_insert_row(&col_positions, &provided, &resolved.columns);
+                let mut full_values =
+                    materialize_insert_row(&col_positions, &provided, &resolved.columns);
 
                 if let Some(ai_col) = auto_inc_col {
                     // MySQL: explicit 0 on AUTO_INCREMENT column is treated same as NULL.
@@ -140,15 +146,14 @@ fn execute_insert_ctx(
                         Some(Value::Null) | Some(Value::Int(0)) | Some(Value::BigInt(0))
                     );
                     if is_auto_trigger {
-                        let id =
-                            next_auto_inc_ctx(
-                                storage,
-                                txn,
-                                &*conn_txn,
-                                &resolved.def,
-                                schema_cols,
-                                ai_col,
-                            )?;
+                        let id = next_auto_inc_ctx(
+                            storage,
+                            txn,
+                            &*conn_txn,
+                            &resolved.def,
+                            schema_cols,
+                            ai_col,
+                        )?;
                         full_values[ai_col] = match schema_cols[ai_col].col_type {
                             axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
                             _ => Value::Int(id as i32),
@@ -160,9 +165,13 @@ fn execute_insert_ctx(
                 }
 
                 // CHAR(N) padding + VARCHAR(N) length check + CHECK constraints.
-                match enforce_text_constraints(&resolved.columns, &mut full_values)
-                    .and_then(|()| check_row_constraints(&resolved.constraints, &full_values, &resolved.def.table_name))
-                {
+                match enforce_text_constraints(&resolved.columns, &mut full_values).and_then(|()| {
+                    check_row_constraints(
+                        &resolved.constraints,
+                        &full_values,
+                        &resolved.def.table_name,
+                    )
+                }) {
                     Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
                     other => other?,
                 }
@@ -182,7 +191,12 @@ fn execute_insert_ctx(
                     }
                 }
 
-                full_batch.push(full_values);
+                full_batch.push(crate::table::coerce_values_with_ctx(
+                    full_values,
+                    schema_cols,
+                    ctx,
+                    row_idx + 1,
+                )?);
             }
 
             if full_batch.len() == 1 || ignore {
@@ -193,6 +207,7 @@ fn execute_insert_ctx(
                         &resolved.def,
                         schema_cols,
                         ctx,
+                        conn_txn,
                         full_values.clone(),
                         row_idx + 1,
                     ) {
@@ -215,12 +230,8 @@ fn execute_insert_ctx(
                         ) {
                             Ok(updated) => {
                                 for (index_id, new_root) in updated {
-                                    CatalogWriter::new(
-                                        storage,
-                                        txn,
-                                        conn_txn,
-                                    )?
-                                    .update_index_root(index_id, new_root)?;
+                                    CatalogWriter::new(storage, txn, conn_txn)?
+                                        .update_index_root(index_id, new_root)?;
                                     if let Some(idx) = secondary_indexes
                                         .iter_mut()
                                         .find(|i| i.index_id == index_id)
@@ -253,6 +264,7 @@ fn execute_insert_ctx(
                     txn,
                     bloom,
                     ctx,
+                    conn_txn,
                     InsertBatchApply {
                         table_def: &resolved.def,
                         columns: schema_cols,
@@ -267,16 +279,18 @@ fn execute_insert_ctx(
             }
         }
         InsertSource::Select(select_stmt) => {
-            let select_rows = match execute_select_ctx(*select_stmt, exec_ctx, Some(&*conn_txn), ctx)? {
-                QueryResult::Rows { rows, .. } => rows,
-                other => {
-                    return Err(DbError::Other(format!(
-                        "INSERT SELECT: expected Rows from SELECT, got {other:?}"
-                    )))
-                }
-            };
+            let select_rows =
+                match execute_select_ctx(*select_stmt, exec_ctx, Some(&*conn_txn), ctx)? {
+                    QueryResult::Rows { rows, .. } => rows,
+                    other => {
+                        return Err(DbError::Other(format!(
+                            "INSERT SELECT: expected Rows from SELECT, got {other:?}"
+                        )))
+                    }
+                };
             for (row_idx, row_values) in select_rows.into_iter().enumerate() {
-                let mut full_values = materialize_insert_row(&col_positions, &row_values, &resolved.columns);
+                let mut full_values =
+                    materialize_insert_row(&col_positions, &row_values, &resolved.columns);
                 if let Some(ai_col) = auto_inc_col {
                     if matches!(full_values.get(ai_col), Some(Value::Null)) {
                         let id = next_auto_inc_ctx(
@@ -310,6 +324,12 @@ fn execute_insert_ctx(
                         other => other?,
                     }
                 }
+                let full_values = crate::table::coerce_values_with_ctx(
+                    full_values,
+                    schema_cols,
+                    ctx,
+                    row_idx + 1,
+                )?;
                 // Clone so full_values remains available for index maintenance.
                 let rid = match TableEngine::insert_row_with_ctx(
                     storage,
@@ -317,6 +337,7 @@ fn execute_insert_ctx(
                     &resolved.def,
                     schema_cols,
                     ctx,
+                    conn_txn,
                     full_values.clone(),
                     row_idx + 1,
                 ) {
@@ -339,12 +360,8 @@ fn execute_insert_ctx(
                     ) {
                         Ok(updated) => {
                             for (index_id, new_root) in updated {
-                                CatalogWriter::new(
-                                    storage,
-                                    txn,
-                                    conn_txn,
-                                )?
-                                .update_index_root(index_id, new_root)?;
+                                CatalogWriter::new(storage, txn, conn_txn)?
+                                    .update_index_root(index_id, new_root)?;
                                 if let Some(idx) = secondary_indexes
                                     .iter_mut()
                                     .find(|i| i.index_id == index_id)
@@ -354,13 +371,7 @@ fn execute_insert_ctx(
                             }
                         }
                         Err(e) if ignore && is_ignorable_insert_error(&e) => {
-                            TableEngine::delete_row(
-                                storage,
-                                txn,
-                                conn_txn,
-                                &resolved.def,
-                                rid,
-                            )?;
+                            TableEngine::delete_row(storage, txn, conn_txn, &resolved.def, rid)?;
                             continue;
                         }
                         Err(e) => return Err(e),
@@ -405,12 +416,15 @@ fn execute_insert_ctx(
                     bloom,
                 )?;
             }
+            let full_values =
+                crate::table::coerce_values_with_ctx(full_values, schema_cols, ctx, 1)?;
             let rid = TableEngine::insert_row_with_ctx(
                 storage,
                 txn,
                 &resolved.def,
                 schema_cols,
                 ctx,
+                conn_txn,
                 full_values.clone(),
                 1,
             )?;
@@ -428,12 +442,8 @@ fn execute_insert_ctx(
                     Some(conn_txn),
                 )?;
                 for (index_id, new_root) in updated {
-                    CatalogWriter::new(
-                        storage,
-                        txn,
-                        conn_txn,
-                    )?
-                    .update_index_root(index_id, new_root)?;
+                    CatalogWriter::new(storage, txn, conn_txn)?
+                        .update_index_root(index_id, new_root)?;
                     if let Some(idx) = secondary_indexes
                         .iter_mut()
                         .find(|i| i.index_id == index_id)

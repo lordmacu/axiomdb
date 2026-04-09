@@ -112,12 +112,20 @@ fn execute_insert(
                     .collect::<Result<_, _>>()?;
                 resolve_expr_defaults(&col_positions, value_exprs, &mut provided, schema_cols);
 
-                let mut full_values = materialize_insert_row(&col_positions, &provided, schema_cols);
+                let mut full_values =
+                    materialize_insert_row(&col_positions, &provided, schema_cols);
 
                 // AUTO_INCREMENT: assign the next ID before batching.
                 if let Some(ai_col) = auto_inc_col {
                     if matches!(full_values.get(ai_col), Some(Value::Null)) {
-                        let id = next_auto_inc(storage, txn, conn_txn, &resolved.def, schema_cols, ai_col)?;
+                        let id = next_auto_inc(
+                            storage,
+                            txn,
+                            conn_txn,
+                            &resolved.def,
+                            schema_cols,
+                            ai_col,
+                        )?;
                         full_values[ai_col] = match schema_cols[ai_col].col_type {
                             axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
                             _ => Value::Int(id as i32),
@@ -128,7 +136,7 @@ fn execute_insert(
                     }
                 }
 
-                full_batch.push(full_values);
+                full_batch.push(crate::table::coerce_values(full_values, schema_cols)?);
             }
 
             // ── Phase 2: insert into the heap / indexes ──────────────────────
@@ -218,11 +226,19 @@ fn execute_insert(
             };
 
             for row_values in select_rows {
-                let mut full_values = materialize_insert_row(&col_positions, &row_values, schema_cols);
+                let mut full_values =
+                    materialize_insert_row(&col_positions, &row_values, schema_cols);
 
                 if let Some(ai_col) = auto_inc_col {
                     if matches!(full_values.get(ai_col), Some(Value::Null)) {
-                        let id = next_auto_inc(storage, txn, conn_txn, &resolved.def, schema_cols, ai_col)?;
+                        let id = next_auto_inc(
+                            storage,
+                            txn,
+                            conn_txn,
+                            &resolved.def,
+                            schema_cols,
+                            ai_col,
+                        )?;
                         full_values[ai_col] = match schema_cols[ai_col].col_type {
                             axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
                             _ => Value::Int(id as i32),
@@ -232,6 +248,7 @@ fn execute_insert(
                         }
                     }
                 }
+                let full_values = crate::table::coerce_values(full_values, schema_cols)?;
 
                 let rid = match TableEngine::insert_row(
                     storage,
@@ -279,7 +296,8 @@ fn execute_insert(
             let mut full_values: Vec<Value> = schema_cols.iter().map(|_| Value::Null).collect();
             if let Some(ai_col) = auto_inc_col {
                 if matches!(full_values.get(ai_col), Some(Value::Null)) {
-                    let id = next_auto_inc(storage, txn, conn_txn, &resolved.def, schema_cols, ai_col)?;
+                    let id =
+                        next_auto_inc(storage, txn, conn_txn, &resolved.def, schema_cols, ai_col)?;
                     full_values[ai_col] = match schema_cols[ai_col].col_type {
                         axiomdb_catalog::schema::ColumnType::BigInt => Value::BigInt(id as i64),
                         _ => Value::Int(id as i32),
@@ -289,6 +307,7 @@ fn execute_insert(
                     }
                 }
             }
+            let full_values = crate::table::coerce_values(full_values, schema_cols)?;
             let rid = TableEngine::insert_row(
                 storage,
                 txn,
@@ -311,7 +330,8 @@ fn execute_insert(
                     Some(conn_txn),
                 )?;
                 for (index_id, new_root) in updated {
-                    CatalogWriter::new(storage, txn, conn_txn)?.update_index_root(index_id, new_root)?;
+                    CatalogWriter::new(storage, txn, conn_txn)?
+                        .update_index_root(index_id, new_root)?;
                 }
             }
             count += 1;
@@ -343,4 +363,3 @@ fn is_ignorable_insert_error(e: &DbError) -> bool {
             | DbError::ForeignKeyViolation { .. }
     )
 }
-

@@ -19,7 +19,15 @@ fn rewrite_rows(
     transform: &dyn Fn(Row) -> Result<Row, DbError>,
 ) -> Result<(), DbError> {
     if table_def.is_clustered() {
-        return rewrite_rows_clustered(storage, txn, conn_txn, table_def, old_columns, new_columns, transform);
+        return rewrite_rows_clustered(
+            storage,
+            txn,
+            conn_txn,
+            table_def,
+            old_columns,
+            new_columns,
+            transform,
+        );
     }
     let snap = txn.active_snapshot(conn_txn);
     let rows = TableEngine::scan_table(storage, table_def, old_columns, snap, None)?;
@@ -74,13 +82,12 @@ fn rewrite_rows_clustered(
 
     for row in all_rows {
         // Decode old values from raw row bytes.
-        let old_values =
-            decode_row(&row.row_data, &old_col_types).map_err(|e| {
-                DbError::Other(format!(
-                    "ALTER TABLE rewrite: failed to decode row in '{}': {e}",
-                    table_def.table_name
-                ))
-            })?;
+        let old_values = decode_row(&row.row_data, &old_col_types).map_err(|e| {
+            DbError::Other(format!(
+                "ALTER TABLE rewrite: failed to decode row in '{}': {e}",
+                table_def.table_name
+            ))
+        })?;
 
         // Apply schema transform (may fail for MODIFY COLUMN type coercions).
         let new_values = transform(old_values)?;
@@ -118,7 +125,218 @@ fn rewrite_rows_clustered(
         // None = row not found or no longer visible — skip.
     }
 
+    if root_pid != table_def.root_page_id {
+        CatalogWriter::new(storage, txn, conn_txn)?.update_table_root(table_def.id, root_pid)?;
+    }
+
     Ok(())
+}
+
+fn current_table_def_for_alter(
+    table_def: &axiomdb_catalog::schema::TableDef,
+    txn: &TxnManager,
+) -> axiomdb_catalog::schema::TableDef {
+    let mut current = table_def.clone();
+    if table_def.is_clustered() {
+        if let Some(root) = txn.clustered_root(table_def.id) {
+            current.root_page_id = root;
+        }
+    }
+    current
+}
+
+type AlterMetadata = (
+    Vec<axiomdb_catalog::schema::IndexDef>,
+    Vec<axiomdb_catalog::schema::ConstraintDef>,
+    Vec<axiomdb_catalog::schema::FkDef>,
+    Vec<axiomdb_catalog::schema::FkDef>,
+);
+
+fn load_alter_metadata(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    table_id: u32,
+) -> Result<AlterMetadata, DbError> {
+    let snap = txn.active_snapshot(conn_txn);
+    let mut reader = CatalogReader::new(storage, snap)?;
+    Ok((
+        reader.list_indexes(table_id)?,
+        reader.list_constraints(table_id)?,
+        reader.list_fk_constraints(table_id)?,
+        reader.list_fk_constraints_referencing(table_id)?,
+    ))
+}
+
+fn replace_table_columns(
+    storage: &mut dyn StorageEngine,
+    txn: &mut TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    table_id: u32,
+    old_columns: &[axiomdb_catalog::schema::ColumnDef],
+    new_columns: &[axiomdb_catalog::schema::ColumnDef],
+) -> Result<(), DbError> {
+    let mut writer = CatalogWriter::new(storage, txn, conn_txn)?;
+    for col in old_columns {
+        writer.delete_column(table_id, col.col_idx)?;
+    }
+    for col in new_columns {
+        writer.create_column(col.clone())?;
+    }
+    Ok(())
+}
+
+fn expr_mentions_column_name(expr: &crate::expr::Expr, target_name: &str) -> bool {
+    use crate::expr::Expr;
+
+    match expr {
+        Expr::Column { name, .. } | Expr::OuterColumn { name, .. } => {
+            name.eq_ignore_ascii_case(target_name)
+        }
+        Expr::Literal(_) | Expr::Param { .. } | Expr::Default => false,
+        Expr::UnaryOp { operand, .. }
+        | Expr::IsNull { expr: operand, .. }
+        | Expr::IsBoolean { expr: operand, .. }
+        | Expr::Cast { expr: operand, .. } => expr_mentions_column_name(operand, target_name),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_mentions_column_name(left, target_name)
+                || expr_mentions_column_name(right, target_name)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_mentions_column_name(expr, target_name)
+                || expr_mentions_column_name(low, target_name)
+                || expr_mentions_column_name(high, target_name)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_mentions_column_name(expr, target_name)
+                || expr_mentions_column_name(pattern, target_name)
+                || escape
+                    .as_deref()
+                    .map(|e| expr_mentions_column_name(e, target_name))
+                    .unwrap_or(false)
+        }
+        Expr::In { expr, list, .. } => {
+            expr_mentions_column_name(expr, target_name)
+                || list
+                    .iter()
+                    .any(|e| expr_mentions_column_name(e, target_name))
+        }
+        Expr::Function { args, .. } => args
+            .iter()
+            .any(|e| expr_mentions_column_name(e, target_name)),
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => {
+            operand
+                .as_deref()
+                .map(|e| expr_mentions_column_name(e, target_name))
+                .unwrap_or(false)
+                || when_thens.iter().any(|(when, then)| {
+                    expr_mentions_column_name(when, target_name)
+                        || expr_mentions_column_name(then, target_name)
+                })
+                || else_result
+                    .as_deref()
+                    .map(|e| expr_mentions_column_name(e, target_name))
+                    .unwrap_or(false)
+        }
+        Expr::Subquery(_) | Expr::Exists { .. } => false,
+        Expr::InSubquery { expr, .. } => expr_mentions_column_name(expr, target_name),
+        Expr::GroupConcat { expr, order_by, .. } => {
+            expr_mentions_column_name(expr, target_name)
+                || order_by
+                    .iter()
+                    .any(|(e, _)| expr_mentions_column_name(e, target_name))
+        }
+    }
+}
+
+fn stored_expr_mentions_column_name(expr_sql: &str, target_name: &str) -> Result<bool, DbError> {
+    let expr = crate::parser::parse_expr_only(expr_sql)?;
+    Ok(expr_mentions_column_name(&expr, target_name))
+}
+
+fn index_depends_on_column(
+    idx: &axiomdb_catalog::schema::IndexDef,
+    target_name: &str,
+    target_col_idx: u16,
+) -> Result<bool, DbError> {
+    if idx.columns.iter().any(|c| c.col_idx == target_col_idx) {
+        return Ok(true);
+    }
+    if idx.include_columns.contains(&target_col_idx) {
+        return Ok(true);
+    }
+    if let Some(pred_sql) = &idx.predicate {
+        return stored_expr_mentions_column_name(pred_sql, target_name);
+    }
+    Ok(false)
+}
+
+fn shift_col_idx_after_drop(col_idx: u16, dropped_col_idx: u16) -> u16 {
+    if col_idx > dropped_col_idx {
+        col_idx - 1
+    } else {
+        col_idx
+    }
+}
+
+fn remap_index_after_drop(
+    idx: &axiomdb_catalog::schema::IndexDef,
+    dropped_col_idx: u16,
+) -> axiomdb_catalog::schema::IndexDef {
+    let mut updated = idx.clone();
+    for col in &mut updated.columns {
+        col.col_idx = shift_col_idx_after_drop(col.col_idx, dropped_col_idx);
+    }
+    for col_idx in &mut updated.include_columns {
+        *col_idx = shift_col_idx_after_drop(*col_idx, dropped_col_idx);
+    }
+    updated
+}
+
+fn remap_child_fk_after_drop(
+    fk: &axiomdb_catalog::schema::FkDef,
+    dropped_col_idx: u16,
+) -> Option<axiomdb_catalog::schema::FkDef> {
+    if fk.child_col_idx > dropped_col_idx {
+        let mut updated = fk.clone();
+        updated.child_col_idx = shift_col_idx_after_drop(fk.child_col_idx, dropped_col_idx);
+        Some(updated)
+    } else {
+        None
+    }
+}
+
+fn remap_parent_fk_after_drop(
+    fk: &axiomdb_catalog::schema::FkDef,
+    dropped_col_idx: u16,
+) -> Option<axiomdb_catalog::schema::FkDef> {
+    if fk.parent_col_idx > dropped_col_idx {
+        let mut updated = fk.clone();
+        updated.parent_col_idx = shift_col_idx_after_drop(fk.parent_col_idx, dropped_col_idx);
+        Some(updated)
+    } else {
+        None
+    }
+}
+
+fn cleanup_rebuilt_index_roots(storage: &mut dyn StorageEngine, roots: &[u64]) {
+    let mut seen = std::collections::HashSet::new();
+    for &root in roots {
+        if seen.insert(root) {
+            let _ = free_btree_pages(storage, root);
+        }
+    }
 }
 
 fn execute_alter_table(
@@ -132,20 +350,37 @@ fn execute_alter_table(
 
     // Resolve the table once upfront.
     let table_def = {
-        let mut resolver =
-            make_resolver_with_database(storage, txn, Some(conn_txn), database)?;
+        let mut resolver = make_resolver_with_database(storage, txn, Some(conn_txn), database)?;
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
     // Keep the current column list; update it as we apply operations.
     let mut columns = table_def.columns.clone();
+    let total_ops = stmt.operations.len();
+    let mut alter_result = QueryResult::Empty;
 
-    for op in stmt.operations {
+    for (idx, op) in stmt.operations.into_iter().enumerate() {
         match op {
             AlterTableOp::AddColumn(col_def) => {
-                alter_add_column(storage, txn, conn_txn, &table_def.def, &mut columns, col_def, schema)?;
+                alter_add_column(
+                    storage,
+                    txn,
+                    conn_txn,
+                    &table_def.def,
+                    &mut columns,
+                    col_def,
+                    schema,
+                )?;
             }
             AlterTableOp::DropColumn { name, if_exists } => {
-                alter_drop_column(storage, txn, conn_txn, &table_def.def, &mut columns, &name, if_exists)?;
+                alter_drop_column(
+                    storage,
+                    txn,
+                    conn_txn,
+                    &table_def.def,
+                    &mut columns,
+                    &name,
+                    if_exists,
+                )?;
             }
             AlterTableOp::RenameColumn { old_name, new_name } => {
                 alter_rename_column(
@@ -163,13 +398,31 @@ fn execute_alter_table(
                 columns = CatalogReader::new(storage, snap2)?.list_columns(table_def.def.id)?;
             }
             AlterTableOp::RenameTable(new_name) => {
-                alter_rename_table(storage, txn, conn_txn, &table_def.def, &new_name, database, schema)?;
+                alter_rename_table(
+                    storage,
+                    txn,
+                    conn_txn,
+                    &table_def.def,
+                    &new_name,
+                    database,
+                    schema,
+                )?;
                 // After RENAME TABLE further operations would need the new table_def;
                 // for simplicity, only one op per statement is expected for RENAME TO.
                 break;
             }
             AlterTableOp::AddConstraint(tc) => {
-                alter_add_constraint(storage, txn, conn_txn, &table_def, &columns, tc, database, schema)?;
+                let is_add_pk = matches!(&tc, crate::ast::TableConstraint::PrimaryKey { .. });
+                if is_add_pk && idx + 1 < total_ops {
+                    return Err(DbError::NotImplemented {
+                        feature: "ALTER TABLE ... ADD PRIMARY KEY followed by additional operations in the same statement".into(),
+                    });
+                }
+                if let Some(result) = alter_add_constraint(
+                    storage, txn, conn_txn, &table_def, &columns, tc, database, schema,
+                )? {
+                    alter_result = result;
+                }
             }
             AlterTableOp::DropConstraint { name, if_exists } => {
                 alter_drop_constraint(storage, txn, conn_txn, &table_def, &name, if_exists)?;
@@ -179,19 +432,29 @@ fn execute_alter_table(
                 let _ = CatalogWriter::new(storage, txn, conn_txn)?
                     .bump_table_schema_version(table_def.def.id);
                 return alter_rebuild_to_clustered(
-                    storage,
-                    txn,
-                    conn_txn,
-                    &table_def,
-                    database,
-                    schema,
+                    storage, txn, conn_txn, &table_def, database, schema,
                 );
             }
             AlterTableOp::ModifyColumn(col_def) => {
-                alter_modify_column(storage, txn, conn_txn, &table_def.def, &mut columns, col_def, schema)?;
+                alter_modify_column(
+                    storage,
+                    txn,
+                    conn_txn,
+                    &table_def.def,
+                    &mut columns,
+                    col_def,
+                    schema,
+                )?;
             }
             AlterTableOp::RenameIndex { old_name, new_name } => {
-                alter_rename_index(storage, txn, conn_txn, table_def.def.id, &old_name, &new_name)?;
+                alter_rename_index(
+                    storage,
+                    txn,
+                    conn_txn,
+                    table_def.def.id,
+                    &old_name,
+                    &new_name,
+                )?;
             }
             AlterTableOp::ConvertCharset | AlterTableOp::SetEngine => {
                 // Accepted and ignored — charset/engine are compat metadata only.
@@ -199,14 +462,25 @@ fn execute_alter_table(
             AlterTableOp::SetAutoIncrement(_) => {
                 // AUTO_INCREMENT counter reset accepted; not yet persisted (4.18e).
             }
-            AlterTableOp::AddIndex { unique, name, columns } => {
+            AlterTableOp::AddIndex {
+                unique,
+                name,
+                columns,
+            } => {
                 alter_add_index(
                     storage, txn, conn_txn, &table_def, &columns, unique, name, database,
                 )?;
                 // Refresh columns after index creation (schema version bumped by create_index).
             }
             AlterTableOp::DropIndex { name } => {
-                alter_drop_index(storage, txn, conn_txn, table_def.def.id, &name, table_def.def.is_clustered())?;
+                alter_drop_index(
+                    storage,
+                    txn,
+                    conn_txn,
+                    table_def.def.id,
+                    &name,
+                    table_def.def.is_clustered(),
+                )?;
             }
             AlterTableOp::ChangeColumn { old_name, new_def } => {
                 // CHANGE COLUMN = rename + retype in one op.
@@ -219,14 +493,28 @@ fn execute_alter_table(
                     name: old_name.clone(),
                     ..new_def
                 };
-                alter_modify_column(storage, txn, conn_txn, &table_def.def, &mut columns, modify_def, schema)?;
+                alter_modify_column(
+                    storage,
+                    txn,
+                    conn_txn,
+                    &table_def.def,
+                    &mut columns,
+                    modify_def,
+                    schema,
+                )?;
                 // Step 2: Rename if needed.
                 if rename_needed {
                     let snap2 = txn.active_snapshot(conn_txn);
                     columns = CatalogReader::new(storage, snap2)?.list_columns(table_def.def.id)?;
                     alter_rename_column(
-                        storage, txn, conn_txn, &table_def.def, &columns,
-                        &old_name, &new_name, schema,
+                        storage,
+                        txn,
+                        conn_txn,
+                        &table_def.def,
+                        &columns,
+                        &old_name,
+                        &new_name,
+                        schema,
                     )?;
                     let snap3 = txn.active_snapshot(conn_txn);
                     columns = CatalogReader::new(storage, snap3)?.list_columns(table_def.def.id)?;
@@ -239,7 +527,7 @@ fn execute_alter_table(
     // detect staleness on next lookup (Phase 40.2 OID-based invalidation).
     let _ = CatalogWriter::new(storage, txn, conn_txn)?.bump_table_schema_version(table_def.def.id);
 
-    Ok(QueryResult::Empty)
+    Ok(alter_result)
 }
 
 fn alter_add_column(
@@ -298,15 +586,12 @@ fn alter_add_column(
         auto_increment,
         type_len: col_def.type_len,
         is_fixed_len: col_def.is_char,
-        default_expr: col_def
-            .constraints
-            .iter()
-            .find_map(|c| match c {
-                crate::ast::ColumnConstraint::Default(expr) => {
-                    Some(crate::expr_to_sql::expr_to_sql_string(expr))
-                }
-                _ => None,
-            }),
+        default_expr: col_def.constraints.iter().find_map(|c| match c {
+            crate::ast::ColumnConstraint::Default(expr) => {
+                Some(crate::expr_to_sql::expr_to_sql_string(expr))
+            }
+            _ => None,
+        }),
     };
 
     // 1. Add column to catalog.
@@ -357,33 +642,81 @@ fn alter_drop_column(
         }
     };
 
-    let dropped_col_idx = columns[drop_pos].col_idx;
+    let dropped_col = columns[drop_pos].clone();
+    let dropped_col_idx = dropped_col.col_idx;
+    let dropped_col_name = dropped_col.name.clone();
+    let (indexes, constraints, child_fks, parent_fks) =
+        load_alter_metadata(storage, txn, conn_txn, table_def.id)?;
 
-    // Reject if the column is referenced by any secondary index — dropping it
-    // would leave the index pointing at a non-existent column.
+    if indexes
+        .iter()
+        .any(|idx| idx.is_primary && idx.columns.iter().any(|c| c.col_idx == dropped_col_idx))
     {
-        let snap = txn.active_snapshot(conn_txn);
-        let mut reader = CatalogReader::new(storage, snap)?;
-        let indexes = reader.list_indexes(table_def.id)?;
-        for idx in &indexes {
-            if idx.is_primary {
-                continue;
-            }
-            if idx.columns.iter().any(|c| c.col_idx == dropped_col_idx) {
-                return Err(DbError::NotImplemented {
-                    feature: format!(
-                        "Cannot drop column '{}': it is part of index '{}'. Drop the index first.",
-                        name, idx.name
-                    ),
-                });
-            }
+        return Err(DbError::InvalidValue {
+            reason: format!("PRIMARY KEY column '{}' cannot be dropped", name),
+        });
+    }
+    if let Some(fk) = child_fks
+        .iter()
+        .find(|fk| fk.child_col_idx == dropped_col_idx)
+    {
+        return Err(DbError::InvalidValue {
+            reason: format!(
+                "Cannot drop column '{}': it is referenced by foreign key '{}'",
+                name, fk.name
+            ),
+        });
+    }
+    if let Some(fk) = parent_fks
+        .iter()
+        .find(|fk| fk.parent_col_idx == dropped_col_idx)
+    {
+        return Err(DbError::InvalidValue {
+            reason: format!(
+                "Cannot drop column '{}': it is referenced by foreign key '{}'",
+                name, fk.name
+            ),
+        });
+    }
+    for constraint in &constraints {
+        if !constraint.check_expr.is_empty()
+            && stored_expr_mentions_column_name(&constraint.check_expr, &dropped_col_name)?
+        {
+            return Err(DbError::InvalidValue {
+                reason: format!(
+                    "Cannot drop column '{}': it is referenced by CHECK constraint '{}'",
+                    name, constraint.name
+                ),
+            });
         }
     }
+
     let old_columns = columns.clone();
 
     // Build new column list (without the dropped column).
     let mut new_columns = columns.clone();
     new_columns.remove(drop_pos);
+    for (new_pos, col) in new_columns.iter_mut().enumerate() {
+        col.col_idx = new_pos as u16;
+    }
+
+    let mut dropped_indexes = Vec::new();
+    let mut surviving_indexes = Vec::new();
+    for idx in indexes {
+        if index_depends_on_column(&idx, &dropped_col_name, dropped_col_idx)? {
+            dropped_indexes.push(idx);
+        } else {
+            surviving_indexes.push((idx.clone(), remap_index_after_drop(&idx, dropped_col_idx)));
+        }
+    }
+    let updated_child_fks: Vec<_> = child_fks
+        .iter()
+        .filter_map(|fk| remap_child_fk_after_drop(fk, dropped_col_idx))
+        .collect();
+    let updated_parent_fks: Vec<_> = parent_fks
+        .iter()
+        .filter_map(|fk| remap_parent_fk_after_drop(fk, dropped_col_idx))
+        .collect();
 
     // 1. Rewrite rows BEFORE updating catalog (if rewrite fails, catalog is still consistent).
     rewrite_rows(
@@ -401,8 +734,69 @@ fn alter_drop_column(
         },
     )?;
 
-    // 2. Delete column from catalog.
-    CatalogWriter::new(storage, txn, conn_txn)?.delete_column(table_def.id, dropped_col_idx)?;
+    // 2. Replace the column catalog with the renumbered schema.
+    replace_table_columns(
+        storage,
+        txn,
+        conn_txn,
+        table_def.id,
+        &old_columns,
+        &new_columns,
+    )?;
+
+    let mut built_roots_for_cleanup = Vec::new();
+    let repair_result = (|| -> Result<(), DbError> {
+        for fk in &updated_child_fks {
+            CatalogWriter::new(storage, txn, conn_txn)?.replace_foreign_key(fk.clone())?;
+        }
+        for fk in &updated_parent_fks {
+            CatalogWriter::new(storage, txn, conn_txn)?.replace_foreign_key(fk.clone())?;
+        }
+
+        let mut pages_to_defer = Vec::new();
+
+        for idx in &dropped_indexes {
+            pages_to_defer.extend(collect_btree_pages(storage, idx.root_page_id)?);
+            CatalogWriter::new(storage, txn, conn_txn)?.delete_index(idx.index_id)?;
+        }
+
+        if table_def.is_clustered() {
+            for (old_idx, updated_idx) in &surviving_indexes {
+                if old_idx != updated_idx {
+                    CatalogWriter::new(storage, txn, conn_txn)?
+                        .replace_index_def(updated_idx.clone())?;
+                }
+            }
+        } else {
+            let current_table_def = current_table_def_for_alter(table_def, txn);
+            let snap = txn.active_snapshot(conn_txn);
+            for (old_idx, updated_idx) in &surviving_indexes {
+                let build = build_index_root_from_existing_def(
+                    storage,
+                    &current_table_def,
+                    &new_columns,
+                    updated_idx,
+                    snap.clone(),
+                )?;
+                built_roots_for_cleanup.push(build.root_page_id);
+                pages_to_defer.extend(collect_btree_pages(storage, old_idx.root_page_id)?);
+
+                let mut final_idx = updated_idx.clone();
+                final_idx.root_page_id = build.root_page_id;
+                CatalogWriter::new(storage, txn, conn_txn)?.replace_index_def(final_idx)?;
+            }
+        }
+
+        pages_to_defer.sort_unstable();
+        pages_to_defer.dedup();
+        txn.defer_free_pages(conn_txn, pages_to_defer);
+        Ok(())
+    })();
+
+    if let Err(err) = repair_result {
+        cleanup_rebuilt_index_roots(storage, &built_roots_for_cleanup);
+        return Err(err);
+    }
 
     *columns = new_columns;
     Ok(())
@@ -410,10 +804,8 @@ fn alter_drop_column(
 
 /// `MODIFY [COLUMN] col_name new_type [NOT NULL | NULL]`
 ///
-/// Rewrites all rows in the table to coerce the target column to the new type.
-/// If the column type changes and the column is part of any secondary index the
-/// operation is rejected — the caller must `DROP INDEX`, `MODIFY`, then
-/// `CREATE INDEX` to avoid stale index key encodings.
+/// Rewrites all rows in the table to coerce the target column to the new type,
+/// then repairs secondary indexes according to the table layout.
 fn alter_modify_column(
     storage: &mut dyn StorageEngine,
     txn: &mut TxnManager,
@@ -441,45 +833,43 @@ fn alter_modify_column(
         .any(|c| matches!(c, crate::ast::ColumnConstraint::NotNull));
 
     let old_col = &columns[col_pos];
-    let old_col_type = old_col.col_type;
     let col_idx = old_col.col_idx;
-    let type_changed = old_col_type != new_col_type;
-
-    // Reject PK column nullability change — PK columns must be NOT NULL.
-    {
-        let snap = txn.active_snapshot(conn_txn);
-        let mut reader = CatalogReader::new(storage, snap)?;
-        let indexes = reader.list_indexes(table_def.id)?;
-
-        // If the type changes and the column is in a secondary index, reject.
-        if type_changed {
-            for idx in &indexes {
-                if idx.is_primary {
-                    continue;
-                }
-                if idx.columns.iter().any(|c| c.col_idx == col_idx) {
-                    return Err(DbError::NotImplemented {
-                        feature: format!(
-                            "Cannot change type of column '{}': it is part of index '{}'. \
-                             Drop the index first.",
-                            col_def.name, idx.name
-                        ),
-                    });
-                }
-            }
-        }
-
-        // PK column must stay NOT NULL.
-        let is_pk_col = indexes
-            .iter()
-            .find(|i| i.is_primary)
-            .map(|pk| pk.columns.iter().any(|c| c.col_idx == col_idx))
-            .unwrap_or(false);
-        if is_pk_col && new_nullable {
+    let (indexes, constraints, child_fks, parent_fks) =
+        load_alter_metadata(storage, txn, conn_txn, table_def.id)?;
+    let is_pk_col = indexes
+        .iter()
+        .find(|i| i.is_primary)
+        .map(|pk| pk.columns.iter().any(|c| c.col_idx == col_idx))
+        .unwrap_or(false);
+    if is_pk_col {
+        return Err(DbError::InvalidValue {
+            reason: format!("PRIMARY KEY column '{}' cannot be modified", col_def.name),
+        });
+    }
+    if let Some(fk) = child_fks.iter().find(|fk| fk.child_col_idx == col_idx) {
+        return Err(DbError::InvalidValue {
+            reason: format!(
+                "Cannot modify column '{}': it is referenced by foreign key '{}'",
+                col_def.name, fk.name
+            ),
+        });
+    }
+    if let Some(fk) = parent_fks.iter().find(|fk| fk.parent_col_idx == col_idx) {
+        return Err(DbError::InvalidValue {
+            reason: format!(
+                "Cannot modify column '{}': it is referenced by foreign key '{}'",
+                col_def.name, fk.name
+            ),
+        });
+    }
+    for constraint in &constraints {
+        if !constraint.check_expr.is_empty()
+            && stored_expr_mentions_column_name(&constraint.check_expr, &col_def.name)?
+        {
             return Err(DbError::InvalidValue {
                 reason: format!(
-                    "PRIMARY KEY column '{}' cannot be changed to NULL",
-                    col_def.name
+                    "Cannot modify column '{}': it is referenced by CHECK constraint '{}'",
+                    col_def.name, constraint.name
                 ),
             });
         }
@@ -537,6 +927,48 @@ fn alter_modify_column(
     };
     CatalogWriter::new(storage, txn, conn_txn)?.create_column(new_catalog_col.clone())?;
 
+    let mut built_roots_for_cleanup = Vec::new();
+    let repair_result = (|| -> Result<(), DbError> {
+        let current_table_def = current_table_def_for_alter(table_def, txn);
+        let snap = txn.active_snapshot(conn_txn);
+        let mut pages_to_defer = Vec::new();
+
+        for idx in &indexes {
+            let must_rebuild = if table_def.is_clustered() {
+                !idx.is_primary && index_depends_on_column(idx, &col_def.name, col_idx)?
+            } else {
+                true
+            };
+            if !must_rebuild {
+                continue;
+            }
+
+            let build = build_index_root_from_existing_def(
+                storage,
+                &current_table_def,
+                &new_columns,
+                idx,
+                snap.clone(),
+            )?;
+            built_roots_for_cleanup.push(build.root_page_id);
+            pages_to_defer.extend(collect_btree_pages(storage, idx.root_page_id)?);
+
+            let mut updated_idx = idx.clone();
+            updated_idx.root_page_id = build.root_page_id;
+            CatalogWriter::new(storage, txn, conn_txn)?.replace_index_def(updated_idx)?;
+        }
+
+        pages_to_defer.sort_unstable();
+        pages_to_defer.dedup();
+        txn.defer_free_pages(conn_txn, pages_to_defer);
+        Ok(())
+    })();
+
+    if let Err(err) = repair_result {
+        cleanup_rebuilt_index_roots(storage, &built_roots_for_cleanup);
+        return Err(err);
+    }
+
     *columns = new_columns;
     Ok(())
 }
@@ -589,14 +1021,21 @@ fn alter_rename_table(
     // Check new name not already in use.
     let snap = txn.active_snapshot(conn_txn);
     let mut reader = CatalogReader::new(storage, snap)?;
-    if reader.get_table_in_database(database, schema, new_name)?.is_some() {
+    if reader
+        .get_table_in_database(database, schema, new_name)?
+        .is_some()
+    {
         return Err(DbError::TableAlreadyExists {
             schema: schema.to_string(),
             name: new_name.to_string(),
         });
     }
 
-    CatalogWriter::new(storage, txn, conn_txn)?.rename_table(table_def.id, new_name.to_string(), schema)?;
+    CatalogWriter::new(storage, txn, conn_txn)?.rename_table(
+        table_def.id,
+        new_name.to_string(),
+        schema,
+    )?;
     Ok(())
 }
 
@@ -611,11 +1050,12 @@ fn alter_rename_index(
 ) -> Result<(), DbError> {
     let snap = txn.active_snapshot(conn_txn);
     let indexes = CatalogReader::new(storage, snap)?.list_indexes(table_id)?;
-    let idx = indexes.into_iter().find(|i| i.name == old_name).ok_or_else(|| {
-        DbError::NotImplemented {
+    let idx = indexes
+        .into_iter()
+        .find(|i| i.name == old_name)
+        .ok_or_else(|| DbError::NotImplemented {
             feature: format!("RENAME INDEX: index '{old_name}' not found"),
-        }
-    })?;
+        })?;
     CatalogWriter::new(storage, txn, conn_txn)?.rename_index(idx.index_id, new_name.to_string())?;
     Ok(())
 }
@@ -661,8 +1101,7 @@ fn alter_add_index(
         pages_per_range: None,
     };
     let mut noop_bloom = crate::bloom::BloomRegistry::new();
-    execute_create_index(stmt, storage, txn, conn_txn, &mut noop_bloom, database)
-        .map(|_| ())
+    execute_create_index(stmt, storage, txn, conn_txn, &mut noop_bloom, database).map(|_| ())
 }
 
 /// Drops an index by name for ALTER TABLE DROP INDEX.
@@ -682,7 +1121,11 @@ fn alter_drop_index(
     let snap = txn.active_snapshot(conn_txn);
     let indexes = CatalogReader::new(storage, snap)?.list_indexes(table_id)?;
     let idx = match indexes.into_iter().find(|i| {
-        if name == "PRIMARY" { i.is_primary } else { i.name == name }
+        if name == "PRIMARY" {
+            i.is_primary
+        } else {
+            i.name == name
+        }
     }) {
         Some(i) => i,
         None => return Ok(()), // index not found — treat as no-op (IF EXISTS semantics)
@@ -693,4 +1136,3 @@ fn alter_drop_index(
     let _ = CatalogWriter::new(storage, txn, conn_txn)?.bump_table_schema_version(table_id);
     Ok(())
 }
-

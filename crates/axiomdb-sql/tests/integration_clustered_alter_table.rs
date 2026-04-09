@@ -292,10 +292,111 @@ fn drop_column_then_insert_and_select_use_new_schema() {
 }
 
 #[test]
-fn drop_indexed_column_on_clustered_table_returns_error() {
+fn drop_indexed_column_on_clustered_table_auto_drops_secondary_index() {
     let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
     run_ctx(
-        "CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE)",
+        "CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE, note TEXT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "INSERT INTO t VALUES (1, 'a@example.com', 'one')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let email_root_before = {
+        let snap = txn.snapshot();
+        let mut reader = CatalogReader::new(&storage, snap).unwrap();
+        let table = reader.get_table("public", "t").unwrap().unwrap();
+        reader
+            .list_indexes(table.id)
+            .unwrap()
+            .into_iter()
+            .find(|idx| !idx.is_primary && idx.name == "t_email_unique")
+            .unwrap()
+            .root_page_id
+    };
+
+    run_ctx(
+        "ALTER TABLE t DROP COLUMN email",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let result = rows(
+        run_ctx(
+            "SELECT id, note FROM t ORDER BY id",
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap(),
+    );
+    assert_eq!(result, vec![vec![Value::Int(1), Value::Text("one".into())]]);
+
+    let snap = txn.snapshot();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
+    let table = reader.get_table("public", "t").unwrap().unwrap();
+    let indexes = reader.list_indexes(table.id).unwrap();
+    assert!(indexes.iter().all(|idx| idx.is_primary));
+    assert!(!indexes
+        .iter()
+        .any(|idx| idx.root_page_id == email_root_before));
+}
+
+#[test]
+fn drop_unrelated_column_on_clustered_table_remaps_surviving_unique_index() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE TABLE t (id INT PRIMARY KEY, pad INT, email TEXT UNIQUE)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "INSERT INTO t VALUES (1, 10, 'a@example.com')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "INSERT INTO t VALUES (2, 20, 'b@example.com')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let email_index_before = {
+        let snap = txn.snapshot();
+        let mut reader = CatalogReader::new(&storage, snap).unwrap();
+        let table = reader.get_table("public", "t").unwrap().unwrap();
+        reader
+            .list_indexes(table.id)
+            .unwrap()
+            .into_iter()
+            .find(|idx| !idx.is_primary && idx.name == "t_email_unique")
+            .unwrap()
+    };
+
+    run_ctx(
+        "ALTER TABLE t DROP COLUMN pad",
         &mut storage,
         &mut txn,
         &mut bloom,
@@ -304,7 +405,7 @@ fn drop_indexed_column_on_clustered_table_returns_error() {
     .unwrap();
 
     let err = run_ctx(
-        "ALTER TABLE t DROP COLUMN email",
+        "INSERT INTO t VALUES (3, 'a@example.com')",
         &mut storage,
         &mut txn,
         &mut bloom,
@@ -312,8 +413,24 @@ fn drop_indexed_column_on_clustered_table_returns_error() {
     );
     assert!(
         err.is_err(),
-        "dropping an indexed column must return an error"
+        "surviving UNIQUE index must still enforce duplicates"
     );
+
+    let snap = txn.snapshot();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
+    let table = reader.get_table("public", "t").unwrap().unwrap();
+    let email_index_after = reader
+        .list_indexes(table.id)
+        .unwrap()
+        .into_iter()
+        .find(|idx| !idx.is_primary && idx.name == "t_email_unique")
+        .unwrap();
+    assert_eq!(
+        email_index_after.root_page_id,
+        email_index_before.root_page_id
+    );
+    assert_eq!(email_index_after.columns.len(), 1);
+    assert_eq!(email_index_after.columns[0].col_idx, 1);
 }
 
 #[test]
@@ -498,10 +615,26 @@ fn modify_column_int_to_text_on_clustered_table() {
 }
 
 #[test]
-fn modify_column_fails_for_indexed_column_on_clustered_table() {
+fn modify_column_rebuilds_indexed_column_on_clustered_table() {
     let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
     run_ctx(
-        "CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE)",
+        "CREATE TABLE t (id INT PRIMARY KEY, score INT UNIQUE)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "INSERT INTO t VALUES (1, 100)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "INSERT INTO t VALUES (2, 200)",
         &mut storage,
         &mut txn,
         &mut bloom,
@@ -509,15 +642,66 @@ fn modify_column_fails_for_indexed_column_on_clustered_table() {
     )
     .unwrap();
 
-    // Changing type of an indexed column must be rejected.
+    let unique_root_before = {
+        let snap = txn.snapshot();
+        let mut reader = CatalogReader::new(&storage, snap).unwrap();
+        let table = reader.get_table("public", "t").unwrap().unwrap();
+        reader
+            .list_indexes(table.id)
+            .unwrap()
+            .into_iter()
+            .find(|idx| !idx.is_primary && idx.name == "t_score_unique")
+            .unwrap()
+            .root_page_id
+    };
+
+    run_ctx(
+        "ALTER TABLE t MODIFY COLUMN score BIGINT",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let result = rows(
+        run_ctx(
+            "SELECT id, score FROM t ORDER BY id",
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap(),
+    );
+    assert_eq!(result[0], vec![Value::Int(1), Value::BigInt(100)]);
+    assert_eq!(result[1], vec![Value::Int(2), Value::BigInt(200)]);
+
     let err = run_ctx(
-        "ALTER TABLE t MODIFY COLUMN email INT",
+        "INSERT INTO t VALUES (3, 100)",
         &mut storage,
         &mut txn,
         &mut bloom,
         &mut ctx,
     );
-    assert!(err.is_err(), "modifying type of indexed column must fail");
+    assert!(
+        err.is_err(),
+        "rebuilt UNIQUE index must still enforce duplicates"
+    );
+
+    let snap = txn.snapshot();
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
+    let table = reader.get_table("public", "t").unwrap().unwrap();
+    let unique_index_after = reader
+        .list_indexes(table.id)
+        .unwrap()
+        .into_iter()
+        .find(|idx| !idx.is_primary && idx.name == "t_score_unique")
+        .unwrap();
+    assert_ne!(unique_index_after.root_page_id, unique_root_before);
+    assert!(unique_index_after.is_unique);
+    assert_eq!(unique_index_after.index_type, 0);
+    assert_eq!(unique_index_after.pages_per_range, 128);
 }
 
 #[test]

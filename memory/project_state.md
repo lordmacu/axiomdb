@@ -1,5 +1,32 @@
 # Project State
 
+## 2026-04-09
+
+- Phase 4 subphases `4.22c` and `4.22e` are closed in code, targeted
+  validation, and wire smoke.
+- `crates/axiomdb-sql/src/executor/ddl_alter_constraint.rs` now implements
+  `ALTER TABLE ... ADD PRIMARY KEY (...)` for heap tables:
+  - validates existing rows for `NULL` and duplicate primary-key tuples
+  - creates a provisional unique heap B-tree root for the new PK
+  - flips the PK columns to `NOT NULL` in catalog metadata
+  - reuses the existing heap→clustered rebuild path to promote the table
+  - preserves existing secondary indexes across the clustered promotion
+- `crates/axiomdb-sql/src/executor/ddl_alter_column.rs` now implements indexed
+  `DROP COLUMN` / `MODIFY COLUMN` repair:
+  - rejects PRIMARY KEY / FOREIGN KEY / CHECK-dependent column changes
+  - auto-drops affected secondary indexes on DROP COLUMN
+  - rebuilds the required secondary indexes after heap or clustered row rewrite
+  - preserves index metadata including partial predicates, `INCLUDE` columns,
+    fillfactor, index type, and BRIN `pages_per_range`
+- `crates/axiomdb-catalog/src/writer.rs` now exposes full-definition replacement
+  helpers for index and foreign-key catalog rows so ALTER TABLE can remap column
+  ordinals and swap repaired roots atomically inside the statement transaction.
+- Validation for this closure:
+  - `cargo test --workspace --no-fail-fast`
+  - `cargo clippy --workspace -- -D warnings`
+  - `cargo fmt --check`
+  - `tools/wire-test.py`: `338/338`
+
 ## 2026-04-03
 
 - Phase 39 subphase `39.21` is closed in code, targeted validation, wire smoke, and docs.
