@@ -586,10 +586,25 @@ ALTER TABLE users DROP COLUMN phone IF EXISTS;
 > Dropping a column is permanent. The data stored in that column is discarded
 > when rows are rewritten and cannot be recovered without a backup.
 
-> Dropping a column that is part of a UNIQUE index or a FOREIGN KEY is
-> rejected with an error. Drop the index or constraint first, then drop
-> the column. Dropping a PRIMARY KEY column is not allowed on clustered
-> tables (the PK is the physical storage key).
+Secondary-index behavior:
+
+- secondary indexes that reference the dropped column through key columns,
+  `INCLUDE` columns, or a partial-index predicate are dropped automatically
+- on heap tables, surviving secondary indexes are rebuilt automatically because
+  the row rewrite assigns new physical `RecordId`s
+- dropping a column still fails if it participates in the PRIMARY KEY, a
+  FOREIGN KEY definition, or a CHECK constraint
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Rebuild Heap Survivors</span>
+Heap secondary indexes bookmark physical <code>RecordId</code>s, so any heap row
+rewrite invalidates even unrelated secondary entries. Clustered tables keep
+secondary bookmarks on PRIMARY KEY bytes instead, so AxiomDB only pays the full
+survivor rebuild cost on heap layouts.
+</div>
+</div>
 
 ### Modify Column
 
@@ -616,12 +631,54 @@ ALTER TABLE orders MODIFY COLUMN status TEXT NOT NULL;
 - Narrowing casts (e.g. `BIGINT → INT`, `TEXT → INT`) are applied with strict
   coercion. If any existing value cannot be represented in the new type the
   statement fails and no rows are changed.
-- A column that is part of a secondary index (UNIQUE or otherwise) cannot have
-  its type changed. Drop the index first, modify the column, then recreate the
-  index.
-- The PRIMARY KEY column's type cannot be changed on a clustered table.
+- secondary indexes are repaired automatically after the rewrite:
+  - heap tables rebuild all secondary indexes so their bookmarks stay valid
+  - clustered tables rebuild only indexes whose definition depends on the
+    modified column
+- modifying a PRIMARY KEY, FOREIGN KEY, or CHECK-dependent column is still
+  rejected explicitly
 - Changing nullability from nullable to `NOT NULL` is allowed only when every
   existing row has a non-NULL value for that column.
+
+### Add Primary Key
+
+Promotes an existing heap table to clustered storage by installing a new
+primary key.
+
+```sql
+ALTER TABLE table_name ADD [CONSTRAINT name] PRIMARY KEY (column_name, ...);
+```
+
+```sql
+CREATE TABLE users (id INT, email TEXT);
+INSERT INTO users VALUES (1, 'alice@example.com'), (2, 'bob@example.com');
+
+ALTER TABLE users ADD PRIMARY KEY (id);
+```
+
+Behavior:
+
+- validates that every referenced column exists
+- rejects the ALTER if any existing row has `NULL` in a key column
+- rejects the ALTER if existing rows contain duplicate key tuples
+- marks the primary-key columns as `NOT NULL`
+- rewrites the heap table into clustered storage ordered by the new key
+- rebuilds existing secondary indexes so they store clustered PK bookmarks
+
+This form is supported for heap tables that do not already have a primary key.
+`DROP PRIMARY KEY` and replacing an existing clustered primary key remain
+deferred.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Migration Advantage</span>
+Unlike SQLite-style migration flows that require <code>CREATE TABLE + INSERT + RENAME</code>,
+AxiomDB can promote a populated heap table to clustered storage in one
+<code>ALTER TABLE ... ADD PRIMARY KEY</code> statement while preserving existing
+secondary-index behavior.
+</div>
+</div>
 
 ### Rename Column
 
@@ -705,7 +762,8 @@ The rebuild path follows PostgreSQL <code>CLUSTER</code> and InnoDB sorted-rebui
 The following ALTER TABLE forms are planned for later phases:
 
 - `ADD CONSTRAINT` / `DROP CONSTRAINT` for multi-column foreign keys
-- Dropping or modifying a column that participates in a secondary index (drop the index first)
+- `DROP PRIMARY KEY` / replacing one primary key with another
+- dropping or modifying a PRIMARY KEY / FOREIGN KEY / CHECK-dependent column
 - Non-blocking `ALTER TABLE` (zero-downtime schema migration via shadow table + WAL delta)
 
 ---

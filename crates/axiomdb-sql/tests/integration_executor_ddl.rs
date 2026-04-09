@@ -2,11 +2,27 @@
 
 mod common;
 
+use axiomdb_catalog::{CatalogReader, TableStorageLayout};
 use axiomdb_core::error::DbError;
 use axiomdb_sql::QueryResult;
 use axiomdb_types::Value;
 
 use common::*;
+
+fn table_and_indexes(
+    storage: &mut axiomdb_storage::MemoryStorage,
+    txn: &axiomdb_wal::TxnManager,
+    name: &str,
+) -> (axiomdb_catalog::TableDef, Vec<axiomdb_catalog::IndexDef>) {
+    let snap = txn.snapshot();
+    let mut reader = CatalogReader::new(storage, snap).expect("catalog reader");
+    let table = reader
+        .get_table("public", name)
+        .expect("get table")
+        .expect("table exists");
+    let indexes = reader.list_indexes(table.id).expect("list indexes");
+    (table, indexes)
+}
 
 // ── 4.20: SHOW TABLES / SHOW COLUMNS / DESCRIBE ──────────────────────────────
 
@@ -336,6 +352,247 @@ fn test_alter_drop_column_if_exists_nonexistent() {
 }
 
 #[test]
+fn test_alter_drop_column_auto_drops_partial_index_on_heap() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE users (id INT, email TEXT, deleted_at INT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE UNIQUE INDEX uq_email_live ON users (email) WHERE deleted_at IS NULL",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO users VALUES (1, 'alice@example.com', NULL)",
+        &mut storage,
+        &mut txn,
+    );
+
+    run(
+        "ALTER TABLE users DROP COLUMN deleted_at",
+        &mut storage,
+        &mut txn,
+    );
+
+    let (_, indexes) = table_and_indexes(&mut storage, &txn, "users");
+    assert!(!indexes.iter().any(|idx| idx.name == "uq_email_live"));
+
+    run(
+        "INSERT INTO users VALUES (2, 'alice@example.com')",
+        &mut storage,
+        &mut txn,
+    );
+    let r = rows(run(
+        "SELECT id, email FROM users ORDER BY id",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 2);
+}
+
+#[test]
+fn test_alter_drop_column_heap_rebuilds_surviving_indexes_and_remaps_metadata() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (pad INT, id INT, email TEXT, note TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE UNIQUE INDEX idx_email ON t (email)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE INDEX idx_id_cover ON t (id) INCLUDE (note) WITH (fillfactor = 77)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES (9, 1, 'a@example.com', 'one')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES (8, 2, 'b@example.com', 'two')",
+        &mut storage,
+        &mut txn,
+    );
+
+    let (_, indexes_before) = table_and_indexes(&mut storage, &txn, "t");
+    let idx_email_before = indexes_before
+        .iter()
+        .find(|idx| idx.name == "idx_email")
+        .unwrap()
+        .root_page_id;
+    let idx_cover_before = indexes_before
+        .iter()
+        .find(|idx| idx.name == "idx_id_cover")
+        .unwrap()
+        .root_page_id;
+
+    run("ALTER TABLE t DROP COLUMN pad", &mut storage, &mut txn);
+
+    let err = run_result(
+        "INSERT INTO t VALUES (3, 'a@example.com', 'dup')",
+        &mut storage,
+        &mut txn,
+    );
+    assert!(matches!(err, Err(DbError::UniqueViolation { .. })));
+
+    let r = rows(run(
+        "SELECT id, email, note FROM t ORDER BY id",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(
+        r,
+        vec![
+            vec![
+                Value::Int(1),
+                Value::Text("a@example.com".into()),
+                Value::Text("one".into()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Text("b@example.com".into()),
+                Value::Text("two".into()),
+            ],
+        ]
+    );
+
+    let (_, indexes_after) = table_and_indexes(&mut storage, &txn, "t");
+    let idx_email_after = indexes_after
+        .iter()
+        .find(|idx| idx.name == "idx_email")
+        .unwrap();
+    let idx_cover_after = indexes_after
+        .iter()
+        .find(|idx| idx.name == "idx_id_cover")
+        .unwrap();
+    assert_ne!(idx_email_after.root_page_id, idx_email_before);
+    assert_ne!(idx_cover_after.root_page_id, idx_cover_before);
+    assert_eq!(idx_cover_after.fillfactor, 77);
+    assert_eq!(idx_cover_after.columns.len(), 1);
+    assert_eq!(idx_cover_after.columns[0].col_idx, 0);
+    assert_eq!(idx_cover_after.include_columns, vec![2]);
+}
+
+#[test]
+fn test_alter_modify_column_heap_rebuilds_unique_index_and_preserves_metadata() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT, score INT)", &mut storage, &mut txn);
+    run(
+        "CREATE UNIQUE INDEX uq_score ON t (score) WITH (fillfactor = 80)",
+        &mut storage,
+        &mut txn,
+    );
+    run("INSERT INTO t VALUES (1, 100)", &mut storage, &mut txn);
+    run("INSERT INTO t VALUES (2, 200)", &mut storage, &mut txn);
+
+    let (_, indexes_before) = table_and_indexes(&mut storage, &txn, "t");
+    let uq_before = indexes_before
+        .iter()
+        .find(|idx| idx.name == "uq_score")
+        .unwrap()
+        .root_page_id;
+
+    run(
+        "ALTER TABLE t MODIFY COLUMN score BIGINT",
+        &mut storage,
+        &mut txn,
+    );
+
+    let r = rows(run(
+        "SELECT id, score FROM t ORDER BY id",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Int(1), Value::BigInt(100)],
+            vec![Value::Int(2), Value::BigInt(200)],
+        ]
+    );
+
+    let err = run_result("INSERT INTO t VALUES (3, 100)", &mut storage, &mut txn);
+    assert!(
+        matches!(
+            err,
+            Err(DbError::UniqueViolation { .. }) | Err(DbError::DuplicateKey)
+        ),
+        "{err:?}"
+    );
+
+    let (_, indexes_after) = table_and_indexes(&mut storage, &txn, "t");
+    let uq_after = indexes_after
+        .iter()
+        .find(|idx| idx.name == "uq_score")
+        .unwrap();
+    assert_ne!(uq_after.root_page_id, uq_before);
+    assert!(uq_after.is_unique);
+    assert_eq!(uq_after.fillfactor, 80);
+    assert_eq!(uq_after.index_type, 0);
+    assert_eq!(uq_after.pages_per_range, 128);
+}
+
+#[test]
+fn test_alter_drop_column_rejects_primary_key_dependency() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT PRIMARY KEY, email TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let err = run_result("ALTER TABLE t DROP COLUMN id", &mut storage, &mut txn);
+    assert!(matches!(err, Err(DbError::InvalidValue { .. })));
+}
+
+#[test]
+fn test_alter_drop_column_rejects_foreign_key_dependency() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE parent (id INT PRIMARY KEY)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id))",
+        &mut storage,
+        &mut txn,
+    );
+
+    let err = run_result(
+        "ALTER TABLE child DROP COLUMN parent_id",
+        &mut storage,
+        &mut txn,
+    );
+    assert!(matches!(err, Err(DbError::InvalidValue { .. })));
+}
+
+#[test]
+fn test_alter_modify_column_rejects_check_dependency() {
+    let (mut storage, mut txn) = setup();
+    run("CREATE TABLE t (id INT, age INT)", &mut storage, &mut txn);
+    run(
+        "ALTER TABLE t ADD CONSTRAINT ck_age_nonnegative CHECK (age >= 0)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let err = run_result(
+        "ALTER TABLE t MODIFY COLUMN age BIGINT",
+        &mut storage,
+        &mut txn,
+    );
+    assert!(matches!(err, Err(DbError::InvalidValue { .. })));
+}
+
+#[test]
 fn test_alter_rename_column() {
     let (mut storage, mut txn) = setup();
     run("CREATE TABLE t (id INT, name TEXT)", &mut storage, &mut txn);
@@ -384,6 +641,181 @@ fn test_alter_rename_column_to_existing_name() {
         &mut txn,
     );
     assert!(matches!(err, Err(DbError::ColumnAlreadyExists { .. })));
+}
+
+#[test]
+fn test_alter_add_primary_key_clusters_heap_table() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT, email TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES (1, 'alice@example.com'), (2, 'bob@example.com')",
+        &mut storage,
+        &mut txn,
+    );
+
+    let result = run("ALTER TABLE t ADD PRIMARY KEY (id)", &mut storage, &mut txn);
+    assert_eq!(affected_count(result), 2);
+
+    let describe = rows(run("DESCRIBE t", &mut storage, &mut txn));
+    assert_eq!(describe[0][0], Value::Text("id".into()));
+    assert_eq!(describe[0][2], Value::Text("NO".into()));
+
+    let (table, indexes) = table_and_indexes(&mut storage, &txn, "t");
+    assert_eq!(table.storage_layout, TableStorageLayout::Clustered);
+    assert!(indexes.iter().any(|idx| idx.is_primary));
+
+    let r = rows(run(
+        "SELECT id, email FROM t ORDER BY id",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(r.len(), 2);
+    assert_eq!(
+        r[0],
+        vec![Value::Int(1), Value::Text("alice@example.com".into())]
+    );
+    assert_eq!(
+        r[1],
+        vec![Value::Int(2), Value::Text("bob@example.com".into())]
+    );
+}
+
+#[test]
+fn test_alter_add_primary_key_preserves_secondary_indexes() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT, email TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES (1, 'alice@example.com'), (2, 'bob@example.com')",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "CREATE UNIQUE INDEX idx_email ON t (email)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let result = run("ALTER TABLE t ADD PRIMARY KEY (id)", &mut storage, &mut txn);
+    assert_eq!(affected_count(result), 2);
+
+    let err = run_result(
+        "INSERT INTO t VALUES (3, 'alice@example.com')",
+        &mut storage,
+        &mut txn,
+    );
+    assert!(matches!(err, Err(DbError::UniqueViolation { .. })));
+
+    let (_, indexes) = table_and_indexes(&mut storage, &txn, "t");
+    assert!(indexes.iter().any(|idx| idx.is_primary));
+    assert!(indexes
+        .iter()
+        .any(|idx| !idx.is_primary && idx.name == "idx_email"));
+}
+
+#[test]
+fn test_alter_add_primary_key_rejects_null_existing_values() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT, email TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES (1, 'alice@example.com'), (NULL, 'bob@example.com')",
+        &mut storage,
+        &mut txn,
+    );
+
+    let err = run_result("ALTER TABLE t ADD PRIMARY KEY (id)", &mut storage, &mut txn);
+    assert!(matches!(err, Err(DbError::InvalidValue { .. })));
+
+    let (table, indexes) = table_and_indexes(&mut storage, &txn, "t");
+    assert_eq!(table.storage_layout, TableStorageLayout::Heap);
+    assert!(!indexes.iter().any(|idx| idx.is_primary));
+
+    let describe = rows(run("DESCRIBE t", &mut storage, &mut txn));
+    assert_eq!(describe[0][2], Value::Text("YES".into()));
+}
+
+#[test]
+fn test_alter_add_primary_key_rejects_duplicates() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT, email TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES (1, 'alice@example.com'), (1, 'bob@example.com')",
+        &mut storage,
+        &mut txn,
+    );
+
+    let err = run_result("ALTER TABLE t ADD PRIMARY KEY (id)", &mut storage, &mut txn);
+    assert!(matches!(err, Err(DbError::UniqueViolation { .. })));
+
+    let (table, indexes) = table_and_indexes(&mut storage, &txn, "t");
+    assert_eq!(table.storage_layout, TableStorageLayout::Heap);
+    assert!(!indexes.iter().any(|idx| idx.is_primary));
+}
+
+#[test]
+fn test_alter_add_primary_key_empty_table() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (id INT, email TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+
+    let result = run("ALTER TABLE t ADD PRIMARY KEY (id)", &mut storage, &mut txn);
+    assert_eq!(affected_count(result), 0);
+
+    let (table, indexes) = table_and_indexes(&mut storage, &txn, "t");
+    assert_eq!(table.storage_layout, TableStorageLayout::Clustered);
+    assert!(indexes.iter().any(|idx| idx.is_primary));
+}
+
+#[test]
+fn test_alter_add_primary_key_composite_key() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE t (a INT, b INT, val TEXT)",
+        &mut storage,
+        &mut txn,
+    );
+    run(
+        "INSERT INTO t VALUES (1, 2, 'x'), (1, 1, 'y')",
+        &mut storage,
+        &mut txn,
+    );
+
+    let result = run(
+        "ALTER TABLE t ADD PRIMARY KEY (a, b)",
+        &mut storage,
+        &mut txn,
+    );
+    assert_eq!(affected_count(result), 2);
+
+    let describe = rows(run("DESCRIBE t", &mut storage, &mut txn));
+    assert_eq!(describe[0][2], Value::Text("NO".into()));
+    assert_eq!(describe[1][2], Value::Text("NO".into()));
+
+    let (table, indexes) = table_and_indexes(&mut storage, &txn, "t");
+    assert_eq!(table.storage_layout, TableStorageLayout::Clustered);
+    let pk = indexes
+        .into_iter()
+        .find(|idx| idx.is_primary)
+        .expect("primary index exists");
+    assert_eq!(pk.columns.len(), 2);
 }
 
 #[test]
