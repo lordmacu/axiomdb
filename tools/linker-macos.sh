@@ -2,6 +2,9 @@
 # Wrapper linker for macOS 26 beta: strips com.apple.provenance xattr from
 # compiled binaries so syspolicyd does not block test execution.
 # Remove this wrapper once Apple fixes the beta security daemon behaviour.
+#
+# Also uses LLVM's ld64.lld linker (3-5x faster than Apple's default ld) if
+# available. Install via `brew install llvm` (keg-only path).
 
 # Find the output file from linker args (-o <path>)
 OUTPUT=""
@@ -13,8 +16,13 @@ for arg in "$@"; do
     PREV="$arg"
 done
 
-# Run the real linker
-cc "$@"
+# Run the real linker — prefer lld if available for faster link times.
+LLD_PATH="/opt/homebrew/opt/llvm/bin/ld64.lld"
+if [[ -x "$LLD_PATH" ]]; then
+    cc -fuse-ld="$LLD_PATH" "$@"
+else
+    cc "$@"
+fi
 STATUS=$?
 
 # Strip provenance xattr if compilation succeeded
