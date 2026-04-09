@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+
 use axiomdb_core::error::DbError;
 use axiomdb_types::{
     coerce::{coerce, CoercionMode},
@@ -260,6 +263,79 @@ pub fn eval_in_session(
 
 /// Evaluates `expr` against `row` using `sq` for subqueries, with the given
 /// session collation for text comparisons.
+// ── HashableValue — wraps Value for use in HashSet (IN subquery optimization) ─
+
+/// Thin newtype enabling `Hash` for `Value` so that `IN (SELECT …)` can build a
+/// `HashSet` for O(1) membership tests instead of O(n) linear scans.
+///
+/// `f64` is hashed via its IEEE-754 bit pattern; NaN is forbidden in AxiomDB
+/// values so collisions from NaN bit patterns are not a concern.
+#[derive(Clone, Debug)]
+pub(crate) struct HashableValue(pub(crate) Value);
+
+impl PartialEq for HashableValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for HashableValue {}
+
+impl Hash for HashableValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(&self.0).hash(state);
+        match &self.0 {
+            Value::Null => {}
+            Value::Bool(b) => b.hash(state),
+            Value::Int(i) => i.hash(state),
+            Value::BigInt(i) => i.hash(state),
+            Value::Real(f) => f.to_bits().hash(state),
+            Value::Decimal(m, s) => {
+                m.hash(state);
+                s.hash(state);
+            }
+            Value::Text(s) => s.hash(state),
+            Value::Bytes(b) => b.hash(state),
+            Value::Date(d) => d.hash(state),
+            Value::Timestamp(t) => t.hash(state),
+            Value::Uuid(u) => u.hash(state),
+        }
+    }
+}
+
+/// Pre-materialized result of an uncorrelated `IN (SELECT …)` subquery.
+///
+/// Built once from the `QueryResult`, then probed per outer row in O(1).
+pub(crate) struct InSubquerySet {
+    values: HashSet<HashableValue>,
+    has_null: bool,
+}
+
+impl InSubquerySet {
+    pub(crate) fn from_query_result(result: QueryResult) -> Self {
+        let rows = match result {
+            QueryResult::Rows { rows, .. } => rows,
+            _ => vec![],
+        };
+        let mut values = HashSet::with_capacity(rows.len());
+        let mut has_null = false;
+        for row in rows {
+            let v = row.into_iter().next().unwrap_or(Value::Null);
+            if matches!(v, Value::Null) {
+                has_null = true;
+            } else {
+                values.insert(HashableValue(v));
+            }
+        }
+        Self { values, has_null }
+    }
+
+    pub(crate) fn contains(&self, val: &Value) -> (bool, bool) {
+        let found = self.values.contains(&HashableValue(val.clone()));
+        (found, self.has_null)
+    }
+}
+
 pub fn eval_with_in_session<R: SubqueryRunner>(
     expr: &Expr,
     row: &[Value],
@@ -500,24 +576,7 @@ pub fn eval_with<R: SubqueryRunner>(
             if matches!(left, Value::Null) {
                 return Ok(Value::Null);
             }
-            let result = sq.run(query)?;
-            let subquery_rows = match result {
-                QueryResult::Rows { rows, .. } => rows,
-                _ => vec![],
-            };
-            let mut found = false;
-            let mut has_null = false;
-            for sq_row in &subquery_rows {
-                let v = sq_row.first().cloned().unwrap_or(Value::Null);
-                match v {
-                    Value::Null => has_null = true,
-                    ref iv if *iv == left => {
-                        found = true;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
+            let (found, has_null) = sq.run_in_check(query, &left)?;
             let raw = if found {
                 Value::Bool(true)
             } else if has_null {

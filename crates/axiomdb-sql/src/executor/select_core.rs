@@ -17,6 +17,8 @@ fn execute_select(
             bloom: &temp_bloom,
             ctx: &mut temp_ctx,
             outer_row: &[],
+            cache: None,
+            in_set_cache: None,
         };
         let mut out_row: Row = Vec::new();
         let mut out_cols: Vec<ColumnMeta> = Vec::new();
@@ -246,48 +248,77 @@ fn execute_select(
             }
         };
 
-        let mut combined_rows: Vec<Row> = Vec::new();
-        for (_rid, values) in raw_rows {
-            if let Some(ref wc) = stmt.where_clause {
-                let mut temp_ctx = SessionContext::new();
-                let temp_bloom = crate::bloom::BloomRegistry::new();
-                let mut runner = ExecSubqueryRunner {
-                    storage,
-                    txn,
-                    bloom: &temp_bloom,
-                    ctx: &mut temp_ctx,
-                    outer_row: &values,
-                };
-                if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
-                    continue;
+        // ── EXISTS decorrelation fast-path (Phase 9 optimization) ────────────
+        // Before entering the per-row WHERE loop, check if the WHERE clause is
+        // a simple correlated EXISTS that can be decorrelated into a hash
+        // semi-join. This turns O(n × cost(inner)) into O(n + m).
+        // Inspired by PostgreSQL's hash semi-join and DataFusion's
+        // decorrelate_predicate_subquery optimizer pass.
+        let mut combined_rows: Vec<Row> = if let Some(ref wc) = stmt.where_clause {
+            if let Some(decorr) = try_extract_exists_decorrelation(wc) {
+                apply_exists_semijoin(raw_rows, &decorr, storage, txn)?
+            } else {
+                // Fall back to per-row evaluation.
+                let mut rows = Vec::new();
+                let mut sq_cache: SubqueryCache = HashMap::new();
+                let mut in_set_cache: InSetCache = HashMap::new();
+                for (_rid, values) in raw_rows {
+                    let mut temp_ctx = SessionContext::new();
+                    let temp_bloom = crate::bloom::BloomRegistry::new();
+                    let mut runner = ExecSubqueryRunner {
+                        storage,
+                        txn,
+                        bloom: &temp_bloom,
+                        ctx: &mut temp_ctx,
+                        outer_row: &values,
+                        cache: Some(&mut sq_cache),
+                        in_set_cache: Some(&mut in_set_cache),
+                    };
+                    if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
+                        continue;
+                    }
+                    rows.push(values);
                 }
+                rows
             }
-            combined_rows.push(values);
-        }
+        } else {
+            raw_rows.into_iter().map(|(_rid, v)| v).collect()
+        };
 
         if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
             return execute_select_grouped(stmt, combined_rows, GroupByStrategy::Hash);
         }
 
         let resolved_ob = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
-        combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
+        // Top-N optimization: if ORDER BY + LIMIT, use partial sort (O(n log k))
+        // instead of full sort (O(n log n)). Inspired by PostgreSQL's bounded
+        // heapsort and DuckDB's TopN physical operator.
+        if !resolved_ob.is_empty() && stmt.limit.is_some() && !stmt.distinct {
+            let (limit_n, offset_n) = eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
+            let top_n = offset_n + limit_n.unwrap_or(usize::MAX).min(usize::MAX - offset_n);
+            combined_rows = apply_order_by_top_n(combined_rows, &resolved_ob, top_n)?;
+        } else {
+            combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
+        }
 
         let out_cols = build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
-        let mut rows = combined_rows
-            .iter()
-            .map(|v| {
-                let mut temp_ctx = SessionContext::new();
-                let temp_bloom = crate::bloom::BloomRegistry::new();
-                let mut runner = ExecSubqueryRunner {
-                    storage,
-                    txn,
-                    bloom: &temp_bloom,
-                    ctx: &mut temp_ctx,
-                    outer_row: v,
-                };
-                project_row_with(&stmt.columns, v, &mut runner)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut rows: Vec<Row> = Vec::with_capacity(combined_rows.len());
+        let mut proj_cache: SubqueryCache = HashMap::new();
+        let mut proj_in_set_cache: InSetCache = HashMap::new();
+        for v in &combined_rows {
+            let mut temp_ctx = SessionContext::new();
+            let temp_bloom = crate::bloom::BloomRegistry::new();
+            let mut runner = ExecSubqueryRunner {
+                storage,
+                txn,
+                bloom: &temp_bloom,
+                ctx: &mut temp_ctx,
+                outer_row: v,
+                cache: Some(&mut proj_cache),
+                in_set_cache: Some(&mut proj_in_set_cache),
+            };
+            rows.push(project_row_with(&stmt.columns, v, &mut runner)?);
+        }
 
         if stmt.distinct {
             rows = apply_distinct_with_session(rows);
@@ -338,6 +369,8 @@ fn execute_select_derived(
 
     // Apply outer WHERE.
     let mut combined_rows: Vec<Row> = Vec::new();
+    let mut sq_cache_derived: SubqueryCache = HashMap::new();
+    let mut in_set_cache_derived: InSetCache = HashMap::new();
     for values in derived_rows {
         if let Some(ref wc) = stmt.where_clause {
             let mut temp_ctx2 = SessionContext::new();
@@ -348,6 +381,8 @@ fn execute_select_derived(
                 bloom: &temp_bloom2,
                 ctx: &mut temp_ctx2,
                 outer_row: &values,
+                cache: Some(&mut sq_cache_derived),
+                in_set_cache: Some(&mut in_set_cache_derived),
             };
             if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
                 continue;

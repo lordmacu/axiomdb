@@ -67,6 +67,124 @@ pub fn execute_snapshot(txn: &axiomdb_wal::TxnManager) -> axiomdb_core::Transact
     })
 }
 
+// ── Subquery materialization cache ────────────────────────────────────────────
+
+/// Cache for uncorrelated subquery results.
+///
+/// When a subquery contains no `OuterColumn` references, its result is identical
+/// for every outer row. We materialize it once and reuse the result, turning
+/// O(n × cost(inner)) into O(n + cost(inner)).
+///
+/// Keyed by the pointer address of the `SelectStmt` AST node, which is stable
+/// within a single query evaluation (the AST lives on the heap and is not moved).
+type SubqueryCache = HashMap<usize, QueryResult>;
+
+/// Cached `InSubquerySet` for O(1) membership tests in `IN (SELECT …)`.
+///
+/// Keyed identically to `SubqueryCache` (AST pointer address). Built once on
+/// first access, then reused for all subsequent outer rows.
+type InSetCache = HashMap<usize, InSubquerySet>;
+
+/// Returns `true` if the expression tree contains any `Expr::OuterColumn` node,
+/// meaning the subquery is correlated with an enclosing scope.
+fn expr_has_outer_ref(expr: &Expr) -> bool {
+    match expr {
+        Expr::OuterColumn { .. } => true,
+        Expr::UnaryOp { operand, .. } => expr_has_outer_ref(operand),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_outer_ref(left) || expr_has_outer_ref(right)
+        }
+        Expr::IsNull { expr, .. } => expr_has_outer_ref(expr),
+        Expr::IsBoolean { expr, .. } => expr_has_outer_ref(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_outer_ref(expr) || expr_has_outer_ref(low) || expr_has_outer_ref(high),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_has_outer_ref(expr)
+                || expr_has_outer_ref(pattern)
+                || escape.as_ref().map_or(false, |e| expr_has_outer_ref(e))
+        }
+        Expr::In { expr, list, .. } => {
+            expr_has_outer_ref(expr) || list.iter().any(expr_has_outer_ref)
+        }
+        Expr::Function { args, .. } => args.iter().any(expr_has_outer_ref),
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+            ..
+        } => {
+            operand.as_ref().map_or(false, |e| expr_has_outer_ref(e))
+                || when_thens
+                    .iter()
+                    .any(|(w, t)| expr_has_outer_ref(w) || expr_has_outer_ref(t))
+                || else_result
+                    .as_ref()
+                    .map_or(false, |e| expr_has_outer_ref(e))
+        }
+        Expr::Cast { expr, .. } => expr_has_outer_ref(expr),
+        Expr::Subquery(inner) => stmt_has_outer_ref(inner),
+        Expr::InSubquery { expr, query, .. } => {
+            expr_has_outer_ref(expr) || stmt_has_outer_ref(query)
+        }
+        Expr::Exists { query, .. } => stmt_has_outer_ref(query),
+        Expr::GroupConcat {
+            expr, order_by, ..
+        } => {
+            expr_has_outer_ref(expr)
+                || order_by.iter().any(|(e, _)| expr_has_outer_ref(e))
+        }
+        // Leaves: Literal, Column, Default, Param — no outer refs.
+        _ => false,
+    }
+}
+
+/// Returns `true` if the `SelectStmt` references any `OuterColumn` anywhere.
+fn stmt_has_outer_ref(stmt: &SelectStmt) -> bool {
+    // Check columns (SELECT list).
+    for item in &stmt.columns {
+        if let SelectItem::Expr { expr, .. } = item {
+            if expr_has_outer_ref(expr) {
+                return true;
+            }
+        }
+    }
+    // WHERE clause.
+    if let Some(ref wc) = stmt.where_clause {
+        if expr_has_outer_ref(wc) {
+            return true;
+        }
+    }
+    // HAVING clause.
+    if let Some(ref h) = stmt.having {
+        if expr_has_outer_ref(h) {
+            return true;
+        }
+    }
+    // GROUP BY expressions.
+    if stmt.group_by.iter().any(expr_has_outer_ref) {
+        return true;
+    }
+    // ORDER BY expressions.
+    if stmt.order_by.iter().any(|ob| expr_has_outer_ref(&ob.expr)) {
+        return true;
+    }
+    // JOIN conditions.
+    for join in &stmt.joins {
+        if let JoinCondition::On(ref e) = join.condition {
+            if expr_has_outer_ref(e) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // ── Subquery execution support ────────────────────────────────────────────────
 
 /// Walks a `SelectStmt` AST and substitutes every `Expr::OuterColumn { col_idx }`
@@ -232,23 +350,344 @@ fn subst_expr(expr: Expr, outer_row: &[Value]) -> Expr {
 /// substituting outer-row references before running.
 ///
 /// Holds shared refs to `storage`, `txn`, and `bloom`, a mutable ref to `ctx`,
-/// plus the current outer row for `substitute_outer`. Created fresh for each outer row.
+/// plus the current outer row for `substitute_outer`.
+///
+/// An optional `&mut SubqueryCache` enables materialization of uncorrelated
+/// subqueries: when a `SelectStmt` contains no `OuterColumn` references, the
+/// result is cached on first execution and reused for subsequent outer rows.
+/// This turns O(n × cost(inner)) into O(n + cost(inner)).
 struct ExecSubqueryRunner<'a> {
     storage: &'a dyn StorageEngine,
     txn: &'a TxnManager,
     bloom: &'a crate::bloom::BloomRegistry,
     ctx: &'a mut SessionContext,
     outer_row: &'a [Value],
+    cache: Option<&'a mut SubqueryCache>,
+    in_set_cache: Option<&'a mut InSetCache>,
 }
 
 impl<'a> SubqueryRunner for ExecSubqueryRunner<'a> {
     fn run(&mut self, stmt: &SelectStmt) -> Result<QueryResult, DbError> {
+        // Fast path: if the subquery is uncorrelated (no OuterColumn refs),
+        // check the cache before executing.
+        let cache_key = std::ptr::from_ref(stmt) as usize;
+        let is_uncorrelated = !stmt_has_outer_ref(stmt);
+
+        if is_uncorrelated {
+            if let Some(ref cache) = self.cache {
+                if let Some(cached) = cache.get(&cache_key) {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
         let bound = substitute_outer(stmt.clone(), self.outer_row);
         let exec_ctx = ExecutionContext::new(self.storage, self.txn, self.bloom);
         let conn = self.ctx.conn_txn.take();
         let r = execute_select_ctx(bound, &exec_ctx, conn.as_ref(), self.ctx);
         self.ctx.conn_txn = conn;
-        r
+
+        let result = r?;
+
+        // Store in cache for reuse by subsequent outer rows.
+        if is_uncorrelated {
+            if let Some(ref mut cache) = self.cache {
+                cache.insert(cache_key, result.clone());
+            }
+        }
+
+        Ok(result)
     }
+
+    fn run_in_check(
+        &mut self,
+        stmt: &SelectStmt,
+        needle: &Value,
+    ) -> Result<(bool, bool), DbError> {
+        let cache_key = std::ptr::from_ref(stmt) as usize;
+        let is_uncorrelated = !stmt_has_outer_ref(stmt);
+
+        // Fast path: probe cached HashSet in O(1).
+        if is_uncorrelated {
+            if let Some(ref in_set_cache) = self.in_set_cache {
+                if let Some(set) = in_set_cache.get(&cache_key) {
+                    return Ok(set.contains(needle));
+                }
+            }
+        }
+
+        // Execute the subquery.
+        let result = self.run(stmt)?;
+
+        if is_uncorrelated {
+            // Build a HashSet for O(1) lookups on subsequent outer rows.
+            let set = InSubquerySet::from_query_result(result);
+            let answer = set.contains(needle);
+            if let Some(ref mut in_set_cache) = self.in_set_cache {
+                in_set_cache.insert(cache_key, set);
+            }
+            Ok(answer)
+        } else {
+            // Correlated: linear scan (result changes per outer row).
+            let rows = match result {
+                QueryResult::Rows { rows, .. } => rows,
+                _ => return Ok((false, false)),
+            };
+            let mut found = false;
+            let mut has_null = false;
+            for row in &rows {
+                let v = row.first().cloned().unwrap_or(Value::Null);
+                match v {
+                    Value::Null => has_null = true,
+                    ref iv if *iv == *needle => {
+                        found = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            Ok((found, has_null))
+        }
+    }
+}
+
+// ── EXISTS decorrelation to hash semi-join ────────────────────────────────────
+//
+// Inspired by PostgreSQL's InitPlan + hash semi-join (subselect.c) and
+// DataFusion's `decorrelate_predicate_subquery.rs` which rewrites
+// `WHERE EXISTS (SELECT ... FROM t WHERE t.col = outer.col AND ...)` into a
+// LEFT SEMI JOIN.
+//
+// We implement a lightweight version at the executor level: before entering the
+// per-row WHERE evaluation loop, we detect the EXISTS pattern, execute the inner
+// query once, build a HashSet of the join key values, and then filter the outer
+// rows with O(1) probes.
+//
+// This turns O(n × cost(inner)) into O(n + m) where m = inner table rows.
+
+/// Result of analyzing a WHERE clause for EXISTS decorrelation.
+struct ExistsDecorrelation {
+    /// Column index in the outer row used as the equijoin key.
+    outer_col_idx: usize,
+    /// Column index in the inner table used as the equijoin key.
+    inner_col_idx: usize,
+    /// The inner `SelectStmt` with OuterColumn replaced by a plain Column
+    /// so it can be executed standalone (the equijoin predicate is removed).
+    inner_stmt: SelectStmt,
+    /// Additional non-correlated filter predicates (e.g., `o.amount > 80`).
+    /// Already embedded in `inner_stmt.where_clause`.
+    negated: bool,
+}
+
+/// Tries to extract an EXISTS decorrelation from the WHERE clause.
+///
+/// Matches the pattern:
+/// ```sql
+/// WHERE [NOT] EXISTS (
+///   SELECT ... FROM <table>
+///   WHERE <inner_col> = OuterColumn(<idx>) [AND <extra_filters>]
+/// )
+/// ```
+///
+/// Returns `None` if the pattern doesn't match (falls back to per-row eval).
+fn try_extract_exists_decorrelation(wc: &Expr) -> Option<ExistsDecorrelation> {
+    let (query, negated) = match wc {
+        Expr::Exists { query, negated } => (query, *negated),
+        _ => return None,
+    };
+
+    // Must have a FROM clause (single table, no joins in the subquery itself).
+    if query.from.is_none() || !query.joins.is_empty() {
+        return None;
+    }
+
+    // Must have a WHERE clause with correlation.
+    let inner_where = query.where_clause.as_ref()?;
+
+    // Split WHERE into conjuncts (AND-separated predicates).
+    let conjuncts = split_and_conjuncts(inner_where);
+
+    // Find exactly one conjunct that is an equijoin with OuterColumn.
+    let mut outer_col_idx = None;
+    let mut inner_col_idx = None;
+    let mut non_correlated: Vec<Expr> = Vec::new();
+
+    for conj in &conjuncts {
+        if let Some((oc, ic)) = extract_equijoin_outer_inner(conj) {
+            if outer_col_idx.is_some() {
+                // Multiple equijoin conditions — too complex, bail out.
+                return None;
+            }
+            outer_col_idx = Some(oc);
+            inner_col_idx = Some(ic);
+        } else if expr_has_outer_ref(conj) {
+            // Non-equijoin correlation — can't decorrelate with hash semi-join.
+            return None;
+        } else {
+            non_correlated.push(conj.clone());
+        }
+    }
+
+    let outer_col_idx = outer_col_idx?;
+    let inner_col_idx = inner_col_idx?;
+
+    // Build a standalone inner statement without the correlated predicate.
+    let mut inner_stmt = query.as_ref().clone();
+    inner_stmt.where_clause = if non_correlated.is_empty() {
+        None
+    } else {
+        Some(rebuild_and_conjunction(non_correlated))
+    };
+    // Rewrite SELECT list to include the join key column.
+    // We need the inner_col_idx value in the result to build the HashSet.
+    inner_stmt.columns = vec![SelectItem::Wildcard];
+    // Remove ORDER BY / LIMIT (irrelevant for semi-join).
+    inner_stmt.order_by.clear();
+    inner_stmt.limit = None;
+    inner_stmt.offset = None;
+
+    Some(ExistsDecorrelation {
+        outer_col_idx,
+        inner_col_idx,
+        inner_stmt,
+        negated,
+    })
+}
+
+/// Extracts an equijoin predicate between an `OuterColumn` and an inner `Column`.
+///
+/// Returns `(outer_col_idx, inner_col_idx)` if the expression is:
+/// - `Column(inner) = OuterColumn(outer)` or
+/// - `OuterColumn(outer) = Column(inner)`
+fn extract_equijoin_outer_inner(expr: &Expr) -> Option<(usize, usize)> {
+    if let Expr::BinaryOp {
+        op: BinaryOp::Eq,
+        left,
+        right,
+    } = expr
+    {
+        match (left.as_ref(), right.as_ref()) {
+            (
+                Expr::OuterColumn { col_idx: oc, .. },
+                Expr::Column { col_idx: ic, .. },
+            ) => Some((*oc, *ic)),
+            (
+                Expr::Column { col_idx: ic, .. },
+                Expr::OuterColumn { col_idx: oc, .. },
+            ) => Some((*oc, *ic)),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// Splits an expression tree on AND boundaries into individual conjuncts.
+fn split_and_conjuncts(expr: &Expr) -> Vec<Expr> {
+    let mut out = Vec::new();
+    split_and_conjuncts_inner(expr, &mut out);
+    out
+}
+
+fn split_and_conjuncts_inner(expr: &Expr, out: &mut Vec<Expr>) {
+    if let Expr::BinaryOp {
+        op: BinaryOp::And,
+        left,
+        right,
+    } = expr
+    {
+        split_and_conjuncts_inner(left, out);
+        split_and_conjuncts_inner(right, out);
+    } else {
+        out.push(expr.clone());
+    }
+}
+
+/// Rebuilds a conjunction (AND chain) from a list of expressions.
+fn rebuild_and_conjunction(mut exprs: Vec<Expr>) -> Expr {
+    assert!(!exprs.is_empty());
+    let mut result = exprs.pop().unwrap();
+    while let Some(e) = exprs.pop() {
+        result = Expr::BinaryOp {
+            op: BinaryOp::And,
+            left: Box::new(e),
+            right: Box::new(result),
+        };
+    }
+    result
+}
+
+/// Executes the EXISTS decorrelation as a hash semi-join.
+///
+/// 1. Executes the inner query once (standalone, no outer refs).
+/// 2. Builds a HashSet of the inner join key values.
+/// 3. Filters outer rows by probing the HashSet.
+///
+/// O(n + m) instead of O(n × m).
+fn apply_exists_semijoin(
+    outer_rows: Vec<(RecordId, Row)>,
+    decorr: &ExistsDecorrelation,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+) -> Result<Vec<Row>, DbError> {
+    // Execute inner query once.
+    let mut temp_ctx = SessionContext::new();
+    let temp_bloom = crate::bloom::BloomRegistry::new();
+    let exec_ctx = ExecutionContext::new(storage, txn, &temp_bloom);
+    let result = execute_select_ctx(
+        decorr.inner_stmt.clone(),
+        &exec_ctx,
+        None,
+        &mut temp_ctx,
+    )?;
+
+    // Build HashSet from the inner join key column.
+    let inner_rows = match result {
+        QueryResult::Rows { rows, .. } => rows,
+        _ => vec![],
+    };
+    let mut key_set: std::collections::HashSet<crate::eval::core::HashableValue> =
+        std::collections::HashSet::with_capacity(inner_rows.len());
+    for row in &inner_rows {
+        if let Some(val) = row.get(decorr.inner_col_idx) {
+            if !matches!(val, Value::Null) {
+                key_set.insert(crate::eval::core::HashableValue(val.clone()));
+            }
+        }
+    }
+
+    // Filter outer rows by probing the HashSet.
+    let mut combined = Vec::new();
+    for (_rid, values) in outer_rows {
+        let outer_key = values
+            .get(decorr.outer_col_idx)
+            .cloned()
+            .unwrap_or(Value::Null);
+        let matches = if matches!(outer_key, Value::Null) {
+            false
+        } else {
+            key_set.contains(&crate::eval::core::HashableValue(outer_key))
+        };
+        let keep = if decorr.negated { !matches } else { matches };
+        if keep {
+            combined.push(values);
+        }
+    }
+    Ok(combined)
+}
+
+/// Same as `apply_exists_semijoin` but for the ctx-path that receives
+/// pre-decoded rows (no RecordId).
+fn apply_exists_semijoin_rows(
+    outer_rows: Vec<Row>,
+    decorr: &ExistsDecorrelation,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+) -> Result<Vec<Row>, DbError> {
+    let with_rid: Vec<(RecordId, Row)> = outer_rows
+        .into_iter()
+        .map(|r| (RecordId { page_id: 0, slot_id: 0 }, r))
+        .collect();
+    apply_exists_semijoin(with_rid, decorr, storage, txn)
 }
 

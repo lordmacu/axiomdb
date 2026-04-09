@@ -61,7 +61,7 @@ use crate::{
         SelectItem, SelectStmt, SetStmt, SetValue, ShowDatabasesStmt, SortOrder, Stmt, TableRef,
         UpdateStmt, UseDatabaseStmt,
     },
-    eval::{eval, eval_with, is_truthy, CollationGuard, SubqueryRunner},
+    eval::{eval, eval_with, is_truthy, CollationGuard, InSubquerySet, SubqueryRunner},
     expr::{BinaryOp, Expr},
     result::{ColumnMeta, QueryResult, Row},
     session::{
