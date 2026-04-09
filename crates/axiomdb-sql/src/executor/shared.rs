@@ -394,43 +394,19 @@ fn compare_sort_values(
     }
 }
 
-/// Compares two non-NULL values using the expression evaluator.
+/// Compares two non-NULL values directly without heap allocations.
 ///
-/// Delegates to `eval()` via synthetic `Expr::BinaryOp { Lt }` and `Eq`
-/// expressions to reuse all existing type coercion and comparison logic.
+/// Delegates to `crate::eval::ops::compare_values` which uses direct
+/// pattern-matching on Value variants with proper type coercion.
+///
+/// Previously this function constructed `Expr::BinaryOp { Lt }` and `Eq`
+/// AST nodes per comparison (4 heap allocations × ~130K comparisons for
+/// 10K rows). Inspired by PostgreSQL's SortSupport and DuckDB's sort-key
+/// approach, both of which avoid per-comparison allocations.
+///
 /// Returns `Equal` if the comparison fails (type mismatch in ORDER BY).
 fn compare_non_null_for_sort(a: &Value, b: &Value) -> std::cmp::Ordering {
-    use std::cmp::Ordering::*;
-
-    let lt = eval(
-        &Expr::BinaryOp {
-            op: BinaryOp::Lt,
-            left: Box::new(Expr::Literal(a.clone())),
-            right: Box::new(Expr::Literal(b.clone())),
-        },
-        &[],
-    );
-    let eq = eval(
-        &Expr::BinaryOp {
-            op: BinaryOp::Eq,
-            left: Box::new(Expr::Literal(a.clone())),
-            right: Box::new(Expr::Literal(b.clone())),
-        },
-        &[],
-    );
-    match (lt, eq) {
-        (Ok(lt_v), Ok(eq_v)) => {
-            if is_truthy(&lt_v) {
-                Less
-            } else if is_truthy(&eq_v) {
-                Equal
-            } else {
-                Greater
-            }
-        }
-        // Type mismatch or error: treat as equal (stable, no crash).
-        _ => Equal,
-    }
+    crate::eval::compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal)
 }
 
 /// Compares two rows using all ORDER BY items (multi-column composite key).

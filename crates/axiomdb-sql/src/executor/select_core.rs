@@ -19,6 +19,7 @@ fn execute_select(
             outer_row: &[],
             cache: None,
             in_set_cache: None,
+            correlated_cache: None,
         };
         let mut out_row: Row = Vec::new();
         let mut out_cols: Vec<ColumnMeta> = Vec::new();
@@ -262,6 +263,7 @@ fn execute_select(
                 let mut rows = Vec::new();
                 let mut sq_cache: SubqueryCache = HashMap::new();
                 let mut in_set_cache: InSetCache = HashMap::new();
+                let mut corr_cache: CorrelatedCache = HashMap::new();
                 for (_rid, values) in raw_rows {
                     let mut temp_ctx = SessionContext::new();
                     let temp_bloom = crate::bloom::BloomRegistry::new();
@@ -273,6 +275,7 @@ fn execute_select(
                         outer_row: &values,
                         cache: Some(&mut sq_cache),
                         in_set_cache: Some(&mut in_set_cache),
+                        correlated_cache: Some(&mut corr_cache),
                     };
                     if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
                         continue;
@@ -305,6 +308,7 @@ fn execute_select(
         let mut rows: Vec<Row> = Vec::with_capacity(combined_rows.len());
         let mut proj_cache: SubqueryCache = HashMap::new();
         let mut proj_in_set_cache: InSetCache = HashMap::new();
+        let mut proj_corr_cache: CorrelatedCache = HashMap::new();
         for v in &combined_rows {
             let mut temp_ctx = SessionContext::new();
             let temp_bloom = crate::bloom::BloomRegistry::new();
@@ -316,6 +320,7 @@ fn execute_select(
                 outer_row: v,
                 cache: Some(&mut proj_cache),
                 in_set_cache: Some(&mut proj_in_set_cache),
+                correlated_cache: Some(&mut proj_corr_cache),
             };
             rows.push(project_row_with(&stmt.columns, v, &mut runner)?);
         }
@@ -371,6 +376,7 @@ fn execute_select_derived(
     let mut combined_rows: Vec<Row> = Vec::new();
     let mut sq_cache_derived: SubqueryCache = HashMap::new();
     let mut in_set_cache_derived: InSetCache = HashMap::new();
+    let mut corr_cache_derived: CorrelatedCache = HashMap::new();
     for values in derived_rows {
         if let Some(ref wc) = stmt.where_clause {
             let mut temp_ctx2 = SessionContext::new();
@@ -383,6 +389,7 @@ fn execute_select_derived(
                 outer_row: &values,
                 cache: Some(&mut sq_cache_derived),
                 in_set_cache: Some(&mut in_set_cache_derived),
+                correlated_cache: Some(&mut corr_cache_derived),
             };
             if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
                 continue;
