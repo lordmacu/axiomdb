@@ -1,6 +1,7 @@
 use std::cell::Cell;
 
 use axiomdb_core::error::DbError;
+use axiomdb_types::Value;
 
 use crate::{ast::SelectStmt, result::QueryResult, session::SessionCollation};
 
@@ -62,6 +63,33 @@ impl Drop for CollationGuard {
 /// at zero runtime cost.
 pub trait SubqueryRunner {
     fn run(&mut self, stmt: &SelectStmt) -> Result<QueryResult, DbError>;
+
+    /// Execute an uncorrelated `IN (SELECT …)` subquery and return whether the
+    /// given `needle` is found and whether the result set contains NULLs.
+    ///
+    /// The default implementation simply calls [`run`] and performs a linear scan.
+    /// `ExecSubqueryRunner` overrides this with a cached `HashSet` for O(1) lookups.
+    fn run_in_check(&mut self, stmt: &SelectStmt, needle: &Value) -> Result<(bool, bool), DbError> {
+        let result = self.run(stmt)?;
+        let rows = match result {
+            QueryResult::Rows { rows, .. } => rows,
+            _ => return Ok((false, false)),
+        };
+        let mut found = false;
+        let mut has_null = false;
+        for row in &rows {
+            let v = row.first().cloned().unwrap_or(Value::Null);
+            match v {
+                Value::Null => has_null = true,
+                ref iv if *iv == *needle => {
+                    found = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        Ok((found, has_null))
+    }
 }
 
 /// Zero-cost runner for expression contexts that cannot contain subqueries.

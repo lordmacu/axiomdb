@@ -2,15 +2,14 @@ fn resolve_table_cached(
     storage: &dyn StorageEngine,
     txn: &TxnManager,
     ctx: &mut SessionContext,
+    conn_txn: Option<&axiomdb_wal::ConnectionTxn>,
     tref: &crate::ast::TableRef,
 ) -> Result<ResolvedTable, DbError> {
     let database = effective_database_for_ref(tref, ctx);
 
     // If the user explicitly specified a database, verify it exists first.
     if tref.database.is_some() {
-        let snap = ctx
-            .conn_txn
-            .as_ref()
+        let snap = conn_txn
             .map(|c| txn.active_snapshot(c))
             .unwrap_or_else(|| txn.snapshot());
         let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
@@ -24,7 +23,7 @@ fn resolve_table_cached(
     // Inside an explicit transaction, catalog metadata can change mid-transaction
     // (bulk DELETE, TRUNCATE, DDL, savepoint rollback). Skip the cache so every
     // statement always reads the current catalog state via the active snapshot.
-    let in_txn = ctx.conn_txn.is_some();
+    let in_txn = conn_txn.is_some();
 
     // If the user specified an explicit schema, resolve directly.
     if let Some(schema) = tref.schema.as_deref() {
@@ -33,7 +32,7 @@ fn resolve_table_cached(
                 return Ok(cached.clone());
             }
         }
-        let mut resolver = make_resolver_with_database(storage, txn, ctx.conn_txn.as_ref(), &database)?;
+        let mut resolver = make_resolver_with_database(storage, txn, conn_txn, &database)?;
         let resolved = resolver.resolve_table(Some(schema), &tref.name)?;
         if !in_txn {
             ctx.cache_table(&database, schema, &tref.name, resolved.clone());
@@ -49,7 +48,7 @@ fn resolve_table_cached(
                 return Ok(cached.clone());
             }
         }
-        let mut resolver = make_resolver_with_database(storage, txn, ctx.conn_txn.as_ref(), &database)?;
+        let mut resolver = make_resolver_with_database(storage, txn, conn_txn, &database)?;
         if let Ok(resolved) = resolver.resolve_table(Some(schema), &tref.name) {
             if !in_txn {
                 ctx.cache_table(&database, schema, &tref.name, resolved.clone());
@@ -480,6 +479,97 @@ fn apply_order_by(mut rows: Vec<Row>, order_items: &[OrderByItem]) -> Result<Vec
         return Err(e);
     }
     Ok(rows)
+}
+
+/// Top-N heap sort: keeps only the top `limit + offset` rows in a BinaryHeap,
+/// avoiding a full O(n log n) sort when only a small subset is needed.
+///
+/// Inspired by PostgreSQL's `tuplesort_heap_insert` (tuplesort.c) and DuckDB's
+/// `TopN` physical operator which both use a bounded heap to avoid sorting the
+/// entire result set.
+///
+/// Complexity: O(n log k) where k = limit + offset, vs O(n log n) for full sort.
+/// For `ORDER BY score DESC LIMIT 100` on 10K rows: ~10K × log(100) ≈ 66K
+/// comparisons vs ~10K × log(10K) ≈ 133K, plus dramatically less memory pressure.
+fn apply_order_by_top_n(
+    rows: Vec<Row>,
+    order_items: &[OrderByItem],
+    top_n: usize,
+) -> Result<Vec<Row>, DbError> {
+    use std::cmp::Ordering;
+
+    if order_items.is_empty() || rows.is_empty() || top_n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let k = top_n.min(rows.len());
+    if k >= rows.len() {
+        // Need all rows anyway — fall back to full sort.
+        return apply_order_by(rows, order_items);
+    }
+
+    // Use indices + select_nth_unstable_by (introselect) for O(n) partitioning,
+    // then sort only the top-k portion in O(k log k).
+    // This is the same strategy PostgreSQL uses for bounded sorts in
+    // tuplesort.c when the working set fits in memory.
+    let mut sort_err: Option<DbError> = None;
+    let mut indices: Vec<usize> = (0..rows.len()).collect();
+    // Use `select_nth_unstable_by` to partition: O(n) on average.
+    indices.select_nth_unstable_by(k - 1, |&a, &b| {
+        match compare_rows_for_sort(&rows[a], &rows[b], order_items) {
+            Ok(ord) => ord,
+            Err(e) => {
+                if sort_err.is_none() {
+                    sort_err = Some(e);
+                }
+                Ordering::Equal
+            }
+        }
+    });
+    if let Some(e) = sort_err {
+        return Err(e);
+    }
+
+    // Now indices[0..k] contains the top-k rows (unordered). Sort just those.
+    let mut top_indices = indices[..k].to_vec();
+    top_indices.sort_by(|&a, &b| {
+        match compare_rows_for_sort(&rows[a], &rows[b], order_items) {
+            Ok(ord) => ord,
+            Err(e) => {
+                if sort_err.is_none() {
+                    sort_err = Some(e);
+                }
+                Ordering::Equal
+            }
+        }
+    });
+    if let Some(e) = sort_err {
+        return Err(e);
+    }
+
+    // Collect the sorted top-k rows by index.
+    // We need to move rows out without double-moving. Convert to Option first.
+    let mut row_slots: Vec<Option<Row>> = rows.into_iter().map(Some).collect();
+    let result: Vec<Row> = top_indices
+        .into_iter()
+        .map(|i| row_slots[i].take().unwrap())
+        .collect();
+
+    Ok(result)
+}
+
+/// Evaluates `limit` and `offset` expressions to a usize, if present.
+fn eval_limit_offset_usize(
+    limit: &Option<Expr>,
+    offset: &Option<Expr>,
+) -> Result<(Option<usize>, usize), DbError> {
+    let offset_n = offset
+        .as_ref()
+        .map(eval_row_count_as_usize)
+        .transpose()?
+        .unwrap_or(0);
+    let limit_n = limit.as_ref().map(eval_row_count_as_usize).transpose()?;
+    Ok((limit_n, offset_n))
 }
 
 /// Remaps ORDER BY expressions so they can be evaluated against grouped output rows.

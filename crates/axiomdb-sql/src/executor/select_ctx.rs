@@ -46,7 +46,7 @@ fn execute_select_ctx(
 
     if stmt.joins.is_empty() {
         // Single-table path — use cache.
-        let resolved = resolve_table_cached(storage, txn, ctx, &from_table_ref)?;
+        let resolved = resolve_table_cached(storage, txn, ctx, conn_txn, &from_table_ref)?;
         let snap = if let Some(ct) = conn_txn {
             txn.active_snapshot(ct)
         } else {
@@ -594,26 +594,38 @@ fn execute_select_ctx(
             }
         };
 
-        let mut combined_rows: Vec<Row> = Vec::new();
-        for (_rid, values) in raw_rows {
-            // Skip redundant WHERE re-evaluation when scan_table_filtered
-            // already applied the predicate (Phase 8.1 optimization).
-            if !where_already_applied {
-                if let Some(ref wc) = stmt.where_clause {
-                    let mut runner = ExecSubqueryRunner {
-                        storage: exec_ctx.storage(),
-                        txn: exec_ctx.coord(),
-                        bloom: exec_ctx.bloom(),
-                        ctx,
-                        outer_row: &values,
-                    };
-                    if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
-                        continue;
+        // ── EXISTS decorrelation fast-path ────────────────────────────────────
+        let mut combined_rows: Vec<Row> = if !where_already_applied {
+            if let Some(ref wc) = stmt.where_clause {
+                if let Some(decorr) = try_extract_exists_decorrelation(wc) {
+                    apply_exists_semijoin(raw_rows, &decorr, exec_ctx.storage(), exec_ctx.coord())?
+                } else {
+                    let mut rows = Vec::new();
+                    let mut sq_cache_ctx: SubqueryCache = HashMap::new();
+                    let mut in_set_cache_ctx: InSetCache = HashMap::new();
+                    for (_rid, values) in raw_rows {
+                        let mut runner = ExecSubqueryRunner {
+                            storage: exec_ctx.storage(),
+                            txn: exec_ctx.coord(),
+                            bloom: exec_ctx.bloom(),
+                            ctx,
+                            outer_row: &values,
+                            cache: Some(&mut sq_cache_ctx),
+                            in_set_cache: Some(&mut in_set_cache_ctx),
+                        };
+                        if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
+                            continue;
+                        }
+                        rows.push(values);
                     }
+                    rows
                 }
+            } else {
+                raw_rows.into_iter().map(|(_rid, v)| v).collect()
             }
-            combined_rows.push(values);
-        }
+        } else {
+            raw_rows.into_iter().map(|(_rid, v)| v).collect()
+        };
 
         if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
             // Single-table path: choose sorted strategy when the access method
@@ -628,22 +640,31 @@ fn execute_select_ctx(
         }
 
         let resolved_ob = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
-        combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
+        // Top-N optimization: partial sort when ORDER BY + LIMIT present.
+        if !resolved_ob.is_empty() && stmt.limit.is_some() && !stmt.distinct {
+            let (limit_n, offset_n) = eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
+            let top_n = offset_n + limit_n.unwrap_or(usize::MAX).min(usize::MAX - offset_n);
+            combined_rows = apply_order_by_top_n(combined_rows, &resolved_ob, top_n)?;
+        } else {
+            combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
+        }
 
         let out_cols = build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
-        let mut rows = combined_rows
-            .iter()
-            .map(|v| {
-                let mut runner = ExecSubqueryRunner {
-                    storage: exec_ctx.storage(),
-                    txn: exec_ctx.coord(),
-                    bloom: exec_ctx.bloom(),
-                    ctx,
-                    outer_row: v,
-                };
-                project_row_with(&stmt.columns, v, &mut runner)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut proj_cache_ctx: SubqueryCache = HashMap::new();
+        let mut proj_in_set_ctx: InSetCache = HashMap::new();
+        let mut rows: Vec<Row> = Vec::with_capacity(combined_rows.len());
+        for v in &combined_rows {
+            let mut runner = ExecSubqueryRunner {
+                storage: exec_ctx.storage(),
+                txn: exec_ctx.coord(),
+                bloom: exec_ctx.bloom(),
+                ctx,
+                outer_row: v,
+                cache: Some(&mut proj_cache_ctx),
+                in_set_cache: Some(&mut proj_in_set_ctx),
+            };
+            rows.push(project_row_with(&stmt.columns, v, &mut runner)?);
+        }
 
         if stmt.distinct {
             rows = apply_distinct_with_session(rows);
@@ -659,6 +680,6 @@ fn execute_select_ctx(
         })
     } else {
         // Multi-table JOIN path — use cache for each table.
-        execute_select_with_joins_ctx(stmt, from_table_ref, exec_ctx, ctx)
+        execute_select_with_joins_ctx(stmt, from_table_ref, exec_ctx, conn_txn, ctx)
     }
 }

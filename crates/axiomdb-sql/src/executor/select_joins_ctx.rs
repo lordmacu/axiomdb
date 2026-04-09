@@ -2,6 +2,7 @@ fn execute_select_with_joins_ctx(
     stmt: SelectStmt,
     from_ref: crate::ast::TableRef,
     exec_ctx: &ExecutionContext,
+    conn_txn: Option<&axiomdb_wal::ConnectionTxn>,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     let storage = exec_ctx.storage();
@@ -16,7 +17,7 @@ fn execute_select_with_joins_ctx(
     let mut running_offset = 0usize;
 
     {
-        let from_t = resolve_table_cached(storage, txn, ctx, &from_ref)?;
+        let from_t = resolve_table_cached(storage, txn, ctx, conn_txn, &from_ref)?;
         col_offsets.push(running_offset);
         running_offset += from_t.columns.len();
         all_resolved.push(from_t);
@@ -24,7 +25,7 @@ fn execute_select_with_joins_ctx(
         for join in &stmt.joins {
             match &join.table {
                 FromClause::Table(tref) => {
-                    let jt = resolve_table_cached(storage, txn, ctx, tref)?;
+                    let jt = resolve_table_cached(storage, txn, ctx, conn_txn, tref)?;
                     col_offsets.push(running_offset);
                     running_offset += jt.columns.len();
                     all_resolved.push(jt);
@@ -94,7 +95,13 @@ fn execute_select_with_joins_ctx(
     }
 
     let resolved_ob = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
-    combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
+    if !resolved_ob.is_empty() && stmt.limit.is_some() && !stmt.distinct {
+        let (limit_n, offset_n) = eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
+        let top_n = offset_n + limit_n.unwrap_or(usize::MAX).min(usize::MAX - offset_n);
+        combined_rows = apply_order_by_top_n(combined_rows, &resolved_ob, top_n)?;
+    } else {
+        combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
+    }
 
     let out_cols = build_join_column_meta(&stmt.columns, &all_resolved, &stmt.joins)?;
 

@@ -18,7 +18,7 @@
 
 pub mod batch;
 mod context;
-mod core;
+pub(crate) mod core;
 mod functions;
 mod ops;
 pub mod simd;
@@ -28,5 +28,6 @@ mod tests;
 
 pub(crate) use context::current_eval_collation;
 pub use context::{ClosureRunner, CollationGuard, NoSubquery, SubqueryRunner};
+pub(crate) use core::InSubquerySet;
 pub use core::{eval, eval_in_session, eval_with, eval_with_in_session};
 pub use ops::{is_truthy, like_match};

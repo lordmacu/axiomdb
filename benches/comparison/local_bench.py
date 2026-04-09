@@ -27,6 +27,20 @@ Scenarios:
   update_range        — UPDATE score over a primary-key range
   delete              — DELETE FROM t  (no WHERE, fast path)
   delete_where        — DELETE WHERE id > N/2  (50% rows)
+  join_inner          — INNER JOIN bench_users × bench_orders + filter
+  join_left           — LEFT JOIN bench_users × bench_orders
+  join_aggregate      — JOIN + GROUP BY + HAVING
+  subquery_in         — WHERE id IN (SELECT ... FROM bench_orders)
+  subquery_exists     — WHERE EXISTS (correlated subquery)
+  subquery_scalar     — scalar correlated subquery in SELECT list
+  order_limit         — ORDER BY score DESC LIMIT 100
+  order_offset        — ORDER BY score DESC LIMIT 100 OFFSET N/2
+  distinct            — SELECT DISTINCT age
+  like_pattern        — WHERE name LIKE 'user_00%'
+  multi_aggregate     — GROUP BY age with COUNT, AVG, MIN, MAX
+  complex_where       — compound OR/AND with arithmetic predicates
+  insert_select       — INSERT INTO ... SELECT * FROM ...
+  between_range       — WHERE age BETWEEN 25 AND 35
   all                 — run the full fair scenario set above
 
 Usage:
@@ -127,6 +141,23 @@ PRINT_ORDER = [
     "update_range",
     "delete",
     "delete_where",
+    # ── joins & subqueries ──
+    "join_inner",
+    "join_left",
+    "join_aggregate",
+    "subquery_in",
+    "subquery_exists",
+    "subquery_scalar",
+    # ── sorting & filtering ──
+    "order_limit",
+    "order_offset",
+    "distinct",
+    "like_pattern",
+    "multi_aggregate",
+    "complex_where",
+    "between_range",
+    # ── bulk ──
+    "insert_select",
 ]
 
 PRELOADED_SCENARIOS = {
@@ -138,6 +169,28 @@ PRELOADED_SCENARIOS = {
     "aggregate",
     "update",
     "update_range",
+    "order_limit",
+    "order_offset",
+    "distinct",
+    "like_pattern",
+    "multi_aggregate",
+    "complex_where",
+    "between_range",
+}
+
+# Scenarios that need the bench_orders table created and populated.
+NEEDS_ORDERS = {
+    "join_inner",
+    "join_left",
+    "join_aggregate",
+    "subquery_in",
+    "subquery_exists",
+    "subquery_scalar",
+}
+
+# Scenarios that need the bench_users_copy table.
+NEEDS_USERS_COPY = {
+    "insert_select",
 }
 
 
@@ -169,6 +222,20 @@ def rows_data(n):
         )
         for i in range(1, n + 1)
     ]
+
+
+def rows_data_orders(n_users):
+    """Generate ~3 orders per user.  Returns list of (id, user_id, amount, status)."""
+    statuses = ["pending", "shipped", "delivered"]
+    rows = []
+    oid = 1
+    for uid in range(1, n_users + 1):
+        for j in range(3):
+            amount = round(10.0 + ((uid * 3 + j) % 200) * 0.5, 2)
+            status = statuses[j % 3]
+            rows.append((oid, uid, amount, status))
+            oid += 1
+    return rows
 
 
 def parse_indexes(raw):
@@ -205,7 +272,7 @@ def parse_engines(raw):
     return ordered
 
 
-def schema_statements(kind, indexes):
+def schema_statements(kind, indexes, with_orders=False, with_users_copy=False):
     if kind == "pg":
         statements = [
             "DROP TABLE IF EXISTS bench_users CASCADE",
@@ -249,7 +316,97 @@ def schema_statements(kind, indexes):
 
     for col in indexes:
         statements.append(f"CREATE INDEX idx_bench_users_{col} ON bench_users ({col})")
+
+    if with_orders:
+        statements += orders_schema_statements(kind)
+
+    if with_users_copy:
+        statements += users_copy_schema_statements(kind)
+
     return statements
+
+
+def orders_schema_statements(kind):
+    if kind == "pg":
+        return [
+            "DROP TABLE IF EXISTS bench_orders CASCADE",
+            """CREATE TABLE bench_orders (
+    id       INT              NOT NULL PRIMARY KEY,
+    user_id  INT              NOT NULL,
+    amount   DOUBLE PRECISION NOT NULL,
+    status   TEXT             NOT NULL
+)""",
+            "CREATE INDEX idx_orders_user_id ON bench_orders (user_id)",
+        ]
+    elif kind == "mysql":
+        return [
+            "DROP TABLE IF EXISTS bench_orders",
+            """CREATE TABLE bench_orders (
+    id       INT          NOT NULL,
+    user_id  INT          NOT NULL,
+    amount   DOUBLE       NOT NULL,
+    status   VARCHAR(50)  NOT NULL,
+    PRIMARY KEY (id)
+) ENGINE=InnoDB""",
+            "CREATE INDEX idx_orders_user_id ON bench_orders (user_id)",
+        ]
+    elif kind == "axiomdb":
+        return [
+            "DROP TABLE IF EXISTS bench_orders",
+            """CREATE TABLE bench_orders (
+    id       INT  NOT NULL,
+    user_id  INT  NOT NULL,
+    amount   REAL NOT NULL,
+    status   TEXT NOT NULL,
+    PRIMARY KEY (id)
+)""",
+            "CREATE INDEX idx_orders_user_id ON bench_orders (user_id)",
+        ]
+    else:
+        raise ValueError(f"unknown engine kind: {kind}")
+
+
+def users_copy_schema_statements(kind):
+    if kind == "pg":
+        return [
+            "DROP TABLE IF EXISTS bench_users_copy CASCADE",
+            """CREATE TABLE bench_users_copy (
+    id     INT              NOT NULL PRIMARY KEY,
+    name   TEXT             NOT NULL,
+    age    INT              NOT NULL,
+    active BOOLEAN          NOT NULL,
+    score  DOUBLE PRECISION NOT NULL,
+    email  TEXT             NOT NULL
+)""",
+        ]
+    elif kind == "mysql":
+        return [
+            "DROP TABLE IF EXISTS bench_users_copy",
+            """CREATE TABLE bench_users_copy (
+    id     INT          NOT NULL,
+    name   VARCHAR(255) NOT NULL,
+    age    INT          NOT NULL,
+    active BOOL         NOT NULL,
+    score  DOUBLE       NOT NULL,
+    email  VARCHAR(255) NOT NULL,
+    PRIMARY KEY (id)
+) ENGINE=InnoDB""",
+        ]
+    elif kind == "axiomdb":
+        return [
+            "DROP TABLE IF EXISTS bench_users_copy",
+            """CREATE TABLE bench_users_copy (
+    id     INT  NOT NULL,
+    name   TEXT NOT NULL,
+    age    INT  NOT NULL,
+    active BOOL NOT NULL,
+    score  REAL NOT NULL,
+    email  TEXT NOT NULL,
+    PRIMARY KEY (id)
+)""",
+        ]
+    else:
+        raise ValueError(f"unknown engine kind: {kind}")
 
 
 def exec_statements(conn, statements, transactional=False):
@@ -263,8 +420,10 @@ def exec_statements(conn, statements, transactional=False):
     cur.close()
 
 
-def reset_table(conn, kind, indexes):
-    exec_statements(conn, schema_statements(kind, indexes))
+def reset_table(conn, kind, indexes, with_orders=False, with_users_copy=False):
+    exec_statements(conn, schema_statements(kind, indexes,
+                                            with_orders=with_orders,
+                                            with_users_copy=with_users_copy))
 
 
 def sql_literal(value):
@@ -319,6 +478,16 @@ def prepare_workload(n_rows, multi_values_chunk, autocommit_rows, point_lookups,
     range_count = max(0, range_end - range_start)
     half = n_rows // 2
 
+    # ── orders data ──────────────────────────────────────────────────────────
+    orders = rows_data_orders(n_rows)
+    order_values_sql = [
+        "(" + ",".join(sql_literal(v) for v in row) + ")" for row in orders
+    ]
+    insert_orders_sqls = [
+        "INSERT INTO bench_orders VALUES " + ",".join(chunk)
+        for chunk in chunked(order_values_sql, multi_values_chunk)
+    ]
+
     return {
         "n_rows": n_rows,
         "data": data,
@@ -354,11 +523,67 @@ def prepare_workload(n_rows, multi_values_chunk, autocommit_rows, point_lookups,
         "delete_sql": "DELETE FROM bench_users",
         "delete_where_sql": f"DELETE FROM bench_users WHERE id > {half}",
         "delete_where_rows": n_rows - half,
+        # ── orders ────────────────────────────────────────────────────────────
+        "n_orders": len(orders),
+        "insert_orders_sqls": insert_orders_sqls,
+        # ── join queries ──────────────────────────────────────────────────────
+        "join_inner_sql": (
+            "SELECT u.name, o.amount "
+            "FROM bench_users u INNER JOIN bench_orders o ON u.id = o.user_id "
+            "WHERE o.amount > 50.00"
+        ),
+        "join_left_sql": (
+            "SELECT u.name, o.amount "
+            "FROM bench_users u LEFT JOIN bench_orders o ON u.id = o.user_id"
+        ),
+        "join_aggregate_sql": (
+            "SELECT u.name, COUNT(*) AS c, SUM(o.amount) AS total "
+            "FROM bench_users u INNER JOIN bench_orders o ON u.id = o.user_id "
+            "GROUP BY u.id, u.name HAVING COUNT(*) > 1"
+        ),
+        # ── subquery queries ──────────────────────────────────────────────────
+        "subquery_in_sql": (
+            "SELECT * FROM bench_users "
+            "WHERE id IN (SELECT user_id FROM bench_orders WHERE amount > 80.00)"
+        ),
+        "subquery_exists_sql": (
+            "SELECT * FROM bench_users u "
+            "WHERE EXISTS (SELECT 1 FROM bench_orders o "
+            "WHERE o.user_id = u.id AND o.amount > 80.00)"
+        ),
+        "subquery_scalar_n": min(n_rows, 1000),
+        "subquery_scalar_sql": (
+            "SELECT u.name, "
+            "(SELECT SUM(o.amount) FROM bench_orders o WHERE o.user_id = u.id) AS total "
+            f"FROM bench_users u LIMIT {min(n_rows, 1000)}"
+        ),
+        # ── sorting / filtering ───────────────────────────────────────────────
+        "order_limit_sql": "SELECT * FROM bench_users ORDER BY score DESC LIMIT 100",
+        "order_offset_sql": (
+            f"SELECT * FROM bench_users ORDER BY score DESC LIMIT 100 OFFSET {half}"
+        ),
+        "distinct_sql": "SELECT DISTINCT age FROM bench_users",
+        "like_pattern_sql": "SELECT * FROM bench_users WHERE name LIKE 'user_00%'",
+        "multi_aggregate_sql": (
+            "SELECT age, COUNT(*) AS c, AVG(score) AS a, MIN(score) AS mn, MAX(score) AS mx "
+            "FROM bench_users GROUP BY age"
+        ),
+        "complex_where_sql": (
+            "SELECT * FROM bench_users "
+            "WHERE (age > 30 AND score > 150.00) OR (active = TRUE AND age < 25)"
+        ),
+        "between_range_sql": "SELECT * FROM bench_users WHERE age BETWEEN 25 AND 35",
+        # ── bulk ──────────────────────────────────────────────────────────────
+        "insert_select_sql": "INSERT INTO bench_users_copy SELECT * FROM bench_users",
     }
 
 
 def preload_table(conn, workload):
     exec_statements(conn, workload["insert_multi_values_sqls"], transactional=True)
+
+
+def preload_orders(conn, workload):
+    exec_statements(conn, workload["insert_orders_sqls"], transactional=True)
 
 
 def emit(engine, scenario, n_ops, mean_s, note=""):
@@ -562,6 +787,176 @@ def run_delete_where(conn, engine, kind, indexes, workload):
     )
 
 
+# ── Join scenarios ─────────────────────────────────────────────────────────────
+
+def run_join_inner(conn, engine, _kind, _indexes, workload):
+    def do():
+        cur = conn.cursor()
+        cur.execute(workload["join_inner_sql"])
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "join_inner", workload["n_rows"], mean, "INNER JOIN + filter amount>50")
+
+
+def run_join_left(conn, engine, _kind, _indexes, workload):
+    def do():
+        cur = conn.cursor()
+        cur.execute(workload["join_left_sql"])
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "join_left", workload["n_rows"], mean, "LEFT JOIN all rows")
+
+
+def run_join_aggregate(conn, engine, _kind, _indexes, workload):
+    def do():
+        cur = conn.cursor()
+        cur.execute(workload["join_aggregate_sql"])
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "join_aggregate", workload["n_rows"], mean, "JOIN + GROUP BY + HAVING")
+
+
+# ── Subquery scenarios ────────────────────────────────────────────────────────
+
+def run_subquery_in(conn, engine, _kind, _indexes, workload):
+    def do():
+        cur = conn.cursor()
+        cur.execute(workload["subquery_in_sql"])
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "subquery_in", workload["n_rows"], mean, "IN (SELECT ...)")
+
+
+def run_subquery_exists(conn, engine, _kind, _indexes, workload):
+    def do():
+        cur = conn.cursor()
+        cur.execute(workload["subquery_exists_sql"])
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "subquery_exists", workload["n_rows"], mean, "EXISTS correlated")
+
+
+def run_subquery_scalar(conn, engine, _kind, _indexes, workload):
+    n = workload["subquery_scalar_n"]
+
+    def do():
+        cur = conn.cursor()
+        cur.execute(workload["subquery_scalar_sql"])
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "subquery_scalar", n, mean, f"scalar SUM in SELECT (LIMIT {n})")
+
+
+# ── Sorting & filtering scenarios ─────────────────────────────────────────────
+
+def run_order_limit(conn, engine, _kind, _indexes, workload):
+    def do():
+        cur = conn.cursor()
+        cur.execute(workload["order_limit_sql"])
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "order_limit", 100, mean, "ORDER BY score DESC LIMIT 100")
+
+
+def run_order_offset(conn, engine, _kind, _indexes, workload):
+    def do():
+        cur = conn.cursor()
+        cur.execute(workload["order_offset_sql"])
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "order_offset", 100, mean, f"LIMIT 100 OFFSET {workload['n_rows']//2}")
+
+
+def run_distinct(conn, engine, _kind, _indexes, workload):
+    def do():
+        cur = conn.cursor()
+        cur.execute(workload["distinct_sql"])
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "distinct", 62, mean, "DISTINCT age (62 unique values)")
+
+
+def run_like_pattern(conn, engine, _kind, _indexes, workload):
+    def do():
+        cur = conn.cursor()
+        cur.execute(workload["like_pattern_sql"])
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "like_pattern", workload["n_rows"], mean, "LIKE 'user_00%'")
+
+
+def run_multi_aggregate(conn, engine, _kind, _indexes, workload):
+    def do():
+        cur = conn.cursor()
+        cur.execute(workload["multi_aggregate_sql"])
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "multi_aggregate", 1, mean, "COUNT+AVG+MIN+MAX by age")
+
+
+def run_complex_where(conn, engine, _kind, _indexes, workload):
+    def do():
+        cur = conn.cursor()
+        cur.execute(workload["complex_where_sql"])
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "complex_where", workload["n_rows"], mean, "compound OR/AND predicates")
+
+
+def run_between_range(conn, engine, _kind, _indexes, workload):
+    def do():
+        cur = conn.cursor()
+        cur.execute(workload["between_range_sql"])
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "between_range", workload["n_rows"], mean, "BETWEEN 25 AND 35 (~17%)")
+
+
+# ── Bulk scenarios ────────────────────────────────────────────────────────────
+
+def run_insert_select(conn, engine, kind, indexes, workload):
+    def setup():
+        # Recreate the copy table (empty), keep users loaded
+        cur = conn.cursor()
+        cur.execute("DROP TABLE IF EXISTS bench_users_copy")
+        for stmt in users_copy_schema_statements(kind):
+            if "DROP" not in stmt:
+                cur.execute(stmt)
+        cur.close()
+
+    def do():
+        exec_statements(conn, [workload["insert_select_sql"]], transactional=True)
+
+    mean = timed_runs(setup, do)
+    emit(engine, "insert_select", workload["n_rows"], mean, "INSERT INTO ... SELECT *")
+
+
 SCENARIOS = {
     "insert": run_insert,
     "insert_multi_values": run_insert_multi_values,
@@ -576,6 +971,20 @@ SCENARIOS = {
     "update_range": run_update_range,
     "delete": run_delete,
     "delete_where": run_delete_where,
+    "join_inner": run_join_inner,
+    "join_left": run_join_left,
+    "join_aggregate": run_join_aggregate,
+    "subquery_in": run_subquery_in,
+    "subquery_exists": run_subquery_exists,
+    "subquery_scalar": run_subquery_scalar,
+    "order_limit": run_order_limit,
+    "order_offset": run_order_offset,
+    "distinct": run_distinct,
+    "like_pattern": run_like_pattern,
+    "multi_aggregate": run_multi_aggregate,
+    "complex_where": run_complex_where,
+    "between_range": run_between_range,
+    "insert_select": run_insert_select,
 }
 
 ALL_SCENARIOS = list(SCENARIOS)
@@ -584,6 +993,8 @@ ALL_SCENARIOS = list(SCENARIOS)
 # ── Runner ─────────────────────────────────────────────────────────────────────
 
 def run_scenario(scenario, workload, indexes, selected_engines):
+    needs_orders = scenario in NEEDS_ORDERS
+    needs_copy = scenario in NEEDS_USERS_COPY
     for engine_key in selected_engines:
         engine, cfg = ENGINE_CONFIGS[engine_key]
         try:
@@ -592,9 +1003,12 @@ def run_scenario(scenario, workload, indexes, selected_engines):
                 conn = connect_pg(cfg)
             else:
                 conn = connect_mysql(cfg)
-            reset_table(conn, kind, indexes)
-            if scenario in PRELOADED_SCENARIOS:
+            reset_table(conn, kind, indexes,
+                        with_orders=needs_orders, with_users_copy=needs_copy)
+            if scenario in PRELOADED_SCENARIOS or needs_orders or needs_copy:
                 preload_table(conn, workload)
+            if needs_orders:
+                preload_orders(conn, workload)
             SCENARIOS[scenario](conn, engine, kind, indexes, workload)
             conn.close()
         except Exception as exc:
