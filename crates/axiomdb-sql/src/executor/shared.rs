@@ -429,6 +429,53 @@ fn compare_rows_for_sort(
     Ok(std::cmp::Ordering::Equal)
 }
 
+/// Checks whether all ORDER BY expressions are simple column references.
+///
+/// When all sort keys are plain `Expr::Column { col_idx }`, we can skip the
+/// expression evaluator entirely and compare values directly from the row
+/// by index. This is the common case for queries like `ORDER BY score DESC`.
+///
+/// Returns `Some(indices_and_dirs)` if all expressions are simple columns,
+/// or `None` if any expression requires evaluation (e.g., `ORDER BY a + b`).
+fn try_extract_sort_columns(
+    order_items: &[OrderByItem],
+) -> Option<Vec<(usize, SortOrder, Option<NullsOrder>)>> {
+    let mut cols = Vec::with_capacity(order_items.len());
+    for item in order_items {
+        match &item.expr {
+            Expr::Column { col_idx, .. } => {
+                cols.push((*col_idx, item.order, item.nulls));
+            }
+            _ => return None,
+        }
+    }
+    Some(cols)
+}
+
+/// Fast-path row comparator for simple column ORDER BY.
+///
+/// Avoids the expression evaluator entirely — reads sort keys directly from
+/// the row by column index. Inspired by PostgreSQL's SortSupport which
+/// pre-computes sort keys to eliminate per-comparison overhead.
+///
+/// For `ORDER BY score DESC LIMIT 100` on 10K rows, this eliminates ~20K
+/// `eval()` dispatch calls, each of which traverses a 30-variant match.
+fn compare_rows_by_columns(
+    a: &[Value],
+    b: &[Value],
+    cols: &[(usize, SortOrder, Option<NullsOrder>)],
+) -> std::cmp::Ordering {
+    for &(idx, direction, nulls) in cols {
+        let va = a.get(idx).unwrap_or(&Value::Null);
+        let vb = b.get(idx).unwrap_or(&Value::Null);
+        let ord = compare_sort_values(va, vb, direction, nulls);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 /// Sorts `rows` in place according to `order_items`.
 ///
 /// Uses `sort_by` (stable) to preserve insertion order for equal keys.
@@ -438,6 +485,13 @@ fn apply_order_by(mut rows: Vec<Row>, order_items: &[OrderByItem]) -> Result<Vec
     if order_items.is_empty() {
         return Ok(rows);
     }
+    // Fast path: when all ORDER BY expressions are simple column references,
+    // skip the expression evaluator and compare values directly by index.
+    if let Some(cols) = try_extract_sort_columns(order_items) {
+        rows.sort_by(|a, b| compare_rows_by_columns(a, b, &cols));
+        return Ok(rows);
+    }
+    // Slow path: expressions require eval() per comparison.
     let mut sort_err: Option<DbError> = None;
     rows.sort_by(|a, b| {
         if sort_err.is_some() {
@@ -488,9 +542,23 @@ fn apply_order_by_top_n(
     // then sort only the top-k portion in O(k log k).
     // This is the same strategy PostgreSQL uses for bounded sorts in
     // tuplesort.c when the working set fits in memory.
-    let mut sort_err: Option<DbError> = None;
     let mut indices: Vec<usize> = (0..rows.len()).collect();
-    // Use `select_nth_unstable_by` to partition: O(n) on average.
+
+    // Fast path: simple column references → zero-eval comparator.
+    if let Some(cols) = try_extract_sort_columns(order_items) {
+        indices.select_nth_unstable_by(k - 1, |&a, &b| {
+            compare_rows_by_columns(&rows[a], &rows[b], &cols)
+        });
+        let mut top_indices = indices[..k].to_vec();
+        top_indices.sort_by(|&a, &b| {
+            compare_rows_by_columns(&rows[a], &rows[b], &cols)
+        });
+        let mut row_slots: Vec<Option<Row>> = rows.into_iter().map(Some).collect();
+        return Ok(top_indices.into_iter().map(|i| row_slots[i].take().unwrap()).collect());
+    }
+
+    // Slow path: expressions require eval() per comparison.
+    let mut sort_err: Option<DbError> = None;
     indices.select_nth_unstable_by(k - 1, |&a, &b| {
         match compare_rows_for_sort(&rows[a], &rows[b], order_items) {
             Ok(ord) => ord,
@@ -506,7 +574,6 @@ fn apply_order_by_top_n(
         return Err(e);
     }
 
-    // Now indices[0..k] contains the top-k rows (unordered). Sort just those.
     let mut top_indices = indices[..k].to_vec();
     top_indices.sort_by(|&a, &b| {
         match compare_rows_for_sort(&rows[a], &rows[b], order_items) {
