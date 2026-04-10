@@ -48,7 +48,7 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
             datetime::eval(lower.as_str(), args, row)
         }
 
-        "from_base64" | "to_base64" | "encode" | "decode" => {
+        "from_base64" | "to_base64" | "encode" | "decode" | "mime_type" => {
             binary::eval(lower.as_str(), args, row)
         }
 
