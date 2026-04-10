@@ -448,14 +448,9 @@ async fn test_40_12_mvcc_repeatable_read() {
 
     exec_in_session(&db, "COMMIT", &mut sa, &mut ca);
 
-    // After commit: verify the core MVCC guarantee held — snapshot isolation
-    // prevented dirty reads during the explicit transaction. Cross-session
-    // visibility timing is a WAL pipeline implementation detail (deferred item).
+    // After commit: new autocommit snapshot sees all 11 rows.
     let count_after = count_rows(&db, "SELECT id FROM t6");
-    assert!(
-        count_after >= 10 && count_after <= 11,
-        "after commit should see 10 or 11 rows, got {count_after}"
-    );
+    assert_eq!(count_after, 11, "after commit should see all 11 rows");
 }
 
 // ── Test 7: DELETE during SELECT ───────────────────────────────────────────
@@ -500,9 +495,9 @@ async fn test_40_12_delete_invisible_during_txn() {
 
     exec_in_session(&db, "COMMIT", &mut sa, &mut ca);
 
-    // After commit: verify the core MVCC guarantee held.
+    // After commit: row 5 gone.
     let count = count_rows(&db, "SELECT id FROM t7 WHERE id = 5");
-    assert!(count <= 1, "row 5 count should be 0 or 1, got {count}");
+    assert_eq!(count, 0, "row 5 should be gone after new snapshot");
 }
 
 // ── Test 9: Autocommit stress (10 clients × 100 INSERTs) ──────────────────
