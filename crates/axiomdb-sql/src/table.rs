@@ -443,8 +443,8 @@ fn build_in_place_tuple_image(
 }
 
 fn update_encoded_row_with_hint(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_def: &TableDef,
     record_id: RecordId,
@@ -507,8 +507,8 @@ fn update_encoded_row_with_hint(
 }
 
 fn apply_prepared_updates_preserve_rid(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_def: &TableDef,
     prepared: Vec<(RecordId, Vec<u8>)>,

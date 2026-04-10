@@ -61,10 +61,10 @@ const MAX_CASCADE_DEPTH: u32 = 10;
 pub fn check_fk_child_insert(
     row: &[Value],
     foreign_keys: &[FkDef],
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     txn: &TxnManager,
     conn_txn: &axiomdb_wal::ConnectionTxn,
-    bloom: &mut BloomRegistry,
+    bloom: &BloomRegistry,
 ) -> Result<(), DbError> {
     if foreign_keys.is_empty() {
         return Ok(());
@@ -156,10 +156,10 @@ pub fn check_fk_child_update(
     old_row: &[Value],
     new_row: &[Value],
     foreign_keys: &[FkDef],
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     txn: &TxnManager,
     conn_txn: &axiomdb_wal::ConnectionTxn,
-    bloom: &mut BloomRegistry,
+    bloom: &BloomRegistry,
 ) -> Result<(), DbError> {
     if foreign_keys.is_empty() {
         return Ok(());
@@ -198,10 +198,10 @@ pub fn check_fk_child_update(
 pub fn enforce_fk_on_parent_delete(
     deleted_rows: &[(RecordId, Vec<Value>)],
     parent_table_id: u32,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
-    bloom: &mut BloomRegistry,
+    bloom: &BloomRegistry,
     depth: u32,
 ) -> Result<(), DbError> {
     if deleted_rows.is_empty() {
@@ -701,10 +701,10 @@ pub fn enforce_fk_on_parent_update(
     old_rows: &[(RecordId, Vec<Value>)],
     new_values_per_row: &[Vec<Value>],
     parent_table_id: u32,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
-    bloom: &mut crate::BloomRegistry,
+    bloom: &crate::BloomRegistry,
 ) -> Result<(), DbError> {
     if old_rows.is_empty() {
         return Ok(());
@@ -828,10 +828,10 @@ pub fn enforce_fk_on_parent_update(
 /// ON UPDATE SET NULL (`replacement_val` = `Value::Null`).
 #[allow(clippy::too_many_arguments)]
 fn apply_fk_update_children(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
-    bloom: &mut crate::BloomRegistry,
+    bloom: &crate::BloomRegistry,
     child_table_def: &axiomdb_catalog::schema::TableDef,
     child_cols: &[axiomdb_catalog::schema::ColumnDef],
     fk: &FkDef,
@@ -1031,7 +1031,7 @@ fn apply_fk_update_children(
 
 /// Returns `true` if any child row has FK column equal to `fk_val` (full scan).
 fn children_exist_via_scan(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     child_table_def: &axiomdb_catalog::schema::TableDef,
     child_cols: &[axiomdb_catalog::schema::ColumnDef],
     child_col_idx: u16,
@@ -1057,7 +1057,7 @@ fn children_exist_via_scan(
 /// value (B-Tree limitation in Phase 6.5 — multiple rows with the same FK value
 /// are not all reachable via the index).
 fn find_children_via_scan(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     child_table_def: &axiomdb_catalog::schema::TableDef,
     child_cols: &[axiomdb_catalog::schema::ColumnDef],
     child_col_idx: u16,
@@ -1119,8 +1119,8 @@ fn find_clustered_children_with_pk(
 
 /// Applies MVCC delete-marks to clustered rows identified by their PK keys.
 fn delete_mark_clustered_rows(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_id: u32,
     root_pid: u64,
@@ -1166,8 +1166,8 @@ fn delete_mark_clustered_rows(
 /// Returns the new effective clustered root (may differ if a split occurred).
 #[allow(clippy::too_many_arguments)]
 fn apply_clustered_set_null(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_id: u32,
     root_pid: u64,

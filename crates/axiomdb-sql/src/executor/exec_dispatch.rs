@@ -9,10 +9,9 @@ fn dispatch_ctx(
     exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
-    // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut doc comments.
-    let storage = unsafe { exec_ctx.storage_mut() };
-    let txn = unsafe { exec_ctx.coord_mut() };
-    let bloom = unsafe { exec_ctx.bloom_mut() };
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
+    let bloom = exec_ctx.bloom();
 
     // Flush staged inserts before any non-INSERT barrier statement.
     // INSERT statements handle same-table vs. different-table flush internally.

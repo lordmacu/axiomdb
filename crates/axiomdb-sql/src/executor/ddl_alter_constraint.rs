@@ -2,8 +2,8 @@
 
 /// Evaluates active CHECK constraints for a row about to be inserted/updated.
 fn alter_add_constraint(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_def: &axiomdb_catalog::ResolvedTable,
     columns_arg: &[axiomdb_catalog::schema::ColumnDef],
@@ -50,8 +50,8 @@ fn alter_add_constraint(
                 index_type: crate::ast::IndexType::BTree,
                 pages_per_range: None,
             };
-            let mut noop_bloom = crate::bloom::BloomRegistry::new();
-            execute_create_index(stmt, storage, txn, conn_txn, &mut noop_bloom, database)?;
+            let noop_bloom = crate::bloom::BloomRegistry::new();
+            execute_create_index(stmt, storage, txn, conn_txn, &noop_bloom, database)?;
             Ok(None)
         }
 
@@ -160,7 +160,7 @@ fn alter_add_constraint(
             };
             let existing_rows =
                 TableEngine::scan_table(storage, &table_def.def, columns_arg, snap, None)?;
-            let mut noop_bloom = crate::bloom::BloomRegistry::new();
+            let noop_bloom = crate::bloom::BloomRegistry::new();
             for (_, row) in &existing_rows {
                 if let Err(e) = crate::fk_enforcement::check_fk_child_insert(
                     row,
@@ -168,7 +168,7 @@ fn alter_add_constraint(
                     storage,
                     txn,
                     conn_txn,
-                    &mut noop_bloom,
+                    &noop_bloom,
                 ) {
                     // Roll back: drop the FK definition (and its auto-created index).
                     let snap2 = txn.active_snapshot(conn_txn);
@@ -183,7 +183,7 @@ fn alter_add_constraint(
                                 storage,
                                 txn,
                                 conn_txn,
-                                &mut noop_bloom,
+                                &noop_bloom,
                             );
                         }
                     }
@@ -236,8 +236,8 @@ fn alter_add_constraint(
                 index_type: crate::ast::IndexType::BTree,
                 pages_per_range: None,
             };
-            let mut noop_bloom = crate::bloom::BloomRegistry::new();
-            execute_create_index(stmt, storage, txn, conn_txn, &mut noop_bloom, database)?;
+            let noop_bloom = crate::bloom::BloomRegistry::new();
+            execute_create_index(stmt, storage, txn, conn_txn, &noop_bloom, database)?;
             Ok(None)
         }
     }
@@ -248,8 +248,8 @@ fn alter_add_constraint(
     reason = "ALTER TABLE ADD PRIMARY KEY coordinates catalog, executor, and namespace state"
 )]
 fn alter_add_primary_key(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_def: &axiomdb_catalog::ResolvedTable,
     columns_arg: &[axiomdb_catalog::schema::ColumnDef],
@@ -404,8 +404,8 @@ fn alter_add_primary_key(
 }
 
 fn alter_drop_constraint(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_def: &axiomdb_catalog::ResolvedTable,
     name: &str,
@@ -454,8 +454,8 @@ fn alter_drop_constraint(
         CatalogWriter::new(storage, txn, conn_txn)?.drop_foreign_key(fk_def.fk_id)?;
         // Drop the auto-created FK index (fk_index_id != 0 means we created it).
         if fk_index_id != 0 {
-            let mut noop_bloom = crate::bloom::BloomRegistry::new();
-            execute_drop_index_by_id(fk_index_id, storage, txn, conn_txn, &mut noop_bloom)?;
+            let noop_bloom = crate::bloom::BloomRegistry::new();
+            execute_drop_index_by_id(fk_index_id, storage, txn, conn_txn, &noop_bloom)?;
         }
         return Ok(());
     }

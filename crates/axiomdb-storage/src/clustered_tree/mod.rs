@@ -85,7 +85,7 @@ pub struct ClusteredRangeIter<'a> {
 }
 
 fn free_overflow_chain_if_any(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     first_page: Option<u64>,
 ) -> Result<(), DbError> {
     if let Some(first_page) = first_page {
@@ -95,7 +95,7 @@ fn free_overflow_chain_if_any(
 }
 
 fn try_insert_leaf_optimistically(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     batch: Option<&mut LocalPageBatch>,
     root_pid: u64,
     key: &[u8],
@@ -177,7 +177,7 @@ fn try_insert_leaf_optimistically(
 /// per-transaction batch (Phase 40.9 Tier-1), falling back to the global
 /// bitmap only on refill.
 pub fn insert(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     root_pid: Option<u64>,
     key: &[u8],
     row_header: &RowHeader,
@@ -189,7 +189,7 @@ pub fn insert(
 /// Like [`insert`] but routes page allocations through `batch` when provided.
 #[allow(clippy::needless_option_as_deref)]
 pub fn insert_with_batch(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     mut batch: Option<&mut LocalPageBatch>,
     root_pid: Option<u64>,
     key: &[u8],
@@ -266,7 +266,7 @@ pub fn insert_with_batch(
 /// leaf would need a structural split, so the caller must fall back to the
 /// normal `insert()` path.
 pub fn try_insert_rightmost_leaf(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     batch: Option<&mut LocalPageBatch>,
     hinted_leaf_pid: u64,
     key: &[u8],
@@ -298,7 +298,7 @@ pub fn try_insert_rightmost_leaf(
 
     let cell = materialize_leaf_cell(storage, batch, key, row_header, row_data)?;
     let cleanup_overflow =
-        |storage: &mut dyn StorageEngine, first_page: Option<u64>| -> Result<(), DbError> {
+        |storage: &dyn StorageEngine, first_page: Option<u64>| -> Result<(), DbError> {
             if let Some(first_page) = first_page {
                 clustered_overflow::free_chain(storage, first_page)?;
             }
@@ -359,7 +359,7 @@ pub fn try_insert_rightmost_leaf(
 /// means the caller must fall back to the normal insert path for the first row.
 #[allow(clippy::needless_option_as_deref)]
 pub fn try_insert_rightmost_leaf_batch(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     mut batch: Option<&mut LocalPageBatch>,
     hinted_leaf_pid: u64,
     rows: &[RightmostAppendRow<'_>],
@@ -670,7 +670,7 @@ where
 /// Rewrites the current inline version of one clustered row in the owning leaf
 /// page without changing the primary key or tree structure.
 pub fn update_in_place(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     root_pid: Option<u64>,
     key: &[u8],
     new_row_data: &[u8],
@@ -747,7 +747,7 @@ pub fn update_in_place(
 /// Applies an MVCC delete-mark to the current inline version of one clustered
 /// row without removing the physical cell from the owning leaf page.
 pub fn delete_mark(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     root_pid: Option<u64>,
     key: &[u8],
     txn_id: u64,
@@ -811,7 +811,7 @@ pub fn delete_mark(
 /// Rewrites one clustered row, falling back to structural delete+insert when
 /// same-leaf growth no longer fits in the owning page.
 pub fn update_with_relocation(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     root_pid: Option<u64>,
     key: &[u8],
     new_row_data: &[u8],
@@ -862,7 +862,7 @@ pub fn update_with_relocation(
 /// This helper is intended for rollback/undo paths that must remove the current
 /// version regardless of MVCC visibility rules.
 pub fn delete_physical_by_key(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     root_pid: u64,
     key: &[u8],
 ) -> Result<Option<u64>, DbError> {
@@ -880,7 +880,7 @@ pub fn delete_physical_by_key(
 /// replacement row is then inserted with the provided `RowHeader` and logical
 /// row bytes, allocating a fresh overflow chain when needed.
 pub fn restore_exact_row_image(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     root_pid: u64,
     key: &[u8],
     row_header: &RowHeader,

@@ -1,0 +1,1009 @@
+//! Shared database handle for the MySQL server.
+//!
+//! Each server process opens exactly one `SharedDatabase`, then shares it via
+//! `Arc<SharedDatabase>` across connection tasks. Internal subsystems (`MmapStorage`,
+//! `TxnManager`, Bloom registry, WAL writer) provide their own synchronization,
+//! so the outer connection path no longer needs a global `RwLock<Database>`.
+//!
+//! ## Fsync Pipeline (Phase 6.19)
+//!
+//! DML commits use a leader-based fsync pipeline (inspired by MariaDB's
+//! `group_commit_lock`). Instead of one `sync_all()` per transaction:
+//!
+//! 1. The executor writes the Commit WAL entry to the BufWriter (no fsync).
+//! 2. `take_commit_rx()` calls `pipeline.acquire(commit_lsn, txn_id)`:
+//!    - **Expired**: another leader already fsynced past this LSN → immediate return.
+//!    - **Acquired**: this connection becomes leader → flush+fsync+advance, return.
+//!    - **Queued**: another leader is active → return receiver; handler awaits it
+//!      after releasing any catalog guard held for statement setup.
+//!
+//! This amortises fsyncs across pipelined commits (even single-connection) and
+//! supersedes the timer-based group commit from Phase 3.19.
+//!
+//! ## Prepared Statement Plan Cache (Phase 5.13)
+//!
+//! `schema_version` is a global monotonic counter incremented after every
+//! successful DDL statement (CREATE/DROP/ALTER TABLE, CREATE/DROP INDEX,
+//! TRUNCATE). Each connection clones `Arc<AtomicU64>` at connect time and
+//! can poll it lock-free. When a connection's cached `compiled_at_version`
+//! diverges from `schema_version`, the cached plan is stale and must be
+//! re-analyzed before execution.
+
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
+
+use tokio::sync::RwLock;
+
+use axiomdb_catalog::{bootstrap::CatalogBootstrap, CatalogReader, DEFAULT_DATABASE_NAME};
+use axiomdb_core::error::DbError;
+use axiomdb_core::TxnId;
+use axiomdb_sql::{
+    analyze_cached_with_defaults,
+    ast::Stmt,
+    bloom::BloomRegistry,
+    execute_read_only_with_ctx, execute_with_ctx, parse_with_sql_mode,
+    result::{ColumnMeta, QueryResult},
+    session::{is_ignorable_on_error, OnErrorMode},
+    verify_and_repair_indexes_on_open, SchemaCache, SessionContext,
+};
+use axiomdb_storage::{DbConfig, MmapStorage, WalDurabilityPolicy};
+use axiomdb_types::{DataType, Value};
+use axiomdb_wal::{AcquireResult, FsyncPipeline, TxnManager};
+
+use super::error::dberror_to_mysql_warning;
+use super::status::StatusRegistry;
+
+/// Receiver for fsync pipeline confirmation.
+///
+/// Resolves to `Ok(())` when the fsync covering the DML commit completes,
+/// or `Err(WalGroupCommitFailed)` / `Err(DiskFull)` if the fsync fails.
+pub type CommitRx = axiomdb_wal::CommitRx;
+
+// ── RuntimeMode ───────────────────────────────────────────────────────────────
+
+/// Shared runtime mode for the whole opened database process.
+///
+/// Stored as an `AtomicU8` so the background group-commit task and all
+/// connection handlers can read it without holding a global outer lock.
+///
+/// The transition is one-way: `ReadWrite → ReadOnlyDegraded`. Once degraded
+/// the mode persists until the process restarts.
+pub const RUNTIME_MODE_READ_WRITE: u8 = 0;
+pub const RUNTIME_MODE_DEGRADED: u8 = 1;
+
+pub struct SharedDatabase {
+    pub storage: MmapStorage,
+    pub txn: TxnManager,
+    /// Bloom filter registry for secondary index lookups.
+    pub bloom: BloomRegistry,
+    /// Leader-based fsync pipeline (Phase 6.19). Always active — replaces the
+    /// timer-based group commit from Phase 3.19.
+    pub pipeline: FsyncPipeline,
+    /// Global schema version. Incremented after every successful DDL
+    /// (CREATE/DROP/ALTER TABLE, CREATE/DROP INDEX, TRUNCATE).
+    ///
+    /// Connections clone this `Arc` at connect time. Reading it requires no
+    /// lock — use `load(Ordering::Acquire)`. Writing happens through
+    /// `execute_query` / `execute_stmt` after the handler has taken the
+    /// appropriate catalog guard.
+    pub schema_version: Arc<AtomicU64>,
+    /// Server-wide status counters (Phase 5.9c).
+    ///
+    /// Connections clone this `Arc` once at connect time. Counter updates
+    /// use atomics — no lock needed after the initial clone.
+    pub status: Arc<StatusRegistry>,
+    /// Shared runtime mode (`RUNTIME_MODE_READ_WRITE` / `RUNTIME_MODE_DEGRADED`).
+    ///
+    /// Connections clone this `Arc` at connect time and poll it without
+    /// holding any global outer lock.
+    pub runtime_mode: Arc<AtomicU8>,
+    /// Snapshot registry for epoch-based page reclamation (Phase 7.8).
+    ///
+    /// Tracks active snapshot IDs across all connections. Used by `flush()`
+    /// to determine which deferred-free pages are safe to release.
+    pub snapshot_registry: Arc<super::snapshot_registry::SnapshotRegistry>,
+    /// Catalog lock used by the wire layer to serialize DDL against concurrent
+    /// DML while allowing multiple read-side statements to proceed together.
+    pub(crate) catalog_lock: RwLock<()>,
+}
+
+impl SharedDatabase {
+    /// Opens or creates a database at `data_dir` with default configuration.
+    ///
+    /// Creates the directory and initializes the catalog if not already present.
+    pub fn open(data_dir: &Path) -> Result<Self, DbError> {
+        Self::open_with_config(data_dir, &DbConfig::default())
+    }
+
+    /// Opens or creates a database at `data_dir` with explicit configuration.
+    ///
+    /// The resolved `WalDurabilityPolicy` controls whether the fsync pipeline
+    /// is used (`Strict`) or bypassed (`Normal` / `Off`).
+    pub fn open_with_config(data_dir: &Path, config: &DbConfig) -> Result<Self, DbError> {
+        std::fs::create_dir_all(data_dir).map_err(DbError::Io)?;
+
+        let db_path = data_dir.join("axiomdb.db");
+        let wal_path = data_dir.join("axiomdb.wal");
+
+        let (storage, mut txn) = if db_path.exists() {
+            let mut storage = MmapStorage::open(&db_path)?;
+            CatalogBootstrap::ensure_database_roots(&storage)?;
+            let (txn, _recovery) = TxnManager::open_with_recovery(&mut storage, &wal_path)?;
+            verify_and_repair_indexes_on_open(&storage, &txn)?;
+            (storage, txn)
+        } else {
+            let storage = MmapStorage::create(&db_path)?;
+            CatalogBootstrap::init(&storage)?;
+            let txn = TxnManager::create(&wal_path)?;
+            (storage, txn)
+        };
+
+        let durability = config.resolved_wal_durability();
+        txn.set_durability_policy(durability);
+
+        // Strict mode: enable pipeline commit so `TxnManager::commit()` writes
+        // the Commit WAL entry to the BufWriter without inline fsync. The fsync
+        // pipeline handles durability via leader-based coalescing.
+        //
+        // Normal / Off: bypass the pipeline — relaxed modes flush or skip
+        // inline and advance max_committed immediately in `commit()`.
+        if durability == WalDurabilityPolicy::Strict {
+            txn.set_deferred_commit_mode(true);
+        }
+        let pipeline = FsyncPipeline::new(txn.wal_current_lsn());
+
+        Ok(Self {
+            storage,
+            txn,
+            bloom: BloomRegistry::new(),
+            pipeline,
+            schema_version: Arc::new(AtomicU64::new(0)),
+            status: Arc::new(StatusRegistry::new()),
+            runtime_mode: Arc::new(AtomicU8::new(RUNTIME_MODE_READ_WRITE)),
+            snapshot_registry: Arc::new(super::snapshot_registry::SnapshotRegistry::new(
+                super::snapshot_registry::DEFAULT_MAX_CONNECTIONS,
+            )),
+            catalog_lock: RwLock::new(()),
+        })
+    }
+
+    /// Executes a SQL string through the full pipeline:
+    /// `parse → analyze_cached → execute_with_ctx`.
+    ///
+    /// Returns `(QueryResult, Option<CommitRx>)`.
+    ///
+    /// Increments `schema_version` after any successful DDL statement so that
+    /// connections can detect stale prepared statement plans (Phase 5.13).
+    ///
+    /// For DML statements that queue behind an active fsync leader, `CommitRx`
+    /// is `Some`. The caller should release any statement-scoped catalog guard
+    /// before awaiting the receiver so DDL/DML coordination is not held across
+    /// the fsync wait.
+    pub fn execute_query(
+        &self,
+        sql: &str,
+        session: &mut SessionContext,
+        schema_cache: &mut SchemaCache,
+    ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
+        // Clear warnings from the previous statement (MySQL clears on each new statement),
+        // except for SHOW WARNINGS itself — it must see the warnings it's reporting.
+        let lower_trim = sql.trim().to_ascii_lowercase();
+        if !lower_trim.starts_with("show warnings") {
+            session.clear_warnings();
+        }
+
+        if let Some(result) = self.try_execute_special_read_query(sql, session) {
+            return Ok((result, None));
+        }
+
+        // ── SHOW WARNINGS ─────────────────────────────────────────────────────
+        // Returns the warnings accumulated by the previous statement.
+        let lower = sql.trim().to_ascii_lowercase();
+        if lower == "show warnings" || lower == "show warnings;" {
+            let rows = session
+                .warnings
+                .iter()
+                .map(|w| {
+                    vec![
+                        Value::Text(w.level.to_string()),
+                        Value::Int(w.code as i32),
+                        Value::Text(w.message.clone()),
+                    ]
+                })
+                .collect();
+            let result = QueryResult::Rows {
+                columns: vec![
+                    ColumnMeta {
+                        name: "Level".into(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        table_name: None,
+                    },
+                    ColumnMeta {
+                        name: "Code".into(),
+                        data_type: DataType::Int,
+                        nullable: false,
+                        table_name: None,
+                    },
+                    ColumnMeta {
+                        name: "Message".into(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        table_name: None,
+                    },
+                ],
+                rows,
+            };
+            return Ok((result, None));
+        }
+
+        if self.is_degraded() && sql_may_mutate(sql) {
+            return Err(DbError::DiskFull {
+                operation: "database is in read-only degraded mode",
+            });
+        }
+
+        // ── parse ─────────────────────────────────────────────────────────────
+        let stmt = match parse_with_sql_mode(sql, None, session.sql_mode_flags()) {
+            Ok(s) => s,
+            Err(e) => return self.apply_on_error_pipeline_failure(sql, session, e),
+        };
+        let is_ddl = is_schema_changing(&stmt);
+
+        // ── analyze ───────────────────────────────────────────────────────────
+        let snap = if let Some(ref ct) = session.conn_txn {
+            self.txn.active_snapshot(ct)
+        } else {
+            self.txn.snapshot()
+        };
+        let analyzed = match analyze_cached_with_defaults(
+            stmt,
+            &self.storage,
+            snap,
+            session.effective_database(),
+            session.current_schema(),
+            schema_cache,
+        ) {
+            Ok(a) => a,
+            Err(e) => return self.apply_on_error_pipeline_failure(sql, session, e),
+        };
+
+        // ── execute ───────────────────────────────────────────────────────────
+        let result = execute_with_ctx(analyzed, &self.storage, &self.txn, &self.bloom, session);
+        if let Err(ref e) = result {
+            if matches!(e, DbError::DiskFull { .. }) {
+                self.enter_degraded_mode();
+            }
+        }
+        // For on_error = 'ignore', executor already rolled back the statement and
+        // returned Err — we intercept here to convert it to a warning + success.
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                return self.apply_on_error_pipeline_failure(sql, session, e);
+            }
+        };
+        if is_ddl {
+            self.schema_version.fetch_add(1, Ordering::Release);
+        }
+        let pending = session.pending_deferred_txn_id.take();
+        Ok((result, self.take_commit_rx(pending)))
+    }
+
+    /// Executes a read-only query using only shared references (Phase 7.4).
+    ///
+    /// Takes `&self` instead of `&mut self` — safe to call from multiple
+    /// connections simultaneously without any lock. Only handles SELECT,
+    /// SHOW TABLES, SHOW DATABASES. Returns error for write statements.
+    pub fn execute_read_query(
+        &self,
+        sql: &str,
+        session: &mut SessionContext,
+        schema_cache: &mut SchemaCache,
+    ) -> Result<QueryResult, DbError> {
+        let lower_trim = sql.trim().to_ascii_lowercase();
+        if !lower_trim.starts_with("show warnings") {
+            session.clear_warnings();
+        }
+
+        if let Some(result) = self.try_execute_special_read_query(sql, session) {
+            return Ok(result);
+        }
+
+        // Parse
+        let stmt = parse_with_sql_mode(sql, None, session.sql_mode_flags())?;
+
+        // Analyze (uses &self.storage, &self.txn — shared refs)
+        let snap = if let Some(ref ct) = session.conn_txn {
+            self.txn.active_snapshot(ct)
+        } else {
+            self.txn.snapshot()
+        };
+        let analyzed = analyze_cached_with_defaults(
+            stmt,
+            &self.storage,
+            snap,
+            session.effective_database(),
+            session.current_schema(),
+            schema_cache,
+        )?;
+
+        // Execute read-only path
+        execute_read_only_with_ctx(analyzed, &self.storage, &self.txn, &self.bloom, session)
+    }
+
+    /// Handles lightweight read-only queries that depend on live transaction or
+    /// session state and should not go through SQL parse/analyze.
+    fn try_execute_special_read_query(
+        &self,
+        sql: &str,
+        session: &SessionContext,
+    ) -> Option<QueryResult> {
+        let lower = sql.trim().to_ascii_lowercase();
+
+        // ── @@in_transaction ──────────────────────────────────────────────────
+        // Returns 1 when inside an active transaction, 0 otherwise.
+        if lower.contains("@@in_transaction") && lower.starts_with("select") {
+            let val = if session.conn_txn.is_some() {
+                Value::Int(1)
+            } else {
+                Value::Int(0)
+            };
+            return Some(QueryResult::Rows {
+                columns: vec![ColumnMeta {
+                    name: "@@in_transaction".into(),
+                    data_type: DataType::Int,
+                    nullable: false,
+                    table_name: None,
+                }],
+                rows: vec![vec![val]],
+            });
+        }
+
+        // ── SHOW WARNINGS ─────────────────────────────────────────────────────
+        if lower == "show warnings" || lower == "show warnings;" {
+            let rows = session
+                .warnings
+                .iter()
+                .map(|w| {
+                    vec![
+                        Value::Text(w.level.to_string()),
+                        Value::Int(w.code as i32),
+                        Value::Text(w.message.clone()),
+                    ]
+                })
+                .collect();
+            return Some(QueryResult::Rows {
+                columns: vec![
+                    ColumnMeta {
+                        name: "Level".into(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        table_name: None,
+                    },
+                    ColumnMeta {
+                        name: "Code".into(),
+                        data_type: DataType::Int,
+                        nullable: false,
+                        table_name: None,
+                    },
+                    ColumnMeta {
+                        name: "Message".into(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        table_name: None,
+                    },
+                ],
+                rows,
+            });
+        }
+
+        None
+    }
+
+    /// Applies the session `on_error` policy to a pipeline failure from
+    /// parse, analyze, or execute.
+    ///
+    /// - `RollbackStatement` / `Savepoint`: keep any active txn open, return ERR.
+    /// - `RollbackTransaction`: roll back the whole active txn, return ERR.
+    /// - `Ignore` (ignorable error): add warning, return `QueryResult::Empty`.
+    /// - `Ignore` (non-ignorable): roll back active txn, return ERR.
+    fn apply_on_error_pipeline_failure(
+        &self,
+        sql: &str,
+        session: &mut SessionContext,
+        err: DbError,
+    ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
+        if matches!(err, DbError::DiskFull { .. }) {
+            self.enter_degraded_mode();
+        }
+        match session.on_error {
+            OnErrorMode::RollbackTransaction => {
+                if let Some(conn) = session.conn_txn.take() {
+                    let _ = self.txn.rollback(conn, &self.storage);
+                }
+                Err(err)
+            }
+            OnErrorMode::Ignore if is_ignorable_on_error(&err) => {
+                let (code, message) = dberror_to_mysql_warning(&err, Some(sql));
+                session.warn(code, message);
+                Ok((QueryResult::Empty, None))
+            }
+            OnErrorMode::Ignore => {
+                if let Some(conn) = session.conn_txn.take() {
+                    let _ = self.txn.rollback(conn, &self.storage);
+                }
+                Err(err)
+            }
+            _ => {
+                // RollbackStatement / Savepoint / Ignore non-ignorable:
+                // executor already handled statement-level rollback where applicable.
+                Err(err)
+            }
+        }
+    }
+
+    /// Executes a pre-parsed `Stmt` — skips `parse()` but runs snapshot +
+    /// analyze + execute (full pipeline minus parse).
+    ///
+    /// Used by the literal-normalized plan cache (Phase 27.8b). Like
+    /// PostgreSQL, every execution gets a fresh snapshot even with a cached
+    /// plan — only the parse step is skipped.
+    pub fn execute_cached_stmt(
+        &self,
+        sql: &str,
+        stmt: Stmt,
+        session: &mut SessionContext,
+        schema_cache: &mut SchemaCache,
+    ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
+        if !sql.trim().to_ascii_lowercase().starts_with("show warnings") {
+            session.clear_warnings();
+        }
+
+        if self.is_degraded() && stmt_may_mutate(&stmt) {
+            return Err(DbError::DiskFull {
+                operation: "database is in read-only degraded mode",
+            });
+        }
+        let is_ddl = is_schema_changing(&stmt);
+
+        // Fresh snapshot (same as execute_query — PostgreSQL model).
+        let snap = if let Some(ref ct) = session.conn_txn {
+            self.txn.active_snapshot(ct)
+        } else {
+            self.txn.snapshot()
+        };
+
+        // Analyze (resolve columns, type check).
+        let analyzed = match analyze_cached_with_defaults(
+            stmt,
+            &self.storage,
+            snap,
+            session.effective_database(),
+            session.current_schema(),
+            schema_cache,
+        ) {
+            Ok(a) => a,
+            Err(e) => return self.apply_on_error_pipeline_failure(sql, session, e),
+        };
+
+        // Execute.
+        let result = execute_with_ctx(analyzed, &self.storage, &self.txn, &self.bloom, session);
+        if let Err(ref e) = result {
+            if matches!(e, DbError::DiskFull { .. }) {
+                self.enter_degraded_mode();
+            }
+        }
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => return self.apply_on_error_pipeline_failure(sql, session, e),
+        };
+        if is_ddl {
+            self.schema_version.fetch_add(1, Ordering::Release);
+        }
+        let pending = session.pending_deferred_txn_id.take();
+        Ok((result, self.take_commit_rx(pending)))
+    }
+
+    /// Executes an already-analyzed `Stmt` — used by the prepared statement
+    /// plan cache path to skip `parse()` + `analyze()` entirely.
+    ///
+    /// Also increments `schema_version` on DDL (Phase 5.13).
+    pub fn execute_stmt(
+        &self,
+        stmt: Stmt,
+        session: &mut SessionContext,
+    ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
+        session.clear_warnings();
+
+        if self.is_degraded() && stmt_may_mutate(&stmt) {
+            return Err(DbError::DiskFull {
+                operation: "database is in read-only degraded mode",
+            });
+        }
+        let is_ddl = is_schema_changing(&stmt);
+        let result = execute_with_ctx(stmt, &self.storage, &self.txn, &self.bloom, session);
+        if let Err(ref e) = result {
+            if matches!(e, DbError::DiskFull { .. }) {
+                self.enter_degraded_mode();
+            }
+        }
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => return self.apply_on_error_pipeline_failure("", session, e),
+        };
+        if is_ddl {
+            self.schema_version.fetch_add(1, Ordering::Release);
+        }
+        let pending = session.pending_deferred_txn_id.take();
+        Ok((result, self.take_commit_rx(pending)))
+    }
+
+    /// Returns a snapshot for plan cache analysis (outside a transaction).
+    pub fn txn_snapshot_for_cache(&self) -> axiomdb_core::TransactionSnapshot {
+        self.txn.snapshot()
+    }
+
+    /// Returns a shared reference to the storage engine for read-only operations.
+    pub fn storage_ref(&self) -> &dyn axiomdb_storage::StorageEngine {
+        &self.storage
+    }
+
+    /// Releases deferred-free pages for the given committed transaction IDs.
+    ///
+    /// Wraps `TxnManager::release_committed_frees` to avoid split-borrow issues
+    /// when both `txn` and `storage` are fields of the same `SharedDatabase`.
+    pub fn release_deferred_frees(
+        &self,
+        txn_ids: &[axiomdb_core::TxnId],
+    ) -> Result<(), axiomdb_core::error::DbError> {
+        self.txn.release_committed_frees(&self.storage, txn_ids)
+    }
+
+    /// Returns `true` if the database has entered read-only degraded mode due
+    /// to a previous disk-full error.
+    pub fn is_degraded(&self) -> bool {
+        self.runtime_mode.load(Ordering::Acquire) == RUNTIME_MODE_DEGRADED
+    }
+
+    /// Transitions the database to read-only degraded mode (one-way).
+    ///
+    /// Safe to call from any thread. Has no effect if already degraded.
+    pub fn enter_degraded_mode(&self) {
+        self.runtime_mode
+            .store(RUNTIME_MODE_DEGRADED, Ordering::Release);
+    }
+
+    /// Returns the current database name (always "axiomdb" for Phase 5).
+    pub fn current_database(&self) -> &str {
+        DEFAULT_DATABASE_NAME
+    }
+
+    /// Resolves the `TableId` affected by a DDL statement.
+    ///
+    /// Used by the connection handler to call `PlanCache::invalidate_table()`
+    /// immediately after DDL succeeds (eager belt-and-suspenders invalidation,
+    /// Phase 40.2). Returns `None` for DDL without a specific table target
+    /// (e.g., `CREATE TABLE`, `CREATE DATABASE`, `DROP DATABASE`).
+    ///
+    /// Does NOT take a write lock — called while the write guard is already held.
+    pub fn ddl_affected_table_id(&self, stmt: &Stmt, database: &str) -> Option<u32> {
+        let table_ref = match stmt {
+            Stmt::DropTable(s) => s.tables.first()?,
+            Stmt::CreateIndex(s) => &s.table,
+            Stmt::DropIndex(s) => s.table.as_ref()?,
+            Stmt::TruncateTable(s) => &s.table,
+            Stmt::AlterTable(s) => &s.table,
+            _ => return None,
+        };
+        let schema = table_ref.schema.as_deref().unwrap_or(DEFAULT_DATABASE_NAME);
+        let snap = self.txn.snapshot();
+        CatalogReader::new(&self.storage, snap)
+            .ok()?
+            .get_table_in_database(database, schema, &table_ref.name)
+            .ok()?
+            .map(|d| d.id)
+    }
+
+    /// Returns `true` if a logical database exists in the catalog.
+    pub fn database_exists(&self, name: &str) -> Result<bool, DbError> {
+        let snap = self.txn.snapshot();
+        let mut reader = CatalogReader::new(&self.storage, snap)?;
+        reader.database_exists(name)
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Drives the fsync pipeline for a deferred DML commit.
+    ///
+    /// `pending_txn_id` is `Some(txn_id)` when `commit()` returned a deferred
+    /// commit (pipeline mode). `None` for read-only or immediate commits.
+    fn take_commit_rx(&self, pending_txn_id: Option<TxnId>) -> Option<CommitRx> {
+        let txn_id = pending_txn_id?;
+        let commit_lsn = self.txn.wal_current_lsn();
+
+        match self.pipeline.acquire(commit_lsn, txn_id) {
+            AcquireResult::Expired => {
+                // Another leader already fsynced past our LSN.
+                self.txn.advance_committed_single(txn_id);
+                let _ = self.txn.release_committed_frees(&self.storage, &[txn_id]);
+                None
+            }
+            AcquireResult::Acquired => {
+                // We are the leader — flush + fsync.
+                let fsync_result = self.txn.wal_flush_and_fsync();
+                match fsync_result {
+                    Ok(()) => {
+                        let flushed_lsn = self.txn.wal_current_lsn();
+                        // Advance our own txn.
+                        self.txn.advance_committed_single(txn_id);
+                        let _ = self.txn.release_committed_frees(&self.storage, &[txn_id]);
+                        // Wake followers and advance their txns.
+                        let woken_ids = self.pipeline.release_ok(flushed_lsn);
+                        if !woken_ids.is_empty() {
+                            self.txn.advance_committed(&woken_ids);
+                            let _ = self.txn.release_committed_frees(&self.storage, &woken_ids);
+                        }
+                        None
+                    }
+                    Err(ref e) => {
+                        let is_disk_full = matches!(e, DbError::DiskFull { .. });
+                        if is_disk_full {
+                            self.enter_degraded_mode();
+                        }
+                        let msg = e.to_string();
+                        self.pipeline.release_err(&msg, is_disk_full);
+                        // Return the error as a failed commit for this connection.
+                        // We create a oneshot and send the error immediately.
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        let err = if is_disk_full {
+                            DbError::DiskFull {
+                                operation: "wal pipeline fsync",
+                            }
+                        } else {
+                            DbError::WalGroupCommitFailed { message: msg }
+                        };
+                        let _ = tx.send(Err(err));
+                        Some(rx)
+                    }
+                }
+            }
+            AcquireResult::Queued(rx) => {
+                // Another leader is running — we must await the fsync.
+                // NOTE: max_committed for this txn will be advanced by the
+                // leader via release_ok → advance_committed on the woken_ids.
+                // However, the leader only knows about woken_ids from the
+                // pipeline, not from TxnManager. We need the leader to
+                // advance max_committed for queued followers.
+                //
+                // Problem: the leader calls self.txn.advance_committed(&woken_ids)
+                // but those woken_ids come from the pipeline's Waiter.txn_id.
+                // This works because we stored txn_id in the pipeline.
+                //
+                // Deferred frees: the handler will call release_deferred_frees
+                // after receiving Ok from the pipeline. But the handler doesn't
+                // have access to SharedDatabase... Actually, the leader already calls
+                // release_committed_frees for the woken_ids. So we're covered.
+                Some(rx)
+            }
+        }
+    }
+}
+
+/// Returns `true` if `stmt` is a DDL statement that modifies the schema.
+///
+/// Used to decide whether to increment `SharedDatabase::schema_version` after
+/// a successful execution, signalling connections to re-validate their
+/// cached prepared statement plans (Phase 5.13).
+fn is_schema_changing(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::CreateTable(_)
+            | Stmt::CreateDatabase(_)
+            | Stmt::DropTable(_)
+            | Stmt::DropDatabase(_)
+            | Stmt::AlterTable(_)
+            | Stmt::CreateIndex(_)
+            | Stmt::DropIndex(_)
+            | Stmt::TruncateTable(_)
+    )
+}
+
+/// Quick keyword-level check: does this SQL string look like it may mutate
+/// durable state?
+///
+/// Used to gate statements before they reach WAL/storage when the database
+/// is in read-only degraded mode. Conservative — prefers false positives
+/// (blocking a SELECT that starts with "INSERT" is fine; never allow a real
+/// INSERT to slip through).
+///
+/// Not a substitute for the parser — only used as a fast pre-check.
+/// Returns true if the SQL is a read-only query that can be executed with
+/// only a shared read lock (Phase 7.4).
+///
+/// Conservative: only SELECT, SHOW, and DESCRIBE qualify. SET, USE, BEGIN,
+/// and anything else goes through the exclusive write path.
+pub fn is_read_only_sql(sql: &str) -> bool {
+    let lower = sql.trim_start().to_ascii_lowercase();
+    if lower.starts_with("select") {
+        // SELECT FOR UPDATE / FOR SHARE require exclusive write lock.
+        // SELECT INTO OUTFILE / INTO DUMPFILE perform filesystem writes.
+        // These are NOT read-only — must go through the write path.
+        return !lower.contains(" for update")
+            && !lower.contains(" for share")
+            && !lower.contains(" into outfile")
+            && !lower.contains(" into dumpfile");
+    }
+    lower.starts_with("show") || lower.starts_with("describe") || lower.starts_with("desc ")
+}
+
+pub fn sql_may_mutate(sql: &str) -> bool {
+    let lower = sql.trim_start().to_ascii_lowercase();
+    // DML
+    lower.starts_with("insert")
+        || lower.starts_with("update")
+        || lower.starts_with("delete")
+        || lower.starts_with("truncate")
+        // DDL
+        || lower.starts_with("create")
+        || lower.starts_with("drop")
+        || lower.starts_with("alter")
+        // Transaction control
+        || lower.starts_with("begin")
+        || lower.starts_with("start transaction")
+        || lower.starts_with("commit")
+        || lower.starts_with("rollback")
+        || lower.starts_with("savepoint")
+        || lower.starts_with("release")
+}
+
+/// Returns `true` if the parsed `Stmt` may mutate durable state.
+///
+/// Used for the prepared-statement execute path where we already have
+/// the parsed AST — avoids re-parsing just for the gate check.
+fn stmt_may_mutate(stmt: &Stmt) -> bool {
+    !matches!(
+        stmt,
+        Stmt::Select(_)
+            | Stmt::ShowTables(_)
+            | Stmt::ShowDatabases(_)
+            | Stmt::ShowColumns(_)
+            | Stmt::ShowIndex(_)
+            | Stmt::ShowCreateTable(_)
+            | Stmt::Set(_)
+            | Stmt::UseDatabase(_)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use axiomdb_core::error::DbError;
+    use axiomdb_sql::{analyze_cached_with_defaults, parse, SchemaCache, SessionContext};
+    use axiomdb_types::Value;
+
+    use super::{is_read_only_sql, OnErrorMode, QueryResult, SharedDatabase};
+
+    fn open_db() -> (tempfile::TempDir, SharedDatabase) {
+        let dir = tempdir().expect("temp dir");
+        let db = SharedDatabase::open(dir.path()).expect("open db");
+        (dir, db)
+    }
+
+    #[test]
+    fn test_ignore_parse_error_becomes_warning_and_keeps_txn_open() {
+        let (_dir, db) = open_db();
+        let mut session = SessionContext::new();
+        let mut cache = SchemaCache::default();
+
+        session.on_error = OnErrorMode::Ignore;
+        db.txn.begin().expect("begin txn");
+
+        let result = db
+            .execute_query("SELEC 1", &mut session, &mut cache)
+            .expect("ignore parse error returns success");
+
+        assert!(
+            matches!(result.0, QueryResult::Empty),
+            "ignored parse error must serialize as Empty/OK"
+        );
+        assert!(
+            db.txn.active_txn_id().is_some(),
+            "ignorable parse error must keep active txn open in ignore mode"
+        );
+        assert_eq!(session.warning_count(), 1);
+        assert_eq!(session.warnings[0].code, 1064);
+        assert!(
+            session.warnings[0]
+                .message
+                .to_ascii_lowercase()
+                .contains("error in your sql syntax"),
+            "warning should preserve original error text: {}",
+            session.warnings[0].message
+        );
+    }
+
+    #[test]
+    fn test_ignore_duplicate_key_becomes_warning_and_keeps_txn_open() {
+        let (_dir, db) = open_db();
+        let mut session = SessionContext::new();
+        let mut cache = SchemaCache::default();
+
+        db.execute_query(
+            "CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE)",
+            &mut session,
+            &mut cache,
+        )
+        .expect("create table");
+
+        session.on_error = OnErrorMode::Ignore;
+        session.conn_txn = Some(db.txn.begin().expect("begin txn"));
+        session.in_explicit_txn = true;
+
+        db.execute_query(
+            "INSERT INTO t VALUES (1, 'alice@example.com')",
+            &mut session,
+            &mut cache,
+        )
+        .expect("first insert");
+
+        let result = db
+            .execute_query(
+                "INSERT INTO t VALUES (1, 'alice@example.com')",
+                &mut session,
+                &mut cache,
+            )
+            .expect("ignore duplicate returns success");
+
+        assert!(
+            matches!(result.0, QueryResult::Empty),
+            "ignored duplicate must serialize as Empty/OK"
+        );
+        assert!(
+            db.txn.active_txn_id().is_some(),
+            "ignorable duplicate must keep active txn open in ignore mode"
+        );
+        assert_eq!(session.warning_count(), 1);
+        assert_eq!(session.warnings[0].code, 1062);
+    }
+
+    #[test]
+    fn test_ignore_duplicate_execute_stmt_cache_hit_becomes_warning_and_keeps_txn_open() {
+        let (_dir, db) = open_db();
+        let mut session = SessionContext::new();
+        let mut cache = SchemaCache::default();
+
+        db.execute_query(
+            "CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE)",
+            &mut session,
+            &mut cache,
+        )
+        .expect("create table");
+
+        session.on_error = OnErrorMode::Ignore;
+        let conn_txn = db.txn.begin().expect("begin txn");
+        let snap = db.txn.active_snapshot(&conn_txn);
+        session.conn_txn = Some(conn_txn);
+
+        let analyzed = analyze_cached_with_defaults(
+            parse("INSERT INTO t VALUES (1, 'alice@example.com')", None).expect("parse insert"),
+            &db.storage,
+            snap,
+            session.effective_database(),
+            session.current_schema(),
+            &mut cache,
+        )
+        .expect("analyze insert");
+
+        db.execute_stmt(analyzed.clone(), &mut session)
+            .expect("first insert");
+
+        let result = db
+            .execute_stmt(analyzed, &mut session)
+            .expect("ignore duplicate returns success on execute_stmt");
+
+        assert!(
+            matches!(result.0, QueryResult::Empty),
+            "ignored duplicate must serialize as Empty/OK"
+        );
+        assert!(
+            db.txn.active_txn_id().is_some(),
+            "ignorable duplicate must keep active txn open in ignore mode"
+        );
+        assert_eq!(session.warning_count(), 1);
+        assert_eq!(session.warnings[0].code, 1062);
+    }
+
+    #[test]
+    fn test_ignore_non_ignorable_error_rolls_back_active_txn() {
+        let (_dir, db) = open_db();
+        let mut session = SessionContext::new();
+
+        session.on_error = OnErrorMode::Ignore;
+        session.conn_txn = Some(db.txn.begin().expect("begin txn"));
+
+        let err = db
+            .apply_on_error_pipeline_failure(
+                "INSERT INTO t VALUES (1)",
+                &mut session,
+                DbError::DiskFull { operation: "test" },
+            )
+            .expect_err("disk full must still return ERR");
+
+        assert!(matches!(err, DbError::DiskFull { .. }));
+        assert!(
+            db.txn.active_txn_id().is_none(),
+            "non-ignorable ignore error must eagerly roll back the txn"
+        );
+        assert_eq!(session.warning_count(), 0);
+    }
+
+    #[test]
+    fn test_execute_read_query_intercepts_in_transaction() {
+        let (_dir, db) = open_db();
+        let mut session = SessionContext::new();
+        let mut cache = SchemaCache::default();
+
+        let result = db
+            .execute_read_query("SELECT @@in_transaction", &mut session, &mut cache)
+            .expect("read-only @@in_transaction should be intercepted");
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected row result for @@in_transaction");
+        };
+        assert_eq!(rows, vec![vec![Value::Int(0)]]);
+
+        session.conn_txn = Some(db.txn.begin().expect("begin txn"));
+        let result = db
+            .execute_read_query("SELECT @@in_transaction", &mut session, &mut cache)
+            .expect("read-only @@in_transaction should see active txn");
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected row result for @@in_transaction");
+        };
+        assert_eq!(rows, vec![vec![Value::Int(1)]]);
+    }
+
+    // ── is_read_only_sql classification tests ────────────────────────────
+
+    #[test]
+    fn test_is_read_only_plain_select() {
+        assert!(is_read_only_sql("SELECT * FROM users"));
+        assert!(is_read_only_sql("select 1"));
+        assert!(is_read_only_sql("  SELECT id FROM t WHERE x = 1"));
+    }
+
+    #[test]
+    fn test_is_read_only_show_describe() {
+        assert!(is_read_only_sql("SHOW TABLES"));
+        assert!(is_read_only_sql("DESCRIBE users"));
+        assert!(is_read_only_sql("DESC users"));
+    }
+
+    #[test]
+    fn test_is_read_only_select_for_update_is_not_read_only() {
+        assert!(!is_read_only_sql("SELECT * FROM users FOR UPDATE"));
+        assert!(!is_read_only_sql("select id from t where x = 1 for update"));
+        assert!(!is_read_only_sql("SELECT * FROM users FOR SHARE"));
+    }
+
+    #[test]
+    fn test_is_read_only_select_into_is_not_read_only() {
+        assert!(!is_read_only_sql(
+            "SELECT * INTO OUTFILE '/tmp/data.csv' FROM t"
+        ));
+        assert!(!is_read_only_sql(
+            "SELECT * INTO DUMPFILE '/tmp/data.bin' FROM t"
+        ));
+    }
+
+    #[test]
+    fn test_is_read_only_dml_is_not_read_only() {
+        assert!(!is_read_only_sql("INSERT INTO t VALUES (1)"));
+        assert!(!is_read_only_sql("UPDATE t SET x = 1"));
+        assert!(!is_read_only_sql("DELETE FROM t"));
+        assert!(!is_read_only_sql("BEGIN"));
+        assert!(!is_read_only_sql("COMMIT"));
+        assert!(!is_read_only_sql("SET autocommit = 0"));
+    }
+}

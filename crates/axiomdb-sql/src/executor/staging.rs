@@ -9,7 +9,7 @@
 
 #[allow(dead_code)]
 fn detect_committed_empty_unique_indexes(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     indexes: &[IndexDef],
 ) -> Result<std::collections::HashSet<u32>, DbError> {
     let mut committed_empty = std::collections::HashSet::new();
@@ -37,10 +37,10 @@ pub(super) struct InsertBatchApply<'a> {
 }
 
 fn persist_batch_insert_indexes(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
     plan: &mut InsertBatchApply<'_>,
     rids: &[RecordId],
 ) -> Result<bool, DbError> {
@@ -93,10 +93,10 @@ fn persist_batch_insert_indexes(
 }
 
 pub(super) fn apply_insert_batch(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
     mut plan: InsertBatchApply<'_>,
 ) -> Result<Vec<RecordId>, DbError> {
     let rids = TableEngine::insert_rows_batch(storage, txn, conn_txn, plan.table_def, plan.columns, plan.rows)?;
@@ -105,9 +105,9 @@ pub(super) fn apply_insert_batch(
 }
 
 pub(super) fn apply_insert_batch_with_ctx(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
-    bloom: &mut crate::bloom::BloomRegistry,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    bloom: &crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     mut plan: InsertBatchApply<'_>,
@@ -143,9 +143,9 @@ pub(super) fn flush_pending_inserts_ctx(
     ctx: &mut SessionContext,
 ) -> Result<(), DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
-    let storage = unsafe { exec_ctx.storage_mut() };
-    let txn = unsafe { exec_ctx.coord_mut() };
-    let bloom = unsafe { exec_ctx.bloom_mut() };
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
+    let bloom = exec_ctx.bloom();
     let batch = match ctx.pending_inserts.take() {
         Some(b) => b,
         None => return Ok(()),
@@ -205,9 +205,9 @@ pub(super) fn flush_clustered_insert_batch(
     ctx: &mut SessionContext,
 ) -> Result<(), DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
-    let storage = unsafe { exec_ctx.storage_mut() };
-    let txn = unsafe { exec_ctx.coord_mut() };
-    let bloom = unsafe { exec_ctx.bloom_mut() };
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
+    let bloom = exec_ctx.bloom();
     let batch = match ctx.clustered_insert_batch.take() {
         Some(b) => b,
         None => return Ok(()),

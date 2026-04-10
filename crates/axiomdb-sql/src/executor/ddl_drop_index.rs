@@ -31,10 +31,10 @@ fn find_table_for_index(
 
 fn execute_drop_index(
     stmt: DropIndexStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
     database: &str,
 ) -> Result<QueryResult, DbError> {
     let snap = txn.active_snapshot(conn_txn);
@@ -113,10 +113,10 @@ fn execute_drop_index(
 /// FK constraint is dropped.
 fn execute_drop_index_by_id(
     index_id: u32,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
 ) -> Result<(), DbError> {
     let snap = txn.active_snapshot(conn_txn);
     // Find the root page ID so we can free the B-Tree pages.

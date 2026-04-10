@@ -23,7 +23,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot, TxnId};
 use axiomdb_storage::{
@@ -216,12 +216,43 @@ impl ConnectionTxn {
     }
 }
 
+// ── PostCommitBatches (Phase 40.10) ──────────────────────────────────────────
+
+/// Post-commit housekeeping data protected by a single `Mutex`.
+///
+/// Contains page-free batches and page-batch draining data that accumulate
+/// during `commit()` and are drained asynchronously afterward. Grouped under
+/// one lock to avoid per-Vec Mutex overhead — the critical section is O(push).
+#[derive(Debug, Default)]
+pub(crate) struct PostCommitBatches {
+    /// Pages waiting to be freed after their transaction is durably committed.
+    pub(crate) committed_free_batches: Vec<(TxnId, Vec<u64>)>,
+    /// Phase 40.9: leftover `LocalPageBatch.available` pages from committed
+    /// transactions, awaiting `free_page_batch` to return them to the bitmap.
+    pub(crate) committed_steal_protection: Vec<Vec<u64>>,
+    /// Phase 40.9: `LocalPageBatch.freed` pages from committed transactions,
+    /// awaiting `recycle_page` to push them to the lock-free queue.
+    pub(crate) committed_recycle_pages: Vec<Vec<u64>>,
+}
+
 // ── TxnManager ───────────────────────────────────────────────────────────────
 
 /// Coordinates the transaction lifecycle over the WAL and heap pages.
+///
+/// ## Interior mutability (Phase 40.10)
+///
+/// All methods take `&self`. Concurrent access is safe:
+/// - `next_txn_id`: `AtomicU64` — lock-free txn ID allocation.
+/// - `max_committed`: `AtomicU64` — lock-free snapshot reads.
+/// - `active_set`: `RwLock` — concurrent snapshot reads, exclusive for begin/commit.
+/// - `wal`: `ConcurrentWalWriter` — internal Mutex for group commit.
+/// - `post_commit`: `Mutex<PostCommitBatches>` — brief lock for page-free bookkeeping.
+/// - `last_clustered_roots`: `Mutex<HashMap>` — brief lock for root tracking.
 pub struct TxnManager {
     wal: ConcurrentWalWriter,
-    next_txn_id: u64,
+    /// Monotonically increasing transaction ID counter.
+    /// `AtomicU64` for lock-free allocation across concurrent connections.
+    next_txn_id: AtomicU64,
     /// TxnId of the last committed transaction.
     /// `AtomicU64` allows `snapshot()` to read without `&mut self`.
     /// Written under `active_set.write()` lock for atomicity (DuckDB + PostgreSQL pattern).
@@ -234,27 +265,14 @@ pub struct TxnManager {
     /// 0 means no active transactions.
     lowest_active_id: AtomicU64,
     /// When `true`, DML `commit()` skips inline flush+fsync.
-    /// The `ConnectionTxn` stores the pending txn_id for the caller to drive the
-    /// leader-based WAL fsync pipeline.
+    /// Set once at construction, immutable afterward.
     deferred_commit_mode: bool,
-    /// Pages waiting to be freed after their transaction is durably committed.
-    committed_free_batches: Vec<(TxnId, Vec<u64>)>,
-    /// Phase 40.9: leftover `LocalPageBatch.available` pages from committed
-    /// transactions, awaiting `free_page_batch` to return them to the bitmap.
-    /// Drained by `drain_committed_page_batches(storage)`.
-    committed_steal_protection: Vec<Vec<u64>>,
-    /// Phase 40.9: `LocalPageBatch.freed` pages from committed transactions,
-    /// awaiting `recycle_page` to push them to the lock-free queue.
-    /// Drained by `drain_committed_page_batches(storage)`.
-    committed_recycle_pages: Vec<Vec<u64>>,
-    /// WAL durability policy for committed DML.
+    /// Post-commit housekeeping data (page frees, page batch draining).
+    post_commit: Mutex<PostCommitBatches>,
+    /// WAL durability policy for committed DML. Set once at construction.
     durability_policy: WalDurabilityPolicy,
     /// Last known clustered root per table after the most recent commit or rollback.
-    last_clustered_roots: HashMap<u32, u64>,
-    /// Mirrors `ConnectionTxn::pending_deferred_txn_id` after each `commit()` in
-    /// deferred mode. Allows callers to retrieve the pending id after the
-    /// `ConnectionTxn` has been consumed by `commit()`.
-    pending_deferred_txn_id: Option<TxnId>,
+    last_clustered_roots: Mutex<HashMap<u32, u64>>,
 }
 
 include!("txn_construction.rs");
@@ -655,15 +673,18 @@ mod tests {
     // ── error cases ───────────────────────────────────────────────────────────
 
     #[test]
-    fn test_double_begin_error() {
+    fn test_double_begin_concurrent() {
+        // Phase 40.10: multiple connections can begin concurrently.
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
+        let mgr = TxnManager::create(&path).unwrap();
 
-        let conn = mgr.begin().unwrap();
-        let err = mgr.begin().unwrap_err();
-        assert!(matches!(err, DbError::TransactionAlreadyActive { .. }));
-        // Drop conn without commit (simulates crash, conn is just dropped)
-        let _ = conn;
+        let conn1 = mgr.begin().unwrap();
+        let conn2 = mgr.begin().unwrap();
+        assert_ne!(conn1.txn_id, conn2.txn_id);
+        // Both txns are in the active set.
+        assert!(mgr.has_active_txn());
+        let _ = mgr.rollback(conn1, &axiomdb_storage::MemoryStorage::new());
+        let _ = mgr.rollback(conn2, &axiomdb_storage::MemoryStorage::new());
     }
 
     #[test]

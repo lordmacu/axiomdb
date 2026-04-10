@@ -101,7 +101,6 @@ impl ServerBootstrapConfig {
 async fn main() {
     use std::sync::Arc;
     use tokio::net::TcpListener;
-    use tokio::sync::RwLock;
     use tracing::info;
     use tracing_subscriber::EnvFilter;
 
@@ -144,11 +143,13 @@ async fn main() {
             }
         };
 
-    let db = match axiomdb_network::mysql::Database::open_with_config(&config.data_dir, &db_config)
-    {
+    let db = match axiomdb_network::mysql::SharedDatabase::open_with_config(
+        &config.data_dir,
+        &db_config,
+    ) {
         Ok(db) => {
             info!("database opened successfully");
-            Arc::new(RwLock::new(db))
+            Arc::new(db)
         }
         Err(e) => {
             tracing::error!(err = %e, "failed to open database");

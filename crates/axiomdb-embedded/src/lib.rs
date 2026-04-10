@@ -131,12 +131,12 @@ mod db {
 
             let (storage, txn) = if db_path.exists() {
                 let mut storage = MmapStorage::open(&db_path)?;
-                let (mut txn, _recovery) = TxnManager::open_with_recovery(&mut storage, &wal_path)?;
-                verify_and_repair_indexes_on_open(&mut storage, &mut txn)?;
+                let (txn, _recovery) = TxnManager::open_with_recovery(&mut storage, &wal_path)?;
+                verify_and_repair_indexes_on_open(&storage, &txn)?;
                 (storage, txn)
             } else {
-                let mut storage = MmapStorage::create(&db_path)?;
-                CatalogBootstrap::init(&mut storage)?;
+                let storage = MmapStorage::create(&db_path)?;
+                CatalogBootstrap::init(&storage)?;
                 let txn = TxnManager::create(&wal_path)?;
                 (storage, txn)
             };
@@ -267,9 +267,9 @@ mod db {
             let analyzed = analyze_cached(stmt, &self.storage, snap, &mut self.schema_cache)?;
             execute_with_ctx(
                 analyzed,
-                &mut self.storage,
-                &mut self.txn,
-                &mut self.bloom,
+                &self.storage,
+                &self.txn,
+                &self.bloom,
                 &mut self.session,
             )
         }
@@ -378,13 +378,7 @@ mod db {
             let stmt = substitute_params(self.analyzed.clone(), params)?;
 
             // Execute directly — no parse, no analyze.
-            execute_with_ctx(
-                stmt,
-                &mut db.storage,
-                &mut db.txn,
-                &mut db.bloom,
-                &mut db.session,
-            )
+            execute_with_ctx(stmt, &db.storage, &db.txn, &db.bloom, &mut db.session)
         }
 
         /// Returns the number of `?` parameters in this prepared statement.

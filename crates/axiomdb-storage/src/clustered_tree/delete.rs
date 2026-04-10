@@ -13,7 +13,7 @@ use crate::{
 use axiomdb_core::error::DbError;
 
 pub(super) fn delete_physical(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     root_pid: u64,
     key: &[u8],
 ) -> Result<(bool, u64), DbError> {
@@ -27,7 +27,7 @@ pub(super) fn delete_physical(
 }
 
 fn delete_physical_subtree(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     pid: u64,
     key: &[u8],
     is_root: bool,
@@ -116,7 +116,7 @@ fn delete_physical_subtree(
 }
 
 fn delete_physical_from_leaf(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     pid: u64,
     mut page: Page,
     key: &[u8],
@@ -143,7 +143,7 @@ fn delete_physical_from_leaf(
 }
 
 fn delete_physical_from_internal(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     pid: u64,
     page: Page,
     key: &[u8],
@@ -198,7 +198,7 @@ fn delete_physical_from_internal(
 }
 
 fn rebalance_child(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     parent: &mut Page,
     child_idx: usize,
 ) -> Result<(), DbError> {
@@ -214,7 +214,7 @@ fn rebalance_child(
 }
 
 fn rebalance_leaf_child(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     parent: &mut Page,
     child_idx: usize,
 ) -> Result<(), DbError> {
@@ -230,7 +230,7 @@ fn rebalance_leaf_child(
 }
 
 pub(super) fn rebalance_leaf_pair(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     parent: &mut Page,
     sep_idx: usize,
     left_pid: u64,
@@ -323,7 +323,7 @@ pub(super) fn rebalance_leaf_pair(
 }
 
 fn rebalance_internal_child(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     parent: &mut Page,
     child_idx: usize,
 ) -> Result<(), DbError> {
@@ -339,7 +339,7 @@ fn rebalance_internal_child(
 }
 
 pub(super) fn rebalance_internal_pair(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     parent: &mut Page,
     sep_idx: usize,
     left_pid: u64,
@@ -524,7 +524,7 @@ fn subtree_min_key(storage: &dyn StorageEngine, mut pid: u64) -> Result<Option<V
     }
 }
 
-fn collapse_root(storage: &mut dyn StorageEngine, mut root_pid: u64) -> Result<u64, DbError> {
+fn collapse_root(storage: &dyn StorageEngine, mut root_pid: u64) -> Result<u64, DbError> {
     loop {
         let page = storage.read_page(root_pid)?;
         match clustered_page_type(&page)? {

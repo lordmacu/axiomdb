@@ -1,7 +1,7 @@
 fn execute_create_table(
     stmt: CreateTableStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     database: &str,
 ) -> Result<QueryResult, DbError> {
@@ -104,8 +104,8 @@ fn execute_create_table(
                                   is_unique: bool,
                                   is_primary: bool,
                                   root_override: Option<u64>,
-                                  storage: &mut dyn StorageEngine,
-                                  txn: &mut TxnManager|
+                                  storage: &dyn StorageEngine,
+                                  txn: &TxnManager|
          -> Result<u32, DbError> {
             let root_page_id = match root_override {
                 Some(root_page_id) => root_page_id,
@@ -435,8 +435,8 @@ fn persist_fk_constraint(
     on_delete: axiomdb_catalog::FkAction,
     on_update: axiomdb_catalog::FkAction,
     fk_name: Option<&str>,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
 ) -> Result<(), DbError> {
     use axiomdb_catalog::FkDef;
@@ -642,8 +642,8 @@ fn persist_fk_constraint(
 /// (MySQL behaviour: `CREATE TABLE … LIKE` does not inherit FK constraints).
 fn execute_create_table_like(
     stmt: crate::ast::CreateTableLikeStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     database: &str,
 ) -> Result<QueryResult, DbError> {
@@ -759,8 +759,8 @@ fn execute_create_table_as_select(
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut.
-    let storage = unsafe { exec_ctx.storage_mut() };
-    let txn = unsafe { exec_ctx.coord_mut() };
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
     let new_schema = stmt
         .new_table
         .schema

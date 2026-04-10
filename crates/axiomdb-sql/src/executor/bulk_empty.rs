@@ -10,7 +10,7 @@ pub(crate) struct BulkEmptyPlan {
 }
 
 /// Allocates a fresh empty heap-chain root page and returns its page_id.
-fn alloc_empty_heap_root(storage: &mut dyn StorageEngine) -> Result<u64, DbError> {
+fn alloc_empty_heap_root(storage: &dyn StorageEngine) -> Result<u64, DbError> {
     let pid = storage.alloc_page(PageType::Data)?;
     let page = Page::new(PageType::Data, pid);
     storage.write_page(pid, &page)?;
@@ -18,7 +18,7 @@ fn alloc_empty_heap_root(storage: &mut dyn StorageEngine) -> Result<u64, DbError
 }
 
 /// Allocates a fresh empty B-Tree leaf root page and returns its page_id.
-fn alloc_empty_index_root(storage: &mut dyn StorageEngine) -> Result<u64, DbError> {
+fn alloc_empty_index_root(storage: &dyn StorageEngine) -> Result<u64, DbError> {
     use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
     let pid = storage.alloc_page(PageType::Index)?;
     let mut page = Page::new(PageType::Index, pid);
@@ -37,7 +37,7 @@ fn alloc_empty_index_root(storage: &mut dyn StorageEngine) -> Result<u64, DbErro
 ///
 /// Follows `chain_next_page(...)` links until `0`. The root page is included.
 fn collect_heap_chain_pages(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     root_page_id: u64,
 ) -> Result<Vec<u64>, DbError> {
     let mut pages = Vec::new();
@@ -54,7 +54,7 @@ fn collect_heap_chain_pages(
 ///
 /// The result includes internal nodes and leaf nodes but excludes `0` sentinels.
 pub(crate) fn collect_btree_pages(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     root_pid: u64,
 ) -> Result<Vec<u64>, DbError> {
     use axiomdb_index::page_layout::cast_internal;
@@ -81,7 +81,7 @@ pub(crate) fn collect_btree_pages(
 /// The first 8 bytes of each overflow page body encode the next page ID as
 /// u64 LE; `u64::MAX` signals the end of the chain.
 fn collect_overflow_chain(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     first_pid: u64,
 ) -> Result<Vec<u64>, DbError> {
     const NULL_PAGE: u64 = u64::MAX;
@@ -102,7 +102,7 @@ fn collect_overflow_chain(
 /// Collects all page IDs in a clustered B-tree rooted at `root_pid`, including
 /// overflow chain pages attached to leaf cells.
 pub(crate) fn collect_clustered_tree_pages(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     root_pid: u64,
 ) -> Result<Vec<u64>, DbError> {
     use axiomdb_storage::PageType;
@@ -153,7 +153,7 @@ pub(crate) fn collect_clustered_tree_pages(
 /// fresh clustered root + fresh secondary index roots, and collects old page
 /// IDs for deferred reclamation.
 pub(crate) fn plan_bulk_empty_clustered_table(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     table_def: &axiomdb_catalog::TableDef,
     indexes: &[axiomdb_catalog::IndexDef],
     snap: axiomdb_core::TransactionSnapshot,
@@ -191,7 +191,7 @@ pub(crate) fn plan_bulk_empty_clustered_table(
 /// Collect old pages FIRST, then allocate new ones so freshly-allocated pages
 /// are never accidentally added to the free list.
 fn plan_bulk_empty_table(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     table_def: &axiomdb_catalog::TableDef,
     indexes: &[axiomdb_catalog::IndexDef],
     snap: axiomdb_core::TransactionSnapshot,
@@ -230,10 +230,10 @@ fn plan_bulk_empty_table(
 /// All catalog mutations happen inside the current active transaction, so they
 /// are fully undone on rollback or savepoint rollback.
 fn apply_bulk_empty_table(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
     table_def: &axiomdb_catalog::TableDef,
     plan: BulkEmptyPlan,
 ) -> Result<(), DbError> {
@@ -258,7 +258,7 @@ fn apply_bulk_empty_table(
 /// Iteratively walks the tree (BFS via a stack) and calls `free_page` on each
 /// node — both internal and leaf pages.
 pub(crate) fn free_btree_pages(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     root_pid: u64,
 ) -> Result<(), DbError> {
     use axiomdb_index::page_layout::{cast_internal, cast_leaf};

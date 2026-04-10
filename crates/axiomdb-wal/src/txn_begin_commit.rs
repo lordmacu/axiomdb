@@ -4,11 +4,8 @@ impl TxnManager {
     /// Starts a new explicit transaction with `RepeatableRead` isolation (default).
     ///
     /// Returns a [`ConnectionTxn`] that holds all per-transaction state.
-    ///
-    /// # Errors
-    /// - [`DbError::TransactionAlreadyActive`] if a transaction is already open
-    ///   (single-writer constraint until Phase 40.10).
-    pub fn begin(&mut self) -> Result<ConnectionTxn, DbError> {
+    /// Multiple connections can call `begin()` concurrently (Phase 40.10).
+    pub fn begin(&self) -> Result<ConnectionTxn, DbError> {
         self.begin_with_isolation(axiomdb_core::IsolationLevel::RepeatableRead)
     }
 
@@ -18,23 +15,11 @@ impl TxnManager {
     /// - `RepeatableRead` / `Serializable`: `active_snapshot()` returns the
     ///   snapshot frozen at BEGIN.
     pub fn begin_with_isolation(
-        &mut self,
+        &self,
         isolation_level: axiomdb_core::IsolationLevel,
     ) -> Result<ConnectionTxn, DbError> {
-        // Single-writer check: enforce at most one active txn.
-        {
-            let set = self.active_set.read().unwrap();
-            if !set.is_empty() {
-                let first_id = *set.iter().next().unwrap();
-                return Err(DbError::TransactionAlreadyActive { txn_id: first_id });
-            }
-        }
-
-        let txn_id = self.next_txn_id;
-        self.next_txn_id = self
-            .next_txn_id
-            .checked_add(1)
-            .ok_or_else(|| DbError::Other("transaction ID overflow".into()))?;
+        // Allocate txn_id atomically — no lock needed.
+        let txn_id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
 
         // Phase 7.15: transaction ID overflow prevention.
         const TXN_ID_WARN_90: u64 = u64::MAX / 10 * 9;
@@ -75,6 +60,8 @@ impl TxnManager {
             (mc + 1, active_ids)
         };
 
+        let clustered_roots = self.last_clustered_roots.lock().unwrap().clone();
+
         Ok(ConnectionTxn {
             txn_id,
             snapshot_id_at_begin,
@@ -82,7 +69,7 @@ impl TxnManager {
             undo_ops: Vec::new(),
             deferred_free_pages: Vec::new(),
             savepoints: Vec::new(),
-            clustered_roots: self.last_clustered_roots.clone(),
+            clustered_roots,
             active_ids_at_begin,
             wal_scratch: Vec::with_capacity(256),
             deferred_commit_mode: self.deferred_commit_mode,
@@ -94,11 +81,21 @@ impl TxnManager {
     /// Commits the transaction: writes the Commit WAL entry, fsyncs (or defers),
     /// advances `max_committed`, and removes the txn from the active set.
     ///
+    /// Returns `Some(txn_id)` when the commit is deferred (pipeline mode) and
+    /// the caller must drive the fsync pipeline. Returns `None` for immediate
+    /// commits or read-only transactions.
+    ///
     /// # Errors
     /// - I/O errors from WAL write or fsync.
-    pub fn commit(&mut self, mut conn_txn: ConnectionTxn) -> Result<(), DbError> {
+    pub fn commit(&self, mut conn_txn: ConnectionTxn) -> Result<Option<TxnId>, DbError> {
         let txn_id = conn_txn.txn_id;
-        self.last_clustered_roots = conn_txn.clustered_roots.clone();
+
+        {
+            let mut roots = self.last_clustered_roots.lock().unwrap();
+            for (table_id, root_pid) in &conn_txn.clustered_roots {
+                roots.insert(*table_id, *root_pid);
+            }
+        }
 
         let mut entry = WalEntry::new(0, txn_id, EntryType::Commit, 0, vec![], vec![], vec![]);
         self.wal
@@ -106,31 +103,27 @@ impl TxnManager {
 
         // Determine if max_committed should advance now or later (deferred pipeline).
         // I/O (flush/fsync) happens BEFORE acquiring the lock to minimize lock hold time.
-        let advance_now = if conn_txn.undo_ops.is_empty() {
+        let (advance_now, pending_deferred) = if conn_txn.undo_ops.is_empty() {
             // Read-only transaction: flush to OS page cache only (no fsync).
             self.wal.flush_no_sync()?;
-            true
+            (true, None)
         } else {
             match self.durability_policy {
                 WalDurabilityPolicy::Strict => {
                     if conn_txn.deferred_commit_mode {
                         // Pipeline mode: Commit entry buffered but not fsynced yet.
-                        // max_committed advances only after the pipeline confirms fsync
-                        // via advance_committed() / advance_committed_single().
-                        conn_txn.pending_deferred_txn_id = Some(txn_id);
-                        // Mirror on TxnManager so callers can retrieve after conn_txn is consumed.
-                        self.pending_deferred_txn_id = Some(txn_id);
-                        false
+                        // max_committed advances only after the pipeline confirms fsync.
+                        (false, Some(txn_id))
                     } else {
                         self.wal.commit_data_sync()?;
-                        true
+                        (true, None)
                     }
                 }
                 WalDurabilityPolicy::Normal => {
                     self.wal.flush_no_sync()?;
-                    true
+                    (true, None)
                 }
-                WalDurabilityPolicy::Off => true,
+                WalDurabilityPolicy::Off => (true, None),
             }
         };
 
@@ -147,64 +140,39 @@ impl TxnManager {
             self.lowest_active_id.store(new_lowest, Ordering::Relaxed);
         }
 
-        if !conn_txn.deferred_free_pages.is_empty() {
-            self.committed_free_batches
-                .push((txn_id, conn_txn.deferred_free_pages));
+        // Post-commit housekeeping under a brief Mutex.
+        {
+            let mut batches = self.post_commit.lock().unwrap();
+            if !conn_txn.deferred_free_pages.is_empty() {
+                batches
+                    .committed_free_batches
+                    .push((txn_id, conn_txn.deferred_free_pages));
+            }
+
+            // Phase 40.9: stash the LocalPageBatch data for later drain.
+            let (avail, freed) = conn_txn.local_page_batch.take_for_commit();
+            if !avail.is_empty() {
+                batches.committed_steal_protection.push(avail);
+            }
+            if !freed.is_empty() {
+                batches.committed_recycle_pages.push(freed);
+            }
         }
 
-        // Phase 40.9: stash the LocalPageBatch data for later drain.
-        let (avail, freed) = conn_txn.local_page_batch.take_for_commit();
-        if !avail.is_empty() {
-            self.committed_steal_protection.push(avail);
-        }
-        if !freed.is_empty() {
-            self.committed_recycle_pages.push(freed);
-        }
-
-        Ok(())
+        Ok(pending_deferred)
     }
 
-    /// Enables or disables deferred commit mode for the server-side fsync pipeline.
-    pub fn set_deferred_commit_mode(&mut self, enabled: bool) {
-        self.deferred_commit_mode = enabled;
-    }
-
-    /// Takes the pending deferred commit txn_id set by the last `commit()` call
-    /// in deferred mode, if any.
-    ///
-    /// Returns `Some(txn_id)` exactly once after a deferred DML commit.
-    /// Returns `None` for read-only commits or non-deferred commits.
-    ///
-    /// This mirrors `ConnectionTxn::take_pending_deferred_commit()` for callers
-    /// who no longer hold the `ConnectionTxn` after passing it to `commit()`.
-    pub fn take_pending_deferred_commit(&mut self) -> Option<TxnId> {
-        self.pending_deferred_txn_id.take()
-    }
-
-    /// Sets the WAL durability policy for committed DML.
-    pub fn set_durability_policy(&mut self, policy: WalDurabilityPolicy) {
-        self.durability_policy = policy;
-    }
-
-    /// Returns the current WAL durability policy.
+    /// Returns the WAL durability policy.
     pub fn durability_policy(&self) -> WalDurabilityPolicy {
         self.durability_policy
     }
 
     /// Advances `max_committed` to the maximum of the given txn_ids.
     ///
-    /// Called after a successful pipeline-driven `wal_flush_and_fsync()`, while
-    /// holding the Database lock. Makes all transactions in the batch visible
-    /// to future snapshots.
-    ///
-    /// Does not regress `max_committed` — if `max(txn_ids) < self.max_committed`,
-    /// no change is made (safe for out-of-order batch notification, though in
-    /// practice batches are always monotone under the single-writer constraint).
-    pub fn advance_committed(&mut self, txn_ids: &[TxnId]) {
+    /// Called after a successful pipeline-driven `wal_flush_and_fsync()`.
+    /// Makes all transactions in the batch visible to future snapshots.
+    pub fn advance_committed(&self, txn_ids: &[TxnId]) {
         if let Some(&max) = txn_ids.iter().max() {
-            // fetch_max: only advances, never regresses. Ordering::Release so
-            // subsequent Acquire loads see committed rows. active_set was already
-            // updated in commit() — no lock needed here.
             self.max_committed.fetch_max(max, Ordering::Release);
         }
     }
@@ -212,22 +180,17 @@ impl TxnManager {
     /// Advances `max_committed` to `txn_id` if it is greater than the current
     /// value. Used by the fsync pipeline leader to make a single transaction
     /// visible after confirming WAL durability.
-    pub fn advance_committed_single(&mut self, txn_id: TxnId) {
+    pub fn advance_committed_single(&self, txn_id: TxnId) {
         self.max_committed.fetch_max(txn_id, Ordering::Release);
     }
 
     /// Returns the WAL writer's current LSN (the last assigned LSN).
-    ///
-    /// Used by the fsync pipeline to track which LSN was last fsynced.
     pub fn wal_current_lsn(&self) -> u64 {
         self.wal.current_lsn()
     }
 
     /// Enqueues `pages` for deferred reclamation after the current transaction
     /// is durably committed.
-    ///
-    /// On `rollback` or `rollback_to_savepoint`, deferred pages are simply
-    /// discarded — the catalog undo restores the old roots so old pages remain live.
     pub fn defer_free_pages(
         &self,
         conn_txn: &mut ConnectionTxn,
@@ -240,49 +203,34 @@ impl TxnManager {
     ///
     /// Called after WAL fsync succeeds (immediate mode: right after `commit()`;
     /// pipeline mode: after `advance_committed(&ids)` in the fsync leader path).
-    ///
-    /// Pages are freed via `storage.free_page(pid)`. Any `txn_id` in `txn_ids`
-    /// that has no pending batch is silently ignored.
-    ///
-    /// # Errors
-    /// - I/O errors from `storage.free_page(...)`.
     pub fn release_committed_frees(
-        &mut self,
-        storage: &mut dyn StorageEngine,
+        &self,
+        storage: &dyn StorageEngine,
         txn_ids: &[TxnId],
     ) -> Result<(), DbError> {
-        if txn_ids.is_empty() || self.committed_free_batches.is_empty() {
+        let mut batches = self.post_commit.lock().unwrap();
+        if txn_ids.is_empty() || batches.committed_free_batches.is_empty() {
             return Ok(());
         }
         let id_set: std::collections::HashSet<TxnId> = txn_ids.iter().copied().collect();
-        let mut remaining = Vec::with_capacity(self.committed_free_batches.len());
-        for (txn_id, pages) in self.committed_free_batches.drain(..) {
+        let mut remaining = Vec::with_capacity(batches.committed_free_batches.len());
+        for (txn_id, pages) in batches.committed_free_batches.drain(..) {
             if id_set.contains(&txn_id) {
                 for pid in pages {
-                    // Best-effort: ignore double-free errors (page already freed
-                    // by earlier recovery or duplicate call).
                     let _ = storage.free_page(pid);
                 }
             } else {
                 remaining.push((txn_id, pages));
             }
         }
-        self.committed_free_batches = remaining;
+        batches.committed_free_batches = remaining;
         Ok(())
     }
 
     /// Releases deferred-free pages for `txn_id` only in immediate-commit mode.
-    ///
-    /// In pipeline mode this is a no-op — the fsync leader path calls
-    /// [`release_committed_frees`] after batch fsync confirms durability.
-    ///
-    /// Call this right after a successful `txn.commit()` in immediate-commit paths,
-    /// passing the txn_id captured from `active_txn_id()` before the commit call.
-    ///
-    /// [`release_committed_frees`]: TxnManager::release_committed_frees
     pub fn release_immediate_committed_frees(
-        &mut self,
-        storage: &mut dyn StorageEngine,
+        &self,
+        storage: &dyn StorageEngine,
         txn_id: TxnId,
     ) -> Result<(), DbError> {
         if !self.deferred_commit_mode {
@@ -293,37 +241,22 @@ impl TxnManager {
 
     /// Flushes the WAL BufWriter to the OS and performs the steady-state
     /// durable data sync.
-    ///
-    /// Called by the fsync pipeline leader while holding the Database lock,
-    /// covering all Commit entries written since the last fsync.
-    ///
-    /// # Errors
-    /// - I/O errors from flush or durable sync propagated to all batch waiters.
-    pub fn wal_flush_and_fsync(&mut self) -> Result<(), DbError> {
+    pub fn wal_flush_and_fsync(&self) -> Result<(), DbError> {
         self.wal.commit_data_sync()
     }
 
     /// Phase 40.9: drains page-batch data stashed during commit.
-    ///
-    /// - `committed_steal_protection`: leftover `LocalPageBatch.available`
-    ///   pages → returned to the bitmap via `storage.free_page_batch`.
-    /// - `committed_recycle_pages`: `LocalPageBatch.freed` pages → pushed
-    ///   to `storage.recycle_page` for fast lock-free reuse.
-    ///
-    /// Call after `commit()` (or `release_committed_frees`) when the caller
-    /// has access to `&dyn StorageEngine`.
     pub fn drain_committed_page_batches(
-        &mut self,
+        &self,
         storage: &dyn StorageEngine,
     ) -> Result<(), DbError> {
-        // Return leftover pre-allocated pages to the bitmap.
-        for batch in self.committed_steal_protection.drain(..) {
+        let mut batches = self.post_commit.lock().unwrap();
+        for batch in batches.committed_steal_protection.drain(..) {
             if !batch.is_empty() {
                 storage.free_page_batch(&batch)?;
             }
         }
-        // Push freed pages to the lock-free recycle queue.
-        for batch in self.committed_recycle_pages.drain(..) {
+        for batch in batches.committed_recycle_pages.drain(..) {
             for page_id in batch {
                 storage.recycle_page(page_id)?;
             }

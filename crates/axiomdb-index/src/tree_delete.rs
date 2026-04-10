@@ -36,7 +36,7 @@ impl BTree {
 
     #[allow(clippy::needless_option_as_deref)]
     fn delete_subtree_batched(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         mut batch: Option<&mut LocalPageBatch>,
         pid: u64,
         key: &[u8],
@@ -127,7 +127,7 @@ impl BTree {
     }
 
     fn delete_leaf(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         old_pid: u64,
         mut node: LeafNodePage,
         key: &[u8],
@@ -169,7 +169,7 @@ impl BTree {
     }
 
     fn rebalance_batched(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         batch: Option<&mut LocalPageBatch>,
         parent_pid: u64,
         parent: InternalNodePage,
@@ -245,7 +245,7 @@ impl BTree {
 
     #[allow(clippy::needless_option_as_deref)]
     fn rotate_right_batched(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         mut batch: Option<&mut LocalPageBatch>,
         parent_pid: u64,
         mut parent: InternalNodePage,
@@ -376,7 +376,7 @@ impl BTree {
 
     #[allow(clippy::needless_option_as_deref)]
     fn rotate_left_batched(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         mut batch: Option<&mut LocalPageBatch>,
         parent_pid: u64,
         mut parent: InternalNodePage,
@@ -488,7 +488,7 @@ impl BTree {
 
     #[allow(clippy::needless_option_as_deref)]
     fn merge_children_batched(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         mut batch: Option<&mut LocalPageBatch>,
         parent_pid: u64,
         mut parent: InternalNodePage,
@@ -585,7 +585,7 @@ impl BTree {
         Ok(npp)
     }
 
-    fn collapse_root(storage: &mut dyn StorageEngine, root_pid: u64) -> Result<u64, DbError> {
+    fn collapse_root(storage: &dyn StorageEngine, root_pid: u64) -> Result<u64, DbError> {
         let (is_empty_internal, only_child) = {
             let page = storage.read_page(root_pid)?;
             if page.body()[0] == 0 {

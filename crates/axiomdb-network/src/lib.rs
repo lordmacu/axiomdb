@@ -6,15 +6,14 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use axiomdb_network::mysql::{Database, handle_connection};
+//! use axiomdb_network::mysql::{SharedDatabase, handle_connection};
 //! use std::sync::Arc;
-//! use tokio::sync::RwLock;
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let db = Arc::new(RwLock::new(
-//!         Database::open(std::path::Path::new("./data")).unwrap()
-//!     ));
+//!     let db = Arc::new(
+//!         SharedDatabase::open(std::path::Path::new("./data")).unwrap()
+//!     );
 //!     let listener = tokio::net::TcpListener::bind("0.0.0.0:3306").await.unwrap();
 //!     loop {
 //!         let (stream, _) = listener.accept().await.unwrap();

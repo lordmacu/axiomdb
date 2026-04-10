@@ -16,7 +16,7 @@ use axiomdb_core::error::DbError;
 
 #[allow(clippy::needless_option_as_deref)]
 pub(super) fn insert_subtree(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     batch: Option<&mut LocalPageBatch>,
     pid: u64,
     key: &[u8],
@@ -63,7 +63,7 @@ pub(super) fn insert_subtree(
 
 #[allow(clippy::needless_option_as_deref)]
 fn insert_into_leaf(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     mut batch: Option<&mut LocalPageBatch>,
     pid: u64,
     mut page: Page,
@@ -119,7 +119,7 @@ fn insert_into_leaf(
 }
 
 fn split_leaf(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     batch: Option<&mut LocalPageBatch>,
     pid: u64,
     page: &Page,
@@ -150,7 +150,7 @@ fn split_leaf(
 
 #[allow(clippy::needless_option_as_deref)]
 fn insert_into_internal(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     mut batch: Option<&mut LocalPageBatch>,
     pid: u64,
     mut page: Page,
@@ -198,7 +198,7 @@ fn insert_into_internal(
 }
 
 fn split_internal(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     batch: Option<&mut LocalPageBatch>,
     pid: u64,
     page: &Page,

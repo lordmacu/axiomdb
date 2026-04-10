@@ -1,7 +1,7 @@
 fn execute_clustered_insert(
     stmt: InsertStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
     resolved: ResolvedTable,
 ) -> Result<QueryResult, DbError> {
@@ -29,7 +29,7 @@ fn execute_clustered_insert(
 
     let mut prepared_rows = Vec::new();
     let mut first_generated = None;
-    let mut noop_bloom = crate::bloom::BloomRegistry::new();
+    let noop_bloom = crate::bloom::BloomRegistry::new();
 
     /// Prepares one row for clustered insert and pushes it onto `prepared_rows`.
     /// When `ignore` is true, ignorable constraint errors silently skip the row.
@@ -49,7 +49,7 @@ fn execute_clustered_insert(
                             storage,
                             txn,
                             conn_txn,
-                            &mut noop_bloom,
+                            &noop_bloom,
                         ) {
                             Err(e) if ignore && is_ignorable_insert_error(&e) => {}
                             Err(e) => return Err(e),
@@ -151,7 +151,7 @@ fn execute_clustered_insert(
                 storage,
                 txn,
                 conn_txn,
-                &mut noop_bloom,
+                &noop_bloom,
                 &resolved.def,
                 &primary_idx,
                 &mut secondary_indexes,
@@ -170,7 +170,7 @@ fn execute_clustered_insert(
             storage,
             txn,
             conn_txn,
-            &mut noop_bloom,
+            &noop_bloom,
             &resolved.def,
             &primary_idx,
             &mut secondary_indexes,
@@ -193,10 +193,10 @@ fn execute_clustered_insert(
 
 #[allow(clippy::too_many_arguments)]
 fn apply_clustered_insert_rows(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
     table_def: &TableDef,
     primary_idx: &IndexDef,
     secondary_indexes: &mut [IndexDef],

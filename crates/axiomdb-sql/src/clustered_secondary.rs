@@ -210,7 +210,7 @@ impl ClusteredSecondaryLayout {
 
     pub fn insert_row(
         &self,
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: &AtomicU64,
         row: &[Value],
     ) -> Result<bool, DbError> {
@@ -219,7 +219,7 @@ impl ClusteredSecondaryLayout {
 
     pub fn insert_row_visible(
         &self,
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: &AtomicU64,
         table_root_page_id: u64,
         snap: &TransactionSnapshot,
@@ -236,7 +236,7 @@ impl ClusteredSecondaryLayout {
 
     fn insert_row_maybe_visible(
         &self,
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: &AtomicU64,
         table_root_page_id: Option<u64>,
         snap: Option<&TransactionSnapshot>,
@@ -278,7 +278,7 @@ impl ClusteredSecondaryLayout {
 
     pub fn delete_row(
         &self,
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: &AtomicU64,
         row: &[Value],
     ) -> Result<bool, DbError> {
@@ -290,7 +290,7 @@ impl ClusteredSecondaryLayout {
 
     pub fn update_row(
         &self,
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: &AtomicU64,
         old_row: &[Value],
         new_row: &[Value],
@@ -300,7 +300,7 @@ impl ClusteredSecondaryLayout {
 
     pub fn update_row_visible(
         &self,
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: &AtomicU64,
         table_root_page_id: u64,
         snap: &TransactionSnapshot,
@@ -319,7 +319,7 @@ impl ClusteredSecondaryLayout {
 
     fn update_row_maybe_visible(
         &self,
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: &AtomicU64,
         table_root_page_id: Option<u64>,
         snap: Option<&TransactionSnapshot>,

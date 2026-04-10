@@ -6,7 +6,7 @@
 //!
 //! ## Public API
 //!
-//! - [`Database`] — database handle (wraps MmapStorage + TxnManager)
+//! - [`SharedDatabase`] — shared database handle for all connections
 //! - [`handle_connection`] — async handler for one TCP connection
 //!
 //! ## Modules
@@ -17,11 +17,13 @@
 //! - [`result`] — QueryResult → text protocol wire format
 //! - [`error`] — DbError → MySQL error code + SQLSTATE
 //! - [`handler`] — connection handler state machine
-//! - [`database`] — database engine wrapper
+//! - [`shared_db`] — shared database engine wrapper
+//! - [`database`] — backward-compatible facade for legacy imports
 
 pub mod auth;
 pub mod charset;
 pub mod codec;
+pub(crate) mod connection;
 pub mod database;
 pub mod error;
 pub mod handler;
@@ -32,6 +34,7 @@ pub mod plan_cache;
 pub mod prepared;
 pub mod result;
 pub mod session;
+pub mod shared_db;
 pub mod snapshot_registry;
 pub(crate) mod sql_scan;
 pub mod status;
@@ -40,3 +43,4 @@ pub use database::Database;
 pub use handler::handle_connection;
 pub use lifecycle::configure_client_socket;
 pub use session::ConnectionState;
+pub use shared_db::SharedDatabase;

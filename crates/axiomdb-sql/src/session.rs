@@ -595,6 +595,13 @@ pub struct SessionContext {
     /// `Some` when a transaction is open (explicit or autocommit-implicit).
     /// `None` between transactions.
     pub conn_txn: Option<ConnectionTxn>,
+    /// Pending deferred commit txn_id from the last `commit()` call in
+    /// pipeline mode (Phase 40.10).
+    ///
+    /// Set by `execute_with_ctx` after each `txn.commit()` returns
+    /// `Some(txn_id)`. Consumed by the network layer to drive the fsync
+    /// pipeline. `None` for read-only or immediate commits.
+    pub pending_deferred_txn_id: Option<axiomdb_core::TxnId>,
 }
 
 impl Default for SessionContext {
@@ -627,6 +634,7 @@ impl SessionContext {
             lock_timeout_secs: 30,
             savepoints: Vec::new(),
             conn_txn: None,
+            pending_deferred_txn_id: None,
         }
     }
 

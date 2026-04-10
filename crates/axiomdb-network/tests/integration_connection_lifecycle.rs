@@ -3,7 +3,6 @@ use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::RwLock,
 };
 
 use axiomdb_network::mysql::{
@@ -13,7 +12,7 @@ use axiomdb_network::mysql::{
         CLIENT_CONNECT_WITH_DB, CLIENT_INTERACTIVE, CLIENT_PLUGIN_AUTH, CLIENT_PROTOCOL_41,
         CLIENT_SECURE_CONNECTION,
     },
-    Database,
+    SharedDatabase,
 };
 use axiomdb_sql::{SchemaCache, SessionContext};
 
@@ -33,14 +32,14 @@ async fn spawn_server_with_setup_and_connections(
     connections: usize,
 ) -> TestServer {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open test db");
+    let db = SharedDatabase::open(dir.path()).expect("open test db");
     let mut session = SessionContext::new();
     let mut cache = SchemaCache::new();
     for sql in setup_sql {
         db.execute_query(sql, &mut session, &mut cache)
             .unwrap_or_else(|e| panic!("setup SQL failed: {sql}\nError: {e:?}"));
     }
-    let db = Arc::new(RwLock::new(db));
+    let db = Arc::new(db);
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
@@ -86,10 +85,11 @@ async fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) -> std::i
     Ok(())
 }
 
-async fn authenticate_with_database(
+async fn authenticate_with_options(
     stream: &mut TcpStream,
     interactive: bool,
     database: Option<&str>,
+    collation_id: u8,
 ) -> std::io::Result<Vec<u8>> {
     let (_seq, greeting) = read_packet(stream).await?;
     assert_eq!(greeting[0], 10, "server must start with HandshakeV10");
@@ -104,7 +104,7 @@ async fn authenticate_with_database(
     }
     payload.extend_from_slice(&caps.to_le_bytes());
     payload.extend_from_slice(&0u32.to_le_bytes()); // max_packet_size
-    payload.push(255u8); // utf8mb4 collation id
+    payload.push(collation_id);
     payload.extend_from_slice(&[0u8; 23]);
     payload.extend_from_slice(b"root\0");
     payload.push(0u8); // empty auth response
@@ -127,33 +127,26 @@ async fn authenticate_with_database(
     Ok(final_packet)
 }
 
+async fn authenticate_with_database(
+    stream: &mut TcpStream,
+    interactive: bool,
+    database: Option<&str>,
+) -> std::io::Result<Vec<u8>> {
+    authenticate_with_options(stream, interactive, database, 255).await
+}
+
 async fn authenticate(stream: &mut TcpStream, interactive: bool) -> std::io::Result<()> {
-    let (_seq, greeting) = read_packet(stream).await?;
-    assert_eq!(greeting[0], 10, "server must start with HandshakeV10");
+    let ok = authenticate_with_options(stream, interactive, None, 255).await?;
+    assert_eq!(ok[0], 0x00, "expected OK after auth");
+    Ok(())
+}
 
-    let mut payload = Vec::new();
-    let mut caps = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
-    if interactive {
-        caps |= CLIENT_INTERACTIVE;
-    }
-    payload.extend_from_slice(&caps.to_le_bytes());
-    payload.extend_from_slice(&0u32.to_le_bytes()); // max_packet_size
-    payload.push(255u8); // utf8mb4 collation id
-    payload.extend_from_slice(&[0u8; 23]);
-    payload.extend_from_slice(b"root\0");
-    payload.push(0u8); // empty auth response
-    payload.extend_from_slice(b"caching_sha2_password\0");
-    write_packet(stream, 1, &payload).await?;
-
-    let (_seq, auth_more) = read_packet(stream).await?;
-    assert_eq!(
-        auth_more.as_slice(),
-        &[0x01, 0x03],
-        "expected fast auth success"
-    );
-
-    write_packet(stream, 3, &[]).await?;
-    let (_seq, ok) = read_packet(stream).await?;
+async fn authenticate_with_collation(
+    stream: &mut TcpStream,
+    interactive: bool,
+    collation_id: u8,
+) -> std::io::Result<()> {
+    let ok = authenticate_with_options(stream, interactive, None, collation_id).await?;
     assert_eq!(ok[0], 0x00, "expected OK after auth");
     Ok(())
 }
@@ -191,6 +184,122 @@ async fn com_query_single_text(
     Ok(Some(String::from_utf8_lossy(&row[1..1 + len]).into_owned()))
 }
 
+fn read_lenenc_int(row: &[u8], offset: &mut usize) -> std::io::Result<usize> {
+    if *offset >= row.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing length-encoded integer",
+        ));
+    }
+    let first = row[*offset];
+    *offset += 1;
+    match first {
+        0xfc => {
+            if *offset + 2 > row.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "truncated 0xfc length-encoded integer",
+                ));
+            }
+            let value = u16::from_le_bytes([row[*offset], row[*offset + 1]]) as usize;
+            *offset += 2;
+            Ok(value)
+        }
+        0xfd => {
+            if *offset + 3 > row.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "truncated 0xfd length-encoded integer",
+                ));
+            }
+            let value = usize::from(row[*offset])
+                | (usize::from(row[*offset + 1]) << 8)
+                | (usize::from(row[*offset + 2]) << 16);
+            *offset += 3;
+            Ok(value)
+        }
+        0xfe => {
+            if *offset + 8 > row.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "truncated 0xfe length-encoded integer",
+                ));
+            }
+            let value = u64::from_le_bytes([
+                row[*offset],
+                row[*offset + 1],
+                row[*offset + 2],
+                row[*offset + 3],
+                row[*offset + 4],
+                row[*offset + 5],
+                row[*offset + 6],
+                row[*offset + 7],
+            ]);
+            *offset += 8;
+            usize::try_from(value).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "length-encoded integer does not fit in usize",
+                )
+            })
+        }
+        0xfb => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "NULL marker is not a valid field length",
+        )),
+        value => Ok(usize::from(value)),
+    }
+}
+
+fn read_lenenc_text_field(row: &[u8], offset: &mut usize) -> std::io::Result<Option<String>> {
+    if *offset >= row.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing row field",
+        ));
+    }
+    if row[*offset] == 0xfb {
+        *offset += 1;
+        return Ok(None);
+    }
+    let len = read_lenenc_int(row, offset)?;
+    if *offset + len > row.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "truncated length-encoded string",
+        ));
+    }
+    let text = String::from_utf8_lossy(&row[*offset..*offset + len]).into_owned();
+    *offset += len;
+    Ok(Some(text))
+}
+
+async fn com_query_single_row_texts(
+    stream: &mut TcpStream,
+    sql: &str,
+) -> std::io::Result<Vec<Option<String>>> {
+    let mut payload = Vec::with_capacity(1 + sql.len());
+    payload.push(0x03);
+    payload.extend_from_slice(sql.as_bytes());
+    write_packet(stream, 0, &payload).await?;
+
+    let (_seq, col_count) = read_packet(stream).await?;
+    let expected_columns = usize::from(col_count[0]);
+    for _ in 0..expected_columns {
+        let _ = read_packet(stream).await?;
+    }
+    let _ = read_packet(stream).await?;
+    let (_seq, row) = read_packet(stream).await?;
+    let _ = read_packet(stream).await?;
+
+    let mut offset = 0usize;
+    let mut fields = Vec::with_capacity(expected_columns);
+    for _ in 0..expected_columns {
+        fields.push(read_lenenc_text_field(&row, &mut offset)?);
+    }
+    Ok(fields)
+}
+
 async fn com_init_db(stream: &mut TcpStream, db_name: &str) -> std::io::Result<Vec<u8>> {
     let mut payload = Vec::with_capacity(1 + db_name.len());
     payload.push(0x02);
@@ -202,6 +311,12 @@ async fn com_init_db(stream: &mut TcpStream, db_name: &str) -> std::io::Result<V
 
 async fn com_reset_connection(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     write_packet(stream, 0, &[0x1f]).await?;
+    let (_seq, response) = read_packet(stream).await?;
+    Ok(response)
+}
+
+async fn com_change_user(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    write_packet(stream, 0, &[0x11]).await?;
     let (_seq, response) = read_packet(stream).await?;
     Ok(response)
 }
@@ -341,6 +456,209 @@ async fn test_reset_connection_rolls_back_active_implicit_txn() {
         .await
         .expect("INSERT after reset");
     assert_eq!(ok[0], 0x00, "connection must remain writable after reset");
+
+    com_quit(&mut stream).await.expect("COM_QUIT");
+    server.task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn test_reset_connection_clears_selected_database_and_session_defaults() {
+    let server = spawn_server_with_setup(
+        LifecycleTimeouts {
+            auth_timeout: Duration::from_millis(200),
+        },
+        &["CREATE DATABASE analytics"],
+    )
+    .await;
+    let mut stream = TcpStream::connect(server.addr).await.expect("connect");
+    authenticate(&mut stream, false).await.expect("auth");
+
+    let ok = com_init_db(&mut stream, "analytics")
+        .await
+        .expect("COM_INIT_DB analytics");
+    assert_eq!(ok[0], 0x00, "COM_INIT_DB must return OK");
+
+    let db = com_query_single_text(&mut stream, "SELECT DATABASE()")
+        .await
+        .expect("SELECT DATABASE before reset");
+    assert_eq!(db.as_deref(), Some("analytics"));
+
+    let ok = com_query(&mut stream, "SET autocommit = 0")
+        .await
+        .expect("SET autocommit");
+    assert_eq!(ok[0], 0x00, "SET autocommit must return OK");
+
+    let autocommit = com_query_single_text(&mut stream, "SELECT @@autocommit")
+        .await
+        .expect("SELECT @@autocommit before reset");
+    assert_eq!(autocommit.as_deref(), Some("0"));
+
+    let ok = com_reset_connection(&mut stream)
+        .await
+        .expect("COM_RESET_CONNECTION");
+    assert_eq!(ok[0], 0x00, "COM_RESET_CONNECTION must return OK");
+
+    let db = com_query_single_text(&mut stream, "SELECT DATABASE()")
+        .await
+        .expect("SELECT DATABASE after reset");
+    assert_eq!(db, None, "reset must clear the selected database");
+
+    let autocommit = com_query_single_text(&mut stream, "SELECT @@autocommit")
+        .await
+        .expect("SELECT @@autocommit after reset");
+    assert_eq!(
+        autocommit.as_deref(),
+        Some("1"),
+        "reset must restore autocommit"
+    );
+
+    com_quit(&mut stream).await.expect("COM_QUIT");
+    server.task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn test_reset_connection_restores_handshake_charset_baseline() {
+    let server = spawn_server(LifecycleTimeouts {
+        auth_timeout: Duration::from_millis(200),
+    })
+    .await;
+    let mut stream = TcpStream::connect(server.addr).await.expect("connect");
+    authenticate_with_collation(&mut stream, false, 8)
+        .await
+        .expect("auth latin1");
+
+    let charset = com_query_single_text(&mut stream, "SELECT @@character_set_client")
+        .await
+        .expect("SELECT @@character_set_client before mutation");
+    assert_eq!(charset.as_deref(), Some("latin1"));
+
+    let ok = com_query(&mut stream, "SET NAMES utf8mb4")
+        .await
+        .expect("SET NAMES utf8mb4");
+    assert_eq!(ok[0], 0x00, "SET NAMES must return OK");
+
+    let charset = com_query_single_text(&mut stream, "SELECT @@character_set_client")
+        .await
+        .expect("SELECT @@character_set_client after SET NAMES");
+    assert_eq!(charset.as_deref(), Some("utf8mb4"));
+
+    let ok = com_reset_connection(&mut stream)
+        .await
+        .expect("COM_RESET_CONNECTION");
+    assert_eq!(ok[0], 0x00, "COM_RESET_CONNECTION must return OK");
+
+    let client = com_query_single_text(&mut stream, "SELECT @@character_set_client")
+        .await
+        .expect("SELECT @@character_set_client after reset");
+    assert_eq!(client.as_deref(), Some("latin1"));
+
+    let connection = com_query_single_text(&mut stream, "SELECT @@character_set_connection")
+        .await
+        .expect("SELECT @@character_set_connection after reset");
+    assert_eq!(connection.as_deref(), Some("latin1"));
+
+    let results = com_query_single_text(&mut stream, "SELECT @@character_set_results")
+        .await
+        .expect("SELECT @@character_set_results after reset");
+    assert_eq!(results.as_deref(), Some("latin1"));
+
+    com_quit(&mut stream).await.expect("COM_QUIT");
+    server.task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn test_reset_connection_clears_local_status_counters() {
+    let server = spawn_server(LifecycleTimeouts {
+        auth_timeout: Duration::from_millis(200),
+    })
+    .await;
+    let mut stream = TcpStream::connect(server.addr).await.expect("connect");
+    authenticate(&mut stream, false).await.expect("auth");
+
+    for _ in 0..3 {
+        let value = com_query_single_text(&mut stream, "SELECT 1")
+            .await
+            .expect("SELECT 1");
+        assert_eq!(value.as_deref(), Some("1"));
+    }
+
+    let before = com_query_single_row_texts(&mut stream, "SHOW LOCAL STATUS LIKE 'com_select'")
+        .await
+        .expect("SHOW LOCAL STATUS before reset");
+    assert_eq!(before.len(), 2, "status row must have name and value");
+    assert_eq!(before[0].as_deref(), Some("Com_select"));
+    assert_eq!(before[1].as_deref(), Some("3"));
+
+    let ok = com_reset_connection(&mut stream)
+        .await
+        .expect("COM_RESET_CONNECTION");
+    assert_eq!(ok[0], 0x00, "COM_RESET_CONNECTION must return OK");
+
+    let after = com_query_single_row_texts(&mut stream, "SHOW LOCAL STATUS LIKE 'com_select'")
+        .await
+        .expect("SHOW LOCAL STATUS after reset");
+    assert_eq!(after.len(), 2, "status row must have name and value");
+    assert_eq!(after[0].as_deref(), Some("Com_select"));
+    assert_eq!(after[1].as_deref(), Some("0"));
+
+    com_quit(&mut stream).await.expect("COM_QUIT");
+    server.task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn test_change_user_resets_session_state_and_preserves_handshake_charset() {
+    let server = spawn_server_with_setup(
+        LifecycleTimeouts {
+            auth_timeout: Duration::from_millis(200),
+        },
+        &["CREATE DATABASE analytics"],
+    )
+    .await;
+    let mut stream = TcpStream::connect(server.addr).await.expect("connect");
+    authenticate_with_collation(&mut stream, false, 8)
+        .await
+        .expect("auth latin1");
+
+    let ok = com_init_db(&mut stream, "analytics")
+        .await
+        .expect("COM_INIT_DB analytics");
+    assert_eq!(ok[0], 0x00, "COM_INIT_DB must return OK");
+
+    let ok = com_query(&mut stream, "SET autocommit = 0")
+        .await
+        .expect("SET autocommit");
+    assert_eq!(ok[0], 0x00, "SET autocommit must return OK");
+
+    let ok = com_query(&mut stream, "SET NAMES utf8mb4")
+        .await
+        .expect("SET NAMES utf8mb4");
+    assert_eq!(ok[0], 0x00, "SET NAMES must return OK");
+
+    let ok = com_change_user(&mut stream).await.expect("COM_CHANGE_USER");
+    assert_eq!(ok[0], 0x00, "COM_CHANGE_USER must return OK");
+
+    let db = com_query_single_text(&mut stream, "SELECT DATABASE()")
+        .await
+        .expect("SELECT DATABASE after change user");
+    assert_eq!(db, None, "change user must clear the selected database");
+
+    let autocommit = com_query_single_text(&mut stream, "SELECT @@autocommit")
+        .await
+        .expect("SELECT @@autocommit after change user");
+    assert_eq!(
+        autocommit.as_deref(),
+        Some("1"),
+        "change user must restore autocommit"
+    );
+
+    let charset = com_query_single_text(&mut stream, "SELECT @@character_set_client")
+        .await
+        .expect("SELECT @@character_set_client after change user");
+    assert_eq!(
+        charset.as_deref(),
+        Some("latin1"),
+        "change user must restore the handshake charset baseline"
+    );
 
     com_quit(&mut stream).await.expect("COM_QUIT");
     server.task.await.expect("server task");

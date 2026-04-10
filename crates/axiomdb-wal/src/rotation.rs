@@ -49,7 +49,7 @@ impl WalRotator {
     pub fn check_and_rotate(
         &self,
         mgr: &mut TxnManager,
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         wal_path: &Path,
     ) -> Result<bool, DbError> {
         mgr.check_and_rotate(storage, wal_path, self.max_wal_size)
@@ -77,7 +77,7 @@ mod tests {
     #[test]
     fn test_rotate_lsn_continues_monotonically() {
         let (_dir, wal_path, _db) = temp_setup();
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
         // Write 3 entries (LSNs 1, 2, 3).
@@ -86,7 +86,7 @@ mod tests {
         mgr.commit(conn).unwrap();
         // LSN 1=Begin, 2=Insert, 3=Commit → current_lsn = 3
 
-        let checkpoint_lsn = mgr.rotate_wal(&mut storage, &wal_path).unwrap();
+        let checkpoint_lsn = mgr.rotate_wal(&storage, &wal_path).unwrap();
         assert_eq!(checkpoint_lsn, 4); // Checkpoint entry = LSN 4
 
         // Next entry after rotation must be LSN 5, not LSN 1.
@@ -102,12 +102,12 @@ mod tests {
     #[test]
     fn test_rotated_wal_file_is_header_only() {
         let (_dir, wal_path, _db) = temp_setup();
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
         let conn = mgr.begin().unwrap();
         mgr.commit(conn).unwrap();
-        mgr.rotate_wal(&mut storage, &wal_path).unwrap();
+        mgr.rotate_wal(&storage, &wal_path).unwrap();
 
         // After rotation, the logical WAL contains only the header, but the
         // physical file may still have reserved tail capacity for the durable
@@ -133,7 +133,7 @@ mod tests {
         for _ in 0..3 {
             let conn = mgr.begin().unwrap();
             mgr.commit(conn).unwrap();
-            let ckpt = mgr.rotate_wal(&mut storage, &wal_path).unwrap();
+            let ckpt = mgr.rotate_wal(&storage, &wal_path).unwrap();
             assert!(
                 ckpt > prev_lsn,
                 "checkpoint_lsn must be strictly increasing"
@@ -149,7 +149,7 @@ mod tests {
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
         let _conn = mgr.begin().unwrap();
-        let err = mgr.rotate_wal(&mut storage, &wal_path).unwrap_err();
+        let err = mgr.rotate_wal(&storage, &wal_path).unwrap_err();
         assert!(matches!(err, DbError::TransactionAlreadyActive { .. }));
     }
 
@@ -204,7 +204,7 @@ mod tests {
 
         let conn = mgr.begin().unwrap();
         mgr.commit(conn).unwrap();
-        let ckpt_lsn = mgr.rotate_wal(&mut storage, &wal_path).unwrap();
+        let ckpt_lsn = mgr.rotate_wal(&storage, &wal_path).unwrap();
 
         let stored = axiomdb_storage::read_checkpoint_lsn(&storage).unwrap();
         assert_eq!(stored, ckpt_lsn);
@@ -219,7 +219,7 @@ mod tests {
         // First session: 2 entries (LSN 1=Begin, 2=Commit) + rotate (LSN 3=Checkpoint).
         let conn = mgr.begin().unwrap();
         mgr.commit(conn).unwrap();
-        let ckpt = mgr.rotate_wal(&mut storage, &wal_path).unwrap();
+        let ckpt = mgr.rotate_wal(&storage, &wal_path).unwrap();
         assert_eq!(ckpt, 3);
 
         // After rotation: new begin must be LSN 4.
@@ -242,7 +242,7 @@ mod tests {
             let mut mgr = TxnManager::create(&wal_path).unwrap();
             let conn = mgr.begin().unwrap();
             mgr.commit(conn).unwrap();
-            mgr.rotate_wal(&mut storage, &wal_path).unwrap()
+            mgr.rotate_wal(&storage, &wal_path).unwrap()
         };
 
         // Reopen: WalWriter::open reads start_lsn from header.
@@ -260,7 +260,7 @@ mod tests {
         // Write, rotate, write again.
         let conn1 = mgr.begin().unwrap();
         mgr.commit(conn1).unwrap();
-        mgr.rotate_wal(&mut storage, &wal_path).unwrap(); // WAL now empty
+        mgr.rotate_wal(&storage, &wal_path).unwrap(); // WAL now empty
 
         let conn2 = mgr.begin().unwrap();
         mgr.commit(conn2).unwrap();

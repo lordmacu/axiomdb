@@ -159,6 +159,8 @@ pub struct ConnectionState {
     /// Collation used when encoding outbound result rows and metadata.
     /// Set at handshake time; changed by `SET NAMES` / `SET character_set_results`.
     results_collation: &'static CollationDef,
+    /// Handshake-time collation restored by `COM_RESET_CONNECTION`.
+    reset_collation: &'static CollationDef,
     /// ON_ERROR mode for this connection (default: `RollbackStatement`).
     on_error: OnErrorMode,
     /// Compatibility mode for this connection (default: `Standard`).
@@ -178,7 +180,7 @@ pub struct ConnectionState {
     /// Used as the `last_used_seq` for LRU eviction ordering.
     execute_seq: u64,
     /// Per-connection cumulative status counters (Phase 5.9c).
-    /// Reset to zero by `COM_RESET_CONNECTION` (which recreates `ConnectionState`).
+    /// Reset to zero by `ConnectionState::reset_for_connection_reuse`.
     pub session_status: SessionStatus,
 }
 
@@ -199,13 +201,15 @@ impl ConnectionState {
     /// Creates a connection state with MySQL-compatible defaults and the
     /// given prepared-statement cache limit.
     pub fn new_with_limit(max_prepared_stmts: usize) -> Self {
-        let mut s = Self::new();
-        s.max_prepared_stmts = max_prepared_stmts;
-        s
+        Self::with_reset_collation(max_prepared_stmts, DEFAULT_SERVER_COLLATION)
     }
 
     /// Creates a connection state with MySQL-compatible defaults.
     pub fn new() -> Self {
+        Self::with_reset_collation(1024, DEFAULT_SERVER_COLLATION)
+    }
+
+    fn default_variables() -> HashMap<String, String> {
         let mut variables = HashMap::new();
         variables.insert("time_zone".into(), "SYSTEM".into());
         variables.insert("sql_mode".into(), "STRICT_TRANS_TABLES".into());
@@ -220,19 +224,27 @@ impl ConnectionState {
         variables.insert("net_read_timeout".into(), "60".into());
         variables.insert("wait_timeout".into(), "28800".into());
         variables.insert("interactive_timeout".into(), "28800".into());
+        variables
+    }
+
+    fn with_reset_collation(
+        max_prepared_stmts: usize,
+        reset_collation: &'static CollationDef,
+    ) -> Self {
         Self {
             current_database: String::new(),
             autocommit: true,
             on_error: OnErrorMode::RollbackStatement,
             compat_mode: CompatMode::Standard,
             explicit_collation: None,
-            client_charset: DEFAULT_SERVER_COLLATION.charset,
-            connection_collation: DEFAULT_SERVER_COLLATION,
-            results_collation: DEFAULT_SERVER_COLLATION,
-            variables,
+            client_charset: reset_collation.charset,
+            connection_collation: reset_collation,
+            results_collation: reset_collation,
+            reset_collation,
+            variables: Self::default_variables(),
             prepared_statements: HashMap::new(),
             next_stmt_id: 1,
-            max_prepared_stmts: 1024,
+            max_prepared_stmts,
             execute_seq: 0,
             session_status: SessionStatus::default(),
         }
@@ -252,11 +264,15 @@ impl ConnectionState {
                 reason: format!("Unsupported handshake character_set id: {id}"),
             }
         })?;
-        let mut s = Self::new();
-        s.client_charset = collation.charset;
-        s.connection_collation = collation;
-        s.results_collation = collation;
-        Ok(s)
+        Ok(Self::with_reset_collation(1024, collation))
+    }
+
+    /// Resets session-local state for connection pooling while preserving the
+    /// charset/collation negotiated during the initial handshake.
+    pub fn reset_for_connection_reuse(&mut self) {
+        let max_prepared_stmts = self.max_prepared_stmts;
+        let reset_collation = self.reset_collation;
+        *self = Self::with_reset_collation(max_prepared_stmts, reset_collation);
     }
 
     /// Increments and returns the execute sequence counter.
@@ -1294,5 +1310,43 @@ mod tests {
         let (id, _param_count) =
             s.prepare_statement(r#"SELECT "name" FROM "t""#.into(), 0, "axiomdb");
         assert!(s.prepared_statements[&id].compiled_ansi_quotes);
+    }
+
+    #[test]
+    fn test_reset_for_connection_reuse_restores_handshake_charset() {
+        let mut s = ConnectionState::from_handshake_collation_id(8).unwrap();
+        s.apply_set("SET NAMES utf8mb4").unwrap();
+        assert_eq!(s.character_set_client_name(), "utf8mb4");
+        assert_eq!(s.character_set_connection_name(), "utf8mb4");
+        assert_eq!(s.character_set_results_name(), "utf8mb4");
+
+        s.reset_for_connection_reuse();
+
+        assert_eq!(s.character_set_client_name(), "latin1");
+        assert_eq!(s.character_set_connection_name(), "latin1");
+        assert_eq!(s.character_set_results_name(), "latin1");
+    }
+
+    #[test]
+    fn test_reset_for_connection_reuse_clears_session_mutation() {
+        let mut s = ConnectionState::new_with_limit(7);
+        s.current_database = "analytics".into();
+        s.autocommit = false;
+        s.apply_set("SET wait_timeout = 1").unwrap();
+        s.prepare_statement("SELECT ?".into(), 1, "analytics");
+        s.next_execute_seq();
+        s.session_status.questions = 9;
+        s.session_status.com_select = 4;
+
+        s.reset_for_connection_reuse();
+
+        assert!(s.current_database.is_empty());
+        assert!(s.autocommit);
+        assert_eq!(s.get_variable("wait_timeout").as_deref(), Some("28800"));
+        assert!(s.prepared_statements.is_empty());
+        assert_eq!(s.next_stmt_id, 1);
+        assert_eq!(s.max_prepared_stmts, 7);
+        assert_eq!(s.session_status.questions, 0);
+        assert_eq!(s.session_status.com_select, 0);
     }
 }

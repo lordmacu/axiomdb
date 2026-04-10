@@ -44,7 +44,7 @@ impl TestEnv {
 
 fn do_insert(
     storage: &mut MmapStorage,
-    txn: &mut TxnManager,
+    txn: &TxnManager,
     conn: &mut ConnectionTxn,
     data: &[u8],
 ) -> (u64, u16) {
@@ -73,7 +73,7 @@ fn slot_visible(
     }
 }
 
-fn leader_fsync(txn: &mut TxnManager, pipeline: &FsyncPipeline) -> Vec<axiomdb_core::TxnId> {
+fn leader_fsync(txn: &TxnManager, pipeline: &FsyncPipeline) -> Vec<axiomdb_core::TxnId> {
     txn.wal_flush_and_fsync().expect("wal_flush_and_fsync");
     let flushed = txn.wal_current_lsn();
     pipeline.release_ok(flushed)
@@ -91,9 +91,9 @@ fn test_pipeline_single_commit_visibility() {
     let pipeline = FsyncPipeline::new(txn.wal_current_lsn());
 
     let mut conn = txn.begin().expect("begin");
-    let (page_id, slot_id) = do_insert(&mut storage, &mut txn, &mut conn, b"pipeline_row");
-    txn.commit(conn).expect("commit");
-    let txn_id = txn.take_pending_deferred_commit().expect("pending txn");
+    let (page_id, slot_id) = do_insert(&mut storage, &txn, &mut conn, b"pipeline_row");
+    let pending = txn.commit(conn).expect("commit");
+    let txn_id = pending.expect("pending txn");
     let commit_lsn = txn.wal_current_lsn();
 
     let snap_before = txn.snapshot();
@@ -109,7 +109,7 @@ fn test_pipeline_single_commit_visibility() {
         ),
         "first acquire must return Acquired"
     );
-    let woken = leader_fsync(&mut txn, &pipeline);
+    let woken = leader_fsync(&txn, &pipeline);
     assert!(woken.is_empty(), "no followers queued");
     txn.advance_committed_single(txn_id);
 
@@ -131,23 +131,23 @@ fn test_pipeline_two_sequential_leaders() {
 
     // First commit: becomes leader, fsyncs.
     let mut conn1 = txn.begin().expect("begin");
-    let (page_id1, slot_id1) = do_insert(&mut storage, &mut txn, &mut conn1, b"row1");
-    txn.commit(conn1).expect("commit");
-    let txn_id1 = txn.take_pending_deferred_commit().expect("pending");
+    let (page_id1, slot_id1) = do_insert(&mut storage, &txn, &mut conn1, b"row1");
+    let pending1 = txn.commit(conn1).expect("commit");
+    let txn_id1 = pending1.expect("pending");
     let lsn1 = txn.wal_current_lsn();
     assert!(matches!(
         pipeline.acquire(lsn1, txn_id1),
         AcquireResult::Acquired
     ));
-    let woken = leader_fsync(&mut txn, &pipeline);
+    let woken = leader_fsync(&txn, &pipeline);
     assert!(woken.is_empty());
     txn.advance_committed_single(txn_id1);
 
     // Second commit: also becomes leader (previous leader released the flag).
     let mut conn2 = txn.begin().expect("begin");
-    let (page_id2, slot_id2) = do_insert(&mut storage, &mut txn, &mut conn2, b"row2");
-    txn.commit(conn2).expect("commit");
-    let txn_id2 = txn.take_pending_deferred_commit().expect("pending");
+    let (page_id2, slot_id2) = do_insert(&mut storage, &txn, &mut conn2, b"row2");
+    let pending2 = txn.commit(conn2).expect("commit");
+    let txn_id2 = pending2.expect("pending");
     let lsn2 = txn.wal_current_lsn();
     // lsn2 > flushed_lsn (new WAL entries appended after previous fsync)
     // → Acquired (new leader), NOT Expired.
@@ -155,7 +155,7 @@ fn test_pipeline_two_sequential_leaders() {
         matches!(pipeline.acquire(lsn2, txn_id2), AcquireResult::Acquired),
         "second sequential commit must become a new leader"
     );
-    let woken = leader_fsync(&mut txn, &pipeline);
+    let woken = leader_fsync(&txn, &pipeline);
     assert!(woken.is_empty());
     txn.advance_committed_single(txn_id2);
 
@@ -180,9 +180,9 @@ async fn test_pipeline_follower_piggybacks_on_leader() {
 
     // First commit → leader (no fsync yet).
     let mut conn1 = txn.begin().expect("begin");
-    do_insert(&mut storage, &mut txn, &mut conn1, b"leader_row");
-    txn.commit(conn1).expect("commit");
-    let txn_id1 = txn.take_pending_deferred_commit().expect("pending");
+    do_insert(&mut storage, &txn, &mut conn1, b"leader_row");
+    let pending1 = txn.commit(conn1).expect("commit");
+    let txn_id1 = pending1.expect("pending");
     let lsn1 = txn.wal_current_lsn();
     assert!(matches!(
         pipeline.acquire(lsn1, txn_id1),
@@ -191,9 +191,9 @@ async fn test_pipeline_follower_piggybacks_on_leader() {
 
     // Second commit → queued while leader is active.
     let mut conn2 = txn.begin().expect("begin");
-    do_insert(&mut storage, &mut txn, &mut conn2, b"follower_row");
-    txn.commit(conn2).expect("commit");
-    let txn_id2 = txn.take_pending_deferred_commit().expect("pending");
+    do_insert(&mut storage, &txn, &mut conn2, b"follower_row");
+    let pending2 = txn.commit(conn2).expect("commit");
+    let txn_id2 = pending2.expect("pending");
     let lsn2 = txn.wal_current_lsn();
     let rx = match pipeline.acquire(lsn2, txn_id2) {
         AcquireResult::Queued(rx) => rx,
@@ -202,7 +202,7 @@ async fn test_pipeline_follower_piggybacks_on_leader() {
     };
 
     // Leader fsyncs → wakes follower.
-    let woken = leader_fsync(&mut txn, &pipeline);
+    let woken = leader_fsync(&txn, &pipeline);
     txn.advance_committed_single(txn_id1);
     txn.advance_committed(&woken);
 
@@ -229,11 +229,11 @@ fn test_pipeline_commit_survives_crash() {
         let pipeline = FsyncPipeline::new(txn.wal_current_lsn());
 
         let mut conn = txn.begin().expect("begin");
-        let ids = do_insert(&mut storage, &mut txn, &mut conn, b"durable_data");
+        let ids = do_insert(&mut storage, &txn, &mut conn, b"durable_data");
         page_id = ids.0;
         slot_id = ids.1;
-        txn.commit(conn).expect("commit");
-        let txn_id = txn.take_pending_deferred_commit().expect("pending");
+        let pending = txn.commit(conn).expect("commit");
+        let txn_id = pending.expect("pending");
         let lsn = txn.wal_current_lsn();
 
         assert!(matches!(
@@ -282,9 +282,9 @@ async fn test_pipeline_batch_wakeup_three_followers() {
 
     // Leader acquires.
     let mut conn0 = txn.begin().expect("begin");
-    do_insert(&mut storage, &mut txn, &mut conn0, b"leader");
-    txn.commit(conn0).expect("commit");
-    let txn_id0 = txn.take_pending_deferred_commit().expect("pending");
+    do_insert(&mut storage, &txn, &mut conn0, b"leader");
+    let pending0 = txn.commit(conn0).expect("commit");
+    let txn_id0 = pending0.expect("pending");
     let lsn0 = txn.wal_current_lsn();
     assert!(matches!(
         pipeline.acquire(lsn0, txn_id0),
@@ -296,9 +296,9 @@ async fn test_pipeline_batch_wakeup_three_followers() {
     let mut txn_ids = Vec::new();
     for i in 0u8..3 {
         let mut conn = txn.begin().expect("begin");
-        do_insert(&mut storage, &mut txn, &mut conn, &[i]);
-        txn.commit(conn).expect("commit");
-        let txn_id = txn.take_pending_deferred_commit().expect("pending");
+        do_insert(&mut storage, &txn, &mut conn, &[i]);
+        let pending = txn.commit(conn).expect("commit");
+        let txn_id = pending.expect("pending");
         let lsn = txn.wal_current_lsn();
         let rx = match pipeline.acquire(lsn, txn_id) {
             AcquireResult::Queued(rx) => rx,
@@ -310,7 +310,7 @@ async fn test_pipeline_batch_wakeup_three_followers() {
     }
 
     // Leader fsyncs.
-    let woken = leader_fsync(&mut txn, &pipeline);
+    let woken = leader_fsync(&txn, &pipeline);
     assert_eq!(woken.len(), 3, "all three followers must be woken");
     for tid in &txn_ids {
         assert!(woken.contains(tid), "txn_id {tid} must be in woken list");
@@ -331,9 +331,9 @@ fn test_pipeline_mvcc_visibility_invariant() {
     let pipeline = FsyncPipeline::new(txn.wal_current_lsn());
 
     let mut conn = txn.begin().expect("begin");
-    let (page_id, slot_id) = do_insert(&mut storage, &mut txn, &mut conn, b"mvcc_test");
-    txn.commit(conn).expect("commit");
-    let txn_id = txn.take_pending_deferred_commit().expect("pending");
+    let (page_id, slot_id) = do_insert(&mut storage, &txn, &mut conn, b"mvcc_test");
+    let pending = txn.commit(conn).expect("commit");
+    let txn_id = pending.expect("pending");
     let lsn = txn.wal_current_lsn();
 
     let snap_before = txn.snapshot();

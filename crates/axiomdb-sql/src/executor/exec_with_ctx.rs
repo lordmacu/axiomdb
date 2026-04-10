@@ -1,14 +1,14 @@
 pub fn execute_with_ctx(
     stmt: Stmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
-    bloom: &mut crate::bloom::BloomRegistry,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    bloom: &crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     // Use new() (shared refs) so that txn/storage/bloom remain usable directly
     // for begin/commit/rollback/savepoint calls below. The &mut borrows held by
     // the caller guarantee exclusive access; the single-writer constraint (Phase 3)
-    // ensures storage_mut()/coord_mut()/bloom_mut() are safe to call on this ctx.
+    // ensures storage()/coord()/bloom() are safe to call on this ctx.
     let exec_ctx = ExecutionContext::new(storage, txn, bloom);
     if ctx.conn_txn.is_some() {
         match &stmt {
@@ -20,7 +20,7 @@ pub fn execute_with_ctx(
                 ctx.savepoints.clear(); // all savepoints destroyed on COMMIT
                 let conn = ctx.conn_txn.take().expect("conn_txn checked above");
                 let tid = conn.txn_id;
-                txn.commit(conn)?;
+                ctx.pending_deferred_txn_id = txn.commit(conn)?;
                 txn.release_immediate_committed_frees(storage, tid)?;
                 txn.drain_committed_page_batches(storage)?;
                 return Ok(QueryResult::Empty);
@@ -88,16 +88,17 @@ pub fn execute_with_ctx(
             ctx.in_explicit_txn = false;
             let pre_conn = ctx.conn_txn.take().expect("conn_txn checked above");
             let pre_tid = pre_conn.txn_id;
-            txn.commit(pre_conn)?;
+            // Pre-DDL commit: discard any pending deferred (pipeline handles it).
+            let _ = txn.commit(pre_conn)?;
             txn.release_immediate_committed_frees(storage, pre_tid)?;
             txn.drain_committed_page_batches(storage)?;
             ctx.conn_txn = Some(txn.begin()?);
-            let exec_ctx2 = ExecutionContext::from_mut(storage, txn, bloom);
+            let exec_ctx2 = ExecutionContext::new(storage, txn, bloom);
             return match dispatch_ctx(stmt, &exec_ctx2, ctx) {
                 Ok(result) => {
                     let ddl_conn = ctx.conn_txn.take().expect("just set above");
                     let ddl_tid = ddl_conn.txn_id;
-                    txn.commit(ddl_conn)?;
+                    ctx.pending_deferred_txn_id = txn.commit(ddl_conn)?;
                     txn.release_immediate_committed_frees(storage, ddl_tid)?;
                     txn.drain_committed_page_batches(storage)?;
                     Ok(result)
@@ -189,12 +190,12 @@ pub fn execute_with_ctx(
                 // NOTE: `in_explicit_txn` is NOT set here — this is an implicit
                 // autocommit transaction. Single-statement INSERTs use the existing
                 // multi-row batch path inside execute_insert_ctx, not the staging buffer.
-                let exec_ctx2 = ExecutionContext::from_mut(storage, txn, bloom);
+                let exec_ctx2 = ExecutionContext::new(storage, txn, bloom);
                 match dispatch_ctx(other, &exec_ctx2, ctx) {
                     Ok(result) => {
                         let conn = ctx.conn_txn.take().expect("just set above");
                         let tid = conn.txn_id;
-                        txn.commit(conn)?;
+                        ctx.pending_deferred_txn_id = txn.commit(conn)?;
                         txn.release_immediate_committed_frees(storage, tid)?;
                         txn.drain_committed_page_batches(storage)?;
                         Ok(result)
@@ -224,11 +225,11 @@ pub fn execute_with_ctx(
             }
             Stmt::Select(_) => {
                 ctx.conn_txn = Some(txn.begin()?);
-                let exec_ctx2 = ExecutionContext::from_mut(storage, txn, bloom);
+                let exec_ctx2 = ExecutionContext::new(storage, txn, bloom);
                 match dispatch_ctx(stmt, &exec_ctx2, ctx) {
                     Ok(result) => {
                         let conn = ctx.conn_txn.take().expect("just set above");
-                        txn.commit(conn)?;
+                        let _ = txn.commit(conn)?;
                         Ok(result)
                     }
                     Err(e) => {
@@ -240,11 +241,11 @@ pub fn execute_with_ctx(
             }
             other if is_ddl(&other) => {
                 ctx.conn_txn = Some(txn.begin()?);
-                let exec_ctx2 = ExecutionContext::from_mut(storage, txn, bloom);
+                let exec_ctx2 = ExecutionContext::new(storage, txn, bloom);
                 match dispatch_ctx(other, &exec_ctx2, ctx) {
                     Ok(result) => {
                         let conn = ctx.conn_txn.take().expect("just set above");
-                        txn.commit(conn)?;
+                        ctx.pending_deferred_txn_id = txn.commit(conn)?;
                         Ok(result)
                     }
                     Err(e) => {
@@ -263,7 +264,7 @@ pub fn execute_with_ctx(
                 } else {
                     None
                 };
-                let exec_ctx2 = ExecutionContext::from_mut(storage, txn, bloom);
+                let exec_ctx2 = ExecutionContext::new(storage, txn, bloom);
                 match dispatch_ctx(other, &exec_ctx2, ctx) {
                     Ok(result) => Ok(result),
                     Err(e) => match ctx.on_error {

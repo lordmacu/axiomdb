@@ -2,8 +2,8 @@
 
 fn execute_drop_table(
     stmt: DropTableStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     database: &str,
 ) -> Result<QueryResult, DbError> {
@@ -37,8 +37,8 @@ fn execute_drop_table(
 }
 
 fn drop_table_fully(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_id: u32,
 ) -> Result<(), DbError> {
@@ -55,14 +55,14 @@ fn drop_table_fully(
     };
 
     let mut seen_fk_ids = HashSet::new();
-    let mut noop_bloom = crate::bloom::BloomRegistry::new();
+    let noop_bloom = crate::bloom::BloomRegistry::new();
     for fk in child_fks.into_iter().chain(parent_fks.into_iter()) {
         if !seen_fk_ids.insert(fk.fk_id) {
             continue;
         }
         CatalogWriter::new(storage, txn, conn_txn)?.drop_foreign_key(fk.fk_id)?;
         if fk.fk_index_id != 0 {
-            let _ = execute_drop_index_by_id(fk.fk_index_id, storage, txn, conn_txn, &mut noop_bloom);
+            let _ = execute_drop_index_by_id(fk.fk_index_id, storage, txn, conn_txn, &noop_bloom);
         }
     }
 

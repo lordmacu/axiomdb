@@ -15,8 +15,8 @@
 //! `SHOW STATUS` never needs to take the `Database` mutex.
 //!
 //! `ConnectionState` owns `SessionStatus` with per-connection cumulative
-//! counters. `COM_RESET_CONNECTION` resets it automatically because it
-//! recreates `ConnectionState::new()`.
+//! counters. `COM_RESET_CONNECTION` resets it through
+//! `ConnectionState::reset_for_connection_reuse()`.
 //!
 //! LIKE filtering reuses the already-tested `like_match` from
 //! `axiomdb-sql` — proper `%` / `_` wildcard semantics, not substring.
@@ -90,7 +90,8 @@ impl Default for StatusRegistry {
 /// Per-connection cumulative status counters.
 ///
 /// Owned by `ConnectionState`. Plain integers — only one task owns them.
-/// Reset automatically when `COM_RESET_CONNECTION` recreates `ConnectionState`.
+/// Reset automatically when `COM_RESET_CONNECTION` calls
+/// `ConnectionState::reset_for_connection_reuse()`.
 #[derive(Debug, Default, Clone)]
 pub struct SessionStatus {
     pub questions: u64,

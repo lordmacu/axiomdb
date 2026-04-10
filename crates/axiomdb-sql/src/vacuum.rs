@@ -49,9 +49,9 @@ pub fn execute_vacuum(
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
-    let storage = unsafe { exec_ctx.storage_mut() };
-    let txn = unsafe { exec_ctx.coord_mut() };
-    let bloom = unsafe { exec_ctx.bloom_mut() };
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
+    let bloom = exec_ctx.bloom();
     let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("active txn for vacuum"));
     // Under RwLock: no concurrent readers, all committed deletes are safe.
     let oldest_safe_txn = txn.max_committed() + 1;
@@ -142,12 +142,12 @@ pub fn execute_vacuum(
 fn vacuum_one_table(
     table_def: &axiomdb_catalog::TableDef,
     indexes: &[IndexDef],
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     snap: TransactionSnapshot,
     oldest_safe_txn: u64,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
 ) -> Result<VacuumTableResult, DbError> {
     if table_def.is_clustered() {
         return vacuum_clustered_table(
@@ -188,7 +188,7 @@ fn vacuum_one_table(
 /// Walks the heap chain and physically kills slots where
 /// `txn_id_deleted != 0 && txn_id_deleted < oldest_safe_txn`.
 fn vacuum_heap_chain(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     root_page_id: u64,
     oldest_safe_txn: u64,
 ) -> Result<u64, DbError> {
@@ -235,12 +235,12 @@ fn vacuum_heap_chain(
 /// Scans all entries in a non-unique secondary index and removes those
 /// pointing to dead heap slots.
 fn vacuum_index(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     index: &IndexDef,
     snap: TransactionSnapshot,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
 ) -> Result<u64, DbError> {
     let all_entries = BTree::range_in(storage, index.root_page_id, None, None)?;
     if all_entries.is_empty() {
@@ -276,11 +276,11 @@ fn vacuum_index(
 fn vacuum_clustered_table(
     table_def: &axiomdb_catalog::TableDef,
     indexes: &[IndexDef],
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     oldest_safe_txn: u64,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
 ) -> Result<VacuumTableResult, DbError> {
     // Phase 1: Clustered leaf cleanup — physically remove dead cells.
     let dead_rows = vacuum_clustered_leaves(storage, table_def.root_page_id, oldest_safe_txn)?;
@@ -309,7 +309,7 @@ fn vacuum_clustered_table(
 /// `txn_id_deleted != 0 && txn_id_deleted < oldest_safe_txn`.
 /// Conditionally defragments pages with >30% freeblock waste.
 fn vacuum_clustered_leaves(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     root_pid: u64,
     oldest_safe_txn: u64,
 ) -> Result<u64, DbError> {
@@ -382,13 +382,13 @@ fn leftmost_clustered_leaf(storage: &dyn StorageEngine, mut pid: u64) -> Result<
 
 /// Cleans secondary index entries that point to dead clustered rows.
 fn vacuum_clustered_secondary(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     index: &IndexDef,
     primary_idx: &IndexDef,
     table_def: &axiomdb_catalog::TableDef,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
 ) -> Result<u64, DbError> {
     let layout = crate::clustered_secondary::ClusteredSecondaryLayout::derive(index, primary_idx)?;
     let all_entries = BTree::range_in(storage, index.root_page_id, None, None)?;
@@ -429,8 +429,8 @@ fn vacuum_clustered_secondary(
 }
 
 fn persist_index_root_if_changed(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     index: &IndexDef,
     root_pid: &AtomicU64,

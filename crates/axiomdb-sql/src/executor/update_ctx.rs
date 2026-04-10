@@ -5,9 +5,9 @@ fn execute_update_ctx(
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
-    let storage = unsafe { exec_ctx.storage_mut() };
-    let txn = unsafe { exec_ctx.coord_mut() };
-    let bloom = unsafe { exec_ctx.bloom_mut() };
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
+    let bloom = exec_ctx.bloom();
     let resolved = resolve_table_cached(
         storage,
         txn,

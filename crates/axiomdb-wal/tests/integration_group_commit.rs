@@ -2,11 +2,11 @@
 //!
 //! Tests cover:
 //! - `commit_deferred_mode = false` (default): TxnManager behaves identically
-//!   to pre-3.19; `take_pending_deferred_commit()` always returns None.
+//!   to pre-3.19; `commit()` returns `Ok(None)`.
 //! - `commit_deferred_mode = true` (used by the Phase 6.19 fsync pipeline):
-//!   - DML commit → `take_pending_deferred_commit()` returns `Some(txn_id)`.
+//!   - DML commit → `commit()` returns `Ok(Some(txn_id))`.
 //!   - max_committed NOT advanced until `advance_committed()` is called.
-//!   - Read-only commit → flush_no_sync path; `take_pending_deferred_commit()` None.
+//!   - Read-only commit → flush_no_sync path; `commit()` returns `Ok(None)`.
 //! - `advance_committed()` advances max_committed to the batch max.
 //! - `advance_committed()` never regresses max_committed.
 //! - `wal_flush_and_fsync()` succeeds (flush + fsync round-trip).
@@ -46,7 +46,7 @@ fn make_storage(env: &TestEnv) -> (MmapStorage, u64) {
 
 fn insert_row(
     storage: &mut MmapStorage,
-    txn: &mut TxnManager,
+    txn: &TxnManager,
     conn: &mut ConnectionTxn,
     page_id: u64,
     data: &[u8],
@@ -67,27 +67,27 @@ fn insert_row(
 fn test_default_mode_commit_advances_max_committed() {
     let env = TestEnv::new();
     let (mut storage, page_id) = make_storage(&env);
-    let mut txn = TxnManager::create(&env.wal).unwrap();
+    let txn = TxnManager::create(&env.wal).unwrap();
 
     let mut conn = txn.begin().unwrap();
-    insert_row(&mut storage, &mut txn, &mut conn, page_id, b"hello");
-    txn.commit(conn).unwrap();
+    insert_row(&mut storage, &txn, &mut conn, page_id, b"hello");
+    let pending = txn.commit(conn).unwrap();
 
     let snap = txn.snapshot();
     assert!(snap.snapshot_id > 0, "max_committed should have advanced");
-    assert!(txn.take_pending_deferred_commit().is_none());
+    assert!(pending.is_none());
 }
 
 #[test]
 fn test_default_mode_readonly_no_pending() {
     let env = TestEnv::new();
     let (_, _) = make_storage(&env);
-    let mut txn = TxnManager::create(&env.wal).unwrap();
+    let txn = TxnManager::create(&env.wal).unwrap();
 
     let conn = txn.begin().unwrap();
-    txn.commit(conn).unwrap();
+    let pending = txn.commit(conn).unwrap();
 
-    assert!(txn.take_pending_deferred_commit().is_none());
+    assert!(pending.is_none());
 }
 
 // ── Tests — deferred commit mode (fsync pipeline hook) ───────────────────────
@@ -102,8 +102,8 @@ fn test_deferred_mode_dml_does_not_advance_max_committed() {
     let snap_before = txn.snapshot();
 
     let mut conn = txn.begin().unwrap();
-    insert_row(&mut storage, &mut txn, &mut conn, page_id, b"world");
-    txn.commit(conn).unwrap();
+    insert_row(&mut storage, &txn, &mut conn, page_id, b"world");
+    let _ = txn.commit(conn).unwrap();
 
     let snap_after = txn.snapshot();
     assert_eq!(
@@ -121,18 +121,14 @@ fn test_deferred_mode_dml_returns_pending_txn_id() {
 
     let mut conn = txn.begin().unwrap();
     let txn_id = conn.txn_id;
-    insert_row(&mut storage, &mut txn, &mut conn, page_id, b"deferred");
-    txn.commit(conn).unwrap();
+    insert_row(&mut storage, &txn, &mut conn, page_id, b"deferred");
+    let pending = txn.commit(conn).unwrap();
 
-    let pending = txn.take_pending_deferred_commit();
     assert_eq!(
         pending,
         Some(txn_id),
         "DML commit must produce a pending txn_id"
     );
-
-    // Second call returns None — idempotent take.
-    assert!(txn.take_pending_deferred_commit().is_none());
 }
 
 #[test]
@@ -146,14 +142,14 @@ fn test_deferred_mode_readonly_no_pending_and_advances_committed() {
 
     let conn = txn.begin().unwrap();
     // No DML — read-only transaction always goes through flush_no_sync.
-    txn.commit(conn).unwrap();
+    let pending = txn.commit(conn).unwrap();
 
     let snap_after = txn.snapshot();
     assert!(
         snap_after.snapshot_id >= snap_before.snapshot_id,
         "read-only commit must advance max_committed"
     );
-    assert!(txn.take_pending_deferred_commit().is_none());
+    assert!(pending.is_none());
 }
 
 // ── Tests — advance_committed ─────────────────────────────────────────────────
@@ -168,9 +164,9 @@ fn test_advance_committed_advances_max() {
     let mut txn_ids = vec![];
     for i in 0..3u8 {
         let mut conn = txn.begin().unwrap();
-        insert_row(&mut storage, &mut txn, &mut conn, page_id, &[i]);
-        txn.commit(conn).unwrap();
-        txn_ids.push(txn.take_pending_deferred_commit().unwrap());
+        insert_row(&mut storage, &txn, &mut conn, page_id, &[i]);
+        let pending = txn.commit(conn).unwrap();
+        txn_ids.push(pending.unwrap());
     }
 
     let snap_before = txn.snapshot();
@@ -196,9 +192,9 @@ fn test_advance_committed_no_regression() {
     txn.set_deferred_commit_mode(true);
 
     let mut conn = txn.begin().unwrap();
-    insert_row(&mut storage, &mut txn, &mut conn, page_id, b"x");
-    txn.commit(conn).unwrap();
-    let txn_id = txn.take_pending_deferred_commit().unwrap();
+    insert_row(&mut storage, &txn, &mut conn, page_id, b"x");
+    let pending = txn.commit(conn).unwrap();
+    let txn_id = pending.unwrap();
     txn.advance_committed(&[txn_id]);
     let snap_high = txn.snapshot();
 
@@ -215,7 +211,7 @@ fn test_advance_committed_no_regression() {
 fn test_advance_committed_empty_slice_is_noop() {
     let env = TestEnv::new();
     let (_, _) = make_storage(&env);
-    let mut txn = TxnManager::create(&env.wal).unwrap();
+    let txn = TxnManager::create(&env.wal).unwrap();
 
     let snap_before = txn.snapshot();
     txn.advance_committed(&[]);
@@ -233,8 +229,8 @@ fn test_wal_flush_and_fsync_succeeds() {
     txn.set_deferred_commit_mode(true);
 
     let mut conn = txn.begin().unwrap();
-    insert_row(&mut storage, &mut txn, &mut conn, page_id, b"fsync test");
-    txn.commit(conn).unwrap();
+    insert_row(&mut storage, &txn, &mut conn, page_id, b"fsync test");
+    let _ = txn.commit(conn).unwrap();
 
     txn.wal_flush_and_fsync()
         .expect("flush_and_fsync must succeed");
@@ -259,13 +255,12 @@ fn test_deferred_row_invisible_before_advance_committed() {
     let txn_id = conn.txn_id;
     let slot_id = insert_row(
         &mut storage,
-        &mut txn,
+        &txn,
         &mut conn,
         page_id,
         b"invisible until fsync",
     );
-    txn.commit(conn).unwrap();
-    let pending = txn.take_pending_deferred_commit().unwrap();
+    let pending = txn.commit(conn).unwrap().unwrap();
 
     // Snapshot taken BEFORE advance_committed — max_committed has not advanced.
     let snap = txn.snapshot();
