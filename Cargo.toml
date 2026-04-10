@@ -103,6 +103,7 @@ axiomdb-storage = { path = "crates/axiomdb-storage" }
 axiomdb-wal     = { path = "crates/axiomdb-wal" }
 axiomdb-catalog = { path = "crates/axiomdb-catalog" }
 axiomdb-index   = { path = "crates/axiomdb-index" }
+axiomdb-lock    = { path = "crates/axiomdb-lock" }
 
 [profile.dev]
 opt-level = 0

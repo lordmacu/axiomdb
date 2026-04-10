@@ -22,7 +22,7 @@ pub mod mode;
 pub mod txn_locks;
 
 pub use bitmap::SlotBitmap;
-pub use entry::{LockEntry, LockQueue, LockWaiter, WaitAbortReason};
+pub use entry::{LockEntry, LockQueue, LockWaiter, SyncNotify, WaitAbortReason, WaiterSignal};
 pub use manager::{LockManager, LockResult};
 pub use mode::{conflicts, LockFlags, LockMode, CONFLICT_MATRIX};
 pub use txn_locks::{LockRef, TxnLockTracker};

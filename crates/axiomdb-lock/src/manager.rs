@@ -7,7 +7,7 @@ use axiomdb_core::TxnId;
 
 use crate::bitmap::SlotBitmap;
 use crate::deadlock::{detect_cycle, select_victim, WaitEdge, WaitForMap};
-use crate::entry::{LockEntry, LockQueue, LockWaiter, WaitAbortReason};
+use crate::entry::{LockEntry, LockQueue, LockWaiter, SyncNotify, WaitAbortReason, WaiterSignal};
 use crate::mode::{LockFlags, LockMode};
 use crate::txn_locks::LockRef;
 
@@ -149,7 +149,7 @@ impl LockManager {
                     requested_at: Instant::now(),
                     bitmap: Some(SlotBitmap::with_slot(slot_id)),
                 },
-                notify: std::sync::Arc::clone(&notify),
+                signal: WaiterSignal::Async(std::sync::Arc::clone(&notify)),
                 abort_reason: None,
             };
             queue.waiting.push_back(waiter);
@@ -290,7 +290,7 @@ impl LockManager {
                     requested_at: Instant::now(),
                     bitmap: None,
                 },
-                notify: std::sync::Arc::clone(&notify),
+                signal: WaiterSignal::Async(std::sync::Arc::clone(&notify)),
                 abort_reason: None,
             });
             notify
@@ -321,7 +321,7 @@ impl LockManager {
     /// Returns the number of waiters that were granted.
     pub fn release_all_locks(&self, txn_id: TxnId, held_locks: &[LockRef]) -> usize {
         let mut total_granted = 0;
-        let mut all_notifies: Vec<std::sync::Arc<tokio::sync::Notify>> = Vec::new();
+        let mut all_signals: Vec<WaiterSignal> = Vec::new();
 
         for lock_ref in held_locks {
             match lock_ref {
@@ -330,9 +330,9 @@ impl LockManager {
                     let mut shard = self.record_shards[shard_idx].lock().unwrap();
                     if let Some(queue) = shard.get_mut(page_id) {
                         queue.remove_granted_by_txn(txn_id);
-                        let notifies = queue.try_grant_waiters();
-                        total_granted += notifies.len();
-                        all_notifies.extend(notifies);
+                        let signals = queue.try_grant_waiters();
+                        total_granted += signals.len();
+                        all_signals.extend(signals);
                         if queue.is_empty() {
                             shard.remove(page_id);
                         }
@@ -343,9 +343,9 @@ impl LockManager {
                     let mut shard = self.table_shards[shard_idx].lock().unwrap();
                     if let Some(queue) = shard.get_mut(table_id) {
                         queue.remove_granted_by_txn(txn_id);
-                        let notifies = queue.try_grant_waiters();
-                        total_granted += notifies.len();
-                        all_notifies.extend(notifies);
+                        let signals = queue.try_grant_waiters();
+                        total_granted += signals.len();
+                        all_signals.extend(signals);
                         if queue.is_empty() {
                             shard.remove(table_id);
                         }
@@ -355,8 +355,8 @@ impl LockManager {
         }
 
         // Notify all waiters AFTER dropping all shard mutexes.
-        for notify in all_notifies {
-            notify.notify_one();
+        for signal in all_signals {
+            signal.notify_one();
         }
 
         total_granted
@@ -376,7 +376,7 @@ impl LockManager {
                         queue.waiting.iter_mut().find(|w| w.entry.txn_id == txn_id)
                     {
                         waiter.abort_reason = Some(WaitAbortReason::Deadlock);
-                        waiter.notify.notify_one();
+                        waiter.signal.notify_one();
                     }
                 }
             }
@@ -388,10 +388,226 @@ impl LockManager {
                         queue.waiting.iter_mut().find(|w| w.entry.txn_id == txn_id)
                     {
                         waiter.abort_reason = Some(WaitAbortReason::Deadlock);
-                        waiter.notify.notify_one();
+                        waiter.signal.notify_one();
                     }
                 }
             }
+        }
+    }
+
+    // ── Synchronous API (Phase 40.11) ──────────────────────────────────────
+
+    /// Synchronous variant of [`acquire_record_lock`] for the sync executor.
+    ///
+    /// Fast path (no conflict): immediate grant — zero async overhead.
+    /// Slow path (conflict): `Condvar::wait_timeout` — blocks the OS thread.
+    ///
+    /// The grant/conflict logic is identical to the async path; only the wait
+    /// mechanism differs (`Condvar` vs `tokio::sync::Notify`).
+    pub fn acquire_record_lock_sync(
+        &self,
+        txn_id: TxnId,
+        page_id: u64,
+        slot_id: u16,
+        mode: LockMode,
+        flags: LockFlags,
+    ) -> Result<LockResult, DbError> {
+        let shard_idx = page_id as usize % RECORD_SHARDS;
+        let (sync_notify, blocker) = {
+            let mut shard = self.record_shards[shard_idx].lock().unwrap();
+            let queue = shard.entry(page_id).or_default();
+
+            // Fast path: same txn already holds compatible lock on this page.
+            if let Some(idx) = queue.find_granted_idx(txn_id, mode) {
+                if let Some(ref mut bm) = queue.granted[idx].bitmap {
+                    bm.set(slot_id);
+                }
+                return Ok(LockResult::Granted);
+            }
+
+            // Check for upgrade: txn holds S, requests X.
+            if mode == LockMode::Exclusive {
+                if let Some(idx) = queue.find_granted_idx(txn_id, LockMode::Shared) {
+                    let has_other_conflict =
+                        queue.find_conflict(txn_id, mode, Some(slot_id)).is_some();
+                    if !has_other_conflict && queue.waiting.is_empty() {
+                        queue.granted[idx].mode = LockMode::Exclusive;
+                        if let Some(ref mut bm) = queue.granted[idx].bitmap {
+                            bm.set(slot_id);
+                        }
+                        return Ok(LockResult::Granted);
+                    }
+                }
+            }
+
+            // Check conflict with granted locks.
+            let blocking_txn = queue.find_conflict(txn_id, mode, Some(slot_id));
+
+            // FIFO discipline.
+            if blocking_txn.is_none() && queue.waiting.is_empty() {
+                let mut entry = LockEntry {
+                    txn_id,
+                    mode,
+                    flags,
+                    requested_at: Instant::now(),
+                    bitmap: Some(SlotBitmap::with_slot(slot_id)),
+                };
+                entry.flags = entry.flags.difference(LockFlags::WAITING);
+                queue.granted.push(entry);
+                return Ok(LockResult::Granted);
+            }
+
+            // Must wait — enqueue with SyncNotify.
+            let sync_notify = std::sync::Arc::new(SyncNotify::new());
+            let waiter = LockWaiter {
+                entry: LockEntry {
+                    txn_id,
+                    mode,
+                    flags: flags.union(LockFlags::WAITING),
+                    requested_at: Instant::now(),
+                    bitmap: Some(SlotBitmap::with_slot(slot_id)),
+                },
+                signal: WaiterSignal::Sync(std::sync::Arc::clone(&sync_notify)),
+                abort_reason: None,
+            };
+            queue.waiting.push_back(waiter);
+
+            let blocker = blocking_txn
+                .unwrap_or_else(|| queue.waiting.front().map(|w| w.entry.txn_id).unwrap_or(0));
+            (sync_notify, blocker)
+            // Shard mutex dropped here.
+        };
+
+        // ── Deadlock detection ───────────────────────────────────────────
+        let lock_ref = LockRef::Record { page_id, slot_id };
+        {
+            let mut wf = self.wait_for.lock().unwrap();
+            wf.insert(
+                txn_id,
+                WaitEdge {
+                    blocking_txn: blocker,
+                    lock_ref: lock_ref.clone(),
+                    wait_started: Instant::now(),
+                    undo_count: 0,
+                },
+            );
+            if let Some(cycle) = detect_cycle(txn_id, &wf) {
+                let victim = select_victim(&cycle, &wf);
+                let victim_ref = wf.get(&victim).map(|e| e.lock_ref.clone());
+                wf.remove(&victim);
+                drop(wf);
+                if let Some(vr) = victim_ref {
+                    self.abort_waiter(victim, &vr);
+                }
+                if victim == txn_id {
+                    let mut shard = self.record_shards[shard_idx].lock().unwrap();
+                    if let Some(queue) = shard.get_mut(&page_id) {
+                        queue.remove_waiter_by_txn(txn_id);
+                        if queue.is_empty() {
+                            shard.remove(&page_id);
+                        }
+                    }
+                    return Err(DbError::DeadlockDetected);
+                }
+            }
+        }
+
+        // Wait via Condvar (blocks the OS thread).
+        let result = if sync_notify.wait_timeout(self.lock_wait_timeout) {
+            // Woken up — check if granted or aborted.
+            let shard = self.record_shards[shard_idx].lock().unwrap();
+            if let Some(queue) = shard.get(&page_id) {
+                if queue
+                    .granted
+                    .iter()
+                    .any(|e| e.txn_id == txn_id && e.mode == mode)
+                {
+                    Ok(LockResult::WaitGranted)
+                } else if queue.waiting.iter().any(|w| {
+                    w.entry.txn_id == txn_id && w.abort_reason == Some(WaitAbortReason::Deadlock)
+                }) {
+                    Err(DbError::DeadlockDetected)
+                } else {
+                    Ok(LockResult::WaitGranted)
+                }
+            } else {
+                Ok(LockResult::WaitGranted)
+            }
+        } else {
+            // Timeout.
+            let mut shard = self.record_shards[shard_idx].lock().unwrap();
+            if let Some(queue) = shard.get_mut(&page_id) {
+                queue.remove_waiter_by_txn(txn_id);
+                if queue.is_empty() {
+                    shard.remove(&page_id);
+                }
+            }
+            Err(DbError::LockTimeout)
+        };
+
+        self.wait_for.lock().unwrap().remove(&txn_id);
+        result
+    }
+
+    /// Synchronous variant of [`acquire_table_lock`].
+    pub fn acquire_table_lock_sync(
+        &self,
+        txn_id: TxnId,
+        table_id: u32,
+        mode: LockMode,
+    ) -> Result<LockResult, DbError> {
+        let shard_idx = table_id as usize % TABLE_SHARDS;
+        let sync_notify = {
+            let mut shard = self.table_shards[shard_idx].lock().unwrap();
+            let queue = shard.entry(table_id).or_default();
+
+            if queue
+                .granted
+                .iter()
+                .any(|e| e.txn_id == txn_id && e.mode == mode)
+            {
+                return Ok(LockResult::Granted);
+            }
+
+            let has_conflict = queue.find_conflict(txn_id, mode, None).is_some();
+
+            if !has_conflict && queue.waiting.is_empty() {
+                queue.granted.push(LockEntry {
+                    txn_id,
+                    mode,
+                    flags: LockFlags::TABLE_LOCK,
+                    requested_at: Instant::now(),
+                    bitmap: None,
+                });
+                return Ok(LockResult::Granted);
+            }
+
+            let sync_notify = std::sync::Arc::new(SyncNotify::new());
+            queue.waiting.push_back(LockWaiter {
+                entry: LockEntry {
+                    txn_id,
+                    mode,
+                    flags: LockFlags::TABLE_LOCK.union(LockFlags::WAITING),
+                    requested_at: Instant::now(),
+                    bitmap: None,
+                },
+                signal: WaiterSignal::Sync(std::sync::Arc::clone(&sync_notify)),
+                abort_reason: None,
+            });
+            sync_notify
+        };
+
+        if sync_notify.wait_timeout(self.lock_wait_timeout) {
+            Ok(LockResult::WaitGranted)
+        } else {
+            let mut shard = self.table_shards[shard_idx].lock().unwrap();
+            if let Some(queue) = shard.get_mut(&table_id) {
+                queue.remove_waiter_by_txn(txn_id);
+                if queue.is_empty() {
+                    shard.remove(&table_id);
+                }
+            }
+            Err(DbError::LockTimeout)
         }
     }
 }
@@ -800,6 +1016,167 @@ mod tests {
             for h in handles {
                 h.await.unwrap();
             }
+        });
+    }
+
+    // ── Sync API tests (Phase 40.11) ─────────────────────────────────────
+
+    #[test]
+    fn sync_record_lock_immediate_grant() {
+        let lm = LockManager::new();
+        let r = lm
+            .acquire_record_lock_sync(1, 100, 5, LockMode::Exclusive, LockFlags::NONE)
+            .unwrap();
+        assert_eq!(r, LockResult::Granted);
+    }
+
+    #[test]
+    fn sync_two_txns_different_slots_both_granted() {
+        let lm = LockManager::new();
+        let r1 = lm
+            .acquire_record_lock_sync(1, 100, 0, LockMode::Exclusive, LockFlags::NONE)
+            .unwrap();
+        let r2 = lm
+            .acquire_record_lock_sync(2, 100, 1, LockMode::Exclusive, LockFlags::NONE)
+            .unwrap();
+        assert_eq!(r1, LockResult::Granted);
+        assert_eq!(r2, LockResult::Granted);
+    }
+
+    #[test]
+    fn sync_same_txn_extends_bitmap() {
+        let lm = LockManager::new();
+        lm.acquire_record_lock_sync(1, 100, 5, LockMode::Exclusive, LockFlags::NONE)
+            .unwrap();
+        let r = lm
+            .acquire_record_lock_sync(1, 100, 10, LockMode::Exclusive, LockFlags::NONE)
+            .unwrap();
+        assert_eq!(r, LockResult::Granted);
+
+        let shard = lm.record_shards[100 % RECORD_SHARDS].lock().unwrap();
+        let queue = shard.get(&100).unwrap();
+        assert_eq!(queue.granted.len(), 1);
+        let bm = queue.granted[0].bitmap.as_ref().unwrap();
+        assert!(bm.test(5));
+        assert!(bm.test(10));
+    }
+
+    #[test]
+    fn sync_x_x_same_row_wait_then_granted() {
+        let lm = std::sync::Arc::new(LockManager::new());
+
+        // Txn 1 acquires X on slot 5.
+        lm.acquire_record_lock_sync(1, 100, 5, LockMode::Exclusive, LockFlags::NONE)
+            .unwrap();
+
+        // Txn 2 waits for X on slot 5 from another thread.
+        let lm2 = std::sync::Arc::clone(&lm);
+        let handle = std::thread::spawn(move || {
+            lm2.acquire_record_lock_sync(2, 100, 5, LockMode::Exclusive, LockFlags::NONE)
+        });
+
+        // Give txn 2 time to enqueue.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Release txn 1.
+        lm.release_all_locks(
+            1,
+            &[LockRef::Record {
+                page_id: 100,
+                slot_id: 5,
+            }],
+        );
+
+        let result = handle.join().unwrap().unwrap();
+        assert_eq!(result, LockResult::WaitGranted);
+    }
+
+    #[test]
+    fn sync_lock_timeout() {
+        let lm = std::sync::Arc::new(LockManager::with_timeout(Duration::from_millis(100)));
+        lm.acquire_record_lock_sync(1, 100, 5, LockMode::Exclusive, LockFlags::NONE)
+            .unwrap();
+
+        // Txn 2 should timeout.
+        let result = lm.acquire_record_lock_sync(2, 100, 5, LockMode::Exclusive, LockFlags::NONE);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            DbError::LockTimeout { .. } => {}
+            other => panic!("expected LockTimeout, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sync_table_lock_ix_ix_compatible() {
+        let lm = LockManager::new();
+        let r1 = lm
+            .acquire_table_lock_sync(1, 10, LockMode::IntentionExclusive)
+            .unwrap();
+        let r2 = lm
+            .acquire_table_lock_sync(2, 10, LockMode::IntentionExclusive)
+            .unwrap();
+        assert_eq!(r1, LockResult::Granted);
+        assert_eq!(r2, LockResult::Granted);
+    }
+
+    #[test]
+    fn sync_table_lock_ix_s_wait_then_granted() {
+        let lm = std::sync::Arc::new(LockManager::new());
+        lm.acquire_table_lock_sync(1, 10, LockMode::IntentionExclusive)
+            .unwrap();
+
+        let lm2 = std::sync::Arc::clone(&lm);
+        let handle =
+            std::thread::spawn(move || lm2.acquire_table_lock_sync(2, 10, LockMode::Shared));
+
+        std::thread::sleep(Duration::from_millis(50));
+        lm.release_all_locks(1, &[LockRef::Table { table_id: 10 }]);
+
+        let result = handle.join().unwrap().unwrap();
+        assert_eq!(result, LockResult::WaitGranted);
+    }
+
+    #[test]
+    fn sync_mixed_async_sync_waiters() {
+        // Async waiter and sync waiter on the same row — both should be
+        // granted after the holder releases.
+        let rt = rt();
+        rt.block_on(async {
+            let lm = std::sync::Arc::new(LockManager::new());
+
+            // Txn 1 holds X.
+            lm.acquire_record_lock(1, 300, 0, LockMode::Exclusive, LockFlags::NONE)
+                .await
+                .unwrap();
+
+            // Txn 2: async waiter for S.
+            let lm2 = std::sync::Arc::clone(&lm);
+            let async_handle = tokio::spawn(async move {
+                lm2.acquire_record_lock(2, 300, 0, LockMode::Shared, LockFlags::NONE)
+                    .await
+            });
+
+            // Txn 3: sync waiter for S (from a blocking thread).
+            let lm3 = std::sync::Arc::clone(&lm);
+            let sync_handle = std::thread::spawn(move || {
+                lm3.acquire_record_lock_sync(3, 300, 0, LockMode::Shared, LockFlags::NONE)
+            });
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // Release holder — both S waiters should be granted.
+            lm.release_all_locks(
+                1,
+                &[LockRef::Record {
+                    page_id: 300,
+                    slot_id: 0,
+                }],
+            );
+
+            let async_result = async_handle.await.unwrap().unwrap();
+            let sync_result = sync_handle.join().unwrap().unwrap();
+            assert!(async_result == LockResult::WaitGranted || async_result == LockResult::Granted);
+            assert!(sync_result == LockResult::WaitGranted || sync_result == LockResult::Granted);
         });
     }
 }

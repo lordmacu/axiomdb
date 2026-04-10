@@ -30,10 +30,84 @@ pub enum WaitAbortReason {
     Timeout,
 }
 
+// ── WaiterSignal ─────────────────────────────────────────────────────────────
+
+/// Synchronous notification primitive using `Condvar`.
+///
+/// The `Mutex<bool>` guard prevents missed wakeups: the notifier sets `true`
+/// before `notify_one()`, and the waiter loops on `wait_timeout()` until the
+/// flag is `true` or the timeout expires.
+pub struct SyncNotify {
+    inner: std::sync::Mutex<bool>,
+    cvar: std::sync::Condvar,
+}
+
+impl Default for SyncNotify {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SyncNotify {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(false),
+            cvar: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Signals the waiter. Safe to call multiple times.
+    pub fn notify(&self) {
+        let mut granted = self.inner.lock().unwrap();
+        *granted = true;
+        self.cvar.notify_one();
+    }
+
+    /// Blocks until notified or timeout. Returns `true` if notified.
+    pub fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
+        let mut granted = self.inner.lock().unwrap();
+        let deadline = Instant::now() + timeout;
+        while !*granted {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let result = self.cvar.wait_timeout(granted, remaining).unwrap();
+            granted = result.0;
+            if result.1.timed_out() && !*granted {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Dual-mode notification handle for lock waiters.
+///
+/// The async path uses `tokio::sync::Notify`, the sync path uses `SyncNotify`
+/// (Condvar-based). Both are stored in `LockWaiter` so `try_grant_waiters()`
+/// and `release_all_locks()` can wake either type of waiter uniformly.
+pub enum WaiterSignal {
+    /// Async waiter — woken via `tokio::sync::Notify`.
+    Async(Arc<Notify>),
+    /// Sync waiter — woken via `Condvar` (Phase 40.11).
+    Sync(Arc<SyncNotify>),
+}
+
+impl WaiterSignal {
+    /// Wakes the waiter regardless of which mode it uses.
+    pub fn notify_one(&self) {
+        match self {
+            WaiterSignal::Async(n) => n.notify_one(),
+            WaiterSignal::Sync(n) => n.notify(),
+        }
+    }
+}
+
 /// A transaction waiting to acquire a lock.
 pub struct LockWaiter {
     pub entry: LockEntry,
-    pub notify: Arc<Notify>,
+    pub signal: WaiterSignal,
     /// Set by the deadlock detector (40.6) or timeout handler before notifying.
     pub abort_reason: Option<WaitAbortReason>,
 }
@@ -122,8 +196,8 @@ impl LockQueue {
     /// **Important**: caller must drop the shard mutex BEFORE calling
     /// `notify.notify_one()` on the returned handles to avoid holding the
     /// mutex during task wake-up.
-    pub fn try_grant_waiters(&mut self) -> Vec<Arc<Notify>> {
-        let mut notifies = Vec::new();
+    pub fn try_grant_waiters(&mut self) -> Vec<WaiterSignal> {
+        let mut signals = Vec::new();
         let mut i = 0;
         while i < self.waiting.len() {
             let waiter = &self.waiting[i];
@@ -145,14 +219,14 @@ impl LockQueue {
             } else {
                 // Grant this waiter.
                 let mut waiter = self.waiting.remove(i).unwrap();
-                let notify = Arc::clone(&waiter.notify);
+                let signal = waiter.signal;
                 waiter.entry.flags = waiter.entry.flags.difference(LockFlags::WAITING);
                 self.granted.push(waiter.entry);
-                notifies.push(notify);
+                signals.push(signal);
                 // Don't increment i — next waiter shifted into current position.
             }
         }
-        notifies
+        signals
     }
 
     /// Removes all granted entries for the given transaction.
@@ -258,7 +332,7 @@ mod tests {
                 e.flags = LockFlags::WAITING;
                 e
             },
-            notify: Arc::clone(&notify2),
+            signal: WaiterSignal::Async(Arc::clone(&notify2)),
             abort_reason: None,
         });
         // Txn 3 waits for S on slot 10 (different slot — should be grantable
@@ -271,7 +345,7 @@ mod tests {
                 e.flags = LockFlags::WAITING;
                 e
             },
-            notify: Arc::clone(&notify3),
+            signal: WaiterSignal::Async(Arc::clone(&notify3)),
             abort_reason: None,
         });
 
