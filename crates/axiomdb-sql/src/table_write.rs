@@ -31,6 +31,14 @@ impl TableEngine {
         let col_types = column_data_types(columns);
         let coerced = coerce_values(values, columns)?;
         let encoded = encode_row(&coerced, &col_types)?;
+        // Phase 11.2: TOAST oversized rows to overflow chains.
+        let encoded = toast_row_if_needed(
+            encoded,
+            &coerced,
+            &col_types,
+            storage,
+            &mut conn_txn.local_page_batch,
+        )?;
 
         let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
         let (page_id, slot_id) = {
@@ -71,6 +79,9 @@ impl TableEngine {
         let col_types = column_data_types(columns);
         let coerced = coerce_values(values, columns)?;
         let encoded = encode_row(&coerced, &col_types)?;
+        let encoded = toast_row_if_needed(
+            encoded, &coerced, &col_types, storage, &mut conn_txn.local_page_batch,
+        )?;
         let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
         let (page_id, slot_id) = {
             let batch = &mut conn_txn.local_page_batch;
@@ -405,4 +416,133 @@ impl TableEngine {
         )
     }
 
+}
+
+// ── TOAST: overflow large values to chain pages (Phase 11.2) ─────────────────
+
+/// Per-column TOAST state after externalization pass.
+enum ToastCol {
+    Inline,
+    External { page_id: u64, raw_len: u32, lz4: bool },
+}
+
+/// If `encoded` exceeds [`TOAST_THRESHOLD`], externalizes the largest Text/Bytes
+/// values to overflow chains and returns a re-encoded row with TOAST pointers.
+/// Leaves unchanged if the row already fits.
+fn toast_row_if_needed(
+    encoded: Vec<u8>,
+    values: &[Value],
+    col_types: &[axiomdb_types::DataType],
+    storage: &dyn StorageEngine,
+    batch: &mut axiomdb_storage::LocalPageBatch,
+) -> Result<Vec<u8>, DbError> {
+    use axiomdb_types::codec::{TOAST_COMPRESS_MIN, TOAST_THRESHOLD};
+    use axiomdb_types::DataType;
+
+    if encoded.len() <= TOAST_THRESHOLD {
+        return Ok(encoded);
+    }
+
+    let mut state: Vec<ToastCol> = (0..values.len()).map(|_| ToastCol::Inline).collect();
+    let mut saved = 0usize;
+
+    // Candidates sorted largest-first.
+    let mut cands: Vec<(usize, usize)> = values
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| match (col_types.get(i), v) {
+            (Some(DataType::Text), Value::Text(s)) => Some((i, s.len())),
+            (Some(DataType::Bytes), Value::Bytes(b)) => Some((i, b.len())),
+            _ => None,
+        })
+        .collect();
+    cands.sort_by(|a, b| b.1.cmp(&a.1));
+
+    for &(ci, sz) in &cands {
+        if encoded.len().saturating_sub(saved) <= TOAST_THRESHOLD {
+            break;
+        }
+        let raw: Vec<u8> = match &values[ci] {
+            Value::Text(s) => s.as_bytes().to_vec(),
+            Value::Bytes(b) => b.clone(),
+            _ => continue,
+        };
+        let (data, lz4) = if raw.len() >= TOAST_COMPRESS_MIN {
+            let c = lz4_flex::compress_prepend_size(&raw);
+            if c.len() < raw.len() { (c, true) } else { (raw.clone(), false) }
+        } else {
+            (raw.clone(), false)
+        };
+        let pid = axiomdb_storage::clustered_overflow::write_chain(storage, Some(batch), &data)?;
+        let pid = match pid { Some(p) => p, None => continue };
+        state[ci] = ToastCol::External { page_id: pid, raw_len: raw.len() as u32, lz4 };
+        // u24+payload replaced by u24+12 bytes pointer → save (sz - 12).
+        saved += sz.saturating_sub(12);
+    }
+
+    // Re-encode with TOAST pointers for externalized columns.
+    toast_encode(values, col_types, &state)
+}
+
+/// Encodes a row where some columns are externalized to overflow chains.
+fn toast_encode(
+    values: &[Value],
+    col_types: &[axiomdb_types::DataType],
+    state: &[ToastCol],
+) -> Result<Vec<u8>, DbError> {
+    use axiomdb_types::codec::{TOAST_SENTINEL_LZ4, TOAST_SENTINEL_RAW};
+    use axiomdb_types::DataType;
+
+    let n = col_types.len();
+    let blen = n.div_ceil(8);
+    let mut buf = Vec::with_capacity(blen + 128);
+
+    // Null bitmap.
+    let mut bm = vec![0u8; blen];
+    for (i, v) in values.iter().enumerate() {
+        if matches!(v, Value::Null) {
+            bm[i / 8] |= 1 << (i % 8);
+        }
+    }
+    buf.extend_from_slice(&bm);
+
+    for (i, v) in values.iter().enumerate() {
+        if matches!(v, Value::Null) { continue; }
+        match &state[i] {
+            ToastCol::External { page_id, raw_len, lz4 } => {
+                let s = if *lz4 { TOAST_SENTINEL_LZ4 } else { TOAST_SENTINEL_RAW };
+                axiomdb_types::codec::encode_toast_pointer(&mut buf, s, *page_id, *raw_len);
+            }
+            ToastCol::Inline => match (col_types[i], v) {
+                (DataType::Bool, Value::Bool(b)) => buf.push(u8::from(*b)),
+                (DataType::Int, Value::Int(n)) => buf.extend_from_slice(&n.to_le_bytes()),
+                (DataType::BigInt, Value::BigInt(n)) => buf.extend_from_slice(&n.to_le_bytes()),
+                (DataType::Real, Value::Real(f)) => buf.extend_from_slice(&f.to_le_bytes()),
+                (DataType::Decimal, Value::Decimal(m, s)) => {
+                    buf.extend_from_slice(&m.to_le_bytes());
+                    buf.push(*s);
+                }
+                (DataType::Text, Value::Text(s)) => {
+                    let b = s.as_bytes();
+                    let len = b.len();
+                    buf.push(len as u8);
+                    buf.push((len >> 8) as u8);
+                    buf.push((len >> 16) as u8);
+                    buf.extend_from_slice(b);
+                }
+                (DataType::Bytes, Value::Bytes(b)) => {
+                    let len = b.len();
+                    buf.push(len as u8);
+                    buf.push((len >> 8) as u8);
+                    buf.push((len >> 16) as u8);
+                    buf.extend_from_slice(b);
+                }
+                (DataType::Date, Value::Date(d)) => buf.extend_from_slice(&d.to_le_bytes()),
+                (DataType::Timestamp, Value::Timestamp(t)) => buf.extend_from_slice(&t.to_le_bytes()),
+                (DataType::Uuid, Value::Uuid(u)) => buf.extend_from_slice(u),
+                _ => return Err(DbError::Internal { message: format!("toast_encode: type mismatch col {i}") }),
+            },
+        }
+    }
+    Ok(buf)
 }
