@@ -395,6 +395,70 @@ impl LockManager {
         }
     }
 
+    /// Releases ALL locks (record + table) held by a transaction by scanning
+    /// every shard. Called on COMMIT/ROLLBACK when per-txn lock tracking is not
+    /// yet wired (Phase 40.11 interim). Promotes compatible waiters.
+    ///
+    /// Equivalent to InnoDB's `lock_trx_release_locks()` but uses brute-force
+    /// shard scan instead of per-txn linked list. Acceptable because:
+    /// - 64 + 16 = 80 shards, each scan is O(entries_in_shard)
+    /// - Called once per transaction end, not per-statement
+    /// - Phase 40.12 can add per-txn tracking for O(held_locks) release
+    pub fn release_all_for_txn(&self, txn_id: TxnId) -> usize {
+        let mut total_granted = 0;
+        let mut all_signals: Vec<WaiterSignal> = Vec::new();
+
+        // Record shards.
+        for shard_mutex in self.record_shards.iter() {
+            let mut shard = shard_mutex.lock().unwrap();
+            let mut empty_pages = Vec::new();
+            for (&page_id, queue) in shard.iter_mut() {
+                let removed = queue.remove_granted_by_txn(txn_id);
+                if !removed.is_empty() {
+                    let signals = queue.try_grant_waiters();
+                    total_granted += signals.len();
+                    all_signals.extend(signals);
+                }
+                if queue.is_empty() {
+                    empty_pages.push(page_id);
+                }
+            }
+            for pid in empty_pages {
+                shard.remove(&pid);
+            }
+        }
+
+        // Table shards.
+        for shard_mutex in self.table_shards.iter() {
+            let mut shard = shard_mutex.lock().unwrap();
+            let mut empty_tables = Vec::new();
+            for (&table_id, queue) in shard.iter_mut() {
+                let removed = queue.remove_granted_by_txn(txn_id);
+                if !removed.is_empty() {
+                    let signals = queue.try_grant_waiters();
+                    total_granted += signals.len();
+                    all_signals.extend(signals);
+                }
+                if queue.is_empty() {
+                    empty_tables.push(table_id);
+                }
+            }
+            for tid in empty_tables {
+                shard.remove(&tid);
+            }
+        }
+
+        // Notify all after dropping all shard mutexes.
+        for signal in all_signals {
+            signal.notify_one();
+        }
+
+        // Clean up any stale wait-for entry.
+        self.wait_for.lock().unwrap().remove(&txn_id);
+
+        total_granted
+    }
+
     // ── Synchronous API (Phase 40.11) ──────────────────────────────────────
 
     /// Synchronous variant of [`acquire_record_lock`] for the sync executor.
