@@ -479,9 +479,14 @@
 - [x] 11.5 ✅ Partial indexes — `CREATE INDEX ... WHERE condition` — implemented in Phase 6.7 (partial UNIQUE index) and fully generalized: `partial_index.rs` with `compile_index_predicates()` + `resolve_predicate_columns()`; predicate stored as SQL string in `IndexDef`; enforced on INSERT/UPDATE/DELETE; planner uses index only when query WHERE implies predicate; works on both heap and clustered tables; dedicated `integration_partial_index.rs` test suite
 - [ ] 11.6 ⏳ Basic FTS — tokenizer + inverted index + BM25 ranking
 - [ ] 11.7 ⏳ Advanced FTS — phrases, booleans, prefixes, stop words
-- [ ] 11.8 ⏳ Buffer pool manager — explicit LRU page cache (not just OS mmap); dirty list, flush scheduler, prefetch for seq scan
-- [ ] 11.9 ⏳ Page prefetching — when sequential scan is detected, prefetch N pages ahead with `madvise(MADV_SEQUENTIAL)` or own read-ahead
-- [ ] 11.10 ⏳ Write combining — group writes to hot pages in a single fsync per commit; reduces IOPS on write-heavy workloads
+- [ ] 11.8 ⏳ Buffer pool manager — explicit LRU page cache (not just OS mmap); dirty list, flush scheduler, prefetch for seq scan; **benchmark gap**: select_pk 0.61x, select_range 0.56x, delete_where 0.14x, between_range 0.68x — all re-read pages via mmap without caching; InnoDB buf_pool keeps hot pages in RAM; expected impact: +40-60% on read-heavy ops
+- [ ] 11.9 ⏳ Page prefetching — when sequential scan is detected, prefetch N pages ahead with `madvise(MADV_SEQUENTIAL)` or own read-ahead; **benchmark gap**: select_range 0.56x — MariaDB prefetches during range scans; expected impact: +30% on scans
+- [ ] 11.10 ⏳ Write combining — group writes to hot pages in a single fsync per commit; reduces IOPS on write-heavy workloads; **benchmark gap**: insert 0.27x, insert_multi_values 0.56x — per-row WAL entry overhead; InnoDB batches WAL writes per mini-transaction; expected impact: +2-3x on batch insert
+- [ ] 11.11 ⏳ Top-N heap sort — ORDER BY ... LIMIT k uses a min/max-heap of size k instead of sorting all N rows; O(n log k) vs current O(n log n); PostgreSQL `bounded_sort` + DuckDB `TopN` operator; **benchmark gap**: order_limit 0.48x — current full sort is 2x slower; expected impact: +2x for LIMIT ≤ 1000
+- [ ] 11.12 ⏳ Correlated subquery memoization — cache correlated subquery results by outer-row key; on cache hit skip re-execution; PostgreSQL `SubPlan` memoize + MySQL 8.0 hash-based materialization; **benchmark gap**: subquery_scalar 0.12x — 1000 re-executions per outer row; expected impact: +5-8x for repeated keys
+- [ ] 11.13 ⏳ Hash-based DISTINCT — use hash table instead of sort for SELECT DISTINCT; O(n) vs O(n log n); DuckDB `PhysicalHashDistinct`; **benchmark gap**: distinct 0.70x; expected impact: +30%
+- [ ] 11.14 ⏳ SIMD string prefix matching — AVX2/NEON vectorized prefix compare for LIKE 'prefix%' patterns; skip per-byte Rust comparison; **benchmark gap**: like_pattern 0.62x — per-row string scan; expected impact: +40%
+- [ ] 11.15 ⏳ Batch INSERT from SELECT — collect all rows from source SELECT, encode in one pass, single WAL entry for the batch; avoids per-row WAL overhead; **benchmark gap**: insert_select 0.66x; expected impact: +50%
 
 ### Phase 12 — Testing + JIT `⏳` week 65-68
 - [ ] 12.1 ⏳ Deterministic simulation testing — `FaultInjector` with seed
