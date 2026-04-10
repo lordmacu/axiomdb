@@ -209,13 +209,15 @@ impl TableEngine {
         record_id: RecordId,
     ) -> Result<(), DbError> {
         ensure_heap_table(table_def, "DELETE from clustered table — Phase 39.17")?;
-        // Read old bytes BEFORE deletion — read_tuple returns None on dead slots.
         let old_bytes = HeapChain::read_row(storage, record_id.page_id, record_id.slot_id)?.ok_or(
             DbError::AlreadyDeleted {
                 page_id: record_id.page_id,
                 slot_id: record_id.slot_id,
             },
         )?;
+
+        // Phase 11.2: free TOAST overflow chains before deleting the row.
+        free_toast_chains_in_encoded(&old_bytes, storage);
 
         let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
         HeapChain::delete(storage, record_id.page_id, record_id.slot_id, txn_id)?;
@@ -416,6 +418,48 @@ impl TableEngine {
         )
     }
 
+}
+
+// ── TOAST cleanup on DELETE (Phase 11.2) ─────────────────────────────────────
+
+/// Scans raw encoded row bytes for TOAST sentinel u24 values and frees the
+/// corresponding overflow chains. Best-effort: errors are silently ignored
+/// (the row is being deleted anyway).
+fn free_toast_chains_in_encoded(encoded: &[u8], storage: &dyn StorageEngine) {
+    use axiomdb_types::codec::{TOAST_SENTINEL_LZ4, TOAST_SENTINEL_RAW};
+
+    // TOAST sentinels appear as u24 LE bytes: [0xFE, 0xFF, 0xFF] (RAW) or [0xFD, 0xFF, 0xFF] (LZ4).
+    // Scan for these 3-byte patterns and extract the following u64 page_id.
+    let raw_bytes = [
+        (TOAST_SENTINEL_RAW & 0xFF) as u8,
+        ((TOAST_SENTINEL_RAW >> 8) & 0xFF) as u8,
+        ((TOAST_SENTINEL_RAW >> 16) & 0xFF) as u8,
+    ];
+    let lz4_bytes = [
+        (TOAST_SENTINEL_LZ4 & 0xFF) as u8,
+        ((TOAST_SENTINEL_LZ4 >> 8) & 0xFF) as u8,
+        ((TOAST_SENTINEL_LZ4 >> 16) & 0xFF) as u8,
+    ];
+
+    let mut i = 0;
+    while i + 15 <= encoded.len() {
+        let is_toast = (encoded[i] == raw_bytes[0]
+            && encoded[i + 1] == raw_bytes[1]
+            && encoded[i + 2] == raw_bytes[2])
+            || (encoded[i] == lz4_bytes[0]
+                && encoded[i + 1] == lz4_bytes[1]
+                && encoded[i + 2] == lz4_bytes[2]);
+        if is_toast {
+            let page_id =
+                u64::from_le_bytes(encoded[i + 3..i + 11].try_into().unwrap_or([0; 8]));
+            if page_id > 0 {
+                let _ = axiomdb_storage::clustered_overflow::free_chain(storage, page_id);
+            }
+            i += 15; // skip the TOAST pointer
+        } else {
+            i += 1;
+        }
+    }
 }
 
 // ── TOAST: overflow large values to chain pages (Phase 11.2) ─────────────────

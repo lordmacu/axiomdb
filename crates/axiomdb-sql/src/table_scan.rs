@@ -85,11 +85,13 @@ impl TableEngine {
                 }
                 // Decode directly from page bytes — no .to_vec().
                 let row_data = &bytes[size_of::<RowHeader>()..];
-                let values = if let Some(mask) = masked_decode {
+                let mut values = if let Some(mask) = masked_decode {
                     decode_row_masked(row_data, &col_types, mask)?
                 } else {
                     decode_row(row_data, &col_types)?
                 };
+                // Phase 11.2: resolve TOAST placeholders from overflow chains.
+                detoast_row(&mut values, storage);
                 result.push((
                     RecordId {
                         page_id: current,
@@ -255,7 +257,8 @@ impl TableEngine {
                 for (i, &(slot_id, off, len)) in visible_slots.iter().enumerate() {
                     if passed[i] {
                         let row_data = &page_bytes[off + hdr..off + len];
-                        let values = decode_row(row_data, &col_types)?;
+                        let mut values = decode_row(row_data, &col_types)?;
+                        detoast_row(&mut values, storage);
                         result.push((
                             RecordId {
                                 page_id: current,
@@ -276,7 +279,8 @@ impl TableEngine {
                         if !predicate(&partial) {
                             continue;
                         }
-                        let values = decode_row(row_data, &col_types)?;
+                        let mut values = decode_row(row_data, &col_types)?;
+                        detoast_row(&mut values, storage);
                         result.push((
                             RecordId {
                                 page_id: current,
@@ -285,7 +289,8 @@ impl TableEngine {
                             values,
                         ));
                     } else {
-                        let values = decode_row(row_data, &col_types)?;
+                        let mut values = decode_row(row_data, &col_types)?;
+                        detoast_row(&mut values, storage);
                         if !predicate(&values) {
                             continue;
                         }
