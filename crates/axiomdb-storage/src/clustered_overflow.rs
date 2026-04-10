@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use axiomdb_core::error::DbError;
 
 use crate::{
+    local_page_batch::{batch_alloc_page, LocalPageBatch},
     page::{Page, PageType, HEADER_SIZE, PAGE_SIZE},
     StorageEngine,
 };
@@ -25,6 +26,7 @@ pub fn payload_capacity() -> usize {
 /// Returns `Ok(None)` when `payload` is empty.
 pub fn write_chain(
     storage: &mut dyn StorageEngine,
+    batch: Option<&mut LocalPageBatch>,
     payload: &[u8],
 ) -> Result<Option<u64>, DbError> {
     if payload.is_empty() {
@@ -33,9 +35,10 @@ pub fn write_chain(
 
     let chunks: Vec<&[u8]> = payload.chunks(payload_capacity()).collect();
     let mut page_ids = Vec::with_capacity(chunks.len());
+    let mut batch = batch;
 
     for _ in &chunks {
-        match storage.alloc_page(PageType::Overflow) {
+        match batch_alloc_page(storage, batch.as_deref_mut(), PageType::Overflow) {
             Ok(page_id) => page_ids.push(page_id),
             Err(err) => {
                 cleanup_allocated_pages(storage, &page_ids)?;
@@ -193,7 +196,7 @@ mod tests {
     fn write_and_read_single_page_chain_roundtrips() {
         let mut storage = MemoryStorage::new();
         let payload = vec![0xAB; payload_capacity() / 2];
-        let first = write_chain(&mut storage, &payload).unwrap().unwrap();
+        let first = write_chain(&mut storage, None, &payload).unwrap().unwrap();
 
         let page = storage.read_page(first).unwrap();
         assert_eq!(
@@ -209,7 +212,7 @@ mod tests {
     fn write_and_read_multi_page_chain_roundtrips() {
         let mut storage = MemoryStorage::new();
         let payload = vec![0x5C; payload_capacity() * 3 + 127];
-        let first = write_chain(&mut storage, &payload).unwrap().unwrap();
+        let first = write_chain(&mut storage, None, &payload).unwrap().unwrap();
 
         let roundtrip = read_chain(&storage, first, payload.len()).unwrap();
         assert_eq!(roundtrip, payload);
@@ -219,7 +222,7 @@ mod tests {
     fn free_chain_releases_every_page() {
         let mut storage = MemoryStorage::new();
         let payload = vec![0x9D; payload_capacity() * 2 + 11];
-        let first = write_chain(&mut storage, &payload).unwrap().unwrap();
+        let first = write_chain(&mut storage, None, &payload).unwrap().unwrap();
 
         let mut pages = Vec::new();
         let mut current = first;

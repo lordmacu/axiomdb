@@ -470,15 +470,25 @@ fn update_encoded_row_with_hint(
         record_id.slot_id,
     )?;
 
-    let (new_page_id, new_slot_id) = match hint {
-        Some(h) => HeapChain::insert_with_hint(
-            storage,
-            table_def.root_page_id,
-            new_encoded,
-            txn_id,
-            Some(h),
-        )?,
-        None => HeapChain::insert(storage, table_def.root_page_id, new_encoded, txn_id)?,
+    let (new_page_id, new_slot_id) = {
+        let batch = &mut conn_txn.local_page_batch;
+        match hint {
+            Some(h) => HeapChain::insert_with_hint(
+                storage,
+                table_def.root_page_id,
+                new_encoded,
+                txn_id,
+                Some(h),
+                Some(batch),
+            )?,
+            None => HeapChain::insert(
+                storage,
+                table_def.root_page_id,
+                new_encoded,
+                txn_id,
+                Some(batch),
+            )?,
+        }
     };
     let new_key = encode_rid(new_page_id, new_slot_id);
     txn.record_insert(

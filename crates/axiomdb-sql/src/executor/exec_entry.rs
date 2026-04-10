@@ -87,6 +87,7 @@ pub fn execute(
                 let tid = conn.txn_id;
                 txn.commit(conn)?;
                 txn.release_immediate_committed_frees(storage, tid)?;
+                txn.drain_committed_page_batches(storage)?;
                 return Ok(QueryResult::Empty);
             }
             Stmt::Rollback => {
@@ -120,6 +121,7 @@ pub fn execute(
                 Ok(result) => {
                     txn.commit(conn)?;
                     txn.release_immediate_committed_frees(storage, tid)?;
+                    txn.drain_committed_page_batches(storage)?;
                     Ok(result)
                 }
                 Err(e) => {

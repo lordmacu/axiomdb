@@ -203,24 +203,296 @@ to zero-fill or extend the file.
    DELETE frees pages to local `freed` list. On COMMIT, freed pages go to
    `recycle_queue`. Next INSERT's batch refill picks from recycle_queue first.
 
+## Implementation contract (locked in /spec-task on 2026-04-09)
+
+The high-level design above is preserved. The contract was strengthened
+during brainstorm by reading two reference systems in `research/`:
+
+### Research synthesis (what we borrow / reject / adapt)
+
+#### PostgreSQL `RelationAddBlocks` (`research/postgresql/src/backend/access/heap/hio.c:236-360`)
+
+**Borrowed:**
+- **Adaptive batch sizing** — `extend_by_pages += extend_by_pages × waiter_count` so the next refill grabs more pages when the freelist is contended. AxiomDB starts at `BATCH_ALLOC_SIZE = 64` and caps at `MAX_BATCH_SIZE = 256`.
+- **Sticky bulk mode** — the `bistate->already_extended_by` field is mirrored as `LocalPageBatch::last_refill_size` so a connection in bulk-INSERT mode reuses the same batch size on every refill (avoids file-extension thrash that hurts ext4/xfs allocation patterns).
+- **Steal protection** — when committing, leftover `LocalPageBatch.available` pages go back to the **bitmap**, not the global recycle queue, so other connections can't grab them. The pages we genuinely freed during the txn (`LocalPageBatch.freed`) go to the recycle queue for fast reuse. PostgreSQL's "only put leftover pages in the FSM, keep mine private" idea, adapted.
+- **Sequential locality** — `mdzeroextend()` always extends the file in contiguous chunks. AxiomDB adds `FreeList::alloc_batch_sequential(n)` which scans words for runs of `n` free bits before falling back to non-contiguous fill, so refilled batches are OS-prefetch friendly.
+
+**Rejected:**
+- PostgreSQL's `extension lock` is a separate `LWLock` from the buffer mapping locks. We reuse `MmapStorage::freelist: Mutex<FreeList>` plus a new `extension_waiters: AtomicU32` counter. Adding a dedicated `LWLock` is overkill for the current single-mutex storage layer.
+- PostgreSQL puts unused pages into the durable FSM. AxiomDB keeps the recycle queue **in memory** (see DuckDB note below).
+
+#### DuckDB `SingleFileBlockManager` (`research/duckdb/src/storage/single_file_block_manager.cpp:829-893`)
+
+**Borrowed:**
+- The **5-state model** as a mental framework. AxiomDB collapses it to 3 explicit states because we don't need DuckDB's checkpoint-iteration semantics:
+  - `bitmap FREE` ≡ DuckDB `free_list`
+  - `bitmap USED + recycle_queue` ≡ DuckDB `free_blocks_in_use` + `modified_blocks`
+  - `bitmap USED + in-use` ≡ DuckDB `newly_used_blocks` + `multi_use_blocks`
+- The **`max_block++` always-fresh** path (when refilling from a grown file segment, just hand out sequential IDs without consulting the bitmap).
+- The **single-mutex-per-batch** acquisition pattern: hold the freelist `Mutex` once per batch, not once per page.
+
+**Rejected:**
+- DuckDB's `set<block_id_t>` data structure for the free list. AxiomDB's bitmap is much more compact (1 bit/page vs ~24 bytes/page for a `set<u64>`) and the on-disk format is a bitmap already, so we'd pay extra to convert.
+- DuckDB's claim of "thread-local 128-page batch" referenced in the original spec. **It does not exist in `single_file_block_manager.cpp`** — DuckDB uses a single mutex. The thread-local idea was a misattribution. We adopt it anyway because the per-`ConnectionTxn` `LocalPageBatch` is a strictly better fit for AxiomDB's per-connection executor model than what DuckDB actually does.
+
+### Approach: storage trait extension + lock-free recycle queue
+
+- `StorageEngine` gains two new methods with default impls that fall back to
+  the existing per-page `alloc_page` / `free_page`:
+
+  ```rust
+  fn alloc_page_batch(
+      &self,
+      n: usize,
+      page_type: PageType,
+  ) -> Result<Vec<u64>, DbError>;
+
+  fn free_page_batch(&self, ids: &[u64]) -> Result<(), DbError>;
+  ```
+
+  `MmapStorage` overrides both. `MemoryStorage` keeps the default impls
+  (fine for tests; no contention there).
+
+- `alloc_page_batch` returns **uninitialized page IDs**. The caller is still
+  responsible for `Page::new(page_type, pid) + write_page(pid, &p)` at the
+  point of first use, exactly as today's `alloc_page` callers already do.
+
+- `MmapStorage::alloc_page_batch` algorithm:
+
+  ```text
+  1. Drain up to N from recycle_queue (lock-free SegQueue pops).
+  2. If still need more, lock freelist Mutex once and:
+     a. Try alloc_batch_sequential(remaining)  → contiguous IDs preferred
+     b. Fall back to alloc() per page if no contiguous run
+  3. If freelist exhausted: drop freelist lock, take grow_lock,
+     do_grow(GROW_PAGES), re-acquire freelist lock, retry from (2).
+  4. Return Vec<u64> of size exactly N (or error).
+  ```
+
+  Adaptive sizing: the `n` argument is what the caller asks for. The caller
+  (`pop_or_refill`) computes it as `LocalPageBatch.last_refill_size.max(BATCH_ALLOC_SIZE) × max(1, extension_waiters.load())` capped at `MAX_BATCH_SIZE`.
+
+- `LocalPageBatch` lives in `ConnectionTxn` (`axiomdb-wal/src/txn.rs`):
+
+  ```rust
+  pub struct LocalPageBatch {
+      /// Pre-allocated page IDs ready for immediate use.
+      /// Homogeneous in `current_type` to match PostgreSQL's bistate model.
+      pub(crate) available: VecDeque<u64>,
+      /// Page type currently held in `available`. A type mismatch on
+      /// pop_or_refill drains `available` back to the recycle_queue and
+      /// refills with the new type.
+      pub(crate) current_type: Option<PageType>,
+      /// Pages freed by this transaction (returned at commit).
+      pub(crate) freed: Vec<u64>,
+      /// Last refill batch size, used for "sticky bulk mode" — once a
+      /// connection refills a large batch, subsequent refills stay large.
+      pub(crate) last_refill_size: usize,
+  }
+  ```
+
+  Not `Send + Sync`. Owned by exactly one connection at a time.
+
+- Hot-path storage helpers gain an `Option<&mut LocalPageBatch>` parameter
+  and route through a small `pop_or_refill(storage, batch, ty)` helper:
+
+  ```rust
+  pub fn pop_or_refill(
+      storage: &dyn StorageEngine,
+      batch: Option<&mut LocalPageBatch>,
+      ty: PageType,
+  ) -> Result<u64, DbError>;
+  ```
+
+  When `batch` is `None`, `pop_or_refill` falls through to
+  `storage.alloc_page(ty)` directly. When `batch` is `Some`:
+
+  ```text
+  1. If batch.current_type != Some(ty):
+     a. Drain batch.available back to storage.free_page_batch (return to bitmap).
+     b. Set batch.current_type = Some(ty), batch.last_refill_size = BATCH_ALLOC_SIZE.
+  2. If batch.available is non-empty: pop_front, return.
+  3. Compute n = batch.last_refill_size × max(1, storage.extension_waiters_load())
+     capped at MAX_BATCH_SIZE.
+  4. ids = storage.alloc_page_batch(n, ty)?;
+  5. batch.last_refill_size = n;
+  6. batch.available.extend(ids); pop_front, return.
+  ```
+
+### Six design points locked
+
+1. **`recycle_queue` durability** — `recycle_queue: crossbeam_queue::SegQueue<u64>`
+   in `MmapStorage`. Lock-free MPMC, ideal for many concurrent commits
+   pushing and many concurrent refills popping. **In-memory only**. On
+   crash, its contents are lost, but **no data is lost** — the on-disk
+   freelist bitmap is the source of truth. `release_deferred_frees` /
+   `flush()` periodically drains the queue back into the bitmap so the
+   in-memory growth is bounded.
+
+2. **Rollback contract for `available`** — pages drawn from
+   `alloc_page_batch` are marked **USED** in the bitmap immediately. On
+   rollback we call `storage.free_page_batch(local.available)` to flip
+   them back to FREE. This keeps the on-disk invariant `bitmap == truth`
+   intact at all times — a crash mid-rollback leaves a few extra pages
+   marked USED until the next bitmap reconciliation.
+
+3. **Commit contract for `available`** — same as rollback. Leftover
+   pre-allocated pages that the txn never touched go **back to the
+   bitmap**, NOT to the recycle queue. PostgreSQL's "steal protection"
+   rule. The `freed` pages (which the txn actually used and then freed)
+   go to the recycle queue.
+
+4. **Refill order** — `MmapStorage::alloc_page_batch` drains
+   `recycle_queue` **first** (lock-free, already-zeroed pages), then falls
+   back to `freelist.alloc_batch_sequential(remaining)` for the rest. If
+   both run dry, falls through to `do_grow(GROW_PAGES)` exactly like
+   today's `alloc_page` and retries.
+
+5. **Adaptive batch sizing** — `BATCH_ALLOC_SIZE = 64` (initial / minimum),
+   `MAX_BATCH_SIZE = 256` (cap), `extension_waiters: AtomicU32`
+   incremented before `freelist.lock()` and decremented after. The
+   actual refill size is
+   `last_refill_size × max(1, extension_waiters)`, capped at
+   `MAX_BATCH_SIZE`. Once a connection sees contention, it pulls a
+   bigger batch and stays there.
+
+6. **Per-page-type homogeneity** — `LocalPageBatch.current_type` enforces
+   that the batch is homogeneous. A type mismatch on alloc returns the
+   existing batch and refills with the new type. This matches
+   PostgreSQL's bistate model (per-relation = per-page-type implicitly).
+
+### Page lifecycle invariant
+
+```
+                                    storage.alloc_page_batch(n, ty)
+bitmap FREE ────────────────────────────────────────────► bitmap USED
+                                                                 │
+                                                                 ▼
+                                              local.available (current_type=ty)
+                                                                 │
+                                  pop_or_refill ────────────────►│
+                                                                 ▼
+                                                      executor uses page
+                                                                 │
+                              ┌──────────────────────────────────┤
+                              │ executor frees                   │ executor commits
+                              ▼                                  │
+                       local.freed                               │
+                              │                                  │
+                              │ commit                           │
+                              ▼                                  │
+                  recycle_queue (SegQueue)                       │
+                              │                                  │
+                              │ next refill                      │
+                              └──────► local.available ──────────┘
+                                       (next txn)
+
+  rollback or shutdown ──► storage.free_page_batch(available + freed-from-rollback-undo)
+                                                       │
+                                                       ▼
+                                                 bitmap FREE
+
+  flush() / release_deferred_frees ──► drain SegQueue ──► bitmap FREE
+```
+
+The invariant: a page is in **exactly one** of `bitmap FREE`,
+`bitmap USED + local.available`, `bitmap USED + in use`, `bitmap USED +
+local.freed`, or `bitmap USED + recycle_queue`. There is no transient state
+where a page is missing from all lists.
+
 ## Acceptance criteria
 
-- [ ] `LocalPageBatch` struct with `available: Vec<u64>` and `freed: Vec<u64>`
-- [ ] `GlobalPageAllocator` with `Mutex<FreeListBitmap>` + `recycle_queue`
-- [ ] Batch allocation: 64 pages per refill from global bitmap
-- [ ] Fast path: alloc from local batch in O(1) with zero locks
-- [ ] Slow path: bitmap Mutex held only during batch scan (~2µs for 64 pages)
-- [ ] Free path: push to local `freed` in O(1) with zero locks
-- [ ] Commit: return `freed` to `recycle_queue`, unused `available` to bitmap
-- [ ] Rollback: return `available` to bitmap, keep `freed` (rollback undoes frees)
-- [ ] File growth: separate `grow_lock`, extend bitmap atomically
-- [ ] Recycle priority: prefer `recycle_queue` over bitmap scan for refill
+### Data structures
+
+- [ ] `LocalPageBatch` struct in `axiomdb-wal::txn` with:
+      `available: VecDeque<u64>`, `current_type: Option<PageType>`,
+      `freed: Vec<u64>`, `last_refill_size: usize`
+- [ ] `LocalPageBatch::take_for_commit()` and `take_for_rollback()` helpers
+      so the txn manager doesn't reach into the fields directly
+- [ ] `LocalPageBatch` field added to `ConnectionTxn`; initialized empty in
+      `TxnManager::begin`, drained in `commit` / `rollback`
+- [ ] `BATCH_ALLOC_SIZE = 64` and `MAX_BATCH_SIZE = 256` as `pub const`s
+
+### Storage trait + MmapStorage
+
+- [ ] `StorageEngine::alloc_page_batch(n, page_type) -> Vec<u64>` and
+      `free_page_batch(&[u64])` trait methods with default impls that fall
+      back to per-page `alloc_page` / `free_page`
+- [ ] `MmapStorage::recycle_queue: crossbeam_queue::SegQueue<u64>` (lock-free)
+- [ ] `MmapStorage::extension_waiters: AtomicU32` for adaptive sizing
+- [ ] `MmapStorage::alloc_page_batch` algorithm:
+      drain `recycle_queue` first → `freelist.alloc_batch_sequential` for
+      the rest → fall through to `do_grow` if exhausted
+- [ ] `MmapStorage::free_page_batch` performs a single bitmap mutation
+      pass under one `Mutex<FreeList>` lock
+- [ ] `release_deferred_frees` (or `flush()`) folds the `recycle_queue`
+      back into the bitmap so in-memory growth is bounded
+- [ ] `crossbeam-queue = "0.3"` added to workspace `Cargo.toml`
+- [ ] `FreeList::alloc_batch_sequential(n) -> Option<(start, len)>` that
+      finds a contiguous run of `n` free bits in O(words) and falls back
+      to non-contiguous fill when no run exists
+
+### Wiring through hot paths
+
+- [ ] `pop_or_refill(storage, batch, ty)` helper in `axiomdb-wal::txn`
+      that hides the optional-batch ergonomics, performs the type-mismatch
+      drain, and computes the adaptive refill size
+- [ ] Hot-path call sites updated to take `Option<&mut LocalPageBatch>`
+      and route through `pop_or_refill`:
+  - [ ] `axiomdb-storage::heap_chain_write::insert{,_with_hint}`
+  - [ ] `axiomdb-storage::clustered_tree::btree_insert::{split_leaf,split_internal}`
+  - [ ] `axiomdb-storage::clustered_tree::mod::insert` (root creation)
+  - [ ] `axiomdb-storage::clustered_overflow::write_chain` (big-row spill)
+  - [ ] `axiomdb-index::tree_insert::{insert_leaf,split_internal,alloc_root}`
+  - [ ] `axiomdb-index::tree_delete::{rotate_left,rotate_right,merge_children}`
+        (CoW internal rebalance still allocates new pages)
+- [ ] `ExecutionContext::alloc_page(ty)` wrapper that forwards
+      `Some(&mut conn_txn.local_page_batch)`; executor call sites use it
+      instead of touching the storage trait directly
+- [ ] DDL / catalog / vacuum / recovery paths keep using
+      `storage.alloc_page` directly (no batch); explicitly verified
+
+### Drain semantics
+
+- [ ] **Commit** drains `local.freed` into `recycle_queue` in O(N) pushes
+      on the lock-free `SegQueue`
+- [ ] **Commit** also drains `local.available` (leftover prealloc) back
+      to the bitmap via `free_page_batch` — **steal protection**
+- [ ] **Rollback** calls `free_page_batch(local.available)` to return
+      pre-allocated-but-unused pages to the bitmap, and **keeps**
+      `local.freed` (the rollback undo restores the rows that were
+      freed → the pages are still in use)
+
+### Correctness invariants
+
 - [ ] No duplicate page allocations under concurrency
 - [ ] No lost free pages under concurrency
-- [ ] 8 threads allocating simultaneously → all get unique page_ids
-- [ ] 8 threads freeing simultaneously → all pages correctly recycled
-- [ ] Stress test: 8 threads × 10K alloc+free cycles → bitmap consistent
-- [ ] Benchmark: 8 concurrent allocs → ~10× throughput vs current Mutex
+- [ ] Page lifecycle invariant (see "Page lifecycle invariant" diagram):
+      a page is always in exactly one of bitmap-FREE, available, in-use,
+      freed, or recycle_queue
+- [ ] **8 threads × 10K alloc+free** stress test → bitmap consistent,
+      every alloc'd ID unique, every freed ID accounted for
+- [ ] **8 threads × 10K** of mixed page-type allocs (heap + index +
+      clustered) → batches drain and refill correctly on type switch
+- [ ] Crash + recovery test: after a simulated crash with non-empty
+      `recycle_queue`, the bitmap is still the source of truth and the
+      lost queue entries become available via the next bitmap scan
+
+### Benchmark gates
+
+- [ ] Benchmark: 8-thread concurrent INSERT throughput ≥ **5×** current
+      single-Mutex baseline (target is 10× per spec but 5× is the closing
+      gate floor; document the actual ratio)
+- [ ] Single-thread INSERT throughput within **±2%** of current baseline
+      (the new path must not regress single-writer performance)
+
+### Closing gates
+
+- [ ] `cargo test --workspace` clean
+- [ ] `cargo clippy --workspace -- -D warnings` clean
+- [ ] `cargo fmt --check` clean
+- [ ] Wire-test smoke not required (no SQL-visible behavior change)
 
 ## Out of scope
 

@@ -11,7 +11,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axiomdb_core::{error::DbError, RecordId};
-use axiomdb_storage::{Page, PageType, StorageEngine};
+use axiomdb_storage::{batch_alloc_page, LocalPageBatch, Page, PageType, StorageEngine};
 
 use crate::iter::RangeIter;
 use crate::page_layout::{

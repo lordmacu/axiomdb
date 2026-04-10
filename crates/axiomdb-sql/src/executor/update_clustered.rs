@@ -316,8 +316,9 @@ fn execute_clustered_update(
                 row_version: 0,
                 _flags: candidate.row_header._flags,
             };
-            root_pid = axiomdb_storage::clustered_tree::insert(
+            root_pid = axiomdb_storage::clustered_tree::insert_with_batch(
                 storage,
+                Some(&mut conn_txn.local_page_batch),
                 Some(root_pid),
                 &new_pk_key,
                 &new_header,

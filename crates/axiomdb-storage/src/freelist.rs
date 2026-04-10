@@ -192,7 +192,118 @@ impl FreeList {
         self.words.iter().map(|w| w.count_ones() as u64).sum()
     }
 
+    // ── Batch operations (Phase 40.9) ────────────────────────────────────────
+
+    /// Allocates up to `n` pages, preferring a contiguous run for
+    /// sequential locality (OS prefetch friendly).
+    ///
+    /// Returns **up to** `n` page IDs. If the bitmap has fewer than `n`
+    /// free pages, the returned Vec is shorter — the caller must check the
+    /// length and grow the file if needed.
+    ///
+    /// Strategy:
+    /// 1. Scan words for a contiguous run of `n` free bits.
+    /// 2. If found, mark them all USED and return.
+    /// 3. If no contiguous run, fall back to `alloc()` in a loop
+    ///    (non-contiguous fill).
+    pub fn alloc_batch_sequential(&mut self, n: usize) -> Vec<u64> {
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Strategy 1: try to find a contiguous run.
+        if let Some(start) = self.find_contiguous_run(n) {
+            for offset in 0..(n as u64) {
+                self.mark_used(start + offset);
+            }
+            return (start..start + n as u64).collect();
+        }
+
+        // Strategy 2: non-contiguous fill via individual alloc().
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            match self.alloc() {
+                Some(id) => out.push(id),
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// Marks all `ids` as free in one pass. Returns the first error
+    /// encountered (if any), but continues marking the rest.
+    pub fn free_batch(&mut self, ids: &[u64]) -> Result<(), DbError> {
+        let mut first_err = None;
+        for &page_id in ids {
+            if let Err(e) = self.free(page_id) {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Scans the bitmap for a contiguous run of `n` free bits.
+    ///
+    /// Returns the page ID of the first bit, or `None` if no run of length
+    /// `n` exists. O(total_pages / 64) worst case.
+    fn find_contiguous_run(&self, n: usize) -> Option<u64> {
+        if n == 0 {
+            return Some(0);
+        }
+        let n = n as u64;
+        let mut run_start = 0u64;
+        let mut run_len = 0u64;
+
+        for (i, &word) in self.words.iter().enumerate() {
+            let base = i as u64 * 64;
+            if word == u64::MAX {
+                // All 64 bits free — extend or start a run.
+                if run_len == 0 {
+                    run_start = base;
+                }
+                run_len += 64;
+                // Clamp to total_pages.
+                let run_end = (run_start + run_len).min(self.total_pages);
+                if run_end - run_start >= n {
+                    return Some(run_start);
+                }
+                continue;
+            }
+            if word == 0 {
+                // All 64 bits used — break any run.
+                run_len = 0;
+                continue;
+            }
+            // Partially free word — check bit by bit for run boundaries.
+            for bit in 0..64u64 {
+                let page_id = base + bit;
+                if page_id >= self.total_pages {
+                    break;
+                }
+                if (word >> bit) & 1 == 1 {
+                    // Free bit.
+                    if run_len == 0 {
+                        run_start = page_id;
+                    }
+                    run_len += 1;
+                    if run_len >= n {
+                        return Some(run_start);
+                    }
+                } else {
+                    // Used bit — break the run.
+                    run_len = 0;
+                }
+            }
+        }
+        None
+    }
 
     #[inline]
     fn words_needed(n_pages: u64) -> usize {
@@ -343,5 +454,93 @@ mod tests {
         // The next alloc must jump to the second word.
         let id = fl.alloc().unwrap();
         assert_eq!(id, 64);
+    }
+
+    // ── Phase 40.9: batch allocation tests ──────────────────────────────
+
+    #[test]
+    fn test_alloc_batch_sequential_contiguous_run() {
+        let mut fl = make_fl(256);
+        // Pages 0,1 reserved, 2..256 free. Request 64 — should get [2..66).
+        let batch = fl.alloc_batch_sequential(64);
+        assert_eq!(batch.len(), 64);
+        assert_eq!(batch[0], 2);
+        assert_eq!(batch[63], 65);
+        // All returned IDs are now used.
+        for &id in &batch {
+            assert!(!fl.is_free(id));
+        }
+        // Free count decreased by exactly 64.
+        assert_eq!(fl.free_count(), 256 - 2 - 64);
+    }
+
+    #[test]
+    fn test_alloc_batch_sequential_no_contiguous_run_falls_back() {
+        let mut fl = make_fl(128);
+        // Fragment the bitmap: use every other page from 2..128.
+        for i in (2u64..128).step_by(2) {
+            fl.mark_used(i);
+        }
+        // Now no contiguous run of 10 exists — all free pages are odd
+        // (3,5,7,...), each separated by a used even page.
+        let batch = fl.alloc_batch_sequential(10);
+        assert_eq!(batch.len(), 10);
+        // All returned IDs are unique and were free.
+        let mut sorted = batch.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 10, "no duplicates in non-contiguous batch");
+    }
+
+    #[test]
+    fn test_alloc_batch_sequential_partial_when_exhausted() {
+        let mut fl = make_fl(68); // 68 pages, 0+1 reserved → 66 free.
+        let batch = fl.alloc_batch_sequential(100); // ask for 100
+        assert_eq!(batch.len(), 66, "should return all 66 free pages");
+        assert_eq!(fl.free_count(), 0);
+    }
+
+    #[test]
+    fn test_alloc_batch_sequential_zero() {
+        let mut fl = make_fl(64);
+        let batch = fl.alloc_batch_sequential(0);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn test_free_batch_returns_pages() {
+        let mut fl = make_fl(128);
+        let batch = fl.alloc_batch_sequential(32);
+        assert_eq!(batch.len(), 32);
+        let before = fl.free_count();
+        fl.free_batch(&batch).unwrap();
+        assert_eq!(fl.free_count(), before + 32);
+        for &id in &batch {
+            assert!(fl.is_free(id));
+        }
+    }
+
+    #[test]
+    fn test_free_batch_double_free_is_error() {
+        let mut fl = make_fl(64);
+        let id = fl.alloc().unwrap();
+        fl.free(id).unwrap();
+        // Batch-freeing the same page again should surface an error.
+        assert!(fl.free_batch(&[id]).is_err());
+    }
+
+    #[test]
+    fn test_alloc_batch_sequential_cross_word_contiguous() {
+        // Test a contiguous run that spans two 64-bit words.
+        let mut fl = make_fl(256);
+        // Exhaust pages 2..60 so the run starts at page 60 and spans into word 1.
+        for i in 2u64..60 {
+            fl.mark_used(i);
+        }
+        // Free pages: 60..256. A batch of 10 should start at 60 (contiguous).
+        let batch = fl.alloc_batch_sequential(10);
+        assert_eq!(batch.len(), 10);
+        assert_eq!(batch[0], 60);
+        assert_eq!(batch[9], 69);
     }
 }

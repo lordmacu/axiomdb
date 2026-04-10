@@ -121,6 +121,8 @@ the "Max acceptable" column is a blocker.
 | Parser — complex SELECT | **2.7 µs** ✅ | 3 µs | 6 µs | 4 |
 | Row codec encode | **33M rows/s** ✅ | — | — | 4 |
 | Expr eval (scan 1K rows) | **14.8M rows/s** ✅ | — | — | 4 |
+| Page alloc (1-thread batch vs Mutex) | **28.8×** ✅ | ≥5× | ≥5× | 40.9 |
+| Page alloc (8-thread batch vs Mutex) | **703×** ✅ | ≥5× | ≥5× | 40.9 |
 
 **Executor end-to-end (Phase 4.16b, MmapStorage + real WAL, full pipeline)**
 
@@ -485,6 +487,51 @@ semantic analysis, not just parsing. The trade-off is that the cached AST must b
 cloned before parameter substitution to avoid mutating shared state — a shallow clone
 of the expression tree is ~200 ns, well below the ~1.5 µs that parse + analyze would
 cost. MySQL and PostgreSQL cache parsed + planned query trees for the same reason.
+</div>
+</div>
+
+---
+
+## Phase 40.9 — FreeList Tier-1 (LocalPageBatch)
+
+Measured with `cargo bench --bench storage -p axiomdb-storage` on Apple M2 Pro, NVMe SSD.
+Workload: 1000 alloc+free cycles (single-thread) and 8 threads × 10K alloc+free cycles
+(concurrent).
+
+| Benchmark | Time | Throughput | Speedup |
+|---|---|---|---|
+| single_mutex_1000 (baseline) | 36.5 ms | 27.4K elem/s | 1× |
+| batch_local_1000 (LocalPageBatch) | 1.27 ms | 787.7K elem/s | **28.8×** |
+| 8t_single_10k (8 threads, per-page Mutex) | 5.35 s | 187 elem/s | 1× |
+| 8t_batch_10k (8 threads, LocalPageBatch) | 7.6 ms | 131.6K elem/s | **703×** |
+
+The single-thread improvement comes from amortizing the Mutex acquisition: one lock
+per 64 pages instead of one per page. The 8-thread improvement is multiplicative:
+each thread has its own `LocalPageBatch`, so 8 threads run 8 independent batches
+with zero cross-thread contention on the fast path.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">703× Faster Than Per-Page Mutex Under 8 Threads</span>
+DuckDB's <code>SingleFileBlockManager</code> uses a single mutex per allocation. InnoDB uses
+SX-latches on extent descriptors (64 pages each). AxiomDB's <code>LocalPageBatch</code>
+eliminates the global lock entirely for 99% of allocations — the remaining 1% (batch refill)
+amortizes the Mutex cost across 64–256 pages. Under 8 concurrent writers, the speedup is
+<strong>703×</strong> because each writer's local batch is fully independent.
+</div>
+</div>
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Lock-Free Recycle Queue</span>
+Freed pages from committed transactions go to a <code>crossbeam_queue::SegQueue&lt;u64&gt;</code>
+(lock-free MPMC queue) instead of immediately back to the bitmap under Mutex. The next
+batch refill drains this queue first — already-initialized pages, zero bitmap overhead.
+PostgreSQL's FSM serves a similar purpose (freed space available for reuse without
+re-scanning); AxiomDB keeps it in-memory for simplicity, with periodic fold-back to the
+bitmap during <code>flush()</code>.
 </div>
 </div>
 

@@ -436,3 +436,116 @@ The protocol has three layers:
   path requires the internal rebalance routines to keep their parent pid
   in place (no CoW). That refactor is the prerequisite for full
   internal-children early release on delete.
+
+## Subfase 40.9 — FreeList Tier-1 (per-connection LocalPageBatch)
+
+### What was implemented
+
+A two-tier page allocation system that eliminates 99% of global `Mutex<FreeList>`
+acquisitions. Tier 2 (the global Mutex) was already implemented in 40.3. This
+subfase adds Tier 1: per-connection `LocalPageBatch` that caches pre-allocated
+page IDs locally, so most allocations are O(1) with zero locks.
+
+### Key components
+
+**`crates/axiomdb-storage/src/local_page_batch.rs`** (new file)
+- `LocalPageBatch`: per-connection batch with `available: VecDeque<u64>`,
+  `current_type: Option<PageType>`, `freed: Vec<u64>`, `last_refill_size: usize`.
+- `pop_or_refill(storage, ty)`: fast path pops from local `available` (O(1), zero
+  contention); slow path refills from global allocator with adaptive sizing.
+- `take_for_commit()` → `(available, freed)`: drains batch for COMMIT. Available
+  pages go back to bitmap (steal protection); freed pages go to recycle queue.
+- `take_for_rollback()` → `available`: drains batch for ROLLBACK. Available pages
+  go back to bitmap; freed pages dropped (rollback restores the rows → pages in use).
+- `batch_alloc_page(storage, batch, ty)`: canonical entry point that delegates to
+  `pop_or_refill` when batch is `Some`, falls back to `storage.alloc_page` when `None`.
+- `BATCH_ALLOC_SIZE = 64` (InnoDB extent size), `MAX_BATCH_SIZE = 256` (cap).
+
+**`crates/axiomdb-storage/src/engine.rs`** (StorageEngine trait)
+- `alloc_page_batch(n, page_type) -> Vec<u64>`: default impl loops `alloc_page`.
+- `free_page_batch(&[u64])`: default impl loops `free_page`.
+- `extension_waiters() -> u32`: returns 0 by default; MmapStorage overrides.
+- `recycle_page(page_id)`: pushes to recycle queue; default impl calls `free_page`.
+
+**`crates/axiomdb-storage/src/freelist.rs`**
+- `alloc_batch_sequential(n) -> Vec<u64>`: scans bitmap words for a contiguous run
+  of `n` free bits; falls back to non-contiguous per-bit allocation if no run found.
+- `free_batch(&[u64])`: single-pass batch deallocation under one lock acquisition.
+
+**`crates/axiomdb-storage/src/mmap.rs`** (MmapStorage)
+- `recycle_queue: crossbeam_queue::SegQueue<u64>` — lock-free MPMC queue for pages
+  freed by committed transactions, ready for fast reuse.
+- `extension_waiters: AtomicU32` — incremented before freelist mutex acquisition,
+  decremented after; used by `pop_or_refill` to compute adaptive batch size.
+- `alloc_page_batch`: drains recycle_queue first (lock-free), then falls back to
+  `freelist.alloc_batch_sequential` under mutex, then to `do_grow` if exhausted.
+- `free_page_batch`: single bitmap mutation pass under one `Mutex<FreeList>` lock.
+- `release_deferred_frees`: now also drains recycle_queue back into bitmap so
+  in-memory growth is bounded.
+
+**`crates/axiomdb-wal/src/txn.rs`** (ConnectionTxn)
+- `local_page_batch: LocalPageBatch` field initialized empty in `begin`.
+- Commit drains: `freed` → `recycle_queue` via `storage.recycle_page()`;
+  `available` → bitmap via `storage.free_page_batch()`.
+- Rollback drains: `available` → bitmap; `freed` cleared (pages still in use).
+- Savepoint records `freed_len_at_sp`; rollback-to-savepoint truncates.
+
+### Hot-path wiring
+
+All hot-path allocators now accept `Option<&mut LocalPageBatch>` and route through
+`batch_alloc_page`:
+
+| Crate | File | Functions |
+|---|---|---|
+| `axiomdb-storage` | `heap_chain_write.rs` | `insert`, `insert_with_hint` |
+| `axiomdb-storage` | `clustered_tree/btree_insert.rs` | `split_leaf`, `split_internal`, `insert_subtree` |
+| `axiomdb-storage` | `clustered_tree/mod.rs` | `insert` (root creation) |
+| `axiomdb-storage` | `clustered_overflow.rs` | `write_chain` |
+| `axiomdb-index` | `tree_insert.rs` | `insert_leaf`, `split_internal`, `alloc_root` |
+| `axiomdb-index` | `tree_delete.rs` | `rotate_left`, `rotate_right`, `merge_children` |
+
+DDL, catalog, vacuum, and recovery paths continue using `storage.alloc_page` directly
+(no batch), explicitly verified.
+
+### Adaptive batch sizing (PostgreSQL-inspired)
+
+The refill size is computed as:
+
+```
+n = last_refill_size × max(1, extension_waiters.load())
+```
+
+Capped at `MAX_BATCH_SIZE = 256`. Once a connection sees contention, it pulls a bigger
+batch and stays there ("sticky bulk mode", borrowed from PostgreSQL's `bistate`).
+
+### Homogeneous batches (PostgreSQL BulkInsertState model)
+
+`LocalPageBatch.current_type` tracks which `PageType` the batch was last refilled for.
+A type mismatch on `pop_or_refill` drains the existing batch back to the bitmap and
+refills with the new type.
+
+### Benchmarks (storage.rs)
+
+| Benchmark | Time | Throughput | Speedup vs baseline |
+|---|---|---|---|
+| single_mutex_1000 (baseline) | 36.5 ms | 27.4K elem/s | 1× |
+| batch_local_1000 | 1.27 ms | 787.7K elem/s | **28.8×** |
+| 8t_single_10k (8 threads, per-page Mutex) | 5.35 s | 187 elem/s | 1× |
+| 8t_batch_10k (8 threads, LocalPageBatch) | 7.6 ms | 131.6K elem/s | **703×** |
+
+Both results far exceed the ≥5× closing gate target.
+
+### Tests
+
+- `crates/axiomdb-storage/tests/integration_storage.rs`:
+  - `test_local_page_batch_pop_or_refill_basic` — basic pop, refill on empty
+  - `test_local_page_batch_type_mismatch_drain` — type mismatch drain + refill
+  - `test_local_page_batch_commit_drain` — commit drain semantics (available→bitmap, freed→recycle)
+  - `test_mmap_alloc_page_batch_concurrent_8_threads` — 8 threads × 10K alloc+free, all unique
+  - `test_mmap_alloc_page_batch_recycle_queue` — recycle queue fold-back
+
+### Validation
+
+- `cargo test --workspace`: **2518 passed, 9 ignored, 0 failed**
+- `cargo clippy --workspace -- -D warnings`: clean
+- `cargo fmt --check`: clean

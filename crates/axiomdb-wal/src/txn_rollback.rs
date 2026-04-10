@@ -19,6 +19,7 @@ impl TxnManager {
         Savepoint {
             undo_len: conn_txn.undo_ops.len(),
             deferred_free_len: conn_txn.deferred_free_pages.len(),
+            batch_freed_len: conn_txn.local_page_batch.freed_len(),
         }
     }
 
@@ -45,6 +46,12 @@ impl TxnManager {
 
         // Discard deferred-free pages recorded after this savepoint.
         conn_txn.deferred_free_pages.truncate(sp.deferred_free_len);
+
+        // Discard freed-after-savepoint entries in the local page batch.
+        // The undo restores those rows → the pages are still in use.
+        conn_txn
+            .local_page_batch
+            .truncate_freed(sp.batch_freed_len);
 
         // Drain only the undo ops recorded after the savepoint.
         let ops_to_undo: Vec<UndoOp> = conn_txn.undo_ops.drain(sp.undo_len..).rev().collect();
@@ -183,6 +190,13 @@ impl TxnManager {
         // Write Rollback entry — informational for crash recovery. No fsync.
         let mut entry = WalEntry::new(0, txn_id, EntryType::Rollback, 0, vec![], vec![], vec![]);
         self.wal.append(&mut entry)?;
+
+        // Phase 40.9: return pre-allocated-but-unused pages to the bitmap.
+        // The freed list is dropped: the undo restores the rows → pages in use.
+        let avail = conn_txn.local_page_batch.take_for_rollback();
+        if !avail.is_empty() {
+            storage.free_page_batch(&avail)?;
+        }
 
         // Deferred-free pages are discarded with conn_txn (catalog undo restores old roots).
 

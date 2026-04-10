@@ -76,14 +76,14 @@ impl BTree {
                 OptimisticLeafResult::NeedPessimistic => {}
             }
 
-            let final_root = match Self::insert_subtree(self.storage.as_mut(), root, key, rid, 90)? {
+            let final_root = match Self::insert_subtree_batched(self.storage.as_mut(), None, root, key, rid, 90)? {
                 InsertResult::Ok(new_root) => new_root,
                 InsertResult::Split {
                     left_pid,
                     right_pid,
                     sep,
                     ..
-                } => Self::alloc_root(self.storage.as_mut(), &sep, left_pid, right_pid)?,
+                } => Self::alloc_root_batched(self.storage.as_mut(), None, &sep, left_pid, right_pid)?,
             };
 
             if self
@@ -203,8 +203,10 @@ impl BTree {
         }
     }
 
-    fn insert_subtree(
+    #[allow(clippy::needless_option_as_deref)]
+    fn insert_subtree_batched(
         storage: &mut dyn StorageEngine,
+        mut batch: Option<&mut LocalPageBatch>,
         pid: u64,
         key: &[u8],
         rid: RecordId,
@@ -237,22 +239,17 @@ impl BTree {
         }
 
         match NodeCopy::read(storage, pid)? {
-            NodeCopy::Leaf(node) => Self::insert_leaf(storage, pid, node, key, rid, fillfactor),
+            NodeCopy::Leaf(node) => Self::insert_leaf_batched(storage, batch, pid, node, key, rid, fillfactor),
             NodeCopy::Internal(node) => {
                 let n = node.num_keys();
                 let child_idx = node.find_child_idx(key);
                 let child_pid = node.child_at(child_idx);
 
                 // Phase 40.8c: early X-latch release on safe descent.
-                // If the child can absorb the worst-case upward propagation
-                // (one new key) without itself splitting, the recursive call
-                // cannot return InsertResult::Split, so the parent will never
-                // need an update. Drop our X-latch now so concurrent readers
-                // can resume on this internal page.
                 if Self::child_is_safe_for_insert(storage, child_pid, fillfactor)? {
                     drop(parent_guard);
                     let result =
-                        Self::insert_subtree(storage, child_pid, key, rid, fillfactor)?;
+                        Self::insert_subtree_batched(storage, batch, child_pid, key, rid, fillfactor)?;
                     debug_assert!(
                         matches!(result, InsertResult::Ok(p) if p == child_pid),
                         "safe child must return InsertResult::Ok with the same pid"
@@ -260,7 +257,7 @@ impl BTree {
                     return Ok(InsertResult::Ok(pid));
                 }
 
-                match Self::insert_subtree(storage, child_pid, key, rid, fillfactor)? {
+                match Self::insert_subtree_batched(storage, batch.as_deref_mut(), child_pid, key, rid, fillfactor)? {
                     InsertResult::Ok(new_child_pid) => {
                         // If the child was updated in-place (same pid), the parent did not change:
                         // no need to rewrite it or update its child pointer.
@@ -300,7 +297,7 @@ impl BTree {
                             let new_pid = Self::write_internal_same_pid(storage, pid, node2)?;
                             Ok(InsertResult::Ok(new_pid))
                         } else {
-                            Self::split_internal(storage, pid, node2, child_idx, &sep, right_pid)
+                            Self::split_internal_batched(storage, batch, pid, node2, child_idx, &sep, right_pid)
                         }
                     }
                 }
@@ -312,8 +309,10 @@ impl BTree {
     ///
     /// Called only when `node.num_keys() >= threshold` (non-split path is
     /// handled directly in `insert_subtree` via the fast path).
-    fn insert_leaf(
+    #[allow(clippy::needless_option_as_deref)]
+    fn insert_leaf_batched(
         storage: &mut dyn StorageEngine,
+        mut batch: Option<&mut LocalPageBatch>,
         old_pid: u64,
         node: LeafNodePage,
         key: &[u8],
@@ -345,8 +344,8 @@ impl BTree {
         let mid = total / 2;
         let sep = ks[mid][..kl[mid] as usize].to_vec();
 
-        let left_pid = storage.alloc_page(PageType::Index)?;
-        let right_pid = storage.alloc_page(PageType::Index)?;
+        let left_pid = batch_alloc_page(storage, batch.as_deref_mut(), PageType::Index)?;
+        let right_pid = batch_alloc_page(storage, batch, PageType::Index)?;
 
         {
             let mut p = Page::new(PageType::Index, left_pid);
@@ -383,8 +382,10 @@ impl BTree {
         })
     }
 
-    fn split_internal(
+    #[allow(clippy::needless_option_as_deref)]
+    fn split_internal_batched(
         storage: &mut dyn StorageEngine,
+        mut batch: Option<&mut LocalPageBatch>,
         old_pid: u64,
         node: InternalNodePage,
         child_idx: usize,
@@ -418,8 +419,8 @@ impl BTree {
 
         let new_sep = ks[mid][..kl[mid] as usize].to_vec();
 
-        let left_pid = storage.alloc_page(PageType::Index)?;
-        let right_pid = storage.alloc_page(PageType::Index)?;
+        let left_pid = batch_alloc_page(storage, batch.as_deref_mut(), PageType::Index)?;
+        let right_pid = batch_alloc_page(storage, batch, PageType::Index)?;
 
         {
             let mut p = Page::new(PageType::Index, left_pid);
@@ -459,13 +460,14 @@ impl BTree {
         })
     }
 
-    fn alloc_root(
+    fn alloc_root_batched(
         storage: &mut dyn StorageEngine,
+        batch: Option<&mut LocalPageBatch>,
         sep: &[u8],
         left_pid: u64,
         right_pid: u64,
     ) -> Result<u64, DbError> {
-        let pid = storage.alloc_page(PageType::Index)?;
+        let pid = batch_alloc_page(storage, batch, PageType::Index)?;
         let mut p = Page::new(PageType::Index, pid);
         let n = cast_internal_mut(&mut p);
         n.is_leaf = 0;

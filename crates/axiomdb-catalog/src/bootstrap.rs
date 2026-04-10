@@ -159,14 +159,14 @@ impl CatalogBootstrap {
         let default_db = DatabaseDef {
             name: DEFAULT_DATABASE_NAME.to_string(),
         };
-        let _ = HeapChain::insert(storage, databases_root, &default_db.to_bytes(), 0)?;
+        let _ = HeapChain::insert(storage, databases_root, &default_db.to_bytes(), 0, None)?;
 
         // Seed the default `public` schema for the default database.
         let public_schema = SchemaDef {
             database_name: DEFAULT_DATABASE_NAME.to_string(),
             name: "public".to_string(),
         };
-        let _ = HeapChain::insert(storage, schemas_root, &public_schema.to_bytes(), 0)?;
+        let _ = HeapChain::insert(storage, schemas_root, &public_schema.to_bytes(), 0, None)?;
 
         storage.flush()?;
 
@@ -236,7 +236,7 @@ impl CatalogBootstrap {
             let default_db = DatabaseDef {
                 name: DEFAULT_DATABASE_NAME.to_string(),
             };
-            let _ = HeapChain::insert(storage, root, &default_db.to_bytes(), 0)?;
+            let _ = HeapChain::insert(storage, root, &default_db.to_bytes(), 0, None)?;
             ids.databases = root;
         }
 
@@ -259,7 +259,7 @@ impl CatalogBootstrap {
                 database_name: DEFAULT_DATABASE_NAME.to_string(),
                 name: "public".to_string(),
             };
-            let _ = HeapChain::insert(storage, root, &public_schema.to_bytes(), 0)?;
+            let _ = HeapChain::insert(storage, root, &public_schema.to_bytes(), 0, None)?;
             ids.schemas = root;
         }
 

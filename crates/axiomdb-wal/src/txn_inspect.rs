@@ -224,6 +224,8 @@ impl TxnManager {
             lowest_active_id: AtomicU64::new(0),
             deferred_commit_mode: false,
             committed_free_batches: Vec::new(),
+            committed_steal_protection: Vec::new(),
+            committed_recycle_pages: Vec::new(),
             durability_policy: WalDurabilityPolicy::Strict,
             last_clustered_roots: result.clustered_roots.clone(),
             pending_deferred_txn_id: None,

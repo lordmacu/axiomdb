@@ -87,6 +87,7 @@ impl TxnManager {
             wal_scratch: Vec::with_capacity(256),
             deferred_commit_mode: self.deferred_commit_mode,
             pending_deferred_txn_id: None,
+            local_page_batch: LocalPageBatch::new(),
         })
     }
 
@@ -149,6 +150,15 @@ impl TxnManager {
         if !conn_txn.deferred_free_pages.is_empty() {
             self.committed_free_batches
                 .push((txn_id, conn_txn.deferred_free_pages));
+        }
+
+        // Phase 40.9: stash the LocalPageBatch data for later drain.
+        let (avail, freed) = conn_txn.local_page_batch.take_for_commit();
+        if !avail.is_empty() {
+            self.committed_steal_protection.push(avail);
+        }
+        if !freed.is_empty() {
+            self.committed_recycle_pages.push(freed);
         }
 
         Ok(())
@@ -291,6 +301,34 @@ impl TxnManager {
     /// - I/O errors from flush or durable sync propagated to all batch waiters.
     pub fn wal_flush_and_fsync(&mut self) -> Result<(), DbError> {
         self.wal.commit_data_sync()
+    }
+
+    /// Phase 40.9: drains page-batch data stashed during commit.
+    ///
+    /// - `committed_steal_protection`: leftover `LocalPageBatch.available`
+    ///   pages → returned to the bitmap via `storage.free_page_batch`.
+    /// - `committed_recycle_pages`: `LocalPageBatch.freed` pages → pushed
+    ///   to `storage.recycle_page` for fast lock-free reuse.
+    ///
+    /// Call after `commit()` (or `release_committed_frees`) when the caller
+    /// has access to `&dyn StorageEngine`.
+    pub fn drain_committed_page_batches(
+        &mut self,
+        storage: &dyn StorageEngine,
+    ) -> Result<(), DbError> {
+        // Return leftover pre-allocated pages to the bitmap.
+        for batch in self.committed_steal_protection.drain(..) {
+            if !batch.is_empty() {
+                storage.free_page_batch(&batch)?;
+            }
+        }
+        // Push freed pages to the lock-free recycle queue.
+        for batch in self.committed_recycle_pages.drain(..) {
+            for page_id in batch {
+                storage.recycle_page(page_id)?;
+            }
+        }
+        Ok(())
     }
 
 }

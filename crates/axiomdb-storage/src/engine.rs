@@ -104,6 +104,65 @@ pub trait StorageEngine: Send + Sync {
     /// `write_page_under_page_lock`. Readers don't latch — MVCC visibility
     /// handles concurrent reads (Phase 40.7).
     fn page_lock_table(&self) -> &crate::page_lock::PageLockTable;
+
+    // ── Batch allocation (Phase 40.9) ───────────────────────────────────
+
+    /// Allocates `n` page IDs of the given type in one batch operation.
+    ///
+    /// Returns **uninitialized** page IDs (the caller is responsible for
+    /// `Page::new(ty, pid) + write_page(pid, &p)` at first use). The IDs
+    /// are marked USED in the on-disk bitmap immediately.
+    ///
+    /// The default implementation falls back to `n` individual `alloc_page`
+    /// calls. `MmapStorage` overrides this with a single `Mutex<FreeList>`
+    /// acquisition per batch (amortized lock cost: ~2µs / 64 = 31 ns each).
+    ///
+    /// ## Recycle priority
+    ///
+    /// When `MmapStorage` overrides this method, committed-but-not-flushed
+    /// pages from the `recycle_queue` are drained first (lock-free), then
+    /// the bitmap is consulted, and finally the file is grown if needed.
+    fn alloc_page_batch(&self, n: usize, page_type: PageType) -> Result<Vec<u64>, DbError> {
+        let mut ids = Vec::with_capacity(n);
+        for _ in 0..n {
+            ids.push(self.alloc_page(page_type)?);
+        }
+        Ok(ids)
+    }
+
+    /// Returns `ids` to the free page pool in one batch operation.
+    ///
+    /// The default implementation falls back to `ids.len()` individual
+    /// `free_page` calls. `MmapStorage` overrides this with a single
+    /// `Mutex<FreeList>` acquisition per batch.
+    fn free_page_batch(&self, ids: &[u64]) -> Result<(), DbError> {
+        for &id in ids {
+            self.free_page(id)?;
+        }
+        Ok(())
+    }
+
+    /// Number of threads currently waiting on the global freelist mutex.
+    ///
+    /// Used by `LocalPageBatch::pop_or_refill` for adaptive batch sizing:
+    /// `refill_size × max(1, extension_waiters)`, capped at `MAX_BATCH_SIZE`.
+    /// Default: 0 (no contention tracking for MemoryStorage).
+    fn extension_waiters(&self) -> u32 {
+        0
+    }
+
+    /// Pushes a page ID into the lock-free recycle queue for fast reuse by
+    /// future `alloc_page_batch` calls.
+    ///
+    /// Called on COMMIT: the transaction's `LocalPageBatch.freed` pages are
+    /// pushed here so other transactions can pick them up without touching
+    /// the global bitmap. The queue is drained back into the bitmap during
+    /// `flush()` / `release_deferred_frees`.
+    ///
+    /// Default: delegates to `free_page`. Overridden by `MmapStorage`.
+    fn recycle_page(&self, page_id: u64) -> Result<(), DbError> {
+        self.free_page(page_id)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -270,6 +270,7 @@ fn apply_pending_rebuilds(
 
     txn.commit(conn_txn)?;
     txn.release_immediate_committed_frees(storage, txn_id)?;
+    txn.drain_committed_page_batches(storage)?;
     Ok(())
 }
 

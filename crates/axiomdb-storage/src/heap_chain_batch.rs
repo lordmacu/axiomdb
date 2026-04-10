@@ -35,7 +35,7 @@ impl HeapChain {
         rows: &[Vec<u8>],
         txn_id: TxnId,
     ) -> Result<Vec<(u64, u16)>, DbError> {
-        Self::insert_batch_with_zm(storage, root_page_id, rows, txn_id, &[])
+        Self::insert_batch_with_zm(storage, root_page_id, rows, txn_id, &[], None)
     }
 
     /// Core batch insert implementation with zone map support.
@@ -45,6 +45,7 @@ impl HeapChain {
         rows: &[Vec<u8>],
         txn_id: TxnId,
         zm_values: &[Option<(u8, i64)>],
+        mut batch: Option<&mut crate::local_page_batch::LocalPageBatch>,
     ) -> Result<Vec<(u64, u16)>, DbError> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -78,7 +79,9 @@ impl HeapChain {
                     storage.write_page(last_id, &page)?;
 
                     // Step 2: allocate an empty new page.
-                    let new_id = storage.alloc_page(PageType::Data)?;
+                    let new_id = crate::local_page_batch::batch_alloc_page(
+                        storage, batch.as_deref_mut(), PageType::Data,
+                    )?;
                     let new_page = Page::new(PageType::Data, new_id);
 
                     // Step 3: link — re-read the page we just wrote, set the

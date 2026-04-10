@@ -343,8 +343,9 @@ impl BTree {
                 // Already merged into a sibling during a previous rebalance step.
                 None => continue,
             };
-            current_parent_pid = Self::rebalance(
+            current_parent_pid = Self::rebalance_batched(
                 storage,
+                None, // bulk_load: no per-txn batch
                 current_parent_pid,
                 parent_node,
                 child_idx,

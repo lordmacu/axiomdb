@@ -22,6 +22,7 @@ pub fn execute_with_ctx(
                 let tid = conn.txn_id;
                 txn.commit(conn)?;
                 txn.release_immediate_committed_frees(storage, tid)?;
+                txn.drain_committed_page_batches(storage)?;
                 return Ok(QueryResult::Empty);
             }
             Stmt::Rollback => {
@@ -89,6 +90,7 @@ pub fn execute_with_ctx(
             let pre_tid = pre_conn.txn_id;
             txn.commit(pre_conn)?;
             txn.release_immediate_committed_frees(storage, pre_tid)?;
+            txn.drain_committed_page_batches(storage)?;
             ctx.conn_txn = Some(txn.begin()?);
             let exec_ctx2 = ExecutionContext::from_mut(storage, txn, bloom);
             return match dispatch_ctx(stmt, &exec_ctx2, ctx) {
@@ -97,6 +99,7 @@ pub fn execute_with_ctx(
                     let ddl_tid = ddl_conn.txn_id;
                     txn.commit(ddl_conn)?;
                     txn.release_immediate_committed_frees(storage, ddl_tid)?;
+                    txn.drain_committed_page_batches(storage)?;
                     Ok(result)
                 }
                 Err(e) => {
@@ -193,6 +196,7 @@ pub fn execute_with_ctx(
                         let tid = conn.txn_id;
                         txn.commit(conn)?;
                         txn.release_immediate_committed_frees(storage, tid)?;
+                        txn.drain_committed_page_batches(storage)?;
                         Ok(result)
                     }
                     Err(e) => {
