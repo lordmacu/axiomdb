@@ -191,8 +191,9 @@ fn execute_create_index(
         })
         .collect();
 
-    // 4. Allocate root: B-Tree leaf page or BRIN metapage.
+    // 4. Allocate root: B-Tree leaf page, BRIN metapage, or Trigram B-Tree.
     let is_brin = matches!(stmt.index_type, crate::ast::IndexType::Brin);
+    let is_trigram = matches!(stmt.index_type, crate::ast::IndexType::Trigram);
     let root_page_id = if is_brin {
         let pages_per_range = stmt.pages_per_range.unwrap_or(128);
         let brin_col_idx = index_columns
@@ -282,6 +283,24 @@ fn execute_create_index(
         axiomdb_storage::brin::write_summaries(storage, root_page_id, &summaries)?;
 
         // Skip B-Tree build + bloom — BRIN doesn't use either.
+    } else if is_trigram {
+        // ── Trigram index build (Phase 11.4b) ────────────────────────────
+        // Extract 3-char n-grams from each row's text value and insert
+        // (trigram || RecordId) keys into the B-Tree.
+        let trgm_col_idx = index_columns.first().map(|c| c.col_idx as usize).unwrap_or(0);
+        for (rid, row_vals) in &rows {
+            let text = match row_vals.get(trgm_col_idx) {
+                Some(Value::Text(s)) | Some(Value::Json(s)) => s,
+                _ => continue,
+            };
+            let trigrams = crate::trigram::extract_trigrams(text);
+            for trgm in &trigrams {
+                let mut key = trgm.to_vec();
+                key.extend_from_slice(&encode_rid(*rid));
+                BTree::insert_in(storage, &root_pid, &key, *rid, index_fillfactor)?;
+            }
+        }
+        // Skip regular bloom for trigram.
     } else if table_def.is_clustered() {
         // ── Clustered secondary index build ──────────────────────────────
         // Derive the physical key layout from the primary index so that every
@@ -412,6 +431,7 @@ fn execute_create_index(
         index_type: match stmt.index_type {
             crate::ast::IndexType::BTree => 0,
             crate::ast::IndexType::Brin => 1,
+            crate::ast::IndexType::Trigram => 2,
         },
         pages_per_range: stmt.pages_per_range.unwrap_or(128),
     })?;
