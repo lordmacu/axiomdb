@@ -109,6 +109,20 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
             Ok(Value::Text(if b { "1" } else { "0" }.to_string()))
         }
 
+        // ── Text → JSON (Phase 11.4) — validate JSON syntax ─────────────────
+        (Value::Text(s), DataType::Json) => {
+            // Validate JSON syntax before storing.
+            if serde_json::from_str::<serde_json::Value>(&s).is_ok() {
+                Ok(Value::Json(s))
+            } else {
+                Err(DbError::InvalidValue {
+                    reason: format!("invalid JSON: {}", &s[..s.len().min(80)]),
+                })
+            }
+        }
+        // ── JSON → Text ─────────────────────────────────────────────────────
+        (Value::Json(s), DataType::Text) => Ok(Value::Text(s)),
+
         // ── Everything else is an error ───────────────────────────────────────
         (value, target) => Err(DbError::InvalidCoercion {
             from: value.variant_name().into(),

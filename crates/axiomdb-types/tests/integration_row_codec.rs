@@ -4,7 +4,10 @@
 //! positions, empty rows, 9-column rows (2-byte bitmap), error cases.
 
 use axiomdb_core::DbError;
-use axiomdb_types::{decode_row, encode_row, encoded_len, DataType, Value};
+use axiomdb_types::codec::{encode_toast_pointer, TOAST_SENTINEL_RAW};
+use axiomdb_types::{
+    coerce, decode_row, decode_row_masked, encode_row, encoded_len, CoercionMode, DataType, Value,
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -96,6 +99,41 @@ fn test_roundtrip_text_empty() {
 fn test_roundtrip_text_unicode() {
     let v = vec![Value::Text("こんにちは 🦀".into())];
     assert_eq!(roundtrip(&v, &[DataType::Text]), v);
+}
+
+#[test]
+fn test_roundtrip_json() {
+    let v = vec![Value::Json(r#"{"age":30,"name":"Alice"}"#.into())];
+    assert_eq!(roundtrip(&v, &[DataType::Json]), v);
+}
+
+#[test]
+fn test_decode_row_masked_json() {
+    let values = vec![
+        Value::Int(1),
+        Value::Json(r#"{"name":"Alice"}"#.into()),
+        Value::Text("tail".into()),
+    ];
+    let schema = &[DataType::Int, DataType::Json, DataType::Text];
+    let encoded = encode_row(&values, schema).unwrap();
+
+    let decoded = decode_row_masked(&encoded, schema, &[true, false, true]).unwrap();
+    assert_eq!(
+        decoded,
+        vec![Value::Int(1), Value::Null, Value::Text("tail".into())]
+    );
+}
+
+#[test]
+fn test_decode_row_masked_json_toast_pointer() {
+    let mut encoded = vec![0u8]; // one-column NULL bitmap, not-null bit remains clear.
+    encode_toast_pointer(&mut encoded, TOAST_SENTINEL_RAW, 42, 123);
+
+    let decoded = decode_row_masked(&encoded, &[DataType::Json], &[true]).unwrap();
+    assert_eq!(decoded, vec![Value::Json("__toast__:42:false".into())]);
+
+    let skipped = decode_row_masked(&encoded, &[DataType::Json], &[false]).unwrap();
+    assert_eq!(skipped, vec![Value::Null]);
 }
 
 #[test]
@@ -329,6 +367,46 @@ fn test_error_invalid_utf8_text() {
     assert!(
         matches!(err, DbError::ParseError { .. }),
         "expected ParseError for invalid UTF-8, got: {err}"
+    );
+}
+
+#[test]
+fn test_error_invalid_json() {
+    let err = encode_row(&[Value::Json("{bad".into())], &[DataType::Json]).unwrap_err();
+    assert!(
+        matches!(err, DbError::InvalidValue { .. }),
+        "expected InvalidValue for invalid JSON, got: {err}"
+    );
+}
+
+#[test]
+fn test_coerce_text_to_json_validates() {
+    let json = coerce(
+        Value::Text(r#"{"ok":true}"#.into()),
+        DataType::Json,
+        CoercionMode::Strict,
+    )
+    .unwrap();
+    assert_eq!(json, Value::Json(r#"{"ok":true}"#.into()));
+    assert_eq!(
+        coerce(
+            Value::Json(r#"{"ok":true}"#.into()),
+            DataType::Json,
+            CoercionMode::Strict,
+        )
+        .unwrap(),
+        Value::Json(r#"{"ok":true}"#.into())
+    );
+
+    let err = coerce(
+        Value::Text("{bad".into()),
+        DataType::Json,
+        CoercionMode::Strict,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, DbError::InvalidValue { .. }),
+        "expected InvalidValue for invalid JSON coercion, got: {err}"
     );
 }
 

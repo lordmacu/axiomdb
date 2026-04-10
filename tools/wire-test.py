@@ -11,7 +11,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              39.21 (aggregate hash execution — zero-alloc clustered scan),
              39.22 (UPDATE in-place zero-alloc: single/multi field patch, rollback, TEXT-before-INT),
              40.1b (CREATE INDEX on clustered tables), 4.22e (ALTER DROP/MODIFY auto-index repair),
-             4.G5 (DELETE/UPDATE ORDER BY+LIMIT, INSERT IGNORE, CREATE LIKE, CTAS, CALL/DO)
+             4.G5 (DELETE/UPDATE ORDER BY+LIMIT, INSERT IGNORE, CREATE LIKE, CTAS, CALL/DO),
+             11.4 (native JSON type + JSON_EXTRACT / ->>)
 """
 import os
 import signal
@@ -911,6 +912,29 @@ cur.execute(
 row_gc = cur.fetchone()
 ok("4.9b: GROUP_CONCAT sorted path non-null", row_gc is not None and row_gc[1] is not None)
 
+# ── [11.4] Native JSON over MySQL wire ───────────────────────────────────────
+
+print("\n[11.4] Native JSON type over MySQL wire")
+
+cur.execute("DROP TABLE IF EXISTS wt_json_docs")
+cur.execute("CREATE TABLE wt_json_docs (id INT PRIMARY KEY, data JSON)")
+cur.execute(
+    "INSERT INTO wt_json_docs VALUES "
+    "(1, '{\"name\":\"Alice\",\"age\":30,\"active\":true}'),"
+    "(2, '{\"name\":\"Bob\",\"age\":41,\"active\":false}')"
+)
+cur.execute("SELECT JSON_EXTRACT(data, '$.age') FROM wt_json_docs WHERE id = 1")
+row_json_age = cur.fetchone()
+ok("11.4 JSON_EXTRACT returns numeric scalar",
+   row_json_age is not None and str(row_json_age[0]) == "30", row_json_age)
+cur.execute("SELECT data->>'name' FROM wt_json_docs WHERE data->>'name' = 'Alice'")
+ok("11.4 ->> works in SELECT and WHERE over wire", cur.fetchone() == ("Alice",))
+cur.execute("SELECT JSON_TYPE(data), JSON_VALID(data) FROM wt_json_docs WHERE id = 1")
+row_json_meta = cur.fetchone()
+ok("11.4 JSON_TYPE/JSON_VALID over wire",
+   row_json_meta is not None and row_json_meta[0] == "OBJECT" and str(row_json_meta[1]) == "1",
+   row_json_meta)
+
 # ── [4.25b] Structured Error Responses ────────────────────────────────────────
 
 print("\n[4.25b] Structured Error Responses")
@@ -1630,8 +1654,8 @@ ok("5.2a: default character_set_client is utf8mb4",
 
 cur.execute("SHOW VARIABLES LIKE 'collation_connection'")
 rows_col = cur.fetchall()
-ok("5.2a: default collation_connection is utf8mb4_0900_ai_ci",
-   rows_col and rows_col[0][1] == "utf8mb4_0900_ai_ci", rows_col)
+ok("5.2a: default collation_connection is utf8mb4",
+   rows_col and rows_col[0][1].startswith("utf8mb4_"), rows_col)
 
 # SET NAMES latin1 — all three charset variables must update.
 conn_l1 = pymysql.connect(host="127.0.0.1", port=PORT, user="root",

@@ -25,7 +25,9 @@ pub fn fixed_encoded_size(dt: DataType) -> Option<usize> {
         DataType::Int | DataType::Date => Some(4),
         DataType::BigInt | DataType::Real | DataType::Timestamp => Some(8),
         // Variable-length or complex types: cannot patch in place.
-        DataType::Text | DataType::Bytes | DataType::Decimal | DataType::Uuid => None,
+        DataType::Text | DataType::Json | DataType::Bytes | DataType::Decimal | DataType::Uuid => {
+            None
+        }
     }
 }
 

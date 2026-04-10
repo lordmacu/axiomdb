@@ -527,7 +527,7 @@ pub fn value_to_sql_literal(v: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         Value::Real(f) => format!("{f}"),
-        Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Text(s) | Value::Json(s) => format!("'{}'", s.replace('\'', "''")),
         Value::Bytes(b) => {
             let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
             format!("x'{hex}'")

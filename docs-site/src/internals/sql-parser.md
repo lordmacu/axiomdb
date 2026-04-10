@@ -577,7 +577,7 @@ split by responsibility:
 - `core.rs` — recursive `Expr` evaluation, CASE dispatch, and subquery-aware paths
 - `ops.rs` — boolean logic, comparisons, `IN`, `LIKE`, and truthiness helpers
 - `functions/` — built-ins grouped by family (`system`, `nulls`, `numeric`,
-  `string`, `datetime`, `binary`, `uuid`)
+  `string`, `datetime`, `binary`, `uuid`, `json`)
 
 Built-in function dispatch still happens by lowercased name inside
 `functions/mod.rs`. The registry remains a single `match` arm: no hash map and
@@ -591,6 +591,38 @@ Like PostgreSQL's separation between expression evaluation helpers and executor 
 AxiomDB now splits evaluator internals by responsibility while keeping the same public
 entrypoints and static built-in dispatch. The payoff is lower maintenance cost without
 adding virtual dispatch or a mutable function registry.
+</div>
+</div>
+
+### JSON Functions and `->>` (11.4)
+
+The lexer recognizes `JSON` as a DDL type token and `->>` as
+`Token::JsonExtractText`. The expression parser treats `->>` as a high-precedence
+left-associative extraction operator and lowers it immediately to a scalar
+function call:
+
+```rust
+data->>'name'
+// becomes
+Expr::Function {
+    name: "json_extract".into(),
+    args: vec![
+        Expr::Column { name: "data".into(), col_idx: 0 },
+        Expr::Literal(Value::Text("$.name".into())),
+    ],
+}
+```
+
+Lowering avoids adding a new `BinaryOp` variant and reuses the existing function
+dispatch path in `eval/functions/json.rs`. That module implements
+`JSON_EXTRACT`, `JSON_SET`, `JSON_REMOVE`, `JSON_KEYS`, `JSON_VALID`, and
+`JSON_TYPE` with `serde_json` and simple dot-path traversal.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Operator Lowering</span>
+PostgreSQL keeps <code>->></code> as a JSON operator in its expression operator catalog; AxiomDB lowers it to <code>JSON_EXTRACT</code> during parsing so the evaluator, analyzer, and wire path share one implementation for both MySQL-style and PostgreSQL-style syntax.
 </div>
 </div>
 

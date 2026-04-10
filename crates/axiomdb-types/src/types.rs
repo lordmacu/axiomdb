@@ -36,6 +36,9 @@ pub enum DataType {
     Timestamp,
     /// SQL UUID — stored as 16 raw bytes (big-endian UUID byte order).
     Uuid,
+    /// SQL JSON — stored as u24 LE length prefix + validated UTF-8 JSON text.
+    /// Same wire format as Text; distinguished by DataType for operator dispatch.
+    Json,
 }
 
 impl DataType {
@@ -52,6 +55,7 @@ impl DataType {
             Self::Date => "DATE",
             Self::Timestamp => "TIMESTAMP",
             Self::Uuid => "UUID",
+            Self::Json => "JSON",
         }
     }
 }

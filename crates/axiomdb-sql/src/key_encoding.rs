@@ -110,7 +110,7 @@ fn encode_value(v: &Value, buf: &mut Vec<u8>) {
             let u = (*micros ^ i64::MIN) as u64;
             buf.extend_from_slice(&u.to_be_bytes());
         }
-        Value::Text(s) => {
+        Value::Text(s) | Value::Json(s) => {
             buf.push(0x08);
             encode_bytes_nul(s.as_bytes(), buf);
         }

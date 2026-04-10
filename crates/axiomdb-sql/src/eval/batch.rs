@@ -499,7 +499,9 @@ fn fixed_size(dt: DataType) -> Option<usize> {
         DataType::Bool => Some(1),
         DataType::Int | DataType::Date => Some(4),
         DataType::BigInt | DataType::Real | DataType::Timestamp => Some(8),
-        DataType::Text | DataType::Bytes | DataType::Decimal | DataType::Uuid => None,
+        DataType::Text | DataType::Json | DataType::Bytes | DataType::Decimal | DataType::Uuid => {
+            None
+        }
     }
 }
 

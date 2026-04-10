@@ -22,8 +22,8 @@ use axiomdb_wal::TxnManager;
 
 /// Creates a MemoryStorage with the catalog bootstrapped and a TxnManager.
 fn setup() -> (MemoryStorage, TxnManager) {
-    let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    let storage = MemoryStorage::new();
+    CatalogBootstrap::init(&storage).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("test.wal");
     let txn = TxnManager::create(&wal_path).unwrap();
@@ -41,11 +41,11 @@ fn committed_snap(txn: &TxnManager) -> TransactionSnapshot {
 
 #[test]
 fn test_create_and_get_table() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     let mut conn_txn = txn.begin().unwrap();
     let table_id = {
-        let mut writer = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut writer = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         writer.create_table("public", "users").unwrap()
     };
     txn.commit(conn_txn).unwrap();
@@ -63,11 +63,11 @@ fn test_create_and_get_table() {
 
 #[test]
 fn test_create_multiple_tables_distinct_ids() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     let mut conn_txn = txn.begin().unwrap();
     let (id1, id2) = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         let a = w.create_table("public", "orders").unwrap();
         let b = w.create_table("public", "products").unwrap();
         (a, b)
@@ -84,11 +84,11 @@ fn test_create_multiple_tables_distinct_ids() {
 
 #[test]
 fn test_get_table_by_id() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     let mut conn_txn = txn.begin().unwrap();
     let table_id = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         w.create_table("myschema", "items").unwrap()
     };
     txn.commit(conn_txn).unwrap();
@@ -102,11 +102,11 @@ fn test_get_table_by_id() {
 
 #[test]
 fn test_create_table_with_clustered_layout_allocates_clustered_leaf_root() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     let mut conn_txn = txn.begin().unwrap();
     let table = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         w.create_table_with_layout("public", "events", TableStorageLayout::Clustered)
             .unwrap()
     };
@@ -138,11 +138,11 @@ fn test_get_table_not_found_returns_none() {
 
 #[test]
 fn test_create_columns_list_ordered_by_col_idx() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     let mut conn_txn = txn.begin().unwrap();
     let table_id = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         let tid = w.create_table("public", "users").unwrap();
         // Insert in reverse col_idx order to verify sort.
         w.create_column(ColumnDef {
@@ -213,11 +213,11 @@ fn test_list_columns_empty_for_unknown_table() {
 
 #[test]
 fn test_create_and_list_index() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     let mut conn_txn = txn.begin().unwrap();
     let (table_id, index_id) = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         let tid = w.create_table("public", "users").unwrap();
         let iid = w
             .create_index(IndexDef {
@@ -253,11 +253,11 @@ fn test_create_and_list_index() {
 
 #[test]
 fn test_index_ids_are_unique_across_tables() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     let mut conn_txn = txn.begin().unwrap();
     let (iid1, iid2) = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         let t1 = w.create_table("public", "a").unwrap();
         let t2 = w.create_table("public", "b").unwrap();
         let i1 = w
@@ -305,11 +305,11 @@ fn test_index_ids_are_unique_across_tables() {
 
 #[test]
 fn test_delete_index() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     let mut conn_txn = txn.begin().unwrap();
     let (table_id, index_id) = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         let tid = w.create_table("public", "t").unwrap();
         let iid = w
             .create_index(IndexDef {
@@ -340,7 +340,7 @@ fn test_delete_index() {
     // Delete the index.
     let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         w.delete_index(index_id).unwrap();
     }
     txn.commit(conn_txn).unwrap();
@@ -353,11 +353,11 @@ fn test_delete_index() {
 
 #[test]
 fn test_delete_table_cascades_columns_and_indexes() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     let mut conn_txn = txn.begin().unwrap();
     let table_id = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         let tid = w.create_table("public", "target").unwrap();
         w.create_column(ColumnDef {
             table_id: tid,
@@ -401,7 +401,7 @@ fn test_delete_table_cascades_columns_and_indexes() {
     // Drop the table.
     let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         w.delete_table(table_id).unwrap();
     }
     txn.commit(conn_txn).unwrap();
@@ -416,10 +416,10 @@ fn test_delete_table_cascades_columns_and_indexes() {
 
 #[test]
 fn test_delete_nonexistent_index_returns_error() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
     let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         let err = w.delete_index(9999).unwrap_err();
         assert!(
             matches!(
@@ -429,21 +429,21 @@ fn test_delete_nonexistent_index_returns_error() {
             "expected CatalogIndexNotFound, got: {err}"
         );
     }
-    txn.rollback(conn_txn, &mut storage).unwrap();
+    txn.rollback(conn_txn, &storage).unwrap();
 }
 
 // ── MVCC snapshot isolation ───────────────────────────────────────────────────
 
 #[test]
 fn test_snapshot_before_commit_does_not_see_new_table() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     // Capture a snapshot BEFORE the transaction commits.
     let snap_before = committed_snap(&txn);
 
     let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         w.create_table("public", "invisible").unwrap();
     }
     txn.commit(conn_txn).unwrap();
@@ -466,11 +466,11 @@ fn test_snapshot_before_commit_does_not_see_new_table() {
 
 #[test]
 fn test_snapshot_before_delete_still_sees_row() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     let mut conn_txn = txn.begin().unwrap();
     let table_id = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         w.create_table("public", "mortal").unwrap()
     };
     txn.commit(conn_txn).unwrap();
@@ -480,7 +480,7 @@ fn test_snapshot_before_delete_still_sees_row() {
 
     let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         w.delete_table(table_id).unwrap();
     }
     txn.commit(conn_txn).unwrap();
@@ -499,14 +499,14 @@ fn test_snapshot_before_delete_still_sees_row() {
 
 #[test]
 fn test_rollback_create_table_row_invisible() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         w.create_table("public", "ghost").unwrap();
     }
-    txn.rollback(conn_txn, &mut storage).unwrap();
+    txn.rollback(conn_txn, &storage).unwrap();
 
     // After rollback, the row must be invisible to any committed snapshot.
     let snap = committed_snap(&txn);
@@ -518,20 +518,20 @@ fn test_rollback_create_table_row_invisible() {
 fn test_rollback_create_does_not_consume_id_permanently() {
     // After rollback, the sequence counter still advanced (no retry mechanism).
     // The next successful create_table must get the ID after the rolled-back one.
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     // First transaction — rolled back.
     let mut conn_txn = txn.begin().unwrap();
     let rolled_back_id = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         w.create_table("public", "ghost").unwrap()
     };
-    txn.rollback(conn_txn, &mut storage).unwrap();
+    txn.rollback(conn_txn, &storage).unwrap();
 
     // Second transaction — committed.
     let mut conn_txn = txn.begin().unwrap();
     let committed_id = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         w.create_table("public", "real").unwrap()
     };
     txn.commit(conn_txn).unwrap();
@@ -548,7 +548,7 @@ fn test_rollback_create_does_not_consume_id_permanently() {
 
 #[test]
 fn test_multi_page_chain_insert_and_scan() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     // Insert enough tables to overflow the root page.
     // Each TableRow is roughly 4 + 1 + 6 + 1 + ~10 = ~22 bytes of data.
@@ -559,7 +559,7 @@ fn test_multi_page_chain_insert_and_scan() {
 
     let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         for i in 0..count {
             let name = format!("table_{i:04}");
             let id = w.create_table("stress", &name).unwrap();
@@ -596,12 +596,12 @@ fn test_sequence_persistence_across_reopen() {
 
     // Session 1: create a table, commit, get its ID.
     let id_session1 = {
-        let mut storage = MmapStorage::create(&db_path).unwrap();
-        CatalogBootstrap::init(&mut storage).unwrap();
-        let mut txn = TxnManager::create(&wal_path).unwrap();
+        let storage = MmapStorage::create(&db_path).unwrap();
+        CatalogBootstrap::init(&storage).unwrap();
+        let txn = TxnManager::create(&wal_path).unwrap();
         let mut conn_txn = txn.begin().unwrap();
         let id = {
-            let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+            let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
             w.create_table("public", "session1_table").unwrap()
         };
         txn.commit(conn_txn).unwrap();
@@ -611,11 +611,11 @@ fn test_sequence_persistence_across_reopen() {
 
     // Session 2: reopen, create another table — ID must be > session1's ID.
     let id_session2 = {
-        let mut storage = MmapStorage::open(&db_path).unwrap();
-        let mut txn = TxnManager::open(&wal_path).unwrap();
+        let storage = MmapStorage::open(&db_path).unwrap();
+        let txn = TxnManager::open(&wal_path).unwrap();
         let mut conn_txn = txn.begin().unwrap();
         let id = {
-            let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+            let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
             w.create_table("public", "session2_table").unwrap()
         };
         txn.commit(conn_txn).unwrap();
@@ -647,15 +647,15 @@ fn test_sequence_persistence_across_reopen() {
 
 #[test]
 fn test_catalog_not_initialized_returns_error() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     // No CatalogBootstrap::init() called.
 
     let wal_dir = tempfile::tempdir().unwrap();
     let wal_path = wal_dir.path().join("test.wal");
-    let mut txn = TxnManager::create(&wal_path).unwrap();
+    let txn = TxnManager::create(&wal_path).unwrap();
     let mut conn_txn = txn.begin().unwrap();
 
-    let err = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn)
+    let err = CatalogWriter::new(&storage, &txn, &mut conn_txn)
         .err()
         .expect("expected CatalogNotInitialized error");
     assert!(
@@ -663,5 +663,5 @@ fn test_catalog_not_initialized_returns_error() {
         "expected CatalogNotInitialized, got: {err}"
     );
 
-    txn.rollback(conn_txn, &mut storage).unwrap();
+    txn.rollback(conn_txn, &storage).unwrap();
 }

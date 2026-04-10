@@ -175,6 +175,8 @@ PRINT_ORDER = [
     "between_range",
     # ── bulk ──
     "insert_select",
+    # ── JSON (Phase 11.4) ──
+    "json_extract",
 ]
 
 PRELOADED_SCENARIOS = {
@@ -193,6 +195,11 @@ PRELOADED_SCENARIOS = {
     "multi_aggregate",
     "complex_where",
     "between_range",
+}
+
+# Scenarios that need the bench_json table created and populated.
+NEEDS_JSON = {
+    "json_extract",
 }
 
 # Scenarios that need the bench_orders table created and populated.
@@ -533,6 +540,19 @@ def rows_data_orders(n_users):
     return rows
 
 
+def rows_data_json(n):
+    rows = []
+    for i in range(1, n + 1):
+        payload = {
+            "id": i,
+            "name": f"user_{i:06d}",
+            "age": 18 + (i % 62),
+            "active": 1 if i % 2 == 0 else 0,
+        }
+        rows.append((i, json.dumps(payload, separators=(",", ":"))))
+    return rows
+
+
 def parse_indexes(raw):
     if not raw:
         return []
@@ -567,7 +587,7 @@ def parse_engines(raw):
     return ordered
 
 
-def schema_statements(kind, indexes, with_orders=False, with_users_copy=False):
+def schema_statements(kind, indexes, with_orders=False, with_users_copy=False, with_json=False):
     if kind == "pg":
         statements = [
             "DROP TABLE IF EXISTS bench_users CASCADE",
@@ -617,6 +637,9 @@ def schema_statements(kind, indexes, with_orders=False, with_users_copy=False):
 
     if with_users_copy:
         statements += users_copy_schema_statements(kind)
+
+    if with_json:
+        statements += json_schema_statements(kind)
 
     return statements
 
@@ -704,6 +727,37 @@ def users_copy_schema_statements(kind):
         raise ValueError(f"unknown engine kind: {kind}")
 
 
+def json_schema_statements(kind):
+    if kind == "pg":
+        return [
+            "DROP TABLE IF EXISTS bench_json CASCADE",
+            """CREATE TABLE bench_json (
+    id   INT   NOT NULL PRIMARY KEY,
+    data JSONB NOT NULL
+)""",
+        ]
+    elif kind == "mysql":
+        return [
+            "DROP TABLE IF EXISTS bench_json",
+            """CREATE TABLE bench_json (
+    id   INT  NOT NULL,
+    data JSON NOT NULL,
+    PRIMARY KEY (id)
+) ENGINE=InnoDB""",
+        ]
+    elif kind == "axiomdb":
+        return [
+            "DROP TABLE IF EXISTS bench_json",
+            """CREATE TABLE bench_json (
+    id   INT  NOT NULL,
+    data JSON NOT NULL,
+    PRIMARY KEY (id)
+)""",
+        ]
+    else:
+        raise ValueError(f"unknown engine kind: {kind}")
+
+
 def exec_statements(conn, statements, transactional=False):
     cur = conn.cursor()
     if transactional:
@@ -715,10 +769,11 @@ def exec_statements(conn, statements, transactional=False):
     cur.close()
 
 
-def reset_table(conn, kind, indexes, with_orders=False, with_users_copy=False):
+def reset_table(conn, kind, indexes, with_orders=False, with_users_copy=False, with_json=False):
     exec_statements(conn, schema_statements(kind, indexes,
                                             with_orders=with_orders,
-                                            with_users_copy=with_users_copy))
+                                            with_users_copy=with_users_copy,
+                                            with_json=with_json))
 
 
 def sql_literal(value):
@@ -783,6 +838,16 @@ def prepare_workload(n_rows, multi_values_chunk, autocommit_rows, point_lookups,
         for chunk in chunked(order_values_sql, multi_values_chunk)
     ]
 
+    # ── JSON data ────────────────────────────────────────────────────────────
+    json_rows = rows_data_json(n_rows)
+    json_values_sql = [
+        "(" + ",".join(sql_literal(v) for v in row) + ")" for row in json_rows
+    ]
+    insert_json_sqls = [
+        "INSERT INTO bench_json VALUES " + ",".join(chunk)
+        for chunk in chunked(json_values_sql, multi_values_chunk)
+    ]
+
     return {
         "n_rows": n_rows,
         "data": data,
@@ -821,6 +886,8 @@ def prepare_workload(n_rows, multi_values_chunk, autocommit_rows, point_lookups,
         # ── orders ────────────────────────────────────────────────────────────
         "n_orders": len(orders),
         "insert_orders_sqls": insert_orders_sqls,
+        "n_json": len(json_rows),
+        "insert_json_sqls": insert_json_sqls,
         # ── join queries ──────────────────────────────────────────────────────
         "join_inner_sql": (
             "SELECT u.name, o.amount "
@@ -870,6 +937,9 @@ def prepare_workload(n_rows, multi_values_chunk, autocommit_rows, point_lookups,
         "between_range_sql": "SELECT * FROM bench_users WHERE age BETWEEN 25 AND 35",
         # ── bulk ──────────────────────────────────────────────────────────────
         "insert_select_sql": "INSERT INTO bench_users_copy SELECT * FROM bench_users",
+        # ── JSON (Phase 11.4) ────────────────────────────────────────────────
+        "json_extract_n": n_rows,
+        "json_extract_sql": "SELECT JSON_EXTRACT(data, '$.age') FROM bench_json WHERE JSON_EXTRACT(data, '$.active') = 1",
     }
 
 
@@ -879,6 +949,10 @@ def preload_table(conn, workload):
 
 def preload_orders(conn, workload):
     exec_statements(conn, workload["insert_orders_sqls"], transactional=True)
+
+
+def preload_json(conn, workload):
+    exec_statements(conn, workload["insert_json_sqls"], transactional=True)
 
 
 def emit(engine, scenario, n_ops, mean_s, note=""):
@@ -1252,6 +1326,24 @@ def run_insert_select(conn, engine, kind, indexes, workload):
     emit(engine, "insert_select", workload["n_rows"], mean, "INSERT INTO ... SELECT *")
 
 
+# ── JSON scenarios ────────────────────────────────────────────────────────────
+
+def run_json_extract(conn, engine, kind, _indexes, workload):
+    if kind == "pg":
+        sql = "SELECT data->>'age' FROM bench_json WHERE (data->>'active') = '1'"
+    else:
+        sql = workload["json_extract_sql"]
+
+    def do():
+        cur = conn.cursor()
+        cur.execute(sql)
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "json_extract", workload["json_extract_n"], mean, "JSON_EXTRACT path filter")
+
+
 SCENARIOS = {
     "insert": run_insert,
     "insert_multi_values": run_insert_multi_values,
@@ -1280,6 +1372,7 @@ SCENARIOS = {
     "complex_where": run_complex_where,
     "between_range": run_between_range,
     "insert_select": run_insert_select,
+    "json_extract": run_json_extract,
 }
 
 ALL_SCENARIOS = list(SCENARIOS)
@@ -1290,6 +1383,7 @@ ALL_SCENARIOS = list(SCENARIOS)
 def run_scenario(scenario, workload, indexes, selected_engines):
     needs_orders = scenario in NEEDS_ORDERS
     needs_copy = scenario in NEEDS_USERS_COPY
+    needs_json = scenario in NEEDS_JSON
     for engine_key in selected_engines:
         engine, cfg = ENGINE_CONFIGS[engine_key]
         try:
@@ -1299,11 +1393,14 @@ def run_scenario(scenario, workload, indexes, selected_engines):
             else:
                 conn = connect_mysql(cfg)
             reset_table(conn, kind, indexes,
-                        with_orders=needs_orders, with_users_copy=needs_copy)
+                        with_orders=needs_orders, with_users_copy=needs_copy,
+                        with_json=needs_json)
             if scenario in PRELOADED_SCENARIOS or needs_orders or needs_copy:
                 preload_table(conn, workload)
             if needs_orders:
                 preload_orders(conn, workload)
+            if needs_json:
+                preload_json(conn, workload)
             SCENARIOS[scenario](conn, engine, kind, indexes, workload)
             conn.close()
         except Exception as exc:

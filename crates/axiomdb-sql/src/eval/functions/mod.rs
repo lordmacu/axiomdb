@@ -5,6 +5,7 @@ use crate::expr::Expr;
 
 mod binary;
 pub(crate) mod datetime;
+mod json;
 mod nulls;
 mod numeric;
 mod string;
@@ -51,6 +52,9 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         "from_base64" | "to_base64" | "encode" | "decode" | "mime_type" => {
             binary::eval(lower.as_str(), args, row)
         }
+
+        "json_extract" | "json_set" | "json_remove" | "json_keys" | "json_valid"
+        | "json_type" => json::eval(lower.as_str(), args, row),
 
         "gen_random_uuid" | "uuid_generate_v4" | "random_uuid" | "newid" | "uuid_generate_v7"
         | "uuid7" | "is_valid_uuid" | "is_uuid" => uuid::eval(lower.as_str(), args, row),

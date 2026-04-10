@@ -10,6 +10,7 @@ fn value_matches_type(value: &Value, target: DataType) -> bool {
             | (Value::Real(_), DataType::Real)
             | (Value::Decimal(..), DataType::Decimal)
             | (Value::Text(_), DataType::Text)
+            | (Value::Json(_), DataType::Json)
             | (Value::Bytes(_), DataType::Bytes)
             | (Value::Date(_), DataType::Date)
             | (Value::Timestamp(_), DataType::Timestamp)
