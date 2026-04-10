@@ -12,6 +12,7 @@ axiomdb-catalog = { workspace = true }
 axiomdb-index   = { workspace = true }
 axiomdb-storage = { workspace = true }
 axiomdb-wal     = { workspace = true }
+axiomdb-lock    = { workspace = true }
 thiserror       = { workspace = true }
 logos           = { workspace = true }
 rand            = { workspace = true }

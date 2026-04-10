@@ -49,7 +49,10 @@ pub use eval::{
     CollationGuard, NoSubquery, SubqueryRunner,
 };
 pub use exec_ctx::ExecutionContext;
-pub use executor::{execute, execute_read_only_with_ctx, execute_snapshot, execute_with_ctx};
+pub use executor::{
+    execute, execute_read_only_with_ctx, execute_snapshot, execute_with_ctx,
+    execute_with_ctx_locked,
+};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lexer::{tokenize, tokenize_with_sql_mode, Span, SpannedToken, Token};
 pub use session::{CompatMode, SessionCollation, SqlModeFlags};

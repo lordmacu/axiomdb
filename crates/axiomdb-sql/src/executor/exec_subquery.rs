@@ -526,7 +526,7 @@ impl<'a> SubqueryRunner for ExecSubqueryRunner<'a> {
         }
 
         let bound = substitute_outer(stmt.clone(), self.outer_row);
-        let exec_ctx = ExecutionContext::new(self.storage, self.txn, self.bloom);
+        let exec_ctx = ExecutionContext::new(self.storage, self.txn, self.bloom, None);
         let conn = self.ctx.conn_txn.take();
         let r = execute_select_ctx(bound, &exec_ctx, conn.as_ref(), self.ctx);
         self.ctx.conn_txn = conn;
@@ -775,7 +775,7 @@ fn apply_exists_semijoin(
     // Execute inner query once.
     let mut temp_ctx = SessionContext::new();
     let temp_bloom = crate::bloom::BloomRegistry::new();
-    let exec_ctx = ExecutionContext::new(storage, txn, &temp_bloom);
+    let exec_ctx = ExecutionContext::new(storage, txn, &temp_bloom, None);
     let result = execute_select_ctx(decorr.inner_stmt.clone(), &exec_ctx, None, &mut temp_ctx)?;
 
     // Build HashSet from the inner join key column.

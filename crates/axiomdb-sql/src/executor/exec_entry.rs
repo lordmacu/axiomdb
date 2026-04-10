@@ -25,7 +25,7 @@ pub fn execute_read_only_with_ctx(
     bloom: &crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
-    let exec_ctx = ExecutionContext::new(storage, txn, bloom);
+    let exec_ctx = ExecutionContext::new(storage, txn, bloom, None);
     match stmt {
         Stmt::Select(s) => {
             let conn = ctx.conn_txn.take();

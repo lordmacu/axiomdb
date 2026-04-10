@@ -5,11 +5,20 @@ pub fn execute_with_ctx(
     bloom: &crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
-    // Use new() (shared refs) so that txn/storage/bloom remain usable directly
-    // for begin/commit/rollback/savepoint calls below. The &mut borrows held by
-    // the caller guarantee exclusive access; the single-writer constraint (Phase 3)
-    // ensures storage()/coord()/bloom() are safe to call on this ctx.
-    let exec_ctx = ExecutionContext::new(storage, txn, bloom);
+    execute_with_ctx_locked(stmt, storage, txn, bloom, None, ctx)
+}
+
+/// Like [`execute_with_ctx`] but accepts an optional `LockManager` for
+/// row-level lock acquisition (Phase 40.11).
+pub fn execute_with_ctx_locked(
+    stmt: Stmt,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    bloom: &crate::bloom::BloomRegistry,
+    lock_mgr: Option<&axiomdb_lock::LockManager>,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let exec_ctx = ExecutionContext::new(storage, txn, bloom, lock_mgr);
     if ctx.conn_txn.is_some() {
         match &stmt {
             Stmt::Commit => {
@@ -93,7 +102,7 @@ pub fn execute_with_ctx(
             txn.release_immediate_committed_frees(storage, pre_tid)?;
             txn.drain_committed_page_batches(storage)?;
             ctx.conn_txn = Some(txn.begin()?);
-            let exec_ctx2 = ExecutionContext::new(storage, txn, bloom);
+            let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
             return match dispatch_ctx(stmt, &exec_ctx2, ctx) {
                 Ok(result) => {
                     let ddl_conn = ctx.conn_txn.take().expect("just set above");
@@ -190,7 +199,7 @@ pub fn execute_with_ctx(
                 // NOTE: `in_explicit_txn` is NOT set here — this is an implicit
                 // autocommit transaction. Single-statement INSERTs use the existing
                 // multi-row batch path inside execute_insert_ctx, not the staging buffer.
-                let exec_ctx2 = ExecutionContext::new(storage, txn, bloom);
+                let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
                 match dispatch_ctx(other, &exec_ctx2, ctx) {
                     Ok(result) => {
                         let conn = ctx.conn_txn.take().expect("just set above");
@@ -225,7 +234,7 @@ pub fn execute_with_ctx(
             }
             Stmt::Select(_) => {
                 ctx.conn_txn = Some(txn.begin()?);
-                let exec_ctx2 = ExecutionContext::new(storage, txn, bloom);
+                let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
                 match dispatch_ctx(stmt, &exec_ctx2, ctx) {
                     Ok(result) => {
                         let conn = ctx.conn_txn.take().expect("just set above");
@@ -241,7 +250,7 @@ pub fn execute_with_ctx(
             }
             other if is_ddl(&other) => {
                 ctx.conn_txn = Some(txn.begin()?);
-                let exec_ctx2 = ExecutionContext::new(storage, txn, bloom);
+                let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
                 match dispatch_ctx(other, &exec_ctx2, ctx) {
                     Ok(result) => {
                         let conn = ctx.conn_txn.take().expect("just set above");
@@ -264,7 +273,7 @@ pub fn execute_with_ctx(
                 } else {
                     None
                 };
-                let exec_ctx2 = ExecutionContext::new(storage, txn, bloom);
+                let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
                 match dispatch_ctx(other, &exec_ctx2, ctx) {
                     Ok(result) => Ok(result),
                     Err(e) => match ctx.on_error {

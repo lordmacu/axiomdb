@@ -25,13 +25,14 @@
 /// All three subsystems support shared (`&`) access, so `ExecutionContext` stores
 /// plain shared references with no unsafe required.
 ///
-/// ## Phase 40.11 extension
+/// ## Phase 40.11
 ///
-/// Adding `lock_mgr` requires one new field here — no further signature sweeps.
+/// `lock_mgr` added — `Option` so embedded mode and unit tests can pass `None`.
 pub struct ExecutionContext<'a> {
     storage: &'a dyn axiomdb_storage::StorageEngine,
     coord: &'a axiomdb_wal::TxnManager,
     bloom: &'a crate::bloom::BloomRegistry,
+    lock_mgr: Option<&'a axiomdb_lock::LockManager>,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -40,11 +41,13 @@ impl<'a> ExecutionContext<'a> {
         storage: &'a dyn axiomdb_storage::StorageEngine,
         coord: &'a axiomdb_wal::TxnManager,
         bloom: &'a crate::bloom::BloomRegistry,
+        lock_mgr: Option<&'a axiomdb_lock::LockManager>,
     ) -> Self {
         Self {
             storage,
             coord,
             bloom,
+            lock_mgr,
         }
     }
 
@@ -64,5 +67,14 @@ impl<'a> ExecutionContext<'a> {
     #[inline]
     pub fn bloom(&self) -> &'a crate::bloom::BloomRegistry {
         self.bloom
+    }
+
+    /// Returns a shared reference to the lock manager, if available.
+    ///
+    /// Returns `None` in embedded mode or unit tests without locking.
+    /// DML lock acquisition is gated on `Some`.
+    #[inline]
+    pub fn lock_manager(&self) -> Option<&'a axiomdb_lock::LockManager> {
+        self.lock_mgr
     }
 }
