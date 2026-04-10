@@ -67,8 +67,10 @@ pub(crate) fn build_index_root_from_existing_def(
     snap: TransactionSnapshot,
 ) -> Result<IndexBuildResult, DbError> {
     if idx.index_type != 0 {
-        return Err(DbError::NotImplemented {
-            feature: "ALTER TABLE index rebuild for non-BTree indexes".into(),
+        // BRIN indexes don't need rebuild via ALTER TABLE — they track summaries.
+        return Ok(IndexBuildResult {
+            root_page_id: idx.root_page_id,
+            skipped_key_too_long: 0,
         });
     }
     if table_def.is_clustered() {
@@ -189,17 +191,28 @@ fn execute_create_index(
         })
         .collect();
 
-    // 4. Allocate and initialize a fresh B-Tree leaf root page.
-    let root_page_id = storage.alloc_page(PageType::Index)?;
-    {
-        let mut page = Page::new(PageType::Index, root_page_id);
-        let leaf = cast_leaf_mut(&mut page);
-        leaf.is_leaf = 1;
-        leaf.set_num_keys(0);
-        leaf.set_next_leaf(NULL_PAGE);
-        page.update_checksum();
-        storage.write_page(root_page_id, &page)?;
-    }
+    // 4. Allocate root: B-Tree leaf page or BRIN metapage.
+    let is_brin = matches!(stmt.index_type, crate::ast::IndexType::Brin);
+    let root_page_id = if is_brin {
+        let pages_per_range = stmt.pages_per_range.unwrap_or(128);
+        let brin_col_idx = index_columns
+            .first()
+            .map(|c| c.col_idx)
+            .unwrap_or(0);
+        axiomdb_storage::brin::init_metapage(storage, pages_per_range, brin_col_idx)?
+    } else {
+        let pid = storage.alloc_page(PageType::Index)?;
+        {
+            let mut page = Page::new(PageType::Index, pid);
+            let leaf = cast_leaf_mut(&mut page);
+            leaf.is_leaf = 1;
+            leaf.set_num_keys(0);
+            leaf.set_next_leaf(NULL_PAGE);
+            page.update_checksum();
+            storage.write_page(pid, &page)?;
+        }
+        pid
+    };
     let root_pid = AtomicU64::new(root_page_id);
 
     // 5. Scan the table and insert existing rows into the B-Tree.
@@ -226,7 +239,50 @@ fn execute_create_index(
         TableEngine::scan_table(storage, &table_def, &col_defs, snap.clone(), None)?
     };
 
-    if table_def.is_clustered() {
+    // ── BRIN index build path (Phase 11.1b Step 4) ─────────────────────────
+    if is_brin {
+        let pages_per_range = stmt.pages_per_range.unwrap_or(128);
+        let brin_col_idx = index_columns
+            .first()
+            .map(|c| c.col_idx as usize)
+            .unwrap_or(0);
+
+        // Compute per-range min/max from existing rows.
+        let mut range_map: std::collections::BTreeMap<u32, axiomdb_storage::brin::BrinSummary> =
+            std::collections::BTreeMap::new();
+        for (rid, row_vals) in &rows {
+            let range_id = (rid.page_id / pages_per_range as u64) as u32;
+            let summary = range_map
+                .entry(range_id)
+                .or_insert_with(axiomdb_storage::brin::BrinSummary::empty);
+            let val = &row_vals[brin_col_idx];
+            if matches!(val, Value::Null) {
+                summary.add_null();
+            } else {
+                // Encode value as i64 for BRIN comparison.
+                let encoded = match val {
+                    Value::Int(v) => *v as i64,
+                    Value::BigInt(v) => *v,
+                    Value::Real(v) => v.to_bits() as i64,
+                    Value::Date(d) => *d as i64,
+                    Value::Timestamp(t) => *t,
+                    Value::Bool(b) => *b as i64,
+                    _ => continue, // non-numeric columns skip
+                };
+                summary.add_value(encoded);
+            }
+        }
+
+        // Write summaries to metapage.
+        let max_range = range_map.keys().copied().max().unwrap_or(0);
+        let mut summaries = vec![axiomdb_storage::brin::BrinSummary::empty(); max_range as usize + 1];
+        for (range_id, summary) in range_map {
+            summaries[range_id as usize] = summary;
+        }
+        axiomdb_storage::brin::write_summaries(storage, root_page_id, &summaries)?;
+
+        // Skip B-Tree build + bloom — BRIN doesn't use either.
+    } else if table_def.is_clustered() {
         // ── Clustered secondary index build ──────────────────────────────
         // Derive the physical key layout from the primary index so that every
         // secondary entry encodes as: secondary_cols ++ suffix_primary_cols.
@@ -360,10 +416,12 @@ fn execute_create_index(
         pages_per_range: stmt.pages_per_range.unwrap_or(128),
     })?;
 
-    // 7. Populate bloom filter for the newly created index.
-    bloom.create(new_index_id, bloom_keys.len().max(1));
-    for key in &bloom_keys {
-        bloom.add(new_index_id, key);
+    // 7. Populate bloom filter for the newly created index (B-Tree only).
+    if !is_brin {
+        bloom.create(new_index_id, bloom_keys.len().max(1));
+        for key in &bloom_keys {
+            bloom.add(new_index_id, key);
+        }
     }
 
     // 8. Bootstrap per-column statistics (Phase 6.10).

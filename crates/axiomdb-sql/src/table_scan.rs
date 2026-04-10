@@ -148,10 +148,37 @@ impl TableEngine {
     where
         F: FnMut(&[Value]) -> bool,
     {
+        Self::scan_table_filtered_brin(
+            storage, table_def, columns, snap, &mut predicate,
+            zone_map_pred, where_col_mask, batch_pred, None, 0,
+        )
+    }
+
+    /// Like `scan_table_filtered` but with optional BRIN range skip set.
+    ///
+    /// When `brin_ranges` is `Some`, only pages whose range_id
+    /// (`page_id / brin_ppr`) is in the set are scanned. Pages in
+    /// non-qualifying ranges are skipped entirely (Phase 11.1b).
+    #[expect(clippy::too_many_arguments, reason = "BRIN adds 2 params to existing 8-param scan")]
+    pub fn scan_table_filtered_brin<F>(
+        storage: &dyn StorageEngine,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        snap: TransactionSnapshot,
+        predicate: &mut F,
+        zone_map_pred: Option<(usize, &axiomdb_storage::zone_map::ZoneMapPredicate)>,
+        where_col_mask: Option<&[bool]>,
+        batch_pred: Option<&crate::eval::batch::BatchPredicate>,
+        brin_ranges: Option<&std::collections::HashSet<u32>>,
+        brin_ppr: u32,
+    ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError>
+    where
+        F: FnMut(&[Value]) -> bool,
+    {
         ensure_heap_table(table_def, "SELECT from clustered table — Phase 39.15")?;
         let col_types = column_data_types(columns);
         let has_two_phase = where_col_mask
-            .filter(|m| !m.iter().all(|&b| b)) // only if mask is selective
+            .filter(|m| !m.iter().all(|&b| b))
             .is_some();
         let mut result = Vec::new();
         let mut current = table_def.root_page_id;
@@ -163,6 +190,17 @@ impl TableEngine {
 
             if next != 0 {
                 storage.prefetch_hint(next, 1);
+            }
+
+            // BRIN range skip (Phase 11.1b).
+            if let Some(ranges) = brin_ranges {
+                if brin_ppr > 0 {
+                    let range_id = (current / brin_ppr as u64) as u32;
+                    if !ranges.contains(&range_id) {
+                        current = next;
+                        continue;
+                    }
+                }
             }
 
             // Zone map skip (Phase 8.3b).

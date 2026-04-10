@@ -136,14 +136,42 @@ pub fn insert_into_indexes_with_undo(
         .enumerate()
         .filter(|(_, i)| !i.columns.is_empty())
     {
+        // Phase 11.1b: BRIN indexes — update range summary, no B-Tree insert.
+        if idx.index_type == 1 {
+            let brin_col_idx = idx.columns[0].col_idx as usize;
+            let val = row.get(brin_col_idx).cloned().unwrap_or(Value::Null);
+            let is_null = matches!(val, Value::Null);
+            let encoded = if is_null {
+                0
+            } else {
+                match &val {
+                    Value::Int(v) => *v as i64,
+                    Value::BigInt(v) => *v,
+                    Value::Real(v) => v.to_bits() as i64,
+                    Value::Date(d) => *d as i64,
+                    Value::Timestamp(t) => *t,
+                    Value::Bool(b) => *b as i64,
+                    _ => continue, // non-numeric — skip BRIN update
+                }
+            };
+            let range_id = (rid.page_id / idx.pages_per_range as u64) as u32;
+            let _ = axiomdb_storage::brin::update_range_summary(
+                storage,
+                idx.root_page_id,
+                range_id,
+                encoded,
+                is_null,
+            );
+            continue;
+        }
+
         let original_root = idx.root_page_id;
         let mut current_root = original_root;
 
         // Partial index predicate check (Phase 6.7).
-        // compiled_preds[i] is None for full indexes OR when caller passes &[].
         if let Some(Some(pred)) = compiled_preds.get(i) {
             if !is_truthy(&eval(pred, row)?) {
-                continue; // row doesn't satisfy predicate → skip this index
+                continue;
             }
         }
 
