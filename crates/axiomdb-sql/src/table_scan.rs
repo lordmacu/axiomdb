@@ -65,9 +65,11 @@ impl TableEngine {
             let page = Page::from_bytes(raw)?;
             let next = heap_chain::chain_next_page(&page);
 
-            // Prefetch next page while processing current page's rows.
+            // Phase 11.9: prefetch 8 pages ahead (128 KB) while processing current.
+            // PostgreSQL uses effective_io_concurrency (default 256 KB lookahead).
+            // InnoDB reads 64 pages ahead for sequential scans (buf0rea.cc).
             if next != 0 {
-                storage.prefetch_hint(next, 1);
+                storage.prefetch_hint(next, 8);
             }
 
             let num = num_slots(&page);
@@ -190,8 +192,9 @@ impl TableEngine {
             let page = Page::from_bytes(raw)?;
             let next = heap_chain::chain_next_page(&page);
 
+            // Phase 11.9: prefetch 8 pages ahead for sequential scan.
             if next != 0 {
-                storage.prefetch_hint(next, 1);
+                storage.prefetch_hint(next, 8);
             }
 
             // BRIN range skip (Phase 11.1b).
