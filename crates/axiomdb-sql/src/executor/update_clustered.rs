@@ -458,9 +458,25 @@ fn apply_order_by_limit_to_clustered_update_candidates(
     order_by: &[OrderByItem],
     limit: Option<&Expr>,
 ) -> Result<Vec<ClusteredUpdateCandidate>, DbError> {
+    // Phase 11.11: Top-N optimization for clustered UPDATE.
+    let k = if let Some(limit_expr) = limit {
+        let n = eval(limit_expr, &[])?;
+        match n {
+            Value::Int(v) => Some(v.max(0) as usize),
+            Value::BigInt(v) => Some(v.max(0) as usize),
+            _ => {
+                return Err(DbError::InvalidValue {
+                    reason: "UPDATE … LIMIT must be an integer".into(),
+                })
+            }
+        }
+    } else {
+        None
+    };
+
     if !order_by.is_empty() {
         let mut sort_err: Option<DbError> = None;
-        candidates.sort_by(|a, b| {
+        let cmp = |a: &ClusteredUpdateCandidate, b: &ClusteredUpdateCandidate| {
             if sort_err.is_some() {
                 return std::cmp::Ordering::Equal;
             }
@@ -471,23 +487,36 @@ fn apply_order_by_limit_to_clustered_update_candidates(
                     std::cmp::Ordering::Equal
                 }
             }
-        });
-        if let Some(e) = sort_err {
-            return Err(e);
-        }
-    }
-    if let Some(limit_expr) = limit {
-        let n = eval(limit_expr, &[])?;
-        let n: usize = match n {
-            Value::Int(v) => v.max(0) as usize,
-            Value::BigInt(v) => v.max(0) as usize,
-            _ => {
-                return Err(DbError::InvalidValue {
-                    reason: "UPDATE … LIMIT must be an integer".into(),
-                })
-            }
         };
-        candidates.truncate(n);
+
+        if let Some(k) = k {
+            let k = k.min(candidates.len());
+            if k > 0 && k < candidates.len() {
+                candidates.select_nth_unstable_by(k - 1, cmp);
+                if let Some(e) = sort_err {
+                    return Err(e);
+                }
+                candidates.truncate(k);
+                candidates.sort_by(|a, b| {
+                    compare_rows_for_sort(&a.values, &b.values, order_by)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            } else {
+                candidates.sort_by(cmp);
+                if let Some(e) = sort_err {
+                    return Err(e);
+                }
+                candidates.truncate(k);
+            }
+        } else {
+            candidates.sort_by(cmp);
+            if let Some(e) = sort_err {
+                return Err(e);
+            }
+        }
+    } else if let Some(k) = k {
+        candidates.truncate(k);
     }
+
     Ok(candidates)
 }

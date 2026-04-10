@@ -915,37 +915,70 @@ fn apply_order_by_limit_to_candidates(
     order_by: &[OrderByItem],
     limit: Option<&Expr>,
 ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+    // Phase 11.11: Top-N optimization — O(n log k) instead of O(n log n).
+    // When ORDER BY + LIMIT are both present, use introselect to partition
+    // the k smallest candidates, then sort only those k.
+    // Same algorithm as apply_order_by_top_n() in shared.rs
+    // (PostgreSQL tuplesort.c bounded_sort pattern).
+    let k = if let Some(limit_expr) = limit {
+        let n = eval(limit_expr, &[])?;
+        match n {
+            Value::Int(v) => Some(v.max(0) as usize),
+            Value::BigInt(v) => Some(v.max(0) as usize),
+            _ => {
+                return Err(DbError::InvalidValue {
+                    reason: "ORDER BY … LIMIT must be an integer".into(),
+                })
+            }
+        }
+    } else {
+        None
+    };
+
     if !order_by.is_empty() {
         let mut sort_err: Option<DbError> = None;
-        candidates.sort_by(|(_, a_vals), (_, b_vals)| {
+        let cmp = |a: &(RecordId, Vec<Value>), b: &(RecordId, Vec<Value>)| {
             if sort_err.is_some() {
                 return std::cmp::Ordering::Equal;
             }
-            match compare_rows_for_sort(a_vals, b_vals, order_by) {
+            match compare_rows_for_sort(&a.1, &b.1, order_by) {
                 Ok(ord) => ord,
                 Err(e) => {
                     sort_err = Some(e);
                     std::cmp::Ordering::Equal
                 }
             }
-        });
-        if let Some(e) = sort_err {
-            return Err(e);
-        }
-    }
-    if let Some(limit_expr) = limit {
-        let n = eval(limit_expr, &[])?;
-        let n: usize = match n {
-            Value::Int(v) => v.max(0) as usize,
-            Value::BigInt(v) => v.max(0) as usize,
-            _ => {
-                return Err(DbError::InvalidValue {
-                    reason: "ORDER BY … LIMIT must be an integer".into(),
-                })
-            }
         };
-        candidates.truncate(n);
+
+        if let Some(k) = k {
+            let k = k.min(candidates.len());
+            if k > 0 && k < candidates.len() {
+                // Top-N: partition then sort only top-k.
+                candidates.select_nth_unstable_by(k - 1, cmp);
+                if let Some(e) = sort_err {
+                    return Err(e);
+                }
+                candidates.truncate(k);
+                candidates.sort_by(|a, b| {
+                    compare_rows_for_sort(&a.1, &b.1, order_by).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            } else {
+                candidates.sort_by(cmp);
+                if let Some(e) = sort_err {
+                    return Err(e);
+                }
+                candidates.truncate(k);
+            }
+        } else {
+            candidates.sort_by(cmp);
+            if let Some(e) = sort_err {
+                return Err(e);
+            }
+        }
+    } else if let Some(k) = k {
+        candidates.truncate(k);
     }
+
     Ok(candidates)
 }
 
@@ -954,9 +987,25 @@ fn apply_order_by_limit_to_clustered_candidates(
     order_by: &[OrderByItem],
     limit: Option<&Expr>,
 ) -> Result<Vec<ClusteredDeleteCandidate>, DbError> {
+    // Phase 11.11: Top-N optimization for clustered DELETE.
+    let k = if let Some(limit_expr) = limit {
+        let n = eval(limit_expr, &[])?;
+        match n {
+            Value::Int(v) => Some(v.max(0) as usize),
+            Value::BigInt(v) => Some(v.max(0) as usize),
+            _ => {
+                return Err(DbError::InvalidValue {
+                    reason: "DELETE … LIMIT must be an integer".into(),
+                })
+            }
+        }
+    } else {
+        None
+    };
+
     if !order_by.is_empty() {
         let mut sort_err: Option<DbError> = None;
-        candidates.sort_by(|a, b| {
+        let cmp = |a: &ClusteredDeleteCandidate, b: &ClusteredDeleteCandidate| {
             if sort_err.is_some() {
                 return std::cmp::Ordering::Equal;
             }
@@ -967,24 +1016,37 @@ fn apply_order_by_limit_to_clustered_candidates(
                     std::cmp::Ordering::Equal
                 }
             }
-        });
-        if let Some(e) = sort_err {
-            return Err(e);
-        }
-    }
-    if let Some(limit_expr) = limit {
-        let n = eval(limit_expr, &[])?;
-        let n: usize = match n {
-            Value::Int(v) => v.max(0) as usize,
-            Value::BigInt(v) => v.max(0) as usize,
-            _ => {
-                return Err(DbError::InvalidValue {
-                    reason: "DELETE … LIMIT must be an integer".into(),
-                })
-            }
         };
-        candidates.truncate(n);
+
+        if let Some(k) = k {
+            let k = k.min(candidates.len());
+            if k > 0 && k < candidates.len() {
+                candidates.select_nth_unstable_by(k - 1, cmp);
+                if let Some(e) = sort_err {
+                    return Err(e);
+                }
+                candidates.truncate(k);
+                candidates.sort_by(|a, b| {
+                    compare_rows_for_sort(&a.values, &b.values, order_by)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            } else {
+                candidates.sort_by(cmp);
+                if let Some(e) = sort_err {
+                    return Err(e);
+                }
+                candidates.truncate(k);
+            }
+        } else {
+            candidates.sort_by(cmp);
+            if let Some(e) = sort_err {
+                return Err(e);
+            }
+        }
+    } else if let Some(k) = k {
+        candidates.truncate(k);
     }
+
     Ok(candidates)
 }
 
