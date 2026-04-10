@@ -165,6 +165,31 @@ pub fn insert_into_indexes_with_undo(
             continue;
         }
 
+        // Phase 11.6: FTS inverted index — tokenize and insert term postings.
+        if idx.index_type == 3 {
+            let fts_col_idx = idx.columns[0].col_idx as usize;
+            let text = match row.get(fts_col_idx) {
+                Some(Value::Text(s)) | Some(Value::Json(s)) => s,
+                _ => continue,
+            };
+            let root_pid = std::sync::atomic::AtomicU64::new(idx.root_page_id);
+            let tokens = crate::tokenizer::tokenize(text);
+            for tok in &tokens {
+                let mut key = tok.term.as_bytes().to_vec();
+                key.push(0x00);
+                key.extend_from_slice(&rid.page_id.to_le_bytes());
+                key.extend_from_slice(&rid.slot_id.to_le_bytes());
+                key.extend_from_slice(&tok.position.to_le_bytes());
+                let _ =
+                    axiomdb_index::BTree::insert_in(storage, &root_pid, &key, rid, idx.fillfactor);
+            }
+            let new_root = root_pid.load(std::sync::atomic::Ordering::Acquire);
+            if new_root != idx.root_page_id {
+                updated_roots.push((idx.index_id, new_root));
+            }
+            continue;
+        }
+
         // Phase 11.4b: Trigram indexes — extract n-grams and insert into B-Tree.
         if idx.index_type == 2 {
             let trgm_col_idx = idx.columns[0].col_idx as usize;

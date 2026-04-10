@@ -194,6 +194,7 @@ fn execute_create_index(
     // 4. Allocate root: B-Tree leaf page, BRIN metapage, or Trigram B-Tree.
     let is_brin = matches!(stmt.index_type, crate::ast::IndexType::Brin);
     let is_trigram = matches!(stmt.index_type, crate::ast::IndexType::Trigram);
+    let is_fts = matches!(stmt.index_type, crate::ast::IndexType::FullText);
     let root_page_id = if is_brin {
         let pages_per_range = stmt.pages_per_range.unwrap_or(128);
         let brin_col_idx = index_columns
@@ -301,6 +302,37 @@ fn execute_create_index(
             }
         }
         // Skip regular bloom for trigram.
+    } else if is_fts {
+        // ── FTS inverted index build (Phase 11.6) ────────────────────────
+        // Tokenize each row's text value, insert (term || docid || position)
+        // keys into B-Tree. Also track document lengths for BM25.
+        let fts_col_idx = index_columns.first().map(|c| c.col_idx as usize).unwrap_or(0);
+        let mut total_tokens: u64 = 0;
+        let mut doc_count: u64 = 0;
+        for (rid, row_vals) in &rows {
+            let text = match row_vals.get(fts_col_idx) {
+                Some(Value::Text(s)) | Some(Value::Json(s)) => s,
+                _ => continue,
+            };
+            let tokens = crate::tokenizer::tokenize(text);
+            if tokens.is_empty() {
+                continue;
+            }
+            total_tokens += tokens.len() as u64;
+            doc_count += 1;
+            for tok in &tokens {
+                // Key: term_bytes + docid(page_id:slot_id) + position
+                let mut key = tok.term.as_bytes().to_vec();
+                key.push(0x00); // null separator between term and docid
+                key.extend_from_slice(&rid.page_id.to_le_bytes());
+                key.extend_from_slice(&rid.slot_id.to_le_bytes());
+                key.extend_from_slice(&tok.position.to_le_bytes());
+                BTree::insert_in(storage, &root_pid, &key, *rid, index_fillfactor)?;
+            }
+        }
+        // TODO: store doc_count + total_tokens in index metadata for BM25 avgdl.
+        let _ = (doc_count, total_tokens);
+        // Skip regular bloom for FTS.
     } else if table_def.is_clustered() {
         // ── Clustered secondary index build ──────────────────────────────
         // Derive the physical key layout from the primary index so that every
@@ -432,6 +464,7 @@ fn execute_create_index(
             crate::ast::IndexType::BTree => 0,
             crate::ast::IndexType::Brin => 1,
             crate::ast::IndexType::Trigram => 2,
+            crate::ast::IndexType::FullText => 3,
         },
         pages_per_range: stmt.pages_per_range.unwrap_or(128),
     })?;
