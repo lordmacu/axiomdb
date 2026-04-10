@@ -349,6 +349,10 @@ pub enum IndexType {
     /// 100× smaller than B-Tree for naturally ordered columns (timestamps, IDs).
     /// PostgreSQL-compatible: `CREATE INDEX ... USING brin`.
     Brin,
+    /// Trigram — 3-character n-gram inverted index for substring search.
+    /// `WHERE col LIKE '%pattern%'` uses trigram index to narrow candidates.
+    /// Built-in (PostgreSQL requires pg_trgm extension).
+    Trigram,
 }
 
 /// `CREATE [UNIQUE] INDEX`

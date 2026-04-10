@@ -33,6 +33,7 @@ pub mod schema_cache;
 pub mod session;
 pub mod table;
 pub mod text_semantics;
+pub mod trigram;
 pub mod vacuum;
 
 pub use ast::{
