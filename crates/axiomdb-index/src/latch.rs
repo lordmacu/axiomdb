@@ -51,6 +51,7 @@
 /// Determines whether to acquire shared (S) or exclusive (X) latches
 /// at each level of the tree. See module-level docs for details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum TreeLatchMode {
     /// Read-only descent: S-latch coupling.
     #[allow(dead_code)]

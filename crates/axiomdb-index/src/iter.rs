@@ -12,7 +12,7 @@
 use std::ops::Bound;
 
 use axiomdb_core::{error::DbError, RecordId};
-use axiomdb_storage::StorageEngine;
+use axiomdb_storage::{page_lock::PageReadGuard, StorageEngine};
 
 use crate::page_layout::{cast_leaf, NULL_PAGE};
 
@@ -28,6 +28,7 @@ const PREFETCH_DEPTH: u64 = 4;
 pub struct RangeIter<'a> {
     storage: &'a dyn StorageEngine,
     current_pid: u64,
+    current_latch: Option<PageReadGuard>,
     /// Cached next_leaf pointer — avoids double-reading the current page
     /// when the leaf is exhausted. Set to `NULL_PAGE` when unknown.
     next_leaf_cache: u64,
@@ -48,6 +49,7 @@ impl<'a> RangeIter<'a> {
         Self {
             storage,
             current_pid: start_pid,
+            current_latch: None,
             next_leaf_cache: NULL_PAGE,
             slot_idx: 0,
             from,
@@ -86,24 +88,22 @@ impl<'a> Iterator for RangeIter<'a> {
         loop {
             if self.current_pid == NULL_PAGE {
                 self.done = true;
+                self.current_latch = None;
                 return None;
             }
 
-            // Read the leaf and find the next in-range slot.
-            // The block ensures the borrow of `page` expires before `find_next_leaf`.
+            if self.current_latch.is_none() {
+                self.current_latch = Some(self.storage.page_lock_table().read(self.current_pid));
+            }
+
             enum SlotResult {
                 Found(Vec<u8>, RecordId),
                 Before,
                 After,
-                Exhausted,
+                Exhausted(u64),
             }
 
             let result = {
-                // Phase 40.8: S-latch the current leaf before reading.
-                // The latch is dropped at the end of this block (before
-                // acquiring the next leaf's latch), preventing the
-                // deadlock of holding two leaf S-latches simultaneously.
-                let _latch = self.storage.page_lock_table().read(self.current_pid);
                 let page = match self.storage.read_page(self.current_pid) {
                     Ok(p) => p,
                     Err(e) => return Some(Err(e)),
@@ -111,15 +111,12 @@ impl<'a> Iterator for RangeIter<'a> {
                 let node = cast_leaf(&page);
                 let num = node.num_keys();
 
-                // Cache next_leaf on first access to this page — avoids
-                // double-reading when the leaf is exhausted (was the #1
-                // redundant I/O in the old iterator).
                 if self.next_leaf_cache == NULL_PAGE && self.slot_idx == 0 {
                     self.next_leaf_cache = node.next_leaf_val();
                 }
 
                 if self.slot_idx >= num {
-                    SlotResult::Exhausted
+                    SlotResult::Exhausted(self.next_leaf_cache)
                 } else {
                     let key = node.key_at(self.slot_idx).to_vec();
                     let rid = node.rid_at(self.slot_idx);
@@ -139,28 +136,37 @@ impl<'a> Iterator for RangeIter<'a> {
                 SlotResult::Before => continue,
                 SlotResult::After => {
                     self.done = true;
+                    self.current_latch = None;
                     return None;
                 }
                 SlotResult::Found(key, rid) => {
                     return Some(Ok((key, rid)));
                 }
-                SlotResult::Exhausted => {
-                    // Phase 7.9: follow cached next_leaf pointer (O(1)).
-                    let next_pid = self.next_leaf_cache;
-
+                SlotResult::Exhausted(next_pid) => {
                     if next_pid == NULL_PAGE {
                         self.done = true;
+                        self.current_latch = None;
                         return None;
                     }
 
-                    // Phase 9.8 gap closure: prefetch next PREFETCH_DEPTH
-                    // leaves ahead (MariaDB buf_read_ahead_linear pattern).
-                    // Hints the OS/mmap to fault-in pages while we process
-                    // the current one — overlaps I/O with computation.
                     self.storage.prefetch_hint(next_pid, PREFETCH_DEPTH);
+                    let next_guard = match self.storage.page_lock_table().try_read(next_pid) {
+                        Some(guard) => {
+                            let old_guard = self.current_latch.replace(guard);
+                            drop(old_guard);
+                            None
+                        }
+                        None => {
+                            self.current_latch = None;
+                            Some(self.storage.page_lock_table().read(next_pid))
+                        }
+                    };
+                    if let Some(guard) = next_guard {
+                        self.current_latch = Some(guard);
+                    }
 
                     self.current_pid = next_pid;
-                    self.next_leaf_cache = NULL_PAGE; // reset for next page
+                    self.next_leaf_cache = NULL_PAGE;
                     self.slot_idx = 0;
                 }
             }
@@ -218,9 +224,23 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
-        assert_eq!(results.len(), 11);
         assert_eq!(results.first().unwrap().0, b"0010");
         assert_eq!(results.last().unwrap().0, b"0020");
+        assert_eq!(results.len(), 11);
+    }
+
+    #[test]
+    fn test_range_excluded_upper() {
+        let tree = build_tree(20);
+        let results: Vec<_> = tree
+            .range(Bound::Included(b"0005"), Bound::Excluded(b"0010"))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let keys: Vec<_> = results.into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys.len(), 5);
+        assert_eq!(keys[0], b"0005");
+        assert_eq!(keys[4], b"0009");
     }
 
     #[test]
@@ -283,7 +303,6 @@ mod tests {
 
     #[test]
     fn test_range_spans_multiple_leaves() {
-        // Use enough keys to force multiple leaves
         let count = 500;
         let tree = build_tree(count);
         let results: Vec<_> = tree

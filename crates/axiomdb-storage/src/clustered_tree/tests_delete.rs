@@ -554,3 +554,65 @@ fn update_with_relocation_reinserts_row_after_same_leaf_failure() {
     );
 }
 
+/// Phase 40.8c: a delete that flows through the early-X-latch-release branch
+/// of `delete_physical_subtree`. The leaves are kept comfortably above the
+/// underfull byte threshold so the safe-descent predicate engages, and we
+/// then verify the result is identical to the pessimistic path.
+#[test]
+fn delete_physical_through_safe_descent_keeps_tree_consistent() {
+    let mut storage = MemoryStorage::new();
+    let mut root = None;
+
+    let count = 128u32;
+    let payload_len = 800usize;
+    for key in 0..count {
+        root = Some(
+            insert(
+                &mut storage,
+                root,
+                &key.to_be_bytes(),
+                &row_header(1),
+                &vec![key as u8; payload_len],
+            )
+            .unwrap(),
+        );
+    }
+    let root = root.unwrap();
+    assert_eq!(
+        clustered_page_type(&storage.read_page(root).unwrap()).unwrap(),
+        PageType::ClusteredInternal,
+        "test requires an internal root so the descent has at least one early-release opportunity"
+    );
+
+    // Delete a key well inside a populated leaf — the leaf still has many
+    // hundreds of bytes used after the removal, so it stays well above the
+    // underfull threshold. This makes the descent's safe-child predicate
+    // hold and exercises the early-release branch.
+    let target_key = (count / 2).to_be_bytes();
+    let (deleted, root_after) = delete_physical(&mut storage, root, &target_key).unwrap();
+    assert!(deleted, "target key must exist before delete");
+    assert_eq!(root_after, root, "non-collapsing delete must keep the root pid stable");
+
+    // Every other key still reachable, in order.
+    let keys = collect_leaf_chain_keys(&storage, root_after).unwrap();
+    let expected: Vec<Vec<u8>> = (0u32..count)
+        .filter(|k| *k != count / 2)
+        .map(|k| k.to_be_bytes().to_vec())
+        .collect();
+    assert_eq!(keys, expected);
+
+    let snap = committed_snapshot(10);
+    assert!(
+        lookup(&storage, Some(root_after), &target_key, &snap)
+            .unwrap()
+            .is_none(),
+        "deleted key must not be reachable"
+    );
+    for k in [0u32, count / 4, count - 1] {
+        let row = lookup(&storage, Some(root_after), &k.to_be_bytes(), &snap)
+            .unwrap()
+            .unwrap_or_else(|| panic!("key {k} should still be reachable"));
+        assert_eq!(row.row_data.len(), payload_len);
+    }
+}
+

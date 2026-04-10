@@ -99,6 +99,90 @@ pub(super) fn internal_underfull(page: &Page) -> bool {
     used * 4 < clustered_internal::page_capacity_bytes()
 }
 
+/// Phase 40.8c: returns `true` when the descent into `child_pid` from a
+/// pessimistic insert is guaranteed not to require an update on the parent
+/// of `child_pid` (no upward split propagation).
+///
+/// The clustered B-tree never changes a page's pid on split (the old page
+/// stays as the left half) so the only reason a parent latch must outlive
+/// the recursion is to absorb a propagated separator. The check verifies
+/// that the immediate child has at least the worst-case footprint of the
+/// new entry available in `free_space`, doubled as headroom to cover the
+/// fact that the propagated separator might be slightly larger than the
+/// inserted key (the median promotion picks among existing leaf keys).
+pub(super) fn child_is_safe_for_insert(
+    storage: &dyn StorageEngine,
+    child_pid: u64,
+    key: &[u8],
+    row_data_len: usize,
+) -> Result<bool, DbError> {
+    let page = storage.read_page(child_pid)?;
+    match clustered_page_type(&page)? {
+        PageType::ClusteredLeaf => {
+            let needed = clustered_leaf::cell_footprint(key.len(), row_data_len);
+            // Require 2× headroom so the in-place fast path stays viable even
+            // when subsequent inserts to this leaf approach the byte limit.
+            Ok(clustered_leaf::free_space(&page) >= needed.saturating_mul(2))
+        }
+        PageType::ClusteredInternal => {
+            // Internal child must absorb a propagated separator, whose key
+            // bytes are bounded above by the longest key in its subtree. We
+            // approximate that with the inserted key length plus a generous
+            // margin and then double the requirement so that even an
+            // unexpectedly large separator (or a follow-up split) does not
+            // turn this descent into a parent rewrite.
+            let estimated_sep_len = key.len().saturating_add(64);
+            let needed = clustered_internal::separator_footprint(estimated_sep_len);
+            Ok(clustered_internal::free_space(&page) >= needed.saturating_mul(2))
+        }
+        other => Err(DbError::BTreeCorrupted {
+            msg: format!(
+                "clustered tree safety check encountered unsupported page type {other:?} at page {child_pid}"
+            ),
+        }),
+    }
+}
+
+/// Phase 40.8c: returns `true` when the descent into `child_pid` from a
+/// pessimistic delete is guaranteed not to require an update on the parent
+/// of `child_pid` (no upward rebalance propagation).
+///
+/// In the clustered B-tree, leaves and internals never change pid on
+/// rebalance/merge (left page is reused). The only thing that propagates
+/// upward is `underfull = true`, which triggers `rebalance_child` on the
+/// parent. To make sure the recursion does not surface that signal, we
+/// require the child to be **comfortably** above the underfull byte
+/// threshold (used > capacity/2 for both leaf and internal pages).
+pub(super) fn child_is_safe_for_delete(
+    storage: &dyn StorageEngine,
+    child_pid: u64,
+) -> Result<bool, DbError> {
+    let page = storage.read_page(child_pid)?;
+    match clustered_page_type(&page)? {
+        PageType::ClusteredLeaf => {
+            let cap = clustered_leaf::page_capacity_bytes();
+            let used = cap.saturating_sub(clustered_leaf::free_space(&page));
+            // Underfull is `used * 4 < cap`, i.e., `used < cap/4`.
+            // Require `used > cap/2` so even after losing one cell the page
+            // remains comfortably above the underfull threshold.
+            Ok(used.saturating_mul(2) > cap)
+        }
+        PageType::ClusteredInternal => {
+            // Internal nodes also rebalance based on byte occupancy, but the
+            // safety analysis must additionally rule out a deeper underflow
+            // surfacing back into this child. Restricting early release to
+            // **leaf** children avoids walking the subtree while still
+            // covering the most common bottom-of-tree descent pattern.
+            Ok(false)
+        }
+        other => Err(DbError::BTreeCorrupted {
+            msg: format!(
+                "clustered tree delete safety check encountered unsupported page type {other:?} at page {child_pid}"
+            ),
+        }),
+    }
+}
+
 pub(super) fn choose_leaf_split_idx(cells: &[OwnedLeafCell]) -> usize {
     debug_assert!(cells.len() >= 2);
     let footprints: Vec<usize> = cells

@@ -12,6 +12,7 @@ use crate::{
     clustered_internal, clustered_leaf, clustered_overflow,
     heap::RowHeader,
     page::{Page, PageType},
+    page_lock::PageReadGuard,
     StorageEngine,
 };
 
@@ -73,12 +74,98 @@ pub struct RightmostAppendRow<'a> {
 pub struct ClusteredRangeIter<'a> {
     storage: &'a dyn StorageEngine,
     current_pid: u64,
+    current_latch: Option<PageReadGuard>,
     next_leaf_cache: u64,
     slot_idx: usize,
     from: Bound<Vec<u8>>,
     to: Bound<Vec<u8>>,
     snapshot: TransactionSnapshot,
     done: bool,
+}
+
+fn free_overflow_chain_if_any(
+    storage: &mut dyn StorageEngine,
+    first_page: Option<u64>,
+) -> Result<(), DbError> {
+    if let Some(first_page) = first_page {
+        clustered_overflow::free_chain(storage, first_page)?;
+    }
+    Ok(())
+}
+
+fn try_insert_leaf_optimistically(
+    storage: &mut dyn StorageEngine,
+    root_pid: u64,
+    key: &[u8],
+    row_header: &RowHeader,
+    row_data: &[u8],
+) -> Result<Option<u64>, DbError> {
+    let leaf_pid = descend_to_leaf(storage, root_pid, key)?.header().page_id;
+    let _leaf_guard = storage.page_lock_table().write(leaf_pid);
+    let mut page = storage.read_page(leaf_pid)?.into_page();
+
+    match clustered_page_type(&page)? {
+        PageType::ClusteredLeaf => {}
+        other => {
+            return Err(DbError::BTreeCorrupted {
+                msg: format!(
+                    "clustered optimistic insert expected leaf at page {leaf_pid}, found {other:?}"
+                ),
+            });
+        }
+    }
+
+    let insert_pos = match leaf_search_checked(&page, key)? {
+        Ok(_) => return Err(DbError::DuplicateKey),
+        Err(pos) => pos,
+    };
+
+    let cell = materialize_leaf_cell(storage, key, row_header, row_data)?;
+    match clustered_leaf::insert_cell_with_overflow(
+        &mut page,
+        insert_pos,
+        &cell.key,
+        &cell.row_header,
+        cell.total_row_len,
+        &cell.local_row_data,
+        cell.overflow_first_page,
+    ) {
+        Ok(()) => {
+            page.update_checksum();
+            storage.write_page_under_page_lock(leaf_pid, &page)?;
+            Ok(Some(root_pid))
+        }
+        Err(DbError::HeapPageFull { .. }) => {
+            clustered_leaf::defragment(&mut page);
+            match clustered_leaf::insert_cell_with_overflow(
+                &mut page,
+                insert_pos,
+                &cell.key,
+                &cell.row_header,
+                cell.total_row_len,
+                &cell.local_row_data,
+                cell.overflow_first_page,
+            ) {
+                Ok(()) => {
+                    page.update_checksum();
+                    storage.write_page_under_page_lock(leaf_pid, &page)?;
+                    Ok(Some(root_pid))
+                }
+                Err(DbError::HeapPageFull { .. }) => {
+                    free_overflow_chain_if_any(storage, cell.overflow_first_page)?;
+                    Ok(None)
+                }
+                Err(err) => {
+                    free_overflow_chain_if_any(storage, cell.overflow_first_page)?;
+                    Err(err)
+                }
+            }
+        }
+        Err(err) => {
+            free_overflow_chain_if_any(storage, cell.overflow_first_page)?;
+            Err(err)
+        }
+    }
 }
 
 /// Inserts one full row into a clustered B-tree and returns the effective root
@@ -93,17 +180,25 @@ pub fn insert(
     validate_row_payload(key, row_data)?;
 
     match root_pid {
-        Some(pid) => match insert_subtree(storage, pid, key, row_header, row_data)? {
-            InsertResult::Inserted => Ok(pid),
-            InsertResult::Split { sep_key, right_pid } => {
-                let new_root_pid = storage.alloc_page(PageType::ClusteredInternal)?;
-                let mut new_root = Page::new(PageType::ClusteredInternal, new_root_pid);
-                clustered_internal::init_clustered_internal(&mut new_root, pid);
-                clustered_internal::insert_at(&mut new_root, 0, &sep_key, right_pid)?;
-                write_page(storage, new_root_pid, &mut new_root)?;
-                Ok(new_root_pid)
+        Some(pid) => {
+            if let Some(root_after_insert) =
+                try_insert_leaf_optimistically(storage, pid, key, row_header, row_data)?
+            {
+                return Ok(root_after_insert);
             }
-        },
+
+            match insert_subtree(storage, pid, key, row_header, row_data)? {
+                InsertResult::Inserted => Ok(pid),
+                InsertResult::Split { sep_key, right_pid } => {
+                    let new_root_pid = storage.alloc_page(PageType::ClusteredInternal)?;
+                    let mut new_root = Page::new(PageType::ClusteredInternal, new_root_pid);
+                    clustered_internal::init_clustered_internal(&mut new_root, pid);
+                    clustered_internal::insert_at(&mut new_root, 0, &sep_key, right_pid)?;
+                    write_page(storage, new_root_pid, &mut new_root)?;
+                    Ok(new_root_pid)
+                }
+            }
+        }
         None => {
             let cell = materialize_leaf_cell(storage, key, row_header, row_data)?;
             let root_pid = storage.alloc_page(PageType::ClusteredLeaf)?;
@@ -143,6 +238,7 @@ pub fn try_insert_rightmost_leaf(
 ) -> Result<bool, DbError> {
     validate_row_payload(key, row_data)?;
 
+    let _leaf_guard = storage.page_lock_table().write(hinted_leaf_pid);
     let page_ref = storage.read_page(hinted_leaf_pid)?;
     if clustered_page_type(&page_ref)? != PageType::ClusteredLeaf {
         return Ok(false);
@@ -182,7 +278,8 @@ pub fn try_insert_rightmost_leaf(
         cell.overflow_first_page,
     ) {
         Ok(()) => {
-            write_page(storage, hinted_leaf_pid, &mut page)?;
+            page.update_checksum();
+            storage.write_page_under_page_lock(hinted_leaf_pid, &page)?;
             Ok(true)
         }
         Err(DbError::HeapPageFull { .. }) => {
@@ -197,7 +294,8 @@ pub fn try_insert_rightmost_leaf(
                 cell.overflow_first_page,
             ) {
                 Ok(()) => {
-                    write_page(storage, hinted_leaf_pid, &mut page)?;
+                    page.update_checksum();
+                    storage.write_page_under_page_lock(hinted_leaf_pid, &page)?;
                     Ok(true)
                 }
                 Err(DbError::HeapPageFull { .. }) => {
@@ -231,6 +329,7 @@ pub fn try_insert_rightmost_leaf_batch(
         return Ok(0);
     }
 
+    let _leaf_guard = storage.page_lock_table().write(hinted_leaf_pid);
     let page_ref = storage.read_page(hinted_leaf_pid)?;
     if clustered_page_type(&page_ref)? != PageType::ClusteredLeaf {
         return Ok(0);
@@ -322,7 +421,8 @@ pub fn try_insert_rightmost_leaf_batch(
     }
 
     if inserted > 0 {
-        write_page(storage, hinted_leaf_pid, &mut page)?;
+        page.update_checksum();
+        storage.write_page_under_page_lock(hinted_leaf_pid, &page)?;
     }
 
     Ok(inserted)
@@ -415,6 +515,7 @@ pub fn range<'a>(
     Ok(ClusteredRangeIter {
         storage,
         current_pid,
+        current_latch: None,
         next_leaf_cache: clustered_leaf::NULL_PAGE,
         slot_idx,
         from,
@@ -451,9 +552,14 @@ where
     };
 
     let mut current_pid = leftmost_leaf_pid(storage, root_pid)?;
+    let mut current_latch = None;
     let mut next_leaf_cache = clustered_leaf::NULL_PAGE;
 
     while current_pid != clustered_leaf::NULL_PAGE {
+        if current_latch.is_none() {
+            current_latch = Some(storage.page_lock_table().read(current_pid));
+        }
+
         let page = storage.read_page(current_pid)?;
 
         match clustered_page_type(&page)? {
@@ -492,6 +598,22 @@ where
         let next_pid = next_leaf_cache;
         if next_pid != clustered_leaf::NULL_PAGE {
             storage.prefetch_hint(next_pid, PREFETCH_DEPTH);
+            let next_guard = match storage.page_lock_table().try_read(next_pid) {
+                Some(guard) => {
+                    let old_guard = current_latch.replace(guard);
+                    drop(old_guard);
+                    None
+                }
+                None => {
+                    current_latch = None;
+                    Some(storage.page_lock_table().read(next_pid))
+                }
+            };
+            if let Some(guard) = next_guard {
+                current_latch = Some(guard);
+            }
+        } else {
+            current_latch = None;
         }
         current_pid = next_pid;
         next_leaf_cache = clustered_leaf::NULL_PAGE;
@@ -516,14 +638,17 @@ pub fn update_in_place(
         return Ok(false);
     };
 
-    let leaf_ref = descend_to_leaf(storage, root_pid, key)?;
-    let pos = match leaf_search_checked(&leaf_ref, key)? {
+    let leaf_pid = descend_to_leaf(storage, root_pid, key)?.header().page_id;
+    let _leaf_guard = storage.page_lock_table().write(leaf_pid);
+    let mut page = storage.read_page(leaf_pid)?.into_page();
+
+    let pos = match leaf_search_checked(&page, key)? {
         Ok(pos) => pos,
         Err(_) => return Ok(false),
     };
 
     let (old_header, old_total_row_len, old_overflow_first_page) = {
-        let cell = clustered_leaf::read_cell(&leaf_ref, pos as u16)?;
+        let cell = clustered_leaf::read_cell(&page, pos as u16)?;
         if !cell.row_header.is_visible(snapshot) {
             return Ok(false);
         }
@@ -542,8 +667,6 @@ pub fn update_in_place(
     };
     let new_cell = materialize_leaf_cell(storage, key, &new_header, new_row_data)?;
 
-    let mut page = leaf_ref.into_page();
-    let page_id = page.header().page_id;
     let available = clustered_leaf::free_space(&page)
         + clustered_leaf::cell_footprint(key.len(), old_total_row_len);
     let needed = clustered_leaf::cell_footprint(key.len(), new_row_data.len());
@@ -558,18 +681,17 @@ pub fn update_in_place(
         new_cell.overflow_first_page,
     )? {
         Some(_) => {
-            write_page(storage, page_id, &mut page)?;
+            page.update_checksum();
+            storage.write_page_under_page_lock(leaf_pid, &page)?;
             if let Some(first_page) = old_overflow_first_page {
                 clustered_overflow::free_chain(storage, first_page)?;
             }
             Ok(true)
         }
         None => {
-            if let Some(first_page) = new_cell.overflow_first_page {
-                clustered_overflow::free_chain(storage, first_page)?;
-            }
+            free_overflow_chain_if_any(storage, new_cell.overflow_first_page)?;
             Err(DbError::HeapPageFull {
-                page_id,
+                page_id: leaf_pid,
                 needed,
                 available,
             })
@@ -590,14 +712,17 @@ pub fn delete_mark(
         return Ok(false);
     };
 
-    let leaf_ref = descend_to_leaf(storage, root_pid, key)?;
-    let pos = match leaf_search_checked(&leaf_ref, key)? {
+    let leaf_pid = descend_to_leaf(storage, root_pid, key)?.header().page_id;
+    let _leaf_guard = storage.page_lock_table().write(leaf_pid);
+    let mut page = storage.read_page(leaf_pid)?.into_page();
+
+    let pos = match leaf_search_checked(&page, key)? {
         Ok(pos) => pos,
         Err(_) => return Ok(false),
     };
 
     let (old_header, old_total_row_len, old_local_row_data, old_overflow_first_page) = {
-        let cell = clustered_leaf::read_cell(&leaf_ref, pos as u16)?;
+        let cell = clustered_leaf::read_cell(&page, pos as u16)?;
         if !cell.row_header.is_visible(snapshot) {
             return Ok(false);
         }
@@ -609,8 +734,6 @@ pub fn delete_mark(
         )
     };
 
-    let mut page = leaf_ref.into_page();
-    let page_id = page.header().page_id;
     let new_header = RowHeader {
         txn_id_created: old_header.txn_id_created,
         txn_id_deleted: txn_id,
@@ -628,12 +751,13 @@ pub fn delete_mark(
         old_overflow_first_page,
     )? {
         Some(_) => {
-            write_page(storage, page_id, &mut page)?;
+            page.update_checksum();
+            storage.write_page_under_page_lock(leaf_pid, &page)?;
             Ok(true)
         }
         None => Err(DbError::BTreeCorrupted {
             msg: format!(
-                "clustered delete-mark unexpectedly required a page rebuild failure at page {page_id}"
+                "clustered delete-mark unexpectedly required a page rebuild failure at page {leaf_pid}"
             ),
         }),
     }

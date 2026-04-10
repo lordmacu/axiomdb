@@ -375,6 +375,46 @@ impl axiomdb_storage::StorageEngine for CountingStorage {
     }
 }
 
+#[derive(Clone)]
+struct SharedMemoryStorage {
+    inner: Arc<MemoryStorage>,
+}
+
+impl StorageEngine for SharedMemoryStorage {
+    fn alloc_page(&self, t: PageType) -> Result<u64, axiomdb_core::error::DbError> {
+        self.inner.alloc_page(t)
+    }
+    fn free_page(&self, id: u64) -> Result<(), axiomdb_core::error::DbError> {
+        self.inner.free_page(id)
+    }
+    fn read_page(&self, id: u64) -> Result<axiomdb_storage::PageRef, axiomdb_core::error::DbError> {
+        self.inner.read_page(id)
+    }
+    fn write_page(
+        &self,
+        id: u64,
+        p: &axiomdb_storage::Page,
+    ) -> Result<(), axiomdb_core::error::DbError> {
+        self.inner.write_page(id, p)
+    }
+    fn write_page_under_page_lock(
+        &self,
+        id: u64,
+        p: &axiomdb_storage::Page,
+    ) -> Result<(), axiomdb_core::error::DbError> {
+        self.inner.write_page_under_page_lock(id, p)
+    }
+    fn page_count(&self) -> u64 {
+        self.inner.page_count()
+    }
+    fn flush(&self) -> Result<(), axiomdb_core::error::DbError> {
+        self.inner.flush()
+    }
+    fn page_lock_table(&self) -> &axiomdb_storage::page_lock::PageLockTable {
+        self.inner.page_lock_table()
+    }
+}
+
 #[test]
 fn test_no_split_insert_same_page_id() {
     // A no-split insert must return the same leaf page ID it started with.
@@ -645,4 +685,198 @@ fn test_delete_many_in_can_collapse_root_to_leaf() {
     let rows = BTree::range_in(&storage, final_root, None, None).unwrap();
     let ids: Vec<u64> = rows.into_iter().map(|(rid, _)| rid.page_id).collect();
     assert_eq!(ids, (0u64..10).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_concurrent_insert_in_eight_threads_all_keys_reachable() {
+    // Phase 40.8: 8 threads × 10K inserts (= 80K total). Matches the stress
+    // scenario in specs/fase-40/spec-40.8-btree-latch-coupling.md and
+    // exercises the early X-latch release optimization on every safe
+    // descent.
+    //
+    // NOTE: this test does NOT spawn a concurrent reader against the same
+    // tree because Phase 40.8 still defers safe root republication across
+    // root splits (see the DEFERRED section of the spec). A separate test
+    // (`test_concurrent_readers_during_inserts_no_lost_keys`) exercises the
+    // reader/writer interaction on a pre-populated tree where the root
+    // never changes during the run.
+    let storage = SharedMemoryStorage {
+        inner: Arc::new(MemoryStorage::new()),
+    };
+    let mut init_storage = storage.clone();
+    let root_pid = Arc::new(init_raw_root(&mut init_storage));
+
+    let threads = 8u64;
+    let per_thread = 10_000u64;
+    let total = threads * per_thread;
+
+    let mut handles = Vec::new();
+    for tid in 0..threads {
+        let mut thread_storage = storage.clone();
+        let root_pid = Arc::clone(&root_pid);
+        handles.push(std::thread::spawn(move || {
+            let base = tid * per_thread;
+            for offset in 0..per_thread {
+                let key_num = base + offset;
+                let key = format!("{:016}", key_num);
+                BTree::insert_in(
+                    &mut thread_storage,
+                    root_pid.as_ref(),
+                    key.as_bytes(),
+                    rid(key_num),
+                    90,
+                )
+                .unwrap();
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let final_root = root_pid.load(Ordering::Acquire);
+    for key_num in 0..total {
+        let key = format!("{:016}", key_num);
+        assert_eq!(
+            BTree::lookup_in(&storage, final_root, key.as_bytes()).unwrap(),
+            Some(rid(key_num)),
+            "missing key after concurrent insert: {key_num}",
+        );
+    }
+
+    let rows = BTree::range_in(&storage, final_root, None, None).unwrap();
+    assert_eq!(rows.len(), total as usize);
+    for (idx, (rec_id, key)) in rows.into_iter().enumerate() {
+        assert_eq!(rec_id, rid(idx as u64));
+        assert_eq!(key, format!("{:016}", idx).into_bytes());
+    }
+}
+
+/// Phase 40.8c: a long sequence of inserts that grows the tree past several
+/// internal levels and then deletes half of them — exercises the
+/// early-release descent on both insert and delete in the same run.
+#[test]
+fn test_btree_early_release_mixed_workload() {
+    let mut storage = MemoryStorage::new();
+    let root_pid = init_raw_root(&mut storage);
+    let count = 20_000usize;
+
+    for i in 0..count {
+        let key = format!("{:016}", i);
+        BTree::insert_in(&mut storage, &root_pid, key.as_bytes(), rid(i as u64), 90).unwrap();
+    }
+
+    // Delete every third key — most of the deletes will hit a leaf that is
+    // still well above MIN_KEYS_LEAF, so the early-release path engages and
+    // skips the X-latch on the leaf's parent.
+    for i in (0..count).step_by(3) {
+        let key = format!("{:016}", i);
+        let removed = BTree::delete_in(&mut storage, &root_pid, key.as_bytes()).unwrap();
+        assert!(removed, "key {i} should be present before delete");
+    }
+
+    let final_root = root_pid.load(Ordering::Acquire);
+    for i in 0..count {
+        let key = format!("{:016}", i);
+        let expected = if i % 3 == 0 {
+            None
+        } else {
+            Some(rid(i as u64))
+        };
+        assert_eq!(
+            BTree::lookup_in(&storage, final_root, key.as_bytes()).unwrap(),
+            expected,
+            "key {i} wrong after mixed workload",
+        );
+    }
+}
+
+/// Phase 40.8c: writers run inserts while readers run point lookups against
+/// the same tree on the static API. The early-release optimization is what
+/// makes the readers not stall on internal-page X-latches; this test
+/// exercises both code paths in lockstep.
+#[test]
+fn test_concurrent_readers_during_inserts_no_lost_keys() {
+    let storage = SharedMemoryStorage {
+        inner: Arc::new(MemoryStorage::new()),
+    };
+    let mut init_storage = storage.clone();
+    let root_pid = Arc::new(init_raw_root(&mut init_storage));
+
+    // Pre-load enough keys that the tree has at least one internal level.
+    let pre_load = 4_000u64;
+    {
+        let mut bootstrap = storage.clone();
+        for i in 0..pre_load {
+            let key = format!("{:016}", i);
+            BTree::insert_in(
+                &mut bootstrap,
+                root_pid.as_ref(),
+                key.as_bytes(),
+                rid(i),
+                90,
+            )
+            .unwrap();
+        }
+    }
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut readers = Vec::new();
+    for _ in 0..4 {
+        let storage = storage.clone();
+        let root_pid = Arc::clone(&root_pid);
+        let stop = Arc::clone(&stop);
+        readers.push(std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                let root = root_pid.load(Ordering::Acquire);
+                // Probe a key we know exists from the pre-load — must always
+                // be visible regardless of how the writers race below.
+                let key = format!("{:016}", pre_load / 2);
+                let result = BTree::lookup_in(&storage, root, key.as_bytes()).unwrap();
+                assert_eq!(result, Some(rid(pre_load / 2)));
+            }
+        }));
+    }
+
+    let writers = 4u64;
+    let per_writer = 2_000u64;
+    let mut writer_handles = Vec::new();
+    for w in 0..writers {
+        let mut thread_storage = storage.clone();
+        let root_pid = Arc::clone(&root_pid);
+        writer_handles.push(std::thread::spawn(move || {
+            let base = pre_load + w * per_writer;
+            for offset in 0..per_writer {
+                let key_num = base + offset;
+                let key = format!("{:016}", key_num);
+                BTree::insert_in(
+                    &mut thread_storage,
+                    root_pid.as_ref(),
+                    key.as_bytes(),
+                    rid(key_num),
+                    90,
+                )
+                .unwrap();
+            }
+        }));
+    }
+
+    for handle in writer_handles {
+        handle.join().unwrap();
+    }
+    stop.store(true, Ordering::Release);
+    for r in readers {
+        r.join().unwrap();
+    }
+
+    let final_root = root_pid.load(Ordering::Acquire);
+    for i in 0..(pre_load + writers * per_writer) {
+        let key = format!("{:016}", i);
+        assert_eq!(
+            BTree::lookup_in(&storage, final_root, key.as_bytes()).unwrap(),
+            Some(rid(i)),
+            "missing key after concurrent reader/writer run: {i}",
+        );
+    }
 }

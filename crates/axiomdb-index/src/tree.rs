@@ -71,6 +71,12 @@ enum DeleteResult {
     Deleted { new_pid: u64, underfull: bool },
 }
 
+enum OptimisticLeafResult<T> {
+    Done(T),
+    NeedPessimistic,
+    Retry,
+}
+
 /// Copied version of a node read from a page (releases the storage borrow).
 enum NodeCopy {
     Leaf(LeafNodePage),
@@ -94,6 +100,16 @@ impl NodeCopy {
 pub struct BTree {
     storage: Box<dyn StorageEngine>,
     root_pid: AtomicU64,
+}
+
+impl BTree {
+    #[inline]
+    fn static_api_lock_id(root_pid: &AtomicU64) -> u64 {
+        // Reserve the high bit so this synthetic tree-level lock cannot clash
+        // with normal page IDs. The address is stable for the lifetime of the
+        // AtomicU64 and uniquely identifies the externally-managed tree root.
+        (root_pid as *const AtomicU64 as usize as u64) | (1u64 << 63)
+    }
 }
 
 include!("tree_insert.rs");

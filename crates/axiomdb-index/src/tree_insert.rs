@@ -32,30 +32,35 @@ impl BTree {
 
     pub fn lookup(&self, key: &[u8]) -> Result<Option<RecordId>, DbError> {
         Self::check_key(key)?;
-        // Phase 40.8: S-latch coupling for concurrent reader safety.
-        // At each level, acquire S-latch on child BEFORE releasing parent.
-        // Inspired by InnoDB BTR_SEARCH_LEAF protocol (btr0cur.cc:1866-1950).
         let locks = self.storage.page_lock_table();
-        let mut pid = self.root_pid.load(Ordering::Acquire);
-        let mut current_guard = locks.read(pid);
-        loop {
-            let page = self.storage.read_page(pid)?;
-            if page.body()[0] == 1 {
-                // Leaf: search under current S-latch.
-                let node = cast_leaf(&page);
-                let result = node.search(key).ok().map(|i| node.rid_at(i));
+        // Phase 40.8: descend with no-wait child coupling. If a writer is
+        // queued on the child, drop the current latch and restart instead of
+        // blocking while holding the parent latch. This follows the
+        // retry-oriented posture described in PostgreSQL/InnoDB research when
+        // latch state/topology changes under us.
+        'restart: loop {
+            let mut pid = self.root_pid.load(Ordering::Acquire);
+            let mut current_guard = locks.read(pid);
+            loop {
+                let page = self.storage.read_page(pid)?;
+                if page.body()[0] == 1 {
+                    let node = cast_leaf(&page);
+                    let result = node.search(key).ok().map(|i| node.rid_at(i));
+                    drop(current_guard);
+                    return Ok(result);
+                }
+                let node = cast_internal(&page);
+                let idx = node.find_child_idx(key);
+                let child_pid = node.child_at(idx);
+                drop(page);
+                let Some(child_guard) = locks.try_read(child_pid) else {
+                    drop(current_guard);
+                    continue 'restart;
+                };
                 drop(current_guard);
-                return Ok(result);
+                current_guard = child_guard;
+                pid = child_pid;
             }
-            let node = cast_internal(&page);
-            let idx = node.find_child_idx(key);
-            let child_pid = node.child_at(idx);
-            drop(page);
-            // Coupling: acquire child before releasing parent.
-            let child_guard = locks.read(child_pid);
-            drop(current_guard);
-            current_guard = child_guard;
-            pid = child_pid;
         }
     }
 
@@ -63,34 +68,139 @@ impl BTree {
 
     pub fn insert(&mut self, key: &[u8], rid: RecordId) -> Result<(), DbError> {
         Self::check_key(key)?;
-        let root = self.root_pid.load(Ordering::Acquire);
-        match Self::insert_subtree(self.storage.as_mut(), root, key, rid, 90)? {
-            InsertResult::Ok(new_root) => {
-                // CAS ensures that if in Phase 7 there were a concurrent writer,
-                // the second would fail instead of silently overwriting.
-                // With &mut self (Phase 2) it always succeeds — the pattern is ready.
-                self.root_pid
-                    .compare_exchange(root, new_root, Ordering::AcqRel, Ordering::Acquire)
-                    .map_err(|_| DbError::BTreeCorrupted {
-                        msg: "root modified concurrently during insert".into(),
-                    })?;
+        loop {
+            let root = self.root_pid.load(Ordering::Acquire);
+            match Self::try_insert_leaf_optimistically(self.storage.as_mut(), root, key, rid, 90)? {
+                OptimisticLeafResult::Done(()) => return Ok(()),
+                OptimisticLeafResult::Retry => continue,
+                OptimisticLeafResult::NeedPessimistic => {}
             }
-            InsertResult::Split {
-                left_pid,
-                right_pid,
-                sep,
-                ..
-            } => {
-                // Root split: no predecessor to update (left_pid is the leftmost leaf).
-                let new_root = Self::alloc_root(self.storage.as_mut(), &sep, left_pid, right_pid)?;
-                self.root_pid
-                    .compare_exchange(root, new_root, Ordering::AcqRel, Ordering::Acquire)
-                    .map_err(|_| DbError::BTreeCorrupted {
-                        msg: "root modified concurrently during insert (split)".into(),
-                    })?;
+
+            let final_root = match Self::insert_subtree(self.storage.as_mut(), root, key, rid, 90)? {
+                InsertResult::Ok(new_root) => new_root,
+                InsertResult::Split {
+                    left_pid,
+                    right_pid,
+                    sep,
+                    ..
+                } => Self::alloc_root(self.storage.as_mut(), &sep, left_pid, right_pid)?,
+            };
+
+            if self
+                .root_pid
+                .compare_exchange(root, final_root, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(());
+            }
+
+            if self.lookup(key)? == Some(rid) {
+                return Ok(());
             }
         }
-        Ok(())
+    }
+
+    fn try_insert_leaf_optimistically(
+        storage: &mut dyn StorageEngine,
+        root_pid: u64,
+        key: &[u8],
+        rid: RecordId,
+        fillfactor: u8,
+    ) -> Result<OptimisticLeafResult<()>, DbError> {
+        let leaf_pid = Self::find_leaf_for_in(storage, root_pid, key)?;
+        let _leaf_guard = storage.page_lock_table().write(leaf_pid);
+        let mut page = storage.read_page(leaf_pid)?.into_page();
+
+        if page.body()[0] != 1 {
+            return Ok(OptimisticLeafResult::Retry);
+        }
+
+        let (insert_pos, can_fit) = {
+            let leaf = cast_leaf(&page);
+            let insert_pos = match leaf.search(key) {
+                Ok(_) => return Err(DbError::DuplicateKey),
+                Err(pos) => pos,
+            };
+            let threshold = fill_threshold(ORDER_LEAF, fillfactor);
+            (insert_pos, leaf.num_keys() < threshold)
+        };
+
+        if !can_fit {
+            return Ok(OptimisticLeafResult::NeedPessimistic);
+        }
+
+        cast_leaf_mut(&mut page).insert_at(insert_pos, key, rid);
+        page.update_checksum();
+        storage.write_page_under_page_lock(leaf_pid, &page)?;
+        Ok(OptimisticLeafResult::Done(()))
+    }
+
+    /// Phase 40.8c: returns `true` when descending into `child_pid` from a
+    /// pessimistic insert is guaranteed not to require an update on the
+    /// parent (no split propagation upward).
+    ///
+    /// A child is "safe for insert" iff it has room to absorb one additional
+    /// key without itself splitting:
+    ///
+    /// - Leaf child: `num_keys < fill_threshold(ORDER_LEAF, fillfactor)` —
+    ///   matches the fast-path predicate in `insert_subtree` so a single
+    ///   in-place leaf insert is guaranteed.
+    /// - Internal child: `num_keys < ORDER_INTERNAL` — matches the in-place
+    ///   parent absorb predicate, so any split that propagates from a deeper
+    ///   level stops at this child.
+    ///
+    /// Reading the child page without holding its latch is safe because all
+    /// writers on the same tree are serialized (instance API: `&mut self`;
+    /// static API: tree-level X-latch in `insert_in` / `delete_in`). The
+    /// parent X-latch is held during this check, so concurrent readers cannot
+    /// observe a half-modified child either.
+    fn child_is_safe_for_insert(
+        storage: &dyn StorageEngine,
+        child_pid: u64,
+        fillfactor: u8,
+    ) -> Result<bool, DbError> {
+        let page = storage.read_page(child_pid)?;
+        if page.body()[0] == 1 {
+            let leaf = cast_leaf(&page);
+            let threshold = fill_threshold(ORDER_LEAF, fillfactor);
+            Ok(leaf.num_keys() < threshold)
+        } else {
+            let internal = cast_internal(&page);
+            Ok(internal.num_keys() < ORDER_INTERNAL)
+        }
+    }
+
+    /// Phase 40.8c: returns `true` when descending into `child_pid` from a
+    /// pessimistic delete is guaranteed not to require an update on the
+    /// parent (no rebalance propagation upward).
+    ///
+    /// In the index B-tree the parent's pid only changes when its child's
+    /// rebalance routine allocates a new parent page (CoW for internal-node
+    /// rotations and merges). That CoW only happens when an underflow
+    /// propagates upward into the immediate child, which in turn requires
+    /// the immediate child or one of its descendants to underflow.
+    ///
+    /// To avoid scanning the entire subtree, we only treat the descent as
+    /// "safe" when the immediate child is a **leaf** with strictly more keys
+    /// than `MIN_KEYS_LEAF`. Leaves never change pid in the delete path
+    /// (`write_leaf_same_pid` keeps the pid; rebalance for leaves is also
+    /// in-place), and the underflow check is `num_keys < MIN_KEYS_LEAF`
+    /// **after** the removal — so `num_keys > MIN_KEYS_LEAF` before delete
+    /// guarantees no underflow.
+    fn child_is_safe_for_delete(
+        storage: &dyn StorageEngine,
+        child_pid: u64,
+    ) -> Result<bool, DbError> {
+        let page = storage.read_page(child_pid)?;
+        if page.body()[0] == 1 {
+            let leaf = cast_leaf(&page);
+            Ok(leaf.num_keys() > MIN_KEYS_LEAF)
+        } else {
+            // Internal children might have a deeper rebalance that allocates
+            // a fresh pid for them, so we cannot safely drop the parent latch
+            // even if the immediate child has plenty of keys.
+            Ok(false)
+        }
     }
 
     fn insert_subtree(
@@ -100,6 +210,7 @@ impl BTree {
         rid: RecordId,
         fillfactor: u8,
     ) -> Result<InsertResult, DbError> {
+        let parent_guard = storage.page_lock_table().write(pid);
         // Fast path: for leaf non-split inserts, avoid copying the entire
         // LeafNodePage struct (16KB). Read the page, check if it needs
         // splitting, and if not, modify the body directly via into_page().
@@ -118,7 +229,7 @@ impl BTree {
                     let mut page = page_ref.into_page();
                     cast_leaf_mut(&mut page).insert_at(ins_pos, key, rid);
                     page.update_checksum();
-                    storage.write_page(pid, &page)?;
+                    storage.write_page_under_page_lock(pid, &page)?;
                     return Ok(InsertResult::Ok(pid));
                 }
                 // Fall through to split path (needs the full node copy).
@@ -131,6 +242,23 @@ impl BTree {
                 let n = node.num_keys();
                 let child_idx = node.find_child_idx(key);
                 let child_pid = node.child_at(child_idx);
+
+                // Phase 40.8c: early X-latch release on safe descent.
+                // If the child can absorb the worst-case upward propagation
+                // (one new key) without itself splitting, the recursive call
+                // cannot return InsertResult::Split, so the parent will never
+                // need an update. Drop our X-latch now so concurrent readers
+                // can resume on this internal page.
+                if Self::child_is_safe_for_insert(storage, child_pid, fillfactor)? {
+                    drop(parent_guard);
+                    let result =
+                        Self::insert_subtree(storage, child_pid, key, rid, fillfactor)?;
+                    debug_assert!(
+                        matches!(result, InsertResult::Ok(p) if p == child_pid),
+                        "safe child must return InsertResult::Ok with the same pid"
+                    );
+                    return Ok(InsertResult::Ok(pid));
+                }
 
                 match Self::insert_subtree(storage, child_pid, key, rid, fillfactor)? {
                     InsertResult::Ok(new_child_pid) => {
@@ -368,7 +496,7 @@ impl BTree {
         let mut page = storage.read_page(pid)?.into_page();
         *cast_leaf_mut(&mut page) = node;
         page.update_checksum();
-        storage.write_page(pid, &page)?;
+        storage.write_page_under_page_lock(pid, &page)?;
         Ok(pid)
     }
 
@@ -390,7 +518,7 @@ impl BTree {
         let mut page = storage.read_page(pid)?.into_page();
         *cast_internal_mut(&mut page) = node;
         page.update_checksum();
-        storage.write_page(pid, &page)?;
+        storage.write_page_under_page_lock(pid, &page)?;
         Ok(pid)
     }
 

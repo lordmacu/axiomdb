@@ -41,12 +41,13 @@ impl BTree {
         let left_sibling_pid = parent.child_at(child_idx - 1);
         let pred_pid = Self::descend_rightmost_leaf(storage, left_sibling_pid)?;
 
+        let _pred_guard = storage.page_lock_table().write(pred_pid);
         let raw = *storage.read_page(pred_pid)?.as_bytes();
         let mut page = Page::from_bytes(raw)?;
         let leaf = cast_leaf_mut(&mut page);
         leaf.set_next_leaf(new_left_pid);
         page.update_checksum();
-        storage.write_page(pred_pid, &page)?;
+        storage.write_page_under_page_lock(pred_pid, &page)?;
         Ok(())
     }
 
@@ -76,45 +77,53 @@ impl BTree {
     }
 
     fn leftmost_leaf(&self) -> Result<u64, DbError> {
-        // Phase 40.8: S-latch coupling for concurrent reader safety.
         let locks = self.storage.page_lock_table();
-        let mut pid = self.root_pid.load(Ordering::Acquire);
-        let mut current_guard = locks.read(pid);
-        loop {
-            match NodeCopy::read(self.storage.as_ref(), pid)? {
-                NodeCopy::Leaf(_) => {
-                    drop(current_guard);
-                    return Ok(pid);
-                }
-                NodeCopy::Internal(n) => {
-                    let child_pid = n.child_at(0);
-                    let child_guard = locks.read(child_pid);
-                    drop(current_guard);
-                    current_guard = child_guard;
-                    pid = child_pid;
+        'restart: loop {
+            let mut pid = self.root_pid.load(Ordering::Acquire);
+            let mut current_guard = locks.read(pid);
+            loop {
+                match NodeCopy::read(self.storage.as_ref(), pid)? {
+                    NodeCopy::Leaf(_) => {
+                        drop(current_guard);
+                        return Ok(pid);
+                    }
+                    NodeCopy::Internal(n) => {
+                        let child_pid = n.child_at(0);
+                        let Some(child_guard) = locks.try_read(child_pid) else {
+                            drop(current_guard);
+                            continue 'restart;
+                        };
+                        drop(current_guard);
+                        current_guard = child_guard;
+                        pid = child_pid;
+                    }
                 }
             }
         }
     }
 
     fn find_leaf_for(&self, key: &[u8]) -> Result<u64, DbError> {
-        // Phase 40.8: S-latch coupling for concurrent reader safety.
         let locks = self.storage.page_lock_table();
-        let mut pid = self.root_pid.load(Ordering::Acquire);
-        let mut current_guard = locks.read(pid);
-        loop {
-            let page = self.storage.read_page(pid)?;
-            if page.body()[0] == 1 {
+        'restart: loop {
+            let mut pid = self.root_pid.load(Ordering::Acquire);
+            let mut current_guard = locks.read(pid);
+            loop {
+                let page = self.storage.read_page(pid)?;
+                if page.body()[0] == 1 {
+                    drop(current_guard);
+                    return Ok(pid);
+                }
+                let node = cast_internal(&page);
+                let child_pid = node.child_at(node.find_child_idx(key));
+                drop(page);
+                let Some(child_guard) = locks.try_read(child_pid) else {
+                    drop(current_guard);
+                    continue 'restart;
+                };
                 drop(current_guard);
-                return Ok(pid);
+                current_guard = child_guard;
+                pid = child_pid;
             }
-            let node = cast_internal(&page);
-            let child_pid = node.child_at(node.find_child_idx(key));
-            drop(page);
-            let child_guard = locks.read(child_pid);
-            drop(current_guard);
-            current_guard = child_guard;
-            pid = child_pid;
         }
     }
 
@@ -146,25 +155,29 @@ impl BTree {
         key: &[u8],
     ) -> Result<Option<RecordId>, DbError> {
         Self::check_key(key)?;
-        // Phase 40.8: S-latch coupling for concurrent reader safety.
         let locks = storage.page_lock_table();
-        let mut pid = root_pid;
-        let mut current_guard = locks.read(pid);
-        loop {
-            let page = storage.read_page(pid)?;
-            if page.body()[0] == 1 {
-                let node = cast_leaf(&page);
-                let result = node.search(key).ok().map(|i| node.rid_at(i));
+        'restart: loop {
+            let mut pid = root_pid;
+            let mut current_guard = locks.read(pid);
+            loop {
+                let page = storage.read_page(pid)?;
+                if page.body()[0] == 1 {
+                    let node = cast_leaf(&page);
+                    let result = node.search(key).ok().map(|i| node.rid_at(i));
+                    drop(current_guard);
+                    return Ok(result);
+                }
+                let node = cast_internal(&page);
+                let child_pid = node.child_at(node.find_child_idx(key));
+                drop(page);
+                let Some(child_guard) = locks.try_read(child_pid) else {
+                    drop(current_guard);
+                    continue 'restart;
+                };
                 drop(current_guard);
-                return Ok(result);
+                current_guard = child_guard;
+                pid = child_pid;
             }
-            let node = cast_internal(&page);
-            let child_pid = node.child_at(node.find_child_idx(key));
-            drop(page);
-            let child_guard = locks.read(child_pid);
-            drop(current_guard);
-            current_guard = child_guard;
-            pid = child_pid;
         }
     }
 
@@ -186,22 +199,36 @@ impl BTree {
         fillfactor: u8,
     ) -> Result<(), DbError> {
         Self::check_key(key)?;
-        let root = root_pid.load(Ordering::Acquire);
-        match Self::insert_subtree(storage, root, key, rid, fillfactor)? {
-            InsertResult::Ok(new_root) => {
-                root_pid.store(new_root, Ordering::Release);
+        let _tree_guard = storage.page_lock_table().write(Self::static_api_lock_id(root_pid));
+        loop {
+            let root = root_pid.load(Ordering::Acquire);
+            match Self::try_insert_leaf_optimistically(storage, root, key, rid, fillfactor)? {
+                OptimisticLeafResult::Done(()) => return Ok(()),
+                OptimisticLeafResult::Retry => continue,
+                OptimisticLeafResult::NeedPessimistic => {}
             }
-            InsertResult::Split {
-                left_pid,
-                right_pid,
-                sep,
-                ..
-            } => {
-                let new_root = Self::alloc_root(storage, &sep, left_pid, right_pid)?;
-                root_pid.store(new_root, Ordering::Release);
+
+            let final_root = match Self::insert_subtree(storage, root, key, rid, fillfactor)? {
+                InsertResult::Ok(new_root) => new_root,
+                InsertResult::Split {
+                    left_pid,
+                    right_pid,
+                    sep,
+                    ..
+                } => Self::alloc_root(storage, &sep, left_pid, right_pid)?,
+            };
+
+            if root_pid
+                .compare_exchange(root, final_root, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(());
+            }
+
+            if Self::lookup_in(storage, root_pid.load(Ordering::Acquire), key)? == Some(rid) {
+                return Ok(());
             }
         }
-        Ok(())
     }
 
     /// Range scan on the B-Tree rooted at `root_pid`.
@@ -254,34 +281,58 @@ impl BTree {
         key: &[u8],
     ) -> Result<bool, DbError> {
         Self::check_key(key)?;
-        let root = root_pid.load(Ordering::Acquire);
-        match Self::delete_subtree(storage, root, key, true)? {
-            DeleteResult::NotFound => Ok(false),
-            DeleteResult::Deleted { new_pid, .. } => {
-                let final_root = Self::collapse_root(storage, new_pid)?;
-                root_pid.store(final_root, Ordering::Release);
-                Ok(true)
+        let _tree_guard = storage.page_lock_table().write(Self::static_api_lock_id(root_pid));
+        loop {
+            let root = root_pid.load(Ordering::Acquire);
+            match Self::try_delete_leaf_optimistically(storage, root, key)? {
+                OptimisticLeafResult::Done(deleted) => return Ok(deleted),
+                OptimisticLeafResult::Retry => continue,
+                OptimisticLeafResult::NeedPessimistic => {}
+            }
+
+            match Self::delete_subtree(storage, root, key, true)? {
+                DeleteResult::NotFound => {
+                    if root_pid.load(Ordering::Acquire) == root {
+                        return Ok(false);
+                    }
+                }
+                DeleteResult::Deleted { new_pid, .. } => {
+                    let final_root = Self::collapse_root(storage, new_pid)?;
+                    if root_pid
+                        .compare_exchange(root, final_root, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        return Ok(true);
+                    }
+                    if Self::lookup_in(storage, root_pid.load(Ordering::Acquire), key)?.is_none() {
+                        return Ok(true);
+                    }
+                }
             }
         }
     }
 
     fn leftmost_leaf_in(storage: &dyn StorageEngine, root_pid: u64) -> Result<u64, DbError> {
-        // Phase 40.8: S-latch coupling for concurrent reader safety.
         let locks = storage.page_lock_table();
-        let mut pid = root_pid;
-        let mut current_guard = locks.read(pid);
-        loop {
-            match NodeCopy::read(storage, pid)? {
-                NodeCopy::Leaf(_) => {
-                    drop(current_guard);
-                    return Ok(pid);
-                }
-                NodeCopy::Internal(n) => {
-                    let child_pid = n.child_at(0);
-                    let child_guard = locks.read(child_pid);
-                    drop(current_guard);
-                    current_guard = child_guard;
-                    pid = child_pid;
+        'restart: loop {
+            let mut pid = root_pid;
+            let mut current_guard = locks.read(pid);
+            loop {
+                match NodeCopy::read(storage, pid)? {
+                    NodeCopy::Leaf(_) => {
+                        drop(current_guard);
+                        return Ok(pid);
+                    }
+                    NodeCopy::Internal(n) => {
+                        let child_pid = n.child_at(0);
+                        let Some(child_guard) = locks.try_read(child_pid) else {
+                            drop(current_guard);
+                            continue 'restart;
+                        };
+                        drop(current_guard);
+                        current_guard = child_guard;
+                        pid = child_pid;
+                    }
                 }
             }
         }
@@ -292,24 +343,61 @@ impl BTree {
         root_pid: u64,
         key: &[u8],
     ) -> Result<u64, DbError> {
-        // Phase 40.8: S-latch coupling for concurrent reader safety.
         let locks = storage.page_lock_table();
-        let mut pid = root_pid;
-        let mut current_guard = locks.read(pid);
-        loop {
-            let page = storage.read_page(pid)?;
-            if page.body()[0] == 1 {
+        'restart: loop {
+            let mut pid = root_pid;
+            let mut current_guard = locks.read(pid);
+            loop {
+                let page = storage.read_page(pid)?;
+                if page.body()[0] == 1 {
+                    drop(current_guard);
+                    return Ok(pid);
+                }
+                let node = cast_internal(&page);
+                let child_pid = node.child_at(node.find_child_idx(key));
+                drop(page);
+                let Some(child_guard) = locks.try_read(child_pid) else {
+                    drop(current_guard);
+                    continue 'restart;
+                };
                 drop(current_guard);
-                return Ok(pid);
+                current_guard = child_guard;
+                pid = child_pid;
             }
-            let node = cast_internal(&page);
-            let child_pid = node.child_at(node.find_child_idx(key));
-            drop(page);
-            let child_guard = locks.read(child_pid);
-            drop(current_guard);
-            current_guard = child_guard;
-            pid = child_pid;
         }
+    }
+
+    fn try_delete_leaf_optimistically(
+        storage: &mut dyn StorageEngine,
+        root_pid: u64,
+        key: &[u8],
+    ) -> Result<OptimisticLeafResult<bool>, DbError> {
+        let leaf_pid = Self::find_leaf_for_in(storage, root_pid, key)?;
+        let _leaf_guard = storage.page_lock_table().write(leaf_pid);
+        let mut page = storage.read_page(leaf_pid)?.into_page();
+
+        if page.body()[0] != 1 {
+            return Ok(OptimisticLeafResult::Retry);
+        }
+
+        let (idx, would_underflow) = {
+            let leaf = cast_leaf(&page);
+            let idx = match leaf.search(key) {
+                Ok(idx) => idx,
+                Err(_) => return Ok(OptimisticLeafResult::Done(false)),
+            };
+            let remaining = leaf.num_keys().saturating_sub(1);
+            (idx, leaf_pid != root_pid && remaining < MIN_KEYS_LEAF)
+        };
+
+        if would_underflow {
+            return Ok(OptimisticLeafResult::NeedPessimistic);
+        }
+
+        cast_leaf_mut(&mut page).remove_at(idx);
+        page.update_checksum();
+        storage.write_page_under_page_lock(leaf_pid, &page)?;
+        Ok(OptimisticLeafResult::Done(true))
     }
 
     /// Public accessor for the fill-factor split threshold (Phase 6.8).

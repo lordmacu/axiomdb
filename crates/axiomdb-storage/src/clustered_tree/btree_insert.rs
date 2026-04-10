@@ -1,7 +1,7 @@
 use super::page_utils::{
-    choose_internal_promotion_idx, choose_leaf_split_idx, clustered_page_type,
-    collect_internal_cells, collect_leaf_cells, materialize_leaf_cell, rebuild_internal_page,
-    rebuild_leaf_page, write_page,
+    child_is_safe_for_insert, choose_internal_promotion_idx, choose_leaf_split_idx,
+    clustered_page_type, collect_internal_cells, collect_leaf_cells, materialize_leaf_cell,
+    rebuild_internal_page, rebuild_leaf_page, write_page,
 };
 use super::search::leaf_search_checked;
 use super::{InsertResult, OwnedInternalCell, OwnedLeafCell};
@@ -20,6 +20,7 @@ pub(super) fn insert_subtree(
     row_header: &RowHeader,
     row_data: &[u8],
 ) -> Result<InsertResult, DbError> {
+    let parent_guard = storage.page_lock_table().write(pid);
     let page_ref = storage.read_page(pid)?;
     match clustered_page_type(&page_ref)? {
         PageType::ClusteredLeaf => insert_into_leaf(
@@ -30,14 +31,29 @@ pub(super) fn insert_subtree(
             row_header,
             row_data,
         ),
-        PageType::ClusteredInternal => insert_into_internal(
-            storage,
-            pid,
-            page_ref.into_page(),
-            key,
-            row_header,
-            row_data,
-        ),
+        PageType::ClusteredInternal => {
+            let page = page_ref.into_page();
+
+            // Phase 40.8c: early X-latch release on safe descent.
+            // We peek at the immediate child while still holding our parent
+            // X-latch. If the child has plenty of free space, the recursive
+            // call cannot return InsertResult::Split (the clustered tree
+            // never changes a page's pid on split), so we can drop our latch
+            // before recursing and let concurrent readers in.
+            let child_idx = clustered_internal::find_child_idx(&page, key)?;
+            let child_pid = clustered_internal::child_at(&page, child_idx as u16)?;
+            if child_is_safe_for_insert(storage, child_pid, key, row_data.len())? {
+                drop(parent_guard);
+                let result = insert_subtree(storage, child_pid, key, row_header, row_data)?;
+                debug_assert!(
+                    matches!(result, InsertResult::Inserted),
+                    "safe child must return InsertResult::Inserted"
+                );
+                return Ok(InsertResult::Inserted);
+            }
+
+            insert_into_internal(storage, pid, page, key, row_header, row_data)
+        }
         other => Err(DbError::BTreeCorrupted {
             msg: format!(
                 "clustered tree encountered unsupported page type {other:?} at page {pid}"
@@ -71,7 +87,8 @@ fn insert_into_leaf(
         cell.overflow_first_page,
     ) {
         Ok(()) => {
-            write_page(storage, pid, &mut page)?;
+            page.update_checksum();
+            storage.write_page_under_page_lock(pid, &page)?;
             Ok(InsertResult::Inserted)
         }
         Err(DbError::HeapPageFull { .. }) => {
@@ -86,7 +103,8 @@ fn insert_into_leaf(
                 cell.overflow_first_page,
             ) {
                 Ok(()) => {
-                    write_page(storage, pid, &mut page)?;
+                    page.update_checksum();
+                    storage.write_page_under_page_lock(pid, &page)?;
                     Ok(InsertResult::Inserted)
                 }
                 Err(DbError::HeapPageFull { .. }) => {
@@ -118,7 +136,8 @@ fn split_leaf(
     let mut right_page = Page::new(PageType::ClusteredLeaf, right_pid);
     rebuild_leaf_page(&mut right_page, &cells[split_at..], old_next_leaf)?;
 
-    write_page(storage, pid, &mut left_page)?;
+    left_page.update_checksum();
+    storage.write_page_under_page_lock(pid, &left_page)?;
     write_page(storage, right_pid, &mut right_page)?;
 
     Ok(InsertResult::Split {
@@ -143,14 +162,16 @@ fn insert_into_internal(
         InsertResult::Split { sep_key, right_pid } => {
             match clustered_internal::insert_at(&mut page, child_idx, &sep_key, right_pid) {
                 Ok(()) => {
-                    write_page(storage, pid, &mut page)?;
+                    page.update_checksum();
+                    storage.write_page_under_page_lock(pid, &page)?;
                     Ok(InsertResult::Inserted)
                 }
                 Err(DbError::HeapPageFull { .. }) => {
                     clustered_internal::defragment(&mut page);
                     match clustered_internal::insert_at(&mut page, child_idx, &sep_key, right_pid) {
                         Ok(()) => {
-                            write_page(storage, pid, &mut page)?;
+                            page.update_checksum();
+                            storage.write_page_under_page_lock(pid, &page)?;
                             Ok(InsertResult::Inserted)
                         }
                         Err(DbError::HeapPageFull { .. }) => {
@@ -197,7 +218,8 @@ fn split_internal(
         &separators[promoted_idx + 1..],
     )?;
 
-    write_page(storage, pid, &mut left_page)?;
+    left_page.update_checksum();
+    storage.write_page_under_page_lock(pid, &left_page)?;
     write_page(storage, new_right_pid, &mut right_page)?;
 
     Ok(InsertResult::Split {

@@ -104,6 +104,24 @@ impl PageLockTable {
         PageReadGuard { guard, lock }
     }
 
+    /// Attempts to acquire a shared (read) lock for `page_id` without blocking.
+    ///
+    /// Returns `None` when a conflicting writer currently holds or is queued on
+    /// the page. Callers can then drop ancestor latches and retry their
+    /// traversal to avoid deadlocks under writer-preferring `RwLock`s.
+    pub fn try_read(&self, page_id: u64) -> Option<PageReadGuard> {
+        let lock = self.page_lock(page_id);
+        let guard: std::sync::RwLockReadGuard<'static, ()> = unsafe {
+            let raw: &'static RwLock<()> = &*(Arc::as_ptr(&lock));
+            match raw.try_read() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+                Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner(),
+            }
+        };
+        Some(PageReadGuard { guard, lock })
+    }
+
     /// Acquires an **exclusive** (write) lock for `page_id`.
     ///
     /// Only one thread may hold an exclusive lock on a page at a time.
@@ -117,6 +135,21 @@ impl PageLockTable {
             raw.write().unwrap_or_else(|e| e.into_inner())
         };
         PageWriteGuard { guard, lock }
+    }
+
+    /// Attempts to acquire an exclusive (write) lock for `page_id` without
+    /// blocking.
+    pub fn try_write(&self, page_id: u64) -> Option<PageWriteGuard> {
+        let lock = self.page_lock(page_id);
+        let guard: std::sync::RwLockWriteGuard<'static, ()> = unsafe {
+            let raw: &'static RwLock<()> = &*(Arc::as_ptr(&lock));
+            match raw.try_write() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+                Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner(),
+            }
+        };
+        Some(PageWriteGuard { guard, lock })
     }
 }
 
