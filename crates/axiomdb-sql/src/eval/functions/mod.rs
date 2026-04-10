@@ -73,16 +73,9 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
                 (Value::Text(t) | Value::Json(t), Value::Text(q) | Value::Json(q)) => (t, q),
                 (t, q) => (t.to_string(), q.to_string()),
             };
-            let doc_tokens = crate::tokenizer::tokenize(&text);
-            let query_terms = crate::tokenizer::tokenize_query(&query);
-            if query_terms.is_empty() || doc_tokens.is_empty() {
-                return Ok(Value::Real(0.0));
-            }
-            // Simple TF-based scoring: count matches / total query terms.
-            let doc_term_set: std::collections::HashSet<&str> =
-                doc_tokens.iter().map(|t| t.term.as_str()).collect();
-            let matches = query_terms.iter().filter(|qt| doc_term_set.contains(qt.as_str())).count();
-            let score = matches as f64 / query_terms.len() as f64;
+            // Phase 11.7: parse advanced FTS query (boolean, phrase, prefix).
+            let clauses = crate::fts_query::parse_fts_query(&query);
+            let score = crate::fts_query::evaluate_fts(&clauses, &text);
             Ok(Value::Real(score))
         }
 
