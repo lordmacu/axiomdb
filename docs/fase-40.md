@@ -307,3 +307,132 @@ shared: 8 transactions share 1 fsync instead of paying 8 × 5 ms = 40 ms.
   - `test_no_duplicate_lsns_under_contention` — 8 threads × 125 = 1000 entries
 - All 115 `axiomdb-wal` lib tests pass (including recovery, checkpoint, txn suites).
 - All 14 `integration_durability` tests pass.
+
+## Subfase 40.8 — B-tree Latch Coupling
+
+### What was implemented
+
+A hybrid optimistic / pessimistic latch coupling protocol for both the
+**index B-tree** (`axiomdb-index/src/tree_*.rs`) and the **clustered B-tree**
+(`axiomdb-storage/src/clustered_tree/*.rs`). All page latches come from the
+shared `PageLockTable` introduced in 40.3.
+
+The protocol has three layers:
+
+1. **Read descent (`lookup`, `range`, `leftmost_leaf`)** — S-latch coupling
+   with `try_read` on the child and a restart-on-contention loop. At most
+   two S-latches are held simultaneously, briefly during the parent → child
+   handover.
+2. **Optimistic write fast path (`insert`, `delete`)** — single X-latch on
+   the leaf if the leaf can absorb the operation in place
+   (`num_keys < threshold` for insert, `num_keys > MIN_KEYS_LEAF` for
+   delete). Internals are not X-latched.
+3. **Pessimistic write descent with early X-latch release** — when the
+   optimistic path fails, the writer restarts in pessimistic mode and
+   X-latches every level. At each recursive level, the parent latch is
+   **dropped before** the recursive call when the immediate child is
+   "safe" (cannot propagate a structural change upward), so concurrent
+   readers can resume on the cleared internal page.
+
+### Key components
+
+**`crates/axiomdb-index/src/tree_insert.rs`**
+
+- `child_is_safe_for_insert(child_pid, fillfactor)` — returns `true` when
+  the child has room to absorb one new entry without splitting:
+  `num_keys < fill_threshold(ORDER_LEAF, fillfactor)` for a leaf,
+  `num_keys < ORDER_INTERNAL` for an internal node.
+- `insert_subtree` now drops the parent X-latch before recursing into a
+  safe child. The recursive call is then guaranteed to return
+  `InsertResult::Ok(child_pid)`, so the parent never needs an update.
+
+**`crates/axiomdb-index/src/tree_delete.rs`**
+
+- `child_is_safe_for_delete(child_pid)` — returns `true` only when the
+  immediate child is a **leaf** with strictly more than `MIN_KEYS_LEAF`
+  keys. Internal children stay pessimistic because the index B-tree's
+  internal-rebalance routines (`rotate_right` / `rotate_left` /
+  `merge_children`) still allocate a fresh parent pid via Copy-on-Write,
+  which means even an internal child with plenty of keys can return a
+  different pid to its grandparent when a deeper underflow propagates a
+  rebalance up to it.
+- `delete_subtree` drops the parent X-latch before recursing into a safe
+  leaf child. Leaves always rewrite in place (`write_leaf_same_pid`), so
+  their pid is stable.
+
+**`crates/axiomdb-storage/src/clustered_tree/page_utils.rs`**
+
+- `child_is_safe_for_insert(storage, child_pid, key, row_data_len)` —
+  byte-budget check with 2× headroom over `cell_footprint` (leaf) /
+  `separator_footprint(key.len() + 64)` (internal). The 2× margin covers
+  the fact that the propagated separator may be slightly larger than the
+  inserted key (the median promotion picks among existing leaf keys).
+- `child_is_safe_for_delete(storage, child_pid)` — for leaf children only,
+  requires `used > capacity / 2`. The clustered tree's underfull rule is
+  `used < capacity / 4`, so this leaves a comfortable margin even after
+  losing one cell. Internal children stay pessimistic by the same
+  reasoning as the index tree (sub-tree introspection would be required
+  to rule out a deeper rebalance).
+
+**`crates/axiomdb-storage/src/clustered_tree/btree_insert.rs`**
+
+- `insert_subtree` peeks the immediate child while holding the parent
+  X-latch, then drops the parent latch on safe descent. The clustered
+  tree never changes a page's pid on split (the old page stays as the
+  left half), so a safe child always returns `InsertResult::Inserted`.
+
+**`crates/axiomdb-storage/src/clustered_tree/delete.rs`**
+
+- `delete_physical_subtree` drops the parent latch on safe descent. After
+  the recursive call returns, the parent latch is **re-acquired only**
+  when the child reports `min_changed && child_idx > 0` (separator
+  repair). If the new separator no longer fits in the parent page, the
+  function surfaces `underfull = true` so the grandparent's existing
+  rebalance path can handle the propagation.
+
+### Latch ordering
+
+- Tree descent: parent before child (standard latch coupling).
+- Sibling pairs (rotate / merge): always `min(left_pid, right_pid)` first,
+  then the other — same ascending block-id order InnoDB uses.
+- Static API writers serialize at a synthetic tree-level X-latch keyed by
+  the address of the `AtomicU64` root, so per-page latches never deadlock
+  between static API callers.
+
+### Tests
+
+- **`crates/axiomdb-index/tests/integration_btree.rs`**:
+  - `test_concurrent_insert_in_eight_threads_all_keys_reachable` — 8
+    threads × 10K writes (= 80K total). Matches the spec stress scenario.
+  - `test_btree_early_release_mixed_workload` — 20K inserts followed by
+    every-third-key deletes. Exercises the early-release branch on both
+    insert and delete in the same run.
+  - `test_concurrent_readers_during_inserts_no_lost_keys` — 4 readers + 4
+    writers on a pre-populated tree where the root never changes during
+    the run.
+- **`crates/axiomdb-storage/src/clustered_tree/tests_insert.rs`**:
+  - `many_inserts_with_safe_descent_keep_tree_consistent` — 2K inserts
+    grow the tree past one internal level and verify the leaf chain is
+    sorted, all keys reachable.
+- **`crates/axiomdb-storage/src/clustered_tree/tests_delete.rs`**:
+  - `delete_physical_through_safe_descent_keeps_tree_consistent` — 128
+    fat-row inserts followed by a delete in the middle of a populated
+    leaf, verifying the safe-descent branch produces the same result as
+    the pessimistic path.
+
+### Validation
+
+- `cargo test --workspace`: **2506 passed, 9 ignored, 0 failed**
+- `cargo clippy --workspace --lib --bins -- -D warnings`: clean
+- `cargo fmt --check`: clean
+
+### Known limitations (deferred to 40.10)
+
+- Concurrent root republication for `BTree::insert_in` / `delete_in` across
+  root splits is not yet retry-safe. The 8-thread × 10K stress test runs
+  writers-only; reader/writer interaction is exercised on a pre-populated
+  tree where the root never changes.
+- Internal-children early X-latch release for the index B-tree **delete**
+  path requires the internal rebalance routines to keep their parent pid
+  in place (no CoW). That refactor is the prerequisite for full
+  internal-children early release on delete.

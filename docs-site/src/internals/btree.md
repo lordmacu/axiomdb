@@ -929,3 +929,112 @@ RocksDB's `WriteBatchWithIndex`, CockroachDB's key encoding, and PostgreSQL's
 `btint4cmp` — proven correct and branch-free at O(1).
 </div>
 </div>
+
+## Concurrency — latch coupling (Phase 40.8)
+
+The B-tree uses a **hybrid optimistic / pessimistic latch coupling protocol**
+for both the index B-tree (`crates/axiomdb-index/src/tree_*.rs`) and the
+clustered B-tree (`crates/axiomdb-storage/src/clustered_tree/*`). Latches are
+per-page `RwLock`s served from the shared `PageLockTable` (Phase 40.3).
+
+### Read descent
+
+Readers (`lookup`, `range` start) use **S-latch coupling** with no-wait child
+acquisition:
+
+1. Acquire S-latch on the root.
+2. Read the page; for an internal node, find the descent child.
+3. Try `try_read(child)`. If it would block (a writer is queued on the child),
+   drop the parent latch and restart the descent from the root.
+4. Otherwise replace the parent guard with the child guard and continue.
+5. At the leaf, perform the search under the S-latch and drop it before
+   returning.
+
+This is the same retry-oriented protocol PostgreSQL uses on its B-tree readers
+(see `nbtsearch.c`'s `_bt_moveright` retry on `BTPageOpaque` mismatch). Two
+S-latches at most are held simultaneously, and only briefly during the
+parent → child handover.
+
+### Optimistic write fast path
+
+`insert` and `delete` first try an **optimistic** descent: S-latch coupling
+on the internals, X-latch only at the leaf. If the leaf has room (or the
+delete would not underflow), the operation completes in-place under a single
+X-latch. This is the 95%+ case.
+
+### Pessimistic write descent with early X-latch release
+
+When the leaf cannot absorb the operation (split or underflow), the writer
+restarts in **pessimistic** mode: X-latch coupling from the root. To keep
+contention low, every recursive level checks whether the *immediate child* is
+"safe" — i.e., whether the recursive call can possibly require an update to
+the parent — and **drops the parent X-latch before recursing** when the
+answer is no:
+
+- `child_is_safe_for_insert(child_pid)` returns `true` when the child has
+  room to absorb one new entry without splitting. For the index B-tree this
+  is `child.num_keys < threshold` (leaf) or `< ORDER_INTERNAL` (internal);
+  for the clustered B-tree it is a byte-budget check with 2× headroom on the
+  estimated separator footprint.
+- `child_is_safe_for_delete(child_pid)` is more conservative because the
+  index B-tree's internal-rebalance routines still allocate a fresh parent
+  pid (CoW); the predicate therefore only fires when the immediate child is
+  a leaf with strictly more than `MIN_KEYS_LEAF` keys. Leaves are always
+  rewritten in place, so their pid is stable. The clustered tree never
+  changes pids on rebalance/merge and uses a pure byte-occupancy check.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Performance Advantage</span>
+Early X-latch release on safe descent shrinks the writer's exclusive
+window to the lowest tree level that actually needs to mutate. Concurrent
+S-latch readers resume on every internal page the writer has cleared,
+instead of stalling until the writer has descended to the leaf. The same
+idea is used by InnoDB's `BTR_MODIFY_TREE` mode and PostgreSQL's nbtree
+`_bt_relandgetbuf` walk, but AxiomDB's recursive Rust implementation
+expresses it via an explicit `drop(parent_guard)` before the recursive
+call, with no manual savepoint stack.
+</div>
+</div>
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision</span>
+Reading the child page without latching it during the safety check is safe
+because all writers on the same tree are serialized — the `BTree` instance
+API by `&mut self`, the static API by an explicit tree-level X-latch in
+`insert_in` / `delete_in`. The parent X-latch is still held while we peek,
+so concurrent readers cannot observe a half-modified child either.
+</div>
+</div>
+
+### Range scan under concurrent splits
+
+`RangeIter` holds an S-latch on the current leaf, prefetches the next leaf,
+and follows the `next_leaf` pointer with `try_read` (falling back to a
+blocking `read` if the no-wait acquisition fails). Splits update the
+predecessor's `next_leaf` under X-latch before any other latch is released,
+so the chain is always consistent for readers.
+
+### Latch ordering — deadlock prevention
+
+- Tree descent: parent latch is acquired before any child latch.
+- Sibling pairs (rotate / merge): always `min(left_pid, right_pid)` first,
+  then the other. This is the same ascending block-id order InnoDB uses.
+- Static API writers serialize at a synthetic tree-level X-latch keyed by the
+  address of the `AtomicU64` root, so per-page latches never deadlock between
+  static API callers.
+
+### Known limitations (deferred to 40.10)
+
+- Concurrent root republication for `BTree::insert_in` / `delete_in` across
+  root splits is not yet retry-safe. The 8-thread × 10K stress test
+  (`test_concurrent_insert_in_eight_threads_all_keys_reachable`) is
+  therefore writer-only; reader/writer interaction is exercised on a
+  pre-populated tree where the root never changes during the run.
+- Internal-children early release for the index B-tree **delete** path
+  requires the internal rebalance routines to keep their parent pid in
+  place (no CoW). That refactor is the prerequisite for full
+  internal-children early release on delete.

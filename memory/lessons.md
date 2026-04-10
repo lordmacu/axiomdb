@@ -1,5 +1,45 @@
 # Lessons Learned
 
+## 2026-04-09 - Early X-latch release in a B-tree must account for the rebalance pid contract, not only key counts
+
+- The classic Bayer/McCreith "child has room → drop parent latch" rule
+  assumes the child's pid never changes during the recursive call.
+- In AxiomDB's index B-tree the **delete** rebalance routines
+  (`rotate_right` / `rotate_left` / `merge_children` for internal nodes)
+  still use Copy-on-Write: they allocate a fresh pid for the rotated
+  parent and free the old one. That means even an internal child with
+  plenty of keys can return a different pid to its grandparent if a
+  *deeper* underflow propagates a rebalance up to it.
+- The honest intermediate contract is therefore stricter than the textbook
+  rule:
+  - **Insert** safe descent → "child has room for one more key" is enough
+    because the index tree's split path keeps the parent pid stable
+    (`write_internal_same_pid` / `in_place_update_child`).
+  - **Delete** safe descent → must additionally guarantee that the child
+    will never call into the CoW rebalance path. The simplest sufficient
+    predicate is "the immediate child is a leaf with strictly more than
+    `MIN_KEYS_LEAF` keys" — leaves are always rewritten in place, so
+    their pid is stable, and the underflow check rules out a leaf-level
+    rebalance.
+- The clustered B-tree never allocates a new pid on rebalance/merge (left
+  page is reused), so its delete safe-descent predicate is purely byte
+  occupancy. The lesson is that the safe-descent predicate is not just a
+  function of the data structure's invariants — it depends on the
+  *implementation* contract of the rebalance path.
+- When dropping the parent latch before the recursion, the safe path may
+  still need to repair a separator after the child returns
+  `min_changed = true && child_idx > 0`. Re-acquire the parent latch
+  *only* in that branch so the common case stays cheap, and surface
+  `underfull = true` if the new separator no longer fits in the parent —
+  the grandparent's existing rebalance path will then handle the propagation.
+
+## 2026-04-09 - Keep the final workspace test command short and record Linux as the faster validation baseline
+
+- When writing project memory for the final test gate, use the exact command `cargo test --workspace`.
+- Do not store longer command variants in memory unless a specific flag is actually part of the required workflow.
+- In this workspace, the full test run is noticeably faster than on the user's macOS machine.
+- Treat this environment as the preferred baseline for broad validation and closing sweeps.
+
 ## 2026-04-03 - Clustered rebuild must flush new roots before the catalog swap and defer old-page free until commit
 
 - A heap→clustered migration is not just “copy rows, update metadata, free old pages”.

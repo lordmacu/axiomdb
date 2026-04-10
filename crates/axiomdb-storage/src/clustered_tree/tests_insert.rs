@@ -202,3 +202,48 @@ fn rows_that_need_overflow_are_materialized_and_reconstructed() {
     assert_eq!(row.row_data, payload);
 }
 
+/// Phase 40.8c: many inserts grow the clustered tree past a single internal
+/// level, exercising the early-X-latch-release path on every safe descent.
+/// The final tree must remain functionally correct (all keys reachable in
+/// sorted order via the leaf chain).
+#[test]
+fn many_inserts_with_safe_descent_keep_tree_consistent() {
+    let mut storage = MemoryStorage::new();
+    let mut root = None;
+
+    let count = 2_000u32;
+    for key in 0..count {
+        root = Some(
+            insert(
+                &mut storage,
+                root,
+                &key.to_be_bytes(),
+                &row_header(1),
+                b"row-payload",
+            )
+            .unwrap(),
+        );
+    }
+
+    let root_pid = root.unwrap();
+    let root_page = storage.read_page(root_pid).unwrap();
+    assert_eq!(
+        clustered_page_type(&root_page).unwrap(),
+        PageType::ClusteredInternal,
+        "root must be internal after {count} inserts so the descent has at least one early-release opportunity"
+    );
+
+    let keys = collect_leaf_chain_keys(&storage, root_pid).unwrap();
+    let expected: Vec<Vec<u8>> = (0u32..count).map(|v| v.to_be_bytes().to_vec()).collect();
+    assert_eq!(keys, expected);
+
+    // Spot-check point lookups for the start, middle, and end keys.
+    let snap = committed_snapshot(10);
+    for k in [0u32, count / 2, count - 1] {
+        let row = lookup(&storage, Some(root_pid), &k.to_be_bytes(), &snap)
+            .unwrap()
+            .unwrap_or_else(|| panic!("key {k} should be reachable after early-release inserts"));
+        assert_eq!(row.row_data, b"row-payload");
+    }
+}
+

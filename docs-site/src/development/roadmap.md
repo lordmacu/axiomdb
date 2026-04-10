@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 40.1b CREATE INDEX on clustered tables — removed `ensure_heap_runtime` guard; `CREATE INDEX` / `CREATE UNIQUE INDEX` now work on clustered (PRIMARY KEY) tables using `ClusteredSecondaryLayout`-based index build with partial index, NULL-skipping, and uniqueness enforcement at build time.
+**Last completed subphase:** 40.8 B-tree latch coupling — hybrid optimistic / pessimistic latch coupling protocol for both the index B-tree (`axiomdb-index`) and the clustered B-tree (`axiomdb-storage::clustered_tree`). Read-path S-latch coupling with no-wait child latches and restart-on-contention; optimistic write fast path X-latches the leaf only; pessimistic write descent now drops the parent X-latch on safe descent (`child_is_safe_for_insert` / `child_is_safe_for_delete`) so concurrent S-latch readers can resume on the cleared internal pages. Stress test: 8 threads × 10K writes plus reader/writer concurrency on a pre-populated tree.
 
-**Active development:** Phase 40 — Clustered engine performance optimizations (40.1 ClusteredInsertBatch done; 40.1b CREATE INDEX on clustered tables done; statement plan cache, transaction write set, vectorized scan next)
+**Active development:** Phase 40 — Clustered engine performance optimizations (40.1 → 40.8 done; 40.9 FreeList Tier-1, 40.10 Database Lock Redesign, 40.11 Executor Refactoring, 40.12 Integration Tests next)
 
-**Next milestone:** 40.2 — Statement plan cache (per-session `CachedPlanSource` with OID-based invalidation)
+**Next milestone:** 40.9 — FreeList Tier-1: per-connection `LocalPageBatch` (64 pages/refill) for O(1) lock-free allocation
 
 **Concurrency note:** the current server already supports concurrent read-only
 queries, but mutating statements are still serialized through a database-wide

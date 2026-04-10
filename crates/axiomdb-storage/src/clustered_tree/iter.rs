@@ -14,6 +14,7 @@ impl<'a> ClusteredRangeIter<'a> {
         Self {
             storage,
             current_pid: clustered_leaf::NULL_PAGE,
+            current_latch: None,
             next_leaf_cache: clustered_leaf::NULL_PAGE,
             slot_idx: 0,
             from,
@@ -51,74 +52,127 @@ impl Iterator for ClusteredRangeIter<'_> {
         loop {
             if self.current_pid == clustered_leaf::NULL_PAGE {
                 self.done = true;
+                self.current_latch = None;
                 return None;
             }
 
-            let page = match self.storage.read_page(self.current_pid) {
-                Ok(page) => page,
-                Err(err) => return Some(Err(err)),
+            if self.current_latch.is_none() {
+                self.current_latch = Some(self.storage.page_lock_table().read(self.current_pid));
+            }
+
+            enum IterResult {
+                Row(ClusteredRow),
+                Advance(u64),
+                Done,
+            }
+
+            let result = {
+                let page = match self.storage.read_page(self.current_pid) {
+                    Ok(page) => page,
+                    Err(err) => return Some(Err(err)),
+                };
+
+                match clustered_page_type(&page) {
+                    Ok(PageType::ClusteredLeaf) => {}
+                    Ok(other) => {
+                        return Some(Err(DbError::BTreeCorrupted {
+                            msg: format!(
+                                "clustered range scan expected leaf at page {}, found {other:?}",
+                                self.current_pid
+                            ),
+                        }));
+                    }
+                    Err(err) => return Some(Err(err)),
+                }
+
+                if self.next_leaf_cache == clustered_leaf::NULL_PAGE {
+                    self.next_leaf_cache = clustered_leaf::next_leaf(&page);
+                }
+
+                let num_cells = clustered_leaf::num_cells(&page) as usize;
+                let mut row = None;
+                let mut reached_upper = false;
+                while self.slot_idx < num_cells {
+                    let idx = self.slot_idx as u16;
+                    self.slot_idx += 1;
+
+                    let cell = match clustered_leaf::read_cell(&page, idx) {
+                        Ok(cell) => cell,
+                        Err(err) => return Some(Err(err)),
+                    };
+
+                    if !self.above_lower(cell.key) {
+                        continue;
+                    }
+                    if !self.below_upper(cell.key) {
+                        reached_upper = true;
+                        break;
+                    } else if !cell.row_header.is_visible(&self.snapshot) {
+                        continue;
+                    } else {
+                        let row_data = match reconstruct_row_data(self.storage, &cell) {
+                            Ok(row_data) => row_data,
+                            Err(err) => return Some(Err(err)),
+                        };
+
+                        row = Some(ClusteredRow {
+                            key: cell.key.to_vec(),
+                            row_header: cell.row_header,
+                            row_data,
+                        });
+                        break;
+                    }
+                }
+
+                if let Some(row) = row {
+                    IterResult::Row(row)
+                } else if reached_upper {
+                    IterResult::Done
+                } else {
+                    let next_pid = self.next_leaf_cache;
+                    if next_pid == clustered_leaf::NULL_PAGE {
+                        IterResult::Done
+                    } else {
+                        IterResult::Advance(next_pid)
+                    }
+                }
             };
 
-            match clustered_page_type(&page) {
-                Ok(PageType::ClusteredLeaf) => {}
-                Ok(other) => {
-                    return Some(Err(DbError::BTreeCorrupted {
-                        msg: format!(
-                            "clustered range scan expected leaf at page {}, found {other:?}",
-                            self.current_pid
-                        ),
-                    }));
+            match result {
+                IterResult::Row(row) => {
+                    if !self.below_upper(&row.key) {
+                        self.done = true;
+                        self.current_latch = None;
+                        return None;
+                    }
+                    return Some(Ok(row));
                 }
-                Err(err) => return Some(Err(err)),
-            }
-
-            if self.next_leaf_cache == clustered_leaf::NULL_PAGE {
-                self.next_leaf_cache = clustered_leaf::next_leaf(&page);
-            }
-
-            let num_cells = clustered_leaf::num_cells(&page) as usize;
-            while self.slot_idx < num_cells {
-                let idx = self.slot_idx as u16;
-                self.slot_idx += 1;
-
-                let cell = match clustered_leaf::read_cell(&page, idx) {
-                    Ok(cell) => cell,
-                    Err(err) => return Some(Err(err)),
-                };
-
-                if !self.above_lower(cell.key) {
-                    continue;
-                }
-                if !self.below_upper(cell.key) {
+                IterResult::Done => {
                     self.done = true;
+                    self.current_latch = None;
                     return None;
                 }
-                if !cell.row_header.is_visible(&self.snapshot) {
-                    continue;
+                IterResult::Advance(next_pid) => {
+                    self.storage.prefetch_hint(next_pid, PREFETCH_DEPTH);
+                    let next_guard = match self.storage.page_lock_table().try_read(next_pid) {
+                        Some(guard) => {
+                            let old_guard = self.current_latch.replace(guard);
+                            drop(old_guard);
+                            None
+                        }
+                        None => {
+                            self.current_latch = None;
+                            Some(self.storage.page_lock_table().read(next_pid))
+                        }
+                    };
+                    if let Some(guard) = next_guard {
+                        self.current_latch = Some(guard);
+                    }
+                    self.current_pid = next_pid;
+                    self.next_leaf_cache = clustered_leaf::NULL_PAGE;
+                    self.slot_idx = 0;
                 }
-
-                let row_data = match reconstruct_row_data(self.storage, &cell) {
-                    Ok(row_data) => row_data,
-                    Err(err) => return Some(Err(err)),
-                };
-
-                return Some(Ok(ClusteredRow {
-                    key: cell.key.to_vec(),
-                    row_header: cell.row_header,
-                    row_data,
-                }));
             }
-
-            let next_pid = self.next_leaf_cache;
-            if next_pid == clustered_leaf::NULL_PAGE {
-                self.done = true;
-                return None;
-            }
-
-            self.storage.prefetch_hint(next_pid, PREFETCH_DEPTH);
-            self.current_pid = next_pid;
-            self.next_leaf_cache = clustered_leaf::NULL_PAGE;
-            self.slot_idx = 0;
         }
     }
 }

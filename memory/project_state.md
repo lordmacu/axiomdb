@@ -2,6 +2,33 @@
 
 ## 2026-04-09
 
+- Phase 40 subphase `40.8` (B-tree latch coupling) is closed in code,
+  targeted validation, and full workspace gate. The hybrid optimistic /
+  pessimistic protocol now lives in both B-trees:
+  - `crates/axiomdb-index/src/tree_insert.rs` and `tree_delete.rs` —
+    `child_is_safe_for_insert` / `child_is_safe_for_delete` helpers; on safe
+    descent the parent X-latch is dropped before the recursive call so
+    concurrent S-latch readers can resume on the cleared internal page.
+  - `crates/axiomdb-storage/src/clustered_tree/page_utils.rs` — same pair
+    of helpers, but byte-budget based; wired into `btree_insert.rs` and
+    `delete.rs` with the corresponding early-release branches.
+  - The clustered delete safe path repairs the parent separator only when
+    `min_changed && child_idx > 0`, falling back to the slow rebalance only
+    if the new separator no longer fits in the parent page.
+  - Read-path latch coupling already shipped in 40.8a (read-only descents
+    use S-latch coupling with `try_read` and restart-on-contention).
+- Two known gaps remain explicit in the spec, both deferred to 40.10:
+  - concurrent root republication for `BTree::insert_in` / `delete_in`
+    across root splits is still racy enough that the 8-thread × 10K stress
+    test runs writers-only;
+  - early X-latch release for the index B-tree **delete** path only treats
+    leaf children as "safe" because the rebalance routines for internal
+    children still allocate a new parent pid (CoW). Removing that CoW is
+    the prerequisite for full internal-children early release.
+- Validation for this closure:
+  - `cargo test --workspace` (2506 passed, 9 ignored, 0 failed)
+  - `cargo clippy --workspace --lib --bins -- -D warnings` (clean)
+  - `cargo fmt --check` (clean)
 - Phase 4 subphases `4.22c` and `4.22e` are closed in code, targeted
   validation, and wire smoke.
 - `crates/axiomdb-sql/src/executor/ddl_alter_constraint.rs` now implements
@@ -22,7 +49,7 @@
   helpers for index and foreign-key catalog rows so ALTER TABLE can remap column
   ordinals and swap repaired roots atomically inside the statement transaction.
 - Validation for this closure:
-  - `cargo test --workspace --no-fail-fast`
+  - `cargo test --workspace`
   - `cargo clippy --workspace -- -D warnings`
   - `cargo fmt --check`
   - `tools/wire-test.py`: `338/338`
@@ -43,6 +70,13 @@
 - local macOS dev builds now use `.cargo/config.toml` plus
   `tools/rustc-macos.sh` / `tools/linker-macos.sh` to strip
   `com.apple.provenance` from outputs and keep proc-macro/test binaries runnable
+- local validation guidance was tightened further:
+  - when recording the final workspace gate in memory, use the exact command
+    `cargo test --workspace`
+  - do not restate longer variants unless they are intentionally required
+  - this Linux workspace is also noticeably faster for the full test suite than
+    the user's local macOS environment, so it is the preferred reference point
+    for broad validation runs
 
 ## 2026-04-03
 

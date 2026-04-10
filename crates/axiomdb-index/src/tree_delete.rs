@@ -3,17 +3,33 @@ impl BTree {
 
     pub fn delete(&mut self, key: &[u8]) -> Result<bool, DbError> {
         Self::check_key(key)?;
-        let root = self.root_pid.load(Ordering::Acquire);
-        match Self::delete_subtree(self.storage.as_mut(), root, key, true)? {
-            DeleteResult::NotFound => Ok(false),
-            DeleteResult::Deleted { new_pid, .. } => {
-                let final_root = Self::collapse_root(self.storage.as_mut(), new_pid)?;
-                self.root_pid
-                    .compare_exchange(root, final_root, Ordering::AcqRel, Ordering::Acquire)
-                    .map_err(|_| DbError::BTreeCorrupted {
-                        msg: "root modified concurrently during delete".into(),
-                    })?;
-                Ok(true)
+        loop {
+            let root = self.root_pid.load(Ordering::Acquire);
+            match Self::try_delete_leaf_optimistically(self.storage.as_mut(), root, key)? {
+                OptimisticLeafResult::Done(deleted) => return Ok(deleted),
+                OptimisticLeafResult::Retry => continue,
+                OptimisticLeafResult::NeedPessimistic => {}
+            }
+
+            match Self::delete_subtree(self.storage.as_mut(), root, key, true)? {
+                DeleteResult::NotFound => {
+                    if self.root_pid.load(Ordering::Acquire) == root {
+                        return Ok(false);
+                    }
+                }
+                DeleteResult::Deleted { new_pid, .. } => {
+                    let final_root = Self::collapse_root(self.storage.as_mut(), new_pid)?;
+                    if self
+                        .root_pid
+                        .compare_exchange(root, final_root, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        return Ok(true);
+                    }
+                    if self.lookup(key)?.is_none() {
+                        return Ok(true);
+                    }
+                }
             }
         }
     }
@@ -24,11 +40,41 @@ impl BTree {
         key: &[u8],
         is_root: bool,
     ) -> Result<DeleteResult, DbError> {
+        let parent_guard = storage.page_lock_table().write(pid);
         match NodeCopy::read(storage, pid)? {
             NodeCopy::Leaf(node) => Self::delete_leaf(storage, pid, node, key, is_root),
             NodeCopy::Internal(node) => {
                 let child_idx = node.find_child_idx(key);
                 let child_pid = node.child_at(child_idx);
+
+                // Phase 40.8c: early X-latch release on safe descent.
+                // The recursive call cannot need a parent update when the
+                // immediate child is a leaf with strictly more than
+                // `MIN_KEYS_LEAF` keys: leaves keep their pid in the delete
+                // fast path, and the underflow check guarantees no upward
+                // propagation. See `child_is_safe_for_delete` for the full
+                // rationale.
+                if Self::child_is_safe_for_delete(storage, child_pid)? {
+                    drop(parent_guard);
+                    let result = Self::delete_subtree(storage, child_pid, key, false)?;
+                    return match result {
+                        DeleteResult::NotFound => Ok(DeleteResult::NotFound),
+                        DeleteResult::Deleted { new_pid, underfull } => {
+                            debug_assert_eq!(
+                                new_pid, child_pid,
+                                "safe child must return Deleted with the same pid"
+                            );
+                            debug_assert!(
+                                !underfull,
+                                "safe child must not underflow under delete"
+                            );
+                            Ok(DeleteResult::Deleted {
+                                new_pid: pid,
+                                underfull: false,
+                            })
+                        }
+                    };
+                }
 
                 match Self::delete_subtree(storage, child_pid, key, false)? {
                     DeleteResult::NotFound => Ok(DeleteResult::NotFound),
@@ -200,6 +246,17 @@ impl BTree {
         is_leaf: bool,
     ) -> Result<u64, DbError> {
         let np = storage.alloc_page(PageType::Index)?;
+        let (_guard_a, _guard_b) = if left_pid <= child_pid {
+            (
+                storage.page_lock_table().write(left_pid),
+                storage.page_lock_table().write(child_pid),
+            )
+        } else {
+            (
+                storage.page_lock_table().write(child_pid),
+                storage.page_lock_table().write(left_pid),
+            )
+        };
 
         if is_leaf {
             // In-place leaf rotation: reuse left_pid and child_pid so the
@@ -233,11 +290,11 @@ impl BTree {
             let mut lp = Page::new(PageType::Index, left_pid);
             *cast_leaf_mut(&mut lp) = left;
             lp.update_checksum();
-            storage.write_page(left_pid, &lp)?;
+            storage.write_page_under_page_lock(left_pid, &lp)?;
             let mut cp = Page::new(PageType::Index, child_pid);
             *cast_leaf_mut(&mut cp) = child;
             cp.update_checksum();
-            storage.write_page(child_pid, &cp)?;
+            storage.write_page_under_page_lock(child_pid, &cp)?;
             // Do NOT free left_pid or child_pid — they are still live leaves.
         } else {
             let nc = storage.alloc_page(PageType::Index)?;
@@ -318,6 +375,17 @@ impl BTree {
         is_leaf: bool,
     ) -> Result<u64, DbError> {
         let np = storage.alloc_page(PageType::Index)?;
+        let (_guard_a, _guard_b) = if child_pid <= right_pid {
+            (
+                storage.page_lock_table().write(child_pid),
+                storage.page_lock_table().write(right_pid),
+            )
+        } else {
+            (
+                storage.page_lock_table().write(right_pid),
+                storage.page_lock_table().write(child_pid),
+            )
+        };
 
         if is_leaf {
             // In-place leaf rotation: reuse child_pid and right_pid so
@@ -350,11 +418,11 @@ impl BTree {
             let mut cp = Page::new(PageType::Index, child_pid);
             *cast_leaf_mut(&mut cp) = child;
             cp.update_checksum();
-            storage.write_page(child_pid, &cp)?;
+            storage.write_page_under_page_lock(child_pid, &cp)?;
             let mut rp = Page::new(PageType::Index, right_pid);
             *cast_leaf_mut(&mut rp) = right;
             rp.update_checksum();
-            storage.write_page(right_pid, &rp)?;
+            storage.write_page_under_page_lock(right_pid, &rp)?;
             // Do NOT free child_pid or right_pid — they are still live leaves.
         } else {
             let nc = storage.alloc_page(PageType::Index)?;
@@ -417,6 +485,17 @@ impl BTree {
         is_leaf: bool,
     ) -> Result<u64, DbError> {
         let npp = storage.alloc_page(PageType::Index)?;
+        let (_guard_a, _guard_b) = if left_pid <= right_pid {
+            (
+                storage.page_lock_table().write(left_pid),
+                storage.page_lock_table().write(right_pid),
+            )
+        } else {
+            (
+                storage.page_lock_table().write(right_pid),
+                storage.page_lock_table().write(left_pid),
+            )
+        };
 
         // `merged_pid` is the page ID that will hold the merged node.
         // For leaves we reuse `left_pid` in-place so the predecessor's
@@ -443,7 +522,7 @@ impl BTree {
             let mut pg = Page::new(PageType::Index, left_pid);
             *cast_leaf_mut(&mut pg) = merged;
             pg.update_checksum();
-            storage.write_page(left_pid, &pg)?;
+            storage.write_page_under_page_lock(left_pid, &pg)?;
             // right_pid is freed below; left_pid stays live.
             left_pid
         } else {
