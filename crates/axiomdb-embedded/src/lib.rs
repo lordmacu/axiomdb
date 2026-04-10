@@ -110,6 +110,9 @@ mod db {
         /// Last error message. Cleared on success, set on any error.
         /// Exposed via `last_error()` (Rust) and `axiomdb_last_error()` (C FFI).
         pub(crate) error_msg: Option<CString>,
+        /// Temp directory for `:memory:` mode (Phase 11.3).
+        /// Kept alive as long as the `Db` exists; cleaned up on drop.
+        _tmpdir: Option<tempfile::TempDir>,
     }
 
     impl Db {
@@ -122,6 +125,10 @@ mod db {
         /// ```
         pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
             let path = path.as_ref();
+            // Phase 11.3: `:memory:` shorthand → ephemeral tempdir-backed database.
+            if path.as_os_str() == ":memory:" {
+                return Self::open_memory();
+            }
             let db_path = path.with_extension("db");
             let wal_path = path.with_extension("wal");
 
@@ -149,6 +156,38 @@ mod db {
                 session: SessionContext::default(),
                 degraded: false,
                 error_msg: None,
+                _tmpdir: None,
+            })
+        }
+
+        /// Opens an ephemeral in-memory database (Phase 11.3).
+        ///
+        /// Data lives in a temporary directory and is discarded when the `Db`
+        /// is dropped. Equivalent to SQLite's `":memory:"` mode.
+        ///
+        /// ```rust,no_run
+        /// let mut db = axiomdb_embedded::Db::open_memory().unwrap();
+        /// db.execute("CREATE TABLE t (id INT)").unwrap();
+        /// // data disappears when `db` goes out of scope
+        /// ```
+        pub fn open_memory() -> Result<Self, DbError> {
+            let tmpdir = tempfile::tempdir().map_err(DbError::Io)?;
+            let db_path = tmpdir.path().join("mem.db");
+            let wal_path = tmpdir.path().join("mem.wal");
+
+            let storage = MmapStorage::create(&db_path)?;
+            CatalogBootstrap::init(&storage)?;
+            let txn = TxnManager::create(&wal_path)?;
+
+            Ok(Self {
+                storage,
+                txn,
+                bloom: BloomRegistry::new(),
+                schema_cache: SchemaCache::new(),
+                session: SessionContext::default(),
+                degraded: false,
+                error_msg: None,
+                _tmpdir: Some(tmpdir),
             })
         }
 
