@@ -42,7 +42,7 @@ use axiomdb_sql::{
     analyze_cached_with_defaults,
     ast::Stmt,
     bloom::BloomRegistry,
-    execute_read_only_with_ctx, execute_with_ctx, parse_with_sql_mode,
+    execute_read_only_with_ctx, execute_with_ctx_locked, parse_with_sql_mode,
     result::{ColumnMeta, QueryResult},
     session::{is_ignorable_on_error, OnErrorMode},
     verify_and_repair_indexes_on_open, SchemaCache, SessionContext,
@@ -106,6 +106,9 @@ pub struct SharedDatabase {
     /// Catalog lock used by the wire layer to serialize DDL against concurrent
     /// DML while allowing multiple read-side statements to proceed together.
     pub(crate) catalog_lock: RwLock<()>,
+    /// Row-level lock manager (Phase 40.11). Shared across all connections.
+    /// Used by DML for IX(table) + X(row) locks. Released on COMMIT/ROLLBACK.
+    pub lock_mgr: axiomdb_lock::LockManager,
 }
 
 impl SharedDatabase {
@@ -165,6 +168,7 @@ impl SharedDatabase {
                 super::snapshot_registry::DEFAULT_MAX_CONNECTIONS,
             )),
             catalog_lock: RwLock::new(()),
+            lock_mgr: axiomdb_lock::LockManager::new(),
         })
     }
 
@@ -270,7 +274,14 @@ impl SharedDatabase {
         };
 
         // ── execute ───────────────────────────────────────────────────────────
-        let result = execute_with_ctx(analyzed, &self.storage, &self.txn, &self.bloom, session);
+        let result = execute_with_ctx_locked(
+            analyzed,
+            &self.storage,
+            &self.txn,
+            &self.bloom,
+            Some(&self.lock_mgr),
+            session,
+        );
         if let Err(ref e) = result {
             if matches!(e, DbError::DiskFull { .. }) {
                 self.enter_degraded_mode();
@@ -489,7 +500,14 @@ impl SharedDatabase {
         };
 
         // Execute.
-        let result = execute_with_ctx(analyzed, &self.storage, &self.txn, &self.bloom, session);
+        let result = execute_with_ctx_locked(
+            analyzed,
+            &self.storage,
+            &self.txn,
+            &self.bloom,
+            Some(&self.lock_mgr),
+            session,
+        );
         if let Err(ref e) = result {
             if matches!(e, DbError::DiskFull { .. }) {
                 self.enter_degraded_mode();
@@ -523,7 +541,14 @@ impl SharedDatabase {
             });
         }
         let is_ddl = is_schema_changing(&stmt);
-        let result = execute_with_ctx(stmt, &self.storage, &self.txn, &self.bloom, session);
+        let result = execute_with_ctx_locked(
+            stmt,
+            &self.storage,
+            &self.txn,
+            &self.bloom,
+            Some(&self.lock_mgr),
+            session,
+        );
         if let Err(ref e) = result {
             if matches!(e, DbError::DiskFull { .. }) {
                 self.enter_degraded_mode();

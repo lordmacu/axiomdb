@@ -32,6 +32,11 @@ pub fn execute_with_ctx_locked(
                 ctx.pending_deferred_txn_id = txn.commit(conn)?;
                 txn.release_immediate_committed_frees(storage, tid)?;
                 txn.drain_committed_page_batches(storage)?;
+                // Phase 40.11: release all row+table locks held by this txn.
+                // InnoDB `lock_trx_release_locks()` pattern: always after WAL commit.
+                if let Some(lm) = lock_mgr {
+                    lm.release_all_for_txn(tid);
+                }
                 return Ok(QueryResult::Empty);
             }
             Stmt::Rollback => {
@@ -40,8 +45,13 @@ pub fn execute_with_ctx_locked(
                 ctx.discard_clustered_insert_batch();
                 ctx.savepoints.clear(); // all savepoints destroyed on ROLLBACK
                 let conn = ctx.conn_txn.take().expect("conn_txn checked above");
-                return rollback_with_index_undo(txn, conn, storage, bloom)
-                    .map(|_| QueryResult::Empty);
+                let tid = conn.txn_id;
+                let result = rollback_with_index_undo(txn, conn, storage, bloom);
+                // Phase 40.11: release all locks on rollback too.
+                if let Some(lm) = lock_mgr {
+                    lm.release_all_for_txn(tid);
+                }
+                return result.map(|_| QueryResult::Empty);
             }
             Stmt::Begin => {
                 let txn_id = ctx.conn_txn.as_ref().map(|c| c.txn_id).unwrap_or(0);
@@ -101,6 +111,7 @@ pub fn execute_with_ctx_locked(
             let _ = txn.commit(pre_conn)?;
             txn.release_immediate_committed_frees(storage, pre_tid)?;
             txn.drain_committed_page_batches(storage)?;
+            if let Some(lm) = lock_mgr { lm.release_all_for_txn(pre_tid); }
             ctx.conn_txn = Some(txn.begin()?);
             let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
             return match dispatch_ctx(stmt, &exec_ctx2, ctx) {
@@ -207,11 +218,14 @@ pub fn execute_with_ctx_locked(
                         ctx.pending_deferred_txn_id = txn.commit(conn)?;
                         txn.release_immediate_committed_frees(storage, tid)?;
                         txn.drain_committed_page_batches(storage)?;
+                        if let Some(lm) = lock_mgr { lm.release_all_for_txn(tid); }
                         Ok(result)
                     }
                     Err(e) => {
                         let conn = ctx.conn_txn.take().expect("just set above");
+                        let tid = conn.txn_id;
                         let _ = rollback_with_index_undo(txn, conn, storage, bloom);
+                        if let Some(lm) = lock_mgr { lm.release_all_for_txn(tid); }
                         Err(e)
                     }
                 }
