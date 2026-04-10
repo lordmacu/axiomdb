@@ -19,8 +19,8 @@ use axiomdb_wal::TxnManager;
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn setup() -> (MemoryStorage, TxnManager) {
-    let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    let storage = MemoryStorage::new();
+    CatalogBootstrap::init(&storage).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("test.wal");
     let txn = TxnManager::create(&wal_path).unwrap();
@@ -53,11 +53,11 @@ fn capturing_listener(notifier: &CatalogChangeNotifier) -> Arc<Mutex<Vec<SchemaC
 
 #[test]
 fn test_no_notifier_backward_compatible() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
     // CatalogWriter without a notifier must work identically to before.
     let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         w.create_table("public", "users").unwrap();
     }
     txn.commit(conn_txn).unwrap();
@@ -71,13 +71,13 @@ fn test_no_notifier_backward_compatible() {
 
 #[test]
 fn test_create_table_fires_table_created() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
     let notifier = Arc::new(CatalogChangeNotifier::new());
     let events = capturing_listener(&notifier);
 
     let mut conn_txn = txn.begin().unwrap();
     let table_id = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn)
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn)
             .unwrap()
             .with_notifier(Arc::clone(&notifier));
         w.create_table("public", "orders").unwrap()
@@ -97,13 +97,13 @@ fn test_create_table_fires_table_created() {
 #[test]
 fn test_create_table_fires_before_commit() {
     // Notification must arrive before commit() is called.
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
     let notifier = Arc::new(CatalogChangeNotifier::new());
     let events = capturing_listener(&notifier);
 
     let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn)
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn)
             .unwrap()
             .with_notifier(Arc::clone(&notifier));
         w.create_table("public", "t").unwrap();
@@ -121,13 +121,13 @@ fn test_create_table_fires_before_commit() {
 
 #[test]
 fn test_create_column_fires_no_event() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
     let notifier = Arc::new(CatalogChangeNotifier::new());
     let events = capturing_listener(&notifier);
 
     let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn)
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn)
             .unwrap()
             .with_notifier(Arc::clone(&notifier));
         let tid = w.create_table("public", "t").unwrap();
@@ -158,13 +158,13 @@ fn test_create_column_fires_no_event() {
 
 #[test]
 fn test_create_index_fires_index_created() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
     let notifier = Arc::new(CatalogChangeNotifier::new());
     let events = capturing_listener(&notifier);
 
     let mut conn_txn = txn.begin().unwrap();
     let (table_id, index_id) = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn)
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn)
             .unwrap()
             .with_notifier(Arc::clone(&notifier));
         let tid = w.create_table("public", "t").unwrap();
@@ -207,12 +207,12 @@ fn test_create_index_fires_index_created() {
 
 #[test]
 fn test_delete_table_fires_table_dropped() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     // Create table (separate txn).
     let mut conn_txn = txn.begin().unwrap();
     let table_id = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         w.create_table("public", "t").unwrap()
     };
     txn.commit(conn_txn).unwrap();
@@ -223,7 +223,7 @@ fn test_delete_table_fires_table_dropped() {
 
     let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn)
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn)
             .unwrap()
             .with_notifier(Arc::clone(&notifier));
         w.delete_table(table_id).unwrap();
@@ -241,12 +241,12 @@ fn test_delete_table_fires_table_dropped() {
 
 #[test]
 fn test_delete_table_with_indexes_fires_index_dropped_per_index() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     // Create table + 2 indexes.
     let mut conn_txn = txn.begin().unwrap();
     let (table_id, iid1, iid2) = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         let tid = w.create_table("public", "t").unwrap();
         let i1 = w
             .create_index(IndexDef {
@@ -292,7 +292,7 @@ fn test_delete_table_with_indexes_fires_index_dropped_per_index() {
 
     let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn)
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn)
             .unwrap()
             .with_notifier(Arc::clone(&notifier));
         w.delete_table(table_id).unwrap();
@@ -332,11 +332,11 @@ fn test_delete_table_with_indexes_fires_index_dropped_per_index() {
 
 #[test]
 fn test_delete_index_fires_index_dropped() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
 
     let mut conn_txn = txn.begin().unwrap();
     let (table_id, index_id) = {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).unwrap();
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
         let tid = w.create_table("public", "t").unwrap();
         let iid = w
             .create_index(IndexDef {
@@ -364,7 +364,7 @@ fn test_delete_index_fires_index_dropped() {
 
     let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn)
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn)
             .unwrap()
             .with_notifier(Arc::clone(&notifier));
         w.delete_index(index_id).unwrap();
@@ -384,7 +384,7 @@ fn test_delete_index_fires_index_dropped() {
 
 #[test]
 fn test_multiple_listeners_all_receive_events() {
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
     let notifier = Arc::new(CatalogChangeNotifier::new());
     let events_a = capturing_listener(&notifier);
     let events_b = capturing_listener(&notifier);
@@ -392,7 +392,7 @@ fn test_multiple_listeners_all_receive_events() {
 
     let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn)
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn)
             .unwrap()
             .with_notifier(Arc::clone(&notifier));
         w.create_table("public", "t").unwrap();
@@ -423,19 +423,19 @@ fn test_spurious_notification_on_rollback() {
     // Notification fires before commit. If txn rolls back, the table is gone
     // but the notification was already delivered. This is the documented
     // spurious-notification contract.
-    let (mut storage, mut txn) = setup();
+    let (storage, txn) = setup();
     let notifier = Arc::new(CatalogChangeNotifier::new());
     let events = capturing_listener(&notifier);
 
     let mut conn_txn = txn.begin().unwrap();
     {
-        let mut w = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn)
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn)
             .unwrap()
             .with_notifier(Arc::clone(&notifier));
         w.create_table("public", "ghost").unwrap();
     }
     // Rollback — the table write is undone.
-    txn.rollback(conn_txn, &mut storage).unwrap();
+    txn.rollback(conn_txn, &storage).unwrap();
 
     // Notification was delivered before the rollback.
     assert_eq!(

@@ -695,6 +695,7 @@ fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::BigInt => "BIGINT",
         ColumnType::Float => "REAL",
         ColumnType::Text => "TEXT",
+        ColumnType::Json => "JSON",
         ColumnType::Bytes => "BYTES",
         ColumnType::Timestamp => "TIMESTAMP",
         ColumnType::Uuid => "UUID",

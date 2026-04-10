@@ -97,7 +97,7 @@ locking clauses.
 | 8 | Advanced SQL | ⚠️ Planned | Window functions, CTEs, recursive queries |
 | 9 | VACUUM / GC | ⚠️ Planned | Dead row cleanup, freelist compaction |
 | 10 | MySQL wire protocol | ⚠️ Planned | COM_QUERY, result set packets, handshake |
-| 11 | TOAST | ⚠️ Planned | Out-of-line storage for large values |
+| 11 | Robustness and indexes | 🔄 In progress | BRIN, TOAST, in-memory mode, native JSON, partial indexes, optimizer gaps |
 | 12 | Full-text search | ⚠️ Planned | Inverted index, BM25 ranking |
 | 13 | Foreign key checks | ⚠️ Planned | Constraint validation on insert/delete |
 | 14 | Vectorized execution | ⚠️ Planned | SIMD scans, morsel-driven pipeline |

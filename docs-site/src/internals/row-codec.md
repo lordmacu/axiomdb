@@ -21,8 +21,8 @@ is in `axiomdb-types::codec`.
 │   Decimal          → 16 bytes  little-endian i128 mantissa       │
 │                    +  1 byte   u8 scale                          │
 │   Uuid             → 16 bytes  as-is (big-endian by convention)  │
-│   Text, Bytes      →  3 bytes  u24 LE length prefix              │
-│                    + length bytes  raw UTF-8 / raw bytes         │
+│   Text, Json, Bytes → 3 bytes  u24 LE length prefix              │
+│                    + length bytes  raw UTF-8 JSON/text / bytes   │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -48,6 +48,7 @@ NULL values in the payload section. This means:
 | `Date`        | DATE              | 4 bytes (i32 days)      |
 | `Timestamp`   | TIMESTAMP         | 8 bytes (i64 µs UTC)    |
 | `Text`        | TEXT, VARCHAR, CHAR | 3 + len bytes          |
+| `Json`        | JSON              | 3 + len bytes           |
 | `Bytes`       | BYTEA, BLOB       | 3 + len bytes           |
 
 ---
@@ -94,7 +95,7 @@ This design saves 7 bytes per nullable column compared to wrapping each value in
 
 ## Why u24 for Variable-Length Fields
 
-The length prefix for `Text` and `Bytes` is 3 bytes (a u24 in little-endian). This
+The length prefix for `Text`, `Json`, and `Bytes` is 3 bytes (a u24 in little-endian). This
 covers strings up to 16,777,215 bytes (~16 MB). The codec enforces this limit with
 `DbError::ValueTooLarge`.
 
@@ -110,14 +111,44 @@ it would far exceed the storage limit and be rejected by the heap layer anyway. 
 u24 saves 1 byte per string column — for a table with 10 text columns, every row is
 10 bytes smaller. At 100 million rows, that is 1 GB of disk savings.
 
-The u24 also signals that future TOAST (out-of-line storage for large values) will take
-over before values approach 16 MB — TOAST is planned for Phase 6.
+The u24 also leaves the top sentinel values for TOAST (out-of-line storage for
+large values). Phase 11.2 uses those sentinels before values approach 16 MB.
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
 <span class="callout-label">Design Decision — u24 Length Prefix</span>
-Saving 1 byte per text/bytes column is significant at scale: a table with 10 text columns × 100M rows saves 1 GB of disk and proportionally faster I/O. The 16 MB per-value ceiling is intentional — values above ~16 KB will use TOAST (Phase 6) long before reaching it, making the u32 range unused in practice.
+Saving 1 byte per text/bytes column is significant at scale: a table with 10 text columns × 100M rows saves 1 GB of disk and proportionally faster I/O. The 16 MB per-value ceiling is intentional — values above the Phase 11.2 TOAST threshold can move out-of-line long before reaching it, making the u32 range unused in practice.
+</div>
+</div>
+
+---
+
+## JSON Encoding
+
+`Value::Json(String)` uses the same payload shape as `Value::Text`: a u24
+little-endian length followed by UTF-8 bytes. The schema's `DataType::Json`
+selects the JSON decode arm, so the same bytes decode back to `Value::Json`
+instead of `Value::Text`.
+
+```rust
+let values = [Value::Json(r#"{"age":30,"name":"Alice"}"#.into())];
+let schema = [DataType::Json];
+let encoded = encode_row(&values, &schema)?;
+let decoded = decode_row(&encoded, &schema)?;
+assert_eq!(decoded[0], values[0]);
+```
+
+The encoder validates JSON syntax before writing the bytes, and text-to-JSON
+coercion validates the same way during INSERT/UPDATE assignment. JSON strings are
+NFC-normalized like `TEXT`, so visually identical Unicode object keys or string
+values are stored in canonical form.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Text-Backed JSON</span>
+PostgreSQL JSONB pays an upfront binary parse cost to accelerate repeated path lookups; Phase 11.4 keeps AxiomDB's row codec unchanged by storing validated JSON text and defers binary JSONB plus GIN indexing until the JSON index subphase.
 </div>
 </div>
 

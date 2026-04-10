@@ -292,7 +292,7 @@ impl Hash for HashableValue {
                 m.hash(state);
                 s.hash(state);
             }
-            Value::Text(s) => s.hash(state),
+            Value::Text(s) | Value::Json(s) => s.hash(state),
             Value::Bytes(b) => b.hash(state),
             Value::Date(d) => d.hash(state),
             Value::Timestamp(t) => t.hash(state),

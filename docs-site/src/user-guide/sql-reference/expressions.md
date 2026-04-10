@@ -13,12 +13,13 @@ From highest to lowest binding (higher = evaluated first):
 |-------|-----------------------------------|---------------|
 | 1     | `()` parentheses                  | —             |
 | 2     | Unary `-`, `NOT`                  | Right         |
-| 3     | `*`, `/`, `%`                     | Left          |
-| 4     | `+`, `-`                          | Left          |
-| 5     | `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=` | —         |
-| 6     | `IS NULL`, `IS NOT NULL`, `BETWEEN`, `LIKE`, `IN` | — |
-| 7     | `AND`                             | Left          |
-| 8     | `OR`                              | Left          |
+| 3     | JSON `->>` extraction             | Left          |
+| 4     | `*`, `/`, `%`                     | Left          |
+| 5     | `+`, `-`                          | Left          |
+| 6     | `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=` | —         |
+| 7     | `IS NULL`, `IS NOT NULL`, `BETWEEN`, `LIKE`, `IN` | — |
+| 8     | `AND`                             | Left          |
+| 9     | `OR`                              | Left          |
 
 Use parentheses to make complex expressions explicit:
 
@@ -455,6 +456,46 @@ INSERT INTO users (age) VALUES (CAST('30' AS INT));
 | `BIGINT`| `REAL`, `DECIMAL`, `TEXT`       | Widening or lossless stringify — always succeeds |
 | `REAL`  | `TEXT`                          | Lossless stringify — always succeeds          |
 | `NULL`  | any                             | Always returns NULL                           |
+
+### JSON Functions
+
+JSON functions operate on `JSON` columns or valid JSON text. AxiomDB validates
+`JSON` column writes at INSERT/UPDATE time and returns SQLSTATE `22P02` for
+malformed documents.
+
+| Function / Operator | Result |
+|---|---|
+| `JSON_EXTRACT(json, '$.key')` | Extracts a simple object path |
+| `json_col->>'key'` | Sugar for `JSON_EXTRACT(json_col, '$.key')` |
+| `JSON_SET(json, '$.key', value)` | Returns a JSON document with the key set |
+| `JSON_REMOVE(json, '$.key')` | Returns a JSON document with the key removed |
+| `JSON_KEYS(json)` | Returns a JSON array of top-level object keys |
+| `JSON_VALID(value)` | `1` for valid JSON, `0` otherwise |
+| `JSON_TYPE(json)` | `OBJECT`, `ARRAY`, `STRING`, `NUMBER`, `BOOLEAN`, or `NULL` |
+
+```sql
+CREATE TABLE docs (id INT, data JSON);
+INSERT INTO docs VALUES (1, '{"name":"Alice","age":30,"active":true}');
+
+SELECT JSON_EXTRACT(data, '$.age') FROM docs;          -- 30
+SELECT data->>'name' FROM docs;                        -- Alice
+SELECT JSON_EXTRACT(JSON_SET(data, '$.tier', 'pro'), '$.tier') FROM docs;
+SELECT JSON_EXTRACT(JSON_REMOVE(data, '$.age'), '$.age') FROM docs; -- NULL
+SELECT JSON_TYPE(data), JSON_VALID(data) FROM docs;    -- OBJECT, 1
+```
+
+SQL `NULL` input returns `NULL` for `JSON_EXTRACT`, `JSON_SET`,
+`JSON_REMOVE`, `JSON_KEYS`, and `JSON_TYPE`. `JSON_VALID(NULL)` returns `0`.
+Phase 11.4 supports simple paths: `$`, `$.key`, `$.key1.key2`, and array indexes
+as path components such as `$.items.0`.
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Tip — Portable Extraction</span>
+Use <code>JSON_EXTRACT(data, '$.field')</code> when targeting MySQL-compatible clients and <code>data->>'field'</code> when porting PostgreSQL-style SQL; AxiomDB accepts both for simple field extraction.
+</div>
+</div>
 
 ### Conditional Functions
 

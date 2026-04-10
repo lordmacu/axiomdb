@@ -1,5 +1,22 @@
 # Lessons Learned
 
+## 2026-04-10 - Masked row decode must treat TOAST sentinels before skipping variable payloads
+
+- `decode_row_masked` cannot skip variable-width values by blindly interpreting
+  every u24 as an inline payload length. Phase 11.2 TOAST reserves high u24
+  sentinel values, and treating `0xFF_FFFE` as a normal inline length turns a
+  15-byte pointer into a bogus ~16 MB payload requirement.
+- The right contract for `Text`, `Json`, and `Bytes` is:
+  - read u24
+  - if it is a TOAST sentinel, consume the fixed 12-byte pointer payload
+  - otherwise consume exactly the inline payload length
+  - when the column is selected, preserve the logical variant (`Value::Json`
+    stays JSON) so the detoast layer returns the right type
+- Roadmap entries that combine a small usable feature with future storage/index
+  work should be split explicitly in the spec and progress docs. For 11.4, the
+  implemented boundary is text-backed Native JSON; JSONB layout and GIN indexing
+  stay deferred instead of being silently implied.
+
 ## 2026-04-09 - Early X-latch release in a B-tree must account for the rebalance pid contract, not only key counts
 
 - The classic Bayer/McCreith "child has room → drop parent latch" rule

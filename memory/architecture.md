@@ -1,5 +1,29 @@
 # Architecture Notes
 
+## 2026-04-10 - Native JSON boundary (11.4)
+
+- AxiomDB now exposes exactly one SQL `JSON` type at the catalog/API boundary.
+  Phase 11.4 stores it as validated UTF-8 JSON text, not binary JSONB, so the
+  public type contract is stable while JSONB/GIN work remains a later storage
+  and index subphase.
+- The row codec contract is:
+  - `Value::Json(String)` uses the same u24 length-prefixed payload shape as
+    `TEXT`
+  - `DataType::Json` selects the decode arm and returns `Value::Json`
+  - encode validates JSON syntax and applies the same NFC normalization rule as
+    `TEXT`
+  - TOAST sentinel decoding preserves the logical JSON variant so detoast can
+    resolve the overflow value back to `Value::Json`
+- SQL parser/evaluator contract:
+  - the lexer has a dedicated `JSON` type token and `->>` token
+  - `data->>'field'` is lowered to `JSON_EXTRACT(data, '$.field')` instead of
+    adding a new `BinaryOp`
+  - `eval/functions/json.rs` owns `JSON_EXTRACT`, `JSON_SET`, `JSON_REMOVE`,
+    `JSON_KEYS`, `JSON_VALID`, and `JSON_TYPE`
+- Wire/API contract: MySQL result packets and prepared statement metadata expose
+  JSON values as string-compatible payloads until a dedicated protocol mapping is
+  justified. The in-memory value still remains `Value::Json`.
+
 ## 2026-04-09 — ALTER TABLE ADD PRIMARY KEY and indexed DROP/MODIFY repair
 
 - `crates/axiomdb-sql/src/executor/ddl_alter_constraint.rs` now treats

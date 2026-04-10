@@ -343,15 +343,15 @@ mod tests {
 
     #[test]
     fn test_init_sets_schema_ver_1() {
-        let mut storage = MemoryStorage::new();
-        CatalogBootstrap::init(&mut storage).unwrap();
+        let storage = MemoryStorage::new();
+        CatalogBootstrap::init(&storage).unwrap();
         assert!(CatalogBootstrap::is_initialized(&storage).unwrap());
     }
 
     #[test]
     fn test_init_allocates_three_pages() {
-        let mut storage = MemoryStorage::new();
-        let ids = CatalogBootstrap::init(&mut storage).unwrap();
+        let storage = MemoryStorage::new();
+        let ids = CatalogBootstrap::init(&storage).unwrap();
 
         // All three page IDs must be distinct and non-zero.
         assert!(ids.tables > 0);
@@ -364,9 +364,9 @@ mod tests {
 
     #[test]
     fn test_init_is_idempotent() {
-        let mut storage = MemoryStorage::new();
-        let ids1 = CatalogBootstrap::init(&mut storage).unwrap();
-        let ids2 = CatalogBootstrap::init(&mut storage).unwrap(); // second call
+        let storage = MemoryStorage::new();
+        let ids1 = CatalogBootstrap::init(&storage).unwrap();
+        let ids2 = CatalogBootstrap::init(&storage).unwrap(); // second call
         assert_eq!(ids1, ids2, "double-init must return the same page IDs");
     }
 
@@ -382,8 +382,8 @@ mod tests {
 
     #[test]
     fn test_page_ids_correct_after_init() {
-        let mut storage = MemoryStorage::new();
-        let init_ids = CatalogBootstrap::init(&mut storage).unwrap();
+        let storage = MemoryStorage::new();
+        let init_ids = CatalogBootstrap::init(&storage).unwrap();
         let read_ids = CatalogBootstrap::page_ids(&storage).unwrap();
         assert_eq!(init_ids, read_ids);
     }
@@ -397,8 +397,8 @@ mod tests {
 
         // Session 1: init catalog.
         let init_ids = {
-            let mut storage = MmapStorage::create(&db_path).unwrap();
-            CatalogBootstrap::init(&mut storage).unwrap()
+            let storage = MmapStorage::create(&db_path).unwrap();
+            CatalogBootstrap::init(&storage).unwrap()
         };
 
         // Session 2: reopen and verify.

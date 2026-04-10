@@ -123,6 +123,11 @@ pub fn detoast_row(row: &mut [Value], storage: &dyn StorageEngine) {
                     *val = Value::Text(resolved);
                 }
             }
+            Value::Json(s) if s.starts_with(TOAST_PREFIX) => {
+                if let Some(resolved) = resolve_toast_text(s, storage) {
+                    *val = Value::Json(resolved);
+                }
+            }
             Value::Bytes(b) => {
                 if let Ok(s) = std::str::from_utf8(b) {
                     if s.starts_with(TOAST_PREFIX) {
@@ -186,6 +191,7 @@ pub fn column_type_to_data_type(ct: ColumnType) -> DataType {
         ColumnType::BigInt => DataType::BigInt,
         ColumnType::Float => DataType::Real,
         ColumnType::Text => DataType::Text,
+        ColumnType::Json => DataType::Json,
         ColumnType::Bytes => DataType::Bytes,
         ColumnType::Timestamp => DataType::Timestamp,
         ColumnType::Uuid => DataType::Uuid,
@@ -203,6 +209,7 @@ pub fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
             ColumnType::BigInt => DataType::BigInt,
             ColumnType::Float => DataType::Real,
             ColumnType::Text => DataType::Text,
+            ColumnType::Json => DataType::Json,
             ColumnType::Bytes => DataType::Bytes,
             ColumnType::Timestamp => DataType::Timestamp,
             ColumnType::Uuid => DataType::Uuid,
@@ -711,6 +718,7 @@ pub(crate) fn coerce_values(
                 ColumnType::BigInt => DataType::BigInt,
                 ColumnType::Float => DataType::Real,
                 ColumnType::Text => DataType::Text,
+                ColumnType::Json => DataType::Json,
                 ColumnType::Bytes => DataType::Bytes,
                 ColumnType::Timestamp => DataType::Timestamp,
                 ColumnType::Uuid => DataType::Uuid,
@@ -745,6 +753,7 @@ pub(crate) fn coerce_values_with_ctx(
             ColumnType::BigInt => DataType::BigInt,
             ColumnType::Float => DataType::Real,
             ColumnType::Text => DataType::Text,
+            ColumnType::Json => DataType::Json,
             ColumnType::Bytes => DataType::Bytes,
             ColumnType::Timestamp => DataType::Timestamp,
             ColumnType::Uuid => DataType::Uuid,

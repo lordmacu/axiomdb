@@ -122,6 +122,7 @@ fn validate_type(value: &Value, dt: DataType) -> Result<(), DbError> {
             | (Value::Real(_), DataType::Real)
             | (Value::Decimal(..), DataType::Decimal)
             | (Value::Text(_), DataType::Text)
+            | (Value::Json(_), DataType::Json)
             | (Value::Bytes(_), DataType::Bytes)
             | (Value::Date(_), DataType::Date)
             | (Value::Timestamp(_), DataType::Timestamp)
@@ -154,7 +155,7 @@ pub fn encoded_len(values: &[Value]) -> usize {
             Value::BigInt(_) | Value::Real(_) | Value::Timestamp(_) => 8,
             Value::Decimal(..) => 17,
             Value::Uuid(_) => 16,
-            Value::Text(s) => 3 + s.len(),
+            Value::Text(s) | Value::Json(s) => 3 + s.len(),
             Value::Bytes(b) => 3 + b.len(),
         })
         .sum();
@@ -241,6 +242,25 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
                 }
                 write_u24(&mut buf, b.len());
                 buf.extend_from_slice(b);
+            }
+            Value::Json(s) => {
+                // Phase 11.4: JSON stored as validated UTF-8 text (same wire format as Text).
+                use unicode_normalization::UnicodeNormalization;
+                let normalized: String = s.nfc().collect();
+                serde_json::from_str::<serde_json::Value>(&normalized).map_err(|e| {
+                    DbError::InvalidValue {
+                        reason: format!("invalid JSON: {e}"),
+                    }
+                })?;
+                let bytes = normalized.as_bytes();
+                if bytes.len() > MAX_INLINE_LEN {
+                    return Err(DbError::ValueTooLarge {
+                        len: bytes.len(),
+                        max: MAX_INLINE_LEN,
+                    });
+                }
+                write_u24(&mut buf, bytes.len());
+                buf.extend_from_slice(bytes);
             }
             Value::Date(d) => buf.extend_from_slice(&d.to_le_bytes()),
             Value::Timestamp(t) => buf.extend_from_slice(&t.to_le_bytes()),
@@ -359,6 +379,29 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                     Value::Bytes(b)
                 }
             }
+            DataType::Json => {
+                // Phase 11.4: JSON decoded as Text wire format → Value::Json.
+                let len = read_u24(bytes, pos)?;
+                pos += 3;
+                if is_toast_sentinel(len) {
+                    let (page_id, _raw_len) = decode_toast_pointer(bytes, &mut pos)?;
+                    Value::Json(format!(
+                        "__toast__:{}:{}",
+                        page_id,
+                        len == TOAST_SENTINEL_LZ4
+                    ))
+                } else {
+                    ensure_bytes(bytes, pos, len)?;
+                    let s = std::str::from_utf8(&bytes[pos..pos + len])
+                        .map_err(|_| DbError::ParseError {
+                            message: format!("invalid UTF-8 in JSON column at offset {pos}"),
+                            position: None,
+                        })?
+                        .to_string();
+                    pos += len;
+                    Value::Json(s)
+                }
+            }
             DataType::Date => {
                 ensure_bytes(bytes, pos, 4)?;
                 let v = i32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
@@ -466,26 +509,49 @@ pub fn decode_row_masked(
                     pos += 17;
                     Value::Decimal(m, s)
                 }
-                DataType::Text => {
+                DataType::Text | DataType::Json => {
                     let len = read_u24(bytes, pos)?;
                     pos += 3;
-                    ensure_bytes(bytes, pos, len)?;
-                    let s = std::str::from_utf8(&bytes[pos..pos + len])
-                        .map_err(|_| DbError::ParseError {
-                            message: format!("invalid UTF-8 in Text column at offset {pos}"),
-                            position: None,
-                        })?
-                        .to_string();
-                    pos += len;
-                    Value::Text(s)
+                    if is_toast_sentinel(len) {
+                        let (page_id, _raw_len) = decode_toast_pointer(bytes, &mut pos)?;
+                        let placeholder =
+                            format!("__toast__:{}:{}", page_id, len == TOAST_SENTINEL_LZ4);
+                        if dt == DataType::Json {
+                            Value::Json(placeholder)
+                        } else {
+                            Value::Text(placeholder)
+                        }
+                    } else {
+                        ensure_bytes(bytes, pos, len)?;
+                        let s = std::str::from_utf8(&bytes[pos..pos + len])
+                            .map_err(|_| DbError::ParseError {
+                                message: format!("invalid UTF-8 in Text column at offset {pos}"),
+                                position: None,
+                            })?
+                            .to_string();
+                        pos += len;
+                        if dt == DataType::Json {
+                            Value::Json(s)
+                        } else {
+                            Value::Text(s)
+                        }
+                    }
                 }
                 DataType::Bytes => {
                     let len = read_u24(bytes, pos)?;
                     pos += 3;
-                    ensure_bytes(bytes, pos, len)?;
-                    let b = bytes[pos..pos + len].to_vec();
-                    pos += len;
-                    Value::Bytes(b)
+                    if is_toast_sentinel(len) {
+                        let (page_id, _raw_len) = decode_toast_pointer(bytes, &mut pos)?;
+                        Value::Bytes(
+                            format!("__toast__:{}:{}", page_id, len == TOAST_SENTINEL_LZ4)
+                                .into_bytes(),
+                        )
+                    } else {
+                        ensure_bytes(bytes, pos, len)?;
+                        let b = bytes[pos..pos + len].to_vec();
+                        pos += len;
+                        Value::Bytes(b)
+                    }
                 }
                 DataType::Date => {
                     ensure_bytes(bytes, pos, 4)?;
@@ -530,11 +596,15 @@ pub fn decode_row_masked(
                     ensure_bytes(bytes, pos, 16)?;
                     pos += 16;
                 }
-                DataType::Text | DataType::Bytes => {
+                DataType::Text | DataType::Json | DataType::Bytes => {
                     let len = read_u24(bytes, pos)?;
                     pos += 3;
-                    ensure_bytes(bytes, pos, len)?;
-                    pos += len; // skip payload — no copy, no allocation
+                    if is_toast_sentinel(len) {
+                        let (_page_id, _raw_len) = decode_toast_pointer(bytes, &mut pos)?;
+                    } else {
+                        ensure_bytes(bytes, pos, len)?;
+                        pos += len; // skip payload — no copy, no allocation
+                    }
                 }
             }
             values.push(Value::Null);

@@ -1,5 +1,39 @@
 # Project State
 
+## 2026-04-10
+
+- Phase 11 subphase `11.4` (Native JSON) is closed in code, documentation, targeted
+  validation, workspace gates, wire smoke, and a local benchmark.
+- The delivered scope is a single SQL `JSON` type backed by validated UTF-8 JSON
+  text:
+  - `Value::Json(String)`, `DataType::Json`, and `ColumnType::Json = 9`
+  - row codec validates JSON, NFC-normalizes strings, and decodes `DataType::Json`
+    back to `Value::Json` rather than `Value::Text`
+  - text-to-JSON coercion rejects invalid JSON with `DbError::InvalidValue`
+  - masked row decode and detoast preserve JSON placeholders instead of leaking
+    them as text
+- SQL support now includes:
+  - `CREATE TABLE ... (data JSON)`
+  - `JSON_EXTRACT`, `JSON_SET`, `JSON_REMOVE`, `JSON_KEYS`, `JSON_VALID`,
+    and `JSON_TYPE`
+  - PostgreSQL-style `data->>'field'`, lowered by the parser to
+    `JSON_EXTRACT(data, '$.field')`
+  - MySQL wire serialization as string payloads for client compatibility
+- Validation for this closure:
+  - `cargo test -p axiomdb-types --test integration_row_codec` (35 passed)
+  - `cargo test -p axiomdb-sql --test integration_json` (6 passed)
+  - `cargo test -p axiomdb-catalog` (passed)
+  - `cargo test --workspace` (passed after cleaning a disk-full `target/`)
+  - `cargo clippy --workspace -- -D warnings` (clean)
+  - `cargo fmt --check` (clean)
+  - `cargo build -p axiomdb-server` (passed)
+  - `tools/wire-test.py` (341/341 passed)
+- Local benchmark:
+  - `json_extract/10K`: 28.7 ms, 348,652 rows/s on AxiomDB
+- Deferred JSON roadmap items remain explicit: binary JSONB layout, automatic
+  GIN indexing, full SQL:2016 JSONPath, `->`, `JSON_MERGE_PATCH`, containment
+  operators, and JSONB in-place update semantics.
+
 ## 2026-04-09
 
 - Phase 40 subphase `40.8` (B-tree latch coupling) is closed in code,

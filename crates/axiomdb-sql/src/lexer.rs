@@ -324,6 +324,8 @@ pub enum Token<'src> {
     TyDatetime,
     #[token("UUID", ignore(ascii_case))]
     TyUuid,
+    #[token("JSON", ignore(ascii_case))]
+    TyJson,
 
     // ── Miscellaneous ─────────────────────────────────────────────────────────
     #[token("SEPARATOR", ignore(ascii_case))]
@@ -504,6 +506,9 @@ pub enum Token<'src> {
     /// `>>` — bitwise shift right.
     #[token(">>")]
     ShiftRight,
+    /// `->>` — JSON field extraction returning text/scalar.
+    #[token("->>")]
+    JsonExtractText,
     #[token("<")]
     Lt,
     #[token(">")]
@@ -1008,6 +1013,11 @@ mod tests {
     #[test]
     fn test_concat_operator() {
         assert_eq!(tok("||")[0], Token::Concat);
+    }
+
+    #[test]
+    fn test_json_extract_text_operator() {
+        assert_eq!(tok("->>")[0], Token::JsonExtractText);
     }
 
     // ── Comments ─────────────────────────────────────────────────────────────

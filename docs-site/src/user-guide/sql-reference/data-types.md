@@ -106,7 +106,7 @@ by a 1-byte scale (total 17 bytes per non-NULL value).
 
 The codec encodes `TEXT` and `VARCHAR` with a 3-byte (u24) length prefix followed by
 raw UTF-8 bytes. This limits inline storage to 16,777,215 bytes; values larger than a
-page use TOAST (planned Phase 6).
+page use Phase 11.2 TOAST.
 
 ```sql
 -- Fixed-length codes (ISO country, state abbreviations)
@@ -249,11 +249,14 @@ CREATE TABLE access_log (
 
 ---
 
-## JSON / JSONB
+## JSON
 
-| SQL Type | Aliases | Notes                                        |
-|----------|---------|----------------------------------------------|
-| `JSON`   | `JSONB` | Stored as serialized JSON; TOAST if > 2 KB   |
+| SQL Type | Aliases | Notes |
+|----------|---------|-------|
+| `JSON`   | —       | Validated UTF-8 JSON text; TOAST handles oversized rows |
+
+AxiomDB accepts a single `JSON` type. Inserts and updates validate JSON syntax
+before the value is written; invalid JSON raises SQLSTATE `22P02`.
 
 ```sql
 CREATE TABLE api_responses (
@@ -264,7 +267,25 @@ CREATE TABLE api_responses (
 
 INSERT INTO api_responses (endpoint, payload)
 VALUES ('/users', '{"count": 42, "items": []}');
+
+SELECT JSON_EXTRACT(payload, '$.count') FROM api_responses;  -- 42
+SELECT payload->>'count' FROM api_responses;                 -- 42
 ```
+
+If the payload is malformed, fix the JSON text before inserting:
+
+```sql
+INSERT INTO api_responses VALUES (1, '/bad', '{count: 42}');
+-- ERROR 22P02: invalid value: invalid JSON: key must be a string
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — One JSON Type</span>
+Phase 11.4 avoids PostgreSQL's <code>json</code> vs <code>jsonb</code> split at the SQL surface: applications declare only <code>JSON</code>, while the current implementation stores validated text and defers binary JSONB plus GIN indexing to a later storage/index subphase.
+</div>
+</div>
 
 ---
 

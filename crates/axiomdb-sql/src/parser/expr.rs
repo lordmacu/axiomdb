@@ -20,7 +20,8 @@
 //! shift_expr     ::= addition (('<<'|'>>') addition)*
 //! addition       ::= multiplication (('+' | '-' | '||') multiplication)*
 //! multiplication ::= bitxor_expr (('*'|'/'|'%'|DIV) bitxor_expr)*
-//! bitxor_expr    ::= unary ('^' unary)*
+//! bitxor_expr    ::= json_extract_text ('^' json_extract_text)*
+//! json_extract_text ::= unary ('->>' unary)*
 //! unary          ::= '-' unary | '~' unary | atom
 //! atom           ::= literal | hex_lit | col_ref | fn_call | '(' expr ')'
 //! col_ref        ::= identifier ['.' identifier]
@@ -373,12 +374,35 @@ fn parse_multiplication(p: &mut Parser) -> Result<Expr, DbError> {
 // ── Bitwise XOR: ^ ───────────────────────────────────────────────────────────
 
 fn parse_bitxor(p: &mut Parser) -> Result<Expr, DbError> {
-    let mut left = parse_unary(p)?;
+    let mut left = parse_json_extract_text(p)?;
     while p.eat(&Token::Caret) {
-        let right = parse_unary(p)?;
+        let right = parse_json_extract_text(p)?;
         left = binop(BinaryOp::BitXor, left, right);
     }
     Ok(left)
+}
+
+// ── JSON field extraction: ->> ───────────────────────────────────────────────
+
+fn parse_json_extract_text(p: &mut Parser) -> Result<Expr, DbError> {
+    let mut left = parse_unary(p)?;
+    while p.eat(&Token::JsonExtractText) {
+        let path = normalize_json_extract_text_path(parse_unary(p)?);
+        left = Expr::Function {
+            name: "json_extract".to_string(),
+            args: vec![left, path],
+        };
+    }
+    Ok(left)
+}
+
+fn normalize_json_extract_text_path(path: Expr) -> Expr {
+    match path {
+        Expr::Literal(Value::Text(s)) if !s.starts_with('$') => {
+            Expr::Literal(Value::Text(format!("$.{s}")))
+        }
+        other => other,
+    }
 }
 
 // ── Unary: unary minus, bitwise NOT ──────────────────────────────────────────

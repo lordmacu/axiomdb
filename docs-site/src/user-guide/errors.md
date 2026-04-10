@@ -552,8 +552,24 @@ The following conversions happen automatically without raising 22018:
 | `TEXT` | `INT` / `BIGINT` | `'42'` → `42` (strict: entire string must be a number) |
 | `TEXT` | `REAL` | `'3.14'` → `3.14` |
 | `TEXT` | `DECIMAL` | `'3.14'` → `Decimal(314, 2)` |
+| `TEXT` | `JSON` | `'{"ok":true}'` → validated JSON |
 | `DATE` | `TIMESTAMP` | midnight UTC of the given date |
 | `NULL` | any | always passes through as `NULL` |
+
+### 22P02 — invalid_text_representation
+
+A literal or stored value has the right SQL type category but invalid text
+content. JSON columns use this when the input text is not syntactically valid
+JSON.
+
+```sql
+CREATE TABLE docs (data JSON);
+INSERT INTO docs VALUES ('{bad');
+-- ERROR 22P02: invalid value: invalid JSON: key must be a string
+```
+
+**Hint:** Quote JSON object keys and string values, or validate the payload with
+`JSON_VALID(text)` before loading it into a `JSON` column.
 
 ---
 

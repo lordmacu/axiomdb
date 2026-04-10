@@ -50,6 +50,9 @@ pub enum Value {
     Timestamp(i64),
     /// SQL UUID — 128-bit identifier in big-endian byte order.
     Uuid([u8; 16]),
+    /// SQL JSON — validated UTF-8 JSON text (Phase 11.4).
+    /// Always NFC-normalized and syntax-validated on INSERT.
+    Json(String),
 }
 
 impl Value {
@@ -67,6 +70,7 @@ impl Value {
             Self::Date(_) => "Date",
             Self::Timestamp(_) => "Timestamp",
             Self::Uuid(_) => "Uuid",
+            Self::Json(_) => "Json",
         }
     }
 
@@ -89,7 +93,7 @@ impl fmt::Display for Value {
             Self::Real(v) => write!(f, "{v}"),
             // "123456e-2" is unambiguous and avoids a float division.
             Self::Decimal(m, s) => write!(f, "{m}e-{s}"),
-            Self::Text(s) => write!(f, "{s}"),
+            Self::Text(s) | Self::Json(s) => write!(f, "{s}"),
             Self::Bytes(b) => {
                 write!(f, "\\x")?;
                 for byte in b {
