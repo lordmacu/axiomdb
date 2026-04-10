@@ -19,6 +19,7 @@ pub mod executor;
 pub mod expr;
 pub mod expr_to_sql;
 pub mod fk_enforcement;
+pub mod fts_query;
 pub mod index_integrity;
 pub mod index_maintenance;
 pub mod information_schema;
