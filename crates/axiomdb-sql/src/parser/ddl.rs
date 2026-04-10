@@ -757,10 +757,11 @@ pub(crate) fn parse_create_index(p: &mut Parser, unique: bool) -> Result<Stmt, D
             "btree" => crate::ast::IndexType::BTree,
             "brin" => crate::ast::IndexType::Brin,
             "trigram" | "gin_trgm" => crate::ast::IndexType::Trigram,
+            "fts" | "fulltext" | "gin" => crate::ast::IndexType::FullText,
             other => {
                 return Err(DbError::ParseError {
                     message: format!(
-                        "unknown index method: {other}; supported: btree, brin, trigram"
+                        "unknown index method: {other}; supported: btree, brin, trigram, fts"
                     ),
                     position: Some(p.current_pos()),
                 });

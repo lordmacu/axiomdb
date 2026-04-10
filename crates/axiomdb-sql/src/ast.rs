@@ -353,6 +353,10 @@ pub enum IndexType {
     /// `WHERE col LIKE '%pattern%'` uses trigram index to narrow candidates.
     /// Built-in (PostgreSQL requires pg_trgm extension).
     Trigram,
+    /// Full Text Search — inverted index with BM25 ranking (Phase 11.6).
+    /// `WHERE MATCH(col, 'query terms')` searches with relevance scoring.
+    /// Built-in (PostgreSQL requires tsearch, MySQL uses FULLTEXT).
+    FullText,
 }
 
 /// `CREATE [UNIQUE] INDEX`
