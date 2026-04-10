@@ -15,6 +15,16 @@ fn execute_update_ctx(
         Some(conn_txn),
         &stmt.table,
     )?;
+
+    // Phase 40.11: IX(table) — once per UPDATE statement, before candidate scan.
+    if let Some(lm) = exec_ctx.lock_manager() {
+        lm.acquire_table_lock_sync(
+            conn_txn.txn_id,
+            resolved.def.id,
+            axiomdb_lock::LockMode::IntentionExclusive,
+        )?;
+    }
+
     let schema_cols = resolved.columns.clone();
     let secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
         .indexes
@@ -133,13 +143,11 @@ fn execute_update_ctx(
             &secondary_indexes,
             &col_types,
             field_patch_eligible,
-            storage,
-            txn,
+            exec_ctx,
             conn_txn,
             snap,
             &resolved,
             ctx,
-            bloom,
         );
     }
 
@@ -159,13 +167,11 @@ fn execute_update_ctx(
         &secondary_indexes,
         &col_types,
         field_patch_eligible,
-        storage,
-        txn,
+        exec_ctx,
         conn_txn,
         snap,
         &resolved,
         ctx,
-        bloom,
     )
 }
 

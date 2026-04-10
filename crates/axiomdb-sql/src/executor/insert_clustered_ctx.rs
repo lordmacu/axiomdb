@@ -9,6 +9,16 @@ fn execute_clustered_insert_ctx(
     let storage = exec_ctx.storage();
     let txn = exec_ctx.coord();
     let bloom = exec_ctx.bloom();
+
+    // Phase 40.11: IX(table) — idempotent, before any clustered row write.
+    if let Some(lm) = exec_ctx.lock_manager() {
+        lm.acquire_table_lock_sync(
+            conn_txn.txn_id,
+            resolved.def.id,
+            axiomdb_lock::LockMode::IntentionExclusive,
+        )?;
+    }
+
     let schema_cols = &resolved.columns;
     let primary_idx =
         crate::clustered_table::primary_index(&resolved.indexes, &resolved.def.table_name)?.clone();
@@ -215,6 +225,16 @@ fn enqueue_clustered_insert_ctx(
     let storage = exec_ctx.storage();
     let txn = exec_ctx.coord();
     let bloom = exec_ctx.bloom();
+
+    // Phase 40.11: IX(table) — idempotent, before batch staging.
+    if let Some(lm) = exec_ctx.lock_manager() {
+        lm.acquire_table_lock_sync(
+            conn_txn.txn_id,
+            resolved.def.id,
+            axiomdb_lock::LockMode::IntentionExclusive,
+        )?;
+    }
+
     let schema_cols = &resolved.columns;
     let table_id = resolved.def.id;
 
