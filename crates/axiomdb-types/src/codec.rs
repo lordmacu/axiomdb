@@ -33,6 +33,46 @@ use crate::{types::DataType, value::Value};
 /// Matches the maximum representable by a u24 prefix (3 bytes LE).
 const MAX_INLINE_LEN: usize = 0xFF_FFFF; // 16,777,215
 
+// ── TOAST sentinels (Phase 11.2) ─────────────────────────────────────────────
+
+/// u24 sentinel: value stored in uncompressed overflow chain.
+/// The next 12 bytes after the u24 are: `[page_id:u64 LE][raw_len:u32 LE]`.
+pub const TOAST_SENTINEL_RAW: usize = 0xFF_FFFE;
+
+/// u24 sentinel: value stored in LZ4-compressed overflow chain.
+/// Same layout as TOAST_SENTINEL_RAW; data in chain is LZ4 compressed.
+pub const TOAST_SENTINEL_LZ4: usize = 0xFF_FFFD;
+
+/// Maximum inline row size before TOAST triggers.
+/// Chosen so that 2 tuples fit per 16 KB page with comfortable margin.
+pub const TOAST_THRESHOLD: usize = 8_000;
+
+/// Minimum value size to attempt LZ4 compression (smaller values don't benefit).
+pub const TOAST_COMPRESS_MIN: usize = 256;
+
+/// Encodes a TOAST pointer: `[u24 sentinel][page_id:u64 LE][raw_len:u32 LE]`.
+/// Total: 3 + 8 + 4 = 15 bytes inline (replaces the original u24 + payload).
+pub fn encode_toast_pointer(buf: &mut Vec<u8>, sentinel: usize, page_id: u64, raw_len: u32) {
+    write_u24(buf, sentinel);
+    buf.extend_from_slice(&page_id.to_le_bytes());
+    buf.extend_from_slice(&raw_len.to_le_bytes());
+}
+
+/// Decodes a TOAST pointer from bytes at `pos` (after reading the u24 sentinel).
+/// Returns `(page_id, raw_len)` and advances position by 12.
+pub fn decode_toast_pointer(bytes: &[u8], pos: &mut usize) -> Result<(u64, u32), DbError> {
+    ensure_bytes(bytes, *pos, 12)?;
+    let page_id = u64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
+    let raw_len = u32::from_le_bytes(bytes[*pos + 8..*pos + 12].try_into().unwrap());
+    *pos += 12;
+    Ok((page_id, raw_len))
+}
+
+/// Returns true if the u24 length is a TOAST sentinel.
+pub fn is_toast_sentinel(len: usize) -> bool {
+    len == TOAST_SENTINEL_RAW || len == TOAST_SENTINEL_LZ4
+}
+
 // ── Bitmap helpers ────────────────────────────────────────────────────────────
 
 #[inline]
@@ -269,23 +309,49 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
             DataType::Text => {
                 let len = read_u24(bytes, pos)?;
                 pos += 3;
-                ensure_bytes(bytes, pos, len)?;
-                let s = std::str::from_utf8(&bytes[pos..pos + len])
-                    .map_err(|_| DbError::ParseError {
-                        message: format!("invalid UTF-8 in Text column at offset {pos}"),
-                        position: None,
-                    })?
-                    .to_string();
-                pos += len;
-                Value::Text(s)
+                if is_toast_sentinel(len) {
+                    // TOAST pointer — skip the 12-byte pointer. The caller must
+                    // resolve the overflow chain via storage. For now, return a
+                    // placeholder indicating the value is external.
+                    ensure_bytes(bytes, pos, 12)?;
+                    let page_id = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+                    let _raw_len = u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap());
+                    pos += 12;
+                    // Placeholder: the de-TOAST layer replaces this before user sees it.
+                    Value::Text(format!(
+                        "__toast__:{}:{}",
+                        page_id,
+                        len == TOAST_SENTINEL_LZ4
+                    ))
+                } else {
+                    ensure_bytes(bytes, pos, len)?;
+                    let s = std::str::from_utf8(&bytes[pos..pos + len])
+                        .map_err(|_| DbError::ParseError {
+                            message: format!("invalid UTF-8 in Text column at offset {pos}"),
+                            position: None,
+                        })?
+                        .to_string();
+                    pos += len;
+                    Value::Text(s)
+                }
             }
             DataType::Bytes => {
                 let len = read_u24(bytes, pos)?;
                 pos += 3;
-                ensure_bytes(bytes, pos, len)?;
-                let b = bytes[pos..pos + len].to_vec();
-                pos += len;
-                Value::Bytes(b)
+                if is_toast_sentinel(len) {
+                    ensure_bytes(bytes, pos, 12)?;
+                    let page_id = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+                    let _raw_len = u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap());
+                    pos += 12;
+                    Value::Bytes(
+                        format!("__toast__:{}:{}", page_id, len == TOAST_SENTINEL_LZ4).into_bytes(),
+                    )
+                } else {
+                    ensure_bytes(bytes, pos, len)?;
+                    let b = bytes[pos..pos + len].to_vec();
+                    pos += len;
+                    Value::Bytes(b)
+                }
             }
             DataType::Date => {
                 ensure_bytes(bytes, pos, 4)?;

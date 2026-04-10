@@ -81,6 +81,9 @@ tempfile = "3"
 # Zero-copy casting
 bytemuck = { version = "1", features = ["derive"] }
 
+# LZ4 compression (pure Rust, no C dependency) — Phase 11.2 TOAST
+lz4_flex = "0.11"
+
 # Configuration file parsing
 toml = "1"
 url = "2"
