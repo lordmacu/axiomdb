@@ -991,7 +991,7 @@ mod tests {
         // Txn 1: insert 5 rows + commit.
         let conn1 = mgr.begin().unwrap();
         for i in 0u8..5 {
-            HeapChain::insert(&mut storage, root_page_id, &[i; 8], conn1.txn_id).unwrap();
+            HeapChain::insert(&mut storage, root_page_id, &[i; 8], conn1.txn_id, None).unwrap();
         }
         mgr.commit(conn1).unwrap();
 

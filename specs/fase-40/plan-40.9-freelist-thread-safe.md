@@ -1,223 +1,140 @@
-# Plan: 40.9 — FreeList Thread-Safety
+# Plan: 40.9 — FreeList Tier-1 (per-connection LocalPageBatch)
 
-## Files to create/modify
+## Files to create / modify
 
-| File | Change |
-|---|---|
-| `crates/axiomdb-storage/src/page_alloc.rs` | **NEW**: GlobalPageAllocator + LocalPageBatch |
-| `crates/axiomdb-storage/src/freelist.rs` | Rename to FreeListBitmap (internal, wrapped by GlobalPageAllocator) |
-| `crates/axiomdb-storage/src/mmap.rs` | Use GlobalPageAllocator instead of raw FreeList |
-| `crates/axiomdb-storage/src/memory.rs` | Same for MemoryStorage |
-| `crates/axiomdb-storage/src/lib.rs` | Export new module |
-| `crates/axiomdb-wal/src/txn.rs` | LocalPageBatch in ConnectionTxn |
+### Workspace + dependency
+- `Cargo.toml` (root) — add `crossbeam-queue = "0.3"` to `[workspace.dependencies]`
+- `crates/axiomdb-storage/Cargo.toml` — pull `crossbeam-queue` into storage
 
-## Implementation phases
+### `axiomdb-storage` (the global allocator side)
+- `crates/axiomdb-storage/src/freelist.rs`
+  - Add `alloc_batch_sequential(n) -> Vec<u64>` and `free_batch(&[u64])`
+- `crates/axiomdb-storage/src/lib.rs` (StorageEngine trait)
+  - Add `alloc_page_batch(n, ty)`, `free_page_batch(&[u64])`, `extension_waiters()` with defaults
+- `crates/axiomdb-storage/src/mmap.rs`
+  - Add `recycle_queue: crossbeam_queue::SegQueue<u64>`, `extension_waiters: AtomicU32`
+  - Implement `alloc_page_batch` / `free_page_batch`
+  - Update `release_deferred_frees` to drain recycle_queue into bitmap
+- `crates/axiomdb-storage/src/memory.rs`
+  - Override `alloc_page_batch` / `free_page_batch` for single-lock batching
 
-### Phase 1: LocalPageBatch struct
-```rust
-pub struct LocalPageBatch {
-    available: Vec<u64>,   // pre-allocated, ready for use
-    freed: Vec<u64>,       // freed by this txn, pending recycle
-}
+### `axiomdb-wal` (the per-connection batch side)
+- `crates/axiomdb-wal/src/txn.rs`
+  - Add `LocalPageBatch { available: VecDeque<u64>, current_type, freed, last_refill_size }` + consts
+  - Add field to `ConnectionTxn`
+- `crates/axiomdb-wal/src/txn_begin_commit.rs` — init in `begin`, drain in `commit`
+- `crates/axiomdb-wal/src/txn_rollback.rs` — drain in `rollback` / `rollback_to_savepoint`
+- `Savepoint` struct — add `available_len_at_sp` and `freed_len_at_sp` fields
 
-impl LocalPageBatch {
-    pub fn alloc(&mut self) -> Option<u64> {
-        self.available.pop()  // O(1), zero locks
-    }
+### Hot-path call site wiring
+| Crate | File | Functions |
+|---|---|---|
+| `axiomdb-storage` | `heap_chain_write.rs` | `insert`, `insert_with_hint` |
+| `axiomdb-storage` | `clustered_tree/btree_insert.rs` | `split_leaf`, `split_internal`, `insert_subtree` |
+| `axiomdb-storage` | `clustered_tree/mod.rs` | `insert` (root creation) |
+| `axiomdb-storage` | `clustered_overflow.rs` | `write_chain` |
+| `axiomdb-index` | `tree_insert.rs` | `insert_leaf`, `split_internal`, `alloc_root` |
+| `axiomdb-index` | `tree_delete.rs` | `rotate_left`, `rotate_right`, `merge_children` |
 
-    pub fn free(&mut self, page_id: u64) {
-        self.freed.push(page_id);  // O(1), zero locks
-    }
+All gain `Option<&mut LocalPageBatch>` and route through `pop_or_refill`.
 
-    pub fn is_empty(&self) -> bool {
-        self.available.is_empty()
-    }
+### `axiomdb-sql` (executor wiring)
+- `ExecutionContext::alloc_page(ty)` / `free_page(pid)` wrappers
 
-    /// On commit: return freed pages to global recycle queue.
-    pub fn drain_freed(&mut self) -> Vec<u64> {
-        std::mem::take(&mut self.freed)
-    }
+## Algorithm: `pop_or_refill`
 
-    /// On rollback: return available (unused pre-allocated) to global bitmap.
-    pub fn drain_available(&mut self) -> Vec<u64> {
-        std::mem::take(&mut self.available)
-    }
-
-    /// Refill available from a batch of page_ids.
-    pub fn refill(&mut self, pages: Vec<u64>) {
-        self.available = pages;
-    }
-}
+```text
+1. If batch.current_type != Some(ty):
+   a. Drain batch.available → storage.free_page_batch (return to bitmap)
+   b. Set current_type = Some(ty), last_refill_size = BATCH_ALLOC_SIZE
+2. If batch.available non-empty: pop_front, return
+3. Compute n = last_refill_size × max(1, extension_waiters), capped at 256
+4. ids = storage.alloc_page_batch(n, ty)
+5. last_refill_size = n
+6. available.extend(ids.skip(1)), return ids[0]
 ```
 
-### Phase 2: GlobalPageAllocator struct
-```rust
-pub struct GlobalPageAllocator {
-    bitmap: Mutex<FreeListBitmap>,
-    recycle_queue: Mutex<VecDeque<u64>>,
-    total_pages: AtomicU64,
-    grow_lock: Mutex<()>,
-}
+## Algorithm: `MmapStorage::alloc_page_batch`
 
-impl GlobalPageAllocator {
-    /// Allocate a batch of up to `count` pages from recycle queue + bitmap.
-    pub fn alloc_batch(&self, count: usize) -> Result<Vec<u64>, DbError> {
-        let mut result = Vec::with_capacity(count);
-
-        // 1. Drain from recycle queue first (preferred — already initialized)
-        {
-            let mut recycle = self.recycle_queue.lock().unwrap();
-            while result.len() < count {
-                match recycle.pop_front() {
-                    Some(pid) => result.push(pid),
-                    None => break,
-                }
-            }
-        }
-
-        // 2. Scan bitmap for remaining needed
-        if result.len() < count {
-            let mut bitmap = self.bitmap.lock().unwrap();
-            while result.len() < count {
-                match bitmap.alloc() {
-                    Some(pid) => result.push(pid),
-                    None => break,  // need file growth
-                }
-            }
-        }
-
-        if result.is_empty() {
-            // 3. File growth needed
-            self.grow()?;
-            return self.alloc_batch(count);  // retry after growth
-        }
-
-        Ok(result)
-    }
-
-    /// Return freed pages to recycle queue (called on commit).
-    pub fn recycle_pages(&self, pages: Vec<u64>) {
-        let mut recycle = self.recycle_queue.lock().unwrap();
-        recycle.extend(pages);
-    }
-
-    /// Return unused pre-allocated pages to bitmap (called on rollback).
-    pub fn return_pages(&self, pages: Vec<u64>) {
-        let mut bitmap = self.bitmap.lock().unwrap();
-        for pid in pages {
-            bitmap.free(pid);
-        }
-    }
-
-    fn grow(&self) -> Result<(), DbError> {
-        let _grow_guard = self.grow_lock.lock().unwrap();
-        // ... extend file, extend bitmap ...
-        Ok(())
-    }
-}
+```text
+Phase 1 (lock-free): drain recycle_queue (SegQueue pops) until full or empty
+Phase 2 (mutex): take freelist.lock(), alloc_batch_sequential(remaining)
+Phase 3 (grow): if still short → grow_lock, do_grow, retry
+Set freelist_dirty. Return exactly n IDs or Err(StorageFull).
 ```
 
-### Phase 3: StorageEngine alloc_page integration
-```rust
-// In MmapStorage (after 40.3 interior mutability):
-impl StorageEngine for MmapStorage {
-    fn alloc_page(&self, page_type: PageType) -> Result<u64, DbError> {
-        // Note: LocalPageBatch is NOT here — it's per-transaction.
-        // StorageEngine.alloc_page() always goes through global.
-        // The executor wraps this with LocalPageBatch.
-        let pages = self.allocator.alloc_batch(1)?;
-        let page_id = pages[0];
-        // ... initialize page ...
-        Ok(page_id)
-    }
-}
+## Algorithm: `FreeList::alloc_batch_sequential`
+
+```text
+1. Scan words[] for a contiguous run of n free bits (cross-word boundary OK)
+2. If found: mark all n bits USED, return (start..start+n)
+3. If not found: fall back to alloc() in a loop, return non-contiguous fill
 ```
 
-**Higher-level integration (executor):**
-```rust
-// In executor, when inserting:
-fn alloc_page_for_txn(
-    local: &mut LocalPageBatch,
-    global: &GlobalPageAllocator,
-    storage: &dyn StorageEngine,
-    page_type: PageType,
-) -> Result<u64, DbError> {
-    // Fast path: local batch
-    if let Some(pid) = local.alloc() {
-        return Ok(pid);
-    }
-    // Slow path: refill from global
-    let batch = global.alloc_batch(BATCH_ALLOC_SIZE)?;
-    local.refill(batch);
-    local.alloc().ok_or(DbError::Other("alloc failed after refill".into()))
-}
-```
+## Drain semantics
 
-### Phase 4: Commit/rollback integration
-```rust
-// On COMMIT:
-fn commit_page_batch(local: &mut LocalPageBatch, global: &GlobalPageAllocator) {
-    // Freed pages → recycle queue (other txns can use them)
-    let freed = local.drain_freed();
-    if !freed.is_empty() {
-        global.recycle_pages(freed);
-    }
-    // Unused pre-allocated pages → return to bitmap
-    let unused = local.drain_available();
-    if !unused.is_empty() {
-        global.return_pages(unused);
-    }
-}
+| Event | `available` | `freed` |
+|---|---|---|
+| **Commit** | → bitmap via `free_page_batch` (steal protection) | → `recycle_queue` for fast reuse |
+| **Rollback** | → bitmap via `free_page_batch` | dropped (rows restored by undo → pages in use) |
+| **Savepoint rollback** | unchanged | truncated to `sp.freed_len_at_sp` |
+| **Connection drop without commit/rollback** | → bitmap via `Drop` impl on `ConnectionTxn` | leaked (same as today) |
+| **flush() / release_deferred_frees** | N/A | recycle_queue drained → bitmap |
 
-// On ROLLBACK:
-fn rollback_page_batch(local: &mut LocalPageBatch, global: &GlobalPageAllocator) {
-    // Unused pre-allocated → return to bitmap
-    let unused = local.drain_available();
-    if !unused.is_empty() {
-        global.return_pages(unused);
-    }
-    // Freed pages → do NOT recycle (rollback undoes the frees)
-    local.freed.clear();
-}
-```
+## Implementation phases (16 tasks)
 
-### Phase 5: FreeListBitmap (rename existing)
-- Rename `FreeList` → `FreeListBitmap` (internal detail, not public API)
-- No logic changes — just wrapped by GlobalPageAllocator
-- Add `alloc_batch(n: usize) -> Vec<u64>` convenience method
-  (scan for N free bits at once, fewer iterations than N × alloc())
-
-### Phase 6: MemoryStorage adaptation
-Same pattern: GlobalPageAllocator wraps an in-memory bitmap.
-Tests use MemoryStorage — must behave identically.
+1. **T1** — `LocalPageBatch` struct + constants. Pure data.
+2. **T2** — Trait methods with default impls. `cargo check --workspace`.
+3. **T3** — `FreeList::alloc_batch_sequential` + `free_batch`. Unit tests.
+4. **T4** — `MmapStorage` fields: `recycle_queue` (SegQueue) + `extension_waiters` (AtomicU32). Compile.
+5. **T5** — `MmapStorage::alloc_page_batch` + `free_page_batch` + recycle fold-back. Storage integration tests.
+6. **T6** — `LocalPageBatch::pop_or_refill` + `take_for_commit` / `take_for_rollback`.
+7. **T7** — `ExecutionContext::alloc_page` / `free_page` wrappers.
+8. **T8** — Wire `heap_chain_write::insert{,_with_hint}`.
+9. **T9** — Wire `axiomdb-index::tree_insert` split paths.
+10. **T10** — Wire `axiomdb-index::tree_delete` rotate/merge paths.
+11. **T11** — Wire `clustered_tree::btree_insert` + `mod::insert`.
+12. **T12** — Wire `clustered_overflow::write_chain`.
+13. **T13** — Commit/rollback drain in `TxnManager` + `Savepoint` extension.
+14. **T14** — Concurrent stress: 8 × 10K alloc+free.
+15. **T15** — Criterion benchmark. Verify ≥5× speedup.
+16. **T16** — Closing protocol (test, clippy, fmt, docs, commit, push).
 
 ## Tests to write
 
-1. **LocalPageBatch unit**: alloc/free cycle, drain_freed, drain_available, refill
-2. **GlobalPageAllocator unit**: alloc_batch, recycle_pages, return_pages
-3. **Recycle priority**: freed pages appear in next alloc_batch before bitmap scan
-4. **No duplicates**: 8 threads × alloc_batch(64) → all 512 page_ids unique
-5. **Rollback returns pages**: alloc batch → rollback → pages available again
-6. **Commit recycles freed**: free pages → commit → next batch gets recycled pages
-7. **File growth**: exhaust bitmap → alloc triggers grow → new pages available
-8. **Concurrent growth**: 2 threads trigger grow simultaneously → only 1 grows (grow_lock)
-9. **Stress**: 8 threads × 10K alloc+free cycles → bitmap consistent, no lost pages
-10. **Benchmark**: 8 concurrent alloc_batch vs 8 concurrent single alloc → measure speedup
+### Unit
+- `alloc_batch_sequential`: contiguous run, no run (non-contiguous), exhausted
+- `free_batch`: single pass, double-free error
+- `pop_or_refill`: basic pop, refill on empty, type mismatch, sticky bulk, adaptive
+
+### Integration
+- commit drains freed → recycle, available → bitmap
+- rollback drains available → bitmap, keeps freed
+- savepoint rollback truncates freed only
+- recycle_queue fold-back during flush
+- 8 threads × 10K alloc+free, all unique, no lost pages
+- mixed page-type stress
+- crash with non-empty recycle_queue → bitmap still consistent
+
+### Bench
+- `bench_alloc_page_batch_vs_per_page` — 8 threads × 10K allocs. Target: ≥5×.
 
 ## Anti-patterns to avoid
 
-- DO NOT use AtomicU64 CAS on bitmap words (research shows worse than Mutex at >4 threads)
-- DO NOT hold bitmap Mutex during file I/O (grow acquires grow_lock first, then bitmap)
-- DO NOT keep local batch across transaction boundary (must drain on commit/rollback)
-- DO NOT skip recycle queue check (recycled pages are already initialized = faster)
-- DO NOT allocate pages to local batch that exceed total_pages (check before returning)
+- ❌ `Mutex<VecDeque>` for recycle_queue — defeats lock-free draining. Use SegQueue.
+- ❌ `Send + Sync` on `LocalPageBatch` — it's per-connection, exclusive ownership.
+- ❌ Page init inside `alloc_page_batch` — callers do `Page::new + write_page`.
+- ❌ `free_page_batch` on recycle_queue pages — already USED in bitmap; double-free.
+- ❌ Changing `MmapStorage::alloc_page` semantics — DDL/vacuum/recovery keep using it.
+- ❌ Fixing savepoint-rollback page leakage — out of scope for 40.9.
 
 ## Risks
 
-- **Batch waste**: if txn allocates 1 page but batch is 64, 63 pages are "reserved" until
-  commit/rollback. Mitigation: other txns still allocate from bitmap (local batch is advisory,
-  not exclusive). On commit, unused pages returned immediately.
-- **Recycle queue growth**: if many txns free pages but few allocate, queue grows.
-  Mitigation: bounded queue (max 10K entries), excess returned to bitmap.
-- **Lock ordering with PageLockTable**: GlobalPageAllocator.bitmap Mutex must NEVER be held
-  while acquiring a page X-latch. Order: page latch < bitmap Mutex (same as 40.7).
+| Risk | Mitigation |
+|---|---|
+| `release_deferred_frees` runs concurrently with `recycle_queue.pop()` | The fold-back path drains SegQueue under freelist mutex; phase-1 (lock-free pop) runs outside the mutex; after fold-back the queue is empty so phase-1 finds nothing |
+| Connection aborts without commit/rollback leaks `available` | `Drop` impl on `ConnectionTxn` returns `available` to bitmap via `free_page_batch`. Log-and-forget on I/O error. |
+| `extension_waiters` underflows on panic | Guard struct: `WaiterGuard { fetch_add in new(), fetch_sub in Drop }`. Panic-safe. |
+| Adaptive sizing creates positive feedback loop | Capped at `MAX_BATCH_SIZE = 256`. Waiters decay naturally after the burst. |
+| Type mismatch drains dominate on mixed workloads | One drain per INSERT statement boundary (heap→index). The heap benefit (~hundreds of pages) dominates. Defer per-type sub-batches until profiling shows otherwise. |
+| Crash with non-empty recycle_queue leaks pages | Bounded by flush interval. Documented as "leaked until next bitmap scan or VACUUM". |

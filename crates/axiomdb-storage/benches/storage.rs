@@ -122,6 +122,9 @@ fn bench_mmap_alloc(c: &mut Criterion) {
             // Free immediately to reuse the same page and prevent
             // the storage from growing during measurement.
             storage.free_page(id).unwrap();
+            // Flush deferred frees back to bitmap so the page can be
+            // reallocated on the next iteration.
+            storage.release_deferred_frees(u64::MAX).unwrap();
         });
     });
 
@@ -207,6 +210,114 @@ fn bench_checksum_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Phase 40.9: batch allocation benchmark ──────────────────────────────────
+
+fn bench_batch_alloc_vs_per_page(c: &mut Criterion) {
+    use axiomdb_storage::{LocalPageBatch, BATCH_ALLOC_SIZE};
+    use std::sync::Arc;
+
+    let mut group = c.benchmark_group("alloc/batch_vs_single");
+    group.throughput(Throughput::Elements(1000));
+
+    // Single-page alloc baseline (1000 allocs under Mutex).
+    group.bench_function("single_mutex_1000", |b| {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bench_single.db");
+        let storage = MmapStorage::create(&path).unwrap();
+        storage.grow(100_000).unwrap();
+
+        b.iter(|| {
+            for _ in 0..1000 {
+                let id = storage.alloc_page(PageType::Data).unwrap();
+                storage.free_page(id).unwrap();
+            }
+            storage.flush().unwrap();
+        });
+    });
+
+    // Batch alloc (1000 allocs via LocalPageBatch — ~15 mutex acquisitions).
+    group.bench_function("batch_local_1000", |b| {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bench_batch.db");
+        let storage = MmapStorage::create(&path).unwrap();
+        storage.grow(100_000).unwrap();
+
+        b.iter(|| {
+            let mut batch = LocalPageBatch::new();
+            for _ in 0..1000 {
+                let id = batch.pop_or_refill(&storage, PageType::Data).unwrap();
+                batch.push_freed(id);
+            }
+            let (avail, freed) = batch.take_for_commit();
+            storage.free_page_batch(&avail).unwrap();
+            for pid in freed {
+                storage.recycle_page(pid).unwrap();
+            }
+            storage.flush().unwrap();
+        });
+    });
+
+    // 8-thread concurrent single-page alloc (10K allocs per thread).
+    group.bench_function("8t_single_10k", |b| {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bench_8t_single.db");
+        let storage = Arc::new(MmapStorage::create(&path).unwrap());
+        storage.grow(100_000).unwrap();
+
+        b.iter(|| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let s = Arc::clone(&storage);
+                    std::thread::spawn(move || {
+                        for _ in 0..10_000 {
+                            let id = s.alloc_page(PageType::Data).unwrap();
+                            s.free_page(id).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            storage.flush().unwrap();
+        });
+    });
+
+    // 8-thread concurrent batch alloc (10K allocs per thread via LocalPageBatch).
+    group.bench_function("8t_batch_10k", |b| {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bench_8t_batch.db");
+        let storage = Arc::new(MmapStorage::create(&path).unwrap());
+        storage.grow(100_000).unwrap();
+
+        b.iter(|| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let s = Arc::clone(&storage);
+                    std::thread::spawn(move || {
+                        let mut batch = LocalPageBatch::new();
+                        for _ in 0..10_000 {
+                            let id = batch.pop_or_refill(s.as_ref(), PageType::Data).unwrap();
+                            batch.push_freed(id);
+                        }
+                        let (avail, freed) = batch.take_for_commit();
+                        s.free_page_batch(&avail).unwrap();
+                        for pid in freed {
+                            s.recycle_page(pid).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            storage.flush().unwrap();
+        });
+    });
+
+    group.finish();
+}
+
 // ── Registration ─────────────────────────────────────────────────────────────
 
 criterion_group!(
@@ -218,5 +329,6 @@ criterion_group!(
     bench_mmap_write_read,
     bench_mmap_sequential_reads,
     bench_checksum_throughput,
+    bench_batch_alloc_vs_per_page,
 );
 criterion_main!(benches);

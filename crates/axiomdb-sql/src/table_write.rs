@@ -33,8 +33,10 @@ impl TableEngine {
         let encoded = encode_row(&coerced, &col_types)?;
 
         let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
-        let (page_id, slot_id) =
-            HeapChain::insert(storage, table_def.root_page_id, &encoded, txn_id)?;
+        let (page_id, slot_id) = {
+            let batch = &mut conn_txn.local_page_batch;
+            HeapChain::insert(storage, table_def.root_page_id, &encoded, txn_id, Some(batch))?
+        };
 
         let key = encode_rid(page_id, slot_id);
         txn.record_insert(conn_txn, table_def.id, &key, &encoded, page_id, slot_id)?;
@@ -70,8 +72,10 @@ impl TableEngine {
         let coerced = coerce_values(values, columns)?;
         let encoded = encode_row(&coerced, &col_types)?;
         let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
-        let (page_id, slot_id) =
-            HeapChain::insert_with_hint(storage, table_def.root_page_id, &encoded, txn_id, hint)?;
+        let (page_id, slot_id) = {
+            let batch = &mut conn_txn.local_page_batch;
+            HeapChain::insert_with_hint(storage, table_def.root_page_id, &encoded, txn_id, hint, Some(batch))?
+        };
         let key = encode_rid(page_id, slot_id);
         txn.record_insert(conn_txn, table_def.id, &key, &encoded, page_id, slot_id)?;
         Ok(RecordId { page_id, slot_id })

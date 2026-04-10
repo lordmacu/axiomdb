@@ -55,9 +55,16 @@ Fairness rules:
 """
 
 import argparse
+import atexit
 import json
+import os
+import shutil
+import signal
+import socket
 import statistics
+import subprocess
 import sys
+import tempfile
 import time
 
 import pymysql
@@ -126,6 +133,16 @@ ENGINE_CONFIGS = {
 }
 
 DEFAULT_ENGINES = ["mariadb", "mysql", "axiomdb"]
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+AXIOMDB_BIN = os.path.join(ROOT_DIR, "target", "release", "axiomdb-server")
+AXIOMDB_DATA_PREFIX = "axiomdb_localbench."
+PORT_WAIT_TIMEOUT_S = 20.0
+CONNECT_WAIT_TIMEOUT_S = 20.0
+BUILD_TIMEOUT_S = 30 * 60
+
+MANAGED_ENGINES = {"mariadb", "axiomdb"}
+PROCESS_HANDLES = []
 
 PRINT_ORDER = [
     "insert",
@@ -208,6 +225,284 @@ def connect_pg(cfg):
     conn = psycopg2.connect(**params)
     conn.autocommit = True
     return conn
+
+
+def run_cmd(cmd, *, cwd=None, check=True, capture_output=True, text=True, timeout=None):
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        check=check,
+        capture_output=capture_output,
+        text=text,
+        timeout=timeout,
+    )
+
+
+def port_is_open(host, port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex((host, port)) == 0
+
+
+def wait_for_port(host, port, timeout_s):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if port_is_open(host, port):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def wait_for_connection(engine_key, cfg, timeout_s):
+    deadline = time.time() + timeout_s
+    last_error = "connection timed out"
+    while time.time() < deadline:
+        try:
+            conn = open_connection(engine_key, cfg)
+            conn.close()
+            return None
+        except Exception as exc:
+            last_error = str(exc)
+            time.sleep(0.3)
+    return last_error
+
+
+def pid_for_port(port):
+    try:
+        result = run_cmd(
+            ["bash", "-lc", f"sudo fuser -n tcp {port} 2>/dev/null || true"],
+            check=False,
+        )
+    except Exception:
+        return []
+    output = result.stdout.strip()
+    if not output:
+        return []
+    pids = []
+    for token in output.split():
+        if token.isdigit():
+            pids.append(int(token))
+    return pids
+
+
+def free_port(port):
+    pids = pid_for_port(port)
+    if not pids:
+        return {"action": "free", "details": "port already free"}
+    run_cmd(["sudo", "fuser", "-k", f"{port}/tcp"], check=False)
+    if wait_for_port("127.0.0.1", port, 2.0):
+        return {"action": "failed", "details": f"port still busy after kill: {pids}"}
+    return {"action": "killed", "details": f"terminated pids {pids}"}
+
+
+def build_axiomdb():
+    run_cmd(
+        ["cargo", "build", "--release", "-p", "axiomdb-server"],
+        cwd=ROOT_DIR,
+        timeout=BUILD_TIMEOUT_S,
+    )
+
+
+def stop_managed_processes():
+    while PROCESS_HANDLES:
+        handle = PROCESS_HANDLES.pop()
+        proc = handle["proc"]
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        if handle.get("data_dir"):
+            shutil.rmtree(handle["data_dir"], ignore_errors=True)
+
+
+atexit.register(stop_managed_processes)
+
+
+def restart_mariadb():
+    run_cmd(["sudo", "systemctl", "restart", "mariadb"])
+
+
+def stop_mariadb():
+    run_cmd(["sudo", "systemctl", "stop", "mariadb"])
+
+
+def start_axiomdb(cfg):
+    data_dir = tempfile.mkdtemp(prefix=AXIOMDB_DATA_PREFIX, dir="/tmp")
+    env = os.environ.copy()
+    env["AXIOMDB_PORT"] = str(cfg["port"])
+    env["AXIOMDB_DATA"] = data_dir
+    proc = subprocess.Popen(
+        [AXIOMDB_BIN],
+        cwd=ROOT_DIR,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        start_new_session=True,
+    )
+    PROCESS_HANDLES.append({"name": "axiomdb", "proc": proc, "data_dir": data_dir})
+    return proc, data_dir
+
+
+def open_connection(engine_key, cfg):
+    kind = cfg["kind"]
+    if kind == "pg":
+        return connect_pg(cfg)
+    if kind in {"mysql", "axiomdb"}:
+        return connect_mysql(cfg)
+    raise ValueError(f"unknown engine kind: {kind}")
+
+
+def preflight_status_icon(status):
+    return {
+        "ready": "\U0001f7e2",
+        "warning": "\U0001f7e1",
+        "error": "\U0001f534",
+        "skipped": "\u26aa",
+    }.get(status, "\u26aa")
+
+
+def semaforo_text(light):
+    return {
+        "\U0001f7e2": "VERDE",
+        "\U0001f7e1": "AMARILLO",
+        "\U0001f534": "ROJO",
+    }.get(light, "N/A")
+
+
+def print_preflight_table(statuses, selected_engines):
+    print()
+    print("Preflight")
+    print("---------")
+    header = (
+        f"{'Engine':<14}  {'Port':<7}  {'Build':<10}  {'Port Check':<12}  "
+        f"{'Health':<8}  {'Action':<10}  Details"
+    )
+    print(header)
+    print("-" * len(header))
+    for engine_key in selected_engines:
+        engine, cfg = ENGINE_CONFIGS[engine_key]
+        status = statuses[engine_key]
+        build = status.get("build", "\u2014")
+        port = status.get("port_check", "\u2014")
+        health = status.get("health", "\u2014")
+        action = status.get("action", "\u2014")
+        details = status.get("details", "")
+        print(
+            f"{engine:<14}  {cfg['port']:<7}  {build:<10}  {port:<12}  "
+            f"{health:<8}  {action:<10}  {details}"
+        )
+    print()
+
+
+def manage_engine(engine_key, statuses):
+    engine, cfg = ENGINE_CONFIGS[engine_key]
+    status = {
+        "engine": engine,
+        "port": cfg["port"],
+        "build": "\u2014",
+        "port_check": "\u26aa pending",
+        "health": "\u26aa pending",
+        "action": "\u2014",
+        "details": "",
+    }
+    statuses[engine_key] = status
+
+    if engine_key not in MANAGED_ENGINES:
+        status["build"] = "\u26aa skipped"
+        if not wait_for_port(cfg["host"], cfg["port"], 1.0):
+            status["port_check"] = "\U0001f534 closed"
+            status["health"] = "\U0001f534 failed"
+            status["action"] = "manual"
+            status["details"] = "engine not auto-managed and port is closed"
+            return False
+        health_error = wait_for_connection(engine_key, cfg, 3.0)
+        if health_error is None:
+            status["port_check"] = "\U0001f7e2 open"
+            status["health"] = "\U0001f7e2 ready"
+            status["action"] = "reuse"
+            status["details"] = "existing engine accepted connections"
+            return True
+        status["port_check"] = "\U0001f7e1 open"
+        status["health"] = "\U0001f534 failed"
+        status["action"] = "manual"
+        status["details"] = health_error
+        return False
+
+    try:
+        if engine_key == "axiomdb":
+            status["build"] = "\U0001f7e1 building"
+            build_axiomdb()
+            status["build"] = "\U0001f7e2 ready"
+        else:
+            status["build"] = "\u26aa skipped"
+
+        if engine_key == "mariadb":
+            stop_mariadb()
+            if wait_for_port(cfg["host"], cfg["port"], 3.0):
+                port_result = free_port(cfg["port"])
+            else:
+                port_result = {"action": "stopped", "details": "service stopped cleanly"}
+            status["action"] = "restart"
+            status["details"] = port_result["details"]
+            if port_result["action"] == "failed":
+                status["port_check"] = "\U0001f534 busy"
+                status["health"] = "\U0001f534 failed"
+                return False
+            restart_mariadb()
+        elif engine_key == "axiomdb":
+            port_result = free_port(cfg["port"])
+            status["action"] = port_result["action"]
+            status["details"] = port_result["details"]
+            if port_result["action"] == "failed":
+                status["port_check"] = "\U0001f534 busy"
+                status["health"] = "\U0001f534 failed"
+                return False
+            start_axiomdb(cfg)
+
+        if not wait_for_port(cfg["host"], cfg["port"], PORT_WAIT_TIMEOUT_S):
+            status["port_check"] = "\U0001f534 closed"
+            status["health"] = "\U0001f534 failed"
+            status["details"] = "port did not open before timeout"
+            return False
+        status["port_check"] = "\U0001f7e2 open"
+
+        health_error = wait_for_connection(engine_key, cfg, CONNECT_WAIT_TIMEOUT_S)
+        if health_error is not None:
+            status["health"] = "\U0001f534 failed"
+            status["details"] = health_error
+            return False
+
+        status["health"] = "\U0001f7e2 ready"
+        if not status["details"]:
+            status["details"] = "engine ready"
+        return True
+    except subprocess.CalledProcessError as exc:
+        output = (exc.stderr or exc.stdout or str(exc)).strip()
+        status["build"] = "\U0001f534 failed" if engine_key == "axiomdb" else status["build"]
+        status["port_check"] = "\U0001f534 failed"
+        status["health"] = "\U0001f534 failed"
+        status["action"] = "error"
+        status["details"] = output.splitlines()[-1] if output else str(exc)
+        return False
+    except Exception as exc:
+        status["port_check"] = "\U0001f534 failed"
+        status["health"] = "\U0001f534 failed"
+        status["action"] = "error"
+        status["details"] = str(exc)
+        return False
+
+
+def prepare_selected_engines(selected_engines):
+    statuses = {}
+    ok = True
+    for engine_key in selected_engines:
+        if not manage_engine(engine_key, statuses):
+            ok = False
+    return ok, statuses
 
 
 def rows_data(n):
@@ -1054,7 +1349,7 @@ def print_table(results, selected_engines):
     print()
     header = f"{'Scenario':<22}" + "".join(f"  {engine:>24}" for engine in all_engines)
     if has_axiom:
-        header += "   vs"
+        header += f"  {'Semaforo':<10}  {'Ratio':>7}"
     print(header)
     print("-" * len(header))
     for scenario in PRINT_ORDER:
@@ -1081,12 +1376,9 @@ def print_table(results, selected_engines):
                         best_other = max(best_other, ov[1])
                 light = traffic_light(axiom_ops, best_other)
                 ratio = axiom_ops / best_other if best_other > 0 else 0
-                if ratio >= 1.0:
-                    row += f"  {light} {ratio:.2f}x"
-                else:
-                    row += f"  {light} {ratio:.2f}x"
+                row += f"  {light} {semaforo_text(light):<8}  {ratio:>6.2f}x"
             else:
-                row += "      "
+                row += f"  {'\u26aa':<10}  {'n/a':>7}"
 
         print(row)
 
@@ -1145,6 +1437,11 @@ if __name__ == "__main__":
         default=None,
         help="rows used by insert_autocommit (default: min(rows,1000))",
     )
+    parser.add_argument(
+        "--no-manage",
+        action="store_true",
+        help="do not auto-build/restart/launch engines; only validate existing services",
+    )
     parser.add_argument("--table", action="store_true", help="pretty-print comparison table")
     args = parser.parse_args()
 
@@ -1158,6 +1455,44 @@ if __name__ == "__main__":
         range_rows=args.range_rows,
     )
     scenarios = ALL_SCENARIOS if args.scenario == "all" else [args.scenario]
+
+    if args.no_manage:
+        statuses = {}
+        ok = True
+        for engine_key in selected_engines:
+            engine, cfg = ENGINE_CONFIGS[engine_key]
+            status = {
+                "engine": engine,
+                "port": cfg["port"],
+                "build": "\u26aa skipped",
+                "port_check": "\u26aa pending",
+                "health": "\u26aa pending",
+                "action": "reuse",
+                "details": "",
+            }
+            statuses[engine_key] = status
+            if wait_for_port(cfg["host"], cfg["port"], 1.0):
+                status["port_check"] = "\U0001f7e2 open"
+            else:
+                status["port_check"] = "\U0001f534 closed"
+                status["health"] = "\U0001f534 failed"
+                status["details"] = "port is closed"
+                ok = False
+                continue
+            health_error = wait_for_connection(engine_key, cfg, 3.0)
+            if health_error is None:
+                status["health"] = "\U0001f7e2 ready"
+                status["details"] = "existing engine accepted connections"
+            else:
+                status["health"] = "\U0001f534 failed"
+                status["details"] = health_error
+                ok = False
+    else:
+        ok, statuses = prepare_selected_engines(selected_engines)
+
+    print_preflight_table(statuses, selected_engines)
+    if not ok:
+        raise SystemExit("preflight failed; fix the engines above or use --no-manage once they are ready")
 
     if args.table:
         import contextlib

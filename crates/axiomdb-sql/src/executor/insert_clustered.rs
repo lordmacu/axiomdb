@@ -250,6 +250,7 @@ fn apply_clustered_insert_rows(
                         .collect();
                 let inserted = axiomdb_storage::clustered_tree::try_insert_rightmost_leaf_batch(
                     storage,
+                    Some(&mut conn_txn.local_page_batch),
                     hinted_leaf_pid,
                     &append_rows,
                 )?;
@@ -339,8 +340,9 @@ fn apply_clustered_insert_rows(
             )?;
             new_root
         } else {
-            let new_root = axiomdb_storage::clustered_tree::insert(
+            let new_root = axiomdb_storage::clustered_tree::insert_with_batch(
                 storage,
+                Some(&mut conn_txn.local_page_batch),
                 Some(current_root),
                 &row.primary_key_bytes,
                 &new_header,

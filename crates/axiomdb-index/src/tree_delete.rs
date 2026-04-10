@@ -11,7 +11,7 @@ impl BTree {
                 OptimisticLeafResult::NeedPessimistic => {}
             }
 
-            match Self::delete_subtree(self.storage.as_mut(), root, key, true)? {
+            match Self::delete_subtree_batched(self.storage.as_mut(), None, root, key, true)? {
                 DeleteResult::NotFound => {
                     if self.root_pid.load(Ordering::Acquire) == root {
                         return Ok(false);
@@ -34,8 +34,10 @@ impl BTree {
         }
     }
 
-    fn delete_subtree(
+    #[allow(clippy::needless_option_as_deref)]
+    fn delete_subtree_batched(
         storage: &mut dyn StorageEngine,
+        mut batch: Option<&mut LocalPageBatch>,
         pid: u64,
         key: &[u8],
         is_root: bool,
@@ -56,7 +58,7 @@ impl BTree {
                 // rationale.
                 if Self::child_is_safe_for_delete(storage, child_pid)? {
                     drop(parent_guard);
-                    let result = Self::delete_subtree(storage, child_pid, key, false)?;
+                    let result = Self::delete_subtree_batched(storage, batch, child_pid, key, false)?;
                     return match result {
                         DeleteResult::NotFound => Ok(DeleteResult::NotFound),
                         DeleteResult::Deleted { new_pid, underfull } => {
@@ -76,7 +78,7 @@ impl BTree {
                     };
                 }
 
-                match Self::delete_subtree(storage, child_pid, key, false)? {
+                match Self::delete_subtree_batched(storage, batch.as_deref_mut(), child_pid, key, false)? {
                     DeleteResult::NotFound => Ok(DeleteResult::NotFound),
                     DeleteResult::Deleted {
                         new_pid: new_child_pid,
@@ -110,7 +112,7 @@ impl BTree {
                             // Child underflowed — structural rebalance (rotate/merge).
                             // Rebalance may change the parent's key count, so check underflow.
                             let new_pid =
-                                Self::rebalance(storage, pid, node, child_idx, new_child_pid)?;
+                                Self::rebalance_batched(storage, batch, pid, node, child_idx, new_child_pid)?;
                             let underfull2 =
                                 !is_root && Self::internal_underfull(storage, new_pid)?;
                             Ok(DeleteResult::Deleted {
@@ -166,8 +168,9 @@ impl BTree {
         })
     }
 
-    fn rebalance(
+    fn rebalance_batched(
         storage: &mut dyn StorageEngine,
+        batch: Option<&mut LocalPageBatch>,
         parent_pid: u64,
         parent: InternalNodePage,
         child_idx: usize,
@@ -187,8 +190,9 @@ impl BTree {
         if child_idx > 0 {
             let left_pid = parent.child_at(child_idx - 1);
             if Self::node_key_count(storage, left_pid)? > min_keys {
-                return Self::rotate_right(
+                return Self::rotate_right_batched(
                     storage,
+                    batch,
                     parent_pid,
                     parent,
                     child_idx,
@@ -201,8 +205,9 @@ impl BTree {
         if child_idx < n {
             let right_pid = parent.child_at(child_idx + 1);
             if Self::node_key_count(storage, right_pid)? > min_keys {
-                return Self::rotate_left(
+                return Self::rotate_left_batched(
                     storage,
+                    batch,
                     parent_pid,
                     parent,
                     child_idx,
@@ -214,8 +219,9 @@ impl BTree {
         }
         if child_idx > 0 {
             let left_pid = parent.child_at(child_idx - 1);
-            return Self::merge_children(
+            return Self::merge_children_batched(
                 storage,
+                batch,
                 parent_pid,
                 parent,
                 child_idx - 1,
@@ -225,8 +231,9 @@ impl BTree {
             );
         }
         let right_pid = parent.child_at(child_idx + 1);
-        Self::merge_children(
+        Self::merge_children_batched(
             storage,
+            batch,
             parent_pid,
             parent,
             child_idx,
@@ -236,8 +243,10 @@ impl BTree {
         )
     }
 
-    fn rotate_right(
+    #[allow(clippy::needless_option_as_deref)]
+    fn rotate_right_batched(
         storage: &mut dyn StorageEngine,
+        mut batch: Option<&mut LocalPageBatch>,
         parent_pid: u64,
         mut parent: InternalNodePage,
         child_idx: usize,
@@ -245,7 +254,7 @@ impl BTree {
         left_pid: u64,
         is_leaf: bool,
     ) -> Result<u64, DbError> {
-        let np = storage.alloc_page(PageType::Index)?;
+        let np = batch_alloc_page(storage, batch.as_deref_mut(), PageType::Index)?;
         let (_guard_a, _guard_b) = if left_pid <= child_pid {
             (
                 storage.page_lock_table().write(left_pid),
@@ -297,8 +306,8 @@ impl BTree {
             storage.write_page_under_page_lock(child_pid, &cp)?;
             // Do NOT free left_pid or child_pid — they are still live leaves.
         } else {
-            let nc = storage.alloc_page(PageType::Index)?;
-            let nl = storage.alloc_page(PageType::Index)?;
+            let nc = batch_alloc_page(storage, batch.as_deref_mut(), PageType::Index)?;
+            let nl = batch_alloc_page(storage, batch.as_deref_mut(), PageType::Index)?;
             let mut left = match NodeCopy::read(storage, left_pid)? {
                 NodeCopy::Internal(n) => n,
                 NodeCopy::Leaf(_) => unreachable!(),
@@ -365,8 +374,10 @@ impl BTree {
         Ok(np)
     }
 
-    fn rotate_left(
+    #[allow(clippy::needless_option_as_deref)]
+    fn rotate_left_batched(
         storage: &mut dyn StorageEngine,
+        mut batch: Option<&mut LocalPageBatch>,
         parent_pid: u64,
         mut parent: InternalNodePage,
         child_idx: usize,
@@ -374,7 +385,7 @@ impl BTree {
         right_pid: u64,
         is_leaf: bool,
     ) -> Result<u64, DbError> {
-        let np = storage.alloc_page(PageType::Index)?;
+        let np = batch_alloc_page(storage, batch.as_deref_mut(), PageType::Index)?;
         let (_guard_a, _guard_b) = if child_pid <= right_pid {
             (
                 storage.page_lock_table().write(child_pid),
@@ -425,8 +436,8 @@ impl BTree {
             storage.write_page_under_page_lock(right_pid, &rp)?;
             // Do NOT free child_pid or right_pid — they are still live leaves.
         } else {
-            let nc = storage.alloc_page(PageType::Index)?;
-            let nr = storage.alloc_page(PageType::Index)?;
+            let nc = batch_alloc_page(storage, batch.as_deref_mut(), PageType::Index)?;
+            let nr = batch_alloc_page(storage, batch.as_deref_mut(), PageType::Index)?;
             let mut child = match NodeCopy::read(storage, child_pid)? {
                 NodeCopy::Internal(n) => n,
                 NodeCopy::Leaf(_) => unreachable!(),
@@ -475,8 +486,10 @@ impl BTree {
         Ok(np)
     }
 
-    fn merge_children(
+    #[allow(clippy::needless_option_as_deref)]
+    fn merge_children_batched(
         storage: &mut dyn StorageEngine,
+        mut batch: Option<&mut LocalPageBatch>,
         parent_pid: u64,
         mut parent: InternalNodePage,
         sep_idx: usize,
@@ -484,7 +497,7 @@ impl BTree {
         right_pid: u64,
         is_leaf: bool,
     ) -> Result<u64, DbError> {
-        let npp = storage.alloc_page(PageType::Index)?;
+        let npp = batch_alloc_page(storage, batch.as_deref_mut(), PageType::Index)?;
         let (_guard_a, _guard_b) = if left_pid <= right_pid {
             (
                 storage.page_lock_table().write(left_pid),
@@ -526,7 +539,7 @@ impl BTree {
             // right_pid is freed below; left_pid stays live.
             left_pid
         } else {
-            let mp = storage.alloc_page(PageType::Index)?;
+            let mp = batch_alloc_page(storage, batch.as_deref_mut(), PageType::Index)?;
             let left = match NodeCopy::read(storage, left_pid)? {
                 NodeCopy::Internal(n) => n,
                 NodeCopy::Leaf(_) => unreachable!(),

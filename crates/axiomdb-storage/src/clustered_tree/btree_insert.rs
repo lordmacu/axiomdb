@@ -8,13 +8,16 @@ use super::{InsertResult, OwnedInternalCell, OwnedLeafCell};
 use crate::{
     clustered_internal, clustered_leaf,
     heap::RowHeader,
+    local_page_batch::{batch_alloc_page, LocalPageBatch},
     page::{Page, PageType},
     StorageEngine,
 };
 use axiomdb_core::error::DbError;
 
+#[allow(clippy::needless_option_as_deref)]
 pub(super) fn insert_subtree(
     storage: &mut dyn StorageEngine,
+    batch: Option<&mut LocalPageBatch>,
     pid: u64,
     key: &[u8],
     row_header: &RowHeader,
@@ -25,6 +28,7 @@ pub(super) fn insert_subtree(
     match clustered_page_type(&page_ref)? {
         PageType::ClusteredLeaf => insert_into_leaf(
             storage,
+            batch,
             pid,
             page_ref.into_page(),
             key,
@@ -35,16 +39,11 @@ pub(super) fn insert_subtree(
             let page = page_ref.into_page();
 
             // Phase 40.8c: early X-latch release on safe descent.
-            // We peek at the immediate child while still holding our parent
-            // X-latch. If the child has plenty of free space, the recursive
-            // call cannot return InsertResult::Split (the clustered tree
-            // never changes a page's pid on split), so we can drop our latch
-            // before recursing and let concurrent readers in.
             let child_idx = clustered_internal::find_child_idx(&page, key)?;
             let child_pid = clustered_internal::child_at(&page, child_idx as u16)?;
             if child_is_safe_for_insert(storage, child_pid, key, row_data.len())? {
                 drop(parent_guard);
-                let result = insert_subtree(storage, child_pid, key, row_header, row_data)?;
+                let result = insert_subtree(storage, batch, child_pid, key, row_header, row_data)?;
                 debug_assert!(
                     matches!(result, InsertResult::Inserted),
                     "safe child must return InsertResult::Inserted"
@@ -52,7 +51,7 @@ pub(super) fn insert_subtree(
                 return Ok(InsertResult::Inserted);
             }
 
-            insert_into_internal(storage, pid, page, key, row_header, row_data)
+            insert_into_internal(storage, batch, pid, page, key, row_header, row_data)
         }
         other => Err(DbError::BTreeCorrupted {
             msg: format!(
@@ -62,8 +61,10 @@ pub(super) fn insert_subtree(
     }
 }
 
+#[allow(clippy::needless_option_as_deref)]
 fn insert_into_leaf(
     storage: &mut dyn StorageEngine,
+    mut batch: Option<&mut LocalPageBatch>,
     pid: u64,
     mut page: Page,
     key: &[u8],
@@ -75,7 +76,7 @@ fn insert_into_leaf(
         Err(pos) => pos,
     };
 
-    let cell = materialize_leaf_cell(storage, key, row_header, row_data)?;
+    let cell = materialize_leaf_cell(storage, batch.as_deref_mut(), key, row_header, row_data)?;
 
     match clustered_leaf::insert_cell_with_overflow(
         &mut page,
@@ -108,7 +109,7 @@ fn insert_into_leaf(
                     Ok(InsertResult::Inserted)
                 }
                 Err(DbError::HeapPageFull { .. }) => {
-                    split_leaf(storage, pid, &page, insert_pos, cell)
+                    split_leaf(storage, batch, pid, &page, insert_pos, cell)
                 }
                 Err(err) => Err(err),
             }
@@ -119,6 +120,7 @@ fn insert_into_leaf(
 
 fn split_leaf(
     storage: &mut dyn StorageEngine,
+    batch: Option<&mut LocalPageBatch>,
     pid: u64,
     page: &Page,
     insert_pos: usize,
@@ -129,7 +131,7 @@ fn split_leaf(
 
     let split_at = choose_leaf_split_idx(&cells);
     let old_next_leaf = clustered_leaf::next_leaf(page);
-    let right_pid = storage.alloc_page(PageType::ClusteredLeaf)?;
+    let right_pid = batch_alloc_page(storage, batch, PageType::ClusteredLeaf)?;
 
     let mut left_page = Page::new(PageType::ClusteredLeaf, pid);
     rebuild_leaf_page(&mut left_page, &cells[..split_at], right_pid)?;
@@ -146,8 +148,10 @@ fn split_leaf(
     })
 }
 
+#[allow(clippy::needless_option_as_deref)]
 fn insert_into_internal(
     storage: &mut dyn StorageEngine,
+    mut batch: Option<&mut LocalPageBatch>,
     pid: u64,
     mut page: Page,
     key: &[u8],
@@ -157,7 +161,14 @@ fn insert_into_internal(
     let child_idx = clustered_internal::find_child_idx(&page, key)?;
     let child_pid = clustered_internal::child_at(&page, child_idx as u16)?;
 
-    match insert_subtree(storage, child_pid, key, row_header, row_data)? {
+    match insert_subtree(
+        storage,
+        batch.as_deref_mut(),
+        child_pid,
+        key,
+        row_header,
+        row_data,
+    )? {
         InsertResult::Inserted => Ok(InsertResult::Inserted),
         InsertResult::Split { sep_key, right_pid } => {
             match clustered_internal::insert_at(&mut page, child_idx, &sep_key, right_pid) {
@@ -174,9 +185,9 @@ fn insert_into_internal(
                             storage.write_page_under_page_lock(pid, &page)?;
                             Ok(InsertResult::Inserted)
                         }
-                        Err(DbError::HeapPageFull { .. }) => {
-                            split_internal(storage, pid, &page, child_idx, &sep_key, right_pid)
-                        }
+                        Err(DbError::HeapPageFull { .. }) => split_internal(
+                            storage, batch, pid, &page, child_idx, &sep_key, right_pid,
+                        ),
                         Err(err) => Err(err),
                     }
                 }
@@ -188,6 +199,7 @@ fn insert_into_internal(
 
 fn split_internal(
     storage: &mut dyn StorageEngine,
+    batch: Option<&mut LocalPageBatch>,
     pid: u64,
     page: &Page,
     insert_pos: usize,
@@ -206,7 +218,7 @@ fn split_internal(
 
     let promoted_idx = choose_internal_promotion_idx(&separators);
     let promoted = separators[promoted_idx].clone();
-    let new_right_pid = storage.alloc_page(PageType::ClusteredInternal)?;
+    let new_right_pid = batch_alloc_page(storage, batch, PageType::ClusteredInternal)?;
 
     let mut left_page = Page::new(PageType::ClusteredInternal, pid);
     rebuild_internal_page(&mut left_page, leftmost_child, &separators[..promoted_idx])?;

@@ -61,6 +61,9 @@ pub struct Savepoint {
     pub(crate) undo_len: usize,
     /// Length of `ActiveTxn::deferred_free_pages` at savepoint creation time.
     pub(crate) deferred_free_len: usize,
+    /// Length of `LocalPageBatch::freed` at savepoint creation time.
+    /// Used by `rollback_to_savepoint` to truncate freed-after-savepoint entries.
+    pub(crate) batch_freed_len: usize,
 }
 
 // ── UndoOp ───────────────────────────────────────────────────────────────────
@@ -149,6 +152,13 @@ pub enum IndexUndoRecord {
     },
 }
 
+// ── LocalPageBatch (re-exported from axiomdb-storage) ──────────────────────
+//
+// The struct lives in `axiomdb-storage::local_page_batch` so that hot-path
+// functions in axiomdb-storage and axiomdb-index can accept it without a
+// dependency cycle. Re-export here for convenience.
+pub use axiomdb_storage::LocalPageBatch;
+
 // ── ConnectionTxn ────────────────────────────────────────────────────────────
 
 /// Per-connection transaction state returned by [`TxnManager::begin`].
@@ -181,6 +191,10 @@ pub struct ConnectionTxn {
     pub(crate) active_ids_at_begin: Option<Arc<HashSet<TxnId>>>,
     /// Reusable WAL scratch buffer (per-connection, zero contention).
     pub(crate) wal_scratch: Vec<u8>,
+    /// Phase 40.9: per-connection page allocation batch. Pre-allocated page
+    /// IDs are drawn from here instead of the global `Mutex<FreeList>`.
+    /// Drained on commit / rollback.
+    pub local_page_batch: LocalPageBatch,
     /// Copied from `TxnManager::deferred_commit_mode` at BEGIN time.
     pub(crate) deferred_commit_mode: bool,
     /// Set by `commit()` in deferred mode. Taken by `take_pending_deferred_commit()`.
@@ -225,6 +239,14 @@ pub struct TxnManager {
     deferred_commit_mode: bool,
     /// Pages waiting to be freed after their transaction is durably committed.
     committed_free_batches: Vec<(TxnId, Vec<u64>)>,
+    /// Phase 40.9: leftover `LocalPageBatch.available` pages from committed
+    /// transactions, awaiting `free_page_batch` to return them to the bitmap.
+    /// Drained by `drain_committed_page_batches(storage)`.
+    committed_steal_protection: Vec<Vec<u64>>,
+    /// Phase 40.9: `LocalPageBatch.freed` pages from committed transactions,
+    /// awaiting `recycle_page` to push them to the lock-free queue.
+    /// Drained by `drain_committed_page_batches(storage)`.
+    committed_recycle_pages: Vec<Vec<u64>>,
     /// WAL durability policy for committed DML.
     durability_policy: WalDurabilityPolicy,
     /// Last known clustered root per table after the most recent commit or rollback.
@@ -818,7 +840,7 @@ mod tests {
         let conn1 = mgr.begin().unwrap();
         let txn1 = conn1.txn_id;
         for i in 0u8..5 {
-            HeapChain::insert(&mut storage, root_page_id, &[i; 8], txn1).unwrap();
+            HeapChain::insert(&mut storage, root_page_id, &[i; 8], txn1, None).unwrap();
         }
         mgr.commit(conn1).unwrap();
 
@@ -871,7 +893,7 @@ mod tests {
         let conn1 = mgr.begin().unwrap();
         let txn1 = conn1.txn_id;
         for i in 0u8..5 {
-            HeapChain::insert(&mut storage, root_page_id, &[i; 8], txn1).unwrap();
+            HeapChain::insert(&mut storage, root_page_id, &[i; 8], txn1, None).unwrap();
         }
         mgr.commit(conn1).unwrap();
 

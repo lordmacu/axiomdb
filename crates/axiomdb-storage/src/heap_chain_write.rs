@@ -4,6 +4,10 @@ impl HeapChain {
     /// Walks to the last page in the chain. If that page is full, allocates a
     /// new `Data` page, links it to the chain, and inserts there.
     ///
+    /// When `batch` is `Some`, page allocation is satisfied from the local
+    /// per-transaction batch (Phase 40.9 Tier-1), falling back to the global
+    /// bitmap only on refill.
+    ///
     /// Returns `(page_id, slot_id)` of the newly inserted tuple.
     ///
     /// # Errors
@@ -15,6 +19,7 @@ impl HeapChain {
         root_page_id: u64,
         data: &[u8],
         txn_id: TxnId,
+        batch: Option<&mut LocalPageBatch>,
     ) -> Result<(u64, u16), DbError> {
         let locks = storage.page_lock_table();
 
@@ -41,7 +46,7 @@ impl HeapChain {
                 drop(_latch);
 
                 // Chain is full on last page. Allocate a new page.
-                let new_page_id = storage.alloc_page(PageType::Data)?;
+                let new_page_id = batch_alloc_page(storage, batch, PageType::Data)?;
                 let mut new_page = Page::new(PageType::Data, new_page_id);
 
                 // Insert into the empty new page — guaranteed to fit.
@@ -79,6 +84,7 @@ impl HeapChain {
         data: &[u8],
         txn_id: TxnId,
         mut hint: Option<&mut HeapAppendHint>,
+        batch: Option<&mut LocalPageBatch>,
     ) -> Result<(u64, u16), DbError> {
         // Resolve tail — use hint when valid, full walk otherwise.
         let last_page_id =
@@ -99,7 +105,7 @@ impl HeapChain {
             Err(DbError::HeapPageFull { .. }) => {
                 drop(_latch);
                 // Allocate new tail page and link it.
-                let new_page_id = storage.alloc_page(PageType::Data)?;
+                let new_page_id = batch_alloc_page(storage, batch, PageType::Data)?;
                 let mut new_page = Page::new(PageType::Data, new_page_id);
                 let slot_id = insert_tuple(&mut new_page, data, txn_id)?;
                 new_page.update_checksum();

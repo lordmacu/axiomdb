@@ -1063,6 +1063,65 @@ caller).
 - The freelist bitmap is itself stored in allocated pages (and tracked recursively
   during bootstrap).
 
+### Two-Tier Allocation (Phase 40.9)
+
+Page allocation uses a two-tier system to eliminate contention on the global
+`Mutex<FreeList>` for 99% of allocations:
+
+**Tier 1 — Per-connection `LocalPageBatch`** (zero contention):
+
+Each `ConnectionTxn` owns a `LocalPageBatch` with a `VecDeque<u64>` of pre-allocated
+page IDs. Most allocations pop from this local batch in O(1) with no locks, no atomics.
+
+```
+Transaction calls batch_alloc_page(storage, Some(&mut batch), ty):
+  1. Check batch.available → non-empty? pop_front, return (0 locks, ~10ns)
+  2. Empty? Refill from global allocator:
+     a. Drain recycle_queue (lock-free SegQueue pops)
+     b. If still need more: lock freelist Mutex, alloc_batch_sequential(n)
+     c. If exhausted: do_grow(GROW_PAGES), retry
+  3. Adaptive sizing: n = last_refill_size × max(1, extension_waiters)
+     capped at MAX_BATCH_SIZE (256)
+```
+
+On COMMIT: leftover `available` pages return to the bitmap (steal protection);
+`freed` pages go to the lock-free `recycle_queue` for fast reuse by other transactions.
+On ROLLBACK: `available` pages return to the bitmap; `freed` pages are kept (rollback
+restores the rows that were freed → the pages are still in use).
+
+**Tier 2 — Global `Mutex<FreeList>` + `SegQueue` recycle** (amortized):
+
+The global allocator is touched only once every 64 allocations (the `BATCH_ALLOC_SIZE`).
+`MmapStorage` adds a `recycle_queue: crossbeam_queue::SegQueue<u64>` — a lock-free MPMC
+queue — where committed transactions push freed page IDs. The next refill drains this
+queue first (zero-cost, already-initialized pages) before falling back to the bitmap scan.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">703× Faster Than Per-Page Mutex Under 8 Threads</span>
+With 8 concurrent threads each performing 10K alloc+free cycles, the <code>LocalPageBatch</code>
+path completes in <strong>7.6 ms</strong> vs <strong>5.35 s</strong> for the per-page Mutex
+baseline — a <strong>703×</strong> speedup. Single-thread speedup is 28.8×. The gain comes from
+eliminating 99% of Mutex acquisitions: each transaction touches the global allocator only
+once per 64 pages instead of once per page.
+</div>
+</div>
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — DuckDB-Inspired Batching, PostgreSQL Adaptive Sizing</span>
+DuckDB's <code>SingleFileBlockManager</code> uses a single mutex per allocation (no thread-local
+batch exists in its source despite documentation claims). AxiomDB borrows the <em>idea</em> of
+per-connection batching but implements it as a <code>LocalPageBatch</code> owned by each
+<code>ConnectionTxn</code>. Adaptive batch sizing is borrowed from PostgreSQL's
+<code>RelationAddBlocks</code> (<code>extend_by_pages += extend_by_pages × waiter_count</code>):
+when contention is detected via <code>extension_waiters: AtomicU32</code>, the next refill
+grabs a larger batch (up to 256 pages) to reduce future contention.
+</div>
+</div>
+
 ---
 
 ## Heap Pages — Slotted Format

@@ -198,6 +198,19 @@ impl BTree {
         rid: RecordId,
         fillfactor: u8,
     ) -> Result<(), DbError> {
+        Self::insert_in_with_batch(storage, None, root_pid, key, rid, fillfactor)
+    }
+
+    /// Like [`insert_in`] but routes page allocations through `batch`.
+    #[allow(clippy::needless_option_as_deref)]
+    pub fn insert_in_with_batch(
+        storage: &mut dyn StorageEngine,
+        mut batch: Option<&mut LocalPageBatch>,
+        root_pid: &AtomicU64,
+        key: &[u8],
+        rid: RecordId,
+        fillfactor: u8,
+    ) -> Result<(), DbError> {
         Self::check_key(key)?;
         let _tree_guard = storage.page_lock_table().write(Self::static_api_lock_id(root_pid));
         loop {
@@ -208,14 +221,14 @@ impl BTree {
                 OptimisticLeafResult::NeedPessimistic => {}
             }
 
-            let final_root = match Self::insert_subtree(storage, root, key, rid, fillfactor)? {
+            let final_root = match Self::insert_subtree_batched(storage, batch.as_deref_mut(), root, key, rid, fillfactor)? {
                 InsertResult::Ok(new_root) => new_root,
                 InsertResult::Split {
                     left_pid,
                     right_pid,
                     sep,
                     ..
-                } => Self::alloc_root(storage, &sep, left_pid, right_pid)?,
+                } => Self::alloc_root_batched(storage, batch.as_deref_mut(), &sep, left_pid, right_pid)?,
             };
 
             if root_pid
@@ -280,6 +293,17 @@ impl BTree {
         root_pid: &AtomicU64,
         key: &[u8],
     ) -> Result<bool, DbError> {
+        Self::delete_in_with_batch(storage, None, root_pid, key)
+    }
+
+    /// Like [`delete_in`] but routes page allocations through `batch`.
+    #[allow(clippy::needless_option_as_deref)]
+    pub fn delete_in_with_batch(
+        storage: &mut dyn StorageEngine,
+        mut batch: Option<&mut LocalPageBatch>,
+        root_pid: &AtomicU64,
+        key: &[u8],
+    ) -> Result<bool, DbError> {
         Self::check_key(key)?;
         let _tree_guard = storage.page_lock_table().write(Self::static_api_lock_id(root_pid));
         loop {
@@ -290,7 +314,7 @@ impl BTree {
                 OptimisticLeafResult::NeedPessimistic => {}
             }
 
-            match Self::delete_subtree(storage, root, key, true)? {
+            match Self::delete_subtree_batched(storage, batch.as_deref_mut(), root, key, true)? {
                 DeleteResult::NotFound => {
                     if root_pid.load(Ordering::Acquire) == root {
                         return Ok(false);

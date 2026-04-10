@@ -31,6 +31,7 @@ use crate::{
         clear_deletion, insert_tuple, num_slots, read_slot, read_tuple_header, scan_visible,
         try_rewrite_tuple_same_slot_no_checksum, RowHeader,
     },
+    local_page_batch::{batch_alloc_page, LocalPageBatch},
     page::{Page, PageType},
     StorageEngine,
 };
@@ -182,7 +183,7 @@ mod tests {
         let snap_before = committed_snap();
 
         // Insert with txn_id=1 (autocommit: visible to snapshot_id=2+).
-        HeapChain::insert(&mut storage, root, b"hello", 1).unwrap();
+        HeapChain::insert(&mut storage, root, b"hello", 1, None).unwrap();
 
         // Snapshot that sees txn 1 as committed.
         let snap = TransactionSnapshot::committed(1);
@@ -199,9 +200,9 @@ mod tests {
     fn test_insert_multi_tuple_same_page() {
         let (mut storage, root) = storage_with_root();
 
-        HeapChain::insert(&mut storage, root, b"row1", 1).unwrap();
-        HeapChain::insert(&mut storage, root, b"row2", 1).unwrap();
-        HeapChain::insert(&mut storage, root, b"row3", 1).unwrap();
+        HeapChain::insert(&mut storage, root, b"row1", 1, None).unwrap();
+        HeapChain::insert(&mut storage, root, b"row2", 1, None).unwrap();
+        HeapChain::insert(&mut storage, root, b"row3", 1, None).unwrap();
 
         let snap = TransactionSnapshot::committed(1);
         let rows = HeapChain::scan_visible(&mut storage, root, snap).unwrap();
@@ -216,8 +217,8 @@ mod tests {
     fn test_deleted_tuple_not_visible() {
         let (mut storage, root) = storage_with_root();
 
-        let (page_id, slot_id) = HeapChain::insert(&mut storage, root, b"alive", 1).unwrap();
-        HeapChain::insert(&mut storage, root, b"also_alive", 1).unwrap();
+        let (page_id, slot_id) = HeapChain::insert(&mut storage, root, b"alive", 1, None).unwrap();
+        HeapChain::insert(&mut storage, root, b"also_alive", 1, None).unwrap();
 
         // Delete first tuple with txn_id=2.
         HeapChain::delete(&mut storage, page_id, slot_id, 2).unwrap();
@@ -239,7 +240,7 @@ mod tests {
         let big_data = vec![0xABu8; 4000];
         let mut inserted = 0usize;
         for _ in 0..10 {
-            HeapChain::insert(&mut storage, root, &big_data, 1).unwrap();
+            HeapChain::insert(&mut storage, root, &big_data, 1, None).unwrap();
             inserted += 1;
         }
 
@@ -302,7 +303,7 @@ mod tests {
         let (mut s2, root2) = storage_with_root();
         let mut indiv_rids = Vec::new();
         for row in &rows {
-            indiv_rids.push(HeapChain::insert(&mut s2, root2, row, 1).unwrap());
+            indiv_rids.push(HeapChain::insert(&mut s2, root2, row, 1, None).unwrap());
         }
 
         assert_eq!(batch_rids.len(), n);
@@ -348,7 +349,7 @@ mod tests {
 
         let (mut s2, root2) = storage_with_root();
         for row in &rows {
-            HeapChain::insert(&mut s2, root2, row, 1).unwrap();
+            HeapChain::insert(&mut s2, root2, row, 1, None).unwrap();
         }
 
         let snap = TransactionSnapshot::committed(1);
@@ -384,9 +385,9 @@ mod tests {
             .write_page(root, &Page::new(PageType::Data, root))
             .unwrap();
 
-        let rid1 = HeapChain::insert(&mut storage, root, b"alpha", 1).unwrap();
-        let rid2 = HeapChain::insert(&mut storage, root, b"bravo", 1).unwrap();
-        let rid3 = HeapChain::insert(&mut storage, root, b"charlie", 1).unwrap();
+        let rid1 = HeapChain::insert(&mut storage, root, b"alpha", 1, None).unwrap();
+        let rid2 = HeapChain::insert(&mut storage, root, b"bravo", 1, None).unwrap();
+        let rid3 = HeapChain::insert(&mut storage, root, b"charlie", 1, None).unwrap();
         assert_eq!(rid1.0, rid2.0);
         assert_eq!(rid2.0, rid3.0);
 
@@ -428,8 +429,8 @@ mod tests {
             .write_page(root, &Page::new(PageType::Data, root))
             .unwrap();
 
-        let rid1 = HeapChain::insert(&mut storage, root, b"alpha", 1).unwrap();
-        let rid2 = HeapChain::insert(&mut storage, root, b"bravo", 1).unwrap();
+        let rid1 = HeapChain::insert(&mut storage, root, b"alpha", 1, None).unwrap();
+        let rid2 = HeapChain::insert(&mut storage, root, b"bravo", 1, None).unwrap();
         assert_eq!(rid1.0, rid2.0, "test rows must share one page");
         let rid1 = axiomdb_core::RecordId {
             page_id: rid1.0,
@@ -492,7 +493,7 @@ mod hint_tests {
 
         // First insert: no hint → seeds hint with root as tail.
         let mut hint = None;
-        HeapChain::insert_with_hint(&mut storage, root, b"row1", 1, hint.as_mut()).unwrap();
+        HeapChain::insert_with_hint(&mut storage, root, b"row1", 1, hint.as_mut(), None).unwrap();
 
         // Seed hint manually.
         let mut h = HeapAppendHint {
@@ -500,7 +501,7 @@ mod hint_tests {
             tail_page_id: root,
         };
         // Second insert using hint.
-        HeapChain::insert_with_hint(&mut storage, root, b"row2", 1, Some(&mut h)).unwrap();
+        HeapChain::insert_with_hint(&mut storage, root, b"row2", 1, Some(&mut h), None).unwrap();
         // Hint must still point to root (no chain growth for 2 rows).
         assert_eq!(h.tail_page_id, root);
     }
@@ -519,7 +520,7 @@ mod hint_tests {
             tail_page_id: 9999,
         };
         // Insert must succeed (falls back to full walk) and heals the hint.
-        HeapChain::insert_with_hint(&mut storage, root, b"row1", 1, Some(&mut h)).unwrap();
+        HeapChain::insert_with_hint(&mut storage, root, b"row1", 1, Some(&mut h), None).unwrap();
         assert_eq!(h.tail_page_id, root, "hint must be healed to actual tail");
     }
 
@@ -540,7 +541,7 @@ mod hint_tests {
             root_page_id: root1,
             tail_page_id: root1,
         };
-        HeapChain::insert_with_hint(&mut storage, root2, b"data", 1, Some(&mut h)).unwrap();
+        HeapChain::insert_with_hint(&mut storage, root2, b"data", 1, Some(&mut h), None).unwrap();
         // Hint must now reflect root2.
         assert_eq!(h.root_page_id, root2);
         assert_eq!(h.tail_page_id, root2);

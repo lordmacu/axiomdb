@@ -31,13 +31,17 @@ impl TableEngine {
         // Phase 5.18: pull heap-tail hint from the session cache, use it for O(1)
         // tail lookup, and write the updated hint back after the insert.
         let mut hint_opt = ctx.get_heap_tail_hint(table_def.id, table_def.root_page_id);
-        let (page_id, slot_id) = HeapChain::insert_with_hint(
-            storage,
-            table_def.root_page_id,
-            &encoded,
-            txn_id,
-            hint_opt.as_mut(),
-        )?;
+        let (page_id, slot_id) = {
+            let batch = &mut conn_txn.local_page_batch;
+            HeapChain::insert_with_hint(
+                storage,
+                table_def.root_page_id,
+                &encoded,
+                txn_id,
+                hint_opt.as_mut(),
+                Some(batch),
+            )?
+        };
         if let Some(h) = hint_opt {
             ctx.set_heap_tail_hint(table_def.id, h.root_page_id, h.tail_page_id);
         } else {
@@ -111,13 +115,17 @@ impl TableEngine {
         }
 
         let txn_id = txn.active_txn_id().ok_or(DbError::NoActiveTransaction)?;
-        let phys_locs = HeapChain::insert_batch_with_zm(
-            storage,
-            table_def.root_page_id,
-            &encoded_rows,
-            txn_id,
-            &zm_values,
-        )?;
+        let phys_locs = {
+            let batch = &mut conn_txn.local_page_batch;
+            HeapChain::insert_batch_with_zm(
+                storage,
+                table_def.root_page_id,
+                &encoded_rows,
+                txn_id,
+                &zm_values,
+                Some(batch),
+            )?
+        };
 
         let mut page_slot_map: std::collections::HashMap<u64, Vec<u16>> =
             std::collections::HashMap::new();

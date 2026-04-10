@@ -3,6 +3,7 @@ use super::OwnedLeafCell;
 use crate::{
     clustered_internal, clustered_leaf, clustered_overflow,
     heap::RowHeader,
+    local_page_batch::LocalPageBatch,
     page::{Page, PageType},
     StorageEngine,
 };
@@ -318,6 +319,7 @@ pub(super) fn choose_balanced_boundary(footprints: &[usize]) -> usize {
 
 pub(super) fn materialize_leaf_cell(
     storage: &mut dyn StorageEngine,
+    batch: Option<&mut LocalPageBatch>,
     key: &[u8],
     row_header: &RowHeader,
     row_data: &[u8],
@@ -328,7 +330,7 @@ pub(super) fn materialize_leaf_cell(
     let local_len = clustered_leaf::local_row_len(key.len(), total_row_len);
     let local_row_data = row_data[..local_len].to_vec();
     let overflow_first_page = if total_row_len > local_len {
-        clustered_overflow::write_chain(storage, &row_data[local_len..])?
+        clustered_overflow::write_chain(storage, batch, &row_data[local_len..])?
     } else {
         None
     };

@@ -154,7 +154,7 @@ impl<'a> CatalogWriter<'a> {
         .to_bytes();
         let txn_id = self.conn.txn_id;
         let (page_id, slot_id) =
-            HeapChain::insert(self.storage, self.page_ids.databases, &data, txn_id)?;
+            HeapChain::insert(self.storage, self.page_ids.databases, &data, txn_id, None)?;
         self.txn.record_insert(
             self.conn,
             SYSTEM_TABLE_DATABASES,
@@ -208,8 +208,13 @@ impl<'a> CatalogWriter<'a> {
         }
         .to_bytes();
         let txn_id = self.conn.txn_id;
-        let (page_id, slot_id) =
-            HeapChain::insert(self.storage, self.page_ids.table_databases, &data, txn_id)?;
+        let (page_id, slot_id) = HeapChain::insert(
+            self.storage,
+            self.page_ids.table_databases,
+            &data,
+            txn_id,
+            None,
+        )?;
         self.txn.record_insert(
             self.conn,
             SYSTEM_TABLE_TABLE_DATABASES,
@@ -295,7 +300,7 @@ impl<'a> CatalogWriter<'a> {
         .to_bytes();
         let txn_id = self.conn.txn_id;
         let key = format!("{}\0{}", database, schema);
-        let (page_id, slot_id) = HeapChain::insert(self.storage, root, &data, txn_id)?;
+        let (page_id, slot_id) = HeapChain::insert(self.storage, root, &data, txn_id, None)?;
         self.txn.record_insert(
             self.conn,
             SYSTEM_TABLE_SCHEMAS,
@@ -365,7 +370,7 @@ impl<'a> CatalogWriter<'a> {
 
         let txn_id = self.conn.txn_id;
         let (page_id, slot_id) =
-            HeapChain::insert(self.storage, self.page_ids.tables, &data, txn_id)?;
+            HeapChain::insert(self.storage, self.page_ids.tables, &data, txn_id, None)?;
 
         let key = table_id.to_le_bytes();
         self.txn.record_insert(
@@ -411,7 +416,7 @@ impl<'a> CatalogWriter<'a> {
 
         let txn_id = self.conn.txn_id;
         let (page_id, slot_id) =
-            HeapChain::insert(self.storage, self.page_ids.columns, &data, txn_id)?;
+            HeapChain::insert(self.storage, self.page_ids.columns, &data, txn_id, None)?;
 
         // Key: (table_id, col_idx) as 6 bytes LE for WAL lookup.
         let mut key = [0u8; 6];
@@ -451,7 +456,7 @@ impl<'a> CatalogWriter<'a> {
 
         let txn_id = self.conn.txn_id;
         let (page_id, slot_id) =
-            HeapChain::insert(self.storage, self.page_ids.indexes, &data, txn_id)?;
+            HeapChain::insert(self.storage, self.page_ids.indexes, &data, txn_id, None)?;
 
         let key = index_id.to_le_bytes();
         self.txn.record_insert(
@@ -662,7 +667,7 @@ impl<'a> CatalogWriter<'a> {
                 };
                 let new_data = new_def.to_bytes();
                 let (pg2, sl2) =
-                    HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id)?;
+                    HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id, None)?;
                 self.txn.record_insert(
                     self.conn,
                     SYSTEM_TABLE_TABLES,
@@ -718,7 +723,7 @@ impl<'a> CatalogWriter<'a> {
                 };
                 let new_data = new_def.to_bytes();
                 let (pg2, sl2) =
-                    HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id)?;
+                    HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id, None)?;
                 self.txn.record_insert(
                     self.conn,
                     SYSTEM_TABLE_TABLES,
@@ -765,7 +770,7 @@ impl<'a> CatalogWriter<'a> {
                 };
                 let new_data = new_def.to_bytes();
                 let (pg2, sl2) =
-                    HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id)?;
+                    HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id, None)?;
                 self.txn.record_insert(
                     self.conn,
                     SYSTEM_TABLE_TABLES,
@@ -822,7 +827,7 @@ impl<'a> CatalogWriter<'a> {
                 };
                 let new_data = new_def.to_bytes();
                 let (pg2, sl2) =
-                    HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id)?;
+                    HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id, None)?;
                 self.txn.record_insert(
                     self.conn,
                     SYSTEM_TABLE_TABLES,
@@ -923,8 +928,13 @@ impl<'a> CatalogWriter<'a> {
                 )?;
 
                 let new_data = def.to_bytes();
-                let (new_page_id, new_slot_id) =
-                    HeapChain::insert(self.storage, self.page_ids.indexes, &new_data, txn_id)?;
+                let (new_page_id, new_slot_id) = HeapChain::insert(
+                    self.storage,
+                    self.page_ids.indexes,
+                    &new_data,
+                    txn_id,
+                    None,
+                )?;
                 self.txn.record_insert(
                     self.conn,
                     SYSTEM_TABLE_INDEXES,
@@ -968,8 +978,13 @@ impl<'a> CatalogWriter<'a> {
                     ..def
                 };
                 let new_data = updated.to_bytes();
-                let (new_page_id, new_slot_id) =
-                    HeapChain::insert(self.storage, self.page_ids.indexes, &new_data, txn_id)?;
+                let (new_page_id, new_slot_id) = HeapChain::insert(
+                    self.storage,
+                    self.page_ids.indexes,
+                    &new_data,
+                    txn_id,
+                    None,
+                )?;
                 self.txn.record_insert(
                     self.conn,
                     SYSTEM_TABLE_INDEXES,
@@ -1004,7 +1019,8 @@ impl<'a> CatalogWriter<'a> {
         let data = row.to_bytes();
 
         let txn_id = self.conn.txn_id;
-        let (page_id, slot_id) = HeapChain::insert(self.storage, constraints_root, &data, txn_id)?;
+        let (page_id, slot_id) =
+            HeapChain::insert(self.storage, constraints_root, &data, txn_id, None)?;
 
         let key = constraint_id.to_le_bytes();
         self.txn.record_insert(
@@ -1076,7 +1092,7 @@ impl<'a> CatalogWriter<'a> {
         let data = row.to_bytes();
 
         let txn_id = self.conn.txn_id;
-        let (page_id, slot_id) = HeapChain::insert(self.storage, fk_root, &data, txn_id)?;
+        let (page_id, slot_id) = HeapChain::insert(self.storage, fk_root, &data, txn_id, None)?;
 
         let key = fk_id.to_le_bytes();
         self.txn.record_insert(
@@ -1165,7 +1181,7 @@ impl<'a> CatalogWriter<'a> {
 
                     let new_data = def.to_bytes();
                     let (new_page_id, new_slot_id) =
-                        HeapChain::insert(self.storage, fk_root, &new_data, txn_id)?;
+                        HeapChain::insert(self.storage, fk_root, &new_data, txn_id, None)?;
                     self.txn.record_insert(
                         self.conn,
                         SYSTEM_TABLE_FOREIGN_KEYS,
@@ -1233,7 +1249,7 @@ impl<'a> CatalogWriter<'a> {
             [def.col_idx as u8, (def.col_idx >> 8) as u8, 0, 0],
         ]
         .concat();
-        let (page_id, slot_id) = HeapChain::insert(self.storage, stats_root, &data, txn_id)?;
+        let (page_id, slot_id) = HeapChain::insert(self.storage, stats_root, &data, txn_id, None)?;
         self.txn
             .record_insert(self.conn, SYSTEM_TABLE_STATS, &key, &data, page_id, slot_id)?;
         Ok(())

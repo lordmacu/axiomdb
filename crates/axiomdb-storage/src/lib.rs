@@ -13,6 +13,7 @@ pub mod heap;
 pub mod heap_chain;
 pub mod heap_hint;
 pub mod integrity;
+pub mod local_page_batch;
 pub mod memory;
 pub mod meta;
 pub mod mmap;
@@ -34,6 +35,7 @@ pub use heap::{
 };
 pub use heap_chain::{chain_next_page, chain_set_next_page, HeapAppendHint, HeapChain};
 pub use integrity::{IntegrityChecker, IntegrityReport, IntegrityViolation, Severity};
+pub use local_page_batch::{batch_alloc_page, LocalPageBatch, BATCH_ALLOC_SIZE, MAX_BATCH_SIZE};
 pub use memory::MemoryStorage;
 pub use meta::{
     alloc_constraint_id, alloc_fk_id, alloc_index_id, alloc_table_id, read_checkpoint_lsn,

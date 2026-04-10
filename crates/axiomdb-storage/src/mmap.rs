@@ -2,7 +2,7 @@ use std::{
     fs::{File, OpenOptions},
     path::Path,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Mutex, RwLock,
     },
 };
@@ -120,6 +120,14 @@ pub struct MmapStorage {
     /// Authoritative page count. `AtomicU64` avoids acquiring the mmap read
     /// lock on every `read_page` call (hot path).
     page_count: AtomicU64,
+    /// Phase 40.9: lock-free queue of pages freed by committed transactions.
+    /// Drained first by `alloc_page_batch` for fast reuse without touching
+    /// the bitmap. Folded back into the bitmap during `release_deferred_frees`.
+    recycle_queue: crossbeam_queue::SegQueue<u64>,
+    /// Phase 40.9: threads currently blocked (or about to block) on the
+    /// freelist `Mutex`. Used by `LocalPageBatch::pop_or_refill` to scale
+    /// the refill batch size adaptively under contention.
+    extension_waiters: AtomicU32,
 }
 
 impl Drop for MmapStorage {
@@ -192,6 +200,8 @@ impl MmapStorage {
             page_locks: PageLockTable::new(),
             grow_lock: Mutex::new(()),
             page_count: AtomicU64::new(GROW_PAGES),
+            recycle_queue: crossbeam_queue::SegQueue::new(),
+            extension_waiters: AtomicU32::new(0),
         })
     }
 
@@ -278,6 +288,8 @@ impl MmapStorage {
             page_locks: PageLockTable::new(),
             grow_lock: Mutex::new(()),
             page_count: AtomicU64::new(db_page_count),
+            recycle_queue: crossbeam_queue::SegQueue::new(),
+            extension_waiters: AtomicU32::new(0),
         })
     }
 
@@ -291,20 +303,47 @@ impl MmapStorage {
             .deferred_frees
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if deferred.is_empty() {
-            return Ok(());
-        }
+        let deferred_empty = deferred.is_empty();
         let mut freelist = self.freelist.lock().unwrap_or_else(|e| e.into_inner());
-        let mut retained = Vec::new();
-        for (page_id, freed_at) in deferred.drain(..) {
-            if freed_at <= oldest_active_snapshot {
-                freelist.free(page_id)?;
-                self.freelist_dirty.store(true, Ordering::Relaxed);
-            } else {
-                retained.push((page_id, freed_at));
+
+        // Step 1: release snapshot-safe deferred frees.
+        if !deferred_empty {
+            let mut retained = Vec::new();
+            for (page_id, freed_at) in deferred.drain(..) {
+                if freed_at <= oldest_active_snapshot {
+                    freelist.free(page_id)?;
+                    self.freelist_dirty.store(true, Ordering::Relaxed);
+                } else {
+                    retained.push((page_id, freed_at));
+                }
             }
+            *deferred = retained;
         }
-        *deferred = retained;
+
+        // Step 2 (Phase 40.9): fold recycled pages back into the bitmap.
+        // The recycle_queue is lock-free so draining it under the freelist
+        // mutex does NOT create a lock-ordering issue with alloc_page_batch
+        // (which pops from the queue OUTSIDE the mutex, then takes the
+        // mutex only for the bitmap path).
+        let mut recycled = 0usize;
+        while let Some(page_id) = self.recycle_queue.pop() {
+            // Best-effort: skip pages already free (commit + rollback race
+            // can push the same ID to both the recycle queue and the bitmap
+            // if the executor code calls recycle_page AND free_page_batch on
+            // the same set).
+            if freelist.is_free(page_id) {
+                continue;
+            }
+            if let Err(e) = freelist.free(page_id) {
+                debug!(page_id, error = %e, "recycle_queue fold-back: skip");
+                continue;
+            }
+            recycled += 1;
+        }
+        if recycled > 0 {
+            self.freelist_dirty.store(true, Ordering::Relaxed);
+        }
+
         Ok(())
     }
 
@@ -680,6 +719,86 @@ impl StorageEngine for MmapStorage {
 
     fn page_lock_table(&self) -> &PageLockTable {
         &self.page_locks
+    }
+
+    // ── Batch allocation (Phase 40.9) ───────────────────────────────────
+
+    fn alloc_page_batch(&self, n: usize, _page_type: PageType) -> Result<Vec<u64>, DbError> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(n);
+
+        // Phase 1: drain recycle_queue (lock-free).
+        while out.len() < n {
+            match self.recycle_queue.pop() {
+                Some(id) => out.push(id),
+                None => break,
+            }
+        }
+        if out.len() == n {
+            self.freelist_dirty.store(true, Ordering::Relaxed);
+            return Ok(out);
+        }
+
+        // Phase 2: acquire freelist mutex once and pull the rest.
+        self.extension_waiters.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut fl = self.freelist.lock().unwrap_or_else(|e| e.into_inner());
+            let remaining = n - out.len();
+            out.extend(fl.alloc_batch_sequential(remaining));
+        }
+        self.extension_waiters.fetch_sub(1, Ordering::Relaxed);
+
+        if out.len() == n {
+            self.freelist_dirty.store(true, Ordering::Relaxed);
+            return Ok(out);
+        }
+
+        // Phase 3: still short — grow the file and retry.
+        {
+            let _grow_guard = self.grow_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+            // Re-check under grow_lock: another thread may have grown in between.
+            {
+                let mut fl = self.freelist.lock().unwrap_or_else(|e| e.into_inner());
+                let still_needed = n - out.len();
+                let extra = fl.alloc_batch_sequential(still_needed);
+                out.extend(extra);
+            }
+            if out.len() < n {
+                let still_needed = (n - out.len()) as u64;
+                let grow_amount = still_needed.max(GROW_PAGES);
+                self.do_grow(grow_amount)?;
+                let mut fl = self.freelist.lock().unwrap_or_else(|e| e.into_inner());
+                out.extend(fl.alloc_batch_sequential(n - out.len()));
+            }
+        }
+
+        if out.len() < n {
+            return Err(DbError::StorageFull);
+        }
+        self.freelist_dirty.store(true, Ordering::Relaxed);
+        Ok(out)
+    }
+
+    fn free_page_batch(&self, ids: &[u64]) -> Result<(), DbError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut fl = self.freelist.lock().unwrap_or_else(|e| e.into_inner());
+        fl.free_batch(ids)?;
+        self.freelist_dirty.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn extension_waiters(&self) -> u32 {
+        self.extension_waiters.load(Ordering::Relaxed)
+    }
+
+    fn recycle_page(&self, page_id: u64) -> Result<(), DbError> {
+        self.recycle_queue.push(page_id);
+        Ok(())
     }
 }
 

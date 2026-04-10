@@ -64,7 +64,7 @@ fn test_mmap_heap_chain_insert_persists_under_page_latch() {
     let root_page = Page::new(PageType::Data, root);
     storage.write_page(root, &root_page).expect("init root");
 
-    let rid = HeapChain::insert(&mut storage, root, b"seed", 1).expect("heap insert");
+    let rid = HeapChain::insert(&mut storage, root, b"seed", 1, None).expect("heap insert");
     assert_eq!(rid.0, root, "single insert should stay on root page");
     storage.flush().expect("flush");
     drop(storage);
@@ -486,4 +486,163 @@ fn test_corrupted_page_detected_on_read() {
         "error must be ChecksumMismatch, got: {:?}",
         result.err()
     );
+}
+
+// ── Phase 40.9: LocalPageBatch + concurrent alloc stress ─────────────────────
+
+#[test]
+fn test_local_page_batch_pop_or_refill_basic() {
+    use axiomdb_storage::{LocalPageBatch, BATCH_ALLOC_SIZE};
+
+    let storage = MemoryStorage::new();
+    let mut batch = LocalPageBatch::new();
+
+    // First alloc triggers a refill from the global allocator.
+    let id1 = batch.pop_or_refill(&storage, PageType::Data).unwrap();
+    assert!(id1 >= 2, "page IDs 0,1 are reserved; got {id1}");
+
+    // Subsequent allocs from the batch are fast (no global lock).
+    let mut ids = vec![id1];
+    for _ in 1..BATCH_ALLOC_SIZE {
+        let id = batch.pop_or_refill(&storage, PageType::Data).unwrap();
+        ids.push(id);
+    }
+    // All IDs must be unique.
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), BATCH_ALLOC_SIZE, "all IDs must be unique");
+}
+
+#[test]
+fn test_local_page_batch_type_mismatch_drain() {
+    use axiomdb_storage::LocalPageBatch;
+
+    let storage = MemoryStorage::new();
+    let mut batch = LocalPageBatch::new();
+
+    // Allocate some Data pages.
+    let _d1 = batch.pop_or_refill(&storage, PageType::Data).unwrap();
+    let _d2 = batch.pop_or_refill(&storage, PageType::Data).unwrap();
+
+    // Switch to Index type — must drain the Data batch and refill.
+    let i1 = batch.pop_or_refill(&storage, PageType::Index).unwrap();
+    assert!(i1 >= 2, "page IDs 0,1 are reserved; got {i1}");
+}
+
+#[test]
+fn test_local_page_batch_commit_drain() {
+    use axiomdb_storage::LocalPageBatch;
+
+    let storage = MemoryStorage::new();
+    let mut batch = LocalPageBatch::new();
+
+    let id1 = batch.pop_or_refill(&storage, PageType::Data).unwrap();
+    batch.push_freed(id1);
+
+    let (avail, freed) = batch.take_for_commit();
+    assert!(
+        !avail.is_empty() || freed.len() == 1,
+        "freed must contain id1"
+    );
+    assert!(freed.contains(&id1));
+
+    // After commit, batch is empty — return pre-allocated to bitmap.
+    storage.free_page_batch(&avail).unwrap();
+    for pid in &freed {
+        storage.recycle_page(*pid).unwrap();
+    }
+}
+
+#[test]
+fn test_mmap_alloc_page_batch_concurrent_8_threads() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = tmp_dir();
+    let path = dir.path().join("concurrent_batch.db");
+    let storage = Arc::new(MmapStorage::create(&path).unwrap());
+
+    // Pre-grow: 8 threads × 10K allocs = 80K pages. Grow to 81K to avoid
+    // interleaving growth with alloc (keeps the test focused on the bitmap).
+    storage.grow(81_000).unwrap();
+
+    let num_threads = 8;
+    let allocs_per_thread = 10_000;
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|_| {
+            let s = Arc::clone(&storage);
+            thread::spawn(move || {
+                let mut ids = Vec::with_capacity(allocs_per_thread);
+                for _ in 0..allocs_per_thread {
+                    let id = s.alloc_page(PageType::Data).unwrap();
+                    ids.push(id);
+                }
+                // Free all pages back.
+                for &id in &ids {
+                    s.free_page(id).unwrap();
+                }
+                ids
+            })
+        })
+        .collect();
+
+    let mut all_ids: Vec<u64> = Vec::new();
+    for h in handles {
+        all_ids.extend(h.join().unwrap());
+    }
+
+    // Verify uniqueness across all threads.
+    let unique: HashSet<u64> = all_ids.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        all_ids.len(),
+        "all {} allocated page IDs must be unique, but got {} unique out of {}",
+        num_threads * allocs_per_thread,
+        unique.len(),
+        all_ids.len()
+    );
+
+    // After freeing all, the storage should have all pages available again.
+    storage.flush().unwrap();
+}
+
+#[test]
+fn test_mmap_alloc_page_batch_recycle_queue() {
+    use axiomdb_storage::LocalPageBatch;
+
+    let dir = tmp_dir();
+    let path = dir.path().join("recycle.db");
+    let storage = MmapStorage::create(&path).unwrap();
+
+    // Allocate a batch.
+    let mut batch = LocalPageBatch::new();
+    let id1 = batch.pop_or_refill(&storage, PageType::Data).unwrap();
+    let id2 = batch.pop_or_refill(&storage, PageType::Data).unwrap();
+
+    // Simulate commit: freed pages go to recycle_queue.
+    batch.push_freed(id1);
+    batch.push_freed(id2);
+    let (avail, freed) = batch.take_for_commit();
+    storage.free_page_batch(&avail).unwrap();
+    for pid in freed {
+        storage.recycle_page(pid).unwrap();
+    }
+
+    // Next batch alloc should pick up recycled pages first.
+    let mut batch2 = LocalPageBatch::new();
+    let r1 = batch2.pop_or_refill(&storage, PageType::Data).unwrap();
+    let r2 = batch2.pop_or_refill(&storage, PageType::Data).unwrap();
+    // At least one of the recycled pages should be reused.
+    let reused = [r1, r2].iter().any(|&r| r == id1 || r == id2);
+    assert!(
+        reused,
+        "recycled pages should be reused; got {r1}, {r2} but freed {id1}, {id2}"
+    );
+
+    // Clean up.
+    let (avail2, _) = batch2.take_for_commit();
+    storage.free_page_batch(&avail2).unwrap();
+    storage.flush().unwrap();
 }

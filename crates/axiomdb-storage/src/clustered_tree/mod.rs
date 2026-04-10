@@ -11,6 +11,7 @@ use axiomdb_core::{error::DbError, TransactionSnapshot};
 use crate::{
     clustered_internal, clustered_leaf, clustered_overflow,
     heap::RowHeader,
+    local_page_batch::{batch_alloc_page, LocalPageBatch},
     page::{Page, PageType},
     page_lock::PageReadGuard,
     StorageEngine,
@@ -95,6 +96,7 @@ fn free_overflow_chain_if_any(
 
 fn try_insert_leaf_optimistically(
     storage: &mut dyn StorageEngine,
+    batch: Option<&mut LocalPageBatch>,
     root_pid: u64,
     key: &[u8],
     row_header: &RowHeader,
@@ -120,7 +122,7 @@ fn try_insert_leaf_optimistically(
         Err(pos) => pos,
     };
 
-    let cell = materialize_leaf_cell(storage, key, row_header, row_data)?;
+    let cell = materialize_leaf_cell(storage, batch, key, row_header, row_data)?;
     match clustered_leaf::insert_cell_with_overflow(
         &mut page,
         insert_pos,
@@ -170,8 +172,25 @@ fn try_insert_leaf_optimistically(
 
 /// Inserts one full row into a clustered B-tree and returns the effective root
 /// page id after the operation.
+///
+/// When `batch` is `Some`, page allocation is satisfied from the local
+/// per-transaction batch (Phase 40.9 Tier-1), falling back to the global
+/// bitmap only on refill.
 pub fn insert(
     storage: &mut dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    row_header: &RowHeader,
+    row_data: &[u8],
+) -> Result<u64, DbError> {
+    insert_with_batch(storage, None, root_pid, key, row_header, row_data)
+}
+
+/// Like [`insert`] but routes page allocations through `batch` when provided.
+#[allow(clippy::needless_option_as_deref)]
+pub fn insert_with_batch(
+    storage: &mut dyn StorageEngine,
+    mut batch: Option<&mut LocalPageBatch>,
     root_pid: Option<u64>,
     key: &[u8],
     row_header: &RowHeader,
@@ -181,16 +200,32 @@ pub fn insert(
 
     match root_pid {
         Some(pid) => {
-            if let Some(root_after_insert) =
-                try_insert_leaf_optimistically(storage, pid, key, row_header, row_data)?
-            {
+            if let Some(root_after_insert) = try_insert_leaf_optimistically(
+                storage,
+                batch.as_deref_mut(),
+                pid,
+                key,
+                row_header,
+                row_data,
+            )? {
                 return Ok(root_after_insert);
             }
 
-            match insert_subtree(storage, pid, key, row_header, row_data)? {
+            match insert_subtree(
+                storage,
+                batch.as_deref_mut(),
+                pid,
+                key,
+                row_header,
+                row_data,
+            )? {
                 InsertResult::Inserted => Ok(pid),
                 InsertResult::Split { sep_key, right_pid } => {
-                    let new_root_pid = storage.alloc_page(PageType::ClusteredInternal)?;
+                    let new_root_pid = batch_alloc_page(
+                        storage,
+                        batch.as_deref_mut(),
+                        PageType::ClusteredInternal,
+                    )?;
                     let mut new_root = Page::new(PageType::ClusteredInternal, new_root_pid);
                     clustered_internal::init_clustered_internal(&mut new_root, pid);
                     clustered_internal::insert_at(&mut new_root, 0, &sep_key, right_pid)?;
@@ -200,8 +235,9 @@ pub fn insert(
             }
         }
         None => {
-            let cell = materialize_leaf_cell(storage, key, row_header, row_data)?;
-            let root_pid = storage.alloc_page(PageType::ClusteredLeaf)?;
+            let cell =
+                materialize_leaf_cell(storage, batch.as_deref_mut(), key, row_header, row_data)?;
+            let root_pid = batch_alloc_page(storage, batch, PageType::ClusteredLeaf)?;
             let mut root = Page::new(PageType::ClusteredLeaf, root_pid);
             clustered_leaf::init_clustered_leaf(&mut root);
             clustered_leaf::insert_cell_with_overflow(
@@ -231,6 +267,7 @@ pub fn insert(
 /// normal `insert()` path.
 pub fn try_insert_rightmost_leaf(
     storage: &mut dyn StorageEngine,
+    batch: Option<&mut LocalPageBatch>,
     hinted_leaf_pid: u64,
     key: &[u8],
     row_header: &RowHeader,
@@ -259,7 +296,7 @@ pub fn try_insert_rightmost_leaf(
         return Ok(false);
     }
 
-    let cell = materialize_leaf_cell(storage, key, row_header, row_data)?;
+    let cell = materialize_leaf_cell(storage, batch, key, row_header, row_data)?;
     let cleanup_overflow =
         |storage: &mut dyn StorageEngine, first_page: Option<u64>| -> Result<(), DbError> {
             if let Some(first_page) = first_page {
@@ -320,8 +357,10 @@ pub fn try_insert_rightmost_leaf(
 ///
 /// Returns the number of rows that were appended directly. A return of `0`
 /// means the caller must fall back to the normal insert path for the first row.
+#[allow(clippy::needless_option_as_deref)]
 pub fn try_insert_rightmost_leaf_batch(
     storage: &mut dyn StorageEngine,
+    mut batch: Option<&mut LocalPageBatch>,
     hinted_leaf_pid: u64,
     rows: &[RightmostAppendRow<'_>],
 ) -> Result<usize, DbError> {
@@ -357,7 +396,13 @@ pub fn try_insert_rightmost_leaf_batch(
             break;
         }
 
-        let cell = materialize_leaf_cell(storage, row.key, row.row_header, row.row_data)?;
+        let cell = materialize_leaf_cell(
+            storage,
+            batch.as_deref_mut(),
+            row.key,
+            row.row_header,
+            row.row_data,
+        )?;
         let insert_pos = clustered_leaf::num_cells(&page) as usize;
 
         match clustered_leaf::insert_cell_with_overflow(
@@ -665,7 +710,7 @@ pub fn update_in_place(
         row_version: old_header.row_version.saturating_add(1),
         _flags: old_header._flags,
     };
-    let new_cell = materialize_leaf_cell(storage, key, &new_header, new_row_data)?;
+    let new_cell = materialize_leaf_cell(storage, None, key, &new_header, new_row_data)?;
 
     let available = clustered_leaf::free_space(&page)
         + clustered_leaf::cell_footprint(key.len(), old_total_row_len);
@@ -801,8 +846,9 @@ pub fn update_with_relocation(
         row_version: old_row.row_header.row_version.saturating_add(1),
         _flags: old_row.row_header._flags,
     };
-    let new_root = insert(
+    let new_root = insert_with_batch(
         storage,
+        None, // update_with_relocation is a rare path; no batch optimization needed
         Some(root_after_delete),
         key,
         &new_header,
@@ -845,7 +891,14 @@ pub fn restore_exact_row_image(
         Some(new_root) => new_root,
         None => root_pid,
     };
-    insert(storage, Some(root_after_delete), key, row_header, row_data)
+    insert_with_batch(
+        storage,
+        None,
+        Some(root_after_delete),
+        key,
+        row_header,
+        row_data,
+    )
 }
 
 mod btree_insert;
