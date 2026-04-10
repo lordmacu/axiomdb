@@ -495,6 +495,38 @@ pub(super) fn eval_in(v: Value, list: &[Expr], row: &[Value]) -> Result<Value, D
 /// Algorithm: O(n·m) with backtracking, handles all patterns including
 /// multiple `%` without exponential blowup.
 pub fn like_match(text: &str, pattern: &str) -> bool {
+    // Phase 11.14: fast paths for common LIKE patterns — avoid O(n·m)
+    // backtracking and Vec<char> allocation when a simpler check suffices.
+
+    // Fast path 1: 'prefix%' — starts_with (O(prefix_len), zero alloc).
+    // Matches InnoDB's internal optimization in field.cc `Field::key_cmp`.
+    if let Some(prefix) = pattern.strip_suffix('%') {
+        if !prefix.contains('%') && !prefix.contains('_') {
+            return text.starts_with(prefix);
+        }
+    }
+
+    // Fast path 2: '%suffix' — ends_with (O(suffix_len), zero alloc).
+    if let Some(suffix) = pattern.strip_prefix('%') {
+        if !suffix.contains('%') && !suffix.contains('_') {
+            return text.ends_with(suffix);
+        }
+    }
+
+    // Fast path 3: '%infix%' — contains (O(n), zero alloc).
+    if pattern.starts_with('%') && pattern.ends_with('%') && pattern.len() >= 2 {
+        let infix = &pattern[1..pattern.len() - 1];
+        if !infix.contains('%') && !infix.contains('_') {
+            return text.contains(infix);
+        }
+    }
+
+    // Fast path 4: exact match (no wildcards at all).
+    if !pattern.contains('%') && !pattern.contains('_') {
+        return text == pattern;
+    }
+
+    // General path: O(n·m) with backtracking.
     let text: Vec<char> = text.chars().collect();
     let pat: Vec<char> = pattern.chars().collect();
     let (n, m) = (text.len(), pat.len());

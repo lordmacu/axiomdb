@@ -300,6 +300,12 @@ fn execute_insert_ctx(
                         )))
                     }
                 };
+
+            // Phase 11.15: batch INSERT SELECT — collect all rows first,
+            // then use apply_insert_batch_with_ctx for batch heap+WAL+index.
+            // Per-row: materialize, AUTO_INCREMENT, FK validation, coerce.
+            // Batch: heap insert + WAL + index maintenance (single pass).
+            let mut full_batch: Vec<Vec<Value>> = Vec::with_capacity(select_rows.len());
             for (row_idx, row_values) in select_rows.into_iter().enumerate() {
                 let mut full_values =
                     materialize_insert_row(&col_positions, &row_values, &resolved.columns);
@@ -322,7 +328,7 @@ fn execute_insert_ctx(
                         }
                     }
                 }
-                // FK validation for INSERT SELECT path.
+                // FK validation (still per-row — FK check reads catalog).
                 if !resolved.foreign_keys.is_empty() {
                     match crate::fk_enforcement::check_fk_child_insert(
                         &full_values,
@@ -342,54 +348,64 @@ fn execute_insert_ctx(
                     ctx,
                     row_idx + 1,
                 )?;
-                // Clone so full_values remains available for index maintenance.
-                let rid = match TableEngine::insert_row_with_ctx(
-                    storage,
-                    txn,
-                    &resolved.def,
-                    schema_cols,
-                    ctx,
-                    conn_txn,
-                    full_values.clone(),
-                    row_idx + 1,
-                ) {
-                    Ok(rid) => rid,
-                    Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
-                    Err(e) => return Err(e),
-                };
-                if !secondary_indexes.is_empty() {
-                    let snap = txn.active_snapshot(&*conn_txn);
-                    match crate::index_maintenance::insert_into_indexes_with_undo(
-                        &secondary_indexes,
-                        &full_values,
-                        rid,
-                        storage,
-                        bloom,
-                        &compiled_preds,
-                        snap,
-                        Some(txn),
-                        Some(conn_txn),
-                    ) {
-                        Ok(updated) => {
-                            for (index_id, new_root) in updated {
-                                CatalogWriter::new(storage, txn, conn_txn)?
-                                    .update_index_root(index_id, new_root)?;
-                                if let Some(idx) = secondary_indexes
-                                    .iter_mut()
-                                    .find(|i| i.index_id == index_id)
-                                {
-                                    idx.root_page_id = new_root;
+                full_batch.push(full_values);
+            }
+
+            // Batch insert: one heap pass + one WAL record per page + batch index maintenance.
+            if !full_batch.is_empty() {
+                if ignore {
+                    // IGNORE mode: fall back to per-row for error handling.
+                    for (row_idx, full_values) in full_batch.into_iter().enumerate() {
+                        let rid = match TableEngine::insert_row_with_ctx(
+                            storage, txn, &resolved.def, schema_cols, ctx, conn_txn,
+                            full_values.clone(), row_idx + 1,
+                        ) {
+                            Ok(rid) => rid,
+                            Err(e) if is_ignorable_insert_error(&e) => continue,
+                            Err(e) => return Err(e),
+                        };
+                        if !secondary_indexes.is_empty() {
+                            let snap = txn.active_snapshot(&*conn_txn);
+                            match crate::index_maintenance::insert_into_indexes_with_undo(
+                                &secondary_indexes, &full_values, rid, storage, bloom,
+                                &compiled_preds, snap, Some(txn), Some(conn_txn),
+                            ) {
+                                Ok(updated) => {
+                                    for (index_id, new_root) in updated {
+                                        CatalogWriter::new(storage, txn, conn_txn)?
+                                            .update_index_root(index_id, new_root)?;
+                                        if let Some(idx) = secondary_indexes.iter_mut().find(|i| i.index_id == index_id) {
+                                            idx.root_page_id = new_root;
+                                        }
+                                    }
                                 }
+                                Err(e) if is_ignorable_insert_error(&e) => {
+                                    TableEngine::delete_row(storage, txn, conn_txn, &resolved.def, rid)?;
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
                             }
                         }
-                        Err(e) if ignore && is_ignorable_insert_error(&e) => {
-                            TableEngine::delete_row(storage, txn, conn_txn, &resolved.def, rid)?;
-                            continue;
-                        }
-                        Err(e) => return Err(e),
+                        count += 1;
                     }
+                } else {
+                    // Fast batch path: single heap pass + batch WAL + batch index.
+                    let committed_empty = std::collections::HashSet::new();
+                    let n = full_batch.len() as u64;
+                    apply_insert_batch_with_ctx(
+                        storage, txn, bloom, ctx, conn_txn,
+                        InsertBatchApply {
+                            table_def: &resolved.def,
+                            columns: schema_cols,
+                            indexes: &mut secondary_indexes,
+                            rows: &full_batch,
+                            compiled_preds: &compiled_preds,
+                            skip_unique_check: false,
+                            committed_empty: &committed_empty,
+                        },
+                    )?;
+                    count = n;
                 }
-                count += 1;
             }
         }
         InsertSource::DefaultValues => {
