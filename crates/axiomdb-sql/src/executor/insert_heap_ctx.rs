@@ -9,6 +9,18 @@ fn execute_insert_ctx(
     let txn = exec_ctx.coord();
     let bloom = exec_ctx.bloom();
     let resolved = resolve_table_cached(storage, txn, ctx, Some(conn_txn), &stmt.table)?;
+
+    // Phase 40.11: IX(table) — once per statement, before any row write.
+    // Idempotent: InnoDB `lock_table_has()` pattern — returns immediately if
+    // this txn already holds IX on this table.
+    if let Some(lm) = exec_ctx.lock_manager() {
+        lm.acquire_table_lock_sync(
+            conn_txn.txn_id,
+            resolved.def.id,
+            axiomdb_lock::LockMode::IntentionExclusive,
+        )?;
+    }
+
     if resolved.def.is_clustered() {
         if ctx.pending_inserts.is_some() {
             flush_pending_inserts_ctx(exec_ctx, ctx)?;

@@ -15,6 +15,16 @@ fn execute_delete_ctx(
         Some(conn_txn),
         &stmt.table,
     )?;
+
+    // Phase 40.11: IX(table) — once per DELETE statement, before candidate scan.
+    if let Some(lm) = exec_ctx.lock_manager() {
+        lm.acquire_table_lock_sync(
+            conn_txn.txn_id,
+            resolved.def.id,
+            axiomdb_lock::LockMode::IntentionExclusive,
+        )?;
+    }
+
     let secondary_indexes: Vec<axiomdb_catalog::IndexDef> = resolved
         .indexes
         .iter()
@@ -23,6 +33,8 @@ fn execute_delete_ctx(
         .collect();
 
     let snap = txn.active_snapshot(conn_txn);
+    // Keep a clone for the lock re-verification path (Phase 40.11).
+    let snap_for_recheck = snap.clone();
 
     // ── Clustered table DELETE dispatch (Phase 39.17) ────────────────────
     if resolved.def.is_clustered() {
@@ -114,6 +126,36 @@ fn execute_delete_ctx(
 
     // Apply ORDER BY + LIMIT (G5.2).
     let to_delete = apply_order_by_limit_to_candidates(to_delete, &stmt.order_by, stmt.limit.as_ref())?;
+
+    // Phase 40.11: X(row) per candidate BEFORE delete-mark — InnoDB
+    // `lock_clust_rec_modify_check_and_lock(X)` pattern.
+    let col_types: Vec<axiomdb_types::DataType> = resolved
+        .columns
+        .iter()
+        .map(|c| crate::table::column_type_to_data_type(c.col_type))
+        .collect();
+    let to_delete = if let Some(lm) = exec_ctx.lock_manager() {
+        let mut locked = Vec::with_capacity(to_delete.len());
+        for (rid, vals) in to_delete {
+            let result = lm.acquire_record_lock_sync(
+                conn_txn.txn_id,
+                rid.page_id,
+                rid.slot_id,
+                axiomdb_lock::LockMode::Exclusive,
+                axiomdb_lock::LockFlags::REC_NOT_GAP,
+            )?;
+            if result == axiomdb_lock::LockResult::WaitGranted
+                && crate::table::reread_heap_row_if_visible(storage, rid, &snap_for_recheck, &col_types)
+                    .is_none()
+            {
+                continue; // row invisible after lock wait — skip
+            }
+            locked.push((rid, vals));
+        }
+        locked
+    } else {
+        to_delete
+    };
 
     // FK parent enforcement: must run BEFORE heap delete so RESTRICT can abort
     // cleanly and CASCADE/SET NULL can still read/update child rows.

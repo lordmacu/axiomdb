@@ -82,6 +82,27 @@ include!("table_scan.rs");
 include!("table_write.rs");
 include!("table_ctx.rs");
 
+/// Re-reads a single heap row by `RecordId` and returns decoded values if
+/// MVCC-visible. Returns `None` if the slot is empty or invisible.
+///
+/// Used by the lock re-verification path (Phase 40.11): after waiting for a
+/// row X-lock, the row may have been modified or deleted by the transaction
+/// that previously held the lock. This function re-reads the latest version.
+pub fn reread_heap_row_if_visible(
+    storage: &dyn StorageEngine,
+    rid: axiomdb_core::RecordId,
+    snap: &axiomdb_core::TransactionSnapshot,
+    col_types: &[DataType],
+) -> Option<Vec<Value>> {
+    let raw = storage.read_page(rid.page_id).ok()?;
+    let page = axiomdb_storage::Page::from_bytes(*raw.as_bytes()).ok()?;
+    let (header, data) = axiomdb_storage::heap::read_tuple(&page, rid.slot_id).ok()??;
+    if !header.is_visible(snap) {
+        return None;
+    }
+    axiomdb_types::codec::decode_row(data, col_types).ok()
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Extracts `DataType` from each `ColumnDef` in declaration order.

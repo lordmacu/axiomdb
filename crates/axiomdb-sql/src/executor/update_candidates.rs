@@ -8,14 +8,15 @@ fn execute_update_with_candidates(
     secondary_indexes: &[axiomdb_catalog::IndexDef],
     col_types: &[axiomdb_types::DataType],
     field_patch_eligible: bool,
-    storage: &dyn StorageEngine,
-    txn: &TxnManager,
+    exec_ctx: &ExecutionContext,
     conn_txn: &mut ConnectionTxn,
     snap: axiomdb_core::TransactionSnapshot,
     resolved: &axiomdb_catalog::ResolvedTable,
     ctx: &mut SessionContext,
-    bloom: &crate::bloom::BloomRegistry,
 ) -> Result<QueryResult, DbError> {
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
+    let bloom = exec_ctx.bloom();
 
     // Collect all matching (rid, old_values, new_values) triples before touching
     // the heap. Old values are kept for secondary index maintenance (delete old
@@ -36,6 +37,32 @@ fn execute_update_with_candidates(
     let mut matched_count: u64 = 0;
 
     for (rid, current_values) in candidate_rows {
+        // Phase 40.11: X(row) BEFORE modification — InnoDB
+        // `lock_clust_rec_modify_check_and_lock(X | REC_NOT_GAP)` pattern.
+        // If WaitGranted, re-read the row from storage (it may have been
+        // modified by the transaction that previously held the lock).
+        let current_values = if let Some(lm) = exec_ctx.lock_manager() {
+            let result = lm.acquire_record_lock_sync(
+                conn_txn.txn_id,
+                rid.page_id,
+                rid.slot_id,
+                axiomdb_lock::LockMode::Exclusive,
+                axiomdb_lock::LockFlags::REC_NOT_GAP,
+            )?;
+            if result == axiomdb_lock::LockResult::WaitGranted {
+                // Re-verification (InnoDB pessimistic re-check / PostgreSQL EvalPlanQual):
+                // the row may have been modified/deleted while we waited.
+                match crate::table::reread_heap_row_if_visible(storage, rid, &snap, col_types) {
+                    Some(refreshed) => refreshed,
+                    None => continue, // row deleted/invisible — skip
+                }
+            } else {
+                current_values
+            }
+        } else {
+            current_values
+        };
+
         matched_count += 1;
         if needs_full_row {
             // Full-row path: build complete new_values (normal path / FK / index maintenance).
