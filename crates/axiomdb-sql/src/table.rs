@@ -103,6 +103,77 @@ pub fn reread_heap_row_if_visible(
     axiomdb_types::codec::decode_row(data, col_types).ok()
 }
 
+// ── TOAST de-externalization (Phase 11.2) ─────────────────────────────────────
+
+const TOAST_PREFIX: &str = "__toast__:";
+
+/// Resolves TOAST placeholder values in a decoded row by reading overflow chains.
+///
+/// The codec produces `Value::Text("__toast__:page_id:compressed")` for externalized
+/// values. This function detects those placeholders, reads the overflow chain via
+/// `clustered_overflow::read_chain`, optionally LZ4-decompresses, and replaces
+/// the placeholder with the real value.
+///
+/// For rows without TOAST placeholders, this is a no-op (fast check per value).
+pub fn detoast_row(row: &mut [Value], storage: &dyn StorageEngine) {
+    for val in row.iter_mut() {
+        match val {
+            Value::Text(s) if s.starts_with(TOAST_PREFIX) => {
+                if let Some(resolved) = resolve_toast_text(s, storage) {
+                    *val = Value::Text(resolved);
+                }
+            }
+            Value::Bytes(b) => {
+                if let Ok(s) = std::str::from_utf8(b) {
+                    if s.starts_with(TOAST_PREFIX) {
+                        if let Some(resolved) = resolve_toast_bytes(s, storage) {
+                            *val = Value::Bytes(resolved);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Parses a TOAST placeholder string and reads the overflow chain.
+fn resolve_toast_text(placeholder: &str, storage: &dyn StorageEngine) -> Option<String> {
+    let rest = placeholder.strip_prefix(TOAST_PREFIX)?;
+    let mut parts = rest.split(':');
+    let page_id: u64 = parts.next()?.parse().ok()?;
+    let compressed: bool = parts.next()?.parse().ok()?;
+
+    // Read the raw_len from the overflow chain header — we don't store it in the
+    // placeholder, so read full chain and derive length from result.
+    let data =
+        axiomdb_storage::clustered_overflow::read_chain(storage, page_id, usize::MAX).ok()?;
+
+    let bytes = if compressed {
+        lz4_flex::decompress_size_prepended(&data).ok()?
+    } else {
+        data
+    };
+
+    String::from_utf8(bytes).ok()
+}
+
+fn resolve_toast_bytes(placeholder: &str, storage: &dyn StorageEngine) -> Option<Vec<u8>> {
+    let rest = placeholder.strip_prefix(TOAST_PREFIX)?;
+    let mut parts = rest.split(':');
+    let page_id: u64 = parts.next()?.parse().ok()?;
+    let compressed: bool = parts.next()?.parse().ok()?;
+
+    let data =
+        axiomdb_storage::clustered_overflow::read_chain(storage, page_id, usize::MAX).ok()?;
+
+    if compressed {
+        lz4_flex::decompress_size_prepended(&data).ok()
+    } else {
+        Some(data)
+    }
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Extracts `DataType` from each `ColumnDef` in declaration order.
