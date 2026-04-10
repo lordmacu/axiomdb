@@ -20,6 +20,7 @@ fn execute_select(
             cache: None,
             in_set_cache: None,
             correlated_cache: None,
+            materialized: None,
         };
         let mut out_row: Row = Vec::new();
         let mut out_cols: Vec<ColumnMeta> = Vec::new();
@@ -276,6 +277,7 @@ fn execute_select(
                         cache: Some(&mut sq_cache),
                         in_set_cache: Some(&mut in_set_cache),
                         correlated_cache: Some(&mut corr_cache),
+                        materialized: None,
                     };
                     if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
                         continue;
@@ -325,6 +327,7 @@ fn execute_select(
                 cache: Some(&mut proj_cache),
                 in_set_cache: Some(&mut proj_in_set_cache),
                 correlated_cache: Some(&mut proj_corr_cache),
+                materialized: None,
             };
             rows.push(project_row_with(&stmt.columns, v, &mut runner)?);
         }
@@ -394,6 +397,7 @@ fn execute_select_derived(
                 cache: Some(&mut sq_cache_derived),
                 in_set_cache: Some(&mut in_set_cache_derived),
                 correlated_cache: Some(&mut corr_cache_derived),
+                materialized: None,
             };
             if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
                 continue;

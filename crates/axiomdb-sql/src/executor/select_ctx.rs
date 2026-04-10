@@ -605,6 +605,7 @@ fn execute_select_ctx(
                     let mut sq_cache_ctx: SubqueryCache = HashMap::new();
                     let mut in_set_cache_ctx: InSetCache = HashMap::new();
                     let mut corr_cache_ctx: CorrelatedCache = HashMap::new();
+                    let mut mat_cache_ctx: MaterializedCache = HashMap::new();
                     for (_rid, values) in raw_rows {
                         let mut runner = ExecSubqueryRunner {
                             storage: exec_ctx.storage(),
@@ -615,6 +616,7 @@ fn execute_select_ctx(
                             cache: Some(&mut sq_cache_ctx),
                             in_set_cache: Some(&mut in_set_cache_ctx),
                             correlated_cache: Some(&mut corr_cache_ctx),
+                            materialized: Some(&mut mat_cache_ctx),
                         };
                         if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
                             continue;
@@ -660,6 +662,7 @@ fn execute_select_ctx(
         let mut proj_cache_ctx: SubqueryCache = HashMap::new();
         let mut proj_in_set_ctx: InSetCache = HashMap::new();
         let mut proj_corr_ctx: CorrelatedCache = HashMap::new();
+        let mut proj_mat_ctx: MaterializedCache = HashMap::new();
         let mut rows: Vec<Row> = Vec::with_capacity(combined_rows.len());
         for v in &combined_rows {
             let mut runner = ExecSubqueryRunner {
@@ -671,6 +674,7 @@ fn execute_select_ctx(
                 cache: Some(&mut proj_cache_ctx),
                 in_set_cache: Some(&mut proj_in_set_ctx),
                 correlated_cache: Some(&mut proj_corr_ctx),
+                materialized: Some(&mut proj_mat_ctx),
             };
             rows.push(project_row_with(&stmt.columns, v, &mut runner)?);
         }

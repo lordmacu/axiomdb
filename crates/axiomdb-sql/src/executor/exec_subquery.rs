@@ -105,6 +105,248 @@ type InSetCache = HashMap<usize, InSubquerySet>;
 /// correlated column indices and using a direct HashMap lookup.
 type CorrelatedCache = HashMap<(usize, u64), QueryResult>;
 
+// ── Phase 11.12: Correlated subquery materialization ─────────────────────────
+
+/// Info extracted when a correlated subquery matches the materializable pattern:
+/// single equijoin `inner.col = OuterColumn(idx)` with an aggregate result.
+struct MaterializableInfo {
+    /// Index into the outer row that provides the join key.
+    outer_col_idx: usize,
+    /// Resolved column index in the inner query that is equi-joined.
+    inner_col_idx: usize,
+    /// Column name in the inner query (for SELECT/GROUP BY).
+    inner_col_name: String,
+}
+
+/// Materialized lookup table: outer key → subquery result row.
+type MaterializedMap = HashMap<crate::eval::core::HashableValue, Vec<Value>>;
+
+/// Per-subquery materialization state: (outer_col_idx, map, column_meta).
+/// `None` means the pattern didn't match — don't retry.
+type MaterializedEntry = Option<(usize, MaterializedMap, Vec<crate::result::ColumnMeta>)>;
+
+/// Cache of materialization attempts, keyed by AST pointer.
+type MaterializedCache = HashMap<usize, MaterializedEntry>;
+
+/// Detects if a correlated scalar subquery matches the materializable pattern:
+/// - Single `inner.col = OuterColumn(idx)` in WHERE
+/// - No other OuterColumn refs anywhere in the statement
+/// - No LIMIT / OFFSET
+///
+/// PostgreSQL rewrites these at planner level (`convert_ANY_sublink_to_join`).
+/// AxiomDB detects at execution time (cheaper, no planner changes).
+fn detect_materializable_pattern(stmt: &SelectStmt) -> Option<MaterializableInfo> {
+    // Must have a WHERE clause.
+    let where_clause = stmt.where_clause.as_ref()?;
+
+    // Must not have LIMIT or OFFSET (semantics would change).
+    if stmt.limit.is_some() || stmt.offset.is_some() {
+        return None;
+    }
+
+    // Find a single `col = OuterColumn(idx)` or `OuterColumn(idx) = col` in WHERE.
+    // We only handle the top-level AND conjuncts — nested OR is not materializable.
+    let mut found: Option<(usize, usize, String)> = None;
+    let mut other_outer_in_where = false;
+
+    fn scan_eq(expr: &Expr, found: &mut Option<(usize, usize, String)>, other: &mut bool) {
+        match expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } => {
+                // Check: OuterColumn = Column or Column = OuterColumn
+                match (left.as_ref(), right.as_ref()) {
+                    (
+                        Expr::OuterColumn { col_idx: outer_idx, .. },
+                        Expr::Column { col_idx: inner_idx, name, .. },
+                    )
+                    | (
+                        Expr::Column { col_idx: inner_idx, name, .. },
+                        Expr::OuterColumn { col_idx: outer_idx, .. },
+                    ) => {
+                        if found.is_none() {
+                            *found = Some((*outer_idx, *inner_idx, name.clone()));
+                        } else {
+                            *other = true;
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+                if expr_has_outer_ref(left) || expr_has_outer_ref(right) {
+                    *other = true;
+                }
+            }
+            Expr::BinaryOp {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
+                scan_eq(left, found, other);
+                scan_eq(right, found, other);
+            }
+            _ => {
+                if expr_has_outer_ref(expr) {
+                    *other = true;
+                }
+            }
+        }
+    }
+
+    scan_eq(where_clause, &mut found, &mut other_outer_in_where);
+
+    if other_outer_in_where {
+        return None;
+    }
+
+    let (outer_col_idx, inner_col_idx, inner_col_name) = found?;
+
+    // Verify no OuterColumn refs in SELECT, HAVING, GROUP BY, ORDER BY.
+    let has_outer_elsewhere = stmt.columns.iter().any(|item| {
+        if let SelectItem::Expr { expr, .. } = item {
+            expr_has_outer_ref(expr)
+        } else {
+            false
+        }
+    }) || stmt.having.as_ref().is_some_and(expr_has_outer_ref)
+        || stmt.group_by.iter().any(expr_has_outer_ref)
+        || stmt.order_by.iter().any(|o| expr_has_outer_ref(&o.expr));
+
+    if has_outer_elsewhere {
+        return None;
+    }
+
+    Some(MaterializableInfo {
+        outer_col_idx,
+        inner_col_idx,
+        inner_col_name,
+    })
+}
+
+/// Materializes the inner query by rewriting it with GROUP BY on the join column,
+/// executing it ONCE, and building a HashMap for O(1) lookup per outer row.
+///
+/// Example:
+///   Input:  SELECT SUM(amount) FROM orders WHERE user_id = OuterColumn(0)
+///   Rewrite: SELECT user_id, SUM(amount) FROM orders GROUP BY user_id
+///   Output: HashMap { 1 → [500], 2 → [300], ... }
+fn materialize_correlated_subquery(
+    stmt: &SelectStmt,
+    info: &MaterializableInfo,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    bloom: &crate::bloom::BloomRegistry,
+    ctx: &mut SessionContext,
+) -> Result<(MaterializedMap, Vec<crate::result::ColumnMeta>), DbError> {
+    use crate::eval::core::HashableValue;
+
+    // Build the rewritten query: add join column to SELECT + GROUP BY, remove equijoin from WHERE.
+    let mut rewritten = stmt.clone();
+
+    // Add the inner join column as the FIRST select item.
+    let join_col_expr = Expr::Column {
+        col_idx: info.inner_col_idx,
+        name: info.inner_col_name.clone(),
+    };
+    rewritten.columns.insert(
+        0,
+        SelectItem::Expr {
+            expr: join_col_expr.clone(),
+            alias: Some("__mat_key".into()),
+        },
+    );
+
+    // Add GROUP BY on the join column (if not already present).
+    let already_grouped = rewritten.group_by.iter().any(|e| match e {
+        Expr::Column { col_idx, .. } => *col_idx == info.inner_col_idx,
+        _ => false,
+    });
+    if !already_grouped {
+        rewritten.group_by.insert(0, join_col_expr);
+    }
+
+    // Remove the equijoin predicate from WHERE (replace OuterColumn refs with always-true).
+    rewritten.where_clause = strip_outer_equijoin(&rewritten.where_clause);
+
+    // Execute the rewritten query once.
+    let exec_ctx = ExecutionContext::new(storage, txn, bloom, None);
+    let conn = ctx.conn_txn.take();
+    let result = execute_select_ctx(rewritten, &exec_ctx, conn.as_ref(), ctx);
+    ctx.conn_txn = conn;
+    let result = result?;
+
+    match result {
+        QueryResult::Rows { columns, rows } => {
+            let mut map: MaterializedMap = HashMap::with_capacity(rows.len());
+            // The first column is the join key, remaining columns are the original result.
+            for row in rows {
+                if row.is_empty() {
+                    continue;
+                }
+                let key = HashableValue(row[0].clone());
+                let value_row: Vec<Value> = row[1..].to_vec();
+                map.insert(key, value_row);
+            }
+            // Column metadata without the join key column.
+            let result_cols = if columns.len() > 1 {
+                columns[1..].to_vec()
+            } else {
+                vec![]
+            };
+            Ok((map, result_cols))
+        }
+        _ => Err(DbError::Internal {
+            message: "materialized subquery returned non-rows result".into(),
+        }),
+    }
+}
+
+/// Strips the `OuterColumn = col` equijoin from a WHERE clause, leaving only
+/// non-correlated predicates. Returns None if nothing remains.
+fn strip_outer_equijoin(where_clause: &Option<Expr>) -> Option<Expr> {
+    let expr = where_clause.as_ref()?;
+    strip_outer_eq_inner(expr)
+}
+
+fn strip_outer_eq_inner(expr: &Expr) -> Option<Expr> {
+    match expr {
+        Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => {
+            let left_is_outer = matches!(left.as_ref(), Expr::OuterColumn { .. });
+            let right_is_outer = matches!(right.as_ref(), Expr::OuterColumn { .. });
+            let is_outer_eq = left_is_outer || right_is_outer;
+            if is_outer_eq {
+                None // Remove this predicate.
+            } else {
+                Some(expr.clone())
+            }
+        }
+        Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            let l = strip_outer_eq_inner(left);
+            let r = strip_outer_eq_inner(right);
+            match (l, r) {
+                (Some(l), Some(r)) => Some(Expr::BinaryOp {
+                    op: BinaryOp::And,
+                    left: Box::new(l),
+                    right: Box::new(r),
+                }),
+                (Some(e), None) | (None, Some(e)) => Some(e),
+                (None, None) => None,
+            }
+        }
+        _ => Some(expr.clone()),
+    }
+}
+
 /// Extracts the `OuterColumn` indices referenced by a `SelectStmt`.
 /// Used to compute cache keys for correlated subqueries.
 fn extract_outer_col_indices(stmt: &SelectStmt) -> Vec<usize> {
@@ -493,6 +735,9 @@ struct ExecSubqueryRunner<'a> {
     cache: Option<&'a mut SubqueryCache>,
     in_set_cache: Option<&'a mut InSetCache>,
     correlated_cache: Option<&'a mut CorrelatedCache>,
+    /// Phase 11.12: materialized correlated subquery lookup tables.
+    /// Keyed by AST pointer. Built once on first cache miss, reused for all outer rows.
+    materialized: Option<&'a mut MaterializedCache>,
 }
 
 impl<'a> SubqueryRunner for ExecSubqueryRunner<'a> {
@@ -509,11 +754,50 @@ impl<'a> SubqueryRunner for ExecSubqueryRunner<'a> {
             }
         }
 
+        // Phase 11.12: materialized correlated subquery — O(1) hash lookup.
+        // For single-equijoin patterns (inner.col = OuterColumn(idx)):
+        // execute the inner query ONCE with GROUP BY, build HashMap, then
+        // lookup per outer row. Turns O(N × M) into O(N + M).
+        if !is_uncorrelated {
+            if let Some(ref mut mat_cache) = self.materialized {
+                mat_cache.entry(cache_key).or_insert_with(|| {
+                    detect_materializable_pattern(stmt).and_then(|info| {
+                        let outer_idx = info.outer_col_idx;
+                        materialize_correlated_subquery(
+                            stmt,
+                            &info,
+                            self.storage,
+                            self.txn,
+                            self.bloom,
+                            self.ctx,
+                        )
+                        .ok()
+                        .map(|(map, cols)| (outer_idx, map, cols))
+                    })
+                });
+                if let Some(Some((outer_idx, ref map, ref cols))) = mat_cache.get(&cache_key) {
+                    let key = crate::eval::core::HashableValue(
+                        self.outer_row.get(*outer_idx).cloned().unwrap_or(Value::Null),
+                    );
+                    return if let Some(row) = map.get(&key) {
+                        Ok(QueryResult::Rows {
+                            columns: cols.clone(),
+                            rows: vec![row.clone()],
+                        })
+                    } else {
+                        // No match — return single row with NULLs (aggregate over empty set).
+                        let null_row = cols.iter().map(|_| Value::Null).collect();
+                        Ok(QueryResult::Rows {
+                            columns: cols.clone(),
+                            rows: vec![null_row],
+                        })
+                    };
+                }
+                // Pattern didn't match or materialization failed — fall through.
+            }
+        }
+
         // Fast path 2: correlated subquery — cache by (AST pointer, param hash).
-        // Inspired by MariaDB's Expression_cache (sql_expression_cache.h):
-        // cache results keyed by the outer column values that parameterize
-        // the inner query. Avoids re-execution when the same parameter
-        // combination appears multiple times.
         if !is_uncorrelated {
             if let Some(ref corr_cache) = self.correlated_cache {
                 let outer_indices = extract_outer_col_indices(stmt);
