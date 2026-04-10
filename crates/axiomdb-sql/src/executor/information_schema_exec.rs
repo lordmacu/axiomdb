@@ -42,6 +42,7 @@ fn execute_information_schema_select(
                 cache: Some(&mut sq_cache_is),
                 in_set_cache: Some(&mut in_set_cache_is),
                 correlated_cache: Some(&mut corr_cache_is),
+                materialized: None,
             };
             if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
                 continue;
