@@ -2,8 +2,8 @@
 
 fn execute_show_databases(
     _stmt: ShowDatabasesStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
 ) -> Result<QueryResult, DbError> {
     let snap = txn.active_snapshot(conn_txn);
@@ -21,8 +21,8 @@ fn execute_show_databases(
 
 fn execute_use_database(
     stmt: UseDatabaseStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("conn_txn for use_database"));
@@ -39,8 +39,8 @@ fn execute_use_database(
 
 fn execute_create_database(
     stmt: CreateDatabaseStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
 ) -> Result<QueryResult, DbError> {
     let snap = txn.active_snapshot(conn_txn);
@@ -60,8 +60,8 @@ fn execute_create_database(
 
 fn execute_create_schema(
     stmt: crate::ast::CreateSchemaStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     database: &str,
 ) -> Result<QueryResult, DbError> {
@@ -82,8 +82,8 @@ fn execute_create_schema(
 
 fn execute_drop_database(
     stmt: DropDatabaseStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     if ctx.selected_database() == Some(stmt.name.as_str()) {
@@ -130,8 +130,8 @@ fn execute_drop_database(
 
 fn execute_show_tables(
     stmt: crate::ast::ShowTablesStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     database: &str,
 ) -> Result<QueryResult, DbError> {
@@ -169,8 +169,8 @@ fn execute_show_tables(
 
 fn execute_show_columns(
     stmt: crate::ast::ShowColumnsStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     database: &str,
 ) -> Result<QueryResult, DbError> {
@@ -252,8 +252,8 @@ fn execute_show_columns(
 ///          Comment, Index_comment, Visible.
 pub(crate) fn execute_show_index(
     stmt: crate::ast::ShowIndexStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     database: &str,
 ) -> Result<QueryResult, DbError> {
@@ -347,8 +347,8 @@ pub(crate) fn execute_show_index(
 /// named unique / non-unique indexes, and the storage engine notation.
 fn execute_show_create_table(
     stmt: crate::ast::ShowCreateTableStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     database: &str,
 ) -> Result<QueryResult, DbError> {
@@ -439,8 +439,8 @@ fn execute_show_create_table(
 /// `RENAME TABLE old TO new [, old2 TO new2 ...]` (4.3h)
 fn execute_rename_table(
     stmt: crate::ast::RenameTableStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     database: &str,
 ) -> Result<QueryResult, DbError> {
@@ -478,8 +478,8 @@ fn execute_rename_table(
 /// Returns one row per table with MySQL-compatible 18-column layout.
 fn execute_show_table_status(
     stmt: crate::ast::ShowTableStatusStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     database: &str,
 ) -> Result<QueryResult, DbError> {

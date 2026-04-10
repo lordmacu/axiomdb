@@ -15,7 +15,7 @@ impl HeapChain {
     /// - [`DbError::HeapPageFull`] is never returned to the caller; it triggers
     ///   automatic chain growth instead.
     pub fn insert(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: u64,
         data: &[u8],
         txn_id: TxnId,
@@ -79,7 +79,7 @@ impl HeapChain {
     ///
     /// Chain growth (page full) always updates the hint to the new tail page.
     pub fn insert_with_hint(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: u64,
         data: &[u8],
         txn_id: TxnId,
@@ -167,7 +167,7 @@ impl HeapChain {
     /// to snapshots older than `txn_id`. It disappears from scans once all
     /// snapshots that predate the deletion have been released (VACUUM).
     pub fn delete(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         page_id: u64,
         slot_id: u16,
         txn_id: TxnId,
@@ -211,7 +211,7 @@ impl HeapChain {
     ///   prior pages may already have been written).
     /// - I/O errors from `storage`.
     pub fn delete_batch(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: u64,
         rids: &[(u64, u16)],
         txn_id: TxnId,
@@ -277,7 +277,7 @@ impl HeapChain {
     /// Pages are grouped by `page_id`, read once, mutated in memory for every
     /// successful same-slot rewrite on that page, and written once at the end.
     pub fn rewrite_batch_same_slot(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: u64,
         updates: &[(axiomdb_core::RecordId, Vec<u8>)],
         txn_id: TxnId,

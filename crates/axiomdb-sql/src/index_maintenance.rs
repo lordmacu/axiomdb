@@ -64,7 +64,7 @@ pub fn fk_key_range(fk_val: &axiomdb_types::Value) -> Result<(Vec<u8>, Vec<u8>),
 /// The caller can filter with `!idx.is_primary` to get only secondary indexes.
 pub fn indexes_for_table(
     table_id: u32,
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
 ) -> Result<Vec<IndexDef>, DbError> {
     let mut reader = CatalogReader::new(storage, snapshot)?;
@@ -94,8 +94,8 @@ pub fn insert_into_indexes(
     indexes: &[IndexDef],
     row: &[Value],
     rid: RecordId,
-    storage: &mut dyn StorageEngine,
-    bloom: &mut crate::bloom::BloomRegistry,
+    storage: &dyn StorageEngine,
+    bloom: &crate::bloom::BloomRegistry,
     compiled_preds: &[Option<Expr>],
     snap: TransactionSnapshot,
 ) -> Result<Vec<(u32, u64)>, DbError> {
@@ -122,11 +122,11 @@ pub fn insert_into_indexes_with_undo(
     indexes: &[IndexDef],
     row: &[Value],
     rid: RecordId,
-    storage: &mut dyn StorageEngine,
-    bloom: &mut crate::bloom::BloomRegistry,
+    storage: &dyn StorageEngine,
+    bloom: &crate::bloom::BloomRegistry,
     compiled_preds: &[Option<Expr>],
     snap: TransactionSnapshot,
-    mut txn: Option<&mut axiomdb_wal::TxnManager>,
+    txn: Option<&axiomdb_wal::TxnManager>,
     mut conn_txn: Option<&mut axiomdb_wal::ConnectionTxn>,
 ) -> Result<Vec<(u32, u64)>, DbError> {
     let mut updated_roots = Vec::new();
@@ -209,7 +209,7 @@ pub fn insert_into_indexes_with_undo(
         }
 
         // Record undo op so ROLLBACK can remove this B-Tree entry.
-        if let (Some(ref mut tm), Some(ref mut ct)) = (&mut txn, &mut conn_txn) {
+        if let (Some(tm), Some(ref mut ct)) = (txn, &mut conn_txn) {
             tm.record_index_insert(ct, idx.index_id, current_root, key);
         }
     }
@@ -234,8 +234,8 @@ pub fn delete_from_indexes(
     indexes: &[IndexDef],
     row: &[Value],
     rid: RecordId,
-    storage: &mut dyn StorageEngine,
-    bloom: &mut crate::bloom::BloomRegistry,
+    storage: &dyn StorageEngine,
+    bloom: &crate::bloom::BloomRegistry,
     compiled_preds: &[Option<Expr>],
 ) -> Result<Vec<(u32, u64)>, DbError> {
     let mut updated_roots = Vec::new();
@@ -358,8 +358,8 @@ pub fn collect_delete_keys_by_index(
 pub fn delete_many_from_indexes(
     indexes: &mut [IndexDef],
     key_buckets: Vec<Vec<Vec<u8>>>,
-    storage: &mut dyn StorageEngine,
-    bloom: &mut crate::bloom::BloomRegistry,
+    storage: &dyn StorageEngine,
+    bloom: &crate::bloom::BloomRegistry,
 ) -> Result<Vec<(u32, u64)>, DbError> {
     let mut updated_roots: Vec<(u32, u64)> = Vec::new();
 
@@ -450,8 +450,8 @@ pub fn update_affects_index(
 pub fn delete_many_from_single_index(
     idx: &mut IndexDef,
     keys: &[Vec<u8>],
-    storage: &mut dyn StorageEngine,
-    bloom: &mut crate::bloom::BloomRegistry,
+    storage: &dyn StorageEngine,
+    bloom: &crate::bloom::BloomRegistry,
 ) -> Result<Option<u64>, DbError> {
     if idx.columns.is_empty() || keys.is_empty() {
         return Ok(None);
@@ -492,8 +492,8 @@ pub fn batch_insert_into_indexes(
     indexes: &mut [IndexDef],
     rows: &[Vec<Value>],
     rids: &[RecordId],
-    storage: &mut dyn StorageEngine,
-    bloom: &mut crate::bloom::BloomRegistry,
+    storage: &dyn StorageEngine,
+    bloom: &crate::bloom::BloomRegistry,
     compiled_preds: &[Option<Expr>],
     skip_unique_check: bool,
     committed_empty: &std::collections::HashSet<u32>,
@@ -614,8 +614,8 @@ pub fn insert_many_into_single_index(
     idx: &mut IndexDef,
     compiled_pred: Option<&Expr>,
     rows: &[(&[Value], RecordId)],
-    storage: &mut dyn StorageEngine,
-    bloom: &mut crate::bloom::BloomRegistry,
+    storage: &dyn StorageEngine,
+    bloom: &crate::bloom::BloomRegistry,
     snap: TransactionSnapshot,
 ) -> Result<Option<u64>, DbError> {
     if idx.columns.is_empty() || rows.is_empty() {
@@ -675,8 +675,8 @@ pub fn insert_into_single_index(
     compiled_pred: Option<&Expr>,
     row: &[Value],
     rid: RecordId,
-    storage: &mut dyn StorageEngine,
-    bloom: &mut crate::bloom::BloomRegistry,
+    storage: &dyn StorageEngine,
+    bloom: &crate::bloom::BloomRegistry,
     snap: TransactionSnapshot,
 ) -> Result<Option<u64>, DbError> {
     if idx.columns.is_empty() {

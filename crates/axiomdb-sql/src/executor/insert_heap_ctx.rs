@@ -5,9 +5,9 @@ fn execute_insert_ctx(
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
-    let storage = unsafe { exec_ctx.storage_mut() };
-    let txn = unsafe { exec_ctx.coord_mut() };
-    let bloom = unsafe { exec_ctx.bloom_mut() };
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
+    let bloom = exec_ctx.bloom();
     let resolved = resolve_table_cached(storage, txn, ctx, Some(conn_txn), &stmt.table)?;
     if resolved.def.is_clustered() {
         if ctx.pending_inserts.is_some() {
@@ -63,7 +63,7 @@ fn execute_insert_ctx(
     let mut first_generated: Option<u64> = None;
 
     fn next_auto_inc_ctx(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         txn: &TxnManager,
         conn_txn: &ConnectionTxn,
         table_def: &axiomdb_catalog::schema::TableDef,

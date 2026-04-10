@@ -1,7 +1,7 @@
 fn execute_update(
     stmt: UpdateStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
 ) -> Result<QueryResult, DbError> {
     let resolved = {
@@ -36,7 +36,7 @@ fn execute_update(
         .collect();
 
     // No-op bloom for the non-ctx path (bloom is managed by execute_with_ctx callers).
-    let mut noop_bloom = crate::bloom::BloomRegistry::new();
+    let noop_bloom = crate::bloom::BloomRegistry::new();
 
     let snap = txn.active_snapshot(conn_txn);
     if resolved.def.is_clustered() {
@@ -53,7 +53,7 @@ fn execute_update(
             conn_txn,
             snap,
             &resolved,
-            &mut noop_bloom,
+            &noop_bloom,
             &mut temp_ctx,
         );
     }
@@ -151,7 +151,7 @@ fn execute_update(
                 storage,
                 txn,
                 conn_txn,
-                &mut noop_bloom,
+                &noop_bloom,
                 snap,
             )?;
         }
@@ -193,10 +193,10 @@ fn apply_update_index_maintenance(
     current_indexes: &mut [IndexDef],
     compiled_preds: &[Option<Expr>],
     update_pairs: &[(RecordId, Vec<Value>, RecordId, Vec<Value>)],
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
     snap: TransactionSnapshot,
 ) -> Result<(), DbError> {
     for (idx_pos, idx) in current_indexes.iter_mut().enumerate() {

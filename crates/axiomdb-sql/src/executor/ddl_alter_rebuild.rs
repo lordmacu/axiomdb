@@ -4,8 +4,8 @@
 /// scans rows in PK order → bulk-inserts into clustered B-tree → rebuilds
 /// secondary indexes with PK bookmarks → swaps root in catalog → frees old pages.
 fn alter_rebuild_to_clustered(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     resolved: &axiomdb_catalog::ResolvedTable,
     _database: &str,
@@ -189,7 +189,7 @@ fn alter_rebuild_to_clustered(
     rebuild_result
 }
 
-fn alloc_empty_clustered_root(storage: &mut dyn StorageEngine) -> Result<u64, DbError> {
+fn alloc_empty_clustered_root(storage: &dyn StorageEngine) -> Result<u64, DbError> {
     let pid = storage.alloc_page(PageType::ClusteredLeaf)?;
     let mut page = axiomdb_storage::Page::new(PageType::ClusteredLeaf, pid);
     axiomdb_storage::clustered_leaf::init_clustered_leaf(&mut page);
@@ -199,7 +199,7 @@ fn alloc_empty_clustered_root(storage: &mut dyn StorageEngine) -> Result<u64, Db
 }
 
 fn cleanup_rebuild_artifacts<I>(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     clustered_root: Option<u64>,
     secondary_roots: I,
 ) where
@@ -214,7 +214,7 @@ fn cleanup_rebuild_artifacts<I>(
 }
 
 fn free_clustered_tree_pages(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     root_pid: u64,
 ) -> Result<(), DbError> {
     let mut stack = vec![root_pid];

@@ -8,13 +8,13 @@ fn execute_update_with_candidates(
     secondary_indexes: &[axiomdb_catalog::IndexDef],
     col_types: &[axiomdb_types::DataType],
     field_patch_eligible: bool,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
     snap: axiomdb_core::TransactionSnapshot,
     resolved: &axiomdb_catalog::ResolvedTable,
     ctx: &mut SessionContext,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
 ) -> Result<QueryResult, DbError> {
 
     // Collect all matching (rid, old_values, new_values) triples before touching

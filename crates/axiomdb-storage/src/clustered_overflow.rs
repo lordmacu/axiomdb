@@ -25,7 +25,7 @@ pub fn payload_capacity() -> usize {
 ///
 /// Returns `Ok(None)` when `payload` is empty.
 pub fn write_chain(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     batch: Option<&mut LocalPageBatch>,
     payload: &[u8],
 ) -> Result<Option<u64>, DbError> {
@@ -125,7 +125,7 @@ pub fn read_chain(
 }
 
 /// Frees every page in an overflow-page chain.
-pub fn free_chain(storage: &mut dyn StorageEngine, first_page_id: u64) -> Result<(), DbError> {
+pub fn free_chain(storage: &dyn StorageEngine, first_page_id: u64) -> Result<(), DbError> {
     let mut page_id = first_page_id;
     let mut visited = HashSet::new();
 
@@ -147,10 +147,7 @@ pub fn free_chain(storage: &mut dyn StorageEngine, first_page_id: u64) -> Result
     }
 }
 
-fn cleanup_allocated_pages(
-    storage: &mut dyn StorageEngine,
-    page_ids: &[u64],
-) -> Result<(), DbError> {
+fn cleanup_allocated_pages(storage: &dyn StorageEngine, page_ids: &[u64]) -> Result<(), DbError> {
     for &page_id in page_ids {
         storage.free_page(page_id)?;
     }

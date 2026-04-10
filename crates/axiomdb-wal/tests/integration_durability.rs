@@ -64,7 +64,7 @@ impl TestEnv {
 /// Returns (page_id, slot_id). Caller must have called `mgr.begin()` first.
 fn do_insert(
     storage: &mut MmapStorage,
-    mgr: &mut TxnManager,
+    mgr: &TxnManager,
     conn: &mut ConnectionTxn,
     data: &[u8],
 ) -> (u64, u16) {
@@ -113,15 +113,15 @@ fn test_committed_data_survives_crash() {
 
     // Session 1: insert and commit 3 rows.
     {
-        let (mut storage, mut mgr) = env.create();
+        let (mut storage, mgr) = env.create();
         for i in 0u64..3 {
             let mut conn = mgr.begin().unwrap();
-            let (pid, sid) = do_insert(&mut storage, &mut mgr, &mut conn, &i.to_le_bytes());
-            mgr.commit(conn).unwrap();
+            let (pid, sid) = do_insert(&mut storage, &mgr, &mut conn, &i.to_le_bytes());
+            let _ = mgr.commit(conn).unwrap();
             committed_slots.push((pid, sid));
         }
         // Simulate crash: flush WAL buffer to OS (no fsync), then drop.
-        mgr.wal_mut().flush_buffer().unwrap();
+        mgr.wal().flush_buffer().unwrap();
         storage.flush().unwrap();
     }
 
@@ -148,12 +148,12 @@ fn test_uncommitted_data_rolled_back() {
 
     // Session 1: begin + insert, crash before commit.
     {
-        let (mut storage, mut mgr) = env.create();
+        let (mut storage, mgr) = env.create();
         let mut conn = mgr.begin().unwrap();
-        (page_id, slot_id) = do_insert(&mut storage, &mut mgr, &mut conn, b"uncommitted-row");
+        (page_id, slot_id) = do_insert(&mut storage, &mgr, &mut conn, b"uncommitted-row");
         storage.flush().unwrap(); // page is on disk
-        mgr.wal_mut().flush_buffer().unwrap(); // WAL in OS buffer
-                                               // Crash: drop without commit
+        mgr.wal().flush_buffer().unwrap(); // WAL in OS buffer
+                                           // Crash: drop without commit
     }
 
     // Session 2: recovery must undo the insert.
@@ -180,18 +180,18 @@ fn test_partial_transaction_committed_survives_crashed_dies() {
     let (pid_a, sid_a, pid_b, sid_b);
 
     {
-        let (mut storage, mut mgr) = env.create();
+        let (mut storage, mgr) = env.create();
 
         // txn 1: insert row A, commit.
         let mut conn1 = mgr.begin().unwrap();
-        (pid_a, sid_a) = do_insert(&mut storage, &mut mgr, &mut conn1, b"row-A-committed");
-        mgr.commit(conn1).unwrap();
+        (pid_a, sid_a) = do_insert(&mut storage, &mgr, &mut conn1, b"row-A-committed");
+        let _ = mgr.commit(conn1).unwrap();
 
         // txn 2: insert row B, crash.
         let mut conn2 = mgr.begin().unwrap();
-        (pid_b, sid_b) = do_insert(&mut storage, &mut mgr, &mut conn2, b"row-B-crashed");
+        (pid_b, sid_b) = do_insert(&mut storage, &mgr, &mut conn2, b"row-B-crashed");
         storage.flush().unwrap();
-        mgr.wal_mut().flush_buffer().unwrap();
+        mgr.wal().flush_buffer().unwrap();
         // Crash
     }
 
@@ -212,16 +212,16 @@ fn test_truncated_wal_recovery_safe() {
 
     // Session 1: commit txn1, start txn2, flush, crash.
     {
-        let (mut storage, mut mgr) = env.create();
+        let (mut storage, mgr) = env.create();
 
         let mut conn1 = mgr.begin().unwrap();
-        do_insert(&mut storage, &mut mgr, &mut conn1, b"committed-row");
-        mgr.commit(conn1).unwrap(); // this fsyncs the WAL
+        do_insert(&mut storage, &mgr, &mut conn1, b"committed-row");
+        let _ = mgr.commit(conn1).unwrap(); // this fsyncs the WAL
 
         let mut conn2 = mgr.begin().unwrap();
-        do_insert(&mut storage, &mut mgr, &mut conn2, b"in-progress-row");
+        do_insert(&mut storage, &mgr, &mut conn2, b"in-progress-row");
         storage.flush().unwrap();
-        mgr.wal_mut().flush_buffer().unwrap(); // partial entries in OS buffer
+        mgr.wal().flush_buffer().unwrap(); // partial entries in OS buffer
     }
 
     // Truncate the WAL file to 3/4 of its size — cuts the last entry in half.
@@ -261,18 +261,17 @@ fn test_wal_rotation_then_crash_recovery() {
 
         // txn1: insert + commit.
         let mut conn1 = mgr.begin().unwrap();
-        (pid_before, sid_before) =
-            do_insert(&mut storage, &mut mgr, &mut conn1, b"before-rotation");
-        mgr.commit(conn1).unwrap();
+        (pid_before, sid_before) = do_insert(&mut storage, &mgr, &mut conn1, b"before-rotation");
+        let _ = mgr.commit(conn1).unwrap();
 
         // Rotate WAL: checkpoint (pages → disk) + new WAL file.
-        mgr.rotate_wal(&mut storage, &env.wal).unwrap();
+        mgr.rotate_wal(&storage, &env.wal).unwrap();
 
         // txn2 in the new WAL segment: insert + crash.
         let mut conn2 = mgr.begin().unwrap();
-        (pid_after, sid_after) = do_insert(&mut storage, &mut mgr, &mut conn2, b"after-rotation");
+        (pid_after, sid_after) = do_insert(&mut storage, &mgr, &mut conn2, b"after-rotation");
         storage.flush().unwrap();
-        mgr.wal_mut().flush_buffer().unwrap();
+        mgr.wal().flush_buffer().unwrap();
         // Crash
     }
 
@@ -298,11 +297,11 @@ fn test_multiple_crash_recovery_cycles_idempotent() {
 
     // Session 1: crash mid-insert.
     {
-        let (mut storage, mut mgr) = env.create();
+        let (mut storage, mgr) = env.create();
         let mut conn = mgr.begin().unwrap();
-        (page_id, slot_id) = do_insert(&mut storage, &mut mgr, &mut conn, b"orphan-row");
+        (page_id, slot_id) = do_insert(&mut storage, &mgr, &mut conn, b"orphan-row");
         storage.flush().unwrap();
-        mgr.wal_mut().flush_buffer().unwrap();
+        mgr.wal().flush_buffer().unwrap();
     }
 
     // Session 2: first recovery.
@@ -342,14 +341,14 @@ fn test_reserved_capacity_growth_survives_crash_reopen() {
     let mut crossed_reservation_boundary = false;
 
     {
-        let (mut storage, mut mgr) = env.create();
+        let (mut storage, mgr) = env.create();
         initial_wal_len = std::fs::metadata(&env.wal).unwrap().len();
 
         for i in 0u64..5000 {
             let mut conn = mgr.begin().unwrap();
             let payload = vec![(i & 0xFF) as u8; 512];
-            let (pid, sid) = do_insert(&mut storage, &mut mgr, &mut conn, &payload);
-            mgr.commit(conn).unwrap();
+            let (pid, sid) = do_insert(&mut storage, &mgr, &mut conn, &payload);
+            let _ = mgr.commit(conn).unwrap();
             committed_slots.push((pid, sid));
 
             let wal_len = std::fs::metadata(&env.wal).unwrap().len();
@@ -395,11 +394,11 @@ fn test_corrupt_checkpoint_lsn_documented_failure_mode() {
 
     // Session 1: insert (uncommitted) + flush page.
     {
-        let (mut storage, mut mgr) = env.create();
+        let (mut storage, mgr) = env.create();
         let mut conn = mgr.begin().unwrap();
-        do_insert(&mut storage, &mut mgr, &mut conn, b"uncommitted");
+        do_insert(&mut storage, &mgr, &mut conn, b"uncommitted");
         storage.flush().unwrap();
-        mgr.wal_mut().flush_buffer().unwrap();
+        mgr.wal().flush_buffer().unwrap();
     }
 
     // Corrupt the checkpoint_lsn in the meta page to a huge value.
@@ -439,10 +438,10 @@ fn test_partial_page_write_detected_as_checksum_mismatch() {
 
     // Session 1: commit a row and flush page to disk.
     let page_id = {
-        let (mut storage, mut mgr) = env.create();
+        let (mut storage, mgr) = env.create();
         let mut conn = mgr.begin().unwrap();
-        let (pid, _) = do_insert(&mut storage, &mut mgr, &mut conn, b"written-row");
-        mgr.commit(conn).unwrap();
+        let (pid, _) = do_insert(&mut storage, &mgr, &mut conn, b"written-row");
+        let _ = mgr.commit(conn).unwrap();
         storage.flush().unwrap();
         pid
     };
@@ -479,13 +478,13 @@ fn test_strict_policy_committed_data_survives_crash() {
     let env = TestEnv::new();
 
     {
-        let (mut storage, mut mgr) = env.create();
+        let (mut storage, mgr) = env.create();
         // Strict is the default — no set_durability_policy needed.
         assert_eq!(mgr.durability_policy(), WalDurabilityPolicy::Strict);
 
         let mut conn = mgr.begin().unwrap();
-        do_insert(&mut storage, &mut mgr, &mut conn, b"strict-row");
-        mgr.commit(conn).unwrap();
+        do_insert(&mut storage, &mgr, &mut conn, b"strict-row");
+        let _ = mgr.commit(conn).unwrap();
 
         storage.flush().unwrap();
     }
@@ -506,13 +505,13 @@ fn test_normal_policy_data_present_after_clean_reopen() {
         mgr.set_durability_policy(WalDurabilityPolicy::Normal);
 
         let mut conn = mgr.begin().unwrap();
-        (page_id, slot_id) = do_insert(&mut storage, &mut mgr, &mut conn, b"normal-row");
-        mgr.commit(conn).unwrap();
+        (page_id, slot_id) = do_insert(&mut storage, &mgr, &mut conn, b"normal-row");
+        let _ = mgr.commit(conn).unwrap();
 
         // max_committed must advance immediately (not deferred).
         assert_eq!(mgr.max_committed(), 1);
 
-        mgr.wal_mut().flush_buffer().unwrap();
+        mgr.wal().flush_buffer().unwrap();
         storage.flush().unwrap();
     }
 
@@ -533,14 +532,14 @@ fn test_off_policy_data_present_after_flush_and_reopen() {
         mgr.set_durability_policy(WalDurabilityPolicy::Off);
 
         let mut conn = mgr.begin().unwrap();
-        (page_id, slot_id) = do_insert(&mut storage, &mut mgr, &mut conn, b"off-row");
-        mgr.commit(conn).unwrap();
+        (page_id, slot_id) = do_insert(&mut storage, &mgr, &mut conn, b"off-row");
+        let _ = mgr.commit(conn).unwrap();
 
         // max_committed must advance immediately.
         assert_eq!(mgr.max_committed(), 1);
 
         // Explicitly flush to make data recoverable.
-        mgr.wal_mut().flush_buffer().unwrap();
+        mgr.wal().flush_buffer().unwrap();
         storage.flush().unwrap();
     }
 
@@ -564,12 +563,12 @@ fn test_read_only_txn_uses_flush_no_sync_regardless_of_policy() {
 
         // Insert one committed row first (DML so WAL is non-empty).
         let mut conn1 = mgr.begin().unwrap();
-        do_insert(&mut storage, &mut mgr, &mut conn1, b"data");
-        mgr.commit(conn1).unwrap();
+        do_insert(&mut storage, &mgr, &mut conn1, b"data");
+        let _ = mgr.commit(conn1).unwrap();
 
         // Read-only transaction: begin + commit without any DML.
         let conn2 = mgr.begin().unwrap();
-        mgr.commit(conn2).unwrap();
+        let _ = mgr.commit(conn2).unwrap();
 
         assert_eq!(mgr.max_committed(), 2);
 
@@ -593,13 +592,13 @@ fn test_normal_policy_multiple_txns_recoverable() {
 
         for i in 0u64..10 {
             let mut conn = mgr.begin().unwrap();
-            let (pid, sid) = do_insert(&mut storage, &mut mgr, &mut conn, &i.to_le_bytes());
-            mgr.commit(conn).unwrap();
+            let (pid, sid) = do_insert(&mut storage, &mgr, &mut conn, &i.to_le_bytes());
+            let _ = mgr.commit(conn).unwrap();
             slots.push((pid, sid));
         }
         assert_eq!(mgr.max_committed(), 10);
 
-        mgr.wal_mut().flush_buffer().unwrap();
+        mgr.wal().flush_buffer().unwrap();
         storage.flush().unwrap();
     }
 

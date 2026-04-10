@@ -101,7 +101,7 @@ impl BTree {
     }
 
     fn try_insert_leaf_optimistically(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_pid: u64,
         key: &[u8],
         rid: RecordId,
@@ -205,7 +205,7 @@ impl BTree {
 
     #[allow(clippy::needless_option_as_deref)]
     fn insert_subtree_batched(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         mut batch: Option<&mut LocalPageBatch>,
         pid: u64,
         key: &[u8],
@@ -311,7 +311,7 @@ impl BTree {
     /// handled directly in `insert_subtree` via the fast path).
     #[allow(clippy::needless_option_as_deref)]
     fn insert_leaf_batched(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         mut batch: Option<&mut LocalPageBatch>,
         old_pid: u64,
         node: LeafNodePage,
@@ -384,7 +384,7 @@ impl BTree {
 
     #[allow(clippy::needless_option_as_deref)]
     fn split_internal_batched(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         mut batch: Option<&mut LocalPageBatch>,
         old_pid: u64,
         node: InternalNodePage,
@@ -461,7 +461,7 @@ impl BTree {
     }
 
     fn alloc_root_batched(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         batch: Option<&mut LocalPageBatch>,
         sep: &[u8],
         left_pid: u64,
@@ -491,7 +491,7 @@ impl BTree {
     /// Reads the existing page, overwrites the body, writes back — avoids
     /// allocating a 16KB zeroed `Page::new` + 16KB struct copy.
     fn write_leaf_same_pid(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         pid: u64,
         node: LeafNodePage,
     ) -> Result<u64, DbError> {
@@ -511,7 +511,7 @@ impl BTree {
     /// Reads the existing page, overwrites the body, writes back — avoids
     /// allocating a 16KB zeroed `Page::new` + 16KB struct copy.
     fn write_internal_same_pid(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         pid: u64,
         node: InternalNodePage,
     ) -> Result<u64, DbError> {
@@ -525,7 +525,7 @@ impl BTree {
     }
 
     fn in_place_update_child(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         old_pid: u64,
         mut node: InternalNodePage,
         child_idx: usize,

@@ -10,12 +10,12 @@ fn execute_clustered_update(
     assignments: Vec<(usize, Expr)>,
     schema_cols: &[axiomdb_catalog::schema::ColumnDef],
     secondary_indexes: &[axiomdb_catalog::IndexDef],
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
     snap: axiomdb_core::TransactionSnapshot,
     resolved: &axiomdb_catalog::ResolvedTable,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     use std::ops::Bound;

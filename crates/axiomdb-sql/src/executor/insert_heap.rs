@@ -1,7 +1,7 @@
 fn execute_insert(
     stmt: InsertStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
 ) -> Result<QueryResult, DbError> {
     let resolved = {
@@ -49,7 +49,7 @@ fn execute_insert(
         .collect();
 
     // No-op bloom for the non-ctx path (bloom is managed by execute_with_ctx callers).
-    let mut noop_bloom = crate::bloom::BloomRegistry::new();
+    let noop_bloom = crate::bloom::BloomRegistry::new();
 
     // Find the AUTO_INCREMENT column index (at most one per table).
     let auto_inc_col: Option<usize> = schema_cols.iter().position(|c| c.auto_increment);
@@ -60,7 +60,7 @@ fn execute_insert(
     /// Returns the next value from the per-table AUTO_INCREMENT sequence,
     /// initializing it from MAX(col)+1 on first use (restart-safe).
     fn next_auto_inc(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         txn: &TxnManager,
         conn_txn: &ConnectionTxn,
         table_def: &axiomdb_catalog::schema::TableDef,
@@ -164,7 +164,7 @@ fn execute_insert(
                             &full_values,
                             rid,
                             storage,
-                            &mut noop_bloom,
+                            &noop_bloom,
                             &compiled_preds,
                             snap,
                             Some(txn),
@@ -199,7 +199,7 @@ fn execute_insert(
                     storage,
                     txn,
                     conn_txn,
-                    &mut noop_bloom,
+                    &noop_bloom,
                     InsertBatchApply {
                         table_def: &resolved.def,
                         columns: schema_cols,
@@ -269,7 +269,7 @@ fn execute_insert(
                         &full_values,
                         rid,
                         storage,
-                        &mut noop_bloom,
+                        &noop_bloom,
                         &compiled_preds,
                         snap,
                         Some(txn),
@@ -323,7 +323,7 @@ fn execute_insert(
                     &full_values,
                     rid,
                     storage,
-                    &mut noop_bloom,
+                    &noop_bloom,
                     &compiled_preds,
                     snap,
                     Some(txn),

@@ -75,8 +75,8 @@ pub fn execute_read_only_with_ctx(
 
 pub fn execute(
     stmt: Stmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
 ) -> Result<QueryResult, DbError> {
     // If a transaction was previously started via `execute(BEGIN, ...)`, retrieve the
     // stored `ConnectionTxn` from the thread-local and pass it to `dispatch`.
@@ -142,10 +142,10 @@ pub fn execute(
 /// of bare `txn.rollback(storage)` whenever the transaction may have
 /// performed INSERT or UPDATE operations that added B-Tree entries.
 fn rollback_with_index_undo(
-    txn: &mut TxnManager,
+    txn: &TxnManager,
     conn_txn: ConnectionTxn,
-    storage: &mut dyn StorageEngine,
-    bloom: &mut crate::bloom::BloomRegistry,
+    storage: &dyn StorageEngine,
+    bloom: &crate::bloom::BloomRegistry,
 ) -> Result<(), DbError> {
     // Collect index insert undos BEFORE rollback (rollback consumes the undo log).
     let index_undos = txn.collect_index_undos(&conn_txn);
@@ -216,11 +216,11 @@ fn rollback_with_index_undo(
 
 /// Like [`rollback_with_index_undo`] but for savepoint rollback.
 fn rollback_to_savepoint_with_index_undo(
-    txn: &mut TxnManager,
+    txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
     sp: Savepoint,
-    storage: &mut dyn StorageEngine,
-    bloom: &mut crate::bloom::BloomRegistry,
+    storage: &dyn StorageEngine,
+    bloom: &crate::bloom::BloomRegistry,
 ) -> Result<(), DbError> {
     let index_undos = txn.collect_index_undos_since(conn_txn, &sp);
     let mut current_roots = load_current_index_roots(txn, conn_txn, storage, &index_undos)?;

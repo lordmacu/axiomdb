@@ -161,10 +161,10 @@ fn apply_clustered_secondary_update(
     table_root_page_id: u64,
     old_values: &[Value],
     new_values: &[Value],
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
 ) -> Result<(), DbError> {
     let snap = txn.active_snapshot(conn_txn);
     let old_indexed =
@@ -270,8 +270,8 @@ fn fused_clustered_scan_patch(
     where_clause: Option<&Expr>,
     assignments: &[(usize, Expr)],
     col_types: &[axiomdb_types::DataType],
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
     snap: axiomdb_core::TransactionSnapshot,
     resolved: &axiomdb_catalog::ResolvedTable,

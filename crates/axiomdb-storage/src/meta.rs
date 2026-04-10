@@ -65,7 +65,7 @@ pub fn read_checkpoint_lsn(storage: &dyn StorageEngine) -> Result<u64, DbError> 
 /// Writes `lsn` into the `checkpoint_lsn` field of the meta page (page 0).
 ///
 /// Caller must flush storage after this call to guarantee durability.
-pub fn write_checkpoint_lsn(storage: &mut dyn StorageEngine, lsn: u64) -> Result<(), DbError> {
+pub fn write_checkpoint_lsn(storage: &dyn StorageEngine, lsn: u64) -> Result<(), DbError> {
     // Read → modify → write (StorageEngine has no read_page_mut).
     let bytes = *storage.read_page(0)?.as_bytes();
     let mut page = Page::from_bytes(bytes)?;
@@ -188,7 +188,7 @@ pub fn read_meta_u32(storage: &dyn StorageEngine, body_offset: usize) -> Result<
 ///
 /// Caller must flush storage afterward to guarantee durability.
 pub fn write_meta_u32(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     body_offset: usize,
     value: u32,
 ) -> Result<(), DbError> {
@@ -203,7 +203,7 @@ pub fn write_meta_u32(
 
 /// Writes a single `u64` to the meta page at `body_offset`.
 pub fn write_meta_u64(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     body_offset: usize,
     value: u64,
 ) -> Result<(), DbError> {
@@ -225,21 +225,21 @@ pub fn write_meta_u64(
 /// # Errors
 /// - [`DbError::CatalogNotInitialized`] if the sequence is 0 (catalog not bootstrapped).
 /// - [`DbError::SequenceOverflow`] if `u32::MAX` would be exceeded.
-pub fn alloc_table_id(storage: &mut dyn StorageEngine) -> Result<u32, DbError> {
+pub fn alloc_table_id(storage: &dyn StorageEngine) -> Result<u32, DbError> {
     alloc_sequence_u32(storage, NEXT_TABLE_ID_BODY_OFFSET)
 }
 
 /// Allocates the next `index_id` from the meta page sequence.
 ///
 /// Same semantics as [`alloc_table_id`].
-pub fn alloc_index_id(storage: &mut dyn StorageEngine) -> Result<u32, DbError> {
+pub fn alloc_index_id(storage: &dyn StorageEngine) -> Result<u32, DbError> {
     alloc_sequence_u32(storage, NEXT_INDEX_ID_BODY_OFFSET)
 }
 
 /// Allocates the next `constraint_id` from the meta page sequence (Phase 4.22b).
 ///
 /// Same semantics as [`alloc_table_id`].
-pub fn alloc_constraint_id(storage: &mut dyn StorageEngine) -> Result<u32, DbError> {
+pub fn alloc_constraint_id(storage: &dyn StorageEngine) -> Result<u32, DbError> {
     // Initialize to 1 on first call if still 0 (lazy-init for existing DBs).
     let current = read_meta_u32(storage, NEXT_CONSTRAINT_ID_BODY_OFFSET)?;
     if current == 0 {
@@ -254,7 +254,7 @@ pub fn alloc_constraint_id(storage: &mut dyn StorageEngine) -> Result<u32, DbErr
 /// Allocates the next `fk_id` from the meta page sequence (Phase 6.5).
 ///
 /// Lazy-initializes to 1 on first call if still 0 (compatible with pre-6.5 DBs).
-pub fn alloc_fk_id(storage: &mut dyn StorageEngine) -> Result<u32, DbError> {
+pub fn alloc_fk_id(storage: &dyn StorageEngine) -> Result<u32, DbError> {
     let current = read_meta_u32(storage, NEXT_FK_ID_BODY_OFFSET)?;
     if current == 0 {
         write_meta_u32(storage, NEXT_FK_ID_BODY_OFFSET, 2)?;
@@ -266,7 +266,7 @@ pub fn alloc_fk_id(storage: &mut dyn StorageEngine) -> Result<u32, DbError> {
 }
 
 /// Internal: read-increment-write for a `u32` sequence stored in the meta page.
-fn alloc_sequence_u32(storage: &mut dyn StorageEngine, body_offset: usize) -> Result<u32, DbError> {
+fn alloc_sequence_u32(storage: &dyn StorageEngine, body_offset: usize) -> Result<u32, DbError> {
     let current = read_meta_u32(storage, body_offset)?;
     if current == 0 {
         return Err(DbError::CatalogNotInitialized);
@@ -280,7 +280,7 @@ fn alloc_sequence_u32(storage: &mut dyn StorageEngine, body_offset: usize) -> Re
 ///
 /// Caller must flush storage afterward to guarantee durability.
 pub fn write_catalog_header(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     tables_root: u64,
     columns_root: u64,
     indexes_root: u64,

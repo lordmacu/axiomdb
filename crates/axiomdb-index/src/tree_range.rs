@@ -32,7 +32,7 @@ impl BTree {
     /// `parent.child(child_idx - 1)`. Cost: O(height) descent — acceptable
     /// because splits are rare (~1 per ORDER_LEAF inserts).
     fn update_predecessor_next_leaf(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         parent: &InternalNodePage,
         child_idx: usize,
         new_left_pid: u64,
@@ -141,7 +141,7 @@ impl BTree {
 
     // ── Static API (shared storage) ──────────────────────────────────────────
     //
-    // These functions take an external `&mut dyn StorageEngine` instead of the
+    // These functions take an external `&dyn StorageEngine` instead of the
     // owned `self.storage`.  They are used when the caller already holds a
     // mutable borrow of storage (e.g., the SQL executor) and cannot hand it to
     // a `BTree` instance.
@@ -192,7 +192,7 @@ impl BTree {
     ///
     /// Updates `*root_pid` atomically if the root splits.
     pub fn insert_in(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_pid: &AtomicU64,
         key: &[u8],
         rid: RecordId,
@@ -204,7 +204,7 @@ impl BTree {
     /// Like [`insert_in`] but routes page allocations through `batch`.
     #[allow(clippy::needless_option_as_deref)]
     pub fn insert_in_with_batch(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         mut batch: Option<&mut LocalPageBatch>,
         root_pid: &AtomicU64,
         key: &[u8],
@@ -289,7 +289,7 @@ impl BTree {
     /// Updates `*root_pid` if the root collapses after deletion.
     /// Returns `true` if the key was found and deleted, `false` if not found.
     pub fn delete_in(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_pid: &AtomicU64,
         key: &[u8],
     ) -> Result<bool, DbError> {
@@ -299,7 +299,7 @@ impl BTree {
     /// Like [`delete_in`] but routes page allocations through `batch`.
     #[allow(clippy::needless_option_as_deref)]
     pub fn delete_in_with_batch(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         mut batch: Option<&mut LocalPageBatch>,
         root_pid: &AtomicU64,
         key: &[u8],
@@ -392,7 +392,7 @@ impl BTree {
     }
 
     fn try_delete_leaf_optimistically(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_pid: u64,
         key: &[u8],
     ) -> Result<OptimisticLeafResult<bool>, DbError> {

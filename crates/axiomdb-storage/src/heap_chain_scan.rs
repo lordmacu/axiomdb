@@ -13,7 +13,7 @@ impl HeapChain {
     /// scan that finds all slots committed and undeleted, the flag is set on the
     /// page (lazy-set write) so every subsequent scan takes the fast path.
     pub fn scan_rids_visible(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: u64,
         snap: TransactionSnapshot,
     ) -> Result<Vec<(u64, u16)>, DbError> {
@@ -133,7 +133,7 @@ impl HeapChain {
     ///
     /// [`RowHeader`]: crate::heap::RowHeader
     pub fn scan_visible(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: u64,
         snap: TransactionSnapshot,
     ) -> Result<Vec<(u64, u16, Vec<u8>)>, DbError> {

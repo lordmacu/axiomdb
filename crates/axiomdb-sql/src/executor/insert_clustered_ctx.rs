@@ -6,9 +6,9 @@ fn execute_clustered_insert_ctx(
     resolved: ResolvedTable,
 ) -> Result<QueryResult, DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
-    let storage = unsafe { exec_ctx.storage_mut() };
-    let txn = unsafe { exec_ctx.coord_mut() };
-    let bloom = unsafe { exec_ctx.bloom_mut() };
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
+    let bloom = exec_ctx.bloom();
     let schema_cols = &resolved.columns;
     let primary_idx =
         crate::clustered_table::primary_index(&resolved.indexes, &resolved.def.table_name)?.clone();
@@ -212,9 +212,9 @@ fn enqueue_clustered_insert_ctx(
     resolved: ResolvedTable,
 ) -> Result<QueryResult, DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
-    let storage = unsafe { exec_ctx.storage_mut() };
-    let txn = unsafe { exec_ctx.coord_mut() };
-    let bloom = unsafe { exec_ctx.bloom_mut() };
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
+    let bloom = exec_ctx.bloom();
     let schema_cols = &resolved.columns;
     let table_id = resolved.def.id;
 

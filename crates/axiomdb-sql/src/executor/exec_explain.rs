@@ -4,8 +4,8 @@
 /// directly when an explicit transaction is already active.
 fn dispatch(
     stmt: Stmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
 ) -> Result<QueryResult, DbError> {
     match stmt {
@@ -25,24 +25,24 @@ fn dispatch(
             feature: "DROP DATABASE requires session context".into(),
         }),
         Stmt::CreateIndex(s) => {
-            let mut noop_bloom = crate::bloom::BloomRegistry::new();
+            let noop_bloom = crate::bloom::BloomRegistry::new();
             execute_create_index(
                 s,
                 storage,
                 txn,
                 conn_txn,
-                &mut noop_bloom,
+                &noop_bloom,
                 DEFAULT_DATABASE_NAME,
             )
         }
         Stmt::DropIndex(s) => {
-            let mut noop_bloom = crate::bloom::BloomRegistry::new();
+            let noop_bloom = crate::bloom::BloomRegistry::new();
             execute_drop_index(
                 s,
                 storage,
                 txn,
                 conn_txn,
-                &mut noop_bloom,
+                &noop_bloom,
                 DEFAULT_DATABASE_NAME,
             )
         }

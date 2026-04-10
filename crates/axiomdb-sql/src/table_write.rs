@@ -13,8 +13,8 @@ impl TableEngine {
     /// - [`DbError::NoActiveTransaction`] — no transaction is active.
     /// - I/O errors from storage or WAL writes.
     pub fn insert_row(
-        storage: &mut dyn StorageEngine,
-        txn: &mut TxnManager,
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
         conn_txn: &mut axiomdb_wal::ConnectionTxn,
         table_def: &TableDef,
         columns: &[ColumnDef],
@@ -53,8 +53,8 @@ impl TableEngine {
     ///
     /// Use this in hot loops (ctx per-row insert paths) to avoid O(N²) behavior.
     pub fn insert_row_with_hint(
-        storage: &mut dyn StorageEngine,
-        txn: &mut TxnManager,
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
         conn_txn: &mut axiomdb_wal::ConnectionTxn,
         table_def: &TableDef,
         columns: &[ColumnDef],
@@ -110,8 +110,8 @@ impl TableEngine {
     /// - [`DbError::NoActiveTransaction`] — no transaction is active.
     /// - I/O errors from storage or WAL writes.
     pub fn insert_rows_batch(
-        storage: &mut dyn StorageEngine,
-        txn: &mut TxnManager,
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
         conn_txn: &mut axiomdb_wal::ConnectionTxn,
         table_def: &TableDef,
         columns: &[ColumnDef],
@@ -191,8 +191,8 @@ impl TableEngine {
     /// - [`DbError::NoActiveTransaction`] — no transaction is active.
     /// - I/O errors from storage or WAL writes.
     pub fn delete_row(
-        storage: &mut dyn StorageEngine,
-        txn: &mut TxnManager,
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
         conn_txn: &mut axiomdb_wal::ConnectionTxn,
         table_def: &TableDef,
         record_id: RecordId,
@@ -233,8 +233,8 @@ impl TableEngine {
     ///
     /// Returns the number of rows deleted.
     pub fn delete_rows_batch(
-        storage: &mut dyn StorageEngine,
-        txn: &mut TxnManager,
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
         conn_txn: &mut axiomdb_wal::ConnectionTxn,
         table_def: &TableDef,
         rids: &[RecordId],
@@ -297,8 +297,8 @@ impl TableEngine {
     /// - [`DbError::TypeMismatch`] — any new row has wrong column count.
     /// - I/O errors from storage or WAL writes.
     pub fn update_rows_batch(
-        storage: &mut dyn StorageEngine,
-        txn: &mut TxnManager,
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
         conn_txn: &mut axiomdb_wal::ConnectionTxn,
         table_def: &TableDef,
         columns: &[ColumnDef],
@@ -339,8 +339,8 @@ impl TableEngine {
     /// - [`DbError::NoActiveTransaction`] — no transaction is active.
     /// - I/O errors from storage or WAL writes.
     pub fn update_row(
-        storage: &mut dyn StorageEngine,
-        txn: &mut TxnManager,
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
         conn_txn: &mut axiomdb_wal::ConnectionTxn,
         table_def: &TableDef,
         columns: &[ColumnDef],
@@ -375,8 +375,8 @@ impl TableEngine {
     /// [`HeapChain::insert_with_hint`] to avoid re-walking the chain from root
     /// on each iteration of a bulk UPDATE loop.
     pub fn update_row_with_hint(
-        storage: &mut dyn StorageEngine,
-        txn: &mut TxnManager,
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
         conn_txn: &mut axiomdb_wal::ConnectionTxn,
         table_def: &TableDef,
         columns: &[ColumnDef],

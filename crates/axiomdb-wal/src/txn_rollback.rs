@@ -1,20 +1,5 @@
 impl TxnManager {
-    /// Rolls back the active transaction: undoes heap changes and writes a
-    /// Rollback WAL entry (not fsynced — rolled-back data is intentionally ephemeral).
-    ///
     /// Captures the current undo log position as a statement-level savepoint.
-    ///
-    /// The returned `Savepoint` can be passed to [`rollback_to_savepoint`] to undo
-    /// only the operations recorded *after* this call, leaving the transaction active.
-    ///
-    /// Call this **before** executing each statement inside an explicit transaction
-    /// to implement MySQL-style statement-level rollback on error.
-    ///
-    /// # Panics
-    ///
-    /// Panics in debug builds if called outside an active transaction.
-    ///
-    /// [`rollback_to_savepoint`]: TxnManager::rollback_to_savepoint
     pub fn savepoint(&self, conn_txn: &ConnectionTxn) -> Savepoint {
         Savepoint {
             undo_len: conn_txn.undo_ops.len(),
@@ -24,23 +9,11 @@ impl TxnManager {
     }
 
     /// Undoes all operations recorded **after** `sp`, leaving the transaction active.
-    ///
-    /// This implements MySQL's statement-level rollback semantics: when a statement
-    /// errors inside an explicit transaction, only that statement's writes are
-    /// undone. The transaction remains open; subsequent statements can execute.
-    ///
-    /// Undo ops are applied in reverse order (last write first), identical to the
-    /// full `rollback()` path but scoped to `sp.0..undo_ops.len()`.
-    ///
-    /// # Errors
-    ///
-    /// - [`DbError::NoActiveTransaction`] if no transaction is active.
-    /// - I/O errors from undo writes.
     pub fn rollback_to_savepoint(
-        &mut self,
+        &self,
         conn_txn: &mut ConnectionTxn,
         sp: Savepoint,
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
     ) -> Result<(), DbError> {
         let txn_id = conn_txn.txn_id;
 
@@ -48,7 +21,6 @@ impl TxnManager {
         conn_txn.deferred_free_pages.truncate(sp.deferred_free_len);
 
         // Discard freed-after-savepoint entries in the local page batch.
-        // The undo restores those rows → the pages are still in use.
         conn_txn
             .local_page_batch
             .truncate_freed(sp.batch_freed_len);
@@ -162,28 +134,23 @@ impl TxnManager {
             }
         }
 
-        // Propagate the post-undo clustered roots back to TxnManager so that
-        // subsequent calls to `clustered_root()` return the correct (restored) root.
-        for (table_id, root_pid) in &conn_txn.clustered_roots {
-            self.last_clustered_roots.insert(*table_id, *root_pid);
+        // Propagate the post-undo clustered roots back to TxnManager.
+        {
+            let mut roots = self.last_clustered_roots.lock().unwrap();
+            for (table_id, root_pid) in &conn_txn.clustered_roots {
+                roots.insert(*table_id, *root_pid);
+            }
         }
 
         Ok(())
     }
 
-    /// Applies undo operations in **reverse chronological order**:
-    /// - `UndoInsert`: marks the slot dead (row hidden from all future snapshots).
-    /// - `UndoDelete`: clears `txn_id_deleted` (row is live again).
-    ///
-    /// Does **not** advance `max_committed`.
-    ///
-    /// # Errors
-    /// - [`DbError::NoActiveTransaction`] if no transaction is open.
-    /// - I/O errors from undo writes or WAL append.
+    /// Applies undo operations in **reverse chronological order** and removes
+    /// the transaction from the active set.
     pub fn rollback(
-        &mut self,
+        &self,
         mut conn_txn: ConnectionTxn,
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
     ) -> Result<(), DbError> {
         let txn_id = conn_txn.txn_id;
 
@@ -192,13 +159,10 @@ impl TxnManager {
         self.wal.append(&mut entry)?;
 
         // Phase 40.9: return pre-allocated-but-unused pages to the bitmap.
-        // The freed list is dropped: the undo restores the rows → pages in use.
         let avail = conn_txn.local_page_batch.take_for_rollback();
         if !avail.is_empty() {
             storage.free_page_batch(&avail)?;
         }
-
-        // Deferred-free pages are discarded with conn_txn (catalog undo restores old roots).
 
         // Apply undo ops in reverse (last DML first).
         for op in conn_txn.undo_ops.into_iter().rev() {
@@ -313,10 +277,12 @@ impl TxnManager {
             self.lowest_active_id.store(new_lowest, Ordering::Relaxed);
         }
 
-        // Propagate the post-undo clustered roots back to TxnManager so that
-        // subsequent calls to `clustered_root()` return the correct (restored) root.
-        for (table_id, root_pid) in conn_txn.clustered_roots {
-            self.last_clustered_roots.insert(table_id, root_pid);
+        // Propagate the post-undo clustered roots back to TxnManager.
+        {
+            let mut roots = self.last_clustered_roots.lock().unwrap();
+            for (table_id, root_pid) in conn_txn.clustered_roots {
+                roots.insert(table_id, root_pid);
+            }
         }
 
         Ok(())

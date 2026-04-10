@@ -55,8 +55,8 @@ struct PendingRebuild {
 }
 
 pub fn verify_and_repair_indexes_on_open(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
 ) -> Result<IndexIntegrityReport, DbError> {
     let snapshot = txn.snapshot();
     let tables = list_visible_tables(storage, snapshot.clone())?;
@@ -228,8 +228,8 @@ pub fn verify_and_repair_indexes_on_open(
 }
 
 fn apply_pending_rebuilds(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     pending: &[PendingRebuild],
 ) -> Result<(), DbError> {
     // The rebuilt B+Tree pages are written directly into the mmap-backed data
@@ -274,7 +274,7 @@ fn apply_pending_rebuilds(
     Ok(())
 }
 
-fn cleanup_pending_new_roots(storage: &mut dyn StorageEngine, pending: &[PendingRebuild]) {
+fn cleanup_pending_new_roots(storage: &dyn StorageEngine, pending: &[PendingRebuild]) {
     for rebuild in pending {
         if rebuild.new_root != rebuild.old_root {
             let _ = free_btree_pages(storage, rebuild.new_root);
@@ -325,7 +325,7 @@ fn expected_entries_for_index(
 }
 
 fn actual_entries_for_index(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     table_def: &TableDef,
     idx: &IndexDef,
 ) -> Result<Vec<IndexEntry>, DbError> {
@@ -391,7 +391,7 @@ fn expected_clustered_secondary_entries(
 /// `ClusteredSecondaryLayout::insert_row` for every row that passes the
 /// partial-index predicate (if any) and has non-NULL secondary columns.
 fn build_clustered_secondary_from_scan(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     layout: &ClusteredSecondaryLayout,
     idx: &IndexDef,
     compiled_pred: Option<&crate::expr::Expr>,

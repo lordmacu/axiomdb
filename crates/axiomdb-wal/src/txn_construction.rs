@@ -8,17 +8,14 @@ impl TxnManager {
         let wal = ConcurrentWalWriter::create(wal_path)?;
         Ok(Self {
             wal,
-            next_txn_id: 1,
+            next_txn_id: AtomicU64::new(1),
             max_committed: AtomicU64::new(0),
             active_set: RwLock::new(HashSet::new()),
             lowest_active_id: AtomicU64::new(0),
             deferred_commit_mode: false,
-            committed_free_batches: Vec::new(),
-            committed_steal_protection: Vec::new(),
-            committed_recycle_pages: Vec::new(),
+            post_commit: Mutex::new(PostCommitBatches::default()),
             durability_policy: WalDurabilityPolicy::Strict,
-            last_clustered_roots: HashMap::new(),
-            pending_deferred_txn_id: None,
+            last_clustered_roots: Mutex::new(HashMap::new()),
         })
     }
 
@@ -33,18 +30,25 @@ impl TxnManager {
         let wal = ConcurrentWalWriter::open(wal_path)?;
         Ok(Self {
             wal,
-            next_txn_id: max_committed + 1,
+            next_txn_id: AtomicU64::new(max_committed + 1),
             max_committed: AtomicU64::new(max_committed),
             active_set: RwLock::new(HashSet::new()),
             lowest_active_id: AtomicU64::new(0),
             deferred_commit_mode: false,
-            committed_free_batches: Vec::new(),
-            committed_steal_protection: Vec::new(),
-            committed_recycle_pages: Vec::new(),
+            post_commit: Mutex::new(PostCommitBatches::default()),
             durability_policy: WalDurabilityPolicy::Strict,
-            last_clustered_roots: clustered_roots,
-            pending_deferred_txn_id: None,
+            last_clustered_roots: Mutex::new(clustered_roots),
         })
     }
 
+    /// Sets the WAL durability policy. Must be called before any transactions.
+    pub fn set_durability_policy(&mut self, policy: WalDurabilityPolicy) {
+        self.durability_policy = policy;
+    }
+
+    /// Enables or disables deferred commit mode for the server-side fsync pipeline.
+    /// Must be called before any transactions.
+    pub fn set_deferred_commit_mode(&mut self, enabled: bool) {
+        self.deferred_commit_mode = enabled;
+    }
 }

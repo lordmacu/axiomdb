@@ -318,7 +318,7 @@ pub(super) fn choose_balanced_boundary(footprints: &[usize]) -> usize {
 }
 
 pub(super) fn materialize_leaf_cell(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     batch: Option<&mut LocalPageBatch>,
     key: &[u8],
     row_header: &RowHeader,
@@ -437,7 +437,7 @@ pub(super) fn clustered_page_type(page: &Page) -> Result<PageType, DbError> {
 }
 
 pub(super) fn write_page(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     pid: u64,
     page: &mut Page,
 ) -> Result<(), DbError> {

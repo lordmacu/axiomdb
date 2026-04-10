@@ -3,10 +3,10 @@
     reason = "clustered insert secondary maintenance naturally needs executor state plus index metadata"
 )]
 fn maintain_clustered_secondary_inserts(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
     table_root_page_id: u64,
     secondary_indexes: &mut [IndexDef],
     secondary_layouts: &[crate::clustered_secondary::ClusteredSecondaryLayout],
@@ -140,7 +140,7 @@ pub(crate) fn resolve_expr_defaults(
 }
 
 fn assign_auto_increment(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     txn: &TxnManager,
     conn_txn: &ConnectionTxn,
     table_def: &axiomdb_catalog::schema::TableDef,

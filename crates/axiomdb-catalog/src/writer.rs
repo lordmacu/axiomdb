@@ -86,8 +86,8 @@ pub const SYSTEM_TABLE_SCHEMAS: u32 = u32::MAX - 8;
 ///
 /// [`with_notifier`]: CatalogWriter::with_notifier
 pub struct CatalogWriter<'a> {
-    storage: &'a mut dyn StorageEngine,
-    txn: &'a mut TxnManager,
+    storage: &'a dyn StorageEngine,
+    txn: &'a TxnManager,
     conn: &'a mut ConnectionTxn,
     page_ids: CatalogPageIds,
     notifier: Option<Arc<CatalogChangeNotifier>>,
@@ -99,8 +99,8 @@ impl<'a> CatalogWriter<'a> {
     /// # Errors
     /// - [`DbError::CatalogNotInitialized`] if [`CatalogBootstrap::init`] has not been called.
     pub fn new(
-        storage: &'a mut dyn StorageEngine,
-        txn: &'a mut TxnManager,
+        storage: &'a dyn StorageEngine,
+        txn: &'a TxnManager,
         conn: &'a mut ConnectionTxn,
     ) -> Result<Self, DbError> {
         let page_ids = CatalogBootstrap::ensure_database_roots(storage)?;

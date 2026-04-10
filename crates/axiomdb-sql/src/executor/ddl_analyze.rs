@@ -7,8 +7,8 @@ fn execute_analyze(
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut.
-    let storage = unsafe { exec_ctx.storage_mut() };
-    let txn = unsafe { exec_ctx.coord_mut() };
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
     let schema = "public";
     let database = ctx.effective_database().to_string();
     let snap = txn.active_snapshot(ctx.conn_txn.as_ref().expect("conn_txn for analyze"));
@@ -91,8 +91,8 @@ fn execute_analyze(
 
 fn execute_truncate(
     stmt: crate::ast::TruncateTableStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     database: &str,
 ) -> Result<QueryResult, DbError> {
@@ -129,13 +129,13 @@ fn execute_truncate(
         .collect();
 
     // Bulk-empty via root rotation (Phase 5.16): correct for indexed tables.
-    let mut noop_bloom = crate::bloom::BloomRegistry::new();
+    let noop_bloom = crate::bloom::BloomRegistry::new();
     let plan = if resolved.def.is_clustered() {
         plan_bulk_empty_clustered_table(storage, &resolved.def, &all_indexes, snap.clone())?
     } else {
         plan_bulk_empty_table(storage, &resolved.def, &all_indexes, snap)?
     };
-    apply_bulk_empty_table(storage, txn, conn_txn, &mut noop_bloom, &resolved.def, plan)?;
+    apply_bulk_empty_table(storage, txn, conn_txn, &noop_bloom, &resolved.def, plan)?;
 
     // Reset the AUTO_INCREMENT sequence so the next insert starts from 1.
     AUTO_INC_SEQ.with(|seq| {

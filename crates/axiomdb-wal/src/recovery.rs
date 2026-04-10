@@ -581,10 +581,10 @@ mod tests {
     fn test_is_needed_false_after_clean_commit() {
         let (_dir, wal) = temp_setup();
         let storage = MemoryStorage::new();
-        let mut mgr = TxnManager::create(&wal).unwrap();
+        let mgr = TxnManager::create(&wal).unwrap();
 
         let conn = mgr.begin().unwrap();
-        mgr.commit(conn).unwrap();
+        let _ = mgr.commit(conn).unwrap();
 
         assert!(!CrashRecovery::is_needed(&storage, &wal).unwrap());
     }
@@ -593,7 +593,7 @@ mod tests {
     fn test_is_needed_true_after_crash() {
         let (_dir, wal) = temp_setup();
         let storage = MemoryStorage::new();
-        let mut mgr = TxnManager::create(&wal).unwrap();
+        let mgr = TxnManager::create(&wal).unwrap();
 
         let _conn = mgr.begin().unwrap();
         // Simulate crash: no commit
@@ -627,12 +627,12 @@ mod tests {
     fn test_recover_max_committed_from_wal() {
         let (_dir, wal) = temp_setup();
         let mut storage = MemoryStorage::new();
-        let mut mgr = TxnManager::create(&wal).unwrap();
+        let mgr = TxnManager::create(&wal).unwrap();
 
         let conn1 = mgr.begin().unwrap(); // txn 1
-        mgr.commit(conn1).unwrap();
+        let _ = mgr.commit(conn1).unwrap();
         let conn2 = mgr.begin().unwrap(); // txn 2
-        mgr.commit(conn2).unwrap();
+        let _ = mgr.commit(conn2).unwrap();
 
         let result = CrashRecovery::recover(&mut storage, &wal).unwrap();
         assert_eq!(result.max_committed, 2);
@@ -646,7 +646,7 @@ mod tests {
         let (_dir, wal) = temp_setup();
         let mut storage = MemoryStorage::new();
         let page_id = fresh_data_page(&mut storage);
-        let mut mgr = TxnManager::create(&wal).unwrap();
+        let mgr = TxnManager::create(&wal).unwrap();
 
         let mut conn = mgr.begin().unwrap();
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
@@ -676,7 +676,7 @@ mod tests {
         let (_dir, wal) = temp_setup();
         let mut storage = MemoryStorage::new();
         let page_id = fresh_data_page(&mut storage);
-        let mut mgr = TxnManager::create(&wal).unwrap();
+        let mgr = TxnManager::create(&wal).unwrap();
 
         // Commit an INSERT (txn 1).
         let mut conn1 = mgr.begin().unwrap();
@@ -686,7 +686,7 @@ mod tests {
         storage.write_page(page_id, &page).unwrap();
         mgr.record_insert(&mut conn1, 1, b"k", b"row", page_id, slot_id)
             .unwrap();
-        mgr.commit(conn1).unwrap();
+        let _ = mgr.commit(conn1).unwrap();
 
         // Crash during DELETE (txn 2).
         let mut conn2 = mgr.begin().unwrap();
@@ -715,7 +715,7 @@ mod tests {
         let (_dir, wal) = temp_setup();
         let mut storage = MemoryStorage::new();
         let page_id = fresh_data_page(&mut storage);
-        let mut mgr = TxnManager::create(&wal).unwrap();
+        let mgr = TxnManager::create(&wal).unwrap();
 
         // Commit original row (txn 1).
         let mut conn1 = mgr.begin().unwrap();
@@ -725,7 +725,7 @@ mod tests {
         storage.write_page(page_id, &page).unwrap();
         mgr.record_insert(&mut conn1, 1, b"k", b"original", page_id, old_slot)
             .unwrap();
-        mgr.commit(conn1).unwrap();
+        let _ = mgr.commit(conn1).unwrap();
 
         // Crash during UPDATE (txn 2).
         let mut conn2 = mgr.begin().unwrap();
@@ -770,7 +770,7 @@ mod tests {
         let (_dir, wal) = temp_setup();
         let mut storage = MemoryStorage::new();
         let page_id = fresh_data_page(&mut storage);
-        let mut mgr = TxnManager::create(&wal).unwrap();
+        let mgr = TxnManager::create(&wal).unwrap();
 
         let mut conn1 = mgr.begin().unwrap();
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
@@ -779,7 +779,7 @@ mod tests {
         storage.write_page(page_id, &page).unwrap();
         mgr.record_insert(&mut conn1, 1, b"k", b"original", page_id, slot_id)
             .unwrap();
-        mgr.commit(conn1).unwrap();
+        let _ = mgr.commit(conn1).unwrap();
 
         let mut conn2 = mgr.begin().unwrap();
         {
@@ -814,7 +814,7 @@ mod tests {
         let (_dir, wal) = temp_setup();
         let mut storage = MemoryStorage::new();
         let page_id = fresh_data_page(&mut storage);
-        let mut mgr = TxnManager::create(&wal).unwrap();
+        let mgr = TxnManager::create(&wal).unwrap();
 
         let mut conn = mgr.begin().unwrap();
         let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
@@ -841,7 +841,7 @@ mod tests {
         let (_dir, wal) = temp_setup();
         let mut storage = MemoryStorage::new();
         let page_id = fresh_data_page(&mut storage);
-        let mut mgr = TxnManager::create(&wal).unwrap();
+        let mgr = TxnManager::create(&wal).unwrap();
 
         // Commit a row to delete later.
         let mut conn1 = mgr.begin().unwrap();
@@ -851,7 +851,7 @@ mod tests {
         storage.write_page(page_id, &page).unwrap();
         mgr.record_insert(&mut conn1, 1, b"d", b"deleteme", page_id, del_slot)
             .unwrap();
-        mgr.commit(conn1).unwrap();
+        let _ = mgr.commit(conn1).unwrap();
 
         // Crash during txn2: INSERT row1, DELETE del_slot.
         let mut conn2 = mgr.begin().unwrap();
@@ -889,8 +889,8 @@ mod tests {
 
         // Commit txn 1, then checkpoint.
         let conn1 = mgr.begin().unwrap();
-        mgr.commit(conn1).unwrap();
-        mgr.rotate_wal(&mut storage, &wal).unwrap(); // checkpoint embedded in rotation
+        let _ = mgr.commit(conn1).unwrap();
+        mgr.rotate_wal(&storage, &wal).unwrap(); // checkpoint embedded in rotation
 
         // Crash txn 2 (in new WAL segment after rotation).
         let _conn2 = mgr.begin().unwrap();
@@ -907,11 +907,11 @@ mod tests {
     fn test_open_with_recovery_initializes_txn_manager() {
         let (_dir, wal) = temp_setup();
         let mut storage = MemoryStorage::new();
-        let mut mgr = TxnManager::create(&wal).unwrap();
+        let mgr = TxnManager::create(&wal).unwrap();
 
         // Commit txn 1.
         let conn1 = mgr.begin().unwrap();
-        mgr.commit(conn1).unwrap();
+        let _ = mgr.commit(conn1).unwrap();
         // Crash txn 2.
         let _conn2 = mgr.begin().unwrap();
         drop(mgr);
@@ -934,7 +934,7 @@ mod tests {
         // Session 1: insert a row, crash before commit.
         let crashed_slot = {
             let storage = MmapStorage::create(&db_path).unwrap();
-            let mut mgr = TxnManager::create(&wal_path).unwrap();
+            let mgr = TxnManager::create(&wal_path).unwrap();
 
             let page_id = storage.alloc_page(PageType::Data).unwrap();
             let mut conn = mgr.begin().unwrap();
@@ -947,7 +947,7 @@ mod tests {
                 .unwrap();
             // Flush WAL buffer to OS (simulates kernel flushing on process exit).
             // Not fsynced — a real crash would not guarantee durability.
-            mgr.wal_mut().flush_buffer().unwrap();
+            mgr.wal().flush_buffer().unwrap();
             drop(mgr);
             (page_id, slot_id)
         };
@@ -986,14 +986,14 @@ mod tests {
         let init_page = Page::new(PageType::Data, root_page_id);
         storage.write_page(root_page_id, &init_page).unwrap();
 
-        let mut mgr = TxnManager::create(&wal).unwrap();
+        let mgr = TxnManager::create(&wal).unwrap();
 
         // Txn 1: insert 5 rows + commit.
         let conn1 = mgr.begin().unwrap();
         for i in 0u8..5 {
             HeapChain::insert(&mut storage, root_page_id, &[i; 8], conn1.txn_id, None).unwrap();
         }
-        mgr.commit(conn1).unwrap();
+        let _ = mgr.commit(conn1).unwrap();
 
         // Txn 2: delete_batch + record_truncate — then CRASH (no commit).
         let mut conn2 = mgr.begin().unwrap();
@@ -1002,7 +1002,7 @@ mod tests {
         HeapChain::delete_batch(&mut storage, root_page_id, &raw_rids, conn2.txn_id).unwrap();
         mgr.record_truncate(&mut conn2, 1, root_page_id).unwrap();
         // Flush WAL buffer to disk (simulate kernel flush on crash).
-        mgr.wal_mut().flush_buffer().unwrap();
+        mgr.wal().flush_buffer().unwrap();
         drop(mgr); // crash — no commit
 
         // Recovery must undo the truncate.

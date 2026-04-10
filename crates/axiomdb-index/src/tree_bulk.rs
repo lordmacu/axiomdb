@@ -18,7 +18,7 @@ impl BTree {
     /// # Errors
     /// - `DbError::StorageFull` if page allocation fails.
     pub fn bulk_load_sorted(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         old_root_pid: u64,
         entries: &[(&[u8], RecordId)],
         fillfactor: u8,
@@ -156,7 +156,7 @@ impl BTree {
     /// This is O(N + tree_height) instead of the O(N * log N) cost of N
     /// individual `delete_in` calls.
     pub fn delete_many_in(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_pid: &AtomicU64,
         sorted_keys: &[Vec<u8>],
     ) -> Result<usize, DbError> {
@@ -174,7 +174,7 @@ impl BTree {
     }
 
     fn batch_delete_subtree(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         pid: u64,
         sorted_keys: &[Vec<u8>],
         is_root: bool,
@@ -199,7 +199,7 @@ impl BTree {
     /// Merge-delete pass on a single leaf: remove all `sorted_keys` that
     /// appear in the leaf in one linear scan. Writes the compacted leaf once.
     fn batch_delete_leaf(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         pid: u64,
         node: LeafNodePage,
         sorted_keys: &[Vec<u8>],
@@ -269,7 +269,7 @@ impl BTree {
     /// affected child, then normalize the parent (update pointers + rebalance
     /// any underfull children) with a single parent write.
     fn batch_delete_internal(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         pid: u64,
         node: InternalNodePage,
         sorted_keys: &[Vec<u8>],

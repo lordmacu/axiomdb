@@ -10,8 +10,8 @@
 /// **Ordering for DROP COLUMN**: call this BEFORE updating the catalog so that
 /// if the rewrite fails the catalog is still consistent with the existing rows.
 fn rewrite_rows(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_def: &axiomdb_catalog::schema::TableDef,
     old_columns: &[axiomdb_catalog::schema::ColumnDef],
@@ -46,8 +46,8 @@ fn rewrite_rows(
 /// The PK never changes — ADD COLUMN and DROP COLUMN only affect non-key columns.
 /// Secondary indexes whose columns are not affected remain valid after the rewrite.
 fn rewrite_rows_clustered(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_def: &axiomdb_catalog::schema::TableDef,
     old_columns: &[axiomdb_catalog::schema::ColumnDef],
@@ -153,8 +153,8 @@ type AlterMetadata = (
 );
 
 fn load_alter_metadata(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_id: u32,
 ) -> Result<AlterMetadata, DbError> {
@@ -169,8 +169,8 @@ fn load_alter_metadata(
 }
 
 fn replace_table_columns(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_id: u32,
     old_columns: &[axiomdb_catalog::schema::ColumnDef],
@@ -330,7 +330,7 @@ fn remap_parent_fk_after_drop(
     }
 }
 
-fn cleanup_rebuilt_index_roots(storage: &mut dyn StorageEngine, roots: &[u64]) {
+fn cleanup_rebuilt_index_roots(storage: &dyn StorageEngine, roots: &[u64]) {
     let mut seen = std::collections::HashSet::new();
     for &root in roots {
         if seen.insert(root) {
@@ -341,8 +341,8 @@ fn cleanup_rebuilt_index_roots(storage: &mut dyn StorageEngine, roots: &[u64]) {
 
 fn execute_alter_table(
     stmt: AlterTableStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     database: &str,
 ) -> Result<QueryResult, DbError> {
@@ -531,8 +531,8 @@ fn execute_alter_table(
 }
 
 fn alter_add_column(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_def: &axiomdb_catalog::schema::TableDef,
     columns: &mut Vec<axiomdb_catalog::schema::ColumnDef>,
@@ -622,8 +622,8 @@ fn alter_add_column(
 }
 
 fn alter_drop_column(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_def: &axiomdb_catalog::schema::TableDef,
     columns: &mut Vec<axiomdb_catalog::schema::ColumnDef>,
@@ -807,8 +807,8 @@ fn alter_drop_column(
 /// Rewrites all rows in the table to coerce the target column to the new type,
 /// then repairs secondary indexes according to the table layout.
 fn alter_modify_column(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_def: &axiomdb_catalog::schema::TableDef,
     columns: &mut Vec<axiomdb_catalog::schema::ColumnDef>,
@@ -974,8 +974,8 @@ fn alter_modify_column(
 }
 
 fn alter_rename_column(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_def: &axiomdb_catalog::schema::TableDef,
     columns: &[axiomdb_catalog::schema::ColumnDef],
@@ -1010,8 +1010,8 @@ fn alter_rename_column(
 }
 
 fn alter_rename_table(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_def: &axiomdb_catalog::schema::TableDef,
     new_name: &str,
@@ -1041,8 +1041,8 @@ fn alter_rename_table(
 
 /// Renames an index: update the name field in the catalog row.
 fn alter_rename_index(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_id: u32,
     old_name: &str,
@@ -1062,8 +1062,8 @@ fn alter_rename_index(
 
 /// Creates an index for ALTER TABLE ADD INDEX / ADD UNIQUE INDEX.
 fn alter_add_index(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_def: &axiomdb_catalog::resolver::ResolvedTable,
     col_names: &[String],
@@ -1100,14 +1100,14 @@ fn alter_add_index(
         index_type: IndexType::BTree,
         pages_per_range: None,
     };
-    let mut noop_bloom = crate::bloom::BloomRegistry::new();
-    execute_create_index(stmt, storage, txn, conn_txn, &mut noop_bloom, database).map(|_| ())
+    let noop_bloom = crate::bloom::BloomRegistry::new();
+    execute_create_index(stmt, storage, txn, conn_txn, &noop_bloom, database).map(|_| ())
 }
 
 /// Drops an index by name for ALTER TABLE DROP INDEX.
 fn alter_drop_index(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_id: u32,
     name: &str,

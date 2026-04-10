@@ -43,7 +43,7 @@ fn test_database_open_fails_for_unreadable_unique_index() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     {
-        let mut db = Database::open(dir.path()).expect("open server db");
+        let db = Database::open(dir.path()).expect("open server db");
         let mut session = SessionContext::new();
         let mut cache = SchemaCache::new();
         db.execute_query(

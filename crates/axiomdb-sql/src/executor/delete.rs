@@ -5,9 +5,9 @@ fn execute_delete_ctx(
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
-    let storage = unsafe { exec_ctx.storage_mut() };
-    let txn = unsafe { exec_ctx.coord_mut() };
-    let bloom = unsafe { exec_ctx.bloom_mut() };
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
+    let bloom = exec_ctx.bloom();
     let resolved = resolve_table_cached(
         storage,
         txn,
@@ -165,12 +165,12 @@ fn execute_clustered_delete(
     limit: Option<&Expr>,
     schema_cols: &[axiomdb_catalog::schema::ColumnDef],
     secondary_indexes: &[axiomdb_catalog::IndexDef],
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     snap: axiomdb_core::TransactionSnapshot,
     resolved: &axiomdb_catalog::ResolvedTable,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     let root_pid = txn
@@ -416,8 +416,8 @@ fn clustered_rows_for_secondary_delete_access(
 /// ALL visible cells as deleted. Zero row decode — only modifies RowHeader.
 /// One page read+write per leaf page (batch).
 fn delete_mark_all_clustered_leaves(
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     table_id: u32,
     root_pid: u64,
@@ -651,7 +651,7 @@ fn collect_delete_candidates(
     _indexes: &[axiomdb_catalog::IndexDef],
     schema_cols: &[axiomdb_catalog::schema::ColumnDef],
     access: &crate::planner::AccessMethod,
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     snap: axiomdb_core::TransactionSnapshot,
     table_def: &axiomdb_catalog::TableDef,
     bloom: &crate::bloom::BloomRegistry,
@@ -764,8 +764,8 @@ fn collect_delete_candidates(
 
 fn execute_delete(
     stmt: DeleteStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
 ) -> Result<QueryResult, DbError> {
     let resolved = {
@@ -784,7 +784,7 @@ fn execute_delete(
         .collect();
 
     // No-op bloom for the non-ctx path (bloom is managed by execute_with_ctx callers).
-    let mut noop_bloom = crate::bloom::BloomRegistry::new();
+    let noop_bloom = crate::bloom::BloomRegistry::new();
 
     let snap = txn.active_snapshot(conn_txn);
     if resolved.def.is_clustered() {
@@ -800,7 +800,7 @@ fn execute_delete(
             conn_txn,
             snap,
             &resolved,
-            &mut noop_bloom,
+            &noop_bloom,
             &mut temp_ctx,
         );
     }
@@ -820,7 +820,7 @@ fn execute_delete(
     if stmt.where_clause.is_none() && !has_fk_references && !has_order_limit {
         let plan = plan_bulk_empty_table(storage, &resolved.def, &secondary_indexes, snap)?;
         let count = plan.visible_row_count;
-        apply_bulk_empty_table(storage, txn, conn_txn, &mut noop_bloom, &resolved.def, plan)?;
+        apply_bulk_empty_table(storage, txn, conn_txn, &noop_bloom, &resolved.def, plan)?;
         return Ok(QueryResult::Affected {
             count,
             last_insert_id: None,

@@ -86,7 +86,7 @@ impl CatalogBootstrap {
     /// existing [`CatalogPageIds`] without allocating new pages.
     ///
     /// Flushes storage after writing to guarantee durability.
-    pub fn init(storage: &mut dyn StorageEngine) -> Result<CatalogPageIds, DbError> {
+    pub fn init(storage: &dyn StorageEngine) -> Result<CatalogPageIds, DbError> {
         if Self::is_initialized(storage)? {
             return Self::ensure_database_roots(storage);
         }
@@ -222,9 +222,7 @@ impl CatalogBootstrap {
     ///
     /// Used when opening a legacy database created before databases became
     /// first-class catalog objects. Idempotent.
-    pub fn ensure_database_roots(
-        storage: &mut dyn StorageEngine,
-    ) -> Result<CatalogPageIds, DbError> {
+    pub fn ensure_database_roots(storage: &dyn StorageEngine) -> Result<CatalogPageIds, DbError> {
         let mut ids = Self::page_ids(storage)?;
 
         if ids.databases == 0 {
@@ -279,7 +277,7 @@ impl CatalogBootstrap {
     /// 0. This method allocates and persists it on first call. Idempotent.
     ///
     /// Returns the (possibly newly allocated) constraints root page ID.
-    pub fn ensure_constraints_root(storage: &mut dyn StorageEngine) -> Result<u64, DbError> {
+    pub fn ensure_constraints_root(storage: &dyn StorageEngine) -> Result<u64, DbError> {
         let root = read_meta_u64(storage, CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET)?;
         if root != 0 {
             return Ok(root);
@@ -295,7 +293,7 @@ impl CatalogBootstrap {
     /// Ensures the `axiom_stats` root page exists (Phase 6.10).
     ///
     /// Lazily initialized on first write. Pre-6.10 databases return empty stats.
-    pub fn ensure_stats_root(storage: &mut dyn StorageEngine) -> Result<u64, DbError> {
+    pub fn ensure_stats_root(storage: &dyn StorageEngine) -> Result<u64, DbError> {
         let root = read_meta_u64(storage, CATALOG_STATS_ROOT_BODY_OFFSET)?;
         if root != 0 {
             return Ok(root);
@@ -314,7 +312,7 @@ impl CatalogBootstrap {
     /// This method allocates and persists it on first call. Idempotent.
     ///
     /// Returns the (possibly newly allocated) FK root page ID.
-    pub fn ensure_fk_root(storage: &mut dyn StorageEngine) -> Result<u64, DbError> {
+    pub fn ensure_fk_root(storage: &dyn StorageEngine) -> Result<u64, DbError> {
         let root = read_meta_u64(storage, CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET)?;
         if root != 0 {
             return Ok(root);

@@ -30,7 +30,7 @@ impl HeapChain {
     /// if the i-th row has a zone-mappable numeric value. The zone map is updated
     /// in the page header BEFORE the checksum is computed.
     pub fn insert_batch(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: u64,
         rows: &[Vec<u8>],
         txn_id: TxnId,
@@ -40,7 +40,7 @@ impl HeapChain {
 
     /// Core batch insert implementation with zone map support.
     pub fn insert_batch_with_zm(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: u64,
         rows: &[Vec<u8>],
         txn_id: TxnId,
@@ -133,7 +133,7 @@ impl HeapChain {
     /// # Errors
     /// - I/O errors from storage reads/writes.
     pub fn clear_deletions_by_txn(
-        storage: &mut dyn StorageEngine,
+        storage: &dyn StorageEngine,
         root_page_id: u64,
         txn_id: TxnId,
     ) -> Result<(), DbError> {

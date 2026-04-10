@@ -7,8 +7,8 @@ impl TableEngine {
     /// `row_num` is 1-based and statement-local — used in the warning message so
     /// multi-row `INSERT VALUES` callers can pass the loop counter.
     pub fn insert_row_with_ctx(
-        storage: &mut dyn StorageEngine,
-        txn: &mut TxnManager,
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
         table_def: &TableDef,
         columns: &[ColumnDef],
         ctx: &mut SessionContext,
@@ -64,8 +64,8 @@ impl TableEngine {
     /// Session-aware batch insert: applies strict or permissive coercion per row,
     /// emitting warning 1265 (with 1-based row numbers) on permissive fallback.
     pub fn insert_rows_batch_with_ctx(
-        storage: &mut dyn StorageEngine,
-        txn: &mut TxnManager,
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
         table_def: &TableDef,
         columns: &[ColumnDef],
         ctx: &mut SessionContext,
@@ -156,8 +156,8 @@ impl TableEngine {
     /// Session-aware single-row update: applies strict or permissive coercion,
     /// emitting warning 1265 on permissive fallback.
     pub fn update_row_with_ctx(
-        storage: &mut dyn StorageEngine,
-        txn: &mut TxnManager,
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
         table_def: &TableDef,
         columns: &[ColumnDef],
         ctx: &mut SessionContext,
@@ -197,8 +197,8 @@ impl TableEngine {
     /// Session-aware batch update: applies strict or permissive coercion per row
     /// (1-based row numbers for warning messages).
     pub fn update_rows_batch_with_ctx(
-        storage: &mut dyn StorageEngine,
-        txn: &mut TxnManager,
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
         table_def: &TableDef,
         columns: &[ColumnDef],
         ctx: &mut SessionContext,
@@ -271,8 +271,8 @@ impl TableEngine {
     ///
     /// The returned vector is parallel to `updates`.
     pub fn update_rows_preserve_rid(
-        storage: &mut dyn StorageEngine,
-        txn: &mut TxnManager,
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
         conn_txn: &mut axiomdb_wal::ConnectionTxn,
         table_def: &TableDef,
         columns: &[ColumnDef],
@@ -306,8 +306,8 @@ impl TableEngine {
     /// Uses the same preserve-RID fast path as [`update_rows_preserve_rid`], but
     /// applies strict/permissive coercion with warning emission through `ctx`.
     pub fn update_rows_preserve_rid_with_ctx(
-        storage: &mut dyn StorageEngine,
-        txn: &mut TxnManager,
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
         conn_txn: &mut axiomdb_wal::ConnectionTxn,
         table_def: &TableDef,
         columns: &[ColumnDef],

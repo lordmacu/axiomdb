@@ -2,7 +2,8 @@
 //!
 //! Tracks active snapshot IDs across all connections. Each connection gets a
 //! fixed slot (indexed by connection ID). Operations are lock-free using
-//! `AtomicU64` — no additional mutex beyond the existing `RwLock<Database>`.
+//! `AtomicU64` — no additional mutex beyond the subsystem-level
+//! synchronization inside `SharedDatabase`.
 //!
 //! ## Usage
 //!

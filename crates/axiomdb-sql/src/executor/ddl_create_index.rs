@@ -7,7 +7,7 @@ pub(crate) struct IndexBuildResult {
 }
 
 pub(crate) fn build_index_root_from_heap(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     table_def: &TableDef,
     col_defs: &[CatalogColumnDef],
     idx: &IndexDef,
@@ -60,7 +60,7 @@ pub(crate) fn build_index_root_from_heap(
 }
 
 pub(crate) fn build_index_root_from_existing_def(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     table_def: &TableDef,
     col_defs: &[CatalogColumnDef],
     idx: &IndexDef,
@@ -79,7 +79,7 @@ pub(crate) fn build_index_root_from_existing_def(
 }
 
 fn build_index_root_from_clustered(
-    storage: &mut dyn StorageEngine,
+    storage: &dyn StorageEngine,
     table_def: &TableDef,
     col_defs: &[CatalogColumnDef],
     idx: &IndexDef,
@@ -139,10 +139,10 @@ fn build_index_root_from_clustered(
 
 fn execute_create_index(
     stmt: CreateIndexStmt,
-    storage: &mut dyn StorageEngine,
-    txn: &mut TxnManager,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
-    bloom: &mut crate::bloom::BloomRegistry,
+    bloom: &crate::bloom::BloomRegistry,
     database: &str,
 ) -> Result<QueryResult, DbError> {
     use crate::key_encoding::{encode_index_key, MAX_INDEX_KEY};
