@@ -133,7 +133,9 @@ impl TxnManager {
         {
             let mut set = self.active_set.write().unwrap();
             if advance_now {
-                self.max_committed.store(txn_id, Ordering::Release);
+                // fetch_max: only advance, never regress. A lower txn_id
+                // committing after a higher one must not overwrite.
+                self.max_committed.fetch_max(txn_id, Ordering::Release);
             }
             set.remove(&txn_id);
             let new_lowest = set.iter().copied().min().unwrap_or(0);

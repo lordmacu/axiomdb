@@ -1447,7 +1447,7 @@
 - [x] 40.12 ✅ Integration Tests & Benchmarks — 8 new integration tests: concurrent INSERT different rows, concurrent UPDATE different rows, MVCC repeatable read (snapshot isolation within explicit txn), DELETE invisible during txn (MVCC), autocommit stress (4 clients × 50 INSERTs), rollback releases locks (Client A rollback → Client B succeeds), mixed workload stress (4 threads × 100 ops: INSERT/UPDATE/SELECT/DELETE), lock contention stress (4 threads × 50 updates on same 10 rows); total 2540 workspace tests passing; spec: `specs/fase-40/spec-40.12-integration-tests.md`
   - [ ] ⚠️ Wire protocol concurrent bench script (concurrent_bench.py) — deferred, requires server process + pymysql orchestration
   - [ ] ⚠️ Crash recovery under concurrency (Test 15) — deferred, requires kill -9 + restart orchestration
-  - [ ] ⚠️ Cross-session visibility after explicit txn COMMIT — `max_committed` may not advance immediately after an explicit txn commits if another txn's autocommit INSERT happened during the explicit txn. Snapshot isolation WITHIN explicit txns is correct; cross-session visibility is a WAL pipeline timing detail. InnoDB has similar behavior with `innodb_flush_log_at_trx_commit=2`
+  - [x] ⚠️ Cross-session visibility after explicit txn COMMIT — **FIXED**: `commit()` used `store()` instead of `fetch_max()` for `max_committed`, causing a lower txn_id to overwrite a higher one when transactions commit out of order. Fix: `self.max_committed.fetch_max(txn_id, Ordering::Release)`. MVCC tests now validate strict cross-session visibility with `assert_eq`
 
 ---
 
