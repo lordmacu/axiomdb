@@ -9,6 +9,7 @@ license.workspace = true
 axiomdb-core = { workspace = true }
 thiserror    = { workspace = true }
 lz4_flex     = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

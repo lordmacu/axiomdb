@@ -216,7 +216,13 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
                 buf.push(*s);
             }
             Value::Text(s) => {
-                let bytes = s.as_bytes();
+                // Phase 11.2e: NFC-normalize all Text before storage.
+                // 'café' (NFD: 6 bytes) and 'café' (NFC: 5 bytes) become identical,
+                // making '=' always correct for visually identical strings.
+                // DuckDB does this; no other OLTP database does.
+                use unicode_normalization::UnicodeNormalization;
+                let normalized: String = s.nfc().collect();
+                let bytes = normalized.as_bytes();
                 if bytes.len() > MAX_INLINE_LEN {
                     return Err(DbError::ValueTooLarge {
                         len: bytes.len(),

@@ -134,7 +134,52 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
         }
 
+        // Phase 11.2c: MIME_TYPE(blob_col) → detect content type from magic bytes.
+        "mime_type" => {
+            let arg = args.first().ok_or_else(|| DbError::TypeMismatch {
+                expected: "1 arg".into(),
+                got: "0".into(),
+            })?;
+            match crate::eval::eval(arg, row)? {
+                Value::Null => Ok(Value::Null),
+                Value::Bytes(b) => Ok(Value::Text(detect_mime_type(&b).to_string())),
+                Value::Text(s) => Ok(Value::Text(detect_mime_type(s.as_bytes()).to_string())),
+                _ => Ok(Value::Text("application/octet-stream".to_string())),
+            }
+        }
+
         _ => unreachable!("dispatcher routed unsupported binary function"),
+    }
+}
+
+/// Detects MIME type from the first bytes of a blob (magic byte signatures).
+///
+/// Covers the 10 most common binary formats. Returns `"application/octet-stream"`
+/// for unknown content. Zero-allocation (returns &str).
+fn detect_mime_type(bytes: &[u8]) -> &'static str {
+    if bytes.len() >= 4 && bytes[..4] == [0x89, 0x50, 0x4E, 0x47] {
+        "image/png"
+    } else if bytes.len() >= 3 && bytes[..3] == [0xFF, 0xD8, 0xFF] {
+        "image/jpeg"
+    } else if bytes.len() >= 4 && bytes[..4] == [0x47, 0x49, 0x46, 0x38] {
+        "image/gif"
+    } else if bytes.len() >= 12
+        && bytes[..4] == [0x52, 0x49, 0x46, 0x46]
+        && bytes[8..12] == [0x57, 0x45, 0x42, 0x50]
+    {
+        "image/webp"
+    } else if bytes.len() >= 4 && bytes[..4] == [0x25, 0x50, 0x44, 0x46] {
+        "application/pdf"
+    } else if bytes.len() >= 4 && bytes[..4] == [0x50, 0x4B, 0x03, 0x04] {
+        "application/zip"
+    } else if bytes.len() >= 2 && bytes[..2] == [0x1F, 0x8B] {
+        "application/gzip"
+    } else if bytes.first() == Some(&0x7B) {
+        "application/json"
+    } else if bytes.first() == Some(&0x3C) {
+        "text/xml"
+    } else {
+        "application/octet-stream"
     }
 }
 
