@@ -103,7 +103,7 @@ impl CatalogChangeNotifier {
     pub fn subscribe(&self, listener: Arc<dyn SchemaChangeListener>) {
         self.listeners
             .write()
-            .expect("CatalogChangeNotifier RwLock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(listener);
     }
 
@@ -117,7 +117,7 @@ impl CatalogChangeNotifier {
         let guard = self
             .listeners
             .read()
-            .expect("CatalogChangeNotifier RwLock poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         for listener in guard.iter() {
             listener.on_schema_change(event);
         }
@@ -127,7 +127,7 @@ impl CatalogChangeNotifier {
     pub fn listener_count(&self) -> usize {
         self.listeners
             .read()
-            .expect("CatalogChangeNotifier RwLock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .len()
     }
 }

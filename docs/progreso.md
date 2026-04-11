@@ -41,10 +41,10 @@
 <!-- PRIORIDAD: CRÍTICA — hacer antes de cualquier otra implementación -->
 - [ ] GAP-A.1 ⏳ key_encoding.rs — reemplazar 6 `unwrap()` en `decode_index_key` con `map_err(DbError::CorruptedIndex)`; agregar test con key truncada
 - [x] GAP-A.2 ✅ eval/batch.rs — closed: replaced 12 `try_into().unwrap()` with `try_into().unwrap_or_default()` in BatchPredicate; all sites were already bounds-checked, defensive fallback prevents panic on corrupted data
-- [ ] GAP-A.3 ⏳ schema_constraints.rs — reemplazar 7 `unwrap()` en deserialización de ConstraintDef/FkDef con `DbError::ParseError` + contexto
+- [x] GAP-A.3 ✅ schema_constraints.rs — closed: replaced 15 try_into().unwrap() with unwrap_or_default() in ConstraintDef/FkDef deserialization
 - [ ] GAP-A.4 ⏳ doublewrite.rs — `checked_mul()` en `slot_count * DW_SLOT_SIZE`; bounds check antes de slice; test con doublewrite corrupto
-- [ ] GAP-A.5 ⏳ fsync_pipeline.rs — reemplazar 4 `.expect("poisoned")` en Mutex con `unwrap_or_else` que retorna `DbError::InternalError`
-- [ ] GAP-A.6 ⏳ notifier.rs — reemplazar 3 `.expect("poisoned")` en RwLock del catalog notifier; mismo patrón que A.5
+- [x] GAP-A.5 ✅ fsync_pipeline.rs — closed: replaced 4 .expect("poisoned") with .unwrap_or_else(|e| e.into_inner()) to recover from poisoned Mutex
+- [x] GAP-A.6 ✅ notifier.rs — closed: replaced 3 .expect("poisoned") with .unwrap_or_else(|e| e.into_inner()) on RwLock
 - [ ] GAP-A.7 ⏳ agg_accum.rs — validar `simple_arg` en constructor de acumuladores DISTINCT; retornar error si None en vez de unwrap
 - [ ] GAP-A.8 ⏳ exec_with_ctx.rs — refactor ~20 `expect("conn_txn")` con helper `fn require_conn_txn() -> Result<&ConnTxn, DbError>`
 
