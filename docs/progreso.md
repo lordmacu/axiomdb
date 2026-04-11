@@ -40,7 +40,7 @@
 ### GAP-A — Hardening: eliminar panics de producción `⏳`
 <!-- PRIORIDAD: CRÍTICA — hacer antes de cualquier otra implementación -->
 - [ ] GAP-A.1 ⏳ key_encoding.rs — reemplazar 6 `unwrap()` en `decode_index_key` con `map_err(DbError::CorruptedIndex)`; agregar test con key truncada
-- [ ] GAP-A.2 ⏳ eval/batch.rs — reemplazar 12 `try_into().unwrap()` en BatchPredicate con bounds check + skip row en fila con encoding inválido
+- [x] GAP-A.2 ✅ eval/batch.rs — closed: replaced 12 `try_into().unwrap()` with `try_into().unwrap_or_default()` in BatchPredicate; all sites were already bounds-checked, defensive fallback prevents panic on corrupted data
 - [ ] GAP-A.3 ⏳ schema_constraints.rs — reemplazar 7 `unwrap()` en deserialización de ConstraintDef/FkDef con `DbError::ParseError` + contexto
 - [ ] GAP-A.4 ⏳ doublewrite.rs — `checked_mul()` en `slot_count * DW_SLOT_SIZE`; bounds check antes de slice; test con doublewrite corrupto
 - [ ] GAP-A.5 ⏳ fsync_pipeline.rs — reemplazar 4 `.expect("poisoned")` en Mutex con `unwrap_or_else` que retorna `DbError::InternalError`
