@@ -158,7 +158,7 @@ fn test_bulk_delete_savepoint_rollback_restores_data() {
         "inside txn after DELETE: must be empty"
     );
     // Rollback to savepoint — restores pre-delete state (items 1-5 + item6).
-    txn.rollback_to_savepoint(ctx.conn_txn.as_mut().expect("active txn"), sp, &mut storage)
+    txn.rollback_to_savepoint(ctx.conn_txn.as_mut().expect("active txn"), sp, &storage)
         .unwrap();
     let count = rows(
         run_ctx(

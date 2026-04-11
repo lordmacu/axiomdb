@@ -198,7 +198,7 @@ fn clustered_insert_reuses_committed_delete_marked_primary_key() {
     let delete_txn = txn.max_committed() + 1;
     let key = encode_index_key(&[Value::Int(1)]).unwrap();
     let deleted = clustered_tree::delete_mark(
-        &mut storage,
+        &storage,
         Some(table.root_page_id),
         &key,
         delete_txn,

@@ -36,14 +36,14 @@ fn test_table_engine_empty_scan() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("w.wal");
     let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    CatalogBootstrap::init(&storage).unwrap();
     let mut txn = TxnManager::create(&wal_path).unwrap();
 
     let columns = vec![col(0, "id", ColumnType::Int)];
     let table_def = create_table_helper(&mut storage, &mut txn, "t", &columns);
 
     let snap = txn.snapshot();
-    let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
+    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap, None).unwrap();
     assert!(rows.is_empty(), "fresh table must have 0 rows");
 }
 
@@ -52,7 +52,7 @@ fn test_table_engine_insert_and_scan() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("w.wal");
     let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    CatalogBootstrap::init(&storage).unwrap();
     let mut txn = TxnManager::create(&wal_path).unwrap();
 
     let columns = vec![
@@ -63,8 +63,8 @@ fn test_table_engine_insert_and_scan() {
 
     let mut conn_txn = txn.begin().unwrap();
     TableEngine::insert_row(
-        &mut storage,
-        &mut txn,
+        &storage,
+        &txn,
         &mut conn_txn,
         &table_def,
         &columns,
@@ -72,8 +72,8 @@ fn test_table_engine_insert_and_scan() {
     )
     .unwrap();
     TableEngine::insert_row(
-        &mut storage,
-        &mut txn,
+        &storage,
+        &txn,
         &mut conn_txn,
         &table_def,
         &columns,
@@ -81,8 +81,8 @@ fn test_table_engine_insert_and_scan() {
     )
     .unwrap();
     TableEngine::insert_row(
-        &mut storage,
-        &mut txn,
+        &storage,
+        &txn,
         &mut conn_txn,
         &table_def,
         &columns,
@@ -92,7 +92,7 @@ fn test_table_engine_insert_and_scan() {
     txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
-    let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
+    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap, None).unwrap();
     assert_eq!(rows.len(), 3);
 
     let names: Vec<&Value> = rows.iter().map(|(_, v)| &v[1]).collect();
@@ -106,7 +106,7 @@ fn test_table_engine_insert_mvcc_visibility() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("w.wal");
     let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    CatalogBootstrap::init(&storage).unwrap();
     let mut txn = TxnManager::create(&wal_path).unwrap();
 
     let columns = vec![col(0, "id", ColumnType::Int)];
@@ -117,8 +117,8 @@ fn test_table_engine_insert_mvcc_visibility() {
 
     let mut conn_txn = txn.begin().unwrap();
     TableEngine::insert_row(
-        &mut storage,
-        &mut txn,
+        &storage,
+        &txn,
         &mut conn_txn,
         &table_def,
         &columns,
@@ -129,13 +129,13 @@ fn test_table_engine_insert_mvcc_visibility() {
 
     // Old snapshot sees 0 rows.
     let rows_old =
-        TableEngine::scan_table(&mut storage, &table_def, &columns, snap_before, None).unwrap();
+        TableEngine::scan_table(&storage, &table_def, &columns, snap_before, None).unwrap();
     assert_eq!(rows_old.len(), 0, "snapshot before insert must see 0 rows");
 
     // Fresh snapshot sees 1 row.
     let snap_after = txn.snapshot();
     let rows_new =
-        TableEngine::scan_table(&mut storage, &table_def, &columns, snap_after, None).unwrap();
+        TableEngine::scan_table(&storage, &table_def, &columns, snap_after, None).unwrap();
     assert_eq!(rows_new.len(), 1);
     assert_eq!(rows_new[0].1[0], Value::Int(42));
 }
@@ -145,7 +145,7 @@ fn test_table_engine_delete_row() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("w.wal");
     let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    CatalogBootstrap::init(&storage).unwrap();
     let mut txn = TxnManager::create(&wal_path).unwrap();
 
     let columns = vec![col(0, "id", ColumnType::Int)];
@@ -154,8 +154,8 @@ fn test_table_engine_delete_row() {
     // Insert 2 rows.
     let mut conn_txn = txn.begin().unwrap();
     let rid1 = TableEngine::insert_row(
-        &mut storage,
-        &mut txn,
+        &storage,
+        &txn,
         &mut conn_txn,
         &table_def,
         &columns,
@@ -163,8 +163,8 @@ fn test_table_engine_delete_row() {
     )
     .unwrap();
     TableEngine::insert_row(
-        &mut storage,
-        &mut txn,
+        &storage,
+        &txn,
         &mut conn_txn,
         &table_def,
         &columns,
@@ -175,12 +175,12 @@ fn test_table_engine_delete_row() {
 
     // Delete row 1.
     let mut conn_txn = txn.begin().unwrap();
-    TableEngine::delete_row(&mut storage, &mut txn, &mut conn_txn, &table_def, rid1).unwrap();
+    TableEngine::delete_row(&storage, &txn, &mut conn_txn, &table_def, rid1).unwrap();
     txn.commit(conn_txn).unwrap();
 
     // Scan sees only row 2.
     let snap = txn.snapshot();
-    let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
+    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap, None).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].1[0], Value::Int(2));
 }
@@ -191,7 +191,7 @@ fn test_table_engine_delete_invalid_slot_error() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("w.wal");
     let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    CatalogBootstrap::init(&storage).unwrap();
     let mut txn = TxnManager::create(&wal_path).unwrap();
 
     let columns = vec![col(0, "id", ColumnType::Int)];
@@ -199,8 +199,8 @@ fn test_table_engine_delete_invalid_slot_error() {
 
     let mut conn_txn = txn.begin().unwrap();
     let rid = TableEngine::insert_row(
-        &mut storage,
-        &mut txn,
+        &storage,
+        &txn,
         &mut conn_txn,
         &table_def,
         &columns,
@@ -215,9 +215,9 @@ fn test_table_engine_delete_invalid_slot_error() {
         slot_id: 9999,
     };
     let mut conn_txn = txn.begin().unwrap();
-    let err = TableEngine::delete_row(&mut storage, &mut txn, &mut conn_txn, &table_def, bad_rid)
-        .unwrap_err();
-    txn.rollback(conn_txn, &mut storage).unwrap();
+    let err =
+        TableEngine::delete_row(&storage, &txn, &mut conn_txn, &table_def, bad_rid).unwrap_err();
+    txn.rollback(conn_txn, &storage).unwrap();
     assert!(
         matches!(err, axiomdb_core::error::DbError::InvalidSlot { .. }),
         "expected InvalidSlot for out-of-range slot, got {err:?}"
@@ -229,7 +229,7 @@ fn test_table_engine_update_row() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("w.wal");
     let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    CatalogBootstrap::init(&storage).unwrap();
     let mut txn = TxnManager::create(&wal_path).unwrap();
 
     let columns = vec![
@@ -240,8 +240,8 @@ fn test_table_engine_update_row() {
 
     let mut conn_txn = txn.begin().unwrap();
     let old_rid = TableEngine::insert_row(
-        &mut storage,
-        &mut txn,
+        &storage,
+        &txn,
         &mut conn_txn,
         &table_def,
         &columns,
@@ -253,8 +253,8 @@ fn test_table_engine_update_row() {
     // Update age from 30 to 31.
     let mut conn_txn = txn.begin().unwrap();
     let new_rid = TableEngine::update_row(
-        &mut storage,
-        &mut txn,
+        &storage,
+        &txn,
         &mut conn_txn,
         &table_def,
         &columns,
@@ -265,7 +265,7 @@ fn test_table_engine_update_row() {
     txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
-    let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
+    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap, None).unwrap();
     assert_eq!(
         rows.len(),
         1,
@@ -284,7 +284,7 @@ fn test_table_engine_update_changes_record_id() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("w.wal");
     let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    CatalogBootstrap::init(&storage).unwrap();
     let mut txn = TxnManager::create(&wal_path).unwrap();
 
     let columns = vec![col(0, "v", ColumnType::Int)];
@@ -292,8 +292,8 @@ fn test_table_engine_update_changes_record_id() {
 
     let mut conn_txn = txn.begin().unwrap();
     let old_rid = TableEngine::insert_row(
-        &mut storage,
-        &mut txn,
+        &storage,
+        &txn,
         &mut conn_txn,
         &table_def,
         &columns,
@@ -304,8 +304,8 @@ fn test_table_engine_update_changes_record_id() {
 
     let mut conn_txn = txn.begin().unwrap();
     let new_rid = TableEngine::update_row(
-        &mut storage,
-        &mut txn,
+        &storage,
+        &txn,
         &mut conn_txn,
         &table_def,
         &columns,
@@ -317,7 +317,7 @@ fn test_table_engine_update_changes_record_id() {
 
     // The new RecordId is valid and the value was updated.
     let snap = txn.snapshot();
-    let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
+    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap, None).unwrap();
     let rids: Vec<RecordId> = rows.iter().map(|(r, _)| *r).collect();
     assert!(
         rids.contains(&new_rid),
@@ -334,7 +334,7 @@ fn test_table_engine_coercion_on_insert() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("w.wal");
     let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    CatalogBootstrap::init(&storage).unwrap();
     let mut txn = TxnManager::create(&wal_path).unwrap();
 
     let columns = vec![col(0, "age", ColumnType::Int)];
@@ -343,8 +343,8 @@ fn test_table_engine_coercion_on_insert() {
     // Insert Text("42") into an INT column — coercion must convert it to Int(42).
     let mut conn_txn = txn.begin().unwrap();
     TableEngine::insert_row(
-        &mut storage,
-        &mut txn,
+        &storage,
+        &txn,
         &mut conn_txn,
         &table_def,
         &columns,
@@ -354,7 +354,7 @@ fn test_table_engine_coercion_on_insert() {
     txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
-    let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
+    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap, None).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].1[0],
@@ -369,7 +369,7 @@ fn test_table_engine_insert_type_mismatch_error() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("w.wal");
     let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    CatalogBootstrap::init(&storage).unwrap();
     let mut txn = TxnManager::create(&wal_path).unwrap();
 
     let columns = vec![
@@ -381,15 +381,15 @@ fn test_table_engine_insert_type_mismatch_error() {
     // Pass only 1 value for 2 columns — must fail with TypeMismatch.
     let mut conn_txn = txn.begin().unwrap();
     let err = TableEngine::insert_row(
-        &mut storage,
-        &mut txn,
+        &storage,
+        &txn,
         &mut conn_txn,
         &table_def,
         &columns,
         vec![Value::Int(1)], // only 1 value for 2 columns
     )
     .unwrap_err();
-    txn.rollback(conn_txn, &mut storage).unwrap();
+    txn.rollback(conn_txn, &storage).unwrap();
     assert!(
         matches!(err, axiomdb_core::error::DbError::TypeMismatch { .. }),
         "expected TypeMismatch, got {err:?}"
@@ -401,7 +401,7 @@ fn test_table_engine_scan_respects_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("w.wal");
     let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    CatalogBootstrap::init(&storage).unwrap();
     let mut txn = TxnManager::create(&wal_path).unwrap();
 
     let columns = vec![col(0, "id", ColumnType::Int)];
@@ -410,8 +410,8 @@ fn test_table_engine_scan_respects_snapshot() {
     // Insert row A.
     let mut conn_txn = txn.begin().unwrap();
     TableEngine::insert_row(
-        &mut storage,
-        &mut txn,
+        &storage,
+        &txn,
         &mut conn_txn,
         &table_def,
         &columns,
@@ -426,8 +426,8 @@ fn test_table_engine_scan_respects_snapshot() {
     // Insert row B.
     let mut conn_txn = txn.begin().unwrap();
     TableEngine::insert_row(
-        &mut storage,
-        &mut txn,
+        &storage,
+        &txn,
         &mut conn_txn,
         &table_def,
         &columns,
@@ -437,15 +437,14 @@ fn test_table_engine_scan_respects_snapshot() {
     txn.commit(conn_txn).unwrap();
 
     // snap_after_a must still see only row A.
-    let rows =
-        TableEngine::scan_table(&mut storage, &table_def, &columns, snap_after_a, None).unwrap();
+    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap_after_a, None).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].1[0], Value::Int(1));
 
     // Current snapshot sees both.
     let snap_current = txn.snapshot();
     let rows2 =
-        TableEngine::scan_table(&mut storage, &table_def, &columns, snap_current, None).unwrap();
+        TableEngine::scan_table(&storage, &table_def, &columns, snap_current, None).unwrap();
     assert_eq!(rows2.len(), 2);
 }
 
@@ -454,7 +453,7 @@ fn test_table_engine_chain_growth() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("w.wal");
     let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    CatalogBootstrap::init(&storage).unwrap();
     let mut txn = TxnManager::create(&wal_path).unwrap();
 
     // Use a BYTES column with large values to force chain growth faster.
@@ -469,8 +468,8 @@ fn test_table_engine_chain_growth() {
     let mut conn_txn = txn.begin().unwrap();
     for _ in 0..n_rows {
         TableEngine::insert_row(
-            &mut storage,
-            &mut txn,
+            &storage,
+            &txn,
             &mut conn_txn,
             &table_def,
             &columns,
@@ -481,12 +480,54 @@ fn test_table_engine_chain_growth() {
     txn.commit(conn_txn).unwrap();
 
     let snap = txn.snapshot();
-    let rows = TableEngine::scan_table(&mut storage, &table_def, &columns, snap, None).unwrap();
+    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap, None).unwrap();
     assert_eq!(
         rows.len(),
         n_rows,
         "all {n_rows} rows must be visible after chain growth"
     );
+}
+
+#[test]
+fn test_table_engine_toast_large_bytes_roundtrip_and_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.path().join("w.wal");
+    let mut storage = MemoryStorage::new();
+    CatalogBootstrap::init(&storage).unwrap();
+    let mut txn = TxnManager::create(&wal_path).unwrap();
+
+    let columns = vec![
+        col(0, "id", ColumnType::Int),
+        col(1, "payload", ColumnType::Bytes),
+    ];
+    let table_def = create_table_helper(&mut storage, &mut txn, "toast_payloads", &columns);
+
+    let big: Vec<u8> = (0..20_000).map(|i| (i % 251) as u8).collect();
+    let mut conn_txn = txn.begin().unwrap();
+    let rid = TableEngine::insert_row(
+        &storage,
+        &txn,
+        &mut conn_txn,
+        &table_def,
+        &columns,
+        vec![Value::Int(1), Value::Bytes(big.clone())],
+    )
+    .unwrap();
+    txn.commit(conn_txn).unwrap();
+
+    let snap = txn.snapshot();
+    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap, None).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1[0], Value::Int(1));
+    assert_eq!(rows[0].1[1], Value::Bytes(big));
+
+    let mut conn_txn = txn.begin().unwrap();
+    TableEngine::delete_row(&storage, &txn, &mut conn_txn, &table_def, rid).unwrap();
+    txn.commit(conn_txn).unwrap();
+
+    let snap = txn.snapshot();
+    let rows = TableEngine::scan_table(&storage, &table_def, &columns, snap, None).unwrap();
+    assert!(rows.is_empty(), "deleted TOAST row must not remain visible");
 }
 
 // ── Helper used by multiple tests ─────────────────────────────────────────────

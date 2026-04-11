@@ -107,16 +107,41 @@ impl CacheShard {
 
     fn evict_if_needed(&mut self) {
         while self.entries.len() > self.capacity {
+            let candidates = self.lru_order.len();
+            let mut scanned = 0usize;
+            let mut evicted = false;
+
+            // A shard can temporarily exceed capacity when every candidate is
+            // pinned. Scan the current LRU set once, then stop instead of
+            // cycling pinned pages forever.
             if let Some(victim_id) = self.lru_order.pop_front() {
                 if let Some(entry) = self.entries.get(&victim_id) {
                     if entry.pin_count == 0 {
                         self.entries.remove(&victim_id);
+                        evicted = true;
                     } else {
-                        // Pinned — push back to end and try next.
                         self.lru_order.push_back(victim_id);
                     }
                 }
-            } else {
+                scanned += 1;
+            }
+
+            while !evicted && scanned < candidates {
+                let Some(victim_id) = self.lru_order.pop_front() else {
+                    break;
+                };
+                if let Some(entry) = self.entries.get(&victim_id) {
+                    if entry.pin_count == 0 {
+                        self.entries.remove(&victim_id);
+                        evicted = true;
+                    } else {
+                        self.lru_order.push_back(victim_id);
+                    }
+                }
+                scanned += 1;
+            }
+
+            if !evicted {
                 break;
             }
         }
@@ -251,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_pinned_not_evicted() {
-        let pool = BufferPool::with_capacity(NUM_SHARDS * 1);
+        let pool = BufferPool::with_capacity(NUM_SHARDS);
 
         // Insert page 0 (pinned by default).
         pool.insert(0, make_page(0));

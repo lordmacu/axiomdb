@@ -17,13 +17,13 @@ fn range_empty_tree_returns_no_rows() {
 
 #[test]
 fn range_full_scan_returns_rows_in_primary_key_order() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in 0u32..128 {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header((key % 17) as u64 + 1),
@@ -53,13 +53,13 @@ fn range_full_scan_returns_rows_in_primary_key_order() {
 
 #[test]
 fn range_included_and_excluded_bounds_are_respected() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in 0u32..32 {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(1),
@@ -102,14 +102,14 @@ fn range_included_and_excluded_bounds_are_respected() {
 
 #[test]
 fn range_skips_invisible_current_versions() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in 0u32..8 {
         let created_by = if key % 2 == 0 { 9 } else { 2 };
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(created_by),
@@ -141,13 +141,13 @@ fn range_skips_invisible_current_versions() {
 
 #[test]
 fn bounded_range_starts_from_non_leftmost_leaf_when_possible() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in 0u32..256 {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(1),
@@ -179,7 +179,7 @@ fn bounded_range_starts_from_non_leftmost_leaf_when_possible() {
 #[test]
 fn range_prefetches_when_advancing_to_next_leaf() {
     let prefetches = Arc::new(AtomicUsize::new(0));
-    let mut storage = CountingPrefetchStorage {
+    let storage = CountingPrefetchStorage {
         inner: MemoryStorage::new(),
         prefetches: Arc::clone(&prefetches),
     };
@@ -188,7 +188,7 @@ fn range_prefetches_when_advancing_to_next_leaf() {
     for key in 0u32..64 {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(1),
@@ -219,14 +219,14 @@ fn range_prefetches_when_advancing_to_next_leaf() {
 
 #[test]
 fn ten_thousand_mixed_rows_stay_sorted() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in 0u32..10_000 {
         let row_len = 64 + (key as usize % 7) * 113;
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header((key % 17) as u64 + 1),

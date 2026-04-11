@@ -139,6 +139,19 @@ CREATE TABLE users (
 |----------|---------------|------------------|------------|-------------------------|
 | `BYTEA`  | `BLOB`, `BYTES` | 16,777,215 bytes | `Vec<u8>` | Raw bytes, hex display  |
 
+AxiomDB stores oversized `TEXT`, `JSON`, and `BYTEA` values out-of-line with
+TOAST. Inserts keep a fixed inline pointer in the row and place the large value
+in overflow pages. Deletes release the referenced overflow chain through the
+refcount-aware BLOB path introduced in Phase 11.2d.
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Usage Tip — Large Values</span>
+Use `BYTEA`/`BLOB` directly for attachments or binary payloads. Values above the TOAST threshold are still selected as normal `Vec<u8>` results; the overflow pointer is internal and does not change SQL.
+</div>
+</div>
+
 ```sql
 CREATE TABLE attachments (
     id      BIGINT PRIMARY KEY AUTO_INCREMENT,

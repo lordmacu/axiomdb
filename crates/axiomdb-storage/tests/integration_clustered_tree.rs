@@ -300,7 +300,7 @@ fn clustered_mixed_inline_and_overflow_rows_roundtrip_through_lookup_and_range()
     assert!(overflow_cell.overflow_first_page.is_some());
     assert_eq!(
         overflow_cell.total_row_len,
-        overflow_threshold + 700 + (3usize % 5) * 17
+        overflow_threshold + 700 + 3usize * 17
     );
 
     let rows: Vec<_> = clustered_tree::range(
@@ -316,7 +316,7 @@ fn clustered_mixed_inline_and_overflow_rows_roundtrip_through_lookup_and_range()
     assert_eq!(rows.len(), 512);
     for (idx, row) in rows.iter().enumerate() {
         let key = idx as u32;
-        let expected_len = if key % 3 == 0 {
+        let expected_len = if key.is_multiple_of(3) {
             overflow_threshold + 700 + (key as usize % 5) * 17
         } else {
             120 + (key as usize % 7) * 31

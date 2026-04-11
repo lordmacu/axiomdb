@@ -565,3 +565,30 @@ critcmp before after
 Benchmarks use **Criterion.rs** and emit JSON results to `target/criterion/`. Each
 run reports mean, standard deviation, min, max, and throughput (ops/s or bytes/s
 depending on the benchmark).
+
+---
+
+## Phase 11.2d Refcounted BLOB Chains
+
+Measured with Criterion on `axiomdb-storage` after adding the versioned `ABOB`
+TOAST/BLOB overflow header. These benchmarks use `MemoryStorage`, so they isolate
+overflow-chain layout, checksum, page reads/writes, and refcount operations from
+disk latency.
+
+```bash
+cargo bench -p axiomdb-storage --bench storage overflow/refcounted_blob
+```
+
+| Benchmark | Mean | Throughput | Verdict |
+|---|---:|---:|---|
+| `overflow/refcounted_blob/write_12kb` | 89.896 us | 130.36 MiB/s | ✅ |
+| `overflow/refcounted_blob/read_128kb` | 20.355 us | 5.997 GiB/s | ✅ |
+| `overflow/refcounted_blob/incref_free_shared_128kb` | 25.241 us | 39.618 Kops/s | ✅ |
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Isolated Storage Bench</span>
+MySQL InnoDB and PostgreSQL TOAST expose large values through full SQL engines, while this Phase 11.2d benchmark isolates AxiomDB's overflow-chain storage path so refcount/layout regressions are visible before SQL, WAL, or network overhead hides them.
+</div>
+</div>

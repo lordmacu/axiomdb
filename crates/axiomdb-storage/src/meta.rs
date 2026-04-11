@@ -321,27 +321,27 @@ mod tests {
 
     #[test]
     fn test_write_then_read_checkpoint_lsn() {
-        let mut storage = storage_with_meta();
-        write_checkpoint_lsn(&mut storage, 42).unwrap();
+        let storage = storage_with_meta();
+        write_checkpoint_lsn(&storage, 42).unwrap();
         assert_eq!(read_checkpoint_lsn(&storage).unwrap(), 42);
     }
 
     #[test]
     fn test_checkpoint_lsn_overwrites_previous() {
-        let mut storage = storage_with_meta();
-        write_checkpoint_lsn(&mut storage, 10).unwrap();
-        write_checkpoint_lsn(&mut storage, 99).unwrap();
+        let storage = storage_with_meta();
+        write_checkpoint_lsn(&storage, 10).unwrap();
+        write_checkpoint_lsn(&storage, 99).unwrap();
         assert_eq!(read_checkpoint_lsn(&storage).unwrap(), 99);
     }
 
     #[test]
     fn test_write_does_not_corrupt_other_meta_fields() {
-        let mut storage = storage_with_meta();
+        let storage = storage_with_meta();
         // page_count lives at body[16..24] (DbFileMeta layout).
         // checkpoint_lsn lives at body[24..32] — must not overlap.
         // Writing checkpoint_lsn must not touch page_count.
         let count_before = storage.page_count();
-        write_checkpoint_lsn(&mut storage, 77).unwrap();
+        write_checkpoint_lsn(&storage, 77).unwrap();
         assert_eq!(storage.page_count(), count_before);
         // Checksum must still be valid.
         assert!(storage.read_page(0).unwrap().verify_checksum().is_ok());
@@ -349,8 +349,8 @@ mod tests {
 
     #[test]
     fn test_alloc_pages_do_not_corrupt_checkpoint_lsn() {
-        let mut storage = storage_with_meta();
-        write_checkpoint_lsn(&mut storage, 55).unwrap();
+        let storage = storage_with_meta();
+        write_checkpoint_lsn(&storage, 55).unwrap();
         // Allocate a page — this may update page_count in the meta page.
         storage.alloc_page(PageType::Data).unwrap();
         // checkpoint_lsn must be preserved.
@@ -361,9 +361,9 @@ mod tests {
 
     #[test]
     fn test_alloc_table_id_uninitialized_returns_error() {
-        let mut storage = storage_with_meta();
+        let storage = storage_with_meta();
         // Fresh DB has next_table_id = 0 → CatalogNotInitialized.
-        let err = alloc_table_id(&mut storage).unwrap_err();
+        let err = alloc_table_id(&storage).unwrap_err();
         assert!(
             matches!(err, axiomdb_core::error::DbError::CatalogNotInitialized),
             "expected CatalogNotInitialized, got: {err}"
@@ -372,31 +372,31 @@ mod tests {
 
     #[test]
     fn test_alloc_table_id_monotonically_increasing() {
-        let mut storage = storage_with_meta();
+        let storage = storage_with_meta();
         // Manually seed the sequence to 1 (simulates CatalogBootstrap::init).
-        write_meta_u32(&mut storage, NEXT_TABLE_ID_BODY_OFFSET, 1).unwrap();
-        assert_eq!(alloc_table_id(&mut storage).unwrap(), 1);
-        assert_eq!(alloc_table_id(&mut storage).unwrap(), 2);
-        assert_eq!(alloc_table_id(&mut storage).unwrap(), 3);
+        write_meta_u32(&storage, NEXT_TABLE_ID_BODY_OFFSET, 1).unwrap();
+        assert_eq!(alloc_table_id(&storage).unwrap(), 1);
+        assert_eq!(alloc_table_id(&storage).unwrap(), 2);
+        assert_eq!(alloc_table_id(&storage).unwrap(), 3);
     }
 
     #[test]
     fn test_alloc_index_id_monotonically_increasing() {
-        let mut storage = storage_with_meta();
-        write_meta_u32(&mut storage, NEXT_INDEX_ID_BODY_OFFSET, 1).unwrap();
-        assert_eq!(alloc_index_id(&mut storage).unwrap(), 1);
-        assert_eq!(alloc_index_id(&mut storage).unwrap(), 2);
+        let storage = storage_with_meta();
+        write_meta_u32(&storage, NEXT_INDEX_ID_BODY_OFFSET, 1).unwrap();
+        assert_eq!(alloc_index_id(&storage).unwrap(), 1);
+        assert_eq!(alloc_index_id(&storage).unwrap(), 2);
     }
 
     #[test]
     fn test_sequences_independent() {
-        let mut storage = storage_with_meta();
-        write_meta_u32(&mut storage, NEXT_TABLE_ID_BODY_OFFSET, 1).unwrap();
-        write_meta_u32(&mut storage, NEXT_INDEX_ID_BODY_OFFSET, 1).unwrap();
-        let t1 = alloc_table_id(&mut storage).unwrap();
-        let i1 = alloc_index_id(&mut storage).unwrap();
-        let t2 = alloc_table_id(&mut storage).unwrap();
-        let i2 = alloc_index_id(&mut storage).unwrap();
+        let storage = storage_with_meta();
+        write_meta_u32(&storage, NEXT_TABLE_ID_BODY_OFFSET, 1).unwrap();
+        write_meta_u32(&storage, NEXT_INDEX_ID_BODY_OFFSET, 1).unwrap();
+        let t1 = alloc_table_id(&storage).unwrap();
+        let i1 = alloc_index_id(&storage).unwrap();
+        let t2 = alloc_table_id(&storage).unwrap();
+        let i2 = alloc_index_id(&storage).unwrap();
         assert_eq!(t1, 1);
         assert_eq!(t2, 2);
         assert_eq!(i1, 1);
@@ -414,10 +414,10 @@ mod tests {
 
     #[test]
     fn test_sequence_does_not_corrupt_other_meta_fields() {
-        let mut storage = storage_with_meta();
-        write_checkpoint_lsn(&mut storage, 42).unwrap();
-        write_meta_u32(&mut storage, NEXT_TABLE_ID_BODY_OFFSET, 1).unwrap();
-        alloc_table_id(&mut storage).unwrap();
+        let storage = storage_with_meta();
+        write_checkpoint_lsn(&storage, 42).unwrap();
+        write_meta_u32(&storage, NEXT_TABLE_ID_BODY_OFFSET, 1).unwrap();
+        alloc_table_id(&storage).unwrap();
         // checkpoint_lsn must be preserved.
         assert_eq!(read_checkpoint_lsn(&storage).unwrap(), 42);
         assert!(storage.read_page(0).unwrap().verify_checksum().is_ok());

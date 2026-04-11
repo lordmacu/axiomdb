@@ -586,7 +586,7 @@ mod tests {
 
         assert_eq!(
             layout
-                .update_row(&mut storage, &root, &old_row, &new_row)
+                .update_row(&storage, &root, &old_row, &new_row)
                 .unwrap(),
             ClusteredSecondaryUpdateOutcome::Unchanged
         );
@@ -610,8 +610,8 @@ mod tests {
         let row_a = vec![Value::Int(1), Value::Text("a@example.com".into())];
         let row_b = vec![Value::Int(2), Value::Text("a@example.com".into())];
 
-        assert!(layout.insert_row(&mut storage, &root, &row_a).unwrap());
-        let err = layout.insert_row(&mut storage, &root, &row_b).unwrap_err();
+        assert!(layout.insert_row(&storage, &root, &row_a).unwrap());
+        let err = layout.insert_row(&storage, &root, &row_b).unwrap_err();
         assert!(matches!(
             err,
             DbError::UniqueViolation { ref index_name, .. } if index_name == "uq_email"
@@ -645,7 +645,7 @@ mod tests {
             Value::Text("payload".into()),
             Value::Text("active".into()),
         ];
-        assert!(layout.insert_row(&mut storage, &root, &row).unwrap());
+        assert!(layout.insert_row(&storage, &root, &row).unwrap());
 
         // Verify entry exists.
         let before = layout
@@ -658,7 +658,7 @@ mod tests {
         assert_eq!(before.len(), 1);
 
         // Delete it.
-        assert!(layout.delete_row(&mut storage, &root, &row).unwrap());
+        assert!(layout.delete_row(&storage, &root, &row).unwrap());
 
         // Verify entry gone.
         let after = layout
@@ -686,7 +686,7 @@ mod tests {
             Value::Text("payload".into()),
             Value::Text("active".into()),
         ];
-        layout.insert_row(&mut storage, &root, &old_row).unwrap();
+        layout.insert_row(&storage, &root, &old_row).unwrap();
 
         let new_row = vec![
             Value::Int(1),
@@ -694,7 +694,7 @@ mod tests {
             Value::Text("inactive".into()),
         ];
         let outcome = layout
-            .update_row(&mut storage, &root, &old_row, &new_row)
+            .update_row(&storage, &root, &old_row, &new_row)
             .unwrap();
         assert_eq!(outcome, ClusteredSecondaryUpdateOutcome::Replaced);
 

@@ -24,8 +24,8 @@ impl Db {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let wal = dir.path().join("t.wal");
-        let mut storage = MemoryStorage::new();
-        CatalogBootstrap::init(&mut storage).unwrap();
+        let storage = MemoryStorage::new();
+        CatalogBootstrap::init(&storage).unwrap();
         let txn = TxnManager::create(&wal).unwrap();
         Self {
             storage,
@@ -46,9 +46,9 @@ impl Db {
         let analyzed = analyze(stmt, &self.storage, snap)?;
         execute_with_ctx(
             analyzed,
-            &mut self.storage,
-            &mut self.txn,
-            &mut self.bloom,
+            &self.storage,
+            &self.txn,
+            &self.bloom,
             &mut self.ctx,
         )
     }

@@ -1,5 +1,24 @@
 # Architecture Notes
 
+## 2026-04-10 - Refcounted TOAST/BLOB overflow chains (11.2d)
+
+- `crates/axiomdb-storage/src/clustered_overflow.rs` now has two compatible
+  overflow-chain contracts:
+  - legacy clustered row overflow: body starts with `next_page: u64`, then
+    payload bytes; used by clustered row tail spill
+  - refcounted TOAST/BLOB overflow: body starts with `ABOB`, version, flags,
+    `next_page`, `part_len`, and first-page `refcount`
+- Only TOAST/BLOB-owned chains use the refcounted format. Clustered row
+  overflow stays non-refcounted so Phase 39 physical descriptors remain stable.
+- `read_blob_chain()` is the compatibility boundary: it detects `ABOB` and reads
+  self-delimiting chunks through `part_len`, or falls back to the legacy
+  `read_chain()` path using the raw length from the inline TOAST pointer.
+- `free_blob()` is the ownership boundary for TOAST cleanup. It decrements the
+  first-page refcount and frees the chain only at zero; `incref_blob()` exists
+  now to support Phase 14.9 content-addressed BLOB dedup.
+- Row codec placeholders include `raw_len` so detoast can read either format:
+  `__toast__:page_id:compressed:raw_len`.
+
 ## 2026-04-10 - Native JSON boundary (11.4)
 
 - AxiomDB now exposes exactly one SQL `JSON` type at the catalog/API boundary.

@@ -111,7 +111,7 @@ fn test_page_write_entry_roundtrip() {
 fn test_record_page_writes_empty_is_noop() {
     let env = TestEnv::new();
     let (_, _) = make_storage_with_page(&env);
-    let mut txn = TxnManager::create(&env.wal).unwrap();
+    let txn = TxnManager::create(&env.wal).unwrap();
 
     let mut conn = txn.begin().unwrap();
     txn.record_page_writes(&mut conn, 1, &[]).unwrap();
@@ -123,7 +123,7 @@ fn test_record_page_writes_empty_is_noop() {
 fn test_record_page_writes_produces_readable_wal_entries() {
     let env = TestEnv::new();
     let (mut storage, page_id) = make_storage_with_page(&env);
-    let mut txn = TxnManager::create(&env.wal).unwrap();
+    let txn = TxnManager::create(&env.wal).unwrap();
 
     let mut conn = txn.begin().unwrap();
     let slot_ids = insert_rows_on_page(&mut storage, &conn, page_id, &[b"row0", b"row1", b"row2"]);
@@ -170,7 +170,7 @@ fn test_record_page_writes_produces_readable_wal_entries() {
 fn test_crash_recovery_undoes_uncommitted_page_write() {
     let env = TestEnv::new();
     let (mut storage, page_id) = make_storage_with_page(&env);
-    let mut txn = TxnManager::create(&env.wal).unwrap();
+    let txn = TxnManager::create(&env.wal).unwrap();
 
     let mut conn = txn.begin().unwrap();
     let slot_ids = insert_rows_on_page(
@@ -209,7 +209,7 @@ fn test_crash_recovery_undoes_uncommitted_page_write() {
 fn test_committed_page_write_rows_visible_after_restart() {
     let env = TestEnv::new();
     let (mut storage, page_id) = make_storage_with_page(&env);
-    let mut txn = TxnManager::create(&env.wal).unwrap();
+    let txn = TxnManager::create(&env.wal).unwrap();
 
     let mut conn = txn.begin().unwrap();
     let slot_ids = insert_rows_on_page(
@@ -250,7 +250,7 @@ fn test_committed_page_write_rows_visible_after_restart() {
 fn test_page_write_recovery_is_idempotent() {
     let env = TestEnv::new();
     let (mut storage, page_id) = make_storage_with_page(&env);
-    let mut txn = TxnManager::create(&env.wal).unwrap();
+    let txn = TxnManager::create(&env.wal).unwrap();
 
     let mut conn = txn.begin().unwrap();
     let slot_ids = insert_rows_on_page(&mut storage, &conn, page_id, &[b"idempotent"]);

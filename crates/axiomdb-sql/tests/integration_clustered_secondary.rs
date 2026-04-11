@@ -79,7 +79,7 @@ fn clustered_secondary_scan_returns_primary_key_bookmarks_for_duplicate_logical_
     ];
 
     for row in &rows {
-        assert!(layout.insert_row(&mut storage, &root, row).unwrap());
+        assert!(layout.insert_row(&storage, &root, row).unwrap());
     }
 
     let open_entries = layout
@@ -114,10 +114,10 @@ fn clustered_secondary_delete_and_relocation_update_preserve_bookmark_semantics(
     let row_a = vec![Value::Int(20), Value::Int(1), Value::Text("open".into())];
     let row_b = vec![Value::Int(20), Value::Int(2), Value::Text("open".into())];
 
-    assert!(layout.insert_row(&mut storage, &root, &row_a).unwrap());
-    assert!(layout.insert_row(&mut storage, &root, &row_b).unwrap());
+    assert!(layout.insert_row(&storage, &root, &row_a).unwrap());
+    assert!(layout.insert_row(&storage, &root, &row_b).unwrap());
 
-    assert!(layout.delete_row(&mut storage, &root, &row_a).unwrap());
+    assert!(layout.delete_row(&storage, &root, &row_a).unwrap());
 
     let remaining = layout
         .scan_prefix(
@@ -141,7 +141,7 @@ fn clustered_secondary_delete_and_relocation_update_preserve_bookmark_semantics(
 
     assert_eq!(
         layout
-            .update_row(&mut storage, &root, &row_b, &relocated_row_b)
+            .update_row(&storage, &root, &row_b, &relocated_row_b)
             .unwrap(),
         ClusteredSecondaryUpdateOutcome::Unchanged
     );

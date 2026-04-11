@@ -59,19 +59,19 @@ fn test_crash_recovery_data_survives() {
 fn test_mmap_heap_chain_insert_persists_under_page_latch() {
     let dir = tmp_dir();
     let db_path = dir.path().join("heap_chain.db");
-    let mut storage = MmapStorage::create(&db_path).expect("create");
+    let storage = MmapStorage::create(&db_path).expect("create");
     let root = storage.alloc_page(PageType::Data).expect("alloc root");
     let root_page = Page::new(PageType::Data, root);
     storage.write_page(root, &root_page).expect("init root");
 
-    let rid = HeapChain::insert(&mut storage, root, b"seed", 1, None).expect("heap insert");
+    let rid = HeapChain::insert(&storage, root, b"seed", 1, None).expect("heap insert");
     assert_eq!(rid.0, root, "single insert should stay on root page");
     storage.flush().expect("flush");
     drop(storage);
 
-    let mut storage = MmapStorage::open(&db_path).expect("reopen");
+    let storage = MmapStorage::open(&db_path).expect("reopen");
     let rows = HeapChain::scan_visible(
-        &mut storage,
+        &storage,
         root,
         axiomdb_core::TransactionSnapshot::committed(1),
     )

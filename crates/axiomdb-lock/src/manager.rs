@@ -933,7 +933,7 @@ mod tests {
                 .await;
             assert!(result.is_err());
             match result.unwrap_err() {
-                DbError::LockTimeout { .. } => {}
+                DbError::LockTimeout => {}
                 other => panic!("expected LockTimeout, got {:?}", other),
             }
         });
@@ -1165,7 +1165,7 @@ mod tests {
         let result = lm.acquire_record_lock_sync(2, 100, 5, LockMode::Exclusive, LockFlags::NONE);
         assert!(result.is_err());
         match result.unwrap_err() {
-            DbError::LockTimeout { .. } => {}
+            DbError::LockTimeout => {}
             other => panic!("expected LockTimeout, got {:?}", other),
         }
     }

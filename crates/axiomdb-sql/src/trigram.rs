@@ -57,8 +57,8 @@ mod tests {
         let trgms = extract_trigrams("abc");
         // "  abc " → ["  a", " ab", "abc", "bc "]
         assert_eq!(trgms.len(), 4);
-        assert!(trgms.contains(&[b' ', b' ', b'a']));
-        assert!(trgms.contains(&[b'a', b'b', b'c']));
+        assert!(trgms.contains(b"  a"));
+        assert!(trgms.contains(b"abc"));
     }
 
     #[test]

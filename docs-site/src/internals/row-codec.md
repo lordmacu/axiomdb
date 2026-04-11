@@ -124,6 +124,43 @@ Saving 1 byte per text/bytes column is significant at scale: a table with 10 tex
 
 ---
 
+## TOAST Pointer Encoding
+
+`Text`, `Json`, and `Bytes` normally use the u24 prefix as an inline payload
+length. Two top-of-range u24 values are reserved for out-of-line TOAST/BLOB
+values:
+
+```text
+0x00_0000..0xFF_FFFC  inline length in bytes
+0xFF_FFFD             LZ4-compressed TOAST pointer
+0xFF_FFFE             raw TOAST pointer
+
+TOAST pointer payload:
+  [page_id: u64 LE]
+  [raw_len: u32 LE]
+```
+
+Decode returns a typed placeholder until the SQL storage layer resolves the
+overflow chain:
+
+```text
+__toast__:{page_id}:{compressed}:{raw_len}
+```
+
+`raw_len` is included in the placeholder so legacy non-refcounted overflow
+chains can still be read with an exact expected length, while the Phase 11.2d
+refcounted chain format can read its own page-local `part_len` values.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Sentinel Pointers</span>
+PostgreSQL TOAST stores out-of-line datum metadata in a varlena pointer, while AxiomDB reuses the unreachable top of the u24 inline-length range. This keeps row codec dispatch branch-local to `Text`, `Json`, and `Bytes` and avoids widening every variable-length field to u32.
+</div>
+</div>
+
+---
+
 ## JSON Encoding
 
 `Value::Json(String)` uses the same payload shape as `Value::Text`: a u24

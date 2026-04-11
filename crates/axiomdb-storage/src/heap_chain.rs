@@ -179,33 +179,33 @@ mod tests {
 
     #[test]
     fn test_insert_single_page_found_in_scan() {
-        let (mut storage, root) = storage_with_root();
+        let (storage, root) = storage_with_root();
         let snap_before = committed_snap();
 
         // Insert with txn_id=1 (autocommit: visible to snapshot_id=2+).
-        HeapChain::insert(&mut storage, root, b"hello", 1, None).unwrap();
+        HeapChain::insert(&storage, root, b"hello", 1, None).unwrap();
 
         // Snapshot that sees txn 1 as committed.
         let snap = TransactionSnapshot::committed(1);
-        let rows = HeapChain::scan_visible(&mut storage, root, snap).unwrap();
+        let rows = HeapChain::scan_visible(&storage, root, snap).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].2, b"hello");
 
         // Snapshot before the insert sees nothing.
-        let rows_before = HeapChain::scan_visible(&mut storage, root, snap_before).unwrap();
+        let rows_before = HeapChain::scan_visible(&storage, root, snap_before).unwrap();
         assert_eq!(rows_before.len(), 0);
     }
 
     #[test]
     fn test_insert_multi_tuple_same_page() {
-        let (mut storage, root) = storage_with_root();
+        let (storage, root) = storage_with_root();
 
-        HeapChain::insert(&mut storage, root, b"row1", 1, None).unwrap();
-        HeapChain::insert(&mut storage, root, b"row2", 1, None).unwrap();
-        HeapChain::insert(&mut storage, root, b"row3", 1, None).unwrap();
+        HeapChain::insert(&storage, root, b"row1", 1, None).unwrap();
+        HeapChain::insert(&storage, root, b"row2", 1, None).unwrap();
+        HeapChain::insert(&storage, root, b"row3", 1, None).unwrap();
 
         let snap = TransactionSnapshot::committed(1);
-        let rows = HeapChain::scan_visible(&mut storage, root, snap).unwrap();
+        let rows = HeapChain::scan_visible(&storage, root, snap).unwrap();
         assert_eq!(rows.len(), 3);
         let payloads: Vec<&[u8]> = rows.iter().map(|(_, _, d)| d.as_slice()).collect();
         assert!(payloads.contains(&b"row1".as_slice()));
@@ -215,24 +215,24 @@ mod tests {
 
     #[test]
     fn test_deleted_tuple_not_visible() {
-        let (mut storage, root) = storage_with_root();
+        let (storage, root) = storage_with_root();
 
-        let (page_id, slot_id) = HeapChain::insert(&mut storage, root, b"alive", 1, None).unwrap();
-        HeapChain::insert(&mut storage, root, b"also_alive", 1, None).unwrap();
+        let (page_id, slot_id) = HeapChain::insert(&storage, root, b"alive", 1, None).unwrap();
+        HeapChain::insert(&storage, root, b"also_alive", 1, None).unwrap();
 
         // Delete first tuple with txn_id=2.
-        HeapChain::delete(&mut storage, page_id, slot_id, 2).unwrap();
+        HeapChain::delete(&storage, page_id, slot_id, 2).unwrap();
 
         // Snapshot at max_committed=2 sees only the non-deleted row.
         let snap = TransactionSnapshot::committed(2);
-        let rows = HeapChain::scan_visible(&mut storage, root, snap).unwrap();
+        let rows = HeapChain::scan_visible(&storage, root, snap).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].2, b"also_alive");
     }
 
     #[test]
     fn test_chain_grows_when_page_full() {
-        let (mut storage, root) = storage_with_root();
+        let (storage, root) = storage_with_root();
 
         // Fill the root page with large tuples until it overflows.
         // Each tuple is 4000 bytes of data + 24-byte RowHeader + 4-byte SlotEntry = 4028 bytes.
@@ -240,7 +240,7 @@ mod tests {
         let big_data = vec![0xABu8; 4000];
         let mut inserted = 0usize;
         for _ in 0..10 {
-            HeapChain::insert(&mut storage, root, &big_data, 1, None).unwrap();
+            HeapChain::insert(&storage, root, &big_data, 1, None).unwrap();
             inserted += 1;
         }
 
@@ -251,15 +251,15 @@ mod tests {
 
         // All inserted rows must be visible.
         let snap = TransactionSnapshot::committed(1);
-        let rows = HeapChain::scan_visible(&mut storage, root, snap).unwrap();
+        let rows = HeapChain::scan_visible(&storage, root, snap).unwrap();
         assert_eq!(rows.len(), inserted, "all inserted rows must be visible");
     }
 
     #[test]
     fn test_scan_empty_chain_returns_empty() {
-        let (mut storage, root) = storage_with_root();
+        let (storage, root) = storage_with_root();
         let snap = committed_snap();
-        let rows = HeapChain::scan_visible(&mut storage, root, snap).unwrap();
+        let rows = HeapChain::scan_visible(&storage, root, snap).unwrap();
         assert!(rows.is_empty());
     }
 
@@ -287,8 +287,8 @@ mod tests {
 
     #[test]
     fn test_insert_batch_empty_is_noop() {
-        let (mut storage, root) = storage_with_root();
-        let result = HeapChain::insert_batch(&mut storage, root, &[], 1).unwrap();
+        let (storage, root) = storage_with_root();
+        let result = HeapChain::insert_batch(&storage, root, &[], 1).unwrap();
         assert!(result.is_empty());
     }
 
@@ -297,13 +297,13 @@ mod tests {
         let n = 20usize;
         let rows: Vec<Vec<u8>> = (0..n).map(|i| vec![i as u8; 32]).collect();
 
-        let (mut s1, root1) = storage_with_root();
-        let batch_rids = HeapChain::insert_batch(&mut s1, root1, &rows, 1).unwrap();
+        let (s1, root1) = storage_with_root();
+        let batch_rids = HeapChain::insert_batch(&s1, root1, &rows, 1).unwrap();
 
-        let (mut s2, root2) = storage_with_root();
+        let (s2, root2) = storage_with_root();
         let mut indiv_rids = Vec::new();
         for row in &rows {
-            indiv_rids.push(HeapChain::insert(&mut s2, root2, row, 1, None).unwrap());
+            indiv_rids.push(HeapChain::insert(&s2, root2, row, 1, None).unwrap());
         }
 
         assert_eq!(batch_rids.len(), n);
@@ -318,13 +318,13 @@ mod tests {
         // 300-byte rows → ~47 rows per 16KB page → 150 rows forces ~3 pages
         let n = 150usize;
         let rows: Vec<Vec<u8>> = (0..n).map(|i| vec![i as u8; 300]).collect();
-        let (mut storage, root) = storage_with_root();
-        let rids = HeapChain::insert_batch(&mut storage, root, &rows, 1).unwrap();
+        let (storage, root) = storage_with_root();
+        let rids = HeapChain::insert_batch(&storage, root, &rows, 1).unwrap();
         assert_eq!(rids.len(), n, "all rows must be inserted");
 
         // committed(txn_id) makes txn visible: snapshot_id = txn_id+1 > txn_id_created
         let snap = TransactionSnapshot::committed(1);
-        let scanned = HeapChain::scan_visible(&mut storage, root, snap).unwrap();
+        let scanned = HeapChain::scan_visible(&storage, root, snap).unwrap();
         assert_eq!(
             scanned.len(),
             n,
@@ -344,21 +344,21 @@ mod tests {
             })
             .collect();
 
-        let (mut s1, root1) = storage_with_root();
-        HeapChain::insert_batch(&mut s1, root1, &rows, 1).unwrap();
+        let (s1, root1) = storage_with_root();
+        HeapChain::insert_batch(&s1, root1, &rows, 1).unwrap();
 
-        let (mut s2, root2) = storage_with_root();
+        let (s2, root2) = storage_with_root();
         for row in &rows {
-            HeapChain::insert(&mut s2, root2, row, 1, None).unwrap();
+            HeapChain::insert(&s2, root2, row, 1, None).unwrap();
         }
 
         let snap = TransactionSnapshot::committed(1);
-        let mut d1: Vec<Vec<u8>> = HeapChain::scan_visible(&mut s1, root1, snap.clone())
+        let mut d1: Vec<Vec<u8>> = HeapChain::scan_visible(&s1, root1, snap.clone())
             .unwrap()
             .into_iter()
             .map(|(_, _, d)| d)
             .collect();
-        let mut d2: Vec<Vec<u8>> = HeapChain::scan_visible(&mut s2, root2, snap)
+        let mut d2: Vec<Vec<u8>> = HeapChain::scan_visible(&s2, root2, snap)
             .unwrap()
             .into_iter()
             .map(|(_, _, d)| d)
@@ -375,7 +375,7 @@ mod tests {
     fn test_read_rows_batch_preserves_order_and_reads_page_once() {
         let reads = Arc::new(AtomicUsize::new(0));
         let writes = Arc::new(AtomicUsize::new(0));
-        let mut storage = CountingStorage {
+        let storage = CountingStorage {
             inner: MemoryStorage::new(),
             reads: reads.clone(),
             writes,
@@ -385,9 +385,9 @@ mod tests {
             .write_page(root, &Page::new(PageType::Data, root))
             .unwrap();
 
-        let rid1 = HeapChain::insert(&mut storage, root, b"alpha", 1, None).unwrap();
-        let rid2 = HeapChain::insert(&mut storage, root, b"bravo", 1, None).unwrap();
-        let rid3 = HeapChain::insert(&mut storage, root, b"charlie", 1, None).unwrap();
+        let rid1 = HeapChain::insert(&storage, root, b"alpha", 1, None).unwrap();
+        let rid2 = HeapChain::insert(&storage, root, b"bravo", 1, None).unwrap();
+        let rid3 = HeapChain::insert(&storage, root, b"charlie", 1, None).unwrap();
         assert_eq!(rid1.0, rid2.0);
         assert_eq!(rid2.0, rid3.0);
 
@@ -419,7 +419,7 @@ mod tests {
     fn test_rewrite_batch_same_slot_reads_and_writes_page_once_per_batch() {
         let reads = Arc::new(AtomicUsize::new(0));
         let writes = Arc::new(AtomicUsize::new(0));
-        let mut storage = CountingStorage {
+        let storage = CountingStorage {
             inner: MemoryStorage::new(),
             reads: reads.clone(),
             writes: writes.clone(),
@@ -429,8 +429,8 @@ mod tests {
             .write_page(root, &Page::new(PageType::Data, root))
             .unwrap();
 
-        let rid1 = HeapChain::insert(&mut storage, root, b"alpha", 1, None).unwrap();
-        let rid2 = HeapChain::insert(&mut storage, root, b"bravo", 1, None).unwrap();
+        let rid1 = HeapChain::insert(&storage, root, b"alpha", 1, None).unwrap();
+        let rid2 = HeapChain::insert(&storage, root, b"bravo", 1, None).unwrap();
         assert_eq!(rid1.0, rid2.0, "test rows must share one page");
         let rid1 = axiomdb_core::RecordId {
             page_id: rid1.0,
@@ -445,7 +445,7 @@ mod tests {
         writes.store(0, Ordering::Relaxed);
 
         let rewritten = HeapChain::rewrite_batch_same_slot(
-            &mut storage,
+            &storage,
             root,
             &[(rid1, b"ALPHA".to_vec()), (rid2, b"BRAVO".to_vec())],
             2,
@@ -466,7 +466,7 @@ mod tests {
         );
 
         let rows =
-            HeapChain::scan_visible(&mut storage, root, TransactionSnapshot::committed(2)).unwrap();
+            HeapChain::scan_visible(&storage, root, TransactionSnapshot::committed(2)).unwrap();
         let payloads: Vec<Vec<u8>> = rows.into_iter().map(|(_, _, d)| d).collect();
         assert!(payloads.contains(&b"ALPHA".to_vec()));
         assert!(payloads.contains(&b"BRAVO".to_vec()));
@@ -485,7 +485,7 @@ mod hint_tests {
 
     #[test]
     fn valid_hint_skips_walk() {
-        let mut storage = make_storage();
+        let storage = make_storage();
         let root = storage.alloc_page(PageType::Data).unwrap();
         storage
             .write_page(root, &Page::new(PageType::Data, root))
@@ -493,7 +493,7 @@ mod hint_tests {
 
         // First insert: no hint → seeds hint with root as tail.
         let mut hint = None;
-        HeapChain::insert_with_hint(&mut storage, root, b"row1", 1, hint.as_mut(), None).unwrap();
+        HeapChain::insert_with_hint(&storage, root, b"row1", 1, hint.as_mut(), None).unwrap();
 
         // Seed hint manually.
         let mut h = HeapAppendHint {
@@ -501,14 +501,14 @@ mod hint_tests {
             tail_page_id: root,
         };
         // Second insert using hint.
-        HeapChain::insert_with_hint(&mut storage, root, b"row2", 1, Some(&mut h), None).unwrap();
+        HeapChain::insert_with_hint(&storage, root, b"row2", 1, Some(&mut h), None).unwrap();
         // Hint must still point to root (no chain growth for 2 rows).
         assert_eq!(h.tail_page_id, root);
     }
 
     #[test]
     fn stale_hint_falls_back_and_heals() {
-        let mut storage = make_storage();
+        let storage = make_storage();
         let root = storage.alloc_page(PageType::Data).unwrap();
         storage
             .write_page(root, &Page::new(PageType::Data, root))
@@ -520,13 +520,13 @@ mod hint_tests {
             tail_page_id: 9999,
         };
         // Insert must succeed (falls back to full walk) and heals the hint.
-        HeapChain::insert_with_hint(&mut storage, root, b"row1", 1, Some(&mut h), None).unwrap();
+        HeapChain::insert_with_hint(&storage, root, b"row1", 1, Some(&mut h), None).unwrap();
         assert_eq!(h.tail_page_id, root, "hint must be healed to actual tail");
     }
 
     #[test]
     fn root_mismatch_ignores_hint() {
-        let mut storage = make_storage();
+        let storage = make_storage();
         let root1 = storage.alloc_page(PageType::Data).unwrap();
         storage
             .write_page(root1, &Page::new(PageType::Data, root1))
@@ -541,7 +541,7 @@ mod hint_tests {
             root_page_id: root1,
             tail_page_id: root1,
         };
-        HeapChain::insert_with_hint(&mut storage, root2, b"data", 1, Some(&mut h), None).unwrap();
+        HeapChain::insert_with_hint(&storage, root2, b"data", 1, Some(&mut h), None).unwrap();
         // Hint must now reflect root2.
         assert_eq!(h.root_page_id, root2);
         assert_eq!(h.tail_page_id, root2);

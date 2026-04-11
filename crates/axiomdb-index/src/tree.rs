@@ -257,7 +257,7 @@ mod tests {
     fn test_bulk_load_empty_entries() {
         let mut s = bulk_setup();
         let root = alloc_empty_root(&mut s);
-        let new_root = BTree::bulk_load_sorted(&mut s, root, &[], 90).unwrap();
+        let new_root = BTree::bulk_load_sorted(&s, root, &[], 90).unwrap();
         assert_eq!(new_root, root, "empty entries must return old root");
     }
 
@@ -268,10 +268,10 @@ mod tests {
         let entries = make_entries(1);
         let refs: Vec<(&[u8], RecordId)> =
             entries.iter().map(|(k, r)| (k.as_slice(), *r)).collect();
-        let new_root = BTree::bulk_load_sorted(&mut s, root, &refs, 90).unwrap();
+        let new_root = BTree::bulk_load_sorted(&s, root, &refs, 90).unwrap();
         assert_ne!(new_root, root);
         assert_eq!(
-            BTree::lookup_in(&mut s, new_root, entries[0].0.as_slice()).unwrap(),
+            BTree::lookup_in(&s, new_root, entries[0].0.as_slice()).unwrap(),
             Some(entries[0].1)
         );
     }
@@ -284,12 +284,12 @@ mod tests {
         let entries = make_entries(threshold);
         let refs: Vec<(&[u8], RecordId)> =
             entries.iter().map(|(k, r)| (k.as_slice(), *r)).collect();
-        let new_root = BTree::bulk_load_sorted(&mut s, root, &refs, 90).unwrap();
+        let new_root = BTree::bulk_load_sorted(&s, root, &refs, 90).unwrap();
 
         // All keys findable.
         for (key, rid) in &entries {
             assert_eq!(
-                BTree::lookup_in(&mut s, new_root, key).unwrap(),
+                BTree::lookup_in(&s, new_root, key).unwrap(),
                 Some(*rid),
                 "key={}",
                 String::from_utf8_lossy(key)
@@ -305,11 +305,11 @@ mod tests {
         let entries = make_entries(threshold + 1);
         let refs: Vec<(&[u8], RecordId)> =
             entries.iter().map(|(k, r)| (k.as_slice(), *r)).collect();
-        let new_root = BTree::bulk_load_sorted(&mut s, root, &refs, 90).unwrap();
+        let new_root = BTree::bulk_load_sorted(&s, root, &refs, 90).unwrap();
 
         for (key, rid) in &entries {
             assert_eq!(
-                BTree::lookup_in(&mut s, new_root, key).unwrap(),
+                BTree::lookup_in(&s, new_root, key).unwrap(),
                 Some(*rid),
                 "key={}",
                 String::from_utf8_lossy(key)
@@ -324,13 +324,13 @@ mod tests {
         let entries = make_entries(50_000);
         let refs: Vec<(&[u8], RecordId)> =
             entries.iter().map(|(k, r)| (k.as_slice(), *r)).collect();
-        let new_root = BTree::bulk_load_sorted(&mut s, root, &refs, 90).unwrap();
+        let new_root = BTree::bulk_load_sorted(&s, root, &refs, 90).unwrap();
 
         // Spot-check first, middle, last.
         for &i in &[0, 25_000, 49_999] {
             let (key, rid) = &entries[i];
             assert_eq!(
-                BTree::lookup_in(&mut s, new_root, key).unwrap(),
+                BTree::lookup_in(&s, new_root, key).unwrap(),
                 Some(*rid),
                 "key={}",
                 String::from_utf8_lossy(key)

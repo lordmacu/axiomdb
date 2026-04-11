@@ -991,15 +991,15 @@ mod tests {
         // Txn 1: insert 5 rows + commit.
         let conn1 = mgr.begin().unwrap();
         for i in 0u8..5 {
-            HeapChain::insert(&mut storage, root_page_id, &[i; 8], conn1.txn_id, None).unwrap();
+            HeapChain::insert(&storage, root_page_id, &[i; 8], conn1.txn_id, None).unwrap();
         }
         let _ = mgr.commit(conn1).unwrap();
 
         // Txn 2: delete_batch + record_truncate — then CRASH (no commit).
         let mut conn2 = mgr.begin().unwrap();
         let snap = mgr.active_snapshot(&conn2);
-        let raw_rids = HeapChain::scan_rids_visible(&mut storage, root_page_id, snap).unwrap();
-        HeapChain::delete_batch(&mut storage, root_page_id, &raw_rids, conn2.txn_id).unwrap();
+        let raw_rids = HeapChain::scan_rids_visible(&storage, root_page_id, snap).unwrap();
+        HeapChain::delete_batch(&storage, root_page_id, &raw_rids, conn2.txn_id).unwrap();
         mgr.record_truncate(&mut conn2, 1, root_page_id).unwrap();
         // Flush WAL buffer to disk (simulate kernel flush on crash).
         mgr.wal().flush_buffer().unwrap();
@@ -1011,7 +1011,7 @@ mod tests {
 
         // After recovery: all 5 rows must be visible to a committed snapshot.
         let snap_after = TransactionSnapshot::committed(result.max_committed);
-        let visible = HeapChain::scan_rids_visible(&mut storage, root_page_id, snap_after).unwrap();
+        let visible = HeapChain::scan_rids_visible(&storage, root_page_id, snap_after).unwrap();
         assert_eq!(
             visible.len(),
             5,

@@ -1,27 +1,27 @@
 #[test]
 fn delete_mark_empty_tree_returns_false() {
-    let mut storage = MemoryStorage::new();
-    let changed = delete_mark(&mut storage, None, b"missing", 9, &committed_snapshot(4)).unwrap();
+    let storage = MemoryStorage::new();
+    let changed = delete_mark(&storage, None, b"missing", 9, &committed_snapshot(4)).unwrap();
     assert!(!changed);
 }
 
 #[test]
 fn delete_mark_missing_key_returns_false() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
     for key in [b"alpha".as_slice(), b"bravo", b"charlie"] {
-        root = Some(insert(&mut storage, root, key, &row_header(1), b"row").unwrap());
+        root = Some(insert(&storage, root, key, &row_header(1), b"row").unwrap());
     }
 
-    let changed = delete_mark(&mut storage, root, b"delta", 9, &committed_snapshot(4)).unwrap();
+    let changed = delete_mark(&storage, root, b"delta", 9, &committed_snapshot(4)).unwrap();
     assert!(!changed);
 }
 
 #[test]
 fn delete_mark_invisible_current_version_returns_false() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let root = insert(
-        &mut storage,
+        &storage,
         None,
         b"future",
         &row_header(9),
@@ -30,7 +30,7 @@ fn delete_mark_invisible_current_version_returns_false() {
     .unwrap();
 
     let changed = delete_mark(
-        &mut storage,
+        &storage,
         Some(root),
         b"future",
         12,
@@ -48,13 +48,13 @@ fn delete_mark_invisible_current_version_returns_false() {
 
 #[test]
 fn delete_mark_root_leaf_hides_row_from_newer_snapshots_but_preserves_old_visibility() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in 0u32..4 {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(1),
@@ -66,7 +66,7 @@ fn delete_mark_root_leaf_hides_row_from_newer_snapshots_but_preserves_old_visibi
 
     let root = root.unwrap();
     let deleted = delete_mark(
-        &mut storage,
+        &storage,
         Some(root),
         &2u32.to_be_bytes(),
         9,
@@ -138,13 +138,13 @@ fn delete_mark_root_leaf_hides_row_from_newer_snapshots_but_preserves_old_visibi
 
 #[test]
 fn delete_mark_on_split_tree_preserves_leaf_identity_and_next_link() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in 0u32..128 {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(1),
@@ -165,7 +165,7 @@ fn delete_mark_on_split_tree_preserves_leaf_identity_and_next_link() {
     };
 
     let deleted = delete_mark(
-        &mut storage,
+        &storage,
         Some(root),
         &63u32.to_be_bytes(),
         11,
@@ -208,13 +208,13 @@ fn delete_mark_on_split_tree_preserves_leaf_identity_and_next_link() {
 
 #[test]
 fn delete_physical_repairs_separator_for_non_leftmost_leaf() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in 0u32..64 {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(1),
@@ -245,7 +245,7 @@ fn delete_physical_repairs_separator_for_non_leftmost_leaf() {
         old_first.as_slice()
     );
 
-    let (deleted, root_after) = delete_physical(&mut storage, root, &old_first).unwrap();
+    let (deleted, root_after) = delete_physical(&storage, root, &old_first).unwrap();
     assert!(deleted);
     assert_eq!(root_after, root);
 
@@ -266,11 +266,11 @@ fn delete_physical_repairs_separator_for_non_leftmost_leaf() {
 
 #[test]
 fn delete_physical_frees_overflow_chain_of_removed_row() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let key = b"overflow-delete";
     let total_len = clustered_leaf::max_inline_row_bytes(key.len()).unwrap() + 321;
     let payload = vec![0x4E; total_len];
-    let root = insert(&mut storage, None, key, &row_header(1), &payload).unwrap();
+    let root = insert(&storage, None, key, &row_header(1), &payload).unwrap();
 
     let page = storage.read_page(root).unwrap();
     let overflow_first_page = clustered_leaf::read_cell(&page, 0)
@@ -278,7 +278,7 @@ fn delete_physical_frees_overflow_chain_of_removed_row() {
         .overflow_first_page
         .expect("row must be overflow-backed");
 
-    let (deleted, root_after) = delete_physical(&mut storage, root, key).unwrap();
+    let (deleted, root_after) = delete_physical(&storage, root, key).unwrap();
     assert!(deleted);
     assert_eq!(root_after, root);
     assert!(
@@ -291,7 +291,7 @@ fn delete_physical_frees_overflow_chain_of_removed_row() {
 
 #[test]
 fn rebalance_leaf_pair_merge_preserves_next_leaf_chain() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let left_pid = storage.alloc_page(PageType::ClusteredLeaf).unwrap();
     let right_pid = storage.alloc_page(PageType::ClusteredLeaf).unwrap();
     let tail_pid = storage.alloc_page(PageType::ClusteredLeaf).unwrap();
@@ -315,7 +315,7 @@ fn rebalance_leaf_pair_merge_preserves_next_leaf_chain() {
     )
     .unwrap();
     clustered_leaf::set_next_leaf(&mut left, right_pid);
-    write_page(&mut storage, left_pid, &mut left).unwrap();
+    write_page(&storage, left_pid, &mut left).unwrap();
 
     let mut right = Page::new(PageType::ClusteredLeaf, right_pid);
     clustered_leaf::init_clustered_leaf(&mut right);
@@ -328,13 +328,13 @@ fn rebalance_leaf_pair_merge_preserves_next_leaf_chain() {
     )
     .unwrap();
     clustered_leaf::set_next_leaf(&mut right, tail_pid);
-    write_page(&mut storage, right_pid, &mut right).unwrap();
+    write_page(&storage, right_pid, &mut right).unwrap();
 
     let mut parent = Page::new(PageType::ClusteredInternal, 99);
     clustered_internal::init_clustered_internal(&mut parent, left_pid);
     clustered_internal::insert_at(&mut parent, 0, &3u32.to_be_bytes(), right_pid).unwrap();
 
-    rebalance_leaf_pair(&mut storage, &mut parent, 0, left_pid, right_pid).unwrap();
+    rebalance_leaf_pair(&storage, &mut parent, 0, left_pid, right_pid).unwrap();
 
     assert_eq!(clustered_internal::num_cells(&parent), 0);
     let merged = storage.read_page(left_pid).unwrap();
@@ -361,7 +361,7 @@ fn rebalance_leaf_pair_merge_preserves_next_leaf_chain() {
 
 #[test]
 fn rebalance_internal_pair_redistributes_and_preserves_children() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let left_pid = storage.alloc_page(PageType::ClusteredInternal).unwrap();
     let right_pid = storage.alloc_page(PageType::ClusteredInternal).unwrap();
 
@@ -372,17 +372,17 @@ fn rebalance_internal_pair_redistributes_and_preserves_children() {
 
     let mut left = Page::new(PageType::ClusteredInternal, left_pid);
     rebuild_internal_page(&mut left, 10, &[make_sep(10, 11), make_sep(20, 12)]).unwrap();
-    write_page(&mut storage, left_pid, &mut left).unwrap();
+    write_page(&storage, left_pid, &mut left).unwrap();
 
     let mut right = Page::new(PageType::ClusteredInternal, right_pid);
     rebuild_internal_page(&mut right, 20, &[make_sep(40, 21), make_sep(50, 22)]).unwrap();
-    write_page(&mut storage, right_pid, &mut right).unwrap();
+    write_page(&storage, right_pid, &mut right).unwrap();
 
     let mut parent = Page::new(PageType::ClusteredInternal, 199);
     clustered_internal::init_clustered_internal(&mut parent, left_pid);
     clustered_internal::insert_at(&mut parent, 0, &vec![30u8; 4_000], right_pid).unwrap();
 
-    rebalance_internal_pair(&mut storage, &mut parent, 0, left_pid, right_pid).unwrap();
+    rebalance_internal_pair(&storage, &mut parent, 0, left_pid, right_pid).unwrap();
 
     assert_eq!(clustered_internal::num_cells(&parent), 1);
     let left_after = storage.read_page(left_pid).unwrap();
@@ -416,7 +416,7 @@ fn rebalance_internal_pair_redistributes_and_preserves_children() {
 
 #[test]
 fn delete_physical_collapses_root_after_leaf_merge() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let left_pid = storage.alloc_page(PageType::ClusteredLeaf).unwrap();
     let right_pid = storage.alloc_page(PageType::ClusteredLeaf).unwrap();
     let root = storage.alloc_page(PageType::ClusteredInternal).unwrap();
@@ -440,7 +440,7 @@ fn delete_physical_collapses_root_after_leaf_merge() {
     )
     .unwrap();
     clustered_leaf::set_next_leaf(&mut left, right_pid);
-    write_page(&mut storage, left_pid, &mut left).unwrap();
+    write_page(&storage, left_pid, &mut left).unwrap();
 
     let mut right = Page::new(PageType::ClusteredLeaf, right_pid);
     clustered_leaf::init_clustered_leaf(&mut right);
@@ -460,14 +460,14 @@ fn delete_physical_collapses_root_after_leaf_merge() {
         &vec![3u8; 3_000],
     )
     .unwrap();
-    write_page(&mut storage, right_pid, &mut right).unwrap();
+    write_page(&storage, right_pid, &mut right).unwrap();
 
     let mut root_page = Page::new(PageType::ClusteredInternal, root);
     clustered_internal::init_clustered_internal(&mut root_page, left_pid);
     clustered_internal::insert_at(&mut root_page, 0, &2u32.to_be_bytes(), right_pid).unwrap();
-    write_page(&mut storage, root, &mut root_page).unwrap();
+    write_page(&storage, root, &mut root_page).unwrap();
 
-    let (deleted, root_after) = delete_physical(&mut storage, root, &0u32.to_be_bytes()).unwrap();
+    let (deleted, root_after) = delete_physical(&storage, root, &0u32.to_be_bytes()).unwrap();
     assert!(deleted);
     assert_ne!(root_after, root);
 
@@ -489,13 +489,13 @@ fn delete_physical_collapses_root_after_leaf_merge() {
 
 #[test]
 fn update_with_relocation_reinserts_row_after_same_leaf_failure() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in 0u32..7 {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(1),
@@ -509,7 +509,7 @@ fn update_with_relocation_reinserts_row_after_same_leaf_failure() {
     let before_pids = collect_leaf_chain_pids(&storage, root).unwrap();
 
     let root_after = update_with_relocation(
-        &mut storage,
+        &storage,
         Some(root),
         &3u32.to_be_bytes(),
         &vec![9u8; 8_000],
@@ -560,7 +560,7 @@ fn update_with_relocation_reinserts_row_after_same_leaf_failure() {
 /// then verify the result is identical to the pessimistic path.
 #[test]
 fn delete_physical_through_safe_descent_keeps_tree_consistent() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     let count = 128u32;
@@ -568,7 +568,7 @@ fn delete_physical_through_safe_descent_keeps_tree_consistent() {
     for key in 0..count {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(1),
@@ -589,7 +589,7 @@ fn delete_physical_through_safe_descent_keeps_tree_consistent() {
     // underfull threshold. This makes the descent's safe-child predicate
     // hold and exercises the early-release branch.
     let target_key = (count / 2).to_be_bytes();
-    let (deleted, root_after) = delete_physical(&mut storage, root, &target_key).unwrap();
+    let (deleted, root_after) = delete_physical(&storage, root, &target_key).unwrap();
     assert!(deleted, "target key must exist before delete");
     assert_eq!(root_after, root, "non-collapsing delete must keep the root pid stable");
 
