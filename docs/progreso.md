@@ -3,7 +3,7 @@
 > Automatically updated with `/subfase-completa`
 > Legend: ✅ completed | 🔄 in progress | ⏳ pending | ⏸ blocked
 >
-> **Progress: 390/1028 subphases (37.9%) — Phase 11 active**
+> **Progress: 392/1028 subphases (38.1%) — Phase 11 active**
 
 ---
 
@@ -12,9 +12,9 @@
 ### Phase 1 ✅ (9/9) — Page format (CRC32c, align64), MmapStorage, MemoryStorage, FreeList, StorageEngine trait, file locking, tracing
 ### Phase 2 ✅ (14/14) — B+ Tree: lookup O(log n), insert+leaf split, range scan (next_leaf chain fixed 7.9), delete+merge, CoW AtomicU64 root, prefix compression, benchmarks; rotate_right key-shift bug fixed 2026-03-26
 ### Phase 3 ✅ (28/28) — WAL (append-only, LSN, CRC), WalWriter/Reader/Rotator, RowHeader+MVCC, TxnManager (BEGIN/COMMIT/ROLLBACK), checkpoint, crash recovery (UNDO state machine), post-recovery integrity, catalog (bootstrap+reader+writer+notifier), schema resolver, page dirty tracker, config (axiomdb.toml), autocommit semantics, doublewrite buffer (torn page repair), WAL batch append, WAL per-page record, group commit, configurable durability policy
-### Phase 4 ✅ (105/110) — SQL parser + executor: row codec (all SQL types), expression evaluator (3-valued NULL semantics), AST, lexer (logos DFA, ~85 tokens), DDL+DML parsers (CREATE/DROP/ALTER/SELECT/INSERT/UPDATE/DELETE), semantic analyzer + type coercion matrix, executor (heap+clustered), JOINs (INNER/LEFT/RIGHT/FULL/CROSS/hash), GROUP BY (hash+sort), aggregates (COUNT/SUM/MIN/MAX/AVG/DISTINCT/GROUP_CONCAT), ORDER BY+LIMIT/OFFSET, subqueries (scalar/IN/EXISTS/correlated/derived), DISTINCT, CASE WHEN, 150+ functions, CLI+REPL, SHOW/DESCRIBE/TRUNCATE/ALTER TABLE, INFORMATION_SCHEMA (6 views), error framework (SQLSTATE + structured errors), strict mode + warnings, prepared statement plan cache (OID-based), clustered DDL integration
+### Phase 4 ✅ (106/110) — SQL parser + executor: row codec (all SQL types), expression evaluator (3-valued NULL semantics), AST, lexer (logos DFA, ~85 tokens), DDL+DML parsers (CREATE/DROP/ALTER/SELECT/INSERT/UPDATE/DELETE), semantic analyzer + type coercion matrix, executor (heap+clustered), JOINs (INNER/LEFT/RIGHT/FULL/CROSS/hash), GROUP BY (hash+sort), aggregates (COUNT/SUM/MIN/MAX/AVG/DISTINCT/GROUP_CONCAT), ORDER BY+LIMIT/OFFSET, subqueries (scalar/IN/EXISTS/correlated/derived), DISTINCT, CASE WHEN, 150+ functions, CLI+REPL, SHOW/DESCRIBE/TRUNCATE/ALTER TABLE, INFORMATION_SCHEMA (6 views), error framework (SQLSTATE + structured errors), strict mode + warnings, prepared statement plan cache (OID-based), clustered DDL integration
 - [ ] 4.10f ⏳ GROUP BY WITH ROLLUP — `GROUP BY dept WITH ROLLUP` generates subtotal rows with NULL group keys
-- [ ] 4.11b ⏳ Subquery in JOIN — `FROM t JOIN (SELECT …) alias ON …`; FROM subqueries work, this is the JOIN variant (`select.rs:667`)
+- [x] 4.11b ✅ Subquery in JOIN — `FROM t JOIN (SELECT …) alias ON …`; implemented by `e34e9f4`: analyzer persists join-side derived tables in the AST; executor materializes JOIN subqueries once per statement; integration coverage includes INNER/LEFT/RIGHT/FULL joins, USING, alias wildcard, and chained joins mixing base and derived sources
 - [ ] 4.4g ⏳ Multi-table DELETE/UPDATE JOIN — `DELETE t FROM t JOIN s ON ...`; `UPDATE t JOIN s ON ... SET t.col=val` (`parser/dml.rs:440-476`)
 - [ ] 4.22f ⏳ DROP PRIMARY KEY on clustered table — requires full rebuild back to heap layout (`ddl.rs:1031`)
 - [ ] ⚠️ 4.22e follow-up — `ALTER TABLE ADD COLUMN` on heap tables with existing secondary indexes needs survivor-rebuild after RID-changing rewrites
@@ -61,7 +61,7 @@
 
 ### GAP-C — SQL completeness + DDL robustness `⏳`
 <!-- PRIORIDAD: MEDIA — mejora significativa de compatibilidad -->
-- [ ] GAP-C.1 ⏳ Subquery in JOIN — `FROM t JOIN (SELECT …) alias ON …`; el FROM subquery path ya existe (Phase 4.11); falta wiring en `select_joins_ctx.rs:33` y `select_helpers.rs:38` para posición JOIN
+- [x] GAP-C.1 ✅ Subquery in JOIN — closed by Phase 4.11b (`e34e9f4`); `FROM t JOIN (SELECT …) alias ON …` now has analyzer/executor wiring for join-side derived tables
 - [ ] GAP-C.2 ⏳ Composite FK (multi-column) — extender `axiom_foreign_keys` encoding para N columnas; `REFERENCES t (col1, col2)` en CREATE TABLE y ALTER TABLE; enforcement en INSERT/UPDATE/DELETE con compound key lookup
 - [ ] GAP-C.3 ⏳ ALTER TABLE DROP/MODIFY COLUMN con index — detectar indexes afectados, auto-drop, proceder con column op, rebuild si MODIFY; `ddl_alter_column.rs:373, 461`
 - [ ] GAP-C.4 ⏳ ON DELETE/UPDATE SET DEFAULT — usar default expression persistida (4.18e) para setear columna child al DEFAULT del catálogo; `fk_enforcement.rs:686, 811`
