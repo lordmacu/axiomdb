@@ -31,6 +31,51 @@ fn maintain_clustered_secondary_inserts(
             }
         }
 
+        if idx.index_type == 4 {
+            let Some(terms) = crate::index_maintenance::gin_terms_for_row_value(
+                row_values.get(idx.columns[0].col_idx as usize),
+            )?
+            else {
+                continue;
+            };
+            let pk_key = crate::index_maintenance::encode_clustered_pk_key_from_row(
+                &idx.name,
+                &layout.primary_cols,
+                row_values,
+            )?;
+            let root_pid = std::sync::atomic::AtomicU64::new(idx.root_page_id);
+            for term in &terms {
+                let key = crate::index_maintenance::gin_clustered_key(term, &pk_key);
+                BTree::insert_in(
+                    storage,
+                    &root_pid,
+                    &key,
+                    crate::index_maintenance::GIN_CLUSTERED_DUMMY_RID,
+                    idx.fillfactor,
+                )?;
+                txn.record_index_insert(
+                    conn_txn,
+                    idx.index_id,
+                    root_pid.load(std::sync::atomic::Ordering::Acquire),
+                    key,
+                );
+            }
+            let new_index_root = root_pid.load(std::sync::atomic::Ordering::Acquire);
+            if let Some(started) = secondary_started {
+                secondary_time += started.elapsed();
+            }
+            if new_index_root != idx.root_page_id {
+                let persist_started = debug_clustered_insert.then(Instant::now);
+                CatalogWriter::new(storage, txn, conn_txn)?
+                    .update_index_root(idx.index_id, new_index_root)?;
+                if let Some(started) = persist_started {
+                    root_persist_time += started.elapsed();
+                }
+                idx.root_page_id = new_index_root;
+            }
+            continue;
+        }
+
         let Some(entry) = layout.entry_from_row(row_values)? else {
             continue;
         };

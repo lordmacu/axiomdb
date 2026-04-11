@@ -248,6 +248,10 @@ fn execute_select(
             crate::planner::AccessMethod::IndexOnlyScan { .. } => {
                 unreachable!("IndexOnlyScan only emitted when select_col_idxs is non-empty")
             }
+            crate::planner::AccessMethod::GinScan {
+                index_def,
+                query_terms,
+            } => gin_scan_rows(storage, &resolved, index_def, query_terms, snap.clone())?,
         };
 
         // ── EXISTS decorrelation fast-path (Phase 9 optimization) ────────────

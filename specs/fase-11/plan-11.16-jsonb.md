@@ -271,7 +271,8 @@ Deliverables:
 - `json_keys`: iterate over key JEntries (indices 0..N) reading key strings.
 - `json_valid`: `Value::Jsonb` is always valid by construction → return `Value::Int(1)`.
 - `json_set`, `json_remove`: decode to `serde_json::Value`, mutate, re-encode as
-  `Value::Jsonb`. (In-place mutation deferred to Phase 11.17.)
+  `Value::Jsonb`. PostgreSQL-style mutation API parity is tracked in Phase 11.22;
+  true in-place binary delta mutation remains a future layout optimization.
 
 Test gate: run all Phase 11.4 integration tests (`integration_json.rs`) with
 `JSONB` columns — must pass without modification.
@@ -430,7 +431,8 @@ Deliverables:
 - **DO NOT mutate JEntries in-place.** The binary layout is immutable once written.
   Mutation functions (`JSON_SET`, `JSON_REMOVE`, `JSON_MERGE_PATCH`) decode to
   `serde_json::Value`, mutate, and re-encode a fresh blob. In-place delta encoding
-  is deferred to Phase 11.17.
+  is not part of Phase 11.17; mutation API parity is Phase 11.22, while true
+  in-place delta encoding remains a future JSONB layout optimization.
 
 - **DO NOT add `Token::JsonExtractSub` after `Token::Minus` in the logos attribute
   list.** Logos processes tokens in declaration order; `"->"` must appear before

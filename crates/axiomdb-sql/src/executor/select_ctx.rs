@@ -593,6 +593,10 @@ fn execute_select_ctx(
                 }
                 result
             }
+            crate::planner::AccessMethod::GinScan {
+                index_def,
+                query_terms,
+            } => gin_scan_rows(storage, &resolved, index_def, query_terms, snap.clone())?,
         };
 
         // ── EXISTS decorrelation fast-path ────────────────────────────────────

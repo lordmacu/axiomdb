@@ -195,6 +195,7 @@ fn execute_create_index(
     let is_brin = matches!(stmt.index_type, crate::ast::IndexType::Brin);
     let is_trigram = matches!(stmt.index_type, crate::ast::IndexType::Trigram);
     let is_fts = matches!(stmt.index_type, crate::ast::IndexType::FullText);
+    let is_gin = matches!(stmt.index_type, crate::ast::IndexType::Gin);
     let root_page_id = if is_brin {
         let pages_per_range = stmt.pages_per_range.unwrap_or(128);
         let brin_col_idx = index_columns
@@ -333,6 +334,67 @@ fn execute_create_index(
         // TODO: store doc_count + total_tokens in index metadata for BM25 avgdl.
         let _ = (doc_count, total_tokens);
         // Skip regular bloom for FTS.
+    } else if is_gin {
+        // ── GIN inverted index build (Phase 11.17) ────────────────────────────
+        // Extract all JSONB terms from each row and insert term postings into the
+        // B-Tree. Heap tables use RID bookmarks; clustered tables use the encoded
+        // primary key as the bookmark suffix. No bloom: term keys use a specialised
+        // encoding.
+        let gin_col_idx = index_columns.first().map(|c| c.col_idx as usize).unwrap_or(0);
+        let clustered_primary_cols = if table_def.is_clustered() {
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
+            let primary_idx = reader
+                .list_indexes(table_def.id)?
+                .into_iter()
+                .find(|i| i.is_primary && !i.columns.is_empty())
+                .ok_or_else(|| {
+                    DbError::Internal {
+                        message: format!(
+                            "clustered table '{}' has no primary index — catalog inconsistency",
+                            table_def.table_name
+                        ),
+                    }
+                })?;
+            Some(
+                primary_idx
+                    .columns
+                    .iter()
+                    .map(|col| col.col_idx)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        for (rid, row_vals) in &rows {
+            let Some(terms) =
+                crate::index_maintenance::gin_terms_for_row_value(row_vals.get(gin_col_idx))?
+            else {
+                continue;
+            };
+            let clustered_pk_key = clustered_primary_cols
+                .as_ref()
+                .map(|primary_cols| {
+                    crate::index_maintenance::encode_clustered_pk_key_from_row(
+                        &stmt.name,
+                        primary_cols,
+                        row_vals,
+                    )
+                })
+                .transpose()?;
+            for term in &terms {
+                let (key, payload_rid) = if let Some(pk_key) = clustered_pk_key.as_ref() {
+                    (
+                        crate::index_maintenance::gin_clustered_key(term, pk_key),
+                        crate::index_maintenance::GIN_CLUSTERED_DUMMY_RID,
+                    )
+                } else {
+                    (crate::index_maintenance::gin_heap_key(term, *rid), *rid)
+                };
+                BTree::insert_in(storage, &root_pid, &key, payload_rid, index_fillfactor)?;
+            }
+        }
+        // Skip bloom for GIN — term keys are specialised; cannot be checked with
+        // simple key-presence bloom used by regular B-Tree indexes.
     } else if table_def.is_clustered() {
         // ── Clustered secondary index build ──────────────────────────────
         // Derive the physical key layout from the primary index so that every
@@ -465,12 +527,14 @@ fn execute_create_index(
             crate::ast::IndexType::Brin => 1,
             crate::ast::IndexType::Trigram => 2,
             crate::ast::IndexType::FullText => 3,
+            crate::ast::IndexType::Gin => 4,
         },
         pages_per_range: stmt.pages_per_range.unwrap_or(128),
     })?;
 
     // 7. Populate bloom filter for the newly created index (B-Tree only).
-    if !is_brin {
+    // Skip BRIN (no B-Tree), FTS, Trigram, and GIN (specialised key encodings).
+    if !is_brin && !is_fts && !is_trigram && !is_gin {
         bloom.create(new_index_id, bloom_keys.len().max(1));
         for key in &bloom_keys {
             bloom.add(new_index_id, key);

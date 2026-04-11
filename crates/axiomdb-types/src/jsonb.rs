@@ -958,3 +958,140 @@ mod tests {
         assert_eq!(r.max_depth().unwrap(), 3);
     }
 }
+
+// ── GIN term extraction ───────────────────────────────────────────────────────
+
+/// GIN term flags — compatible with PostgreSQL jsonb_ops (jsonb_gin.c JGINFLAG_*).
+pub const GIN_FLAG_KEY: u8 = 0x01; // object key string, or string-typed array element
+pub const GIN_FLAG_NULL: u8 = 0x02; // null value (no payload)
+pub const GIN_FLAG_BOOL: u8 = 0x03; // bool (payload: 0=false, 1=true)
+pub const GIN_FLAG_NUM: u8 = 0x04; // numeric (payload: canonical decimal string)
+pub const GIN_FLAG_STR: u8 = 0x05; // string value that is NOT a key
+
+/// Extract all GIN index terms from a JSONB document.
+///
+/// Each term is `[flag: u8][payload: bytes]`. The full set of terms from a
+/// document is stored in the GIN B-Tree as separate entries. Two documents
+/// satisfy `doc @> query` iff every term in `query`'s term set appears in
+/// `doc`'s term set.
+///
+/// Extraction rules (mirrors `gin_extract_jsonb` in PostgreSQL `jsonb_gin.c`):
+/// - Object key          → `[GIN_FLAG_KEY][key_utf8]`
+/// - String array elem   → `[GIN_FLAG_KEY][elem_utf8]`  (PostgreSQL compat)
+/// - Non-string array elem or object value → value term by type:
+///   - null              → `[GIN_FLAG_NULL]`
+///   - bool              → `[GIN_FLAG_BOOL][0|1]`
+///   - int / float       → `[GIN_FLAG_NUM][decimal_string]`
+///   - string            → `[GIN_FLAG_STR][utf8]`
+///   - container         → recurse (no term for the container itself)
+pub fn gin_extract_terms(data: &[u8]) -> Result<Vec<Vec<u8>>, DbError> {
+    let root = JsonbDecoder::decode(data)?;
+    let mut terms: Vec<Vec<u8>> = Vec::new();
+    gin_collect(&root, &mut terms);
+    Ok(terms)
+}
+
+/// Extract GIN terms directly from a JSON text string (without binary encoding).
+///
+/// Convenience wrapper for planner-time extraction from JSON literal values.
+pub fn gin_extract_terms_from_str(s: &str) -> Result<Vec<Vec<u8>>, DbError> {
+    let root: serde_json::Value = serde_json::from_str(s).map_err(|e| DbError::InvalidValue {
+        reason: format!("invalid JSON for GIN extraction: {e}"),
+    })?;
+    let mut terms: Vec<Vec<u8>> = Vec::new();
+    gin_collect(&root, &mut terms);
+    Ok(terms)
+}
+
+fn gin_collect(val: &serde_json::Value, out: &mut Vec<Vec<u8>>) {
+    match val {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                // key term
+                let mut t = Vec::with_capacity(1 + k.len());
+                t.push(GIN_FLAG_KEY);
+                t.extend_from_slice(k.as_bytes());
+                out.push(t);
+                // value term (recurse for containers)
+                gin_collect(v, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for elem in arr {
+                match elem {
+                    serde_json::Value::String(s) => {
+                        // String array elements are treated as keys (PostgreSQL compat)
+                        let mut t = Vec::with_capacity(1 + s.len());
+                        t.push(GIN_FLAG_KEY);
+                        t.extend_from_slice(s.as_bytes());
+                        out.push(t);
+                    }
+                    other => gin_collect(other, out),
+                }
+            }
+        }
+        serde_json::Value::Null => out.push(vec![GIN_FLAG_NULL]),
+        serde_json::Value::Bool(b) => out.push(vec![GIN_FLAG_BOOL, *b as u8]),
+        serde_json::Value::Number(n) => {
+            let s = n.to_string();
+            let mut t = Vec::with_capacity(1 + s.len());
+            t.push(GIN_FLAG_NUM);
+            t.extend_from_slice(s.as_bytes());
+            out.push(t);
+        }
+        serde_json::Value::String(s) => {
+            let mut t = Vec::with_capacity(1 + s.len());
+            t.push(GIN_FLAG_STR);
+            t.extend_from_slice(s.as_bytes());
+            out.push(t);
+        }
+    }
+}
+
+#[cfg(test)]
+mod gin_tests {
+    use super::*;
+
+    fn enc_obj(j: serde_json::Value) -> Vec<u8> {
+        JsonbEncoder::encode(&j).unwrap()
+    }
+
+    #[test]
+    fn test_gin_extract_object_keys_and_values() {
+        let blob = enc_obj(serde_json::json!({"name": "Alice", "age": 30}));
+        let terms = gin_extract_terms(&blob).unwrap();
+        // keys: "name", "age"
+        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_KEY], b"name" as &[u8]].concat()));
+        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_KEY], b"age" as &[u8]].concat()));
+        // values: "Alice" (STR), 30 (NUM)
+        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_STR], b"Alice" as &[u8]].concat()));
+        assert!(terms.iter().any(|t| t[0] == GIN_FLAG_NUM && &t[1..] == b"30"));
+    }
+
+    #[test]
+    fn test_gin_extract_string_array_elements_are_keys() {
+        let blob = enc_obj(serde_json::json!(["a", "b", "c"]));
+        let terms = gin_extract_terms(&blob).unwrap();
+        // String array elements → KEY flag
+        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_KEY], b"a" as &[u8]].concat()));
+        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_KEY], b"b" as &[u8]].concat()));
+    }
+
+    #[test]
+    fn test_gin_extract_bool_and_null() {
+        let blob = enc_obj(serde_json::json!({"active": true, "deleted": null}));
+        let terms = gin_extract_terms(&blob).unwrap();
+        assert!(terms.iter().any(|t| t == &[GIN_FLAG_BOOL, 1]));
+        assert!(terms.iter().any(|t| t == &[GIN_FLAG_NULL]));
+    }
+
+    #[test]
+    fn test_gin_extract_nested_object() {
+        let blob = enc_obj(serde_json::json!({"user": {"role": "admin"}}));
+        let terms = gin_extract_terms(&blob).unwrap();
+        // Both "user" key and inner "role" key + "admin" value
+        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_KEY], b"user" as &[u8]].concat()));
+        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_KEY], b"role" as &[u8]].concat()));
+        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_STR], b"admin" as &[u8]].concat()));
+    }
+}

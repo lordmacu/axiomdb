@@ -303,11 +303,15 @@ pub enum BinaryOp {
     /// `REGEXP` / `RLIKE` — regular-expression match.
     Regexp,
 
-    // JSON operators (Phase 11.16)
+    // JSON operators (Phase 11.16 / 11.17)
     /// `->` — JSON sub-document extraction returning `Value::Jsonb`.
     /// `expr -> 'key'` returns the JSON object field as a binary JSONB value.
     /// `expr -> 0` returns the array element at that index as JSONB.
     JsonSub,
+    /// `@>` — JSONB containment: `doc @> query` returns 1 if every key/value
+    /// in `query` exists in `doc` (deep subset check). NULL if either operand
+    /// is NULL. Evaluated by `jsonb_contains()`.
+    JsonContains,
 }
 
 // ── UnaryOp ───────────────────────────────────────────────────────────────────

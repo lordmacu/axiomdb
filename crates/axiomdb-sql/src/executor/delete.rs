@@ -629,7 +629,8 @@ fn collect_clustered_delete_candidates(
                 snap,
             )?);
         }
-        crate::planner::AccessMethod::IndexOnlyScan { .. } => unreachable!(),
+        crate::planner::AccessMethod::IndexOnlyScan { .. }
+        | crate::planner::AccessMethod::GinScan { .. } => unreachable!(),
     }
 
     let mut seen = std::collections::HashSet::new();
@@ -701,7 +702,9 @@ fn collect_delete_candidates(
     use crate::planner::AccessMethod;
 
     match access {
-        AccessMethod::Scan | AccessMethod::IndexOnlyScan { .. } => {
+        // GIN indexes are not used for DELETE candidate discovery (GIN is read-only
+        // from the planner's perspective for DELETE/UPDATE — fall through to full scan).
+        AccessMethod::Scan | AccessMethod::IndexOnlyScan { .. } | AccessMethod::GinScan { .. } => {
             // Optimized scan: compile a BatchPredicate for zero-alloc raw-byte
             // predicate evaluation, zone map page skipping, and two-phase decode
             // (only decode WHERE columns first, full decode only for matching rows).

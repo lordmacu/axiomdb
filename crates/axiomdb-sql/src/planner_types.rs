@@ -58,4 +58,19 @@ pub enum AccessMethod {
         /// the decoded key values (0 = first key column, 1 = second, …).
         needed_key_positions: Vec<usize>,
     },
+
+    /// GIN inverted index scan for JSONB containment (`col @> literal`) — Phase 11.17.
+    ///
+    /// The executor performs one B-Tree range scan per query term, intersects all
+    /// resulting RID sets (AND semantics), and rechecks each candidate row via the
+    /// full `@>` evaluator to eliminate false positives.
+    ///
+    /// B-Tree key format: `[term_bytes][0x00][page_id: 8 LE][slot_id: 2 LE]`.
+    GinScan {
+        /// The GIN index to use.
+        index_def: IndexDef,
+        /// Pre-extracted query terms from the right-hand JSONB literal.
+        /// Each entry is `[GIN_FLAG_*][payload]` without the 0x00 separator or RID suffix.
+        query_terms: Vec<Vec<u8>>,
+    },
 }

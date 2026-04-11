@@ -156,15 +156,16 @@ re-parsing the UTF-8 text on each call when the input is already `Value::Jsonb`.
 
 ## Out of scope
 
-- GIN / inverted index creation for JSONB columns (Phase 11.17).
+- GIN / inverted index creation for JSONB columns (implemented in Phase 11.17).
 - Automatic migration of existing `JSON` rows to binary JSONB on table open.
-- `@>` / `<@` as standalone SQL operators (containment available as functions).
+- `<@` as standalone SQL operator (Phase 11.18). `@>` is implemented in Phase 11.17.
 - JSONB generation functions: `JSON_BUILD_OBJECT`, `JSON_BUILD_ARRAY`, `JSON_AGG`
   (Phase 29.12).
 - JSONPath `datetime()` filter function.
 - Writing JSONB columns through the MySQL binary prepared-statement protocol.
-- In-place binary mutation of JSONB blobs (Phase 11.17 delta update).
-- User-defined JSON schema validation (Phase 12.x).
+- PostgreSQL-style JSONB mutation API parity (Phase 11.22). True in-place binary
+  delta mutation remains a future layout optimization.
+- User-defined JSON schema validation (Phase 11.23).
 
 ## Dependencies
 

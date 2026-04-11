@@ -54,7 +54,10 @@ fn choose_group_by_strategy_ctx_with_collation(
         crate::planner::AccessMethod::IndexLookup { index_def, .. }
         | crate::planner::AccessMethod::IndexRange { index_def, .. }
         | crate::planner::AccessMethod::IndexOnlyScan { index_def, .. } => index_def,
-        crate::planner::AccessMethod::Scan => return GroupByStrategy::Hash,
+        // GIN scan delivers rows in arbitrary RID order — always hash-group.
+        crate::planner::AccessMethod::GinScan { .. } | crate::planner::AccessMethod::Scan => {
+            return GroupByStrategy::Hash
+        }
     };
 
     if group_by_matches_index_prefix(group_by, index_def) {

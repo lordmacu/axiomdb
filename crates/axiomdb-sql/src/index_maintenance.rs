@@ -24,7 +24,7 @@ use axiomdb_index::BTree;
 use axiomdb_storage::StorageEngine;
 use axiomdb_types::Value;
 
-use axiomdb_index::page_layout::encode_rid;
+use axiomdb_index::page_layout::{encode_rid, MAX_KEY_LEN};
 
 use axiomdb_storage::heap_chain::HeapChain;
 
@@ -55,6 +55,117 @@ pub fn fk_key_range(fk_val: &axiomdb_types::Value) -> Result<(Vec<u8>, Vec<u8>),
     let mut hi = prefix;
     hi.extend_from_slice(&[0xFF; 10]);
     Ok((lo, hi))
+}
+
+// ── GIN JSONB key helpers ───────────────────────────────────────────────────
+
+const GIN_SEPARATOR: u8 = 0x00;
+
+/// Dummy B-Tree payload for clustered GIN entries.
+///
+/// The real bookmark is the clustered primary-key suffix encoded in the key:
+/// `[term][0x00][pk_key]`.
+pub(crate) const GIN_CLUSTERED_DUMMY_RID: RecordId = RecordId {
+    page_id: 0,
+    slot_id: 0,
+};
+
+fn dedup_gin_terms(mut terms: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    terms.sort_unstable();
+    terms.dedup();
+    terms
+}
+
+pub(crate) fn gin_terms_for_row_value(
+    value: Option<&Value>,
+) -> Result<Option<Vec<Vec<u8>>>, DbError> {
+    let terms = match value {
+        Some(Value::Jsonb(b)) => axiomdb_types::jsonb::gin_extract_terms(b.as_slice())?,
+        Some(Value::Json(s)) | Some(Value::Text(s)) => {
+            axiomdb_types::jsonb::gin_extract_terms_from_str(s)?
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(dedup_gin_terms(terms)))
+}
+
+pub(crate) fn gin_terms_if_indexed(
+    idx: &IndexDef,
+    row: &[Value],
+    compiled_pred: Option<&Expr>,
+) -> Result<Option<Vec<Vec<u8>>>, DbError> {
+    if idx.columns.is_empty() {
+        return Ok(None);
+    }
+    if let Some(pred) = compiled_pred {
+        if !is_truthy(&eval(pred, row)?) {
+            return Ok(None);
+        }
+    }
+    gin_terms_for_row_value(row.get(idx.columns[0].col_idx as usize))
+}
+
+pub(crate) fn gin_heap_key(term: &[u8], rid: RecordId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(term.len() + 1 + 10);
+    key.extend_from_slice(term);
+    key.push(GIN_SEPARATOR);
+    key.extend_from_slice(&rid.page_id.to_le_bytes());
+    key.extend_from_slice(&rid.slot_id.to_le_bytes());
+    key
+}
+
+pub(crate) fn gin_clustered_key(term: &[u8], pk_key: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(term.len() + 1 + pk_key.len());
+    key.extend_from_slice(term);
+    key.push(GIN_SEPARATOR);
+    key.extend_from_slice(pk_key);
+    key
+}
+
+pub(crate) fn gin_term_bounds(term: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut lo = Vec::with_capacity(term.len() + 1);
+    lo.extend_from_slice(term);
+    lo.push(GIN_SEPARATOR);
+
+    let mut hi = lo.clone();
+    hi.resize(MAX_KEY_LEN, 0xFF);
+    (lo, hi)
+}
+
+pub(crate) fn gin_key_suffix<'a>(key: &'a [u8], term: &[u8]) -> Option<&'a [u8]> {
+    let sep_pos = term.len();
+    if key.len() <= sep_pos || !key.starts_with(term) || key[sep_pos] != GIN_SEPARATOR {
+        return None;
+    }
+    Some(&key[sep_pos + 1..])
+}
+
+pub(crate) fn encode_clustered_pk_key_from_row(
+    index_name: &str,
+    primary_cols: &[u16],
+    row: &[Value],
+) -> Result<Vec<u8>, DbError> {
+    let mut pk_values = Vec::with_capacity(primary_cols.len());
+    for col_idx in primary_cols {
+        let value = row
+            .get(*col_idx as usize)
+            .cloned()
+            .ok_or_else(|| DbError::InvalidValue {
+                reason: format!(
+                    "clustered GIN index '{index_name}' requires primary-key column {col_idx} in row with len {}",
+                    row.len()
+                ),
+            })?;
+        if matches!(value, Value::Null) {
+            return Err(DbError::InvalidValue {
+                reason: format!(
+                    "clustered GIN index '{index_name}' cannot build a primary-key bookmark with NULL column {col_idx}"
+                ),
+            });
+        }
+        pk_values.push(value);
+    }
+    encode_index_key(&pk_values)
 }
 
 // ── indexes_for_table ─────────────────────────────────────────────────────────
@@ -182,6 +293,36 @@ pub fn insert_into_indexes_with_undo(
                 key.extend_from_slice(&tok.position.to_le_bytes());
                 let _ =
                     axiomdb_index::BTree::insert_in(storage, &root_pid, &key, rid, idx.fillfactor);
+            }
+            let new_root = root_pid.load(std::sync::atomic::Ordering::Acquire);
+            if new_root != idx.root_page_id {
+                updated_roots.push((idx.index_id, new_root));
+            }
+            continue;
+        }
+
+        // Phase 11.17: GIN inverted index — extract JSONB terms and insert each term+rid.
+        if idx.index_type == 4 {
+            let Some(terms) = gin_terms_if_indexed(
+                idx,
+                row,
+                compiled_preds.get(i).and_then(|pred| pred.as_ref()),
+            )?
+            else {
+                continue;
+            };
+            let root_pid = std::sync::atomic::AtomicU64::new(idx.root_page_id);
+            for term in &terms {
+                let key = gin_heap_key(term, rid);
+                axiomdb_index::BTree::insert_in(storage, &root_pid, &key, rid, idx.fillfactor)?;
+                if let (Some(tm), Some(ref mut ct)) = (txn, &mut conn_txn) {
+                    tm.record_index_insert(
+                        ct,
+                        idx.index_id,
+                        root_pid.load(std::sync::atomic::Ordering::Acquire),
+                        key,
+                    );
+                }
             }
             let new_root = root_pid.load(std::sync::atomic::Ordering::Acquire);
             if new_root != idx.root_page_id {
@@ -326,6 +467,26 @@ pub fn delete_from_indexes(
                 continue; // row was never in this index → nothing to delete
             }
         }
+
+        // Phase 11.17: GIN — delete all term entries for this row.
+        if idx.index_type == 4 {
+            let Some(terms) = gin_terms_for_row_value(row.get(idx.columns[0].col_idx as usize))?
+            else {
+                continue;
+            };
+            let root_pid = AtomicU64::new(idx.root_page_id);
+            for term in &terms {
+                let key = gin_heap_key(term, rid);
+                let _ = BTree::delete_in(storage, &root_pid, &key)?;
+            }
+            bloom.mark_dirty(idx.index_id);
+            let new_root = root_pid.load(Ordering::Acquire);
+            if new_root != idx.root_page_id {
+                updated_roots.push((idx.index_id, new_root));
+            }
+            continue;
+        }
+
         let key_vals: Vec<Value> = idx
             .columns
             .iter()
@@ -592,6 +753,26 @@ pub fn batch_insert_into_indexes(
 
         let pred = compiled_preds.get(i).and_then(|p| p.as_ref());
 
+        if idx.index_type == 4 {
+            let original_root = idx.root_page_id;
+            let root_pid = AtomicU64::new(original_root);
+            for (row, rid) in rows.iter().zip(rids.iter()) {
+                let Some(terms) = gin_terms_if_indexed(idx, row, pred)? else {
+                    continue;
+                };
+                for term in &terms {
+                    let key = gin_heap_key(term, *rid);
+                    BTree::insert_in(storage, &root_pid, &key, *rid, idx.fillfactor)?;
+                }
+            }
+            let new_root = root_pid.load(Ordering::Acquire);
+            if new_root != original_root {
+                idx.root_page_id = new_root;
+                updated_roots.push((idx.index_id, new_root));
+            }
+            continue;
+        }
+
         // ── Collect (encoded_key, rid) for this index ────────────────────────
         let mut pairs: Vec<(Vec<u8>, RecordId)> = Vec::new();
         for (row, rid) in rows.iter().zip(rids.iter()) {
@@ -697,50 +878,73 @@ pub fn insert_many_into_single_index(
         return Ok(None);
     }
 
-    let original_root = idx.root_page_id;
-    let root_pid = AtomicU64::new(original_root);
+    if idx.index_type == 4 {
+        let original_root = idx.root_page_id;
+        let root_pid = AtomicU64::new(original_root);
 
-    for (row, rid) in rows {
-        let Some(key_vals) = index_key_values_if_indexed(idx, row, compiled_pred)? else {
-            continue;
-        };
-        let key = encode_index_entry_key(idx, &key_vals, *rid)?;
-
-        if idx.is_unique && !idx.is_fk_index {
-            let cur_root = root_pid.load(Ordering::Acquire);
-            if let Some(existing_rid) = BTree::lookup_in(storage, cur_root, &key)? {
-                if HeapChain::is_slot_visible(
-                    storage,
-                    existing_rid.page_id,
-                    existing_rid.slot_id,
-                    snap.clone(),
-                )? {
-                    let dup_val = key_vals.first().map(|v| format!("{v}"));
-                    return Err(DbError::UniqueViolation {
-                        index_name: idx.name.clone(),
-                        value: dup_val,
-                    });
-                }
-                // Dead entry: remove from B-Tree so insert_in won't reject.
-                let del_pid = AtomicU64::new(cur_root);
-                let _ = BTree::delete_in(storage, &del_pid, &key);
-                let del_root = del_pid.load(Ordering::Acquire);
-                if del_root != cur_root {
-                    root_pid.store(del_root, Ordering::Release);
-                }
+        for (row, rid) in rows {
+            let Some(terms) = gin_terms_if_indexed(idx, row, compiled_pred)? else {
+                continue;
+            };
+            for term in &terms {
+                let key = gin_heap_key(term, *rid);
+                BTree::insert_in(storage, &root_pid, &key, *rid, idx.fillfactor)?;
             }
         }
 
-        BTree::insert_in(storage, &root_pid, &key, *rid, idx.fillfactor)?;
-        bloom.add(idx.index_id, &key);
-    }
-
-    let new_root = root_pid.load(Ordering::Acquire);
-    if new_root != original_root {
-        idx.root_page_id = new_root;
-        Ok(Some(new_root))
+        let new_root = root_pid.load(Ordering::Acquire);
+        if new_root != original_root {
+            idx.root_page_id = new_root;
+            Ok(Some(new_root))
+        } else {
+            Ok(None)
+        }
     } else {
-        Ok(None)
+        let original_root = idx.root_page_id;
+        let root_pid = AtomicU64::new(original_root);
+
+        for (row, rid) in rows {
+            let Some(key_vals) = index_key_values_if_indexed(idx, row, compiled_pred)? else {
+                continue;
+            };
+            let key = encode_index_entry_key(idx, &key_vals, *rid)?;
+
+            if idx.is_unique && !idx.is_fk_index {
+                let cur_root = root_pid.load(Ordering::Acquire);
+                if let Some(existing_rid) = BTree::lookup_in(storage, cur_root, &key)? {
+                    if HeapChain::is_slot_visible(
+                        storage,
+                        existing_rid.page_id,
+                        existing_rid.slot_id,
+                        snap.clone(),
+                    )? {
+                        let dup_val = key_vals.first().map(|v| format!("{v}"));
+                        return Err(DbError::UniqueViolation {
+                            index_name: idx.name.clone(),
+                            value: dup_val,
+                        });
+                    }
+                    // Dead entry: remove from B-Tree so insert_in won't reject.
+                    let del_pid = AtomicU64::new(cur_root);
+                    let _ = BTree::delete_in(storage, &del_pid, &key);
+                    let del_root = del_pid.load(Ordering::Acquire);
+                    if del_root != cur_root {
+                        root_pid.store(del_root, Ordering::Release);
+                    }
+                }
+            }
+
+            BTree::insert_in(storage, &root_pid, &key, *rid, idx.fillfactor)?;
+            bloom.add(idx.index_id, &key);
+        }
+
+        let new_root = root_pid.load(Ordering::Acquire);
+        if new_root != original_root {
+            idx.root_page_id = new_root;
+            Ok(Some(new_root))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -755,6 +959,24 @@ pub fn insert_into_single_index(
     snap: TransactionSnapshot,
 ) -> Result<Option<u64>, DbError> {
     if idx.columns.is_empty() {
+        return Ok(None);
+    }
+
+    if idx.index_type == 4 {
+        let Some(terms) = gin_terms_if_indexed(idx, row, compiled_pred)? else {
+            return Ok(None);
+        };
+
+        let root_pid = AtomicU64::new(idx.root_page_id);
+        for term in &terms {
+            let key = gin_heap_key(term, rid);
+            BTree::insert_in(storage, &root_pid, &key, rid, idx.fillfactor)?;
+        }
+        let new_root = root_pid.load(Ordering::Acquire);
+        if new_root != idx.root_page_id {
+            idx.root_page_id = new_root;
+            return Ok(Some(new_root));
+        }
         return Ok(None);
     }
 

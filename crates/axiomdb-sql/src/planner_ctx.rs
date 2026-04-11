@@ -50,7 +50,8 @@ pub fn plan_select_ctx(
             .first()
             .map(|c| text_col_idxs.contains(&c.col_idx))
             .unwrap_or(false),
-        AccessMethod::Scan => false,
+        // GIN uses specialised JSONB term encoding — not affected by text collation.
+        AccessMethod::GinScan { .. } | AccessMethod::Scan => false,
     };
 
     if uses_text_index {
@@ -230,7 +231,9 @@ pub fn plan_delete_candidates_ctx(
             .first()
             .map(|c| text_col_idxs.contains(&c.col_idx))
             .unwrap_or(false),
-        AccessMethod::Scan | AccessMethod::IndexOnlyScan { .. } => false,
+        AccessMethod::GinScan { .. } | AccessMethod::Scan | AccessMethod::IndexOnlyScan { .. } => {
+            false
+        }
     };
 
     if uses_text_index {
@@ -269,7 +272,9 @@ pub fn plan_update_candidates_ctx(
             .first()
             .map(|c| text_col_idxs.contains(&c.col_idx))
             .unwrap_or(false),
-        AccessMethod::Scan | AccessMethod::IndexOnlyScan { .. } => false,
+        AccessMethod::GinScan { .. } | AccessMethod::Scan | AccessMethod::IndexOnlyScan { .. } => {
+            false
+        }
     };
 
     if uses_text_index {

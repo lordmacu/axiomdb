@@ -141,7 +141,66 @@ pub fn plan_select(
         }
     }
 
+    // ── Rule G: GIN inverted index scan for col @> literal (Phase 11.17) ────────
+    // Detects `col @> jsonb_literal` and uses the GIN index when one exists on
+    // that column. Term extraction happens at plan time from the literal value.
+    if let Some(am) = plan_gin_scan(expr, indexes, columns) {
+        return am;
+    }
+
     AccessMethod::Scan
+}
+
+// ── Rule G helper: GIN scan planner ──────────────────────────────────────────
+
+/// Detects `col @> literal` and returns `AccessMethod::GinScan` when a GIN index
+/// (index_type == 4) exists on `col` and the literal yields at least one term.
+fn plan_gin_scan(
+    expr: &Expr,
+    indexes: &[IndexDef],
+    columns: &[ColumnDef],
+) -> Option<AccessMethod> {
+    let (col_name, literal) = match expr {
+        Expr::BinaryOp {
+            op: BinaryOp::JsonContains,
+            left,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Column { name, .. }, Expr::Literal(v)) => (name.as_str(), v),
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    // Resolve column index.
+    let col_idx = columns.iter().find(|c| c.name == col_name)?.col_idx;
+
+    // Find a GIN index (index_type == 4) whose first column matches.
+    let gin_idx = indexes.iter().find(|idx| {
+        idx.index_type == 4
+            && !idx.columns.is_empty()
+            && idx.columns[0].col_idx == col_idx
+    })?;
+
+    // Extract query terms from the literal value at plan time.
+    // SQL text literals ('{"a":1}') are treated as JSON; Jsonb is pre-encoded binary.
+    let query_terms = match literal {
+        Value::Jsonb(b) => axiomdb_types::jsonb::gin_extract_terms(b.as_slice()).ok()?,
+        Value::Json(s) | Value::Text(s) => {
+            axiomdb_types::jsonb::gin_extract_terms_from_str(s).ok()?
+        }
+        _ => return None,
+    };
+
+    // An empty query (`col @> '{}'`) is always true — no index help possible.
+    if query_terms.is_empty() {
+        return None;
+    }
+
+    Some(AccessMethod::GinScan {
+        index_def: gin_idx.clone(),
+        query_terms,
+    })
 }
 
 // ── Index-only scan coverage (Phase 6.13) ────────────────────────────────────
