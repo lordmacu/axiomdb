@@ -218,6 +218,64 @@ pub(super) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
         BinaryOp::And | BinaryOp::Or => unreachable!("AND/OR handled in eval"),
         // NullSafe handled above.
         BinaryOp::NullSafe => unreachable!(),
+
+        // ── JSON sub-document extraction: -> (Phase 11.16) ───────────────────
+        // `json -> 'key'` returns the sub-document as Value::Jsonb.
+        // `json -> 0`     returns the array element at index 0 as Value::Jsonb.
+        BinaryOp::JsonSub => eval_json_sub(l, r),
+    }
+}
+
+fn eval_json_sub(left: Value, right: Value) -> Result<Value, DbError> {
+    use axiomdb_types::{JsonbEncoder, JsonbRef, JsonbValue};
+
+    if left.is_null() {
+        return Ok(Value::Null);
+    }
+
+    // Obtain the JSONB binary blob for the left side.
+    let blob_owned: Vec<u8>;
+    let blob: &[u8] = match &left {
+        Value::Jsonb(b) => b.as_ref(),
+        Value::Json(s) => {
+            // Lazy encode text JSON to binary for navigation
+            let parsed = serde_json::from_str::<serde_json::Value>(s).map_err(|e| {
+                DbError::InvalidValue {
+                    reason: format!("invalid JSON: {e}"),
+                }
+            })?;
+            blob_owned = JsonbEncoder::encode(&parsed)?;
+            &blob_owned
+        }
+        _ => {
+            return Err(DbError::TypeMismatch {
+                expected: "JSON or JSONB".into(),
+                got: left.variant_name().into(),
+            });
+        }
+    };
+
+    let jref = JsonbRef::new(blob);
+    let result = match &right {
+        Value::Text(key) | Value::Json(key) => jref.get_key(key)?,
+        Value::Int(idx) => jref.get_index(*idx as i64)?,
+        Value::BigInt(idx) => jref.get_index(*idx)?,
+        _ => {
+            return Err(DbError::TypeMismatch {
+                expected: "string key or integer index for ->".into(),
+                got: right.variant_name().into(),
+            });
+        }
+    };
+
+    match result {
+        None => Ok(Value::Null),
+        Some(JsonbValue::Null) => Ok(Value::Null),
+        Some(JsonbValue::Bool(b)) => Ok(Value::Bool(b)),
+        Some(JsonbValue::Int(n)) => Ok(Value::BigInt(n)),
+        Some(JsonbValue::Float(f)) => Ok(Value::Real(f)),
+        Some(JsonbValue::String(s)) => Ok(Value::Text(s.as_ref().to_owned())),
+        Some(JsonbValue::Container(bytes)) => Ok(Value::Jsonb(bytes)),
     }
 }
 

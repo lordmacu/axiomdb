@@ -123,6 +123,28 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
         // ── JSON → Text ─────────────────────────────────────────────────────
         (Value::Json(s), DataType::Text) => Ok(Value::Text(s)),
 
+        // ── Text/Json → JSONB — encode to binary format (Phase 11.16) ───────
+        (Value::Text(s) | Value::Json(s), DataType::Jsonb) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&s).map_err(|e| DbError::InvalidValue {
+                    reason: format!("invalid JSON: {e}"),
+                })?;
+            let blob = crate::JsonbEncoder::encode(&parsed)?;
+            Ok(Value::Jsonb(std::sync::Arc::new(blob)))
+        }
+        // ── JSONB → Text/Json — decode to JSON text ──────────────────────────
+        (Value::Jsonb(blob), DataType::Text | DataType::Json) => {
+            let s = crate::JsonbDecoder::to_string(&blob).map_err(|e| DbError::InvalidValue {
+                reason: format!("JSONB decode: {e}"),
+            })?;
+            Ok(match target {
+                DataType::Json => Value::Json(s),
+                _ => Value::Text(s),
+            })
+        }
+        // ── JSONB identity ───────────────────────────────────────────────────
+        (v @ Value::Jsonb(_), DataType::Jsonb) => Ok(v),
+
         // ── Everything else is an error ───────────────────────────────────────
         (value, target) => Err(DbError::InvalidCoercion {
             from: value.variant_name().into(),
@@ -251,4 +273,3 @@ pub fn coerce_for_op(l: Value, r: Value) -> Result<(Value, Value), DbError> {
         }),
     }
 }
-

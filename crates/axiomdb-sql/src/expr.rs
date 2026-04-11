@@ -302,6 +302,12 @@ pub enum BinaryOp {
     // Pattern matching
     /// `REGEXP` / `RLIKE` — regular-expression match.
     Regexp,
+
+    // JSON operators (Phase 11.16)
+    /// `->` — JSON sub-document extraction returning `Value::Jsonb`.
+    /// `expr -> 'key'` returns the JSON object field as a binary JSONB value.
+    /// `expr -> 0` returns the array element at that index as JSONB.
+    JsonSub,
 }
 
 // ── UnaryOp ───────────────────────────────────────────────────────────────────

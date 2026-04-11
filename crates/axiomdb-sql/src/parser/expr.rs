@@ -374,15 +374,31 @@ fn parse_multiplication(p: &mut Parser) -> Result<Expr, DbError> {
 // ── Bitwise XOR: ^ ───────────────────────────────────────────────────────────
 
 fn parse_bitxor(p: &mut Parser) -> Result<Expr, DbError> {
-    let mut left = parse_json_extract_text(p)?;
+    let mut left = parse_json_extract_sub(p)?;
     while p.eat(&Token::Caret) {
-        let right = parse_json_extract_text(p)?;
+        let right = parse_json_extract_sub(p)?;
         left = binop(BinaryOp::BitXor, left, right);
     }
     Ok(left)
 }
 
-// ── JSON field extraction: ->> ───────────────────────────────────────────────
+// ── JSON sub-document extraction: -> (Phase 11.16) ───────────────────────────
+//
+// `expr -> 'key'`  returns the sub-document as JSONB (Value::Jsonb).
+// `expr -> 0`      returns array element as JSONB.
+// This level is higher precedence than `->>`  but only parses `->` tokens.
+// The lexer emits `->>` before `->` so there's no ambiguity.
+
+fn parse_json_extract_sub(p: &mut Parser) -> Result<Expr, DbError> {
+    let mut left = parse_json_extract_text(p)?;
+    while p.eat(&Token::JsonExtractSub) {
+        let right = parse_json_extract_text(p)?;
+        left = binop(BinaryOp::JsonSub, left, right);
+    }
+    Ok(left)
+}
+
+// ── JSON field extraction: ->> (Phase 11.4) ──────────────────────────────────
 
 fn parse_json_extract_text(p: &mut Parser) -> Result<Expr, DbError> {
     let mut left = parse_unary(p)?;

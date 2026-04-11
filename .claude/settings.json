@@ -29,25 +29,13 @@
     ]
   },
   "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/Users/cristian/nexusdb/.claude/check-docs-before-commit.sh",
-            "statusMessage": "Verificando docs antes de commit..."
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
-            "command": "cd /Users/cristian/nexusdb && [ -f Cargo.toml ] && cargo fmt 2>/dev/null; exit 0"
+            "command": "cd /home/familia/axiomdb && [ -f Cargo.toml ] && cargo fmt 2>/dev/null; exit 0"
           }
         ]
       }
@@ -57,7 +45,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd /Users/cristian/nexusdb && echo '\n── Estado al parar ──' && git status --short || echo 'Repo no disponible'; exit 0"
+            "command": "cd /home/familia/axiomdb && echo '\n── Estado al parar ──' && git status --short || echo 'Repo no disponible'; exit 0"
           }
         ]
       }

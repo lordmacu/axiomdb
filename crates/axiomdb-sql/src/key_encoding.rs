@@ -114,6 +114,13 @@ fn encode_value(v: &Value, buf: &mut Vec<u8>) {
             buf.push(0x08);
             encode_bytes_nul(s.as_bytes(), buf);
         }
+        Value::Jsonb(b) => {
+            // JSONB blobs are not typically used as index keys, but we need
+            // a deterministic encoding. Use canonical JSON text for comparison.
+            buf.push(0x0C);
+            let text = axiomdb_types::JsonbDecoder::to_string(b).unwrap_or_else(|_| String::new());
+            encode_bytes_nul(text.as_bytes(), buf);
+        }
         Value::Bytes(b) => {
             buf.push(0x09);
             encode_bytes_nul(b, buf);

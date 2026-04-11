@@ -262,27 +262,39 @@ CREATE TABLE access_log (
 
 ---
 
-## JSON
+## JSON and JSONB
 
-| SQL Type | Aliases | Notes |
-|----------|---------|-------|
-| `JSON`   | —       | Validated UTF-8 JSON text; TOAST handles oversized rows |
+| SQL Type | Aliases | Storage | Notes |
+|----------|---------|---------|-------|
+| `JSON`   | —       | u24 length + UTF-8 bytes | Validated JSON text; TOAST handles oversized values |
+| `JSONB`  | —       | Binary (JEntry format) | O(1) key access, no re-parse on read |
 
-AxiomDB accepts a single `JSON` type. Inserts and updates validate JSON syntax
-before the value is written; invalid JSON raises SQLSTATE `22P02`.
+AxiomDB offers two JSON types. Use `JSON` for values written infrequently and read
+as whole documents. Use `JSONB` for values where you extract fields frequently —
+`JSONB` stores data in a binary format that allows key lookup and JSONPath evaluation
+without re-parsing the JSON text on every read.
 
 ```sql
 CREATE TABLE api_responses (
     id       BIGINT PRIMARY KEY AUTO_INCREMENT,
     endpoint TEXT   NOT NULL,
-    payload  JSON   NOT NULL
+    payload  JSONB  NOT NULL
 );
 
 INSERT INTO api_responses (endpoint, payload)
 VALUES ('/users', '{"count": 42, "items": []}');
 
-SELECT JSON_EXTRACT(payload, '$.count') FROM api_responses;  -- 42
-SELECT payload->>'count' FROM api_responses;                 -- 42
+-- Key extraction with -> (returns typed value or sub-document)
+SELECT payload->'count' FROM api_responses;         -- 42
+
+-- Text extraction with ->>
+SELECT payload->>'count' FROM api_responses;        -- "42" (TEXT)
+
+-- JSONPath
+SELECT JSON_PATH_QUERY_FIRST(payload, '$.count') FROM api_responses; -- 42
+
+-- JSON_EXTRACT also works on JSONB
+SELECT JSON_EXTRACT(payload, '$.count') FROM api_responses; -- 42
 ```
 
 If the payload is malformed, fix the JSON text before inserting:
@@ -292,13 +304,70 @@ INSERT INTO api_responses VALUES (1, '/bad', '{count: 42}');
 -- ERROR 22P02: invalid value: invalid JSON: key must be a string
 ```
 
-<div class="callout callout-design">
-<span class="callout-icon">⚙️</span>
+### JSONB Binary Format
+
+JSONB stores JSON values in a compact binary format (PostgreSQL-inspired JEntry layout):
+
+- **Container header** (4 bytes): bit 31 = 1 for arrays, bits 30..0 = element count
+- **JEntry array**: one `u32` per element encoding type + length/offset
+- **Data section**: key strings sorted bytewise-length-first (enables binary search), then value payloads
+- **Stride-32 optimization**: every 32nd JEntry stores an absolute offset → `O(1)` random access to any element
+
+Key extraction (`data->'name'`) performs a binary search over the sorted key section —
+zero heap allocation for the lookup.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">⚡</span>
 <div class="callout-body">
-<span class="callout-label">Design Decision — One JSON Type</span>
-Phase 11.4 avoids PostgreSQL's <code>json</code> vs <code>jsonb</code> split at the SQL surface: applications declare only <code>JSON</code>, while the current implementation stores validated text and defers binary JSONB plus GIN indexing to a later storage/index subphase.
+<span class="callout-label">Advantage — Zero-Allocation Key Lookup</span>
+<code>JsonbRef::get_key()</code> binary-searches the sorted key section without any heap allocation. PostgreSQL <code>findJsonbValueFromContainer()</code> does the same but only after a separate parse phase; AxiomDB stores data pre-sorted at write time so every read is O(log k) with k = number of keys.
 </div>
 </div>
+
+### JSON Functions
+
+All JSON functions accept both `JSON` (text-backed) and `JSONB` (binary) values:
+
+| Function | Description |
+|----------|-------------|
+| `JSON_EXTRACT(doc, path)` | Extract value at `$.key`, `$[0]`, nested paths |
+| `JSON_SET(doc, path, val)` | Set value at path |
+| `JSON_REMOVE(doc, path)` | Remove value at path |
+| `JSON_KEYS(doc)` | Return object keys as JSON array |
+| `JSON_TYPE(doc)` | Return `'OBJECT'`, `'ARRAY'`, `'STRING'`, etc. |
+| `JSON_VALID(doc)` | Return 1 if valid JSON, 0 otherwise |
+| `JSON_MERGE_PATCH(a, b)` | RFC 7396 merge: `b` overwrites keys in `a` |
+| `JSON_CONTAINS(doc, query)` | Return 1 if `query` is a subset of `doc` |
+| `JSON_OVERLAPS(a, b)` | Return 1 if `a` and `b` share any element |
+| `JSON_ARRAY_LENGTH(arr)` | Length of array; NULL if not an array |
+| `JSON_DEPTH(val)` | Maximum nesting depth |
+| `JSON_PRETTY(val)` | Formatted JSON text with indentation |
+| `TO_JSONB(text)` | Convert JSON text to binary JSONB |
+
+### JSONPath
+
+`JSONB` supports SQL:2016 JSONPath expressions:
+
+| Expression | Meaning |
+|------------|---------|
+| `$` | Root node |
+| `$.key` | Object field |
+| `$[0]` | Array element at index |
+| `$.*` | All object values |
+| `$[*]` | All array elements |
+| `$..key` | Recursive descent — all `key` fields at any depth |
+| `$[?(@.price > 10)]` | Filter: array elements matching predicate |
+
+```sql
+-- Find all orders over $100
+SELECT JSON_PATH_QUERY(payload, '$[?(@.total > 100)]') FROM api_responses;
+
+-- Get first tag from each document
+SELECT JSON_PATH_QUERY_FIRST(payload, '$.tags[0]') FROM api_responses;
+
+-- Check if a path exists
+SELECT JSON_PATH_EXISTS(payload, '$.user.email') FROM api_responses;
+```
 
 ---
 

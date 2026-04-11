@@ -326,6 +326,8 @@ pub enum Token<'src> {
     TyUuid,
     #[token("JSON", ignore(ascii_case))]
     TyJson,
+    #[token("JSONB", ignore(ascii_case))]
+    TyJsonb,
 
     // ── Miscellaneous ─────────────────────────────────────────────────────────
     #[token("SEPARATOR", ignore(ascii_case))]
@@ -506,9 +508,14 @@ pub enum Token<'src> {
     /// `>>` — bitwise shift right.
     #[token(">>")]
     ShiftRight,
-    /// `->>` — JSON field extraction returning text/scalar.
+    /// `->>` — JSON field extraction returning text/scalar (Phase 11.4).
+    /// MUST appear before `->` in the logos attribute list so the longer token wins.
     #[token("->>")]
     JsonExtractText,
+    /// `->` — JSON sub-document extraction returning JSONB (Phase 11.16).
+    /// MUST appear after `->>` but before `-` and `>` individually.
+    #[token("->")]
+    JsonExtractSub,
     #[token("<")]
     Lt,
     #[token(">")]

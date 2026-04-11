@@ -54,7 +54,12 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         }
 
         "json_extract" | "json_set" | "json_remove" | "json_keys" | "json_valid"
-        | "json_type" => json::eval(lower.as_str(), args, row),
+        | "json_type" | "json_merge_patch" | "json_contains" | "json_overlaps"
+        | "json_array_length" | "json_depth" | "json_pretty"
+        | "to_jsonb" | "jsonb"
+        | "json_path_exists" | "json_path_query" | "json_path_query_first" => {
+            json::eval(lower.as_str(), args, row)
+        }
 
         // Phase 11.6: MATCH(text_col, 'query terms') → relevance score (f64).
         // Returns 0.0 if no match, >0.0 if terms found. Higher = more matches.

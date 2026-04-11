@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 40.9 FreeList Tier-1 — per-connection `LocalPageBatch` (64 pages/refill, adaptive up to 256) eliminates 99% of global `Mutex<FreeList>` acquisitions. Lock-free `SegQueue` recycle path for committed freed pages. Wired through all hot-path allocators (heap, clustered tree, index tree, overflow chains). Benchmark: 28.8× single-thread, 703× 8-thread speedup over per-page Mutex baseline.
+**Last completed subphase:** 11.16 Binary JSONB + JSONPath — `Value::Jsonb(Arc<Vec<u8>>)`, binary JEntry encoder/decoder with O(1) stride-based element access, `->` operator, JSONPath compiler (lax/strict, filter expressions, recursive descent), `JSON_MERGE_PATCH`, `JSON_CONTAINS`, `JSON_OVERLAPS`, `JSON_ARRAY_LENGTH`, `JSON_DEPTH`, `JSON_PRETTY`, `TO_JSONB`; 20 integration tests.
 
-**Active development:** Phase 40 — Clustered engine performance optimizations (40.1 → 40.9 done; 40.10 Database Lock Redesign, 40.11 Executor Refactoring, 40.12 Integration Tests next)
+**Active development:** Phase 11 — Robustness and indexes (11.16 closed; 11.17 GIN index for JSONB next)
 
-**Next milestone:** 40.10 — Database Lock Redesign: remove `Arc<RwLock<Database>>`, `SharedDatabase` with individual subsystem locks, connections run DML concurrently
+**Next milestone:** 11.17 — GIN index for JSONB: `CREATE INDEX ... USING gin` on JSONB columns; `@>` containment operator uses the index for `O(log n)` lookup instead of full table scan
 
 **Concurrency note:** the current server already supports concurrent read-only
 queries, but mutating statements are still serialized through a database-wide
@@ -97,7 +97,7 @@ locking clauses.
 | 8 | Advanced SQL | ⚠️ Planned | Window functions, CTEs, recursive queries |
 | 9 | VACUUM / GC | ⚠️ Planned | Dead row cleanup, freelist compaction |
 | 10 | MySQL wire protocol | ⚠️ Planned | COM_QUERY, result set packets, handshake |
-| 11 | Robustness and indexes | ✅ Complete | BRIN, TOAST, refcounted BLOB chains, in-memory mode, native JSON, partial indexes, optimizer gaps |
+| 11 | Robustness and indexes | 🔄 Active | BRIN, TOAST, refcounted BLOB chains, in-memory mode, native JSON (11.4), binary JSONB + JSONPath (11.16); GIN index for JSONB pending (11.17) |
 | 12 | Full-text search | ⚠️ Planned | Inverted index, BM25 ranking |
 | 13 | Foreign key checks | ⚠️ Planned | Constraint validation on insert/delete |
 | 14 | Vectorized execution | ⚠️ Planned | SIMD scans, morsel-driven pipeline |

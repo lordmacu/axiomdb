@@ -192,6 +192,7 @@ pub fn column_type_to_data_type(ct: ColumnType) -> DataType {
         ColumnType::Float => DataType::Real,
         ColumnType::Text => DataType::Text,
         ColumnType::Json => DataType::Json,
+        ColumnType::Jsonb => DataType::Jsonb,
         ColumnType::Bytes => DataType::Bytes,
         ColumnType::Timestamp => DataType::Timestamp,
         ColumnType::Uuid => DataType::Uuid,
@@ -213,6 +214,7 @@ pub fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
             ColumnType::Bytes => DataType::Bytes,
             ColumnType::Timestamp => DataType::Timestamp,
             ColumnType::Uuid => DataType::Uuid,
+            ColumnType::Jsonb => DataType::Jsonb,
         })
         .collect()
 }
@@ -722,6 +724,7 @@ pub(crate) fn coerce_values(
                 ColumnType::Bytes => DataType::Bytes,
                 ColumnType::Timestamp => DataType::Timestamp,
                 ColumnType::Uuid => DataType::Uuid,
+                ColumnType::Jsonb => DataType::Jsonb,
             };
             coerce(v, target, CoercionMode::Strict)
         })
@@ -757,6 +760,7 @@ pub(crate) fn coerce_values_with_ctx(
             ColumnType::Bytes => DataType::Bytes,
             ColumnType::Timestamp => DataType::Timestamp,
             ColumnType::Uuid => DataType::Uuid,
+            ColumnType::Jsonb => DataType::Jsonb,
         };
 
         if ctx.strict_mode {

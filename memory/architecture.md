@@ -1,533 +1,90 @@
 # Architecture Notes
 
+## 2026-04-10 - JSONB binary layout (11.16)
+
+- `crates/axiomdb-types/src/jsonb.rs` owns the binary JSONB format:
+  - container header (u32): bit31=array, bits30..0=count
+  - JEntry array (u32 per element): bit31=HAS_OFF, bits30..28=type, bits27..0=len/offset
+  - stride=32: every 32nd JEntry stores an absolute offset for O(1) random access
+  - key sort order: bytewise-length-first (shorter keys first, then lexicographic)
+  - `JsonbEncoder::encode` uses iterative DFS with explicit `Vec<Frame>` stack; depth limit 256
+  - `JsonbRef::get_key` uses binary search over sorted key section; no heap alloc for lookup
+- `Value::Jsonb(Arc<Vec<u8>>)` is the in-memory type; `DataType::Jsonb` discriminant 10; `ColumnType::Jsonb = 10`
+- `->` operator lowers to `BinaryOp::JsonSub`; `->>` still lowers to `JSON_EXTRACT`
+- JSONPath: `crates/axiomdb-sql/src/eval/jsonpath.rs` owns compiler + executor with lax/strict modes
+- All existing Phase 11.4 JSON functions upgraded to binary path for `Value::Jsonb` input
+
 ## 2026-04-10 - Refcounted TOAST/BLOB overflow chains (11.2d)
 
-- `crates/axiomdb-storage/src/clustered_overflow.rs` now has two compatible
-  overflow-chain contracts:
-  - legacy clustered row overflow: body starts with `next_page: u64`, then
-    payload bytes; used by clustered row tail spill
-  - refcounted TOAST/BLOB overflow: body starts with `ABOB`, version, flags,
-    `next_page`, `part_len`, and first-page `refcount`
-- Only TOAST/BLOB-owned chains use the refcounted format. Clustered row
-  overflow stays non-refcounted so Phase 39 physical descriptors remain stable.
-- `read_blob_chain()` is the compatibility boundary: it detects `ABOB` and reads
-  self-delimiting chunks through `part_len`, or falls back to the legacy
-  `read_chain()` path using the raw length from the inline TOAST pointer.
-- `free_blob()` is the ownership boundary for TOAST cleanup. It decrements the
-  first-page refcount and frees the chain only at zero; `incref_blob()` exists
-  now to support Phase 14.9 content-addressed BLOB dedup.
-- Row codec placeholders include `raw_len` so detoast can read either format:
-  `__toast__:page_id:compressed:raw_len`.
+- `crates/axiomdb-storage/src/clustered_overflow.rs` has two compatible overflow-chain contracts:
+  - legacy clustered row overflow: body starts with `next_page: u64`, then payload bytes
+  - refcounted TOAST/BLOB overflow: body starts with `ABOB`, version, flags, `next_page`, `part_len`, first-page `refcount`
+- `read_blob_chain()` is the compatibility boundary: detects `ABOB` or falls back to legacy path
+- `free_blob()` decrements first-page refcount; frees chain only at zero
+- Row codec TOAST placeholder: `__toast__:page_id:compressed:raw_len`
 
 ## 2026-04-10 - Native JSON boundary (11.4)
 
-- AxiomDB now exposes exactly one SQL `JSON` type at the catalog/API boundary.
-  Phase 11.4 stores it as validated UTF-8 JSON text, not binary JSONB, so the
-  public type contract is stable while JSONB/GIN work remains a later storage
-  and index subphase.
-- The row codec contract is:
-  - `Value::Json(String)` uses the same u24 length-prefixed payload shape as
-    `TEXT`
-  - `DataType::Json` selects the decode arm and returns `Value::Json`
-  - encode validates JSON syntax and applies the same NFC normalization rule as
-    `TEXT`
-  - TOAST sentinel decoding preserves the logical JSON variant so detoast can
-    resolve the overflow value back to `Value::Json`
-- SQL parser/evaluator contract:
-  - the lexer has a dedicated `JSON` type token and `->>` token
-  - `data->>'field'` is lowered to `JSON_EXTRACT(data, '$.field')` instead of
-    adding a new `BinaryOp`
-  - `eval/functions/json.rs` owns `JSON_EXTRACT`, `JSON_SET`, `JSON_REMOVE`,
-    `JSON_KEYS`, `JSON_VALID`, and `JSON_TYPE`
-- Wire/API contract: MySQL result packets and prepared statement metadata expose
-  JSON values as string-compatible payloads until a dedicated protocol mapping is
-  justified. The in-memory value still remains `Value::Json`.
+- `Value::Json(String)` uses u24 length-prefixed payload, same shape as TEXT
+- `DataType::Json = 9` → decode arm returns `Value::Json`, not `Value::Text`
+- `data->>'field'` lowers to `JSON_EXTRACT(data, '$.field')` (no new BinaryOp)
+- Wire: JSON exposed as string-compatible payload on MySQL wire
 
-## 2026-04-09 — ALTER TABLE ADD PRIMARY KEY and indexed DROP/MODIFY repair
+## 2026-04-09 — ALTER TABLE + ANSI quote mode hardening
 
-- `crates/axiomdb-sql/src/executor/ddl_alter_constraint.rs` now treats
-  `ALTER TABLE ... ADD PRIMARY KEY (...)` as a staged heap→clustered migration:
-  - build a provisional unique heap index root from visible rows
-  - reject `NULL` PK components and duplicate tuples before any physical swap
-  - persist primary-index metadata and mark PK columns `NOT NULL`
-  - re-resolve the table and reuse `alter_rebuild_to_clustered(...)`
-- `crates/axiomdb-sql/src/executor/ddl_alter_column.rs` now owns the ALTER
-  repair matrix for indexed `DROP COLUMN` / `MODIFY COLUMN`:
-  - detect dependency through key columns, `INCLUDE` columns, and partial-index predicates
-  - reject PRIMARY KEY / FOREIGN KEY / CHECK-dependent column changes
-  - heap rewrite path rebuilds every surviving secondary index because `RecordId`
-    bookmarks change
-  - clustered rewrite path drops or rebuilds only the affected secondary roots
-- `crates/axiomdb-catalog/src/writer.rs` now exposes:
-  - `replace_index_def(...)` for MVCC-safe full-row index metadata replacement
-  - `replace_foreign_key(...)` for FK column-ordinal remap after unrelated column drops
-- The ALTER invariant is now:
-  - old roots remain authoritative until row rewrite succeeds
-  - repaired roots are written back through catalog replacement helpers
-  - old index pages are reclaimed only via deferred free, never inline during the swap
-
-## 2026-04-09 — ANSI quote mode and closeout hardening
-
-- `crates/axiomdb-sql/src/lexer.rs` and `crates/axiomdb-sql/src/parser/mod.rs`
-  now treat MySQL variable prefixes as first-class tokens:
-  - `Token::AtAt` for `@@`
-  - `Token::At` for `@`
-  - `parse_set_variable(...)` strips optional `session.` / `global.` scope after tokenization
-- The `ansi_quotes` session bit is now one shared contract across parser and
-  wire helpers:
-  - lexer resolves raw `"` fragments to `StringLit` vs `DqIdent`
-  - raw-SQL helpers use the same bit for parameter counting and statement splitting
-  - plan-cache lookup no longer crosses quote-mode boundaries
-- Connection cleanup now has a stronger invariant in `mysql/handler.rs`:
-  - before resetting or dropping a session, the server checks `session.conn_txn`
-  - if a transaction is still open, it issues `ROLLBACK` under the database write lock
-  - reset/disconnect paths therefore cannot leak writer ownership into the next connection
-- Clustered validation hardening now includes:
-  - staged clustered INSERT batches track per-statement PKs so rollback truncates
-    only rows introduced by the failing statement
-  - clustered UPDATE secondary maintenance recompiles predicate dependencies and
-    treats predicate-only changes as index-affecting
-  - uniqueness checks on clustered secondaries ignore stale dead entries by
-    verifying visibility through the authoritative clustered primary root
+- `ddl_alter_constraint.rs`: `ALTER TABLE ... ADD PRIMARY KEY` → staged heap→clustered migration
+- `ddl_alter_column.rs`: indexed DROP/MODIFY repair matrix (PK/FK/CHECK dependencies, heap vs clustered rewrite)
+- `catalog/writer.rs`: `replace_index_def`, `replace_foreign_key` for MVCC-safe replacement
+- `lexer.rs`: `Token::AtAt` (`@@`), `Token::At` (`@`); `ansi_quotes` bit shared across parser and wire helpers
 
 ## 2026-04-03 — Aggregate hash execution + zero-alloc clustered scan (39.21)
 
-- `crates/axiomdb-sql/src/executor/aggregate.rs` now has two specialized hash
-  table types:
-  - `GroupTablePrimitive`: `hashbrown::HashMap<i64, usize>` — INT/BIGINT single-column
-    GROUP BY, no key serialization, pure integer comparison
-  - `GroupTableGeneric`: `hashbrown::HashMap<Box<[u8]>, usize>` — multi-column / TEXT /
-    mixed-type GROUP BY, key bytes reused per row via clear+extend
-- `GroupEntry` now uses `non_agg_col_values` (sparse slice of referenced columns)
-  instead of the full `representative_row` clone; indices pre-computed once before scan
-- `value_agg_add` provides direct arithmetic on `Value` variants for SUM/MIN/MAX/COUNT
-- `crates/axiomdb-storage/src/clustered_tree.rs` now exports `scan_all_callback<F>`:
-  - callback receives `(&[u8], Option<(overflow_first_page, tail_len)>)`
-  - bypasses `ClusteredRangeIter`, avoids `ClusteredRow` alloc and `reconstruct_row_data` copy
-  - for inline rows (common case): zero extra allocation per row
-- `crates/axiomdb-sql/src/table.rs` now exports `scan_clustered_table_masked(mask: Option<&[bool]>)`
-  backed by `scan_all_callback`; `scan_clustered_table` delegates to it with `mask = None`
-- `collect_expr_columns` walks SELECT/WHERE/GROUP BY/HAVING/ORDER BY to build a decode mask;
-  now covers all `Expr` variants including `GroupConcat` (was `_ => {}` before, a latent bug)
+- `GroupTablePrimitive` (INT/BIGINT single-col GROUP BY) and `GroupTableGeneric` (multi-col/TEXT)
+- `scan_all_callback` in `clustered_tree.rs`: callback-based scan, zero extra allocation for inline rows
+- `scan_clustered_table_masked(mask)` backed by `scan_all_callback`
 
-## 2026-04-03 — Clustered legacy rebuild bridge
+## 2026-04-03 — Clustered VACUUM and root-persistence fix (39.18)
 
-- `crates/axiomdb-sql/src/executor/ddl.rs` now owns the first executor-visible
-  heap→clustered migration bridge for Phase `39.19`.
-- The rebuild contract is now explicit:
-  - source rows come from the legacy PRIMARY KEY B-Tree in logical key order
-  - a fresh clustered root is built before any catalog metadata changes
-  - every non-primary index is rebuilt as a clustered-secondary bookmark tree
-  - storage is flushed before the catalog swap makes those roots authoritative
-  - old heap/index pages are reclaimed only through `txn.defer_free_pages(...)`
-    after commit, never via inline `free_page()` during the swap
-- The SQL boundary is intentionally narrow:
-  - `ALTER TABLE ... REBUILD` is for legacy heap+PK tables only
-  - modern `CREATE TABLE ... PRIMARY KEY ...` still starts clustered directly
-  - rollback of newly allocated rebuild pages is still best-effort inside the
-    statement path; generic allocated-page rollback tracking remains future work
+- Clustered purge: descend once to leftmost leaf, walk `next_leaf`, remove cells where delete-mark is safe
+- `BTree::delete_many_in` may rotate/collapse root → VACUUM must persist new root to catalog immediately
 
-## 2026-04-03 — Clustered VACUUM and clustered root-persistence fix
+## 2026-04-02 — Clustered storage (Phase 39: 39.1–39.17)
 
-- `crates/axiomdb-sql/src/vacuum.rs` now owns the executor-visible clustered
-  maintenance bridge for Phase `39.18`.
-- The clustered purge contract is now explicit:
-  - descend once to the leftmost clustered leaf
-  - walk `next_leaf`
-  - remove only cells whose delete-mark is physically safe
-  - free any overflow chain owned by each purged cell
-  - clean clustered secondaries only when the bookmarked clustered row no longer
-    exists physically after purge
-- The shared vacuum/index-cleanup contract is also tighter now:
-  - `BTree::delete_many_in(...)` may rotate or collapse the root
-  - VACUUM must persist that new root into the catalog immediately
-  - clustered and heap vacuum now share that root-persistence rule
-- `crates/axiomdb-storage/src/clustered_tree.rs` now exports
-  `descend_to_leaf_pub(...)` for executor-side batched clustered leaf work
-  without re-running a full row lookup
+- `clustered_internal.rs`: clustered internal page format
+- `clustered_tree.rs`: clustered tree controller (insert/read/update/delete/rebalance + `scan_all_callback`)
+- `clustered_overflow.rs`: overflow-page chain for large clustered rows
+- `clustered_secondary.rs`: secondary key = `secondary_logical_key ++ missing_PK_columns`
+- `clustered_tree.rs` + `clustered.rs` (WAL): row-image codec for WAL; key=PK bytes, payload=exact row image
+- Catalog `TableDef`: `root_page_id` + `storage_layout` (heap vs clustered)
+- CREATE TABLE with explicit PRIMARY KEY → clustered tree; without PK → heap
+- Variable-size: split by byte volume, not key count; left page keeps old page ID
 
-## 2026-04-02 — Clustered internal page primitive, clustered insert/read/update/delete/rebalance, clustered secondary bookmarks, clustered overflow pages, clustered WAL support, clustered crash recovery, clustered CREATE TABLE, and clustered SQL INSERT/SELECT/UPDATE/DELETE
+## 2026-03-29 — Integration test structure
 
-- `crates/axiomdb-storage/src/clustered_internal.rs` owns the clustered
-  internal page format for Phase `39.2`.
-- `crates/axiomdb-storage/src/clustered_tree.rs` now owns the first clustered
-  tree controller for Phases `39.3`, `39.4`, `39.5`, `39.6`, `39.7`, `39.8`, `39.10`, `39.11`, and `39.12`.
-- `crates/axiomdb-storage/src/clustered_overflow.rs` now owns the overflow-page
-  chain primitive for large clustered rows in Phase `39.10`.
-- `crates/axiomdb-wal/src/clustered.rs` now owns the logical row-image codec for
-  clustered WAL in Phases `39.11` and `39.12`.
-- `crates/axiomdb-sql/src/clustered_secondary.rs` now owns the clustered-first
-  secondary bookmark layout for Phase `39.9`.
-- `crates/axiomdb-catalog/src/schema.rs` and `crates/axiomdb-catalog/src/writer.rs`
-  now own the dual-mode table-root contract for Phase `39.13`.
-- `crates/axiomdb-sql/src/executor/ddl.rs` now decides heap vs clustered table
-  creation from the presence of an explicit primary key.
-- `crates/axiomdb-sql/src/clustered_table.rs` now owns executor-facing clustered
-  row preparation for Phase `39.14`.
-- `crates/axiomdb-sql/src/executor/select.rs` now owns the clustered executor
-  read bridge for Phase `39.15`.
-- `crates/axiomdb-sql/src/executor/update.rs` now owns the clustered executor
-  rewrite bridge for Phase `39.16`.
-- `crates/axiomdb-sql/src/executor/delete.rs` now owns the clustered executor
-  delete bridge for Phase `39.17`.
-- The architecture still keeps storage and tree responsibilities separate:
-  - storage owns page layout, free-space accounting, binary search, and page-local mutation
-  - `clustered_tree` owns descent, exact leaf search, split planning, separator propagation, and root growth
-  - the executor now exposes clustered `INSERT`, `SELECT`, `UPDATE`, and `DELETE`
-  - clustered maintenance paths remain the next executor-visible cuts
-- The catalog/root contract is now generic instead of heap-specific:
-  - `TableDef.root_page_id` points to the primary row-store root for the table
-  - `TableDef.storage_layout` tells the executor whether that root is a heap chain or a clustered tree
-  - logical primary-index metadata on clustered tables reuses the same `root_page_id`
-- The child mapping rule remains explicit:
-  - `leftmost_child` lives in the 16-byte page-local header
-  - every separator cell stores only its `right_child`
-  - logical child `i` is:
-    - `0` → `leftmost_child`
-    - `i > 0` → `right_child` of cell `i - 1`
-- The clustered split policy is intentionally in-place for the left half:
-  - old page ID stays as the left page
-  - only the new right sibling is allocated
-  - parent propagation inserts only `(separator_key, right_child_pid)`
-- The clustered point-lookup contract is currently one-version only:
-  - visible current inline row → return it
-  - missing key → `None`
-  - invisible current inline row → `None`
-  - no undo/version-chain reconstruction until later clustered MVCC phases
-- The clustered leaf-cell contract is now split into physical and logical views:
-  - physical leaf descriptor = `key + RowHeader + total_row_len + local_row_prefix + overflow_first_page?`
-  - logical row bytes are reconstructed only when a read or update path needs them
-  - split / merge / rebalance move physical descriptors and do not rewrite overflow payload
-- The clustered overflow contract is now explicit:
-  - only clustered rows may spill payload to overflow pages in Phase 39
-  - overflow pages form a singly linked list of payload chunks
-  - delete-mark keeps the chain reachable
-  - physical delete and shrink-to-inline update free the obsolete chain
-- The clustered range-scan contract mirrors that same boundary:
-  - descend once to the first relevant leaf for the lower bound
-  - then iterate through the `next_leaf` chain in key order
-  - yield only visible current inline rows
-  - skip invisible current inline rows instead of reconstructing older versions
-  - issue bounded prefetch hints while crossing leaf boundaries
-- The clustered update contract is now also explicit:
-  - descend to the owning leaf by exact primary key
-  - rewrite only the current inline version in that leaf
-  - keep key order, parent separators, and `next_leaf` unchanged
-  - allow overwrite or same-leaf rebuild, but never structural relocation in `39.6`
-  - report `HeapPageFull` when the row no longer fits in the same leaf
-- The clustered SQL update contract is now executor-visible:
-  - candidate discovery may start from PK lookup, PK range, clustered secondary bookmark probe, or full clustered scan
-  - WAL records the exact old clustered row image captured from storage, not a reconstructed executor-side header guess
-  - clustered secondary bookmark rewrites now register both index-insert and index-delete undo so rollback can restore the old bookmark set
-- The clustered delete contract is now also explicit:
-  - descend to the owning leaf by exact primary key
-  - stamp `txn_id_deleted` on the current inline version only when it is visible
-  - preserve key bytes, row payload bytes, `txn_id_created`, `row_version`, and `next_leaf`
-  - keep the physical cell inline so older snapshots can still observe it
-  - defer purge to later clustered `VACUUM`
-- The clustered structural-maintenance contract is now also explicit:
-  - `update_with_relocation(...)` uses `update_in_place(...)` as the fast path
-  - physical delete is private helper logic, not the public delete API
-  - underfull and minimum-key-change signals propagate upward separately
-  - sibling rebalance uses encoded-byte occupancy, not fixed key counts
-  - leaf merge preserves `next_leaf`
-  - an empty internal root collapses to its only child
-  - current separator repair assumes the repaired key still fits on the parent page
-- The clustered secondary-bookmark contract is now explicit:
-  - physical secondary key = `secondary_logical_key ++ missing_primary_key_columns`
-  - missing PK columns are derived from the primary index definition, not hard-coded in catalog
-  - scanned secondary entries decode into a logical secondary key plus a full PK bookmark
-  - relocate-only updates are secondary no-ops when both the logical secondary key and PK stay stable
-  - the old `RecordId` payload in `axiomdb-index::BTree` is retained only for compatibility with the fixed page format
-- The clustered WAL contract is now also explicit:
-  - clustered WAL keys use primary-key bytes, not `(page_id, slot_id)`
-  - clustered undo payloads store exact logical row images plus the latest clustered `root_pid`
-  - `TxnManager` tracks clustered roots per `table_id` during the active transaction
-  - rollback and crash recovery restore logical row state, not exact pre-change page topology
-  - `open()` / `open_with_recovery()` rebuild clustered roots from WAL history today
-  - checkpoint/rotation-stable clustered root persistence remains future work
-- The clustered executor boundary is now explicit:
-  - clustered tables are created only when the SQL definition has an explicit `PRIMARY KEY`
-  - tables without explicit PK remain heap-backed for now
-  - clustered `INSERT` now has a dedicated executor branch and writes directly into the clustered tree
-  - clustered `SELECT` now has a dedicated executor branch and reads directly from the clustered tree
-  - clustered `DELETE` now has a dedicated executor branch and delete-marks clustered rows directly in the clustered tree
-  - clustered secondary access methods resolve `secondary key -> PK bookmark -> clustered row`
-  - covering plans emitted as `IndexOnlyScan` are normalized away from heap-era semantics on clustered tables
-  - heap-only executor helpers still reject only the remaining maintenance gaps instead of touching the wrong page format
-  - startup index-integrity repair skips clustered tables until clustered executor/index rebuild work exists
-  - pending heap INSERT batches flush before a clustered INSERT statement so clustered writes do not inherit heap staging semantics accidentally
-  - reusing a delete-marked clustered PK is logged as clustered update undo, not clustered insert undo, so rollback can restore the superseded tombstone image
-  - clustered delete-mark records exact old/new row images and runs parent-side FK restriction checks before mutating the first clustered row
-- Variable-size occupancy is measured in encoded bytes, not key count:
-  - clustered leaves split by cumulative cell footprint
-  - clustered internals split by cumulative separator footprint
-  - clustered underflow rebalance also uses cumulative encoded bytes
-- `remove_at(key_pos, child_pos)` intentionally supports only the two adjacent
-  child removals (`child_pos == key_pos` or `child_pos == key_pos + 1`), which
-  matches real B-tree merge / redistribution semantics and avoids an overly
-  permissive page-local API.
+- `axiomdb-sql/tests/common/mod.rs`: shared harness
+- Tests split by execution path: `integration_executor`, `integration_executor_joins`, etc.
+- One binary per cohesive execution path; split only on mixed responsibility
 
-## 2026-03-29 — Thematic integration test binaries for `axiomdb-sql`
+## 2026-03-27 — WAL fsync pipeline + transactional INSERT staging
 
-- `crates/axiomdb-sql/tests/common/mod.rs` now owns the shared executor-test
-  harness (`setup`, `run`, `run_ctx`, staging helpers, row extractors).
-- Integration tests are now grouped by execution path rather than by one giant
-  catch-all file:
-  - `integration_executor` for base CRUD
-  - `integration_executor_joins` for joins and aggregates
-  - `integration_executor_query` for query-shaping features
-  - `integration_executor_ddl` for `SHOW` / `DESCRIBE` / `TRUNCATE` / `ALTER`
-  - `integration_executor_ctx` for base `SessionContext` and `strict_mode`
-  - `integration_executor_ctx_group` for ctx-path sorted group-by
-  - `integration_executor_ctx_limit` for ctx-path `LIMIT` / `OFFSET` coercion
-  - `integration_executor_ctx_on_error` for ctx-path `on_error`
-  - `integration_executor_sql` for broader SQL semantics
-  - `integration_delete_apply` for DELETE fast paths
-  - `integration_insert_staging` for transactional INSERT staging
-  - `integration_namespacing` for database catalog behavior
-  - `integration_namespacing_cross_db` for explicit cross-database resolution
-  - `integration_namespacing_schema` for schema namespacing and `search_path`
-- The structural rule is:
-  - keep one binary per cohesive execution path
-  - prefer adding related tests to an existing themed binary
-  - split only when a binary starts mixing unrelated paths or grows beyond a practical review/run size
-- Current watch list for future split is empty inside `axiomdb-sql/tests/`; the larger remaining bins are still responsibility-cohesive.
+- `axiomdb-wal/src/fsync_pipeline.rs`: leader-based fsync coalescing (Expired / Acquired / Queued)
+- `PendingInsertBatch` in `SessionContext`: staging for explicit transactions only
+- `executor/staging.rs`: `apply_insert_batch` shared by transactional staging and immediate multi-row INSERT
 
-## 2026-03-26 — Prepared long data over MySQL wire
+## 2026-03-26 — Executor + eval decomposition
 
-- `COM_STMT_SEND_LONG_DATA` is handled entirely in `axiomdb-network/src/mysql/handler.rs`.
-- The command does not take the `Database` mutex and never touches the SQL engine directly.
-- Pending bytes are owned by `PreparedStatement` in `axiomdb-network/src/mysql/session.rs`.
-- Chunks are stored as raw bytes and decoded only in `parse_execute_packet(...)`.
-- Long data has precedence over both the inline execute payload and the null bitmap.
-- `COM_STMT_RESET` clears stmt-local long-data state but keeps the prepared statement, cached analyzed plan, and type metadata.
-- `SHOW STATUS` exposes `Com_stmt_send_long_data` in both session and global scope.
+- `executor/` directory: `mod.rs` facade + `shared`, `select`, `joins`, `aggregate`, `insert`, `update`, `delete`, `bulk_empty`, `ddl`
+- `eval/` directory: `mod.rs` facade + `context`, `core`, `ops`, `functions/`
+- `index_maintenance.rs`: `delete_many_from_indexes` for batch DELETE/UPDATE
+- Stable-RID UPDATE: skip index rewrite only when RID stable AND logical key unchanged
 
-## 2026-03-26 — Executor decomposition
+## 2026-03-27 — Database catalog + DSN parsing
 
-- `crates/axiomdb-sql/src/executor.rs` was replaced by `crates/axiomdb-sql/src/executor/`.
-- `executor/mod.rs` remains the stable facade for `execute`, `execute_with_ctx`, and `last_insert_id_value()`.
-- Responsibility is now split across:
-  - `shared.rs`
-  - `select.rs`
-  - `joins.rs`
-  - `aggregate.rs`
-  - `insert.rs`
-  - `update.rs`
-  - `delete.rs`
-  - `bulk_empty.rs`
-  - `ddl.rs`
-- The current implementation keeps a single logical module via `include!` inside `mod.rs`, which preserves private helper visibility while eliminating the 7K-line monolith.
-- This is an internal refactor only. No SQL-visible behavior or public crate API changed.
+- `axiomdb-catalog`: `axiom_databases` + `axiom_table_databases` relations
+- Pre-22b.3a tables readable without migration (default to `axiomdb` db)
+- `axiomdb-core/src/dsn.rs`: `ParsedDsn::Wire` vs `ParsedDsn::Local`
 
-## 2026-03-26 — Batched B+Tree delete for DELETE / UPDATE
+## 2026-03-26 — Connection lifecycle
 
-- `axiomdb-index/src/tree.rs` now exposes `BTree::delete_many_in(...)` for exact
-  encoded keys that are already sorted ascending.
-- The batch primitive partitions the delete slice by child range, recurses once
-  per affected child, then normalizes the parent once instead of calling the
-  point-delete path in a loop.
-- `axiomdb-sql/src/index_maintenance.rs` stages delete keys per index with
-  `collect_delete_keys_by_index(...)` and executes one batch delete per index
-  through `delete_many_from_indexes(...)`.
-- `DELETE` now batch-deletes index keys after heap deletion.
-- `UPDATE` now batch-deletes old keys before reinserting new keys, which keeps
-  PRIMARY KEY and secondary indexes correct even though heap `RecordId`s change.
-
-## 2026-03-26 — Eval decomposition
-
-- `crates/axiomdb-sql/src/eval.rs` was replaced by `crates/axiomdb-sql/src/eval/`.
-- `eval/mod.rs` keeps the old public facade:
-  - `eval`
-  - `eval_with`
-  - `eval_in_session`
-  - `eval_with_in_session`
-  - `is_truthy`
-  - `like_match`
-  - `CollationGuard`
-  - `ClosureRunner`
-  - `NoSubquery`
-  - `SubqueryRunner`
-- Internal responsibilities are now split into:
-  - `context.rs`
-  - `core.rs`
-  - `ops.rs`
-  - `functions/` by family
-- This is structural only. No SQL-visible evaluator behavior changed.
-
-## 2026-03-26 — Stable-RID UPDATE fast path
-
-- `axiomdb-storage/src/heap.rs` now exposes same-slot tuple rewrite/restore helpers.
-- `axiomdb-storage/src/heap_chain.rs` batches same-page stable-RID rewrites so a
-  page is read once and written once for the eligible rows in that batch.
-- `axiomdb-wal` adds `EntryType::UpdateInPlace` plus matching undo/recovery handling.
-- `axiomdb-sql/src/table.rs` now tries a preserve-RID branch before falling back to
-  heap delete+insert.
-- Index skipping in UPDATE is now keyed on two facts together:
-  - the RID stayed stable
-  - the logical key / partial-index membership for that index did not change
-- This fixed the large UPDATE throughput gap without weakening rollback or recovery.
-
-## 2026-03-27 — Transactional INSERT staging
-
-- `axiomdb-sql/src/session.rs` now owns `PendingInsertBatch` in `SessionContext`.
-- The current staging design is session-scoped but transaction-gated:
-  - only explicit transactions (`BEGIN ... COMMIT`) can append to the batch
-  - autocommit-wrapped single statements do not use it
-- `axiomdb-sql/src/executor/staging.rs` flushes staged rows through:
-  - `TableEngine::insert_rows_batch_with_ctx(...)`
-  - `batch_insert_into_indexes(...)`
-  - one catalog root update per changed index
-- The critical ordering invariant is:
-  - if the next statement cannot continue the current INSERT batch, flush it
-    before taking that statement's savepoint
-- This invariant matters for `rollback_statement` / `savepoint` / `ignore`
-  modes: a later failing statement must not roll back staged rows that logically
-  belonged to earlier successful INSERT statements.
-
-## 2026-03-26 — Explicit MySQL connection lifecycle
-
-- `axiomdb-network/src/mysql/lifecycle.rs` now owns transport-phase tracking for
-  MySQL connections.
-- The lifecycle is explicit: `CONNECTED -> AUTH -> IDLE -> EXECUTING -> CLOSING`.
-- `ConnectionLifecycle` is intentionally separate from `ConnectionState`.
-- `ConnectionState` still owns SQL session variables, prepared statements,
-  warnings, and session counters.
-- `ConnectionLifecycle` owns timeout policy, client interactivity classification,
-  and socket configuration helpers.
-- Auth uses a fixed 10-second timeout.
-- Idle uses `interactive_timeout` or `wait_timeout` depending on the original
-  handshake capability flags.
-- Packet writes during command execution use `net_write_timeout`.
-- `COM_RESET_CONNECTION` recreates `ConnectionState` and resets timeout vars to
-  defaults, but preserves lifecycle metadata such as interactive classification.
-
-## 2026-03-27 — Shared DSN parsing for server and embedded
-
-- `axiomdb-core/src/dsn.rs` now owns DSN normalization and classification.
-- The parser returns one of two typed shapes:
-  - `ParsedDsn::Wire(WireEndpointDsn)`
-  - `ParsedDsn::Local(LocalPathDsn)`
-- `mysql://`, `postgres://`, and `postgresql://` are parsing aliases only.
-- `axiomdb-server` consumes only the wire shape and currently uses only:
-  - bind host
-  - bind port
-  - `data_dir` query param
-- `axiomdb-embedded` consumes only the local shape and rejects query params in
-  `5.15`.
-- The architectural rule is:
-  - parse once in core
-  - validate per consumer
-  - do not silently invent semantics for unsupported DSN fields
-
-## 2026-03-27 — Startup index integrity verification
-
-- `axiomdb-sql/src/index_integrity.rs` owns the startup verifier.
-- The verifier treats heap-visible rows as source of truth and compares them
-  against every catalog-visible index.
-- Readable divergence is repaired by:
-  - rebuilding a fresh index root from heap rows
-  - flushing the rebuilt pages
-  - rotating the catalog root in a WAL-protected txn
-  - deferring free of old tree pages until commit durability is confirmed
-- Unreadable or non-enumerable index trees are not auto-healed; open fails with
-  `DbError::IndexIntegrityFailure`.
-
-## 2026-03-27 — PRIMARY KEY SELECT planner parity
-
-- `axiomdb-sql/src/planner.rs` now treats PRIMARY KEY indexes as first-class
-  candidates for single-table `SELECT`.
-- The local architectural rule is now:
-  - PK equality uses `IndexLookup` unconditionally
-  - PK range can use `IndexRange` through the normal extraction path
-  - session collation can still veto text-key index access, even on PK
-- No executor redesign was needed:
-  - `executor/select.rs` already handled `IndexLookup` / `IndexRange`
-  - the gap was planner eligibility only
-- Both `axiomdb-network` and `axiomdb-embedded` now call the same verifier
-  immediately after `open_with_recovery(...)` and before serving traffic.
-
-## 2026-03-27 — Indexed UPDATE candidate planning
-
-- `axiomdb-sql/src/planner.rs` now owns a second DML discovery entrypoint:
-  - `plan_update_candidates(...)`
-  - `plan_update_candidates_ctx(...)`
-- UPDATE candidate planning intentionally mirrors DELETE candidate planning:
-  - no `stats_cost_gate`
-  - no `IndexOnlyScan`
-  - PK, UNIQUE, secondary, and eligible partial indexes are allowed
-  - non-binary session collation can still veto text-key index access
-- `executor/update.rs` now separates candidate discovery from physical rewrite:
-  - planner selects an access path
-  - candidate `RecordId`s are materialized first
-  - fetched rows recheck the full `WHERE`
-  - surviving rows flow into the existing `5.20` stable-RID / fallback write path
-- The architectural boundary is now explicit:
-  - `6.17` owns indexed UPDATE discovery
-  - `5.20` remains the source of truth for heap/index rewrite semantics
-
-## 2026-03-27 — Indexed multi-row INSERT batch apply
-
-- `axiomdb-sql/src/executor/staging.rs` now owns shared physical apply helpers:
-  - `apply_insert_batch(...)`
-  - `apply_insert_batch_with_ctx(...)`
-- Those helpers are reused by two logically different producers:
-  - `5.21` transactional staging flushes
-  - `6.18` immediate `INSERT ... VALUES (...), (... )`
-- The architectural rule is:
-  - share grouped heap/index physical apply
-  - do not share staged bulk-load semantics blindly
-- In particular, the immediate multi-row path must not reuse the staged
-  `committed_empty` optimization because it lacks the staging path's
-  `unique_seen` prevalidation and still must reject duplicate PRIMARY KEY /
-  UNIQUE values inside a single SQL statement atomically.
-
-## 2026-03-27 — WAL fsync pipeline
-
-- `axiomdb-wal/src/fsync_pipeline.rs` now owns server-side fsync coalescing.
-- The server path no longer depends on the old timer-based `CommitCoordinator`
-  modules from `axiomdb-network/src/mysql/`.
-- The runtime contract is:
-  - `TxnManager::commit()` still writes the Commit record first
-  - the server then calls `pipeline.acquire(commit_lsn, txn_id)`
-  - `Expired` means a previous leader already covered this LSN
-  - `Acquired` means this connection must `flush+fsync`
-  - `Queued(rx)` means release the DB lock and await the leader
-- The old `deferred_commit_mode` hook still exists inside `TxnManager`, but it
-  is now just the internal handoff point from commit serialization to the
-  leader-based fsync pipeline.
-
-## 2026-03-27 — Database catalog and session-scoped default database
-
-- `axiomdb-catalog` now persists logical databases explicitly instead of treating
-  `SHOW DATABASES` and `USE` as wire-only session sugar.
-- Two catalog relations own that state:
-  - `axiom_databases` stores database definitions
-  - `axiom_table_databases` stores database ownership per table id
-- The architectural compatibility rule is:
-  - tables created before `22b.3a` remain readable without migration
-  - missing ownership rows resolve to the implicit default database `axiomdb`
-- `axiomdb-sql/src/analyzer.rs` now applies database defaults in addition to
-  schema defaults:
-  - selected database from `SessionContext` wins
-  - otherwise `axiomdb` is the effective default
-- The current namespace model is intentionally two-level:
-  - database ownership decides which table set is visible
-  - `schema_name` inside `TableDef` remains available for future schema work
-- Cross-database qualification is intentionally still deferred:
-  - the parser/analyzer continue to accept only the current one-part or
-    `schema.table` forms
-  - `database.schema.table` belongs to the next subphase, not this one
-- `DROP DATABASE` is executed as catalog-driven cascade DDL:
-  - enumerate owned tables in the target database
-  - drop each table and its dependent catalog rows
-  - finally delete the database row itself
-- `axiomdb-network/src/mysql/handler.rs` now validates the requested database in
-  both places where MySQL clients can select it:
-  - handshake connect-with-db
-  - `COM_INIT_DB`
-- The wire invariant is now explicit:
-  - unknown databases must fail before the server sends the final auth OK
-  - otherwise clients can observe a spurious successful connect followed by a
-    late catalog error
+- `axiomdb-network/src/mysql/lifecycle.rs`: explicit `CONNECTED → AUTH → IDLE → EXECUTING → CLOSING`
+- `ConnectionLifecycle` (timeout policy) separate from `ConnectionState` (SQL session state)

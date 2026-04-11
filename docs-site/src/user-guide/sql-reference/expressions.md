@@ -13,7 +13,7 @@ From highest to lowest binding (higher = evaluated first):
 |-------|-----------------------------------|---------------|
 | 1     | `()` parentheses                  | —             |
 | 2     | Unary `-`, `NOT`                  | Right         |
-| 3     | JSON `->>` extraction             | Left          |
+| 3     | JSON `->` extraction, `->>` text extraction | Left   |
 | 4     | `*`, `/`, `%`                     | Left          |
 | 5     | `+`, `-`                          | Left          |
 | 6     | `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=` | —         |
@@ -77,6 +77,37 @@ so those statements parse the same way they do on MySQL 8 unless the session
 explicitly enables <code>ANSI_QUOTES</code>.
 </div>
 </div>
+
+---
+
+## JSON Operators
+
+| Operator | Meaning                                     | Example                      | Result type |
+|----------|---------------------------------------------|------------------------------|-------------|
+| `->`     | Extract field or element (typed)            | `data->'name'`               | Text / JSONB container |
+| `->>`    | Extract field or element as text            | `data->>'name'`              | TEXT |
+
+The `->` operator works on both `JSON` and `JSONB` columns. When the extracted value
+is a scalar (string, number, boolean, null) it returns a `TEXT` value. When the
+extracted value is an object or array it returns a `JSONB` sub-document.
+
+Operators can be chained:
+
+```sql
+-- Extract a nested field
+SELECT data->'address'->'city' FROM users;
+
+-- Extract array element then a field from that element
+SELECT data->'tags'->0 FROM docs;  -- first tag
+```
+
+The `->>` operator always returns `TEXT`, stripping the JSON string delimiters:
+
+```sql
+SELECT '{"name":"Alice"}'::JSONB->>'name';   -- Alice   (TEXT, no quotes)
+SELECT '{"name":"Alice"}'::JSONB->'name';    -- Alice   (TEXT scalar)
+SELECT '{"tags":["a","b"]}'::JSONB->'tags';  -- ["a","b"]  (JSONB sub-array)
+```
 
 ---
 

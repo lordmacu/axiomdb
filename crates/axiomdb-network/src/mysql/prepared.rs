@@ -528,6 +528,11 @@ pub fn value_to_sql_literal(v: &Value) -> String {
         Value::BigInt(n) => n.to_string(),
         Value::Real(f) => format!("{f}"),
         Value::Text(s) | Value::Json(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Jsonb(blob) => {
+            let s = axiomdb_types::JsonbDecoder::to_string(blob.as_ref())
+                .unwrap_or_else(|_| "null".to_string());
+            format!("'{}'", s.replace('\'', "''"))
+        }
         Value::Bytes(b) => {
             let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
             format!("x'{hex}'")
