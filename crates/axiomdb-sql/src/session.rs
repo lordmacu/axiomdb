@@ -186,6 +186,7 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         | DbError::TableNotFound { .. }
         | DbError::DatabaseNotFound { .. }
         | DbError::ColumnNotFound { .. }
+        | DbError::IndexNotFound { .. }
         | DbError::AmbiguousColumn { .. }
         | DbError::UniqueViolation { .. }
         | DbError::DuplicateKey

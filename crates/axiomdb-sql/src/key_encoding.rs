@@ -210,7 +210,7 @@ fn decode_value(key: &[u8], pos: usize) -> Result<(Value, usize), DbError> {
             if pos + 9 > key.len() {
                 return Err(trunc());
             }
-            let u = u64::from_be_bytes(key[pos + 1..pos + 9].try_into().unwrap());
+            let u = u64::from_be_bytes(key[pos + 1..pos + 9].try_into().map_err(|_| trunc())?);
             let n = (u ^ (i64::MIN as u64)) as i64 as i32;
             Ok((Value::Int(n), pos + 9))
         }
@@ -219,7 +219,7 @@ fn decode_value(key: &[u8], pos: usize) -> Result<(Value, usize), DbError> {
             if pos + 9 > key.len() {
                 return Err(trunc());
             }
-            let u = u64::from_be_bytes(key[pos + 1..pos + 9].try_into().unwrap());
+            let u = u64::from_be_bytes(key[pos + 1..pos + 9].try_into().map_err(|_| trunc())?);
             let n = (u ^ (i64::MIN as u64)) as i64;
             Ok((Value::BigInt(n), pos + 9))
         }
@@ -228,7 +228,7 @@ fn decode_value(key: &[u8], pos: usize) -> Result<(Value, usize), DbError> {
             if pos + 9 > key.len() {
                 return Err(trunc());
             }
-            let bytes: [u8; 8] = key[pos + 1..pos + 9].try_into().unwrap();
+            let bytes: [u8; 8] = key[pos + 1..pos + 9].try_into().map_err(|_| trunc())?;
             Ok((Value::Real(decode_f64(bytes)), pos + 9))
         }
         0x05 => {
@@ -237,7 +237,7 @@ fn decode_value(key: &[u8], pos: usize) -> Result<(Value, usize), DbError> {
                 return Err(trunc());
             }
             let scale = key[pos + 1];
-            let u = u128::from_be_bytes(key[pos + 2..pos + 18].try_into().unwrap());
+            let u = u128::from_be_bytes(key[pos + 2..pos + 18].try_into().map_err(|_| trunc())?);
             let m = (u ^ (i128::MIN as u128)) as i128;
             Ok((Value::Decimal(m, scale), pos + 18))
         }
@@ -246,7 +246,7 @@ fn decode_value(key: &[u8], pos: usize) -> Result<(Value, usize), DbError> {
             if pos + 9 > key.len() {
                 return Err(trunc());
             }
-            let u = u64::from_be_bytes(key[pos + 1..pos + 9].try_into().unwrap());
+            let u = u64::from_be_bytes(key[pos + 1..pos + 9].try_into().map_err(|_| trunc())?);
             let n = (u ^ (i64::MIN as u64)) as i64 as i32;
             Ok((Value::Date(n), pos + 9))
         }
@@ -255,7 +255,7 @@ fn decode_value(key: &[u8], pos: usize) -> Result<(Value, usize), DbError> {
             if pos + 9 > key.len() {
                 return Err(trunc());
             }
-            let u = u64::from_be_bytes(key[pos + 1..pos + 9].try_into().unwrap());
+            let u = u64::from_be_bytes(key[pos + 1..pos + 9].try_into().map_err(|_| trunc())?);
             let n = (u ^ (i64::MIN as u64)) as i64;
             Ok((Value::Timestamp(n), pos + 9))
         }

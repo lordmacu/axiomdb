@@ -234,6 +234,13 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             Stmt::CreateTableLike(_) => Ok(()),
             // CREATE TABLE AS SELECT — deps come from the inner SELECT.
             Stmt::CreateTableAsSelect(s) => self.visit_select(&s.select),
+            // UNION — deps come from all inner SELECTs.
+            Stmt::Union { selects, .. } => {
+                for s in selects {
+                    self.visit_select(s)?;
+                }
+                Ok(())
+            }
         }
     }
 

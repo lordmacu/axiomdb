@@ -325,6 +325,75 @@ modified files, test state. Commit it. Next session: read it first.
 
 ---
 
+## /subfase-completa
+
+Mark a subphase as completed. Full protocol in `.claude/skills/subfase-completa.md`.
+Usage: `/subfase-completa N.M` (e.g., `/subfase-completa 3.2`).
+
+---
+
+## /fase-completa
+
+Full phase close protocol. Runs final tests, benchmarks, documents, updates memory, commits.
+Full protocol in `.claude/skills/fase-completa.md`.
+Usage: `/fase-completa N` (e.g., `/fase-completa 3`).
+
+---
+
+## /scan-gaps (PROACTIVE)
+
+Discover undocumented gaps by comparing AxiomDB against MySQL/PostgreSQL behavior.
+Full protocol in `.claude/skills/scan-gaps.md`. Flow:
+
+1. Build feature inventory from progreso.md + specs + code
+2. Create checklist comparing against MySQL/PostgreSQL expectations
+3. Create `tools/tmp_gap_test.py` to verify each feature
+4. Classify: WORKS / NEW GAP / KNOWN GAP / DEFERRED / EDGE CASE
+5. Document new gaps in progreso.md
+6. Hand off each new gap to `/hunt-gap` for fixing
+
+Usage: `/scan-gaps fase 3` | `/scan-gaps area parser` | `/scan-gaps fase 1-11` | `/scan-gaps full`
+
+### Proactive triggers — use `/scan-gaps` automatically when:
+
+- The user says "busca gaps", "find bugs", "scan for issues", "compare with MySQL"
+- The user asks to audit or review a phase for completeness
+- After closing a major phase, to verify nothing was missed
+
+---
+
+## /hunt-gap (PROACTIVE)
+
+Proactive gap/bug hunter. Verify and fix documented gaps one at a time.
+Full protocol in `.claude/skills/hunt-gap.md`. Flow:
+
+1. Locate gap in `docs/progreso.md` + `specs/`
+2. Reproduce: create `tools/tmp_gap_test.py` (Python, connects via MySQL wire) or grep for code patterns
+3. Classify: CONFIRMED / ALREADY-FIXED / PARTIALLY-FIXED
+4. Root cause: 2+ hypotheses, investigate, identify exact file:line
+5. Fix: minimal change, build + test incrementally
+6. Validate: wire-test regression check, clippy, delete tmp file, update progreso.md
+
+Usage: `/hunt-gap GAP-B.1` | `/hunt-gap fase 3` | `/hunt-gap fase 1-11` | `/hunt-gap all`
+
+### Proactive triggers — use `/hunt-gap` automatically when:
+
+- The user mentions **gaps**, **bugs**, **unwrap**, **panics**, or **missing features**
+- The user asks to **review**, **audit**, or **check** code for problems
+- During `/review-task`, if acceptance criteria reveal a gap not in progreso.md
+- During `/implement-task`, if a test failure reveals an undocumented bug
+- When reading `docs/progreso.md` and seeing `⏳` items in phases already closed
+- When the user says "fix", "solve", "hunt", "find bugs", "verify gaps"
+- After completing a subphase close, if collateral findings were documented
+
+When triggered proactively, announce it:
+```
+Detected [trigger reason]. Activating /hunt-gap protocol for [gap-id].
+```
+Then follow the full protocol from `.claude/skills/hunt-gap.md`.
+
+---
+
 ## Rust code conventions
 
 - **Errors**: use `thiserror`. No `unwrap()` in `src/` — use `?` or `map_err(...)`.

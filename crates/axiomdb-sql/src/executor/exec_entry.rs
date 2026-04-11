@@ -33,6 +33,12 @@ pub fn execute_read_only_with_ctx(
             ctx.conn_txn = conn;
             r
         }
+        Stmt::Union { selects, all } => {
+            let conn = ctx.conn_txn.take();
+            let r = execute_union(selects, all, &exec_ctx, conn.as_ref(), ctx);
+            ctx.conn_txn = conn;
+            r
+        }
         Stmt::ShowTables(mut s) => {
             if s.schema.is_none() {
                 s.schema = Some(ctx.current_schema().to_string());

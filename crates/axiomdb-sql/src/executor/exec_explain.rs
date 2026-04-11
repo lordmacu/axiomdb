@@ -10,6 +10,9 @@ fn dispatch(
 ) -> Result<QueryResult, DbError> {
     match stmt {
         Stmt::Select(s) => execute_select(s, storage, txn, Some(conn_txn)),
+        Stmt::Union { .. } => Err(DbError::NotImplemented {
+            feature: "UNION in legacy dispatch — use session-aware path".into(),
+        }),
         Stmt::Insert(s) => execute_insert(s, storage, txn, conn_txn),
         Stmt::Update(s) => execute_update(s, storage, txn, conn_txn),
         Stmt::Delete(s) => execute_delete(s, storage, txn, conn_txn),
@@ -133,6 +136,20 @@ fn execute_explain(
 ) -> Result<QueryResult, DbError> {
     match inner {
         Stmt::Select(s) => explain_select(s, exec_ctx, ctx),
+        Stmt::Union { selects, all } => {
+            // EXPLAIN UNION: show each SELECT's plan.
+            let mode = if all { "UNION ALL" } else { "UNION" };
+            let columns = explain_columns();
+            let mut rows = Vec::new();
+            for (i, s) in selects.into_iter().enumerate() {
+                rows.push(vec![
+                    Value::Text(format!("{mode} branch {}", i + 1)),
+                    Value::Text(format!("{:?}", s.from)),
+                    Value::Null, Value::Null, Value::Null, Value::Null,
+                ]);
+            }
+            Ok(QueryResult::Rows { columns, rows })
+        }
         other => {
             // For non-SELECT, just show the statement type.
             let type_name = match &other {

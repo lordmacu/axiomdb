@@ -50,6 +50,9 @@ pub enum DbError {
     #[error("column '{name}' not found in table '{table}'")]
     ColumnNotFound { name: String, table: String },
 
+    #[error("index '{name}' not found")]
+    IndexNotFound { name: String },
+
     // ── Integrity ────────────────────────────────────────────────
     #[error("unique key violation on index '{index_name}'")]
     UniqueViolation {

@@ -47,8 +47,8 @@ fn execute_drop_index(
             Some(tr) => tr,
             None if stmt.if_exists => return Ok(QueryResult::Empty),
             None => {
-                return Err(DbError::NotImplemented {
-                    feature: format!("DROP INDEX — index '{}' not found in any table", stmt.name),
+                return Err(DbError::IndexNotFound {
+                    name: stmt.name.clone(),
                 })
             }
         },
@@ -88,8 +88,8 @@ fn execute_drop_index(
 
     match index_id {
         None if stmt.if_exists => Ok(QueryResult::Empty),
-        None => Err(DbError::NotImplemented {
-            feature: format!("DROP INDEX — index '{}' not found", stmt.name),
+        None => Err(DbError::IndexNotFound {
+            name: stmt.name.clone(),
         }),
         Some(id) => {
             // Delete catalog entry first.
