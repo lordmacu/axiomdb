@@ -8,7 +8,7 @@
 //!   G4: REGEXP/RLIKE parser, XOR parser, <=> parser, hex literals, SET SESSION/GLOBAL
 
 use axiomdb_sql::{
-    ast::{SelectItem, Stmt},
+    ast::{SelectItem, SetValue, Stmt},
     expr::{BinaryOp, Expr},
     parse, parse_with_sql_mode, SqlModeFlags,
 };
@@ -523,6 +523,19 @@ fn test_set_local_prefix_parses() {
 fn test_set_at_at_variable_parses() {
     // @@varname (without qualifier.prefix) strips the @@ prefix
     parse_ok("SET @@autocommit = 0");
+}
+
+#[test]
+fn test_set_session_qualified_variable_parses() {
+    match parse_ok("SET @@session.time_zone = 'UTC'") {
+        Stmt::Set(stmt) => {
+            assert_eq!(stmt.variable, "time_zone");
+            assert!(
+                matches!(stmt.value, SetValue::Expr(Expr::Literal(Value::Text(ref s))) if s == "UTC")
+            );
+        }
+        other => panic!("expected SET, got {other:?}"),
+    }
 }
 
 #[test]
