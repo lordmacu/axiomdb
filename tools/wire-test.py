@@ -12,7 +12,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              39.22 (UPDATE in-place zero-alloc: single/multi field patch, rollback, TEXT-before-INT),
              40.1b (CREATE INDEX on clustered tables), 4.22e (ALTER DROP/MODIFY auto-index repair),
              4.G5 (DELETE/UPDATE ORDER BY+LIMIT, INSERT IGNORE, CREATE LIKE, CTAS, CALL/DO),
-             11.2d (refcounted TOAST/BLOB chain roundtrip), 11.4 (native JSON type + JSON_EXTRACT / ->>)
+             11.2d (refcounted TOAST/BLOB chain roundtrip), 11.4 (native JSON type + JSON_EXTRACT / ->>),
+             11.16 (binary JSONB + JSONPath: -> operator, JSON_MERGE_PATCH, JSON_CONTAINS, JSON_PATH_EXISTS, TO_JSONB)
 """
 import os
 import signal
@@ -934,6 +935,69 @@ row_json_meta = cur.fetchone()
 ok("11.4 JSON_TYPE/JSON_VALID over wire",
    row_json_meta is not None and row_json_meta[0] == "OBJECT" and str(row_json_meta[1]) == "1",
    row_json_meta)
+
+# ── [11.16] Binary JSONB + JSONPath over MySQL wire ──────────────────────────
+
+print("\n[11.16] Binary JSONB + JSONPath over MySQL wire")
+
+cur.execute("DROP TABLE IF EXISTS wt_jsonb_docs")
+cur.execute("CREATE TABLE wt_jsonb_docs (id INT PRIMARY KEY, data JSONB)")
+cur.execute(
+    "INSERT INTO wt_jsonb_docs VALUES "
+    "(1, '{\"name\":\"Alice\",\"age\":30,\"tags\":[\"a\",\"b\"],\"nested\":{\"x\":42}}'),"
+    "(2, '{\"name\":\"Bob\",\"age\":41,\"tags\":[\"c\"]}')"
+)
+
+# JSONB column type accepted — round-trips as JSON text over wire
+cur.execute("SELECT data FROM wt_jsonb_docs WHERE id = 1")
+row_jsonb = cur.fetchone()
+ok("11.16 JSONB SELECT returns JSON text over wire",
+   row_jsonb is not None and "Alice" in str(row_jsonb[0]), row_jsonb)
+
+# -> operator — key extraction from object
+cur.execute("SELECT data->'name' FROM wt_jsonb_docs WHERE id = 1")
+ok("11.16 -> key extraction on JSONB", cur.fetchone() == ("Alice",))
+
+# -> operator — integer index on array
+cur.execute("SELECT data->'tags'->0 FROM wt_jsonb_docs WHERE id = 1")
+ok("11.16 -> chained array index on JSONB", cur.fetchone() == ("a",))
+
+# ->> on JSONB
+cur.execute("SELECT data->>'name' FROM wt_jsonb_docs WHERE id = 2")
+ok("11.16 ->> on JSONB returns text", cur.fetchone() == ("Bob",))
+
+# JSON_EXTRACT on JSONB column
+cur.execute("SELECT JSON_EXTRACT(data, '$.age') FROM wt_jsonb_docs WHERE id = 1")
+row_age = cur.fetchone()
+ok("11.16 JSON_EXTRACT on JSONB returns scalar", row_age is not None and str(row_age[0]) == "30", row_age)
+
+# JSON_MERGE_PATCH
+cur.execute("SELECT JSON_TYPE(JSON_MERGE_PATCH('{\"a\":1,\"b\":2}', '{\"b\":3,\"c\":4}'))")
+ok("11.16 JSON_MERGE_PATCH returns object", cur.fetchone() == ("OBJECT",))
+
+# JSON_CONTAINS
+cur.execute("SELECT JSON_CONTAINS('{\"a\":1,\"b\":2,\"c\":3}', '{\"a\":1}')")
+ok("11.16 JSON_CONTAINS returns 1 for subset", cur.fetchone()[0] in (1, "1", True))
+
+# JSON_ARRAY_LENGTH
+cur.execute("SELECT JSON_ARRAY_LENGTH('[1,2,3,4,5]')")
+ok("11.16 JSON_ARRAY_LENGTH scalar", cur.fetchone()[0] in (5, "5"))
+
+# JSON_DEPTH
+cur.execute("SELECT JSON_DEPTH('{\"a\":{\"b\":1}}')")
+ok("11.16 JSON_DEPTH nested object", cur.fetchone()[0] in (3, "3"))
+
+# JSON_PATH_EXISTS
+cur.execute("SELECT JSON_PATH_EXISTS('{\"a\":{\"b\":1}}', '$.a.b')")
+ok("11.16 JSON_PATH_EXISTS returns true", cur.fetchone()[0] in (1, True, "1"))
+
+# JSON_PATH_QUERY_FIRST on array
+cur.execute("SELECT JSON_PATH_QUERY_FIRST('[10,20,30]', '$[*]')")
+ok("11.16 JSON_PATH_QUERY_FIRST returns first element", cur.fetchone()[0] in (10, "10"))
+
+# TO_JSONB cast
+cur.execute("SELECT JSON_TYPE(TO_JSONB('{\"x\":1}'))")
+ok("11.16 TO_JSONB returns JSONB object", cur.fetchone() == ("OBJECT",))
 
 # ── [4.25b] Structured Error Responses ────────────────────────────────────────
 

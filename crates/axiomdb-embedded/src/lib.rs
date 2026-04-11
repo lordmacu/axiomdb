@@ -619,6 +619,11 @@ mod ffi {
             Value::Text(s) | Value::Json(s) => {
                 CellValue::Text(CString::new(s).unwrap_or_else(|_| CString::new("").unwrap()))
             }
+            Value::Jsonb(blob) => {
+                let s = axiomdb_types::JsonbDecoder::to_string(blob.as_ref())
+                    .unwrap_or_else(|_| "null".to_string());
+                CellValue::Text(CString::new(s).unwrap_or_else(|_| CString::new("").unwrap()))
+            }
             Value::Bytes(b) => CellValue::Blob(b),
             Value::Uuid(u) => {
                 let s = format!(

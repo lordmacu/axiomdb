@@ -39,6 +39,11 @@ fn value_to_key_bytes(v: &Value) -> Vec<u8> {
             buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
             buf.extend_from_slice(s.as_bytes());
         }
+        Value::Jsonb(b) => {
+            buf.push(0x0B);
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b.as_ref());
+        }
         Value::Bytes(b) => {
             buf.push(0x07);
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());

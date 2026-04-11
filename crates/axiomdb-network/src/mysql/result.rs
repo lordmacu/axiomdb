@@ -464,16 +464,16 @@ fn build_row_packet(
 
 fn datatype_to_mysql_type(dt: DataType) -> u8 {
     match dt {
-        DataType::Bool => 0x01,                  // TINY
-        DataType::Int => 0x03,                   // LONG
-        DataType::BigInt => 0x08,                // LONGLONG
-        DataType::Real => 0x05,                  // DOUBLE
-        DataType::Decimal => 0xf6,               // NEWDECIMAL
-        DataType::Text | DataType::Json => 0xfd, // VAR_STRING
-        DataType::Bytes => 0xfc,                 // BLOB
-        DataType::Date => 0x0a,                  // DATE
-        DataType::Timestamp => 0x07,             // TIMESTAMP
-        DataType::Uuid => 0xfd,                  // VAR_STRING
+        DataType::Bool => 0x01,                                    // TINY
+        DataType::Int => 0x03,                                     // LONG
+        DataType::BigInt => 0x08,                                  // LONGLONG
+        DataType::Real => 0x05,                                    // DOUBLE
+        DataType::Decimal => 0xf6,                                 // NEWDECIMAL
+        DataType::Text | DataType::Json | DataType::Jsonb => 0xfd, // VAR_STRING
+        DataType::Bytes => 0xfc,                                   // BLOB
+        DataType::Date => 0x0a,                                    // DATE
+        DataType::Timestamp => 0x07,                               // TIMESTAMP
+        DataType::Uuid => 0xfd,                                    // VAR_STRING
     }
 }
 
@@ -484,7 +484,7 @@ fn column_display_len(dt: DataType) -> u32 {
         DataType::BigInt => 20,
         DataType::Real => 22,
         DataType::Decimal => 65,
-        DataType::Text | DataType::Json => 16_777_215,
+        DataType::Text | DataType::Json | DataType::Jsonb => 16_777_215,
         DataType::Bytes => 16_777_215,
         DataType::Date => 10,
         DataType::Timestamp => 19,
@@ -580,6 +580,8 @@ fn value_to_text(v: &Value) -> String {
             }
         }
         Value::Text(s) | Value::Json(s) => s.clone(),
+        Value::Jsonb(blob) => axiomdb_types::JsonbDecoder::to_string(blob.as_ref())
+            .unwrap_or_else(|_| "null".to_string()),
         Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
         Value::Decimal(m, s) => format_decimal(*m, *s),
         Value::Date(d) => format_date(*d),

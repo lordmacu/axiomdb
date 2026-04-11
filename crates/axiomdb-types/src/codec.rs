@@ -123,6 +123,7 @@ fn validate_type(value: &Value, dt: DataType) -> Result<(), DbError> {
             | (Value::Decimal(..), DataType::Decimal)
             | (Value::Text(_), DataType::Text)
             | (Value::Json(_), DataType::Json)
+            | (Value::Jsonb(_), DataType::Jsonb)
             | (Value::Bytes(_), DataType::Bytes)
             | (Value::Date(_), DataType::Date)
             | (Value::Timestamp(_), DataType::Timestamp)
@@ -156,6 +157,7 @@ pub fn encoded_len(values: &[Value]) -> usize {
             Value::Decimal(..) => 17,
             Value::Uuid(_) => 16,
             Value::Text(s) | Value::Json(s) => 3 + s.len(),
+            Value::Jsonb(b) => 3 + b.len(),
             Value::Bytes(b) => 3 + b.len(),
         })
         .sum();
@@ -253,6 +255,18 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
                     }
                 })?;
                 let bytes = normalized.as_bytes();
+                if bytes.len() > MAX_INLINE_LEN {
+                    return Err(DbError::ValueTooLarge {
+                        len: bytes.len(),
+                        max: MAX_INLINE_LEN,
+                    });
+                }
+                write_u24(&mut buf, bytes.len());
+                buf.extend_from_slice(bytes);
+            }
+            Value::Jsonb(blob) => {
+                // Phase 11.16: binary JSONB stored as u24 length + raw binary bytes.
+                let bytes: &[u8] = blob.as_ref();
                 if bytes.len() > MAX_INLINE_LEN {
                     return Err(DbError::ValueTooLarge {
                         len: bytes.len(),
@@ -410,6 +424,29 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                     Value::Json(s)
                 }
             }
+            DataType::Jsonb => {
+                // Phase 11.16: binary JSONB blob, u24 length prefix + raw bytes.
+                let len = read_u24(bytes, pos)?;
+                pos += 3;
+                if is_toast_sentinel(len) {
+                    let (page_id, raw_len) = decode_toast_pointer(bytes, &mut pos)?;
+                    // TOAST placeholder: encode as empty JSONB blob with a placeholder string.
+                    // The de-TOAST layer resolves this before the user sees it.
+                    let placeholder = format!(
+                        "__toast__:{}:{}:{}",
+                        page_id,
+                        len == TOAST_SENTINEL_LZ4,
+                        raw_len
+                    );
+                    // Store the placeholder as a JSON text value for the TOAST layer.
+                    Value::Json(placeholder)
+                } else {
+                    ensure_bytes(bytes, pos, len)?;
+                    let blob = bytes[pos..pos + len].to_vec();
+                    pos += len;
+                    Value::Jsonb(std::sync::Arc::new(blob))
+                }
+            }
             DataType::Date => {
                 ensure_bytes(bytes, pos, 4)?;
                 let v = i32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
@@ -549,6 +586,25 @@ pub fn decode_row_masked(
                         }
                     }
                 }
+                DataType::Jsonb => {
+                    let len = read_u24(bytes, pos)?;
+                    pos += 3;
+                    if is_toast_sentinel(len) {
+                        let (page_id, raw_len) = decode_toast_pointer(bytes, &mut pos)?;
+                        let placeholder = format!(
+                            "__toast__:{}:{}:{}",
+                            page_id,
+                            len == TOAST_SENTINEL_LZ4,
+                            raw_len
+                        );
+                        Value::Json(placeholder)
+                    } else {
+                        ensure_bytes(bytes, pos, len)?;
+                        let blob = bytes[pos..pos + len].to_vec();
+                        pos += len;
+                        Value::Jsonb(std::sync::Arc::new(blob))
+                    }
+                }
                 DataType::Bytes => {
                     let len = read_u24(bytes, pos)?;
                     pos += 3;
@@ -613,7 +669,7 @@ pub fn decode_row_masked(
                     ensure_bytes(bytes, pos, 16)?;
                     pos += 16;
                 }
-                DataType::Text | DataType::Json | DataType::Bytes => {
+                DataType::Text | DataType::Json | DataType::Jsonb | DataType::Bytes => {
                     let len = read_u24(bytes, pos)?;
                     pos += 3;
                     if is_toast_sentinel(len) {

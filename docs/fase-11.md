@@ -135,3 +135,95 @@ Comando usado:
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 benches/comparison/local_bench.py --scenario json_extract --rows 10000 --engines axiomdb --table
 ```
+
+## 11.16 Binary JSONB + JSONPath - cerrada 2026-04-10
+
+La subfase 11.16 entrega el tipo `JSONB` con layout binario, el operador `->`,
+funciones de contencion y un compilador JSONPath completo.
+
+### Tipo y codec
+
+- `Value::Jsonb(Arc<Vec<u8>>)` — datos en el formato binario, compartidos via `Arc`
+- `DataType::Jsonb` / `ColumnType::Jsonb = 10` — disco estable
+- `CAST('...' AS JSONB)` convierte texto JSON a binario; `TO_JSONB('...')` es alias
+- Wire: se serializa como texto JSON sobre el protocolo MySQL (mismo payload que `TEXT`)
+
+### Layout binario (PostgreSQL jsonb.c — JEntry + stride)
+
+```text
+Container (object u array):
+  [0..3]     u32 header: bit31=1→array, bits30..0=count N
+  [4..E*4+3] JEntry array: E = 2*N (object) o N (array)
+               Object: key JEntries [0..N), value JEntries [N..2N)
+  [E*4+4..]  Data section: keys ordenadas bytewise-length-first, luego valores
+
+JEntry (u32):
+  bit31:     HAS_OFF (0=longitud, 1=offset absoluto desde data start)
+  bits30..28 tipo: 0b000=string, 0b001=numeric, 0b010=false,
+                    0b011=true, 0b100=null, 0b101=container
+  bits27..0  longitud o offset (max 256 MB)
+
+Stride=32: cada 32a JEntry almacena offset absoluto → element_offset(i) O(1).
+Key sort: bytewise-length-first → busqueda binaria con short-circuit.
+Encoder: DFS iterativo con Vec<Frame>; limite 256 niveles.
+```
+
+### Operador `->` y `->>`
+
+- `data->'key'` — `BinaryOp::JsonSub` — extrae sub-valor como `Jsonb` (container) o escalar
+- `data->>'key'` — ya existia; sigue bajando a `JSON_EXTRACT` que retorna texto
+- `data->'tags'->0` — cadena de operadores: primero extrae array, luego indexa
+
+### Funciones nuevas
+
+| Funcion | Descripcion |
+|---|---|
+| `JSON_MERGE_PATCH(a, b)` | RFC 7396 merge patch |
+| `JSON_CONTAINS(doc, query)` | 1 si query es subconjunto de doc |
+| `JSON_OVERLAPS(a, b)` | 1 si tienen algun elemento en comun |
+| `JSON_ARRAY_LENGTH(arr)` | longitud del array (NULL si no es array) |
+| `JSON_DEPTH(val)` | profundidad maxima de anidamiento |
+| `JSON_PRETTY(val)` | texto formateado con indentacion |
+| `TO_JSONB(text)` | convierte JSON text a `Value::Jsonb` |
+
+### JSONPath (`crates/axiomdb-sql/src/eval/jsonpath.rs`)
+
+Compilador + ejecutor con modos lax/strict:
+
+| Expresion | Significado |
+|---|---|
+| `$` | raiz |
+| `$.key` | campo de objeto |
+| `$[0]` | elemento de array por indice |
+| `$.*` | todos los valores de un objeto |
+| `$[*]` | todos los elementos de un array |
+| `$..key` | descenso recursivo (todos los `key` a cualquier profundidad) |
+| `$[?(@.field > val)]` | filtro por predicado |
+
+Funciones expuestas:
+- `JSON_PATH_EXISTS(doc, path)` → `Bool`
+- `JSON_PATH_QUERY(doc, path)` → `Json` (array de resultados)
+- `JSON_PATH_QUERY_FIRST(doc, path)` → escalar o `Null`
+
+### Actualizacion de funciones 11.4
+
+Todas las funciones JSON existentes (`JSON_EXTRACT`, `JSON_SET`, `JSON_REMOVE`,
+`JSON_KEYS`, `JSON_TYPE`, `JSON_VALID`) detectan `Value::Jsonb` en el primer
+argumento y usan el codec binario en lugar de re-parsear texto.
+
+### Validacion
+
+- `cargo test -p axiomdb-sql --test integration_jsonb` — paso, 20 tests.
+- `cargo test -p axiomdb-types` — paso.
+- `cargo test --workspace` — paso.
+- `cargo clippy --workspace -- -D warnings` — paso.
+- `cargo fmt --check` — paso.
+- `tools/wire-test.py` — paso, 350/350 assertions.
+
+### Benchmark
+
+| Benchmark | AxiomDB | MySQL (aprox) | PostgreSQL (aprox) | Target | Max aceptable | Veredicto |
+|---|---:|---:|---:|---:|---:|---|
+| jsonb/encode_small | sin referencia formal | N/A | N/A | sin limite 11.16 | sin limite 11.16 | ✅ |
+| jsonb/decode_small | sin referencia formal | N/A | N/A | sin limite 11.16 | sin limite 11.16 | ✅ |
+| jsonb/get_key | sin referencia formal | N/A | N/A | sin limite 11.16 | sin limite 11.16 | ✅ |

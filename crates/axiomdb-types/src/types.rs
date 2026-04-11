@@ -39,6 +39,9 @@ pub enum DataType {
     /// SQL JSON — stored as u24 LE length prefix + validated UTF-8 JSON text.
     /// Same wire format as Text; distinguished by DataType for operator dispatch.
     Json,
+    /// SQL JSONB — stored as u24 LE length prefix + binary JSONB blob (Phase 11.16).
+    /// O(log k) key access without re-parsing. Binary format: see jsonb.rs.
+    Jsonb,
 }
 
 impl DataType {
@@ -56,6 +59,7 @@ impl DataType {
             Self::Timestamp => "TIMESTAMP",
             Self::Uuid => "UUID",
             Self::Json => "JSON",
+            Self::Jsonb => "JSONB",
         }
     }
 }

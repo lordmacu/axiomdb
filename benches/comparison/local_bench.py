@@ -177,6 +177,12 @@ PRINT_ORDER = [
     "insert_select",
     # ── JSON (Phase 11.4) ──
     "json_extract",
+    # ── JSONB (Phase 11.16) ──
+    "jsonb_extract",
+    "jsonb_contains",
+    "jsonb_path_query",
+    # ── FTS (Phase 11.6/11.7) ──
+    "fts_match",
 ]
 
 PRELOADED_SCENARIOS = {
@@ -200,6 +206,14 @@ PRELOADED_SCENARIOS = {
 # Scenarios that need the bench_json table created and populated.
 NEEDS_JSON = {
     "json_extract",
+    "jsonb_extract",
+    "jsonb_contains",
+    "jsonb_path_query",
+}
+
+# Scenarios that need the bench_fts table created and populated.
+NEEDS_FTS = {
+    "fts_match",
 }
 
 # Scenarios that need the bench_orders table created and populated.
@@ -553,6 +567,35 @@ def rows_data_json(n):
     return rows
 
 
+# Predefined word pools for FTS data generation.
+_FTS_WORDS = [
+    "database", "engine", "storage", "index", "query", "optimizer", "transaction",
+    "concurrency", "isolation", "durability", "checkpoint", "recovery", "buffer",
+    "page", "tuple", "column", "table", "schema", "catalog", "constraint",
+    "primary", "foreign", "unique", "cluster", "partition", "shard", "replica",
+    "snapshot", "vacuum", "compaction", "bloom", "filter", "hash", "btree",
+    "sequential", "parallel", "vectorized", "aggregate", "window", "subquery",
+    "correlated", "materialized", "view", "trigger", "procedure", "function",
+    "expression", "predicate", "selectivity", "cardinality", "histogram",
+    "statistics", "planner", "executor", "scanner", "parser", "lexer",
+    "analyzer", "resolver", "rewriter", "optimizer", "pipeline", "morsel",
+    "cache", "eviction", "prefetch", "write", "ahead", "log", "journal",
+]
+
+
+def rows_data_fts(n):
+    """Generate (id, body TEXT) rows with semi-random searchable content."""
+    rows = []
+    nw = len(_FTS_WORDS)
+    for i in range(1, n + 1):
+        # Each doc gets 8-15 words picked pseudo-deterministically from the pool.
+        count = 8 + (i % 8)
+        words = [_FTS_WORDS[(i * 7 + j * 13) % nw] for j in range(count)]
+        body = " ".join(words)
+        rows.append((i, body))
+    return rows
+
+
 def parse_indexes(raw):
     if not raw:
         return []
@@ -587,7 +630,7 @@ def parse_engines(raw):
     return ordered
 
 
-def schema_statements(kind, indexes, with_orders=False, with_users_copy=False, with_json=False):
+def schema_statements(kind, indexes, with_orders=False, with_users_copy=False, with_json=False, with_fts=False):
     if kind == "pg":
         statements = [
             "DROP TABLE IF EXISTS bench_users CASCADE",
@@ -640,6 +683,9 @@ def schema_statements(kind, indexes, with_orders=False, with_users_copy=False, w
 
     if with_json:
         statements += json_schema_statements(kind)
+
+    if with_fts:
+        statements += fts_schema_statements(kind)
 
     return statements
 
@@ -758,6 +804,28 @@ def json_schema_statements(kind):
         raise ValueError(f"unknown engine kind: {kind}")
 
 
+def fts_schema_statements(kind):
+    if kind == "pg":
+        return [
+            "DROP TABLE IF EXISTS bench_fts CASCADE",
+            """CREATE TABLE bench_fts (
+    id   INT  NOT NULL PRIMARY KEY,
+    body TEXT NOT NULL
+)""",
+        ]
+    elif kind in ("mysql", "axiomdb"):
+        return [
+            "DROP TABLE IF EXISTS bench_fts",
+            """CREATE TABLE bench_fts (
+    id   INT  NOT NULL,
+    body TEXT NOT NULL,
+    PRIMARY KEY (id)
+)""",
+        ]
+    else:
+        raise ValueError(f"unknown engine kind: {kind}")
+
+
 def exec_statements(conn, statements, transactional=False):
     cur = conn.cursor()
     if transactional:
@@ -769,11 +837,12 @@ def exec_statements(conn, statements, transactional=False):
     cur.close()
 
 
-def reset_table(conn, kind, indexes, with_orders=False, with_users_copy=False, with_json=False):
+def reset_table(conn, kind, indexes, with_orders=False, with_users_copy=False, with_json=False, with_fts=False):
     exec_statements(conn, schema_statements(kind, indexes,
                                             with_orders=with_orders,
                                             with_users_copy=with_users_copy,
-                                            with_json=with_json))
+                                            with_json=with_json,
+                                            with_fts=with_fts))
 
 
 def sql_literal(value):
@@ -846,6 +915,16 @@ def prepare_workload(n_rows, multi_values_chunk, autocommit_rows, point_lookups,
     insert_json_sqls = [
         "INSERT INTO bench_json VALUES " + ",".join(chunk)
         for chunk in chunked(json_values_sql, multi_values_chunk)
+    ]
+
+    # ── FTS data ─────────────────────────────────────────────────────────────
+    fts_rows = rows_data_fts(n_rows)
+    fts_values_sql = [
+        "(" + ",".join(sql_literal(v) for v in row) + ")" for row in fts_rows
+    ]
+    insert_fts_sqls = [
+        "INSERT INTO bench_fts VALUES " + ",".join(chunk)
+        for chunk in chunked(fts_values_sql, multi_values_chunk)
     ]
 
     return {
@@ -940,6 +1019,14 @@ def prepare_workload(n_rows, multi_values_chunk, autocommit_rows, point_lookups,
         # ── JSON (Phase 11.4) ────────────────────────────────────────────────
         "json_extract_n": n_rows,
         "json_extract_sql": "SELECT JSON_EXTRACT(data, '$.age') FROM bench_json WHERE JSON_EXTRACT(data, '$.active') = 1",
+        # ── JSONB (Phase 11.16) ──────────────────────────────────────────────
+        "jsonb_extract_n": n_rows,
+        "jsonb_contains_n": n_rows,
+        "jsonb_path_query_n": n_rows,
+        # ── FTS (Phase 11.6/11.7) ────────────────────────────────────────────
+        "n_fts": len(fts_rows),
+        "insert_fts_sqls": insert_fts_sqls,
+        "fts_match_n": n_rows,
     }
 
 
@@ -953,6 +1040,10 @@ def preload_orders(conn, workload):
 
 def preload_json(conn, workload):
     exec_statements(conn, workload["insert_json_sqls"], transactional=True)
+
+
+def preload_fts(conn, workload):
+    exec_statements(conn, workload["insert_fts_sqls"], transactional=True)
 
 
 def emit(engine, scenario, n_ops, mean_s, note=""):
@@ -1344,6 +1435,85 @@ def run_json_extract(conn, engine, kind, _indexes, workload):
     emit(engine, "json_extract", workload["json_extract_n"], mean, "JSON_EXTRACT path filter")
 
 
+# ── JSONB scenarios (Phase 11.16) ─────────────────────────────────────────────
+
+def run_jsonb_extract(conn, engine, kind, _indexes, workload):
+    if kind == "pg":
+        sql = "SELECT data->>'age' FROM bench_json WHERE (data->>'active') = '1'"
+    elif kind == "axiomdb":
+        sql = "SELECT data->>'age' FROM bench_json WHERE data->>'active' = '1'"
+    else:
+        # MySQL does not have JSONB; use JSON_EXTRACT
+        sql = workload.get("json_extract_sql",
+                           "SELECT JSON_EXTRACT(data, '$.age') FROM bench_json WHERE JSON_EXTRACT(data, '$.active') = 1")
+
+    def do():
+        cur = conn.cursor()
+        cur.execute(sql)
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "jsonb_extract", workload["jsonb_extract_n"], mean, "JSONB -> path extract + filter")
+
+
+def run_jsonb_contains(conn, engine, kind, _indexes, workload):
+    if kind == "pg":
+        sql = "SELECT COUNT(*) FROM bench_json WHERE data @> '{\"active\":1}'"
+    elif kind == "axiomdb":
+        sql = "SELECT COUNT(*) FROM bench_json WHERE JSON_CONTAINS(data, '1', '$.active') = 1"
+    else:
+        sql = "SELECT COUNT(*) FROM bench_json WHERE JSON_CONTAINS(data, '1', '$.active')"
+
+    def do():
+        cur = conn.cursor()
+        cur.execute(sql)
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "jsonb_contains", workload["jsonb_contains_n"], mean, "JSON_CONTAINS filter")
+
+
+def run_jsonb_path_query(conn, engine, kind, _indexes, workload):
+    if kind == "pg":
+        sql = "SELECT COUNT(*) FROM bench_json WHERE jsonb_path_exists(data, '$.age ? (@ > 40)')"
+    elif kind == "axiomdb":
+        sql = "SELECT COUNT(*) FROM bench_json WHERE JSON_PATH_EXISTS(data, '$.age') = TRUE AND JSON_EXTRACT(data, '$.age') > 40"
+    else:
+        sql = "SELECT COUNT(*) FROM bench_json WHERE JSON_EXTRACT(data, '$.age') > 40"
+
+    def do():
+        cur = conn.cursor()
+        cur.execute(sql)
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "jsonb_path_query", workload["jsonb_path_query_n"], mean, "JSONPath / path-based filter")
+
+
+# ── FTS scenarios (Phase 11.6/11.7) ──────────────────────────────────────────
+
+def run_fts_match(conn, engine, kind, _indexes, workload):
+    if kind == "pg":
+        sql = "SELECT id, body FROM bench_fts WHERE to_tsvector('english', body) @@ to_tsquery('english', 'database & engine')"
+    elif kind == "axiomdb":
+        sql = "SELECT id, body FROM bench_fts WHERE MATCH(body, '+database +engine') > 0"
+    else:
+        # MySQL FULLTEXT would require an index; use LIKE as fallback
+        sql = "SELECT id, body FROM bench_fts WHERE body LIKE '%database%' AND body LIKE '%engine%'"
+
+    def do():
+        cur = conn.cursor()
+        cur.execute(sql)
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(engine, "fts_match", workload["fts_match_n"], mean, "FTS MATCH boolean query")
+
+
 SCENARIOS = {
     "insert": run_insert,
     "insert_multi_values": run_insert_multi_values,
@@ -1373,6 +1543,10 @@ SCENARIOS = {
     "between_range": run_between_range,
     "insert_select": run_insert_select,
     "json_extract": run_json_extract,
+    "jsonb_extract": run_jsonb_extract,
+    "jsonb_contains": run_jsonb_contains,
+    "jsonb_path_query": run_jsonb_path_query,
+    "fts_match": run_fts_match,
 }
 
 ALL_SCENARIOS = list(SCENARIOS)
@@ -1384,6 +1558,7 @@ def run_scenario(scenario, workload, indexes, selected_engines):
     needs_orders = scenario in NEEDS_ORDERS
     needs_copy = scenario in NEEDS_USERS_COPY
     needs_json = scenario in NEEDS_JSON
+    needs_fts = scenario in NEEDS_FTS
     for engine_key in selected_engines:
         engine, cfg = ENGINE_CONFIGS[engine_key]
         try:
@@ -1394,13 +1569,15 @@ def run_scenario(scenario, workload, indexes, selected_engines):
                 conn = connect_mysql(cfg)
             reset_table(conn, kind, indexes,
                         with_orders=needs_orders, with_users_copy=needs_copy,
-                        with_json=needs_json)
+                        with_json=needs_json, with_fts=needs_fts)
             if scenario in PRELOADED_SCENARIOS or needs_orders or needs_copy:
                 preload_table(conn, workload)
             if needs_orders:
                 preload_orders(conn, workload)
             if needs_json:
                 preload_json(conn, workload)
+            if needs_fts:
+                preload_fts(conn, workload)
             SCENARIOS[scenario](conn, engine, kind, indexes, workload)
             conn.close()
         except Exception as exc:

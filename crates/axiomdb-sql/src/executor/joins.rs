@@ -517,6 +517,7 @@ impl std::hash::Hash for HashableValue {
             Value::BigInt(n) => n.hash(state),
             Value::Real(f) => f.to_bits().hash(state),
             Value::Text(s) | Value::Json(s) => s.hash(state),
+            Value::Jsonb(b) => b.hash(state),
             Value::Bytes(b) => b.hash(state),
             Value::Decimal(m, s) => {
                 m.hash(state);

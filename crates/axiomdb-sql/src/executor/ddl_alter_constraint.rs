@@ -513,6 +513,7 @@ fn expr_to_sql_string(expr: &Expr) -> String {
                 BinaryOp::ShiftLeft => "<<",
                 BinaryOp::ShiftRight => ">>",
                 BinaryOp::Regexp => "REGEXP",
+                BinaryOp::JsonSub => "->",
             };
             format!(
                 "({} {op_str} {})",

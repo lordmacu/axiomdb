@@ -59,7 +59,7 @@ mod tests {
     #[test]
     fn test_column_type_invalid_discriminant() {
         assert!(ColumnType::try_from(0).is_err());
-        assert!(ColumnType::try_from(10).is_err()); // 9 = Json (Phase 11.4)
+        assert!(ColumnType::try_from(11).is_err()); // 10 = Jsonb (Phase 11.16)
         assert!(ColumnType::try_from(255).is_err());
     }
 

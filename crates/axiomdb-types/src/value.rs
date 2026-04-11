@@ -53,6 +53,9 @@ pub enum Value {
     /// SQL JSON — validated UTF-8 JSON text (Phase 11.4).
     /// Always NFC-normalized and syntax-validated on INSERT.
     Json(String),
+    /// SQL JSONB — binary pre-parsed JSONB blob (Phase 11.16).
+    /// Allows O(log k) key access without re-parsing UTF-8 text.
+    Jsonb(std::sync::Arc<Vec<u8>>),
 }
 
 impl Value {
@@ -71,6 +74,7 @@ impl Value {
             Self::Timestamp(_) => "Timestamp",
             Self::Uuid(_) => "Uuid",
             Self::Json(_) => "Json",
+            Self::Jsonb(_) => "Jsonb",
         }
     }
 
@@ -94,6 +98,13 @@ impl fmt::Display for Value {
             // "123456e-2" is unambiguous and avoids a float division.
             Self::Decimal(m, s) => write!(f, "{m}e-{s}"),
             Self::Text(s) | Self::Json(s) => write!(f, "{s}"),
+            Self::Jsonb(b) => {
+                // Display as canonical JSON text
+                match crate::jsonb::JsonbDecoder::to_string(b) {
+                    Ok(s) => write!(f, "{s}"),
+                    Err(_) => write!(f, "<invalid jsonb>"),
+                }
+            }
             Self::Bytes(b) => {
                 write!(f, "\\x")?;
                 for byte in b {

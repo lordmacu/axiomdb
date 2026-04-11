@@ -18,3 +18,7 @@ criterion = { workspace = true }
 [[bench]]
 name    = "row_codec"
 harness = false
+
+[[bench]]
+name    = "jsonb"
+harness = false

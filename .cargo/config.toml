@@ -4,7 +4,7 @@ jobs = 10
 # sccache cache is cold. Re-enable for CI with: rustc-wrapper = "sccache" + incremental = false
 # rustc-wrapper = "sccache"
 # incremental = false
-rustc-wrapper = "/Users/cristian/nexusdb/tools/rustc-macos.sh"
+# rustc-wrapper = "/Users/cristian/nexusdb/tools/rustc-macos.sh"  # macOS only, disabled on Linux
 
-[target.aarch64-apple-darwin]
-linker = "/Users/cristian/nexusdb/tools/linker-macos.sh"
+# [target.aarch64-apple-darwin]
+# linker = "/Users/cristian/nexusdb/tools/linker-macos.sh"  # macOS only

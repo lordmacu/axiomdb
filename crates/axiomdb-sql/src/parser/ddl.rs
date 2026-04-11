@@ -653,6 +653,10 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<(DataType, u16, bool), D
             p.advance();
             Ok((DataType::Json, 0, false))
         }
+        Token::TyJsonb => {
+            p.advance();
+            Ok((DataType::Jsonb, 0, false))
+        }
         other => Err(DbError::ParseError {
             message: format!(
                 "expected a data type (INT, TEXT, BIGINT, …) but found {:?}",
