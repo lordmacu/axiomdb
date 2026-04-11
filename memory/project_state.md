@@ -2,6 +2,12 @@
 
 ## 2026-04-10
 
+- Repository workflow note: the previous instruction that forbade direct pushes
+  to `main` was removed from `AGENTS.md` and `CLAUDE.md`. The project still uses
+  the personal `lordmacu` account for GitHub operations.
+- Local GitHub CLI state was verified with `gh auth status`: `github.com` is
+  logged in as active account `lordmacu` with `repo` and `workflow` scopes.
+
 - Phase 11 subphase `11.2d` (BLOB reference tracking) is closed in code,
   documentation, targeted validation, workspace gates, and a dedicated storage
   benchmark.

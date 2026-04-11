@@ -492,7 +492,8 @@ Always use the **lordmacu** account (personal, NOT the work account).
 The repo is configured with:
 - `user.name = lordmacu`
 - `user.email = lordmacu@users.noreply.github.com`
-- GitHub CLI authenticated as lordmacu
+- GitHub CLI authenticated as lordmacu (`gh auth status` must show
+  `github.com` active account `lordmacu`)
 
 Do not include Co-Authored-By from Codex in any commit of this project.
 
@@ -503,8 +504,6 @@ main              → stable code
 fase-N-nombre     → phase development
 hotfix/nombre     → urgent fixes on top of main
 ```
-
-Never push directly to main. Merge only after /review-task is complete.
 
 ---
 
