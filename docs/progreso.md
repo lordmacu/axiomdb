@@ -51,7 +51,7 @@
 ### GAP-B — MySQL wire compat crítica `⏳`
 <!-- PRIORIDAD: ALTA — desbloquea ORMs y clientes -->
 - [x] GAP-B.1 ✅ UNION / UNION ALL — closed: `Stmt::Union { selects, all }` AST variant; parser detects `UNION [ALL]` after SELECT and chains multiple SELECTs; executor materializes each SELECT then concatenates (ALL) or hash-deduplicates (UNION); analyzer resolves columns in all branches; supports chained triple+ UNIONs, NULLs, literals, aliases
-- [ ] GAP-B.2 ⏳ Column type wire codes — `datatype_to_mysql_type()` en `result.rs`: TINYINT→0x01, SMALLINT→0x02, MEDIUMINT→0x09, YEAR→0x0d, TIME→0x0b, DATETIME→0x0c; agregar DataType variants si faltan
+- [x] GAP-B.2 ✅ Column type wire codes — closed: existing types already sent correct codes; added parser aliases for TINYINT→Bool, SMALLINT→Int, MEDIUMINT→Int, YEAR→Int, TIME→Timestamp in parse_data_type(); DATETIME already worked as Timestamp alias
 - [ ] GAP-B.3 ⏳ DECIMAL column type — almacenar como `i128` con scale en row codec; `DataType::Decimal(precision, scale)`; CREATE TABLE + INSERT/SELECT/WHERE; arithmetic con scale propagation
 - [ ] GAP-B.4 ⏳ DATE column type independiente — `DataType::Date` como days-since-epoch (i32); distinto de Timestamp; row codec + comparisons + key encoding + wire binary encoding
 - [ ] GAP-B.5 ⏳ Multi-table DELETE/UPDATE JOIN — parser: `DELETE t FROM t JOIN s ON ...`; `UPDATE t JOIN s ON ... SET t.col=val`; extender DeleteStmt/UpdateStmt con optional join clause; executor: join + filter + DML

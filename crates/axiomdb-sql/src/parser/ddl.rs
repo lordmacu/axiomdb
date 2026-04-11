@@ -657,6 +657,34 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<(DataType, u16, bool), D
             p.advance();
             Ok((DataType::Jsonb, 0, false))
         }
+        Token::Ident(ref s) if s.eq_ignore_ascii_case("TINYINT") => {
+            p.advance();
+            eat_optional_length(p)?; // TINYINT(N) — display width, ignored
+            Ok((DataType::Bool, 0, false))
+        }
+        Token::Ident(ref s) if s.eq_ignore_ascii_case("SMALLINT") => {
+            p.advance();
+            eat_optional_length(p)?;
+            Ok((DataType::Int, 0, false))
+        }
+        Token::Ident(ref s) if s.eq_ignore_ascii_case("MEDIUMINT") => {
+            p.advance();
+            eat_optional_length(p)?;
+            Ok((DataType::Int, 0, false))
+        }
+        Token::Ident(ref s)
+            if s.eq_ignore_ascii_case("YEAR") =>
+        {
+            p.advance();
+            eat_optional_length(p)?; // YEAR(4)
+            Ok((DataType::Int, 0, false))
+        }
+        Token::Ident(ref s)
+            if s.eq_ignore_ascii_case("TIME") =>
+        {
+            p.advance();
+            Ok((DataType::Timestamp, 0, false))
+        }
         other => Err(DbError::ParseError {
             message: format!(
                 "expected a data type (INT, TEXT, BIGINT, …) but found {:?}",
