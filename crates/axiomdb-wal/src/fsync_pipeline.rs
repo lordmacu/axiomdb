@@ -107,7 +107,7 @@ impl FsyncPipeline {
     ///
     /// This method never performs I/O. The internal mutex is held for <100ns.
     pub fn acquire(&self, commit_lsn: u64, txn_id: TxnId) -> AcquireResult {
-        let mut state = self.inner.lock().expect("FsyncPipeline lock poisoned");
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // Fast path: already flushed past this LSN.
         if state.flushed_lsn >= commit_lsn {
@@ -148,7 +148,7 @@ impl FsyncPipeline {
     /// advance `max_committed` for them).
     pub fn release_ok(&self, new_flushed_lsn: u64) -> Vec<TxnId> {
         let (to_wake, woken_txn_ids) = {
-            let mut state = self.inner.lock().expect("FsyncPipeline lock poisoned");
+            let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
             // Advance flushed_lsn (never regress).
             if new_flushed_lsn > state.flushed_lsn {
@@ -226,7 +226,7 @@ impl FsyncPipeline {
     /// All queued followers receive the error. `flushed_lsn` is NOT advanced.
     pub fn release_err(&self, error_msg: &str, is_disk_full: bool) {
         let to_wake = {
-            let mut state = self.inner.lock().expect("FsyncPipeline lock poisoned");
+            let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             state.leader_active = false;
             std::mem::take(&mut state.waiters)
         };
@@ -248,7 +248,7 @@ impl FsyncPipeline {
     /// Returns the current flushed LSN.
     #[cfg(test)]
     pub fn flushed_lsn(&self) -> u64 {
-        self.inner.lock().expect("poisoned").flushed_lsn
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).flushed_lsn
     }
 }
 

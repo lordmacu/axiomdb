@@ -49,12 +49,12 @@ impl ConstraintDef {
                 position: None,
             });
         }
-        let constraint_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        let table_id = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let constraint_id = u32::from_le_bytes(data[0..4].try_into().unwrap_or_default());
+        let table_id = u32::from_le_bytes(data[4..8].try_into().unwrap_or_default());
 
         let mut pos = 8usize;
 
-        let name_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        let name_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or_default()) as usize;
         pos += 4;
         let name = String::from_utf8(data[pos..pos + name_len].to_vec()).map_err(|e| {
             DbError::ParseError {
@@ -64,7 +64,7 @@ impl ConstraintDef {
         })?;
         pos += name_len;
 
-        let expr_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        let expr_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or_default()) as usize;
         pos += 4;
         let check_expr = String::from_utf8(data[pos..pos + expr_len].to_vec()).map_err(|e| {
             DbError::ParseError {
@@ -215,15 +215,15 @@ impl FkDef {
             });
         }
 
-        let fk_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        let child_table_id = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        let child_col_idx = u16::from_le_bytes(data[8..10].try_into().unwrap());
-        let parent_table_id = u32::from_le_bytes(data[10..14].try_into().unwrap());
-        let parent_col_idx = u16::from_le_bytes(data[14..16].try_into().unwrap());
+        let fk_id = u32::from_le_bytes(data[0..4].try_into().unwrap_or_default());
+        let child_table_id = u32::from_le_bytes(data[4..8].try_into().unwrap_or_default());
+        let child_col_idx = u16::from_le_bytes(data[8..10].try_into().unwrap_or_default());
+        let parent_table_id = u32::from_le_bytes(data[10..14].try_into().unwrap_or_default());
+        let parent_col_idx = u16::from_le_bytes(data[14..16].try_into().unwrap_or_default());
         let on_delete = FkAction::try_from(data[16])?;
         let on_update = FkAction::try_from(data[17])?;
-        let fk_index_id = u32::from_le_bytes(data[18..22].try_into().unwrap());
-        let name_len = u32::from_le_bytes(data[22..26].try_into().unwrap()) as usize;
+        let fk_index_id = u32::from_le_bytes(data[18..22].try_into().unwrap_or_default());
+        let name_len = u32::from_le_bytes(data[22..26].try_into().unwrap_or_default()) as usize;
 
         let end = FIXED + name_len;
         if data.len() < end {
@@ -307,10 +307,10 @@ impl StatsDef {
                 position: None,
             });
         }
-        let table_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        let col_idx = u16::from_le_bytes(data[4..6].try_into().unwrap());
-        let row_count = u64::from_le_bytes(data[6..14].try_into().unwrap());
-        let ndv = i64::from_le_bytes(data[14..22].try_into().unwrap());
+        let table_id = u32::from_le_bytes(data[0..4].try_into().unwrap_or_default());
+        let col_idx = u16::from_le_bytes(data[4..6].try_into().unwrap_or_default());
+        let row_count = u64::from_le_bytes(data[6..14].try_into().unwrap_or_default());
+        let ndv = i64::from_le_bytes(data[14..22].try_into().unwrap_or_default());
         Ok((
             Self {
                 table_id,
