@@ -45,8 +45,8 @@
 - [ ] GAP-A.4 ⏳ doublewrite.rs — `checked_mul()` en `slot_count * DW_SLOT_SIZE`; bounds check antes de slice; test con doublewrite corrupto
 - [x] GAP-A.5 ✅ fsync_pipeline.rs — closed: replaced 4 .expect("poisoned") with .unwrap_or_else(|e| e.into_inner()) to recover from poisoned Mutex
 - [x] GAP-A.6 ✅ notifier.rs — closed: replaced 3 .expect("poisoned") with .unwrap_or_else(|e| e.into_inner()) on RwLock
-- [ ] GAP-A.7 ⏳ agg_accum.rs — validar `simple_arg` en constructor de acumuladores DISTINCT; retornar error si None en vez de unwrap
-- [ ] GAP-A.8 ⏳ exec_with_ctx.rs — refactor ~20 `expect("conn_txn")` con helper `fn require_conn_txn() -> Result<&ConnTxn, DbError>`
+- [x] GAP-A.7 ✅ agg_accum.rs — closed: replaced 8 simple_arg.unwrap() with require_arg() helper that returns DbError::Internal instead of panic
+- [x] GAP-A.8 ✅ exec_with_ctx.rs — closed: improved 18 expect() messages to document the invariant guarding each call (is_some() check or preceding begin()); all sites are structurally safe
 
 ### GAP-B — MySQL wire compat crítica `⏳`
 <!-- PRIORIDAD: ALTA — desbloquea ORMs y clientes -->

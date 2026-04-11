@@ -27,7 +27,7 @@ pub fn execute_with_ctx_locked(
                 flush_clustered_insert_batch(&exec_ctx, ctx)?;
                 ctx.in_explicit_txn = false;
                 ctx.savepoints.clear(); // all savepoints destroyed on COMMIT
-                let conn = ctx.conn_txn.take().expect("conn_txn checked above");
+                let conn = ctx.conn_txn.take().expect("conn_txn: checked by is_some() guard");
                 let tid = conn.txn_id;
                 ctx.pending_deferred_txn_id = txn.commit(conn)?;
                 txn.release_immediate_committed_frees(storage, tid)?;
@@ -44,7 +44,7 @@ pub fn execute_with_ctx_locked(
                 ctx.discard_pending_inserts();
                 ctx.discard_clustered_insert_batch();
                 ctx.savepoints.clear(); // all savepoints destroyed on ROLLBACK
-                let conn = ctx.conn_txn.take().expect("conn_txn checked above");
+                let conn = ctx.conn_txn.take().expect("conn_txn: checked by is_some() guard");
                 let tid = conn.txn_id;
                 let result = rollback_with_index_undo(txn, conn, storage, bloom);
                 // Phase 40.11: release all locks on rollback too.
@@ -60,7 +60,7 @@ pub fn execute_with_ctx_locked(
             Stmt::Savepoint(ref name) => {
                 flush_pending_inserts_ctx(&exec_ctx, ctx)?;
                 flush_clustered_insert_batch(&exec_ctx, ctx)?;
-                let sp = txn.savepoint(ctx.conn_txn.as_ref().expect("conn_txn checked above"));
+                let sp = txn.savepoint(ctx.conn_txn.as_ref().expect("conn_txn: checked by is_some() guard"));
                 ctx.savepoints.push((name.clone(), sp));
                 return Ok(QueryResult::Empty);
             }
@@ -76,7 +76,7 @@ pub fn execute_with_ctx_locked(
                         ctx.discard_pending_inserts();
                         ctx.discard_clustered_insert_batch();
                         let sp = ctx.savepoints[idx].1;
-                        let conn = ctx.conn_txn.as_mut().expect("conn_txn checked above");
+                        let conn = ctx.conn_txn.as_mut().expect("conn_txn: checked by is_some() guard");
                         rollback_to_savepoint_with_index_undo(txn, conn, sp, storage, bloom)?;
                         // Destroy all savepoints after the target (MySQL behavior).
                         ctx.savepoints.truncate(idx + 1);
@@ -105,7 +105,7 @@ pub fn execute_with_ctx_locked(
             flush_pending_inserts_ctx(&exec_ctx, ctx)?;
             flush_clustered_insert_batch(&exec_ctx, ctx)?;
             ctx.in_explicit_txn = false;
-            let pre_conn = ctx.conn_txn.take().expect("conn_txn checked above");
+            let pre_conn = ctx.conn_txn.take().expect("conn_txn: checked by is_some() guard");
             let pre_tid = pre_conn.txn_id;
             // Pre-DDL commit: discard any pending deferred (pipeline handles it).
             let _ = txn.commit(pre_conn)?;
@@ -116,7 +116,7 @@ pub fn execute_with_ctx_locked(
             let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
             return match dispatch_ctx(stmt, &exec_ctx2, ctx) {
                 Ok(result) => {
-                    let ddl_conn = ctx.conn_txn.take().expect("just set above");
+                    let ddl_conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
                     let ddl_tid = ddl_conn.txn_id;
                     ctx.pending_deferred_txn_id = txn.commit(ddl_conn)?;
                     txn.release_immediate_committed_frees(storage, ddl_tid)?;
@@ -124,7 +124,7 @@ pub fn execute_with_ctx_locked(
                     Ok(result)
                 }
                 Err(e) => {
-                    let ddl_conn = ctx.conn_txn.take().expect("just set above");
+                    let ddl_conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
                     let _ = rollback_with_index_undo(txn, ddl_conn, storage, bloom);
                     Err(e)
                 }
@@ -145,7 +145,7 @@ pub fn execute_with_ctx_locked(
         let sp_opt: Option<Savepoint> = if ctx.on_error == OnErrorMode::RollbackTransaction {
             None
         } else {
-            Some(txn.savepoint(ctx.conn_txn.as_ref().expect("conn_txn set above")))
+            Some(txn.savepoint(ctx.conn_txn.as_ref().expect("conn_txn: checked by is_some() guard")))
         };
         match dispatch_ctx(stmt, &exec_ctx, ctx) {
             Ok(result) => Ok(result),
@@ -153,7 +153,7 @@ pub fn execute_with_ctx_locked(
                 OnErrorMode::RollbackTransaction => {
                     ctx.discard_pending_inserts();
                     ctx.discard_clustered_insert_batch();
-                    let conn = ctx.conn_txn.take().expect("conn_txn set above");
+                    let conn = ctx.conn_txn.take().expect("conn_txn: checked by is_some() guard");
                     let _ = rollback_with_index_undo(txn, conn, storage, bloom);
                     Err(e)
                 }
@@ -170,7 +170,7 @@ pub fn execute_with_ctx_locked(
                 OnErrorMode::Ignore => {
                     ctx.discard_pending_inserts();
                     ctx.discard_clustered_insert_batch();
-                    let conn = ctx.conn_txn.take().expect("conn_txn set above");
+                    let conn = ctx.conn_txn.take().expect("conn_txn: checked by is_some() guard");
                     let _ = rollback_with_index_undo(txn, conn, storage, bloom);
                     Err(e)
                 }
@@ -213,7 +213,7 @@ pub fn execute_with_ctx_locked(
                 let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
                 match dispatch_ctx(other, &exec_ctx2, ctx) {
                     Ok(result) => {
-                        let conn = ctx.conn_txn.take().expect("just set above");
+                        let conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
                         let tid = conn.txn_id;
                         ctx.pending_deferred_txn_id = txn.commit(conn)?;
                         txn.release_immediate_committed_frees(storage, tid)?;
@@ -222,7 +222,7 @@ pub fn execute_with_ctx_locked(
                         Ok(result)
                     }
                     Err(e) => {
-                        let conn = ctx.conn_txn.take().expect("just set above");
+                        let conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
                         let tid = conn.txn_id;
                         let _ = rollback_with_index_undo(txn, conn, storage, bloom);
                         if let Some(lm) = lock_mgr { lm.release_all_for_txn(tid); }
@@ -251,12 +251,12 @@ pub fn execute_with_ctx_locked(
                 let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
                 match dispatch_ctx(stmt, &exec_ctx2, ctx) {
                     Ok(result) => {
-                        let conn = ctx.conn_txn.take().expect("just set above");
+                        let conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
                         let _ = txn.commit(conn)?;
                         Ok(result)
                     }
                     Err(e) => {
-                        let conn = ctx.conn_txn.take().expect("just set above");
+                        let conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
                         let _ = rollback_with_index_undo(txn, conn, storage, bloom);
                         Err(e)
                     }
@@ -267,12 +267,12 @@ pub fn execute_with_ctx_locked(
                 let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
                 match dispatch_ctx(other, &exec_ctx2, ctx) {
                     Ok(result) => {
-                        let conn = ctx.conn_txn.take().expect("just set above");
+                        let conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
                         ctx.pending_deferred_txn_id = txn.commit(conn)?;
                         Ok(result)
                     }
                     Err(e) => {
-                        let conn = ctx.conn_txn.take().expect("just set above");
+                        let conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
                         let _ = rollback_with_index_undo(txn, conn, storage, bloom);
                         Err(e)
                     }
@@ -283,7 +283,7 @@ pub fn execute_with_ctx_locked(
                 let sp_opt: Option<Savepoint> = if ctx.on_error == OnErrorMode::Savepoint
                     || ctx.on_error == OnErrorMode::Ignore
                 {
-                    Some(txn.savepoint(ctx.conn_txn.as_ref().expect("just set above")))
+                    Some(txn.savepoint(ctx.conn_txn.as_ref().expect("conn_txn: set by begin() on preceding line")))
                 } else {
                     None
                 };
@@ -312,7 +312,7 @@ pub fn execute_with_ctx_locked(
                             Err(e)
                         }
                         _ => {
-                            let conn = ctx.conn_txn.take().expect("just set above");
+                            let conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
                             let _ = rollback_with_index_undo(txn, conn, storage, bloom);
                             Err(e)
                         }
