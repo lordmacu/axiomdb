@@ -23,8 +23,8 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let mut storage = MemoryStorage::new();
-        CatalogBootstrap::init(&mut storage).unwrap();
+        let storage = MemoryStorage::new();
+        CatalogBootstrap::init(&storage).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let wal = dir.path().join("test.wal");
         let txn = TxnManager::create(&wal).unwrap();
@@ -36,8 +36,7 @@ impl Fixture {
     fn create_table(&mut self, name: &str, cols: &[(&str, ColumnType)]) -> u32 {
         let mut conn_txn = self.txn.begin().unwrap();
         let table_id = {
-            let mut w =
-                CatalogWriter::new(&mut self.storage, &mut self.txn, &mut conn_txn).unwrap();
+            let mut w = CatalogWriter::new(&self.storage, &self.txn, &mut conn_txn).unwrap();
             let tid = w.create_table("public", name).unwrap();
             for (i, (col_name, col_type)) in cols.iter().enumerate() {
                 w.create_column(ColumnDef {

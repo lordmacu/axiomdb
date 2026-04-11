@@ -12,7 +12,7 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              39.22 (UPDATE in-place zero-alloc: single/multi field patch, rollback, TEXT-before-INT),
              40.1b (CREATE INDEX on clustered tables), 4.22e (ALTER DROP/MODIFY auto-index repair),
              4.G5 (DELETE/UPDATE ORDER BY+LIMIT, INSERT IGNORE, CREATE LIKE, CTAS, CALL/DO),
-             11.4 (native JSON type + JSON_EXTRACT / ->>)
+             11.2d (refcounted TOAST/BLOB chain roundtrip), 11.4 (native JSON type + JSON_EXTRACT / ->>)
 """
 import os
 import signal
@@ -1340,6 +1340,39 @@ row_blob = cld.fetchone()
 ok("binary long data preserves raw bytes including NUL",
    row_blob and row_blob[0] == b"\x00\xff\x00\x42", row_blob)
 raw_stmt_close(conn_ld, stmt_blob)
+
+# Refcounted TOAST/BLOB chain smoke. Use COM_STMT_SEND_LONG_DATA so the test
+# exercises large BLOB storage without depending on COM_QUERY's long-literal stack.
+large_blob = (b"toast-blob-" * 900)[:9_000]
+stmt_big_blob, _, _ = raw_prepare(
+    conn_ld,
+    "INSERT INTO t_long_data (id, txt, blb) VALUES (?, NULL, ?)",
+)
+raw_send_long_data(conn_ld, stmt_big_blob, 1, large_blob[:4_500])
+raw_send_long_data(conn_ld, stmt_big_blob, 1, large_blob[4_500:])
+pkt_big_blob = raw_execute(
+    conn_ld,
+    stmt_big_blob,
+    [0x03, 0xfc],  # INT, BLOB
+    inline_values=_struct.pack("<i", 30),
+    null_indices=(1,),
+)
+ok("11.2d large BLOB long-data execute returns OK",
+   pkt_big_blob[:1] == b"\x00", pkt_big_blob[:12])
+conn_ld.commit()
+cld.execute("SELECT blb FROM t_long_data WHERE id = 30")
+row_big_blob = cld.fetchone()
+ok("11.2d large BLOB roundtrips through TOAST/BLOB chain",
+   row_big_blob and row_big_blob[0] == large_blob,
+   None if row_big_blob is None else len(row_big_blob[0]))
+cld.execute("DELETE FROM t_long_data WHERE id = 30")
+conn_ld.commit()
+cld.execute("SELECT COUNT(*) FROM t_long_data WHERE id = 30")
+row_big_blob_count = cld.fetchone()
+ok("11.2d delete releases large BLOB row without visible residue",
+   row_big_blob_count is not None and str(row_big_blob_count[0]) == "0",
+   row_big_blob_count)
+raw_stmt_close(conn_ld, stmt_big_blob)
 
 # Deferred overflow error surfaces on EXECUTE and the connection remains usable.
 stmt_err, _, _ = raw_prepare(

@@ -21,8 +21,8 @@ impl Db {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.wal");
-        let mut storage = MemoryStorage::new();
-        CatalogBootstrap::init(&mut storage).unwrap();
+        let storage = MemoryStorage::new();
+        CatalogBootstrap::init(&storage).unwrap();
         let txn = TxnManager::create(&wal_path).unwrap();
         Self {
             storage,
@@ -43,9 +43,9 @@ impl Db {
         let analyzed = analyze(stmt, &self.storage, snap)?;
         execute_with_ctx(
             analyzed,
-            &mut self.storage,
-            &mut self.txn,
-            &mut self.bloom,
+            &self.storage,
+            &self.txn,
+            &self.bloom,
             &mut self.ctx,
         )
     }
@@ -580,11 +580,11 @@ fn test_fk_action_encoding_roundtrip() {
 fn test_legacy_db_fk_root_zero_returns_empty() {
     use axiomdb_core::TransactionSnapshot;
 
-    let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    let storage = MemoryStorage::new();
+    CatalogBootstrap::init(&storage).unwrap();
     // Simulate pre-6.5 DB by zeroing FK root.
     axiomdb_storage::write_meta_u64(
-        &mut storage,
+        &storage,
         axiomdb_storage::CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET,
         0,
     )

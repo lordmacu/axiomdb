@@ -14,8 +14,8 @@ use axiomdb_wal::TxnManager;
 fn setup() -> (MemoryStorage, TxnManager) {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.keep().join("test.wal");
-    let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    let storage = MemoryStorage::new();
+    CatalogBootstrap::init(&storage).unwrap();
     let txn = TxnManager::create(&wal_path).unwrap();
     (storage, txn)
 }
@@ -511,7 +511,7 @@ fn test_savepoint_rollback_leaves_pre_savepoint_writes() {
     );
 
     // Rollback to savepoint — row 2 disappears, row 1 survives, txn still active.
-    txn.rollback_to_savepoint(ctx.conn_txn.as_mut().expect("active txn"), sp, &mut storage)
+    txn.rollback_to_savepoint(ctx.conn_txn.as_mut().expect("active txn"), sp, &storage)
         .unwrap();
     assert!(txn.active_txn_id().is_some(), "txn must remain active");
 
@@ -550,7 +550,7 @@ fn test_savepoint_noop_when_no_writes_after() {
 
     let sp = txn.savepoint(ctx.conn_txn.as_ref().expect("active txn"));
     // No writes after the savepoint.
-    txn.rollback_to_savepoint(ctx.conn_txn.as_mut().expect("active txn"), sp, &mut storage)
+    txn.rollback_to_savepoint(ctx.conn_txn.as_mut().expect("active txn"), sp, &storage)
         .unwrap();
 
     // Row 99 still there (was before the savepoint).

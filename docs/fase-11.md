@@ -1,5 +1,80 @@
 # Fase 11 - Robustness and indexes
 
+## 11.2d BLOB reference tracking - cerrada 2026-04-10
+
+La subfase 11.2d agrega un formato versionado para cadenas TOAST/BLOB
+refcounted en `crates/axiomdb-storage/src/clustered_overflow.rs`. La
+investigacion se hizo en `research/`:
+
+- PostgreSQL TOAST usa chunks por OID de valor, sin contador por cadena.
+- SQLite overflow usa una lista enlazada de paginas, sin sharing/refcount.
+- InnoDB/MariaDB guarda metadata de propiedad en punteros BLOB externos, util
+  para MVCC, pero no suficiente para deduplicacion N-a-1.
+
+La opcion elegida fue mantener las cadenas clustered overflow existentes para
+filas clustered, y agregar un formato `ABOB` solo para cadenas TOAST/BLOB:
+
+```text
+[magic="ABOB"][version=1][flags][reserved][next_page:u64][part_len:u32][refcount:u64][payload]
+```
+
+Solo la primera pagina posee el contador. Las paginas de continuacion cargan el
+mismo magic/version y `part_len`, pero `refcount = 0`. `read_blob_chain()`
+detecta el formato nuevo y usa `part_len`; si el magic no existe, cae al lector
+legacy `read_chain()` con longitud esperada. `free_blob()` decrementa el
+contador y libera la cadena solo cuando llega a cero. `incref_blob()` queda
+implementado ahora como primitiva para Phase 14.9 content-addressed dedup.
+
+Integracion:
+
+- `toast_row_if_needed()` escribe TOAST con `write_refcounted_chain()`.
+- `detoast_row()` resuelve placeholders `__toast__:page_id:compressed:raw_len`
+  mediante `read_blob_chain()`.
+- `free_toast_chains_in_encoded()` libera mediante `free_blob()`.
+- El codec conserva `raw_len` en los placeholders de `Text`, `Json` y `Bytes`
+  para que las cadenas legacy sigan leyendo con longitud exacta.
+
+Estado de cierre: implementado, validado y marcado cerrado en
+`docs/progreso.md`. Durante el cierre se limpiaron warnings mecanicos de tests
+activados por `clippy` y se corrigio un bug real en `CacheShard::evict_if_needed()`:
+si el shard excedia capacidad y todas las paginas candidatas estaban pinned, el
+evictor podia ciclar indefinidamente. Ahora escanea el conjunto LRU una vez y
+sale si no hay pagina evictable.
+
+Validacion dirigida:
+
+- `cargo test -p axiomdb-storage clustered_overflow --lib` - paso, 9 tests.
+- `cargo test -p axiomdb-types --test integration_row_codec test_decode_row_masked_json_toast_pointer` - paso.
+- `cargo test -p axiomdb-sql --test integration_table` - paso, 12 tests.
+- `cargo clippy -p axiomdb-storage -p axiomdb-types -p axiomdb-sql --lib -- -D warnings` - paso.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+- `cargo fmt --check` - paso.
+- `cargo build -p axiomdb-server` - paso.
+- `tools/wire-test.py` - paso, 344/344 assertions.
+
+Gap descubierto durante wire smoke:
+
+- `COM_QUERY` con literales `TEXT` largos (~7 KB+) puede desbordar el stack del
+  worker tokio antes de llegar al almacenamiento. No pertenece al formato
+  `ABOB` ni al detoast/refcount; se reprodujo tambien con payloads debajo del
+  umbral TOAST. El smoke 11.2d usa `COM_STMT_SEND_LONG_DATA`, que es la ruta
+  wire correcta para BLOBs grandes y valida la cadena TOAST/BLOB refcounted.
+
+Benchmark:
+
+| Benchmark | AxiomDB | MySQL (aprox) | PostgreSQL (aprox) | Target | Max aceptable | Veredicto |
+|---|---:|---:|---:|---:|---:|---|
+| overflow/refcounted_blob/write_12kb | 89.896 µs / 130.36 MiB/s | N/A | N/A | sin limite formal 11.2d | sin limite formal 11.2d | ✅ |
+| overflow/refcounted_blob/read_128kb | 20.355 µs / 5.997 GiB/s | N/A | N/A | sin limite formal 11.2d | sin limite formal 11.2d | ✅ |
+| overflow/refcounted_blob/incref_free_shared_128kb | 25.241 µs / 39.618 Kops/s | N/A | N/A | sin limite formal 11.2d | sin limite formal 11.2d | ✅ |
+
+Comando usado:
+
+```bash
+cargo bench -p axiomdb-storage --bench storage overflow/refcounted_blob 2>&1 | tee /tmp/bench-fase-11-2d.txt
+```
+
 ## 11.4 Native JSON - cerrada 2026-04-10
 
 La subfase 11.4 entrega un tipo SQL `JSON` nativo visible en DDL, catalogo,

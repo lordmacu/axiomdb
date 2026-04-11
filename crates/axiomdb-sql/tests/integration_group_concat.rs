@@ -16,8 +16,8 @@ use axiomdb_wal::TxnManager;
 fn setup() -> (MemoryStorage, TxnManager) {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.keep().join("test.wal");
-    let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    let storage = MemoryStorage::new();
+    CatalogBootstrap::init(&storage).unwrap();
     let txn = TxnManager::create(&wal_path).unwrap();
     (storage, txn)
 }

@@ -41,8 +41,14 @@ The speed advantage comes from two decisions:
 | B+ Tree point lookup (1M) | **1.2M ops/s**| 800K ops/s   | 600K ops/s     | ✅     |
 | Range scan 10K rows       | **0.61 ms**   | 45 ms        | 60 ms          | ✅     |
 | B+ Tree INSERT (storage only) | **195K ops/s** | 180K ops/s | 150K ops/s  | ✅     |
+| TOAST/BLOB read 128KB (storage only) | **20.355 us / 5.997 GiB/s** | no formal target | no formal max | ✅ |
+| TOAST/BLOB incref+free shared 128KB (storage only) | **25.241 us / 39.618K ops/s** | no formal target | no formal max | ✅ |
 | Sequential scan 1M rows   | **0.72 s**    | 0.8 s        | 1.2 s          | ✅     |
 | Concurrent reads ×16      | **linear**    | linear       | <2× degradation| ✅     |
+
+The TOAST/BLOB rows are Phase `11.2d` Criterion measurements over
+`MemoryStorage`. They validate the refcounted overflow-chain path directly; full
+SQL throughput still includes row codec, planner/executor, WAL, and wire costs.
 
 ### Wire Protocol Throughput (Phase 5.14)
 

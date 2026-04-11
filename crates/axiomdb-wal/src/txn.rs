@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn test_begin_commit_advances_max_committed() {
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
+        let mgr = TxnManager::create(&path).unwrap();
         assert_eq!(mgr.max_committed(), 0);
 
         let conn = mgr.begin().unwrap();
@@ -415,11 +415,11 @@ mod tests {
     #[test]
     fn test_begin_rollback_does_not_advance_max_committed() {
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
-        let mut storage = MemoryStorage::new();
+        let mgr = TxnManager::create(&path).unwrap();
+        let storage = MemoryStorage::new();
 
         let conn = mgr.begin().unwrap();
-        mgr.rollback(conn, &mut storage).unwrap();
+        mgr.rollback(conn, &storage).unwrap();
         assert_eq!(mgr.max_committed(), 0);
     }
 
@@ -428,8 +428,8 @@ mod tests {
     #[test]
     fn test_rollback_undo_insert_marks_slot_dead() {
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
-        let mut storage = MemoryStorage::new();
+        let mgr = TxnManager::create(&path).unwrap();
+        let storage = MemoryStorage::new();
 
         let page_id = storage.alloc_page(PageType::Data).unwrap();
         let mut conn = mgr.begin().unwrap();
@@ -442,7 +442,7 @@ mod tests {
         mgr.record_insert(&mut conn, 1, b"key", b"hello", page_id, slot_id)
             .unwrap();
 
-        mgr.rollback(conn, &mut storage).unwrap();
+        mgr.rollback(conn, &storage).unwrap();
 
         let page = storage.read_page(page_id).unwrap();
         let result = read_tuple(&page, slot_id).unwrap();
@@ -457,8 +457,8 @@ mod tests {
     #[test]
     fn test_rollback_undo_delete_clears_deletion() {
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
-        let mut storage = MemoryStorage::new();
+        let mgr = TxnManager::create(&path).unwrap();
+        let storage = MemoryStorage::new();
 
         let page_id = storage.alloc_page(PageType::Data).unwrap();
 
@@ -484,7 +484,7 @@ mod tests {
         }
         mgr.record_delete(&mut conn2, 1, b"k", b"data", page_id, slot_id)
             .unwrap();
-        mgr.rollback(conn2, &mut storage).unwrap();
+        mgr.rollback(conn2, &storage).unwrap();
 
         let page = storage.read_page(page_id).unwrap();
         let (hdr, _) = read_tuple(&page, slot_id).unwrap().unwrap();
@@ -499,8 +499,8 @@ mod tests {
     #[test]
     fn test_rollback_undo_update() {
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
-        let mut storage = MemoryStorage::new();
+        let mgr = TxnManager::create(&path).unwrap();
+        let storage = MemoryStorage::new();
 
         let page_id = storage.alloc_page(PageType::Data).unwrap();
 
@@ -538,7 +538,7 @@ mod tests {
             )
             .unwrap();
         }
-        mgr.rollback(conn2, &mut storage).unwrap();
+        mgr.rollback(conn2, &storage).unwrap();
 
         let page = storage.read_page(page_id).unwrap();
         let (old_hdr, old_data) = read_tuple(&page, old_slot).unwrap().unwrap();
@@ -557,8 +557,8 @@ mod tests {
     #[test]
     fn test_rollback_undo_update_in_place_restores_old_tuple_image() {
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
-        let mut storage = MemoryStorage::new();
+        let mgr = TxnManager::create(&path).unwrap();
+        let storage = MemoryStorage::new();
 
         let page_id = storage.alloc_page(PageType::Data).unwrap();
 
@@ -589,7 +589,7 @@ mod tests {
             old_image
         };
 
-        mgr.rollback(conn2, &mut storage).unwrap();
+        mgr.rollback(conn2, &storage).unwrap();
 
         let page = storage.read_page(page_id).unwrap();
         let (hdr, data) = read_tuple(&page, slot_id).unwrap().unwrap();
@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn test_snapshot_returns_committed_snapshot() {
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
+        let mgr = TxnManager::create(&path).unwrap();
 
         let snap = mgr.snapshot();
         assert_eq!(snap.snapshot_id, 1); // max_committed=0 → snapshot_id=1
@@ -624,7 +624,7 @@ mod tests {
     #[test]
     fn test_active_snapshot_has_current_txn_id() {
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
+        let mgr = TxnManager::create(&path).unwrap();
 
         let conn = mgr.begin().unwrap();
         let txn_id = conn.txn_id;
@@ -637,8 +637,8 @@ mod tests {
     #[test]
     fn test_uncommitted_row_not_visible_via_snapshot() {
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
-        let mut storage = MemoryStorage::new();
+        let mgr = TxnManager::create(&path).unwrap();
+        let storage = MemoryStorage::new();
 
         let page_id = storage.alloc_page(PageType::Data).unwrap();
         let mut conn = mgr.begin().unwrap();
@@ -667,7 +667,7 @@ mod tests {
             "active txn must see its own writes"
         );
 
-        mgr.rollback(conn, &mut storage).unwrap();
+        mgr.rollback(conn, &storage).unwrap();
     }
 
     // ── error cases ───────────────────────────────────────────────────────────
@@ -711,7 +711,7 @@ mod tests {
         let (_dir, path) = temp_wal();
 
         {
-            let mut mgr = TxnManager::create(&path).unwrap();
+            let mgr = TxnManager::create(&path).unwrap();
             let c = mgr.begin().unwrap();
             mgr.commit(c).unwrap(); // txn 1
             let c = mgr.begin().unwrap();
@@ -729,7 +729,7 @@ mod tests {
     #[test]
     fn test_wal_entry_order() {
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
+        let mgr = TxnManager::create(&path).unwrap();
 
         let mut conn = mgr.begin().unwrap();
         let txn_id = conn.txn_id;
@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn test_record_update_in_place_batch_writes_parseable_entries() {
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
+        let mgr = TxnManager::create(&path).unwrap();
 
         let mut conn = mgr.begin().unwrap();
         let txn_id = conn.txn_id;
@@ -816,10 +816,10 @@ mod tests {
     #[test]
     fn test_autocommit_commits_on_ok() {
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
-        let mut storage = MemoryStorage::new();
+        let mgr = TxnManager::create(&path).unwrap();
+        let storage = MemoryStorage::new();
 
-        mgr.autocommit(&mut storage, |mgr, conn| {
+        mgr.autocommit(&storage, |mgr, conn| {
             mgr.record_insert(conn, 1, b"k", b"v", 99, 0)?;
             Ok(())
         })
@@ -831,10 +831,10 @@ mod tests {
     #[test]
     fn test_autocommit_rollbacks_on_err() {
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
-        let mut storage = MemoryStorage::new();
+        let mgr = TxnManager::create(&path).unwrap();
+        let storage = MemoryStorage::new();
 
-        let result = mgr.autocommit(&mut storage, |_mgr, _conn| {
+        let result = mgr.autocommit(&storage, |_mgr, _conn| {
             Err::<(), _>(DbError::Other("simulated failure".into()))
         });
 
@@ -851,8 +851,8 @@ mod tests {
         use axiomdb_storage::{heap_chain::HeapChain, PageType};
 
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
-        let mut storage = MemoryStorage::new();
+        let mgr = TxnManager::create(&path).unwrap();
+        let storage = MemoryStorage::new();
 
         let root_page_id = storage.alloc_page(PageType::Data).unwrap();
         let init_page = axiomdb_storage::Page::new(PageType::Data, root_page_id);
@@ -861,15 +861,15 @@ mod tests {
         let conn1 = mgr.begin().unwrap();
         let txn1 = conn1.txn_id;
         for i in 0u8..5 {
-            HeapChain::insert(&mut storage, root_page_id, &[i; 8], txn1, None).unwrap();
+            HeapChain::insert(&storage, root_page_id, &[i; 8], txn1, None).unwrap();
         }
         mgr.commit(conn1).unwrap();
 
         let mut conn2 = mgr.begin().unwrap();
         let txn2 = conn2.txn_id;
         let snap = mgr.active_snapshot(&conn2);
-        let raw_rids = HeapChain::scan_rids_visible(&mut storage, root_page_id, snap).unwrap();
-        HeapChain::delete_batch(&mut storage, root_page_id, &raw_rids, txn2).unwrap();
+        let raw_rids = HeapChain::scan_rids_visible(&storage, root_page_id, snap).unwrap();
+        HeapChain::delete_batch(&storage, root_page_id, &raw_rids, txn2).unwrap();
         mgr.record_truncate(&mut conn2, 1, root_page_id).unwrap();
         mgr.commit(conn2).unwrap();
 
@@ -904,8 +904,8 @@ mod tests {
         use axiomdb_storage::{heap_chain::HeapChain, PageType};
 
         let (_dir, path) = temp_wal();
-        let mut mgr = TxnManager::create(&path).unwrap();
-        let mut storage = MemoryStorage::new();
+        let mgr = TxnManager::create(&path).unwrap();
+        let storage = MemoryStorage::new();
 
         let root_page_id = storage.alloc_page(PageType::Data).unwrap();
         let init_page = axiomdb_storage::Page::new(PageType::Data, root_page_id);
@@ -914,26 +914,26 @@ mod tests {
         let conn1 = mgr.begin().unwrap();
         let txn1 = conn1.txn_id;
         for i in 0u8..5 {
-            HeapChain::insert(&mut storage, root_page_id, &[i; 8], txn1, None).unwrap();
+            HeapChain::insert(&storage, root_page_id, &[i; 8], txn1, None).unwrap();
         }
         mgr.commit(conn1).unwrap();
 
         let snap_after_insert = TransactionSnapshot::committed(mgr.max_committed());
         let before =
-            HeapChain::scan_rids_visible(&mut storage, root_page_id, snap_after_insert).unwrap();
+            HeapChain::scan_rids_visible(&storage, root_page_id, snap_after_insert).unwrap();
         assert_eq!(before.len(), 5);
 
         let mut conn2 = mgr.begin().unwrap();
         let txn2 = conn2.txn_id;
         let snap2 = mgr.active_snapshot(&conn2);
-        let raw_rids = HeapChain::scan_rids_visible(&mut storage, root_page_id, snap2).unwrap();
-        HeapChain::delete_batch(&mut storage, root_page_id, &raw_rids, txn2).unwrap();
+        let raw_rids = HeapChain::scan_rids_visible(&storage, root_page_id, snap2).unwrap();
+        HeapChain::delete_batch(&storage, root_page_id, &raw_rids, txn2).unwrap();
         mgr.record_truncate(&mut conn2, 1, root_page_id).unwrap();
-        mgr.rollback(conn2, &mut storage).unwrap();
+        mgr.rollback(conn2, &storage).unwrap();
 
         let snap_after_rollback = TransactionSnapshot::committed(mgr.max_committed());
         let after =
-            HeapChain::scan_rids_visible(&mut storage, root_page_id, snap_after_rollback).unwrap();
+            HeapChain::scan_rids_visible(&storage, root_page_id, snap_after_rollback).unwrap();
         assert_eq!(
             after.len(),
             5,

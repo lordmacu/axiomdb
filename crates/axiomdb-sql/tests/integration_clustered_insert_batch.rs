@@ -490,8 +490,7 @@ fn clustered_batch_table_switch_flushes_current_batch() {
     assert!(ctx
         .clustered_insert_batch
         .as_ref()
-        .map_or(false, |b| b.table_id
-            == ctx.clustered_insert_batch.as_ref().unwrap().table_id));
+        .is_some_and(|b| b.table_id == ctx.clustered_insert_batch.as_ref().unwrap().table_id));
 
     // INSERT into tb must flush ta's batch first.
     ok(

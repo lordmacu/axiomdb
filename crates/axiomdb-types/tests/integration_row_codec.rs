@@ -130,7 +130,7 @@ fn test_decode_row_masked_json_toast_pointer() {
     encode_toast_pointer(&mut encoded, TOAST_SENTINEL_RAW, 42, 123);
 
     let decoded = decode_row_masked(&encoded, &[DataType::Json], &[true]).unwrap();
-    assert_eq!(decoded, vec![Value::Json("__toast__:42:false".into())]);
+    assert_eq!(decoded, vec![Value::Json("__toast__:42:false:123".into())]);
 
     let skipped = decode_row_masked(&encoded, &[DataType::Json], &[false]).unwrap();
     assert_eq!(skipped, vec![Value::Null]);

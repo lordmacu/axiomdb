@@ -487,7 +487,7 @@ mod tests {
         }
 
         // Vacuum with oldest_safe_txn=3 (txn 2 is committed and safe).
-        let removed = vacuum_heap_chain(&mut storage, page_id, 3).unwrap();
+        let removed = vacuum_heap_chain(&storage, page_id, 3).unwrap();
         assert_eq!(removed, 3);
 
         // Verify: slots 0-2 are dead, slots 3-4 are alive.
@@ -512,7 +512,7 @@ mod tests {
         let mut storage = MemoryStorage::new();
         let (page_id, _) = make_page_with_rows(&mut storage, 5, 1);
 
-        let removed = vacuum_heap_chain(&mut storage, page_id, 100).unwrap();
+        let removed = vacuum_heap_chain(&storage, page_id, 100).unwrap();
         assert_eq!(removed, 0);
     }
 
@@ -525,11 +525,11 @@ mod tests {
         mark_deleted_in_page(&mut storage, page_id, slots[0], 10);
 
         // Vacuum with oldest_safe_txn=5 → txn 10 is NOT safe yet.
-        let removed = vacuum_heap_chain(&mut storage, page_id, 5).unwrap();
+        let removed = vacuum_heap_chain(&storage, page_id, 5).unwrap();
         assert_eq!(removed, 0, "recently deleted row should be preserved");
 
         // Vacuum with oldest_safe_txn=11 → now safe.
-        let removed = vacuum_heap_chain(&mut storage, page_id, 11).unwrap();
+        let removed = vacuum_heap_chain(&storage, page_id, 11).unwrap();
         assert_eq!(removed, 1);
     }
 
@@ -538,18 +538,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.keep().join("vacuum-root-test.wal");
 
-        let mut storage = MemoryStorage::new();
-        CatalogBootstrap::init(&mut storage).unwrap();
-        let mut txn = TxnManager::create(&wal_path).unwrap();
+        let storage = MemoryStorage::new();
+        CatalogBootstrap::init(&storage).unwrap();
+        let txn = TxnManager::create(&wal_path).unwrap();
         let mut conn_txn = txn.begin().unwrap();
 
-        let table_id = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn)
+        let table_id = CatalogWriter::new(&storage, &txn, &mut conn_txn)
             .unwrap()
             .create_table("public", "users")
             .unwrap();
         let old_root = storage.alloc_page(PageType::Index).unwrap();
         let new_root = storage.alloc_page(PageType::Index).unwrap();
-        let index_id = CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn)
+        let index_id = CatalogWriter::new(&storage, &txn, &mut conn_txn)
             .unwrap()
             .create_index(axiomdb_catalog::IndexDef {
                 index_id: 0,
@@ -583,14 +583,8 @@ mod tests {
         };
 
         let rotated_root = AtomicU64::new(new_root);
-        persist_index_root_if_changed(
-            &mut storage,
-            &mut txn,
-            &mut conn_txn,
-            &index_def,
-            &rotated_root,
-        )
-        .unwrap();
+        persist_index_root_if_changed(&storage, &txn, &mut conn_txn, &index_def, &rotated_root)
+            .unwrap();
 
         let updated = {
             let snap = txn.active_snapshot(&conn_txn);

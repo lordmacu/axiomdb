@@ -341,13 +341,14 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                     // placeholder indicating the value is external.
                     ensure_bytes(bytes, pos, 12)?;
                     let page_id = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
-                    let _raw_len = u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap());
+                    let raw_len = u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap());
                     pos += 12;
                     // Placeholder: the de-TOAST layer replaces this before user sees it.
                     Value::Text(format!(
-                        "__toast__:{}:{}",
+                        "__toast__:{}:{}:{}",
                         page_id,
-                        len == TOAST_SENTINEL_LZ4
+                        len == TOAST_SENTINEL_LZ4,
+                        raw_len
                     ))
                 } else {
                     ensure_bytes(bytes, pos, len)?;
@@ -367,10 +368,16 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                 if is_toast_sentinel(len) {
                     ensure_bytes(bytes, pos, 12)?;
                     let page_id = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
-                    let _raw_len = u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap());
+                    let raw_len = u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap());
                     pos += 12;
                     Value::Bytes(
-                        format!("__toast__:{}:{}", page_id, len == TOAST_SENTINEL_LZ4).into_bytes(),
+                        format!(
+                            "__toast__:{}:{}:{}",
+                            page_id,
+                            len == TOAST_SENTINEL_LZ4,
+                            raw_len
+                        )
+                        .into_bytes(),
                     )
                 } else {
                     ensure_bytes(bytes, pos, len)?;
@@ -384,11 +391,12 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                 let len = read_u24(bytes, pos)?;
                 pos += 3;
                 if is_toast_sentinel(len) {
-                    let (page_id, _raw_len) = decode_toast_pointer(bytes, &mut pos)?;
+                    let (page_id, raw_len) = decode_toast_pointer(bytes, &mut pos)?;
                     Value::Json(format!(
-                        "__toast__:{}:{}",
+                        "__toast__:{}:{}:{}",
                         page_id,
-                        len == TOAST_SENTINEL_LZ4
+                        len == TOAST_SENTINEL_LZ4,
+                        raw_len
                     ))
                 } else {
                     ensure_bytes(bytes, pos, len)?;
@@ -513,9 +521,13 @@ pub fn decode_row_masked(
                     let len = read_u24(bytes, pos)?;
                     pos += 3;
                     if is_toast_sentinel(len) {
-                        let (page_id, _raw_len) = decode_toast_pointer(bytes, &mut pos)?;
-                        let placeholder =
-                            format!("__toast__:{}:{}", page_id, len == TOAST_SENTINEL_LZ4);
+                        let (page_id, raw_len) = decode_toast_pointer(bytes, &mut pos)?;
+                        let placeholder = format!(
+                            "__toast__:{}:{}:{}",
+                            page_id,
+                            len == TOAST_SENTINEL_LZ4,
+                            raw_len
+                        );
                         if dt == DataType::Json {
                             Value::Json(placeholder)
                         } else {
@@ -541,10 +553,15 @@ pub fn decode_row_masked(
                     let len = read_u24(bytes, pos)?;
                     pos += 3;
                     if is_toast_sentinel(len) {
-                        let (page_id, _raw_len) = decode_toast_pointer(bytes, &mut pos)?;
+                        let (page_id, raw_len) = decode_toast_pointer(bytes, &mut pos)?;
                         Value::Bytes(
-                            format!("__toast__:{}:{}", page_id, len == TOAST_SENTINEL_LZ4)
-                                .into_bytes(),
+                            format!(
+                                "__toast__:{}:{}:{}",
+                                page_id,
+                                len == TOAST_SENTINEL_LZ4,
+                                raw_len
+                            )
+                            .into_bytes(),
                         )
                     } else {
                         ensure_bytes(bytes, pos, len)?;

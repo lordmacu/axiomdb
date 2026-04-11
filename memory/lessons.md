@@ -1,5 +1,41 @@
 # Lessons Learned
 
+## 2026-04-10 - TOAST refcounts belong on the owned BLOB chain, not clustered overflow
+
+- PostgreSQL TOAST, SQLite overflow pages, and InnoDB/MariaDB external BLOB
+  references solve different problems:
+  - PostgreSQL TOAST chunks give independent out-of-line storage but no
+    page-chain refcount
+  - SQLite overflow is a simple linked chain with no sharing
+  - InnoDB/MariaDB ownership metadata is good for MVCC inheritance but not a
+    complete N-to-1 dedup counter
+- For AxiomDB, the robust Phase 11.2d cut is a separate versioned TOAST/BLOB
+  chain header (`ABOB`) with first-page refcount and per-page `part_len`.
+- Keeping clustered row overflow legacy avoids changing Phase 39 physical row
+  invariants, while still giving Phase 14.9 content-addressed BLOB dedup a real
+  `incref_blob` / `free_blob` primitive.
+
+## 2026-04-10 - Bounded eviction scans avoid pinned-page spin loops
+
+- A buffer-pool shard can be over its nominal capacity while all current LRU
+  candidates are pinned.
+- An eviction loop that keeps popping pinned pages and pushing them back can
+  cycle forever in that state.
+- The safe contract is to scan the current LRU candidate set at most once per
+  eviction attempt and exit if no unpinned page exists; capacity enforcement
+  resumes naturally when a page is unpinned.
+
+## 2026-04-10 - Large wire values should use long-data protocol in smoke tests
+
+- `COM_QUERY` with long text literals currently stack-overflows a tokio worker
+  around the 7 KB range before the request reaches storage.
+- That failure is separate from TOAST/BLOB overflow-chain correctness: the same
+  large payload stored through `COM_STMT_SEND_LONG_DATA` reaches the SQL/storage
+  path and round-trips through the Phase 11.2d refcounted chain.
+- Wire smoke for large BLOB storage should use prepared statements plus
+  `COM_STMT_SEND_LONG_DATA`; the long-literal crash belongs to wire/parser
+  hardening, not the BLOB refcount implementation.
+
 ## 2026-04-10 - Masked row decode must treat TOAST sentinels before skipping variable payloads
 
 - `decode_row_masked` cannot skip variable-width values by blindly interpreting

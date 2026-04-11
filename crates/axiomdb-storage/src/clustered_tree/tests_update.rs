@@ -1,8 +1,8 @@
 #[test]
 fn update_in_place_empty_tree_returns_false() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let changed = update_in_place(
-        &mut storage,
+        &storage,
         None,
         b"missing",
         b"new-row",
@@ -15,14 +15,14 @@ fn update_in_place_empty_tree_returns_false() {
 
 #[test]
 fn update_in_place_missing_key_returns_false() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
     for key in [b"alpha".as_slice(), b"bravo", b"charlie"] {
-        root = Some(insert(&mut storage, root, key, &row_header(1), b"row").unwrap());
+        root = Some(insert(&storage, root, key, &row_header(1), b"row").unwrap());
     }
 
     let changed = update_in_place(
-        &mut storage,
+        &storage,
         root,
         b"delta",
         b"updated",
@@ -35,9 +35,9 @@ fn update_in_place_missing_key_returns_false() {
 
 #[test]
 fn update_in_place_invisible_current_version_returns_false() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let root = insert(
-        &mut storage,
+        &storage,
         None,
         b"future",
         &row_header(9),
@@ -46,7 +46,7 @@ fn update_in_place_invisible_current_version_returns_false() {
     .unwrap();
 
     let changed = update_in_place(
-        &mut storage,
+        &storage,
         Some(root),
         b"future",
         b"replacement",
@@ -65,13 +65,13 @@ fn update_in_place_invisible_current_version_returns_false() {
 
 #[test]
 fn update_in_place_root_leaf_growth_rewrites_row_and_bumps_version() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in 0u32..4 {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(1),
@@ -83,7 +83,7 @@ fn update_in_place_root_leaf_growth_rewrites_row_and_bumps_version() {
 
     let root = root.unwrap();
     let changed = update_in_place(
-        &mut storage,
+        &storage,
         Some(root),
         &2u32.to_be_bytes(),
         &vec![7u8; 2_000],
@@ -118,13 +118,13 @@ fn update_in_place_root_leaf_growth_rewrites_row_and_bumps_version() {
 
 #[test]
 fn update_in_place_on_split_tree_preserves_leaf_identity_and_next_link() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in 0u32..128 {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(1),
@@ -145,7 +145,7 @@ fn update_in_place_on_split_tree_preserves_leaf_identity_and_next_link() {
     };
 
     let changed = update_in_place(
-        &mut storage,
+        &storage,
         Some(root),
         &63u32.to_be_bytes(),
         &vec![9u8; 700],
@@ -181,13 +181,13 @@ fn update_in_place_on_split_tree_preserves_leaf_identity_and_next_link() {
 
 #[test]
 fn update_in_place_returns_heap_page_full_when_growth_cannot_stay_in_leaf() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in 0u32..7 {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(1),
@@ -199,7 +199,7 @@ fn update_in_place_returns_heap_page_full_when_growth_cannot_stay_in_leaf() {
 
     let root = root.unwrap();
     let err = update_in_place(
-        &mut storage,
+        &storage,
         Some(root),
         &0u32.to_be_bytes(),
         &vec![9u8; 8_000],

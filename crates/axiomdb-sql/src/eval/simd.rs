@@ -176,7 +176,7 @@ mod tests {
         let values = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let mut output = [true; 16];
         batch_cmp_i32(&values, 5, CmpOp::Eq, &mut output);
-        assert_eq!(output[4], true);
+        assert!(output[4]);
         assert_eq!(output.iter().filter(|&&o| o).count(), 1);
     }
 
@@ -260,7 +260,7 @@ mod tests {
         let values: Vec<i64> = (0..10).collect();
         let mut output = vec![true; 10];
         batch_cmp_i64(&values, 7, CmpOp::Eq, &mut output);
-        assert_eq!(output[7], true);
+        assert!(output[7]);
         assert_eq!(output.iter().filter(|&&o| o).count(), 1);
     }
 

@@ -2,6 +2,43 @@
 
 ## 2026-04-10
 
+- Phase 11 subphase `11.2d` (BLOB reference tracking) is closed in code,
+  documentation, targeted validation, workspace gates, and a dedicated storage
+  benchmark.
+- The selected design comes from `research/`: PostgreSQL TOAST and SQLite
+  overflow chains do not provide chain refcounts; InnoDB/MariaDB external BLOB
+  ownership metadata helps with MVCC but does not cover future N-to-1
+  content-addressed dedup. AxiomDB therefore adds a versioned `ABOB` header only
+  for TOAST/BLOB-owned overflow chains.
+- The 11.2d implementation adds `write_refcounted_chain`, `read_blob_chain`,
+  `incref_blob`, and `free_blob` in `clustered_overflow.rs`; TOAST writes now
+  use the refcounted chain and delete cleanup calls `free_blob`.
+- Row codec TOAST placeholders now include `raw_len`:
+  `__toast__:page_id:compressed:raw_len`, so legacy overflow chains still read
+  with exact expected length while new refcounted chains use page-local
+  `part_len`.
+- Validation for this closure:
+  - `cargo test -p axiomdb-storage clustered_overflow --lib` (9 passed)
+  - `cargo test -p axiomdb-types --test integration_row_codec test_decode_row_masked_json_toast_pointer` (passed)
+  - `cargo test -p axiomdb-sql --test integration_table` (12 passed)
+  - `cargo test --workspace` (clean)
+  - `cargo clippy --workspace -- -D warnings` (clean)
+  - `cargo fmt --check` (clean)
+  - `cargo build -p axiomdb-server` (clean)
+  - `tools/wire-test.py` (344/344 passed)
+- Local benchmark:
+  - `overflow/refcounted_blob/write_12kb`: 89.896 us, 130.36 MiB/s
+  - `overflow/refcounted_blob/read_128kb`: 20.355 us, 5.997 GiB/s
+  - `overflow/refcounted_blob/incref_free_shared_128kb`: 25.241 us, 39.618 Kops/s
+- During closeout, `CacheShard::evict_if_needed()` was fixed so a shard over
+  capacity with all candidate pages pinned cannot cycle forever while trying to
+  evict.
+- During wire smoke, `COM_QUERY` with long text literals (~7 KB+) was found to
+  stack-overflow a tokio worker before storage. The 11.2d wire assertion uses
+  `COM_STMT_SEND_LONG_DATA`, which is the correct large-BLOB wire path and
+  passes through the refcounted TOAST/BLOB chain. Track the long-literal crash
+  separately under wire/parser hardening.
+
 - Phase 11 subphase `11.4` (Native JSON) is closed in code, documentation, targeted
   validation, workspace gates, wire smoke, and a local benchmark.
 - The delivered scope is a single SQL `JSON` type backed by validated UTF-8 JSON

@@ -38,8 +38,8 @@ fn run_result(
 fn setup() -> (MemoryStorage, TxnManager) {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.keep().join("test.wal");
-    let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    let storage = MemoryStorage::new();
+    CatalogBootstrap::init(&storage).unwrap();
     let txn = TxnManager::create(&wal_path).unwrap();
     (storage, txn)
 }
@@ -640,8 +640,8 @@ fn run_ctx_idx(
 fn setup_ctx_idx() -> (MemoryStorage, TxnManager, BloomRegistry, SessionContext) {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.keep().join("test.wal");
-    let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    let storage = MemoryStorage::new();
+    CatalogBootstrap::init(&storage).unwrap();
     let txn = TxnManager::create(&wal_path).unwrap();
     (storage, txn, BloomRegistry::new(), SessionContext::new())
 }
@@ -737,7 +737,7 @@ fn test_5_21_staged_flush_pk_index_correct() {
         let stmt = parse("INSERT INTO pkt VALUES (1, 999)", None).unwrap();
         let snap = txn.snapshot();
         let analyzed = analyze(stmt, &storage, snap).unwrap();
-        execute_with_ctx(analyzed, &mut storage, &mut txn, &mut bloom, &mut ctx)
+        execute_with_ctx(analyzed, &storage, &txn, &bloom, &mut ctx)
             .expect_err("expected UniqueViolation")
     };
     assert!(

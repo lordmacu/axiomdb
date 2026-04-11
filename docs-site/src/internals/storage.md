@@ -444,6 +444,56 @@ references, compression, or crash recovery for overflow chains. `39.11` now
 adds in-process clustered WAL/rollback over those row images, but clustered
 crash recovery still stays in later phases.
 
+### Refcounted TOAST/BLOB Overflow Chains (Phase 11.2d)
+
+Phase `11.2d` adds a versioned overflow-chain format for TOAST/BLOB-owned
+chains. It shares `PageType::Overflow` with clustered-row overflow pages but is
+detected by a magic header, so clustered rows keep their existing physical
+tail-spill contract.
+
+```text
+Refcounted TOAST/BLOB overflow body:
+  [magic: 4 bytes = "ABOB"]
+  [version: u8 = 1]
+  [flags: u8]          // bit 0 = first page
+  [reserved: u16 LE]
+  [next_page: u64 LE]
+  [part_len: u32 LE]
+  [refcount: u64 LE]   // first page owns the count; continuations store 0
+  [payload bytes...]
+```
+
+The storage helpers are:
+
+```rust
+write_refcounted_chain(storage, batch, payload) -> Result<Option<u64>, DbError>
+read_blob_chain(storage, first_page, legacy_expected_len) -> Result<Vec<u8>, DbError>
+incref_blob(storage, first_page) -> Result<u64, DbError>
+free_blob(storage, first_page) -> Result<(), DbError>
+```
+
+`write_refcounted_chain` initializes the first page with `refcount = 1`.
+`free_blob` decrements the first-page count and frees the whole chain only when
+the count reaches zero. `read_blob_chain` detects the `ABOB` header and reads
+each page's `part_len`; if the header is absent, it falls back to the legacy
+clustered overflow reader using the caller-provided expected length.
+
+The key invariants are:
+
+- only the first page may carry the first-page flag
+- continuation pages must have `refcount = 0`
+- every `part_len` must fit inside `PAGE_SIZE - HEADER_SIZE - 28`
+- loops are rejected by tracking visited page IDs
+- legacy clustered overflow chains are never refcounted in place
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design Decision — Header Refcount</span>
+PostgreSQL TOAST chunks and SQLite overflow chains do not store a page-chain refcount, while InnoDB stores ownership metadata in off-page BLOB references. AxiomDB keeps the counter in the first overflow page because Phase 14 content-addressed BLOB dedup needs N-to-1 sharing without adding a sidecar catalog lookup to every free.
+</div>
+</div>
+
 ### Clustered WAL and Rollback (Phase 39.11)
 
 Phase `39.11` adds the first WAL contract that understands clustered rows:

@@ -133,21 +133,15 @@ fn collect_rows(
 fn crash_recovery_undoes_uncommitted_clustered_insert() {
     let (_dir, wal_path) = temp_wal();
     let mut storage = MemoryStorage::new();
-    let mut mgr = TxnManager::create(&wal_path).expect("create wal");
+    let mgr = TxnManager::create(&wal_path).expect("create wal");
 
     let mut conn1 = mgr.begin().expect("begin seed txn");
     let txn1 = conn1.txn_id;
     let seed_key = 10u32.to_be_bytes();
     let seed_payload = b"seed".to_vec();
     let mut root = Some(
-        clustered_tree::insert(
-            &mut storage,
-            None,
-            &seed_key,
-            &row_header(txn1),
-            &seed_payload,
-        )
-        .expect("seed clustered row"),
+        clustered_tree::insert(&storage, None, &seed_key, &row_header(txn1), &seed_payload)
+            .expect("seed clustered row"),
     );
     let seed_image =
         ClusteredRowImage::new(root.expect("seed root"), row_header(txn1), &seed_payload);
@@ -162,7 +156,7 @@ fn crash_recovery_undoes_uncommitted_clustered_insert() {
         let payload = vec![key as u8; 300];
         let header = row_header(txn2);
         root = Some(
-            clustered_tree::insert(&mut storage, root, &key_bytes, &header, &payload)
+            clustered_tree::insert(&storage, root, &key_bytes, &header, &payload)
                 .expect("insert crash row"),
         );
         let image =
@@ -203,13 +197,13 @@ fn crash_recovery_undoes_uncommitted_clustered_insert() {
 fn crash_recovery_restores_clustered_delete_mark() {
     let (_dir, wal_path) = temp_wal();
     let mut storage = MemoryStorage::new();
-    let mut mgr = TxnManager::create(&wal_path).expect("create wal");
+    let mgr = TxnManager::create(&wal_path).expect("create wal");
 
     let mut conn1 = mgr.begin().expect("begin seed txn");
     let txn1 = conn1.txn_id;
     let key = b"pk-delete";
     let payload = b"live-row".to_vec();
-    let root = clustered_tree::insert(&mut storage, None, key, &row_header(txn1), &payload)
+    let root = clustered_tree::insert(&storage, None, key, &row_header(txn1), &payload)
         .expect("seed clustered row");
     let image = ClusteredRowImage::new(root, row_header(txn1), &payload);
     mgr.record_clustered_insert(&mut conn1, TABLE_ID, key, &image)
@@ -223,7 +217,7 @@ fn crash_recovery_restores_clustered_delete_mark() {
         .expect("lookup old row")
         .expect("old row exists");
     assert!(
-        clustered_tree::delete_mark(&mut storage, Some(root), key, txn2, &snapshot)
+        clustered_tree::delete_mark(&storage, Some(root), key, txn2, &snapshot)
             .expect("delete mark"),
         "delete mark must succeed"
     );
@@ -261,13 +255,13 @@ fn crash_recovery_restores_clustered_delete_mark() {
 fn crash_recovery_restores_overflow_backed_clustered_update() {
     let (_dir, wal_path) = temp_wal();
     let mut storage = MemoryStorage::new();
-    let mut mgr = TxnManager::create(&wal_path).expect("create wal");
+    let mgr = TxnManager::create(&wal_path).expect("create wal");
 
     let mut conn1 = mgr.begin().expect("begin seed txn");
     let txn1 = conn1.txn_id;
     let key = b"pk-overflow";
     let old_payload = vec![7u8; 12_000];
-    let root = clustered_tree::insert(&mut storage, None, key, &row_header(txn1), &old_payload)
+    let root = clustered_tree::insert(&storage, None, key, &row_header(txn1), &old_payload)
         .expect("seed overflow-backed row");
     let image = ClusteredRowImage::new(root, row_header(txn1), &old_payload);
     mgr.record_clustered_insert(&mut conn1, TABLE_ID, key, &image)
@@ -282,15 +276,8 @@ fn crash_recovery_restores_overflow_backed_clustered_update() {
         .expect("old row exists");
     let new_payload = b"tiny".to_vec();
     assert!(
-        clustered_tree::update_in_place(
-            &mut storage,
-            Some(root),
-            key,
-            &new_payload,
-            txn2,
-            &snapshot
-        )
-        .expect("update in place"),
+        clustered_tree::update_in_place(&storage, Some(root), key, &new_payload, txn2, &snapshot)
+            .expect("update in place"),
         "overflow-backed row must update in place"
     );
     let old_image = row_image(root, &old_row);
@@ -328,7 +315,7 @@ fn crash_recovery_restores_overflow_backed_clustered_update() {
 fn crash_recovery_restores_relocate_update_logically() {
     let (_dir, wal_path) = temp_wal();
     let mut storage = MemoryStorage::new();
-    let mut mgr = TxnManager::create(&wal_path).expect("create wal");
+    let mgr = TxnManager::create(&wal_path).expect("create wal");
 
     let mut conn1 = mgr.begin().expect("begin seed txn");
     let txn1 = conn1.txn_id;
@@ -337,7 +324,7 @@ fn crash_recovery_restores_relocate_update_logically() {
         let key_bytes = key.to_be_bytes();
         let payload = vec![key as u8; 2_100];
         root = Some(
-            clustered_tree::insert(&mut storage, root, &key_bytes, &row_header(txn1), &payload)
+            clustered_tree::insert(&storage, root, &key_bytes, &row_header(txn1), &payload)
                 .expect("seed split-tree row"),
         );
         let image = ClusteredRowImage::new(root.expect("seed root"), row_header(txn1), &payload);
@@ -357,7 +344,7 @@ fn crash_recovery_restores_relocate_update_logically() {
         .expect("lookup old row")
         .expect("old row exists");
     let root_after = clustered_tree::update_with_relocation(
-        &mut storage,
+        &storage,
         Some(root),
         &key,
         &vec![9u8; 8_000],
@@ -403,7 +390,7 @@ fn crash_recovery_undoes_uncommitted_clustered_field_patch() {
     let txn1 = conn1.txn_id;
     let key = b"pk-field-patch";
     let original = b"abcdefghijklmnop".to_vec();
-    let root = clustered_tree::insert(&mut storage, None, key, &row_header(txn1), &original)
+    let root = clustered_tree::insert(&storage, None, key, &row_header(txn1), &original)
         .expect("seed clustered row");
     let image = ClusteredRowImage::new(root, row_header(txn1), &original);
     mgr.record_clustered_insert(&mut conn1, TABLE_ID, key, &image)
@@ -453,7 +440,7 @@ fn clean_reopen_handles_committed_clustered_field_patch_entries() {
     let txn1 = conn1.txn_id;
     let key = b"pk-field-patch";
     let original = b"abcdefghijklmnop".to_vec();
-    let root = clustered_tree::insert(&mut storage, None, key, &row_header(txn1), &original)
+    let root = clustered_tree::insert(&storage, None, key, &row_header(txn1), &original)
         .expect("seed clustered row");
     let image = ClusteredRowImage::new(root, row_header(txn1), &original);
     mgr.record_clustered_insert(&mut conn1, TABLE_ID, key, &image)
@@ -499,14 +486,14 @@ fn clean_reopen_handles_committed_clustered_field_patch_entries() {
 #[test]
 fn clean_reopen_restores_last_committed_clustered_root() {
     let (_dir, wal_path) = temp_wal();
-    let mut storage = MemoryStorage::new();
-    let mut mgr = TxnManager::create(&wal_path).expect("create wal");
+    let storage = MemoryStorage::new();
+    let mgr = TxnManager::create(&wal_path).expect("create wal");
 
     let mut conn1 = mgr.begin().expect("begin first txn");
     let txn1 = conn1.txn_id;
     let key1 = 1u32.to_be_bytes();
     let payload1 = b"row-1".to_vec();
-    let root1 = clustered_tree::insert(&mut storage, None, &key1, &row_header(txn1), &payload1)
+    let root1 = clustered_tree::insert(&storage, None, &key1, &row_header(txn1), &payload1)
         .expect("insert first committed row");
     let image1 = ClusteredRowImage::new(root1, row_header(txn1), &payload1);
     mgr.record_clustered_insert(&mut conn1, TABLE_ID, &key1, &image1)
@@ -520,7 +507,7 @@ fn clean_reopen_restores_last_committed_clustered_root() {
         let key_bytes = key.to_be_bytes();
         let payload = vec![key as u8; 280];
         root = Some(
-            clustered_tree::insert(&mut storage, root, &key_bytes, &row_header(txn2), &payload)
+            clustered_tree::insert(&storage, root, &key_bytes, &row_header(txn2), &payload)
                 .expect("insert committed row"),
         );
         let image =

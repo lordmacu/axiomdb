@@ -1,7 +1,7 @@
 #[test]
 fn insert_bootstraps_empty_tree() {
-    let mut storage = MemoryStorage::new();
-    let root = insert(&mut storage, None, b"pk-1", &row_header(11), b"row-1").unwrap();
+    let storage = MemoryStorage::new();
+    let root = insert(&storage, None, b"pk-1", &row_header(11), b"row-1").unwrap();
     let page = storage.read_page(root).unwrap();
 
     assert_eq!(clustered_page_type(&page).unwrap(), PageType::ClusteredLeaf);
@@ -14,19 +14,19 @@ fn insert_bootstraps_empty_tree() {
 
 #[test]
 fn duplicate_key_is_rejected() {
-    let mut storage = MemoryStorage::new();
-    let root = insert(&mut storage, None, b"dup", &row_header(1), b"a").unwrap();
-    let err = insert(&mut storage, Some(root), b"dup", &row_header(2), b"b").unwrap_err();
+    let storage = MemoryStorage::new();
+    let root = insert(&storage, None, b"dup", &row_header(1), b"a").unwrap();
+    let err = insert(&storage, Some(root), b"dup", &row_header(2), b"b").unwrap_err();
     assert!(matches!(err, DbError::DuplicateKey));
 }
 
 #[test]
 fn non_split_leaf_insert_preserves_sorted_order() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in [b"charlie".as_slice(), b"alpha", b"bravo"] {
-        root = Some(insert(&mut storage, root, key, &row_header(1), b"row").unwrap());
+        root = Some(insert(&storage, root, key, &row_header(1), b"row").unwrap());
     }
 
     let keys = collect_leaf_chain_keys(&storage, root.unwrap()).unwrap();
@@ -38,7 +38,7 @@ fn non_split_leaf_insert_preserves_sorted_order() {
 
 #[test]
 fn defrag_happens_before_split() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let root_pid = storage.alloc_page(PageType::ClusteredLeaf).unwrap();
     let mut root = Page::new(PageType::ClusteredLeaf, root_pid);
     clustered_leaf::init_clustered_leaf(&mut root);
@@ -74,7 +74,7 @@ fn defrag_happens_before_split() {
     assert!(gap_before >= clustered_leaf::cell_footprint(4, 3_000));
 
     let root_after = insert(
-        &mut storage,
+        &storage,
         Some(root_pid),
         &4u32.to_be_bytes(),
         &hdr,
@@ -104,13 +104,13 @@ fn defrag_happens_before_split() {
 
 #[test]
 fn leaf_split_sets_separator_and_next_leaf_chain() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in 0u32..8 {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(1),
@@ -146,13 +146,13 @@ fn leaf_split_sets_separator_and_next_leaf_chain() {
 
 #[test]
 fn internal_split_and_root_split_keep_keys_reachable() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in 0u32..64 {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(1),
@@ -180,12 +180,12 @@ fn internal_split_and_root_split_keep_keys_reachable() {
 
 #[test]
 fn rows_that_need_overflow_are_materialized_and_reconstructed() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let key = b"overflow-pk";
     let total_len = clustered_leaf::max_inline_row_bytes(key.len()).unwrap() + 257;
     let payload = vec![0x6D; total_len];
 
-    let root = insert(&mut storage, None, key, &row_header(1), &payload).unwrap();
+    let root = insert(&storage, None, key, &row_header(1), &payload).unwrap();
     let page = storage.read_page(root).unwrap();
     let cell = clustered_leaf::read_cell(&page, 0).unwrap();
 
@@ -208,14 +208,14 @@ fn rows_that_need_overflow_are_materialized_and_reconstructed() {
 /// sorted order via the leaf chain).
 #[test]
 fn many_inserts_with_safe_descent_keep_tree_consistent() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     let count = 2_000u32;
     for key in 0..count {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(1),

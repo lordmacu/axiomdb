@@ -1,4 +1,6 @@
-use axiomdb_storage::{MemoryStorage, MmapStorage, Page, PageType, StorageEngine};
+use axiomdb_storage::{
+    clustered_overflow, MemoryStorage, MmapStorage, Page, PageType, StorageEngine,
+};
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
@@ -26,7 +28,7 @@ fn bench_memory_alloc(c: &mut Criterion) {
     group.bench_function("alloc_page", |b| {
         b.iter_batched(
             MemoryStorage::new,
-            |mut s| s.alloc_page(PageType::Data).unwrap(),
+            |s| s.alloc_page(PageType::Data).unwrap(),
             BatchSize::SmallInput,
         )
     });
@@ -41,11 +43,11 @@ fn bench_memory_write_read(c: &mut Criterion) {
     group.bench_function("write_page", |b| {
         b.iter_batched(
             || {
-                let mut s = MemoryStorage::new();
+                let s = MemoryStorage::new();
                 let id = s.alloc_page(PageType::Data).unwrap();
                 (s, id, make_data_page(id))
             },
-            |(mut s, id, page)| s.write_page(id, &page).unwrap(),
+            |(s, id, page)| s.write_page(id, &page).unwrap(),
             BatchSize::SmallInput,
         )
     });
@@ -53,7 +55,7 @@ fn bench_memory_write_read(c: &mut Criterion) {
     group.bench_function("read_page", |b| {
         b.iter_batched(
             || {
-                let mut s = MemoryStorage::new();
+                let s = MemoryStorage::new();
                 let id = s.alloc_page(PageType::Data).unwrap();
                 let page = make_data_page(id);
                 s.write_page(id, &page).unwrap();
@@ -78,7 +80,7 @@ fn bench_memory_sequential_reads(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("read_sequential", N_PAGES), |b| {
         b.iter_batched(
             || {
-                let mut s = MemoryStorage::new();
+                let s = MemoryStorage::new();
                 let ids: Vec<u64> = (0..N_PAGES)
                     .map(|_| {
                         let id = s.alloc_page(PageType::Data).unwrap();
@@ -113,7 +115,7 @@ fn bench_mmap_alloc(c: &mut Criterion) {
     group.bench_function("alloc_page", |b| {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bench_alloc.db");
-        let mut storage = MmapStorage::create(&path).unwrap();
+        let storage = MmapStorage::create(&path).unwrap();
         // Pre-grow to 10_000 pages so the benchmark does not trigger grows.
         storage.grow(10_000).unwrap();
 
@@ -137,7 +139,7 @@ fn bench_mmap_write_read(c: &mut Criterion) {
 
     let dir = tempdir().unwrap();
     let path = dir.path().join("bench_wr.db");
-    let mut storage = MmapStorage::create(&path).unwrap();
+    let storage = MmapStorage::create(&path).unwrap();
     let page_id = storage.alloc_page(PageType::Data).unwrap();
     let page = make_data_page(page_id);
 
@@ -165,7 +167,7 @@ fn bench_mmap_sequential_reads(c: &mut Criterion) {
     // One-time setup: storage with 1000 pages already written.
     let dir = tempdir().unwrap();
     let path = dir.path().join("bench_seq.db");
-    let mut storage = MmapStorage::create(&path).unwrap();
+    let storage = MmapStorage::create(&path).unwrap();
     storage.grow(N_PAGES + 64).unwrap();
     let ids: Vec<u64> = (0..N_PAGES)
         .map(|_| {
@@ -210,10 +212,79 @@ fn bench_checksum_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Refcounted TOAST/BLOB overflow chains ────────────────────────────────────
+
+fn bench_refcounted_blob_chain(c: &mut Criterion) {
+    const SMALL_BLOB: usize = 12 * 1024;
+    const LARGE_BLOB: usize = 128 * 1024;
+
+    let small_payload: Vec<u8> = (0..SMALL_BLOB).map(|i| (i % 251) as u8).collect();
+    let large_payload: Vec<u8> = (0..LARGE_BLOB).map(|i| (i % 251) as u8).collect();
+
+    let mut group = c.benchmark_group("overflow/refcounted_blob");
+
+    group.throughput(Throughput::Bytes(SMALL_BLOB as u64));
+    group.bench_function("write_12kb", |b| {
+        b.iter_batched(
+            MemoryStorage::new,
+            |storage| {
+                let first =
+                    clustered_overflow::write_refcounted_chain(&storage, None, &small_payload)
+                        .unwrap()
+                        .unwrap();
+                black_box(first);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.throughput(Throughput::Bytes(LARGE_BLOB as u64));
+    group.bench_function("read_128kb", |b| {
+        b.iter_batched(
+            || {
+                let storage = MemoryStorage::new();
+                let first =
+                    clustered_overflow::write_refcounted_chain(&storage, None, &large_payload)
+                        .unwrap()
+                        .unwrap();
+                (storage, first)
+            },
+            |(storage, first)| {
+                let out = clustered_overflow::read_blob_chain(&storage, first, LARGE_BLOB).unwrap();
+                black_box(out.len());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("incref_free_shared_128kb", |b| {
+        b.iter_batched(
+            || {
+                let storage = MemoryStorage::new();
+                let first =
+                    clustered_overflow::write_refcounted_chain(&storage, None, &large_payload)
+                        .unwrap()
+                        .unwrap();
+                (storage, first)
+            },
+            |(storage, first)| {
+                let refs = clustered_overflow::incref_blob(&storage, first).unwrap();
+                black_box(refs);
+                clustered_overflow::free_blob(&storage, first).unwrap();
+                clustered_overflow::free_blob(&storage, first).unwrap();
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
 // ── Phase 40.9: batch allocation benchmark ──────────────────────────────────
 
 fn bench_batch_alloc_vs_per_page(c: &mut Criterion) {
-    use axiomdb_storage::{LocalPageBatch, BATCH_ALLOC_SIZE};
+    use axiomdb_storage::LocalPageBatch;
     use std::sync::Arc;
 
     let mut group = c.benchmark_group("alloc/batch_vs_single");
@@ -329,6 +400,7 @@ criterion_group!(
     bench_mmap_write_read,
     bench_mmap_sequential_reads,
     bench_checksum_throughput,
+    bench_refcounted_blob_chain,
     bench_batch_alloc_vs_per_page,
 );
 criterion_main!(benches);

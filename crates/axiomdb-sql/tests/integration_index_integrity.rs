@@ -33,7 +33,7 @@ impl DiskDb {
         let wal_path = dir.path().join("integrity.wal");
 
         let mut storage = MmapStorage::create(&db_path).expect("create db");
-        CatalogBootstrap::init(&mut storage).expect("init catalog");
+        CatalogBootstrap::init(&storage).expect("init catalog");
         let mut txn = TxnManager::create(&wal_path).expect("create wal");
         let mut bloom = BloomRegistry::new();
         let mut ctx = SessionContext::new();
@@ -92,13 +92,12 @@ fn load_index(
 }
 
 fn rewrite_index_root(db: &DiskDb, table_name: &str, index_name: &str, new_root_page_id: u64) {
-    let mut storage = MmapStorage::open(&db.db_path).expect("open db");
-    let mut txn = TxnManager::open(&db.wal_path).expect("open wal");
+    let storage = MmapStorage::open(&db.db_path).expect("open db");
+    let txn = TxnManager::open(&db.wal_path).expect("open wal");
     let idx = load_index(&storage, &txn, table_name, index_name);
     let mut conn_txn = txn.begin().expect("begin catalog txn");
     {
-        let mut writer =
-            CatalogWriter::new(&mut storage, &mut txn, &mut conn_txn).expect("catalog writer");
+        let mut writer = CatalogWriter::new(&storage, &txn, &mut conn_txn).expect("catalog writer");
         writer
             .update_index_root(idx.index_id, new_root_page_id)
             .expect("update index root");
@@ -172,8 +171,7 @@ fn test_verify_and_repair_rebuilds_missing_unique_index_entry() {
     rewrite_index_root_to_existing_index(&db, "users", "uq_email");
 
     let (mut storage, mut txn) = db.open_recovered();
-    let report =
-        verify_and_repair_indexes_on_open(&mut storage, &mut txn).expect("rebuild missing entry");
+    let report = verify_and_repair_indexes_on_open(&storage, &txn).expect("rebuild missing entry");
 
     assert_eq!(report.tables_checked, 1);
     assert_eq!(
@@ -231,8 +229,7 @@ fn test_verify_and_repair_rebuilds_partial_index_with_predicate_semantics() {
     rewrite_index_root_to_existing_index(&db, "users", "uq_email");
 
     let (mut storage, mut txn) = db.open_recovered();
-    let report =
-        verify_and_repair_indexes_on_open(&mut storage, &mut txn).expect("rebuild partial index");
+    let report = verify_and_repair_indexes_on_open(&storage, &txn).expect("rebuild partial index");
 
     assert_eq!(report.rebuilt_indexes.len(), 1);
     assert_eq!(report.rebuilt_indexes[0].index_name, "uq_email");
@@ -275,8 +272,8 @@ fn test_verify_and_repair_fails_open_for_unreadable_index_root() {
 
     rewrite_index_root(&db, "users", "uq_email", 9_999_999);
 
-    let (mut storage, mut txn) = db.open_recovered();
-    let err = verify_and_repair_indexes_on_open(&mut storage, &mut txn)
+    let (storage, txn) = db.open_recovered();
+    let err = verify_and_repair_indexes_on_open(&storage, &txn)
         .expect_err("unreadable root must fail open");
 
     assert!(matches!(

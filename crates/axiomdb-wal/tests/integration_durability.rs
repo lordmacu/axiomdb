@@ -403,8 +403,8 @@ fn test_corrupt_checkpoint_lsn_documented_failure_mode() {
 
     // Corrupt the checkpoint_lsn in the meta page to a huge value.
     {
-        let mut storage = MmapStorage::open(&env.db).unwrap();
-        axiomdb_storage::write_checkpoint_lsn(&mut storage, 999_999).unwrap();
+        let storage = MmapStorage::open(&env.db).unwrap();
+        axiomdb_storage::write_checkpoint_lsn(&storage, 999_999).unwrap();
         storage.flush().unwrap();
     }
 

@@ -23,8 +23,8 @@ impl Db {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let wal = dir.path().join("t.wal");
-        let mut storage = MemoryStorage::new();
-        CatalogBootstrap::init(&mut storage).unwrap();
+        let storage = MemoryStorage::new();
+        CatalogBootstrap::init(&storage).unwrap();
         let txn = TxnManager::create(&wal).unwrap();
         Self {
             storage,
@@ -44,9 +44,9 @@ impl Db {
         let analyzed = analyze(stmt, &self.storage, snap)?;
         execute_with_ctx(
             analyzed,
-            &mut self.storage,
-            &mut self.txn,
-            &mut self.bloom,
+            &self.storage,
+            &self.txn,
+            &self.bloom,
             &mut self.ctx,
         )
     }
@@ -175,15 +175,11 @@ fn test_create_table_bootstraps_empty_stats_for_pk() {
 #[test]
 fn test_pre_610_database_no_stats_root() {
     // Simulate a pre-6.10 database: stats root = 0 → list_stats returns empty vec.
-    let mut storage = MemoryStorage::new();
-    CatalogBootstrap::init(&mut storage).unwrap();
+    let storage = MemoryStorage::new();
+    CatalogBootstrap::init(&storage).unwrap();
     // Manually zero out the stats root to simulate pre-6.10 DB.
-    axiomdb_storage::write_meta_u64(
-        &mut storage,
-        axiomdb_storage::CATALOG_STATS_ROOT_BODY_OFFSET,
-        0,
-    )
-    .unwrap();
+    axiomdb_storage::write_meta_u64(&storage, axiomdb_storage::CATALOG_STATS_ROOT_BODY_OFFSET, 0)
+        .unwrap();
 
     let snap = axiomdb_core::TransactionSnapshot {
         snapshot_id: 0,
@@ -302,7 +298,7 @@ fn test_planner_uses_scan_for_low_cardinality() {
     };
     // upsert_stats requires an active transaction.
     let mut conn_txn = db.txn.begin().unwrap();
-    CatalogWriter::new(&mut db.storage, &mut db.txn, &mut conn_txn)
+    CatalogWriter::new(&db.storage, &db.txn, &mut conn_txn)
         .unwrap()
         .upsert_stats(axiomdb_catalog::StatsDef {
             table_id,

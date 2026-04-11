@@ -614,7 +614,7 @@ fn test_delete_many_in_single_leaf_no_alloc_free() {
         .into_iter()
         .map(|i| format!("{:016}", i).into_bytes())
         .collect();
-    let deleted = BTree::delete_many_in(&mut storage, &root_pid, &keys).unwrap();
+    let deleted = BTree::delete_many_in(&storage, &root_pid, &keys).unwrap();
     assert_eq!(deleted, 5);
     assert_eq!(allocs.load(AOrdering::Relaxed), 0);
     assert_eq!(frees.load(AOrdering::Relaxed), 0);
@@ -653,7 +653,7 @@ fn test_delete_many_in_cross_leaf_preserves_sorted_survivors() {
     let keys: Vec<Vec<u8>> = (90usize..=310)
         .map(|i| format!("{:016}", i).into_bytes())
         .collect();
-    let deleted = BTree::delete_many_in(&mut storage, &root_pid, &keys).unwrap();
+    let deleted = BTree::delete_many_in(&storage, &root_pid, &keys).unwrap();
     assert_eq!(deleted, 221);
 
     let rows = BTree::range_in(&storage, root_pid.load(Ordering::Acquire), None, None).unwrap();
@@ -671,7 +671,7 @@ fn test_delete_many_in_can_collapse_root_to_leaf() {
     let keys: Vec<Vec<u8>> = (10usize..260)
         .map(|i| format!("{:016}", i).into_bytes())
         .collect();
-    let deleted = BTree::delete_many_in(&mut storage, &root_pid, &keys).unwrap();
+    let deleted = BTree::delete_many_in(&storage, &root_pid, &keys).unwrap();
     assert_eq!(deleted, 250);
 
     let final_root = root_pid.load(Ordering::Acquire);
@@ -712,7 +712,7 @@ fn test_concurrent_insert_in_eight_threads_all_keys_reachable() {
 
     let mut handles = Vec::new();
     for tid in 0..threads {
-        let mut thread_storage = storage.clone();
+        let thread_storage = storage.clone();
         let root_pid = Arc::clone(&root_pid);
         handles.push(std::thread::spawn(move || {
             let base = tid * per_thread;
@@ -720,7 +720,7 @@ fn test_concurrent_insert_in_eight_threads_all_keys_reachable() {
                 let key_num = base + offset;
                 let key = format!("{:016}", key_num);
                 BTree::insert_in(
-                    &mut thread_storage,
+                    &thread_storage,
                     root_pid.as_ref(),
                     key.as_bytes(),
                     rid(key_num),
@@ -764,7 +764,7 @@ fn test_btree_early_release_mixed_workload() {
 
     for i in 0..count {
         let key = format!("{:016}", i);
-        BTree::insert_in(&mut storage, &root_pid, key.as_bytes(), rid(i as u64), 90).unwrap();
+        BTree::insert_in(&storage, &root_pid, key.as_bytes(), rid(i as u64), 90).unwrap();
     }
 
     // Delete every third key — most of the deletes will hit a leaf that is
@@ -772,7 +772,7 @@ fn test_btree_early_release_mixed_workload() {
     // skips the X-latch on the leaf's parent.
     for i in (0..count).step_by(3) {
         let key = format!("{:016}", i);
-        let removed = BTree::delete_in(&mut storage, &root_pid, key.as_bytes()).unwrap();
+        let removed = BTree::delete_in(&storage, &root_pid, key.as_bytes()).unwrap();
         assert!(removed, "key {i} should be present before delete");
     }
 
@@ -807,17 +807,10 @@ fn test_concurrent_readers_during_inserts_no_lost_keys() {
     // Pre-load enough keys that the tree has at least one internal level.
     let pre_load = 4_000u64;
     {
-        let mut bootstrap = storage.clone();
+        let bootstrap = storage.clone();
         for i in 0..pre_load {
             let key = format!("{:016}", i);
-            BTree::insert_in(
-                &mut bootstrap,
-                root_pid.as_ref(),
-                key.as_bytes(),
-                rid(i),
-                90,
-            )
-            .unwrap();
+            BTree::insert_in(&bootstrap, root_pid.as_ref(), key.as_bytes(), rid(i), 90).unwrap();
         }
     }
 
@@ -843,7 +836,7 @@ fn test_concurrent_readers_during_inserts_no_lost_keys() {
     let per_writer = 2_000u64;
     let mut writer_handles = Vec::new();
     for w in 0..writers {
-        let mut thread_storage = storage.clone();
+        let thread_storage = storage.clone();
         let root_pid = Arc::clone(&root_pid);
         writer_handles.push(std::thread::spawn(move || {
             let base = pre_load + w * per_writer;
@@ -851,7 +844,7 @@ fn test_concurrent_readers_during_inserts_no_lost_keys() {
                 let key_num = base + offset;
                 let key = format!("{:016}", key_num);
                 BTree::insert_in(
-                    &mut thread_storage,
+                    &thread_storage,
                     root_pid.as_ref(),
                     key.as_bytes(),
                     rid(key_num),

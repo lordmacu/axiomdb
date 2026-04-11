@@ -109,9 +109,10 @@ const TOAST_PREFIX: &str = "__toast__:";
 
 /// Resolves TOAST placeholder values in a decoded row by reading overflow chains.
 ///
-/// The codec produces `Value::Text("__toast__:page_id:compressed")` for externalized
-/// values. This function detects those placeholders, reads the overflow chain via
-/// `clustered_overflow::read_chain`, optionally LZ4-decompresses, and replaces
+/// The codec produces `Value::Text("__toast__:page_id:compressed:raw_len")` for
+/// externalized values. This function detects those placeholders, reads the
+/// overflow chain via `clustered_overflow::read_blob_chain`, optionally
+/// LZ4-decompresses, and replaces
 /// the placeholder with the real value.
 ///
 /// For rows without TOAST placeholders, this is a no-op (fast check per value).
@@ -144,15 +145,9 @@ pub fn detoast_row(row: &mut [Value], storage: &dyn StorageEngine) {
 
 /// Parses a TOAST placeholder string and reads the overflow chain.
 fn resolve_toast_text(placeholder: &str, storage: &dyn StorageEngine) -> Option<String> {
-    let rest = placeholder.strip_prefix(TOAST_PREFIX)?;
-    let mut parts = rest.split(':');
-    let page_id: u64 = parts.next()?.parse().ok()?;
-    let compressed: bool = parts.next()?.parse().ok()?;
-
-    // Read the raw_len from the overflow chain header — we don't store it in the
-    // placeholder, so read full chain and derive length from result.
+    let (page_id, compressed, raw_len) = parse_toast_placeholder(placeholder)?;
     let data =
-        axiomdb_storage::clustered_overflow::read_chain(storage, page_id, usize::MAX).ok()?;
+        axiomdb_storage::clustered_overflow::read_blob_chain(storage, page_id, raw_len).ok()?;
 
     let bytes = if compressed {
         lz4_flex::decompress_size_prepended(&data).ok()?
@@ -164,19 +159,24 @@ fn resolve_toast_text(placeholder: &str, storage: &dyn StorageEngine) -> Option<
 }
 
 fn resolve_toast_bytes(placeholder: &str, storage: &dyn StorageEngine) -> Option<Vec<u8>> {
-    let rest = placeholder.strip_prefix(TOAST_PREFIX)?;
-    let mut parts = rest.split(':');
-    let page_id: u64 = parts.next()?.parse().ok()?;
-    let compressed: bool = parts.next()?.parse().ok()?;
-
+    let (page_id, compressed, raw_len) = parse_toast_placeholder(placeholder)?;
     let data =
-        axiomdb_storage::clustered_overflow::read_chain(storage, page_id, usize::MAX).ok()?;
+        axiomdb_storage::clustered_overflow::read_blob_chain(storage, page_id, raw_len).ok()?;
 
     if compressed {
         lz4_flex::decompress_size_prepended(&data).ok()
     } else {
         Some(data)
     }
+}
+
+fn parse_toast_placeholder(placeholder: &str) -> Option<(u64, bool, usize)> {
+    let rest = placeholder.strip_prefix(TOAST_PREFIX)?;
+    let mut parts = rest.split(':');
+    let page_id: u64 = parts.next()?.parse().ok()?;
+    let compressed: bool = parts.next()?.parse().ok()?;
+    let raw_len: usize = parts.next()?.parse().ok()?;
+    Some((page_id, compressed, raw_len))
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -865,7 +865,7 @@ mod tests {
     fn test_update_rows_preserve_rid_keeps_same_record_id_when_row_fits() {
         let dir = tempfile::tempdir().unwrap();
         let wal = dir.path().join("table-test.wal");
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let root_page_id = storage.alloc_page(PageType::Data).unwrap();
         let root = Page::new(PageType::Data, root_page_id);
         storage.write_page(root_page_id, &root).unwrap();
@@ -896,11 +896,11 @@ mod tests {
             },
         ];
 
-        let mut txn = TxnManager::create(&wal).unwrap();
+        let txn = TxnManager::create(&wal).unwrap();
         let mut conn_txn = txn.begin().unwrap();
         let rid = TableEngine::insert_row(
-            &mut storage,
-            &mut txn,
+            &storage,
+            &txn,
             &mut conn_txn,
             &table,
             &cols,
@@ -909,8 +909,8 @@ mod tests {
         .unwrap();
 
         let new_rids = TableEngine::update_rows_preserve_rid(
-            &mut storage,
-            &mut txn,
+            &storage,
+            &txn,
             &mut conn_txn,
             &table,
             &cols,
@@ -929,7 +929,7 @@ mod tests {
     fn test_scan_table_direct_masked_decode_can_skip_all_columns() {
         let dir = tempfile::tempdir().unwrap();
         let wal = dir.path().join("table-mask-test.wal");
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let root_page_id = storage.alloc_page(PageType::Data).unwrap();
         let root = Page::new(PageType::Data, root_page_id);
         storage.write_page(root_page_id, &root).unwrap();
@@ -960,11 +960,11 @@ mod tests {
             },
         ];
 
-        let mut txn = TxnManager::create(&wal).unwrap();
+        let txn = TxnManager::create(&wal).unwrap();
         let mut conn_txn = txn.begin().unwrap();
         TableEngine::insert_row(
-            &mut storage,
-            &mut txn,
+            &storage,
+            &txn,
             &mut conn_txn,
             &table,
             &cols,
@@ -976,7 +976,7 @@ mod tests {
         let snap = txn.snapshot();
         let mask = [false, false];
         let rows =
-            TableEngine::scan_table_direct(&mut storage, &table, &cols, snap, Some(&mask)).unwrap();
+            TableEngine::scan_table_direct(&storage, &table, &cols, snap, Some(&mask)).unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1, vec![Value::Null, Value::Null]);

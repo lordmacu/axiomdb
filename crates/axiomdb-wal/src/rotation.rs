@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn test_multiple_rotations_lsn_monotonic() {
         let (_dir, wal_path, _db) = temp_setup();
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
         let mut prev_lsn = 0u64;
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn test_rotate_with_active_txn_returns_error() {
         let (_dir, wal_path, _db) = temp_setup();
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
         let _conn = mgr.begin().unwrap();
@@ -156,12 +156,12 @@ mod tests {
     #[test]
     fn test_check_and_rotate_below_threshold_no_rotation() {
         let (_dir, wal_path, _db) = temp_setup();
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
         // Threshold = 1 GB — WAL will never exceed it in this test.
         let rotated = mgr
-            .check_and_rotate(&mut storage, &wal_path, 1024 * 1024 * 1024)
+            .check_and_rotate(&storage, &wal_path, 1024 * 1024 * 1024)
             .unwrap();
         assert!(!rotated);
     }
@@ -169,21 +169,21 @@ mod tests {
     #[test]
     fn test_check_and_rotate_above_threshold_triggers_rotation() {
         let (_dir, wal_path, _db) = temp_setup();
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
         let conn = mgr.begin().unwrap();
         mgr.commit(conn).unwrap();
 
         // Threshold = 0 — any WAL size triggers rotation.
-        let rotated = mgr.check_and_rotate(&mut storage, &wal_path, 0).unwrap();
+        let rotated = mgr.check_and_rotate(&storage, &wal_path, 0).unwrap();
         assert!(rotated);
     }
 
     #[test]
     fn test_wal_rotator_convenience_wrapper() {
         let (_dir, wal_path, _db) = temp_setup();
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
         let conn = mgr.begin().unwrap();
@@ -191,7 +191,7 @@ mod tests {
 
         let rotator = WalRotator::new(0); // always triggers
         let rotated = rotator
-            .check_and_rotate(&mut mgr, &mut storage, &wal_path)
+            .check_and_rotate(&mut mgr, &storage, &wal_path)
             .unwrap();
         assert!(rotated);
     }
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn test_rotation_updates_checkpoint_lsn_in_meta_page() {
         let (_dir, wal_path, _db) = temp_setup();
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
         let conn = mgr.begin().unwrap();
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn test_entries_after_rotation_have_correct_lsns() {
         let (_dir, wal_path, _db) = temp_setup();
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
         // First session: 2 entries (LSN 1=Begin, 2=Commit) + rotate (LSN 3=Checkpoint).
@@ -238,7 +238,7 @@ mod tests {
         let (_dir, wal_path, db_path) = temp_setup();
 
         let ckpt_lsn = {
-            let mut storage = MmapStorage::create(&db_path).unwrap();
+            let storage = MmapStorage::create(&db_path).unwrap();
             let mut mgr = TxnManager::create(&wal_path).unwrap();
             let conn = mgr.begin().unwrap();
             mgr.commit(conn).unwrap();
@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn test_wal_entries_readable_after_rotation() {
         let (_dir, wal_path, _db) = temp_setup();
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         let mut mgr = TxnManager::create(&wal_path).unwrap();
 
         // Write, rotate, write again.

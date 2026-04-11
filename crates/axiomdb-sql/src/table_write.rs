@@ -453,7 +453,7 @@ fn free_toast_chains_in_encoded(encoded: &[u8], storage: &dyn StorageEngine) {
             let page_id =
                 u64::from_le_bytes(encoded[i + 3..i + 11].try_into().unwrap_or([0; 8]));
             if page_id > 0 {
-                let _ = axiomdb_storage::clustered_overflow::free_chain(storage, page_id);
+                let _ = axiomdb_storage::clustered_overflow::free_blob(storage, page_id);
             }
             i += 15; // skip the TOAST pointer
         } else {
@@ -517,7 +517,8 @@ fn toast_row_if_needed(
         } else {
             (raw.clone(), false)
         };
-        let pid = axiomdb_storage::clustered_overflow::write_chain(storage, Some(batch), &data)?;
+        let pid =
+            axiomdb_storage::clustered_overflow::write_refcounted_chain(storage, Some(batch), &data)?;
         let pid = match pid { Some(p) => p, None => continue };
         state[ci] = ToastCol::External { page_id: pid, raw_len: raw.len() as u32, lz4 };
         // u24+payload replaced by u24+12 bytes pointer → save (sz - 12).

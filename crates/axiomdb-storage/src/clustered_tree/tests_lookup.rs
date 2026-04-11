@@ -7,8 +7,8 @@ fn lookup_empty_tree_returns_none() {
 
 #[test]
 fn lookup_root_leaf_hit_returns_inline_row() {
-    let mut storage = MemoryStorage::new();
-    let root = insert(&mut storage, None, b"pk-1", &row_header(3), b"row-inline").unwrap();
+    let storage = MemoryStorage::new();
+    let root = insert(&storage, None, b"pk-1", &row_header(3), b"row-inline").unwrap();
 
     let got = lookup(&storage, Some(root), b"pk-1", &committed_snapshot(10))
         .unwrap()
@@ -21,10 +21,10 @@ fn lookup_root_leaf_hit_returns_inline_row() {
 
 #[test]
 fn lookup_missing_key_returns_none() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
     for key in [b"alpha".as_slice(), b"bravo", b"charlie"] {
-        root = Some(insert(&mut storage, root, key, &row_header(1), b"row").unwrap());
+        root = Some(insert(&storage, root, key, &row_header(1), b"row").unwrap());
     }
 
     let got = lookup(&storage, root, b"delta", &committed_snapshot(10)).unwrap();
@@ -33,9 +33,9 @@ fn lookup_missing_key_returns_none() {
 
 #[test]
 fn lookup_invisible_current_version_returns_none() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let root = insert(
-        &mut storage,
+        &storage,
         None,
         b"future",
         &row_header(9),
@@ -54,13 +54,13 @@ fn lookup_invisible_current_version_returns_none() {
 
 #[test]
 fn lookup_after_internal_splits_finds_exact_row() {
-    let mut storage = MemoryStorage::new();
+    let storage = MemoryStorage::new();
     let mut root = None;
 
     for key in 0u32..128 {
         root = Some(
             insert(
-                &mut storage,
+                &storage,
                 root,
                 &key.to_be_bytes(),
                 &row_header(1),
