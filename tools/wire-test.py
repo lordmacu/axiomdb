@@ -12,6 +12,7 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              39.22 (UPDATE in-place zero-alloc: single/multi field patch, rollback, TEXT-before-INT),
              40.1b (CREATE INDEX on clustered tables), 4.22e (ALTER DROP/MODIFY auto-index repair),
              4.G5 (DELETE/UPDATE ORDER BY+LIMIT, INSERT IGNORE, CREATE LIKE, CTAS, CALL/DO),
+             4.11b (Subquery in JOIN),
              11.2d (refcounted TOAST/BLOB chain roundtrip), 11.4 (native JSON type + JSON_EXTRACT / ->>),
              11.16 (binary JSONB + JSONPath: -> operator, JSON_MERGE_PATCH, JSON_CONTAINS, JSON_PATH_EXISTS, TO_JSONB)
 """
@@ -2965,6 +2966,95 @@ rows = c_g5.fetchall()
 ok("G5.6 CTAS correct rows", [r[0] for r in rows] == [1, 2])
 
 conn_g5.close()
+
+# ── 4.11b Subquery in JOIN ───────────────────────────────────────────────────
+
+print("\n[4.11b] Subquery in JOIN")
+conn_411b = connect()
+c_411b = conn_411b.cursor()
+c_411b.execute("DROP TABLE IF EXISTS jt_users")
+c_411b.execute("DROP TABLE IF EXISTS jt_orders")
+c_411b.execute("CREATE TABLE jt_users (id INT, name TEXT, role TEXT)")
+c_411b.execute("CREATE TABLE jt_orders (id INT, user_id INT, total INT)")
+c_411b.execute(
+    "INSERT INTO jt_users VALUES "
+    "(1, 'Alice', 'admin'), (2, 'Bob', 'user'), (3, 'Carol', 'vip')"
+)
+c_411b.execute(
+    "INSERT INTO jt_orders VALUES "
+    "(10, 1, 500), (11, 1, 1500), (12, 2, 200), (13, 99, 50)"
+)
+conn_411b.commit()
+
+c_411b.execute(
+    "SELECT big.total "
+    "FROM jt_users "
+    "JOIN (SELECT user_id, total FROM jt_orders WHERE total > 400) AS big "
+    "ON big.user_id = jt_users.id "
+    "ORDER BY big.total"
+)
+ok("4.11b INNER JOIN derived table", list(c_411b.fetchall()) == [(500,), (1500,)])
+
+c_411b.execute(
+    "SELECT jt_users.id, stats.order_count "
+    "FROM jt_users "
+    "LEFT JOIN ("
+    "    SELECT user_id, COUNT(*) AS order_count "
+    "    FROM jt_orders GROUP BY user_id"
+    ") AS stats ON stats.user_id = jt_users.id "
+    "ORDER BY jt_users.id"
+)
+ok(
+    "4.11b LEFT JOIN derived table preserves NULL-extended rows",
+    list(c_411b.fetchall()) == [(1, 2), (2, 1), (3, None)],
+)
+
+c_411b.execute(
+    "SELECT jt_users.id, stats.user_id, stats.order_count "
+    "FROM jt_users "
+    "RIGHT JOIN ("
+    "    SELECT user_id, COUNT(*) AS order_count "
+    "    FROM jt_orders GROUP BY user_id"
+    ") AS stats ON stats.user_id = jt_users.id "
+    "ORDER BY stats.user_id"
+)
+rows = [(left_id, int(user_id), order_count) for (left_id, user_id, order_count) in c_411b.fetchall()]
+ok(
+    "4.11b RIGHT JOIN derived table preserves unmatched derived rows",
+    rows == [(1, 1, 2), (2, 2, 1), (None, 99, 1)],
+)
+
+c_411b.execute(
+    "SELECT stats.* "
+    "FROM jt_users "
+    "JOIN ("
+    "    SELECT user_id, COUNT(*) AS order_count "
+    "    FROM jt_orders GROUP BY user_id"
+    ") AS stats ON stats.user_id = jt_users.id "
+    "ORDER BY stats.user_id"
+)
+rows = [(int(user_id), order_count) for (user_id, order_count) in c_411b.fetchall()]
+ok(
+    "4.11b alias.* exposes only derived columns",
+    rows == [(1, 2), (2, 1)],
+)
+
+c_411b.execute(
+    "SELECT jt_users.id "
+    "FROM jt_users "
+    "JOIN ("
+    "    SELECT user_id, MAX(total) AS biggest "
+    "    FROM jt_orders GROUP BY user_id"
+    ") AS mx ON mx.user_id = jt_users.id "
+    "WHERE mx.biggest > 400 "
+    "ORDER BY mx.biggest DESC"
+)
+ok(
+    "4.11b WHERE and ORDER BY can reference derived join columns",
+    list(c_411b.fetchall()) == [(1,)],
+)
+
+conn_411b.close()
 
 # ── Connectivity / basics ─────────────────────────────────────────────────────
 

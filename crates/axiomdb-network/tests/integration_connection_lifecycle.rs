@@ -715,6 +715,55 @@ async fn test_com_quit_rolls_back_active_implicit_txn() {
 }
 
 #[tokio::test]
+async fn test_disconnect_rolls_back_active_implicit_txn() {
+    let server = spawn_server_with_setup_and_connections(
+        LifecycleTimeouts {
+            auth_timeout: Duration::from_millis(200),
+        },
+        &["CREATE TABLE close_tx (id INT PRIMARY KEY, v INT)"],
+        2,
+    )
+    .await;
+
+    let mut stream1 = TcpStream::connect(server.addr)
+        .await
+        .expect("connect first");
+    authenticate(&mut stream1, false).await.expect("auth first");
+    let ok = com_query(&mut stream1, "SET autocommit = 0")
+        .await
+        .expect("SET autocommit first");
+    assert_eq!(ok[0], 0x00, "SET autocommit must return OK");
+    let ok = com_query(&mut stream1, "INSERT INTO close_tx VALUES (1, 10)")
+        .await
+        .expect("INSERT first");
+    assert_eq!(ok[0], 0x00, "INSERT must return OK");
+    drop(stream1);
+
+    let mut stream2 = TcpStream::connect(server.addr)
+        .await
+        .expect("connect second");
+    authenticate(&mut stream2, false)
+        .await
+        .expect("auth second");
+    let count = com_query_single_text(&mut stream2, "SELECT COUNT(*) FROM close_tx")
+        .await
+        .expect("SELECT COUNT second");
+    assert_eq!(
+        count.as_deref(),
+        Some("0"),
+        "socket disconnect must roll back implicit txn"
+    );
+
+    let ok = com_query(&mut stream2, "INSERT INTO close_tx VALUES (2, 20)")
+        .await
+        .expect("INSERT second");
+    assert_eq!(ok[0], 0x00, "writer must be released after disconnect");
+
+    com_quit(&mut stream2).await.expect("COM_QUIT second");
+    server.task.await.expect("server task");
+}
+
+#[tokio::test]
 async fn test_handshake_database_sets_current_database_visible_to_database_function() {
     let server = spawn_server_with_setup(
         LifecycleTimeouts {
