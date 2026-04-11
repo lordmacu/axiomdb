@@ -104,18 +104,18 @@ ORDER BY mx.biggest DESC;
 
 ## Acceptance criteria
 
-- [ ] `JOIN (SELECT ...) alias ON ...` executes without `NotImplemented`
-- [ ] `LEFT JOIN (SELECT ...) alias ON ...` preserves unmatched left rows with NULL-extended right side
-- [ ] `RIGHT JOIN (SELECT ...) alias ON ...` preserves unmatched derived-table rows with NULL-extended left side
-- [ ] `FULL JOIN (SELECT ...) alias ON ...` preserves unmatched rows from both sides
-- [ ] `JOIN (SELECT ...) alias USING (col)` resolves column names correctly on both sides
-- [ ] `SELECT *` expands columns from base tables and join-side derived tables in join order
-- [ ] `SELECT alias.*` expands only the derived-table columns for that alias
-- [ ] `WHERE`, `GROUP BY`, `HAVING`, and `ORDER BY` can reference columns produced by the join-side subquery
-- [ ] Chained joins mixing base tables and join-side subqueries work correctly
-- [ ] The join-side subquery is analyzed before execution so its internal column references are resolved
-- [ ] Base table JOIN behavior remains unchanged for queries without join-side subqueries
-- [ ] `cargo test -p axiomdb-sql` passes with new unit/integration coverage
+- [x] `JOIN (SELECT ...) alias ON ...` executes without `NotImplemented`
+- [x] `LEFT JOIN (SELECT ...) alias ON ...` preserves unmatched left rows with NULL-extended right side
+- [x] `RIGHT JOIN (SELECT ...) alias ON ...` preserves unmatched derived-table rows with NULL-extended left side
+- [x] `FULL JOIN (SELECT ...) alias ON ...` preserves unmatched rows from both sides
+- [x] `JOIN (SELECT ...) alias USING (col)` resolves column names correctly on both sides
+- [x] `SELECT *` expands columns from base tables and join-side derived tables in join order
+- [x] `SELECT alias.*` expands only the derived-table columns for that alias
+- [x] `WHERE`, `GROUP BY`, `HAVING`, and `ORDER BY` can reference columns produced by the join-side subquery
+- [x] Chained joins mixing base tables and join-side subqueries work correctly
+- [x] The join-side subquery is analyzed before execution so its internal column references are resolved
+- [x] Base table JOIN behavior remains unchanged for queries without join-side subqueries
+- [x] `cargo test -p axiomdb-sql` passes with new unit/integration coverage
 
 ## Out of scope
 
