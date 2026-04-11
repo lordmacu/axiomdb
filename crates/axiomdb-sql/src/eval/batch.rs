@@ -143,18 +143,18 @@ impl BatchPredicate {
                 cmp_bool(col_val, lit_val, check.op)
             }
             DataType::Int | DataType::Date => {
-                let col_val = i32::from_le_bytes(col_bytes.try_into().unwrap());
-                let lit_val = i32::from_le_bytes(lit_bytes.try_into().unwrap());
+                let col_val = i32::from_le_bytes(col_bytes.try_into().unwrap_or_default());
+                let lit_val = i32::from_le_bytes(lit_bytes.try_into().unwrap_or_default());
                 cmp_ord(col_val, lit_val, check.op)
             }
             DataType::BigInt | DataType::Timestamp => {
-                let col_val = i64::from_le_bytes(col_bytes.try_into().unwrap());
-                let lit_val = i64::from_le_bytes(lit_bytes.try_into().unwrap());
+                let col_val = i64::from_le_bytes(col_bytes.try_into().unwrap_or_default());
+                let lit_val = i64::from_le_bytes(lit_bytes.try_into().unwrap_or_default());
                 cmp_ord(col_val, lit_val, check.op)
             }
             DataType::Real => {
-                let col_val = f64::from_le_bytes(col_bytes.try_into().unwrap());
-                let lit_val = f64::from_le_bytes(lit_bytes.try_into().unwrap());
+                let col_val = f64::from_le_bytes(col_bytes.try_into().unwrap_or_default());
+                let lit_val = f64::from_le_bytes(lit_bytes.try_into().unwrap_or_default());
                 cmp_f64(col_val, lit_val, check.op)
             }
             _ => false, // unsupported type — should not happen (try_compile rejects)
@@ -223,7 +223,7 @@ impl BatchPredicate {
                     }
                     if let Some(off) = self.col_offset(row, check) {
                         if off + 4 <= row.len() {
-                            vals[i] = i32::from_le_bytes(row[off..off + 4].try_into().unwrap());
+                            vals[i] = i32::from_le_bytes(row[off..off + 4].try_into().unwrap_or_default());
                         } else {
                             output[i] = false;
                         }
@@ -231,7 +231,7 @@ impl BatchPredicate {
                         output[i] = false;
                     }
                 }
-                let lit = i32::from_le_bytes(check.literal_bytes[..4].try_into().unwrap());
+                let lit = i32::from_le_bytes(check.literal_bytes[..4].try_into().unwrap_or_default());
                 super::simd::batch_cmp_i32(&vals, lit, check.op, output);
             }
             DataType::BigInt | DataType::Timestamp => {
@@ -246,7 +246,7 @@ impl BatchPredicate {
                     }
                     if let Some(off) = self.col_offset(row, check) {
                         if off + 8 <= row.len() {
-                            vals[i] = i64::from_le_bytes(row[off..off + 8].try_into().unwrap());
+                            vals[i] = i64::from_le_bytes(row[off..off + 8].try_into().unwrap_or_default());
                         } else {
                             output[i] = false;
                         }
@@ -254,7 +254,7 @@ impl BatchPredicate {
                         output[i] = false;
                     }
                 }
-                let lit = i64::from_le_bytes(check.literal_bytes[..8].try_into().unwrap());
+                let lit = i64::from_le_bytes(check.literal_bytes[..8].try_into().unwrap_or_default());
                 super::simd::batch_cmp_i64(&vals, lit, check.op, output);
             }
             DataType::Real => {
@@ -269,7 +269,7 @@ impl BatchPredicate {
                     }
                     if let Some(off) = self.col_offset(row, check) {
                         if off + 8 <= row.len() {
-                            vals[i] = f64::from_le_bytes(row[off..off + 8].try_into().unwrap());
+                            vals[i] = f64::from_le_bytes(row[off..off + 8].try_into().unwrap_or_default());
                         } else {
                             output[i] = false;
                         }
@@ -277,7 +277,7 @@ impl BatchPredicate {
                         output[i] = false;
                     }
                 }
-                let lit = f64::from_le_bytes(check.literal_bytes[..8].try_into().unwrap());
+                let lit = f64::from_le_bytes(check.literal_bytes[..8].try_into().unwrap_or_default());
                 super::simd::batch_cmp_f64(&vals, lit, check.op, output);
             }
             _ => {
