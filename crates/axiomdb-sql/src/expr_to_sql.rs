@@ -53,6 +53,7 @@ pub fn expr_to_sql_string(expr: &Expr) -> String {
                 BinaryOp::ShiftRight => ">>",
                 BinaryOp::Regexp => "REGEXP",
                 BinaryOp::JsonSub => "->",
+                BinaryOp::JsonContains => "@>",
             };
             format!(
                 "({} {op_str} {})",

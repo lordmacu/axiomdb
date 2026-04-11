@@ -205,6 +205,54 @@ fn apply_update_index_maintenance(
         }
         let pred = compiled_preds.get(idx_pos).and_then(|p| p.as_ref());
 
+        if idx.index_type == 4 {
+            let mut insert_rows: Vec<(RecordId, &Vec<Value>)> = Vec::new();
+            for (old_rid, old_values, new_rid, new_values) in update_pairs {
+                if crate::index_maintenance::update_affects_index(
+                    idx,
+                    pred,
+                    old_values,
+                    *old_rid,
+                    new_values,
+                    *new_rid,
+                )? {
+                    insert_rows.push((*new_rid, new_values));
+                }
+            }
+
+            if !insert_rows.is_empty() {
+                let batch_refs: Vec<(&[Value], RecordId)> = insert_rows
+                    .iter()
+                    .map(|(rid, vals)| (vals.as_slice(), *rid))
+                    .collect();
+
+                for &(vals, rid) in &batch_refs {
+                    if let Some(terms) =
+                        crate::index_maintenance::gin_terms_if_indexed(idx, vals, pred)?
+                    {
+                        for term in &terms {
+                            let key = crate::index_maintenance::gin_heap_key(term, rid);
+                            txn.record_index_insert(conn_txn, idx.index_id, idx.root_page_id, key);
+                        }
+                    }
+                }
+
+                if let Some(new_root) = crate::index_maintenance::insert_many_into_single_index(
+                    idx,
+                    pred,
+                    &batch_refs,
+                    storage,
+                    bloom,
+                    snap.clone(),
+                )? {
+                    CatalogWriter::new(storage, txn, conn_txn)?
+                        .update_index_root(idx.index_id, new_root)?;
+                    idx.root_page_id = new_root;
+                }
+            }
+            continue;
+        }
+
         // Phase 7.3b — HOT optimization: per-index check.
         // If no key column changed for any row in this batch, skip this index entirely.
         let mut insert_rows: Vec<(RecordId, &Vec<Value>)> = Vec::new();

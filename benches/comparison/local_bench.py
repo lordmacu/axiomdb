@@ -41,6 +41,11 @@ Scenarios:
   complex_where       — compound OR/AND with arithmetic predicates
   insert_select       — INSERT INTO ... SELECT * FROM ...
   between_range       — WHERE age BETWEEN 25 AND 35
+  json_extract        — JSON_EXTRACT path filter
+  jsonb_extract       — JSONB -> path extract + filter
+  jsonb_contains      — JSON_CONTAINS containment filter
+  jsonb_path_query    — JSONPath / path-based filter
+  jsonb_gin_contains  — JSONB @> containment through GIN where supported
   all                 — run the full fair scenario set above
 
 Usage:
@@ -181,6 +186,7 @@ PRINT_ORDER = [
     "jsonb_extract",
     "jsonb_contains",
     "jsonb_path_query",
+    "jsonb_gin_contains",
     # ── FTS (Phase 11.6/11.7) ──
     "fts_match",
 ]
@@ -209,6 +215,7 @@ NEEDS_JSON = {
     "jsonb_extract",
     "jsonb_contains",
     "jsonb_path_query",
+    "jsonb_gin_contains",
 }
 
 # Scenarios that need the bench_fts table created and populated.
@@ -556,12 +563,22 @@ def rows_data_orders(n_users):
 
 def rows_data_json(n):
     rows = []
+    tenants = ["acme", "globex", "initech"]
+    plans = ["free", "pro", "enterprise"]
+    countries = ["US", "CO", "ES"]
     for i in range(1, n + 1):
         payload = {
             "id": i,
             "name": f"user_{i:06d}",
             "age": 18 + (i % 62),
             "active": 1 if i % 2 == 0 else 0,
+            "tenant": tenants[(i - 1) % len(tenants)],
+            "role": "admin" if i % 10 == 0 else "user",
+            "profile": {
+                "plan": plans[i % len(plans)],
+                "country": countries[i % len(countries)],
+            },
+            "tags": ["mobile", "beta"] if i % 5 == 0 else ["web", "paid"],
         }
         rows.append((i, json.dumps(payload, separators=(",", ":"))))
     return rows
@@ -776,16 +793,27 @@ def users_copy_schema_statements(kind):
 def json_schema_statements(kind):
     if kind == "pg":
         return [
+            "DROP TABLE IF EXISTS bench_jsonb CASCADE",
             "DROP TABLE IF EXISTS bench_json CASCADE",
             """CREATE TABLE bench_json (
+    id   INT   NOT NULL PRIMARY KEY,
+    data JSONB NOT NULL
+)""",
+            """CREATE TABLE bench_jsonb (
     id   INT   NOT NULL PRIMARY KEY,
     data JSONB NOT NULL
 )""",
         ]
     elif kind == "mysql":
         return [
+            "DROP TABLE IF EXISTS bench_jsonb",
             "DROP TABLE IF EXISTS bench_json",
             """CREATE TABLE bench_json (
+    id   INT  NOT NULL,
+    data JSON NOT NULL,
+    PRIMARY KEY (id)
+) ENGINE=InnoDB""",
+            """CREATE TABLE bench_jsonb (
     id   INT  NOT NULL,
     data JSON NOT NULL,
     PRIMARY KEY (id)
@@ -793,10 +821,16 @@ def json_schema_statements(kind):
         ]
     elif kind == "axiomdb":
         return [
+            "DROP TABLE IF EXISTS bench_jsonb",
             "DROP TABLE IF EXISTS bench_json",
             """CREATE TABLE bench_json (
     id   INT  NOT NULL,
     data JSON NOT NULL,
+    PRIMARY KEY (id)
+)""",
+            """CREATE TABLE bench_jsonb (
+    id   INT   NOT NULL,
+    data JSONB NOT NULL,
     PRIMARY KEY (id)
 )""",
         ]
@@ -916,6 +950,10 @@ def prepare_workload(n_rows, multi_values_chunk, autocommit_rows, point_lookups,
         "INSERT INTO bench_json VALUES " + ",".join(chunk)
         for chunk in chunked(json_values_sql, multi_values_chunk)
     ]
+    insert_jsonb_sqls = [
+        "INSERT INTO bench_jsonb VALUES " + ",".join(chunk)
+        for chunk in chunked(json_values_sql, multi_values_chunk)
+    ]
 
     # ── FTS data ─────────────────────────────────────────────────────────────
     fts_rows = rows_data_fts(n_rows)
@@ -967,6 +1005,8 @@ def prepare_workload(n_rows, multi_values_chunk, autocommit_rows, point_lookups,
         "insert_orders_sqls": insert_orders_sqls,
         "n_json": len(json_rows),
         "insert_json_sqls": insert_json_sqls,
+        "n_jsonb": len(json_rows),
+        "insert_jsonb_sqls": insert_jsonb_sqls,
         # ── join queries ──────────────────────────────────────────────────────
         "join_inner_sql": (
             "SELECT u.name, o.amount "
@@ -1023,6 +1063,7 @@ def prepare_workload(n_rows, multi_values_chunk, autocommit_rows, point_lookups,
         "jsonb_extract_n": n_rows,
         "jsonb_contains_n": n_rows,
         "jsonb_path_query_n": n_rows,
+        "jsonb_gin_contains_n": n_rows,
         # ── FTS (Phase 11.6/11.7) ────────────────────────────────────────────
         "n_fts": len(fts_rows),
         "insert_fts_sqls": insert_fts_sqls,
@@ -1040,6 +1081,7 @@ def preload_orders(conn, workload):
 
 def preload_json(conn, workload):
     exec_statements(conn, workload["insert_json_sqls"], transactional=True)
+    exec_statements(conn, workload["insert_jsonb_sqls"], transactional=True)
 
 
 def preload_fts(conn, workload):
@@ -1439,13 +1481,12 @@ def run_json_extract(conn, engine, kind, _indexes, workload):
 
 def run_jsonb_extract(conn, engine, kind, _indexes, workload):
     if kind == "pg":
-        sql = "SELECT data->>'age' FROM bench_json WHERE (data->>'active') = '1'"
+        sql = "SELECT data->>'age' FROM bench_jsonb WHERE (data->>'active') = '1'"
     elif kind == "axiomdb":
-        sql = "SELECT data->>'age' FROM bench_json WHERE data->>'active' = '1'"
+        sql = "SELECT data->>'age' FROM bench_jsonb WHERE data->>'active' = '1'"
     else:
         # MySQL does not have JSONB; use JSON_EXTRACT
-        sql = workload.get("json_extract_sql",
-                           "SELECT JSON_EXTRACT(data, '$.age') FROM bench_json WHERE JSON_EXTRACT(data, '$.active') = 1")
+        sql = "SELECT JSON_EXTRACT(data, '$.age') FROM bench_jsonb WHERE JSON_EXTRACT(data, '$.active') = 1"
 
     def do():
         cur = conn.cursor()
@@ -1459,11 +1500,11 @@ def run_jsonb_extract(conn, engine, kind, _indexes, workload):
 
 def run_jsonb_contains(conn, engine, kind, _indexes, workload):
     if kind == "pg":
-        sql = "SELECT COUNT(*) FROM bench_json WHERE data @> '{\"active\":1}'"
+        sql = "SELECT COUNT(*) FROM bench_jsonb WHERE data @> '{\"active\":1}'"
     elif kind == "axiomdb":
-        sql = "SELECT COUNT(*) FROM bench_json WHERE JSON_CONTAINS(data, '1', '$.active') = 1"
+        sql = "SELECT COUNT(*) FROM bench_jsonb WHERE JSON_CONTAINS(data, '1', '$.active') = 1"
     else:
-        sql = "SELECT COUNT(*) FROM bench_json WHERE JSON_CONTAINS(data, '1', '$.active')"
+        sql = "SELECT COUNT(*) FROM bench_jsonb WHERE JSON_CONTAINS(data, '1', '$.active')"
 
     def do():
         cur = conn.cursor()
@@ -1475,13 +1516,45 @@ def run_jsonb_contains(conn, engine, kind, _indexes, workload):
     emit(engine, "jsonb_contains", workload["jsonb_contains_n"], mean, "JSON_CONTAINS filter")
 
 
+def run_jsonb_gin_contains(conn, engine, kind, _indexes, workload):
+    candidate = '{"tenant":"acme","profile":{"plan":"pro"},"tags":["web"]}'
+    if kind == "pg":
+        exec_statements(conn, ["CREATE INDEX idx_bench_jsonb_gin ON bench_jsonb USING gin (data)"])
+        sql = f"SELECT COUNT(*) FROM bench_jsonb WHERE data @> '{candidate}'"
+    elif kind == "axiomdb":
+        exec_statements(conn, ["CREATE INDEX idx_bench_jsonb_gin ON bench_jsonb USING GIN (data)"])
+        sql = f"SELECT COUNT(*) FROM bench_jsonb WHERE data @> '{candidate}'"
+    else:
+        sql = f"SELECT COUNT(*) FROM bench_jsonb WHERE JSON_CONTAINS(data, '{candidate}')"
+
+    cur = conn.cursor()
+    cur.execute(sql)
+    matched = cur.fetchone()[0]
+    cur.close()
+
+    def do():
+        cur = conn.cursor()
+        cur.execute(sql)
+        cur.fetchall()
+        cur.close()
+
+    mean = timed_runs(lambda: None, do)
+    emit(
+        engine,
+        "jsonb_gin_contains",
+        workload["jsonb_gin_contains_n"],
+        mean,
+        f"JSONB @> nested containment ({matched} matches)",
+    )
+
+
 def run_jsonb_path_query(conn, engine, kind, _indexes, workload):
     if kind == "pg":
-        sql = "SELECT COUNT(*) FROM bench_json WHERE jsonb_path_exists(data, '$.age ? (@ > 40)')"
+        sql = "SELECT COUNT(*) FROM bench_jsonb WHERE jsonb_path_exists(data, '$.age ? (@ > 40)')"
     elif kind == "axiomdb":
-        sql = "SELECT COUNT(*) FROM bench_json WHERE JSON_PATH_EXISTS(data, '$.age') = TRUE AND JSON_EXTRACT(data, '$.age') > 40"
+        sql = "SELECT COUNT(*) FROM bench_jsonb WHERE JSON_PATH_EXISTS(data, '$.age') = TRUE AND JSON_EXTRACT(data, '$.age') > 40"
     else:
-        sql = "SELECT COUNT(*) FROM bench_json WHERE JSON_EXTRACT(data, '$.age') > 40"
+        sql = "SELECT COUNT(*) FROM bench_jsonb WHERE JSON_EXTRACT(data, '$.age') > 40"
 
     def do():
         cur = conn.cursor()
@@ -1546,6 +1619,7 @@ SCENARIOS = {
     "jsonb_extract": run_jsonb_extract,
     "jsonb_contains": run_jsonb_contains,
     "jsonb_path_query": run_jsonb_path_query,
+    "jsonb_gin_contains": run_jsonb_gin_contains,
     "fts_match": run_fts_match,
 }
 

@@ -265,6 +265,12 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
                 Ok(op_expr)
             }
         }
+        // Phase 11.17: `@>` JSONB containment — same precedence level as comparisons.
+        Token::JsonContains if !negated => {
+            p.advance();
+            let right = parse_bitor(p)?;
+            return Ok(binop(BinaryOp::JsonContains, left, right));
+        }
         cmp if !negated => {
             let op = match cmp {
                 Token::NullSafe => BinaryOp::NullSafe,

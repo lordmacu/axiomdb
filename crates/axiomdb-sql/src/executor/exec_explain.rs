@@ -295,6 +295,18 @@ fn explain_select(
                 "Using index",
             )
         }
+        crate::planner::AccessMethod::GinScan { index_def, query_terms } => {
+            // GIN scan: estimate ~10% of rows pass the containment filter.
+            let est = (row_count / 10).max(1);
+            (
+                "gin",
+                Value::Text(index_def.name.clone()),
+                Value::Int(query_terms.len() as i32),
+                Value::Null,
+                Value::Int(est as i32),
+                "Using GIN index; Using where",
+            )
+        }
     };
 
     // Possible keys: all indexes on the table.

@@ -357,6 +357,10 @@ pub enum IndexType {
     /// `WHERE MATCH(col, 'query terms')` searches with relevance scoring.
     /// Built-in (PostgreSQL requires tsearch, MySQL uses FULLTEXT).
     FullText,
+    /// GIN — Generalized Inverted Index for JSONB containment (Phase 11.17).
+    /// `CREATE INDEX ... USING gin (col)` on a JSONB column.
+    /// Enables `col @> '{"key":"val"}'` with O(log n) index lookup.
+    Gin,
 }
 
 /// `CREATE [UNIQUE] INDEX`

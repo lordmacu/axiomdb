@@ -237,6 +237,91 @@ fn clustered_secondary_rows_for_range(
     )
 }
 
+fn gin_scan_rows(
+    storage: &dyn StorageEngine,
+    resolved: &axiomdb_catalog::ResolvedTable,
+    index_def: &axiomdb_catalog::IndexDef,
+    query_terms: &[Vec<u8>],
+    snap: TransactionSnapshot,
+) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+    use std::collections::HashSet;
+
+    if resolved.def.is_clustered() {
+        let mut candidate_keys: Option<HashSet<Vec<u8>>> = None;
+
+        for term in query_terms {
+            let (lo, hi) = crate::index_maintenance::gin_term_bounds(term);
+            let pairs = BTree::range_in(
+                storage,
+                index_def.root_page_id,
+                Some(&lo),
+                Some(&hi),
+            )?;
+            let term_keys: HashSet<Vec<u8>> = pairs
+                .into_iter()
+                .filter_map(|(_rid, key)| {
+                    crate::index_maintenance::gin_key_suffix(&key, term).map(|pk| pk.to_vec())
+                })
+                .collect();
+
+            candidate_keys = Some(match candidate_keys.take() {
+                None => term_keys,
+                Some(existing) => existing.intersection(&term_keys).cloned().collect(),
+            });
+        }
+
+        let pk_keys = candidate_keys.unwrap_or_default();
+        let col_types = crate::table::column_data_types(&resolved.columns);
+        let mut result = Vec::with_capacity(pk_keys.len());
+        for pk_key in pk_keys {
+            let Some(row) = axiomdb_storage::clustered_tree::lookup(
+                storage,
+                Some(resolved.def.root_page_id),
+                &pk_key,
+                &snap,
+            )?
+            else {
+                continue;
+            };
+            let values = axiomdb_types::codec::decode_row(&row.row_data, &col_types)?;
+            result.push((RecordId { page_id: 0, slot_id: 0 }, values));
+        }
+        return Ok(result);
+    }
+
+    let mut candidate_rids: Option<HashSet<RecordId>> = None;
+
+    for term in query_terms {
+        let (lo, hi) = crate::index_maintenance::gin_term_bounds(term);
+        let pairs = BTree::range_in(
+            storage,
+            index_def.root_page_id,
+            Some(&lo),
+            Some(&hi),
+        )?;
+        let term_rids: HashSet<RecordId> = pairs.into_iter().map(|(rid, _)| rid).collect();
+
+        candidate_rids = Some(match candidate_rids.take() {
+            None => term_rids,
+            Some(existing) => existing.intersection(&term_rids).copied().collect(),
+        });
+    }
+
+    let rids: Vec<RecordId> = candidate_rids.unwrap_or_default().into_iter().collect();
+    let mut result = Vec::with_capacity(rids.len());
+
+    for rid in rids {
+        if !HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap.clone())? {
+            continue;
+        }
+        if let Some(values) = TableEngine::read_row(storage, &resolved.columns, rid)? {
+            result.push((rid, values));
+        }
+    }
+
+    Ok(result)
+}
+
 fn clustered_primary_index(
     resolved: &axiomdb_catalog::ResolvedTable,
 ) -> Result<&axiomdb_catalog::IndexDef, DbError> {

@@ -564,6 +564,9 @@ pub enum Token<'src> {
     /// `@@` — MySQL session/system variable prefix.
     #[token("@@")]
     AtAt,
+    /// `@>` — JSONB containment operator (Phase 11.17). MUST appear before `@`.
+    #[token("@>")]
+    JsonContains,
     /// `@` — MySQL user-variable prefix.
     #[token("@")]
     At,

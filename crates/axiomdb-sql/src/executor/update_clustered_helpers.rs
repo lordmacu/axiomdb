@@ -123,7 +123,8 @@ fn collect_clustered_update_candidates(
                 snap,
             )?);
         }
-        crate::planner::AccessMethod::IndexOnlyScan { .. } => unreachable!(),
+        crate::planner::AccessMethod::IndexOnlyScan { .. }
+        | crate::planner::AccessMethod::GinScan { .. } => unreachable!(),
     }
 
     let mut seen = std::collections::HashSet::new();
@@ -167,6 +168,79 @@ fn apply_clustered_secondary_update(
     bloom: &crate::bloom::BloomRegistry,
 ) -> Result<(), DbError> {
     let snap = txn.active_snapshot(conn_txn);
+
+    if idx.index_type == 4 {
+        let old_terms =
+            crate::index_maintenance::gin_terms_if_indexed(idx, old_values, compiled_pred)?;
+        let new_terms =
+            crate::index_maintenance::gin_terms_if_indexed(idx, new_values, compiled_pred)?;
+
+        if old_terms.is_none() && new_terms.is_none() {
+            return Ok(());
+        }
+
+        let old_pk_key = old_terms
+            .as_ref()
+            .map(|_| {
+                crate::index_maintenance::encode_clustered_pk_key_from_row(
+                    &idx.name,
+                    &layout.primary_cols,
+                    old_values,
+                )
+            })
+            .transpose()?;
+        let new_pk_key = new_terms
+            .as_ref()
+            .map(|_| {
+                crate::index_maintenance::encode_clustered_pk_key_from_row(
+                    &idx.name,
+                    &layout.primary_cols,
+                    new_values,
+                )
+            })
+            .transpose()?;
+
+        if old_terms == new_terms && old_pk_key == new_pk_key {
+            return Ok(());
+        }
+
+        if let (Some(terms), Some(pk_key)) = (old_terms.as_ref(), old_pk_key.as_ref()) {
+            for term in terms {
+                let key = crate::index_maintenance::gin_clustered_key(term, pk_key);
+                let _ = BTree::delete_in(storage, sec_root, &key)?;
+                txn.record_index_delete(
+                    conn_txn,
+                    idx.index_id,
+                    sec_root.load(std::sync::atomic::Ordering::Acquire),
+                    key,
+                    crate::index_maintenance::GIN_CLUSTERED_DUMMY_RID,
+                    idx.fillfactor,
+                );
+            }
+        }
+
+        if let (Some(terms), Some(pk_key)) = (new_terms.as_ref(), new_pk_key.as_ref()) {
+            for term in terms {
+                let key = crate::index_maintenance::gin_clustered_key(term, pk_key);
+                BTree::insert_in(
+                    storage,
+                    sec_root,
+                    &key,
+                    crate::index_maintenance::GIN_CLUSTERED_DUMMY_RID,
+                    idx.fillfactor,
+                )?;
+                txn.record_index_insert(
+                    conn_txn,
+                    idx.index_id,
+                    sec_root.load(std::sync::atomic::Ordering::Acquire),
+                    key,
+                );
+            }
+        }
+
+        return Ok(());
+    }
+
     let old_indexed =
         crate::index_maintenance::index_key_values_if_indexed(idx, old_values, compiled_pred)?
             .is_some();

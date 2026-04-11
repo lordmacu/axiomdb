@@ -223,6 +223,10 @@ pub(super) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
         // `json -> 'key'` returns the sub-document as Value::Jsonb.
         // `json -> 0`     returns the array element at index 0 as Value::Jsonb.
         BinaryOp::JsonSub => eval_json_sub(l, r),
+
+        // ── JSONB containment: @> (Phase 11.17) ──────────────────────────────
+        // `doc @> query` returns 1 if every key/value in query is in doc.
+        BinaryOp::JsonContains => eval_json_contains(l, r),
     }
 }
 
@@ -739,4 +743,40 @@ fn eval_regexp(l: Value, r: Value) -> Result<Value, DbError> {
         reason: format!("invalid REGEXP pattern: {e}"),
     })?;
     Ok(Value::Bool(re.is_match(&text)))
+}
+
+// ── JSONB containment: @> (Phase 11.17) ──────────────────────────────────────
+
+fn eval_json_contains(left: Value, right: Value) -> Result<Value, DbError> {
+    use axiomdb_types::jsonb::{jsonb_contains, JsonbEncoder};
+
+    // NULL propagation
+    if left.is_null() || right.is_null() {
+        return Ok(Value::Null);
+    }
+
+    // Obtain binary JSONB bytes for both sides.
+    // Text literals ('{"a":1}') are treated as JSON strings, parsed on the fly.
+    let to_blob = |v: Value| -> Result<Vec<u8>, DbError> {
+        match v {
+            Value::Jsonb(b) => Ok(b.as_ref().clone()),
+            Value::Json(s) | Value::Text(s) => {
+                let parsed = serde_json::from_str::<serde_json::Value>(&s).map_err(|e| {
+                    DbError::InvalidValue {
+                        reason: format!("invalid JSON in @> operand: {e}"),
+                    }
+                })?;
+                JsonbEncoder::encode(&parsed)
+            }
+            other => Err(DbError::TypeMismatch {
+                expected: "JSON or JSONB".into(),
+                got: other.variant_name().into(),
+            }),
+        }
+    };
+
+    let doc_blob = to_blob(left)?;
+    let query_blob = to_blob(right)?;
+    let result = jsonb_contains(&doc_blob, &query_blob)?;
+    Ok(Value::Bool(result))
 }
