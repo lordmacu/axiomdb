@@ -115,6 +115,7 @@ include!("ddl_alter_column.rs");
 include!("ddl_alter_constraint.rs");
 include!("ddl_alter_rebuild.rs");
 include!("staging.rs");
+include!("union.rs");
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 

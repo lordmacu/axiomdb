@@ -29,6 +29,12 @@ fn dispatch_ctx(
             ctx.conn_txn = Some(conn);
             r
         }
+        Stmt::Union { selects, all } => {
+            let conn = ctx.conn_txn.take().expect("conn_txn set");
+            let r = execute_union(selects, all, exec_ctx, Some(&conn), ctx);
+            ctx.conn_txn = Some(conn);
+            r
+        }
         Stmt::Insert(s) => {
             let mut conn = ctx.conn_txn.take().expect("conn_txn set");
             let r = execute_insert_ctx(s, exec_ctx, &mut conn, ctx);

@@ -587,6 +587,12 @@ pub struct CreateSchemaStmt {
 pub enum Stmt {
     // DML
     Select(SelectStmt),
+    /// `SELECT ... UNION [ALL] SELECT ...` — set operation combining multiple SELECTs.
+    Union {
+        selects: Vec<SelectStmt>,
+        /// `true` = UNION ALL (keep duplicates), `false` = UNION (deduplicate).
+        all: bool,
+    },
     Insert(InsertStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),

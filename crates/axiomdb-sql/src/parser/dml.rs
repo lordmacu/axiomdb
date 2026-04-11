@@ -21,7 +21,12 @@ pub(crate) fn parse_dml(p: &mut Parser) -> Result<Stmt, DbError> {
     match p.peek() {
         Token::Select => {
             p.advance();
-            parse_select(p).map(Stmt::Select)
+            let first = parse_select(p)?;
+            // Check for UNION [ALL] continuation.
+            if matches!(p.peek(), Token::Union) {
+                return parse_union(p, first);
+            }
+            Ok(Stmt::Select(first))
         }
         Token::Insert => {
             p.advance();
@@ -43,6 +48,29 @@ pub(crate) fn parse_dml(p: &mut Parser) -> Result<Stmt, DbError> {
             position: Some(p.current_pos()),
         }),
     }
+}
+
+// ── UNION ────────────────────────────────────────────────────────────────────
+
+/// Parses `UNION [ALL] SELECT ...` chains after the first SELECT has been parsed.
+///
+/// Supports chained UNIONs: `SELECT ... UNION ALL SELECT ... UNION ALL SELECT ...`
+/// All UNION operators in a chain must be the same kind (ALL or DISTINCT).
+/// If mixed, the last UNION type wins (MySQL behavior).
+fn parse_union(p: &mut Parser, first: SelectStmt) -> Result<Stmt, DbError> {
+    let mut selects = vec![first];
+    let mut all = false;
+
+    while p.eat(&Token::Union) {
+        // UNION ALL or plain UNION (deduplicate).
+        all = p.eat(&Token::All);
+
+        // Expect SELECT after UNION [ALL].
+        p.expect(&Token::Select)?;
+        selects.push(parse_select(p)?);
+    }
+
+    Ok(Stmt::Union { selects, all })
 }
 
 // ── SELECT ────────────────────────────────────────────────────────────────────

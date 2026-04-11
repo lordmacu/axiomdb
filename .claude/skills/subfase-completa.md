@@ -16,7 +16,7 @@ Example: `/subfase-completa 1.3` marks subphase 1.3 as completed.
 ### Step 1 — Verify the subphase is truly ready
 
 ```bash
-cd /Users/cristian/nexusdb
+cd /home/familia/axiomdb
 
 # Incremental tests for the touched crate
 cargo test -p axiomdb-CRATE --quiet 2>&1 | tail -5

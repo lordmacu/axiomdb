@@ -59,6 +59,7 @@ pub fn plan_select(
     // ── Rule 1: col = literal ─────────────────────────────────────────────
     if let Some((col_name, value)) = extract_eq_col_literal(expr) {
         if let Some(idx) = find_index_on_col(col_name, indexes, columns, Some(expr), true) {
+            let value = coerce_literal_to_col_type(value, col_name, columns);
             if let Ok(key) = encode_index_key(&[value]) {
                 // PK equality is always worth using for SELECT: the current
                 // small-table/NDV cost gate is the wrong trade-off for point
@@ -101,8 +102,18 @@ pub fn plan_select(
         let use_index =
             idx.is_primary || stats_cost_gate(idx, columns, table_id, table_stats, stale_tracker);
         if use_index {
-            let lo = lo_val.and_then(|v| encode_index_key(&[v]).ok());
-            let hi = hi_val.and_then(|v| encode_index_key(&[v]).ok());
+            // Coerce range bounds to the indexed column's stored type.
+            let range_col = idx.columns.first().and_then(|c| {
+                columns.iter().find(|col| col.col_idx == c.col_idx).map(|col| col.name.as_str())
+            });
+            let lo = lo_val.and_then(|v| {
+                let v = range_col.map_or(v.clone(), |cn| coerce_literal_to_col_type(v, cn, columns));
+                encode_index_key(&[v]).ok()
+            });
+            let hi = hi_val.and_then(|v| {
+                let v = range_col.map_or(v.clone(), |cn| coerce_literal_to_col_type(v, cn, columns));
+                encode_index_key(&[v]).ok()
+            });
             return AccessMethod::IndexRange {
                 index_def: idx.clone(),
                 lo,
@@ -126,7 +137,10 @@ pub fn plan_select(
                         ..
                     }
                 );
-                let encoded = bound.and_then(|v| encode_index_key(&[v]).ok());
+                let encoded = bound.and_then(|v| {
+                    let v = coerce_literal_to_col_type(v, col_name, columns);
+                    encode_index_key(&[v]).ok()
+                });
                 let (lo, hi) = if is_lower {
                     (encoded, None) // open upper bound
                 } else {
@@ -343,7 +357,9 @@ fn plan_composite_eq(
                 .map(|c| c.name.as_str())?;
 
             match eq_conds.iter().find(|(name, _)| *name == col_name) {
-                Some((_, val)) => key_parts.push(val.clone()),
+                Some((_, val)) => {
+                    key_parts.push(coerce_literal_to_col_type(val.clone(), col_name, columns));
+                }
                 None => break, // gap in leading columns — can't use this index
             }
         }
@@ -456,6 +472,35 @@ fn extract_range<'a>(
     let idx = find_index_on_col(col1, indexes, columns, query_where, allow_primary)?;
     // bound1 = lo side, bound2 = hi side (order may be loose but correct for 6.3)
     Some((idx, bound1, bound2))
+}
+
+/// Coerces a literal value to match the column's stored type so that the
+/// encoded index key uses the same type tag as the stored key.
+///
+/// Without this coercion, a literal `0` (parsed as `Value::Int`) compared
+/// against a `BIGINT` column (stored as `Value::BigInt`) would encode with
+/// tag `0x02` instead of `0x03`, causing the B-Tree lookup to miss.
+fn coerce_literal_to_col_type(value: Value, col_name: &str, columns: &[ColumnDef]) -> Value {
+    use axiomdb_catalog::ColumnType;
+    use axiomdb_types::{coerce, CoercionMode, DataType};
+
+    let col = match columns.iter().find(|c| c.name == col_name) {
+        Some(c) => c,
+        None => return value,
+    };
+    let target = match col.col_type {
+        ColumnType::Bool => DataType::Bool,
+        ColumnType::Int => DataType::Int,
+        ColumnType::BigInt => DataType::BigInt,
+        ColumnType::Float => DataType::Real,
+        ColumnType::Text => DataType::Text,
+        ColumnType::Json => DataType::Json,
+        ColumnType::Jsonb => DataType::Jsonb,
+        ColumnType::Bytes => DataType::Bytes,
+        ColumnType::Timestamp => DataType::Timestamp,
+        ColumnType::Uuid => DataType::Uuid,
+    };
+    coerce(value.clone(), target, CoercionMode::Strict).unwrap_or(value)
 }
 
 /// Returns `(col_name, bound_value)` for range comparison operators.

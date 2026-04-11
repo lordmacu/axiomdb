@@ -50,7 +50,7 @@
 
 ### GAP-B — MySQL wire compat crítica `⏳`
 <!-- PRIORIDAD: ALTA — desbloquea ORMs y clientes -->
-- [ ] GAP-B.1 ⏳ UNION / UNION ALL — parser: consumir UNION [ALL] entre SELECTs → `Stmt::Union { selects, all }` AST; executor: materializar ambos lados, dedup (UNION) o append (UNION ALL); wire: serializar como result set único
+- [x] GAP-B.1 ✅ UNION / UNION ALL — closed: `Stmt::Union { selects, all }` AST variant; parser detects `UNION [ALL]` after SELECT and chains multiple SELECTs; executor materializes each SELECT then concatenates (ALL) or hash-deduplicates (UNION); analyzer resolves columns in all branches; supports chained triple+ UNIONs, NULLs, literals, aliases
 - [ ] GAP-B.2 ⏳ Column type wire codes — `datatype_to_mysql_type()` en `result.rs`: TINYINT→0x01, SMALLINT→0x02, MEDIUMINT→0x09, YEAR→0x0d, TIME→0x0b, DATETIME→0x0c; agregar DataType variants si faltan
 - [ ] GAP-B.3 ⏳ DECIMAL column type — almacenar como `i128` con scale en row codec; `DataType::Decimal(precision, scale)`; CREATE TABLE + INSERT/SELECT/WHERE; arithmetic con scale propagation
 - [ ] GAP-B.4 ⏳ DATE column type independiente — `DataType::Date` como days-since-epoch (i32); distinto de Timestamp; row codec + comparisons + key encoding + wire binary encoding
@@ -67,7 +67,7 @@
 - [ ] GAP-C.4 ⏳ ON DELETE/UPDATE SET DEFAULT — usar default expression persistida (4.18e) para setear columna child al DEFAULT del catálogo; `fk_enforcement.rs:686, 811`
 - [ ] GAP-C.5 ⏳ GROUP BY WITH ROLLUP — parser: consumir `WITH ROLLUP` después de GROUP BY; executor: generar filas subtotal con NULL en group keys por cada nivel de agrupación
 - [ ] GAP-C.6 ⏳ ALTER AUTO_INCREMENT=N persistence — escribir nuevo valor en catálogo (sequence counter) via CatalogWriter; actualmente acepta silenciosamente sin persistir
-- [ ] GAP-C.7 ⏳ DROP INDEX not found → error propio — cambiar NotImplemented por `DbError::IndexNotFound` en `ddl_drop_index.rs:91`; incluir nombre del índice buscado
+- [x] GAP-C.7 ✅ DROP INDEX not found → error propio — closed: added `DbError::IndexNotFound { name }` variant; MySQL errno 1091 "Can't DROP; check that it exists"; replaced NotImplemented in both ON-table and scan-all paths of ddl_drop_index.rs
 - [ ] GAP-C.8 ⏳ Correlated subquery depth > 1 — substitution chain en analyzer: propagar `OuterColumn` references a través de múltiples niveles de nesting; `analyzer_expr.rs:7-34`
 - [ ] GAP-C.9 ⏳ MySQL default collation case-insensitive — cuando `CompatMode::Mysql` activo, default `SessionCollation` a `CaseInsensitive`; emitir `collation_connection = utf8mb4_general_ci` (collation_id 45) en server greeting
 - [ ] GAP-C.10 ⏳ COM_STMT_SEND_LONG_DATA validación — verificar que stmt_id existe en `pending_long_data` antes de almacenar; retornar ERR si stmt_id inválido en vez de panic potencial

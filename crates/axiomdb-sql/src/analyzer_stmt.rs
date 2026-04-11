@@ -44,6 +44,17 @@ fn analyze_stmt(
             analyze_alter_table(s, storage, snapshot, default_database, default_schema)
                 .map(Stmt::AlterTable)
         }
+        // UNION — analyze each inner SELECT.
+        Stmt::Union { selects, all } => {
+            let analyzed: Result<Vec<_>, _> = selects
+                .into_iter()
+                .map(|s| analyze_select(s, storage, snapshot.clone(), default_database, default_schema))
+                .collect();
+            Ok(Stmt::Union {
+                selects: analyzed?,
+                all,
+            })
+        }
         // Statements that need no semantic analysis for Phase 4.18:
         other => Ok(other),
     }
