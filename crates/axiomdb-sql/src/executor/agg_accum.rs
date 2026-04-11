@@ -88,6 +88,15 @@ impl AggAccumulator {
             }
         }
 
+        /// Unwraps the aggregate argument, returning a clear error instead of
+        /// panicking if the invariant is violated.
+        #[inline]
+        fn require_arg<'a>(arg: Option<&'a Expr>) -> Result<&'a Expr, DbError> {
+            arg.ok_or_else(|| DbError::Internal {
+                message: "aggregate accumulator requires an argument expression".into(),
+            })
+        }
+
         match self {
             Self::CountStar { n } => *n += 1,
 
@@ -97,7 +106,7 @@ impl AggAccumulator {
                         *n += 1;
                     }
                 } else {
-                    let v = eval(simple_arg.unwrap(), row)?;
+                    let v = eval(require_arg(simple_arg)?, row)?;
                     if !matches!(v, Value::Null) {
                         *n += 1;
                     }
@@ -105,7 +114,7 @@ impl AggAccumulator {
             }
 
             Self::CountDistinct { seen, n } => {
-                let v = eval(simple_arg.unwrap(), row)?;
+                let v = eval(require_arg(simple_arg)?, row)?;
                 if !matches!(v, Value::Null) {
                     let key = value_to_display_string(v);
                     if seen.insert(key) {
@@ -115,14 +124,14 @@ impl AggAccumulator {
             }
 
             Self::SumDistinct { values } => {
-                let v = eval(simple_arg.unwrap(), row)?;
+                let v = eval(require_arg(simple_arg)?, row)?;
                 if !matches!(v, Value::Null) && !values.iter().any(|e| e == &v) {
                     values.push(v);
                 }
             }
 
             Self::AvgDistinct { values } => {
-                let v = eval(simple_arg.unwrap(), row)?;
+                let v = eval(require_arg(simple_arg)?, row)?;
                 if !matches!(v, Value::Null) && !values.iter().any(|e| e == &v) {
                     values.push(v);
                 }
@@ -132,7 +141,7 @@ impl AggAccumulator {
                 let v = if let Some(v) = fast_eval(simple_arg, row) {
                     v.clone()
                 } else {
-                    eval(simple_arg.unwrap(), row)?
+                    eval(require_arg(simple_arg)?, row)?
                 };
                 if !matches!(v, Value::Null) {
                     *acc = Some(match acc.take() {
@@ -147,7 +156,7 @@ impl AggAccumulator {
                 let v = if let Some(v) = fast_eval(simple_arg, row) {
                     v.clone()
                 } else {
-                    eval(simple_arg.unwrap(), row)?
+                    eval(require_arg(simple_arg)?, row)?
                 };
                 if !matches!(v, Value::Null) {
                     *acc = Some(match acc.take() {
@@ -168,7 +177,7 @@ impl AggAccumulator {
                 let v = if let Some(v) = fast_eval(simple_arg, row) {
                     v.clone()
                 } else {
-                    eval(simple_arg.unwrap(), row)?
+                    eval(require_arg(simple_arg)?, row)?
                 };
                 if !matches!(v, Value::Null) {
                     *acc = Some(match acc.take() {
@@ -189,7 +198,7 @@ impl AggAccumulator {
                 let v = if let Some(v) = fast_eval(simple_arg, row) {
                     v.clone()
                 } else {
-                    eval(simple_arg.unwrap(), row)?
+                    eval(require_arg(simple_arg)?, row)?
                 };
                 if !matches!(v, Value::Null) {
                     // value_agg_add: direct arithmetic, no AST allocation.
