@@ -87,6 +87,15 @@ fn execute_create_table(
                 }
                 _ => None,
             });
+        let on_update_expr = col_def
+            .constraints
+            .iter()
+            .find_map(|c| match c {
+                ColumnConstraint::OnUpdate(expr) => {
+                    Some(crate::expr_to_sql::expr_to_sql_string(expr))
+                }
+                _ => None,
+            });
 
         writer.create_column(CatalogColumnDef {
             table_id,
@@ -98,6 +107,7 @@ fn execute_create_table(
             type_len,
             is_fixed_len: col_def.is_char,
             default_expr,
+            on_update_expr,
         })?;
     }
 
@@ -725,6 +735,7 @@ fn execute_create_table_like(
             type_len: col.type_len,
             is_fixed_len: col.is_fixed_len,
             default_expr: col.default_expr.clone(),
+            on_update_expr: col.on_update_expr.clone(),
         })?;
     }
 
@@ -876,6 +887,7 @@ fn execute_create_table_as_select(
             type_len: 0,
             is_fixed_len: false,
             default_expr: None,
+            on_update_expr: None,
         })?;
     }
 
@@ -894,6 +906,7 @@ fn execute_create_table_as_select(
             type_len: 0,
             is_fixed_len: false,
             default_expr: None,
+            on_update_expr: None,
         })
         .collect();
 

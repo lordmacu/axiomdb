@@ -325,8 +325,8 @@ fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
                 p.advance(); // ON
                 if matches!(p.peek(), Token::Update) {
                     p.advance(); // UPDATE
-                                 // Consume the expression (typically CURRENT_TIMESTAMP or a function call)
-                    let _ = parse_expr(p)?;
+                    let expr = parse_expr(p)?;
+                    constraints.push(crate::ast::ColumnConstraint::OnUpdate(expr));
                 }
                 // If not UPDATE, we consumed ON spuriously — but ON only appears
                 // here in "ON UPDATE" context for column defs, so this is safe.

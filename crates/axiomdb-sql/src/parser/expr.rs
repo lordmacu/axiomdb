@@ -269,7 +269,7 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
         Token::JsonContains if !negated => {
             p.advance();
             let right = parse_bitor(p)?;
-            return Ok(binop(BinaryOp::JsonContains, left, right));
+            Ok(binop(BinaryOp::JsonContains, left, right))
         }
         cmp if !negated => {
             let op = match cmp {
@@ -594,6 +594,32 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
             col_idx: 0,
             name: qualified,
         });
+    }
+
+    // SQL niladic-keyword functions — no parens required in the standard.
+    // Without this, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_USER`, etc.
+    // would parse as column references and fail at eval time.
+    {
+        let lower = name.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "current_timestamp"
+                | "current_date"
+                | "current_time"
+                | "current_user"
+                | "session_user"
+                | "system_user"
+                | "current_schema"
+                | "current_database"
+                | "localtimestamp"
+                | "localtime"
+        ) && !matches!(p.peek(), Token::LParen)
+        {
+            return Ok(Expr::Function {
+                name: lower,
+                args: vec![],
+            });
+        }
     }
 
     // Check for function call: `name(`

@@ -41,7 +41,7 @@ fn execute_update_ctx(
         .cloned()
         .collect();
 
-    let assignments: Vec<(usize, Expr)> = stmt
+    let mut assignments: Vec<(usize, Expr)> = stmt
         .assignments
         .into_iter()
         .map(|a| {
@@ -55,6 +55,27 @@ fn execute_update_ctx(
             Ok((pos, a.value))
         })
         .collect::<Result<_, DbError>>()?;
+
+    // MySQL `ON UPDATE` auto-refresh: every column with a persisted
+    // `on_update_expr` that the statement did NOT explicitly assign is
+    // appended to `assignments` with its expression reparsed into the AST.
+    // Common case: `updated_at TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`.
+    for (pos, col) in schema_cols.iter().enumerate() {
+        let Some(expr_sql) = col.on_update_expr.as_ref() else {
+            continue;
+        };
+        if assignments.iter().any(|(p, _)| *p == pos) {
+            continue;
+        }
+        match crate::parser::parse_expr_only(expr_sql) {
+            Ok(expr) => assignments.push((pos, expr)),
+            Err(_) => {
+                // Malformed persisted expression — skip the auto-update to
+                // avoid failing the whole UPDATE. The column keeps its old
+                // value, matching MySQL's tolerant behavior.
+            }
+        }
+    }
 
     // Extract ORDER BY / LIMIT before stmt.where_clause borrow (G5.3).
     let stmt_order_by = stmt.order_by;
