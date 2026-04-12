@@ -145,6 +145,10 @@ pub enum ColumnConstraint {
     },
     /// `CHECK (expr)`
     Check(Expr),
+    /// `ON UPDATE expr` — auto-refresh this column on every UPDATE when it
+    /// was not explicitly assigned. Classic MySQL pattern:
+    /// `updated_at TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`.
+    OnUpdate(Expr),
 }
 
 /// Table-level constraint declared after the column list.

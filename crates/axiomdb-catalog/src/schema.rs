@@ -213,6 +213,7 @@ mod tests {
             type_len: 0,
             is_fixed_len: false,
             default_expr: None,
+            on_update_expr: None,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -232,6 +233,7 @@ mod tests {
             type_len: 0,
             is_fixed_len: false,
             default_expr: None,
+            on_update_expr: None,
         };
         let bytes = def.to_bytes();
         let (back, _) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -251,6 +253,7 @@ mod tests {
             type_len: 0,
             is_fixed_len: false,
             default_expr: None,
+            on_update_expr: None,
         };
         let bytes = def.to_bytes();
         assert!(ColumnDef::from_bytes(&bytes[..5]).is_err());

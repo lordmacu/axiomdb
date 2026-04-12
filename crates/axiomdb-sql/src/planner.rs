@@ -53,6 +53,7 @@ mod tests {
             type_len: 0,
             is_fixed_len: false,
             default_expr: None,
+            on_update_expr: None,
         }
     }
 
@@ -67,6 +68,7 @@ mod tests {
             type_len: 0,
             is_fixed_len: false,
             default_expr: None,
+            on_update_expr: None,
         }
     }
 

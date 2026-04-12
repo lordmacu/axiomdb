@@ -632,6 +632,12 @@ fn alter_add_column(
             }
             _ => None,
         }),
+        on_update_expr: col_def.constraints.iter().find_map(|c| match c {
+            crate::ast::ColumnConstraint::OnUpdate(expr) => {
+                Some(crate::expr_to_sql::expr_to_sql_string(expr))
+            }
+            _ => None,
+        }),
     };
 
     // 1. Add column to catalog.
@@ -1005,6 +1011,16 @@ fn alter_modify_column(
                 _ => None,
             })
             .or_else(|| old_columns[col_pos].default_expr.clone()),
+        on_update_expr: col_def
+            .constraints
+            .iter()
+            .find_map(|c| match c {
+                crate::ast::ColumnConstraint::OnUpdate(expr) => {
+                    Some(crate::expr_to_sql::expr_to_sql_string(expr))
+                }
+                _ => None,
+            })
+            .or_else(|| old_columns[col_pos].on_update_expr.clone()),
     };
     CatalogWriter::new(storage, txn, conn_txn)?.create_column(new_catalog_col.clone())?;
 

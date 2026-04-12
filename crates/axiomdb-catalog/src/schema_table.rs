@@ -226,6 +226,13 @@ pub struct ColumnDef {
     /// Stored as `[u16 len][utf8 bytes]` after the other extensions when
     /// `flags bit4` is set (backward-compatible: old rows read as `None`).
     pub default_expr: Option<String>,
+    /// SQL text of the `ON UPDATE` expression (typically `CURRENT_TIMESTAMP`).
+    /// When set, the executor auto-evaluates it on every UPDATE unless the
+    /// column is explicitly assigned. Ubiquitous in MySQL audit patterns
+    /// (`updated_at TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`). Stored right
+    /// after `default_expr` when `flags bit5` is set — old rows read as
+    /// `None`.
+    pub on_update_expr: Option<String>,
 }
 
 impl ColumnDef {
@@ -244,6 +251,8 @@ impl ColumnDef {
         let has_type_len = self.type_len > 0;
         let default_bytes = self.default_expr.as_deref().map(|s| s.as_bytes());
         let has_default = default_bytes.is_some();
+        let on_update_bytes = self.on_update_expr.as_deref().map(|s| s.as_bytes());
+        let has_on_update = on_update_bytes.is_some();
 
         let mut flags: u8 = 0;
         if self.nullable {
@@ -261,9 +270,13 @@ impl ColumnDef {
         if has_default {
             flags |= 0x10; // bit4: default_expr present
         }
+        if has_on_update {
+            flags |= 0x20; // bit5: on_update_expr present
+        }
 
         let extra = if has_type_len { 2 } else { 0 }
-            + default_bytes.map_or(0, |b| 2 + b.len());
+            + default_bytes.map_or(0, |b| 2 + b.len())
+            + on_update_bytes.map_or(0, |b| 2 + b.len());
         let mut buf = Vec::with_capacity(4 + 2 + 1 + 1 + 1 + name.len() + extra);
         buf.extend_from_slice(&self.table_id.to_le_bytes());
         buf.extend_from_slice(&self.col_idx.to_le_bytes());
@@ -277,6 +290,10 @@ impl ColumnDef {
         if let Some(db) = default_bytes {
             buf.extend_from_slice(&(db.len() as u16).to_le_bytes());
             buf.extend_from_slice(db);
+        }
+        if let Some(ob) = on_update_bytes {
+            buf.extend_from_slice(&(ob.len() as u16).to_le_bytes());
+            buf.extend_from_slice(ob);
         }
         buf
     }
@@ -304,6 +321,7 @@ impl ColumnDef {
         let has_type_len = flags & 0x04 != 0;
         let is_fixed_len = flags & 0x08 != 0;
         let has_default = flags & 0x10 != 0;
+        let has_on_update = flags & 0x20 != 0;
         let name_len = bytes[8] as usize;
 
         if bytes.len() < 9 + name_len {
@@ -351,6 +369,28 @@ impl ColumnDef {
             None
         };
 
+        // on_update_expr present only when bit5 set (old rows read as None).
+        let on_update_expr = if has_on_update {
+            if bytes.len() < consumed + 2 {
+                return Err(err());
+            }
+            let olen = u16::from_le_bytes([bytes[consumed], bytes[consumed + 1]]) as usize;
+            consumed += 2;
+            if bytes.len() < consumed + olen {
+                return Err(err());
+            }
+            let s = std::str::from_utf8(&bytes[consumed..consumed + olen])
+                .map_err(|_| DbError::ParseError {
+                    message: "invalid UTF-8 in on_update_expr".into(),
+                    position: None,
+                })?
+                .to_string();
+            consumed += olen;
+            Some(s)
+        } else {
+            None
+        };
+
         Ok((
             Self {
                 table_id,
@@ -362,6 +402,7 @@ impl ColumnDef {
                 type_len,
                 is_fixed_len,
                 default_expr,
+                on_update_expr,
             },
             consumed,
         ))
