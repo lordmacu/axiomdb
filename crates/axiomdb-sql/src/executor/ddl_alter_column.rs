@@ -190,9 +190,9 @@ fn expr_mentions_column_name(expr: &crate::expr::Expr, target_name: &str) -> boo
     use crate::expr::Expr;
 
     match expr {
-        Expr::Column { name, .. } | Expr::OuterColumn { name, .. } => {
-            name.eq_ignore_ascii_case(target_name)
-        }
+        Expr::Column { name, .. }
+        | Expr::OuterColumn { name, .. }
+        | Expr::InsertValue { name, .. } => name.eq_ignore_ascii_case(target_name),
         Expr::Literal(_) | Expr::Param { .. } | Expr::Default => false,
         Expr::UnaryOp { operand, .. }
         | Expr::IsNull { expr: operand, .. }

@@ -202,6 +202,15 @@ pub enum Expr {
         depth: u16,
     },
 
+    /// `VALUES(col)` inside an `INSERT ... ON DUPLICATE KEY UPDATE`
+    /// assignment list — references the proposed (would-have-been-
+    /// inserted) row's value for `col`. Valid only in that parse
+    /// context; everywhere else the parser must reject it.
+    ///
+    /// `col_idx` is set by the analyzer to the column's position in the
+    /// target table's schema; the parser emits `col_idx = 0`.
+    InsertValue { col_idx: usize, name: String },
+
     /// A positional parameter placeholder — the `?` in a prepared statement.
     ///
     /// `idx` is the 0-based index of the parameter (first `?` → 0, second → 1).

@@ -100,6 +100,11 @@ pub(crate) struct Parser<'src> {
     /// Parameter index counter for `?` placeholders in prepared statement templates.
     /// Incremented each time `Token::Question` is consumed via `parse_atom`.
     pub(crate) param_count: usize,
+    /// `true` while parsing the assignment list of
+    /// `INSERT ... ON DUPLICATE KEY UPDATE`. The expression parser uses this
+    /// to recognize `VALUES(col)` as the MySQL pseudo-function referring to
+    /// the proposed row; outside ODKU it stays a normal identifier / call.
+    pub(crate) in_odku_assignment: bool,
 }
 
 impl<'src> Parser<'src> {
@@ -108,6 +113,7 @@ impl<'src> Parser<'src> {
             tokens,
             pos: 0,
             param_count: 0,
+            in_odku_assignment: false,
         }
     }
 

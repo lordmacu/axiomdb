@@ -18,6 +18,12 @@ fn execute_clustered_insert_ctx(
             feature: "REPLACE INTO on clustered tables (Phase follow-up)".into(),
         });
     }
+    if stmt.on_duplicate_update.is_some() {
+        return Err(DbError::NotImplemented {
+            feature: "INSERT ... ON DUPLICATE KEY UPDATE on clustered tables (Phase follow-up)"
+                .into(),
+        });
+    }
 
     // Phase 40.11: IX(table) — idempotent, before any clustered row write.
     if let Some(lm) = exec_ctx.lock_manager() {
@@ -233,6 +239,12 @@ fn enqueue_clustered_insert_ctx(
     if stmt.replace {
         return Err(DbError::NotImplemented {
             feature: "REPLACE INTO on clustered tables (Phase follow-up)".into(),
+        });
+    }
+    if stmt.on_duplicate_update.is_some() {
+        return Err(DbError::NotImplemented {
+            feature: "INSERT ... ON DUPLICATE KEY UPDATE on clustered tables (Phase follow-up)"
+                .into(),
         });
     }
 

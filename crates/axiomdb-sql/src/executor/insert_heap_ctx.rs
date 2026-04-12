@@ -109,6 +109,17 @@ fn execute_insert_ctx(
         crate::partial_index::compile_index_predicates(&secondary_indexes, schema_cols)?;
     let ignore = stmt.ignore;
     let replace_mode = stmt.replace;
+    // Pre-resolve the ODKU assignment list once so the per-row loop only
+    // evaluates against the dual-row context, not parse-tree column names.
+    let odku_assignments: Option<Vec<(usize, Expr)>> = match &stmt.on_duplicate_update {
+        Some(list) => Some(resolve_odku_assignments(
+            list,
+            schema_cols,
+            &resolved.def.table_name,
+        )?),
+        None => None,
+    };
+    let odku_mode = odku_assignments.is_some();
 
     match stmt.source {
         // ── INSERT ... VALUES — immediate path ────────────────────────────────
@@ -212,7 +223,7 @@ fn execute_insert_ctx(
                 )?);
             }
 
-            if full_batch.len() == 1 || ignore || replace_mode {
+            if full_batch.len() == 1 || ignore || replace_mode || odku_mode {
                 for (row_idx, full_values) in full_batch.into_iter().enumerate() {
                     // REPLACE: delete every row that would violate a PK / UNIQUE
                     // before attempting the INSERT. Each displaced row counts
@@ -229,6 +240,35 @@ fn execute_insert_ctx(
                             &full_values,
                         )?;
                         count += deleted;
+                    }
+                    // ODKU: if the proposed row would conflict with a PK /
+                    // UNIQUE index, update the conflicting row in place.
+                    // MySQL formula — insert=1, update_changed=2, update_unchanged=0.
+                    if let Some(ref assigns) = odku_assignments {
+                        match apply_odku_heap(
+                            storage,
+                            txn,
+                            conn_txn,
+                            bloom,
+                            ctx,
+                            &resolved,
+                            schema_cols,
+                            &mut secondary_indexes,
+                            &compiled_preds,
+                            assigns,
+                            &full_values,
+                        )? {
+                            OdkuOutcome::UpdatedChanged => {
+                                count += 2;
+                                continue;
+                            }
+                            OdkuOutcome::UpdatedNoChange => {
+                                continue;
+                            }
+                            OdkuOutcome::Inserted => {
+                                // Fall through to the normal INSERT path below.
+                            }
+                        }
                     }
                     let rid = match TableEngine::insert_row_with_ctx(
                         storage,
@@ -370,9 +410,9 @@ fn execute_insert_ctx(
 
             // Batch insert: one heap pass + one WAL record per page + batch index maintenance.
             if !full_batch.is_empty() {
-                if ignore || replace_mode {
-                    // IGNORE / REPLACE mode: fall back to per-row for
-                    // error handling / conflict displacement.
+                if ignore || replace_mode || odku_mode {
+                    // IGNORE / REPLACE / ODKU mode: fall back to per-row for
+                    // error handling / conflict displacement / conflict-update.
                     for (row_idx, full_values) in full_batch.into_iter().enumerate() {
                         if replace_mode {
                             let deleted = replace_displace_conflicts_heap(
@@ -386,6 +426,30 @@ fn execute_insert_ctx(
                                 &full_values,
                             )?;
                             count += deleted;
+                        }
+                        if let Some(ref assigns) = odku_assignments {
+                            match apply_odku_heap(
+                                storage,
+                                txn,
+                                conn_txn,
+                                bloom,
+                                ctx,
+                                &resolved,
+                                schema_cols,
+                                &mut secondary_indexes,
+                                &compiled_preds,
+                                assigns,
+                                &full_values,
+                            )? {
+                                OdkuOutcome::UpdatedChanged => {
+                                    count += 2;
+                                    continue;
+                                }
+                                OdkuOutcome::UpdatedNoChange => {
+                                    continue;
+                                }
+                                OdkuOutcome::Inserted => {}
+                            }
                         }
                         let rid = match TableEngine::insert_row_with_ctx(
                             storage, txn, &resolved.def, schema_cols, ctx, conn_txn,
@@ -489,6 +553,40 @@ fn execute_insert_ctx(
                     &full_values,
                 )?;
                 count += deleted;
+            }
+            let odku_outcome = if let Some(ref assigns) = odku_assignments {
+                Some(apply_odku_heap(
+                    storage,
+                    txn,
+                    conn_txn,
+                    bloom,
+                    ctx,
+                    &resolved,
+                    schema_cols,
+                    &mut secondary_indexes,
+                    &compiled_preds,
+                    assigns,
+                    &full_values,
+                )?)
+            } else {
+                None
+            };
+            match odku_outcome {
+                Some(OdkuOutcome::UpdatedChanged) => {
+                    count += 2;
+                    // Skip the INSERT; this row was resolved via UPDATE branch.
+                    return Ok(QueryResult::Affected {
+                        count,
+                        last_insert_id: first_generated,
+                    });
+                }
+                Some(OdkuOutcome::UpdatedNoChange) => {
+                    return Ok(QueryResult::Affected {
+                        count,
+                        last_insert_id: first_generated,
+                    });
+                }
+                Some(OdkuOutcome::Inserted) | None => {}
             }
             let rid = TableEngine::insert_row_with_ctx(
                 storage,

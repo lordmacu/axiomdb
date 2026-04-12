@@ -36,9 +36,12 @@ fn contains_aggregate(expr: &Expr) -> bool {
                 || else_result.as_deref().is_some_and(contains_aggregate)
         }
         Expr::Cast { expr, .. } => contains_aggregate(expr),
-        Expr::Literal(_) | Expr::Default | Expr::Column { .. } | Expr::OuterColumn { .. } | Expr::Param { .. } => {
-            false
-        }
+        Expr::Literal(_)
+        | Expr::Default
+        | Expr::Column { .. }
+        | Expr::OuterColumn { .. }
+        | Expr::InsertValue { .. }
+        | Expr::Param { .. } => false,
         // Subquery internals are analyzed independently; aggregates inside them
         // do not count as aggregates of the outer query.
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => false,
@@ -237,7 +240,12 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
             collect_agg_exprs_from(expr, result);
             collect_agg_exprs_from(pattern, result);
         }
-        Expr::Literal(_) | Expr::Default | Expr::Column { .. } | Expr::OuterColumn { .. } | Expr::Param { .. } => {}
+        Expr::Literal(_)
+        | Expr::Default
+        | Expr::Column { .. }
+        | Expr::OuterColumn { .. }
+        | Expr::InsertValue { .. }
+        | Expr::Param { .. } => {}
         // Aggregates inside a subquery belong to the inner query, not the outer.
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {}
     }

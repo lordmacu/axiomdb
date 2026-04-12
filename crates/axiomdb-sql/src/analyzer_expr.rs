@@ -42,6 +42,19 @@ fn resolve_expr_full(
         Expr::Literal(v) => Ok(Expr::Literal(v)),
         Expr::Default => Ok(Expr::Default),
 
+        Expr::InsertValue { col_idx: _, name } => {
+            // Resolve the proposed-row column against the current target
+            // table's schema. Out-of-scope contexts surface as ColumnNotFound.
+            if !ctx.tables.is_empty() {
+                if let Ok(idx) = ctx.resolve_column(&name) {
+                    return Ok(Expr::InsertValue { col_idx: idx, name });
+                }
+            }
+            Err(DbError::ColumnNotFound {
+                name: name.clone(),
+                table: "VALUES()".into(),
+            })
+        }
         Expr::Column { col_idx: _, name } => {
             // 1. Try the inner (current) scope first.
             if !ctx.tables.is_empty() {
