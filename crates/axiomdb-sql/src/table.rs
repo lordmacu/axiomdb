@@ -190,10 +190,12 @@ pub fn column_type_to_data_type(ct: ColumnType) -> DataType {
         ColumnType::Int => DataType::Int,
         ColumnType::BigInt => DataType::BigInt,
         ColumnType::Float => DataType::Real,
+        ColumnType::Decimal => DataType::Decimal,
         ColumnType::Text => DataType::Text,
         ColumnType::Json => DataType::Json,
         ColumnType::Jsonb => DataType::Jsonb,
         ColumnType::Bytes => DataType::Bytes,
+        ColumnType::Date => DataType::Date,
         ColumnType::Timestamp => DataType::Timestamp,
         ColumnType::Uuid => DataType::Uuid,
     }
@@ -209,9 +211,11 @@ pub fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
             ColumnType::Int => DataType::Int,
             ColumnType::BigInt => DataType::BigInt,
             ColumnType::Float => DataType::Real,
+            ColumnType::Decimal => DataType::Decimal,
             ColumnType::Text => DataType::Text,
             ColumnType::Json => DataType::Json,
             ColumnType::Bytes => DataType::Bytes,
+            ColumnType::Date => DataType::Date,
             ColumnType::Timestamp => DataType::Timestamp,
             ColumnType::Uuid => DataType::Uuid,
             ColumnType::Jsonb => DataType::Jsonb,
@@ -725,6 +729,8 @@ pub(crate) fn coerce_values(
                 ColumnType::Timestamp => DataType::Timestamp,
                 ColumnType::Uuid => DataType::Uuid,
                 ColumnType::Jsonb => DataType::Jsonb,
+                ColumnType::Decimal => DataType::Decimal,
+                ColumnType::Date => DataType::Date,
             };
             coerce(v, target, CoercionMode::Strict)
         })
@@ -761,6 +767,8 @@ pub(crate) fn coerce_values_with_ctx(
             ColumnType::Timestamp => DataType::Timestamp,
             ColumnType::Uuid => DataType::Uuid,
             ColumnType::Jsonb => DataType::Jsonb,
+            ColumnType::Decimal => DataType::Decimal,
+            ColumnType::Date => DataType::Date,
         };
 
         if ctx.strict_mode {
@@ -806,6 +814,7 @@ mod tests {
             schema_name: "public".into(),
             table_name: "t".into(),
             schema_version: 1,
+            immutable: false,
         }
     }
 

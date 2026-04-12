@@ -35,7 +35,12 @@ fn execute_create_table(
     } // resolver dropped here — releases immutable borrow on storage
 
     let mut writer = CatalogWriter::new(storage, txn, conn_txn)?;
-    let table_def = writer.create_table_with_layout(schema, &stmt.table.name, storage_layout)?;
+    let table_def = writer.create_table_with_options(
+        schema,
+        &stmt.table.name,
+        storage_layout,
+        stmt.immutable,
+    )?;
     let table_id = table_def.id;
     if database != DEFAULT_DATABASE_NAME {
         writer.bind_table_to_database(table_id, database)?;

@@ -364,6 +364,8 @@ pub struct CreateTableStmt {
     pub table: TableRef,
     pub columns: Vec<ColumnDef>,
     pub table_constraints: Vec<TableConstraint>,
+    /// `CREATE TABLE ... IMMUTABLE` (Phase 13.9) — rejects any UPDATE/DELETE.
+    pub immutable: bool,
 }
 
 /// Index access method (Phase 11.1b).
@@ -814,6 +816,7 @@ mod tests {
                 },
             ],
             table_constraints: vec![],
+            immutable: false,
         });
         assert!(matches!(stmt, Stmt::CreateTable(_)));
     }
@@ -853,6 +856,7 @@ mod tests {
                     on_update: ForeignKeyAction::NoAction,
                 },
             ],
+            immutable: false,
         });
         if let Stmt::CreateTable(ct) = stmt {
             assert_eq!(ct.table_constraints.len(), 2);

@@ -355,6 +355,20 @@ impl<'a> CatalogWriter<'a> {
         name: &str,
         storage_layout: TableStorageLayout,
     ) -> Result<TableDef, DbError> {
+        self.create_table_with_options(schema, name, storage_layout, false)
+    }
+
+    /// Allocates a new table with full option control.
+    ///
+    /// `immutable = true` declares the table as append-only (Phase 13.9 — the
+    /// executor rejects UPDATE/DELETE on it).
+    pub fn create_table_with_options(
+        &mut self,
+        schema: &str,
+        name: &str,
+        storage_layout: TableStorageLayout,
+        immutable: bool,
+    ) -> Result<TableDef, DbError> {
         let table_id = alloc_table_id(self.storage)?;
         let root_page_id = self.allocate_table_root(storage_layout)?;
 
@@ -365,6 +379,7 @@ impl<'a> CatalogWriter<'a> {
             schema_name: schema.to_string(),
             table_name: name.to_string(),
             schema_version: 1,
+            immutable,
         };
         let data = def.to_bytes();
 

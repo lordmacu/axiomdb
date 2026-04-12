@@ -16,6 +16,14 @@ fn execute_update_ctx(
         &stmt.table,
     )?;
 
+    // Phase 13.9: immutable tables reject UPDATE at the executor layer.
+    if resolved.def.immutable {
+        return Err(DbError::ImmutableTable {
+            table: resolved.def.table_name.clone(),
+            operation: "UPDATE".into(),
+        });
+    }
+
     // Phase 40.11: IX(table) — once per UPDATE statement, before candidate scan.
     if let Some(lm) = exec_ctx.lock_manager() {
         lm.acquire_table_lock_sync(
@@ -54,6 +62,36 @@ fn execute_update_ctx(
 
     let snap = txn.active_snapshot(conn_txn);
 
+    // Pre-compute field-patch eligibility early — needed for both the fused
+    // index-range path and the standard candidate loop optimization.
+    let col_types: Vec<axiomdb_types::DataType> = schema_cols
+        .iter()
+        .map(|c| crate::table::column_type_to_data_type(c.col_type))
+        .collect();
+
+    if !stmt.joins.is_empty() {
+        let join_stmt = UpdateStmt {
+            table: stmt.table,
+            joins: stmt.joins,
+            assignments: vec![],
+            where_clause: stmt.where_clause,
+            order_by: stmt_order_by,
+            limit: stmt_limit,
+        };
+        return execute_update_join_ctx(
+            join_stmt,
+            assignments,
+            &schema_cols,
+            &secondary_indexes,
+            &col_types,
+            exec_ctx,
+            conn_txn,
+            snap,
+            &resolved,
+            ctx,
+        );
+    }
+
     // ── Clustered table UPDATE dispatch (Phase 39.16) ────────────────────
     if resolved.def.is_clustered() {
         return execute_clustered_update(
@@ -73,12 +111,6 @@ fn execute_update_ctx(
         );
     }
 
-    // Pre-compute field-patch eligibility early — needed for both the fused
-    // index-range path and the standard candidate loop optimization.
-    let col_types: Vec<axiomdb_types::DataType> = schema_cols
-        .iter()
-        .map(|c| crate::table::column_type_to_data_type(c.col_type))
-        .collect();
     let field_patch_eligible = ctx.strict_mode
         && resolved.foreign_keys.is_empty()
         && assignments.iter().all(|(col_pos, _)| {
@@ -174,4 +206,3 @@ fn execute_update_ctx(
         ctx,
     )
 }
-

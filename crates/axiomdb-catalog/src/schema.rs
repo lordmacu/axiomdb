@@ -48,6 +48,10 @@ mod tests {
             ColumnType::Bytes,
             ColumnType::Timestamp,
             ColumnType::Uuid,
+            ColumnType::Json,
+            ColumnType::Jsonb,
+            ColumnType::Decimal,
+            ColumnType::Date,
         ];
         for v in variants {
             let byte: u8 = v.into();
@@ -59,7 +63,7 @@ mod tests {
     #[test]
     fn test_column_type_invalid_discriminant() {
         assert!(ColumnType::try_from(0).is_err());
-        assert!(ColumnType::try_from(11).is_err()); // 10 = Jsonb (Phase 11.16)
+        assert!(ColumnType::try_from(13).is_err());
         assert!(ColumnType::try_from(255).is_err());
     }
 
@@ -99,6 +103,7 @@ mod tests {
             schema_name: "public".to_string(),
             table_name: "users".to_string(),
             schema_version: 1,
+            immutable: false,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();
@@ -117,6 +122,7 @@ mod tests {
                 schema_name: "public".into(),
                 table_name: "t".into(),
                 schema_version: 1,
+                immutable: false,
             };
             let (back, _) = TableDef::from_bytes(&def.to_bytes()).unwrap();
             assert_eq!(back.root_page_id, root);
@@ -132,6 +138,7 @@ mod tests {
             schema_name: String::new(),
             table_name: String::new(),
             schema_version: 1,
+            immutable: false,
         };
         let bytes = def.to_bytes();
         let (back, _) = TableDef::from_bytes(&bytes).unwrap();
@@ -147,6 +154,7 @@ mod tests {
             schema_name: "s".into(),
             table_name: "t".into(),
             schema_version: 1,
+            immutable: false,
         };
         let bytes = def.to_bytes();
         // Minimum is 14 bytes; truncate to 10 (has id+root but no schema_len).
@@ -164,6 +172,7 @@ mod tests {
             schema_name: "public".into(),
             table_name: "orders".into(),
             schema_version: 1,
+            immutable: false,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();

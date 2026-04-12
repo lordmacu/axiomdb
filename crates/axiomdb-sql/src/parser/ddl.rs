@@ -119,11 +119,25 @@ pub(crate) fn parse_create_table(p: &mut Parser) -> Result<Stmt, DbError> {
     // mysqldump output always includes: ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 etc.
     skip_table_options(p);
 
+    // Phase 13.9: `IMMUTABLE` table option. Accepted either as a bare
+    // keyword after the column list or as `WITH (IMMUTABLE)`.
+    let mut immutable = false;
+    loop {
+        match p.peek().clone() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("immutable") => {
+                p.advance();
+                immutable = true;
+            }
+            _ => break,
+        }
+    }
+
     Ok(Stmt::CreateTable(CreateTableStmt {
         if_not_exists,
         table,
         columns,
         table_constraints,
+        immutable,
     }))
 }
 
@@ -657,31 +671,27 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<(DataType, u16, bool), D
             p.advance();
             Ok((DataType::Jsonb, 0, false))
         }
-        Token::Ident(ref s) if s.eq_ignore_ascii_case("TINYINT") => {
+        Token::Ident(s) if s.eq_ignore_ascii_case("TINYINT") => {
             p.advance();
             eat_optional_length(p)?; // TINYINT(N) — display width, ignored
             Ok((DataType::Bool, 0, false))
         }
-        Token::Ident(ref s) if s.eq_ignore_ascii_case("SMALLINT") => {
+        Token::Ident(s) if s.eq_ignore_ascii_case("SMALLINT") => {
             p.advance();
             eat_optional_length(p)?;
             Ok((DataType::Int, 0, false))
         }
-        Token::Ident(ref s) if s.eq_ignore_ascii_case("MEDIUMINT") => {
+        Token::Ident(s) if s.eq_ignore_ascii_case("MEDIUMINT") => {
             p.advance();
             eat_optional_length(p)?;
             Ok((DataType::Int, 0, false))
         }
-        Token::Ident(ref s)
-            if s.eq_ignore_ascii_case("YEAR") =>
-        {
+        Token::Ident(s) if s.eq_ignore_ascii_case("YEAR") => {
             p.advance();
             eat_optional_length(p)?; // YEAR(4)
             Ok((DataType::Int, 0, false))
         }
-        Token::Ident(ref s)
-            if s.eq_ignore_ascii_case("TIME") =>
-        {
+        Token::Ident(s) if s.eq_ignore_ascii_case("TIME") => {
             p.advance();
             Ok((DataType::Timestamp, 0, false))
         }
