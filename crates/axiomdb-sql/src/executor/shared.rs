@@ -96,7 +96,11 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
                 mask[*col_idx] = true;
             }
         }
-        Expr::Literal(_) | Expr::Default | Expr::OuterColumn { .. } | Expr::Param { .. } => {}
+        Expr::Literal(_)
+        | Expr::Default
+        | Expr::OuterColumn { .. }
+        | Expr::InsertValue { .. }
+        | Expr::Param { .. } => {}
         Expr::UnaryOp { operand, .. } => collect_column_refs(operand, mask),
         Expr::BinaryOp { left, right, .. } => {
             collect_column_refs(left, mask);
@@ -186,12 +190,8 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
         DataType::Bytes => Ok(ColumnType::Bytes),
         DataType::Timestamp => Ok(ColumnType::Timestamp),
         DataType::Uuid => Ok(ColumnType::Uuid),
-        DataType::Decimal => Err(DbError::NotImplemented {
-            feature: "DECIMAL column type — Phase 4.3".into(),
-        }),
-        DataType::Date => Err(DbError::NotImplemented {
-            feature: "DATE column type — Phase 4.19".into(),
-        }),
+        DataType::Decimal => Ok(ColumnType::Decimal),
+        DataType::Date => Ok(ColumnType::Date),
     }
 }
 
@@ -208,6 +208,8 @@ fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::Bytes => DataType::Bytes,
         ColumnType::Timestamp => DataType::Timestamp,
         ColumnType::Uuid => DataType::Uuid,
+        ColumnType::Decimal => DataType::Decimal,
+        ColumnType::Date => DataType::Date,
     }
 }
 

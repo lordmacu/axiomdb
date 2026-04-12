@@ -509,6 +509,20 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
             p.expect(&Token::RParen)?;
             Ok(expr)
         }
+        // `VALUES(col)` inside an `ON DUPLICATE KEY UPDATE` assignment list
+        // — MySQL pseudo-function pointing at the proposed row's value for
+        // `col`. Only a bare identifier is accepted; complex expressions
+        // inside `VALUES(...)` are a MariaDB parse error and we match that.
+        Token::Values if p.in_odku_assignment => {
+            p.advance();
+            p.expect(&Token::LParen)?;
+            let col_name = p.parse_identifier()?;
+            p.expect(&Token::RParen)?;
+            Ok(Expr::InsertValue {
+                col_idx: 0,
+                name: col_name,
+            })
+        }
         // Identifiers and unreserved keywords usable as column/function names.
         Token::Ident(_)
         | Token::QuotedIdent(_)

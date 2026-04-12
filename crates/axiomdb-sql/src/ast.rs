@@ -308,6 +308,12 @@ pub struct InsertStmt {
     /// conflicting row on any PK/UNIQUE index is deleted — FK cascade
     /// included. `ignore` and `replace` are mutually exclusive.
     pub replace: bool,
+    /// `INSERT ... ON DUPLICATE KEY UPDATE col = expr, ...` (MySQL ODKU).
+    /// When the incoming row collides with a PK/UNIQUE index, the
+    /// conflicting row is updated with the given assignments instead
+    /// of erroring. `VALUES(col)` in the RHS refers to the proposed
+    /// (would-have-been-inserted) row via `Expr::InsertValue`.
+    pub on_duplicate_update: Option<Vec<Assignment>>,
 }
 
 /// An `UPDATE` statement.
@@ -884,6 +890,7 @@ mod tests {
             ]),
             ignore: false,
             replace: false,
+            on_duplicate_update: None,
         });
         if let Stmt::Insert(ins) = stmt {
             if let InsertSource::Values(rows) = &ins.source {

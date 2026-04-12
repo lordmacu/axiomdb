@@ -49,6 +49,16 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
                 })
         }
 
+        // Plain `eval` has no access to the "proposed" row — evaluating a
+        // `VALUES(col)` reference outside the ODKU helper is a programming
+        // error. See `eval_with_proposed` for the ODKU-aware variant.
+        Expr::InsertValue { col_idx, name } => Err(DbError::Internal {
+            message: format!(
+                "unsubstituted VALUES('{name}') (col_idx={col_idx}) — \
+                 eval_with_proposed must be called inside an ODKU assignment"
+            ),
+        }),
+
         Expr::UnaryOp { op, operand } => {
             let v = eval(operand, row)?;
             eval_unary(*op, v)
@@ -387,6 +397,13 @@ pub fn eval_with<R: SubqueryRunner>(
         // The executor (insert/update) replaces Null with the column's declared
         // default when default-expression persistence is implemented (4.18e).
         Expr::Default => Ok(Value::Null),
+
+        Expr::InsertValue { col_idx, name } => Err(DbError::Internal {
+            message: format!(
+                "unsubstituted VALUES('{name}') (col_idx={col_idx}) — \
+                 eval_with_proposed must be called inside an ODKU assignment"
+            ),
+        }),
 
         Expr::OuterColumn {
             col_idx,

@@ -543,12 +543,14 @@ fn parse_insert_body(p: &mut Parser, is_replace: bool) -> Result<Stmt, DbError> 
                 break;
             }
         }
+        let on_duplicate_update = parse_on_duplicate_update_tail(p, is_replace)?;
         return Ok(Stmt::Insert(InsertStmt {
             table,
             columns: Some(col_names),
             source: InsertSource::Values(vec![col_values]),
             ignore,
             replace: is_replace,
+            on_duplicate_update,
         }));
     }
 
@@ -591,13 +593,82 @@ fn parse_insert_body(p: &mut Parser, is_replace: bool) -> Result<Stmt, DbError> 
         }
     };
 
+    let on_duplicate_update = parse_on_duplicate_update_tail(p, is_replace)?;
     Ok(Stmt::Insert(InsertStmt {
         table,
         columns,
         source,
         ignore,
         replace: is_replace,
+        on_duplicate_update,
     }))
+}
+
+/// Parses the optional `ON DUPLICATE KEY UPDATE col = expr, ...` tail that
+/// may follow an INSERT. Returns `Ok(None)` when the next tokens are not
+/// `ON DUPLICATE KEY UPDATE`.
+///
+/// Rejects the clause when it follows a `REPLACE INTO` — REPLACE and ODKU
+/// are mutually exclusive upserts; combining them is a parse error.
+fn parse_on_duplicate_update_tail(
+    p: &mut Parser,
+    is_replace: bool,
+) -> Result<Option<Vec<Assignment>>, DbError> {
+    if !matches!(p.peek(), Token::On) {
+        return Ok(None);
+    }
+    // Two-token lookahead: only consume ON if it's "ON DUPLICATE".
+    if !matches!(p.peek_at(1), Token::Ident(s) if s.eq_ignore_ascii_case("duplicate")) {
+        return Ok(None);
+    }
+    p.advance(); // ON
+    p.advance(); // DUPLICATE
+                 // KEY
+    match p.peek().clone() {
+        Token::Key => {
+            p.advance();
+        }
+        Token::Ident(s) if s.eq_ignore_ascii_case("key") => {
+            p.advance();
+        }
+        other => {
+            return Err(DbError::ParseError {
+                message: format!("expected KEY after ON DUPLICATE, found {other:?}"),
+                position: Some(p.current_pos()),
+            })
+        }
+    }
+    p.expect(&Token::Update)?;
+
+    if is_replace {
+        return Err(DbError::ParseError {
+            message: "REPLACE INTO ... ON DUPLICATE KEY UPDATE is not a valid MySQL \
+                      combination (REPLACE and ODKU are mutually exclusive upserts)"
+                .into(),
+            position: Some(p.current_pos()),
+        });
+    }
+
+    p.in_odku_assignment = true;
+    let mut assignments: Vec<Assignment> = Vec::new();
+    loop {
+        let column = p.parse_identifier()?;
+        p.expect(&Token::Eq)?;
+        let value = parse_expr(p)?;
+        assignments.push(Assignment { column, value });
+        if !p.eat(&Token::Comma) {
+            break;
+        }
+    }
+    p.in_odku_assignment = false;
+
+    if assignments.is_empty() {
+        return Err(DbError::ParseError {
+            message: "ON DUPLICATE KEY UPDATE requires at least one assignment".into(),
+            position: Some(p.current_pos()),
+        });
+    }
+    Ok(Some(assignments))
 }
 
 // ── UPDATE ────────────────────────────────────────────────────────────────────

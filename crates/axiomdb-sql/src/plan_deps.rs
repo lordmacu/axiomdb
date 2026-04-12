@@ -399,6 +399,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             // Leaf nodes — no sub-structure to traverse.
             Expr::Column { .. }
             | Expr::OuterColumn { .. }
+            | Expr::InsertValue { .. }
             | Expr::Literal(_)
             | Expr::Default
             | Expr::Param { .. } => Ok(()),

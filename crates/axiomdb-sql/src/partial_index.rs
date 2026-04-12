@@ -172,6 +172,7 @@ pub fn resolve_predicate_columns(expr: Expr, col_defs: &[ColumnDef]) -> Result<E
         | Expr::InSubquery { .. }
         | Expr::Exists { .. }
         | Expr::OuterColumn { .. }
+        | Expr::InsertValue { .. }
         | Expr::Param { .. }
         | Expr::Case { .. }
         | Expr::Cast { .. }
