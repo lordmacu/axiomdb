@@ -68,6 +68,25 @@ fn parses_with_session_prefix() {
 }
 
 #[test]
+fn parses_start_transaction_variants() {
+    use axiomdb_sql::ast::Stmt;
+    for sql in [
+        "START TRANSACTION",
+        "START TRANSACTION READ ONLY",
+        "START TRANSACTION READ WRITE",
+        "START TRANSACTION WITH CONSISTENT SNAPSHOT",
+        "START TRANSACTION READ WRITE, WITH CONSISTENT SNAPSHOT",
+        "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY",
+    ] {
+        let stmt = parse(sql, None).unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"));
+        assert!(
+            matches!(stmt, Stmt::Begin),
+            "expected Begin for {sql:?}, got {stmt:?}",
+        );
+    }
+}
+
+#[test]
 fn parses_read_only_write_transaction() {
     let stmt = parse("SET TRANSACTION READ ONLY", None).unwrap();
     let set = match stmt {

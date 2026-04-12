@@ -571,11 +571,35 @@ impl<'src> Parser<'src> {
             Token::Start => {
                 self.advance();
                 self.eat(&Token::Transaction);
-                // Optional READ ONLY / READ WRITE modifier — consumed and ignored
-                // (AxiomDB uses optimistic MVCC; both modes work the same until Phase 13.7)
-                if self.eat(&Token::Read) {
-                    self.eat(&Token::Only);
-                    self.eat(&Token::Write);
+                // MySQL `START TRANSACTION [option_list]` — option_list is a
+                // comma-separated sequence of:
+                //   READ ONLY | READ WRITE | WITH CONSISTENT SNAPSHOT
+                // All three are accepted but effectively no-ops: AxiomDB's
+                // optimistic MVCC already gives a consistent snapshot per txn
+                // and read-only / read-write are superficial until Phase 13.7.
+                loop {
+                    if self.eat(&Token::Read) {
+                        self.eat(&Token::Only);
+                        self.eat(&Token::Write);
+                    } else if self.eat(&Token::With) {
+                        // WITH CONSISTENT SNAPSHOT — `CONSISTENT` + `SNAPSHOT`
+                        // arrive as identifiers.
+                        if let Token::Ident(s) = self.peek().clone() {
+                            if s.eq_ignore_ascii_case("consistent") {
+                                self.advance();
+                                if let Token::Ident(s2) = self.peek().clone() {
+                                    if s2.eq_ignore_ascii_case("snapshot") {
+                                        self.advance();
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
                 }
                 Ok(Stmt::Begin)
             }
