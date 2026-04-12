@@ -317,6 +317,25 @@ impl<'src> Parser<'src> {
             Token::Select | Token::Insert | Token::Update | Token::Delete => {
                 dml::parse_dml(self)
             }
+            // MySQL `REPLACE INTO` — distinct statement verb, not a function
+            // here (REPLACE() as a function still works in expression context
+            // via parse_ident_or_call because the `(` follows immediately).
+            // Also accepted at the dispatcher level: `REPLACE LOW_PRIORITY INTO`,
+            // `REPLACE DELAYED INTO`, and `REPLACE IGNORE INTO` (the last is
+            // invalid MySQL — parse_replace rejects it with a clear error).
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("replace")
+                    && {
+                        matches!(self.peek_at(1), Token::Into | Token::Ignore)
+                            || matches!(self.peek_at(1), Token::Ident(k)
+                                if k.eq_ignore_ascii_case("low_priority")
+                                    || k.eq_ignore_ascii_case("delayed")
+                                    || k.eq_ignore_ascii_case("high_priority"))
+                    } =>
+            {
+                self.advance();
+                dml::parse_replace(self)
+            }
             Token::Truncate => {
                 self.advance();
                 // TRUNCATE [TABLE] table_name
