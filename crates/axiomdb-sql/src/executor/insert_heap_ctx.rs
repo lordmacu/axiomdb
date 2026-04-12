@@ -108,6 +108,7 @@ fn execute_insert_ctx(
     let compiled_preds =
         crate::partial_index::compile_index_predicates(&secondary_indexes, schema_cols)?;
     let ignore = stmt.ignore;
+    let replace_mode = stmt.replace;
 
     match stmt.source {
         // ── INSERT ... VALUES — immediate path ────────────────────────────────
@@ -211,8 +212,24 @@ fn execute_insert_ctx(
                 )?);
             }
 
-            if full_batch.len() == 1 || ignore {
+            if full_batch.len() == 1 || ignore || replace_mode {
                 for (row_idx, full_values) in full_batch.into_iter().enumerate() {
+                    // REPLACE: delete every row that would violate a PK / UNIQUE
+                    // before attempting the INSERT. Each displaced row counts
+                    // toward affected_rows (matches MariaDB's copied+deleted formula).
+                    if replace_mode {
+                        let deleted = replace_displace_conflicts_heap(
+                            storage,
+                            txn,
+                            conn_txn,
+                            bloom,
+                            ctx,
+                            &resolved,
+                            schema_cols,
+                            &full_values,
+                        )?;
+                        count += deleted;
+                    }
                     let rid = match TableEngine::insert_row_with_ctx(
                         storage,
                         txn,
@@ -353,15 +370,29 @@ fn execute_insert_ctx(
 
             // Batch insert: one heap pass + one WAL record per page + batch index maintenance.
             if !full_batch.is_empty() {
-                if ignore {
-                    // IGNORE mode: fall back to per-row for error handling.
+                if ignore || replace_mode {
+                    // IGNORE / REPLACE mode: fall back to per-row for
+                    // error handling / conflict displacement.
                     for (row_idx, full_values) in full_batch.into_iter().enumerate() {
+                        if replace_mode {
+                            let deleted = replace_displace_conflicts_heap(
+                                storage,
+                                txn,
+                                conn_txn,
+                                bloom,
+                                ctx,
+                                &resolved,
+                                schema_cols,
+                                &full_values,
+                            )?;
+                            count += deleted;
+                        }
                         let rid = match TableEngine::insert_row_with_ctx(
                             storage, txn, &resolved.def, schema_cols, ctx, conn_txn,
                             full_values.clone(), row_idx + 1,
                         ) {
                             Ok(rid) => rid,
-                            Err(e) if is_ignorable_insert_error(&e) => continue,
+                            Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
                             Err(e) => return Err(e),
                         };
                         if !secondary_indexes.is_empty() {
@@ -379,7 +410,7 @@ fn execute_insert_ctx(
                                         }
                                     }
                                 }
-                                Err(e) if is_ignorable_insert_error(&e) => {
+                                Err(e) if ignore && is_ignorable_insert_error(&e) => {
                                     TableEngine::delete_row(storage, txn, conn_txn, &resolved.def, rid)?;
                                     continue;
                                 }
@@ -446,6 +477,19 @@ fn execute_insert_ctx(
             }
             let full_values =
                 crate::table::coerce_values_with_ctx(full_values, schema_cols, ctx, 1)?;
+            if replace_mode {
+                let deleted = replace_displace_conflicts_heap(
+                    storage,
+                    txn,
+                    conn_txn,
+                    bloom,
+                    ctx,
+                    &resolved,
+                    schema_cols,
+                    &full_values,
+                )?;
+                count += deleted;
+            }
             let rid = TableEngine::insert_row_with_ctx(
                 storage,
                 txn,

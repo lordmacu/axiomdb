@@ -10,6 +10,15 @@ fn execute_clustered_insert_ctx(
     let txn = exec_ctx.coord();
     let bloom = exec_ctx.bloom();
 
+    // REPLACE INTO on clustered tables is deferred — the MVP only ships
+    // against heap tables. Surface a clear error rather than silently
+    // doing the wrong thing on the clustered secondary-index path.
+    if stmt.replace {
+        return Err(DbError::NotImplemented {
+            feature: "REPLACE INTO on clustered tables (Phase follow-up)".into(),
+        });
+    }
+
     // Phase 40.11: IX(table) — idempotent, before any clustered row write.
     if let Some(lm) = exec_ctx.lock_manager() {
         lm.acquire_table_lock_sync(
@@ -221,6 +230,12 @@ fn enqueue_clustered_insert_ctx(
     ctx: &mut SessionContext,
     resolved: ResolvedTable,
 ) -> Result<QueryResult, DbError> {
+    if stmt.replace {
+        return Err(DbError::NotImplemented {
+            feature: "REPLACE INTO on clustered tables (Phase follow-up)".into(),
+        });
+    }
+
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
     let storage = exec_ctx.storage();
     let txn = exec_ctx.coord();

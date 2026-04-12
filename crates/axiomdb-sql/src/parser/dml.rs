@@ -485,17 +485,33 @@ pub(crate) fn parse_do_expr(p: &mut Parser) -> Result<Expr, DbError> {
     parse_expr(p)
 }
 
-// ── INSERT ────────────────────────────────────────────────────────────────────
+// ── INSERT / REPLACE ──────────────────────────────────────────────────────────
 
 fn parse_insert(p: &mut Parser) -> Result<Stmt, DbError> {
+    parse_insert_body(p, /*is_replace=*/ false)
+}
+
+/// Entry point for `REPLACE INTO` (MySQL upsert). The caller has already
+/// consumed the leading `REPLACE` identifier.
+pub(crate) fn parse_replace(p: &mut Parser) -> Result<Stmt, DbError> {
+    parse_insert_body(p, /*is_replace=*/ true)
+}
+
+fn parse_insert_body(p: &mut Parser, is_replace: bool) -> Result<Stmt, DbError> {
     // MySQL priority / delay modifiers — consume and discard (4.6e).
-    // `INSERT LOW_PRIORITY INTO ...` / `INSERT HIGH_PRIORITY INTO ...`
-    // `INSERT DELAYED INTO ...`
+    // Accepted for both INSERT and REPLACE.
     eat_ident_ci(p, "LOW_PRIORITY");
     eat_ident_ci(p, "HIGH_PRIORITY");
     eat_ident_ci(p, "DELAYED");
-    // `INSERT IGNORE INTO ...` — silently skip constraint violations
+    // `INSERT IGNORE INTO ...` — silently skip constraint violations.
+    // `REPLACE IGNORE` is not valid MySQL — reject up front.
     let ignore = p.eat(&Token::Ignore);
+    if is_replace && ignore {
+        return Err(DbError::ParseError {
+            message: "REPLACE IGNORE is not valid MySQL syntax".into(),
+            position: Some(p.current_pos()),
+        });
+    }
     p.expect(&Token::Into)?;
     let table = p.parse_table_ref()?;
 
@@ -532,6 +548,7 @@ fn parse_insert(p: &mut Parser) -> Result<Stmt, DbError> {
             columns: Some(col_names),
             source: InsertSource::Values(vec![col_values]),
             ignore,
+            replace: is_replace,
         }));
     }
 
@@ -579,6 +596,7 @@ fn parse_insert(p: &mut Parser) -> Result<Stmt, DbError> {
         columns,
         source,
         ignore,
+        replace: is_replace,
     }))
 }
 

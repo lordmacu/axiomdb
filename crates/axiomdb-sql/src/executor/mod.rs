@@ -98,6 +98,7 @@ include!("dml_join.rs");
 include!("aggregate.rs");
 include!("select.rs");
 include!("insert.rs");
+include!("replace_helpers.rs");
 include!("update_ctx.rs");
 include!("update_fused_range.rs");
 include!("update_clustered_helpers.rs");

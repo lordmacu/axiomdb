@@ -304,6 +304,10 @@ pub struct InsertStmt {
     pub source: InsertSource,
     /// `INSERT IGNORE` — skip rows that would cause a constraint violation.
     pub ignore: bool,
+    /// `REPLACE INTO` (MySQL upsert). Before each row insert, every
+    /// conflicting row on any PK/UNIQUE index is deleted — FK cascade
+    /// included. `ignore` and `replace` are mutually exclusive.
+    pub replace: bool,
 }
 
 /// An `UPDATE` statement.
@@ -879,6 +883,7 @@ mod tests {
                 vec![Expr::int(2), Expr::text("Bob")],
             ]),
             ignore: false,
+            replace: false,
         });
         if let Stmt::Insert(ins) = stmt {
             if let InsertSource::Values(rows) = &ins.source {
