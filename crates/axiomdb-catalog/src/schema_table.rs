@@ -38,6 +38,11 @@ pub struct TableDef {
     ///
     /// Mirrors PostgreSQL's per-relation version tracking in `relcache`.
     pub schema_version: u64,
+    /// `true` when the table was declared `IMMUTABLE` (Phase 13.9). The
+    /// executor rejects every UPDATE and DELETE statement that would modify
+    /// an immutable table; INSERTs still succeed. Stored in the v3 on-disk
+    /// row format; v0–v2 rows decode as `false`.
+    pub immutable: bool,
 }
 
 impl TableDef {
@@ -71,7 +76,8 @@ impl TableDef {
         debug_assert!(schema.len() <= 255, "schema_name too long");
         debug_assert!(name.len() <= 255, "table_name too long");
 
-        let mut buf = Vec::with_capacity(4 + 8 + 1 + schema.len() + 1 + name.len() + 1 + 8);
+        let mut buf =
+            Vec::with_capacity(4 + 8 + 1 + schema.len() + 1 + name.len() + 1 + 8 + 1);
         buf.extend_from_slice(&self.id.to_le_bytes());
         buf.extend_from_slice(&self.root_page_id.to_le_bytes());
         buf.push(schema.len() as u8);
@@ -80,6 +86,10 @@ impl TableDef {
         buf.extend_from_slice(name);
         buf.push(self.storage_layout.into());
         buf.extend_from_slice(&self.schema_version.to_le_bytes());
+        // v3 trailer: 1-byte `immutable` flag (Phase 13.9). Older readers
+        // treat the extra byte as unexpected trailing data; newer readers
+        // accept either 9 (v2) or 10 (v3) trailing bytes.
+        buf.push(self.immutable as u8);
         buf
     }
 
@@ -130,16 +140,17 @@ impl TableDef {
             })?
             .to_string();
         let mut consumed = pos + name_len;
-        // Three on-disk formats — decode trailing bytes by total remaining size:
-        //   v0 (0 trailing):  storage_layout = Heap, schema_version = 1
-        //   v1 (1 trailing):  storage_layout from byte, schema_version = 1
-        //   v2 (9 trailing):  storage_layout from byte, schema_version from 8 LE bytes
-        let (storage_layout, schema_version) = match bytes.len() - consumed {
-            0 => (TableStorageLayout::Heap, 1u64),
+        // On-disk formats — decode trailing bytes by total remaining size:
+        //   v0 (0 trailing):  storage_layout = Heap, schema_version = 1, immutable = false
+        //   v1 (1 trailing):  storage_layout from byte, schema_version = 1, immutable = false
+        //   v2 (9 trailing):  storage_layout + schema_version, immutable = false
+        //   v3 (10 trailing): v2 + 1-byte immutable flag (Phase 13.9)
+        let (storage_layout, schema_version, immutable) = match bytes.len() - consumed {
+            0 => (TableStorageLayout::Heap, 1u64, false),
             1 => {
                 let layout = TableStorageLayout::try_from(bytes[consumed])?;
                 consumed += 1;
-                (layout, 1u64)
+                (layout, 1u64, false)
             }
             9 => {
                 let layout = TableStorageLayout::try_from(bytes[consumed])?;
@@ -150,7 +161,20 @@ impl TableDef {
                         .expect("slice is exactly 8 bytes"),
                 );
                 consumed += 8;
-                (layout, v)
+                (layout, v, false)
+            }
+            10 => {
+                let layout = TableStorageLayout::try_from(bytes[consumed])?;
+                consumed += 1;
+                let v = u64::from_le_bytes(
+                    bytes[consumed..consumed + 8]
+                        .try_into()
+                        .expect("slice is exactly 8 bytes"),
+                );
+                consumed += 8;
+                let imm = bytes[consumed] != 0;
+                consumed += 1;
+                (layout, v, imm)
             }
             _ => {
                 return Err(DbError::ParseError {
@@ -168,6 +192,7 @@ impl TableDef {
                 schema_name,
                 table_name,
                 schema_version,
+                immutable,
             },
             consumed,
         ))

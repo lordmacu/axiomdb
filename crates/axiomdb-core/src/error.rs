@@ -53,6 +53,10 @@ pub enum DbError {
     #[error("index '{name}' not found")]
     IndexNotFound { name: String },
 
+    /// `CREATE TABLE ... IMMUTABLE` rejects any modification (Phase 13.9).
+    #[error("{operation} rejected: table '{table}' is IMMUTABLE")]
+    ImmutableTable { table: String, operation: String },
+
     // ── Integrity ────────────────────────────────────────────────
     #[error("unique key violation on index '{index_name}'")]
     UniqueViolation {
@@ -367,6 +371,7 @@ impl DbError {
             DbError::ColumnNotFound { .. } => "42703",
             DbError::AmbiguousColumn { .. } => "42702",
             DbError::PermissionDenied { .. } => "42501",
+            DbError::ImmutableTable { .. } => "42000",
             // ── Data / Types ──────────────────────────────────────────────
             DbError::TypeMismatch { .. } => "42804",
             DbError::InvalidCoercion { .. } => "22018",

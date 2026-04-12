@@ -102,6 +102,14 @@ fn execute_truncate(
         resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
     };
 
+    // Phase 13.9: IMMUTABLE tables reject bulk removal via TRUNCATE as well.
+    if resolved.def.immutable {
+        return Err(DbError::ImmutableTable {
+            table: resolved.def.table_name.clone(),
+            operation: "TRUNCATE".into(),
+        });
+    }
+
     let snap = txn.active_snapshot(conn_txn);
 
     // TRUNCATE TABLE must fail if child FKs reference this table as the parent.

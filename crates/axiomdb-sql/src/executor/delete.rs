@@ -16,6 +16,14 @@ fn execute_delete_ctx(
         &stmt.table,
     )?;
 
+    // Phase 13.9: immutable tables reject DELETE at the executor layer.
+    if resolved.def.immutable {
+        return Err(DbError::ImmutableTable {
+            table: resolved.def.table_name.clone(),
+            operation: "DELETE".into(),
+        });
+    }
+
     // Phase 40.11: IX(table) — once per DELETE statement, before candidate scan.
     if let Some(lm) = exec_ctx.lock_manager() {
         lm.acquire_table_lock_sync(
@@ -35,6 +43,10 @@ fn execute_delete_ctx(
     let snap = txn.active_snapshot(conn_txn);
     // Keep a clone for the lock re-verification path (Phase 40.11).
     let snap_for_recheck = snap.clone();
+
+    if !stmt.joins.is_empty() {
+        return execute_delete_join_ctx(stmt, &resolved, exec_ctx, conn_txn, ctx);
+    }
 
     // ── Clustered table DELETE dispatch (Phase 39.17) ────────────────────
     if resolved.def.is_clustered() {
@@ -813,6 +825,12 @@ fn execute_delete(
     txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
 ) -> Result<QueryResult, DbError> {
+    if !stmt.joins.is_empty() {
+        return Err(DbError::NotImplemented {
+            feature: "multi-table DELETE JOIN requires session execution context".into(),
+        });
+    }
+
     let resolved = {
         let mut resolver =
             make_resolver_with_database(storage, txn, Some(conn_txn), DEFAULT_DATABASE_NAME)?;
