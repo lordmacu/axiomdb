@@ -1043,4 +1043,21 @@ mod tests {
         let result = apply_strict_to_sql_mode("STRICT_TRANS_TABLES", true);
         assert_eq!(result, "STRICT_TRANS_TABLES");
     }
+
+    // ── GAP-C.9 regression: MySQL compat mode implies CI collation ────────
+    #[test]
+    fn gap_c9_mysql_compat_defaults_to_case_insensitive_collation() {
+        let mut ctx = SessionContext::new();
+        // Default is Standard → Binary (case-sensitive).
+        assert_eq!(ctx.effective_collation(), SessionCollation::Binary);
+
+        // Switching to MySQL compat flips the effective collation to Es (CI).
+        ctx.compat_mode = CompatMode::MySql;
+        assert_eq!(ctx.effective_collation(), SessionCollation::Es);
+        assert_eq!(ctx.effective_collation_name(), "es");
+
+        // Explicit override still wins over the compat-derived default.
+        ctx.explicit_collation = Some(SessionCollation::Binary);
+        assert_eq!(ctx.effective_collation(), SessionCollation::Binary);
+    }
 }

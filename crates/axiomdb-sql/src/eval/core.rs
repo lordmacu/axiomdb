@@ -220,9 +220,13 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
         }
 
         // OuterColumn must be substituted by the executor before eval() is called.
-        Expr::OuterColumn { name, col_idx } => Err(DbError::Internal {
+        Expr::OuterColumn {
+            name,
+            col_idx,
+            depth,
+        } => Err(DbError::Internal {
             message: format!(
-                "unsubstituted OuterColumn '{name}' (col_idx={col_idx}) — \
+                "unsubstituted OuterColumn '{name}' (col_idx={col_idx}, depth={depth}) — \
                  substitute_outer must be called before executing the inner query"
             ),
         }),
@@ -384,9 +388,13 @@ pub fn eval_with<R: SubqueryRunner>(
         // default when default-expression persistence is implemented (4.18e).
         Expr::Default => Ok(Value::Null),
 
-        Expr::OuterColumn { col_idx, name } => Err(DbError::Internal {
+        Expr::OuterColumn {
+            col_idx,
+            name,
+            depth,
+        } => Err(DbError::Internal {
             message: format!(
-                "unsubstituted OuterColumn '{name}' (col_idx={col_idx}) — \
+                "unsubstituted OuterColumn '{name}' (col_idx={col_idx}, depth={depth}) — \
                  substitute_outer must be called before executing the inner query"
             ),
         }),

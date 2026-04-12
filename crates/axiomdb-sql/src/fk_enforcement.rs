@@ -48,6 +48,34 @@ use crate::{
 /// Matches InnoDB's `FK_MAX_CASCADE_DEL`. Prevents infinite loops in circular graphs.
 const MAX_CASCADE_DEPTH: u32 = 10;
 
+/// Computes the replacement value for an FK child column when the referential
+/// action is `SET NULL` or `SET DEFAULT` (GAP-C.4).
+///
+/// For `SET DEFAULT`, evaluates the stored default expression of the child
+/// column. Returns `Value::Null` when no default is declared (matches the
+/// PostgreSQL fallback — a child with no default behaves like `SET NULL`).
+fn fk_replacement_value(
+    action: FkAction,
+    child_cols: &[axiomdb_catalog::schema::ColumnDef],
+    child_col_idx: u16,
+) -> Value {
+    if action != FkAction::SetDefault {
+        return Value::Null;
+    }
+    let col = match child_cols.iter().find(|c| c.col_idx == child_col_idx) {
+        Some(c) => c,
+        None => return Value::Null,
+    };
+    let expr_str = match &col.default_expr {
+        Some(s) => s,
+        None => return Value::Null,
+    };
+    match crate::parser::parse_expr_only(expr_str) {
+        Ok(expr) => crate::eval::eval(&expr, &[]).unwrap_or(Value::Null),
+        Err(_) => Value::Null,
+    }
+}
+
 // ── INSERT / UPDATE child ─────────────────────────────────────────────────────
 
 /// Validates that `row` satisfies all FK constraints in `foreign_keys`.
@@ -74,18 +102,23 @@ pub fn check_fk_child_insert(
     let snap = txn.active_snapshot(conn_txn);
 
     for fk in foreign_keys {
-        let fk_val = row.get(fk.child_col_idx as usize).unwrap_or(&Value::Null);
+        // Collect values for every child FK column (composite FKs: GAP-C.2).
+        let fk_vals: Vec<&Value> = fk
+            .child_col_idxs
+            .iter()
+            .map(|idx| row.get(*idx as usize).unwrap_or(&Value::Null))
+            .collect();
 
-        // NULL FK → constraint passes (MATCH SIMPLE).
-        if matches!(fk_val, Value::Null) {
+        // NULL on any FK column → MATCH SIMPLE passes.
+        if fk_vals.iter().any(|v| matches!(v, Value::Null)) {
             continue;
         }
 
-        let key = encode_index_key(std::slice::from_ref(fk_val))?;
+        let owned_vals: Vec<Value> = fk_vals.iter().map(|v| (*v).clone()).collect();
+        let key = encode_index_key(&owned_vals)?;
 
-        // Find the parent's PRIMARY KEY or UNIQUE index covering parent_col_idx.
-        // We use a block scope so the reader (which holds &storage) is dropped
-        // before any call that needs &mut storage.
+        // Find a parent PRIMARY KEY or UNIQUE index whose leading columns
+        // match `fk.parent_col_idxs` in order.
         let (parent_index_id, parent_index_root, parent_clustered_primary) = {
             let mut reader = CatalogReader::new(storage, snap.clone())?;
             let parent_def = reader.get_table_by_id(fk.parent_table_id)?.ok_or(
@@ -98,8 +131,12 @@ pub fn check_fk_child_insert(
                 .iter()
                 .find(|i| {
                     (i.is_primary || i.is_unique)
-                        && i.columns.len() == 1
-                        && i.columns[0].col_idx == fk.parent_col_idx
+                        && i.columns.len() >= fk.parent_col_idxs.len()
+                        && i.columns
+                            .iter()
+                            .take(fk.parent_col_idxs.len())
+                            .zip(fk.parent_col_idxs.iter())
+                            .all(|(ic, wanted)| ic.col_idx == *wanted)
                 })
                 .ok_or_else(|| {
                     let (tname, cname) =
@@ -114,26 +151,59 @@ pub fn check_fk_child_insert(
                 parent_idx.root_page_id,
                 parent_def.is_clustered() && parent_idx.is_primary,
             )
-        }; // reader dropped here → &storage released
+        }; // reader dropped here
 
         // Phase 6.9: PK B-Trees are now populated via insert_into_indexes
         // (the `!is_primary` filter was removed). All index types use B-Tree lookup.
         //
         // Bloom shortcut: if the filter says definitely absent, skip B-Tree entirely.
-        if !bloom.might_exist(parent_index_id, &key) {
+        // For composite keys we use the first column's bloom as a heuristic — a
+        // false-positive here is fine because the B-Tree lookup below is exact.
+        let bloom_lookup_key = if fk.child_col_idxs.len() == 1 {
+            key.clone()
+        } else {
+            encode_index_key(std::slice::from_ref(&owned_vals[0]))?
+        };
+        if !bloom.might_exist(parent_index_id, &bloom_lookup_key) && fk.child_col_idxs.len() == 1 {
             let (tname, cname) = resolve_names(storage, snap, fk.child_table_id, fk.child_col_idx);
             return Err(DbError::ForeignKeyViolation {
                 table: tname,
                 column: cname,
-                value: format!("{fk_val}"),
+                value: format!("{}", fk_vals[0]),
             });
         }
 
-        let parent_exists = if parent_clustered_primary {
-            axiomdb_storage::clustered_tree::lookup(storage, Some(parent_index_root), &key, &snap)?
+        // For composite FKs whose parent index has MORE columns than the FK
+        // references (e.g. FK on (a,b) against PK (a,b,c)), we need a range
+        // scan over the key prefix rather than a point lookup. Otherwise an
+        // exact-match lookup would never succeed.
+        let parent_idx_col_count = {
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
+            reader
+                .list_indexes(fk.parent_table_id)?
+                .into_iter()
+                .find(|i| i.index_id == parent_index_id)
+                .map(|i| i.columns.len())
+                .unwrap_or(fk.parent_col_idxs.len())
+        };
+        let parent_exists = if parent_idx_col_count == fk.parent_col_idxs.len() {
+            if parent_clustered_primary {
+                axiomdb_storage::clustered_tree::lookup(
+                    storage,
+                    Some(parent_index_root),
+                    &key,
+                    &snap,
+                )?
                 .is_some()
+            } else {
+                BTree::lookup_in(storage, parent_index_root, &key)?.is_some()
+            }
         } else {
-            BTree::lookup_in(storage, parent_index_root, &key)?.is_some()
+            // Prefix scan: match any parent index entry whose leading bytes
+            // equal `key`. `key` already encodes exactly the FK columns.
+            let mut upper = key.clone();
+            upper.push(0xff);
+            !BTree::range_in(storage, parent_index_root, Some(&key), Some(&upper))?.is_empty()
         };
 
         if !parent_exists {
@@ -141,7 +211,7 @@ pub fn check_fk_child_insert(
             return Err(DbError::ForeignKeyViolation {
                 table: tname,
                 column: cname,
-                value: format!("{fk_val}"),
+                value: format!("{}", fk_vals[0]),
             });
         }
     }
@@ -478,7 +548,9 @@ pub fn enforce_fk_on_parent_delete(
                     }
                 }
 
-                FkAction::SetNull => {
+                FkAction::SetNull | FkAction::SetDefault => {
+                    let replacement =
+                        fk_replacement_value(fk.on_delete, &child_cols, fk.child_col_idx);
                     if child_table_def.is_clustered() {
                         // Clustered child: scan with PK keys, then delete-mark + re-insert
                         // each row with the FK column set to NULL.
@@ -523,7 +595,7 @@ pub fn enforce_fk_on_parent_delete(
 
                         for (pk_key, old_values) in &children_with_pk {
                             let mut new_values = old_values.clone();
-                            new_values[fk.child_col_idx as usize] = Value::Null;
+                            new_values[fk.child_col_idx as usize] = replacement.clone();
                             current_root = apply_clustered_set_null(
                                 storage,
                                 txn,
@@ -597,7 +669,7 @@ pub fn enforce_fk_on_parent_delete(
 
                         for (child_rid, child_row) in &child_rows {
                             let mut new_child_row = child_row.clone();
-                            new_child_row[fk.child_col_idx as usize] = Value::Null;
+                            new_child_row[fk.child_col_idx as usize] = replacement.clone();
 
                             let new_rid = TableEngine::update_row(
                                 storage,
@@ -680,12 +752,6 @@ pub fn enforce_fk_on_parent_delete(
                             }
                         }
                     }
-                }
-
-                FkAction::SetDefault => {
-                    return Err(DbError::NotImplemented {
-                        feature: "ON DELETE SET DEFAULT — Phase 6.9".into(),
-                    });
                 }
             }
         }
@@ -787,11 +853,16 @@ pub fn enforce_fk_on_parent_update(
                             child_column: child_col_name.clone(),
                         });
                     }
-                    FkAction::Cascade | FkAction::SetNull => {
-                        let replacement = if fk.on_update == FkAction::Cascade {
-                            new_key_val.clone()
-                        } else {
-                            Value::Null
+                    FkAction::Cascade | FkAction::SetNull | FkAction::SetDefault => {
+                        let replacement = match fk.on_update {
+                            FkAction::Cascade => new_key_val.clone(),
+                            FkAction::SetNull => Value::Null,
+                            FkAction::SetDefault => fk_replacement_value(
+                                FkAction::SetDefault,
+                                &child_cols,
+                                fk.child_col_idx,
+                            ),
+                            _ => unreachable!(),
                         };
                         apply_fk_update_children(
                             storage,
@@ -806,11 +877,6 @@ pub fn enforce_fk_on_parent_update(
                             &replacement,
                             snap.clone(),
                         )?;
-                    }
-                    FkAction::SetDefault => {
-                        return Err(DbError::NotImplemented {
-                            feature: "ON UPDATE SET DEFAULT".into(),
-                        });
                     }
                 }
             }

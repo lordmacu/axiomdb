@@ -47,6 +47,7 @@ fn intercept_special_query(
     sql: &str,
     conn_state: &mut ConnectionState,
     status: &Arc<StatusRegistry>,
+    registry: &super::processlist::Registry,
 ) -> InterceptResult {
     use super::packets::build_ok_packet;
     use super::result::serialize_query_result;
@@ -140,7 +141,10 @@ fn intercept_special_query(
         ));
     }
 
-    // ── SHOW FULL PROCESSLIST ─────────────────────────────────────────────────
+    // ── SHOW [FULL] PROCESSLIST (GAP-B.7) ────────────────────────────────────
+    // Reads the shared connection registry maintained by every handler's
+    // ProcesslistGuard. `FULL` extends the Info column from MySQL's usual
+    // 100-char truncation to unlimited — we always emit the full text.
     if lower.starts_with("show") && lower.contains("processlist") {
         let cols = vec![
             ColumnMeta::computed("Id".to_string(), DataType::BigInt),
@@ -152,21 +156,26 @@ fn intercept_special_query(
             ColumnMeta::computed("State".to_string(), DataType::Text),
             ColumnMeta::computed("Info".to_string(), DataType::Text),
         ];
-        let db_val = if conn_state.current_database.is_empty() {
-            Value::Null
-        } else {
-            Value::Text(conn_state.current_database.clone())
-        };
-        let rows = vec![vec![
-            Value::BigInt(1),
-            Value::Text("root".into()),
-            Value::Text("localhost".into()),
-            db_val,
-            Value::Text("Query".into()),
-            Value::BigInt(0),
-            Value::Null,
-            Value::Null,
-        ]];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let snapshot = super::processlist::snapshot(registry);
+        let rows: Vec<Vec<Value>> = snapshot
+            .into_iter()
+            .map(|info| {
+                vec![
+                    Value::BigInt(info.id as i64),
+                    Value::Text(info.user),
+                    Value::Text(info.host),
+                    info.db.map(Value::Text).unwrap_or(Value::Null),
+                    Value::Text(info.command),
+                    Value::BigInt((now - info.command_started_at).max(0)),
+                    info.state.map(Value::Text).unwrap_or(Value::Null),
+                    info.info.map(Value::Text).unwrap_or(Value::Null),
+                ]
+            })
+            .collect();
         let qr = QueryResult::Rows {
             columns: cols,
             rows,

@@ -289,3 +289,38 @@ pub fn build_ok_with_status(
     buf.extend_from_slice(&warnings.to_le_bytes());
     buf
 }
+
+#[cfg(test)]
+mod greeting_tests {
+    use super::*;
+
+    /// GAP-C.9: the server greeting must advertise a case-insensitive utf8mb4
+    /// collation so MySQL clients default to CI comparisons out of the box.
+    ///
+    /// Byte offsets (per HandshakeV10 layout):
+    ///   0        protocol version (10)
+    ///   1..=N    server version string + NUL
+    ///   N+1..    conn_id (4) + auth_plugin_data_part1 (8) + filler (1) +
+    ///            capabilities_lo (2) + character_set (1)
+    #[test]
+    fn greeting_advertises_case_insensitive_utf8mb4_collation() {
+        let challenge = [0u8; 20];
+        let greeting = build_server_greeting(42, &challenge, "caching_sha2_password");
+
+        // Locate the character_set byte: skip proto(1) + version + NUL + conn_id(4)
+        // + auth1(8) + filler(1) + cap_lo(2). Find end of server version string
+        // (NUL terminator) to compute offset precisely.
+        let nul = greeting.iter().position(|b| *b == 0).unwrap();
+        // After NUL: conn_id(4) + auth1(8) + filler(1) + cap_lo(2) + charset(1).
+        let charset_offset = nul + 1 + 4 + 8 + 1 + 2;
+        let id = greeting[charset_offset];
+
+        // id 255 = utf8mb4_0900_ai_ci (MySQL 8.0 default, CI+AI).
+        // id 45  = utf8mb4_general_ci (MySQL 5.7 default, CI).
+        // Both are acceptable for GAP-C.9 — they are utf8mb4 CI collations.
+        assert!(
+            id == 255 || id == 45,
+            "server greeting must advertise a utf8mb4 CI collation (got id {id})"
+        );
+    }
+}

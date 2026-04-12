@@ -137,10 +137,13 @@ impl Default for FkAction {
 
 /// A row in `axiom_foreign_keys` — one entry per FK constraint (Phase 6.5).
 ///
-/// Scoped to **single-column** FKs. Composite FK support is deferred to
-/// Phase 6.9.
+/// Supports single-column and composite FKs (GAP-C.2). Legacy single-column
+/// fields `child_col_idx` / `parent_col_idx` mirror the first element of
+/// `child_col_idxs` / `parent_col_idxs` so older code paths keep working.
 ///
 /// ## Binary row format
+///
+/// Legacy (single-column) layout — still written when `child_col_idxs.len() == 1`:
 ///
 /// ```text
 /// [fk_id:          4 bytes LE u32]
@@ -150,43 +153,69 @@ impl Default for FkAction {
 /// [parent_col_idx: 2 bytes LE u16]
 /// [on_delete:      1 byte  u8   ]
 /// [on_update:      1 byte  u8   ]
-/// [fk_index_id:    4 bytes LE u32]  — auto-created index on child FK col;
-///                                      0 = user-provided, not auto-created
+/// [fk_index_id:    4 bytes LE u32]
 /// [name_len:       4 bytes LE u32]
 /// [name:           name_len bytes UTF-8]
 /// ```
 ///
 /// Fixed header: 26 bytes.
+///
+/// Composite extension — only written when `child_col_idxs.len() > 1`:
+/// appended after `name`:
+///
+/// ```text
+/// [ext_magic:      1 byte  0xCF  ]
+/// [num_pairs:      1 byte  u8    ] — total pair count (>= 2)
+/// [extra_child_idxs: (num_pairs - 1) × u16 LE] — pairs beyond the first
+/// [extra_parent_idxs:(num_pairs - 1) × u16 LE]
+/// ```
+///
+/// Readers detect the extension by checking `data.len() > FIXED + name_len`.
+/// Old rows (no extension) decode to single-column vectors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FkDef {
     /// Catalog-allocated monotonic ID.
     pub fk_id: u32,
     /// Table that owns the FK column (the "child" / referencing table).
     pub child_table_id: u32,
-    /// Column index in the child table that holds the FK value.
+    /// First child column index (legacy single-column field — always
+    /// equals `child_col_idxs[0]`).
     pub child_col_idx: u16,
     /// Table being referenced (the "parent" table).
     pub parent_table_id: u32,
-    /// Column index in the parent table that is referenced (must be PK/UNIQUE).
+    /// First parent column index (legacy — always equals `parent_col_idxs[0]`).
     pub parent_col_idx: u16,
     /// Action when the parent row is deleted.
     pub on_delete: FkAction,
     /// Action when the parent key is updated.
     pub on_update: FkAction,
-    /// `index_id` of the B-Tree index auto-created on `child_col_idx`.
-    /// `0` means the user already had a suitable index — we did not create one,
-    /// and therefore we must NOT drop it when the FK is dropped.
+    /// `index_id` of the B-Tree index auto-created on the child FK columns.
+    /// `0` means the user already had a suitable index — we did not create one.
     pub fk_index_id: u32,
-    /// Constraint name. Auto-generated as `fk_{child_table}_{col}_{parent_table}`
-    /// when not explicitly specified.
+    /// Constraint name.
     pub name: String,
+    /// All child column indices in order (GAP-C.2). `len() == 1` for single-
+    /// column FKs, `>= 2` for composite.
+    pub child_col_idxs: Vec<u16>,
+    /// All parent column indices in order. Must have the same length as
+    /// `child_col_idxs` (parallel arrays).
+    pub parent_col_idxs: Vec<u16>,
 }
+
+/// Marker byte introducing the composite-FK extension trailer.
+const FK_COMPOSITE_EXT_MAGIC: u8 = 0xCF;
 
 impl FkDef {
     /// Serializes this definition to bytes for heap storage.
     pub fn to_bytes(&self) -> Vec<u8> {
         let name_bytes = self.name.as_bytes();
-        let mut buf = Vec::with_capacity(26 + name_bytes.len());
+        let num_pairs = self.child_col_idxs.len();
+        let ext_bytes = if num_pairs > 1 {
+            2 + 4 * (num_pairs - 1)
+        } else {
+            0
+        };
+        let mut buf = Vec::with_capacity(26 + name_bytes.len() + ext_bytes);
         buf.extend_from_slice(&self.fk_id.to_le_bytes());
         buf.extend_from_slice(&self.child_table_id.to_le_bytes());
         buf.extend_from_slice(&self.child_col_idx.to_le_bytes());
@@ -197,6 +226,18 @@ impl FkDef {
         buf.extend_from_slice(&self.fk_index_id.to_le_bytes());
         buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(name_bytes);
+
+        // Composite extension: only written for multi-column FKs.
+        if num_pairs > 1 {
+            buf.push(FK_COMPOSITE_EXT_MAGIC);
+            buf.push(num_pairs as u8);
+            for idx in self.child_col_idxs.iter().skip(1) {
+                buf.extend_from_slice(&idx.to_le_bytes());
+            }
+            for idx in self.parent_col_idxs.iter().skip(1) {
+                buf.extend_from_slice(&idx.to_le_bytes());
+            }
+        }
         buf
     }
 
@@ -241,6 +282,48 @@ impl FkDef {
                 position: None,
             })?;
 
+        // Composite extension — appended after `name` when num_pairs > 1.
+        let mut child_col_idxs = vec![child_col_idx];
+        let mut parent_col_idxs = vec![parent_col_idx];
+        let mut consumed = end;
+        if data.len() > end && data[end] == FK_COMPOSITE_EXT_MAGIC {
+            if data.len() < end + 2 {
+                return Err(DbError::ParseError {
+                    message: "FkDef composite extension truncated".into(),
+                    position: None,
+                });
+            }
+            let num_pairs = data[end + 1] as usize;
+            if num_pairs < 2 {
+                return Err(DbError::ParseError {
+                    message: format!("FkDef composite num_pairs must be >= 2, got {num_pairs}"),
+                    position: None,
+                });
+            }
+            let extra = num_pairs - 1;
+            let ext_data_end = end + 2 + 4 * extra;
+            if data.len() < ext_data_end {
+                return Err(DbError::ParseError {
+                    message: "FkDef composite extension columns truncated".into(),
+                    position: None,
+                });
+            }
+            let mut off = end + 2;
+            for _ in 0..extra {
+                child_col_idxs.push(u16::from_le_bytes(
+                    data[off..off + 2].try_into().unwrap_or_default(),
+                ));
+                off += 2;
+            }
+            for _ in 0..extra {
+                parent_col_idxs.push(u16::from_le_bytes(
+                    data[off..off + 2].try_into().unwrap_or_default(),
+                ));
+                off += 2;
+            }
+            consumed = ext_data_end;
+        }
+
         Ok((
             Self {
                 fk_id,
@@ -252,8 +335,10 @@ impl FkDef {
                 on_update,
                 fk_index_id,
                 name,
+                child_col_idxs,
+                parent_col_idxs,
             },
-            end,
+            consumed,
         ))
     }
 }

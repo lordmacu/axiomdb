@@ -58,8 +58,8 @@ use crate::{
         AlterTableOp, AlterTableStmt, ColumnConstraint, CreateDatabaseStmt, CreateIndexStmt,
         CreateTableStmt, DeleteStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, FromClause,
         InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType, NullsOrder, OrderByItem,
-        SelectItem, SelectStmt, SetStmt, SetValue, ShowDatabasesStmt, SortOrder, Stmt, TableRef,
-        UpdateStmt, UseDatabaseStmt,
+        SelectItem, SelectStmt, SetOpKind, SetOpTail, SetStmt, SetValue, ShowDatabasesStmt,
+        SortOrder, Stmt, TableRef, UpdateStmt, UseDatabaseStmt,
     },
     eval::{eval, eval_with, is_truthy, CollationGuard, InSubquerySet, SubqueryRunner},
     expr::{BinaryOp, Expr},
@@ -94,6 +94,7 @@ include!("exec_explain.rs");
 
 include!("shared.rs");
 include!("joins.rs");
+include!("dml_join.rs");
 include!("aggregate.rs");
 include!("select.rs");
 include!("insert.rs");
@@ -157,18 +158,15 @@ mod tests {
             datatype_to_column_type(&DataType::Uuid).unwrap(),
             ColumnType::Uuid
         );
-    }
 
-    #[test]
-    fn test_datatype_to_column_type_unsupported() {
-        assert!(matches!(
-            datatype_to_column_type(&DataType::Decimal),
-            Err(DbError::NotImplemented { .. })
-        ));
-        assert!(matches!(
-            datatype_to_column_type(&DataType::Date),
-            Err(DbError::NotImplemented { .. })
-        ));
+        assert_eq!(
+            datatype_to_column_type(&DataType::Decimal).unwrap(),
+            ColumnType::Decimal
+        );
+        assert_eq!(
+            datatype_to_column_type(&DataType::Date).unwrap(),
+            ColumnType::Date
+        );
     }
 
     #[test]
@@ -178,8 +176,10 @@ mod tests {
             DataType::Int,
             DataType::BigInt,
             DataType::Real,
+            DataType::Decimal,
             DataType::Text,
             DataType::Bytes,
+            DataType::Date,
             DataType::Timestamp,
             DataType::Uuid,
         ] {

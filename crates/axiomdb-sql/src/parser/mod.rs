@@ -602,6 +602,14 @@ impl<'src> Parser<'src> {
                 self.eat(&Token::Session);
                 self.eat(&Token::Global);
                 self.eat(&Token::Local);
+                // `SET [SESSION|GLOBAL] TRANSACTION ISOLATION LEVEL <level>` —
+                // SQL-standard syntax. Also `SET TRANSACTION READ {ONLY|WRITE}`.
+                // Both map to the existing session variables.
+                if self.eat(&Token::Transaction) {
+                    if let Some(stmt) = self.parse_set_transaction_tail()? {
+                        return Ok(stmt);
+                    }
+                }
                 // Skip optional @@ or @ prefix (already consumed as part of identifier
                 // in the wire-level interceptor; here we handle the raw SQL path).
                 let variable = self.parse_set_variable()?;
@@ -797,6 +805,123 @@ impl<'src> Parser<'src> {
                     self.pos += 1;
                 }
             }
+        }
+    }
+
+    /// Parses the tail of `SET [SESSION|GLOBAL] TRANSACTION ...`.
+    ///
+    /// Supports:
+    /// - `ISOLATION LEVEL READ UNCOMMITTED | READ COMMITTED | REPEATABLE READ | SERIALIZABLE`
+    ///   → `SET transaction_isolation = '<level>'`
+    /// - `READ ONLY` / `READ WRITE`
+    ///   → `SET transaction_read_only = ON|OFF`
+    ///
+    /// Returns `Ok(None)` when the tokens don't match any known form — the
+    /// caller then falls through to the generic `var = value` path so other
+    /// vendor dialects aren't accidentally rejected.
+    pub(crate) fn parse_set_transaction_tail(&mut self) -> Result<Option<Stmt>, DbError> {
+        // ISOLATION LEVEL <level>
+        if let Token::Ident(s) = self.peek().clone() {
+            if s.eq_ignore_ascii_case("isolation") {
+                self.advance();
+                if let Token::Ident(lvl) = self.peek().clone() {
+                    if !lvl.eq_ignore_ascii_case("level") {
+                        return Err(DbError::ParseError {
+                            message: format!("expected LEVEL after ISOLATION, found {lvl}"),
+                            position: Some(self.current_pos()),
+                        });
+                    }
+                    self.advance(); // LEVEL
+                }
+                // Level identifier: READ UNCOMMITTED | READ COMMITTED |
+                // REPEATABLE READ | SERIALIZABLE.
+                let level = self.parse_isolation_level_words()?;
+                return Ok(Some(Stmt::Set(SetStmt {
+                    variable: "transaction_isolation".into(),
+                    value: SetValue::Expr(crate::expr::Expr::Literal(axiomdb_types::Value::Text(
+                        level,
+                    ))),
+                })));
+            }
+        }
+        // READ ONLY / READ WRITE
+        if self.eat(&Token::Read) {
+            if self.eat(&Token::Only) {
+                return Ok(Some(Stmt::Set(SetStmt {
+                    variable: "transaction_read_only".into(),
+                    value: SetValue::Expr(crate::expr::Expr::Literal(axiomdb_types::Value::Text(
+                        "ON".into(),
+                    ))),
+                })));
+            }
+            if self.eat(&Token::Write) {
+                return Ok(Some(Stmt::Set(SetStmt {
+                    variable: "transaction_read_only".into(),
+                    value: SetValue::Expr(crate::expr::Expr::Literal(axiomdb_types::Value::Text(
+                        "OFF".into(),
+                    ))),
+                })));
+            }
+        }
+        Ok(None)
+    }
+
+    fn parse_isolation_level_words(&mut self) -> Result<String, DbError> {
+        // First word: READ (then UNCOMMITTED|COMMITTED), REPEATABLE (then READ),
+        // or SERIALIZABLE.
+        let first = match self.peek().clone() {
+            Token::Read => {
+                self.advance();
+                "read"
+            }
+            Token::Ident(s) => {
+                self.advance();
+                return match s.to_ascii_lowercase().as_str() {
+                    "repeatable" => {
+                        // Expect READ.
+                        match self.peek().clone() {
+                            Token::Read => {
+                                self.advance();
+                                Ok("repeatable read".into())
+                            }
+                            other => Err(DbError::ParseError {
+                                message: format!("expected READ after REPEATABLE, found {other:?}"),
+                                position: Some(self.current_pos()),
+                            }),
+                        }
+                    }
+                    "serializable" => Ok("serializable".into()),
+                    other => Err(DbError::ParseError {
+                        message: format!("unknown isolation level '{other}'"),
+                        position: Some(self.current_pos()),
+                    }),
+                };
+            }
+            other => {
+                return Err(DbError::ParseError {
+                    message: format!("expected isolation level, found {other:?}"),
+                    position: Some(self.current_pos()),
+                })
+            }
+        };
+        // After READ: UNCOMMITTED or COMMITTED.
+        match self.peek().clone() {
+            Token::Ident(s) => {
+                let low = s.to_ascii_lowercase();
+                if low == "uncommitted" || low == "committed" {
+                    self.advance();
+                    Ok(format!("{first} {low}"))
+                } else {
+                    Err(DbError::ParseError {
+                        message: format!("expected UNCOMMITTED or COMMITTED after READ, found {s}"),
+                        position: Some(self.current_pos()),
+                    })
+                }
+            }
+            other => Err(DbError::ParseError {
+                message: format!("expected UNCOMMITTED or COMMITTED after READ, found {other:?}"),
+                position: Some(self.current_pos()),
+            }),
         }
     }
 

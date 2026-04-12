@@ -176,6 +176,84 @@ fn test_create_table_fk_no_parent_index_error() {
 }
 
 #[test]
+fn test_fk_parent_rename_table_preserves_enforcement() {
+    let mut db = Db::new();
+    setup!(
+        db,
+        "CREATE TABLE users (id INT PRIMARY KEY)",
+        "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT REFERENCES users(id))",
+        "INSERT INTO users VALUES (1)"
+    );
+
+    db.ok("RENAME TABLE users TO accounts");
+    db.ok("INSERT INTO orders VALUES (10, 1)");
+
+    let err = db.err("INSERT INTO orders VALUES (11, 999)");
+    assert!(
+        matches!(err, DbError::ForeignKeyViolation { .. }),
+        "expected ForeignKeyViolation after parent rename, got: {err}"
+    );
+
+    let err = db.err("DELETE FROM accounts WHERE id = 1");
+    assert!(
+        matches!(err, DbError::ForeignKeyParentViolation { .. }),
+        "expected ForeignKeyParentViolation after parent rename, got: {err}"
+    );
+}
+
+#[test]
+fn test_fk_parent_alter_rename_table_preserves_enforcement() {
+    let mut db = Db::new();
+    setup!(
+        db,
+        "CREATE TABLE users (id INT PRIMARY KEY)",
+        "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT REFERENCES users(id))",
+        "INSERT INTO users VALUES (1)"
+    );
+
+    db.ok("ALTER TABLE users RENAME TO accounts");
+    db.ok("INSERT INTO orders VALUES (10, 1)");
+
+    let err = db.err("INSERT INTO orders VALUES (11, 999)");
+    assert!(
+        matches!(err, DbError::ForeignKeyViolation { .. }),
+        "expected ForeignKeyViolation after ALTER TABLE parent rename, got: {err}"
+    );
+
+    let err = db.err("DELETE FROM accounts WHERE id = 1");
+    assert!(
+        matches!(err, DbError::ForeignKeyParentViolation { .. }),
+        "expected ForeignKeyParentViolation after ALTER TABLE parent rename, got: {err}"
+    );
+}
+
+#[test]
+fn test_fk_child_rename_table_preserves_enforcement() {
+    let mut db = Db::new();
+    setup!(
+        db,
+        "CREATE TABLE users (id INT PRIMARY KEY)",
+        "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT REFERENCES users(id))",
+        "INSERT INTO users VALUES (1)"
+    );
+
+    db.ok("ALTER TABLE orders RENAME TO purchases");
+    db.ok("INSERT INTO purchases VALUES (10, 1)");
+
+    let err = db.err("INSERT INTO purchases VALUES (11, 999)");
+    assert!(
+        matches!(err, DbError::ForeignKeyViolation { .. }),
+        "expected ForeignKeyViolation after child rename, got: {err}"
+    );
+
+    let err = db.err("DELETE FROM users WHERE id = 1");
+    assert!(
+        matches!(err, DbError::ForeignKeyParentViolation { .. }),
+        "expected ForeignKeyParentViolation after child rename, got: {err}"
+    );
+}
+
+#[test]
 fn test_alter_table_add_fk() {
     let mut db = Db::new();
     setup!(
@@ -551,6 +629,8 @@ fn test_fk_def_roundtrip() {
         on_update: FkAction::Restrict,
         fk_index_id: 7,
         name: "fk_orders_user".to_string(),
+        child_col_idxs: vec![2],
+        parent_col_idxs: vec![0],
     };
 
     let bytes = original.to_bytes();

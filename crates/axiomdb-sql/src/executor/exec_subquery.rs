@@ -157,14 +157,16 @@ fn detect_materializable_pattern(stmt: &SelectStmt) -> Option<MaterializableInfo
                 right,
             } => {
                 // Check: OuterColumn = Column or Column = OuterColumn
+                // Only depth-0 refs (immediate parent) qualify for this opt;
+                // deeper correlation is handled by the generic row-by-row path.
                 match (left.as_ref(), right.as_ref()) {
                     (
-                        Expr::OuterColumn { col_idx: outer_idx, .. },
+                        Expr::OuterColumn { col_idx: outer_idx, depth: 0, .. },
                         Expr::Column { col_idx: inner_idx, name, .. },
                     )
                     | (
                         Expr::Column { col_idx: inner_idx, name, .. },
-                        Expr::OuterColumn { col_idx: outer_idx, .. },
+                        Expr::OuterColumn { col_idx: outer_idx, depth: 0, .. },
                     ) => {
                         if found.is_none() {
                             *found = Some((*outer_idx, *inner_idx, name.clone()));
@@ -557,36 +559,47 @@ fn stmt_has_outer_ref(stmt: &SelectStmt) -> bool {
 
 // ── Subquery execution support ────────────────────────────────────────────────
 
-/// Walks a `SelectStmt` AST and substitutes every `Expr::OuterColumn { col_idx }`
-/// with `Expr::Literal(outer_row[col_idx])`, producing a fully self-contained
-/// statement ready for inner execution.
+/// Walks a `SelectStmt` AST and substitutes `Expr::OuterColumn` nodes that
+/// refer to the caller's scope with `Expr::Literal(outer_row[col_idx])`.
 ///
 /// Called once per outer row for correlated subqueries. Uncorrelated subqueries
 /// contain no `OuterColumn` nodes — `substitute_outer` is a no-op for them.
-fn substitute_outer(mut stmt: SelectStmt, outer_row: &[Value]) -> SelectStmt {
-    stmt.where_clause = stmt.where_clause.map(|e| subst_expr(e, outer_row));
+///
+/// Nested subqueries are walked with `binding_depth + 1` so that refs pointing
+/// to the caller's scope through multiple layers of nesting are still resolved
+/// correctly (GAP-C.8).
+fn substitute_outer(stmt: SelectStmt, outer_row: &[Value]) -> SelectStmt {
+    substitute_outer_at(stmt, outer_row, 0)
+}
+
+fn substitute_outer_at(mut stmt: SelectStmt, outer_row: &[Value], binding_depth: u16) -> SelectStmt {
+    stmt.where_clause = stmt
+        .where_clause
+        .map(|e| subst_expr(e, outer_row, binding_depth));
     stmt.columns = stmt
         .columns
         .into_iter()
         .map(|item| match item {
             SelectItem::Expr { expr, alias } => SelectItem::Expr {
-                expr: subst_expr(expr, outer_row),
+                expr: subst_expr(expr, outer_row, binding_depth),
                 alias,
             },
             other => other,
         })
         .collect();
-    stmt.having = stmt.having.map(|e| subst_expr(e, outer_row));
+    stmt.having = stmt
+        .having
+        .map(|e| subst_expr(e, outer_row, binding_depth));
     stmt.group_by = stmt
         .group_by
         .into_iter()
-        .map(|e| subst_expr(e, outer_row))
+        .map(|e| subst_expr(e, outer_row, binding_depth))
         .collect();
     stmt.order_by = stmt
         .order_by
         .into_iter()
         .map(|mut item| {
-            item.expr = subst_expr(item.expr, outer_row);
+            item.expr = subst_expr(item.expr, outer_row, binding_depth);
             item
         })
         .collect();
@@ -596,7 +609,7 @@ fn substitute_outer(mut stmt: SelectStmt, outer_row: &[Value]) -> SelectStmt {
         .map(|mut join| {
             use crate::ast::JoinCondition;
             join.condition = match join.condition {
-                JoinCondition::On(e) => JoinCondition::On(subst_expr(e, outer_row)),
+                JoinCondition::On(e) => JoinCondition::On(subst_expr(e, outer_row, binding_depth)),
                 other => other,
             };
             join
@@ -605,23 +618,42 @@ fn substitute_outer(mut stmt: SelectStmt, outer_row: &[Value]) -> SelectStmt {
     stmt
 }
 
-/// Recursively replaces `OuterColumn` nodes with `Literal` values from `outer_row`.
-fn subst_expr(expr: Expr, outer_row: &[Value]) -> Expr {
+/// Recursively replaces `OuterColumn` nodes whose `depth` matches
+/// `binding_depth` with `Literal` values from `outer_row`. OuterColumn nodes
+/// at greater depth (referring to scopes further out than the current binding)
+/// are left intact — they will be bound by an outer substitution pass.
+///
+/// Supports correlation at arbitrary nesting depth (GAP-C.8): when recursing
+/// into a nested subquery, `binding_depth` is incremented so that deep refs
+/// to the caller's row resolve through multiple scope layers.
+fn subst_expr(expr: Expr, outer_row: &[Value], binding_depth: u16) -> Expr {
     match expr {
-        Expr::OuterColumn { col_idx, .. } => {
-            Expr::Literal(outer_row.get(col_idx).cloned().unwrap_or(Value::Null))
+        Expr::OuterColumn {
+            col_idx,
+            name,
+            depth,
+        } => {
+            if depth == binding_depth {
+                Expr::Literal(outer_row.get(col_idx).cloned().unwrap_or(Value::Null))
+            } else {
+                Expr::OuterColumn {
+                    col_idx,
+                    name,
+                    depth,
+                }
+            }
         }
         Expr::UnaryOp { op, operand } => Expr::UnaryOp {
             op,
-            operand: Box::new(subst_expr(*operand, outer_row)),
+            operand: Box::new(subst_expr(*operand, outer_row, binding_depth)),
         },
         Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
             op,
-            left: Box::new(subst_expr(*left, outer_row)),
-            right: Box::new(subst_expr(*right, outer_row)),
+            left: Box::new(subst_expr(*left, outer_row, binding_depth)),
+            right: Box::new(subst_expr(*right, outer_row, binding_depth)),
         },
         Expr::IsNull { expr, negated } => Expr::IsNull {
-            expr: Box::new(subst_expr(*expr, outer_row)),
+            expr: Box::new(subst_expr(*expr, outer_row, binding_depth)),
             negated,
         },
         Expr::IsBoolean {
@@ -629,7 +661,7 @@ fn subst_expr(expr: Expr, outer_row: &[Value]) -> Expr {
             value,
             negated,
         } => Expr::IsBoolean {
-            expr: Box::new(subst_expr(*expr, outer_row)),
+            expr: Box::new(subst_expr(*expr, outer_row, binding_depth)),
             value,
             negated,
         },
@@ -639,9 +671,9 @@ fn subst_expr(expr: Expr, outer_row: &[Value]) -> Expr {
             high,
             negated,
         } => Expr::Between {
-            expr: Box::new(subst_expr(*expr, outer_row)),
-            low: Box::new(subst_expr(*low, outer_row)),
-            high: Box::new(subst_expr(*high, outer_row)),
+            expr: Box::new(subst_expr(*expr, outer_row, binding_depth)),
+            low: Box::new(subst_expr(*low, outer_row, binding_depth)),
+            high: Box::new(subst_expr(*high, outer_row, binding_depth)),
             negated,
         },
         Expr::Like {
@@ -650,52 +682,67 @@ fn subst_expr(expr: Expr, outer_row: &[Value]) -> Expr {
             negated,
             escape,
         } => Expr::Like {
-            expr: Box::new(subst_expr(*expr, outer_row)),
-            pattern: Box::new(subst_expr(*pattern, outer_row)),
+            expr: Box::new(subst_expr(*expr, outer_row, binding_depth)),
+            pattern: Box::new(subst_expr(*pattern, outer_row, binding_depth)),
             negated,
-            escape: escape.map(|e| Box::new(subst_expr(*e, outer_row))),
+            escape: escape.map(|e| Box::new(subst_expr(*e, outer_row, binding_depth))),
         },
         Expr::In {
             expr,
             list,
             negated,
         } => Expr::In {
-            expr: Box::new(subst_expr(*expr, outer_row)),
-            list: list.into_iter().map(|e| subst_expr(e, outer_row)).collect(),
+            expr: Box::new(subst_expr(*expr, outer_row, binding_depth)),
+            list: list
+                .into_iter()
+                .map(|e| subst_expr(e, outer_row, binding_depth))
+                .collect(),
             negated,
         },
         Expr::Function { name, args } => Expr::Function {
             name,
-            args: args.into_iter().map(|a| subst_expr(a, outer_row)).collect(),
+            args: args
+                .into_iter()
+                .map(|a| subst_expr(a, outer_row, binding_depth))
+                .collect(),
         },
         Expr::Case {
             operand,
             when_thens,
             else_result,
         } => Expr::Case {
-            operand: operand.map(|e| Box::new(subst_expr(*e, outer_row))),
+            operand: operand.map(|e| Box::new(subst_expr(*e, outer_row, binding_depth))),
             when_thens: when_thens
                 .into_iter()
-                .map(|(w, t)| (subst_expr(w, outer_row), subst_expr(t, outer_row)))
+                .map(|(w, t)| {
+                    (
+                        subst_expr(w, outer_row, binding_depth),
+                        subst_expr(t, outer_row, binding_depth),
+                    )
+                })
                 .collect(),
-            else_result: else_result.map(|e| Box::new(subst_expr(*e, outer_row))),
+            else_result: else_result.map(|e| Box::new(subst_expr(*e, outer_row, binding_depth))),
         },
         Expr::Cast { expr, target } => Expr::Cast {
-            expr: Box::new(subst_expr(*expr, outer_row)),
+            expr: Box::new(subst_expr(*expr, outer_row, binding_depth)),
             target,
         },
-        Expr::Subquery(inner) => Expr::Subquery(Box::new(substitute_outer(*inner, outer_row))),
+        Expr::Subquery(inner) => Expr::Subquery(Box::new(substitute_outer_at(
+            *inner,
+            outer_row,
+            binding_depth + 1,
+        ))),
         Expr::InSubquery {
             expr,
             query,
             negated,
         } => Expr::InSubquery {
-            expr: Box::new(subst_expr(*expr, outer_row)),
-            query: Box::new(substitute_outer(*query, outer_row)),
+            expr: Box::new(subst_expr(*expr, outer_row, binding_depth)),
+            query: Box::new(substitute_outer_at(*query, outer_row, binding_depth + 1)),
             negated,
         },
         Expr::Exists { query, negated } => Expr::Exists {
-            query: Box::new(substitute_outer(*query, outer_row)),
+            query: Box::new(substitute_outer_at(*query, outer_row, binding_depth + 1)),
             negated,
         },
         Expr::GroupConcat {
@@ -704,11 +751,11 @@ fn subst_expr(expr: Expr, outer_row: &[Value]) -> Expr {
             order_by,
             separator,
         } => Expr::GroupConcat {
-            expr: Box::new(subst_expr(*expr, outer_row)),
+            expr: Box::new(subst_expr(*expr, outer_row, binding_depth)),
             distinct,
             order_by: order_by
                 .into_iter()
-                .map(|(e, dir)| (subst_expr(e, outer_row), dir))
+                .map(|(e, dir)| (subst_expr(e, outer_row, binding_depth), dir))
                 .collect(),
             separator,
         },
@@ -995,12 +1042,22 @@ fn extract_equijoin_outer_inner(expr: &Expr) -> Option<(usize, usize)> {
     } = expr
     {
         match (left.as_ref(), right.as_ref()) {
-            (Expr::OuterColumn { col_idx: oc, .. }, Expr::Column { col_idx: ic, .. }) => {
-                Some((*oc, *ic))
-            }
-            (Expr::Column { col_idx: ic, .. }, Expr::OuterColumn { col_idx: oc, .. }) => {
-                Some((*oc, *ic))
-            }
+            (
+                Expr::OuterColumn {
+                    col_idx: oc,
+                    depth: 0,
+                    ..
+                },
+                Expr::Column { col_idx: ic, .. },
+            ) => Some((*oc, *ic)),
+            (
+                Expr::Column { col_idx: ic, .. },
+                Expr::OuterColumn {
+                    col_idx: oc,
+                    depth: 0,
+                    ..
+                },
+            ) => Some((*oc, *ic)),
             _ => None,
         }
     } else {

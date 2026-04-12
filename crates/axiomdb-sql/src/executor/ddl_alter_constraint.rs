@@ -110,44 +110,63 @@ fn alter_add_constraint(
             on_delete,
             on_update,
         } => {
-            if columns.len() != 1 {
-                return Err(DbError::NotImplemented {
-                    feature: "composite foreign key (multiple columns) — Phase 6.9".into(),
-                });
-            }
-            let child_col_name = &columns[0];
-            let child_col_idx = columns_arg
+            // Resolve child col indexes.
+            let child_col_idxs: Vec<u16> = columns
                 .iter()
-                .find(|c| &c.name == child_col_name)
-                .map(|c| c.col_idx)
-                .ok_or_else(|| DbError::ColumnNotFound {
-                    name: child_col_name.clone(),
-                    table: table_def.def.table_name.clone(),
-                })?;
-            let ref_col = ref_columns.first().map(|s| s.as_str());
+                .map(|col_name| {
+                    columns_arg
+                        .iter()
+                        .find(|c| &c.name == col_name)
+                        .map(|c| c.col_idx)
+                        .ok_or_else(|| DbError::ColumnNotFound {
+                            name: col_name.clone(),
+                            table: table_def.def.table_name.clone(),
+                        })
+                })
+                .collect::<Result<_, _>>()?;
 
-            // Persist the FK definition (validates parent, creates auto-index if needed).
-            persist_fk_constraint(
-                table_def.def.id,
-                &table_def.def.table_name,
-                database,
-                child_col_idx,
-                child_col_name,
-                &ref_table,
-                ref_col,
-                ast_fk_action_to_catalog(on_delete),
-                ast_fk_action_to_catalog(on_update),
-                name.as_deref(),
-                storage,
-                txn,
-                conn_txn,
-            )?;
+            if columns.len() == 1 {
+                let child_col_name = &columns[0];
+                let ref_col = ref_columns.first().map(|s| s.as_str());
+                persist_fk_constraint(
+                    table_def.def.id,
+                    &table_def.def.table_name,
+                    database,
+                    child_col_idxs[0],
+                    child_col_name,
+                    &ref_table,
+                    ref_col,
+                    ast_fk_action_to_catalog(on_delete),
+                    ast_fk_action_to_catalog(on_update),
+                    name.as_deref(),
+                    storage,
+                    txn,
+                    conn_txn,
+                )?;
+            } else {
+                persist_composite_fk_constraint(
+                    table_def.def.id,
+                    &table_def.def.table_name,
+                    database,
+                    &child_col_idxs,
+                    &columns,
+                    &ref_table,
+                    &ref_columns,
+                    ast_fk_action_to_catalog(on_delete),
+                    ast_fk_action_to_catalog(on_update),
+                    name.as_deref(),
+                    storage,
+                    txn,
+                    conn_txn,
+                )?;
+            }
 
             // Validate existing data: every non-NULL FK value must reference a parent row.
             let snap = txn.active_snapshot(conn_txn);
             let default_constraint_name = format!(
                 "fk_{}_{}_{ref_table}",
-                table_def.def.table_name, child_col_name
+                table_def.def.table_name,
+                columns.join("_")
             );
             let constraint_name = name.as_deref().unwrap_or(&default_constraint_name);
             let new_fk = {

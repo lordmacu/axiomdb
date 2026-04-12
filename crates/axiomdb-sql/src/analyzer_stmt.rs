@@ -44,16 +44,17 @@ fn analyze_stmt(
             analyze_alter_table(s, storage, snapshot, default_database, default_schema)
                 .map(Stmt::AlterTable)
         }
-        // UNION — analyze each inner SELECT.
-        Stmt::Union { selects, all } => {
-            let analyzed: Result<Vec<_>, _> = selects
+        // UNION / INTERSECT / EXCEPT — analyze first + each tail SELECT.
+        Stmt::SetOp { first, rest } => {
+            let first = analyze_select(first, storage, snapshot.clone(), default_database, default_schema)?;
+            let rest: Result<Vec<_>, _> = rest
                 .into_iter()
-                .map(|s| analyze_select(s, storage, snapshot.clone(), default_database, default_schema))
+                .map(|t| {
+                    analyze_select(t.select, storage, snapshot.clone(), default_database, default_schema)
+                        .map(|select| crate::ast::SetOpTail { kind: t.kind, all: t.all, select })
+                })
                 .collect();
-            Ok(Stmt::Union {
-                selects: analyzed?,
-                all,
-            })
+            Ok(Stmt::SetOp { first, rest: rest? })
         }
         // Statements that need no semantic analysis for Phase 4.18:
         other => Ok(other),
