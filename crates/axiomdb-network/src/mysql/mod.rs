@@ -32,6 +32,7 @@ pub mod lifecycle;
 pub mod packets;
 pub mod plan_cache;
 pub mod prepared;
+pub mod processlist;
 pub mod result;
 pub mod session;
 pub mod shared_db;

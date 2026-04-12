@@ -50,9 +50,18 @@ fn resolve_expr_full(
                 }
             }
             // 2. Try outer scopes — emit OuterColumn if found.
-            for outer_ctx in outer_scopes {
+            // `outer_scopes` is ordered outermost→innermost (see subquery arms).
+            // `depth` is measured from the immediate enclosing query:
+            // innermost outer = 0, next = 1, etc.
+            let n_outer = outer_scopes.len();
+            for (i, outer_ctx) in outer_scopes.iter().enumerate() {
                 if let Ok(idx) = outer_ctx.resolve_column(&name) {
-                    return Ok(Expr::OuterColumn { col_idx: idx, name });
+                    let depth = (n_outer - 1 - i) as u16;
+                    return Ok(Expr::OuterColumn {
+                        col_idx: idx,
+                        name,
+                        depth,
+                    });
                 }
             }
             // 3. Not found anywhere.

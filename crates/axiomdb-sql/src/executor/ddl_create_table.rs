@@ -210,40 +210,57 @@ fn execute_create_table(
             on_update,
         } = tc
         {
-            if columns.len() != 1 {
-                return Err(DbError::NotImplemented {
-                    feature: "composite foreign key (multiple columns) — Phase 6.9".into(),
-                });
-            }
-            let child_col_name = &columns[0];
             let snap = txn.active_snapshot(conn_txn);
-            let child_col_idx = {
-                let mut reader = CatalogReader::new(storage, snap)?;
+            let child_col_idxs: Vec<u16> = {
+                let mut reader = CatalogReader::new(storage, snap.clone())?;
                 let cols = reader.list_columns(table_id)?;
-                cols.iter()
-                    .find(|c| &c.name == child_col_name)
-                    .map(|c| c.col_idx)
-                    .ok_or_else(|| DbError::ColumnNotFound {
-                        name: child_col_name.clone(),
-                        table: stmt.table.name.clone(),
-                    })?
+                columns
+                    .iter()
+                    .map(|name| {
+                        cols.iter()
+                            .find(|c| &c.name == name)
+                            .map(|c| c.col_idx)
+                            .ok_or_else(|| DbError::ColumnNotFound {
+                                name: name.clone(),
+                                table: stmt.table.name.clone(),
+                            })
+                    })
+                    .collect::<Result<_, _>>()?
             };
-            let ref_col = ref_columns.first().map(|s| s.as_str());
-            persist_fk_constraint(
-                table_id,
-                &stmt.table.name,
-                database,
-                child_col_idx,
-                child_col_name,
-                ref_table,
-                ref_col,
-                ast_fk_action_to_catalog(*on_delete),
-                ast_fk_action_to_catalog(*on_update),
-                name.as_deref(),
-                storage,
-                txn,
-                conn_txn,
-            )?;
+            if columns.len() == 1 {
+                let ref_col = ref_columns.first().map(|s| s.as_str());
+                persist_fk_constraint(
+                    table_id,
+                    &stmt.table.name,
+                    database,
+                    child_col_idxs[0],
+                    &columns[0],
+                    ref_table,
+                    ref_col,
+                    ast_fk_action_to_catalog(*on_delete),
+                    ast_fk_action_to_catalog(*on_update),
+                    name.as_deref(),
+                    storage,
+                    txn,
+                    conn_txn,
+                )?;
+            } else {
+                persist_composite_fk_constraint(
+                    table_id,
+                    &stmt.table.name,
+                    database,
+                    &child_col_idxs,
+                    columns,
+                    ref_table,
+                    ref_columns,
+                    ast_fk_action_to_catalog(*on_delete),
+                    ast_fk_action_to_catalog(*on_update),
+                    name.as_deref(),
+                    storage,
+                    txn,
+                    conn_txn,
+                )?;
+            }
         }
     }
 
@@ -628,6 +645,8 @@ fn persist_fk_constraint(
         on_update,
         fk_index_id,
         name: constraint_name,
+        child_col_idxs: vec![child_col_idx],
+        parent_col_idxs: vec![parent_col_idx],
     })?;
 
     Ok(())
@@ -880,5 +899,179 @@ fn execute_create_table_as_select(
     }
 
     Ok(QueryResult::Empty)
+}
+
+// ── Composite foreign key (GAP-C.2) ──────────────────────────────────────────
+
+/// Persists a multi-column FK. Requires that both parent and child already
+/// have an index whose leading columns exactly match the FK column list
+/// (parent: PRIMARY KEY or UNIQUE covering `parent_col_idxs`; child: any
+/// index whose prefix matches `child_col_idxs`). This avoids the complexity
+/// of auto-building a composite child index on existing rows — a tradeoff
+/// that mirrors MySQL's recommendation to always pre-declare the child
+/// composite index explicitly.
+#[allow(clippy::too_many_arguments)]
+fn persist_composite_fk_constraint(
+    child_table_id: u32,
+    child_table_name: &str,
+    database: &str,
+    child_col_idxs: &[u16],
+    child_col_names: &[String],
+    ref_table: &str,
+    ref_columns: &[String],
+    on_delete: axiomdb_catalog::FkAction,
+    on_update: axiomdb_catalog::FkAction,
+    fk_name: Option<&str>,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+) -> Result<(), DbError> {
+    use axiomdb_catalog::FkDef;
+
+    let snap = txn.active_snapshot(conn_txn);
+
+    // 1. Resolve parent table + columns.
+    let parent_def = {
+        let mut reader = CatalogReader::new(storage, snap.clone())?;
+        reader
+            .get_table_in_database(database, "public", ref_table)?
+            .ok_or_else(|| DbError::TableNotFound {
+                name: ref_table.to_string(),
+            })?
+    };
+    let parent_cols = {
+        let mut reader = CatalogReader::new(storage, snap.clone())?;
+        reader.list_columns(parent_def.id)?
+    };
+
+    // Parent column list: must match arity. If REFERENCES specifies columns
+    // explicitly, use those; otherwise default to the PK leading columns.
+    let parent_col_idxs: Vec<u16> = if ref_columns.is_empty() {
+        let parent_indexes = {
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
+            reader.list_indexes(parent_def.id)?
+        };
+        let pk = parent_indexes
+            .iter()
+            .find(|i| i.is_primary && i.columns.len() >= child_col_idxs.len())
+            .ok_or_else(|| DbError::ForeignKeyNoParentIndex {
+                table: ref_table.to_string(),
+                column: "<primary key>".to_string(),
+            })?;
+        pk.columns
+            .iter()
+            .take(child_col_idxs.len())
+            .map(|c| c.col_idx)
+            .collect()
+    } else {
+        if ref_columns.len() != child_col_idxs.len() {
+            return Err(DbError::InvalidValue {
+                reason: format!(
+                    "composite FK arity mismatch: child has {} column(s), REFERENCES has {}",
+                    child_col_idxs.len(),
+                    ref_columns.len()
+                ),
+            });
+        }
+        ref_columns
+            .iter()
+            .map(|name| {
+                parent_cols
+                    .iter()
+                    .find(|c| &c.name == name)
+                    .map(|c| c.col_idx)
+                    .ok_or_else(|| DbError::ColumnNotFound {
+                        name: name.clone(),
+                        table: ref_table.to_string(),
+                    })
+            })
+            .collect::<Result<_, _>>()?
+    };
+
+    // 2. Verify parent has a PK or UNIQUE index covering every parent col in order.
+    {
+        let mut reader = CatalogReader::new(storage, snap.clone())?;
+        let parent_indexes = reader.list_indexes(parent_def.id)?;
+        let covered = parent_indexes.iter().any(|i| {
+            (i.is_primary || i.is_unique)
+                && i.columns.len() >= parent_col_idxs.len()
+                && i.columns
+                    .iter()
+                    .take(parent_col_idxs.len())
+                    .zip(parent_col_idxs.iter())
+                    .all(|(ic, wanted)| ic.col_idx == *wanted)
+        });
+        if !covered {
+            return Err(DbError::ForeignKeyNoParentIndex {
+                table: ref_table.to_string(),
+                column: format!("({})", ref_columns.join(",")),
+            });
+        }
+    }
+
+    // 3. Auto-generate FK name if not provided.
+    let constraint_name: String = fk_name.map(|n| n.to_string()).unwrap_or_else(|| {
+        format!(
+            "fk_{child_table_name}_{}_{ref_table}",
+            child_col_names.join("_")
+        )
+    });
+
+    // 4. Name uniqueness on this child table.
+    {
+        let mut reader = CatalogReader::new(storage, snap.clone())?;
+        if reader
+            .get_fk_by_name(child_table_id, &constraint_name)?
+            .is_some()
+        {
+            return Err(DbError::Other(format!(
+                "foreign key constraint '{constraint_name}' already exists on table \
+                 '{child_table_name}'"
+            )));
+        }
+    }
+
+    // 5. Verify child already has an index whose leading columns match
+    //    `child_col_idxs`. Auto-building a composite FK index on existing
+    //    child rows is not yet supported — user must declare it explicitly.
+    let child_has_index = {
+        let mut reader = CatalogReader::new(storage, snap.clone())?;
+        reader.list_indexes(child_table_id)?.into_iter().any(|i| {
+            !i.is_fk_index
+                && i.columns.len() >= child_col_idxs.len()
+                && i.columns
+                    .iter()
+                    .take(child_col_idxs.len())
+                    .zip(child_col_idxs.iter())
+                    .all(|(ic, wanted)| ic.col_idx == *wanted)
+        })
+    };
+    if !child_has_index {
+        return Err(DbError::InvalidValue {
+            reason: format!(
+                "composite FK '{constraint_name}' requires a pre-declared index on \
+                 child columns ({}); auto-creation of composite FK indexes is not \
+                 supported yet",
+                child_col_names.join(",")
+            ),
+        });
+    }
+
+    // 6. Persist FkDef with composite vectors. `fk_index_id = 0` → user-provided.
+    CatalogWriter::new(storage, txn, conn_txn)?.create_foreign_key(FkDef {
+        fk_id: 0,
+        child_table_id,
+        child_col_idx: child_col_idxs[0],
+        parent_table_id: parent_def.id,
+        parent_col_idx: parent_col_idxs[0],
+        on_delete,
+        on_update,
+        fk_index_id: 0,
+        name: constraint_name,
+        child_col_idxs: child_col_idxs.to_vec(),
+        parent_col_idxs,
+    })?;
+
+    Ok(())
 }
 

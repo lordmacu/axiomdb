@@ -380,6 +380,29 @@ pub async fn handle_connection_with_timeouts(
     // Placed after auth so only authenticated connections are counted.
     let _connected_guard = ConnectedGuard::new(Arc::clone(&status));
 
+    // Register this connection in the SHOW PROCESSLIST registry (GAP-B.7).
+    // RAII guard removes the entry on drop even if the command loop panics.
+    let _processlist_guard = super::processlist::ProcesslistGuard::register(
+        Arc::clone(&db.connection_registry),
+        super::shared_db::ConnectionInfo {
+            id: conn_id,
+            user: username.clone(),
+            host: peer.clone(),
+            db: if conn_state.current_database.is_empty() {
+                None
+            } else {
+                Some(conn_state.current_database.clone())
+            },
+            command: "Sleep".into(),
+            command_started_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            state: None,
+            info: None,
+        },
+    );
+
     // Sync decoder limit to the session value after auth.  The session default
     // matches the codec default (67 108 864), but a future SET may change it.
     reader.decoder_mut().set_max_payload_len(
@@ -545,7 +568,7 @@ pub async fn handle_connection_with_timeouts(
                 debug!(conn_id, %sql, "COM_QUERY");
 
                 // Intercept queries that ORMs/clients send automatically on connect.
-                match intercept_special_query(sql, &mut conn_state, &status) {
+                match intercept_special_query(sql, &mut conn_state, &status, &db.connection_registry) {
                     Ok(Some(packets)) => {
                         engine.sync_from_wire(&conn_state);
                         // Sync decoder limit after SET max_allowed_packet.
@@ -610,7 +633,7 @@ pub async fn handle_connection_with_timeouts(
                     // Classify statement for counter updates.
                     let class = SqlCommandClass::from_sql(stmt_sql);
 
-                    match intercept_special_query(stmt_sql, &mut conn_state, &status) {
+                    match intercept_special_query(stmt_sql, &mut conn_state, &status, &db.connection_registry) {
                         Ok(Some(packets)) => {
                             engine.sync_from_wire(&conn_state);
                             reader.decoder_mut().set_max_payload_len(

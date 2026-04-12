@@ -120,12 +120,135 @@ fn execute_select_grouped(
     stmt.group_by = resolve_positional_group_by(&stmt.group_by, &stmt.columns);
     // Resolve positional ORDER BY (e.g. ORDER BY 2) to SELECT expressions (G8).
     stmt.order_by = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
+
+    if stmt.with_rollup {
+        return execute_select_grouped_rollup(stmt, combined_rows, strategy);
+    }
+
     match strategy {
         GroupByStrategy::Hash => execute_select_grouped_hash(stmt, combined_rows),
         GroupByStrategy::Sorted { presorted } => {
             execute_select_grouped_sorted(stmt, combined_rows, presorted)
         }
     }
+}
+
+/// Executes `GROUP BY ... WITH ROLLUP` (GAP-C.5).
+///
+/// For `GROUP BY c1, c2, ..., cN WITH ROLLUP`, produces rows at every grouping
+/// level from full keys down to the grand total:
+///
+/// - Level N (full)   — normal groups
+/// - Level N-1        — subtotal per (c1..c_{N-1}); `cN` emitted as NULL
+/// - ...
+/// - Level 0          — grand total; every group key emitted as NULL
+///
+/// Strategy: run the underlying grouped executor once per level with a
+/// progressively truncated `group_by`; then null out SELECT output positions
+/// that correspond to the rolled-up group-by expressions. Top-level
+/// ORDER BY / LIMIT / OFFSET / DISTINCT are deferred so they apply to the
+/// union of all levels (matching MySQL semantics).
+fn execute_select_grouped_rollup(
+    stmt: SelectStmt,
+    combined_rows: Vec<Row>,
+    strategy: GroupByStrategy,
+) -> Result<QueryResult, DbError> {
+    let n = stmt.group_by.len();
+    if n == 0 {
+        // `GROUP BY () WITH ROLLUP` degenerates to a single grand-total row.
+        let mut stripped = stmt.clone();
+        stripped.with_rollup = false;
+        return execute_select_grouped_hash(stripped, combined_rows);
+    }
+
+    // Precompute which SELECT item positions correspond to each group_by expr.
+    // Used to null-out rolled-up keys at each level.
+    let select_slot_for_gb: Vec<Option<usize>> = stmt
+        .group_by
+        .iter()
+        .map(|gb| {
+            stmt.columns.iter().position(|item| match item {
+                SelectItem::Expr { expr, .. } => expr == gb,
+                _ => false,
+            })
+        })
+        .collect();
+
+    let out_cols_template = {
+        // Borrow the column meta from a single-level run (shape is identical
+        // across all levels — only values change).
+        let mut probe = stmt.clone();
+        probe.with_rollup = false;
+        probe.order_by.clear();
+        probe.limit = None;
+        probe.offset = None;
+        probe.distinct = false;
+        probe.calc_found_rows = false;
+        let res = match strategy {
+            GroupByStrategy::Hash => execute_select_grouped_hash(probe, combined_rows.clone())?,
+            GroupByStrategy::Sorted { presorted } => {
+                execute_select_grouped_sorted(probe, combined_rows.clone(), presorted)?
+            }
+        };
+        match res {
+            QueryResult::Rows { columns, rows: _ } => columns,
+            other => return Ok(other),
+        }
+    };
+
+    // Re-run per level, from full keys down to zero.
+    let mut all_rows: Vec<Row> = Vec::new();
+    for k in (0..=n).rev() {
+        let mut level_stmt = stmt.clone();
+        level_stmt.with_rollup = false;
+        level_stmt.group_by.truncate(k);
+        level_stmt.order_by.clear();
+        level_stmt.limit = None;
+        level_stmt.offset = None;
+        level_stmt.distinct = false;
+        level_stmt.calc_found_rows = false;
+
+        let level_res = match strategy {
+            GroupByStrategy::Hash => {
+                execute_select_grouped_hash(level_stmt, combined_rows.clone())?
+            }
+            GroupByStrategy::Sorted { presorted } => {
+                execute_select_grouped_sorted(level_stmt, combined_rows.clone(), presorted)?
+            }
+        };
+        let mut level_rows = match level_res {
+            QueryResult::Rows { rows, .. } => rows,
+            other => return Ok(other),
+        };
+
+        // Null out SELECT positions for rolled-up group-by exprs (indices k..n).
+        if k < n {
+            for row in level_rows.iter_mut() {
+                for slot in select_slot_for_gb.iter().take(n).skip(k).flatten() {
+                    if *slot < row.len() {
+                        row[*slot] = Value::Null;
+                    }
+                }
+            }
+        }
+        all_rows.extend(level_rows);
+    }
+
+    // Outer DISTINCT / ORDER BY / LIMIT apply to the union of all levels.
+    if stmt.distinct {
+        all_rows = apply_distinct_with_session(all_rows);
+    }
+    let remapped_ob = remap_order_by_for_grouped(&stmt.order_by, &stmt.columns);
+    all_rows = apply_order_by(all_rows, &remapped_ob)?;
+    if stmt.calc_found_rows {
+        set_found_rows(all_rows.len() as u64);
+    }
+    all_rows = apply_limit_offset(all_rows, &stmt.limit, &stmt.offset)?;
+
+    Ok(QueryResult::Rows {
+        columns: out_cols_template,
+        rows: all_rows,
+    })
 }
 
 // ── Hash aggregation ─────────────────────────────────────────────────────────

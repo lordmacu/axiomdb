@@ -459,8 +459,48 @@ fn execute_alter_table(
             AlterTableOp::ConvertCharset | AlterTableOp::SetEngine => {
                 // Accepted and ignored — charset/engine are compat metadata only.
             }
-            AlterTableOp::SetAutoIncrement(_) => {
-                // AUTO_INCREMENT counter reset accepted; not yet persisted (4.18e).
+            AlterTableOp::SetAutoIncrement(n) => {
+                // MySQL semantics: only honors N if greater than the current
+                // max value on the AUTO_INCREMENT column; otherwise silently
+                // ignored. Persistence lives in the per-process `AUTO_INC_SEQ`
+                // cache — future inserts on this table use `next >= N`.
+                //
+                // NOTE: full cross-restart persistence requires a catalog field
+                // (`auto_increment_next` on TableDef) and is tracked separately.
+                if let Some(ai_col) = columns.iter().position(|c| c.auto_increment) {
+                    let snap = txn.active_snapshot(conn_txn);
+                    let max_existing = if table_def.def.is_clustered() {
+                        crate::clustered_table::scan_max_numeric_column(
+                            storage,
+                            txn.clustered_root(table_def.def.id)
+                                .or(Some(table_def.def.root_page_id)),
+                            &columns,
+                            ai_col,
+                            &snap,
+                        )?
+                    } else {
+                        let rows = TableEngine::scan_table(
+                            storage,
+                            &table_def.def,
+                            &columns,
+                            snap,
+                            None,
+                        )?;
+                        rows.iter()
+                            .filter_map(|(_, vals)| vals.get(ai_col))
+                            .filter_map(|v| match v {
+                                Value::Int(m) => Some(*m as u64),
+                                Value::BigInt(m) => Some(*m as u64),
+                                _ => None,
+                            })
+                            .max()
+                            .unwrap_or(0)
+                    };
+                    let desired = n.max(max_existing + 1);
+                    AUTO_INC_SEQ.with(|seq| {
+                        seq.borrow_mut().insert(table_def.def.id, desired);
+                    });
+                }
             }
             AlterTableOp::AddIndex {
                 unique,
@@ -615,6 +655,47 @@ fn alter_add_column(
             Ok(row)
         },
     )?;
+
+    // 4.22e follow-up: the heap rewrite above deleted+re-inserted every row,
+    // so RIDs changed. Secondary indexes on a heap table still point at the
+    // old RIDs — rebuild them from the live heap. Clustered tables don't
+    // change RIDs during rewrite (`rewrite_rows_clustered` updates in place
+    // with PK preserved) so no rebuild is needed there.
+    if !table_def.is_clustered() {
+        let snap = txn.active_snapshot(conn_txn);
+        let indexes = CatalogReader::new(storage, snap.clone())?.list_indexes(table_def.id)?;
+        let current_table_def = current_table_def_for_alter(table_def, txn);
+        let mut built_roots_for_cleanup = Vec::new();
+        let mut pages_to_defer = Vec::new();
+        let rebuild_result = (|| -> Result<(), DbError> {
+            for idx in &indexes {
+                if idx.columns.is_empty() {
+                    continue;
+                }
+                let build = build_index_root_from_existing_def(
+                    storage,
+                    &current_table_def,
+                    &new_columns,
+                    idx,
+                    snap.clone(),
+                )?;
+                built_roots_for_cleanup.push(build.root_page_id);
+                pages_to_defer.extend(collect_btree_pages(storage, idx.root_page_id)?);
+
+                let mut updated = idx.clone();
+                updated.root_page_id = build.root_page_id;
+                CatalogWriter::new(storage, txn, conn_txn)?.replace_index_def(updated)?;
+            }
+            pages_to_defer.sort_unstable();
+            pages_to_defer.dedup();
+            txn.defer_free_pages(conn_txn, pages_to_defer);
+            Ok(())
+        })();
+        if let Err(err) = rebuild_result {
+            cleanup_rebuilt_index_roots(storage, &built_roots_for_cleanup);
+            return Err(err);
+        }
+    }
 
     columns.push(new_catalog_col);
     let _ = schema; // schema already encoded in table_def

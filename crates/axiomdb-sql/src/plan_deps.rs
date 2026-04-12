@@ -234,10 +234,11 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             Stmt::CreateTableLike(_) => Ok(()),
             // CREATE TABLE AS SELECT — deps come from the inner SELECT.
             Stmt::CreateTableAsSelect(s) => self.visit_select(&s.select),
-            // UNION — deps come from all inner SELECTs.
-            Stmt::Union { selects, .. } => {
-                for s in selects {
-                    self.visit_select(s)?;
+            // Set ops — deps come from first + every tail SELECT.
+            Stmt::SetOp { first, rest } => {
+                self.visit_select(first)?;
+                for t in rest {
+                    self.visit_select(&t.select)?;
                 }
                 Ok(())
             }
@@ -266,6 +267,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
 
     fn visit_update(&mut self, s: &UpdateStmt) -> Result<(), DbError> {
         self.visit_tableref(&s.table)?;
+        self.visit_joins(&s.joins)?;
         if let Some(w) = &s.where_clause {
             self.visit_expr(w)?;
         }
@@ -274,6 +276,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
 
     fn visit_delete(&mut self, s: &DeleteStmt) -> Result<(), DbError> {
         self.visit_tableref(&s.table)?;
+        self.visit_joins(&s.joins)?;
         if let Some(w) = &s.where_clause {
             self.visit_expr(w)?;
         }

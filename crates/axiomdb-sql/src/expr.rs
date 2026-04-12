@@ -191,7 +191,16 @@ pub enum Expr {
     /// `OuterColumn` is a programming error.
     ///
     /// [`BindContext`]: crate::analyzer::BindContext
-    OuterColumn { col_idx: usize, name: String },
+    ///
+    /// `depth` is the nesting distance to the target scope: `0` = immediate
+    /// enclosing query, `1` = grandparent, etc. Each substitution pass replaces
+    /// nodes at depth 0 and decrements deeper nodes so the outer substitution
+    /// frame picks them up. Supports correlation at any nesting depth (GAP-C.8).
+    OuterColumn {
+        col_idx: usize,
+        name: String,
+        depth: u16,
+    },
 
     /// A positional parameter placeholder — the `?` in a prepared statement.
     ///

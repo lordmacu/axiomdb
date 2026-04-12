@@ -238,6 +238,23 @@ pub struct OrderByItem {
 
 /// A `SELECT` statement.
 ///
+/// Set operator kind for `Stmt::SetOp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOpKind {
+    Union,
+    Intersect,
+    Except,
+}
+
+/// One tail element in a set-operation chain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetOpTail {
+    pub kind: SetOpKind,
+    /// `true` = ALL variant (keeps duplicates per postgres semantics).
+    pub all: bool,
+    pub select: SelectStmt,
+}
+
 /// `from` is `None` for `SELECT` without `FROM` (e.g. `SELECT 1`, `SELECT NOW()`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
@@ -249,6 +266,10 @@ pub struct SelectStmt {
     pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
     pub group_by: Vec<Expr>,
+    /// `true` when `GROUP BY ... WITH ROLLUP` was specified (GAP-C.5).
+    /// Produces one subtotal row per grouping level with NULL in the rolled-up keys,
+    /// plus a grand-total row with NULL in every group-by column.
+    pub with_rollup: bool,
     pub having: Option<Expr>,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<Expr>,
@@ -285,6 +306,8 @@ pub struct InsertStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateStmt {
     pub table: TableRef,
+    /// Optional MySQL multi-table join source: `UPDATE t JOIN u ON ... SET ...`.
+    pub joins: Vec<JoinClause>,
     pub assignments: Vec<Assignment>,
     pub where_clause: Option<Expr>,
     /// `UPDATE ... ORDER BY col [ASC|DESC]` — sort candidates before applying.
@@ -297,6 +320,10 @@ pub struct UpdateStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteStmt {
     pub table: TableRef,
+    /// Optional MySQL target before FROM: `DELETE t FROM t JOIN u ON ...`.
+    pub target: Option<String>,
+    /// Optional MySQL multi-table join source after FROM.
+    pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
     /// `DELETE ... ORDER BY col [ASC|DESC]` — sort candidates before deleting.
     pub order_by: Vec<OrderByItem>,
@@ -587,11 +614,17 @@ pub struct CreateSchemaStmt {
 pub enum Stmt {
     // DML
     Select(SelectStmt),
-    /// `SELECT ... UNION [ALL] SELECT ...` — set operation combining multiple SELECTs.
-    Union {
-        selects: Vec<SelectStmt>,
-        /// `true` = UNION ALL (keep duplicates), `false` = UNION (deduplicate).
-        all: bool,
+    /// `SELECT ... (UNION|INTERSECT|EXCEPT) [ALL] SELECT ...` — set operation chain.
+    ///
+    /// Left-associative application of `rest` against `first`. Each tail
+    /// carries its own operator kind and ALL flag. INTERSECT binds tighter
+    /// than UNION/EXCEPT per SQL std — enforced during parsing by grouping
+    /// INTERSECT chains into nested SetOp trees via an intermediate SELECT
+    /// wrapper if needed (current impl folds left-to-right; mix precedence
+    /// is MySQL-compatible).
+    SetOp {
+        first: SelectStmt,
+        rest: Vec<SetOpTail>,
     },
     Insert(InsertStmt),
     Update(UpdateStmt),
@@ -702,6 +735,7 @@ mod tests {
             joins: vec![],
             where_clause: Some(Expr::binop(BinaryOp::Gt, col(0, "age"), Expr::int(18))),
             group_by: vec![],
+            with_rollup: false,
             having: None,
             order_by: vec![OrderByItem {
                 expr: col(1, "name"),
@@ -729,6 +763,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: vec![],
+            with_rollup: false,
             having: None,
             order_by: vec![],
             limit: None,
@@ -863,6 +898,7 @@ mod tests {
                 },
             ],
             where_clause: Some(Expr::binop(BinaryOp::Eq, col(1, "id"), Expr::int(42))),
+            joins: vec![],
             order_by: vec![],
             limit: None,
         });
@@ -873,6 +909,8 @@ mod tests {
     fn test_delete_with_where() {
         let stmt = Stmt::Delete(DeleteStmt {
             table: TableRef::simple("users"),
+            target: None,
+            joins: vec![],
             where_clause: Some(Expr::IsNull {
                 expr: Box::new(col(0, "email")),
                 negated: false,
@@ -912,6 +950,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: vec![],
+            with_rollup: false,
             having: None,
             order_by: vec![],
             limit: None,

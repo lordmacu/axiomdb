@@ -111,7 +111,11 @@ impl PreparedStatement {
         }
         let entry = &mut self.pending_long_data[param_idx];
         let current_len = entry.as_deref().map_or(0, |v| v.len());
-        if current_len + chunk.len() > max_len {
+        // `checked_add` guards against usize overflow on pathological inputs.
+        let exceeds = current_len
+            .checked_add(chunk.len())
+            .is_none_or(|total| total > max_len);
+        if exceeds {
             self.pending_long_data_error = Some(format!(
                 "COM_STMT_SEND_LONG_DATA: accumulated value for parameter {param_idx} \
                  exceeds max_allowed_packet ({max_len} bytes)"

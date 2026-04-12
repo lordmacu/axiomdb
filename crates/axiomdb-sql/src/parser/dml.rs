@@ -7,8 +7,8 @@ use axiomdb_types::Value;
 use crate::{
     ast::{
         Assignment, DeleteStmt, FromClause, InsertSource, InsertStmt, JoinClause, JoinCondition,
-        JoinType, LockMode, NullsOrder, OrderByItem, SelectItem, SelectStmt, SortOrder, Stmt,
-        UpdateStmt,
+        JoinType, LockMode, NullsOrder, OrderByItem, SelectItem, SelectStmt, SetOpKind, SetOpTail,
+        SortOrder, Stmt, UpdateStmt,
     },
     expr::Expr,
     lexer::Token,
@@ -22,9 +22,9 @@ pub(crate) fn parse_dml(p: &mut Parser) -> Result<Stmt, DbError> {
         Token::Select => {
             p.advance();
             let first = parse_select(p)?;
-            // Check for UNION [ALL] continuation.
-            if matches!(p.peek(), Token::Union) {
-                return parse_union(p, first);
+            // Check for UNION / INTERSECT / EXCEPT continuation.
+            if matches!(p.peek(), Token::Union | Token::Intersect | Token::Except) {
+                return parse_set_op(p, first);
             }
             Ok(Stmt::Select(first))
         }
@@ -50,27 +50,30 @@ pub(crate) fn parse_dml(p: &mut Parser) -> Result<Stmt, DbError> {
     }
 }
 
-// ── UNION ────────────────────────────────────────────────────────────────────
+// ── SET OPERATIONS (UNION / INTERSECT / EXCEPT) ───────────────────────────────
 
-/// Parses `UNION [ALL] SELECT ...` chains after the first SELECT has been parsed.
-///
-/// Supports chained UNIONs: `SELECT ... UNION ALL SELECT ... UNION ALL SELECT ...`
-/// All UNION operators in a chain must be the same kind (ALL or DISTINCT).
-/// If mixed, the last UNION type wins (MySQL behavior).
-fn parse_union(p: &mut Parser, first: SelectStmt) -> Result<Stmt, DbError> {
-    let mut selects = vec![first];
-    let mut all = false;
+/// Parses `(UNION|INTERSECT|EXCEPT) [ALL] SELECT ...` chains after the first
+/// SELECT has been parsed. Left-associative. Each tail carries its own kind
+/// and ALL flag (MySQL 8.0.31+ compatible).
+fn parse_set_op(p: &mut Parser, first: SelectStmt) -> Result<Stmt, DbError> {
+    let mut rest = Vec::new();
 
-    while p.eat(&Token::Union) {
-        // UNION ALL or plain UNION (deduplicate).
-        all = p.eat(&Token::All);
+    loop {
+        let kind = match p.peek() {
+            Token::Union => SetOpKind::Union,
+            Token::Intersect => SetOpKind::Intersect,
+            Token::Except => SetOpKind::Except,
+            _ => break,
+        };
+        p.advance();
 
-        // Expect SELECT after UNION [ALL].
+        let all = p.eat(&Token::All);
         p.expect(&Token::Select)?;
-        selects.push(parse_select(p)?);
+        let select = parse_select(p)?;
+        rest.push(SetOpTail { kind, all, select });
     }
 
-    Ok(Stmt::Union { selects, all })
+    Ok(Stmt::SetOp { first, rest })
 }
 
 // ── SELECT ────────────────────────────────────────────────────────────────────
@@ -129,11 +132,22 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
         None
     };
 
-    let group_by = if p.eat(&Token::Group) {
+    let (group_by, with_rollup) = if p.eat(&Token::Group) {
         p.expect(&Token::By)?;
-        parse_expr_list(p)?
+        let exprs = parse_expr_list(p)?;
+        // Optional `WITH ROLLUP` modifier (MySQL + SQL std).
+        let rollup = if matches!(p.peek(), Token::With)
+            && matches!(p.peek_at(1), Token::Ident(s) if s.eq_ignore_ascii_case("rollup"))
+        {
+            p.advance(); // WITH
+            p.advance(); // ROLLUP
+            true
+        } else {
+            false
+        };
+        (exprs, rollup)
     } else {
-        vec![]
+        (vec![], false)
     };
 
     let having = if p.eat(&Token::Having) {
@@ -173,6 +187,7 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
         joins,
         where_clause,
         group_by,
+        with_rollup,
         having,
         order_by,
         limit,
@@ -570,7 +585,17 @@ fn parse_insert(p: &mut Parser) -> Result<Stmt, DbError> {
 // ── UPDATE ────────────────────────────────────────────────────────────────────
 
 fn parse_update(p: &mut Parser) -> Result<Stmt, DbError> {
-    let table = p.parse_table_ref()?;
+    let from = parse_from_item(p)?;
+    let table = match from {
+        FromClause::Table(table) => table,
+        FromClause::Subquery { .. } => {
+            return Err(DbError::ParseError {
+                message: "UPDATE target must be a table".into(),
+                position: Some(p.current_pos()),
+            })
+        }
+    };
+    let joins = parse_join_clauses(p)?;
     p.expect(&Token::Set)?;
 
     let mut assignments = vec![parse_assignment(p)?];
@@ -599,6 +624,7 @@ fn parse_update(p: &mut Parser) -> Result<Stmt, DbError> {
 
     Ok(Stmt::Update(UpdateStmt {
         table,
+        joins,
         assignments,
         where_clause,
         order_by,
@@ -607,7 +633,10 @@ fn parse_update(p: &mut Parser) -> Result<Stmt, DbError> {
 }
 
 fn parse_assignment(p: &mut Parser) -> Result<Assignment, DbError> {
-    let column = p.parse_identifier()?;
+    let mut column = p.parse_identifier()?;
+    if p.eat(&Token::Dot) {
+        column = p.parse_identifier()?;
+    }
     p.expect(&Token::Eq)?;
     let value = parse_expr(p)?;
     Ok(Assignment { column, value })
@@ -616,8 +645,34 @@ fn parse_assignment(p: &mut Parser) -> Result<Assignment, DbError> {
 // ── DELETE ────────────────────────────────────────────────────────────────────
 
 fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
-    p.expect(&Token::From)?;
-    let table = p.parse_table_ref()?;
+    let (target, table, joins) = if p.eat(&Token::From) {
+        let from = parse_from_item(p)?;
+        let table = match from {
+            FromClause::Table(table) => table,
+            FromClause::Subquery { .. } => {
+                return Err(DbError::ParseError {
+                    message: "DELETE target must be a table".into(),
+                    position: Some(p.current_pos()),
+                })
+            }
+        };
+        (None, table, vec![])
+    } else {
+        let target = p.parse_identifier()?;
+        p.expect(&Token::From)?;
+        let from = parse_from_item(p)?;
+        let table = match from {
+            FromClause::Table(table) => table,
+            FromClause::Subquery { .. } => {
+                return Err(DbError::ParseError {
+                    message: "DELETE FROM source must be a table".into(),
+                    position: Some(p.current_pos()),
+                })
+            }
+        };
+        let joins = parse_join_clauses(p)?;
+        (Some(target), table, joins)
+    };
     let where_clause = if p.eat(&Token::Where) {
         Some(parse_expr(p)?)
     } else {
@@ -639,6 +694,8 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
 
     Ok(Stmt::Delete(DeleteStmt {
         table,
+        target,
+        joins,
         where_clause,
         order_by,
         limit,

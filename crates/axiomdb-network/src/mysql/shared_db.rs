@@ -109,6 +109,30 @@ pub struct SharedDatabase {
     /// Row-level lock manager (Phase 40.11). Shared across all connections.
     /// Used by DML for IX(table) + X(row) locks. Released on COMMIT/ROLLBACK.
     pub lock_mgr: axiomdb_lock::LockManager,
+    /// Active connection registry for `SHOW [FULL] PROCESSLIST` (GAP-B.7).
+    ///
+    /// Each connection registers itself on successful authentication and
+    /// removes itself on disconnect. Per-query state (`command`, `info`,
+    /// `state`) is updated by the handler's command loop. A single
+    /// `RwLock<HashMap>` is sufficient — registrations are rare and
+    /// PROCESSLIST reads are brief.
+    pub connection_registry: Arc<std::sync::RwLock<std::collections::HashMap<u32, ConnectionInfo>>>,
+}
+
+/// Snapshot of a live connection's state — displayed by `SHOW PROCESSLIST`.
+#[derive(Clone, Debug)]
+pub struct ConnectionInfo {
+    pub id: u32,
+    pub user: String,
+    pub host: String,
+    pub db: Option<String>,
+    /// Current command verb — `"Sleep"` when idle, `"Query"` while executing.
+    pub command: String,
+    /// Unix-seconds timestamp of the last command start (used to compute Time).
+    pub command_started_at: i64,
+    pub state: Option<String>,
+    /// SQL text currently being processed (only when `command == "Query"`).
+    pub info: Option<String>,
 }
 
 impl SharedDatabase {
@@ -169,6 +193,7 @@ impl SharedDatabase {
             )),
             catalog_lock: RwLock::new(()),
             lock_mgr: axiomdb_lock::LockManager::new(),
+            connection_registry: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         })
     }
 

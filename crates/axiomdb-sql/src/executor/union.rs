@@ -1,93 +1,157 @@
-// ── UNION / UNION ALL executor ───────────────────────────────────────────────
+// ── UNION / INTERSECT / EXCEPT executor ──────────────────────────────────────
 
-/// Executes `SELECT ... UNION [ALL] SELECT ...` chains.
+/// Executes a set-operation chain: `first` followed by a sequence of tails
+/// applied left-to-right. Each tail has its own kind (UNION/INTERSECT/EXCEPT)
+/// and ALL flag.
 ///
-/// For UNION ALL: concatenates all result sets (keeps duplicates).
-/// For UNION: concatenates then deduplicates using hash-based dedup.
+/// Semantics (per PostgreSQL / SQL std):
+/// - UNION     — distinct concatenation (hash dedup)
+/// - UNION ALL — concatenation (keeps duplicates)
+/// - INTERSECT — rows present in both sides, distinct
+/// - INTERSECT ALL — per group, output min(L,R) copies
+/// - EXCEPT    — rows in left but not in right, distinct
+/// - EXCEPT ALL — per group, output max(0, L-R) copies
 ///
-/// Column metadata is taken from the first SELECT. All SELECTs must produce
-/// the same number of columns (MySQL behavior: types are coerced from the
-/// first query's column types).
-fn execute_union(
-    selects: Vec<SelectStmt>,
-    all: bool,
+/// Column metadata comes from the first SELECT. Every tail must produce
+/// the same arity.
+fn execute_set_op(
+    first: SelectStmt,
+    rest: Vec<SetOpTail>,
     exec_ctx: &ExecutionContext,
     conn_txn: Option<&ConnectionTxn>,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
-    if selects.is_empty() {
-        return Ok(QueryResult::affected(0));
-    }
+    let first_result = execute_select_ctx(first, exec_ctx, conn_txn, ctx)?;
+    let (columns, mut acc_rows) = match first_result {
+        QueryResult::Rows { columns, rows } => (columns, rows),
+        other => return Ok(other),
+    };
+    let width = columns.len();
 
-    // Execute each SELECT and collect rows.
-    let mut columns: Option<Vec<ColumnMeta>> = None;
-    let mut all_rows: Vec<Row> = Vec::new();
-    let mut expected_width: Option<usize> = None;
-
-    for select in selects {
-        let result = execute_select_ctx(select, exec_ctx, conn_txn, ctx)?;
-        match result {
+    for tail in rest {
+        let right_result = execute_select_ctx(tail.select, exec_ctx, conn_txn, ctx)?;
+        let right_rows = match right_result {
             QueryResult::Rows { columns: cols, rows } => {
-                // Validate column count consistency.
-                match expected_width {
-                    None => {
-                        expected_width = Some(cols.len());
-                        columns = Some(cols);
-                    }
-                    Some(w) if cols.len() != w => {
-                        return Err(DbError::ParseError {
-                            message: format!(
-                                "UNION queries must have the same number of columns \
-                                 (first SELECT has {w}, this one has {})",
-                                cols.len()
-                            ),
-                            position: None,
-                        });
-                    }
-                    _ => {} // same width, discard cols (use first SELECT's metadata)
+                if cols.len() != width {
+                    return Err(DbError::ParseError {
+                        message: format!(
+                            "set operation branches must have the same number of columns \
+                             (first has {width}, this one has {})",
+                            cols.len()
+                        ),
+                        position: None,
+                    });
                 }
-                all_rows.extend(rows);
+                rows
             }
-            // Non-row results (shouldn't happen for SELECT, but handle gracefully)
             other => return Ok(other),
-        }
+        };
+
+        acc_rows = match tail.kind {
+            SetOpKind::Union => apply_union(acc_rows, right_rows, tail.all),
+            SetOpKind::Intersect => apply_intersect(acc_rows, right_rows, tail.all),
+            SetOpKind::Except => apply_except(acc_rows, right_rows, tail.all),
+        };
     }
 
-    let columns = columns.unwrap_or_default();
+    Ok(QueryResult::Rows { columns, rows: acc_rows })
+}
 
-    // For UNION ALL: just return all rows.
+fn apply_union(mut left: Vec<Row>, right: Vec<Row>, all: bool) -> Vec<Row> {
+    left.extend(right);
     if all {
-        return Ok(QueryResult::Rows {
-            columns,
-            rows: all_rows,
-        });
+        return left;
     }
-
-    // For UNION (distinct): deduplicate using a HashSet on serialized row bytes.
     let mut seen = std::collections::HashSet::new();
-    let mut deduped = Vec::with_capacity(all_rows.len());
-    for row in all_rows {
+    let mut out = Vec::with_capacity(left.len());
+    for row in left {
         let key = row_to_dedup_key(&row);
         if seen.insert(key) {
-            deduped.push(row);
+            out.push(row);
         }
     }
+    out
+}
 
-    Ok(QueryResult::Rows {
-        columns,
-        rows: deduped,
-    })
+fn apply_intersect(left: Vec<Row>, right: Vec<Row>, all: bool) -> Vec<Row> {
+    // Build per-group counts for the right side.
+    let mut right_counts: std::collections::HashMap<Vec<u8>, usize> =
+        std::collections::HashMap::new();
+    for row in &right {
+        *right_counts.entry(row_to_dedup_key(row)).or_insert(0) += 1;
+    }
+
+    if all {
+        // INTERSECT ALL: per row in left, emit if right still has it; decrement.
+        let mut out = Vec::new();
+        for row in left {
+            let key = row_to_dedup_key(&row);
+            if let Some(cnt) = right_counts.get_mut(&key) {
+                if *cnt > 0 {
+                    *cnt -= 1;
+                    out.push(row);
+                }
+            }
+        }
+        out
+    } else {
+        // INTERSECT: emit each group once, iff both sides contain it.
+        let mut emitted = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for row in left {
+            let key = row_to_dedup_key(&row);
+            if right_counts.contains_key(&key) && emitted.insert(key) {
+                out.push(row);
+            }
+        }
+        out
+    }
+}
+
+fn apply_except(left: Vec<Row>, right: Vec<Row>, all: bool) -> Vec<Row> {
+    // Counts of right-side groups to subtract from left.
+    let mut right_counts: std::collections::HashMap<Vec<u8>, usize> =
+        std::collections::HashMap::new();
+    for row in &right {
+        *right_counts.entry(row_to_dedup_key(row)).or_insert(0) += 1;
+    }
+
+    if all {
+        // EXCEPT ALL: for each left row, skip if right still has a matching copy.
+        let mut out = Vec::new();
+        for row in left {
+            let key = row_to_dedup_key(&row);
+            if let Some(cnt) = right_counts.get_mut(&key) {
+                if *cnt > 0 {
+                    *cnt -= 1;
+                    continue;
+                }
+            }
+            out.push(row);
+        }
+        out
+    } else {
+        // EXCEPT: each distinct left group, emit once iff not in right.
+        let mut emitted = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for row in left {
+            let key = row_to_dedup_key(&row);
+            if !right_counts.contains_key(&key) && emitted.insert(key) {
+                out.push(row);
+            }
+        }
+        out
+    }
 }
 
 /// Creates a deduplication key from a row by serializing all values.
 ///
 /// Uses a simple but correct serialization: each value is converted to its
-/// debug string representation. This is not the most efficient approach but
-/// is correct for all value types including NULL.
+/// typed byte representation with a type tag so `Int(0)` ≠ `BigInt(0)` ≠
+/// `Text("0")`. NULLs are encoded explicitly.
 fn row_to_dedup_key(row: &Row) -> Vec<u8> {
     let mut key = Vec::new();
     for value in row.iter() {
-        // Type tag to distinguish Int(0) from BigInt(0) from Text("0")
         match value {
             Value::Null => key.push(0),
             Value::Bool(b) => {
@@ -122,7 +186,7 @@ fn row_to_dedup_key(row: &Row) -> Vec<u8> {
             Value::Text(s) | Value::Json(s) => {
                 key.push(8);
                 key.extend_from_slice(s.as_bytes());
-                key.push(0); // terminator
+                key.push(0);
             }
             Value::Bytes(b) => {
                 key.push(9);
