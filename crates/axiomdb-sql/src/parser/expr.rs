@@ -170,9 +170,31 @@ fn parse_is_null(p: &mut Parser) -> Result<Expr, DbError> {
                     negated,
                 });
             }
+            // Phase 21.17 — IS [NOT] DISTINCT FROM: NULL-safe comparison.
+            //   a IS DISTINCT FROM b     ≡ NOT (a <=> b)
+            //   a IS NOT DISTINCT FROM b ≡ (a <=> b)
+            Token::Distinct => {
+                p.advance();
+                p.expect(&Token::From)?;
+                let rhs = parse_predicate(p)?;
+                let eq = Expr::BinaryOp {
+                    op: crate::expr::BinaryOp::NullSafe,
+                    left: Box::new(expr),
+                    right: Box::new(rhs),
+                };
+                // IS DISTINCT FROM     → NOT eq  (negated=false here means "distinct" so wrap)
+                // IS NOT DISTINCT FROM → eq
+                if negated {
+                    return Ok(eq);
+                }
+                return Ok(Expr::UnaryOp {
+                    op: crate::expr::UnaryOp::Not,
+                    operand: Box::new(eq),
+                });
+            }
             _ => {
                 return Err(DbError::ParseError {
-                    message: "expected NULL, TRUE, or FALSE after IS [NOT]".into(),
+                    message: "expected NULL, TRUE, FALSE, or DISTINCT after IS [NOT]".into(),
                     position: None,
                 });
             }

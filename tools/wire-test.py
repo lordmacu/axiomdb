@@ -3446,6 +3446,22 @@ ok("11.25d JSON_STORAGE_FREE returns 0",
    rows[0][0] == 0,
    f"got {rows}")
 
+# ── Phase 21.17 — IS [NOT] DISTINCT FROM ──────────────────────────────────────
+
+print("\n[21.17 IS DISTINCT FROM]")
+
+cur.execute("SELECT NULL IS NOT DISTINCT FROM NULL")
+rows = cur.fetchall()
+ok("21.17 NULL IS NOT DISTINCT FROM NULL -> TRUE",
+   rows[0][0] in (1, True),
+   f"got {rows}")
+
+cur.execute("SELECT 1 IS DISTINCT FROM NULL")
+rows = cur.fetchall()
+ok("21.17 1 IS DISTINCT FROM NULL -> TRUE",
+   rows[0][0] in (1, True),
+   f"got {rows}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()
