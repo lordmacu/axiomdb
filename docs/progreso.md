@@ -255,7 +255,7 @@ JSON parity, window functions, generated columns, views, sequences, ENUMs, array
 - [ ] 21.14 ⏳ CREATE TABLE AS SELECT — create table from query result
 - [ ] 21.15 ⏳ CREATE TABLE LIKE — clone structure from another table
 - [ ] 21.16 ⏳ DEFERRABLE constraints — `DEFERRABLE INITIALLY DEFERRED/IMMEDIATE`; buffer of pending violations per transaction; verify all on COMMIT; full rollback if any fail; prerequisite for bulk imports without FK ordering
-- [ ] 21.17 ⏳ IS DISTINCT FROM / IS NOT DISTINCT FROM — NULL-safe comparison (1 IS DISTINCT FROM NULL → true)
+- [x] ✅ 21.17 `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` — NULL-safe comparison. Parser `parse_is_null` extended with `Token::Distinct` arm after `IS [NOT]`: expects `FROM`, parses RHS predicate, desugars at parse time to `BinaryOp::NullSafe(lhs, rhs)` for `IS NOT DISTINCT FROM` and `UnaryOp::Not(BinaryOp::NullSafe(lhs, rhs))` for `IS DISTINCT FROM`. No new AST variant — reuses existing `<=>` infrastructure. Truth table: `NULL/NULL → FALSE/TRUE`, `x/NULL → TRUE/FALSE`, `x/x → FALSE/TRUE`, `x/y → TRUE/FALSE`. 7 integration tests in `tests/integration_is_distinct_from.rs` (full truth table + WHERE filter). Wire smoke 392/392 (2 new `[21.17]` assertions). Spec+plan: `specs/fase-21/{spec,plan}-21.17-is-distinct-from.md`.
 - [ ] 21.18 ⏳ NATURAL JOIN — automatic join on columns with the same name
 - [ ] 21.19 ⏳ FETCH FIRST n ROWS ONLY / OFFSET n ROWS — standard SQL alias for LIMIT
 - [ ] 21.20 ⏳ CHECKPOINT — force WAL write to disk manually

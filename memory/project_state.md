@@ -3,7 +3,7 @@
 ## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 11.25d JSON mutators + MySQL completeness (`jsonb_strip_nulls`, `JSON_STORAGE_FREE`, regression `jsonb_set_lax` / `JSON_MERGE_PRESERVE` / `JSON_STORAGE_SIZE`) — ✅ closed. **Phase 11 COMPLETE on MySQL+PG parity path.** Remaining: 11.18c (blocked by TEXT[] — fase 20.4), 11.21h (planner pushdown — optional perf).
+**Active subphase:** 21.17 `IS [NOT] DISTINCT FROM` — ✅ closed. Fase 11 JSON complete on MySQL+PG path; moved to fase 21 (Advanced SQL) per ruta crítica. Next small parser wins: 21.19 `FETCH FIRST`, 21.18 `NATURAL JOIN`, 21.22 `VALUES` inline; then medium: 21.14 `CREATE TABLE AS SELECT`, 21.15 `CREATE TABLE LIKE`, 21.4 `RETURNING`; then big: 21.2 CTE, 21.5 MERGE family.
 
 ### Phase 11 subphase status
 
