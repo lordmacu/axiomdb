@@ -82,6 +82,7 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         | "json_array_append" | "json_array_insert"
         | "json_array" | "json_object" | "json_merge_preserve" | "json_merge"
         | "json_contains_path" | "json_search" | "json_transform"
+        | "json_dataguide"
         | "json_insert" | "json_replace" => {
             json::eval(lower.as_str(), args, row)
         }
