@@ -80,6 +80,8 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         | "json_schema_valid" | "json_schema_validation_report"
         | "json_quote" | "json_unquote" | "json_length" | "json_storage_size"
         | "json_array_append" | "json_array_insert"
+        | "json_array" | "json_object" | "json_merge_preserve" | "json_merge"
+        | "json_contains_path"
         | "json_insert" | "json_replace" => {
             json::eval(lower.as_str(), args, row)
         }
