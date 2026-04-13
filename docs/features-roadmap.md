@@ -437,3 +437,15 @@ Cuando el core DB esté estable, extraer una fase de aquí, renumerar, mover de 
 
 ---
 
+
+## Oracle-specific JSON features (moved from Phase 11)
+
+Ni MySQL ni PostgreSQL tienen equivalente nativo. Se re-evalúan cuando haga falta compatibilidad con Oracle.
+
+### 11.23c — `CREATE JSON SCHEMA` DDL + catalog
+- [ ] Catalog storage para esquemas JSON reutilizables nombrados (`CREATE JSON SCHEMA ...` DDL + metadata) y `CHECK (JSON_SCHEMA_VALID(<schema_name>, col))` resolviendo desde el catálogo.
+- **Motivo wishlist:** Oracle 21c tiene JSON Schema como tipo catálogo; PG soporta schema validation vía extensión `pg_jsonschema` pero sin DDL nativo; MySQL no lo tiene. La función `JSON_SCHEMA_VALID(literal_schema, doc)` (11.23a-f ✅) ya cubre el uso común sin catalog persistence.
+
+### 11.24c — Dot notation para columnas JSON
+- [ ] `t.doc.a.b` como azúcar para `JSON_EXTRACT(t.doc, '$.a.b')`; requiere parser disambiguation vs schema-qualified names (`schema.table.col`).
+- **Motivo wishlist:** Oracle-specific (Oracle 12c+ / 21c). MySQL usa `t.doc->'$.a.b'` y `t.doc->>'$.a.b'`; PostgreSQL usa `t.doc->'a'->'b'` y `t.doc->>'a'->>'b'`. Ambos syntaxes ya están implementados en 11.16 / 11.18a. El azúcar dot-notation no agrega capacidad funcional.
