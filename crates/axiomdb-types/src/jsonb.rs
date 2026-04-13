@@ -991,6 +991,20 @@ pub fn gin_extract_terms(data: &[u8]) -> Result<Vec<Vec<u8>>, DbError> {
     Ok(terms)
 }
 
+/// Encode a single "key" term for the PG `?` / `?|` / `?&` operators.
+///
+/// The term layout is identical to the one used by `gin_collect` for object
+/// keys and string array elements (`[GIN_FLAG_KEY][utf8]`), so `WHERE col ?
+/// 'x'` can probe the existing GIN index created for `@>` without a separate
+/// term kind. Mirrors PG `make_text_key(JGINFLAG_KEY, ...)` in
+/// `jsonb_gin.c:874`.
+pub fn gin_key_term(key: &str) -> Vec<u8> {
+    let mut term = Vec::with_capacity(1 + key.len());
+    term.push(GIN_FLAG_KEY);
+    term.extend_from_slice(key.as_bytes());
+    term
+}
+
 /// Extract GIN terms directly from a JSON text string (without binary encoding).
 ///
 /// Convenience wrapper for planner-time extraction from JSON literal values.
@@ -1061,11 +1075,19 @@ mod gin_tests {
         let blob = enc_obj(serde_json::json!({"name": "Alice", "age": 30}));
         let terms = gin_extract_terms(&blob).unwrap();
         // keys: "name", "age"
-        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_KEY], b"name" as &[u8]].concat()));
-        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_KEY], b"age" as &[u8]].concat()));
+        assert!(terms
+            .iter()
+            .any(|t| t == &[&[GIN_FLAG_KEY], b"name" as &[u8]].concat()));
+        assert!(terms
+            .iter()
+            .any(|t| t == &[&[GIN_FLAG_KEY], b"age" as &[u8]].concat()));
         // values: "Alice" (STR), 30 (NUM)
-        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_STR], b"Alice" as &[u8]].concat()));
-        assert!(terms.iter().any(|t| t[0] == GIN_FLAG_NUM && &t[1..] == b"30"));
+        assert!(terms
+            .iter()
+            .any(|t| t == &[&[GIN_FLAG_STR], b"Alice" as &[u8]].concat()));
+        assert!(terms
+            .iter()
+            .any(|t| t[0] == GIN_FLAG_NUM && &t[1..] == b"30"));
     }
 
     #[test]
@@ -1073,8 +1095,12 @@ mod gin_tests {
         let blob = enc_obj(serde_json::json!(["a", "b", "c"]));
         let terms = gin_extract_terms(&blob).unwrap();
         // String array elements → KEY flag
-        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_KEY], b"a" as &[u8]].concat()));
-        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_KEY], b"b" as &[u8]].concat()));
+        assert!(terms
+            .iter()
+            .any(|t| t == &[&[GIN_FLAG_KEY], b"a" as &[u8]].concat()));
+        assert!(terms
+            .iter()
+            .any(|t| t == &[&[GIN_FLAG_KEY], b"b" as &[u8]].concat()));
     }
 
     #[test]
@@ -1090,8 +1116,14 @@ mod gin_tests {
         let blob = enc_obj(serde_json::json!({"user": {"role": "admin"}}));
         let terms = gin_extract_terms(&blob).unwrap();
         // Both "user" key and inner "role" key + "admin" value
-        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_KEY], b"user" as &[u8]].concat()));
-        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_KEY], b"role" as &[u8]].concat()));
-        assert!(terms.iter().any(|t| t == &[&[GIN_FLAG_STR], b"admin" as &[u8]].concat()));
+        assert!(terms
+            .iter()
+            .any(|t| t == &[&[GIN_FLAG_KEY], b"user" as &[u8]].concat()));
+        assert!(terms
+            .iter()
+            .any(|t| t == &[&[GIN_FLAG_KEY], b"role" as &[u8]].concat()));
+        assert!(terms
+            .iter()
+            .any(|t| t == &[&[GIN_FLAG_STR], b"admin" as &[u8]].concat()));
     }
 }

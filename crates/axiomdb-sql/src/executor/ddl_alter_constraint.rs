@@ -534,6 +534,8 @@ fn expr_to_sql_string(expr: &Expr) -> String {
                 BinaryOp::Regexp => "REGEXP",
                 BinaryOp::JsonSub => "->",
                 BinaryOp::JsonContains => "@>",
+                BinaryOp::JsonContainedBy => "<@",
+                BinaryOp::JsonExists => "?",
             };
             format!(
                 "({} {op_str} {})",

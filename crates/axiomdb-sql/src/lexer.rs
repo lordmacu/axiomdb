@@ -567,6 +567,11 @@ pub enum Token<'src> {
     /// `@>` — JSONB containment operator (Phase 11.17). MUST appear before `@`.
     #[token("@>")]
     JsonContains,
+    /// `<@` — JSONB contained-by operator (Phase 11.18a, PG parity).
+    /// Reverse of `@>`. Token appears near `@>` so the DFA prefers this
+    /// longer match when the input begins with `<`.
+    #[token("<@")]
+    JsonContainedBy,
     /// `@` — MySQL user-variable prefix.
     #[token("@")]
     At,

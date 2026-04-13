@@ -320,6 +320,38 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
         }
 
+        // ── Phase 11.18a: JSONB operator aliases for cross-engine SQL ───────
+        //
+        // `JSONB_EXISTS(doc, key)` ≡ `doc ? key`
+        // `JSONB_CONTAINED(a, b)` ≡ `a <@ b`
+        // `JSONB_CONCAT(a, b)` ≡ `a || b`
+        // `JSONB_DELETE_KEY(doc, key)` ≡ `doc - 'key'`
+        // `JSONB_DELETE_INDEX(doc, idx)` ≡ `doc - idx`
+        "jsonb_exists" => {
+            expect_arg_count(name, args, 2)?;
+            let left = eval_arg(args, 0, row, name)?;
+            let right = eval_arg(args, 1, row, name)?;
+            crate::eval::eval_binary(crate::expr::BinaryOp::JsonExists, left, right)
+        }
+        "jsonb_contained" => {
+            expect_arg_count(name, args, 2)?;
+            let left = eval_arg(args, 0, row, name)?;
+            let right = eval_arg(args, 1, row, name)?;
+            crate::eval::eval_binary(crate::expr::BinaryOp::JsonContainedBy, left, right)
+        }
+        "jsonb_concat" => {
+            expect_arg_count(name, args, 2)?;
+            let left = eval_arg(args, 0, row, name)?;
+            let right = eval_arg(args, 1, row, name)?;
+            crate::eval::eval_binary(crate::expr::BinaryOp::Concat, left, right)
+        }
+        "jsonb_delete_key" | "jsonb_delete_index" => {
+            expect_arg_count(name, args, 2)?;
+            let left = eval_arg(args, 0, row, name)?;
+            let right = eval_arg(args, 1, row, name)?;
+            crate::eval::eval_binary(crate::expr::BinaryOp::Sub, left, right)
+        }
+
         _ => unreachable!("dispatcher routed unsupported JSON function"),
     }
 }
