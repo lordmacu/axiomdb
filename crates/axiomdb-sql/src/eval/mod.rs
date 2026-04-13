@@ -30,5 +30,5 @@ pub(crate) use context::current_eval_collation;
 pub use context::{ClosureRunner, CollationGuard, NoSubquery, SubqueryRunner};
 pub(crate) use core::InSubquerySet;
 pub use core::{eval, eval_in_session, eval_with, eval_with_in_session};
-pub(crate) use ops::compare_values;
+pub(crate) use ops::{compare_values, eval_binary};
 pub use ops::{is_truthy, like_match};

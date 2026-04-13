@@ -167,20 +167,45 @@ pub fn plan_select(
 
 // ── Rule G helper: GIN scan planner ──────────────────────────────────────────
 
-/// Detects `col @> literal` and returns `AccessMethod::GinScan` when a GIN index
-/// (index_type == 4) exists on `col` and the literal yields at least one term.
+/// Detects JSONB predicates that a `jsonb_ops` GIN index can accelerate:
+///
+/// - `col @>  <jsonb_literal>` (Phase 11.17 — containment)
+/// - `col ?   <text_literal>`  (Phase 11.18a — key/array-string exists)
+///
+/// Returns `AccessMethod::GinScan` with the probe terms when a GIN index
+/// whose first column matches `col` exists. The executor always runs the
+/// original predicate as a re-check (`recheck_required = true`) because GIN
+/// posting-list intersection alone cannot confirm structural containment or
+/// rule out dead rows.
 fn plan_gin_scan(
     expr: &Expr,
     indexes: &[IndexDef],
     columns: &[ColumnDef],
 ) -> Option<AccessMethod> {
-    let (col_name, literal) = match expr {
+    enum GinProbe {
+        Contains,
+        Exists,
+    }
+
+    let (probe, col_name, literal) = match expr {
         Expr::BinaryOp {
             op: BinaryOp::JsonContains,
             left,
             right,
         } => match (left.as_ref(), right.as_ref()) {
-            (Expr::Column { name, .. }, Expr::Literal(v)) => (name.as_str(), v),
+            (Expr::Column { name, .. }, Expr::Literal(v)) => {
+                (GinProbe::Contains, name.as_str(), v)
+            }
+            _ => return None,
+        },
+        Expr::BinaryOp {
+            op: BinaryOp::JsonExists,
+            left,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Column { name, .. }, Expr::Literal(v)) => {
+                (GinProbe::Exists, name.as_str(), v)
+            }
             _ => return None,
         },
         _ => return None,
@@ -197,13 +222,20 @@ fn plan_gin_scan(
     })?;
 
     // Extract query terms from the literal value at plan time.
-    // SQL text literals ('{"a":1}') are treated as JSON; Jsonb is pre-encoded binary.
-    let query_terms = match literal {
-        Value::Jsonb(b) => axiomdb_types::jsonb::gin_extract_terms(b.as_slice()).ok()?,
-        Value::Json(s) | Value::Text(s) => {
-            axiomdb_types::jsonb::gin_extract_terms_from_str(s).ok()?
-        }
-        _ => return None,
+    let query_terms = match probe {
+        GinProbe::Contains => match literal {
+            // SQL text literals ('{"a":1}') are treated as JSON; Jsonb is
+            // pre-encoded binary.
+            Value::Jsonb(b) => axiomdb_types::jsonb::gin_extract_terms(b.as_slice()).ok()?,
+            Value::Json(s) | Value::Text(s) => {
+                axiomdb_types::jsonb::gin_extract_terms_from_str(s).ok()?
+            }
+            _ => return None,
+        },
+        GinProbe::Exists => match literal {
+            Value::Text(s) | Value::Json(s) => vec![axiomdb_types::jsonb::gin_key_term(s)],
+            _ => return None,
+        },
     };
 
     // An empty query (`col @> '{}'`) is always true — no index help possible.
@@ -493,10 +525,12 @@ fn coerce_literal_to_col_type(value: Value, col_name: &str, columns: &[ColumnDef
         ColumnType::Int => DataType::Int,
         ColumnType::BigInt => DataType::BigInt,
         ColumnType::Float => DataType::Real,
+        ColumnType::Decimal => DataType::Decimal,
         ColumnType::Text => DataType::Text,
         ColumnType::Json => DataType::Json,
         ColumnType::Jsonb => DataType::Jsonb,
         ColumnType::Bytes => DataType::Bytes,
+        ColumnType::Date => DataType::Date,
         ColumnType::Timestamp => DataType::Timestamp,
         ColumnType::Uuid => DataType::Uuid,
     };

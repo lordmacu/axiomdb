@@ -149,7 +149,7 @@ pub(super) fn eval_xor(left: &Expr, right: &Expr, row: &[Value]) -> Result<Value
 /// Evaluates a binary op on already-evaluated operands (non-AND/OR/XOR).
 /// NULL propagates: if either operand is NULL, the result is NULL
 /// (except `<=>` which handles NULL explicitly).
-pub(super) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbError> {
+pub(crate) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbError> {
     // `<=>` (null-safe equality) must run BEFORE the NULL propagation check.
     if op == BinaryOp::NullSafe {
         let result = match (&l, &r) {
@@ -168,9 +168,15 @@ pub(super) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
         return Ok(Value::Null);
     }
     match op {
-        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
-            eval_arithmetic(op, l, r)
-        }
+        BinaryOp::Add | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => eval_arithmetic(op, l, r),
+        // `-` is polymorphic (Phase 11.18a): JSONB LHS triggers key / index
+        // deletion; otherwise it stays arithmetic subtraction.
+        BinaryOp::Sub => match (&l, &r) {
+            (Value::Jsonb(doc), Value::Text(key)) => eval_jsonb_delete_key(doc, key),
+            (Value::Jsonb(doc), Value::Int(i)) => eval_jsonb_delete_idx(doc, *i as i64),
+            (Value::Jsonb(doc), Value::BigInt(i)) => eval_jsonb_delete_idx(doc, *i),
+            _ => eval_arithmetic(BinaryOp::Sub, l, r),
+        },
         BinaryOp::IntDiv => eval_int_div(l, r),
 
         BinaryOp::Eq
@@ -180,7 +186,13 @@ pub(super) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
         | BinaryOp::Gt
         | BinaryOp::GtEq => eval_comparison(op, l, r),
 
-        BinaryOp::Concat => eval_concat(l, r),
+        // `||` is polymorphic (Phase 11.18a): JSONB on both sides → PG
+        // concat semantics; otherwise string concatenation (MySQL `||`
+        // default). NULL propagation already handled above.
+        BinaryOp::Concat => match (&l, &r) {
+            (Value::Jsonb(a), Value::Jsonb(b)) => eval_jsonb_concat(a, b),
+            _ => eval_concat(l, r),
+        },
 
         BinaryOp::BitAnd => Ok(Value::BigInt(value_to_i64_bits(&l) & value_to_i64_bits(&r))),
         BinaryOp::BitOr => Ok(Value::BigInt(value_to_i64_bits(&l) | value_to_i64_bits(&r))),
@@ -227,6 +239,14 @@ pub(super) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
         // ── JSONB containment: @> (Phase 11.17) ──────────────────────────────
         // `doc @> query` returns 1 if every key/value in query is in doc.
         BinaryOp::JsonContains => eval_json_contains(l, r),
+
+        // ── JSONB contained-by: <@ (Phase 11.18a) ───────────────────────────-
+        // Reverse of @>: delegate with swapped arguments to reuse the
+        // existing deep-containment walk.
+        BinaryOp::JsonContainedBy => eval_json_contains(r, l),
+
+        // ── JSONB key / array-string exists: ? (Phase 11.18a) ────────────────
+        BinaryOp::JsonExists => eval_jsonb_exists(l, r),
     }
 }
 
@@ -449,6 +469,12 @@ pub(crate) fn compare_values(l: &Value, r: &Value) -> Result<std::cmp::Ordering,
         (Value::Date(a), Value::Date(b)) => Ok(a.cmp(b)),
         (Value::Timestamp(a), Value::Timestamp(b)) => Ok(a.cmp(b)),
         (Value::Uuid(a), Value::Uuid(b)) => Ok(a.cmp(b)),
+        // MySQL compatibility: allow comparing DECIMAL with numeric text.
+        // Common ORM pattern: `WHERE dec_col = '123.45'`.
+        (Value::Decimal(m, s), Value::Text(t)) => text_vs_decimal_cmp(t, *m, *s),
+        (Value::Text(t), Value::Decimal(m, s)) => {
+            text_vs_decimal_cmp(t, *m, *s).map(|o| o.reverse())
+        }
         // 4.18d: implicit coercion of string literals to date/timestamp (MySQL
         // compatibility). `WHERE ts_col = '2024-01-01'` and similar patterns used
         // by every ORM must not fail with TypeMismatch.
@@ -496,6 +522,37 @@ fn text_vs_date_cmp(s: &str, days: i32) -> Result<std::cmp::Ordering, DbError> {
             expected: "date string".into(),
             got: s.to_string(),
         }),
+    }
+}
+
+/// Parses `s` as DECIMAL and compares with `(mantissa, scale)`.
+fn text_vs_decimal_cmp(s: &str, mantissa: i128, scale: u8) -> Result<std::cmp::Ordering, DbError> {
+    use axiomdb_types::{coerce, CoercionMode, DataType, Value};
+
+    let parsed = match coerce(
+        Value::Text(s.to_string()),
+        DataType::Decimal,
+        CoercionMode::Strict,
+    ) {
+        Ok(Value::Decimal(m, sc)) => (m, sc),
+        _ => {
+            return Err(DbError::TypeMismatch {
+                expected: "decimal string".into(),
+                got: s.to_string(),
+            });
+        }
+    };
+
+    let (m2, s2) = parsed;
+    if scale == s2 {
+        return Ok(mantissa.cmp(&m2));
+    }
+    if scale > s2 {
+        let factor = 10i128.pow((scale - s2) as u32);
+        Ok(mantissa.cmp(&m2.saturating_mul(factor)))
+    } else {
+        let factor = 10i128.pow((s2 - scale) as u32);
+        Ok(mantissa.saturating_mul(factor).cmp(&m2))
     }
 }
 
@@ -779,4 +836,180 @@ fn eval_json_contains(left: Value, right: Value) -> Result<Value, DbError> {
     let query_blob = to_blob(right)?;
     let result = jsonb_contains(&doc_blob, &query_blob)?;
     Ok(Value::Bool(result))
+}
+
+// ── JSONB ? / <@ / || / - helpers (Phase 11.18a) ─────────────────────────────
+//
+// All four helpers round-trip through `serde_json::Value` because the current
+// JSONB binary layout does not expose mutation primitives (Phase 11.22 will
+// add those). Decoding to serde_json and re-encoding with `JsonbEncoder` is
+// exact — no precision loss — and keeps the key-sort / JEntry-stride
+// invariants owned by the encoder, not by these helpers.
+
+/// Coerces a `Value` to a `serde_json::Value` by way of its JSONB blob.
+/// Accepts `Jsonb`, `Json`, or `Text` (the latter parsed as a JSON literal,
+/// matching the tolerant surface used by `@>` and `->`).
+fn value_to_serde_json(v: Value) -> Result<serde_json::Value, DbError> {
+    use axiomdb_types::jsonb::JsonbDecoder;
+    match v {
+        Value::Jsonb(b) => JsonbDecoder::decode(b.as_ref()),
+        Value::Json(s) | Value::Text(s) => {
+            serde_json::from_str(&s).map_err(|e| DbError::InvalidValue {
+                reason: format!("invalid JSON operand: {e}"),
+            })
+        }
+        other => Err(DbError::TypeMismatch {
+            expected: "JSON or JSONB".into(),
+            got: other.variant_name().into(),
+        }),
+    }
+}
+
+fn serde_json_to_jsonb_value(v: &serde_json::Value) -> Result<Value, DbError> {
+    use axiomdb_types::JsonbEncoder;
+    use std::sync::Arc;
+    let blob = JsonbEncoder::encode(v)?;
+    Ok(Value::Jsonb(Arc::new(blob)))
+}
+
+/// PG `?` — object key exists OR array contains the text as a string element.
+/// Every other LHS kind returns false (not error).
+fn eval_jsonb_exists(left: Value, right: Value) -> Result<Value, DbError> {
+    let key = match right {
+        Value::Text(s) | Value::Json(s) => s,
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "text key for ?".into(),
+                got: other.variant_name().into(),
+            })
+        }
+    };
+    let doc = value_to_serde_json(left)?;
+    let found = match &doc {
+        serde_json::Value::Object(map) => map.contains_key(&key),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .any(|e| matches!(e, serde_json::Value::String(s) if s == &key)),
+        _ => false,
+    };
+    Ok(Value::Bool(found))
+}
+
+/// PG `||` — concatenate two JSONB values.
+/// Rules (from `jsonfuncs.c::IteratorConcat`):
+///   object || object → shallow merge (RHS keys override)
+///   array  || array  → append
+///   object || array  → [obj, ...arr]
+///   array  || object → [...arr, obj]
+///   scalar on either side → wrap as a 1-element array and recurse
+fn eval_jsonb_concat(a: &[u8], b: &[u8]) -> Result<Value, DbError> {
+    use axiomdb_types::jsonb::JsonbDecoder;
+    let lhs = JsonbDecoder::decode(a)?;
+    let rhs = JsonbDecoder::decode(b)?;
+    let merged = jsonb_concat_serde(lhs, rhs);
+    serde_json_to_jsonb_value(&merged)
+}
+
+fn jsonb_concat_serde(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    let is_container = |v: &J| matches!(v, J::Object(_) | J::Array(_));
+    match (a, b) {
+        (J::Object(mut la), J::Object(rb)) => {
+            for (k, v) in rb {
+                la.insert(k, v);
+            }
+            J::Object(la)
+        }
+        (J::Array(mut la), J::Array(rb)) => {
+            la.extend(rb);
+            J::Array(la)
+        }
+        (obj @ J::Object(_), J::Array(mut arr)) => {
+            let mut out = Vec::with_capacity(arr.len() + 1);
+            out.push(obj);
+            out.append(&mut arr);
+            J::Array(out)
+        }
+        (J::Array(mut arr), obj @ J::Object(_)) => {
+            arr.push(obj);
+            J::Array(arr)
+        }
+        // scalar on either side (but not both sides being containers above).
+        (lhs, rhs) => {
+            let la = if is_container(&lhs) {
+                lhs
+            } else {
+                J::Array(vec![lhs])
+            };
+            let rb = if is_container(&rhs) {
+                rhs
+            } else {
+                J::Array(vec![rb_from_scalar(rhs)])
+            };
+            // `rb` has been moved; reconstruct via second pass.
+            jsonb_concat_serde(la, rb)
+        }
+    }
+}
+
+// Helper to sidestep the borrow checker in the scalar-wrap branch.
+#[inline]
+fn rb_from_scalar(v: serde_json::Value) -> serde_json::Value {
+    v
+}
+
+/// PG `-(jsonb, text)` — drop an object key or every string array element
+/// equal to the text. Scalar LHS is an error (matches `jsonfuncs.c:4673`).
+fn eval_jsonb_delete_key(doc: &[u8], key: &str) -> Result<Value, DbError> {
+    use axiomdb_types::jsonb::JsonbDecoder;
+    let v = JsonbDecoder::decode(doc)?;
+    let out = match v {
+        serde_json::Value::Object(mut map) => {
+            map.remove(key);
+            serde_json::Value::Object(map)
+        }
+        serde_json::Value::Array(arr) => {
+            let kept: Vec<_> = arr
+                .into_iter()
+                .filter(|e| !matches!(e, serde_json::Value::String(s) if s == key))
+                .collect();
+            serde_json::Value::Array(kept)
+        }
+        _ => {
+            return Err(DbError::InvalidValue {
+                reason: "cannot delete from scalar JSONB".into(),
+            })
+        }
+    };
+    serde_json_to_jsonb_value(&out)
+}
+
+/// PG `-(jsonb, int)` — drop an array element at the given index.
+/// Negative counts from end. Out-of-range is a no-op (not an error).
+/// Object LHS → error. Scalar LHS → error.
+fn eval_jsonb_delete_idx(doc: &[u8], idx: i64) -> Result<Value, DbError> {
+    use axiomdb_types::jsonb::JsonbDecoder;
+    let v = JsonbDecoder::decode(doc)?;
+    let out = match v {
+        serde_json::Value::Array(mut arr) => {
+            let n = arr.len() as i64;
+            let real = if idx < 0 { n + idx } else { idx };
+            if real >= 0 && real < n {
+                arr.remove(real as usize);
+            }
+            serde_json::Value::Array(arr)
+        }
+        serde_json::Value::Object(_) => {
+            return Err(DbError::InvalidValue {
+                reason: "cannot delete from object using integer index".into(),
+            })
+        }
+        _ => {
+            return Err(DbError::InvalidValue {
+                reason: "cannot delete from scalar JSONB".into(),
+            })
+        }
+    };
+    serde_json_to_jsonb_value(&out)
 }

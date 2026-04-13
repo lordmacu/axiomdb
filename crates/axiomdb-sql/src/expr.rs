@@ -330,6 +330,16 @@ pub enum BinaryOp {
     /// in `query` exists in `doc` (deep subset check). NULL if either operand
     /// is NULL. Evaluated by `jsonb_contains()`.
     JsonContains,
+    /// `<@` — JSONB contained-by: `query <@ doc` ≡ `doc @> query`
+    /// (Phase 11.18a, PG parity). Arguments are NOT swapped in the AST —
+    /// the eval layer delegates to `jsonb_contains(rhs, lhs)` to preserve
+    /// EXPLAIN fidelity.
+    JsonContainedBy,
+    /// `?` — JSONB key/array-string existence: `doc ? 'k'` returns true
+    /// when `doc` is an object containing key `'k'`, or an array holding
+    /// `'k'` as a string element (Phase 11.18a). Matches PG
+    /// `jsonb_exists()` semantics.
+    JsonExists,
 }
 
 // ── UnaryOp ───────────────────────────────────────────────────────────────────

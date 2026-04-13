@@ -57,7 +57,12 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         | "json_type" | "json_merge_patch" | "json_contains" | "json_overlaps"
         | "json_array_length" | "json_depth" | "json_pretty"
         | "to_jsonb" | "jsonb"
-        | "json_path_exists" | "json_path_query" | "json_path_query_first" => {
+        | "json_path_exists" | "json_path_query" | "json_path_query_first"
+        // Phase 11.18a: function-style aliases of the new operators so SQL
+        // portable across MySQL / MariaDB / DuckDB (which lack ?, <@, ||
+        // operator syntax) can still drive the same machinery.
+        | "jsonb_exists" | "jsonb_contained" | "jsonb_concat"
+        | "jsonb_delete_key" | "jsonb_delete_index" => {
             json::eval(lower.as_str(), args, row)
         }
 
