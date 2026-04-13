@@ -86,7 +86,9 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         | "json_dataguide"
         | "json_insert" | "json_replace"
         // Phase 11.25c — PG construction helpers + to_json alias.
-        | "jsonb_build_object" | "jsonb_build_array" | "to_json" => {
+        | "jsonb_build_object" | "jsonb_build_array" | "to_json"
+        // Phase 11.25d — PG + MySQL mutator/introspection completion.
+        | "jsonb_strip_nulls" | "json_storage_free" => {
             json::eval(lower.as_str(), args, row)
         }
 
