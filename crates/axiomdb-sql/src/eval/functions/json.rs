@@ -705,6 +705,136 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
         }
 
+        // ── Phase 11.25a: MySQL JSON completion bundle ───────────────────────
+        // JSON_QUOTE(text) — serialize a TEXT string as a JSON string literal.
+        "json_quote" => {
+            expect_arg_count(name, args, 1)?;
+            let v = eval_arg(args, 0, row, name)?;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let s = match v {
+                Value::Text(s) | Value::Json(s) => s,
+                other => other.to_string(),
+            };
+            Ok(Value::Json(serde_json::Value::String(s).to_string()))
+        }
+        // JSON_UNQUOTE(json) — strip outer double-quotes, decode JSON escapes.
+        // Non-string input returned unchanged (as its text form).
+        "json_unquote" => {
+            expect_arg_count(name, args, 1)?;
+            let v = eval_arg(args, 0, row, name)?;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let sj = value_to_serde_json(&v)?;
+            match sj {
+                serde_json::Value::String(s) => Ok(Value::Text(s)),
+                other => Ok(Value::Text(other.to_string())),
+            }
+        }
+        // JSON_LENGTH(json [, path]) — number of top-level elements of the doc
+        // (or at path). Object → key count, array → length, scalar → 1.
+        "json_length" => {
+            if args.len() != 1 && args.len() != 2 {
+                return Err(DbError::TypeMismatch {
+                    expected: "json_length: 1 or 2 args".into(),
+                    got: args.len().to_string(),
+                });
+            }
+            let v = eval_arg(args, 0, row, name)?;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let mut sj = value_to_serde_json(&v)?;
+            if args.len() == 2 {
+                let path = eval_path_arg(args, 1, row, name)?;
+                match extract_path(&sj, &path)? {
+                    Some(t) => sj = t.clone(),
+                    None => return Ok(Value::Null),
+                }
+            }
+            let len: i64 = match &sj {
+                serde_json::Value::Array(a) => a.len() as i64,
+                serde_json::Value::Object(o) => o.len() as i64,
+                _ => 1,
+            };
+            Ok(Value::BigInt(len))
+        }
+        // JSON_STORAGE_SIZE(json) — byte length of the JSONB encoding.
+        "json_storage_size" => {
+            expect_arg_count(name, args, 1)?;
+            let v = eval_arg(args, 0, row, name)?;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            match v {
+                Value::Jsonb(b) => Ok(Value::BigInt(b.len() as i64)),
+                other => {
+                    let sj = value_to_serde_json(&other)?;
+                    let blob = JsonbEncoder::encode(&sj)?;
+                    Ok(Value::BigInt(blob.len() as i64))
+                }
+            }
+        }
+        // JSON_ARRAY_APPEND(doc, path, val, [path, val]*) — append val to array
+        // at path; if target is non-array, it is wrapped in an array first.
+        "json_array_append" => {
+            if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
+                return Err(DbError::TypeMismatch {
+                    expected: "json_array_append: doc + path/value pairs".into(),
+                    got: args.len().to_string(),
+                });
+            }
+            let doc = eval_arg(args, 0, row, name)?;
+            if matches!(doc, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let mut sj = value_to_serde_json(&doc)?;
+            let pair_count = (args.len() - 1) / 2;
+            for i in 0..pair_count {
+                let p = eval_arg(args, 1 + 2 * i, row, name)?;
+                let val = eval_arg(args, 2 + 2 * i, row, name)?;
+                let parts = parse_mutation_path(&p)?;
+                json_array_append_at(&mut sj, &parts, sql_to_serde_json(&val));
+            }
+            Ok(Value::Json(sj.to_string()))
+        }
+        // JSON_ARRAY_INSERT(doc, path, val, [path, val]*) — path must end with
+        // [idx]; insert val at that position, shifting the rest right.
+        "json_array_insert" => {
+            if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
+                return Err(DbError::TypeMismatch {
+                    expected: "json_array_insert: doc + path/value pairs".into(),
+                    got: args.len().to_string(),
+                });
+            }
+            let doc = eval_arg(args, 0, row, name)?;
+            if matches!(doc, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let mut sj = value_to_serde_json(&doc)?;
+            let pair_count = (args.len() - 1) / 2;
+            for i in 0..pair_count {
+                let p = eval_arg(args, 1 + 2 * i, row, name)?;
+                let val = eval_arg(args, 2 + 2 * i, row, name)?;
+                let parts = parse_mutation_path(&p)?;
+                if parts.is_empty() {
+                    return Err(DbError::InvalidValue {
+                        reason: "json_array_insert: path must end with [idx]".into(),
+                    });
+                }
+                let (last, parents) = parts.split_last().unwrap();
+                let idx: usize = last.parse().map_err(|_| DbError::InvalidValue {
+                    reason: format!(
+                        "json_array_insert: final path segment must be array index, got `{last}`"
+                    ),
+                })?;
+                json_array_insert_at(&mut sj, parents, idx, sql_to_serde_json(&val));
+            }
+            Ok(Value::Json(sj.to_string()))
+        }
+
         // ── Phase 11.23a: JSON Schema Draft-07 subset validator ──────────────
         // JSON_SCHEMA_VALID(schema, doc) → bool. NULL on either side → NULL.
         "json_schema_valid" => {
@@ -2479,5 +2609,53 @@ fn schema_type_single(name: &str, doc: &serde_json::Value) -> bool {
         "array" => doc.is_array(),
         "object" => doc.is_object(),
         _ => false,
+    }
+}
+
+// ── Phase 11.25a helpers: MySQL JSON_ARRAY_APPEND / INSERT ───────────────────
+
+fn descend_mut<'a>(
+    root: &'a mut serde_json::Value,
+    parts: &[String],
+) -> Option<&'a mut serde_json::Value> {
+    let mut cur = root;
+    for p in parts {
+        cur = match cur {
+            serde_json::Value::Object(m) => m.get_mut(p)?,
+            serde_json::Value::Array(a) => {
+                let idx: usize = p.parse().ok()?;
+                a.get_mut(idx)?
+            }
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+fn json_array_append_at(root: &mut serde_json::Value, parts: &[String], val: serde_json::Value) {
+    let Some(target) = descend_mut(root, parts) else {
+        return;
+    };
+    match target {
+        serde_json::Value::Array(a) => a.push(val),
+        other => {
+            let taken = std::mem::replace(other, serde_json::Value::Null);
+            *other = serde_json::Value::Array(vec![taken, val]);
+        }
+    }
+}
+
+fn json_array_insert_at(
+    root: &mut serde_json::Value,
+    parent_parts: &[String],
+    idx: usize,
+    val: serde_json::Value,
+) {
+    let Some(target) = descend_mut(root, parent_parts) else {
+        return;
+    };
+    if let serde_json::Value::Array(a) = target {
+        let at = idx.min(a.len());
+        a.insert(at, val);
     }
 }
