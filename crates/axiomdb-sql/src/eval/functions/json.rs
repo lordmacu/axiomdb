@@ -705,6 +705,40 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
         }
 
+        // ── Phase 11.24a: Oracle JSON surface ────────────────────────────────
+        // JSON_EQUAL(a, b) — deep structural equality. NULL if either is NULL.
+        "json_equal" => {
+            expect_arg_count(name, args, 2)?;
+            let a = eval_arg(args, 0, row, name)?;
+            let b = eval_arg(args, 1, row, name)?;
+            if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let sa = value_to_serde_json(&a)?;
+            let sb = value_to_serde_json(&b)?;
+            Ok(Value::Bool(sa == sb))
+        }
+        // JSON_SCALAR(v) — wrap a SQL scalar in a JSONB scalar value.
+        "json_scalar" => {
+            expect_arg_count(name, args, 1)?;
+            let v = eval_arg(args, 0, row, name)?;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let sj = sql_to_serde_json(&v);
+            jsonb_blob_from_serde(&sj)
+        }
+        // JSON_SERIALIZE(jsonb) — render JSONB/JSON as canonical TEXT.
+        "json_serialize" => {
+            expect_arg_count(name, args, 1)?;
+            let v = eval_arg(args, 0, row, name)?;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let sj = value_to_serde_json(&v)?;
+            Ok(Value::Text(sj.to_string()))
+        }
+
         _ => unreachable!("dispatcher routed unsupported JSON function"),
     }
 }
