@@ -25,37 +25,51 @@ use axiomdb_types::{
 };
 
 use crate::ast::{self, JsonTable, JsonTableColumn};
+use crate::eval::functions::{execute_jsonpath_owned_env, parse_jsonpath, PassingEnv, PathStep};
 use crate::eval::{eval_with, SubqueryRunner};
-use crate::expr::SqlJsonOnBehavior;
+use crate::expr::{Expr, SqlJsonOnBehavior, SqlJsonQuotes, SqlJsonWrapper};
 
 // ── Lowered form ─────────────────────────────────────────────────────────────
 
 /// Compiled JSON_TABLE: every JSONPath string is parsed once here, so each
 /// materialization just walks.
+///
+/// Phase 11.20d1 migrated path storage from the legacy restricted walker
+/// to `eval::functions::json::PathStep` so that filters, `.size()` /
+/// `.type()` accessors, and PASSING `$var` references all work uniformly.
 #[derive(Debug, Clone)]
 pub struct JsonTableSpec {
     pub alias: String,
-    pub row_path: Vec<PathStepOwned>,
+    pub(crate) row_path: Vec<PathStep>,
     pub columns: Vec<JsonTableColumnSpec>,
     /// Total number of slots in each emitted row (sum of leaf columns across
     /// every level of NESTED PATH). Leaves count 1 each; `Nested` columns
     /// expand into their children's slot range.
     pub total_slots: usize,
+    /// PASSING bindings (Phase 11.20d1). Expressions are evaluated once
+    /// per JSON_TABLE invocation before any path walking. The resolved
+    /// values feed a `PassingEnv` shared by the row path, every column
+    /// path, and every NESTED path at any depth.
+    pub passing: Vec<(Expr, String)>,
 }
 
 #[derive(Debug, Clone)]
 pub struct JsonTableColumnSpec {
     pub name: String,
     pub ty: DataType,
-    pub kind: JsonTableColumnKind,
+    pub(crate) kind: JsonTableColumnKind,
 }
 
 #[derive(Debug, Clone)]
-pub enum JsonTableColumnKind {
+pub(crate) enum JsonTableColumnKind {
     Regular {
         /// Slot index in the emitted row.
         slot: usize,
-        path: Vec<PathStepOwned>,
+        path: Vec<PathStep>,
+        /// Phase 11.20d1 — default `Without`.
+        wrapper: SqlJsonWrapper,
+        /// Phase 11.20d1 — default `Keep`.
+        quotes: SqlJsonQuotes,
         on_empty: SqlJsonOnBehavior,
         on_error: SqlJsonOnBehavior,
     },
@@ -64,48 +78,50 @@ pub enum JsonTableColumnKind {
     },
     Exists {
         slot: usize,
-        path: Vec<PathStepOwned>,
+        path: Vec<PathStep>,
         on_error: SqlJsonOnBehavior,
     },
     /// Phase 11.20b — a single-level `NESTED PATH ... COLUMNS(...)` subtree.
-    /// 11.20b rejects multi-sibling + multi-level NESTED at compile time;
-    /// `children` therefore contains only `Regular`, `Ordinality`, and
-    /// `Exists` variants. Slot range `[start, end)` is a contiguous span
-    /// inside the emitted row's flat slot vector.
+    /// 11.20c lifted the depth and multi-sibling restrictions; `children`
+    /// now contains any `JsonTableColumnSpec`, including further `Nested`.
+    /// Slot range `[start, end)` is a contiguous span inside the emitted
+    /// row's flat slot vector.
     Nested {
-        path: Vec<PathStepOwned>,
+        path: Vec<PathStep>,
         children: Vec<JsonTableColumnSpec>,
+        /// `[start, end)` slot range occupied by this subtree; retained for
+        /// debug/EXPLAIN output and future LATERAL-pruning work (11.20d3).
+        #[allow(dead_code)]
         slot_range: (usize, usize),
     },
-}
-
-/// Owned snapshot of a compiled JSONPath step (independent of the rich
-/// `PathStep` enum in `eval::functions::json`, which contains `Expr` and
-/// is not trivially `Clone` outside that module).
-///
-/// We restrict JSON_TABLE paths to a subset: `$`, `.key`, `[idx]`, `[*]`,
-/// `.*`, `..key` recursive descent. No filter expressions.
-#[derive(Debug, Clone)]
-pub enum PathStepOwned {
-    Root,
-    Key(String),
-    Index(usize),
-    WildcardKey,
-    WildcardIndex,
-    Recursive,
 }
 
 // ── Compile ──────────────────────────────────────────────────────────────────
 
 pub fn compile_json_table(jt: &JsonTable) -> Result<JsonTableSpec, DbError> {
-    let row_path = parse_restricted_path(&jt.row_path)?;
+    let row_path = parse_jsonpath(&jt.row_path)?;
 
     // Enforce: unique column names across every level.
     let mut seen = std::collections::HashSet::new();
     collect_names_recursive(&jt.columns, &mut seen)?;
 
-    // Depth-first slot assignment; enforces depth ≤ 1 and single NESTED
-    // sibling per list (11.20b constraints; 11.20c lifts both).
+    // Enforce: unique PASSING variable names (case-insensitive). The
+    // parser also checks this, but analyzer passes could theoretically
+    // synthesize duplicates — defense in depth.
+    {
+        let mut seen_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_, name) in &jt.passing {
+            if !seen_vars.insert(name.to_ascii_lowercase()) {
+                return Err(DbError::ParseError {
+                    message: format!("JSON_TABLE: duplicate PASSING variable `{name}`"),
+                    position: None,
+                });
+            }
+        }
+    }
+
+    // Depth-first slot assignment. Phase 11.20c supports arbitrary NESTED
+    // depth and multi-sibling; a defensive depth ≤ 32 guard remains.
     let mut next_slot = 0usize;
     let columns = compile_columns_recursive(&jt.columns, &mut next_slot, 0)?;
 
@@ -115,6 +131,7 @@ pub fn compile_json_table(jt: &JsonTable) -> Result<JsonTableSpec, DbError> {
         row_path,
         columns,
         total_slots: next_slot,
+        passing: jt.passing.clone(),
     })
 }
 
@@ -179,6 +196,8 @@ fn compile_columns_recursive(
                 name,
                 ty,
                 path,
+                wrapper,
+                quotes,
                 on_empty,
                 on_error,
             } => {
@@ -189,7 +208,9 @@ fn compile_columns_recursive(
                     ty: *ty,
                     kind: JsonTableColumnKind::Regular {
                         slot,
-                        path: parse_restricted_path(path)?,
+                        path: parse_jsonpath(path)?,
+                        wrapper: *wrapper,
+                        quotes: *quotes,
                         on_empty: on_empty.clone(),
                         on_error: on_error.clone(),
                     },
@@ -217,7 +238,7 @@ fn compile_columns_recursive(
                     ty: *ty,
                     kind: JsonTableColumnKind::Exists {
                         slot,
-                        path: parse_restricted_path(path)?,
+                        path: parse_jsonpath(path)?,
                         on_error: on_error.clone(),
                     },
                 });
@@ -232,7 +253,7 @@ fn compile_columns_recursive(
                     name: String::new(),
                     ty: DataType::BigInt,
                     kind: JsonTableColumnKind::Nested {
-                        path: parse_restricted_path(path)?,
+                        path: parse_jsonpath(path)?,
                         children,
                         slot_range: (start, end),
                     },
@@ -373,7 +394,17 @@ pub fn materialize_json_table<R: SubqueryRunner>(
     outer_row: &[Value],
     sq: &mut R,
 ) -> Result<Vec<Vec<Value>>, DbError> {
-    let parent_matches = walk_path_owned(doc, &spec.row_path);
+    // Phase 11.20d1 — evaluate PASSING bindings once per invocation.
+    // Correlation (doc or PASSING referencing outer columns) is deferred to
+    // Phase 11.20d3; this subphase evaluates bindings against the current
+    // `outer_row` (which is `&[]` when JSON_TABLE is the first FROM entry).
+    let mut env = PassingEnv::new();
+    for (expr, name) in &spec.passing {
+        let v = eval_with(expr, outer_row, sq)?;
+        env.insert(name.clone(), value_to_serde_for_env(&v)?);
+    }
+
+    let parent_matches = execute_jsonpath_owned_env(doc, &spec.row_path, &env);
     let mut rows: Vec<Vec<Value>> = Vec::new();
 
     for (i, parent) in parent_matches.iter().enumerate() {
@@ -390,10 +421,38 @@ pub fn materialize_json_table<R: SubqueryRunner>(
             ord,
             outer_row,
             sq,
+            &env,
             &mut rows,
         )?;
     }
     Ok(rows)
+}
+
+/// Render a SQL `Value` as a `serde_json::Value` for use as a PASSING
+/// variable binding. Keeps scalar JSON types native, encodes JSONB by
+/// decoding its binary form, and falls back to string representations for
+/// temporal / UUID / bytes. Used only by the JSON_TABLE env builder.
+fn value_to_serde_for_env(v: &Value) -> Result<serde_json::Value, DbError> {
+    match v {
+        Value::Null => Ok(serde_json::Value::Null),
+        Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+        Value::Int(i) => Ok(serde_json::json!(*i)),
+        Value::BigInt(i) => Ok(serde_json::json!(*i)),
+        Value::Real(f) => Ok(serde_json::json!(*f)),
+        Value::Text(s) => Ok(serde_json::Value::String(s.clone())),
+        Value::Json(s) => serde_json::from_str(s).map_err(|e| DbError::InvalidCoercion {
+            from: "JSON".into(),
+            to: "PASSING var".into(),
+            value: truncate_for_error(s),
+            reason: format!("invalid JSON in PASSING binding: {e}"),
+        }),
+        Value::Jsonb(b) => Ok(JsonbDecoder::decode(b.as_ref())?),
+        other => {
+            // Timestamp / Date / Uuid / Bytes / Decimal → render as string,
+            // the same shape a user would see via the MySQL wire.
+            Ok(serde_json::Value::String(format!("{other:?}")))
+        }
+    }
 }
 
 /// Phase 11.20c — recursive row emitter supporting arbitrary NESTED depth
@@ -408,6 +467,7 @@ pub fn materialize_json_table<R: SubqueryRunner>(
 ///    walks its child path and produces `max(1, |child_matches|)` rows,
 ///    cloning the template per row so the other siblings' ranges stay
 ///    `NULL` (LEFT-OUTER pad).
+#[allow(clippy::too_many_arguments)]
 fn emit_rows_rec<R: SubqueryRunner>(
     cols: &[JsonTableColumnSpec],
     node: &serde_json::Value,
@@ -415,6 +475,7 @@ fn emit_rows_rec<R: SubqueryRunner>(
     level_ord: i64,
     outer_row: &[Value],
     sq: &mut R,
+    env: &PassingEnv,
     rows: &mut Vec<Vec<Value>>,
 ) -> Result<(), DbError> {
     // Pass 1 — fill this level's leaf columns in place.
@@ -426,18 +487,22 @@ fn emit_rows_rec<R: SubqueryRunner>(
             JsonTableColumnKind::Regular {
                 slot,
                 path,
+                wrapper,
+                quotes,
                 on_empty,
                 on_error,
             } => {
-                template[*slot] =
-                    materialize_regular(node, path, col.ty, on_empty, on_error, outer_row, sq)?;
+                template[*slot] = materialize_regular(
+                    node, path, col.ty, *wrapper, *quotes, on_empty, on_error, outer_row, sq, env,
+                )?;
             }
             JsonTableColumnKind::Exists {
                 slot,
                 path,
                 on_error,
             } => {
-                template[*slot] = materialize_exists(node, path, col.ty, on_error, outer_row, sq)?;
+                template[*slot] =
+                    materialize_exists(node, path, col.ty, on_error, outer_row, sq, env)?;
             }
             JsonTableColumnKind::Nested { .. } => {
                 // Handled in pass 2.
@@ -463,7 +528,7 @@ fn emit_rows_rec<R: SubqueryRunner>(
             JsonTableColumnKind::Nested { path, children, .. } => (path, children),
             _ => unreachable!("filtered to Nested above"),
         };
-        let child_matches = walk_path_owned(node, path);
+        let child_matches = execute_jsonpath_owned_env(node, path, env);
         if child_matches.is_empty() {
             // LEFT-OUTER pad for this sibling. Clone so other siblings see
             // the same parent template on the next iteration.
@@ -478,6 +543,7 @@ fn emit_rows_rec<R: SubqueryRunner>(
                     child_ord,
                     outer_row,
                     sq,
+                    env,
                     rows,
                 )?;
             }
@@ -486,41 +552,69 @@ fn emit_rows_rec<R: SubqueryRunner>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn materialize_regular<R: SubqueryRunner>(
     parent: &serde_json::Value,
-    path: &[PathStepOwned],
+    path: &[PathStep],
     ty: DataType,
+    wrapper: SqlJsonWrapper,
+    quotes: SqlJsonQuotes,
     on_empty: &SqlJsonOnBehavior,
     on_error: &SqlJsonOnBehavior,
     outer_row: &[Value],
     sq: &mut R,
+    env: &PassingEnv,
 ) -> Result<Value, DbError> {
-    let hits = walk_path_owned(parent, path);
-    match hits.len() {
-        0 => apply_on_behavior(on_empty, ty, outer_row, sq),
-        1 => {
-            let sj = &hits[0];
-            match serde_to_value_typed(sj, ty) {
-                Ok(v) => Ok(v),
-                Err(_) => apply_on_behavior(on_error, ty, outer_row, sq),
+    let hits = execute_jsonpath_owned_env(parent, path, env);
+    if hits.is_empty() {
+        return apply_on_behavior(on_empty, ty, outer_row, sq);
+    }
+    // Phase 11.20d1 — apply WRAPPER before coercion:
+    //   WITHOUT           → single hit: pass-through; multi-hit: ON ERROR.
+    //   UNCONDITIONAL     → always wrap as JSON array.
+    //   CONDITIONAL       → single array hit: unwrap; otherwise wrap.
+    let wrapped: serde_json::Value = match wrapper {
+        SqlJsonWrapper::Without => {
+            if hits.len() == 1 {
+                hits.into_iter().next().unwrap()
+            } else {
+                return apply_on_behavior(on_error, ty, outer_row, sq);
             }
         }
-        _ => apply_on_behavior(on_error, ty, outer_row, sq),
+        SqlJsonWrapper::Unconditional => serde_json::Value::Array(hits),
+        SqlJsonWrapper::Conditional => {
+            if hits.len() == 1 && hits[0].is_array() {
+                hits.into_iter().next().unwrap()
+            } else {
+                serde_json::Value::Array(hits)
+            }
+        }
+    };
+    // Phase 11.20d1 — OMIT QUOTES on a TEXT-returning column strips the
+    // JSON double-quote pair around a string scalar. Parser already
+    // enforces OMIT is only allowed on TEXT.
+    if matches!(quotes, SqlJsonQuotes::Omit) && matches!(ty, DataType::Text) {
+        if let serde_json::Value::String(s) = &wrapped {
+            return Ok(Value::Text(s.clone()));
+        }
+    }
+    match serde_to_value_typed(&wrapped, ty) {
+        Ok(v) => Ok(v),
+        Err(_) => apply_on_behavior(on_error, ty, outer_row, sq),
     }
 }
 
 fn materialize_exists<R: SubqueryRunner>(
     parent: &serde_json::Value,
-    path: &[PathStepOwned],
+    path: &[PathStep],
     ty: DataType,
     on_error: &SqlJsonOnBehavior,
     outer_row: &[Value],
     sq: &mut R,
+    env: &PassingEnv,
 ) -> Result<Value, DbError> {
-    // walk_path_owned never errors in this subset; we keep the on_error plumbing
-    // to stay grammar-compatible with PG and to accommodate future richer paths.
-    let _ = on_error; // currently unused — kept for future error-producing paths
-    let hits = walk_path_owned(parent, path);
+    let _ = on_error; // the full engine does not surface strict-mode errors here
+    let hits = execute_jsonpath_owned_env(parent, path, env);
     let b = !hits.is_empty();
     let base = Value::Bool(b);
     if ty == DataType::Bool {
@@ -589,218 +683,6 @@ fn serde_to_value_typed(sj: &serde_json::Value, ty: DataType) -> Result<Value, D
         }
     };
     coerce(base, ty, CoercionMode::Strict)
-}
-
-// ── Path parsing & walking (flat subset) ────────────────────────────────────
-
-/// Parse `$`, `$.key`, `$.key[0]`, `$[*]`, `$.*`, `$..key` into a step list.
-/// Deliberately strict — no filter expressions or `.size()`/`.type()` etc.
-fn parse_restricted_path(s: &str) -> Result<Vec<PathStepOwned>, DbError> {
-    let trimmed = s.trim();
-    if !trimmed.starts_with('$') {
-        return Err(DbError::ParseError {
-            message: format!("JSON_TABLE path must start with `$`: {trimmed:?}"),
-            position: None,
-        });
-    }
-    let mut steps = vec![PathStepOwned::Root];
-    let bytes = trimmed.as_bytes();
-    let mut i = 1usize;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if c == b'.' {
-            i += 1;
-            // `..key` recursive descent
-            if i < bytes.len() && bytes[i] == b'.' {
-                i += 1;
-                let (key, j) = parse_ident(bytes, i)?;
-                steps.push(PathStepOwned::Recursive);
-                steps.push(PathStepOwned::Key(key));
-                i = j;
-                continue;
-            }
-            // `.*` wildcard key
-            if i < bytes.len() && bytes[i] == b'*' {
-                steps.push(PathStepOwned::WildcardKey);
-                i += 1;
-                continue;
-            }
-            let (key, j) = parse_ident(bytes, i)?;
-            steps.push(PathStepOwned::Key(key));
-            i = j;
-        } else if c == b'[' {
-            i += 1;
-            if i < bytes.len() && bytes[i] == b'*' {
-                if i + 1 >= bytes.len() || bytes[i + 1] != b']' {
-                    return Err(DbError::ParseError {
-                        message: format!("JSON_TABLE path: unterminated [*] in {trimmed:?}"),
-                        position: None,
-                    });
-                }
-                steps.push(PathStepOwned::WildcardIndex);
-                i += 2;
-                continue;
-            }
-            let start = i;
-            while i < bytes.len() && bytes[i] != b']' {
-                i += 1;
-            }
-            if i >= bytes.len() {
-                return Err(DbError::ParseError {
-                    message: format!("JSON_TABLE path: unterminated `[` in {trimmed:?}"),
-                    position: None,
-                });
-            }
-            let idx_str =
-                std::str::from_utf8(&bytes[start..i]).map_err(|_| DbError::ParseError {
-                    message: format!("JSON_TABLE path: non-utf8 index in {trimmed:?}"),
-                    position: None,
-                })?;
-            let idx: usize = idx_str.trim().parse().map_err(|_| DbError::ParseError {
-                message: format!("JSON_TABLE path: invalid array index `{idx_str}`"),
-                position: None,
-            })?;
-            steps.push(PathStepOwned::Index(idx));
-            i += 1; // consume ']'
-        } else {
-            return Err(DbError::ParseError {
-                message: format!(
-                    "JSON_TABLE path: unexpected character `{}` at position {i} of {trimmed:?}",
-                    c as char
-                ),
-                position: None,
-            });
-        }
-    }
-    Ok(steps)
-}
-
-fn parse_ident(bytes: &[u8], start: usize) -> Result<(String, usize), DbError> {
-    let mut j = start;
-    // Support `"quoted key"`.
-    if j < bytes.len() && bytes[j] == b'"' {
-        j += 1;
-        let from = j;
-        while j < bytes.len() && bytes[j] != b'"' {
-            j += 1;
-        }
-        if j >= bytes.len() {
-            return Err(DbError::ParseError {
-                message: "JSON_TABLE path: unterminated quoted key".into(),
-                position: None,
-            });
-        }
-        let s = String::from_utf8_lossy(&bytes[from..j]).into_owned();
-        Ok((s, j + 1))
-    } else {
-        let from = j;
-        while j < bytes.len() {
-            let c = bytes[j];
-            if c == b'.' || c == b'[' || c == b' ' {
-                break;
-            }
-            j += 1;
-        }
-        if from == j {
-            return Err(DbError::ParseError {
-                message: "JSON_TABLE path: expected key after `.`".into(),
-                position: None,
-            });
-        }
-        let s = String::from_utf8_lossy(&bytes[from..j]).into_owned();
-        Ok((s, j))
-    }
-}
-
-fn walk_path_owned(root: &serde_json::Value, steps: &[PathStepOwned]) -> Vec<serde_json::Value> {
-    let mut current: Vec<serde_json::Value> = vec![root.clone()];
-    for step in steps {
-        let next = match step {
-            PathStepOwned::Root => continue,
-            PathStepOwned::Key(k) => step_key(&current, k),
-            PathStepOwned::Index(i) => step_index(&current, *i),
-            PathStepOwned::WildcardIndex => step_wildcard_idx(&current),
-            PathStepOwned::WildcardKey => step_wildcard_key(&current),
-            PathStepOwned::Recursive => step_recursive(&current),
-        };
-        current = next;
-        if current.is_empty() {
-            break;
-        }
-    }
-    current
-}
-
-fn step_key(nodes: &[serde_json::Value], key: &str) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    for n in nodes {
-        if let serde_json::Value::Object(m) = n {
-            if let Some(v) = m.get(key) {
-                out.push(v.clone());
-            }
-        }
-    }
-    out
-}
-
-fn step_index(nodes: &[serde_json::Value], idx: usize) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    for n in nodes {
-        if let serde_json::Value::Array(a) = n {
-            if idx < a.len() {
-                out.push(a[idx].clone());
-            }
-        }
-    }
-    out
-}
-
-fn step_wildcard_idx(nodes: &[serde_json::Value]) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    for n in nodes {
-        if let serde_json::Value::Array(a) = n {
-            out.extend(a.iter().cloned());
-        }
-    }
-    out
-}
-
-fn step_wildcard_key(nodes: &[serde_json::Value]) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    for n in nodes {
-        if let serde_json::Value::Object(m) = n {
-            out.extend(m.values().cloned());
-        }
-    }
-    out
-}
-
-fn step_recursive(nodes: &[serde_json::Value]) -> Vec<serde_json::Value> {
-    // `..` prefixes the *next* key step; for `..key` we emit every descendant
-    // container, and the following Key step filters. For standalone `..`
-    // (rare) we also yield every descendant.
-    let mut out = Vec::new();
-    for n in nodes {
-        collect_descendants(n, &mut out);
-    }
-    out
-}
-
-fn collect_descendants(n: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
-    out.push(n.clone());
-    match n {
-        serde_json::Value::Array(a) => {
-            for v in a {
-                collect_descendants(v, out);
-            }
-        }
-        serde_json::Value::Object(m) => {
-            for v in m.values() {
-                collect_descendants(v, out);
-            }
-        }
-        _ => {}
-    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -921,6 +803,7 @@ mod tests {
         let jt = JsonTable {
             doc: crate::expr::Expr::Literal(Value::Null),
             row_path: "$".into(),
+            passing: Vec::new(),
             columns: vec![
                 JsonTableColumn::Ordinality { name: "a".into() },
                 JsonTableColumn::Ordinality { name: "b".into() },
@@ -936,12 +819,15 @@ mod tests {
         let jt = JsonTable {
             doc: crate::expr::Expr::Literal(Value::Null),
             row_path: "$".into(),
+            passing: Vec::new(),
             columns: vec![
                 JsonTableColumn::Ordinality { name: "ord".into() },
                 JsonTableColumn::Regular {
                     name: "ORD".into(), // case-insensitive collision
                     ty: DataType::Int,
                     path: "$.a".into(),
+                    wrapper: SqlJsonWrapper::Without,
+                    quotes: SqlJsonQuotes::Keep,
                     on_empty: SqlJsonOnBehavior::Null,
                     on_error: SqlJsonOnBehavior::Null,
                 },
@@ -953,47 +839,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_restricted_path_basic_shapes() {
-        assert_eq!(parse_restricted_path("$").unwrap().len(), 1);
-        assert_eq!(parse_restricted_path("$.a.b").unwrap().len(), 3);
-        assert_eq!(parse_restricted_path("$[0]").unwrap().len(), 2);
-        assert_eq!(parse_restricted_path("$[*]").unwrap().len(), 2);
-        assert!(parse_restricted_path("foo").is_err());
-        assert!(parse_restricted_path("$[").is_err());
+    fn compile_rejects_duplicate_passing_var() {
+        let jt = JsonTable {
+            doc: crate::expr::Expr::Literal(Value::Null),
+            row_path: "$".into(),
+            passing: vec![
+                (crate::expr::Expr::Literal(Value::BigInt(1)), "v".into()),
+                (crate::expr::Expr::Literal(Value::BigInt(2)), "V".into()),
+            ],
+            columns: vec![JsonTableColumn::Ordinality { name: "a".into() }],
+            alias: None,
+        };
+        let err = compile_json_table(&jt).unwrap_err();
+        assert!(format!("{err:?}").contains("duplicate PASSING"));
     }
 
     #[test]
-    fn walk_simple_object_key() {
-        let doc = serde_json::json!({"a": {"b": 42}});
-        let steps = parse_restricted_path("$.a.b").unwrap();
-        let hits = walk_path_owned(&doc, &steps);
-        assert_eq!(hits, vec![serde_json::json!(42)]);
-    }
-
-    #[test]
-    fn walk_array_wildcard() {
-        let doc = serde_json::json!([1, 2, 3]);
-        let steps = parse_restricted_path("$[*]").unwrap();
-        let hits = walk_path_owned(&doc, &steps);
-        assert_eq!(
-            hits,
-            vec![
-                serde_json::json!(1),
-                serde_json::json!(2),
-                serde_json::json!(3)
-            ]
-        );
-    }
-
-    #[test]
-    fn walk_recursive_descent() {
-        let doc = serde_json::json!({"a": [{"v": 1}, {"v": 2}], "b": {"c": {"v": 3}}});
-        let steps = parse_restricted_path("$..v").unwrap();
-        let mut hits: Vec<_> = walk_path_owned(&doc, &steps)
-            .into_iter()
-            .map(|v| v.as_i64().unwrap())
-            .collect();
-        hits.sort();
-        assert_eq!(hits, vec![1, 2, 3]);
+    fn compile_rejects_invalid_path() {
+        let jt = JsonTable {
+            doc: crate::expr::Expr::Literal(Value::Null),
+            row_path: "not-a-path".into(),
+            passing: Vec::new(),
+            columns: vec![JsonTableColumn::Ordinality { name: "a".into() }],
+            alias: None,
+        };
+        assert!(compile_json_table(&jt).is_err());
     }
 }

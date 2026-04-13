@@ -225,17 +225,21 @@ pub enum FromClause {
     JsonTable(Box<JsonTable>),
 }
 
-/// `JSON_TABLE(doc, row_path COLUMNS (...))` — SQL:2016 table-valued function.
+/// `JSON_TABLE(doc, row_path [PASSING ...] COLUMNS (...))` — SQL:2016
+/// table-valued function.
 ///
-/// Phase 11.20a: flat form only (no `NESTED PATH`). The row path is held as a
-/// raw string at parse time and compiled once per statement invocation at
-/// executor preamble via `crate::json_table::compile_json_table`.
+/// Phase 11.20a introduced the flat form; 11.20b/c extended to NESTED PATH;
+/// 11.20d1 added PASSING bindings (visible in every path evaluation) plus
+/// per-column WRAPPER / QUOTES clauses (on `JsonTableColumn::Regular`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct JsonTable {
     /// Document expression — must evaluate to JSONB/JSON/TEXT at exec time.
     pub doc: Expr,
     /// Row path as a SQL string literal, e.g. `'$[*]'`.
     pub row_path: String,
+    /// `PASSING expr AS name` bindings; empty when the clause is absent.
+    /// Bindings are visible to the row path AND every column / NESTED path.
+    pub passing: Vec<(Expr, String)>,
     /// Column declarations in the `COLUMNS(...)` list.
     pub columns: Vec<JsonTableColumn>,
     /// Alias after `AS` (defaults to a synthetic name when omitted).
@@ -245,11 +249,15 @@ pub struct JsonTable {
 /// One column inside a JSON_TABLE's `COLUMNS(...)` list.
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsonTableColumn {
-    /// `name TYPE PATH 'jsonpath' [ON EMPTY] [ON ERROR]`.
+    /// `name TYPE PATH 'jsonpath' [WRAPPER] [QUOTES] [ON EMPTY] [ON ERROR]`.
     Regular {
         name: String,
         ty: DataType,
         path: String,
+        /// Phase 11.20d1: default `SqlJsonWrapper::Without`.
+        wrapper: crate::expr::SqlJsonWrapper,
+        /// Phase 11.20d1: default `SqlJsonQuotes::Keep`.
+        quotes: crate::expr::SqlJsonQuotes,
         /// Default behavior: `SqlJsonOnBehavior::Null` (SQL:2016 spec default).
         on_empty: crate::expr::SqlJsonOnBehavior,
         on_error: crate::expr::SqlJsonOnBehavior,

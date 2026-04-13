@@ -1884,14 +1884,26 @@ pub(crate) enum FilterExpr {
     Not(Box<FilterExpr>),
 }
 
-/// Right-hand side of a filter comparison: a literal, a path reference, or
-/// a numeric arithmetic combination of the above.
+/// Right-hand side of a filter comparison: a literal, a path reference, a
+/// PASSING variable (`$name`), or a numeric arithmetic combination of the
+/// above.
 #[derive(Debug, Clone)]
 pub(crate) enum FilterSide {
     Literal(serde_json::Value),
     Path(Vec<String>),
+    /// PASSING variable binding — resolved against the active `PassingEnv`
+    /// at evaluation time (Phase 11.20d1).
+    Var(String),
     Arith(Box<FilterSide>, ArithOp, Box<FilterSide>),
 }
+
+/// PASSING bindings visible to a JSONPath evaluation. Maps bare variable
+/// name (without the leading `$`) to a pre-JSON-ified value.
+///
+/// An empty env is the historical default — every path engine entry point
+/// has a non-`_env` shim that builds the empty env so existing callers
+/// (Phase 11.19b, 11.21a/b/c, `@?`, `@@`) stay unchanged.
+pub(crate) type PassingEnv = std::collections::HashMap<String, serde_json::Value>;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ArithOp {
@@ -2273,6 +2285,24 @@ impl SidesParser<'_> {
     fn parse_atom(&mut self) -> Result<FilterSide, DbError> {
         self.skip_ws();
         let src = std::str::from_utf8(&self.bytes[self.pos..]).unwrap_or("");
+        if let Some(rest_after_dollar) = src.strip_prefix('$') {
+            // `$name` — PASSING variable reference (Phase 11.20d1). Scan a
+            // bare identifier; terminate at the same delimiters that end a
+            // literal.
+            let stop = rest_after_dollar
+                .find(|c: char| {
+                    c.is_whitespace() || matches!(c, '+' | '-' | '*' | '/' | '%' | ')' | '(')
+                })
+                .unwrap_or(rest_after_dollar.len());
+            if stop == 0 {
+                return Err(DbError::InvalidValue {
+                    reason: "expected variable name after `$` in filter".into(),
+                });
+            }
+            let name = rest_after_dollar[..stop].to_string();
+            self.pos += 1 + stop;
+            return Ok(FilterSide::Var(name));
+        }
         if let Some(rest_after_at) = src.strip_prefix('@') {
             // `@.k.k…` path reference — terminate at whitespace, arith op,
             // or end of RHS.
@@ -2364,8 +2394,18 @@ pub(crate) fn execute_jsonpath_owned(
     root: &serde_json::Value,
     steps: &[PathStep],
 ) -> Vec<serde_json::Value> {
+    execute_jsonpath_owned_env(root, steps, &PassingEnv::new())
+}
+
+/// Variant of [`execute_jsonpath_owned`] with a PASSING environment
+/// (Phase 11.20d1). `.size()` / `.type()` accessors still strip last.
+pub(crate) fn execute_jsonpath_owned_env(
+    root: &serde_json::Value,
+    steps: &[PathStep],
+    env: &PassingEnv,
+) -> Vec<serde_json::Value> {
     let (body, accessor) = split_trailing_accessor(steps);
-    let refs = execute_jsonpath(root, body);
+    let refs = execute_jsonpath_env(root, body, env);
     match accessor {
         None => refs.into_iter().cloned().collect(),
         Some(PathStep::Size) => refs
@@ -2396,59 +2436,71 @@ pub(crate) fn execute_jsonpath<'a>(
     root: &'a serde_json::Value,
     steps: &[PathStep],
 ) -> Vec<&'a serde_json::Value> {
+    execute_jsonpath_env(root, steps, &PassingEnv::new())
+}
+
+/// Variant of [`execute_jsonpath`] that threads a PASSING environment
+/// through every filter evaluation (Phase 11.20d1).
+pub(crate) fn execute_jsonpath_env<'a>(
+    root: &'a serde_json::Value,
+    steps: &[PathStep],
+    env: &PassingEnv,
+) -> Vec<&'a serde_json::Value> {
     let start = if matches!(steps.first(), Some(PathStep::Root)) {
         &steps[1..]
     } else {
         steps
     };
-    apply_steps(root, start)
+    apply_steps(root, start, env)
 }
 
 fn apply_steps<'a>(
     current: &'a serde_json::Value,
     steps: &[PathStep],
+    env: &PassingEnv,
 ) -> Vec<&'a serde_json::Value> {
     if steps.is_empty() {
         return vec![current];
     }
     let (step, rest) = (&steps[0], &steps[1..]);
     match step {
-        PathStep::Root => apply_steps(current, rest),
+        PathStep::Root => apply_steps(current, rest, env),
 
         PathStep::Key(key) => match current {
             serde_json::Value::Object(map) => match map.get(key.as_str()) {
-                Some(v) => apply_steps(v, rest),
+                Some(v) => apply_steps(v, rest, env),
                 None => vec![],
             },
             serde_json::Value::Array(arr) => arr
                 .iter()
-                .flat_map(|elem| apply_steps(elem, steps))
+                .flat_map(|elem| apply_steps(elem, steps, env))
                 .collect(),
             _ => vec![],
         },
 
         PathStep::Index(idx) => match current {
             serde_json::Value::Array(arr) => match arr.get(*idx) {
-                Some(v) => apply_steps(v, rest),
+                Some(v) => apply_steps(v, rest, env),
                 None => vec![],
             },
             _ => vec![],
         },
 
         PathStep::WildcardKey => match current {
-            serde_json::Value::Object(map) => {
-                map.values().flat_map(|v| apply_steps(v, rest)).collect()
-            }
+            serde_json::Value::Object(map) => map
+                .values()
+                .flat_map(|v| apply_steps(v, rest, env))
+                .collect(),
             serde_json::Value::Array(arr) => arr
                 .iter()
-                .flat_map(|elem| apply_steps(elem, steps))
+                .flat_map(|elem| apply_steps(elem, steps, env))
                 .collect(),
             _ => vec![],
         },
 
         PathStep::WildcardIndex => match current {
             serde_json::Value::Array(arr) => {
-                arr.iter().flat_map(|v| apply_steps(v, rest)).collect()
+                arr.iter().flat_map(|v| apply_steps(v, rest, env)).collect()
             }
             _ => vec![],
         },
@@ -2458,19 +2510,19 @@ fn apply_steps<'a>(
             collect_recursive(current, &mut all_nodes);
             all_nodes
                 .into_iter()
-                .flat_map(|node| apply_steps(node, rest))
+                .flat_map(|node| apply_steps(node, rest, env))
                 .collect()
         }
 
         PathStep::Filter(filter_expr) => match current {
             serde_json::Value::Array(arr) => arr
                 .iter()
-                .filter(|elem| eval_filter(elem, filter_expr))
-                .flat_map(|elem| apply_steps(elem, rest))
+                .filter(|elem| eval_filter(elem, filter_expr, env))
+                .flat_map(|elem| apply_steps(elem, rest, env))
                 .collect(),
             serde_json::Value::Object(_) => {
-                if eval_filter(current, filter_expr) {
-                    apply_steps(current, rest)
+                if eval_filter(current, filter_expr, env) {
+                    apply_steps(current, rest, env)
                 } else {
                     vec![]
                 }
@@ -2503,7 +2555,7 @@ fn collect_recursive<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a serde_json:
     }
 }
 
-fn eval_filter(node: &serde_json::Value, filter: &FilterExpr) -> bool {
+fn eval_filter(node: &serde_json::Value, filter: &FilterExpr, env: &PassingEnv) -> bool {
     match filter {
         FilterExpr::Exists(path) => {
             let mut current = node;
@@ -2517,20 +2569,24 @@ fn eval_filter(node: &serde_json::Value, filter: &FilterExpr) -> bool {
         }
         FilterExpr::Compare { lhs, op, rhs } => {
             match (
-                resolve_filter_side(lhs, node),
-                resolve_filter_side(rhs, node),
+                resolve_filter_side(lhs, node, env),
+                resolve_filter_side(rhs, node, env),
             ) {
                 (Some(l), Some(r)) => compare_json(&l, *op, &r),
                 _ => false,
             }
         }
-        FilterExpr::And(a, b) => eval_filter(node, a) && eval_filter(node, b),
-        FilterExpr::Or(a, b) => eval_filter(node, a) || eval_filter(node, b),
-        FilterExpr::Not(inner) => !eval_filter(node, inner),
+        FilterExpr::And(a, b) => eval_filter(node, a, env) && eval_filter(node, b, env),
+        FilterExpr::Or(a, b) => eval_filter(node, a, env) || eval_filter(node, b, env),
+        FilterExpr::Not(inner) => !eval_filter(node, inner, env),
     }
 }
 
-fn resolve_filter_side(side: &FilterSide, node: &serde_json::Value) -> Option<serde_json::Value> {
+fn resolve_filter_side(
+    side: &FilterSide,
+    node: &serde_json::Value,
+    env: &PassingEnv,
+) -> Option<serde_json::Value> {
     match side {
         FilterSide::Literal(v) => Some(v.clone()),
         FilterSide::Path(p) => {
@@ -2540,9 +2596,10 @@ fn resolve_filter_side(side: &FilterSide, node: &serde_json::Value) -> Option<se
             }
             Some(current.clone())
         }
+        FilterSide::Var(name) => env.get(name).cloned(),
         FilterSide::Arith(lhs, op, rhs) => {
-            let l = resolve_filter_side(lhs, node)?.as_f64()?;
-            let r = resolve_filter_side(rhs, node)?.as_f64()?;
+            let l = resolve_filter_side(lhs, node, env)?.as_f64()?;
+            let r = resolve_filter_side(rhs, node, env)?.as_f64()?;
             let out = match op {
                 ArithOp::Add => l + r,
                 ArithOp::Sub => l - r,
