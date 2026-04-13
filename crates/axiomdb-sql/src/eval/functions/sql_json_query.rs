@@ -33,6 +33,7 @@ pub(crate) fn eval_sql_json_query<R: SubqueryRunner>(
         doc,
         path,
         path_mode,
+        passing,
         returning,
         wrapper,
         quotes,
@@ -69,10 +70,25 @@ pub(crate) fn eval_sql_json_query<R: SubqueryRunner>(
         }
     };
 
+    // Phase 11.19c: substitute PASSING bindings `$name` → literal form.
+    let effective_path = if passing.is_empty() {
+        path.clone()
+    } else {
+        let mut out = path.clone();
+        for (bind_expr, name) in passing {
+            let bound = crate::eval::eval_with(bind_expr, row, sq)?;
+            let literal = sql_value_to_jsonpath_literal(&bound);
+            // Replace `$name` (token boundary: next char must not be alnum/_).
+            let placeholder = format!("${name}");
+            out = replace_jsonpath_var(&out, &placeholder, &literal);
+        }
+        out
+    };
+
     // Walk the path with strict/lax semantics, returning one of:
     //   Matched(Vec<serde_json::Value>) — zero-or-more results
     //   Error(DbError)                  — strict-mode failure
-    let outcome = execute_path(&sj, path, *path_mode);
+    let outcome = execute_path(&sj, &effective_path, *path_mode);
 
     match kind {
         SqlJsonQueryKind::Exists => match outcome {
@@ -503,4 +519,48 @@ fn query_result_to_value(
             }
         }
     }
+}
+
+// ── Phase 11.19c helpers: PASSING variable substitution ─────────────────────
+
+/// Render a SQL `Value` as a jsonpath literal for direct string substitution
+/// into the path before parse. Strings are JSON-quoted, bools become `true`/
+/// `false`, integers/floats use their decimal form, NULL becomes `null`.
+fn sql_value_to_jsonpath_literal(v: &Value) -> String {
+    match v {
+        Value::Null => "null".into(),
+        Value::Bool(b) => if *b { "true" } else { "false" }.into(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::Real(f) => f.to_string(),
+        Value::Text(s) | Value::Json(s) => {
+            // JSON-quote the string so comparisons work in filter contexts.
+            serde_json::Value::String(s.clone()).to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Replace every occurrence of `$name` in `path` with `literal`. `$name`
+/// matches only when the next character is NOT a word char (letter, digit,
+/// underscore) so `$foo` does not match inside `$foobar`.
+fn replace_jsonpath_var(path: &str, placeholder: &str, literal: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let bytes = path.as_bytes();
+    let ph = placeholder.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + ph.len() <= bytes.len() && &bytes[i..i + ph.len()] == ph {
+            let next = bytes.get(i + ph.len()).copied();
+            let is_word = next.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_');
+            if !is_word {
+                out.push_str(literal);
+                i += ph.len();
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }

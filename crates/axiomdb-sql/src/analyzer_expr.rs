@@ -49,6 +49,7 @@ fn resolve_expr_full(
             doc,
             path,
             path_mode,
+            passing,
             returning,
             wrapper,
             quotes,
@@ -56,6 +57,13 @@ fn resolve_expr_full(
             on_error,
         } => {
             let doc = resolve_expr_full(*doc, ctx, outer_scopes, state)?;
+            let mut resolved_passing = Vec::with_capacity(passing.len());
+            for (e, name) in passing {
+                resolved_passing.push((
+                    resolve_expr_full(e, ctx, outer_scopes, state)?,
+                    name,
+                ));
+            }
             let on_empty = resolve_sql_json_behavior(on_empty, ctx, outer_scopes, state)?;
             let on_error = resolve_sql_json_behavior(on_error, ctx, outer_scopes, state)?;
             Ok(Expr::SqlJsonQuery {
@@ -63,6 +71,7 @@ fn resolve_expr_full(
                 doc: Box::new(doc),
                 path,
                 path_mode,
+                passing: resolved_passing,
                 returning,
                 wrapper,
                 quotes,
