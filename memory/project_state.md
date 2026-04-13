@@ -3,7 +3,7 @@
 ## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 21.17 `IS [NOT] DISTINCT FROM` — ✅ closed. Fase 11 JSON complete on MySQL+PG path; moved to fase 21 (Advanced SQL) per ruta crítica. Next small parser wins: 21.19 `FETCH FIRST`, 21.18 `NATURAL JOIN`, 21.22 `VALUES` inline; then medium: 21.14 `CREATE TABLE AS SELECT`, 21.15 `CREATE TABLE LIKE`, 21.4 `RETURNING`; then big: 21.2 CTE, 21.5 MERGE family.
+**Active subphase:** 21.19 `FETCH FIRST n ROWS ONLY` / `OFFSET n ROWS` (SQL:2008) — ✅ closed. Next small parser wins: 21.18 `NATURAL JOIN`, 21.22 `VALUES` inline; then medium: 21.14 `CREATE TABLE AS SELECT`, 21.15 `CREATE TABLE LIKE`, 21.4 `RETURNING`; then big: 21.2 CTE, 21.5 MERGE family.
 
 ### Phase 11 subphase status
 

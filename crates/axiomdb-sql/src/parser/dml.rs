@@ -507,25 +507,73 @@ fn parse_order_item(p: &mut Parser) -> Result<OrderByItem, DbError> {
 // ── LIMIT / OFFSET ────────────────────────────────────────────────────────────
 
 fn parse_limit_offset(p: &mut Parser) -> Result<(Option<Expr>, Option<Expr>), DbError> {
-    if p.eat(&Token::Limit) {
-        let first = parse_expr(p)?;
-        if p.eat(&Token::Comma) {
-            // MySQL comma syntax: LIMIT offset, count
-            // The first number is the OFFSET, the second is the COUNT (LIMIT).
-            let count = parse_expr(p)?;
-            Ok((Some(count), Some(first)))
-        } else {
-            // Standard: LIMIT count [OFFSET offset]
-            let offset = if p.eat(&Token::Offset) {
-                Some(parse_expr(p)?)
+    let mut limit: Option<Expr> = None;
+    let mut offset: Option<Expr> = None;
+    let mut saw_limit_keyword = false;
+    let mut saw_fetch_keyword = false;
+
+    loop {
+        if p.eat(&Token::Limit) {
+            if saw_fetch_keyword {
+                return Err(DbError::ParseError {
+                    message: "cannot mix LIMIT with FETCH FIRST in the same query".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+            saw_limit_keyword = true;
+            let first = parse_expr(p)?;
+            if p.eat(&Token::Comma) {
+                // MySQL comma syntax: LIMIT offset, count
+                let count = parse_expr(p)?;
+                offset = Some(first);
+                limit = Some(count);
             } else {
-                None
+                limit = Some(first);
+                if p.eat(&Token::Offset) {
+                    offset = Some(parse_expr(p)?);
+                    // Optional SQL:2008 noise words after OFFSET.
+                    let _ = p.eat(&Token::Row) || p.eat(&Token::Rows);
+                }
+            }
+        } else if p.eat(&Token::Offset) {
+            // Phase 21.19 — SQL:2008 standalone `OFFSET n [ ROW | ROWS ]`.
+            let e = parse_expr(p)?;
+            offset = Some(e);
+            let _ = p.eat(&Token::Row) || p.eat(&Token::Rows);
+        } else if p.eat(&Token::Fetch) {
+            // Phase 21.19 — SQL:2008 `FETCH { FIRST | NEXT } [n] { ROW | ROWS } ONLY`.
+            if saw_limit_keyword {
+                return Err(DbError::ParseError {
+                    message: "cannot mix LIMIT with FETCH FIRST in the same query".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+            saw_fetch_keyword = true;
+            if !(p.eat(&Token::First) || p.eat(&Token::Next)) {
+                return Err(DbError::ParseError {
+                    message: "expected FIRST or NEXT after FETCH".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+            // Optional count; absent → 1 row.
+            let count = if matches!(p.peek(), Token::Row | Token::Rows) {
+                Expr::Literal(axiomdb_types::Value::Int(1))
+            } else {
+                parse_expr(p)?
             };
-            Ok((Some(first), offset))
+            if !(p.eat(&Token::Row) || p.eat(&Token::Rows)) {
+                return Err(DbError::ParseError {
+                    message: "expected ROW or ROWS after FETCH FIRST [count]".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+            p.expect(&Token::Only)?;
+            limit = Some(count);
+        } else {
+            break;
         }
-    } else {
-        Ok((None, None))
     }
+    Ok((limit, offset))
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
