@@ -3427,6 +3427,25 @@ ok("11.25c to_json returns text",
    v == "42",
    f"got {rows}")
 
+# ── Phase 11.25d — Mutators + MySQL completeness ──────────────────────────────
+
+print("\n[11.25d mutators + MySQL completeness]")
+
+cur.execute("""SELECT jsonb_strip_nulls('{"a":1,"b":null,"c":"x"}')""")
+rows = cur.fetchall()
+v = rows[0][0]
+if isinstance(v, (bytes, bytearray)):
+    v = v.decode()
+ok("11.25d jsonb_strip_nulls removes null keys",
+   '"a":1' in v and '"c":"x"' in v and '"b"' not in v,
+   f"got {rows}")
+
+cur.execute("""SELECT JSON_STORAGE_FREE('{"a":1}')""")
+rows = cur.fetchall()
+ok("11.25d JSON_STORAGE_FREE returns 0",
+   rows[0][0] == 0,
+   f"got {rows}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

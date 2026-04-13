@@ -1121,6 +1121,35 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
                 }
             }
         }
+        // Phase 11.25d — JSON_STORAGE_FREE(json) (MySQL). Returns the number
+        // of unused bytes in the storage slot after an in-place partial
+        // update. AxiomDB always re-encodes from scratch, so the slot
+        // always matches the payload exactly — 0 bytes free. Matches the
+        // MySQL contract: "0 is returned when the JSON column is never
+        // updated, or when the last update was a full replacement".
+        "json_storage_free" => {
+            expect_arg_count(name, args, 1)?;
+            let v = eval_arg(args, 0, row, name)?;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            Ok(Value::BigInt(0))
+        }
+        // Phase 11.25d — jsonb_strip_nulls(doc) (PG). Recursively remove
+        // object fields whose value is JSON null. Arrays keep null
+        // elements (PG behavior: only object keys with null values are
+        // stripped).
+        "jsonb_strip_nulls" => {
+            expect_arg_count(name, args, 1)?;
+            let v = eval_arg(args, 0, row, name)?;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let mut sj = value_to_serde_json(&v)?;
+            strip_nulls_in_place(&mut sj);
+            let blob = JsonbEncoder::encode(&sj)?;
+            Ok(Value::Jsonb(Arc::new(blob)))
+        }
         // JSON_ARRAY_APPEND(doc, path, val, [path, val]*) — append val to array
         // at path; if target is non-array, it is wrapped in an array first.
         "json_array_append" => {
@@ -1563,6 +1592,27 @@ fn path_exists(root: &serde_json::Value, parts: &[String]) -> bool {
 fn jsonb_blob_from_serde(v: &serde_json::Value) -> Result<Value, DbError> {
     let blob = JsonbEncoder::encode(v)?;
     Ok(Value::Jsonb(Arc::new(blob)))
+}
+
+/// Phase 11.25d — `jsonb_strip_nulls` helper. Recursively removes object
+/// fields whose value is JSON null. Arrays unchanged (PG semantics: only
+/// object keys with null values are stripped; null elements in arrays
+/// survive).
+fn strip_nulls_in_place(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            map.retain(|_, val| !matches!(val, serde_json::Value::Null));
+            for val in map.values_mut() {
+                strip_nulls_in_place(val);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                strip_nulls_in_place(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn is_truthy_arg(v: &Value) -> bool {

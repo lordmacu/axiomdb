@@ -3,7 +3,7 @@
 ## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 11.25c JSON construction helpers (`jsonb_build_object`, `jsonb_build_array`, `to_json`) — ✅ closed (row_to_json deferred). Remaining fase 11 (MySQL+PG path): 11.18c, 11.21h, 11.25d.
+**Active subphase:** 11.25d JSON mutators + MySQL completeness (`jsonb_strip_nulls`, `JSON_STORAGE_FREE`, regression `jsonb_set_lax` / `JSON_MERGE_PRESERVE` / `JSON_STORAGE_SIZE`) — ✅ closed. **Phase 11 COMPLETE on MySQL+PG parity path.** Remaining: 11.18c (blocked by TEXT[] — fase 20.4), 11.21h (planner pushdown — optional perf).
 
 ### Phase 11 subphase status
 
