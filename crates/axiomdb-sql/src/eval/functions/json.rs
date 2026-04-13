@@ -1875,7 +1875,7 @@ pub(crate) enum PathStep {
 pub(crate) enum FilterExpr {
     Exists(Vec<String>),
     Compare {
-        path: Vec<String>,
+        lhs: FilterSide,
         op: CmpOp,
         rhs: FilterSide,
     },
@@ -1884,12 +1884,22 @@ pub(crate) enum FilterExpr {
     Not(Box<FilterExpr>),
 }
 
-/// Right-hand side of a filter comparison: either a literal or another
-/// `@.path` reference into the current candidate node.
+/// Right-hand side of a filter comparison: a literal, a path reference, or
+/// a numeric arithmetic combination of the above.
 #[derive(Debug, Clone)]
 pub(crate) enum FilterSide {
     Literal(serde_json::Value),
     Path(Vec<String>),
+    Arith(Box<FilterSide>, ArithOp, Box<FilterSide>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2108,110 +2118,219 @@ impl FilterParser<'_> {
     }
 
     fn parse_primary(&mut self) -> Result<FilterExpr, DbError> {
+        // Slice from current position up to the next boolean combinator or
+        // the matching close paren. Within that slice, parse LHS arith,
+        // optional CmpOp, and RHS arith via SidesParser.
         self.skip_ws();
         let src = std::str::from_utf8(&self.bytes[self.pos..]).unwrap_or("");
-        let rest = src.strip_prefix('@').ok_or_else(|| DbError::InvalidValue {
-            reason: format!("JSONPath filter atom must start with '@': {src}"),
-        })?;
+        let end = src.find(['&', '|', ')']).unwrap_or(src.len());
+        let (atom_str, _tail) = src.split_at(end);
+        let atom_str = atom_str.trim_end();
+        self.pos += atom_str.len();
+
+        // Locate the comparison operator outside of any path identifier.
+        // Operators considered: == != <= >= < > =. Search left-to-right.
+        let mut op_pos: Option<(usize, usize, CmpOp)> = None;
+        let bytes = atom_str.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let two = if i + 2 <= bytes.len() {
+                Some(&bytes[i..i + 2])
+            } else {
+                None
+            };
+            if two == Some(b"==") {
+                op_pos = Some((i, 2, CmpOp::Eq));
+                break;
+            }
+            if two == Some(b"!=") {
+                op_pos = Some((i, 2, CmpOp::Ne));
+                break;
+            }
+            if two == Some(b"<=") {
+                op_pos = Some((i, 2, CmpOp::Le));
+                break;
+            }
+            if two == Some(b">=") {
+                op_pos = Some((i, 2, CmpOp::Ge));
+                break;
+            }
+            let one = bytes[i];
+            if one == b'<' {
+                op_pos = Some((i, 1, CmpOp::Lt));
+                break;
+            }
+            if one == b'>' {
+                op_pos = Some((i, 1, CmpOp::Gt));
+                break;
+            }
+            if one == b'=' {
+                op_pos = Some((i, 1, CmpOp::Eq));
+                break;
+            }
+            i += 1;
+        }
+
+        if let Some((idx, op_len, op)) = op_pos {
+            let lhs_str = atom_str[..idx].trim();
+            let rhs_str = atom_str[idx + op_len..].trim();
+            let lhs = parse_filter_side_str(lhs_str)?;
+            let rhs = parse_filter_side_str(rhs_str)?;
+            return Ok(FilterExpr::Compare { lhs, op, rhs });
+        }
+
+        // No comparison operator → existence atom (must be `@.path…`).
+        let rest = atom_str
+            .strip_prefix('@')
+            .ok_or_else(|| DbError::InvalidValue {
+                reason: format!("JSONPath filter atom must start with '@': {atom_str}"),
+            })?;
         let mut path = Vec::new();
         let mut r = rest;
         while let Some(s2) = r.strip_prefix('.') {
-            let end = s2
-                .find(|c: char| {
-                    c.is_whitespace()
-                        || c == '='
-                        || c == '!'
-                        || c == '<'
-                        || c == '>'
-                        || c == '&'
-                        || c == '|'
-                        || c == ')'
-                })
+            let stop = s2
+                .find(|c: char| c.is_whitespace() || c == '.')
                 .unwrap_or(s2.len());
-            let key = &s2[..end];
+            let key = &s2[..stop];
             if !key.is_empty() {
                 path.push(key.to_string());
             }
-            r = &s2[end..];
-            if r.is_empty()
-                || r.starts_with(char::is_whitespace)
-                || r.starts_with(['=', '!', '<', '>', '&', '|', ')'])
-            {
+            r = &s2[stop..];
+            if r.is_empty() || r.starts_with(char::is_whitespace) {
                 break;
             }
         }
-        // Consumed from src up to the remainder r — advance self.pos.
-        let consumed = src.len() - r.len();
-        // src started at self.pos (relative to bytes); but r = src — .. so
-        // `consumed` equals the number of bytes we parsed into the primary
-        // including the leading '@' (since `rest` began after `@`, we re-add 1).
-        self.pos += consumed;
-        let _ = rest; // suppress unused warning on older compilers
+        Ok(FilterExpr::Exists(path))
+    }
+}
 
+/// Parse a filter side string (LHS or RHS of a comparison) as a
+/// `FilterSide` arithmetic expression. Trailing-input check enforces
+/// no slop.
+fn parse_filter_side_str(s: &str) -> Result<FilterSide, DbError> {
+    let mut sp = SidesParser {
+        bytes: s.as_bytes(),
+        pos: 0,
+    };
+    let side = sp.parse_addsub()?;
+    sp.skip_ws();
+    if sp.pos != sp.bytes.len() {
+        return Err(DbError::InvalidValue {
+            reason: format!("trailing input in filter side: {s}"),
+        });
+    }
+    Ok(side)
+}
+
+/// Pratt-style parser for filter RHS arithmetic. Operator precedence:
+/// `* / %` binds tighter than `+ -`. No parentheses (filters that need
+/// them can lift the work out into multiple `&&`-combined comparisons).
+struct SidesParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl SidesParser<'_> {
+    fn skip_ws(&mut self) {
+        while self.pos < self.bytes.len() && (self.bytes[self.pos] as char).is_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn parse_addsub(&mut self) -> Result<FilterSide, DbError> {
+        let mut left = self.parse_muldiv()?;
+        loop {
+            self.skip_ws();
+            let c = self.bytes.get(self.pos).copied();
+            let op = match c {
+                Some(b'+') => ArithOp::Add,
+                Some(b'-') => ArithOp::Sub,
+                _ => return Ok(left),
+            };
+            self.pos += 1;
+            let right = self.parse_muldiv()?;
+            left = FilterSide::Arith(Box::new(left), op, Box::new(right));
+        }
+    }
+
+    fn parse_muldiv(&mut self) -> Result<FilterSide, DbError> {
+        let mut left = self.parse_atom()?;
+        loop {
+            self.skip_ws();
+            let c = self.bytes.get(self.pos).copied();
+            let op = match c {
+                Some(b'*') => ArithOp::Mul,
+                Some(b'/') => ArithOp::Div,
+                Some(b'%') => ArithOp::Mod,
+                _ => return Ok(left),
+            };
+            self.pos += 1;
+            let right = self.parse_atom()?;
+            left = FilterSide::Arith(Box::new(left), op, Box::new(right));
+        }
+    }
+
+    fn parse_atom(&mut self) -> Result<FilterSide, DbError> {
         self.skip_ws();
-        let tail = std::str::from_utf8(&self.bytes[self.pos..]).unwrap_or("");
-        let (op, remainder) = if let Some(x) = tail.strip_prefix("==") {
-            (Some(CmpOp::Eq), x)
-        } else if let Some(x) = tail.strip_prefix("!=") {
-            (Some(CmpOp::Ne), x)
-        } else if let Some(x) = tail.strip_prefix("<=") {
-            (Some(CmpOp::Le), x)
-        } else if let Some(x) = tail.strip_prefix(">=") {
-            (Some(CmpOp::Ge), x)
-        } else if let Some(x) = tail.strip_prefix('<') {
-            (Some(CmpOp::Lt), x)
-        } else if let Some(x) = tail.strip_prefix('>') {
-            (Some(CmpOp::Gt), x)
-        } else if let Some(x) = tail.strip_prefix('=') {
-            (Some(CmpOp::Eq), x)
-        } else {
-            (None, tail)
-        };
-
-        let Some(op) = op else {
-            return Ok(FilterExpr::Exists(path));
-        };
-        // Advance past the operator token.
-        let op_len = tail.len() - remainder.len();
-        self.pos += op_len;
-
-        // Parse the RHS — either `@.path` reference or a literal — up to
-        // the next combinator / close paren.
-        let rhs = std::str::from_utf8(&self.bytes[self.pos..]).unwrap_or("");
-        let rhs_trim = rhs.trim_start();
-        let ws_consumed = rhs.len() - rhs_trim.len();
-        self.pos += ws_consumed;
-        let rhs = rhs_trim;
-        let end = rhs.find(['&', '|', ')']).unwrap_or(rhs.len());
-        let (token_str, _tail_after) = rhs.split_at(end);
-        let token_str = token_str.trim_end();
-        self.pos += token_str.len();
-        let rhs_side = if let Some(rest_after_at) = token_str.strip_prefix('@') {
-            // Path RHS — collect dot-segments.
+        let src = std::str::from_utf8(&self.bytes[self.pos..]).unwrap_or("");
+        if let Some(rest_after_at) = src.strip_prefix('@') {
+            // `@.k.k…` path reference — terminate at whitespace, arith op,
+            // or end of RHS.
             let mut rpath = Vec::<String>::new();
             let mut r = rest_after_at;
+            let mut consumed = 1usize; // for '@'
             while let Some(s2) = r.strip_prefix('.') {
+                consumed += 1;
                 let stop = s2
-                    .find(|c: char| c.is_whitespace() || c == '.')
+                    .find(|c: char| {
+                        c.is_whitespace()
+                            || c == '.'
+                            || c == '+'
+                            || c == '-'
+                            || c == '*'
+                            || c == '/'
+                            || c == '%'
+                    })
                     .unwrap_or(s2.len());
                 let key = &s2[..stop];
                 if !key.is_empty() {
                     rpath.push(key.to_string());
                 }
+                consumed += stop;
                 r = &s2[stop..];
-                if r.is_empty() || r.starts_with(char::is_whitespace) {
+                if r.is_empty()
+                    || r.starts_with(char::is_whitespace)
+                    || r.starts_with(['+', '-', '*', '/', '%'])
+                {
                     break;
                 }
             }
-            FilterSide::Path(rpath)
+            self.pos += consumed;
+            return Ok(FilterSide::Path(rpath));
+        }
+        // Literal: scan up to the next arithmetic operator or whitespace.
+        let stop = src
+            .find(|c: char| c.is_whitespace() || matches!(c, '+' | '-' | '*' | '/' | '%'))
+            .unwrap_or(src.len());
+        // Allow leading minus sign for negative numeric literals.
+        let stop = if stop == 0 && src.starts_with('-') {
+            // Pick up `-N` as a literal.
+            let r = &src[1..];
+            let n = r
+                .find(|c: char| c.is_whitespace() || matches!(c, '+' | '-' | '*' | '/' | '%'))
+                .unwrap_or(r.len());
+            n + 1
         } else {
-            FilterSide::Literal(parse_jsonpath_literal(token_str)?)
+            stop
         };
-        Ok(FilterExpr::Compare {
-            path,
-            op,
-            rhs: rhs_side,
-        })
+        if stop == 0 {
+            return Err(DbError::InvalidValue {
+                reason: format!("expected literal or @path in filter RHS: {src}"),
+            });
+        }
+        let lit = &src[..stop];
+        self.pos += stop;
+        Ok(FilterSide::Literal(parse_jsonpath_literal(lit)?))
     }
 }
 
@@ -2396,31 +2515,53 @@ fn eval_filter(node: &serde_json::Value, filter: &FilterExpr) -> bool {
             }
             true
         }
-        FilterExpr::Compare { path, op, rhs } => {
-            let mut current = node;
-            for key in path {
-                match current.get(key.as_str()) {
-                    Some(v) => current = v,
-                    None => return false,
-                }
-            }
-            match rhs {
-                FilterSide::Literal(v) => compare_json(current, *op, v),
-                FilterSide::Path(rpath) => {
-                    let mut r = node;
-                    for k in rpath {
-                        match r.get(k.as_str()) {
-                            Some(v) => r = v,
-                            None => return false,
-                        }
-                    }
-                    compare_json(current, *op, r)
-                }
+        FilterExpr::Compare { lhs, op, rhs } => {
+            match (
+                resolve_filter_side(lhs, node),
+                resolve_filter_side(rhs, node),
+            ) {
+                (Some(l), Some(r)) => compare_json(&l, *op, &r),
+                _ => false,
             }
         }
         FilterExpr::And(a, b) => eval_filter(node, a) && eval_filter(node, b),
         FilterExpr::Or(a, b) => eval_filter(node, a) || eval_filter(node, b),
         FilterExpr::Not(inner) => !eval_filter(node, inner),
+    }
+}
+
+fn resolve_filter_side(side: &FilterSide, node: &serde_json::Value) -> Option<serde_json::Value> {
+    match side {
+        FilterSide::Literal(v) => Some(v.clone()),
+        FilterSide::Path(p) => {
+            let mut current = node;
+            for k in p {
+                current = current.get(k.as_str())?;
+            }
+            Some(current.clone())
+        }
+        FilterSide::Arith(lhs, op, rhs) => {
+            let l = resolve_filter_side(lhs, node)?.as_f64()?;
+            let r = resolve_filter_side(rhs, node)?.as_f64()?;
+            let out = match op {
+                ArithOp::Add => l + r,
+                ArithOp::Sub => l - r,
+                ArithOp::Mul => l * r,
+                ArithOp::Div => {
+                    if r == 0.0 {
+                        return None;
+                    }
+                    l / r
+                }
+                ArithOp::Mod => {
+                    if r == 0.0 {
+                        return None;
+                    }
+                    l % r
+                }
+            };
+            Some(serde_json::json!(out))
+        }
     }
 }
 
