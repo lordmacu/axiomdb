@@ -100,6 +100,7 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
         | Expr::Default
         | Expr::OuterColumn { .. }
         | Expr::InsertValue { .. }
+        | Expr::SqlJsonQuery { .. }
         | Expr::Param { .. } => {}
         Expr::UnaryOp { operand, .. } => collect_column_refs(operand, mask),
         Expr::BinaryOp { left, right, .. } => {

@@ -45,6 +45,10 @@ fn contains_aggregate(expr: &Expr) -> bool {
         // Subquery internals are analyzed independently; aggregates inside them
         // do not count as aggregates of the outer query.
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => false,
+        // Phase 11.19a: SQL/JSON special form. Aggregates are not allowed
+        // inside its clauses in this MVP (PG allows in DEFAULT but it is
+        // pathological); treat as a leaf for aggregation analysis.
+        Expr::SqlJsonQuery { .. } => false,
     }
 }
 
@@ -245,6 +249,7 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
         | Expr::Column { .. }
         | Expr::OuterColumn { .. }
         | Expr::InsertValue { .. }
+        | Expr::SqlJsonQuery { .. }
         | Expr::Param { .. } => {}
         // Aggregates inside a subquery belong to the inner query, not the outer.
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {}

@@ -229,6 +229,11 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             eval_with(expr, row, &mut NoSubquery)
         }
 
+        // Phase 11.19a — SQL/JSON standard query function.
+        Expr::SqlJsonQuery { .. } => {
+            crate::eval::functions::eval_sql_json_query(expr, row, &mut super::NoSubquery)
+        }
+
         // OuterColumn must be substituted by the executor before eval() is called.
         Expr::OuterColumn {
             name,
@@ -397,6 +402,9 @@ pub fn eval_with<R: SubqueryRunner>(
         // The executor (insert/update) replaces Null with the column's declared
         // default when default-expression persistence is implemented (4.18e).
         Expr::Default => Ok(Value::Null),
+
+        // Phase 11.19a — SQL/JSON standard query function.
+        Expr::SqlJsonQuery { .. } => crate::eval::functions::eval_sql_json_query(expr, row, sq),
 
         Expr::InsertValue { col_idx, name } => Err(DbError::Internal {
             message: format!(

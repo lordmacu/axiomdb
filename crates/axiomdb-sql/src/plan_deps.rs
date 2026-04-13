@@ -400,6 +400,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             Expr::Column { .. }
             | Expr::OuterColumn { .. }
             | Expr::InsertValue { .. }
+            | Expr::SqlJsonQuery { .. }
             | Expr::Literal(_)
             | Expr::Default
             | Expr::Param { .. } => Ok(()),

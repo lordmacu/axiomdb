@@ -193,7 +193,10 @@ fn expr_mentions_column_name(expr: &crate::expr::Expr, target_name: &str) -> boo
         Expr::Column { name, .. }
         | Expr::OuterColumn { name, .. }
         | Expr::InsertValue { name, .. } => name.eq_ignore_ascii_case(target_name),
-        Expr::Literal(_) | Expr::Param { .. } | Expr::Default => false,
+        Expr::Literal(_)
+        | Expr::Param { .. }
+        | Expr::Default
+        | Expr::SqlJsonQuery { .. } => false,
         Expr::UnaryOp { operand, .. }
         | Expr::IsNull { expr: operand, .. }
         | Expr::IsBoolean { expr: operand, .. }
