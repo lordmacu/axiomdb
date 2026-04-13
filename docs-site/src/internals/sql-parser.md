@@ -885,6 +885,88 @@ Identifiers are <code>&'src str</code> slices into the original SQL string — n
 
 ---
 
+## Phase 11.20d3 — LATERAL-correlated JSON_TABLE
+
+Lifts the final LATERAL guardrail: JSON_TABLE on the right side of a
+JOIN / CROSS APPLY / OUTER APPLY may now reference outer columns in
+both its `doc` argument and any `PASSING expr AS var` bindings. The
+PG-compatible `LATERAL` keyword is also accepted as an optional no-op
+prefix.
+
+### Detection
+
+```rust
+pub fn jsontable_is_correlated(jt: &JsonTable) -> bool {
+    doc_has_column_refs(&jt.doc)
+        || jt.passing.iter().any(|(expr, _)| doc_has_column_refs(expr))
+}
+```
+
+Used by both `select_joins_ctx.rs` (to route correlated right sources
+into a per-outer-row loop) and by `execute_select_json_table_source`
+(to reject correlated `doc` in first-FROM position — there is no
+outer source to reference).
+
+### Analyzer
+
+Join-side `FromClause::JsonTable` now flows through
+`resolve_json_table(&ctx, outer_scopes, …)` during join iteration.
+Previously only first-FROM JSON_TABLE was resolved; join-side JT
+doc/passing exprs stayed raw, which accidentally worked for 11.20d1
+because PASSING values were literals. `resolve_json_table` itself was
+extended to resolve each `jt.passing.iter_mut()` expression against
+the same scope as `jt.doc`.
+
+### Executor
+
+`execute_select_with_joins_first_materialized` adds a parallel
+tracker `correlated_jt: Vec<Option<JsonTableSpec>>`. Non-correlated
+right sources push `None` and materialize once into
+`scanned[right_idx]` exactly as before. Correlated sources push
+`Some(spec)` and a placeholder `Vec::new()`; during the combine loop
+the join dispatches to `apply_correlated_jt_join(left_rows, jt_ast,
+spec, …)` instead of `apply_join(…, &scanned[right_idx], …)`.
+
+The per-outer-row helper evaluates `doc` against each outer row,
+converts via `doc_to_serde`, materializes with
+`materialize_json_table(spec, &sj, outer, &mut NoSubquery)` (the env
+builder has been per-invocation since 11.20d1), and then tests the
+ON condition per right row. LEFT JOIN / OUTER APPLY NULL-pad when no
+rows match; RIGHT JOIN / FULL JOIN raise `NotImplemented` because
+outer re-scan semantics are ill-defined (PG rejects them too).
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Hash/spill skipped on correlated JT</span>
+The adaptive join selection that picks hash-join and spill-to-disk
+(Phase 9.8 / 9.9) requires the full right set pre-built. A correlated
+JT right side is fundamentally a different shape — one materialization
+per outer row — so the correlated branch always runs nested-loop.
+Since the outer loop was already O(|outer|), and JT cardinality per
+outer row is bounded by the doc structure, this is a deliberate
+limitation rather than a regression.
+</div>
+</div>
+
+### LATERAL keyword
+
+`Token::Lateral` is consumed optionally at the top of
+`parse_from_item`, covering:
+
+```
+FROM LATERAL JSON_TABLE(...)            -- first-FROM sugar (no-op)
+FROM t JOIN LATERAL JSON_TABLE(...) ...  -- PG form
+FROM LATERAL (SELECT ...) AS q          -- subquery prefix (no-op)
+```
+
+LATERAL semantics on bare subqueries (allowing the inner SELECT /
+WHERE to reference outer columns) is a separate subphase — it
+requires exposing `outer_scopes` to derived-table analysis. LATERAL
+here is purely syntactic: for JSON_TABLE the correlation machinery
+is always active; for subqueries AxiomDB's analyzer does not yet
+feed outer scope into derived SELECTs.
+
 ## Phase 11.20d2 — JSON_TABLE first FROM + CROSS/OUTER APPLY
 
 Two small additions layered on the existing join infrastructure:

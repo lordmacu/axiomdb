@@ -1000,3 +1000,72 @@ fn hash_value(v: &Value) -> u64 {
     HashableValue(v.clone()).hash(&mut hasher);
     hasher.finish()
 }
+
+/// Phase 11.20d3 — JOIN where the right side is a LATERAL-correlated
+/// `JSON_TABLE`. `doc` and/or PASSING expressions reference outer
+/// columns, so we cannot materialize the right side up-front; we
+/// re-run it once per outer row. Hash-join / spill optimizations do
+/// not apply (they need the full right set pre-built).
+///
+/// INNER / CROSS JOIN / CROSS APPLY → emit matched rows only.
+/// LEFT / OUTER APPLY → NULL-pad the outer row when it matches zero
+/// JSON_TABLE rows. RIGHT / FULL → reject with NotImplemented
+/// (PG-compatible; outer re-scan semantics are ill-defined).
+#[allow(clippy::too_many_arguments)]
+fn apply_correlated_jt_join(
+    left_rows: Vec<Row>,
+    jt_ast: &crate::ast::JsonTable,
+    spec: &crate::json_table::JsonTableSpec,
+    right_columns: &[ColumnMeta],
+    right_col_count: usize,
+    join_type: JoinType,
+    condition: &JoinCondition,
+    left_schema: &[(String, usize)],
+    right_col_offset: usize,
+) -> Result<Vec<Row>, DbError> {
+    match join_type {
+        JoinType::Right | JoinType::Full => {
+            return Err(DbError::NotImplemented {
+                feature: "RIGHT/FULL JOIN on LATERAL-correlated JSON_TABLE — \
+                          PG-compatible rejection (outer re-scan semantics)"
+                    .into(),
+            });
+        }
+        _ => {}
+    }
+
+    let null_right: Row = vec![Value::Null; right_col_count];
+    let mut out: Vec<Row> = Vec::with_capacity(left_rows.len());
+
+    for outer in &left_rows {
+        let doc_val = crate::eval::eval(&jt_ast.doc, outer)?;
+        let rows = match crate::json_table::doc_to_serde(&doc_val)? {
+            None => Vec::new(),
+            Some(sj) => {
+                let mut runner = crate::eval::NoSubquery;
+                crate::json_table::materialize_json_table(spec, &sj, outer, &mut runner)?
+            }
+        };
+
+        let mut matched = false;
+        for right in &rows {
+            let combined = concat_rows(outer, right);
+            if eval_join_cond(
+                condition,
+                &combined,
+                left_schema,
+                right_col_offset,
+                right_columns,
+            )? {
+                out.push(combined);
+                matched = true;
+            }
+        }
+
+        if !matched && matches!(join_type, JoinType::Left) {
+            out.push(concat_rows(outer, &null_right));
+        }
+    }
+
+    Ok(out)
+}

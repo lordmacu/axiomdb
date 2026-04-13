@@ -233,19 +233,29 @@ fn analyze_select_with_outer(
     // resolving JOIN conditions so the executor receives analyzed inner SELECTs.
     let mut resolved_joins = Vec::with_capacity(s.joins.len());
     for mut join in s.joins {
-        if let FromClause::Subquery { query, alias } = join.table {
-            let analyzed_inner = analyze_select_with_outer(
-                *query,
-                storage,
-                state.snapshot.clone(),
-                state.default_database,
-                state.default_schema,
-                outer_scopes,
-            )?;
-            join.table = FromClause::Subquery {
-                query: Box::new(analyzed_inner),
-                alias,
-            };
+        match join.table {
+            FromClause::Subquery { query, alias } => {
+                let analyzed_inner = analyze_select_with_outer(
+                    *query,
+                    storage,
+                    state.snapshot.clone(),
+                    state.default_database,
+                    state.default_schema,
+                    outer_scopes,
+                )?;
+                join.table = FromClause::Subquery {
+                    query: Box::new(analyzed_inner),
+                    alias,
+                };
+            }
+            // Phase 11.20d3 — resolve JSON_TABLE doc + PASSING on the JOIN
+            // right side against the combined scope so correlated expressions
+            // pick up outer-column bindings.
+            FromClause::JsonTable(jt) => {
+                let resolved = resolve_json_table(*jt, &ctx, outer_scopes, &state)?;
+                join.table = FromClause::JsonTable(Box::new(resolved));
+            }
+            FromClause::Table(_) => {}
         }
         join.condition = match join.condition {
             JoinCondition::On(expr) => {
@@ -369,6 +379,13 @@ fn resolve_json_table(
     state: &AnalyzeState<'_>,
 ) -> Result<crate::ast::JsonTable, DbError> {
     jt.doc = resolve_expr_full(jt.doc, ctx, outer_scopes, Some(state))?;
+    // Phase 11.20d3: resolve PASSING expressions against outer scope so
+    // correlated PASSING refs (`PASSING outer.col AS var`) bind properly.
+    // Non-correlated PASSING (literals, params) resolves to itself.
+    for (expr, _name) in &mut jt.passing {
+        let taken = std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
+        *expr = resolve_expr_full(taken, ctx, outer_scopes, Some(state))?;
+    }
     for c in &mut jt.columns {
         if let crate::ast::JsonTableColumn::Regular {
             on_empty, on_error, ..

@@ -274,10 +274,10 @@ fn where_predicate_on_json_table_column() {
 }
 
 #[test]
-fn correlated_doc_in_join_is_rejected_11_20a() {
-    // JSON_TABLE on the right of a JOIN with a correlated `doc` expression
-    // (referencing the left-side row) requires LATERAL semantics — deferred
-    // to 11.20d.
+fn correlated_doc_in_join_works_11_20d3() {
+    // Phase 11.20d3 lifted the LATERAL-correlation guardrail: JSON_TABLE on
+    // the right of a JOIN with a `doc` expression referencing the left-side
+    // row now re-materializes per outer row.
     let (mut s, mut t, mut b, mut c) = setup();
     run("CREATE TABLE u (tags TEXT)", &mut s, &mut t, &mut b, &mut c);
     run(
@@ -287,21 +287,26 @@ fn correlated_doc_in_join_is_rejected_11_20a() {
         &mut b,
         &mut c,
     );
-    let err = run_ctx(
-        r#"SELECT jt.v FROM u
-           JOIN JSON_TABLE(u.tags, '$[*]' COLUMNS (v INT PATH '$')) AS jt
-             ON TRUE"#,
-        &mut s,
-        &mut t,
-        &mut b,
-        &mut c,
-    );
-    // Accept either a parse-path error or the deliberate NotImplemented
-    // raised by the JOIN executor when the doc references a column.
-    assert!(
-        err.is_err(),
-        "expected error for correlated doc, got {err:?}"
-    );
+    let rows = {
+        let res = run_ctx(
+            r#"SELECT jt.v FROM u
+               JOIN JSON_TABLE(u.tags, '$[*]' COLUMNS (v INT PATH '$')) AS jt
+                 ON TRUE
+               ORDER BY jt.v"#,
+            &mut s,
+            &mut t,
+            &mut b,
+            &mut c,
+        )
+        .expect("correlated JSON_TABLE join must succeed after 11.20d3");
+        match res {
+            axiomdb_sql::QueryResult::Rows { rows, .. } => rows,
+            _ => panic!("expected Rows"),
+        }
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::Int(1));
+    assert_eq!(rows[1][0], Value::Int(2));
 }
 
 #[test]

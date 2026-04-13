@@ -47,6 +47,11 @@ fn execute_select_with_joins_first_materialized(
     let mut all_sources: Vec<JoinSourceSchema> = Vec::new();
     let mut scanned: Vec<Vec<Row>> = Vec::new();
     let mut col_offsets: Vec<usize> = Vec::new();
+    // Phase 11.20d3: parallel tracker. None → right side is already
+    // materialized in `scanned[idx]`. Some(spec) → LATERAL-correlated
+    // JSON_TABLE that must be re-evaluated per outer row during the
+    // combine loop.
+    let mut correlated_jt: Vec<Option<crate::json_table::JsonTableSpec>> = vec![None];
     let mut running_offset = 0usize;
     let snap = conn_txn
         .map(|c| txn.active_snapshot(c))
@@ -68,6 +73,7 @@ fn execute_select_with_joins_first_materialized(
                     running_offset += jt.columns.len();
                     all_sources.push(join_source_schema_from_resolved(tref, &jt));
                     scanned.push(rows.into_iter().map(|(_, r)| r).collect());
+                    correlated_jt.push(None);
                 }
                 FromClause::Subquery { query, alias } => {
                     let inner_result =
@@ -84,33 +90,35 @@ fn execute_select_with_joins_first_materialized(
                     running_offset += columns.len();
                     all_sources.push(join_source_schema_from_derived(alias, columns));
                     scanned.push(rows);
+                    correlated_jt.push(None);
                 }
-                // Phase 11.20a — JSON_TABLE on the right side of a JOIN.
-                // Non-correlated doc only: evaluate once with an empty row,
-                // materialize, then combine via the normal nested-loop path.
-                // Correlated doc (LATERAL semantics) → 11.20d.
+                // Phase 11.20a/d3 — JSON_TABLE on the right side of a JOIN.
+                // Non-correlated doc: evaluate once with an empty row, materialize,
+                // feed to the batch nested-loop path. LATERAL-correlated doc (or
+                // PASSING): defer materialization to the per-outer-row combine loop.
                 FromClause::JsonTable(jt) => {
-                    if crate::json_table::doc_has_column_refs(&jt.doc) {
-                        return Err(DbError::NotImplemented {
-                            feature: "correlated JSON_TABLE in a JOIN (LATERAL semantics) — \
-                                      deferred to 11.20d"
-                                .into(),
-                        });
-                    }
                     let spec = crate::json_table::compile_json_table(jt)?;
                     let column_metas = crate::json_table::column_metas_for_spec(&spec);
-                    let doc_val = crate::eval::eval(&jt.doc, &[])?;
-                    let rows = match crate::json_table::doc_to_serde(&doc_val)? {
-                        None => Vec::new(),
-                        Some(sj) => {
-                            let mut runner = crate::eval::NoSubquery;
-                            crate::json_table::materialize_json_table(&spec, &sj, &[], &mut runner)?
-                        }
-                    };
                     col_offsets.push(running_offset);
                     running_offset += column_metas.len();
                     all_sources.push(join_source_schema_from_derived(&spec.alias, column_metas));
-                    scanned.push(rows);
+                    if crate::json_table::jsontable_is_correlated(jt) {
+                        // Placeholder — the real rows are produced per outer row
+                        // in the combine loop below.
+                        scanned.push(Vec::new());
+                        correlated_jt.push(Some(spec));
+                    } else {
+                        let doc_val = crate::eval::eval(&jt.doc, &[])?;
+                        let rows = match crate::json_table::doc_to_serde(&doc_val)? {
+                            None => Vec::new(),
+                            Some(sj) => {
+                                let mut runner = crate::eval::NoSubquery;
+                                crate::json_table::materialize_json_table(&spec, &sj, &[], &mut runner)?
+                            }
+                        };
+                        scanned.push(rows);
+                        correlated_jt.push(None);
+                    }
                 }
             }
         }
@@ -131,17 +139,37 @@ fn execute_select_with_joins_first_materialized(
         let right_col_count = all_sources[right_idx].columns.len();
         let right_col_offset = col_offsets[right_idx];
 
-        combined_rows = apply_join(
-            combined_rows,
-            &scanned[right_idx],
-            left_col_count,
-            right_col_count,
-            join.join_type,
-            &join.condition,
-            &left_schema,
-            right_col_offset,
-            &all_sources[right_idx].columns,
-        )?;
+        combined_rows = if let Some(spec) = correlated_jt[right_idx].as_ref() {
+            // Phase 11.20d3 — correlated JSON_TABLE right side. Extract the
+            // original AST to access `doc` / `passing` expressions.
+            let jt_ast = match &stmt.joins[i].table {
+                FromClause::JsonTable(j) => j.as_ref(),
+                _ => unreachable!("correlated_jt set but AST is not JsonTable"),
+            };
+            apply_correlated_jt_join(
+                combined_rows,
+                jt_ast,
+                spec,
+                &all_sources[right_idx].columns,
+                right_col_count,
+                join.join_type,
+                &join.condition,
+                &left_schema,
+                right_col_offset,
+            )?
+        } else {
+            apply_join(
+                combined_rows,
+                &scanned[right_idx],
+                left_col_count,
+                right_col_count,
+                join.join_type,
+                &join.condition,
+                &left_schema,
+                right_col_offset,
+                &all_sources[right_idx].columns,
+            )?
+        };
 
         for (j, col) in all_sources[right_idx].columns.iter().enumerate() {
             left_schema.push((col.name.clone(), right_col_offset + j));
