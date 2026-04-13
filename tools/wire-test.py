@@ -3462,6 +3462,19 @@ ok("21.17 1 IS DISTINCT FROM NULL -> TRUE",
    rows[0][0] in (1, True),
    f"got {rows}")
 
+# ── Phase 21.19 — FETCH FIRST / OFFSET n ROWS ─────────────────────────────────
+
+print("\n[21.19 FETCH FIRST]")
+
+cur.execute("CREATE TABLE ff_t (id INT)")
+cur.execute("INSERT INTO ff_t VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10)")
+
+cur.execute("SELECT id FROM ff_t ORDER BY id OFFSET 3 ROWS FETCH FIRST 2 ROWS ONLY")
+rows = cur.fetchall()
+ok("21.19 OFFSET n ROWS FETCH FIRST m ROWS ONLY pagination",
+   rows == ((4,), (5,)),
+   f"got {rows}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

@@ -220,6 +220,14 @@ pub enum Token<'src> {
     First,
     #[token("LAST", ignore(ascii_case))]
     Last,
+    #[token("FETCH", ignore(ascii_case))]
+    Fetch,
+    #[token("NEXT", ignore(ascii_case))]
+    Next,
+    #[token("ROW", ignore(ascii_case))]
+    Row,
+    #[token("ROWS", ignore(ascii_case))]
+    Rows,
 
     // ── Boolean / predicates ──────────────────────────────────────────────────
     #[token("AND", ignore(ascii_case))]
