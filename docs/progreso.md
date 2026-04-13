@@ -3,17 +3,54 @@
 > Automatically updated with `/subfase-completa`
 > Legend: ✅ completed | 🔄 in progress | ⏳ pending | ⏸ blocked
 >
-> **MySQL+PG parity path: 133/442 subphases (30.1%) — Phase 11 active**
+> **MySQL+PG parity path: 135/442 subphases (30.5%) — Phase 11 active**
 >
 > **Wishlist / feature extras** (Vector/GIS, GraphQL, OData, Toolkit, MongoDB/DoltDB/Arrow, AI, Distributed, AxiomQL, Browser Wasm, Oracle-specific DDL, IoT/time-series, Lua/WASM runtimes, advanced compliance security, SQL:2011 bi-temporal) moved to [`features-roadmap.md`](./features-roadmap.md) — 301 items. Nothing deleted from code — todo queda tracked para repescar una vez el core esté estable.
 
 ---
 
-## BLOCK 1 — Engine Foundations (Phases 1-7)
+## Ruta crítica (orden de ataque)
+
+1. **Fase 11 JSON** — 3 subfases restantes (`11.18c`, `11.21h`, `11.25d`). ~75% cerrada.
+2. **Fase 21 Advanced SQL** — CTE, MERGE, RETURNING, CHECK, LATERAL, cursors. ⭐ alto valor user-visible.
+3. **Fase 13 Advanced PostgreSQL** — window funcs, generated cols, triggers BEFORE/AFTER, collation ICU.
+4. **Fase 20 Types + import/export** — views, sequences, ENUMs, arrays, COPY.
+5. **Fase 16 Server logic** — stored procs, triggers completos, pooler.
+6. **Fase 17 Security** — auth, TLS, RBAC, RLS, audit, TDE.
+7. **Fase 19 Observability** — pg_stat_*, auto-vacuum, Prometheus, health.
+8. **Fase 18 High availability** — streaming replication, PITR, backup.
+9. **Fase 24-26 Type system complete** — complete types + optimizations + full collation.
+10. **Fase 27 Real query optimizer** — DP, cardinality, adaptive.
+11. **Fase 28-30 SQL pro + functions + infrastructure**.
+12. **Fase 12 + 31 + 32 + 35 Polish + deploy** — testing, final features, architecture, DevEx.
+
+---
+
+## Bloques lógicos
+
+| Bloque | Fases | Estado |
+|---|---|---|
+| A. Foundations | 1-7, 39, 40 | ✅ done |
+| B. Execution + Embedded | 8-10 | ✅ done |
+| C. Type System + SQL completeness | 11, 13, 20, 21, 24, 25, 26 | 🔄 fase 11 in progress |
+| D. Server Logic + Security + Observability | 16, 17, 19 | ⏳ pending |
+| E. High Availability | 18 | ⏳ pending |
+| F. Platform + Compat | 14, 22b, 23 | ⏳ pending |
+| G. Query Optimizer + SQL Pro | 27, 28, 29, 30 | ⏳ pending |
+| H. Final Polish + Deploy | 12, 31, 32, 35 | ⏳ pending |
+
+---
+
+## Block A — Foundations (DONE ✅)
+
+Storage, WAL, MVCC, B+Tree, SQL parser/executor, MySQL wire, secondary indexes, FK, clustered engine.
 
 ### Phase 1 ✅ (9/9) — Page format (CRC32c, align64), MmapStorage, MemoryStorage, FreeList, StorageEngine trait, file locking, tracing
+
 ### Phase 2 ✅ (14/14) — B+ Tree: lookup O(log n), insert+leaf split, range scan (next_leaf chain fixed 7.9), delete+merge, CoW AtomicU64 root, prefix compression, benchmarks; rotate_right key-shift bug fixed 2026-03-26
+
 ### Phase 3 ✅ (28/28) — WAL (append-only, LSN, CRC), WalWriter/Reader/Rotator, RowHeader+MVCC, TxnManager (BEGIN/COMMIT/ROLLBACK), checkpoint, crash recovery (UNDO state machine), post-recovery integrity, catalog (bootstrap+reader+writer+notifier), schema resolver, page dirty tracker, config (axiomdb.toml), autocommit semantics, doublewrite buffer (torn page repair), WAL batch append, WAL per-page record, group commit, configurable durability policy
+
 ### Phase 4 ✅ (106/110) — SQL parser + executor: row codec (all SQL types), expression evaluator (3-valued NULL semantics), AST, lexer (logos DFA, ~85 tokens), DDL+DML parsers (CREATE/DROP/ALTER/SELECT/INSERT/UPDATE/DELETE), semantic analyzer + type coercion matrix, executor (heap+clustered), JOINs (INNER/LEFT/RIGHT/FULL/CROSS/hash), GROUP BY (hash+sort), aggregates (COUNT/SUM/MIN/MAX/AVG/DISTINCT/GROUP_CONCAT), ORDER BY+LIMIT/OFFSET, subqueries (scalar/IN/EXISTS/correlated/derived), DISTINCT, CASE WHEN, 150+ functions, CLI+REPL, SHOW/DESCRIBE/TRUNCATE/ALTER TABLE, INFORMATION_SCHEMA (6 views), error framework (SQLSTATE + structured errors), strict mode + warnings, prepared statement plan cache (OID-based), clustered DDL integration
 - [x] 4.10f ✅ GROUP BY WITH ROLLUP — closed via GAP-C.5 (parser + executor, level-loop subtotals)
 - [x] 4.11b ✅ Subquery in JOIN — `FROM t JOIN (SELECT …) alias ON …`; implemented by `e34e9f4`: analyzer persists join-side derived tables in the AST; executor materializes JOIN subqueries once per statement; integration coverage includes INNER/LEFT/RIGHT/FULL joins, USING, alias wildcard, and chained joins mixing base and derived sources
@@ -23,65 +60,44 @@
 - [x] ✅ `INSERT ... ON DUPLICATE KEY UPDATE` (MySQL ODKU) — closed via full /brainstorm→/spec→/plan workflow (`specs/fase-gap-audit/spec-insert-on-duplicate-key-update.md`, `plan-insert-on-duplicate-key-update.md`). Research against MariaDB `sql/sql_insert.cc::write_record` DUP_UPDATE branch + PostgreSQL `ExecOnConflictUpdate` (EXCLUDED pseudo-relation). New `Expr::InsertValue { col_idx, name }` AST variant threaded through analyzer/eval/plan-deps/partial-index/executor pattern matches. Parser adds an `on_duplicate_update: Option<Vec<Assignment>>` tail to every INSERT source (VALUES, DEFAULT VALUES, SET, SELECT); `VALUES(col)` pseudo-function recognized only when `parser.in_odku_assignment == true` (mirrors MariaDB's `IN_UPDATE_ON_DUP_KEY` parsing scope) and rejects `REPLACE ... ON DUPLICATE KEY UPDATE`. Executor helper `apply_odku_heap` iterates PK/UNIQUE indexes (partial-predicate + MATCH SIMPLE NULL + bloom shortcut), picks the FIRST match (MariaDB semantics), evaluates assignments with dual-row context (existing_row for `Column`, proposed_row for `InsertValue`), runs `check_fk_child_update` + conditional `enforce_fk_on_parent_update`, and dispatches to `TableEngine::update_row` + the shared `apply_update_index_maintenance` helper; a no-op detection produces `affected_rows += 0` when the UPDATE leaves the row equal. Per-row outcome feeds the MySQL `1/2/0` counter rule. Clustered tables return `NotImplemented`. 16 integration tests in `tests/integration_insert_on_dup.rs` cover every acceptance criterion: all source forms, PK/UNIQUE/composite conflict, counter-increment pattern, VALUES(col), unchanged-update, NULL-in-key insert, batch mixed, SELECT source, FK child validation on update branch, INSERT IGNORE coexistence, clustered rejection.
 - [x] ✅ `REPLACE INTO` (MySQL upsert) — closed via full /brainstorm→/spec→/plan workflow (`specs/fase-gap-audit/spec-replace-into.md`, `plan-replace-into.md`). Research against MariaDB (`sql/sql_insert.cc::replace_row`) + PostgreSQL (`ExecOnConflictUpdate`) informed the design. Heap tables covered end-to-end: parser accepts every source form (`VALUES`, `DEFAULT VALUES`, `SET`, `SELECT`, `LOW_PRIORITY`/`DELAYED` prefixes) and rejects `REPLACE IGNORE`; `REPLACE(str, from, to)` stays available as a scalar function in expression contexts. Executor helper `replace_displace_conflicts_heap` probes every PRIMARY/UNIQUE index (honoring partial predicates + MATCH SIMPLE NULL semantics + bloom shortcut), deletes each conflicting row through the FK-aware delete path, and returns a count that contributes to `affected_rows = inserted + deleted` (MariaDB formula). Clustered tables return `NotImplemented` cleanly and are tracked as a follow-up. 16 integration tests in `tests/integration_replace_into.rs` cover every acceptance criterion (no-conflict, PK/UNIQUE/composite conflicts, multi-index displacement, FK CASCADE + RESTRICT, batch VALUES, `DEFAULT VALUES`, SET syntax, SELECT self-reference, parser rejections, scalar-function coexistence).
 - [x] ✅ `ON UPDATE CURRENT_TIMESTAMP` column attribute — closed: `ColumnConstraint::OnUpdate(Expr)` captured by the parser; persisted in the catalog as `ColumnDef.on_update_expr: Option<String>` (flag bit5 in the column row; old rows read as `None`); `execute_update_ctx` auto-appends the parsed expression to the assignment list for every column whose explicit assignment is absent. Niladic SQL-std keywords (`CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_USER`, `CURRENT_SCHEMA`, `LOCALTIMESTAMP`, etc.) now parse as zero-arg functions even without parentheses. Coverage: `tests/integration_on_update_expr.rs` — auto-refresh on UPDATE, explicit assignment wins, non-annotated columns untouched
+
 ### Phase 5 ✅ (49/51) — MySQL wire protocol: TCP/Tokio listener, handshake (HandshakeV10), auth (mysql_native_password + caching_sha2_password), charset/collation negotiation, COM_QUERY/PING/QUIT/RESET_CONNECTION/INIT_DB/STATISTICS/CHANGE_USER, COM_STMT_PREPARE/EXECUTE/CLOSE/RESET/SEND_LONG_DATA, binary result encoding (all types), session state (variables, collation, compat mode, on_error), multi-statement, max_allowed_packet, plan cache (schema_version), throughput benchmarks, DSN parser (axiomdb://, mysql://, postgres://), DELETE bulk truncate (root rotation), B+ Tree in-place writes (4 fast paths), heap insert tail cache, executor/eval decomposition, batch B+ Tree delete, stable-RID UPDATE fast path, transactional INSERT staging; 5.1–5.21 complete
 - [x] 5.2d ✅ MySQL default collation CI — closed via GAP-C.9 (CompatMode::MySql → SessionCollation::Es; greeting advertises utf8mb4_0900_ai_ci / id 255 CI)
 - [x] 5.5b ✅ Column type wire encoding subtypes — closed via GAP-B.2 (parser aliases TINYINT/SMALLINT/MEDIUMINT/YEAR/TIME/DATETIME mapped to existing column types with correct wire codes)
+
 ### Phase 6 ✅ (33/36) — Secondary indexes + FK: key encoding (order-preserving), CREATE INDEX executor, index maintenance (INSERT/UPDATE/DELETE), query planner (IndexLookup/IndexRange/IndexOnlyScan), bloom filter (1% FPR), FK checker + CASCADE/SET NULL/RESTRICT/ON UPDATE, partial indexes (WHERE predicate), fill factor, index statistics (axiom_stats) + ANALYZE, index-only scans + INCLUDE, startup integrity verifier (auto-rebuild divergent indexes), PK SELECT access path, indexed UPDATE candidates, multi-row INSERT batch path, WAL fsync pipeline (leader-based FsyncPipeline), UPDATE apply fast path (369.9K r/s), MVCC lazy index deletion (PostgreSQL-style deferred delete), bulk DELETE root rotation
 - [x] 6.5b ✅ Multi-column FK constraints — closed via GAP-C.2 (catalog + CREATE/ALTER + INSERT child validation; UPDATE child + parent-side cascade deferred)
 - [x] 6.6d ✅ FK references on RENAME TABLE — closed via GAP-B.6 (FK catalog rows key by table_id, so renames preserve enforcement without updates; integration coverage for parent/child rename)
 - [x] 6.6c ✅ ON DELETE SET DEFAULT / ON UPDATE SET DEFAULT — closed via GAP-C.4 (helper `fk_replacement_value` evaluates child column's default_expr; merged SetNull/SetDefault paths)
+
 ### Phase 7 ✅ (22/22) — MVCC: READ COMMITTED/REPEATABLE READ snapshot isolation, TxnManager, CoW lock-free readers (Arc<RwLock>), savepoints, VACUUM (heap + index lazy deletion), epoch-based reclamation (1024-slot SnapshotRegistry), next_leaf CoW gap fixed, lock timeout, TxnID overflow prevention; 7.16/7.17/7.18/7.19/7.20 moved to later phases
-## BLOCK 2 — Execution Optimizations (Phases 8-10)
 
-### Phase 8 ✅ (13/13) — SIMD vectorized filter (BatchPredicate, 6× faster, ~20 ns/row), zone maps (per-page min/max, heap page skip), improved planner (full plan cache, PK bloom filter), wire row serialization fast path, full-scan parity with MariaDB (205K r/s), EXPLAIN output, SIMD benchmarks vs MySQL/MariaDB; `wide` crate (AVX2/NEON/scalar fallback)
-### Phase 9 ✅ (12/12) — Morsel-driven parallelism (Rayon par_iter over pages), operator fusion + unified decode mask, late materialization (BatchPredicate zero-decode for non-matching), hash join O(n+m) equijoin, sort-merge join, spill to disk (radix partitioning, 64MB limit), adaptive join selection, streaming LIMIT early-exit (no full materialization); join bench: LEFT 14.7ms vs MariaDB 162ms (11×)
-### Phase 10 ✅ (8/8) — Embedded: `Db` struct (open/execute/query/begin/commit/rollback), C FFI (15 `#[no_mangle]` functions), cdylib+staticlib, Python ctypes binding, Node.js koffi binding, embedded vs server benchmark (2.7× faster embedded for PK lookups), PreparedStatement Rust API (skip parse+analyze in tight loops)
-## GAP CLOSURE — Auditoría 2026-04-08
+### Phase 39 🔄 (26/38) — Clustered index storage engine: variable-size slotted leaf+internal pages, clustered B-Tree insert+lookup+range+update+delete+rebalance (byte-volume splits, separator propagation, root collapse), secondary PK bookmarks (`secondary_key ++ missing_PK_cols`), overflow pages (local prefix + chain), WAL (ClusteredRowImage, EntryType::Clustered*), crash recovery (PK-based undo/redo), SQL executor integration (CREATE TABLE/INSERT/SELECT/UPDATE/DELETE for explicit-PK tables), VACUUM (clustered purge + overflow free + secondary cleanup), heap→clustered rebuild (ALTER TABLE REBUILD), aggregate hash (GroupTablePrimitive/Generic, 14.25× speedup), zero-alloc clustered scan (scan_all_callback), UPDATE in-place field patch (≥1M r/s); 39.22 ✅
+- [ ] ⚠️ Clustered older-version reconstruction (MVCC version chains) — lookup/range/update return None for invisible current versions; deferred to later clustered MVCC / version-chain work (affects 39.4, 39.5, 39.6, 39.8, 39.14, 39.15)
+- [ ] ⚠️ Clustered root checkpoint persistence — roots still reconstructed from WAL history after crash; checkpoint/rotation-stable persistence deferred (39.12)
+- [ ] ⚠️ FK enforcement for clustered child tables — parent-side enforcement works; child-table deferred (39.17)
+- [ ] ⚠️ Parent separator repair page overflow — repair assumes new separator fits in current internal page budget; revisit in 39.20 (39.8)
+- [ ] ⚠️ 39.19b — ALTER TABLE ADD/DROP COLUMN on clustered tables: code complete (246 lines, `rewrite_rows_clustered`, 13 tests) but NOT YET COMMITTED
 
-> Hallazgos de la auditoría completa de 5 subsistemas.
-> Spec: `specs/fase-gap-audit/audit-2026-04-08.md`
-> Orden de ejecución: GAP-A → GAP-B → GAP-C
-
-### GAP-A — Hardening: eliminar panics de producción `⏳`
-<!-- PRIORIDAD: CRÍTICA — hacer antes de cualquier otra implementación -->
-- [x] GAP-A.1 ✅ key_encoding.rs — closed: decode paths have no unwrap/expect; truncated index key now surfaces as `DbError::BTreeCorrupted` and unit test covers truncation
-- [x] GAP-A.2 ✅ eval/batch.rs — closed: replaced 12 `try_into().unwrap()` with `try_into().unwrap_or_default()` in BatchPredicate; all sites were already bounds-checked, defensive fallback prevents panic on corrupted data
-- [x] GAP-A.3 ✅ schema_constraints.rs — closed: replaced 15 try_into().unwrap() with unwrap_or_default() in ConstraintDef/FkDef deserialization
-- [x] GAP-A.4 ✅ doublewrite.rs — closed: size math via checked ops (`dw_expected_size`), defensive parsing (no `expect()` on on-disk bytes), added regression test for extreme slot_count
-- [x] GAP-A.5 ✅ fsync_pipeline.rs — closed: replaced 4 .expect("poisoned") with .unwrap_or_else(|e| e.into_inner()) to recover from poisoned Mutex
-- [x] GAP-A.6 ✅ notifier.rs — closed: replaced 3 .expect("poisoned") with .unwrap_or_else(|e| e.into_inner()) on RwLock
-- [x] GAP-A.7 ✅ agg_accum.rs — closed: replaced 8 simple_arg.unwrap() with require_arg() helper that returns DbError::Internal instead of panic
-- [x] GAP-A.8 ✅ exec_with_ctx.rs — closed: improved 18 expect() messages to document the invariant guarding each call (is_some() check or preceding begin()); all sites are structurally safe
-
-### GAP-B — MySQL wire compat crítica `⏳`
-<!-- PRIORIDAD: ALTA — desbloquea ORMs y clientes -->
-- [x] GAP-B.1 ✅ UNION / UNION ALL — closed: `Stmt::Union { selects, all }` AST variant; parser detects `UNION [ALL]` after SELECT and chains multiple SELECTs; executor materializes each SELECT then concatenates (ALL) or hash-deduplicates (UNION); analyzer resolves columns in all branches; supports chained triple+ UNIONs, NULLs, literals, aliases
-- [x] GAP-B.2 ✅ Column type wire codes — closed: existing types already sent correct codes; added parser aliases for TINYINT→Bool, SMALLINT→Int, MEDIUMINT→Int, YEAR→Int, TIME→Timestamp in parse_data_type(); DATETIME already worked as Timestamp alias
-- [x] GAP-B.3 ✅ DECIMAL column type — ColumnType::Decimal added (catalog + executor mappings). Storage: row codec already uses `Value::Decimal(i128,u8)` (mantissa+scale). MySQL wire advertises NEWDECIMAL (0xf6). Comparisons support `Decimal` vs numeric `Text` (ORM-friendly). Integration test covers CREATE/INSERT/SELECT/WHERE.
-- [x] GAP-B.4 ✅ DATE column type independiente — ColumnType::Date added (catalog + executor mappings). Storage: `Value::Date(i32)` days-since-epoch. MySQL wire advertises DATE (0x0a) + binary DATE encode/decode. Column assignment supports `Text`→`Date` for ISO `YYYY-MM-DD` (time part ignored). Integration test covers CREATE/INSERT/SELECT.
-- [x] GAP-B.5 ✅ Multi-table DELETE/UPDATE JOIN — closed: parser/analyzer support `UPDATE t JOIN s ON ... SET t.col=...` and `DELETE t FROM t JOIN s ON ...`; ctx executor materializes JOIN candidates, deduplicates target RIDs, and reuses UPDATE/DELETE heap/index/FK paths; integration coverage includes assignment from joined table and DELETE target alias
-- [x] GAP-B.6 ✅ FK RENAME TABLE fix — closed by verification: FK catalog rows store `child_table_id` / `parent_table_id`, so parent/child table renames preserve enforcement without name rewrites; integration coverage added for `RENAME TABLE` parent rename, `ALTER TABLE ... RENAME TO` parent rename, and child rename
-- [x] GAP-B.7 ✅ SHOW PROCESSLIST real — closed: added `ConnectionInfo` + shared `Arc<RwLock<HashMap<u32, ConnectionInfo>>>` registry on `SharedDatabase` (`connection_registry`); new `processlist` module provides `ProcesslistGuard` (RAII register/deregister) with `set_command` / `set_database` helpers for live state updates; handler registers every authenticated connection with user, peer host, and initial db; `SHOW [FULL] PROCESSLIST` interceptor in `handler_sql_intercept.rs` now reads a sorted snapshot with real Id/User/Host/db/Command/Time columns; unit tests cover register → snapshot ordering, drop-removes, `set_command`/`set_database` mutations
-- [x] GAP-B.8 ✅ INTERSECT / EXCEPT — closed: new `Stmt::SetOp { first, rest: Vec<SetOpTail> }` AST unifies UNION/INTERSECT/EXCEPT with per-step kind + ALL flag; parser accepts chained set ops (left-assoc); executor applies left-to-right using hash-based key (per-group counts for ALL variants: INTERSECT ALL = min(L,R), EXCEPT ALL = max(0,L-R)); integration coverage in `tests/integration_set_operations.rs` (10 tests: UNION/INTERSECT/EXCEPT + ALL variants, chained mixes, arity mismatch)
-
-### GAP-C — SQL completeness + DDL robustness `⏳`
-<!-- PRIORIDAD: MEDIA — mejora significativa de compatibilidad -->
-- [x] GAP-C.1 ✅ Subquery in JOIN — closed by Phase 4.11b (`e34e9f4`); `FROM t JOIN (SELECT …) alias ON …` now has analyzer/executor wiring for join-side derived tables
-- [x] GAP-C.2 ✅ Composite FK (multi-column) — closed (scoped): `FkDef` extended with `child_col_idxs: Vec<u16>` / `parent_col_idxs: Vec<u16>`; serialization appends an `0xCF`-prefixed extension trailer only when `len > 1` so single-column rows remain bit-for-bit identical to the legacy format; `persist_composite_fk_constraint` validates that parent has a PK/UNIQUE covering the column list in order and that the child has a pre-declared matching index (auto-creation of composite FK indexes deferred); `check_fk_child_insert` encodes the composite tuple key, finds a parent index whose leading columns match, and uses exact lookup or a prefix range scan when the parent index has extra trailing columns; CREATE TABLE and ALTER TABLE ADD CONSTRAINT both route multi-col FKs through the new path. ⚠️ DEFERRED: composite-aware `check_fk_child_update` and parent-side enforcement (`enforce_fk_on_parent_delete` / `enforce_fk_on_parent_update`) still operate on the first column only — composite rows get UPDATE/DELETE parent handling as follow-up. Integration tests in `tests/integration_fk_composite.rs` (3): matched tuple accepted, mismatched tuple rejected, NULL passes MATCH SIMPLE
-- [x] GAP-C.3 ✅ ALTER TABLE DROP/MODIFY COLUMN con index — closed by verification: `alter_drop_column` already auto-drops indexes whose key depends on the dropped column (`ddl_alter_column.rs:798-801`) and rebuilds surviving indexes with remapped col_idx (clustered + heap paths); `alter_modify_column` rebuilds every dependent index from storage using the new column type (`ddl_alter_column.rs:976-999`); test coverage: `test_alter_drop_column_auto_drops_partial_index_on_heap`, `test_alter_drop_column_heap_rebuilds_surviving_indexes_and_remaps_metadata`, `test_alter_modify_column_heap_rebuilds_unique_index_and_preserves_metadata`, `drop_indexed_column_on_clustered_table_auto_drops_secondary_index`, `drop_unrelated_column_on_clustered_table_remaps_surviving_unique_index` — all passing
-- [x] GAP-C.4 ✅ ON DELETE/UPDATE SET DEFAULT — closed: added `fk_replacement_value` helper in `fk_enforcement.rs` that evaluates the child column's persisted `default_expr` (or falls back to NULL when absent — PG semantics); merged `SetNull`/`SetDefault` match arms in `enforce_fk_on_parent_delete` (clustered + heap paths) and `enforce_fk_on_parent_update`; previously NotImplemented, now fully functional; integration tests in `tests/integration_fk_set_default.rs` cover ON DELETE with default, ON UPDATE with default, and missing-default→NULL fallback
-- [x] GAP-C.5 ✅ GROUP BY WITH ROLLUP — closed: added `with_rollup: bool` to `SelectStmt`; parser recognizes `GROUP BY … WITH ROLLUP` via 2-token lookahead (`WITH` + ident `ROLLUP`); executor wraps grouped path with `execute_select_grouped_rollup` that re-runs aggregation for levels N down to 0 with progressively truncated GROUP BY list, nulling out SELECT slots for rolled-up expressions; outer ORDER BY / LIMIT / DISTINCT apply to the union of all levels; integration coverage in `tests/integration_rollup.rs` (4 tests: single-col, two-col all-levels, COUNT grand total, LIMIT)
-- [x] GAP-C.6 ✅ ALTER AUTO_INCREMENT=N — closed: `ddl_alter_column.rs` now honors `ALTER TABLE t AUTO_INCREMENT = N` by updating the `AUTO_INC_SEQ` thread-local after scanning for current max; MySQL semantics applied (`desired = max(N, max_existing + 1)` — N below current max is silently ignored); integration tests cover empty-table advance, below-max ignore, and above-max honor (`tests/integration_alter_auto_increment.rs`). NOTE: catalog-level cross-restart persistence still pending — would require adding `auto_increment_next: Option<u64>` to TableDef and migration; tracked as follow-up (current impl matches MySQL per-session behavior)
-- [x] GAP-C.7 ✅ DROP INDEX not found → error propio — closed: added `DbError::IndexNotFound { name }` variant; MySQL errno 1091 "Can't DROP; check that it exists"; replaced NotImplemented in both ON-table and scan-all paths of ddl_drop_index.rs
-- [x] GAP-C.8 ✅ Correlated subquery depth > 1 — closed: `Expr::OuterColumn` gained a `depth: u16` field carrying nesting distance (0 = immediate parent); analyzer emits depth based on outer-scope position in `resolve_expr_full`; executor `subst_expr`/`substitute_outer_at` threads a `binding_depth` parameter that only substitutes OuterColumns whose depth matches the current binding level and increments on nested subquery entry; single-equijoin materialization optimization now requires `depth: 0` to avoid misoptimizing deep refs; integration coverage: EXISTS depth-2 (positive + negative), IN subquery depth-2 (`tests/integration_correlated_depth.rs`)
-- [x] GAP-C.9 ✅ MySQL default collation case-insensitive — closed by verification: `SessionContext::effective_collation()` returns `SessionCollation::Es` (CI+AI fold) when `CompatMode::MySql` is active (`session.rs:688`); server greeting advertises `utf8mb4_0900_ai_ci` (id 255) which is MySQL 8.0's default CI collation — matches the advertised server version "8.0.36" and is semantically equivalent to id 45 (`utf8mb4_general_ci`) for CI comparison purposes; regression tests added: `gap_c9_mysql_compat_defaults_to_case_insensitive_collation` (session) + `greeting_advertises_case_insensitive_utf8mb4_collation` (packets)
-- [x] GAP-C.10 ✅ COM_STMT_SEND_LONG_DATA validación — closed by verification: `handler.rs` guards `body.len() < 6` before slicing stmt_id/param_idx, unknown stmt_id is silently ignored (MySQL wire contract — no response), `PreparedStatement::append_long_data` validates param_idx bounds and stores deferred error (surfaced on next `COM_STMT_EXECUTE`); added `checked_add` overflow guard on `current_len + chunk.len()` to protect against pathological usize overflow; unit tests cover all deferred-error paths
+### Phase 40 ✅ (16/16) — Clustered Engine Performance: ClusteredInsertBatch (55.9K r/s, +59% vs MySQL 8), CREATE INDEX on clustered tables, statement plan cache (OID-based invalidation, LRU eviction), StorageEngine interior mutability (64-shard PageLockTable), ALTER TABLE ADD/DROP/MODIFY on clustered, INSERT DEFAULT VALUES + SHOW INDEX, concurrent WAL writer (lock-free LSN reservation, group commit leader/follower), per-connection TxnState + atomic MVCC snapshots (DuckDB GC horizon), Lock Manager (5 modes, 64-shard, InnoDB-pattern), deadlock detection (Brent's O(1) cycle-finding), HeapChain concurrent access (page X-latch, atomic chain growth), B-tree latch coupling (hybrid optimistic/pessimistic, both index+clustered trees), FreeList tier-1 batch (703× speedup 8-thread), database lock redesign (SharedDatabase, per-subsystem sync, DDL write lock / DML read lock), executor lock integration (IX table + X row per DML), integration tests (2540 workspace tests, 8 concurrent DML tests)
 
 ---
 
-## BLOCK 3 — Advanced Features (Phases 11-14)
+## Block B — Execution + Embedded (DONE ✅)
 
-> **Note:** Phase 15 (MongoDB + DoltDB + Arrow — CDC streams, Git-for-data, Arrow Flight) moved to `features-roadmap.md`.
+SIMD vectorization, parallelism, spill-to-disk, embedded C FFI / Python / Node.js bindings.
+
+### Phase 8 ✅ (13/13) — SIMD vectorized filter (BatchPredicate, 6× faster, ~20 ns/row), zone maps (per-page min/max, heap page skip), improved planner (full plan cache, PK bloom filter), wire row serialization fast path, full-scan parity with MariaDB (205K r/s), EXPLAIN output, SIMD benchmarks vs MySQL/MariaDB; `wide` crate (AVX2/NEON/scalar fallback)
+
+### Phase 9 ✅ (12/12) — Morsel-driven parallelism (Rayon par_iter over pages), operator fusion + unified decode mask, late materialization (BatchPredicate zero-decode for non-matching), hash join O(n+m) equijoin, sort-merge join, spill to disk (radix partitioning, 64MB limit), adaptive join selection, streaming LIMIT early-exit (no full materialization); join bench: LEFT 14.7ms vs MariaDB 162ms (11×)
+
+### Phase 10 ✅ (8/8) — Embedded: `Db` struct (open/execute/query/begin/commit/rollback), C FFI (15 `#[no_mangle]` functions), cdylib+staticlib, Python ctypes binding, Node.js koffi binding, embedded vs server benchmark (2.7× faster embedded for PK lookups), PreparedStatement Rust API (skip parse+analyze in tight loops)
+
+---
+
+## Block C — Type System + SQL Completeness (🔄 fase 11 in progress)
+
+JSON parity, window functions, generated columns, views, sequences, ENUMs, arrays, CTE, MERGE, RETURNING, advanced types, collation + ICU.
 
 ### Phase 11 — Robustness and indexes `🔄` week 61-64
 - [x] 11.1 ✅ Sparse index — covered by zone maps (per-page min/max, Phase 8.3b) + BRIN (11.1b); research confirmed zone maps are equivalent to sparse indexes for time-series data
@@ -163,16 +179,6 @@
   - [x] ✅ 11.25c (partial) — PG construction helpers: `jsonb_build_object(k1, v1, ...)` y `jsonb_build_array(v1, v2, ...)` añadidos como aliases de `json_object` / `json_array` pero retornando `Value::Jsonb` binary en vez de `Value::Json` text (rama dispatch por nombre en `eval/functions/json.rs`). `to_json(v)` añadido como contrapartida de `to_jsonb(v)` que retorna JSON text en vez de JSONB binary. Nested builder calls funcionan (`jsonb_build_object('items', jsonb_build_array(1,2,3), 'n', 3)`). NULL key y odd-arg-count errors consistentes entre las 4 variantes. 8 integration tests en `tests/integration_jsonb_builders.rs`. Wire smoke 388/388 (3 new `[11.25c]` assertions). **Deferred to features-roadmap**: `row_to_json(row_expr)` — requiere ROW(...) como first-class value / record types (PG extension del type system que AxiomDB no tiene aun).
   - [ ] 11.25d ⏳ **Mutators + MySQL completeness**: `jsonb_strip_nulls(doc)`, `jsonb_set_lax(doc, path, value, create_if_missing, null_value_treatment)`, `JSON_MERGE_PRESERVE(doc1, doc2, ...)` (MySQL — variant de `JSON_MERGE_PATCH` que conserva duplicates en objects y concatena arrays). `JSON_STORAGE_SIZE(doc)`, `JSON_STORAGE_FREE(doc)` (MySQL storage introspection — retorna tamaño en bytes del JSONB blob y espacio libre si fue actualizado in-place).
 
-### Phase 12 — Testing + JIT `⏳` week 65-68
-- [ ] 12.1 ⏳ Deterministic simulation testing — `FaultInjector` with seed
-- [ ] 12.2 ⏳ EXPLAIN ANALYZE — real times per plan node; JSON output format compatible with PostgreSQL (`{"Plan":{"Node Type":..., "Actual Rows":..., "Actual Total Time":..., "Buffers":{}}}`) and indented text format for psql/CLI; metrics: actual rows, loops, shared/local buffers hit/read, planning time, execution time
-- [ ] 12.4 ⏳ Final block 1 benchmarks — compare with MySQL and SQLite
-- [ ] 12.5 ⏳ SQL parser fuzz testing — `cargo fuzz` on the parser with random inputs; register crashes as regression tests
-- [ ] 12.6 ⏳ Storage fuzz testing — pages with random bytes, deliberate corruptions; verify that crash recovery handles corrupted data
-- [ ] 12.7 ⏳ ORM compatibility tier 1 — Django ORM and SQLAlchemy connect, run simple migrations and SELECT/INSERT/UPDATE/DELETE queries without errors; document workarounds if any
-- [ ] 12.8 ⏳ Unified axiom_* observability system — all system views use consistent naming, types, and join keys; `SELECT * FROM axiom_queries` shows running queries with pid, duration, state, sql_text, plan_hash; `SELECT * FROM axiom_bloat` shows table bloat (from 7.11); `SELECT * FROM axiom_slow_queries` is auto-populated when query exceeds `slow_query_threshold` (default 1s); `SELECT * FROM axiom_stats` shows database-wide metrics (cache hit rate, rows read/written, lock waits); `SELECT * FROM axiom_index_usage` shows which indexes are used/unused; unlike MySQL's inconsistent SHOW commands and PostgreSQL's complex pg_catalog joins, every axiom_* view is self-documented, joinable, and has the same timestamp/duration formats
-- [x] 12.9 ✅ Date/time validation strictness — closed by verification: `coerce_helpers::parse_text_to_date_days` delegates to `ymd_to_days_checked` which rejects every out-of-range component (month ∉ 1..=12, day ∉ 1..=days_in_month including leap-year math for February). `'0000-00-00'`, `'2024-13-01'`, `'2024-00-15'`, `'2024-02-30'`, `'2023-02-29'`, `'2024-04-31'` all surface as `DbError::InvalidCoercion`. Regression coverage: `tests/integration_date_strictness.rs` (9 tests). `TIMESTAMP WITH TIME ZONE` / `SET AXIOM_COMPAT='mysql'` lenient opt-in deferred to a dedicated follow-up — current behavior matches MySQL strict mode
-
 ### Phase 13 — Advanced PostgreSQL `⏳` week 69-72
 - [ ] 13.1 ⏳ Materialized views — `CREATE MATERIALIZED VIEW` + `REFRESH`
 - [ ] 13.2 ⏳ Window functions — `RANK`, `ROW_NUMBER`, `LAG`, `LEAD`, `SUM OVER`
@@ -201,87 +207,6 @@
 - [ ] 13.13d ⏳ COLLATE 'auto' per-column script detection — when a column is declared `TEXT COLLATE 'auto'`, AxiomDB analyzes the Unicode script property of stored data (Latin, Arabic, CJK, Cyrillic, etc.) and caches the dominant script in column metadata; subsequent `ORDER BY` uses the appropriate CLDR tailoring for that script automatically; `SELECT * FROM axiom_column_collations` shows detected scripts; no other database does this — inspired by how mobile OS keyboards auto-detect language
 - [ ] 13.13e ⏳ Full ICU integration — link against libicu for industry-standard Unicode collation; `COLLATE 'de_DE'` applies German phone-book order (ß → ss); `COLLATE 'ja_JP'` handles Japanese kana/kanji ordering; `COLLATE 'tr_TR'` handles Turkish dotted/dotless I correctly; `CREATE COLLATION my_custom (BASE='es_ES', CASE_SENSITIVE=false)` for custom rules; exact same behavior as PostgreSQL ICU collations but with zero configuration for the common case
 - [ ] 13.14 ⏳ Custom aggregate functions — `CREATE AGGREGATE median(FLOAT) (SFUNC=median_state, STYPE=FLOAT[], FINALFUNC=median_final)`; user-defined aggregates beyond SUM/COUNT/AVG/MAX/MIN; enables: weighted average, geometric mean, mode, P95 latency, Gini coefficient, domain-specific business metrics; Phase 16.1 has scalar UDFs but aggregates have different execution semantics (called once per row, finalized once per group)
-
-### Phase 14 — TimescaleDB + Redis + Content-addressed BLOB `⏳` week 32-33
-- [ ] 14.1 ⏳ Table partitioning — `PARTITION BY RANGE/HASH/LIST`
-- [ ] 14.2 ⏳ Partition pruning — query planner skips irrelevant partitions
-
-## BLOCK 4 — Logic and Security (Phases 16-17)
-
-### Phase 16 — Server logic `⏳` week 36-38
-- [ ] 16.1 ⏳ Scalar SQL UDFs — `CREATE FUNCTION ... AS $$ ... $$`
-- [ ] 16.2 ⏳ Table SQL UDFs — return multiple rows
-- [ ] 16.3 ⏳ BEFORE/AFTER triggers — with `WHEN` condition and `SIGNAL`
-- [ ] 16.3b ⏳ INSTEAD OF triggers — INSERT/UPDATE/DELETE logic over views
-- [ ] 16.7 ⏳ Stored procedures — `CREATE PROCEDURE` with flow control (`IF`, `LOOP`, `WHILE`, `BEGIN/END`)
-- [ ] 16.8 ⏳ Exception handling in procedures — `DECLARE ... HANDLER FOR SQLSTATE`, re-raise, cleanup handlers
-- [ ] 16.9 ⏳ UDF and trigger tests — correctness, error handling, WHEN conditions, INSTEAD OF over views
-- [ ] 16.10 ⏳ Built-in connection pooler
-
-### Phase 17 — Security `⏳` week 39-40
-- [ ] 17.1 ⏳ CREATE USER / CREATE ROLE — user and role model
-- [ ] 17.2 ⏳ GRANT / REVOKE — permissions per table and per column
-- [ ] 17.3 ⏳ Row-Level Security — `CREATE POLICY empresa_isolation ON cuentas USING (empresa_id = current_setting('app.empresa_id')::INT)`; policies applied automatically on every SELECT/INSERT/UPDATE/DELETE without application code changes; multiple policies per table combined with OR; `FORCE ROW LEVEL SECURITY` for table owners; critical for multi-tenant accounting software where one DB instance serves multiple companies and data isolation is a legal requirement
-- [ ] 17.4 ⏳ Argon2id — password hashing + Scram-SHA-256 in handshake
-- [ ] 17.5 ⏳ TLS 1.3 — encrypted connections with `tokio-rustls`
-- [ ] 17.6 ⏳ Statement timeout — per user, session and global
-- [ ] 17.7 ⏳ Audit trail — `CREATE AUDIT POLICY` with automatic logging
-- [ ] 17.8 ⏳ Account lockout — tracking failed attempts + automatic lockout
-- [ ] 17.9 ⏳ Password policy — minimum length, complexity, expiration, history
-- [ ] 17.10 ⏳ IP allowlist per user — pg_hba.conf with rules per IP/CIDR
-- [ ] 17.11 ⏳ Connection rate limiting — max connections per second per user/IP
-- [ ] 17.12 ⏳ Log levels and rotation — trace/debug/info/warn/error + daily rotation
-- [ ] 17.13 ⏳ SQL injection prevention — mandatory prepared statements in wire protocol; detect and block direct interpolation in internal APIs
-- [ ] 17.14 ⏳ Security tests — RLS bypass attempts, brute force, SQL injection, privilege escalation
-- [ ] 17.17 ⏳ Column-level GRANT — `GRANT SELECT (name, email, created_at) ON patients TO nurse_role`; deny access to diagnosis, ssn, medication columns for that role; currently Phase 17.2 grants at table level only; column-level is required when different departments have different sensitivity levels
-- [ ] 17.22 ⏳ Transparent Data Encryption (TDE) at tablespace level — `CREATE DATABASE axiomdb ENCRYPTION = 'AES-256-GCM'`; the engine encrypts all pages before writing to disk and decrypts on read; the application sees plaintext — zero code changes required; the `.db` file is meaningless without the key even if stolen from disk; key stored separately from data (configurable: local keystore, HSM, AWS KMS, Vault); complements Phase 17.15 (column-level encryption) — TDE protects the whole database at rest, column encryption protects specific fields even from DBAs; required for PCI-DSS, HIPAA, SOC 2 compliance where full disk encryption of database files is mandatory engine tracks storage used per schema/tenant and rejects INSERTs when quota is exceeded with a clear SQLSTATE error; `SELECT * FROM axiom_tenant_usage` for monitoring; critical for SaaS billing and preventing one tenant from monopolizing disk space
-
----
-
-## BLOCK 5 — High Availability (Phases 18-19)
-
-### Phase 18 — High availability `⏳` week 41-43
-- [ ] 18.1 ⏳ Streaming replication — send WAL in real time to replica
-- [ ] 18.2 ⏳ Replica apply — receive and apply WAL entries
-- [ ] 18.3 ⏳ Configurable synchronous commit — off, local, remote_write, remote_apply
-- [ ] 18.4 ⏳ Cascading replication — replica retransmits to sub-replicas
-- [ ] 18.5 ⏳ Hot standby — reads from replica while applying WAL
-- [ ] 18.6 ⏳ PITR — restore to the exact second using archived WAL
-- [ ] 18.7 ⏳ Hot backup — `BACKUP DATABASE` without locking
-- [ ] 18.8 ⏳ WAL archiving — copy WAL segments to external storage (S3/local) automatically; prerequisite for PITR (18.6)
-- [ ] 18.9 ⏳ Replica lag monitoring — `replication_lag_bytes` and `replication_lag_seconds` metrics exposed in virtual system `sys.replication_status`
-- [ ] 18.10 ⏳ Basic automatic failover — detect primary down + promote standby; minimal configuration without Raft
-- [ ] 18.11 ⏳ Replication slot WAL retention protection — `max_replication_slot_wal_keep = '10 GB'` (safe default); when a replica falls behind and the retention limit is reached, the slot is dropped gracefully and the replica is disconnected with a clear error instead of silently filling the primary's disk; `SELECT * FROM axiom_replication_slots` shows slot name, active, wal_retained_bytes, age; this is a known production outage cause in PostgreSQL (fixed in PG 13 but not as default) — we ship with a safe default from day one
-
-### Phase 19 — Maintenance + observability `⏳` week 44-46
-- [ ] 19.1 ⏳ Auto-vacuum — background task in Tokio, configurable threshold per table
-- [ ] 19.2 ⏳ VACUUM CONCURRENTLY — compact without blocking reads or writes
-- [ ] 19.3 ⏳ Deadlock detection — DFS on wait graph every 100ms; ⚠️ TRIPLICATE: same feature also in 13.8 and 40.6 — implement once in Phase 40.6, then mark all three
-- [ ] 19.4 ⏳ Statement fingerprinting — normalize SQL (remove literals, replace with `$1`, `$2`); hash the result to group identical queries with different parameters; prerequisite for pg_stat_statements and slow query log
-- [ ] 19.4b ⏳ pg_stat_statements — fingerprint (via 19.4) + calls + total/min/max/stddev time + cache hits/misses per query
-- [ ] 19.5 ⏳ Slow query log — JSON with execution plan
-- [ ] 19.6 ⏳ Connection pooling — Semaphore + built-in idle pool; ⚠️ DUPLICATE of 16.10 — implement once and mark both
-- [ ] 19.7 ⏳ pg_stat_activity — view and cancel running queries
-- [ ] 19.7b ⏳ Cancel / kill query — `SELECT axiom_cancel_query(pid)` sends cancellation signal to a running query (like `pg_cancel_backend`); `axiom_terminate_session(pid)` forcibly closes a connection; without this, a runaway `SELECT * FROM logs` (millions of rows) cannot be stopped without restarting the server; integrates with pg_stat_activity (19.7) to expose the pid (moved from 7.18)
-- [ ] 19.8 ⏳ pg_stat_progress_vacuum — real-time vacuum progress
-- [x] 19.9 ✅ lock_timeout — implemented in Phase 7.10: `SET lock_timeout = N`; `DbError::LockTimeout` with MySQL error 1205 + SQLSTATE 40001; `lock_wait_timeout`/`innodb_lock_wait_timeout` aliases; per-session; default 30s
-- [ ] 19.10 ⏳ deadlock_timeout — how long to wait before running deadlock detector
-- [ ] 19.11 ⏳ idle_in_transaction_session_timeout — kill abandoned transactions
-- [ ] 19.12 ⏳ pg_stat_user_tables — seq_scan, idx_scan, n_live_tup, n_dead_tup per table
-- [ ] 19.13 ⏳ pg_stat_user_indexes — idx_scan, idx_tup_read per index
-- [ ] 19.14 ⏳ Table/index bloat detection — dead_tup/live_tup ratio with alert threshold
-- [ ] 19.15 ⏳ REINDEX TABLE / INDEX / DATABASE — rebuild corrupt or bloated indexes
-- [ ] 19.16 ⏳ REINDEX CONCURRENTLY — rebuild index without blocking writes
-- [ ] 19.17 ⏳ Prometheus metrics endpoint — `/metrics` HTTP on configurable port; expose ops/s, p99 latency, cache hit rate, replication lag
-- [ ] 19.18 ⏳ Health check endpoint — `/health` and `/ready` for load balancers; verify WAL, storage and replicas
-- [ ] 19.19 ⏳ pg_stat_wal — bytes written, syncs, sync time; detect WAL as bottleneck
-- [ ] 19.21 ⏳ performance_schema equivalent — `axiom_performance_schema` namespace with: `events_statements_current` (running queries with digest, timer, rows_examined), `events_statements_history` (last 10 per connection), `events_waits_current` (lock waits, I/O waits), `table_io_waits_summary_by_table` (read/write latency per table), `file_io_summary` (bytes read/written per file); activated via `SET axiom_performance_schema = ON`; zero overhead when off (unlike MySQL where it's always on); MySQL monitoring tools (PMM, Datadog, New Relic MySQL integration) query these tables — this makes those tools work with AxiomDB without a custom plugin
-- [ ] 19.21b ⏳ Lock contention visibility — `SELECT * FROM axiom_lock_waits` shows: waiting_pid, blocking_pid, waiting_query, lock_type, wait_duration; `SELECT * FROM axiom_locks` shows all currently held locks; essential for diagnosing deadlocks in production without guessing; sits alongside the rest of the axiom_* monitoring views (moved from 7.19)
-- [ ] 19.20 ⏳ Audit trail infrastructure — write audit logs async (circular buffer, without blocking writer); JSON format with: user, IP, SQL, bind params, rows_affected, duration, result; daily rotation; prerequisite for 17.7 (CREATE AUDIT POLICY)
-
----
-
-## BLOCK 6 — Complete Types and SQL (Phases 20-21)
 
 ### Phase 20 — Types + import/export `⏳` week 47-48
 - [ ] 20.1 ⏳ Regular views — `CREATE VIEW` and updatable views
@@ -340,48 +265,6 @@
 - [ ] 21.25 ⏳ PIVOT dynamic — `SELECT * FROM sales PIVOT (SUM(amount) FOR month IN ('Jan', 'Feb', 'Mar', 'Apr'))` transforms rows into columns dynamically; unlike CASE WHEN (which requires knowing column names at write time), dynamic PIVOT adapts to the data; BI reports, cross-tab analysis, cohort studies, financial summaries by period
 - [ ] 21.24 ⏳ ORM compatibility tier 2 — Prisma and ActiveRecord connect; migrations with RETURNING, GENERATED IDENTITY and deferred FK; document incompatibilities
 
----
-
-## BLOCK 7 — Platform + Compatibility (Phases 22b-23)
-
-> **Note:** Phase 22 (Vector + GIS), 22c (GraphQL), 22d (OData), 22e (Toolkit) moved to `features-roadmap.md` — verticales / APIs alternativas sobre el core DB.
-
-### Phase 22b — Platform features `🔄` week 55-57
-- [ ] 22b.1 ⏳ Scheduled jobs — `cron_schedule()` with `tokio-cron-scheduler`
-- [ ] 22b.2 ⏳ Foreign Data Wrappers — HTTP + PostgreSQL as external sources
-- [x] 22b.3a ✅ Database catalog + `CREATE/DROP DATABASE` — persisted `axiom_databases`, catalog-backed `SHOW DATABASES`, validated `USE` / `COM_INIT_DB`, legacy tables default to `axiomdb`
-- [ ] 22b.3b ⏳ Cross-database queries — `database.schema.table`, cross-db SELECT / JOIN / DML
-- [ ] 22b.4 ⏳ Schema namespacing — `CREATE SCHEMA`, `schema.table`
-- [ ] 22b.5 ⏳ Schema migrations CLI — `axiomdb migrate up/down/status`
-- [ ] 22b.6 ⏳ FDW pushdown — push SQL predicates to remote origin when possible; avoid fetching unnecessary rows
-
-### Phase 23 — Backwards compatibility `⏳` week 68-71
-- [ ] 23.1 ⏳ Native SQLite reader — parse binary `.db`/`.sqlite` format
-- [ ] 23.2 ⏳ ATTACH sqlite — `ATTACH 'file.sqlite' AS src USING sqlite`
-- [ ] 23.3 ⏳ Migrate from MySQL — `axiomdb migrate from-mysql` with `mysql_async`
-- [ ] 23.4 ⏳ Migrate from PostgreSQL — `axiomdb migrate from-postgres` with `tokio-postgres`
-- [ ] 23.5 ⏳ PostgreSQL wire protocol — port 5432, psql and psycopg2 connect
-- [ ] 23.6 ⏳ Both protocols simultaneously — :3306 MySQL + :5432 PostgreSQL
-- [ ] 23.7 ⏳ ORM compatibility tests — Django ORM, SQLAlchemy, ActiveRecord, Prisma connect without changes
-- [ ] 23.8 ⏳ Dump / restore compatibility — read dumps from `mysqldump` and `pg_dump --format=plain`
-- [ ] 23.9 ⏳ ORM compatibility tier 3 — Typeorm (async), psycopg3 (Python), SQLx (Rust compile-time) connect; benchmark queries/s vs native PostgreSQL
-
----
-
-> **🏁 PRODUCTION-READY CHECKPOINT — week ~67**
-> On completing Phase 23, AxiomDB must be able to:
-> - MySQL + PostgreSQL wire protocols simultaneously
-> - All major ORMs (Django, SQLAlchemy, Prisma, ActiveRecord, Typeorm, psycopg3)
-> - Schema migrations with standard tools (Alembic, Rails migrate, Prisma migrate)
-> - Import existing DBs from MySQL/PostgreSQL/SQLite
-> - Full observability (metrics, logs, EXPLAIN ANALYZE in JSON)
->
-> **ORM target at this point:** all tier 3 ORMs without workarounds.
-
----
-
-## BLOCK 8 — Complete Type System (Phases 24-26)
-
 ### Phase 24 — Complete types `⏳` week 67-69
 - [ ] 24.1 ⏳ Integers: TINYINT, SMALLINT, BIGINT, HUGEINT + U variants
 - [ ] 24.1b ⏳ SERIAL / BIGSERIAL — convenient auto-increment types (INT + SEQUENCE + DEFAULT)
@@ -430,7 +313,118 @@
 
 ---
 
-## BLOCK 9 — Professional SQL (Phases 27-30)
+## Block D — Server Logic + Security + Observability (⏳ pending)
+
+UDFs, triggers, stored procedures, pooler. Auth, RBAC, TLS, RLS, audit, TDE. pg_stat_*, auto-vacuum, Prometheus, health.
+
+### Phase 16 — Server logic `⏳` week 36-38
+- [ ] 16.1 ⏳ Scalar SQL UDFs — `CREATE FUNCTION ... AS $$ ... $$`
+- [ ] 16.2 ⏳ Table SQL UDFs — return multiple rows
+- [ ] 16.3 ⏳ BEFORE/AFTER triggers — with `WHEN` condition and `SIGNAL`
+- [ ] 16.3b ⏳ INSTEAD OF triggers — INSERT/UPDATE/DELETE logic over views
+- [ ] 16.7 ⏳ Stored procedures — `CREATE PROCEDURE` with flow control (`IF`, `LOOP`, `WHILE`, `BEGIN/END`)
+- [ ] 16.8 ⏳ Exception handling in procedures — `DECLARE ... HANDLER FOR SQLSTATE`, re-raise, cleanup handlers
+- [ ] 16.9 ⏳ UDF and trigger tests — correctness, error handling, WHEN conditions, INSTEAD OF over views
+- [ ] 16.10 ⏳ Built-in connection pooler
+
+### Phase 17 — Security `⏳` week 39-40
+- [ ] 17.1 ⏳ CREATE USER / CREATE ROLE — user and role model
+- [ ] 17.2 ⏳ GRANT / REVOKE — permissions per table and per column
+- [ ] 17.3 ⏳ Row-Level Security — `CREATE POLICY empresa_isolation ON cuentas USING (empresa_id = current_setting('app.empresa_id')::INT)`; policies applied automatically on every SELECT/INSERT/UPDATE/DELETE without application code changes; multiple policies per table combined with OR; `FORCE ROW LEVEL SECURITY` for table owners; critical for multi-tenant accounting software where one DB instance serves multiple companies and data isolation is a legal requirement
+- [ ] 17.4 ⏳ Argon2id — password hashing + Scram-SHA-256 in handshake
+- [ ] 17.5 ⏳ TLS 1.3 — encrypted connections with `tokio-rustls`
+- [ ] 17.6 ⏳ Statement timeout — per user, session and global
+- [ ] 17.7 ⏳ Audit trail — `CREATE AUDIT POLICY` with automatic logging
+- [ ] 17.8 ⏳ Account lockout — tracking failed attempts + automatic lockout
+- [ ] 17.9 ⏳ Password policy — minimum length, complexity, expiration, history
+- [ ] 17.10 ⏳ IP allowlist per user — pg_hba.conf with rules per IP/CIDR
+- [ ] 17.11 ⏳ Connection rate limiting — max connections per second per user/IP
+- [ ] 17.12 ⏳ Log levels and rotation — trace/debug/info/warn/error + daily rotation
+- [ ] 17.13 ⏳ SQL injection prevention — mandatory prepared statements in wire protocol; detect and block direct interpolation in internal APIs
+- [ ] 17.14 ⏳ Security tests — RLS bypass attempts, brute force, SQL injection, privilege escalation
+- [ ] 17.17 ⏳ Column-level GRANT — `GRANT SELECT (name, email, created_at) ON patients TO nurse_role`; deny access to diagnosis, ssn, medication columns for that role; currently Phase 17.2 grants at table level only; column-level is required when different departments have different sensitivity levels
+- [ ] 17.22 ⏳ Transparent Data Encryption (TDE) at tablespace level — `CREATE DATABASE axiomdb ENCRYPTION = 'AES-256-GCM'`; the engine encrypts all pages before writing to disk and decrypts on read; the application sees plaintext — zero code changes required; the `.db` file is meaningless without the key even if stolen from disk; key stored separately from data (configurable: local keystore, HSM, AWS KMS, Vault); complements Phase 17.15 (column-level encryption) — TDE protects the whole database at rest, column encryption protects specific fields even from DBAs; required for PCI-DSS, HIPAA, SOC 2 compliance where full disk encryption of database files is mandatory engine tracks storage used per schema/tenant and rejects INSERTs when quota is exceeded with a clear SQLSTATE error; `SELECT * FROM axiom_tenant_usage` for monitoring; critical for SaaS billing and preventing one tenant from monopolizing disk space
+
+### Phase 19 — Maintenance + observability `⏳` week 44-46
+- [ ] 19.1 ⏳ Auto-vacuum — background task in Tokio, configurable threshold per table
+- [ ] 19.2 ⏳ VACUUM CONCURRENTLY — compact without blocking reads or writes
+- [ ] 19.3 ⏳ Deadlock detection — DFS on wait graph every 100ms; ⚠️ TRIPLICATE: same feature also in 13.8 and 40.6 — implement once in Phase 40.6, then mark all three
+- [ ] 19.4 ⏳ Statement fingerprinting — normalize SQL (remove literals, replace with `$1`, `$2`); hash the result to group identical queries with different parameters; prerequisite for pg_stat_statements and slow query log
+- [ ] 19.4b ⏳ pg_stat_statements — fingerprint (via 19.4) + calls + total/min/max/stddev time + cache hits/misses per query
+- [ ] 19.5 ⏳ Slow query log — JSON with execution plan
+- [ ] 19.6 ⏳ Connection pooling — Semaphore + built-in idle pool; ⚠️ DUPLICATE of 16.10 — implement once and mark both
+- [ ] 19.7 ⏳ pg_stat_activity — view and cancel running queries
+- [ ] 19.7b ⏳ Cancel / kill query — `SELECT axiom_cancel_query(pid)` sends cancellation signal to a running query (like `pg_cancel_backend`); `axiom_terminate_session(pid)` forcibly closes a connection; without this, a runaway `SELECT * FROM logs` (millions of rows) cannot be stopped without restarting the server; integrates with pg_stat_activity (19.7) to expose the pid (moved from 7.18)
+- [ ] 19.8 ⏳ pg_stat_progress_vacuum — real-time vacuum progress
+- [x] 19.9 ✅ lock_timeout — implemented in Phase 7.10: `SET lock_timeout = N`; `DbError::LockTimeout` with MySQL error 1205 + SQLSTATE 40001; `lock_wait_timeout`/`innodb_lock_wait_timeout` aliases; per-session; default 30s
+- [ ] 19.10 ⏳ deadlock_timeout — how long to wait before running deadlock detector
+- [ ] 19.11 ⏳ idle_in_transaction_session_timeout — kill abandoned transactions
+- [ ] 19.12 ⏳ pg_stat_user_tables — seq_scan, idx_scan, n_live_tup, n_dead_tup per table
+- [ ] 19.13 ⏳ pg_stat_user_indexes — idx_scan, idx_tup_read per index
+- [ ] 19.14 ⏳ Table/index bloat detection — dead_tup/live_tup ratio with alert threshold
+- [ ] 19.15 ⏳ REINDEX TABLE / INDEX / DATABASE — rebuild corrupt or bloated indexes
+- [ ] 19.16 ⏳ REINDEX CONCURRENTLY — rebuild index without blocking writes
+- [ ] 19.17 ⏳ Prometheus metrics endpoint — `/metrics` HTTP on configurable port; expose ops/s, p99 latency, cache hit rate, replication lag
+- [ ] 19.18 ⏳ Health check endpoint — `/health` and `/ready` for load balancers; verify WAL, storage and replicas
+- [ ] 19.19 ⏳ pg_stat_wal — bytes written, syncs, sync time; detect WAL as bottleneck
+- [ ] 19.21 ⏳ performance_schema equivalent — `axiom_performance_schema` namespace with: `events_statements_current` (running queries with digest, timer, rows_examined), `events_statements_history` (last 10 per connection), `events_waits_current` (lock waits, I/O waits), `table_io_waits_summary_by_table` (read/write latency per table), `file_io_summary` (bytes read/written per file); activated via `SET axiom_performance_schema = ON`; zero overhead when off (unlike MySQL where it's always on); MySQL monitoring tools (PMM, Datadog, New Relic MySQL integration) query these tables — this makes those tools work with AxiomDB without a custom plugin
+- [ ] 19.21b ⏳ Lock contention visibility — `SELECT * FROM axiom_lock_waits` shows: waiting_pid, blocking_pid, waiting_query, lock_type, wait_duration; `SELECT * FROM axiom_locks` shows all currently held locks; essential for diagnosing deadlocks in production without guessing; sits alongside the rest of the axiom_* monitoring views (moved from 7.19)
+- [ ] 19.20 ⏳ Audit trail infrastructure — write audit logs async (circular buffer, without blocking writer); JSON format with: user, IP, SQL, bind params, rows_affected, duration, result; daily rotation; prerequisite for 17.7 (CREATE AUDIT POLICY)
+
+---
+
+## Block E — High Availability (⏳ pending)
+
+Streaming replication, hot standby, PITR, backup, WAL archive, failover, replica lag monitoring.
+
+### Phase 18 — High availability `⏳` week 41-43
+- [ ] 18.1 ⏳ Streaming replication — send WAL in real time to replica
+- [ ] 18.2 ⏳ Replica apply — receive and apply WAL entries
+- [ ] 18.3 ⏳ Configurable synchronous commit — off, local, remote_write, remote_apply
+- [ ] 18.4 ⏳ Cascading replication — replica retransmits to sub-replicas
+- [ ] 18.5 ⏳ Hot standby — reads from replica while applying WAL
+- [ ] 18.6 ⏳ PITR — restore to the exact second using archived WAL
+- [ ] 18.7 ⏳ Hot backup — `BACKUP DATABASE` without locking
+- [ ] 18.8 ⏳ WAL archiving — copy WAL segments to external storage (S3/local) automatically; prerequisite for PITR (18.6)
+- [ ] 18.9 ⏳ Replica lag monitoring — `replication_lag_bytes` and `replication_lag_seconds` metrics exposed in virtual system `sys.replication_status`
+- [ ] 18.10 ⏳ Basic automatic failover — detect primary down + promote standby; minimal configuration without Raft
+- [ ] 18.11 ⏳ Replication slot WAL retention protection — `max_replication_slot_wal_keep = '10 GB'` (safe default); when a replica falls behind and the retention limit is reached, the slot is dropped gracefully and the replica is disconnected with a clear error instead of silently filling the primary's disk; `SELECT * FROM axiom_replication_slots` shows slot name, active, wal_retained_bytes, age; this is a known production outage cause in PostgreSQL (fixed in PG 13 but not as default) — we ship with a safe default from day one
+
+---
+
+## Block F — Platform + Compatibility (⏳ pending)
+
+Partitioning baseline, schemas, cross-database queries, migrations CLI, FDW, scheduled jobs, MySQL + PostgreSQL wire compat.
+
+### Phase 14 — TimescaleDB + Redis + Content-addressed BLOB `⏳` week 32-33
+- [ ] 14.1 ⏳ Table partitioning — `PARTITION BY RANGE/HASH/LIST`
+- [ ] 14.2 ⏳ Partition pruning — query planner skips irrelevant partitions
+
+### Phase 22b — Platform features `🔄` week 55-57
+- [ ] 22b.1 ⏳ Scheduled jobs — `cron_schedule()` with `tokio-cron-scheduler`
+- [ ] 22b.2 ⏳ Foreign Data Wrappers — HTTP + PostgreSQL as external sources
+- [x] 22b.3a ✅ Database catalog + `CREATE/DROP DATABASE` — persisted `axiom_databases`, catalog-backed `SHOW DATABASES`, validated `USE` / `COM_INIT_DB`, legacy tables default to `axiomdb`
+- [ ] 22b.3b ⏳ Cross-database queries — `database.schema.table`, cross-db SELECT / JOIN / DML
+- [ ] 22b.4 ⏳ Schema namespacing — `CREATE SCHEMA`, `schema.table`
+- [ ] 22b.5 ⏳ Schema migrations CLI — `axiomdb migrate up/down/status`
+- [ ] 22b.6 ⏳ FDW pushdown — push SQL predicates to remote origin when possible; avoid fetching unnecessary rows
+
+### Phase 23 — Backwards compatibility `⏳` week 68-71
+- [ ] 23.1 ⏳ Native SQLite reader — parse binary `.db`/`.sqlite` format
+- [ ] 23.2 ⏳ ATTACH sqlite — `ATTACH 'file.sqlite' AS src USING sqlite`
+- [ ] 23.3 ⏳ Migrate from MySQL — `axiomdb migrate from-mysql` with `mysql_async`
+- [ ] 23.4 ⏳ Migrate from PostgreSQL — `axiomdb migrate from-postgres` with `tokio-postgres`
+- [ ] 23.5 ⏳ PostgreSQL wire protocol — port 5432, psql and psycopg2 connect
+- [ ] 23.6 ⏳ Both protocols simultaneously — :3306 MySQL + :5432 PostgreSQL
+- [ ] 23.7 ⏳ ORM compatibility tests — Django ORM, SQLAlchemy, ActiveRecord, Prisma connect without changes
+- [ ] 23.8 ⏳ Dump / restore compatibility — read dumps from `mysqldump` and `pg_dump --format=plain`
+- [ ] 23.9 ⏳ ORM compatibility tier 3 — Typeorm (async), psycopg3 (Python), SQLx (Rust compile-time) connect; benchmark queries/s vs native PostgreSQL
+
+---
+
+## Block G — Query Optimizer + SQL Pro (⏳ pending)
+
+Real query optimizer (DP, cardinality, adaptive), SQL completeness edge cases, full function library, pro infrastructure.
 
 ### Phase 27 — Real Query Optimizer `⏳` week 76-78
 - [ ] 27.1 ⏳ Join ordering — dynamic programming, 2^N subsets
@@ -514,9 +508,19 @@
 
 ---
 
-## BLOCK 10 — Final Features + Deployment (Phases 31-32, 35)
+## Block H — Final Polish + Deployment (⏳ pending)
 
-> **Note:** Phase 33 (AI embeddings), 33b/c/d (AI functions / RAG / intelligence), 34 (Distributed sharding + Raft + 2PC) moved to `features-roadmap.md`.
+Testing (deterministic simulation, EXPLAIN ANALYZE, benchmarks), final features, architecture polish, AxiomStudio + DevEx + CI/CD.
+
+### Phase 12 — Testing + EXPLAIN ANALYZE + Benchmarks `⏳` week 65-68
+- [ ] 12.1 ⏳ Deterministic simulation testing — `FaultInjector` with seed
+- [ ] 12.2 ⏳ EXPLAIN ANALYZE — real times per plan node; JSON output format compatible with PostgreSQL (`{"Plan":{"Node Type":..., "Actual Rows":..., "Actual Total Time":..., "Buffers":{}}}`) and indented text format for psql/CLI; metrics: actual rows, loops, shared/local buffers hit/read, planning time, execution time
+- [ ] 12.4 ⏳ Final block 1 benchmarks — compare with MySQL and SQLite
+- [ ] 12.5 ⏳ SQL parser fuzz testing — `cargo fuzz` on the parser with random inputs; register crashes as regression tests
+- [ ] 12.6 ⏳ Storage fuzz testing — pages with random bytes, deliberate corruptions; verify that crash recovery handles corrupted data
+- [ ] 12.7 ⏳ ORM compatibility tier 1 — Django ORM and SQLAlchemy connect, run simple migrations and SELECT/INSERT/UPDATE/DELETE queries without errors; document workarounds if any
+- [ ] 12.8 ⏳ Unified axiom_* observability system — all system views use consistent naming, types, and join keys; `SELECT * FROM axiom_queries` shows running queries with pid, duration, state, sql_text, plan_hash; `SELECT * FROM axiom_bloat` shows table bloat (from 7.11); `SELECT * FROM axiom_slow_queries` is auto-populated when query exceeds `slow_query_threshold` (default 1s); `SELECT * FROM axiom_stats` shows database-wide metrics (cache hit rate, rows read/written, lock waits); `SELECT * FROM axiom_index_usage` shows which indexes are used/unused; unlike MySQL's inconsistent SHOW commands and PostgreSQL's complex pg_catalog joins, every axiom_* view is self-documented, joinable, and has the same timestamp/duration formats
+- [x] 12.9 ✅ Date/time validation strictness — closed by verification: `coerce_helpers::parse_text_to_date_days` delegates to `ymd_to_days_checked` which rejects every out-of-range component (month ∉ 1..=12, day ∉ 1..=days_in_month including leap-year math for February). `'0000-00-00'`, `'2024-13-01'`, `'2024-00-15'`, `'2024-02-30'`, `'2023-02-29'`, `'2024-04-31'` all surface as `DbError::InvalidCoercion`. Regression coverage: `tests/integration_date_strictness.rs` (9 tests). `TIMESTAMP WITH TIME ZONE` / `SET AXIOM_COMPAT='mysql'` lenient opt-in deferred to a dedicated follow-up — current behavior matches MySQL strict mode
 
 ### Phase 31 — Final features `⏳` week 88-90
 - [ ] ⚠️ 31.1 duplicate of 17.22 — Encryption at rest (TDE AES-256-GCM) is tracked there; remove this item when 17.22 is implemented
@@ -587,13 +591,47 @@
 
 ---
 
-### Phase 39 🔄 (26/38) — Clustered index storage engine: variable-size slotted leaf+internal pages, clustered B-Tree insert+lookup+range+update+delete+rebalance (byte-volume splits, separator propagation, root collapse), secondary PK bookmarks (`secondary_key ++ missing_PK_cols`), overflow pages (local prefix + chain), WAL (ClusteredRowImage, EntryType::Clustered*), crash recovery (PK-based undo/redo), SQL executor integration (CREATE TABLE/INSERT/SELECT/UPDATE/DELETE for explicit-PK tables), VACUUM (clustered purge + overflow free + secondary cleanup), heap→clustered rebuild (ALTER TABLE REBUILD), aggregate hash (GroupTablePrimitive/Generic, 14.25× speedup), zero-alloc clustered scan (scan_all_callback), UPDATE in-place field patch (≥1M r/s); 39.22 ✅
-- [ ] ⚠️ Clustered older-version reconstruction (MVCC version chains) — lookup/range/update return None for invisible current versions; deferred to later clustered MVCC / version-chain work (affects 39.4, 39.5, 39.6, 39.8, 39.14, 39.15)
-- [ ] ⚠️ Clustered root checkpoint persistence — roots still reconstructed from WAL history after crash; checkpoint/rotation-stable persistence deferred (39.12)
-- [ ] ⚠️ FK enforcement for clustered child tables — parent-side enforcement works; child-table deferred (39.17)
-- [ ] ⚠️ Parent separator repair page overflow — repair assumes new separator fits in current internal page budget; revisit in 39.20 (39.8)
-- [ ] ⚠️ 39.19b — ALTER TABLE ADD/DROP COLUMN on clustered tables: code complete (246 lines, `rewrite_rows_clustered`, 13 tests) but NOT YET COMMITTED
-### Phase 40 ✅ (16/16) — Clustered Engine Performance: ClusteredInsertBatch (55.9K r/s, +59% vs MySQL 8), CREATE INDEX on clustered tables, statement plan cache (OID-based invalidation, LRU eviction), StorageEngine interior mutability (64-shard PageLockTable), ALTER TABLE ADD/DROP/MODIFY on clustered, INSERT DEFAULT VALUES + SHOW INDEX, concurrent WAL writer (lock-free LSN reservation, group commit leader/follower), per-connection TxnState + atomic MVCC snapshots (DuckDB GC horizon), Lock Manager (5 modes, 64-shard, InnoDB-pattern), deadlock detection (Brent's O(1) cycle-finding), HeapChain concurrent access (page X-latch, atomic chain growth), B-tree latch coupling (hybrid optimistic/pessimistic, both index+clustered trees), FreeList tier-1 batch (703× speedup 8-thread), database lock redesign (SharedDatabase, per-subsystem sync, DDL write lock / DML read lock), executor lock integration (IX table + X row per DML), integration tests (2540 workspace tests, 8 concurrent DML tests)
+## GAP CLOSURE — Auditoría 2026-04-08
+
+> Hallazgos de la auditoría completa de 5 subsistemas.
+> Spec: `specs/fase-gap-audit/audit-2026-04-08.md`
+> Orden de ejecución: GAP-A → GAP-B → GAP-C
+
+### GAP-A — Hardening: eliminar panics de producción `⏳`
+<!-- PRIORIDAD: CRÍTICA — hacer antes de cualquier otra implementación -->
+- [x] GAP-A.1 ✅ key_encoding.rs — closed: decode paths have no unwrap/expect; truncated index key now surfaces as `DbError::BTreeCorrupted` and unit test covers truncation
+- [x] GAP-A.2 ✅ eval/batch.rs — closed: replaced 12 `try_into().unwrap()` with `try_into().unwrap_or_default()` in BatchPredicate; all sites were already bounds-checked, defensive fallback prevents panic on corrupted data
+- [x] GAP-A.3 ✅ schema_constraints.rs — closed: replaced 15 try_into().unwrap() with unwrap_or_default() in ConstraintDef/FkDef deserialization
+- [x] GAP-A.4 ✅ doublewrite.rs — closed: size math via checked ops (`dw_expected_size`), defensive parsing (no `expect()` on on-disk bytes), added regression test for extreme slot_count
+- [x] GAP-A.5 ✅ fsync_pipeline.rs — closed: replaced 4 .expect("poisoned") with .unwrap_or_else(|e| e.into_inner()) to recover from poisoned Mutex
+- [x] GAP-A.6 ✅ notifier.rs — closed: replaced 3 .expect("poisoned") with .unwrap_or_else(|e| e.into_inner()) on RwLock
+- [x] GAP-A.7 ✅ agg_accum.rs — closed: replaced 8 simple_arg.unwrap() with require_arg() helper that returns DbError::Internal instead of panic
+- [x] GAP-A.8 ✅ exec_with_ctx.rs — closed: improved 18 expect() messages to document the invariant guarding each call (is_some() check or preceding begin()); all sites are structurally safe
+
+### GAP-B — MySQL wire compat crítica `⏳`
+<!-- PRIORIDAD: ALTA — desbloquea ORMs y clientes -->
+- [x] GAP-B.1 ✅ UNION / UNION ALL — closed: `Stmt::Union { selects, all }` AST variant; parser detects `UNION [ALL]` after SELECT and chains multiple SELECTs; executor materializes each SELECT then concatenates (ALL) or hash-deduplicates (UNION); analyzer resolves columns in all branches; supports chained triple+ UNIONs, NULLs, literals, aliases
+- [x] GAP-B.2 ✅ Column type wire codes — closed: existing types already sent correct codes; added parser aliases for TINYINT→Bool, SMALLINT→Int, MEDIUMINT→Int, YEAR→Int, TIME→Timestamp in parse_data_type(); DATETIME already worked as Timestamp alias
+- [x] GAP-B.3 ✅ DECIMAL column type — ColumnType::Decimal added (catalog + executor mappings). Storage: row codec already uses `Value::Decimal(i128,u8)` (mantissa+scale). MySQL wire advertises NEWDECIMAL (0xf6). Comparisons support `Decimal` vs numeric `Text` (ORM-friendly). Integration test covers CREATE/INSERT/SELECT/WHERE.
+- [x] GAP-B.4 ✅ DATE column type independiente — ColumnType::Date added (catalog + executor mappings). Storage: `Value::Date(i32)` days-since-epoch. MySQL wire advertises DATE (0x0a) + binary DATE encode/decode. Column assignment supports `Text`→`Date` for ISO `YYYY-MM-DD` (time part ignored). Integration test covers CREATE/INSERT/SELECT.
+- [x] GAP-B.5 ✅ Multi-table DELETE/UPDATE JOIN — closed: parser/analyzer support `UPDATE t JOIN s ON ... SET t.col=...` and `DELETE t FROM t JOIN s ON ...`; ctx executor materializes JOIN candidates, deduplicates target RIDs, and reuses UPDATE/DELETE heap/index/FK paths; integration coverage includes assignment from joined table and DELETE target alias
+- [x] GAP-B.6 ✅ FK RENAME TABLE fix — closed by verification: FK catalog rows store `child_table_id` / `parent_table_id`, so parent/child table renames preserve enforcement without name rewrites; integration coverage added for `RENAME TABLE` parent rename, `ALTER TABLE ... RENAME TO` parent rename, and child rename
+- [x] GAP-B.7 ✅ SHOW PROCESSLIST real — closed: added `ConnectionInfo` + shared `Arc<RwLock<HashMap<u32, ConnectionInfo>>>` registry on `SharedDatabase` (`connection_registry`); new `processlist` module provides `ProcesslistGuard` (RAII register/deregister) with `set_command` / `set_database` helpers for live state updates; handler registers every authenticated connection with user, peer host, and initial db; `SHOW [FULL] PROCESSLIST` interceptor in `handler_sql_intercept.rs` now reads a sorted snapshot with real Id/User/Host/db/Command/Time columns; unit tests cover register → snapshot ordering, drop-removes, `set_command`/`set_database` mutations
+- [x] GAP-B.8 ✅ INTERSECT / EXCEPT — closed: new `Stmt::SetOp { first, rest: Vec<SetOpTail> }` AST unifies UNION/INTERSECT/EXCEPT with per-step kind + ALL flag; parser accepts chained set ops (left-assoc); executor applies left-to-right using hash-based key (per-group counts for ALL variants: INTERSECT ALL = min(L,R), EXCEPT ALL = max(0,L-R)); integration coverage in `tests/integration_set_operations.rs` (10 tests: UNION/INTERSECT/EXCEPT + ALL variants, chained mixes, arity mismatch)
+
+### GAP-C — SQL completeness + DDL robustness `⏳`
+<!-- PRIORIDAD: MEDIA — mejora significativa de compatibilidad -->
+- [x] GAP-C.1 ✅ Subquery in JOIN — closed by Phase 4.11b (`e34e9f4`); `FROM t JOIN (SELECT …) alias ON …` now has analyzer/executor wiring for join-side derived tables
+- [x] GAP-C.2 ✅ Composite FK (multi-column) — closed (scoped): `FkDef` extended with `child_col_idxs: Vec<u16>` / `parent_col_idxs: Vec<u16>`; serialization appends an `0xCF`-prefixed extension trailer only when `len > 1` so single-column rows remain bit-for-bit identical to the legacy format; `persist_composite_fk_constraint` validates that parent has a PK/UNIQUE covering the column list in order and that the child has a pre-declared matching index (auto-creation of composite FK indexes deferred); `check_fk_child_insert` encodes the composite tuple key, finds a parent index whose leading columns match, and uses exact lookup or a prefix range scan when the parent index has extra trailing columns; CREATE TABLE and ALTER TABLE ADD CONSTRAINT both route multi-col FKs through the new path. ⚠️ DEFERRED: composite-aware `check_fk_child_update` and parent-side enforcement (`enforce_fk_on_parent_delete` / `enforce_fk_on_parent_update`) still operate on the first column only — composite rows get UPDATE/DELETE parent handling as follow-up. Integration tests in `tests/integration_fk_composite.rs` (3): matched tuple accepted, mismatched tuple rejected, NULL passes MATCH SIMPLE
+- [x] GAP-C.3 ✅ ALTER TABLE DROP/MODIFY COLUMN con index — closed by verification: `alter_drop_column` already auto-drops indexes whose key depends on the dropped column (`ddl_alter_column.rs:798-801`) and rebuilds surviving indexes with remapped col_idx (clustered + heap paths); `alter_modify_column` rebuilds every dependent index from storage using the new column type (`ddl_alter_column.rs:976-999`); test coverage: `test_alter_drop_column_auto_drops_partial_index_on_heap`, `test_alter_drop_column_heap_rebuilds_surviving_indexes_and_remaps_metadata`, `test_alter_modify_column_heap_rebuilds_unique_index_and_preserves_metadata`, `drop_indexed_column_on_clustered_table_auto_drops_secondary_index`, `drop_unrelated_column_on_clustered_table_remaps_surviving_unique_index` — all passing
+- [x] GAP-C.4 ✅ ON DELETE/UPDATE SET DEFAULT — closed: added `fk_replacement_value` helper in `fk_enforcement.rs` that evaluates the child column's persisted `default_expr` (or falls back to NULL when absent — PG semantics); merged `SetNull`/`SetDefault` match arms in `enforce_fk_on_parent_delete` (clustered + heap paths) and `enforce_fk_on_parent_update`; previously NotImplemented, now fully functional; integration tests in `tests/integration_fk_set_default.rs` cover ON DELETE with default, ON UPDATE with default, and missing-default→NULL fallback
+- [x] GAP-C.5 ✅ GROUP BY WITH ROLLUP — closed: added `with_rollup: bool` to `SelectStmt`; parser recognizes `GROUP BY … WITH ROLLUP` via 2-token lookahead (`WITH` + ident `ROLLUP`); executor wraps grouped path with `execute_select_grouped_rollup` that re-runs aggregation for levels N down to 0 with progressively truncated GROUP BY list, nulling out SELECT slots for rolled-up expressions; outer ORDER BY / LIMIT / DISTINCT apply to the union of all levels; integration coverage in `tests/integration_rollup.rs` (4 tests: single-col, two-col all-levels, COUNT grand total, LIMIT)
+- [x] GAP-C.6 ✅ ALTER AUTO_INCREMENT=N — closed: `ddl_alter_column.rs` now honors `ALTER TABLE t AUTO_INCREMENT = N` by updating the `AUTO_INC_SEQ` thread-local after scanning for current max; MySQL semantics applied (`desired = max(N, max_existing + 1)` — N below current max is silently ignored); integration tests cover empty-table advance, below-max ignore, and above-max honor (`tests/integration_alter_auto_increment.rs`). NOTE: catalog-level cross-restart persistence still pending — would require adding `auto_increment_next: Option<u64>` to TableDef and migration; tracked as follow-up (current impl matches MySQL per-session behavior)
+- [x] GAP-C.7 ✅ DROP INDEX not found → error propio — closed: added `DbError::IndexNotFound { name }` variant; MySQL errno 1091 "Can't DROP; check that it exists"; replaced NotImplemented in both ON-table and scan-all paths of ddl_drop_index.rs
+- [x] GAP-C.8 ✅ Correlated subquery depth > 1 — closed: `Expr::OuterColumn` gained a `depth: u16` field carrying nesting distance (0 = immediate parent); analyzer emits depth based on outer-scope position in `resolve_expr_full`; executor `subst_expr`/`substitute_outer_at` threads a `binding_depth` parameter that only substitutes OuterColumns whose depth matches the current binding level and increments on nested subquery entry; single-equijoin materialization optimization now requires `depth: 0` to avoid misoptimizing deep refs; integration coverage: EXISTS depth-2 (positive + negative), IN subquery depth-2 (`tests/integration_correlated_depth.rs`)
+- [x] GAP-C.9 ✅ MySQL default collation case-insensitive — closed by verification: `SessionContext::effective_collation()` returns `SessionCollation::Es` (CI+AI fold) when `CompatMode::MySql` is active (`session.rs:688`); server greeting advertises `utf8mb4_0900_ai_ci` (id 255) which is MySQL 8.0's default CI collation — matches the advertised server version "8.0.36" and is semantically equivalent to id 45 (`utf8mb4_general_ci`) for CI comparison purposes; regression tests added: `gap_c9_mysql_compat_defaults_to_case_insensitive_collation` (session) + `greeting_advertises_case_insensitive_utf8mb4_collation` (packets)
+- [x] GAP-C.10 ✅ COM_STMT_SEND_LONG_DATA validación — closed by verification: `handler.rs` guards `body.len() < 6` before slicing stmt_id/param_idx, unknown stmt_id is silently ignored (MySQL wire contract — no response), `PreparedStatement::append_long_data` validates param_idx bounds and stores deferred error (surfaced on next `COM_STMT_EXECUTE`); added `checked_add` overflow guard on `current_len + chunk.len()` to protect against pathological usize overflow; unit tests cover all deferred-error paths
+
 ## USE CASE PROFILES
 
 Each profile maps a target workload to the minimum set of subfases needed to make
