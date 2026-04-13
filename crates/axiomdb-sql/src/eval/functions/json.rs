@@ -705,6 +705,59 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
         }
 
+        // ── Phase 11.25c: MySQL JSON_SEARCH ──────────────────────────────────
+        // JSON_SEARCH(doc, one|all, search_str [, escape_char [, path ...]])
+        // Returns matching JSON paths ('$.a.b') whose string values match the
+        // LIKE pattern. MVP: escape_char and path filters accepted but ignored
+        // (full-doc walk). NULL args propagate. No match → NULL.
+        "json_search" => {
+            if args.len() < 3 {
+                return Err(DbError::TypeMismatch {
+                    expected: "json_search: doc + mode + pattern [...]".into(),
+                    got: args.len().to_string(),
+                });
+            }
+            let doc = eval_arg(args, 0, row, name)?;
+            let mode_v = eval_arg(args, 1, row, name)?;
+            let pat_v = eval_arg(args, 2, row, name)?;
+            if matches!(doc, Value::Null)
+                || matches!(mode_v, Value::Null)
+                || matches!(pat_v, Value::Null)
+            {
+                return Ok(Value::Null);
+            }
+            let mode = match mode_v {
+                Value::Text(s) | Value::Json(s) => s.to_ascii_lowercase(),
+                other => other.to_string().to_ascii_lowercase(),
+            };
+            if mode != "one" && mode != "all" {
+                return Err(DbError::InvalidValue {
+                    reason: format!("json_search mode must be 'one' or 'all', got '{mode}'"),
+                });
+            }
+            let pat = match pat_v {
+                Value::Text(s) | Value::Json(s) => s,
+                other => other.to_string(),
+            };
+            let sj = value_to_serde_json(&doc)?;
+            let want_all = mode == "all";
+            let mut hits: Vec<String> = Vec::new();
+            json_search_walk(&sj, "$", &pat, &mut hits, !want_all);
+            if hits.is_empty() {
+                return Ok(Value::Null);
+            }
+            if want_all {
+                Ok(Value::Json(
+                    serde_json::Value::Array(
+                        hits.into_iter().map(serde_json::Value::String).collect(),
+                    )
+                    .to_string(),
+                ))
+            } else {
+                Ok(Value::Text(hits.into_iter().next().unwrap()))
+            }
+        }
+
         // ── Phase 11.25b: JSON constructors + merge_preserve + contains_path
         // JSON_ARRAY(v1, v2, ...) → JSON array.
         "json_array" => {
@@ -2758,6 +2811,72 @@ fn json_array_append_at(root: &mut serde_json::Value, parts: &[String], val: ser
             let taken = std::mem::replace(other, serde_json::Value::Null);
             *other = serde_json::Value::Array(vec![taken, val]);
         }
+    }
+}
+
+/// LIKE-style pattern match: `%` any-length, `_` single char.
+fn like_match(pat: &str, text: &str) -> bool {
+    let pat: Vec<char> = pat.chars().collect();
+    let txt: Vec<char> = text.chars().collect();
+    fn rec(p: &[char], t: &[char]) -> bool {
+        match p.split_first() {
+            None => t.is_empty(),
+            Some((&'%', rest)) => {
+                if rec(rest, t) {
+                    return true;
+                }
+                for i in 0..t.len() {
+                    if rec(rest, &t[i + 1..]) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Some((&'_', rest)) => !t.is_empty() && rec(rest, &t[1..]),
+            Some((&c, rest)) => match t.split_first() {
+                Some((&tc, trest)) if tc == c => rec(rest, trest),
+                _ => false,
+            },
+        }
+    }
+    rec(&pat, &txt)
+}
+
+fn json_search_walk(
+    node: &serde_json::Value,
+    path: &str,
+    pattern: &str,
+    hits: &mut Vec<String>,
+    stop_at_one: bool,
+) {
+    if stop_at_one && !hits.is_empty() {
+        return;
+    }
+    match node {
+        serde_json::Value::String(s) => {
+            if like_match(pattern, s) {
+                hits.push(path.to_string());
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for (i, v) in arr.iter().enumerate() {
+                let sub = format!("{path}[{i}]");
+                json_search_walk(v, &sub, pattern, hits, stop_at_one);
+                if stop_at_one && !hits.is_empty() {
+                    return;
+                }
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let sub = format!("{path}.{k}");
+                json_search_walk(v, &sub, pattern, hits, stop_at_one);
+                if stop_at_one && !hits.is_empty() {
+                    return;
+                }
+            }
+        }
+        _ => {}
     }
 }
 
