@@ -705,6 +705,122 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
         }
 
+        // ── Phase 11.25b: JSON constructors + merge_preserve + contains_path
+        // JSON_ARRAY(v1, v2, ...) → JSON array.
+        "json_array" => {
+            let mut items = Vec::with_capacity(args.len());
+            for i in 0..args.len() {
+                let v = eval_arg(args, i, row, name)?;
+                items.push(sql_to_serde_json(&v));
+            }
+            Ok(Value::Json(serde_json::Value::Array(items).to_string()))
+        }
+        // JSON_OBJECT(k1, v1, k2, v2, ...) → JSON object. Even arg count.
+        "json_object" => {
+            if !args.len().is_multiple_of(2) {
+                return Err(DbError::TypeMismatch {
+                    expected: "json_object: even arg count (key/value pairs)".into(),
+                    got: args.len().to_string(),
+                });
+            }
+            let mut map = serde_json::Map::with_capacity(args.len() / 2);
+            let pair_count = args.len() / 2;
+            for i in 0..pair_count {
+                let k = eval_arg(args, 2 * i, row, name)?;
+                let v = eval_arg(args, 2 * i + 1, row, name)?;
+                let key = match k {
+                    Value::Text(s) | Value::Json(s) => s,
+                    Value::Null => {
+                        return Err(DbError::InvalidValue {
+                            reason: "json_object: NULL key".into(),
+                        });
+                    }
+                    other => other.to_string(),
+                };
+                map.insert(key, sql_to_serde_json(&v));
+            }
+            Ok(Value::Json(serde_json::Value::Object(map).to_string()))
+        }
+        // JSON_MERGE_PRESERVE(d1, d2, ...) — array-concat on conflict,
+        // object-key overwrite from right. Mirrors MySQL deprecated-alias
+        // JSON_MERGE semantics.
+        "json_merge_preserve" | "json_merge" => {
+            if args.is_empty() {
+                return Err(DbError::TypeMismatch {
+                    expected: "json_merge_preserve: at least 1 arg".into(),
+                    got: "0".into(),
+                });
+            }
+            let mut acc: Option<serde_json::Value> = None;
+            for i in 0..args.len() {
+                let v = eval_arg(args, i, row, name)?;
+                if matches!(v, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let sj = value_to_serde_json(&v)?;
+                acc = Some(match acc {
+                    None => sj,
+                    Some(a) => merge_preserve(a, sj),
+                });
+            }
+            let merged = acc.unwrap();
+            Ok(Value::Json(merged.to_string()))
+        }
+        // JSON_CONTAINS_PATH(doc, 'one'|'all', p1, p2, ...) — existence check.
+        "json_contains_path" => {
+            if args.len() < 3 {
+                return Err(DbError::TypeMismatch {
+                    expected: "json_contains_path: doc + mode + path [, path ...]".into(),
+                    got: args.len().to_string(),
+                });
+            }
+            let doc = eval_arg(args, 0, row, name)?;
+            if matches!(doc, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let mode_val = eval_arg(args, 1, row, name)?;
+            let mode = match mode_val {
+                Value::Text(s) | Value::Json(s) => s.to_ascii_lowercase(),
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "'one' or 'all'".into(),
+                        got: other.variant_name().into(),
+                    });
+                }
+            };
+            if mode != "one" && mode != "all" {
+                return Err(DbError::InvalidValue {
+                    reason: format!("json_contains_path mode must be 'one' or 'all', got '{mode}'"),
+                });
+            }
+            let sj = value_to_serde_json(&doc)?;
+            let want_all = mode == "all";
+            let mut any_hit = false;
+            let mut all_hit = true;
+            for i in 2..args.len() {
+                let p = eval_arg(args, i, row, name)?;
+                let path_str = match p {
+                    Value::Text(s) | Value::Json(s) => s,
+                    Value::Null => return Ok(Value::Null),
+                    other => other.to_string(),
+                };
+                let steps = parse_jsonpath(&path_str)?;
+                if execute_jsonpath(&sj, &steps).is_empty() {
+                    all_hit = false;
+                    if want_all {
+                        return Ok(Value::Bool(false));
+                    }
+                } else {
+                    any_hit = true;
+                    if !want_all {
+                        return Ok(Value::Bool(true));
+                    }
+                }
+            }
+            Ok(Value::Bool(if want_all { all_hit } else { any_hit }))
+        }
+
         // ── Phase 11.25a: MySQL JSON completion bundle ───────────────────────
         // JSON_QUOTE(text) — serialize a TEXT string as a JSON string literal.
         "json_quote" => {
@@ -2642,6 +2758,42 @@ fn json_array_append_at(root: &mut serde_json::Value, parts: &[String], val: ser
             let taken = std::mem::replace(other, serde_json::Value::Null);
             *other = serde_json::Value::Array(vec![taken, val]);
         }
+    }
+}
+
+/// MySQL JSON_MERGE_PRESERVE semantics: arrays concatenate; objects key-merge
+/// recursively (on conflict, recursive preserve — values wrap into an array);
+/// other type mismatches promote both to an array.
+fn merge_preserve(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match (a, b) {
+        (J::Array(mut xa), J::Array(mut xb)) => {
+            xa.append(&mut xb);
+            J::Array(xa)
+        }
+        (J::Array(mut xa), other) => {
+            xa.push(other);
+            J::Array(xa)
+        }
+        (other, J::Array(mut xb)) => {
+            let mut out = vec![other];
+            out.append(&mut xb);
+            J::Array(out)
+        }
+        (J::Object(mut ma), J::Object(mb)) => {
+            for (k, v) in mb {
+                match ma.remove(&k) {
+                    Some(prev) => {
+                        ma.insert(k, merge_preserve(prev, v));
+                    }
+                    None => {
+                        ma.insert(k, v);
+                    }
+                }
+            }
+            J::Object(ma)
+        }
+        (a, b) => J::Array(vec![a, b]),
     }
 }
 
