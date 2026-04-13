@@ -60,10 +60,15 @@ fn execute_select(
         return execute_select_derived(stmt, storage, txn, conn_txn);
     }
 
+    // JSON_TABLE in FROM (Phase 11.20a).
+    if matches!(stmt.from, Some(FromClause::JsonTable(_))) {
+        return execute_select_json_table_source(stmt, storage, txn, conn_txn);
+    }
+
     // Extract the FROM table reference.
     let from_table_ref = match stmt.from.take() {
         Some(FromClause::Table(tref)) => tref,
-        _ => unreachable!("already handled None and Subquery above"),
+        _ => unreachable!("already handled None, Subquery, and JsonTable above"),
     };
 
     // INFORMATION_SCHEMA virtual tables (4.20c).
@@ -426,6 +431,107 @@ fn execute_select_derived(
     }
 
     // Build output columns from SELECT list against derived column metadata.
+    let out_cols = build_derived_output_columns(&stmt.columns, &derived_cols)?;
+    let mut rows = combined_rows
+        .iter()
+        .map(|v| project_row(&stmt.columns, v))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if stmt.distinct {
+        rows = apply_distinct_with_session(rows);
+    }
+    if stmt.calc_found_rows {
+        set_found_rows(rows.len() as u64);
+    }
+    rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
+
+    Ok(QueryResult::Rows {
+        columns: out_cols,
+        rows,
+    })
+}
+
+/// Phase 11.20a — executes a SELECT whose FROM clause is a `JSON_TABLE(...)`
+/// row source. Mirrors `execute_select_derived`: materialize the rows first,
+/// then apply WHERE / GROUP BY / ORDER BY / LIMIT on top.
+///
+/// Joins with JSON_TABLE on the first source are not supported in 11.20a —
+/// the JSON_TABLE → JOIN wiring lives in `select_joins_ctx` which requires a
+/// base TableRef FROM. Deferred to 11.20d.
+fn execute_select_json_table_source(
+    mut stmt: SelectStmt,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    _conn_txn: Option<&ConnectionTxn>,
+) -> Result<QueryResult, DbError> {
+    let jt_ast = match stmt.from.take() {
+        Some(FromClause::JsonTable(jt)) => *jt,
+        _ => unreachable!("execute_select_json_table_source called with non-JsonTable FROM"),
+    };
+
+    if !stmt.joins.is_empty() {
+        return Err(DbError::NotImplemented {
+            feature: "JSON_TABLE as the first FROM entry combined with JOIN — \
+                      deferred to 11.20d (put a real table first and JSON_TABLE on the right)"
+                .into(),
+        });
+    }
+
+    // Compile + evaluate.
+    let spec = crate::json_table::compile_json_table(&jt_ast)?;
+    let doc_val = crate::eval::eval(&jt_ast.doc, &[])?;
+    let derived_rows: Vec<Row> = match crate::json_table::doc_to_serde(&doc_val)? {
+        None => Vec::new(),
+        Some(sj) => {
+            let mut runner = crate::eval::NoSubquery;
+            crate::json_table::materialize_json_table(&spec, &sj, &[], &mut runner)?
+        }
+    };
+    let derived_cols = crate::json_table::column_metas_for_spec(&spec);
+
+    // Apply outer WHERE.
+    let mut combined_rows: Vec<Row> = Vec::new();
+    let mut sq_cache_derived: SubqueryCache = HashMap::new();
+    let mut in_set_cache_derived: InSetCache = HashMap::new();
+    let mut corr_cache_derived: CorrelatedCache = HashMap::new();
+    for values in derived_rows {
+        if let Some(ref wc) = stmt.where_clause {
+            let mut temp_ctx2 = SessionContext::new();
+            let temp_bloom2 = crate::bloom::BloomRegistry::new();
+            let mut runner = ExecSubqueryRunner {
+                storage,
+                txn,
+                bloom: &temp_bloom2,
+                ctx: &mut temp_ctx2,
+                outer_row: &values,
+                cache: Some(&mut sq_cache_derived),
+                in_set_cache: Some(&mut in_set_cache_derived),
+                correlated_cache: Some(&mut corr_cache_derived),
+                materialized: None,
+            };
+            if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
+                continue;
+            }
+        }
+        combined_rows.push(values);
+    }
+
+    // GROUP BY / aggregation.
+    if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
+        return execute_select_grouped(stmt, combined_rows, GroupByStrategy::Hash);
+    }
+
+    // ORDER BY + top-N optimization.
+    let resolved_ob = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
+    if !resolved_ob.is_empty() && stmt.limit.is_some() && !stmt.distinct && !stmt.calc_found_rows {
+        let (limit_n, offset_n) = eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
+        let top_n = offset_n + limit_n.unwrap_or(usize::MAX).min(usize::MAX - offset_n);
+        combined_rows = apply_order_by_top_n(combined_rows, &resolved_ob, top_n)?;
+    } else {
+        combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
+    }
+
+    // Projection + distinct + limit/offset.
     let out_cols = build_derived_output_columns(&stmt.columns, &derived_cols)?;
     let mut rows = combined_rows
         .iter()

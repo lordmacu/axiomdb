@@ -3064,6 +3064,62 @@ ok("SELECT 1", cur.fetchone() == (1,))
 cur.execute("SELECT version()")
 ok("version() contains AxiomDB", "AxiomDB" in cur.fetchone()[0])
 
+# ── Phase 11.20a — JSON_TABLE (flat, no NESTED PATH) ──────────────────────────
+
+print("\n[11.20a JSON_TABLE]")
+
+# Basic array shred
+cur.execute("SELECT v FROM JSON_TABLE('[1,2,3]', '$[*]' COLUMNS (v INT PATH '$')) AS t")
+rows = cur.fetchall()
+vals = [int(r[0]) for r in rows]
+ok("11.20a JSON_TABLE shreds array of scalars", vals == [1, 2, 3], f"got {vals}")
+
+# Objects + ordinality + DEFAULT ON EMPTY
+cur.execute("""SELECT ord, id, COALESCE(age, -1) FROM JSON_TABLE(
+    '[{"id":1,"age":30},{"id":2}]',
+    '$[*]' COLUMNS (
+        ord FOR ORDINALITY,
+        id  INT PATH '$.id',
+        age INT PATH '$.age' DEFAULT -1 ON EMPTY
+    )
+) AS t ORDER BY ord""")
+rows = cur.fetchall()
+ok("11.20a JSON_TABLE ordinality + DEFAULT ON EMPTY",
+   [tuple(int(x) for x in r) for r in rows] == [(1, 1, 30), (2, 2, -1)],
+   f"got {rows}")
+
+# EXISTS PATH
+cur.execute("""SELECT has_a FROM JSON_TABLE(
+    '[{"a":1},{"b":2}]',
+    '$[*]' COLUMNS (has_a BOOLEAN EXISTS PATH '$.a')
+) AS t""")
+rows = cur.fetchall()
+bools = [bool(int(r[0])) if isinstance(r[0], (int, str, bytes)) else bool(r[0]) for r in rows]
+ok("11.20a JSON_TABLE EXISTS PATH", bools == [True, False], f"got {rows}")
+
+# NULL document → zero rows
+cur.execute("SELECT COUNT(*) FROM JSON_TABLE(NULL, '$[*]' COLUMNS (v INT PATH '$')) AS t")
+ok("11.20a JSON_TABLE NULL doc → zero rows", cur.fetchone()[0] in (0, "0"))
+
+# JOIN base table JOIN JSON_TABLE ON TRUE
+cur.execute("DROP TABLE IF EXISTS jt_users")
+cur.execute("CREATE TABLE jt_users (id INT)")
+cur.execute("INSERT INTO jt_users VALUES (1), (2)")
+cur.execute("""SELECT u.id, j.v FROM jt_users u
+    JOIN JSON_TABLE('[10,20]', '$[*]' COLUMNS (v INT PATH '$')) AS j ON TRUE
+    ORDER BY u.id, j.v""")
+rows = cur.fetchall()
+ok("11.20a JSON_TABLE JOIN base_table", rows == ((1, 10), (1, 20), (2, 10), (2, 20)))
+cur.execute("DROP TABLE jt_users")
+
+# Invalid JSON in doc → error
+try:
+    cur.execute("SELECT v FROM JSON_TABLE('not json', '$[*]' COLUMNS (v INT PATH '$')) AS t")
+    cur.fetchall()
+    ok("11.20a JSON_TABLE invalid doc raises", False)
+except Exception:
+    ok("11.20a JSON_TABLE invalid doc raises", True)
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

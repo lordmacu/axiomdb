@@ -221,6 +221,14 @@ fn analyze_select_with_outer(
         default_schema,
     };
 
+    // Phase 11.20a — resolve JSON_TABLE's `doc` expression (and any
+    // `DEFAULT` expressions inside ON EMPTY / ON ERROR) against the full
+    // bind context. This mirrors how subqueries are re-analyzed above.
+    if let Some(FromClause::JsonTable(jt)) = s.from {
+        let resolved = resolve_json_table(*jt, &ctx, outer_scopes, &state)?;
+        s.from = Some(FromClause::JsonTable(Box::new(resolved)));
+    }
+
     // Persist analyzed join-side derived tables back into the AST before
     // resolving JOIN conditions so the executor receives analyzed inner SELECTs.
     let mut resolved_joins = Vec::with_capacity(s.joins.len());
@@ -347,4 +355,45 @@ fn expr_column_idx(expr: &Expr) -> Option<usize> {
         Expr::Column { col_idx, .. } => Some(*col_idx),
         _ => None,
     }
+}
+
+/// Phase 11.20a — resolve references inside a `JSON_TABLE(...)` node.
+///
+/// Walks the `doc` expression and every `DEFAULT ...` expression inside the
+/// column list's ON EMPTY / ON ERROR clauses. Uses the same resolver as
+/// WHERE/ORDER BY so correlation through `OuterColumn` works consistently.
+fn resolve_json_table(
+    mut jt: crate::ast::JsonTable,
+    ctx: &BindContext,
+    outer_scopes: &[&BindContext],
+    state: &AnalyzeState<'_>,
+) -> Result<crate::ast::JsonTable, DbError> {
+    jt.doc = resolve_expr_full(jt.doc, ctx, outer_scopes, Some(state))?;
+    for c in &mut jt.columns {
+        if let crate::ast::JsonTableColumn::Regular {
+            on_empty, on_error, ..
+        } = c
+        {
+            resolve_on_behavior(on_empty, ctx, outer_scopes, state)?;
+            resolve_on_behavior(on_error, ctx, outer_scopes, state)?;
+        }
+    }
+    Ok(jt)
+}
+
+fn resolve_on_behavior(
+    b: &mut crate::expr::SqlJsonOnBehavior,
+    ctx: &BindContext,
+    outer_scopes: &[&BindContext],
+    state: &AnalyzeState<'_>,
+) -> Result<(), DbError> {
+    if let crate::expr::SqlJsonOnBehavior::Default(boxed) = b {
+        let inner = std::mem::replace(
+            boxed.as_mut(),
+            Expr::Literal(axiomdb_types::Value::Null),
+        );
+        let resolved = resolve_expr_full(inner, ctx, outer_scopes, Some(state))?;
+        *boxed.as_mut() = resolved;
+    }
+    Ok(())
 }

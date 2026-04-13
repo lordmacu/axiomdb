@@ -1,9 +1,9 @@
 # Project State
 
-## Current (2026-04-10)
+## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 11.16 Binary JSONB + JSONPath — implementation complete, pending closing protocol
+**Active subphase:** 11.20a `JSON_TABLE` (flat) — ✅ closed; next is 11.20b (single-level `NESTED PATH`).
 
 ### Phase 11 subphase status
 
@@ -14,12 +14,21 @@
 | 11.7 Advanced FTS (boolean, phrase, prefix) | ✅ closed |
 | 11.8 Buffer Pool Manager | ✅ closed |
 | 11.9 + 11.10 Prefetch + Write Combining | ✅ closed |
-| **11.16 Binary JSONB + JSONPath** | ✅ closed |
-| 11.17 GIN index for JSONB | 🔄 next |
+| 11.16 Binary JSONB + JSONPath | ✅ closed |
+| 11.17 GIN index for JSONB | ✅ closed |
+| 11.18a / 11.18b (partial) JSONB operators | ✅ closed — 11.18c deferred (needs `TEXT[]`) |
+| 11.19a / 11.19b / 11.19c SQL/JSON query functions | ✅ closed |
+| **11.20a** `JSON_TABLE` flat | ✅ closed — no NESTED PATH yet |
+| 11.21a–g JSONPath parity | ✅ closed (through path arithmetic in filters) — 11.21h pending planner pushdown |
+| 11.22a / 11.22b JSONB mutations | ✅ closed |
+| 11.23a / 11.23b / 11.23d / 11.23e / 11.23f JSON Schema | ✅ closed — 11.23c catalog persistence pending |
+| 11.24a / 11.24b / 11.24d (partial) Oracle JSON | ✅ closed — 11.24c dot-notation pending |
 
-### 11.17 next
+### 11.20 follow-ups
 
-GIN index for JSONB `@>` containment operator. `CREATE INDEX ... USING gin` on JSONB columns.
+- **11.20b** — Single-level `NESTED PATH` with LEFT-OUTER NULL padding + per-level ordinality.
+- **11.20c** — Multi-sibling (`UNION` semantics) and multi-level NESTED PATH.
+- **11.20d** — WRAPPER/QUOTES, `PASSING` on the row path, LATERAL-correlated `doc` (dependent on left-side row), JSON_TABLE as UPDATE/DELETE/MERGE source.
 
 ### Completed phases
 

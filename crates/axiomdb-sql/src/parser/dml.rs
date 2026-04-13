@@ -299,6 +299,16 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
         });
     }
 
+    // Phase 11.20a — `JSON_TABLE(...)` table-valued function. Only dispatch
+    // when followed by `(` so a user table named `json_table` without
+    // arguments still parses as a plain table reference.
+    if let Token::Ident(s) = p.peek() {
+        if s.eq_ignore_ascii_case("JSON_TABLE") && matches!(p.peek_at(1), Token::LParen) {
+            p.advance(); // consume the JSON_TABLE identifier
+            return crate::parser::json_table::parse_json_table_call(p);
+        }
+    }
+
     // Regular table reference
     let mut table_ref = p.parse_table_ref()?;
 
@@ -677,7 +687,7 @@ fn parse_update(p: &mut Parser) -> Result<Stmt, DbError> {
     let from = parse_from_item(p)?;
     let table = match from {
         FromClause::Table(table) => table,
-        FromClause::Subquery { .. } => {
+        FromClause::Subquery { .. } | FromClause::JsonTable(_) => {
             return Err(DbError::ParseError {
                 message: "UPDATE target must be a table".into(),
                 position: Some(p.current_pos()),
@@ -738,7 +748,7 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
         let from = parse_from_item(p)?;
         let table = match from {
             FromClause::Table(table) => table,
-            FromClause::Subquery { .. } => {
+            FromClause::Subquery { .. } | FromClause::JsonTable(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE target must be a table".into(),
                     position: Some(p.current_pos()),
@@ -752,7 +762,7 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
         let from = parse_from_item(p)?;
         let table = match from {
             FromClause::Table(table) => table,
-            FromClause::Subquery { .. } => {
+            FromClause::Subquery { .. } | FromClause::JsonTable(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE FROM source must be a table".into(),
                     position: Some(p.current_pos()),

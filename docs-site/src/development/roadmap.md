@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 11.16 Binary JSONB + JSONPath — `Value::Jsonb(Arc<Vec<u8>>)`, binary JEntry encoder/decoder with O(1) stride-based element access, `->` operator, JSONPath compiler (lax/strict, filter expressions, recursive descent), `JSON_MERGE_PATCH`, `JSON_CONTAINS`, `JSON_OVERLAPS`, `JSON_ARRAY_LENGTH`, `JSON_DEPTH`, `JSON_PRETTY`, `TO_JSONB`; 20 integration tests.
+**Last completed subphase:** 11.20a `JSON_TABLE` flat row source — `FROM JSON_TABLE('[{...}]', '$[*]' COLUMNS (name TYPE PATH '$.k', ord FOR ORDINALITY, exists_col BOOLEAN EXISTS PATH '$.flag'))` with ON EMPTY / ON ERROR dispatch (`NULL` / `ERROR` / `DEFAULT expr`) and TRUE|FALSE|UNKNOWN|ERROR on EXISTS columns; usable as first FROM or as JOIN right-side with non-correlated `doc`; 16 integration tests + 6 wire-smoke assertions.
 
-**Active development:** Phase 11 — Robustness and indexes (11.16 closed; 11.17 GIN index for JSONB next)
+**Active development:** Phase 11 — Advanced types. 11.16 → 11.19c + 11.20a + 11.21a–g + 11.22a/b + 11.23a/b/d/e/f + 11.24a/b/d closed. Remaining gaps: 11.18c (needs `TEXT[]`), 11.20b/c/d (NESTED PATH + LATERAL), 11.21h (planner JSONPath pushdown + `jsonb_path_ops` GIN), 11.23c (catalog storage of named JSON schemas), 11.24c (dot-notation `t.doc.a.b`).
 
-**Next milestone:** 11.17 — GIN index for JSONB: `CREATE INDEX ... USING gin` on JSONB columns; `@>` containment operator uses the index for `O(log n)` lookup instead of full table scan
+**Next milestone:** 11.20b — `NESTED PATH` inside `JSON_TABLE(...)` with LEFT-OUTER NULL padding and per-level ordinality.
 
 **Concurrency note:** the current server already supports concurrent read-only
 queries, but mutating statements are still serialized through a database-wide

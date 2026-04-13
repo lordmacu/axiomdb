@@ -206,6 +206,11 @@ fn explain_select(
                 "EXPLAIN for subquery FROM not yet supported".into(),
             ))
         }
+        crate::ast::FromClause::JsonTable(_) => {
+            return Err(DbError::Other(
+                "EXPLAIN for JSON_TABLE FROM not yet supported".into(),
+            ))
+        }
     };
 
     let conn = ctx.conn_txn.take();

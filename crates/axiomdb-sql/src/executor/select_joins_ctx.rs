@@ -56,6 +56,33 @@ fn execute_select_with_joins_ctx(
                     all_sources.push(join_source_schema_from_derived(alias, columns));
                     scanned.push(rows);
                 }
+                // Phase 11.20a — JSON_TABLE on the right side of a JOIN.
+                // Non-correlated doc only: evaluate once with an empty row,
+                // materialize, then combine via the normal nested-loop path.
+                // Correlated doc (LATERAL semantics) → 11.20d.
+                FromClause::JsonTable(jt) => {
+                    if crate::json_table::doc_has_column_refs(&jt.doc) {
+                        return Err(DbError::NotImplemented {
+                            feature: "correlated JSON_TABLE in a JOIN (LATERAL semantics) — \
+                                      deferred to 11.20d"
+                                .into(),
+                        });
+                    }
+                    let spec = crate::json_table::compile_json_table(jt)?;
+                    let column_metas = crate::json_table::column_metas_for_spec(&spec);
+                    let doc_val = crate::eval::eval(&jt.doc, &[])?;
+                    let rows = match crate::json_table::doc_to_serde(&doc_val)? {
+                        None => Vec::new(),
+                        Some(sj) => {
+                            let mut runner = crate::eval::NoSubquery;
+                            crate::json_table::materialize_json_table(&spec, &sj, &[], &mut runner)?
+                        }
+                    };
+                    col_offsets.push(running_offset);
+                    running_offset += column_metas.len();
+                    all_sources.push(join_source_schema_from_derived(&spec.alias, column_metas));
+                    scanned.push(rows);
+                }
             }
         }
     }

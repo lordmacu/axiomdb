@@ -302,6 +302,22 @@ fn bound_from_clause(
             *col_offset += n;
             Ok(vec![bound])
         }
+        // Phase 11.20a — JSON_TABLE: publish the COLUMNS(...) declarations
+        // as a virtual BoundTable. The `doc` expression is resolved later in
+        // `analyze_select_with_outer` against the accumulated BindContext.
+        FromClause::JsonTable(jt) => {
+            let virtual_cols = crate::json_table::column_defs_for_ast(jt)?;
+            let n = virtual_cols.len();
+            let alias = jt.alias.clone().unwrap_or_else(|| "json_table".into());
+            let bound = BoundTable {
+                alias: Some(alias.clone()),
+                name: alias,
+                columns: virtual_cols,
+                col_offset: *col_offset,
+            };
+            *col_offset += n;
+            Ok(vec![bound])
+        }
     }
 }
 

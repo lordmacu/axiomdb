@@ -1583,3 +1583,70 @@ that support MySQL stored procedures. Treating them as no-ops lets AxiomDB run
 migration files unmodified even before full stored-procedure support is available.
 </div>
 </div>
+
+---
+
+## JSON_TABLE — shred JSON into rows (Phase 11.20a)
+
+`JSON_TABLE(doc, '$.row_path' COLUMNS (...))` is a SQL:2016 table-valued function
+usable inside a `FROM` clause. It walks `row_path` against the document and emits
+one row per match. Each `COLUMNS(...)` entry projects a value out of that row.
+
+### Syntax
+
+```
+JSON_TABLE ( <expr>, '<row_path>'
+             COLUMNS ( <column_def> [, <column_def>]* ) )
+           [ [AS] alias ]
+
+column_def := <name> <type> PATH '<jsonpath>'
+                     [ {NULL | ERROR | DEFAULT <expr>} ON EMPTY ]
+                     [ {NULL | ERROR | DEFAULT <expr>} ON ERROR ]
+            | <name> FOR ORDINALITY
+            | <name> <type> EXISTS PATH '<jsonpath>'
+                     [ {TRUE | FALSE | UNKNOWN | ERROR} ON ERROR ]
+```
+
+Phase 11.20a implements the **flat** subset — `NESTED PATH`, `WRAPPER`, `QUOTES`,
+and lateral-correlated `doc` references are deferred to 11.20b–d.
+
+### Example — shred an array of objects
+
+```sql
+SELECT t.id, t.name, t.ord
+FROM JSON_TABLE(
+    '[{"id":1,"name":"Ada"},{"id":2,"name":"Babbage"}]',
+    '$[*]'
+    COLUMNS (
+        ord  FOR ORDINALITY,
+        id   INT  PATH '$.id',
+        name TEXT PATH '$.name'
+    )
+) AS t;
+-- (ord=1, id=1, name='Ada')
+-- (ord=2, id=2, name='Babbage')
+```
+
+### Semantics
+
+- **`NULL` document → zero rows.** No error is raised; this matches PostgreSQL
+  and MariaDB behavior so `JSON_TABLE` can be safely joined to a nullable column.
+- **Invalid JSON in a `TEXT` document → `InvalidCoercion`** at execution time.
+- **`PATH` miss** (0 matches) → dispatches `ON EMPTY`. Default is `NULL ON EMPTY`.
+- **Type mismatch / multi-match** on a scalar `PATH` → dispatches `ON ERROR`.
+  Default is `NULL ON ERROR`.
+- **`FOR ORDINALITY`** counts from 1 and increments once per emitted row.
+  Exactly one ordinality column is allowed per `COLUMNS(...)` list.
+- **`EXISTS PATH`** returns `TRUE` / `FALSE`. Default `ON ERROR` is `FALSE`.
+  Use `ERROR ON ERROR` to propagate execution errors as a failure.
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Join idiom</span>
+Use <code>SELECT ... FROM base_table JOIN JSON_TABLE(&lt;constant&gt;, ...) AS t ON TRUE</code>
+to combine a constant JSON source with a real table. Correlating the <code>doc</code>
+expression to the left-side row (<code>JSON_TABLE(base.tags, ...)</code>) is deferred
+to Phase 11.20d.
+</div>
+</div>

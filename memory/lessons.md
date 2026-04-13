@@ -1,5 +1,34 @@
 # Lessons Learned
 
+## 2026-04-13 — Phase 11.20a
+
+- **Parser dispatch for table-valued functions must check the `(` to keep
+  the identifier namespace usable.** `JSON_TABLE` followed by `(` commits
+  to the table-function branch; without `(` the parser falls through to
+  the regular table-ref path so a real table named `json_table` still
+  resolves. Implementation uses `peek_at(1) == Token::LParen`; no rollback
+  needed since the ident hasn't been consumed yet.
+- **`eat_ident_ci("DEFAULT"|"FOR"|"EXISTS"|"TRUE"|"FALSE"|"NULL")` silently
+  fails when those are reserved tokens.** The helper only matches
+  `Token::Ident` / `Token::QuotedIdent`. Every parser that wants to accept
+  one of these SQL keywords must use the dedicated `Token::*` variant or
+  fall back to `eat(&Token::Default)` etc. — caught this only at test time
+  because the "ON EMPTY / ON ERROR" clauses silently no-op'd.
+- **LATERAL semantics are an executor-architecture constraint, not a
+  parser one.** `JSON_TABLE(u.tags, ...)` joined against `u` requires
+  per-left-row re-materialization of the right source. The current
+  `select_joins_ctx` pre-scans every source once into `Vec<Row>` before the
+  nested-loop combine — so we gate correlated `doc` with
+  `doc_has_column_refs` and raise `NotImplemented`. Refactoring to a
+  generic per-left-row right-source callback belongs in the 11.20d
+  follow-up; trying to sneak it into 11.20a would have entangled subquery
+  JOIN arms, DML JOINs, and the legacy `select_helpers` path all at once.
+- **AxiomDB has two JSONPath step enums.** `eval::functions::json::PathStep`
+  carries filter `Expr` nodes and is non-trivially cloneable; JSON_TABLE
+  doesn't need filter-in-path support at 11.20a and uses its own
+  `PathStepOwned` (pure data, `Clone`). Keeps the module self-contained and
+  lets `JsonTableSpec` live in executor memory without borrowing the AST.
+
 ## 2026-04-10 — Phase 11.x
 
 - **TOAST refcounts belong on the owned BLOB chain, not clustered overflow.** Use versioned `ABOB` header only for TOAST/BLOB-owned chains; clustered row overflow stays non-refcounted so Phase 39 physical descriptors remain stable.

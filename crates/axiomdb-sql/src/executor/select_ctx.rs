@@ -21,9 +21,14 @@ fn execute_select_ctx(
         return execute_select(stmt, storage, txn, conn_txn);
     }
 
+    // JSON_TABLE in FROM (Phase 11.20a): no caching path — delegate.
+    if matches!(stmt.from, Some(FromClause::JsonTable(_))) {
+        return execute_select(stmt, storage, txn, conn_txn);
+    }
+
     let from_table_ref = match stmt.from.take() {
         Some(FromClause::Table(tref)) => tref,
-        _ => unreachable!("already handled None and Subquery above"),
+        _ => unreachable!("already handled None, Subquery, and JsonTable above"),
     };
 
     // INFORMATION_SCHEMA virtual tables (4.20c).
