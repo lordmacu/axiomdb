@@ -127,3 +127,56 @@ fn existence_and_comparison_mix() {
     assert!(!text.contains("\"score\":70"));
     assert!(!text.contains("\"score\":10"));
 }
+
+// ── Phase 11.21f (partial): path-vs-path comparison ────────────────────────
+
+#[test]
+fn compare_two_paths_equal() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSONB_PATH_QUERY_ARRAY(\
+            '[{\"a\":1,\"b\":1},{\"a\":1,\"b\":2}]', \
+            '$[?(@.a == @.b)]')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    let text = as_text(&v);
+    assert!(text.contains("\"a\":1,\"b\":1"));
+    assert!(!text.contains("\"a\":1,\"b\":2"));
+}
+
+#[test]
+fn compare_two_paths_lt() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSONB_PATH_QUERY_ARRAY(\
+            '[{\"x\":1,\"y\":2},{\"x\":3,\"y\":1}]', \
+            '$[?(@.x < @.y)]')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    let text = as_text(&v);
+    assert!(text.contains("\"x\":1"));
+    assert!(!text.contains("\"x\":3"));
+}
+
+#[test]
+fn missing_rhs_path_filters_out() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSONB_PATH_QUERY_ARRAY(\
+            '[{\"a\":1,\"b\":1},{\"a\":1}]', \
+            '$[?(@.a == @.b)]')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    let text = as_text(&v);
+    assert!(text.contains("\"b\":1"));
+    assert_eq!(text.matches("\"a\":1}").count(), 0);
+}
