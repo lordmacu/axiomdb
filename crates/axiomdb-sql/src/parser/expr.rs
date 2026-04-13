@@ -286,6 +286,15 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
             let right = parse_bitor(p)?;
             Ok(binop(BinaryOp::JsonbPathExists, left, right))
         }
+        // Phase 11.21c: `@@` in infix position = JSONB JSONPath match.
+        // The same token is reserved for MySQL `@@session_var` prefixes at
+        // atom position; because this arm runs only after a completed LHS,
+        // there is no grammatical collision.
+        Token::AtAt if !negated => {
+            p.advance();
+            let right = parse_bitor(p)?;
+            Ok(binop(BinaryOp::JsonbPathMatch, left, right))
+        }
         // Phase 11.18a: `?` in infix position = JSONB key/array-element exists.
         // `?` as a prefix atom stays reserved for prepared-statement
         // placeholders (see `parse_atom`), which is unreachable here.

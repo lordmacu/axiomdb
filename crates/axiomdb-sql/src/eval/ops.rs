@@ -250,6 +250,47 @@ pub(crate) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
 
         // ── JSONB JSONPath exists: @? (Phase 11.21b) ─────────────────────────
         BinaryOp::JsonbPathExists => eval_jsonb_path_exists(l, r),
+
+        // ── JSONB JSONPath match:  @@ (Phase 11.21c) ─────────────────────────
+        BinaryOp::JsonbPathMatch => eval_jsonb_path_match(l, r),
+    }
+}
+
+fn eval_jsonb_path_match(doc: Value, path: Value) -> Result<Value, DbError> {
+    if doc.is_null() || path.is_null() {
+        return Ok(Value::Null);
+    }
+    let path_str = match path {
+        Value::Text(s) | Value::Json(s) => s,
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "TEXT jsonpath".into(),
+                got: other.variant_name().into(),
+            });
+        }
+    };
+    let sj = match &doc {
+        Value::Jsonb(b) => axiomdb_types::jsonb::JsonbDecoder::decode(b.as_ref())?,
+        Value::Json(s) | Value::Text(s) => {
+            serde_json::from_str(s).map_err(|e| DbError::InvalidValue {
+                reason: format!("invalid JSON: {e}"),
+            })?
+        }
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "JSON or JSONB".into(),
+                got: other.variant_name().into(),
+            });
+        }
+    };
+    let steps = crate::eval::functions::parse_jsonpath_public(&path_str)?;
+    let results = crate::eval::functions::execute_jsonpath_public(&sj, &steps);
+    if results.len() != 1 {
+        return Ok(Value::Null);
+    }
+    match results[0] {
+        serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
+        _ => Ok(Value::Null),
     }
 }
 

@@ -360,6 +360,11 @@ pub enum BinaryOp {
     /// returns true when the path has at least one match. Equivalent to
     /// `jsonb_path_exists(doc, path)`.
     JsonbPathExists,
+    /// `@@` — JSONB JSONPath match (Phase 11.21c): `doc @@ 'jsonpath'`
+    /// treats the path result as a predicate and returns that bool, or NULL
+    /// when the result is absent / multi-valued / non-boolean. Equivalent to
+    /// `jsonb_path_match(doc, path)`.
+    JsonbPathMatch,
 }
 
 // ── SQL/JSON standard query functions (Phase 11.19a) ─────────────────────────
