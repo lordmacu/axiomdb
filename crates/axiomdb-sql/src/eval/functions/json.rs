@@ -330,7 +330,7 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
             let sj = value_to_serde_json(&json_val)?;
             let steps = parse_jsonpath(&path_str)?;
-            Ok(Value::Bool(!execute_jsonpath(&sj, &steps).is_empty()))
+            Ok(Value::Bool(!execute_jsonpath_owned(&sj, &steps).is_empty()))
         }
         "jsonb_path_query" => {
             expect_arg_count(name, args, 2)?;
@@ -341,8 +341,7 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
             let sj = value_to_serde_json(&json_val)?;
             let steps = parse_jsonpath(&path_str)?;
-            let results = execute_jsonpath(&sj, &steps);
-            let arr: Vec<serde_json::Value> = results.into_iter().cloned().collect();
+            let arr = execute_jsonpath_owned(&sj, &steps);
             Ok(Value::Json(serde_json::Value::Array(arr).to_string()))
         }
         "jsonb_path_query_first" => {
@@ -354,9 +353,9 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
             let sj = value_to_serde_json(&json_val)?;
             let steps = parse_jsonpath(&path_str)?;
-            match execute_jsonpath(&sj, &steps).into_iter().next() {
+            match execute_jsonpath_owned(&sj, &steps).into_iter().next() {
                 None => Ok(Value::Null),
-                Some(v) => Ok(serde_json_to_sql_value(Some(v))),
+                Some(v) => Ok(serde_json_to_sql_value(Some(&v))),
             }
         }
         "jsonb_path_query_array" => {
@@ -368,9 +367,7 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
             let sj = value_to_serde_json(&json_val)?;
             let steps = parse_jsonpath(&path_str)?;
-            let arr = serde_json::Value::Array(
-                execute_jsonpath(&sj, &steps).into_iter().cloned().collect(),
-            );
+            let arr = serde_json::Value::Array(execute_jsonpath_owned(&sj, &steps));
             jsonb_blob_from_serde(&arr)
         }
         "jsonb_path_match" => {
@@ -382,11 +379,11 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
             let sj = value_to_serde_json(&json_val)?;
             let steps = parse_jsonpath(&path_str)?;
-            let results = execute_jsonpath(&sj, &steps);
+            let results = execute_jsonpath_owned(&sj, &steps);
             if results.len() != 1 {
                 return Ok(Value::Null);
             }
-            match results[0] {
+            match &results[0] {
                 serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
                 _ => Ok(Value::Null),
             }
@@ -1868,6 +1865,10 @@ pub(crate) enum PathStep {
     WildcardIndex,
     Recursive,
     Filter(FilterExpr),
+    /// `.size()` accessor — returns the array length, or 1 for non-arrays (PG parity).
+    Size,
+    /// `.type()` accessor — returns the JSON type name as a string.
+    TypeOf,
 }
 
 #[derive(Debug, Clone)]
@@ -1918,7 +1919,29 @@ pub(crate) fn parse_jsonpath(path: &str) -> Result<Vec<PathStep>, DbError> {
                     steps.push(PathStep::WildcardKey);
                 } else {
                     let key = consume_identifier(&mut chars);
-                    if !key.is_empty() {
+                    if key.is_empty() {
+                        // Nothing between dots — skip.
+                    } else if chars.peek() == Some(&'(') {
+                        // `.size()` / `.type()` accessor.
+                        chars.next();
+                        if chars.peek() != Some(&')') {
+                            return Err(DbError::InvalidValue {
+                                reason: format!("accessor `.{key}(` must close with `)`: {path}"),
+                            });
+                        }
+                        chars.next();
+                        match key.as_str() {
+                            "size" => steps.push(PathStep::Size),
+                            "type" => steps.push(PathStep::TypeOf),
+                            other => {
+                                return Err(DbError::InvalidValue {
+                                    reason: format!(
+                                        "unsupported accessor `.{other}()` in path: {path}"
+                                    ),
+                                });
+                            }
+                        }
+                    } else {
                         steps.push(PathStep::Key(key));
                     }
                 }
@@ -1947,7 +1970,7 @@ pub(crate) fn parse_jsonpath(path: &str) -> Result<Vec<PathStep>, DbError> {
 fn consume_identifier(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
     let mut s = String::new();
     while let Some(&c) = chars.peek() {
-        if c == '.' || c == '[' || c == ']' {
+        if c == '.' || c == '[' || c == ']' || c == '(' {
             break;
         }
         s.push(c);
@@ -2059,6 +2082,41 @@ fn parse_jsonpath_literal(s: &str) -> Result<serde_json::Value, DbError> {
 
 // ── JSONPath executor (lax mode) ──────────────────────────────────────────────
 
+/// Accessor-aware variant of [`execute_jsonpath`]. If the path ends with
+/// `.size()` / `.type()` the trailing step is stripped before walking and
+/// applied to each borrowed result, returning owned values.
+pub(crate) fn execute_jsonpath_owned(
+    root: &serde_json::Value,
+    steps: &[PathStep],
+) -> Vec<serde_json::Value> {
+    let (body, accessor) = split_trailing_accessor(steps);
+    let refs = execute_jsonpath(root, body);
+    match accessor {
+        None => refs.into_iter().cloned().collect(),
+        Some(PathStep::Size) => refs
+            .into_iter()
+            .map(|v| match v {
+                serde_json::Value::Array(a) => serde_json::json!(a.len()),
+                _ => serde_json::json!(1),
+            })
+            .collect(),
+        Some(PathStep::TypeOf) => refs
+            .into_iter()
+            .map(|v| serde_json::Value::String(json_node_type_name(v).into()))
+            .collect(),
+        Some(_) => unreachable!("split_trailing_accessor returns Size or TypeOf"),
+    }
+}
+
+fn split_trailing_accessor(steps: &[PathStep]) -> (&[PathStep], Option<&PathStep>) {
+    if let Some(last) = steps.last() {
+        if matches!(last, PathStep::Size | PathStep::TypeOf) {
+            return (&steps[..steps.len() - 1], Some(last));
+        }
+    }
+    (steps, None)
+}
+
 pub(crate) fn execute_jsonpath<'a>(
     root: &'a serde_json::Value,
     steps: &[PathStep],
@@ -2144,6 +2202,11 @@ fn apply_steps<'a>(
             }
             _ => vec![],
         },
+
+        // Accessors are terminal and only applied in `execute_jsonpath_owned`.
+        // If they appear in the mid-path through the ref-based walker, treat
+        // as an empty match (caller should route through the owned variant).
+        PathStep::Size | PathStep::TypeOf => vec![],
     }
 }
 

@@ -284,11 +284,11 @@ fn eval_jsonb_path_match(doc: Value, path: Value) -> Result<Value, DbError> {
         }
     };
     let steps = crate::eval::functions::parse_jsonpath_public(&path_str)?;
-    let results = crate::eval::functions::execute_jsonpath_public(&sj, &steps);
+    let results = crate::eval::functions::execute_jsonpath_owned_public(&sj, &steps);
     if results.len() != 1 {
         return Ok(Value::Null);
     }
-    match results[0] {
+    match &results[0] {
         serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
         _ => Ok(Value::Null),
     }
@@ -323,7 +323,7 @@ fn eval_jsonb_path_exists(doc: Value, path: Value) -> Result<Value, DbError> {
     };
     let steps = crate::eval::functions::parse_jsonpath_public(&path_str)?;
     Ok(Value::Bool(
-        !crate::eval::functions::execute_jsonpath_public(&sj, &steps).is_empty(),
+        !crate::eval::functions::execute_jsonpath_owned_public(&sj, &steps).is_empty(),
     ))
 }
 
