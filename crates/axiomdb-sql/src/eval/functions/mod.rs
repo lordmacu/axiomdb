@@ -61,6 +61,8 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         | "json_array_length" | "json_depth" | "json_pretty"
         | "to_jsonb" | "jsonb"
         | "json_path_exists" | "json_path_query" | "json_path_query_first"
+        | "jsonb_path_exists" | "jsonb_path_query" | "jsonb_path_query_first"
+        | "jsonb_path_query_array" | "jsonb_path_match"
         // Phase 11.18a: function-style aliases of the new operators so SQL
         // portable across MySQL / MariaDB / DuckDB (which lack ?, <@, ||
         // operator syntax) can still drive the same machinery.
