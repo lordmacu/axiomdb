@@ -352,7 +352,498 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             crate::eval::eval_binary(crate::expr::BinaryOp::Sub, left, right)
         }
 
+        // ── Phase 11.22a: JSONB mutation parity ──────────────────────────────
+        //
+        // jsonb_set(target, path, new_value [, create_if_missing=true])
+        //   — PG upsert. Returns Jsonb.
+        "jsonb_set" => {
+            if args.len() < 3 || args.len() > 4 {
+                return Err(DbError::TypeMismatch {
+                    expected: "jsonb_set: 3 or 4 args".into(),
+                    got: args.len().to_string(),
+                });
+            }
+            let target = eval_arg(args, 0, row, name)?;
+            if matches!(target, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let path_arg = eval_arg(args, 1, row, name)?;
+            let new_val = eval_arg(args, 2, row, name)?;
+            let create_if_missing = if args.len() == 4 {
+                is_truthy_arg(&eval_arg(args, 3, row, name)?)
+            } else {
+                true
+            };
+            let mut sj = value_to_serde_json(&target)?;
+            let parts = parse_mutation_path(&path_arg)?;
+            set_path_ext(
+                &mut sj,
+                &parts,
+                sql_to_serde_json(&new_val),
+                MutationFlags {
+                    create_if_missing,
+                    insert_after: false,
+                    raise_on_existing_key: false,
+                    allow_insert: false,
+                },
+            )?;
+            jsonb_blob_from_serde(&sj)
+        }
+
+        // jsonb_insert(target, path, new_value [, insert_after=false])
+        //   — PG insert. Raises on existing object key (matches PG).
+        "jsonb_insert" => {
+            if args.len() < 3 || args.len() > 4 {
+                return Err(DbError::TypeMismatch {
+                    expected: "jsonb_insert: 3 or 4 args".into(),
+                    got: args.len().to_string(),
+                });
+            }
+            let target = eval_arg(args, 0, row, name)?;
+            if matches!(target, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let path_arg = eval_arg(args, 1, row, name)?;
+            let new_val = eval_arg(args, 2, row, name)?;
+            let insert_after = if args.len() == 4 {
+                is_truthy_arg(&eval_arg(args, 3, row, name)?)
+            } else {
+                false
+            };
+            let mut sj = value_to_serde_json(&target)?;
+            let parts = parse_mutation_path(&path_arg)?;
+            set_path_ext(
+                &mut sj,
+                &parts,
+                sql_to_serde_json(&new_val),
+                MutationFlags {
+                    create_if_missing: false,
+                    insert_after,
+                    raise_on_existing_key: true,
+                    allow_insert: true,
+                },
+            )?;
+            jsonb_blob_from_serde(&sj)
+        }
+
+        // jsonb_delete_path(target, path)
+        //   — PG #-. Empty path returns target unchanged. Scalar root errors.
+        "jsonb_delete_path" => {
+            expect_arg_count(name, args, 2)?;
+            let target = eval_arg(args, 0, row, name)?;
+            if matches!(target, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let path_arg = eval_arg(args, 1, row, name)?;
+            let parts = parse_mutation_path(&path_arg)?;
+            let mut sj = value_to_serde_json(&target)?;
+            if !parts.is_empty() {
+                if sj.is_object() || sj.is_array() {
+                    remove_path_parts(&mut sj, &parts);
+                } else {
+                    return Err(DbError::InvalidValue {
+                        reason: "cannot delete path in scalar JSONB".into(),
+                    });
+                }
+            }
+            jsonb_blob_from_serde(&sj)
+        }
+
+        // json_insert(doc, p1, v1, p2, v2, ...) — MySQL variadic.
+        // Adds key only if path missing; silent no-op on existing key
+        // (diverges from PG jsonb_insert).
+        "json_insert" => {
+            if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
+                return Err(DbError::TypeMismatch {
+                    expected: "json_insert: odd arg count (doc + path/value pairs)".into(),
+                    got: args.len().to_string(),
+                });
+            }
+            let doc = eval_arg(args, 0, row, name)?;
+            if matches!(doc, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let mut sj = value_to_serde_json(&doc)?;
+            let pair_count = (args.len() - 1) / 2;
+            for i in 0..pair_count {
+                let p = eval_arg(args, 1 + 2 * i, row, name)?;
+                let v = eval_arg(args, 2 + 2 * i, row, name)?;
+                let parts = parse_mutation_path(&p)?;
+                if path_exists(&sj, &parts) {
+                    continue; // MySQL: silent no-op on existing
+                }
+                set_path_ext(
+                    &mut sj,
+                    &parts,
+                    sql_to_serde_json(&v),
+                    MutationFlags {
+                        create_if_missing: true,
+                        insert_after: false,
+                        raise_on_existing_key: false,
+                        allow_insert: false,
+                    },
+                )?;
+            }
+            Ok(Value::Json(sj.to_string()))
+        }
+
+        // json_replace(doc, p1, v1, p2, v2, ...) — MySQL variadic.
+        // Updates only if path exists; silent no-op on missing path.
+        "json_replace" => {
+            if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
+                return Err(DbError::TypeMismatch {
+                    expected: "json_replace: odd arg count (doc + path/value pairs)".into(),
+                    got: args.len().to_string(),
+                });
+            }
+            let doc = eval_arg(args, 0, row, name)?;
+            if matches!(doc, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let mut sj = value_to_serde_json(&doc)?;
+            let pair_count = (args.len() - 1) / 2;
+            for i in 0..pair_count {
+                let p = eval_arg(args, 1 + 2 * i, row, name)?;
+                let v = eval_arg(args, 2 + 2 * i, row, name)?;
+                let parts = parse_mutation_path(&p)?;
+                if !path_exists(&sj, &parts) {
+                    continue; // MySQL: silent no-op on missing
+                }
+                set_path_ext(
+                    &mut sj,
+                    &parts,
+                    sql_to_serde_json(&v),
+                    MutationFlags {
+                        create_if_missing: false,
+                        insert_after: false,
+                        raise_on_existing_key: false,
+                        allow_insert: false,
+                    },
+                )?;
+            }
+            Ok(Value::Json(sj.to_string()))
+        }
+
         _ => unreachable!("dispatcher routed unsupported JSON function"),
+    }
+}
+
+// ── Phase 11.22a helpers ─────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+struct MutationFlags {
+    /// When the leaf (or intermediate) is missing, create containers / insert
+    /// the leaf. PG `jsonb_set(create_if_missing=true)` default.
+    create_if_missing: bool,
+    /// For array leaves, insert after the indexed position instead of before.
+    insert_after: bool,
+    /// When the leaf already exists as an object key, raise an error instead
+    /// of replacing it. PG `jsonb_insert` behavior.
+    raise_on_existing_key: bool,
+    /// When `true`, leaf writes on arrays are treated as insertions (before
+    /// or after the indexed element) rather than replacements. PG
+    /// `jsonb_insert` sets this; everything else leaves it `false`.
+    allow_insert: bool,
+}
+
+/// Convert a SQL path argument to a schema-neutral `Vec<String>`:
+///   - MySQL-style string: `'$.a.b'`, `'$[0]'`, `'$."quoted key"'`
+///   - JSON-array literal (PG `text[]` workaround): `'["a","b"]'`
+///   - Binary JSONB array (`Value::Jsonb`)
+///
+/// Wildcards (`$.*`, `$[*]`, `$..key`) are rejected — both PG and MySQL
+/// reject them for mutation.
+fn parse_mutation_path(arg: &Value) -> Result<Vec<String>, DbError> {
+    match arg {
+        Value::Text(s) | Value::Json(s) => {
+            let trimmed = s.trim_start();
+            if let Some(first) = trimmed.chars().next() {
+                if first == '$' {
+                    // MySQL JSONPath.
+                    if s.contains("[*]") || s.contains(".*") || s.contains("..") {
+                        return Err(DbError::InvalidValue {
+                            reason: format!(
+                                "wildcard paths are not allowed in mutation functions: {s}"
+                            ),
+                        });
+                    }
+                    return jsonpath_to_parts(s);
+                }
+                if first == '[' {
+                    // PG text[] workaround as JSON-array literal.
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(s).map_err(|e| DbError::InvalidValue {
+                            reason: format!("invalid JSON-array path {s:?}: {e}"),
+                        })?;
+                    return json_array_to_path_parts(&parsed);
+                }
+            }
+            Err(DbError::InvalidValue {
+                reason: format!("unsupported path form: {s:?}"),
+            })
+        }
+        Value::Jsonb(b) => {
+            let sj = JsonbDecoder::decode(b.as_ref())?;
+            json_array_to_path_parts(&sj)
+        }
+        Value::Null => Err(DbError::InvalidValue {
+            reason: "NULL path argument".into(),
+        }),
+        other => Err(type_err("text or jsonb array path", other.variant_name())),
+    }
+}
+
+/// Splits a MySQL-style `$.key.nested[0]."q.k"` path into schema-neutral
+/// string parts. Array indices are preserved as their decimal string so
+/// `set_path_ext` can parse them against the current container type.
+fn jsonpath_to_parts(path: &str) -> Result<Vec<String>, DbError> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut chars = path.trim_start().chars().peekable();
+    if chars.next() != Some('$') {
+        return Err(DbError::InvalidValue {
+            reason: format!("path must start with $: {path}"),
+        });
+    }
+    while let Some(&c) = chars.peek() {
+        if c == '.' {
+            chars.next();
+            let mut buf = String::new();
+            if chars.peek() == Some(&'"') {
+                chars.next();
+                for ch in chars.by_ref() {
+                    if ch == '"' {
+                        break;
+                    }
+                    buf.push(ch);
+                }
+            } else {
+                while let Some(&nc) = chars.peek() {
+                    if nc == '.' || nc == '[' {
+                        break;
+                    }
+                    buf.push(nc);
+                    chars.next();
+                }
+            }
+            if buf.is_empty() {
+                return Err(DbError::InvalidValue {
+                    reason: format!("empty key in path: {path}"),
+                });
+            }
+            parts.push(buf);
+        } else if c == '[' {
+            chars.next();
+            let mut buf = String::new();
+            for ch in chars.by_ref() {
+                if ch == ']' {
+                    break;
+                }
+                buf.push(ch);
+            }
+            let trimmed = buf.trim();
+            if trimmed.is_empty() {
+                return Err(DbError::InvalidValue {
+                    reason: format!("empty index in path: {path}"),
+                });
+            }
+            parts.push(trimmed.to_string());
+        } else {
+            return Err(DbError::InvalidValue {
+                reason: format!("unexpected character {c:?} in path: {path}"),
+            });
+        }
+    }
+    Ok(parts)
+}
+
+fn json_array_to_path_parts(v: &serde_json::Value) -> Result<Vec<String>, DbError> {
+    match v {
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .map(|e| match e {
+                serde_json::Value::String(s) => Ok(s.clone()),
+                serde_json::Value::Number(n) => Ok(n.to_string()),
+                other => Err(DbError::InvalidValue {
+                    reason: format!(
+                        "JSON-array path element must be string or number, got {other}"
+                    ),
+                }),
+            })
+            .collect(),
+        _ => Err(DbError::InvalidValue {
+            reason: "path must be a JSON array or MySQL-style string".into(),
+        }),
+    }
+}
+
+/// Recursively walks `root` along `parts` and applies `new_val` at the leaf
+/// honoring `flags`. Returns `Ok(())` on success; common PG errors surface
+/// as `DbError::InvalidValue`.
+fn set_path_ext(
+    root: &mut serde_json::Value,
+    parts: &[String],
+    new_val: serde_json::Value,
+    flags: MutationFlags,
+) -> Result<(), DbError> {
+    // Empty path — PG: jsonb_set on empty path returns target unchanged
+    // (setPath in jsonfuncs.c line 4886). Same for jsonb_insert.
+    if parts.is_empty() {
+        return Ok(());
+    }
+    set_path_step(root, parts, 0, new_val, flags)
+}
+
+fn set_path_step(
+    node: &mut serde_json::Value,
+    parts: &[String],
+    idx: usize,
+    new_val: serde_json::Value,
+    flags: MutationFlags,
+) -> Result<(), DbError> {
+    let is_leaf = idx == parts.len() - 1;
+    let step = &parts[idx];
+
+    match node {
+        serde_json::Value::Object(map) => {
+            let has_key = map.contains_key(step);
+            if is_leaf {
+                if has_key {
+                    if flags.raise_on_existing_key {
+                        return Err(DbError::InvalidValue {
+                            reason: format!("cannot replace existing key {step:?}"),
+                        });
+                    }
+                    map.insert(step.clone(), new_val);
+                } else if flags.create_if_missing || flags.allow_insert {
+                    map.insert(step.clone(), new_val);
+                }
+                Ok(())
+            } else if has_key {
+                set_path_step(map.get_mut(step).unwrap(), parts, idx + 1, new_val, flags)
+            } else if flags.create_if_missing {
+                // Create an empty object for the remaining path.
+                map.insert(step.clone(), serde_json::Value::Object(Default::default()));
+                set_path_step(map.get_mut(step).unwrap(), parts, idx + 1, new_val, flags)
+            } else {
+                Ok(())
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            let len = arr.len() as i64;
+            let parsed: i64 = step.parse().map_err(|_| DbError::InvalidValue {
+                reason: format!("path element {step:?} is not an integer for array"),
+            })?;
+            let real = if parsed < 0 { len + parsed } else { parsed };
+            if is_leaf {
+                if flags.allow_insert {
+                    // PG jsonb_insert — insert before/after index.
+                    let clamped = real.max(0).min(len) as usize;
+                    let position = if flags.insert_after {
+                        (clamped + 1).min(arr.len())
+                    } else {
+                        clamped
+                    };
+                    arr.insert(position, new_val);
+                } else if real >= 0 && real < len {
+                    arr[real as usize] = new_val;
+                } else if flags.create_if_missing {
+                    if real < 0 {
+                        arr.insert(0, new_val);
+                    } else {
+                        arr.push(new_val);
+                    }
+                }
+                Ok(())
+            } else if real >= 0 && real < len {
+                set_path_step(&mut arr[real as usize], parts, idx + 1, new_val, flags)
+            } else if flags.create_if_missing {
+                // Extend the array with an empty object intermediate.
+                arr.push(serde_json::Value::Object(Default::default()));
+                let last = arr.len() - 1;
+                set_path_step(&mut arr[last], parts, idx + 1, new_val, flags)
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err(DbError::InvalidValue {
+            reason: "cannot set path in scalar JSONB".into(),
+        }),
+    }
+}
+
+fn remove_path_parts(node: &mut serde_json::Value, parts: &[String]) {
+    if parts.is_empty() {
+        return;
+    }
+    remove_path_step(node, parts, 0);
+}
+
+fn remove_path_step(node: &mut serde_json::Value, parts: &[String], idx: usize) {
+    let step = &parts[idx];
+    let is_leaf = idx == parts.len() - 1;
+    match node {
+        serde_json::Value::Object(map) => {
+            if is_leaf {
+                map.remove(step);
+            } else if let Some(next) = map.get_mut(step) {
+                remove_path_step(next, parts, idx + 1);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            let len = arr.len() as i64;
+            let Ok(parsed) = step.parse::<i64>() else {
+                return;
+            };
+            let real = if parsed < 0 { len + parsed } else { parsed };
+            if real < 0 || real >= len {
+                return;
+            }
+            if is_leaf {
+                arr.remove(real as usize);
+            } else {
+                remove_path_step(&mut arr[real as usize], parts, idx + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn path_exists(root: &serde_json::Value, parts: &[String]) -> bool {
+    let mut cur = root;
+    for step in parts {
+        match cur {
+            serde_json::Value::Object(map) => match map.get(step) {
+                Some(next) => cur = next,
+                None => return false,
+            },
+            serde_json::Value::Array(arr) => {
+                let Ok(parsed) = step.parse::<i64>() else {
+                    return false;
+                };
+                let len = arr.len() as i64;
+                let real = if parsed < 0 { len + parsed } else { parsed };
+                if real < 0 || real >= len {
+                    return false;
+                }
+                cur = &arr[real as usize];
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn jsonb_blob_from_serde(v: &serde_json::Value) -> Result<Value, DbError> {
+    let blob = JsonbEncoder::encode(v)?;
+    Ok(Value::Jsonb(Arc::new(blob)))
+}
+
+fn is_truthy_arg(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::Int(n) => *n != 0,
+        Value::BigInt(n) => *n != 0,
+        _ => false,
     }
 }
 
