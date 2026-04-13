@@ -160,16 +160,15 @@ fn compile_columns_recursive(
         });
     }
 
-    // Phase 11.20b restriction: at most one NESTED sibling per list.
-    let nested_count = cols
-        .iter()
-        .filter(|c| matches!(c, JsonTableColumn::Nested { .. }))
-        .count();
-    if nested_count > 1 {
-        return Err(DbError::NotImplemented {
-            feature: "JSON_TABLE: multiple NESTED PATH siblings in the same COLUMNS(...) \
-                      list — deferred to 11.20c"
-                .into(),
+    // Phase 11.20c — defensive depth limit. Multi-sibling and multi-level
+    // NESTED are now supported; this guard exists solely to stop
+    // pathological AST recursion (the SQL compiler already rejects inputs
+    // deeper than a few hundred tokens, so 32 is well beyond any real
+    // workload).
+    if depth > 32 {
+        return Err(DbError::ParseError {
+            message: "JSON_TABLE: NESTED PATH recursion depth exceeds 32".into(),
+            position: None,
         });
     }
 
@@ -224,13 +223,6 @@ fn compile_columns_recursive(
                 });
             }
             JsonTableColumn::Nested { path, columns } => {
-                if depth >= 1 {
-                    return Err(DbError::NotImplemented {
-                        feature: "JSON_TABLE: NESTED PATH inside NESTED PATH (depth ≥ 2) — \
-                                  deferred to 11.20c"
-                            .into(),
-                    });
-                }
                 let start = *next_slot;
                 let children = compile_columns_recursive(columns, next_slot, depth + 1)?;
                 let end = *next_slot;
@@ -386,91 +378,50 @@ pub fn materialize_json_table<R: SubqueryRunner>(
 
     for (i, parent) in parent_matches.iter().enumerate() {
         let ord = (i as i64) + 1;
-        // Row template initialised to NULLs; fill parent-level leaves then
-        // expand via NESTED PATH children (Phase 11.20b: single NESTED).
-        let mut template: Vec<Value> = vec![Value::Null; spec.total_slots];
-
-        // Fill leaf columns and locate the (at most one) nested child.
-        let mut nested_child: Option<&JsonTableColumnSpec> = None;
-        for col in &spec.columns {
-            match &col.kind {
-                JsonTableColumnKind::Ordinality { slot } => {
-                    template[*slot] = Value::BigInt(ord);
-                }
-                JsonTableColumnKind::Regular {
-                    slot,
-                    path,
-                    on_empty,
-                    on_error,
-                } => {
-                    template[*slot] = materialize_regular(
-                        parent, path, col.ty, on_empty, on_error, outer_row, sq,
-                    )?;
-                }
-                JsonTableColumnKind::Exists {
-                    slot,
-                    path,
-                    on_error,
-                } => {
-                    template[*slot] =
-                        materialize_exists(parent, path, col.ty, on_error, outer_row, sq)?;
-                }
-                JsonTableColumnKind::Nested { .. } => {
-                    nested_child = Some(col);
-                }
-            }
-        }
-
-        // Expand NESTED (Phase 11.20b: depth 1, at most one per list).
-        match nested_child {
-            None => rows.push(template),
-            Some(nested) => {
-                let (path, children, (start, end)) = match &nested.kind {
-                    JsonTableColumnKind::Nested {
-                        path,
-                        children,
-                        slot_range,
-                    } => (path, children, *slot_range),
-                    _ => unreachable!("nested_child is Nested"),
-                };
-                let child_matches = walk_path_owned(parent, path);
-                if child_matches.is_empty() {
-                    // LEFT-OUTER NULL pad: emit one row; child slots stay
-                    // NULL from the template initialisation.
-                    rows.push(template);
-                } else {
-                    for (j, child) in child_matches.iter().enumerate() {
-                        let child_ord = (j as i64) + 1;
-                        let mut row = template.clone();
-                        fill_leaf_children(children, child, child_ord, outer_row, sq, &mut row)?;
-                        // `fill_leaf_children` writes into the (start..end)
-                        // slot range; slots outside that range retain their
-                        // parent values from the template.
-                        let _ = (start, end); // no-op; present for clarity
-                        rows.push(row);
-                    }
-                }
-            }
-        }
+        // Row template initialised to NULLs; the recursive emitter fills
+        // leaves at every level and emits UNION rows across sibling
+        // NESTED entries (Phase 11.20c — arbitrary depth, arbitrary
+        // number of siblings).
+        let template: Vec<Value> = vec![Value::Null; spec.total_slots];
+        emit_rows_rec(
+            &spec.columns,
+            parent,
+            template,
+            ord,
+            outer_row,
+            sq,
+            &mut rows,
+        )?;
     }
     Ok(rows)
 }
 
-/// Phase 11.20b: fill child-level leaf slots for one child match.
-/// Depth-1 constraint is enforced at compile time, so `children` contains
-/// only `Regular`, `Ordinality`, and `Exists` kinds.
-fn fill_leaf_children<R: SubqueryRunner>(
-    children: &[JsonTableColumnSpec],
-    child: &serde_json::Value,
-    child_ord: i64,
+/// Phase 11.20c — recursive row emitter supporting arbitrary NESTED depth
+/// and arbitrary number of sibling NESTED entries per `COLUMNS(...)`
+/// list.
+///
+/// Semantics:
+/// 1. Fill this level's leaves (Regular / Ordinality / Exists) into the
+///    caller-supplied template in place.
+/// 2. If there are zero NESTED siblings at this level, push the template.
+/// 3. Otherwise emit **UNION** across each NESTED sibling: each sibling
+///    walks its child path and produces `max(1, |child_matches|)` rows,
+///    cloning the template per row so the other siblings' ranges stay
+///    `NULL` (LEFT-OUTER pad).
+fn emit_rows_rec<R: SubqueryRunner>(
+    cols: &[JsonTableColumnSpec],
+    node: &serde_json::Value,
+    mut template: Vec<Value>,
+    level_ord: i64,
     outer_row: &[Value],
     sq: &mut R,
-    row: &mut [Value],
+    rows: &mut Vec<Vec<Value>>,
 ) -> Result<(), DbError> {
-    for c in children {
-        match &c.kind {
+    // Pass 1 — fill this level's leaf columns in place.
+    for col in cols {
+        match &col.kind {
             JsonTableColumnKind::Ordinality { slot } => {
-                row[*slot] = Value::BigInt(child_ord);
+                template[*slot] = Value::BigInt(level_ord);
             }
             JsonTableColumnKind::Regular {
                 slot,
@@ -478,22 +429,57 @@ fn fill_leaf_children<R: SubqueryRunner>(
                 on_empty,
                 on_error,
             } => {
-                row[*slot] =
-                    materialize_regular(child, path, c.ty, on_empty, on_error, outer_row, sq)?;
+                template[*slot] =
+                    materialize_regular(node, path, col.ty, on_empty, on_error, outer_row, sq)?;
             }
             JsonTableColumnKind::Exists {
                 slot,
                 path,
                 on_error,
             } => {
-                row[*slot] = materialize_exists(child, path, c.ty, on_error, outer_row, sq)?;
+                template[*slot] = materialize_exists(node, path, col.ty, on_error, outer_row, sq)?;
             }
             JsonTableColumnKind::Nested { .. } => {
-                // Compile-time depth check in `compile_columns_recursive`
-                // prevents reaching this arm in 11.20b.
-                return Err(DbError::NotImplemented {
-                    feature: "JSON_TABLE: multi-level NESTED — deferred to 11.20c".into(),
-                });
+                // Handled in pass 2.
+            }
+        }
+    }
+
+    // Pass 2 — collect NESTED siblings at this level.
+    let nested_siblings: Vec<&JsonTableColumnSpec> = cols
+        .iter()
+        .filter(|c| matches!(c.kind, JsonTableColumnKind::Nested { .. }))
+        .collect();
+
+    if nested_siblings.is_empty() {
+        rows.push(template);
+        return Ok(());
+    }
+
+    // UNION across siblings: each sibling contributes its own row set
+    // with the other siblings' slot ranges left NULL (template init).
+    for nested in nested_siblings {
+        let (path, children) = match &nested.kind {
+            JsonTableColumnKind::Nested { path, children, .. } => (path, children),
+            _ => unreachable!("filtered to Nested above"),
+        };
+        let child_matches = walk_path_owned(node, path);
+        if child_matches.is_empty() {
+            // LEFT-OUTER pad for this sibling. Clone so other siblings see
+            // the same parent template on the next iteration.
+            rows.push(template.clone());
+        } else {
+            for (j, child) in child_matches.iter().enumerate() {
+                let child_ord = (j as i64) + 1;
+                emit_rows_rec(
+                    children,
+                    child,
+                    template.clone(),
+                    child_ord,
+                    outer_row,
+                    sq,
+                    rows,
+                )?;
             }
         }
     }

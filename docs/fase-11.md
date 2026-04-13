@@ -319,3 +319,53 @@ PASSING sobre la row-path (11.20d).
   porque mapea directo al layout DFS de slots sin IR plan-tree.
 - PG exige `PATH` despues de `NESTED`; AxiomDB tambien acepta la forma
   corta `NESTED '<path>' COLUMNS(...)` (MariaDB parity).
+
+---
+
+## 11.20c — multi-sibling + multi-level `NESTED PATH` (2026-04-13)
+
+### Resumen
+
+Lift de los dos guards 11.20b:
+- **Multi-sibling NESTED**: dos o más `NESTED PATH` en la misma `COLUMNS(...)`
+  → UNION semantics (cada sibling emite sus filas con los otros siblings en
+  NULL).
+- **Multi-level NESTED**: `NESTED` dentro de `NESTED` hasta profundidad 32.
+
+### Componentes
+
+- `compile_columns_recursive`: borrado `depth >= 1` y `nested_count > 1`;
+  agregado defensive `depth > 32 → error`.
+- `materialize_json_table` + `fill_leaf_children` (11.20b) colapsan en
+  `emit_rows_rec(cols, node, template, level_ord, ...)`:
+  1. Fill leaves (Regular / Ordinality / Exists) in-place sobre template.
+  2. Si no hay NESTED siblings → push template y return.
+  3. Por cada NESTED sibling: walk child path, emit UNION — `max(1, |hijos|)`
+     filas por sibling; siblings restantes quedan NULL (template init).
+- El mismo `emit_rows_rec` expresa multi-level (recursion sobre children)
+  y multi-sibling (iteracion sobre hermanos NESTED) en una sola funcion.
+
+### Semantica UNION confirmada
+
+Para parent con prices=[10,20] y tags=["a","b","c"]:
+- sibling prices → 2 filas con tag=NULL
+- sibling tags   → 3 filas con price=NULL
+- Total: 5 filas (no 2×3=6 — no es cartesiano entre siblings).
+
+Dos siblings vacios → 2 filas LEFT-OUTER pad (una por sibling). PG + MariaDB parity.
+
+### Validacion
+
+- `cargo test -p axiomdb-sql --test integration_json_table_multi` — 10/10 OK.
+- `cargo test -p axiomdb-sql --test integration_json_table_nested` — 9/9 OK (los 2 tests "deferred" quitados).
+- `cargo test -p axiomdb-sql --test integration_json_table` — 16/16 OK (sin regresion).
+- `cargo clippy -p axiomdb-sql --lib -- -D warnings` — limpio.
+- `cargo fmt --check` — limpio.
+- `tools/wire-test.py` — 372/372 OK (2 aserciones nuevas 11.20c).
+
+### Nota de diseño
+
+Una sola funcion recursiva expresa todos los casos (flat, single-NESTED,
+multi-sibling, multi-level, mixto). No hay plan-tree IR separado (modelo
+MariaDB). PG usa `JsonTableSiblingJoin` node; AxiomDB lo inlinea como
+iteracion sobre siblings en `emit_rows_rec`.
