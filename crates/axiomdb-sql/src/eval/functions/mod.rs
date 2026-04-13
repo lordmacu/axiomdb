@@ -13,6 +13,9 @@ mod string;
 mod system;
 mod uuid;
 
+pub(crate) use json::{
+    execute_jsonpath as execute_jsonpath_public, parse_jsonpath as parse_jsonpath_public,
+};
 pub(crate) use sql_json_query::eval_sql_json_query;
 
 pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, DbError> {

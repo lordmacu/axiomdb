@@ -354,6 +354,10 @@ pub enum BinaryOp {
     /// `'k'` as a string element (Phase 11.18a). Matches PG
     /// `jsonb_exists()` semantics.
     JsonExists,
+    /// `@?` — JSONB JSONPath existence (Phase 11.21b): `doc @? 'jsonpath'`
+    /// returns true when the path has at least one match. Equivalent to
+    /// `jsonb_path_exists(doc, path)`.
+    JsonbPathExists,
 }
 
 // ── SQL/JSON standard query functions (Phase 11.19a) ─────────────────────────

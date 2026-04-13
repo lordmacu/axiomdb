@@ -280,6 +280,12 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
             let right = parse_bitor(p)?;
             Ok(binop(BinaryOp::JsonContainedBy, left, right))
         }
+        // Phase 11.21b: `@?` in infix position = JSONB JSONPath exists.
+        Token::JsonbPathExists if !negated => {
+            p.advance();
+            let right = parse_bitor(p)?;
+            Ok(binop(BinaryOp::JsonbPathExists, left, right))
+        }
         // Phase 11.18a: `?` in infix position = JSONB key/array-element exists.
         // `?` as a prefix atom stays reserved for prepared-statement
         // placeholders (see `parse_atom`), which is unreachable here.
