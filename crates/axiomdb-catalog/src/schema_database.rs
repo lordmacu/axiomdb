@@ -232,6 +232,8 @@ pub enum ColumnType {
     Uuid = 8,      // [u8; 16]
     Json = 9,      // validated UTF-8 JSON text (Phase 11.4)
     Jsonb = 10,    // binary JSONB blob (Phase 11.16)
+    Decimal = 11,  // i128 mantissa + u8 scale
+    Date = 12,     // i32 days since 1970-01-01
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -249,6 +251,8 @@ impl TryFrom<u8> for ColumnType {
             8 => Ok(Self::Uuid),
             9 => Ok(Self::Json),
             10 => Ok(Self::Jsonb),
+            11 => Ok(Self::Decimal),
+            12 => Ok(Self::Date),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
                 position: None,
