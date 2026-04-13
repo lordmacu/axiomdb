@@ -1754,6 +1754,20 @@ fn compare_json(left: &serde_json::Value, op: CmpOp, right: &serde_json::Value) 
 // multipleOf.
 // `true` schema accepts all; `false` schema rejects all.
 fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> bool {
+    validate_with_root(schema, doc, schema, 0)
+}
+
+const SCHEMA_REF_DEPTH_LIMIT: u32 = 32;
+
+fn validate_with_root(
+    schema: &serde_json::Value,
+    doc: &serde_json::Value,
+    root: &serde_json::Value,
+    depth: u32,
+) -> bool {
+    if depth > SCHEMA_REF_DEPTH_LIMIT {
+        return false;
+    }
     match schema {
         serde_json::Value::Bool(true) => return true,
         serde_json::Value::Bool(false) => return false,
@@ -1762,24 +1776,41 @@ fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> 
     }
     let obj = schema.as_object().unwrap();
 
+    // $ref short-circuits per Draft-07: all sibling keywords are ignored.
+    if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+        return match resolve_json_pointer(root, r) {
+            Some(target) => validate_with_root(target, doc, root, depth + 1),
+            None => false,
+        };
+    }
+
     if let Some(subs) = obj.get("allOf").and_then(|v| v.as_array()) {
-        if !subs.iter().all(|s| json_schema_validate(s, doc)) {
+        if !subs
+            .iter()
+            .all(|s| validate_with_root(s, doc, root, depth + 1))
+        {
             return false;
         }
     }
     if let Some(subs) = obj.get("anyOf").and_then(|v| v.as_array()) {
-        if !subs.iter().any(|s| json_schema_validate(s, doc)) {
+        if !subs
+            .iter()
+            .any(|s| validate_with_root(s, doc, root, depth + 1))
+        {
             return false;
         }
     }
     if let Some(subs) = obj.get("oneOf").and_then(|v| v.as_array()) {
-        let hits = subs.iter().filter(|s| json_schema_validate(s, doc)).count();
+        let hits = subs
+            .iter()
+            .filter(|s| validate_with_root(s, doc, root, depth + 1))
+            .count();
         if hits != 1 {
             return false;
         }
     }
     if let Some(sub) = obj.get("not") {
-        if json_schema_validate(sub, doc) {
+        if validate_with_root(sub, doc, root, depth + 1) {
             return false;
         }
     }
@@ -1879,7 +1910,7 @@ fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> 
                 serde_json::Value::Array(subs) => {
                     for (i, sub) in subs.iter().enumerate() {
                         if let Some(v) = arr.get(i) {
-                            if !json_schema_validate(sub, v) {
+                            if !validate_with_root(sub, v, root, depth + 1) {
                                 return false;
                             }
                         }
@@ -1887,7 +1918,7 @@ fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> 
                 }
                 _ => {
                     for v in arr {
-                        if !json_schema_validate(items, v) {
+                        if !validate_with_root(items, v, root, depth + 1) {
                             return false;
                         }
                     }
@@ -1922,14 +1953,14 @@ fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> 
 
         for (k, sub) in props {
             if let Some(v) = map.get(k) {
-                if !json_schema_validate(sub, v) {
+                if !validate_with_root(sub, v, root, depth + 1) {
                     return false;
                 }
             }
         }
         for (k, v) in map {
             for (re, sub) in &compiled_pp {
-                if re.is_match(k) && !json_schema_validate(sub, v) {
+                if re.is_match(k) && !validate_with_root(sub, v, root, depth + 1) {
                     return false;
                 }
             }
@@ -1948,7 +1979,7 @@ fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> 
                 }
                 serde_json::Value::Object(_) | serde_json::Value::Bool(true) => {
                     for (k, v) in map {
-                        if is_additional(k) && !json_schema_validate(ap, v) {
+                        if is_additional(k) && !validate_with_root(ap, v, root, depth + 1) {
                             return false;
                         }
                     }
@@ -1959,7 +1990,7 @@ fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> 
         if let Some(pn) = obj.get("propertyNames") {
             for k in map.keys() {
                 let kv = serde_json::Value::String(k.clone());
-                if !json_schema_validate(pn, &kv) {
+                if !validate_with_root(pn, &kv, root, depth + 1) {
                     return false;
                 }
             }
@@ -1980,7 +2011,7 @@ fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> 
                         }
                     }
                     _ => {
-                        if !json_schema_validate(dep, doc) {
+                        if !validate_with_root(dep, doc, root, depth + 1) {
                             return false;
                         }
                     }
@@ -1990,19 +2021,47 @@ fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> 
     }
 
     if let Some(cond) = obj.get("if") {
-        let branch_key = if json_schema_validate(cond, doc) {
+        let branch_key = if validate_with_root(cond, doc, root, depth + 1) {
             "then"
         } else {
             "else"
         };
         if let Some(branch) = obj.get(branch_key) {
-            if !json_schema_validate(branch, doc) {
+            if !validate_with_root(branch, doc, root, depth + 1) {
                 return false;
             }
         }
     }
 
     true
+}
+
+/// Resolve a RFC 6901 JSON pointer (with optional leading `#`) against a root.
+fn resolve_json_pointer<'a>(
+    root: &'a serde_json::Value,
+    pointer: &str,
+) -> Option<&'a serde_json::Value> {
+    let p = pointer.strip_prefix('#').unwrap_or(pointer);
+    if p.is_empty() || p == "/" {
+        // "#" and "#/" both mean the root document.
+        return Some(root);
+    }
+    let p = p.strip_prefix('/')?;
+    let mut current = root;
+    for raw in p.split('/') {
+        let decoded = raw.replace("~1", "/").replace("~0", "~");
+        match current {
+            serde_json::Value::Object(map) => {
+                current = map.get(&decoded)?;
+            }
+            serde_json::Value::Array(arr) => {
+                let idx: usize = decoded.parse().ok()?;
+                current = arr.get(idx)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
 }
 
 fn schema_format_matches(fmt: &str, s: &str) -> bool {

@@ -609,3 +609,127 @@ fn format_ipv4_ipv6() {
     );
     assert!(is_false(&v));
 }
+
+// ── Phase 11.23f: $ref internal JSON-pointer references ──────────────────
+
+#[test]
+fn ref_to_definitions() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"definitions\":{\"pos\":{\"type\":\"integer\",\"minimum\":0}},\
+              \"$ref\":\"#/definitions/pos\"}', \
+            '5')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"definitions\":{\"pos\":{\"type\":\"integer\",\"minimum\":0}},\
+              \"$ref\":\"#/definitions/pos\"}', \
+            '-1')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_false(&v));
+}
+
+#[test]
+fn ref_nested_in_properties() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"definitions\":{\"name\":{\"type\":\"string\",\"minLength\":1}},\
+              \"type\":\"object\",\
+              \"properties\":{\"name\":{\"$ref\":\"#/definitions/name\"}}}', \
+            '{\"name\":\"ok\"}')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"definitions\":{\"name\":{\"type\":\"string\",\"minLength\":1}},\
+              \"type\":\"object\",\
+              \"properties\":{\"name\":{\"$ref\":\"#/definitions/name\"}}}', \
+            '{\"name\":\"\"}')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_false(&v));
+}
+
+#[test]
+fn ref_root() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    // Root-ref recursion: tree with self-referential items.
+    // Depth limit protects against infinite loops.
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"type\":\"array\",\"items\":{\"$ref\":\"#\"}}', \
+            '[[[]]]')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+}
+
+#[test]
+fn ref_missing_pointer_fails() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"$ref\":\"#/nonexistent\"}', '42')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_false(&v));
+}
+
+#[test]
+fn ref_pointer_escaping() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    // ~1 decodes to '/' per RFC 6901.
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"defs\":{\"a/b\":{\"type\":\"integer\"}},\
+              \"$ref\":\"#/defs/a~1b\"}', \
+            '42')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+}
+
+#[test]
+fn ref_siblings_ignored_draft07() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    // Draft-07: sibling keywords are ignored when $ref is present.
+    // The sibling "type":"string" would reject 42, but $ref→integer wins.
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"definitions\":{\"i\":{\"type\":\"integer\"}},\
+              \"$ref\":\"#/definitions/i\",\
+              \"type\":\"string\"}', \
+            '42')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+}
