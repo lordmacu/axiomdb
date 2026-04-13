@@ -335,6 +335,32 @@ fn is_implicit_alias_token(tok: &Token) -> bool {
 fn parse_join_clauses(p: &mut Parser) -> Result<Vec<JoinClause>, DbError> {
     let mut joins = Vec::new();
     loop {
+        // Phase 11.20d2: CROSS APPLY / OUTER APPLY are non-correlated lateral
+        // sugar for INNER/LEFT JOIN … ON TRUE. Desugar at parse time.
+        let apply_form = match (p.peek(), p.peek_at(1)) {
+            (Token::Cross, Token::Apply) => Some(JoinType::Inner),
+            (Token::Outer, Token::Apply) => Some(JoinType::Left),
+            _ => None,
+        };
+        if let Some(join_type) = apply_form {
+            p.advance(); // CROSS / OUTER
+            p.advance(); // APPLY
+            let table = parse_from_item(p)?;
+            // APPLY takes no ON / USING — any such clause is a parse error.
+            if matches!(p.peek(), Token::On | Token::Using) {
+                return Err(DbError::ParseError {
+                    message: "CROSS APPLY / OUTER APPLY does not accept ON / USING".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+            joins.push(JoinClause {
+                join_type,
+                table,
+                condition: JoinCondition::On(Expr::Literal(Value::Bool(true))),
+            });
+            continue;
+        }
+
         let join_type = match p.peek() {
             Token::Join => {
                 p.advance();

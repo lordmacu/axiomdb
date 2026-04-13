@@ -7,6 +7,38 @@ fn execute_select_with_joins_ctx(
 ) -> Result<QueryResult, DbError> {
     let storage = exec_ctx.storage();
     let txn = exec_ctx.coord();
+    let snap = conn_txn
+        .map(|c| txn.active_snapshot(c))
+        .unwrap_or_else(|| txn.snapshot());
+    let from_t = resolve_table_cached(storage, txn, ctx, conn_txn, &from_ref)?;
+    let from_rows =
+        crate::table::scan_table_any_layout(storage, &from_t.def, &from_t.columns, snap)?;
+    let first_source = join_source_schema_from_resolved(&from_ref, &from_t);
+    let first_rows: Vec<Row> = from_rows.into_iter().map(|(_, r)| r).collect();
+    execute_select_with_joins_first_materialized(
+        stmt,
+        first_source,
+        first_rows,
+        exec_ctx,
+        conn_txn,
+        ctx,
+    )
+}
+
+/// Phase 11.20d2 — shared join-loop entry point that takes an already-
+/// materialized first source. Used both by the regular FROM-Table path
+/// (`execute_select_with_joins_ctx`) and by the JSON_TABLE-first path
+/// (`execute_select_json_table_source` when `!stmt.joins.is_empty()`).
+fn execute_select_with_joins_first_materialized(
+    stmt: SelectStmt,
+    first_source: JoinSourceSchema,
+    first_rows: Vec<Row>,
+    exec_ctx: &ExecutionContext,
+    conn_txn: Option<&axiomdb_wal::ConnectionTxn>,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
     // Session collation for eval()-based comparisons in join ON, WHERE, ORDER BY, etc.
     // Guard propagates from execute_select_ctx when called via the join path, but
     // we set it here too so this function can also be called independently.
@@ -21,13 +53,10 @@ fn execute_select_with_joins_ctx(
         .unwrap_or_else(|| txn.snapshot());
 
     {
-        let from_t = resolve_table_cached(storage, txn, ctx, conn_txn, &from_ref)?;
-        let from_rows =
-            crate::table::scan_table_any_layout(storage, &from_t.def, &from_t.columns, snap.clone())?;
         col_offsets.push(running_offset);
-        running_offset += from_t.columns.len();
-        all_sources.push(join_source_schema_from_resolved(&from_ref, &from_t));
-        scanned.push(from_rows.into_iter().map(|(_, r)| r).collect());
+        running_offset += first_source.columns.len();
+        all_sources.push(first_source);
+        scanned.push(first_rows);
 
         for join in &stmt.joins {
             match &join.table {

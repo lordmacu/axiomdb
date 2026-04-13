@@ -171,6 +171,46 @@ CROSS JOIN colors
 ORDER BY sizes.sort_order, colors.sort_order;
 ```
 
+### CROSS APPLY / OUTER APPLY
+
+SQL Server–style lateral-join sugar. `CROSS APPLY src` is equivalent to
+`INNER JOIN src ON TRUE`; `OUTER APPLY src` is equivalent to
+`LEFT JOIN src ON TRUE`. Useful when the right side is a `JSON_TABLE(...)`
+row source driven by a constant document or parameter, because no `ON`
+clause is required.
+
+```sql
+-- Explode a constant JSON array against every user row.
+SELECT u.id, j.v
+FROM users u
+CROSS APPLY JSON_TABLE('[10, 20, 30]', '$[*]'
+              COLUMNS (v INT PATH '$')) AS j;
+
+-- Keep the user row even when the JSON array yields no children.
+SELECT u.id, j.v
+FROM users u
+OUTER APPLY JSON_TABLE('[]', '$[*]'
+              COLUMNS (v INT PATH '$')) AS j;
+```
+
+`APPLY` accepts any right-hand source (table, subquery, `JSON_TABLE`).
+`ON` / `USING` clauses after `APPLY` are a parse error — the join
+condition is implicit `TRUE`. Correlated APPLY (where the right side
+references the left, e.g. `CROSS APPLY JSON_TABLE(t.doc, ...)`) is
+deferred to phase 11.20d3.
+
+### JSON_TABLE as first FROM + JOIN
+
+`JSON_TABLE(...)` can appear as the first `FROM` entry and still be
+joined to other sources:
+
+```sql
+SELECT j.id, u.name
+FROM JSON_TABLE('[{"id":1},{"id":3}]', '$[*]'
+                COLUMNS (id INT PATH '$.id')) AS j
+JOIN users u ON u.id = j.id;
+```
+
 ### Multi-Table JOIN
 
 ```sql
@@ -1596,19 +1636,34 @@ one row per match. Each `COLUMNS(...)` entry projects a value out of that row.
 
 ```
 JSON_TABLE ( <expr>, '<row_path>'
+             [ PASSING <passing_item> [, <passing_item>]* ]
              COLUMNS ( <column_def> [, <column_def>]* ) )
            [ [AS] alias ]
 
+passing_item := <expr> AS <identifier>
+
 column_def := <name> <type> PATH '<jsonpath>'
+                     [ <wrapper_clause> ]
+                     [ <quotes_clause> ]
                      [ {NULL | ERROR | DEFAULT <expr>} ON EMPTY ]
                      [ {NULL | ERROR | DEFAULT <expr>} ON ERROR ]
             | <name> FOR ORDINALITY
             | <name> <type> EXISTS PATH '<jsonpath>'
                      [ {TRUE | FALSE | UNKNOWN | ERROR} ON ERROR ]
+            | NESTED [PATH] '<jsonpath>' COLUMNS ( <column_def>* )
+
+wrapper_clause := WITH [CONDITIONAL | UNCONDITIONAL] [ARRAY] WRAPPER
+                | WITHOUT [ARRAY] WRAPPER
+
+quotes_clause  := KEEP QUOTES [ON SCALAR STRING]
+                | OMIT QUOTES [ON SCALAR STRING]
 ```
 
-Phase 11.20a implements the **flat** subset — `NESTED PATH`, `WRAPPER`, `QUOTES`,
-and lateral-correlated `doc` references are deferred to 11.20b–d.
+Phase 11.20a implemented the flat subset; 11.20b added single-level `NESTED
+PATH`; 11.20c lifted the depth and multi-sibling restrictions; 11.20d1 added
+per-column `WRAPPER` / `QUOTES` plus top-level `PASSING` bindings.
+LATERAL-correlated `doc` expressions and `JSON_TABLE` as an UPDATE/DELETE
+source remain deferred to 11.20d2–d4.
 
 ### Example — shred an array of objects
 
@@ -1755,3 +1810,83 @@ SELECT inv_id, line_id, part FROM JSON_TABLE(
 -- (1, 'L1', 'P2')
 -- (1, 'L2', NULL)   ← L2.parts empty → inner LEFT-OUTER pad
 ```
+
+### WRAPPER / QUOTES / PASSING (Phase 11.20d1)
+
+`JSON_TABLE` now accepts the SQL:2016 path-tailoring clauses that
+`JSON_VALUE` / `JSON_QUERY` already supported:
+
+```sql
+-- WRAPPER: force an array literal even if the path yields a single hit
+SELECT tags FROM JSON_TABLE(
+    '{"tags":["a","b","c"]}',
+    '$' COLUMNS (
+        tags JSON PATH '$.tags[*]' WITH UNCONDITIONAL ARRAY WRAPPER
+    )
+) AS t;
+-- ('["a","b","c"]')
+
+-- QUOTES: strip the outer "..." around a JSON string scalar on TEXT
+SELECT name FROM JSON_TABLE(
+    '{"name":"Alice"}',
+    '$' COLUMNS (
+        name TEXT PATH '$.name' OMIT QUOTES ON SCALAR STRING
+    )
+) AS t;
+-- ('Alice')
+```
+
+`PASSING expr AS name` attaches one or more variable bindings to the
+`JSON_TABLE` call. Bindings are visible to the row path, every column
+`PATH`, and every `NESTED PATH` (including filter expressions):
+
+```sql
+SELECT oid, price FROM JSON_TABLE(
+    '{"items":[{"price":10},{"price":20},{"price":30}]}',
+    '$.items[?(@.price > $min)]'
+    PASSING 15 AS min
+    COLUMNS (
+        oid   FOR ORDINALITY,
+        price INT PATH '$.price'
+    )
+) AS t;
+-- (1, 20)
+-- (2, 30)
+```
+
+<div class="callout callout-design">
+<span class="callout-icon">🔧</span>
+<div class="callout-body">
+<span class="callout-label">Unified JSONPath engine</span>
+Phase 11.20d1 retired JSON_TABLE's restricted path walker. All three
+path sites (row path, column path, <code>NESTED</code> path) now go
+through the same <code>parse_jsonpath</code> engine as
+<code>jsonb_path_*</code>, <code>@?</code>, <code>@@</code>, and the
+filter accessors <code>.size()</code> / <code>.type()</code>. A single
+<code>PassingEnv</code> threads through every filter evaluation, so
+<code>$var</code> references work identically everywhere and you don't
+pay for two divergent dialects.
+</div>
+</div>
+
+Rules:
+
+- `WRAPPER` / `QUOTES` are only valid on `Regular` column entries.
+  Applying them to `FOR ORDINALITY`, `EXISTS PATH`, or `NESTED PATH` is
+  a parse-time error.
+- `OMIT QUOTES` is only valid on TEXT-returning columns (SQL:2016
+  §9.42 + PG parity). Using it elsewhere is rejected at parse time.
+- Duplicate `PASSING` names (case-insensitive) are rejected at parse
+  time with a clear error.
+- A `$var` referenced by a filter but not bound in `PASSING` silently
+  yields no match on that row (PG lax-mode parity — no panic, no
+  `DbError`).
+
+Remaining pieces of 11.20d:
+
+- `11.20d2` — JSON_TABLE as the first FROM entry combined with JOIN /
+  CROSS APPLY.
+- `11.20d3` — LATERAL-correlated `doc` and PASSING expressions that
+  reference outer columns (env rebuilt per outer row).
+- `11.20d4` — JSON_TABLE as source for UPDATE / DELETE (`MERGE`
+  deferred until `MERGE` itself lands).

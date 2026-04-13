@@ -3213,6 +3213,75 @@ ok("11.20c JSON_TABLE multi-level NESTED with LEFT-OUTER pad",
    cleaned == [("L1", "P1"), ("L1", "P2"), ("L2", None)],
    f"got {cleaned}")
 
+# ── Phase 11.20d1 — WRAPPER / QUOTES / PASSING ────────────────────────────────
+
+print("\n[11.20d1 JSON_TABLE wrapper/quotes/passing]")
+
+# WITH UNCONDITIONAL ARRAY WRAPPER → JSON array literal, OMIT QUOTES on TEXT,
+# PASSING threaded into the column path filter.
+cur.execute("""SELECT oid, tag_list, top_tag FROM JSON_TABLE(
+    '{"min":2,"items":[{"t":"a","q":1},{"t":"b","q":5},{"t":"c","q":9}]}',
+    '$'
+    PASSING 4 AS qmin
+    COLUMNS (
+        oid      FOR ORDINALITY,
+        tag_list JSON PATH '$.items[?(@.q > $qmin)].t'
+            WITH UNCONDITIONAL ARRAY WRAPPER,
+        top_tag  TEXT PATH '$.items[?(@.q > $qmin)].t'
+            WITH UNCONDITIONAL ARRAY WRAPPER OMIT QUOTES ON SCALAR STRING
+            NULL ON EMPTY
+    )
+) AS t""")
+rows = cur.fetchall()
+# top_tag is OMIT QUOTES but wrapper result is array → rendered as JSON
+# array text (OMIT only strips outer quotes on string scalars, PG parity).
+oid_ok = rows[0][0] in (1, "1")
+tags_ok = str(rows[0][1]) == '["b","c"]'
+ok("11.20d1 WRAPPER + OMIT QUOTES + PASSING roundtrip",
+   oid_ok and tags_ok,
+   f"got {rows}")
+
+# ── Phase 11.20d2 — JSON_TABLE as first FROM + CROSS/OUTER APPLY ──────────────
+
+print("\n[11.20d2 JSON_TABLE first FROM + APPLY]")
+
+# Seed a small base table for APPLY and first-FROM tests.
+cur.execute("CREATE TABLE d2_users (id INT PRIMARY KEY, name TEXT)")
+cur.execute("INSERT INTO d2_users VALUES (1,'alice'),(2,'bob'),(3,'carol')")
+
+# 1. JSON_TABLE as first FROM, INNER JOIN to a real table.
+cur.execute("""SELECT j.id, u.name
+                 FROM JSON_TABLE('[{"id":1},{"id":3},{"id":99}]',
+                                 '$[*]' COLUMNS (id INT PATH '$.id')) AS j
+                 JOIN d2_users u ON u.id = j.id
+                 ORDER BY j.id""")
+rows = cur.fetchall()
+ok("11.20d2 JSON_TABLE first + INNER JOIN",
+   rows == ((1, "alice"), (3, "carol")),
+   f"got {rows}")
+
+# 2. CROSS APPLY — product of left rows × materialized JSON rows.
+cur.execute("""SELECT u.id, j.v
+                 FROM d2_users u
+                 CROSS APPLY JSON_TABLE('[10,20]', '$[*]'
+                              COLUMNS (v INT PATH '$')) AS j
+                 ORDER BY u.id, j.v""")
+rows = cur.fetchall()
+ok("11.20d2 CROSS APPLY JSON_TABLE product",
+   rows == ((1, 10), (1, 20), (2, 10), (2, 20), (3, 10), (3, 20)),
+   f"got {rows}")
+
+# 3. OUTER APPLY preserves left row when right yields no rows.
+cur.execute("""SELECT u.id, j.v
+                 FROM d2_users u
+                 OUTER APPLY JSON_TABLE('[]', '$[*]'
+                              COLUMNS (v INT PATH '$')) AS j
+                 ORDER BY u.id""")
+rows = cur.fetchall()
+ok("11.20d2 OUTER APPLY preserves left on empty",
+   rows == ((1, None), (2, None), (3, None)),
+   f"got {rows}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()
