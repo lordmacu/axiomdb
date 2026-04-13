@@ -308,3 +308,97 @@ fn parse_text_to_decimal(s: &str, mode: CoercionMode) -> Result<(i128, u8), DbEr
 
     Ok((if negative { -mantissa } else { mantissa }, scale))
 }
+
+fn parse_text_to_date_days(s: &str, mode: CoercionMode) -> Result<i32, DbError> {
+    let trimmed = s.trim();
+    let make_err = |reason: String| DbError::InvalidCoercion {
+        from: "Text".into(),
+        to: "DATE".into(),
+        value: format!("'{s}'"),
+        reason,
+    };
+
+    // Accept ISO date prefix: YYYY-MM-DD.
+    // If a time part exists ("YYYY-MM-DD HH:MM:SS"), ignore it.
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 10 {
+        return Err(make_err("expected YYYY-MM-DD".into()));
+    }
+    let prefix = &trimmed[..10];
+    let b = prefix.as_bytes();
+    if !(b[0].is_ascii_digit()
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+        && b[4] == b'-'
+        && b[5].is_ascii_digit()
+        && b[6].is_ascii_digit()
+        && b[7] == b'-'
+        && b[8].is_ascii_digit()
+        && b[9].is_ascii_digit())
+    {
+        return Err(make_err("expected YYYY-MM-DD".into()));
+    }
+
+    // Strict mode: after the 10-byte prefix, allow optional whitespace + time.
+    // We don't validate the time payload here since Date truncates it.
+    if mode == CoercionMode::Strict && bytes.len() > 10 {
+        let rest = &trimmed[10..];
+        if !rest.is_empty() {
+            let first = rest.as_bytes()[0];
+            if !first.is_ascii_whitespace() && first != b'T' {
+                return Err(make_err("unexpected trailing characters after date".into()));
+            }
+        }
+    }
+
+    let year: i32 = prefix[0..4]
+        .parse()
+        .map_err(|_| make_err("invalid year".into()))?;
+    let month: i32 = prefix[5..7]
+        .parse()
+        .map_err(|_| make_err("invalid month".into()))?;
+    let day: i32 = prefix[8..10]
+        .parse()
+        .map_err(|_| make_err("invalid day".into()))?;
+
+    ymd_to_days_checked(year, month, day).ok_or_else(|| make_err("invalid calendar date".into()))
+}
+
+fn ymd_to_days_checked(year: i32, month: i32, day: i32) -> Option<i32> {
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    if day < 1 {
+        return None;
+    }
+    let dim = days_in_month(year, month) as i32;
+    if day > dim {
+        return None;
+    }
+
+    // Howard Hinnant's civil calendar algorithm (same math as mysql/prepared.rs).
+    let y = if month <= 2 { year - 1 } else { year };
+    let m = if month <= 2 { month + 9 } else { month - 3 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * m as u32 + 2) / 5 + day as u32 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era as i64 * 146_097_i64 + doe as i64 - 719_468_i64;
+    if days < i32::MIN as i64 || days > i32::MAX as i64 {
+        return None;
+    }
+    Some(days as i32)
+}
+
+fn days_in_month(year: i32, month: i32) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
+}

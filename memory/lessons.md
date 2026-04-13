@@ -45,3 +45,4 @@
 - **UPDATE index skip requires two conditions:** RID stable AND logical key / predicate membership unchanged.
 - **Research citations:** cite exact file paths from `research/`, not just "PostgreSQL" or "MariaDB". Use borrow/reject/adapt mindset.
 - **Critical subphases (correctness, durability, WAL, crash recovery):** review all relevant engines in `research/`, not just the obvious one. Correctness before speed.
+- **Default choice:** pick best + most robust solution over quick/minimal hacks. If semantics unclear, consult `research/{postgres,mariadb,duckdb}` source and cite the exact path.

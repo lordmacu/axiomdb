@@ -373,6 +373,15 @@ pub enum BinaryOp {
     /// `?&` — JSONB all-keys existence (Phase 11.18b): like `?|` but every
     /// RHS-array element must match.
     JsonExistsAll,
+    /// `#>` — JSONB path-extract (Phase 11.18c): `doc #> '["a","b"]'` returns
+    /// the sub-document at the path as JSONB. RHS is a JSONB array of path
+    /// segments (string keys / numeric indices).
+    JsonPathExtract,
+    /// `#>>` — JSONB path-extract as TEXT (Phase 11.18c).
+    JsonPathExtractText,
+    /// `#-` — JSONB path-delete (Phase 11.18c): returns doc with the path
+    /// pruned. RHS is a JSONB array of path segments.
+    JsonPathDelete,
 }
 
 // ── SQL/JSON standard query functions (Phase 11.19a) ─────────────────────────

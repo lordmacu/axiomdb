@@ -114,10 +114,7 @@ impl CatalogChangeNotifier {
     ///
     /// [`CatalogWriter`]: crate::writer::CatalogWriter
     pub fn notify(&self, event: &SchemaChangeEvent) {
-        let guard = self
-            .listeners
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let guard = self.listeners.read().unwrap_or_else(|e| e.into_inner());
         for listener in guard.iter() {
             listener.on_schema_change(event);
         }

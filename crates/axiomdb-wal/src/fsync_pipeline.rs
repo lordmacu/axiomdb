@@ -248,7 +248,10 @@ impl FsyncPipeline {
     /// Returns the current flushed LSN.
     #[cfg(test)]
     pub fn flushed_lsn(&self) -> u64 {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).flushed_lsn
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .flushed_lsn
     }
 }
 

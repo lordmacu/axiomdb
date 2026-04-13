@@ -694,10 +694,12 @@ fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Int => "INT",
         ColumnType::BigInt => "BIGINT",
         ColumnType::Float => "REAL",
+        ColumnType::Decimal => "DECIMAL",
         ColumnType::Text => "TEXT",
         ColumnType::Json => "JSON",
         ColumnType::Jsonb => "JSONB",
         ColumnType::Bytes => "BYTES",
+        ColumnType::Date => "DATE",
         ColumnType::Timestamp => "TIMESTAMP",
         ColumnType::Uuid => "UUID",
     }

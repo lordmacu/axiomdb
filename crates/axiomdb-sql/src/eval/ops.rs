@@ -257,6 +257,131 @@ pub(crate) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
         // ── JSONB any/all-keys exists: ?| / ?& (Phase 11.18b) ────────────────
         BinaryOp::JsonExistsAny => eval_jsonb_exists_set(l, r, false),
         BinaryOp::JsonExistsAll => eval_jsonb_exists_set(l, r, true),
+
+        // ── JSONB path operators: #>, #>>, #- (Phase 11.18c) ─────────────────
+        BinaryOp::JsonPathExtract => eval_jsonb_path_extract(l, r, false),
+        BinaryOp::JsonPathExtractText => eval_jsonb_path_extract(l, r, true),
+        BinaryOp::JsonPathDelete => eval_jsonb_path_delete(l, r),
+    }
+}
+
+fn jsonb_path_segments(rhs: Value) -> Result<Vec<String>, DbError> {
+    let sj = value_to_serde_json(rhs)?;
+    let arr = match sj {
+        serde_json::Value::Array(a) => a,
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "JSONB array of path segments".into(),
+                got: other.to_string(),
+            });
+        }
+    };
+    arr.into_iter()
+        .map(|e| match e {
+            serde_json::Value::String(s) => Ok(s),
+            serde_json::Value::Number(n) => Ok(n.to_string()),
+            other => Err(DbError::TypeMismatch {
+                expected: "string or number path segment".into(),
+                got: other.to_string(),
+            }),
+        })
+        .collect()
+}
+
+fn descend_serde<'a>(
+    node: &'a serde_json::Value,
+    parts: &[String],
+) -> Option<&'a serde_json::Value> {
+    let mut cur = node;
+    for p in parts {
+        cur = match cur {
+            serde_json::Value::Object(m) => m.get(p)?,
+            serde_json::Value::Array(a) => {
+                let idx: i64 = p.parse().ok()?;
+                let real = if idx < 0 { a.len() as i64 + idx } else { idx };
+                if real < 0 {
+                    return None;
+                }
+                a.get(real as usize)?
+            }
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+fn eval_jsonb_path_extract(left: Value, right: Value, as_text: bool) -> Result<Value, DbError> {
+    if left.is_null() || right.is_null() {
+        return Ok(Value::Null);
+    }
+    let parts = jsonb_path_segments(right)?;
+    let doc = value_to_serde_json(left)?;
+    let target = match descend_serde(&doc, &parts) {
+        Some(v) => v.clone(),
+        None => return Ok(Value::Null),
+    };
+    if as_text {
+        match target {
+            serde_json::Value::String(s) => Ok(Value::Text(s)),
+            other => Ok(Value::Text(other.to_string())),
+        }
+    } else {
+        let blob = axiomdb_types::jsonb::JsonbEncoder::encode(&target)?;
+        Ok(Value::Jsonb(std::sync::Arc::new(blob)))
+    }
+}
+
+fn eval_jsonb_path_delete(left: Value, right: Value) -> Result<Value, DbError> {
+    if left.is_null() || right.is_null() {
+        return Ok(Value::Null);
+    }
+    let parts = jsonb_path_segments(right)?;
+    let mut doc = value_to_serde_json(left)?;
+    if !parts.is_empty() {
+        prune_serde(&mut doc, &parts);
+    }
+    let blob = axiomdb_types::jsonb::JsonbEncoder::encode(&doc)?;
+    Ok(Value::Jsonb(std::sync::Arc::new(blob)))
+}
+
+fn prune_serde(node: &mut serde_json::Value, parts: &[String]) {
+    let Some((last, parents)) = parts.split_last() else {
+        return;
+    };
+    let mut cur: &mut serde_json::Value = node;
+    for p in parents {
+        cur = match cur {
+            serde_json::Value::Object(m) => match m.get_mut(p) {
+                Some(v) => v,
+                None => return,
+            },
+            serde_json::Value::Array(a) => {
+                let idx: i64 = match p.parse() {
+                    Ok(i) => i,
+                    Err(_) => return,
+                };
+                let real = if idx < 0 { a.len() as i64 + idx } else { idx };
+                if real < 0 || real as usize >= a.len() {
+                    return;
+                }
+                &mut a[real as usize]
+            }
+            _ => return,
+        };
+    }
+    match cur {
+        serde_json::Value::Object(m) => {
+            m.remove(last);
+        }
+        serde_json::Value::Array(a) => {
+            if let Ok(idx) = last.parse::<i64>() {
+                let real = if idx < 0 { a.len() as i64 + idx } else { idx };
+                if real >= 0 && (real as usize) < a.len() {
+                    a.remove(real as usize);
+                }
+            }
+        }
+        _ => {}
     }
 }
 

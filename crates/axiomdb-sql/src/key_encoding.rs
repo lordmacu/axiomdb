@@ -176,11 +176,10 @@ pub fn decode_index_key(key: &[u8], n_values: usize) -> Result<(Vec<Value>, usiz
     let mut pos = 0;
     for _ in 0..n_values {
         if pos >= key.len() {
-            return Err(DbError::ParseError {
-                message: format!(
+            return Err(DbError::BTreeCorrupted {
+                msg: format!(
                     "decode_index_key: key truncated at pos {pos} (need {n_values} values)"
                 ),
-                position: None,
             });
         }
         let (v, new_pos) = decode_value(key, pos)?;
@@ -327,9 +326,8 @@ fn decode_bytes_nul(src: &[u8]) -> Result<(Vec<u8>, usize), DbError> {
 }
 
 fn trunc() -> DbError {
-    DbError::ParseError {
-        message: "decode_index_key: key bytes truncated".into(),
-        position: None,
+    DbError::BTreeCorrupted {
+        msg: "decode_index_key: key bytes truncated".into(),
     }
 }
 
@@ -445,5 +443,16 @@ mod tests {
     fn test_timestamp_sort_order() {
         assert_order(&[Value::Timestamp(-1_000_000)], &[Value::Timestamp(0)]);
         assert_order(&[Value::Timestamp(0)], &[Value::Timestamp(1_000_000)]);
+    }
+
+    #[test]
+    fn test_decode_index_key_truncated_is_corruption() {
+        let key = encode_index_key(&[Value::Int(123)]).unwrap();
+        let truncated = &key[..key.len() - 1];
+        let err = decode_index_key(truncated, 1).unwrap_err();
+        assert!(
+            matches!(err, DbError::BTreeCorrupted { .. }),
+            "expected BTreeCorrupted, got: {err}"
+        );
     }
 }
