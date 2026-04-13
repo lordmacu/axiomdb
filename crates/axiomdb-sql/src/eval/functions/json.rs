@@ -705,6 +705,139 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
         }
 
+        // ── Phase 11.24b: JSON_TRANSFORM (function-form variadic) ───────────
+        // Syntax (function-form, not Oracle special-form):
+        //   JSON_TRANSFORM(doc, 'SET', path, val, 'REMOVE', path,
+        //                       'RENAME', path, new_name,
+        //                       'APPEND', path, val,
+        //                       'INSERT', path, val,
+        //                       'REPLACE', path, val, ...)
+        // Ops consume their own arg counts (SET=3, REMOVE=1, RENAME=2,
+        // APPEND=2, INSERT=2, REPLACE=2). Applied sequentially.
+        "json_transform" => {
+            if args.len() < 2 {
+                return Err(DbError::TypeMismatch {
+                    expected: "json_transform: doc + at least one op".into(),
+                    got: args.len().to_string(),
+                });
+            }
+            let doc = eval_arg(args, 0, row, name)?;
+            if matches!(doc, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let mut sj = value_to_serde_json(&doc)?;
+            let mut i = 1usize;
+            while i < args.len() {
+                let op_val = eval_arg(args, i, row, name)?;
+                let op = match op_val {
+                    Value::Text(s) | Value::Json(s) => s.to_ascii_uppercase(),
+                    other => {
+                        return Err(DbError::TypeMismatch {
+                            expected: "json_transform op keyword (TEXT)".into(),
+                            got: other.variant_name().into(),
+                        });
+                    }
+                };
+                match op.as_str() {
+                    "SET" | "REPLACE" => {
+                        if i + 2 >= args.len() {
+                            return Err(DbError::InvalidValue {
+                                reason: format!("json_transform {op} needs path + value"),
+                            });
+                        }
+                        let p = eval_arg(args, i + 1, row, name)?;
+                        let v = eval_arg(args, i + 2, row, name)?;
+                        let parts = parse_mutation_path(&p)?;
+                        set_path_ext(
+                            &mut sj,
+                            &parts,
+                            sql_to_serde_json(&v),
+                            MutationFlags {
+                                create_if_missing: op == "SET",
+                                insert_after: false,
+                                raise_on_existing_key: false,
+                                allow_insert: false,
+                            },
+                        )?;
+                        i += 3;
+                    }
+                    "REMOVE" => {
+                        if i + 1 >= args.len() {
+                            return Err(DbError::InvalidValue {
+                                reason: "json_transform REMOVE needs path".into(),
+                            });
+                        }
+                        let p = eval_arg(args, i + 1, row, name)?;
+                        let parts = parse_mutation_path(&p)?;
+                        if !parts.is_empty() && (sj.is_object() || sj.is_array()) {
+                            remove_path_parts(&mut sj, &parts);
+                        }
+                        i += 2;
+                    }
+                    "RENAME" => {
+                        if i + 2 >= args.len() {
+                            return Err(DbError::InvalidValue {
+                                reason: "json_transform RENAME needs path + new_name".into(),
+                            });
+                        }
+                        let p = eval_arg(args, i + 1, row, name)?;
+                        let newn = eval_arg(args, i + 2, row, name)?;
+                        let parts = parse_mutation_path(&p)?;
+                        let new_name = match newn {
+                            Value::Text(s) | Value::Json(s) => s,
+                            other => other.to_string(),
+                        };
+                        json_rename_at(&mut sj, &parts, &new_name);
+                        i += 3;
+                    }
+                    "APPEND" => {
+                        if i + 2 >= args.len() {
+                            return Err(DbError::InvalidValue {
+                                reason: "json_transform APPEND needs path + value".into(),
+                            });
+                        }
+                        let p = eval_arg(args, i + 1, row, name)?;
+                        let v = eval_arg(args, i + 2, row, name)?;
+                        let parts = parse_mutation_path(&p)?;
+                        json_array_append_at(&mut sj, &parts, sql_to_serde_json(&v));
+                        i += 3;
+                    }
+                    "INSERT" => {
+                        if i + 2 >= args.len() {
+                            return Err(DbError::InvalidValue {
+                                reason: "json_transform INSERT needs path + value".into(),
+                            });
+                        }
+                        let p = eval_arg(args, i + 1, row, name)?;
+                        let v = eval_arg(args, i + 2, row, name)?;
+                        let parts = parse_mutation_path(&p)?;
+                        if !path_exists(&sj, &parts) {
+                            set_path_ext(
+                                &mut sj,
+                                &parts,
+                                sql_to_serde_json(&v),
+                                MutationFlags {
+                                    create_if_missing: true,
+                                    insert_after: false,
+                                    raise_on_existing_key: false,
+                                    allow_insert: false,
+                                },
+                            )?;
+                        }
+                        i += 3;
+                    }
+                    other => {
+                        return Err(DbError::InvalidValue {
+                            reason: format!(
+                                "json_transform: unknown op '{other}' (expected SET/REMOVE/RENAME/APPEND/INSERT/REPLACE)"
+                            ),
+                        });
+                    }
+                }
+            }
+            Ok(Value::Json(sj.to_string()))
+        }
+
         // ── Phase 11.25c: MySQL JSON_SEARCH ──────────────────────────────────
         // JSON_SEARCH(doc, one|all, search_str [, escape_char [, path ...]])
         // Returns matching JSON paths ('$.a.b') whose string values match the
@@ -2913,6 +3046,23 @@ fn merge_preserve(a: serde_json::Value, b: serde_json::Value) -> serde_json::Val
             J::Object(ma)
         }
         (a, b) => J::Array(vec![a, b]),
+    }
+}
+
+/// Rename an object key identified by `parts`. The last component must name
+/// an object key; renames it to `new_name` in-place, preserving value. No-op
+/// if the path doesn't resolve to an object key.
+fn json_rename_at(root: &mut serde_json::Value, parts: &[String], new_name: &str) {
+    let Some((last, parents)) = parts.split_last() else {
+        return;
+    };
+    let Some(target) = descend_mut(root, parents) else {
+        return;
+    };
+    if let serde_json::Value::Object(map) = target {
+        if let Some(v) = map.remove(last) {
+            map.insert(new_name.to_string(), v);
+        }
     }
 }
 
