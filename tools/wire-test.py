@@ -3399,6 +3399,34 @@ ok("11.25b JSON_OBJECTAGG builds object",
    '"a":1' in str(rows[0][0]) and '"b":2' in str(rows[0][0]) and '"c":3' in str(rows[0][0]),
    f"got {rows}")
 
+# ── Phase 11.25c — PG construction helpers ────────────────────────────────────
+
+print("\n[11.25c JSON construction helpers]")
+
+cur.execute("SELECT jsonb_build_object('a', 1, 'b', 'hi')")
+rows = cur.fetchall()
+ok("11.25c jsonb_build_object",
+   '"a":1' in str(rows[0][0]) and '"b":"hi"' in str(rows[0][0]),
+   f"got {rows}")
+
+cur.execute("SELECT jsonb_build_array(1, 'x', TRUE)")
+rows = cur.fetchall()
+v = rows[0][0]
+if isinstance(v, (bytes, bytearray)):
+    v = v.decode()
+ok("11.25c jsonb_build_array",
+   v == '[1,"x",true]',
+   f"got {rows}")
+
+cur.execute("SELECT to_json(42)")
+rows = cur.fetchall()
+v = rows[0][0]
+if isinstance(v, (bytes, bytearray)):
+    v = v.decode()
+ok("11.25c to_json returns text",
+   v == "42",
+   f"got {rows}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

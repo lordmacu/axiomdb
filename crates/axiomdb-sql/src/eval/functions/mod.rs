@@ -84,7 +84,9 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         | "json_array" | "json_object" | "json_merge_preserve" | "json_merge"
         | "json_contains_path" | "json_search" | "json_transform"
         | "json_dataguide"
-        | "json_insert" | "json_replace" => {
+        | "json_insert" | "json_replace"
+        // Phase 11.25c — PG construction helpers + to_json alias.
+        | "jsonb_build_object" | "jsonb_build_array" | "to_json" => {
             json::eval(lower.as_str(), args, row)
         }
 
