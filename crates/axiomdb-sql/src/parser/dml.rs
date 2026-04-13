@@ -385,9 +385,13 @@ fn parse_join_clauses(p: &mut Parser) -> Result<Vec<JoinClause>, DbError> {
                 join_type,
                 table,
                 condition: JoinCondition::On(Expr::Literal(Value::Bool(true))),
+                natural: false,
             });
             continue;
         }
+
+        // Phase 21.18 — optional NATURAL prefix.
+        let natural = p.eat(&Token::Natural);
 
         let join_type = match p.peek() {
             Token::Join => {
@@ -418,43 +422,69 @@ fn parse_join_clauses(p: &mut Parser) -> Result<Vec<JoinClause>, DbError> {
                 JoinType::Full
             }
             Token::Cross => {
+                if natural {
+                    return Err(DbError::ParseError {
+                        message: "NATURAL CROSS JOIN is invalid; CROSS has no match condition"
+                            .into(),
+                        position: Some(p.current_pos()),
+                    });
+                }
                 p.advance();
                 p.expect(&Token::Join)?;
                 JoinType::Cross
             }
-            _ => break,
+            _ => {
+                if natural {
+                    return Err(DbError::ParseError {
+                        message: "expected JOIN after NATURAL [INNER|LEFT|RIGHT|FULL]".into(),
+                        position: Some(p.current_pos()),
+                    });
+                }
+                break;
+            }
         };
 
         let table = parse_from_item(p)?;
 
-        let condition = match p.peek() {
-            Token::On => {
-                p.advance();
-                JoinCondition::On(parse_expr(p)?)
+        let condition = if natural {
+            // Phase 21.18 — NATURAL JOIN forbids ON / USING.
+            if matches!(p.peek(), Token::On | Token::Using) {
+                return Err(DbError::ParseError {
+                    message: "NATURAL JOIN does not accept ON / USING".into(),
+                    position: Some(p.current_pos()),
+                });
             }
-            Token::Using => {
-                p.advance();
-                p.expect(&Token::LParen)?;
-                let mut cols = vec![p.parse_identifier()?];
-                while p.eat(&Token::Comma) {
-                    cols.push(p.parse_identifier()?);
+            // Placeholder — analyzer fills the shared-column list.
+            JoinCondition::Using(Vec::new())
+        } else {
+            match p.peek() {
+                Token::On => {
+                    p.advance();
+                    JoinCondition::On(parse_expr(p)?)
                 }
-                p.expect(&Token::RParen)?;
-                JoinCondition::Using(cols)
-            }
-            other => {
-                // CROSS JOIN has no condition; others require one
-                if join_type == JoinType::Cross {
-                    // No condition for CROSS JOIN — use a dummy ON TRUE
-                    JoinCondition::On(Expr::Literal(Value::Bool(true)))
-                } else {
-                    return Err(DbError::ParseError {
-                        message: format!(
-                            "expected ON or USING after JOIN table, found {:?}",
-                            other,
-                        ),
-                        position: Some(p.current_pos()),
-                    });
+                Token::Using => {
+                    p.advance();
+                    p.expect(&Token::LParen)?;
+                    let mut cols = vec![p.parse_identifier()?];
+                    while p.eat(&Token::Comma) {
+                        cols.push(p.parse_identifier()?);
+                    }
+                    p.expect(&Token::RParen)?;
+                    JoinCondition::Using(cols)
+                }
+                other => {
+                    // CROSS JOIN has no condition; others require one
+                    if join_type == JoinType::Cross {
+                        JoinCondition::On(Expr::Literal(Value::Bool(true)))
+                    } else {
+                        return Err(DbError::ParseError {
+                            message: format!(
+                                "expected ON or USING after JOIN table, found {:?}",
+                                other,
+                            ),
+                            position: Some(p.current_pos()),
+                        });
+                    }
                 }
             }
         };
@@ -463,6 +493,7 @@ fn parse_join_clauses(p: &mut Parser) -> Result<Vec<JoinClause>, DbError> {
             join_type,
             table,
             condition,
+            natural,
         });
     }
     Ok(joins)

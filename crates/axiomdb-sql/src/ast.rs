@@ -332,6 +332,11 @@ pub struct JoinClause {
     pub join_type: JoinType,
     pub table: FromClause,
     pub condition: JoinCondition,
+    /// Phase 21.18 — `true` when the surface form was `NATURAL JOIN`. The
+    /// analyzer computes the shared-column list and rewrites `condition`
+    /// to `Using(...)`, clearing this flag; downstream code only ever
+    /// sees the resolved form.
+    pub natural: bool,
 }
 
 /// An item in the `ORDER BY` clause.
@@ -1060,6 +1065,7 @@ mod tests {
                 col(0, "u.id"),
                 col(1, "o.user_id"),
             )),
+            natural: false,
         };
         assert_eq!(join.join_type, JoinType::Left);
     }
