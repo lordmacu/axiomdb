@@ -3,7 +3,7 @@
 ## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 11.20d4 JSON_TABLE as UPDATE/DELETE source — ✅ closed. **Phase 11.20 complete.** Remaining fase 11: 11.18c, 11.21h, 11.23c, 11.24c, 11.25a-d.
+**Active subphase:** 11.25a JSONB SRF (PG `jsonb_each` / `jsonb_object_keys` / `jsonb_array_elements` + `_text` variants) — ✅ closed. Remaining fase 11 (MySQL+PG path): 11.18c, 11.21h, 11.25b, 11.25c, 11.25d. (11.23c + 11.24c moved to features-roadmap.md as Oracle-specific.)
 
 ### Phase 11 subphase status
 

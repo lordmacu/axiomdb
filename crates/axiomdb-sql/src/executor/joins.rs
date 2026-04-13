@@ -1069,3 +1069,53 @@ fn apply_correlated_jt_join(
 
     Ok(out)
 }
+
+/// Phase 11.25a — JOIN where the right side is a correlated JSONB SRF
+/// (`jsonb_each`, `jsonb_object_keys`, `jsonb_array_elements`, and
+/// their `_text` variants). Doc expression references outer columns,
+/// so the SRF is re-materialized per outer row. Semantics mirror
+/// `apply_correlated_jt_join`.
+#[allow(clippy::too_many_arguments)]
+fn apply_correlated_srf_join(
+    left_rows: Vec<Row>,
+    kind: crate::ast::JsonbSrfKind,
+    doc_expr: &crate::expr::Expr,
+    right_columns: &[ColumnMeta],
+    right_col_count: usize,
+    join_type: JoinType,
+    condition: &JoinCondition,
+    left_schema: &[(String, usize)],
+    right_col_offset: usize,
+) -> Result<Vec<Row>, DbError> {
+    if matches!(join_type, JoinType::Right | JoinType::Full) {
+        return Err(DbError::NotImplemented {
+            feature: "RIGHT/FULL JOIN on LATERAL-correlated JSONB SRF — \
+                      PG-compatible rejection"
+                .into(),
+        });
+    }
+    let null_right: Row = vec![Value::Null; right_col_count];
+    let mut out: Vec<Row> = Vec::with_capacity(left_rows.len());
+    for outer in &left_rows {
+        let doc_val = crate::eval::eval(doc_expr, outer)?;
+        let rows = crate::jsonb_srf::materialize_jsonb_srf(kind, &doc_val)?;
+        let mut matched = false;
+        for right in &rows {
+            let combined = concat_rows(outer, right);
+            if eval_join_cond(
+                condition,
+                &combined,
+                left_schema,
+                right_col_offset,
+                right_columns,
+            )? {
+                out.push(combined);
+                matched = true;
+            }
+        }
+        if !matched && matches!(join_type, JoinType::Left) {
+            out.push(concat_rows(outer, &null_right));
+        }
+    }
+    Ok(out)
+}

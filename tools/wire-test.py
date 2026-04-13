@@ -3356,6 +3356,28 @@ ok("11.20d4 DELETE JOIN JSON_TABLE",
    rows == ((1,), (3,)),
    f"got {rows}")
 
+# ── Phase 11.25a — JSONB set-returning functions ──────────────────────────────
+
+print("\n[11.25a JSONB SRF]")
+
+# jsonb_each basic.
+cur.execute("""SELECT key FROM jsonb_each('{"a":1,"b":2}') ORDER BY key""")
+rows = cur.fetchall()
+ok("11.25a jsonb_each basic",
+   rows == (("a",), ("b",)),
+   f"got {rows}")
+
+# jsonb_array_elements + CROSS APPLY on a real table.
+cur.execute("CREATE TABLE srf_u (id INT, tags TEXT)")
+cur.execute("""INSERT INTO srf_u VALUES (1, '["x","y"]'), (2, '["z"]')""")
+cur.execute("""SELECT u.id, j.value FROM srf_u u
+                 CROSS APPLY jsonb_array_elements_text(u.tags) AS j
+                 ORDER BY u.id, j.value""")
+rows = cur.fetchall()
+ok("11.25a CROSS APPLY jsonb_array_elements_text correlated",
+   rows == ((1, "x"), (1, "y"), (2, "z")),
+   f"got {rows}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

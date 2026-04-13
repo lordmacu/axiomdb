@@ -318,6 +318,20 @@ fn bound_from_clause(
             *col_offset += n;
             Ok(vec![bound])
         }
+        // Phase 11.25a — JSONB SRF virtual table (jsonb_each, etc.).
+        FromClause::JsonbSrf(srf) => {
+            let virtual_cols = crate::jsonb_srf::column_defs_for_srf(srf.kind);
+            let n = virtual_cols.len();
+            let alias = crate::jsonb_srf::srf_alias(srf);
+            let bound = BoundTable {
+                alias: Some(alias.clone()),
+                name: alias,
+                columns: virtual_cols,
+                col_offset: *col_offset,
+            };
+            *col_offset += n;
+            Ok(vec![bound])
+        }
     }
 }
 

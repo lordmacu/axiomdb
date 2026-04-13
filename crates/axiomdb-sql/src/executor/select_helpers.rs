@@ -66,6 +66,13 @@ fn execute_select_with_joins(
                             .into(),
                     });
                 }
+                FromClause::JsonbSrf(_) => {
+                    return Err(DbError::NotImplemented {
+                        feature: "JSONB SRF JOIN via the non-ctx executor path; \
+                                  use a session-bound query path"
+                            .into(),
+                    });
+                }
             }
         }
     }

@@ -229,6 +229,13 @@ fn analyze_select_with_outer(
         s.from = Some(FromClause::JsonTable(Box::new(resolved)));
     }
 
+    // Phase 11.25a — resolve JSONB SRF doc expression for first-FROM position.
+    if let Some(FromClause::JsonbSrf(mut srf)) = s.from {
+        let taken = std::mem::replace(&mut srf.doc, Expr::Literal(axiomdb_types::Value::Null));
+        srf.doc = resolve_expr_full(taken, &ctx, outer_scopes, Some(&state))?;
+        s.from = Some(FromClause::JsonbSrf(srf));
+    }
+
     // Persist analyzed join-side derived tables back into the AST before
     // resolving JOIN conditions so the executor receives analyzed inner SELECTs.
     let mut resolved_joins = Vec::with_capacity(s.joins.len());
@@ -254,6 +261,15 @@ fn analyze_select_with_outer(
             FromClause::JsonTable(jt) => {
                 let resolved = resolve_json_table(*jt, &ctx, outer_scopes, &state)?;
                 join.table = FromClause::JsonTable(Box::new(resolved));
+            }
+            // Phase 11.25a — resolve SRF doc against combined + outer scope.
+            FromClause::JsonbSrf(mut srf) => {
+                let taken = std::mem::replace(
+                    &mut srf.doc,
+                    Expr::Literal(axiomdb_types::Value::Null),
+                );
+                srf.doc = resolve_expr_full(taken, &ctx, outer_scopes, Some(&state))?;
+                join.table = FromClause::JsonbSrf(srf);
             }
             FromClause::Table(_) => {}
         }
