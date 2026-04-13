@@ -112,9 +112,13 @@ fn eval_with_aggs(
         }
 
         Expr::Function { name, args } if is_aggregate(name.as_str()) => {
+            let lower = name.to_ascii_lowercase();
+            // Phase 11.25b — 2-arg object aggregates use a different matcher.
             let idx = agg_exprs
                 .iter()
-                .position(|ae| ae.matches_simple(name.as_str(), args))
+                .position(|ae| {
+                    ae.matches_simple(&lower, args) || ae.matches_object_agg(&lower, args)
+                })
                 .ok_or_else(|| {
                     DbError::Other(format!(
                         "aggregate '{name}' not pre-registered — internal error"

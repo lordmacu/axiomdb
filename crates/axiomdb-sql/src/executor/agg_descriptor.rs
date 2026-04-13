@@ -3,7 +3,21 @@ fn is_aggregate(name: &str) -> bool {
         name,
         "count" | "sum" | "min" | "max" | "avg"
             | "count_distinct" | "sum_distinct" | "avg_distinct"
+            // Phase 11.25b — PG + MySQL JSON aggregates.
+            | "jsonb_agg" | "json_agg" | "json_arrayagg"
+            | "jsonb_object_agg" | "json_object_agg" | "json_objectagg"
     )
+}
+
+/// Phase 11.25b — true when the aggregate is a 2-arg object aggregate.
+fn is_object_agg(name: &str) -> bool {
+    matches!(name, "jsonb_object_agg" | "json_object_agg" | "json_objectagg")
+}
+
+/// Phase 11.25b — true when the aggregate is a 1-arg array aggregate.
+#[allow(dead_code)]
+fn is_array_agg(name: &str) -> bool {
+    matches!(name, "jsonb_agg" | "json_agg" | "json_arrayagg")
 }
 
 /// Returns `true` if `expr` or any sub-expression is an aggregate call.
@@ -95,6 +109,17 @@ enum AggExpr {
         #[allow(dead_code)]
         agg_idx: usize,
     },
+    /// Phase 11.25b — 2-arg object aggregate: `jsonb_object_agg(key, value)`,
+    /// `json_object_agg(key, value)`, MySQL `JSON_OBJECTAGG(key, value)`.
+    JsonbObjectAgg {
+        key_expr: Box<Expr>,
+        value_expr: Box<Expr>,
+        /// Returns JSON text when `false` (MySQL `JSON_OBJECTAGG`, PG
+        /// `json_object_agg`), JSONB binary when `true` (PG `jsonb_object_agg`).
+        returns_jsonb: bool,
+        #[allow(dead_code)]
+        agg_idx: usize,
+    },
 }
 
 impl AggExpr {
@@ -102,7 +127,9 @@ impl AggExpr {
     #[allow(dead_code)]
     fn agg_idx(&self) -> usize {
         match self {
-            Self::Simple { agg_idx, .. } | Self::GroupConcat { agg_idx, .. } => *agg_idx,
+            Self::Simple { agg_idx, .. }
+            | Self::GroupConcat { agg_idx, .. }
+            | Self::JsonbObjectAgg { agg_idx, .. } => *agg_idx,
         }
     }
 
@@ -125,6 +152,33 @@ impl AggExpr {
                 }
             }
             Self::GroupConcat { .. } => false,
+            Self::JsonbObjectAgg { .. } => false,
+        }
+    }
+
+    /// Phase 11.25b — match for 2-arg object aggregates.
+    fn matches_object_agg(
+        &self,
+        name: &str,
+        args: &[Expr],
+    ) -> bool {
+        match self {
+            Self::JsonbObjectAgg {
+                key_expr,
+                value_expr,
+                returns_jsonb,
+                ..
+            } => {
+                if args.len() != 2 {
+                    return false;
+                }
+                let expected_jsonb = matches!(name, "jsonb_object_agg");
+                if expected_jsonb != *returns_jsonb {
+                    return false;
+                }
+                key_expr.as_ref() == &args[0] && value_expr.as_ref() == &args[1]
+            }
+            _ => false,
         }
     }
 
@@ -149,7 +203,7 @@ impl AggExpr {
                     && ob == order_by
                     && sep.as_str() == separator
             }
-            Self::Simple { .. } => false,
+            Self::Simple { .. } | Self::JsonbObjectAgg { .. } => false,
         }
     }
 }
@@ -184,15 +238,41 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
             }
         }
         Expr::Function { name, args } if is_aggregate(name.as_str()) => {
+            let lower = name.to_ascii_lowercase();
+            // Phase 11.25b — 2-arg object aggregates.
+            if is_object_agg(&lower) {
+                if args.len() != 2 {
+                    // Parse error / analyzer will catch; emit no descriptor.
+                    return;
+                }
+                let already = result
+                    .iter()
+                    .any(|ae| ae.matches_object_agg(&lower, args));
+                if !already {
+                    let idx = result.len();
+                    let returns_jsonb = matches!(lower.as_str(), "jsonb_object_agg");
+                    result.push(AggExpr::JsonbObjectAgg {
+                        key_expr: Box::new(args[0].clone()),
+                        value_expr: Box::new(args[1].clone()),
+                        returns_jsonb,
+                        agg_idx: idx,
+                    });
+                }
+                return;
+            }
+            // Phase 11.25b — 1-arg array aggregates piggyback on Simple via
+            // a normalized name so dedup by arg works. Keep the original
+            // name in the AggExpr so the accumulator can distinguish
+            // JSON vs JSONB output.
             let arg = args.first().cloned();
             // Deduplicate: only add if not already registered.
             let already = result
                 .iter()
-                .any(|ae| ae.matches_simple(name.as_str(), args));
+                .any(|ae| ae.matches_simple(&lower, args));
             if !already {
                 let idx = result.len();
                 result.push(AggExpr::Simple {
-                    name: name.clone(),
+                    name: lower,
                     arg,
                     agg_idx: idx,
                 });

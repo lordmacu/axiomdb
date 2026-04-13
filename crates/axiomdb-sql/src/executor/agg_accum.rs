@@ -32,6 +32,19 @@ enum AggAccumulator {
         /// Sort directions: `true` = ASC, `false` = DESC. One per ORDER BY key.
         order_by_dirs: Vec<bool>,
     },
+    /// Phase 11.25b — `jsonb_agg` / `json_agg` / MySQL `JSON_ARRAYAGG`.
+    JsonArrayAgg {
+        values: Vec<serde_json::Value>,
+        returns_jsonb: bool,
+    },
+    /// Phase 11.25b — `jsonb_object_agg` / `json_object_agg` / MySQL
+    /// `JSON_OBJECTAGG`. Stores insertion-ordered key/value pairs; a later
+    /// key with the same name overwrites the earlier pair (MySQL semantics;
+    /// PG does the same — the last write wins and no error is raised).
+    JsonObjectAgg {
+        pairs: Vec<(String, serde_json::Value)>,
+        returns_jsonb: bool,
+    },
 }
 
 impl AggAccumulator {
@@ -67,7 +80,20 @@ impl AggAccumulator {
                     count: 0,
                 },
                 "avg_distinct" => Self::AvgDistinct { values: Vec::new() },
+                // Phase 11.25b — array aggregates. Simple dispatch by name.
+                "jsonb_agg" => Self::JsonArrayAgg {
+                    values: Vec::new(),
+                    returns_jsonb: true,
+                },
+                "json_agg" | "json_arrayagg" => Self::JsonArrayAgg {
+                    values: Vec::new(),
+                    returns_jsonb: false,
+                },
                 _ => unreachable!("AggAccumulator::new called with non-aggregate"),
+            },
+            AggExpr::JsonbObjectAgg { returns_jsonb, .. } => Self::JsonObjectAgg {
+                pairs: Vec::new(),
+                returns_jsonb: *returns_jsonb,
             },
         }
     }
@@ -77,6 +103,7 @@ impl AggAccumulator {
         let simple_arg = match agg {
             AggExpr::Simple { arg, .. } => arg.as_ref(),
             AggExpr::GroupConcat { .. } => None,
+            AggExpr::JsonbObjectAgg { .. } => None,
         };
 
         // Phase 9.5b: fast-path for simple column refs — avoids eval() overhead.
@@ -230,6 +257,52 @@ impl AggAccumulator {
 
                 rows.push((val, keys));
             }
+
+            Self::JsonArrayAgg { values, .. } => {
+                let (val_expr,) = match agg {
+                    AggExpr::Simple { arg: Some(e), .. } => (e,),
+                    _ => {
+                        return Err(DbError::Internal {
+                            message: "JsonArrayAgg requires a Simple AggExpr with one argument"
+                                .into(),
+                        });
+                    }
+                };
+                let v = eval(val_expr, row)?;
+                values.push(crate::jsonb_srf::value_to_serde_for_agg(&v)?);
+            }
+
+            Self::JsonObjectAgg { pairs, .. } => {
+                let (key_expr, value_expr) = match agg {
+                    AggExpr::JsonbObjectAgg {
+                        key_expr,
+                        value_expr,
+                        ..
+                    } => (key_expr.as_ref(), value_expr.as_ref()),
+                    _ => {
+                        return Err(DbError::Internal {
+                            message: "JsonObjectAgg paired with non-JsonbObjectAgg AggExpr".into(),
+                        });
+                    }
+                };
+                let k = eval(key_expr, row)?;
+                if matches!(k, Value::Null) {
+                    return Err(DbError::InvalidValue {
+                        reason: "null key in JSON object aggregate (jsonb_object_agg / \
+                                 JSON_OBJECTAGG): keys must be non-null"
+                            .into(),
+                    });
+                }
+                let k_str = value_to_display_string(k);
+                let v = eval(value_expr, row)?;
+                let v_sj = crate::jsonb_srf::value_to_serde_for_agg(&v)?;
+                // Last-write-wins on duplicate keys (MySQL + PG agree).
+                if let Some(slot) = pairs.iter_mut().find(|(k2, _)| k2 == &k_str) {
+                    slot.1 = v_sj;
+                } else {
+                    pairs.push((k_str, v_sj));
+                }
+            }
         }
         Ok(())
     }
@@ -321,6 +394,38 @@ impl AggAccumulator {
                     }
                 }
                 Ok(Value::Text(result))
+            }
+
+            Self::JsonArrayAgg {
+                values,
+                returns_jsonb,
+            } => {
+                let arr = serde_json::Value::Array(values);
+                if returns_jsonb {
+                    let blob = axiomdb_types::jsonb::JsonbEncoder::encode(&arr)?;
+                    Ok(Value::Jsonb(std::sync::Arc::new(blob)))
+                } else {
+                    Ok(Value::Json(arr.to_string()))
+                }
+            }
+
+            Self::JsonObjectAgg {
+                pairs,
+                returns_jsonb,
+            } => {
+                // Preserve insertion order; JSON objects are logically
+                // unordered but both PG and MySQL emit in insertion order.
+                let mut obj = serde_json::Map::with_capacity(pairs.len());
+                for (k, v) in pairs {
+                    obj.insert(k, v);
+                }
+                let val = serde_json::Value::Object(obj);
+                if returns_jsonb {
+                    let blob = axiomdb_types::jsonb::JsonbEncoder::encode(&val)?;
+                    Ok(Value::Jsonb(std::sync::Arc::new(blob)))
+                } else {
+                    Ok(Value::Json(val.to_string()))
+                }
             }
         }
     }
