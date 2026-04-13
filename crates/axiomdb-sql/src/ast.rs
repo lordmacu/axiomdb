@@ -264,6 +264,15 @@ pub enum JsonTableColumn {
         /// Default behavior: `SqlJsonOnBehavior::FalseLit` (PG parity).
         on_error: crate::expr::SqlJsonOnBehavior,
     },
+    /// `NESTED [PATH] 'jsonpath' COLUMNS ( ... )` — Phase 11.20b.
+    ///
+    /// The nested list shares the same `JsonTableColumn` shape, allowing
+    /// the grammar to recurse arbitrarily; runtime depth is limited to 1
+    /// in 11.20b (depth ≥ 2 and multi-sibling NESTED → 11.20c).
+    Nested {
+        path: String,
+        columns: Vec<JsonTableColumn>,
+    },
 }
 
 /// A `JOIN` attached to a `SELECT` statement.

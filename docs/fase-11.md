@@ -272,3 +272,50 @@ PASSING sobre la row-path (11.20d).
 - `JSON_TABLE` como primera entrada del `FROM` combinada con `JOIN` tambien
   se rechaza; PG/MariaDB tratan `JSON_TABLE` como fuente simetrica.
 - `NESTED PATH` no soportado todavia.
+
+---
+
+## 11.20b — `JSON_TABLE` single-level `NESTED PATH` (2026-04-13)
+
+### Resumen
+
+`NESTED PATH` dentro de `COLUMNS(...)` con:
+- LEFT-OUTER NULL padding cuando el array hijo esta vacio o la clave falta.
+- Ordinality independiente por nivel (el `FOR ORDINALITY` del padre incrementa
+  por cada parent match; el del hijo se resetea a 1 por cada padre).
+- Sintaxis `NESTED [PATH] '$.x' COLUMNS (...)` (palabra `PATH` opcional).
+
+### Componentes
+
+- AST: nueva variante `JsonTableColumn::Nested { path, columns }`.
+- Parser: dispatch `NESTED` en `parse_column_def` + recursion via misma
+  funcion.
+- `JsonTableSpec`: compilacion DFS con `slot` fijo por leaf y
+  `slot_range: (usize,usize)` por `Nested`; `total_slots` en el spec.
+- Executor: `materialize_json_table` allocates template `Vec<Value>` de
+  `total_slots` NULLs por parent match, fills leaves, y expande NESTED
+  (clone del template por child match; empty child list → emit template
+  como LEFT-OUTER pad).
+- `column_defs_for_ast` ahora recursivo con flag `inside_nested=true`
+  propagado para marcar nullable en el schema flat.
+
+### Restricciones 11.20b → deferidas a 11.20c
+
+- Multi-sibling NESTED dentro del mismo `COLUMNS(...)` → `NotImplemented`.
+- Anidamiento profundidad ≥ 2 (NESTED dentro de NESTED) → `NotImplemented`.
+
+### Validacion
+
+- `cargo test -p axiomdb-sql --test integration_json_table_nested` — 11/11 OK.
+- `cargo test -p axiomdb-sql --test integration_json_table` — 16/16 OK (sin regresion).
+- `cargo clippy -p axiomdb-sql --lib -- -D warnings` — limpio.
+- `cargo fmt --check` — limpio.
+- `tools/wire-test.py` — 370/370 OK (3 aserciones nuevas NESTED).
+
+### Diferencias vs PostgreSQL
+
+- PG emite un plan-tree aplanado en planner time (`parse_jsontable.c`
+  + `nodeTableFuncscan.c`). AxiomDB usa modelo recursivo MariaDB-style
+  porque mapea directo al layout DFS de slots sin IR plan-tree.
+- PG exige `PATH` despues de `NESTED`; AxiomDB tambien acepta la forma
+  corta `NESTED '<path>' COLUMNS(...)` (MariaDB parity).

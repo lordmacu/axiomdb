@@ -900,10 +900,17 @@ column_def := ident type PATH string_literal
             | ident 'FOR' 'ORDINALITY'
             | ident type 'EXISTS' 'PATH' string_literal
                      [ exists_on_error ]
+            | 'NESTED' [ 'PATH' ] string_literal
+                     'COLUMNS' '(' column_def (',' column_def)* ')'
 
 on_behavior     := 'NULL' | 'ERROR' | 'DEFAULT' expr
 exists_on_error := ('TRUE' | 'FALSE' | 'UNKNOWN' | 'ERROR') 'ON' 'ERROR'
 ```
+
+Phase 11.20b accepts the `NESTED` production grammatically at any depth;
+`json_table::compile_columns_recursive` enforces the 11.20b runtime
+constraints — **one** NESTED sibling per `COLUMNS(...)` list and **depth
+≤ 1** — raising a clear `NotImplemented` pointing to 11.20c otherwise.
 
 ### Dispatch
 
