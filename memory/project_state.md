@@ -3,7 +3,7 @@
 ## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 11.20d3 LATERAL-correlated JSON_TABLE (`doc` + PASSING outer refs) — ✅ closed; next is 11.20d4 (JSON_TABLE as UPDATE/DELETE source).
+**Active subphase:** 11.20d4 JSON_TABLE as UPDATE/DELETE source — ✅ closed. **Phase 11.20 complete.** Remaining fase 11: 11.18c, 11.21h, 11.23c, 11.24c, 11.25a-d.
 
 ### Phase 11 subphase status
 
@@ -23,7 +23,8 @@
 | 11.20c `JSON_TABLE` multi-sibling + multi-level NESTED | ✅ closed |
 | 11.20d1 `JSON_TABLE` WRAPPER / QUOTES / PASSING | ✅ closed |
 | 11.20d2 `JSON_TABLE` first FROM + CROSS/OUTER APPLY | ✅ closed |
-| **11.20d3** `JSON_TABLE` LATERAL-correlated doc + PASSING | ✅ closed — UPDATE/DELETE source → 11.20d4 |
+| 11.20d3 `JSON_TABLE` LATERAL-correlated doc + PASSING | ✅ closed |
+| **11.20d4** `JSON_TABLE` as UPDATE/DELETE source | ✅ closed — **Phase 11.20 COMPLETE** |
 | 11.21a–g JSONPath parity | ✅ closed (through path arithmetic in filters) — 11.21h pending planner pushdown |
 | 11.22a / 11.22b JSONB mutations | ✅ closed |
 | 11.23a / 11.23b / 11.23d / 11.23e / 11.23f JSON Schema | ✅ closed — 11.23c catalog persistence pending |

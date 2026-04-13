@@ -3327,6 +3327,35 @@ ok("11.20d3 PASSING outer column into filter",
    len(rows) == 5,
    f"got {rows}")
 
+# ── Phase 11.20d4 — JSON_TABLE as UPDATE/DELETE source ────────────────────────
+
+print("\n[11.20d4 JSON_TABLE as UPDATE/DELETE source]")
+
+cur.execute("CREATE TABLE d4_orders (id INT, priority INT)")
+cur.execute("INSERT INTO d4_orders VALUES (1, 0), (2, 0), (3, 0)")
+
+# UPDATE driven by JSON_TABLE JOIN.
+cur.execute("""UPDATE d4_orders o
+                 JOIN JSON_TABLE('[{"id":1,"pri":5},{"id":3,"pri":9}]', '$[*]'
+                        COLUMNS (id INT PATH '$.id', pri INT PATH '$.pri')) AS j
+                   ON o.id = j.id
+                 SET o.priority = j.pri""")
+cur.execute("SELECT id, priority FROM d4_orders ORDER BY id")
+rows = cur.fetchall()
+ok("11.20d4 UPDATE JOIN JSON_TABLE",
+   rows == ((1, 5), (2, 0), (3, 9)),
+   f"got {rows}")
+
+# DELETE driven by JSON_TABLE JOIN.
+cur.execute("""DELETE o FROM d4_orders o
+                 JOIN JSON_TABLE('[2]', '$[*]' COLUMNS (id INT PATH '$')) AS j
+                   ON o.id = j.id""")
+cur.execute("SELECT id FROM d4_orders ORDER BY id")
+rows = cur.fetchall()
+ok("11.20d4 DELETE JOIN JSON_TABLE",
+   rows == ((1,), (3,)),
+   f"got {rows}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()
