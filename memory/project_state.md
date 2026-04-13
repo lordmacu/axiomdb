@@ -28,6 +28,7 @@
 | 11.22a / 11.22b JSONB mutations | ✅ closed |
 | 11.23a / 11.23b / 11.23d / 11.23e / 11.23f JSON Schema | ✅ closed — 11.23c catalog persistence pending |
 | 11.24a / 11.24b / 11.24d (partial) Oracle JSON | ✅ closed — 11.24c dot-notation pending |
+| **11.25** JSON SRF + aggregates + construction helpers (PG streaming parity) | ⬜ scoped — 4 subfases 11.25a-d |
 
 ### 11.20 follow-ups
 
