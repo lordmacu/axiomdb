@@ -253,7 +253,49 @@ pub(crate) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
 
         // ── JSONB JSONPath match:  @@ (Phase 11.21c) ─────────────────────────
         BinaryOp::JsonbPathMatch => eval_jsonb_path_match(l, r),
+
+        // ── JSONB any/all-keys exists: ?| / ?& (Phase 11.18b) ────────────────
+        BinaryOp::JsonExistsAny => eval_jsonb_exists_set(l, r, false),
+        BinaryOp::JsonExistsAll => eval_jsonb_exists_set(l, r, true),
     }
+}
+
+fn eval_jsonb_exists_set(left: Value, right: Value, all: bool) -> Result<Value, DbError> {
+    if left.is_null() || right.is_null() {
+        return Ok(Value::Null);
+    }
+    let doc = value_to_serde_json(left)?;
+    let rhs = value_to_serde_json(right)?;
+    let keys: Vec<String> = match rhs {
+        serde_json::Value::Array(arr) => arr
+            .into_iter()
+            .filter_map(|e| match e {
+                serde_json::Value::String(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "JSONB array of strings".into(),
+                got: other.to_string(),
+            });
+        }
+    };
+    let exists = |k: &str| -> bool {
+        match &doc {
+            serde_json::Value::Object(map) => map.contains_key(k),
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .any(|e| matches!(e, serde_json::Value::String(s) if s == k)),
+            _ => false,
+        }
+    };
+    let result = if all {
+        keys.iter().all(|k| exists(k))
+    } else {
+        keys.iter().any(|k| exists(k))
+    };
+    Ok(Value::Bool(result))
 }
 
 fn eval_jsonb_path_match(doc: Value, path: Value) -> Result<Value, DbError> {

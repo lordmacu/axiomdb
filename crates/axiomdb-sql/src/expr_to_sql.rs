@@ -58,6 +58,8 @@ pub fn expr_to_sql_string(expr: &Expr) -> String {
                 BinaryOp::JsonExists => "?",
                 BinaryOp::JsonbPathExists => "@?",
                 BinaryOp::JsonbPathMatch => "@@",
+                BinaryOp::JsonExistsAny => "?|",
+                BinaryOp::JsonExistsAll => "?&",
             };
             format!(
                 "({} {op_str} {})",

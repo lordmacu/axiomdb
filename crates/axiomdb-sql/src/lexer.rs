@@ -578,6 +578,12 @@ pub enum Token<'src> {
     /// `@` — MySQL user-variable prefix.
     #[token("@")]
     At,
+    /// `?|` — JSONB any-key existence (Phase 11.18b). MUST appear before `?`.
+    #[token("?|")]
+    JsonExistsAny,
+    /// `?&` — JSONB all-keys existence (Phase 11.18b). MUST appear before `?`.
+    #[token("?&")]
+    JsonExistsAll,
     /// `?` — positional parameter placeholder in a prepared statement template.
     #[token("?")]
     Question,
