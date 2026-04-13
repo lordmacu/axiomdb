@@ -182,6 +182,8 @@ pub enum Token<'src> {
     Full,
     #[token("CROSS", ignore(ascii_case))]
     Cross,
+    #[token("NATURAL", ignore(ascii_case))]
+    Natural,
     #[token("APPLY", ignore(ascii_case))]
     Apply,
     #[token("LATERAL", ignore(ascii_case))]

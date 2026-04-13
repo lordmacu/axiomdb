@@ -3475,6 +3475,21 @@ ok("21.19 OFFSET n ROWS FETCH FIRST m ROWS ONLY pagination",
    rows == ((4,), (5,)),
    f"got {rows}")
 
+# ── Phase 21.18 — NATURAL JOIN ────────────────────────────────────────────────
+
+print("\n[21.18 NATURAL JOIN]")
+
+cur.execute("CREATE TABLE nj_a (id INT, x INT)")
+cur.execute("CREATE TABLE nj_b (id INT, y INT)")
+cur.execute("INSERT INTO nj_a VALUES (1, 10), (2, 20)")
+cur.execute("INSERT INTO nj_b VALUES (1, 100), (3, 300)")
+
+cur.execute("SELECT nj_a.x, nj_b.y FROM nj_a NATURAL JOIN nj_b ORDER BY nj_a.x")
+rows = cur.fetchall()
+ok("21.18 NATURAL JOIN inner match",
+   rows == ((10, 100),),
+   f"got {rows}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

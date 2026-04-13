@@ -239,7 +239,7 @@ fn analyze_select_with_outer(
     // Persist analyzed join-side derived tables back into the AST before
     // resolving JOIN conditions so the executor receives analyzed inner SELECTs.
     let mut resolved_joins = Vec::with_capacity(s.joins.len());
-    for mut join in s.joins {
+    for (join_idx, mut join) in s.joins.into_iter().enumerate() {
         match join.table {
             FromClause::Subquery { query, alias } => {
                 let analyzed_inner = analyze_select_with_outer(
@@ -272,6 +272,54 @@ fn analyze_select_with_outer(
                 join.table = FromClause::JsonbSrf(srf);
             }
             FromClause::Table(_) => {}
+        }
+        // Phase 21.18 — NATURAL JOIN: compute the shared-column list between
+        // the accumulated left-side scope and this join's right-side BoundTable,
+        // then rewrite condition to the equivalent `USING (shared...)`.
+        if join.natural {
+            // ctx.tables = [first_FROM, join[0].right, join[1].right, ...]
+            // For joins[join_idx], left = ctx.tables[..=join_idx],
+            // right = ctx.tables[join_idx + 1].
+            if join_idx + 1 >= ctx.tables.len() {
+                return Err(DbError::Internal {
+                    message: "NATURAL JOIN: analyzer scope out of sync with join list"
+                        .into(),
+                });
+            }
+            let right_cols: Vec<String> = ctx.tables[join_idx + 1]
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            let mut shared: Vec<String> = Vec::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for bt in &ctx.tables[..=join_idx] {
+                for col in &bt.columns {
+                    let cname_ci = col.name.to_ascii_lowercase();
+                    if !seen.insert(cname_ci.clone()) {
+                        continue;
+                    }
+                    if right_cols
+                        .iter()
+                        .any(|r| r.eq_ignore_ascii_case(&col.name))
+                    {
+                        shared.push(col.name.clone());
+                    }
+                }
+            }
+            if shared.is_empty() {
+                let left_name = ctx.tables[join_idx].name.clone();
+                let right_name = ctx.tables[join_idx + 1].name.clone();
+                return Err(DbError::ParseError {
+                    message: format!(
+                        "NATURAL JOIN: no shared columns between `{left_name}` and \
+                         `{right_name}`"
+                    ),
+                    position: None,
+                });
+            }
+            join.condition = JoinCondition::Using(shared);
+            join.natural = false;
         }
         join.condition = match join.condition {
             JoinCondition::On(expr) => {
