@@ -186,6 +186,36 @@ fn jsonb_from_serde(v: &serde_json::Value) -> Result<Value, DbError> {
     Ok(Value::Jsonb(Arc::new(blob)))
 }
 
+/// Phase 11.25b — render a SQL `Value` as `serde_json::Value` for JSON
+/// aggregate accumulation. Native JSON/JSONB stays as-is; primitives map
+/// to their JSON equivalents; strings become JSON strings; temporal / UUID
+/// / bytes fall back to string representation.
+pub fn value_to_serde_for_agg(v: &Value) -> Result<serde_json::Value, DbError> {
+    match v {
+        Value::Null => Ok(serde_json::Value::Null),
+        Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+        Value::Int(i) => Ok(serde_json::Value::Number((*i as i64).into())),
+        Value::BigInt(i) => Ok(serde_json::Value::Number((*i).into())),
+        Value::Real(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| DbError::InvalidValue {
+                reason: format!("non-finite float in JSON aggregate: {f}"),
+            }),
+        Value::Text(s) => Ok(serde_json::Value::String(s.clone())),
+        Value::Json(s) => serde_json::from_str(s).map_err(|e| DbError::InvalidCoercion {
+            from: "text".into(),
+            to: "json".into(),
+            value: s.clone(),
+            reason: e.to_string(),
+        }),
+        Value::Jsonb(bytes) => {
+            let jref = JsonbRef::new(bytes.as_slice());
+            jref.to_serde_json()
+        }
+        other => Ok(serde_json::Value::String(format!("{other:?}"))),
+    }
+}
+
 fn type_err(kind: JsonbSrfKind, expected: &str) -> DbError {
     DbError::TypeMismatch {
         expected: format!("JSON {} for {}", expected, kind.fn_name()),

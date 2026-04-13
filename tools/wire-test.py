@@ -3378,6 +3378,27 @@ ok("11.25a CROSS APPLY jsonb_array_elements_text correlated",
    rows == ((1, "x"), (1, "y"), (2, "z")),
    f"got {rows}")
 
+# ── Phase 11.25b — JSON aggregates ────────────────────────────────────────────
+
+print("\n[11.25b JSON aggregates]")
+
+cur.execute("CREATE TABLE agg_t (k TEXT, v INT)")
+cur.execute("INSERT INTO agg_t VALUES ('a', 1), ('b', 2), ('c', 3)")
+
+# jsonb_agg (PG — returns JSONB binary rendered as JSON text on wire).
+cur.execute("SELECT jsonb_agg(v) FROM agg_t")
+rows = cur.fetchall()
+ok("11.25b jsonb_agg returns array",
+   str(rows[0][0]) == "[1,2,3]",
+   f"got {rows}")
+
+# JSON_OBJECTAGG (MySQL alias for json_object_agg).
+cur.execute("SELECT JSON_OBJECTAGG(k, v) FROM agg_t")
+rows = cur.fetchall()
+ok("11.25b JSON_OBJECTAGG builds object",
+   '"a":1' in str(rows[0][0]) and '"b":2' in str(rows[0][0]) and '"c":3' in str(rows[0][0]),
+   f"got {rows}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()
