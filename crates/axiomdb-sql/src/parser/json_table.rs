@@ -62,6 +62,32 @@ pub(crate) fn parse_json_table_call(p: &mut Parser<'_>) -> Result<FromClause, Db
 }
 
 fn parse_column_def(p: &mut Parser<'_>) -> Result<JsonTableColumn, DbError> {
+    // `NESTED [PATH] '<jsonpath>' COLUMNS (...)` — Phase 11.20b.
+    // Dispatch before the generic identifier path since `NESTED` is not a
+    // reserved token but, when it appears as the first token of a column
+    // spec, it introduces a nested shred rather than a column name.
+    if p.eat_ident_ci("NESTED") {
+        // `PATH` keyword is optional (SQL:2016 shortcut + MariaDB parity).
+        let _ = p.eat_ident_ci("PATH");
+        let path = p.parse_string_literal()?;
+        if !p.eat_ident_ci("COLUMNS") {
+            return Err(DbError::ParseError {
+                message: "JSON_TABLE NESTED: expected COLUMNS(...) clause".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        p.expect(&Token::LParen)?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(parse_column_def(p)?);
+            if !p.eat(&Token::Comma) {
+                break;
+            }
+        }
+        p.expect(&Token::RParen)?;
+        return Ok(JsonTableColumn::Nested { path, columns });
+    }
+
     let name = p.parse_identifier()?;
 
     // `name FOR ORDINALITY` — dispatch first (`FOR` is a reserved token).

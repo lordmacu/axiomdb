@@ -1,5 +1,22 @@
 # Lessons Learned
 
+## 2026-04-13 — Phase 11.20b
+
+- **Slot layout up front is easier than deferred row assembly.** First
+  draft of the NESTED executor rebuilt the row incrementally via
+  `Vec::push`; slot collisions between parent leaves and the NESTED
+  expansion made the logic fragile. Switching to a fixed DFS slot
+  assignment (every leaf knows its slot, every `Nested` owns a
+  `slot_range`) made `materialize` a straight "clone template, overwrite
+  range" — and 11.20c's multi-level case becomes the same shape.
+- **LEFT-OUTER is cheapest as "don't modify the template".** Because the
+  template starts as all-`Null`, an empty child match means we push the
+  template as-is; no NULL-initialisation pass needed.
+- **Recursive name uniqueness beats per-level.** Enforcing unique column
+  names *across all levels* up front (`collect_names_recursive` before
+  slot assignment) surfaces duplicates as clean parse errors rather than
+  as surprising JOIN ambiguity at bind time.
+
 ## 2026-04-13 — Phase 11.20a
 
 - **Parser dispatch for table-valued functions must check the `(` to keep

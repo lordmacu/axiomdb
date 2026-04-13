@@ -1650,3 +1650,62 @@ expression to the left-side row (<code>JSON_TABLE(base.tags, ...)</code>) is def
 to Phase 11.20d.
 </div>
 </div>
+
+### NESTED PATH — shred parent + child arrays (Phase 11.20b)
+
+`NESTED PATH` inside a `COLUMNS(...)` list walks a child path against every
+parent match and emits one row per `(parent_match, child_match)` pair.
+When a parent match has zero children, JSON_TABLE emits a single row with
+all nested slots set to `NULL` (LEFT-OUTER padding — MariaDB semantics).
+
+```sql
+SELECT inv_id, item_name, qty
+FROM JSON_TABLE(
+    '[{"id":1,"items":[{"name":"A","qty":2},{"name":"B","qty":3}]},
+      {"id":2,"items":[]}]',
+    '$[*]' COLUMNS (
+        inv_id INT PATH '$.id',
+        NESTED PATH '$.items[*]' COLUMNS (
+            item_name TEXT PATH '$.name',
+            qty       INT  PATH '$.qty'
+        )
+    )
+) AS t;
+-- (1, 'A', 2)
+-- (1, 'B', 3)
+-- (2, NULL, NULL)   ← empty items array → LEFT OUTER pad
+```
+
+Ordinality counters are independent at each level: the parent's
+`FOR ORDINALITY` increments once per parent match; the nested's
+`FOR ORDINALITY` resets to 1 at the start of each parent and counts child
+matches.
+
+```sql
+SELECT ord_inv, inv_id, ord_item, item_name FROM JSON_TABLE(
+    '[{"id":10,"items":[{"name":"A"},{"name":"B"}]},
+      {"id":20,"items":[{"name":"C"}]}]',
+    '$[*]' COLUMNS (
+        ord_inv FOR ORDINALITY,
+        inv_id  INT PATH '$.id',
+        NESTED PATH '$.items[*]' COLUMNS (
+            ord_item  FOR ORDINALITY,
+            item_name TEXT PATH '$.name'
+        )
+    )
+) AS t;
+-- (1, 10, 1, 'A')
+-- (1, 10, 2, 'B')
+-- (2, 20, 1, 'C')   ← ord_item reset at next parent
+```
+
+The `PATH` keyword after `NESTED` is optional (SQL:2016 shortcut / MariaDB
+parity): `NESTED '$.items[*]' COLUMNS (...)` is equivalent.
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Scope</span>
+Phase 11.20b supports <strong>one</strong> NESTED PATH per <code>COLUMNS(...)</code> list and <strong>one</strong> level of nesting. Multi-sibling NESTED (UNION semantics) and multi-level nesting (NESTED inside NESTED) raise an explicit <code>NotImplemented</code> pointing to Phase 11.20c.
+</div>
+</div>

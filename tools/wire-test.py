@@ -3120,6 +3120,57 @@ try:
 except Exception:
     ok("11.20a JSON_TABLE invalid doc raises", True)
 
+# ── Phase 11.20b — NESTED PATH ────────────────────────────────────────────────
+
+print("\n[11.20b NESTED PATH]")
+
+# Basic shred with parent × child fan-out
+cur.execute("""SELECT inv_id, item_name, qty FROM JSON_TABLE(
+    '[{"id":1,"items":[{"name":"A","qty":2},{"name":"B","qty":3}]},
+      {"id":2,"items":[{"name":"C","qty":1}]}]',
+    '$[*]' COLUMNS (
+        inv_id INT PATH '$.id',
+        NESTED PATH '$.items[*]' COLUMNS (
+            item_name TEXT PATH '$.name',
+            qty       INT  PATH '$.qty'
+        )
+    )
+) AS t ORDER BY inv_id, item_name""")
+rows = cur.fetchall()
+normalized = [(int(r[0]), str(r[1]), int(r[2])) for r in rows]
+ok("11.20b JSON_TABLE NESTED parent × children",
+   normalized == [(1, "A", 2), (1, "B", 3), (2, "C", 1)],
+   f"got {normalized}")
+
+# LEFT-OUTER NULL pad on empty children
+cur.execute("""SELECT inv_id, item_name FROM JSON_TABLE(
+    '[{"id":1,"items":[{"name":"A"}]},
+      {"id":2,"items":[]}]',
+    '$[*]' COLUMNS (
+        inv_id INT PATH '$.id',
+        NESTED PATH '$.items[*]' COLUMNS (item_name TEXT PATH '$.name')
+    )
+) AS t ORDER BY inv_id""")
+rows = cur.fetchall()
+ok("11.20b JSON_TABLE NESTED LEFT-OUTER NULL pad",
+   len(rows) == 2 and int(rows[0][0]) == 1 and str(rows[0][1]) == "A"
+   and int(rows[1][0]) == 2 and rows[1][1] is None,
+   f"got {rows}")
+
+# Per-level ordinality
+cur.execute("""SELECT ord_inv, ord_item FROM JSON_TABLE(
+    '[{"items":[{"n":"A"},{"n":"B"}]},{"items":[{"n":"C"}]}]',
+    '$[*]' COLUMNS (
+        ord_inv FOR ORDINALITY,
+        NESTED PATH '$.items[*]' COLUMNS (ord_item FOR ORDINALITY)
+    )
+) AS t ORDER BY ord_inv, ord_item""")
+rows = cur.fetchall()
+pairs = [(int(r[0]), int(r[1])) for r in rows]
+ok("11.20b JSON_TABLE NESTED per-level ordinality",
+   pairs == [(1, 1), (1, 2), (2, 1)],
+   f"got {pairs}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

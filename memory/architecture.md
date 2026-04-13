@@ -1,5 +1,45 @@
 # Architecture Notes
 
+## 2026-04-13 — `JSON_TABLE` single-level `NESTED PATH` (11.20b)
+
+- **AST** extended with `JsonTableColumn::Nested { path, columns }`. The
+  parser `parse_column_def` dispatches on a leading `NESTED` ident before
+  the generic identifier path, consumes an optional `PATH` keyword, reads
+  the path literal, expects `COLUMNS`, and recurses into the same
+  `parse_column_def` entry for the child list.
+- **Spec compilation** is now a **DFS slot assignment**:
+  - Each leaf column (`Regular`, `Ordinality`, `Exists`) carries a fixed
+    `slot: usize` index in the emitted row.
+  - Each `Nested` carries `slot_range: (usize, usize)` spanning its
+    descendants; it contributes zero own slots.
+  - `JsonTableSpec.total_slots` records the flat row width.
+  - `compile_columns_recursive` enforces 11.20b scope at compile time:
+    multi-sibling NESTED per list → `NotImplemented 11.20c`; depth ≥ 2
+    → `NotImplemented 11.20c`. Unique column names are checked across
+    every level. Per-level at-most-one `FOR ORDINALITY`.
+- **Materialize**:
+  - `materialize_json_table` allocates one `Vec<Value>` template of
+    `total_slots` NULLs per parent match, fills leaves in place, and
+    records the (at most one) NESTED column.
+  - If no NESTED: push template as-is.
+  - If NESTED present and child matches are empty: push template — slots
+    in `slot_range` stay NULL → LEFT-OUTER pad.
+  - If NESTED present and non-empty: clone template once per child,
+    `fill_leaf_children` fills child-scope slots with a per-parent
+    ordinality counter that resets to 1. Parent slots outside `slot_range`
+    are preserved by the clone; no need to rewrite them.
+- **`column_defs_for_ast`** is now recursive with an `inside_nested: bool`
+  flag; columns beneath a NESTED are marked `nullable = true` because
+  LEFT-OUTER pad can NULL-them at runtime.
+- **Why MariaDB-style recursion over PG plan-tree**: PG
+  (`parse_jsontable.c` + `nodeTableFuncscan.c`) flattens the tree into a
+  `TableFunc` with a `SiblingJoin` plan node at planning time. We adopt
+  MariaDB's recursive `scan_next` model (`sql/json_table.cc:322-361`)
+  because the DFS slot layout maps directly onto it without a separate
+  plan-tree IR. When 11.20c generalizes to multi-sibling / multi-level,
+  the same recursion naturally extends — the gate in
+  `compile_columns_recursive` is the single change.
+
 ## 2026-04-13 — `JSON_TABLE` flat row source (11.20a)
 
 - **New module**: `crates/axiomdb-sql/src/json_table.rs`. Owns compile + materialize.

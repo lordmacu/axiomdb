@@ -37,6 +37,10 @@ pub struct JsonTableSpec {
     pub alias: String,
     pub row_path: Vec<PathStepOwned>,
     pub columns: Vec<JsonTableColumnSpec>,
+    /// Total number of slots in each emitted row (sum of leaf columns across
+    /// every level of NESTED PATH). Leaves count 1 each; `Nested` columns
+    /// expand into their children's slot range.
+    pub total_slots: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -49,14 +53,29 @@ pub struct JsonTableColumnSpec {
 #[derive(Debug, Clone)]
 pub enum JsonTableColumnKind {
     Regular {
+        /// Slot index in the emitted row.
+        slot: usize,
         path: Vec<PathStepOwned>,
         on_empty: SqlJsonOnBehavior,
         on_error: SqlJsonOnBehavior,
     },
-    Ordinality,
+    Ordinality {
+        slot: usize,
+    },
     Exists {
+        slot: usize,
         path: Vec<PathStepOwned>,
         on_error: SqlJsonOnBehavior,
+    },
+    /// Phase 11.20b — a single-level `NESTED PATH ... COLUMNS(...)` subtree.
+    /// 11.20b rejects multi-sibling + multi-level NESTED at compile time;
+    /// `children` therefore contains only `Regular`, `Ordinality`, and
+    /// `Exists` variants. Slot range `[start, end)` is a contiguous span
+    /// inside the emitted row's flat slot vector.
+    Nested {
+        path: Vec<PathStepOwned>,
+        children: Vec<JsonTableColumnSpec>,
+        slot_range: (usize, usize),
     },
 }
 
@@ -81,9 +100,55 @@ pub enum PathStepOwned {
 pub fn compile_json_table(jt: &JsonTable) -> Result<JsonTableSpec, DbError> {
     let row_path = parse_restricted_path(&jt.row_path)?;
 
-    // Enforce: at most one FOR ORDINALITY per COLUMNS list.
-    let ordinality_count = jt
-        .columns
+    // Enforce: unique column names across every level.
+    let mut seen = std::collections::HashSet::new();
+    collect_names_recursive(&jt.columns, &mut seen)?;
+
+    // Depth-first slot assignment; enforces depth ≤ 1 and single NESTED
+    // sibling per list (11.20b constraints; 11.20c lifts both).
+    let mut next_slot = 0usize;
+    let columns = compile_columns_recursive(&jt.columns, &mut next_slot, 0)?;
+
+    let alias = jt.alias.clone().unwrap_or_else(|| "json_table".into());
+    Ok(JsonTableSpec {
+        alias,
+        row_path,
+        columns,
+        total_slots: next_slot,
+    })
+}
+
+fn collect_names_recursive(
+    cols: &[JsonTableColumn],
+    seen: &mut std::collections::HashSet<String>,
+) -> Result<(), DbError> {
+    for c in cols {
+        match c {
+            JsonTableColumn::Regular { name, .. }
+            | JsonTableColumn::Ordinality { name }
+            | JsonTableColumn::Exists { name, .. } => {
+                if !seen.insert(name.to_ascii_lowercase()) {
+                    return Err(DbError::ParseError {
+                        message: format!("JSON_TABLE: duplicate column name `{name}`"),
+                        position: None,
+                    });
+                }
+            }
+            JsonTableColumn::Nested { columns, .. } => {
+                collect_names_recursive(columns, seen)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compile_columns_recursive(
+    cols: &[JsonTableColumn],
+    next_slot: &mut usize,
+    depth: usize,
+) -> Result<Vec<JsonTableColumnSpec>, DbError> {
+    // At-most-one FOR ORDINALITY per list (each level has its own counter).
+    let ordinality_count = cols
         .iter()
         .filter(|c| matches!(c, JsonTableColumn::Ordinality { .. }))
         .count();
@@ -95,83 +160,112 @@ pub fn compile_json_table(jt: &JsonTable) -> Result<JsonTableSpec, DbError> {
         });
     }
 
-    // Enforce: unique column names.
-    let mut seen = std::collections::HashSet::new();
-    for c in &jt.columns {
-        let name = column_name(c);
-        if !seen.insert(name.to_ascii_lowercase()) {
-            return Err(DbError::ParseError {
-                message: format!("JSON_TABLE: duplicate column name `{name}`"),
-                position: None,
-            });
+    // Phase 11.20b restriction: at most one NESTED sibling per list.
+    let nested_count = cols
+        .iter()
+        .filter(|c| matches!(c, JsonTableColumn::Nested { .. }))
+        .count();
+    if nested_count > 1 {
+        return Err(DbError::NotImplemented {
+            feature: "JSON_TABLE: multiple NESTED PATH siblings in the same COLUMNS(...) \
+                      list — deferred to 11.20c"
+                .into(),
+        });
+    }
+
+    let mut out = Vec::with_capacity(cols.len());
+    for c in cols {
+        match c {
+            JsonTableColumn::Regular {
+                name,
+                ty,
+                path,
+                on_empty,
+                on_error,
+            } => {
+                let slot = *next_slot;
+                *next_slot += 1;
+                out.push(JsonTableColumnSpec {
+                    name: name.clone(),
+                    ty: *ty,
+                    kind: JsonTableColumnKind::Regular {
+                        slot,
+                        path: parse_restricted_path(path)?,
+                        on_empty: on_empty.clone(),
+                        on_error: on_error.clone(),
+                    },
+                });
+            }
+            JsonTableColumn::Ordinality { name } => {
+                let slot = *next_slot;
+                *next_slot += 1;
+                out.push(JsonTableColumnSpec {
+                    name: name.clone(),
+                    ty: DataType::BigInt,
+                    kind: JsonTableColumnKind::Ordinality { slot },
+                });
+            }
+            JsonTableColumn::Exists {
+                name,
+                ty,
+                path,
+                on_error,
+            } => {
+                let slot = *next_slot;
+                *next_slot += 1;
+                out.push(JsonTableColumnSpec {
+                    name: name.clone(),
+                    ty: *ty,
+                    kind: JsonTableColumnKind::Exists {
+                        slot,
+                        path: parse_restricted_path(path)?,
+                        on_error: on_error.clone(),
+                    },
+                });
+            }
+            JsonTableColumn::Nested { path, columns } => {
+                if depth >= 1 {
+                    return Err(DbError::NotImplemented {
+                        feature: "JSON_TABLE: NESTED PATH inside NESTED PATH (depth ≥ 2) — \
+                                  deferred to 11.20c"
+                            .into(),
+                    });
+                }
+                let start = *next_slot;
+                let children = compile_columns_recursive(columns, next_slot, depth + 1)?;
+                let end = *next_slot;
+                // Nested contributes no own slot; it expands into child slots.
+                // The spec's `name`/`ty` are placeholders for uniformity.
+                out.push(JsonTableColumnSpec {
+                    name: String::new(),
+                    ty: DataType::BigInt,
+                    kind: JsonTableColumnKind::Nested {
+                        path: parse_restricted_path(path)?,
+                        children,
+                        slot_range: (start, end),
+                    },
+                });
+            }
         }
     }
-
-    let mut columns = Vec::with_capacity(jt.columns.len());
-    for c in &jt.columns {
-        columns.push(compile_column(c)?);
-    }
-
-    let alias = jt.alias.clone().unwrap_or_else(|| "json_table".into());
-    Ok(JsonTableSpec {
-        alias,
-        row_path,
-        columns,
-    })
-}
-
-fn compile_column(c: &JsonTableColumn) -> Result<JsonTableColumnSpec, DbError> {
-    match c {
-        JsonTableColumn::Regular {
-            name,
-            ty,
-            path,
-            on_empty,
-            on_error,
-        } => Ok(JsonTableColumnSpec {
-            name: name.clone(),
-            ty: *ty,
-            kind: JsonTableColumnKind::Regular {
-                path: parse_restricted_path(path)?,
-                on_empty: on_empty.clone(),
-                on_error: on_error.clone(),
-            },
-        }),
-        JsonTableColumn::Ordinality { name } => Ok(JsonTableColumnSpec {
-            name: name.clone(),
-            ty: DataType::BigInt,
-            kind: JsonTableColumnKind::Ordinality,
-        }),
-        JsonTableColumn::Exists {
-            name,
-            ty,
-            path,
-            on_error,
-        } => Ok(JsonTableColumnSpec {
-            name: name.clone(),
-            ty: *ty,
-            kind: JsonTableColumnKind::Exists {
-                path: parse_restricted_path(path)?,
-                on_error: on_error.clone(),
-            },
-        }),
-    }
-}
-
-fn column_name(c: &JsonTableColumn) -> &str {
-    match c {
-        JsonTableColumn::Regular { name, .. }
-        | JsonTableColumn::Ordinality { name }
-        | JsonTableColumn::Exists { name, .. } => name.as_str(),
-    }
+    Ok(out)
 }
 
 // ── ColumnDef projection (for analyzer_bind) ────────────────────────────────
 
 pub fn column_defs_for_ast(jt: &JsonTable) -> Result<Vec<ColumnDef>, DbError> {
-    let mut out = Vec::with_capacity(jt.columns.len());
-    for (idx, c) in jt.columns.iter().enumerate() {
-        let (name, dt, nullable) = match c {
+    let mut out = Vec::new();
+    flatten_defs_recursive(&jt.columns, &mut out, /*inside_nested=*/ false)?;
+    Ok(out)
+}
+
+fn flatten_defs_recursive(
+    cols: &[JsonTableColumn],
+    out: &mut Vec<ColumnDef>,
+    inside_nested: bool,
+) -> Result<(), DbError> {
+    for c in cols {
+        match c {
             JsonTableColumn::Regular {
                 name,
                 ty,
@@ -179,27 +273,58 @@ pub fn column_defs_for_ast(jt: &JsonTable) -> Result<Vec<ColumnDef>, DbError> {
                 on_error,
                 ..
             } => {
-                let nullable = matches!(on_empty, SqlJsonOnBehavior::Null)
+                let nullable = inside_nested
+                    || matches!(on_empty, SqlJsonOnBehavior::Null)
                     || matches!(on_error, SqlJsonOnBehavior::Null);
-                (name.as_str(), *ty, nullable)
+                out.push(ColumnDef {
+                    table_id: 0 as TableId,
+                    col_idx: out.len() as u16,
+                    name: name.clone(),
+                    col_type: datatype_to_column_type(ty)?,
+                    nullable,
+                    auto_increment: false,
+                    type_len: 0,
+                    is_fixed_len: false,
+                    default_expr: None,
+                    on_update_expr: None,
+                });
             }
-            JsonTableColumn::Ordinality { name } => (name.as_str(), DataType::BigInt, false),
-            JsonTableColumn::Exists { name, ty, .. } => (name.as_str(), *ty, false),
-        };
-        out.push(ColumnDef {
-            table_id: 0 as TableId,
-            col_idx: idx as u16,
-            name: name.to_string(),
-            col_type: datatype_to_column_type(&dt)?,
-            nullable,
-            auto_increment: false,
-            type_len: 0,
-            is_fixed_len: false,
-            default_expr: None,
-            on_update_expr: None,
-        });
+            JsonTableColumn::Ordinality { name } => {
+                out.push(ColumnDef {
+                    table_id: 0 as TableId,
+                    col_idx: out.len() as u16,
+                    name: name.clone(),
+                    col_type: ColumnType::BigInt,
+                    // Inner ordinality column IS nullable on LEFT-OUTER pad
+                    // (no child matches → NULL-pad row for that level).
+                    nullable: inside_nested,
+                    auto_increment: false,
+                    type_len: 0,
+                    is_fixed_len: false,
+                    default_expr: None,
+                    on_update_expr: None,
+                });
+            }
+            JsonTableColumn::Exists { name, ty, .. } => {
+                out.push(ColumnDef {
+                    table_id: 0 as TableId,
+                    col_idx: out.len() as u16,
+                    name: name.clone(),
+                    col_type: datatype_to_column_type(ty)?,
+                    nullable: inside_nested,
+                    auto_increment: false,
+                    type_len: 0,
+                    is_fixed_len: false,
+                    default_expr: None,
+                    on_update_expr: None,
+                });
+            }
+            JsonTableColumn::Nested { columns, .. } => {
+                flatten_defs_recursive(columns, out, /*inside_nested=*/ true)?;
+            }
+        }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
@@ -257,30 +382,122 @@ pub fn materialize_json_table<R: SubqueryRunner>(
     sq: &mut R,
 ) -> Result<Vec<Vec<Value>>, DbError> {
     let parent_matches = walk_path_owned(doc, &spec.row_path);
-    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(parent_matches.len());
+    let mut rows: Vec<Vec<Value>> = Vec::new();
 
     for (i, parent) in parent_matches.iter().enumerate() {
         let ord = (i as i64) + 1;
-        let mut row: Vec<Value> = Vec::with_capacity(spec.columns.len());
+        // Row template initialised to NULLs; fill parent-level leaves then
+        // expand via NESTED PATH children (Phase 11.20b: single NESTED).
+        let mut template: Vec<Value> = vec![Value::Null; spec.total_slots];
 
+        // Fill leaf columns and locate the (at most one) nested child.
+        let mut nested_child: Option<&JsonTableColumnSpec> = None;
         for col in &spec.columns {
-            let v = match &col.kind {
-                JsonTableColumnKind::Ordinality => Value::BigInt(ord),
+            match &col.kind {
+                JsonTableColumnKind::Ordinality { slot } => {
+                    template[*slot] = Value::BigInt(ord);
+                }
                 JsonTableColumnKind::Regular {
+                    slot,
                     path,
                     on_empty,
                     on_error,
-                } => materialize_regular(parent, path, col.ty, on_empty, on_error, outer_row, sq)?,
-                JsonTableColumnKind::Exists { path, on_error } => {
-                    materialize_exists(parent, path, col.ty, on_error, outer_row, sq)?
+                } => {
+                    template[*slot] = materialize_regular(
+                        parent, path, col.ty, on_empty, on_error, outer_row, sq,
+                    )?;
                 }
-            };
-            row.push(v);
+                JsonTableColumnKind::Exists {
+                    slot,
+                    path,
+                    on_error,
+                } => {
+                    template[*slot] =
+                        materialize_exists(parent, path, col.ty, on_error, outer_row, sq)?;
+                }
+                JsonTableColumnKind::Nested { .. } => {
+                    nested_child = Some(col);
+                }
+            }
         }
 
-        rows.push(row);
+        // Expand NESTED (Phase 11.20b: depth 1, at most one per list).
+        match nested_child {
+            None => rows.push(template),
+            Some(nested) => {
+                let (path, children, (start, end)) = match &nested.kind {
+                    JsonTableColumnKind::Nested {
+                        path,
+                        children,
+                        slot_range,
+                    } => (path, children, *slot_range),
+                    _ => unreachable!("nested_child is Nested"),
+                };
+                let child_matches = walk_path_owned(parent, path);
+                if child_matches.is_empty() {
+                    // LEFT-OUTER NULL pad: emit one row; child slots stay
+                    // NULL from the template initialisation.
+                    rows.push(template);
+                } else {
+                    for (j, child) in child_matches.iter().enumerate() {
+                        let child_ord = (j as i64) + 1;
+                        let mut row = template.clone();
+                        fill_leaf_children(children, child, child_ord, outer_row, sq, &mut row)?;
+                        // `fill_leaf_children` writes into the (start..end)
+                        // slot range; slots outside that range retain their
+                        // parent values from the template.
+                        let _ = (start, end); // no-op; present for clarity
+                        rows.push(row);
+                    }
+                }
+            }
+        }
     }
     Ok(rows)
+}
+
+/// Phase 11.20b: fill child-level leaf slots for one child match.
+/// Depth-1 constraint is enforced at compile time, so `children` contains
+/// only `Regular`, `Ordinality`, and `Exists` kinds.
+fn fill_leaf_children<R: SubqueryRunner>(
+    children: &[JsonTableColumnSpec],
+    child: &serde_json::Value,
+    child_ord: i64,
+    outer_row: &[Value],
+    sq: &mut R,
+    row: &mut [Value],
+) -> Result<(), DbError> {
+    for c in children {
+        match &c.kind {
+            JsonTableColumnKind::Ordinality { slot } => {
+                row[*slot] = Value::BigInt(child_ord);
+            }
+            JsonTableColumnKind::Regular {
+                slot,
+                path,
+                on_empty,
+                on_error,
+            } => {
+                row[*slot] =
+                    materialize_regular(child, path, c.ty, on_empty, on_error, outer_row, sq)?;
+            }
+            JsonTableColumnKind::Exists {
+                slot,
+                path,
+                on_error,
+            } => {
+                row[*slot] = materialize_exists(child, path, c.ty, on_error, outer_row, sq)?;
+            }
+            JsonTableColumnKind::Nested { .. } => {
+                // Compile-time depth check in `compile_columns_recursive`
+                // prevents reaching this arm in 11.20b.
+                return Err(DbError::NotImplemented {
+                    feature: "JSON_TABLE: multi-level NESTED — deferred to 11.20c".into(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn materialize_regular<R: SubqueryRunner>(
