@@ -524,6 +524,115 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             Ok(Value::Json(sj.to_string()))
         }
 
+        // ── Phase 11.22b: jsonb_set_lax ─────────────────────────────────────
+        // jsonb_set_lax(target, path, new_value [, create_if_missing=true
+        //               [, null_value_treatment='use_json_null']])
+        // SQL-NULL new_value dispatches on null_value_treatment enum.
+        "jsonb_set_lax" => {
+            if args.len() < 3 || args.len() > 5 {
+                return Err(DbError::TypeMismatch {
+                    expected: "jsonb_set_lax: 3, 4 or 5 args".into(),
+                    got: args.len().to_string(),
+                });
+            }
+            let target = eval_arg(args, 0, row, name)?;
+            let path_arg = eval_arg(args, 1, row, name)?;
+            if matches!(target, Value::Null) || matches!(path_arg, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let new_val = eval_arg(args, 2, row, name)?;
+            let create_if_missing = if args.len() >= 4 {
+                let v = eval_arg(args, 3, row, name)?;
+                if matches!(v, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                is_truthy_arg(&v)
+            } else {
+                true
+            };
+            let treatment: String = if args.len() == 5 {
+                let v = eval_arg(args, 4, row, name)?;
+                match v {
+                    Value::Null => {
+                        return Err(DbError::InvalidValue {
+                            reason: "null_value_treatment must be \"delete_key\", \
+                                \"return_target\", \"use_json_null\", or \
+                                \"raise_exception\""
+                                .into(),
+                        });
+                    }
+                    Value::Text(s) | Value::Json(s) => s,
+                    other => other.to_string(),
+                }
+            } else {
+                "use_json_null".into()
+            };
+
+            let parts = parse_mutation_path(&path_arg)?;
+
+            // non-null new_value → plain jsonb_set
+            if !matches!(new_val, Value::Null) {
+                let mut sj = value_to_serde_json(&target)?;
+                set_path_ext(
+                    &mut sj,
+                    &parts,
+                    sql_to_serde_json(&new_val),
+                    MutationFlags {
+                        create_if_missing,
+                        insert_after: false,
+                        raise_on_existing_key: false,
+                        allow_insert: false,
+                    },
+                )?;
+                return jsonb_blob_from_serde(&sj);
+            }
+
+            match treatment.as_str() {
+                "use_json_null" => {
+                    let mut sj = value_to_serde_json(&target)?;
+                    set_path_ext(
+                        &mut sj,
+                        &parts,
+                        serde_json::Value::Null,
+                        MutationFlags {
+                            create_if_missing,
+                            insert_after: false,
+                            raise_on_existing_key: false,
+                            allow_insert: false,
+                        },
+                    )?;
+                    jsonb_blob_from_serde(&sj)
+                }
+                "raise_exception" => Err(DbError::InvalidValue {
+                    reason: "JSON value must not be null (null_value_treatment = \
+                        raise_exception)"
+                        .into(),
+                }),
+                "delete_key" => {
+                    let mut sj = value_to_serde_json(&target)?;
+                    if !parts.is_empty() {
+                        if sj.is_object() || sj.is_array() {
+                            remove_path_parts(&mut sj, &parts);
+                        } else {
+                            return Err(DbError::InvalidValue {
+                                reason: "cannot delete path in scalar JSONB".into(),
+                            });
+                        }
+                    }
+                    jsonb_blob_from_serde(&sj)
+                }
+                "return_target" => {
+                    let sj = value_to_serde_json(&target)?;
+                    jsonb_blob_from_serde(&sj)
+                }
+                _ => Err(DbError::InvalidValue {
+                    reason: "null_value_treatment must be \"delete_key\", \
+                        \"return_target\", \"use_json_null\", or \"raise_exception\""
+                        .into(),
+                }),
+            }
+        }
+
         _ => unreachable!("dispatcher routed unsupported JSON function"),
     }
 }

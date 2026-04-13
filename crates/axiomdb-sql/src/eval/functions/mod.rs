@@ -70,7 +70,7 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         // were not yet implemented. All share the same path-normalizer and
         // a flag-driven `set_path_ext` core so semantics stay consistent
         // while the per-function flag combination preserves vendor behavior.
-        | "jsonb_set" | "jsonb_insert" | "jsonb_delete_path"
+        | "jsonb_set" | "jsonb_set_lax" | "jsonb_insert" | "jsonb_delete_path"
         | "json_insert" | "json_replace" => {
             json::eval(lower.as_str(), args, row)
         }
