@@ -1762,6 +1762,28 @@ fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> 
     }
     let obj = schema.as_object().unwrap();
 
+    if let Some(subs) = obj.get("allOf").and_then(|v| v.as_array()) {
+        if !subs.iter().all(|s| json_schema_validate(s, doc)) {
+            return false;
+        }
+    }
+    if let Some(subs) = obj.get("anyOf").and_then(|v| v.as_array()) {
+        if !subs.iter().any(|s| json_schema_validate(s, doc)) {
+            return false;
+        }
+    }
+    if let Some(subs) = obj.get("oneOf").and_then(|v| v.as_array()) {
+        let hits = subs.iter().filter(|s| json_schema_validate(s, doc)).count();
+        if hits != 1 {
+            return false;
+        }
+    }
+    if let Some(sub) = obj.get("not") {
+        if json_schema_validate(sub, doc) {
+            return false;
+        }
+    }
+
     if let Some(t) = obj.get("type") {
         if !schema_type_matches(t, doc) {
             return false;
@@ -1816,6 +1838,16 @@ fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> 
                 return false;
             }
         }
+        if let Some(p) = obj.get("pattern").and_then(|v| v.as_str()) {
+            match regex::Regex::new(p) {
+                Ok(re) => {
+                    if !re.is_match(s) {
+                        return false;
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
     }
     if let Some(arr) = doc.as_array() {
         if let Some(m) = obj.get("minItems").and_then(|v| v.as_u64()) {
@@ -1826,6 +1858,15 @@ fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> 
         if let Some(m) = obj.get("maxItems").and_then(|v| v.as_u64()) {
             if (arr.len() as u64) > m {
                 return false;
+            }
+        }
+        if obj.get("uniqueItems").and_then(|v| v.as_bool()) == Some(true) {
+            for i in 0..arr.len() {
+                for j in (i + 1)..arr.len() {
+                    if arr[i] == arr[j] {
+                        return false;
+                    }
+                }
             }
         }
         if let Some(items) = obj.get("items") {

@@ -290,3 +290,123 @@ fn jsonb_input() {
     );
     assert!(is_true(&v));
 }
+
+// ── Phase 11.23d partial: pattern, logical combinators, uniqueItems ────────
+
+#[test]
+fn pattern_matches() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"type\":\"string\",\"pattern\":\"^[a-z]+$\"}', '\"abc\"')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"type\":\"string\",\"pattern\":\"^[a-z]+$\"}', '\"AB\"')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_false(&v));
+}
+
+#[test]
+fn all_of_ok() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"allOf\":[{\"minimum\":0},{\"maximum\":10}]}', '5')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"allOf\":[{\"minimum\":0},{\"maximum\":10}]}', '15')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_false(&v));
+}
+
+#[test]
+fn any_of_short_circuits() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"integer\"}]}', '42')",
+        &mut s, &mut t, &mut b, &mut c,
+    );
+    assert!(is_true(&v));
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"integer\"}]}', '[]')",
+        &mut s, &mut t, &mut b, &mut c,
+    );
+    assert!(is_false(&v));
+}
+
+#[test]
+fn one_of_exactly_one() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"oneOf\":[{\"type\":\"integer\"},{\"type\":\"string\"}]}', '42')",
+        &mut s, &mut t, &mut b, &mut c,
+    );
+    assert!(is_true(&v));
+    // Matches both integer and minimum:0 → 2 hits → fails
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"oneOf\":[{\"type\":\"integer\"},{\"minimum\":0}]}', '5')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_false(&v));
+}
+
+#[test]
+fn not_combinator() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"not\":{\"type\":\"string\"}}', '42')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"not\":{\"type\":\"string\"}}', '\"hi\"')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_false(&v));
+}
+
+#[test]
+fn unique_items() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"type\":\"array\",\"uniqueItems\":true}', '[1,2,3]')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"type\":\"array\",\"uniqueItems\":true}', '[1,2,1]')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_false(&v));
+}
