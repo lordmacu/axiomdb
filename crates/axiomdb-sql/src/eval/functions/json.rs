@@ -719,6 +719,30 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             Ok(Value::Bool(json_schema_validate(&schema_sj, &doc_sj)))
         }
 
+        // JSON_SCHEMA_VALIDATION_REPORT(schema, doc) — Phase 11.23b.
+        // Returns a JSON array of {path, keyword, message} error objects.
+        // Empty array means the document is valid.
+        "json_schema_validation_report" => {
+            expect_arg_count(name, args, 2)?;
+            let schema = eval_arg(args, 0, row, name)?;
+            let doc = eval_arg(args, 1, row, name)?;
+            if matches!(schema, Value::Null) || matches!(doc, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let schema_sj = value_to_serde_json(&schema)?;
+            let doc_sj = value_to_serde_json(&doc)?;
+            let mut errors = Vec::<serde_json::Value>::new();
+            collect_schema_errors(
+                &schema_sj,
+                &doc_sj,
+                &schema_sj,
+                0,
+                "#".to_string(),
+                &mut errors,
+            );
+            Ok(Value::Json(serde_json::Value::Array(errors).to_string()))
+        }
+
         // ── Phase 11.24a: Oracle JSON surface ────────────────────────────────
         // JSON_EQUAL(a, b) — deep structural equality. NULL if either is NULL.
         "json_equal" => {
@@ -2034,6 +2058,346 @@ fn validate_with_root(
     }
 
     true
+}
+
+fn push_error(
+    errors: &mut Vec<serde_json::Value>,
+    path: &str,
+    keyword: &str,
+    message: impl Into<String>,
+) {
+    errors.push(serde_json::json!({
+        "path": path,
+        "keyword": keyword,
+        "message": message.into(),
+    }));
+}
+
+fn collect_schema_errors(
+    schema: &serde_json::Value,
+    doc: &serde_json::Value,
+    root: &serde_json::Value,
+    depth: u32,
+    path: String,
+    errors: &mut Vec<serde_json::Value>,
+) {
+    if depth > SCHEMA_REF_DEPTH_LIMIT {
+        push_error(errors, &path, "$ref", "max ref depth exceeded");
+        return;
+    }
+    match schema {
+        serde_json::Value::Bool(true) => return,
+        serde_json::Value::Bool(false) => {
+            push_error(errors, &path, "false", "schema `false` rejects all");
+            return;
+        }
+        serde_json::Value::Object(_) => {}
+        _ => {
+            push_error(errors, &path, "schema", "schema must be object or bool");
+            return;
+        }
+    }
+    let obj = schema.as_object().unwrap();
+
+    if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+        match resolve_json_pointer(root, r) {
+            Some(target) => collect_schema_errors(target, doc, root, depth + 1, path, errors),
+            None => push_error(errors, &path, "$ref", format!("cannot resolve {r}")),
+        }
+        return;
+    }
+
+    // Logical combinators use the boolean validator to avoid noisy duplicate
+    // errors inside anyOf/oneOf; allOf reports each branch's errors inline.
+    if let Some(subs) = obj.get("allOf").and_then(|v| v.as_array()) {
+        for (i, sub) in subs.iter().enumerate() {
+            if !validate_with_root(sub, doc, root, depth + 1) {
+                let sub_path = format!("{path}/allOf/{i}");
+                collect_schema_errors(sub, doc, root, depth + 1, sub_path, errors);
+            }
+        }
+    }
+    if let Some(subs) = obj.get("anyOf").and_then(|v| v.as_array()) {
+        if !subs
+            .iter()
+            .any(|s| validate_with_root(s, doc, root, depth + 1))
+        {
+            push_error(errors, &path, "anyOf", "value matched none of the schemas");
+        }
+    }
+    if let Some(subs) = obj.get("oneOf").and_then(|v| v.as_array()) {
+        let hits = subs
+            .iter()
+            .filter(|s| validate_with_root(s, doc, root, depth + 1))
+            .count();
+        if hits != 1 {
+            push_error(
+                errors,
+                &path,
+                "oneOf",
+                format!("value matched {hits} schemas, expected exactly 1"),
+            );
+        }
+    }
+    if let Some(sub) = obj.get("not") {
+        if validate_with_root(sub, doc, root, depth + 1) {
+            push_error(errors, &path, "not", "value matched the `not` schema");
+        }
+    }
+
+    if let Some(t) = obj.get("type") {
+        if !schema_type_matches(t, doc) {
+            push_error(
+                errors,
+                &path,
+                "type",
+                format!("value does not match type {t}"),
+            );
+        }
+    }
+    if let Some(e) = obj.get("enum").and_then(|v| v.as_array()) {
+        if !e.iter().any(|x| x == doc) {
+            push_error(errors, &path, "enum", "value not in enum");
+        }
+    }
+    if let Some(c) = obj.get("const") {
+        if c != doc {
+            push_error(errors, &path, "const", "value does not equal const");
+        }
+    }
+    if let Some(n) = doc.as_f64() {
+        if let Some(m) = obj.get("minimum").and_then(|v| v.as_f64()) {
+            if n < m {
+                push_error(errors, &path, "minimum", format!("{n} < {m}"));
+            }
+        }
+        if let Some(m) = obj.get("maximum").and_then(|v| v.as_f64()) {
+            if n > m {
+                push_error(errors, &path, "maximum", format!("{n} > {m}"));
+            }
+        }
+        if let Some(m) = obj.get("exclusiveMinimum").and_then(|v| v.as_f64()) {
+            if n <= m {
+                push_error(errors, &path, "exclusiveMinimum", format!("{n} <= {m}"));
+            }
+        }
+        if let Some(m) = obj.get("exclusiveMaximum").and_then(|v| v.as_f64()) {
+            if n >= m {
+                push_error(errors, &path, "exclusiveMaximum", format!("{n} >= {m}"));
+            }
+        }
+        if let Some(m) = obj.get("multipleOf").and_then(|v| v.as_f64()) {
+            if m == 0.0 || (n / m).fract() != 0.0 {
+                push_error(
+                    errors,
+                    &path,
+                    "multipleOf",
+                    format!("{n} not multiple of {m}"),
+                );
+            }
+        }
+    }
+    if let Some(s) = doc.as_str() {
+        let len = s.chars().count() as u64;
+        if let Some(m) = obj.get("minLength").and_then(|v| v.as_u64()) {
+            if len < m {
+                push_error(errors, &path, "minLength", format!("length {len} < {m}"));
+            }
+        }
+        if let Some(m) = obj.get("maxLength").and_then(|v| v.as_u64()) {
+            if len > m {
+                push_error(errors, &path, "maxLength", format!("length {len} > {m}"));
+            }
+        }
+        if let Some(p) = obj.get("pattern").and_then(|v| v.as_str()) {
+            match regex::Regex::new(p) {
+                Ok(re) => {
+                    if !re.is_match(s) {
+                        push_error(errors, &path, "pattern", format!("does not match /{p}/"));
+                    }
+                }
+                Err(e) => push_error(errors, &path, "pattern", format!("invalid regex: {e}")),
+            }
+        }
+        if let Some(fmt) = obj.get("format").and_then(|v| v.as_str()) {
+            if !schema_format_matches(fmt, s) {
+                push_error(errors, &path, "format", format!("not a valid {fmt}"));
+            }
+        }
+    }
+    if let Some(arr) = doc.as_array() {
+        if let Some(m) = obj.get("minItems").and_then(|v| v.as_u64()) {
+            if (arr.len() as u64) < m {
+                push_error(errors, &path, "minItems", format!("{} < {m}", arr.len()));
+            }
+        }
+        if let Some(m) = obj.get("maxItems").and_then(|v| v.as_u64()) {
+            if (arr.len() as u64) > m {
+                push_error(errors, &path, "maxItems", format!("{} > {m}", arr.len()));
+            }
+        }
+        if obj.get("uniqueItems").and_then(|v| v.as_bool()) == Some(true) {
+            'outer: for i in 0..arr.len() {
+                for j in (i + 1)..arr.len() {
+                    if arr[i] == arr[j] {
+                        push_error(
+                            errors,
+                            &path,
+                            "uniqueItems",
+                            format!("duplicate at indices {i} and {j}"),
+                        );
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if let Some(items) = obj.get("items") {
+            match items {
+                serde_json::Value::Array(subs) => {
+                    for (i, sub) in subs.iter().enumerate() {
+                        if let Some(v) = arr.get(i) {
+                            let sub_path = format!("{path}/{i}");
+                            collect_schema_errors(sub, v, root, depth + 1, sub_path, errors);
+                        }
+                    }
+                }
+                _ => {
+                    for (i, v) in arr.iter().enumerate() {
+                        let sub_path = format!("{path}/{i}");
+                        collect_schema_errors(items, v, root, depth + 1, sub_path, errors);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(map) = doc.as_object() {
+        if let Some(req) = obj.get("required").and_then(|v| v.as_array()) {
+            for r in req {
+                if let Some(k) = r.as_str() {
+                    if !map.contains_key(k) {
+                        push_error(errors, &path, "required", format!("missing key `{k}`"));
+                    }
+                }
+            }
+        }
+        let empty_props = serde_json::Map::new();
+        let props = obj
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .unwrap_or(&empty_props);
+        let pattern_props = obj
+            .get("patternProperties")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let compiled_pp: Vec<(regex::Regex, serde_json::Value)> = pattern_props
+            .iter()
+            .filter_map(|(k, v)| regex::Regex::new(k).ok().map(|re| (re, v.clone())))
+            .collect();
+
+        for (k, sub) in props {
+            if let Some(v) = map.get(k) {
+                let sub_path = format!("{path}/{k}");
+                collect_schema_errors(sub, v, root, depth + 1, sub_path, errors);
+            }
+        }
+        for (k, v) in map {
+            for (re, sub) in &compiled_pp {
+                if re.is_match(k) {
+                    let sub_path = format!("{path}/{k}");
+                    collect_schema_errors(sub, v, root, depth + 1, sub_path, errors);
+                }
+            }
+        }
+        if let Some(ap) = obj.get("additionalProperties") {
+            let is_additional = |k: &str| {
+                !props.contains_key(k) && !compiled_pp.iter().any(|(re, _)| re.is_match(k))
+            };
+            match ap {
+                serde_json::Value::Bool(false) => {
+                    for k in map.keys() {
+                        if is_additional(k) {
+                            push_error(
+                                errors,
+                                &path,
+                                "additionalProperties",
+                                format!("extra key `{k}` not allowed"),
+                            );
+                        }
+                    }
+                }
+                serde_json::Value::Object(_) | serde_json::Value::Bool(true) => {
+                    for (k, v) in map {
+                        if is_additional(k) {
+                            let sub_path = format!("{path}/{k}");
+                            collect_schema_errors(ap, v, root, depth + 1, sub_path, errors);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(pn) = obj.get("propertyNames") {
+            for k in map.keys() {
+                let kv = serde_json::Value::String(k.clone());
+                if !validate_with_root(pn, &kv, root, depth + 1) {
+                    push_error(
+                        errors,
+                        &path,
+                        "propertyNames",
+                        format!("key `{k}` does not satisfy propertyNames"),
+                    );
+                }
+            }
+        }
+        if let Some(deps) = obj.get("dependencies").and_then(|v| v.as_object()) {
+            for (k, dep) in deps {
+                if !map.contains_key(k) {
+                    continue;
+                }
+                match dep {
+                    serde_json::Value::Array(keys) => {
+                        for r in keys {
+                            if let Some(rk) = r.as_str() {
+                                if !map.contains_key(rk) {
+                                    push_error(
+                                        errors,
+                                        &path,
+                                        "dependencies",
+                                        format!("`{k}` requires `{rk}`"),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        if !validate_with_root(dep, doc, root, depth + 1) {
+                            push_error(
+                                errors,
+                                &path,
+                                "dependencies",
+                                format!("`{k}` schema-dependency failed"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(cond) = obj.get("if") {
+        let branch_key = if validate_with_root(cond, doc, root, depth + 1) {
+            "then"
+        } else {
+            "else"
+        };
+        if let Some(branch) = obj.get(branch_key) {
+            if !validate_with_root(branch, doc, root, depth + 1) {
+                let sub_path = format!("{path}/{branch_key}");
+                collect_schema_errors(branch, doc, root, depth + 1, sub_path, errors);
+            }
+        }
+    }
 }
 
 /// Resolve a RFC 6901 JSON pointer (with optional leading `#`) against a root.
