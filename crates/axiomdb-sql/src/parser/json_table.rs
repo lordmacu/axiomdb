@@ -7,10 +7,13 @@
 use axiomdb_core::error::DbError;
 
 use crate::ast::{FromClause, JsonTable, JsonTableColumn};
-use crate::expr::SqlJsonOnBehavior;
+use crate::expr::{SqlJsonOnBehavior, SqlJsonQuotes, SqlJsonWrapper};
 use crate::lexer::Token;
 use crate::parser::ddl::parse_data_type;
 use crate::parser::expr::parse_expr;
+use crate::parser::sql_json_common::{
+    parse_optional_passing, parse_optional_quotes, parse_optional_wrapper,
+};
 use crate::parser::Parser;
 
 /// Parse a `JSON_TABLE(...)` call, assuming the `JSON_TABLE` identifier and
@@ -24,6 +27,22 @@ pub(crate) fn parse_json_table_call(p: &mut Parser<'_>) -> Result<FromClause, Db
     let doc = parse_expr(p)?;
     p.expect(&Token::Comma)?;
     let row_path = p.parse_string_literal()?;
+    // Optional `PASSING expr AS name [, …]` between the row path and
+    // `COLUMNS(...)` — Phase 11.20d1. Bindings are visible to the row path
+    // AND every column / NESTED path.
+    let passing = parse_optional_passing(p)?;
+    // Reject duplicate variable names up-front.
+    {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_, name) in &passing {
+            if !seen.insert(name.to_ascii_lowercase()) {
+                return Err(DbError::ParseError {
+                    message: format!("JSON_TABLE: duplicate PASSING variable `{name}`"),
+                    position: Some(p.current_pos()),
+                });
+            }
+        }
+    }
     // Require `COLUMNS` keyword (not currently a reserved token → ident-ci).
     if !p.eat_ident_ci("COLUMNS") {
         return Err(DbError::ParseError {
@@ -56,6 +75,7 @@ pub(crate) fn parse_json_table_call(p: &mut Parser<'_>) -> Result<FromClause, Db
     Ok(FromClause::JsonTable(Box::new(JsonTable {
         doc,
         row_path,
+        passing,
         columns,
         alias,
     })))
@@ -125,12 +145,27 @@ fn parse_column_def(p: &mut Parser<'_>) -> Result<JsonTableColumn, DbError> {
         });
     }
 
-    // Regular column — clause order per SQL:2016: ON EMPTY before ON ERROR.
+    // Regular column clause order — SQL:2016 / PG / Oracle:
+    //   PATH  →  WRAPPER  →  QUOTES  →  ON EMPTY  →  ON ERROR.
+    let wrapper = parse_optional_wrapper(p)?.unwrap_or(SqlJsonWrapper::Without);
+    let quotes = parse_optional_quotes(p)?.unwrap_or(SqlJsonQuotes::Keep);
+    // `OMIT QUOTES` is only meaningful on TEXT-returning columns
+    // (SQL:2016 §9.42 + PG parity). Reject early.
+    if matches!(quotes, SqlJsonQuotes::Omit) && !matches!(ty, axiomdb_types::DataType::Text) {
+        return Err(DbError::ParseError {
+            message: format!(
+                "JSON_TABLE column `{name}`: OMIT QUOTES is only valid on TEXT-returning columns"
+            ),
+            position: Some(p.current_pos()),
+        });
+    }
     let (on_empty, on_error) = parse_on_empty_on_error(p)?;
     Ok(JsonTableColumn::Regular {
         name,
         ty,
         path,
+        wrapper,
+        quotes,
         on_empty,
         on_error,
     })

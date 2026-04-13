@@ -19,7 +19,7 @@
 pub mod batch;
 mod context;
 pub(crate) mod core;
-mod functions;
+pub(crate) mod functions;
 mod ops;
 pub mod simd;
 

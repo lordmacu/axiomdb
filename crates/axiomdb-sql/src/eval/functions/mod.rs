@@ -14,8 +14,8 @@ mod system;
 mod uuid;
 
 pub(crate) use json::{
-    execute_jsonpath_owned as execute_jsonpath_owned_public,
-    parse_jsonpath as parse_jsonpath_public,
+    execute_jsonpath_owned as execute_jsonpath_owned_public, execute_jsonpath_owned_env,
+    parse_jsonpath, parse_jsonpath as parse_jsonpath_public, PassingEnv, PathStep,
 };
 pub(crate) use sql_json_query::eval_sql_json_query;
 
