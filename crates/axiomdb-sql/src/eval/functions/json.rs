@@ -320,6 +320,78 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
         }
 
+        // ── Phase 11.21a: PG jsonb_path_* family ─────────────────────────────
+        "jsonb_path_exists" => {
+            expect_arg_count(name, args, 2)?;
+            let json_val = eval_arg(args, 0, row, name)?;
+            let path_str = eval_path_arg_raw(args, 1, row, name)?;
+            if matches!(json_val, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let sj = value_to_serde_json(&json_val)?;
+            let steps = parse_jsonpath(&path_str)?;
+            Ok(Value::Bool(!execute_jsonpath(&sj, &steps).is_empty()))
+        }
+        "jsonb_path_query" => {
+            expect_arg_count(name, args, 2)?;
+            let json_val = eval_arg(args, 0, row, name)?;
+            let path_str = eval_path_arg_raw(args, 1, row, name)?;
+            if matches!(json_val, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let sj = value_to_serde_json(&json_val)?;
+            let steps = parse_jsonpath(&path_str)?;
+            let results = execute_jsonpath(&sj, &steps);
+            let arr: Vec<serde_json::Value> = results.into_iter().cloned().collect();
+            Ok(Value::Json(serde_json::Value::Array(arr).to_string()))
+        }
+        "jsonb_path_query_first" => {
+            expect_arg_count(name, args, 2)?;
+            let json_val = eval_arg(args, 0, row, name)?;
+            let path_str = eval_path_arg_raw(args, 1, row, name)?;
+            if matches!(json_val, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let sj = value_to_serde_json(&json_val)?;
+            let steps = parse_jsonpath(&path_str)?;
+            match execute_jsonpath(&sj, &steps).into_iter().next() {
+                None => Ok(Value::Null),
+                Some(v) => Ok(serde_json_to_sql_value(Some(v))),
+            }
+        }
+        "jsonb_path_query_array" => {
+            expect_arg_count(name, args, 2)?;
+            let json_val = eval_arg(args, 0, row, name)?;
+            let path_str = eval_path_arg_raw(args, 1, row, name)?;
+            if matches!(json_val, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let sj = value_to_serde_json(&json_val)?;
+            let steps = parse_jsonpath(&path_str)?;
+            let arr = serde_json::Value::Array(
+                execute_jsonpath(&sj, &steps).into_iter().cloned().collect(),
+            );
+            jsonb_blob_from_serde(&arr)
+        }
+        "jsonb_path_match" => {
+            expect_arg_count(name, args, 2)?;
+            let json_val = eval_arg(args, 0, row, name)?;
+            let path_str = eval_path_arg_raw(args, 1, row, name)?;
+            if matches!(json_val, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let sj = value_to_serde_json(&json_val)?;
+            let steps = parse_jsonpath(&path_str)?;
+            let results = execute_jsonpath(&sj, &steps);
+            if results.len() != 1 {
+                return Ok(Value::Null);
+            }
+            match results[0] {
+                serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
+                _ => Ok(Value::Null),
+            }
+        }
+
         // ── Phase 11.18a: JSONB operator aliases for cross-engine SQL ───────
         //
         // `JSONB_EXISTS(doc, key)` ≡ `doc ? key`
