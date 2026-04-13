@@ -218,6 +218,8 @@ pub enum Expr {
         doc: Box<Expr>,
         path: String,
         path_mode: SqlJsonPathMode,
+        /// PASSING bindings: (value expression, variable name). Phase 11.19c.
+        passing: Vec<(Expr, String)>,
         returning: Option<axiomdb_types::DataType>,
         wrapper: SqlJsonWrapper,
         quotes: SqlJsonQuotes,

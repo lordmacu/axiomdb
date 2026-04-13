@@ -956,6 +956,39 @@ fn parse_sql_json_query(p: &mut Parser, kind: SqlJsonQueryKind) -> Result<Expr, 
         SqlJsonQueryKind::Exists => SqlJsonOnBehavior::FalseLit,
         _ => SqlJsonOnBehavior::Null,
     };
+    let mut passing: Vec<(Expr, String)> = Vec::new();
+
+    // Optional PASSING <expr> AS <name> [, ...]  — Phase 11.19c.
+    // Placed before RETERURNING per SQL:2016 grammar.
+    if p.eat_ident_ci("PASSING") {
+        loop {
+            let val_expr = parse_expr(p)?;
+            if !matches!(p.peek(), Token::As) {
+                return Err(DbError::ParseError {
+                    message: "expected AS after PASSING expression".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+            p.advance();
+            let var_name = match p.peek().clone() {
+                Token::Ident(n) => {
+                    p.advance();
+                    n
+                }
+                other => {
+                    return Err(DbError::ParseError {
+                        message: format!("expected identifier after AS, got {other:?}"),
+                        position: Some(p.current_pos()),
+                    });
+                }
+            };
+            passing.push((val_expr, var_name.to_string()));
+            if !matches!(p.peek(), Token::Comma) {
+                break;
+            }
+            p.advance();
+        }
+    }
 
     // Optional RETURNING <type> — not valid for JSON_EXISTS.
     if p.eat_ident_ci("RETURNING") {
@@ -1093,6 +1126,7 @@ fn parse_sql_json_query(p: &mut Parser, kind: SqlJsonQueryKind) -> Result<Expr, 
         doc: Box::new(doc),
         path: path_str,
         path_mode,
+        passing,
         returning,
         wrapper,
         quotes,
