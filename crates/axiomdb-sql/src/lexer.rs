@@ -567,6 +567,9 @@ pub enum Token<'src> {
     /// `@>` — JSONB containment operator (Phase 11.17). MUST appear before `@`.
     #[token("@>")]
     JsonContains,
+    /// `@?` — JSONB JSONPath existence operator (Phase 11.21b). MUST appear before `@`.
+    #[token("@?")]
+    JsonbPathExists,
     /// `<@` — JSONB contained-by operator (Phase 11.18a, PG parity).
     /// Reverse of `@>`. Token appears near `@>` so the DFA prefers this
     /// longer match when the input begins with `<`.

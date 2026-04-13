@@ -1334,7 +1334,7 @@ fn serde_json_depth(v: &serde_json::Value) -> usize {
 // ── SQL:2016 JSONPath compiler ────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-enum PathStep {
+pub(crate) enum PathStep {
     Root,
     Key(String),
     Index(usize),
@@ -1345,7 +1345,7 @@ enum PathStep {
 }
 
 #[derive(Debug, Clone)]
-enum FilterExpr {
+pub(crate) enum FilterExpr {
     Exists(Vec<String>),
     Compare {
         path: Vec<String>,
@@ -1355,7 +1355,7 @@ enum FilterExpr {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum CmpOp {
+pub(crate) enum CmpOp {
     Eq,
     Ne,
     Lt,
@@ -1364,7 +1364,7 @@ enum CmpOp {
     Ge,
 }
 
-fn parse_jsonpath(path: &str) -> Result<Vec<PathStep>, DbError> {
+pub(crate) fn parse_jsonpath(path: &str) -> Result<Vec<PathStep>, DbError> {
     let path = path.trim();
     if !path.starts_with('$') {
         return Err(DbError::InvalidValue {
@@ -1533,7 +1533,7 @@ fn parse_jsonpath_literal(s: &str) -> Result<serde_json::Value, DbError> {
 
 // ── JSONPath executor (lax mode) ──────────────────────────────────────────────
 
-fn execute_jsonpath<'a>(
+pub(crate) fn execute_jsonpath<'a>(
     root: &'a serde_json::Value,
     steps: &[PathStep],
 ) -> Vec<&'a serde_json::Value> {
