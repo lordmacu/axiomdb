@@ -195,9 +195,40 @@ OUTER APPLY JSON_TABLE('[]', '$[*]'
 
 `APPLY` accepts any right-hand source (table, subquery, `JSON_TABLE`).
 `ON` / `USING` clauses after `APPLY` are a parse error — the join
-condition is implicit `TRUE`. Correlated APPLY (where the right side
-references the left, e.g. `CROSS APPLY JSON_TABLE(t.doc, ...)`) is
-deferred to phase 11.20d3.
+condition is implicit `TRUE`.
+
+Correlated APPLY / LATERAL is fully supported for `JSON_TABLE`:
+
+```sql
+-- The doc argument references the outer row.
+SELECT o.id, j.qty
+FROM orders o
+CROSS APPLY JSON_TABLE(o.payload, '$.items[*]'
+              COLUMNS (qty INT PATH '$.qty')) AS j;
+
+-- OUTER APPLY preserves the outer row when the doc yields zero rows.
+SELECT o.id, j.qty
+FROM orders o
+OUTER APPLY JSON_TABLE(o.payload, '$.items[*]'
+              COLUMNS (qty INT PATH '$.qty')) AS j;
+
+-- PASSING binds outer columns into the JSONPath filter.
+SELECT c.id, j.v
+FROM cfg c
+CROSS APPLY JSON_TABLE('[1,2,3,4,5,6]', '$[?(@ > $lo)]'
+              PASSING c.lo AS lo
+              COLUMNS (v INT PATH '$')) AS j;
+
+-- PG LATERAL keyword is accepted (no-op for JSON_TABLE; PG parity).
+SELECT o.id, j.qty
+FROM orders o
+JOIN LATERAL JSON_TABLE(o.payload, '$.items[*]'
+              COLUMNS (qty INT PATH '$.qty')) AS j ON TRUE;
+```
+
+`RIGHT JOIN` and `FULL OUTER JOIN` against a correlated `JSON_TABLE`
+are rejected — outer re-scan semantics are ill-defined and PostgreSQL
+rejects the same combination.
 
 ### JSON_TABLE as first FROM + JOIN
 

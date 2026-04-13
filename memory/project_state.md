@@ -3,7 +3,7 @@
 ## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 11.20d2 `JSON_TABLE` first FROM + CROSS/OUTER APPLY — ✅ closed; next is 11.20d3 (LATERAL-correlated `doc` / PASSING referencing outer columns) then 11.20d4 (UPDATE/DELETE source).
+**Active subphase:** 11.20d3 LATERAL-correlated JSON_TABLE (`doc` + PASSING outer refs) — ✅ closed; next is 11.20d4 (JSON_TABLE as UPDATE/DELETE source).
 
 ### Phase 11 subphase status
 
@@ -22,7 +22,8 @@
 | 11.20b `JSON_TABLE` single-level NESTED | ✅ closed |
 | 11.20c `JSON_TABLE` multi-sibling + multi-level NESTED | ✅ closed |
 | 11.20d1 `JSON_TABLE` WRAPPER / QUOTES / PASSING | ✅ closed |
-| **11.20d2** `JSON_TABLE` first FROM + CROSS/OUTER APPLY | ✅ closed — LATERAL correlation → 11.20d3 |
+| 11.20d2 `JSON_TABLE` first FROM + CROSS/OUTER APPLY | ✅ closed |
+| **11.20d3** `JSON_TABLE` LATERAL-correlated doc + PASSING | ✅ closed — UPDATE/DELETE source → 11.20d4 |
 | 11.21a–g JSONPath parity | ✅ closed (through path arithmetic in filters) — 11.21h pending planner pushdown |
 | 11.22a / 11.22b JSONB mutations | ✅ closed |
 | 11.23a / 11.23b / 11.23d / 11.23e / 11.23f JSON Schema | ✅ closed — 11.23c catalog persistence pending |
@@ -34,7 +35,7 @@
 - **11.20c** — Multi-sibling (`UNION` semantics) and multi-level NESTED PATH.
 - **11.20d1** — WRAPPER/QUOTES, `PASSING` on the row path. ✅ closed.
 - **11.20d2** — JSON_TABLE as first FROM + JOINs; CROSS/OUTER APPLY parser sugar. ✅ closed.
-- **11.20d3** — LATERAL-correlated `doc` / PASSING referencing outer columns; env rebuild per outer row.
+- **11.20d3** — LATERAL-correlated `doc` / PASSING referencing outer columns + `LATERAL` keyword. ✅ closed.
 - **11.20d4** — JSON_TABLE as UPDATE/DELETE source (MERGE deferred until MERGE lands).
 
 ### Completed phases

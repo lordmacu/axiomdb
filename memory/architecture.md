@@ -1,5 +1,46 @@
 # Architecture Notes
 
+## 2026-04-13 — LATERAL-correlated JSON_TABLE (11.20d3)
+
+- **Correlation detector**: `jsontable_is_correlated(&jt)` returns true
+  when `doc_has_column_refs(doc)` or any PASSING expression has column
+  refs. Single predicate reused by the join dispatcher and the
+  first-FROM guard.
+- **Analyzer fix**: join-side `FromClause::JsonTable` was never routed
+  through `resolve_json_table` (only first-FROM was). 11.20d1 got away
+  with it because PASSING literals resolve to themselves. 11.20d3
+  requires real binding of outer column refs, so both `jt.doc` and
+  every `jt.passing.iter_mut()` expression now run through
+  `resolve_expr_full(ctx, outer_scopes)`.
+- **Executor split**: `execute_select_with_joins_first_materialized`
+  adds `correlated_jt: Vec<Option<JsonTableSpec>>` parallel to
+  `scanned`. Non-correlated JT → `None`, materialize once as before.
+  Correlated JT → `Some(spec)`, `scanned[i] = Vec::new()`. The
+  combine loop consults the tracker and dispatches to
+  `apply_correlated_jt_join` instead of `apply_join`.
+- **Per-outer-row helper** `apply_correlated_jt_join` lives in
+  `joins.rs`. It never builds a full right-set — for each outer row it
+  evaluates `doc`, materializes, tests ON, and collects. INNER /
+  CROSS APPLY / CROSS JOIN emit only matched rows; LEFT JOIN / OUTER
+  APPLY NULL-pad unmatched; RIGHT JOIN / FULL JOIN return
+  `NotImplemented` at the top of the function (PG-compatible
+  rejection — correlated outer re-scan is semantically undefined).
+- **Hash/spill optimizations not applied** to correlated JT — they
+  require the full right set pre-built. Correlated JT is always
+  nested-loop. Acceptable: the outer loop is already O(|outer|) and
+  JT cardinality per outer row is bounded.
+- **`LATERAL` keyword** is a pure parse-time no-op eaten at the start
+  of `parse_from_item`. Covers `FROM LATERAL X`, `JOIN LATERAL X`, and
+  `LATERAL (SELECT ...)` uniformly. No AST variant change; it is
+  discarded because JSON_TABLE's lateral semantics are always implicit
+  after 11.20d3, and bare-subquery LATERAL would require a different
+  analyzer refactor.
+- **First-FROM correlated doc** now raises a permanent
+  `ParseError: correlated JSON_TABLE requires an outer FROM source`
+  (the earlier 11.20d3 placeholder). The guard uses the same
+  `jsontable_is_correlated` predicate, so PASSING outer refs are
+  caught just like doc outer refs.
+
 ## 2026-04-13 — JSON_TABLE first FROM + CROSS/OUTER APPLY (11.20d2)
 
 - **Join-loop split.** `execute_select_with_joins_ctx` (the ctx-path

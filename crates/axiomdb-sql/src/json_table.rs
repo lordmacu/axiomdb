@@ -711,6 +711,15 @@ pub fn column_metas_for_spec(spec: &JsonTableSpec) -> Vec<crate::result::ColumnM
 /// Returns `true` if the expression tree contains any column reference —
 /// used to detect LATERAL-style correlated `doc` expressions that 11.20a
 /// does not yet support.
+/// Phase 11.20d3 — true when JSON_TABLE call requires per-outer-row
+/// re-materialization because its `doc` or any PASSING expression
+/// references outer columns. Non-correlated calls (literal / param
+/// doc, literal PASSING) return false and stay on the single-
+/// materialization fast path.
+pub fn jsontable_is_correlated(jt: &crate::ast::JsonTable) -> bool {
+    doc_has_column_refs(&jt.doc) || jt.passing.iter().any(|(expr, _)| doc_has_column_refs(expr))
+}
+
 pub fn doc_has_column_refs(expr: &crate::expr::Expr) -> bool {
     use crate::expr::Expr;
     match expr {

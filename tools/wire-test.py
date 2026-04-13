@@ -3282,6 +3282,51 @@ ok("11.20d2 OUTER APPLY preserves left on empty",
    rows == ((1, None), (2, None), (3, None)),
    f"got {rows}")
 
+# ── Phase 11.20d3 — LATERAL-correlated JSON_TABLE ─────────────────────────────
+
+print("\n[11.20d3 JSON_TABLE LATERAL correlation]")
+
+cur.execute("CREATE TABLE d3_orders (id INT PRIMARY KEY, payload TEXT)")
+cur.execute("""INSERT INTO d3_orders VALUES
+               (1, '{"items":[{"qty":1},{"qty":2}]}'),
+               (2, '{"items":[{"qty":10}]}'),
+               (3, '{"items":[]}')""")
+
+# 1. CROSS APPLY with correlated doc — re-materialize per outer row.
+cur.execute("""SELECT o.id, j.qty FROM d3_orders o
+                 CROSS APPLY JSON_TABLE(o.payload, '$.items[*]'
+                              COLUMNS (qty INT PATH '$.qty')) AS j
+                 ORDER BY o.id, j.qty""")
+rows = cur.fetchall()
+ok("11.20d3 CROSS APPLY correlated doc",
+   rows == ((1, 1), (1, 2), (2, 10)),
+   f"got {rows}")
+
+# 2. OUTER APPLY with correlated doc — NULL-pad outer rows with empty JT.
+cur.execute("""SELECT o.id, j.qty FROM d3_orders o
+                 OUTER APPLY JSON_TABLE(o.payload, '$.items[*]'
+                              COLUMNS (qty INT PATH '$.qty')) AS j
+                 ORDER BY o.id""")
+rows = cur.fetchall()
+id3_preserved = any(r[0] == 3 and r[1] is None for r in rows)
+ok("11.20d3 OUTER APPLY correlated doc preserves left on empty",
+   len(rows) == 4 and id3_preserved,
+   f"got {rows}")
+
+# 3. Correlated PASSING — outer column drives a JSONPath filter variable.
+cur.execute("CREATE TABLE d3_cfg (id INT, lo INT)")
+cur.execute("INSERT INTO d3_cfg VALUES (1, 2), (2, 5)")
+cur.execute("""SELECT c.id, j.v FROM d3_cfg c
+                 CROSS APPLY JSON_TABLE('[1,2,3,4,5,6]', '$[?(@ > $threshold)]'
+                              PASSING c.lo AS threshold
+                              COLUMNS (v INT PATH '$')) AS j
+                 ORDER BY c.id, j.v""")
+rows = cur.fetchall()
+# id=1 lo=2 → 3,4,5,6 (4 rows); id=2 lo=5 → 6 (1 row); total 5.
+ok("11.20d3 PASSING outer column into filter",
+   len(rows) == 5,
+   f"got {rows}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

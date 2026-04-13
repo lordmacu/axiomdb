@@ -469,14 +469,16 @@ fn execute_select_json_table_source(
         _ => unreachable!("execute_select_json_table_source called with non-JsonTable FROM"),
     };
 
-    // Defensive: first-FROM JSON_TABLE doc cannot reference outer columns by
-    // definition (no outer source). Any column refs escaped 11.20a binding →
-    // raise the same deferred-11.20d3 message the JOIN right-side path uses.
-    if crate::json_table::doc_has_column_refs(&jt_ast.doc) {
-        return Err(DbError::NotImplemented {
-            feature: "correlated JSON_TABLE in a JOIN (LATERAL semantics) — \
-                      deferred to 11.20d"
+    // First-FROM JSON_TABLE has no outer source, so correlated `doc` or PASSING
+    // expressions cannot resolve. Reject with a clear semantic error (Phase
+    // 11.20d3 — supersedes the earlier "deferred" placeholder).
+    if crate::json_table::jsontable_is_correlated(&jt_ast) {
+        return Err(DbError::ParseError {
+            message: "correlated JSON_TABLE requires an outer FROM source — \
+                      doc / PASSING expressions cannot reference outer columns \
+                      when JSON_TABLE is the first FROM entry"
                 .into(),
+            position: None,
         });
     }
 

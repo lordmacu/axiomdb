@@ -494,7 +494,6 @@ columnas non-TEXT (`ParseError` con mensaje explicito).
 
 ### Pendiente 11.20d
 
-- 11.20d3: LATERAL correlacion (doc/PASSING referencia columnas outer).
 - 11.20d4: JSON_TABLE como source UPDATE/DELETE. MERGE diferido hasta
   que MERGE mismo aterrice.
 
@@ -565,7 +564,93 @@ columnas non-TEXT (`ParseError` con mensaje explicito).
 
 ### Pendiente 11.20d
 
-- 11.20d3: LATERAL correlacion (doc/PASSING referencia columnas
-  outer) + keyword `LATERAL`.
+- 11.20d4: JSON_TABLE como source UPDATE/DELETE. MERGE diferido
+  hasta que MERGE mismo aterrice.
+
+## Subfase 11.20d3 — LATERAL-correlated JSON_TABLE
+
+### Nuevo
+
+- `doc` correlacionado: `CROSS APPLY JSON_TABLE(t.payload, ...)`
+  re-materializa JSON_TABLE una vez por fila outer.
+- PASSING correlacionado: `PASSING t.col AS var` resuelve `t.col`
+  contra cada fila outer; `$var` en row/column/NESTED paths y en
+  filtros se substituye con el valor outer correspondiente.
+- `LATERAL` keyword aceptado como no-op antes de `JSON_TABLE(...)`
+  y antes de subqueries en FROM / right-source de JOIN. Semantica
+  LATERAL ya es implicita en AxiomDB para JSON_TABLE; el keyword
+  existe por paridad con PG.
+- Semantica por join-type:
+  - INNER / CROSS JOIN / CROSS APPLY → emit solo matches ON.
+  - LEFT JOIN / OUTER APPLY → NULL-pad cuando el doc da 0 rows.
+  - RIGHT JOIN / FULL JOIN → `NotImplemented` (PG tambien rechaza;
+    outer re-scan ill-defined).
+
+### Implementacion
+
+- `analyzer_stmt.rs`:
+  - `resolve_json_table` ahora resuelve `jt.passing` exprs contra
+    el mismo scope que `jt.doc`.
+  - El loop de joins rutea `FromClause::JsonTable` a
+    `resolve_json_table` — antes solo first-FROM JT se resolvia;
+    join-side JT quedaba sin bindings (los literales de 11.20d1
+    funcionaban por accidente).
+- `lexer.rs`: `Token::Lateral` case-insensitive.
+- `parser/dml.rs::parse_from_item`: consume `LATERAL` opcional al
+  entrar. Cubre `FROM LATERAL X`, `JOIN LATERAL X`,
+  `LATERAL (SELECT ...)` naturalmente.
+- `json_table.rs::jsontable_is_correlated(jt)`:
+  `doc_has_column_refs(doc) ||
+   jt.passing.iter().any(|(e,_)| doc_has_column_refs(e))`.
+- `executor/select_joins_ctx.rs`: tracker paralelo
+  `correlated_jt: Vec<Option<JsonTableSpec>>`. Non-correlated →
+  `None` + materializacion one-shot (igual que antes). Correlated
+  → `Some(spec)` + `scanned[i] = Vec::new()` como placeholder. El
+  combine loop dispatcha segun el tracker.
+- `executor/joins.rs::apply_correlated_jt_join`: per-outer-row
+  loop. `eval(doc, outer)` → `doc_to_serde` →
+  `materialize_json_table(spec, &sj, outer, &mut NoSubquery)` →
+  iterar right_rows y evaluar ON. LEFT/OUTER APPLY null-pad al
+  final si no hubo matches. RIGHT/FULL: error al principio.
+- `executor/select_core.rs::execute_select_json_table_source`:
+  first-FROM correlated guard usa `jsontable_is_correlated` y da
+  `ParseError` ("correlated JSON_TABLE requires an outer FROM
+  source") en lugar del placeholder anterior.
+
+### Cobertura
+
+- `tests/integration_json_table_correlated.rs` — 13 tests nuevos
+  (CROSS APPLY basico, OUTER APPLY empty-preserve, INNER con ON,
+  LEFT null-pad, PASSING una var, PASSING dos vars en rango,
+  correlated NULL doc, correlated + NESTED PATH, LATERAL sobre
+  JOIN, LATERAL sobre first-FROM non-correlated, RIGHT/FULL
+  rechazados, first-FROM correlated rechazado).
+- `tests/integration_json_table.rs::correlated_doc_in_join_is_rejected_11_20a`
+  → `correlated_doc_in_join_works_11_20d3` (flipeado a
+  assert-success).
+- Regresion 11.20a/b/c/d1/d2: limpia.
+- Wire smoke 379/379 (3 aserciones nuevas `[11.20d3]`).
+
+### Limitaciones conocidas
+
+- Hash-join / spill optimization NO se aplica a JSON_TABLE
+  correlado (siempre nested-loop). Aceptable.
+- `PASSING` con subqueries anidados (e.g. `PASSING (SELECT ...)
+  AS v`) usa `NoSubquery` runner → no soportado aun.
+- `LATERAL` sobre subqueries con correlacion real (no
+  JSON_TABLE) queda para una subphase separada — requiere exponer
+  outer_scopes al analyzer del derived SELECT.
+
+### Cross-engine
+
+- **PostgreSQL**: `JOIN LATERAL` — AxiomDB matchea para
+  JSON_TABLE; LATERAL keyword no-op.
+- **SQL Server / Sybase / Oracle 12c+**: `CROSS APPLY` / `OUTER
+  APPLY` — AxiomDB iguala.
+- **PG** rechaza `RIGHT JOIN LATERAL` y `FULL JOIN LATERAL` por la
+  misma razon que nosotros.
+
+### Pendiente 11.20d
+
 - 11.20d4: JSON_TABLE como source UPDATE/DELETE. MERGE diferido
   hasta que MERGE mismo aterrice.
