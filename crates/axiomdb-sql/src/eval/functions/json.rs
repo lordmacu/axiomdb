@@ -705,6 +705,28 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
         }
 
+        // ── Phase 11.24d: Oracle JSON_DATAGUIDE ──────────────────────────────
+        // JSON_DATAGUIDE(doc) → JSON array of {path, type} entries describing
+        // every reachable subpath and its JSON type. Compact Oracle-Data-Guide
+        // analog. NULL doc → NULL. Format-spec args (ORDERED, FORMAT) accepted
+        // but ignored in MVP.
+        "json_dataguide" => {
+            if args.is_empty() || args.len() > 3 {
+                return Err(DbError::TypeMismatch {
+                    expected: "json_dataguide: 1 to 3 args".into(),
+                    got: args.len().to_string(),
+                });
+            }
+            let doc = eval_arg(args, 0, row, name)?;
+            if matches!(doc, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let sj = value_to_serde_json(&doc)?;
+            let mut entries = Vec::<serde_json::Value>::new();
+            json_dataguide_walk(&sj, "$", &mut entries);
+            Ok(Value::Json(serde_json::Value::Array(entries).to_string()))
+        }
+
         // ── Phase 11.24b: JSON_TRANSFORM (function-form variadic) ───────────
         // Syntax (function-form, not Oracle special-form):
         //   JSON_TRANSFORM(doc, 'SET', path, val, 'REMOVE', path,
@@ -2944,6 +2966,45 @@ fn json_array_append_at(root: &mut serde_json::Value, parts: &[String], val: ser
             let taken = std::mem::replace(other, serde_json::Value::Null);
             *other = serde_json::Value::Array(vec![taken, val]);
         }
+    }
+}
+
+fn json_node_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                "integer"
+            } else {
+                "number"
+            }
+        }
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn json_dataguide_walk(node: &serde_json::Value, path: &str, out: &mut Vec<serde_json::Value>) {
+    out.push(serde_json::json!({
+        "path": path,
+        "type": json_node_type_name(node),
+    }));
+    match node {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let sub = format!("{path}.{k}");
+                json_dataguide_walk(v, &sub, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for (i, v) in arr.iter().enumerate() {
+                let sub = format!("{path}[{i}]");
+                json_dataguide_walk(v, &sub, out);
+            }
+        }
+        _ => {}
     }
 }
 
