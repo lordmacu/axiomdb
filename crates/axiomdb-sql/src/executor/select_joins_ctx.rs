@@ -52,6 +52,8 @@ fn execute_select_with_joins_first_materialized(
     // JSON_TABLE that must be re-evaluated per outer row during the
     // combine loop.
     let mut correlated_jt: Vec<Option<crate::json_table::JsonTableSpec>> = vec![None];
+    // Phase 11.25a: parallel tracker for correlated JSONB SRFs.
+    let mut correlated_srf: Vec<Option<crate::ast::JsonbSrfKind>> = vec![None];
     let mut running_offset = 0usize;
     let snap = conn_txn
         .map(|c| txn.active_snapshot(c))
@@ -74,6 +76,7 @@ fn execute_select_with_joins_first_materialized(
                     all_sources.push(join_source_schema_from_resolved(tref, &jt));
                     scanned.push(rows.into_iter().map(|(_, r)| r).collect());
                     correlated_jt.push(None);
+                    correlated_srf.push(None);
                 }
                 FromClause::Subquery { query, alias } => {
                     let inner_result =
@@ -91,6 +94,7 @@ fn execute_select_with_joins_first_materialized(
                     all_sources.push(join_source_schema_from_derived(alias, columns));
                     scanned.push(rows);
                     correlated_jt.push(None);
+                    correlated_srf.push(None);
                 }
                 // Phase 11.20a/d3 — JSON_TABLE on the right side of a JOIN.
                 // Non-correlated doc: evaluate once with an empty row, materialize,
@@ -103,10 +107,9 @@ fn execute_select_with_joins_first_materialized(
                     running_offset += column_metas.len();
                     all_sources.push(join_source_schema_from_derived(&spec.alias, column_metas));
                     if crate::json_table::jsontable_is_correlated(jt) {
-                        // Placeholder — the real rows are produced per outer row
-                        // in the combine loop below.
                         scanned.push(Vec::new());
                         correlated_jt.push(Some(spec));
+                        correlated_srf.push(None);
                     } else {
                         let doc_val = crate::eval::eval(&jt.doc, &[])?;
                         let rows = match crate::json_table::doc_to_serde(&doc_val)? {
@@ -118,6 +121,26 @@ fn execute_select_with_joins_first_materialized(
                         };
                         scanned.push(rows);
                         correlated_jt.push(None);
+                        correlated_srf.push(None);
+                    }
+                }
+                // Phase 11.25a — JSONB SRF (jsonb_each, etc.) on the right side.
+                FromClause::JsonbSrf(srf) => {
+                    let alias = crate::jsonb_srf::srf_alias(srf);
+                    let column_metas = crate::jsonb_srf::column_metas_for_srf(srf.kind, &alias);
+                    col_offsets.push(running_offset);
+                    running_offset += column_metas.len();
+                    all_sources.push(join_source_schema_from_derived(&alias, column_metas));
+                    if crate::jsonb_srf::srf_is_correlated(srf) {
+                        scanned.push(Vec::new());
+                        correlated_jt.push(None);
+                        correlated_srf.push(Some(srf.kind));
+                    } else {
+                        let doc_val = crate::eval::eval(&srf.doc, &[])?;
+                        let rows = crate::jsonb_srf::materialize_jsonb_srf(srf.kind, &doc_val)?;
+                        scanned.push(rows);
+                        correlated_jt.push(None);
+                        correlated_srf.push(None);
                     }
                 }
             }
@@ -140,8 +163,7 @@ fn execute_select_with_joins_first_materialized(
         let right_col_offset = col_offsets[right_idx];
 
         combined_rows = if let Some(spec) = correlated_jt[right_idx].as_ref() {
-            // Phase 11.20d3 — correlated JSON_TABLE right side. Extract the
-            // original AST to access `doc` / `passing` expressions.
+            // Phase 11.20d3 — correlated JSON_TABLE right side.
             let jt_ast = match &stmt.joins[i].table {
                 FromClause::JsonTable(j) => j.as_ref(),
                 _ => unreachable!("correlated_jt set but AST is not JsonTable"),
@@ -150,6 +172,23 @@ fn execute_select_with_joins_first_materialized(
                 combined_rows,
                 jt_ast,
                 spec,
+                &all_sources[right_idx].columns,
+                right_col_count,
+                join.join_type,
+                &join.condition,
+                &left_schema,
+                right_col_offset,
+            )?
+        } else if let Some(kind) = correlated_srf[right_idx] {
+            // Phase 11.25a — correlated JSONB SRF right side.
+            let srf_ast = match &stmt.joins[i].table {
+                FromClause::JsonbSrf(s) => s.as_ref(),
+                _ => unreachable!("correlated_srf set but AST is not JsonbSrf"),
+            };
+            apply_correlated_srf_join(
+                combined_rows,
+                kind,
+                &srf_ast.doc,
                 &all_sources[right_idx].columns,
                 right_col_count,
                 join.join_type,

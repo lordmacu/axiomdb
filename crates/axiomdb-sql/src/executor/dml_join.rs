@@ -285,6 +285,8 @@ fn collect_dml_join_candidates_ctx(
     // right sources. None → right side is already in scanned[i]; Some(spec)
     // → placeholder scanned[i] and per-outer-row re-materialization.
     let mut correlated_jt: Vec<Option<crate::json_table::JsonTableSpec>> = vec![None];
+    // Phase 11.25a: same for JSONB SRFs.
+    let mut correlated_srf: Vec<Option<crate::ast::JsonbSrfKind>> = vec![None];
     let mut running_offset = 0usize;
 
     let from_t = resolve_table_cached(storage, txn, ctx, conn_txn, from_ref)?;
@@ -317,6 +319,7 @@ fn collect_dml_join_candidates_ctx(
                 all_sources.push(join_source_schema_from_resolved(tref, &jt));
                 scanned.push(dml_source_rows(rows, is_target));
                 correlated_jt.push(None);
+                correlated_srf.push(None);
             }
             FromClause::Subquery { query, alias } => {
                 let inner_result = execute_select_ctx((**query).clone(), exec_ctx, conn_txn, ctx)?;
@@ -336,6 +339,7 @@ fn collect_dml_join_candidates_ctx(
                     target: None,
                 }).collect());
                 correlated_jt.push(None);
+                correlated_srf.push(None);
             }
             // Phase 11.20d4 — JSON_TABLE as DML right-side source.
             FromClause::JsonTable(jt) => {
@@ -364,6 +368,30 @@ fn collect_dml_join_candidates_ctx(
                             .collect(),
                     );
                     correlated_jt.push(None);
+                    correlated_srf.push(None);
+                }
+            }
+            // Phase 11.25a — JSONB SRF as DML JOIN right-side source.
+            FromClause::JsonbSrf(srf) => {
+                let alias = crate::jsonb_srf::srf_alias(srf);
+                let column_metas = crate::jsonb_srf::column_metas_for_srf(srf.kind, &alias);
+                col_offsets.push(running_offset);
+                running_offset += column_metas.len();
+                all_sources.push(join_source_schema_from_derived(&alias, column_metas));
+                if crate::jsonb_srf::srf_is_correlated(srf) {
+                    scanned.push(Vec::new());
+                    correlated_jt.push(None);
+                    correlated_srf.push(Some(srf.kind));
+                } else {
+                    let doc_val = crate::eval::eval(&srf.doc, &[])?;
+                    let rows = crate::jsonb_srf::materialize_jsonb_srf(srf.kind, &doc_val)?;
+                    scanned.push(
+                        rows.into_iter()
+                            .map(|values| DmlJoinRow { values, target: None })
+                            .collect(),
+                    );
+                    correlated_jt.push(None);
+                    correlated_srf.push(None);
                 }
             }
         }
@@ -391,6 +419,22 @@ fn collect_dml_join_candidates_ctx(
                 combined_rows,
                 jt_ast,
                 spec,
+                &all_sources[right_idx].columns,
+                right_col_count,
+                join.join_type,
+                &join.condition,
+                &left_schema,
+                right_col_offset,
+            )?
+        } else if let Some(kind) = correlated_srf[right_idx] {
+            let srf_ast = match &joins[i].table {
+                FromClause::JsonbSrf(s) => s.as_ref(),
+                _ => unreachable!("correlated_srf set but AST is not JsonbSrf"),
+            };
+            apply_correlated_srf_dml_join(
+                combined_rows,
+                kind,
+                &srf_ast.doc,
                 &all_sources[right_idx].columns,
                 right_col_count,
                 join.join_type,
@@ -720,5 +764,61 @@ fn apply_correlated_jt_dml_join(
         }
     }
 
+    Ok(out)
+}
+
+/// Phase 11.25a — DML variant of `apply_correlated_srf_join`. Per-outer-row
+/// re-materialization of a correlated JSONB SRF on the right side of an
+/// UPDATE/DELETE JOIN. `DmlJoinRow` propagates the target RID from the
+/// outer; SRF rows contribute values only (target=None).
+#[allow(clippy::too_many_arguments)]
+fn apply_correlated_srf_dml_join(
+    left_rows: Vec<DmlJoinRow>,
+    kind: crate::ast::JsonbSrfKind,
+    doc_expr: &crate::expr::Expr,
+    right_columns: &[ColumnMeta],
+    right_col_count: usize,
+    join_type: JoinType,
+    condition: &JoinCondition,
+    left_schema: &[(String, usize)],
+    right_col_offset: usize,
+) -> Result<Vec<DmlJoinRow>, DbError> {
+    if matches!(join_type, JoinType::Right | JoinType::Full) {
+        return Err(DbError::NotImplemented {
+            feature: "RIGHT/FULL JOIN on correlated JSONB SRF in UPDATE/DELETE \
+                      — PG-compatible rejection"
+                .into(),
+        });
+    }
+    let null_right = DmlJoinRow {
+        values: vec![Value::Null; right_col_count],
+        target: None,
+    };
+    let mut out: Vec<DmlJoinRow> = Vec::with_capacity(left_rows.len());
+    for outer in &left_rows {
+        let doc_val = crate::eval::eval(doc_expr, &outer.values)?;
+        let rows = crate::jsonb_srf::materialize_jsonb_srf(kind, &doc_val)?;
+        let mut matched = false;
+        for values in &rows {
+            let right = DmlJoinRow {
+                values: values.clone(),
+                target: None,
+            };
+            let combined = concat_dml_join_rows(outer, &right);
+            if eval_join_cond(
+                condition,
+                &combined.values,
+                left_schema,
+                right_col_offset,
+                right_columns,
+            )? {
+                out.push(combined);
+                matched = true;
+            }
+        }
+        if !matched && matches!(join_type, JoinType::Left) {
+            out.push(concat_dml_join_rows(outer, &null_right));
+        }
+    }
     Ok(out)
 }

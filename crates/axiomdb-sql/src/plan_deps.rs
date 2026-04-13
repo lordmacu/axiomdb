@@ -306,6 +306,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 }
                 Ok(())
             }
+            FromClause::JsonbSrf(srf) => self.visit_expr(&srf.doc),
         }
     }
 

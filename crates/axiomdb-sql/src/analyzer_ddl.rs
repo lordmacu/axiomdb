@@ -93,6 +93,14 @@ fn analyze_update(
                 *expr = resolve_expr(taken, &ctx)?;
             }
         }
+        // Phase 11.25a: resolve JSONB SRF doc for UPDATE join sources.
+        if let FromClause::JsonbSrf(srf) = &mut join.table {
+            let taken = std::mem::replace(
+                &mut srf.doc,
+                Expr::Literal(axiomdb_types::Value::Null),
+            );
+            srf.doc = resolve_expr(taken, &ctx)?;
+        }
         join.condition = match join.condition {
             JoinCondition::On(expr) => JoinCondition::On(resolve_expr(expr, &ctx)?),
             JoinCondition::Using(cols) => JoinCondition::Using(cols),
@@ -181,6 +189,13 @@ fn analyze_delete(
                 let taken = std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
                 *expr = resolve_expr(taken, &ctx)?;
             }
+        }
+        if let FromClause::JsonbSrf(srf) = &mut join.table {
+            let taken = std::mem::replace(
+                &mut srf.doc,
+                Expr::Literal(axiomdb_types::Value::Null),
+            );
+            srf.doc = resolve_expr(taken, &ctx)?;
         }
         join.condition = match join.condition {
             JoinCondition::On(expr) => JoinCondition::On(resolve_expr(expr, &ctx)?),

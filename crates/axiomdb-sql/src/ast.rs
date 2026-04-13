@@ -223,6 +223,49 @@ pub enum FromClause {
     /// `JSON_TABLE(doc, '$.path' COLUMNS (...)) [AS alias]` — SQL:2016
     /// table-valued function (Phase 11.20a, flat subset).
     JsonTable(Box<JsonTable>),
+    /// Phase 11.25a — PostgreSQL-compatible JSONB set-returning functions:
+    /// `jsonb_each`, `jsonb_each_text`, `jsonb_object_keys`,
+    /// `jsonb_array_elements`, `jsonb_array_elements_text`.
+    JsonbSrf(Box<JsonbSrf>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonbSrfKind {
+    Each,
+    EachText,
+    ObjectKeys,
+    ArrayElements,
+    ArrayElementsText,
+}
+
+impl JsonbSrfKind {
+    pub fn from_fn_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "jsonb_each" => Some(Self::Each),
+            "jsonb_each_text" => Some(Self::EachText),
+            "jsonb_object_keys" => Some(Self::ObjectKeys),
+            "jsonb_array_elements" => Some(Self::ArrayElements),
+            "jsonb_array_elements_text" => Some(Self::ArrayElementsText),
+            _ => None,
+        }
+    }
+
+    pub fn fn_name(self) -> &'static str {
+        match self {
+            Self::Each => "jsonb_each",
+            Self::EachText => "jsonb_each_text",
+            Self::ObjectKeys => "jsonb_object_keys",
+            Self::ArrayElements => "jsonb_array_elements",
+            Self::ArrayElementsText => "jsonb_array_elements_text",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonbSrf {
+    pub kind: JsonbSrfKind,
+    pub doc: Expr,
+    pub alias: Option<String>,
 }
 
 /// `JSON_TABLE(doc, row_path [PASSING ...] COLUMNS (...))` — SQL:2016

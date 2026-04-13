@@ -315,6 +315,28 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
         }
     }
 
+    // Phase 11.25a — PostgreSQL JSONB set-returning functions in FROM.
+    if let Token::Ident(s) = p.peek() {
+        if let Some(kind) = crate::ast::JsonbSrfKind::from_fn_name(s) {
+            if matches!(p.peek_at(1), Token::LParen) {
+                p.advance(); // consume function name
+                p.expect(&Token::LParen)?;
+                let doc = crate::parser::expr::parse_expr(p)?;
+                p.expect(&Token::RParen)?;
+                let alias = if p.eat(&Token::As) || is_implicit_alias_token(p.peek()) {
+                    Some(p.parse_identifier()?)
+                } else {
+                    None
+                };
+                return Ok(FromClause::JsonbSrf(Box::new(crate::ast::JsonbSrf {
+                    kind,
+                    doc,
+                    alias,
+                })));
+            }
+        }
+    }
+
     // Regular table reference
     let mut table_ref = p.parse_table_ref()?;
 
@@ -719,7 +741,7 @@ fn parse_update(p: &mut Parser) -> Result<Stmt, DbError> {
     let from = parse_from_item(p)?;
     let table = match from {
         FromClause::Table(table) => table,
-        FromClause::Subquery { .. } | FromClause::JsonTable(_) => {
+        FromClause::Subquery { .. } | FromClause::JsonTable(_) | FromClause::JsonbSrf(_) => {
             return Err(DbError::ParseError {
                 message: "UPDATE target must be a table".into(),
                 position: Some(p.current_pos()),
@@ -780,7 +802,7 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
         let from = parse_from_item(p)?;
         let table = match from {
             FromClause::Table(table) => table,
-            FromClause::Subquery { .. } | FromClause::JsonTable(_) => {
+            FromClause::Subquery { .. } | FromClause::JsonTable(_) | FromClause::JsonbSrf(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE target must be a table".into(),
                     position: Some(p.current_pos()),
@@ -794,7 +816,7 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
         let from = parse_from_item(p)?;
         let table = match from {
             FromClause::Table(table) => table,
-            FromClause::Subquery { .. } | FromClause::JsonTable(_) => {
+            FromClause::Subquery { .. } | FromClause::JsonTable(_) | FromClause::JsonbSrf(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE FROM source must be a table".into(),
                     position: Some(p.current_pos()),

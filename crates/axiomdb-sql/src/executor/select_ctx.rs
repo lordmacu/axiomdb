@@ -26,9 +26,14 @@ fn execute_select_ctx(
         return execute_select(stmt, storage, txn, conn_txn);
     }
 
+    // JSONB SRF in FROM (Phase 11.25a): no caching path — delegate.
+    if matches!(stmt.from, Some(FromClause::JsonbSrf(_))) {
+        return execute_select(stmt, storage, txn, conn_txn);
+    }
+
     let from_table_ref = match stmt.from.take() {
         Some(FromClause::Table(tref)) => tref,
-        _ => unreachable!("already handled None, Subquery, and JsonTable above"),
+        _ => unreachable!("already handled None, Subquery, JsonTable, JsonbSrf above"),
     };
 
     // INFORMATION_SCHEMA virtual tables (4.20c).

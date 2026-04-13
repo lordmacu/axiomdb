@@ -65,10 +65,15 @@ fn execute_select(
         return execute_select_json_table_source(stmt, storage, txn, conn_txn);
     }
 
+    // JSONB SRF in FROM (Phase 11.25a).
+    if matches!(stmt.from, Some(FromClause::JsonbSrf(_))) {
+        return execute_select_jsonb_srf_source(stmt, storage, txn, conn_txn);
+    }
+
     // Extract the FROM table reference.
     let from_table_ref = match stmt.from.take() {
         Some(FromClause::Table(tref)) => tref,
-        _ => unreachable!("already handled None, Subquery, and JsonTable above"),
+        _ => unreachable!("already handled None, Subquery, JsonTable, JsonbSrf above"),
     };
 
     // INFORMATION_SCHEMA virtual tables (4.20c).
@@ -554,6 +559,110 @@ fn execute_select_json_table_source(
     }
 
     // Projection + distinct + limit/offset.
+    let out_cols = build_derived_output_columns(&stmt.columns, &derived_cols)?;
+    let mut rows = combined_rows
+        .iter()
+        .map(|v| project_row(&stmt.columns, v))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if stmt.distinct {
+        rows = apply_distinct_with_session(rows);
+    }
+    if stmt.calc_found_rows {
+        set_found_rows(rows.len() as u64);
+    }
+    rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
+
+    Ok(QueryResult::Rows {
+        columns: out_cols,
+        rows,
+    })
+}
+
+/// Phase 11.25a — SELECT whose FROM clause is a JSONB set-returning
+/// function (`jsonb_each`, `jsonb_object_keys`, etc.).
+fn execute_select_jsonb_srf_source(
+    mut stmt: SelectStmt,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    _conn_txn: Option<&ConnectionTxn>,
+) -> Result<QueryResult, DbError> {
+    let srf = match stmt.from.take() {
+        Some(FromClause::JsonbSrf(s)) => *s,
+        _ => unreachable!("execute_select_jsonb_srf_source called with non-JsonbSrf FROM"),
+    };
+
+    if crate::jsonb_srf::srf_is_correlated(&srf) {
+        return Err(DbError::ParseError {
+            message: format!(
+                "correlated {} requires an outer FROM source — doc cannot \
+                 reference outer columns when {} is the first FROM entry",
+                srf.kind.fn_name(),
+                srf.kind.fn_name(),
+            ),
+            position: None,
+        });
+    }
+
+    let alias = crate::jsonb_srf::srf_alias(&srf);
+    let doc_val = crate::eval::eval(&srf.doc, &[])?;
+    let derived_rows = crate::jsonb_srf::materialize_jsonb_srf(srf.kind, &doc_val)?;
+    let derived_cols = crate::jsonb_srf::column_metas_for_srf(srf.kind, &alias);
+
+    if !stmt.joins.is_empty() {
+        let mut temp_ctx = SessionContext::new();
+        let temp_bloom = crate::bloom::BloomRegistry::new();
+        let temp_exec_ctx = ExecutionContext::new(storage, txn, &temp_bloom, None);
+        let first_source = join_source_schema_from_derived(&alias, derived_cols);
+        return execute_select_with_joins_first_materialized(
+            stmt,
+            first_source,
+            derived_rows,
+            &temp_exec_ctx,
+            _conn_txn,
+            &mut temp_ctx,
+        );
+    }
+
+    let mut combined_rows: Vec<Row> = Vec::new();
+    let mut sq_cache: SubqueryCache = HashMap::new();
+    let mut in_set_cache: InSetCache = HashMap::new();
+    let mut corr_cache: CorrelatedCache = HashMap::new();
+    for values in derived_rows {
+        if let Some(ref wc) = stmt.where_clause {
+            let mut temp_ctx2 = SessionContext::new();
+            let temp_bloom2 = crate::bloom::BloomRegistry::new();
+            let mut runner = ExecSubqueryRunner {
+                storage,
+                txn,
+                bloom: &temp_bloom2,
+                ctx: &mut temp_ctx2,
+                outer_row: &values,
+                cache: Some(&mut sq_cache),
+                in_set_cache: Some(&mut in_set_cache),
+                correlated_cache: Some(&mut corr_cache),
+                materialized: None,
+            };
+            if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
+                continue;
+            }
+        }
+        combined_rows.push(values);
+    }
+
+    if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
+        return execute_select_grouped(stmt, combined_rows, GroupByStrategy::Hash);
+    }
+
+    let resolved_ob = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
+    if !resolved_ob.is_empty() && stmt.limit.is_some() && !stmt.distinct && !stmt.calc_found_rows {
+        let (limit_n, offset_n) = eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
+        let top_n = offset_n + limit_n.unwrap_or(usize::MAX).min(usize::MAX - offset_n);
+        combined_rows = apply_order_by_top_n(combined_rows, &resolved_ob, top_n)?;
+    } else {
+        combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
+    }
+
     let out_cols = build_derived_output_columns(&stmt.columns, &derived_cols)?;
     let mut rows = combined_rows
         .iter()

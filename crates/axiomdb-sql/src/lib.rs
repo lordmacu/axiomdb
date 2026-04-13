@@ -24,6 +24,7 @@ pub mod index_integrity;
 pub mod index_maintenance;
 pub mod information_schema;
 pub mod json_table;
+pub mod jsonb_srf;
 pub mod key_encoding;
 pub mod lexer;
 pub mod parser;
