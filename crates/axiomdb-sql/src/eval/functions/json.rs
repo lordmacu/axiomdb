@@ -1848,6 +1848,11 @@ fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> 
                 Err(_) => return false,
             }
         }
+        if let Some(fmt) = obj.get("format").and_then(|v| v.as_str()) {
+            if !schema_format_matches(fmt, s) {
+                return false;
+            }
+        }
     }
     if let Some(arr) = doc.as_array() {
         if let Some(m) = obj.get("minItems").and_then(|v| v.as_u64()) {
@@ -1900,18 +1905,82 @@ fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> 
                 }
             }
         }
-        if let Some(props) = obj.get("properties").and_then(|v| v.as_object()) {
-            for (k, sub) in props {
-                if let Some(v) = map.get(k) {
-                    if !json_schema_validate(sub, v) {
-                        return false;
-                    }
+        let empty_props = serde_json::Map::new();
+        let props = obj
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .unwrap_or(&empty_props);
+        let pattern_props = obj
+            .get("patternProperties")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let compiled_pp: Vec<(regex::Regex, serde_json::Value)> = pattern_props
+            .iter()
+            .filter_map(|(k, v)| regex::Regex::new(k).ok().map(|re| (re, v.clone())))
+            .collect();
+
+        for (k, sub) in props {
+            if let Some(v) = map.get(k) {
+                if !json_schema_validate(sub, v) {
+                    return false;
                 }
             }
-            if let Some(ap) = obj.get("additionalProperties") {
-                if let Some(false) = ap.as_bool() {
+        }
+        for (k, v) in map {
+            for (re, sub) in &compiled_pp {
+                if re.is_match(k) && !json_schema_validate(sub, v) {
+                    return false;
+                }
+            }
+        }
+        if let Some(ap) = obj.get("additionalProperties") {
+            let is_additional = |k: &str| {
+                !props.contains_key(k) && !compiled_pp.iter().any(|(re, _)| re.is_match(k))
+            };
+            match ap {
+                serde_json::Value::Bool(false) => {
                     for k in map.keys() {
-                        if !props.contains_key(k) {
+                        if is_additional(k) {
+                            return false;
+                        }
+                    }
+                }
+                serde_json::Value::Object(_) | serde_json::Value::Bool(true) => {
+                    for (k, v) in map {
+                        if is_additional(k) && !json_schema_validate(ap, v) {
+                            return false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(pn) = obj.get("propertyNames") {
+            for k in map.keys() {
+                let kv = serde_json::Value::String(k.clone());
+                if !json_schema_validate(pn, &kv) {
+                    return false;
+                }
+            }
+        }
+        if let Some(deps) = obj.get("dependencies").and_then(|v| v.as_object()) {
+            for (k, dep) in deps {
+                if !map.contains_key(k) {
+                    continue;
+                }
+                match dep {
+                    serde_json::Value::Array(keys) => {
+                        for r in keys {
+                            if let Some(rk) = r.as_str() {
+                                if !map.contains_key(rk) {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        if !json_schema_validate(dep, doc) {
                             return false;
                         }
                     }
@@ -1919,7 +1988,51 @@ fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> 
             }
         }
     }
+
+    if let Some(cond) = obj.get("if") {
+        let branch_key = if json_schema_validate(cond, doc) {
+            "then"
+        } else {
+            "else"
+        };
+        if let Some(branch) = obj.get(branch_key) {
+            if !json_schema_validate(branch, doc) {
+                return false;
+            }
+        }
+    }
+
     true
+}
+
+fn schema_format_matches(fmt: &str, s: &str) -> bool {
+    match fmt {
+        "email" => regex::Regex::new(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+            .map(|re| re.is_match(s))
+            .unwrap_or(false),
+        "uuid" => regex::Regex::new(
+            r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+        )
+        .map(|re| re.is_match(s))
+        .unwrap_or(false),
+        "date" => regex::Regex::new(r"^\d{4}-\d{2}-\d{2}$")
+            .map(|re| re.is_match(s))
+            .unwrap_or(false),
+        "date-time" | "datetime" => regex::Regex::new(
+            r"^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})?$",
+        )
+        .map(|re| re.is_match(s))
+        .unwrap_or(false),
+        "time" => regex::Regex::new(r"^\d{2}:\d{2}:\d{2}(\.\d+)?$")
+            .map(|re| re.is_match(s))
+            .unwrap_or(false),
+        "ipv4" => s.parse::<std::net::Ipv4Addr>().is_ok(),
+        "ipv6" => s.parse::<std::net::Ipv6Addr>().is_ok(),
+        "uri" => s.contains("://") && !s.contains(' '),
+        "regex" => regex::Regex::new(s).is_ok(),
+        // Unknown format → validation success (Draft-07 default: formats are annotations).
+        _ => true,
+    }
 }
 
 fn schema_type_matches(t: &serde_json::Value, doc: &serde_json::Value) -> bool {
