@@ -75,6 +75,12 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
             Ok(Value::Decimal(mantissa, scale))
         }
 
+        // ── Text → Date (ISO) ───────────────────────────────────────────────
+        (Value::Text(s), DataType::Date) => {
+            let days = parse_text_to_date_days(&s, mode)?;
+            Ok(Value::Date(days))
+        }
+
         // ── Temporal ──────────────────────────────────────────────────────────
         (Value::Date(days), DataType::Timestamp) => {
             // Convert days since epoch to microseconds since epoch (midnight UTC).

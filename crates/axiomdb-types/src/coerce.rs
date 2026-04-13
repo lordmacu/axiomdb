@@ -24,7 +24,7 @@
 //!
 //! ## What is NOT in scope
 //!
-//! - `Text → Date / Timestamp` parsing (requires chrono — Phase 4.19)
+//! - `Text → Date / Timestamp` parsing beyond simple ISO forms (Phase 4.19)
 //! - `Text → UUID` parsing (Phase 4.19)
 //! - `Text → Bool` conversion
 //! - `Real / Decimal → Int / BigInt` narrowing (requires explicit CAST — Phase 4.12b)
@@ -92,6 +92,38 @@ mod tests {
                 "Null should pass through for {target:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_coerce_text_to_date_iso() {
+        assert_eq!(
+            coerce(
+                Value::Text("1970-01-01".into()),
+                DataType::Date,
+                CoercionMode::Strict
+            )
+            .unwrap(),
+            Value::Date(0)
+        );
+        assert_eq!(
+            coerce(
+                Value::Text("1970-01-02".into()),
+                DataType::Date,
+                CoercionMode::Strict
+            )
+            .unwrap(),
+            Value::Date(1)
+        );
+        // Datetime string: time part ignored.
+        assert_eq!(
+            coerce(
+                Value::Text("1970-01-02 12:34:56".into()),
+                DataType::Date,
+                CoercionMode::Strict
+            )
+            .unwrap(),
+            Value::Date(1)
+        );
     }
 
     // ── Numeric widening ─────────────────────────────────────────────────────
@@ -491,9 +523,8 @@ mod tests {
 
     #[test]
     fn test_coerce_text_to_date_is_error() {
-        // Phase 4.19 — not implemented yet.
         let err = coerce(
-            Value::Text("2026-01-01".into()),
+            Value::Text("not-a-date".into()),
             DataType::Date,
             CoercionMode::Strict,
         )

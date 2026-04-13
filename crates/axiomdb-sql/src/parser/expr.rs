@@ -314,6 +314,22 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
             let right = parse_bitor(p)?;
             Ok(binop(BinaryOp::JsonExistsAll, left, right))
         }
+        // Phase 11.18c: #>, #>>, #-
+        Token::JsonPathExtract if !negated => {
+            p.advance();
+            let right = parse_bitor(p)?;
+            Ok(binop(BinaryOp::JsonPathExtract, left, right))
+        }
+        Token::JsonPathExtractText if !negated => {
+            p.advance();
+            let right = parse_bitor(p)?;
+            Ok(binop(BinaryOp::JsonPathExtractText, left, right))
+        }
+        Token::JsonPathDelete if !negated => {
+            p.advance();
+            let right = parse_bitor(p)?;
+            Ok(binop(BinaryOp::JsonPathDelete, left, right))
+        }
         cmp if !negated => {
             let op = match cmp {
                 Token::NullSafe => BinaryOp::NullSafe,

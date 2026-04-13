@@ -540,6 +540,9 @@ fn expr_to_sql_string(expr: &Expr) -> String {
                 BinaryOp::JsonbPathMatch => "@@",
                 BinaryOp::JsonExistsAny => "?|",
                 BinaryOp::JsonExistsAll => "?&",
+                BinaryOp::JsonPathExtract => "#>",
+                BinaryOp::JsonPathExtractText => "#>>",
+                BinaryOp::JsonPathDelete => "#-",
             };
             format!(
                 "({} {op_str} {})",

@@ -126,7 +126,19 @@ impl DoublewriteBuffer {
         }
 
         let slot_count = pages.len();
-        let total_size = DW_HEADER_SIZE + slot_count * DW_SLOT_SIZE + DW_FOOTER_SIZE;
+        if slot_count > u32::MAX as usize {
+            return Err(DbError::Other(format!(
+                "doublewrite: too many pages for one DW file: {slot_count}"
+            )));
+        }
+        let total_size = match dw_expected_size(slot_count) {
+            Some(n) => n,
+            None => {
+                return Err(DbError::Other(format!(
+                    "doublewrite: DW file size overflow (slot_count={slot_count})"
+                )))
+            }
+        };
 
         // Build the entire DW file in a single buffer for sequential I/O.
         let mut buf = vec![0u8; total_size];
@@ -204,21 +216,31 @@ impl DoublewriteBuffer {
             return Ok(0);
         }
 
-        let slot_count = u32::from_le_bytes(data[12..16].try_into().expect("4 bytes")) as usize;
+        let Some(slot_count) = dw_read_u32_le(&data, 12).map(|n| n as usize) else {
+            // Should not happen if validate() passed, but never trust on-disk bytes.
+            return Ok(0);
+        };
         let mut repaired = 0usize;
 
         for i in 0..slot_count {
-            let slot_offset = DW_HEADER_SIZE + i * DW_SLOT_SIZE;
+            let Some(slot_offset) = i
+                .checked_mul(DW_SLOT_SIZE)
+                .and_then(|n| DW_HEADER_SIZE.checked_add(n))
+            else {
+                return Ok(0);
+            };
 
-            let page_id = u64::from_le_bytes(
-                data[slot_offset..slot_offset + 8]
-                    .try_into()
-                    .expect("8 bytes"),
-            );
-            let dw_page_data = &data[slot_offset + 8..slot_offset + 8 + PAGE_SIZE];
+            let Some(page_id) = dw_read_u64_le(&data, slot_offset) else {
+                return Ok(0);
+            };
+            let Some(dw_page_data) = data.get(slot_offset + 8..slot_offset + 8 + PAGE_SIZE) else {
+                return Ok(0);
+            };
 
             // Read current page from main file.
-            let file_offset = page_id * PAGE_SIZE as u64;
+            let Some(file_offset) = page_id.checked_mul(PAGE_SIZE as u64) else {
+                return Ok(0);
+            };
             let mut current = [0u8; PAGE_SIZE];
             {
                 use std::os::unix::fs::FileExt;
@@ -230,7 +252,7 @@ impl DoublewriteBuffer {
             let stored_crc = u32::from_le_bytes(
                 current[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]
                     .try_into()
-                    .expect("4 bytes"),
+                    .unwrap(),
             );
             let actual_crc = crc32c::crc32c(&current[HEADER_SIZE..PAGE_SIZE]);
 
@@ -279,45 +301,60 @@ impl DoublewriteBuffer {
         }
 
         // Magic.
-        if data[0..8] != DW_MAGIC {
+        if data.get(0..8) != Some(DW_MAGIC.as_slice()) {
             return false;
         }
 
         // Version.
-        let version = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
-        if version != DW_VERSION {
+        if dw_read_u32_le(data, 8) != Some(DW_VERSION) {
             return false;
         }
 
         // Size consistency.
-        let slot_count = u32::from_le_bytes(data[12..16].try_into().expect("4 bytes")) as usize;
-        let expected_size = DW_HEADER_SIZE + slot_count * DW_SLOT_SIZE + DW_FOOTER_SIZE;
+        let Some(slot_count) = dw_read_u32_le(data, 12).map(|n| n as usize) else {
+            return false;
+        };
+        let Some(expected_size) = dw_expected_size(slot_count) else {
+            return false;
+        };
         if data.len() != expected_size {
             return false;
         }
 
         // Sentinel (last 4 bytes of file).
         let sentinel_offset = expected_size - 4;
-        let sentinel = u32::from_le_bytes(
-            data[sentinel_offset..sentinel_offset + 4]
-                .try_into()
-                .expect("4 bytes"),
-        );
+        let Some(sentinel) = dw_read_u32_le(data, sentinel_offset) else {
+            return false;
+        };
         if sentinel != DW_SENTINEL {
             return false;
         }
 
         // CRC32c: covers header + all slots (everything before footer).
         let payload_end = expected_size - DW_FOOTER_SIZE;
-        let expected_crc = u32::from_le_bytes(
-            data[payload_end..payload_end + 4]
-                .try_into()
-                .expect("4 bytes"),
-        );
+        let Some(expected_crc) = dw_read_u32_le(data, payload_end) else {
+            return false;
+        };
         let actual_crc = crc32c::crc32c(&data[..payload_end]);
 
         expected_crc == actual_crc
     }
+}
+
+fn dw_expected_size(slot_count: usize) -> Option<usize> {
+    DW_HEADER_SIZE
+        .checked_add(slot_count.checked_mul(DW_SLOT_SIZE)?)
+        .and_then(|n| n.checked_add(DW_FOOTER_SIZE))
+}
+
+fn dw_read_u32_le(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+fn dw_read_u64_le(data: &[u8], offset: usize) -> Option<u64> {
+    let bytes: [u8; 8] = data.get(offset..offset + 8)?.try_into().ok()?;
+    Some(u64::from_le_bytes(bytes))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -375,6 +412,14 @@ mod tests {
         let mut data = build_valid_dw(&[]);
         // Claim 5 slots but file only has 0
         data[12..16].copy_from_slice(&5u32.to_le_bytes());
+        assert!(!DoublewriteBuffer::validate(&data));
+    }
+
+    #[test]
+    fn test_validate_slot_count_overflow_is_invalid() {
+        let mut data = build_valid_dw(&[]);
+        // Extreme slot_count must never panic in validate()
+        data[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(!DoublewriteBuffer::validate(&data));
     }
 

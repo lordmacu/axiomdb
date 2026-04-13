@@ -263,20 +263,16 @@ the connection is a protocol violation that causes client reconnect loops.
 Fix: add match arms for known-but-unimplemented COM bytes that return ERR 1047 +
 keep the connection alive; only truly unknown bytes should close.
 
-### FK references not updated when a table is renamed — **data integrity bug**
+### FK references after table rename — **resolved 2026-04-12**
 
-`ALTER TABLE t RENAME TO new_name` and `RENAME TABLE t TO new_name` do not update
-foreign key definitions that reference the renamed table. If table `orders` has a FK
-pointing to `users`, and `users` is renamed to `accounts`, the FK catalog entry still
-stores the old reference. Subsequent FK enforcement (INSERT into `orders`, DELETE from
-`accounts`) breaks silently or errors with table-not-found.
+Audit follow-up: `ALTER TABLE t RENAME TO new_name` and `RENAME TABLE t TO new_name`
+preserve FK enforcement because `axiom_foreign_keys` stores `child_table_id` and
+`parent_table_id`, not table names. No FK row rewrite is required.
 
-- `executor/ddl.rs:1697-1711` — `alter_rename_table()` updates only the table's own
-  catalog entry; it does not scan `axiom_foreign_keys` for `parent_table_id` or child
-  references pointing to the renamed table
-- Fix: after updating the table catalog entry, query `axiom_foreign_keys` for all FK
-  rows where `parent_table_name = old_name` (or `parent_table_id`) and update them
-  to the new name; do the same for child-side FKs if stored by name
+Coverage added in `integration_fk.rs`:
+- `RENAME TABLE` parent rename: child INSERT and parent DELETE enforcement still work
+- `ALTER TABLE ... RENAME TO` parent rename: child INSERT and parent DELETE enforcement still work
+- child table rename: child INSERT and parent DELETE enforcement still work
 
 ### CHECK constraints not evaluated on `UPDATE` — **bug**
 

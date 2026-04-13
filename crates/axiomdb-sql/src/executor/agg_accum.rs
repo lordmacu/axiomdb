@@ -91,7 +91,7 @@ impl AggAccumulator {
         /// Unwraps the aggregate argument, returning a clear error instead of
         /// panicking if the invariant is violated.
         #[inline]
-        fn require_arg<'a>(arg: Option<&'a Expr>) -> Result<&'a Expr, DbError> {
+        fn require_arg(arg: Option<&Expr>) -> Result<&Expr, DbError> {
             arg.ok_or_else(|| DbError::Internal {
                 message: "aggregate accumulator requires an argument expression".into(),
             })
@@ -392,4 +392,3 @@ fn finalize_avg(sum: Value, count: u64) -> Result<Value, DbError> {
     };
     Ok(Value::Real(f / count as f64))
 }
-

@@ -52,20 +52,40 @@ fn analyze_update(
     default_database: &str,
     default_schema: &str,
 ) -> Result<UpdateStmt, DbError> {
-    let mut reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot.clone())?;
     let table_def = resolve_dml_table(&mut reader, &s.table, default_database, default_schema)?;
     let columns = reader.list_columns(table_def.id)?;
 
-    // Build single-table context.
-    let bound = BoundTable {
-        alias: s.table.alias.clone(),
-        name: s.table.name.clone(),
-        columns: columns.clone(),
-        col_offset: 0,
+    let ctx = if s.joins.is_empty() {
+        let bound = BoundTable {
+            alias: s.table.alias.clone(),
+            name: s.table.name.clone(),
+            columns: columns.clone(),
+            col_offset: 0,
+        };
+        BindContext {
+            tables: vec![bound],
+        }
+    } else {
+        build_context(
+            &Some(FromClause::Table(s.table.clone())),
+            &s.joins,
+            storage,
+            snapshot.clone(),
+            default_database,
+            default_schema,
+        )?
     };
-    let ctx = BindContext {
-        tables: vec![bound],
-    };
+
+    let mut resolved_joins = Vec::with_capacity(s.joins.len());
+    for mut join in s.joins {
+        join.condition = match join.condition {
+            JoinCondition::On(expr) => JoinCondition::On(resolve_expr(expr, &ctx)?),
+            JoinCondition::Using(cols) => JoinCondition::Using(cols),
+        };
+        resolved_joins.push(join);
+    }
+    s.joins = resolved_joins;
 
     // Validate and resolve SET assignments.
     let mut resolved = Vec::with_capacity(s.assignments.len());
@@ -110,18 +130,39 @@ fn analyze_delete(
     default_database: &str,
     default_schema: &str,
 ) -> Result<DeleteStmt, DbError> {
-    let mut reader = CatalogReader::new(storage, snapshot)?;
+    let mut reader = CatalogReader::new(storage, snapshot.clone())?;
     let table_def = resolve_dml_table(&mut reader, &s.table, default_database, default_schema)?;
     let columns = reader.list_columns(table_def.id)?;
-    let bound = BoundTable {
-        alias: s.table.alias.clone(),
-        name: s.table.name.clone(),
-        columns,
-        col_offset: 0,
+    let ctx = if s.joins.is_empty() {
+        let bound = BoundTable {
+            alias: s.table.alias.clone(),
+            name: s.table.name.clone(),
+            columns,
+            col_offset: 0,
+        };
+        BindContext {
+            tables: vec![bound],
+        }
+    } else {
+        build_context(
+            &Some(FromClause::Table(s.table.clone())),
+            &s.joins,
+            storage,
+            snapshot.clone(),
+            default_database,
+            default_schema,
+        )?
     };
-    let ctx = BindContext {
-        tables: vec![bound],
-    };
+
+    let mut resolved_joins = Vec::with_capacity(s.joins.len());
+    for mut join in s.joins {
+        join.condition = match join.condition {
+            JoinCondition::On(expr) => JoinCondition::On(resolve_expr(expr, &ctx)?),
+            JoinCondition::Using(cols) => JoinCondition::Using(cols),
+        };
+        resolved_joins.push(join);
+    }
+    s.joins = resolved_joins;
 
     s.where_clause = resolve_opt_expr(s.where_clause, &ctx)?;
 

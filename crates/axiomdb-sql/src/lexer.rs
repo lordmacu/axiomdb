@@ -584,6 +584,15 @@ pub enum Token<'src> {
     /// `?&` — JSONB all-keys existence (Phase 11.18b). MUST appear before `?`.
     #[token("?&")]
     JsonExistsAll,
+    /// `#>>` — JSONB path-extract as TEXT (Phase 11.18c). MUST appear before `#>`.
+    #[token("#>>")]
+    JsonPathExtractText,
+    /// `#>` — JSONB path-extract as JSONB (Phase 11.18c).
+    #[token("#>")]
+    JsonPathExtract,
+    /// `#-` — JSONB path-delete (Phase 11.18c).
+    #[token("#-")]
+    JsonPathDelete,
     /// `?` — positional parameter placeholder in a prepared statement template.
     #[token("?")]
     Question,

@@ -4,6 +4,12 @@ fn execute_update(
     txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
 ) -> Result<QueryResult, DbError> {
+    if !stmt.joins.is_empty() {
+        return Err(DbError::NotImplemented {
+            feature: "multi-table UPDATE JOIN requires session execution context".into(),
+        });
+    }
+
     let resolved = {
         let mut resolver =
             make_resolver_with_database(storage, txn, Some(conn_txn), DEFAULT_DATABASE_NAME)?;
