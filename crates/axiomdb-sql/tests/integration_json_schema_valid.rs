@@ -410,3 +410,202 @@ fn unique_items() {
     );
     assert!(is_false(&v));
 }
+
+// ── Phase 11.23e partial: patternProperties, propertyNames, dependencies,
+// if/then/else, format ──────────────────────────────────────────────────────
+
+#[test]
+fn pattern_properties_matches() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"patternProperties\":{\"^x_\":{\"type\":\"integer\"}}}', \
+            '{\"x_a\":1,\"y_b\":\"ok\"}')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+}
+
+#[test]
+fn pattern_properties_fails_non_matching_type() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"patternProperties\":{\"^x_\":{\"type\":\"integer\"}}}', \
+            '{\"x_a\":\"not-int\"}')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_false(&v));
+}
+
+#[test]
+fn property_names_schema() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"propertyNames\":{\"maxLength\":3}}', \
+            '{\"ok\":1,\"too_long\":2}')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_false(&v));
+}
+
+#[test]
+fn dependencies_required_keys() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"dependencies\":{\"credit_card\":[\"billing_address\"]}}', \
+            '{\"credit_card\":\"4242\"}')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_false(&v));
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"dependencies\":{\"credit_card\":[\"billing_address\"]}}', \
+            '{\"credit_card\":\"4242\",\"billing_address\":\"x\"}')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+}
+
+#[test]
+fn if_then_branch() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"if\":{\"type\":\"string\"},\"then\":{\"minLength\":3}}', \
+            '\"ab\"')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_false(&v));
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"if\":{\"type\":\"string\"},\"then\":{\"minLength\":3}}', \
+            '\"abcd\"')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+}
+
+#[test]
+fn if_else_branch() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"if\":{\"type\":\"string\"},\"else\":{\"minimum\":10}}', \
+            '5')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_false(&v));
+}
+
+#[test]
+fn format_email() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"type\":\"string\",\"format\":\"email\"}', '\"a@b.co\"')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"type\":\"string\",\"format\":\"email\"}', '\"bogus\"')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_false(&v));
+}
+
+#[test]
+fn format_uuid() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID(\
+            '{\"type\":\"string\",\"format\":\"uuid\"}', \
+            '\"550e8400-e29b-41d4-a716-446655440000\"')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+}
+
+#[test]
+fn format_date_and_datetime() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"format\":\"date\"}', '\"2026-04-13\"')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"format\":\"date-time\"}', '\"2026-04-13T10:00:00Z\"')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+}
+
+#[test]
+fn format_ipv4_ipv6() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"format\":\"ipv4\"}', '\"10.0.0.1\"')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"format\":\"ipv6\"}', '\"::1\"')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_true(&v));
+    let v = scalar(
+        "SELECT JSON_SCHEMA_VALID('{\"format\":\"ipv4\"}', '\"not-an-ip\"')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    assert!(is_false(&v));
+}
