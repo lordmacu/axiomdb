@@ -1877,11 +1877,19 @@ pub(crate) enum FilterExpr {
     Compare {
         path: Vec<String>,
         op: CmpOp,
-        value: serde_json::Value,
+        rhs: FilterSide,
     },
     And(Box<FilterExpr>, Box<FilterExpr>),
     Or(Box<FilterExpr>, Box<FilterExpr>),
     Not(Box<FilterExpr>),
+}
+
+/// Right-hand side of a filter comparison: either a literal or another
+/// `@.path` reference into the current candidate node.
+#[derive(Debug, Clone)]
+pub(crate) enum FilterSide {
+    Literal(serde_json::Value),
+    Path(Vec<String>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2167,19 +2175,43 @@ impl FilterParser<'_> {
         let op_len = tail.len() - remainder.len();
         self.pos += op_len;
 
-        // Parse the RHS literal up to next combinator / close paren.
+        // Parse the RHS — either `@.path` reference or a literal — up to
+        // the next combinator / close paren.
         let rhs = std::str::from_utf8(&self.bytes[self.pos..]).unwrap_or("");
         let rhs_trim = rhs.trim_start();
         let ws_consumed = rhs.len() - rhs_trim.len();
         self.pos += ws_consumed;
         let rhs = rhs_trim;
         let end = rhs.find(['&', '|', ')']).unwrap_or(rhs.len());
-        let (lit_str, _tail_after) = rhs.split_at(end);
-        let lit_str = lit_str.trim_end();
-        self.pos += lit_str.len();
-        // Skip any trailing whitespace we just reported as part of the literal.
-        let value = parse_jsonpath_literal(lit_str)?;
-        Ok(FilterExpr::Compare { path, op, value })
+        let (token_str, _tail_after) = rhs.split_at(end);
+        let token_str = token_str.trim_end();
+        self.pos += token_str.len();
+        let rhs_side = if let Some(rest_after_at) = token_str.strip_prefix('@') {
+            // Path RHS — collect dot-segments.
+            let mut rpath = Vec::<String>::new();
+            let mut r = rest_after_at;
+            while let Some(s2) = r.strip_prefix('.') {
+                let stop = s2
+                    .find(|c: char| c.is_whitespace() || c == '.')
+                    .unwrap_or(s2.len());
+                let key = &s2[..stop];
+                if !key.is_empty() {
+                    rpath.push(key.to_string());
+                }
+                r = &s2[stop..];
+                if r.is_empty() || r.starts_with(char::is_whitespace) {
+                    break;
+                }
+            }
+            FilterSide::Path(rpath)
+        } else {
+            FilterSide::Literal(parse_jsonpath_literal(token_str)?)
+        };
+        Ok(FilterExpr::Compare {
+            path,
+            op,
+            rhs: rhs_side,
+        })
     }
 }
 
@@ -2364,7 +2396,7 @@ fn eval_filter(node: &serde_json::Value, filter: &FilterExpr) -> bool {
             }
             true
         }
-        FilterExpr::Compare { path, op, value } => {
+        FilterExpr::Compare { path, op, rhs } => {
             let mut current = node;
             for key in path {
                 match current.get(key.as_str()) {
@@ -2372,7 +2404,19 @@ fn eval_filter(node: &serde_json::Value, filter: &FilterExpr) -> bool {
                     None => return false,
                 }
             }
-            compare_json(current, *op, value)
+            match rhs {
+                FilterSide::Literal(v) => compare_json(current, *op, v),
+                FilterSide::Path(rpath) => {
+                    let mut r = node;
+                    for k in rpath {
+                        match r.get(k.as_str()) {
+                            Some(v) => r = v,
+                            None => return false,
+                        }
+                    }
+                    compare_json(current, *op, r)
+                }
+            }
         }
         FilterExpr::And(a, b) => eval_filter(node, a) && eval_filter(node, b),
         FilterExpr::Or(a, b) => eval_filter(node, a) || eval_filter(node, b),
