@@ -367,6 +367,7 @@ fn collect_col_idxs_non_agg(expr: &Expr, out: &mut Vec<usize>) {
         | Expr::Default
         | Expr::OuterColumn { .. }
         | Expr::InsertValue { .. }
+        | Expr::SqlJsonQuery { .. }
         | Expr::Param { .. }
         | Expr::Subquery(_)
         | Expr::InSubquery { .. }
@@ -431,6 +432,7 @@ fn collect_non_agg_col_idxs_in_expr(expr: &Expr, inside_agg: bool, out: &mut Vec
         | Expr::Default
         | Expr::OuterColumn { .. }
         | Expr::InsertValue { .. }
+        | Expr::SqlJsonQuery { .. }
         | Expr::Param { .. }
         | Expr::Subquery(_)
         | Expr::InSubquery { .. }

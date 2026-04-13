@@ -211,6 +211,18 @@ pub enum Expr {
     /// target table's schema; the parser emits `col_idx = 0`.
     InsertValue { col_idx: usize, name: String },
 
+    /// SQL:2016 `JSON_VALUE` / `JSON_QUERY` / `JSON_EXISTS` (Phase 11.19a).
+    /// Special-form grammar with typed clause fields.
+    SqlJsonQuery {
+        kind: SqlJsonQueryKind,
+        doc: Box<Expr>,
+        path: String,
+        path_mode: SqlJsonPathMode,
+        returning: Option<axiomdb_types::DataType>,
+        on_empty: SqlJsonOnBehavior,
+        on_error: SqlJsonOnBehavior,
+    },
+
     /// A positional parameter placeholder — the `?` in a prepared statement.
     ///
     /// `idx` is the 0-based index of the parameter (first `?` → 0, second → 1).
@@ -340,6 +352,53 @@ pub enum BinaryOp {
     /// `'k'` as a string element (Phase 11.18a). Matches PG
     /// `jsonb_exists()` semantics.
     JsonExists,
+}
+
+// ── SQL/JSON standard query functions (Phase 11.19a) ─────────────────────────
+
+/// Which of the three SQL:2016 special-form functions this node represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlJsonQueryKind {
+    /// `JSON_VALUE` — scalar extraction with type coercion.
+    Value,
+    /// `JSON_QUERY` — subtree (object / array / scalar) extraction.
+    Query,
+    /// `JSON_EXISTS` — existence predicate.
+    Exists,
+}
+
+/// Path-mode prefix inside the jsonpath string.
+///
+/// `strict` (SQL:2016 + PG default) raises on missing parts, type
+/// mismatches, and index out-of-range; `lax` silently drops such parts
+/// and auto-unwraps arrays for scalar extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlJsonPathMode {
+    Strict,
+    Lax,
+}
+
+/// ON EMPTY / ON ERROR handler.
+///
+/// `JSON_EXISTS` additionally accepts the `TrueLit` / `FalseLit` /
+/// `Unknown` variants for `ON ERROR`; the other two functions use
+/// `Null` / `Error` / `Default`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlJsonOnBehavior {
+    /// `NULL` — return SQL NULL (spec default when clause omitted).
+    Null,
+    /// `ERROR` — raise the condition as a runtime error.
+    Error,
+    /// `DEFAULT expr` — lazy-evaluate `expr` and return it, coerced to
+    /// the `RETURNING` type when present.
+    Default(Box<Expr>),
+    /// `TRUE` — only valid on `JSON_EXISTS` `ON ERROR`.
+    TrueLit,
+    /// `FALSE` — only valid on `JSON_EXISTS` `ON ERROR`.
+    FalseLit,
+    /// `UNKNOWN` — only valid on `JSON_EXISTS` `ON ERROR`; maps to
+    /// `Value::Null` in our 3VL model.
+    Unknown,
 }
 
 // ── UnaryOp ───────────────────────────────────────────────────────────────────

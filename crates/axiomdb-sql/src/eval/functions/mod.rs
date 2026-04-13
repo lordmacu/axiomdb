@@ -8,9 +8,12 @@ pub(crate) mod datetime;
 mod json;
 mod nulls;
 mod numeric;
+mod sql_json_query;
 mod string;
 mod system;
 mod uuid;
+
+pub(crate) use sql_json_query::eval_sql_json_query;
 
 pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, DbError> {
     let lower = name.to_ascii_lowercase();

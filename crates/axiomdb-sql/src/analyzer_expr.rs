@@ -42,6 +42,31 @@ fn resolve_expr_full(
         Expr::Literal(v) => Ok(Expr::Literal(v)),
         Expr::Default => Ok(Expr::Default),
 
+        // Phase 11.19a: SQL/JSON query special form. Walk the doc
+        // sub-expression and any DEFAULT handlers in on_empty / on_error.
+        Expr::SqlJsonQuery {
+            kind,
+            doc,
+            path,
+            path_mode,
+            returning,
+            on_empty,
+            on_error,
+        } => {
+            let doc = resolve_expr_full(*doc, ctx, outer_scopes, state)?;
+            let on_empty = resolve_sql_json_behavior(on_empty, ctx, outer_scopes, state)?;
+            let on_error = resolve_sql_json_behavior(on_error, ctx, outer_scopes, state)?;
+            Ok(Expr::SqlJsonQuery {
+                kind,
+                doc: Box::new(doc),
+                path,
+                path_mode,
+                returning,
+                on_empty,
+                on_error,
+            })
+        }
+
         Expr::InsertValue { col_idx: _, name } => {
             // Resolve the proposed-row column against the current target
             // table's schema. Out-of-scope contexts surface as ColumnNotFound.
@@ -310,5 +335,23 @@ fn resolve_opt_expr_full(
 ) -> Result<Option<Expr>, DbError> {
     expr.map(|e| resolve_expr_full(e, ctx, outer_scopes, state))
         .transpose()
+}
+
+/// Resolves any `Default(expr)` inside a [`crate::expr::SqlJsonOnBehavior`]
+/// so the DEFAULT expression sees the surrounding scope. All other variants
+/// pass through unchanged.
+fn resolve_sql_json_behavior(
+    behavior: crate::expr::SqlJsonOnBehavior,
+    ctx: &BindContext,
+    outer_scopes: &[&BindContext],
+    state: Option<&AnalyzeState<'_>>,
+) -> Result<crate::expr::SqlJsonOnBehavior, DbError> {
+    match behavior {
+        crate::expr::SqlJsonOnBehavior::Default(e) => {
+            let resolved = resolve_expr_full(*e, ctx, outer_scopes, state)?;
+            Ok(crate::expr::SqlJsonOnBehavior::Default(Box::new(resolved)))
+        }
+        other => Ok(other),
+    }
 }
 

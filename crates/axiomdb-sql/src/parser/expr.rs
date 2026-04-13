@@ -37,7 +37,7 @@ use axiomdb_types::{DataType, Value};
 
 use crate::{
     ast::SortOrder,
-    expr::{BinaryOp, Expr, UnaryOp},
+    expr::{BinaryOp, Expr, SqlJsonOnBehavior, SqlJsonPathMode, SqlJsonQueryKind, UnaryOp},
     lexer::Token,
 };
 
@@ -624,6 +624,25 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
         });
     }
 
+    // Phase 11.19a — SQL:2016 `JSON_VALUE` / `JSON_QUERY` / `JSON_EXISTS`
+    // are special-form expressions with a keyword-driven grammar, not
+    // variadic function calls. We detect them here before the regular
+    // `name(` function dispatcher consumes the LParen.
+    {
+        let lower = name.to_ascii_lowercase();
+        let sql_json_kind = match lower.as_str() {
+            "json_value" => Some(SqlJsonQueryKind::Value),
+            "json_query" => Some(SqlJsonQueryKind::Query),
+            "json_exists" => Some(SqlJsonQueryKind::Exists),
+            _ => None,
+        };
+        if let Some(kind) = sql_json_kind {
+            if matches!(p.peek(), Token::LParen) {
+                return parse_sql_json_query(p, kind);
+            }
+        }
+    }
+
     // SQL niladic-keyword functions — no parens required in the standard.
     // Without this, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_USER`, etc.
     // would parse as column references and fail at eval time.
@@ -884,5 +903,140 @@ fn parse_convert_type(p: &mut Parser) -> Result<DataType, DbError> {
             }
         }
         _ => super::ddl::parse_data_type(p).map(|(dt, _, _)| dt),
+    }
+}
+
+// ── Phase 11.19a — SQL:2016 JSON query special forms ────────────────────────-
+
+/// Parses the body of `JSON_VALUE(...)`, `JSON_QUERY(...)`, or
+/// `JSON_EXISTS(...)` after the caller has consumed the function name.
+/// Keyword-driven grammar — ordering:
+///
+/// ```text
+///   doc , path
+///     [ RETURNING <type> ]                   -- not for JSON_EXISTS
+///     [ ON EMPTY { ERROR | NULL | DEFAULT expr } ]  -- not for JSON_EXISTS
+///     [ ON ERROR { ERROR | NULL | DEFAULT expr | TRUE | FALSE | UNKNOWN } ]
+/// ```
+fn parse_sql_json_query(p: &mut Parser, kind: SqlJsonQueryKind) -> Result<Expr, DbError> {
+    p.expect(&Token::LParen)?;
+    let doc = parse_expr(p)?;
+    p.expect(&Token::Comma)?;
+
+    // Path must be a string literal; we parse it once to split the
+    // `strict`/`lax` mode prefix from the actual jsonpath body.
+    let path_raw = match p.peek().clone() {
+        Token::StringLit(s) => {
+            p.advance();
+            s
+        }
+        other => {
+            return Err(DbError::ParseError {
+                message: format!("SQL/JSON path must be a string literal, got {other:?}"),
+                position: Some(p.current_pos()),
+            })
+        }
+    };
+    let (path_mode, path_str) = split_sql_json_path_mode(&path_raw);
+
+    let mut returning: Option<DataType> = None;
+    let mut on_empty = SqlJsonOnBehavior::Null;
+    let mut on_error = match kind {
+        SqlJsonQueryKind::Exists => SqlJsonOnBehavior::FalseLit,
+        _ => SqlJsonOnBehavior::Null,
+    };
+
+    // Optional RETURNING <type> — not valid for JSON_EXISTS.
+    if p.eat_ident_ci("RETURNING") {
+        if matches!(kind, SqlJsonQueryKind::Exists) {
+            return Err(DbError::ParseError {
+                message: "RETURNING is not allowed on JSON_EXISTS".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        let (dt, _, _) = super::ddl::parse_data_type(p)?;
+        returning = Some(dt);
+    }
+
+    // Optional ON EMPTY <behavior> — not valid for JSON_EXISTS.
+    while matches!(p.peek(), Token::On) {
+        p.advance(); // ON
+        if p.eat_ident_ci("EMPTY") {
+            if matches!(kind, SqlJsonQueryKind::Exists) {
+                return Err(DbError::ParseError {
+                    message: "ON EMPTY is not allowed on JSON_EXISTS".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+            on_empty = parse_sql_json_behavior(p, /*is_exists=*/ false)?;
+            continue;
+        }
+        if p.eat_ident_ci("ERROR") {
+            on_error = parse_sql_json_behavior(p, matches!(kind, SqlJsonQueryKind::Exists))?;
+            continue;
+        }
+        return Err(DbError::ParseError {
+            message: "expected EMPTY or ERROR after ON".into(),
+            position: Some(p.current_pos()),
+        });
+    }
+
+    p.expect(&Token::RParen)?;
+
+    Ok(Expr::SqlJsonQuery {
+        kind,
+        doc: Box::new(doc),
+        path: path_str,
+        path_mode,
+        returning,
+        on_empty,
+        on_error,
+    })
+}
+
+/// Parses the right-hand-side of an `ON EMPTY` / `ON ERROR` clause.
+fn parse_sql_json_behavior(p: &mut Parser, is_exists: bool) -> Result<SqlJsonOnBehavior, DbError> {
+    // ERROR keyword stays an Ident in logos (no Token::Error reserved).
+    if p.eat_ident_ci("ERROR") {
+        return Ok(SqlJsonOnBehavior::Error);
+    }
+    if p.eat(&Token::Null) {
+        return Ok(SqlJsonOnBehavior::Null);
+    }
+    if is_exists {
+        if p.eat(&Token::True) {
+            return Ok(SqlJsonOnBehavior::TrueLit);
+        }
+        if p.eat(&Token::False) {
+            return Ok(SqlJsonOnBehavior::FalseLit);
+        }
+        if p.eat_ident_ci("UNKNOWN") {
+            return Ok(SqlJsonOnBehavior::Unknown);
+        }
+    }
+    if p.eat(&Token::Default) {
+        let e = parse_expr(p)?;
+        return Ok(SqlJsonOnBehavior::Default(Box::new(e)));
+    }
+    Err(DbError::ParseError {
+        message: if is_exists {
+            "expected ERROR | NULL | TRUE | FALSE | UNKNOWN | DEFAULT expr".into()
+        } else {
+            "expected ERROR | NULL | DEFAULT expr".into()
+        },
+        position: Some(p.current_pos()),
+    })
+}
+
+/// Splits the `strict ` / `lax ` mode prefix from the rest of the path.
+fn split_sql_json_path_mode(raw: &str) -> (SqlJsonPathMode, String) {
+    let trimmed = raw.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("strict ") {
+        (SqlJsonPathMode::Strict, rest.trim_start().to_string())
+    } else if let Some(rest) = trimmed.strip_prefix("lax ") {
+        (SqlJsonPathMode::Lax, rest.trim_start().to_string())
+    } else {
+        // SQL:2016 + PG default is strict.
+        (SqlJsonPathMode::Strict, trimmed.to_string())
     }
 }
