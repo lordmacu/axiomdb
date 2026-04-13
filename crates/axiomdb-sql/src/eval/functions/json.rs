@@ -705,6 +705,20 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
         }
 
+        // ── Phase 11.23a: JSON Schema Draft-07 subset validator ──────────────
+        // JSON_SCHEMA_VALID(schema, doc) → bool. NULL on either side → NULL.
+        "json_schema_valid" => {
+            expect_arg_count(name, args, 2)?;
+            let schema = eval_arg(args, 0, row, name)?;
+            let doc = eval_arg(args, 1, row, name)?;
+            if matches!(schema, Value::Null) || matches!(doc, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let schema_sj = value_to_serde_json(&schema)?;
+            let doc_sj = value_to_serde_json(&doc)?;
+            Ok(Value::Bool(json_schema_validate(&schema_sj, &doc_sj)))
+        }
+
         // ── Phase 11.24a: Oracle JSON surface ────────────────────────────────
         // JSON_EQUAL(a, b) — deep structural equality. NULL if either is NULL.
         "json_equal" => {
@@ -1727,6 +1741,166 @@ fn compare_json(left: &serde_json::Value, op: CmpOp, right: &serde_json::Value) 
             _ => false,
         },
         (J::Null, J::Null) => matches!(op, CmpOp::Eq),
+        _ => false,
+    }
+}
+
+// ── Phase 11.23a: JSON Schema Draft-07 subset validator ─────────────────────-
+//
+// Supported keywords: type, enum, const, required, properties,
+// additionalProperties (bool), items (object or array of schemas),
+// minimum, maximum, exclusiveMinimum, exclusiveMaximum,
+// minLength, maxLength, minItems, maxItems,
+// multipleOf.
+// `true` schema accepts all; `false` schema rejects all.
+fn json_schema_validate(schema: &serde_json::Value, doc: &serde_json::Value) -> bool {
+    match schema {
+        serde_json::Value::Bool(true) => return true,
+        serde_json::Value::Bool(false) => return false,
+        serde_json::Value::Object(_) => {}
+        _ => return false,
+    }
+    let obj = schema.as_object().unwrap();
+
+    if let Some(t) = obj.get("type") {
+        if !schema_type_matches(t, doc) {
+            return false;
+        }
+    }
+    if let Some(e) = obj.get("enum").and_then(|v| v.as_array()) {
+        if !e.iter().any(|x| x == doc) {
+            return false;
+        }
+    }
+    if let Some(c) = obj.get("const") {
+        if c != doc {
+            return false;
+        }
+    }
+    if let Some(n) = doc.as_f64() {
+        if let Some(m) = obj.get("minimum").and_then(|v| v.as_f64()) {
+            if n < m {
+                return false;
+            }
+        }
+        if let Some(m) = obj.get("maximum").and_then(|v| v.as_f64()) {
+            if n > m {
+                return false;
+            }
+        }
+        if let Some(m) = obj.get("exclusiveMinimum").and_then(|v| v.as_f64()) {
+            if n <= m {
+                return false;
+            }
+        }
+        if let Some(m) = obj.get("exclusiveMaximum").and_then(|v| v.as_f64()) {
+            if n >= m {
+                return false;
+            }
+        }
+        if let Some(m) = obj.get("multipleOf").and_then(|v| v.as_f64()) {
+            if m == 0.0 || (n / m).fract() != 0.0 {
+                return false;
+            }
+        }
+    }
+    if let Some(s) = doc.as_str() {
+        let len = s.chars().count() as u64;
+        if let Some(m) = obj.get("minLength").and_then(|v| v.as_u64()) {
+            if len < m {
+                return false;
+            }
+        }
+        if let Some(m) = obj.get("maxLength").and_then(|v| v.as_u64()) {
+            if len > m {
+                return false;
+            }
+        }
+    }
+    if let Some(arr) = doc.as_array() {
+        if let Some(m) = obj.get("minItems").and_then(|v| v.as_u64()) {
+            if (arr.len() as u64) < m {
+                return false;
+            }
+        }
+        if let Some(m) = obj.get("maxItems").and_then(|v| v.as_u64()) {
+            if (arr.len() as u64) > m {
+                return false;
+            }
+        }
+        if let Some(items) = obj.get("items") {
+            match items {
+                serde_json::Value::Array(subs) => {
+                    for (i, sub) in subs.iter().enumerate() {
+                        if let Some(v) = arr.get(i) {
+                            if !json_schema_validate(sub, v) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    for v in arr {
+                        if !json_schema_validate(items, v) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(map) = doc.as_object() {
+        if let Some(req) = obj.get("required").and_then(|v| v.as_array()) {
+            for r in req {
+                if let Some(k) = r.as_str() {
+                    if !map.contains_key(k) {
+                        return false;
+                    }
+                }
+            }
+        }
+        if let Some(props) = obj.get("properties").and_then(|v| v.as_object()) {
+            for (k, sub) in props {
+                if let Some(v) = map.get(k) {
+                    if !json_schema_validate(sub, v) {
+                        return false;
+                    }
+                }
+            }
+            if let Some(ap) = obj.get("additionalProperties") {
+                if let Some(false) = ap.as_bool() {
+                    for k in map.keys() {
+                        if !props.contains_key(k) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn schema_type_matches(t: &serde_json::Value, doc: &serde_json::Value) -> bool {
+    match t {
+        serde_json::Value::String(s) => schema_type_single(s, doc),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|s| schema_type_single(s, doc)),
+        _ => false,
+    }
+}
+
+fn schema_type_single(name: &str, doc: &serde_json::Value) -> bool {
+    match name {
+        "string" => doc.is_string(),
+        "number" => doc.is_number(),
+        "integer" => doc.is_i64() || doc.is_u64() || doc.as_f64().is_some_and(|f| f.fract() == 0.0),
+        "boolean" => doc.is_boolean(),
+        "null" => doc.is_null(),
+        "array" => doc.is_array(),
+        "object" => doc.is_object(),
         _ => false,
     }
 }
