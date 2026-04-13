@@ -1706,6 +1706,52 @@ parity): `NESTED '$.items[*]' COLUMNS (...)` is equivalent.
 <span class="callout-icon">💡</span>
 <div class="callout-body">
 <span class="callout-label">Scope</span>
-Phase 11.20b supports <strong>one</strong> NESTED PATH per <code>COLUMNS(...)</code> list and <strong>one</strong> level of nesting. Multi-sibling NESTED (UNION semantics) and multi-level nesting (NESTED inside NESTED) raise an explicit <code>NotImplemented</code> pointing to Phase 11.20c.
+Phase 11.20c lifts the 11.20b restrictions: multiple <code>NESTED PATH</code> siblings inside the same <code>COLUMNS(...)</code> list produce <strong>UNION</strong> semantics — each sibling emits its own rows with the other siblings' columns <code>NULL</code>-padded. Nesting depth is now bounded only by a defensive limit of 32 levels.
 </div>
 </div>
+
+### Multi-sibling + multi-level NESTED (Phase 11.20c)
+
+Two or more `NESTED PATH` siblings in the same `COLUMNS(...)` list produce
+a **UNION** across them — each sibling's row set is emitted sequentially
+with the other siblings' columns NULL-padded. Nesting also supports
+arbitrary depth (bounded to 32 levels defensively).
+
+```sql
+SELECT inv_id, price, tag FROM JSON_TABLE(
+    '[{"id":1,"prices":[10,20],"tags":["a","b"]}]',
+    '$[*]' COLUMNS (
+        inv_id INT PATH '$.id',
+        NESTED PATH '$.prices[*]' COLUMNS (price INT  PATH '$'),
+        NESTED PATH '$.tags[*]'   COLUMNS (tag   TEXT PATH '$')
+    )
+) AS t;
+-- (1, 10,   NULL)
+-- (1, 20,   NULL)
+-- (1, NULL, 'a')
+-- (1, NULL, 'b')
+```
+
+Multi-level nesting (`NESTED` inside `NESTED`) combines with LEFT-OUTER
+padding at every level:
+
+```sql
+SELECT inv_id, line_id, part FROM JSON_TABLE(
+    '[{"id":1,"lines":[
+         {"lid":"L1","parts":["P1","P2"]},
+         {"lid":"L2","parts":[]}
+    ]}]',
+    '$[*]' COLUMNS (
+        inv_id INT PATH '$.id',
+        NESTED PATH '$.lines[*]' COLUMNS (
+            line_id TEXT PATH '$.lid',
+            NESTED PATH '$.parts[*]' COLUMNS (
+                part TEXT PATH '$'
+            )
+        )
+    )
+) AS t;
+-- (1, 'L1', 'P1')
+-- (1, 'L1', 'P2')
+-- (1, 'L2', NULL)   ← L2.parts empty → inner LEFT-OUTER pad
+```

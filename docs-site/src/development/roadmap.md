@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 11.20b `JSON_TABLE` single-level `NESTED PATH` — `COLUMNS(... NESTED [PATH] '$.child[*]' COLUMNS(...))` with LEFT-OUTER NULL padding on empty child arrays, per-level `FOR ORDINALITY` counters (parent increments per match, child resets per parent), recursive unique-name enforcement across levels, and fixed DFS slot layout for the emitted row. Multi-sibling NESTED (UNION) and depth ≥ 2 → `NotImplemented 11.20c`. 11 integration tests + 3 wire-smoke assertions.
+**Last completed subphase:** 11.20c `JSON_TABLE` multi-sibling + multi-level `NESTED PATH` — any number of NESTED siblings in the same `COLUMNS(...)` list produce UNION rows (each sibling's row set emitted with the other siblings' columns NULL-padded); NESTED can recurse arbitrarily (bounded to depth 32); per-level `FOR ORDINALITY` resets cleanly at each iteration entry. `materialize_json_table` collapsed into a single `emit_rows_rec` recursion covering flat, single-NESTED, multi-sibling, multi-level, and mixed cases. 10 new integration tests + 2 wire-smoke assertions.
 
-**Active development:** Phase 11 — Advanced types. 11.16 → 11.19c + 11.20a/b + 11.21a–g + 11.22a/b + 11.23a/b/d/e/f + 11.24a/b/d closed. Remaining gaps: 11.18c (needs `TEXT[]`), 11.20c (multi-sibling UNION + multi-level NESTED), 11.20d (WRAPPER/QUOTES/PASSING + LATERAL-correlated doc + UPDATE/DELETE/MERGE sources), 11.21h (planner JSONPath pushdown + `jsonb_path_ops` GIN), 11.23c (catalog-stored named JSON schemas), 11.24c (dot-notation `t.doc.a.b`).
+**Active development:** Phase 11 — Advanced types. 11.16 → 11.19c + 11.20a/b/c + 11.21a–g + 11.22a/b + 11.23a/b/d/e/f + 11.24a/b/d closed. Remaining gaps: 11.18c (needs `TEXT[]`), 11.20d (WRAPPER/QUOTES/PASSING + LATERAL-correlated doc + UPDATE/DELETE/MERGE sources + first-FROM JSON_TABLE combined with JOIN), 11.21h (planner JSONPath pushdown + `jsonb_path_ops` GIN), 11.23c (catalog-stored named JSON schemas), 11.24c (dot-notation `t.doc.a.b`).
 
-**Next milestone:** 11.20c — multi-sibling `NESTED PATH` (UNION semantics across siblings inside the same `COLUMNS(...)` list) and multi-level nesting (NESTED inside NESTED).
+**Next milestone:** 11.20d — `WRAPPER` / `QUOTES` on JSON_TABLE columns, `PASSING name AS var` on the row path, LATERAL-correlated `doc` expression, and JSON_TABLE as first FROM entry combined with JOINs / as UPDATE / DELETE / MERGE source.
 
 **Concurrency note:** the current server already supports concurrent read-only
 queries, but mutating statements are still serialized through a database-wide

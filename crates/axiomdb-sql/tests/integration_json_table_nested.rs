@@ -296,41 +296,5 @@ fn duplicate_column_name_across_levels_errors() {
     assert!(err.is_err(), "expected duplicate-name error, got {err:?}");
 }
 
-#[test]
-fn multi_sibling_nested_not_yet_implemented() {
-    // 11.20c scope — reject with explicit message.
-    let (mut s, mut t, mut b, mut c) = setup();
-    let err = run_ctx(
-        r#"SELECT 1 FROM JSON_TABLE('[]', '$[*]' COLUMNS (
-            NESTED PATH '$.a[*]' COLUMNS (v1 INT PATH '$'),
-            NESTED PATH '$.b[*]' COLUMNS (v2 INT PATH '$')
-        )) AS t"#,
-        &mut s,
-        &mut t,
-        &mut b,
-        &mut c,
-    );
-    let e = err.unwrap_err();
-    let s = format!("{e:?}");
-    assert!(s.contains("11.20c"), "expected 11.20c pointer, got {s}");
-}
-
-#[test]
-fn multi_level_nested_not_yet_implemented() {
-    // 11.20c scope — reject depth ≥ 2.
-    let (mut s, mut t, mut b, mut c) = setup();
-    let err = run_ctx(
-        r#"SELECT 1 FROM JSON_TABLE('[]', '$[*]' COLUMNS (
-            NESTED PATH '$.a[*]' COLUMNS (
-                NESTED PATH '$.b[*]' COLUMNS (v INT PATH '$')
-            )
-        )) AS t"#,
-        &mut s,
-        &mut t,
-        &mut b,
-        &mut c,
-    );
-    let e = err.unwrap_err();
-    let s = format!("{e:?}");
-    assert!(s.contains("11.20c"), "expected 11.20c pointer, got {s}");
-}
+// Multi-sibling NESTED and multi-level NESTED are now supported in 11.20c;
+// success tests live in `integration_json_table_multi.rs`.

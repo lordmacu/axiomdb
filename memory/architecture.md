@@ -1,5 +1,32 @@
 # Architecture Notes
 
+## 2026-04-13 — `JSON_TABLE` multi-sibling + multi-level NESTED (11.20c)
+
+- **Guards removed**: the 11.20b `depth >= 1 → NotImplemented` and
+  `nested_count > 1 → NotImplemented` checks are gone from
+  `compile_columns_recursive`. Replaced by a single defensive
+  `depth > 32 → ParseError` (no real workload hits this).
+- **Executor collapsed**: `materialize_json_table` + `fill_leaf_children`
+  (11.20b) → single `emit_rows_rec(cols, node, template, level_ord, …)`.
+  Body:
+  1. Pass 1 — fill Regular / Ordinality / Exists into `template` in place.
+  2. Collect NESTED siblings.
+  3. If no NESTED → push `template`.
+  4. Otherwise UNION: for each NESTED sibling, walk its child path;
+     empty → push `template.clone()` (LEFT-OUTER pad); non-empty →
+     recurse for each child match with `template.clone()` and the
+     child's 1-based ordinality.
+- Multi-level and multi-sibling share the same recursion; no plan-tree
+  IR. PG's `JsonTableSiblingJoin` node becomes implicit via the sibling
+  iteration.
+- **Ordinality scope** is the `level_ord` argument; parent passes its
+  parent-match index, nested recursion passes the child-match index.
+  Resets happen naturally because `emit_rows_rec` is re-entered per
+  child match.
+- **LEFT-OUTER semantics unchanged**: template starts all-NULL;
+  sibling-empty and inner-empty paths both express "don't modify this
+  region" via cheap `template.clone()` pushes.
+
 ## 2026-04-13 — `JSON_TABLE` single-level `NESTED PATH` (11.20b)
 
 - **AST** extended with `JsonTableColumn::Nested { path, columns }`. The

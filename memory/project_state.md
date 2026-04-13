@@ -3,7 +3,7 @@
 ## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 11.20b `JSON_TABLE` single-level `NESTED PATH` — ✅ closed; next is 11.20c (multi-sibling NESTED UNION + multi-level depth ≥ 2).
+**Active subphase:** 11.20c `JSON_TABLE` multi-sibling + multi-level NESTED — ✅ closed; next is 11.20d (WRAPPER/QUOTES/PASSING + LATERAL-correlated doc + UPDATE/DELETE/MERGE sources + first-FROM JSON_TABLE combined with JOIN).
 
 ### Phase 11 subphase status
 
@@ -19,7 +19,8 @@
 | 11.18a / 11.18b (partial) JSONB operators | ✅ closed — 11.18c deferred (needs `TEXT[]`) |
 | 11.19a / 11.19b / 11.19c SQL/JSON query functions | ✅ closed |
 | 11.20a `JSON_TABLE` flat | ✅ closed |
-| **11.20b** `JSON_TABLE` single-level NESTED | ✅ closed — multi-sibling + multi-level → 11.20c |
+| 11.20b `JSON_TABLE` single-level NESTED | ✅ closed |
+| **11.20c** `JSON_TABLE` multi-sibling + multi-level NESTED | ✅ closed — WRAPPER/PASSING/LATERAL → 11.20d |
 | 11.21a–g JSONPath parity | ✅ closed (through path arithmetic in filters) — 11.21h pending planner pushdown |
 | 11.22a / 11.22b JSONB mutations | ✅ closed |
 | 11.23a / 11.23b / 11.23d / 11.23e / 11.23f JSON Schema | ✅ closed — 11.23c catalog persistence pending |

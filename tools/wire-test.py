@@ -3171,6 +3171,48 @@ ok("11.20b JSON_TABLE NESTED per-level ordinality",
    pairs == [(1, 1), (1, 2), (2, 1)],
    f"got {pairs}")
 
+# ── Phase 11.20c — multi-sibling + multi-level NESTED ─────────────────────────
+
+print("\n[11.20c multi NESTED]")
+
+# Multi-sibling UNION semantics
+cur.execute("""SELECT inv_id, price, tag FROM JSON_TABLE(
+    '[{"id":1,"prices":[10,20],"tags":["a","b"]}]',
+    '$[*]' COLUMNS (
+        inv_id INT PATH '$.id',
+        NESTED PATH '$.prices[*]' COLUMNS (price INT  PATH '$'),
+        NESTED PATH '$.tags[*]'   COLUMNS (tag   TEXT PATH '$')
+    )
+) AS t ORDER BY COALESCE(price, 1000), COALESCE(tag, 'z')""")
+rows = cur.fetchall()
+def norm_cell(x):
+    if x is None:
+        return None
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return str(x)
+normalized = [tuple(norm_cell(x) for x in r) for r in rows]
+ok("11.20c JSON_TABLE multi-sibling UNION",
+   normalized == [(1, 10, None), (1, 20, None), (1, None, "a"), (1, None, "b")],
+   f"got {normalized}")
+
+# Multi-level depth 2
+cur.execute("""SELECT line_id, part FROM JSON_TABLE(
+    '[{"lines":[{"lid":"L1","parts":["P1","P2"]},{"lid":"L2","parts":[]}]}]',
+    '$[*]' COLUMNS (
+        NESTED PATH '$.lines[*]' COLUMNS (
+            line_id TEXT PATH '$.lid',
+            NESTED PATH '$.parts[*]' COLUMNS (part TEXT PATH '$')
+        )
+    )
+) AS t ORDER BY line_id, COALESCE(part, 'z')""")
+rows = cur.fetchall()
+cleaned = [tuple(str(x) if x is not None else None for x in r) for r in rows]
+ok("11.20c JSON_TABLE multi-level NESTED with LEFT-OUTER pad",
+   cleaned == [("L1", "P1"), ("L1", "P2"), ("L2", None)],
+   f"got {cleaned}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()
