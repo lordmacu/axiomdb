@@ -180,3 +180,113 @@ fn missing_rhs_path_filters_out() {
     assert!(text.contains("\"b\":1"));
     assert_eq!(text.matches("\"a\":1}").count(), 0);
 }
+
+// ── Phase 11.21g (partial): arithmetic in filter RHS ───────────────────────
+
+#[test]
+fn arith_path_times_literal() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    // price > cost * 1.5
+    let v = scalar(
+        "SELECT JSONB_PATH_QUERY_ARRAY(\
+            '[{\"price\":20,\"cost\":10},{\"price\":12,\"cost\":10}]', \
+            '$[?(@.price > @.cost * 1.5)]')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    let text = as_text(&v);
+    assert!(text.contains("\"price\":20"));
+    assert!(!text.contains("\"price\":12"));
+}
+
+#[test]
+fn arith_path_plus_path() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    // total >= a + b
+    let v = scalar(
+        "SELECT JSONB_PATH_QUERY_ARRAY(\
+            '[{\"a\":1,\"b\":2,\"total\":5},{\"a\":1,\"b\":2,\"total\":2}]', \
+            '$[?(@.total >= @.a + @.b)]')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    let text = as_text(&v);
+    assert!(text.contains("\"total\":5"));
+    assert!(!text.contains("\"total\":2"));
+}
+
+#[test]
+fn arith_division() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    // ratio == n / d
+    let v = scalar(
+        "SELECT JSONB_PATH_QUERY_ARRAY(\
+            '[{\"n\":10,\"d\":4,\"ratio\":2.5},{\"n\":10,\"d\":4,\"ratio\":1.0}]', \
+            '$[?(@.ratio == @.n / @.d)]')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    let text = as_text(&v);
+    assert!(text.contains("\"ratio\":2.5"));
+    assert!(!text.contains("\"ratio\":1.0"));
+}
+
+#[test]
+fn arith_precedence_mul_over_add() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    // x == 2 + 3 * 4  -> 14
+    let v = scalar(
+        "SELECT JSONB_PATH_QUERY_ARRAY(\
+            '[{\"x\":14},{\"x\":20}]', \
+            '$[?(@.x == 2 + 3 * 4)]')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    let text = as_text(&v);
+    assert!(text.contains("\"x\":14"));
+    assert!(!text.contains("\"x\":20"));
+}
+
+#[test]
+fn arith_modulo() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    // even-only via @.n % 2 == 0
+    let v = scalar(
+        "SELECT JSONB_PATH_QUERY_ARRAY(\
+            '[{\"n\":2},{\"n\":3},{\"n\":4}]', \
+            '$[?(@.n % 2 == 0)]')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    let text = as_text(&v);
+    assert!(text.contains("\"n\":2"));
+    assert!(text.contains("\"n\":4"));
+    assert!(!text.contains("\"n\":3"));
+}
+
+#[test]
+fn arith_div_by_zero_filters_out() {
+    let (mut s, mut t, mut b, mut c) = setup();
+    let v = scalar(
+        "SELECT JSONB_PATH_QUERY_ARRAY(\
+            '[{\"a\":10,\"b\":0},{\"a\":10,\"b\":2}]', \
+            '$[?(@.a / @.b > 0)]')",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    let text = as_text(&v);
+    assert!(text.contains("\"b\":2"));
+    assert_eq!(text.matches("\"b\":0").count(), 0);
+}
