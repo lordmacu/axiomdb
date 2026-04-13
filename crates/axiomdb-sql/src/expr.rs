@@ -365,6 +365,14 @@ pub enum BinaryOp {
     /// when the result is absent / multi-valued / non-boolean. Equivalent to
     /// `jsonb_path_match(doc, path)`.
     JsonbPathMatch,
+    /// `?|` — JSONB any-key existence (Phase 11.18b): `doc ?| keys` returns
+    /// true when at least one element of the RHS array matches a top-level
+    /// key (object) or string element (array) in the LHS document. RHS is a
+    /// JSONB array (no native `TEXT[]` — documented PG divergence).
+    JsonExistsAny,
+    /// `?&` — JSONB all-keys existence (Phase 11.18b): like `?|` but every
+    /// RHS-array element must match.
+    JsonExistsAll,
 }
 
 // ── SQL/JSON standard query functions (Phase 11.19a) ─────────────────────────

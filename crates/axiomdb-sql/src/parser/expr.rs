@@ -303,6 +303,17 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
             let right = parse_bitor(p)?;
             Ok(binop(BinaryOp::JsonExists, left, right))
         }
+        // Phase 11.18b: `?|` = any-of, `?&` = all-of (JSONB-array RHS).
+        Token::JsonExistsAny if !negated => {
+            p.advance();
+            let right = parse_bitor(p)?;
+            Ok(binop(BinaryOp::JsonExistsAny, left, right))
+        }
+        Token::JsonExistsAll if !negated => {
+            p.advance();
+            let right = parse_bitor(p)?;
+            Ok(binop(BinaryOp::JsonExistsAll, left, right))
+        }
         cmp if !negated => {
             let op = match cmp {
                 Token::NullSafe => BinaryOp::NullSafe,
