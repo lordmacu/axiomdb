@@ -1879,6 +1879,9 @@ pub(crate) enum FilterExpr {
         op: CmpOp,
         value: serde_json::Value,
     },
+    And(Box<FilterExpr>, Box<FilterExpr>),
+    Or(Box<FilterExpr>, Box<FilterExpr>),
+    Not(Box<FilterExpr>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2006,57 +2009,178 @@ fn parse_filter(s: &str) -> Result<FilterExpr, DbError> {
         })?
         .trim();
 
-    let inner = inner
-        .strip_prefix('@')
-        .ok_or_else(|| DbError::InvalidValue {
-            reason: format!("JSONPath filter must start with '@': {inner}"),
-        })?;
-
-    // Parse dot-path: .key.key2...
-    let mut path = Vec::new();
-    let mut rest = inner;
-    while let Some(r) = rest.strip_prefix('.') {
-        let end = r
-            .find(|c: char| c.is_whitespace() || c == '=' || c == '!' || c == '<' || c == '>')
-            .unwrap_or(r.len());
-        let key = &r[..end];
-        if !key.is_empty() {
-            path.push(key.to_string());
-        }
-        rest = &r[end..];
-        if rest.is_empty()
-            || rest.starts_with(char::is_whitespace)
-            || rest.starts_with(['=', '!', '<', '>'])
-        {
-            break;
-        }
-    }
-
-    let rest = rest.trim();
-    if rest.is_empty() {
-        return Ok(FilterExpr::Exists(path));
-    }
-
-    let (op, value_str) = if let Some(r) = rest.strip_prefix("==") {
-        (CmpOp::Eq, r.trim())
-    } else if let Some(r) = rest.strip_prefix("!=") {
-        (CmpOp::Ne, r.trim())
-    } else if let Some(r) = rest.strip_prefix("<=") {
-        (CmpOp::Le, r.trim())
-    } else if let Some(r) = rest.strip_prefix(">=") {
-        (CmpOp::Ge, r.trim())
-    } else if let Some(r) = rest.strip_prefix('<') {
-        (CmpOp::Lt, r.trim())
-    } else if let Some(r) = rest.strip_prefix('>') {
-        (CmpOp::Gt, r.trim())
-    } else if let Some(r) = rest.strip_prefix('=') {
-        (CmpOp::Eq, r.trim())
-    } else {
-        return Ok(FilterExpr::Exists(path));
+    let mut fp = FilterParser {
+        bytes: inner.as_bytes(),
+        pos: 0,
     };
+    let expr = fp.parse_or()?;
+    fp.skip_ws();
+    if fp.pos != fp.bytes.len() {
+        return Err(DbError::InvalidValue {
+            reason: format!(
+                "unexpected trailing input in JSONPath filter at offset {}: {}",
+                fp.pos, inner
+            ),
+        });
+    }
+    Ok(expr)
+}
 
-    let value = parse_jsonpath_literal(value_str)?;
-    Ok(FilterExpr::Compare { path, op, value })
+struct FilterParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl FilterParser<'_> {
+    fn skip_ws(&mut self) {
+        while self.pos < self.bytes.len() && (self.bytes[self.pos] as char).is_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn eat(&mut self, tok: &str) -> bool {
+        self.skip_ws();
+        let t = tok.as_bytes();
+        if self.pos + t.len() <= self.bytes.len() && &self.bytes[self.pos..self.pos + t.len()] == t
+        {
+            self.pos += t.len();
+            return true;
+        }
+        false
+    }
+
+    fn parse_or(&mut self) -> Result<FilterExpr, DbError> {
+        let mut left = self.parse_and()?;
+        loop {
+            self.skip_ws();
+            if self.eat("||") {
+                let right = self.parse_and()?;
+                left = FilterExpr::Or(Box::new(left), Box::new(right));
+            } else {
+                return Ok(left);
+            }
+        }
+    }
+
+    fn parse_and(&mut self) -> Result<FilterExpr, DbError> {
+        let mut left = self.parse_unary()?;
+        loop {
+            self.skip_ws();
+            if self.eat("&&") {
+                let right = self.parse_unary()?;
+                left = FilterExpr::And(Box::new(left), Box::new(right));
+            } else {
+                return Ok(left);
+            }
+        }
+    }
+
+    fn parse_unary(&mut self) -> Result<FilterExpr, DbError> {
+        self.skip_ws();
+        if self.eat("!") {
+            let inner = self.parse_unary()?;
+            return Ok(FilterExpr::Not(Box::new(inner)));
+        }
+        self.parse_atom()
+    }
+
+    fn parse_atom(&mut self) -> Result<FilterExpr, DbError> {
+        self.skip_ws();
+        if self.eat("(") {
+            let e = self.parse_or()?;
+            self.skip_ws();
+            if !self.eat(")") {
+                return Err(DbError::InvalidValue {
+                    reason: "missing ) in JSONPath filter".into(),
+                });
+            }
+            return Ok(e);
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<FilterExpr, DbError> {
+        self.skip_ws();
+        let src = std::str::from_utf8(&self.bytes[self.pos..]).unwrap_or("");
+        let rest = src.strip_prefix('@').ok_or_else(|| DbError::InvalidValue {
+            reason: format!("JSONPath filter atom must start with '@': {src}"),
+        })?;
+        let mut path = Vec::new();
+        let mut r = rest;
+        while let Some(s2) = r.strip_prefix('.') {
+            let end = s2
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || c == '='
+                        || c == '!'
+                        || c == '<'
+                        || c == '>'
+                        || c == '&'
+                        || c == '|'
+                        || c == ')'
+                })
+                .unwrap_or(s2.len());
+            let key = &s2[..end];
+            if !key.is_empty() {
+                path.push(key.to_string());
+            }
+            r = &s2[end..];
+            if r.is_empty()
+                || r.starts_with(char::is_whitespace)
+                || r.starts_with(['=', '!', '<', '>', '&', '|', ')'])
+            {
+                break;
+            }
+        }
+        // Consumed from src up to the remainder r — advance self.pos.
+        let consumed = src.len() - r.len();
+        // src started at self.pos (relative to bytes); but r = src — .. so
+        // `consumed` equals the number of bytes we parsed into the primary
+        // including the leading '@' (since `rest` began after `@`, we re-add 1).
+        self.pos += consumed;
+        let _ = rest; // suppress unused warning on older compilers
+
+        self.skip_ws();
+        let tail = std::str::from_utf8(&self.bytes[self.pos..]).unwrap_or("");
+        let (op, remainder) = if let Some(x) = tail.strip_prefix("==") {
+            (Some(CmpOp::Eq), x)
+        } else if let Some(x) = tail.strip_prefix("!=") {
+            (Some(CmpOp::Ne), x)
+        } else if let Some(x) = tail.strip_prefix("<=") {
+            (Some(CmpOp::Le), x)
+        } else if let Some(x) = tail.strip_prefix(">=") {
+            (Some(CmpOp::Ge), x)
+        } else if let Some(x) = tail.strip_prefix('<') {
+            (Some(CmpOp::Lt), x)
+        } else if let Some(x) = tail.strip_prefix('>') {
+            (Some(CmpOp::Gt), x)
+        } else if let Some(x) = tail.strip_prefix('=') {
+            (Some(CmpOp::Eq), x)
+        } else {
+            (None, tail)
+        };
+
+        let Some(op) = op else {
+            return Ok(FilterExpr::Exists(path));
+        };
+        // Advance past the operator token.
+        let op_len = tail.len() - remainder.len();
+        self.pos += op_len;
+
+        // Parse the RHS literal up to next combinator / close paren.
+        let rhs = std::str::from_utf8(&self.bytes[self.pos..]).unwrap_or("");
+        let rhs_trim = rhs.trim_start();
+        let ws_consumed = rhs.len() - rhs_trim.len();
+        self.pos += ws_consumed;
+        let rhs = rhs_trim;
+        let end = rhs.find(['&', '|', ')']).unwrap_or(rhs.len());
+        let (lit_str, _tail_after) = rhs.split_at(end);
+        let lit_str = lit_str.trim_end();
+        self.pos += lit_str.len();
+        // Skip any trailing whitespace we just reported as part of the literal.
+        let value = parse_jsonpath_literal(lit_str)?;
+        Ok(FilterExpr::Compare { path, op, value })
+    }
 }
 
 fn parse_jsonpath_literal(s: &str) -> Result<serde_json::Value, DbError> {
@@ -2250,6 +2374,9 @@ fn eval_filter(node: &serde_json::Value, filter: &FilterExpr) -> bool {
             }
             compare_json(current, *op, value)
         }
+        FilterExpr::And(a, b) => eval_filter(node, a) && eval_filter(node, b),
+        FilterExpr::Or(a, b) => eval_filter(node, a) || eval_filter(node, b),
+        FilterExpr::Not(inner) => !eval_filter(node, inner),
     }
 }
 
