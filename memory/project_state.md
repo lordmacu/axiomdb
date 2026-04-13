@@ -3,7 +3,7 @@
 ## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 11.25b JSON aggregates (PG `jsonb_agg` / `jsonb_object_agg` + text variants + MySQL `JSON_ARRAYAGG` / `JSON_OBJECTAGG`) — ✅ closed. Remaining fase 11 (MySQL+PG path): 11.18c, 11.21h, 11.25c, 11.25d.
+**Active subphase:** 11.25c JSON construction helpers (`jsonb_build_object`, `jsonb_build_array`, `to_json`) — ✅ closed (row_to_json deferred). Remaining fase 11 (MySQL+PG path): 11.18c, 11.21h, 11.25d.
 
 ### Phase 11 subphase status
 

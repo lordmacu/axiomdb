@@ -912,19 +912,28 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
 
         // ── Phase 11.25b: JSON constructors + merge_preserve + contains_path
         // JSON_ARRAY(v1, v2, ...) → JSON array.
-        "json_array" => {
+        // Phase 11.25c: `jsonb_build_array` is the PG name for the same
+        // builder but returns JSONB binary instead of JSON text.
+        "json_array" | "jsonb_build_array" => {
             let mut items = Vec::with_capacity(args.len());
             for i in 0..args.len() {
                 let v = eval_arg(args, i, row, name)?;
                 items.push(sql_to_serde_json(&v));
             }
-            Ok(Value::Json(serde_json::Value::Array(items).to_string()))
+            let arr = serde_json::Value::Array(items);
+            if name == "jsonb_build_array" {
+                let blob = JsonbEncoder::encode(&arr)?;
+                Ok(Value::Jsonb(Arc::new(blob)))
+            } else {
+                Ok(Value::Json(arr.to_string()))
+            }
         }
         // JSON_OBJECT(k1, v1, k2, v2, ...) → JSON object. Even arg count.
-        "json_object" => {
+        // Phase 11.25c: `jsonb_build_object` is the PG name, returns JSONB.
+        "json_object" | "jsonb_build_object" => {
             if !args.len().is_multiple_of(2) {
                 return Err(DbError::TypeMismatch {
-                    expected: "json_object: even arg count (key/value pairs)".into(),
+                    expected: format!("{name}: even arg count (key/value pairs)"),
                     got: args.len().to_string(),
                 });
             }
@@ -937,14 +946,28 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
                     Value::Text(s) | Value::Json(s) => s,
                     Value::Null => {
                         return Err(DbError::InvalidValue {
-                            reason: "json_object: NULL key".into(),
+                            reason: format!("{name}: NULL key"),
                         });
                     }
                     other => other.to_string(),
                 };
                 map.insert(key, sql_to_serde_json(&v));
             }
-            Ok(Value::Json(serde_json::Value::Object(map).to_string()))
+            let obj = serde_json::Value::Object(map);
+            if name == "jsonb_build_object" {
+                let blob = JsonbEncoder::encode(&obj)?;
+                Ok(Value::Jsonb(Arc::new(blob)))
+            } else {
+                Ok(Value::Json(obj.to_string()))
+            }
+        }
+        // Phase 11.25c: `to_json(v)` is the PG alias of `to_jsonb(v)` but
+        // returns JSON text instead of JSONB binary.
+        "to_json" => {
+            expect_arg_count(name, args, 1)?;
+            let v = eval_arg(args, 0, row, name)?;
+            let sj = sql_to_serde_json(&v);
+            Ok(Value::Json(sj.to_string()))
         }
         // JSON_MERGE_PRESERVE(d1, d2, ...) — array-concat on conflict,
         // object-key overwrite from right. Mirrors MySQL deprecated-alias
