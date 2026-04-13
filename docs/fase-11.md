@@ -227,3 +227,48 @@ argumento y usan el codec binario en lugar de re-parsear texto.
 | jsonb/encode_small | sin referencia formal | N/A | N/A | sin limite 11.16 | sin limite 11.16 | ✅ |
 | jsonb/decode_small | sin referencia formal | N/A | N/A | sin limite 11.16 | sin limite 11.16 | ✅ |
 | jsonb/get_key | sin referencia formal | N/A | N/A | sin limite 11.16 | sin limite 11.16 | ✅ |
+
+---
+
+## 11.20a — `JSON_TABLE` flat row source (2026-04-13)
+
+### Resumen
+
+`JSON_TABLE(doc, '$.row_path' COLUMNS (...))` ahora funciona como fuente de
+filas en `FROM`. Cubre: `name TYPE PATH '$.x'`, `name FOR ORDINALITY`,
+`name TYPE EXISTS PATH '$.x'`, con clausulas `ON EMPTY` / `ON ERROR`
+(`NULL` / `ERROR` / `DEFAULT expr`) y `TRUE|FALSE|UNKNOWN|ERROR ON ERROR`
+en columnas EXISTS. No incluye `NESTED PATH` (11.20b/c) ni WRAPPER/QUOTES/
+PASSING sobre la row-path (11.20d).
+
+### Componentes
+
+- AST: `FromClause::JsonTable(Box<JsonTable>)`, `JsonTableColumn::{Regular,
+  Ordinality, Exists}` en `crates/axiomdb-sql/src/ast.rs`.
+- Parser: `crates/axiomdb-sql/src/parser/json_table.rs` + dispatch
+  peek-`(` en `parse_from_item` de `dml.rs`.
+- Analyzer: arma la `BoundTable` virtual en `bound_from_clause` y resuelve
+  el `doc` + `DEFAULT` exprs en `analyzer_stmt::resolve_json_table`.
+- Ejecutor: `crates/axiomdb-sql/src/json_table.rs` compila las PATH una
+  sola vez y materializa con un walker recursivo estilo MariaDB.
+  - First-FROM: `execute_select_json_table_source` en `select_core.rs`.
+  - JOIN right-side: nuevo arm en `select_joins_ctx.rs` (rechaza `doc`
+    correlacionado con `NotImplemented` que apunta a 11.20d).
+
+### Validacion
+
+- `cargo test -p axiomdb-sql --test integration_json_table` — 16/16 OK.
+- `cargo test -p axiomdb-sql` — sin regresion (los 8 failures de
+  `integration_jsonb_path_ops` son gap 11.18c pre-existente).
+- `cargo clippy -p axiomdb-sql --lib -- -D warnings` — limpio.
+- `cargo fmt --check` — limpio.
+- `tools/wire-test.py` — 367/367 OK (incluye 6 nuevas aserciones JSON_TABLE).
+
+### Diferencias vs PostgreSQL / MariaDB
+
+- `doc` correlacionado a columnas del FROM izquierdo (`JSON_TABLE(u.tags, ...)`
+  en un JOIN) se rechaza con error explicito pidiendo 11.20d. PG/MariaDB
+  lo soportan nativamente via semantica LATERAL.
+- `JSON_TABLE` como primera entrada del `FROM` combinada con `JOIN` tambien
+  se rechaza; PG/MariaDB tratan `JSON_TABLE` como fuente simetrica.
+- `NESTED PATH` no soportado todavia.

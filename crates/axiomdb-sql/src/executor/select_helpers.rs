@@ -59,6 +59,13 @@ fn execute_select_with_joins(
                     all_sources.push(join_source_schema_from_derived(alias, columns));
                     scanned.push(rows);
                 }
+                FromClause::JsonTable(_) => {
+                    return Err(DbError::NotImplemented {
+                        feature: "JSON_TABLE JOIN via the non-ctx executor path; \
+                                  use a session-bound query path"
+                            .into(),
+                    });
+                }
             }
         }
     }

@@ -289,6 +289,23 @@ impl<'r, 'db> DepCollector<'r, 'db> {
         match from {
             FromClause::Table(tref) => self.visit_tableref(tref),
             FromClause::Subquery { query, .. } => self.visit_select(query),
+            FromClause::JsonTable(jt) => {
+                self.visit_expr(&jt.doc)?;
+                for col in &jt.columns {
+                    if let crate::ast::JsonTableColumn::Regular {
+                        on_empty, on_error, ..
+                    } = col
+                    {
+                        if let crate::expr::SqlJsonOnBehavior::Default(e) = on_empty {
+                            self.visit_expr(e)?;
+                        }
+                        if let crate::expr::SqlJsonOnBehavior::Default(e) = on_error {
+                            self.visit_expr(e)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
         }
     }
 

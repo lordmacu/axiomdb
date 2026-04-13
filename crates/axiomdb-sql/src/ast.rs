@@ -211,7 +211,7 @@ pub enum SelectItem {
     Expr { expr: Expr, alias: Option<String> },
 }
 
-/// The `FROM` source: a table or a subquery.
+/// The `FROM` source: a table, a subquery, or a table-valued function.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FromClause {
     Table(TableRef),
@@ -219,6 +219,50 @@ pub enum FromClause {
     Subquery {
         query: Box<SelectStmt>,
         alias: String,
+    },
+    /// `JSON_TABLE(doc, '$.path' COLUMNS (...)) [AS alias]` — SQL:2016
+    /// table-valued function (Phase 11.20a, flat subset).
+    JsonTable(Box<JsonTable>),
+}
+
+/// `JSON_TABLE(doc, row_path COLUMNS (...))` — SQL:2016 table-valued function.
+///
+/// Phase 11.20a: flat form only (no `NESTED PATH`). The row path is held as a
+/// raw string at parse time and compiled once per statement invocation at
+/// executor preamble via `crate::json_table::compile_json_table`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonTable {
+    /// Document expression — must evaluate to JSONB/JSON/TEXT at exec time.
+    pub doc: Expr,
+    /// Row path as a SQL string literal, e.g. `'$[*]'`.
+    pub row_path: String,
+    /// Column declarations in the `COLUMNS(...)` list.
+    pub columns: Vec<JsonTableColumn>,
+    /// Alias after `AS` (defaults to a synthetic name when omitted).
+    pub alias: Option<String>,
+}
+
+/// One column inside a JSON_TABLE's `COLUMNS(...)` list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsonTableColumn {
+    /// `name TYPE PATH 'jsonpath' [ON EMPTY] [ON ERROR]`.
+    Regular {
+        name: String,
+        ty: DataType,
+        path: String,
+        /// Default behavior: `SqlJsonOnBehavior::Null` (SQL:2016 spec default).
+        on_empty: crate::expr::SqlJsonOnBehavior,
+        on_error: crate::expr::SqlJsonOnBehavior,
+    },
+    /// `name FOR ORDINALITY` — 1-based BIGINT counter.
+    Ordinality { name: String },
+    /// `name TYPE EXISTS PATH 'jsonpath' [<bool|UNKNOWN|ERROR> ON ERROR]`.
+    Exists {
+        name: String,
+        ty: DataType,
+        path: String,
+        /// Default behavior: `SqlJsonOnBehavior::FalseLit` (PG parity).
+        on_error: crate::expr::SqlJsonOnBehavior,
     },
 }
 

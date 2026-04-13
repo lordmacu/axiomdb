@@ -882,3 +882,53 @@ workloads at realistic connection concurrency.
 Identifiers are <code>&'src str</code> slices into the original SQL string — no heap allocation during lexing. The Rust lifetime <code>'src</code> enforces at compile time that tokens cannot outlive the input. Only <code>StringLit</code> allocates, because escape processing (<code>\'</code>, <code>\\</code>, <code>\n</code>) must transform the content in place.
 </div>
 </div>
+
+---
+
+## Phase 11.20a — `JSON_TABLE` grammar
+
+```
+table_factor := ... | json_table_call
+
+json_table_call := JSON_TABLE '(' expr ',' string_literal
+                     COLUMNS '(' column_def (',' column_def)* ')'
+                   ')' [ [AS] ident ]
+
+column_def := ident type PATH string_literal
+                     [ on_behavior 'ON' 'EMPTY' ]
+                     [ on_behavior 'ON' 'ERROR' ]
+            | ident 'FOR' 'ORDINALITY'
+            | ident type 'EXISTS' 'PATH' string_literal
+                     [ exists_on_error ]
+
+on_behavior     := 'NULL' | 'ERROR' | 'DEFAULT' expr
+exists_on_error := ('TRUE' | 'FALSE' | 'UNKNOWN' | 'ERROR') 'ON' 'ERROR'
+```
+
+### Dispatch
+
+`parse_from_item` peeks for the case-insensitive identifier `JSON_TABLE` followed
+by `(`. If present it delegates to `parser::json_table::parse_json_table_call`.
+If `JSON_TABLE` appears without an opening `(`, the parser falls through to the
+standard table-ref path — a user table named `json_table` still resolves normally.
+
+### Compilation
+
+The analyzer resolves column references inside the `doc` expression and any
+`DEFAULT` expressions in ON EMPTY / ON ERROR clauses against the outer
+`BindContext` (see `analyzer_stmt.rs::resolve_json_table`). The row path and
+every column `PATH` string are compiled into `Vec<PathStepOwned>` once per
+statement via `json_table::compile_json_table`; subsequent row emission walks
+the pre-compiled step list — no per-row parsing.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">MariaDB-style recursive walk</span>
+The executor uses the MariaDB <code>json_table.cc</code> recursive-walk model
+rather than PostgreSQL's pre-flattened plan tree. Mapping onto AxiomDB's
+<code>Vec&lt;Row&gt;</code> executor is direct and avoids the SiblingJoin node
+type PG introduces for NESTED PATH — to be revisited when <code>NESTED PATH</code>
+lands in 11.20c.
+</div>
+</div>

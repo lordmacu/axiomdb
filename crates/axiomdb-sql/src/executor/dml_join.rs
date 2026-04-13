@@ -331,6 +331,12 @@ fn collect_dml_join_candidates_ctx(
                     target: None,
                 }).collect());
             }
+            FromClause::JsonTable(_) => {
+                return Err(DbError::NotImplemented {
+                    feature: "JSON_TABLE as DML (UPDATE/DELETE) JOIN source — deferred to 11.20d"
+                        .into(),
+                });
+            }
         }
     }
 

@@ -1,5 +1,52 @@
 # Architecture Notes
 
+## 2026-04-13 — `JSON_TABLE` flat row source (11.20a)
+
+- **New module**: `crates/axiomdb-sql/src/json_table.rs`. Owns compile + materialize.
+  - `JsonTableSpec` holds `Vec<PathStepOwned>` compiled once per statement
+    (row path + every column PATH); `materialize_json_table` walks without
+    re-parsing.
+  - `PathStepOwned` is an owned, trivially-cloneable subset (`Root`, `Key`,
+    `Index`, `WildcardKey`, `WildcardIndex`, `Recursive`) — distinct from the
+    richer `PathStep` enum in `eval::functions::json` that carries `Expr`
+    filter nodes (not needed here).
+- **AST**: `FromClause::JsonTable(Box<JsonTable>)` with three column shapes:
+  `Regular { ty, path, on_empty, on_error }`, `Ordinality { name }`,
+  `Exists { ty, path, on_error }`. Reuses the Phase 11.19a
+  `SqlJsonOnBehavior` enum (`Null | Error | Default(Expr) | TrueLit | FalseLit | Unknown`).
+- **Parser dispatch**: `parse_from_item` uses `peek_at(1) == Token::LParen`
+  to commit to the `JSON_TABLE` branch only when the identifier is followed
+  by `(`. This keeps a user table literally named `json_table` working.
+  `COLUMNS`, `PATH`, `ORDINALITY`, `EMPTY`, `UNKNOWN` are plain identifiers;
+  `FOR`, `DEFAULT`, `EXISTS`, `NULL`, `TRUE`, `FALSE`, `ON`, `AS` are reserved
+  tokens (`Token::For`, `Token::Default`, `Token::Exists`, etc.).
+- **Analyzer**: `bound_from_clause` publishes `JsonTable` as a virtual
+  `BoundTable` (columns built from the declared DataTypes + nullability from
+  `on_empty=Null`). `analyzer_stmt::resolve_json_table` re-runs
+  `resolve_expr_full` over the `doc` expression and every `DEFAULT expr`
+  inside ON EMPTY / ON ERROR so correlation (through `OuterColumn`) and
+  outer-scope binding stay consistent with subquery-in-FROM handling.
+- **Executor**: First-FROM case goes through `execute_select_json_table_source`
+  in `select_core.rs` (mirrors `execute_select_derived`). JOIN right-side
+  case goes through a new arm in `select_joins_ctx.rs` that compiles + walks
+  in-place. **Deliberate restriction for 11.20a**:
+  1. `doc_has_column_refs` guards the JOIN path — any column reference in
+     `doc` triggers a `NotImplemented` pointing to 11.20d (LATERAL semantics
+     require per-left-row re-materialization).
+  2. `JSON_TABLE` as the first FROM combined with JOIN also raises
+     `NotImplemented` (generalizing `select_joins_ctx.rs` to accept a non-
+     TableRef first source is 11.20d scope).
+- **Semantics chosen**: `Value::Null` doc → zero rows (PG/MariaDB parity, not
+  an error); invalid TEXT JSON → `InvalidCoercion`; scalar PATH miss →
+  `ON EMPTY` (default `Null`); scalar type mismatch / multi-match →
+  `ON ERROR` (default `Null`); `EXISTS` defaults `FALSE ON ERROR`.
+- **Research reference**: PG `parse_jsontable.c` + `nodeTableFuncscan.c`
+  use a flattened plan tree with a `SiblingJoin` node; MariaDB `json_table.cc`
+  uses recursive sibling-walk with `m_ordinality_counter` per path. AxiomDB
+  adopts MariaDB's model — cleaner fit for the `Vec<Row>` executor. When
+  NESTED PATH lands in 11.20c the same module adds recursive child-walk
+  without a dedicated plan-tree IR.
+
 ## 2026-04-10 - JSONB binary layout (11.16)
 
 - `crates/axiomdb-types/src/jsonb.rs` owns the binary JSONB format:
