@@ -1,5 +1,41 @@
 # Architecture Notes
 
+## 2026-04-13 — JSON_TABLE first FROM + CROSS/OUTER APPLY (11.20d2)
+
+- **Join-loop split.** `execute_select_with_joins_ctx` (the ctx-path
+  entry used when `FROM` is a `TableRef`) is now a thin wrapper that
+  resolves the base table, scans it, and delegates to a new shared
+  helper `execute_select_with_joins_first_materialized(stmt,
+  first_source: JoinSourceSchema, first_rows: Vec<Row>, exec_ctx,
+  conn_txn, ctx)`. The helper owns the entire nested-loop join
+  pipeline that used to be inline. No semantic change for existing
+  callers.
+- **JSON_TABLE as first FROM + JOINs** now flows through the same
+  helper: `execute_select_json_table_source` compiles JSON_TABLE,
+  evaluates `doc` once against an empty row, materializes, and
+  delegates — with a temp `ExecutionContext::new(storage, txn,
+  &temp_bloom, None)` and `SessionContext::new()` built on the spot
+  (same pattern as `execute_select_derived` for subquery-first FROM).
+  The prior `NotImplemented` early-return is gone.
+- **CROSS APPLY / OUTER APPLY as pure parse-time desugar.** New
+  `Token::Apply` in the lexer. `parse_join_clauses` peeks two tokens
+  to disambiguate `CROSS APPLY` from `CROSS JOIN`; the APPLY arm emits
+  `JoinType::Inner` (or `Left` for `OUTER APPLY`) with
+  `JoinCondition::On(Expr::Literal(Value::Bool(true)))`. No new
+  `JoinType` variants — the downstream join loop, projection binder,
+  and EXPLAIN output see standard `InnerJoin`/`LeftJoin` nodes.
+- **`Outer` at top-level of `parse_join_clauses`** previously never
+  matched (it is always consumed inside LEFT/RIGHT/FULL arms first).
+  The APPLY dispatch is placed *above* the per-token match so
+  `Outer + Apply` triggers before any other rule sees `Outer`; the
+  `LEFT [OUTER] JOIN` path is untouched because `LEFT` consumes the
+  `Outer` token inline.
+- **Correlation guardrail unchanged.** `doc_has_column_refs` still
+  rejects correlated `doc` on APPLY right-side sources with the
+  11.20d3 `NotImplemented` message. The first-FROM path also runs it
+  defensively even though a first-FROM `doc` cannot reference outer
+  columns by definition.
+
 ## 2026-04-13 — `JSON_TABLE` multi-sibling + multi-level NESTED (11.20c)
 
 - **Guards removed**: the 11.20b `depth >= 1 → NotImplemented` and

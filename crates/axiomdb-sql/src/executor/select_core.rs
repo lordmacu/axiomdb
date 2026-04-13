@@ -469,10 +469,13 @@ fn execute_select_json_table_source(
         _ => unreachable!("execute_select_json_table_source called with non-JsonTable FROM"),
     };
 
-    if !stmt.joins.is_empty() {
+    // Defensive: first-FROM JSON_TABLE doc cannot reference outer columns by
+    // definition (no outer source). Any column refs escaped 11.20a binding →
+    // raise the same deferred-11.20d3 message the JOIN right-side path uses.
+    if crate::json_table::doc_has_column_refs(&jt_ast.doc) {
         return Err(DbError::NotImplemented {
-            feature: "JSON_TABLE as the first FROM entry combined with JOIN — \
-                      deferred to 11.20d (put a real table first and JSON_TABLE on the right)"
+            feature: "correlated JSON_TABLE in a JOIN (LATERAL semantics) — \
+                      deferred to 11.20d"
                 .into(),
         });
     }
@@ -488,6 +491,23 @@ fn execute_select_json_table_source(
         }
     };
     let derived_cols = crate::json_table::column_metas_for_spec(&spec);
+
+    // Phase 11.20d2: JSON_TABLE as first FROM combined with JOINs — route to
+    // the shared join-loop entry point with the materialized rows as source 0.
+    if !stmt.joins.is_empty() {
+        let mut temp_ctx = SessionContext::new();
+        let temp_bloom = crate::bloom::BloomRegistry::new();
+        let temp_exec_ctx = ExecutionContext::new(storage, txn, &temp_bloom, None);
+        let first_source = join_source_schema_from_derived(&spec.alias, derived_cols);
+        return execute_select_with_joins_first_materialized(
+            stmt,
+            first_source,
+            derived_rows,
+            &temp_exec_ctx,
+            _conn_txn,
+            &mut temp_ctx,
+        );
+    }
 
     // Apply outer WHERE.
     let mut combined_rows: Vec<Row> = Vec::new();

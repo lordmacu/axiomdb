@@ -385,7 +385,7 @@ fn depth_limit_rejected_above_32() {
     }
     sql.push_str("v INT PATH '$'");
     for _ in 0..33 {
-        sql.push_str(")");
+        sql.push(')');
     }
     sql.push_str(")) AS t");
     let err = run_ctx(&sql, &mut s, &mut t, &mut b, &mut c);

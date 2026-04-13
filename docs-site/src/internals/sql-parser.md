@@ -885,16 +885,68 @@ Identifiers are <code>&'src str</code> slices into the original SQL string — n
 
 ---
 
-## Phase 11.20a — `JSON_TABLE` grammar
+## Phase 11.20d2 — JSON_TABLE first FROM + CROSS/OUTER APPLY
+
+Two small additions layered on the existing join infrastructure:
+
+```
+join_item := 'CROSS' 'APPLY' from_item
+           | 'OUTER' 'APPLY' from_item
+           | (existing INNER | LEFT | RIGHT | FULL | CROSS) 'JOIN' from_item join_condition
+```
+
+`parse_join_clauses` disambiguates the `CROSS` keyword by peeking the next
+token: if `APPLY`, it desugars to `JoinType::Inner` with `ON TRUE`; if
+`JOIN`, it falls through to the existing `CROSS JOIN` arm. `OUTER` at the
+top level of the join match only triggers when followed by `APPLY` —
+`LEFT / RIGHT / FULL [OUTER] JOIN` consume `OUTER` inside their own arms
+first, so there is no grammar collision. `APPLY` accepts any `from_item`
+(table, subquery, `JSON_TABLE(...)`); `ON` or `USING` after `APPLY` is an
+explicit parse error because the join condition is implicit `TRUE`.
+
+CROSS/OUTER APPLY desugars at parse time — no new `JoinType` variants
+are introduced. Surface-form round-trip is not preserved.
+
+Executor side: `execute_select_with_joins_ctx` is split into a thin
+wrapper that resolves the base table and a reusable helper
+`execute_select_with_joins_first_materialized(stmt, first_source,
+first_rows, exec_ctx, conn_txn, ctx)` that owns the nested-loop join
+pipeline. `execute_select_json_table_source` materializes JSON_TABLE
+as source 0 and delegates to the same helper with a temp
+`ExecutionContext` / `SessionContext` (the same pattern
+`execute_select_derived` uses for subquery-first FROM).
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">APPLY as pure desugar, not a new join type</span>
+SQL Server, Oracle, and Sybase all expose <code>CROSS APPLY</code> /
+<code>OUTER APPLY</code>; PostgreSQL spells the same concept as
+<code>JOIN LATERAL ... ON TRUE</code>. Because the non-correlated case
+is semantically identical to <code>JOIN ... ON TRUE</code>, AxiomDB
+parses APPLY directly into that shape. The join loop, projection
+binder, and EXPLAIN output all see a standard <code>InnerJoin</code>
+or <code>LeftJoin</code> — no new code paths downstream, and the
+LATERAL correlation work in 11.20d3 can specialize the same join
+node without reworking APPLY grammar.
+</div>
+</div>
+
+## Phase 11.20a–d1 — `JSON_TABLE` grammar
 
 ```
 table_factor := ... | json_table_call
 
 json_table_call := JSON_TABLE '(' expr ',' string_literal
+                     [ 'PASSING' passing_item (',' passing_item)* ]
                      COLUMNS '(' column_def (',' column_def)* ')'
                    ')' [ [AS] ident ]
 
+passing_item := expr 'AS' ident
+
 column_def := ident type PATH string_literal
+                     [ wrapper_clause ]
+                     [ quotes_clause ]
                      [ on_behavior 'ON' 'EMPTY' ]
                      [ on_behavior 'ON' 'ERROR' ]
             | ident 'FOR' 'ORDINALITY'
@@ -903,14 +955,19 @@ column_def := ident type PATH string_literal
             | 'NESTED' [ 'PATH' ] string_literal
                      'COLUMNS' '(' column_def (',' column_def)* ')'
 
+wrapper_clause  := 'WITH' ['CONDITIONAL' | 'UNCONDITIONAL'] ['ARRAY'] 'WRAPPER'
+                 | 'WITHOUT' ['ARRAY'] 'WRAPPER'
+quotes_clause   := ('KEEP' | 'OMIT') 'QUOTES' ['ON' 'SCALAR' 'STRING']
 on_behavior     := 'NULL' | 'ERROR' | 'DEFAULT' expr
 exists_on_error := ('TRUE' | 'FALSE' | 'UNKNOWN' | 'ERROR') 'ON' 'ERROR'
 ```
 
-Phase 11.20b accepts the `NESTED` production grammatically at any depth;
-`json_table::compile_columns_recursive` enforces the 11.20b runtime
-constraints — **one** NESTED sibling per `COLUMNS(...)` list and **depth
-≤ 1** — raising a clear `NotImplemented` pointing to 11.20c otherwise.
+Phase 11.20b/c accept arbitrary `NESTED` depth (bounded defensively to 32).
+Phase 11.20d1 adds `PASSING` and the per-column `WRAPPER` / `QUOTES` clauses.
+The `WRAPPER`/`QUOTES` grammar is parsed by
+`parser::sql_json_common::{parse_optional_wrapper, parse_optional_quotes}`,
+the same helpers `JSON_QUERY` uses. `OMIT QUOTES` on a non-TEXT column is
+a parse-time error, as is a duplicate `PASSING` variable name.
 
 ### Dispatch
 
@@ -924,18 +981,26 @@ standard table-ref path — a user table named `json_table` still resolves norma
 The analyzer resolves column references inside the `doc` expression and any
 `DEFAULT` expressions in ON EMPTY / ON ERROR clauses against the outer
 `BindContext` (see `analyzer_stmt.rs::resolve_json_table`). The row path and
-every column `PATH` string are compiled into `Vec<PathStepOwned>` once per
-statement via `json_table::compile_json_table`; subsequent row emission walks
-the pre-compiled step list — no per-row parsing.
+every column `PATH` string are compiled via the full
+`eval::functions::json::parse_jsonpath` engine (11.20d1 migrated away from the
+legacy restricted walker) into `Vec<PathStep>` once per statement in
+`json_table::compile_json_table`. Row emission walks the pre-compiled step
+list via `execute_jsonpath_owned_env` — no per-row parsing, and filter
+expressions / `.size()` / `.type()` / `$var` references all work
+uniformly across SQL/JSON surfaces.
 
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
-<span class="callout-label">MariaDB-style recursive walk</span>
-The executor uses the MariaDB <code>json_table.cc</code> recursive-walk model
-rather than PostgreSQL's pre-flattened plan tree. Mapping onto AxiomDB's
-<code>Vec&lt;Row&gt;</code> executor is direct and avoids the SiblingJoin node
-type PG introduces for NESTED PATH — to be revisited when <code>NESTED PATH</code>
-lands in 11.20c.
+<span class="callout-label">Unified JSONPath engine + recursive walk</span>
+The executor keeps the MariaDB <code>json_table.cc</code> recursive-walk
+model for row emission (no SiblingJoin plan node), but 11.20d1 retired the
+restricted per-feature walker. Every path site (row path, column path,
+NESTED path) now goes through the same <code>parse_jsonpath</code>
+engine that powers <code>jsonb_path_*</code>, <code>@?</code>,
+<code>@@</code>, and filter accessors. PASSING variables thread through
+<code>PassingEnv</code> — a single <code>HashMap&lt;String,
+serde_json::Value&gt;</code> built once per JSON_TABLE invocation and
+shared by every filter evaluation at every nesting depth.
 </div>
 </div>

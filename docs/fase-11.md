@@ -369,3 +369,203 @@ Una sola funcion recursiva expresa todos los casos (flat, single-NESTED,
 multi-sibling, multi-level, mixto). No hay plan-tree IR separado (modelo
 MariaDB). PG usa `JsonTableSiblingJoin` node; AxiomDB lo inlinea como
 iteracion sobre siblings en `emit_rows_rec`.
+
+---
+
+## Subfase 11.20d1 — WRAPPER / QUOTES / PASSING
+
+Cerrada 2026-04-13.
+
+### Gramatica aceptada
+
+```
+JSON_TABLE(doc, row_path
+    [ PASSING expr AS name [, expr AS name]* ]
+    COLUMNS (
+        col_name TYPE PATH '<jsonpath>'
+            [ WITH [CONDITIONAL|UNCONDITIONAL] [ARRAY] WRAPPER
+            | WITHOUT [ARRAY] WRAPPER ]
+            [ KEEP | OMIT QUOTES [ON SCALAR STRING] ]
+            [ ON EMPTY ] [ ON ERROR ],
+        ...
+    )
+) [AS alias]
+```
+
+Orden clausulas SQL:2016 / PG / Oracle: `PATH → WRAPPER → QUOTES →
+ON EMPTY → ON ERROR`.
+
+### Decision arquitectural — migracion a motor JSONPath completo
+
+Se elimina el walker legacy (`PathStepOwned` + `parse_restricted_path` +
+`walk_path_owned` + step_* helpers — ~220 LoC). JSON_TABLE usa ahora el
+motor `parse_jsonpath` / `execute_jsonpath_owned_env` de
+`eval::functions::json`. Razones:
+
+1. PASSING `$var` requiere un evaluador con tabla de variables; duplicar
+   en dos walkers invita divergencia.
+2. El 11.21* (filtros, `.size()`, `.type()`, aritmetica) ya vive en el
+   motor completo; usuarios esperan el mismo dialecto.
+3. Sin perdida de perf en paths planos — ambos walkers ejecutan
+   `Key`/`Index` con el mismo costo.
+
+### Engine extension — `FilterSide::Var`
+
+Nueva variante en `eval::functions::json::FilterSide`. Parser de filtros
+acepta `$name`, termina en whitespace u operador aritmetico. Resolucion
+contra `PassingEnv` (`HashMap<String, serde_json::Value>`). Variable no
+declarada → `None` → filtro falso en esa fila (parity PG lax mode). Cada
+entry point publico del motor tiene gemelo `_env`:
+
+- `execute_jsonpath_env(root, steps, env) -> Vec<&Value>`
+- `execute_jsonpath_owned_env(root, steps, env) -> Vec<Value>`
+
+Entry points no-`_env` son shims con env vacio, cero breakage en
+11.19b/c, 11.21a/b/c, `@?`, `@@`, `jsonb_path_*`.
+
+### Parser helpers extraidos
+
+`parser::sql_json_common` module nuevo con 3 fns reutilizables:
+`parse_optional_wrapper`, `parse_optional_quotes`,
+`parse_optional_passing`. JSON_TABLE las llama; el parser inline de
+`SqlJsonQuery` (11.19b/c) puede migrarse tambien en una refactor
+posterior sin cambio de comportamiento.
+
+### WRAPPER — tres modos
+
+- `WITHOUT` (default): match unico → pass-through; multi-match → ON ERROR.
+- `WITH UNCONDITIONAL ARRAY`: siempre envuelve en `[...]` (hasta
+  match vacio → `[]`, pero en JSON_TABLE `empty → ON EMPTY` se dispara
+  primero).
+- `WITH CONDITIONAL ARRAY`: single match que ya es array → unwrap;
+  cualquier otro caso → envuelve. Parity PG.
+
+### QUOTES — solo TEXT
+
+`OMIT QUOTES [ON SCALAR STRING]` sobre columna TEXT cuyo hit es un
+string escalar → emite `Value::Text(raw)` sin las comillas JSON
+circundantes. Sobre cualquier otra combinacion el render normal de
+`serde_to_value_typed` aplica. Parser rechaza `OMIT QUOTES` sobre
+columnas non-TEXT (`ParseError` con mensaje explicito).
+
+### PASSING lifecycle
+
+- Parse: `parse_optional_passing` produce `Vec<(Expr, String)>`.
+- Analyzer: expresiones visibles para binding como cualquier expr de
+  nivel FROM. Para 11.20d1 no pueden referenciar columnas outer
+  (correlacion en 11.20d3).
+- Compile: `compile_json_table` verifica nombres unicos
+  case-insensitive y los guarda en `JsonTableSpec.passing`.
+- Materialize: `materialize_json_table` evalua cada expr una vez
+  (`outer_row = &[]` para first-FROM), JSON-ifica via
+  `value_to_serde_for_env`, construye `PassingEnv`, lo threads en:
+  - `execute_jsonpath_owned_env(doc, row_path, &env)` — row path
+  - `emit_rows_rec(..., &env, ...)` — cada nivel
+  - `materialize_regular` / `materialize_exists` — cada column path
+  - walk del child_path de cada NESTED sibling.
+
+### Gotchas
+
+- `FilterSide::Var` en `parse_atom` se reconoce ANTES del branch literal,
+  si no `$` se tragaria como parte de un literal generico.
+- `OMIT QUOTES` no aplica cuando WRAPPER envolvio en `[...]` — la JSON
+  value resultante es array, no string; `OMIT` silenciosamente no-op,
+  parity con PG (no es error).
+- `value_to_serde_for_env` encode JSONB via `JsonbDecoder::decode`, JSON
+  via `serde_json::from_str`. Tipos exoticos (Timestamp/Uuid/Bytes/
+  Decimal) renderizan como string via `format!("{other:?}")` — caso
+  rarisimo; el driver MySQL nunca entrega esos tipos como PASSING
+  expr literales.
+
+### Validacion
+
+- `cargo test -p axiomdb-sql --test integration_json_table_wrapper` — 15/15 OK.
+- `cargo test -p axiomdb-sql --test integration_json_table` — 16/16 OK.
+- `cargo test -p axiomdb-sql --test integration_json_table_nested` — 9/9 OK.
+- `cargo test -p axiomdb-sql --test integration_json_table_multi` — 10/10 OK.
+- `cargo test -p axiomdb-sql --test integration_sql_json_query` — 35/35 OK.
+- `cargo test -p axiomdb-sql --test integration_sql_json_query_wrapper_quotes` — 21/21 OK.
+- `cargo test -p axiomdb-sql --test integration_sql_json_passing` — 7/7 OK.
+- `cargo test -p axiomdb-sql --test integration_jsonb` — 25/25 OK.
+- `cargo test -p axiomdb-sql --test integration_jsonb_operators` — 12/12 OK.
+- `cargo clippy --workspace -- -D warnings` — limpio.
+- `cargo fmt --check` — limpio.
+- `tools/wire-test.py` — 373/373 OK (`[11.20d1 JSON_TABLE wrapper/quotes/passing]` roundtrip).
+
+### Pendiente 11.20d
+
+- 11.20d3: LATERAL correlacion (doc/PASSING referencia columnas outer).
+- 11.20d4: JSON_TABLE como source UPDATE/DELETE. MERGE diferido hasta
+  que MERGE mismo aterrice.
+
+## Subfase 11.20d2 — JSON_TABLE primer FROM + CROSS/OUTER APPLY
+
+### Nuevo
+
+- `JSON_TABLE(...) AS j JOIN t ON ...` — JSON_TABLE como **primer**
+  FROM combinado con JOINs (INNER / LEFT / subquery / otro
+  JSON_TABLE).
+- `CROSS APPLY src` y `OUTER APPLY src` como azúcar parser de
+  `INNER JOIN src ON TRUE` y `LEFT JOIN src ON TRUE` respectivamente.
+  Son genéricos — funcionan con tablas normales, subqueries y
+  JSON_TABLE. Non-correlated: `doc` que referencia columnas outer
+  sigue rechazado con `NotImplemented 11.20d3`.
+
+### Implementación
+
+- `lexer.rs`: nuevo `Token::Apply` (`APPLY`, ignore ASCII case).
+- `parser/dml.rs::parse_join_clauses`: desugar en tiempo de parseo
+  — `CROSS APPLY` → `JoinType::Inner + ON TRUE`, `OUTER APPLY`
+  → `JoinType::Left + ON TRUE`. Disambiguacion por peek2: si tras
+  `CROSS` viene `APPLY` → APPLY; si viene `JOIN` → CROSS JOIN
+  existente. `Outer` al top-level del match solo dispara cuando le
+  sigue `Apply` — `LEFT/RIGHT/FULL [OUTER] JOIN` sigue consumiendo
+  `Outer` dentro de esas ramas sin interferencia. APPLY no acepta
+  `ON` ni `USING` — cualquier clausula posterior da parse error
+  explicito.
+- `executor/select_joins_ctx.rs`: `execute_select_with_joins_ctx`
+  refactorizado en wrapper delgado que resuelve la tabla y delega
+  a nuevo `execute_select_with_joins_first_materialized(stmt,
+  first_source, first_rows, exec_ctx, conn_txn, ctx)` que contiene
+  el bucle de JOINs. Reutilizable desde el path JSON_TABLE-first.
+- `executor/select_core.rs::execute_select_json_table_source`:
+  cuando `!stmt.joins.is_empty()`, materializa el JSON_TABLE como
+  source 0 y delega a
+  `execute_select_with_joins_first_materialized` con
+  `ExecutionContext::new(storage, txn, &temp_bloom, None)` y un
+  `SessionContext::new()` temporal (misma receta que
+  `execute_select_derived`). `doc_has_column_refs` de guardia
+  antes de delegar — referencias outer imposibles en primer FROM
+  por definicion, pero se rechaza explicitamente con mensaje
+  11.20d3 por robustez.
+- No nuevas variantes AST — `CROSS/OUTER APPLY` se pierden al
+  parsear (surface form no se preserva). Fuera de alcance por spec.
+
+### Cobertura
+
+- `tests/integration_json_table_first_from.rs` — 12 tests:
+  JSON_TABLE primer FROM + INNER/LEFT JOIN, JSON_TABLE × JSON_TABLE,
+  CROSS APPLY ≡ JOIN ON TRUE, CROSS APPLY non-correlated,
+  OUTER APPLY preserva izquierda cuando JSON vacio, CROSS APPLY
+  sobre tabla regular, APPLY rechaza `ON`, WHERE/ORDER BY/LIMIT/
+  GROUP BY sobre join, NESTED PATH con join.
+- `tools/wire-test.py` — 376/376 OK (3 aserciones nuevas
+  `[11.20d2 JSON_TABLE first FROM + APPLY]`).
+- Regresion 11.20a/b/c/d1 limpia.
+
+### Cross-engine
+
+- **SQL Server / Sybase**: origen historico de `CROSS APPLY` /
+  `OUTER APPLY`. Semantica conservada.
+- **PostgreSQL**: usa `LATERAL` en lugar de APPLY —
+  `CROSS APPLY src` ≡ `CROSS JOIN LATERAL src`; `OUTER APPLY src` ≡
+  `LEFT JOIN LATERAL src ON TRUE`. El keyword `LATERAL` queda
+  deferido a 11.20d3 (donde aterriza la correlacion real).
+- **Oracle 12c+**: soporta ambos (`CROSS APPLY` y `LATERAL`).
+
+### Pendiente 11.20d
+
+- 11.20d3: LATERAL correlacion (doc/PASSING referencia columnas
+  outer) + keyword `LATERAL`.
+- 11.20d4: JSON_TABLE como source UPDATE/DELETE. MERGE diferido
+  hasta que MERGE mismo aterrice.
