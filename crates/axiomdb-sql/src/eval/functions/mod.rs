@@ -62,7 +62,13 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         // portable across MySQL / MariaDB / DuckDB (which lack ?, <@, ||
         // operator syntax) can still drive the same machinery.
         | "jsonb_exists" | "jsonb_contained" | "jsonb_concat"
-        | "jsonb_delete_key" | "jsonb_delete_index" => {
+        | "jsonb_delete_key" | "jsonb_delete_index"
+        // Phase 11.22a: PG JSONB mutation functions + MySQL siblings that
+        // were not yet implemented. All share the same path-normalizer and
+        // a flag-driven `set_path_ext` core so semantics stay consistent
+        // while the per-function flag combination preserves vendor behavior.
+        | "jsonb_set" | "jsonb_insert" | "jsonb_delete_path"
+        | "json_insert" | "json_replace" => {
             json::eval(lower.as_str(), args, row)
         }
 
