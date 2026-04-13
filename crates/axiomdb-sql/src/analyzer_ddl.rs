@@ -79,6 +79,20 @@ fn analyze_update(
 
     let mut resolved_joins = Vec::with_capacity(s.joins.len());
     for mut join in s.joins {
+        // Phase 11.20d4: resolve JSON_TABLE doc + PASSING against the combined
+        // UPDATE scope so correlated doc / PASSING bind to the target table's
+        // columns.
+        if let FromClause::JsonTable(jt) = &mut join.table {
+            let taken_doc = std::mem::replace(
+                &mut jt.doc,
+                Expr::Literal(axiomdb_types::Value::Null),
+            );
+            jt.doc = resolve_expr(taken_doc, &ctx)?;
+            for (expr, _name) in &mut jt.passing {
+                let taken = std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
+                *expr = resolve_expr(taken, &ctx)?;
+            }
+        }
         join.condition = match join.condition {
             JoinCondition::On(expr) => JoinCondition::On(resolve_expr(expr, &ctx)?),
             JoinCondition::Using(cols) => JoinCondition::Using(cols),
@@ -156,6 +170,18 @@ fn analyze_delete(
 
     let mut resolved_joins = Vec::with_capacity(s.joins.len());
     for mut join in s.joins {
+        // Phase 11.20d4: resolve JSON_TABLE doc + PASSING for DELETE joins.
+        if let FromClause::JsonTable(jt) = &mut join.table {
+            let taken_doc = std::mem::replace(
+                &mut jt.doc,
+                Expr::Literal(axiomdb_types::Value::Null),
+            );
+            jt.doc = resolve_expr(taken_doc, &ctx)?;
+            for (expr, _name) in &mut jt.passing {
+                let taken = std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
+                *expr = resolve_expr(taken, &ctx)?;
+            }
+        }
         join.condition = match join.condition {
             JoinCondition::On(expr) => JoinCondition::On(resolve_expr(expr, &ctx)?),
             JoinCondition::Using(cols) => JoinCondition::Using(cols),

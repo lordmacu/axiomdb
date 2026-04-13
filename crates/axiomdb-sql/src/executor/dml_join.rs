@@ -281,6 +281,10 @@ fn collect_dml_join_candidates_ctx(
     let mut all_sources: Vec<JoinSourceSchema> = Vec::new();
     let mut scanned: Vec<Vec<DmlJoinRow>> = Vec::new();
     let mut col_offsets: Vec<usize> = Vec::new();
+    // Phase 11.20d4: parallel tracker for LATERAL-correlated JSON_TABLE
+    // right sources. None → right side is already in scanned[i]; Some(spec)
+    // → placeholder scanned[i] and per-outer-row re-materialization.
+    let mut correlated_jt: Vec<Option<crate::json_table::JsonTableSpec>> = vec![None];
     let mut running_offset = 0usize;
 
     let from_t = resolve_table_cached(storage, txn, ctx, conn_txn, from_ref)?;
@@ -312,6 +316,7 @@ fn collect_dml_join_candidates_ctx(
                 running_offset += jt.columns.len();
                 all_sources.push(join_source_schema_from_resolved(tref, &jt));
                 scanned.push(dml_source_rows(rows, is_target));
+                correlated_jt.push(None);
             }
             FromClause::Subquery { query, alias } => {
                 let inner_result = execute_select_ctx((**query).clone(), exec_ctx, conn_txn, ctx)?;
@@ -330,12 +335,36 @@ fn collect_dml_join_candidates_ctx(
                     values,
                     target: None,
                 }).collect());
+                correlated_jt.push(None);
             }
-            FromClause::JsonTable(_) => {
-                return Err(DbError::NotImplemented {
-                    feature: "JSON_TABLE as DML (UPDATE/DELETE) JOIN source — deferred to 11.20d"
-                        .into(),
-                });
+            // Phase 11.20d4 — JSON_TABLE as DML right-side source.
+            FromClause::JsonTable(jt) => {
+                let spec = crate::json_table::compile_json_table(jt)?;
+                let column_metas = crate::json_table::column_metas_for_spec(&spec);
+                col_offsets.push(running_offset);
+                running_offset += column_metas.len();
+                all_sources.push(join_source_schema_from_derived(&spec.alias, column_metas));
+                if crate::json_table::jsontable_is_correlated(jt) {
+                    scanned.push(Vec::new());
+                    correlated_jt.push(Some(spec));
+                } else {
+                    let doc_val = crate::eval::eval(&jt.doc, &[])?;
+                    let rows = match crate::json_table::doc_to_serde(&doc_val)? {
+                        None => Vec::new(),
+                        Some(sj) => {
+                            let mut runner = crate::eval::NoSubquery;
+                            crate::json_table::materialize_json_table(
+                                &spec, &sj, &[], &mut runner,
+                            )?
+                        }
+                    };
+                    scanned.push(
+                        rows.into_iter()
+                            .map(|values| DmlJoinRow { values, target: None })
+                            .collect(),
+                    );
+                    correlated_jt.push(None);
+                }
             }
         }
     }
@@ -353,17 +382,35 @@ fn collect_dml_join_candidates_ctx(
         let right_idx = i + 1;
         let right_col_count = all_sources[right_idx].columns.len();
         let right_col_offset = col_offsets[right_idx];
-        combined_rows = apply_dml_join(
-            combined_rows,
-            &scanned[right_idx],
-            left_col_count,
-            right_col_count,
-            join.join_type,
-            &join.condition,
-            &left_schema,
-            right_col_offset,
-            &all_sources[right_idx].columns,
-        )?;
+        combined_rows = if let Some(spec) = correlated_jt[right_idx].as_ref() {
+            let jt_ast = match &joins[i].table {
+                FromClause::JsonTable(j) => j.as_ref(),
+                _ => unreachable!("correlated_jt set but AST is not JsonTable"),
+            };
+            apply_correlated_jt_dml_join(
+                combined_rows,
+                jt_ast,
+                spec,
+                &all_sources[right_idx].columns,
+                right_col_count,
+                join.join_type,
+                &join.condition,
+                &left_schema,
+                right_col_offset,
+            )?
+        } else {
+            apply_dml_join(
+                combined_rows,
+                &scanned[right_idx],
+                left_col_count,
+                right_col_count,
+                join.join_type,
+                &join.condition,
+                &left_schema,
+                right_col_offset,
+                &all_sources[right_idx].columns,
+            )?
+        };
 
         for (j, col) in all_sources[right_idx].columns.iter().enumerate() {
             left_schema.push((col.name.clone(), right_col_offset + j));
@@ -603,4 +650,75 @@ fn apply_order_by_limit_to_dml_join_candidates(
         candidates.truncate(limit_n);
     }
     Ok(candidates)
+}
+
+/// Phase 11.20d4 — DML variant of `apply_correlated_jt_join`. A
+/// LATERAL-correlated JSON_TABLE on the right side of a multi-table
+/// UPDATE/DELETE JOIN is re-materialized per outer row. Outer rows
+/// come as `DmlJoinRow` (carry a `target` RID for the modifiable
+/// table); JT right rows have `target = None` and contribute only
+/// values. `concat_dml_join_rows` already carries the target from
+/// the left operand, so the combined row points to the correct
+/// modifiable RID.
+#[allow(clippy::too_many_arguments)]
+fn apply_correlated_jt_dml_join(
+    left_rows: Vec<DmlJoinRow>,
+    jt_ast: &crate::ast::JsonTable,
+    spec: &crate::json_table::JsonTableSpec,
+    right_columns: &[ColumnMeta],
+    right_col_count: usize,
+    join_type: JoinType,
+    condition: &JoinCondition,
+    left_schema: &[(String, usize)],
+    right_col_offset: usize,
+) -> Result<Vec<DmlJoinRow>, DbError> {
+    if matches!(join_type, JoinType::Right | JoinType::Full) {
+        return Err(DbError::NotImplemented {
+            feature: "RIGHT/FULL JOIN on LATERAL-correlated JSON_TABLE in \
+                      UPDATE/DELETE — PG-compatible rejection"
+                .into(),
+        });
+    }
+
+    let null_right = DmlJoinRow {
+        values: vec![Value::Null; right_col_count],
+        target: None,
+    };
+    let mut out: Vec<DmlJoinRow> = Vec::with_capacity(left_rows.len());
+
+    for outer in &left_rows {
+        let doc_val = crate::eval::eval(&jt_ast.doc, &outer.values)?;
+        let rows = match crate::json_table::doc_to_serde(&doc_val)? {
+            None => Vec::new(),
+            Some(sj) => {
+                let mut runner = crate::eval::NoSubquery;
+                crate::json_table::materialize_json_table(spec, &sj, &outer.values, &mut runner)?
+            }
+        };
+
+        let mut matched = false;
+        for values in &rows {
+            let right = DmlJoinRow {
+                values: values.clone(),
+                target: None,
+            };
+            let combined = concat_dml_join_rows(outer, &right);
+            if eval_join_cond(
+                condition,
+                &combined.values,
+                left_schema,
+                right_col_offset,
+                right_columns,
+            )? {
+                out.push(combined);
+                matched = true;
+            }
+        }
+
+        if !matched && matches!(join_type, JoinType::Left) {
+            out.push(concat_dml_join_rows(outer, &null_right));
+        }
+    }
+
+    Ok(out)
 }
