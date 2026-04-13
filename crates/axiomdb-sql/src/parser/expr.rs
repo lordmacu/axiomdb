@@ -37,7 +37,10 @@ use axiomdb_types::{DataType, Value};
 
 use crate::{
     ast::SortOrder,
-    expr::{BinaryOp, Expr, SqlJsonOnBehavior, SqlJsonPathMode, SqlJsonQueryKind, UnaryOp},
+    expr::{
+        BinaryOp, Expr, SqlJsonOnBehavior, SqlJsonPathMode, SqlJsonQueryKind, SqlJsonQuotes,
+        SqlJsonWrapper, UnaryOp,
+    },
     lexer::Token,
 };
 
@@ -940,6 +943,8 @@ fn parse_sql_json_query(p: &mut Parser, kind: SqlJsonQueryKind) -> Result<Expr, 
     let (path_mode, path_str) = split_sql_json_path_mode(&path_raw);
 
     let mut returning: Option<DataType> = None;
+    let mut wrapper = SqlJsonWrapper::Without;
+    let mut quotes = SqlJsonQuotes::Keep;
     let mut on_empty = SqlJsonOnBehavior::Null;
     let mut on_error = match kind {
         SqlJsonQueryKind::Exists => SqlJsonOnBehavior::FalseLit,
@@ -956,6 +961,100 @@ fn parse_sql_json_query(p: &mut Parser, kind: SqlJsonQueryKind) -> Result<Expr, 
         }
         let (dt, _, _) = super::ddl::parse_data_type(p)?;
         returning = Some(dt);
+    }
+
+    // Optional WRAPPER / QUOTES — JSON_QUERY only (Phase 11.19b).
+    // Grammar: [WITH [UNCONDITIONAL|CONDITIONAL] [ARRAY] WRAPPER
+    //         | WITHOUT [ARRAY] WRAPPER]
+    //         [KEEP|OMIT QUOTES [ON SCALAR STRING]]
+    let saw_with = matches!(p.peek(), Token::With);
+    if saw_with {
+        p.advance();
+    }
+    if saw_with {
+        if !matches!(kind, SqlJsonQueryKind::Query) {
+            return Err(DbError::ParseError {
+                message: "WITH ... WRAPPER is only valid on JSON_QUERY".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        let kind_w = if p.eat_ident_ci("CONDITIONAL") {
+            SqlJsonWrapper::Conditional
+        } else {
+            let _ = p.eat_ident_ci("UNCONDITIONAL");
+            SqlJsonWrapper::Unconditional
+        };
+        let _ = p.eat_ident_ci("ARRAY");
+        if !p.eat_ident_ci("WRAPPER") {
+            return Err(DbError::ParseError {
+                message: "expected WRAPPER after WITH [CONDITIONAL|UNCONDITIONAL] [ARRAY]".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        wrapper = kind_w;
+    } else if p.eat_ident_ci("WITHOUT") {
+        if !matches!(kind, SqlJsonQueryKind::Query) {
+            return Err(DbError::ParseError {
+                message: "WITHOUT ... WRAPPER is only valid on JSON_QUERY".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        let _ = p.eat_ident_ci("ARRAY");
+        if !p.eat_ident_ci("WRAPPER") {
+            return Err(DbError::ParseError {
+                message: "expected WRAPPER after WITHOUT [ARRAY]".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        wrapper = SqlJsonWrapper::Without;
+    }
+
+    if p.eat_ident_ci("KEEP") {
+        if !matches!(kind, SqlJsonQueryKind::Query) {
+            return Err(DbError::ParseError {
+                message: "KEEP QUOTES is only valid on JSON_QUERY".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        if !p.eat_ident_ci("QUOTES") {
+            return Err(DbError::ParseError {
+                message: "expected QUOTES after KEEP".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        if matches!(p.peek(), Token::On) {
+            p.advance();
+            if !p.eat_ident_ci("SCALAR") || !p.eat_ident_ci("STRING") {
+                return Err(DbError::ParseError {
+                    message: "expected SCALAR STRING after ON in QUOTES clause".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+        }
+        quotes = SqlJsonQuotes::Keep;
+    } else if p.eat_ident_ci("OMIT") {
+        if !matches!(kind, SqlJsonQueryKind::Query) {
+            return Err(DbError::ParseError {
+                message: "OMIT QUOTES is only valid on JSON_QUERY".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        if !p.eat_ident_ci("QUOTES") {
+            return Err(DbError::ParseError {
+                message: "expected QUOTES after OMIT".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        if matches!(p.peek(), Token::On) {
+            p.advance();
+            if !p.eat_ident_ci("SCALAR") || !p.eat_ident_ci("STRING") {
+                return Err(DbError::ParseError {
+                    message: "expected SCALAR STRING after ON in QUOTES clause".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+        }
+        quotes = SqlJsonQuotes::Omit;
     }
 
     // Optional ON EMPTY <behavior> — not valid for JSON_EXISTS.
@@ -989,6 +1088,8 @@ fn parse_sql_json_query(p: &mut Parser, kind: SqlJsonQueryKind) -> Result<Expr, 
         path: path_str,
         path_mode,
         returning,
+        wrapper,
+        quotes,
         on_empty,
         on_error,
     })

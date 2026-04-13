@@ -15,7 +15,9 @@ use axiomdb_types::{
 };
 
 use crate::eval::SubqueryRunner;
-use crate::expr::{Expr, SqlJsonOnBehavior, SqlJsonPathMode, SqlJsonQueryKind};
+use crate::expr::{
+    Expr, SqlJsonOnBehavior, SqlJsonPathMode, SqlJsonQueryKind, SqlJsonQuotes, SqlJsonWrapper,
+};
 
 /// Entry point called from `eval::core::eval{,_with}` when the AST node is
 /// [`Expr::SqlJsonQuery`]. Applies strict/lax path semantics, dispatches
@@ -32,6 +34,8 @@ pub(crate) fn eval_sql_json_query<R: SubqueryRunner>(
         path,
         path_mode,
         returning,
+        wrapper,
+        quotes,
         on_empty,
         on_error,
     } = expr
@@ -120,20 +124,37 @@ pub(crate) fn eval_sql_json_query<R: SubqueryRunner>(
             PathOutcome::Matched(results) => {
                 if results.is_empty() {
                     apply_on_behavior(on_empty, None, returning, row, sq)
-                } else if results.len() > 1 {
-                    apply_on_behavior(
-                        on_error,
-                        Some(DbError::InvalidValue {
-                            reason: "JSON_QUERY matched more than one item (WITH WRAPPER pending)"
-                                .into(),
-                        }),
-                        returning,
-                        row,
-                        sq,
-                    )
                 } else {
-                    let only = &results[0];
-                    query_result_to_value(only, returning.as_ref())
+                    let wrapped = apply_wrapper(&results, *wrapper);
+                    match wrapped {
+                        WrapOutcome::Scalar(v) => {
+                            if matches!(quotes, SqlJsonQuotes::Omit)
+                                && matches!(v, serde_json::Value::String(_))
+                            {
+                                // OMIT QUOTES on a scalar string → render as TEXT.
+                                let s = match &v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    _ => unreachable!(),
+                                };
+                                match returning {
+                                    Some(dt) => coerce(Value::Text(s), *dt, CoercionMode::Strict),
+                                    None => Ok(Value::Text(s)),
+                                }
+                            } else {
+                                query_result_to_value(&v, returning.as_ref())
+                            }
+                        }
+                        WrapOutcome::MultiError => apply_on_behavior(
+                            on_error,
+                            Some(DbError::InvalidValue {
+                                reason: "JSON_QUERY matched more than one item (use WITH WRAPPER)"
+                                    .into(),
+                            }),
+                            returning,
+                            row,
+                            sq,
+                        ),
+                    }
                 }
             }
         },
@@ -147,6 +168,39 @@ enum PathOutcome {
     Matched(Vec<serde_json::Value>),
     /// Strict-mode violation (missing key, OOB index, type mismatch).
     Error(DbError),
+}
+
+/// Outcome of applying a `WITH/WITHOUT WRAPPER` clause over a non-empty
+/// match set (Phase 11.19b).
+enum WrapOutcome {
+    /// A single serde_json value ready to be encoded/coerced.
+    Scalar(serde_json::Value),
+    /// Multi-item match with `WITHOUT WRAPPER` → route via ON ERROR.
+    MultiError,
+}
+
+fn apply_wrapper(results: &[serde_json::Value], wrapper: SqlJsonWrapper) -> WrapOutcome {
+    match wrapper {
+        SqlJsonWrapper::Without => {
+            if results.len() == 1 {
+                WrapOutcome::Scalar(results[0].clone())
+            } else {
+                WrapOutcome::MultiError
+            }
+        }
+        SqlJsonWrapper::Unconditional => {
+            WrapOutcome::Scalar(serde_json::Value::Array(results.to_vec()))
+        }
+        SqlJsonWrapper::Conditional => {
+            // PG: wrap unless the result is a single item that is already
+            // a JSON array.
+            if results.len() == 1 && results[0].is_array() {
+                WrapOutcome::Scalar(results[0].clone())
+            } else {
+                WrapOutcome::Scalar(serde_json::Value::Array(results.to_vec()))
+            }
+        }
+    }
 }
 
 /// Walk the path against `doc` with the requested mode. Mirrors PG's

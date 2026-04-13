@@ -219,6 +219,8 @@ pub enum Expr {
         path: String,
         path_mode: SqlJsonPathMode,
         returning: Option<axiomdb_types::DataType>,
+        wrapper: SqlJsonWrapper,
+        quotes: SqlJsonQuotes,
         on_empty: SqlJsonOnBehavior,
         on_error: SqlJsonOnBehavior,
     },
@@ -399,6 +401,26 @@ pub enum SqlJsonOnBehavior {
     /// `UNKNOWN` — only valid on `JSON_EXISTS` `ON ERROR`; maps to
     /// `Value::Null` in our 3VL model.
     Unknown,
+}
+
+/// `WITH [CONDITIONAL|UNCONDITIONAL] ARRAY WRAPPER` on JSON_QUERY (Phase 11.19b).
+/// Default = Without (SQL:2016 + PG).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlJsonWrapper {
+    /// No wrapping; multi-item match routes via ON ERROR.
+    Without,
+    /// Always wrap in an array (even single items).
+    Unconditional,
+    /// Wrap only if the result is not already a single array (PG semantics).
+    Conditional,
+}
+
+/// `KEEP|OMIT QUOTES [ON SCALAR STRING]` on JSON_QUERY (Phase 11.19b).
+/// Default = Keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlJsonQuotes {
+    Keep,
+    Omit,
 }
 
 // ── UnaryOp ───────────────────────────────────────────────────────────────────

@@ -50,6 +50,8 @@ fn resolve_expr_full(
             path,
             path_mode,
             returning,
+            wrapper,
+            quotes,
             on_empty,
             on_error,
         } => {
@@ -62,6 +64,8 @@ fn resolve_expr_full(
                 path,
                 path_mode,
                 returning,
+                wrapper,
+                quotes,
                 on_empty,
                 on_error,
             })
