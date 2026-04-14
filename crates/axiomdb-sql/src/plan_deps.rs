@@ -307,6 +307,14 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 Ok(())
             }
             FromClause::JsonbSrf(srf) => self.visit_expr(&srf.doc),
+            FromClause::Values(vc) => {
+                for row in &vc.rows {
+                    for e in row {
+                        self.visit_expr(e)?;
+                    }
+                }
+                Ok(())
+            }
         }
     }
 

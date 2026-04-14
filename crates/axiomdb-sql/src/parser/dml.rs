@@ -292,8 +292,54 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
     // and correlated subqueries remain out of scope.
     p.eat(&Token::Lateral);
 
-    // Subquery: `(SELECT ...) AS alias`
+    // Subquery: `(SELECT ...) AS alias`  or  `(VALUES (...)) AS alias(cols)`.
     if p.eat(&Token::LParen) {
+        // Phase 21.22 — `(VALUES (row), (row), ...) [AS] alias [(col, col, ...)]`.
+        if p.eat(&Token::Values) {
+            let mut rows: Vec<Vec<crate::expr::Expr>> = Vec::new();
+            loop {
+                p.expect(&Token::LParen)?;
+                let mut row = vec![parse_expr(p)?];
+                while p.eat(&Token::Comma) {
+                    row.push(parse_expr(p)?);
+                }
+                p.expect(&Token::RParen)?;
+                if let Some(first) = rows.first() {
+                    if row.len() != first.len() {
+                        return Err(DbError::ParseError {
+                            message: format!(
+                                "VALUES: row width {} does not match first row width {}",
+                                row.len(),
+                                first.len(),
+                            ),
+                            position: Some(p.current_pos()),
+                        });
+                    }
+                }
+                rows.push(row);
+                if !p.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            p.expect(&Token::RParen)?;
+            p.eat(&Token::As);
+            let alias = p.parse_identifier()?;
+            let column_names = if p.eat(&Token::LParen) {
+                let mut cols = vec![p.parse_identifier()?];
+                while p.eat(&Token::Comma) {
+                    cols.push(p.parse_identifier()?);
+                }
+                p.expect(&Token::RParen)?;
+                Some(cols)
+            } else {
+                None
+            };
+            return Ok(FromClause::Values(Box::new(crate::ast::ValuesClause {
+                rows,
+                alias,
+                column_names,
+            })));
+        }
         p.expect(&Token::Select)?;
         let sub = parse_select(p)?;
         p.expect(&Token::RParen)?;
@@ -820,7 +866,10 @@ fn parse_update(p: &mut Parser) -> Result<Stmt, DbError> {
     let from = parse_from_item(p)?;
     let table = match from {
         FromClause::Table(table) => table,
-        FromClause::Subquery { .. } | FromClause::JsonTable(_) | FromClause::JsonbSrf(_) => {
+        FromClause::Subquery { .. }
+        | FromClause::JsonTable(_)
+        | FromClause::JsonbSrf(_)
+        | FromClause::Values(_) => {
             return Err(DbError::ParseError {
                 message: "UPDATE target must be a table".into(),
                 position: Some(p.current_pos()),
@@ -881,7 +930,10 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
         let from = parse_from_item(p)?;
         let table = match from {
             FromClause::Table(table) => table,
-            FromClause::Subquery { .. } | FromClause::JsonTable(_) | FromClause::JsonbSrf(_) => {
+            FromClause::Subquery { .. }
+            | FromClause::JsonTable(_)
+            | FromClause::JsonbSrf(_)
+            | FromClause::Values(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE target must be a table".into(),
                     position: Some(p.current_pos()),
@@ -895,7 +947,10 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
         let from = parse_from_item(p)?;
         let table = match from {
             FromClause::Table(table) => table,
-            FromClause::Subquery { .. } | FromClause::JsonTable(_) | FromClause::JsonbSrf(_) => {
+            FromClause::Subquery { .. }
+            | FromClause::JsonTable(_)
+            | FromClause::JsonbSrf(_)
+            | FromClause::Values(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE FROM source must be a table".into(),
                     position: Some(p.current_pos()),

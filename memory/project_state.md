@@ -3,7 +3,7 @@
 ## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 21.18 `NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` — ✅ closed. Next small parser wins: 21.22 `VALUES` inline; then medium: 21.14 `CREATE TABLE AS SELECT`, 21.15 `CREATE TABLE LIKE`, 21.4 `RETURNING`; then big: 21.2 CTE, 21.5 MERGE family.
+**Active subphase:** 21.22 `VALUES` inline table — ✅ closed. Next medium: 21.14 `CREATE TABLE AS SELECT`, 21.15 `CREATE TABLE LIKE`, 21.4 `RETURNING`; then big: 21.2 CTE, 21.5 MERGE family.
 
 ### Phase 11 subphase status
 

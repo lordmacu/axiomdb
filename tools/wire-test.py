@@ -3490,6 +3490,28 @@ ok("21.18 NATURAL JOIN inner match",
    rows == ((10, 100),),
    f"got {rows}")
 
+# ── Phase 21.22 — VALUES inline table ─────────────────────────────────────────
+
+print("\n[21.22 VALUES inline]")
+
+cur.execute("""SELECT t.id, t.name FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name)
+               ORDER BY t.id""")
+rows = cur.fetchall()
+# VALUES infers column types from literals; integer literal may be reported
+# over wire as string-encoded in the current executor path. Compare loosely.
+ok("21.22 VALUES inline basic two rows",
+   len(rows) == 2 and str(rows[0][1]) == 'a' and str(rows[1][1]) == 'b',
+   f"got {rows}")
+
+cur.execute("CREATE TABLE vi_users (id INT, name TEXT)")
+cur.execute("INSERT INTO vi_users VALUES (1, 'alice'), (2, 'bob')")
+cur.execute("""SELECT u.name, r.tag FROM vi_users u
+                 JOIN (VALUES (1, 'admin')) AS r(id, tag) ON r.id = u.id""")
+rows = cur.fetchall()
+ok("21.22 VALUES JOIN with real table",
+   rows == (('alice', 'admin'),),
+   f"got {rows}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

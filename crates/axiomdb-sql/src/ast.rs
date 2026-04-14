@@ -227,6 +227,23 @@ pub enum FromClause {
     /// `jsonb_each`, `jsonb_each_text`, `jsonb_object_keys`,
     /// `jsonb_array_elements`, `jsonb_array_elements_text`.
     JsonbSrf(Box<JsonbSrf>),
+    /// Phase 21.22 — `(VALUES (...)) AS alias(col1, col2, ...)` inline
+    /// table constructor. Each row is evaluated at execution time
+    /// against an empty scope (no outer correlation in this subphase).
+    Values(Box<ValuesClause>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValuesClause {
+    /// Each inner `Vec<Expr>` is one row; all rows must have the same
+    /// column count.
+    pub rows: Vec<Vec<Expr>>,
+    /// Required alias — both PG and MySQL reject inline VALUES without
+    /// an alias.
+    pub alias: String,
+    /// Optional explicit column name list — `VALUES (...) AS t(c1, c2)`.
+    /// When None, defaults to `column1`, `column2`, ... (PG parity).
+    pub column_names: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -236,6 +236,18 @@ fn analyze_select_with_outer(
         s.from = Some(FromClause::JsonbSrf(srf));
     }
 
+    // Phase 21.22 — resolve VALUES row exprs for first-FROM position.
+    if let Some(FromClause::Values(mut vc)) = s.from {
+        let empty_ctx = BindContext::empty();
+        for row in &mut vc.rows {
+            for e in row {
+                let taken = std::mem::replace(e, Expr::Literal(axiomdb_types::Value::Null));
+                *e = resolve_expr_full(taken, &empty_ctx, &[], Some(&state))?;
+            }
+        }
+        s.from = Some(FromClause::Values(vc));
+    }
+
     // Persist analyzed join-side derived tables back into the AST before
     // resolving JOIN conditions so the executor receives analyzed inner SELECTs.
     let mut resolved_joins = Vec::with_capacity(s.joins.len());
@@ -270,6 +282,21 @@ fn analyze_select_with_outer(
                 );
                 srf.doc = resolve_expr_full(taken, &ctx, outer_scopes, Some(&state))?;
                 join.table = FromClause::JsonbSrf(srf);
+            }
+            // Phase 21.22 — VALUES rows resolve against an empty scope
+            // (no correlation in this subphase).
+            FromClause::Values(mut vc) => {
+                let empty_ctx = BindContext::empty();
+                for row in &mut vc.rows {
+                    for e in row {
+                        let taken = std::mem::replace(
+                            e,
+                            Expr::Literal(axiomdb_types::Value::Null),
+                        );
+                        *e = resolve_expr_full(taken, &empty_ctx, &[], Some(&state))?;
+                    }
+                }
+                join.table = FromClause::Values(vc);
             }
             FromClause::Table(_) => {}
         }
