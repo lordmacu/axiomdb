@@ -3,7 +3,7 @@
 ## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 21.3 (scaffolding) `WITH RECURSIVE` — AST + parser keyword + 10 match sites landed; runtime defers to 21.3b. Next: 21.3b iteration executor, 21.5 MERGE + PG ON CONFLICT, 21.4b INSERT/UPDATE RETURNING executor.
+**Active subphase:** 21.6 CHECK constraints closed — column-level + table-level CHECK persisted at CREATE TABLE, enforced on INSERT/UPDATE/ODKU paths, NULL→pass per SQL standard, 7 integration tests pass. Next: 21.3b WITH RECURSIVE iteration executor, 21.4b INSERT/UPDATE RETURNING executor, 21.5 MERGE + PG ON CONFLICT.
 
 ### Phase 11 subphase status
 

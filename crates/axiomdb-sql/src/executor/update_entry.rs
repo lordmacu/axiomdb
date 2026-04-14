@@ -120,6 +120,21 @@ fn execute_update(
         to_update.push((rid, current_values, new_values));
     }
 
+    // Phase 21.6 — CHAR/VARCHAR + CHECK constraint validation (mirrors INSERT).
+    for (_, _, new_values) in &mut to_update {
+        enforce_text_constraints(&resolved.columns, new_values)?;
+    }
+    if !resolved.constraints.is_empty() {
+        for (_, _, new_values) in &to_update {
+            check_row_constraints_with_cols(
+                &resolved.constraints,
+                new_values,
+                &resolved.def.table_name,
+                &resolved.columns,
+            )?;
+        }
+    }
+
     let heap_updates: Vec<(RecordId, Vec<Value>)> = to_update
         .iter()
         .map(|(rid, _old, new)| (*rid, new.clone()))

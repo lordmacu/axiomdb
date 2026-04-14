@@ -29,7 +29,9 @@ fn execute_update_with_candidates(
     // When the field-patch fast path is eligible AND no secondary indexes need
     // maintenance, we store only the sparse assigned-column values instead of
     // cloning the full row — eliminating String clones for unchanged columns.
-    let needs_full_row = !field_patch_eligible || !secondary_indexes.is_empty();
+    let needs_full_row = !field_patch_eligible
+        || !secondary_indexes.is_empty()
+        || !resolved.constraints.is_empty();
 
     let mut to_update: Vec<(RecordId, Vec<Value>, Vec<Value>)> = Vec::new();
     // Sparse path: (rid, [(col_pos, new_value)])
@@ -108,10 +110,11 @@ fn execute_update_with_candidates(
     }
     if !resolved.constraints.is_empty() {
         for (_, _, new_values) in &to_update {
-            check_row_constraints(
+            check_row_constraints_with_cols(
                 &resolved.constraints,
                 new_values,
                 &resolved.def.table_name,
+                &resolved.columns,
             )?;
         }
     }
