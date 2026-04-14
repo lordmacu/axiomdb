@@ -3512,6 +3512,19 @@ ok("21.22 VALUES JOIN with real table",
    rows == (('alice', 'admin'),),
    f"got {rows}")
 
+# ── Phase 21.4 — DELETE ... RETURNING ────────────────────────────────────────
+
+print("\n[21.4 DELETE RETURNING]")
+
+cur.execute("CREATE TABLE ret_t (id INT, name TEXT)")
+cur.execute("INSERT INTO ret_t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+cur.execute("DELETE FROM ret_t WHERE id = 2 RETURNING id, name")
+rows = cur.fetchall()
+# RETURNING returns rows — value may come over wire as string.
+ok("21.4 DELETE RETURNING captures pre-delete row",
+   len(rows) == 1 and str(rows[0][1]) == 'b',
+   f"got {rows}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

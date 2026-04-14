@@ -198,6 +198,15 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
 
 // ── SELECT list ───────────────────────────────────────────────────────────────
 
+/// Phase 21.4 — parse optional `RETURNING <select_item>[, ...]` tail.
+/// Returns empty vec when `RETURNING` not present.
+fn parse_returning_clause(p: &mut Parser) -> Result<Vec<SelectItem>, DbError> {
+    if !p.eat(&Token::Returning) {
+        return Ok(Vec::new());
+    }
+    parse_select_list(p)
+}
+
 fn parse_select_list(p: &mut Parser) -> Result<Vec<SelectItem>, DbError> {
     let mut items = vec![parse_select_item(p)?];
     while p.eat(&Token::Comma) {
@@ -733,6 +742,7 @@ fn parse_insert_body(p: &mut Parser, is_replace: bool) -> Result<Stmt, DbError> 
             }
         }
         let on_duplicate_update = parse_on_duplicate_update_tail(p, is_replace)?;
+        let returning = parse_returning_clause(p)?;
         return Ok(Stmt::Insert(InsertStmt {
             table,
             columns: Some(col_names),
@@ -740,6 +750,7 @@ fn parse_insert_body(p: &mut Parser, is_replace: bool) -> Result<Stmt, DbError> 
             ignore,
             replace: is_replace,
             on_duplicate_update,
+            returning,
         }));
     }
 
@@ -783,6 +794,7 @@ fn parse_insert_body(p: &mut Parser, is_replace: bool) -> Result<Stmt, DbError> 
     };
 
     let on_duplicate_update = parse_on_duplicate_update_tail(p, is_replace)?;
+    let returning = parse_returning_clause(p)?;
     Ok(Stmt::Insert(InsertStmt {
         table,
         columns,
@@ -790,6 +802,7 @@ fn parse_insert_body(p: &mut Parser, is_replace: bool) -> Result<Stmt, DbError> 
         ignore,
         replace: is_replace,
         on_duplicate_update,
+        returning,
     }))
 }
 
@@ -903,6 +916,7 @@ fn parse_update(p: &mut Parser) -> Result<Stmt, DbError> {
         None
     };
 
+    let returning = parse_returning_clause(p)?;
     Ok(Stmt::Update(UpdateStmt {
         table,
         joins,
@@ -910,6 +924,7 @@ fn parse_update(p: &mut Parser) -> Result<Stmt, DbError> {
         where_clause,
         order_by,
         limit,
+        returning,
     }))
 }
 
@@ -979,6 +994,7 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
         None
     };
 
+    let returning = parse_returning_clause(p)?;
     Ok(Stmt::Delete(DeleteStmt {
         table,
         target,
@@ -986,5 +1002,6 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
         where_clause,
         order_by,
         limit,
+        returning,
     }))
 }

@@ -4,6 +4,16 @@ fn execute_update_ctx(
     conn_txn: &mut ConnectionTxn,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    // Phase 21.4 — UPDATE RETURNING deferred to 21.4b (same reasoning as
+    // INSERT: multiple exit points; row-capture hook needed after in-place
+    // write or patch-apply).
+    if !stmt.returning.is_empty() {
+        return Err(DbError::NotImplemented {
+            feature: "UPDATE ... RETURNING — executor support deferred to 21.4b; \
+                      parser + AST + analyzer landed in 21.4"
+                .into(),
+        });
+    }
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
     let storage = exec_ctx.storage();
     let txn = exec_ctx.coord();
@@ -98,6 +108,7 @@ fn execute_update_ctx(
             where_clause: stmt.where_clause,
             order_by: stmt_order_by,
             limit: stmt_limit,
+            returning: Vec::new(),
         };
         return execute_update_join_ctx(
             join_stmt,

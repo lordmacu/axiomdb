@@ -434,6 +434,9 @@ pub struct InsertStmt {
     /// conflicting row on any PK/UNIQUE index is deleted — FK cascade
     /// included. `ignore` and `replace` are mutually exclusive.
     pub replace: bool,
+    /// Phase 21.4 — `RETURNING ...` projection. Empty = no RETURNING.
+    #[allow(dead_code)]
+    pub returning: Vec<SelectItem>,
     /// `INSERT ... ON DUPLICATE KEY UPDATE col = expr, ...` (MySQL ODKU).
     /// When the incoming row collides with a PK/UNIQUE index, the
     /// conflicting row is updated with the given assignments instead
@@ -454,6 +457,9 @@ pub struct UpdateStmt {
     pub order_by: Vec<OrderByItem>,
     /// `UPDATE ... LIMIT N` — cap the number of rows updated.
     pub limit: Option<Expr>,
+    /// Phase 21.4 — `RETURNING ...` projection. Empty = no RETURNING.
+    #[allow(dead_code)]
+    pub returning: Vec<SelectItem>,
 }
 
 /// A `DELETE` statement.
@@ -469,6 +475,9 @@ pub struct DeleteStmt {
     pub order_by: Vec<OrderByItem>,
     /// `DELETE ... LIMIT N` — cap the number of rows deleted.
     pub limit: Option<Expr>,
+    /// Phase 21.4 — `RETURNING ...` projection. Empty = no RETURNING.
+    #[allow(dead_code)]
+    pub returning: Vec<SelectItem>,
 }
 
 /// Row-level lock mode for `SELECT ... FOR UPDATE` / `LOCK IN SHARE MODE`.
@@ -1017,6 +1026,7 @@ mod tests {
             ignore: false,
             replace: false,
             on_duplicate_update: None,
+            returning: Vec::new(),
         });
         if let Stmt::Insert(ins) = stmt {
             if let InsertSource::Values(rows) = &ins.source {
@@ -1047,6 +1057,7 @@ mod tests {
             joins: vec![],
             order_by: vec![],
             limit: None,
+            returning: Vec::new(),
         });
         assert!(matches!(stmt, Stmt::Update(_)));
     }
@@ -1063,6 +1074,7 @@ mod tests {
             }),
             order_by: vec![],
             limit: None,
+            returning: Vec::new(),
         });
         assert!(matches!(stmt, Stmt::Delete(_)));
     }

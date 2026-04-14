@@ -224,6 +224,8 @@ pub enum Token<'src> {
     Last,
     #[token("FETCH", ignore(ascii_case))]
     Fetch,
+    #[token("RETURNING", ignore(ascii_case))]
+    Returning,
     #[token("NEXT", ignore(ascii_case))]
     Next,
     #[token("ROW", ignore(ascii_case))]
