@@ -39,6 +39,7 @@ pub mod text_semantics;
 pub mod tokenizer;
 pub mod trigram;
 pub mod vacuum;
+pub mod values_clause;
 
 pub use ast::{
     AlterTableOp, AlterTableStmt, Assignment, ColumnConstraint, ColumnDef, CreateDatabaseStmt,

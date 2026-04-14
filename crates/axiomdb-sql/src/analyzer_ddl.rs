@@ -101,6 +101,18 @@ fn analyze_update(
             );
             srf.doc = resolve_expr(taken, &ctx)?;
         }
+        // Phase 21.22: resolve VALUES row exprs (no correlation) for UPDATE
+        // join sources.
+        if let FromClause::Values(vc) = &mut join.table {
+            let empty_ctx = BindContext::empty();
+            for row in &mut vc.rows {
+                for e in row {
+                    let taken =
+                        std::mem::replace(e, Expr::Literal(axiomdb_types::Value::Null));
+                    *e = resolve_expr(taken, &empty_ctx)?;
+                }
+            }
+        }
         join.condition = match join.condition {
             JoinCondition::On(expr) => JoinCondition::On(resolve_expr(expr, &ctx)?),
             JoinCondition::Using(cols) => JoinCondition::Using(cols),
@@ -196,6 +208,17 @@ fn analyze_delete(
                 Expr::Literal(axiomdb_types::Value::Null),
             );
             srf.doc = resolve_expr(taken, &ctx)?;
+        }
+        // Phase 21.22: VALUES rows for DELETE joins.
+        if let FromClause::Values(vc) = &mut join.table {
+            let empty_ctx = BindContext::empty();
+            for row in &mut vc.rows {
+                for e in row {
+                    let taken =
+                        std::mem::replace(e, Expr::Literal(axiomdb_types::Value::Null));
+                    *e = resolve_expr(taken, &empty_ctx)?;
+                }
+            }
         }
         join.condition = match join.condition {
             JoinCondition::On(expr) => JoinCondition::On(resolve_expr(expr, &ctx)?),

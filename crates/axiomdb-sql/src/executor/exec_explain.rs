@@ -216,6 +216,11 @@ fn explain_select(
                 "EXPLAIN for JSONB SRF FROM not yet supported".into(),
             ))
         }
+        crate::ast::FromClause::Values(_) => {
+            return Err(DbError::Other(
+                "EXPLAIN for VALUES FROM not yet supported".into(),
+            ))
+        }
     };
 
     let conn = ctx.conn_txn.take();

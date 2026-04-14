@@ -332,6 +332,20 @@ fn bound_from_clause(
             *col_offset += n;
             Ok(vec![bound])
         }
+        // Phase 21.22 — inline VALUES virtual table.
+        FromClause::Values(vc) => {
+            let virtual_cols = crate::values_clause::column_defs_for_values(vc);
+            let n = virtual_cols.len();
+            let alias = vc.alias.clone();
+            let bound = BoundTable {
+                alias: Some(alias.clone()),
+                name: alias,
+                columns: virtual_cols,
+                col_offset: *col_offset,
+            };
+            *col_offset += n;
+            Ok(vec![bound])
+        }
     }
 }
 

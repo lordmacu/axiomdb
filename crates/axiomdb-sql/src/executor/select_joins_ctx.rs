@@ -143,6 +143,17 @@ fn execute_select_with_joins_first_materialized(
                         correlated_srf.push(None);
                     }
                 }
+                // Phase 21.22 — inline VALUES on the right side.
+                FromClause::Values(vc) => {
+                    let column_metas = crate::values_clause::column_metas_for_values(vc);
+                    let rows = crate::values_clause::materialize_values(vc)?;
+                    col_offsets.push(running_offset);
+                    running_offset += column_metas.len();
+                    all_sources.push(join_source_schema_from_derived(&vc.alias, column_metas));
+                    scanned.push(rows);
+                    correlated_jt.push(None);
+                    correlated_srf.push(None);
+                }
             }
         }
     }
