@@ -19,13 +19,23 @@ use super::{expr::parse_expr, Parser};
 /// Parse a DML statement. Called by `Parser::parse_stmt`.
 pub(crate) fn parse_dml(p: &mut Parser) -> Result<Stmt, DbError> {
     match p.peek() {
-        // Phase 21.2 — `WITH <ctes> SELECT ...`
+        // Phase 21.2 — `WITH <ctes> SELECT ...` (21.3 adds RECURSIVE).
         Token::With => {
             p.advance();
-            // RECURSIVE keyword reserved for Phase 21.3.
-            if matches!(p.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("RECURSIVE")) {
+            let is_recursive = matches!(
+                p.peek(),
+                Token::Ident(s) if s.eq_ignore_ascii_case("RECURSIVE")
+            );
+            if is_recursive {
+                p.advance();
+                // Phase 21.3: parser accepts RECURSIVE keyword + AST flag
+                // lands so downstream tooling sees the intent. Iteration
+                // executor deferred to 21.3b.
                 return Err(DbError::NotImplemented {
-                    feature: "WITH RECURSIVE — recursive CTEs are Phase 21.3".into(),
+                    feature: "WITH RECURSIVE runtime loop — parser + AST + match \
+                              sites scaffolded in 21.3; full iteration executor \
+                              deferred to 21.3b per specs/fase-21/plan-21.3-recursive-cte.md"
+                        .into(),
                 });
             }
             let ctes = parse_cte_list(p)?;
@@ -252,6 +262,7 @@ fn parse_cte_list(p: &mut Parser) -> Result<Vec<crate::ast::CteBinding>, DbError
             name,
             column_names,
             query: Box::new(body),
+            recursive: false,
         });
         if !p.eat(&Token::Comma) {
             break;
@@ -935,7 +946,8 @@ fn parse_update(p: &mut Parser) -> Result<Stmt, DbError> {
         FromClause::Subquery { .. }
         | FromClause::JsonTable(_)
         | FromClause::JsonbSrf(_)
-        | FromClause::Values(_) => {
+        | FromClause::Values(_)
+        | FromClause::RecursiveCte(_) => {
             return Err(DbError::ParseError {
                 message: "UPDATE target must be a table".into(),
                 position: Some(p.current_pos()),
@@ -1001,7 +1013,8 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
             FromClause::Subquery { .. }
             | FromClause::JsonTable(_)
             | FromClause::JsonbSrf(_)
-            | FromClause::Values(_) => {
+            | FromClause::Values(_)
+            | FromClause::RecursiveCte(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE target must be a table".into(),
                     position: Some(p.current_pos()),
@@ -1018,7 +1031,8 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
             FromClause::Subquery { .. }
             | FromClause::JsonTable(_)
             | FromClause::JsonbSrf(_)
-            | FromClause::Values(_) => {
+            | FromClause::Values(_)
+            | FromClause::RecursiveCte(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE FROM source must be a table".into(),
                     position: Some(p.current_pos()),

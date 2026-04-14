@@ -154,6 +154,15 @@ fn execute_select_with_joins_first_materialized(
                     correlated_jt.push(None);
                     correlated_srf.push(None);
                 }
+                // Phase 21.3 — recursive CTE as join right side is deferred;
+                // MVP only supports recursive CTE as first-FROM source.
+                FromClause::RecursiveCte(_) => {
+                    return Err(DbError::NotImplemented {
+                        feature: "recursive CTE on the right side of a JOIN — use as \
+                                  first-FROM for now (21.3 MVP)"
+                            .into(),
+                    });
+                }
             }
         }
     }

@@ -346,6 +346,21 @@ fn bound_from_clause(
             *col_offset += n;
             Ok(vec![bound])
         }
+        // Phase 21.3 — recursive CTE virtual table. Columns inherited
+        // from the base SELECT's analyzed output.
+        FromClause::RecursiveCte(rc) => {
+            let virtual_cols = crate::recursive_cte::column_defs_for_recursive(rc);
+            let n = virtual_cols.len();
+            let alias = rc.alias.clone();
+            let bound = BoundTable {
+                alias: Some(alias.clone()),
+                name: alias,
+                columns: virtual_cols,
+                col_offset: *col_offset,
+            };
+            *col_offset += n;
+            Ok(vec![bound])
+        }
     }
 }
 

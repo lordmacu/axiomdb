@@ -314,6 +314,8 @@ fn analyze_select_with_outer(
                 join.table = FromClause::Values(vc);
             }
             FromClause::Table(_) => {}
+            // Phase 21.3 — recursive CTE already pre-analyzed by expand_ctes.
+            FromClause::RecursiveCte(_) => {}
         }
         // Phase 21.18 — NATURAL JOIN: compute the shared-column list between
         // the accumulated left-side scope and this join's right-side BoundTable,
@@ -549,6 +551,7 @@ fn expand_ctes(
                 name: name.clone(),
                 column_names: None,
                 query: q.clone(),
+                recursive: false,
             })
             .collect();
 

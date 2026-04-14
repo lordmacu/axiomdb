@@ -80,6 +80,12 @@ fn execute_select_with_joins(
                             .into(),
                     });
                 }
+                FromClause::RecursiveCte(_) => {
+                    return Err(DbError::NotImplemented {
+                        feature: "recursive CTE JOIN via the non-ctx executor path"
+                            .into(),
+                    });
+                }
             }
         }
     }
