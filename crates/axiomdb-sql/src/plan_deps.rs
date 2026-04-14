@@ -315,6 +315,10 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 }
                 Ok(())
             }
+            FromClause::RecursiveCte(rc) => {
+                self.visit_select(&rc.base)?;
+                self.visit_select(&rc.step)
+            }
         }
     }
 

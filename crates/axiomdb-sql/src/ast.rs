@@ -231,6 +231,10 @@ pub enum FromClause {
     /// table constructor. Each row is evaluated at execution time
     /// against an empty scope (no outer correlation in this subphase).
     Values(Box<ValuesClause>),
+    /// Phase 21.3 — materialized recursive CTE reference. Produced by
+    /// the analyzer when a `FromClause::Table` matches a recursive CTE
+    /// name; carries base+step SELECTs plus iteration semantics.
+    RecursiveCte(Box<RecursiveCteClause>),
 }
 
 /// Phase 21.2 — one binding in a `WITH` clause.
@@ -240,6 +244,23 @@ pub struct CteBinding {
     /// Optional explicit column-name override: `WITH t(a, b) AS (...)`.
     pub column_names: Option<Vec<String>>,
     pub query: Box<SelectStmt>,
+    /// Phase 21.3 — `true` when declared inside `WITH RECURSIVE`.
+    /// Body must be `SELECT base UNION [ALL] SELECT step`.
+    pub recursive: bool,
+}
+
+/// Phase 21.3 — materialized recursive CTE reference in FROM. The
+/// analyzer rewrites `FromClause::Table(cte_name)` into this variant
+/// when the CTE is flagged recursive. The executor runs the PG-parity
+/// iteration loop (base → working table → step → dedup → repeat).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecursiveCteClause {
+    pub alias: String,
+    pub column_names: Option<Vec<String>>,
+    pub base: Box<SelectStmt>,
+    pub step: Box<SelectStmt>,
+    /// `true` = UNION ALL (keep dups). `false` = UNION (dedup).
+    pub union_all: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

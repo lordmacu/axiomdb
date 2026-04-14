@@ -221,6 +221,11 @@ fn explain_select(
                 "EXPLAIN for VALUES FROM not yet supported".into(),
             ))
         }
+        crate::ast::FromClause::RecursiveCte(_) => {
+            return Err(DbError::Other(
+                "EXPLAIN for recursive CTE FROM not yet supported".into(),
+            ))
+        }
     };
 
     let conn = ctx.conn_txn.take();

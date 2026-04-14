@@ -409,6 +409,12 @@ fn collect_dml_join_candidates_ctx(
                 correlated_jt.push(None);
                 correlated_srf.push(None);
             }
+            // Phase 21.3 — recursive CTE as DML join source deferred.
+            FromClause::RecursiveCte(_) => {
+                return Err(DbError::NotImplemented {
+                    feature: "recursive CTE as UPDATE/DELETE JOIN source deferred".into(),
+                });
+            }
         }
     }
 

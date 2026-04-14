@@ -31,6 +31,7 @@ pub mod parser;
 pub mod partial_index;
 pub mod plan_deps;
 pub mod planner;
+pub mod recursive_cte;
 pub mod result;
 pub mod schema_cache;
 pub mod session;
