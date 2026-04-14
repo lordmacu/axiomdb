@@ -203,10 +203,11 @@ fn execute_insert_ctx(
 
                 // CHAR(N) padding + VARCHAR(N) length check + CHECK constraints.
                 match enforce_text_constraints(&resolved.columns, &mut full_values).and_then(|()| {
-                    check_row_constraints(
+                    check_row_constraints_with_cols(
                         &resolved.constraints,
                         &full_values,
                         &resolved.def.table_name,
+                        &resolved.columns,
                     )
                 }) {
                     Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
@@ -537,10 +538,11 @@ fn execute_insert_ctx(
                 }
             }
             enforce_text_constraints(&resolved.columns, &mut full_values)?;
-            check_row_constraints(
+            check_row_constraints_with_cols(
                 &resolved.constraints,
                 &full_values,
                 &resolved.def.table_name,
+                &resolved.columns,
             )?;
             if !resolved.foreign_keys.is_empty() {
                 crate::fk_enforcement::check_fk_child_insert(

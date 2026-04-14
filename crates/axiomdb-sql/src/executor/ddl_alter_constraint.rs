@@ -493,7 +493,7 @@ fn alter_drop_constraint(
 ///
 /// Not a perfect round-trip — whitespace and casing may differ from the original
 /// input, but the output is valid SQL that can be re-parsed and evaluated.
-fn expr_to_sql_string(expr: &Expr) -> String {
+pub(crate) fn expr_to_sql_string(expr: &Expr) -> String {
     use crate::expr::BinaryOp;
 
     match expr {

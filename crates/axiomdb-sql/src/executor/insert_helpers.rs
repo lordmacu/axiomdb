@@ -310,21 +310,31 @@ pub(crate) fn enforce_text_constraints(
     Ok(())
 }
 
-pub(crate) fn check_row_constraints(
+/// Phase 21.6 — CHECK enforcement with column-name resolution. Walks the
+/// re-parsed expression and replaces each `Expr::Column { name, col_idx }`
+/// with the actual `col_idx` from the schema's `columns` list. Needed
+/// because CREATE TABLE persists the CHECK SQL without the name→index
+/// resolution that ALTER ADD CONSTRAINT does via the analyzer.
+///
+/// SQL standard: CHECK passes when expr is TRUE or UNKNOWN (NULL); only
+/// explicit FALSE is a violation.
+pub(crate) fn check_row_constraints_with_cols(
     constraints: &[axiomdb_catalog::schema::ConstraintDef],
     row_values: &[Value],
     table_name: &str,
+    columns: &[axiomdb_catalog::schema::ColumnDef],
 ) -> Result<(), DbError> {
     for c in constraints {
         if c.check_expr.is_empty() {
             continue;
         }
-        let expr = match crate::parser::parse_expr_only(&c.check_expr) {
+        let mut expr = match crate::parser::parse_expr_only(&c.check_expr) {
             Ok(e) => e,
             Err(_) => continue,
         };
+        resolve_column_refs(&mut expr, columns);
         let result = eval(&expr, row_values)?;
-        if !crate::eval::is_truthy(&result) {
+        if matches!(result, Value::Bool(false)) {
             return Err(DbError::CheckViolation {
                 table: table_name.to_string(),
                 constraint: c.name.clone(),
@@ -332,6 +342,66 @@ pub(crate) fn check_row_constraints(
         }
     }
     Ok(())
+}
+
+fn resolve_column_refs(
+    expr: &mut Expr,
+    columns: &[axiomdb_catalog::schema::ColumnDef],
+) {
+    use crate::expr::Expr as E;
+    match expr {
+        E::Column { col_idx, name } => {
+            // Strip optional `table.` prefix for lookup.
+            let bare = name.rsplit('.').next().unwrap_or(name);
+            if let Some(pos) = columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(bare))
+            {
+                *col_idx = pos;
+            }
+        }
+        E::BinaryOp { left, right, .. } => {
+            resolve_column_refs(left, columns);
+            resolve_column_refs(right, columns);
+        }
+        E::UnaryOp { operand, .. } => resolve_column_refs(operand, columns),
+        E::Between { expr, low, high, .. } => {
+            resolve_column_refs(expr, columns);
+            resolve_column_refs(low, columns);
+            resolve_column_refs(high, columns);
+        }
+        E::Like { expr, pattern, .. } => {
+            resolve_column_refs(expr, columns);
+            resolve_column_refs(pattern, columns);
+        }
+        E::In { expr, list, .. } => {
+            resolve_column_refs(expr, columns);
+            for e in list {
+                resolve_column_refs(e, columns);
+            }
+        }
+        E::IsNull { expr, .. } => resolve_column_refs(expr, columns),
+        E::IsBoolean { expr, .. } => resolve_column_refs(expr, columns),
+        E::Cast { expr, .. } => resolve_column_refs(expr, columns),
+        E::Function { args, .. } => {
+            for a in args {
+                resolve_column_refs(a, columns);
+            }
+        }
+        E::Case { operand, when_thens, else_result } => {
+            if let Some(o) = operand {
+                resolve_column_refs(o, columns);
+            }
+            for (w, t) in when_thens {
+                resolve_column_refs(w, columns);
+                resolve_column_refs(t, columns);
+            }
+            if let Some(e) = else_result {
+                resolve_column_refs(e, columns);
+            }
+        }
+        _ => {}
+    }
 }
 
 // ── ALTER TABLE constraint helpers (Phase 4.22b) ──────────────────────────────

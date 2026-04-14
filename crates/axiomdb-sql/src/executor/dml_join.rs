@@ -100,7 +100,7 @@ fn execute_update_join_ctx(
     }
     if !resolved.constraints.is_empty() {
         for (_, _, new_values) in &to_update {
-            check_row_constraints(&resolved.constraints, new_values, &resolved.def.table_name)?;
+            check_row_constraints_with_cols(&resolved.constraints, new_values, &resolved.def.table_name, &resolved.columns)?;
         }
     }
     if !resolved.foreign_keys.is_empty() {

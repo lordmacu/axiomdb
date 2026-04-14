@@ -215,6 +215,50 @@ fn execute_create_table(
         )?;
     }
 
+    // Phase 21.6 — persist CHECK constraints declared at column level or
+    // table level. Enforcement is driven by insert_helpers::check_row_constraints
+    // reading the persisted check_expr from axiom_constraints.
+    let mut check_ordinal = 1usize;
+    for col_def in &stmt.columns {
+        for cc in &col_def.constraints {
+            if let crate::ast::ColumnConstraint::Check(expr) = cc {
+                let check_name = format!(
+                    "axiom_check_{}_{}",
+                    col_def.name, check_ordinal
+                );
+                check_ordinal += 1;
+                let check_expr_str =
+                    expr_to_sql_string(expr);
+                CatalogWriter::new(storage, txn, conn_txn)?.create_constraint(
+                    axiomdb_catalog::schema::ConstraintDef {
+                        constraint_id: 0,
+                        table_id,
+                        name: check_name,
+                        check_expr: check_expr_str,
+                    },
+                )?;
+            }
+        }
+    }
+    for tc in &stmt.table_constraints {
+        if let crate::ast::TableConstraint::Check { name, expr } = tc {
+            let check_name = name.clone().unwrap_or_else(|| {
+                let n = format!("axiom_check_tbl_{}", check_ordinal);
+                check_ordinal += 1;
+                n
+            });
+            let check_expr_str = expr_to_sql_string(expr);
+            CatalogWriter::new(storage, txn, conn_txn)?.create_constraint(
+                axiomdb_catalog::schema::ConstraintDef {
+                    constraint_id: 0,
+                    table_id,
+                    name: check_name,
+                    check_expr: check_expr_str,
+                },
+            )?;
+        }
+    }
+
     for tc in &stmt.table_constraints {
         if let crate::ast::TableConstraint::ForeignKey {
             name,

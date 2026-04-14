@@ -205,7 +205,7 @@ fn apply_odku_heap(
 
     // Same constraint + FK pipeline as a plain UPDATE.
     enforce_text_constraints(schema_cols, &mut new_row)?;
-    check_row_constraints(&resolved.constraints, &new_row, &resolved.def.table_name)?;
+    check_row_constraints_with_cols(&resolved.constraints, &new_row, &resolved.def.table_name, &resolved.columns)?;
     if !resolved.foreign_keys.is_empty() {
         crate::fk_enforcement::check_fk_child_update(
             &existing_row,

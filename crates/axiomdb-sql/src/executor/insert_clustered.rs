@@ -37,7 +37,7 @@ fn execute_clustered_insert(
         ($full_values:expr) => {{
             let mut fv = $full_values;
             match enforce_text_constraints(&resolved.columns, &mut fv)
-                .and_then(|()| check_row_constraints(&resolved.constraints, &fv, &resolved.def.table_name))
+                .and_then(|()| check_row_constraints_with_cols(&resolved.constraints, &fv, &resolved.def.table_name, &resolved.columns))
             {
                 Err(e) if ignore && is_ignorable_insert_error(&e) => {}
                 Err(e) => return Err(e),
