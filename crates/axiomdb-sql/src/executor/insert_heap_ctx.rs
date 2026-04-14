@@ -4,16 +4,14 @@ fn execute_insert_ctx(
     conn_txn: &mut ConnectionTxn,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
-    // Phase 21.4 — INSERT RETURNING is parser-accepted but executor wiring is
-    // deferred to 21.4b: the INSERT path has ~10 exit points across heap /
-    // clustered / batched / SELECT-source / ON DUPLICATE / REPLACE, and each
-    // needs a post-write row-capture hook. Landing them in a dedicated subphase
-    // to keep commits focused. Today: clear runtime rejection so ORMs fail
-    // fast rather than silently missing returned rows.
-    if !stmt.returning.is_empty() {
+    // Phase 21.4b — INSERT RETURNING: ODKU + REPLACE interactions cover
+    // post-conflict row semantics that land with 21.5 (MERGE / ON CONFLICT).
+    // For 21.4b we accept RETURNING on plain INSERT VALUES / INSERT SELECT /
+    // DEFAULT VALUES paths and reject the conflict-resolution combos.
+    if !stmt.returning.is_empty() && (stmt.replace || stmt.on_duplicate_update.is_some()) {
         return Err(DbError::NotImplemented {
-            feature: "INSERT ... RETURNING — executor support deferred to 21.4b; \
-                      parser + AST + analyzer landed in 21.4"
+            feature: "INSERT ... RETURNING with REPLACE / ON DUPLICATE KEY UPDATE \
+                      — deferred to 21.5 (MERGE family)"
                 .into(),
         });
     }
@@ -41,7 +39,10 @@ fn execute_insert_ctx(
         // For explicit transactions with a VALUES source, stage rows into the
         // batch instead of writing immediately.  All other cases (SELECT source,
         // autocommit) go through the existing single-statement path.
-        if ctx.in_explicit_txn {
+        // Phase 21.4b — RETURNING forces the immediate-write path (the staged
+        // path's deferred flush makes row-capture awkward to wire into the
+        // current execution turn).
+        if ctx.in_explicit_txn && stmt.returning.is_empty() {
             if let InsertSource::Values(_) = &stmt.source {
                 return enqueue_clustered_insert_ctx(stmt, exec_ctx, conn_txn, ctx, resolved);
             }
@@ -82,6 +83,9 @@ fn execute_insert_ctx(
     let explicit_col_count: Option<usize> = stmt.columns.as_ref().map(|c| c.len());
 
     let mut count = 0u64;
+    // Phase 21.4b — RETURNING row capture.
+    let mut returning_rows: Vec<Vec<Value>> = Vec::new();
+    let want_returning = !stmt.returning.is_empty();
 
     // Find the AUTO_INCREMENT column (at most one per table).
     let auto_inc_col: Option<usize> = schema_cols.iter().position(|c| c.auto_increment);
@@ -337,9 +341,15 @@ fn execute_insert_ctx(
                             Err(e) => return Err(e),
                         }
                     }
+                    if want_returning {
+                        returning_rows.push(full_values);
+                    }
                     count += 1;
                 }
             } else {
+                if want_returning {
+                    returning_rows.extend(full_batch.iter().cloned());
+                }
                 let committed_empty = std::collections::HashSet::new();
                 let n = full_batch.len() as u64;
                 apply_insert_batch_with_ctx(
@@ -495,9 +505,15 @@ fn execute_insert_ctx(
                                 Err(e) => return Err(e),
                             }
                         }
+                        if want_returning {
+                            returning_rows.push(full_values);
+                        }
                         count += 1;
                     }
                 } else {
+                    if want_returning {
+                        returning_rows.extend(full_batch.iter().cloned());
+                    }
                     // Fast batch path: single heap pass + batch WAL + batch index.
                     let committed_empty = std::collections::HashSet::new();
                     let n = full_batch.len() as u64;
@@ -637,8 +653,24 @@ fn execute_insert_ctx(
                     }
                 }
             }
+            if want_returning {
+                returning_rows.push(full_values);
+            }
             count += 1;
         }
+    }
+
+    if want_returning {
+        ctx.stats.on_rows_changed(resolved.def.id, count);
+        if let Some(id) = first_generated {
+            THREAD_LAST_INSERT_ID.with(|v| v.set(id));
+        }
+        return project_returning(
+            &stmt.returning,
+            &returning_rows,
+            &resolved.def,
+            &resolved.columns,
+        );
     }
 
     if let Some(id) = first_generated {

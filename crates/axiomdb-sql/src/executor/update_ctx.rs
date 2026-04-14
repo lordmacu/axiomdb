@@ -4,16 +4,11 @@ fn execute_update_ctx(
     conn_txn: &mut ConnectionTxn,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
-    // Phase 21.4 — UPDATE RETURNING deferred to 21.4b (same reasoning as
-    // INSERT: multiple exit points; row-capture hook needed after in-place
-    // write or patch-apply).
-    if !stmt.returning.is_empty() {
-        return Err(DbError::NotImplemented {
-            feature: "UPDATE ... RETURNING — executor support deferred to 21.4b; \
-                      parser + AST + analyzer landed in 21.4"
-                .into(),
-        });
-    }
+    // Phase 21.4b — UPDATE RETURNING is supported on the heap candidate
+    // path. Clustered tables and the fused index-range patch path are
+    // deferred to 21.4c (each writes through a path that does not retain
+    // the post-update row in a single buffer).
+    let want_returning = !stmt.returning.is_empty();
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
     let storage = exec_ctx.storage();
     let txn = exec_ctx.coord();
@@ -126,6 +121,12 @@ fn execute_update_ctx(
 
     // ── Clustered table UPDATE dispatch (Phase 39.16) ────────────────────
     if resolved.def.is_clustered() {
+        if want_returning {
+            return Err(DbError::NotImplemented {
+                feature: "UPDATE ... RETURNING on clustered tables — deferred to 21.4c"
+                    .into(),
+            });
+        }
         return execute_clustered_update(
             stmt.where_clause,
             &stmt_order_by,
@@ -166,7 +167,7 @@ fn execute_update_ctx(
 
         if let crate::planner::AccessMethod::IndexRange { ref index_def, ref lo, ref hi } = update_access {
             let has_affected_secondary = secondary_indexes.iter().any(|i| !i.is_primary);
-            if index_def.is_primary && field_patch_eligible && !has_affected_secondary {
+            if !want_returning && index_def.is_primary && field_patch_eligible && !has_affected_secondary {
                 return fused_index_range_patch(
                     index_def,
                     lo.as_deref(),
@@ -212,6 +213,7 @@ fn execute_update_ctx(
             snap,
             &resolved,
             ctx,
+            &stmt.returning,
         );
     }
 
@@ -236,5 +238,6 @@ fn execute_update_ctx(
         snap,
         &resolved,
         ctx,
+        &stmt.returning,
     )
 }

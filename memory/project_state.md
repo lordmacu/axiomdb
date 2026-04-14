@@ -3,7 +3,7 @@
 ## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 21.6 CHECK constraints closed — column-level + table-level CHECK persisted at CREATE TABLE, enforced on INSERT/UPDATE/ODKU paths, NULL→pass per SQL standard, 7 integration tests pass. Next: 21.3b WITH RECURSIVE iteration executor, 21.4b INSERT/UPDATE RETURNING executor, 21.5 MERGE + PG ON CONFLICT.
+**Active subphase:** 21.4b RETURNING closed — INSERT/UPDATE/DELETE RETURNING wired on heap + clustered-autocommit paths; forces full-row path when needed; shared `executor/returning.rs` helpers; 15 tests. 21.4c deferred: ODKU/REPLACE RETURNING, clustered UPDATE RETURNING, fused-range UPDATE RETURNING, explicit-txn clustered-staged INSERT RETURNING. Next: 21.3b WITH RECURSIVE iteration executor, 21.5 MERGE + PG ON CONFLICT.
 
 ### Phase 11 subphase status
 
