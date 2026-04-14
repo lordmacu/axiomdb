@@ -247,6 +247,11 @@ pub struct CteBinding {
     /// Phase 21.3 — `true` when declared inside `WITH RECURSIVE`.
     /// Body must be `SELECT base UNION [ALL] SELECT step`.
     pub recursive: bool,
+    /// Phase 21.3b — recursive step SELECT, set by the parser when a
+    /// recursive CTE body has `UNION [ALL] SELECT ...` after the base.
+    pub recursive_step: Option<Box<SelectStmt>>,
+    /// Phase 21.3b — `true` when the base/step combiner was `UNION ALL`.
+    pub recursive_union_all: bool,
 }
 
 /// Phase 21.3 — materialized recursive CTE reference in FROM. The

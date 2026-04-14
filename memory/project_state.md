@@ -3,7 +3,7 @@
 ## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 21.4b RETURNING closed — INSERT/UPDATE/DELETE RETURNING wired on heap + clustered-autocommit paths; forces full-row path when needed; shared `executor/returning.rs` helpers; 15 tests. 21.4c deferred: ODKU/REPLACE RETURNING, clustered UPDATE RETURNING, fused-range UPDATE RETURNING, explicit-txn clustered-staged INSERT RETURNING. Next: 21.3b WITH RECURSIVE iteration executor, 21.5 MERGE + PG ON CONFLICT.
+**Active subphase:** 21.3b WITH RECURSIVE closed — parser absorbs `UNION [ALL] SELECT step` inside CTE paren; expand_ctes routes recursive CTEs through `recursive_dict` producing `FromClause::RecursiveCte`; executor `execute_select_recursive_cte_ctx` runs PG-style loop with per-iter step re-analysis (self-ref → Values substitution); MAX_RECURSION=1000 caps infinite loops; 7 tests pass. Next: 21.5 MERGE + PG ON CONFLICT, 21.5f GENERATED columns, 21.9 LATERAL joins.
 
 ### Phase 11 subphase status
 

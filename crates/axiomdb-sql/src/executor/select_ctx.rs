@@ -36,9 +36,14 @@ fn execute_select_ctx(
         return execute_select(stmt, storage, txn, conn_txn);
     }
 
+    // Recursive CTE in FROM (Phase 21.3b).
+    if matches!(stmt.from, Some(FromClause::RecursiveCte(_))) {
+        return execute_select_recursive_cte_ctx(stmt, exec_ctx, conn_txn, ctx);
+    }
+
     let from_table_ref = match stmt.from.take() {
         Some(FromClause::Table(tref)) => tref,
-        _ => unreachable!("already handled None, Subquery, JsonTable, JsonbSrf, Values above"),
+        _ => unreachable!("already handled None, Subquery, JsonTable, JsonbSrf, Values, RecursiveCte above"),
     };
 
     // INFORMATION_SCHEMA virtual tables (4.20c).

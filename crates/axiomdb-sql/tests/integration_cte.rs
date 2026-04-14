@@ -163,21 +163,20 @@ fn cte_in_join() {
 // ── Error cases ─────────────────────────────────────────────────────────────
 
 #[test]
-fn with_recursive_rejected_as_21_3() {
+fn with_recursive_no_step_degrades_to_non_recursive() {
+    // Phase 21.3b — `WITH RECURSIVE` without a UNION tail is equivalent
+    // to a plain CTE (no self-ref body). Validate the keyword is parsed
+    // and the query succeeds; full recursive behavior is covered by
+    // integration_recursive_cte.rs.
     let (mut s, mut t, mut b, mut c) = setup();
-    let err = run_ctx(
-        "WITH RECURSIVE r AS (SELECT 1 AS n) SELECT * FROM r",
+    run_ctx(
+        "WITH RECURSIVE r(n) AS (SELECT 1) SELECT n FROM r",
         &mut s,
         &mut t,
         &mut b,
         &mut c,
     )
-    .unwrap_err();
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("RECURSIVE") && msg.contains("21.3"),
-        "got {msg}"
-    );
+    .unwrap();
 }
 
 #[test]
