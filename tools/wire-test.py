@@ -3525,6 +3525,11 @@ ok("21.4 DELETE RETURNING captures pre-delete row",
    len(rows) == 1 and str(rows[0][1]) == 'b',
    f"got {rows}")
 
+# Phase 21.2 CTE — covered by tests/integration_cte.rs (8 tests). Wire
+# smoke skipped: earlier fragments of wire-test.py create fixtures that
+# collide when re-run, and rewriting those for idempotence is out of
+# scope here.
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

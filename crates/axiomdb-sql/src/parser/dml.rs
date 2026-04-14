@@ -19,6 +19,24 @@ use super::{expr::parse_expr, Parser};
 /// Parse a DML statement. Called by `Parser::parse_stmt`.
 pub(crate) fn parse_dml(p: &mut Parser) -> Result<Stmt, DbError> {
     match p.peek() {
+        // Phase 21.2 — `WITH <ctes> SELECT ...`
+        Token::With => {
+            p.advance();
+            // RECURSIVE keyword reserved for Phase 21.3.
+            if matches!(p.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("RECURSIVE")) {
+                return Err(DbError::NotImplemented {
+                    feature: "WITH RECURSIVE — recursive CTEs are Phase 21.3".into(),
+                });
+            }
+            let ctes = parse_cte_list(p)?;
+            p.expect(&Token::Select)?;
+            let mut s = parse_select(p)?;
+            s.with_ctes = ctes;
+            if matches!(p.peek(), Token::Union | Token::Intersect | Token::Except) {
+                return parse_set_op(p, s);
+            }
+            Ok(Stmt::Select(s))
+        }
         Token::Select => {
             p.advance();
             let first = parse_select(p)?;
@@ -180,6 +198,7 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
     };
 
     Ok(SelectStmt {
+        with_ctes: Vec::new(),
         distinct,
         calc_found_rows,
         columns,
@@ -205,6 +224,40 @@ fn parse_returning_clause(p: &mut Parser) -> Result<Vec<SelectItem>, DbError> {
         return Ok(Vec::new());
     }
     parse_select_list(p)
+}
+
+/// Phase 21.2 — parse a comma-separated list of CTE bindings after
+/// `WITH [RECURSIVE]` has been consumed.
+/// Grammar per CTE: `ident [( col [, col]* )] AS ( SELECT ... )`.
+fn parse_cte_list(p: &mut Parser) -> Result<Vec<crate::ast::CteBinding>, DbError> {
+    let mut out = Vec::new();
+    loop {
+        let name = p.parse_identifier()?;
+        let column_names = if p.eat(&Token::LParen) {
+            let mut cols = vec![p.parse_identifier()?];
+            while p.eat(&Token::Comma) {
+                cols.push(p.parse_identifier()?);
+            }
+            p.expect(&Token::RParen)?;
+            Some(cols)
+        } else {
+            None
+        };
+        p.expect(&Token::As)?;
+        p.expect(&Token::LParen)?;
+        p.expect(&Token::Select)?;
+        let body = parse_select(p)?;
+        p.expect(&Token::RParen)?;
+        out.push(crate::ast::CteBinding {
+            name,
+            column_names,
+            query: Box::new(body),
+        });
+        if !p.eat(&Token::Comma) {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 fn parse_select_list(p: &mut Parser) -> Result<Vec<SelectItem>, DbError> {

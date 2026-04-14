@@ -3,7 +3,7 @@
 ## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 21.5 family status fix — 21.5b REPLACE INTO, 21.5c INSERT IGNORE, 21.5d Multi-table UPDATE/DELETE, 21.5e ON DUPLICATE KEY UPDATE all ✅ (implementations landed in earlier sprints — G5/11.20d4/4.x/etc; progreso.md ticks updated). Real pending in MERGE family: 21.5 standard SQL `MERGE` + PG `ON CONFLICT` (needs dedicated session — parser + merge-loop executor + EXCLUDED semantics), 21.5f GENERATED columns. Next: 21.2 CTE (biggest remaining high-leverage feature).
+**Active subphase:** 21.2 non-recursive CTE (`WITH`) — ✅ closed. Parser + analyzer substitution; 8 integration tests pass. Next big: 21.3 recursive CTE (`WITH RECURSIVE`), 21.5 MERGE + PG ON CONFLICT, 21.4b INSERT/UPDATE RETURNING executor wiring.
 
 ### Phase 11 subphase status
 

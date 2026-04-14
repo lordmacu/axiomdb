@@ -233,6 +233,15 @@ pub enum FromClause {
     Values(Box<ValuesClause>),
 }
 
+/// Phase 21.2 — one binding in a `WITH` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CteBinding {
+    pub name: String,
+    /// Optional explicit column-name override: `WITH t(a, b) AS (...)`.
+    pub column_names: Option<Vec<String>>,
+    pub query: Box<SelectStmt>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValuesClause {
     /// Each inner `Vec<Expr>` is one row; all rows must have the same
@@ -388,6 +397,11 @@ pub struct SetOpTail {
 /// `from` is `None` for `SELECT` without `FROM` (e.g. `SELECT 1`, `SELECT NOW()`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
+    /// Phase 21.2 — `WITH name AS (SELECT ...), ...` non-recursive CTEs
+    /// bound for the scope of this SELECT. Empty = no WITH clause.
+    /// The analyzer substitutes references into `FromClause::Subquery`
+    /// and clears the list, so executors never see non-empty entries.
+    pub with_ctes: Vec<CteBinding>,
     pub distinct: bool,
     /// `SQL_CALC_FOUND_ROWS` modifier: stash pre-LIMIT count for `FOUND_ROWS()` (4.5e).
     pub calc_found_rows: bool,
@@ -879,6 +893,7 @@ mod tests {
     #[test]
     fn test_select_star_from_table_with_where_and_order() {
         let stmt = Stmt::Select(SelectStmt {
+            with_ctes: Vec::new(),
             distinct: false,
             calc_found_rows: false,
             columns: vec![SelectItem::Wildcard],
@@ -904,6 +919,7 @@ mod tests {
     fn test_select_without_from() {
         // SELECT 1  — health-check query used by ORMs
         let stmt = Stmt::Select(SelectStmt {
+            with_ctes: Vec::new(),
             distinct: false,
             calc_found_rows: false,
             columns: vec![SelectItem::Expr {
@@ -1102,6 +1118,7 @@ mod tests {
     #[test]
     fn test_subquery_from_clause() {
         let subquery = SelectStmt {
+            with_ctes: Vec::new(),
             distinct: false,
             calc_found_rows: false,
             columns: vec![SelectItem::Wildcard],

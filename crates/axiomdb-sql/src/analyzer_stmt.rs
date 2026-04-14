@@ -183,6 +183,21 @@ fn analyze_select_with_outer(
     default_schema: &str,
     outer_scopes: &[&BindContext],
 ) -> Result<SelectStmt, DbError> {
+    // Phase 21.2 — expand CTE bindings before resolving FROM.
+    // Each CTE body is analyzed in order so later CTEs can reference
+    // earlier ones; references in the outer query's FROM / JOINs are
+    // rewritten to FromClause::Subquery.
+    if !s.with_ctes.is_empty() {
+        expand_ctes(
+            &mut s,
+            storage,
+            snapshot.clone(),
+            default_database,
+            default_schema,
+            outer_scopes,
+        )?;
+    }
+
     // Build resolution context from FROM and JOINs.
     let ctx = build_context(
         &s.from,
@@ -504,4 +519,120 @@ fn resolve_on_behavior(
         *boxed.as_mut() = resolved;
     }
     Ok(())
+}
+
+/// Phase 21.2 — analyze each CTE body in order, then rewrite every
+/// reference in `s.from` / `s.joins` that resolves to a CTE name into
+/// `FromClause::Subquery`. Clears `s.with_ctes` after substitution so
+/// downstream code never sees non-empty entries.
+fn expand_ctes(
+    s: &mut SelectStmt,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_database: &str,
+    default_schema: &str,
+    outer_scopes: &[&BindContext],
+) -> Result<(), DbError> {
+    use std::collections::HashMap;
+
+    let bindings = std::mem::take(&mut s.with_ctes);
+    let mut dict: HashMap<String, Box<SelectStmt>> = HashMap::new();
+
+    for cte in bindings {
+        // Allow the current CTE body to reference previously-analyzed
+        // CTEs by re-attaching them as with_ctes in the body (analyzer
+        // recursion will substitute them there too).
+        let mut body = *cte.query;
+        body.with_ctes = dict
+            .iter()
+            .map(|(name, q)| crate::ast::CteBinding {
+                name: name.clone(),
+                column_names: None,
+                query: q.clone(),
+            })
+            .collect();
+
+        let analyzed = analyze_select_with_outer(
+            body,
+            storage,
+            snapshot.clone(),
+            default_database,
+            default_schema,
+            outer_scopes,
+        )?;
+
+        let analyzed = if let Some(col_override) = cte.column_names {
+            apply_cte_column_rename(analyzed, &col_override)?
+        } else {
+            analyzed
+        };
+
+        dict.insert(cte.name.to_ascii_lowercase(), Box::new(analyzed));
+    }
+
+    // Substitute references in FROM and each join's FromClause.
+    if let Some(from) = s.from.take() {
+        s.from = Some(substitute_cte_ref(from, &dict));
+    }
+    for join in &mut s.joins {
+        let taken = std::mem::replace(
+            &mut join.table,
+            FromClause::Table(crate::ast::TableRef {
+                database: None,
+                schema: None,
+                name: String::new(),
+                alias: None,
+            }),
+        );
+        join.table = substitute_cte_ref(taken, &dict);
+    }
+
+    Ok(())
+}
+
+fn substitute_cte_ref(
+    from: FromClause,
+    dict: &std::collections::HashMap<String, Box<SelectStmt>>,
+) -> FromClause {
+    match from {
+        FromClause::Table(tref)
+            if tref.database.is_none() && tref.schema.is_none() =>
+        {
+            if let Some(body) = dict.get(&tref.name.to_ascii_lowercase()) {
+                let alias = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
+                return FromClause::Subquery {
+                    query: body.clone(),
+                    alias,
+                };
+            }
+            FromClause::Table(tref)
+        }
+        other => other,
+    }
+}
+
+fn apply_cte_column_rename(
+    mut s: SelectStmt,
+    names: &[String],
+) -> Result<SelectStmt, DbError> {
+    // Count non-wildcard select items to compare width.
+    let item_count: usize = s.columns.iter().map(|_| 1).sum();
+    if item_count != names.len() {
+        return Err(DbError::ParseError {
+            message: format!(
+                "CTE column-name list has {} name(s) but select list produces {} column(s)",
+                names.len(),
+                item_count,
+            ),
+            position: None,
+        });
+    }
+    // Positionally reassign alias on each SelectItem::Expr. Wildcards are
+    // not renamable at this stage (analyzer has already expanded them).
+    for (item, new_name) in s.columns.iter_mut().zip(names.iter()) {
+        if let crate::ast::SelectItem::Expr { alias, .. } = item {
+            *alias = Some(new_name.clone());
+        }
+    }
+    Ok(s)
 }
