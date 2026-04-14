@@ -109,6 +109,7 @@ include!("update_entry.rs");
 include!("bulk_empty.rs");
 include!("delete.rs");
 include!("returning.rs");
+include!("recursive_cte_exec.rs");
 include!("ddl_create_table.rs");
 include!("ddl_drop_table.rs");
 include!("ddl_create_index.rs");

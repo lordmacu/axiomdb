@@ -28,17 +28,8 @@ pub(crate) fn parse_dml(p: &mut Parser) -> Result<Stmt, DbError> {
             );
             if is_recursive {
                 p.advance();
-                // Phase 21.3: parser accepts RECURSIVE keyword + AST flag
-                // lands so downstream tooling sees the intent. Iteration
-                // executor deferred to 21.3b.
-                return Err(DbError::NotImplemented {
-                    feature: "WITH RECURSIVE runtime loop — parser + AST + match \
-                              sites scaffolded in 21.3; full iteration executor \
-                              deferred to 21.3b per specs/fase-21/plan-21.3-recursive-cte.md"
-                        .into(),
-                });
             }
-            let ctes = parse_cte_list(p)?;
+            let ctes = parse_cte_list(p, is_recursive)?;
             p.expect(&Token::Select)?;
             let mut s = parse_select(p)?;
             s.with_ctes = ctes;
@@ -237,9 +228,10 @@ fn parse_returning_clause(p: &mut Parser) -> Result<Vec<SelectItem>, DbError> {
 }
 
 /// Phase 21.2 — parse a comma-separated list of CTE bindings after
-/// `WITH [RECURSIVE]` has been consumed.
+/// `WITH [RECURSIVE]` has been consumed. When `recursive` is true, each
+/// CTE body may be `SELECT base UNION [ALL] SELECT step`.
 /// Grammar per CTE: `ident [( col [, col]* )] AS ( SELECT ... )`.
-fn parse_cte_list(p: &mut Parser) -> Result<Vec<crate::ast::CteBinding>, DbError> {
+fn parse_cte_list(p: &mut Parser, recursive: bool) -> Result<Vec<crate::ast::CteBinding>, DbError> {
     let mut out = Vec::new();
     loop {
         let name = p.parse_identifier()?;
@@ -257,12 +249,26 @@ fn parse_cte_list(p: &mut Parser) -> Result<Vec<crate::ast::CteBinding>, DbError
         p.expect(&Token::LParen)?;
         p.expect(&Token::Select)?;
         let body = parse_select(p)?;
+        // Phase 21.3b — detect optional `UNION [ALL] SELECT step` tail
+        // when the CTE is recursive. Without RECURSIVE, leave the UNION
+        // for the body to consume as a SetOp later.
+        let (step, union_all, is_recursive) = if recursive && matches!(p.peek(), Token::Union) {
+            p.advance();
+            let union_all = p.eat(&Token::All);
+            p.expect(&Token::Select)?;
+            let step = parse_select(p)?;
+            (Some(Box::new(step)), union_all, true)
+        } else {
+            (None, false, false)
+        };
         p.expect(&Token::RParen)?;
         out.push(crate::ast::CteBinding {
             name,
             column_names,
             query: Box::new(body),
-            recursive: false,
+            recursive: is_recursive,
+            recursive_step: step,
+            recursive_union_all: union_all,
         });
         if !p.eat(&Token::Comma) {
             break;

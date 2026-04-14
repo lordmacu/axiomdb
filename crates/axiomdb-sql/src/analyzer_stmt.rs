@@ -539,8 +539,55 @@ fn expand_ctes(
 
     let bindings = std::mem::take(&mut s.with_ctes);
     let mut dict: HashMap<String, Box<SelectStmt>> = HashMap::new();
+    // Phase 21.3b — recursive CTEs register here; substitute_cte_ref
+    // rewrites matching Table refs into FromClause::RecursiveCte.
+    let mut recursive_dict: HashMap<String, Box<crate::ast::RecursiveCteClause>> = HashMap::new();
 
     for cte in bindings {
+        if cte.recursive {
+            let step = cte.recursive_step.clone().ok_or_else(|| DbError::ParseError {
+                message: format!(
+                    "WITH RECURSIVE `{}`: body must be `SELECT base UNION [ALL] SELECT step`",
+                    cte.name
+                ),
+                position: None,
+            })?;
+            let mut base_body = *cte.query.clone();
+            base_body.with_ctes = dict
+                .iter()
+                .map(|(name, q)| crate::ast::CteBinding {
+                    name: name.clone(),
+                    column_names: None,
+                    query: q.clone(),
+                    recursive: false,
+                    recursive_step: None,
+                    recursive_union_all: false,
+                })
+                .collect();
+            let analyzed_base = analyze_select_with_outer(
+                base_body,
+                storage,
+                snapshot.clone(),
+                default_database,
+                default_schema,
+                outer_scopes,
+            )?;
+            let analyzed_base = if let Some(ref names) = cte.column_names {
+                apply_cte_column_rename(analyzed_base, names)?
+            } else {
+                analyzed_base
+            };
+            let clause = crate::ast::RecursiveCteClause {
+                alias: cte.name.clone(),
+                column_names: cte.column_names.clone(),
+                base: Box::new(analyzed_base),
+                step,
+                union_all: cte.recursive_union_all,
+            };
+            recursive_dict.insert(cte.name.to_ascii_lowercase(), Box::new(clause));
+            continue;
+        }
+
         // Allow the current CTE body to reference previously-analyzed
         // CTEs by re-attaching them as with_ctes in the body (analyzer
         // recursion will substitute them there too).
@@ -552,6 +599,8 @@ fn expand_ctes(
                 column_names: None,
                 query: q.clone(),
                 recursive: false,
+                recursive_step: None,
+                recursive_union_all: false,
             })
             .collect();
 
@@ -575,7 +624,7 @@ fn expand_ctes(
 
     // Substitute references in FROM and each join's FromClause.
     if let Some(from) = s.from.take() {
-        s.from = Some(substitute_cte_ref(from, &dict));
+        s.from = Some(substitute_cte_ref(from, &dict, &recursive_dict));
     }
     for join in &mut s.joins {
         let taken = std::mem::replace(
@@ -587,7 +636,7 @@ fn expand_ctes(
                 alias: None,
             }),
         );
-        join.table = substitute_cte_ref(taken, &dict);
+        join.table = substitute_cte_ref(taken, &dict, &recursive_dict);
     }
 
     Ok(())
@@ -596,12 +645,21 @@ fn expand_ctes(
 fn substitute_cte_ref(
     from: FromClause,
     dict: &std::collections::HashMap<String, Box<SelectStmt>>,
+    recursive_dict: &std::collections::HashMap<String, Box<crate::ast::RecursiveCteClause>>,
 ) -> FromClause {
     match from {
         FromClause::Table(tref)
             if tref.database.is_none() && tref.schema.is_none() =>
         {
-            if let Some(body) = dict.get(&tref.name.to_ascii_lowercase()) {
+            let key = tref.name.to_ascii_lowercase();
+            if let Some(clause) = recursive_dict.get(&key) {
+                let mut c = (**clause).clone();
+                if let Some(alias) = tref.alias.clone() {
+                    c.alias = alias;
+                }
+                return FromClause::RecursiveCte(Box::new(c));
+            }
+            if let Some(body) = dict.get(&key) {
                 let alias = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
                 return FromClause::Subquery {
                     query: body.clone(),
