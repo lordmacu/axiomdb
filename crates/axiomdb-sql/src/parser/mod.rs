@@ -322,7 +322,7 @@ impl<'src> Parser<'src> {
                 self.advance();
                 self.parse_drop()
             }
-            Token::Select | Token::Insert | Token::Update | Token::Delete => {
+            Token::Select | Token::Insert | Token::Update | Token::Delete | Token::With => {
                 dml::parse_dml(self)
             }
             // MySQL `REPLACE INTO` — distinct statement verb, not a function
