@@ -203,10 +203,106 @@ fn execute_delete_ctx(
         ctx.stats.on_rows_changed(resolved.def.id, count);
     }
 
+    // Phase 21.4 — RETURNING projection. `to_delete` holds the pre-delete
+    // row values; project them through the RETURNING list.
+    if !stmt.returning.is_empty() {
+        return project_returning(
+            &stmt.returning,
+            &to_delete,
+            &resolved.def,
+            &resolved.columns,
+        );
+    }
+
     Ok(QueryResult::Affected {
         count,
         last_insert_id: None,
     })
+}
+
+/// Phase 21.4 — shared RETURNING projection for DELETE. Rows are
+/// pre-delete values; columns come from the target table's schema.
+fn project_returning(
+    items: &[crate::ast::SelectItem],
+    to_delete: &[(RecordId, Vec<Value>)],
+    def: &axiomdb_catalog::TableDef,
+    columns: &[axiomdb_catalog::ColumnDef],
+) -> Result<QueryResult, DbError> {
+    let out_cols = expand_returning_cols(items, def, columns);
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(to_delete.len());
+    for (_rid, vals) in to_delete {
+        rows.push(project_returning_row(items, vals, columns)?);
+    }
+    Ok(QueryResult::Rows {
+        columns: out_cols,
+        rows,
+    })
+}
+
+fn expand_returning_cols(
+    items: &[crate::ast::SelectItem],
+    def: &axiomdb_catalog::TableDef,
+    columns: &[axiomdb_catalog::ColumnDef],
+) -> Vec<crate::result::ColumnMeta> {
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            crate::ast::SelectItem::Wildcard
+            | crate::ast::SelectItem::QualifiedWildcard(_) => {
+                for c in columns {
+                    out.push(crate::result::ColumnMeta {
+                        name: c.name.clone(),
+                        data_type: crate::table::column_type_to_data_type(c.col_type),
+                        nullable: c.nullable,
+                        table_name: Some(def.table_name.clone()),
+                    });
+                }
+            }
+            crate::ast::SelectItem::Expr { expr, alias } => {
+                let name = alias
+                    .clone()
+                    .unwrap_or_else(|| expr_column_name(expr, None));
+                // Best-effort type inference: Column ref → schema type.
+                let data_type = if let crate::expr::Expr::Column { col_idx, .. } = expr {
+                    columns
+                        .get(*col_idx)
+                        .map(|c| crate::table::column_type_to_data_type(c.col_type))
+                        .unwrap_or(axiomdb_types::DataType::Text)
+                } else {
+                    axiomdb_types::DataType::Text
+                };
+                out.push(crate::result::ColumnMeta {
+                    name,
+                    data_type,
+                    nullable: true,
+                    table_name: Some(def.table_name.clone()),
+                });
+            }
+        }
+    }
+    out
+}
+
+fn project_returning_row(
+    items: &[crate::ast::SelectItem],
+    row: &[Value],
+    columns: &[axiomdb_catalog::ColumnDef],
+) -> Result<Vec<Value>, DbError> {
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            crate::ast::SelectItem::Wildcard
+            | crate::ast::SelectItem::QualifiedWildcard(_) => {
+                for i in 0..columns.len() {
+                    out.push(row.get(i).cloned().unwrap_or(Value::Null));
+                }
+            }
+            crate::ast::SelectItem::Expr { expr, .. } => {
+                out.push(crate::eval::eval(expr, row)?);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Clustered table DELETE: collects candidates from the clustered B-tree,

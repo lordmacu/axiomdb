@@ -4,6 +4,19 @@ fn execute_insert_ctx(
     conn_txn: &mut ConnectionTxn,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    // Phase 21.4 — INSERT RETURNING is parser-accepted but executor wiring is
+    // deferred to 21.4b: the INSERT path has ~10 exit points across heap /
+    // clustered / batched / SELECT-source / ON DUPLICATE / REPLACE, and each
+    // needs a post-write row-capture hook. Landing them in a dedicated subphase
+    // to keep commits focused. Today: clear runtime rejection so ORMs fail
+    // fast rather than silently missing returned rows.
+    if !stmt.returning.is_empty() {
+        return Err(DbError::NotImplemented {
+            feature: "INSERT ... RETURNING — executor support deferred to 21.4b; \
+                      parser + AST + analyzer landed in 21.4"
+                .into(),
+        });
+    }
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
     let storage = exec_ctx.storage();
     let txn = exec_ctx.coord();

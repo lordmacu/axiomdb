@@ -33,11 +33,37 @@ fn analyze_insert(
         let analyzed = analyze_select(
             *select.clone(),
             storage,
-            snapshot,
+            snapshot.clone(),
             default_database,
             default_schema,
         )?;
         s.source = InsertSource::Select(Box::new(analyzed));
+    }
+
+    // Phase 21.4 — resolve RETURNING projection against the target table's scope.
+    if !s.returning.is_empty() {
+        let mut reader = CatalogReader::new(storage, snapshot.clone())?;
+        let table_def =
+            resolve_dml_table(&mut reader, &s.table, default_database, default_schema)?;
+        let columns = reader.list_columns(table_def.id)?;
+        let bound = BoundTable {
+            alias: s.table.alias.clone(),
+            name: s.table.name.clone(),
+            columns,
+            col_offset: 0,
+        };
+        let ctx = BindContext { tables: vec![bound] };
+        let mut resolved = Vec::with_capacity(s.returning.len());
+        for item in std::mem::take(&mut s.returning) {
+            resolved.push(match item {
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => item,
+                SelectItem::Expr { expr, alias } => SelectItem::Expr {
+                    expr: resolve_expr(expr, &ctx)?,
+                    alias,
+                },
+            });
+        }
+        s.returning = resolved;
     }
 
     Ok(s)
@@ -152,6 +178,19 @@ fn analyze_update(
 
     s.limit = resolve_opt_expr(s.limit, &ctx)?;
 
+    // Phase 21.4 — resolve RETURNING against the target scope.
+    let mut resolved_returning = Vec::with_capacity(s.returning.len());
+    for item in std::mem::take(&mut s.returning) {
+        resolved_returning.push(match item {
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => item,
+            SelectItem::Expr { expr, alias } => SelectItem::Expr {
+                expr: resolve_expr(expr, &ctx)?,
+                alias,
+            },
+        });
+    }
+    s.returning = resolved_returning;
+
     Ok(s)
 }
 
@@ -239,6 +278,19 @@ fn analyze_delete(
     s.order_by = resolved_order;
 
     s.limit = resolve_opt_expr(s.limit, &ctx)?;
+
+    // Phase 21.4 — resolve RETURNING projection items against the target.
+    let mut resolved_returning = Vec::with_capacity(s.returning.len());
+    for item in s.returning {
+        resolved_returning.push(match item {
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => item,
+            SelectItem::Expr { expr, alias } => SelectItem::Expr {
+                expr: resolve_expr(expr, &ctx)?,
+                alias,
+            },
+        });
+    }
+    s.returning = resolved_returning;
 
     Ok(s)
 }
