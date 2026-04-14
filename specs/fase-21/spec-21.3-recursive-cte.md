@@ -125,6 +125,34 @@ MAX_RECURSION = 1000 (PG default). Configurable later via
 - SEARCH / CYCLE clauses (PG 14+).
 - Recursive CTE in DML sources.
 
+## Cross-engine research
+
+**PostgreSQL** (`research/postgres/src/backend/executor/nodeRecursiveunion.c:63-173`):
+- Two tuplestores: `working_table` + `intermediate_table`.
+- Hash table for dedup when `numCols > 0` (UNION, not ALL).
+- Algorithm:
+  1. Evaluate non-recursive term, yield each tuple, put to working_table.
+  2. Set `recursing=true`.
+  3. Loop recursive term (`innerPlan`): put each output to
+     intermediate_table, yield to caller.
+  4. On innerPlan exhaustion: if intermediate_empty → done.
+  5. Swap working_table ↔ intermediate_table; reset recursive term
+     via `chgParam` (re-binds WT); continue.
+
+**DuckDB** (`research/duckdb/src/execution/operator/set/physical_recursive_cte.cpp`):
+- Two children: `top` (base), `bottom` (recursive).
+- `intermediate_table` column data collection + hash table.
+- `union_all` flag controls dedup.
+- Similar swap-based iteration.
+
+**AxiomDB adaptation**:
+- Reuse existing row `Vec<Vec<Value>>` as both tables (smaller scale OK).
+- Dedup via `HashSet<Vec<Value>>` over serialized row bytes (when
+  !union_all).
+- Step re-analysis per iter acceptable for MVP (bounded by
+  MAX_RECURSION); later optimization: pre-analyze step once with
+  `FromClause::RecursiveSelf` sentinel + thread-local WT binding.
+
 ## Dependencies
 
 - Parser already has SetOp for UNION in 21.2.
