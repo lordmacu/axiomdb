@@ -3,7 +3,7 @@
 ## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 21.22 `VALUES` inline table — ✅ closed. Next medium: 21.14 `CREATE TABLE AS SELECT`, 21.15 `CREATE TABLE LIKE`, 21.4 `RETURNING`; then big: 21.2 CTE, 21.5 MERGE family.
+**Active subphase:** 21.14 + 21.15 `CREATE TABLE AS SELECT` / `CREATE TABLE LIKE` — ✅ marked (were already implemented in Phase 4 G5 sprint; status fix). Next: 21.4 `RETURNING`; then big: 21.2 CTE, 21.5 MERGE family.
 
 ### Phase 11 subphase status
 
