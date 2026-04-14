@@ -201,6 +201,22 @@ fn execute_clustered_insert_ctx(
     ctx.stats.on_rows_changed(resolved.def.id, count);
     ctx.invalidate_all();
 
+    if !stmt.returning.is_empty() {
+        let returning_rows: Vec<Vec<Value>> = prepared_rows
+            .into_iter()
+            .map(|p| p.values)
+            .collect();
+        if let Some(id) = first_generated {
+            THREAD_LAST_INSERT_ID.with(|v| v.set(id));
+        }
+        return project_returning(
+            &stmt.returning,
+            &returning_rows,
+            &resolved.def,
+            &resolved.columns,
+        );
+    }
+
     if let Some(id) = first_generated {
         THREAD_LAST_INSERT_ID.with(|v| v.set(id));
         return Ok(QueryResult::affected_with_id(count, id));

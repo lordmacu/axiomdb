@@ -13,6 +13,7 @@ fn execute_update_with_candidates(
     snap: axiomdb_core::TransactionSnapshot,
     resolved: &axiomdb_catalog::ResolvedTable,
     ctx: &mut SessionContext,
+    returning: &[crate::ast::SelectItem],
 ) -> Result<QueryResult, DbError> {
     let storage = exec_ctx.storage();
     let txn = exec_ctx.coord();
@@ -31,7 +32,8 @@ fn execute_update_with_candidates(
     // cloning the full row — eliminating String clones for unchanged columns.
     let needs_full_row = !field_patch_eligible
         || !secondary_indexes.is_empty()
-        || !resolved.constraints.is_empty();
+        || !resolved.constraints.is_empty()
+        || !returning.is_empty();
 
     let mut to_update: Vec<(RecordId, Vec<Value>, Vec<Value>)> = Vec::new();
     // Sparse path: (rid, [(col_pos, new_value)])
@@ -352,6 +354,14 @@ fn execute_update_with_candidates(
     }
 
     // ── Normal UPDATE path (full decode + encode) ────────────────────────
+    // Phase 21.4b — capture post-update rows BEFORE to_update is moved
+    // into the index-maintenance pairing below.
+    let returning_rows: Vec<Vec<Value>> = if !returning.is_empty() {
+        to_update.iter().map(|(_, _, new)| new.clone()).collect()
+    } else {
+        Vec::new()
+    };
+
     let heap_updates: Vec<(RecordId, Vec<Value>)> = to_update
         .iter()
         .map(|(rid, _old, new)| (*rid, new.clone()))
@@ -395,6 +405,10 @@ fn execute_update_with_candidates(
             )?;
             ctx.invalidate_all();
         }
+    }
+
+    if !returning.is_empty() {
+        return project_returning(returning, &returning_rows, &resolved.def, &resolved.columns);
     }
 
     Ok(QueryResult::Affected {
