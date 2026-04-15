@@ -193,10 +193,7 @@ fn expr_mentions_column_name(expr: &crate::expr::Expr, target_name: &str) -> boo
         Expr::Column { name, .. }
         | Expr::OuterColumn { name, .. }
         | Expr::InsertValue { name, .. } => name.eq_ignore_ascii_case(target_name),
-        Expr::Literal(_)
-        | Expr::Param { .. }
-        | Expr::Default
-        | Expr::SqlJsonQuery { .. } => false,
+        Expr::Literal(_) | Expr::Param { .. } | Expr::Default | Expr::SqlJsonQuery { .. } => false,
         Expr::UnaryOp { operand, .. }
         | Expr::IsNull { expr: operand, .. }
         | Expr::IsBoolean { expr: operand, .. }
@@ -482,13 +479,8 @@ fn execute_alter_table(
                             &snap,
                         )?
                     } else {
-                        let rows = TableEngine::scan_table(
-                            storage,
-                            &table_def.def,
-                            &columns,
-                            snap,
-                            None,
-                        )?;
+                        let rows =
+                            TableEngine::scan_table(storage, &table_def.def, &columns, snap, None)?;
                         rows.iter()
                             .filter_map(|(_, vals)| vals.get(ai_col))
                             .filter_map(|v| match v {
@@ -1192,6 +1184,7 @@ fn alter_add_index(
             .map(|c| crate::ast::IndexColumn {
                 name: c.clone(),
                 order: SortOrder::Asc,
+                expr: None,
             })
             .collect(),
         predicate: None,
