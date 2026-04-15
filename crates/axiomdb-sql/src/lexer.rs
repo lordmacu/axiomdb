@@ -65,8 +65,7 @@ impl<'src> SpannedToken<'src> {
 /// produce [`Token::Select`].
 #[derive(Logos, Debug, Clone, PartialEq)]
 #[logos(skip r"[ \t\r\n]+")] // whitespace
-#[logos(skip r"--[^\n]*")] // line comment (--)
-#[logos(skip r"#[^\n]*")] // MySQL line comment (#)
+#[logos(skip r"--[^\n]*")] // line comment (--) MySQL also supports # but it collides with #> #>> #- operators
 #[logos(skip r"/\*([^*]|\*[^/])*\*/")] // block comment /* */
 pub enum Token<'src> {
     // ── DML keywords ─────────────────────────────────────────────────────────
@@ -752,6 +751,36 @@ fn process_double_quoted_identifier(raw: &str) -> Option<String> {
     Some(result)
 }
 
+// ── MySQL `#` comment stripper ───────────────────────────────────────────────
+
+/// Strips MySQL `#` line comments from `input` before tokenization.
+///
+/// This is done here rather than via a logos `skip` rule because `#` conflicts
+/// with the JSONB operators `#>`, `#>>`, `#-` (Phase 11.18c).
+fn strip_hash_comments(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Only treat `#` as a comment at the start of a line (after \n or \r or start)
+        if bytes[i] == b'#'
+            && (i == 0
+                || bytes[i.saturating_sub(1)] == b'\n'
+                || bytes[i.saturating_sub(1)] == b'\r')
+        {
+            // Skip until end of line
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    result
+}
+
 // ── tokenize ─────────────────────────────────────────────────────────────────
 
 /// Tokenizes `input` into a flat stream of [`SpannedToken`]s.
@@ -801,7 +830,14 @@ pub fn tokenize_with_sql_mode<'src>(
     }
 
     let mut tokens: Vec<SpannedToken<'src>> = Vec::new();
-    let mut lex = Token::lexer(input);
+
+    // Phase 11.18c fix: explicitly strip MySQL `#` comments before tokenization.
+    // The `#` character conflicts with the #> #>> #- JSONB operators,
+    // so we handle it here in the tokenize function rather than in the logos skip rule.
+    let stripped_input = strip_hash_comments(input);
+    let stripped_input: &'src str = Box::leak(stripped_input.into_boxed_str());
+
+    let mut lex = Token::lexer(stripped_input);
 
     while let Some(result) = lex.next() {
         let logos_span = lex.span();

@@ -161,12 +161,28 @@ fn detect_materializable_pattern(stmt: &SelectStmt) -> Option<MaterializableInfo
                 // deeper correlation is handled by the generic row-by-row path.
                 match (left.as_ref(), right.as_ref()) {
                     (
-                        Expr::OuterColumn { col_idx: outer_idx, depth: 0, .. },
-                        Expr::Column { col_idx: inner_idx, name, .. },
+                        Expr::OuterColumn {
+                            col_idx: outer_idx,
+                            depth: 0,
+                            ..
+                        },
+                        Expr::Column {
+                            col_idx: inner_idx,
+                            name,
+                            ..
+                        },
                     )
                     | (
-                        Expr::Column { col_idx: inner_idx, name, .. },
-                        Expr::OuterColumn { col_idx: outer_idx, depth: 0, .. },
+                        Expr::Column {
+                            col_idx: inner_idx,
+                            name,
+                            ..
+                        },
+                        Expr::OuterColumn {
+                            col_idx: outer_idx,
+                            depth: 0,
+                            ..
+                        },
                     ) => {
                         if found.is_none() {
                             *found = Some((*outer_idx, *inner_idx, name.clone()));
@@ -568,11 +584,17 @@ fn stmt_has_outer_ref(stmt: &SelectStmt) -> bool {
 /// Nested subqueries are walked with `binding_depth + 1` so that refs pointing
 /// to the caller's scope through multiple layers of nesting are still resolved
 /// correctly (GAP-C.8).
-fn substitute_outer(stmt: SelectStmt, outer_row: &[Value]) -> SelectStmt {
+/// Phase 21.9 — public within the crate so joins.rs can use it for
+/// LATERAL-correlated subquery materialization.
+pub(crate) fn substitute_outer(stmt: SelectStmt, outer_row: &[Value]) -> SelectStmt {
     substitute_outer_at(stmt, outer_row, 0)
 }
 
-fn substitute_outer_at(mut stmt: SelectStmt, outer_row: &[Value], binding_depth: u16) -> SelectStmt {
+fn substitute_outer_at(
+    mut stmt: SelectStmt,
+    outer_row: &[Value],
+    binding_depth: u16,
+) -> SelectStmt {
     stmt.where_clause = stmt
         .where_clause
         .map(|e| subst_expr(e, outer_row, binding_depth));
@@ -587,9 +609,7 @@ fn substitute_outer_at(mut stmt: SelectStmt, outer_row: &[Value], binding_depth:
             other => other,
         })
         .collect();
-    stmt.having = stmt
-        .having
-        .map(|e| subst_expr(e, outer_row, binding_depth));
+    stmt.having = stmt.having.map(|e| subst_expr(e, outer_row, binding_depth));
     stmt.group_by = stmt
         .group_by
         .into_iter()
@@ -824,7 +844,10 @@ impl<'a> SubqueryRunner for ExecSubqueryRunner<'a> {
                 });
                 if let Some(Some((outer_idx, ref map, ref cols))) = mat_cache.get(&cache_key) {
                     let key = crate::eval::core::HashableValue(
-                        self.outer_row.get(*outer_idx).cloned().unwrap_or(Value::Null),
+                        self.outer_row
+                            .get(*outer_idx)
+                            .cloned()
+                            .unwrap_or(Value::Null),
                     );
                     return if let Some(row) = map.get(&key) {
                         Ok(QueryResult::Rows {

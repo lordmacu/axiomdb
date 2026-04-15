@@ -9,6 +9,7 @@ use crate::{
         CreateTableAsSelectStmt, CreateTableLikeStmt, CreateTableStmt, DropIndexStmt,
         DropTableStmt, ForeignKeyAction, IndexColumn, SortOrder, Stmt, TableConstraint,
     },
+    expr::Expr,
     lexer::Token,
 };
 
@@ -912,6 +913,36 @@ pub(crate) fn parse_create_index(p: &mut Parser, unique: bool) -> Result<Stmt, D
 
 fn parse_index_column(p: &mut Parser) -> Result<IndexColumn, DbError> {
     let name = p.parse_identifier()?;
+
+    // Check if this is an expression like LOWER(col)
+    // Look ahead: if next token is LParen, it's a function/expression
+    let (name, expr) = if *p.peek() == Token::LParen {
+        // This is an expression - the column name is INSIDE the parentheses
+        let func_name = name.clone();
+        p.expect(&Token::LParen)?;
+
+        // Parse the argument (column reference)
+        let arg = parse_expr(p)?;
+        p.expect(&Token::RParen)?;
+
+        // For expression indexes, the name should be the column being indexed
+        // and the expression wraps it
+        let column_in_expr = match &arg {
+            Expr::Column { name: col_name, .. } => col_name.clone(),
+            _ => func_name.clone(), // fallback
+        };
+
+        // Wrap as a function call: LOWER(col)
+        let expr = Expr::Function {
+            name: func_name,
+            args: vec![arg],
+        };
+
+        (column_in_expr, Some(Box::new(expr)))
+    } else {
+        (name, None)
+    };
+
     let order = if p.eat(&Token::Asc) {
         SortOrder::Asc
     } else if p.eat(&Token::Desc) {
@@ -919,7 +950,8 @@ fn parse_index_column(p: &mut Parser) -> Result<IndexColumn, DbError> {
     } else {
         SortOrder::Asc
     };
-    Ok(IndexColumn { name, order })
+
+    Ok(IndexColumn { name, order, expr })
 }
 
 // ── DROP TABLE ────────────────────────────────────────────────────────────────
