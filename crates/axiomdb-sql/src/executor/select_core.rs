@@ -101,7 +101,8 @@ fn execute_select(
     if stmt.joins.is_empty() {
         // ── Single-table path (no JOIN) ───────────────────────────────────────
         let resolved = {
-            let mut resolver = make_resolver_with_database(storage, txn, conn_txn, DEFAULT_DATABASE_NAME)?;
+            let mut resolver =
+                make_resolver_with_database(storage, txn, conn_txn, DEFAULT_DATABASE_NAME)?;
             resolver.resolve_table(from_table_ref.schema.as_deref(), &from_table_ref.name)?
         };
         let snap = conn_txn
@@ -380,7 +381,7 @@ fn execute_select_derived(
     _conn_txn: Option<&ConnectionTxn>,
 ) -> Result<QueryResult, DbError> {
     let (inner_query, _alias) = match stmt.from.take() {
-        Some(FromClause::Subquery { query, alias }) => (*query, alias),
+        Some(FromClause::Subquery { query, alias, .. }) => (*query, alias),
         _ => unreachable!("execute_select_derived called with non-subquery FROM"),
     };
 
@@ -431,8 +432,7 @@ fn execute_select_derived(
     }
 
     let resolved_ob = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
-    if !resolved_ob.is_empty() && stmt.limit.is_some() && !stmt.distinct && !stmt.calc_found_rows
-    {
+    if !resolved_ob.is_empty() && stmt.limit.is_some() && !stmt.distinct && !stmt.calc_found_rows {
         let (limit_n, offset_n) = eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
         let top_n = offset_n + limit_n.unwrap_or(usize::MAX).min(usize::MAX - offset_n);
         combined_rows = apply_order_by_top_n(combined_rows, &resolved_ob, top_n)?;

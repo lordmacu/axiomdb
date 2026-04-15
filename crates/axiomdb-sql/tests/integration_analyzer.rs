@@ -376,7 +376,7 @@ fn test_join_side_subquery_is_persisted_as_analyzed_ast() {
     assert_eq!(select.joins.len(), 1);
 
     match &select.joins[0].table {
-        axiomdb_sql::ast::FromClause::Subquery { query, alias } => {
+        axiomdb_sql::ast::FromClause::Subquery { query, alias, .. } => {
             assert_eq!(alias, "stats");
 
             match &query.where_clause {
