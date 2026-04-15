@@ -720,6 +720,197 @@ pub fn jsontable_is_correlated(jt: &crate::ast::JsonTable) -> bool {
     doc_has_column_refs(&jt.doc) || jt.passing.iter().any(|(expr, _)| doc_has_column_refs(expr))
 }
 
+/// Phase 21.9 — Returns `true` if the expression tree contains an
+/// `OuterColumn` node at depth 0 (immediate outer scope). Used to detect
+/// correlated LATERAL subqueries that must be re-evaluated per outer row.
+pub fn expr_has_outer_column_refs(expr: &crate::expr::Expr) -> bool {
+    use crate::expr::Expr;
+    match expr {
+        Expr::OuterColumn { depth: 0, .. } => true,
+        // Depth > 0: deeper nesting — not relevant for LATERAL correlation detection
+        Expr::OuterColumn { .. } => false,
+        Expr::Column { .. }
+        | Expr::Literal(_)
+        | Expr::Default
+        | Expr::Param { .. }
+        | Expr::InsertValue { .. } => false,
+        Expr::UnaryOp { operand, .. } => expr_has_outer_column_refs(operand),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_outer_column_refs(left) || expr_has_outer_column_refs(right)
+        }
+        Expr::Function { args, .. } => args.iter().any(expr_has_outer_column_refs),
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|o| expr_has_outer_column_refs(o))
+                || when_thens
+                    .iter()
+                    .any(|(a, b)| expr_has_outer_column_refs(a) || expr_has_outer_column_refs(b))
+                || else_result
+                    .as_ref()
+                    .is_some_and(|e| expr_has_outer_column_refs(e))
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_has_outer_column_refs(expr)
+                || expr_has_outer_column_refs(low)
+                || expr_has_outer_column_refs(high)
+        }
+        Expr::In { expr, list, .. } => {
+            expr_has_outer_column_refs(expr) || list.iter().any(expr_has_outer_column_refs)
+        }
+        Expr::IsBoolean { expr, .. } => expr_has_outer_column_refs(expr),
+        Expr::Cast { expr, .. } => expr_has_outer_column_refs(expr),
+        Expr::IsNull { expr, .. } => expr_has_outer_column_refs(expr),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_has_outer_column_refs(expr)
+                || expr_has_outer_column_refs(pattern)
+                || escape
+                    .as_ref()
+                    .is_some_and(|e| expr_has_outer_column_refs(e))
+        }
+        Expr::SqlJsonQuery {
+            doc,
+            passing,
+            on_empty,
+            on_error,
+            ..
+        } => {
+            expr_has_outer_column_refs(doc)
+                || passing.iter().any(|(e, _)| expr_has_outer_column_refs(e))
+                || on_behavior_has_outer_col_refs(on_empty)
+                || on_behavior_has_outer_col_refs(on_error)
+        }
+        Expr::GroupConcat { expr, order_by, .. } => {
+            expr_has_outer_column_refs(expr)
+                || order_by.iter().any(|(e, _)| expr_has_outer_column_refs(e))
+        }
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => false,
+    }
+}
+
+fn on_behavior_has_outer_col_refs(b: &SqlJsonOnBehavior) -> bool {
+    match b {
+        SqlJsonOnBehavior::Default(e) => expr_has_outer_column_refs(e),
+        _ => false,
+    }
+}
+
+/// Phase 21.9 — Returns `col_idx` of the first depth-0 `OuterColumn` found
+/// in `expr`, or `None` if the expression contains no outer column references.
+pub fn outer_column_idx(expr: &crate::expr::Expr) -> Option<usize> {
+    use crate::expr::Expr;
+    match expr {
+        Expr::OuterColumn {
+            col_idx, depth: 0, ..
+        } => Some(*col_idx),
+        Expr::UnaryOp { operand, .. } => outer_column_idx(operand),
+        Expr::BinaryOp { left, right, .. } => {
+            outer_column_idx(left).or_else(|| outer_column_idx(right))
+        }
+        Expr::Function { args, .. } => args.iter().find_map(outer_column_idx),
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => operand
+            .as_ref()
+            .and_then(|o| outer_column_idx(o))
+            .or_else(|| {
+                when_thens
+                    .iter()
+                    .find_map(|(a, b)| outer_column_idx(a).or_else(|| outer_column_idx(b)))
+            })
+            .or_else(|| else_result.as_ref().and_then(|e| outer_column_idx(e))),
+        // Depth > 0: deeper nesting — not relevant for LATERAL correlation
+        Expr::OuterColumn { .. } => None,
+        _ => None,
+    }
+}
+
+/// Phase 21.9 — Returns `true` if `subquery`'s SELECT list, WHERE, GROUP BY,
+/// HAVING, ORDER BY, or JOIN ON expressions contain any `OuterColumn` node at
+/// depth 0 whose `col_idx` refers to a column that precedes the subquery's
+/// own columns (i.e., `col_idx < left_col_count`). Such a subquery is
+/// correlated to the outer query and must be re-evaluated per outer row.
+pub fn subquery_is_correlated(subquery: &crate::ast::SelectStmt, left_col_count: usize) -> bool {
+    // Check SELECT items
+    for item in &subquery.columns {
+        if let crate::ast::SelectItem::Expr { expr, .. } = item {
+            if expr_has_outer_column_refs(expr) {
+                if let Some(idx) = outer_column_idx(expr) {
+                    if idx < left_col_count {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // Check WHERE
+    if let Some(ref where_clause) = subquery.where_clause {
+        if expr_has_outer_column_refs(where_clause) {
+            if let Some(idx) = outer_column_idx(where_clause) {
+                if idx < left_col_count {
+                    return true;
+                }
+            }
+        }
+    }
+    // Check GROUP BY
+    for expr in &subquery.group_by {
+        if expr_has_outer_column_refs(expr) {
+            if let Some(idx) = outer_column_idx(expr) {
+                if idx < left_col_count {
+                    return true;
+                }
+            }
+        }
+    }
+    // Check HAVING
+    if let Some(ref having) = subquery.having {
+        if expr_has_outer_column_refs(having) {
+            if let Some(idx) = outer_column_idx(having) {
+                if idx < left_col_count {
+                    return true;
+                }
+            }
+        }
+    }
+    // Check ORDER BY
+    for ob in &subquery.order_by {
+        if expr_has_outer_column_refs(&ob.expr) {
+            if let Some(idx) = outer_column_idx(&ob.expr) {
+                if idx < left_col_count {
+                    return true;
+                }
+            }
+        }
+    }
+    // Check JOIN conditions in the subquery itself
+    for join in &subquery.joins {
+        if let crate::ast::JoinCondition::On(ref expr) = join.condition {
+            if expr_has_outer_column_refs(expr) {
+                if let Some(idx) = outer_column_idx(expr) {
+                    if idx < left_col_count {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 pub fn doc_has_column_refs(expr: &crate::expr::Expr) -> bool {
     use crate::expr::Expr;
     match expr {
