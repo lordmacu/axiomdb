@@ -54,6 +54,10 @@ fn execute_select_with_joins_first_materialized(
     let mut correlated_jt: Vec<Option<crate::json_table::JsonTableSpec>> = vec![None];
     // Phase 11.25a: parallel tracker for correlated JSONB SRFs.
     let mut correlated_srf: Vec<Option<crate::ast::JsonbSrfKind>> = vec![None];
+    // Phase 21.9: parallel tracker for correlated LATERAL subqueries.
+    // Some(subquery) → LATERAL subquery correlated to left side, must be
+    // re-evaluated per outer row. None → non-LATERAL or non-correlated.
+    let mut correlated_sub: Vec<Option<SelectStmt>> = vec![None];
     let mut running_offset = 0usize;
     let snap = conn_txn
         .map(|c| txn.active_snapshot(c))
@@ -64,6 +68,7 @@ fn execute_select_with_joins_first_materialized(
         running_offset += first_source.columns.len();
         all_sources.push(first_source);
         scanned.push(first_rows);
+        correlated_sub.push(None);
 
         for join in &stmt.joins {
             match &join.table {
@@ -82,21 +87,44 @@ fn execute_select_with_joins_first_materialized(
                     correlated_jt.push(None);
                     correlated_srf.push(None);
                 }
-                FromClause::Subquery { query, alias, .. } => {
-                    let inner_result =
-                        execute_select_ctx((**query).clone(), exec_ctx, conn_txn, ctx)?;
-                    let (columns, rows) = match inner_result {
-                        QueryResult::Rows { columns, rows } => (columns, rows),
-                        _ => {
-                            return Err(DbError::Internal {
-                                message: "join-side subquery did not return rows".into(),
-                            });
+                FromClause::Subquery {
+                    query,
+                    alias,
+                    lateral,
+                } => {
+                    // Phase 21.9: check if this LATERAL subquery is correlated
+                    // (references outer columns from the left side of the join).
+                    // For correlated subqueries, we defer materialization to the
+                    // per-outer-row combine loop. Non-LATERAL or non-correlated
+                    // subqueries are materialized once upfront.
+                    let left_col_count = all_sources.iter().map(|s| s.columns.len()).sum::<usize>();
+                    let is_correlated = *lateral
+                        && crate::json_table::subquery_is_correlated(query, left_col_count);
+
+                    let (columns, rows) = if is_correlated {
+                        // Deferred: store the subquery for combine loop, use empty schema.
+                        (vec![], Vec::new())
+                    } else {
+                        let inner_result =
+                            execute_select_ctx((**query).clone(), exec_ctx, conn_txn, ctx)?;
+                        match inner_result {
+                            QueryResult::Rows { columns, rows } => (columns, rows),
+                            _ => {
+                                return Err(DbError::Internal {
+                                    message: "join-side subquery did not return rows".into(),
+                                });
+                            }
                         }
                     };
                     col_offsets.push(running_offset);
                     running_offset += columns.len();
                     all_sources.push(join_source_schema_from_derived(alias, columns));
                     scanned.push(rows);
+                    correlated_sub.push(if is_correlated {
+                        Some((**query).clone())
+                    } else {
+                        None
+                    });
                     correlated_jt.push(None);
                     correlated_srf.push(None);
                 }
@@ -224,6 +252,21 @@ fn execute_select_with_joins_first_materialized(
                 &join.condition,
                 &left_schema,
                 right_col_offset,
+            )?
+        } else if let Some(subquery) = correlated_sub[right_idx].as_ref() {
+            // Phase 21.9 — correlated LATERAL subquery right side.
+            apply_correlated_subquery_join(
+                combined_rows,
+                subquery,
+                &all_sources[right_idx].columns,
+                right_col_count,
+                join.join_type,
+                &join.condition,
+                &left_schema,
+                right_col_offset,
+                exec_ctx,
+                conn_txn,
+                ctx,
             )?
         } else {
             apply_join(

@@ -16,7 +16,10 @@ fn join_source_schema_from_resolved(
     if let Some(alias) = table_ref.alias.as_ref() {
         match_names.push(alias.clone());
     }
-    if !match_names.iter().any(|name| name == &resolved.def.table_name) {
+    if !match_names
+        .iter()
+        .any(|name| name == &resolved.def.table_name)
+    {
         match_names.push(resolved.def.table_name.clone());
     }
 
@@ -76,8 +79,7 @@ fn apply_join(
     right_columns: &[ColumnMeta],
 ) -> Result<Vec<Row>, DbError> {
     // Phase 9.9: Adaptive join selection.
-    let is_large = left_rows.len() >= HASH_JOIN_MIN_ROWS
-        || right_rows.len() >= HASH_JOIN_MIN_ROWS;
+    let is_large = left_rows.len() >= HASH_JOIN_MIN_ROWS || right_rows.len() >= HASH_JOIN_MIN_ROWS;
 
     if is_large {
         if let Some((l_idx, r_combined_idx)) = detect_equijoin(condition, left_col_count) {
@@ -87,26 +89,31 @@ fn apply_join(
             match join_type {
                 JoinType::Inner => {
                     // Phase 9.8: spill-to-disk for large hash joins (>64MB estimated).
-                    return hash_join_inner_with_spill(
-                        &left_rows, right_rows, l_idx, r_idx,
-                    );
+                    return hash_join_inner_with_spill(&left_rows, right_rows, l_idx, r_idx);
                 }
                 JoinType::Left => {
                     return Ok(hash_join_left(
-                        &left_rows, right_rows, l_idx, r_idx, right_col_count,
+                        &left_rows,
+                        right_rows,
+                        l_idx,
+                        r_idx,
+                        right_col_count,
                     ));
                 }
                 JoinType::Right => {
                     // RIGHT = LEFT with swapped sides + column reorder.
-                    let swapped = hash_join_left(
-                        right_rows, &left_rows, r_idx, l_idx, left_col_count,
-                    );
+                    let swapped =
+                        hash_join_left(right_rows, &left_rows, r_idx, l_idx, left_col_count);
                     return Ok(swap_columns(swapped, right_col_count, left_col_count));
                 }
                 JoinType::Full => {
                     return Ok(hash_join_full(
-                        &left_rows, right_rows, l_idx, r_idx,
-                        left_col_count, right_col_count,
+                        &left_rows,
+                        right_rows,
+                        l_idx,
+                        r_idx,
+                        left_col_count,
+                        right_col_count,
                     ));
                 }
                 JoinType::Cross => {} // no equijoin for CROSS
@@ -889,7 +896,12 @@ fn hash_join_inner_with_spill(
 
     if estimated_mem <= SPILL_MEMORY_LIMIT {
         // Fits in memory — use fast in-memory path.
-        return Ok(hash_join_inner(left_rows, right_rows, left_key_idx, right_key_idx));
+        return Ok(hash_join_inner(
+            left_rows,
+            right_rows,
+            left_key_idx,
+            right_key_idx,
+        ));
     }
 
     // Need to spill. Use partitioned approach.
@@ -1099,6 +1111,72 @@ fn apply_correlated_srf_join(
     for outer in &left_rows {
         let doc_val = crate::eval::eval(doc_expr, outer)?;
         let rows = crate::jsonb_srf::materialize_jsonb_srf(kind, &doc_val)?;
+        let mut matched = false;
+        for right in &rows {
+            let combined = concat_rows(outer, right);
+            if eval_join_cond(
+                condition,
+                &combined,
+                left_schema,
+                right_col_offset,
+                right_columns,
+            )? {
+                out.push(combined);
+                matched = true;
+            }
+        }
+        if !matched && matches!(join_type, JoinType::Left) {
+            out.push(concat_rows(outer, &null_right));
+        }
+    }
+    Ok(out)
+}
+
+/// Phase 21.9 — JOIN where the right side is a correlated LATERAL subquery.
+/// The subquery references outer columns from the left side, so it must be
+/// re-evaluated per outer row. Semantics mirror `apply_correlated_jt_join`.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_correlated_subquery_join(
+    left_rows: Vec<Row>,
+    subquery: &crate::ast::SelectStmt,
+    right_columns: &[ColumnMeta],
+    right_col_count: usize,
+    join_type: JoinType,
+    condition: &crate::ast::JoinCondition,
+    left_schema: &[(String, usize)],
+    right_col_offset: usize,
+    exec_ctx: &ExecutionContext,
+    conn_txn: Option<&axiomdb_wal::ConnectionTxn>,
+    ctx: &mut SessionContext,
+) -> Result<Vec<Row>, DbError> {
+    use crate::executor::substitute_outer;
+
+    match join_type {
+        JoinType::Right | JoinType::Full => {
+            return Err(DbError::NotImplemented {
+                feature: "RIGHT/FULL JOIN on LATERAL-correlated subquery — \
+                          PG-compatible rejection"
+                    .into(),
+            });
+        }
+        _ => {}
+    }
+    let null_right: Row = vec![axiomdb_types::Value::Null; right_col_count];
+    let mut out: Vec<Row> = Vec::with_capacity(left_rows.len());
+
+    for outer in &left_rows {
+        // Substitute OuterColumn nodes in the subquery with values from the outer row.
+        let subquery_resolved = substitute_outer(subquery.clone(), outer);
+        let inner_result =
+            crate::executor::execute_select_ctx(subquery_resolved, exec_ctx, conn_txn, ctx)?;
+        let rows = match inner_result {
+            crate::QueryResult::Rows { rows, .. } => rows,
+            _ => {
+                return Err(DbError::Internal {
+                    message: "LATERAL subquery did not return rows".into(),
+                });
+            }
+        };
         let mut matched = false;
         for right in &rows {
             let combined = concat_rows(outer, right);
