@@ -427,6 +427,7 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
         return Ok(FromClause::Subquery {
             query: Box::new(sub),
             alias,
+            lateral: false,
         });
     }
 

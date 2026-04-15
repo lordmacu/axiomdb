@@ -184,11 +184,13 @@ pub enum TableConstraint {
     },
 }
 
-/// A column listed in `CREATE INDEX`, with optional sort direction.
+/// A column listed in `CREATE INDEX`, with optional sort direction and expression.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexColumn {
     pub name: String,
     pub order: SortOrder,
+    /// Optional expression for expression indexes: `CREATE INDEX ON t(LOWER(col))`
+    pub expr: Option<Box<Expr>>,
 }
 
 /// `col = expr` assignment in an `UPDATE` statement.
@@ -216,9 +218,11 @@ pub enum SelectItem {
 pub enum FromClause {
     Table(TableRef),
     /// `(SELECT ...) AS alias` — boxed to break mutual recursion with SelectStmt.
+    /// `lateral: true` for `LATERAL (SELECT ...)` (Phase 21.9).
     Subquery {
         query: Box<SelectStmt>,
         alias: String,
+        lateral: bool,
     },
     /// `JSON_TABLE(doc, '$.path' COLUMNS (...)) [AS alias]` — SQL:2016
     /// table-valued function (Phase 11.20a, flat subset).
@@ -1162,6 +1166,7 @@ mod tests {
         let from = FromClause::Subquery {
             query: Box::new(subquery),
             alias: "sub".into(),
+            lateral: false,
         };
         assert!(matches!(from, FromClause::Subquery { .. }));
     }
@@ -1226,6 +1231,7 @@ mod tests {
             columns: vec![IndexColumn {
                 name: "email".into(),
                 order: SortOrder::Asc,
+                expr: None,
             }],
             predicate: None,
             fillfactor: None,

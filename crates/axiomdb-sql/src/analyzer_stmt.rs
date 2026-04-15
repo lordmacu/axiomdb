@@ -28,8 +28,13 @@ fn analyze_stmt(
         Stmt::CreateTableLike(_) => Ok(stmt),
         // CREATE TABLE AS SELECT — analyze the inner SELECT
         Stmt::CreateTableAsSelect(mut s) => {
-            s.select =
-                analyze_select(s.select, storage, snapshot, default_database, default_schema)?;
+            s.select = analyze_select(
+                s.select,
+                storage,
+                snapshot,
+                default_database,
+                default_schema,
+            )?;
             Ok(Stmt::CreateTableAsSelect(s))
         }
         Stmt::DropTable(s) => {
@@ -46,12 +51,28 @@ fn analyze_stmt(
         }
         // UNION / INTERSECT / EXCEPT — analyze first + each tail SELECT.
         Stmt::SetOp { first, rest } => {
-            let first = analyze_select(first, storage, snapshot.clone(), default_database, default_schema)?;
+            let first = analyze_select(
+                first,
+                storage,
+                snapshot.clone(),
+                default_database,
+                default_schema,
+            )?;
             let rest: Result<Vec<_>, _> = rest
                 .into_iter()
                 .map(|t| {
-                    analyze_select(t.select, storage, snapshot.clone(), default_database, default_schema)
-                        .map(|select| crate::ast::SetOpTail { kind: t.kind, all: t.all, select })
+                    analyze_select(
+                        t.select,
+                        storage,
+                        snapshot.clone(),
+                        default_database,
+                        default_schema,
+                    )
+                    .map(|select| crate::ast::SetOpTail {
+                        kind: t.kind,
+                        all: t.all,
+                        select,
+                    })
                 })
                 .collect();
             Ok(Stmt::SetOp { first, rest: rest? })
@@ -212,7 +233,12 @@ fn analyze_select_with_outer(
     // the inner query to extract virtual column names, but did NOT store the
     // analyzed version back into `s.from`. Fix that here so the executor
     // receives the analyzed inner query with correct `col_idx` values.
-    if let Some(FromClause::Subquery { query, alias }) = s.from {
+    if let Some(FromClause::Subquery {
+        query,
+        alias,
+        lateral,
+    }) = s.from
+    {
         let analyzed_inner = analyze_select_with_outer(
             *query,
             storage,
@@ -224,6 +250,7 @@ fn analyze_select_with_outer(
         s.from = Some(FromClause::Subquery {
             query: Box::new(analyzed_inner),
             alias,
+            lateral,
         });
     }
 
@@ -268,7 +295,11 @@ fn analyze_select_with_outer(
     let mut resolved_joins = Vec::with_capacity(s.joins.len());
     for (join_idx, mut join) in s.joins.into_iter().enumerate() {
         match join.table {
-            FromClause::Subquery { query, alias } => {
+            FromClause::Subquery {
+                query,
+                alias,
+                lateral,
+            } => {
                 let analyzed_inner = analyze_select_with_outer(
                     *query,
                     storage,
@@ -280,6 +311,7 @@ fn analyze_select_with_outer(
                 join.table = FromClause::Subquery {
                     query: Box::new(analyzed_inner),
                     alias,
+                    lateral,
                 };
             }
             // Phase 11.20d3 — resolve JSON_TABLE doc + PASSING on the JOIN
@@ -291,10 +323,8 @@ fn analyze_select_with_outer(
             }
             // Phase 11.25a — resolve SRF doc against combined + outer scope.
             FromClause::JsonbSrf(mut srf) => {
-                let taken = std::mem::replace(
-                    &mut srf.doc,
-                    Expr::Literal(axiomdb_types::Value::Null),
-                );
+                let taken =
+                    std::mem::replace(&mut srf.doc, Expr::Literal(axiomdb_types::Value::Null));
                 srf.doc = resolve_expr_full(taken, &ctx, outer_scopes, Some(&state))?;
                 join.table = FromClause::JsonbSrf(srf);
             }
@@ -304,10 +334,7 @@ fn analyze_select_with_outer(
                 let empty_ctx = BindContext::empty();
                 for row in &mut vc.rows {
                     for e in row {
-                        let taken = std::mem::replace(
-                            e,
-                            Expr::Literal(axiomdb_types::Value::Null),
-                        );
+                        let taken = std::mem::replace(e, Expr::Literal(axiomdb_types::Value::Null));
                         *e = resolve_expr_full(taken, &empty_ctx, &[], Some(&state))?;
                     }
                 }
@@ -326,8 +353,7 @@ fn analyze_select_with_outer(
             // right = ctx.tables[join_idx + 1].
             if join_idx + 1 >= ctx.tables.len() {
                 return Err(DbError::Internal {
-                    message: "NATURAL JOIN: analyzer scope out of sync with join list"
-                        .into(),
+                    message: "NATURAL JOIN: analyzer scope out of sync with join list".into(),
                 });
             }
             let right_cols: Vec<String> = ctx.tables[join_idx + 1]
@@ -343,10 +369,7 @@ fn analyze_select_with_outer(
                     if !seen.insert(cname_ci.clone()) {
                         continue;
                     }
-                    if right_cols
-                        .iter()
-                        .any(|r| r.eq_ignore_ascii_case(&col.name))
-                    {
+                    if right_cols.iter().any(|r| r.eq_ignore_ascii_case(&col.name)) {
                         shared.push(col.name.clone());
                     }
                 }
@@ -513,10 +536,7 @@ fn resolve_on_behavior(
     state: &AnalyzeState<'_>,
 ) -> Result<(), DbError> {
     if let crate::expr::SqlJsonOnBehavior::Default(boxed) = b {
-        let inner = std::mem::replace(
-            boxed.as_mut(),
-            Expr::Literal(axiomdb_types::Value::Null),
-        );
+        let inner = std::mem::replace(boxed.as_mut(), Expr::Literal(axiomdb_types::Value::Null));
         let resolved = resolve_expr_full(inner, ctx, outer_scopes, Some(state))?;
         *boxed.as_mut() = resolved;
     }
@@ -545,13 +565,16 @@ fn expand_ctes(
 
     for cte in bindings {
         if cte.recursive {
-            let step = cte.recursive_step.clone().ok_or_else(|| DbError::ParseError {
-                message: format!(
-                    "WITH RECURSIVE `{}`: body must be `SELECT base UNION [ALL] SELECT step`",
-                    cte.name
-                ),
-                position: None,
-            })?;
+            let step = cte
+                .recursive_step
+                .clone()
+                .ok_or_else(|| DbError::ParseError {
+                    message: format!(
+                        "WITH RECURSIVE `{}`: body must be `SELECT base UNION [ALL] SELECT step`",
+                        cte.name
+                    ),
+                    position: None,
+                })?;
             let mut base_body = *cte.query.clone();
             base_body.with_ctes = dict
                 .iter()
@@ -648,9 +671,7 @@ fn substitute_cte_ref(
     recursive_dict: &std::collections::HashMap<String, Box<crate::ast::RecursiveCteClause>>,
 ) -> FromClause {
     match from {
-        FromClause::Table(tref)
-            if tref.database.is_none() && tref.schema.is_none() =>
-        {
+        FromClause::Table(tref) if tref.database.is_none() && tref.schema.is_none() => {
             let key = tref.name.to_ascii_lowercase();
             if let Some(clause) = recursive_dict.get(&key) {
                 let mut c = (**clause).clone();
@@ -664,6 +685,7 @@ fn substitute_cte_ref(
                 return FromClause::Subquery {
                     query: body.clone(),
                     alias,
+                    lateral: false,
                 };
             }
             FromClause::Table(tref)
@@ -672,10 +694,7 @@ fn substitute_cte_ref(
     }
 }
 
-fn apply_cte_column_rename(
-    mut s: SelectStmt,
-    names: &[String],
-) -> Result<SelectStmt, DbError> {
+fn apply_cte_column_rename(mut s: SelectStmt, names: &[String]) -> Result<SelectStmt, DbError> {
     // Count non-wildcard select items to compare width.
     let item_count: usize = s.columns.iter().map(|_| 1).sum();
     if item_count != names.len() {

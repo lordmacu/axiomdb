@@ -281,7 +281,7 @@ fn bound_from_clause(
             )?;
             Ok(vec![bound])
         }
-        FromClause::Subquery { query, alias } => {
+        FromClause::Subquery { query, alias, .. } => {
             // Analyze the inner SELECT recursively.
             // The virtual table's columns = the SELECT list items.
             let analyzed_query = analyze_select(
@@ -378,13 +378,10 @@ fn bound_table_ref(
     // INFORMATION_SCHEMA virtual tables (4.20c) — synthetic column binding,
     // no catalog lookup required.
     if crate::information_schema::is_information_schema(schema) {
-        let cols = crate::information_schema::make_is_catalog_columns(
-            &table_ref.name,
-            *col_offset,
-        )
-        .ok_or_else(|| DbError::TableNotFound {
-            name: format!("information_schema.{}", table_ref.name),
-        })?;
+        let cols = crate::information_schema::make_is_catalog_columns(&table_ref.name, *col_offset)
+            .ok_or_else(|| DbError::TableNotFound {
+                name: format!("information_schema.{}", table_ref.name),
+            })?;
         let n = cols.len();
         let bound = BoundTable {
             alias: table_ref.alias.clone(),
@@ -502,4 +499,3 @@ fn virtual_columns_from_select(select: &SelectStmt) -> Vec<ColumnDef> {
         })
         .collect()
 }
-

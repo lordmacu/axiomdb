@@ -100,7 +100,12 @@ fn execute_update_join_ctx(
     }
     if !resolved.constraints.is_empty() {
         for (_, _, new_values) in &to_update {
-            check_row_constraints_with_cols(&resolved.constraints, new_values, &resolved.def.table_name, &resolved.columns)?;
+            check_row_constraints_with_cols(
+                &resolved.constraints,
+                new_values,
+                &resolved.def.table_name,
+                &resolved.columns,
+            )?;
         }
     }
     if !resolved.foreign_keys.is_empty() {
@@ -133,7 +138,8 @@ fn execute_update_join_ctx(
         )?;
     }
 
-    let compiled_preds = crate::partial_index::compile_index_predicates(secondary_indexes, schema_cols)?;
+    let compiled_preds =
+        crate::partial_index::compile_index_predicates(secondary_indexes, schema_cols)?;
     let heap_updates: Vec<(RecordId, Vec<Value>)> = to_update
         .iter()
         .map(|(rid, _old, new)| (*rid, new.clone()))
@@ -296,7 +302,8 @@ fn collect_dml_join_candidates_ctx(
             feature: "multi-table UPDATE/DELETE JOIN on clustered target tables".into(),
         });
     }
-    let from_rows = TableEngine::scan_table(storage, &from_t.def, &from_t.columns, snap.clone(), None)?;
+    let from_rows =
+        TableEngine::scan_table(storage, &from_t.def, &from_t.columns, snap.clone(), None)?;
     col_offsets.push(running_offset);
     running_offset += from_t.columns.len();
     all_sources.push(join_source_schema_from_resolved(from_ref, &from_t));
@@ -321,7 +328,7 @@ fn collect_dml_join_candidates_ctx(
                 correlated_jt.push(None);
                 correlated_srf.push(None);
             }
-            FromClause::Subquery { query, alias } => {
+            FromClause::Subquery { query, alias, .. } => {
                 let inner_result = execute_select_ctx((**query).clone(), exec_ctx, conn_txn, ctx)?;
                 let (columns, rows) = match inner_result {
                     QueryResult::Rows { columns, rows } => (columns, rows),
@@ -334,10 +341,14 @@ fn collect_dml_join_candidates_ctx(
                 col_offsets.push(running_offset);
                 running_offset += columns.len();
                 all_sources.push(join_source_schema_from_derived(alias, columns));
-                scanned.push(rows.into_iter().map(|values| DmlJoinRow {
-                    values,
-                    target: None,
-                }).collect());
+                scanned.push(
+                    rows.into_iter()
+                        .map(|values| DmlJoinRow {
+                            values,
+                            target: None,
+                        })
+                        .collect(),
+                );
                 correlated_jt.push(None);
                 correlated_srf.push(None);
             }
@@ -357,14 +368,15 @@ fn collect_dml_join_candidates_ctx(
                         None => Vec::new(),
                         Some(sj) => {
                             let mut runner = crate::eval::NoSubquery;
-                            crate::json_table::materialize_json_table(
-                                &spec, &sj, &[], &mut runner,
-                            )?
+                            crate::json_table::materialize_json_table(&spec, &sj, &[], &mut runner)?
                         }
                     };
                     scanned.push(
                         rows.into_iter()
-                            .map(|values| DmlJoinRow { values, target: None })
+                            .map(|values| DmlJoinRow {
+                                values,
+                                target: None,
+                            })
                             .collect(),
                     );
                     correlated_jt.push(None);
@@ -387,7 +399,10 @@ fn collect_dml_join_candidates_ctx(
                     let rows = crate::jsonb_srf::materialize_jsonb_srf(srf.kind, &doc_val)?;
                     scanned.push(
                         rows.into_iter()
-                            .map(|values| DmlJoinRow { values, target: None })
+                            .map(|values| DmlJoinRow {
+                                values,
+                                target: None,
+                            })
                             .collect(),
                     );
                     correlated_jt.push(None);
@@ -403,7 +418,10 @@ fn collect_dml_join_candidates_ctx(
                 all_sources.push(join_source_schema_from_derived(&vc.alias, column_metas));
                 scanned.push(
                     rows.into_iter()
-                        .map(|values| DmlJoinRow { values, target: None })
+                        .map(|values| DmlJoinRow {
+                            values,
+                            target: None,
+                        })
                         .collect(),
                 );
                 correlated_jt.push(None);
@@ -512,21 +530,20 @@ fn dml_source_matches_target(
     default_target: bool,
 ) -> bool {
     match target_name {
-        Some(target) => table_ref
-            .alias
-            .as_deref()
-            .map(|alias| alias.eq_ignore_ascii_case(target))
-            .unwrap_or(false)
-            || table_ref.name.eq_ignore_ascii_case(target)
-            || resolved.def.table_name.eq_ignore_ascii_case(target),
+        Some(target) => {
+            table_ref
+                .alias
+                .as_deref()
+                .map(|alias| alias.eq_ignore_ascii_case(target))
+                .unwrap_or(false)
+                || table_ref.name.eq_ignore_ascii_case(target)
+                || resolved.def.table_name.eq_ignore_ascii_case(target)
+        }
         None => default_target,
     }
 }
 
-fn dml_source_rows(
-    rows: Vec<(RecordId, Vec<Value>)>,
-    is_target: bool,
-) -> Vec<DmlJoinRow> {
+fn dml_source_rows(rows: Vec<(RecordId, Vec<Value>)>, is_target: bool) -> Vec<DmlJoinRow> {
     rows.into_iter()
         .map(|(rid, values)| {
             let target = if is_target {

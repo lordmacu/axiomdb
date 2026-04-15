@@ -24,10 +24,15 @@ fn execute_select_with_joins(
         .unwrap_or_else(|| txn.snapshot());
 
     {
-        let mut resolver = make_resolver_with_database(storage, txn, conn_txn, DEFAULT_DATABASE_NAME)?;
+        let mut resolver =
+            make_resolver_with_database(storage, txn, conn_txn, DEFAULT_DATABASE_NAME)?;
         let from_t = resolver.resolve_table(from_ref.schema.as_deref(), &from_ref.name)?;
-        let from_rows =
-            crate::table::scan_table_any_layout(storage, &from_t.def, &from_t.columns, snap.clone())?;
+        let from_rows = crate::table::scan_table_any_layout(
+            storage,
+            &from_t.def,
+            &from_t.columns,
+            snap.clone(),
+        )?;
         col_offsets.push(running_offset);
         running_offset += from_t.columns.len();
         all_sources.push(join_source_schema_from_resolved(&from_ref, &from_t));
@@ -37,14 +42,18 @@ fn execute_select_with_joins(
             match &join.table {
                 FromClause::Table(tref) => {
                     let jt = resolver.resolve_table(tref.schema.as_deref(), &tref.name)?;
-                    let rows =
-                        crate::table::scan_table_any_layout(storage, &jt.def, &jt.columns, snap.clone())?;
+                    let rows = crate::table::scan_table_any_layout(
+                        storage,
+                        &jt.def,
+                        &jt.columns,
+                        snap.clone(),
+                    )?;
                     col_offsets.push(running_offset);
                     running_offset += jt.columns.len();
                     all_sources.push(join_source_schema_from_resolved(tref, &jt));
                     scanned.push(rows.into_iter().map(|(_, r)| r).collect());
                 }
-                FromClause::Subquery { query, alias } => {
+                FromClause::Subquery { query, alias, .. } => {
                     let inner_result = execute_select((**query).clone(), storage, txn, conn_txn)?;
                     let (columns, rows) = match inner_result {
                         QueryResult::Rows { columns, rows } => (columns, rows),
@@ -82,8 +91,7 @@ fn execute_select_with_joins(
                 }
                 FromClause::RecursiveCte(_) => {
                     return Err(DbError::NotImplemented {
-                        feature: "recursive CTE JOIN via the non-ctx executor path"
-                            .into(),
+                        feature: "recursive CTE JOIN via the non-ctx executor path".into(),
                     });
                 }
             }
@@ -278,12 +286,7 @@ fn gin_scan_rows(
 
         for term in query_terms {
             let (lo, hi) = crate::index_maintenance::gin_term_bounds(term);
-            let pairs = BTree::range_in(
-                storage,
-                index_def.root_page_id,
-                Some(&lo),
-                Some(&hi),
-            )?;
+            let pairs = BTree::range_in(storage, index_def.root_page_id, Some(&lo), Some(&hi))?;
             let term_keys: HashSet<Vec<u8>> = pairs
                 .into_iter()
                 .filter_map(|(_rid, key)| {
@@ -311,7 +314,13 @@ fn gin_scan_rows(
                 continue;
             };
             let values = axiomdb_types::codec::decode_row(&row.row_data, &col_types)?;
-            result.push((RecordId { page_id: 0, slot_id: 0 }, values));
+            result.push((
+                RecordId {
+                    page_id: 0,
+                    slot_id: 0,
+                },
+                values,
+            ));
         }
         return Ok(result);
     }
@@ -320,12 +329,7 @@ fn gin_scan_rows(
 
     for term in query_terms {
         let (lo, hi) = crate::index_maintenance::gin_term_bounds(term);
-        let pairs = BTree::range_in(
-            storage,
-            index_def.root_page_id,
-            Some(&lo),
-            Some(&hi),
-        )?;
+        let pairs = BTree::range_in(storage, index_def.root_page_id, Some(&lo), Some(&hi))?;
         let term_rids: HashSet<RecordId> = pairs.into_iter().map(|(rid, _)| rid).collect();
 
         candidate_rids = Some(match candidate_rids.take() {
