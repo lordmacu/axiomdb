@@ -919,7 +919,11 @@ fn parse_index_column(p: &mut Parser) -> Result<IndexColumn, DbError> {
     } else {
         SortOrder::Asc
     };
-    Ok(IndexColumn { name, order })
+    Ok(IndexColumn {
+        name,
+        order,
+        expr: None,
+    })
 }
 
 // ── DROP TABLE ────────────────────────────────────────────────────────────────
