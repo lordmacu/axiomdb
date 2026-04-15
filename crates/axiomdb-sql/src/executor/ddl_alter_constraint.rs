@@ -40,6 +40,7 @@ fn alter_add_constraint(
                     .map(|c| crate::ast::IndexColumn {
                         name: c,
                         order: crate::ast::SortOrder::Asc,
+                        expr: None,
                     })
                     .collect(),
                 unique: true,
@@ -245,6 +246,7 @@ fn alter_add_constraint(
                     .map(|c| crate::ast::IndexColumn {
                         name: c,
                         order: crate::ast::SortOrder::Asc,
+                        expr: None,
                     })
                     .collect(),
                 unique: false,
