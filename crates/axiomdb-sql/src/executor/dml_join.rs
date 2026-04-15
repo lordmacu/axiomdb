@@ -293,6 +293,8 @@ fn collect_dml_join_candidates_ctx(
     let mut correlated_jt: Vec<Option<crate::json_table::JsonTableSpec>> = vec![None];
     // Phase 11.25a: same for JSONB SRFs.
     let mut correlated_srf: Vec<Option<crate::ast::JsonbSrfKind>> = vec![None];
+    // Phase 21.9: parallel tracker for LATERAL-correlated subqueries.
+    let mut correlated_sub: Vec<Option<Box<crate::ast::SelectStmt>>> = vec![None];
     let mut running_offset = 0usize;
 
     let from_t = resolve_table_cached(storage, txn, ctx, conn_txn, from_ref)?;
@@ -327,30 +329,60 @@ fn collect_dml_join_candidates_ctx(
                 scanned.push(dml_source_rows(rows, is_target));
                 correlated_jt.push(None);
                 correlated_srf.push(None);
+                correlated_sub.push(None);
             }
-            FromClause::Subquery { query, alias, .. } => {
-                let inner_result = execute_select_ctx((**query).clone(), exec_ctx, conn_txn, ctx)?;
-                let (columns, rows) = match inner_result {
-                    QueryResult::Rows { columns, rows } => (columns, rows),
-                    _ => {
-                        return Err(DbError::Internal {
-                            message: "join-side subquery did not return rows".into(),
-                        });
-                    }
-                };
+            FromClause::Subquery {
+                query,
+                alias,
+                lateral,
+            } => {
                 col_offsets.push(running_offset);
-                running_offset += columns.len();
-                all_sources.push(join_source_schema_from_derived(alias, columns));
-                scanned.push(
-                    rows.into_iter()
-                        .map(|values| DmlJoinRow {
-                            values,
-                            target: None,
-                        })
-                        .collect(),
-                );
-                correlated_jt.push(None);
-                correlated_srf.push(None);
+                if *lateral {
+                    // Phase 21.9 — LATERAL subquery: defer materialization to per-outer-row
+                    // combine loop. The query carries OuterColumn references that need
+                    // values from the left side of the JOIN.
+                    let inner_result =
+                        execute_select_ctx((**query).clone(), exec_ctx, conn_txn, ctx)?;
+                    let columns = match inner_result {
+                        QueryResult::Rows { columns, .. } => columns,
+                        _ => {
+                            return Err(DbError::Internal {
+                                message: "join-side subquery did not return rows".into(),
+                            });
+                        }
+                    };
+                    running_offset += columns.len();
+                    all_sources.push(join_source_schema_from_derived(alias, columns));
+                    scanned.push(Vec::new());
+                    correlated_jt.push(None);
+                    correlated_srf.push(None);
+                    correlated_sub.push(Some(query.clone()));
+                } else {
+                    // Non-correlated subquery: materialize once with empty scope.
+                    let inner_result =
+                        execute_select_ctx((**query).clone(), exec_ctx, conn_txn, ctx)?;
+                    let (columns, rows) = match inner_result {
+                        QueryResult::Rows { columns, rows } => (columns, rows),
+                        _ => {
+                            return Err(DbError::Internal {
+                                message: "join-side subquery did not return rows".into(),
+                            });
+                        }
+                    };
+                    running_offset += columns.len();
+                    all_sources.push(join_source_schema_from_derived(alias, columns));
+                    scanned.push(
+                        rows.into_iter()
+                            .map(|values| DmlJoinRow {
+                                values,
+                                target: None,
+                            })
+                            .collect(),
+                    );
+                    correlated_jt.push(None);
+                    correlated_srf.push(None);
+                    correlated_sub.push(None);
+                }
             }
             // Phase 11.20d4 — JSON_TABLE as DML right-side source.
             FromClause::JsonTable(jt) => {
@@ -362,6 +394,8 @@ fn collect_dml_join_candidates_ctx(
                 if crate::json_table::jsontable_is_correlated(jt) {
                     scanned.push(Vec::new());
                     correlated_jt.push(Some(spec));
+                    correlated_srf.push(None);
+                    correlated_sub.push(None);
                 } else {
                     let doc_val = crate::eval::eval(&jt.doc, &[])?;
                     let rows = match crate::json_table::doc_to_serde(&doc_val)? {
@@ -381,6 +415,7 @@ fn collect_dml_join_candidates_ctx(
                     );
                     correlated_jt.push(None);
                     correlated_srf.push(None);
+                    correlated_sub.push(None);
                 }
             }
             // Phase 11.25a — JSONB SRF as DML JOIN right-side source.
@@ -394,6 +429,7 @@ fn collect_dml_join_candidates_ctx(
                     scanned.push(Vec::new());
                     correlated_jt.push(None);
                     correlated_srf.push(Some(srf.kind));
+                    correlated_sub.push(None);
                 } else {
                     let doc_val = crate::eval::eval(&srf.doc, &[])?;
                     let rows = crate::jsonb_srf::materialize_jsonb_srf(srf.kind, &doc_val)?;
@@ -407,6 +443,7 @@ fn collect_dml_join_candidates_ctx(
                     );
                     correlated_jt.push(None);
                     correlated_srf.push(None);
+                    correlated_sub.push(None);
                 }
             }
             // Phase 21.22 — inline VALUES as DML JOIN right-side source.
@@ -426,6 +463,7 @@ fn collect_dml_join_candidates_ctx(
                 );
                 correlated_jt.push(None);
                 correlated_srf.push(None);
+                correlated_sub.push(None);
             }
             // Phase 21.3 — recursive CTE as DML join source deferred.
             FromClause::RecursiveCte(_) => {
@@ -480,6 +518,21 @@ fn collect_dml_join_candidates_ctx(
                 &join.condition,
                 &left_schema,
                 right_col_offset,
+            )?
+        } else if let Some(subquery) = correlated_sub[right_idx].as_ref() {
+            // Phase 21.9 — LATERAL-correlated subquery on the right side.
+            apply_correlated_subquery_dml_join(
+                combined_rows,
+                subquery.as_ref(),
+                &all_sources[right_idx].columns,
+                right_col_count,
+                join.join_type,
+                &join.condition,
+                &left_schema,
+                right_col_offset,
+                exec_ctx,
+                conn_txn,
+                ctx,
             )?
         } else {
             apply_dml_join(
@@ -858,5 +911,75 @@ fn apply_correlated_srf_dml_join(
             out.push(concat_dml_join_rows(outer, &null_right));
         }
     }
+    Ok(out)
+}
+
+/// Phase 21.9 — DML variant of LATERAL-correlated subquery join. A
+/// LATERAL subquery on the right side of an UPDATE/DELETE JOIN is
+/// re-materialized per outer row. `DmlJoinRow` propagates the target
+/// RID from the outer; subquery rows contribute values only (target=None).
+#[allow(clippy::too_many_arguments)]
+fn apply_correlated_subquery_dml_join(
+    left_rows: Vec<DmlJoinRow>,
+    subquery: &crate::ast::SelectStmt,
+    right_columns: &[ColumnMeta],
+    right_col_count: usize,
+    join_type: JoinType,
+    condition: &JoinCondition,
+    left_schema: &[(String, usize)],
+    right_col_offset: usize,
+    exec_ctx: &ExecutionContext,
+    conn_txn: Option<&axiomdb_wal::ConnectionTxn>,
+    ctx: &mut SessionContext,
+) -> Result<Vec<DmlJoinRow>, DbError> {
+    if matches!(join_type, JoinType::Right | JoinType::Full) {
+        return Err(DbError::NotImplemented {
+            feature: "RIGHT/FULL JOIN on LATERAL-correlated subquery in UPDATE/DELETE \
+                      — PG-compatible rejection"
+                .into(),
+        });
+    }
+    let null_right = DmlJoinRow {
+        values: vec![Value::Null; right_col_count],
+        target: None,
+    };
+    let mut out: Vec<DmlJoinRow> = Vec::with_capacity(left_rows.len());
+
+    for outer in &left_rows {
+        // Execute the LATERAL subquery with outer values in scope.
+        let inner_result = execute_select_ctx(subquery.clone(), exec_ctx, conn_txn, ctx)?;
+        let rows = match inner_result {
+            QueryResult::Rows { rows, .. } => rows,
+            _ => {
+                return Err(DbError::Internal {
+                    message: "join-side subquery did not return rows".into(),
+                });
+            }
+        };
+
+        let mut matched = false;
+        for values in &rows {
+            let right = DmlJoinRow {
+                values: values.clone(),
+                target: None,
+            };
+            let combined = concat_dml_join_rows(outer, &right);
+            if eval_join_cond(
+                condition,
+                &combined.values,
+                left_schema,
+                right_col_offset,
+                right_columns,
+            )? {
+                out.push(combined);
+                matched = true;
+            }
+        }
+
+        if !matched && matches!(join_type, JoinType::Left) {
+            out.push(concat_dml_join_rows(outer, &null_right));
+        }
+    }
+
     Ok(out)
 }

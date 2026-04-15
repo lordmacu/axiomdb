@@ -369,7 +369,7 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
     // or a subquery. PG-compatible syntactic sugar; no-op today because
     // correlated `doc` / PASSING on JSON_TABLE is enabled unconditionally
     // and correlated subqueries remain out of scope.
-    p.eat(&Token::Lateral);
+    let lateral_consumed = p.eat(&Token::Lateral);
 
     // Subquery: `(SELECT ...) AS alias`  or  `(VALUES (...)) AS alias(cols)`.
     if p.eat(&Token::LParen) {
@@ -427,7 +427,7 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
         return Ok(FromClause::Subquery {
             query: Box::new(sub),
             alias,
-            lateral: false,
+            lateral: lateral_consumed,
         });
     }
 
