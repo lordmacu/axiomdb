@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@opencode-ai/plugin": "1.4.3"
+    "@opencode-ai/plugin": "1.4.3",
+    "@kilocode/plugin": "7.2.10"
   },
   "devDependencies": {
     "unique-names-generator": "4.7.1",

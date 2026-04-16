@@ -424,6 +424,83 @@ pub struct SetOpTail {
     pub select: SelectStmt,
 }
 
+/// GROUP BY clause representation.
+///
+/// Replaces the former `group_by: Vec<Expr>` + `with_rollup: bool` fields on `SelectStmt`.
+/// Introduced in Phase 21.21 (GROUPING SETS / ROLLUP / CUBE).
+#[derive(Debug, Clone, PartialEq)]
+pub enum GroupByClause {
+    /// No GROUP BY.
+    None,
+    /// Plain `GROUP BY expr, ...`
+    Simple(Vec<Expr>),
+    /// MySQL `GROUP BY expr, ... WITH ROLLUP` (GAP-C.5).
+    /// Produces one subtotal row per grouping level with NULL in the rolled-up keys,
+    /// plus a grand-total row with NULL in every group-by column.
+    WithRollup(Vec<Expr>),
+    /// SQL:1999 standard `GROUP BY ROLLUP(...)` / `CUBE(...)` / `GROUPING SETS(...)`.
+    ///
+    /// `universe`: deduplicated list of all expressions referenced across all sets,
+    ///             in first-appearance order.
+    /// `sets`:     each inner `Vec<usize>` is one grouping set, given as indices into
+    ///             `universe`. An empty inner vec represents the grand-total set `()`.
+    Sets {
+        universe: Vec<Expr>,
+        sets: Vec<Vec<usize>>,
+    },
+}
+
+impl GroupByClause {
+    /// Returns the flat list of group-by expressions.
+    /// - `None`  → empty slice
+    /// - `Simple` / `WithRollup` → the expression list
+    /// - `Sets`  → the universe list
+    pub fn exprs(&self) -> &[Expr] {
+        match self {
+            Self::None => &[],
+            Self::Simple(v) | Self::WithRollup(v) => v,
+            Self::Sets { universe, .. } => universe,
+        }
+    }
+
+    /// Mutable access to the expression list for in-place resolution.
+    /// Panics on `None` — callers must guard with `is_empty()` first.
+    pub fn exprs_mut(&mut self) -> &mut Vec<Expr> {
+        match self {
+            Self::None => panic!("exprs_mut called on GroupByClause::None"),
+            Self::Simple(v) | Self::WithRollup(v) => v,
+            Self::Sets { universe, .. } => universe,
+        }
+    }
+
+    /// True when there are no group-by expressions (includes `None` and empty vecs).
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::None => true,
+            Self::Simple(v) | Self::WithRollup(v) => v.is_empty(),
+            Self::Sets { universe, .. } => universe.is_empty(),
+        }
+    }
+
+    /// True for the `WithRollup` variant.
+    pub fn is_with_rollup(&self) -> bool {
+        matches!(self, Self::WithRollup(_))
+    }
+
+    /// True for the `Sets` variant (SQL standard ROLLUP/CUBE/GROUPING SETS).
+    pub fn is_sets(&self) -> bool {
+        matches!(self, Self::Sets { .. })
+    }
+
+    /// Returns the sets list for the `Sets` variant; empty slice otherwise.
+    pub fn grouping_sets(&self) -> &[Vec<usize>] {
+        match self {
+            Self::Sets { sets, .. } => sets,
+            _ => &[],
+        }
+    }
+}
+
 /// `from` is `None` for `SELECT` without `FROM` (e.g. `SELECT 1`, `SELECT NOW()`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
@@ -439,11 +516,8 @@ pub struct SelectStmt {
     pub from: Option<FromClause>,
     pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
-    pub group_by: Vec<Expr>,
-    /// `true` when `GROUP BY ... WITH ROLLUP` was specified (GAP-C.5).
-    /// Produces one subtotal row per grouping level with NULL in the rolled-up keys,
-    /// plus a grand-total row with NULL in every group-by column.
-    pub with_rollup: bool,
+    /// GROUP BY clause — see [`GroupByClause`] for all variants.
+    pub group_by: GroupByClause,
     pub having: Option<Expr>,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<Expr>,
@@ -936,8 +1010,7 @@ mod tests {
             from: Some(FromClause::Table(TableRef::simple("users"))),
             joins: vec![],
             where_clause: Some(Expr::binop(BinaryOp::Gt, col(0, "age"), Expr::int(18))),
-            group_by: vec![],
-            with_rollup: false,
+            group_by: GroupByClause::None,
             having: None,
             order_by: vec![OrderByItem {
                 expr: col(1, "name"),
@@ -966,8 +1039,7 @@ mod tests {
             from: None,
             joins: vec![],
             where_clause: None,
-            group_by: vec![],
-            with_rollup: false,
+            group_by: GroupByClause::None,
             having: None,
             order_by: vec![],
             limit: None,
@@ -1163,8 +1235,7 @@ mod tests {
             from: Some(FromClause::Table(TableRef::simple("users"))),
             joins: vec![],
             where_clause: None,
-            group_by: vec![],
-            with_rollup: false,
+            group_by: GroupByClause::None,
             having: None,
             order_by: vec![],
             limit: None,

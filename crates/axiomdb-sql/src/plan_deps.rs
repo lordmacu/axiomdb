@@ -347,7 +347,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
         for ob in &s.order_by {
             self.visit_expr(&ob.expr)?;
         }
-        for gb in &s.group_by {
+        for gb in s.group_by.exprs() {
             self.visit_expr(gb)?;
         }
         if let Some(lim) = &s.limit {

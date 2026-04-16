@@ -229,7 +229,7 @@ fn detect_materializable_pattern(stmt: &SelectStmt) -> Option<MaterializableInfo
             false
         }
     }) || stmt.having.as_ref().is_some_and(expr_has_outer_ref)
-        || stmt.group_by.iter().any(expr_has_outer_ref)
+        || stmt.group_by.exprs().iter().any(expr_has_outer_ref)
         || stmt.order_by.iter().any(|o| expr_has_outer_ref(&o.expr));
 
     if has_outer_elsewhere {
@@ -277,12 +277,15 @@ fn materialize_correlated_subquery(
     );
 
     // Add GROUP BY on the join column (if not already present).
-    let already_grouped = rewritten.group_by.iter().any(|e| match e {
+    let already_grouped = rewritten.group_by.exprs().iter().any(|e| match e {
         Expr::Column { col_idx, .. } => *col_idx == info.inner_col_idx,
         _ => false,
     });
     if !already_grouped {
-        rewritten.group_by.insert(0, join_col_expr);
+        use crate::ast::GroupByClause;
+        let mut exprs = rewritten.group_by.exprs().to_vec();
+        exprs.insert(0, join_col_expr);
+        rewritten.group_by = GroupByClause::Simple(exprs);
     }
 
     // Remove the equijoin predicate from WHERE (replace OuterColumn refs with always-true).
@@ -453,7 +456,7 @@ fn extract_outer_col_indices(stmt: &SelectStmt) -> Vec<usize> {
         if let Some(ref h) = stmt.having {
             walk_expr(h, indices);
         }
-        for e in &stmt.group_by {
+        for e in stmt.group_by.exprs() {
             walk_expr(e, indices);
         }
         for ob in &stmt.order_by {
@@ -556,7 +559,7 @@ fn stmt_has_outer_ref(stmt: &SelectStmt) -> bool {
         }
     }
     // GROUP BY expressions.
-    if stmt.group_by.iter().any(expr_has_outer_ref) {
+    if stmt.group_by.exprs().iter().any(expr_has_outer_ref) {
         return true;
     }
     // ORDER BY expressions.
@@ -611,11 +614,18 @@ fn substitute_outer_at(
         })
         .collect();
     stmt.having = stmt.having.map(|e| subst_expr(e, outer_row, binding_depth));
-    stmt.group_by = stmt
-        .group_by
-        .into_iter()
-        .map(|e| subst_expr(e, outer_row, binding_depth))
-        .collect();
+    {
+        use crate::ast::GroupByClause;
+        let resolved: Vec<_> = stmt.group_by.exprs().iter()
+            .map(|e| subst_expr(e.clone(), outer_row, binding_depth))
+            .collect();
+        stmt.group_by = match stmt.group_by {
+            GroupByClause::Simple(_) => GroupByClause::Simple(resolved),
+            GroupByClause::WithRollup(_) => GroupByClause::WithRollup(resolved),
+            GroupByClause::Sets { sets, .. } => GroupByClause::Sets { universe: resolved, sets },
+            GroupByClause::None => GroupByClause::None,
+        };
+    }
     stmt.order_by = stmt
         .order_by
         .into_iter()
