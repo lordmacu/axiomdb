@@ -151,7 +151,6 @@ fn test_mysql_with_rollup_still_works_regression() {
 // They are marked #[ignore] until then; Step 3 will remove the attribute.
 
 #[test]
-#[ignore = "requires Step 3 executor (execute_select_grouped_sets)"]
 fn test_rollup_two_columns() {
     let (mut s, mut t, mut b, mut c) = setup();
     let result = run(
@@ -171,7 +170,6 @@ fn test_rollup_two_columns() {
 }
 
 #[test]
-#[ignore = "requires Step 3 executor"]
 fn test_rollup_single_column() {
     let (mut s, mut t, mut b, mut c) = setup();
     let result = run(
@@ -187,7 +185,6 @@ fn test_rollup_single_column() {
 }
 
 #[test]
-#[ignore = "requires Step 3 executor"]
 fn test_cube_two_columns() {
     let (mut s, mut t, mut b, mut c) = setup();
     let result = run(
@@ -205,7 +202,6 @@ fn test_cube_two_columns() {
 }
 
 #[test]
-#[ignore = "requires Step 3 executor"]
 fn test_grouping_sets_explicit() {
     let (mut s, mut t, mut b, mut c) = setup();
     let result = run(
@@ -219,7 +215,6 @@ fn test_grouping_sets_explicit() {
 }
 
 #[test]
-#[ignore = "requires Step 3 executor"]
 fn test_grand_total_row_nulls() {
     let (mut s, mut t, mut b, mut c) = setup();
     let result = run(
@@ -234,7 +229,6 @@ fn test_grand_total_row_nulls() {
 }
 
 #[test]
-#[ignore = "requires Step 3 executor"]
 fn test_having_per_pass() {
     let (mut s, mut t, mut b, mut c) = setup();
     // HAVING SUM(amount) > 40 should filter within each pass
@@ -249,7 +243,6 @@ fn test_having_per_pass() {
 }
 
 #[test]
-#[ignore = "requires Step 3 executor"]
 fn test_mixed_plain_and_rollup_cross_product() {
     // GROUP BY region, ROLLUP(yr) → cross-product: {region, yr}, {region}
     // Same as GROUP BY ROLLUP(yr) per region group
@@ -264,7 +257,6 @@ fn test_mixed_plain_and_rollup_cross_product() {
 }
 
 #[test]
-#[ignore = "requires Step 3 executor"]
 fn test_order_by_post_union() {
     let (mut s, mut t, mut b, mut c) = setup();
     let result = run(
@@ -283,7 +275,6 @@ fn test_order_by_post_union() {
 }
 
 #[test]
-#[ignore = "requires Step 3 executor"]
 fn test_limit_post_union() {
     let (mut s, mut t, mut b, mut c) = setup();
     let result = run(
@@ -295,7 +286,6 @@ fn test_limit_post_union() {
 }
 
 #[test]
-#[ignore = "requires Step 3 executor"]
 fn test_grouping_sets_duplicate_sets() {
     // GROUPING SETS((region),(region)) → duplicate sets → 2x region rows
     let (mut s, mut t, mut b, mut c) = setup();
@@ -309,7 +299,6 @@ fn test_grouping_sets_duplicate_sets() {
 }
 
 #[test]
-#[ignore = "requires Step 3 executor"]
 fn test_real_null_not_confused() {
     // If original data has NULL in group-by column, it groups with other NULLs
     // but GROUPING() should return 0 (it's a real NULL, not a rolled-up NULL).

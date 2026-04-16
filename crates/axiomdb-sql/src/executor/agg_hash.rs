@@ -275,18 +275,154 @@ fn execute_select_grouped_rollup(
     })
 }
 
-// ── GROUPING SETS executor (Step 3 — placeholder until Step 3 is implemented) ──
+// ── GROUPING SETS executor (Phase 21.21) ─────────────────────────────────────
 
 /// Executes `GROUP BY ROLLUP(...) / CUBE(...) / GROUPING SETS(...)`.
 ///
-/// Full implementation in Step 3. This stub returns `NotImplemented` so Step 1/2
-/// compile and all existing tests stay green.
+/// Algorithm:
+/// 1. For each grouping set `s` in `sets`:
+///    a. Build a sub-`SelectStmt` with `group_by = Simple(exprs_in_s)`.
+///    b. Run `execute_select_grouped_hash` (HAVING applied per-pass, SQL standard).
+///    c. Null-out SELECT positions for universe exprs **not** in `s`.
+///    d. Append a hidden `__grouping_mask__: Value::BigInt(mask)` to each row.
+///       Bit `i` is set when universe[i] is absent from this set.
+/// 2. Union all per-set rows.
+/// 3. Apply DISTINCT / ORDER BY (ORDER BY may reference GROUPING() which reads the mask).
+/// 4. Strip the hidden mask column.
+/// 5. Apply LIMIT / OFFSET.
+///
+/// The `__grouping_mask__` hidden column is always the **last** value in each row
+/// during steps 1–3. It is stripped before returning `QueryResult::Rows`.
 fn execute_select_grouped_sets(
-    _stmt: SelectStmt,
-    _combined_rows: Vec<Row>,
+    stmt: SelectStmt,
+    combined_rows: Vec<Row>,
 ) -> Result<QueryResult, DbError> {
-    Err(DbError::NotImplemented {
-        feature: "GROUP BY GROUPING SETS / ROLLUP / CUBE — executor coming in Step 3".into(),
+    use crate::ast::GroupByClause;
+
+    let (universe, sets) = match &stmt.group_by {
+        GroupByClause::Sets { universe, sets } => (universe.clone(), sets.clone()),
+        _ => unreachable!("execute_select_grouped_sets called without GroupByClause::Sets"),
+    };
+
+    let n_universe = universe.len();
+
+    // Precompute: for each universe[i], which SELECT output positions map to it?
+    // A universe expression may appear multiple times in the SELECT list.
+    let select_slots_for_universe: Vec<Vec<usize>> = universe
+        .iter()
+        .map(|ue| {
+            stmt.columns
+                .iter()
+                .enumerate()
+                .filter_map(|(pos, item)| match item {
+                    SelectItem::Expr { expr, .. } if expr == ue => Some(pos),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+
+    // Get column meta from a probe run (use the first non-empty set, or grand total).
+    let probe_set = sets
+        .iter()
+        .find(|s| !s.is_empty())
+        .or_else(|| sets.first())
+        .cloned()
+        .unwrap_or_default();
+    let probe_exprs: Vec<Expr> = probe_set.iter().map(|&i| universe[i].clone()).collect();
+    let mut probe_stmt = stmt.clone();
+    probe_stmt.group_by = if probe_exprs.is_empty() {
+        GroupByClause::None
+    } else {
+        GroupByClause::Simple(probe_exprs)
+    };
+    probe_stmt.order_by.clear();
+    probe_stmt.limit = None;
+    probe_stmt.offset = None;
+    probe_stmt.distinct = false;
+    probe_stmt.calc_found_rows = false;
+    let out_cols_template = match execute_select_grouped_hash(probe_stmt, combined_rows.clone())? {
+        QueryResult::Rows { columns, .. } => columns,
+        other => return Ok(other),
+    };
+
+    // Run one pass per grouping set.
+    let mut all_rows: Vec<Row> = Vec::new();
+
+    for set_indices in &sets {
+        let set_exprs: Vec<Expr> = set_indices.iter().map(|&i| universe[i].clone()).collect();
+        let mut pass_stmt = stmt.clone();
+        pass_stmt.group_by = if set_exprs.is_empty() {
+            GroupByClause::None
+        } else {
+            GroupByClause::Simple(set_exprs)
+        };
+        pass_stmt.order_by.clear();
+        pass_stmt.limit = None;
+        pass_stmt.offset = None;
+        pass_stmt.distinct = false;
+        pass_stmt.calc_found_rows = false;
+        // HAVING intentionally kept — applied per-pass (SQL standard semantics).
+
+        let pass_rows = match execute_select_grouped_hash(pass_stmt, combined_rows.clone())? {
+            QueryResult::Rows { rows, .. } => rows,
+            QueryResult::Affected { .. } => vec![],
+            other => return Ok(other),
+        };
+
+        // Compute grouping mask: bit i = 1 when universe[i] is absent from this set.
+        let mut mask: u64 = 0;
+        for i in 0..n_universe {
+            if !set_indices.contains(&i) {
+                mask |= 1u64 << i;
+            }
+        }
+
+        // Null-out SELECT positions for absent universe exprs; inject hidden mask.
+        let mut pass_rows = pass_rows;
+        for row in pass_rows.iter_mut() {
+            for (ui, slots) in select_slots_for_universe.iter().enumerate() {
+                if !set_indices.contains(&ui) {
+                    for &slot in slots {
+                        if slot < row.len() {
+                            row[slot] = Value::Null;
+                        }
+                    }
+                }
+            }
+            row.push(Value::BigInt(mask as i64));
+        }
+        all_rows.extend(pass_rows);
+    }
+
+    // Post-union operations: DISTINCT, ORDER BY (may reference GROUPING()), LIMIT/OFFSET.
+    if stmt.distinct {
+        // Strip mask before dedup — it's an internal marker.
+        for row in all_rows.iter_mut() {
+            row.pop();
+        }
+        all_rows = apply_distinct_with_session(all_rows);
+        // Mask gone — GROUPING() in ORDER BY is not supported after DISTINCT.
+        let remapped_ob = remap_order_by_for_grouped(&stmt.order_by, &stmt.columns);
+        all_rows = apply_order_by(all_rows, &remapped_ob)?;
+    } else {
+        // ORDER BY before strip so GROUPING() exprs can read the hidden mask.
+        let remapped_ob = remap_order_by_for_grouped(&stmt.order_by, &stmt.columns);
+        all_rows = apply_order_by(all_rows, &remapped_ob)?;
+        // Strip mask after ORDER BY.
+        for row in all_rows.iter_mut() {
+            row.pop();
+        }
+    }
+
+    if stmt.calc_found_rows {
+        set_found_rows(all_rows.len() as u64);
+    }
+    all_rows = apply_limit_offset(all_rows, &stmt.limit, &stmt.offset)?;
+
+    Ok(QueryResult::Rows {
+        columns: out_cols_template,
+        rows: all_rows,
     })
 }
 
