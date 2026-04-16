@@ -153,17 +153,7 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
 
     let group_by = if p.eat(&Token::Group) {
         p.expect(&Token::By)?;
-        let exprs = parse_expr_list(p)?;
-        // Optional `WITH ROLLUP` modifier (MySQL-style).
-        if matches!(p.peek(), Token::With)
-            && matches!(p.peek_at(1), Token::Ident(s) if s.eq_ignore_ascii_case("rollup"))
-        {
-            p.advance(); // WITH
-            p.advance(); // ROLLUP
-            GroupByClause::WithRollup(exprs)
-        } else {
-            GroupByClause::Simple(exprs)
-        }
+        parse_group_by_items(p)?
     } else {
         GroupByClause::None
     };
@@ -780,6 +770,296 @@ fn parse_expr_list(p: &mut Parser) -> Result<Vec<Expr>, DbError> {
 /// Exposed as `pub(crate)` for use by the top-level parser dispatch.
 pub(crate) fn parse_call_arg(p: &mut Parser) -> Result<Expr, DbError> {
     parse_expr(p)
+}
+
+// ── GROUP BY clause parser (Phase 21.21) ─────────────────────────────────────
+
+/// Find or insert `expr` in the universe list (deduplication).
+/// Returns the index of the expression in the universe.
+fn grouping_intern(universe: &mut Vec<Expr>, expr: Expr) -> usize {
+    if let Some(pos) = universe.iter().position(|e| e == &expr) {
+        pos
+    } else {
+        let idx = universe.len();
+        universe.push(expr);
+        idx
+    }
+}
+
+/// Check whether the next token is an identifier matching `keyword` (case-insensitive).
+/// Does not advance the parser.
+fn peek_ident_ci_at(p: &Parser, offset: usize, keyword: &str) -> bool {
+    match p.peek_at(offset) {
+        Token::Ident(s) => s.eq_ignore_ascii_case(keyword),
+        _ => false,
+    }
+}
+
+/// Parse the argument list inside `ROLLUP(...)` or `CUBE(...)`.
+///
+/// Each argument can be:
+///  - A simple expression: `a`  → contributes one universe slot
+///  - A tuple `(a, b)` → contributes multiple slots treated as a composite element
+///
+/// Returns indices into `universe` (one per composite element; tuples contribute
+/// one index per column inside the composite, all added to the result flat list).
+fn parse_grouping_arg_list(
+    p: &mut Parser,
+    universe: &mut Vec<Expr>,
+) -> Result<Vec<usize>, DbError> {
+    let mut items: Vec<usize> = Vec::new();
+    loop {
+        if p.peek() == &Token::LParen {
+            p.advance(); // consume '('
+            // Tuple of exprs — add each as a separate universe slot.
+            loop {
+                let e = parse_expr(p)?;
+                items.push(grouping_intern(universe, e));
+                if p.peek() == &Token::RParen { break; }
+                p.expect(&Token::Comma)?;
+            }
+            p.expect(&Token::RParen)?;
+        } else {
+            let e = parse_expr(p)?;
+            items.push(grouping_intern(universe, e));
+        }
+        if p.peek() != &Token::Comma { break; }
+        p.advance(); // consume ','
+        // Stop if we see the closing ')' of the outer ROLLUP/CUBE call.
+        if p.peek() == &Token::RParen { break; }
+    }
+    Ok(items)
+}
+
+/// Parse the content of `GROUPING SETS(...)`.
+///
+/// Grammar:
+///   grouping_sets_list ::= grouping_sets_item (',' grouping_sets_item)*
+///   grouping_sets_item ::= '(' expr_list_or_empty ')'
+///                        | ROLLUP '(' grouping_args ')'
+///                        | CUBE '(' grouping_args ')'
+///                        | expr
+///
+/// Nested ROLLUP/CUBE inside GROUPING SETS is flattened (PostgreSQL semantics).
+/// Nested GROUPING SETS is also flattened.
+fn parse_grouping_sets_content(
+    p: &mut Parser,
+    universe: &mut Vec<Expr>,
+) -> Result<Vec<Vec<usize>>, DbError> {
+    let mut sets: Vec<Vec<usize>> = Vec::new();
+    loop {
+        if peek_ident_ci_at(p, 0, "ROLLUP") && p.peek_at(1) == &Token::LParen {
+            eat_ident_ci(p, "ROLLUP");
+            p.expect(&Token::LParen)?;
+            let items = parse_grouping_arg_list(p, universe)?;
+            p.expect(&Token::RParen)?;
+            // ROLLUP(items) → N+1 sets (full prefix down to empty)
+            let n = items.len();
+            for k in (0..=n).rev() {
+                sets.push(items[..k].to_vec());
+            }
+        } else if peek_ident_ci_at(p, 0, "CUBE") && p.peek_at(1) == &Token::LParen {
+            eat_ident_ci(p, "CUBE");
+            p.expect(&Token::LParen)?;
+            let items = parse_grouping_arg_list(p, universe)?;
+            p.expect(&Token::RParen)?;
+            let n = items.len();
+            if n > 16 {
+                return Err(DbError::ParseError {
+                    message: format!(
+                        "CUBE with {} dimensions would produce {} sets (maximum is 65536)",
+                        n, 1usize << n
+                    ),
+                    position: Some(p.current_pos()),
+                });
+            }
+            let total = 1usize << n;
+            let mut cube_sets: Vec<Vec<usize>> = (0..total)
+                .map(|mask| (0..n).filter(|&i| (mask >> i) & 1 == 1).map(|i| items[i]).collect())
+                .collect();
+            cube_sets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+            sets.extend(cube_sets);
+        } else if peek_ident_ci_at(p, 0, "GROUPING") && peek_ident_ci_at(p, 1, "SETS")
+            && p.peek_at(2) == &Token::LParen
+        {
+            // Nested GROUPING SETS — flatten by appending its sets directly.
+            eat_ident_ci(p, "GROUPING");
+            eat_ident_ci(p, "SETS");
+            p.expect(&Token::LParen)?;
+            let inner = parse_grouping_sets_content(p, universe)?;
+            p.expect(&Token::RParen)?;
+            sets.extend(inner);
+        } else if p.peek() == &Token::LParen {
+            p.advance(); // '('
+            if p.peek() == &Token::RParen {
+                // Empty set () → grand total
+                p.advance(); // ')'
+                sets.push(vec![]);
+            } else {
+                // Explicit set of exprs: (a, b, ...)
+                let mut set_items = Vec::new();
+                loop {
+                    let e = parse_expr(p)?;
+                    set_items.push(grouping_intern(universe, e));
+                    if p.peek() == &Token::RParen { break; }
+                    p.expect(&Token::Comma)?;
+                }
+                p.expect(&Token::RParen)?;
+                sets.push(set_items);
+            }
+        } else {
+            // Single bare expression — treated as a singleton set
+            let e = parse_expr(p)?;
+            let idx = grouping_intern(universe, e);
+            sets.push(vec![idx]);
+        }
+
+        if p.peek() != &Token::Comma { break; }
+        p.advance(); // consume ','
+        // Stop if we've hit the closing ')' of the outer GROUPING SETS call
+        if p.peek() == &Token::RParen { break; }
+    }
+    Ok(sets)
+}
+
+/// Parse a full `GROUP BY` clause (after `GROUP BY` keywords have been consumed).
+///
+/// Handles:
+/// - Plain `GROUP BY a, b, c`          → `GroupByClause::Simple`
+/// - MySQL `GROUP BY a, b WITH ROLLUP`  → `GroupByClause::WithRollup`
+/// - Standard `GROUP BY ROLLUP(a, b)`   → `GroupByClause::Sets`
+/// - Standard `GROUP BY CUBE(a, b)`     → `GroupByClause::Sets`
+/// - Standard `GROUP BY GROUPING SETS(...)` → `GroupByClause::Sets`
+/// - Mixed `GROUP BY a, ROLLUP(b, c)`   → `GroupByClause::Sets` (cross-product)
+fn parse_group_by_items(p: &mut Parser) -> Result<GroupByClause, DbError> {
+    let mut universe: Vec<Expr> = Vec::new();
+    // Each entry is one GROUP BY item's contribution as a list of grouping sets.
+    // A plain expr `a` contributes `[[idx_a]]` (one set containing one index).
+    // ROLLUP(a,b) contributes `[[a,b],[a],[]]`.
+    let mut item_sets: Vec<Vec<Vec<usize>>> = Vec::new();
+    let mut has_special = false;
+
+    loop {
+        if peek_ident_ci_at(p, 0, "ROLLUP") && p.peek_at(1) == &Token::LParen {
+            has_special = true;
+            eat_ident_ci(p, "ROLLUP");
+            p.expect(&Token::LParen)?;
+            let items = parse_grouping_arg_list(p, &mut universe)?;
+            p.expect(&Token::RParen)?;
+            if items.is_empty() {
+                return Err(DbError::ParseError {
+                    message: "ROLLUP requires at least one expression".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+            let n = items.len();
+            let mut sets: Vec<Vec<usize>> = Vec::new();
+            for k in (0..=n).rev() {
+                sets.push(items[..k].to_vec());
+            }
+            item_sets.push(sets);
+        } else if peek_ident_ci_at(p, 0, "CUBE") && p.peek_at(1) == &Token::LParen {
+            has_special = true;
+            eat_ident_ci(p, "CUBE");
+            p.expect(&Token::LParen)?;
+            let items = parse_grouping_arg_list(p, &mut universe)?;
+            p.expect(&Token::RParen)?;
+            if items.is_empty() {
+                return Err(DbError::ParseError {
+                    message: "CUBE requires at least one expression".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+            let n = items.len();
+            if n > 16 {
+                return Err(DbError::ParseError {
+                    message: format!(
+                        "CUBE with {} dimensions would produce {} sets (maximum is 65536)",
+                        n, 1usize << n
+                    ),
+                    position: Some(p.current_pos()),
+                });
+            }
+            let total = 1usize << n;
+            let mut cube_sets: Vec<Vec<usize>> = (0..total)
+                .map(|mask| (0..n).filter(|&i| (mask >> i) & 1 == 1).map(|i| items[i]).collect())
+                .collect();
+            cube_sets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+            item_sets.push(cube_sets);
+        } else if peek_ident_ci_at(p, 0, "GROUPING")
+            && peek_ident_ci_at(p, 1, "SETS")
+            && p.peek_at(2) == &Token::LParen
+        {
+            has_special = true;
+            eat_ident_ci(p, "GROUPING");
+            eat_ident_ci(p, "SETS");
+            p.expect(&Token::LParen)?;
+            let sets = parse_grouping_sets_content(p, &mut universe)?;
+            p.expect(&Token::RParen)?;
+            if sets.is_empty() {
+                return Err(DbError::ParseError {
+                    message: "GROUPING SETS requires at least one grouping set".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+            item_sets.push(sets);
+        } else {
+            // Plain expression — one set containing one index.
+            let e = parse_expr(p)?;
+            let idx = grouping_intern(&mut universe, e);
+            item_sets.push(vec![vec![idx]]);
+        }
+
+        if p.peek() == &Token::Comma {
+            p.advance(); // consume ','
+        } else {
+            break;
+        }
+    }
+
+    if !has_special {
+        // Check for MySQL-style WITH ROLLUP.
+        if matches!(p.peek(), Token::With)
+            && peek_ident_ci_at(p, 1, "rollup")
+        {
+            p.advance(); // WITH
+            p.advance(); // ROLLUP
+            return Ok(GroupByClause::WithRollup(universe));
+        }
+        return Ok(GroupByClause::Simple(universe));
+    }
+
+    // Cross-product all item_sets into a flat list of grouping sets.
+    let mut result: Vec<Vec<usize>> = vec![vec![]];
+    for item in item_sets {
+        let mut new_result: Vec<Vec<usize>> = Vec::new();
+        for existing in &result {
+            for set in &item {
+                let mut combined: Vec<usize> = existing.clone();
+                for &idx in set {
+                    if !combined.contains(&idx) {
+                        combined.push(idx);
+                    }
+                }
+                combined.sort_unstable();
+                new_result.push(combined);
+            }
+        }
+        result = new_result;
+    }
+
+    let total_sets = result.len();
+    if total_sets > 65535 {
+        return Err(DbError::ParseError {
+            message: format!(
+                "Grouping set count {} exceeds maximum 65535",
+                total_sets
+            ),
+            position: Some(p.current_pos()),
+        });
+    }
+
+    Ok(GroupByClause::Sets { universe, sets: result })
 }
 
 /// Parse the expression after `DO`.
