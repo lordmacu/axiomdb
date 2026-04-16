@@ -912,35 +912,24 @@ pub(crate) fn parse_create_index(p: &mut Parser, unique: bool) -> Result<Stmt, D
 }
 
 fn parse_index_column(p: &mut Parser) -> Result<IndexColumn, DbError> {
-    let name = p.parse_identifier()?;
-
-    // Check if this is an expression like LOWER(col)
-    // Look ahead: if next token is LParen, it's a function/expression
-    let (name, expr) = if *p.peek() == Token::LParen {
-        // This is an expression - the column name is INSIDE the parentheses
-        let func_name = name.clone();
-        p.expect(&Token::LParen)?;
-
-        // Parse the argument (column reference)
-        let arg = parse_expr(p)?;
-        p.expect(&Token::RParen)?;
-
-        // For expression indexes, the name should be the column being indexed
-        // and the expression wraps it
-        let column_in_expr = match &arg {
-            Expr::Column { name: col_name, .. } => col_name.clone(),
-            _ => func_name.clone(), // fallback
-        };
-
-        // Wrap as a function call: LOWER(col)
-        let expr = Expr::Function {
-            name: func_name,
-            args: vec![arg],
-        };
-
-        (column_in_expr, Some(Box::new(expr)))
-    } else {
-        (name, None)
+    // Phase 21.8: An index column is either
+    //   • a simple column reference (the common case):       (col_name [ASC|DESC])
+    //   • an expression over one or more columns (Phase 21.8): (expr [ASC|DESC])
+    //
+    // We distinguish by parsing the full expression and then checking whether
+    // it is a bare `Expr::Column` — if so, the index targets that column
+    // directly with no expression. Otherwise we keep the expression and pick
+    // the first referenced column name (arbitrary but stable) as `name` so
+    // catalog code that indexes by column name still works.
+    let expr = parse_expr(p)?;
+    let (name, expr) = match expr {
+        Expr::Column { name, .. } => (name, None),
+        other => {
+            let col_name = first_column_name(&other)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "__expr__".to_string());
+            (col_name, Some(Box::new(other)))
+        }
     };
 
     let order = if p.eat(&Token::Asc) {
@@ -952,6 +941,48 @@ fn parse_index_column(p: &mut Parser) -> Result<IndexColumn, DbError> {
     };
 
     Ok(IndexColumn { name, order, expr })
+}
+
+/// Returns the name of the first `Expr::Column` found in the expression tree,
+/// using a left-to-right pre-order traversal. Used by expression indexes to
+/// pick a stable representative column name for catalog lookups.
+fn first_column_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Column { name, .. } => Some(name.as_str()),
+        Expr::UnaryOp { operand, .. } => first_column_name(operand),
+        Expr::BinaryOp { left, right, .. } => {
+            first_column_name(left).or_else(|| first_column_name(right))
+        }
+        Expr::IsNull { expr, .. } => first_column_name(expr),
+        Expr::IsBoolean { expr, .. } => first_column_name(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => first_column_name(expr)
+            .or_else(|| first_column_name(low))
+            .or_else(|| first_column_name(high)),
+        Expr::Like { expr, pattern, .. } => {
+            first_column_name(expr).or_else(|| first_column_name(pattern))
+        }
+        Expr::In { expr, list, .. } => {
+            first_column_name(expr).or_else(|| list.iter().find_map(first_column_name))
+        }
+        Expr::Function { args, .. } => args.iter().find_map(first_column_name),
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => operand
+            .as_deref()
+            .and_then(first_column_name)
+            .or_else(|| {
+                when_thens
+                    .iter()
+                    .find_map(|(c, r)| first_column_name(c).or_else(|| first_column_name(r)))
+            })
+            .or_else(|| else_result.as_deref().and_then(first_column_name)),
+        Expr::Cast { expr, .. } => first_column_name(expr),
+        _ => None,
+    }
 }
 
 // ── DROP TABLE ────────────────────────────────────────────────────────────────

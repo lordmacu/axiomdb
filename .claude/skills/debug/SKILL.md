@@ -1,3 +1,8 @@
+---
+name: debug
+description: Systematic debug protocol — reproduce with minimal test, 2+ hypotheses, fix root cause, add regression test
+---
+
 # /debug — Systematic debugging
 
 Never make random changes hoping they work. Follow this process.

@@ -43,8 +43,7 @@ fn analyze_insert(
     // Phase 21.4 — resolve RETURNING projection against the target table's scope.
     if !s.returning.is_empty() {
         let mut reader = CatalogReader::new(storage, snapshot.clone())?;
-        let table_def =
-            resolve_dml_table(&mut reader, &s.table, default_database, default_schema)?;
+        let table_def = resolve_dml_table(&mut reader, &s.table, default_database, default_schema)?;
         let columns = reader.list_columns(table_def.id)?;
         let bound = BoundTable {
             alias: s.table.alias.clone(),
@@ -52,7 +51,9 @@ fn analyze_insert(
             columns,
             col_offset: 0,
         };
-        let ctx = BindContext { tables: vec![bound] };
+        let ctx = BindContext {
+            tables: vec![bound],
+        };
         let mut resolved = Vec::with_capacity(s.returning.len());
         for item in std::mem::take(&mut s.returning) {
             resolved.push(match item {
@@ -100,6 +101,7 @@ fn analyze_update(
             snapshot.clone(),
             default_database,
             default_schema,
+            &[],
         )?
     };
 
@@ -109,10 +111,8 @@ fn analyze_update(
         // UPDATE scope so correlated doc / PASSING bind to the target table's
         // columns.
         if let FromClause::JsonTable(jt) = &mut join.table {
-            let taken_doc = std::mem::replace(
-                &mut jt.doc,
-                Expr::Literal(axiomdb_types::Value::Null),
-            );
+            let taken_doc =
+                std::mem::replace(&mut jt.doc, Expr::Literal(axiomdb_types::Value::Null));
             jt.doc = resolve_expr(taken_doc, &ctx)?;
             for (expr, _name) in &mut jt.passing {
                 let taken = std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
@@ -121,10 +121,7 @@ fn analyze_update(
         }
         // Phase 11.25a: resolve JSONB SRF doc for UPDATE join sources.
         if let FromClause::JsonbSrf(srf) = &mut join.table {
-            let taken = std::mem::replace(
-                &mut srf.doc,
-                Expr::Literal(axiomdb_types::Value::Null),
-            );
+            let taken = std::mem::replace(&mut srf.doc, Expr::Literal(axiomdb_types::Value::Null));
             srf.doc = resolve_expr(taken, &ctx)?;
         }
         // Phase 21.22: resolve VALUES row exprs (no correlation) for UPDATE
@@ -133,8 +130,7 @@ fn analyze_update(
             let empty_ctx = BindContext::empty();
             for row in &mut vc.rows {
                 for e in row {
-                    let taken =
-                        std::mem::replace(e, Expr::Literal(axiomdb_types::Value::Null));
+                    let taken = std::mem::replace(e, Expr::Literal(axiomdb_types::Value::Null));
                     *e = resolve_expr(taken, &empty_ctx)?;
                 }
             }
@@ -224,6 +220,7 @@ fn analyze_delete(
             snapshot.clone(),
             default_database,
             default_schema,
+            &[],
         )?
     };
 
@@ -231,10 +228,8 @@ fn analyze_delete(
     for mut join in s.joins {
         // Phase 11.20d4: resolve JSON_TABLE doc + PASSING for DELETE joins.
         if let FromClause::JsonTable(jt) = &mut join.table {
-            let taken_doc = std::mem::replace(
-                &mut jt.doc,
-                Expr::Literal(axiomdb_types::Value::Null),
-            );
+            let taken_doc =
+                std::mem::replace(&mut jt.doc, Expr::Literal(axiomdb_types::Value::Null));
             jt.doc = resolve_expr(taken_doc, &ctx)?;
             for (expr, _name) in &mut jt.passing {
                 let taken = std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
@@ -242,10 +237,7 @@ fn analyze_delete(
             }
         }
         if let FromClause::JsonbSrf(srf) = &mut join.table {
-            let taken = std::mem::replace(
-                &mut srf.doc,
-                Expr::Literal(axiomdb_types::Value::Null),
-            );
+            let taken = std::mem::replace(&mut srf.doc, Expr::Literal(axiomdb_types::Value::Null));
             srf.doc = resolve_expr(taken, &ctx)?;
         }
         // Phase 21.22: VALUES rows for DELETE joins.
@@ -253,8 +245,7 @@ fn analyze_delete(
             let empty_ctx = BindContext::empty();
             for row in &mut vc.rows {
                 for e in row {
-                    let taken =
-                        std::mem::replace(e, Expr::Literal(axiomdb_types::Value::Null));
+                    let taken = std::mem::replace(e, Expr::Literal(axiomdb_types::Value::Null));
                     *e = resolve_expr(taken, &empty_ctx)?;
                 }
             }
@@ -410,7 +401,14 @@ fn analyze_create_index(
     let columns = reader.list_columns(table_def.id)?;
 
     for idx_col in &s.columns {
-        if !columns.iter().any(|c| c.name == idx_col.name) {
+        // Phase 21.8: for expression indexes we validate the expression tree
+        // (rejecting subqueries, aggregates, window functions, parameters) and
+        // ensure every referenced column exists. For plain column indexes we
+        // just check the column name against the catalog.
+        if let Some(expr) = &idx_col.expr {
+            reject_disallowed_in_index_expr(expr)?;
+            ensure_expr_columns_exist(expr, &s.table.name, &columns)?;
+        } else if !columns.iter().any(|c| c.name == idx_col.name) {
             let available = columns
                 .iter()
                 .map(|c| c.name.as_str())
@@ -424,6 +422,198 @@ fn analyze_create_index(
     }
 
     Ok(s)
+}
+
+/// Rejects expression-index expressions that reference constructs which cannot
+/// be persisted or re-evaluated deterministically: subqueries, aggregate
+/// function calls, window functions, `EXISTS`, `OuterColumn`, prepared
+/// parameters, or `InsertValue`.
+fn reject_disallowed_in_index_expr(expr: &crate::expr::Expr) -> Result<(), DbError> {
+    use crate::expr::Expr;
+    match expr {
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {
+            Err(DbError::NotImplemented {
+                feature: "subquery in index expression is not allowed".into(),
+            })
+        }
+        Expr::Function { name, args } => {
+            if is_aggregate_function(name) {
+                return Err(DbError::NotImplemented {
+                    feature: format!(
+                        "aggregate function '{name}' is not allowed in index expression"
+                    ),
+                });
+            }
+            for a in args {
+                reject_disallowed_in_index_expr(a)?;
+            }
+            Ok(())
+        }
+        Expr::GroupConcat { .. } => Err(DbError::NotImplemented {
+            feature: "GROUP_CONCAT is not allowed in index expression".into(),
+        }),
+        Expr::Param { .. } => Err(DbError::NotImplemented {
+            feature: "prepared parameter is not allowed in index expression".into(),
+        }),
+        Expr::OuterColumn { .. } | Expr::InsertValue { .. } => Err(DbError::NotImplemented {
+            feature: "outer/insert reference is not allowed in index expression".into(),
+        }),
+        Expr::BinaryOp { left, right, .. } => {
+            reject_disallowed_in_index_expr(left)?;
+            reject_disallowed_in_index_expr(right)
+        }
+        Expr::UnaryOp { operand, .. } => reject_disallowed_in_index_expr(operand),
+        Expr::IsNull { expr, .. } => reject_disallowed_in_index_expr(expr),
+        Expr::IsBoolean { expr, .. } => reject_disallowed_in_index_expr(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            reject_disallowed_in_index_expr(expr)?;
+            reject_disallowed_in_index_expr(low)?;
+            reject_disallowed_in_index_expr(high)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            reject_disallowed_in_index_expr(expr)?;
+            reject_disallowed_in_index_expr(pattern)
+        }
+        Expr::In { expr, list, .. } => {
+            reject_disallowed_in_index_expr(expr)?;
+            for item in list {
+                reject_disallowed_in_index_expr(item)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                reject_disallowed_in_index_expr(op)?;
+            }
+            for (c, r) in when_thens {
+                reject_disallowed_in_index_expr(c)?;
+                reject_disallowed_in_index_expr(r)?;
+            }
+            if let Some(e) = else_result {
+                reject_disallowed_in_index_expr(e)?;
+            }
+            Ok(())
+        }
+        Expr::Cast { expr, .. } => reject_disallowed_in_index_expr(expr),
+        Expr::SqlJsonQuery { doc, passing, .. } => {
+            reject_disallowed_in_index_expr(doc)?;
+            for (v, _) in passing {
+                reject_disallowed_in_index_expr(v)?;
+            }
+            Ok(())
+        }
+        Expr::Literal(_) | Expr::Column { .. } | Expr::Default => Ok(()),
+    }
+}
+
+fn is_aggregate_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "count"
+            | "sum"
+            | "avg"
+            | "min"
+            | "max"
+            | "group_concat"
+            | "string_agg"
+            | "array_agg"
+            | "bit_and"
+            | "bit_or"
+            | "bit_xor"
+            | "stddev"
+            | "stddev_pop"
+            | "stddev_samp"
+            | "var_pop"
+            | "var_samp"
+            | "variance"
+    )
+}
+
+/// Walks the expression and errors with `ColumnNotFound` for any column
+/// reference whose name is not in `columns`.
+fn ensure_expr_columns_exist(
+    expr: &crate::expr::Expr,
+    table_name: &str,
+    columns: &[axiomdb_catalog::ColumnDef],
+) -> Result<(), DbError> {
+    use crate::expr::Expr;
+    let mut missing: Option<String> = None;
+    walk_columns(expr, &mut |name| {
+        if missing.is_none() && !columns.iter().any(|c| c.name == name) {
+            missing = Some(name.to_string());
+        }
+    });
+    if let Some(name) = missing {
+        let available = columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(DbError::ColumnNotFound {
+            name,
+            table: format!("\"{table_name}\" (available: {available})"),
+        });
+    }
+    return Ok(());
+
+    fn walk_columns(e: &Expr, f: &mut impl FnMut(&str)) {
+        match e {
+            Expr::Column { name, .. } => f(name),
+            Expr::BinaryOp { left, right, .. } => {
+                walk_columns(left, f);
+                walk_columns(right, f);
+            }
+            Expr::UnaryOp { operand, .. } => walk_columns(operand, f),
+            Expr::IsNull { expr, .. } => walk_columns(expr, f),
+            Expr::IsBoolean { expr, .. } => walk_columns(expr, f),
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                walk_columns(expr, f);
+                walk_columns(low, f);
+                walk_columns(high, f);
+            }
+            Expr::Like { expr, pattern, .. } => {
+                walk_columns(expr, f);
+                walk_columns(pattern, f);
+            }
+            Expr::In { expr, list, .. } => {
+                walk_columns(expr, f);
+                for it in list {
+                    walk_columns(it, f);
+                }
+            }
+            Expr::Function { args, .. } => {
+                for a in args {
+                    walk_columns(a, f);
+                }
+            }
+            Expr::Case {
+                operand,
+                when_thens,
+                else_result,
+            } => {
+                if let Some(op) = operand {
+                    walk_columns(op, f);
+                }
+                for (c, r) in when_thens {
+                    walk_columns(c, f);
+                    walk_columns(r, f);
+                }
+                if let Some(er) = else_result {
+                    walk_columns(er, f);
+                }
+            }
+            Expr::Cast { expr, .. } => walk_columns(expr, f),
+            _ => {}
+        }
+    }
 }
 
 // ── ALTER TABLE ───────────────────────────────────────────────────────────────

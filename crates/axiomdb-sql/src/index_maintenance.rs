@@ -18,7 +18,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use axiomdb_catalog::{CatalogReader, IndexDef};
+use axiomdb_catalog::{CatalogReader, IndexColumnDef, IndexDef};
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
 use axiomdb_index::BTree;
 use axiomdb_storage::StorageEngine;
@@ -198,6 +198,11 @@ pub fn indexes_for_table(
 /// Passing `&[]` for `compiled_preds` is equivalent to "no predicates" — all
 /// indexes are treated as full indexes regardless of their stored predicate.
 ///
+/// For **expression indexes** (Phase 21.8), `compiled_index_exprs[i][j]` holds
+/// the pre-compiled expression for `indexes[i].columns[j]`, or `None` for regular
+/// columns. Callers produce this via [`crate::partial_index::compile_index_exprs`]
+/// once per statement. Pass `&[]` (empty vec) if no indexes have expressions.
+///
 /// Returns a list of `(index_id, new_root_page_id)` for indexes whose root
 /// changed due to a B-Tree split.  The caller should persist these via
 /// `CatalogWriter::update_index_root`.
@@ -208,6 +213,7 @@ pub fn insert_into_indexes(
     storage: &dyn StorageEngine,
     bloom: &crate::bloom::BloomRegistry,
     compiled_preds: &[Option<Expr>],
+    compiled_index_exprs: &[Vec<Option<Expr>>],
     snap: TransactionSnapshot,
 ) -> Result<Vec<(u32, u64)>, DbError> {
     insert_into_indexes_with_undo(
@@ -217,6 +223,7 @@ pub fn insert_into_indexes(
         storage,
         bloom,
         compiled_preds,
+        compiled_index_exprs,
         snap,
         None,
         None,
@@ -236,6 +243,7 @@ pub fn insert_into_indexes_with_undo(
     storage: &dyn StorageEngine,
     bloom: &crate::bloom::BloomRegistry,
     compiled_preds: &[Option<Expr>],
+    compiled_index_exprs: &[Vec<Option<Expr>>],
     snap: TransactionSnapshot,
     txn: Option<&axiomdb_wal::TxnManager>,
     mut conn_txn: Option<&mut axiomdb_wal::ConnectionTxn>,
@@ -363,16 +371,28 @@ pub fn insert_into_indexes_with_undo(
             }
         }
 
-        let key_vals: Vec<Value> = idx
-            .columns
-            .iter()
-            .map(|c| row.get(c.col_idx as usize).cloned().unwrap_or(Value::Null))
-            .collect();
+        // Phase 21.8: expression index key extraction.
+        // Use index_key_values_if_indexed_with_exprs when compiled expressions
+        // are available; fall back to plain column access for regular indexes.
+        let idx_exprs = compiled_index_exprs.get(i);
+        let key_vals: Vec<Value> = if let Some(exprs) = idx_exprs {
+            match index_key_values_if_indexed_with_exprs(idx, row, None, exprs)? {
+                Some(vals) => vals,
+                None => continue, // NULL in key column → not indexed
+            }
+        } else {
+            idx.columns
+                .iter()
+                .map(|c| row.get(c.col_idx as usize).cloned().unwrap_or(Value::Null))
+                .collect()
+        };
 
         // Skip NULL key values — NULLs are not indexed in secondary indexes.
         // This is consistent with SQL semantics (NULL ≠ NULL) and avoids
         // DuplicateKey errors from the B-Tree when multiple NULLs are inserted
         // into a UNIQUE index.
+        // (Already filtered by index_key_values_if_indexed_with_exprs above,
+        // but kept as safety net for the no-expr path.)
         if key_vals.iter().any(|v| matches!(v, Value::Null)) {
             continue;
         }
@@ -444,6 +464,11 @@ pub fn insert_into_indexes_with_undo(
 /// never indexed — the delete is skipped. Pass compiled predicates via
 /// `compiled_preds` (parallel to `indexes`); pass `&[]` to treat all as full indexes.
 ///
+/// For **expression indexes** (Phase 21.8), `compiled_index_exprs[i][j]` holds
+/// the pre-compiled expression for `indexes[i].columns[j]`, or `None` for regular
+/// columns. Callers produce this via [`crate::partial_index::compile_index_exprs`]
+/// once per statement.
+///
 /// Returns a list of `(index_id, new_root_page_id)` for indexes whose root
 /// changed due to a collapse after deletion.
 pub fn delete_from_indexes(
@@ -453,6 +478,7 @@ pub fn delete_from_indexes(
     storage: &dyn StorageEngine,
     bloom: &crate::bloom::BloomRegistry,
     compiled_preds: &[Option<Expr>],
+    compiled_index_exprs: &[Vec<Option<Expr>>],
 ) -> Result<Vec<(u32, u64)>, DbError> {
     let mut updated_roots = Vec::new();
 
@@ -487,11 +513,19 @@ pub fn delete_from_indexes(
             continue;
         }
 
-        let key_vals: Vec<Value> = idx
-            .columns
-            .iter()
-            .map(|c| row.get(c.col_idx as usize).cloned().unwrap_or(Value::Null))
-            .collect();
+        // Phase 21.8: expression index key extraction.
+        let idx_exprs = compiled_index_exprs.get(i);
+        let key_vals: Vec<Value> = if let Some(exprs) = idx_exprs {
+            match index_key_values_if_indexed_with_exprs(idx, row, None, exprs)? {
+                Some(vals) => vals,
+                None => continue, // NULL in key column → not indexed
+            }
+        } else {
+            idx.columns
+                .iter()
+                .map(|c| row.get(c.col_idx as usize).cloned().unwrap_or(Value::Null))
+                .collect()
+        };
 
         // Skip NULL key values — NULLs were not inserted into the index.
         if key_vals.iter().any(|v| matches!(v, Value::Null)) {
@@ -642,6 +676,67 @@ pub(crate) fn index_key_values_if_indexed(
     Ok(Some(key_vals))
 }
 
+/// Extracts the key value for a single index column from a row.
+///
+/// For expression columns: evaluates the compiled expression.
+/// For regular columns: reads `row[col.col_idx]` directly.
+///
+/// Returns `Ok(None)` if the result is `Value::Null` (NULL is not indexed).
+pub fn index_key_value_for_column(
+    col: &IndexColumnDef,
+    compiled_expr: Option<&Expr>,
+    row: &[Value],
+) -> Result<Option<Value>, DbError> {
+    let value = match (&col.expr, compiled_expr) {
+        (Some(_), Some(expr)) => eval(expr, row)?,
+        (None, None) => row
+            .get(col.col_idx as usize)
+            .cloned()
+            .unwrap_or(Value::Null),
+        _ => {
+            return Err(DbError::Internal {
+                message: format!(
+                    "index_key_value_for_column: expr mismatch for column {} (expr={:?}, compiled={:?})",
+                    col.col_idx, col.expr.as_ref().map(|_| "Some"), compiled_expr.map(|_| "Some")
+                ),
+            });
+        }
+    };
+    if matches!(value, Value::Null) {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+/// Like [`index_key_values_if_indexed`] but accepts per-column compiled expressions
+/// for expression indexes (Phase 21.8).
+///
+/// `compiled_exprs` is parallel to `idx.columns` — `compiled_exprs[i]` is the
+/// resolved `Expr` for `idx.columns[i]`, or `None` for regular columns.
+pub fn index_key_values_if_indexed_with_exprs(
+    idx: &IndexDef,
+    row: &[Value],
+    compiled_pred: Option<&Expr>,
+    compiled_exprs: &[Option<Expr>],
+) -> Result<Option<Vec<Value>>, DbError> {
+    if let Some(pred) = compiled_pred {
+        if !is_truthy(&eval(pred, row)?) {
+            return Ok(None);
+        }
+    }
+
+    let mut key_vals = Vec::with_capacity(idx.columns.len());
+    for (i, col) in idx.columns.iter().enumerate() {
+        let compiled_expr = compiled_exprs.get(i).and_then(|e| e.as_ref());
+        let value = index_key_value_for_column(col, compiled_expr, row)?;
+        match value {
+            Some(v) => key_vals.push(v),
+            None => return Ok(None), // NULL in any key column → not indexed
+        }
+    }
+    Ok(Some(key_vals))
+}
+
 pub(crate) fn encode_index_entry_key(
     idx: &IndexDef,
     key_vals: &[Value],
@@ -661,6 +756,10 @@ pub(crate) fn encode_index_entry_key(
 ///
 /// If the RID changes, the index is always affected. When the RID is stable, the
 /// index is affected only if its membership or logical key changes.
+///
+/// For **expression indexes** (Phase 21.8), `compiled_index_exprs` provides
+/// per-column compiled expressions aligned with `idx.columns`. When provided,
+/// expression columns are evaluated against both old_row and new_row to detect key changes.
 pub fn update_affects_index(
     idx: &IndexDef,
     compiled_pred: Option<&Expr>,
@@ -668,11 +767,27 @@ pub fn update_affects_index(
     old_rid: RecordId,
     new_row: &[Value],
     new_rid: RecordId,
+    compiled_index_exprs: Option<&[Option<Expr>]>,
 ) -> Result<bool, DbError> {
     if old_rid != new_rid {
         return Ok(true);
     }
 
+    // Phase 21.8: expression-aware key comparison.
+    // When compiled expressions are available, use index_key_values_if_indexed_with_exprs.
+    if let Some(exprs) = compiled_index_exprs {
+        let old_key_vals =
+            index_key_values_if_indexed_with_exprs(idx, old_row, compiled_pred, exprs)?;
+        let new_key_vals =
+            index_key_values_if_indexed_with_exprs(idx, new_row, compiled_pred, exprs)?;
+        return Ok(match (old_key_vals, new_key_vals) {
+            (None, None) => false,
+            (Some(old_vals), Some(new_vals)) => old_vals != new_vals,
+            _ => true,
+        });
+    }
+
+    // Fallback: regular column access (backwards compatible).
     let old_key_vals = index_key_values_if_indexed(idx, old_row, compiled_pred)?;
     let new_key_vals = index_key_values_if_indexed(idx, new_row, compiled_pred)?;
     Ok(match (old_key_vals, new_key_vals) {
@@ -721,6 +836,10 @@ pub fn delete_many_from_single_index(
 /// at enqueue time — as the staged-insert path does. Eliminating the
 /// redundant N lookups at flush time halves total B-Tree operations.
 ///
+/// For **expression indexes** (Phase 21.8), `compiled_index_exprs[i][j]` holds
+/// the pre-compiled expression for `indexes[i].columns[j]`, or `None` for regular
+/// columns. Pass `&[]` (empty vec) if no indexes have expressions.
+///
 /// Returns `(index_id, new_root_page_id)` for every index whose root changed.
 /// The caller is responsible for updating the in-memory `IndexDef` slice.
 #[allow(clippy::too_many_arguments)]
@@ -731,6 +850,7 @@ pub fn batch_insert_into_indexes(
     storage: &dyn StorageEngine,
     bloom: &crate::bloom::BloomRegistry,
     compiled_preds: &[Option<Expr>],
+    compiled_index_exprs: &[Vec<Option<Expr>>],
     skip_unique_check: bool,
     committed_empty: &std::collections::HashSet<u32>,
     snap: TransactionSnapshot,
@@ -752,6 +872,7 @@ pub fn batch_insert_into_indexes(
         }
 
         let pred = compiled_preds.get(i).and_then(|p| p.as_ref());
+        let idx_exprs = compiled_index_exprs.get(i);
 
         if idx.index_type == 4 {
             let original_root = idx.root_page_id;
@@ -781,14 +902,18 @@ pub fn batch_insert_into_indexes(
                     continue;
                 }
             }
-            let key_vals: Vec<Value> = idx
-                .columns
-                .iter()
-                .map(|c| row.get(c.col_idx as usize).cloned().unwrap_or(Value::Null))
-                .collect();
-            if key_vals.iter().any(|v| matches!(v, Value::Null)) {
-                continue;
-            }
+            // Phase 21.8: expression index key extraction.
+            let key_vals: Vec<Value> = if let Some(exprs) = idx_exprs {
+                match index_key_values_if_indexed_with_exprs(idx, row, None, exprs)? {
+                    Some(vals) => vals,
+                    None => continue, // NULL in key column → not indexed
+                }
+            } else {
+                idx.columns
+                    .iter()
+                    .map(|c| row.get(c.col_idx as usize).cloned().unwrap_or(Value::Null))
+                    .collect()
+            };
             let key = if idx.is_fk_index || !idx.is_unique {
                 let mut k = encode_index_key(&key_vals)?;
                 k.extend_from_slice(&encode_rid(*rid));
@@ -1037,6 +1162,7 @@ mod tests {
             columns: vec![IndexColumnDef {
                 col_idx,
                 order: SortOrder::Asc,
+                expr: None,
             }],
             predicate: None,
             fillfactor: 90,
@@ -1059,7 +1185,7 @@ mod tests {
         let new_row = vec![Value::Int(7), Value::Int(99)];
 
         assert!(
-            !update_affects_index(&idx, None, &old_row, old_rid, &new_row, new_rid).unwrap(),
+            !update_affects_index(&idx, None, &old_row, old_rid, &new_row, new_rid, None).unwrap(),
             "non-indexed column change must not affect index when RID stays stable"
         );
     }
@@ -1084,6 +1210,7 @@ mod tests {
                     page_id: 84,
                     slot_id: 1,
                 },
+                None,
             )
             .unwrap(),
             "fallback delete+insert rows must still treat the index as affected"
@@ -1110,7 +1237,8 @@ mod tests {
         let new_row = vec![Value::Int(7), Value::Bool(false)];
 
         assert!(
-            update_affects_index(&idx, Some(&predicate), &old_row, rid, &new_row, rid).unwrap(),
+            update_affects_index(&idx, Some(&predicate), &old_row, rid, &new_row, rid, None,)
+                .unwrap(),
             "partial index membership changes must force maintenance even with stable RID"
         );
     }

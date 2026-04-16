@@ -32,6 +32,7 @@ pub(super) struct InsertBatchApply<'a> {
     pub indexes: &'a mut [IndexDef],
     pub rows: &'a [Vec<Value>],
     pub compiled_preds: &'a [Option<Expr>],
+    pub compiled_index_exprs: &'a [Vec<Option<Expr>>],
     pub skip_unique_check: bool,
     pub committed_empty: &'a std::collections::HashSet<u32>,
 }
@@ -56,6 +57,7 @@ fn persist_batch_insert_indexes(
         storage,
         bloom,
         plan.compiled_preds,
+        &plan.compiled_index_exprs,
         plan.skip_unique_check,
         plan.committed_empty,
         snap,
@@ -73,9 +75,16 @@ fn persist_batch_insert_indexes(
             let key_vals: Vec<axiomdb_types::Value> = idx
                 .columns
                 .iter()
-                .map(|c| row.get(c.col_idx as usize).cloned().unwrap_or(axiomdb_types::Value::Null))
+                .map(|c| {
+                    row.get(c.col_idx as usize)
+                        .cloned()
+                        .unwrap_or(axiomdb_types::Value::Null)
+                })
                 .collect();
-            if key_vals.iter().any(|v| matches!(v, axiomdb_types::Value::Null)) {
+            if key_vals
+                .iter()
+                .any(|v| matches!(v, axiomdb_types::Value::Null))
+            {
                 continue;
             }
             let key = if idx.is_fk_index || !idx.is_unique {
@@ -99,7 +108,14 @@ pub(super) fn apply_insert_batch(
     bloom: &crate::bloom::BloomRegistry,
     mut plan: InsertBatchApply<'_>,
 ) -> Result<Vec<RecordId>, DbError> {
-    let rids = TableEngine::insert_rows_batch(storage, txn, conn_txn, plan.table_def, plan.columns, plan.rows)?;
+    let rids = TableEngine::insert_rows_batch(
+        storage,
+        txn,
+        conn_txn,
+        plan.table_def,
+        plan.columns,
+        plan.rows,
+    )?;
     let _ = persist_batch_insert_indexes(storage, txn, conn_txn, bloom, &mut plan, &rids)?;
     Ok(rids)
 }
@@ -112,8 +128,15 @@ pub(super) fn apply_insert_batch_with_ctx(
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     mut plan: InsertBatchApply<'_>,
 ) -> Result<Vec<RecordId>, DbError> {
-    let rids =
-        TableEngine::insert_rows_batch_with_ctx(storage, txn, plan.table_def, plan.columns, ctx, conn_txn, plan.rows)?;
+    let rids = TableEngine::insert_rows_batch_with_ctx(
+        storage,
+        txn,
+        plan.table_def,
+        plan.columns,
+        ctx,
+        conn_txn,
+        plan.rows,
+    )?;
     let roots_changed =
         persist_batch_insert_indexes(storage, txn, conn_txn, bloom, &mut plan, &rids)?;
     if roots_changed {
@@ -156,7 +179,10 @@ pub(super) fn flush_pending_inserts_ctx(
     }
 
     let mut indexes = batch.indexes;
-    let mut conn = ctx.conn_txn.take().expect("active txn for flush_pending_inserts_ctx");
+    let mut conn = ctx
+        .conn_txn
+        .take()
+        .expect("active txn for flush_pending_inserts_ctx");
     let result = apply_insert_batch_with_ctx(
         storage,
         txn,
@@ -169,6 +195,7 @@ pub(super) fn flush_pending_inserts_ctx(
             indexes: &mut indexes,
             rows: &batch.rows,
             compiled_preds: &batch.compiled_preds,
+            compiled_index_exprs: &batch.compiled_index_exprs,
             skip_unique_check: true, // pre-verified at enqueue time
             committed_empty: &batch.committed_empty,
         },
@@ -235,7 +262,10 @@ pub(super) fn flush_clustered_insert_batch(
 
     let mut secondary_indexes = batch.secondary_indexes;
     let count = {
-        let conn = ctx.conn_txn.as_mut().expect("active txn for clustered insert flush");
+        let conn = ctx
+            .conn_txn
+            .as_mut()
+            .expect("active txn for clustered insert flush");
         apply_clustered_insert_rows(
             storage,
             txn,

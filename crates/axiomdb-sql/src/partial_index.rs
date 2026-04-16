@@ -184,6 +184,35 @@ pub fn resolve_predicate_columns(expr: Expr, col_defs: &[ColumnDef]) -> Result<E
     }
 }
 
+// ── Expression index compilation (Phase 21.8) ────────────────────────────────
+
+/// Compiles expression-index SQL expressions into resolved `Expr` trees.
+///
+/// Returns `Vec<Vec<Option<Expr>>>` — indexed `[index_idx][column_idx]`.
+/// Columns without expressions yield `None`; columns with expressions yield
+/// `Some(resolved_expr)`.
+///
+/// Subqueries, aggregates, window functions, and CASE/CAST/PARAM are rejected
+/// at compile time via the existing `resolve_predicate_columns` blocklist
+/// (same rule as partial-index predicates).
+pub fn compile_index_exprs(
+    indexes: &[IndexDef],
+    col_defs: &[ColumnDef],
+) -> Result<Vec<Vec<Option<Expr>>>, DbError> {
+    indexes
+        .iter()
+        .map(|idx| {
+            idx.columns
+                .iter()
+                .map(|col| match &col.expr {
+                    None => Ok(None),
+                    Some(sql) => compile_predicate_sql(sql, col_defs).map(Some),
+                })
+                .collect()
+        })
+        .collect()
+}
+
 // ── Planner: predicate implication ────────────────────────────────────────────
 
 /// Conservative predicate implication check for the query planner.

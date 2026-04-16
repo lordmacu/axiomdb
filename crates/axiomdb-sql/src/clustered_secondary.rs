@@ -7,6 +7,11 @@
 //! The existing `axiomdb-index::BTree` is reused only as an ordered container.
 //! The legacy fixed-size `RecordId` payload remains a compatibility artifact and
 //! is never treated as the logical bookmark for clustered rows.
+//!
+//! Phase 21.8: expression indexes on clustered tables are handled here by
+//! keeping the compiled expression alongside the column index in
+//! `secondary_exprs`; when present, the logical-key builder evaluates the
+//! expression against the row instead of reading the raw column value.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,6 +21,7 @@ use axiomdb_index::BTree;
 use axiomdb_storage::StorageEngine;
 use axiomdb_types::Value;
 
+use crate::expr::Expr;
 use crate::key_encoding::{decode_index_key, encode_index_key, MAX_INDEX_KEY};
 
 const DUMMY_RID: RecordId = RecordId {
@@ -23,7 +29,7 @@ const DUMMY_RID: RecordId = RecordId {
     slot_id: 0,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ClusteredSecondaryLayout {
     index_name: String,
     fillfactor: u8,
@@ -31,6 +37,13 @@ pub struct ClusteredSecondaryLayout {
     pub secondary_cols: Vec<u16>,
     pub primary_cols: Vec<u16>,
     pub suffix_cols: Vec<u16>,
+    /// Phase 21.8: per-secondary-column compiled expression. `None` means the
+    /// key component is the raw row value at `secondary_cols[i]`; `Some(expr)`
+    /// means the expression is evaluated against the row to produce the key.
+    ///
+    /// Built separately via [`ClusteredSecondaryLayout::with_exprs`] because
+    /// compiled `Expr` requires column metadata not available at `derive` time.
+    pub secondary_exprs: Vec<Option<Expr>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +103,9 @@ impl ClusteredSecondaryLayout {
             .copied()
             .filter(|pk_col| !secondary_cols.contains(pk_col))
             .collect();
+        // Expression-index slots are left as `None` here; the caller can supply
+        // compiled expressions via [`with_exprs`] when they are available.
+        let secondary_exprs = vec![None; secondary_cols.len()];
 
         Ok(Self {
             index_name: secondary_idx.name.clone(),
@@ -98,7 +114,27 @@ impl ClusteredSecondaryLayout {
             secondary_cols,
             primary_cols,
             suffix_cols,
+            secondary_exprs,
         })
+    }
+
+    /// Attaches compiled expression-index expressions, one per secondary key
+    /// column (parallel to `self.secondary_cols`). `None` means the column
+    /// value is used directly. Used by the INSERT / UPDATE paths that
+    /// pre-compile the index expressions once per statement.
+    pub fn with_exprs(mut self, exprs: Vec<Option<Expr>>) -> Result<Self, DbError> {
+        if exprs.len() != self.secondary_cols.len() {
+            return Err(DbError::Internal {
+                message: format!(
+                    "clustered secondary '{}' expected {} compiled expressions but got {}",
+                    self.index_name,
+                    self.secondary_cols.len(),
+                    exprs.len()
+                ),
+            });
+        }
+        self.secondary_exprs = exprs;
+        Ok(self)
     }
 
     pub fn physical_value_count(&self) -> usize {
@@ -130,7 +166,7 @@ impl ClusteredSecondaryLayout {
         &self,
         row: &[Value],
     ) -> Result<Option<ClusteredSecondaryEntry>, DbError> {
-        let logical_key = self.collect_row_values(row, &self.secondary_cols, false)?;
+        let logical_key = self.collect_secondary_values(row)?;
         if logical_key.iter().any(|v| matches!(v, Value::Null)) {
             return Ok(None);
         }
@@ -464,6 +500,31 @@ impl ClusteredSecondaryLayout {
         }
         Ok(values)
     }
+
+    /// Builds the logical key values from a row. For each secondary column, if
+    /// an expression is attached (Phase 21.8 expression index), evaluates the
+    /// expression against the row; otherwise reads the raw column value.
+    fn collect_secondary_values(&self, row: &[Value]) -> Result<Vec<Value>, DbError> {
+        let mut values = Vec::with_capacity(self.secondary_cols.len());
+        for (i, col_idx) in self.secondary_cols.iter().enumerate() {
+            let value =
+                match self.secondary_exprs.get(i).and_then(|e| e.as_ref()) {
+                    Some(expr) => crate::eval::eval(expr, row)?,
+                    None => row.get(*col_idx as usize).cloned().ok_or_else(|| {
+                        DbError::InvalidValue {
+                            reason: format!(
+                                "clustered secondary '{}' requires column {} in row with len {}",
+                                self.index_name,
+                                col_idx,
+                                row.len()
+                            ),
+                        }
+                    })?,
+                };
+            values.push(value);
+        }
+        Ok(values)
+    }
 }
 
 #[cfg(test)]
@@ -477,6 +538,7 @@ mod tests {
         IndexColumnDef {
             col_idx,
             order: SortOrder::Asc,
+            expr: None,
         }
     }
 

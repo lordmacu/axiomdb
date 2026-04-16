@@ -1,3 +1,8 @@
+---
+name: bench
+description: Run Criterion micro-benchmarks and 3-Docker comparison benchmarks, verify no regression against MySQL/PostgreSQL
+---
+
 # /bench — Measure performance correctly
 
 Never optimize without measuring. Never merge without verifying there was no regression.

@@ -227,6 +227,7 @@ mod tests {
                 .map(|&c| IndexColumnDef {
                     col_idx: c,
                     order: SortOrder::Asc,
+                    expr: None,
                 })
                 .collect(),
             predicate: None,

@@ -1,3 +1,8 @@
+---
+name: brainstorm
+description: Explore approaches before proposing — read context, ask questions, present 2+ options with trade-offs, write sprint with dependencies
+---
+
 # /brainstorm — Explore before proposing
 
 Before proposing any solution, run this complete protocol:

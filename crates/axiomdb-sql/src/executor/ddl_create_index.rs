@@ -116,7 +116,18 @@ fn build_index_root_from_clustered(
                 table_def.table_name
             ))
         })?;
-    let layout = crate::clustered_secondary::ClusteredSecondaryLayout::derive(idx, &primary_idx)?;
+    let layout = {
+        let base =
+            crate::clustered_secondary::ClusteredSecondaryLayout::derive(idx, &primary_idx)?;
+        // Phase 21.8: attach compiled expression-index expressions so the
+        // layout builds logical keys from LOWER(col) etc. when evaluating
+        // existing rows (e.g. CREATE UNIQUE INDEX after data is already loaded).
+        let idx_exprs =
+            crate::partial_index::compile_index_exprs(std::slice::from_ref(idx), col_defs)?
+                .pop()
+                .unwrap_or_default();
+        base.with_exprs(idx_exprs)?
+    };
     let rows = crate::table::scan_clustered_table(storage, table_def, col_defs, snap)?;
     let mut skipped_key_too_long = 0usize;
 
@@ -173,6 +184,7 @@ fn execute_create_index(
     }
 
     // 3. Build IndexColumnDef list from the CREATE INDEX statement.
+    //    Also compile expression-index expressions (Phase 21.8).
     let index_columns: Vec<IndexColumnDef> = stmt
         .columns
         .iter()
@@ -187,6 +199,10 @@ fn execute_create_index(
                     crate::ast::SortOrder::Asc => CatalogSortOrder::Asc,
                     crate::ast::SortOrder::Desc => CatalogSortOrder::Desc,
                 },
+                expr: ic
+                    .expr
+                    .as_ref()
+                    .map(|e| crate::expr_to_sql::expr_to_sql_string(e)),
             }
         })
         .collect();
@@ -198,10 +214,7 @@ fn execute_create_index(
     let is_gin = matches!(stmt.index_type, crate::ast::IndexType::Gin);
     let root_page_id = if is_brin {
         let pages_per_range = stmt.pages_per_range.unwrap_or(128);
-        let brin_col_idx = index_columns
-            .first()
-            .map(|c| c.col_idx)
-            .unwrap_or(0);
+        let brin_col_idx = index_columns.first().map(|c| c.col_idx).unwrap_or(0);
         axiomdb_storage::brin::init_metapage(storage, pages_per_range, brin_col_idx)?
     } else {
         let pid = storage.alloc_page(PageType::Index)?;
@@ -220,16 +233,29 @@ fn execute_create_index(
 
     // 5. Scan the table and insert existing rows into the B-Tree.
     //    For partial indexes, compile the predicate once and skip non-matching rows.
+    //    For expression indexes, compile the per-column expressions once (Phase 21.8).
     let index_fillfactor = stmt.fillfactor.unwrap_or(90);
     let pred_expr: Option<crate::expr::Expr> = match &stmt.predicate {
         Some(pred) => {
-            let sql = expr_to_sql_string(pred);
+            let sql = crate::expr_to_sql::expr_to_sql_string(pred);
             Some(crate::partial_index::compile_predicate_sql(
                 &sql, &col_defs,
             )?)
         }
         None => None,
     };
+
+    // Compile expression-index expressions (parallel to index_columns).
+    // Results in Vec<Option<Expr>> aligned with index_columns.
+    let compiled_exprs: Vec<Option<crate::expr::Expr>> = index_columns
+        .iter()
+        .map(|ic| {
+            ic.expr
+                .as_ref()
+                .map(|sql| crate::partial_index::compile_predicate_sql(sql, &col_defs))
+                .transpose()
+        })
+        .collect::<Result<_, _>>()?;
 
     let mut bloom_keys: Vec<Vec<u8>> = Vec::new();
     let mut skipped = 0usize;
@@ -278,7 +304,8 @@ fn execute_create_index(
 
         // Write summaries to metapage.
         let max_range = range_map.keys().copied().max().unwrap_or(0);
-        let mut summaries = vec![axiomdb_storage::brin::BrinSummary::empty(); max_range as usize + 1];
+        let mut summaries =
+            vec![axiomdb_storage::brin::BrinSummary::empty(); max_range as usize + 1];
         for (range_id, summary) in range_map {
             summaries[range_id as usize] = summary;
         }
@@ -289,7 +316,10 @@ fn execute_create_index(
         // ── Trigram index build (Phase 11.4b) ────────────────────────────
         // Extract 3-char n-grams from each row's text value and insert
         // (trigram || RecordId) keys into the B-Tree.
-        let trgm_col_idx = index_columns.first().map(|c| c.col_idx as usize).unwrap_or(0);
+        let trgm_col_idx = index_columns
+            .first()
+            .map(|c| c.col_idx as usize)
+            .unwrap_or(0);
         for (rid, row_vals) in &rows {
             let text = match row_vals.get(trgm_col_idx) {
                 Some(Value::Text(s)) | Some(Value::Json(s)) => s,
@@ -307,7 +337,10 @@ fn execute_create_index(
         // ── FTS inverted index build (Phase 11.6) ────────────────────────
         // Tokenize each row's text value, insert (term || docid || position)
         // keys into B-Tree. Also track document lengths for BM25.
-        let fts_col_idx = index_columns.first().map(|c| c.col_idx as usize).unwrap_or(0);
+        let fts_col_idx = index_columns
+            .first()
+            .map(|c| c.col_idx as usize)
+            .unwrap_or(0);
         let mut total_tokens: u64 = 0;
         let mut doc_count: u64 = 0;
         for (rid, row_vals) in &rows {
@@ -340,20 +373,21 @@ fn execute_create_index(
         // B-Tree. Heap tables use RID bookmarks; clustered tables use the encoded
         // primary key as the bookmark suffix. No bloom: term keys use a specialised
         // encoding.
-        let gin_col_idx = index_columns.first().map(|c| c.col_idx as usize).unwrap_or(0);
+        let gin_col_idx = index_columns
+            .first()
+            .map(|c| c.col_idx as usize)
+            .unwrap_or(0);
         let clustered_primary_cols = if table_def.is_clustered() {
             let mut reader = CatalogReader::new(storage, snap.clone())?;
             let primary_idx = reader
                 .list_indexes(table_def.id)?
                 .into_iter()
                 .find(|i| i.is_primary && !i.columns.is_empty())
-                .ok_or_else(|| {
-                    DbError::Internal {
-                        message: format!(
-                            "clustered table '{}' has no primary index — catalog inconsistency",
-                            table_def.table_name
-                        ),
-                    }
+                .ok_or_else(|| DbError::Internal {
+                    message: format!(
+                        "clustered table '{}' has no primary index — catalog inconsistency",
+                        table_def.table_name
+                    ),
                 })?;
             Some(
                 primary_idx
@@ -430,10 +464,15 @@ fn execute_create_index(
             index_type: 0,
             pages_per_range: 128,
         };
-        let layout = crate::clustered_secondary::ClusteredSecondaryLayout::derive(
-            &preview_index_def,
-            &primary_idx,
-        )?;
+        let layout = {
+            let base = crate::clustered_secondary::ClusteredSecondaryLayout::derive(
+                &preview_index_def,
+                &primary_idx,
+            )?;
+            // Phase 21.8: attach the already-compiled per-column expressions
+            // so logical keys use LOWER(col) etc. when indexing existing rows.
+            base.with_exprs(compiled_exprs.clone())?
+        };
 
         for (_rid, row_vals) in &rows {
             // Partial index: skip rows that don't satisfy the predicate.
@@ -460,12 +499,19 @@ fn execute_create_index(
                 }
             }
 
+            // Collect key values — for expression columns, evaluate the compiled expression;
+            // for regular columns, read the raw column value (Phase 21.8).
             let key_vals: Vec<Value> = index_columns
                 .iter()
-                .map(|ic| row_vals[ic.col_idx as usize].clone())
+                .enumerate()
+                .filter_map(|(i, ic)| {
+                    let compiled = compiled_exprs.get(i).and_then(|e| e.as_ref());
+                    crate::index_maintenance::index_key_value_for_column(ic, compiled, row_vals)
+                        .unwrap_or(None)
+                })
                 .collect();
             // Skip rows with NULL key values — NULLs are not indexed.
-            if key_vals.iter().any(|v| matches!(v, Value::Null)) {
+            if key_vals.len() != index_columns.len() {
                 continue;
             }
             match encode_index_key(&key_vals) {
@@ -501,7 +547,10 @@ fn execute_create_index(
     let mut writer = CatalogWriter::new(storage, txn, conn_txn)?;
     // Serialize the predicate expression to SQL string for catalog storage.
     // Stored as a human-readable string for debuggability and backward-compat.
-    let predicate_sql: Option<String> = stmt.predicate.as_ref().map(expr_to_sql_string);
+    let predicate_sql: Option<String> = stmt
+        .predicate
+        .as_ref()
+        .map(crate::expr_to_sql::expr_to_sql_string);
 
     // Resolve INCLUDE column names to col_idx values for catalog storage (Phase 6.13).
     let include_col_idxs: Vec<u16> = stmt

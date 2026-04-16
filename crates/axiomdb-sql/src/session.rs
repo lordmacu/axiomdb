@@ -442,6 +442,8 @@ pub struct PendingInsertBatch {
     pub indexes: Vec<IndexDef>,
     /// Pre-compiled partial-index predicates, parallel to `indexes`.
     pub compiled_preds: Vec<Option<Expr>>,
+    /// Pre-compiled index expressions, parallel to `indexes` (Phase 21.8).
+    pub compiled_index_exprs: Vec<Vec<Option<Expr>>>,
     /// Fully materialized rows ready to be written to the heap.
     pub rows: Vec<Vec<Value>>,
     /// For each unique (non-FK) index: set of encoded keys already staged.

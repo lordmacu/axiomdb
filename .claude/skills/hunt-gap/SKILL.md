@@ -1,3 +1,8 @@
+---
+name: hunt-gap
+description: Verify and fix documented gaps one at a time — reproduce, root cause, minimal fix, wire-test regression, close
+---
+
 # /hunt-gap — Proactive gap/bug hunter
 
 Systematically verify and fix documented gaps or bugs. Never assume a gap still
@@ -210,19 +215,13 @@ def test_gap():
     cur.execute("USE gap_test")
 
     # --- Control test (known-working feature to confirm infra works) ---
-    # ...
     # ok("control: SELECT works", ...)
 
     # --- Gap test (the feature/behavior that is expected to fail) ---
     try:
-        # ... SQL that exercises the gap ...
-        # ok("gap description", condition, got=result)
         pass
     except Exception as e:
         ok("gap description", False, got=str(e))
-
-    # --- Edge cases ---
-    # ...
 
     # Cleanup
     for tbl in ["table1", "table2"]:
@@ -351,7 +350,7 @@ Reason: [one line]
 - Do **NOT** refactor, clean up, or "improve" surrounding code
 - Do **NOT** add features beyond what the gap describes
 - For type coercion fixes: remember `axiomdb_types::coerce(value, target, mode)`
-- For unwrap→error fixes: use the existing error type (e.g., `trunc()`, `DbError::ParseError`)
+- For unwrap→error fixes: use the existing error type
 
 ### Step 3: Build and test incrementally
 
@@ -435,54 +434,6 @@ git commit -m "fix(fase-N): close GAP-X.Y — [description]
 ```
 
 Do NOT include Co-Authored-By from Claude (per CLAUDE.md).
-
----
-
-## Decision tree
-
-```
-/hunt-gap [id]
-    |
-    v
-[Phase 1] Locate gap in docs/progreso.md + specs/
-    |
-    v
-  Already fixed? ----YES----> Update progreso.md, report, done
-    |
-   NO
-    |
-    v
-  Code-level only? (unwrap/expect/unsafe)
-    |           |
-   YES         NO
-    |           |
-[Phase 2A]   [Phase 2B]
-  Grep src/   Create tmp Python test
-    |           |
-    v           v
-  Pattern      Build server + run test
-  exists?      |
-    |           v
-   YES   [Phase 3] Gap confirmed?
-    |     |              |
-    v    YES            NO -> mark fixed, done
-    |     |
-    +-----+
-    |
-    v
-[Phase 4] Root cause analysis (2+ hypotheses)
-    |
-    v
-[Phase 5] Implement minimal fix
-    |
-    v
-  Re-run test --> passes?
-    |                |
-   YES              NO -> iterate (re-examine hypotheses)
-    |
-    v
-[Phase 6] Validate (wire-test + clippy) + clean up + report
-```
 
 ---
 

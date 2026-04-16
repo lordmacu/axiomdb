@@ -94,6 +94,8 @@ fn execute_insert(
 
     let compiled_preds =
         crate::partial_index::compile_index_predicates(&secondary_indexes, schema_cols)?;
+    let compiled_index_exprs =
+        crate::partial_index::compile_index_exprs(&secondary_indexes, schema_cols)?;
     let ignore = stmt.ignore;
 
     match stmt.source {
@@ -166,6 +168,7 @@ fn execute_insert(
                             storage,
                             &noop_bloom,
                             &compiled_preds,
+                            &compiled_index_exprs,
                             snap,
                             Some(txn),
                             Some(conn_txn),
@@ -206,6 +209,7 @@ fn execute_insert(
                         indexes: &mut secondary_indexes,
                         rows: &full_batch,
                         compiled_preds: &compiled_preds,
+                        compiled_index_exprs: &compiled_index_exprs,
                         skip_unique_check: false,
                         committed_empty: &committed_empty,
                     },
@@ -271,6 +275,7 @@ fn execute_insert(
                         storage,
                         &noop_bloom,
                         &compiled_preds,
+                        &compiled_index_exprs,
                         snap,
                         Some(txn),
                         Some(conn_txn),
@@ -325,6 +330,7 @@ fn execute_insert(
                     storage,
                     &noop_bloom,
                     &compiled_preds,
+                    &compiled_index_exprs,
                     snap,
                     Some(txn),
                     Some(conn_txn),

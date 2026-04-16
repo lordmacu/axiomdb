@@ -140,6 +140,8 @@ fn execute_update_join_ctx(
 
     let compiled_preds =
         crate::partial_index::compile_index_predicates(secondary_indexes, schema_cols)?;
+    let compiled_index_exprs =
+        crate::partial_index::compile_index_exprs(secondary_indexes, schema_cols)?;
     let heap_updates: Vec<(RecordId, Vec<Value>)> = to_update
         .iter()
         .map(|(rid, _old, new)| (*rid, new.clone()))
@@ -174,6 +176,7 @@ fn execute_update_join_ctx(
             apply_update_index_maintenance(
                 &mut current_indexes,
                 &compiled_preds,
+                &compiled_index_exprs,
                 &update_pairs,
                 storage,
                 txn,

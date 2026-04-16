@@ -43,11 +43,17 @@ fn execute_clustered_insert_ctx(
         .filter(|i| !i.is_primary && !i.columns.is_empty())
         .cloned()
         .collect();
+    // Phase 21.8: compile per-column expressions once; zip with the layouts so
+    // the clustered-secondary writer can evaluate LOWER(col) etc. for each row.
+    let compiled_index_exprs =
+        crate::partial_index::compile_index_exprs(&secondary_indexes, schema_cols)?;
     let secondary_layouts: Vec<crate::clustered_secondary::ClusteredSecondaryLayout> =
         secondary_indexes
             .iter()
-            .map(|idx| {
+            .zip(compiled_index_exprs.iter())
+            .map(|(idx, exprs)| {
                 crate::clustered_secondary::ClusteredSecondaryLayout::derive(idx, &primary_idx)
+                    .and_then(|layout| layout.with_exprs(exprs.clone()))
             })
             .collect::<Result<_, _>>()?;
     let compiled_preds =

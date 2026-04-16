@@ -1,3 +1,8 @@
+---
+name: fuzz
+description: Fuzz SQL parser and storage with cargo-fuzz — setup targets, run, add regression tests for crashes
+---
+
 # /fuzz — Testing with random inputs
 
 Critical for the SQL parser (malformed inputs) and storage (corrupt pages).
@@ -9,7 +14,7 @@ Critical for the SQL parser (malformed inputs) and storage (corrupt pages).
 cargo install cargo-fuzz
 
 # Create fuzz targets
-cd /Users/cristian/nexusdb
+cd /home/familia/axiomdb
 cargo fuzz init   # if first time
 
 # Targets for axiomdb

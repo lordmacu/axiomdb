@@ -14,7 +14,10 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              4.G5 (DELETE/UPDATE ORDER BY+LIMIT, INSERT IGNORE, CREATE LIKE, CTAS, CALL/DO),
              4.11b (Subquery in JOIN),
              11.2d (refcounted TOAST/BLOB chain roundtrip), 11.4 (native JSON type + JSON_EXTRACT / ->>),
-             11.16 (binary JSONB + JSONPath: -> operator, JSON_MERGE_PATCH, JSON_CONTAINS, JSON_PATH_EXISTS, TO_JSONB)
+             11.16 (binary JSONB + JSONPath: -> operator, JSON_MERGE_PATCH, JSON_CONTAINS, JSON_PATH_EXISTS, TO_JSONB),
+             11.25b (JSON aggregates: jsonb_agg, json_agg, JSON_ARRAYAGG, jsonb_object_agg,
+                      json_object_agg, JSON_OBJECTAGG; constructors: JSON_ARRAY, JSON_OBJECT,
+                      jsonb_build_object/array, to_json, JSON_MERGE_PRESERVE, JSON_CONTAINS_PATH)
 """
 import os
 import signal

@@ -532,6 +532,7 @@ pub fn enforce_fk_on_parent_delete(
                                     storage,
                                     bloom,
                                     &[],
+                                    &[],
                                 )?;
                                 for (index_id, new_root) in updated {
                                     CatalogWriter::new(storage, txn, conn_txn)?
@@ -699,7 +700,7 @@ pub fn enforce_fk_on_parent_delete(
 
                             for (old_rid, old_values, new_rid, new_values) in &update_pairs {
                                 if crate::index_maintenance::update_affects_index(
-                                    idx, pred, old_values, *old_rid, new_values, *new_rid,
+                                    idx, pred, old_values, *old_rid, new_values, *new_rid, None,
                                 )? {
                                     if let Some(key_vals) =
                                         crate::index_maintenance::index_key_values_if_indexed(
@@ -1045,7 +1046,7 @@ fn apply_fk_update_children(
 
             for (old_rid, old_values, new_rid, new_values) in &update_pairs {
                 if crate::index_maintenance::update_affects_index(
-                    idx, pred, old_values, *old_rid, new_values, *new_rid,
+                    idx, pred, old_values, *old_rid, new_values, *new_rid, None,
                 )? {
                     if let Some(key_vals) = crate::index_maintenance::index_key_values_if_indexed(
                         idx, old_values, pred,

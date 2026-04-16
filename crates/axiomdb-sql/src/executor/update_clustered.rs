@@ -188,6 +188,10 @@ fn execute_clustered_update(
     let primary_idx = clustered_update_primary_index(resolved)?;
     let compiled_secondary_preds =
         crate::partial_index::compile_index_predicates(secondary_indexes, schema_cols)?;
+    // Phase 21.8: compile expression-index expressions so the secondary layout
+    // can evaluate LOWER(col) etc. when rebuilding the logical key on UPDATE.
+    let compiled_secondary_exprs =
+        crate::partial_index::compile_index_exprs(secondary_indexes, schema_cols)?;
     let secondary_layouts: Vec<(
         &axiomdb_catalog::IndexDef,
         Option<crate::expr::Expr>,
@@ -196,9 +200,11 @@ fn execute_clustered_update(
     )> = secondary_indexes
         .iter()
         .zip(compiled_secondary_preds.iter())
-        .filter(|(idx, _)| !idx.is_primary && !idx.columns.is_empty())
-        .filter_map(|(idx, compiled_pred)| {
+        .zip(compiled_secondary_exprs.iter())
+        .filter(|((idx, _), _)| !idx.is_primary && !idx.columns.is_empty())
+        .filter_map(|((idx, compiled_pred), idx_exprs)| {
             crate::clustered_secondary::ClusteredSecondaryLayout::derive(idx, primary_idx)
+                .and_then(|layout| layout.with_exprs(idx_exprs.clone()))
                 .ok()
                 .map(|layout| {
                     (

@@ -96,6 +96,22 @@ pub fn plan_select(
         }
     }
 
+    // ── Rule 1b: expression index lookup ──────────────────────────────────────────
+    // Handles patterns like `LOWER(email) = 'foo'` or `LOWER(email) LIKE 'foo%'`
+    // where an expression index `LOWER(email)` exists.
+    if let Some((idx, lo_key, hi_key)) = find_expression_index(expr, indexes) {
+        let use_index =
+            idx.is_primary || stats_cost_gate(&idx, columns, table_id, table_stats, stale_tracker);
+        if use_index {
+            // Expression indexes are always single-column (by definition).
+            return AccessMethod::IndexRange {
+                index_def: idx.clone(),
+                lo: lo_key,
+                hi: hi_key,
+            };
+        }
+    }
+
     // ── Rule 2: col > lo AND col < hi (or >=, <=) ─────────────────────────
     if let Some((idx, lo_val, hi_val)) = extract_range(expr, indexes, columns, Some(expr), true) {
         // Cost gate: range scans are even less selective — apply same threshold.
@@ -104,14 +120,19 @@ pub fn plan_select(
         if use_index {
             // Coerce range bounds to the indexed column's stored type.
             let range_col = idx.columns.first().and_then(|c| {
-                columns.iter().find(|col| col.col_idx == c.col_idx).map(|col| col.name.as_str())
+                columns
+                    .iter()
+                    .find(|col| col.col_idx == c.col_idx)
+                    .map(|col| col.name.as_str())
             });
             let lo = lo_val.and_then(|v| {
-                let v = range_col.map_or(v.clone(), |cn| coerce_literal_to_col_type(v, cn, columns));
+                let v =
+                    range_col.map_or(v.clone(), |cn| coerce_literal_to_col_type(v, cn, columns));
                 encode_index_key(&[v]).ok()
             });
             let hi = hi_val.and_then(|v| {
-                let v = range_col.map_or(v.clone(), |cn| coerce_literal_to_col_type(v, cn, columns));
+                let v =
+                    range_col.map_or(v.clone(), |cn| coerce_literal_to_col_type(v, cn, columns));
                 encode_index_key(&[v]).ok()
             });
             return AccessMethod::IndexRange {
@@ -177,11 +198,7 @@ pub fn plan_select(
 /// original predicate as a re-check (`recheck_required = true`) because GIN
 /// posting-list intersection alone cannot confirm structural containment or
 /// rule out dead rows.
-fn plan_gin_scan(
-    expr: &Expr,
-    indexes: &[IndexDef],
-    columns: &[ColumnDef],
-) -> Option<AccessMethod> {
+fn plan_gin_scan(expr: &Expr, indexes: &[IndexDef], columns: &[ColumnDef]) -> Option<AccessMethod> {
     enum GinProbe {
         Contains,
         Exists,
@@ -193,9 +210,7 @@ fn plan_gin_scan(
             left,
             right,
         } => match (left.as_ref(), right.as_ref()) {
-            (Expr::Column { name, .. }, Expr::Literal(v)) => {
-                (GinProbe::Contains, name.as_str(), v)
-            }
+            (Expr::Column { name, .. }, Expr::Literal(v)) => (GinProbe::Contains, name.as_str(), v),
             _ => return None,
         },
         Expr::BinaryOp {
@@ -203,9 +218,7 @@ fn plan_gin_scan(
             left,
             right,
         } => match (left.as_ref(), right.as_ref()) {
-            (Expr::Column { name, .. }, Expr::Literal(v)) => {
-                (GinProbe::Exists, name.as_str(), v)
-            }
+            (Expr::Column { name, .. }, Expr::Literal(v)) => (GinProbe::Exists, name.as_str(), v),
             _ => return None,
         },
         _ => return None,
@@ -216,9 +229,7 @@ fn plan_gin_scan(
 
     // Find a GIN index (index_type == 4) whose first column matches.
     let gin_idx = indexes.iter().find(|idx| {
-        idx.index_type == 4
-            && !idx.columns.is_empty()
-            && idx.columns[0].col_idx == col_idx
+        idx.index_type == 4 && !idx.columns.is_empty() && idx.columns[0].col_idx == col_idx
     })?;
 
     // Extract query terms from the literal value at plan time.
@@ -261,8 +272,14 @@ fn index_covers_query(index_def: &IndexDef, select_col_idxs: &[u16]) -> bool {
     if select_col_idxs.is_empty() {
         return false; // SELECT * or unknown — never use index-only
     }
-    let key_cols: std::collections::HashSet<u16> =
-        index_def.columns.iter().map(|c| c.col_idx).collect();
+    // Expression columns are NOT stored in the index — only the computed result
+    // is stored. Therefore they cannot be used for index-only scan coverage.
+    let key_cols: std::collections::HashSet<u16> = index_def
+        .columns
+        .iter()
+        .filter(|c| c.expr.is_none()) // only plain columns count
+        .map(|c| c.col_idx)
+        .collect();
     select_col_idxs.iter().all(|col| key_cols.contains(col))
 }
 
@@ -431,6 +448,203 @@ fn extract_eq_col_literal(expr: &Expr) -> Option<(&str, Value)> {
         }
     }
     None
+}
+
+// ── Expression index matching (Phase 21.8E) ─────────────────────────────────────
+
+/// Produces a canonical SQL string for an expression by:
+/// - Lowercasing function names and column names
+/// - Removing extra whitespace
+/// - Using consistent parentheses
+///
+/// This allows direct string comparison with the stored SQL expression
+/// from a `CREATE INDEX ... (LOWER(col))` statement.
+fn normalize_expr_sql(e: &Expr) -> String {
+    match e {
+        Expr::Literal(v) => format!("{:?}", v),
+        Expr::Column { name, .. } => name.to_lowercase(),
+        Expr::Function { name, args } => {
+            let args_sql: Vec<String> = args.iter().map(normalize_expr_sql).collect();
+            format!("{}({})", name.to_lowercase(), args_sql.join(", "))
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let op_str = match op {
+                BinaryOp::Add => "+",
+                BinaryOp::Sub => "-",
+                BinaryOp::Mul => "*",
+                BinaryOp::Div => "/",
+                BinaryOp::Mod => "%",
+                BinaryOp::And => "AND",
+                BinaryOp::Or => "OR",
+                BinaryOp::Eq => "=",
+                BinaryOp::NotEq => "<>",
+                BinaryOp::Lt => "<",
+                BinaryOp::LtEq => "<=",
+                BinaryOp::Gt => ">",
+                BinaryOp::GtEq => ">=",
+                BinaryOp::Concat => "||",
+                _ => return String::new(), // Unsupported ops give no match
+            };
+            format!(
+                "({} {} {})",
+                normalize_expr_sql(left),
+                op_str,
+                normalize_expr_sql(right)
+            )
+        }
+        Expr::UnaryOp { op, operand } => {
+            let op_str = match op {
+                UnaryOp::Neg => "-",
+                UnaryOp::Not => "NOT",
+                UnaryOp::BitNot => "~",
+            };
+            format!("({}{})", op_str, normalize_expr_sql(operand))
+        }
+        Expr::Cast { expr, target } => {
+            format!("cast({} AS {:?})", normalize_expr_sql(expr), target)
+        }
+        // Partial coverage — other expression types return empty (no match)
+        _ => String::new(),
+    }
+}
+
+/// Extracts the indexable expression from a comparison LHS, returning the
+/// inner-most function call or column if there's no wrapping function.
+fn extract_indexable_expr(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::Function { .. } => Some(e),
+        Expr::Column { .. } => Some(e),
+        Expr::Cast { expr, .. } => extract_indexable_expr(expr),
+        Expr::UnaryOp { operand, .. } => extract_indexable_expr(operand),
+        _ => None,
+    }
+}
+
+/// Finds an expression index whose stored SQL matches a WHERE expression.
+///
+/// Returns `(index, lo_key, hi_key)` where `lo_key` and `hi_key` are the
+/// encoded index key bounds. For equality, `hi_key = Some(lo_key.clone())`.
+/// For prefix LIKE (`'foo%'`), `lo_key` = encoded 'foo', `hi_key` = encoded 'foo\xFF'.
+/// Returns `None` if no expression index matches or the predicate is not indexable.
+///
+/// Currently handles:
+/// - `func(col) = literal` → IndexLookup on expression index `func(col)`
+/// - `func(col) LIKE 'prefix%'` → IndexRange with prefix bounds
+#[allow(clippy::type_complexity)]
+fn find_expression_index(
+    where_expr: &Expr,
+    indexes: &[IndexDef],
+) -> Option<(IndexDef, Option<Vec<u8>>, Option<Vec<u8>>)> {
+    use crate::key_encoding::encode_index_key;
+
+    // Match either BinaryOp::Eq or Expr::Like.
+    let (indexable_expr, literal_expr, is_eq) = match where_expr {
+        // func(col) = literal
+        Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => {
+            let (lhs, rhs) = (left.as_ref(), right.as_ref());
+            // Only handle func(col) = literal, not literal = func(col) (swap later).
+            if matches!(lhs, Expr::Function { .. } | Expr::Cast { .. }) {
+                (Some(lhs), Some(rhs), true)
+            } else {
+                return None;
+            }
+        }
+        // LIKE pattern
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            ..
+        } if !negated => {
+            // Only handle non-negated LIKE.
+            (Some(expr.as_ref()), Some(pattern.as_ref()), false)
+        }
+        _ => return None,
+    };
+
+    let (indexable_expr, literal_expr, is_eq) = match (indexable_expr, literal_expr) {
+        (Some(a), Some(b)) => (a, b, is_eq),
+        _ => return None,
+    };
+
+    // Extract the function/column expression.
+    let indexable = extract_indexable_expr(indexable_expr)?;
+    let normalized_query = normalize_expr_sql(indexable);
+    if normalized_query.is_empty() {
+        return None;
+    }
+
+    // Find an expression index whose stored SQL matches the query expression.
+    let matching_idx = indexes.iter().find(|idx| {
+        if idx.is_primary || idx.is_fk_index {
+            return false;
+        }
+        // Partial indexes not yet supported for expression matching.
+        if idx.predicate.is_some() {
+            return false;
+        }
+        // Expression indexes are always single-column.
+        if idx.columns.len() != 1 {
+            return false;
+        }
+        let idx_col = &idx.columns[0];
+        let Some(stored_expr) = &idx_col.expr else {
+            return false; // Not an expression index
+        };
+        // Normalize the stored expression for comparison.
+        // The stored SQL may have mixed case (e.g., "LOWER(email)") so we
+        // normalize both sides before comparing.
+        let stored_normalized = stored_expr
+            .to_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+        let query_normalized: String = normalized_query
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        stored_normalized == query_normalized
+    })?;
+
+    // Extract the literal value from the RHS for encoding.
+    let pat = match literal_expr {
+        Expr::Literal(Value::Text(t)) => t,
+        // JSON patterns for LIKE are not yet supported.
+        Expr::Literal(Value::Json(_)) => return None,
+        _ => return None,
+    };
+
+    if is_eq {
+        // func(col) = 'literal' → point lookup.
+        // We need to encode the literal as an index key.
+        // The value type must match the expression's result type (TEXT).
+        let literal_val = Value::Text(pat.clone());
+        if let Ok(key) = encode_index_key(&[literal_val]) {
+            return Some((matching_idx.clone(), Some(key.clone()), Some(key)));
+        }
+        None
+    } else {
+        // LIKE 'prefix%' → prefix range scan.
+        // `pat` here is from the Value::Text branch; Value::Json is not supported for LIKE.
+        if pat.ends_with('%') && !pat.starts_with('%') {
+            // Prefix pattern: 'foo%' → lo='foo', hi='foo\xFF' (0xFF as last possible char)
+            let prefix = pat.trim_end_matches('%');
+            let lo_val = Value::Text(prefix.to_string());
+            let hi_val = Value::Text(format!("{}\u{FF}", prefix));
+            let lo = encode_index_key(&[lo_val]).ok();
+            let hi = encode_index_key(&[hi_val]).ok();
+            if lo.is_some() {
+                return Some((matching_idx.clone(), lo, hi));
+            }
+        }
+        // '%suffix' or '%infix%' — would need reverse index or full scan.
+        // Return None to fall through to regular evaluation.
+        None
+    }
 }
 
 /// Returns the first usable index whose first column matches `col_name` and

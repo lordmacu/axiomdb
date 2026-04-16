@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sudo)",
+      "Read(//home/familia/**)",
+      "Read(//home/familia/.local/share/opencode/**)",
+      "Read(//home/familia/.opencode/**)",
+      "Bash(opencode models:*)",
+      "Bash(ls /home/familia/axiomdb/opencode.json* /home/familia/axiomdb/opencode.jsonc*)",
+      "Bash(curl -s \"https://ollama.com/search?q=qwen\")",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo build:*)",
+      "Bash(python3 tools/wire-test.py)",
+      "Bash(gh auth:*)",
+      "Bash(git -c commit.gpgsign=false commit -m ':*)",
+      "Bash(git -c user.name=lordmacu -c user.email=lordmacu@users.noreply.github.com -c commit.gpgsign=false commit -m ':*)",
+      "Bash(cargo fmt:*)",
+      "Bash(git push:*)",
+      "Bash(cargo check:*)",
+      "Bash(git stash:*)",
+      "Bash(git -c user.name=lordmacu -c user.email=lordmacu@users.noreply.github.com commit -m ':*)",
+      "Bash(grep -rn \"IS DISTINCT FROM\\\\|is_distinct_from\\\\|IS_NOT_DISTINCT\" /home/familia/axiomdb/research/postgres/src/backend/parser/*.y)"
+    ]
+  }
+}

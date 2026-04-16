@@ -10,6 +10,7 @@ fn idx_col(col_idx: u16) -> IndexColumnDef {
     IndexColumnDef {
         col_idx,
         order: SortOrder::Asc,
+        expr: None,
     }
 }
 

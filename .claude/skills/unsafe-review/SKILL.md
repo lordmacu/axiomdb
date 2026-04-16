@@ -1,3 +1,8 @@
+---
+name: unsafe-review
+description: Audit unsafe blocks — verify necessity, add SAFETY comments, confirm test coverage, encapsulate in safe public API
+---
+
 # /unsafe-review — Audit unsafe blocks
 
 ## Find all unsafe blocks

@@ -268,6 +268,7 @@ fn test_index_def_fillfactor_roundtrip() {
         columns: vec![IndexColumnDef {
             col_idx: 1,
             order: SortOrder::Asc,
+            expr: None,
         }],
         predicate: None,
         fillfactor: 70,
@@ -300,6 +301,7 @@ fn test_pre_68_index_row_reads_fillfactor_as_90() {
         columns: vec![IndexColumnDef {
             col_idx: 0,
             order: SortOrder::Asc,
+            expr: None,
         }],
         predicate: None,
         fillfactor: 90,

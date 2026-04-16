@@ -91,7 +91,7 @@ fn alter_add_constraint(
             }
 
             // Serialize the expression to SQL string for persistence.
-            let check_expr = expr_to_sql_string(&expr);
+            let check_expr = crate::expr_to_sql::expr_to_sql_string(&expr);
 
             // Persist in axiom_constraints.
             CatalogWriter::new(storage, txn, conn_txn)?.create_constraint(ConstraintDef {
@@ -322,6 +322,7 @@ fn alter_add_primary_key(
             Ok(IndexColumnDef {
                 col_idx: col.col_idx,
                 order: SortOrder::Asc,
+                expr: None,
             })
         })
         .collect::<Result<_, DbError>>()?;
@@ -493,84 +494,13 @@ fn alter_drop_constraint(
 
 /// Converts an [`Expr`] to a SQL string suitable for storing in `axiom_constraints`.
 ///
-/// Not a perfect round-trip — whitespace and casing may differ from the original
-/// input, but the output is valid SQL that can be re-parsed and evaluated.
+/// Thin wrapper around [`crate::expr_to_sql::expr_to_sql_string`] kept for
+/// local callers within the executor module. Previously this was a separate
+/// implementation that fell back to `{other:?}` for unhandled variants, which
+/// produced Rust Debug output ("Function { name: \"LOWER\", ... }") that could
+/// not be re-parsed — breaking expression indexes that round-trip the AST
+/// through the catalog (Phase 21.8). Delegating to the canonical helper keeps
+/// all serialization paths in sync.
 pub(crate) fn expr_to_sql_string(expr: &Expr) -> String {
-    use crate::expr::BinaryOp;
-
-    match expr {
-        Expr::Literal(v) => match v {
-            Value::Int(n) => n.to_string(),
-            Value::BigInt(n) => n.to_string(),
-            Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-            Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
-            Value::Null => "NULL".to_string(),
-            Value::Real(f) => f.to_string(),
-            _ => format!("{v}"),
-        },
-        Expr::Column { name, .. } => name.clone(),
-        Expr::BinaryOp { left, op, right } => {
-            let op_str = match op {
-                BinaryOp::Eq => "=",
-                BinaryOp::NotEq => "!=",
-                BinaryOp::Lt => "<",
-                BinaryOp::LtEq => "<=",
-                BinaryOp::Gt => ">",
-                BinaryOp::GtEq => ">=",
-                BinaryOp::And => "AND",
-                BinaryOp::Or => "OR",
-                BinaryOp::Add => "+",
-                BinaryOp::Sub => "-",
-                BinaryOp::Mul => "*",
-                BinaryOp::Div => "/",
-                BinaryOp::Mod => "%",
-                BinaryOp::Concat => "||",
-                BinaryOp::Xor => "XOR",
-                BinaryOp::NullSafe => "<=>",
-                BinaryOp::IntDiv => "DIV",
-                BinaryOp::BitAnd => "&",
-                BinaryOp::BitOr => "|",
-                BinaryOp::BitXor => "^",
-                BinaryOp::ShiftLeft => "<<",
-                BinaryOp::ShiftRight => ">>",
-                BinaryOp::Regexp => "REGEXP",
-                BinaryOp::JsonSub => "->",
-                BinaryOp::JsonContains => "@>",
-                BinaryOp::JsonContainedBy => "<@",
-                BinaryOp::JsonExists => "?",
-                BinaryOp::JsonbPathExists => "@?",
-                BinaryOp::JsonbPathMatch => "@@",
-                BinaryOp::JsonExistsAny => "?|",
-                BinaryOp::JsonExistsAll => "?&",
-                BinaryOp::JsonPathExtract => "#>",
-                BinaryOp::JsonPathExtractText => "#>>",
-                BinaryOp::JsonPathDelete => "#-",
-            };
-            format!(
-                "({} {op_str} {})",
-                expr_to_sql_string(left),
-                expr_to_sql_string(right)
-            )
-        }
-        Expr::UnaryOp {
-            op: crate::expr::UnaryOp::Not,
-            operand,
-        } => {
-            format!("NOT {}", expr_to_sql_string(operand))
-        }
-        Expr::IsNull {
-            expr: inner,
-            negated: false,
-        } => {
-            format!("{} IS NULL", expr_to_sql_string(inner))
-        }
-        Expr::IsNull {
-            expr: inner,
-            negated: true,
-        } => {
-            format!("{} IS NOT NULL", expr_to_sql_string(inner))
-        }
-        // For complex expressions not yet handled, fall back to a debug representation.
-        other => format!("{other:?}"),
-    }
+    crate::expr_to_sql::expr_to_sql_string(expr)
 }

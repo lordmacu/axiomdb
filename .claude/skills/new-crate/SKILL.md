@@ -1,3 +1,8 @@
+---
+name: new-crate
+description: Scaffold a new crate in the axiomdb workspace — create, wire to workspace, write initial test, update architecture.md
+---
+
 # /new-crate — Scaffold a crate in the workspace
 
 ## Complete process
@@ -5,7 +10,7 @@
 ### 1. Create the crate
 
 ```bash
-cd /Users/cristian/nexusdb
+cd /home/familia/axiomdb
 cargo new --lib crates/axiomdb-NAME
 ```
 
