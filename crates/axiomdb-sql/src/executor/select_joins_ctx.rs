@@ -58,6 +58,10 @@ fn execute_select_with_joins_first_materialized(
     // Some(subquery) → LATERAL subquery correlated to left side, must be
     // re-evaluated per outer row. None → non-LATERAL or non-correlated.
     let mut correlated_sub: Vec<Option<SelectStmt>> = vec![None];
+    // Phase 21.9: Track accumulated columns from correlated LATERAL subqueries.
+    // Even when deferred (empty columns in all_sources), subsequent LATERALs
+    // need to reference these output columns for correlation detection.
+    let mut lateral_accum_cols = 0usize;
     let mut running_offset = 0usize;
     let snap = conn_txn
         .map(|c| txn.active_snapshot(c))
@@ -70,7 +74,7 @@ fn execute_select_with_joins_first_materialized(
         scanned.push(first_rows);
         correlated_sub.push(None);
 
-        for join in &stmt.joins {
+        for (_join_idx, join) in stmt.joins.iter().enumerate() {
             match &join.table {
                 FromClause::Table(tref) => {
                     let jt = resolve_table_cached(storage, txn, ctx, conn_txn, tref)?;
@@ -86,23 +90,40 @@ fn execute_select_with_joins_first_materialized(
                     scanned.push(rows.into_iter().map(|(_, r)| r).collect());
                     correlated_jt.push(None);
                     correlated_srf.push(None);
+                    correlated_sub.push(None);
                 }
                 FromClause::Subquery {
                     query,
                     alias,
                     lateral,
                 } => {
+                    // Phase 21.9: RIGHT/FULL JOIN on LATERAL subquery is not supported
+                    // (LATERAL semantics imply left-to-right evaluation; RIGHT/FULL
+                    // would require outer-scan which is ill-defined for LATERAL).
+                    if *lateral && matches!(join.join_type, JoinType::Right | JoinType::Full) {
+                        return Err(DbError::NotImplemented {
+                            feature:
+                                "RIGHT/FULL JOIN on LATERAL subquery — PG-compatible rejection"
+                                    .into(),
+                        });
+                    }
                     // Phase 21.9: check if this LATERAL subquery is correlated
                     // (references outer columns from the left side of the join).
                     // For correlated subqueries, we defer materialization to the
                     // per-outer-row combine loop. Non-LATERAL or non-correlated
                     // subqueries are materialized once upfront.
-                    let left_col_count = all_sources.iter().map(|s| s.columns.len()).sum::<usize>();
+                    let base_left_cols = all_sources.iter().map(|s| s.columns.len()).sum::<usize>();
+                    let effective_left_cols = base_left_cols + lateral_accum_cols;
                     let is_correlated = *lateral
-                        && crate::json_table::subquery_is_correlated(query, left_col_count);
+                        && crate::json_table::subquery_is_correlated(query, effective_left_cols);
+                    eprintln!("DEBUG: Subquery {} lateral={} base_left={} lateral_accum={} effective_left={} is_correlated={}",
+                        alias, lateral, base_left_cols, lateral_accum_cols, effective_left_cols, is_correlated);
 
                     let (columns, rows) = if is_correlated {
                         // Deferred: store the subquery for combine loop, use empty schema.
+                        // But track our output column count so subsequent LATERALs can
+                        // reference our columns for their correlation checks.
+                        lateral_accum_cols += query.columns.len();
                         (vec![], Vec::new())
                     } else {
                         let inner_result =
@@ -125,6 +146,11 @@ fn execute_select_with_joins_first_materialized(
                     } else {
                         None
                     });
+                    eprintln!(
+                        "DEBUG: After Subquery push correlated_sub.len()={}, is_correlated={}",
+                        correlated_sub.len(),
+                        is_correlated
+                    );
                     correlated_jt.push(None);
                     correlated_srf.push(None);
                 }
@@ -254,6 +280,8 @@ fn execute_select_with_joins_first_materialized(
                 right_col_offset,
             )?
         } else if let Some(subquery) = correlated_sub[right_idx].as_ref() {
+            eprintln!("DEBUG combine: i={} right_idx={} correlated_sub.len()={} - calling apply_correlated_subquery_join", 
+                i, right_idx, correlated_sub.len());
             // Phase 21.9 — correlated LATERAL subquery right side.
             apply_correlated_subquery_join(
                 combined_rows,
@@ -269,6 +297,13 @@ fn execute_select_with_joins_first_materialized(
                 ctx,
             )?
         } else {
+            eprintln!("DEBUG combine: i={} right_idx={} correlated_sub.len()={} - calling apply_join (non-correlated)", 
+                i, right_idx, correlated_sub.len());
+            eprintln!(
+                "DEBUG combine: scanned[{}].len()={}",
+                right_idx,
+                scanned[right_idx].len()
+            );
             apply_join(
                 combined_rows,
                 &scanned[right_idx],
